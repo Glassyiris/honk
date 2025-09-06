@@ -1,6 +1,6 @@
 [package]
 name = "xdp"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 description = "AF_XDP socket support without C dependencies"
 license = "Apache-2.0 OR MIT"
@@ -27,5 +27,5 @@ members = [
 
 [workspace.dependencies]
 test-utils = { version = "0.1.0", path = "./crates/test-utils" }
-xdp = { version = "0.7.0", path = ".", features = ["__debug"] }
+xdp = { version = "0.7.1", path = ".", features = ["__debug"] }
 etherparse = "0.17"
