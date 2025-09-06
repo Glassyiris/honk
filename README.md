@@ -8,8 +8,8 @@
 
 [![Crates.io](https://img.shields.io/crates/v/xdp.svg)](https://crates.io/crates/xdp)
 [![API Docs](https://docs.rs/xdp/badge.svg)](https://docs.rs/xdp)
-[![dependency status](https://deps.rs/repo/github/Jake-Shadle/xdp/status.svg)](https://deps.rs/repo/github/Jake-Shadle/xdp)
-[![Build Status](https://github.com/Jake-Shadle/xdp/workflows/CI/badge.svg)](https://github.com/Jake-Shadle/xdp/actions?workflow=CI)
+[![dependency status](https://deps.rs/repo/codeberg/ca1ne/xdp/status.svg)](https://deps.rs/repo/codeberg/ca1ne/xdp)
+<!-- [![Build Status](https://codeberg.org/ca1ne/xdp/workflows/CI/badge.svg)](https://codeberg.org/ca1ne/xdp/actions?workflow=CI) -->
 
 </div>
 
