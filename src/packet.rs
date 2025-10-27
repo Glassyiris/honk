@@ -363,7 +363,7 @@ impl Packet {
     ///     }
     ///
     ///     assert!(packet.is_empty());
-    ///     
+    ///
     ///     packet.adjust_tail(10).expect("failed to extend the tail");
     ///     assert_eq!(&packet[..10], &[0xff; 10]);
     /// }
@@ -450,7 +450,7 @@ impl Packet {
         }
 
         let size = std::mem::size_of::<T>();
-        if start + size > self.tail {
+        if unlikely(size >= SANE) || start + size > self.tail {
             return Err(PacketError::InsufficientData {
                 offset,
                 size,
@@ -533,7 +533,7 @@ impl Packet {
         }
 
         let size = std::mem::size_of::<T>();
-        if start + size > self.tail {
+        if unlikely(size >= SANE) || start + size > self.tail {
             return Err(PacketError::InsufficientData {
                 offset,
                 size,
@@ -618,6 +618,54 @@ impl Packet {
             std::ptr::copy_nonoverlapping(self.data.byte_offset(start as _), array.as_mut_ptr(), N);
         }
         Ok(())
+    }
+
+    /// Retrieves the bytes of `len` beginning at the specified offset
+    ///
+    /// # Errors
+    ///
+    /// - The offset is not within bounds
+    /// - The offset + `len` is not within bounds
+    ///
+    /// ```
+    /// # use xdp::packet::Pod;
+    /// # let mut umem = xdp::Umem::map(
+    /// #    xdp::umem::UmemCfgBuilder {
+    /// #        head_room: 0,
+    /// #        ..Default::default()
+    /// #    }.build().unwrap()
+    /// # ).expect("failed to map Umem");
+    /// # let mut packet = unsafe {
+    /// #    umem.alloc().expect("failed to allocate packet")
+    /// # };
+    /// // Insert string slice
+    /// packet.insert(0, b"abcd").unwrap();
+    ///
+    /// let bytes = packet.slice_at_offset(0, 4).unwrap();
+    ///
+    /// assert_eq!(bytes, b"abcd");
+    /// ```
+    #[inline]
+    pub fn slice_at_offset(&self, offset: usize, len: usize) -> Result<&[u8], PacketError> {
+        if unlikely(offset >= SANE) {
+            return Err(PacketError::InvalidOffset {
+                offset,
+                length: self.len(),
+            });
+        }
+
+        let start = self.head + offset;
+        if unlikely(len >= SANE) || start + len > self.tail {
+            return Err(PacketError::InsufficientData {
+                offset,
+                size: len,
+                length: self.tail - offset,
+            });
+        }
+
+        // SAFETY: we've validated the range of data we are reading
+        let slice = unsafe { std::slice::from_raw_parts(self.data.byte_offset(start as _), len) };
+        Ok(slice)
     }
 
     /// Inserts a slice at the specified offset, shifting any bytes above `offset`
