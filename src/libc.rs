@@ -99,7 +99,7 @@ pub mod xdp {
         pub const XDP_UMEM_REG: Enum = 4;
         pub const XDP_UMEM_FILL_RING: Enum = 5;
         pub const XDP_UMEM_COMPLETION_RING: Enum = 6;
-        //pub const XDP_STATISTICS: Enum = 7;
+        pub const XDP_STATISTICS: Enum = 7;
         //pub const XDP_OPTIONS: Enum = 8;
     }
 
@@ -266,6 +266,24 @@ pub mod xdp {
         pub flags: UmemFlags::Enum,
         /// Length of the TX metadata, if any.
         pub tx_metadata_len: u32,
+    }
+
+    /// Statistics for a particular XDP socket
+    #[repr(C)]
+    #[derive(Debug)]
+    pub struct XdpStatistics {
+        /// Dropped for other reasons
+        pub rx_dropped: u64,
+        /// Received packet dropped due to invalid descriptor
+        pub rx_invalid_descs: u64,
+        /// Sent packet dropped due to invalid descriptor
+        pub tx_invalid_descs: u64,
+        /// Dropped due to rx ring being full
+        pub rx_ring_full: u64,
+        /// Failed to retrieve item from fill ring
+        pub rx_fill_ring_empty_descs: u64,
+        /// Failed to retrieve item from tx ring
+        pub tx_ring_empty_descs: u64,
     }
 
     #[repr(C)]
@@ -532,8 +550,6 @@ pub(crate) mod mmap {
 
     #[link(name = "c")]
     unsafe extern "C" {
-        /// <https://man7.org/linux/man-pages/man3/sysconf.3.html>
-        pub safe fn sysconf(name: i32) -> i64;
         /// <https://man7.org/linux/man-pages/man2/mmap.2.html>
         #[cfg_attr(
             any(

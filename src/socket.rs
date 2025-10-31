@@ -75,6 +75,8 @@ pub enum OptName {
     TxRing = libc::xdp::SockOpts::XDP_TX_RING,
     /// Used to retrieve the ring offsets configured by the kernel
     XdpMmapOffsets = libc::xdp::SockOpts::XDP_MMAP_OFFSETS,
+    /// Used to retrieve [`xdp::XdpStatistics`]
+    Statistics = libc::xdp::SockOpts::XDP_STATISTICS,
     // PreferBusyPoll = 69, // SO_PREFER_BUSY_POLL
     // BusyPoll = libc::SO_BUSY_POLL,
     // BusyPollBudget = 70, // SO_BUSY_POLL_BUDGET
@@ -118,6 +120,44 @@ impl BindFlags {
     fn needs_wakeup(&mut self) {
         self.0 |= xdp::BindFlags::XDP_USE_NEED_WAKEUP;
     }
+}
+
+#[inline]
+fn get_sock_opt<T>(
+    socket: std::os::fd::RawFd,
+    optname: OptName,
+    out: &mut T,
+) -> Result<(), SocketError> {
+    let expected = std::mem::size_of_val(out);
+    let mut size = expected as u32;
+    // SAFETY: safe barring kernel bugs
+    if unsafe {
+        libc::socket::getsockopt(
+            socket,
+            libc::socket::Level::SOL_XDP,
+            optname as _,
+            (out as *mut T).cast(),
+            &mut size,
+        )
+    } != 0
+    {
+        return Err(SocketError::GetSockOpt {
+            inner: std::io::Error::last_os_error(),
+            option: optname,
+        });
+    }
+
+    if size as usize != expected {
+        return Err(SocketError::GetSockOpt {
+            inner: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("expected size {expected}b but got {size}b"),
+            ),
+            option: optname,
+        });
+    }
+
+    Ok(())
 }
 
 impl XdpSocketBuilder {
@@ -275,40 +315,10 @@ impl XdpSocketBuilder {
 
         // SAFETY: xdp_mmap_offsets is POD
         let mut offsets = unsafe { std::mem::zeroed::<libc::rings::xdp_mmap_offsets>() };
-
-        let expected_size = std::mem::size_of_val(&offsets) as u32;
-        let mut size = expected_size;
-
         let socket = self.sock.as_raw_fd();
 
         // Retrieve the mapping offsets
-        // SAFETY: safe barring kernel bugs
-        if unsafe {
-            libc::socket::getsockopt(
-                socket,
-                libc::socket::Level::SOL_XDP,
-                OptName::XdpMmapOffsets as _,
-                (&mut offsets as *mut libc::rings::xdp_mmap_offsets).cast(),
-                &mut size,
-            )
-        } != 0
-        {
-            return Err(SocketError::GetSockOpt {
-                inner: std::io::Error::last_os_error(),
-                option: OptName::XdpMmapOffsets,
-            });
-        }
-
-        // Sanity check the result
-        if size != expected_size {
-            return Err(SocketError::GetSockOpt {
-                inner: std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("expected size {expected_size} but size returned was {size}"),
-                ),
-                option: OptName::XdpMmapOffsets,
-            });
-        }
+        get_sock_opt(socket, OptName::XdpMmapOffsets, &mut offsets)?;
 
         Ok(offsets)
     }
@@ -450,6 +460,15 @@ impl XdpSocket {
         }
     }
 
+    /// Retrieves the statistics for this socket
+    #[inline]
+    pub fn statistics(&self) -> Result<xdp::XdpStatistics, SocketError> {
+        // SAFETY: POD
+        let mut stats = unsafe { std::mem::zeroed::<xdp::XdpStatistics>() };
+        get_sock_opt(self.as_raw_fd(), OptName::Statistics, &mut stats)?;
+        Ok(stats)
+    }
+
     /// Gets the file descriptor for the socket
     #[inline]
     pub fn raw_fd(&self) -> std::os::fd::RawFd {
@@ -458,6 +477,7 @@ impl XdpSocket {
 }
 
 impl std::os::fd::AsRawFd for XdpSocket {
+    #[inline]
     fn as_raw_fd(&self) -> std::os::fd::RawFd {
         self.sock.as_raw_fd()
     }
