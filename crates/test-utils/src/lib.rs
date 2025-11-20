@@ -7,7 +7,6 @@ static LOGGER: std::sync::Once = std::sync::Once::new();
 
 /// Needs `./build_ebpf.sh` to be run
 const PROGRAM: &[u8] = include_bytes!("../../../target/bpfel-unknown-none/release/socket-router");
-const DUMMY: &[u8] = include_bytes!("../../../target/bpfel-unknown-none/release/dummy");
 
 pub struct Bpf {
     bpf: aya::Ebpf,
@@ -18,12 +17,6 @@ impl Bpf {
         let mut loader = aya::EbpfLoader::new();
 
         let sockets: Vec<_> = sockets.collect();
-        // let socket_count = sockets.len() as u64;
-        // loader.set_global("SOCKET_COUNT", &socket_count, true);
-
-        // if let Err(err) = object::read::File::parse(PROGRAM) {
-        //     panic!("{err}");
-        // }
 
         let mut bpf = loader.load(PROGRAM).expect("failed to load socket-router");
 
@@ -51,13 +44,10 @@ impl Bpf {
 
     pub fn dummy() -> Self {
         let mut loader = aya::EbpfLoader::new();
-        // if let Err(err) = object::read::File::parse(DUMMY) {
-        //     panic!("{err}");
-        // }
 
-        let mut bpf = loader.load(DUMMY).expect("failed to load socket-router");
+        let mut bpf = loader.load(PROGRAM).expect("failed to load socket-router");
         let program: &mut aya::programs::Xdp = bpf
-            .program_mut("socket_router")
+            .program_mut("dummy")
             .expect("failed to find entrypoint")
             .try_into()
             .expect("not an XDP program");

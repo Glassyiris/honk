@@ -14,14 +14,12 @@ name: CI
 jobs:
   lint:
     name: Lint
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-24.04
-    runs-on: ${{ matrix.os }}
+    runs-on: codeberg-small
+    container:
+      image: node:25-trixie
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: https://github.com/actions/checkout@v4
+      - uses: https://github.com/dtolnay/rust-toolchain@stable
 
       # make sure all code has been formatted with rustfmt
       - name: check rustfmt
@@ -37,10 +35,12 @@ jobs:
           cargo clippy --all-targets --all-features -- -D warnings
 
   test:
-    runs-on: ubuntu-24.04
+    runs-on: codeberg-small
+    container:
+      image: node:25-trixie
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: https://github.com/actions/checkout@v4
+      - uses: https://github.com/dtolnay/rust-toolchain@stable
       - run: cargo fetch
       - name: cargo test build
         run: cargo build --tests
@@ -48,20 +48,22 @@ jobs:
         run: cargo test
 
   miri-test:
-    runs-on: ubuntu-24.04
+    runs-on: codeberg-medium
+    container:
+      image: node:25-trixie
     env:
       BPF_LINKER_VERSION: "v0.9.13"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: dtolnay/rust-toolchain@master
+      - uses: https://github.com/actions/checkout@v4
+      - uses: https://github.com/dtolnay/rust-toolchain@stable
+      - uses: https://github.com/dtolnay/rust-toolchain@master
         with:
           toolchain: nightly
           components: rust-src, miri
       - run: cargo fetch
       - name: build eBPF
         run: |
-          (cd /usr/bin && curl -L https://github.com/aya-rs/bpf-linker/releases/download/${BPF_LINKER_VERSION}/bpf-linker-x86_64-unknown-linux-gnu.tar.gz | sudo tar xzf - bpf-linker)
+          (cd /usr/bin && curl -L https://github.com/aya-rs/bpf-linker/releases/download/${BPF_LINKER_VERSION}/bpf-linker-x86_64-unknown-linux-gnu.tar.gz | tar xzf - bpf-linker)
           ./build_ebpf.sh
       - name: install nextest
         run: curl -LsSf https://get.nexte.st/latest/linux-musl | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
@@ -73,20 +75,28 @@ jobs:
         run: cargo miri nextest run -j 4
 
   integ-test:
-    runs-on: ubuntu-24.04
+    # Disable for now, unfortunately the codeberg hosted runners don't allow
+    # manipulation of network namespaces
+    if: false
+    runs-on: codeberg-medium
+    container:
+      image: node:25-trixie
     env:
       BPF_LINKER_VERSION: "v0.9.13"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: dtolnay/rust-toolchain@master
+      - uses: https://github.com/actions/checkout@v4
+      - uses: https://github.com/dtolnay/rust-toolchain@stable
+      - uses: https://github.com/dtolnay/rust-toolchain@master
         with:
           toolchain: nightly
-          components: rust-src, miri
+          components: rust-src
+      - run:
+          # need the ip command
+          apt-get update && apt-get install iproute2 -y
       - run: cargo fetch
       - name: build eBPF
         run: |
-          (cd /usr/bin && curl -L https://github.com/aya-rs/bpf-linker/releases/download/${BPF_LINKER_VERSION}/bpf-linker-x86_64-unknown-linux-gnu.tar.gz | sudo tar xzf - bpf-linker)
+          (cd /usr/bin && curl -L https://github.com/aya-rs/bpf-linker/releases/download/${BPF_LINKER_VERSION}/bpf-linker-x86_64-unknown-linux-gnu.tar.gz | tar xzf - bpf-linker)
           ./build_ebpf.sh
       - name: cargo test build
         working-directory: ./crates/integ
@@ -96,35 +106,43 @@ jobs:
         run: cargo test
 
   docs:
-    runs-on: ubuntu-24.04
+    runs-on: codeberg-small
+    container:
+      image: node:25-trixie
     env:
       RUSTDOCFLAGS: "-D warnings"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: https://github.com/actions/checkout@v4
+      - uses: https://github.com/dtolnay/rust-toolchain@stable
       - run: cargo fetch
       - name: cargo doc check
         run: cargo doc
 
   deny-check:
     name: cargo-deny
-    runs-on: ubuntu-24.04
+    runs-on: codeberg-small
+    container:
+      image: node:25-trixie
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: https://github.com/actions/checkout@v4
+      - uses: https://github.com/EmbarkStudios/cargo-deny-action@v2
 
   publish-check:
     name: Publish Check
-    runs-on: ubuntu-24.04
+    runs-on: codeberg-small
+    container:
+      image: node:25-trixie
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: https://github.com/actions/checkout@v4
+      - uses: https://github.com/dtolnay/rust-toolchain@stable
       - run: cargo fetch
       - name: cargo publish check
         run: cargo publish --dry-run
 
   test_success:
-    runs-on: ubuntu-24.04
-    needs: [lint, test, miri-test, integ-test, docs, publish-check]
+    runs-on: codeberg-tiny
+    container:
+      image: node:25-trixie
+    needs: [lint, test, miri-test, docs, publish-check]
     steps:
       - run: echo "All test jobs passed"

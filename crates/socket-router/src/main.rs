@@ -116,6 +116,13 @@ pub fn socket_router(ctx: XdpContext) -> Action {
     }
 }
 
+/// A dummy xdp program that always passes. This is needed because a veth pair
+/// must have an XDP program on both sides
+#[xdp]
+pub fn dummy(_ctx: XdpContext) -> Action {
+    xdp_action::XDP_PASS
+}
+
 /// We can't panic, but we still need to satisfy the linker
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
