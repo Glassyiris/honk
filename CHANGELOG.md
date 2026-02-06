@@ -8,7 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
+### Added
+- [PR#27](https://codeberg.org/ca1ne/xdp/pulls/27) added `Packet::slice_at_offset`.
+- [PR#29](https://codeberg.org/ca1ne/xdp/pulls/29) added `XdpSocket::statistics` to retrieve the [`xdp_statistics`](https://github.com/torvalds/linux/blob/b7ff7151e653aa296ab6c5495b2c1ab7c21eb250/include/uapi/linux/if_xdp.h#L93-L100) collected by the kernel for a specific XDP socket.
+- [PR#36](https://codeberg.org/ca1ne/xdp/pulls/36) added `Umem::capacity`, `Umem::outstanding`, and `Umem::allocatable`.
+
 ## [0.7.1] - 2025-09-06
+### Changed
+- Moved from github to codeberg
+
 ## [0.7.0] - 2025-03-11
 ### Fixed
 - [PR#20](https://codeberg.org/ca1ne/xdp/pulls/20) changed `EtherType` and `IpProto` from enums to scoped constants to avoid UB in the presence of invalid/corrupt data that didn't match a variant. Also removed a bunch of the `IpProto` variants as most will never be used, and since it's now scoped constants users can provide their own constants without needing them in the lib themselves. Resolved [#19](https://codeberg.org/ca1ne/xdp/issues/19).

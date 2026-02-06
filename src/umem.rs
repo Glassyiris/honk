@@ -103,6 +103,24 @@ impl Umem {
         })
     }
 
+    /// The total capacity of this [`Umem`] in number of frames
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.available.capacity()
+    }
+
+    /// The number of frames that are currently allocated from this [`Umem`]
+    #[inline]
+    pub fn outstanding(&self) -> usize {
+        self.available.capacity() - self.available.len()
+    }
+
+    /// The number of frames that can be allocated from this [`Umem`] before it is exhausted
+    #[inline]
+    pub fn allocatable(&self) -> usize {
+        self.available.len()
+    }
+
     /// Given an [`xdp_desc`] filled by the kernel, retrieves the memory block
     /// it points to as a [`Packet`]
     ///

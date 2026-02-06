@@ -12,7 +12,7 @@ use std::fmt;
 const SANE: usize = 4096;
 
 // TODO: Replace with `std::intrinsics::unlikely` if/when it is stabilized
-// https://github.com/rust-lang/rust/issues/136873
+// <https://github.com/rust-lang/rust/issues/151619>
 #[inline(always)]
 pub(crate) const fn unlikely<T>(x: T) -> T {
     x
