@@ -87,6 +87,10 @@ fn simple() {
     assert_eq!(0xf3f3f3f3f3f3f3f3, u64::from_ne_bytes(arr6));
     packet.array_at_offset(8, &mut arr6).unwrap();
     assert_eq!(0x1212121212121212, u64::from_ne_bytes(arr6));
+    assert!(packet.array_at_offset(16, &mut arr6).is_err());
+    assert!(packet.array_at_offset(17, &mut arr6).is_err());
+    let mut arr0 = [];
+    assert!(packet.array_at_offset(90, &mut arr0).is_err());
 }
 
 #[test]
@@ -326,4 +330,52 @@ fn data_range() {
 
     range.start = range.end + 1;
     dbg!(&packet[range]);
+}
+
+#[test]
+fn slice() {
+    let mut buf = [0u8; 2048];
+    let mut packet = Packet::testing_new(&mut buf);
+
+    PacketBuilder::ethernet2(SRC_MAC.0, DST_MAC.0)
+        .ipv6([20; 16], [33; 16], 64)
+        .udp(5353, 1111)
+        .write(&mut packet, IPV6_DATA)
+        .unwrap();
+
+    assert_eq!(
+        packet
+            .slice_at_offset(
+                nt::EthHdr::LEN + nt::Ipv6Hdr::LEN + nt::UdpHdr::LEN,
+                IPV6_DATA.len()
+            )
+            .unwrap(),
+        IPV6_DATA
+    );
+
+    // Outside range
+    assert!(
+        packet
+            .slice_at_offset(
+                nt::EthHdr::LEN + nt::Ipv6Hdr::LEN + nt::UdpHdr::LEN + IPV6_DATA.len(),
+                1
+            )
+            .is_err()
+    );
+    assert!(
+        packet
+            .slice_at_offset(
+                nt::EthHdr::LEN + nt::Ipv6Hdr::LEN + nt::UdpHdr::LEN + IPV6_DATA.len() - 1,
+                2
+            )
+            .is_err()
+    );
+    assert!(
+        packet
+            .slice_at_offset(
+                nt::EthHdr::LEN + nt::Ipv6Hdr::LEN + nt::UdpHdr::LEN + IPV6_DATA.len() + 1,
+                1
+            )
+            .is_err()
+    );
 }

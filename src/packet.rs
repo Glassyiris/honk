@@ -609,7 +609,7 @@ impl Packet {
             return Err(PacketError::InsufficientData {
                 offset,
                 size: N,
-                length: self.tail - offset,
+                length: self.tail.saturating_sub(offset),
             });
         }
 
@@ -659,7 +659,7 @@ impl Packet {
             return Err(PacketError::InsufficientData {
                 offset,
                 size: len,
-                length: self.tail - offset,
+                length: self.tail.saturating_sub(offset),
             });
         }
 
@@ -772,12 +772,11 @@ impl Packet {
     /// Calling this function requires that the [`crate::umem::UmemCfgBuilder::tx_checksum`]
     /// and/or [`crate::umem::UmemCfgBuilder::tx_timestamp`] were true
     ///
-    /// - If `csum` is `CsumOffload::Request`, this will request that the Layer 4
-    ///   checksum computation be offload to the NIC before transmission. Note that
-    ///   this requires that the IP pseudo header checksum be calculated and stored
-    ///   in the same location.
-    /// - If `request_timestamp` is true, requests that the NIC write the timestamp
-    ///   the packet was transmitted. This can be retrieved using [`crate::CompletionRing::dequeue_with_timestamps`]
+    /// - If `csum` is `CsumOffload::Request`, this will request that the Layer 4 checksum computation be offloaded to
+    ///   the NIC before transmission. Note that this requires that the IP pseudo header checksum be calculated and
+    ///   stored in the same location.
+    /// - If `request_timestamp` is true, requests that the NIC write the timestamp the packet was transmitted. This can
+    ///   be retrieved using [`crate::CompletionRing::dequeue_with_timestamps`]
     #[inline]
     pub fn set_tx_metadata(
         &mut self,
@@ -850,6 +849,7 @@ impl Packet {
 
 impl std::ops::Deref for Packet {
     type Target = [u8];
+
     fn deref(&self) -> &Self::Target {
         // SAFETY: the pointer is valid as long as the mmap is alive
         unsafe { &std::slice::from_raw_parts(self.data, self.capacity)[self.head..self.tail] }
