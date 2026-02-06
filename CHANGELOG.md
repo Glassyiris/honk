@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
+## [0.7.2] - 2026-02-06
 ### Added
 - [PR#27](https://codeberg.org/ca1ne/xdp/pulls/27) added `Packet::slice_at_offset`.
 - [PR#29](https://codeberg.org/ca1ne/xdp/pulls/29) added `XdpSocket::statistics` to retrieve the [`xdp_statistics`](https://github.com/torvalds/linux/blob/b7ff7151e653aa296ab6c5495b2c1ab7c21eb250/include/uapi/linux/if_xdp.h#L93-L100) collected by the kernel for a specific XDP socket.
@@ -101,7 +102,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Initial crate squat
 
 <!-- next-url -->
-[Unreleased]: https://codeberg.org/ca1ne/xdp/compare/0.7.1...HEAD
+[Unreleased]: https://codeberg.org/ca1ne/xdp/compare/0.7.2...HEAD
+[0.7.2]: https://codeberg.org/ca1ne/xdp/compare/0.7.1...0.7.2
 [0.7.1]: https://codeberg.org/ca1ne/xdp/compare/0.7.0...0.7.1
 [0.7.0]: https://codeberg.org/ca1ne/xdp/compare/0.6.0...0.7.0
 [0.6.0]: https://codeberg.org/ca1ne/xdp/compare/0.5.0...0.6.0
