@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
+### Added
+- [PR#38](https://codeberg.org/ca1ne/xdp/pulls/38) added checksum calculation support for `aarch64`, resolving [#5](https://codeberg.org/ca1ne/xdp/issues/5).
+
 ## [0.7.2] - 2026-02-06
 ### Added
 - [PR#27](https://codeberg.org/ca1ne/xdp/pulls/27) added `Packet::slice_at_offset`.

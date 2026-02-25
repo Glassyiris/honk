@@ -10,6 +10,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
 
+env:
+  BPF_LINKER_VERSION: "v0.9.13"
+
 name: CI
 jobs:
   lint:
@@ -18,7 +21,7 @@ jobs:
     container:
       image: node:25-trixie
     steps:
-      - uses: https://github.com/actions/checkout@v4
+      - uses: https://github.com/actions/checkout@v6
       - uses: https://github.com/dtolnay/rust-toolchain@stable
 
       # make sure all code has been formatted with rustfmt
@@ -28,7 +31,7 @@ jobs:
           cargo fmt -- --check --color always
 
       # run clippy to verify we have no warnings
-      - run: cargo fetch
+      - run: cargo fetch --target x86_64-unknown-linux-gnu
       - name: cargo clippy
         run: |
           rustup component add clippy
@@ -39,28 +42,32 @@ jobs:
     container:
       image: node:25-trixie
     steps:
-      - uses: https://github.com/actions/checkout@v4
-      - uses: https://github.com/dtolnay/rust-toolchain@stable
-      - run: cargo fetch
+      - uses: https://github.com/actions/checkout@v6
+      - uses: https://github.com/dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: rust-src
+      - name: build eBPF
+        run: |
+          (cd /usr/bin && curl -L https://github.com/aya-rs/bpf-linker/releases/download/${BPF_LINKER_VERSION}/bpf-linker-x86_64-unknown-linux-gnu.tar.gz | tar xzf - bpf-linker)
+          ./build_ebpf.sh
+      - run: cargo fetch --target x86_64-unknown-linux-gnu
       - name: cargo test build
-        run: cargo build --tests
+        run: cargo build --tests -p xdp -p tests
       - name: cargo test
-        run: cargo test
+        run: cargo test -p xdp -p tests
 
   miri-test:
     runs-on: codeberg-medium
     container:
       image: node:25-trixie
-    env:
-      BPF_LINKER_VERSION: "v0.9.13"
     steps:
-      - uses: https://github.com/actions/checkout@v4
-      - uses: https://github.com/dtolnay/rust-toolchain@stable
+      - uses: https://github.com/actions/checkout@v6
       - uses: https://github.com/dtolnay/rust-toolchain@master
         with:
           toolchain: nightly
           components: rust-src, miri
-      - run: cargo fetch
+      - run: cargo fetch --target x86_64-unknown-linux-gnu
       - name: build eBPF
         run: |
           (cd /usr/bin && curl -L https://github.com/aya-rs/bpf-linker/releases/download/${BPF_LINKER_VERSION}/bpf-linker-x86_64-unknown-linux-gnu.tar.gz | tar xzf - bpf-linker)
@@ -81,11 +88,8 @@ jobs:
     runs-on: codeberg-medium
     container:
       image: node:25-trixie
-    env:
-      BPF_LINKER_VERSION: "v0.9.13"
     steps:
-      - uses: https://github.com/actions/checkout@v4
-      - uses: https://github.com/dtolnay/rust-toolchain@stable
+      - uses: https://github.com/actions/checkout@v6
       - uses: https://github.com/dtolnay/rust-toolchain@master
         with:
           toolchain: nightly
@@ -112,7 +116,7 @@ jobs:
     env:
       RUSTDOCFLAGS: "-D warnings"
     steps:
-      - uses: https://github.com/actions/checkout@v4
+      - uses: https://github.com/actions/checkout@v6
       - uses: https://github.com/dtolnay/rust-toolchain@stable
       - run: cargo fetch
       - name: cargo doc check
@@ -124,7 +128,7 @@ jobs:
     container:
       image: node:25-trixie
     steps:
-      - uses: https://github.com/actions/checkout@v4
+      - uses: https://github.com/actions/checkout@v6
       - uses: https://github.com/EmbarkStudios/cargo-deny-action@v2
 
   publish-check:
@@ -133,7 +137,7 @@ jobs:
     container:
       image: node:25-trixie
     steps:
-      - uses: https://github.com/actions/checkout@v4
+      - uses: https://github.com/actions/checkout@v6
       - uses: https://github.com/dtolnay/rust-toolchain@stable
       - run: cargo fetch
       - name: cargo publish check

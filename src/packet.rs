@@ -1,6 +1,5 @@
 //! Utilities for raw [`Packet`] reading and writing
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub mod csum;
 pub mod net_types;
 

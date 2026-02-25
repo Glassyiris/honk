@@ -1,4 +1,24 @@
-//! Utitlities for calculating [internet checksums](https://en.wikipedia.org/wiki/Internet_checksum)
+#![cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+
+//! Utilities for calculating [internet checksums](https://en.wikipedia.org/wiki/Internet_checksum)
+
+use std::arch::asm;
+
+macro_rules! impl_block {
+    ($x86:block, $aarch64:block) => {
+        // SAFETY: asm
+        unsafe {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            {
+                $x86
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                $aarch64
+            }
+        }
+    };
+}
 
 /// Folds a running checksum calculation to a 16-bit value appropriate for use
 /// in a checksum field
@@ -20,15 +40,26 @@ pub fn to_u16(mut csum: u32) -> u16 {
 /// Add with carry
 #[inline]
 pub fn add(mut a: u32, b: u32) -> u32 {
-    // SAFETY: asm
-    unsafe {
-        std::arch::asm!(
-            "addl {b:e}, {a:e}",
-            "adcl $0, {a:e}",
-            a = inout(reg) a,
-            b = in(reg) b,
-        );
-    }
+    impl_block!(
+        {
+            asm!(
+                "addl {b:e}, {a:e}",
+                "adcl $0, {a:e}",
+                a = inout(reg) a,
+                b = in(reg) b,
+                options(att_syntax)
+            );
+        },
+        {
+            asm!(
+                "adds {a:w}, {a:w}, {b:w}",
+                "adc {a:w}, {a:w}, {zero:w}",
+                a = inout(reg) a,
+                b = in(reg) b,
+                zero = in(reg) 0,
+            );
+        }
+    );
 
     a
 }
@@ -83,20 +114,40 @@ pub fn partial(mut buf: &[u8], sum: u32) -> u32 {
     fn update_40(mut sum: u64, bytes: &[u8]) -> u64 {
         debug_assert_eq!(bytes.len(), 40);
 
-        // SAFETY: asm
-        unsafe {
-            std::arch::asm!(
-                "addq 0*8({buf}), {sum}",
-                "adcq 1*8({buf}), {sum}",
-                "adcq 2*8({buf}), {sum}",
-                "adcq 3*8({buf}), {sum}",
-                "adcq 4*8({buf}), {sum}",
-                "adcq $0, {sum}",
-                buf = in(reg) bytes.as_ptr(),
-                sum = inout(reg) sum,
-                options(att_syntax)
-            );
-        }
+        impl_block!(
+            {
+                asm!(
+                    "addq 0*8({buf}), {sum}",
+                    "adcq 1*8({buf}), {sum}",
+                    "adcq 2*8({buf}), {sum}",
+                    "adcq 3*8({buf}), {sum}",
+                    "adcq 4*8({buf}), {sum}",
+                    "adcq $0, {sum}",
+                    buf = in(reg) bytes.as_ptr(),
+                    sum = inout(reg) sum,
+                    options(att_syntax)
+                );
+            },
+            {
+                asm!(
+                    "ldr {tmp},[{buf},#0]",
+                    "adds {sum}, {sum}, {tmp}",
+                    "ldr {tmp},[{buf},#8]",
+                    "adcs {sum}, {sum}, {tmp}",
+                    "ldr {tmp},[{buf},#16]",
+                    "adcs {sum}, {sum}, {tmp}",
+                    "ldr {tmp},[{buf},#24]",
+                    "adcs {sum}, {sum}, {tmp}",
+                    "ldr {tmp},[{buf},#32]",
+                    "adcs {sum}, {sum}, {tmp}",
+                    "adc {sum}, {sum}, {zero}",
+                    buf = in(reg) bytes.as_ptr(),
+                    sum = inout(reg) sum,
+                    tmp = out(reg) _,
+                    zero = in(reg) 0u64,
+                );
+            }
+        );
 
         sum
     }
@@ -111,16 +162,27 @@ pub fn partial(mut buf: &[u8], sum: u32) -> u32 {
             buf = &buf[80..];
         }
 
-        // SAFETY: asm
-        unsafe {
-            std::arch::asm!(
-                "addq {0}, {sum}",
-                "adcq $0, {sum}",
-                in(reg) sum2,
-                sum = inout(reg) sum,
-                options(att_syntax)
-            );
-        }
+        // Add all of the blocks together
+        impl_block!(
+            {
+                asm!(
+                    "addq {0}, {sum}",
+                    "adcq $0, {sum}",
+                    in(reg) sum2,
+                    sum = inout(reg) sum,
+                    options(att_syntax)
+                );
+            },
+            {
+                asm!(
+                    "adds {sum}, {sum}, {sum2}",
+                    "adc {sum}, {sum}, {zero}",
+                    sum2 = in(reg) sum2,
+                    sum = inout(reg) sum,
+                    zero = in(reg) 0u64,
+                );
+            }
+        );
     }
 
     if buf.len() >= 40 {
@@ -134,50 +196,94 @@ pub fn partial(mut buf: &[u8], sum: u32) -> u32 {
 
     let len = buf.len();
     if len & 32 != 0 {
-        // SAFETY: asm
-        unsafe {
-            std::arch::asm!(
-                "addq 0*8({buf}), {sum}",
-                "adcq 1*8({buf}), {sum}",
-                "adcq 2*8({buf}), {sum}",
-                "adcq 3*8({buf}), {sum}",
-                "adcq $0, {sum}",
-                buf = in(reg) buf.as_ptr(),
-                sum = inout(reg) sum,
-                options(att_syntax)
-            );
-        }
+        impl_block!(
+            {
+                asm!(
+                    "addq 0*8({buf}), {sum}",
+                    "adcq 1*8({buf}), {sum}",
+                    "adcq 2*8({buf}), {sum}",
+                    "adcq 3*8({buf}), {sum}",
+                    "adcq $0, {sum}",
+                    buf = in(reg) buf.as_ptr(),
+                    sum = inout(reg) sum,
+                    options(att_syntax)
+                );
+            },
+            {
+                asm!(
+                    "ldr {tmp},[{buf},#0]",
+                    "adds {sum}, {sum}, {tmp}",
+                    "ldr {tmp},[{buf},#8]",
+                    "adcs {sum}, {sum}, {tmp}",
+                    "ldr {tmp},[{buf},#16]",
+                    "adcs {sum}, {sum}, {tmp}",
+                    "ldr {tmp},[{buf},#24]",
+                    "adcs {sum}, {sum}, {tmp}",
+                    "adc {sum}, {sum}, {zero}",
+                    buf = in(reg) buf.as_ptr(),
+                    sum = inout(reg) sum,
+                    tmp = out(reg) _,
+                    zero = in(reg) 0u64,
+                );
+            }
+        );
 
         buf = &buf[32..];
     }
 
     if len & 16 != 0 {
-        // SAFETY: asm
-        unsafe {
-            std::arch::asm!(
-                "addq 0*8({buf}), {sum}",
-                "adcq 1*8({buf}), {sum}",
-                "adcq $0, {sum}",
-                buf = in(reg) buf.as_ptr(),
-                sum = inout(reg) sum,
-                options(att_syntax)
-            );
-        }
+        impl_block!(
+            {
+                asm!(
+                    "addq 0*8({buf}), {sum}",
+                    "adcq 1*8({buf}), {sum}",
+                    "adcq $0, {sum}",
+                    buf = in(reg) buf.as_ptr(),
+                    sum = inout(reg) sum,
+                    options(att_syntax)
+                );
+            },
+            {
+                asm!(
+                    "ldr {tmp},[{buf},#0]",
+                    "adds {sum}, {sum}, {tmp}",
+                    "ldr {tmp},[{buf},#8]",
+                    "adcs {sum}, {sum}, {tmp}",
+                    "adc {sum}, {sum}, {zero}",
+                    buf = in(reg) buf.as_ptr(),
+                    sum = inout(reg) sum,
+                    tmp = out(reg) _,
+                    zero = in(reg) 0u64,
+                );
+            }
+        );
 
         buf = &buf[16..];
     }
 
     if len & 8 != 0 {
-        // SAFETY: asm
-        unsafe {
-            std::arch::asm!(
-                "addq 0*8({buf}), {sum}",
-                "adcq $0, {sum}",
-                buf = in(reg) buf.as_ptr(),
-                sum = inout(reg) sum,
-                options(att_syntax)
-            );
-        }
+        impl_block!(
+            {
+                asm!(
+                    "addq 0*8({buf}), {sum}",
+                    "adcq $0, {sum}",
+                    buf = in(reg) buf.as_ptr(),
+                    sum = inout(reg) sum,
+                    options(att_syntax)
+                );
+            },
+            {
+                asm!(
+                    "ldr {tmp},[{buf},#0]",
+                    "adds {sum}, {sum}, {tmp}",
+                    "adc {sum}, {sum}, {zero}",
+                    buf = in(reg) buf.as_ptr(),
+                    sum = inout(reg) sum,
+                    tmp = out(reg) _,
+                    zero = in(reg) 0u64,
+                );
+            }
+        );
 
         buf = &buf[8..];
     }
@@ -187,32 +293,53 @@ pub fn partial(mut buf: &[u8], sum: u32) -> u32 {
         // of the whole u64
         let shift = ((-(len as i64) << 3) & 63) as u32;
 
-        // SAFETY: asm
-        unsafe {
-            // The kernel's load_unaligned_zeropad needs to take into account
-            // this load potentially crossing page boundaries, but we don't have
-            // that problem because Umem chunks can't be larger than a page, nor
-            // do we support unaligned chunks
-            let trail = {
-                let mut ual: u64;
-                std::arch::asm!(
-                    "movq 0*8({buf}), {ual}",
-                    buf = in(reg) buf.as_ptr(),
-                    ual = out(reg) ual,
+        // The kernel's load_unaligned_zeropad needs to take into account
+        // this load potentially crossing page boundaries, but we don't have
+        // that problem because UMEM chunks can't be larger than a page, nor
+        // do we support unaligned chunks
+        impl_block!(
+            {
+                let trail = {
+                    let mut ual: u64;
+                    asm!(
+                        "movq 0*8({buf}), {ual}",
+                        buf = in(reg) buf.as_ptr(),
+                        ual = out(reg) ual,
+                        options(att_syntax)
+                    );
+
+                    (ual << shift) >> shift
+                };
+
+                asm!(
+                    "addq {trail}, {sum}",
+                    "adcq $0, {sum}",
+                    trail = in(reg) trail,
+                    sum = inout(reg) sum,
                     options(att_syntax)
                 );
+            },
+            {
+                let trail = {
+                    let mut ual: u64;
+                    asm!(
+                        "ldr {ual},[{buf},#0]",
+                        buf = in(reg) buf.as_ptr(),
+                        ual = out(reg) ual,
+                    );
 
-                (ual << shift) >> shift
-            };
+                    (ual << shift) >> shift
+                };
 
-            std::arch::asm!(
-                "addq {trail}, {sum}",
-                "adcq $0, {sum}",
-                trail = in(reg) trail,
-                sum = inout(reg) sum,
-                options(att_syntax)
-            );
-        }
+                asm!(
+                    "adds {sum}, {sum}, {trail}",
+                    "adc {sum}, {sum}, {zero}",
+                    trail = in(reg) trail,
+                    sum = inout(reg) sum,
+                    zero = in(reg) 0u64,
+                );
+            }
+        );
     }
 
     finalize(sum)
@@ -353,24 +480,37 @@ impl super::Packet {
                 let udp_hdr = self.read::<UdpHdr>(offset)?;
 
                 // https://en.wikipedia.org/wiki/User_Datagram_Protocol#IPv4_pseudo_header
-                // SAFETY: asm
-                unsafe {
-                    let mut sum = 0;
+                let mut sum = 0;
+                impl_block!(
+                    {
+                        asm!(
+                            "addl {saddr:e}, {sum:e}",
+                            "adcl {daddr:e}, {sum:e}",
+                            "adcl {pseudo:e}, {sum:e}",
+                            "adcl $0, {sum:e}",
+                            saddr = in(reg) ipv4.source.0,
+                            daddr = in(reg) ipv4.destination.0,
+                            pseudo = in(reg) (udp_hdr.length.host() as u32 + IpProto::Udp as u32) << 8,
+                            sum = inout(reg) sum,
+                            options(att_syntax)
+                        );
+                    },
+                    {
+                        asm!(
+                            "adds {sum:w}, {sum:w}, {saddr:w}",
+                            "adcs {sum:w}, {sum:w}, {daddr:w}",
+                            "adcs {sum:w}, {sum:w}, {pseudo:w}",
+                            "adc {sum:w}, {sum:w}, {zero:w}",
+                            saddr = in(reg) ipv4.source.0,
+                            daddr = in(reg) ipv4.destination.0,
+                            pseudo = in(reg) (udp_hdr.length.host() as u32 + IpProto::Udp as u32) << 8,
+                            sum = inout(reg) sum,
+                            zero = in(reg) 0u32,
+                        );
+                    }
+                );
 
-                    std::arch::asm!(
-                        "addl {saddr:e}, {sum:e}",
-                        "adcl {daddr:e}, {sum:e}",
-                        "adcl {pseudo:e}, {sum:e}",
-                        "adcl $0, {sum:e}",
-                        saddr = in(reg) ipv4.source.0,
-                        daddr = in(reg) ipv4.destination.0,
-                        pseudo = in(reg) (udp_hdr.length.host() as u32 + IpProto::Udp as u32) << 8,
-                        sum = inout(reg) sum,
-                        options(att_syntax)
-                    );
-
-                    (sum, udp_hdr)
-                }
+                (sum, udp_hdr)
             }
             EtherType::Ipv6 => {
                 let ipv6 = self.read::<Ipv6Hdr>(offset)?;
@@ -383,25 +523,43 @@ impl super::Packet {
                 let udp_hdr = self.read::<UdpHdr>(offset)?;
 
                 // https://en.wikipedia.org/wiki/User_Datagram_Protocol#IPv6_pseudo_header
-                // SAFETY: asm
-                unsafe {
-                    let mut sum = ((udp_hdr.length.host() as u32).to_be() as u64)
-                        .wrapping_add((IpProto::Udp as u64).to_be());
+                let mut sum = ((udp_hdr.length.host() as u32).to_be() as u64)
+                    .wrapping_add((IpProto::Udp as u64).to_be());
+                impl_block!(
+                    {
+                        asm!(
+                            "addq 0*8({saddr}), {sum}",
+                            "adcq 1*8({saddr}), {sum}",
+                            "adcq 0*8({daddr}), {sum}",
+                            "adcq 1*8({daddr}), {sum}",
+                            "adcq $0, {sum}",
+                            saddr = in(reg) ipv6.source.as_ptr(),
+                            daddr = in(reg) ipv6.destination.as_ptr(),
+                            sum = inout(reg) sum,
+                            options(att_syntax)
+                        );
+                    },
+                    {
+                        asm!(
+                            "ldr {tmp},[{saddr},#0]",
+                            "adds {sum}, {sum}, {tmp}",
+                            "ldr {tmp},[{saddr},#8]",
+                            "adcs {sum}, {sum}, {tmp}",
+                            "ldr {tmp},[{daddr},#0]",
+                            "adcs {sum}, {sum}, {tmp}",
+                            "ldr {tmp},[{daddr},#8]",
+                            "adcs {sum}, {sum}, {tmp}",
+                            "adc {sum}, {sum}, {zero}",
+                            saddr = in(reg) ipv6.source.as_ptr(),
+                            daddr = in(reg) ipv6.destination.as_ptr(),
+                            sum = inout(reg) sum,
+                            tmp = out(reg) _,
+                            zero = in(reg) 0u64,
+                        );
+                    }
+                );
 
-                    std::arch::asm!(
-                        "addq 0*8({saddr}), {sum}",
-                        "adcq 1*8({saddr}), {sum}",
-                        "adcq 0*8({daddr}), {sum}",
-                        "adcq 1*8({daddr}), {sum}",
-                        "adcq $0, {sum}",
-                        saddr = in(reg) ipv6.source.as_ptr(),
-                        daddr = in(reg) ipv6.destination.as_ptr(),
-                        sum = inout(reg) sum,
-                        options(att_syntax)
-                    );
-
-                    (finalize(sum), udp_hdr)
-                }
+                (finalize(sum), udp_hdr)
             }
             invalid => return Err(UdpCalcError::NotIp(invalid)),
         };
@@ -462,56 +620,109 @@ impl nt::UdpHeaders {
         match &self.ip {
             nt::IpHdr::V4(v4) => {
                 // https://en.wikipedia.org/wiki/User_Datagram_Protocol#IPv4_pseudo_header
-                // SAFETY: asm
-                unsafe {
-                    std::arch::asm!(
-                        "addq {pseudo_udp}, {sum}",
-                        "adcq {saddr}, {sum}",
-                        "adcq {daddr}, {sum}",
-                        "adcq 0*8({udp}), {sum}",
-                        "adcq $0, {sum}",
-                        pseudo_udp = in(reg) ((data_len + nt::IpProto::Udp as usize) as u64).to_be(),
-                        saddr = in(reg) (v4.source.host() as u64).to_be(),
-                        daddr = in(reg) (v4.destination.host() as u64).to_be(),
-                        udp = in(reg) &nt::UdpHdr {
-                            source: self.udp.source,
-                            destination: self.udp.destination,
-                            length: (data_len as u16).into(),
-                            check: 0,
-                        },
-                        sum = inout(reg) sum,
-                        options(att_syntax)
-                    );
-                }
+                impl_block!(
+                    {
+                        asm!(
+                            "addq {pseudo_udp}, {sum}",
+                            "adcq {saddr}, {sum}",
+                            "adcq {daddr}, {sum}",
+                            "adcq 0*8({udp}), {sum}",
+                            "adcq $0, {sum}",
+                            pseudo_udp = in(reg) ((data_len + nt::IpProto::Udp as usize) as u64).to_be(),
+                            saddr = in(reg) (v4.source.host() as u64).to_be(),
+                            daddr = in(reg) (v4.destination.host() as u64).to_be(),
+                            udp = in(reg) &nt::UdpHdr {
+                                source: self.udp.source,
+                                destination: self.udp.destination,
+                                length: (data_len as u16).into(),
+                                check: 0,
+                            },
+                            sum = inout(reg) sum,
+                            options(att_syntax)
+                        );
+                    },
+                    {
+                        asm!(
+                            "adds {sum}, {sum}, {pseudo_udp}",
+                            "adcs {sum}, {sum}, {saddr}",
+                            "adcs {sum}, {sum}, {daddr}",
+                            "ldr {tmp},[{udp},#0]",
+                            "adcs {sum}, {sum}, {tmp}",
+                            "adc {sum}, {sum}, {zero}",
+                            pseudo_udp = in(reg) ((data_len + nt::IpProto::Udp as usize) as u64).to_be(),
+                            saddr = in(reg) (v4.source.host() as u64).to_be(),
+                            daddr = in(reg) (v4.destination.host() as u64).to_be(),
+                            udp = in(reg) &nt::UdpHdr {
+                                source: self.udp.source,
+                                destination: self.udp.destination,
+                                length: (data_len as u16).into(),
+                                check: 0,
+                            },
+                            sum = inout(reg) sum,
+                            tmp = out(reg) _,
+                            zero = in(reg) 0u64,
+                        );
+                    }
+                );
             }
             nt::IpHdr::V6(v6) => {
                 // https://en.wikipedia.org/wiki/User_Datagram_Protocol#IPv6_pseudo_header
-                // SAFETY: asm
-                unsafe {
-                    let source = v6.source;
-                    let destination = v6.destination;
 
-                    std::arch::asm!(
-                        "addq {pseudo_udp}, {sum}",
-                        "adcq 0*8({saddr}), {sum}",
-                        "adcq 1*8({saddr}), {sum}",
-                        "adcq 0*8({daddr}), {sum}",
-                        "adcq 1*8({daddr}), {sum}",
-                        "adcq 0*8({udp}), {sum}",
-                        "adcq $0, {sum}",
-                        pseudo_udp = in(reg) ((data_len + nt::IpProto::Udp as usize) as u64).to_be(),
-                        saddr = in(reg) source.as_ptr(),
-                        daddr = in(reg) destination.as_ptr(),
-                        udp = in(reg) &nt::UdpHdr {
-                            source: self.udp.source,
-                            destination: self.udp.destination,
-                            length: (data_len as u16).into(),
-                            check: 0,
-                        },
-                        sum = inout(reg) sum,
-                        options(att_syntax)
-                    );
-                }
+                let source = v6.source;
+                let destination = v6.destination;
+
+                impl_block!(
+                    {
+                        asm!(
+                            "addq {pseudo_udp}, {sum}",
+                            "adcq 0*8({saddr}), {sum}",
+                            "adcq 1*8({saddr}), {sum}",
+                            "adcq 0*8({daddr}), {sum}",
+                            "adcq 1*8({daddr}), {sum}",
+                            "adcq 0*8({udp}), {sum}",
+                            "adcq $0, {sum}",
+                            pseudo_udp = in(reg) ((data_len + nt::IpProto::Udp as usize) as u64).to_be(),
+                            saddr = in(reg) source.as_ptr(),
+                            daddr = in(reg) destination.as_ptr(),
+                            udp = in(reg) &nt::UdpHdr {
+                                source: self.udp.source,
+                                destination: self.udp.destination,
+                                length: (data_len as u16).into(),
+                                check: 0,
+                            },
+                            sum = inout(reg) sum,
+                            options(att_syntax)
+                        );
+                    },
+                    {
+                        asm!(
+                            "adds {sum}, {sum}, {pseudo_udp}",
+                            "ldr {tmp},[{saddr},#0]",
+                            "adcs {sum}, {sum}, {tmp}",
+                            "ldr {tmp},[{saddr},#8]",
+                            "adcs {sum}, {sum}, {tmp}",
+                            "ldr {tmp},[{daddr},#0]",
+                            "adcs {sum}, {sum}, {tmp}",
+                            "ldr {tmp},[{daddr},#8]",
+                            "adcs {sum}, {sum}, {tmp}",
+                            "ldr {tmp},[{udp},#0]",
+                            "adcs {sum}, {sum}, {tmp}",
+                            "adc {sum}, {sum}, {zero}",
+                            pseudo_udp = in(reg) ((data_len + nt::IpProto::Udp as usize) as u64).to_be(),
+                            saddr = in(reg) source.as_ptr(),
+                            daddr = in(reg) destination.as_ptr(),
+                            udp = in(reg) &nt::UdpHdr {
+                                source: self.udp.source,
+                                destination: self.udp.destination,
+                                length: (data_len as u16).into(),
+                                check: 0,
+                            },
+                            sum = inout(reg) sum,
+                            tmp = out(reg) _,
+                            zero = in(reg) 0u64,
+                        );
+                    }
+                );
             }
         }
 
