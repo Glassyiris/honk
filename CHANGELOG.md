@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
+## [0.7.3] - 2026-02-25
 ### Added
 - [PR#38](https://codeberg.org/ca1ne/xdp/pulls/38) added checksum calculation support for `aarch64`, resolving [#5](https://codeberg.org/ca1ne/xdp/issues/5).
 
@@ -105,7 +106,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Initial crate squat
 
 <!-- next-url -->
-[Unreleased]: https://codeberg.org/ca1ne/xdp/compare/0.7.2...HEAD
+[Unreleased]: https://codeberg.org/ca1ne/xdp/compare/0.7.3...HEAD
+[0.7.3]: https://codeberg.org/ca1ne/xdp/compare/0.7.2...0.7.3
 [0.7.2]: https://codeberg.org/ca1ne/xdp/compare/0.7.1...0.7.2
 [0.7.1]: https://codeberg.org/ca1ne/xdp/compare/0.7.0...0.7.1
 [0.7.0]: https://codeberg.org/ca1ne/xdp/compare/0.6.0...0.7.0
