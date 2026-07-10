@@ -509,10 +509,10 @@ impl NicIndex {
                         continue;
                     }
 
-                    if entry.d_name[..2] == [b'r', b'x'] {
+                    if entry.d_name[..2] == *b"rx" {
                         channels.max_rx += 1;
                         channels.rx_count += 1;
-                    } else if entry.d_name[..2] == [b't', b'x'] {
+                    } else if entry.d_name[..2] == *b"tx" {
                         channels.max_tx += 1;
                         channels.tx_count += 1;
                     }
