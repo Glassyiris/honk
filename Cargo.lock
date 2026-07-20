@@ -1296,7 +1296,7 @@ dependencies = [
 
 [[package]]
 name = "honk-config"
-version = "0.1.0"
+version = "0.0.1-alpha"
 dependencies = [
  "anyhow",
  "base64",
@@ -1314,7 +1314,7 @@ dependencies = [
 
 [[package]]
 name = "honk-core"
-version = "0.1.0"
+version = "0.0.1-alpha"
 dependencies = [
  "aes-gcm",
  "aho-corasick",
@@ -1375,7 +1375,7 @@ dependencies = [
 
 [[package]]
 name = "honk-ebpf-common"
-version = "0.1.0"
+version = "0.0.1-alpha"
 dependencies = [
  "aya",
  "aya-ebpf",
@@ -1385,7 +1385,7 @@ dependencies = [
 
 [[package]]
 name = "honk-outbound"
-version = "0.1.0"
+version = "0.0.1-alpha"
 dependencies = [
  "aes-gcm",
  "anyhow",

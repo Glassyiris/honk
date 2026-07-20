@@ -1,0 +1,109 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: cargo test --all
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --all
+
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-gnu
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable (with target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Install Rust nightly (for the eBPF object)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libbpf-dev pkg-config musl-tools
+
+      - name: Install bpf-linker
+        run: cargo install bpf-linker
+
+      - name: Point eBPF .cargo/config at the installed bpf-linker
+        run: |
+          sed -i 's|linker=/root/.cargo/bin/bpf-linker-wrapper|linker=bpf-linker|' \
+            crates/honk-ebpf/.cargo/config.toml
+
+      # The eBPF object is target-independent; build it once on the host so
+      # cross builds just pick it up (build.rs locates it when present).
+      - name: Build eBPF object
+        run: |
+          cd crates/honk-ebpf
+          cargo +nightly build --release -Zbuild-std=core --target bpfel-unknown-none
+
+      - name: Install cross (non-native targets)
+        if: matrix.target != 'x86_64-unknown-linux-gnu'
+        run: cargo install cross --locked
+
+      - name: Build honk-core (native gnu)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo build --release -p honk-core --features ebpf --target ${{ matrix.target }}
+
+      - name: Build honk-core (cross)
+        if: matrix.target != 'x86_64-unknown-linux-gnu'
+        run: cross build --release -p honk-core --features ebpf --target ${{ matrix.target }}
+
+      - name: Package artifact
+        run: |
+          name="honk-core-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/honk-core" "dist/$name/"
+          cp LICENSE README.md "dist/$name/"
+          tar -czf "$name.tar.gz" -C dist "$name"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: honk-core-${{ matrix.target }}
+          path: honk-core-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          retention-days: 1
+
+  release:
+    name: GitHub Release
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz
+          prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
+          generate_release_notes: true

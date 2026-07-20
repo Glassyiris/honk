@@ -12,6 +12,8 @@
 
 It is **not** a line-for-line port of either project. The kernel path follows dae’s TC + match_set + `dae0`/`daens` model; the userspace outbound/control stack follows sing-box-oriented designs.
 
+> **Status: experimental (`v0.0.1.alpha`).** honk is an early alpha release — expect breaking changes, incomplete features (see TODO), and limited real-world validation. Not recommended for production use.
+
 License: **GPL-3.0-only**.
 
 ### Documentation
