@@ -43,7 +43,7 @@ honk 沿用 dae 的内核模型，但并非移植。主要不同点：
 **eBPF 数据面**
 
 - 工具链：Rust [aya](https://github.com/aya-rs/aya)（内核侧 `aya-ebpf`），而非 Go `cilium/ebpf`。
-- LAN 投递增加了 `iptables` `TPROXY` 一级：TC 程序只给代理流量打标，装在 `lan_interface` **网桥主设备**上的 TPROXY 规则负责把报文重定向到本地监听 socket，而非 dae 的纯 tc/`dae0` 重定向路径。
+- LAN/WAN 投递与 dae 同构，并非重写：TC 程序给代理流量打标并重定向进 `dae0` veth，随后 `daens` 命名空间内的 `sk_lookup` + `bpf_sk_assign` 把报文交给透明监听 socket。与 Go dae 一样，**不安装任何全局 `iptables` `TPROXY` 规则**。
 - 内核侧按出站统计：TC 程序维护 per-CPU `OUTBOUND_STATS` 数组（每出站的 tx/rx 包数/字节数）；dae 的内核路径没有按出站的计数器。
 - Conntrack 溢出通过 `EVENT_RINGBUF` 上报到用户态并记日志，而非仅在内核计数。
 

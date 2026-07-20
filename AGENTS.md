@@ -6,7 +6,7 @@ This file is written for AI coding agents that need to understand, build, test, 
 
 `honk` is a Rust reimplementation of [dae](https://github.com/daeuniverse/dae), the eBPF-based Linux transparent proxy. The goal is to provide:
 
-- An eBPF transparent proxy engine (`honk-core`) that intercepts traffic with `iptables` `TPROXY`, classifies it in eBPF, and relays it through proxy handlers in userspace.
+- An eBPF transparent proxy engine (`honk-core`) that intercepts traffic with eBPF TC redirect (no global `iptables` rules), classifies it in eBPF, and relays it through proxy handlers in userspace.
 - Shared configuration types and parsers (`honk-config`) that parse the original dae `{ section { ... } }` configuration syntax.
 
 (The `honk-server` GraphQL API and `honk-web` Leptos dashboard crates were removed from the repository; the project now ships the proxy engine only.)
@@ -127,7 +127,7 @@ Proxy handlers, groups, and health checks live in `honk-outbound` (above), not i
 
 Runtime flow (high level):
 
-1. The eBPF LAN ingress program classifies each new TCP SYN / UDP datagram and marks proxy-bound flows with `tproxy_mark`. `iptables` `TPROXY` rules installed on the *bridge master* of `lan_interface` (e.g. `podman0` when `lan_interface: veth2`) redirect those marked packets to the local listener on `127.0.0.1:<tproxy_port>`. The rule is on the bridge device because the Linux bridge forwards packets from the slave interface to the bridge before L3/iptables processing; placing it there also ensures subsequent packets of a flow (ACKs, etc.) reach the transparent socket even though eBPF only marks the first SYN.
+1. The eBPF LAN ingress program classifies each new TCP SYN / UDP datagram, marks proxy-bound flows with `tproxy_mark`, and tc-redirects them into the `dae0` veth. Inside the `daens` netns, policy routing plus the `sk_lookup` program and the `dae0peer` TC ingress program (`bpf_sk_assign`) deliver them to the transparent (TPROXY) listener sockets bound there, preserving the original destination. Like Go dae, **no global `iptables` TPROXY/PREROUTING rules are installed**.
 2. `honk-core` binds to that port and reads the original destination (`SO_ORIGINAL_DST` / `IP_ORIGINAL_DSTADDR`).
 3. It looks up an eBPF routing handoff entry; if absent it falls back to the userspace `Router`.
 4. It sniffs TLS SNI / HTTP Host to obtain a domain for domain-based rules.
@@ -282,7 +282,7 @@ Default runtime paths:
 
 ### Native
 
-Run `honk-core` as root (it needs eBPF, `iptables`, and network namespaces). The engine is self-contained: it reads a single config file (`--config`, default `/etc/honk/config.dae`), embeds the eBPF object, and optionally exposes the Clash-compatible API via `[experimental.clash_api]`.
+Run `honk-core` as root (it needs eBPF, network namespaces, and transparent TPROXY sockets). The engine is self-contained: it reads a single config file (`--config`, default `/etc/honk/config.dae`), embeds the eBPF object, and optionally exposes the Clash-compatible API via `[experimental.clash_api]`.
 
 ### Gateway / VyOS
 
@@ -311,15 +311,15 @@ docker run -d \
 
 ## Security considerations
 
-- **Root/privileged execution:** `honk-core` must run as root to load eBPF programs, modify `iptables`, create `dae0` veth pairs, and bind `TPROXY` sockets. The Docker deployment uses `--privileged`, `--network=host`, and `--pid=host`.
+- **Root/privileged execution:** `honk-core` must run as root to load eBPF programs, create `dae0` veth pairs / netns, and bind `TPROXY` sockets. The Docker deployment uses `--privileged`, `--network=host`, and `--pid=host`.
 - **Clash API secret:** when `[experimental.clash_api]` is enabled, set a strong `secret`; the REST/WS API has no TLS of its own — front it with a reverse proxy if exposed beyond localhost.
-- **Config trust:** `honk-core` runs `iptables`, `ip`, and loads a BPF object from paths supplied by configuration. Treat config files and the BPF object as privileged input.
+- **Config trust:** `honk-core` runs `ip` and loads a BPF object from paths supplied by configuration. Treat config files and the BPF object as privileged input.
 
 ## Notes for agents
 
 - Always check whether a file is in `crates/honk-config`, `crates/honk-ebpf-common`, `crates/honk-outbound`, `crates/honk-core`, or one of the reference checkouts (`honk/`, `outbound/`, `sing-box/`) before assuming a command context.
 - When modifying eBPF map types or constants, update both `honk-ebpf-common` and the eBPF program in `crates/honk-ebpf`; struct layouts must stay in sync.
-- `honk-core` installs its `iptables` `TPROXY` rules on the bridge master of `global.lan_interface`. If `lan_interface` is a bridge slave (typical for container veth pairs), set `LAN_IFACE=<slave>` when running `scripts/cleanup-honk.sh` so it removes the correct rules.
+- LAN delivery follows Go dae (tc redirect to `dae0` + `sk_lookup`/`bpf_sk_assign` in `daens`); no `iptables` TPROXY rules are installed, so cleanup only needs to remove `dae0`/`daens`, policy routes, and BPF pins.
 - The userspace relay has two paths: connections where both ends are plain `TcpStream`s (direct dial) relay zero-copy via `splice(2)` (`relay::splice::relay_splice`, bidirectional with half-close propagation); TLS/protocol-wrapped streams use `tokio::io::copy_bidirectional` (`relay::splice::relay_auto` → `relay_tcp`). If the kernel rejects `splice(2)` (EINVAL/ENOSYS/EXDEV on the first probe, before any byte is moved) the connection falls back to copy and a process-wide flag latches so later connections skip probing. Do not bypass the probe/fallback logic; the old unidirectional splice path caused timeouts and must not return.
 - If you add or remove workspace crates, update this file and the root `Cargo.toml` `[workspace] members` list accordingly.
 - `plan.md` collects unfinished design work (e.g. the health-check/node-selection redesign inspired by sing-box URLTest/Selector). Consult it before reimplementing those subsystems.

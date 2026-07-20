@@ -45,7 +45,7 @@ honk follows dae's kernel model but is not a port. The notable deltas:
 **eBPF datapath**
 
 - Toolchain: Rust [aya](https://github.com/aya-rs/aya) (`aya-ebpf` kernel side) instead of Go `cilium/ebpf`.
-- LAN delivery adds an `iptables` `TPROXY` stage: the TC programs only mark proxy-bound flows, and TPROXY rules installed on the **bridge master** of `lan_interface` redirect them to the local listener, instead of dae's pure tc/`dae0` redirect path.
+- LAN/WAN delivery is dae-parity, not a rewrite: the TC programs mark proxy-bound flows and redirect them into the `dae0` veth, then `sk_lookup` + `bpf_sk_assign` inside the `daens` netns hand them to the transparent listener sockets. Like Go dae, **no global `iptables` `TPROXY` rules are installed**.
 - Kernel-side per-outbound accounting: a per-CPU `OUTBOUND_STATS` array (tx/rx packets/bytes per outbound) maintained by the TC programs; dae keeps no per-outbound counters in the kernel path.
 - Conntrack overflow is surfaced to userspace via an `EVENT_RINGBUF` and logged, instead of only being counted in-kernel.
 
