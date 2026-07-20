@@ -1,0 +1,18 @@
+[package]
+name = "honk-ebpf-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# This crate is shared between user-space (honk-core) and eBPF (honk-ebpf).
+# It contains types, constants, and map definitions used by both sides.
+# Both sides must agree on struct layouts and map keys.
+
+[dependencies]
+aya-ebpf-bindings.workspace = true
+aya-ebpf.workspace = true
+network-types.workspace = true
+
+# aya is userspace-only; exclude it from BPF target builds.
+[target.'cfg(not(target_arch = "bpf"))'.dependencies]
+aya.workspace = true

@@ -1,0 +1,112 @@
+[package]
+name = "honk-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "honk_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "honk-core"
+path = "src/main.rs"
+
+[dependencies]
+honk-config.workspace = true
+honk-ebpf-common.workspace = true
+honk-outbound.workspace = true
+
+# eBPF (optional, enabled by default on Linux)
+aya = { workspace = true, optional = true }
+aya-obj = { workspace = true, optional = true }
+aya-log = { workspace = true, optional = true }
+
+# Async runtime
+tokio.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+
+# Logging
+tracing.workspace = true
+tracing-subscriber.workspace = true
+log.workspace = true
+
+# Error handling
+thiserror.workspace = true
+anyhow.workspace = true
+
+# CLI
+clap.workspace = true
+
+# Config
+toml.workspace = true
+
+# Networking
+reqwest.workspace = true
+socket2.workspace = true
+bytes.workspace = true
+pin-project-lite.workspace = true
+
+# Encoding
+base64.workspace = true
+percent-encoding.workspace = true
+aho-corasick.workspace = true
+
+# DNS
+hickory-resolver.workspace = true
+
+# Persistence (cache_file / cachedb)
+rusqlite.workspace = true
+
+# Misc
+chrono.workspace = true
+uuid.workspace = true
+regex.workspace = true
+url.workspace = true
+ipnet.workspace = true
+rand.workspace = true
+lru.workspace = true
+libc.workspace = true
+parking_lot.workspace = true
+dashmap.workspace = true
+libsystemd.workspace = true
+nix.workspace = true
+sha2.workspace = true
+tokio-rustls.workspace = true
+rustls-pemfile.workspace = true
+webpki-roots.workspace = true
+aes-gcm.workspace = true
+chacha20poly1305.workspace = true
+hkdf.workspace = true
+sha1.workspace = true
+md-5.workspace = true
+
+# Debug HTTP API / Clash API (both need axum; clash-api also needs ws)
+axum = { workspace = true, optional = true, features = ["ws"] }
+tower-http = { workspace = true, optional = true }
+
+# External UI auto-download (clash-api)
+zip.workspace = true
+
+[features]
+default = ["clash-api"]
+# Enable real eBPF support (requires Linux kernel 5.8+)
+ebpf = ["aya", "aya-obj", "aya-log"]
+# Enable the Clash-compatible REST API (experimental.clash_api)
+clash-api = ["dep:axum", "dep:tower-http"]
+
+[build-dependencies]
+anyhow.workspace = true
+
+[dev-dependencies]
+# Test utilities
+tempfile.workspace = true
+tokio-test.workspace = true
+tokio-tungstenite.workspace = true

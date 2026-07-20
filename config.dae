@@ -1,0 +1,193 @@
+global {
+    wan_interface: bond0 # 使用 "auto" 自动侦测 WAN 接口。
+    lan_interface: podman0
+    log_level: info
+    dial_mode: domain++
+    allow_insecure: false
+    auto_config_kernel_parameter: true
+    tcp_check_url: 'http://cp.cloudflare.com,1.1.1.1,2606:4700:4700::1111'
+    tcp_check_http_method: HEAD
+    udp_check_dns: 'dns.google.com:53,8.8.8.8,2001:4860:4860::8888'
+    check_interval: 300s
+    bootstrap_resolver: '1.1.1.1:53'
+
+    # Group will switch node only when new_latency <= old_latency - tolerance.
+    check_tolerance: 30ms
+}
+
+# 代理节点链
+node {
+    iris: 'socks5://10.10.10.1:2077'
+}
+
+subscription {
+    sub: 'http://sub'
+}
+
+# 对于中国大陆域名使用 alidns，其他使用 googledns 查询。
+dns {
+    ipversion_prefer: 4
+    upstream {
+        homedns: 'udp+tcp://10.10.10.1:53'
+    }
+    routing {
+        # 根据 DNS 查询，决定使用哪个 DNS 上游。
+        # 按由上到下的顺序匹配。
+        request {
+            fallback: homedns
+        }
+    }
+}
+
+# 代理组
+group {
+    # 固定节点
+    iris {
+        filter: name('iris')
+        policy: fixed(0)
+    }
+
+    # 按地区自动选择最低延迟节点
+    hk {
+        filter: name(keyword: '🇭🇰')
+        policy: min_moving_avg
+        final: iris
+    }
+    jp {
+        filter: name(keyword: '🇯🇵')
+        filter: name('tokyo')
+        policy: min_moving_avg
+        final: iris
+    }
+    kr {
+        filter: name(keyword: '🇰🇷')
+        policy: min_moving_avg
+        final: iris
+    }
+    tw {
+        filter: name(keyword: '🇹🇼')
+        policy: min_moving_avg
+        final: iris
+    }
+    sgp {
+        filter: name(keyword: '🇸🇬')
+        policy: min_moving_avg
+        final: iris
+    }
+    us {
+        filter: name(keyword: '🇺🇸')
+        policy: min_moving_avg
+        final: iris
+    }
+
+    # 通用代理（无地区过滤，用于未匹配到具体地区的流量）
+    omg {
+        policy: min_moving_avg
+        final: iris
+    }
+}
+
+# 路由规则
+# 参考: https://github.com/daeuniverse/dae/blob/main/docs/routing.md
+routing {
+    # ============================================================
+    # must_direct: DNS 服务、代理客户端、系统服务
+    # ============================================================
+    pname(dnsmasq, systemd-resolved) && l4proto(udp) && dport(53) -> direct(must)
+    pname(AdGuardHome) -> direct(must)
+    pname(mosdns) -> direct(must)
+    pname(NetworkManager) -> direct(must)
+    pname(systemd-networkd) -> direct(must)
+    pname(systemd-resolved) -> direct(must)
+    pname(dhcpcd) -> direct
+
+    # BT 下载
+    dscp(4) -> direct(must)
+    pname(qbittorrent) -> direct(must)
+
+    # 代理客户端直连（防止回环）
+    pname(iris) -> direct(must)
+    pname(iris-meta) -> direct(must)
+    pname(sing-box) -> direct(must)
+    pname(mihomo) -> direct(must)
+    pname(frpc) -> direct(must)
+    pname(einat) -> direct(must)
+
+    # 虚拟化
+    pname(qemu-system-x86) -> direct(must)
+
+    # 包管理器
+    pname(pacman) -> direct
+
+    sip(10.10.10.24/32) -> direct
+
+    # ============================================================
+    # GeoIP 规则
+    # ============================================================
+    dip(geoip: private) -> direct(must)
+    dip(geoip: cn) -> direct(must)
+
+    # ============================================================
+    # 域名直连
+    # ============================================================
+    domain(geosite: private) -> direct
+    domain(geosite: apple-cn) -> direct
+    domain(suffix: apple.com.cn) -> direct
+    domain(geosite: geolocation-cn) -> direct
+    domain(geosite: category-games@cn) -> direct
+    domain(geosite: category-ai-cn) -> direct
+    domain(geosite: onedrive) -> direct
+    domain(geosite: steam@cn) -> direct
+    domain(keyword: m-team) -> direct
+
+    # ============================================================
+    # 域名代理
+    # ============================================================
+    # AI 服务
+    domain(geosite: category-ai-!cn) -> sgp
+
+    # 域名规则（优先级高于 geoip，先匹配域名再回退到 IP）
+    domain(geosite: netflix) -> sgp
+    domain(geosite: category-media, geosite: youtube) -> sgp
+    domain(geosite: bahamut) -> hk
+    domain(geosite: pixiv) -> hk
+    domain(geosite: nintendo) -> hk
+    domain(keyword: paradox) -> hk
+    domain(keyword: wemod) -> hk
+    domain(geosite: category-games) -> hk
+    domain(geosite: google) -> hk
+    domain(geosite: category-dev) -> hk
+
+    # IP 级别路由（domain 规则优先于 IP 规则）
+    dip(geoip: jp) -> jp
+    dip(geoip: telegram) -> sgp
+    # dip(x.x.x.x) -> tw  # 特定 IP 走台湾
+
+    # Google
+    domain(geosite: google) -> hk
+
+    # ============================================================
+    # 通用端口代理（未命中具体规则时走 omg）
+    # ============================================================
+    dport(22, 80, 443, 8080, 6443, 9090) -> omg
+
+    # ============================================================
+    # fallback
+    # ============================================================
+    fallback: direct
+}
+
+experimental {
+    clash_api {
+        external_controller: '0.0.0.0:9090'
+        external_ui: 'yacd'
+        secret: ''
+        default_mode: 'Rule'
+    }
+    cache_file {
+        enabled: false
+        path: 'cache.db'
+        cache_id: ''
+        store_fakeip: false
+    }
+}

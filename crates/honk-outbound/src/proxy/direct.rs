@@ -1,0 +1,129 @@
+//! Bypass handler that connects directly without a proxy.
+
+use async_trait::async_trait;
+use honk_config::node::Node;
+use honk_config::types::NodeProtocol;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::net::TcpStream;
+use tracing::debug;
+
+use super::{ProxyHandler, ProxyStream, UdpProxySocket};
+
+pub struct DirectHandler;
+
+impl Default for DirectHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DirectHandler {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl ProxyHandler for DirectHandler {
+    fn protocol(&self) -> NodeProtocol {
+        // Direct isn't really a protocol, but we use it as one for the routing system
+        // We map it to HTTP since that's the closest "raw" protocol
+        NodeProtocol::HTTP
+    }
+
+    async fn dial(
+        &self,
+        _node: &Node,
+        target: SocketAddr,
+        _target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        debug!("Direct dial to {}", target);
+        let stream = crate::util::connect_marked_addr(
+            target,
+            Some(honk_ebpf_common::DAE_BYPASS_MARK),
+            connect_timeout,
+        )
+        .await?;
+        Ok(ProxyStream {
+            stream: Box::new(stream),
+            target_addr: target,
+            target_domain: None,
+        })
+    }
+
+    async fn dial_with_tcp(
+        &self,
+        _node: &Node,
+        target: SocketAddr,
+        _target_domain: Option<&str>,
+        tcp: TcpStream,
+        _connect_timeout: Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        debug!("Direct dial (pooled) to {}", target);
+        Ok(ProxyStream {
+            stream: Box::new(tcp),
+            target_addr: target,
+            target_domain: None,
+        })
+    }
+
+    async fn test_connectivity(&self, _node: &Node) -> bool {
+        // Direct always "works" - connectivity depends on the actual target
+        true
+    }
+
+    async fn dial_udp(
+        &self,
+        _node: &Node,
+        target: SocketAddr,
+        _target_domain: Option<&str>,
+        _connect_timeout: Duration,
+    ) -> anyhow::Result<UdpProxySocket> {
+        debug!("Direct UDP to {}", target);
+        // Bind to the correct address family so the source address matches.
+        let bind_addr: SocketAddr = if target.is_ipv4() {
+            "0.0.0.0:0".parse().expect("hardcoded IPv4 bind address")
+        } else {
+            "[::]:0".parse().expect("hardcoded IPv6 bind address")
+        };
+        let socket = crate::util::udp_marked_bind(bind_addr).await?;
+        Ok(UdpProxySocket {
+            socket: Arc::new(socket),
+            relay_addr: target,
+            target_addr: target,
+            target_domain: None,
+            _control: None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn test_direct_connect() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::AsyncWriteExt;
+                stream.write_all(b"hello").await.ok();
+            }
+        });
+
+        let handler = DirectHandler::new();
+        let node = Node::default();
+        let target: SocketAddr = addr;
+
+        let result = handler
+            .dial(&node, target, None, Duration::from_secs(3))
+            .await;
+        assert!(result.is_ok());
+    }
+}

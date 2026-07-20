@@ -1,0 +1,46 @@
+[package]
+name = "honk-outbound"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+honk-config.workspace = true
+honk-ebpf-common.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+rand.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+serde.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+hkdf.workspace = true
+tokio-rustls.workspace = true
+rustls-pemfile.workspace = true
+webpki-roots.workspace = true
+aes-gcm.workspace = true
+chacha20poly1305.workspace = true
+blake3.workspace = true
+bytes.workspace = true
+base64.workspace = true
+anyhow.workspace = true
+md-5.workspace = true
+socket2.workspace = true
+libc.workspace = true
+parking_lot.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+# QUIC transport (TUIC / Hysteria2 / Juicity outbounds)
+quinn.workspace = true
+# HTTP/2 framing for h2mux multiplexing
+h2.workspace = true
+http.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+tracing-subscriber.workspace = true

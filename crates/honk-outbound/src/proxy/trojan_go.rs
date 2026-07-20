@@ -1,0 +1,524 @@
+//! Trojan-Go proxy handler with mux support.
+//!
+//! Trojan-Go extends Trojan-GFW with connection multiplexing: a single
+//! TCP connection carries multiple logical streams identified by a
+//! 2-byte stream ID. The `CommandMux` byte (`0x7f`) replaces the
+//! standard `CMD_TCP`/`CMD_UDP` bytes.
+//!
+//! ## Protocol
+//!
+//! **Stream open** (first frame on a new stream):
+//! ```text
+//! SHA224(password) hex 56B | CRLF | 0x7f | stream_id(2B BE) | address | CRLF
+//! ```
+//!
+//! **Data frames** (after stream is open):
+//! ```text
+//! stream_id(2B BE) | length(2B BE) | payload(length)
+//! ```
+//!
+//! ## Architecture
+//!
+//! Each unique `host:port` pair gets a single reusable mux connection.
+//! Per-stream proxy data is bridged through internal channels:
+//!
+//! - A global demux task reads from the TCP connection and routes
+//!   incoming frames to the correct per-stream channel.
+//! - A per-stream bridge task reads from the stream's write channel
+//!   and writes framed data to the shared TCP connection.
+//!
+//! Reference: <https://p4gefau1t.github.io/trojan-go/developer/protocol/>
+
+use async_trait::async_trait;
+use honk_config::node::Node;
+use honk_config::types::NodeProtocol;
+use sha2::{Digest, Sha224};
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::net::TcpStream;
+use tokio::sync::mpsc;
+use tokio_rustls::TlsConnector;
+use tokio_rustls::rustls::pki_types::ServerName;
+
+use super::{AsyncReadWrite, ProxyHandler, ProxyStream};
+
+const CRLF: &[u8] = b"\r\n";
+const CMD_MUX: u8 = 0x7f;
+const ATYP_IPV4: u8 = 0x01;
+const ATYP_DOMAIN: u8 = 0x03;
+const ATYP_IPV6: u8 = 0x04;
+
+/// Trojan-Go proxy handler with multiplexing.
+#[derive(Debug, Default)]
+pub struct TrojanGoHandler {
+    /// Connection pool: `host:port` → `MuxConnection`
+    pool: Mutex<HashMap<String, Arc<MuxConnection>>>,
+}
+
+impl TrojanGoHandler {
+    pub fn new() -> Self {
+        Self {
+            pool: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn build_tls_connector(node: &Node) -> anyhow::Result<TlsConnector> {
+        crate::tls::build_connector(node)
+    }
+
+    async fn connect_server(
+        node: &Node,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
+        let addr = format!("{}:{}", node.host(), node.port);
+        let stream = crate::util::connect_outbound(&addr, connect_timeout).await?;
+        let stream: Box<dyn AsyncReadWrite> = if node.tls {
+            let connector = Self::build_tls_connector(node)?;
+            let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
+            let server_name = ServerName::try_from(server_name)
+                .map_err(|e| anyhow::anyhow!("TrojanGo TLS: invalid SNI: {}", e))?;
+            Box::new(connector.connect(server_name, stream).await?)
+        } else {
+            Box::new(stream)
+        };
+        Ok(stream)
+    }
+
+    /// Get or create a mux connection for the given node.
+    async fn get_mux(
+        &self,
+        node: &Node,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<Arc<MuxConnection>> {
+        let host_key = format!("{}:{}", node.host(), node.port);
+        {
+            let pool = self.pool.lock().unwrap();
+            if let Some(mux) = pool.get(&host_key)
+                && !mux.is_closed()
+            {
+                return Ok(Arc::clone(mux));
+            }
+        }
+
+        let stream = Self::connect_server(node, connect_timeout).await?;
+        let mux = Arc::new(MuxConnection::new(host_key.clone(), stream));
+        mux.spawn_demux_task();
+        {
+            let mut pool = self.pool.lock().unwrap();
+            pool.insert(host_key, Arc::clone(&mux));
+        }
+        Ok(mux)
+    }
+}
+
+/// A single multiplexed connection to a Trojan-Go server.
+struct MuxConnection {
+    #[allow(dead_code)]
+    host_key: String,
+    conn: Arc<tokio::sync::Mutex<Box<dyn AsyncReadWrite>>>,
+    readers: Arc<Mutex<HashMap<u16, mpsc::UnboundedSender<Vec<u8>>>>>,
+    next_id: AtomicU16,
+    closed: AtomicBool,
+}
+
+impl std::fmt::Debug for MuxConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MuxConnection")
+            .field("host_key", &self.host_key)
+            .field("next_id", &self.next_id)
+            .field("closed", &self.closed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl MuxConnection {
+    fn new(host_key: String, conn: Box<dyn AsyncReadWrite>) -> Self {
+        Self {
+            host_key,
+            conn: Arc::new(tokio::sync::Mutex::new(conn)),
+            readers: Arc::new(Mutex::new(HashMap::new())),
+            next_id: AtomicU16::new(0),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    fn alloc_stream_id(&self) -> u16 {
+        loop {
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            if id != 0 {
+                return id;
+            }
+        }
+    }
+
+    /// Spawn a background task that reads from the TCP connection,
+    /// demuxes frames by stream_id, and routes payloads to the
+    /// appropriate per-stream channel.
+    fn spawn_demux_task(self: &Arc<Self>) {
+        let conn = Arc::clone(&self.conn);
+        let readers = Arc::clone(&self.readers);
+        let this = Arc::clone(self);
+
+        self.closed.store(false, Ordering::Release);
+
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65536];
+            let mut carry = Vec::new();
+            loop {
+                let mut conn_guard = conn.lock().await;
+                let n = match conn_guard.read(&mut buf).await {
+                    Ok(0) => {
+                        this.closed.store(true, Ordering::Release);
+                        break;
+                    }
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::debug!("TrojanGo mux read error: {}", e);
+                        this.closed.store(true, Ordering::Release);
+                        break;
+                    }
+                };
+                let read_data = &buf[..n];
+                drop(conn_guard);
+
+                let mut data = carry;
+                data.extend_from_slice(read_data);
+                carry = Vec::new();
+
+                let mut offset = 0;
+                while offset + 4 <= data.len() {
+                    let stream_id = u16::from_be_bytes([data[offset], data[offset + 1]]);
+                    let len = u16::from_be_bytes([data[offset + 2], data[offset + 3]]) as usize;
+                    offset += 4;
+
+                    if offset + len > data.len() {
+                        // Partial frame — carry over to next read
+                        carry = data[offset - 4..].to_vec();
+                        break;
+                    }
+                    let payload = data[offset..offset + len].to_vec();
+                    offset += len;
+
+                    let readers = readers.lock().unwrap();
+                    if let Some(tx) = readers.get(&stream_id) {
+                        let _ = tx.send(payload);
+                    }
+                }
+            }
+        });
+    }
+}
+
+#[async_trait]
+impl ProxyHandler for TrojanGoHandler {
+    fn protocol(&self) -> NodeProtocol {
+        NodeProtocol::TrojanGo
+    }
+
+    async fn dial(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        let password = node.password.as_deref().unwrap_or("");
+        let mux = self.get_mux(node, connect_timeout).await?;
+        let stream_id = mux.alloc_stream_id();
+
+        let header = build_mux_header(password, stream_id, target, target_domain);
+
+        let (read_tx, read_rx) = mpsc::unbounded_channel();
+
+        let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
+        {
+            let mut readers = mux.readers.lock().unwrap();
+            readers.insert(stream_id, read_tx);
+        }
+
+        {
+            let mut conn = mux.conn.lock().await;
+            conn.write_all(&header).await?;
+        }
+
+        let conn = Arc::clone(&mux.conn);
+        let sid = stream_id;
+        tokio::spawn(async move {
+            while let Some(payload) = write_rx.recv().await {
+                let mut frame = Vec::with_capacity(4 + payload.len());
+                frame.extend_from_slice(&sid.to_be_bytes());
+                frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+                frame.extend_from_slice(&payload);
+                let mut conn = conn.lock().await;
+                if conn.write_all(&frame).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let proxy_stream =
+            MuxProxyStream::new(stream_id, read_rx, write_tx, Arc::clone(&mux.readers));
+
+        Ok(ProxyStream {
+            stream: Box::new(proxy_stream),
+            target_addr: target,
+            target_domain: target_domain.map(|s| s.to_string()),
+        })
+    }
+
+    async fn dial_with_tcp(
+        &self,
+        _node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        _tcp: TcpStream,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        // dial_with_tcp with connection pooling isn't meaningful for
+        // TrojanGo since it already multiplexes. Delegate to dial.
+        self.dial(_node, target, target_domain, connect_timeout)
+            .await
+    }
+
+    async fn test_connectivity(&self, node: &Node) -> bool {
+        let addr = format!("{}:{}", node.host(), node.port);
+        match crate::util::connect_outbound(&addr, std::time::Duration::from_secs(3)).await {
+            Ok(_stream) => true,
+            Err(e) => {
+                tracing::debug!("TrojanGo connectivity test failed for {}: {}", node.name, e);
+                false
+            }
+        }
+    }
+}
+
+/// Build the Trojan-Go mux request header.
+///
+/// Format: `hex_sha224(password) + CRLF + CMD_MUX + stream_id(2) + address + CRLF`
+fn build_mux_header(
+    password: &str,
+    stream_id: u16,
+    target: SocketAddr,
+    target_domain: Option<&str>,
+) -> Vec<u8> {
+    let hash = hex_sha224(password);
+    let addr = encode_address(target, target_domain);
+    let mut header = Vec::with_capacity(56 + 2 + 1 + 2 + addr.len() + 2);
+    header.extend_from_slice(hash.as_bytes());
+    header.extend_from_slice(CRLF);
+    header.push(CMD_MUX);
+    header.extend_from_slice(&stream_id.to_be_bytes());
+    header.extend_from_slice(&addr);
+    header.extend_from_slice(CRLF);
+    header
+}
+
+fn encode_address(target: SocketAddr, target_domain: Option<&str>) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(19);
+    if let Some(domain) = target_domain {
+        buf.push(ATYP_DOMAIN);
+        buf.push(domain.len().min(u8::MAX as usize) as u8);
+        buf.extend_from_slice(domain.as_bytes());
+        buf.extend_from_slice(&target.port().to_be_bytes());
+    } else {
+        match target {
+            SocketAddr::V4(v4) => {
+                buf.push(ATYP_IPV4);
+                buf.extend_from_slice(&v4.ip().octets());
+                buf.extend_from_slice(&v4.port().to_be_bytes());
+            }
+            SocketAddr::V6(v6) => {
+                buf.push(ATYP_IPV6);
+                buf.extend_from_slice(&v6.ip().octets());
+                buf.extend_from_slice(&v6.port().to_be_bytes());
+            }
+        }
+    }
+    buf
+}
+
+struct MuxProxyStream {
+    stream_id: u16,
+    read_rx: Mutex<mpsc::UnboundedReceiver<Vec<u8>>>,
+    write_tx: mpsc::UnboundedSender<Vec<u8>>,
+    read_buf: Vec<u8>,
+    read_pos: usize,
+    readers: Arc<Mutex<HashMap<u16, mpsc::UnboundedSender<Vec<u8>>>>>,
+}
+
+impl std::fmt::Debug for MuxProxyStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MuxProxyStream")
+            .field("stream_id", &self.stream_id)
+            .field("read_buf_len", &self.read_buf.len())
+            .field("read_pos", &self.read_pos)
+            .finish_non_exhaustive()
+    }
+}
+
+impl MuxProxyStream {
+    fn new(
+        stream_id: u16,
+        read_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+        write_tx: mpsc::UnboundedSender<Vec<u8>>,
+        readers: Arc<Mutex<HashMap<u16, mpsc::UnboundedSender<Vec<u8>>>>>,
+    ) -> Self {
+        Self {
+            stream_id,
+            read_rx: Mutex::new(read_rx),
+            write_tx,
+            read_buf: Vec::new(),
+            read_pos: 0,
+            readers,
+        }
+    }
+}
+
+impl Drop for MuxProxyStream {
+    fn drop(&mut self) {
+        let mut readers = self.readers.lock().unwrap();
+        readers.remove(&self.stream_id);
+    }
+}
+
+impl AsyncRead for MuxProxyStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+
+        let available = this.read_buf.len() - this.read_pos;
+        if available > 0 {
+            let to_copy = available.min(buf.remaining());
+            buf.put_slice(&this.read_buf[this.read_pos..this.read_pos + to_copy]);
+            this.read_pos += to_copy;
+            if this.read_pos >= this.read_buf.len() {
+                this.read_buf.clear();
+                this.read_pos = 0;
+            }
+            return Poll::Ready(Ok(()));
+        }
+
+        let msg = {
+            let mut rx = this.read_rx.lock().unwrap();
+            match rx.poll_recv(cx) {
+                Poll::Ready(Some(msg)) => msg,
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Pending => return Poll::Pending,
+            }
+        };
+
+        this.read_buf = msg;
+        this.read_pos = 0;
+        let to_copy = this.read_buf.len().min(buf.remaining());
+        buf.put_slice(&this.read_buf[..to_copy]);
+        this.read_pos = to_copy;
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for MuxProxyStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.write_tx.send(buf.to_vec()) {
+            Ok(()) => Poll::Ready(Ok(buf.len())),
+            Err(_) => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "mux write channel closed",
+            ))),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+fn hex_sha224(password: &str) -> String {
+    let hash = Sha224::digest(password.as_bytes());
+    let mut out = String::with_capacity(hash.len() * 2);
+    for byte in hash {
+        out.push(hex_digit(byte >> 4));
+        out.push(hex_digit(byte & 0x0f));
+    }
+    out
+}
+
+fn hex_digit(n: u8) -> char {
+    match n {
+        0..=9 => (b'0' + n) as char,
+        10..=15 => (b'a' + (n - 10)) as char,
+        _ => unreachable!(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mux_header_basic() {
+        let password = "test";
+        let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
+        let stream_id = 42u16;
+
+        let header = build_mux_header(password, stream_id, target, None);
+        let expected_hash = hex_sha224(password);
+        assert_eq!(&header[..56], expected_hash.as_bytes());
+        assert_eq!(&header[56..58], CRLF);
+        assert_eq!(header[58], CMD_MUX);
+        assert_eq!(&header[59..61], &stream_id.to_be_bytes());
+        assert_eq!(header[61], ATYP_IPV4);
+        assert_eq!(&header[62..66], &[93, 184, 216, 34]);
+        assert_eq!(&header[66..68], &[0x00, 0x50]);
+        assert_eq!(&header[68..70], CRLF);
+    }
+
+    #[test]
+    fn test_mux_header_domain() {
+        let password = "pw";
+        let target: SocketAddr = "10.0.0.1:443".parse().unwrap();
+        let stream_id = 256u16;
+        let domain = "example.org";
+
+        let header = build_mux_header(password, stream_id, target, Some(domain));
+        let expected_hash = hex_sha224(password);
+        assert_eq!(&header[..56], expected_hash.as_bytes());
+        assert_eq!(&header[56..58], CRLF);
+        assert_eq!(header[58], CMD_MUX);
+        assert_eq!(&header[59..61], &stream_id.to_be_bytes());
+        assert_eq!(header[61], ATYP_DOMAIN);
+        assert_eq!(header[62], domain.len() as u8);
+        assert_eq!(&header[63..74], domain.as_bytes());
+        assert_eq!(&header[74..76], &[0x01, 0xbb]);
+    }
+
+    #[test]
+    fn test_stream_id_alloc_skips_zero() {
+        let conn = MuxConnection::new("test:443".into(), Box::new(tokio::io::duplex(1024).0));
+        let id = conn.alloc_stream_id();
+        assert_ne!(id, 0);
+        let id2 = conn.alloc_stream_id();
+        assert_ne!(id, id2);
+        assert_ne!(id2, 0);
+    }
+}

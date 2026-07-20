@@ -1,0 +1,102 @@
+# honk 示例配置（dae 语法）
+#
+# 说明文档：doc/configuration.zh.md（配置指南）、doc/components.zh.md（组件参考）
+# 最小示例见 config.min.dae；生产向完整示例见 config.dae。
+
+global {
+    # WAN 接口可填 auto 自动侦测；LAN 接口通常是网桥或其从接口。
+    wan_interface: auto
+    lan_interface: eth0
+
+    log_level: info
+    tproxy_port: 12345
+    # 拨号模式：ip / domain / domain+ / domain++
+    dial_mode: domain
+    allow_insecure: false
+    auto_config_kernel_parameter: true
+
+    # 健康检查：TCP 用 HTTP 探测，UDP 用 DNS 探测（经节点自身隧道）
+    tcp_check_url: 'http://cp.cloudflare.com,1.1.1.1,2606:4700:4700::1111'
+    tcp_check_http_method: HEAD
+    udp_check_dns: 'dns.google.com:53,8.8.8.8,2001:4860:4860::8888'
+    check_interval: 30s
+    # 新节点延迟 <= 旧节点延迟 - tolerance 才切换
+    check_tolerance: 50ms
+}
+
+# 订阅（可选）：节点只合并进内存，不回写本文件
+# subscription {
+#     mysub: 'https://example.com/subscription'
+# }
+
+# 节点：必须为「标签: '分享链接'」形式（不带标签的裸链接会被忽略）
+node {
+    home-socks5: 'socks5://user:pass@gw.example.com:1080'
+    ss-node: 'ss://YWVzLTEyOC1nY206cGFzc3dvcmQ=@ss.example.com:8388'
+    trojan-ws: 'trojan://secret@trojan.example.com:443?sni=trojan.example.com&type=ws&path=%2Fws&host=trojan.example.com'
+    hy2-node: 'hysteria2://secret@hy2.example.com:443?sni=hy2.example.com'
+}
+
+# 分组
+group {
+    # 固定使用组内第一个节点
+    manual {
+        filter: name('home-socks5')
+        policy: fixed(0)
+    }
+
+    # 按延迟自动选择；无存活节点时回退到 manual 组
+    auto {
+        filter: name(keyword: 'node')
+        policy: min_moving_avg
+        final: manual
+    }
+}
+
+dns {
+    ipversion_prefer: 4
+    upstream {
+        alidns: 'udp://223.5.5.5:53'
+        googledns: 'udp+tcp://8.8.8.8:53'
+    }
+    routing {
+        request {
+            # DNS 请求全部走 alidns（当前 dae 语法仅支持 fallback）
+            fallback: alidns
+        }
+    }
+}
+
+routing {
+    # 本机 DNS/系统服务直连，防止回环
+    pname(dnsmasq, systemd-resolved) && l4proto(udp) && dport(53) -> direct(must)
+    pname(sing-box, mihomo) -> direct(must)
+
+    # 私有与国内 IP 直连
+    dip(geoip: private) -> direct(must)
+    dip(geoip: cn) -> direct
+
+    # 域名规则（先于 IP 规则匹配）
+    domain(geosite: geolocation-cn) -> direct
+    domain(suffix: internal.example.com) -> direct
+    domain(geosite: google) -> auto
+
+    # 其余流量
+    fallback: manual
+}
+
+experimental {
+    clash_api {
+        external_controller: '127.0.0.1:9090'
+        external_ui: 'ui'
+        secret: ''
+        default_mode: 'Rule'
+    }
+    cache_file {
+        enabled: true
+        path: 'cache.db'
+        cache_id: ''
+        store_fakeip: false
+        store_dns: false
+    }
+}

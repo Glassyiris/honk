@@ -1,0 +1,128 @@
+
+[workspace]
+resolver = "2"
+members = [
+  "crates/honk-config",
+  "crates/honk-ebpf-common",
+  "crates/honk-outbound",
+  "crates/honk-core",
+]
+exclude = ["crates/honk-ebpf"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+repository = "https://github.com/Glassyiris/honk"
+authors = ["glassyiris <honk@catmint.cc> and honk contributors"]
+
+[workspace.dependencies]
+# Internal
+honk-config = { path = "crates/honk-config" }
+honk-ebpf-common = { path = "crates/honk-ebpf-common" }
+honk-outbound = { path = "crates/honk-outbound" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+futures-util = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+toml = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+log = "0.4"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# HTTP (clash-api in honk-core, h2mux in honk-outbound)
+axum = { version = "0.8", features = ["macros"] }
+tower-http = { version = "0.7", features = ["cors", "fs", "trace"] }
+reqwest = { version = "0.13", features = [
+  "json",
+  "rustls",
+], default-features = false }
+h2 = "0.4"
+http = "1"
+
+# eBPF / Aya
+aya = "0.14"
+aya-obj = "0.3"
+aya-log = "0.3"
+aya-ebpf = "0.2"
+aya-ebpf-bindings = "0.2"
+network-types = "0.2"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# TLS / crypto
+tokio-rustls = "0.26"
+rustls-pemfile = "2.2"
+webpki-roots = "1"
+aes-gcm = "0.11"
+chacha20poly1305 = "0.11"
+sha1 = "0.11"
+sha2 = "0.11"
+hmac = "0.13"
+hkdf = "0.13"
+md-5 = "0.11"
+blake3 = "1"
+
+# Networking
+socket2 = { version = "0.6", features = ["all"] }
+hickory-resolver = "0.26"
+quinn = "0.11"
+tokio-tungstenite = { version = "0.30", default-features = false, features = [
+  "connect",
+] }
+ipnet = "2"
+url = "2"
+percent-encoding = "2"
+aho-corasick = "1"
+
+# Persistence (cache_file / cachedb)
+rusqlite = { version = "0.40", features = ["bundled"] }
+
+# Misc
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+regex = "1"
+base64 = "0.22"
+bytes = "1"
+rand = "0.9"
+lru = "0.18"
+libc = "0.2"
+parking_lot = "0.12"
+dashmap = "6"
+libsystemd = "0.7"
+nix = { version = "0.31", features = ["time"] }
+pin-project-lite = "0.2"
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
+
+# Dev/test utilities
+tempfile = "3"
+tokio-test = "0.4"
+rcgen = "0.14"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+
+# Static musl build for portable deployment (VyOS/Debian/etc.)
+[profile.release-musl]
+inherits = "release"
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

@@ -1,0 +1,47 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Build artifacts
+dist/
+*.o
+*.so
+
+# eBPF
+*.o
+/sys/fs/bpf/
+crates/honk-ebpf/target/
+crates/honk-ebpf/log/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+log/
+
+# External/outbound repo (not a submodule)
+/outbound/
+
+# Local artifacts
+cache.db
+sing-box/
+
+honk/
+
+*.dat
+AGENT.*

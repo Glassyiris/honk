@@ -1,0 +1,285 @@
+//! Bootstrap DNS resolution for proxy-server hostnames.
+//!
+//! Node dials must not depend on the regular DNS path: the system resolver
+//! may itself be routed through honk (interception + DNS routing), so right
+//! after a restart — before any node is reachable — resolving a proxy
+//! server's domain can deadlock against the very nodes it is needed to
+//! reach. dae solves this with `bootstrap_resolver`: a plain, direct DNS
+//! server that honk queries itself on a bypass-marked socket.
+//!
+//! [`resolve`] checks the configured bootstrap resolver first and falls back
+//! to the system resolver on any failure, so behavior is unchanged when no
+//! `bootstrap_resolver` is configured.
+
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::RwLock;
+use std::time::Duration;
+
+/// A direct DNS server used to resolve proxy-server hostnames.
+#[derive(Debug, Clone, Copy)]
+pub struct BootstrapResolver {
+    server: SocketAddr,
+    use_tcp: bool,
+}
+
+impl BootstrapResolver {
+    /// Parse `8.8.8.8:53`, `udp://8.8.8.8:53` or `tcp://8.8.8.8:53`.
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        if s.is_empty() {
+            return None;
+        }
+        let (use_tcp, rest) = match s.split_once("://") {
+            Some((scheme, rest)) => (scheme.eq_ignore_ascii_case("tcp"), rest),
+            None => (false, s),
+        };
+        let server: SocketAddr = rest.parse().ok()?;
+        Some(Self { server, use_tcp })
+    }
+}
+
+static GLOBAL: RwLock<Option<BootstrapResolver>> = RwLock::new(None);
+
+/// Install (or clear) the process-wide bootstrap resolver. Called by
+/// honk-core at startup and on config reload.
+pub fn set_global(resolver: Option<BootstrapResolver>) {
+    *GLOBAL.write().unwrap() = resolver;
+}
+
+/// Resolve `host` to IP addresses, preferring the configured bootstrap
+/// resolver (direct, bypass-marked) and falling back to the system resolver.
+pub async fn resolve(host: &str) -> io::Result<Vec<IpAddr>> {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(vec![ip]);
+    }
+    let resolver = *GLOBAL.read().unwrap();
+    if let Some(resolver) = resolver {
+        match tokio::time::timeout(Duration::from_secs(3), resolver.query(host)).await {
+            Ok(Ok(ips)) if !ips.is_empty() => return Ok(ips),
+            Ok(Ok(_)) => {
+                tracing::debug!("bootstrap resolver returned no records for '{}'", host)
+            }
+            Ok(Err(e)) => {
+                tracing::debug!("bootstrap resolution of '{}' failed: {}", host, e)
+            }
+            Err(_) => {
+                tracing::debug!("bootstrap resolution of '{}' timed out", host)
+            }
+        }
+    }
+    let addrs: Vec<IpAddr> = tokio::net::lookup_host(format!("{}:0", host))
+        .await?
+        .map(|a| a.ip())
+        .collect();
+    Ok(addrs)
+}
+
+impl BootstrapResolver {
+    /// Query A and AAAA records for `host` directly from the configured
+    /// server over a bypass-marked socket.
+    async fn query(&self, host: &str) -> io::Result<Vec<IpAddr>> {
+        if self.use_tcp {
+            let ips_a = self.query_tcp(host, 1).await?;
+            let ips_aaaa = self.query_tcp(host, 28).await.unwrap_or_default();
+            Ok([ips_a, ips_aaaa].concat())
+        } else {
+            let ips_a = self.query_udp(host, 1).await?;
+            let ips_aaaa = self.query_udp(host, 28).await.unwrap_or_default();
+            Ok([ips_a, ips_aaaa].concat())
+        }
+    }
+
+    async fn query_udp(&self, host: &str, qtype: u16) -> io::Result<Vec<IpAddr>> {
+        let bind: SocketAddr = if self.server.is_ipv4() {
+            (Ipv4Addr::UNSPECIFIED, 0).into()
+        } else {
+            (Ipv6Addr::UNSPECIFIED, 0).into()
+        };
+        let socket = crate::util::udp_marked_bind(bind).await?;
+        socket.connect(self.server).await?;
+        socket.send(&build_query(host, qtype)).await?;
+        let mut buf = [0u8; 1500];
+        let n = socket.recv(&mut buf).await?;
+        parse_answers(&buf[..n], qtype)
+    }
+
+    async fn query_tcp(&self, host: &str, qtype: u16) -> io::Result<Vec<IpAddr>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream =
+            crate::util::connect_marked_addr(self.server, Some(honk_ebpf_common::DAE_BYPASS_MARK), Duration::from_secs(3))
+                .await?;
+        let query = build_query(host, qtype);
+        stream
+            .write_all(&(query.len() as u16).to_be_bytes())
+            .await?;
+        stream.write_all(&query).await?;
+        let mut len_buf = [0u8; 2];
+        stream.read_exact(&mut len_buf).await?;
+        let len = u16::from_be_bytes(len_buf) as usize;
+        let mut buf = vec![0u8; len];
+        stream.read_exact(&mut buf).await?;
+        parse_answers(&buf, qtype)
+    }
+}
+
+/// Build a minimal DNS query (RD set, single question).
+fn build_query(host: &str, qtype: u16) -> Vec<u8> {
+    let mut q = Vec::with_capacity(host.len() + 18);
+    q.extend_from_slice(&[0xda, 0xed]); // id
+    q.extend_from_slice(&0x0100u16.to_be_bytes()); // RD
+    q.extend_from_slice(&1u16.to_be_bytes()); // qdcount
+    q.extend_from_slice(&[0; 6]); // an/ns/ar = 0
+    for label in host.trim_end_matches('.').split('.') {
+        q.push(label.len() as u8);
+        q.extend_from_slice(label.as_bytes());
+    }
+    q.push(0);
+    q.extend_from_slice(&qtype.to_be_bytes());
+    q.extend_from_slice(&1u16.to_be_bytes()); // IN
+    q
+}
+
+/// Extract A/AAAA answer addresses from a DNS response.
+fn parse_answers(msg: &[u8], qtype: u16) -> io::Result<Vec<IpAddr>> {
+    if msg.len() < 12 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "short DNS message"));
+    }
+    let qd = u16::from_be_bytes([msg[4], msg[5]]) as usize;
+    let an = u16::from_be_bytes([msg[6], msg[7]]) as usize;
+    let mut pos = 12;
+    // Skip the question section.
+    for _ in 0..qd {
+        pos = skip_name(msg, pos)?;
+        pos = pos.checked_add(4).ok_or_else(bad)?; // qtype + qclass
+    }
+    let mut ips = Vec::new();
+    for _ in 0..an {
+        pos = skip_name(msg, pos)?;
+        if pos + 10 > msg.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated answer"));
+        }
+        let rtype = u16::from_be_bytes([msg[pos], msg[pos + 1]]);
+        let rdlen = u16::from_be_bytes([msg[pos + 8], msg[pos + 9]]) as usize;
+        pos += 10;
+        if pos + rdlen > msg.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated rdata"));
+        }
+        if rtype == qtype {
+            match (rtype, rdlen) {
+                (1, 4) => ips.push(IpAddr::V4(Ipv4Addr::new(
+                    msg[pos],
+                    msg[pos + 1],
+                    msg[pos + 2],
+                    msg[pos + 3],
+                ))),
+                (28, 16) => {
+                    let mut octets = [0u8; 16];
+                    octets.copy_from_slice(&msg[pos..pos + 16]);
+                    ips.push(IpAddr::V6(Ipv6Addr::from(octets)));
+                }
+                _ => {}
+            }
+        }
+        pos += rdlen;
+    }
+    Ok(ips)
+}
+
+fn bad() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "bad DNS message")
+}
+
+/// Skip a (possibly compressed) domain name, returning the offset after it.
+fn skip_name(msg: &[u8], mut pos: usize) -> io::Result<usize> {
+    loop {
+        let Some(&len) = msg.get(pos) else {
+            return Err(bad());
+        };
+        if len & 0xC0 == 0xC0 {
+            // Compression pointer: two bytes, done.
+            return Ok(pos + 2);
+        }
+        if len == 0 {
+            return Ok(pos + 1);
+        }
+        pos += 1 + len as usize;
+        if pos > msg.len() {
+            return Err(bad());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_resolver() {
+        let r = BootstrapResolver::parse("udp://8.8.8.8:53").unwrap();
+        assert_eq!(r.server, "8.8.8.8:53".parse().unwrap());
+        assert!(!r.use_tcp);
+        let r = BootstrapResolver::parse("tcp://1.1.1.1:53").unwrap();
+        assert!(r.use_tcp);
+        let r = BootstrapResolver::parse("9.9.9.9:53").unwrap();
+        assert!(!r.use_tcp);
+        assert!(BootstrapResolver::parse("").is_none());
+        assert!(BootstrapResolver::parse("not-an-addr").is_none());
+    }
+
+    #[test]
+    fn test_build_and_parse_roundtrip() {
+        // Hand-craft a response for the query: copy the question, set flags
+        // and append one A answer with a compression pointer.
+        let query = build_query("example.com", 1);
+        let mut resp = query.clone();
+        resp[2] = 0x81;
+        resp[3] = 0x80;
+        resp[6] = 0;
+        resp[7] = 1; // ancount = 1
+        resp.extend_from_slice(&[0xC0, 0x0C]); // name pointer
+        resp.extend_from_slice(&1u16.to_be_bytes()); // A
+        resp.extend_from_slice(&1u16.to_be_bytes()); // IN
+        resp.extend_from_slice(&60u32.to_be_bytes()); // TTL
+        resp.extend_from_slice(&4u16.to_be_bytes()); // rdlen
+        resp.extend_from_slice(&[93, 184, 216, 34]);
+        let ips = parse_answers(&resp, 1).unwrap();
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_literal_ip_skips_lookup() {
+        let ips = resolve("1.2.3.4").await.unwrap();
+        assert_eq!(ips, vec!["1.2.3.4".parse::<IpAddr>().unwrap()]);
+    }
+
+    /// End-to-end: a stub UDP DNS server on loopback answering A records,
+    /// installed as the global bootstrap resolver.
+    #[tokio::test]
+    async fn test_resolve_via_bootstrap_udp() {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, peer) = server.recv_from(&mut buf).await.unwrap();
+            let mut resp = buf[..n].to_vec();
+            resp[2] = 0x81;
+            resp[3] = 0x80;
+            resp[6] = 0;
+            resp[7] = 1;
+            resp.extend_from_slice(&[0xC0, 0x0C]);
+            resp.extend_from_slice(&1u16.to_be_bytes());
+            resp.extend_from_slice(&1u16.to_be_bytes());
+            resp.extend_from_slice(&60u32.to_be_bytes());
+            resp.extend_from_slice(&4u16.to_be_bytes());
+            resp.extend_from_slice(&[10, 9, 8, 7]);
+            server.send_to(&resp, peer).await.unwrap();
+        });
+
+        set_global(BootstrapResolver::parse(&format!("udp://{}", server_addr)));
+        let ips = resolve("node.example.com").await.unwrap();
+        set_global(None);
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(10, 9, 8, 7))]);
+    }
+}

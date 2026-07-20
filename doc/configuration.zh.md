@@ -1,0 +1,356 @@
+# honk 配置说明
+
+本文说明如何配置 **honk**：配置格式、顶层分段与常用示例。
+
+逐字段的组件级说明（节点/组/DNS/CLI 全表）见 [components.zh.md](./components.zh.md)。
+
+## 1. 配置格式
+
+honk 使用原始的 **dae 配置语法**（`{ section { ... } }`）作为配置格式，配置文件通常以 `.dae` 结尾。语法要点：
+
+- 顶层由若干 `section { ... }` 组成；`#` 为行注释。
+- 键值对写作 `key: value`；含特殊字符的值用单引号包裹（如 `tcp_check_url: 'http://cp.cloudflare.com,1.1.1.1'`）。
+- 列表值用逗号分隔写在同一行（如 `lan_interface: eth0, eth1`）。
+
+仓库内示例：
+
+- `config.dae`（完整功能示例）
+- `config.min.dae`（最小示例）
+
+## 2. 顶层结构
+
+```text
+global         # 透明代理、健康检查、拨号模式
+node           # 代理节点（分享链接）
+group          # 节点/嵌套组的选择策略
+routing        # 有序流量规则 + fallback
+dns            # 上游、DNS 路由、缓存
+subscription   # 远程节点列表
+experimental   # clash_api、cache_file
+```
+
+内置：
+
+- 出站 **`direct`** 在缺失时会自动注入（可用于组过滤与路由）。
+- 出站 **`block`** 丢弃流量。
+
+## 3. 最小示例
+
+```dae
+global {
+    wan_interface: auto
+    lan_interface: eth0
+    log_level: info
+    dial_mode: domain
+    auto_config_kernel_parameter: true
+    tcp_check_url: 'http://cp.cloudflare.com,1.1.1.1'
+    check_interval: 30s
+    check_tolerance: 50ms
+    bootstrap_resolver: '223.5.5.5:53'
+}
+
+node {
+    trojan-node: 'trojan://password@trojan.example.com:443?sni=trojan.example.com'
+}
+
+group {
+    proxy {
+        filter: name(keyword: 'node')
+        policy: min_moving_avg
+    }
+}
+
+routing {
+    dip(geoip: private) -> direct
+    domain(suffix: google.com, suffix: youtube.com) -> proxy
+    fallback: direct
+}
+```
+
+## 4. 完整示例
+
+```dae
+global {
+    tproxy_port: 12345
+    log_level: info
+    lan_interface: eth0
+    wan_interface: auto
+    auto_config_kernel_parameter: true
+    tcp_check_url: 'http://cp.cloudflare.com'
+    check_interval: 30s
+    check_tolerance: 50ms
+    dial_mode: domain
+    bootstrap_resolver: '223.5.5.5:53'
+}
+
+node {
+    trojan-node: 'trojan://trojan-password@trojan.example.com:443?sni=trojan.example.com'
+}
+
+group {
+    proxy {
+        filter: name(keyword: 'node')
+        policy: min_moving_avg
+    }
+}
+
+routing {
+    dip(10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8) -> direct
+    domain(suffix: google.com, suffix: youtube.com, suffix: github.com) -> proxy
+    fallback: direct
+}
+
+dns {
+    ipversion_prefer: 4
+    optimistic_cache: true
+    optimistic_cache_ttl: 600
+    max_cache_size: 10000
+    upstream {
+        alidns: 'udp://223.5.5.5:53'
+    }
+    routing {
+        request {
+            fallback: alidns
+        }
+    }
+}
+
+experimental {
+    clash_api {
+        external_controller: '127.0.0.1:9090'
+        secret: 'change-me'
+        default_mode: 'Rule'
+    }
+    cache_file {
+        enabled: true
+        path: 'cache.db'
+        store_dns: true
+    }
+}
+```
+
+## 5. Global 要点
+
+| 主题 | 关键字段 | 建议 |
+| ------ | ---------- | ------ |
+| 拦截网卡 | `lan_interface`、`wan_interface` | LAN 为空则不拦截 LAN。`auto` 解析默认路由网卡 |
+| 监听 | `tproxy_port` | 默认 `12345`；`tproxy_mark`（默认 `0x08000000`）在 dae 语法中不可设置 |
+| 内核 | `auto_config_kernel_parameter` | 需 root；自动设置有用的 sysctl |
+| 健康检查 | `tcp_check_url`、`udp_check_dns`、`check_interval`、`check_tolerance` | 驱动 AliveDialerSet / URLTest；时长写作 `30s` / `50ms` |
+| 拨号 | `dial_mode` | `ip` / `domain` / `domain+` / `domain++` |
+| 解析 | `bootstrap_resolver`、`fallback_resolver` | 解析节点域名时避免自拦截死锁 |
+| 超时 | `connect_timeout_ms`、`dns_resolve_timeout_ms`、`relay_idle_timeout_secs` | dae 语法暂不解析这些字段，使用内置默认值 |
+
+**拨号模式：**
+
+| 取值 | 适用场景 |
+| ------ | ---------- |
+| `ip` | 简单 IP 路由；不嗅探 |
+| `domain` | 默认；嗅探并校验目的 IP |
+| `domain+` | DNS 不经过 honk 时 |
+| `domain++` | 强制嗅探并按 SNI/Host 重路由 |
+
+## 6. 节点与分享链接
+
+节点在 `node { }` 中以**分享链接**声明，格式为 `tag: 'scheme://...'`（tag 即节点名）。
+
+解析支持的 scheme：`ss://`、`ssr://`、`socks5://`、`trojan://`、`trojan-go://`、`vmess://`、`vless://`、`hysteria2://`、`tuic://`、`juicity://`、`anytls://`、`http://`、`https://`。
+
+分享链接中的参数会映射到 `Node` 字段：`name`、`protocol`、`address`/`host`、`port`、`password`/`username`、`encryption`、`tls`、`sni`、`transport`、`ws_path`、`ws_host`、`grpc_service`、`mux`，以及 Hy2/TUIC/Juicity/AnyTLS 专用字段。
+
+完整字段表与协议注意点（含 UDP 支持矩阵）见 [components.zh.md](./components.zh.md)。
+
+## 7. 组（group）
+
+```dae
+group {
+    proxy {
+        filter: name(keyword: 'HK')
+        filter: name('us1')
+        filter: group('hk', 'jp')   # 嵌套子组（可选）
+        policy: min_moving_avg      # fixed(0) | min_moving_avg | roundrobin | fallback
+        default: 'us1'              # selector 默认节点
+        final: direct               # 成员全死时的出站
+    }
+}
+```
+
+组级 `tolerance`、`idle_timeout`、`interrupt_connections` 在 dae 语法中不可设置：URLTest 切换滞后由全局 `check_tolerance`（如 `check_tolerance: 50ms`）控制，其余使用内置默认值。
+
+**过滤表达式：**
+
+| 表达式 | 含义 |
+| -------- | ------ |
+| `name('exact')` | 精确名称 |
+| `name(keyword: 'pat')` | 子串匹配 |
+| `group('hk')` / `group('hk', 'jp')` | 嵌套子组 |
+
+经验规则：
+
+- **无** filters 且 **无** 嵌套组 → 包含**全部**节点。
+- 仅有嵌套组 → **不会**自动吞入全部节点。
+- 多个 `filter: name(...)` 行之间是 OR。
+
+**策略：**
+
+| 策略 | dae 写法 | 行为 |
+| ------ | ---------- | ------ |
+| `selector` | `fixed(0)`、`select` | 手动固定 |
+| `urltest` | `min_moving_avg`、`min_avg10`、`min_last_delay` | 最低延迟 + tolerance；TCP/UDP 分离 |
+| `loadbalance` | `roundrobin`、`round_robin`、`balance` | 存活成员轮询 |
+| `fallback` | `fallback` | 声明顺序第一个存活；粘性 |
+
+## 8. 路由（routing）
+
+规则有序，按源码书写顺序匹配（靠前优先），以 `fallback:` 收尾。
+
+条件写成**函数调用**，可用 `&&` 组合：
+
+```dae
+routing {
+    domain(suffix: doubleclick.net) -> block
+    fallback: direct
+}
+```
+
+**可用条件：**
+
+| 函数 | 匹配内容 |
+| ------ | ---------- |
+| `domain(suffix: x)` / `domain(keyword: x)` / `domain(full: x)` / `domain(regex: x)` / `domain(geosite: x)` | 域名 / geosite |
+| `dip(cidr, ...)` / `dip(geoip: cn)` | 目的 IP / geoip |
+| `sip(cidr, ...)` | 源 IP |
+| `dport(80, 443)` / `sport(...)` | 目的 / 源端口 |
+| `l4proto(tcp)` / `l4proto(udp)` | 四层协议 |
+| `ipversion(4)` / `ipversion(6)` | IP 版本 |
+| `pname(dnsmasq)` | 进程名 |
+| `mac('aa:bb:...')` | MAC 地址 |
+| `dscp(4)` | DSCP |
+
+出站目标：`direct`、`block`，或任意 **组 / 节点** 名称。
+
+**Must 规则**（`-> direct(must)`）：命中不终结，继续匹配并传播 must 语义（兼容 Go dae）。Clash 的 Global/Direct 模式不会覆盖 must/block。
+
+Geo 资源：将 `geoip.dat` / `geosite.dat` 放到运行时可加载的位置（开发时常用仓库根目录副本）。
+
+### 路由片段
+
+```dae
+routing {
+    pname(dnsmasq) && l4proto(udp) && dport(53) -> direct(must)
+    dip(geoip: private) -> direct
+    domain(geosite: geolocation-cn) -> direct
+    domain(suffix: google.com) -> proxy
+    fallback: direct
+}
+```
+
+## 9. DNS
+
+```dae
+dns {
+    ipversion_prefer: 4
+    optimistic_cache: true        # 缓存开关
+    optimistic_cache_ttl: 600     # 缓存 TTL（秒）
+    max_cache_size: 10000
+    upstream {
+        alidns: 'udp://223.5.5.5:53'
+        # 可附加出站：gooddns: 'tcp://8.8.8.8:53' outbound: proxy
+    }
+    routing {
+        request {
+            fallback: alidns
+        }
+    }
+}
+```
+
+上游 URI 协议前缀：`udp://`、`tcp://`、`tcp+udp://`、`tls://`、`https://`、`h3://`、`quic://`；无前缀按 UDP 处理。
+
+**当前限制：**
+
+- 真正的 DoT/DoH/DoQ 线协议仍不完整（上游 URI 可写 `tls://` / `https://` / `quic://`，运行时可能回退 TCP）。
+- dae 语法的 `routing { request { } }` 目前只解析 `fallback`；按域名分流上游的规则（`suffix:` / `keyword:` / `full:` / `regex:` 前缀，无前缀视为完整精确匹配）在 schema 中存在，但 dae 语法尚不可写。
+
+## 10. 订阅（subscription）
+
+```dae
+subscription {
+    my-sub: 'https://example.com/sub'
+}
+```
+
+dae 语法仅支持 `tag: 'url'` 形式；`sub_type`（simple | clash | sip008 | custom）、`update_interval`（秒，默认 86400，0 = 仅手动）、`enabled` 等字段使用默认值，在 dae 语法中不可设置。
+
+- 启动拉取有短截止时间；迟到结果经控制面通道合并。
+- 订阅节点**只在内存中**（不会回写配置文件）。
+- 正文中的分享链接由 `Node::from_share_link` 解析。
+
+## 11. Experimental
+
+### Clash API
+
+```dae
+experimental {
+    clash_api {
+        external_controller: '127.0.0.1:9090'  # 空 = 关闭
+        external_ui: 'yacd'
+        secret: 'change-me'
+        default_mode: 'Rule'                   # Rule | Global | Direct
+    }
+}
+```
+
+常用接口：`/proxies`、`/proxies/{name}`（PUT 切换 Selector）、delay、`/connections`、`/traffic`、`/logs`、`/dns/query`、`/stats`。
+
+环境变量：`HONK_UI_DOWNLOAD_URL` 可覆盖默认 Yacd-meta zip（当 `external_ui` 目录为空/不存在时后台下载）。
+
+### 缓存文件
+
+```dae
+experimental {
+    cache_file {
+        enabled: true
+        path: 'cache.db'
+        cache_id: ''
+        store_fakeip: false   # 仅有前缀/API；完整 FakeIP 引擎未完成
+        store_dns: true       # 跨重启持久化 DNS 应答
+    }
+}
+```
+
+持久化 Selector 选择与 Clash 模式；可选将 DNS 应答存在 `dns:` kv 前缀下。
+
+## 12. 使用配置运行
+
+```bash
+# 真实 eBPF（需 root）
+sudo ./target/release/honk-core --config /etc/honk/config.dae
+
+# 外部 BPF 目标文件
+sudo ./target/release/honk-core \
+  --config /etc/honk/config.dae \
+  --bpf-object /etc/honk/honk-ebpf.o
+
+# 开发：无内核 eBPF
+cargo run --release -p honk-core -- \
+  --config config.min.dae --mock-ebpf --debug
+```
+
+CLI 参数：`--config` / `-c`、`--bpf-object` / `-b`、`--bpf-pin-root`、`--debug` / `-d`、`--mock-ebpf`。
+
+子命令：`mode`、`proxy`、`delay`（详见 [components.zh.md](./components.zh.md)）。
+
+## 13. 校验建议
+
+1. 以仓库根目录的 `config.dae`（完整）或 `config.min.dae`（最小）为起点。
+2. 确保 routing / dns / 组的 `final` 中的名称指向真实组、节点、`direct` 或 `block`。
+3. 首连域名规则：使用 `dial_mode: domain` / `domain++`，或让 DNS 走 honk 以填充域名位图。
+4. 修改组/策略后，SIGHUP 重载会重建 `GroupManager`；仍有效的 Selector 选择会迁移。
+5. 若增加示例夹具，可跑 `cargo test -p honk-config` 确认仍能解析。
+
+## 14. 相关文档
+
+- [设计文档](./design.zh.md)
+- [组件详细配置](./components.zh.md)
+- 仓库示例：`config.dae`、`config.min.dae`
