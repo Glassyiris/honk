@@ -81,7 +81,7 @@ impl BinaryLpmTrie {
         self.nodes[node_idx as usize].matched = true;
     }
 
-    fn matches(&self, ip: &IpAddr) -> bool {
+    pub(crate) fn matches(&self, ip: &IpAddr) -> bool {
         if self.nodes.len() <= 1 {
             return false; // only root, no entries
         }

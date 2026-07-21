@@ -167,7 +167,7 @@ async fn ws_bridge_relay(
             }
             ws_sink
                 .send(tokio_tungstenite::tungstenite::Message::Binary(
-                    buf[..n].to_vec(),
+                    buf[..n].to_vec().into(),
                 ))
                 .await
                 .map_err(|e| anyhow::anyhow!("ws bridge send: {}", e))?;
@@ -532,7 +532,7 @@ mod tests {
             let msg = ws.next().await.unwrap().unwrap();
             assert_eq!(msg.into_data(), b"ping");
             ws.send(tokio_tungstenite::tungstenite::Message::Binary(
-                b"pong".to_vec(),
+                b"pong".to_vec().into(),
             ))
             .await
             .unwrap();

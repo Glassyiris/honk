@@ -172,12 +172,12 @@ async fn udp_fast_path_drops_internal_and_broadcast() {
     let client = addr("10.0.0.1:12345");
     let dst = addr("203.0.113.1:443");
     // honk-internal subnets (v4 + v6), either direction.  The v6 check
-    // must match the real dae0 addresses (fd00:honk::1/2, see the
+    // must match the real dae0 addresses (fd00:686f:6e6b::1/2, see the
     // DAENS_* constants in the crate root).
     assert!(udp_fast_path(&pool, b"hello", client, addr("169.254.0.11:8080")).await);
     assert!(udp_fast_path(&pool, b"hello", addr("169.254.0.1:1234"), dst).await);
-    assert!(udp_fast_path(&pool, b"hello", client, addr("[fd00:honk::1]:8080")).await);
-    assert!(udp_fast_path(&pool, b"hello", addr("[fd00:honk::2]:1234"), dst).await);
+    assert!(udp_fast_path(&pool, b"hello", client, addr("[fd00:686f:6e6b::1]:8080")).await);
+    assert!(udp_fast_path(&pool, b"hello", addr("[fd00:686f:6e6b::2]:1234"), dst).await);
     // Broadcast / multicast destinations.
     assert!(udp_fast_path(&pool, b"hello", client, addr("255.255.255.255:67")).await);
     assert!(udp_fast_path(&pool, b"hello", client, addr("192.168.1.255:67")).await);
@@ -205,7 +205,7 @@ fn dae0_internal_addr_covers_real_dae0_addresses() {
         );
     }
     // Other hosts inside the same subnets.
-    assert!(is_honk_internal_addr(&"fd00:honk::beef".parse().unwrap()));
+    assert!(is_honk_internal_addr(&"fd00:686f:6e6b::beef".parse().unwrap()));
     assert!(is_honk_internal_addr(&"169.254.0.200".parse().unwrap()));
     // Outside the subnets — including fd00:dae:d000::/64, the value of
     // the old wrong DAE0_IPV6_PREFIX_HI constant that never matched the

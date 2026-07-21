@@ -41,12 +41,12 @@ impl HandoffResult {
     }
 }
 
-struct ConnectionGuard {
+pub(super) struct ConnectionGuard {
     drain: Arc<DrainTracker>,
 }
 
 impl ConnectionGuard {
-    fn new(drain: Arc<DrainTracker>) -> Self {
+    pub(super) fn new(drain: Arc<DrainTracker>) -> Self {
         drain.increment();
         Self { drain }
     }
@@ -62,29 +62,29 @@ impl Drop for ConnectionGuard {
 /// Bundles all shared fields under a single `Arc` to eliminate
 /// per-field atomic reference-count overhead on the hot path.
 #[derive(Clone)]
-struct ControlPlaneHandle {
-    config: Arc<RwLock<Config>>,
-    router: Arc<RwLock<Router>>,
-    proxy_registry: Arc<ProxyRegistry>,
-    dns_resolver: Arc<DnsResolver>,
-    group_manager: SharedGroupManager,
-    stats: Arc<StatsManager>,
-    ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
-    udp_pool: Arc<UdpEndpointPool>,
-    tcp_sniff_neg_cache: Arc<crate::control::tcp_sniff::TcpSniffNegCache>,
-    sniffer_pool: Arc<crate::control::packet_sniffer::PacketSnifferPool>,
-    dns_controller: Arc<crate::control::dns_control::DnsController>,
-    alive_set: Arc<AliveDialerSet>,
-    connection_pool: Arc<ConnectionPool>,
-    connection_tracker: Arc<ConnectionTracker>,
+pub(super) struct ControlPlaneHandle {
+    pub(super) config: Arc<RwLock<Config>>,
+    pub(super) router: Arc<RwLock<Router>>,
+    pub(super) proxy_registry: Arc<ProxyRegistry>,
+    pub(super) dns_resolver: Arc<DnsResolver>,
+    pub(super) group_manager: SharedGroupManager,
+    pub(super) stats: Arc<StatsManager>,
+    pub(super) ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+    pub(super) udp_pool: Arc<UdpEndpointPool>,
+    pub(super) tcp_sniff_neg_cache: Arc<crate::control::tcp_sniff::TcpSniffNegCache>,
+    pub(super) sniffer_pool: Arc<crate::control::packet_sniffer::PacketSnifferPool>,
+    pub(super) dns_controller: Arc<crate::control::dns_control::DnsController>,
+    pub(super) alive_set: Arc<AliveDialerSet>,
+    pub(super) connection_pool: Arc<ConnectionPool>,
+    pub(super) connection_tracker: Arc<ConnectionTracker>,
     /// Shared clash mode state (None when the clash API is disabled).
-    mode_state: Option<crate::mode::SharedModeState>,
+    pub(super) mode_state: Option<crate::mode::SharedModeState>,
 }
 
 /// Check whether a connected TCP stream is still alive via SO_ERROR.
 ///
 /// Returns true if the socket is healthy (no pending error).
-fn is_tcp_stream_alive(stream: &TcpStream) -> bool {
+pub(super) fn is_tcp_stream_alive(stream: &TcpStream) -> bool {
     use std::os::unix::io::AsRawFd;
     let fd = stream.as_raw_fd();
     let mut err: libc::c_int = 0;
@@ -213,7 +213,7 @@ impl ControlPlaneHandle {
         state.override_outbound(&outbound_name, false, selection_resolvable)
     }
 
-    async fn serve_connection(
+    pub(super) async fn serve_connection(
         &self,
         mut stream: TcpStream,
         client_addr: SocketAddr,
@@ -1040,7 +1040,7 @@ impl ControlPlaneHandle {
         }
     }
 
-    async fn serve_udp_connection(
+    pub(super) async fn serve_udp_connection(
         &self,
         udp_socket: Arc<UdpSocket>,
         data: bytes::Bytes,
@@ -1059,7 +1059,7 @@ impl ControlPlaneHandle {
             std::time::Duration::from_millis(config.global.connect_timeout_ms)
         };
 
-        // The dae0/dae0peer veth pair uses fd00:honk::/64 (IPv6)
+        // The dae0/dae0peer veth pair uses fd00:686f:6e6b::/64 (IPv6)
         // and 169.254.0.0/16 (IPv4 link-local). Traffic between these addresses
         // is honk's own internal communication — proxying it would create
         // a routing loop and exhaust file descriptors.
@@ -1344,7 +1344,7 @@ impl ControlPlaneHandle {
 /// Outcome of comparing a connection destination IP against DNS answers for
 /// the sniffed domain (`dial_mode: domain` reality check).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RealityOutcome {
+pub(super) enum RealityOutcome {
     /// Exact IP present in the same-family answer set.
     ExactMatch,
     /// No answers for the connection's family, but the other family has
@@ -1356,7 +1356,7 @@ enum RealityOutcome {
 }
 
 /// Pure reality-check decision (unit-tested). See [`ControlPlane::verify_domain_reality`].
-fn domain_reality_outcome(
+pub(super) fn domain_reality_outcome(
     expected: std::net::IpAddr,
     ipv4: &[std::net::IpAddr],
     ipv6: &[std::net::IpAddr],

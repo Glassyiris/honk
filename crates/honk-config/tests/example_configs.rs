@@ -74,11 +74,12 @@ fn test_example_dae_parses() {
     assert_eq!(config.routing.rules.len(), 7);
     assert_eq!(config.routing.default_outbound, "manual");
 
-    // Two DNS upstreams; clash API on localhost; cache file disabled.
+    // Two DNS upstreams; clash API on localhost; cache file enabled in sample.
     assert_eq!(config.dns.upstream.len(), 2);
     assert_eq!(
         config.experimental.clash_api.external_controller,
         "127.0.0.1:9090"
     );
-    assert!(!config.experimental.cache_file.enabled);
+    assert!(config.experimental.cache_file.enabled);
+    assert_eq!(config.experimental.cache_file.path, "cache.db");
 }

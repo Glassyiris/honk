@@ -121,7 +121,8 @@ Status reflects the current tree and unit/integration tests. Prefer re-running `
 - [ ] UDP relay for VMess / VLESS / SSR / Trojan-Go
 - [ ] REALITY + uTLS (**deferred** — no mature rustls hooks)
 - [ ] smux/yamux; verified h2mux interop with official sing-box multiplex inbounds
-- [ ] Real DoT/DoH/DoQ upstreams; FakeIP engine
+- [x] Real DoT/DoH/DoQ/DoH3 upstreams (pooled TLS/H2/QUIC sessions)
+- [ ] FakeIP engine
 - [ ] Kernel-side eBPF DNS answer cache (userspace cache exists)
 - [ ] Consistent-hash load balancing (round-robin LoadBalance exists)
 - [ ] Broader live interop tests vs production peers; routine root-only netns gates

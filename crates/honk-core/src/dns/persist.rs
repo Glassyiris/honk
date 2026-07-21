@@ -221,7 +221,7 @@ mod tests {
         let restored = restore_dns_cache(&db, &cache).await;
         assert_eq!(restored, 1);
 
-        let cache = cache.lock().await;
+        let mut cache = cache.lock().await;
         let entry = cache.get("example.com:1").expect("restored entry");
         assert_eq!(entry.response, b"wire-bytes");
         let remaining = entry.remaining_ttl_secs();

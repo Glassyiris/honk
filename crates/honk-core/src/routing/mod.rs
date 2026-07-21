@@ -7,7 +7,7 @@ use std::net::IpAddr;
 mod geo;
 mod lpm;
 
-use geo::GeoAssets;
+pub(crate) use geo::GeoAssets;
 pub(crate) use lpm::BinaryLpmTrie;
 
 #[derive(Debug, Clone)]
@@ -28,7 +28,7 @@ pub struct CompiledRoute {
     pub protocols: Vec<String>,
     pub process_names: Vec<String>,
     pub mac_addresses: Vec<String>,
-    pub geosite_domains: Vec<GeositeDomain>,
+    pub(crate) geosite_domains: Vec<GeositeDomain>,
     /// Pre-built hash/automaton matcher derived from `geosite_domains`.
     ///
     /// The naive representation costs O(domains) string operations (with
@@ -47,7 +47,7 @@ pub struct CompiledRoute {
 }
 
 #[derive(Debug, Clone)]
-pub enum GeositeDomain {
+pub(crate) enum GeositeDomain {
     Full(String),
     Domain(String),
     Keyword(String),
@@ -74,7 +74,7 @@ pub(crate) struct GeositeMatcher {
 }
 
 impl GeositeMatcher {
-    fn build(domains: &[GeositeDomain]) -> Self {
+    pub(crate) fn build(domains: &[GeositeDomain]) -> Self {
         let mut matcher = GeositeMatcher::default();
         let mut keywords: Vec<&str> = Vec::new();
         for d in domains {
@@ -95,7 +95,7 @@ impl GeositeMatcher {
         matcher
     }
 
-    fn matches(&self, domain: &str) -> bool {
+    pub(crate) fn matches(&self, domain: &str) -> bool {
         let lower = domain.to_lowercase();
         if self.full.contains(lower.as_str()) {
             return true;

@@ -1,3 +1,5 @@
+use rand::RngCore;
+
 use super::*;
 
 // BLAKE2b-256 (RFC 7693) — salamander obfuscation key derivation.

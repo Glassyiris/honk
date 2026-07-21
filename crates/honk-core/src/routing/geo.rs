@@ -8,13 +8,13 @@ use super::*;
 /// full CPU core for >10 seconds at startup. The databases are now parsed
 /// once into a per-code index, and only codes actually referenced by the
 /// configuration have their regexes compiled / CIDRs decoded.
-pub(super) struct GeoAssets {
+pub(crate) struct GeoAssets {
     geosite: Option<std::collections::HashMap<String, Vec<GeositeDomain>>>,
     geoip: Option<std::collections::HashMap<String, Vec<ipnet::IpNet>>>,
 }
 
 impl GeoAssets {
-    pub(super) fn load(rules: &[RoutingRule]) -> Self {
+    pub(crate) fn load(rules: &[RoutingRule]) -> Self {
         use std::collections::HashSet;
         let mut geosite_codes: HashSet<String> = HashSet::new();
         let mut geoip_codes: HashSet<String> = HashSet::new();
@@ -48,9 +48,27 @@ impl GeoAssets {
         Self { geosite, geoip }
     }
 
+    /// Load GeoAssets from explicit code sets (for DNS routing).
+    pub(crate) fn load_codes(
+        geosite_codes: &std::collections::HashSet<String>,
+        geoip_codes: &std::collections::HashSet<String>,
+    ) -> Self {
+        let geosite = if geosite_codes.is_empty() {
+            None
+        } else {
+            load_geosite_index(geosite_codes)
+        };
+        let geoip = if geoip_codes.is_empty() {
+            None
+        } else {
+            load_geoip_index(geoip_codes)
+        };
+        Self { geosite, geoip }
+    }
+
     /// Expand geosite codes into compiled domain matchers, cloned from the
     /// shared per-code index (`Regex` clones are cheap Arc bumps).
-    pub(super) fn geosite_domains(&self, codes: &[String]) -> Vec<GeositeDomain> {
+    pub(crate) fn geosite_domains(&self, codes: &[String]) -> Vec<GeositeDomain> {
         let mut out = Vec::new();
         if codes.is_empty() {
             return out;
@@ -76,7 +94,7 @@ impl GeoAssets {
 
     /// Expand geoip codes into CIDR nets. `private` is built in and never
     /// touches geoip.dat; other codes come from the shared index.
-    pub(super) fn geoip_nets(&self, codes: &[String]) -> Vec<ipnet::IpNet> {
+    pub(crate) fn geoip_nets(&self, codes: &[String]) -> Vec<ipnet::IpNet> {
         let mut nets = Vec::new();
         for code in codes {
             let code = code.trim();

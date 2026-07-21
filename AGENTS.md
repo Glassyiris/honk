@@ -54,7 +54,7 @@ Repository: <https://github.com/Glassyiris/honk>
 - **TLS (outbound):** tokio-rustls 0.26 + rustls-pemfile + webpki-roots.
 - **Serialization:** serde, toml 1, serde_json, serde_yaml.
 - **Logging:** tracing + tracing-subscriber (`env-filter`, `json`); also `log`.
-- **DNS:** hickory-resolver 0.26.
+- **DNS:** self-contained forwarder (UDP/TCP/DoT/DoH/DoQ/DoH3) in `honk-core::dns`; no hickory dependency.
 - **Error handling:** anyhow + thiserror 2.
 - **HTTP client:** reqwest (rustls, no default features).
 

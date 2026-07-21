@@ -61,9 +61,16 @@ dns {
     }
     routing {
         request {
-            # DNS 请求全部走 alidns（当前 dae 语法仅支持 fallback）
+            # qname / qtype / reject / asis 均已支持；此处示例全部走 alidns
+            # qname(geosite: category-ads-all) -> reject
+            # qtype(https) -> reject
             fallback: alidns
         }
+        # response {
+        #     upstream(googledns) -> accept
+        #     ip(geoip: private) && !qname(geosite: cn) -> googledns
+        #     fallback: accept
+        # }
     }
 }
 

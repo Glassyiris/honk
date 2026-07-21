@@ -105,6 +105,7 @@ fn test_dns_forwarder(cache: Arc<tokio::sync::Mutex<DnsCache>>, response: Vec<u8
         DnsRouter::new(&DnsRouting {
             rules: vec![],
             fallback: "default".into(),
+            ..Default::default()
         })
         .unwrap(),
     );
@@ -163,8 +164,12 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        if let Err(e) = axum::serve(listener, app).await {
+            eprintln!("axum serve error: {e:#}");
+        }
     });
+    // Give the server a tick to bind.
+    tokio::task::yield_now().await;
 
     TestApp {
         addr,
@@ -177,6 +182,7 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
 fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .build()
         .unwrap()
 }

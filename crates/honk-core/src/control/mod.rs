@@ -87,10 +87,10 @@ pub mod commands {
 }
 
 pub use commands::ControlCommand;
-pub(crate) use connection::*;
-pub(crate) use probers::*;
-pub(crate) use reload::*;
-pub(crate) use sockets::*;
+use connection::*;
+use probers::*;
+use reload::*;
+use sockets::*;
 pub use sockets::DnsBpfNotifier;
 
 #[derive(Debug, Clone)]
@@ -305,6 +305,12 @@ impl ControlPlane {
 
     pub fn group_manager(&self) -> SharedGroupManager {
         self.group_manager.clone()
+    }
+
+    /// Shared traffic router cell (same handle DNS dial uses for dae-style
+    /// "route the DNS server IP" selection).
+    pub fn traffic_router(&self) -> Arc<RwLock<Router>> {
+        self.router.clone()
     }
 
     pub fn connection_tracker(&self) -> Arc<ConnectionTracker> {

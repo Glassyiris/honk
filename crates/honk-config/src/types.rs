@@ -138,10 +138,12 @@ pub enum DnsProtocol {
     Udp,
     /// DNS over TCP
     Tcp,
-    /// DNS over TLS
+    /// DNS over TLS (DoT, RFC 7858)
     Tls,
-    /// DNS over HTTPS
+    /// DNS over HTTPS / HTTP/2 (DoH, RFC 8484)
     Https,
-    /// DNS over QUIC
+    /// DNS over HTTP/3 (DoH3)
+    H3,
+    /// DNS over QUIC (DoQ, RFC 9250)
     Quic,
 }

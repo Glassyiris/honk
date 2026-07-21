@@ -5,7 +5,7 @@ use super::*;
 /// Implements `HttpProber` for `AliveDialerSet`, matching Go's `Dialer.HttpCheck`.
 /// Resolves the check URL's hostname, dials through the proxy node via the
 /// `ProxyRegistry`, sends a raw HTTP request, and validates the status code.
-struct ProxyHttpProber {
+pub(super) struct ProxyHttpProber {
     config: Arc<RwLock<Config>>,
     proxy_registry: Arc<ProxyRegistry>,
     check_url: String,
@@ -13,7 +13,7 @@ struct ProxyHttpProber {
 }
 
 impl ProxyHttpProber {
-    fn new(
+    pub(super) fn new(
         config: Arc<RwLock<Config>>,
         proxy_registry: Arc<ProxyRegistry>,
         check_url: String,
@@ -156,14 +156,14 @@ const DEFAULT_UDP_CHECK_DNS: &str = "8.8.8.8:53";
 /// answer. Nodes whose server or protocol cannot carry UDP (e.g. an
 /// AnyTLS server without UoT support) fail here even while their TCP
 /// probe succeeds — exactly the signal the UDP alive domains need.
-struct ProxyUdpProber {
+pub(super) struct ProxyUdpProber {
     config: Arc<RwLock<Config>>,
     proxy_registry: Arc<ProxyRegistry>,
     dns_target: SocketAddr,
 }
 
 impl ProxyUdpProber {
-    fn new(
+    pub(super) fn new(
         config: Arc<RwLock<Config>>,
         proxy_registry: Arc<ProxyRegistry>,
         dns_target: SocketAddr,
@@ -249,7 +249,7 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
 /// Build the minimal DNS query used by the UDP health probe: a single
 /// A-record question for google.com with a fixed id (0x1234). The id is
 /// echoed back by the resolver and validated in the response.
-fn build_dns_probe_query() -> Vec<u8> {
+pub(super) fn build_dns_probe_query() -> Vec<u8> {
     let mut q = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
     q.extend_from_slice(&[
         6, b'g', b'o', b'o', b'g', b'l', b'e', 3, b'c', b'o', b'm', 0, 0, 1, 0, 1,
@@ -260,7 +260,7 @@ fn build_dns_probe_query() -> Vec<u8> {
 /// Resolve the UDP health check target from `global.udp_check_dns`
 /// (first entry, dae semantics: `host[:port]`, default port 53).
 /// Falls back to [`DEFAULT_UDP_CHECK_DNS`] when unset or unresolvable.
-async fn resolve_udp_check_target(raw: Option<String>) -> SocketAddr {
+pub(super) async fn resolve_udp_check_target(raw: Option<String>) -> SocketAddr {
     let fallback: SocketAddr = DEFAULT_UDP_CHECK_DNS
         .parse()
         .expect("hardcoded default UDP check DNS address");
@@ -301,12 +301,12 @@ async fn resolve_udp_check_target(raw: Option<String>) -> SocketAddr {
 /// live in the crate root next to the `DAENS_*` address strings used by the
 /// netns setup, so this datapath check and the interface configuration
 /// cannot drift apart.
-fn is_honk_internal_addr(ip: &std::net::IpAddr) -> bool {
+pub(super) fn is_honk_internal_addr(ip: &std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V6(v6) => {
             let octets = v6.octets();
             let hi = u64::from_be_bytes(octets[..8].try_into().unwrap());
-            hi == crate::DAE0_IPV6_PREFIX_HI // fd00:honk::/64
+            hi == crate::DAE0_IPV6_PREFIX_HI // fd00:686f:6e6b::/64
         }
         std::net::IpAddr::V4(v4) => {
             let addr: u32 = u32::from(*v4);
@@ -317,7 +317,7 @@ fn is_honk_internal_addr(ip: &std::net::IpAddr) -> bool {
 
 /// Returns true for broadcast/multicast addresses that should not be
 /// proxied (mDNS, SSDP, LLMNR local discovery traffic).
-fn is_broadcast_or_multicast(ip: &std::net::IpAddr) -> bool {
+pub(super) fn is_broadcast_or_multicast(ip: &std::net::IpAddr) -> bool {
     if ip.is_multicast() {
         return true;
     }
@@ -337,7 +337,7 @@ fn is_broadcast_or_multicast(ip: &std::net::IpAddr) -> bool {
 /// (`http://host,ip4,ip6`) only the first segment contributes. The path
 /// defaults to `/` when the URL has none. The port is stripped (bracketed
 /// IPv6 literals are kept intact).
-fn extract_url_host_path(url: &str) -> Option<(&str, &str)> {
+pub(super) fn extract_url_host_path(url: &str) -> Option<(&str, &str)> {
     let s = url.trim();
     let s = s
         .strip_prefix("http://")

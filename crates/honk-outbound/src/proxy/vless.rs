@@ -322,7 +322,7 @@ mod tests {
             assert_eq!(header[18], CMD_TCP);
 
             // Accept with the 1-byte response, then expect relayed payload.
-            ws.send(tokio_tungstenite::tungstenite::Message::Binary(vec![0x00]))
+            ws.send(tokio_tungstenite::tungstenite::Message::Binary(vec![0x00].into()))
                 .await
                 .unwrap();
             let msg = ws.next().await.unwrap().unwrap();

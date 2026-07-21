@@ -29,7 +29,7 @@ use async_trait::async_trait;
 use honk_config::node::Node;
 use honk_config::types::NodeProtocol;
 use hkdf::Hkdf;
-use rand::Rng;
+use rand::RngCore;
 use sha1::Sha1;
 use std::fmt;
 use std::net::SocketAddr;

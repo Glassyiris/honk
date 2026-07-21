@@ -6,16 +6,22 @@
 //! and returns the result.  It also supports background prefetch to
 //! warm the cache for frequently-accessed domains.
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use super::cache::DnsCache;
-use super::routing::DnsRouter;
+use super::routing::{DnsRequestDecision, DnsResponseDecision, DnsRouter};
 use honk_config::dns::DnsStrategy;
+use honk_ebpf_common::DAE_BYPASS_MARK;
+
+/// dae response-routing re-query depth cap (`MaxDnsLookupDepth`).
+const MAX_DNS_LOOKUP_DEPTH: usize = 3;
 
 /// Abstraction over a pool of DNS upstream servers.
 ///
@@ -52,13 +58,15 @@ pub trait DomainResolveNotifier: Send + Sync {
 /// raw_query
 ///   │
 ///   ├─ parse domain + qtype
+///   ├─ strategy filter (empty A/AAAA)
+///   ├─ request routing (reject / asis / upstream)  — before cache (dae order)
 ///   ├─ cache.get(key)  ── hit ──→ return cached bytes
 ///   │       │ miss
-///   ├─ router.select_upstream(domain)
-///   ├─ upstream_pool.query(upstream, raw_query)
-///   ├─ extract min_ttl
-///   ├─ cache.put(key, response, min_ttl)
-///   ├─ notifier.on_domain_resolved(domain, response)  (if present)
+///   ├─ upstream_pool.query / asis dial
+///   ├─ response routing loop (accept / reject / requery, depth ≤ 3)
+///   ├─ fixed_domain_ttl / optimistic_cache_ttl
+///   ├─ cache.put
+///   ├─ notifier.on_domain_resolved
 ///   └─ return response
 /// ```
 #[derive(Clone)]
@@ -67,6 +75,14 @@ pub struct DnsForwarder {
     cache: Arc<Mutex<DnsCache>>,
     routing: Arc<DnsRouter>,
     strategy: DnsStrategy,
+    /// When false, skip positive/negative cache lookups and inserts
+    /// (`dns.optimistic_cache` / `cache.enabled`).
+    cache_enabled: bool,
+    /// Fixed positive-cache TTL in seconds (`dns.optimistic_cache_ttl` /
+    /// `cache.ttl`). Overrides answer-section min TTL when storing entries
+    /// and when rewriting wire TTLs on the way into the cache. `0` falls
+    /// back to the answer min TTL (default path uses 600).
+    cache_ttl: u32,
     notifier: Option<Arc<dyn DomainResolveNotifier>>,
 }
 
@@ -82,6 +98,9 @@ impl DnsForwarder {
             cache,
             routing,
             strategy: DnsStrategy::default(),
+            cache_enabled: true,
+            // 0 = keep answer min TTL until `with_cache_ttl` is applied from config.
+            cache_ttl: 0,
             notifier: None,
         }
     }
@@ -98,6 +117,8 @@ impl DnsForwarder {
             cache,
             routing,
             strategy: DnsStrategy::default(),
+            cache_enabled: true,
+            cache_ttl: 0,
             notifier: Some(notifier),
         }
     }
@@ -108,17 +129,42 @@ impl DnsForwarder {
         self
     }
 
+    /// Enable or disable the in-memory DNS cache (dae `optimistic_cache`).
+    pub fn with_cache_enabled(mut self, enabled: bool) -> Self {
+        self.cache_enabled = enabled;
+        self
+    }
+
+    /// Set the fixed positive-cache TTL (dae `optimistic_cache_ttl`).
+    ///
+    /// When non-zero, this value **overrides** the minimum TTL from the
+    /// upstream answer for both cache lifetime and wire-format TTL fields
+    /// stored in the cache. `0` keeps answer min TTL behaviour.
+    pub fn with_cache_ttl(mut self, ttl_secs: u32) -> Self {
+        self.cache_ttl = ttl_secs;
+        self
+    }
+
     /// Return a clone of the underlying cache Arc.
     pub fn cache(&self) -> Arc<Mutex<DnsCache>> {
         self.cache.clone()
     }
 
-    /// Resolve a raw DNS query.
-    ///
-    /// Parses the question section to extract the domain and query type,
-    /// checks the cache, routes to the appropriate upstream, and caches
-    /// the response for future queries.
+    /// Resolve a raw DNS query (no original destination for `asis`).
     pub async fn resolve(&self, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.resolve_with_context(raw_query, None).await
+    }
+
+    /// Resolve a raw DNS query with optional original destination.
+    ///
+    /// `original_dst` is used when request routing selects `asis` (dial the
+    /// intercepted packet's real DNS server). When `None`, `asis` falls back
+    /// to the configured default upstream with a debug log.
+    pub async fn resolve_with_context(
+        &self,
+        raw_query: &[u8],
+        original_dst: Option<SocketAddr>,
+    ) -> anyhow::Result<Vec<u8>> {
         debug!("DNS forwarder: resolving {} bytes", raw_query.len());
 
         let (domain, qtype) = parse_dns_question(raw_query)
@@ -142,8 +188,19 @@ impl DnsForwarder {
             return Ok(make_empty_response(raw_query, &domain, qtype));
         }
 
-        {
-            let cache = self.cache.lock().await;
+        // Request routing runs *before* cache (dae order) so reject always wins
+        // over a stale positive entry and asis is never short-circuited.
+        let decision = self.routing.select_request(&domain, qtype);
+        match &decision {
+            DnsRequestDecision::Reject => {
+                debug!("DNS forwarder: request reject for {}", domain);
+                return Ok(make_empty_response(raw_query, &domain, qtype));
+            }
+            DnsRequestDecision::AsIs | DnsRequestDecision::Upstream(_) => {}
+        }
+
+        if self.cache_enabled {
+            let mut cache = self.cache.lock().await;
             if cache.is_negative(&cache_key) {
                 debug!(
                     "DNS forwarder: negative cache hit for {} — skipping upstream",
@@ -160,9 +217,6 @@ impl DnsForwarder {
                     domain,
                     entry.remaining_ttl_secs()
                 );
-                // Cached responses keep the ID of the query that populated the
-                // cache.  Rewrite it to match the current query so the client
-                // (libc/c-ares) accepts the response.
                 let mut response = entry.response.clone();
                 if response.len() >= 2 && raw_query.len() >= 2 {
                     response[0..2].copy_from_slice(&raw_query[0..2]);
@@ -171,60 +225,187 @@ impl DnsForwarder {
             }
         }
 
-        let upstream_name = self.routing.select_upstream(&domain);
-        debug!(
-            "DNS forwarder: routing {} → upstream '{}'",
-            domain, upstream_name
-        );
-
-        let mut response = self
-            .upstream_pool
-            .query(upstream_name, raw_query)
-            .await
-            .with_context(|| format!("upstream '{}' query failed for {}", upstream_name, domain))?;
-
-        let rcode = if response.len() >= 4 {
-            response[3] & 0x0F
-        } else {
-            0
+        let (mut response, mut upstream_name) = match decision {
+            DnsRequestDecision::AsIs => {
+                let resp = self
+                    .query_asis(raw_query, original_dst)
+                    .await
+                    .with_context(|| format!("asis query failed for {domain}"))?;
+                (resp, "asis".to_string())
+            }
+            DnsRequestDecision::Upstream(name) => {
+                debug!("DNS forwarder: routing {} → upstream '{}'", domain, name);
+                let resp = self
+                    .upstream_pool
+                    .query(&name, raw_query)
+                    .await
+                    .with_context(|| {
+                        format!("upstream '{name}' query failed for {domain}")
+                    })?;
+                (resp, name)
+            }
+            DnsRequestDecision::Reject => unreachable!("reject handled above"),
         };
-        if rcode == 2 || rcode == 3 {
-            // SERVFAIL or NXDOMAIN — store in negative cache
-            let mut cache = self.cache.lock().await;
-            cache.put_negative(cache_key.clone(), 60);
-            debug!(
-                "DNS forwarder: negative cache stored for {} (rcode={})",
-                domain, rcode
-            );
-            // Still return the response to the client
-            return Ok(response);
+
+        // Response routing: accept / reject / re-query (depth capped).
+        for depth in 0..MAX_DNS_LOOKUP_DEPTH {
+            let rcode = if response.len() >= 4 {
+                response[3] & 0x0F
+            } else {
+                0
+            };
+            // Don't re-route hard failures — return them (and negative-cache).
+            if rcode == 2 || rcode == 3 {
+                if self.cache_enabled {
+                    let mut cache = self.cache.lock().await;
+                    cache.put_negative(cache_key.clone(), 60);
+                    debug!(
+                        "DNS forwarder: negative cache stored for {} (rcode={})",
+                        domain, rcode
+                    );
+                }
+                if response.len() >= 2 && raw_query.len() >= 2 {
+                    response[0..2].copy_from_slice(&raw_query[0..2]);
+                }
+                return Ok(response);
+            }
+
+            let ips = extract_answer_ips(&response);
+            match self
+                .routing
+                .select_response(&domain, qtype, &ips, &upstream_name)
+            {
+                DnsResponseDecision::Accept => break,
+                DnsResponseDecision::Reject => {
+                    debug!(
+                        "DNS forwarder: response reject for {} via {}",
+                        domain, upstream_name
+                    );
+                    response = make_empty_response(raw_query, &domain, qtype);
+                    break;
+                }
+                DnsResponseDecision::Requery(next) => {
+                    if depth + 1 >= MAX_DNS_LOOKUP_DEPTH {
+                        warn!(
+                            "DNS forwarder: response re-query depth exceeded for {} (last={})",
+                            domain, next
+                        );
+                        break;
+                    }
+                    if next == upstream_name {
+                        debug!(
+                            "DNS forwarder: response re-query to same upstream '{}' — accepting",
+                            next
+                        );
+                        break;
+                    }
+                    debug!(
+                        "DNS forwarder: response re-query {} → '{}' (depth={})",
+                        domain,
+                        next,
+                        depth + 1
+                    );
+                    response = self
+                        .upstream_pool
+                        .query(&next, raw_query)
+                        .await
+                        .with_context(|| {
+                            format!("response re-query upstream '{next}' failed for {domain}")
+                        })?;
+                    upstream_name = next;
+                }
+            }
         }
 
-        let min_ttl = extract_min_ttl(&response);
-        {
+        // Cache TTL: fixed_domain_ttl wins when set; else optimistic_cache_ttl
+        // override; else answer min TTL. fixed=0 means do not cache.
+        let skip_cache = matches!(self.routing.fixed_ttl(&domain), Some(0));
+        let answer_ttl = extract_min_ttl(&response);
+        let cache_ttl = match self.routing.fixed_ttl(&domain) {
+            Some(0) => 0,
+            Some(fixed) => fixed,
+            None => effective_cache_ttl(self.cache_ttl, answer_ttl),
+        };
+
+        if self.cache_enabled && !skip_cache && cache_ttl > 0 {
+            rewrite_answer_ttls(&mut response, cache_ttl);
             let mut cache = self.cache.lock().await;
-            cache.put(cache_key, response.clone(), min_ttl);
+            cache.put(cache_key, response.clone(), cache_ttl);
         }
 
         if let Some(ref notifier) = self.notifier {
             notifier.on_domain_resolved(&domain, &response);
         }
 
-        // Ensure the response ID matches the current query in case the
-        // upstream (or cached entry) used a different ID.
         if response.len() >= 2 && raw_query.len() >= 2 {
             response[0..2].copy_from_slice(&raw_query[0..2]);
         }
 
         debug!(
-            "DNS forwarder: resolved {} via '{}' (min_ttl={}s, {} bytes)",
+            "DNS forwarder: resolved {} via '{}' (cache_ttl={}s answer_ttl={}s, {} bytes)",
             domain,
             upstream_name,
-            min_ttl,
+            cache_ttl,
+            answer_ttl,
             response.len()
         );
 
         Ok(response)
+    }
+
+    /// Dial the original destination DNS server (dae `asis`).
+    async fn query_asis(
+        &self,
+        raw_query: &[u8],
+        original_dst: Option<SocketAddr>,
+    ) -> anyhow::Result<Vec<u8>> {
+        let Some(dst) = original_dst else {
+            debug!(
+                "DNS forwarder: asis without original_dst — falling back to default upstream"
+            );
+            return self.upstream_pool.query("default", raw_query).await;
+        };
+
+        debug!("DNS forwarder: asis dial {}", dst);
+        let domain = if dst.is_ipv4() {
+            socket2::Domain::IPV4
+        } else {
+            socket2::Domain::IPV6
+        };
+        let sock2 = socket2::Socket::new(domain, socket2::Type::DGRAM, None)
+            .context("asis socket")?;
+        sock2.set_nonblocking(true).context("asis nonblocking")?;
+        #[cfg(target_os = "linux")]
+        {
+            let _ = sock2.set_mark(DAE_BYPASS_MARK);
+        }
+        sock2
+            .bind(
+                &SocketAddr::new(
+                    if dst.is_ipv4() {
+                        IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+                    } else {
+                        IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+                    },
+                    0,
+                )
+                .into(),
+            )
+            .context("asis bind")?;
+        let socket = tokio::net::UdpSocket::from_std(sock2.into()).context("asis from_std")?;
+        socket.connect(dst).await.context("asis connect")?;
+
+        let resp = tokio::time::timeout(Duration::from_secs(5), async {
+            socket.send(raw_query).await?;
+            let mut buf = vec![0u8; 4096];
+            let n = socket.recv(&mut buf).await?;
+            buf.truncate(n);
+            Ok::<_, std::io::Error>(buf)
+        })
+        .await
+        .context("asis recv timeout")?
+        .context("asis recv")?;
+        Ok(resp)
     }
 
     /// Prefetch domains asynchronously to warm the cache.
@@ -367,6 +548,112 @@ fn decode_dns_name(data: &[u8], pos: &mut usize) -> Option<String> {
         None
     } else {
         Some(labels.join("."))
+    }
+}
+
+/// Resolve the TTL used for positive cache inserts.
+///
+/// `configured` is `dns.cache.ttl` / `optimistic_cache_ttl`. Non-zero values
+/// win (fixed override); `0` keeps the answer-section minimum.
+/// Extract A/AAAA answer IPs from a wire-format DNS response.
+pub fn extract_answer_ips(data: &[u8]) -> Vec<IpAddr> {
+    let mut ips = Vec::new();
+    if data.len() < 12 {
+        return ips;
+    }
+    let qdcount = u16::from_be_bytes([data[4], data[5]]) as usize;
+    let ancount = u16::from_be_bytes([data[6], data[7]]) as usize;
+    let mut pos = 12;
+    for _ in 0..qdcount {
+        if !skip_dns_name(data, &mut pos) {
+            return ips;
+        }
+        pos += 4;
+        if pos > data.len() {
+            return ips;
+        }
+    }
+    for _ in 0..ancount {
+        if !skip_dns_name(data, &mut pos) {
+            break;
+        }
+        if pos + 10 > data.len() {
+            break;
+        }
+        let rtype = u16::from_be_bytes([data[pos], data[pos + 1]]);
+        let rdlength = u16::from_be_bytes([data[pos + 8], data[pos + 9]]) as usize;
+        pos += 10;
+        if pos + rdlength > data.len() {
+            break;
+        }
+        match rtype {
+            1 if rdlength == 4 => {
+                ips.push(IpAddr::V4(std::net::Ipv4Addr::new(
+                    data[pos],
+                    data[pos + 1],
+                    data[pos + 2],
+                    data[pos + 3],
+                )));
+            }
+            28 if rdlength == 16 => {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&data[pos..pos + 16]);
+                ips.push(IpAddr::V6(std::net::Ipv6Addr::from(octets)));
+            }
+            _ => {}
+        }
+        pos += rdlength;
+    }
+    ips
+}
+
+fn effective_cache_ttl(configured: u32, answer_min_ttl: u32) -> u32 {
+    if configured > 0 {
+        configured
+    } else {
+        answer_min_ttl.max(1)
+    }
+}
+
+/// Overwrite TTL fields on every answer/authority/additional RR with `ttl`.
+///
+/// Used so cached (and client-visible) records reflect `optimistic_cache_ttl`
+/// rather than the upstream's original values. Malformed tails are left as-is.
+fn rewrite_answer_ttls(data: &mut [u8], ttl: u32) {
+    if data.len() < 12 {
+        return;
+    }
+    let qdcount = u16::from_be_bytes([data[4], data[5]]) as usize;
+    let ancount = u16::from_be_bytes([data[6], data[7]]) as usize;
+    let nscount = u16::from_be_bytes([data[8], data[9]]) as usize;
+    let arcount = u16::from_be_bytes([data[10], data[11]]) as usize;
+
+    let mut pos = 12;
+    for _ in 0..qdcount {
+        if !skip_dns_name(data, &mut pos) {
+            return;
+        }
+        pos += 4;
+        if pos > data.len() {
+            return;
+        }
+    }
+
+    let ttl_be = ttl.to_be_bytes();
+    for _ in 0..(ancount + nscount + arcount) {
+        if !skip_dns_name(data, &mut pos) {
+            return;
+        }
+        if pos + 10 > data.len() {
+            return;
+        }
+        // TYPE(2) CLASS(2) TTL(4) RDLENGTH(2) RDATA
+        data[pos + 4] = ttl_be[0];
+        data[pos + 5] = ttl_be[1];
+        data[pos + 6] = ttl_be[2];
+        data[pos + 7] = ttl_be[3];
+        let rdlength = u16::from_be_bytes([data[pos + 8], data[pos + 9]]) as usize;
+        pos += 10 + rdlength;
     }
 }
 
@@ -527,6 +814,7 @@ mod tests {
             DnsRouter::new(&DnsRouting {
                 rules: vec![],
                 fallback: "default".into(),
+                ..Default::default()
             })
             .expect("test router"),
         )
@@ -715,6 +1003,7 @@ mod tests {
                     upstream: "custom".into(),
                 }],
                 fallback: "default".into(),
+                ..Default::default()
             })
             .expect("router"),
         );
@@ -858,5 +1147,235 @@ mod tests {
                 assert_eq!(parsed_qtype, qtype, "qtype mismatch for {}", domain);
             }
         }
+    }
+
+    #[test]
+    fn test_effective_cache_ttl_override() {
+        assert_eq!(effective_cache_ttl(600, 30), 600);
+        assert_eq!(effective_cache_ttl(0, 30), 30);
+        assert_eq!(effective_cache_ttl(0, 0), 1);
+    }
+
+    #[test]
+    fn test_rewrite_answer_ttls_overrides_wire() {
+        let mut resp = make_a_response([1, 2, 3, 4], 30);
+        assert_eq!(extract_min_ttl(&resp), 30);
+        rewrite_answer_ttls(&mut resp, 600);
+        assert_eq!(extract_min_ttl(&resp), 600);
+    }
+
+    #[tokio::test]
+    async fn test_optimistic_cache_ttl_overrides_answer_ttl() {
+        // Upstream answers with TTL=30; forwarder configured for 600.
+        let upstream_resp = make_a_response([9, 9, 9, 9], 30);
+        let mock = Arc::new(MockUpstream::new(upstream_resp));
+        let cache = test_cache();
+        let forwarder = DnsForwarder::new(
+            mock as Arc<dyn DnsUpstreamPool>,
+            cache.clone(),
+            test_router(),
+        )
+        .with_cache_ttl(600);
+
+        let query = make_a_query();
+        let result = forwarder.resolve(&query).await.expect("resolve");
+        assert_eq!(extract_min_ttl(&result), 600, "client-visible wire TTL overridden");
+
+        {
+            let mut guard = cache.lock().await;
+            let entry = guard.get("example.com:1").expect("cached");
+            assert_eq!(entry.min_ttl, 600);
+            assert_eq!(extract_min_ttl(&entry.response), 600);
+            // Lifetime should be ~600s, not 30s.
+            let remaining = entry.remaining_ttl_secs();
+            assert!(
+                (590..=600).contains(&remaining),
+                "cache lifetime uses optimistic_cache_ttl, got {remaining}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_request_reject_skips_upstream() {
+        use honk_config::dns::{DnsCond, DnsRequestAction, DnsRequestRule, DnsRequestRouting};
+
+        let mock = Arc::new(MockUpstream::new(make_a_response([1, 1, 1, 1], 60)));
+        let router = Arc::new(
+            DnsRouter::new(&DnsRouting {
+                request: DnsRequestRouting {
+                    rules: vec![DnsRequestRule {
+                        conditions: vec![DnsCond::Qtype {
+                            not: false,
+                            types: vec![65], // HTTPS
+                        }],
+                        action: DnsRequestAction::Reject,
+                    }],
+                    fallback: DnsRequestAction::Upstream("default".into()),
+                },
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let forwarder = DnsForwarder::new(mock.clone() as Arc<dyn DnsUpstreamPool>, test_cache(), router);
+
+        let query = build_dns_query("example.com", 65);
+        let result = forwarder.resolve(&query).await.expect("resolve");
+        assert_eq!(mock.call_count.load(Ordering::SeqCst), 0, "reject must not dial");
+        assert_eq!(u16::from_be_bytes([result[6], result[7]]), 0, "empty ANCOUNT");
+    }
+
+    #[tokio::test]
+    async fn test_qtype_routes_to_named_upstream() {
+        use honk_config::dns::{DnsCond, DnsRequestAction, DnsRequestRule, DnsRequestRouting};
+
+        struct NameMock {
+            last: std::sync::Mutex<String>,
+            a_resp: Vec<u8>,
+            aaaa_resp: Vec<u8>,
+        }
+        #[async_trait]
+        impl DnsUpstreamPool for NameMock {
+            async fn query(
+                &self,
+                upstream_name: &str,
+                _raw_query: &[u8],
+            ) -> anyhow::Result<Vec<u8>> {
+                *self.last.lock().unwrap() = upstream_name.to_string();
+                if upstream_name == "v6dns" {
+                    Ok(self.aaaa_resp.clone())
+                } else {
+                    Ok(self.a_resp.clone())
+                }
+            }
+        }
+
+        let mock = Arc::new(NameMock {
+            last: std::sync::Mutex::new(String::new()),
+            a_resp: make_a_response([1, 2, 3, 4], 60),
+            aaaa_resp: make_a_response([9, 9, 9, 9], 60),
+        });
+        let router = Arc::new(
+            DnsRouter::new(&DnsRouting {
+                request: DnsRequestRouting {
+                    rules: vec![DnsRequestRule {
+                        conditions: vec![DnsCond::Qtype {
+                            not: false,
+                            types: vec![28],
+                        }],
+                        action: DnsRequestAction::Upstream("v6dns".into()),
+                    }],
+                    fallback: DnsRequestAction::Upstream("default".into()),
+                },
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let forwarder =
+            DnsForwarder::new(mock.clone() as Arc<dyn DnsUpstreamPool>, test_cache(), router)
+                .with_strategy(honk_config::dns::DnsStrategy::Both);
+
+        let q_a = build_dns_query("example.com", 1);
+        let _ = forwarder.resolve(&q_a).await.unwrap();
+        assert_eq!(mock.last.lock().unwrap().as_str(), "default");
+
+        let q_aaaa = build_dns_query("example.com", 28);
+        let _ = forwarder.resolve(&q_aaaa).await.unwrap();
+        assert_eq!(mock.last.lock().unwrap().as_str(), "v6dns");
+    }
+
+    #[tokio::test]
+    async fn test_response_requery_switches_upstream() {
+        use honk_config::dns::{
+            DnsCond, DnsRequestAction, DnsRequestRouting, DnsResponseAction, DnsResponseRule,
+            DnsResponseRouting,
+        };
+
+        struct SeqMock {
+            calls: AtomicUsize,
+            polluted: Vec<u8>,
+            clean: Vec<u8>,
+        }
+        #[async_trait]
+        impl DnsUpstreamPool for SeqMock {
+            async fn query(
+                &self,
+                upstream_name: &str,
+                _raw_query: &[u8],
+            ) -> anyhow::Result<Vec<u8>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if upstream_name == "googledns" {
+                    Ok(self.clean.clone())
+                } else {
+                    Ok(self.polluted.clone())
+                }
+            }
+        }
+
+        let mock = Arc::new(SeqMock {
+            calls: AtomicUsize::new(0),
+            polluted: make_a_response([10, 0, 0, 1], 60), // private → trigger requery
+            clean: make_a_response([8, 8, 8, 8], 60),
+        });
+        let router = Arc::new(
+            DnsRouter::new(&DnsRouting {
+                request: DnsRequestRouting {
+                    rules: vec![],
+                    fallback: DnsRequestAction::Upstream("alidns".into()),
+                },
+                response: DnsResponseRouting {
+                    rules: vec![DnsResponseRule {
+                        conditions: vec![DnsCond::Ip {
+                            not: false,
+                            cidrs: vec!["10.0.0.0/8".into()],
+                            geoip: vec![],
+                        }],
+                        action: DnsResponseAction::Upstream("googledns".into()),
+                    }],
+                    fallback: DnsResponseAction::Accept,
+                },
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let forwarder =
+            DnsForwarder::new(mock.clone() as Arc<dyn DnsUpstreamPool>, test_cache(), router);
+
+        let query = make_a_query();
+        let result = forwarder.resolve(&query).await.expect("resolve");
+        assert_eq!(mock.calls.load(Ordering::SeqCst), 2, "polluted then clean");
+        assert_eq!(&result[result.len() - 4..], &[8, 8, 8, 8]);
+    }
+
+    #[tokio::test]
+    async fn test_fixed_domain_ttl_zero_skips_cache() {
+        use std::collections::HashMap;
+
+        let response = make_a_response([1, 2, 3, 4], 300);
+        let mock = Arc::new(MockUpstream::new(response));
+        let cache = test_cache();
+        let mut ttl = HashMap::new();
+        ttl.insert("example.com".to_string(), 0u32);
+        let router = Arc::new(
+            DnsRouter::new_with_fixed_ttl(&DnsRouting::default(), &ttl).unwrap(),
+        );
+        let forwarder =
+            DnsForwarder::new(mock.clone() as Arc<dyn DnsUpstreamPool>, cache.clone(), router);
+
+        let query = make_a_query();
+        let _ = forwarder.resolve(&query).await.unwrap();
+        assert!(
+            cache.lock().await.get("example.com:1").is_none(),
+            "fixed_domain_ttl=0 must not cache"
+        );
+        // Second resolve hits upstream again.
+        let _ = forwarder.resolve(&query).await.unwrap();
+        assert_eq!(mock.call_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_extract_answer_ips_a_record() {
+        let resp = make_a_response([1, 2, 3, 4], 60);
+        let ips = extract_answer_ips(&resp);
+        assert_eq!(ips, vec![IpAddr::from([1, 2, 3, 4])]);
     }
 }

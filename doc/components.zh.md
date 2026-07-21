@@ -322,7 +322,7 @@ dns {
 | `protocol` | enum | `udp` | `udp`/`tcp`/`tls`/`https`/`quic`；dae 中由 URI scheme 决定（`udp://`、`tcp://`、`tcp+udp://`/`udp+tcp://`、`tls://`、`https://`、`h3://`、`quic://`，无 scheme 默认为 UDP） |
 | `tls_server_name` | string? | null | DoT/DoH SNI（结构化模型字段，dae 语法无对应键） |
 | `bootstrap` | string? | null | Bootstrap DNS（结构化模型字段，dae 语法无对应键） |
-| `outbound` | string? | null | 经节点/组发出；dae 中行内后缀 `'uri' outbound: <name>` |
+| `outbound` | string? | null | 经节点/组发出；dae 中行内后缀 `'uri' -> <name>`（旧：`outbound: name`） |
 | `tags` | string[] | `[]` | 标签（结构化模型字段，dae 语法无对应键） |
 
 **运行时说明：** UDP/TCP 可用；TLS/HTTPS/QUIC 目前偏向回退普通 TCP。经代理的 DNS SOCKS5 UDP 路径不完整。
@@ -348,7 +348,7 @@ dae：`ipversion_prefer: 4|6`。
 | 字段 | 默认值 | 含义 |
 | ------ | -------- | ------ |
 | `enabled` | `true` | 开关。**dae：** `optimistic_cache` |
-| `ttl` | `600` | 秒。**dae：** `optimistic_cache_ttl` |
+| `ttl` | `600` | 正缓存固定 TTL（覆盖应答 min TTL；`0` 表示沿用上游）。**dae：** `optimistic_cache_ttl` |
 | `max_size` | `10000` | 最大条目（必须 > 0）。**dae：** `max_cache_size` |
 
 可选持久化：`experimental { cache_file { ... } }` 的 `store_dns`。

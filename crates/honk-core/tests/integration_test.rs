@@ -34,6 +34,7 @@ mod integration_tests {
             dns::routing::DnsRouter::new(&honk_config::dns::DnsRouting {
                 rules: vec![],
                 fallback: "default".into(),
+                ..Default::default()
             })
             .unwrap(),
         );

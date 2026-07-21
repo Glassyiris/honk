@@ -119,7 +119,8 @@ honk 沿用 dae 的内核模型，但并非移植。主要不同点：
 - [ ] VMess / VLESS / SSR / Trojan-Go 的 UDP 中继
 - [ ] REALITY + uTLS（**已延期** — rustls 缺成熟 hook）
 - [ ] smux/yamux；h2mux 与官方 sing-box multiplex inbound 的验证互通
-- [ ] 真正的 DoT/DoH/DoQ 上游；FakeIP 引擎
+- [x] 真正的 DoT/DoH/DoQ/DoH3 上游（TLS/H2/QUIC 会话复用）
+- [ ] FakeIP 引擎
 - [ ] 内核侧 eBPF DNS 应答缓存（用户态缓存已有）
 - [ ] 一致性哈希负载均衡（轮询 LoadBalance 已有）
 - [ ] 对生产环境对端的更广 live 互通测试；root netns 门禁例行化
