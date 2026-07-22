@@ -45,9 +45,7 @@ mod integration_tests {
                     address: "8.8.8.8:53".into(),
                     protocol: honk_config::types::DnsProtocol::Udp,
                     tls_server_name: None,
-                    bootstrap: None,
                     outbound: None,
-                    tags: vec![],
                 }],
                 router.clone(),
             )

@@ -550,9 +550,7 @@ mod tests {
             address: addr.to_string(),
             protocol,
             tls_server_name: None,
-            bootstrap: None,
             outbound: None,
-            tags: vec![],
         }
     }
 

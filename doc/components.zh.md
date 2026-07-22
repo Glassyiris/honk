@@ -311,7 +311,6 @@ dns {
 | `routing` | object | fallback 默认 | 请求路由；dae：`routing { request { ... } }` |
 | `strategy` | enum | `preferipv4` | 地址族策略；dae：`ipversion_prefer: 4\|6` |
 | `cache` | object | 启用 | 缓存；dae：`optimistic_cache` / `optimistic_cache_ttl` / `max_cache_size` |
-| `has_response_routing` | bool | `false` | 存在 dae `response {}` 时置位（标志） |
 
 ### 上游
 
@@ -320,22 +319,20 @@ dns {
 | `name` | string | 必填 | Id；dae 中冒号前的名字 |
 | `address` | string | 必填 | `ip:port` 或主机；dae 中取 URI 的主机部分 |
 | `protocol` | enum | `udp` | `udp`/`tcp`/`tls`/`https`/`quic`；dae 中由 URI scheme 决定（`udp://`、`tcp://`、`tcp+udp://`/`udp+tcp://`、`tls://`、`https://`、`h3://`、`quic://`，无 scheme 默认为 UDP） |
-| `tls_server_name` | string? | null | DoT/DoH SNI（结构化模型字段，dae 语法无对应键） |
-| `bootstrap` | string? | null | Bootstrap DNS（结构化模型字段，dae 语法无对应键） |
+| `tls_server_name` | string? | null | DoT/DoH SNI；dae 语法中当主机名不是 IP 时自动派生 |
 | `outbound` | string? | null | 经节点/组发出；dae 中行内后缀 `'uri' -> <name>`（旧：`outbound: name`） |
-| `tags` | string[] | `[]` | 标签（结构化模型字段，dae 语法无对应键） |
 
-**运行时说明：** UDP/TCP 可用；TLS/HTTPS/QUIC 目前偏向回退普通 TCP。经代理的 DNS SOCKS5 UDP 路径不完整。
+**运行时说明：** UDP/TCP/DoT/DoH/DoQ/DoH3 均可用（连接复用）。DoT/DoH/TCP 支持 `-> proxy`（经节点/组的 TCP 隧道）；DoQ/DoH3 暂仅直连。经代理的 DNS SOCKS5 UDP 路径不完整（UDP+代理隧道化为 TCP DNS）。
 
 ### 路由 / 规则
 
 | 字段 | 含义 |
 | ------ | ------ |
-| `routing.fallback` | 无规则命中时的上游名；dae：`request { fallback: <上游名> }` |
-| `routing.rules[].domain` | 可带前缀的模式（结构化模型字段；dae 解析器目前不读取 `request` 内的规则行） |
-| `routing.rules[].upstream` | 上游名（同上） |
-
-前缀：`suffix:`、`keyword:`、`full:`、`regex:`；裸字符串 = 完整精确匹配。
+| `request { <条件> [&& <条件>...] -> <动作> }` | 请求规则，首条命中。条件：`qname(suffix:/keyword:/full:/regex:/geosite:...)`、`qtype(a/aaaa/...)`；`!` 取反。动作：`reject`、`asis`（拨查询的原始目的地址）或上游名 |
+| `request { fallback: <上游名> }` | 无请求规则命中时的上游 |
+| `response { <条件> [&& <条件>...] -> <动作> }` | 响应规则，首条命中。条件：`upstream(name)`、`qname(...)`、`ip(cidr, geoip:...)`；`!` 取反。动作：`accept`、`reject` 或上游名（重新查询，深度 ≤ 3） |
+| `response { fallback: accept\|reject }` | 无响应规则命中时的判定 |
+| `routing.rules[].domain` / `.upstream` | 旧版纯模式字段（前缀 `suffix:`/`keyword:`/`full:`/`regex:`）；无新式规则时在加载时转换为请求规则 |
 
 ### 策略
 

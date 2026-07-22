@@ -133,9 +133,7 @@ fn bench_forwarder_cache_hit(c: &mut Criterion) {
             address: addr.to_string(),
             protocol: DnsProtocol::Udp,
             tls_server_name: None,
-            bootstrap: None,
             outbound: None,
-            tags: vec![],
         }];
         let router = Arc::new(
             DnsRouter::new(&DnsRouting {
@@ -244,9 +242,7 @@ fn bench_udp_pool_exchange(c: &mut Criterion) {
             address: addr.to_string(),
             protocol: DnsProtocol::Udp,
             tls_server_name: None,
-            bootstrap: None,
             outbound: None,
-            tags: vec![],
         }];
         let router = Arc::new(
             DnsRouter::new(&DnsRouting {

@@ -611,7 +611,6 @@ dns {
 }
 "#;
     let config = parse_dae_config(input).unwrap();
-    assert!(config.dns.has_response_routing);
     assert_eq!(config.dns.routing.response.rules.len(), 2);
     // First rule
     let rule0 = &config.dns.routing.response.rules[0];

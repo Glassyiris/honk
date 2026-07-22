@@ -23,9 +23,6 @@ pub struct DnsConfig {
     /// Cache settings
     #[serde(default)]
     pub cache: DnsCacheConfig,
-    /// Whether response routing is configured (derived from parsed rules).
-    #[serde(default)]
-    pub has_response_routing: bool,
     /// Per-domain fixed TTL overrides. Key = domain, value = TTL seconds.
     /// A value of 0 means "never cache".
     #[serde(default)]
@@ -45,9 +42,6 @@ pub struct DnsUpstream {
     /// TLS server name
     #[serde(default)]
     pub tls_server_name: Option<String>,
-    /// Bootstrap DNS for resolving upstream
-    #[serde(default)]
-    pub bootstrap: Option<String>,
     /// Outbound node/group to route this upstream through (e.g. `proxy`).
     ///
     /// dae syntax: `name: 'https://dns.google/dns-query' -> proxy`
@@ -55,9 +49,6 @@ pub struct DnsUpstream {
     /// node/group instead of a direct connection.
     #[serde(default)]
     pub outbound: Option<String>,
-    /// Tags for matching
-    #[serde(default)]
-    pub tags: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -505,9 +496,7 @@ impl Default for DnsConfig {
                 address: "223.5.5.5:53".to_string(),
                 protocol: DnsProtocol::Udp,
                 tls_server_name: None,
-                bootstrap: None,
                 outbound: None,
-                tags: vec![],
             }],
             routing: DnsRouting::default(),
             strategy: DnsStrategy::PreferIpv4,
@@ -516,7 +505,6 @@ impl Default for DnsConfig {
                 ttl: 600,
                 max_size: 10000,
             },
-            has_response_routing: false,
             fixed_domain_ttl: HashMap::new(),
         }
     }
@@ -621,14 +609,6 @@ mod tests {
             converted.fallback,
             DnsRequestAction::Upstream("default".to_string())
         );
-    }
-
-    #[test]
-    fn test_has_response_routing_from_parsed() {
-        let mut cfg = DnsConfig::default();
-        assert!(!cfg.has_response_routing);
-        cfg.has_response_routing = true;
-        assert!(cfg.has_response_routing);
     }
 
     #[test]

@@ -355,7 +355,6 @@ fn parse_dns_section(section: &Section) -> Result<DnsConfig, crate::ConfigError>
                 }
                 if let Some(resp_body) = resp {
                     cfg.routing.response = parse_dns_response_routing(&resp_body);
-                    cfg.has_response_routing = true;
                 }
             }
             "fixed_domain_ttl" => {
@@ -404,9 +403,7 @@ fn parse_dns_upstreams(body: &str) -> Vec<crate::dns::DnsUpstream> {
                 address,
                 protocol,
                 tls_server_name,
-                bootstrap: None,
                 outbound,
-                tags: vec![],
             });
         }
     }

@@ -78,9 +78,7 @@ fn make_upstream(name: &str, addr: &str, protocol: DnsProtocol) -> DnsUpstream {
         address: addr.into(),
         protocol,
         tls_server_name: None,
-        bootstrap: None,
         outbound: None,
-        tags: vec![],
     }
 }
 
@@ -477,9 +475,7 @@ async fn live_google_doh_request_path() {
         address: "dns.google/dns-query".into(),
         protocol: DnsProtocol::Https,
         tls_server_name: None,
-        bootstrap: None,
         outbound: None,
-        tags: vec![],
     };
     let router = Arc::new(
         DnsRouter::new(&DnsRouting {

@@ -355,7 +355,6 @@ dns {
 | `optimistic_cache` | `cache.enabled` | `true` | Cache on/off |
 | `optimistic_cache_ttl` | `cache.ttl` | `600` | Fixed positive-cache TTL (overrides answer min TTL; `0` keeps answer TTL) |
 | `max_cache_size` | `cache.max_size` | `10000` | Max entries (must be > 0) |
-| `response { ... }` (presence) | `has_response_routing` | `false` | Flag set if dae `response{}` present |
 
 ### Upstream
 
@@ -367,9 +366,7 @@ Each upstream is a `name: 'uri'` line; an optional trailing `-> tag` (or legacy 
 | `address` | string | required | `ip:port` or host (from the URI) |
 | `protocol` | enum | `udp` | From URI scheme: `udp`/`tcp`/`tls`/`https`/`quic` (`tcp+udp`, `h3`/`http3` aliases) |
 | `tls_server_name` | string? | null | DoT/DoH SNI; dae syntax auto-derives from hostname when not an IP |
-| `bootstrap` | string? | null | Bootstrap DNS; not settable in dae syntax |
 | `outbound` | string? | null | Send via node/group (trailing `-> tag`) |
-| `tags` | string[] | `[]` | Labels; not settable in dae syntax |
 
 **Runtime note:** UDP/TCP/DoT/DoH/DoQ/DoH3 work with connection reuse. DoT/DoH/TCP support `-> proxy` (TCP tunnel via node/group). DoQ/DoH3 are direct-only for now. DNS-over-proxy SOCKS5 UDP is incomplete (UDP+proxy tunnels as TCP DNS).
 
@@ -377,9 +374,11 @@ Each upstream is a `name: 'uri'` line; an optional trailing `-> tag` (or legacy 
 
 | Item | Meaning |
 | ------ | --------- |
-| `request { fallback: name }` | Upstream if no rule matches (the only request-routing key parsed from dae syntax) |
-| `routing.rules[].domain` | Pattern with optional prefix (`suffix:`, `keyword:`, `full:`, `regex:`; bare = full exact) — schema field; per-rule `qname(...) -> upstream` lines are **not** parsed from dae syntax today |
-| `routing.rules[].upstream` | Upstream name (schema field) |
+| `request { <cond> [&& <cond>...] -> <action> }` | Request rules, first match wins. Conditions: `qname(suffix:/keyword:/full:/regex:/geosite:...)`, `qtype(a/aaaa/...)`; `!` negates a condition. Actions: `reject`, `asis` (dial the query's original destination), or an upstream name |
+| `request { fallback: name }` | Upstream when no request rule matches |
+| `response { <cond> [&& <cond>...] -> <action> }` | Response rules, first match wins. Conditions: `upstream(name)`, `qname(...)`, `ip(cidr, geoip:...)`; `!` negates. Actions: `accept`, `reject`, or an upstream name (re-query, depth ≤ 3) |
+| `response { fallback: accept\|reject }` | Verdict when no response rule matches |
+| `routing.rules[].domain` / `.upstream` | Legacy schema-only fields (`suffix:`/`keyword:`/`full:`/`regex:` prefixes), converted to request rules at load when no new-style rules exist |
 
 ### Strategy
 
