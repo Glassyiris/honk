@@ -83,9 +83,8 @@ dashmap.workspace = true
 libsystemd.workspace = true
 nix.workspace = true
 sha2.workspace = true
-tokio-rustls.workspace = true
-rustls-pemfile.workspace = true
-webpki-roots.workspace = true
+boring.workspace = true
+tokio-boring.workspace = true
 aes-gcm.workspace = true
 chacha20poly1305.workspace = true
 hkdf.workspace = true
@@ -115,6 +114,10 @@ tempfile.workspace = true
 tokio-test.workspace = true
 tokio-tungstenite.workspace = true
 rcgen.workspace = true
+# rustls: test-only — mock TLS/QUIC servers prove interop with the BoringSSL client stack
+tokio-rustls.workspace = true
+rustls-pemfile.workspace = true
+webpki-roots.workspace = true
 criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
 futures-util = "0.3"
 

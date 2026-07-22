@@ -53,24 +53,6 @@ pub fn congestion_factory(
     }
 }
 
-/// Build a rustls client config for a QUIC protocol.
-///
-/// Reuses the shared `tls.rs` configs (webpki roots, or a no-verify verifier
-/// when `skip_cert_verify` is set) and overrides the ALPN protocol list with
-/// the protocol-specific value (e.g. `tuic`, `h3`).
-pub fn rustls_client_config(
-    skip_cert_verify: bool,
-    alpn: &[&[u8]],
-) -> anyhow::Result<tokio_rustls::rustls::ClientConfig> {
-    let mut cfg = if skip_cert_verify {
-        crate::tls::standard_dangerous_config()?
-    } else {
-        crate::tls::standard_config()?
-    };
-    cfg.alpn_protocols = alpn.iter().map(|a| a.to_vec()).collect();
-    Ok(cfg)
-}
-
 /// Assemble a quinn [`ClientConfig`] for a proxy protocol.
 ///
 /// - `alpn`: ALPN protocol list required by the protocol (TUIC: `tuic`,
@@ -79,16 +61,26 @@ pub fn rustls_client_config(
 /// - `keep_alive`: optional QUIC keep-alive interval (Juicity uses 5s per the
 ///   daeuniverse reference client; TUIC relies on its own heartbeat datagrams
 ///   instead and passes `None`).
+///
+/// TLS is the BoringSSL backend in [`crate::quic_boring`] (Chrome fingerprint
+/// when `tls_implementation = "utls"`, ECH when the node carries one).
 pub fn client_config(
-    skip_cert_verify: bool,
+    node: &honk_config::node::Node,
     alpn: &[&[u8]],
     congestion: Option<&str>,
     keep_alive: Option<Duration>,
 ) -> anyhow::Result<ClientConfig> {
-    let rustls_cfg = rustls_client_config(skip_cert_verify, alpn)?;
-    let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(rustls_cfg)
-        .map_err(|e| anyhow!("rustls client config is not QUIC-compatible: {e}"))?;
-    let mut cfg = ClientConfig::new(Arc::new(quic_crypto));
+    let alpn_wire = alpn
+        .iter()
+        .flat_map(|p| std::iter::once(p.len() as u8).chain(p.iter().copied()))
+        .collect::<Vec<u8>>();
+    let crypto = crate::quic_boring::BoringQuicClientConfig::new(
+        alpn_wire,
+        node.skip_cert_verify,
+        crate::tls::chrome_mode(),
+        crate::tls::load_ech_config_list(node)?.map(Arc::new),
+    )?;
+    let mut cfg = ClientConfig::new(Arc::new(crypto));
 
     let mut transport = TransportConfig::default();
     transport
@@ -386,7 +378,7 @@ pub(crate) mod testutil {
     /// When `datagrams` is false the server does not advertise QUIC datagram
     /// support, which exercises the UDP-over-stream fallback of clients.
     pub fn server_config(alpn: &[&[u8]], datagrams: bool) -> anyhow::Result<ServerConfig> {
-        let rcgen::CertifiedKey { cert, key_pair } =
+        let rcgen::CertifiedKey { cert, signing_key } =
             rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
 
         let provider = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider();
@@ -398,7 +390,7 @@ pub(crate) mod testutil {
                 .with_single_cert(
                     vec![cert.der().clone()],
                     tokio_rustls::rustls::pki_types::PrivateKeyDer::Pkcs8(
-                        key_pair.serialize_der().into(),
+                        signing_key.serialize_der().into(),
                     ),
                 )
                 .map_err(|e| anyhow!("TLS server config: {e}"))?;

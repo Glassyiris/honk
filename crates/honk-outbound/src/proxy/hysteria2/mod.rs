@@ -668,12 +668,8 @@ impl Hysteria2Handler {
         // and BBR congestion control: sing-quic's default when no bandwidth
         // is configured (`client.go:580-588`). The brutal sender needs
         // configured bandwidth, which the Node schema has no fields for.
-        let config = crate::quic::client_config(
-            node.skip_cert_verify,
-            &[b"h3"],
-            Some("bbr"),
-            Some(KEEP_ALIVE_INTERVAL),
-        )?;
+        let config =
+            crate::quic::client_config(node, &[b"h3"], Some("bbr"), Some(KEEP_ALIVE_INTERVAL))?;
         let quic = QuicClient::new(node.host().to_string(), node.port, server_name, config);
         let quic = match obfs {
             Some(obfs_password) => quic.with_endpoint_factory(salamander_endpoint_factory(

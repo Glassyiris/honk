@@ -136,7 +136,13 @@ async fn udp_fast_path_dns_goes_slow_even_with_endpoint() {
     let client = addr("10.0.0.1:12345");
     let dst = addr("203.0.113.1:53");
     let proxy = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-    let (_ep, is_new) = pool.get_or_create(client, dst, proxy, addr("127.0.0.1:9"), "test-node".to_string());
+    let (_ep, is_new) = pool.get_or_create(
+        client,
+        dst,
+        proxy,
+        addr("127.0.0.1:9"),
+        "test-node".to_string(),
+    );
     assert!(is_new);
 
     assert!(!udp_fast_path(&pool, &dns_query_payload(), client, dst).await);
@@ -205,7 +211,9 @@ fn dae0_internal_addr_covers_real_dae0_addresses() {
         );
     }
     // Other hosts inside the same subnets.
-    assert!(is_honk_internal_addr(&"fd00:686f:6e6b::beef".parse().unwrap()));
+    assert!(is_honk_internal_addr(
+        &"fd00:686f:6e6b::beef".parse().unwrap()
+    ));
     assert!(is_honk_internal_addr(&"169.254.0.200".parse().unwrap()));
     // Outside the subnets — including fd00:dae:d000::/64, the value of
     // the old wrong DAE0_IPV6_PREFIX_HI constant that never matched the

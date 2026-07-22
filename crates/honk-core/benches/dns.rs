@@ -5,7 +5,6 @@
 //!
 //! Focuses on hot-path userspace costs that matter under concurrent DNS load.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -260,7 +259,10 @@ fn bench_udp_pool_exchange(c: &mut Criterion) {
     g.throughput(Throughput::Elements(1));
     g.bench_function("exchange", |b| {
         b.to_async(&rt).iter(|| async {
-            let r = pool.query(black_box(pool_name), black_box(&q)).await.unwrap();
+            let r = pool
+                .query(black_box(pool_name), black_box(&q))
+                .await
+                .unwrap();
             black_box(r);
         });
     });

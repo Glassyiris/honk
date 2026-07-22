@@ -47,7 +47,7 @@ Notable absences (referenced by older docs but **not in this tree**): `Makefile`
 - **eBPF:** userspace [aya](https://github.com/aya-rs/aya) 0.14 (optional `ebpf` feature in `honk-core`); kernel side `aya-ebpf` 0.2 targeting `bpfel-unknown-none` (nightly + `-Zbuild-std=core` + `bpf-linker`).
 - **HTTP API:** axum 0.8 (with `ws`) + tower-http 0.7 (optional `clash-api` feature of `honk-core`, on by default).
 - **QUIC:** quinn 0.11 (TUIC/Juicity/Hysteria2 outbounds, DoQ/DoH3 DNS); `h3`/`h3-quinn` for DoH3 only — Hysteria2 ships its own minimal HTTP/3+QPACK layer.
-- **TLS:** tokio-rustls 0.26 + rustls-pemfile + webpki-roots.
+- **TLS:** [boring](https://github.com/cloudflare/boring) 5.x (BoringSSL) + tokio-boring for TCP TLS and — via the custom `quinn_proto::crypto` backend in `honk-outbound/src/quic_boring.rs` — for QUIC handshakes; webpki-root-certs for CA roots. rustls remains only as a **dev/test** dependency (loopback servers proving wire interop). boring-sys builds BoringSSL from source: requires `cmake` + a C compiler + `libclang` (bindgen).
 - **Persistence:** rusqlite 0.40 (`bundled`) for the `cachedb` SQLite cache.
 - **Serialization:** serde, toml 1, serde_json, serde_yaml.
 - **Logging:** tracing + tracing-subscriber (`env-filter`, `json`); also `log`.
@@ -66,9 +66,9 @@ Configuration schema and parsers used by the rest of the project. Deps are pure-
 - Format loading: the dae syntax is primary; TOML/YAML/JSON serde loaders remain for compatibility (undocumented). `from_file` picks by extension — recognized `.json`/`.yaml`/`.toml` try that format then fall back only among TOML/YAML/JSON (dae is never tried); unknown/missing extensions try `dae → TOML → YAML → JSON`.
 - `src/parser/` — the dae-syntax parser. **`parser/mod.rs` is the entire real parser** (line/section based, ~1200 lines): all sections, group policies and aliases (`fixed(0)`/`select`→Selector, `min_moving_avg`/`min_avg10`/`min_last_delay`→URLTest, `roundrobin`→LoadBalance, `fallback`→Fallback), nested `filter: group('a','b')` (comma or pipe separated) routed into `Group.groups`, DNS `upstream`/`routing { request/response }`, `fixed_domain_ttl`, `subscription`, `experimental`, `resolve_group_filters`. `parser/lexer.rs` is **dead scaffolding** (`tokenize()` returns an empty vec); `section_parser.rs` is only the `Section` struct.
 - Group filter resolution: `resolve_group_filters` resolves only node filters (`name('exact')`, `name(keyword: 'pat')` — case-sensitive substring); the "include all nodes" fallback applies **only** when a group has neither node filters nor sub-groups.
-- `src/node.rs` — `Node` (all per-protocol fields) **plus `Group` and `GroupPolicy`** (Selector/URLTest/LoadBalance/Fallback). `src/group.rs` is a 2-line re-export. `Group.groups: Vec<String>` holds nested sub-group tags; `Group.default`, `final_outbound` (dae `final:`), `tolerance` (default 50 ms), `idle_timeout`, `interrupt_connections`.
+- `src/node.rs` — `Node` (all per-protocol fields, incl. **ECH**: `ech_enabled` / `ech_config` / `ech_config_path`) **plus `Group` and `GroupPolicy`** (Selector/URLTest/LoadBalance/Fallback). `src/group.rs` is a 2-line re-export. `Group.groups: Vec<String>` holds nested sub-group tags; `Group.default`, `final_outbound` (dae `final:`), `tolerance` (default 50 ms), `idle_timeout`, `interrupt_connections`.
 - `src/dns.rs` — much richer than a plain upstream list: `DnsConfig` (`upstream`, `routing`, `strategy`, `cache`, `fixed_domain_ttl`), `DnsUpstream` (name, address, `protocol: DnsProtocol`, `tls_server_name`, **`outbound: Option<String>`** — per-upstream dial-path proxy tag), and the dae-shaped DNS routing model (`DnsRequestRule`/`DnsResponseRule` with AND-ed `DnsCond`s — Qname/Qtype/Upstream/Ip, each negatable — first match wins; actions Reject/AsIs/Accept/Upstream(name); legacy `rules`/`fallback` with conversion). `types.rs::DnsProtocol` has 6 variants: Udp, Tcp, Tls (DoT), Https (DoH), H3 (DoH3), Quic (DoQ). Request/response routing types are populated only by the dae parser (deliberately outside the serde tree).
-- `src/share_link.rs` — `Node::from_share_link`, the single share-link parser: SIP002 `ss://` (all base64 forms, plugin suffix), `ssr://` base64 blobs, `vmess://` base64-JSON (v2rayN schema), trojan/trojan-go ws/grpc query params, AnyTLS pool params, plus socks5/http(s)/vless/hysteria2/tuic/juicity. Node name = decoded `#fragment`, else `scheme-host` (never leaks credentials). Chain links (`a -> b`): only the first hop is parsed. Used by the dae parser and `honk-core` subscriptions.
+- `src/share_link.rs` — `Node::from_share_link`, the single share-link parser: SIP002 `ss://` (all base64 forms, plugin suffix), `ssr://` base64 blobs, `vmess://` base64-JSON (v2rayN schema), trojan/trojan-go ws/grpc query params, AnyTLS pool params, **ECH params** (`ech_config=<base64url ECHConfigList>`, `ech=1`), plus socks5/http(s)/vless/hysteria2/tuic/juicity. Node name = decoded `#fragment`, else `scheme-host` (never leaks credentials). Chain links (`a -> b`): only the first hop is parsed. Used by the dae parser and `honk-core` subscriptions.
 - `src/routing.rs` — `RoutingRule` (condition + outbound + priority + **`must` flag** — Go dae semantics: match does not finalize, continues searching), `RoutingCondition` (14 matcher lists incl. dscp, ip_version, mac, process_name, geoip/geosite), `RoutingOutbound` (Simple/Complex), `RoutingConfig`.
 - `src/experimental.rs` — `ExperimentalConfig` { `clash_api: ClashApiConfig` (`external_controller`, `external_ui`, `secret`, **`default_mode`**, default "Rule"), `cache_file: CacheFileConfig` (`enabled`, `path` default `cache.db`, `cache_id`, `store_fakeip`, `store_dns`) } — also parsed from the dae `experimental { ... }` section.
 - `src/subscription.rs`, `src/types.rs` (`NodeProtocol` 12 variants, `DialMode` ip/domain/domain+/domain++, config-side `OutboundIndex` — **a different type** from `honk-ebpf-common`'s `#[repr(u8)] OutboundIndex`, `SubscriptionType`, `DnsProtocol`), `src/error.rs` (`ConfigError`).
@@ -121,9 +121,10 @@ Outbound dialing, groups, and health checking. Re-exported by `honk-core` as `ho
 - `src/proxy/transport.rs` — shared stream-transport layer for trojan/vmess/vless (TCP → optional TLS → h2mux **or** WS/gRPC, driven by `node.mux`/`node.transport`/`ws_path`/`ws_host`/`grpc_service`); hand-rolled minimal gRPC-over-H2 client.
 - `src/proxy/mux.rs` — h2mux (`node.mux = true`; h2mux only, no smux/yamux): process-wide `MuxManager` caching HTTP/2 sessions per `(host, port, tls, sni)`, sing-mux session header `0x00 0x02`, one h2 stream per dial (`:method CONNECT`, `:authority localhost`, 200 OK expected), least-loaded session reused below 8 streams, one redial on GOAWAY/error, idle (0-stream) sessions closed after 60s. Mux and WS/gRPC transport are mutually exclusive (mux wins). honk writes the proxy handshake onto each h2 stream instead of sing-mux's outer-handshake + per-stream `StreamRequest`, so **official sing-box multiplex inbounds are not interop-verified**.
 - `src/proxy/anytls.rs` — sing-anytls session multiplexing: global session pool per `host:port`, demux task per session dispatching frames by `sid`, atomic sid allocator, FIN ends streams, janitor reaps stream-less idle sessions and pre-establishes `min_idle` sessions (node fields `anytls_min_idle_session` / `anytls_idle_session_check_interval` / `anytls_idle_session_timeout`).
-- `src/quic.rs` — shared quinn 0.11 plumbing for tuic/juicity/hysteria2: rustls ClientConfig assembly (ALPN, cubic/new_reno/bbr), client `Endpoint` on `SO_MARK`'ed UDP sockets, single-flight `QuicClient<C>` connection holder, `QuicBiStream`, plus `#[cfg(test)] testutil` in-process QUIC servers.
+- `src/quic.rs` — shared quinn 0.11 plumbing for tuic/juicity/hysteria2: `client_config(node, ...)` assembling a quinn ClientConfig over the **BoringSSL crypto backend** (ALPN, cubic/new_reno/bbr), client `Endpoint` on `SO_MARK`'ed UDP sockets, single-flight `QuicClient<C>` connection holder, `QuicBiStream`, plus `#[cfg(test)] testutil` in-process QUIC servers (rustls, for interop coverage).
+- `src/quic_boring.rs` — **quinn-proto `crypto::Session` over BoringSSL QUIC APIs** (`SSL_set_quic_method` / `SSL_provide_quic_data` / `SSL_export_keying_material`): TLS 1.3 handshake, RFC 9001 key schedule (HKDF + AEAD + header protection via `boring::aead`, `aes`, `chacha20`), key update, retry integrity, transport-params plumbing. This is what makes **ECH on QUIC** (hy2/juicity/tuic/DoQ/DoH3) and a real Chrome QUIC ClientHello possible — rustls has no client ECH, quiche exposes no per-connection ECH hook. Header-protection masking is pn-length-aware (hard-learned: a fixed 4-byte mask corrupts short-pn payloads and self-cancels against a same-bug peer).
 - `src/proxy/tuic.rs` (TUIC v5: TLS-exporter auth on uni stream, TCP = bi stream, UDP = datagrams with uni-stream fallback + fragmentation, 10s heartbeat), `src/proxy/juicity.rs` (ALPN `h3`, UDP on one length-framed bi stream), `src/proxy/hysteria2/` (`mod.rs` handler: ALPN `h3`, BBR — brutal impossible since `Node` has no bandwidth fields; `h3.rs` self-contained minimal HTTP/3+QPACK for `POST https://hysteria/auth` status 233; `salamander.rs` self-contained BLAKE2b-256 + XOR obfs socket). One shared QUIC connection per node; per-session loopback UDP bridges.
-- `src/tls.rs` — TLS client configs: webpki-roots and no-verify variants, **plus a Chrome-131 fingerprint mode** toggled process-wide via `set_tls_mode` (`tls_implementation = "utls"`); `build_connector(node)` picks per `node.skip_cert_verify`.
+- `src/tls.rs` — **BoringSSL TLS client**: webpki root store and no-verify variants, a **real Chrome fingerprint** toggled process-wide via `set_tls_mode` (`tls_implementation = "utls"`) — GREASE, permuted extensions, X25519MLKEM768+X25519 key shares (`mlkem` feature), Chrome sigalgs/curves, brotli cert compression, ALPS-h2, ECH GREASE — and **real ECH** per node (`ech_config` / `ech_config_path`, `SSL_set1_ech_config_list`; ECH rejection is fail-closed per RFC and surfaces retry configs in logs). `build_connector(node)` for proxy outbounds, `build_dns_connector()` for DoT/DoH upstreams.
 - `src/bootstrap.rs` — **bootstrap DNS resolution for proxy-server hostnames** (dae `bootstrap_resolver` parity): process-wide resolver querying over bypass-marked UDP/TCP with a hand-rolled wire codec, falling back to the system resolver. Node dials must use it (wired into `util::connect_marked` and `quic.rs`), never bare `lookup_host` — otherwise resolution deadlocks against honk's own intercepted DNS path.
 - `src/util.rs` — `connect_marked` / `connect_outbound` (TCP with `SO_MARK`, keepalive, timeout), `udp_marked_bind`, `udp_loopback_bind`. **SO_MARK discipline:** every control-plane-originated socket must carry `DAE_BYPASS_MARK` (or be loopback) or `wan_egress` re-routes it into `daens`, looping the gateway's own traffic.
 - `src/alive/` — `AliveDialerSet` health checking. Split: `mod.rs` (state, thresholds, registries, eBPF connectivity-push callback, `StickyCache`), `probe.rs` (`probe_node` HTTP/raw-connect, `probe_node_udp` DNS-through-`dial_udp`, concurrent cycle runner), `collection.rs` (`DialerCollection`: latencies + moving average + alive flag; failures append a synthetic 10s sample), `latencies.rs` (O(1) ring buffer, cap 10).
@@ -202,7 +203,7 @@ Key runtime invariants (do not break):
 
 ```bash
 cargo check
-cargo build --release                 # whole workspace
+cargo build --release                 # whole workspace (needs cmake + C compiler + libclang for boring-sys)
 cargo build --release -p honk-core    # engine (default features: clash-api, mock eBPF)
 cargo test --all                      # full suite (see current status below!)
 ```
@@ -254,18 +255,20 @@ cargo +nightly build --release -Zbuild-std=core --target bpfel-unknown-none
 
 `.github/workflows/release.yml` runs on `v*` tags: `cargo test --all` gate (stable toolchain), then builds `honk-core --features ebpf` for `x86_64`/`aarch64` × `gnu`/`musl` (via `cross`; the eBPF object is built once on the host with nightly + `bpf-linker`, which the workflow substitutes for the hardcoded linker path), and publishes tarballs to a GitHub Release (marked prerelease when the tag contains `alpha`/`beta`/`rc`).
 
-## Current test status (verified 2026-07-22)
+## Current test status (verified 2026-07-22, after the boring-tls migration)
 
-`cargo test --all` does **not** currently pass. Known failures, so you don't think you caused them:
+Only pre-existing failures remain. `cargo clippy --all --all-targets -- -D warnings` is clean.
 
 | Crate | Result |
 | ------- | -------- |
-| `honk-config` | lib 37 pass; `tests/example_configs.rs` 3 pass (all three root `.dae` files parse); `tests/share_link.rs` 24 pass / **2 fail** — `test_config_toml_round_trip` and `test_to_file_and_from_file_by_extension`: TOML round-trip serialization is broken (recent DNS config surface doesn't survive `toml`) |
+| `honk-config` | lib 37 pass; `tests/example_configs.rs` 3 pass; `tests/share_link.rs` 26 pass / **2 fail** — `test_config_toml_round_trip` and `test_to_file_and_from_file_by_extension`: TOML round-trip serialization is broken (recent DNS config surface doesn't survive `toml`) — pre-existing |
 | `honk-ebpf-common` | no tests |
-| `honk-outbound` | **lib test target does not compile**: test code in `src/quic.rs` uses `rcgen::CertifiedKey.key_pair`, renamed to `signing_key` in rcgen 0.14.8, plus a `bytes::Bytes` `PartialEq` mismatch (4 errors) |
-| `honk-core` | lib 351 pass (1 ignored); `tests/integration_test.rs` 21 pass; `tests/clash_api_test.rs` 21 pass; `tests/config_dae_routing_test.rs` **1 fail** — `test_routing_with_config_dae` expects `domain(suffix: jogiyw.sbs) -> direct` in the root `config.dae`, which no longer contains that rule (falls through to `dport(...443...) -> omg`) |
+| `honk-outbound` | lib 231 pass (the target previously did not compile at all). Includes: `tls::tests` (boring↔boring handshakes, real ECH round-trip, fail-closed ECH rejection), `quic_boring::tests` (RFC 9001 A.1/A.2 vectors, boring↔rustls cross-impl keys, boring QUIC client ↔ rustls server interop in standard/Chrome-fingerprint/ECH-GREASE modes, fail-closed real ECH over QUIC), and the full hysteria2/tuic/juicity loopback end-to-end suites over the BoringSSL QUIC backend |
+| `honk-core` | lib 351 pass (1 ignored); `tests/integration_test.rs` 21 pass; `tests/clash_api_test.rs` 31 pass; `tests/config_dae_routing_test.rs` **1 fail** — `test_routing_with_config_dae` expects `domain(suffix: jogiyw.sbs) -> direct` in the root `config.dae`, which no longer contains that rule — pre-existing |
 
-Consequence: the release workflow's `cargo test --all` gate would fail today. When fixing code, run at least `cargo test -p <crate>` for the crates you touched and don't regress the passing suites.
+Environment notes: (1) tests must run with `HTTP_PROXY`/`HTTPS_PROXY` **unset** — reqwest picks up proxy env vars and the clash-ui download test's loopback fetch otherwise dies (`Connection reset`); (2) building `boring-sys` needs `cmake`, a C compiler, and `libclang` for bindgen (on nix set `LIBCLANG_PATH` + `BINDGEN_EXTRA_CLANG_ARGS`, e.g. via `~/.cargo/config.toml` `[env]`); (3) the release workflow's `cargo test --all` gate still fails on the two pre-existing suites above — CI cross images also need `cmake`/`libclang` for the boring build.
+
+When fixing code, run at least `cargo test -p <crate>` for the crates you touched and don't regress the passing suites.
 
 ## Code style guidelines
 
@@ -351,7 +354,16 @@ Use subagents to spawn specialized workers:
 | `momus` | Ruthless plan reviewer | High-accuracy plan validation |
 | `sisyphus-junior` | Task executor | Atomic tasks with clear instructions |
 
-All agents use DeepSeek models (current default provider).
+Model routing (see global `/skill:ulw` for full matrix + Backup rules):
+
+| 职能 | Model | thinking | 典型 Agent |
+| --- | --- | --- | --- |
+| Coder | `kimi-coding/k3` | `high` | `hephaestus`, `sisyphus-junior` |
+| Explore | `deepseek/deepseek-v4-flash` | `high` | `Explore`, locator/analyzer 族 |
+| Web | `deepseek/deepseek-v4-pro` | `high` | `librarian`, `web-search-researcher` |
+| Planner | `kimi-coding/k3` | `max` | `prometheus`, `Plan`, `atlas`, `metis` |
+| Reviewer | `kimi-coding/k3` | `max` | `momus`, `oracle`, artifact/slice reviewers |
+| Backup | `xai/grok-4.5` | `high` | `backup` agent（frontmatter 锁定；勿用 model 参数覆盖） |
 
 ### ULW principles
 

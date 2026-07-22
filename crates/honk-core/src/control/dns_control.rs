@@ -14,8 +14,8 @@
 use crate::dns::forwarder::DnsForwarder;
 use crate::ebpf::EbpfBackend;
 use crate::routing::Router;
-use honk_ebpf_common::DomainRouting;
 use dashmap::DashMap;
+use honk_ebpf_common::DomainRouting;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;

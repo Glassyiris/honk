@@ -20,10 +20,15 @@ sha1.workspace = true
 sha2.workspace = true
 hmac.workspace = true
 hkdf.workspace = true
-tokio-rustls.workspace = true
-rustls-pemfile.workspace = true
-webpki-roots.workspace = true
+boring.workspace = true
+boring-sys.workspace = true
+tokio-boring.workspace = true
+brotli.workspace = true
+webpki-root-certs.workspace = true
+foreign-types.workspace = true
 aes-gcm.workspace = true
+aes.workspace = true
+chacha20.workspace = true
 chacha20poly1305.workspace = true
 blake3.workspace = true
 bytes.workspace = true
@@ -37,6 +42,7 @@ tokio-tungstenite.workspace = true
 futures-util.workspace = true
 # QUIC transport (TUIC / Hysteria2 / Juicity outbounds)
 quinn.workspace = true
+quinn-proto.workspace = true
 # HTTP/2 framing for h2mux multiplexing
 h2.workspace = true
 http.workspace = true
@@ -44,3 +50,8 @@ http.workspace = true
 [dev-dependencies]
 rcgen.workspace = true
 tracing-subscriber.workspace = true
+# rustls: test-only — loopback TLS/QUIC servers prove wire interop with the
+# BoringSSL client stack (and cross-check the QUIC crypto backend)
+tokio-rustls.workspace = true
+rustls-pemfile.workspace = true
+webpki-roots.workspace = true

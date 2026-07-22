@@ -12,8 +12,8 @@ use honk_config::types::DnsProtocol;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio_rustls::TlsAcceptor;
-use tokio_rustls::rustls::{self, ServerConfig};
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use tokio_rustls::rustls::{self, ServerConfig};
 
 use crate::dns::endpoint::DnsEndpoint;
 use crate::dns::forwarder::{DnsForwarder, DnsUpstreamPool, build_dns_query};
@@ -252,17 +252,22 @@ async fn dot_pool_roundtrip() {
     let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
     let mut tls = connector.connect(name, tcp).await.unwrap();
     let q = build_dns_query("example.com", 1);
-    let resp = crate::dns::transport::exchange_length_prefixed(&mut tls, &q, Duration::from_secs(2))
-        .await
-        .unwrap();
+    let resp =
+        crate::dns::transport::exchange_length_prefixed(&mut tls, &q, Duration::from_secs(2))
+            .await
+            .unwrap();
     assert!(resp.len() >= 12);
     assert_eq!(&resp[0..2], &q[0..2]);
-    let _ = (ep, DotPool::new(DialContext {
-        endpoint: DnsEndpoint::parse("127.0.0.1:1", DnsProtocol::Tls, Some("localhost")).unwrap(),
-        query_timeout: Duration::from_secs(1),
-        dial_timeout: Duration::from_secs(1),
-        proxy: None,
-    }));
+    let _ = (
+        ep,
+        DotPool::new(DialContext {
+            endpoint: DnsEndpoint::parse("127.0.0.1:1", DnsProtocol::Tls, Some("localhost"))
+                .unwrap(),
+            query_timeout: Duration::from_secs(1),
+            dial_timeout: Duration::from_secs(1),
+            proxy: None,
+        }),
+    );
     server.await.unwrap();
 }
 
@@ -300,7 +305,8 @@ async fn doh_post_over_h2_roundtrip() {
                 .body(())
                 .unwrap();
             let mut send = respond.send_response(response, false).unwrap();
-            send.send_data(bytes::Bytes::from(resp_bytes), true).unwrap();
+            send.send_data(bytes::Bytes::from(resp_bytes), true)
+                .unwrap();
         }
         // Drive connection to completion briefly.
         while conn.accept().await.is_some() {}
@@ -351,13 +357,20 @@ async fn doh_post_over_h2_roundtrip() {
     }
     crate::dns::transport::restore_dns_id(&mut buf, orig);
     assert!(buf.len() >= 12);
-    let _ = (ep, DohClient::new(DialContext {
-        endpoint: DnsEndpoint::parse("127.0.0.1/dns-query", DnsProtocol::Https, Some("localhost"))
+    let _ = (
+        ep,
+        DohClient::new(DialContext {
+            endpoint: DnsEndpoint::parse(
+                "127.0.0.1/dns-query",
+                DnsProtocol::Https,
+                Some("localhost"),
+            )
             .unwrap(),
-        query_timeout: Duration::from_secs(1),
-        dial_timeout: Duration::from_secs(1),
-        proxy: None,
-    }));
+            query_timeout: Duration::from_secs(1),
+            dial_timeout: Duration::from_secs(1),
+            proxy: None,
+        }),
+    );
     server.abort();
 }
 
@@ -380,7 +393,11 @@ async fn forwarder_cache_hit_all_protocols_udp() {
         }
     });
 
-    let ups = [make_upstream("default", &addr.to_string(), DnsProtocol::Udp)];
+    let ups = [make_upstream(
+        "default",
+        &addr.to_string(),
+        DnsProtocol::Udp,
+    )];
     let pool = Arc::new(UpstreamPool::new(&ups, empty_router()).unwrap());
     let cache = Arc::new(tokio::sync::Mutex::new(DnsCache::new(100)));
     let fw = DnsForwarder::new(pool, cache, empty_router());
@@ -404,8 +421,14 @@ async fn resolver_uses_forwarder_stack() {
         let _ = n;
     });
 
-    let mut cfg = honk_config::dns::DnsConfig::default();
-    cfg.upstream = vec![make_upstream("default", &addr.to_string(), DnsProtocol::Udp)];
+    let mut cfg = honk_config::dns::DnsConfig {
+        upstream: vec![make_upstream(
+            "default",
+            &addr.to_string(),
+            DnsProtocol::Udp,
+        )],
+        ..Default::default()
+    };
     cfg.routing.fallback = "default".into();
     let resolver = DnsResolver::new(&cfg).unwrap();
     let r = resolver.resolve("example.com").await.unwrap();
@@ -437,12 +460,12 @@ fn encrypted_endpoint_defaults() {
 #[tokio::test]
 #[ignore = "live network: Google DoH"]
 async fn live_google_doh_request_path() {
-    use std::time::Instant;
     use crate::dns::cache::DnsCache;
-    use crate::dns::forwarder::{build_dns_query, extract_answer_ips, DnsForwarder};
+    use crate::dns::forwarder::{DnsForwarder, build_dns_query, extract_answer_ips};
     use crate::dns::routing::DnsRouter;
     use crate::dns::upstream_pool::UpstreamPool;
     use honk_config::dns::{DnsRequestAction, DnsRequestRouting, DnsRouting, DnsUpstream};
+    use std::time::Instant;
     use tokio::sync::Mutex;
 
     eprintln!("\n=== Google DoH live request path ===");
@@ -452,7 +475,11 @@ async fn live_google_doh_request_path() {
     let ep = DnsEndpoint::parse("dns.google/dns-query", DnsProtocol::Https, None).unwrap();
     eprintln!(
         "[1] endpoint parse  host={} port={} path={} sni={}  ({:?})",
-        ep.host, ep.port, ep.path, ep.sni, t0.elapsed()
+        ep.host,
+        ep.port,
+        ep.path,
+        ep.sni,
+        t0.elapsed()
     );
     assert_eq!(ep.port, 443);
     assert_eq!(ep.path, "/dns-query");
@@ -461,13 +488,19 @@ async fn live_google_doh_request_path() {
     // 2) Bootstrap resolve of dns.google (system resolver; no bootstrap_resolver set)
     //    IPv4 is preferred so broken dual-stack hosts still dial.
     let t1 = Instant::now();
-    let addrs = ep.resolve_addrs().await.expect("bootstrap resolve dns.google");
+    let addrs = ep
+        .resolve_addrs()
+        .await
+        .expect("bootstrap resolve dns.google");
     eprintln!(
         "[2] bootstrap resolve → {:?}  (prefer first)  ({:?})",
         addrs,
         t1.elapsed()
     );
-    assert!(addrs.iter().any(|a| a.is_ipv4()), "expected A record for dns.google");
+    assert!(
+        addrs.iter().any(|a| a.is_ipv4()),
+        "expected A record for dns.google"
+    );
 
     // 3) Build UpstreamPool + Forwarder (same as production)
     let upstream = DnsUpstream {
@@ -540,10 +573,7 @@ async fn live_google_doh_request_path() {
         .expect("forwarder resolve #1");
     let fd1 = t4.elapsed();
     let fips = extract_answer_ips(&f1);
-    eprintln!(
-        "[5] forwarder.resolve (miss)  ips={:?}  ({:?})",
-        fips, fd1
-    );
+    eprintln!("[5] forwarder.resolve (miss)  ips={:?}  ({:?})", fips, fd1);
     assert!(!fips.is_empty());
 
     let t5 = Instant::now();
@@ -567,6 +597,7 @@ async fn live_google_doh_request_path() {
 fn doq_doh3_clients_construct() {
     let ep = DnsEndpoint::parse("127.0.0.1", DnsProtocol::Quic, Some("localhost")).unwrap();
     assert!(crate::dns::transport::DoqClient::new(ep.clone(), Duration::from_secs(1)).is_ok());
-    let ep3 = DnsEndpoint::parse("127.0.0.1/dns-query", DnsProtocol::H3, Some("localhost")).unwrap();
+    let ep3 =
+        DnsEndpoint::parse("127.0.0.1/dns-query", DnsProtocol::H3, Some("localhost")).unwrap();
     assert!(crate::dns::transport::Doh3Client::new(ep3, Duration::from_secs(1)).is_ok());
 }

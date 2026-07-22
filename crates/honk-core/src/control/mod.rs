@@ -13,9 +13,9 @@ mod reload;
 pub mod routing_matcher;
 mod sockets;
 pub mod tcp_sniff;
-pub mod udp_endpoint;
 #[cfg(test)]
 mod tests;
+pub mod udp_endpoint;
 use crate::connection_tracker::ConnectionTracker;
 use crate::control::packet_sniffer::PacketSnifferPool;
 use crate::control::routing_matcher::DOMAIN_BITMAPS;
@@ -30,11 +30,11 @@ use crate::relay;
 use crate::routing::{ConnectionInfo, Router};
 use crate::sniffing;
 use crate::stats::StatsManager;
+use drain::DrainTracker;
 use honk_config::node::{Group, GroupPolicy};
 use honk_config::{Config, node::Node, types::DialMode};
 use honk_ebpf_common::*;
 use honk_outbound::alive::{AliveDialerSet, IpVersion, ProbeDomain};
-use drain::DrainTracker;
 use janitor::BpfJanitor;
 use socket2::{Domain, Socket, Type};
 use std::io;
@@ -90,15 +90,14 @@ pub use commands::ControlCommand;
 use connection::*;
 use probers::*;
 use reload::*;
-use sockets::*;
 pub use sockets::DnsBpfNotifier;
+use sockets::*;
 
 #[derive(Debug, Clone)]
 pub struct StatsSnapshot {
     pub per_outbound: std::collections::HashMap<String, OutboundStats>,
     pub total_connections: u64,
 }
-
 
 /// The main control plane.
 pub struct ControlPlane {
@@ -937,7 +936,6 @@ impl ControlPlane {
         );
         Ok(push_result)
     }
-
 
     /// Test TCP connect latency to a node using the node's configured address:port.
     /// Returns `Some(duration)` on success, `None` on failure.

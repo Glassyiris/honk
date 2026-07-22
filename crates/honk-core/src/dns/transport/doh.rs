@@ -12,12 +12,11 @@ use h2::client::{SendRequest, handshake};
 use http::Request;
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_rustls::TlsConnector;
-use tokio_rustls::rustls::pki_types::ServerName;
 use tracing::debug;
 
-use super::framing::{force_dns_id_zero, restore_dns_id};
 use super::DialContext;
+use super::framing::{force_dns_id_zero, restore_dns_id};
+use honk_outbound::tls::TlsConnector;
 
 type H2Sender = SendRequest<Bytes>;
 
@@ -31,11 +30,10 @@ pub struct DohClient {
 
 impl DohClient {
     pub fn new(dial: DialContext) -> anyhow::Result<Arc<Self>> {
-        let mut cfg = honk_outbound::tls::standard_config()?;
-        cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let connector = honk_outbound::tls::build_dns_connector(false, b"\x02h2\x08http/1.1")?;
         Ok(Arc::new(Self {
             dial,
-            connector: TlsConnector::from(Arc::new(cfg)),
+            connector,
             session: Mutex::new(None),
         }))
     }
@@ -118,24 +116,22 @@ impl DohClient {
     }
 
     async fn get_sender(&self, force_new: bool) -> anyhow::Result<H2Sender> {
-        if !force_new
-            && let Some(s) = self.session.lock().clone() {
-                return Ok(s);
-            }
+        if !force_new && let Some(s) = self.session.lock().clone() {
+            return Ok(s);
+        }
         let sender = self.handshake().await?;
         *self.session.lock() = Some(sender.clone());
         Ok(sender)
     }
 
     async fn handshake(&self) -> anyhow::Result<H2Sender> {
-        let server_name = ServerName::try_from(self.dial.endpoint.sni.clone())
-            .map_err(|e| anyhow::anyhow!("invalid DoH SNI '{}': {e}", self.dial.endpoint.sni))?;
+        let server_name = self.dial.endpoint.sni.clone();
 
         if self.dial.proxy.is_some() {
             let tcp = self.dial.dial_tcp_boxed().await?;
             let tls = self
                 .connector
-                .connect(server_name, tcp)
+                .connect(&server_name, tcp)
                 .await
                 .map_err(|e| anyhow::anyhow!("DoH TLS handshake (proxy): {e}"))?;
             return spawn_h2(tls).await;
@@ -143,7 +139,7 @@ impl DohClient {
         let tcp = self.dial.dial_tcp().await?;
         let tls = self
             .connector
-            .connect(server_name, tcp)
+            .connect(&server_name, tcp)
             .await
             .map_err(|e| anyhow::anyhow!("DoH TLS handshake: {e}"))?;
         spawn_h2(tls).await

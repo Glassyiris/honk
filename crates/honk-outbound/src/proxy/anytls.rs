@@ -15,6 +15,7 @@
 //!   idle past `idle_session_timeout` (sing `idleCleanupExpTime` parity);
 //! - `min_idle_session` keeps that many idle sessions pre-established.
 
+use crate::tls::TlsConnector;
 use async_trait::async_trait;
 use honk_config::node::Node;
 use honk_config::types::NodeProtocol;
@@ -29,8 +30,6 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time;
-use tokio_rustls::TlsConnector;
-use tokio_rustls::rustls::pki_types::ServerName;
 use tracing::{debug, warn};
 
 use super::{ProxyHandler, ProxyStream, UdpProxySocket};
@@ -631,9 +630,7 @@ async fn connect_transport(
 
     let connector = AnyTlsHandler::build_tls_connector(node)?;
     let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
-    let server_name =
-        ServerName::try_from(server_name).map_err(|e| anyhow::anyhow!("invalid SNI: {}", e))?;
-    let tls = connector.connect(server_name, tcp).await?;
+    let tls = connector.connect(&server_name, tcp).await?;
     debug!("AnyTLS: TLS handshake completed with {}", addr);
     let (read, write) = tokio::io::split(tls);
 
@@ -1348,7 +1345,8 @@ mod uot_tests {
         let v6 = AnyTlsHandler::encode_address("[2606:4700:4700::1111]:853".parse().unwrap(), None);
         assert_eq!(v6[0], 0x04);
         assert_eq!(v6.len(), 1 + 16 + 2);
-        let fqdn = AnyTlsHandler::encode_address("1.2.3.4:443".parse().unwrap(), Some("example.com"));
+        let fqdn =
+            AnyTlsHandler::encode_address("1.2.3.4:443".parse().unwrap(), Some("example.com"));
         assert_eq!(fqdn[0], 0x03);
         assert_eq!(fqdn[1], 11);
         assert_eq!(&fqdn[2..13], b"example.com");
@@ -1383,5 +1381,4 @@ mod uot_tests {
         assert_eq!(&buf[..n], b"pong");
         assert_eq!(from, relay_addr);
     }
-
 }

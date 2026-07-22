@@ -97,8 +97,9 @@ impl ControlPlane {
     /// then install the new forwarder into the DNS controller.
     async fn reload_dns_forwarder(&self) -> anyhow::Result<()> {
         let config = self.config.read().await;
-        let dns_router =
-            Arc::new(crate::dns::routing::DnsRouter::new_from_dns_config(&config.dns)?);
+        let dns_router = Arc::new(crate::dns::routing::DnsRouter::new_from_dns_config(
+            &config.dns,
+        )?);
         let dns_upstream_pool = Arc::new(
             crate::dns::upstream_pool::UpstreamPool::new_with_proxy(
                 &config.dns.upstream,
@@ -265,7 +266,10 @@ fn health_check_targets(config: &Config) -> Vec<(String, String)> {
 /// group membership: register nodes that are new or whose address changed,
 /// remove nodes that left the checked set. Unchanged registrations keep
 /// their probe state and grace period. Returns `(added, removed)` counts.
-pub(super) fn sync_health_check_nodes(alive_set: &AliveDialerSet, config: &Config) -> (usize, usize) {
+pub(super) fn sync_health_check_nodes(
+    alive_set: &AliveDialerSet,
+    config: &Config,
+) -> (usize, usize) {
     let desired: std::collections::HashMap<String, String> =
         health_check_targets(config).into_iter().collect();
     let current = alive_set.registered_nodes();
@@ -293,7 +297,9 @@ pub(super) fn sync_health_check_nodes(alive_set: &AliveDialerSet, config: &Confi
 /// Selector members. Nested sub-groups are expanded to their leaf nodes
 /// (health state lives on real nodes). Used identically at startup and on
 /// config reload.
-pub(super) fn urltest_group_registrations(config: &Config) -> Vec<(String, Vec<String>, Option<Duration>)> {
+pub(super) fn urltest_group_registrations(
+    config: &Config,
+) -> Vec<(String, Vec<String>, Option<Duration>)> {
     let by_name = groups_by_name(config);
     let leaf_ids = |g: &Group| {
         let mut ids = std::collections::BTreeSet::new();

@@ -244,9 +244,7 @@ impl DnsForwarder {
                     .upstream_pool
                     .query(&name, raw_query)
                     .await
-                    .with_context(|| {
-                        format!("upstream '{name}' query failed for {domain}")
-                    })?;
+                    .with_context(|| format!("upstream '{name}' query failed for {domain}"))?;
                 (resp, name)
             }
             DnsRequestDecision::Reject => unreachable!("reject handled above"),
@@ -434,9 +432,7 @@ impl DnsForwarder {
         original_dst: Option<SocketAddr>,
     ) -> anyhow::Result<Vec<u8>> {
         let Some(dst) = original_dst else {
-            debug!(
-                "DNS forwarder: asis without original_dst — falling back to default upstream"
-            );
+            debug!("DNS forwarder: asis without original_dst — falling back to default upstream");
             return self.upstream_pool.query("default", raw_query).await;
         };
 
@@ -446,8 +442,8 @@ impl DnsForwarder {
         } else {
             socket2::Domain::IPV6
         };
-        let sock2 = socket2::Socket::new(domain, socket2::Type::DGRAM, None)
-            .context("asis socket")?;
+        let sock2 =
+            socket2::Socket::new(domain, socket2::Type::DGRAM, None).context("asis socket")?;
         sock2.set_nonblocking(true).context("asis nonblocking")?;
         #[cfg(target_os = "linux")]
         {
@@ -1264,7 +1260,11 @@ mod tests {
 
         let query = make_a_query();
         let result = forwarder.resolve(&query).await.expect("resolve");
-        assert_eq!(extract_min_ttl(&result), 600, "client-visible wire TTL overridden");
+        assert_eq!(
+            extract_min_ttl(&result),
+            600,
+            "client-visible wire TTL overridden"
+        );
 
         {
             let mut guard = cache.lock().await;
@@ -1282,7 +1282,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_request_reject_skips_upstream() {
-        use honk_config::dns::{DnsCond, DnsRequestAction, DnsRequestRule, DnsRequestRouting};
+        use honk_config::dns::{DnsCond, DnsRequestAction, DnsRequestRouting, DnsRequestRule};
 
         let mock = Arc::new(MockUpstream::new(make_a_response([1, 1, 1, 1], 60)));
         let router = Arc::new(
@@ -1301,17 +1301,29 @@ mod tests {
             })
             .unwrap(),
         );
-        let forwarder = DnsForwarder::new(mock.clone() as Arc<dyn DnsUpstreamPool>, test_cache(), router);
+        let forwarder = DnsForwarder::new(
+            mock.clone() as Arc<dyn DnsUpstreamPool>,
+            test_cache(),
+            router,
+        );
 
         let query = build_dns_query("example.com", 65);
         let result = forwarder.resolve(&query).await.expect("resolve");
-        assert_eq!(mock.call_count.load(Ordering::SeqCst), 0, "reject must not dial");
-        assert_eq!(u16::from_be_bytes([result[6], result[7]]), 0, "empty ANCOUNT");
+        assert_eq!(
+            mock.call_count.load(Ordering::SeqCst),
+            0,
+            "reject must not dial"
+        );
+        assert_eq!(
+            u16::from_be_bytes([result[6], result[7]]),
+            0,
+            "empty ANCOUNT"
+        );
     }
 
     #[tokio::test]
     async fn test_qtype_routes_to_named_upstream() {
-        use honk_config::dns::{DnsCond, DnsRequestAction, DnsRequestRule, DnsRequestRouting};
+        use honk_config::dns::{DnsCond, DnsRequestAction, DnsRequestRouting, DnsRequestRule};
 
         struct NameMock {
             last: std::sync::Mutex<String>,
@@ -1355,9 +1367,12 @@ mod tests {
             })
             .unwrap(),
         );
-        let forwarder =
-            DnsForwarder::new(mock.clone() as Arc<dyn DnsUpstreamPool>, test_cache(), router)
-                .with_strategy(honk_config::dns::DnsStrategy::Both);
+        let forwarder = DnsForwarder::new(
+            mock.clone() as Arc<dyn DnsUpstreamPool>,
+            test_cache(),
+            router,
+        )
+        .with_strategy(honk_config::dns::DnsStrategy::Both);
 
         let q_a = build_dns_query("example.com", 1);
         let _ = forwarder.resolve(&q_a).await.unwrap();
@@ -1371,8 +1386,8 @@ mod tests {
     #[tokio::test]
     async fn test_response_requery_switches_upstream() {
         use honk_config::dns::{
-            DnsCond, DnsRequestAction, DnsRequestRouting, DnsResponseAction, DnsResponseRule,
-            DnsResponseRouting,
+            DnsCond, DnsRequestAction, DnsRequestRouting, DnsResponseAction, DnsResponseRouting,
+            DnsResponseRule,
         };
 
         struct SeqMock {
@@ -1422,8 +1437,11 @@ mod tests {
             })
             .unwrap(),
         );
-        let forwarder =
-            DnsForwarder::new(mock.clone() as Arc<dyn DnsUpstreamPool>, test_cache(), router);
+        let forwarder = DnsForwarder::new(
+            mock.clone() as Arc<dyn DnsUpstreamPool>,
+            test_cache(),
+            router,
+        );
 
         let query = make_a_query();
         let result = forwarder.resolve(&query).await.expect("resolve");
@@ -1440,11 +1458,12 @@ mod tests {
         let cache = test_cache();
         let mut ttl = HashMap::new();
         ttl.insert("example.com".to_string(), 0u32);
-        let router = Arc::new(
-            DnsRouter::new_with_fixed_ttl(&DnsRouting::default(), &ttl).unwrap(),
+        let router = Arc::new(DnsRouter::new_with_fixed_ttl(&DnsRouting::default(), &ttl).unwrap());
+        let forwarder = DnsForwarder::new(
+            mock.clone() as Arc<dyn DnsUpstreamPool>,
+            cache.clone(),
+            router,
         );
-        let forwarder =
-            DnsForwarder::new(mock.clone() as Arc<dyn DnsUpstreamPool>, cache.clone(), router);
 
         let query = make_a_query();
         let _ = forwarder.resolve(&query).await.unwrap();
@@ -1468,22 +1487,49 @@ mod tests {
     fn make_aaaa_response(ip: [u8; 16], ttl: u32) -> Vec<u8> {
         let ttl_bytes = ttl.to_be_bytes();
         let mut v = vec![
-            0x00, 0x00, // ID
-            0x81, 0x80, // Flags: QR=1, RD=1, RA=1
-            0x00, 0x01, // QDCOUNT
-            0x00, 0x01, // ANCOUNT
-            0x00, 0x00, // NSCOUNT
-            0x00, 0x00, // ARCOUNT
+            0x00,
+            0x00, // ID
+            0x81,
+            0x80, // Flags: QR=1, RD=1, RA=1
+            0x00,
+            0x01, // QDCOUNT
+            0x00,
+            0x01, // ANCOUNT
+            0x00,
+            0x00, // NSCOUNT
+            0x00,
+            0x00, // ARCOUNT
             // Question: example.com AAAA IN
-            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00,
+            0x07,
+            b'e',
+            b'x',
+            b'a',
+            b'm',
+            b'p',
+            b'l',
+            b'e',
+            0x03,
+            b'c',
+            b'o',
+            b'm',
+            0x00,
+            0x00,
             0x1c, // QTYPE AAAA
-            0x00, 0x01, // QCLASS IN
+            0x00,
+            0x01, // QCLASS IN
             // Answer
-            0xc0, 0x0c, // NAME pointer to offset 12
-            0x00, 0x1c, // TYPE AAAA
-            0x00, 0x01, // CLASS IN
-            ttl_bytes[0], ttl_bytes[1], ttl_bytes[2], ttl_bytes[3], // TTL
-            0x00, 0x10, // RDLENGTH 16
+            0xc0,
+            0x0c, // NAME pointer to offset 12
+            0x00,
+            0x1c, // TYPE AAAA
+            0x00,
+            0x01, // CLASS IN
+            ttl_bytes[0],
+            ttl_bytes[1],
+            ttl_bytes[2],
+            ttl_bytes[3], // TTL
+            0x00,
+            0x10, // RDLENGTH 16
         ];
         v.extend_from_slice(&ip);
         v

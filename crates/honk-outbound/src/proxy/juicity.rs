@@ -320,12 +320,7 @@ impl JuicityHandler {
             return Ok(Arc::clone(client));
         }
         let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
-        let config = crate::quic::client_config(
-            node.skip_cert_verify,
-            &[b"h3"],
-            None,
-            Some(KEEP_ALIVE_INTERVAL),
-        )?;
+        let config = crate::quic::client_config(node, &[b"h3"], None, Some(KEEP_ALIVE_INTERVAL))?;
         let client = Arc::new(JuicityClient {
             quic: QuicClient::new(node.host().to_string(), node.port, server_name, config),
             uuid: *uuid.as_bytes(),

@@ -207,6 +207,16 @@ impl Node {
             node.skip_cert_verify = v == "1" || v.eq_ignore_ascii_case("true");
         }
 
+        // ECH (Encrypted Client Hello): `ech_config=<base64 ECHConfigList>`
+        // enables real ECH; bare `ech=1` toggles it on without keys (GREASE
+        // only until DNS HTTPS-RR lookup lands).
+        if let Some(v) = query.get("ech_config").or_else(|| query.get("echconfig")) {
+            node.ech_enabled = true;
+            node.ech_config = Some(v.clone());
+        } else if let Some(v) = query.get("ech") {
+            node.ech_enabled = v == "1" || v.eq_ignore_ascii_case("true");
+        }
+
         if let Some(v) = query.get("plugin") {
             // SIP002 packs the plugin as `name;opt=k;...` in a single
             // parameter; other protocols pass the plugin name verbatim.

@@ -97,9 +97,7 @@ impl DialContext {
 
     /// Dial through the optional proxy, returning a boxed duplex stream to the
     /// upstream DNS server address.
-    pub async fn dial_tcp_boxed(
-        &self,
-    ) -> anyhow::Result<Box<dyn crate::proxy::AsyncReadWrite>> {
+    pub async fn dial_tcp_boxed(&self) -> anyhow::Result<Box<dyn crate::proxy::AsyncReadWrite>> {
         if let Some(proxy) = &self.proxy {
             let addr = self.endpoint.resolve_addr().await?;
             let ps = proxy

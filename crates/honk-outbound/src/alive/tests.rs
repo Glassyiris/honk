@@ -23,8 +23,7 @@ fn test_parse_url_host_strips_path_and_missing_scheme() {
     // Regression: the path must never leak into DNS resolution — this was
     // the "Name does not resolve" health-check failure.
     assert_eq!(
-        AliveDialerSet::parse_url_host("http://www.google-analytics.com/generate_204")
-            .as_deref(),
+        AliveDialerSet::parse_url_host("http://www.google-analytics.com/generate_204").as_deref(),
         Some("www.google-analytics.com")
     );
     // No scheme at all.

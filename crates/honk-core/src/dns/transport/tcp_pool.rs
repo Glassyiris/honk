@@ -5,8 +5,8 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use tracing::debug;
 
-use super::framing::exchange_length_prefixed;
 use super::DialContext;
+use super::framing::exchange_length_prefixed;
 
 const MAX_POOL_SIZE: usize = 4;
 

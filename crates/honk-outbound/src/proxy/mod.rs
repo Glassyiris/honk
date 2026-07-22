@@ -20,9 +20,9 @@ pub mod vmess;
 use anytls::AnyTlsHandler;
 use async_trait::async_trait;
 use block::BlockHandler;
+use direct::DirectHandler;
 use honk_config::node::Node;
 use honk_config::types::NodeProtocol;
-use direct::DirectHandler;
 use hysteria2::Hysteria2Handler;
 use juicity::JuicityHandler;
 use shadowsocks::ShadowsocksHandler;
@@ -42,7 +42,7 @@ use vmess::VmessHandler;
 /// Trait object-compatible combination of async I/O traits used for proxy streams.
 ///
 /// This allows a `ProxyStream` to hold either a plain `TcpStream` or a
-/// TLS-wrapped stream (e.g. `tokio_rustls::client::TlsStream<TcpStream>`)
+/// TLS-wrapped stream (e.g. `tokio_boring::SslStream<TcpStream>`)
 /// without exposing the concrete type to downstream relay code.
 ///
 /// The `as_any`/`into_any` accessors let the relay layer downcast back to a
@@ -113,10 +113,8 @@ impl ProxyStream {
         if let Some(tcp) = any.downcast_ref::<tokio::net::TcpStream>() {
             return Some(tcp.as_raw_fd());
         }
-        if let Some(tls) =
-            any.downcast_ref::<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>()
-        {
-            return Some(tls.get_ref().0.as_raw_fd());
+        if let Some(tls) = any.downcast_ref::<tokio_boring::SslStream<tokio::net::TcpStream>>() {
+            return Some(tls.get_ref().as_raw_fd());
         }
         None
     }

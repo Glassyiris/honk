@@ -32,7 +32,7 @@ struct DoqState {
 impl DoqClient {
     pub fn new(endpoint: DnsEndpoint, query_timeout: Duration) -> anyhow::Result<Arc<Self>> {
         let quic_config = honk_outbound::quic::client_config(
-            false,
+            &Default::default(),
             &[b"doq"],
             Some("cubic"),
             Some(Duration::from_secs(15)),
@@ -106,10 +106,7 @@ impl DoqClient {
                     .map_err(|e| anyhow::anyhow!("DoQ endpoint: {e}"))?;
                 st.ep = Some(ep);
             }
-            st.ep
-                .as_ref()
-                .expect("endpoint just inserted")
-                .clone()
+            st.ep.as_ref().expect("endpoint just inserted").clone()
         };
 
         let connecting = ep

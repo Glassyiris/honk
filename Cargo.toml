@@ -65,10 +65,18 @@ network-types = "0.2"
 clap = { version = "4", features = ["derive", "env"] }
 
 # TLS / crypto
+boring = { version = "5", features = ["mlkem"] }
+boring-sys = "5"
+tokio-boring = "5"
+brotli = "8"
+webpki-root-certs = "1"
+foreign-types = "0.5"
 tokio-rustls = "0.26"
 rustls-pemfile = "2.2"
 webpki-roots = "1"
 aes-gcm = "0.11"
+aes = "0.8"
+chacha20 = "0.9"
 chacha20poly1305 = "0.11"
 sha1 = "0.11"
 sha2 = "0.11"
@@ -80,6 +88,7 @@ blake3 = "1"
 # Networking
 socket2 = { version = "0.6", features = ["all"] }
 quinn = "0.11"
+quinn-proto = "0.11"
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
 tokio-tungstenite = { version = "0.30", default-features = false, features = [
@@ -127,3 +136,4 @@ opt-level = "s"
 lto = true
 codegen-units = 1
 strip = true
+

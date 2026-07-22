@@ -326,10 +326,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         &config.global.bootstrap_resolver,
     ));
     if !config.global.bootstrap_resolver.is_empty() {
-        info!(
-            "Bootstrap resolver: {}",
-            config.global.bootstrap_resolver
-        );
+        info!("Bootstrap resolver: {}", config.global.bootstrap_resolver);
     }
 
     // Fetch any configured subscriptions concurrently with a 5-second
@@ -882,11 +879,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                                 sub.id = old.id;
                             }
                         }
-                        let known: std::collections::HashSet<uuid::Uuid> = new_config
-                            .subscriptions
-                            .iter()
-                            .map(|s| s.id)
-                            .collect();
+                        let known: std::collections::HashSet<uuid::Uuid> =
+                            new_config.subscriptions.iter().map(|s| s.id).collect();
                         let carried: Vec<_> = current
                             .nodes
                             .iter()

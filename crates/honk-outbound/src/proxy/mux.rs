@@ -56,9 +56,9 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use honk_config::node::Node;
 use h2::client::SendRequest;
 use h2::{Reason, RecvStream, SendStream};
+use honk_config::node::Node;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::{Notify, watch};
 

@@ -16,7 +16,6 @@ use honk_config::node::Node;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio_rustls::rustls::pki_types::ServerName;
 
 /// Default liveness URL (sing-box / clash convention).
 pub const DEFAULT_URLTEST_URL: &str = "https://www.gstatic.com/generate_204";
@@ -68,10 +67,8 @@ pub async fn urltest_node(
 
         if is_https {
             let connector = https_connector()?;
-            let server_name = ServerName::try_from(host.clone())
-                .map_err(|e| anyhow!("invalid TLS server name '{}': {}", host, e))?;
             let mut tls = connector
-                .connect(server_name, stream)
+                .connect(&host, stream)
                 .await
                 .context("TLS handshake failed")?;
             exchange_head(&mut tls, &host).await?;
@@ -88,17 +85,15 @@ pub async fn urltest_node(
     }
 }
 
-/// TLS connector with standard webpki root verification for urltest.
-/// The underlying ClientConfig is built once and reused across
-/// measurements (it never changes at runtime).
-fn https_connector() -> anyhow::Result<tokio_rustls::TlsConnector> {
-    use tokio_rustls::rustls::ClientConfig;
-    static CONFIG: std::sync::OnceLock<anyhow::Result<Arc<ClientConfig>>> =
+/// BoringSSL connector with webpki root verification for urltest.
+/// Built once and reused across measurements (it never changes at runtime).
+fn https_connector() -> anyhow::Result<crate::tls::TlsConnector> {
+    static CONNECTOR: std::sync::OnceLock<anyhow::Result<crate::tls::TlsConnector>> =
         std::sync::OnceLock::new();
-    let config = CONFIG.get_or_init(|| crate::tls::standard_config().map(Arc::new));
-    match config {
-        Ok(c) => Ok(tokio_rustls::TlsConnector::from(c.clone())),
-        Err(e) => Err(anyhow!("failed to build urltest TLS config: {}", e)),
+    let connector = CONNECTOR.get_or_init(|| crate::tls::build_connector(&Node::default()));
+    match connector {
+        Ok(c) => Ok(c.clone()),
+        Err(e) => Err(anyhow!("failed to build urltest TLS connector: {e:#}")),
     }
 }
 

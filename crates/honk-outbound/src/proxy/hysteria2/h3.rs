@@ -30,7 +30,11 @@ pub(super) fn take<'a>(cursor: &mut &'a [u8], n: usize) -> io::Result<&'a [u8]> 
     Ok(head)
 }
 
-pub(super) fn read_prefixed_int(cursor: &mut &[u8], first: u8, prefix_bits: u32) -> io::Result<u64> {
+pub(super) fn read_prefixed_int(
+    cursor: &mut &[u8],
+    first: u8,
+    prefix_bits: u32,
+) -> io::Result<u64> {
     let mask = (1u64 << prefix_bits) - 1;
     let mut value = (first as u64) & mask;
     if value < mask {

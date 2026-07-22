@@ -4,13 +4,11 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_rustls::TlsConnector;
-use tokio_rustls::client::TlsStream;
-use tokio_rustls::rustls::pki_types::ServerName;
 use tracing::debug;
 
-use super::framing::exchange_length_prefixed;
 use super::DialContext;
+use super::framing::exchange_length_prefixed;
+use honk_outbound::tls::{TlsConnector, TlsStream};
 
 const MAX_POOL_SIZE: usize = 4;
 
@@ -74,11 +72,10 @@ pub struct DotPool {
 
 impl DotPool {
     pub fn new(dial: DialContext) -> anyhow::Result<Arc<Self>> {
-        let mut cfg = honk_outbound::tls::standard_config()?;
-        cfg.alpn_protocols = vec![b"dot".to_vec()];
+        let connector = honk_outbound::tls::build_dns_connector(false, b"\x03dot")?;
         Ok(Arc::new(Self {
             dial,
-            connector: TlsConnector::from(Arc::new(cfg)),
+            connector,
             idle: Mutex::new(Vec::with_capacity(MAX_POOL_SIZE)),
         }))
     }
@@ -116,14 +113,13 @@ impl DotPool {
     }
 
     async fn dial_tls(&self) -> anyhow::Result<DotStream> {
-        let server_name = ServerName::try_from(self.dial.endpoint.sni.clone())
-            .map_err(|e| anyhow::anyhow!("invalid DoT SNI '{}': {e}", self.dial.endpoint.sni))?;
+        let server_name = self.dial.endpoint.sni.clone();
 
         if self.dial.proxy.is_some() {
             let tcp = self.dial.dial_tcp_boxed().await?;
             let tls = self
                 .connector
-                .connect(server_name, tcp)
+                .connect(&server_name, tcp)
                 .await
                 .map_err(|e| anyhow::anyhow!("DoT TLS handshake (via proxy): {e}"))?;
             Ok(DotStream::Proxied(tls))
@@ -131,7 +127,7 @@ impl DotPool {
             let tcp = self.dial.dial_tcp().await?;
             let tls = self
                 .connector
-                .connect(server_name, tcp)
+                .connect(&server_name, tcp)
                 .await
                 .map_err(|e| anyhow::anyhow!("DoT TLS handshake: {e}"))?;
             Ok(DotStream::Direct(tls))

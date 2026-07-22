@@ -119,13 +119,9 @@ mod tests {
                 .unwrap();
         });
 
-        let got = exchange_length_prefixed(
-            &mut client,
-            &query,
-            Duration::from_secs(2),
-        )
-        .await
-        .unwrap();
+        let got = exchange_length_prefixed(&mut client, &query, Duration::from_secs(2))
+            .await
+            .unwrap();
         assert_eq!(got, response);
         server_task.await.unwrap();
     }

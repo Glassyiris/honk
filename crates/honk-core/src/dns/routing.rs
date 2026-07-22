@@ -510,35 +510,19 @@ fn eval_conditions(
         let matches = match cond {
             CompiledCond::Qname { not, matchers } => {
                 let hit = matchers.iter().any(|m| m.matches(domain));
-                if *not {
-                    !hit
-                } else {
-                    hit
-                }
+                if *not { !hit } else { hit }
             }
             CompiledCond::Qtype { not, types } => {
                 let hit = types.contains(&qtype);
-                if *not {
-                    !hit
-                } else {
-                    hit
-                }
+                if *not { !hit } else { hit }
             }
             CompiledCond::Upstream { not, names } => {
                 let hit = names.iter().any(|n| n == from_upstream);
-                if *not {
-                    !hit
-                } else {
-                    hit
-                }
+                if *not { !hit } else { hit }
             }
             CompiledCond::Ip { not, trie } => {
                 let hit = answer_ips.iter().any(|ip| trie.matches(ip));
-                if *not {
-                    !hit
-                } else {
-                    hit
-                }
+                if *not { !hit } else { hit }
             }
         };
         if !matches {

@@ -31,8 +31,8 @@ Source of truth: `crates/honk-config/src/*`, the dae parser in `crates/honk-conf
 | `lan_tcp_mss` | `lan_tcp_mss` | `0` | Deprecated; parsed only |
 | `allow_insecure` | `allow_insecure` | `false` | Global TLS skip-verify fallback |
 | `sniffing_timeout` | `sniffing_timeout_ms` | `30` | Sniff timeout, duration form (e.g. `30ms`) |
-| `tls_implementation` | `tls_implementation` | `"tls"` | TLS stack name |
-| `utls_imitate` | `utls_imitate` | `"chrome_auto"` | Reserved (REALITY/uTLS deferred) |
+| `tls_implementation` | `tls_implementation` | `"tls"` | TLS stack: `tls` (plain BoringSSL) / `utls` (real Chrome fingerprint) |
+| `utls_imitate` | `utls_imitate` | `"chrome_auto"` | Fingerprint profile; `chrome*` maps to the built-in real Chrome profile (BoringSSL) |
 | `tls_fragment` | `tls_fragment` | `false` | TLS ClientHello fragment flag |
 | `tls_fragment_length` | `tls_fragment_length` | `""` | Fragment length range |
 | `tls_fragment_interval` | `tls_fragment_interval` | `""` | Fragment interval range |
@@ -110,6 +110,9 @@ The fields below are what a parsed node carries. In dae syntax they are **derive
 | `tls` | bool | `false` | Enable TLS |
 | `sni` | string? | null | TLS SNI (share-link `sni=`) |
 | `skip_cert_verify` | bool | `false` | Insecure TLS (share-link `allowInsecure=1`/`insecure=1`) |
+| `ech_enabled` | bool | `false` | Offer ECH (share-link `ech=1`, or implied by `ech_config`) |
+| `ech_config` | string? | null | Base64 ECHConfigList (share-link `ech_config=`) |
+| `ech_config_path` | string? | null | File holding a base64 ECHConfigList |
 | `network` | string? | null | V2Ray-style network hint |
 | `ws_path` / `ws_host` | string? | null | WebSocket (share-link `path=`/`host=`) |
 | `grpc_service` | string? | null | gRPC service name (`serviceName=`) |
@@ -166,6 +169,25 @@ node {
 ```
 
 `mux = true` (h2mux) exists in the node schema but cannot be expressed in dae syntax today.
+
+### TLS fingerprint and ECH
+
+TLS runs on **BoringSSL** everywhere (proxy TLS, DoT/DoH upstreams, and QUIC handshakes via the custom quinn crypto backend). Two global modes:
+
+- `tls_implementation: tls` — plain BoringSSL ClientHello.
+- `tls_implementation: utls` — real Chrome fingerprint: GREASE, permuted extension order, X25519MLKEM768+X25519 key shares, Chrome sigalgs/curves, brotli certificate compression, ALPS for h2, and ECH GREASE. Applies to TCP TLS and QUIC ClientHellos alike.
+
+Per-node **ECH** (Encrypted Client Hello) — works over TLS and over QUIC (hysteria2/juicity/tuic):
+
+```dae
+node {
+    hy2_ech: 'hysteria2://secret@example.com:443?sni=example.com&ech_config=AD%2B-DQIAA...#hy2_ech'
+}
+```
+
+- `ech_config=<base64 ECHConfigList>` (or `ech_config_path` in the JSON/TOML config forms) offers real ECH. Without configs, Chrome mode sends ECH GREASE like a real browser.
+- ECH is fail-closed per RFC: if the server cannot accept ECH, the handshake fails (BoringSSL `ECH_REJECTED`) and any server-provided retry configs are logged.
+- DNS HTTPS-RR discovery of ECH configs is not implemented yet; configs must be provided statically.
 
 **AnyTLS pool**
 

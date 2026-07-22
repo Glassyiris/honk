@@ -33,8 +33,8 @@
 | `lan_tcp_mss` | u16 | `0` | 已弃用；仅解析兼容 |
 | `allow_insecure` | bool | `false` | 全局 TLS 跳过校验回退 |
 | `sniffing_timeout_ms` | u64 | `30` | 嗅探超时（ms）。**dae：** `sniffing_timeout` 时长 |
-| `tls_implementation` | string | `"tls"` | TLS 栈名称 |
-| `utls_imitate` | string | `"chrome_auto"` | 预留（REALITY/uTLS 已延期） |
+| `tls_implementation` | string | `"tls"` | TLS 栈：`tls`（原生 BoringSSL）/ `utls`（真实 Chrome 指纹） |
+| `utls_imitate` | string | `"chrome_auto"` | 指纹配置；`chrome*` 映射到内置真实 Chrome 指纹（BoringSSL） |
 | `tls_fragment` | bool | `false` | TLS ClientHello 分片开关 |
 | `tls_fragment_length` | string | `""` | 分片长度范围 |
 | `tls_fragment_interval` | string | `""` | 分片间隔范围 |
@@ -80,6 +80,9 @@ dae 语法中节点**只能以分享链接书写**：`tag: 'scheme://...'` 或�
 | `tls` | bool | `false` | 启用 TLS；trojan/vless/anytls 等链接自动开启 |
 | `sni` | string? | null | TLS SNI；链接 `sni`（或未被传输占用的 `host`）参数 |
 | `skip_cert_verify` | bool | `false` | 跳过证书校验；链接 `allowInsecure` / `insecure` 参数 |
+| `ech_enabled` | bool | `false` | 提供 ECH；链接 `ech=1`（或 `ech_config` 隐式开启） |
+| `ech_config` | string? | null | Base64 编码的 ECHConfigList；链接 `ech_config` 参数 |
+| `ech_config_path` | string? | null | 存放 base64 ECHConfigList 的文件路径 |
 | `network` | string? | null | V2Ray 风格 network 提示 |
 | `ws_path` / `ws_host` | string? | null | WebSocket；链接 `path` / `host` 参数 |
 | `grpc_service` | string? | null | gRPC service 名；链接 `serviceName` 参数 |
@@ -136,6 +139,25 @@ node {
 ```
 
 注意：`mux`（h2mux）没有对应的分享链接参数，dae 语法下无法开启。
+
+### TLS 指纹与 ECH
+
+所有 TLS 均运行在 **BoringSSL** 上（代理 TLS、DoT/DoH 上游，以及经由自研 quinn 加密后端的 QUIC 握手）。两种全局模式：
+
+- `tls_implementation: tls` — 原生 BoringSSL ClientHello。
+- `tls_implementation: utls` — 真实 Chrome 指纹：GREASE、扩展乱序、X25519MLKEM768+X25519 密钥分享、Chrome 签名算法/曲线、brotli 证书压缩、h2 ALPS、ECH GREASE。对 TCP TLS 与 QUIC ClientHello 同时生效。
+
+按节点配置 **ECH**（Encrypted Client Hello）——TLS 与 QUIC（hysteria2/juicity/tuic）均可：
+
+```dae
+node {
+    hy2_ech: 'hysteria2://secret@example.com:443?sni=example.com&ech_config=AD%2B-DQIAA...#hy2_ech'
+}
+```
+
+- `ech_config=<base64 ECHConfigList>`（或结构化配置中的 `ech_config_path`）提供真实 ECH；无配置时 Chrome 模式发送 ECH GREASE（与真实浏览器一致）。
+- ECH 按 RFC 失败关闭：服务端不接受 ECH 时握手失败（BoringSSL `ECH_REJECTED`），服务端提供的重试配置会写入日志。
+- 暂不支持从 DNS HTTPS RR 发现 ECH 配置；目前只能静态提供。
 
 **AnyTLS 池**
 

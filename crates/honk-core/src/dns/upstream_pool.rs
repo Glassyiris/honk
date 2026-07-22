@@ -240,9 +240,7 @@ impl UpstreamPool {
                 && !tag.eq_ignore_ascii_case("direct")
                 && !tag.eq_ignore_ascii_case("block")
             {
-                anyhow::bail!(
-                    "DNS upstream outbound '{tag}' has no available node"
-                );
+                anyhow::bail!("DNS upstream outbound '{tag}' has no available node");
             }
             debug!(
                 "DNS dial leaf (forced -> {}): {:?}",
@@ -520,7 +518,10 @@ impl DnsUpstreamPool for UpstreamPool {
             upstream_name,
             entry.protocol,
             entry.endpoint.host,
-            proxy_node.as_ref().map(|n| n.name.as_str()).unwrap_or("direct"),
+            proxy_node
+                .as_ref()
+                .map(|n| n.name.as_str())
+                .unwrap_or("direct"),
             response.len()
         );
         Ok(response)
@@ -703,7 +704,11 @@ mod tests {
         }
     }
 
-    fn test_group(name: &str, policy: honk_config::group::GroupPolicy, ids: Vec<uuid::Uuid>) -> Group {
+    fn test_group(
+        name: &str,
+        policy: honk_config::group::GroupPolicy,
+        ids: Vec<uuid::Uuid>,
+    ) -> Group {
         use chrono::Utc;
         Group {
             id: uuid::Uuid::new_v4(),
@@ -726,14 +731,8 @@ mod tests {
     #[test]
     fn resolve_outbound_leaf_node_by_name() {
         let a = test_node("hk-1");
-        let pool = UpstreamPool::new_with_proxy(
-            &[],
-            make_router(),
-            None,
-            vec![a.clone()],
-            vec![],
-        )
-        .unwrap();
+        let pool = UpstreamPool::new_with_proxy(&[], make_router(), None, vec![a.clone()], vec![])
+            .unwrap();
         let leaf = pool.resolve_outbound_leaf("hk-1").unwrap();
         assert_eq!(leaf.name, "hk-1");
         assert!(pool.resolve_outbound_leaf("direct").is_none());
@@ -747,11 +746,7 @@ mod tests {
 
         let a = test_node("alpha");
         let b = test_node("beta");
-        let mut g = test_group(
-            "proxy",
-            GroupPolicy::Selector,
-            vec![a.id, b.id],
-        );
+        let mut g = test_group("proxy", GroupPolicy::Selector, vec![a.id, b.id]);
         g.default = Some("beta".into());
         let gm = GroupManager::new(&[g], &[a.clone(), b.clone()]);
         // Runtime Selector override must win (same as traffic).
@@ -761,15 +756,9 @@ mod tests {
         let mut google = make_upstream("google", "dns.google/dns-query", DnsProtocol::Https);
         google.outbound = Some("proxy".into());
 
-        let pool = UpstreamPool::new_with_proxy(
-            &[google],
-            make_router(),
-            None,
-            vec![a, b],
-            vec![],
-        )
-        .unwrap()
-        .with_group_manager(shared);
+        let pool = UpstreamPool::new_with_proxy(&[google], make_router(), None, vec![a, b], vec![])
+            .unwrap()
+            .with_group_manager(shared);
 
         let leaf = pool.resolve_outbound_leaf("proxy").unwrap();
         assert_eq!(
@@ -795,24 +784,18 @@ mod tests {
         let a = test_node("first");
         let b = test_node("second");
         let g = test_group("proxy", GroupPolicy::URLTest, vec![a.id, b.id]);
-        let pool = UpstreamPool::new_with_proxy(
-            &[],
-            make_router(),
-            None,
-            vec![a, b],
-            vec![g],
-        )
-        .unwrap();
+        let pool =
+            UpstreamPool::new_with_proxy(&[], make_router(), None, vec![a, b], vec![g]).unwrap();
         // No GroupManager: legacy first-member fallback for unit tests.
         assert_eq!(pool.resolve_outbound_leaf("proxy").unwrap().name, "first");
     }
 
     #[tokio::test]
     async fn resolve_dial_leaf_forced_arrow_bypasses_traffic_router() {
+        use crate::routing::Router;
         use honk_config::group::GroupPolicy;
         use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
         use honk_outbound::group::GroupManager;
-        use crate::routing::Router;
 
         let a = test_node("forced-node");
         let b = test_node("routed-node");
@@ -837,16 +820,10 @@ mod tests {
         let mut up = make_upstream("google", "8.8.8.8:53", DnsProtocol::Udp);
         up.outbound = Some("force_g".into()); // explicit `-> force_g`
 
-        let pool = UpstreamPool::new_with_proxy(
-            &[up],
-            make_router(),
-            None,
-            vec![a, b],
-            vec![],
-        )
-        .unwrap()
-        .with_group_manager(gm)
-        .with_traffic_router(traffic);
+        let pool = UpstreamPool::new_with_proxy(&[up], make_router(), None, vec![a, b], vec![])
+            .unwrap()
+            .with_group_manager(gm)
+            .with_traffic_router(traffic);
 
         let entry = pool.entries.get("google").unwrap();
         let leaf = pool.resolve_dial_leaf(entry).await.unwrap().unwrap();
@@ -855,14 +832,14 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_dial_leaf_implicit_uses_traffic_router() {
+        use crate::routing::Router;
         use honk_config::group::GroupPolicy;
         use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
         use honk_outbound::group::GroupManager;
-        use crate::routing::Router;
 
         let a = test_node("proxy-leaf");
         let g = test_group("proxy", GroupPolicy::Selector, vec![a.id]);
-        let gm = GroupManager::new(&[g], &[a.clone()]).into_shared();
+        let gm = GroupManager::new(&[g], std::slice::from_ref(&a)).into_shared();
 
         // No explicit -> on upstream; 8.8.8.8 → proxy via traffic routing.
         let rules = vec![RoutingRule {
@@ -880,26 +857,23 @@ mod tests {
 
         let up = make_upstream("google", "8.8.8.8:53", DnsProtocol::Udp); // no outbound
 
-        let pool = UpstreamPool::new_with_proxy(
-            &[up],
-            make_router(),
-            None,
-            vec![a],
-            vec![],
-        )
-        .unwrap()
-        .with_group_manager(gm)
-        .with_traffic_router(traffic);
+        let pool = UpstreamPool::new_with_proxy(&[up], make_router(), None, vec![a], vec![])
+            .unwrap()
+            .with_group_manager(gm)
+            .with_traffic_router(traffic);
 
         let entry = pool.entries.get("google").unwrap();
         let leaf = pool.resolve_dial_leaf(entry).await.unwrap().unwrap();
-        assert_eq!(leaf.name, "proxy-leaf", "implicit dial must follow traffic Route");
+        assert_eq!(
+            leaf.name, "proxy-leaf",
+            "implicit dial must follow traffic Route"
+        );
     }
 
     #[tokio::test]
     async fn resolve_dial_leaf_implicit_direct_when_route_is_direct() {
-        use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
         use crate::routing::Router;
+        use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
 
         // 223.5.5.5 → direct
         let rules = vec![RoutingRule {
@@ -922,7 +896,10 @@ mod tests {
 
         let entry = pool.entries.get("alidns").unwrap();
         let leaf = pool.resolve_dial_leaf(entry).await.unwrap();
-        assert!(leaf.is_none(), "geoip/cn-style direct route → no proxy leaf");
+        assert!(
+            leaf.is_none(),
+            "geoip/cn-style direct route → no proxy leaf"
+        );
     }
 
     #[tokio::test]

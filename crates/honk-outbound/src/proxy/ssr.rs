@@ -14,9 +14,9 @@
 //! Reference: <https://github.com/shadowsocksrr/shadowsocks-rss/blob/master/doc/protocol.md>
 
 use async_trait::async_trait;
+use hkdf::Hkdf;
 use honk_config::node::Node;
 use honk_config::types::NodeProtocol;
-use hkdf::Hkdf;
 use rand::RngCore;
 use sha1::Sha1;
 use std::fmt;

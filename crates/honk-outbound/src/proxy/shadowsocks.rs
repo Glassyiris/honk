@@ -26,9 +26,9 @@
 //! <https://shadowsocks.org/doc/sip022.html>
 
 use async_trait::async_trait;
+use hkdf::Hkdf;
 use honk_config::node::Node;
 use honk_config::types::NodeProtocol;
-use hkdf::Hkdf;
 use rand::RngCore;
 use sha1::Sha1;
 use std::fmt;
@@ -382,7 +382,9 @@ impl ProxyHandler for ShadowsocksHandler {
             ips.into_iter()
                 .next()
                 .map(|ip| SocketAddr::new(ip, node.port))
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no address for host"))
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::NotFound, "no address for host")
+                })
         })
         .await
         .map_err(|_| anyhow::anyhow!("Shadowsocks UDP: resolve {} timed out", lookup))??;

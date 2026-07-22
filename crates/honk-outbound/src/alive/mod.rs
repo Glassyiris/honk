@@ -1006,7 +1006,6 @@ impl AliveDialerSet {
             .unwrap_or(0)
     }
 
-
     /// Extract hostname from a URL string like "http://cp.cloudflare.com".
     ///
     /// The dae config format allows comma-separated fallback IPs after the
@@ -1068,7 +1067,6 @@ impl AliveDialerSet {
         ips.dedup();
         ips
     }
-
 }
 
 impl Default for AliveDialerSet {
@@ -1223,4 +1221,3 @@ impl RecoveryState {
         )
     }
 }
-

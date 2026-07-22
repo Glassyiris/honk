@@ -107,9 +107,12 @@ impl BootstrapResolver {
 
     async fn query_tcp(&self, host: &str, qtype: u16) -> io::Result<Vec<IpAddr>> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let mut stream =
-            crate::util::connect_marked_addr(self.server, Some(honk_ebpf_common::DAE_BYPASS_MARK), Duration::from_secs(3))
-                .await?;
+        let mut stream = crate::util::connect_marked_addr(
+            self.server,
+            Some(honk_ebpf_common::DAE_BYPASS_MARK),
+            Duration::from_secs(3),
+        )
+        .await?;
         let query = build_query(host, qtype);
         stream
             .write_all(&(query.len() as u16).to_be_bytes())
@@ -144,7 +147,10 @@ fn build_query(host: &str, qtype: u16) -> Vec<u8> {
 /// Extract A/AAAA answer addresses from a DNS response.
 fn parse_answers(msg: &[u8], qtype: u16) -> io::Result<Vec<IpAddr>> {
     if msg.len() < 12 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "short DNS message"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short DNS message",
+        ));
     }
     let qd = u16::from_be_bytes([msg[4], msg[5]]) as usize;
     let an = u16::from_be_bytes([msg[6], msg[7]]) as usize;
@@ -158,13 +164,19 @@ fn parse_answers(msg: &[u8], qtype: u16) -> io::Result<Vec<IpAddr>> {
     for _ in 0..an {
         pos = skip_name(msg, pos)?;
         if pos + 10 > msg.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated answer"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated answer",
+            ));
         }
         let rtype = u16::from_be_bytes([msg[pos], msg[pos + 1]]);
         let rdlen = u16::from_be_bytes([msg[pos + 8], msg[pos + 9]]) as usize;
         pos += 10;
         if pos + rdlen > msg.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated rdata"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated rdata",
+            ));
         }
         if rtype == qtype {
             match (rtype, rdlen) {

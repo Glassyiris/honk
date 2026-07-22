@@ -71,9 +71,9 @@ impl DnsEndpoint {
     /// networks (common on gateways without working IPv6 egress) still dial.
     pub async fn resolve_addr(&self) -> anyhow::Result<SocketAddr> {
         let mut addrs = self.resolve_addrs().await?;
-        addrs
-            .pop()
-            .ok_or_else(|| anyhow::anyhow!("bootstrap resolve '{}' returned no addresses", self.host))
+        addrs.pop().ok_or_else(|| {
+            anyhow::anyhow!("bootstrap resolve '{}' returned no addresses", self.host)
+        })
     }
 
     /// Resolve host → all candidate addresses (IPv4 preferred, then IPv6).
@@ -164,12 +164,15 @@ fn split_host_port(hostport: &str) -> anyhow::Result<(String, Option<u16>)> {
 
     // host:port — only split when suffix is numeric (so "dns.google" stays intact).
     if let Some((host, port_s)) = hostport.rsplit_once(':')
-        && !host.is_empty() && port_s.chars().all(|c| c.is_ascii_digit()) && !port_s.is_empty() {
-            let port: u16 = port_s
-                .parse()
-                .map_err(|e| anyhow::anyhow!("invalid port in '{hostport}': {e}"))?;
-            return Ok((host.to_string(), Some(port)));
-        }
+        && !host.is_empty()
+        && port_s.chars().all(|c| c.is_ascii_digit())
+        && !port_s.is_empty()
+    {
+        let port: u16 = port_s
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid port in '{hostport}': {e}"))?;
+        return Ok((host.to_string(), Some(port)));
+    }
     Ok((hostport.to_string(), None))
 }
 
@@ -188,8 +191,8 @@ mod tests {
 
     #[test]
     fn parse_doh_path_and_port() {
-        let ep = DnsEndpoint::parse("cloudflare-dns.com/dns-query", DnsProtocol::Https, None)
-            .unwrap();
+        let ep =
+            DnsEndpoint::parse("cloudflare-dns.com/dns-query", DnsProtocol::Https, None).unwrap();
         assert_eq!(ep.host, "cloudflare-dns.com");
         assert_eq!(ep.port, 443);
         assert_eq!(ep.path, "/dns-query");

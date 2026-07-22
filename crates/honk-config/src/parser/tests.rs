@@ -612,7 +612,8 @@ fn test_parse_ipversion_prefer_maps_to_prefer_variants() {
 }
 
 #[test]
-fn test_parse_dns_response_routing() {    let input = r#"
+fn test_parse_dns_response_routing() {
+    let input = r#"
 dns {
     routing {
         response {
