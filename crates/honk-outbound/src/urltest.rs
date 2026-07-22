@@ -87,10 +87,12 @@ pub async fn urltest_node(
 
 /// BoringSSL connector with webpki root verification for urltest.
 /// Built once and reused across measurements (it never changes at runtime).
+/// HTTP/1.1-only ALPN: the probe speaks a minimal HTTP/1.1 HEAD, so h2 must
+/// never be negotiated (Chrome mode would otherwise offer it).
 fn https_connector() -> anyhow::Result<crate::tls::TlsConnector> {
     static CONNECTOR: std::sync::OnceLock<anyhow::Result<crate::tls::TlsConnector>> =
         std::sync::OnceLock::new();
-    let connector = CONNECTOR.get_or_init(|| crate::tls::build_connector(&Node::default()));
+    let connector = CONNECTOR.get_or_init(|| crate::tls::build_http1_connector(false));
     match connector {
         Ok(c) => Ok(c.clone()),
         Err(e) => Err(anyhow!("failed to build urltest TLS connector: {e:#}")),

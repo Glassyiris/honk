@@ -380,6 +380,16 @@ impl ControlPlaneHandle {
             (name.to_string(), must)
         };
 
+        // Matched-rule identity for the /connections display. The userspace
+        // Router mirrors the eBPF-compiled rules, so this names eBPF-decided
+        // flows as well (display-only; the handoff decision above stands).
+        let matched_rule = {
+            let router = self.router.read().await;
+            router
+                .route_full(&conn_info)
+                .map(|m| m.rule_name.to_string())
+        };
+
         // Clash mode override (Direct/Global); no-op when the clash API is
         // disabled or mode is Rule. Must-rule and block results are never
         // overridden.
@@ -812,6 +822,29 @@ impl ControlPlaneHandle {
         let dscp_val = handoff.as_ref().map(|ho| ho.dscp).unwrap_or(0);
 
         let conn_id = uuid::Uuid::new_v4().to_string();
+        // Clash-shaped matched rule + dial chain for /connections: `rule` is
+        // the dae rule expression ("Match" = fallback), `chains` is the
+        // selection path leaf-first ([leaf, ..sub-groups.., topGroup]).
+        let (rule, rule_payload) = match &matched_rule {
+            Some(name) => (
+                name.clone(),
+                domain
+                    .clone()
+                    .unwrap_or_else(|| resolved_target.ip().to_string()),
+            ),
+            None => ("Match".to_string(), String::new()),
+        };
+        let chains = {
+            let gm = self.group_manager.read();
+            let mut chain = gm.selection_chain(&outbound_name);
+            // Groups without a formed selection (LoadBalance, cold URLTest)
+            // stop at the group tag — append the actual dialed leaf.
+            if chain.last() != Some(&node.name) {
+                chain.push(node.name.clone());
+            }
+            chain.reverse();
+            chain
+        };
         // Live byte counters shared with the relay task: it increments them
         // as data flows so /connections shows real-time totals instead of a
         // single close-time (never-visible) update.
@@ -823,6 +856,9 @@ impl ControlPlaneHandle {
                 source: client_addr.to_string(),
                 destination: resolved_target.to_string(),
                 proxy: node.name.clone(),
+                rule,
+                rule_payload,
+                chains,
                 upload: conn_upload.clone(),
                 download: conn_download.clone(),
                 start_time: std::time::Instant::now(),

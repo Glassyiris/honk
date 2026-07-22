@@ -377,6 +377,17 @@ pub fn build_dns_connector(
     })
 }
 
+/// ALPN wire advertising plain HTTP/1.1 only.
+const HTTP1_ALPN_WIRE: &[u8] = b"\x08http/1.1";
+
+/// Connector for urltest-style HTTP/1.1 probes. Never offers h2 — even in
+/// Chrome mode, where the browser profile would — because the probe speaks a
+/// minimal HTTP/1.1 `HEAD` and a server answering h2 frames breaks it (this
+/// was the "every delay test fails" bug: gstatic negotiated h2 via ALPN).
+pub fn build_http1_connector(skip_cert_verify: bool) -> anyhow::Result<TlsConnector> {
+    build_dns_connector(skip_cert_verify, HTTP1_ALPN_WIRE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -549,9 +560,86 @@ mod tests {
         assert!(msg.contains("ECH_REJECTED"), "unexpected error: {msg}");
     }
 
+    /// The urltest probe connector must never offer h2 — even in Chrome
+    /// mode — or an h2-capable server breaks the HTTP/1.1 HEAD probe.
+    #[tokio::test]
+    async fn http1_connector_never_negotiates_h2() {
+        use boring::ssl::AlpnError;
+
+        fn spawn_alpn_server(cert_pem: &str, key_pem: &str) -> u16 {
+            let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
+            acceptor
+                .set_certificate(&X509::from_pem(cert_pem.as_bytes()).unwrap())
+                .unwrap();
+            acceptor
+                .set_private_key(&PKey::private_key_from_pem(key_pem.as_bytes()).unwrap())
+                .unwrap();
+            // Server prefers h2, falls back to http/1.1.
+            acceptor.set_alpn_select_callback(|_ssl, protos| {
+                let mut i = 0;
+                let mut http11 = None;
+                while i < protos.len() {
+                    let n = protos[i] as usize;
+                    let p = &protos[i + 1..i + 1 + n];
+                    if p == b"h2" {
+                        return Ok(b"h2");
+                    }
+                    if p == b"http/1.1" {
+                        http11 = Some(p);
+                    }
+                    i += 1 + n;
+                }
+                http11.ok_or(AlpnError::NOACK)
+            });
+            let acceptor = acceptor.build();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let mut tls: SslStream<_> = acceptor.accept(stream).unwrap();
+                let mut buf = Vec::new();
+                tls.read_to_end(&mut buf).ok();
+                buf
+            });
+            port
+        }
+
+        for chrome in [false, true] {
+            set_tls_mode(if chrome { "utls" } else { "tls" });
+            let (cert, key) = server_cert();
+            let port = spawn_alpn_server(&cert, &key);
+            let connector = build_http1_connector(true).unwrap();
+            let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let stream = connector.connect("localhost", tcp).await.unwrap();
+            assert_eq!(
+                stream.ssl().selected_alpn_protocol(),
+                Some(b"http/1.1".as_slice()),
+                "chrome={chrome}: urltest connector must negotiate http/1.1"
+            );
+
+            // Contrast: the node connector in Chrome mode offers h2 and the
+            // h2-preferring server takes it (the urltest bug's trigger).
+            if chrome {
+                let (cert2, key2) = server_cert();
+                let port2 = spawn_alpn_server(&cert2, &key2);
+                let connector2 = build_connector(&test_node()).unwrap();
+                let tcp2 = tokio::net::TcpStream::connect(("127.0.0.1", port2))
+                    .await
+                    .unwrap();
+                let stream2 = connector2.connect("localhost", tcp2).await.unwrap();
+                assert_eq!(
+                    stream2.ssl().selected_alpn_protocol(),
+                    Some(b"h2".as_slice()),
+                    "chrome node connector must offer h2 (precondition of the bug)"
+                );
+            }
+        }
+    }
+
     #[test]
-    fn decode_ech_base64_variants() {
-        let raw = b"\xff\x00abc";
+    fn decode_ech_base64_variants() {        let raw = b"\xff\x00abc";
         for encoded in [
             general_purpose::STANDARD.encode(raw),
             general_purpose::URL_SAFE.encode(raw),

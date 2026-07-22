@@ -1,6 +1,6 @@
 //! Per-node-per-domain health tracking: Latencies10 + MovingAverage + Alive.
 
-use super::latencies::SyncLatencies10;
+use super::latencies::{LatencySample, SyncLatencies10};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -23,7 +23,7 @@ impl DialerCollection {
     }
 
     pub(crate) fn mark_available(&self, latency: Duration) {
-        self.latencies.append(latency);
+        self.latencies.append(LatencySample::real(latency));
         let mut ma = self.moving_average.lock();
         if *ma == Duration::ZERO {
             *ma = latency;
@@ -34,7 +34,11 @@ impl DialerCollection {
     }
 
     pub(crate) fn mark_unavailable(&self) {
-        self.latencies.append(TIMEOUT_LATENCY);
+        // Synthetic 10s placeholder: pushes the node to the back of
+        // latency-sorted selection, flagged so it is never displayed as a
+        // measured delay (clash history would show a bogus 10000ms).
+        self.latencies
+            .append(LatencySample::synthetic(TIMEOUT_LATENCY));
         let mut ma = self.moving_average.lock();
         if *ma == Duration::ZERO {
             *ma = TIMEOUT_LATENCY;
