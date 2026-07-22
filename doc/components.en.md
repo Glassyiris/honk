@@ -32,7 +32,7 @@ Source of truth: `crates/honk-config/src/*`, the dae parser in `crates/honk-conf
 | `allow_insecure` | `allow_insecure` | `false` | Global TLS skip-verify fallback |
 | `sniffing_timeout` | `sniffing_timeout_ms` | `30` | Sniff timeout, duration form (e.g. `30ms`) |
 | `tls_implementation` | `tls_implementation` | `"tls"` | TLS stack: `tls` (plain BoringSSL) / `utls` (real Chrome fingerprint) |
-| `utls_imitate` | `utls_imitate` | `"chrome_auto"` | Fingerprint profile; `chrome*` maps to the built-in real Chrome profile (BoringSSL) |
+| `utls_imitate` | `utls_imitate` | `"chrome_auto"` | Fingerprint profile; `chrome*` maps to the built-in real Chrome profile (BoringSSL); any other value warns and falls back to Chrome (the only profile) |
 | `tls_fragment` | `tls_fragment` | `false` | TLS ClientHello fragment flag |
 | `tls_fragment_length` | `tls_fragment_length` | `""` | Fragment length range |
 | `tls_fragment_interval` | `tls_fragment_interval` | `""` | Fragment interval range |
@@ -187,7 +187,7 @@ node {
 
 - `ech_config=<base64 ECHConfigList>` (or `ech_config_path` in the JSON/TOML config forms) offers real ECH. Without configs, Chrome mode sends ECH GREASE like a real browser.
 - ECH is fail-closed per RFC: if the server cannot accept ECH, the handshake fails (BoringSSL `ECH_REJECTED`) and any server-provided retry configs are logged.
-- DNS HTTPS-RR discovery of ECH configs is not implemented yet; configs must be provided statically.
+- `ech_enabled` without a static config discovers the ECHConfigList from DNS HTTPS records (RFC 9460) at connect time — via the bootstrap resolver, or the first system nameserver when none is configured — cached per domain (record TTL for hits, 5 min for misses). Discovery is best-effort and fail-open: if no config is found, Chrome mode still sends ECH GREASE and the handshake proceeds without ECH.
 
 **AnyTLS pool**
 

@@ -6,10 +6,13 @@
 //! key share, ALPS, brotli certificate compression, and ECH GREASE.
 //!
 //! ECH: when a node carries an ECHConfigList (`ech_config` / `ech_config_path`)
-//! the connector offers real ECH via `SSL_set1_ech_config_list`; without one,
-//! Chrome mode sends ECH GREASE like a real browser.
+//! the connector offers real ECH via `SSL_set1_ech_config_list`; `ech_enabled`
+//! without a static config triggers DNS HTTPS-RR discovery (RFC 9460) at
+//! connect time; without either, Chrome mode sends ECH GREASE like a real
+//! browser.
 //!
-//! Controlled by global config: tls_implementation ("tls"|"utls"), utls_imitate.
+//! Controlled by global config: tls_implementation ("tls"|"utls"), utls_imitate
+//! (only the Chrome profile exists; other values warn and fall back).
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -73,21 +76,24 @@ pub struct TlsConnector {
     connector: SslConnector,
     chrome: bool,
     ech_config_list: Option<Arc<Vec<u8>>>,
+    /// `ech_enabled` without a static config: discover via DNS HTTPS RR at
+    /// connect time (best-effort, fail-open).
+    ech_discovery: bool,
 }
 
 impl TlsConnector {
     /// Per-connection `Ssl` configuration: applies the parts of the Chrome
     /// profile that only exist per-SSL (permuted extensions, key shares,
     /// ALPS, ECH) — BoringSSL has no ctx-level API for these.
-    fn configuration(&self) -> anyhow::Result<ConnectConfiguration> {
+    fn configuration(&self, ech: Option<Arc<Vec<u8>>>) -> anyhow::Result<ConnectConfiguration> {
         let mut cfg = self.connector.configure()?;
         if self.chrome {
             cfg.set_permute_extensions(true);
             set_chrome_key_shares(&mut cfg)?;
             add_chrome_alps(&mut cfg)?;
         }
-        match &self.ech_config_list {
-            Some(list) => cfg.set_ech_config_list(list)?,
+        match ech {
+            Some(list) => cfg.set_ech_config_list(&list)?,
             // Real Chrome always GREASEs ECH when it holds no ECH keys.
             None if self.chrome => cfg.set_enable_ech_grease(true),
             None => {}
@@ -101,10 +107,15 @@ impl TlsConnector {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
-        let cfg = self.configuration()?;
+        let ech = match &self.ech_config_list {
+            Some(list) => Some(list.clone()),
+            None if self.ech_discovery => discover_ech_config(domain).await.map(Arc::new),
+            None => None,
+        };
+        let cfg = self.configuration(ech.clone())?;
         match tokio_boring::connect(cfg, domain, stream).await {
             Ok(stream) => {
-                if self.ech_config_list.is_some() {
+                if ech.is_some() {
                     tracing::debug!(
                         ech_accepted = stream.ssl().ech_accepted(),
                         sni = domain,
@@ -208,8 +219,8 @@ fn decode_ech_config_list(encoded: &str) -> anyhow::Result<Vec<u8>> {
 }
 
 /// Resolve the node's ECHConfigList, if any. Explicit `ech_config` wins over
-/// `ech_config_path`. `ech_enabled` without configs only gates GREASE-free
-/// behavior in non-Chrome mode and is a no-op until DNS HTTPS-RR lookup lands.
+/// `ech_config_path`. `ech_enabled` without configs is handled separately at
+/// connect time via DNS HTTPS-RR discovery ([`discover_ech_config`]).
 pub fn load_ech_config_list(node: &Node) -> anyhow::Result<Option<Vec<u8>>> {
     if let Some(encoded) = &node.ech_config {
         return decode_ech_config_list(encoded)
@@ -239,9 +250,70 @@ pub fn set_tls_mode(implementation: &str) {
     );
 }
 
+/// Called from ControlPlane startup with GlobalConfig.utls_imitate.
+///
+/// Only the Chrome profile exists today; any other requested value warns and
+/// falls back to it (dae accepts `chrome*`/`firefox`/`safari`/... here).
+pub fn set_utls_imitate(imitate: &str) {
+    let requested = imitate.trim();
+    if requested.is_empty() || requested.starts_with("chrome") {
+        return;
+    }
+    tracing::warn!(
+        "utls_imitate '{}' is not implemented; only the Chrome profile is available, using it",
+        requested
+    );
+}
+
 /// Chrome fingerprint active (global `tls_implementation: utls`).
 pub fn chrome_mode() -> bool {
     USE_CHROME_TLS.load(Ordering::Acquire)
+}
+
+/// Process-wide cache for DNS-discovered ECHConfigLists (RFC 9460 HTTPS RR).
+struct EchCacheEntry {
+    config: Option<Vec<u8>>,
+    expires: std::time::Instant,
+}
+
+static ECH_DISCOVERY_CACHE: LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, EchCacheEntry>>,
+> = LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Discover a domain's ECHConfigList via DNS HTTPS records (RFC 9460),
+/// cached per domain (positive: record TTL clamped to 60s..1d; negative:
+/// 5 min). Best-effort and fail-open: any failure yields `None`, unlike
+/// explicit `ech_config` which is fail-closed.
+pub async fn discover_ech_config(domain: &str) -> Option<Vec<u8>> {
+    let key = domain.trim_end_matches('.').to_ascii_lowercase();
+    if key.is_empty() || key.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    if let Some(hit) = ECH_DISCOVERY_CACHE.lock().unwrap().get(&key)
+        && hit.expires > std::time::Instant::now()
+    {
+        return hit.config.clone();
+    }
+    let (config, ttl) = match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        crate::bootstrap::query_ech_config(&key),
+    )
+    .await
+    {
+        Ok(Ok(Some((ech, ttl)))) => (Some(ech), ttl.clamp(60, 86400)),
+        _ => (None, 300),
+    };
+    if config.is_some() {
+        tracing::debug!(domain = %key, "discovered ECH config via DNS HTTPS RR");
+    }
+    ECH_DISCOVERY_CACHE.lock().unwrap().insert(
+        key,
+        EchCacheEntry {
+            config: config.clone(),
+            expires: std::time::Instant::now() + std::time::Duration::from_secs(ttl as u64),
+        },
+    );
+    config
 }
 
 /// Build the TLS connector for a node: BoringSSL with webpki roots,
@@ -280,6 +352,7 @@ pub fn build_connector(node: &Node) -> anyhow::Result<TlsConnector> {
     Ok(TlsConnector {
         connector: builder.build(),
         chrome,
+        ech_discovery: node.ech_enabled && ech_config_list.is_none(),
         ech_config_list: ech_config_list.map(Arc::new),
     })
 }
@@ -300,6 +373,7 @@ pub fn build_dns_connector(
         connector: builder.build(),
         chrome,
         ech_config_list: None,
+        ech_discovery: false,
     })
 }
 
@@ -486,5 +560,113 @@ mod tests {
             assert_eq!(decode_ech_config_list(&encoded).unwrap(), raw);
         }
         assert!(decode_ech_config_list("!!!not-base64!!!").is_err());
+    }
+
+    /// DNS response with one HTTPS answer carrying the given ech SvcParam
+    /// (`None` → NODATA), for the discovery stub server.
+    fn https_response(query: &[u8], ech: Option<&[u8]>, ttl: u32) -> Vec<u8> {
+        let mut resp = query.to_vec();
+        resp[2] = 0x81;
+        resp[3] = 0x80;
+        let Some(ech) = ech else {
+            resp[6] = 0;
+            resp[7] = 0;
+            return resp;
+        };
+        resp[6] = 0;
+        resp[7] = 1;
+        resp.extend_from_slice(&[0xC0, 0x0C]); // name pointer to question
+        resp.extend_from_slice(&65u16.to_be_bytes()); // TYPE HTTPS
+        resp.extend_from_slice(&1u16.to_be_bytes()); // IN
+        resp.extend_from_slice(&ttl.to_be_bytes());
+        let mut rdata = vec![0, 0, 0]; // priority 0, root target name
+        rdata.extend_from_slice(&5u16.to_be_bytes()); // SvcParam key ech
+        rdata.extend_from_slice(&(ech.len() as u16).to_be_bytes());
+        rdata.extend_from_slice(ech);
+        resp.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        resp.extend_from_slice(&rdata);
+        resp
+    }
+
+    /// Stub UDP DNS server answering every query with the canned HTTPS
+    /// response, counting queries. Installed via the bootstrap resolver.
+    async fn spawn_https_dns(
+        ech: Option<Vec<u8>>,
+        ttl: u32,
+    ) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::AtomicUsize;
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let count2 = count.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            while let Ok((n, peer)) = server.recv_from(&mut buf).await {
+                count2.fetch_add(1, Ordering::SeqCst);
+                let resp = https_response(&buf[..n], ech.as_deref(), ttl);
+                server.send_to(&resp, peer).await.ok();
+            }
+        });
+        (addr, count)
+    }
+
+    #[tokio::test]
+    async fn discover_ech_config_caches_positive_and_negative() {
+        use std::sync::atomic::Ordering as AOrd;
+        let _lock = crate::bootstrap::GLOBAL_TEST_LOCK.lock().unwrap();
+
+        // Positive: two lookups for the same name cost one DNS query.
+        let (addr, count) = spawn_https_dns(Some(b"\x00\x01ech-bytes".to_vec()), 120).await;
+        crate::bootstrap::set_global(crate::bootstrap::BootstrapResolver::parse(&format!(
+            "udp://{addr}"
+        )));
+        let first = discover_ech_config("ech-pos-unique.test").await;
+        let second = discover_ech_config("ech-pos-unique.test").await;
+        assert_eq!(first.as_deref(), Some(b"\x00\x01ech-bytes".as_slice()));
+        assert_eq!(second, first);
+        assert_eq!(count.load(AOrd::SeqCst), 1, "second lookup must hit cache");
+
+        // Negative: NODATA is cached too.
+        let (addr, count) = spawn_https_dns(None, 120).await;
+        crate::bootstrap::set_global(crate::bootstrap::BootstrapResolver::parse(&format!(
+            "udp://{addr}"
+        )));
+        assert_eq!(discover_ech_config("ech-neg-unique.test").await, None);
+        assert_eq!(discover_ech_config("ech-neg-unique.test").await, None);
+        assert_eq!(count.load(AOrd::SeqCst), 1, "negative lookup must hit cache");
+
+        // IP literals never query.
+        assert_eq!(discover_ech_config("203.0.113.7").await, None);
+        crate::bootstrap::set_global(None);
+    }
+
+    /// End-to-end: `ech_enabled` with no static config discovers the
+    /// ECHConfigList via DNS and completes a real ECH handshake.
+    #[tokio::test]
+    async fn ech_discovery_end_to_end() {
+        static ECH_CONFIG_LIST: &[u8] = include_bytes!("../tests/fixtures/echconfiglist");
+        let _lock = crate::bootstrap::GLOBAL_TEST_LOCK.lock().unwrap();
+
+        let (addr, _count) = spawn_https_dns(Some(ECH_CONFIG_LIST.to_vec()), 300).await;
+        crate::bootstrap::set_global(crate::bootstrap::BootstrapResolver::parse(&format!(
+            "udp://{addr}"
+        )));
+        let node = Node {
+            skip_cert_verify: true,
+            ech_enabled: true,
+            ..Default::default()
+        };
+        let (cert, key) = server_cert();
+        let (port, server) = spawn_ech_server(&cert, &key);
+        let mut stream = loopback_connect(&node, true, port).await.unwrap();
+        assert!(
+            stream.ssl().ech_accepted(),
+            "ECH via DNS discovery must be accepted"
+        );
+        use tokio::io::AsyncWriteExt;
+        stream.write_all(b"ok").await.unwrap();
+        stream.shutdown().await.unwrap();
+        assert_eq!(server.join().unwrap(), b"ok");
+        crate::bootstrap::set_global(None);
     }
 }

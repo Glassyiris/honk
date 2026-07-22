@@ -34,13 +34,14 @@ struct Doh3State {
 }
 
 impl Doh3Client {
-    pub fn new(endpoint: DnsEndpoint, query_timeout: Duration) -> anyhow::Result<Arc<Self>> {
+    pub async fn new(endpoint: DnsEndpoint, query_timeout: Duration) -> anyhow::Result<Arc<Self>> {
         let quic_config = honk_outbound::quic::client_config(
             &Default::default(),
             &[b"h3"],
             Some("cubic"),
             Some(Duration::from_secs(15)),
-        )?;
+        )
+        .await?;
         Ok(Arc::new(Self {
             endpoint,
             query_timeout,

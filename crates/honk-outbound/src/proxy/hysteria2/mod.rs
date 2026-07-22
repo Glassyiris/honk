@@ -647,7 +647,7 @@ impl Hysteria2Handler {
             .unwrap_or_else(|| node.password.as_deref().unwrap_or(""))
     }
 
-    fn client_for(node: &Node) -> anyhow::Result<Arc<Hy2Client>> {
+    async fn client_for(node: &Node) -> anyhow::Result<Arc<Hy2Client>> {
         let password = Self::resolve_password(node);
         let obfs = node.hy2_obfs.as_deref().filter(|s| !s.is_empty());
         let key = format!(
@@ -659,17 +659,18 @@ impl Hysteria2Handler {
             node.skip_cert_verify,
             obfs.unwrap_or("")
         );
-        let mut clients = CLIENTS.lock();
-        if let Some(client) = clients.get(&key) {
+        if let Some(client) = CLIENTS.lock().get(&key) {
             return Ok(Arc::clone(client));
         }
+        // Build outside the lock: client_config is async (ECH discovery).
         let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
         // ALPN "h3" (hysteria2 runs its auth over HTTP/3, `client.go:100-102`)
         // and BBR congestion control: sing-quic's default when no bandwidth
         // is configured (`client.go:580-588`). The brutal sender needs
         // configured bandwidth, which the Node schema has no fields for.
         let config =
-            crate::quic::client_config(node, &[b"h3"], Some("bbr"), Some(KEEP_ALIVE_INTERVAL))?;
+            crate::quic::client_config(node, &[b"h3"], Some("bbr"), Some(KEEP_ALIVE_INTERVAL))
+                .await?;
         let quic = QuicClient::new(node.host().to_string(), node.port, server_name, config);
         let quic = match obfs {
             Some(obfs_password) => quic.with_endpoint_factory(salamander_endpoint_factory(
@@ -681,8 +682,9 @@ impl Hysteria2Handler {
             quic,
             password: password.to_string(),
         });
-        clients.insert(key, Arc::clone(&client));
-        Ok(client)
+        // Another task may have won the race — reuse theirs.
+        let mut clients = CLIENTS.lock();
+        Ok(clients.entry(key).or_insert_with(|| Arc::clone(&client)).clone())
     }
 }
 
@@ -699,7 +701,7 @@ impl ProxyHandler for Hysteria2Handler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let client = Self::client_for(node)?;
+        let client = Self::client_for(node).await?;
         let addr = target_string(target, target_domain);
         if addr.len() as u64 > MAX_ADDRESS_LENGTH {
             anyhow::bail!("Hysteria2: target address too long");
@@ -757,7 +759,7 @@ impl ProxyHandler for Hysteria2Handler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<UdpProxySocket> {
-        let client = Self::client_for(node)?;
+        let client = Self::client_for(node).await?;
         let (conn, state) = client.connection(connect_timeout).await?;
         if state.udp_disabled {
             anyhow::bail!("Hysteria2: UDP disabled by server");
@@ -872,7 +874,7 @@ impl ProxyHandler for Hysteria2Handler {
     }
 
     async fn test_connectivity(&self, node: &Node) -> bool {
-        match Self::client_for(node) {
+        match Self::client_for(node).await {
             Ok(client) => client.connection(Duration::from_secs(5)).await.is_ok(),
             Err(e) => {
                 debug!(

@@ -19,7 +19,16 @@ build-core-ebpf:
     cargo build --release -p honk-core --features ebpf
 
 # Build honk-core for VyOS/Debian (static musl, portable)
+# boring-sys (BoringSSL, C++) needs a musl-target C++ runtime — linking with a
+# glibc-built libstdc++ fails with __isoc23_strtoul / __libc_single_threaded.
+# Requires a musl C/C++ toolchain: nix pkgsMusl or musl-cross-make (provides
+# musl-gcc / musl-g++ / x86_64-linux-musl-ar). Debian `musl-tools` lacks g++;
+# there, use zig (`CC=zig cc`, `CXX=zig c++`) instead.
 build-musl:
+    CC_x86_64_unknown_linux_musl=musl-gcc \
+    CXX_x86_64_unknown_linux_musl=musl-g++ \
+    AR_x86_64_unknown_linux_musl=x86_64-linux-musl-ar \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
     cargo build --release -p honk-core --features "ebpf" --target x86_64-unknown-linux-musl
     @echo "Binary: target/x86_64-unknown-linux-musl/release/honk-core"
 

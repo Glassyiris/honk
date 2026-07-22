@@ -63,8 +63,9 @@ pub fn congestion_factory(
 ///   instead and passes `None`).
 ///
 /// TLS is the BoringSSL backend in [`crate::quic_boring`] (Chrome fingerprint
-/// when `tls_implementation = "utls"`, ECH when the node carries one).
-pub fn client_config(
+/// when `tls_implementation = "utls"`, ECH when the node carries one —
+/// static config, or DNS HTTPS-RR discovery when only `ech_enabled` is set).
+pub async fn client_config(
     node: &honk_config::node::Node,
     alpn: &[&[u8]],
     congestion: Option<&str>,
@@ -74,11 +75,19 @@ pub fn client_config(
         .iter()
         .flat_map(|p| std::iter::once(p.len() as u8).chain(p.iter().copied()))
         .collect::<Vec<u8>>();
+    let ech = match crate::tls::load_ech_config_list(node)? {
+        Some(list) => Some(Arc::new(list)),
+        None if node.ech_enabled => {
+            let name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
+            crate::tls::discover_ech_config(&name).await.map(Arc::new)
+        }
+        None => None,
+    };
     let crypto = crate::quic_boring::BoringQuicClientConfig::new(
         alpn_wire,
         node.skip_cert_verify,
         crate::tls::chrome_mode(),
-        crate::tls::load_ech_config_list(node)?.map(Arc::new),
+        ech,
     )?;
     let mut cfg = ClientConfig::new(Arc::new(crypto));
 

@@ -34,7 +34,7 @@
 | `allow_insecure` | bool | `false` | 全局 TLS 跳过校验回退 |
 | `sniffing_timeout_ms` | u64 | `30` | 嗅探超时（ms）。**dae：** `sniffing_timeout` 时长 |
 | `tls_implementation` | string | `"tls"` | TLS 栈：`tls`（原生 BoringSSL）/ `utls`（真实 Chrome 指纹） |
-| `utls_imitate` | string | `"chrome_auto"` | 指纹配置；`chrome*` 映射到内置真实 Chrome 指纹（BoringSSL） |
+| `utls_imitate` | string | `"chrome_auto"` | 指纹配置；`chrome*` 映射到内置真实 Chrome 指纹（BoringSSL）；其他值告警并回退 Chrome（目前唯一 profile） |
 | `tls_fragment` | bool | `false` | TLS ClientHello 分片开关 |
 | `tls_fragment_length` | string | `""` | 分片长度范围 |
 | `tls_fragment_interval` | string | `""` | 分片间隔范围 |
@@ -157,7 +157,7 @@ node {
 
 - `ech_config=<base64 ECHConfigList>`（或结构化配置中的 `ech_config_path`）提供真实 ECH；无配置时 Chrome 模式发送 ECH GREASE（与真实浏览器一致）。
 - ECH 按 RFC 失败关闭：服务端不接受 ECH 时握手失败（BoringSSL `ECH_REJECTED`），服务端提供的重试配置会写入日志。
-- 暂不支持从 DNS HTTPS RR 发现 ECH 配置；目前只能静态提供。
+- `ech_enabled` 但无静态配置时，连接期从 DNS HTTPS 记录（RFC 9460）发现 ECHConfigList——经 bootstrap resolver（未配置时用系统首个 nameserver），按域名缓存（命中按记录 TTL，未命中 5 分钟）。发现是尽力而为且失败开放的：找不到配置时 Chrome 模式仍发送 ECH GREASE，握手不带 ECH 继续。
 
 **AnyTLS 池**
 

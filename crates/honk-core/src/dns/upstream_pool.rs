@@ -350,7 +350,7 @@ impl UpstreamPool {
         }
     }
 
-    fn build_transport(
+    async fn build_transport(
         &self,
         entry: &UpstreamEntry,
         proxy_node: Option<&Node>,
@@ -363,8 +363,12 @@ impl UpstreamPool {
             DnsProtocol::Tcp => PooledTransport::Tcp(TcpPool::new(dial)),
             DnsProtocol::Tls => PooledTransport::Dot(DotPool::new(dial)?),
             DnsProtocol::Https => PooledTransport::Doh(DohClient::new(dial)?),
-            DnsProtocol::Quic => PooledTransport::Doq(DoqClient::new(endpoint, query_timeout)?),
-            DnsProtocol::H3 => PooledTransport::Doh3(Doh3Client::new(endpoint, query_timeout)?),
+            DnsProtocol::Quic => {
+                PooledTransport::Doq(DoqClient::new(endpoint, query_timeout).await?)
+            }
+            DnsProtocol::H3 => {
+                PooledTransport::Doh3(Doh3Client::new(endpoint, query_timeout).await?)
+            }
             DnsProtocol::Udp => anyhow::bail!("internal: UDP has no pooled transport"),
         })
     }
@@ -382,7 +386,7 @@ impl UpstreamPool {
                 return Ok(t.clone());
             }
         }
-        let built = Arc::new(self.build_transport(entry, proxy_node)?);
+        let built = Arc::new(self.build_transport(entry, proxy_node).await?);
         let mut guard = entry.transports.lock().await;
         // Another task may have won the race — reuse theirs.
         if let Some(t) = guard.get(&key) {

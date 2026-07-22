@@ -92,20 +92,23 @@ impl BootstrapResolver {
     }
 
     async fn query_udp(&self, host: &str, qtype: u16) -> io::Result<Vec<IpAddr>> {
-        let bind: SocketAddr = if self.server.is_ipv4() {
-            (Ipv4Addr::UNSPECIFIED, 0).into()
-        } else {
-            (Ipv6Addr::UNSPECIFIED, 0).into()
-        };
-        let socket = crate::util::udp_marked_bind(bind).await?;
-        socket.connect(self.server).await?;
-        socket.send(&build_query(host, qtype)).await?;
-        let mut buf = [0u8; 1500];
-        let n = socket.recv(&mut buf).await?;
-        parse_answers(&buf[..n], qtype)
+        parse_answers(&query_udp_raw(self.server, host, qtype).await?, qtype)
     }
 
     async fn query_tcp(&self, host: &str, qtype: u16) -> io::Result<Vec<IpAddr>> {
+        parse_answers(&self.query_tcp_raw(host, qtype).await?, qtype)
+    }
+
+    /// Send a single query and return the raw response bytes.
+    async fn query_raw(&self, host: &str, qtype: u16) -> io::Result<Vec<u8>> {
+        if self.use_tcp {
+            self.query_tcp_raw(host, qtype).await
+        } else {
+            query_udp_raw(self.server, host, qtype).await
+        }
+    }
+
+    async fn query_tcp_raw(&self, host: &str, qtype: u16) -> io::Result<Vec<u8>> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut stream = crate::util::connect_marked_addr(
             self.server,
@@ -123,8 +126,125 @@ impl BootstrapResolver {
         let len = u16::from_be_bytes(len_buf) as usize;
         let mut buf = vec![0u8; len];
         stream.read_exact(&mut buf).await?;
-        parse_answers(&buf, qtype)
+        Ok(buf)
     }
+}
+
+/// One UDP query/response exchange with `server` over a bypass-marked socket.
+async fn query_udp_raw(server: SocketAddr, host: &str, qtype: u16) -> io::Result<Vec<u8>> {
+    let bind: SocketAddr = if server.is_ipv4() {
+        (Ipv4Addr::UNSPECIFIED, 0).into()
+    } else {
+        (Ipv6Addr::UNSPECIFIED, 0).into()
+    };
+    let socket = crate::util::udp_marked_bind(bind).await?;
+    socket.connect(server).await?;
+    socket.send(&build_query(host, qtype)).await?;
+    let mut buf = [0u8; 1500];
+    let n = socket.recv(&mut buf).await?;
+    Ok(buf[..n].to_vec())
+}
+
+/// First nameserver from /etc/resolv.conf (UDP, port 53). Used for record
+/// lookups (e.g. ECH discovery) when no `bootstrap_resolver` is configured.
+fn system_nameserver() -> Option<SocketAddr> {
+    let contents = std::fs::read_to_string("/etc/resolv.conf").ok()?;
+    for line in contents.lines() {
+        if let Some(rest) = line.trim().strip_prefix("nameserver")
+            && let Ok(ip) = rest.trim().parse::<IpAddr>()
+        {
+            return Some(SocketAddr::new(ip, 53));
+        }
+    }
+    None
+}
+
+/// DNS qtype for HTTPS service-binding records (RFC 9460).
+const QTYPE_HTTPS: u16 = 65;
+/// SVCB SvcParam key carrying the ECHConfigList.
+const SVCB_KEY_ECH: u16 = 5;
+
+/// Look up the ECHConfigList for `host` via DNS HTTPS records (RFC 9460).
+///
+/// Queries the configured bootstrap resolver, or the first system nameserver
+/// when none is configured. Returns the ECHConfigList and the record TTL, or
+/// `None` when no usable HTTPS record exists.
+pub async fn query_ech_config(host: &str) -> io::Result<Option<(Vec<u8>, u32)>> {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.parse::<IpAddr>().is_ok() {
+        return Ok(None);
+    }
+    let resolver = *GLOBAL.read().unwrap();
+    let msg = match resolver {
+        Some(r) => r.query_raw(host, QTYPE_HTTPS).await?,
+        None => {
+            let Some(server) = system_nameserver() else {
+                return Ok(None);
+            };
+            query_udp_raw(server, host, QTYPE_HTTPS).await?
+        }
+    };
+    Ok(parse_https_rr_ech(&msg))
+}
+
+/// Extract the ECHConfigList and TTL from the first ServiceMode HTTPS RR in
+/// a DNS response. AliasMode records (priority != 0) carry no SvcParams and
+/// are skipped.
+fn parse_https_rr_ech(msg: &[u8]) -> Option<(Vec<u8>, u32)> {
+    if msg.len() < 12 {
+        return None;
+    }
+    let qd = u16::from_be_bytes([msg[4], msg[5]]) as usize;
+    let an = u16::from_be_bytes([msg[6], msg[7]]) as usize;
+    let mut pos = 12;
+    for _ in 0..qd {
+        pos = skip_name(msg, pos).ok()?;
+        pos = pos.checked_add(4)?;
+    }
+    for _ in 0..an {
+        pos = skip_name(msg, pos).ok()?;
+        if pos + 10 > msg.len() {
+            return None;
+        }
+        let rtype = u16::from_be_bytes([msg[pos], msg[pos + 1]]);
+        let ttl = u32::from_be_bytes([msg[pos + 4], msg[pos + 5], msg[pos + 6], msg[pos + 7]]);
+        let rdlen = u16::from_be_bytes([msg[pos + 8], msg[pos + 9]]) as usize;
+        pos += 10;
+        if pos + rdlen > msg.len() {
+            return None;
+        }
+        if rtype == QTYPE_HTTPS
+            && rdlen >= 3
+            && let Some(ech) = parse_svcb_ech_param(&msg[pos..pos + rdlen])
+        {
+            return Some((ech, ttl));
+        }
+        pos += rdlen;
+    }
+    None
+}
+
+/// Parse SVCB/HTTPS RDATA for the `ech` SvcParam (key 5). ServiceMode only:
+/// priority 0; the target name follows, then key=len=value pairs.
+fn parse_svcb_ech_param(rdata: &[u8]) -> Option<Vec<u8>> {
+    let priority = u16::from_be_bytes([rdata[0], rdata[1]]);
+    if priority != 0 {
+        return None; // AliasMode has no SvcParams
+    }
+    let mut pos = skip_name(rdata, 2).ok()?;
+    while pos + 4 <= rdata.len() {
+        let key = u16::from_be_bytes([rdata[pos], rdata[pos + 1]]);
+        let len = u16::from_be_bytes([rdata[pos + 2], rdata[pos + 3]]) as usize;
+        pos += 4;
+        if pos + len > rdata.len() {
+            return None;
+        }
+        if key == SVCB_KEY_ECH {
+            return Some(rdata[pos..pos + len].to_vec());
+        }
+        pos += len;
+    }
+    None
 }
 
 /// Build a minimal DNS query (RD set, single question).
@@ -224,6 +344,9 @@ fn skip_name(msg: &[u8], mut pos: usize) -> io::Result<usize> {
 }
 
 #[cfg(test)]
+pub(crate) static GLOBAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -270,6 +393,7 @@ mod tests {
     /// installed as the global bootstrap resolver.
     #[tokio::test]
     async fn test_resolve_via_bootstrap_udp() {
+        let _lock = GLOBAL_TEST_LOCK.lock().unwrap();
         let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server.local_addr().unwrap();
         tokio::spawn(async move {
@@ -293,5 +417,74 @@ mod tests {
         let ips = resolve("node.example.com").await.unwrap();
         set_global(None);
         assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(10, 9, 8, 7))]);
+    }
+
+    /// Build a DNS response carrying one HTTPS (65) answer for the query's
+    /// question, with the given priority and `ech` SvcParam (or none).
+    fn make_https_response(query: &[u8], priority: u16, ech: Option<&[u8]>, ttl: u32) -> Vec<u8> {
+        let mut resp = query.to_vec();
+        resp[2] = 0x81;
+        resp[3] = 0x80;
+        resp[6] = 0;
+        resp[7] = 1; // ancount = 1
+        resp.extend_from_slice(&[0xC0, 0x0C]); // name pointer to question
+        resp.extend_from_slice(&65u16.to_be_bytes()); // TYPE HTTPS
+        resp.extend_from_slice(&1u16.to_be_bytes()); // IN
+        resp.extend_from_slice(&ttl.to_be_bytes());
+        let mut rdata = Vec::new();
+        rdata.extend_from_slice(&priority.to_be_bytes());
+        rdata.push(0); // target name = root
+        if let Some(ech) = ech {
+            rdata.extend_from_slice(&5u16.to_be_bytes()); // SvcParam key ech
+            rdata.extend_from_slice(&(ech.len() as u16).to_be_bytes());
+            rdata.extend_from_slice(ech);
+        }
+        resp.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        resp.extend_from_slice(&rdata);
+        resp
+    }
+
+    #[test]
+    fn test_parse_https_rr_ech() {
+        let query = build_query("example.com", 65);
+        let ech = b"\x00\x01fake-ech-config";
+        let resp = make_https_response(&query, 0, Some(ech), 300);
+        assert_eq!(
+            parse_https_rr_ech(&resp),
+            Some((ech.to_vec(), 300)),
+            "ServiceMode HTTPS RR with ech param"
+        );
+
+        // AliasMode (priority != 0) carries no SvcParams — skipped.
+        let resp = make_https_response(&query, 1, Some(ech), 300);
+        assert_eq!(parse_https_rr_ech(&resp), None);
+
+        // ServiceMode without an ech param.
+        let resp = make_https_response(&query, 0, None, 300);
+        assert_eq!(parse_https_rr_ech(&resp), None);
+    }
+
+    /// End-to-end: stub UDP DNS server answering HTTPS records with an ech
+    /// SvcParam, installed as the global bootstrap resolver.
+    #[tokio::test]
+    async fn test_query_ech_config_via_bootstrap_udp() {
+        let _lock = GLOBAL_TEST_LOCK.lock().unwrap();
+        let ech = b"\x00\x02real-ech-bytes";
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, peer) = server.recv_from(&mut buf).await.unwrap();
+            let resp = make_https_response(&buf[..n], 0, Some(ech), 120);
+            server.send_to(&resp, peer).await.unwrap();
+        });
+
+        set_global(BootstrapResolver::parse(&format!("udp://{}", server_addr)));
+        let got = query_ech_config("node.example.com").await.unwrap();
+        set_global(None);
+        assert_eq!(got, Some((ech.to_vec(), 120)));
+
+        // IP literals never hit the network.
+        assert_eq!(query_ech_config("1.2.3.4").await.unwrap(), None);
     }
 }

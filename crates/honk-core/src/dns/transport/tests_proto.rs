@@ -593,11 +593,19 @@ async fn live_google_doh_request_path() {
     eprintln!("=== path OK ===\n");
 }
 
-#[test]
-fn doq_doh3_clients_construct() {
+#[tokio::test]
+async fn doq_doh3_clients_construct() {
     let ep = DnsEndpoint::parse("127.0.0.1", DnsProtocol::Quic, Some("localhost")).unwrap();
-    assert!(crate::dns::transport::DoqClient::new(ep.clone(), Duration::from_secs(1)).is_ok());
+    assert!(
+        crate::dns::transport::DoqClient::new(ep.clone(), Duration::from_secs(1))
+            .await
+            .is_ok()
+    );
     let ep3 =
         DnsEndpoint::parse("127.0.0.1/dns-query", DnsProtocol::H3, Some("localhost")).unwrap();
-    assert!(crate::dns::transport::Doh3Client::new(ep3, Duration::from_secs(1)).is_ok());
+    assert!(
+        crate::dns::transport::Doh3Client::new(ep3, Duration::from_secs(1))
+            .await
+            .is_ok()
+    );
 }

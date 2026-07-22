@@ -30,13 +30,14 @@ struct DoqState {
 }
 
 impl DoqClient {
-    pub fn new(endpoint: DnsEndpoint, query_timeout: Duration) -> anyhow::Result<Arc<Self>> {
+    pub async fn new(endpoint: DnsEndpoint, query_timeout: Duration) -> anyhow::Result<Arc<Self>> {
         let quic_config = honk_outbound::quic::client_config(
             &Default::default(),
             &[b"doq"],
             Some("cubic"),
             Some(Duration::from_secs(15)),
-        )?;
+        )
+        .await?;
         Ok(Arc::new(Self {
             endpoint,
             query_timeout,

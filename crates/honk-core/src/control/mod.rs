@@ -441,6 +441,7 @@ impl ControlPlane {
             {
                 let c = self.config.read().await;
                 honk_outbound::tls::set_tls_mode(&c.global.tls_implementation);
+                honk_outbound::tls::set_utls_imitate(&c.global.utls_imitate);
             }
 
             // Configure HTTP-based health checks from config (Go: TcpCheckOption).
