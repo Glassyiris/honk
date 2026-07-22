@@ -25,6 +25,7 @@ This file is written for AI coding agents that need to understand, build, test, 
 ├── config.min.dae            # Minimal example (good for --mock-ebpf dev)
 ├── example.dae               # Annotated example (Chinese comments)
 ├── doc/                      # design / configuration / components docs (en + zh)
+├── ci/                       # zigcc/zigcxx: zig cc/c++ wrappers for cross builds (strip CMake's clang-style --target from boring-sys ASM rules + rustc's aarch64 errata linker args; used by build-musl and the release workflow); zig-bindgen-env: derive BINDGEN_EXTRA_CLANG_ARGS from `zig cc -E -v` for cross bindgen
 ├── .github/workflows/        # release.yml: tag-triggered test + cross-build + GitHub Release
 └── crates/
     ├── honk-config           # Config schema + dae-syntax parser + share links (workspace member)
@@ -145,7 +146,7 @@ The proxy engine (library `honk_core` + `honk-core` binary). Cargo features:
 - `ebpf` — real eBPF backend via aya (requires Linux kernel 5.8+); without it the engine runs on `MockEbpfBackend`.
 - `clash-api` — Clash-compatible REST/WS API (pulls in optional axum/tower-http).
 
-`build.rs` (only with `ebpf`) locates the eBPF object (`crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf` or `target/honk-core.o`), auto-builds it with `cargo +nightly` when missing, copies it to `OUT_DIR/honk-ebpf.o`, and sets `HONK_EBPF_OBJECT`; `lib.rs` embeds it with `include_bytes!`. Runtime override: `--bpf-object`.
+`build.rs` (only with `ebpf`) locates the eBPF object (`crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf` or `target/honk-core.o`), **verifies it contains `.BTF`** (rebuilds with `cargo +nightly` when missing or BTF-less — the rebuild strips `RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS` from the child env because an environment RUSTFLAGS overrides `crates/honk-ebpf/.cargo/config.toml`'s `--btf` flags and silently produces BTF-less objects), copies it to `OUT_DIR/honk-ebpf.o`, and sets `HONK_EBPF_OBJECT`; `lib.rs` embeds it with `include_bytes!`. Runtime override: `--bpf-object`.
 
 Module map:
 
@@ -236,24 +237,24 @@ cargo +nightly build --release -Zbuild-std=core --target bpfel-unknown-none
 | Recipe | Purpose |
 | -------- | --------- |
 | `build` / `check` / `lint` / `fmt` | `cargo build --release` / `check` / `clippy --all -D warnings` / `fmt --all` |
-| `test` / `test-core` / `test-config` / `test-ebpf` | Test suites (`test-ebpf` = honk-ebpf-common only) |
+| `test` / `test-ci` / `test-core` / `test-config` / `test-ebpf` | Test suites (`test` = full incl. known failures; `test-ci` = CI gate with the 3 known failures skipped; `test-ebpf` = honk-ebpf-common only) |
 | `build-core` / `build-core-ebpf` | honk-core with `ebpf` feature |
-| `build-musl` | Static musl build (`x86_64-unknown-linux-musl`, for VyOS/Debian) |
-| `build-ebpf` | eBPF object standalone (nightly, `bpfel-unknown-none`) |
+| `build-musl` | Static musl build (`x86_64-unknown-linux-musl`, for VyOS/Debian) via the `ci/zigcc`/`ci/zigcxx` zig wrappers + `link-self-contained=no` (needs zig 0.14+) |
+| `build-ebpf` | eBPF object standalone (nightly, `bpfel-unknown-none`) — warns when `RUSTFLAGS` is set (it overrides the crate's `--btf` rustflags) and verifies the object actually has `.BTF` (aya refuses BTF-less objects) |
 | `run-debug` | Build with ebpf, clean previous state, run with `config.dae` + external object |
 | `run-dae` | Run with `config.dae` + `--mock-ebpf` |
 | `debug-status` / `debug-config` / `debug-alive` / `debug-stats` / `watch-debug` | Query the clash HTTP API on :9090 (`/version`, `/configs`, `/proxies`, `/group/{n}/delay`, `/stats`, `/connections`) |
 | `bpf-progs` / `bpf-maps` | Inspect loaded BPF programs and pinned maps |
 | `deploy-vyos HOST=...` | musl build + scp to a VyOS router |
-| `clean` / `clean-all` | `cargo clean` / kill honk-core, remove `dae0`/`daens`, BPF pins, legacy iptables/policy-route leftovers |
+| `clean` / `clean-all` | `cargo clean` / kill honk-core, remove `dae0`/`daens`, BPF pins, policy routes (live table 100 + legacy table 2023/iptables leftovers) |
 | `cycle` | `clean-all` + `build-core` |
 | `watch-core` | `cargo watch` rebuild |
 
-**Broken in this checkout:** `run` and `deploy` (missing `scripts/`), `docker` / `docker-up` / `docker-down` (missing `Dockerfile` / `docker-compose.yml`). Note `clean-all` still deletes iptables MASQUERADE rules and routing table 2023 — legacy leftovers; the live setup installs no iptables rules and uses table 100.
+The old `run` / `deploy` / `docker*` recipes were removed: they called `scripts/debug-local.sh` / `scripts/deploy-gateway.sh` / `Dockerfile` / `docker-compose.yml`, none of which exist in this tree.
 
 ### CI / releases
 
-`.github/workflows/release.yml` runs on `v*` tags: `cargo test --all` gate (stable toolchain), then builds `honk-core --features ebpf` for `x86_64`/`aarch64` × `gnu`/`musl` (via `cross`; the eBPF object is built once on the host with nightly + `bpf-linker`, which the workflow substitutes for the hardcoded linker path), and publishes tarballs to a GitHub Release (marked prerelease when the tag contains `alpha`/`beta`/`rc`).
+`.github/workflows/release.yml` runs on `v*` tags: a test gate (`cargo test --workspace --no-fail-fast` with the 3 known-failing pre-existing tests `--skip`ped — boring-sys needs `cmake` + `libclang-dev` installed), then builds `honk-core --features ebpf` for `x86_64`/`aarch64` × `gnu`/`musl` (native gnu via `cargo build`; the other three via **zig cc/c++ wrapper scripts `ci/zigcc` / `ci/zigcxx`** — under cross, CMake injects clang-style `--target` flags into boring-sys' ASM rules that real GCC rejects and zig rejects in Rust-triple spelling, so the wrappers strip them and re-anchor on `$ZIGCC_TARGET`; musl targets also set `link-self-contained=no` so zig supplies the CRT). The eBPF object is built once on the host with nightly + `bpf-linker` (the workflow substitutes the hardcoded linker path) and **verified to contain `.BTF`** before packaging. Tarballs go to a GitHub Release (prerelease when the tag contains `alpha`/`beta`/`rc`).
 
 ## Current test status (verified 2026-07-22, after the boring-tls migration)
 

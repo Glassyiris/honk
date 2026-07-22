@@ -12,13 +12,25 @@ fn main() {
 
 #[cfg(feature = "ebpf")]
 fn embed_ebpf_object() {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let ebpf_crate = manifest_dir.join("../honk-ebpf");
     let ebpf_common_crate = manifest_dir.join("../honk-ebpf-common");
     let ebpf_target = ebpf_crate.join("target/bpfel-unknown-none/release/honk-ebpf");
+
+    /// aya refuses objects without a `.BTF` section ("no BTF parsed for
+    /// object"). Cheap guard: section names live verbatim in the section
+    /// header string table, so a byte search for the NUL-terminated name is
+    /// sufficient.
+    fn object_has_btf(path: &Path) -> bool {
+        std::fs::read(path)
+            .map(|data| {
+                data.windows(5).any(|w| w == b".BTF\0") || data.windows(5).any(|w| w == b".BTF.")
+            })
+            .unwrap_or(false)
+    }
 
     let candidates = [
         ebpf_target.clone(),
@@ -28,11 +40,13 @@ fn embed_ebpf_object() {
     let obj = candidates.iter().find(|p| p.exists()).cloned();
 
     let obj = match obj {
-        Some(p) => {
+        Some(p) if object_has_btf(&p) => {
             println!("cargo:rerun-if-changed={}", p.display());
             p
         }
-        None => {
+        _ => {
+            // Missing, or stale without .BTF (e.g. built while an environment
+            // RUSTFLAGS overrode crates/honk-ebpf/.cargo/config.toml): (re)build.
             println!("cargo:warning=Building eBPF object (one-time, ~30s)...");
             let status = Command::new("cargo")
                 .args([
@@ -43,6 +57,11 @@ fn embed_ebpf_object() {
                     "--target",
                     "bpfel-unknown-none",
                 ])
+                // An inherited RUSTFLAGS would override the crate's
+                // .cargo/config.toml rustflags (--btf, debuginfo) and silently
+                // produce a BTF-less object again.
+                .env_remove("RUSTFLAGS")
+                .env_remove("CARGO_ENCODED_RUSTFLAGS")
                 .current_dir(&ebpf_crate)
                 .status()
                 .expect("failed to build eBPF object");
@@ -54,6 +73,16 @@ fn embed_ebpf_object() {
                      -Zbuild-std=core --target bpfel-unknown-none"
                 );
             }
+            if !object_has_btf(&ebpf_target) {
+                panic!(
+                    "eBPF object at {} has no .BTF section — aya cannot load it. \
+                     Rebuild manually:\n  \
+                     cd crates/honk-ebpf && cargo +nightly build --release \
+                     -Zbuild-std=core --target bpfel-unknown-none",
+                    ebpf_target.display()
+                );
+            }
+            println!("cargo:rerun-if-changed={}", ebpf_target.display());
             ebpf_target
         }
     };
