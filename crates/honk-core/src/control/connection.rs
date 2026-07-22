@@ -997,8 +997,9 @@ impl ControlPlaneHandle {
     /// SNI sent by the client. Both IPv4 and IPv6 results are checked.
     ///
     /// When the connection is dual-stack but our resolver only returns the
-    /// other family (common with `dns.ipversion_prefer: 4` / Ipv4Only, which
-    /// drops AAAA), the check **trusts the SNI** instead of discarding it.
+    /// other family (common when the DNS strategy suppresses AAAA — e.g.
+    /// `ipversion_prefer: 4` with A answers present, or an only-mode), the
+    /// check **trusts the SNI** instead of discarding it.
     /// Falling back to IP-only would mis-route CDN IPv6 (e.g. `tracker.m-team.cc`
     /// on Cloudflare AAAA) via `dport(443) → proxy` despite
     /// `domain(keyword: m-team) → direct`.

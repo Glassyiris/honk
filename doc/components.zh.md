@@ -338,7 +338,11 @@ dns {
 
 `preferipv4` | `preferipv6` | `ipv4only` | `ipv6only` | `both`
 
-dae：`ipversion_prefer: 4|6`。
+- `ipv4only` / `ipv6only`：另一地址族的查询在请求期直接回 NODATA，不转发上游。
+- `preferipv4` / `preferipv6`：两个地址族都会转发；当偏好族对同名有应答时，另一族的应答被压制（NODATA）；偏好族无应答时返回另一族的真实应答（允许回退）。缓存未命中时偏好族检查需额外一次上游查询。
+- `both`：不过滤。
+
+dae：`ipversion_prefer: 4` 映射 `preferipv4`，`6` 映射 `preferipv6`（其他值 = `preferipv4`）；only 模式无法通过 dae 语法表达。
 
 ### 缓存
 

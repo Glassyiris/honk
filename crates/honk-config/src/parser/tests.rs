@@ -598,8 +598,21 @@ dns {
 }
 
 #[test]
-fn test_parse_dns_response_routing() {
-    let input = r#"
+fn test_parse_ipversion_prefer_maps_to_prefer_variants() {
+    let config = parse_dae_config("dns {\n    ipversion_prefer: 4\n}\n").unwrap();
+    assert!(matches!(
+        config.dns.strategy,
+        crate::dns::DnsStrategy::PreferIpv4
+    ));
+    let config = parse_dae_config("dns {\n    ipversion_prefer: 6\n}\n").unwrap();
+    assert!(matches!(
+        config.dns.strategy,
+        crate::dns::DnsStrategy::PreferIpv6
+    ));
+}
+
+#[test]
+fn test_parse_dns_response_routing() {    let input = r#"
 dns {
     routing {
         response {

@@ -1075,9 +1075,11 @@ fn parse_duration_ms(s: &str) -> u64 {
 
 fn parse_ip_prefer(s: &str) -> crate::dns::DnsStrategy {
     use crate::dns::DnsStrategy;
+    // dae `ipversion_prefer` is a *preference*, not an only-mode: 4/6 map to
+    // the prefer variants (other family still answered when it alone exists).
     match s.parse::<i32>() {
-        Ok(4) => DnsStrategy::Ipv4Only,
-        Ok(6) => DnsStrategy::Ipv6Only,
+        Ok(4) => DnsStrategy::PreferIpv4,
+        Ok(6) => DnsStrategy::PreferIpv6,
         _ => DnsStrategy::PreferIpv4,
     }
 }

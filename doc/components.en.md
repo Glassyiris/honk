@@ -384,7 +384,11 @@ Each upstream is a `name: 'uri'` line; an optional trailing `-> tag` (or legacy 
 
 Internal values: `preferipv4` | `preferipv6` | `ipv4only` | `ipv6only` | `both`.
 
-dae: `ipversion_prefer: 4|6` (anything else = `preferipv4`).
+- `ipv4only` / `ipv6only`: the other family's queries are answered NODATA at request time and never forwarded upstream.
+- `preferipv4` / `preferipv6`: both families are forwarded. When the preferred family has answers for the name, the other family's response is suppressed (NODATA); when it has none, the other family's answers are returned (fallback allowed). The preferred-family check costs one extra upstream query per name on cache miss.
+- `both`: no filtering.
+
+dae: `ipversion_prefer: 4` maps to `preferipv4`, `6` to `preferipv6` (anything else = `preferipv4`). The only-modes are not expressible in dae syntax.
 
 ### Cache
 

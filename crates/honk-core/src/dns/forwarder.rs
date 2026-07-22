@@ -176,9 +176,9 @@ impl DnsForwarder {
             domain, qtype, cache_key
         );
 
-        // IP-version strategy: drop queries for the unwanted address family so
-        // clients fall back to the preferred one instead of trying to connect
-        // through a proxy that lacks IPv6 connectivity.
+        // IP-version strategy: `*_only` modes answer the other family's
+        // query with NODATA right here; prefer modes forward both families
+        // and are enforced at response time (see `apply_prefer_strategy`).
         if is_filtered_qtype(qtype, &self.strategy) {
             debug!(
                 "DNS forwarder: dropping {} query due to strategy {:?}",
@@ -221,7 +221,12 @@ impl DnsForwarder {
                 if response.len() >= 2 && raw_query.len() >= 2 {
                     response[0..2].copy_from_slice(&raw_query[0..2]);
                 }
-                return Ok(response);
+                // Drop the lock before the prefer check: it re-locks the cache
+                // and may issue a sibling query.
+                drop(cache);
+                return self
+                    .apply_prefer_strategy(raw_query, &domain, qtype, response, original_dst)
+                    .await;
             }
         }
 
@@ -350,7 +355,76 @@ impl DnsForwarder {
             response.len()
         );
 
+        self.apply_prefer_strategy(raw_query, &domain, qtype, response, original_dst)
+            .await
+    }
+
+    /// Prefer-mode strategy (sing-box / dae `ipversion_prefer` semantics):
+    /// when the preferred family has answers for the same name, suppress the
+    /// non-preferred family's response with NODATA; otherwise return it
+    /// unchanged. Only-modes are handled earlier at request time.
+    async fn apply_prefer_strategy(
+        &self,
+        raw_query: &[u8],
+        domain: &str,
+        qtype: u16,
+        response: Vec<u8>,
+        original_dst: Option<SocketAddr>,
+    ) -> anyhow::Result<Vec<u8>> {
+        let preferred = match (&self.strategy, qtype) {
+            (DnsStrategy::PreferIpv4, 28) => 1u16,
+            (DnsStrategy::PreferIpv6, 1) => 28u16,
+            _ => return Ok(response),
+        };
+        if self
+            .preferred_family_has_answers(domain, preferred, original_dst)
+            .await
+        {
+            debug!(
+                "DNS forwarder: suppressing {} answer for {} — preferred {} answers exist",
+                qtype_name(qtype),
+                domain,
+                qtype_name(preferred)
+            );
+            return Ok(make_empty_response(raw_query, domain, qtype));
+        }
         Ok(response)
+    }
+
+    /// Whether the preferred address family has answers for `domain`, checking
+    /// the cache first and issuing a sibling query through the normal pipeline
+    /// on a miss (its result is cached by that pipeline). The sibling query
+    /// uses the preferred qtype, so `apply_prefer_strategy` never recurses.
+    async fn preferred_family_has_answers(
+        &self,
+        domain: &str,
+        preferred_qtype: u16,
+        original_dst: Option<SocketAddr>,
+    ) -> bool {
+        let sibling_key = dns_cache_key(domain, preferred_qtype);
+        if self.cache_enabled {
+            let mut cache = self.cache.lock().await;
+            if cache.is_negative(&sibling_key) {
+                return false;
+            }
+            if let Some(entry) = cache.get(&sibling_key) {
+                return response_has_family_ips(&entry.response, preferred_qtype);
+            }
+        }
+        let query = build_dns_query(domain, preferred_qtype);
+        // Boxed: breaks the async recursion cycle through resolve_with_context
+        // (the sibling uses the preferred qtype, so it never re-enters here).
+        let sibling = Box::pin(self.resolve_with_context(&query, original_dst)).await;
+        match sibling {
+            Ok(resp) => response_has_family_ips(&resp, preferred_qtype),
+            Err(e) => {
+                debug!(
+                    "DNS forwarder: preferred-family probe for {} failed: {}",
+                    domain, e
+                );
+                false
+            }
+        }
     }
 
     /// Dial the original destination DNS server (dae `asis`).
@@ -744,14 +818,25 @@ fn dns_cache_key(domain: &str, qtype: u16) -> String {
     format!("{}:{}", domain, qtype)
 }
 
-/// Return `true` if the given query type should be dropped for the configured
-/// IP-version strategy.
+/// Return `true` if the given query type is hard-filtered at request time.
+/// Only the `*_only` strategies filter here; prefer strategies forward both
+/// families and suppress at response time instead.
 fn is_filtered_qtype(qtype: u16, strategy: &DnsStrategy) -> bool {
     match strategy {
-        DnsStrategy::PreferIpv4 | DnsStrategy::Ipv4Only => qtype == 28, // AAAA
-        DnsStrategy::PreferIpv6 | DnsStrategy::Ipv6Only => qtype == 1,  // A
-        DnsStrategy::Both => false,
+        DnsStrategy::Ipv4Only => qtype == 28, // AAAA
+        DnsStrategy::Ipv6Only => qtype == 1,  // A
+        DnsStrategy::PreferIpv4 | DnsStrategy::PreferIpv6 | DnsStrategy::Both => false,
     }
+}
+
+/// Whether a wire-format response contains at least one address record of
+/// the given family (qtype 1 = A, 28 = AAAA).
+fn response_has_family_ips(response: &[u8], qtype: u16) -> bool {
+    extract_answer_ips(response).iter().any(|ip| match qtype {
+        1 => ip.is_ipv4(),
+        28 => ip.is_ipv6(),
+        _ => false,
+    })
 }
 
 /// Human-readable qtype name for logging.
@@ -1377,5 +1462,214 @@ mod tests {
         let resp = make_a_response([1, 2, 3, 4], 60);
         let ips = extract_answer_ips(&resp);
         assert_eq!(ips, vec![IpAddr::from([1, 2, 3, 4])]);
+    }
+
+    /// Build an AAAA-record response for example.com with a given IPv6 and TTL.
+    fn make_aaaa_response(ip: [u8; 16], ttl: u32) -> Vec<u8> {
+        let ttl_bytes = ttl.to_be_bytes();
+        let mut v = vec![
+            0x00, 0x00, // ID
+            0x81, 0x80, // Flags: QR=1, RD=1, RA=1
+            0x00, 0x01, // QDCOUNT
+            0x00, 0x01, // ANCOUNT
+            0x00, 0x00, // NSCOUNT
+            0x00, 0x00, // ARCOUNT
+            // Question: example.com AAAA IN
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00,
+            0x1c, // QTYPE AAAA
+            0x00, 0x01, // QCLASS IN
+            // Answer
+            0xc0, 0x0c, // NAME pointer to offset 12
+            0x00, 0x1c, // TYPE AAAA
+            0x00, 0x01, // CLASS IN
+            ttl_bytes[0], ttl_bytes[1], ttl_bytes[2], ttl_bytes[3], // TTL
+            0x00, 0x10, // RDLENGTH 16
+        ];
+        v.extend_from_slice(&ip);
+        v
+    }
+
+    fn nodata_response(domain: &str, qtype: u16) -> Vec<u8> {
+        make_empty_response(&build_dns_query(domain, qtype), domain, qtype)
+    }
+
+    fn answer_count(resp: &[u8]) -> u16 {
+        u16::from_be_bytes([resp[6], resp[7]])
+    }
+
+    /// Mock upstream answering per query qtype.
+    struct QtypeMock {
+        a: Vec<u8>,
+        aaaa: Vec<u8>,
+        call_count: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl DnsUpstreamPool for QtypeMock {
+        async fn query(&self, _upstream_name: &str, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            let (domain, qtype) = parse_dns_question(raw_query).expect("question");
+            Ok(match qtype {
+                1 => self.a.clone(),
+                28 => self.aaaa.clone(),
+                _ => make_empty_response(raw_query, &domain, qtype),
+            })
+        }
+    }
+
+    fn qtype_mock(a: Vec<u8>, aaaa: Vec<u8>) -> Arc<QtypeMock> {
+        Arc::new(QtypeMock {
+            a,
+            aaaa,
+            call_count: AtomicUsize::new(0),
+        })
+    }
+
+    const TEST_V6: [u8; 16] = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+
+    #[tokio::test]
+    async fn test_only_strategy_filters_at_request_time() {
+        let mock = qtype_mock(
+            make_a_response([10, 0, 0, 1], 300),
+            make_aaaa_response(TEST_V6, 300),
+        );
+        let forwarder = DnsForwarder::new(
+            mock.clone() as Arc<dyn DnsUpstreamPool>,
+            test_cache(),
+            test_router(),
+        )
+        .with_strategy(DnsStrategy::Ipv4Only);
+
+        let resp = forwarder
+            .resolve(&build_dns_query("example.com", 28))
+            .await
+            .unwrap();
+        assert_eq!(answer_count(&resp), 0, "AAAA must be answered NODATA");
+        assert_eq!(
+            mock.call_count.load(Ordering::SeqCst),
+            0,
+            "filtered query must never reach upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prefer_ipv4_suppresses_aaaa_when_a_exists() {
+        let mock = qtype_mock(
+            make_a_response([10, 0, 0, 1], 300),
+            make_aaaa_response(TEST_V6, 300),
+        );
+        let forwarder = DnsForwarder::new(
+            mock.clone() as Arc<dyn DnsUpstreamPool>,
+            test_cache(),
+            test_router(),
+        )
+        .with_strategy(DnsStrategy::PreferIpv4);
+
+        // Prime the A cache with real answers.
+        let a_resp = forwarder.resolve(&make_a_query()).await.unwrap();
+        assert!(answer_count(&a_resp) > 0);
+
+        // AAAA is forwarded to upstream but suppressed at response time.
+        let aaaa_resp = forwarder
+            .resolve(&build_dns_query("example.com", 28))
+            .await
+            .unwrap();
+        assert_eq!(
+            answer_count(&aaaa_resp),
+            0,
+            "AAAA must be suppressed when A answers exist"
+        );
+        assert_eq!(
+            mock.call_count.load(Ordering::SeqCst),
+            2,
+            "A + AAAA; the prefer check must hit the cache, not upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prefer_ipv4_returns_aaaa_when_no_a() {
+        let mock = qtype_mock(
+            nodata_response("example.com", 1),
+            make_aaaa_response(TEST_V6, 300),
+        );
+        let forwarder = DnsForwarder::new(
+            mock.clone() as Arc<dyn DnsUpstreamPool>,
+            test_cache(),
+            test_router(),
+        )
+        .with_strategy(DnsStrategy::PreferIpv4);
+
+        let resp = forwarder
+            .resolve(&build_dns_query("example.com", 28))
+            .await
+            .unwrap();
+        assert_eq!(
+            answer_count(&resp),
+            1,
+            "AAAA must be returned when no A answers exist"
+        );
+        assert_eq!(
+            mock.call_count.load(Ordering::SeqCst),
+            2,
+            "AAAA + sibling A probe"
+        );
+
+        // Cache-hit path: AAAA and the sibling's NODATA are both cached.
+        let resp2 = forwarder
+            .resolve(&build_dns_query("example.com", 28))
+            .await
+            .unwrap();
+        assert_eq!(answer_count(&resp2), 1);
+        assert_eq!(mock.call_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_prefer_ipv4_never_probes_for_a_queries() {
+        let mock = qtype_mock(
+            make_a_response([10, 0, 0, 1], 300),
+            make_aaaa_response(TEST_V6, 300),
+        );
+        let forwarder = DnsForwarder::new(
+            mock.clone() as Arc<dyn DnsUpstreamPool>,
+            test_cache(),
+            test_router(),
+        )
+        .with_strategy(DnsStrategy::PreferIpv4);
+
+        let resp = forwarder.resolve(&make_a_query()).await.unwrap();
+        assert_eq!(answer_count(&resp), 1);
+        assert_eq!(
+            mock.call_count.load(Ordering::SeqCst),
+            1,
+            "preferred qtype must not trigger a sibling probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prefer_ipv6_suppresses_a_when_aaaa_exists() {
+        let mock = qtype_mock(
+            make_a_response([10, 0, 0, 1], 300),
+            make_aaaa_response(TEST_V6, 300),
+        );
+        let forwarder = DnsForwarder::new(
+            mock.clone() as Arc<dyn DnsUpstreamPool>,
+            test_cache(),
+            test_router(),
+        )
+        .with_strategy(DnsStrategy::PreferIpv6);
+
+        // Prime the AAAA cache.
+        let aaaa_resp = forwarder
+            .resolve(&build_dns_query("example.com", 28))
+            .await
+            .unwrap();
+        assert!(answer_count(&aaaa_resp) > 0);
+
+        let a_resp = forwarder.resolve(&make_a_query()).await.unwrap();
+        assert_eq!(
+            answer_count(&a_resp),
+            0,
+            "A must be suppressed when AAAA answers exist"
+        );
     }
 }
