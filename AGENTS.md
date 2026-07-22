@@ -1,340 +1,345 @@
 # AGENTS.md — honk
 
-This file is written for AI coding agents that need to understand, build, test, and modify the project. It describes the actual layout and conventions observed in the repository.
+This file is written for AI coding agents that need to understand, build, test, and modify the project. It describes the actual layout and conventions observed in the repository (last verified against the tree on 2026-07-22).
 
 ## Project overview
 
-`honk` is a Rust reimplementation of [dae](https://github.com/daeuniverse/dae), the eBPF-based Linux transparent proxy. The goal is to provide:
+`honk` is a Rust transparent-proxy engine for Linux, **inspired by** [dae](https://github.com/daeuniverse/dae) (eBPF datapath and configuration surface) and [sing-box](https://github.com/SagerNet/sing-box) (outbound groups, multi-protocol dialers, Clash-compatible API). It is not a line-for-line port of either: the kernel path follows dae's TC + match_set + `dae0`/`daens` model, the userspace outbound/control stack follows sing-box-oriented designs.
 
-- An eBPF transparent proxy engine (`honk-core`) that intercepts traffic with eBPF TC redirect (no global `iptables` rules), classifies it in eBPF, and relays it through proxy handlers in userspace.
-- Shared configuration types and parsers (`honk-config`) that parse the original dae `{ section { ... } }` configuration syntax.
-
-(The `honk-server` GraphQL API and `honk-web` Leptos dashboard crates were removed from the repository; the project now ships the proxy engine only.)
-
-License: **GPL-3.0-only** (`SPDX-License-Identifier: GPL-3.0-only`).
-Repository: <https://github.com/Glassyiris/honk>
+- An eBPF transparent proxy engine (`honk-core`) intercepts traffic with eBPF TC redirect (no global `iptables` TPROXY rules), classifies it in eBPF, and relays it through proxy handlers in userspace.
+- Shared configuration types and parsers (`honk-config`) parse the original dae `{ section { ... } }` configuration syntax — the primary and only documented config format.
+- Status: **experimental alpha** (`v0.0.1-alpha`). Expect breaking changes.
+- License: **GPL-3.0-only**. Repository: <https://github.com/Glassyiris/honk>
+- Documentation: `README.md` / `README_CN.md` (bilingual overview, feature checklist, TODO list) and `doc/` — `design.en.md`, `configuration.en.md`, `components.en.md` (plus `.zh.md` translations), all currently in sync with the code.
 
 ## Repository layout
 
 ```text
 .
-├── Cargo.toml                 # Workspace manifest (release + release-musl profiles)
-├── Makefile                   # Generic build/test/run tasks
-├── Justfile                   # Day-to-day dev tasks (build, debug via clash API, deploy, cleanup)
-├── run_tests.sh               # Per-crate test runner
-├── test-honk.sh               # Root-only honk-core smoke runner with timeout + cleanup
-├── Dockerfile                 # Multi-stage container build (honk-core only)
-├── docker-compose.yml         # Compose deployment (privileged, host net)
-├── plan.md                    # Consolidated unfinished design docs (health-check redesign, ...)
-├── example.dae / config.dae / config.min.dae # Example dae-syntax configurations
-├── scripts/                   # Root-only netns/podman integration tests + deploy helpers
-├── log/                       # Captured logs from netns/podman test runs
-├── crates/
-│   ├── honk-config            # Shared config schema + parsers (workspace member)
-│   ├── honk-ebpf-common       # no_std shared eBPF/userspace types (workspace member)
-│   ├── honk-outbound          # Proxy handlers, groups, health checks (workspace member)
-│   ├── honk-core              # eBPF proxy engine (workspace member)
-│   └── honk-ebpf              # eBPF program crate (EXCLUDED from workspace)
-├── daed/                      # Reference checkout: upstream daed dashboard (React/Vite/pnpm)
-├── outbound/                  # Reference checkout: github.com/daeuniverse/outbound (Go)
-└── sing-box/                  # Reference checkout: github.com/SagerNet/sing-box (Go)
+├── Cargo.toml / Cargo.lock   # Workspace manifest (release + release-musl profiles)
+├── Justfile                  # Day-to-day dev tasks (build, test, run, debug via clash API, cleanup)
+├── README.md / README_CN.md  # Bilingual project overview
+├── AGENTS.md                 # This file
+├── LICENSE                   # GPL-3.0-only
+├── config.dae                # Full-featured example config (production-leaning)
+├── config.min.dae            # Minimal example (good for --mock-ebpf dev)
+├── example.dae               # Annotated example (Chinese comments)
+├── doc/                      # design / configuration / components docs (en + zh)
+├── .github/workflows/        # release.yml: tag-triggered test + cross-build + GitHub Release
+└── crates/
+    ├── honk-config           # Config schema + dae-syntax parser + share links (workspace member)
+    ├── honk-ebpf-common      # no_std shared eBPF/userspace types (workspace member)
+    ├── honk-outbound         # Proxy handlers, groups, health checks (workspace member)
+    ├── honk-core             # eBPF proxy engine, library + `honk-core` binary (workspace member)
+    └── honk-ebpf             # Kernel eBPF programs (EXCLUDED from workspace, own Cargo.lock)
 ```
 
-> **Workspace note:** The root `Cargo.toml` includes `honk-config`, `honk-ebpf-common`, `honk-outbound`, and `honk-core` as workspace members and explicitly excludes `crates/honk-ebpf`.
+Notable absences (referenced by older docs but **not in this tree**): `Makefile`, `scripts/`, `Dockerfile`, `docker-compose.yml`, `plan.md`, `run_tests.sh`, `test-honk.sh`, `log/`, and the vendored reference checkouts (`honk/`, `outbound/`, `sing-box/` — these paths are `.gitignore`d). Consequences:
 
-> **Vendored reference repos:** `honk/`, `outbound/`, and `sing-box/` are independent git checkouts kept for protocol/behavior reference. They are **not** part of the Rust workspace, are not required to build anything, and changes there should not be mixed into Rust work. `honk/` is the upstream React dashboard with its own pnpm/Turbo monorepo and a `wing` submodule (the original Go backend).
+- `just run` and `just deploy` call `scripts/debug-local.sh` / `scripts/deploy-gateway.sh`, which do not exist here — use `just run-debug` / `just run-dae` instead.
+- `just docker*` and the README Docker section reference a missing `Dockerfile` / `docker-compose.yml`.
+- There are no root-only netns/podman test scripts in the checkout; all runnable tests are unprivileged.
 
 ## Technology stack
 
-- **Language:** Rust edition 2024 (migrated from 2021 on Rust 1.96 stable).
+- **Language:** Rust, edition 2024 (workspace-wide, including the eBPF crate).
 - **Async runtime:** Tokio (`full`).
-- **eBPF:** [aya-rs](https://github.com/aya-rs/aya) 0.14 (optional `ebpf` feature in `honk-core`); the eBPF program crate uses `aya-ebpf` 0.2 and targets `bpfel-unknown-none` (built with nightly + `-Zbuild-std=core`).
-- **HTTP APIs:** axum 0.8 + tower-http 0.7 (optional `clash-api` feature in `honk-core`, on by default).
-- **Persistence:** `honk-core` uses rusqlite 0.40 (`bundled`) for its persistent cache (`cachedb`).
-- **TLS (outbound):** tokio-rustls 0.26 + rustls-pemfile + webpki-roots.
+- **eBPF:** userspace [aya](https://github.com/aya-rs/aya) 0.14 (optional `ebpf` feature in `honk-core`); kernel side `aya-ebpf` 0.2 targeting `bpfel-unknown-none` (nightly + `-Zbuild-std=core` + `bpf-linker`).
+- **HTTP API:** axum 0.8 (with `ws`) + tower-http 0.7 (optional `clash-api` feature of `honk-core`, on by default).
+- **QUIC:** quinn 0.11 (TUIC/Juicity/Hysteria2 outbounds, DoQ/DoH3 DNS); `h3`/`h3-quinn` for DoH3 only — Hysteria2 ships its own minimal HTTP/3+QPACK layer.
+- **TLS:** tokio-rustls 0.26 + rustls-pemfile + webpki-roots.
+- **Persistence:** rusqlite 0.40 (`bundled`) for the `cachedb` SQLite cache.
 - **Serialization:** serde, toml 1, serde_json, serde_yaml.
 - **Logging:** tracing + tracing-subscriber (`env-filter`, `json`); also `log`.
-- **DNS:** self-contained forwarder (UDP/TCP/DoT/DoH/DoQ/DoH3) in `honk-core::dns`; no hickory dependency.
+- **HTTP client:** reqwest 0.13 (rustls, no default features) — subscriptions.
 - **Error handling:** anyhow + thiserror 2.
-- **HTTP client:** reqwest (rustls, no default features).
+- **Misc:** socket2, ipnet, aho-corasick, lru, dashmap, parking_lot, h2 0.4 (h2mux + DoH), tokio-tungstenite (WS transport), zip (external-UI download only), libsystemd (only `sd_notify`), nix (only `clock_gettime`), aes-gcm/chacha20poly1305/blake3/sha1/sha2/hmac/hkdf/md-5.
+- **Dev/test:** tempfile, tokio-test, rcgen 0.14, tokio-tungstenite, criterion 0.5 (DNS benchmarks).
 
 ## Crate responsibilities
 
 ### `crates/honk-config`
 
-Defines the configuration schema and parsers used by the rest of the project.
+Configuration schema and parsers used by the rest of the project. Deps are pure-Rust (serde, regex, url, base64, chrono, uuid).
 
-- `config.rs` — top-level `Config`/`GlobalConfig` structs and `from_file`/`to_file`/`validate` helpers. `ensure_builtin_nodes()` injects the built-in `direct` node at load/reload (maps to `DirectHandler` via the HTTP protocol), so `direct` works as a group member (`filter: name('direct')`, `groups`, `default`) without being declared in the config. `from_file`/`to_file` pick the format by file extension; the dae syntax is the primary format, while the TOML/YAML/JSON loaders remain for compatibility (undocumented).
-- `experimental.rs` — `ExperimentalConfig` with `ClashApiConfig` (`external_controller`, `external_ui`, `secret`) and `CacheFileConfig` (`enabled`, `path`, `cache_id`, `store_fakeip`, `store_dns`; also parsed from the dae `experimental { ... }` section).
-- `share_link.rs` — `Node::from_share_link`, the single share-link parser (SIP002 ss://, ssr:// base64 parameter blobs, vmess:// base64-JSON (v2rayN schema, ws/grpc/tls fields), trojan/trojan-go ws/grpc query params, AnyTLS pool params) used by the dae parser and `honk-core` subscriptions.
-- `dns.rs` — `DnsConfig`, `DnsUpstream`, `DnsRouting`, `DnsStrategy`, `DnsCacheConfig`.
-- `node.rs` / `group.rs` — `Node`, `Group`, `GroupPolicy`, plus node protocol field types. `Group.groups: Vec<String>` holds nested sub-group tags (sing-box style nested outbounds).
-- `routing.rs` — `RoutingRule`, `RoutingCondition`, `RoutingOutbound`, `RoutingConfig`.
-- `subscription.rs` — subscription configuration.
-- `types.rs` — shared enums: `NodeProtocol`, `DialMode`, `OutboundIndex`, `SubscriptionType`, `DnsProtocol`.
-- `parser/` — custom lexer/section parser (`lexer.rs`, `section_parser.rs`, `tests.rs`) that reads the original dae `{ global { ... } node { ... } routing { ... } }` syntax. Group sections accept `filter: group('tag'[, ...])` for nested sub-groups (routed into `Group.groups`); `resolve_group_filters` resolves only node filters (`name(...)`), and the filter-less "include all nodes" fallback applies solely when a group has neither filters nor sub-groups.
-- `error.rs` — `ConfigError` type.
+- `src/config.rs` — top-level `Config` / `GlobalConfig` (~40 global fields), `from_file` / `to_file` / `validate`, JSON helpers, and `ensure_builtin_nodes()` (injects the built-in `direct` node, mapped to `DirectHandler` via `NodeProtocol::HTTP`, idempotent). **The crate never calls `ensure_builtin_nodes()` itself** — `honk-core` calls it at startup and SIGHUP reload (`honk-core/src/lib.rs`); other consumers must call it explicitly.
+- Format loading: the dae syntax is primary; TOML/YAML/JSON serde loaders remain for compatibility (undocumented). `from_file` picks by extension — recognized `.json`/`.yaml`/`.toml` try that format then fall back only among TOML/YAML/JSON (dae is never tried); unknown/missing extensions try `dae → TOML → YAML → JSON`.
+- `src/parser/` — the dae-syntax parser. **`parser/mod.rs` is the entire real parser** (line/section based, ~1200 lines): all sections, group policies and aliases (`fixed(0)`/`select`→Selector, `min_moving_avg`/`min_avg10`/`min_last_delay`→URLTest, `roundrobin`→LoadBalance, `fallback`→Fallback), nested `filter: group('a','b')` (comma or pipe separated) routed into `Group.groups`, DNS `upstream`/`routing { request/response }`, `fixed_domain_ttl`, `subscription`, `experimental`, `resolve_group_filters`. `parser/lexer.rs` is **dead scaffolding** (`tokenize()` returns an empty vec); `section_parser.rs` is only the `Section` struct.
+- Group filter resolution: `resolve_group_filters` resolves only node filters (`name('exact')`, `name(keyword: 'pat')` — case-sensitive substring); the "include all nodes" fallback applies **only** when a group has neither node filters nor sub-groups.
+- `src/node.rs` — `Node` (all per-protocol fields) **plus `Group` and `GroupPolicy`** (Selector/URLTest/LoadBalance/Fallback). `src/group.rs` is a 2-line re-export. `Group.groups: Vec<String>` holds nested sub-group tags; `Group.default`, `final_outbound` (dae `final:`), `tolerance` (default 50 ms), `idle_timeout`, `interrupt_connections`.
+- `src/dns.rs` — much richer than a plain upstream list: `DnsConfig` (`upstream`, `routing`, `strategy`, `cache`, `fixed_domain_ttl`), `DnsUpstream` (name, address, `protocol: DnsProtocol`, `tls_server_name`, **`outbound: Option<String>`** — per-upstream dial-path proxy tag), and the dae-shaped DNS routing model (`DnsRequestRule`/`DnsResponseRule` with AND-ed `DnsCond`s — Qname/Qtype/Upstream/Ip, each negatable — first match wins; actions Reject/AsIs/Accept/Upstream(name); legacy `rules`/`fallback` with conversion). `types.rs::DnsProtocol` has 6 variants: Udp, Tcp, Tls (DoT), Https (DoH), H3 (DoH3), Quic (DoQ). Request/response routing types are populated only by the dae parser (deliberately outside the serde tree).
+- `src/share_link.rs` — `Node::from_share_link`, the single share-link parser: SIP002 `ss://` (all base64 forms, plugin suffix), `ssr://` base64 blobs, `vmess://` base64-JSON (v2rayN schema), trojan/trojan-go ws/grpc query params, AnyTLS pool params, plus socks5/http(s)/vless/hysteria2/tuic/juicity. Node name = decoded `#fragment`, else `scheme-host` (never leaks credentials). Chain links (`a -> b`): only the first hop is parsed. Used by the dae parser and `honk-core` subscriptions.
+- `src/routing.rs` — `RoutingRule` (condition + outbound + priority + **`must` flag** — Go dae semantics: match does not finalize, continues searching), `RoutingCondition` (14 matcher lists incl. dscp, ip_version, mac, process_name, geoip/geosite), `RoutingOutbound` (Simple/Complex), `RoutingConfig`.
+- `src/experimental.rs` — `ExperimentalConfig` { `clash_api: ClashApiConfig` (`external_controller`, `external_ui`, `secret`, **`default_mode`**, default "Rule"), `cache_file: CacheFileConfig` (`enabled`, `path` default `cache.db`, `cache_id`, `store_fakeip`, `store_dns`) } — also parsed from the dae `experimental { ... }` section.
+- `src/subscription.rs`, `src/types.rs` (`NodeProtocol` 12 variants, `DialMode` ip/domain/domain+/domain++, config-side `OutboundIndex` — **a different type** from `honk-ebpf-common`'s `#[repr(u8)] OutboundIndex`, `SubscriptionType`, `DnsProtocol`), `src/error.rs` (`ConfigError`).
 
 ### `crates/honk-ebpf-common`
 
-`#![no_std]` crate that contains constants and `#[repr(C)]` structs shared between the eBPF program and userspace `honk-core`. Both sides must agree on layout and map key sizes. Modules: `conn.rs` (`ConnTuple`, `TuplesKey`), `route.rs` (`RoutingResult`, `MatchSet`, `LpmKey`, `DomainKey`), `event.rs`, `redirect_need.rs`, `dae_ip.rs`, plus `DnsCacheEntry`, `OutboundStats`, `ParamKey`, `OutboundIndex`.
+`#![no_std]` crate with constants and `#[repr(C)]` structs shared between the eBPF program and userspace `honk-core` (`aya` is only a non-BPF-target dependency, for `Pod` impls). **Both sides must agree on layout and map key sizes** — changing a map type or constant means updating this crate, `honk-ebpf`, and the map writers in `honk-core` together.
+
+- `src/lib.rs` — datapath constants (`TPROXY_MARK`, `DAE_BYPASS_MARK` = `0x100`, `MAX_OUTBOUND_STATS` sizes), `DaeParam`, `ParamKey`, `OutboundIndex` (`#[repr(u8)]`: Direct=0, Block=1, UserBase=2, MustRules=0xFC, ControlPlaneRouting=0xFD, LogicalOr=0xFE, LogicalAnd=0xFF), `ConnTuple`, `RoutingMeta` (u64 union, size pinned by compile-time asserts), `RedirectTuple`/`RedirectEntry` (records `outbound` for rx stats), `LpmKey`, `PidPname`, `OUTBOUND_STATS_*` constants + `outbound_stats_index()` (= `outbound * 4 + counter`), `OutboundStats`.
+- `src/conn.rs` — `ConnState` (conntrack value), `ConntrackArgs`, `ParseTransportCtx`, `BpfStatsKey`, `TcpState`.
+- `src/redirect_need.rs` — `TuplesKey`, `Tuples`, `RoutingResult`, `RoutingHandoffEntry`, `DomainRouting` (per-domain rule bitmap), `IPPort`, `PortRange`, `PIDName`, `MAX_MATCH_SET_LEN` (=128).
+- `src/route.rs` — `MatchSet` (dae-core `match_set` layout), `MatchSetValue`, `MatchType` (incl. DNS match types `Upstream`/`QType`), and the routing-group pre-filter constants (`ROUTING_GROUP_*`, `routing_group_index()`, `ROUTING_META_MAP_LEN` = 17 — 1 rule-count slot + 4 group bitmaps × 4 words, asserted at compile time).
+- `src/event.rs` — `DaeEvent` (72-byte ring-buffer event), `DaeEventType` (`Blocked` is defined but never emitted; only Udp/TcpConnOverflow are sent). `src/dae_ip.rs` — `In6Addr` union + v4-mapped helpers.
+- Invariants: IPv4 flows are stored as `::ffff:<ipv4>` (network byte order) everywhere; all wire structs are `#[repr(C)]`. Note: `DnsCacheEntry` and `DomainKey` do **not** exist (domain routing uses `DomainRouting`; DNS caching is purely userspace). There are a few intentional duplicate definitions (`MAX_MATCH_SET_LEN`, `PortRange`, `TcpState`). No tests in this crate.
 
 ### `crates/honk-ebpf`
 
-Separate Cargo project (**excluded from the workspace**, own `Cargo.lock`) that builds the kernel eBPF programs: TC LAN ingress / WAN ingress+egress, cgroup, `sk_lookup`, conntrack, routing, and DNS fast path (see `src/ingress.rs`, `egress.rs`, `cgroup.rs`, `sk_lookup.rs`, `contrack.rs`, `routing.rs`, `transport.rs`). Per-outbound traffic counters live in the per-CPU `OUTBOUND_STATS` array (index `outbound_stats_index(outbound, counter)` = `outbound * 4 + counter`, four `u64` slots: tx_packets/tx_bytes/rx_packets/rx_bytes — see `src/stats.rs`); tx is counted at `lan_ingress` when the routing decision lands (redirect and direct+must alike), rx at `dae0_ingress` using the outbound recorded in `RedirectEntry.outbound` at redirect time. `RealEbpfBackend` attaches `wan_ingress_l2/l3` to the WAN interface (L2/L3 by interface type, like `attach_wan_egress`; skipped in single-homed setups) and drains `EVENT_RINGBUF` (conntrack overflow `DaeEvent`s) into tracing on a background task. It has a custom `.cargo/config.toml` for the `bpfel-unknown-none` target whose `linker` points at a **machine-specific absolute path** (`/root/.cargo/bin/bpf-linker-wrapper`) — adjust it or install `bpf-linker` on a new machine. The crate builds to `target/bpfel-unknown-none/release/honk-ebpf`; `honk-core`'s `build.rs` embeds the object into the `honk-core` binary (built automatically with `cargo +nightly` when missing), and an external object can be supplied at runtime with `--bpf-object`. It is on Rust **edition 2024** (same as the workspace; verified building with nightly + `aya-ebpf` 0.2).
+Separate Cargo project (**excluded from the workspace**, own `Cargo.lock`) building the kernel eBPF programs. Edition 2024, `aya-ebpf` 0.2, release profile `panic = "abort"`, `lto = true`, `opt-level = "z"`. `src/main.rs` is the `#![no_std] #![no_main]` bin (spin-loop panic handler + module declarations). Optional `log` feature enables `aya-log-ebpf`; without it `log_shim.rs` macros compile to no-ops.
+
+- TC programs use raw `#[unsafe(no_mangle)] #[unsafe(link_section = "classifier")]` fns (not the `#[tc]` macro — avoids a verifier issue on kernel ≥ 7.0). Program inventory:
+  - `lan_ingress_l2/l3` — LAN classify/route/redirect into `dae0`, tx stats, DNS port-53 fast path, `CLASSIFIED_MARK` dedup for bridge master+slave double-attach (`src/ingress.rs`).
+  - `wan_ingress_l2/l3` — reverse-direction conntrack refresh (skipped single-homed).
+  - `lan_egress_l2/l3`, `wan_egress_l2/l3` (`src/egress.rs`) — reverse conn state; locally-originated traffic routing (pname via `COOKIE_PID_MAP`, control-plane bypass, `OUTBOUND_CONNECTIVITY_MAP` aliveness, redirect to control plane).
+  - `dae0_ingress` — reply path: rx stats from `RedirectEntry.outbound`, MAC rewrite, redirect to original LAN iface.
+  - `dae0peer_ingress` — `bpf_sk_assign` of the TPROXY listener via `LISTEN_SOCKET_MAP` inside `daens`.
+  - `tproxy_sk_lookup` (`src/sk_lookup.rs`) — assigns flows to transparent listeners (keys 0-3 = TCP4/UDP4/TCP6/UDP6).
+  - cgroup sock_create/sock_release/connect4/6/sendmsg4/6 (`src/cgroup.rs`) — cookie → `PIDName{pid, pname}` for process-name rules + control-plane bypass.
+  - `tproxy_sockops` / `tproxy_sk_msg_redir` (`src/compat.rs`) — **intentional no-op stubs** kept for ABI parity; the sockops+sk_msg combo caused kernel panics, TC redirect is used instead.
+- `src/route.rs` is the routing engine (`route()` + `RouteCtx` state machine over `MatchSet`s via `bpf_loop`, 1:1 port of Go dae's `kern/tproxy.c`, group-bitmap skip logic). `src/routing.rs` is only a small helper (`bpf_sock_is_dae_socket`) — don't confuse the two. `src/outbound.rs` is an empty file.
+- Key maps (`src/maps.rs`): `CONN_STATE_MAP` (LRU, 512K), `REDIRECT_TRACK` (LRU, 64K), `ROUTING_HANDOFF_MAP` (LRU, 64K), `ROUTING_MAP` (array of 128 `MatchSet`s), `ROUTING_META_MAP` (17 slots: rule count = atomic commit switch + 4 group bitmaps), `DOMAIN_ROUTING_MAP` (plain hash, 64K), `DEST/SOURCE/MAC_LPM_ROUTING_MAP` (tries capped at 64K entries), `COOKIE_PID_MAP`, `OUTBOUND_CONNECTIVITY_MAP` (1536 slots: `outbound*6 + domain*2 + ipver`), `OUTBOUND_STATS` (per-CPU, 1024 slots), `LISTEN_SOCKET_MAP` (SockMap, 4), `EVENT_RINGBUF` (conntrack-overflow events only), plus per-CPU scratch maps.
+- Per-outbound stats: index `outbound * 4 + counter` (tx_packets/tx_bytes/rx_packets/rx_bytes); tx counted at `lan_ingress` when the routing decision lands, rx at `dae0_ingress`.
+- Build (needs nightly + `bpf-linker`):
+
+  ```bash
+  cd crates/honk-ebpf
+  cargo +nightly build --release -Zbuild-std=core --target bpfel-unknown-none
+  # → crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf
+  ```
+
+  **Caveat:** `.cargo/config.toml` hardcodes `-C linker=/root/.cargo/bin/bpf-linker-wrapper` — a machine-specific absolute path. On a new machine, install `bpf-linker` and either provide that wrapper or point `linker` at `bpf-linker` (the CI workflow does exactly this `sed`).
 
 ### `crates/honk-outbound`
 
-Outbound dialing, groups, and health checking (extracted from `honk-core`).
+Outbound dialing, groups, and health checking. Re-exported by `honk-core` as `honk_core::{proxy, group, outbound}`.
 
-- `proxy/` — the `ProxyHandler` trait/registry and per-protocol handlers: direct, block, socks5, shadowsocks (+ `shadowsocks_2022.rs` for `2022-blake3-*` methods, selected via `shadowsocks.rs::is_2022_method`), ssr, trojan, trojan-go, vmess, vless, hysteria2, anytls, tuic, juicity. `proxy/transport.rs` holds the shared stream-transport layer (TCP → optional TLS → optional h2mux or WebSocket/gRPC, driven by `node.mux`/`node.transport`/`ws_path`/`ws_host`/`grpc_service`) used by the trojan, vmess and vless handlers. `proxy/mux.rs` implements h2mux multiplexing (`node.mux = true`, h2mux only — no smux/yamux) behind that transport layer: a process-wide `MuxManager` caches HTTP/2 client sessions per `(host, port, tls, sni)`, prefixes the sing-mux session header (`0x00 0x02` = Version0+ProtocolH2Mux), opens one h2 stream per dial (`:method CONNECT`, `:authority localhost`, no `:path`/`:scheme`, 200 OK expected), reuses the least-loaded session below 8 active streams (sing-mux default `min_streams`), invalidates on GOAWAY/error with one redial attempt, and closes sessions idle (0 streams) for 60s. sing-box caveat: multiplex and WS/gRPC transport are mutually exclusive (mux wins, a debug log notes the ignored transport), and honk writes the proxy protocol header onto each h2 stream rather than using sing-mux's outer-handshake + per-stream `StreamRequest` layering, so official sing-box multiplex inbounds are not yet interop-verified. `anytls.rs` keeps a pool of multiplexed TLS sessions per node (sing-anytls semantics: one session carries many concurrent streams — a demux task dispatches frames by `sid`, an atomic allocator hands out stream ids, a stream ends with FIN, and the janitor reaps sessions that are stream-less and idle past the timeout), tuned by the node's `anytls_min_idle_session` / `anytls_idle_session_check_interval` / `anytls_idle_session_timeout` fields. `tuic.rs` (TUIC v5) and `juicity.rs` are QUIC handlers built on `quic.rs`: one shared QUIC connection per node (TLS-exporter auth on a uni stream, TCP = bi stream, TUIC UDP = datagrams with uni-stream fallback + fragmentation, Juicity UDP = length-framed bi stream), with per-session UDP bridges to local loopback socket pairs for `UdpProxySocket`. `hysteria2/` (handler in `mod.rs`, self-contained HTTP/3+QPACK layer in `h3.rs`, salamander obfuscation in `salamander.rs`) is also built on `quic.rs`: real QUIC wire protocol (ALPN `h3`) with a minimal self-contained HTTP/3 + QPACK layer for the `POST https://hysteria/auth` auth exchange (status 233), `0x401`-framed TCP streams, UDP over QUIC datagrams with sing-style fragmentation/reassembly, optional salamander obfuscation (`hy2_obfs`) via a custom quinn `AsyncUdpSocket` with a self-contained BLAKE2b-256, and BBR congestion (brutal needs bandwidth fields `Node` does not have).
-  UDP relay handlers follow one pattern — `dial_udp` returns a loopback `UdpProxySocket` whose bridge task frames datagrams onto the tunnel (trojan UDP associate: `addr | u16 len | CRLF | payload` on a TLS-wrapped control stream, i.e. `trojan_udp_bridge`; anytls: sing UoT v2 — stream opened to `sp.v2.udp-over-tcp.arpa`, then `isConnect byte + destination in SOCKS5 form (sing's uot.ReadRequest uses M.SocksaddrSerializer, NOT the 0x00/0x01/0x02 per-packet AddrParser form)`, then bare `u16 len + payload` datagrams). `direct` is the only handler whose `relay_addr` is the target itself; every tunnel handler must bridge, or proxied UDP silently bypasses the tunnel and UDP health probes measure the gateway's own egress instead.
-- `quic.rs` — shared QUIC client plumbing (quinn 0.11) for the QUIC-based outbounds: rustls/quinn `ClientConfig` assembly (ALPN, congestion control cubic/new_reno/bbr via quinn-proto factories), client `Endpoint` creation on `SO_MARK`'ed UDP sockets, the single-flight `QuicClient<C>` connection holder, and `QuicBiStream` (`AsyncRead + AsyncWrite` over a quinn stream pair).
-- `alive/` — `AliveDialerSet` health checking: periodic TCP/UDP probes with per-protocol failure thresholds and latency history (the data URLTest selection sorts on). Each probe cycle runs the TCP probe (`probe_node`, HTTP via the injected `HttpProber` or raw connect) followed by a UDP probe (`probe_node_udp`) when honk-core has injected a `UdpProber` (`set_udp_probe`): honk-core's `ProxyUdpProber` sends a minimal DNS query to the first `global.udp_check_dns` target (default `8.8.8.8:53`) through the node's own `dial_udp` path, so a node with healthy TCP but broken UDP (e.g. an AnyTLS server without UoT) is marked dead on both UDP domains (success → `mark_alive_for_latency` on DataUdp+DnsUdp v4/v6 with the measured RTT; failure → one probe failure per UDP domain, threshold 3 + exponential backoff, gated in the cycle via `should_probe(DataUdp)`). UDP probes never touch TCP state and vice versa. `has_udp_state(node)` reports whether any UDP-domain state was ever recorded (probe or traffic report), which group selection uses to distinguish "never UDP-probed" from "UDP-probed and dead".
-- `group/` — `GroupManager` (`mod.rs`: core types + `SharedGroupManager`; `selection.rs`: all policy selection logic): selector/urltest/loadbalance/fallback policies with **authoritative selection** (sing-box semantics): the dial path returns exactly the policy pick (manual Selector choice, current URLTest winner, rotated LoadBalance node, pinned Fallback node); the only multi-candidate race left is a URLTest group with no measurement data yet. **Nested groups** (sing-box style): `Group.groups` names sub-groups whose own policy pick contributes one member candidate each — candidates flatten recursively (depth cap `MAX_GROUP_DEPTH` = 8 + visited set; construction-time DFS cuts cycle-closing edges with a warning) and selection always resolves to a single leaf node. Member identity is the tag (node name or sub-group tag): `node_names_in_group` returns member tags (clash `all`, PUT `/proxies/{group}` targets), `leaf_node_names_in_group` expands to real nodes (health checks, eBPF connectivity aggregation), `delay_test_members` flattens to `(tag, leaf)` pairs for the delay endpoints, and `selection_chain` walks the current picks down to the leaf (RealTag-style debug view). URLTest keeps separate TCP/UDP selections (`SelectionNetwork`; UDP ranks by DataUDP→DnsUDP→TCP latency and mirrors the TCP selection when no UDP data exists) and is re-evaluated with tolerance hysteresis after every explicit delay test (clash-api delay endpoints) and on the dial path; LoadBalance rotates per-group via an independent `AtomicUsize` counter per group and never interrupts; Fallback pins the first alive member tag in declaration order until it dies (no immediate failback when a preferred node recovers). Selector-choice change callbacks (persisted by `honk-core` via `cachedb`), `interrupt_connections` interruption on selection changes, and URLTest idle sleep (`idle_timeout` stops health checks for idle groups). `SharedGroupManager` (`Arc<RwLock<Arc<GroupManager>>>`) is the hot-swappable cell the control plane, connection handles, and clash API share; config reload swaps in a rebuilt manager and migrates surviving selector choices (`migrate_selector_choices_from` — valid for node-targeted and sub-group-targeted choices alike). **UDP candidate exclusion** (`filter_alive_candidates`): per node, DataUDP or DnsUDP alive → selectable; BOTH UDP domains explicitly dead → excluded even when TCP is alive (no TCP fallback — a TCP-only node must not attract UDP flows); node never UDP-probed (`!AliveDialerSet::has_udp_state`) → inherits TCP liveness (the legacy fallback, kept for setups without UDP probing).
-- `urltest.rs` — on-demand URLTest latency measurement (sing-box semantics) backing the clash API delay endpoints; failures clear the node's latency history so it sorts last.
-- `tls.rs` — shared TLS client configuration helpers.
+- `src/proxy/mod.rs` — the `ProxyHandler` trait (`dial`, `dial_udp` [default: unsupported error], `test_connectivity`, pooling hooks), `ProxyRegistry` (registers all 13 handlers), `ProxyStream` (`into_tcp_stream` downcast enables honk-core's zero-copy splice path — the `as_any` dispatch must go through `(*stream)`, regression-tested), `UdpProxySocket`.
+- Handlers: `direct` (bypass-marked dial; UDP `relay_addr` **is the target**), `block`, `socks5` (CONNECT + UDP ASSOCIATE — `relay_addr` is the server-assigned relay, **no loopback bridge**), `shadowsocks` (+ `shadowsocks_2022.rs` SIP022: BLAKE3 KDF, EIH, replay protection; selected via `is_2022_method`), `ssr` (TCP only), `trojan` (+ UDP associate bridge), `trojan_go` (own smux-style mux, TCP only), `vmess` (TCP only), `vless` (TCP only), `anytls`, `tuic`, `juicity`, `hysteria2/`.
+- **UDP support matrix** (verified): `dial_udp` works for direct, socks5, shadowsocks (+2022), trojan, hysteria2, anytls, tuic, juicity. **Not implemented for vmess, vless, ssr, trojan-go** (matches the README TODO).
+- **UDP bridge invariant:** stream-based tunnel handlers return a loopback `UdpProxySocket` whose bridge task frames datagrams onto the tunnel (trojan: `addr | u16 len | CRLF | payload` on the TLS control stream; anytls: sing UoT v2 — stream to `sp.v2.udp-over-tcp.arpa`, `isConnect` byte + SOCKS5-form destination, then bare `u16 len + payload`; ss: encapsulated datagrams; tuic/hy2: QUIC datagrams; juicity: length-framed bi stream). Only `direct` (target itself) and `socks5` (server-assigned relay) are exceptions. A tunnel handler that skips the bridge silently bypasses the proxy and makes UDP health probes measure the gateway's own egress.
+- `src/proxy/transport.rs` — shared stream-transport layer for trojan/vmess/vless (TCP → optional TLS → h2mux **or** WS/gRPC, driven by `node.mux`/`node.transport`/`ws_path`/`ws_host`/`grpc_service`); hand-rolled minimal gRPC-over-H2 client.
+- `src/proxy/mux.rs` — h2mux (`node.mux = true`; h2mux only, no smux/yamux): process-wide `MuxManager` caching HTTP/2 sessions per `(host, port, tls, sni)`, sing-mux session header `0x00 0x02`, one h2 stream per dial (`:method CONNECT`, `:authority localhost`, 200 OK expected), least-loaded session reused below 8 streams, one redial on GOAWAY/error, idle (0-stream) sessions closed after 60s. Mux and WS/gRPC transport are mutually exclusive (mux wins). honk writes the proxy handshake onto each h2 stream instead of sing-mux's outer-handshake + per-stream `StreamRequest`, so **official sing-box multiplex inbounds are not interop-verified**.
+- `src/proxy/anytls.rs` — sing-anytls session multiplexing: global session pool per `host:port`, demux task per session dispatching frames by `sid`, atomic sid allocator, FIN ends streams, janitor reaps stream-less idle sessions and pre-establishes `min_idle` sessions (node fields `anytls_min_idle_session` / `anytls_idle_session_check_interval` / `anytls_idle_session_timeout`).
+- `src/quic.rs` — shared quinn 0.11 plumbing for tuic/juicity/hysteria2: rustls ClientConfig assembly (ALPN, cubic/new_reno/bbr), client `Endpoint` on `SO_MARK`'ed UDP sockets, single-flight `QuicClient<C>` connection holder, `QuicBiStream`, plus `#[cfg(test)] testutil` in-process QUIC servers.
+- `src/proxy/tuic.rs` (TUIC v5: TLS-exporter auth on uni stream, TCP = bi stream, UDP = datagrams with uni-stream fallback + fragmentation, 10s heartbeat), `src/proxy/juicity.rs` (ALPN `h3`, UDP on one length-framed bi stream), `src/proxy/hysteria2/` (`mod.rs` handler: ALPN `h3`, BBR — brutal impossible since `Node` has no bandwidth fields; `h3.rs` self-contained minimal HTTP/3+QPACK for `POST https://hysteria/auth` status 233; `salamander.rs` self-contained BLAKE2b-256 + XOR obfs socket). One shared QUIC connection per node; per-session loopback UDP bridges.
+- `src/tls.rs` — TLS client configs: webpki-roots and no-verify variants, **plus a Chrome-131 fingerprint mode** toggled process-wide via `set_tls_mode` (`tls_implementation = "utls"`); `build_connector(node)` picks per `node.skip_cert_verify`.
+- `src/bootstrap.rs` — **bootstrap DNS resolution for proxy-server hostnames** (dae `bootstrap_resolver` parity): process-wide resolver querying over bypass-marked UDP/TCP with a hand-rolled wire codec, falling back to the system resolver. Node dials must use it (wired into `util::connect_marked` and `quic.rs`), never bare `lookup_host` — otherwise resolution deadlocks against honk's own intercepted DNS path.
+- `src/util.rs` — `connect_marked` / `connect_outbound` (TCP with `SO_MARK`, keepalive, timeout), `udp_marked_bind`, `udp_loopback_bind`. **SO_MARK discipline:** every control-plane-originated socket must carry `DAE_BYPASS_MARK` (or be loopback) or `wan_egress` re-routes it into `daens`, looping the gateway's own traffic.
+- `src/alive/` — `AliveDialerSet` health checking. Split: `mod.rs` (state, thresholds, registries, eBPF connectivity-push callback, `StickyCache`), `probe.rs` (`probe_node` HTTP/raw-connect, `probe_node_udp` DNS-through-`dial_udp`, concurrent cycle runner), `collection.rs` (`DialerCollection`: latencies + moving average + alive flag; failures append a synthetic 10s sample), `latencies.rs` (O(1) ring buffer, cap 10).
+  - Per-node state: 3 domains (`Tcp`, `DnsUdp`, `DataUdp`) × v4/v6. **Asymmetric thresholds** — probe: TCP=1, UDP=3; traffic-reported: TCP=10, DnsUdp=3, DataUDP=50. Exponential backoff 5s→300s (permanent stop at 10), recovery after 2 consecutive successes, 60s registration grace period, URLTest idle-sleep registry (default 30 min), probe history (100/node/domain).
+  - UDP probe (injected by honk-core via `set_udp_probe`): one minimal DNS query to the first `global.udp_check_dns` target (default 8.8.8.8:53) through the node's own `dial_udp`; success marks **both** UDP domains alive with the measured RTT, failure adds one probe failure per UDP domain. UDP probes never touch TCP state and vice versa. `has_udp_state(node)` distinguishes "never UDP-probed" from "UDP-probed and dead".
+- `src/group/` — `GroupManager` (`mod.rs`: core types + `SharedGroupManager = Arc<parking_lot::RwLock<Arc<GroupManager>>>`; `selection.rs`: all policy logic).
+  - **Authoritative selection** (sing-box semantics): the dial path returns exactly the policy pick — manual Selector choice, current URLTest winner, rotated LoadBalance node, pinned Fallback node. The only multi-candidate race left is a cold URLTest group (no measurements yet). Never reintroduce parallel racing elsewhere.
+  - **Nested groups:** `Group.groups` names sub-groups whose own policy pick contributes one candidate each; recursive flattening with depth cap `MAX_GROUP_DEPTH` = 8 + visited set; construction-time DFS cuts cycle-closing edges with a warning. Member identity is the tag: `node_names_in_group` (member tags), `leaf_node_names_in_group` (real nodes), `delay_test_members` (`(tag, leaf)` pairs), `selection_chain` (current picks down to the leaf).
+  - URLTest keeps separate TCP/UDP selections (`SelectionNetwork`; UDP ranks by DataUDP→DnsUDP→TCP latency and mirrors the TCP selection when no UDP data exists), tolerance hysteresis (`group.tolerance.max(1)` ms), re-evaluated lazily on the dial path / selection queries; LoadBalance rotates per group via an independent `AtomicUsize` and never interrupts; Fallback pins the first alive member in declaration order until it dies (no failback on recovery). Selector-choice change callbacks (persisted by honk-core via `cachedb`), `interrupt_connections` on selection changes, URLTest idle sleep (`idle_timeout` stops health checks for idle groups). Config reload swaps in a rebuilt manager and migrates surviving selector choices (`migrate_selector_choices_from`).
+  - **UDP candidate exclusion** (`filter_alive_candidates`): DataUDP or DnsUDP alive → selectable; **both** UDP domains explicitly dead → excluded even when TCP is alive (a TCP-only node must not attract UDP flows); never UDP-probed → inherits TCP liveness.
+- `src/urltest.rs` — on-demand latency measurement backing the clash API delay endpoints: dials the check URL through the node's handler (real TLS handshake for https, `HEAD /`, status 200–499 OK); group measurement is concurrent (cap 10); **failures clear the node's latency history** so it sorts last. Empty URL normalizes to `https://www.gstatic.com/generate_204`.
 
 ### `crates/honk-core`
 
-The proxy engine (library + `honk-core` binary). Cargo features:
+The proxy engine (library `honk_core` + `honk-core` binary). Cargo features:
 
 - `default = ["clash-api"]`
 - `ebpf` — real eBPF backend via aya (requires Linux kernel 5.8+); without it the engine runs on `MockEbpfBackend`.
-- `clash-api` — Clash-compatible REST/WS API (both API features pull in optional axum/tower-http deps).
+- `clash-api` — Clash-compatible REST/WS API (pulls in optional axum/tower-http).
 
-`build.rs` (only active with the `ebpf` feature) locates or builds the eBPF object and copies it into `OUT_DIR` as `honk-ebpf.o`; `lib.rs` embeds it with `include_bytes!(env!("HONK_EBPF_OBJECT"))`.
+`build.rs` (only with `ebpf`) locates the eBPF object (`crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf` or `target/honk-core.o`), auto-builds it with `cargo +nightly` when missing, copies it to `OUT_DIR/honk-ebpf.o`, and sets `HONK_EBPF_OBJECT`; `lib.rs` embeds it with `include_bytes!`. Runtime override: `--bpf-object`.
 
-Major modules:
+Module map:
 
-- `control/` — the control plane: `ControlPlane` accept loop (`mod.rs`), connection handling (`connection.rs`), config reload pipeline (`reload.rs`), TPROXY/UDP reply sockets (`sockets.rs`), health probers (`probers.rs`), command channel, connection draining, DNS control, routing matcher push, janitors, UDP endpoint pool, packet sniffing helpers, interface binding. Proxied-UDP replies are sent back to LAN clients from a per-endpoint "anyfrom" transparent socket bound to the flow's original destination (Go dae parity; `new_udp_reply_socket` in `control/sockets.rs`, cached on the endpoint in `udp_endpoint.rs`) — falling back to the TPROXY listener socket makes replies die in the host dae0 path with source `169.254.0.11:<tproxy_port>`.
-- `dns/` — DNS resolver, cache, forwarder, upstream pool, listener, DNS routing, and `persist.rs` (optional `store_dns` persistence: a background batch writer mirroring `DnsCache` inserts into cache.db, plus startup restore).
-- `ebpf/` — `EbpfBackend` trait, in-memory `MockEbpfBackend` (`mock.rs`), and `RealEbpfBackend` (`real/`, gated by the `ebpf` feature; `real/syscall.rs` raw BPF syscalls, `real/attach.rs` program load/attach, `real/events.rs` EVENT_RINGBUF draining), plus map helpers (`maps.rs`) and kernel probing (`probe.rs`).
-- `relay/` — TCP splicing/relay and UDP relay utilities.
-- `routing/` — userspace routing engine (`Router` in `mod.rs`, LPM trie in `lpm.rs`, geoip/geosite matchers in `geo.rs`) compiled from `RoutingRule`s.
-- `sniffing.rs` — TLS SNI and HTTP Host sniffing from initial TCP bytes.
-- `stats.rs` — per-outbound connection/byte/error statistics.
-- `pool.rs` — TCP connection pool for proxy dials (bare pre-handshake streams and fully-dialed "ready" tunnels).
-- `connection_tracker.rs` — per-connection state tracker feeding the clash API `/connections`.
-- `subscription.rs` — subscription fetching/parsing (share links decoded via `Node::from_share_link`). Startup fetches race a 5-second deadline in `run()`; late completions and per-subscription periodic refreshes (`Subscription.update_interval`, default 86400s, 0 = manual) merge through `ControlCommand::MergeSubscription`, which replaces that subscription's nodes (matched by `subscription_id`), re-resolves group membership, and reuses the same serialized rebuild pipeline as SIGHUP reloads (`apply_runtime_config`). Subscription nodes live in memory only, never written back to the config file.
-- `cachedb.rs` — persistent SQLite cache (selector choices, clash mode, and — when `cache_file.store_dns` is set — DNS answers under the `dns:` kv prefix with lazy expiry) opened via `experimental.cache_file` (rusqlite, bundled).
-- `mode.rs` — shared clash mode state (`ModeState`: Rule/Global/Direct + GLOBAL selection), held by both the control plane (mode override on the outbound decision) and the clash API.
-- `clash_api.rs` + `clash_api/{logs,doh,ui}.rs` — Clash-compatible REST/WS API (sing-box `experimental/clashapi` minimal set), started when `experimental.clash_api.external_controller` is set. `clash_api/logs.rs` is the tracing broadcast layer feeding `/logs`. Includes on-demand delay endpoints (`/proxies/{name}/delay`, `/group/{name}/delay`) backed by `honk-outbound::urltest`, `/dns/query` (DoH-style JSON via the control-plane DNS forwarder, parsing in `clash_api/doh.rs`), `/providers/proxies` (each group exposed as a proxy provider), chunked-HTTP fallbacks for `/logs` and `/traffic` on non-WS requests, and external-UI auto-download (`clash_api/ui.rs`: background Yacd-meta zip download into an empty/missing `external_ui` dir, `HONK_UI_DOWNLOAD_URL` override; failures only warn).
+- `src/lib.rs` — engine entry `run()`, `Cli`/`ClashCommand` (clap), dae0 veth + `daens` netns setup (`169.254.0.1`/`.11`, `fd00:686f:6e6b::/64`; policy routing fwmark → table 100), scoped `with_daens_netns` setns helper, bootstrap-resolver install, subscription startup fetch (5s deadline) + merge tasks, sysctl helpers, `sd_notify`. `src/main.rs` is a thin binary.
+- `src/control/` — the control plane:
+  - `mod.rs` — `ControlPlane`: TPROXY TCP/UDP v4+v6 accept loop, `ControlCommand` mpsc channel (live commands: `ReloadConfig`, `MergeSubscription`, `GetStats`, `Shutdown`), 1024-connection semaphore (`try_acquire` — drop at capacity, never hold the fd), listener-fd publication to `LISTEN_SOCKET_MAP`.
+  - `connection.rs` — per-flow handling: `serve_connection` (orig-dst → DNS interception → handoff → sniff → route → mode override → candidates → parallel happy-eyeballs dial → relay → pool deposit), `serve_udp_connection` (QUIC sniff → endpoint reuse → route → sequential dial → reply handler), 3-tier pooled dial (ready → bare → fresh; `HONK_POOL_DISABLE=1` bypass).
+  - `sockets.rs` — TPROXY listener binds (daens-scoped), `new_udp_reply_socket` (**anyfrom** transparent socket bound to the flow's original destination), cached per-family DNS reply sockets (:53, `IP_PKTINFO` per-send source), `get_original_dst` (`SO_ORIGINAL_DST`/`IP6T`, `recvmsg` cmsg for UDP), `udp_fast_path`, `DnsBpfNotifier`.
+  - `dns_control.rs` — `DnsController`: port-53 interception, singleflight dedup, 256-query semaphore with SERVFAIL degradation, `DOMAIN_ROUTING_MAP` pushes from resolved answers, learned-route persistence + rebuild after reload.
+  - `reload.rs` — `apply_runtime_config`: the **single** rebuild pipeline for SIGHUP reload and subscription merge (router swap → config swap → outbound id map → GroupManager rebuild with choice migration → DNS forwarder recreate → eBPF push → domain-route rebuild), `config_with_subscription_nodes`, `resolve_outbound_nodes` (V6→V4 fallback, `final` fallback).
+  - `routing_matcher.rs` — eBPF routing push: **two-phase commit** — compile (no map writes), publish (MatchSets → LPM plan → `set_routing_meta` last as the atomic switch), post-switch cleanup (tail clear + LPM prune). Never call `clear_routes` on the push path. Port-only generic proxy rules punt to `ControlPlaneRouting` in domain dial modes.
+  - `quic.rs` — QUIC v1/v2 Initial decryption (RFC 9001/9369: HKDF initial secrets, AES-128-ECB header-protection removal, AES-128-GCM, CRYPTO reassembly 64 KiB cap); `packet_sniffer.rs` — per-flow QUIC sniff sessions with negative caches; `tcp_sniff.rs` — TCP sniff negative cache (3 failures → skip 600s).
+  - `udp_endpoint.rs` — `UdpEndpointPool` (NAT 30s, reply idle 120s, per-endpoint routing cache + anyfrom reply socket cache).
+  - `probers.rs` — `ProxyHttpProber` (HTTP through the node, 200–499 healthy), `ProxyUdpProber` (one DNS query through `dial_udp`).
+  - `janitor.rs` — `BpfJanitor` (2s tick; sweeps REDIRECT_TRACK/COOKIE_PID/ROUTING_HANDOFF; `CONN_STATE_MAP` deliberately not scanned — kernel LRU + lazy expiry).
+  - `drain.rs` — `DrainTracker` (reject-new + 5s drain during reload).
+  - **Unused scaffolding** (don't describe as live): `core.rs` (`ControlPlaneCore` — Go-dae-parity defer/eject/inject), `bind.rs` (`InterfaceBinding`), `drain.rs::GracefulShutdown`.
+- `src/dns/` — userspace DNS: `forwarder.rs` (parse → strategy filter → request routing → cache → upstream → response routing loop (re-query depth ≤ 3) → fixed/optimistic TTL → cache → `DomainResolveNotifier`), `routing.rs` (dae-shaped request/response rules: qname/qtype/upstream/answer-IP, negation, `fixed_domain_ttl`), `upstream_pool.rs` (transports pooled **per leaf node name**; `resolve_dial_leaf` = explicit `-> tag` via `SharedGroupManager` authoritative selection or implicit dae-style route of the DNS server IP through the traffic `Router`; UDP+proxy ⇒ TCP-DNS over the proxy; DoQ/DoH3+proxy ⇒ hard error; direct UDP uses a `DAE_BYPASS_MARK` socket per query), `transport/` (**encrypted upstreams**: `dot.rs` idle pool of 4 TLS streams, `doh.rs` one long-lived H2 session, `doq.rs` one QUIC conn ALPN `doq`, `doh3.rs` QUIC + `h3`-crate session, `tcp_pool.rs`, `framing.rs` RFC 7766 length-prefix; all retry once after session invalidation), `endpoint.rs` (upstream address parsing + bootstrap resolution), `cache.rs` (LRU + TTL + negative cache), `persist.rs` (`store_dns`: 500ms batch writer → cache.db + startup restore; best-effort, drops never stall DNS), `listener.rs` (standalone listener; production interception goes through `DnsController`), `mod.rs` (`DnsResolver` app-level A/AAAA resolution).
+- `src/ebpf/` — `EbpfBackend` trait (`mod.rs`; `set_routing_meta` contract: group-bitmap slots first, rule-count slot 0 **last**), `mock.rs` (full in-memory `MockEbpfBackend` used by all tests), `real/` (gated by `ebpf`: `attach.rs` program load/attach incl. bond/bridge slaves + dae0/dae0peer/sk_lookup, `syscall.rs` raw `bpf()` map ops avoiding aya `Pod` bounds, `events.rs` EVENT_RINGBUF drain → tracing, `mod.rs` link holders + per-CPU stat readers), `maps.rs` (LPM key helpers, v4 → v6-mapped with prefix +96), `probe.rs` (`bpf()` batch-capability latch).
+- `src/relay/` — `splice.rs`: `relay_splice` zero-copy bidirectional `splice(2)` with half-close propagation when both ends are plain `TcpStream`s; the first splice per direction is a capability probe (EINVAL/ENOSYS/EXDEV before any byte moved ⇒ lossless copy fallback + process-wide latch). **Never reintroduce a unidirectional splice path** (caused timeouts). `relay_auto` for TLS/protocol-wrapped streams (`copy_bidirectional`). `relay/udp.rs` and `handle_proxied_connection` are unused by the live path (UDP goes through `UdpEndpointPool`).
+- `src/routing/` — userspace `Router` (priority-ordered compiled routes, `route_with_must`, `GeositeMatcher` hash sets + Aho-Corasick + regex), `lpm.rs` (`BinaryLpmTrie`), `geo.rs` (`GeoAssets`: `geoip.dat`/`geosite.dat` parsed once per Router build, only referenced codes decoded).
+- `src/sniffing.rs` — **TCP only**: TLS SNI + HTTP Host (≤4096 bytes; buffered bytes returned for forwarding); `parse_client_hello_body` shared with the QUIC sniffer in `control/quic.rs`.
+- `src/stats.rs` (`StatsManager` per-outbound conns/bytes/errors), `src/pool.rs` (`ConnectionPool`: bare pre-handshake TCP 60s idle, ready dialed `ProxyStream` 30s idle, 8/key, 300s max age), `src/connection_tracker.rs` (feeds `/connections`), `src/mode.rs` (`ModeState` Rule/Global/Direct + GLOBAL selection; `override_outbound` never overrides block/must), `src/cachedb.rs` (rusqlite WAL: selector choices, clash mode, `dns:` answers with lazy expiry, `cache_id` namespacing, corruption auto-reset to `*.corrupt-<ts>`), `src/subscription.rs` (fetch via reqwest: base64/simple, raw-line fallback, Clash YAML; share links via `Node::from_share_link`; startup races a 5s deadline; periodic refresh per `Subscription.update_interval` default 86400s, 0 = manual; merges through `ControlCommand::MergeSubscription`; **nodes live in memory only, never written back to the config file**; SIGHUP carries them over and triggers an immediate refresh).
+- `src/clash_api.rs` + `clash_api/{logs,doh,ui}.rs` — Clash-compatible REST/WS API, started when `experimental.clash_api.external_controller` is non-empty. Auth: `Authorization: Bearer` or `?token=` (percent-decoded). Endpoints: `GET /`, `GET /version`, `GET/PUT/PATCH /configs`, `GET /proxies`, `GET/PUT /proxies/{name}`, `GET /proxies/{name}/delay`, `GET /group/{name}/delay` (on-demand via `honk-outbound::urltest`), `GET /rules`, `GET/DELETE /connections` (+WS `?interval=`), `DELETE /connections/{id}`, `GET /traffic` (WS or chunked JSON lines), `GET /stats` (userspace StatsManager snapshot, not eBPF `OUTBOUND_STATS`), `GET /logs` (WS or chunked, `?level=`), `GET /dns/query` (DoH-style JSON via the control-plane forwarder), `POST /cache/fakeip/flush`, `POST /cache/dns/flush`, `GET /providers/proxies`, `GET /providers/rules` (stub), `/ui` static hosting + background Yacd-meta zip auto-download into an empty/missing `external_ui` dir (`HONK_UI_DOWNLOAD_URL` override; failures only warn). `logs.rs` is the tracing broadcast layer. Note: the API mutates `SharedGroupManager`/`ModeState` directly; `ControlCommand::{SetMode, SetSelectorChoice, TestNodeDelay, UpdateNode, RemoveNode}` exist but have no senders.
 
-The `honk-core` binary (`src/main.rs`) parses `Cli` (from `lib.rs`) and either runs a **clash-style subcommand** (`mode`, `proxy`, `delay` — edit/save config or query a running controller) or starts the engine. CLI flags: `--config` (default `/etc/honk/config.dae`), `--bpf-object`, `--bpf-pin-root` (default `/sys/fs/bpf`), `--debug`, `--mock-ebpf`.
+CLI (`honk-core` binary):
 
-Proxy handlers, groups, and health checks live in `honk-outbound` (above), not in this crate.
+- Flags: `--config/-c` (default `/etc/honk/config.dae`), `--bpf-object/-b`, `--bpf-pin-root` (default `/sys/fs/bpf`), `--debug/-d`, `--mock-ebpf`. Log-level order: `--debug` → `RUST_LOG` → `global.log_level` → `info`.
+- Subcommands (clash-style, **local only — none talks to a running engine**): `mode <rule|global|direct>` (rewrites `global.dial_mode` in the config file), `proxy <group> <node>` (validates existence and prints; persists nothing), `delay <node> [--url HOST:PORT]` (raw TCP connect timing, not a proxied urltest).
 
-Runtime flow (high level):
+Benchmarks: `benches/dns.rs` (criterion, `harness = false`) — DNS endpoint parse, cache get/put, framing, forwarder cache-hit, TcpPool/UpstreamPool exchange. Run: `cargo bench -p honk-core --bench dns` (no external network needed).
 
-1. The eBPF LAN ingress program classifies each new TCP SYN / UDP datagram, marks proxy-bound flows with `tproxy_mark`, and tc-redirects them into the `dae0` veth. Inside the `daens` netns, policy routing plus the `sk_lookup` program and the `dae0peer` TC ingress program (`bpf_sk_assign`) deliver them to the transparent (TPROXY) listener sockets bound there, preserving the original destination. Like Go dae, **no global `iptables` TPROXY/PREROUTING rules are installed**.
-2. `honk-core` binds to that port and reads the original destination (`SO_ORIGINAL_DST` / `IP_ORIGINAL_DSTADDR`).
-3. It looks up an eBPF routing handoff entry; if absent it falls back to the userspace `Router`.
-4. It sniffs TLS SNI / HTTP Host to obtain a domain for domain-based rules.
-5. It resolves the target, selects the node/group, dials through the appropriate `ProxyHandler`, and relays traffic bidirectionally.
-6. DNS queries can take a fast path through the internal DNS forwarder/resolver (also accelerated by an eBPF DNS fast path).
+## Runtime architecture (data path)
+
+1. The eBPF LAN ingress program classifies each new TCP SYN / UDP datagram, marks proxy-bound flows with `tproxy_mark` (default `0x08000000`), and tc-redirects them into the `dae0` veth. Inside the `daens` netns, policy routing (fwmark → table 100) plus the `sk_lookup` program and the `dae0peer` TC ingress program (`bpf_sk_assign`) deliver them to the transparent (`IP_TRANSPARENT`) listener sockets bound in `daens`, preserving the original destination. Like Go dae, **no global `iptables` TPROXY/PREROUTING rules are installed**. DNS to port 53 takes a fast path that skips the full route loop.
+2. `honk-core` accepts and reads the original destination (`SO_ORIGINAL_DST` / `IP6T_SO_ORIGINAL_DST` for TCP with transparent-`local_addr` fallback; `IP_RECVORIGDSTADDR` cmsg for UDP).
+3. It takes the eBPF routing handoff entry (`routing_handoff_take`); if absent or `ControlPlaneRouting`, it falls back to the userspace `Router::route_with_must`. eBPF-decided `direct` with a nonzero mark is offloaded without userspace relay.
+4. It sniffs TLS SNI / HTTP Host (TCP) or decrypts QUIC Initial SNI (UDP) for domain-based rules (skipped for must-rules, `dial_mode: ip`, or negative-cache hits; `dial_mode: domain` runs a DNS reality check).
+5. Clash mode override → group/leaf selection (`SharedGroupManager` authoritative pick) → dial through the `ProxyHandler` (pooled: ready → bare → fresh; TCP dials race in parallel, UDP sequential) → relay: `splice(2)` when both ends are plain TCP, else `copy_bidirectional`; sniffed bytes are flushed to the proxy first.
+6. DNS: port-53 flows are intercepted by `DnsController` → singleflight → `DnsForwarder` (request routing → cache → upstream pool: UDP/TCP/DoT/DoH/DoQ/DoH3, optionally through a proxy leaf → response routing) → answers are pushed into `DOMAIN_ROUTING_MAP` so eBPF can route subsequent connections to those IPs.
+
+Key runtime invariants (do not break):
+
+- **Bypass mark:** all control-plane-originated sockets (dials, probes, DNS upstreams, QUIC endpoints) carry `DAE_BYPASS_MARK` (`0x100`) or are loopback — otherwise the gateway loops its own traffic back into `daens`.
+- **Anyfrom UDP replies:** proxied-UDP and DNS replies are sent from a transparent socket bound to the flow's original destination (created inside `daens`, cached per endpoint). Replying from the TPROXY listener dies in the host `dae0` path with source `169.254.0.11:<tproxy_port>`.
+- **Netns discipline:** the process never leaves the host netns; `daens` is entered only through scoped, fully synchronous `with_daens_netns` switches (never `.await` inside — setns is per-thread; the original netns is restored on all exit paths, serialized by a process-wide mutex).
+- **must/block are final:** clash mode override never overrides `block` results or dae `(must)` results.
+- **eBPF connectivity pushes are group-OR:** the per-group alive slot is shared by all members — health callbacks write the OR of leaf-member states, never a single node's state (one dead member would otherwise `TC_ACT_SHOT` the whole group).
+- **Internal traffic is never proxied:** `169.254.0.0/16` and `fd00:686f:6e6b::/64` (honk's own veth), broadcast/multicast.
+- Reserved outbound indices: `0 Direct | 1 Block | 2+ user groups | 0xFC MustRules | 0xFD ControlPlaneRouting | 0xFE OR | 0xFF AND`.
 
 ## Build and test commands
 
 ### Rust workspace
 
 ```bash
-# Check / build workspace members
 cargo check
-cargo build --release
-
-# Individual workspace crates
-cargo build --release -p honk-config
-cargo build --release -p honk-ebpf-common
-cargo build --release -p honk-outbound
-cargo build --release -p honk-core
-
-# Run tests for the workspace members (verified: 603 tests, all passing)
-cargo test --all
-
-# The repo also provides a convenience test script
-./run_tests.sh
+cargo build --release                 # whole workspace
+cargo build --release -p honk-core    # engine (default features: clash-api, mock eBPF)
+cargo test --all                      # full suite (see current status below!)
 ```
 
-### `honk-core` with real eBPF
+### honk-core with real eBPF
 
 ```bash
-# Requires Linux kernel 5.8+, clang, llvm, libbpf-dev, and the ebpf feature.
-# build.rs auto-builds the eBPF object with the nightly toolchain on first build.
+# Requires Linux kernel 5.8+, clang/llvm/libbpf headers, nightly + bpf-linker.
+# build.rs auto-builds the eBPF object on first build (~30s).
 cargo build --release -p honk-core --features ebpf
-
-# Run as root (TPROXY + eBPF require privileges).
-# The eBPF object file is embedded into the binary, so --bpf-object is optional.
-sudo ./target/release/honk-core --config /etc/honk/config.dae
-
-# To use an external object file instead of the built-in one:
-sudo ./target/release/honk-core \
-    --config /etc/honk/config.dae \
-    --bpf-object /etc/honk/honk-core.o
+sudo ./target/release/honk-core --config /etc/honk/config.dae          # embedded object
+sudo ./target/release/honk-core --config c.dae --bpf-object /path.o    # external object
 ```
 
-Without the `ebpf` feature, `honk-core` runs with the `MockEbpfBackend` and can be started for testing:
+Dev without kernel eBPF (unprivileged):
 
 ```bash
-cargo run --release -p honk-core -- \
-    --config config.dae \
-    --mock-ebpf
+cargo run --release -p honk-core -- --config config.min.dae --mock-ebpf
 ```
 
-### eBPF program
+### eBPF program standalone
 
 ```bash
 cd crates/honk-ebpf
 cargo +nightly build --release -Zbuild-std=core --target bpfel-unknown-none
-# Produces the object at target/bpfel-unknown-none/release/honk-ebpf
 ```
-
-This crate assumes a nightly toolchain and `bpf-linker` (the `.cargo/config.toml` references a `bpf-linker-wrapper` by absolute path — see the crate section above).
 
 ### Justfile (preferred for day-to-day dev)
 
-`just` is the task runner used for real-device work. Key recipes:
-
 | Recipe | Purpose |
 | -------- | --------- |
-| `build` | `cargo build --release` (whole workspace) |
-| `build-core` | `honk-core` with `ebpf` (+ default `clash-api`) |
-| `build-core-ebpf` | `honk-core` with `ebpf` only |
-| `build-musl` | static musl build of `honk-core` for VyOS/Debian (sources `scripts/musl-env.sh`, target `x86_64-unknown-linux-musl`) |
-| `build-ebpf` | build the eBPF object standalone (nightly, `bpfel-unknown-none`) |
-| `run` / `run-debug` | run `honk-core` locally via `scripts/debug-local.sh` (clash API on :9090) |
-| `run-dae` | run `honk-core` with `config.dae` + `--mock-ebpf` |
-| `debug-status` / `debug-config` / `debug-alive` / `debug-stats` / `watch-debug` | query the clash HTTP API (`/version`, `/proxies`, `/group/{n}/delay`, `/stats`, `/connections`) |
-| `bpf-progs` / `bpf-maps` | inspect loaded BPF programs and pinned maps |
-| `deploy HOST=...` | build + deploy to a gateway (default `10.10.10.1`) via `scripts/deploy-gateway.sh` |
+| `build` / `check` / `lint` / `fmt` | `cargo build --release` / `check` / `clippy --all -D warnings` / `fmt --all` |
+| `test` / `test-core` / `test-config` / `test-ebpf` | Test suites (`test-ebpf` = honk-ebpf-common only) |
+| `build-core` / `build-core-ebpf` | honk-core with `ebpf` feature |
+| `build-musl` | Static musl build (`x86_64-unknown-linux-musl`, for VyOS/Debian) |
+| `build-ebpf` | eBPF object standalone (nightly, `bpfel-unknown-none`) |
+| `run-debug` | Build with ebpf, clean previous state, run with `config.dae` + external object |
+| `run-dae` | Run with `config.dae` + `--mock-ebpf` |
+| `debug-status` / `debug-config` / `debug-alive` / `debug-stats` / `watch-debug` | Query the clash HTTP API on :9090 (`/version`, `/configs`, `/proxies`, `/group/{n}/delay`, `/stats`, `/connections`) |
+| `bpf-progs` / `bpf-maps` | Inspect loaded BPF programs and pinned maps |
 | `deploy-vyos HOST=...` | musl build + scp to a VyOS router |
-| `clean-all` | kill `honk-core`, remove `dae0`/`daens`, BPF pins, iptables MASQUERADE rules, policy routes |
+| `clean` / `clean-all` | `cargo clean` / kill honk-core, remove `dae0`/`daens`, BPF pins, legacy iptables/policy-route leftovers |
 | `cycle` | `clean-all` + `build-core` |
+| `watch-core` | `cargo watch` rebuild |
 
-### Makefile targets
+**Broken in this checkout:** `run` and `deploy` (missing `scripts/`), `docker` / `docker-up` / `docker-down` (missing `Dockerfile` / `docker-compose.yml`). Note `clean-all` still deletes iptables MASQUERADE rules and routing table 2023 — legacy leftovers; the live setup installs no iptables rules and uses table 100.
 
-| Target | Purpose |
-| -------- | --------- |
-| `all`, `build` | Build Rust workspace release binaries |
-| `build-core` | Build `honk-core` (no features) |
-| `test` | `cargo test --all` |
-| `fmt` | `cargo fmt --all` |
-| `lint` | `cargo clippy --all -- -D warnings` |
-| `clean` | `cargo clean` |
-| `docker` / `docker-up` / `docker-down` | Docker image and compose helpers |
-| `outdated` / `audit` | `cargo outdated` / `cargo audit` |
-| `doc` | `cargo doc --no-deps --open` |
+### CI / releases
 
-### JavaScript frontend (`honk/`, reference only)
+`.github/workflows/release.yml` runs on `v*` tags: `cargo test --all` gate (stable toolchain), then builds `honk-core --features ebpf` for `x86_64`/`aarch64` × `gnu`/`musl` (via `cross`; the eBPF object is built once on the host with nightly + `bpf-linker`, which the workflow substitutes for the hardcoded linker path), and publishes tarballs to a GitHub Release (marked prerelease when the tag contains `alpha`/`beta`/`rc`).
 
-```bash
-cd honk
-pnpm install
-pnpm dev        # start Vite dev server
-pnpm build      # production build via turbo
-pnpm test       # vitest via turbo
-pnpm lint       # eslint --fix
-pnpm codegen    # graphql-codegen
-```
+## Current test status (verified 2026-07-22)
+
+`cargo test --all` does **not** currently pass. Known failures, so you don't think you caused them:
+
+| Crate | Result |
+| ------- | -------- |
+| `honk-config` | lib 36 pass; `tests/example_configs.rs` 3 pass (all three root `.dae` files parse); `tests/share_link.rs` 24 pass / **2 fail** — `test_config_toml_round_trip` and `test_to_file_and_from_file_by_extension`: TOML round-trip serialization is broken (recent DNS config surface doesn't survive `toml`) |
+| `honk-ebpf-common` | no tests |
+| `honk-outbound` | **lib test target does not compile**: test code in `src/quic.rs` uses `rcgen::CertifiedKey.key_pair`, renamed to `signing_key` in rcgen 0.14.8, plus a `bytes::Bytes` `PartialEq` mismatch (4 errors) |
+| `honk-core` | lib 346 pass (1 ignored); `tests/integration_test.rs` 21 pass; `tests/clash_api_test.rs` 21 pass; `tests/config_dae_routing_test.rs` **1 fail** — `test_routing_with_config_dae` expects `domain(suffix: jogiyw.sbs) -> direct` in the root `config.dae`, which no longer contains that rule (falls through to `dport(...443...) -> omg`) |
+
+Consequence: the release workflow's `cargo test --all` gate would fail today. When fixing code, run at least `cargo test -p <crate>` for the crates you touched and don't regress the passing suites.
 
 ## Code style guidelines
 
-- Rust source files do **not** carry SPDX/copyright headers; licensing and attribution live in the root `README.md` only.
+- Rust source files do **not** carry SPDX/copyright headers; licensing and attribution live in the root `README.md`/`LICENSE`.
 - Keep comments minimal: module-level `//!` docs (purpose + non-obvious architecture), `///` docs on public items, and "why" comments (rationale, invariants, wire formats, upstream parity notes, past-bug warnings). No section banners, no comments that restate the code.
-- Prefer `anyhow::Result<()>` for application/binaries and `thiserror` for library error types.
-- Use `tracing` macros for logging; prefer structured fields where useful (`info!(network = "tcp", outbound = %name, ...)`).
+- Prefer `anyhow::Result` for application/binary code and `thiserror` for library error types.
+- Use `tracing` macros for logging; prefer structured fields (`info!(network = "tcp", outbound = %name, ...)`).
 - Use `tokio` async/await and `tokio::select!` for long-lived loops.
-- eBPF-related structs that cross the kernel/userspace boundary live in `honk-ebpf-common` and must be `#[repr(C)]` with stable layouts.
-- Follow `cargo fmt` formatting and keep `cargo clippy --all -- -D warnings` clean.
+- Structs crossing the kernel/userspace boundary live in `honk-ebpf-common`, must be `#[repr(C)]` with stable layouts, and must be changed together with `honk-ebpf` and the `honk-core` map writers.
+- Follow `cargo fmt --all` and keep `cargo clippy --all -- -D warnings` clean.
+- Match the surrounding file's idioms; make minimal, scoped changes (no opportunistic cleanups).
+- Documentation language: code comments and `.en.md` docs are English; user docs are bilingual en/zh (`README_CN.md`, `doc/*.zh.md`) — update both when you change documented behavior.
 
 ## Testing instructions
 
-- `cargo test --all` runs unit and integration tests for workspace members (last verified: 603 tests, all passing, no root required).
-- `./run_tests.sh` performs per-crate `cargo check` and targeted `cargo test` runs for `honk-config`, `honk-ebpf-common`, and `honk-core`.
-- `honk-core` tests rely on `MockEbpfBackend` so they do **not** require a kernel with eBPF support or root privileges.
+- `cargo test --all` runs unit + integration tests for workspace members. Everything runs unprivileged: `honk-core` tests use `MockEbpfBackend` and loopback sockets — no root, no kernel eBPF.
 - Test locations:
-  - `crates/honk-core/tests/integration_test.rs` — configuration loading/validation, routing (domain suffix, IP CIDR, default fallback), mock eBPF backend workflow, SOCKS5/direct/block proxy handlers, TCP relay, DNS resolver creation, statistics manager, control-plane command channel.
-  - `crates/honk-core/tests/clash_api_test.rs` — Clash API endpoints.
-  - `crates/honk-core/tests/config_dae_routing_test.rs` — dae-syntax config + routing integration.
-  - `crates/honk-config/tests/example_configs.rs` — keeps the root example config files parseable.
-  - `crates/honk-config/tests/share_link.rs` — share-link parsing.
-  - `crates/honk-config/src/parser/tests.rs` — dae-syntax lexer/parser unit tests.
-- Root-only end-to-end scripts (require root, network namespaces / podman, real eBPF): `test-honk.sh` (smoke runner with timeout + cleanup), `scripts/test-netns*.sh`, `scripts/test-podman-honk.sh`. Their captured output lives in `log/`. `scripts/cleanup-honk.sh` / `scripts/cleanup.sh` remove the resulting system state.
+  - `crates/honk-config/src/parser/tests.rs` — dae-syntax parser unit tests (sections, groups, nested filters, DNS upstreams/routing, subscriptions, experimental).
+  - `crates/honk-config/tests/example_configs.rs` — keeps `config.dae`, `config.min.dae`, `example.dae` parseable.
+  - `crates/honk-config/tests/share_link.rs` — share-link parsing + config format round-trips.
+  - `crates/honk-outbound/src/group/tests.rs`, `group/udp_selection_repro_tests.rs` — selection semantics (selector/urltest/LB/fallback, nested groups, UDP exclusion).
+  - `crates/honk-outbound/src/alive/tests.rs` — health-check state machine, probe semantics, idle suspension.
+  - `crates/honk-outbound/src/proxy/hysteria2/tests.rs` + inline `#[cfg(test)]` modules across `proxy/*`, `urltest.rs`, `bootstrap.rs` — wire-codec vectors and loopback end-to-end handshake/UDP-bridge tests (in-process QUIC servers via `quic::testutil`).
+  - `crates/honk-core/tests/integration_test.rs` — config loading, routing, mock-eBPF workflow, SOCKS5/direct/block, TCP relay + splice, DNS resolver, stats, reload/subscription-merge pipeline.
+  - `crates/honk-core/tests/clash_api_test.rs` — Clash API endpoints (auth, proxies, delay, connections, traffic/logs chunked + WS, `/dns/query`, cache flush, providers, UI hosting, store_dns).
+  - `crates/honk-core/tests/config_dae_routing_test.rs` — end-to-end routing assertions against the root `config.dae` (**currently failing**, see status above).
+  - Inline unit tests in `honk-core/src/control/*`, `routing/tests.rs`, `dns/*` (incl. `transport/tests_proto.rs` — DoT/DoH round-trips with rcgen self-signed certs; one `#[ignore]`d live Google DoH test), `relay/*`, `ebpf/real/tests.rs` (only with `ebpf` feature).
+- Benchmarks: `cargo bench -p honk-core --bench dns`.
+- The root-only netns/podman integration scripts referenced by older docs are not in this checkout.
 
 ## Configuration
 
-The primary (and only documented) configuration format is the original **dae syntax** — `{ global { ... } node { ... } routing { ... } }`, parsed by `honk-config/src/parser/` (see the root examples `config.dae` and `config.min.dae`, kept parseable by `crates/honk-config/tests/example_configs.rs`).
+The primary (and only documented) format is the original **dae syntax** — `{ global { ... } node { ... } group { ... } routing { ... } dns { ... } subscription { ... } experimental { ... } }`, parsed by `honk-config/src/parser/mod.rs`. Root examples: `config.dae` (full), `config.min.dae` (minimal), `example.dae` (annotated). Field-by-field reference: `doc/components.en.md`; guide: `doc/configuration.en.md`.
 
-Important configuration sections:
+- Built-ins: outbound `direct` is auto-injected (by `honk-core`, not the parser) if missing; `block` drops traffic.
+- Health checks via `global { tcp_check_url, udp_check_dns, check_interval, check_tolerance }`; dial modes `ip` / `domain` / `domain+` / `domain++`.
+- DNS upstream URI schemes: `udp://` (bare default), `tcp://`, `tcp+udp://`, `tls://` (DoT), `https://` (DoH), `h3://`/`http3://` (DoH3), `quic://` (DoQ); optional dial-path proxy `name: 'uri' -> <node|group>` (or legacy `outbound:` key).
+- Geo assets: `geoip.dat` / `geosite.dat` loaded at runtime (repo root is the common dev location).
+- Environment variables: `RUST_LOG`, `HONK_UI_DOWNLOAD_URL` (UI zip override), `HONK_POOL_DISABLE=1` (bypass connection pool).
+- Default runtime paths: config `/etc/honk/config.dae`, BPF pin root `/sys/fs/bpf`, embedded BPF object unless `--bpf-object`.
 
-- `global { ... }` — `tproxy_port`, `tproxy_mark`, `log_level`, `lan_interface`, `auto_config_kernel_parameter`, health-check URLs/intervals, etc.
-- `node { ... }` / `group { ... }` — proxy nodes and load-balancing groups.
-- `routing { ... }` — ordered rules matching domain, IP/CIDR, port, protocol, process name, MAC, geosite, geoip, ending in a `fallback:`.
-- `dns { ... }` — upstreams, routing, cache.
-- `subscription { ... }` — subscription URLs.
-- `experimental { ... }` — `clash_api.external_controller` / `clash_api.secret`, `cache_file`.
+## Deployment
 
-Default runtime paths:
-
-- `honk-core`: config `/etc/honk/config.dae`, built-in BPF object (external override via `--bpf-object`), pin root `/sys/fs/bpf`.
-
-## Deployment processes
-
-### Native
-
-Run `honk-core` as root (it needs eBPF, network namespaces, and transparent TPROXY sockets). The engine is self-contained: it reads a single config file (`--config`, default `/etc/honk/config.dae`), embeds the eBPF object, and optionally exposes the Clash-compatible API via `[experimental.clash_api]`.
-
-### Gateway / VyOS
-
-`just deploy [HOST]` (default `10.10.10.1`) builds `honk-core` with `ebpf` and runs `scripts/deploy-gateway.sh` (strip + scp + restart). `just deploy-vyos [HOST]` cross-compiles a static musl binary (`scripts/musl-env.sh` sets up the cross toolchain on NixOS) and installs it on a VyOS router. The workspace Cargo.toml defines a `release-musl` profile for portable static builds.
-
-### Docker
-
-The multi-stage `Dockerfile` builds only `honk-core` (`cargo build --release -p honk-core`, default features) and uses it as the container entrypoint (`--config /etc/honk/config.dae`). A container built this way runs the mock eBPF backend; for real eBPF builds add `--features ebpf` (which additionally needs a nightly toolchain + `bpf-linker` in the build stage) or bind-mount an external object and pass `--bpf-object`.
-
-Example container run (privileged, host network):
-
-```bash
-docker run -d \
-    --privileged \
-    --network=host \
-    --pid=host \
-    --restart=always \
-    -v /sys:/sys \
-    -v /etc/honk:/etc/honk \
-    honk:latest
-```
-
-### Docker Compose
-
-`docker-compose.yml` uses the prebuilt image `ghcr.io/daeuniverse/honk:latest` with `privileged: true`, `network_mode: host`, `pid: host`, and mounts `/sys` and `/etc/honk`. Run `docker compose up -d`.
+- **Native:** run `honk-core` as root (eBPF load, netns/veth creation, transparent TPROXY sockets, sysctl). The engine is self-contained: one config file, embedded eBPF object, optional clash API via `experimental.clash_api`.
+- **Gateway / VyOS:** `just build-core` (or `build-musl` for a static `x86_64-unknown-linux-musl` binary — the workspace defines a `release-musl` profile) and copy the binary; `just deploy-vyos HOST=...` does musl build + scp + smoke run. The `just deploy` gateway script is not in this checkout.
+- **Releases:** tag `v*` → GitHub Actions builds four targets and publishes tarballs (see CI above).
+- **Docker:** the `Dockerfile` / `docker-compose.yml` referenced by the README and Justfile are not present in this tree; a container needs `--privileged --network=host --pid=host` and `/sys` mounted, and either an `ebpf`-feature build or `--bpf-object`/`--mock-ebpf`.
+- **Cleanup:** stopping honk-core plus removing `dae0`/`daens`, BPF pins under `/sys/fs/bpf`, and policy routes (`just clean-all`) is sufficient — no global iptables rules are installed.
 
 ## Security considerations
 
-- **Root/privileged execution:** `honk-core` must run as root to load eBPF programs, create `dae0` veth pairs / netns, and bind `TPROXY` sockets. The Docker deployment uses `--privileged`, `--network=host`, and `--pid=host`.
-- **Clash API secret:** when `[experimental.clash_api]` is enabled, set a strong `secret`; the REST/WS API has no TLS of its own — front it with a reverse proxy if exposed beyond localhost.
-- **Config trust:** `honk-core` runs `ip` and loads a BPF object from paths supplied by configuration. Treat config files and the BPF object as privileged input.
+- **Root/privileged execution:** `honk-core` must run as root to load eBPF programs, create `dae0`/`daens`, and bind transparent sockets.
+- **Clash API secret:** when `experimental.clash_api` is enabled, set a strong `secret`; the REST/WS API has no TLS of its own — bind to localhost or front it with a reverse proxy.
+- **Config trust:** `honk-core` runs `ip`/`sysctl` and loads a BPF object from configured/CLI paths. Treat config files and the BPF object as privileged input.
+- **Bypass mark discipline:** `DAE_BYPASS_MARK` must stay on control-plane dial/probe/DNS sockets or the gateway loops its own traffic (see invariants above).
 
 ## Notes for agents
 
-- Always check whether a file is in `crates/honk-config`, `crates/honk-ebpf-common`, `crates/honk-outbound`, `crates/honk-core`, or one of the reference checkouts (`honk/`, `outbound/`, `sing-box/`) before assuming a command context.
-- When modifying eBPF map types or constants, update both `honk-ebpf-common` and the eBPF program in `crates/honk-ebpf`; struct layouts must stay in sync.
-- LAN delivery follows Go dae (tc redirect to `dae0` + `sk_lookup`/`bpf_sk_assign` in `daens`); no `iptables` TPROXY rules are installed, so cleanup only needs to remove `dae0`/`daens`, policy routes, and BPF pins.
-- The userspace relay has two paths: connections where both ends are plain `TcpStream`s (direct dial) relay zero-copy via `splice(2)` (`relay::splice::relay_splice`, bidirectional with half-close propagation); TLS/protocol-wrapped streams use `tokio::io::copy_bidirectional` (`relay::splice::relay_auto` → `relay_tcp`). If the kernel rejects `splice(2)` (EINVAL/ENOSYS/EXDEV on the first probe, before any byte is moved) the connection falls back to copy and a process-wide flag latches so later connections skip probing. Do not bypass the probe/fallback logic; the old unidirectional splice path caused timeouts and must not return.
-- If you add or remove workspace crates, update this file and the root `Cargo.toml` `[workspace] members` list accordingly.
-- `plan.md` collects unfinished design work (e.g. the health-check/node-selection redesign inspired by sing-box URLTest/Selector). Consult it before reimplementing those subsystems.
-- The reference checkouts (`honk/`, `outbound/`, `sing-box/`) have their own upstream conventions; do not edit them as part of Rust changes.
+- Check which crate a file belongs to before assuming command context; `honk-ebpf` is **not** a workspace member (separate `Cargo.lock`, nightly-only target) — workspace-wide `cargo` commands skip it.
+- When modifying eBPF map types or constants, update `honk-ebpf-common`, `honk-ebpf`, and the userspace map writers in `honk-core` together; struct layouts must stay in sync.
+- Consult `doc/design.en.md` (architecture), `doc/configuration.en.md` / `doc/components.en.md` (config surface) before changing behavior; update them (both en and zh) when behavior changes.
+- If you add or remove workspace crates, update this file and the root `Cargo.toml` `[workspace] members` list.
+- The README contains an authorship disclosure: the eBPF datapath is the maintainer's primary focus; most userspace subsystems were largely AI-authored with partial review. Review userspace changes with corresponding care.
 
 ## ULW (UltraWork) Mode — Default Agent Behavior
 
 > This project uses ULW mode by default, ported from [oh-my-openagent](https://github.com/code-yeongyu/oh-my-openagent).
 > Type `ulw` or `ultrawork` in any prompt to activate full ultrawork orchestration.
 
-### Agent Roles Available
+### Agent roles
 
-Use the `Agent` tool (pi-subagents) to spawn specialized workers:
+Use subagents to spawn specialized workers:
 
-| Agent Type | Role | Use When |
+| Agent type | Role | Use when |
 | ----------- | ------ | ---------- |
 | `hephaestus` | Deep autonomous worker | Writing code, implementing features end-to-end |
 | `prometheus` | Strategic planner | Complex multi-step tasks needing a plan first |
@@ -346,23 +351,9 @@ Use the `Agent` tool (pi-subagents) to spawn specialized workers:
 | `momus` | Ruthless plan reviewer | High-accuracy plan validation |
 | `sisyphus-junior` | Task executor | Atomic tasks with clear instructions |
 
-### Default Model Assignments
+All agents use DeepSeek models (current default provider).
 
-All agents use DeepSeek models (current default provider):
-
-| Agent | Model | Thinking |
-| ------- | ------- | ---------- |
-| Main/Sisyphus | `deepseek/deepseek-v4-pro` | xhigh |
-| hephaestus | `deepseek/deepseek-v4-pro` | xhigh |
-| prometheus | `deepseek/deepseek-v4-pro` | high |
-| atlas | `deepseek/deepseek-v4-pro` | medium |
-| oracle | `deepseek/deepseek-v4-pro` | xhigh |
-| librarian | `deepseek/deepseek-chat` | low |
-| metis | `deepseek/deepseek-v4-pro` | medium |
-| momus | `deepseek/deepseek-v4-pro` | high |
-| sisyphus-junior | `deepseek/deepseek-v4-pro` | low |
-
-### ULW Principles
+### ULW principles
 
 1. **Never stop halfway.** Complete the task or clearly report blockers.
 2. **Delegate aggressively.** Use background agents for independent work.
@@ -373,20 +364,9 @@ All agents use DeepSeek models (current default provider):
 ### Commands for this project
 
 ```bash
-# Build workspace
-cargo build --release
-
-# Build specific crates
-cargo build --release -p honk-config
+cargo build --release          # Build workspace
 cargo build --release -p honk-core
-
-# Run tests
-cargo test --all
-./run_tests.sh
-
-# Lint
+cargo test --all               # Run tests (see "Current test status" above!)
 cargo clippy --all -- -D warnings
-
-# Format
 cargo fmt --all
 ```
