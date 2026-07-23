@@ -21,6 +21,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake libclang-dev
+
+      # routing::tests::test_geosite_* need geo assets (locally found at
+      # /etc/dae/geosite.dat; the runner has none).
+      - name: Install geo assets for the geosite tests
+        run: |
+          sudo mkdir -p /etc/dae
+          sudo curl -sL --retry 3 -o /etc/dae/geosite.dat \
+            https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat
+          sudo curl -sL --retry 3 -o /etc/dae/geoip.dat \
+            https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
       # Full suite minus the known-failing pre-existing tests (see AGENTS.md
       # "Current test status": share_link TOML round-trip x2,
       # config_dae_routing x1).
