@@ -387,7 +387,7 @@ impl ControlPlaneHandle {
             let router = self.router.read().await;
             router
                 .route_full(&conn_info)
-                .map(|m| m.rule_name.to_string())
+                .map(|m| m.rule_display.to_string())
         };
 
         // Clash mode override (Direct/Global); no-op when the clash API is

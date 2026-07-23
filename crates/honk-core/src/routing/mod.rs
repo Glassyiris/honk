@@ -13,6 +13,9 @@ pub(crate) use lpm::BinaryLpmTrie;
 #[derive(Debug, Clone)]
 pub struct CompiledRoute {
     pub name: String,
+    /// dae-style rendering of the condition (`display_expr`), for the
+    /// clash `/connections` rule field and logs.
+    pub display: String,
     pub priority: u32,
     pub domain_patterns: Vec<Regex>,
     pub domain_suffixes: Vec<String>,
@@ -249,6 +252,7 @@ impl Router {
 
             compiled.push(CompiledRoute {
                 name: rule.name.clone(),
+                display: rule.condition.display_expr(),
                 priority: rule.priority,
                 domain_patterns,
                 domain_suffixes: rule.condition.domain_suffix.clone(),
@@ -322,6 +326,7 @@ impl Router {
                 return Some(RouteMatch {
                     outbound_name: &route.outbound,
                     rule_name: &route.name,
+                    rule_display: &route.display,
                     must: route.must,
                     mark: route.mark,
                 });
@@ -374,6 +379,7 @@ impl Router {
                 return Some(RouteMatch {
                     outbound_name: &route.outbound,
                     rule_name: &route.name,
+                    rule_display: &route.display,
                     must: route.must,
                     mark: route.mark,
                 });
@@ -529,6 +535,8 @@ pub struct RouteResult {
 pub struct RouteMatch<'a> {
     pub outbound_name: &'a str,
     pub rule_name: &'a str,
+    /// dae-style rendering of the matched rule's condition (display).
+    pub rule_display: &'a str,
     pub must: bool,
     pub mark: u32,
 }
