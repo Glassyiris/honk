@@ -14,7 +14,7 @@ const EINPROGRESS: i32 = libc::EINPROGRESS;
 /// bypass is irrelevant there because no eBPF datapath is loaded.
 /// Non-EPERM errors are real failures and propagate.
 #[cfg(target_os = "linux")]
-pub(crate) fn set_mark_best_effort(socket: &socket2::Socket, mark: u32) -> io::Result<()> {
+pub fn set_mark_best_effort(socket: &socket2::Socket, mark: u32) -> io::Result<()> {
     match socket.set_mark(mark) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {

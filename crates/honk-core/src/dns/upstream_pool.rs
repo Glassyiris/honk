@@ -410,7 +410,7 @@ impl UpstreamPool {
         sock2.set_nonblocking(true)?;
         #[cfg(target_os = "linux")]
         {
-            sock2.set_mark(DAE_BYPASS_MARK)?;
+            honk_outbound::util::set_mark_best_effort(&sock2, DAE_BYPASS_MARK)?;
         }
         sock2.bind(
             &SocketAddr::new(

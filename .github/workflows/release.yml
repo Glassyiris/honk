@@ -105,9 +105,12 @@ jobs:
           set -euo pipefail
           T="${{ matrix.target }}"
           export ZIGCC_TARGET="${T/-unknown/}"
+          # cc crate wants lowercase CC_<target_with_underscores>; cargo
+          # wants uppercase CARGO_TARGET_<TARGET>.
+          L=$(printf '%s' "$T" | tr '-' '_')
           U=$(printf '%s' "$T" | tr 'a-z-' 'A-Z_')
-          eval "export CC_${U}=\$PWD/ci/zigcc"
-          eval "export CXX_${U}=\$PWD/ci/zigcxx"
+          eval "export CC_${L}=\$PWD/ci/zigcc"
+          eval "export CXX_${L}=\$PWD/ci/zigcxx"
           eval "export CARGO_TARGET_${U}_LINKER=\$PWD/ci/zigcc"
           # musl: let zig supply the CRT (Rust's self-contained rcrt1.o and
           # zig's crt1.o both define _start).
