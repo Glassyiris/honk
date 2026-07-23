@@ -11,6 +11,7 @@
 //!   bit      56 → has_routing
 
 use aya_ebpf_cty::c_void;
+use core::ffi::c_long;
 
 use aya_ebpf::bindings::__be32;
 use aya_ebpf::maps::lpm_trie::Key;
@@ -36,6 +37,17 @@ pub const OUTBOUND_CONTROL_PLANE_ROUTING: u8 = 0xFD;
 pub const OUTBOUND_LOGICAL_OR: u8 = 0xFE;
 pub const OUTBOUND_LOGICAL_AND: u8 = 0xFF;
 pub const OUTBOUND_LOGICAL_MASK: u8 = 0xFE;
+
+/// `bpf_loop` callback control value: keep iterating.  NOT a TC verdict.
+const LOOP_CONTINUE: i32 = 0;
+/// `bpf_loop` callback control value: stop iterating (a rule matched or an
+/// error was recorded in `RouteCtx::result`).  NOT a TC verdict.
+const LOOP_BREAK: i32 = 1;
+
+/// Internal error code for the `eval_match`/`match_*` helpers — NOT a TC
+/// verdict; `route_loop_iteration` only checks `is_err()` and turns it into
+/// [`LOOP_BREAK`] with `RouteCtx::result` carrying the real errno.
+const MATCH_ERR: c_long = 1;
 
 /// Execute routing decision for a packet.
 ///
@@ -167,15 +179,15 @@ impl RouteCtx {
     /// then check the bitmap bit for the current `match_set` index and set
     /// GOOD_SUBRULE if it matches.
     ///
-    /// Returns `Ok(())` on normal execution (hit or miss), and `Err(1)` if a
-    /// map lookup fails.
+    /// Returns `Ok(())` on normal execution (hit or miss), and
+    /// `Err(MATCH_ERR)` if a map lookup fails.
     #[inline(always)]
     pub fn match_lpm(
         &mut self,
         lpm_key: &Key<[__be32; 4]>,
         match_type: MatchType,
         index: u32,
-    ) -> Result<(), i32> {
+    ) -> Result<(), c_long> {
         let lpm = match match_type {
             MatchType::IpSet => DEST_LPM_ROUTING_MAP.get(lpm_key),
             MatchType::SourceIpSet => SOURCE_LPM_ROUTING_MAP.get(lpm_key),
@@ -202,9 +214,10 @@ impl RouteCtx {
 
     /// Domain-set match: look up the bitmap in DOMAIN_ROUTING_MAP.
     ///
-    /// Returns `Ok(())` on success, and `Err(1)` if the index is out of bounds.
+    /// Returns `Ok(())` on success, and `Err(MATCH_ERR)` if the index is out
+    /// of bounds.
     #[inline(always)]
-    pub fn match_domain_set(&mut self, index: u32) -> Result<(), i32> {
+    pub fn match_domain_set(&mut self, index: u32) -> Result<(), c_long> {
         // Clamp to valid range for verifier. The bitmap has
         // MAX_MATCH_SET_LEN/32 entries.
         let safe_index = index.min(MAX_MATCH_SET_LEN as u32 - 1);
@@ -238,8 +251,8 @@ impl RouteCtx {
 
     /// Core match dispatcher: corresponds to C's `route_eval_match`.
     ///
-    /// Returns `Ok(())` when the match logic executed normally, and `Err(1)`
-    /// for internal errors (map failure or invalid type).
+    /// Returns `Ok(())` when the match logic executed normally, and
+    /// `Err(MATCH_ERR)` for internal errors (map failure or invalid type).
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     pub fn eval_match(
@@ -251,12 +264,12 @@ impl RouteCtx {
         pname: &[u32; 4],
         is_wan: u8,
         dscp: u8,
-    ) -> Result<(), i32> {
+    ) -> Result<(), c_long> {
         let match_type: MatchType = match MatchType::from_u8(match_set.match_type) {
             Some(mt) => mt,
             None => {
                 self.result = -EINVAL as i64;
-                return Err(1);
+                return Err(MATCH_ERR);
             }
         };
 
@@ -327,7 +340,7 @@ impl RouteCtx {
 
             _ => {
                 self.result = -EINVAL as i64;
-                return Err(1);
+                return Err(MATCH_ERR);
             }
         }
 
@@ -336,8 +349,8 @@ impl RouteCtx {
 
     /// Rule finalization: corresponds to C's `route_finalize_match`.
     ///
-    /// Returns `0` to continue to the next `match_set`, and `1` when a rule
-    /// has matched and `self.result` has been set.
+    /// Returns `LOOP_CONTINUE` to continue to the next `match_set`, and
+    /// `LOOP_BREAK` when a rule has matched and `self.result` has been set.
     #[inline(always)]
     pub fn finalize_match(&mut self, match_set: &MatchSet) -> i32 {
         let match_outbound = match_set.outbound;
@@ -366,19 +379,19 @@ impl RouteCtx {
                         self.result = (OUTBOUND_CONTROL_PLANE_ROUTING as i64)
                             | ((match_set.mark as i64) << 8)
                             | ((must as i64) << 40);
-                        return 1;
+                        return LOOP_BREAK;
                     }
 
                     self.result = (match_outbound as i64)
                         | ((match_set.mark as i64) << 8)
                         | ((must as i64) << 40);
-                    return 1;
+                    return LOOP_BREAK;
                 }
             }
             self.route_state &= !(RouteStateFlags::BadRule as u8);
         }
 
-        0
+        LOOP_CONTINUE
     }
 
     /// Load this flow's group bitmap from ROUTING_META_MAP into
@@ -429,7 +442,7 @@ impl RouteCtx {
 
         if index >= MAX_MATCH_SET_LEN as u32 {
             self.result = -EFAULT as i64;
-            return 1;
+            return LOOP_BREAK;
         }
 
         // Group pre-filter: skip MatchSets that do not belong to this
@@ -446,7 +459,7 @@ impl RouteCtx {
         let word = (safe_index / 32) as usize;
         let bit = safe_index % 32;
         if ((self.group_bitmap[word] >> bit) & 1) == 0 {
-            return 0;
+            return LOOP_CONTINUE;
         }
 
         let k = index;
@@ -455,7 +468,7 @@ impl RouteCtx {
             Some(ms) => ms,
             None => {
                 self.result = -EFAULT as i64;
-                return 1;
+                return LOOP_BREAK;
             }
         };
 
@@ -479,7 +492,7 @@ impl RouteCtx {
                 .is_err()
             {
                 // eval_match has already set self.result to the error code.
-                return 1;
+                return LOOP_BREAK;
             }
         }
 

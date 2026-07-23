@@ -6,6 +6,7 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
     loop {}
 }
 
+pub mod action;
 pub mod cgroup;
 pub mod compat;
 pub mod contrack;

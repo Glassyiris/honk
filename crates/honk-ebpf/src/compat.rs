@@ -7,14 +7,20 @@
 
 use aya_ebpf::{macros::sock_ops, programs::SockOpsContext};
 
+/// sock_ops verdict: allow the operation.
+const BPF_OK: u32 = 0;
+
 #[sock_ops]
 pub fn tproxy_sockops(_ctx: SockOpsContext) -> u32 {
-    0 // BPF_OK
+    BPF_OK
 }
 
 use aya_ebpf::{macros::sk_msg, programs::SkMsgContext};
 
+/// sk_msg verdict: deliver to the socket without redirect.
+const SK_PASS: u32 = 1;
+
 #[sk_msg]
 pub fn tproxy_sk_msg_redir(_ctx: SkMsgContext) -> u32 {
-    1 // SK_PASS
+    SK_PASS
 }

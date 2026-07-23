@@ -14,6 +14,9 @@ use honk_ebpf_common::redirect_need::PIDName;
 
 use crate::maps::COOKIE_PID_MAP;
 
+/// Cgroup program verdict: allow the operation.
+const CGROUP_ALLOW: i32 = 1;
+
 /// Populate a `PIDName` with current process name and TGID.
 #[inline(always)]
 fn get_pid_pname(pid_pname: &mut PIDName) -> i32 {
@@ -77,7 +80,7 @@ fn update_map_elem_by_cookie(cookie: u64) -> i32 {
 pub fn tproxy_wan_cg_sock_create(ctx: SockContext) -> i32 {
     let cookie = unsafe { bpf_get_socket_cookie(ctx.sock as *mut aya_ebpf_cty::c_void) };
     update_map_elem_by_cookie(cookie);
-    1
+    CGROUP_ALLOW
 }
 
 #[cgroup_sock(sock_release)]
@@ -86,33 +89,33 @@ pub fn tproxy_wan_cg_sock_release(ctx: SockContext) -> i32 {
     if cookie != 0 {
         let _ = COOKIE_PID_MAP.remove(cookie);
     }
-    1
+    CGROUP_ALLOW
 }
 
 #[cgroup_sock_addr(connect4)]
 pub fn tproxy_wan_cg_connect4(ctx: SockAddrContext) -> i32 {
     let cookie = unsafe { bpf_get_socket_cookie(ctx.sock_addr as *mut aya_ebpf_cty::c_void) };
     update_map_elem_by_cookie(cookie);
-    1
+    CGROUP_ALLOW
 }
 
 #[cgroup_sock_addr(connect6)]
 pub fn tproxy_wan_cg_connect6(ctx: SockAddrContext) -> i32 {
     let cookie = unsafe { bpf_get_socket_cookie(ctx.sock_addr as *mut aya_ebpf_cty::c_void) };
     update_map_elem_by_cookie(cookie);
-    1
+    CGROUP_ALLOW
 }
 
 #[cgroup_sock_addr(sendmsg4)]
 pub fn tproxy_wan_cg_sendmsg4(ctx: SockAddrContext) -> i32 {
     let cookie = unsafe { bpf_get_socket_cookie(ctx.sock_addr as *mut aya_ebpf_cty::c_void) };
     update_map_elem_by_cookie(cookie);
-    1
+    CGROUP_ALLOW
 }
 
 #[cgroup_sock_addr(sendmsg6)]
 pub fn tproxy_wan_cg_sendmsg6(ctx: SockAddrContext) -> i32 {
     let cookie = unsafe { bpf_get_socket_cookie(ctx.sock_addr as *mut aya_ebpf_cty::c_void) };
     update_map_elem_by_cookie(cookie);
-    1
+    CGROUP_ALLOW
 }
