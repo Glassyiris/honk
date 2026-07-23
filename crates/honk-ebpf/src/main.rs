@@ -8,7 +8,6 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 
 pub mod action;
 pub mod cgroup;
-pub mod compat;
 pub mod contrack;
 pub mod egress;
 pub mod errno;
