@@ -377,15 +377,16 @@ pub fn build_dns_connector(
     })
 }
 
-/// ALPN wire advertising plain HTTP/1.1 only.
-const HTTP1_ALPN_WIRE: &[u8] = b"\x08http/1.1";
+/// ALPN wire offering HTTP/2 with HTTP/1.1 fallback (Chrome / Go-client
+/// style: the server picks).
+const PROBE_ALPN_WIRE: &[u8] = b"\x02h2\x08http/1.1";
 
-/// Connector for urltest-style HTTP/1.1 probes. Never offers h2 — even in
-/// Chrome mode, where the browser profile would — because the probe speaks a
-/// minimal HTTP/1.1 `HEAD` and a server answering h2 frames breaks it (this
-/// was the "every delay test fails" bug: gstatic negotiated h2 via ALPN).
-pub fn build_http1_connector(skip_cert_verify: bool) -> anyhow::Result<TlsConnector> {
-    build_dns_connector(skip_cert_verify, HTTP1_ALPN_WIRE)
+/// Connector for urltest-style latency probes. Offers `h2,http/1.1` — the
+/// probe dispatches on the negotiated protocol (HTTP/1.1 HEAD or a real H2
+/// session), so h2-only and h2-preferring endpoints (gstatic & co.) work,
+/// and in Chrome mode the offer matches the browser fingerprint anyway.
+pub fn build_http_probe_connector(skip_cert_verify: bool) -> anyhow::Result<TlsConnector> {
+    build_dns_connector(skip_cert_verify, PROBE_ALPN_WIRE)
 }
 
 #[cfg(test)]
@@ -560,13 +561,13 @@ mod tests {
         assert!(msg.contains("ECH_REJECTED"), "unexpected error: {msg}");
     }
 
-    /// The urltest probe connector must never offer h2 — even in Chrome
-    /// mode — or an h2-capable server breaks the HTTP/1.1 HEAD probe.
+    /// The urltest probe connector offers `h2,http/1.1` and honors the
+    /// server's pick in both directions (the probe handles either).
     #[tokio::test]
-    async fn http1_connector_never_negotiates_h2() {
+    async fn probe_connector_negotiates_h2_and_http1() {
         use boring::ssl::AlpnError;
 
-        fn spawn_alpn_server(cert_pem: &str, key_pem: &str) -> u16 {
+        fn spawn_alpn_server(cert_pem: &str, key_pem: &str, prefer_h2: bool) -> u16 {
             let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
             acceptor
                 .set_certificate(&X509::from_pem(cert_pem.as_bytes()).unwrap())
@@ -574,22 +575,26 @@ mod tests {
             acceptor
                 .set_private_key(&PKey::private_key_from_pem(key_pem.as_bytes()).unwrap())
                 .unwrap();
-            // Server prefers h2, falls back to http/1.1.
-            acceptor.set_alpn_select_callback(|_ssl, protos| {
+            acceptor.set_alpn_select_callback(move |_ssl, protos| {
                 let mut i = 0;
-                let mut http11 = None;
+                let (mut h2, mut http11) = (None, None);
                 while i < protos.len() {
                     let n = protos[i] as usize;
                     let p = &protos[i + 1..i + 1 + n];
                     if p == b"h2" {
-                        return Ok(b"h2");
+                        h2 = Some(p);
                     }
                     if p == b"http/1.1" {
                         http11 = Some(p);
                     }
                     i += 1 + n;
                 }
-                http11.ok_or(AlpnError::NOACK)
+                if prefer_h2 {
+                    h2.or(http11).ok_or(AlpnError::NOACK)
+                } else {
+                    // h1-only server: refuses anything else.
+                    http11.ok_or(AlpnError::NOACK)
+                }
             });
             let acceptor = acceptor.build();
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -606,9 +611,25 @@ mod tests {
 
         for chrome in [false, true] {
             set_tls_mode(if chrome { "utls" } else { "tls" });
+
+            // h2-preferring server: probe must negotiate h2.
             let (cert, key) = server_cert();
-            let port = spawn_alpn_server(&cert, &key);
-            let connector = build_http1_connector(true).unwrap();
+            let port = spawn_alpn_server(&cert, &key, true);
+            let connector = build_http_probe_connector(true).unwrap();
+            let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let stream = connector.connect("localhost", tcp).await.unwrap();
+            assert_eq!(
+                stream.ssl().selected_alpn_protocol(),
+                Some(b"h2".as_slice()),
+                "chrome={chrome}: probe must take h2 when the server prefers it"
+            );
+
+            // h1-only server: probe must fall back to http/1.1.
+            let (cert, key) = server_cert();
+            let port = spawn_alpn_server(&cert, &key, false);
+            let connector = build_http_probe_connector(true).unwrap();
             let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
                 .await
                 .unwrap();
@@ -616,25 +637,8 @@ mod tests {
             assert_eq!(
                 stream.ssl().selected_alpn_protocol(),
                 Some(b"http/1.1".as_slice()),
-                "chrome={chrome}: urltest connector must negotiate http/1.1"
+                "chrome={chrome}: probe must fall back to http/1.1"
             );
-
-            // Contrast: the node connector in Chrome mode offers h2 and the
-            // h2-preferring server takes it (the urltest bug's trigger).
-            if chrome {
-                let (cert2, key2) = server_cert();
-                let port2 = spawn_alpn_server(&cert2, &key2);
-                let connector2 = build_connector(&test_node()).unwrap();
-                let tcp2 = tokio::net::TcpStream::connect(("127.0.0.1", port2))
-                    .await
-                    .unwrap();
-                let stream2 = connector2.connect("localhost", tcp2).await.unwrap();
-                assert_eq!(
-                    stream2.ssl().selected_alpn_protocol(),
-                    Some(b"h2".as_slice()),
-                    "chrome node connector must offer h2 (precondition of the bug)"
-                );
-            }
         }
     }
 
