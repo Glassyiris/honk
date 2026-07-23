@@ -387,7 +387,7 @@ impl ControlPlaneHandle {
             let router = self.router.read().await;
             router
                 .route_full(&conn_info)
-                .map(|m| m.rule_display.to_string())
+                .map(|m| (m.rule_type.to_string(), m.rule_payload.to_string()))
         };
 
         // Clash mode override (Direct/Global); no-op when the clash API is
@@ -825,18 +825,13 @@ impl ControlPlaneHandle {
         let dscp_val = handoff.as_ref().map(|ho| ho.dscp).unwrap_or(0);
 
         let conn_id = uuid::Uuid::new_v4().to_string();
-        // Clash-shaped matched rule + dial chain for /connections: `rule` is
-        // the dae rule expression ("Match" = fallback), `chains` is the
-        // selection path leaf-first ([leaf, ..sub-groups.., topGroup]).
-        let (rule, rule_payload) = match &matched_rule {
-            Some(name) => (
-                name.clone(),
-                domain
-                    .clone()
-                    .unwrap_or_else(|| resolved_target.ip().to_string()),
-            ),
-            None => ("Match".to_string(), String::new()),
-        };
+        // Clash-shaped matched rule + dial chain for /connections: rule and
+        // rulePayload describe the RULE (type + own payload, "Match" =
+        // fallback), while metadata.host keeps the connection's domain.
+        // chains is the selection path leaf-first ([leaf, .., topGroup]).
+        let (rule, rule_payload) = matched_rule
+            .clone()
+            .unwrap_or_else(|| ("Match".to_string(), String::new()));
         let chains = {
             let gm = self.group_manager.read();
             let mut chain = gm.selection_chain(&outbound_name);

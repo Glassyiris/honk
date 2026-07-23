@@ -13,9 +13,11 @@ pub(crate) use lpm::BinaryLpmTrie;
 #[derive(Debug, Clone)]
 pub struct CompiledRoute {
     pub name: String,
-    /// dae-style rendering of the condition (`display_expr`), for the
-    /// clash `/connections` rule field and logs.
-    pub display: String,
+    /// Clash-style matched-rule type and payload (`clash_rule_parts`),
+    /// e.g. ("GeoIP", "telegram") — the rule's own payload, not the
+    /// connection's domain/IP.
+    pub rule_type: String,
+    pub rule_payload: String,
     pub priority: u32,
     pub domain_patterns: Vec<Regex>,
     pub domain_suffixes: Vec<String>,
@@ -250,9 +252,16 @@ impl Router {
                 }
             };
 
+            let (rule_type, rule_payload) = rule
+                .condition
+                .clash_rule_parts()
+                .map(|(t, p)| (t.to_string(), p))
+                .unwrap_or_else(|| ("Match".to_string(), String::new()));
+
             compiled.push(CompiledRoute {
                 name: rule.name.clone(),
-                display: rule.condition.display_expr(),
+                rule_type,
+                rule_payload,
                 priority: rule.priority,
                 domain_patterns,
                 domain_suffixes: rule.condition.domain_suffix.clone(),
@@ -326,7 +335,8 @@ impl Router {
                 return Some(RouteMatch {
                     outbound_name: &route.outbound,
                     rule_name: &route.name,
-                    rule_display: &route.display,
+                    rule_type: &route.rule_type,
+                    rule_payload: &route.rule_payload,
                     must: route.must,
                     mark: route.mark,
                 });
@@ -379,7 +389,8 @@ impl Router {
                 return Some(RouteMatch {
                     outbound_name: &route.outbound,
                     rule_name: &route.name,
-                    rule_display: &route.display,
+                    rule_type: &route.rule_type,
+                    rule_payload: &route.rule_payload,
                     must: route.must,
                     mark: route.mark,
                 });
@@ -535,8 +546,9 @@ pub struct RouteResult {
 pub struct RouteMatch<'a> {
     pub outbound_name: &'a str,
     pub rule_name: &'a str,
-    /// dae-style rendering of the matched rule's condition (display).
-    pub rule_display: &'a str,
+    /// Clash-style matched-rule type and payload.
+    pub rule_type: &'a str,
+    pub rule_payload: &'a str,
     pub must: bool,
     pub mark: u32,
 }

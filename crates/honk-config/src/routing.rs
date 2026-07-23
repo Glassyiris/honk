@@ -125,6 +125,38 @@ impl RoutingCondition {
         }
         parts.join(" && ")
     }
+
+    /// Clash-style `(rule, rulePayload)` pair for the matched rule: the
+    /// rule's OWN type and payload (e.g. `("GeoIP", "telegram")`), NOT the
+    /// connection's domain/IP — `/connections` `metadata.host` already
+    /// carries that. First non-empty condition kind wins (declaration order
+    /// below matches typical dae rule shape); multi-value payloads are
+    /// comma-joined. Returns `None` for a condition-less rule (fallback
+    /// renders as `Match`).
+    pub fn clash_rule_parts(&self) -> Option<(&'static str, String)> {
+        let pick = |ty: &'static str, vals: &[String]| {
+            if vals.is_empty() {
+                None
+            } else {
+                Some((ty, vals.join(",")))
+            }
+        };
+        pick("Domain", &self.domain)
+            .or_else(|| pick("DomainSuffix", &self.domain_suffix))
+            .or_else(|| pick("DomainKeyword", &self.domain_keyword))
+            .or_else(|| pick("DomainRegex", &self.domain_regex))
+            .or_else(|| pick("GeoSite", &self.geosite))
+            .or_else(|| pick("IpCidr", &self.ip))
+            .or_else(|| pick("GeoIP", &self.geo_ip))
+            .or_else(|| pick("SrcIpCidr", &self.source_ip))
+            .or_else(|| pick("DstPort", &self.port))
+            .or_else(|| pick("SrcPort", &self.source_port))
+            .or_else(|| pick("Protocol", &self.protocol))
+            .or_else(|| pick("ProcessName", &self.process_name))
+            .or_else(|| pick("SourceMac", &self.mac))
+            .or_else(|| pick("IPVersion", &self.ip_version))
+            .or_else(|| pick("Dscp", &self.dscp))
+    }
 }
 
 /// Outbound target for routing.
@@ -178,5 +210,43 @@ impl Default for RoutingConfig {
             rules: vec![],
             default_outbound: "direct".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clash_rule_parts_picks_first_condition_kind() {
+        let cond = RoutingCondition {
+            geosite: vec!["category-dev".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            cond.clash_rule_parts(),
+            Some(("GeoSite", "category-dev".to_string()))
+        );
+
+        let cond = RoutingCondition {
+            ip: vec!["1.0.0.0/8".into()],
+            geo_ip: vec!["telegram".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            cond.clash_rule_parts(),
+            Some(("IpCidr", "1.0.0.0/8".to_string()))
+        );
+
+        let cond = RoutingCondition {
+            port: vec!["22".into(), "80".into(), "443".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            cond.clash_rule_parts(),
+            Some(("DstPort", "22,80,443".to_string()))
+        );
+
+        assert_eq!(RoutingCondition::default().clash_rule_parts(), None);
     }
 }
