@@ -484,7 +484,6 @@ impl ControlPlaneHandle {
                 client_addr,
                 original_dst,
             );
-            self.stats.record_connection(&outbound_name);
             self.stats.record_close(&outbound_name);
             return Ok(());
         }
@@ -504,6 +503,7 @@ impl ControlPlaneHandle {
                 self.alive_set.notify_check_tcp(&node_name);
             }
             self.stats.record_error(&outbound_name);
+            self.stats.record_close(&outbound_name);
             return Ok(());
         }
 
@@ -814,6 +814,9 @@ impl ControlPlaneHandle {
                             );
                         }
                     }
+                    // Per-candidate failures already counted as errors above;
+                    // only balance the active-connections counter here.
+                    self.stats.record_close(&outbound_name);
                     return Ok(());
                 }
             }
@@ -882,6 +885,7 @@ impl ControlPlaneHandle {
             if let Err(e) = proxy_stream.stream.write_all(&sniff_result.buffered).await {
                 warn!("Failed to write sniffed bytes to proxy: {}", e);
                 self.stats.record_error(&outbound_name);
+                self.stats.record_close(&outbound_name);
                 self.connection_tracker.remove(&conn_id);
                 return Ok(());
             }
@@ -1006,6 +1010,7 @@ impl ControlPlaneHandle {
                     );
                 }
                 self.stats.record_error(&outbound_name);
+                self.stats.record_close(&outbound_name);
             }
         }
 
@@ -1235,6 +1240,7 @@ impl ControlPlaneHandle {
                 self.alive_set.notify_check_tcp(&node_name);
             }
             self.stats.record_error(&outbound_name);
+            self.stats.record_close(&outbound_name);
             return Ok(());
         }
 
@@ -1311,6 +1317,7 @@ impl ControlPlaneHandle {
             debug!("All {} UDP candidate(s) failed: {}", candidates.len(), e);
         }
         self.stats.record_error(&outbound_name);
+        self.stats.record_close(&outbound_name);
         Ok(())
     }
 
