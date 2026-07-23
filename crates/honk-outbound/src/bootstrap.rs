@@ -224,11 +224,12 @@ fn parse_https_rr_ech(msg: &[u8]) -> Option<(Vec<u8>, u32)> {
     None
 }
 
-/// Parse SVCB/HTTPS RDATA for the `ech` SvcParam (key 5). ServiceMode only:
-/// priority 0; the target name follows, then key=len=value pairs.
+/// Parse SVCB/HTTPS RDATA for the `ech` SvcParam (key 5). Only ServiceMode
+/// records (SvcPriority >= 1) carry SvcParams; AliasMode (priority 0) has
+/// just a TargetName and is skipped.
 fn parse_svcb_ech_param(rdata: &[u8]) -> Option<Vec<u8>> {
     let priority = u16::from_be_bytes([rdata[0], rdata[1]]);
-    if priority != 0 {
+    if priority == 0 {
         return None; // AliasMode has no SvcParams
     }
     let mut pos = skip_name(rdata, 2).ok()?;
@@ -449,19 +450,21 @@ mod tests {
     fn test_parse_https_rr_ech() {
         let query = build_query("example.com", 65);
         let ech = b"\x00\x01fake-ech-config";
-        let resp = make_https_response(&query, 0, Some(ech), 300);
+        // ServiceMode (priority >= 1) with an ech param.
+        let resp = make_https_response(&query, 1, Some(ech), 300);
         assert_eq!(
             parse_https_rr_ech(&resp),
             Some((ech.to_vec(), 300)),
             "ServiceMode HTTPS RR with ech param"
         );
 
-        // AliasMode (priority != 0) carries no SvcParams — skipped.
-        let resp = make_https_response(&query, 1, Some(ech), 300);
+        // AliasMode (priority 0) carries no SvcParams — skipped even when
+        // bytes shaped like params follow (they are part of the TargetName).
+        let resp = make_https_response(&query, 0, Some(ech), 300);
         assert_eq!(parse_https_rr_ech(&resp), None);
 
         // ServiceMode without an ech param.
-        let resp = make_https_response(&query, 0, None, 300);
+        let resp = make_https_response(&query, 1, None, 300);
         assert_eq!(parse_https_rr_ech(&resp), None);
     }
 
@@ -477,7 +480,7 @@ mod tests {
         tokio::spawn(async move {
             let mut buf = [0u8; 512];
             let (n, peer) = server.recv_from(&mut buf).await.unwrap();
-            let resp = make_https_response(&buf[..n], 0, Some(ech), 120);
+            let resp = make_https_response(&buf[..n], 1, Some(ech), 120);
             server.send_to(&resp, peer).await.unwrap();
         });
 

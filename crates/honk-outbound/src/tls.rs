@@ -671,7 +671,7 @@ mod tests {
         resp.extend_from_slice(&65u16.to_be_bytes()); // TYPE HTTPS
         resp.extend_from_slice(&1u16.to_be_bytes()); // IN
         resp.extend_from_slice(&ttl.to_be_bytes());
-        let mut rdata = vec![0, 0, 0]; // priority 0, root target name
+        let mut rdata = vec![0, 1, 0]; // ServiceMode priority 1, root target name
         rdata.extend_from_slice(&5u16.to_be_bytes()); // SvcParam key ech
         rdata.extend_from_slice(&(ech.len() as u16).to_be_bytes());
         rdata.extend_from_slice(ech);
