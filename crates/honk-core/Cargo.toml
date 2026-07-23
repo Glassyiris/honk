@@ -118,7 +118,7 @@ rcgen.workspace = true
 tokio-rustls.workspace = true
 rustls-pemfile.workspace = true
 webpki-roots.workspace = true
-criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
+criterion = { version = "0.8", features = ["async_tokio", "html_reports"] }
 futures-util = "0.3"
 
 [[bench]]

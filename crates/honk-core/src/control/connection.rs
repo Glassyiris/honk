@@ -474,7 +474,7 @@ impl ControlPlaneHandle {
                 })
                 .unwrap_or(false);
         if ebpf_offload {
-            info!(
+            debug!(
                 network = "tcp",
                 outbound = %outbound_name,
                 ip = %original_dst,
@@ -869,7 +869,7 @@ impl ControlPlaneHandle {
                 network: "tcp".to_string(),
             });
 
-        info!(
+        debug!(
             network = "tcp",
             outbound = %outbound_name,
             dialer = %node.name,
