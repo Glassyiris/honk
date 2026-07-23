@@ -60,18 +60,8 @@ fn skb_ifindex(ctx: &TcContext) -> u32 {
 }
 
 #[inline(always)]
-pub(crate) fn skb_protocol(ctx: &TcContext) -> u16 {
-    unsafe { (*ctx.skb.skb).protocol as u16 }
-}
-
-#[inline(always)]
 fn skb_mark(ctx: &TcContext) -> u32 {
     unsafe { (*ctx.skb.skb).mark }
-}
-
-#[inline(always)]
-fn skb_set_mark(ctx: &TcContext, mark: u32) {
-    ctx.skb.set_mark(mark);
 }
 
 const DOMAIN_DNS: u32 = 1;
@@ -100,7 +90,7 @@ pub fn wan_outbound_is_alive(ctx: &TcContext, outbound: u8, l4proto: u8, dport: 
         _ => DOMAIN_DEFAULT,
     };
 
-    let proto = skb_protocol(ctx);
+    let proto = ctx.skb.protocol() as u16;
     let ip_idx: u32 = if proto == ETH_P_IP.to_be() { 0 } else { 1 };
 
     let key: u32 = (outbound as u32)
@@ -202,7 +192,7 @@ pub fn prep_redirect_to_control_plane(
 
     if !use_redirect_peer {
         if link_h_len == 0 {
-            let l3proto = skb_protocol(ctx);
+            let l3proto = ctx.skb.protocol() as u16;
             let zero_mac: [u8; 6] = [0; 6];
             let ret =
                 unsafe { bpf_skb_change_head(ctx.skb.skb, mem::size_of::<EthHdr>() as u32, 0) };
@@ -238,7 +228,7 @@ pub fn prep_redirect_to_control_plane(
         }
     }
 
-    let proto = skb_protocol(ctx);
+    let proto = ctx.skb.protocol() as u16;
     let redirect_tuple = RedirectTuple::from_tuples_ip(&tuples.five, proto == ETH_P_IP.to_be());
 
     // Cached-flow throttle: skip the update while the existing entry is
@@ -404,7 +394,7 @@ fn do_tproxy_wan_egress_tcp(
         *scratch = unsafe { mem::zeroed() };
         scratch.flag[0] = 1u32; // L4ProtoType_TCP = 1
 
-        let proto = skb_protocol(ctx);
+        let proto = ctx.skb.protocol() as u16;
         scratch.flag[1] = if proto == ETH_P_IP.to_be() {
             4u32
         } else {
@@ -529,7 +519,7 @@ fn do_tproxy_wan_egress_tcp(
     }
 
     if outbound == OUTBOUND_DIRECT && mark == 0 {
-        skb_set_mark(ctx, mark);
+        ctx.set_mark(mark);
         return Err(TC_ACT_OK);
     } else if outbound == OUTBOUND_BLOCK {
         return Err(TC_ACT_SHOT);
@@ -668,7 +658,7 @@ fn do_tproxy_wan_egress_udp(
     *scratch = unsafe { mem::zeroed() };
     scratch.flag[0] = 2u32; // L4ProtoType_UDP = 2
 
-    let proto = skb_protocol(ctx);
+    let proto = ctx.skb.protocol() as u16;
     scratch.flag[1] = if proto == ETH_P_IP.to_be() {
         4u32
     } else {

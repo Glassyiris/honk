@@ -25,8 +25,7 @@ use aya_ebpf_bindings::{
         bpf_sock_tuple__bindgen_ty_1__bindgen_ty_2,
     },
     helpers::{
-        bpf_ktime_get_ns, bpf_map_lookup_elem, bpf_redirect, bpf_redirect_peer, bpf_sk_assign,
-        bpf_sk_lookup_tcp, bpf_sk_lookup_udp, bpf_sk_release, bpf_skb_load_bytes,
+        bpf_ktime_get_ns, bpf_redirect, bpf_redirect_peer, bpf_skb_load_bytes,
         bpf_skb_store_bytes,
     },
 };
@@ -47,7 +46,7 @@ use crate::{
         ROUTING_HANDOFF_MAP, ROUTING_META_MAP,
     },
     route::{RouteCtx, OUTBOUND_BLOCK, OUTBOUND_DIRECT},
-    routing::bpf_sock_is_dae_socket,
+    sk,
     transport::{parse_packet, ETH_HLEN, ETH_P_IP, ETH_P_IPV6, IPPROTO_TCP, IPPROTO_UDP},
 };
 
@@ -695,52 +694,24 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             // Skip socket lookup for SYN packets
             if !(pkt.tcph.syn() != 0 && pkt.tcph.ack() == 0) {
                 let param = PARAM.load();
-                let sk = unsafe {
-                    bpf_sk_lookup_tcp(
-                        ctx.skb.skb as *mut _,
-                        &mut tuple,
-                        tuple_size,
-                        param.dae_netns_id as u64,
-                        0,
-                    )
-                };
-                if !sk.is_null() {
-                    if !bpf_sock_is_dae_socket(sk as *const _) {
-                        let state = unsafe { (*sk).state };
-                        unsafe {
-                            bpf_sk_release(sk as *mut _);
-                        }
-                        // BPF_TCP_LISTEN = 10
-                        if state == 10 {
-                            return pass_through_classified(ctx);
-                        }
-                    } else {
-                        unsafe {
-                            bpf_sk_release(sk as *mut _);
-                        }
+                if let Some(probe) =
+                    sk::probe_tcp_socket(ctx, &mut tuple, tuple_size, param.dae_netns_id as u64)
+                {
+                    // A local (non-dae) LISTEN socket owns this destination:
+                    // NAT loopback — leave it to the kernel.
+                    // BPF_TCP_LISTEN = 10
+                    if !probe.is_dae_socket && probe.state == 10 {
+                        return pass_through_classified(ctx);
                     }
                 }
             }
         } else {
             let param = PARAM.load();
-            let sk = unsafe {
-                bpf_sk_lookup_udp(
-                    ctx.skb.skb as *mut _,
-                    &mut tuple,
-                    tuple_size,
-                    param.dae_netns_id as u64,
-                    0,
-                )
-            };
-            if !sk.is_null() {
-                if !bpf_sock_is_dae_socket(sk as *const _) {
-                    unsafe {
-                        bpf_sk_release(sk as *mut _);
-                    }
+            if let Some(probe) =
+                sk::probe_udp_socket(ctx, &mut tuple, tuple_size, param.dae_netns_id as u64)
+            {
+                if !probe.is_dae_socket {
                     return pass_through_classified(ctx);
-                }
-                unsafe {
-                    bpf_sk_release(sk as *mut _);
                 }
             }
         }
@@ -1031,9 +1002,10 @@ const KEY_UDP6: u32 = 3;
 ///
 /// Ported from Go dae's `assign_listener` in `control/kern/tproxy.c`.  Uses
 /// `bpf_sk_assign` via a SOCKMAP lookup — the same proven pattern employed by
-/// the `tproxy_sk_lookup` program in `sk_lookup.rs`.
+/// the `tproxy_sk_lookup` program in `sk_lookup.rs`, shared via
+/// [`sk::sk_assign_by_index`].
 #[inline(always)]
-fn assign_listener(ctx: &TcContext, listener_l4proto: u8) -> i32 {
+fn assign_listener(ctx: &TcContext, listener_l4proto: u8) -> Result<(), c_long> {
     // SockMap keys differentiate IPv4 vs IPv6 to match the per-family
     // listeners published by userspace.
     let is_v6 = unsafe { (*ctx.skb.skb).protocol as u16 } == ETH_P_IPV6.to_be();
@@ -1051,22 +1023,8 @@ fn assign_listener(ctx: &TcContext, listener_l4proto: u8) -> i32 {
         }
     };
 
-    let map_ptr = ptr::from_ref(&LISTEN_SOCKET_MAP)
-        .cast_mut()
-        .cast::<c_void>();
-    let sk = unsafe { bpf_map_lookup_elem(map_ptr, &key as *const u32 as *const c_void) };
-    if sk.is_null() {
-        return -1;
-    }
-
-    // In a TC classifier context the first argument is the __sk_buff pointer.
-    let ret = unsafe { bpf_sk_assign(ctx.skb.skb as *mut c_void, sk, 0) };
-
-    // The verifier requires releasing the socket reference to balance the
-    // lookup's implicit acquire.
-    unsafe { bpf_sk_release(sk) };
-
-    ret as i32
+    let map_ptr = ptr::from_ref(&LISTEN_SOCKET_MAP).cast::<c_void>();
+    sk::sk_assign_by_index(ctx, map_ptr, &key, 0)
 }
 
 // #[inline(never)]: standalone program, no deep call chain.

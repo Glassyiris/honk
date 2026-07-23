@@ -19,6 +19,7 @@ pub mod maps;
 pub mod outbound;
 pub mod route;
 pub mod routing;
+pub mod sk;
 pub mod sk_lookup;
 pub mod stats;
 pub mod transport;
