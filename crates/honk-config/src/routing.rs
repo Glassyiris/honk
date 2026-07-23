@@ -151,7 +151,7 @@ impl RoutingCondition {
             .or_else(|| pick("src_ip", &self.source_ip))
             .or_else(|| pick("dport", &self.port))
             .or_else(|| pick("sport", &self.source_port))
-            .or_else(|| pick("protocal", &self.protocol))
+            .or_else(|| pick("protocol", &self.protocol))
             .or_else(|| pick("process", &self.process_name))
             .or_else(|| pick("smac", &self.mac))
             .or_else(|| pick("ip_version", &self.ip_version))
@@ -225,7 +225,7 @@ mod tests {
         };
         assert_eq!(
             cond.clash_rule_parts(),
-            Some(("GeoSite", "category-dev".to_string()))
+            Some(("geosite", "category-dev".to_string()))
         );
 
         let cond = RoutingCondition {
@@ -235,7 +235,7 @@ mod tests {
         };
         assert_eq!(
             cond.clash_rule_parts(),
-            Some(("IpCidr", "1.0.0.0/8".to_string()))
+            Some(("dip", "1.0.0.0/8".to_string()))
         );
 
         let cond = RoutingCondition {
@@ -244,7 +244,7 @@ mod tests {
         };
         assert_eq!(
             cond.clash_rule_parts(),
-            Some(("DstPort", "22,80,443".to_string()))
+            Some(("dport", "22,80,443".to_string()))
         );
 
         assert_eq!(RoutingCondition::default().clash_rule_parts(), None);
