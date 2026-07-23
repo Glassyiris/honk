@@ -159,6 +159,7 @@ impl UdpEndpoint {
         self.has_reply.load(Ordering::Relaxed)
     }
 
+    #[allow(dead_code)]
     pub fn acquire(&self) -> bool {
         if self.dead.load(Ordering::Acquire) {
             return false;
@@ -334,7 +335,11 @@ impl UdpEndpointPool {
             dashmap::mapref::entry::Entry::Occupied(mut occ) => {
                 let existing = occ.get();
                 if !existing.dead.load(Ordering::Acquire) {
-                    existing.acquire();
+                    // NB: no acquire() here — the endpoint's single ref is
+                    // owned by its reply handler (released when the handler
+                    // exits after REPLY_IDLE_TIMEOUT). Acquiring per packet
+                    // without a matching release pinned every reused
+                    // endpoint in the pool forever (the UDP socket leak).
                     existing.refresh();
                     return (Arc::clone(existing), false);
                 }
