@@ -41,13 +41,52 @@ dns {
     upstream {
         alidns: 'udp://dns.alidns.com:53'
         googledns: 'tcp+udp://dns.google:53'
+        cloudflare_dot: 'tls://1.1.1.1:853'
+        google_doh: 'https://dns.google/dns-query'
+        cf_h3: 'h3://cloudflare-dns.com/dns-query'
+        adguard_doq: 'quic://dns.adguard-dns.com'
+        proxied: 'tcp://8.8.8.8:53' -> proxy
+        google_via: 'https://dns.google/dns-query' -> proxy
+        legacy_out: 'tcp://1.1.1.1:53' outbound: oldproxy
     }
 }
 "#;
         let config = parse_dae_config(input).unwrap();
-        assert_eq!(config.dns.upstream.len(), 2);
+        assert_eq!(config.dns.upstream.len(), 9);
         assert_eq!(config.dns.upstream[0].name, "alidns");
         assert_eq!(config.dns.upstream[1].name, "googledns");
+
+        let dot = &config.dns.upstream[2];
+        assert_eq!(dot.protocol, crate::types::DnsProtocol::Tls);
+        assert_eq!(dot.address, "1.1.1.1:853");
+        // IP literal → no SNI derived from host.
+        assert_eq!(dot.tls_server_name, None);
+
+        let doh = &config.dns.upstream[3];
+        assert_eq!(doh.protocol, crate::types::DnsProtocol::Https);
+        assert_eq!(doh.address, "dns.google/dns-query");
+        assert_eq!(doh.tls_server_name.as_deref(), Some("dns.google"));
+
+        let h3 = &config.dns.upstream[4];
+        assert_eq!(h3.protocol, crate::types::DnsProtocol::H3);
+        assert_eq!(h3.tls_server_name.as_deref(), Some("cloudflare-dns.com"));
+
+        let doq = &config.dns.upstream[5];
+        assert_eq!(doq.protocol, crate::types::DnsProtocol::Quic);
+        assert_eq!(doq.tls_server_name.as_deref(), Some("dns.adguard-dns.com"));
+
+        let proxied = &config.dns.upstream[6];
+        assert_eq!(proxied.outbound.as_deref(), Some("proxy"));
+
+        let google_via = &config.dns.upstream[7];
+        assert_eq!(google_via.protocol, crate::types::DnsProtocol::Https);
+        assert_eq!(google_via.address, "dns.google/dns-query");
+        assert_eq!(google_via.outbound.as_deref(), Some("proxy"));
+        assert_eq!(google_via.tls_server_name.as_deref(), Some("dns.google"));
+
+        // Legacy `outbound:` still accepted.
+        let legacy = &config.dns.upstream[8];
+        assert_eq!(legacy.outbound.as_deref(), Some("oldproxy"));
     }
 
     #[test]
@@ -309,7 +348,8 @@ node {
         let config = parse_dae_config(input).unwrap();
         assert_eq!(config.nodes.len(), 1);
         let node = &config.nodes[0];
-        assert_eq!(node.name, "test-node");
+        // Named node key is the config name; URL fragment is not the name.
+        assert_eq!(node.name, "test_node");
         assert!(matches!(node.protocol, crate::types::NodeProtocol::AnyTLS));
         assert_eq!(node.host, "example.com");
         assert_eq!(node.port, 443);
@@ -414,4 +454,228 @@ fn test_group_tags_serde_string_and_array() {
         g.groups,
         vec!["hk".to_string(), "jp".to_string(), "sg".to_string()]
     );
+}
+
+// ---------------------------------------------------------------------------
+// DNS routing parser tests (new dae-shaped model)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_parse_dns_request_routing_qname() {
+    let input = r#"
+dns {
+    routing {
+        request {
+            qname(geosite:cn) -> alidns
+            fallback: default
+        }
+    }
+}
+"#;
+    let config = parse_dae_config(input).unwrap();
+    assert_eq!(config.dns.routing.request.rules.len(), 1);
+    let rule = &config.dns.routing.request.rules[0];
+    assert_eq!(rule.conditions.len(), 1);
+    match &rule.conditions[0] {
+        crate::dns::DnsCond::Qname { not, matchers } => {
+            assert!(!not);
+            assert_eq!(matchers.len(), 1);
+        }
+        _ => panic!("expected Qname condition"),
+    }
+    assert_eq!(
+        rule.action,
+        crate::dns::DnsRequestAction::Upstream("alidns".to_string())
+    );
+    // fallback synced to legacy field
+    assert_eq!(config.dns.routing.fallback, "default");
+}
+
+#[test]
+fn test_parse_dns_request_routing_qtype() {
+    let input = r#"
+dns {
+    routing {
+        request {
+            qtype(a, aaaa) -> alidns
+            qtype(https) -> reject
+        }
+    }
+}
+"#;
+    let config = parse_dae_config(input).unwrap();
+    assert_eq!(config.dns.routing.request.rules.len(), 2);
+    // First rule: qtype(a,aaaa) -> alidns
+    match &config.dns.routing.request.rules[0].conditions[0] {
+        crate::dns::DnsCond::Qtype { not, types } => {
+            assert!(!not);
+            assert!(types.contains(&1));
+            assert!(types.contains(&28));
+        }
+        _ => panic!("expected Qtype"),
+    }
+    // Second rule: qtype(https) -> reject
+    match &config.dns.routing.request.rules[1].conditions[0] {
+        crate::dns::DnsCond::Qtype { not, types } => {
+            assert!(!not);
+            assert!(types.contains(&65));
+        }
+        _ => panic!("expected Qtype"),
+    }
+    assert_eq!(
+        config.dns.routing.request.rules[1].action,
+        crate::dns::DnsRequestAction::Reject
+    );
+}
+
+#[test]
+fn test_parse_dns_request_routing_qname_and_qtype() {
+    let input = r#"
+dns {
+    routing {
+        request {
+            qname(suffix:cn) && qtype(a, aaaa) -> alidns
+            qname(full:block.test) -> reject
+        }
+    }
+}
+"#;
+    let config = parse_dae_config(input).unwrap();
+    assert_eq!(config.dns.routing.request.rules.len(), 2);
+    // First rule: AND of qname + qtype
+    assert_eq!(config.dns.routing.request.rules[0].conditions.len(), 2);
+    // Second rule: reject
+    assert_eq!(
+        config.dns.routing.request.rules[1].action,
+        crate::dns::DnsRequestAction::Reject
+    );
+}
+
+#[test]
+fn test_parse_dns_request_routing_negation() {
+    let input = r#"
+dns {
+    routing {
+        request {
+            !qname(geosite:cn) -> googledns
+        }
+    }
+}
+"#;
+    let config = parse_dae_config(input).unwrap();
+    assert_eq!(config.dns.routing.request.rules.len(), 1);
+    match &config.dns.routing.request.rules[0].conditions[0] {
+        crate::dns::DnsCond::Qname { not, .. } => {
+            assert!(*not);
+        }
+        _ => panic!("expected Qname"),
+    }
+}
+
+#[test]
+fn test_parse_dns_request_routing_reject_asis() {
+    let input = r#"
+dns {
+    routing {
+        request {
+            qname(keyword:ads) -> reject
+            qname(full:local.test) -> asis
+            fallback: default
+        }
+    }
+}
+"#;
+    let config = parse_dae_config(input).unwrap();
+    assert_eq!(config.dns.routing.request.rules.len(), 2);
+    assert_eq!(
+        config.dns.routing.request.rules[0].action,
+        crate::dns::DnsRequestAction::Reject
+    );
+    assert_eq!(
+        config.dns.routing.request.rules[1].action,
+        crate::dns::DnsRequestAction::AsIs
+    );
+}
+
+#[test]
+fn test_parse_ipversion_prefer_maps_to_prefer_variants() {
+    let config = parse_dae_config("dns {\n    ipversion_prefer: 4\n}\n").unwrap();
+    assert!(matches!(
+        config.dns.strategy,
+        crate::dns::DnsStrategy::PreferIpv4
+    ));
+    let config = parse_dae_config("dns {\n    ipversion_prefer: 6\n}\n").unwrap();
+    assert!(matches!(
+        config.dns.strategy,
+        crate::dns::DnsStrategy::PreferIpv6
+    ));
+}
+
+#[test]
+fn test_parse_dns_response_routing() {
+    let input = r#"
+dns {
+    routing {
+        response {
+            ip(geoip:private) && !qname(geosite:cn) -> accept
+            upstream(googledns) -> reject
+            fallback: accept
+        }
+    }
+}
+"#;
+    let config = parse_dae_config(input).unwrap();
+    assert_eq!(config.dns.routing.response.rules.len(), 2);
+    // First rule
+    let rule0 = &config.dns.routing.response.rules[0];
+    assert_eq!(rule0.conditions.len(), 2);
+    assert_eq!(rule0.action, crate::dns::DnsResponseAction::Accept);
+    // Second rule
+    let rule1 = &config.dns.routing.response.rules[1];
+    match &rule1.conditions[0] {
+        crate::dns::DnsCond::Upstream { not, names } => {
+            assert!(!not);
+            assert!(names.contains(&"googledns".to_string()));
+        }
+        _ => panic!("expected Upstream"),
+    }
+    assert_eq!(rule1.action, crate::dns::DnsResponseAction::Reject);
+}
+
+#[test]
+fn test_parse_fixed_domain_ttl() {
+    let input = r#"
+dns {
+    fixed_domain_ttl {
+        a.test: 0
+        b.test: 300
+        c.test: 60
+    }
+}
+"#;
+    let config = parse_dae_config(input).unwrap();
+    assert_eq!(config.dns.fixed_domain_ttl.get("a.test"), Some(&0u32));
+    assert_eq!(config.dns.fixed_domain_ttl.get("b.test"), Some(&300u32));
+    assert_eq!(config.dns.fixed_domain_ttl.get("c.test"), Some(&60u32));
+}
+
+#[test]
+fn test_parse_dns_request_ignores_sub() {
+    let input = r#"
+dns {
+    routing {
+        request {
+            qname(geosite:cn) -> alidns
+            sub(whatever) -> reject
+        }
+    }
+}
+"#;
+    let config = parse_dae_config(input).unwrap();
+    // sub() rule should be ignored, only the qname rule remains
+    assert_eq!(config.dns.routing.request.rules.len(), 1);
+    match &config.dns.routing.request.rules[0].conditions[0] {
+        crate::dns::DnsCond::Qname { .. } => {}
+        _ => panic!("expected Qname"),
+    }
 }

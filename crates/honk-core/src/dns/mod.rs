@@ -4,32 +4,36 @@
 //!
 //! - `routing` — DNS request routing (domain → upstream)
 //! - `cache` — DNS response cache with LRU and TTL
-//! - `upstream_pool` — Per-upstream DNS query management
-//! - `listener` — UDP/TCP DNS listener (intercepts local DNS)
+//! - `endpoint` — upstream address / SNI / path parsing
+//! - `transport` — pooled UDP/TCP/DoT/DoH/DoQ/DoH3 clients
+//! - `upstream_pool` — per-upstream DNS query management
+//! - `listener` — UDP/TCP DNS listener (standalone; production uses TPROXY)
 //! - `forwarder` — DNS forwarding engine (cache + upstream + routing)
-//! - `persist` — Optional cache.db persistence for DNS answers
+//! - `persist` — optional cache.db persistence for DNS answers
 //!
-//! ## Legacy
+//! ## `DnsResolver`
 //!
-//! The `DnsResolver` wraps hickory-resolver for simple resolution.
+//! Application-level domain → IP helper used by the control plane (SNI
+//! reality checks, etc.). Always resolves through a [`DnsForwarder`] so
+//! the same upstream stack (including encrypted DNS and `outbound:`) is
+//! shared with intercepted client queries. There is no separate stub
+//! resolver dependency.
 
 pub mod cache;
+pub mod endpoint;
 pub mod forwarder;
 pub mod persist;
 pub mod routing;
+pub mod transport;
 pub mod upstream_pool;
 
 pub mod listener;
 
-use hickory_resolver::Resolver;
-use hickory_resolver::TokioResolver;
-use hickory_resolver::config::*;
-use hickory_resolver::net::runtime::TokioRuntimeProvider;
-use honk_config::dns::{DnsConfig, DnsStrategy, DnsUpstream};
-use honk_config::types::DnsProtocol;
-use std::net::{IpAddr, SocketAddr};
+use honk_config::dns::{DnsConfig, DnsUpstream};
+use std::net::IpAddr;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::debug;
 
 /// A resolved DNS result.
@@ -44,101 +48,77 @@ pub struct ResolvedAddr {
 }
 
 /// DNS resolver for honk-core.
+///
+/// Always backs onto a [`forwarder::DnsForwarder`] (built from config or
+/// injected). A small process-local domain cache sits in front to avoid
+/// re-issuing A+AAAA pairs for hot names.
 pub struct DnsResolver {
-    /// Hickory DNS resolver
-    resolver: TokioResolver,
-    /// DNS configuration
+    /// DNS configuration (routing helpers, strategy)
     config: DnsConfig,
-    /// In-memory cache for fast lookups
+    /// In-memory cache for fast domain lookups (application layer)
     cache: Arc<RwLock<lru::LruCache<String, (ResolvedAddr, std::time::Instant)>>>,
-    /// Optional DNS forwarder used to route queries through proxy outbounds.
-    forwarder: Option<Arc<crate::dns::forwarder::DnsForwarder>>,
+    /// Upstream wire-format forwarder (UDP/TCP/DoT/DoH/DoQ/DoH3)
+    forwarder: Arc<crate::dns::forwarder::DnsForwarder>,
 }
 
 impl DnsResolver {
-    /// Create a new DNS resolver from configuration.
+    /// Build a resolver with a private forwarder from `config.dns` upstreams.
+    ///
+    /// Used by tests and any caller that does not already own a shared
+    /// forwarder. Production prefers [`Self::with_forwarder`] so intercepted
+    /// DNS and internal lookups share one pool/cache.
     pub fn new(config: &DnsConfig) -> anyhow::Result<Self> {
-        let mut resolver_config = ResolverConfig::from_parts(None, Vec::new(), Vec::new());
-
-        for upstream in &config.upstream {
-            let socket_addr: SocketAddr = upstream
-                .address
-                .parse()
-                .unwrap_or_else(|_| "8.8.8.8:53".parse().unwrap());
-
-            // hickory 0.26: NameServerConfig is non-exhaustive and built via
-            // constructors; TLS/HTTPS/QUIC upstreams fall back to plain UDP
-            // (same behavior as before the upgrade).
-            let mut name_server_config = match upstream.protocol {
-                DnsProtocol::Udp => NameServerConfig::udp(socket_addr.ip()),
-                DnsProtocol::Tcp => NameServerConfig::tcp(socket_addr.ip()),
-                DnsProtocol::Tls | DnsProtocol::Https | DnsProtocol::Quic => {
-                    NameServerConfig::udp(socket_addr.ip())
-                }
-            };
-            // Preserve a non-default port from the configured address.
-            for connection in &mut name_server_config.connections {
-                connection.port = socket_addr.port();
-            }
-
-            resolver_config.add_name_server(name_server_config);
-        }
-
-        let mut options = ResolverOpts::default();
-        options.cache_size = config.cache.max_size as u64;
-        options.use_hosts_file = ResolveHosts::Never;
-        options.num_concurrent_reqs = 3;
-
-        match config.strategy {
-            DnsStrategy::PreferIpv4 => {
-                options.ip_strategy = LookupIpStrategy::Ipv4AndIpv6;
-            }
-            DnsStrategy::PreferIpv6 => {
-                options.ip_strategy = LookupIpStrategy::Ipv6thenIpv4;
-            }
-            DnsStrategy::Ipv4Only => {
-                options.ip_strategy = LookupIpStrategy::Ipv4Only;
-            }
-            DnsStrategy::Ipv6Only => {
-                options.ip_strategy = LookupIpStrategy::Ipv6Only;
-            }
-            DnsStrategy::Both => {
-                options.ip_strategy = LookupIpStrategy::Ipv4AndIpv6;
-            }
-        }
-
-        let resolver =
-            Resolver::builder_with_config(resolver_config, TokioRuntimeProvider::default())
-                .with_options(options)
-                .build()?;
-
+        let forwarder = build_forwarder_from_config(config)?;
         Ok(Self {
-            resolver,
             config: config.clone(),
-            cache: Arc::new(RwLock::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(config.cache.max_size).unwrap(),
-            ))),
-            forwarder: None,
+            cache: new_app_cache(config.cache.max_size),
+            forwarder,
         })
     }
 
-    /// Create a resolver that delegates upstream queries to the provided
-    /// DNS forwarder. This lets internal domain resolution benefit from the
-    /// same upstream routing (including proxy outbounds) as intercepted DNS.
+    /// Create a resolver that reuses an existing shared DNS forwarder.
     pub fn with_forwarder(
         config: &DnsConfig,
         forwarder: Arc<crate::dns::forwarder::DnsForwarder>,
     ) -> anyhow::Result<Self> {
-        let mut resolver = Self::new(config)?;
-        resolver.forwarder = Some(forwarder);
-        Ok(resolver)
+        Ok(Self {
+            config: config.clone(),
+            cache: new_app_cache(config.cache.max_size),
+            forwarder,
+        })
     }
 
-    /// Resolve a domain name to IP addresses.
+    /// Shared forwarder (for tests / diagnostics).
+    pub fn forwarder(&self) -> Arc<crate::dns::forwarder::DnsForwarder> {
+        self.forwarder.clone()
+    }
+
+    /// Resolve a domain name to IP addresses (A + AAAA via the forwarder).
     pub async fn resolve(&self, domain: &str) -> anyhow::Result<ResolvedAddr> {
+        let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+        if domain.is_empty() {
+            anyhow::bail!("empty domain");
+        }
+
+        // Literal IP short-circuit — no upstream round-trip.
+        if let Ok(ip) = domain.parse::<IpAddr>() {
+            return Ok(match ip {
+                IpAddr::V4(_) => ResolvedAddr {
+                    ipv4: vec![ip],
+                    ipv6: vec![],
+                    min_ttl: 3600,
+                },
+                IpAddr::V6(_) => ResolvedAddr {
+                    ipv4: vec![],
+                    ipv6: vec![ip],
+                    min_ttl: 3600,
+                },
+            });
+        }
+
         {
             let cache = self.cache.read().await;
-            if let Some((addrs, timestamp)) = cache.peek(domain) {
+            if let Some((addrs, timestamp)) = cache.peek(&domain) {
                 let elapsed = timestamp.elapsed().as_secs();
                 if elapsed < addrs.min_ttl as u64 {
                     debug!("DNS cache hit: {} → {:?}", domain, addrs.ipv4.first());
@@ -148,53 +128,7 @@ impl DnsResolver {
         }
 
         debug!("DNS lookup: {}", domain);
-
-        // If a forwarder is configured, use it so queries can be routed through
-        // proxy outbounds and avoid on-path DNS pollution.
-        if let Some(ref forwarder) = self.forwarder {
-            return self.resolve_via_forwarder(domain, forwarder).await;
-        }
-
-        let lookup = self.resolver.lookup_ip(domain).await?;
-
-        let mut ipv4 = Vec::new();
-        let mut ipv6 = Vec::new();
-        for addr in lookup.iter() {
-            match addr {
-                IpAddr::V4(_) => ipv4.push(addr),
-                IpAddr::V6(_) => ipv6.push(addr),
-            }
-        }
-
-        let min_ttl = lookup
-            .as_lookup()
-            .record_iter()
-            .next()
-            .map(|r| r.ttl())
-            .unwrap_or(60);
-
-        let resolved = ResolvedAddr {
-            ipv4,
-            ipv6,
-            min_ttl,
-        };
-
-        {
-            let mut cache = self.cache.write().await;
-            cache.put(
-                domain.to_string(),
-                (resolved.clone(), std::time::Instant::now()),
-            );
-        }
-
-        debug!(
-            "DNS resolved: {} → {:?} (TTL: {}s)",
-            domain,
-            resolved.ipv4.first(),
-            resolved.min_ttl
-        );
-
-        Ok(resolved)
+        self.resolve_via_forwarder(&domain, &self.forwarder).await
     }
 
     /// Resolve a domain and return the first IPv4 address.
@@ -203,7 +137,13 @@ impl DnsResolver {
         Ok(result.ipv4.first().copied())
     }
 
-    /// Resolve a domain through the DNS forwarder.
+    /// Resolve a domain and return the first IPv6 address.
+    pub async fn resolve_first_ipv6(&self, domain: &str) -> anyhow::Result<Option<IpAddr>> {
+        let result = self.resolve(domain).await?;
+        Ok(result.ipv6.first().copied())
+    }
+
+    /// Resolve a domain through the DNS forwarder (A then AAAA).
     async fn resolve_via_forwarder(
         &self,
         domain: &str,
@@ -215,34 +155,49 @@ impl DnsResolver {
 
         // Query A record
         let a_query = crate::dns::forwarder::build_dns_query(domain, 1);
-        let a_resp = forwarder.resolve(&a_query).await?;
-        if let Some((_, ttl, addrs)) = parse_a_aaaa_from_response(&a_resp) {
-            ipv4 = addrs
-                .into_iter()
-                .filter_map(|ip| match ip {
-                    IpAddr::V4(v4) => Some(IpAddr::V4(v4)),
-                    _ => None,
-                })
-                .collect();
-            min_ttl = min_ttl.min(ttl);
+        match forwarder.resolve(&a_query).await {
+            Ok(a_resp) => {
+                if let Some((_, ttl, addrs)) = parse_a_aaaa_from_response(&a_resp) {
+                    ipv4 = addrs
+                        .into_iter()
+                        .filter(|ip| matches!(ip, IpAddr::V4(_)))
+                        .collect();
+                    min_ttl = min_ttl.min(ttl);
+                }
+            }
+            Err(e) => debug!("A lookup for {} failed: {e}", domain),
         }
 
         // Query AAAA record
         let aaaa_query = crate::dns::forwarder::build_dns_query(domain, 28);
-        let aaaa_resp = forwarder.resolve(&aaaa_query).await?;
-        if let Some((_, ttl, addrs)) = parse_a_aaaa_from_response(&aaaa_resp) {
-            ipv6 = addrs
-                .into_iter()
-                .filter_map(|ip| match ip {
-                    IpAddr::V6(v6) => Some(IpAddr::V6(v6)),
-                    _ => None,
-                })
-                .collect();
-            min_ttl = min_ttl.min(ttl);
+        match forwarder.resolve(&aaaa_query).await {
+            Ok(aaaa_resp) => {
+                if let Some((_, ttl, addrs)) = parse_a_aaaa_from_response(&aaaa_resp) {
+                    ipv6 = addrs
+                        .into_iter()
+                        .filter(|ip| matches!(ip, IpAddr::V6(_)))
+                        .collect();
+                    min_ttl = min_ttl.min(ttl);
+                }
+            }
+            Err(e) => debug!("AAAA lookup for {} failed: {e}", domain),
         }
 
+        // Last-resort: system resolver (bootstrap may also help node hostnames).
         if ipv4.is_empty() && ipv6.is_empty() {
-            anyhow::bail!("forwarder returned no A/AAAA records for {}", domain);
+            match honk_outbound::bootstrap::resolve(domain).await {
+                Ok(ips) if !ips.is_empty() => {
+                    for ip in ips {
+                        match ip {
+                            IpAddr::V4(_) => ipv4.push(ip),
+                            IpAddr::V6(_) => ipv6.push(ip),
+                        }
+                    }
+                    min_ttl = 60;
+                }
+                Ok(_) => anyhow::bail!("no A/AAAA records for {domain}"),
+                Err(e) => anyhow::bail!("resolve {domain}: {e}"),
+            }
         }
 
         let resolved = ResolvedAddr {
@@ -267,12 +222,6 @@ impl DnsResolver {
         );
 
         Ok(resolved)
-    }
-
-    /// Resolve a domain and return the first IPv6 address.
-    pub async fn resolve_first_ipv6(&self, domain: &str) -> anyhow::Result<Option<IpAddr>> {
-        let result = self.resolve(domain).await?;
-        Ok(result.ipv6.first().copied())
     }
 
     /// Route a domain to the appropriate upstream based on DNS routing rules.
@@ -288,6 +237,31 @@ impl DnsResolver {
         }
         None
     }
+}
+
+fn new_app_cache(
+    max_size: usize,
+) -> Arc<RwLock<lru::LruCache<String, (ResolvedAddr, std::time::Instant)>>> {
+    let cap = NonZeroUsize::new(max_size.max(1)).expect("max_size >= 1");
+    Arc::new(RwLock::new(lru::LruCache::new(cap)))
+}
+
+/// Build a standalone forwarder from dns config (used by [`DnsResolver::new`]).
+fn build_forwarder_from_config(
+    config: &DnsConfig,
+) -> anyhow::Result<Arc<crate::dns::forwarder::DnsForwarder>> {
+    let dns_cache = Arc::new(Mutex::new(cache::DnsCache::new(config.cache.max_size)));
+    let router = Arc::new(routing::DnsRouter::new_from_dns_config(config)?);
+    let pool = Arc::new(upstream_pool::UpstreamPool::new(
+        &config.upstream,
+        router.clone(),
+    )?);
+    Ok(Arc::new(
+        forwarder::DnsForwarder::new(pool, dns_cache, router)
+            .with_strategy(config.strategy.clone())
+            .with_cache_enabled(config.cache.enabled)
+            .with_cache_ttl(config.cache.ttl.min(u64::from(u32::MAX)) as u32),
+    ))
 }
 
 /// Check if a domain matches a routing pattern.
@@ -439,13 +413,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_resolver_cache() {
+    async fn test_resolver_literal_ip() {
         let config = DnsConfig::default();
         let resolver = DnsResolver::new(&config).unwrap();
+        let r = resolver.resolve("127.0.0.1").await.unwrap();
+        assert_eq!(r.ipv4.len(), 1);
+        assert!(r.ipv6.is_empty());
+    }
 
-        // This test will try to resolve (may fail without network, but shouldn't panic)
-        let result = resolver.resolve("localhost").await;
-        // localhost should resolve on most systems
-        assert!(result.is_ok() || result.is_err());
+    #[tokio::test]
+    async fn test_resolver_system_fallback_localhost() {
+        let config = DnsConfig::default();
+        let resolver = DnsResolver::new(&config).unwrap();
+        // May hit upstream or system fallback; must not panic.
+        let _ = resolver.resolve("localhost").await;
     }
 }

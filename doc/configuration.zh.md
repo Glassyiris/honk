@@ -251,26 +251,50 @@ routing {
 dns {
     ipversion_prefer: 4
     optimistic_cache: true        # 缓存开关
-    optimistic_cache_ttl: 600     # 缓存 TTL（秒）
+    # 正缓存固定 TTL（覆盖应答 min TTL，并改写 wire RR TTL）。0 = 沿用上游应答 TTL。
+    optimistic_cache_ttl: 600
     max_cache_size: 10000
     upstream {
         alidns: 'udp://223.5.5.5:53'
-        # 可附加出站：gooddns: 'tcp://8.8.8.8:53' outbound: proxy
+        # 经代理：google: 'https://dns.google/dns-query' -> proxy
     }
     routing {
         request {
-            fallback: alidns
+            # qname / qtype / && / ! — 与流量 routing 同语法
+            qname(geosite: category-ads-all) -> reject
+            qname(suffix: cn) -> alidns
+            qtype(https) -> reject
+            qtype(a, aaaa) -> alidns
+            fallback: alidns   # 也可 asis | reject | 命名上游
         }
+        response {
+            # accept | reject | 命名上游（重查，深度 ≤ 3）
+            upstream(googledns) -> accept
+            ip(geoip: private) && !qname(geosite: cn) -> googledns
+            fallback: accept
+        }
+    }
+
+    fixed_domain_ttl {
+        ddns.example.org: 10
+        nocache.test: 0        # 0 = 不缓存
     }
 }
 ```
 
 上游 URI 协议前缀：`udp://`、`tcp://`、`tcp+udp://`、`tls://`、`https://`、`h3://`、`quic://`；无前缀按 UDP 处理。
 
+**request 动作：** 命名上游、`reject`（空成功应答）、`asis`（拨向拦截包原始 DNS 目标）。
+**response 动作：** `accept`、`reject`、或命名上游重查。
+
 **当前限制：**
 
-- 真正的 DoT/DoH/DoQ 线协议仍不完整（上游 URI 可写 `tls://` / `https://` / `quic://`，运行时可能回退 TCP）。
-- dae 语法的 `routing { request { } }` 目前只解析 `fallback`；按域名分流上游的规则（`suffix:` / `keyword:` / `full:` / `regex:` 前缀，无前缀视为完整精确匹配）在 schema 中存在，但 dae 语法尚不可写。
+- DoT / DoH（HTTP/2）/ DoQ / DoH3 已实现，并做会话复用（TLS 空闲池、H2 多路复用、单 QUIC 连接）。DoQ/DoH3 暂不支持代理隧道。
+- **拨号路径（对齐 dae）：**
+  - 显式：`name: 'uri' -> <节点|组>` 强制该出站（组走 GroupManager 策略）。
+  - 隐式（无 `->`）：解析 DNS 上游 IP/主机名，用流量 `routing { }` 再判一次出站，再经 GroupManager 选 leaf——等同 dae 的 `chooseBestDnsDialer`。
+  - H2/TLS 会话按 **leaf 节点** 缓存。旧写法 `outbound: tag` 仍接受。
+- 内部 `sub()` / `node()` / `subnode()` 选择器会解析并忽略（仅客户端 DNS）。
 
 ## 10. 订阅（subscription）
 

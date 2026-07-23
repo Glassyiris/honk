@@ -219,8 +219,8 @@ flowchart TB
 ```
 
 - 当前仅有用户态缓存（尚无内核 DNS 应答 cache map）。
-- 上游：UDP/TCP 真实实现；TLS/HTTPS/QUIC 配置值目前回退为普通 TCP。
-- 上游可选 `outbound`，意图经代理组查询（防污染）；SOCKS5-UDP 路径仍不完整。
+- 上游协议：UDP/TCP/DoT/DoH/DoQ/DoH3 均已实现（`honk-core/src/dns/transport/`，会话池化，失效后重试一次）。
+- 上游可选 `outbound`，经代理节点/组发出查询（防污染）；因 SOCKS5-UDP 路径不完整，UDP+代理隧道化为 TCP-DNS，DoQ/DoH3 仅支持直连。
 
 ## 10. Clash API
 

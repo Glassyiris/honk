@@ -599,10 +599,12 @@ mod tests {
         );
         let relay = make_addr("192.168.1.1", 1080);
 
-        let (_ep, is_new) = pool.get_or_create(client, dst, proxy.clone(), relay, "test-node".to_string());
+        let (_ep, is_new) =
+            pool.get_or_create(client, dst, proxy.clone(), relay, "test-node".to_string());
         assert!(is_new, "first call should be new");
 
-        let (_ep2, is_new2) = pool.get_or_create(client, dst, proxy, relay, "test-node".to_string());
+        let (_ep2, is_new2) =
+            pool.get_or_create(client, dst, proxy, relay, "test-node".to_string());
         assert!(!is_new2, "second call should return existing");
     }
 
@@ -630,7 +632,11 @@ mod tests {
             rt.block_on(tokio::net::UdpSocket::bind("127.0.0.1:0"))
                 .unwrap(),
         );
-        let ep = UdpEndpoint::new(proxy, make_addr("192.168.1.1", 1080), "test-node".to_string());
+        let ep = UdpEndpoint::new(
+            proxy,
+            make_addr("192.168.1.1", 1080),
+            "test-node".to_string(),
+        );
 
         ep.cache_routing_result(make_addr("8.8.8.8", 53), 3);
         assert!(ep.get_cached_routing(make_addr("1.1.1.1", 53)).is_none());
@@ -643,7 +649,11 @@ mod tests {
             rt.block_on(tokio::net::UdpSocket::bind("127.0.0.1:0"))
                 .unwrap(),
         );
-        let ep = UdpEndpoint::new(proxy, make_addr("192.168.1.1", 1080), "test-node".to_string());
+        let ep = UdpEndpoint::new(
+            proxy,
+            make_addr("192.168.1.1", 1080),
+            "test-node".to_string(),
+        );
         let dst = make_addr("8.8.8.8", 53);
 
         ep.cache_routing_result(dst, 7);

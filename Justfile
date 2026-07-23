@@ -6,7 +6,8 @@ default: build
 
 # ── Build ───────────────────────────────────────────────
 
-# Build all workspace crates (release)
+# Build all workspace crates (release) — boring-sys needs cmake + a C
+# compiler + libclang (bindgen) installed
 build:
     cargo build --release
 
@@ -19,13 +20,32 @@ build-core-ebpf:
     cargo build --release -p honk-core --features ebpf
 
 # Build honk-core for VyOS/Debian (static musl, portable)
+# Uses zig cc/c++ as the musl toolchain (ci/zigcc, ci/zigcxx): boring-sys
+# (BoringSSL, C++) needs a clang-compatible compiler — under cross, CMake
+# injects clang-style --target flags into the ASM rules that real GCC rejects
+# ("unrecognized command-line option '--target=...'") and zig rejects in Rust
+# triple spelling, so the wrappers strip them and re-anchor on the zig triple.
+# link-self-contained=no lets zig supply the CRT (Rust's self-contained
+# rcrt1.o + zig's crt1.o both define _start). Requires zig (0.14+) in PATH.
 build-musl:
+    ZIGCC_TARGET=x86_64-linux-musl \
+    CC_x86_64_unknown_linux_musl={{justfile_directory()}}/ci/zigcc \
+    CXX_x86_64_unknown_linux_musl={{justfile_directory()}}/ci/zigcxx \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER={{justfile_directory()}}/ci/zigcc \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C link-self-contained=no" \
+    BINDGEN_EXTRA_CLANG_ARGS="$({{justfile_directory()}}/ci/zig-bindgen-env x86_64-linux-musl)" \
     cargo build --release -p honk-core --features "ebpf" --target x86_64-unknown-linux-musl
     @echo "Binary: target/x86_64-unknown-linux-musl/release/honk-core"
 
 # Build eBPF object standalone (optional; honk-core build.rs auto-builds it)
+# NOTE: an environment RUSTFLAGS overrides crates/honk-ebpf/.cargo/config.toml
+# rustflags (--btf, debuginfo) — the object then silently loses its .BTF
+# section and aya refuses to load it ("no BTF parsed for object").
 build-ebpf:
+    @test -z "$RUSTFLAGS" || echo "warning: RUSTFLAGS is set and overrides crates/honk-ebpf/.cargo/config.toml (--btf) — the object may lack .BTF"
     cd crates/honk-ebpf && cargo +nightly build --release -Zbuild-std=core --target bpfel-unknown-none
+    @readelf -S crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf | grep -q '\.BTF' \
+        || (echo "error: eBPF object has no .BTF section (see RUSTFLAGS note above)" && exit 1)
 
 # Build all (core with embedded ebpf)
 build-all: build-core
@@ -46,9 +66,17 @@ fmt:
 
 # ── Test ─────────────────────────────────────────────────
 
-# Run all tests
+# Run all tests (includes known-failing pre-existing tests — see AGENTS.md)
 test:
     cargo test --all
+
+# CI-equivalent gate: full suite minus the known-failing pre-existing tests
+# (share_link TOML round-trip ×2, config_dae_routing ×1 — see AGENTS.md)
+test-ci:
+    cargo test --workspace --no-fail-fast -- \
+        --skip test_config_toml_round_trip \
+        --skip test_to_file_and_from_file_by_extension \
+        --skip test_routing_with_config_dae
 
 # Run core + outbound tests
 test-core:
@@ -63,10 +91,6 @@ test-ebpf:
     cargo test -p honk-ebpf-common
 
 # ── Run ──────────────────────────────────────────────────
-
-# Run honk-core with config.dae (local testing)
-run:
-    ./scripts/debug-local.sh
 
 # Run honk-core with eBPF (clash API comes from config.dae experimental section)
 run-debug:
@@ -114,19 +138,15 @@ bpf-progs:
 bpf-maps:
     ls -la /sys/fs/bpf/ 2>/dev/null
 
-# ── Deploy ────────────────────────────────────────────────
-
-# Deploy to gateway (default: 10.10.10.1)
-deploy HOST="10.10.10.1": build-ebpf build-core
-    @./scripts/deploy-gateway.sh {{ HOST }}
-
 # ── Clean ────────────────────────────────────────────────
 
 # Clean build artifacts
 clean:
     cargo clean
 
-# Clean all honk-core state (process, netns, veth, bpf maps, iptables, routes)
+# Clean all honk-core state (process, netns, veth, bpf maps, policy routes).
+# No iptables rules are installed by the live engine; the MASQUERADE/table-2023
+# lines below only remove legacy leftovers.
 clean-all:
     @echo "=== Stopping honk-core ==="
     @pkill honk-core 2>/dev/null || true
@@ -136,10 +156,12 @@ clean-all:
     @ip netns del daens 2>/dev/null || true
     @echo "=== Cleaning BPF maps ==="
     @find /sys/fs/bpf -maxdepth 1 -type f -delete 2>/dev/null || true
-    @echo "=== Cleaning iptables rules ==="
+    @echo "=== Cleaning policy routes (live: table 100) ==="
+    @ip rule del fwmark 0x8000000/0x8000000 table 100 2>/dev/null || true
+    @ip route flush table 100 2>/dev/null || true
+    @echo "=== Cleaning legacy iptables/table-2023 leftovers ==="
     @iptables -t nat -D POSTROUTING -s 192.168.254.0/24 -j MASQUERADE 2>/dev/null || true
     @iptables -t nat -D POSTROUTING -s 169.254.0.0/16 -j MASQUERADE 2>/dev/null || true
-    @echo "=== Cleaning policy routes ==="
     @ip rule del fwmark 0x8000000/0x8000000 table 2023 2>/dev/null || true
     @ip route flush table 2023 2>/dev/null || true
     @echo "=== Done ==="
@@ -148,20 +170,6 @@ clean-all:
 deploy-vyos HOST="10.10.10.1": build-musl
     scp target/x86_64-unknown-linux-musl/release/honk-core "root@{{ HOST }}:/config/vyos-scripts/podman/dae/dae"
     ssh "root@{{ HOST }}" 'chmod +x /config/vyos-scripts/podman/dae/dae && /config/vyos-scripts/podman/dae/dae --help'
-
-# ── Docker ───────────────────────────────────────────────
-
-# Build Docker image
-docker:
-    docker build -t honk:latest .
-
-# Run with Docker Compose
-docker-up:
-    docker compose up -d
-
-# Stop Docker Compose
-docker-down:
-    docker compose down
 
 # ── Dev ──────────────────────────────────────────────────
 

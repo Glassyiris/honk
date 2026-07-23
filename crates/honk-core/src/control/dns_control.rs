@@ -14,8 +14,8 @@
 use crate::dns::forwarder::DnsForwarder;
 use crate::ebpf::EbpfBackend;
 use crate::routing::Router;
-use honk_ebpf_common::DomainRouting;
 use dashmap::DashMap;
+use honk_ebpf_common::DomainRouting;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -218,7 +218,9 @@ impl DnsController {
             client_addr
         );
 
-        let response = self.resolve_with_singleflight(data).await;
+        let response = self
+            .resolve_with_singleflight(data, Some(original_dst))
+            .await;
         let _ = super::send_udp_reply_from_orig_dst(&response, client_addr, original_dst).await;
         Ok(true)
     }
@@ -260,7 +262,8 @@ impl DnsController {
         );
 
         let response = if self.concurrency_limit.try_acquire().is_ok() {
-            self.resolve_with_singleflight(&dns_data).await
+            self.resolve_with_singleflight(&dns_data, Some(original_dst))
+                .await
         } else {
             build_dns_servfail(&dns_data)
         };
@@ -285,7 +288,8 @@ impl DnsController {
             }
 
             let resp = if self.concurrency_limit.try_acquire().is_ok() {
-                self.resolve_with_singleflight(&dns_data).await
+                self.resolve_with_singleflight(&dns_data, Some(original_dst))
+                    .await
             } else {
                 build_dns_servfail(&dns_data)
             };
@@ -294,26 +298,30 @@ impl DnsController {
     }
 
     /// Resolve a DNS query with singleflight deduplication.
-    async fn resolve_with_singleflight(&self, data: &[u8]) -> Vec<u8> {
+    async fn resolve_with_singleflight(
+        &self,
+        data: &[u8],
+        original_dst: Option<SocketAddr>,
+    ) -> Vec<u8> {
         let cache_key = match crate::dns::forwarder::parse_dns_question(data) {
             Some((domain, qtype)) => format!("{}:{}", domain, qtype),
-            None => return self.resolve_and_notify(data).await.0,
+            None => return self.resolve_and_notify(data, original_dst).await.0,
         };
 
         let maybe_rx = self.in_flight.get(&cache_key).map(|tx| tx.subscribe());
 
-        if let Some(mut rx) = maybe_rx {
-            if let Ok(resp) = rx.recv().await {
-                debug!("DNS singleflight: reused result for {}", cache_key);
-                return resp;
-            }
-            // Sender dropped — fall through to execute the query ourselves.
+        if let Some(mut rx) = maybe_rx
+            && let Ok(resp) = rx.recv().await
+        {
+            debug!("DNS singleflight: reused result for {}", cache_key);
+            return resp;
         }
+        // Sender dropped — fall through to execute the query ourselves.
 
         let (tx, _) = broadcast::channel(1);
         self.in_flight.insert(cache_key.clone(), tx.clone());
 
-        let (response, _) = self.resolve_and_notify(data).await;
+        let (response, _) = self.resolve_and_notify(data, original_dst).await;
 
         let _ = tx.send(response.clone());
         self.in_flight.remove(&cache_key);
@@ -322,9 +330,13 @@ impl DnsController {
     }
 
     /// Resolve a raw DNS query and notify BPF on success.
-    async fn resolve_and_notify(&self, data: &[u8]) -> (Vec<u8>, bool) {
+    async fn resolve_and_notify(
+        &self,
+        data: &[u8],
+        original_dst: Option<SocketAddr>,
+    ) -> (Vec<u8>, bool) {
         let forwarder = self.forwarder.read().await;
-        match forwarder.resolve(data).await {
+        match forwarder.resolve_with_context(data, original_dst).await {
             Ok(resp) => {
                 self.notify_bpf_update(data, &resp).await;
                 (resp, true)

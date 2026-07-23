@@ -20,7 +20,7 @@ const IP6T_SO_ORIGINAL_DST_OPT: libc::c_int = 80;
 /// socket so the kernel routes them via dae0peer → host dae0_ingress
 /// (REDIRECT_TRACK rewrite) to the LAN.  In mock mode there is no daens and
 /// the listener is bound in the current (host) netns.
-fn bind_tproxy_tcp(addr: SocketAddr, _mark: u32) -> anyhow::Result<TcpListener> {
+pub(super) fn bind_tproxy_tcp(addr: SocketAddr, _mark: u32) -> anyhow::Result<TcpListener> {
     #[cfg(target_os = "linux")]
     if daens_netns_exists() {
         return crate::with_daens_netns("bind TPROXY TCP listener", || build_tproxy_tcp(addr));
@@ -99,7 +99,7 @@ fn build_tproxy_tcp(addr: SocketAddr) -> anyhow::Result<TcpListener> {
 
 /// Clear the packet mark on a socket so that locally generated replies are
 /// routed through the ordinary routing table, not the TPROXY policy route.
-fn set_so_mark_zero(fd: RawFd) -> io::Result<()> {
+pub(super) fn set_so_mark_zero(fd: RawFd) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     unsafe {
         let zero: libc::c_uint = 0;
@@ -129,7 +129,7 @@ fn set_so_mark_zero(fd: RawFd) -> io::Result<()> {
 /// Replies to clients are sent through dedicated daens-resident reply
 /// sockets (see `new_udp_reply_socket` / the cached DNS reply sockets
 /// below), not through this listener socket.
-fn bind_tproxy_udp(addr: SocketAddr, _mark: u32) -> anyhow::Result<UdpSocket> {
+pub(super) fn bind_tproxy_udp(addr: SocketAddr, _mark: u32) -> anyhow::Result<UdpSocket> {
     #[cfg(target_os = "linux")]
     if daens_netns_exists() {
         return crate::with_daens_netns("bind TPROXY UDP listener", || build_tproxy_udp(addr));
@@ -227,7 +227,7 @@ fn build_tproxy_udp(addr: SocketAddr) -> anyhow::Result<UdpSocket> {
 /// destination address as the source.  The client expects the response to come
 /// from the address it sent the query to (e.g. the bridge gateway at port 53),
 /// not from the local tproxy listener port.
-async fn send_udp_reply_from_orig_dst(
+pub(super) async fn send_udp_reply_from_orig_dst(
     data: &[u8],
     client_addr: SocketAddr,
     original_dst: SocketAddr,
@@ -288,7 +288,7 @@ async fn send_udp_reply_from_orig_dst(
 /// In mock mode there is no daens and the socket is created in the current
 /// (host) netns.
 #[cfg(target_os = "linux")]
-fn new_udp_reply_socket(original_dst: SocketAddr) -> io::Result<UdpSocket> {
+pub(super) fn new_udp_reply_socket(original_dst: SocketAddr) -> io::Result<UdpSocket> {
     if daens_netns_exists() {
         return crate::with_daens_netns("create UDP reply socket", || {
             build_udp_reply_socket(original_dst).map_err(anyhow::Error::from)
@@ -301,7 +301,7 @@ fn new_udp_reply_socket(original_dst: SocketAddr) -> io::Result<UdpSocket> {
 /// Non-Linux fallback: no daens netns exists; create the socket in the
 /// current namespace.
 #[cfg(not(target_os = "linux"))]
-fn new_udp_reply_socket(original_dst: SocketAddr) -> io::Result<UdpSocket> {
+pub(super) fn new_udp_reply_socket(original_dst: SocketAddr) -> io::Result<UdpSocket> {
     build_udp_reply_socket(original_dst)
 }
 
@@ -619,7 +619,7 @@ fn sendmsg_with_src(
 
 /// Receive a UDP datagram from a TPROXY socket together with its original
 /// destination address.  Requires `IP_RECVORIGDSTADDR` to be set on the socket.
-async fn recv_from_with_orig_dst(
+pub(super) async fn recv_from_with_orig_dst(
     socket: &UdpSocket,
     buf: &mut [u8],
 ) -> io::Result<(usize, SocketAddr, SocketAddr)> {
@@ -743,7 +743,7 @@ fn sockaddr_to_std(addr: &libc::sockaddr_storage, len: libc::socklen_t) -> io::R
     }
 }
 
-fn get_original_dst(stream: &TcpStream) -> anyhow::Result<SocketAddr> {
+pub(super) fn get_original_dst(stream: &TcpStream) -> anyhow::Result<SocketAddr> {
     use std::os::unix::io::AsRawFd;
     let fd = stream.as_raw_fd();
 
@@ -811,7 +811,7 @@ fn get_original_dst(stream: &TcpStream) -> anyhow::Result<SocketAddr> {
 /// Used as a fallback when the eBPF bpf_sk_assign path does not preserve
 /// IP_ORIGDSTADDR for UDP datagrams: any DNS-shaped payload received on the
 /// TPROXY listener is treated as a DNS query destined for port 53.
-fn is_dns_payload(data: &[u8]) -> bool {
+pub(super) fn is_dns_payload(data: &[u8]) -> bool {
     if data.len() < 12 {
         return false;
     }
@@ -828,7 +828,7 @@ fn is_dns_payload(data: &[u8]) -> bool {
 /// runs (and `is_dns_query` already implies a DNS-shaped payload). Datagrams
 /// failing this check are guaranteed to fall through the DNS fast path, so
 /// the UDP fast path may safely skip the DNS controller for them.
-fn might_be_dns_query(data: &[u8]) -> bool {
+pub(super) fn might_be_dns_query(data: &[u8]) -> bool {
     if data.len() < 12 {
         return false;
     }
@@ -853,7 +853,7 @@ fn might_be_dns_query(data: &[u8]) -> bool {
 /// skipping the QUIC sniffer on hits is safe because an established
 /// endpoint means routing for this flow was already decided when its first
 /// packet took the slow path.
-async fn udp_fast_path(
+pub(super) async fn udp_fast_path(
     udp_pool: &UdpEndpointPool,
     data: &[u8],
     client_addr: SocketAddr,

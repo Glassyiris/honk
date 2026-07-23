@@ -66,6 +66,15 @@ pub struct Node {
     /// Skip certificate verification
     #[serde(default)]
     pub skip_cert_verify: bool,
+    /// Enable ECH (Encrypted Client Hello) for TLS/QUIC handshakes
+    #[serde(default)]
+    pub ech_enabled: bool,
+    /// Base64-encoded ECHConfigList; implies ech_enabled when set
+    #[serde(default)]
+    pub ech_config: Option<String>,
+    /// Path to a file containing a base64-encoded ECHConfigList
+    #[serde(default)]
+    pub ech_config_path: Option<String>,
     /// Network type for V2Ray (tcp/ws/grpc/h2/quic/kcp)
     #[serde(default)]
     pub network: Option<String>,

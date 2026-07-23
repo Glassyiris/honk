@@ -7,9 +7,17 @@
 //! replies from that listener back onto the original LAN interface so the
 //! three-way handshake can complete without involving host IP forwarding.
 
-use core::{ffi::c_void, mem, ptr};
+use core::{
+    ffi::{c_long, c_void},
+    mem, ptr,
+};
 
-use crate::{log_shim::*, maps::LISTEN_SOCKET_MAP, transport::ParsedPacket};
+use crate::{
+    action::{TC_ACT_OK, TC_ACT_PIPE, TC_ACT_SHOT, Verdict, flatten},
+    log_shim::*,
+    maps::LISTEN_SOCKET_MAP,
+    transport::ParsedPacket,
+};
 use aya_ebpf::programs::TcContext;
 use aya_ebpf_bindings::{
     bindings::{
@@ -17,8 +25,7 @@ use aya_ebpf_bindings::{
         bpf_sock_tuple__bindgen_ty_1__bindgen_ty_2,
     },
     helpers::{
-        bpf_ktime_get_ns, bpf_map_lookup_elem, bpf_redirect, bpf_redirect_peer, bpf_sk_assign,
-        bpf_sk_lookup_tcp, bpf_sk_lookup_udp, bpf_sk_release, bpf_skb_load_bytes,
+        bpf_ktime_get_ns, bpf_redirect, bpf_redirect_peer, bpf_skb_load_bytes,
         bpf_skb_store_bytes,
     },
 };
@@ -39,17 +46,20 @@ use crate::{
         ROUTING_HANDOFF_MAP, ROUTING_META_MAP,
     },
     route::{RouteCtx, OUTBOUND_BLOCK, OUTBOUND_DIRECT},
-    routing::bpf_sock_is_dae_socket,
+    sk,
     transport::{parse_packet, ETH_HLEN, ETH_P_IP, ETH_P_IPV6, IPPROTO_TCP, IPPROTO_UDP},
 };
 
-pub const TC_ACT_OK: i32 = 0;
-pub const TC_ACT_SHOT: i32 = 2;
-pub const TC_ACT_PIPE: i32 = 3;
-pub const TC_ACT_REDIRECT: i32 = 7;
 const IPV6_BYTE_LENGTH: usize = 16;
 
-const LOAD_REDIRECT_TUPLE_FALLBACK: i32 = 2;
+// Internal codes for the load_redirect_tuple_* helpers — NOT TC verdicts.
+// `LOAD_REDIRECT_TUPLE_FALLBACK` numerically collides with `TC_ACT_SHOT`;
+// it is consumed only by `load_redirect_tuple`'s fast→slow fallback chain.
+const LOAD_REDIRECT_TUPLE_FALLBACK: c_long = 2;
+/// Packet is neither IPv4 nor IPv6 — nothing to look up.
+const LOAD_REDIRECT_TUPLE_NOT_IP: c_long = 1;
+/// `bpf_skb_load_bytes` failed during the slow parse.
+const LOAD_REDIRECT_TUPLE_ERR: c_long = -1;
 const REDIRECT_PULL_SIZE: u32 = 128;
 
 /// skb->mark bit set on packets that already passed `lan_ingress`
@@ -97,7 +107,7 @@ fn redirect_lan_packet_to_control_plane(
     pkt: &ParsedPacket,
     routing_meta_raw: u64,
     handoff_mode: u8,
-) -> i32 {
+) -> Verdict {
     let routing_meta = RoutingMeta {
         raw: routing_meta_raw,
     };
@@ -184,25 +194,25 @@ fn redirect_lan_packet_to_control_plane(
     // Requires kernel >= 6.8 (CVE-2025-37959 fix). Userspace verifies the
     // kernel version before enabling this flag.
     if param.use_redirect_peer != 0 {
-        unsafe { bpf_redirect_peer(param.dae0_ifindex, 0) as i32 }
+        Ok(unsafe { bpf_redirect_peer(param.dae0_ifindex, 0) } as c_long)
     } else {
-        unsafe { bpf_redirect(param.dae0_ifindex, 0) as i32 }
+        Ok(unsafe { bpf_redirect(param.dae0_ifindex, 0) } as c_long)
     }
 }
 
-/// Return `TC_ACT_OK` after tagging the skb with `CLASSIFIED_MARK`, so the
+/// Early-exit `TC_ACT_OK` after tagging the skb with `CLASSIFIED_MARK`, so the
 /// second TC pass (bridge master + slave double-attach) short-circuits at
 /// the `do_tproxy_lan_ingress` entry check instead of redoing the full
 /// classification.
 #[inline(always)]
-fn pass_through_classified(ctx: &TcContext) -> i32 {
+fn pass_through_classified(ctx: &TcContext) -> Verdict {
     ctx.skb
         .set_mark(unsafe { (*ctx.skb.skb).mark } | CLASSIFIED_MARK);
-    TC_ACT_OK
+    Err(TC_ACT_OK)
 }
 
 #[inline(always)]
-fn load_redirect_tuple_fast(ctx: &TcContext) -> Result<RedirectTuple, i32> {
+fn load_redirect_tuple_fast(ctx: &TcContext) -> Result<RedirectTuple, c_long> {
     if ctx.pull_data(REDIRECT_PULL_SIZE).is_err() {
         return Err(LOAD_REDIRECT_TUPLE_FALLBACK);
     }
@@ -243,12 +253,12 @@ fn load_redirect_tuple_fast(ctx: &TcContext) -> Result<RedirectTuple, i32> {
 
         Ok(rt)
     } else {
-        Err(1)
+        Err(LOAD_REDIRECT_TUPLE_NOT_IP)
     }
 }
 
 #[inline(always)]
-fn load_redirect_tuple_slow(ctx: &TcContext) -> Result<RedirectTuple, i32> {
+fn load_redirect_tuple_slow(ctx: &TcContext) -> Result<RedirectTuple, c_long> {
     let protocol = unsafe { (*ctx.skb.skb).protocol as u16 };
 
     match protocol {
@@ -270,7 +280,7 @@ fn load_redirect_tuple_slow(ctx: &TcContext) -> Result<RedirectTuple, i32> {
                 )
             };
             if ret != 0 {
-                return Err(-1);
+                return Err(LOAD_REDIRECT_TUPLE_ERR);
             }
 
             let src_ip = In6Addr::from_ipv4_bytes(dst_buf);
@@ -287,7 +297,7 @@ fn load_redirect_tuple_slow(ctx: &TcContext) -> Result<RedirectTuple, i32> {
                 )
             };
             if ret != 0 {
-                return Err(-1);
+                return Err(LOAD_REDIRECT_TUPLE_ERR);
             }
 
             let dst_ip = In6Addr::from_ipv4_bytes(src_buf);
@@ -307,7 +317,7 @@ fn load_redirect_tuple_slow(ctx: &TcContext) -> Result<RedirectTuple, i32> {
                 )
             };
             if ret != 0 {
-                return Err(-1);
+                return Err(LOAD_REDIRECT_TUPLE_ERR);
             }
 
             let src_offset = (ETH_HLEN as usize + mem::offset_of!(Ipv6Hdr, src_addr)) as u32;
@@ -320,17 +330,17 @@ fn load_redirect_tuple_slow(ctx: &TcContext) -> Result<RedirectTuple, i32> {
                 )
             };
             if ret != 0 {
-                return Err(-1);
+                return Err(LOAD_REDIRECT_TUPLE_ERR);
             }
 
             Ok(rt)
         }
-        _ => Err(1),
+        _ => Err(LOAD_REDIRECT_TUPLE_NOT_IP),
     }
 }
 
 #[inline(always)]
-fn load_redirect_tuple(ctx: &TcContext) -> Result<RedirectTuple, i32> {
+fn load_redirect_tuple(ctx: &TcContext) -> Result<RedirectTuple, c_long> {
     match load_redirect_tuple_fast(ctx) {
         Err(LOAD_REDIRECT_TUPLE_FALLBACK) => load_redirect_tuple_slow(ctx),
         other => other,
@@ -419,20 +429,20 @@ fn dst_is_likely_local(dst_ip: &In6Addr) -> bool {
 // #[inline(never)]: shared by lan_ingress_l2/l3. 5-level call chain
 // with 256B baseline stays under the 512B BPF stack limit.
 #[inline(never)]
-fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> i32 {
+fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     // Userspace attaches lan_ingress to both the bridge master and every
     // bridge slave, so a forwarded packet can traverse this program twice.
     // The first pass tags pass-through packets with CLASSIFIED_MARK; pass
     // them straight through here to skip the duplicate parse + conntrack +
     // socket lookup.
     if unsafe { (*ctx.skb.skb).mark } & CLASSIFIED_MARK != 0 {
-        return TC_ACT_OK;
+        return Err(TC_ACT_OK);
     }
 
     let scratch_key: u32 = 0;
     let pkt = match PKT_SCRATCH_KEY.get_ptr_mut(scratch_key) {
         Some(ptr) => unsafe { &mut *ptr },
-        None => return TC_ACT_SHOT,
+        None => return Err(TC_ACT_SHOT),
     };
 
     let ret = parse_packet(ctx, link_h_len, pkt);
@@ -469,7 +479,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> i32 {
         if outbound == OUTBOUND_DIRECT && must != 0 {
             crate::stats::count_tx(ctx, outbound);
             ctx.skb.set_mark(mark | CLASSIFIED_MARK);
-            return TC_ACT_OK;
+            return Err(TC_ACT_OK);
         }
         if outbound == OUTBOUND_DIRECT {
             return redirect_lan_packet_to_control_plane(
@@ -491,7 +501,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> i32 {
             );
         }
         if !wan_outbound_is_alive(ctx, outbound, pkt.l4proto, pkt.tuples.five.dst_port) {
-            return TC_ACT_SHOT;
+            return Err(TC_ACT_SHOT);
         }
         return redirect_lan_packet_to_control_plane(
             ctx,
@@ -551,7 +561,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> i32 {
                     if outbound == OUTBOUND_DIRECT && must != 0 {
                         crate::stats::count_tx(ctx, outbound);
                         ctx.skb.set_mark(mark | CLASSIFIED_MARK);
-                        return TC_ACT_OK;
+                        return Err(TC_ACT_OK);
                     }
                     if outbound == OUTBOUND_DIRECT {
                         if !wan_outbound_is_alive(
@@ -560,7 +570,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> i32 {
                             pkt.l4proto,
                             pkt.tuples.five.dst_port,
                         ) {
-                            return TC_ACT_SHOT;
+                            return Err(TC_ACT_SHOT);
                         }
                         return redirect_lan_packet_to_control_plane(
                             ctx,
@@ -586,7 +596,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> i32 {
                             pkt.l4proto,
                             pkt.tuples.five.dst_port,
                         ) {
-                            return TC_ACT_SHOT;
+                            return Err(TC_ACT_SHOT);
                         }
                         return redirect_lan_packet_to_control_plane(
                             ctx,
@@ -606,7 +616,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> i32 {
                     }
                     if !wan_outbound_is_alive(ctx, outbound, pkt.l4proto, pkt.tuples.five.dst_port)
                     {
-                        return TC_ACT_SHOT;
+                        return Err(TC_ACT_SHOT);
                     }
                     return redirect_lan_packet_to_control_plane(
                         ctx,
@@ -684,52 +694,24 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> i32 {
             // Skip socket lookup for SYN packets
             if !(pkt.tcph.syn() != 0 && pkt.tcph.ack() == 0) {
                 let param = PARAM.load();
-                let sk = unsafe {
-                    bpf_sk_lookup_tcp(
-                        ctx.skb.skb as *mut _,
-                        &mut tuple,
-                        tuple_size,
-                        param.dae_netns_id as u64,
-                        0,
-                    )
-                };
-                if !sk.is_null() {
-                    if !bpf_sock_is_dae_socket(sk as *const _) {
-                        let state = unsafe { (*sk).state };
-                        unsafe {
-                            bpf_sk_release(sk as *mut _);
-                        }
-                        // BPF_TCP_LISTEN = 10
-                        if state == 10 {
-                            return pass_through_classified(ctx);
-                        }
-                    } else {
-                        unsafe {
-                            bpf_sk_release(sk as *mut _);
-                        }
+                if let Some(probe) =
+                    sk::probe_tcp_socket(ctx, &mut tuple, tuple_size, param.dae_netns_id as u64)
+                {
+                    // A local (non-dae) LISTEN socket owns this destination:
+                    // NAT loopback — leave it to the kernel.
+                    // BPF_TCP_LISTEN = 10
+                    if !probe.is_dae_socket && probe.state == 10 {
+                        return pass_through_classified(ctx);
                     }
                 }
             }
         } else {
             let param = PARAM.load();
-            let sk = unsafe {
-                bpf_sk_lookup_udp(
-                    ctx.skb.skb as *mut _,
-                    &mut tuple,
-                    tuple_size,
-                    param.dae_netns_id as u64,
-                    0,
-                )
-            };
-            if !sk.is_null() {
-                if !bpf_sock_is_dae_socket(sk as *const _) {
-                    unsafe {
-                        bpf_sk_release(sk as *mut _);
-                    }
+            if let Some(probe) =
+                sk::probe_udp_socket(ctx, &mut tuple, tuple_size, param.dae_netns_id as u64)
+            {
+                if !probe.is_dae_socket {
                     return pass_through_classified(ctx);
-                }
-                unsafe {
-                    bpf_sk_release(sk as *mut _);
                 }
             }
         }
@@ -759,7 +741,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> i32 {
 
     let route_ctx_ptr = ROUTE_CTX_SCRATCH_MAP.get_ptr_mut(0);
     if route_ctx_ptr.is_none() {
-        return TC_ACT_SHOT;
+        return Err(TC_ACT_SHOT);
     }
     let route_ctx = unsafe { &mut *route_ctx_ptr.unwrap() };
 
@@ -833,13 +815,13 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> i32 {
     let loop_ret = route_ctx.route_loop(active_rules_len);
     if loop_ret < 0 {
         error!(ctx, target: "honk", "shot routing: {}", loop_ret);
-        return TC_ACT_SHOT;
+        return Err(TC_ACT_SHOT);
     }
 
     let s64_ret = route_ctx.result;
     if s64_ret < 0 {
         error!(ctx, target: "honk", "lan_ingress route fail: {}", s64_ret);
-        return TC_ACT_SHOT;
+        return Err(TC_ACT_SHOT);
     }
 
     let outbound = s64_ret as u8;
@@ -866,10 +848,10 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> i32 {
     if pkt.l4proto == IPPROTO_TCP && tcp_state.is_none() {
         if outbound == OUTBOUND_DIRECT && must != 0 && mark == 0 {
             ctx.skb.set_mark(mark | CLASSIFIED_MARK);
-            return TC_ACT_OK;
+            return Err(TC_ACT_OK);
         }
         if outbound == OUTBOUND_DIRECT && must != 0 {}
-        return TC_ACT_SHOT;
+        return Err(TC_ACT_SHOT);
     }
 
     if outbound == OUTBOUND_DIRECT && must != 0 {
@@ -878,7 +860,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> i32 {
         }
         crate::stats::count_tx(ctx, outbound);
         ctx.skb.set_mark(mark | CLASSIFIED_MARK);
-        return TC_ACT_OK;
+        return Err(TC_ACT_OK);
     }
     if outbound == OUTBOUND_DIRECT {
         // No must → domain-based or uncertain routing.
@@ -899,7 +881,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> i32 {
     if outbound == OUTBOUND_BLOCK {
         // Redirect BLOCK to control plane.
         if !wan_outbound_is_alive(ctx, outbound, pkt.l4proto, pkt.tuples.five.dst_port) {
-            return TC_ACT_SHOT;
+            return Err(TC_ACT_SHOT);
         }
         return redirect_lan_packet_to_control_plane(
             ctx,
@@ -911,7 +893,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> i32 {
     }
 
     if !wan_outbound_is_alive(ctx, outbound, pkt.l4proto, pkt.tuples.five.dst_port) {
-        return TC_ACT_SHOT;
+        return Err(TC_ACT_SHOT);
     }
 
     redirect_lan_packet_to_control_plane(
@@ -926,20 +908,20 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> i32 {
 // #[inline(never)]: shared by wan_ingress_l2/l3. Shallow call chain
 // (only parse_packet + conn state update).
 #[inline(never)]
-fn do_tproxy_wan_ingress(ctx: &TcContext, link_h_len: u32) -> i32 {
+fn do_tproxy_wan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     let scratch_key: u32 = 0;
     let pkt = match PKT_SCRATCH_KEY.get_ptr_mut(scratch_key) {
         Some(ptr) => unsafe { &mut *ptr },
-        None => return TC_ACT_SHOT,
+        None => return Err(TC_ACT_SHOT),
     };
 
     let ret = parse_packet(ctx, link_h_len, pkt);
     if ret != 0 {
         if ret < 0 {
             error!(ctx, target: "honk", "parse_transport error: {}, dropping", ret);
-            return TC_ACT_SHOT;
+            return Err(TC_ACT_SHOT);
         }
-        return TC_ACT_OK;
+        return Err(TC_ACT_OK);
     }
 
     if pkt.l4proto == IPPROTO_TCP {
@@ -961,7 +943,7 @@ fn do_tproxy_wan_ingress(ctx: &TcContext, link_h_len: u32) -> i32 {
         let src_port = u16::from_be_bytes(pkt.udph.src);
         let dst_port = u16::from_be_bytes(pkt.udph.dst);
         if src_port == 53 || dst_port == 53 {
-            return TC_ACT_PIPE;
+            return Err(TC_ACT_PIPE);
         }
 
         let mut reversed_key: TuplesKey = unsafe { mem::zeroed() };
@@ -970,19 +952,19 @@ fn do_tproxy_wan_ingress(ctx: &TcContext, link_h_len: u32) -> i32 {
             crate::contrack::mark_udp_seen(&reversed_key, 1u8, None, None, None, None, 0, None, 0);
     }
 
-    TC_ACT_PIPE
+    Ok(TC_ACT_PIPE)
 }
 
 // #[inline(never)]: standalone program, no deep call chain.
 #[inline(never)]
-fn do_tproxy_dae0peer_ingress(ctx: &TcContext) -> i32 {
+fn do_tproxy_dae0peer_ingress(ctx: &TcContext) -> Verdict {
     // Only packets redirected from wan_egress or lan_ingress carry this cb
     // mark.  Other traffic (e.g. replies to locally-generated proxy outbound
     // connections) must be passed through so the daens IP stack can deliver it
     // to the correct local socket.
     let cb0 = unsafe { (*ctx.skb.skb).cb[0] };
     if cb0 != TPROXY_MARK {
-        return TC_ACT_SHOT;
+        return Err(TC_ACT_SHOT);
     }
 
     // listener_l4proto is stored in cb[1] only when the control-plane handoff
@@ -1003,7 +985,7 @@ fn do_tproxy_dae0peer_ingress(ctx: &TcContext) -> i32 {
         let _ = assign_listener(ctx, listener_l4proto);
     }
 
-    TC_ACT_OK
+    Ok(TC_ACT_OK)
 }
 
 /// SockMap keys for `LISTEN_SOCKET_MAP`, matching the userspace
@@ -1020,9 +1002,10 @@ const KEY_UDP6: u32 = 3;
 ///
 /// Ported from Go dae's `assign_listener` in `control/kern/tproxy.c`.  Uses
 /// `bpf_sk_assign` via a SOCKMAP lookup — the same proven pattern employed by
-/// the `tproxy_sk_lookup` program in `sk_lookup.rs`.
+/// the `tproxy_sk_lookup` program in `sk_lookup.rs`, shared via
+/// [`sk::sk_assign_by_index`].
 #[inline(always)]
-fn assign_listener(ctx: &TcContext, listener_l4proto: u8) -> i32 {
+fn assign_listener(ctx: &TcContext, listener_l4proto: u8) -> Result<(), c_long> {
     // SockMap keys differentiate IPv4 vs IPv6 to match the per-family
     // listeners published by userspace.
     let is_v6 = unsafe { (*ctx.skb.skb).protocol as u16 } == ETH_P_IPV6.to_be();
@@ -1040,35 +1023,21 @@ fn assign_listener(ctx: &TcContext, listener_l4proto: u8) -> i32 {
         }
     };
 
-    let map_ptr = ptr::from_ref(&LISTEN_SOCKET_MAP)
-        .cast_mut()
-        .cast::<c_void>();
-    let sk = unsafe { bpf_map_lookup_elem(map_ptr, &key as *const u32 as *const c_void) };
-    if sk.is_null() {
-        return -1;
-    }
-
-    // In a TC classifier context the first argument is the __sk_buff pointer.
-    let ret = unsafe { bpf_sk_assign(ctx.skb.skb as *mut c_void, sk, 0) };
-
-    // The verifier requires releasing the socket reference to balance the
-    // lookup's implicit acquire.
-    unsafe { bpf_sk_release(sk) };
-
-    ret as i32
+    let map_ptr = ptr::from_ref(&LISTEN_SOCKET_MAP).cast::<c_void>();
+    sk::sk_assign_by_index(ctx, map_ptr, &key, 0)
 }
 
 // #[inline(never)]: standalone program, no deep call chain.
 #[inline(never)]
-fn do_tproxy_dae0_ingress(ctx: &TcContext) -> i32 {
+fn do_tproxy_dae0_ingress(ctx: &TcContext) -> Verdict {
     let redirect_tuple = match load_redirect_tuple(ctx) {
         Ok(rt) => rt,
-        Err(_) => return TC_ACT_OK,
+        Err(_) => return Err(TC_ACT_OK),
     };
 
     let entry_ptr = REDIRECT_TRACK.get_ptr_mut(redirect_tuple);
     if entry_ptr.is_none() {
-        return TC_ACT_OK;
+        return Err(TC_ACT_OK);
     }
     let entry = unsafe { &mut *entry_ptr.unwrap() };
 
@@ -1102,9 +1071,7 @@ fn do_tproxy_dae0_ingress(ctx: &TcContext) -> i32 {
     }
 
     let _ = ctx.skb.change_type(0); // PACKET_HOST
-    let ret = unsafe { bpf_redirect(entry.ifindex, 0) as i32 };
-
-    ret
+    Ok(unsafe { bpf_redirect(entry.ifindex, 0) } as c_long)
 }
 
 // TC entry points use raw __sk_buff pointer to avoid verifier
@@ -1113,35 +1080,35 @@ fn do_tproxy_dae0_ingress(ctx: &TcContext) -> i32 {
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn lan_ingress_l2(ctx: *mut __sk_buff) -> i32 {
-    do_tproxy_lan_ingress(&TcContext::new(ctx), 14)
+    flatten(do_tproxy_lan_ingress(&TcContext::new(ctx), 14))
 }
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn lan_ingress_l3(ctx: *mut __sk_buff) -> i32 {
-    do_tproxy_lan_ingress(&TcContext::new(ctx), 0)
+    flatten(do_tproxy_lan_ingress(&TcContext::new(ctx), 0))
 }
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn wan_ingress_l2(ctx: *mut __sk_buff) -> i32 {
-    do_tproxy_wan_ingress(&TcContext::new(ctx), 14)
+    flatten(do_tproxy_wan_ingress(&TcContext::new(ctx), 14))
 }
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn wan_ingress_l3(ctx: *mut __sk_buff) -> i32 {
-    do_tproxy_wan_ingress(&TcContext::new(ctx), 0)
+    flatten(do_tproxy_wan_ingress(&TcContext::new(ctx), 0))
 }
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn dae0peer_ingress(ctx: *mut __sk_buff) -> i32 {
-    do_tproxy_dae0peer_ingress(&TcContext::new(ctx))
+    flatten(do_tproxy_dae0peer_ingress(&TcContext::new(ctx)))
 }
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn dae0_ingress(ctx: *mut __sk_buff) -> i32 {
-    do_tproxy_dae0_ingress(&TcContext::new(ctx))
+    flatten(do_tproxy_dae0_ingress(&TcContext::new(ctx)))
 }

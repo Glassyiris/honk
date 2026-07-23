@@ -1,7 +1,7 @@
 //! Statistics tracking for honk-core.
 
-use honk_ebpf_common::OutboundStats;
 use dashmap::DashMap;
+use honk_ebpf_common::OutboundStats;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 

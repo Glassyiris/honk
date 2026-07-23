@@ -1,10 +1,12 @@
 //! On-demand URLTest latency measurement (sing-box `urltest` semantics).
 //!
-//! Dials a liveness URL through a proxy node, issues an HTTP/1.1 HEAD
-//! request, and times the exchange up to the response headers. Successful
-//! measurements feed the node's latency history in [`AliveDialerSet`];
-//! failed ones clear it (sing-box "delete history" semantics), so a failed
-//! node immediately sorts last in URLTest selection.
+//! Dials a liveness URL through a proxy node and times the exchange up to
+//! the response headers: HTTP/1.1 `HEAD /` or a real HTTP/2 request when the
+//! server negotiates h2 via ALPN (dispatched per connection — the probe
+//! offers `h2,http/1.1` and speaks whichever the server picks, Go-client
+//! style). Successful measurements feed the node's latency history in
+//! [`AliveDialerSet`]; failed ones clear it (sing-box "delete history"
+//! semantics), so a failed node immediately sorts last in URLTest selection.
 //!
 //! Used by the clash API delay endpoints; the periodic health check loop in
 //! `alive` is unaffected by these ad-hoc measurements.
@@ -16,7 +18,6 @@ use honk_config::node::Node;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio_rustls::rustls::pki_types::ServerName;
 
 /// Default liveness URL (sing-box / clash convention).
 pub const DEFAULT_URLTEST_URL: &str = "https://www.gstatic.com/generate_204";
@@ -32,10 +33,11 @@ pub const URLTEST_MAX_CONCURRENT: usize = 10;
 ///
 /// Dials the URL's host on port 443 (https) or 80 (http) through the proxy
 /// handler. For https URLs the stream is then wrapped in a real TLS
-/// handshake (server_name = host, standard webpki verification) before a
-/// minimal `HEAD / HTTP/1.1` request is sent; the measurement runs from
-/// dial start until the response headers are fully received. A TLS
-/// handshake failure counts as a measurement failure.
+/// handshake (server_name = host, standard webpki verification) and the
+/// probe issues a HEAD request over HTTP/1.1 or HTTP/2, whichever ALPN
+/// negotiated; the measurement runs from dial start until the response
+/// headers are fully received. A TLS handshake failure counts as a
+/// measurement failure.
 ///
 /// An empty `url` — or one starting with `http://` — falls back to
 /// [`DEFAULT_URLTEST_URL`]. A zero `timeout` falls back to
@@ -68,13 +70,18 @@ pub async fn urltest_node(
 
         if is_https {
             let connector = https_connector()?;
-            let server_name = ServerName::try_from(host.clone())
-                .map_err(|e| anyhow!("invalid TLS server name '{}': {}", host, e))?;
-            let mut tls = connector
-                .connect(server_name, stream)
+            let tls = connector
+                .connect(&host, stream)
                 .await
                 .context("TLS handshake failed")?;
-            exchange_head(&mut tls, &host).await?;
+            // The probe offers `h2,http/1.1`; speak whatever was negotiated.
+            match tls.ssl().selected_alpn_protocol() {
+                Some(b"h2") => exchange_head_h2(tls, &host).await?,
+                _ => {
+                    let mut tls = tls;
+                    exchange_head(&mut tls, &host).await?;
+                }
+            }
         } else {
             let mut stream = stream;
             exchange_head(&mut stream, &host).await?;
@@ -88,18 +95,51 @@ pub async fn urltest_node(
     }
 }
 
-/// TLS connector with standard webpki root verification for urltest.
-/// The underlying ClientConfig is built once and reused across
-/// measurements (it never changes at runtime).
-fn https_connector() -> anyhow::Result<tokio_rustls::TlsConnector> {
-    use tokio_rustls::rustls::ClientConfig;
-    static CONFIG: std::sync::OnceLock<anyhow::Result<Arc<ClientConfig>>> =
+/// BoringSSL connector with webpki root verification for urltest.
+/// Built once and reused across measurements (it never changes at runtime).
+/// Offers `h2,http/1.1`; the exchange dispatches on the negotiated ALPN.
+fn https_connector() -> anyhow::Result<crate::tls::TlsConnector> {
+    static CONNECTOR: std::sync::OnceLock<anyhow::Result<crate::tls::TlsConnector>> =
         std::sync::OnceLock::new();
-    let config = CONFIG.get_or_init(|| crate::tls::standard_config().map(Arc::new));
-    match config {
-        Ok(c) => Ok(tokio_rustls::TlsConnector::from(c.clone())),
-        Err(e) => Err(anyhow!("failed to build urltest TLS config: {}", e)),
+    let connector = CONNECTOR.get_or_init(|| crate::tls::build_http_probe_connector(false));
+    match connector {
+        Ok(c) => Ok(c.clone()),
+        Err(e) => Err(anyhow!("failed to build urltest TLS connector: {e:#}")),
     }
+}
+
+/// HTTP/2 variant of [`exchange_head`]: one HEAD request over a fresh H2
+/// session (same layer as the DoH transport), resolved when the response
+/// HEADERS arrive — the same measurement point as the HTTP/1.1 path.
+async fn exchange_head_h2<S>(stream: S, host: &str) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut sender, conn) = h2::client::handshake(stream)
+        .await
+        .map_err(|e| anyhow!("HTTP/2 handshake: {e}"))?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let req = http::Request::builder()
+        .method("HEAD")
+        .uri(format!("https://{host}/"))
+        .header("user-agent", "honk-urltest/1.0")
+        .body(())
+        .map_err(|e| anyhow!("h2 request build: {e}"))?;
+    let (response_fut, _send_stream) = sender
+        .send_request(req, true)
+        .map_err(|e| anyhow!("h2 send_request: {e}"))?;
+    let response = response_fut
+        .await
+        .map_err(|e| anyhow!("h2 response: {e}"))?;
+
+    let code = response.status().as_u16();
+    if !(200..500).contains(&code) {
+        return Err(anyhow!("bad status code: {}", code));
+    }
+    Ok(())
 }
 
 /// Send a minimal HTTP/1.1 HEAD request and wait for the response
@@ -311,6 +351,49 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// Spawn a minimal HTTP/2 server answering every request with 204.
+    async fn spawn_h2_server() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut conn = h2::server::handshake(sock).await.unwrap();
+                    while let Some(result) = conn.accept().await {
+                        let (_request, mut respond) = result.unwrap();
+                        let response = http::Response::builder().status(204).body(()).unwrap();
+                        respond.send_response(response, true).unwrap();
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// The h2 probe path completes against an h2-only server — this is the
+    /// gstatic case that used to fail with "malformed HTTP response".
+    #[tokio::test]
+    async fn test_exchange_head_h2() {
+        let addr = spawn_h2_server().await;
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        exchange_head_h2(stream, "localhost")
+            .await
+            .expect("h2 HEAD exchange must succeed");
+
+        // A non-2xx..4xx status is a measurement failure.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut conn = h2::server::handshake(sock).await.unwrap();
+            let (_req, mut respond) = conn.accept().await.unwrap().unwrap();
+            let response = http::Response::builder().status(500).body(()).unwrap();
+            respond.send_response(response, true).unwrap();
+        });
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        assert!(exchange_head_h2(stream, "localhost").await.is_err());
     }
 
     #[test]

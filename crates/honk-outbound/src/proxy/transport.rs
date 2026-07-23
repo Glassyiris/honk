@@ -24,13 +24,12 @@
 //! exclusive, so a configured `node.transport` is ignored with a debug
 //! log). The protocol header the handler writes afterwards is unchanged.
 
-use honk_config::node::Node;
 use futures_util::{SinkExt, StreamExt};
+use honk_config::node::Node;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
-use tokio_rustls::rustls::pki_types::ServerName;
 
 use super::AsyncReadWrite;
 
@@ -95,9 +94,7 @@ pub(crate) async fn maybe_tls_wrap(
     if node.tls {
         let connector = crate::tls::build_connector(node)?;
         let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
-        let server_name =
-            ServerName::try_from(server_name).map_err(|e| anyhow::anyhow!("invalid SNI: {}", e))?;
-        let tls_stream = connector.connect(server_name, stream).await?;
+        let tls_stream = connector.connect(&server_name, stream).await?;
         Ok(Box::new(tls_stream))
     } else {
         Ok(Box::new(stream))
@@ -167,7 +164,7 @@ async fn ws_bridge_relay(
             }
             ws_sink
                 .send(tokio_tungstenite::tungstenite::Message::Binary(
-                    buf[..n].to_vec(),
+                    buf[..n].to_vec().into(),
                 ))
                 .await
                 .map_err(|e| anyhow::anyhow!("ws bridge send: {}", e))?;
@@ -530,9 +527,9 @@ mod tests {
                 .await
                 .unwrap();
             let msg = ws.next().await.unwrap().unwrap();
-            assert_eq!(msg.into_data(), b"ping");
+            assert_eq!(&msg.into_data()[..], b"ping");
             ws.send(tokio_tungstenite::tungstenite::Message::Binary(
-                b"pong".to_vec(),
+                b"pong".to_vec().into(),
             ))
             .await
             .unwrap();

@@ -659,7 +659,7 @@ impl TuicHandler {
         Self
     }
 
-    fn client_for(node: &Node) -> anyhow::Result<Arc<TuicClient>> {
+    async fn client_for(node: &Node) -> anyhow::Result<Arc<TuicClient>> {
         let uuid_str = node
             .tuic_uuid
             .as_deref()
@@ -682,24 +682,22 @@ impl TuicHandler {
             node.sni.as_deref().unwrap_or(""),
             node.skip_cert_verify
         );
-        let mut clients = CLIENTS.lock();
-        if let Some(client) = clients.get(&key) {
+        if let Some(client) = CLIENTS.lock().get(&key) {
             return Ok(Arc::clone(client));
         }
+        // Build outside the lock: client_config is async (ECH discovery).
         let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
-        let config = crate::quic::client_config(
-            node.skip_cert_verify,
-            &[b"tuic"],
-            node.tuic_congestion.as_deref(),
-            None,
-        )?;
+        let config =
+            crate::quic::client_config(node, &[b"tuic"], node.tuic_congestion.as_deref(), None)
+                .await?;
         let client = Arc::new(TuicClient {
             quic: QuicClient::new(node.host().to_string(), node.port, server_name, config),
             uuid: *uuid.as_bytes(),
             password,
         });
-        clients.insert(key, Arc::clone(&client));
-        Ok(client)
+        // Another task may have won the race — reuse theirs.
+        let mut clients = CLIENTS.lock();
+        Ok(clients.entry(key).or_insert_with(|| Arc::clone(&client)).clone())
     }
 
     async fn send_udp(
@@ -753,7 +751,7 @@ impl ProxyHandler for TuicHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let client = Self::client_for(node)?;
+        let client = Self::client_for(node).await?;
         let addr = TuicAddr::new(target, target_domain);
         let mut last_err: Option<anyhow::Error> = None;
         // Retry once with a fresh connection when the stream open fails on a
@@ -803,7 +801,7 @@ impl ProxyHandler for TuicHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<UdpProxySocket> {
-        let client = Self::client_for(node)?;
+        let client = Self::client_for(node).await?;
         let (conn, state) = client.connection(connect_timeout).await?;
         state.touch();
         let session_id = state.alloc_session();
@@ -893,7 +891,7 @@ impl ProxyHandler for TuicHandler {
     }
 
     async fn test_connectivity(&self, node: &Node) -> bool {
-        match Self::client_for(node) {
+        match Self::client_for(node).await {
             Ok(client) => client.connection(Duration::from_secs(5)).await.is_ok(),
             Err(e) => {
                 debug!("TUIC connectivity test failed for {}: {}", node.name, e);

@@ -33,8 +33,8 @@
 | `lan_tcp_mss` | u16 | `0` | 已弃用；仅解析兼容 |
 | `allow_insecure` | bool | `false` | 全局 TLS 跳过校验回退 |
 | `sniffing_timeout_ms` | u64 | `30` | 嗅探超时（ms）。**dae：** `sniffing_timeout` 时长 |
-| `tls_implementation` | string | `"tls"` | TLS 栈名称 |
-| `utls_imitate` | string | `"chrome_auto"` | 预留（REALITY/uTLS 已延期） |
+| `tls_implementation` | string | `"tls"` | TLS 栈：`tls`（原生 BoringSSL）/ `utls`（真实 Chrome 指纹） |
+| `utls_imitate` | string | `"chrome_auto"` | 指纹配置；`chrome*` 映射到内置真实 Chrome 指纹（BoringSSL）；其他值告警并回退 Chrome（目前唯一 profile） |
 | `tls_fragment` | bool | `false` | TLS ClientHello 分片开关 |
 | `tls_fragment_length` | string | `""` | 分片长度范围 |
 | `tls_fragment_interval` | string | `""` | 分片间隔范围 |
@@ -80,6 +80,9 @@ dae 语法中节点**只能以分享链接书写**：`tag: 'scheme://...'` 或�
 | `tls` | bool | `false` | 启用 TLS；trojan/vless/anytls 等链接自动开启 |
 | `sni` | string? | null | TLS SNI；链接 `sni`（或未被传输占用的 `host`）参数 |
 | `skip_cert_verify` | bool | `false` | 跳过证书校验；链接 `allowInsecure` / `insecure` 参数 |
+| `ech_enabled` | bool | `false` | 提供 ECH；链接 `ech=1`（或 `ech_config` 隐式开启） |
+| `ech_config` | string? | null | Base64 编码的 ECHConfigList；链接 `ech_config` 参数 |
+| `ech_config_path` | string? | null | 存放 base64 ECHConfigList 的文件路径 |
 | `network` | string? | null | V2Ray 风格 network 提示 |
 | `ws_path` / `ws_host` | string? | null | WebSocket；链接 `path` / `host` 参数 |
 | `grpc_service` | string? | null | gRPC service 名；链接 `serviceName` 参数 |
@@ -136,6 +139,25 @@ node {
 ```
 
 注意：`mux`（h2mux）没有对应的分享链接参数，dae 语法下无法开启。
+
+### TLS 指纹与 ECH
+
+所有 TLS 均运行在 **BoringSSL** 上（代理 TLS、DoT/DoH 上游，以及经由自研 quinn 加密后端的 QUIC 握手）。两种全局模式：
+
+- `tls_implementation: tls` — 原生 BoringSSL ClientHello。
+- `tls_implementation: utls` — 真实 Chrome 指纹：GREASE、扩展乱序、X25519MLKEM768+X25519 密钥分享、Chrome 签名算法/曲线、brotli 证书压缩、h2 ALPS、ECH GREASE。对 TCP TLS 与 QUIC ClientHello 同时生效。
+
+按节点配置 **ECH**（Encrypted Client Hello）——TLS 与 QUIC（hysteria2/juicity/tuic）均可：
+
+```dae
+node {
+    hy2_ech: 'hysteria2://secret@example.com:443?sni=example.com&ech_config=AD%2B-DQIAA...#hy2_ech'
+}
+```
+
+- `ech_config=<base64 ECHConfigList>`（或结构化配置中的 `ech_config_path`）提供真实 ECH；无配置时 Chrome 模式发送 ECH GREASE（与真实浏览器一致）。
+- ECH 按 RFC 失败关闭：服务端不接受 ECH 时握手失败（BoringSSL `ECH_REJECTED`），服务端提供的重试配置会写入日志。
+- `ech_enabled` 但无静态配置时，连接期从 DNS HTTPS 记录（RFC 9460）发现 ECHConfigList——经 bootstrap resolver（未配置时用系统首个 nameserver），按域名缓存（命中按记录 TTL，未命中 5 分钟）。发现是尽力而为且失败开放的：找不到配置时 Chrome 模式仍发送 ECH GREASE，握手不带 ECH 继续。
 
 **AnyTLS 池**
 
@@ -311,7 +333,6 @@ dns {
 | `routing` | object | fallback 默认 | 请求路由；dae：`routing { request { ... } }` |
 | `strategy` | enum | `preferipv4` | 地址族策略；dae：`ipversion_prefer: 4\|6` |
 | `cache` | object | 启用 | 缓存；dae：`optimistic_cache` / `optimistic_cache_ttl` / `max_cache_size` |
-| `has_response_routing` | bool | `false` | 存在 dae `response {}` 时置位（标志） |
 
 ### 上游
 
@@ -320,35 +341,37 @@ dns {
 | `name` | string | 必填 | Id；dae 中冒号前的名字 |
 | `address` | string | 必填 | `ip:port` 或主机；dae 中取 URI 的主机部分 |
 | `protocol` | enum | `udp` | `udp`/`tcp`/`tls`/`https`/`quic`；dae 中由 URI scheme 决定（`udp://`、`tcp://`、`tcp+udp://`/`udp+tcp://`、`tls://`、`https://`、`h3://`、`quic://`，无 scheme 默认为 UDP） |
-| `tls_server_name` | string? | null | DoT/DoH SNI（结构化模型字段，dae 语法无对应键） |
-| `bootstrap` | string? | null | Bootstrap DNS（结构化模型字段，dae 语法无对应键） |
-| `outbound` | string? | null | 经节点/组发出；dae 中行内后缀 `'uri' outbound: <name>` |
-| `tags` | string[] | `[]` | 标签（结构化模型字段，dae 语法无对应键） |
+| `tls_server_name` | string? | null | DoT/DoH SNI；dae 语法中当主机名不是 IP 时自动派生 |
+| `outbound` | string? | null | 经节点/组发出；dae 中行内后缀 `'uri' -> <name>`（旧：`outbound: name`） |
 
-**运行时说明：** UDP/TCP 可用；TLS/HTTPS/QUIC 目前偏向回退普通 TCP。经代理的 DNS SOCKS5 UDP 路径不完整。
+**运行时说明：** UDP/TCP/DoT/DoH/DoQ/DoH3 均可用（连接复用）。DoT/DoH/TCP 支持 `-> proxy`（经节点/组的 TCP 隧道）；DoQ/DoH3 暂仅直连。经代理的 DNS SOCKS5 UDP 路径不完整（UDP+代理隧道化为 TCP DNS）。
 
 ### 路由 / 规则
 
 | 字段 | 含义 |
 | ------ | ------ |
-| `routing.fallback` | 无规则命中时的上游名；dae：`request { fallback: <上游名> }` |
-| `routing.rules[].domain` | 可带前缀的模式（结构化模型字段；dae 解析器目前不读取 `request` 内的规则行） |
-| `routing.rules[].upstream` | 上游名（同上） |
-
-前缀：`suffix:`、`keyword:`、`full:`、`regex:`；裸字符串 = 完整精确匹配。
+| `request { <条件> [&& <条件>...] -> <动作> }` | 请求规则，首条命中。条件：`qname(suffix:/keyword:/full:/regex:/geosite:...)`、`qtype(a/aaaa/...)`；`!` 取反。动作：`reject`、`asis`（拨查询的原始目的地址）或上游名 |
+| `request { fallback: <上游名> }` | 无请求规则命中时的上游 |
+| `response { <条件> [&& <条件>...] -> <动作> }` | 响应规则，首条命中。条件：`upstream(name)`、`qname(...)`、`ip(cidr, geoip:...)`；`!` 取反。动作：`accept`、`reject` 或上游名（重新查询，深度 ≤ 3） |
+| `response { fallback: accept\|reject }` | 无响应规则命中时的判定 |
+| `routing.rules[].domain` / `.upstream` | 旧版纯模式字段（前缀 `suffix:`/`keyword:`/`full:`/`regex:`）；无新式规则时在加载时转换为请求规则 |
 
 ### 策略
 
 `preferipv4` | `preferipv6` | `ipv4only` | `ipv6only` | `both`
 
-dae：`ipversion_prefer: 4|6`。
+- `ipv4only` / `ipv6only`：另一地址族的查询在请求期直接回 NODATA，不转发上游。
+- `preferipv4` / `preferipv6`：两个地址族都会转发；当偏好族对同名有应答时，另一族的应答被压制（NODATA）；偏好族无应答时返回另一族的真实应答（允许回退）。缓存未命中时偏好族检查需额外一次上游查询。
+- `both`：不过滤。
+
+dae：`ipversion_prefer: 4` 映射 `preferipv4`，`6` 映射 `preferipv6`（其他值 = `preferipv4`）；only 模式无法通过 dae 语法表达。
 
 ### 缓存
 
 | 字段 | 默认值 | 含义 |
 | ------ | -------- | ------ |
 | `enabled` | `true` | 开关。**dae：** `optimistic_cache` |
-| `ttl` | `600` | 秒。**dae：** `optimistic_cache_ttl` |
+| `ttl` | `600` | 正缓存固定 TTL（覆盖应答 min TTL；`0` 表示沿用上游）。**dae：** `optimistic_cache_ttl` |
 | `max_size` | `10000` | 最大条目（必须 > 0）。**dae：** `max_cache_size` |
 
 可选持久化：`experimental { cache_file { ... } }` 的 `store_dns`。

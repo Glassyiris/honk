@@ -81,12 +81,16 @@ impl DnsCache {
 
     /// Look up a cached DNS response by key.
     ///
-    /// Returns `None` if the key is not present **or** if the
-    /// entry has expired.  This method does **not** update the
-    /// LRU position of the entry (uses `peek` internally), so
-    /// eviction order is driven by insertion time, not read time.
-    pub fn get(&self, key: &str) -> Option<&CachedEntry> {
-        self.inner.peek(key).filter(|entry| !entry.is_expired())
+    /// Returns `None` if the key is not present **or** if the entry has
+    /// expired. Hot keys are promoted in the LRU so repeated lookups keep
+    /// popular domains resident under pressure.
+    pub fn get(&mut self, key: &str) -> Option<&CachedEntry> {
+        // Promote on hit; drop expired entries so capacity is freed promptly.
+        if self.inner.peek(key).is_some_and(|e| e.is_expired()) {
+            self.inner.pop(key);
+            return None;
+        }
+        self.inner.get(key).filter(|entry| !entry.is_expired())
     }
 
     /// Store a DNS response in the cache.

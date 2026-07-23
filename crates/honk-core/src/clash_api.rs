@@ -359,8 +359,10 @@ fn build_group_proxy_info(
 
     let mut history: Vec<serde_json::Value> = Vec::new();
     for name in &node_names {
-        if let Some(latency) = alive_set.get_last_latency(name, ProbeDomain::Tcp, IpVersion::V4) {
-            history.push(delay_history_entry(latency.as_millis() as u64));
+        if let Some((latency, at)) =
+            alive_set.get_last_real_sample(name, ProbeDomain::Tcp, IpVersion::V4)
+        {
+            history.push(delay_history_entry(latency.as_millis() as u64, at));
         }
     }
 
@@ -391,17 +393,20 @@ fn build_node_proxy_info(node: &Node, alive_set: &AliveDialerSet) -> serde_json:
         "udp": true,
         "history": [],
     });
-    if let Some(latency) = alive_set.get_last_latency(&node.name, ProbeDomain::Tcp, IpVersion::V4) {
+    if let Some((latency, at)) =
+        alive_set.get_last_real_sample(&node.name, ProbeDomain::Tcp, IpVersion::V4)
+    {
         let ms = latency.as_millis() as u64;
-        info["history"] = serde_json::json!([delay_history_entry(ms)]);
+        info["history"] = serde_json::json!([delay_history_entry(ms, at)]);
     }
     info
 }
 
-/// A clash-shaped delay history entry.
-fn delay_history_entry(ms: u64) -> serde_json::Value {
+/// A clash-shaped delay history entry: the measurement's own wall-clock
+/// time, not the render time (dashboards treat "now" timestamps as fresh).
+fn delay_history_entry(ms: u64, at: std::time::SystemTime) -> serde_json::Value {
     serde_json::json!({
-        "time": chrono::Utc::now().to_rfc3339(),
+        "time": chrono::DateTime::<chrono::Utc>::from(at).to_rfc3339(),
         "delay": ms,
     })
 }
@@ -911,9 +916,9 @@ fn connections_json(s: &ClashState) -> serde_json::Value {
                 "upload": e.upload,
                 "download": e.download,
                 "start": start,
-                "chains": [e.proxy.clone()],
-                "rule": "",
-                "rulePayload": "",
+                "chains": e.chains,
+                "rule": e.rule,
+                "rulePayload": e.rule_payload,
             })
         })
         .collect();

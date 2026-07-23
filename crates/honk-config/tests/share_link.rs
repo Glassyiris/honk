@@ -2,9 +2,9 @@
 //! extension-aware config (de)serialization.
 
 use base64::Engine as _;
+use honk_config::Config;
 use honk_config::node::Node;
 use honk_config::types::NodeProtocol;
-use honk_config::Config;
 
 /// URL-safe base64 without padding (the encoding used by vmess/ssr links).
 fn b64(s: &str) -> String {
@@ -433,4 +433,25 @@ fn test_percent_encoded_userinfo_is_decoded() {
 
     let node = Node::from_share_link("trojan://pass%40word%3Ax@h.example.com:443").unwrap();
     assert_eq!(node.password.as_deref(), Some("pass@word:x"));
+}
+
+#[test]
+fn test_ech_query_params() {
+    // ech_config=<base64url ECHConfigList> enables ECH and carries the config.
+    let node = Node::from_share_link(
+        "hysteria2://pass@example.com:443/?sni=example.com&ech_config=QUJDMTIz",
+    )
+    .unwrap();
+    assert!(node.ech_enabled);
+    assert_eq!(node.ech_config.as_deref(), Some("QUJDMTIz"));
+
+    // Bare ech=1 toggles ECH without keys.
+    let node = Node::from_share_link("tuic://u:p@example.com:443/?ech=1").unwrap();
+    assert!(node.ech_enabled);
+    assert!(node.ech_config.is_none());
+
+    // No ECH params: disabled.
+    let node = Node::from_share_link("trojan://pass@example.com:443").unwrap();
+    assert!(!node.ech_enabled);
+    assert!(node.ech_config.is_none());
 }

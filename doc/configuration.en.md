@@ -124,6 +124,8 @@ dns {
         }
     }
     optimistic_cache: true
+    # Fixed positive-cache TTL (overrides answer min TTL for cache + wire RR TTLs).
+    # Set 0 to keep the upstream answer TTL instead.
     optimistic_cache_ttl: 600
     max_cache_size: 10000
 }
@@ -270,27 +272,53 @@ dns {
     upstream {
         alidns: 'udp://223.5.5.5:53'
         # optional: query this upstream via a proxy group
-        googledns: 'tcp://8.8.8.8:53' outbound: proxy
+        googledns: 'tcp://8.8.8.8:53' -> proxy
+        google_doh: 'https://dns.google/dns-query' -> proxy
     }
 
     routing {
         request {
-            fallback: alidns
+            # qname / qtype / && / !  — same grammar as traffic routing
+            qname(geosite: category-ads-all) -> reject
+            qname(suffix: cn) -> alidns
+            qtype(https) -> reject
+            qtype(a, aaaa) -> alidns
+            fallback: alidns   # also: asis | reject | named upstream
+        }
+        response {
+            # accept | reject | named upstream (re-query, depth ≤ 3)
+            upstream(googledns) -> accept
+            ip(geoip: private) && !qname(geosite: cn) -> googledns
+            fallback: accept
         }
     }
 
+    fixed_domain_ttl {
+        ddns.example.org: 10
+        nocache.test: 0        # 0 = never cache
+    }
+
     optimistic_cache: true
+    # Fixed positive-cache TTL (overrides answer min TTL for cache + wire RR TTLs).
+    # Set 0 to keep the upstream answer TTL instead.
     optimistic_cache_ttl: 600
     max_cache_size: 10000
 }
 ```
 
-Upstream URIs take a scheme prefix: `udp://`, `tcp://`, `tcp+udp://`, `tls://`, `https://`, `quic://`; a bare `host:port` defaults to UDP.
+Upstream URIs take a scheme prefix: `udp://`, `tcp://`, `tcp+udp://`, `tls://`, `https://`, `quic://`, `h3://`; a bare `host:port` defaults to UDP.
+
+**Request outbounds:** named upstream, `reject` (empty success), `asis` (dial the intercepted original DNS destination).
+**Response outbounds:** `accept`, `reject`, or a named upstream to re-query.
 
 **Caveats today:**
 
-- Real wire DoT/DoH/DoQ is incomplete (config accepts protocols; runtime may fall back to TCP).
-- The dae `request { }` block maps the `fallback` upstream only; per-domain upstream rules are not expressible in dae syntax.
+- DoT / DoH (HTTP/2) / DoQ / DoH3 are implemented with session reuse (TLS idle pool, H2 mux, single QUIC conn). DoQ/DoH3 do not yet support proxy tunneling.
+- **Dial path (dae-aligned):**
+  - Explicit: `name: 'uri' -> <node|group>` forces that outbound (GroupManager policy for groups).
+  - Implicit (no `->`): resolve the DNS server IP/host, run the traffic `routing { }` rules on that destination, then select a leaf via GroupManager — same idea as dae's `chooseBestDnsDialer`.
+  - H2/TLS sessions are cached **per leaf node**. Legacy `outbound: tag` is still accepted.
+- Internal `sub()` / `node()` / `subnode()` request selectors are parsed and ignored (client DNS only).
 
 ## 10. Subscriptions
 

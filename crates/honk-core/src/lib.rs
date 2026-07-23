@@ -326,10 +326,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         &config.global.bootstrap_resolver,
     ));
     if !config.global.bootstrap_resolver.is_empty() {
-        info!(
-            "Bootstrap resolver: {}",
-            config.global.bootstrap_resolver
-        );
+        info!("Bootstrap resolver: {}", config.global.bootstrap_resolver);
     }
 
     // Fetch any configured subscriptions concurrently with a 5-second
@@ -621,7 +618,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let dns_cache = std::sync::Arc::new(tokio::sync::Mutex::new(dns::cache::DnsCache::new(
         config.dns.cache.max_size,
     )));
-    let dns_router = std::sync::Arc::new(dns::routing::DnsRouter::new(&config.dns.routing)?);
+    let dns_router =
+        std::sync::Arc::new(dns::routing::DnsRouter::new_from_dns_config(&config.dns)?);
+    // Keep a concrete Arc so we can attach SharedGroupManager after the
+    // control plane builds it (same cell traffic dials use).
     let dns_upstream_pool = std::sync::Arc::new(
         dns::upstream_pool::UpstreamPool::new_with_proxy(
             &config.dns.upstream,
@@ -643,11 +643,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     }
     let dns_forwarder = std::sync::Arc::new(
         dns::forwarder::DnsForwarder::new(
-            dns_upstream_pool as std::sync::Arc<dyn dns::forwarder::DnsUpstreamPool>,
+            dns_upstream_pool.clone() as std::sync::Arc<dyn dns::forwarder::DnsUpstreamPool>,
             dns_cache,
             dns_router,
         )
-        .with_strategy(config.dns.strategy.clone()),
+        .with_strategy(config.dns.strategy.clone())
+        .with_cache_enabled(config.dns.cache.enabled)
+        .with_cache_ttl(config.dns.cache.ttl.min(u64::from(u32::MAX)) as u32),
     );
     info!("DNS forwarder ready");
 
@@ -662,6 +664,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         dns_resolver,
         dns_forwarder,
     )?;
+
+    // Wire GroupManager into DNS outbound selection (Selector/URLTest/…).
+    dns_upstream_pool.set_group_manager(Some(control_plane.group_manager()));
+    dns_upstream_pool.set_traffic_router(Some(control_plane.traffic_router()));
+    info!("DNS upstream pool attached to SharedGroupManager + traffic Router");
 
     // Persistent cache (selector choices, clash mode): opens cache.db when
     // `experimental.cache_file` is enabled, restores Selector choices, and
@@ -872,11 +879,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                                 sub.id = old.id;
                             }
                         }
-                        let known: std::collections::HashSet<uuid::Uuid> = new_config
-                            .subscriptions
-                            .iter()
-                            .map(|s| s.id)
-                            .collect();
+                        let known: std::collections::HashSet<uuid::Uuid> =
+                            new_config.subscriptions.iter().map(|s| s.id).collect();
                         let carried: Vec<_> = current
                             .nodes
                             .iter()
@@ -1565,15 +1569,17 @@ fn cleanup_dae0_interface() {
 pub(crate) const DAENS_HOST_IP: &str = "169.254.0.1";
 #[cfg_attr(not(feature = "ebpf"), allow(dead_code))]
 pub(crate) const DAENS_PEER_IP: &str = "169.254.0.11";
-/// IPv6 ULA addresses of the dae0/dae0peer veth pair (fd00:honk::/64).
+/// IPv6 ULA addresses of the dae0/dae0peer veth pair (fd00:686f:6e6b::/64).
+/// The middle hextets are ASCII "honk" (`68 6f 6e 6b`) so the mnemonic
+/// stays readable while remaining a valid IPv6 ULA prefix.
 #[cfg_attr(not(feature = "ebpf"), allow(dead_code))]
-pub(crate) const DAENS_HOST_IPV6: &str = "fd00:honk::1";
+pub(crate) const DAENS_HOST_IPV6: &str = "fd00:686f:6e6b::1";
 #[cfg_attr(not(feature = "ebpf"), allow(dead_code))]
-pub(crate) const DAENS_PEER_IPV6: &str = "fd00:honk::2";
+pub(crate) const DAENS_PEER_IPV6: &str = "fd00:686f:6e6b::2";
 
-/// First 64 bits of `DAENS_HOST_IPV6`/`DAENS_PEER_IPV6` — the fd00:honk::/64
-/// ULA prefix — as a big-endian u64.
-pub(crate) const DAE0_IPV6_PREFIX_HI: u64 = 0xfd00_honk_0000_0000;
+/// First 64 bits of `DAENS_HOST_IPV6`/`DAENS_PEER_IPV6` — the
+/// fd00:686f:6e6b::/64 ULA prefix — as a big-endian u64.
+pub(crate) const DAE0_IPV6_PREFIX_HI: u64 = 0xfd00_686f_6e6b_0000;
 /// `DAENS_HOST_IP`/`DAENS_PEER_IP` with the host bits masked off
 /// (169.254.0.0/16), as a big-endian u32.
 pub(crate) const DAE0_IPV4_NET: u32 = 0xA9FE_0000;

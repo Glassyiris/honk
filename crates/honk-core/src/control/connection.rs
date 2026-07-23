@@ -41,12 +41,12 @@ impl HandoffResult {
     }
 }
 
-struct ConnectionGuard {
+pub(super) struct ConnectionGuard {
     drain: Arc<DrainTracker>,
 }
 
 impl ConnectionGuard {
-    fn new(drain: Arc<DrainTracker>) -> Self {
+    pub(super) fn new(drain: Arc<DrainTracker>) -> Self {
         drain.increment();
         Self { drain }
     }
@@ -62,29 +62,29 @@ impl Drop for ConnectionGuard {
 /// Bundles all shared fields under a single `Arc` to eliminate
 /// per-field atomic reference-count overhead on the hot path.
 #[derive(Clone)]
-struct ControlPlaneHandle {
-    config: Arc<RwLock<Config>>,
-    router: Arc<RwLock<Router>>,
-    proxy_registry: Arc<ProxyRegistry>,
-    dns_resolver: Arc<DnsResolver>,
-    group_manager: SharedGroupManager,
-    stats: Arc<StatsManager>,
-    ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
-    udp_pool: Arc<UdpEndpointPool>,
-    tcp_sniff_neg_cache: Arc<crate::control::tcp_sniff::TcpSniffNegCache>,
-    sniffer_pool: Arc<crate::control::packet_sniffer::PacketSnifferPool>,
-    dns_controller: Arc<crate::control::dns_control::DnsController>,
-    alive_set: Arc<AliveDialerSet>,
-    connection_pool: Arc<ConnectionPool>,
-    connection_tracker: Arc<ConnectionTracker>,
+pub(super) struct ControlPlaneHandle {
+    pub(super) config: Arc<RwLock<Config>>,
+    pub(super) router: Arc<RwLock<Router>>,
+    pub(super) proxy_registry: Arc<ProxyRegistry>,
+    pub(super) dns_resolver: Arc<DnsResolver>,
+    pub(super) group_manager: SharedGroupManager,
+    pub(super) stats: Arc<StatsManager>,
+    pub(super) ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+    pub(super) udp_pool: Arc<UdpEndpointPool>,
+    pub(super) tcp_sniff_neg_cache: Arc<crate::control::tcp_sniff::TcpSniffNegCache>,
+    pub(super) sniffer_pool: Arc<crate::control::packet_sniffer::PacketSnifferPool>,
+    pub(super) dns_controller: Arc<crate::control::dns_control::DnsController>,
+    pub(super) alive_set: Arc<AliveDialerSet>,
+    pub(super) connection_pool: Arc<ConnectionPool>,
+    pub(super) connection_tracker: Arc<ConnectionTracker>,
     /// Shared clash mode state (None when the clash API is disabled).
-    mode_state: Option<crate::mode::SharedModeState>,
+    pub(super) mode_state: Option<crate::mode::SharedModeState>,
 }
 
 /// Check whether a connected TCP stream is still alive via SO_ERROR.
 ///
 /// Returns true if the socket is healthy (no pending error).
-fn is_tcp_stream_alive(stream: &TcpStream) -> bool {
+pub(super) fn is_tcp_stream_alive(stream: &TcpStream) -> bool {
     use std::os::unix::io::AsRawFd;
     let fd = stream.as_raw_fd();
     let mut err: libc::c_int = 0;
@@ -213,7 +213,7 @@ impl ControlPlaneHandle {
         state.override_outbound(&outbound_name, false, selection_resolvable)
     }
 
-    async fn serve_connection(
+    pub(super) async fn serve_connection(
         &self,
         mut stream: TcpStream,
         client_addr: SocketAddr,
@@ -380,6 +380,16 @@ impl ControlPlaneHandle {
             (name.to_string(), must)
         };
 
+        // Matched-rule identity for the /connections display. The userspace
+        // Router mirrors the eBPF-compiled rules, so this names eBPF-decided
+        // flows as well (display-only; the handoff decision above stands).
+        let matched_rule = {
+            let router = self.router.read().await;
+            router
+                .route_full(&conn_info)
+                .map(|m| m.rule_display.to_string())
+        };
+
         // Clash mode override (Direct/Global); no-op when the clash API is
         // disabled or mode is Rule. Must-rule and block results are never
         // overridden.
@@ -464,7 +474,7 @@ impl ControlPlaneHandle {
                 })
                 .unwrap_or(false);
         if ebpf_offload {
-            info!(
+            debug!(
                 network = "tcp",
                 outbound = %outbound_name,
                 ip = %original_dst,
@@ -474,7 +484,6 @@ impl ControlPlaneHandle {
                 client_addr,
                 original_dst,
             );
-            self.stats.record_connection(&outbound_name);
             self.stats.record_close(&outbound_name);
             return Ok(());
         }
@@ -494,6 +503,7 @@ impl ControlPlaneHandle {
                 self.alive_set.notify_check_tcp(&node_name);
             }
             self.stats.record_error(&outbound_name);
+            self.stats.record_close(&outbound_name);
             return Ok(());
         }
 
@@ -804,6 +814,9 @@ impl ControlPlaneHandle {
                             );
                         }
                     }
+                    // Per-candidate failures already counted as errors above;
+                    // only balance the active-connections counter here.
+                    self.stats.record_close(&outbound_name);
                     return Ok(());
                 }
             }
@@ -812,6 +825,29 @@ impl ControlPlaneHandle {
         let dscp_val = handoff.as_ref().map(|ho| ho.dscp).unwrap_or(0);
 
         let conn_id = uuid::Uuid::new_v4().to_string();
+        // Clash-shaped matched rule + dial chain for /connections: `rule` is
+        // the dae rule expression ("Match" = fallback), `chains` is the
+        // selection path leaf-first ([leaf, ..sub-groups.., topGroup]).
+        let (rule, rule_payload) = match &matched_rule {
+            Some(name) => (
+                name.clone(),
+                domain
+                    .clone()
+                    .unwrap_or_else(|| resolved_target.ip().to_string()),
+            ),
+            None => ("Match".to_string(), String::new()),
+        };
+        let chains = {
+            let gm = self.group_manager.read();
+            let mut chain = gm.selection_chain(&outbound_name);
+            // Groups without a formed selection (LoadBalance, cold URLTest)
+            // stop at the group tag — append the actual dialed leaf.
+            if chain.last() != Some(&node.name) {
+                chain.push(node.name.clone());
+            }
+            chain.reverse();
+            chain
+        };
         // Live byte counters shared with the relay task: it increments them
         // as data flows so /connections shows real-time totals instead of a
         // single close-time (never-visible) update.
@@ -823,6 +859,9 @@ impl ControlPlaneHandle {
                 source: client_addr.to_string(),
                 destination: resolved_target.to_string(),
                 proxy: node.name.clone(),
+                rule,
+                rule_payload,
+                chains,
                 upload: conn_upload.clone(),
                 download: conn_download.clone(),
                 start_time: std::time::Instant::now(),
@@ -830,7 +869,7 @@ impl ControlPlaneHandle {
                 network: "tcp".to_string(),
             });
 
-        info!(
+        debug!(
             network = "tcp",
             outbound = %outbound_name,
             dialer = %node.name,
@@ -846,6 +885,7 @@ impl ControlPlaneHandle {
             if let Err(e) = proxy_stream.stream.write_all(&sniff_result.buffered).await {
                 warn!("Failed to write sniffed bytes to proxy: {}", e);
                 self.stats.record_error(&outbound_name);
+                self.stats.record_close(&outbound_name);
                 self.connection_tracker.remove(&conn_id);
                 return Ok(());
             }
@@ -970,6 +1010,7 @@ impl ControlPlaneHandle {
                     );
                 }
                 self.stats.record_error(&outbound_name);
+                self.stats.record_close(&outbound_name);
             }
         }
 
@@ -997,8 +1038,9 @@ impl ControlPlaneHandle {
     /// SNI sent by the client. Both IPv4 and IPv6 results are checked.
     ///
     /// When the connection is dual-stack but our resolver only returns the
-    /// other family (common with `dns.ipversion_prefer: 4` / Ipv4Only, which
-    /// drops AAAA), the check **trusts the SNI** instead of discarding it.
+    /// other family (common when the DNS strategy suppresses AAAA — e.g.
+    /// `ipversion_prefer: 4` with A answers present, or an only-mode), the
+    /// check **trusts the SNI** instead of discarding it.
     /// Falling back to IP-only would mis-route CDN IPv6 (e.g. `tracker.m-team.cc`
     /// on Cloudflare AAAA) via `dport(443) → proxy` despite
     /// `domain(keyword: m-team) → direct`.
@@ -1040,7 +1082,7 @@ impl ControlPlaneHandle {
         }
     }
 
-    async fn serve_udp_connection(
+    pub(super) async fn serve_udp_connection(
         &self,
         udp_socket: Arc<UdpSocket>,
         data: bytes::Bytes,
@@ -1059,7 +1101,7 @@ impl ControlPlaneHandle {
             std::time::Duration::from_millis(config.global.connect_timeout_ms)
         };
 
-        // The dae0/dae0peer veth pair uses fd00:honk::/64 (IPv6)
+        // The dae0/dae0peer veth pair uses fd00:686f:6e6b::/64 (IPv6)
         // and 169.254.0.0/16 (IPv4 link-local). Traffic between these addresses
         // is honk's own internal communication — proxying it would create
         // a routing loop and exhaust file descriptors.
@@ -1198,6 +1240,7 @@ impl ControlPlaneHandle {
                 self.alive_set.notify_check_tcp(&node_name);
             }
             self.stats.record_error(&outbound_name);
+            self.stats.record_close(&outbound_name);
             return Ok(());
         }
 
@@ -1274,6 +1317,7 @@ impl ControlPlaneHandle {
             debug!("All {} UDP candidate(s) failed: {}", candidates.len(), e);
         }
         self.stats.record_error(&outbound_name);
+        self.stats.record_close(&outbound_name);
         Ok(())
     }
 
@@ -1344,7 +1388,7 @@ impl ControlPlaneHandle {
 /// Outcome of comparing a connection destination IP against DNS answers for
 /// the sniffed domain (`dial_mode: domain` reality check).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RealityOutcome {
+pub(super) enum RealityOutcome {
     /// Exact IP present in the same-family answer set.
     ExactMatch,
     /// No answers for the connection's family, but the other family has
@@ -1356,7 +1400,7 @@ enum RealityOutcome {
 }
 
 /// Pure reality-check decision (unit-tested). See [`ControlPlane::verify_domain_reality`].
-fn domain_reality_outcome(
+pub(super) fn domain_reality_outcome(
     expected: std::net::IpAddr,
     ipv4: &[std::net::IpAddr],
     ipv6: &[std::net::IpAddr],

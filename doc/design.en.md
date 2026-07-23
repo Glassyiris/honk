@@ -219,8 +219,8 @@ Client :53 → eBPF DNS fast path (redirect, no full route loop)
 ```
 
 - Userspace cache only today (no kernel DNS answer cache map yet).
-- Upstream protocols: UDP/TCP are real; TLS/HTTPS/QUIC config values currently fall back to plain TCP.
-- Optional `outbound` on an upstream routes queries through a proxy group (anti-pollution intent; SOCKS5-UDP path still incomplete).
+- Upstream protocols: UDP/TCP/DoT/DoH/DoQ/DoH3 are all implemented (`honk-core/src/dns/transport/`, pooled sessions with one retry after invalidation).
+- Optional `outbound` on an upstream routes queries through a proxy node/group (anti-pollution intent; UDP+proxy tunnels as TCP-DNS because the SOCKS5-UDP path is still incomplete, and DoQ/DoH3 are direct-only).
 
 ## 10. Clash API
 

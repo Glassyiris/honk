@@ -13,9 +13,9 @@ mod reload;
 pub mod routing_matcher;
 mod sockets;
 pub mod tcp_sniff;
-pub mod udp_endpoint;
 #[cfg(test)]
 mod tests;
+pub mod udp_endpoint;
 use crate::connection_tracker::ConnectionTracker;
 use crate::control::packet_sniffer::PacketSnifferPool;
 use crate::control::routing_matcher::DOMAIN_BITMAPS;
@@ -30,11 +30,11 @@ use crate::relay;
 use crate::routing::{ConnectionInfo, Router};
 use crate::sniffing;
 use crate::stats::StatsManager;
+use drain::DrainTracker;
 use honk_config::node::{Group, GroupPolicy};
 use honk_config::{Config, node::Node, types::DialMode};
 use honk_ebpf_common::*;
 use honk_outbound::alive::{AliveDialerSet, IpVersion, ProbeDomain};
-use drain::DrainTracker;
 use janitor::BpfJanitor;
 use socket2::{Domain, Socket, Type};
 use std::io;
@@ -87,18 +87,17 @@ pub mod commands {
 }
 
 pub use commands::ControlCommand;
-pub(crate) use connection::*;
-pub(crate) use probers::*;
-pub(crate) use reload::*;
-pub(crate) use sockets::*;
+use connection::*;
+use probers::*;
+use reload::*;
 pub use sockets::DnsBpfNotifier;
+use sockets::*;
 
 #[derive(Debug, Clone)]
 pub struct StatsSnapshot {
     pub per_outbound: std::collections::HashMap<String, OutboundStats>,
     pub total_connections: u64,
 }
-
 
 /// The main control plane.
 pub struct ControlPlane {
@@ -307,6 +306,12 @@ impl ControlPlane {
         self.group_manager.clone()
     }
 
+    /// Shared traffic router cell (same handle DNS dial uses for dae-style
+    /// "route the DNS server IP" selection).
+    pub fn traffic_router(&self) -> Arc<RwLock<Router>> {
+        self.router.clone()
+    }
+
     pub fn connection_tracker(&self) -> Arc<ConnectionTracker> {
         self.connection_tracker.clone()
     }
@@ -436,6 +441,7 @@ impl ControlPlane {
             {
                 let c = self.config.read().await;
                 honk_outbound::tls::set_tls_mode(&c.global.tls_implementation);
+                honk_outbound::tls::set_utls_imitate(&c.global.utls_imitate);
             }
 
             // Configure HTTP-based health checks from config (Go: TcpCheckOption).
@@ -931,7 +937,6 @@ impl ControlPlane {
         );
         Ok(push_result)
     }
-
 
     /// Test TCP connect latency to a node using the node's configured address:port.
     /// Returns `Some(duration)` on success, `None` on failure.

@@ -345,14 +345,20 @@ fn parse_dns_section(section: &Section) -> Result<DnsConfig, crate::ConfigError>
                 let req = extract_nested(&sub.body, "request");
                 let resp = extract_nested(&sub.body, "response");
                 if let Some(req_body) = req {
-                    let kv = parse_kv_pairs(&req_body);
-                    if let Some(fb) = kv.get("fallback") {
-                        cfg.routing.fallback = fb.to_string();
+                    cfg.routing.request = parse_dns_request_routing(&req_body);
+                    // Sync legacy fallback for callers that only look there.
+                    if let crate::dns::DnsRequestAction::Upstream(ref name) =
+                        cfg.routing.request.fallback
+                    {
+                        cfg.routing.fallback = name.clone();
                     }
                 }
-                if resp.is_some() {
-                    cfg.has_response_routing = true;
+                if let Some(resp_body) = resp {
+                    cfg.routing.response = parse_dns_response_routing(&resp_body);
                 }
+            }
+            "fixed_domain_ttl" => {
+                cfg.fixed_domain_ttl = parse_fixed_domain_ttl(&sub.body);
             }
             _ => {}
         }
@@ -371,8 +377,19 @@ fn parse_dns_upstreams(body: &str) -> Vec<crate::dns::DnsUpstream> {
         if let Some(pos) = trimmed.find(':') {
             let name = trimmed[..pos].trim().to_string();
             let rest = trimmed[pos + 1..].trim();
-            // Support optional `outbound: <name>` suffix on the same line.
-            let (uri, outbound) = if let Some(opos) = rest.find("outbound:") {
+            // Optional via-proxy suffix (same line):
+            //   preferred:  name: 'uri' -> proxy
+            //   legacy:     name: 'uri' outbound: proxy
+            let (uri, outbound) = if let Some((left, right)) = rest.split_once("->") {
+                let uri_part = left.trim().trim_matches('\'').trim_matches('"');
+                let outbound_part = right.trim().trim_matches('\'').trim_matches('"');
+                let outbound = if outbound_part.is_empty() {
+                    None
+                } else {
+                    Some(outbound_part.to_string())
+                };
+                (uri_part, outbound)
+            } else if let Some(opos) = rest.find("outbound:") {
                 let uri_part = rest[..opos].trim().trim_matches('\'').trim_matches('"');
                 let outbound_part = rest[opos + 9..].trim().trim_matches('\'').trim_matches('"');
                 (uri_part, Some(outbound_part.to_string()))
@@ -380,14 +397,13 @@ fn parse_dns_upstreams(body: &str) -> Vec<crate::dns::DnsUpstream> {
                 (rest.trim_matches('\'').trim_matches('"'), None)
             };
             let (protocol, address) = parse_upstream_uri(uri);
+            let tls_server_name = sni_from_upstream_address(&address);
             upstreams.push(crate::dns::DnsUpstream {
                 name,
                 address,
                 protocol,
-                tls_server_name: None,
-                bootstrap: None,
+                tls_server_name,
                 outbound,
-                tags: vec![],
             });
         }
     }
@@ -401,9 +417,9 @@ fn parse_upstream_uri(uri: &str) -> (crate::types::DnsProtocol, String) {
     } else if let Some(rest) = uri.strip_prefix("udp+tcp://") {
         (crate::types::DnsProtocol::Udp, rest.to_string())
     } else if let Some(rest) = uri.strip_prefix("h3://") {
-        (crate::types::DnsProtocol::Https, rest.to_string())
+        (crate::types::DnsProtocol::H3, rest.to_string())
     } else if let Some(rest) = uri.strip_prefix("http3://") {
-        (crate::types::DnsProtocol::Https, rest.to_string())
+        (crate::types::DnsProtocol::H3, rest.to_string())
     } else if let Some(rest) = uri.strip_prefix("quic://") {
         (crate::types::DnsProtocol::Quic, rest.to_string())
     } else if let Some(rest) = uri.strip_prefix("https://") {
@@ -418,6 +434,258 @@ fn parse_upstream_uri(uri: &str) -> (crate::types::DnsProtocol, String) {
         (crate::types::DnsProtocol::Udp, uri.to_string())
     }
 }
+
+/// Derive a TLS SNI hostname from a stripped upstream address.
+///
+/// Returns `None` when the host is a bare IP (no SNI needed / not useful).
+fn sni_from_upstream_address(address: &str) -> Option<String> {
+    let hostport = address.split('/').next().unwrap_or(address);
+    let host = if let Some(rest) = hostport.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        hostport
+            .rsplit_once(':')
+            .map(|(h, p)| {
+                // Only treat as host:port when the suffix is numeric.
+                if p.chars().all(|c| c.is_ascii_digit()) {
+                    h
+                } else {
+                    hostport
+                }
+            })
+            .unwrap_or(hostport)
+    };
+    let host = host.trim();
+    if host.is_empty() {
+        return None;
+    }
+    // Bare IPs do not need (and often cannot use) SNI.
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    Some(host.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// DNS request/response routing parsers (new dae-shaped model)
+// ---------------------------------------------------------------------------
+
+/// Parse `fixed_domain_ttl { domain: N ... }` into a HashMap.
+fn parse_fixed_domain_ttl(body: &str) -> std::collections::HashMap<String, u32> {
+    let mut map = std::collections::HashMap::new();
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some(pos) = trimmed.find(':') {
+            let key = trimmed[..pos].trim().trim_matches('"').trim_matches('\'');
+            let val = trimmed[pos + 1..].split_whitespace().next().unwrap_or("");
+            if let Ok(n) = val.parse::<u32>() {
+                map.insert(key.to_string(), n);
+            }
+        }
+    }
+    map
+}
+
+/// Parse `routing.request { ... }` block.
+fn parse_dns_request_routing(body: &str) -> crate::dns::DnsRequestRouting {
+    let mut routing = crate::dns::DnsRequestRouting::default();
+
+    for line in body.lines() {
+        let mut trimmed = line.trim();
+        // Strip trailing inline comment
+        if let Some(pos) = trimmed.find("//") {
+            trimmed = trimmed[..pos].trim();
+        } else if let Some(pos) = trimmed.find('#') {
+            // Only strip # if preceded by space (to avoid stripping domain # itself)
+            if pos > 0 && trimmed.as_bytes()[pos - 1] == b' ' {
+                trimmed = trimmed[..pos].trim();
+            }
+        }
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // fallback/default
+        if trimmed.starts_with("fallback:") || trimmed.starts_with("default:") {
+            let fb = trimmed.split_once(':').unwrap().1.trim();
+            routing.fallback = crate::dns::DnsRequestAction::parse(fb);
+            continue;
+        }
+
+        // Rule: COND -> action
+        if let Some(arrow_pos) = trimmed.find("->") {
+            let left = trimmed[..arrow_pos].trim();
+            let right = trimmed[arrow_pos + 2..].trim();
+            let action = crate::dns::DnsRequestAction::parse(right);
+            let conditions = parse_dns_conditions(left, false);
+            // Skip rules whose conditions were all ignored (e.g. sub()/node()).
+            if !conditions.is_empty() {
+                routing
+                    .rules
+                    .push(crate::dns::DnsRequestRule { conditions, action });
+            }
+        }
+    }
+
+    routing
+}
+
+/// Parse `routing.response { ... }` block.
+fn parse_dns_response_routing(body: &str) -> crate::dns::DnsResponseRouting {
+    let mut routing = crate::dns::DnsResponseRouting::default();
+
+    for line in body.lines() {
+        let mut trimmed = line.trim();
+        // Strip trailing inline comment
+        if let Some(pos) = trimmed.find("//") {
+            trimmed = trimmed[..pos].trim();
+        } else if let Some(pos) = trimmed.find('#')
+            && pos > 0
+            && trimmed.as_bytes()[pos - 1] == b' '
+        {
+            trimmed = trimmed[..pos].trim();
+        }
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // fallback/default
+        if trimmed.starts_with("fallback:") || trimmed.starts_with("default:") {
+            let fb = trimmed.split_once(':').unwrap().1.trim();
+            routing.fallback = crate::dns::DnsResponseAction::parse(fb);
+            continue;
+        }
+
+        // Rule: COND -> action
+        if let Some(arrow_pos) = trimmed.find("->") {
+            let left = trimmed[..arrow_pos].trim();
+            let right = trimmed[arrow_pos + 2..].trim();
+            let action = crate::dns::DnsResponseAction::parse(right);
+            let conditions = parse_dns_conditions(left, true);
+            // Skip rules whose conditions were all ignored (e.g. sub()/node()).
+            if !conditions.is_empty() {
+                routing
+                    .rules
+                    .push(crate::dns::DnsResponseRule { conditions, action });
+            }
+        }
+    }
+
+    routing
+}
+
+/// Parse a chain of `&&`-separated conditions.
+fn parse_dns_conditions(expr: &str, is_response: bool) -> Vec<crate::dns::DnsCond> {
+    let mut conds = Vec::new();
+    let parts: Vec<&str> = expr.split("&&").map(|s| s.trim()).collect();
+
+    for part in parts {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        // Negation
+        let (not, inner) = if let Some(rest) = part.strip_prefix('!') {
+            (true, rest.trim())
+        } else {
+            (false, part)
+        };
+
+        // qname(...)
+        if let Some(args) = extract_fn_args(inner, "qname") {
+            let matchers = parse_dns_qname_args(&args);
+            conds.push(crate::dns::DnsCond::Qname { not, matchers });
+            continue;
+        }
+
+        // qtype(...)
+        if let Some(args) = extract_fn_args(inner, "qtype") {
+            let types: Vec<u16> = args
+                .iter()
+                .filter_map(|a| crate::dns::parse_qtype_token(a))
+                .collect();
+            conds.push(crate::dns::DnsCond::Qtype { not, types });
+            continue;
+        }
+
+        // Response-only functions
+        if is_response {
+            if let Some(args) = extract_fn_args(inner, "upstream") {
+                conds.push(crate::dns::DnsCond::Upstream { not, names: args });
+                continue;
+            }
+            if let Some(args) = extract_fn_args(inner, "ip") {
+                let (cidrs, geoip) = parse_dns_ip_args(&args);
+                conds.push(crate::dns::DnsCond::Ip { not, cidrs, geoip });
+                continue;
+            }
+        }
+
+        // sub() / node() / subnode() — not supported for client DNS, warn
+        if inner.starts_with("sub(") || inner.starts_with("node(") || inner.starts_with("subnode(")
+        {
+            eprintln!(
+                "dns routing: ignoring unsupported function {} (out of scope for client DNS)",
+                inner
+            );
+            continue;
+        }
+
+        // unknown condition function — silently ignored
+    }
+
+    conds
+}
+
+/// Parse qname(args) into a list of domain matchers.
+fn parse_dns_qname_args(args: &[String]) -> Vec<crate::dns::DnsDomainMatcher> {
+    let mut matchers = Vec::new();
+    for a in args {
+        let a = a.trim();
+        if a.is_empty() {
+            continue;
+        }
+        if let Some(v) = strip_tag_arg(a, "geosite:") {
+            matchers.push(crate::dns::DnsDomainMatcher::Geosite(
+                normalize_geosite_code(&v),
+            ));
+        } else if let Some(v) = strip_tag_arg(a, "keyword:") {
+            matchers.push(crate::dns::DnsDomainMatcher::Keyword(v));
+        } else if let Some(v) = strip_tag_arg(a, "full:") {
+            matchers.push(crate::dns::DnsDomainMatcher::Full(v));
+        } else if let Some(v) = strip_tag_arg(a, "regex:") {
+            matchers.push(crate::dns::DnsDomainMatcher::Regex(v));
+        } else if let Some(v) = strip_tag_arg(a, "suffix:") {
+            matchers.push(crate::dns::DnsDomainMatcher::Suffix(v));
+        } else {
+            // Bare argument → suffix (dae compatible)
+            matchers.push(crate::dns::DnsDomainMatcher::Suffix(a.to_string()));
+        }
+    }
+    matchers
+}
+
+/// Parse ip(...) args into (cidrs, geoip_codes).
+fn parse_dns_ip_args(args: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut cidrs = Vec::new();
+    let mut geoip = Vec::new();
+    for a in args {
+        let a = a.trim();
+        if let Some(v) = strip_tag_arg(a, "geoip:") {
+            geoip.push(v.to_lowercase());
+        } else {
+            cidrs.push(a.to_string());
+        }
+    }
+    (cidrs, geoip)
+}
+
+// ---------------------------------------------------------------------------
+// End of DNS routing parsers
+// ---------------------------------------------------------------------------
 
 fn parse_routing_section(section: &Section) -> Result<RoutingConfig, crate::ConfigError> {
     let mut cfg = RoutingConfig::default();
@@ -807,9 +1075,11 @@ fn parse_duration_ms(s: &str) -> u64 {
 
 fn parse_ip_prefer(s: &str) -> crate::dns::DnsStrategy {
     use crate::dns::DnsStrategy;
+    // dae `ipversion_prefer` is a *preference*, not an only-mode: 4/6 map to
+    // the prefer variants (other family still answered when it alone exists).
     match s.parse::<i32>() {
-        Ok(4) => DnsStrategy::Ipv4Only,
-        Ok(6) => DnsStrategy::Ipv6Only,
+        Ok(4) => DnsStrategy::PreferIpv4,
+        Ok(6) => DnsStrategy::PreferIpv6,
         _ => DnsStrategy::PreferIpv4,
     }
 }

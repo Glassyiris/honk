@@ -61,7 +61,10 @@ pub struct RelayStats {
 /// `(client→proxy, proxy→client)`; relays increment them as bytes move so
 /// observers see per-connection traffic in real time instead of a single
 /// close-time update.
-pub type RelayProgress = Option<(std::sync::Arc<std::sync::atomic::AtomicU64>, std::sync::Arc<std::sync::atomic::AtomicU64>)>;
+pub type RelayProgress = Option<(
+    std::sync::Arc<std::sync::atomic::AtomicU64>,
+    std::sync::Arc<std::sync::atomic::AtomicU64>,
+)>;
 
 /// AsyncRead wrapper that counts bytes read from the inner stream into a
 /// shared counter. Writes pass through untouched.

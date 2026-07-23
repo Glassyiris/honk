@@ -59,8 +59,12 @@ base64.workspace = true
 percent-encoding.workspace = true
 aho-corasick.workspace = true
 
-# DNS
-hickory-resolver.workspace = true
+# DNS transports (DoH H2 / DoQ / DoH3)
+h2.workspace = true
+http.workspace = true
+quinn.workspace = true
+h3.workspace = true
+h3-quinn.workspace = true
 
 # Persistence (cache_file / cachedb)
 rusqlite.workspace = true
@@ -79,9 +83,8 @@ dashmap.workspace = true
 libsystemd.workspace = true
 nix.workspace = true
 sha2.workspace = true
-tokio-rustls.workspace = true
-rustls-pemfile.workspace = true
-webpki-roots.workspace = true
+boring.workspace = true
+tokio-boring.workspace = true
 aes-gcm.workspace = true
 chacha20poly1305.workspace = true
 hkdf.workspace = true
@@ -110,3 +113,14 @@ anyhow.workspace = true
 tempfile.workspace = true
 tokio-test.workspace = true
 tokio-tungstenite.workspace = true
+rcgen.workspace = true
+# rustls: test-only — mock TLS/QUIC servers prove interop with the BoringSSL client stack
+tokio-rustls.workspace = true
+rustls-pemfile.workspace = true
+webpki-roots.workspace = true
+criterion = { version = "0.8", features = ["async_tokio", "html_reports"] }
+futures-util = "0.3"
+
+[[bench]]
+name = "dns"
+harness = false

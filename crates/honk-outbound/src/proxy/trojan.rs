@@ -451,7 +451,12 @@ mod tests {
         let relay_addr = internal.local_addr().unwrap();
         let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
         let addr_header = TrojanHandler::encode_address(target, None);
-        tokio::spawn(trojan_udp_bridge(boxed, internal, external_addr, addr_header));
+        tokio::spawn(trojan_udp_bridge(
+            boxed,
+            internal,
+            external_addr,
+            addr_header,
+        ));
 
         // Outbound: payload from the loopback peer becomes a framed packet.
         external.send_to(b"ping", relay_addr).await.unwrap();

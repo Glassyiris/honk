@@ -12,7 +12,7 @@ impl ControlPlane {
     /// are serialized through the command channel, so concurrent reloads and
     /// merges can never interleave. New connections are rejected briefly
     /// while the swap happens.
-    async fn apply_runtime_config(&self, new_config: Config, drain: &DrainTracker) {
+    pub(super) async fn apply_runtime_config(&self, new_config: Config, drain: &DrainTracker) {
         drain.start_rejecting();
         // Brief pause for in-flight connection setup
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -97,7 +97,9 @@ impl ControlPlane {
     /// then install the new forwarder into the DNS controller.
     async fn reload_dns_forwarder(&self) -> anyhow::Result<()> {
         let config = self.config.read().await;
-        let dns_router = Arc::new(crate::dns::routing::DnsRouter::new(&config.dns.routing)?);
+        let dns_router = Arc::new(crate::dns::routing::DnsRouter::new_from_dns_config(
+            &config.dns,
+        )?);
         let dns_upstream_pool = Arc::new(
             crate::dns::upstream_pool::UpstreamPool::new_with_proxy(
                 &config.dns.upstream,
@@ -109,7 +111,11 @@ impl ControlPlane {
             .with_timeouts(
                 std::time::Duration::from_millis(config.global.dns_resolve_timeout_ms),
                 std::time::Duration::from_millis(config.global.connect_timeout_ms),
-            ),
+            )
+            // Same SharedGroupManager + traffic Router cells as the data path
+            // (dae: Route DNS server IP; explicit `-> tag` still forces a group).
+            .with_group_manager(self.group_manager.clone())
+            .with_traffic_router(self.router.clone()),
         );
         let new_forwarder = Arc::new(
             crate::dns::forwarder::DnsForwarder::new(
@@ -117,7 +123,9 @@ impl ControlPlane {
                 self.dns_controller.cache().await,
                 dns_router,
             )
-            .with_strategy(config.dns.strategy.clone()),
+            .with_strategy(config.dns.strategy.clone())
+            .with_cache_enabled(config.dns.cache.enabled)
+            .with_cache_ttl(config.dns.cache.ttl.min(u64::from(u32::MAX)) as u32),
         );
         self.dns_controller.set_forwarder(new_forwarder).await;
         info!(
@@ -179,7 +187,7 @@ impl ControlPlane {
 /// merged node set. Nodes from other subscriptions and static config nodes
 /// are untouched. Re-merging the same subscription is idempotent — nodes
 /// are replaced, never duplicated.
-fn config_with_subscription_nodes(
+pub(super) fn config_with_subscription_nodes(
     current: &Config,
     subscription_id: uuid::Uuid,
     nodes: Vec<Node>,
@@ -258,7 +266,10 @@ fn health_check_targets(config: &Config) -> Vec<(String, String)> {
 /// group membership: register nodes that are new or whose address changed,
 /// remove nodes that left the checked set. Unchanged registrations keep
 /// their probe state and grace period. Returns `(added, removed)` counts.
-fn sync_health_check_nodes(alive_set: &AliveDialerSet, config: &Config) -> (usize, usize) {
+pub(super) fn sync_health_check_nodes(
+    alive_set: &AliveDialerSet,
+    config: &Config,
+) -> (usize, usize) {
     let desired: std::collections::HashMap<String, String> =
         health_check_targets(config).into_iter().collect();
     let current = alive_set.registered_nodes();
@@ -286,7 +297,9 @@ fn sync_health_check_nodes(alive_set: &AliveDialerSet, config: &Config) -> (usiz
 /// Selector members. Nested sub-groups are expanded to their leaf nodes
 /// (health state lives on real nodes). Used identically at startup and on
 /// config reload.
-fn urltest_group_registrations(config: &Config) -> Vec<(String, Vec<String>, Option<Duration>)> {
+pub(super) fn urltest_group_registrations(
+    config: &Config,
+) -> Vec<(String, Vec<String>, Option<Duration>)> {
     let by_name = groups_by_name(config);
     let leaf_ids = |g: &Group| {
         let mut ids = std::collections::BTreeSet::new();
@@ -326,7 +339,7 @@ fn urltest_group_registrations(config: &Config) -> Vec<(String, Vec<String>, Opt
 /// manager out. Tracked connections record the dialed leaf node name, so
 /// the target set covers the group name, its member tags, and every leaf
 /// reachable through nested sub-groups.
-fn install_interrupt_callback(
+pub(super) fn install_interrupt_callback(
     group_manager: &GroupManager,
     group_manager_cell: &SharedGroupManager,
     tracker: &Arc<ConnectionTracker>,
@@ -363,7 +376,7 @@ fn install_interrupt_callback(
 /// leaves so a leaf dialed via a sub-group still maps to the top group's
 /// slot. Nodes outside any group have no eBPF outbound id and are absent
 /// from the map.
-fn build_outbound_id_map(config: &Config) -> std::collections::HashMap<String, u8> {
+pub(super) fn build_outbound_id_map(config: &Config) -> std::collections::HashMap<String, u8> {
     let by_name = groups_by_name(config);
     let mut map = std::collections::HashMap::new();
     for (i, group) in config.groups.iter().enumerate() {
@@ -379,7 +392,7 @@ fn build_outbound_id_map(config: &Config) -> std::collections::HashMap<String, u
     map
 }
 
-fn resolve_outbound_nodes(
+pub(super) fn resolve_outbound_nodes(
     config: &Config,
     group_manager: &GroupManager,
     outbound_name: &str,

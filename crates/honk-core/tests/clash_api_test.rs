@@ -105,6 +105,7 @@ fn test_dns_forwarder(cache: Arc<tokio::sync::Mutex<DnsCache>>, response: Vec<u8
         DnsRouter::new(&DnsRouting {
             rules: vec![],
             fallback: "default".into(),
+            ..Default::default()
         })
         .unwrap(),
     );
@@ -163,8 +164,12 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        if let Err(e) = axum::serve(listener, app).await {
+            eprintln!("axum serve error: {e:#}");
+        }
     });
+    // Give the server a tick to bind.
+    tokio::task::yield_now().await;
 
     TestApp {
         addr,
@@ -177,6 +182,7 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
 fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .build()
         .unwrap()
 }
@@ -496,6 +502,9 @@ async fn test_connections_snapshot_and_delete() {
         source: "10.0.0.2:12345".into(),
         destination: "142.250.72.14:443".into(),
         proxy: "proxy".into(),
+        rule: "domain(suffix: example.com)".into(),
+        rule_payload: "example.com".into(),
+        chains: vec!["node-a".into(), "hk".into(), "proxy".into()],
         upload: std::sync::Arc::new(AtomicU64::new(100)),
         download: std::sync::Arc::new(AtomicU64::new(200)),
         start_time: Instant::now(),
@@ -521,7 +530,13 @@ async fn test_connections_snapshot_and_delete() {
     assert_eq!(c["metadata"]["host"], "example.com");
     assert_eq!(c["upload"], 100);
     assert_eq!(c["download"], 200);
-    assert_eq!(c["chains"][0], "proxy");
+    assert_eq!(c["rule"], "domain(suffix: example.com)");
+    assert_eq!(c["rulePayload"], "example.com");
+    assert_eq!(
+        c["chains"],
+        serde_json::json!(["node-a", "hk", "proxy"]),
+        "chains must be the selection path, leaf-first"
+    );
     // RFC3339 start timestamp.
     let start = c["start"].as_str().unwrap();
     assert!(chrono::DateTime::parse_from_rfc3339(start).is_ok());
@@ -880,6 +895,9 @@ async fn test_connections_ws_stream() {
         source: "10.0.0.3:5555".into(),
         destination: "1.1.1.1:443".into(),
         proxy: "proxy".into(),
+        rule: "Match".into(),
+        rule_payload: String::new(),
+        chains: vec!["node-a".into(), "proxy".into()],
         upload: std::sync::Arc::new(AtomicU64::new(1)),
         download: std::sync::Arc::new(AtomicU64::new(2)),
         start_time: Instant::now(),

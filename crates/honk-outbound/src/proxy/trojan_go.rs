@@ -42,8 +42,6 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio_rustls::TlsConnector;
-use tokio_rustls::rustls::pki_types::ServerName;
 
 use super::{AsyncReadWrite, ProxyHandler, ProxyStream};
 
@@ -67,7 +65,7 @@ impl TrojanGoHandler {
         }
     }
 
-    fn build_tls_connector(node: &Node) -> anyhow::Result<TlsConnector> {
+    fn build_tls_connector(node: &Node) -> anyhow::Result<crate::tls::TlsConnector> {
         crate::tls::build_connector(node)
     }
 
@@ -80,9 +78,7 @@ impl TrojanGoHandler {
         let stream: Box<dyn AsyncReadWrite> = if node.tls {
             let connector = Self::build_tls_connector(node)?;
             let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
-            let server_name = ServerName::try_from(server_name)
-                .map_err(|e| anyhow::anyhow!("TrojanGo TLS: invalid SNI: {}", e))?;
-            Box::new(connector.connect(server_name, stream).await?)
+            Box::new(connector.connect(&server_name, stream).await?)
         } else {
             Box::new(stream)
         };

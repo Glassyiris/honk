@@ -1,3 +1,5 @@
+use rand::Rng;
+
 use super::*;
 
 // BLAKE2b-256 (RFC 7693) — salamander obfuscation key derivation.
@@ -31,8 +33,8 @@ pub(super) const BLAKE2B_SIGMA: [[usize; 16]; 12] = [
 #[allow(clippy::many_single_char_names)]
 pub(super) fn blake2b_compress(h: &mut [u64; 8], block: &[u8; 128], t: u128, last: bool) {
     let mut m = [0u64; 16];
-    for (i, chunk) in block.chunks_exact(8).enumerate() {
-        m[i] = u64::from_le_bytes(chunk.try_into().expect("8-byte chunk"));
+    for (i, chunk) in block.as_chunks::<8>().0.iter().enumerate() {
+        m[i] = u64::from_le_bytes(*chunk);
     }
     let mut v = [0u64; 16];
     v[..8].copy_from_slice(h);
@@ -84,11 +86,9 @@ pub(super) fn blake2b256(data: &[u8]) -> [u8; 32] {
         full_blocks * 128
     };
     let (head, tail) = data.split_at(head_len);
-    for chunk in head.chunks_exact(128) {
-        let mut block = [0u8; 128];
-        block.copy_from_slice(chunk);
+    for chunk in head.as_chunks::<128>().0 {
         t += 128;
-        blake2b_compress(&mut h, &block, t, false);
+        blake2b_compress(&mut h, chunk, t, false);
     }
     let mut last_block = [0u8; 128];
     last_block[..tail.len()].copy_from_slice(tail);
@@ -145,8 +145,10 @@ pub(super) fn salamander_open(password: &[u8], buf: &mut [u8]) -> Option<usize> 
 /// `Transmit`/`RecvMeta` carries exactly one datagram to (de)obfuscate.
 #[derive(Debug)]
 pub(super) struct SalamanderSocket {
-    socket: Arc<tokio::net::UdpSocket>,
-    password: Arc<[u8]>,
+    // pub(super): hysteria2 tests construct the socket directly for the
+    // obfuscated-server fixture.
+    pub(super) socket: Arc<tokio::net::UdpSocket>,
+    pub(super) password: Arc<[u8]>,
 }
 
 impl SalamanderSocket {

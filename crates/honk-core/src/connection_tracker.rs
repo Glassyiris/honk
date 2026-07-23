@@ -15,6 +15,12 @@ pub struct ConnectionSnapshot {
     pub source: String,
     pub destination: String,
     pub proxy: String,
+    /// Matched routing rule (dae expression; "Match" = fallback).
+    pub rule: String,
+    /// Value that drove the match (sniffed domain or destination IP).
+    pub rule_payload: String,
+    /// Selection path, leaf-first ([leaf, ..sub-groups.., topGroup]).
+    pub chains: Vec<String>,
     pub upload: u64,
     pub download: u64,
     pub start_time: Instant,
@@ -28,6 +34,9 @@ pub struct ConnectionEntry {
     pub source: String,
     pub destination: String,
     pub proxy: String,
+    pub rule: String,
+    pub rule_payload: String,
+    pub chains: Vec<String>,
     /// Byte counters are shared with the relay task, which increments them
     /// as data flows so `/connections` shows live (not close-time) totals.
     pub upload: Arc<AtomicU64>,
@@ -45,6 +54,9 @@ impl ConnectionEntry {
             source: self.source.clone(),
             destination: self.destination.clone(),
             proxy: self.proxy.clone(),
+            rule: self.rule.clone(),
+            rule_payload: self.rule_payload.clone(),
+            chains: self.chains.clone(),
             upload: self.upload.load(Ordering::Relaxed),
             download: self.download.load(Ordering::Relaxed),
             start_time: self.start_time,

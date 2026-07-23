@@ -31,8 +31,8 @@ Source of truth: `crates/honk-config/src/*`, the dae parser in `crates/honk-conf
 | `lan_tcp_mss` | `lan_tcp_mss` | `0` | Deprecated; parsed only |
 | `allow_insecure` | `allow_insecure` | `false` | Global TLS skip-verify fallback |
 | `sniffing_timeout` | `sniffing_timeout_ms` | `30` | Sniff timeout, duration form (e.g. `30ms`) |
-| `tls_implementation` | `tls_implementation` | `"tls"` | TLS stack name |
-| `utls_imitate` | `utls_imitate` | `"chrome_auto"` | Reserved (REALITY/uTLS deferred) |
+| `tls_implementation` | `tls_implementation` | `"tls"` | TLS stack: `tls` (plain BoringSSL) / `utls` (real Chrome fingerprint) |
+| `utls_imitate` | `utls_imitate` | `"chrome_auto"` | Fingerprint profile; `chrome*` maps to the built-in real Chrome profile (BoringSSL); any other value warns and falls back to Chrome (the only profile) |
 | `tls_fragment` | `tls_fragment` | `false` | TLS ClientHello fragment flag |
 | `tls_fragment_length` | `tls_fragment_length` | `""` | Fragment length range |
 | `tls_fragment_interval` | `tls_fragment_interval` | `""` | Fragment interval range |
@@ -110,6 +110,9 @@ The fields below are what a parsed node carries. In dae syntax they are **derive
 | `tls` | bool | `false` | Enable TLS |
 | `sni` | string? | null | TLS SNI (share-link `sni=`) |
 | `skip_cert_verify` | bool | `false` | Insecure TLS (share-link `allowInsecure=1`/`insecure=1`) |
+| `ech_enabled` | bool | `false` | Offer ECH (share-link `ech=1`, or implied by `ech_config`) |
+| `ech_config` | string? | null | Base64 ECHConfigList (share-link `ech_config=`) |
+| `ech_config_path` | string? | null | File holding a base64 ECHConfigList |
 | `network` | string? | null | V2Ray-style network hint |
 | `ws_path` / `ws_host` | string? | null | WebSocket (share-link `path=`/`host=`) |
 | `grpc_service` | string? | null | gRPC service name (`serviceName=`) |
@@ -166,6 +169,25 @@ node {
 ```
 
 `mux = true` (h2mux) exists in the node schema but cannot be expressed in dae syntax today.
+
+### TLS fingerprint and ECH
+
+TLS runs on **BoringSSL** everywhere (proxy TLS, DoT/DoH upstreams, and QUIC handshakes via the custom quinn crypto backend). Two global modes:
+
+- `tls_implementation: tls` — plain BoringSSL ClientHello.
+- `tls_implementation: utls` — real Chrome fingerprint: GREASE, permuted extension order, X25519MLKEM768+X25519 key shares, Chrome sigalgs/curves, brotli certificate compression, ALPS for h2, and ECH GREASE. Applies to TCP TLS and QUIC ClientHellos alike.
+
+Per-node **ECH** (Encrypted Client Hello) — works over TLS and over QUIC (hysteria2/juicity/tuic):
+
+```dae
+node {
+    hy2_ech: 'hysteria2://secret@example.com:443?sni=example.com&ech_config=AD%2B-DQIAA...#hy2_ech'
+}
+```
+
+- `ech_config=<base64 ECHConfigList>` (or `ech_config_path` in the JSON/TOML config forms) offers real ECH. Without configs, Chrome mode sends ECH GREASE like a real browser.
+- ECH is fail-closed per RFC: if the server cannot accept ECH, the handshake fails (BoringSSL `ECH_REJECTED`) and any server-provided retry configs are logged.
+- `ech_enabled` without a static config discovers the ECHConfigList from DNS HTTPS records (RFC 9460) at connect time — via the bootstrap resolver, or the first system nameserver when none is configured — cached per domain (record TTL for hits, 5 min for misses). Discovery is best-effort and fail-open: if no config is found, Chrome mode still sends ECH GREASE and the handshake proceeds without ECH.
 
 **AnyTLS pool**
 
@@ -334,7 +356,8 @@ dns {
     max_cache_size: 10000
     upstream {
         alidns: 'udp://223.5.5.5:53'
-        googledns: 'tcp+udp://dns.google:53' outbound: proxy
+        googledns: 'tcp+udp://dns.google:53' -> proxy
+        google_doh: 'https://dns.google/dns-query' -> proxy
     }
     routing {
         request {
@@ -352,39 +375,42 @@ dns {
 | `routing { ... }` | `routing` | fallback default | Request routing |
 | `ipversion_prefer` | `strategy` | `preferipv4` | Address family (`4`/`6`) |
 | `optimistic_cache` | `cache.enabled` | `true` | Cache on/off |
-| `optimistic_cache_ttl` | `cache.ttl` | `600` | Cache TTL seconds |
+| `optimistic_cache_ttl` | `cache.ttl` | `600` | Fixed positive-cache TTL (overrides answer min TTL; `0` keeps answer TTL) |
 | `max_cache_size` | `cache.max_size` | `10000` | Max entries (must be > 0) |
-| `response { ... }` (presence) | `has_response_routing` | `false` | Flag set if dae `response{}` present |
 
 ### Upstream
 
-Each upstream is a `name: 'uri'` line; an optional trailing `outbound: tag` sends queries via a node/group.
+Each upstream is a `name: 'uri'` line; an optional trailing `-> tag` (or legacy `outbound: tag`) sends queries via a node/group.
 
 | Field | Type | Default | Meaning |
 | ------- | ------ | --------- | --------- |
 | `name` | string | required | Id (the key before `:`) |
 | `address` | string | required | `ip:port` or host (from the URI) |
 | `protocol` | enum | `udp` | From URI scheme: `udp`/`tcp`/`tls`/`https`/`quic` (`tcp+udp`, `h3`/`http3` aliases) |
-| `tls_server_name` | string? | null | DoT/DoH SNI; not settable in dae syntax |
-| `bootstrap` | string? | null | Bootstrap DNS; not settable in dae syntax |
-| `outbound` | string? | null | Send via node/group (trailing `outbound: tag`) |
-| `tags` | string[] | `[]` | Labels; not settable in dae syntax |
+| `tls_server_name` | string? | null | DoT/DoH SNI; dae syntax auto-derives from hostname when not an IP |
+| `outbound` | string? | null | Send via node/group (trailing `-> tag`) |
 
-**Runtime note:** UDP/TCP work; TLS/HTTPS/QUIC currently fall back toward plain TCP. DNS-over-proxy SOCKS5 UDP is incomplete.
+**Runtime note:** UDP/TCP/DoT/DoH/DoQ/DoH3 work with connection reuse. DoT/DoH/TCP support `-> proxy` (TCP tunnel via node/group). DoQ/DoH3 are direct-only for now. DNS-over-proxy SOCKS5 UDP is incomplete (UDP+proxy tunnels as TCP DNS).
 
 ### Routing / rules
 
 | Item | Meaning |
 | ------ | --------- |
-| `request { fallback: name }` | Upstream if no rule matches (the only request-routing key parsed from dae syntax) |
-| `routing.rules[].domain` | Pattern with optional prefix (`suffix:`, `keyword:`, `full:`, `regex:`; bare = full exact) — schema field; per-rule `qname(...) -> upstream` lines are **not** parsed from dae syntax today |
-| `routing.rules[].upstream` | Upstream name (schema field) |
+| `request { <cond> [&& <cond>...] -> <action> }` | Request rules, first match wins. Conditions: `qname(suffix:/keyword:/full:/regex:/geosite:...)`, `qtype(a/aaaa/...)`; `!` negates a condition. Actions: `reject`, `asis` (dial the query's original destination), or an upstream name |
+| `request { fallback: name }` | Upstream when no request rule matches |
+| `response { <cond> [&& <cond>...] -> <action> }` | Response rules, first match wins. Conditions: `upstream(name)`, `qname(...)`, `ip(cidr, geoip:...)`; `!` negates. Actions: `accept`, `reject`, or an upstream name (re-query, depth ≤ 3) |
+| `response { fallback: accept\|reject }` | Verdict when no response rule matches |
+| `routing.rules[].domain` / `.upstream` | Legacy schema-only fields (`suffix:`/`keyword:`/`full:`/`regex:` prefixes), converted to request rules at load when no new-style rules exist |
 
 ### Strategy
 
 Internal values: `preferipv4` | `preferipv6` | `ipv4only` | `ipv6only` | `both`.
 
-dae: `ipversion_prefer: 4|6` (anything else = `preferipv4`).
+- `ipv4only` / `ipv6only`: the other family's queries are answered NODATA at request time and never forwarded upstream.
+- `preferipv4` / `preferipv6`: both families are forwarded. When the preferred family has answers for the name, the other family's response is suppressed (NODATA); when it has none, the other family's answers are returned (fallback allowed). The preferred-family check costs one extra upstream query per name on cache miss.
+- `both`: no filtering.
+
+dae: `ipversion_prefer: 4` maps to `preferipv4`, `6` to `preferipv6` (anything else = `preferipv4`). The only-modes are not expressible in dae syntax.
 
 ### Cache
 

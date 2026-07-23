@@ -16,6 +16,7 @@ use aya_ebpf_bindings::{
     },
 };
 use aya_ebpf_cty::c_void;
+use core::ffi::c_long;
 use core::mem;
 use honk_ebpf_common::{
     RedirectEntry, RedirectTuple, TASK_COMM_LEN, TPROXY_MARK,
@@ -41,7 +42,7 @@ use crate::{
     },
 };
 
-use aya_ebpf::bindings::{TC_ACT_OK, TC_ACT_PIPE, TC_ACT_SHOT};
+use crate::action::{TC_ACT_OK, TC_ACT_PIPE, TC_ACT_SHOT, Verdict, flatten};
 
 /// Ingress ifindex for locally-generated packets (not from any interface).
 const NOWHERE_IFINDEX: u32 = 0;
@@ -59,18 +60,8 @@ fn skb_ifindex(ctx: &TcContext) -> u32 {
 }
 
 #[inline(always)]
-pub(crate) fn skb_protocol(ctx: &TcContext) -> u16 {
-    unsafe { (*ctx.skb.skb).protocol as u16 }
-}
-
-#[inline(always)]
 fn skb_mark(ctx: &TcContext) -> u32 {
     unsafe { (*ctx.skb.skb).mark }
-}
-
-#[inline(always)]
-fn skb_set_mark(ctx: &TcContext, mark: u32) {
-    ctx.skb.set_mark(mark);
 }
 
 const DOMAIN_DNS: u32 = 1;
@@ -99,7 +90,7 @@ pub fn wan_outbound_is_alive(ctx: &TcContext, outbound: u8, l4proto: u8, dport: 
         _ => DOMAIN_DEFAULT,
     };
 
-    let proto = skb_protocol(ctx);
+    let proto = ctx.skb.protocol() as u16;
     let ip_idx: u32 = if proto == ETH_P_IP.to_be() { 0 } else { 1 };
 
     let key: u32 = (outbound as u32)
@@ -201,7 +192,7 @@ pub fn prep_redirect_to_control_plane(
 
     if !use_redirect_peer {
         if link_h_len == 0 {
-            let l3proto = skb_protocol(ctx);
+            let l3proto = ctx.skb.protocol() as u16;
             let zero_mac: [u8; 6] = [0; 6];
             let ret =
                 unsafe { bpf_skb_change_head(ctx.skb.skb, mem::size_of::<EthHdr>() as u32, 0) };
@@ -237,7 +228,7 @@ pub fn prep_redirect_to_control_plane(
         }
     }
 
-    let proto = skb_protocol(ctx);
+    let proto = ctx.skb.protocol() as u16;
     let redirect_tuple = RedirectTuple::from_tuples_ip(&tuples.five, proto == ETH_P_IP.to_be());
 
     // Cached-flow throttle: skip the update while the existing entry is
@@ -282,9 +273,9 @@ pub fn prep_redirect_to_control_plane(
 ///
 /// bpf_redirect_peer is NOT supported in the egress direction.
 #[inline(always)]
-pub fn redirect_to_control_plane_egress() -> i32 {
+pub fn redirect_to_control_plane_egress() -> Verdict {
     let param = PARAM.load();
-    unsafe { bpf_redirect(param.dae0_ifindex, 0) as i32 }
+    Ok(unsafe { bpf_redirect(param.dae0_ifindex, 0) } as c_long)
 }
 
 /// LAN egress: update reverse-direction connection tracking state so the
@@ -295,20 +286,20 @@ pub fn redirect_to_control_plane_egress() -> i32 {
 ///
 /// #[inline(never)]: shared by lan_egress_l2/l3. Shallow call chain.
 #[inline(never)]
-pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> i32 {
+pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     let scratch_key: u32 = 0;
     let pkt = match unsafe { PKT_SCRATCH_KEY.get_ptr_mut(scratch_key) } {
         Some(ptr) => unsafe { &mut *ptr },
-        None => return TC_ACT_SHOT,
+        None => return Err(TC_ACT_SHOT),
     };
 
     let ret = parse_packet(ctx, link_h_len, pkt);
     if ret != 0 {
         // Negative: error → drop; Positive: unsupported protocol → pass through.
         if ret < 0 {
-            return TC_ACT_SHOT;
+            return Err(TC_ACT_SHOT);
         }
-        return TC_ACT_OK;
+        return Err(TC_ACT_OK);
     }
 
     // Drop NDP REDIRECT packets from localhost to prevent ND proxy interference.
@@ -329,7 +320,7 @@ pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> i32 {
             );
         }
         if icmp6_type == NDP_REDIRECT {
-            return TC_ACT_SHOT;
+            return Err(TC_ACT_SHOT);
         }
     }
 
@@ -353,7 +344,7 @@ pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> i32 {
         IPPROTO_UDP => {
             // Skip DNS traffic to reduce state churn.
             if u16::from_be_bytes(pkt.udph.src) == 53 || u16::from_be_bytes(pkt.udph.dst) == 53 {
-                return TC_ACT_PIPE;
+                return Err(TC_ACT_PIPE);
             }
             let mut reversed_key: TuplesKey = unsafe { mem::zeroed() };
             copy_reversed_tuples(&pkt.tuples.five, &mut reversed_key);
@@ -372,7 +363,7 @@ pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> i32 {
         _ => {}
     }
 
-    TC_ACT_PIPE
+    Ok(TC_ACT_PIPE)
 }
 
 /// WAN egress TCP handler: route new connections and cache the decision;
@@ -384,7 +375,7 @@ fn do_tproxy_wan_egress_tcp(
     tuples: &Tuples,
     ethh: &EthHdr,
     tcph: &TcpHdr,
-) -> i32 {
+) -> Verdict {
     let tcp_state_syn = is_new_tcp_connection(tcph);
     let outbound: u8;
     let must: bool;
@@ -396,14 +387,14 @@ fn do_tproxy_wan_egress_tcp(
     let scratch_key: u32 = 0;
     let scratch = match unsafe { WAN_EGRESS_ROUTE_SCRATCH_MAP.get_ptr_mut(scratch_key) } {
         Some(ptr) => unsafe { &mut *ptr },
-        None => return TC_ACT_SHOT,
+        None => return Err(TC_ACT_SHOT),
     };
 
     if tcp_state_syn {
         *scratch = unsafe { mem::zeroed() };
         scratch.flag[0] = 1u32; // L4ProtoType_TCP = 1
 
-        let proto = skb_protocol(ctx);
+        let proto = ctx.skb.protocol() as u16;
         scratch.flag[1] = if proto == ETH_P_IP.to_be() {
             4u32
         } else {
@@ -417,7 +408,7 @@ fn do_tproxy_wan_egress_tcp(
         if let Some(pid_pname) = pid_pname_opt {
             let param = PARAM.load();
             if pid_pname.pid == param.control_plane_pid {
-                return TC_ACT_OK;
+                return Err(TC_ACT_OK);
             }
 
             // Copy pname into flag[2..6] (4 × u32 = 16 bytes = TASK_COMM_LEN).
@@ -456,7 +447,7 @@ fn do_tproxy_wan_egress_tcp(
         );
 
         if s64_ret < 0 {
-            return TC_ACT_SHOT;
+            return Err(TC_ACT_SHOT);
         }
 
         outbound = (s64_ret & 0xFF) as u8;
@@ -489,9 +480,9 @@ fn do_tproxy_wan_egress_tcp(
 
         if tcp_conn.is_none() {
             if outbound == OUTBOUND_DIRECT && mark == 0 {
-                return TC_ACT_OK;
+                return Err(TC_ACT_OK);
             }
-            return TC_ACT_SHOT;
+            return Err(TC_ACT_SHOT);
         }
     } else {
         let tcp_conn = mark_tcp_seen(
@@ -519,30 +510,30 @@ fn do_tproxy_wan_egress_tcp(
                 scratch.mac.copy_from_slice(&conn.mac);
             } else {
                 // No cached routing — direct connection, pass through.
-                return TC_ACT_OK;
+                return Err(TC_ACT_OK);
             }
         } else {
             // No state at all — pass through.
-            return TC_ACT_OK;
+            return Err(TC_ACT_OK);
         }
     }
 
     if outbound == OUTBOUND_DIRECT && mark == 0 {
-        skb_set_mark(ctx, mark);
-        return TC_ACT_OK;
+        ctx.set_mark(mark);
+        return Err(TC_ACT_OK);
     } else if outbound == OUTBOUND_BLOCK {
-        return TC_ACT_SHOT;
+        return Err(TC_ACT_SHOT);
     }
 
     if !wan_outbound_is_alive(ctx, outbound, IPPROTO_TCP, tuples.five.dst_port) {
-        return TC_ACT_SHOT;
+        return Err(TC_ACT_SHOT);
     }
 
     if prep_redirect_to_control_plane(ctx, link_h_len, tuples, ethh, 0, !tcp_state_syn, outbound)
         != 0
     {
         // Failed to prepare → fallback to direct pass.
-        return TC_ACT_OK;
+        return Err(TC_ACT_OK);
     }
 
     // Set cb marks for dae0peer_ingress.
@@ -589,19 +580,19 @@ fn fast_path_decision(
     mac: [u8; 6],
     handoff_pname: Option<&[u8; TASK_COMM_LEN]>,
     handoff_pid: u32,
-) -> i32 {
+) -> Verdict {
     if outbound == OUTBOUND_DIRECT && mark == 0 {
-        return TC_ACT_OK;
+        return Err(TC_ACT_OK);
     } else if outbound == OUTBOUND_BLOCK {
-        return TC_ACT_SHOT;
+        return Err(TC_ACT_SHOT);
     }
 
     if !wan_outbound_is_alive(ctx, outbound, IPPROTO_UDP, tuples.five.dst_port) {
-        return TC_ACT_SHOT;
+        return Err(TC_ACT_SHOT);
     }
 
     if prep_redirect_to_control_plane(ctx, link_h_len, tuples, ethh, 0, true, outbound) != 0 {
-        return TC_ACT_OK;
+        return Err(TC_ACT_OK);
     }
 
     unsafe {
@@ -650,7 +641,7 @@ fn do_tproxy_wan_egress_udp(
     tuples: &Tuples,
     ethh: &EthHdr,
     udph: &UdpHdr,
-) -> i32 {
+) -> Verdict {
     let outbound: u8;
     let mark: u32;
     let must: bool;
@@ -661,13 +652,13 @@ fn do_tproxy_wan_egress_udp(
     let scratch_key: u32 = 0;
     let scratch = match unsafe { WAN_EGRESS_ROUTE_SCRATCH_MAP.get_ptr_mut(scratch_key) } {
         Some(ptr) => unsafe { &mut *ptr },
-        None => return TC_ACT_SHOT,
+        None => return Err(TC_ACT_SHOT),
     };
 
     *scratch = unsafe { mem::zeroed() };
     scratch.flag[0] = 2u32; // L4ProtoType_UDP = 2
 
-    let proto = skb_protocol(ctx);
+    let proto = ctx.skb.protocol() as u16;
     scratch.flag[1] = if proto == ETH_P_IP.to_be() {
         4u32
     } else {
@@ -680,7 +671,7 @@ fn do_tproxy_wan_egress_udp(
     if let Some(pid_pname) = pid_pname_opt {
         let param = PARAM.load();
         if pid_pname.pid == param.control_plane_pid {
-            return TC_ACT_OK;
+            return Err(TC_ACT_OK);
         }
     }
 
@@ -700,7 +691,7 @@ fn do_tproxy_wan_egress_udp(
 
         if let Some(conn_state) = conn {
             if conn_state.is_wan_ingress_direction != 0 {
-                return TC_ACT_OK;
+                return Err(TC_ACT_OK);
             }
 
             let meta_raw = unsafe { conn_state.meta.raw };
@@ -780,7 +771,7 @@ fn do_tproxy_wan_egress_udp(
     );
 
     if s64_ret < 0 {
-        return TC_ACT_SHOT;
+        return Err(TC_ACT_SHOT);
     }
 
     outbound = (s64_ret & 0xFF) as u8;
@@ -823,11 +814,11 @@ fn do_tproxy_wan_egress_udp(
 /// direct `__sk_buff` field access, skip non-localhost traffic, then dispatch
 /// to the TCP or UDP handler.
 #[inline(always)]
-fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> i32 {
+fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     let scratch_key: u32 = 0;
     let pkt = match unsafe { PKT_SCRATCH_KEY.get_ptr_mut(scratch_key) } {
         Some(ptr) => unsafe { &mut *ptr },
-        None => return TC_ACT_SHOT,
+        None => return Err(TC_ACT_SHOT),
     };
 
     // Parse before reading __sk_buff fields: ctx.load() proves to the verifier
@@ -835,7 +826,7 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> i32 {
     let ret = parse_packet(ctx, link_h_len, pkt);
     if ret != 0 {
         // Unsupported or malformed traffic is left untouched.
-        return TC_ACT_OK;
+        return Err(TC_ACT_OK);
     }
 
     // Bypass locally-generated traffic destined for the honk host itself.
@@ -846,7 +837,7 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> i32 {
         let dst_ip = pkt.tuples.five.dst_ip;
         let dst_ipv4 = unsafe { dst_ip.u6_addr32[3] };
         if dst_ip.is_v4_mapped() && dst_ipv4 == param.local_ip {
-            return TC_ACT_OK;
+            return Err(TC_ACT_OK);
         }
     }
 
@@ -854,7 +845,7 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> i32 {
     // real ingress interface and must be left alone to avoid double-handling
     // and loops.
     if skb_ingress_ifindex(ctx) != NOWHERE_IFINDEX {
-        return TC_ACT_OK;
+        return Err(TC_ACT_OK);
     }
 
     // Control-plane bypass (Go dae `pid_is_control_plane` mark fallback,
@@ -866,13 +857,13 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> i32 {
     // back into daens and looping.
     let mark = skb_mark(ctx);
     if (param.dae_socket_mark != 0 && mark == param.dae_socket_mark) || (mark & 0x100) == 0x100 {
-        return TC_ACT_OK;
+        return Err(TC_ACT_OK);
     }
 
     match pkt.l4proto {
         IPPROTO_TCP => do_tproxy_wan_egress_tcp(ctx, link_h_len, &pkt.tuples, &pkt.ethh, &pkt.tcph),
         IPPROTO_UDP => do_tproxy_wan_egress_udp(ctx, link_h_len, &pkt.tuples, &pkt.ethh, &pkt.udph),
-        _ => TC_ACT_OK,
+        _ => Ok(TC_ACT_OK),
     }
 }
 
@@ -881,23 +872,23 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> i32 {
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn lan_egress_l2(ctx: *mut __sk_buff) -> i32 {
-    do_tproxy_lan_egress(&TcContext::new(ctx), 14)
+    flatten(do_tproxy_lan_egress(&TcContext::new(ctx), 14))
 }
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn lan_egress_l3(ctx: *mut __sk_buff) -> i32 {
-    do_tproxy_lan_egress(&TcContext::new(ctx), 0)
+    flatten(do_tproxy_lan_egress(&TcContext::new(ctx), 0))
 }
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn wan_egress_l2(ctx: *mut __sk_buff) -> i32 {
-    do_tproxy_wan_egress(&TcContext::new(ctx), 14)
+    flatten(do_tproxy_wan_egress(&TcContext::new(ctx), 14))
 }
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn wan_egress_l3(ctx: *mut __sk_buff) -> i32 {
-    do_tproxy_wan_egress(&TcContext::new(ctx), 0)
+    flatten(do_tproxy_wan_egress(&TcContext::new(ctx), 0))
 }

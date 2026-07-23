@@ -292,7 +292,7 @@ impl JuicityHandler {
         Self
     }
 
-    fn client_for(node: &Node) -> anyhow::Result<Arc<JuicityClient>> {
+    async fn client_for(node: &Node) -> anyhow::Result<Arc<JuicityClient>> {
         let uuid_str = node
             .juicity_uuid
             .as_deref()
@@ -315,24 +315,24 @@ impl JuicityHandler {
             node.sni.as_deref().unwrap_or(""),
             node.skip_cert_verify
         );
-        let mut clients = CLIENTS.lock();
-        if let Some(client) = clients.get(&key) {
+        if let Some(client) = CLIENTS.lock().get(&key) {
             return Ok(Arc::clone(client));
         }
+        // Build outside the lock: client_config is async (ECH discovery).
         let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
-        let config = crate::quic::client_config(
-            node.skip_cert_verify,
-            &[b"h3"],
-            None,
-            Some(KEEP_ALIVE_INTERVAL),
-        )?;
+        // Upstream juicity (Go and juicity-rs) defaults to BBR on the client
+        // when no congestion_control is configured.
+        let config =
+            crate::quic::client_config(node, &[b"h3"], Some("bbr"), Some(KEEP_ALIVE_INTERVAL))
+                .await?;
         let client = Arc::new(JuicityClient {
             quic: QuicClient::new(node.host().to_string(), node.port, server_name, config),
             uuid: *uuid.as_bytes(),
             password,
         });
-        clients.insert(key, Arc::clone(&client));
-        Ok(client)
+        // Another task may have won the race — reuse theirs.
+        let mut clients = CLIENTS.lock();
+        Ok(clients.entry(key).or_insert_with(|| Arc::clone(&client)).clone())
     }
 
     /// Open a bi stream and write the juicity request header
@@ -366,7 +366,7 @@ impl ProxyHandler for JuicityHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let client = Self::client_for(node)?;
+        let client = Self::client_for(node).await?;
         let addr = JuiceAddr::new(target, target_domain);
         let mut last_err: Option<anyhow::Error> = None;
         // Retry once with a fresh connection when the stream open fails on a
@@ -404,7 +404,7 @@ impl ProxyHandler for JuicityHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<UdpProxySocket> {
-        let client = Self::client_for(node)?;
+        let client = Self::client_for(node).await?;
         let (conn, state) = client.connection(connect_timeout).await?;
         state.touch();
         let target_addr = JuiceAddr::new(target, target_domain);
@@ -485,7 +485,7 @@ impl ProxyHandler for JuicityHandler {
     }
 
     async fn test_connectivity(&self, node: &Node) -> bool {
-        match Self::client_for(node) {
+        match Self::client_for(node).await {
             Ok(client) => client.connection(Duration::from_secs(5)).await.is_ok(),
             Err(e) => {
                 debug!("Juicity connectivity test failed for {}: {}", node.name, e);

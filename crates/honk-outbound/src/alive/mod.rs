@@ -807,6 +807,24 @@ impl AliveDialerSet {
         coll.latencies.last()
     }
 
+    /// Read the most recent REAL (non-synthetic) probe sample and its
+    /// measurement time — display semantics for the clash delay history.
+    /// Synthetic failure placeholders (10s) are skipped so dashboards never
+    /// show them as a measured delay.
+    pub fn get_last_real_sample(
+        &self,
+        node_id: &str,
+        domain: ProbeDomain,
+        ipver: IpVersion,
+    ) -> Option<(Duration, std::time::SystemTime)> {
+        let idx = alive_index(domain, ipver);
+        let cols = self.collections.read();
+        let coll = cols.get(node_id).map(|arr| &arr[idx])?;
+        coll.latencies
+            .last_real_sample()
+            .map(|s| (s.latency, s.at))
+    }
+
     /// Moving average of the recent probe samples for the same
     /// (domain, ipver) state — this is what dae's `min_moving_avg` /
     /// `min_avg10` group policies rank nodes by. Falls back to the latest
@@ -1006,7 +1024,6 @@ impl AliveDialerSet {
             .unwrap_or(0)
     }
 
-
     /// Extract hostname from a URL string like "http://cp.cloudflare.com".
     ///
     /// The dae config format allows comma-separated fallback IPs after the
@@ -1068,7 +1085,6 @@ impl AliveDialerSet {
         ips.dedup();
         ips
     }
-
 }
 
 impl Default for AliveDialerSet {
@@ -1223,4 +1239,3 @@ impl RecoveryState {
         )
     }
 }
-

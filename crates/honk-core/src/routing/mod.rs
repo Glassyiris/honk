@@ -7,12 +7,15 @@ use std::net::IpAddr;
 mod geo;
 mod lpm;
 
-use geo::GeoAssets;
+pub(crate) use geo::GeoAssets;
 pub(crate) use lpm::BinaryLpmTrie;
 
 #[derive(Debug, Clone)]
 pub struct CompiledRoute {
     pub name: String,
+    /// dae-style rendering of the condition (`display_expr`), for the
+    /// clash `/connections` rule field and logs.
+    pub display: String,
     pub priority: u32,
     pub domain_patterns: Vec<Regex>,
     pub domain_suffixes: Vec<String>,
@@ -28,7 +31,7 @@ pub struct CompiledRoute {
     pub protocols: Vec<String>,
     pub process_names: Vec<String>,
     pub mac_addresses: Vec<String>,
-    pub geosite_domains: Vec<GeositeDomain>,
+    pub(crate) geosite_domains: Vec<GeositeDomain>,
     /// Pre-built hash/automaton matcher derived from `geosite_domains`.
     ///
     /// The naive representation costs O(domains) string operations (with
@@ -47,7 +50,7 @@ pub struct CompiledRoute {
 }
 
 #[derive(Debug, Clone)]
-pub enum GeositeDomain {
+pub(crate) enum GeositeDomain {
     Full(String),
     Domain(String),
     Keyword(String),
@@ -74,7 +77,7 @@ pub(crate) struct GeositeMatcher {
 }
 
 impl GeositeMatcher {
-    fn build(domains: &[GeositeDomain]) -> Self {
+    pub(crate) fn build(domains: &[GeositeDomain]) -> Self {
         let mut matcher = GeositeMatcher::default();
         let mut keywords: Vec<&str> = Vec::new();
         for d in domains {
@@ -95,7 +98,7 @@ impl GeositeMatcher {
         matcher
     }
 
-    fn matches(&self, domain: &str) -> bool {
+    pub(crate) fn matches(&self, domain: &str) -> bool {
         let lower = domain.to_lowercase();
         if self.full.contains(lower.as_str()) {
             return true;
@@ -249,6 +252,7 @@ impl Router {
 
             compiled.push(CompiledRoute {
                 name: rule.name.clone(),
+                display: rule.condition.display_expr(),
                 priority: rule.priority,
                 domain_patterns,
                 domain_suffixes: rule.condition.domain_suffix.clone(),
@@ -322,6 +326,7 @@ impl Router {
                 return Some(RouteMatch {
                     outbound_name: &route.outbound,
                     rule_name: &route.name,
+                    rule_display: &route.display,
                     must: route.must,
                     mark: route.mark,
                 });
@@ -374,6 +379,7 @@ impl Router {
                 return Some(RouteMatch {
                     outbound_name: &route.outbound,
                     rule_name: &route.name,
+                    rule_display: &route.display,
                     must: route.must,
                     mark: route.mark,
                 });
@@ -529,6 +535,8 @@ pub struct RouteResult {
 pub struct RouteMatch<'a> {
     pub outbound_name: &'a str,
     pub rule_name: &'a str,
+    /// dae-style rendering of the matched rule's condition (display).
+    pub rule_display: &'a str,
     pub must: bool,
     pub mark: u32,
 }

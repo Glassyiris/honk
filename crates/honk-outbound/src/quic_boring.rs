@@ -1,0 +1,1125 @@
+//! BoringSSL-backed QUIC crypto for quinn-proto (`crypto::Session`).
+//!
+//! Replaces rustls inside QUIC handshakes so QUIC outbounds (TUIC, Juicity,
+//! Hysteria2, DoQ/DoH3) get the same BoringSSL ClientHello as the TCP path:
+//! real Chrome fingerprint and, crucially, ECH — rustls has no client ECH,
+//! and quiche exposes no per-connection ECH hook, which is why this backend
+//! exists instead of a quiche port.
+//!
+//! Architecture: BoringSSL is callback-driven (`SSL_QUIC_METHOD`), quinn is
+//! pull-driven (`write_handshake`/`read_handshake`). The trampolines below
+//! stash traffic secrets, outgoing CRYPTO bytes, and alerts into
+//! [`QuicCryptoState`] (reachable from the C callbacks via `SSL` ex_data);
+//! the pull methods drain that state in the order quinn's `write_crypto`
+//! loop expects: old-level bytes and the *next* level's keys in one call.
+//!
+//! Only the client side is implemented (honk is a client-side outbound).
+
+use std::any::Any;
+use std::ffi::c_void;
+use std::ptr;
+use std::sync::{Arc, LazyLock};
+
+use aes::cipher::{BlockCipherEncrypt, KeyInit};
+use boring::aead::{AeadCtx, Algorithm as AeadAlgorithm};
+use boring::error::ErrorStack;
+use boring::ssl::{Ssl, SslContext, SslMethod, SslVerifyMode, SslVersion};
+use bytes::BytesMut;
+use foreign_types::ForeignTypeRef;
+use hkdf::Hkdf;
+use quinn_proto::crypto::{
+    self, CryptoError, ExportKeyingMaterialError, HeaderKey, KeyPair, Keys, PacketKey, Session,
+};
+use quinn_proto::transport_parameters::TransportParameters;
+use quinn_proto::{ConnectError, ConnectionId, Side, TransportError, TransportErrorCode};
+use sha2::{Sha256, Sha384};
+
+// TLS 1.3 cipher suite IDs (RFC 8446 §B.4).
+const TLS13_AES_128_GCM_SHA256: u16 = 0x1301;
+const TLS13_AES_256_GCM_SHA384: u16 = 0x1302;
+const TLS13_CHACHA20_POLY1305_SHA256: u16 = 0x1303;
+
+// RFC 9001 §5.2 initial salt (QUIC v1).
+const INITIAL_SALT_V1: [u8; 20] = [
+    0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad,
+    0xcc, 0xbb, 0x7f, 0x0a,
+];
+
+// RFC 9001 §5.3 retry integrity tag key/nonce (QUIC v1).
+const RETRY_INTEGRITY_KEY_V1: [u8; 16] = [
+    0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a, 0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e,
+];
+const RETRY_INTEGRITY_NONCE_V1: [u8; 12] = [
+    0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb,
+];
+
+// BoringSSL encryption levels (ssl.h ssl_encryption_level_t).
+const LEVEL_INITIAL: usize = 0;
+#[allow(dead_code)] // BoringSSL level 1 (0-RTT); unused, honk offers no early data
+const LEVEL_EARLY_DATA: usize = 1;
+const LEVEL_HANDSHAKE: usize = 2;
+const LEVEL_APPLICATION: usize = 3;
+
+/// HKDF-Expand-Label (RFC 8446 §7.1), SHA-256 variant.
+fn hkdf_expand_label_sha256(secret: &[u8], label: &str, out: &mut [u8]) {
+    let full_label = format!("tls13 {label}");
+    let mut info = Vec::with_capacity(3 + full_label.len() + 1);
+    info.extend_from_slice(&(out.len() as u16).to_be_bytes());
+    info.push(full_label.len() as u8);
+    info.extend_from_slice(full_label.as_bytes());
+    info.push(0); // empty context
+    let hk = Hkdf::<Sha256>::from_prk(secret).expect("traffic secret shorter than hash");
+    hk.expand(&info, out).expect("okm length within limits");
+}
+
+/// HKDF-Expand-Label (RFC 8446 §7.1), SHA-384 variant.
+fn hkdf_expand_label_sha384(secret: &[u8], label: &str, out: &mut [u8]) {
+    let full_label = format!("tls13 {label}");
+    let mut info = Vec::with_capacity(3 + full_label.len() + 1);
+    info.extend_from_slice(&(out.len() as u16).to_be_bytes());
+    info.push(full_label.len() as u8);
+    info.extend_from_slice(full_label.as_bytes());
+    info.push(0); // empty context
+    let hk = Hkdf::<Sha384>::from_prk(secret).expect("traffic secret shorter than hash");
+    hk.expand(&info, out).expect("okm length within limits");
+}
+
+/// A TLS 1.3 traffic secret plus the suite it belongs to.
+#[derive(Clone)]
+struct TrafficSecrets {
+    suite: u16,
+    secret: Vec<u8>,
+}
+
+impl TrafficSecrets {
+    fn expand_label(&self, label: &str, out: &mut [u8]) {
+        match self.suite {
+            TLS13_AES_256_GCM_SHA384 => hkdf_expand_label_sha384(&self.secret, label, out),
+            _ => hkdf_expand_label_sha256(&self.secret, label, out),
+        }
+    }
+
+    fn hash_len(&self) -> usize {
+        match self.suite {
+            TLS13_AES_256_GCM_SHA384 => 48,
+            _ => 32,
+        }
+    }
+
+    /// QUIC key update (RFC 9001 §6): next traffic secret.
+    fn next_secret(&self) -> Self {
+        let mut secret = vec![0u8; self.hash_len()];
+        self.expand_label("quic ku", &mut secret);
+        Self {
+            suite: self.suite,
+            secret,
+        }
+    }
+}
+
+/// QUIC AEAD packet-protection key (RFC 9001 §5.3).
+struct BoringPacketKey {
+    aead: AeadCtx,
+    iv: [u8; 12],
+    tag_len: usize,
+    confidentiality_limit: u64,
+    integrity_limit: u64,
+}
+
+impl BoringPacketKey {
+    fn new(secrets: &TrafficSecrets) -> anyhow::Result<Self> {
+        let (algorithm, key_len, confidentiality_limit, integrity_limit): (_, _, u64, u64) =
+            match secrets.suite {
+                TLS13_AES_128_GCM_SHA256 => (AeadAlgorithm::aes_128_gcm(), 16, 1 << 23, 1 << 52),
+                TLS13_AES_256_GCM_SHA384 => (AeadAlgorithm::aes_256_gcm(), 32, 1 << 23, 1 << 52),
+                TLS13_CHACHA20_POLY1305_SHA256 => {
+                    (AeadAlgorithm::chacha20_poly1305(), 32, u64::MAX, 1 << 36)
+                }
+                other => anyhow::bail!("unsupported TLS 1.3 cipher suite 0x{other:04x}"),
+            };
+        let mut key = vec![0u8; key_len];
+        secrets.expand_label("quic key", &mut key);
+        let mut iv = [0u8; 12];
+        secrets.expand_label("quic iv", &mut iv);
+        let aead = AeadCtx::new_default_tag(&algorithm, &key)?;
+        let tag_len = algorithm.max_tag_len();
+        Ok(Self {
+            aead,
+            iv,
+            tag_len,
+            confidentiality_limit,
+            integrity_limit,
+        })
+    }
+
+    fn nonce(&self, packet: u64) -> [u8; 12] {
+        // RFC 9001 §5.3: nonce = iv XOR packet number (left-padded).
+        let mut nonce = self.iv;
+        for (i, b) in packet.to_be_bytes().iter().enumerate() {
+            nonce[4 + i] ^= b;
+        }
+        nonce
+    }
+}
+
+impl PacketKey for BoringPacketKey {
+    fn encrypt(&self, packet: u64, buf: &mut [u8], header_len: usize) {
+        let nonce = self.nonce(packet);
+        let (header, payload_tag) = buf.split_at_mut(header_len);
+        let (payload, tag_storage) = payload_tag.split_at_mut(payload_tag.len() - self.tag_len);
+        let tag = self
+            .aead
+            .seal_in_place(&nonce, payload, tag_storage, header)
+            .expect("AEAD seal failed");
+        debug_assert_eq!(tag.len(), self.tag_len);
+    }
+
+    fn decrypt(
+        &self,
+        packet: u64,
+        header: &[u8],
+        payload: &mut BytesMut,
+    ) -> Result<(), CryptoError> {
+        let nonce = self.nonce(packet);
+        let payload_len = payload.len();
+        let (body, tag) = payload.split_at_mut(payload_len - self.tag_len);
+        self.aead
+            .open_in_place(&nonce, body, tag, header)
+            .map_err(|_| CryptoError)?;
+        payload.truncate(payload_len - self.tag_len);
+        Ok(())
+    }
+
+    fn tag_len(&self) -> usize {
+        self.tag_len
+    }
+
+    fn confidentiality_limit(&self) -> u64 {
+        self.confidentiality_limit
+    }
+
+    fn integrity_limit(&self) -> u64 {
+        self.integrity_limit
+    }
+}
+
+/// QUIC header-protection key (RFC 9001 §5.4): AES-ECB or ChaCha20.
+#[allow(clippy::large_enum_variant)] // AES-256 key schedule is large; HP keys are per-connection
+enum BoringHeaderKey {
+    Aes128(aes::Aes128),
+    Aes256(aes::Aes256),
+    ChaCha20([u8; 32]),
+}
+
+impl BoringHeaderKey {
+    fn new(secrets: &TrafficSecrets) -> anyhow::Result<Self> {
+        let key_len = match secrets.suite {
+            TLS13_AES_128_GCM_SHA256 => 16,
+            _ => 32,
+        };
+        let mut key = vec![0u8; key_len];
+        secrets.expand_label("quic hp", &mut key);
+        Ok(match secrets.suite {
+            TLS13_AES_128_GCM_SHA256 => {
+                Self::Aes128(aes::Aes128::new_from_slice(&key).expect("key length"))
+            }
+            TLS13_AES_256_GCM_SHA384 => {
+                Self::Aes256(aes::Aes256::new_from_slice(&key).expect("key length"))
+            }
+            TLS13_CHACHA20_POLY1305_SHA256 => Self::ChaCha20(key.try_into().expect("key length")),
+            other => anyhow::bail!("unsupported TLS 1.3 cipher suite 0x{other:04x}"),
+        })
+    }
+
+    fn compute_mask(&self, sample: &[u8]) -> [u8; 5] {
+        match self {
+            Self::Aes128(cipher) => {
+                let mut block = [0u8; 16];
+                block.copy_from_slice(&sample[..16]);
+                cipher.encrypt_block((&mut block).into());
+                block[..5].try_into().expect("slice length")
+            }
+            Self::Aes256(cipher) => {
+                let mut block = [0u8; 16];
+                block.copy_from_slice(&sample[..16]);
+                cipher.encrypt_block((&mut block).into());
+                block[..5].try_into().expect("slice length")
+            }
+            Self::ChaCha20(key) => {
+                use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
+                let counter = u32::from_le_bytes(sample[..4].try_into().expect("slice length"));
+                let nonce: [u8; 12] = sample[4..16].try_into().expect("slice length");
+                let mut cipher = chacha20::ChaCha20::new(key.into(), &nonce.into());
+                cipher.seek(counter);
+                let mut mask = [0u8; 5];
+                cipher.apply_keystream(&mut mask);
+                mask
+            }
+        }
+    }
+}
+
+impl HeaderKey for BoringHeaderKey {
+    fn decrypt(&self, pn_offset: usize, packet: &mut [u8]) {
+        // Mirrors quinn-proto's rustls impl: same layout, same mask application.
+        // NB: rustls's HeaderProtectionKey does two things internally that
+        // this impl must mirror exactly:
+        //  1. Bit-width masking (RFC 9001 §5.4.1): long header masks 4 bits of
+        //     the first byte, short header 5.
+        //  2. pn-LENGTH-aware masking: only pn_len bytes after the first byte
+        //     are masked. Masking a fixed 4-byte span corrupts the payload
+        //     bytes following a short (1-3 byte) packet number — and because
+        //     XOR is self-inverse, a same-bug peer silently self-cancels
+        //     (which is why every boring↔boring self-test passed while
+        //     rustls correctly rejected our packets).
+        // Removal order: unmask the first byte FIRST, then read pn_len from
+        // it (the pn-length bits themselves were masked).
+        let (header, sample) = packet.split_at_mut(pn_offset + 4);
+        let (first, rest) = header.split_at_mut(1);
+        let mask = self.compute_mask(&sample[..self.sample_size()]);
+        first[0] ^= mask[0] & if first[0] & 0x80 == 0x80 { 0x0f } else { 0x1f };
+        let pn_len = (first[0] & 0x03) as usize + 1;
+        for (dst, m) in rest[pn_offset - 1..]
+            .iter_mut()
+            .zip(&mask[1..])
+            .take(pn_len)
+        {
+            *dst ^= m;
+        }
+    }
+
+    fn encrypt(&self, pn_offset: usize, packet: &mut [u8]) {
+        // Application order: pn_len comes from the first byte BEFORE masking
+        // it (the pn-length bits are plaintext until we mask them).
+        let (header, sample) = packet.split_at_mut(pn_offset + 4);
+        let (first, rest) = header.split_at_mut(1);
+        let mask = self.compute_mask(&sample[..self.sample_size()]);
+        let pn_len = (first[0] & 0x03) as usize + 1;
+        first[0] ^= mask[0] & if first[0] & 0x80 == 0x80 { 0x0f } else { 0x1f };
+        for (dst, m) in rest[pn_offset - 1..]
+            .iter_mut()
+            .zip(&mask[1..])
+            .take(pn_len)
+        {
+            *dst ^= m;
+        }
+    }
+
+    fn sample_size(&self) -> usize {
+        16
+    }
+}
+
+fn keys_from_secrets(read: &TrafficSecrets, write: &TrafficSecrets) -> anyhow::Result<Keys> {
+    Ok(Keys {
+        header: KeyPair {
+            local: Box::new(BoringHeaderKey::new(write)?),
+            remote: Box::new(BoringHeaderKey::new(read)?),
+        },
+        packet: KeyPair {
+            local: Box::new(BoringPacketKey::new(write)?),
+            remote: Box::new(BoringPacketKey::new(read)?),
+        },
+    })
+}
+
+/// QUIC initial keys from the client's initial DCID (RFC 9001 §5.2).
+fn initial_keys_v1(dst_cid: &ConnectionId, side: Side) -> Keys {
+    let (initial_secret, _) = Hkdf::<Sha256>::extract(Some(&INITIAL_SALT_V1), dst_cid.as_ref());
+    let initial_secret = &initial_secret[..];
+    let mut client_secret = vec![0u8; 32];
+    hkdf_expand_label_sha256(initial_secret, "client in", &mut client_secret);
+    let mut server_secret = vec![0u8; 32];
+    hkdf_expand_label_sha256(initial_secret, "server in", &mut server_secret);
+
+    let client = TrafficSecrets {
+        suite: TLS13_AES_128_GCM_SHA256,
+        secret: client_secret,
+    };
+    let server = TrafficSecrets {
+        suite: TLS13_AES_128_GCM_SHA256,
+        secret: server_secret,
+    };
+    let (read, write) = match side {
+        Side::Client => (server, client),
+        Side::Server => (client, server),
+    };
+    keys_from_secrets(&read, &write).expect("initial keys derivation is infallible")
+}
+
+/// State shared between the `SSL_QUIC_METHOD` C callbacks and the quinn
+/// `Session` pull methods. Owned by the session; the callbacks reach it via
+/// `SSL` ex_data. All access happens either inside `SSL_do_handshake` (which
+/// requires `&mut self` on the session) or from quinn's single connection
+/// task, so the raw-pointer plumbing cannot race.
+#[derive(Default)]
+struct QuicCryptoState {
+    read_secrets: [Option<TrafficSecrets>; 4],
+    write_secrets: [Option<TrafficSecrets>; 4],
+    /// Buffered outgoing CRYPTO bytes per level.
+    outgoing: [Vec<u8>; 4],
+    /// Fatal alert code from `send_alert`.
+    alert: Option<u8>,
+    handshake_complete: bool,
+}
+
+static EX_DATA_INDEX: LazyLock<i32> = LazyLock::new(|| unsafe {
+    boring_sys::SSL_get_ex_new_index(0, ptr::null_mut(), ptr::null_mut(), None, None)
+});
+
+unsafe fn state_of<'a>(ssl: *mut boring_sys::SSL) -> &'a mut QuicCryptoState {
+    unsafe {
+        let ptr = boring_sys::SSL_get_ex_data(ssl, *EX_DATA_INDEX).cast::<QuicCryptoState>();
+        assert!(!ptr.is_null(), "QUIC ex_data not initialized");
+        &mut *ptr
+    }
+}
+
+unsafe extern "C" fn on_set_read_secret(
+    ssl: *mut boring_sys::SSL,
+    level: boring_sys::ssl_encryption_level_t,
+    cipher: *const boring_sys::SSL_CIPHER,
+    secret: *const u8,
+    secret_len: usize,
+) -> i32 {
+    unsafe {
+        let suite = boring_sys::SSL_CIPHER_get_protocol_id(cipher);
+        let secret = std::slice::from_raw_parts(secret, secret_len).to_vec();
+        state_of(ssl).read_secrets[level.0 as usize] = Some(TrafficSecrets { suite, secret });
+    }
+    1
+}
+
+unsafe extern "C" fn on_set_write_secret(
+    ssl: *mut boring_sys::SSL,
+    level: boring_sys::ssl_encryption_level_t,
+    cipher: *const boring_sys::SSL_CIPHER,
+    secret: *const u8,
+    secret_len: usize,
+) -> i32 {
+    unsafe {
+        let suite = boring_sys::SSL_CIPHER_get_protocol_id(cipher);
+        let secret = std::slice::from_raw_parts(secret, secret_len).to_vec();
+        state_of(ssl).write_secrets[level.0 as usize] = Some(TrafficSecrets { suite, secret });
+    }
+    1
+}
+
+unsafe extern "C" fn on_add_handshake_data(
+    ssl: *mut boring_sys::SSL,
+    level: boring_sys::ssl_encryption_level_t,
+    data: *const u8,
+    len: usize,
+) -> i32 {
+    unsafe {
+        let bytes = std::slice::from_raw_parts(data, len);
+        state_of(ssl).outgoing[level.0 as usize].extend_from_slice(bytes);
+    }
+    1
+}
+
+extern "C" fn on_flush_flight(_ssl: *mut boring_sys::SSL) -> i32 {
+    // quinn flushes packets itself; nothing to do.
+    1
+}
+
+unsafe extern "C" fn on_send_alert(
+    ssl: *mut boring_sys::SSL,
+    _level: boring_sys::ssl_encryption_level_t,
+    alert: u8,
+) -> i32 {
+    unsafe {
+        state_of(ssl).alert = Some(alert);
+    }
+    1
+}
+
+static QUIC_METHOD: boring_sys::SSL_QUIC_METHOD = boring_sys::SSL_QUIC_METHOD {
+    set_read_secret: Some(on_set_read_secret),
+    set_write_secret: Some(on_set_write_secret),
+    add_handshake_data: Some(on_add_handshake_data),
+    flush_flight: Some(on_flush_flight),
+    send_alert: Some(on_send_alert),
+};
+
+/// `crypto::ClientConfig` backed by a BoringSSL `SSL_CTX` (TLS 1.3 only).
+pub struct BoringQuicClientConfig {
+    ctx: SslContext,
+    alpn_wire: Vec<u8>,
+    chrome: bool,
+    verify: bool,
+    ech_config_list: Option<Arc<Vec<u8>>>,
+}
+
+impl BoringQuicClientConfig {
+    /// Build the config. `alpn` is the protocol list in TLS wire format
+    /// (length-prefixed entries), e.g. `b"\x02h3"` for Hysteria2/Juicity.
+    pub fn new(
+        alpn_wire: Vec<u8>,
+        skip_cert_verify: bool,
+        chrome: bool,
+        ech_config_list: Option<Arc<Vec<u8>>>,
+    ) -> anyhow::Result<Self> {
+        let mut builder = SslContext::builder(SslMethod::tls())?;
+        // QUIC mandates TLS 1.3.
+        builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
+        builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
+
+        if skip_cert_verify {
+            builder.set_verify(SslVerifyMode::NONE);
+        } else {
+            builder.set_verify(SslVerifyMode::PEER);
+            builder.set_verify_cert_store(crate::tls::root_store()?)?;
+        }
+        if chrome {
+            builder.set_grease_enabled(true);
+            builder.set_sigalgs_list(crate::tls::CHROME_SIGALGS)?;
+            builder.set_curves_list(crate::tls::CHROME_CURVES)?;
+            builder.add_certificate_compression_algorithm(crate::tls::BrotliCertCompression)?;
+        }
+
+        Ok(Self {
+            ctx: builder.build(),
+            alpn_wire,
+            chrome,
+            verify: !skip_cert_verify,
+            ech_config_list,
+        })
+    }
+}
+
+impl crypto::ClientConfig for BoringQuicClientConfig {
+    fn start_session(
+        self: Arc<Self>,
+        version: u32,
+        server_name: &str,
+        params: &TransportParameters,
+    ) -> Result<Box<dyn Session>, ConnectError> {
+        // QUIC v1 only (0xff000021/0xff000022 are v1-compatible drafts).
+        if version != 0x0000_0001 && !(0xff00_0021..=0xff00_0022).contains(&version) {
+            return Err(ConnectError::UnsupportedVersion);
+        }
+
+        let mut ssl = Ssl::new(&self.ctx).expect("SSL_new failed");
+        ssl.set_hostname(server_name)
+            .map_err(|_| ConnectError::InvalidServerName(server_name.into()))?;
+        if self.verify {
+            let name = std::ffi::CString::new(server_name)
+                .map_err(|_| ConnectError::InvalidServerName(server_name.into()))?;
+            let ok = unsafe { boring_sys::SSL_set1_host(ssl.as_ptr(), name.as_ptr()) };
+            if ok != 1 {
+                return Err(ConnectError::InvalidServerName(server_name.into()));
+            }
+        }
+        ssl.set_alpn_protos(&self.alpn_wire)
+            .expect("invalid ALPN wire format");
+
+        if self.chrome {
+            ssl.set_permute_extensions(true);
+            crate::tls::set_chrome_key_shares_ssl(&ssl).expect("SSL_set1_client_key_shares");
+        }
+        match &self.ech_config_list {
+            Some(list) => ssl
+                .set_ech_config_list(list)
+                .expect("invalid ECHConfigList"),
+            None if self.chrome => ssl.set_enable_ech_grease(true),
+            None => {}
+        }
+
+        let ok = unsafe { boring_sys::SSL_set_quic_method(ssl.as_ptr(), &QUIC_METHOD) };
+        assert_eq!(ok, 1, "SSL_set_quic_method");
+
+        let mut transport_params = Vec::new();
+        params.write(&mut transport_params);
+        let ok = unsafe {
+            boring_sys::SSL_set_quic_transport_params(
+                ssl.as_ptr(),
+                transport_params.as_ptr(),
+                transport_params.len(),
+            )
+        };
+        assert_eq!(ok, 1, "SSL_set_quic_transport_params");
+
+        let state = Box::new(QuicCryptoState::default());
+        let ok = unsafe {
+            boring_sys::SSL_set_ex_data(
+                ssl.as_ptr(),
+                *EX_DATA_INDEX,
+                (&*state as *const QuicCryptoState)
+                    .cast_mut()
+                    .cast::<c_void>(),
+            )
+        };
+        assert_eq!(ok, 1, "SSL_set_ex_data");
+
+        unsafe { boring_sys::SSL_set_connect_state(ssl.as_ptr()) };
+
+        Ok(Box::new(BoringQuicSession {
+            ssl,
+            state,
+            reported_level: LEVEL_INITIAL,
+            got_handshake_data: false,
+            driven: false,
+            cur_1rtt: None,
+        }))
+    }
+}
+
+/// Handshake data exposed to quinn consumers (ALPN only; no honk consumer
+/// downcasts further).
+pub struct BoringHandshakeData {
+    /// Negotiated ALPN protocol, if any.
+    pub protocol: Option<Vec<u8>>,
+}
+
+/// quinn `crypto::Session` over a BoringSSL QUIC client handshake.
+struct BoringQuicSession {
+    ssl: Ssl,
+    state: Box<QuicCryptoState>,
+    /// Highest level whose keys quinn has been given (mirrors quinn's
+    /// `highest_space`): INITIAL → HANDSHAKE → APPLICATION.
+    reported_level: usize,
+    got_handshake_data: bool,
+    /// Whether `SSL_do_handshake` has been driven at least once.
+    driven: bool,
+    /// Current 1-RTT (read, write) secrets for key updates.
+    cur_1rtt: Option<(TrafficSecrets, TrafficSecrets)>,
+}
+
+impl BoringQuicSession {
+    /// Drive `SSL_do_handshake`; errors are mapped onto quinn transport
+    /// errors, preferring the alert code captured by `send_alert`.
+    fn drive_handshake(&mut self) -> Result<(), TransportError> {
+        // One call processes all buffered CRYPTO data; WANT_READ just means
+        // "feed me more", which arrives via the next read_handshake.
+        let ret = unsafe { boring_sys::SSL_do_handshake(self.ssl.as_ptr()) };
+        if ret == 1 {
+            self.state.handshake_complete = true;
+            return Ok(());
+        }
+        let code = unsafe { boring_sys::SSL_get_error(self.ssl.as_ptr(), ret) };
+        if code as u32 == boring_sys::SSL_ERROR_WANT_READ as u32 {
+            return Ok(());
+        }
+        let reason = ErrorStack::get().to_string();
+        Err(self.fatal_error(&reason))
+    }
+
+    fn fatal_error(&self, reason: &str) -> TransportError {
+        if let Some(alert) = self.state.alert {
+            TransportError {
+                code: TransportErrorCode::crypto(alert),
+                frame: None,
+                reason: format!("TLS alert {alert}: {reason}"),
+            }
+        } else {
+            TransportError {
+                code: TransportErrorCode::PROTOCOL_VIOLATION,
+                frame: None,
+                reason: format!("TLS error: {reason}"),
+            }
+        }
+    }
+
+    /// Keys for the next packet space, once BoringSSL installed both
+    /// directions of the next level.
+    fn take_next_level_keys(&mut self) -> Option<Keys> {
+        let next = match self.reported_level {
+            LEVEL_INITIAL => LEVEL_HANDSHAKE,
+            LEVEL_HANDSHAKE => LEVEL_APPLICATION,
+            _ => return None,
+        };
+        if self.state.read_secrets[next].is_none() || self.state.write_secrets[next].is_none() {
+            return None;
+        }
+        self.reported_level = next;
+        let read = self.state.read_secrets[next]
+            .clone()
+            .expect("checked above");
+        let write = self.state.write_secrets[next]
+            .clone()
+            .expect("checked above");
+        if next == LEVEL_APPLICATION {
+            self.cur_1rtt = Some((read.clone(), write.clone()));
+        }
+        Some(
+            keys_from_secrets(&read, &write)
+                .expect("key derivation from installed traffic secrets"),
+        )
+    }
+}
+
+impl Session for BoringQuicSession {
+    fn initial_keys(&self, dst_cid: &ConnectionId, side: Side) -> Keys {
+        initial_keys_v1(dst_cid, side)
+    }
+
+    fn handshake_data(&self) -> Option<Box<dyn Any>> {
+        if !self.got_handshake_data {
+            return None;
+        }
+        Some(Box::new(BoringHandshakeData {
+            protocol: self.ssl.selected_alpn_protocol().map(|p| p.to_vec()),
+        }))
+    }
+
+    fn peer_identity(&self) -> Option<Box<dyn Any>> {
+        // No honk consumer; skip building the cert chain.
+        None
+    }
+
+    fn early_crypto(&self) -> Option<(Box<dyn HeaderKey>, Box<dyn PacketKey>)> {
+        // 0-RTT is not offered by the QUIC outbounds.
+        None
+    }
+
+    fn early_data_accepted(&self) -> Option<bool> {
+        Some(false)
+    }
+
+    fn is_handshaking(&self) -> bool {
+        !self.state.handshake_complete
+    }
+
+    fn read_handshake(&mut self, buf: &[u8]) -> Result<bool, TransportError> {
+        if buf.is_empty() {
+            return Ok(false);
+        }
+        let level = unsafe { boring_sys::SSL_quic_read_level(self.ssl.as_ptr()) };
+        let ok = unsafe {
+            boring_sys::SSL_provide_quic_data(self.ssl.as_ptr(), level, buf.as_ptr(), buf.len())
+        };
+        if ok != 1 {
+            return Err(self.fatal_error("unexpected CRYPTO data at this level"));
+        }
+
+        if self.state.handshake_complete {
+            let ok = unsafe { boring_sys::SSL_process_quic_post_handshake(self.ssl.as_ptr()) };
+            if ok != 1 {
+                return Err(self.fatal_error(&ErrorStack::get().to_string()));
+            }
+        } else {
+            self.driven = true;
+            self.drive_handshake()?;
+        }
+
+        if !self.got_handshake_data
+            && (self.ssl.selected_alpn_protocol().is_some() || !self.is_handshaking())
+        {
+            self.got_handshake_data = true;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn transport_parameters(&self) -> Result<Option<TransportParameters>, TransportError> {
+        let mut data: *const u8 = ptr::null();
+        let mut len: usize = 0;
+        unsafe {
+            boring_sys::SSL_get_peer_quic_transport_params(self.ssl.as_ptr(), &mut data, &mut len);
+        }
+        if data.is_null() || len == 0 {
+            return Ok(None);
+        }
+        let mut bytes: &[u8] = unsafe { std::slice::from_raw_parts(data, len) };
+        TransportParameters::read(Side::Client, &mut bytes)
+            .map(Some)
+            .map_err(Into::into)
+    }
+
+    fn write_handshake(&mut self, buf: &mut Vec<u8>) -> Option<Keys> {
+        // The first write produces the ClientHello.
+        if !self.driven {
+            self.driven = true;
+            // The first flight cannot fail meaningfully; real errors surface
+            // through read_handshake.
+            let _ = self.drive_handshake();
+        }
+
+        // Drain CRYPTO bytes for the level quinn currently occupies. New-level
+        // bytes stay queued until quinn upgrades (it re-calls in a loop).
+        let level = self.reported_level;
+        let queued = std::mem::take(&mut self.state.outgoing[level]);
+        buf.extend_from_slice(&queued);
+
+        self.take_next_level_keys()
+    }
+
+    fn next_1rtt_keys(&mut self) -> Option<KeyPair<Box<dyn PacketKey>>> {
+        let (read, write) = self.cur_1rtt.as_mut()?;
+        let next_read = read.next_secret();
+        let next_write = write.next_secret();
+        *read = next_read;
+        *write = next_write;
+        Some(KeyPair {
+            local: Box::new(BoringPacketKey::new(write).expect("key derivation from 1-RTT secret"))
+                as Box<dyn PacketKey>,
+            remote: Box::new(BoringPacketKey::new(read).expect("key derivation from 1-RTT secret"))
+                as Box<dyn PacketKey>,
+        })
+    }
+
+    fn is_valid_retry(&self, orig_dst_cid: &ConnectionId, header: &[u8], payload: &[u8]) -> bool {
+        // RFC 9001 §5.8 retry integrity tag: AES-128-GCM over the pseudo-packet.
+        let Some(tag_start) = payload.len().checked_sub(16) else {
+            return false;
+        };
+        let mut pseudo_packet =
+            Vec::with_capacity(header.len() + payload.len() + orig_dst_cid.len() + 1);
+        pseudo_packet.push(orig_dst_cid.len() as u8);
+        pseudo_packet.extend_from_slice(orig_dst_cid);
+        pseudo_packet.extend_from_slice(header);
+        let tag_start = tag_start + pseudo_packet.len();
+        pseudo_packet.extend_from_slice(payload);
+
+        let (aad, tag) = pseudo_packet.split_at_mut(tag_start);
+        let Ok(ctx) =
+            AeadCtx::new_default_tag(&AeadAlgorithm::aes_128_gcm(), &RETRY_INTEGRITY_KEY_V1)
+        else {
+            return false;
+        };
+        ctx.open_in_place(&RETRY_INTEGRITY_NONCE_V1, &mut [], tag, aad)
+            .is_ok()
+    }
+
+    fn export_keying_material(
+        &self,
+        output: &mut [u8],
+        label: &[u8],
+        context: &[u8],
+    ) -> Result<(), ExportKeyingMaterialError> {
+        let ok = unsafe {
+            boring_sys::SSL_export_keying_material(
+                self.ssl.as_ptr(),
+                output.as_mut_ptr().cast(),
+                output.len(),
+                label.as_ptr().cast(),
+                label.len(),
+                context.as_ptr(),
+                context.len(),
+                1,
+            )
+        };
+        if ok == 1 {
+            Ok(())
+        } else {
+            Err(ExportKeyingMaterialError)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Interop: BoringSSL QUIC client ↔ rustls QUIC server (the same servers
+    //! the protocol handlers are tested against).
+    use super::*;
+    use honk_config::node::Node;
+
+    fn skip_verify_node() -> Node {
+        Node {
+            skip_cert_verify: true,
+            ..Default::default()
+        }
+    }
+
+    /// Echo server: relays every accepted bi stream back to its peer.
+    fn spawn_echo_server(alpn: &[&[u8]]) -> std::net::SocketAddr {
+        let (endpoint, addr) = crate::quic::testutil::server_endpoint(alpn, true).unwrap();
+        tokio::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                tokio::spawn(async move {
+                    let Ok(conn) = incoming.await else { return };
+                    loop {
+                        match conn.accept_bi().await {
+                            Ok((mut send, mut recv)) => {
+                                tokio::spawn(async move {
+                                    if let Ok(buf) = recv.read_to_end(usize::MAX).await {
+                                        let _ = send.write_all(&buf).await;
+                                        let _ = send.finish();
+                                    }
+                                });
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    async fn roundtrip(node: &Node) -> anyhow::Result<Vec<u8>> {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_test_writer()
+            .try_init();
+        let addr = spawn_echo_server(&[b"h3"]);
+        let cfg = crate::quic::client_config(node, &[b"h3"], None, None).await?;
+        let mut endpoint = crate::quic::client_endpoint(false)?;
+        endpoint.set_default_client_config(cfg);
+        let conn = endpoint.connect(addr, "localhost")?.await?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        send.write_all(b"ping").await?;
+        send.finish()?;
+        let echoed = recv.read_to_end(usize::MAX).await?;
+        Ok(echoed)
+    }
+
+    /// Baseline: standard (non-Chrome) mode round-trips through a rustls server.
+    #[tokio::test]
+    async fn interop_standard_mode() {
+        crate::tls::set_tls_mode("tls");
+        let echoed = roundtrip(&skip_verify_node()).await.unwrap();
+        assert_eq!(&echoed, b"ping");
+    }
+
+    #[tokio::test]
+    async fn interop_chrome_mode_with_ech_grease() {
+        crate::tls::set_tls_mode("utls");
+        let echoed = roundtrip(&skip_verify_node()).await.unwrap();
+        assert_eq!(&echoed, b"ping");
+    }
+
+    /// Real ECH over QUIC: a server that cannot accept ECH must fail the
+    /// handshake (fail-closed, RFC anti-downgrade) — which also proves the
+    /// ECH extension really reached the wire inside the QUIC ClientHello.
+    #[tokio::test]
+    async fn ech_over_quic_fails_closed_without_server_support() {
+        static ECH_CONFIG_LIST: &[u8] = include_bytes!("../tests/fixtures/echconfiglist");
+        crate::tls::set_tls_mode("utls");
+        let node = Node {
+            skip_cert_verify: true,
+            ech_enabled: true,
+            ech_config: Some(base64::engine::general_purpose::STANDARD.encode(ECH_CONFIG_LIST)),
+            ..Default::default()
+        };
+        let err = roundtrip(&node)
+            .await
+            .expect_err("handshake must fail when the server cannot accept ECH");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("ech") || msg.contains("ECH") || msg.contains("crypto"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    /// RFC 9001 Appendix A.1 test vectors for initial-secret derivation.
+    #[test]
+    fn rfc9001_a1_initial_key_vectors() {
+        fn hex(b: &[u8]) -> String {
+            b.iter().map(|x| format!("{x:02x}")).collect()
+        }
+        let dcid = [0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08];
+        let (initial_secret, _) = Hkdf::<Sha256>::extract(Some(&INITIAL_SALT_V1), &dcid);
+        assert_eq!(
+            hex(&initial_secret),
+            "7db5df06e7a69e432496adedb00851923595221596ae2ae9fb8115c1e9ed0a44"
+        );
+
+        let mut client_secret = [0u8; 32];
+        hkdf_expand_label_sha256(&initial_secret, "client in", &mut client_secret);
+        assert_eq!(
+            hex(&client_secret),
+            "c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea"
+        );
+
+        let secrets = TrafficSecrets {
+            suite: TLS13_AES_128_GCM_SHA256,
+            secret: client_secret.to_vec(),
+        };
+        let mut key = [0u8; 16];
+        secrets.expand_label("quic key", &mut key);
+        assert_eq!(hex(&key), "1f369613dd76d5467730efcbe3b1a22d");
+        let mut iv = [0u8; 12];
+        secrets.expand_label("quic iv", &mut iv);
+        assert_eq!(hex(&iv), "fa044b2f42a3fd3b46fb255c");
+        let mut hp = [0u8; 16];
+        secrets.expand_label("quic hp", &mut hp);
+        assert_eq!(hex(&hp), "9f50449e04a0e810283a1e9933adedd2");
+    }
+
+    /// RFC 9001 Appendix A.2: full Client Initial packet protection vector.
+    #[test]
+    fn rfc9001_a2_client_initial_packet() {
+        fn unhex(s: &str) -> Vec<u8> {
+            let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+                .collect()
+        }
+
+        let secrets = TrafficSecrets {
+            suite: TLS13_AES_128_GCM_SHA256,
+            secret: unhex("c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea"),
+        };
+        let header = unhex("c300000001088394c8f03e5157080000449e00000002");
+        let mut payload = unhex(
+            "060040f1010000ed0303ebf8fa56f12939b9584a3896472ec40bb863cfd3e868\
+             04fe3a47f06a2b69484c00000413011302010000c000000010000e00000b6578\
+             616d706c652e636f6dff01000100000a00080006001d00170018001000070005\
+             04616c706e000500050100000000003300260024001d00209370b2c9caa47fba\
+             baf4559fedba753de171fa71f50f1ce15d43e994ec74d748002b000302030400\
+             0d0010000e0403050306030203080408050806002d00020101001c0002400100\
+             3900320408ffffffffffffffff05048000ffff07048000ffff08011001048000\
+             75300901100f088394c8f03e51570806048000ffff",
+        );
+        payload.resize(1162, 0);
+        let mut buf = [header, payload].concat();
+
+        let pkt = BoringPacketKey::new(&secrets).unwrap();
+        pkt.encrypt(2, &mut buf, 22);
+        // First 16 bytes of the protected payload are the HP sample.
+        assert_eq!(&buf[22..38], &unhex("d1b1c98dd7689fb8ec11d242b123dc9b")[..]);
+
+        let hk = BoringHeaderKey::new(&secrets).unwrap();
+        hk.encrypt(18, &mut buf);
+        assert_eq!(buf[0], 0xc0, "long-header first byte");
+        assert_eq!(&buf[18..22], &unhex("7b9aec34")[..], "masked packet number");
+    }
+
+    /// Cross-implementation check: encrypt with rustls initial keys, decrypt
+    /// with ours (and vice versa). Any key-derivation or AEAD-usage
+    /// divergence from rustls shows up here before live interop is attempted.
+    #[test]
+    fn cross_impl_initial_keys_match_rustls() {
+        // TransportParameters has no public constructor; an empty extension
+        // parses to defaults (only initial keys matter here anyway).
+        let params = TransportParameters::read(Side::Server, &mut &[][..]).unwrap();
+
+        // rustls client session (dangerous no-verify; only initial keys used).
+        let mut rustls_cfg = tokio_rustls::rustls::ClientConfig::builder_with_provider(
+            tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().into(),
+        )
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerifier))
+        .with_no_client_auth();
+        rustls_cfg.alpn_protocols = vec![b"h3".to_vec()];
+        let rustls_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(rustls_cfg)
+            .expect("rustls QUIC client config");
+        let rustls_session =
+            crypto::ClientConfig::start_session(Arc::new(rustls_crypto), 1, "localhost", &params)
+                .unwrap();
+
+        let my_cfg =
+            Arc::new(BoringQuicClientConfig::new(b"\x02h3".to_vec(), true, false, None).unwrap());
+        let my_session =
+            crypto::ClientConfig::start_session(my_cfg, 1, "localhost", &params).unwrap();
+
+        let dcid = ConnectionId::new(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        // QUIC initial keys are directional: the client encrypts with the
+        // client secret, the server decrypts with the same secret (its
+        // "remote" key). Cross-checks must pair client.local with
+        // server.remote, never client.local with client.remote.
+        let rustls_client = rustls_session.initial_keys(&dcid, Side::Client);
+        let rustls_server = rustls_session.initial_keys(&dcid, Side::Server);
+        let my_client = my_session.initial_keys(&dcid, Side::Client);
+        let my_server = my_session.initial_keys(&dcid, Side::Server);
+
+        // Packet protection: self-consistency, then cross-implementation.
+        for (name, enc, dec) in [
+            (
+                "boring->boring",
+                &my_client.packet.local,
+                &my_server.packet.remote,
+            ),
+            (
+                "rustls->rustls",
+                &rustls_client.packet.local,
+                &rustls_server.packet.remote,
+            ),
+            (
+                "boring->rustls",
+                &my_client.packet.local,
+                &rustls_server.packet.remote,
+            ),
+            (
+                "rustls->boring",
+                &rustls_client.packet.local,
+                &my_server.packet.remote,
+            ),
+        ] {
+            let header = *b"\xc3\x00\x00\x00\x01\x08dciddddd\x00\x00\x44\x9e\x00\x00\x00\x02";
+            let mut buf = header.to_vec();
+            buf.extend_from_slice(b"payload-payload-payload");
+            buf.resize(buf.len() + 16, 0);
+            enc.encrypt(2, &mut buf, header.len());
+            let mut payload = BytesMut::from(&buf[header.len()..]);
+            dec.decrypt(2, &buf[..header.len()], &mut payload)
+                .unwrap_or_else(|_| panic!("{name}: cross decrypt failed"));
+            assert_eq!(&payload[..], b"payload-payload-payload", "{name}");
+        }
+
+        // Header protection: client.local masks, server.remote unmasks.
+        for (name, enc, dec) in [
+            (
+                "rustls->boring",
+                &rustls_client.header.local,
+                &my_server.header.remote,
+            ),
+            (
+                "boring->rustls",
+                &my_client.header.local,
+                &rustls_server.header.remote,
+            ),
+        ] {
+            let mut buf = vec![0xabu8; 64];
+            buf[0] = 0xc3;
+            let original = buf.clone();
+            enc.encrypt(18, &mut buf);
+            dec.decrypt(18, &mut buf);
+            assert_eq!(buf, original, "{name} HP roundtrip");
+        }
+    }
+
+    /// No-op cert verifier for the rustls side of the cross test.
+    #[derive(Debug)]
+    struct NoVerifier;
+    impl tokio_rustls::rustls::client::danger::ServerCertVerifier for NoVerifier {
+        fn verify_server_cert(
+            &self,
+            _: &tokio_rustls::rustls::pki_types::CertificateDer,
+            _: &[tokio_rustls::rustls::pki_types::CertificateDer],
+            _: &tokio_rustls::rustls::pki_types::ServerName,
+            _: &[u8],
+            _: tokio_rustls::rustls::pki_types::UnixTime,
+        ) -> Result<
+            tokio_rustls::rustls::client::danger::ServerCertVerified,
+            tokio_rustls::rustls::Error,
+        > {
+            Ok(tokio_rustls::rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _: &[u8],
+            _: &tokio_rustls::rustls::pki_types::CertificateDer,
+            _: &tokio_rustls::rustls::DigitallySignedStruct,
+        ) -> Result<
+            tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
+            tokio_rustls::rustls::Error,
+        > {
+            Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _: &[u8],
+            _: &tokio_rustls::rustls::pki_types::CertificateDer,
+            _: &tokio_rustls::rustls::DigitallySignedStruct,
+        ) -> Result<
+            tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
+            tokio_rustls::rustls::Error,
+        > {
+            Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<tokio_rustls::rustls::SignatureScheme> {
+            vec![tokio_rustls::rustls::SignatureScheme::ECDSA_NISTP256_SHA256]
+        }
+    }
+
+    use base64::Engine as _;
+}

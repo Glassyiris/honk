@@ -121,7 +121,8 @@ Status reflects the current tree and unit/integration tests. Prefer re-running `
 - [ ] UDP relay for VMess / VLESS / SSR / Trojan-Go
 - [ ] REALITY + uTLS (**deferred** — no mature rustls hooks)
 - [ ] smux/yamux; verified h2mux interop with official sing-box multiplex inbounds
-- [ ] Real DoT/DoH/DoQ upstreams; FakeIP engine
+- [x] Real DoT/DoH/DoQ/DoH3 upstreams (pooled TLS/H2/QUIC sessions)
+- [ ] FakeIP engine
 - [ ] Kernel-side eBPF DNS answer cache (userspace cache exists)
 - [ ] Consistent-hash load balancing (round-robin LoadBalance exists)
 - [ ] Broader live interop tests vs production peers; routine root-only netns gates
@@ -196,6 +197,7 @@ Full guides: [doc/configuration.en.md](./doc/configuration.en.md), [doc/componen
 - [dae](https://github.com/daeuniverse/dae) / [daed-rs](https://github.com/daeuniverse/daed-rs) — eBPF transparent proxy lineage
 - [sing-box](https://github.com/SagerNet/sing-box) — outbound group & Clash API patterns
 - [daeuniverse/outbound](https://github.com/daeuniverse/outbound) — protocol reference
+- [juicity-rs](https://github.com/juicity/juicity-rs) by Markson Pigeonzilla Plus — Juicity protocol implementation reference; the wire-format alignment and live interop testing of honk's Juicity outbound were done against it
 - [aya-rs](https://github.com/aya-rs/aya) — Rust eBPF
 
 ### License

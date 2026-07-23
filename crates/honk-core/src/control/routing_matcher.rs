@@ -984,6 +984,7 @@ mod tests {
     fn make_route(name: &str, outbound: &str) -> CompiledRoute {
         CompiledRoute {
             name: name.into(),
+            display: name.into(),
             priority: 0,
             domain_patterns: Vec::new(),
             domain_suffixes: Vec::new(),
