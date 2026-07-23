@@ -702,6 +702,7 @@ mod tests {
         (addr, count)
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn discover_ech_config_caches_positive_and_negative() {
         use std::sync::atomic::Ordering as AOrd;
@@ -734,6 +735,7 @@ mod tests {
 
     /// End-to-end: `ech_enabled` with no static config discovers the
     /// ECHConfigList via DNS and completes a real ECH handshake.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn ech_discovery_end_to_end() {
         static ECH_CONFIG_LIST: &[u8] = include_bytes!("../tests/fixtures/echconfiglist");

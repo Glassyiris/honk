@@ -391,6 +391,7 @@ mod tests {
 
     /// End-to-end: a stub UDP DNS server on loopback answering A records,
     /// installed as the global bootstrap resolver.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn test_resolve_via_bootstrap_udp() {
         let _lock = GLOBAL_TEST_LOCK.lock().unwrap();
@@ -466,6 +467,7 @@ mod tests {
 
     /// End-to-end: stub UDP DNS server answering HTTPS records with an ech
     /// SvcParam, installed as the global bootstrap resolver.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn test_query_ech_config_via_bootstrap_udp() {
         let _lock = GLOBAL_TEST_LOCK.lock().unwrap();

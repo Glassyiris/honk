@@ -8,7 +8,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use std::hint::black_box;
 use honk_config::dns::{DnsRouting, DnsUpstream};
 use honk_config::types::DnsProtocol;
 use honk_core::dns::cache::DnsCache;

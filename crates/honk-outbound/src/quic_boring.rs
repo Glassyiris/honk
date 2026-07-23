@@ -20,7 +20,7 @@ use std::ffi::c_void;
 use std::ptr;
 use std::sync::{Arc, LazyLock};
 
-use aes::cipher::{BlockEncrypt, KeyInit};
+use aes::cipher::{BlockCipherEncrypt, KeyInit};
 use boring::aead::{AeadCtx, Algorithm as AeadAlgorithm};
 use boring::error::ErrorStack;
 use boring::ssl::{Ssl, SslContext, SslMethod, SslVerifyMode, SslVersion};

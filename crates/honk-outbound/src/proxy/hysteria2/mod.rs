@@ -57,7 +57,7 @@ use honk_config::node::Node;
 use honk_config::types::NodeProtocol;
 use parking_lot::Mutex;
 use quinn::{AsyncUdpSocket, Endpoint, EndpointConfig, UdpPoller};
-use rand::Rng;
+use rand::RngExt;
 use tokio::io::ReadBuf;
 use tokio::sync::mpsc;
 use tracing::debug;

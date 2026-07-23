@@ -22,7 +22,8 @@
 //!
 //! Reference: <https://shadowsocks.org/doc/sip022.html>
 
-use rand::{Rng, RngCore};
+use rand::Rng;
+use rand::RngExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::debug;
