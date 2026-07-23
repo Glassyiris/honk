@@ -121,7 +121,7 @@ pub fn marked_udp_socket(ipv6: bool) -> io::Result<std::net::UdpSocket> {
     let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, None)?;
     socket.set_nonblocking(true)?;
     #[cfg(target_os = "linux")]
-    socket.set_mark(honk_ebpf_common::DAE_BYPASS_MARK)?;
+    crate::util::set_mark_best_effort(&socket, honk_ebpf_common::DAE_BYPASS_MARK)?;
     let bind_addr: SocketAddr = if ipv6 {
         "[::]:0".parse().expect("hardcoded IPv6 bind address")
     } else {

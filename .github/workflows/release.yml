@@ -90,9 +90,13 @@ jobs:
         with:
           version: 0.14.1
 
+      # NB: the nightly step above makes nightly the DEFAULT toolchain, and
+      # rust-toolchain's `target` input installs the std only for stable —
+      # build with +stable explicitly or cross targets fail with
+      # "can't find crate for `core`".
       - name: Build honk-core (native gnu)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo build --release -p honk-core --features ebpf --target ${{ matrix.target }}
+        run: cargo +stable build --release -p honk-core --features ebpf --target ${{ matrix.target }}
 
       - name: Build honk-core (cross via zig wrappers)
         if: matrix.target != 'x86_64-unknown-linux-gnu'
@@ -113,7 +117,7 @@ jobs:
           # boring-sys generates its bindings with bindgen at build time —
           # point it at zig's target headers, not the host's.
           export BINDGEN_EXTRA_CLANG_ARGS="$(ci/zig-bindgen-env "$ZIGCC_TARGET")"
-          cargo build --release -p honk-core --features ebpf --target "$T"
+          cargo +stable build --release -p honk-core --features ebpf --target "$T"
 
       - name: Package artifact
         run: |

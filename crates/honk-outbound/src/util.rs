@@ -8,6 +8,28 @@ use tokio::net::TcpStream;
 
 const EINPROGRESS: i32 = libc::EINPROGRESS;
 
+/// Set `SO_MARK` best-effort. In production honk runs as root (eBPF load
+/// requires it) so the mark always applies; unprivileged environments (CI,
+/// local tests) get EPERM, where we log once and continue unmarked — the
+/// bypass is irrelevant there because no eBPF datapath is loaded.
+/// Non-EPERM errors are real failures and propagate.
+#[cfg(target_os = "linux")]
+pub(crate) fn set_mark_best_effort(socket: &socket2::Socket, mark: u32) -> io::Result<()> {
+    match socket.set_mark(mark) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::debug!(
+                    "SO_MARK denied (unprivileged); continuing without bypass mark"
+                );
+            });
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Create a TCP stream to `addr`, optionally setting `SO_MARK` before the
 /// handshake so the local eBPF datapath treats it as control-plane traffic
 /// and does not re-route it.
@@ -28,7 +50,7 @@ pub async fn connect_marked_addr(
         socket.set_keepalive(true)?;
         #[cfg(target_os = "linux")]
         {
-            socket.set_mark(mark)?;
+            set_mark_best_effort(&socket, mark)?;
             unsafe {
                 let fd = socket.as_raw_fd();
                 let keepidle: libc::c_int = 60;
@@ -211,7 +233,7 @@ pub async fn udp_marked_bind(bind_addr: SocketAddr) -> io::Result<tokio::net::Ud
     let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, None)?;
     socket.set_nonblocking(true)?;
     #[cfg(target_os = "linux")]
-    socket.set_mark(honk_ebpf_common::DAE_BYPASS_MARK)?;
+    set_mark_best_effort(&socket, honk_ebpf_common::DAE_BYPASS_MARK)?;
     socket.bind(&bind_addr.into())?;
     tokio::net::UdpSocket::from_std(socket.into())
 }
