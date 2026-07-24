@@ -86,7 +86,12 @@ dae 语法中节点**只能以分享链接书写**：`tag: 'scheme://...'` 或�
 | `network` | string? | null | V2Ray 风格 network 提示 |
 | `ws_path` / `ws_host` | string? | null | WebSocket；链接 `path` / `host` 参数 |
 | `grpc_service` | string? | null | gRPC service 名；链接 `serviceName` 参数 |
-| `hy2_auth` / `hy2_obfs` | string? | null | Hysteria2 |
+| `hy2_auth` / `hy2_obfs` | string? | null | Hysteria2 认证 / salamander 混淆密码 |
+| `hy2_up_mbps` / `hy2_down_mbps` | u32? | null | Hysteria2 brutal 带宽（`upmbps`/`downmbps`） |
+| `hy2_port_hopping` / `hy2_hop_interval` | string? / u64? | null | Hysteria2 端口跳跃（`mport`/`mhop`） |
+| `hy2_init_stream_recv_window` / `hy2_init_conn_recv_window` | u64? | null | Hysteria2 QUIC 接收窗口 |
+| `hy2_disable_mtu_discovery` | bool? | null | Hysteria2 `disablePathMTUDiscovery` |
+| `tls_pin_sha256` | string? | null | 叶证书 SHA-256 固定（`pinSHA256=`） |
 | `tuic_uuid` / `tuic_password` / `tuic_congestion` | string? | null | TUIC |
 | `juicity_uuid` / `juicity_password` | string? | null | Juicity |
 | `anytls_password` | string? | null | AnyTLS 密钥（等于链接密码） |
@@ -113,7 +118,7 @@ dae 语法中节点**只能以分享链接书写**：`tag: 'scheme://...'` 或�
 | `vless` | | 是 | 否 | 头里的 UDP 仅测试存在 |
 | `socks5` | | 是 | 是 | UDP ASSOCIATE |
 | `http` | | 是* | — | 走类似 direct 的拨号 |
-| `hysteria2` | | 是 | 是 | 真实 QUIC/H3；salamander；BBR（无 brutal） |
+| `hysteria2` | | 是 | 是 | 真实 QUIC/H3；salamander；brutal（配带宽时）或 BBR；端口跳跃 |
 | `tuic` | | 是 | 是 | TUIC v5 / quinn |
 | `juicity` | | 是 | 是 | quinn 双向流 UDP |
 | `anytls` | | 是 | 是 | 会话池 + UoT v2 |
@@ -169,7 +174,13 @@ node {
 
 **Hysteria2 / TUIC / Juicity**
 
-使用分享链接（`hysteria2://` / `tuic://` / `juicity://`），链接解析后填充 `hy2_*` / `tuic_*` / `juicity_*` 字段。QUIC ALPN/拥塞控制跟随 Handler 默认（Hy2 使用 BBR）。
+使用分享链接（`hysteria2://` / `tuic://` / `juicity://`），链接解析后填充 `hy2_*` / `tuic_*` / `juicity_*` 字段。QUIC ALPN/拥塞控制跟随 Handler 默认（无带宽提示时 Hy2 使用 BBR）。hysteria2 链接中 userinfo 为认证密钥（→ `hy2_auth`），`obfs=salamander&obfs-password=<pwd>` 映射到 `hy2_obfs`，`upmbps`/`downmbps` 启用 brutal 发送端并通过 `Hysteria-CC-RX` 通告下行带宽，`mport`/`mhop` 启用客户端端口跳跃（服务端需将端口段 DNAT 到监听端口），`pinSHA256=<hex>` 固定叶证书指纹（替代 PKI/域名校验），`initStreamReceiveWindow`/`initConnReceiveWindow`/`disablePathMTUDiscovery` 调整 QUIC 传输参数：
+
+```dae
+node {
+    hy2: 'hysteria2://secret@example.com:443?sni=example.com&insecure=1&obfs=salamander&obfs-password=obfspw&upmbps=50&downmbps=200&mport=20000-30000&mhop=30#hy2'
+}
+```
 
 ### 分享链接 scheme
 

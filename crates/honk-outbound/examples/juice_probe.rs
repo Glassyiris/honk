@@ -28,7 +28,12 @@ async fn main() -> anyhow::Result<()> {
             juicity_password: Some("33440f5a7608".into()),
             ..Default::default()
         };
-        let config = quic::client_config(&node, &[b"h3"], Some("bbr"), None).await?;
+        let config = quic::client_config(
+            &node,
+            &[b"h3"],
+            quic::QuicClientOptions::with_congestion(Some("bbr")),
+        )
+        .await?;
         let ip = honk_outbound::bootstrap::resolve(&host)
             .await?
             .into_iter()

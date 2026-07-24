@@ -687,9 +687,12 @@ impl TuicHandler {
         }
         // Build outside the lock: client_config is async (ECH discovery).
         let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
-        let config =
-            crate::quic::client_config(node, &[b"tuic"], node.tuic_congestion.as_deref(), None)
-                .await?;
+        let config = crate::quic::client_config(
+            node,
+            &[b"tuic"],
+            crate::quic::QuicClientOptions::with_congestion(node.tuic_congestion.as_deref()),
+        )
+        .await?;
         let client = Arc::new(TuicClient {
             quic: QuicClient::new(node.host().to_string(), node.port, server_name, config),
             uuid: *uuid.as_bytes(),

@@ -88,6 +88,9 @@ Status reflects the current tree and unit/integration tests. Prefer re-running `
 - [ ] REALITY + uTLS (**deferred** — no mature rustls hooks)
 - [ ] smux/yamux; verified h2mux interop with official sing-box multiplex inbounds
 - [x] Real DoT/DoH/DoQ/DoH3 upstreams (pooled TLS/H2/QUIC sessions)
+- [x] Hysteria2 brutal (up/down Mbps), port hopping (`mport`/`mhop`), `pinSHA256`, QUIC receive-window/PMTUD knobs; live-verified against the official server
+- [ ] Hysteria2 residue: `maxStreamReceiveWindow`/`maxConnReceiveWindow` (no quinn autotuning equivalent), `fastOpen`, configurable UDP-session/connection idle timeouts (hardcoded 90s/120s)
+- [x] Consolidate QUIC client options: `QuicClientOptions` for transport tuning, `BoringQuicOptions` for the TLS backend
 - [ ] FakeIP engine
 - [ ] Kernel-side eBPF DNS answer cache (userspace cache exists)
 - [ ] Consistent-hash load balancing (round-robin LoadBalance exists)

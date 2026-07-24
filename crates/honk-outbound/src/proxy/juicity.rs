@@ -322,9 +322,15 @@ impl JuicityHandler {
         let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
         // Upstream juicity (Go and juicity-rs) defaults to BBR on the client
         // when no congestion_control is configured.
-        let config =
-            crate::quic::client_config(node, &[b"h3"], Some("bbr"), Some(KEEP_ALIVE_INTERVAL))
-                .await?;
+        let config = crate::quic::client_config(
+            node,
+            &[b"h3"],
+            crate::quic::QuicClientOptions {
+                keep_alive: Some(KEEP_ALIVE_INTERVAL),
+                ..crate::quic::QuicClientOptions::with_congestion(Some("bbr"))
+            },
+        )
+        .await?;
         let client = Arc::new(JuicityClient {
             quic: QuicClient::new(node.host().to_string(), node.port, server_name, config),
             uuid: *uuid.as_bytes(),

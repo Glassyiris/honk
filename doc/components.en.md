@@ -116,7 +116,12 @@ The fields below are what a parsed node carries. In dae syntax they are **derive
 | `network` | string? | null | V2Ray-style network hint |
 | `ws_path` / `ws_host` | string? | null | WebSocket (share-link `path=`/`host=`) |
 | `grpc_service` | string? | null | gRPC service name (`serviceName=`) |
-| `hy2_auth` / `hy2_obfs` | string? | null | Hysteria2 |
+| `hy2_auth` / `hy2_obfs` | string? | null | Hysteria2 auth / salamander obfs password |
+| `hy2_up_mbps` / `hy2_down_mbps` | u32? | null | Hysteria2 brutal bandwidth (`upmbps`/`downmbps`) |
+| `hy2_port_hopping` / `hy2_hop_interval` | string? / u64? | null | Hysteria2 port hopping (`mport`/`mhop`) |
+| `hy2_init_stream_recv_window` / `hy2_init_conn_recv_window` | u64? | null | Hysteria2 QUIC receive windows |
+| `hy2_disable_mtu_discovery` | bool? | null | Hysteria2 `disablePathMTUDiscovery` |
+| `tls_pin_sha256` | string? | null | Leaf cert SHA-256 pin (`pinSHA256=`) |
 | `tuic_uuid` / `tuic_password` / `tuic_congestion` | string? | null | TUIC |
 | `juicity_uuid` / `juicity_password` | string? | null | Juicity |
 | `anytls_password` | string? | null | AnyTLS secret |
@@ -143,7 +148,7 @@ The fields below are what a parsed node carries. In dae syntax they are **derive
 | `vless` | | Yes | No | Header UDP exists in tests only |
 | `socks5` | | Yes | Yes | UDP ASSOCIATE |
 | `http` | | Yes* | — | Mapped through direct-style dial |
-| `hysteria2` | | Yes | Yes | Real QUIC/H3; salamander; BBR (no brutal) |
+| `hysteria2` | | Yes | Yes | Real QUIC/H3; salamander; brutal (with bandwidth) or BBR; port hopping |
 | `tuic` | | Yes | Yes | TUIC v5 / quinn |
 | `juicity` | | Yes | Yes | quinn bi-stream UDP |
 | `anytls` | | Yes | Yes | Session pool + UoT v2 |
@@ -201,7 +206,13 @@ node {
 
 **Hysteria2 / TUIC / Juicity**
 
-Prefer share links; the `hy2_*` / `tuic_*` / `juicity_*` fields are derived from them. QUIC ALPN/congestion follow handler defaults (Hy2 uses BBR).
+Prefer share links; the `hy2_*` / `tuic_*` / `juicity_*` fields are derived from them. QUIC ALPN/congestion follow handler defaults (Hy2 uses BBR without bandwidth hints). For hysteria2 the userinfo carries the auth secret (→ `hy2_auth`), `obfs=salamander&obfs-password=<pwd>` maps to `hy2_obfs`, `upmbps`/`downmbps` enable the brutal sender and the `Hysteria-CC-RX` advertisement, `mport`/`mhop` enable client-side port hopping (the server must DNAT the range onto its listen port), `pinSHA256=<hex>` pins the leaf certificate fingerprint (replacing PKI/hostname checks), and `initStreamReceiveWindow`/`initConnReceiveWindow`/`disablePathMTUDiscovery` tune the QUIC transport:
+
+```dae
+node {
+    hy2: 'hysteria2://secret@example.com:443?sni=example.com&insecure=1&obfs=salamander&obfs-password=obfspw&upmbps=50&downmbps=200&mport=20000-30000&mhop=30#hy2'
+}
+```
 
 ### Share-link schemes
 

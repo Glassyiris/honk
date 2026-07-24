@@ -22,7 +22,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, anyhow};
 use quinn::congestion;
@@ -53,23 +53,151 @@ pub fn congestion_factory(
     }
 }
 
+/// Fixed-rate "brutal" sender (hysteria2 parity): paces at a constant rate
+/// and ignores loss entirely. quinn's token-bucket pacer refills at
+/// window/RTT, so reporting a window of `rate × RTT` yields the target
+/// pacing rate — the same shape as apernet's brutal sender, whose congestion
+/// window is `SendBPS × RTT`.
+#[derive(Debug)]
+pub struct BrutalConfig {
+    /// Target send rate in bytes per second.
+    bytes_per_second: u64,
+}
+
+impl BrutalConfig {
+    /// Build a factory for a target rate in bits per second (hysteria2
+    /// bandwidth configs are in bps; 1 Mbps = 1e6 bps).
+    pub fn from_bps(bps: u64) -> Self {
+        Self {
+            bytes_per_second: bps / 8,
+        }
+    }
+}
+
+impl congestion::ControllerFactory for BrutalConfig {
+    fn build(self: Arc<Self>, _now: Instant, current_mtu: u16) -> Box<dyn congestion::Controller> {
+        Box::new(Brutal {
+            rate: self.bytes_per_second,
+            // RFC 9002 initial RTT; refined by the first ACK.
+            rtt: Duration::from_millis(333),
+            mtu: current_mtu,
+        })
+    }
+}
+
+struct Brutal {
+    /// Target send rate, bytes per second.
+    rate: u64,
+    /// Latest smoothed RTT estimate.
+    rtt: Duration,
+    mtu: u16,
+}
+
+impl Brutal {
+    fn bdp(&self) -> u64 {
+        let bdp = self.rate as u128 * self.rtt.as_micros() / 1_000_000;
+        bdp as u64
+    }
+}
+
+impl congestion::Controller for Brutal {
+    fn on_ack(
+        &mut self,
+        _now: Instant,
+        _sent: Instant,
+        _bytes: u64,
+        _app_limited: bool,
+        rtt: &quinn_proto::RttEstimator,
+    ) {
+        self.rtt = rtt.get();
+    }
+
+    /// Brutal never slows down for loss or ECN — that is its entire point.
+    fn on_congestion_event(
+        &mut self,
+        _now: Instant,
+        _sent: Instant,
+        _is_persistent_congestion: bool,
+        _lost_bytes: u64,
+    ) {
+    }
+
+    fn on_mtu_update(&mut self, new_mtu: u16) {
+        self.mtu = new_mtu;
+    }
+
+    fn window(&self) -> u64 {
+        self.bdp().max(self.initial_window())
+    }
+
+    fn metrics(&self) -> congestion::ControllerMetrics {
+        // ControllerMetrics is #[non_exhaustive]: no struct literals outside
+        // the crate, mutate a default value instead.
+        let mut metrics = congestion::ControllerMetrics::default();
+        metrics.congestion_window = self.window();
+        metrics.pacing_rate = Some(self.rate * 8);
+        metrics
+    }
+
+    fn clone_box(&self) -> Box<dyn congestion::Controller> {
+        Box::new(Brutal {
+            rate: self.rate,
+            rtt: self.rtt,
+            mtu: self.mtu,
+        })
+    }
+
+    fn initial_window(&self) -> u64 {
+        10 * u64::from(self.mtu)
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
+    }
+}
+
+/// Caller-tunable options for [`client_config`]. Everything defaults to the
+/// quinn/cubic behavior; protocol handlers override only what they need.
+#[derive(Clone, Default)]
+pub struct QuicClientOptions {
+    /// Congestion controller; `None` = cubic. Use [`congestion_factory`] for
+    /// named algorithms or [`BrutalConfig`] for hysteria2's fixed-rate sender.
+    pub congestion: Option<Arc<dyn congestion::ControllerFactory + Send + Sync>>,
+    /// QUIC keep-alive interval (Juicity uses 5s per the daeuniverse
+    /// reference client; TUIC relies on its own heartbeat datagrams instead).
+    pub keep_alive: Option<Duration>,
+    /// Initial per-stream receive window, bytes.
+    pub stream_receive_window: Option<u64>,
+    /// Initial connection-level receive window, bytes.
+    pub conn_receive_window: Option<u64>,
+    /// Disable QUIC path MTU discovery.
+    pub disable_mtu_discovery: bool,
+}
+
+impl QuicClientOptions {
+    /// Options with a named congestion controller (`cubic`/`new_reno`/`bbr`).
+    pub fn with_congestion(name: Option<&str>) -> Self {
+        Self {
+            congestion: Some(congestion_factory(name)),
+            ..Default::default()
+        }
+    }
+}
+
 /// Assemble a quinn [`ClientConfig`] for a proxy protocol.
 ///
 /// - `alpn`: ALPN protocol list required by the protocol (TUIC: `tuic`,
-///   Juicity: `h3`).
-/// - `congestion`: optional congestion-control name (`cubic`/`new_reno`/`bbr`).
-/// - `keep_alive`: optional QUIC keep-alive interval (Juicity uses 5s per the
-///   daeuniverse reference client; TUIC relies on its own heartbeat datagrams
-///   instead and passes `None`).
+///   Juicity/Hysteria2: `h3`).
+/// - `options`: transport tuning, see [`QuicClientOptions`].
 ///
 /// TLS is the BoringSSL backend in [`crate::quic_boring`] (Chrome fingerprint
 /// when `tls_implementation = "utls"`, ECH when the node carries one —
-/// static config, or DNS HTTPS-RR discovery when only `ech_enabled` is set).
+/// static config, or DNS HTTPS-RR discovery when only `ech_enabled` is set,
+/// pinSHA256 when `tls_pin_sha256` is set).
 pub async fn client_config(
     node: &honk_config::node::Node,
     alpn: &[&[u8]],
-    congestion: Option<&str>,
-    keep_alive: Option<Duration>,
+    options: QuicClientOptions,
 ) -> anyhow::Result<ClientConfig> {
     let alpn_wire = alpn
         .iter()
@@ -84,21 +212,38 @@ pub async fn client_config(
         None => None,
     };
     let crypto = crate::quic_boring::BoringQuicClientConfig::new(
-        alpn_wire,
-        node.skip_cert_verify,
-        crate::tls::chrome_mode(),
-        ech,
+        crate::quic_boring::BoringQuicOptions {
+            alpn_wire,
+            skip_cert_verify: node.skip_cert_verify,
+            chrome: crate::tls::chrome_mode(),
+            ech_config_list: ech,
+            pin_sha256: node
+                .tls_pin_sha256
+                .as_deref()
+                .and_then(crate::tls::parse_pin_sha256),
+        },
     )?;
     let mut cfg = ClientConfig::new(Arc::new(crypto));
 
     let mut transport = TransportConfig::default();
     transport
-        .congestion_controller_factory(congestion_factory(congestion))
+        .congestion_controller_factory(
+            options.congestion.unwrap_or_else(|| congestion_factory(None)),
+        )
         // Protocols like TUIC deliver inbound UDP packets on server-initiated
         // uni streams (one stream per packet) — allow a generous number
         // (sing-quic sets MaxIncomingUniStreams to 1<<60).
         .max_concurrent_uni_streams(VarInt::from_u32(4096));
-    if let Some(ka) = keep_alive {
+    if let Some(w) = options.stream_receive_window {
+        transport.stream_receive_window(VarInt::from_u64(w)?);
+    }
+    if let Some(w) = options.conn_receive_window {
+        transport.receive_window(VarInt::from_u64(w)?);
+    }
+    if options.disable_mtu_discovery {
+        transport.mtu_discovery_config(None);
+    }
+    if let Some(ka) = options.keep_alive {
         transport.keep_alive_interval(Some(ka));
     }
     cfg.transport_config(Arc::new(transport));
@@ -253,15 +398,17 @@ impl<C> QuicClient<C> {
             // single attempt is what made nodes flap dead on such paths
             // (Go/quic-go clients succeed via retries).
             for attempt in 1..=3u8 {
-                let connecting =
-                    match endpoint.connect_with(self.config.clone(), server_addr, &self.server_name)
-                    {
-                        Ok(c) => c,
-                        Err(e) => {
-                            last_err = Some(e.into());
-                            continue 'addrs;
-                        }
-                    };
+                let connecting = match endpoint.connect_with(
+                    self.config.clone(),
+                    server_addr,
+                    &self.server_name,
+                ) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        last_err = Some(e.into());
+                        continue 'addrs;
+                    }
+                };
                 match tokio::time::timeout(connect_timeout, connecting).await {
                     Err(_) => {
                         last_err = Some(anyhow!(
@@ -398,6 +545,15 @@ pub(crate) mod testutil {
     /// When `datagrams` is false the server does not advertise QUIC datagram
     /// support, which exercises the UDP-over-stream fallback of clients.
     pub fn server_config(alpn: &[&[u8]], datagrams: bool) -> anyhow::Result<ServerConfig> {
+        server_config_with_cert(alpn, datagrams).map(|(config, _)| config)
+    }
+
+    /// [`server_config`] that also returns the leaf certificate DER (for
+    /// pinSHA256 tests).
+    pub fn server_config_with_cert(
+        alpn: &[&[u8]],
+        datagrams: bool,
+    ) -> anyhow::Result<(ServerConfig, Vec<u8>)> {
         let rcgen::CertifiedKey { cert, signing_key } =
             rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
 
@@ -424,7 +580,7 @@ pub(crate) mod testutil {
             transport.datagram_receive_buffer_size(None);
             config.transport_config(Arc::new(transport));
         }
-        Ok(config)
+        Ok((config, cert.der().to_vec()))
     }
 
     /// Start a QUIC server endpoint on a loopback ephemeral port.
@@ -438,5 +594,32 @@ pub(crate) mod testutil {
         )?;
         let addr = endpoint.local_addr()?;
         Ok((endpoint, addr))
+    }
+}
+
+#[cfg(test)]
+mod brutal_tests {
+    use super::*;
+    use congestion::ControllerFactory;
+
+    fn controller(rate_bps: u64) -> Box<dyn congestion::Controller> {
+        Arc::new(BrutalConfig::from_bps(rate_bps)).build(Instant::now(), 1200)
+    }
+
+    #[test]
+    fn window_is_rate_times_rtt() {
+        let cc = controller(100_000_000); // 100 Mbps → 12.5 MB/s
+        // Initial RTT guess 333ms: BDP = 12.5e6 × 0.333 ≈ 4.16 MB.
+        let w = cc.window();
+        assert!((4_000_000..4_400_000).contains(&w), "window {w}");
+    }
+
+    #[test]
+    fn loss_never_shrinks_window() {
+        let mut cc = controller(50_000_000);
+        let before = cc.window();
+        cc.on_congestion_event(Instant::now(), Instant::now(), true, 12000);
+        cc.on_congestion_event(Instant::now(), Instant::now(), false, 0);
+        assert_eq!(cc.window(), before);
     }
 }

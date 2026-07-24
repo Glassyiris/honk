@@ -207,6 +207,12 @@ impl Node {
             node.skip_cert_verify = v == "1" || v.eq_ignore_ascii_case("true");
         }
 
+        // Certificate SHA-256 pin (`pinSHA256=<hex>`) — replaces PKI
+        // verification with a leaf-certificate fingerprint check.
+        if let Some(v) = query.get("pinSHA256").or_else(|| query.get("pin_sha256")) {
+            node.tls_pin_sha256 = Some(v.clone());
+        }
+
         // ECH (Encrypted Client Hello): `ech_config=<base64 ECHConfigList>`
         // enables real ECH; bare `ech=1` toggles it on without keys (GREASE
         // only until DNS HTTPS-RR lookup lands).
@@ -238,6 +244,48 @@ impl Node {
             .or_else(|| query.get("plugin_opts"))
         {
             node.plugin_opts = Some(v.clone());
+        }
+
+        if protocol == NodeProtocol::Hysteria2 {
+            // hy2 puts the auth secret bare in the userinfo
+            // (`hysteria2://password@host`); the handler reads `hy2_auth`
+            // first and falls back to `password`, so populate both.
+            if node.hy2_auth.is_none() {
+                node.hy2_auth = node.username.clone();
+            }
+            if node.password.is_none() {
+                node.password = node.username.clone();
+            }
+            // Salamander obfuscation: `obfs=salamander&obfs-password=...`.
+            if query.get("obfs").is_some_and(|v| v == "salamander")
+                && let Some(v) = query.get("obfs-password").filter(|s| !s.is_empty())
+            {
+                node.hy2_obfs = Some(v.clone());
+            }
+            // Brutal bandwidth hints (`upmbps`/`downmbps`).
+            if let Some(v) = query.get("upmbps") {
+                node.hy2_up_mbps = v.parse().ok();
+            }
+            if let Some(v) = query.get("downmbps") {
+                node.hy2_down_mbps = v.parse().ok();
+            }
+            // Port hopping (`mport=20000-30000` / `mport=p1,p2`, `mhop=secs`).
+            if let Some(v) = query.get("mport").filter(|s| !s.is_empty()) {
+                node.hy2_port_hopping = Some(v.clone());
+            }
+            if let Some(v) = query.get("mhop") {
+                node.hy2_hop_interval = v.parse().ok();
+            }
+            // QUIC flow-control / MTU knobs (hy2 client config parity).
+            if let Some(v) = query.get("initStreamReceiveWindow") {
+                node.hy2_init_stream_recv_window = v.parse().ok();
+            }
+            if let Some(v) = query.get("initConnReceiveWindow") {
+                node.hy2_init_conn_recv_window = v.parse().ok();
+            }
+            if let Some(v) = query.get("disablePathMTUDiscovery") {
+                node.hy2_disable_mtu_discovery = Some(v == "1" || v.eq_ignore_ascii_case("true"));
+            }
         }
 
         if protocol == NodeProtocol::AnyTLS {

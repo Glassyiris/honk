@@ -34,8 +34,10 @@ impl DoqClient {
         let quic_config = honk_outbound::quic::client_config(
             &Default::default(),
             &[b"doq"],
-            Some("cubic"),
-            Some(Duration::from_secs(15)),
+            honk_outbound::quic::QuicClientOptions {
+                keep_alive: Some(Duration::from_secs(15)),
+                ..honk_outbound::quic::QuicClientOptions::with_congestion(Some("cubic"))
+            },
         )
         .await?;
         Ok(Arc::new(Self {

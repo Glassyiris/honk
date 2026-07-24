@@ -436,6 +436,50 @@ fn test_percent_encoded_userinfo_is_decoded() {
 }
 
 #[test]
+fn test_hysteria2_auth_and_obfs_params() {
+    // The auth secret lives bare in the userinfo; it must reach both
+    // `hy2_auth` and the `password` fallback the handler resolves.
+    let node =
+        Node::from_share_link("hysteria2://pass@example.com:443/?sni=example.com&insecure=1")
+            .unwrap();
+    assert_eq!(node.protocol, NodeProtocol::Hysteria2);
+    assert_eq!(node.hy2_auth.as_deref(), Some("pass"));
+    assert_eq!(node.password.as_deref(), Some("pass"));
+    assert_eq!(node.sni.as_deref(), Some("example.com"));
+    assert!(node.skip_cert_verify);
+    assert!(node.hy2_obfs.is_none());
+
+    // Percent-encoded secrets are decoded; salamander obfs password lands in
+    // `hy2_obfs`; the fragment names the node.
+    let node = Node::from_share_link(
+        "hysteria2://p%40ss%3Aword@example.com:443/?obfs=salamander&obfs-password=obfspw#my-hy2",
+    )
+    .unwrap();
+    assert_eq!(node.hy2_auth.as_deref(), Some("p@ss:word"));
+    assert_eq!(node.hy2_obfs.as_deref(), Some("obfspw"));
+    assert_eq!(node.name, "my-hy2");
+
+    // obfs without a password leaves obfuscation off.
+    let node = Node::from_share_link("hysteria2://pass@example.com:443/?obfs=salamander").unwrap();
+    assert!(node.hy2_obfs.is_none());
+
+    // Brutal bandwidth hints.
+    let node =
+        Node::from_share_link("hysteria2://pass@example.com:443/?upmbps=50&downmbps=200").unwrap();
+    assert_eq!(node.hy2_up_mbps, Some(50));
+    assert_eq!(node.hy2_down_mbps, Some(200));
+
+    // Port hopping and certificate pin.
+    let node = Node::from_share_link(
+        "hysteria2://pass@example.com:443/?mport=20000-20010,30000&mhop=15&pinSHA256=aabbcc",
+    )
+    .unwrap();
+    assert_eq!(node.hy2_port_hopping.as_deref(), Some("20000-20010,30000"));
+    assert_eq!(node.hy2_hop_interval, Some(15));
+    assert_eq!(node.tls_pin_sha256.as_deref(), Some("aabbcc"));
+}
+
+#[test]
 fn test_ech_query_params() {
     // ech_config=<base64url ECHConfigList> enables ECH and carries the config.
     let node = Node::from_share_link(

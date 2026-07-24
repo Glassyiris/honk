@@ -38,8 +38,10 @@ impl Doh3Client {
         let quic_config = honk_outbound::quic::client_config(
             &Default::default(),
             &[b"h3"],
-            Some("cubic"),
-            Some(Duration::from_secs(15)),
+            honk_outbound::quic::QuicClientOptions {
+                keep_alive: Some(Duration::from_secs(15)),
+                ..honk_outbound::quic::QuicClientOptions::with_congestion(Some("cubic"))
+            },
         )
         .await?;
         Ok(Arc::new(Self {

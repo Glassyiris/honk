@@ -442,6 +442,23 @@ static QUIC_METHOD: boring_sys::SSL_QUIC_METHOD = boring_sys::SSL_QUIC_METHOD {
     send_alert: Some(on_send_alert),
 };
 
+/// Options for [`BoringQuicClientConfig::new`].
+#[derive(Default)]
+pub struct BoringQuicOptions {
+    /// ALPN protocol list in TLS wire format (length-prefixed entries),
+    /// e.g. `b"\x02h3"` for Hysteria2/Juicity.
+    pub alpn_wire: Vec<u8>,
+    /// Skip all certificate verification.
+    pub skip_cert_verify: bool,
+    /// Chrome ClientHello fingerprint.
+    pub chrome: bool,
+    /// Static ECHConfigList; ECH GREASE applies when `chrome` and unset.
+    pub ech_config_list: Option<Arc<Vec<u8>>>,
+    /// pinSHA256 leaf-certificate fingerprint; replaces PKI and hostname
+    /// verification when set.
+    pub pin_sha256: Option<[u8; 32]>,
+}
+
 /// `crypto::ClientConfig` backed by a BoringSSL `SSL_CTX` (TLS 1.3 only).
 pub struct BoringQuicClientConfig {
     ctx: SslContext,
@@ -452,20 +469,27 @@ pub struct BoringQuicClientConfig {
 }
 
 impl BoringQuicClientConfig {
-    /// Build the config. `alpn` is the protocol list in TLS wire format
-    /// (length-prefixed entries), e.g. `b"\x02h3"` for Hysteria2/Juicity.
-    pub fn new(
-        alpn_wire: Vec<u8>,
-        skip_cert_verify: bool,
-        chrome: bool,
-        ech_config_list: Option<Arc<Vec<u8>>>,
-    ) -> anyhow::Result<Self> {
+    /// Build the config from [`BoringQuicOptions`].
+    pub fn new(options: BoringQuicOptions) -> anyhow::Result<Self> {
+        let BoringQuicOptions {
+            alpn_wire,
+            skip_cert_verify,
+            chrome,
+            ech_config_list,
+            pin_sha256,
+        } = options;
         let mut builder = SslContext::builder(SslMethod::tls())?;
         // QUIC mandates TLS 1.3.
         builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
         builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
 
-        if skip_cert_verify {
+        if let Some(pin) = pin_sha256 {
+            // pinSHA256: fingerprint check replaces PKI + hostname checks.
+            builder.set_custom_verify_callback(
+                SslVerifyMode::PEER,
+                crate::tls::pin_sha256_custom_verify(pin),
+            );
+        } else if skip_cert_verify {
             builder.set_verify(SslVerifyMode::NONE);
         } else {
             builder.set_verify(SslVerifyMode::PEER);
@@ -482,7 +506,7 @@ impl BoringQuicClientConfig {
             ctx: builder.build(),
             alpn_wire,
             chrome,
-            verify: !skip_cert_verify,
+            verify: !skip_cert_verify && pin_sha256.is_none(),
             ech_config_list,
         })
     }
@@ -849,12 +873,16 @@ mod tests {
     }
 
     async fn roundtrip(node: &Node) -> anyhow::Result<Vec<u8>> {
+        let addr = spawn_echo_server(&[b"h3"]);
+        roundtrip_to(node, addr).await
+    }
+
+    async fn roundtrip_to(node: &Node, addr: std::net::SocketAddr) -> anyhow::Result<Vec<u8>> {
         let _ = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::TRACE)
             .with_test_writer()
             .try_init();
-        let addr = spawn_echo_server(&[b"h3"]);
-        let cfg = crate::quic::client_config(node, &[b"h3"], None, None).await?;
+        let cfg = crate::quic::client_config(node, &[b"h3"], Default::default()).await?;
         let mut endpoint = crate::quic::client_endpoint(false)?;
         endpoint.set_default_client_config(cfg);
         let conn = endpoint.connect(addr, "localhost")?.await?;
@@ -863,6 +891,59 @@ mod tests {
         send.finish()?;
         let echoed = recv.read_to_end(usize::MAX).await?;
         Ok(echoed)
+    }
+
+    /// pinSHA256: the handshake succeeds when the server leaf matches the
+    /// pin and fails otherwise — with PKI/hostname checks fully replaced.
+    #[tokio::test]
+    async fn pin_sha256_accepts_matching_cert_and_rejects_others() {
+        let (config, cert_der) =
+            crate::quic::testutil::server_config_with_cert(&[b"h3"], true).unwrap();
+        let endpoint =
+            quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                tokio::spawn(async move {
+                    let Ok(conn) = incoming.await else { return };
+                    loop {
+                        match conn.accept_bi().await {
+                            Ok((mut send, mut recv)) => {
+                                tokio::spawn(async move {
+                                    if let Ok(buf) = recv.read_to_end(usize::MAX).await {
+                                        let _ = send.write_all(&buf).await;
+                                        let _ = send.finish();
+                                    }
+                                });
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                });
+            }
+        });
+
+        use sha2::Digest as _;
+        let pin_hex = sha2::Sha256::digest(&cert_der)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+
+        // Matching pin works even though the cert is self-signed and the
+        // node does not skip verification.
+        let node = Node {
+            tls_pin_sha256: Some(pin_hex),
+            ..Default::default()
+        };
+        let echoed = roundtrip_to(&node, addr).await.unwrap();
+        assert_eq!(&echoed, b"ping");
+
+        // A mismatched pin fails the handshake.
+        let node = Node {
+            tls_pin_sha256: Some("00".repeat(32)),
+            ..Default::default()
+        };
+        assert!(roundtrip_to(&node, addr).await.is_err());
     }
 
     /// Baseline: standard (non-Chrome) mode round-trips through a rustls server.
@@ -1004,7 +1085,14 @@ mod tests {
                 .unwrap();
 
         let my_cfg =
-            Arc::new(BoringQuicClientConfig::new(b"\x02h3".to_vec(), true, false, None).unwrap());
+            Arc::new(
+                BoringQuicClientConfig::new(BoringQuicOptions {
+                    alpn_wire: b"\x02h3".to_vec(),
+                    skip_cert_verify: true,
+                    ..Default::default()
+                })
+                .unwrap(),
+            );
         let my_session =
             crypto::ClientConfig::start_session(my_cfg, 1, "localhost", &params).unwrap();
 
