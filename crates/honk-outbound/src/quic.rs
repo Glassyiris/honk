@@ -234,7 +234,7 @@ impl<C> QuicClient<C> {
 
         let mut last_err: Option<anyhow::Error> = None;
         let mut conn: Option<Connection> = None;
-        for server_addr in addrs {
+        'addrs: for server_addr in addrs {
             let ipv6 = server_addr.is_ipv6();
             let endpoint = match &state.endpoint {
                 Some((family, ep)) if *family == ipv6 => ep.clone(),
@@ -248,24 +248,35 @@ impl<C> QuicClient<C> {
                     ep
                 }
             };
-            let connecting =
-                match endpoint.connect_with(self.config.clone(), server_addr, &self.server_name) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        last_err = Some(e.into());
-                        continue;
+            // Retry the handshake a few times per address: lossy uplinks
+            // (typical for cross-border QUIC) drop most Initials, and a
+            // single attempt is what made nodes flap dead on such paths
+            // (Go/quic-go clients succeed via retries).
+            for attempt in 1..=3u8 {
+                let connecting =
+                    match endpoint.connect_with(self.config.clone(), server_addr, &self.server_name)
+                    {
+                        Ok(c) => c,
+                        Err(e) => {
+                            last_err = Some(e.into());
+                            continue 'addrs;
+                        }
+                    };
+                match tokio::time::timeout(connect_timeout, connecting).await {
+                    Err(_) => {
+                        last_err = Some(anyhow!(
+                            "QUIC connect to {server_addr} timed out (attempt {attempt})"
+                        ));
                     }
-                };
-            match tokio::time::timeout(connect_timeout, connecting).await {
-                Err(_) => {
-                    last_err = Some(anyhow!("QUIC connect to {server_addr} timed out"));
-                }
-                Ok(Err(e)) => {
-                    last_err = Some(anyhow!("QUIC connect to {server_addr}: {e}"));
-                }
-                Ok(Ok(established)) => {
-                    conn = Some(established);
-                    break;
+                    Ok(Err(e)) => {
+                        last_err = Some(anyhow!(
+                            "QUIC connect to {server_addr}: {e} (attempt {attempt})"
+                        ));
+                    }
+                    Ok(Ok(established)) => {
+                        conn = Some(established);
+                        break 'addrs;
+                    }
                 }
             }
         }
