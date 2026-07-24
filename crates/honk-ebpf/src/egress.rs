@@ -529,7 +529,7 @@ fn do_tproxy_wan_egress_tcp(
         return Err(TC_ACT_SHOT);
     }
 
-    if prep_redirect_to_control_plane(ctx, link_h_len, tuples, ethh, 0, !tcp_state_syn, outbound)
+    if prep_redirect_to_control_plane(ctx, link_h_len, tuples, ethh, 1, !tcp_state_syn, outbound)
         != 0
     {
         // Failed to prepare → fallback to direct pass.
@@ -591,7 +591,7 @@ fn fast_path_decision(
         return Err(TC_ACT_SHOT);
     }
 
-    if prep_redirect_to_control_plane(ctx, link_h_len, tuples, ethh, 0, true, outbound) != 0 {
+    if prep_redirect_to_control_plane(ctx, link_h_len, tuples, ethh, 1, true, outbound) != 0 {
         return Err(TC_ACT_OK);
     }
 

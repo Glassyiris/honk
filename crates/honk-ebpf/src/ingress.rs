@@ -1051,8 +1051,14 @@ fn do_tproxy_dae0_ingress(ctx: &TcContext) -> Verdict {
     // lookup here is a reply (proxy -> LAN).  Rewrite the Ethernet header
     // back to the original LAN framing and redirect to the original
     // interface so the reply reaches the original client.
+    //
+    // Host-originated flows (from_wan != 0, e.g. gateway's own traffic out a
+    // PPPoE WAN) have no LAN framing to restore: inject the reply into the
+    // WAN interface's RX path (BPF_F_INGRESS) as PACKET_HOST so the local
+    // stack accepts it, mirroring Go dae's tproxy_dae0_ingress.
     let dmac = entry.smac;
     let smac = entry.dmac;
+    let from_wan = entry.from_wan;
     unsafe {
         bpf_skb_store_bytes(
             ctx.skb.skb,
@@ -1070,8 +1076,10 @@ fn do_tproxy_dae0_ingress(ctx: &TcContext) -> Verdict {
         );
     }
 
-    let _ = ctx.skb.change_type(0); // PACKET_HOST
-    Ok(unsafe { bpf_redirect(entry.ifindex, 0) } as c_long)
+    let pkt_type: u32 = if from_wan != 0 { 0 } else { 1 }; // PACKET_HOST : PACKET_OTHERHOST
+    let flags: u64 = if from_wan != 0 { 1 } else { 0 }; // BPF_F_INGRESS
+    let _ = ctx.skb.change_type(pkt_type);
+    Ok(unsafe { bpf_redirect(entry.ifindex, flags) } as c_long)
 }
 
 // TC entry points use raw __sk_buff pointer to avoid verifier
