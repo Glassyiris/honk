@@ -2,16 +2,27 @@
 //!
 //! Mirrors Go's `startConnStateJanitor` from `daed/wing/dae-core/control/control_plane.go`.
 //! The janitor runs on a configurable tick interval and performs periodic cleanup
-//! of redirect tracking, cookie PID metadata, and routing handoff entries.
+//! of conn-state, redirect tracking, cookie PID metadata, and routing handoff
+//! entries.
 //!
-//! CONN_STATE_MAP is deliberately *not* scanned from userspace: the eBPF
-//! datapath expires entries lazily on every hit (`contrack.rs`), and the map
-//! is an LRU hash that evicts the oldest entries when full, so cold entries
-//! only cost memory.  Pressure mode is therefore purely overflow-driven:
-//! any growth in the kernel's UDP/TCP overflow counters latches it on, and
-//! it switches off after a few ticks without new overflow.
+//! All swept maps are plain hashes: the kernel never evicts on its own
+//! (silent LRU eviction could re-route or break live flows mid-flight), so
+//! occupancy management lives here.  Conn-state entries expire with
+//! state-based timeouts mirroring the datapath's lazy expiry (TCP closing /
+//! TCP active / UDP); the datapath's `CONN_STATE_OCCUPANCY` counters feed a
+//! live pressure gauge so sweeps run earlier as the map fills:
+//!
+//! - `< 70%` full: steady sweep interval (60 s)
+//! - `70–85%`: elevated interval (15 s)
+//! - `>= 85%`: pressure mode — sweep every tick + faster redirect/handoff
+//!   sweeps (overflow-counter growth also latches pressure mode on, as the
+//!   fail-closed last resort)
 
 use crate::ebpf::EbpfBackend;
+use honk_ebpf_common::conn::{
+    MAX_CONN_STATE_NUM, TCP_CONN_STATE_CLOSING_TIMEOUT_NS,
+    TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS, TcpState, UDP_CONN_STATE_TIMEOUT_NS,
+};
 use honk_ebpf_common::{RedirectTuple, TuplesKey};
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,6 +42,15 @@ const ROUTING_HANDOFF_PRESSURE_SECS: u64 = 8;
 /// Map health check interval: 5 seconds.
 const HEALTH_CHECK_INTERVAL_SECS: u64 = 5;
 
+/// Conn-state sweep interval below the elevated watermark: 60 seconds.
+const CONN_STATE_STEADY_INTERVAL_SECS: u64 = 60;
+/// Conn-state sweep interval between the elevated and pressure watermarks.
+const CONN_STATE_ELEVATED_INTERVAL_SECS: u64 = 15;
+/// Occupancy fraction of CONN_STATE_MAP that shortens the sweep interval.
+const CONN_STATE_ELEVATED_WATERMARK: f64 = 0.70;
+/// Occupancy fraction that latches pressure mode (sweep every tick).
+const CONN_STATE_PRESSURE_WATERMARK: f64 = 0.85;
+
 /// Redirect track entry timeout: 120 seconds.
 const REDIRECT_TRACK_TIMEOUT_NS: u64 = 120_000_000_000;
 /// Cookie PID entry timeout: 600 seconds.
@@ -41,6 +61,41 @@ const ROUTING_HANDOFF_TIMEOUT_NS: u64 = 30_000_000_000;
 /// Number of consecutive ticks without conn-state overflow after which
 /// pressure mode is switched off.
 const PRESSURE_EXIT_ROUNDS: u32 = 3;
+
+/// TCP protocol number in `TuplesKey::l4proto`.
+const IPPROTO_TCP: u8 = 6;
+
+/// Live CONN_STATE_MAP occupancy estimate, derived from the datapath's
+/// insert/delete counters plus the janitor's own delete accounting, and
+/// recalibrated against the exact entry count on every sweep.
+#[derive(Debug, Default)]
+struct OccupancyGauge {
+    /// Cumulative entries deleted by janitor sweeps.
+    janitor_deletes: u64,
+    /// `exact_count - raw_estimate` recorded at the last sweep, absorbing
+    /// races (e.g. a datapath delete of an entry the janitor also removed).
+    drift: i64,
+}
+
+impl OccupancyGauge {
+    /// Raw counter-derived occupancy before drift correction.
+    fn raw_estimate(&self, inserts: u64, ebpf_deletes: u64) -> i64 {
+        inserts as i64 - ebpf_deletes as i64 - self.janitor_deletes as i64
+    }
+
+    fn estimate(&self, inserts: u64, ebpf_deletes: u64) -> u64 {
+        (self.raw_estimate(inserts, ebpf_deletes) + self.drift).max(0) as u64
+    }
+
+    /// Recalibrate with the exact entry count observed during a sweep.
+    fn calibrate(&mut self, exact: u64, inserts: u64, ebpf_deletes: u64) {
+        self.drift = exact as i64 - self.raw_estimate(inserts, ebpf_deletes);
+    }
+
+    fn note_janitor_deletes(&mut self, n: u64) {
+        self.janitor_deletes += n;
+    }
+}
 
 /// Tracks the pressure state of the BPF maps for adaptive cleanup intervals.
 #[derive(Debug, Clone, Default)]
@@ -97,14 +152,16 @@ impl BpfJanitor {
             interval.tick().await;
 
             let mut pressure = PressureState::default();
+            let mut gauge = OccupancyGauge::default();
 
             let mut last_redirect_cleanup = tokio::time::Instant::now();
             let mut last_cookie_pid_cleanup = tokio::time::Instant::now();
             let mut last_routing_handoff = tokio::time::Instant::now();
             let mut last_health_check = tokio::time::Instant::now();
+            let mut last_conn_state_cleanup = tokio::time::Instant::now();
 
             info!(
-                "BPF janitor: started (tick={}s; conn state expiry is kernel-side, pressure is overflow-driven)",
+                "BPF janitor: started (tick={}s; conn-state sweep is watermark-driven)",
                 JANITOR_TICK_INTERVAL_SECS
             );
 
@@ -124,7 +181,7 @@ impl BpfJanitor {
 
                 let now = tokio::time::Instant::now();
 
-                let overflow_delta = {
+                let (overflow_delta, utilization, occ_counters) = {
                     let ebpf = self.ebpf.read().await;
                     let udp = ebpf.get_bpf_stats(0).unwrap_or(None).unwrap_or(0);
                     let tcp = ebpf.get_bpf_stats(1).unwrap_or(None).unwrap_or(0);
@@ -132,9 +189,15 @@ impl BpfJanitor {
                         udp > pressure.last_udp_overflow || tcp > pressure.last_tcp_overflow;
                     pressure.last_udp_overflow = udp;
                     pressure.last_tcp_overflow = tcp;
-                    delta
+                    let counters = ebpf.conn_state_occupancy().unwrap_or((0, 0));
+                    let occupancy = gauge.estimate(counters.0, counters.1);
+                    (
+                        delta,
+                        occupancy as f64 / f64::from(MAX_CONN_STATE_NUM),
+                        counters,
+                    )
                 };
-                update_pressure_state(&mut pressure, overflow_delta);
+                update_pressure_state(&mut pressure, overflow_delta, utilization);
 
                 let redirect_interval = if pressure.active {
                     Duration::from_secs(REDIRECT_PRESSURE_INTERVAL_SECS)
@@ -146,6 +209,27 @@ impl BpfJanitor {
                 } else {
                     Duration::from_secs(ROUTING_HANDOFF_STEADY_SECS)
                 };
+                let conn_state_interval = if pressure.active {
+                    Duration::from_secs(JANITOR_TICK_INTERVAL_SECS)
+                } else if utilization >= CONN_STATE_ELEVATED_WATERMARK {
+                    Duration::from_secs(CONN_STATE_ELEVATED_INTERVAL_SECS)
+                } else {
+                    Duration::from_secs(CONN_STATE_STEADY_INTERVAL_SECS)
+                };
+
+                if last_conn_state_cleanup + conn_state_interval <= now {
+                    let (deleted, total) =
+                        self.cleanup_conn_state(&mut gauge, occ_counters).await;
+                    last_conn_state_cleanup = now;
+                    if utilization >= CONN_STATE_ELEVATED_WATERMARK || deleted > 0 {
+                        info!(
+                            "BPF janitor: conn-state sweep removed {}/{} entries (occupancy ~{:.1}%)",
+                            deleted,
+                            total,
+                            utilization * 100.0
+                        );
+                    }
+                }
 
                 if last_redirect_cleanup + redirect_interval <= now {
                     self.cleanup_redirect_track().await;
@@ -162,11 +246,67 @@ impl BpfJanitor {
                 }
 
                 if last_health_check + Duration::from_secs(HEALTH_CHECK_INTERVAL_SECS) <= now {
-                    self.check_map_health().await;
+                    self.check_map_health(utilization).await;
                     last_health_check = now;
                 }
             }
         })
+    }
+
+    /// Clean up expired conn-state entries with state-based timeouts
+    /// mirroring the datapath's lazy expiry (TCP closing: 10 s, TCP active:
+    /// 120 s, UDP: 120 s).  Returns `(deleted, total_scanned)` and
+    /// recalibrates the occupancy gauge against the exact entry count.
+    async fn cleanup_conn_state(
+        &self,
+        gauge: &mut OccupancyGauge,
+        occ_counters: (u64, u64),
+    ) -> (u64, usize) {
+        let now_ns = match monotonic_now_ns() {
+            Ok(ns) => ns,
+            Err(e) => {
+                error!("BPF janitor: failed to get monotonic time: {}", e);
+                return (0, 0);
+            }
+        };
+
+        let mut entries = Vec::new();
+        {
+            let ebpf = self.ebpf.read().await;
+            if ebpf.conn_state_snapshot(&mut entries).is_err() {
+                return (0, 0);
+            }
+        }
+        gauge.calibrate(entries.len() as u64, occ_counters.0, occ_counters.1);
+
+        let expired: Vec<TuplesKey> = entries
+            .iter()
+            .filter(|(key, state)| {
+                let age = now_ns.saturating_sub(state.last_seen_ns);
+                if key.l4proto == IPPROTO_TCP {
+                    if state.state == TcpState::TcpStateClosing as u8 {
+                        age > TCP_CONN_STATE_CLOSING_TIMEOUT_NS
+                    } else {
+                        age > TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS
+                    }
+                } else {
+                    age > UDP_CONN_STATE_TIMEOUT_NS
+                }
+            })
+            .map(|(key, _)| *key)
+            .collect();
+
+        let deleted = expired.len() as u64;
+        if !expired.is_empty() {
+            let mut ebpf = self.ebpf.write().await;
+            if let Err(e) = ebpf.conn_state_remove_batch(&expired) {
+                debug!("BPF janitor: failed to batch-remove conn states: {}", e);
+            } else {
+                gauge.note_janitor_deletes(deleted);
+            }
+        }
+
+        (deleted, entries.len())
     }
 
     /// Clean up stale redirect track entries.
@@ -310,8 +450,9 @@ impl BpfJanitor {
         deleted as u64
     }
 
-    /// Check BPF map health — overflow counter warnings.
-    async fn check_map_health(&self) {
+    /// Check BPF map health — overflow counter warnings plus conn-state
+    /// occupancy watermark warnings.
+    async fn check_map_health(&self, utilization: f64) {
         let ebpf = self.ebpf.read().await;
         let udp_overflow = ebpf.get_bpf_stats(0).unwrap_or(None).unwrap_or(0);
         let tcp_overflow = ebpf.get_bpf_stats(1).unwrap_or(None).unwrap_or(0);
@@ -340,6 +481,14 @@ impl BpfJanitor {
                 tcp_overflow
             );
         }
+
+        if utilization >= CONN_STATE_PRESSURE_WATERMARK {
+            warn!(
+                "BPF janitor: conn-state map occupancy ~{:.1}% — sweeping every tick; \
+                 consider increasing MAX_CONN_STATE_NUM if this persists",
+                utilization * 100.0
+            );
+        }
     }
 }
 
@@ -352,17 +501,25 @@ fn monotonic_now_ns() -> anyhow::Result<u64> {
     Ok(ts.tv_sec() as u64 * 1_000_000_000 + ts.tv_nsec() as u64)
 }
 
-/// Update the pressure state from the conn-state overflow counters.
+/// Update the pressure state from the conn-state overflow counters and the
+/// live occupancy watermark.
 ///
-/// Pressure mode is purely overflow-driven: any growth in the kernel's
-/// UDP/TCP overflow counters latches it on, and it switches off after
-/// `PRESSURE_EXIT_ROUNDS` consecutive ticks without new overflow.  Map
-/// usage is no longer sampled — CONN_STATE_MAP is an LRU hash with
-/// kernel-side lazy expiry, so its occupancy is self-managing.
-fn update_pressure_state(state: &mut PressureState, overflow_delta: bool) {
-    if overflow_delta {
+/// Pressure mode latches on when either the kernel's UDP/TCP overflow
+/// counters grow (insert failures — the fail-closed last resort) or the
+/// estimated occupancy crosses `CONN_STATE_PRESSURE_WATERMARK`.  It switches
+/// off after `PRESSURE_EXIT_ROUNDS` consecutive ticks with neither signal.
+fn update_pressure_state(state: &mut PressureState, overflow_delta: bool, utilization: f64) {
+    let high_water = utilization >= CONN_STATE_PRESSURE_WATERMARK;
+    if overflow_delta || high_water {
         if !state.active {
-            info!("BPF janitor: entering pressure mode (conn state overflow)");
+            if overflow_delta {
+                info!("BPF janitor: entering pressure mode (conn state overflow)");
+            } else {
+                info!(
+                    "BPF janitor: entering pressure mode (conn-state occupancy ~{:.1}%)",
+                    utilization * 100.0
+                );
+            }
         }
         state.active = true;
         state.quiet_rounds = 0;
@@ -376,7 +533,7 @@ fn update_pressure_state(state: &mut PressureState, overflow_delta: bool) {
         state.active = false;
         state.quiet_rounds = 0;
         info!(
-            "BPF janitor: exiting pressure mode (no overflow for {} rounds)",
+            "BPF janitor: exiting pressure mode (quiet for {} rounds)",
             PRESSURE_EXIT_ROUNDS
         );
     }
@@ -391,9 +548,28 @@ mod tests {
         let mut state = PressureState::default();
         assert!(!state.active);
 
-        update_pressure_state(&mut state, true);
+        update_pressure_state(&mut state, true, 0.0);
         assert!(state.active);
         assert_eq!(state.quiet_rounds, 0);
+    }
+
+    #[test]
+    fn test_pressure_state_enter_on_high_watermark() {
+        let mut state = PressureState::default();
+        assert!(!state.active);
+
+        update_pressure_state(&mut state, false, CONN_STATE_PRESSURE_WATERMARK + 0.01);
+        assert!(state.active);
+        assert_eq!(state.quiet_rounds, 0);
+    }
+
+    #[test]
+    fn test_pressure_state_stays_inactive_below_watermark() {
+        let mut state = PressureState::default();
+        for _ in 0..10 {
+            update_pressure_state(&mut state, false, CONN_STATE_PRESSURE_WATERMARK - 0.01);
+            assert!(!state.active);
+        }
     }
 
     #[test]
@@ -405,10 +581,11 @@ mod tests {
             last_tcp_overflow: 0,
         };
 
-        // No overflow for PRESSURE_EXIT_ROUNDS consecutive ticks → exit.
+        // No overflow and below the watermark for PRESSURE_EXIT_ROUNDS
+        // consecutive ticks → exit.
         for _ in 0..PRESSURE_EXIT_ROUNDS {
             assert!(state.active);
-            update_pressure_state(&mut state, false);
+            update_pressure_state(&mut state, false, 0.0);
         }
         assert!(!state.active);
     }
@@ -423,16 +600,16 @@ mod tests {
         };
 
         // A new overflow restarts the quiet-period countdown.
-        update_pressure_state(&mut state, true);
+        update_pressure_state(&mut state, true, 0.0);
         assert!(state.active);
         assert_eq!(state.quiet_rounds, 0);
 
         // And it still takes the full run of quiet ticks to exit.
         for _ in 0..PRESSURE_EXIT_ROUNDS - 1 {
-            update_pressure_state(&mut state, false);
+            update_pressure_state(&mut state, false, 0.0);
             assert!(state.active);
         }
-        update_pressure_state(&mut state, false);
+        update_pressure_state(&mut state, false, 0.0);
         assert!(!state.active);
     }
 
@@ -440,9 +617,29 @@ mod tests {
     fn test_pressure_state_inactive_stays_inactive_without_overflow() {
         let mut state = PressureState::default();
         for _ in 0..10 {
-            update_pressure_state(&mut state, false);
+            update_pressure_state(&mut state, false, 0.0);
             assert!(!state.active);
         }
+    }
+
+    #[test]
+    fn test_occupancy_gauge_estimate_and_calibrate() {
+        let mut gauge = OccupancyGauge::default();
+        // 100 inserts, 30 datapath deletes, 20 janitor deletes → 50 live.
+        gauge.note_janitor_deletes(20);
+        assert_eq!(gauge.estimate(100, 30), 50);
+
+        // A sweep observes 45 entries (5 lost to races) → drift corrects.
+        gauge.calibrate(45, 100, 30);
+        assert_eq!(gauge.estimate(100, 30), 45);
+        // Post-calibration deltas apply on top of the exact count.
+        assert_eq!(gauge.estimate(110, 35), 50);
+    }
+
+    #[test]
+    fn test_occupancy_gauge_never_negative() {
+        let gauge = OccupancyGauge::default();
+        assert_eq!(gauge.estimate(0, 10), 0);
     }
 
     #[test]

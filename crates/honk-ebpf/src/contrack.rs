@@ -7,12 +7,16 @@
 use crate::log_shim::*;
 use crate::{
     event::send_dae_event,
-    maps::{BPF_STATS_MAP, CONN_STATE_MAP, CONNTRACK_ARGS_MAP},
+    maps::{BPF_STATS_MAP, CONN_STATE_MAP, CONN_STATE_OCCUPANCY, CONNTRACK_ARGS_MAP},
 };
 use aya_ebpf_bindings::helpers::bpf_ktime_get_ns;
 use honk_ebpf_common::{
     RoutingMeta,
-    conn::{BpfStatsKey, ConnState, ConntrackArgs, TcpState},
+    conn::{
+        BpfStatsKey, ConnState, ConntrackArgs, OCCUPANCY_EBPF_DELETES, OCCUPANCY_INSERTS,
+        TCP_CONN_STATE_CLOSING_TIMEOUT_NS, TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS, TcpState,
+        UDP_CONN_STATE_TIMEOUT_NS,
+    },
     redirect_need::TuplesKey,
 };
 use network_types::tcp::TcpHdr;
@@ -20,8 +24,6 @@ use network_types::tcp::TcpHdr;
 /// Type alias so callers can refer to [`ConnState`] through the contrack module.
 pub type ConnStateAlias = ConnState;
 
-/// 120-second backstop for UDP; userspace endpoint teardown is the primary owner.
-pub const UDP_CONN_STATE_TIMEOUT_NS: u64 = 120_000_000_000;
 /// Lazy-timestamp update interval: only bump `last_seen_ns` when > 1 s elapsed.
 pub const UDP_CONN_STATE_UPDATE_INTERVAL_NS: u64 = 1_000_000_000;
 
@@ -32,9 +34,17 @@ pub const UDP_CONN_STATE_UPDATE_INTERVAL_NS: u64 = 1_000_000_000;
 /// the verifier sees monotonic unsigned arithmetic.
 pub const REDIRECT_REFRESH_INTERVAL_NS: u64 = 1_000_000_000;
 
-pub const TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS: u64 = 120_000_000_000; // 120 seconds
-pub const TCP_CONN_STATE_CLOSING_TIMEOUT_NS: u64 = 10_000_000_000; // 10 seconds
 pub const TCP_CONN_STATE_UPDATE_INTERVAL_NS: u64 = 1_000_000_000; // 1 second
+
+/// Bump a slot of the CONN_STATE_OCCUPANCY gauge (per-CPU, contention-free).
+#[inline(always)]
+fn occupancy_add(slot: u32) {
+    if let Some(counter) = CONN_STATE_OCCUPANCY.get_ptr_mut(slot) {
+        unsafe {
+            *counter += 1;
+        }
+    }
+}
 
 /// Build a [`RoutingMeta`] from routing parameters.
 ///
@@ -165,6 +175,7 @@ fn __mark_tcp_seen(
         // not inherit stale routing metadata.  Fall through to the slow path.
         if ptr_opt.is_some() {
             let _ = CONN_STATE_MAP.remove(key);
+            occupancy_add(OCCUPANCY_EBPF_DELETES);
         }
     } else if let Some(ptr) = ptr_opt {
         // Non-SYN fast path: hold the pointer from a single lookup, check
@@ -172,6 +183,7 @@ fn __mark_tcp_seen(
         let state = unsafe { &mut *ptr };
         if tcp_conn_state_expired(state, now) {
             let _ = CONN_STATE_MAP.remove(key);
+            occupancy_add(OCCUPANCY_EBPF_DELETES);
             // Non-SYN packets without valid state must never allocate.
             return core::ptr::null_mut();
         }
@@ -246,6 +258,7 @@ fn __mark_tcp_seen(
             warn!((), target: "honk", "tcp conn state map overflow, key: {:i}:{} -> {:i}:{}", unsafe { key.src_ip.u6_addr8 }, key.src_port, unsafe { key.dst_ip.u6_addr8 }, key.dst_port);
             return core::ptr::null_mut();
         }
+        occupancy_add(OCCUPANCY_INSERTS);
 
         CONN_STATE_MAP
             .get_ptr_mut(key)
@@ -320,6 +333,7 @@ fn __mark_udp_seen(
         let state = unsafe { &*ptr };
         if udp_conn_state_expired(state, now) {
             let _ = CONN_STATE_MAP.remove(key);
+            occupancy_add(OCCUPANCY_EBPF_DELETES);
         }
     }
 
@@ -387,6 +401,7 @@ fn __mark_udp_seen(
         warn!((), target: "honk", "udp conn state map overflow, key: {:i}:{} -> {:i}:{}", unsafe { key.src_ip.u6_addr8 }, key.src_port, unsafe { key.dst_ip.u6_addr8 }, key.dst_port);
         return core::ptr::null_mut();
     }
+    occupancy_add(OCCUPANCY_INSERTS);
 
     CONN_STATE_MAP
         .get_ptr_mut(key)

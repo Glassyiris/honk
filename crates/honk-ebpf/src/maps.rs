@@ -1,8 +1,8 @@
 use aya_ebpf::Global;
 use aya_ebpf::bindings::__be32;
-use aya_ebpf::btf_maps::{Array, HashMap, LpmTrie, LruHashMap, PerCpuArray, RingBuf, SockMap};
+use aya_ebpf::btf_maps::{Array, HashMap, LpmTrie, PerCpuArray, RingBuf, SockMap};
 use aya_ebpf::macros::btf_map;
-use honk_ebpf_common::conn::{ConnState, ConntrackArgs, ParseTransportCtx};
+use honk_ebpf_common::conn::{ConnState, ConntrackArgs, MAX_CONN_STATE_NUM, ParseTransportCtx};
 use honk_ebpf_common::event::DaeEvent;
 use honk_ebpf_common::redirect_need::{
     DomainRouting, MAX_MATCH_SET_LEN, PIDName, RoutingHandoffEntry, TuplesKey,
@@ -14,19 +14,14 @@ use crate::route::{RouteCtx, WanEgressRouteScratch};
 use crate::transport::ParsedPacket;
 
 /// Maximum LPM trie size: 65,536 entries.
-/// Reduced from 2,048,000 to stay under kernel memory limits after
-/// switching to LRU eviction on other maps.  Each entry consumes ~20 bytes
-/// of kernel memory, so 65,536 entries ≈ 1.3 MB per LPM map.
+/// Reduced from 2,048,000 to stay under kernel memory limits.
+/// Each entry consumes ~20 bytes of kernel memory, so 65,536 entries
+/// ≈ 1.3 MB per LPM map.
 pub const MAX_LPM_SIZE: usize = 65536;
 pub const MAX_ROUTING_HANDOFF_NUM: usize = 65536;
 pub const MAX_LPM_NUM: usize = MAX_MATCH_SET_LEN + 8;
 pub const MAX_COOKIE_PID_PNAME_MAPPING_NUM: usize = 65536;
 pub const MAX_DOMAIN_ROUTING_NUM: usize = 65536;
-/// Default connection state map size: 512K entries (~68 MB kernel memory).
-/// LRU hash map: auto-evicts least-recently-used entries when full.
-/// Increase this if you see "map overflow" warnings in the log.
-/// Maximum practical size is ~4M entries depending on available kernel memory.
-pub const MAX_CONN_STATE_NUM: usize = 65536 * 8; // 524,288 entries
 
 // Global variable: corresponds to the C `const volatile struct dae_param PARAM = {};`.
 #[unsafe(no_mangle)]
@@ -62,17 +57,15 @@ pub static OUTBOUND_CONNECTIVITY_MAP: Array<u64, 1536, 0> = Array::new();
 pub static LISTEN_SOCKET_MAP: SockMap<4> = SockMap::new();
 
 #[btf_map]
-/// LRU hash map: auto-evicts least-recently-used entries when full.
-pub static REDIRECT_TRACK: LruHashMap<RedirectTuple, RedirectEntry, 65536, 0> = LruHashMap::new();
+/// Plain hash: eviction is owned by the userspace janitor (state-based
+/// timeouts), never by silent kernel LRU eviction — an evicted entry here
+/// breaks reply rewriting for live flows.
+pub static REDIRECT_TRACK: HashMap<RedirectTuple, RedirectEntry, 65536, 0> = HashMap::new();
 
 #[btf_map]
-/// LRU hash map: auto-evicts least-recently-used entries when full.
-pub static ROUTING_HANDOFF_MAP: LruHashMap<
-    TuplesKey,
-    RoutingHandoffEntry,
-    MAX_ROUTING_HANDOFF_NUM,
-    0,
-> = LruHashMap::new();
+/// Plain hash: swept by the userspace janitor (30 s timeout).
+pub static ROUTING_HANDOFF_MAP: HashMap<TuplesKey, RoutingHandoffEntry, MAX_ROUTING_HANDOFF_NUM, 0> =
+    HashMap::new();
 
 #[btf_map]
 pub static ROUTING_MAP: Array<MatchSet, MAX_MATCH_SET_LEN, 0> = Array::new();
@@ -108,9 +101,20 @@ pub static COOKIE_PID_MAP: HashMap<u64, PIDName, MAX_COOKIE_PID_PNAME_MAPPING_NU
     HashMap::new();
 
 // Must be pinned in userspace.
+// Plain hash: the datapath expires entries lazily on hit and the userspace
+// janitor sweeps with state-based timeouts; the kernel never evicts on its
+// own (silent LRU eviction could re-route or break live flows mid-flight).
 #[btf_map]
-pub static CONN_STATE_MAP: LruHashMap<TuplesKey, ConnState, MAX_CONN_STATE_NUM, 0> =
-    LruHashMap::new();
+pub static CONN_STATE_MAP: HashMap<TuplesKey, ConnState, { MAX_CONN_STATE_NUM as usize }, 0> =
+    HashMap::new();
+
+/// Occupancy gauge for CONN_STATE_MAP (per-CPU to keep the insert path
+/// contention-free): slot `OCCUPANCY_INSERTS` counts successful inserts,
+/// slot `OCCUPANCY_EBPF_DELETES` counts datapath-side deletes.  Userspace
+/// combines these with its own janitor-delete accounting to estimate live
+/// occupancy between sweeps.
+#[btf_map]
+pub static CONN_STATE_OCCUPANCY: PerCpuArray<u64, 2> = PerCpuArray::new();
 
 // key=0: UDP conn overflow count; key=1: TCP conn overflow count.
 #[btf_map]

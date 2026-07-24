@@ -620,6 +620,40 @@ impl EbpfBackend for RealEbpfBackend {
         self.map_snapshot("REDIRECT_TRACK", out)
     }
 
+    fn conn_state_snapshot(&self, out: &mut Vec<(TuplesKey, ConnState)>) -> anyhow::Result<()> {
+        self.map_snapshot("CONN_STATE_MAP", out)
+    }
+
+    fn conn_state_remove_batch(&mut self, keys: &[TuplesKey]) -> anyhow::Result<()> {
+        self.map_delete_batch("CONN_STATE_MAP", keys)
+    }
+
+    fn conn_state_occupancy(&self) -> anyhow::Result<(u64, u64)> {
+        let bpf = self.bpf()?;
+        // Objects from an older build (supplied via --bpf-object) may not
+        // carry the gauge; report zeros instead of failing.
+        if bpf.map("CONN_STATE_OCCUPANCY").is_none() {
+            return Ok((0, 0));
+        }
+        let ncpu = possible_cpus();
+        let mut slots = [0u64; 2];
+        for (i, slot) in [
+            honk_ebpf_common::conn::OCCUPANCY_INSERTS,
+            honk_ebpf_common::conn::OCCUPANCY_EBPF_DELETES,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut buf = vec![0u8; ncpu * 8];
+            if let Some(()) =
+                bpf_hash_lookup(bpf, "CONN_STATE_OCCUPANCY", unsafe { as_bytes(&slot) }, &mut buf)?
+            {
+                slots[i] = sum_percpu_u64(&buf, ncpu);
+            }
+        }
+        Ok((slots[0], slots[1]))
+    }
+
     fn cookie_pid_snapshot(&self, out: &mut Vec<(u64, PidPname)>) -> anyhow::Result<()> {
         self.map_snapshot("COOKIE_PID_MAP", out)
     }

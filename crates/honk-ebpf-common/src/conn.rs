@@ -9,7 +9,7 @@ use network_types::{
     udp::UdpHdr,
 };
 
-/// Unified connection state stored in CONN_STATE_MAP (LruHashMap).
+/// Unified connection state stored in CONN_STATE_MAP (hash map).
 /// Used by both eBPF programs (for conntrack/lifecycle) and userspace janitor
 /// (for cleanup).  All fields are repr(C) so the binary layout is identical
 /// regardless of compiler or target triple.
@@ -44,6 +44,26 @@ pub enum BpfStatsKey {
     UdpConnOverflow = 0,
     TcpConnOverflow = 1,
 }
+
+/// CONN_STATE_MAP capacity, shared by the eBPF map definition and the
+/// userspace janitor's pressure gauge.  ~68 MB kernel memory at 524,288
+/// entries.
+pub const MAX_CONN_STATE_NUM: u32 = 65536 * 8;
+
+/// Conn-state entry timeouts, applied lazily by the eBPF datapath on every
+/// hit and proactively by the userspace janitor sweep.  Both sides must use
+/// the same values.
+pub const TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS: u64 = 120_000_000_000; // 120 s
+pub const TCP_CONN_STATE_CLOSING_TIMEOUT_NS: u64 = 10_000_000_000; // 10 s
+pub const UDP_CONN_STATE_TIMEOUT_NS: u64 = 120_000_000_000; // 120 s backstop
+
+/// Slots of the `CONN_STATE_OCCUPANCY` per-CPU array: the datapath's
+/// cumulative successful inserts / deletes into CONN_STATE_MAP.  Userspace
+/// derives the live occupancy estimate as
+/// `inserts - ebpf_deletes - janitor_deletes`, recalibrated against the exact
+/// count on every janitor sweep.
+pub const OCCUPANCY_INSERTS: u32 = 0;
+pub const OCCUPANCY_EBPF_DELETES: u32 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy)]

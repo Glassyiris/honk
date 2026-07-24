@@ -89,7 +89,7 @@ const CLASSIFIED_MARK: u32 = 0x4000_0000;
 ///   unconditionally as well.
 /// `HANDOFF_WRITE_SKIP`: established TCP on the cached-routing path.
 ///   Userspace never looks up handoffs for these packets, so writing one
-///   would just sit in the LRU map until the janitor sweeps it.
+///   would just sit in the map until the janitor sweeps it.
 ///   `REDIRECT_TRACK` is refreshed only when stale.
 /// `HANDOFF_WRITE_REFRESH`: UDP, first packet and cached path alike.
 ///   Write when no entry exists or the existing one is older than

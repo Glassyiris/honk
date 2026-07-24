@@ -545,7 +545,7 @@ fn do_tproxy_wan_egress_tcp(
     // Write routing handoff entry for the control plane.  Only the SYN that
     // starts the connection needs one: userspace consumes handoffs once per
     // accepted connection, so per-packet writes on established flows would
-    // just churn the LRU map until the janitor sweeps them.
+    // just churn the map until the janitor sweeps them.
     if tcp_state_syn {
         let mut handoff: RoutingHandoffEntry = unsafe { mem::zeroed() };
         handoff.last_seen_ns = unsafe { bpf_ktime_get_ns() };
