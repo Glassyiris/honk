@@ -370,12 +370,25 @@ impl ControlPlaneHandle {
         // Router. `must` marks dae `(must)`-rule results (handoff must flag
         // or a must-matched userspace rule) — final decisions exempt from
         // the clash mode override below.
+        //
+        // Domain dial modes (domain / domain+ / domain++): an eBPF decision
+        // made without domain knowledge (e.g. fallback direct for an
+        // unlearned IP) is preliminary — once a domain is sniffed (and, in
+        // `domain` mode, verified), re-run the userspace router with it so
+        // domain rules apply.  must and block results stay final; only Ip
+        // mode takes the handoff decision as-is.
+        let reroute_by_sniffed_domain = !matches!(dial_mode, DialMode::Ip)
+            && domain.is_some()
+            && handoff.as_ref().is_some_and(|ho| {
+                ho.must == 0 && ho.outbound != OutboundIndex::Block as u8
+            });
         let (outbound_name, must) = if let Some(ref ho) = handoff {
             debug!(
                 "eBPF handoff: outbound={}, mark=0x{:x}, dscp={}",
                 ho.outbound, ho.mark, ho.dscp
             );
-            if ho.outbound == OutboundIndex::ControlPlaneRouting as u8 {
+            if ho.outbound == OutboundIndex::ControlPlaneRouting as u8 || reroute_by_sniffed_domain
+            {
                 let router = self.router.read().await;
                 let (name, must) = router.route_with_must(&conn_info);
                 (name.to_string(), must)
