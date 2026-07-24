@@ -42,7 +42,7 @@ fn test_config_dae_parses() {
         config.experimental.clash_api.external_controller,
         "0.0.0.0:9090"
     );
-    assert!(!config.experimental.cache_file.enabled);
+    assert!(config.experimental.cache_file.enabled);
 }
 
 #[test]
