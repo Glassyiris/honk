@@ -338,7 +338,10 @@ impl JuicityHandler {
         });
         // Another task may have won the race — reuse theirs.
         let mut clients = CLIENTS.lock();
-        Ok(clients.entry(key).or_insert_with(|| Arc::clone(&client)).clone())
+        Ok(clients
+            .entry(key)
+            .or_insert_with(|| Arc::clone(&client))
+            .clone())
     }
 
     /// Open a bi stream and write the juicity request header

@@ -645,9 +645,12 @@ impl EbpfBackend for RealEbpfBackend {
         .enumerate()
         {
             let mut buf = vec![0u8; ncpu * 8];
-            if let Some(()) =
-                bpf_hash_lookup(bpf, "CONN_STATE_OCCUPANCY", unsafe { as_bytes(&slot) }, &mut buf)?
-            {
+            if let Some(()) = bpf_hash_lookup(
+                bpf,
+                "CONN_STATE_OCCUPANCY",
+                unsafe { as_bytes(&slot) },
+                &mut buf,
+            )? {
                 slots[i] = sum_percpu_u64(&buf, ncpu);
             }
         }

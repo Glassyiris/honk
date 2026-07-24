@@ -49,11 +49,7 @@ async fn main() -> anyhow::Result<()> {
         .await;
         match result {
             Ok(Ok(conn)) => {
-                println!(
-                    "chrome={}: CONNECTED rtt={:?}",
-                    chrome,
-                    conn.rtt()
-                );
+                println!("chrome={}: CONNECTED rtt={:?}", chrome, conn.rtt());
                 conn.close(0u32.into(), b"done");
             }
             Ok(Err(e)) => println!("chrome={}: connect error: {}", chrome, e),

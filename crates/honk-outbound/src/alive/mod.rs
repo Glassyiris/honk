@@ -820,9 +820,7 @@ impl AliveDialerSet {
         let idx = alive_index(domain, ipver);
         let cols = self.collections.read();
         let coll = cols.get(node_id).map(|arr| &arr[idx])?;
-        coll.latencies
-            .last_real_sample()
-            .map(|s| (s.latency, s.at))
+        coll.latencies.last_real_sample().map(|s| (s.latency, s.at))
     }
 
     /// Moving average of the recent probe samples for the same

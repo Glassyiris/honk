@@ -700,7 +700,10 @@ impl TuicHandler {
         });
         // Another task may have won the race — reuse theirs.
         let mut clients = CLIENTS.lock();
-        Ok(clients.entry(key).or_insert_with(|| Arc::clone(&client)).clone())
+        Ok(clients
+            .entry(key)
+            .or_insert_with(|| Arc::clone(&client))
+            .clone())
     }
 
     async fn send_udp(

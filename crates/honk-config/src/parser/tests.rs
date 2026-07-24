@@ -452,7 +452,15 @@ group {
         let mut v: Vec<String> = g
             .nodes
             .iter()
-            .map(|id| config.nodes.iter().find(|n| n.id == *id).unwrap().name.clone())
+            .map(|id| {
+                config
+                    .nodes
+                    .iter()
+                    .find(|n| n.id == *id)
+                    .unwrap()
+                    .name
+                    .clone()
+            })
             .collect();
         v.sort();
         v

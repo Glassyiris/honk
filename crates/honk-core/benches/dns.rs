@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use std::hint::black_box;
 use honk_config::dns::{DnsRouting, DnsUpstream};
 use honk_config::types::DnsProtocol;
 use honk_core::dns::cache::DnsCache;
@@ -20,6 +19,7 @@ use honk_core::dns::transport::{
     DialContext, TcpPool, exchange_length_prefixed, force_dns_id_zero, restore_dns_id,
 };
 use honk_core::dns::upstream_pool::UpstreamPool;
+use std::hint::black_box;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::runtime::Runtime;

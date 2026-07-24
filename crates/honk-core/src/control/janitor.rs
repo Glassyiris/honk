@@ -20,8 +20,8 @@
 
 use crate::ebpf::EbpfBackend;
 use honk_ebpf_common::conn::{
-    MAX_CONN_STATE_NUM, TCP_CONN_STATE_CLOSING_TIMEOUT_NS,
-    TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS, TcpState, UDP_CONN_STATE_TIMEOUT_NS,
+    MAX_CONN_STATE_NUM, TCP_CONN_STATE_CLOSING_TIMEOUT_NS, TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS,
+    TcpState, UDP_CONN_STATE_TIMEOUT_NS,
 };
 use honk_ebpf_common::{RedirectTuple, TuplesKey};
 use std::sync::Arc;
@@ -80,7 +80,10 @@ struct OccupancyGauge {
 impl OccupancyGauge {
     /// Raw counter-derived occupancy before drift correction.
     fn raw_estimate(&self, inserts: u64, ebpf_deletes: u64, userspace_deletes: u64) -> i64 {
-        inserts as i64 - ebpf_deletes as i64 - self.janitor_deletes as i64 - userspace_deletes as i64
+        inserts as i64
+            - ebpf_deletes as i64
+            - self.janitor_deletes as i64
+            - userspace_deletes as i64
     }
 
     fn estimate(&self, inserts: u64, ebpf_deletes: u64, userspace_deletes: u64) -> u64 {
@@ -220,8 +223,7 @@ impl BpfJanitor {
                 };
 
                 if last_conn_state_cleanup + conn_state_interval <= now {
-                    let (deleted, total) =
-                        self.cleanup_conn_state(&mut gauge, occ_counters).await;
+                    let (deleted, total) = self.cleanup_conn_state(&mut gauge, occ_counters).await;
                     last_conn_state_cleanup = now;
                     if utilization >= CONN_STATE_ELEVATED_WATERMARK || deleted > 0 {
                         info!(
