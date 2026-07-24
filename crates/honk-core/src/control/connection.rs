@@ -1369,6 +1369,15 @@ impl ControlPlaneHandle {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<crate::proxy::ProxyStream> {
+        // The built-in block node shares NodeProtocol::HTTP with direct;
+        // reject here before find() resolves it to DirectHandler (and before
+        // any pool lookup under its meaningless ":0" address).
+        if node.name == "block" {
+            use crate::proxy::ProxyHandler as _;
+            return crate::proxy::block::BlockHandler::new()
+                .dial(node, target, target_domain, connect_timeout)
+                .await;
+        }
         static POOL_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let pool_disabled = *POOL_DISABLED.get_or_init(|| {
             std::env::var("HONK_POOL_DISABLE")

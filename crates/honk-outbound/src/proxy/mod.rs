@@ -233,6 +233,14 @@ impl ProxyRegistry {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
+        // The built-in direct/block nodes share NodeProtocol::HTTP, and
+        // find() returns the first protocol match (DirectHandler) — dispatch
+        // block by name so routed block traffic is actually rejected.
+        if node.name == "block" {
+            return BlockHandler::new()
+                .dial(node, target, target_domain, connect_timeout)
+                .await;
+        }
         let handler = self
             .find(node.protocol)
             .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", node.protocol))?;
@@ -257,6 +265,13 @@ impl ProxyRegistry {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<UdpProxySocket> {
+        // See dial(): the block built-in must not fall through to
+        // DirectHandler via the shared NodeProtocol::HTTP marker.
+        if node.name == "block" {
+            return BlockHandler::new()
+                .dial_udp(node, target, target_domain, connect_timeout)
+                .await;
+        }
         let handler = self
             .find(node.protocol)
             .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", node.protocol))?;
@@ -309,6 +324,31 @@ mod tests {
         assert!(registry.find(NodeProtocol::VMess).is_some());
         assert!(registry.find(NodeProtocol::Tuic).is_some());
         assert!(registry.find(NodeProtocol::Juicity).is_some());
+    }
+
+    /// The built-in direct/block nodes both carry NodeProtocol::HTTP; the
+    /// registry must dispatch "block" by name to BlockHandler instead of
+    /// falling through to DirectHandler (regression: block rules silently
+    /// dialed direct).
+    #[tokio::test]
+    async fn test_block_node_dispatches_to_block_handler() {
+        let registry = ProxyRegistry::default_resolver().unwrap();
+        let node = Node {
+            name: "block".into(),
+            protocol: NodeProtocol::HTTP,
+            ..Default::default()
+        };
+        let target: SocketAddr = "10.0.0.1:80".parse().unwrap();
+        let err = registry
+            .dial(&node, target, None, Duration::from_secs(1))
+            .await
+            .expect_err("block node must not dial");
+        assert!(err.to_string().contains("blocked"));
+        let err = registry
+            .dial_udp(&node, target, None, Duration::from_secs(1))
+            .await
+            .expect_err("block node must not dial UDP");
+        assert!(err.to_string().contains("blocked"));
     }
 
     /// Regression test for the `Box<dyn AsyncReadWrite>` method-resolution
