@@ -348,16 +348,17 @@ impl EndpointKey {
     }
 }
 
+/// Message sent to the endpoint-removal sink: `(client, dst, conn_id)`.
+type EndpointRemoval = (SocketAddr, SocketAddr, Option<String>);
+
 /// Pool of UDP endpoints with LRU-like eviction.
 pub struct UdpEndpointPool {
     endpoints: DashMap<EndpointKey, Arc<UdpEndpoint>>,
-    /// Sink notified with `(client, dst, conn_id)` whenever an endpoint is
-    /// removed; the control plane uses it to retire the flow's conntrack
-    /// entries promptly instead of waiting for the datapath/janitor
-    /// timeouts, and to drop the flow from the clash-API tracker.
-    remove_sink: std::sync::Mutex<
-        Option<tokio::sync::mpsc::UnboundedSender<(SocketAddr, SocketAddr, Option<String>)>>,
-    >,
+    /// Sink notified whenever an endpoint is removed; the control plane uses
+    /// it to retire the flow's conntrack entries promptly instead of waiting
+    /// for the datapath/janitor timeouts, and to drop the flow from the
+    /// clash-API tracker.
+    remove_sink: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<EndpointRemoval>>>,
 }
 
 impl UdpEndpointPool {
@@ -370,10 +371,7 @@ impl UdpEndpointPool {
 
     /// Register the endpoint-removal sink (called once at control-plane
     /// startup).
-    pub fn set_remove_sink(
-        &self,
-        tx: tokio::sync::mpsc::UnboundedSender<(SocketAddr, SocketAddr, Option<String>)>,
-    ) {
+    pub fn set_remove_sink(&self, tx: tokio::sync::mpsc::UnboundedSender<EndpointRemoval>) {
         *self.remove_sink.lock().unwrap() = Some(tx);
     }
 
