@@ -432,7 +432,6 @@ pub fn parse_qtype_token(s: &str) -> Option<u16> {
 #[serde(rename_all = "lowercase")]
 pub enum DnsStrategy {
     /// Prefer IPv4
-    #[default]
     PreferIpv4,
     /// Prefer IPv6
     PreferIpv6,
@@ -441,6 +440,7 @@ pub enum DnsStrategy {
     /// IPv6 only
     Ipv6Only,
     /// Both IPv4 and IPv6
+    #[default]
     Both,
 }
 
@@ -499,7 +499,7 @@ impl Default for DnsConfig {
                 outbound: None,
             }],
             routing: DnsRouting::default(),
-            strategy: DnsStrategy::PreferIpv4,
+            strategy: DnsStrategy::Both,
             cache: DnsCacheConfig {
                 enabled: true,
                 ttl: 600,
