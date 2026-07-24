@@ -1336,10 +1336,7 @@ impl ControlPlaneHandle {
                             chain.reverse();
                             chain
                         };
-                        let conn_upload =
-                            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-                        let conn_download =
-                            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                        let (conn_upload, conn_download) = endpoint.byte_counters();
                         self.connection_tracker.register(
                             crate::connection_tracker::ConnectionEntry {
                                 id: conn_id.clone(),
@@ -1349,18 +1346,14 @@ impl ControlPlaneHandle {
                                 rule,
                                 rule_payload,
                                 chains,
-                                upload: conn_upload.clone(),
-                                download: conn_download.clone(),
+                                upload: conn_upload,
+                                download: conn_download,
                                 start_time: std::time::Instant::now(),
                                 domain: quic_domain.clone(),
                                 network: "udp".to_string(),
                             },
                         );
-                        endpoint.set_tracker(crate::control::udp_endpoint::UdpTrackerMeta {
-                            conn_id,
-                            upload: conn_upload,
-                            download: conn_download,
-                        });
+                        endpoint.set_tracker(conn_id);
                     }
                     endpoint.tracker_upload(client_to_proxy);
 

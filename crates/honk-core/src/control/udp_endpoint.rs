@@ -62,16 +62,13 @@ pub struct UdpEndpoint {
     pending_reply_count: AtomicU64,
     /// Next ring position to write.
     pending_reply_next: AtomicU64,
-    /// Clash-API tracker binding (connection id + live byte counters);
-    /// set when the endpoint's flow is registered in /connections.
-    tracker: Mutex<Option<UdpTrackerMeta>>,
-}
-
-/// Clash-API tracking state for a UDP "connection" (one endpoint).
-pub struct UdpTrackerMeta {
-    pub conn_id: String,
-    pub upload: Arc<AtomicU64>,
-    pub download: Arc<AtomicU64>,
+    /// Live byte counters shared with the clash-API tracker entry (plain
+    /// atomics — the per-packet path must not take a lock).
+    upload: Arc<AtomicU64>,
+    download: Arc<AtomicU64>,
+    /// Clash-API tracker connection id; set once at registration, taken at
+    /// removal.  Not touched on the per-packet path.
+    tracker_id: Mutex<Option<String>>,
 }
 
 impl UdpEndpoint {
@@ -106,32 +103,36 @@ impl UdpEndpoint {
             ),
             pending_reply_count: AtomicU64::new(0),
             pending_reply_next: AtomicU64::new(0),
-            tracker: Mutex::new(None),
+            upload: Arc::new(AtomicU64::new(0)),
+            download: Arc::new(AtomicU64::new(0)),
+            tracker_id: Mutex::new(None),
         }
     }
 
-    /// Bind the clash-API tracker entry to this endpoint.
-    pub fn set_tracker(&self, meta: UdpTrackerMeta) {
-        *self.tracker.lock().unwrap() = Some(meta);
+    /// Bind the clash-API tracker entry to this endpoint: the entry shares
+    /// the endpoint's atomic counters, and `conn_id` is stored for removal.
+    pub fn set_tracker(&self, conn_id: String) {
+        *self.tracker_id.lock().unwrap() = Some(conn_id);
     }
 
-    /// Count client→proxy bytes on the tracker (if registered).
+    /// Counter clones for the tracker entry.
+    pub fn byte_counters(&self) -> (Arc<AtomicU64>, Arc<AtomicU64>) {
+        (self.upload.clone(), self.download.clone())
+    }
+
+    /// Count client→proxy bytes (lock-free).
     pub fn tracker_upload(&self, n: u64) {
-        if let Some(meta) = &*self.tracker.lock().unwrap() {
-            meta.upload.fetch_add(n, Ordering::Relaxed);
-        }
+        self.upload.fetch_add(n, Ordering::Relaxed);
     }
 
-    /// Count proxy→client bytes on the tracker (if registered).
+    /// Count proxy→client bytes (lock-free).
     pub fn tracker_download(&self, n: u64) {
-        if let Some(meta) = &*self.tracker.lock().unwrap() {
-            meta.download.fetch_add(n, Ordering::Relaxed);
-        }
+        self.download.fetch_add(n, Ordering::Relaxed);
     }
 
     /// Take the tracker connection id (on endpoint removal).
     pub fn take_tracker_id(&self) -> Option<String> {
-        self.tracker.lock().unwrap().take().map(|m| m.conn_id)
+        self.tracker_id.lock().unwrap().take()
     }
 
     pub fn is_expired(&self) -> bool {
