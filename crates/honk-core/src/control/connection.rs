@@ -1193,6 +1193,7 @@ impl ControlPlaneHandle {
             }
             ep.mark_sent();
             ep.refresh();
+            ep.tracker_upload(data.len() as u64);
             ep.proxy_socket.send_to(&data, ep.relay_addr).await?;
             return Ok(());
         }
@@ -1240,6 +1241,14 @@ impl ControlPlaneHandle {
         // Clash mode override (Direct/Global); must/block results are never
         // overridden — same semantics as the TCP path.
         let outbound_name = self.apply_mode_override(outbound_name, must).await;
+
+        // Matched-rule identity for the /connections display (same as TCP).
+        let matched_rule = {
+            let router = self.router.read().await;
+            router
+                .route_full(&conn_info)
+                .map(|m| (m.rule_type.to_string(), m.rule_payload.to_string()))
+        };
 
         self.stats.record_connection(&outbound_name);
 
@@ -1309,6 +1318,51 @@ impl ControlPlaneHandle {
                     endpoint.mark_sent();
                     endpoint.record_pending_reply_peer(proxy.relay_addr);
                     endpoint.cache_routing_result(original_dst, outbound_index);
+
+                    // Register the flow in the clash-API tracker once per
+                    // endpoint (one endpoint == one UDP "connection"), with
+                    // live byte counters shared by the send/reply paths.
+                    if is_new {
+                        let conn_id = uuid::Uuid::new_v4().to_string();
+                        let (rule, rule_payload) = matched_rule
+                            .clone()
+                            .unwrap_or_else(|| ("Match".to_string(), String::new()));
+                        let chains = {
+                            let gm = self.group_manager.read();
+                            let mut chain = gm.selection_chain(&outbound_name);
+                            if chain.last() != Some(&node.name) {
+                                chain.push(node.name.clone());
+                            }
+                            chain.reverse();
+                            chain
+                        };
+                        let conn_upload =
+                            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                        let conn_download =
+                            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                        self.connection_tracker.register(
+                            crate::connection_tracker::ConnectionEntry {
+                                id: conn_id.clone(),
+                                source: client_addr.to_string(),
+                                destination: original_dst.to_string(),
+                                proxy: node.name.clone(),
+                                rule,
+                                rule_payload,
+                                chains,
+                                upload: conn_upload.clone(),
+                                download: conn_download.clone(),
+                                start_time: std::time::Instant::now(),
+                                domain: quic_domain.clone(),
+                                network: "udp".to_string(),
+                            },
+                        );
+                        endpoint.set_tracker(crate::control::udp_endpoint::UdpTrackerMeta {
+                            conn_id,
+                            upload: conn_upload,
+                            download: conn_download,
+                        });
+                    }
+                    endpoint.tracker_upload(client_to_proxy);
 
                     if is_new {
                         UdpEndpointPool::spawn_reply_handler(

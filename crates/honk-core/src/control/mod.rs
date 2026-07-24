@@ -418,14 +418,21 @@ impl ControlPlane {
             info!("BPF map janitor started");
 
             // Retire conntrack entries as UDP endpoints die (event-driven
-            // lifecycle; the datapath/janitor timeouts remain the backstop).
-            let (remove_tx, mut remove_rx) =
-                tokio::sync::mpsc::unbounded_channel::<(std::net::SocketAddr, std::net::SocketAddr)>(
-                );
+            // lifecycle; the datapath/janitor timeouts remain the backstop),
+            // and drop the flow from the clash-API tracker.
+            let (remove_tx, mut remove_rx) = tokio::sync::mpsc::unbounded_channel::<(
+                std::net::SocketAddr,
+                std::net::SocketAddr,
+                Option<String>,
+            )>();
             self.udp_pool.set_remove_sink(remove_tx);
             let ebpf = self.ebpf.clone();
+            let tracker = self.connection_tracker.clone();
             tasks.push(tokio::spawn(async move {
-                while let Some((client, dst)) = remove_rx.recv().await {
+                while let Some((client, dst, conn_id)) = remove_rx.recv().await {
+                    if let Some(id) = conn_id {
+                        tracker.remove(&id);
+                    }
                     let fwd = crate::control::connection::build_tuples_key(
                         dst.ip(),
                         dst.port(),

@@ -62,6 +62,16 @@ pub struct UdpEndpoint {
     pending_reply_count: AtomicU64,
     /// Next ring position to write.
     pending_reply_next: AtomicU64,
+    /// Clash-API tracker binding (connection id + live byte counters);
+    /// set when the endpoint's flow is registered in /connections.
+    tracker: Mutex<Option<UdpTrackerMeta>>,
+}
+
+/// Clash-API tracking state for a UDP "connection" (one endpoint).
+pub struct UdpTrackerMeta {
+    pub conn_id: String,
+    pub upload: Arc<AtomicU64>,
+    pub download: Arc<AtomicU64>,
 }
 
 impl UdpEndpoint {
@@ -96,7 +106,32 @@ impl UdpEndpoint {
             ),
             pending_reply_count: AtomicU64::new(0),
             pending_reply_next: AtomicU64::new(0),
+            tracker: Mutex::new(None),
         }
+    }
+
+    /// Bind the clash-API tracker entry to this endpoint.
+    pub fn set_tracker(&self, meta: UdpTrackerMeta) {
+        *self.tracker.lock().unwrap() = Some(meta);
+    }
+
+    /// Count client→proxy bytes on the tracker (if registered).
+    pub fn tracker_upload(&self, n: u64) {
+        if let Some(meta) = &*self.tracker.lock().unwrap() {
+            meta.upload.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// Count proxy→client bytes on the tracker (if registered).
+    pub fn tracker_download(&self, n: u64) {
+        if let Some(meta) = &*self.tracker.lock().unwrap() {
+            meta.download.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// Take the tracker connection id (on endpoint removal).
+    pub fn take_tracker_id(&self) -> Option<String> {
+        self.tracker.lock().unwrap().take().map(|m| m.conn_id)
     }
 
     pub fn is_expired(&self) -> bool {
@@ -316,10 +351,13 @@ impl EndpointKey {
 /// Pool of UDP endpoints with LRU-like eviction.
 pub struct UdpEndpointPool {
     endpoints: DashMap<EndpointKey, Arc<UdpEndpoint>>,
-    /// Sink notified with `(client, dst)` whenever an endpoint is removed;
-    /// the control plane uses it to retire the flow's conntrack entries
-    /// promptly instead of waiting for the datapath/janitor timeouts.
-    remove_sink: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<(SocketAddr, SocketAddr)>>>,
+    /// Sink notified with `(client, dst, conn_id)` whenever an endpoint is
+    /// removed; the control plane uses it to retire the flow's conntrack
+    /// entries promptly instead of waiting for the datapath/janitor
+    /// timeouts, and to drop the flow from the clash-API tracker.
+    remove_sink: std::sync::Mutex<
+        Option<tokio::sync::mpsc::UnboundedSender<(SocketAddr, SocketAddr, Option<String>)>>,
+    >,
 }
 
 impl UdpEndpointPool {
@@ -334,14 +372,14 @@ impl UdpEndpointPool {
     /// startup).
     pub fn set_remove_sink(
         &self,
-        tx: tokio::sync::mpsc::UnboundedSender<(SocketAddr, SocketAddr)>,
+        tx: tokio::sync::mpsc::UnboundedSender<(SocketAddr, SocketAddr, Option<String>)>,
     ) {
         *self.remove_sink.lock().unwrap() = Some(tx);
     }
 
-    fn notify_removed(&self, client: SocketAddr, dst: SocketAddr) {
+    fn notify_removed(&self, client: SocketAddr, dst: SocketAddr, conn_id: Option<String>) {
         if let Some(tx) = &*self.remove_sink.lock().unwrap() {
-            let _ = tx.send((client, dst));
+            let _ = tx.send((client, dst, conn_id));
         }
     }
 
@@ -402,7 +440,7 @@ impl UdpEndpointPool {
         let key = EndpointKey::new(client, dst);
         if let Some((_, ep)) = self.endpoints.remove(&key) {
             ep.kill();
-            self.notify_removed(client, dst);
+            self.notify_removed(client, dst, ep.take_tracker_id());
         }
     }
 
@@ -500,6 +538,7 @@ impl UdpEndpointPool {
                             continue;
                         }
                         endpoint.mark_reply();
+                        endpoint.tracker_download(n as u64);
                         // A reply is the only proof a UDP path actually works
                         // (a UoT-blackhole server accepts sends but never
                         // answers); report liveness on receipt, not on send.

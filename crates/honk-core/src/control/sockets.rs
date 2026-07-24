@@ -899,6 +899,7 @@ pub(super) async fn udp_fast_path(
     }
     ep.mark_sent();
     ep.refresh();
+    ep.tracker_upload(data.len() as u64);
     if let Err(e) = ep.proxy_socket.send_to(data, ep.relay_addr).await {
         warn!(
             "UDP fast path send to {} for {} -> {} failed: {}",
