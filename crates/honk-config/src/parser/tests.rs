@@ -418,6 +418,53 @@ group {
 }
 
 #[test]
+fn test_group_name_filter_exact_multi_and_regex() {
+    // Plain name() params are exact-match, comma-separated values OR-ed;
+    // regex: gives a raw pattern (Go dae filter.go parity).
+    let input = r#"
+node {
+    juicity-1: 'juicity://u:p@1.1.1.1:443'
+    juicity-2: 'juicity://u:p@2.2.2.2:443'
+    other: 'juicity://u:p@3.3.3.3:443'
+}
+group {
+    exact {
+        filter: name('juicity-1', 'juicity-2')
+        policy: select
+    }
+    re {
+        filter: name(regex: '^juicity-')
+        policy: select
+    }
+    kw {
+        filter: name(keyword: 'icity-1')
+        policy: select
+    }
+    nomatch {
+        filter: name('juicity')
+        policy: select
+    }
+}
+"#;
+    let config = parse_dae_config(input).unwrap();
+    let names = |tag: &str| {
+        let g = config.groups.iter().find(|g| g.name == tag).unwrap();
+        let mut v: Vec<String> = g
+            .nodes
+            .iter()
+            .map(|id| config.nodes.iter().find(|n| n.id == *id).unwrap().name.clone())
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(names("exact"), vec!["juicity-1", "juicity-2"]);
+    assert_eq!(names("re"), vec!["juicity-1", "juicity-2"]);
+    assert_eq!(names("kw"), vec!["juicity-1"]);
+    // Exact match on a shared prefix matches NOTHING (the test.dae case).
+    assert!(names("nomatch").is_empty());
+}
+
+#[test]
 fn test_group_filter_multi_tags_comma_and_pipe() {
     let input = r#"
 group {

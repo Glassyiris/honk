@@ -99,11 +99,12 @@ pub fn resolve_group_filters(groups: &mut [Group], nodes: &[Node]) {
     }
 }
 
-/// Parse a `name(...)` filter into a regex.
+/// Parse a `name(...)` filter into a regex (Go dae `filter.go` parity).
 ///
 /// Supported patterns:
-///   name('exact-name')  — exact match
-///   name(keyword: 'pattern') — case-insensitive regex keyword match
+///   name('a', 'b')          — exact match of any listed name (params OR-ed)
+///   name(keyword: 'pat')    — substring match
+///   name(regex: '^ju')      — raw regex match
 fn parse_name_filter(filter: &str) -> Option<Regex> {
     let body = filter
         .strip_prefix("name(")
@@ -113,9 +114,23 @@ fn parse_name_filter(filter: &str) -> Option<Regex> {
     if let Some(keyword) = body.strip_prefix("keyword:") {
         let kw = keyword.trim().trim_matches(|c: char| c == '\'' || c == '"');
         Regex::new(&regex::escape(kw)).ok()
+    } else if let Some(pattern) = body.strip_prefix("regex:") {
+        let pat = pattern.trim().trim_matches(|c: char| c == '\'' || c == '"');
+        Regex::new(pat).ok()
     } else {
-        let name = body.trim_matches(|c: char| c == '\'' || c == '"');
-        Regex::new(&format!("^{}$", regex::escape(name))).ok()
+        // Plain params: comma-separated exact names, OR-ed — dae matches a
+        // node when ANY param equals its name.
+        let pattern = body
+            .split(',')
+            .map(|p| p.trim().trim_matches(|c: char| c == '\'' || c == '"'))
+            .filter(|p| !p.is_empty())
+            .map(|n| format!("^{}$", regex::escape(n)))
+            .collect::<Vec<_>>()
+            .join("|");
+        if pattern.is_empty() {
+            return None;
+        }
+        Regex::new(&pattern).ok()
     }
 }
 

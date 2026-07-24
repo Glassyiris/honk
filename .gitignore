@@ -48,3 +48,7 @@ AGENT.*
 
 .pi
 test.dae
+cache.db
+cache.db-shm
+cache.db-wal
+yacd/
