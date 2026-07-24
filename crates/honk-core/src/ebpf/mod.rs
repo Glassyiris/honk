@@ -8,6 +8,14 @@ pub mod real;
 
 use async_trait::async_trait;
 use honk_ebpf_common::*;
+use std::sync::atomic::AtomicU64;
+
+/// Cumulative conn-state entries deleted by userspace (TCP relay teardown,
+/// UDP endpoint reaper), for the janitor's occupancy gauge.  eBPF-side
+/// inserts/deletes are counted by the `CONN_STATE_OCCUPANCY` map; deletions
+/// initiated from userspace must be accounted separately or the gauge
+/// overestimates live occupancy between sweep calibrations.
+pub static USERSPACE_CONN_STATE_DELETES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct BpfLoadParams {

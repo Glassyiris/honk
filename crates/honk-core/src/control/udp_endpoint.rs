@@ -291,17 +291,57 @@ impl EndpointKey {
             dst_port: dst.port(),
         }
     }
+
+    /// Convert a stored 16-byte address back to `IpAddr`, unwrapping the
+    /// v4-mapped form written by `new()`.
+    fn ip_addr(bytes: &[u8; 16]) -> std::net::IpAddr {
+        if bytes[0..10].iter().all(|&b| b == 0) && bytes[10] == 0xff && bytes[11] == 0xff {
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                bytes[12], bytes[13], bytes[14], bytes[15],
+            ))
+        } else {
+            std::net::IpAddr::V6(std::net::Ipv6Addr::from(*bytes))
+        }
+    }
+
+    fn client_ip(&self) -> std::net::IpAddr {
+        Self::ip_addr(&self.client_ip)
+    }
+
+    fn dst_ip(&self) -> std::net::IpAddr {
+        Self::ip_addr(&self.dst_ip)
+    }
 }
 
 /// Pool of UDP endpoints with LRU-like eviction.
 pub struct UdpEndpointPool {
     endpoints: DashMap<EndpointKey, Arc<UdpEndpoint>>,
+    /// Sink notified with `(client, dst)` whenever an endpoint is removed;
+    /// the control plane uses it to retire the flow's conntrack entries
+    /// promptly instead of waiting for the datapath/janitor timeouts.
+    remove_sink: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<(SocketAddr, SocketAddr)>>>,
 }
 
 impl UdpEndpointPool {
     pub fn new() -> Self {
         Self {
             endpoints: DashMap::new(),
+            remove_sink: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Register the endpoint-removal sink (called once at control-plane
+    /// startup).
+    pub fn set_remove_sink(
+        &self,
+        tx: tokio::sync::mpsc::UnboundedSender<(SocketAddr, SocketAddr)>,
+    ) {
+        *self.remove_sink.lock().unwrap() = Some(tx);
+    }
+
+    fn notify_removed(&self, client: SocketAddr, dst: SocketAddr) {
+        if let Some(tx) = &*self.remove_sink.lock().unwrap() {
+            let _ = tx.send((client, dst));
         }
     }
 
@@ -362,21 +402,28 @@ impl UdpEndpointPool {
         let key = EndpointKey::new(client, dst);
         if let Some((_, ep)) = self.endpoints.remove(&key) {
             ep.kill();
+            self.notify_removed(client, dst);
         }
     }
 
     /// Run a janitor cycle: remove expired endpoints.
     pub fn janitor_cycle(&self) -> usize {
-        let before = self.endpoints.len();
-        self.endpoints.retain(|_, ep| {
-            if ep.ref_count() <= 0 && ep.is_expired() {
-                ep.kill();
-                false
-            } else {
-                true
-            }
-        });
-        let removed = before - self.endpoints.len();
+        let expired: Vec<(SocketAddr, SocketAddr)> = self
+            .endpoints
+            .iter()
+            .filter(|ep| ep.ref_count() <= 0 && ep.is_expired())
+            .map(|ep| {
+                let key = ep.key();
+                (
+                    SocketAddr::new(key.client_ip(), key.client_port),
+                    SocketAddr::new(key.dst_ip(), key.dst_port),
+                )
+            })
+            .collect();
+        let removed = expired.len();
+        for (client, dst) in expired {
+            self.remove(client, dst);
+        }
         if removed > 0 {
             debug!("UDP endpoint janitor removed {} expired endpoints", removed);
         }

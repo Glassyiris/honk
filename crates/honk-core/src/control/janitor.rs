@@ -79,17 +79,17 @@ struct OccupancyGauge {
 
 impl OccupancyGauge {
     /// Raw counter-derived occupancy before drift correction.
-    fn raw_estimate(&self, inserts: u64, ebpf_deletes: u64) -> i64 {
-        inserts as i64 - ebpf_deletes as i64 - self.janitor_deletes as i64
+    fn raw_estimate(&self, inserts: u64, ebpf_deletes: u64, userspace_deletes: u64) -> i64 {
+        inserts as i64 - ebpf_deletes as i64 - self.janitor_deletes as i64 - userspace_deletes as i64
     }
 
-    fn estimate(&self, inserts: u64, ebpf_deletes: u64) -> u64 {
-        (self.raw_estimate(inserts, ebpf_deletes) + self.drift).max(0) as u64
+    fn estimate(&self, inserts: u64, ebpf_deletes: u64, userspace_deletes: u64) -> u64 {
+        (self.raw_estimate(inserts, ebpf_deletes, userspace_deletes) + self.drift).max(0) as u64
     }
 
     /// Recalibrate with the exact entry count observed during a sweep.
-    fn calibrate(&mut self, exact: u64, inserts: u64, ebpf_deletes: u64) {
-        self.drift = exact as i64 - self.raw_estimate(inserts, ebpf_deletes);
+    fn calibrate(&mut self, exact: u64, inserts: u64, ebpf_deletes: u64, userspace_deletes: u64) {
+        self.drift = exact as i64 - self.raw_estimate(inserts, ebpf_deletes, userspace_deletes);
     }
 
     fn note_janitor_deletes(&mut self, n: u64) {
@@ -190,11 +190,13 @@ impl BpfJanitor {
                     pressure.last_udp_overflow = udp;
                     pressure.last_tcp_overflow = tcp;
                     let counters = ebpf.conn_state_occupancy().unwrap_or((0, 0));
-                    let occupancy = gauge.estimate(counters.0, counters.1);
+                    let userspace_deletes = crate::ebpf::USERSPACE_CONN_STATE_DELETES
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let occupancy = gauge.estimate(counters.0, counters.1, userspace_deletes);
                     (
                         delta,
                         occupancy as f64 / f64::from(MAX_CONN_STATE_NUM),
-                        counters,
+                        (counters, userspace_deletes),
                     )
                 };
                 update_pressure_state(&mut pressure, overflow_delta, utilization);
@@ -260,7 +262,7 @@ impl BpfJanitor {
     async fn cleanup_conn_state(
         &self,
         gauge: &mut OccupancyGauge,
-        occ_counters: (u64, u64),
+        occ_counters: ((u64, u64), u64),
     ) -> (u64, usize) {
         let now_ns = match monotonic_now_ns() {
             Ok(ns) => ns,
@@ -277,7 +279,13 @@ impl BpfJanitor {
                 return (0, 0);
             }
         }
-        gauge.calibrate(entries.len() as u64, occ_counters.0, occ_counters.1);
+        let ((inserts, ebpf_deletes), userspace_deletes) = occ_counters;
+        gauge.calibrate(
+            entries.len() as u64,
+            inserts,
+            ebpf_deletes,
+            userspace_deletes,
+        );
 
         let expired: Vec<TuplesKey> = entries
             .iter()
@@ -625,21 +633,22 @@ mod tests {
     #[test]
     fn test_occupancy_gauge_estimate_and_calibrate() {
         let mut gauge = OccupancyGauge::default();
-        // 100 inserts, 30 datapath deletes, 20 janitor deletes → 50 live.
+        // 100 inserts, 30 datapath deletes, 20 janitor deletes, 10 userspace
+        // deletes → 40 live.
         gauge.note_janitor_deletes(20);
-        assert_eq!(gauge.estimate(100, 30), 50);
+        assert_eq!(gauge.estimate(100, 30, 10), 40);
 
-        // A sweep observes 45 entries (5 lost to races) → drift corrects.
-        gauge.calibrate(45, 100, 30);
-        assert_eq!(gauge.estimate(100, 30), 45);
+        // A sweep observes 35 entries (5 lost to races) → drift corrects.
+        gauge.calibrate(35, 100, 30, 10);
+        assert_eq!(gauge.estimate(100, 30, 10), 35);
         // Post-calibration deltas apply on top of the exact count.
-        assert_eq!(gauge.estimate(110, 35), 50);
+        assert_eq!(gauge.estimate(110, 35, 12), 38);
     }
 
     #[test]
     fn test_occupancy_gauge_never_negative() {
         let gauge = OccupancyGauge::default();
-        assert_eq!(gauge.estimate(0, 10), 0);
+        assert_eq!(gauge.estimate(0, 10, 5), 0);
     }
 
     #[test]

@@ -417,6 +417,35 @@ impl ControlPlane {
             tasks.push(janitor.spawn());
             info!("BPF map janitor started");
 
+            // Retire conntrack entries as UDP endpoints die (event-driven
+            // lifecycle; the datapath/janitor timeouts remain the backstop).
+            let (remove_tx, mut remove_rx) =
+                tokio::sync::mpsc::unbounded_channel::<(std::net::SocketAddr, std::net::SocketAddr)>(
+                );
+            self.udp_pool.set_remove_sink(remove_tx);
+            let ebpf = self.ebpf.clone();
+            tasks.push(tokio::spawn(async move {
+                while let Some((client, dst)) = remove_rx.recv().await {
+                    let fwd = crate::control::connection::build_tuples_key(
+                        dst.ip(),
+                        dst.port(),
+                        client.ip(),
+                        client.port(),
+                        17, // UDP
+                    );
+                    let mut rev = fwd;
+                    std::mem::swap(&mut rev.src_ip, &mut rev.dst_ip);
+                    std::mem::swap(&mut rev.src_port, &mut rev.dst_port);
+                    let mut ebpf = ebpf.write().await;
+                    for key in [&fwd, &rev] {
+                        if ebpf.udp_conn_state_remove(key).is_ok() {
+                            crate::ebpf::USERSPACE_CONN_STATE_DELETES
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
+            }));
+
             tasks.push(self.udp_pool.spawn_janitor());
 
             tasks.push(self.sniffer_pool.spawn_janitor());

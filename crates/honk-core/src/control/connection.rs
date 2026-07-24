@@ -101,37 +101,45 @@ pub(super) fn is_tcp_stream_alive(stream: &TcpStream) -> bool {
     ret == 0 && err == 0
 }
 
-impl ControlPlaneHandle {
-    fn build_tuples_key(
-        dst_ip: std::net::IpAddr,
-        dst_port: u16,
-        src_ip: std::net::IpAddr,
-        src_port: u16,
-        l4proto: u8,
-    ) -> TuplesKey {
-        let mut key = TuplesKey::default();
-        match dst_ip {
-            std::net::IpAddr::V4(ip) => {
-                key.dst_ip[10] = 0xff;
-                key.dst_ip[11] = 0xff;
-                key.dst_ip[12..16].copy_from_slice(&ip.octets());
-            }
-            std::net::IpAddr::V6(ip) => key.dst_ip.copy_from_slice(&ip.octets()),
+/// Build the eBPF conntrack key for a flow: IPs as 16-byte v4-mapped
+/// addresses, ports in host byte order, `l4proto` as the IANA number.
+pub(crate) fn build_tuples_key(
+    dst_ip: std::net::IpAddr,
+    dst_port: u16,
+    src_ip: std::net::IpAddr,
+    src_port: u16,
+    l4proto: u8,
+) -> TuplesKey {
+    // mem::zeroed, NOT TuplesKey::default(): the struct has 3 implicit
+    // padding bytes after l4proto (37 field bytes in a 40-byte repr(C)
+    // layout), and Rust does not guarantee padding is zeroed on field-wise
+    // initialization.  The kernel hashes all 40 key bytes, and the datapath
+    // writes keys from a zeroed scratch buffer — a garbage-padded userspace
+    // key never matches (lookups/deletes silently ENOENT).
+    let mut key: TuplesKey = unsafe { std::mem::zeroed() };
+    match dst_ip {
+        std::net::IpAddr::V4(ip) => {
+            key.dst_ip[10] = 0xff;
+            key.dst_ip[11] = 0xff;
+            key.dst_ip[12..16].copy_from_slice(&ip.octets());
         }
-        match src_ip {
-            std::net::IpAddr::V4(ip) => {
-                key.src_ip[10] = 0xff;
-                key.src_ip[11] = 0xff;
-                key.src_ip[12..16].copy_from_slice(&ip.octets());
-            }
-            std::net::IpAddr::V6(ip) => key.src_ip.copy_from_slice(&ip.octets()),
-        }
-        key.dst_port = dst_port;
-        key.src_port = src_port;
-        key.l4proto = l4proto;
-        key
+        std::net::IpAddr::V6(ip) => key.dst_ip.copy_from_slice(&ip.octets()),
     }
+    match src_ip {
+        std::net::IpAddr::V4(ip) => {
+            key.src_ip[10] = 0xff;
+            key.src_ip[11] = 0xff;
+            key.src_ip[12..16].copy_from_slice(&ip.octets());
+        }
+        std::net::IpAddr::V6(ip) => key.src_ip.copy_from_slice(&ip.octets()),
+    }
+    key.dst_port = dst_port;
+    key.src_port = src_port;
+    key.l4proto = l4proto;
+    key
+}
 
+impl ControlPlaneHandle {
     /// Look up the eBPF routing handoff entry for a connection, consuming it.
     ///
     /// Only a read lock is taken: `routing_handoff_take` performs raw bpf()
@@ -260,7 +268,7 @@ impl ControlPlaneHandle {
             return Ok(());
         }
 
-        let tuples = Self::build_tuples_key(
+        let tuples = build_tuples_key(
             original_dst.ip(),
             original_dst.port(),
             client_addr.ip(),
@@ -1009,6 +1017,31 @@ impl ControlPlaneHandle {
             }
         }
 
+        // Event-driven lifecycle: the userspace relay has ended, so this
+        // flow's conntrack entries are dead state — retire both directions
+        // now instead of leaving them to the datapath/janitor timeouts
+        // (the model dae's SessionManager releaseFlow uses).  Late FIN/ACK
+        // stragglers hitting an empty entry simply pass through, which is
+        // harmless for a closed flow.
+        let mut reversed = tuples;
+        std::mem::swap(&mut reversed.src_ip, &mut reversed.dst_ip);
+        std::mem::swap(&mut reversed.src_port, &mut reversed.dst_port);
+        {
+            let mut ebpf = self.ebpf.write().await;
+            let mut removed = 0u32;
+            for key in [&tuples, &reversed] {
+                if ebpf.tcp_conn_state_remove(key).is_ok() {
+                    removed += 1;
+                    crate::ebpf::USERSPACE_CONN_STATE_DELETES
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            debug!(
+                "conn-state retire: {} -> {} removed {} entr(ies)",
+                client_addr, resolved_target, removed
+            );
+        }
+
         if let (Some(ref ho), Some(ref domain)) = (handoff, sniff_result.domain)
             && (ho.outbound >= OutboundIndex::UserBase as u8
                 || ho.outbound == OutboundIndex::Direct as u8)
@@ -1164,7 +1197,7 @@ impl ControlPlaneHandle {
             return Ok(());
         }
 
-        let tuples = Self::build_tuples_key(
+        let tuples = build_tuples_key(
             original_dst.ip(),
             original_dst.port(),
             client_addr.ip(),
