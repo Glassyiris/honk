@@ -57,14 +57,17 @@ pub static OUTBOUND_CONNECTIVITY_MAP: Array<u64, 1536, 0> = Array::new();
 pub static LISTEN_SOCKET_MAP: SockMap<4> = SockMap::new();
 
 #[btf_map]
-/// Plain hash: eviction is owned by the userspace janitor (state-based
-/// timeouts), never by silent kernel LRU eviction — an evicted entry here
-/// breaks reply rewriting for live flows.
-pub static REDIRECT_TRACK: HashMap<RedirectTuple, RedirectEntry, 65536, 0> = HashMap::new();
+/// Plain hash with BPF_F_NO_PREALLOC: kernel memory scales with live
+/// entries instead of locking max_entries up front (~8 MB empty instead of
+/// ~8 MB per 64K capacity).  Eviction is owned by the userspace janitor
+/// (state-based timeouts), never by silent kernel LRU eviction — an evicted
+/// entry here breaks reply rewriting for live flows.
+pub static REDIRECT_TRACK: HashMap<RedirectTuple, RedirectEntry, 65536, 1> = HashMap::new();
 
 #[btf_map]
-/// Plain hash: swept by the userspace janitor (30 s timeout).
-pub static ROUTING_HANDOFF_MAP: HashMap<TuplesKey, RoutingHandoffEntry, MAX_ROUTING_HANDOFF_NUM, 0> =
+/// Plain hash with BPF_F_NO_PREALLOC: swept by the userspace janitor (30 s
+/// timeout).
+pub static ROUTING_HANDOFF_MAP: HashMap<TuplesKey, RoutingHandoffEntry, MAX_ROUTING_HANDOFF_NUM, 1> =
     HashMap::new();
 
 #[btf_map]
@@ -101,11 +104,15 @@ pub static COOKIE_PID_MAP: HashMap<u64, PIDName, MAX_COOKIE_PID_PNAME_MAPPING_NU
     HashMap::new();
 
 // Must be pinned in userspace.
-// Plain hash: the datapath expires entries lazily on hit and the userspace
-// janitor sweeps with state-based timeouts; the kernel never evicts on its
-// own (silent LRU eviction could re-route or break live flows mid-flight).
+// Plain hash with BPF_F_NO_PREALLOC: kernel memory scales with live entries
+// instead of pinning ~84 MB for 512K capacity up front.  The datapath
+// expires entries lazily on hit and the userspace janitor sweeps with
+// state-based timeouts; the kernel never evicts on its own (silent LRU
+// eviction could re-route or break live flows mid-flight).  Inserts under
+// kernel memory pressure can fail — the overflow counter + fail-closed
+// path covers that.
 #[btf_map]
-pub static CONN_STATE_MAP: HashMap<TuplesKey, ConnState, { MAX_CONN_STATE_NUM as usize }, 0> =
+pub static CONN_STATE_MAP: HashMap<TuplesKey, ConnState, { MAX_CONN_STATE_NUM as usize }, 1> =
     HashMap::new();
 
 /// Occupancy gauge for CONN_STATE_MAP (per-CPU to keep the insert path
