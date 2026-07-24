@@ -834,12 +834,12 @@ impl ControlPlaneHandle {
 
         let conn_id = uuid::Uuid::new_v4().to_string();
         // Clash-shaped matched rule + dial chain for /connections: rule and
-        // rulePayload describe the RULE (type + own payload, "Match" =
+        // rulePayload describe the RULE (type + own payload, "Fallback" =
         // fallback), while metadata.host keeps the connection's domain.
         // chains is the selection path leaf-first ([leaf, .., topGroup]).
         let (rule, rule_payload) = matched_rule
             .clone()
-            .unwrap_or_else(|| ("Match".to_string(), String::new()));
+            .unwrap_or_else(|| ("Fallback".to_string(), String::new()));
         let chains = {
             let gm = self.group_manager.read();
             let mut chain = gm.selection_chain(&outbound_name);
@@ -1326,7 +1326,7 @@ impl ControlPlaneHandle {
                         let conn_id = uuid::Uuid::new_v4().to_string();
                         let (rule, rule_payload) = matched_rule
                             .clone()
-                            .unwrap_or_else(|| ("Match".to_string(), String::new()));
+                            .unwrap_or_else(|| ("Fallback".to_string(), String::new()));
                         let chains = {
                             let gm = self.group_manager.read();
                             let mut chain = gm.selection_chain(&outbound_name);

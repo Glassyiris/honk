@@ -15,7 +15,7 @@ pub struct ConnectionSnapshot {
     pub source: String,
     pub destination: String,
     pub proxy: String,
-    /// Matched routing rule (dae expression; "Match" = fallback).
+    /// Matched routing rule (dae expression; "Fallback" = fallback).
     pub rule: String,
     /// Value that drove the match (sniffed domain or destination IP).
     pub rule_payload: String,
