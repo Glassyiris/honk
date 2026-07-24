@@ -271,10 +271,17 @@ impl RealEbpfBackend {
                     warn!("failed to add clsact qdisc to {}: {}", ebpf_wan_ifname, e);
                 }
             }
-            // The bonding master may see locally-generated egress skbs as
-            // L3-only (Ethernet header added later by the slave driver), so use
-            // the L3 program for WAN egress.
-            let wan_egress_prog = "wan_egress_l3";
+            // Choose the L2/L3 variant by interface type (Go dae mapLinkType
+            // semantics): ARPHRD_ETHER interfaces (incl. bond masters) carry
+            // fully-framed packets at TC egress — neigh_output runs
+            // dev_hard_header before dev_queue_xmit, so the Ethernet header
+            // is already present when the TC hook fires.  Only genuinely
+            // headerless interfaces (PPP/tun/IPIP) get the L3 program.
+            let wan_egress_prog = if Self::iface_is_ethernet(&ebpf_wan_ifname) {
+                "wan_egress_l2"
+            } else {
+                "wan_egress_l3"
+            };
             let id = Self::attach_tc_at(
                 &mut bpf,
                 wan_egress_prog,
@@ -456,10 +463,10 @@ impl RealEbpfBackend {
                 if let Err(e) = aya::programs::tc::qdisc_add_clsact(slave) {
                     warn!("failed to add clsact qdisc to slave {}: {}", slave, e);
                 }
-                // Bond slaves may see locally-generated egress skbs as L3-only
-                // (Ethernet header added by the driver after TC), so use the L3
-                // program for slaves even though their type is ARPHRD_ETHER.
-                let slave_prog = "wan_egress_l3";
+                // Bond slaves are ARPHRD_ETHER and see fully-framed skbs at
+                // their TC egress hook (the bond driver has already built
+                // the Ethernet header), so use the L2 program.
+                let slave_prog = "wan_egress_l2";
                 let attach_result: anyhow::Result<()> = (|| {
                     let p: &mut aya::programs::SchedClassifier = bpf
                         .program_mut(slave_prog)
