@@ -117,6 +117,7 @@ The fields below are what a parsed node carries. In dae syntax they are **derive
 | `ws_path` / `ws_host` | string? | null | WebSocket (share-link `path=`/`host=`) |
 | `grpc_service` | string? | null | gRPC service name (`serviceName=`) |
 | `hy2_auth` / `hy2_obfs` | string? | null | Hysteria2 auth / salamander obfs password |
+| `hy2_port_ranges` | `PortRange[]` | `[]` | Port-hop union parsed from `host:port,port-start-end` |
 | `hy2_up_mbps` / `hy2_down_mbps` | u32? | null | Hysteria2 brutal bandwidth (`upmbps`/`downmbps`) |
 | `hy2_port_hopping` / `hy2_hop_interval` | string? / u64? | null | Hysteria2 port hopping (`mport`/`mhop`) |
 | `hy2_init_stream_recv_window` / `hy2_init_conn_recv_window` | u64? | null | Hysteria2 QUIC receive windows |
@@ -148,7 +149,7 @@ The fields below are what a parsed node carries. In dae syntax they are **derive
 | `vless` | | Yes | No | Header UDP exists in tests only |
 | `socks5` | | Yes | Yes | UDP ASSOCIATE |
 | `http` | | Yes* | — | Mapped through direct-style dial |
-| `hysteria2` | | Yes | Yes | Real QUIC/H3; salamander; brutal (with bandwidth) or BBR; port hopping |
+| `hysteria2` | `hy2`, `hysteria` | Yes | Yes | Real QUIC/H3; salamander; brutal (with bandwidth) or BBR; port hopping |
 | `tuic` | | Yes | Yes | TUIC v5 / quinn |
 | `juicity` | | Yes | Yes | quinn bi-stream UDP |
 | `anytls` | | Yes | Yes | Session pool + UoT v2 |
@@ -174,6 +175,24 @@ node {
 ```
 
 `mux = true` (h2mux) exists in the node schema but cannot be expressed in dae syntax today.
+
+**Hysteria2 port hopping**
+
+Hysteria2 share links accept the upstream multi-port authority syntax. Use an
+individual port, a range, or a comma-separated union:
+
+```dae
+node {
+    hy2_hop: 'hy2://secret@example.com:443,8443,40000-50000/?sni=example.com&obfs=salamander&obfs-password=obfs#hy2_hop'
+}
+```
+
+For two or more distinct ports, honk chooses an initial port at random, then
+every 30 seconds updates the existing UDP socket's wire target port. The local
+socket and QUIC endpoint remain unchanged. Replies are normalized internally so
+the QUIC connection remains continuous. All listed ports must reach the same
+Hysteria2 server and credentials; a single port keeps the ordinary non-hopping
+behavior.
 
 ### TLS fingerprint and ECH
 

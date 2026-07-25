@@ -72,14 +72,18 @@ pub async fn consume_dae_events(
                 let dip = event_ip(&ev.dip);
                 let is_overflow = ev.type_ == DaeEventType::UdpConnOverflow as u32
                     || ev.type_ == DaeEventType::TcpConnOverflow as u32;
+                let is_tproxy_assign_failure = ev.type_ == DaeEventType::TproxyAssignFailure as u32;
                 let kind = match ev.type_ {
                     t if t == DaeEventType::UdpConnOverflow as u32 => "udp_conn_overflow",
                     t if t == DaeEventType::TcpConnOverflow as u32 => "tcp_conn_overflow",
+                    t if t == DaeEventType::TproxyAssignFailure as u32 => "tproxy_assign_failure",
                     t if t == DaeEventType::Blocked as u32 => "blocked",
                     _ => "unknown",
                 };
                 if is_overflow {
                     warn!(target: "honk-ebpf", event = kind, pid = ev.pid, pname = %pname, l4proto = ev.l4proto, %sip, sport = ev.sport, %dip, dport = ev.dport, outbound = ev.outbound, "eBPF conntrack overflow");
+                } else if is_tproxy_assign_failure {
+                    warn!(target: "honk-ebpf", event = kind, errno = ev.pid, l4proto = ev.l4proto, "eBPF TPROXY listener assignment failed");
                 } else {
                     info!(target: "honk-ebpf", event = kind, pid = ev.pid, pname = %pname, l4proto = ev.l4proto, %sip, sport = ev.sport, %dip, dport = ev.dport, outbound = ev.outbound, "eBPF datapath event");
                 }

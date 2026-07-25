@@ -204,7 +204,7 @@ impl Router {
                 .condition
                 .ip
                 .iter()
-                .filter_map(|c| c.parse().ok())
+                .filter_map(|c| parse_ip_net(c))
                 .collect();
             ip_nets.extend(assets.geoip_nets(&rule.condition.geo_ip));
 
@@ -212,7 +212,7 @@ impl Router {
                 .condition
                 .source_ip
                 .iter()
-                .filter_map(|c| c.parse().ok())
+                .filter_map(|c| parse_ip_net(c))
                 .collect();
 
             let ports = parse_port_ranges(&rule.condition.port)?;
@@ -600,6 +600,24 @@ fn parse_ip_version(s: &str) -> Option<u8> {
         "6" | "ipv6" => Some(6),
         _ => None,
     }
+}
+
+/// Parse a routing IP matcher, accepting both CIDRs and a single host IP.
+///
+/// dae configuration commonly writes `dip(203.0.113.7)` for an exact host.
+/// `ipnet` only accepts the CIDR spelling, so treating a bare address as
+/// `/32` or `/128` here keeps the userspace router and the eBPF LPM compiler
+/// in agreement.
+fn parse_ip_net(value: &str) -> Option<ipnet::IpNet> {
+    value.parse::<ipnet::IpNet>().ok().or_else(|| {
+        value.parse::<IpAddr>().ok().and_then(|ip| {
+            let prefix_len = match ip {
+                IpAddr::V4(_) => 32,
+                IpAddr::V6(_) => 128,
+            };
+            ipnet::IpNet::new(ip, prefix_len).ok()
+        })
+    })
 }
 
 fn parse_port_ranges(ports: &[String]) -> anyhow::Result<Vec<PortRange>> {

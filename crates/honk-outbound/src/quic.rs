@@ -17,22 +17,24 @@
 //!   [`SendStream`]/[`RecvStream`] so it can be boxed into a
 //!   [`crate::proxy::ProxyStream`].
 
-use std::io;
+use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, anyhow};
 use quinn::congestion;
 use quinn::{
-    ClientConfig, Connection, Endpoint, EndpointConfig, RecvStream, SendStream, TransportConfig,
-    VarInt,
+    AsyncUdpSocket, ClientConfig, Connection, Endpoint, EndpointConfig, RecvStream, SendStream,
+    TransportConfig, UdpPoller, VarInt,
 };
+use rand::RngExt;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::Mutex;
-use tracing::warn;
+use tokio::sync::{Mutex, oneshot};
+use tracing::{debug, warn};
 
 /// Map a congestion-control name (`cubic` / `new_reno` / `bbr`, as used by
 /// sing-box and dae node configs) to a quinn controller factory.
@@ -211,8 +213,8 @@ pub async fn client_config(
         }
         None => None,
     };
-    let crypto = crate::quic_boring::BoringQuicClientConfig::new(
-        crate::quic_boring::BoringQuicOptions {
+    let crypto =
+        crate::quic_boring::BoringQuicClientConfig::new(crate::quic_boring::BoringQuicOptions {
             alpn_wire,
             skip_cert_verify: node.skip_cert_verify,
             chrome: crate::tls::chrome_mode(),
@@ -221,14 +223,15 @@ pub async fn client_config(
                 .tls_pin_sha256
                 .as_deref()
                 .and_then(crate::tls::parse_pin_sha256),
-        },
-    )?;
+        })?;
     let mut cfg = ClientConfig::new(Arc::new(crypto));
 
     let mut transport = TransportConfig::default();
     transport
         .congestion_controller_factory(
-            options.congestion.unwrap_or_else(|| congestion_factory(None)),
+            options
+                .congestion
+                .unwrap_or_else(|| congestion_factory(None)),
         )
         // Protocols like TUIC deliver inbound UDP packets on server-initiated
         // uni streams (one stream per packet) — allow a generous number
@@ -276,6 +279,26 @@ pub fn marked_udp_socket(ipv6: bool) -> io::Result<std::net::UdpSocket> {
     Ok(socket.into())
 }
 
+/// Wrap a marked UDP socket in Quinn's runtime abstraction.
+///
+/// This is useful for protocols that must layer a custom [`AsyncUdpSocket`]
+/// wrapper over a regular marked socket (such as Hysteria2 port hopping).
+pub fn marked_async_udp_socket(ipv6: bool) -> io::Result<Arc<dyn AsyncUdpSocket>> {
+    let socket = marked_udp_socket(ipv6)?;
+    let runtime = quinn::default_runtime()
+        .ok_or_else(|| io::Error::other("no async runtime available for QUIC"))?;
+    runtime.wrap_udp_socket(socket)
+}
+
+/// Create a client-only endpoint over an already-abstract QUIC UDP socket.
+///
+/// Hysteria2 uses this for salamander obfuscation and port-hopping wrappers.
+pub fn client_endpoint_with_socket(socket: Arc<dyn AsyncUdpSocket>) -> io::Result<Endpoint> {
+    let runtime = quinn::default_runtime()
+        .ok_or_else(|| io::Error::other("no async runtime available for QUIC"))?;
+    Endpoint::new_with_abstract_socket(EndpointConfig::default(), None, socket, runtime)
+}
+
 /// Create a client-only quinn [`Endpoint`] on a marked UDP socket for the
 /// given address family.
 pub fn client_endpoint(ipv6: bool) -> io::Result<Endpoint> {
@@ -285,11 +308,190 @@ pub fn client_endpoint(ipv6: bool) -> io::Result<Endpoint> {
     Endpoint::new(EndpointConfig::default(), None, socket, runtime)
 }
 
+/// Hysteria2 port-hopping parameters.
+///
+/// A port-hopping connection has a stable, internal QUIC peer address while
+/// its UDP wrapper rewrites packets to a randomly selected real server port.
+/// This is important because Quinn intentionally rejects remote-address
+/// migration for clients; responses are normalized back to the stable port.
+#[derive(Debug, Clone)]
+pub struct PortHoppingConfig {
+    ports: Arc<[u16]>,
+    min_interval: Duration,
+    max_interval: Duration,
+}
+
+impl PortHoppingConfig {
+    /// Construct a fixed-interval port-hopping configuration.
+    ///
+    /// Hysteria2 requires two or more target ports and documents a five-second
+    /// lower bound for hop intervals. The official default is 30 seconds.
+    pub fn fixed(mut ports: Vec<u16>, interval: Duration) -> anyhow::Result<Self> {
+        ports.sort_unstable();
+        ports.dedup();
+        if ports.len() < 2 {
+            anyhow::bail!("Hysteria2 port hopping requires at least two distinct ports");
+        }
+        if ports.contains(&0) {
+            anyhow::bail!("Hysteria2 port hopping does not permit port 0");
+        }
+        if interval < Duration::from_secs(5) {
+            anyhow::bail!("Hysteria2 port-hop interval must be at least 5 seconds");
+        }
+        Ok(Self {
+            ports: ports.into(),
+            min_interval: interval,
+            max_interval: interval,
+        })
+    }
+
+    fn next_interval(&self) -> Duration {
+        if self.min_interval == self.max_interval {
+            return self.min_interval;
+        }
+        let min_ms = self.min_interval.as_millis() as u64;
+        let max_ms = self.max_interval.as_millis() as u64;
+        Duration::from_millis(rand::rng().random_range(min_ms..=max_ms))
+    }
+}
+
+/// The currently selected real UDP destination from a Hysteria2 port union.
+#[derive(Debug)]
+struct PortHopper {
+    ports: Arc<[u16]>,
+}
+
+impl PortHopper {
+    fn new(config: &PortHoppingConfig) -> Self {
+        Self {
+            ports: Arc::clone(&config.ports),
+        }
+    }
+
+    fn initial_port(&self) -> u16 {
+        self.ports[rand::rng().random_range(0..self.ports.len())]
+    }
+
+    /// Pick a member different from `current`.
+    fn next_port(&self, current: u16) -> u16 {
+        let Some(old_index) = self.ports.iter().position(|port| *port == current) else {
+            return self.initial_port();
+        };
+        let offset = rand::rng().random_range(1..self.ports.len());
+        let next_index = (old_index + offset) % self.ports.len();
+        self.ports[next_index]
+    }
+}
+
+type PortHopSocketFactory =
+    Arc<dyn Fn(bool) -> io::Result<Arc<dyn AsyncUdpSocket>> + Send + Sync + 'static>;
+
+struct PortHopping {
+    config: PortHoppingConfig,
+    hopper: Arc<PortHopper>,
+    socket_factory: PortHopSocketFactory,
+}
+
+/// An [`AsyncUdpSocket`] wrapper used for Hysteria2 UDP port hopping.
+///
+/// Quinn continues to see the canonical peer port passed to `connect`; this
+/// wrapper changes only the wire destination. Incoming packets have their
+/// source port normalized back to the canonical port, which prevents Quinn's
+/// client-side remote-migration guard from discarding replies after a hop.
+pub struct PortHoppingSocket {
+    inner: Arc<dyn AsyncUdpSocket>,
+    target_port: AtomicU16,
+    canonical_port: u16,
+}
+
+impl PortHoppingSocket {
+    pub fn new(inner: Arc<dyn AsyncUdpSocket>, target_port: u16, canonical_port: u16) -> Self {
+        Self {
+            inner,
+            target_port: AtomicU16::new(target_port),
+            canonical_port,
+        }
+    }
+
+    pub fn target_port(&self) -> u16 {
+        self.target_port.load(Ordering::Acquire)
+    }
+
+    pub fn set_target_port(&self, target_port: u16) {
+        self.target_port.store(target_port, Ordering::Release);
+    }
+}
+
+impl std::fmt::Debug for PortHoppingSocket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PortHoppingSocket")
+            .field("inner", &self.inner)
+            .field("target_port", &self.target_port())
+            .field("canonical_port", &self.canonical_port)
+            .finish()
+    }
+}
+
+impl AsyncUdpSocket for PortHoppingSocket {
+    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+        Arc::clone(&self.inner).create_io_poller()
+    }
+
+    fn try_send(&self, transmit: &quinn::udp::Transmit) -> io::Result<()> {
+        let mut destination = transmit.destination;
+        destination.set_port(self.target_port());
+        self.inner.try_send(&quinn::udp::Transmit {
+            destination,
+            ecn: transmit.ecn,
+            contents: transmit.contents,
+            segment_size: transmit.segment_size,
+            src_ip: transmit.src_ip,
+        })
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut Context<'_>,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [quinn::udp::RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        match self.inner.poll_recv(cx, bufs, meta) {
+            Poll::Ready(Ok(count)) => {
+                for item in meta.iter_mut().take(count) {
+                    item.addr.set_port(self.canonical_port);
+                }
+                Poll::Ready(Ok(count))
+            }
+            other => other,
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    fn max_transmit_segments(&self) -> usize {
+        self.inner.max_transmit_segments()
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        self.inner.max_receive_segments()
+    }
+
+    fn may_fragment(&self) -> bool {
+        self.inner.may_fragment()
+    }
+}
+
 struct State<C> {
     /// Lazily created endpoint, tagged with its address family. Recreated when
     /// the family of the resolved server address changes.
     endpoint: Option<(bool, Endpoint)>,
+    /// Port-rewriting wrapper owned by the cached endpoint.
+    port_hop_socket: Option<Arc<PortHoppingSocket>>,
     conn: Option<(Connection, Arc<C>)>,
+    /// Stops the port-hop task associated with the cached connection.
+    port_hop_stop: Option<oneshot::Sender<()>>,
 }
 
 /// Per-server QUIC connection holder.
@@ -310,6 +512,8 @@ pub struct QuicClient<C> {
     /// run QUIC over a salamander-obfuscated socket; when unset the plain
     /// marked socket from [`client_endpoint`] is used.
     endpoint_factory: Option<Arc<dyn Fn(bool) -> io::Result<Endpoint> + Send + Sync>>,
+    /// Optional Hysteria2 UDP port-hopping transport.
+    port_hopping: Option<PortHopping>,
     state: Mutex<State<C>>,
 }
 
@@ -326,9 +530,12 @@ impl<C> QuicClient<C> {
             server_name: server_name.into(),
             config,
             endpoint_factory: None,
+            port_hopping: None,
             state: Mutex::new(State {
                 endpoint: None,
+                port_hop_socket: None,
                 conn: None,
+                port_hop_stop: None,
             }),
         }
     }
@@ -342,6 +549,31 @@ impl<C> QuicClient<C> {
     ) -> Self {
         self.endpoint_factory = Some(Arc::new(factory));
         self
+    }
+
+    /// Enable Hysteria2 UDP port hopping for this client.
+    ///
+    /// The factory builds the marked, optionally obfuscated UDP socket once.
+    /// Hopping only updates the surrounding [`PortHoppingSocket`]'s target
+    /// port; the endpoint and underlying socket remain unchanged.
+    pub fn with_port_hopping(
+        mut self,
+        config: PortHoppingConfig,
+        socket_factory: impl Fn(bool) -> io::Result<Arc<dyn AsyncUdpSocket>> + Send + Sync + 'static,
+    ) -> Self {
+        self.endpoint_factory = None;
+        self.port_hopping = Some(PortHopping {
+            hopper: Arc::new(PortHopper::new(&config)),
+            config,
+            socket_factory: Arc::new(socket_factory),
+        });
+        self
+    }
+
+    fn stop_port_hop_task(state: &mut State<C>) {
+        if let Some(stop) = state.port_hop_stop.take() {
+            let _ = stop.send(());
+        }
     }
 
     /// Return the shared connection (plus its protocol state), dialing and
@@ -365,6 +597,7 @@ impl<C> QuicClient<C> {
             return Ok((conn.clone(), Arc::clone(ctx)));
         }
         state.conn = None;
+        Self::stop_port_hop_task(&mut state);
 
         let host = format!("{}:{}", self.server_host, self.server_port);
         let addrs: Vec<SocketAddr> = crate::bootstrap::resolve(&self.server_host)
@@ -384,12 +617,28 @@ impl<C> QuicClient<C> {
             let endpoint = match &state.endpoint {
                 Some((family, ep)) if *family == ipv6 => ep.clone(),
                 _ => {
-                    let ep = match &self.endpoint_factory {
-                        Some(factory) => factory(ipv6),
-                        None => client_endpoint(ipv6),
-                    }
-                    .with_context(|| format!("create QUIC endpoint (ipv6={ipv6})"))?;
+                    let (ep, port_hop_socket) = if let Some(hopping) = &self.port_hopping {
+                        let target_port = hopping.hopper.initial_port();
+                        let inner = (hopping.socket_factory)(ipv6).with_context(|| {
+                            format!(
+                                "create Hysteria2 port-hop socket (ipv6={ipv6}, target_port={target_port})"
+                            )
+                        })?;
+                        let socket =
+                            Arc::new(PortHoppingSocket::new(inner, target_port, self.server_port));
+                        (client_endpoint_with_socket(socket.clone()), Some(socket))
+                    } else {
+                        (
+                            match &self.endpoint_factory {
+                                Some(factory) => factory(ipv6),
+                                None => client_endpoint(ipv6),
+                            },
+                            None,
+                        )
+                    };
+                    let ep = ep.with_context(|| format!("create QUIC endpoint (ipv6={ipv6})"))?;
                     state.endpoint = Some((ipv6, ep.clone()));
+                    state.port_hop_socket = port_hop_socket;
                     ep
                 }
             };
@@ -438,6 +687,16 @@ impl<C> QuicClient<C> {
         })?;
         let ctx = Arc::new(ctx);
         state.conn = Some((conn.clone(), Arc::clone(&ctx)));
+        if let Some(hopping) = &self.port_hopping {
+            let socket = state
+                .port_hop_socket
+                .as_ref()
+                .cloned()
+                .expect("port-hop socket is present after a successful connection");
+            let (stop, stop_rx) = oneshot::channel();
+            spawn_port_hop_task(socket, conn.clone(), hopping, stop_rx);
+            state.port_hop_stop = Some(stop);
+        }
         Ok((conn, ctx))
     }
 
@@ -450,7 +709,155 @@ impl<C> QuicClient<C> {
             && cached.stable_id() == conn.stable_id()
         {
             state.conn = None;
+            Self::stop_port_hop_task(&mut state);
         }
+    }
+}
+
+/// Drive a Hysteria2 QUIC port-hopping transport until its connection is
+/// closed or the owning [`QuicClient`] invalidates it.
+fn spawn_port_hop_task(
+    socket: Arc<PortHoppingSocket>,
+    conn: Connection,
+    hopping: &PortHopping,
+    stop_rx: oneshot::Receiver<()>,
+) {
+    let config = hopping.config.clone();
+    let hopper = Arc::clone(&hopping.hopper);
+    tokio::spawn(async move {
+        let mut stop_rx = stop_rx;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(config.next_interval()) => {}
+                _ = &mut stop_rx => return,
+                _ = conn.closed() => return,
+            }
+
+            let old_port = socket.target_port();
+            let target_port = hopper.next_port(old_port);
+            socket.set_target_port(target_port);
+            debug!(
+                old_port,
+                target_port, "Hysteria2 QUIC connection switched to a new target port"
+            );
+        }
+    });
+}
+
+#[cfg(test)]
+mod port_hopping_tests {
+    use std::future::poll_fn;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use super::*;
+
+    #[test]
+    fn port_hopper_always_selects_a_different_member() {
+        let config = PortHoppingConfig::fixed(vec![8443, 443, 10000], Duration::from_secs(5))
+            .expect("valid hop configuration");
+        let hopper = PortHopper::new(&config);
+        let mut current = hopper.initial_port();
+        for _ in 0..20 {
+            let new = hopper.next_port(current);
+            assert_ne!(current, new);
+            assert!(matches!(new, 443 | 8443 | 10000));
+            current = new;
+        }
+    }
+
+    #[tokio::test]
+    async fn port_hopping_socket_updates_target_without_rebinding() {
+        let first_peer = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind first peer");
+        let second_peer = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind second peer");
+        let raw = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind client");
+        raw.set_nonblocking(true).expect("make client nonblocking");
+        let runtime = quinn::default_runtime().expect("Tokio QUIC runtime");
+        let inner = runtime.wrap_udp_socket(raw).expect("wrap client socket");
+
+        let canonical_port = 443;
+        let socket = Arc::new(PortHoppingSocket::new(
+            inner,
+            first_peer.local_addr().expect("first peer address").port(),
+            canonical_port,
+        ));
+        let transmit = quinn::udp::Transmit {
+            destination: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), canonical_port),
+            ecn: None,
+            contents: b"outbound",
+            segment_size: None,
+            src_ip: None,
+        };
+        let mut poller = Arc::clone(&socket).create_io_poller();
+        loop {
+            match socket.try_send(&transmit) {
+                Ok(()) => break,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    poll_fn(|cx| poller.as_mut().poll_writable(cx))
+                        .await
+                        .expect("wait for client socket write readiness");
+                }
+                Err(e) => panic!("send rewritten packet: {e}"),
+            }
+        }
+
+        let mut outbound = [0u8; 64];
+        let (n, client_addr) = first_peer
+            .recv_from(&mut outbound)
+            .await
+            .expect("receive rewritten packet");
+        assert_eq!(&outbound[..n], b"outbound");
+        assert_eq!(client_addr, socket.local_addr().expect("client address"));
+
+        socket.set_target_port(
+            second_peer
+                .local_addr()
+                .expect("second peer address")
+                .port(),
+        );
+        let hopped = quinn::udp::Transmit {
+            contents: b"hopped",
+            ..transmit
+        };
+        loop {
+            match socket.try_send(&hopped) {
+                Ok(()) => break,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    poll_fn(|cx| poller.as_mut().poll_writable(cx))
+                        .await
+                        .expect("wait for client socket write readiness");
+                }
+                Err(e) => panic!("send packet after target-port update: {e}"),
+            }
+        }
+        let (n, hopped_client_addr) = second_peer
+            .recv_from(&mut outbound)
+            .await
+            .expect("receive packet after target-port update");
+        assert_eq!(&outbound[..n], b"hopped");
+        assert_eq!(hopped_client_addr, client_addr);
+        assert_eq!(socket.local_addr().expect("client address"), client_addr);
+
+        second_peer
+            .send_to(b"inbound", client_addr)
+            .await
+            .expect("send reply");
+        let mut inbound = [0u8; 64];
+        let mut bufs = [IoSliceMut::new(&mut inbound)];
+        let mut meta = [quinn::udp::RecvMeta::default()];
+        let count = poll_fn(|cx| socket.poll_recv(cx, &mut bufs, &mut meta))
+            .await
+            .expect("receive normalized packet");
+        let len = meta[0].len;
+        let addr = meta[0].addr;
+        drop(bufs);
+        assert_eq!(count, 1);
+        assert_eq!(&inbound[..len], b"inbound");
+        assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(addr.port(), canonical_port);
     }
 }
 

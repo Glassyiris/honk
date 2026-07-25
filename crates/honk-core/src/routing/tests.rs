@@ -162,6 +162,48 @@ fn test_ip_cidr_route() {
 }
 
 #[test]
+fn test_bare_ip_route_is_an_exact_host_match() {
+    let rules = vec![RoutingRule {
+        name: "exact-host".into(),
+        condition: RoutingCondition {
+            // dae's `dip(203.0.113.7)` syntax reaches the router as a bare
+            // address, not as an explicit `/32` CIDR.
+            ip: vec!["203.0.113.7".into()],
+            ..Default::default()
+        },
+        outbound: RoutingOutbound::Simple("proxy".into()),
+        priority: 0,
+        must: false,
+        mark: 0,
+    }];
+
+    let router = Router::new(&rules, "direct").unwrap();
+    let mut conn = make_conn(None, None);
+
+    conn.dst_ip = "203.0.113.7".parse().unwrap();
+    assert_eq!(router.route(&conn), "proxy");
+    conn.dst_ip = "203.0.113.8".parse().unwrap();
+    assert_eq!(router.route(&conn), "direct");
+
+    let ipv6_rule = RoutingRule {
+        name: "exact-v6-host".into(),
+        condition: RoutingCondition {
+            ip: vec!["2001:db8::7".into()],
+            ..Default::default()
+        },
+        outbound: RoutingOutbound::Simple("proxy".into()),
+        priority: 0,
+        must: false,
+        mark: 0,
+    };
+    let ipv6_router = Router::new(&[ipv6_rule], "direct").unwrap();
+    conn.dst_ip = "2001:db8::7".parse().unwrap();
+    assert_eq!(ipv6_router.route(&conn), "proxy");
+    conn.dst_ip = "2001:db8::8".parse().unwrap();
+    assert_eq!(ipv6_router.route(&conn), "direct");
+}
+
+#[test]
 fn test_port_route() {
     let rules = vec![RoutingRule {
         name: "web-traffic".into(),

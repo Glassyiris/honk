@@ -87,6 +87,7 @@ dae 语法中节点**只能以分享链接书写**：`tag: 'scheme://...'` 或�
 | `ws_path` / `ws_host` | string? | null | WebSocket；链接 `path` / `host` 参数 |
 | `grpc_service` | string? | null | gRPC service 名；链接 `serviceName` 参数 |
 | `hy2_auth` / `hy2_obfs` | string? | null | Hysteria2 认证 / salamander 混淆密码 |
+| `hy2_port_ranges` | `PortRange[]` | `[]` | 从 `host:端口,端口-端口` 解析出的端口跳跃集合 |
 | `hy2_up_mbps` / `hy2_down_mbps` | u32? | null | Hysteria2 brutal 带宽（`upmbps`/`downmbps`） |
 | `hy2_port_hopping` / `hy2_hop_interval` | string? / u64? | null | Hysteria2 端口跳跃（`mport`/`mhop`） |
 | `hy2_init_stream_recv_window` / `hy2_init_conn_recv_window` | u64? | null | Hysteria2 QUIC 接收窗口 |
@@ -118,7 +119,7 @@ dae 语法中节点**只能以分享链接书写**：`tag: 'scheme://...'` 或�
 | `vless` | | 是 | 否 | 头里的 UDP 仅测试存在 |
 | `socks5` | | 是 | 是 | UDP ASSOCIATE |
 | `http` | | 是* | — | 走类似 direct 的拨号 |
-| `hysteria2` | | 是 | 是 | 真实 QUIC/H3；salamander；brutal（配带宽时）或 BBR；端口跳跃 |
+| `hysteria2` | `hy2`, `hysteria` | 是 | 是 | 真实 QUIC/H3；salamander；brutal（配带宽时）或 BBR；端口跳跃 |
 | `tuic` | | 是 | 是 | TUIC v5 / quinn |
 | `juicity` | | 是 | 是 | quinn 双向流 UDP |
 | `anytls` | | 是 | 是 | 会话池 + UoT v2 |
@@ -181,6 +182,18 @@ node {
     hy2: 'hysteria2://secret@example.com:443?sni=example.com&insecure=1&obfs=salamander&obfs-password=obfspw&upmbps=50&downmbps=200&mport=20000-30000&mhop=30#hy2'
 }
 ```
+
+**Hysteria2 端口跳跃**
+
+Hy2 分享链接支持上游的多端口 authority 语法：单端口、端口范围，或逗号分隔的并集均可。
+
+```dae
+node {
+    hy2_hop: 'hy2://secret@example.com:443,8443,40000-50000/?sni=example.com&obfs=salamander&obfs-password=obfs#hy2_hop'
+}
+```
+
+当集合中至少有两个不同端口时，honk 会随机选择初始端口，之后每 30 秒只更新现有 UDP socket 的实际目标端口；本地 socket 和 QUIC endpoint 均保持不变。入站回复会在内部归一化，连接不会因服务端端口变化而中断。列出的全部端口必须指向同一台 Hysteria2 服务端并使用相同凭据；只有一个端口时保持普通的非跳跃行为。
 
 ### 分享链接 scheme
 

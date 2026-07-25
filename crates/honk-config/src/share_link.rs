@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use base64::Engine as _;
 
 use crate::error::ConfigError;
-use crate::node::Node;
+use crate::node::{Node, PortRange};
 use crate::types::NodeProtocol;
 
 impl Node {
@@ -63,6 +63,19 @@ impl Node {
             None => first,
         };
 
+        // Hysteria2 extends the URI authority with a comma-separated port
+        // union (for example `:443,8443,40000-50000`). `url::Url` correctly
+        // rejects that non-standard port syntax, so normalize it to one
+        // representative port for ordinary URL parsing while retaining the
+        // full union on the Node for the QUIC port-hopper.
+        let mut normalized_hy2 = None;
+        let mut hy2_port_ranges = Vec::new();
+        if let Some((normalized, ranges)) = normalize_hysteria2_port_hopping_uri(first)? {
+            normalized_hy2 = Some(normalized);
+            hy2_port_ranges = ranges;
+        }
+        let first = normalized_hy2.as_deref().unwrap_or(first);
+
         let url = url::Url::parse(first)
             .map_err(|e| ConfigError::Parse(format!("invalid share link '{}': {}", first, e)))?;
         let scheme = url.scheme();
@@ -75,7 +88,7 @@ impl Node {
             "anytls" => NodeProtocol::AnyTLS,
             "vmess" => NodeProtocol::VMess,
             "vless" => NodeProtocol::VLess,
-            "hysteria2" | "hysteria" => NodeProtocol::Hysteria2,
+            "hysteria2" | "hysteria" | "hy2" => NodeProtocol::Hysteria2,
             "tuic" => NodeProtocol::Tuic,
             "juicity" => NodeProtocol::Juicity,
             "http" | "https" => NodeProtocol::HTTP,
@@ -97,6 +110,7 @@ impl Node {
             host: host.clone(),
             address: format!("{}:{}", host, port),
             port,
+            hy2_port_ranges,
             ..Default::default()
         };
 
@@ -112,6 +126,19 @@ impl Node {
             }
             if let Some(pw) = url.password() {
                 node.password = Some(percent_decode_str(pw));
+            }
+
+            // Hysteria2 puts `auth` in the URI userinfo. Unlike Trojan-like
+            // links, it may deliberately be a `username:password` pair, so
+            // preserve both components as one protocol-level auth value.
+            if protocol == NodeProtocol::Hysteria2 && !url.username().is_empty() {
+                let username = percent_decode_str(url.username());
+                node.hy2_auth = Some(match url.password() {
+                    Some(password) => {
+                        format!("{}:{}", username, percent_decode_str(password))
+                    }
+                    None => username,
+                });
             }
 
             // Trojan, Trojan-Go and AnyTLS put the authentication secret in the
@@ -302,8 +329,151 @@ impl Node {
             }
         }
 
+        if protocol == NodeProtocol::Hysteria2
+            && query
+                .get("obfs")
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("salamander"))
+            && let Some(password) = query
+                .get("obfs-password")
+                .filter(|password| !password.is_empty())
+        {
+            node.hy2_obfs = Some(password.clone());
+        }
+
         Ok(node)
     }
+}
+
+/// Normalize Hysteria2's non-standard multi-port URI authority before it is
+/// handed to `url::Url`. The original port union is returned separately so
+/// the caller can retain it for actual QUIC hopping.
+fn normalize_hysteria2_port_hopping_uri(
+    link: &str,
+) -> Result<Option<(String, Vec<PortRange>)>, ConfigError> {
+    let Some((scheme, after_scheme)) = link.split_once("://") else {
+        return Ok(None);
+    };
+    if !matches!(
+        scheme.to_ascii_lowercase().as_str(),
+        "hysteria2" | "hysteria" | "hy2"
+    ) {
+        return Ok(None);
+    }
+
+    let authority_end = after_scheme
+        .char_indices()
+        .find_map(|(idx, ch)| matches!(ch, '/' | '?' | '#').then_some(idx))
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+    let suffix = &after_scheme[authority_end..];
+    let (userinfo, host_port) = match authority.rsplit_once('@') {
+        Some((userinfo, host_port)) => (format!("{userinfo}@"), host_port),
+        None => (String::new(), authority),
+    };
+    let Some((host, port_spec)) = split_hysteria2_host_port(host_port)? else {
+        // Keep the generic parser's normal `:443` fallback for an ordinary
+        // Hysteria2 URI that omits a port altogether.
+        return Ok(None);
+    };
+
+    if !port_spec.contains(',') && !port_spec.contains('-') {
+        return Ok(None);
+    }
+
+    let ranges = parse_hysteria2_port_union(port_spec)?;
+    let representative = ranges
+        .first()
+        .expect("validated Hysteria2 port union is non-empty")
+        .start;
+    Ok(Some((
+        format!("{scheme}://{userinfo}{host}:{representative}{suffix}"),
+        ranges,
+    )))
+}
+
+/// Split a Hysteria2 URI authority into the host (including IPv6 brackets)
+/// and an optional port expression.
+///
+/// A normal URI may omit its port and rely on the Hysteria2 default of 443;
+/// only a port expression containing a union needs special normalization.
+fn split_hysteria2_host_port(authority: &str) -> Result<Option<(&str, &str)>, ConfigError> {
+    let (host, port) = if authority.starts_with('[') {
+        let close = authority.find(']').ok_or_else(|| {
+            ConfigError::Parse("invalid Hysteria2 URI: unterminated IPv6 host".into())
+        })?;
+        let host = &authority[..=close];
+        let suffix = &authority[close + 1..];
+        if suffix.is_empty() {
+            return Ok(None);
+        }
+        let port = suffix.strip_prefix(':').ok_or_else(|| {
+            ConfigError::Parse("invalid Hysteria2 URI: invalid text after IPv6 host".into())
+        })?;
+        (host, port)
+    } else {
+        match authority.rsplit_once(':') {
+            Some(parts) => parts,
+            None => return Ok(None),
+        }
+    };
+    if host.is_empty() || port.is_empty() {
+        return Err(ConfigError::Parse(
+            "invalid Hysteria2 URI: empty host or port".into(),
+        ));
+    }
+    Ok(Some((host, port)))
+}
+
+/// Parse Hysteria2's comma-separated union of individual ports and inclusive
+/// port ranges. Port zero is invalid for an outbound UDP peer.
+fn parse_hysteria2_port_union(port_spec: &str) -> Result<Vec<PortRange>, ConfigError> {
+    fn parse_port(raw: &str, port_spec: &str) -> Result<u16, ConfigError> {
+        let port = raw.trim().parse::<u16>().map_err(|_| {
+            ConfigError::Parse(format!("invalid Hysteria2 port union '{port_spec}'"))
+        })?;
+        if port == 0 {
+            return Err(ConfigError::Parse(format!(
+                "invalid Hysteria2 port union '{port_spec}': port 0 is not allowed"
+            )));
+        }
+        Ok(port)
+    }
+
+    let mut ranges = Vec::new();
+    for raw_item in port_spec.split(',') {
+        let item = raw_item.trim();
+        if item.is_empty() {
+            return Err(ConfigError::Parse(format!(
+                "invalid Hysteria2 port union '{port_spec}'"
+            )));
+        }
+        let range = match item.split_once('-') {
+            Some((start, end)) if !end.contains('-') => {
+                let start = parse_port(start, port_spec)?;
+                let end = parse_port(end, port_spec)?;
+                if start > end {
+                    return Err(ConfigError::Parse(format!(
+                        "invalid Hysteria2 port range '{item}': start exceeds end"
+                    )));
+                }
+                PortRange { start, end }
+            }
+            Some(_) => {
+                return Err(ConfigError::Parse(format!(
+                    "invalid Hysteria2 port range '{item}'"
+                )));
+            }
+            None => {
+                let port = parse_port(item, port_spec)?;
+                PortRange {
+                    start: port,
+                    end: port,
+                }
+            }
+        };
+        ranges.push(range);
+    }
+    Ok(ranges)
 }
 
 /// Parse a `vmess://` share link: base64 of a JSON object (v2rayN schema).
@@ -685,4 +855,94 @@ fn hex_to_byte(h: u8, l: u8) -> Result<u8, ()> {
     let hi = hex_val(h).ok_or(())?;
     let lo = hex_val(l).ok_or(())?;
     Ok(hi << 4 | lo)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_hysteria2_port_range_and_obfuscation() {
+        let node = Node::from_share_link(
+            "hysteria2://secret@[2001:db8::1]:40000-40002/?sni=example.com&obfs=salamander&obfs-password=obfs",
+        )
+        .expect("valid Hysteria2 port-hopping URI");
+
+        assert_eq!(node.protocol, NodeProtocol::Hysteria2);
+        assert_eq!(node.host, "[2001:db8::1]");
+        assert_eq!(node.port, 40000);
+        assert_eq!(node.hy2_auth.as_deref(), Some("secret"));
+        assert_eq!(node.hy2_obfs.as_deref(), Some("obfs"));
+        assert_eq!(node.sni.as_deref(), Some("example.com"));
+        assert_eq!(
+            node.hy2_port_ranges,
+            vec![PortRange {
+                start: 40000,
+                end: 40002,
+            }]
+        );
+        assert_eq!(node.hy2_port_hopping_ports(), vec![40000, 40001, 40002]);
+    }
+
+    #[test]
+    fn parses_hy2_port_union_and_auth_pair() {
+        let node =
+            Node::from_share_link("hy2://user:pass@example.com:443,8443,10000-10002/?insecure=1")
+                .expect("valid HY2 port union URI");
+
+        assert_eq!(node.protocol, NodeProtocol::Hysteria2);
+        assert_eq!(node.port, 443);
+        assert_eq!(node.hy2_auth.as_deref(), Some("user:pass"));
+        assert!(node.skip_cert_verify);
+        assert_eq!(
+            node.hy2_port_hopping_ports(),
+            vec![443, 8443, 10000, 10001, 10002]
+        );
+    }
+
+    #[test]
+    fn hysteria2_single_or_missing_port_remains_a_normal_uri() {
+        let single = Node::from_share_link("hysteria2://secret@example.com:443/?sni=example.com")
+            .expect("single-port URI remains supported");
+        assert!(single.hy2_port_ranges.is_empty());
+        assert_eq!(single.port, 443);
+
+        let implicit = Node::from_share_link("hysteria2://secret@example.com/?sni=example.com")
+            .expect("implicit default port remains supported");
+        assert!(implicit.hy2_port_ranges.is_empty());
+        assert_eq!(implicit.port, 443);
+    }
+
+    #[test]
+    fn rejects_invalid_hysteria2_port_union() {
+        for link in [
+            "hysteria2://secret@example.com:40002-40000/",
+            "hysteria2://secret@example.com:0,443/",
+            "hysteria2://secret@example.com:443,,8443/",
+            "hysteria2://secret@example.com:443-444-445/",
+        ] {
+            assert!(Node::from_share_link(link).is_err(), "{link}");
+        }
+    }
+
+    #[test]
+    fn serializes_hysteria2_port_ranges_in_toml_node_tables() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct NodeList {
+            nodes: Vec<Node>,
+        }
+
+        let source = Node::from_share_link("hy2://secret@example.com:443,8443,10000-10001/")
+            .expect("valid Hysteria2 port union");
+        let text = toml::to_string(&NodeList {
+            nodes: vec![source.clone()],
+        })
+        .expect("serialize node table");
+        assert!(text.contains("hy2_port_ranges"));
+        let restored: NodeList = toml::from_str(&text).expect("deserialize node table");
+        assert_eq!(
+            restored.nodes[0].hy2_port_hopping_ports(),
+            source.hy2_port_hopping_ports()
+        );
+    }
 }

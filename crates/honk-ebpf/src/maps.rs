@@ -67,8 +67,12 @@ pub static REDIRECT_TRACK: HashMap<RedirectTuple, RedirectEntry, 65536, 1> = Has
 #[btf_map]
 /// Plain hash with BPF_F_NO_PREALLOC: swept by the userspace janitor (30 s
 /// timeout).
-pub static ROUTING_HANDOFF_MAP: HashMap<TuplesKey, RoutingHandoffEntry, MAX_ROUTING_HANDOFF_NUM, 1> =
-    HashMap::new();
+pub static ROUTING_HANDOFF_MAP: HashMap<
+    TuplesKey,
+    RoutingHandoffEntry,
+    MAX_ROUTING_HANDOFF_NUM,
+    1,
+> = HashMap::new();
 
 #[btf_map]
 pub static ROUTING_MAP: Array<MatchSet, MAX_MATCH_SET_LEN, 0> = Array::new();

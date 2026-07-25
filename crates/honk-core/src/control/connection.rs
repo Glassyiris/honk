@@ -379,9 +379,9 @@ impl ControlPlaneHandle {
         // mode takes the handoff decision as-is.
         let reroute_by_sniffed_domain = !matches!(dial_mode, DialMode::Ip)
             && domain.is_some()
-            && handoff.as_ref().is_some_and(|ho| {
-                ho.must == 0 && ho.outbound != OutboundIndex::Block as u8
-            });
+            && handoff
+                .as_ref()
+                .is_some_and(|ho| ho.must == 0 && ho.outbound != OutboundIndex::Block as u8);
         let (outbound_name, must) = if let Some(ref ho) = handoff {
             debug!(
                 "eBPF handoff: outbound={}, mark=0x{:x}, dscp={}",

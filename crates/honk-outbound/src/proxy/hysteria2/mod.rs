@@ -64,7 +64,7 @@ use tokio::io::ReadBuf;
 use tokio::sync::mpsc;
 use tracing::debug;
 
-use crate::quic::{QuicBiStream, QuicClient};
+use crate::quic::{PortHoppingConfig, QuicBiStream, QuicClient};
 
 use super::{ProxyHandler, ProxyStream, UdpProxySocket};
 
@@ -97,6 +97,8 @@ const TCP_PADDING_MAX: usize = 512;
 
 /// QUIC keep-alive (`hysteria/protocol.go:21`).
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
+/// Hysteria2's documented default UDP port-hop interval.
+const PORT_HOP_INTERVAL: Duration = Duration::from_secs(30);
 /// Close the shared QUIC connection after this long without open streams.
 const CONN_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Tear down a UDP session bridge after this long without traffic.
@@ -663,30 +665,41 @@ impl Hysteria2Handler {
         let obfs = node.hy2_obfs.as_deref().filter(|s| !s.is_empty());
         // Receive bandwidth for the auth header, bits/s (0 = unset).
         let rx_bps = u64::from(node.hy2_down_mbps.unwrap_or(0)) * 1_000_000;
-        // Port hopping (`mport`/`mhop`): destination port rotates among the
-        // list every interval (default 30s, official client parity).
-        let hop = node
-            .hy2_port_hopping
-            .as_deref()
-            .and_then(parse_port_hopping)
-            .map(|ports| {
-                (
-                    ports,
-                    Duration::from_secs(node.hy2_hop_interval.unwrap_or(30).max(1)),
-                )
-            });
+        // Both accepted Hysteria2 syntaxes describe the same hop set: the
+        // multi-port URI authority (`:443,8443,40000-50000`) and `mport`.
+        // Combine them so a subscription using either spelling keeps the
+        // stable-socket port-hopping path below.
+        let mut hop_ports = node.hy2_port_hopping_ports();
+        if let Some(spec) = node.hy2_port_hopping.as_deref().filter(|s| !s.is_empty()) {
+            let mut parsed = parse_port_hopping(spec)
+                .ok_or_else(|| anyhow!("invalid Hysteria2 mport value: {spec}"))?;
+            hop_ports.append(&mut parsed);
+        }
+        hop_ports.sort_unstable();
+        hop_ports.dedup();
+        let hop_interval =
+            Duration::from_secs(node.hy2_hop_interval.unwrap_or(PORT_HOP_INTERVAL.as_secs()));
+        let hop_key = hop_ports
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
         let key = format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
             node.host(),
             node.port,
             password,
             node.sni.as_deref().unwrap_or(""),
             node.skip_cert_verify,
             obfs.unwrap_or(""),
+            hop_key,
+            hop_interval.as_secs(),
             node.hy2_up_mbps.unwrap_or(0),
             rx_bps,
-            node.hy2_port_hopping.as_deref().unwrap_or(""),
-            node.hy2_hop_interval.unwrap_or(0),
+            node.hy2_init_stream_recv_window.unwrap_or(0),
+            node.hy2_init_conn_recv_window.unwrap_or(0),
+            node.hy2_disable_mtu_discovery.unwrap_or(false),
+            node.tls_pin_sha256.as_deref().unwrap_or(""),
         );
         if let Some(client) = CLIENTS.lock().get(&key) {
             return Ok(Arc::clone(client));
@@ -717,12 +730,31 @@ impl Hysteria2Handler {
         )
         .await?;
         let quic = QuicClient::new(node.host().to_string(), node.port, server_name, config);
-        let quic = match (obfs, hop) {
-            (None, None) => quic,
-            (obfs, hop) => quic.with_endpoint_factory(hy2_endpoint_factory(
-                obfs.map(|p| Arc::from(p.as_bytes())),
-                hop,
-            )),
+        let quic = if hop_ports.len() > 1 {
+            let port_hopping = PortHoppingConfig::fixed(hop_ports, hop_interval)
+                .context("invalid Hysteria2 port-hopping configuration")?;
+            let obfs_password = obfs.map(|value| Arc::<[u8]>::from(value.as_bytes()));
+            quic.with_port_hopping(
+                port_hopping,
+                move |ipv6| -> std::io::Result<Arc<dyn AsyncUdpSocket>> {
+                    match &obfs_password {
+                        Some(password) => Ok(Arc::new(Hy2UdpSocket::new(
+                            ipv6,
+                            Some(Arc::clone(password)),
+                            None,
+                        )?)),
+                        None => crate::quic::marked_async_udp_socket(ipv6),
+                    }
+                },
+            )
+        } else {
+            match obfs {
+                Some(obfs_password) => quic.with_endpoint_factory(hy2_endpoint_factory(
+                    Some(Arc::from(obfs_password.as_bytes())),
+                    None,
+                )),
+                None => quic,
+            }
         };
         let client = Arc::new(Hy2Client {
             quic,

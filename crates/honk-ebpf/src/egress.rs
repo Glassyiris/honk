@@ -37,7 +37,7 @@ use crate::{
     },
     route::{OUTBOUND_BLOCK, OUTBOUND_DIRECT},
     transport::{
-        ETH_HLEN, ETH_P_IP, IPPROTO_ICMPV6, IPPROTO_TCP, IPPROTO_UDP, parse_packet,
+        ETH_HLEN, ETH_P_IP, ETH_P_IPV6, IPPROTO_ICMPV6, IPPROTO_TCP, IPPROTO_UDP, parse_packet,
         tcp_listener_l4proto,
     },
 };
@@ -537,6 +537,12 @@ fn do_tproxy_wan_egress_tcp(
     }
 
     // Set cb marks for dae0peer_ingress.
+    // `skb->cb` is scratch storage and is not preserved consistently when a
+    // packet crosses the dae0 veth pair.  Mirror the listener protocol in
+    // the low byte of skb->mark (the same encoding used by lan_ingress) so
+    // dae0peer_ingress can still assign the TPROXY listener after the veth
+    // handoff.
+    ctx.set_mark(TPROXY_MARK | (tcp_listener_l4proto(tcph) as u32));
     unsafe {
         (*ctx.skb.skb).cb[0] = TPROXY_MARK;
         (*ctx.skb.skb).cb[1] = tcp_listener_l4proto(tcph) as u32;
@@ -595,6 +601,9 @@ fn fast_path_decision(
         return Err(TC_ACT_OK);
     }
 
+    // See the TCP path above: preserve the listener type in skb->mark as
+    // well as cb[] because veth delivery may clear the control buffer.
+    ctx.set_mark(TPROXY_MARK | (IPPROTO_UDP as u32));
     unsafe {
         (*ctx.skb.skb).cb[0] = TPROXY_MARK;
         (*ctx.skb.skb).cb[1] = IPPROTO_UDP as u32;
@@ -867,6 +876,49 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     }
 }
 
+/// Choose the actual header layout of a locally-originated WAN packet.
+///
+/// `ARPHRD_ETHER` is normally a good attachment-time predictor, but it is
+/// not an invariant: some drivers expose a packet before the Ethernet header
+/// is pushed, while others expose the fully-framed skb.  Parsing with the
+/// wrong offset fails open, silently bypassing the transparent proxy.  Probe
+/// both the EtherType at byte 12 and the matching IP version at byte 14 so
+/// an L3 packet cannot be mistaken for Ethernet merely because payload bytes
+/// happen to resemble an EtherType.
+#[inline(always)]
+fn wan_egress_link_h_len(ctx: &TcContext, fallback_link_h_len: u32) -> u32 {
+    let skb = ctx.skb.skb as *mut _;
+    let mut ether_type: u16 = 0;
+    let ether_type_ok = unsafe {
+        bpf_skb_load_bytes(
+            skb,
+            12,
+            &mut ether_type as *mut u16 as *mut _,
+            mem::size_of::<u16>() as u32,
+        )
+    } == 0;
+
+    if ether_type_ok && (ether_type == ETH_P_IP.to_be() || ether_type == ETH_P_IPV6.to_be()) {
+        let expected_version = if ether_type == ETH_P_IP.to_be() { 4 } else { 6 };
+        let mut l2_ip_version = 0u8;
+        let version_ok = unsafe {
+            bpf_skb_load_bytes(skb, ETH_HLEN, &mut l2_ip_version as *mut u8 as *mut _, 1)
+        } == 0;
+        if version_ok && l2_ip_version >> 4 == expected_version {
+            return ETH_HLEN;
+        }
+    }
+
+    let mut l3_ip_version = 0u8;
+    let version_ok =
+        unsafe { bpf_skb_load_bytes(skb, 0, &mut l3_ip_version as *mut u8 as *mut _, 1) } == 0;
+    if version_ok && matches!(l3_ip_version >> 4, 4 | 6) {
+        return 0;
+    }
+
+    fallback_link_h_len
+}
+
 // TC entry points use raw __sk_buff pointer for verifier compatibility.
 
 #[unsafe(no_mangle)]
@@ -884,11 +936,16 @@ pub fn lan_egress_l3(ctx: *mut __sk_buff) -> i32 {
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn wan_egress_l2(ctx: *mut __sk_buff) -> i32 {
-    flatten(do_tproxy_wan_egress(&TcContext::new(ctx), 14))
+    let ctx = TcContext::new(ctx);
+    flatten(do_tproxy_wan_egress(
+        &ctx,
+        wan_egress_link_h_len(&ctx, ETH_HLEN),
+    ))
 }
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn wan_egress_l3(ctx: *mut __sk_buff) -> i32 {
-    flatten(do_tproxy_wan_egress(&TcContext::new(ctx), 0))
+    let ctx = TcContext::new(ctx);
+    flatten(do_tproxy_wan_egress(&ctx, wan_egress_link_h_len(&ctx, 0)))
 }

@@ -754,9 +754,7 @@ fn e2e_node() -> Option<Node> {
         hy2_hop_interval: std::env::var("HONK_HY2_MHOP")
             .ok()
             .and_then(|v| v.parse().ok()),
-        tls_pin_sha256: std::env::var("HONK_HY2_PIN")
-            .ok()
-            .filter(|s| !s.is_empty()),
+        tls_pin_sha256: std::env::var("HONK_HY2_PIN").ok().filter(|s| !s.is_empty()),
         hy2_init_stream_recv_window: std::env::var("HONK_HY2_STREAM_RWND")
             .ok()
             .and_then(|v| v.parse().ok()),

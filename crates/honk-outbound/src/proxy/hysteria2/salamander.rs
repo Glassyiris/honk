@@ -153,7 +153,7 @@ pub(super) struct Hy2UdpSocket {
 }
 
 impl Hy2UdpSocket {
-    fn new(
+    pub(super) fn new(
         ipv6: bool,
         obfs: Option<Arc<[u8]>>,
         hop: Option<(Vec<u16>, Duration)>,

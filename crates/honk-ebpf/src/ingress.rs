@@ -14,6 +14,7 @@ use core::{
 
 use crate::{
     action::{TC_ACT_OK, TC_ACT_PIPE, TC_ACT_SHOT, Verdict, flatten},
+    event::send_dae_event,
     log_shim::*,
     maps::LISTEN_SOCKET_MAP,
     transport::ParsedPacket,
@@ -25,15 +26,15 @@ use aya_ebpf_bindings::{
         bpf_sock_tuple__bindgen_ty_1__bindgen_ty_2,
     },
     helpers::{
-        bpf_ktime_get_ns, bpf_redirect, bpf_redirect_peer, bpf_skb_load_bytes,
-        bpf_skb_store_bytes,
+        bpf_ktime_get_ns, bpf_redirect, bpf_redirect_peer, bpf_skb_load_bytes, bpf_skb_store_bytes,
     },
 };
 use honk_ebpf_common::{
+    RedirectEntry, RedirectTuple, RoutingMeta, TPROXY_MARK,
     conn::ConnState,
     dae_ip::In6Addr,
+    event::DaeEventType,
     redirect_need::{RoutingHandoffEntry, TuplesKey},
-    RedirectEntry, RedirectTuple, RoutingMeta, TPROXY_MARK,
 };
 use network_types::{
     eth::EthHdr,
@@ -42,12 +43,12 @@ use network_types::{
 
 use crate::{
     maps::{
-        OUTBOUND_CONNECTIVITY_MAP, PARAM, PKT_SCRATCH_KEY, REDIRECT_TRACK, ROUTE_CTX_SCRATCH_MAP,
-        ROUTING_HANDOFF_MAP, ROUTING_META_MAP,
+        CONN_STATE_MAP, OUTBOUND_CONNECTIVITY_MAP, PARAM, PKT_SCRATCH_KEY, REDIRECT_TRACK,
+        ROUTE_CTX_SCRATCH_MAP, ROUTING_HANDOFF_MAP, ROUTING_META_MAP,
     },
-    route::{RouteCtx, OUTBOUND_BLOCK, OUTBOUND_DIRECT},
+    route::{OUTBOUND_BLOCK, OUTBOUND_DIRECT, RouteCtx},
     sk,
-    transport::{parse_packet, ETH_HLEN, ETH_P_IP, ETH_P_IPV6, IPPROTO_TCP, IPPROTO_UDP},
+    transport::{ETH_HLEN, ETH_P_IP, ETH_P_IPV6, IPPROTO_TCP, IPPROTO_UDP, parse_packet},
 };
 
 const IPV6_BYTE_LENGTH: usize = 16;
@@ -956,23 +957,64 @@ fn do_tproxy_wan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
 }
 
 // #[inline(never)]: standalone program, no deep call chain.
+/// Recover the listener protocol when veth delivery has cleared both
+/// `skb->cb` and `skb->mark`.
+///
+/// The host-side ingress/egress programs record every redirected flow in
+/// `CONN_STATE_MAP` before sending it to dae0.  This gives the dedicated
+/// dae0peer ingress hook a durable, per-flow proof that the packet belongs to
+/// honk, without accepting unrelated traffic injected into the namespace.
+#[inline(always)]
+fn recover_dae0peer_listener_l4proto(ctx: &TcContext) -> Option<u8> {
+    let scratch_key: u32 = 0;
+    let pkt = match PKT_SCRATCH_KEY.get_ptr_mut(scratch_key) {
+        Some(ptr) => unsafe { &mut *ptr },
+        None => return None,
+    };
+
+    if parse_packet(ctx, ETH_HLEN, pkt) != 0 {
+        return None;
+    }
+
+    let state = CONN_STATE_MAP.get_ptr_mut(pkt.tuples.five)?;
+    let has_routing = ((unsafe { (*state).meta.raw } >> 56) & 1) != 0;
+    has_routing.then_some(pkt.listener_l4proto)
+}
+
+// #[inline(never)]: standalone program, no deep call chain.
 #[inline(never)]
 fn do_tproxy_dae0peer_ingress(ctx: &TcContext) -> Verdict {
-    // Only packets redirected from wan_egress or lan_ingress carry this cb
-    // mark.  Other traffic (e.g. replies to locally-generated proxy outbound
-    // connections) must be passed through so the daens IP stack can deliver it
-    // to the correct local socket.
+    // Only packets redirected from wan_egress or lan_ingress carry the
+    // TPROXY marker. `skb->cb` is scratch storage and can be cleared when a
+    // packet crosses the dae0 veth pair, so the redirect path mirrors the
+    // marker and listener L4 protocol in skb->mark as a durable fallback.
+    // Other traffic (e.g. replies to locally-generated proxy outbound
+    // connections) must be dropped here rather than accidentally assigned to
+    // the transparent listener.
     let cb0 = unsafe { (*ctx.skb.skb).cb[0] };
-    if cb0 != TPROXY_MARK {
-        return Err(TC_ACT_SHOT);
-    }
+    let packet_mark = unsafe { (*ctx.skb.skb).mark };
+    let mark_is_tproxy = (packet_mark & TPROXY_MARK) == TPROXY_MARK;
 
     // listener_l4proto is stored in cb[1] only when the control-plane handoff
     // needs an explicit listener assignment (UDP or TCP SYN, including first
-    // fragments that still expose those headers).  Established TCP can return
-    // to the stack without bpf_sk_assign; the kernel will find the child
-    // socket via normal socket lookup.
-    let listener_l4proto = (unsafe { (*ctx.skb.skb).cb[1] }) as u8;
+    // fragments that still expose those headers). If cb[] was cleared by the
+    // veth handoff, recover it from the low byte of skb->mark. Established TCP
+    // has a zero protocol marker and can return to the stack without
+    // bpf_sk_assign; the kernel will find the child socket via normal socket
+    // lookup.
+    let listener_l4proto = if cb0 == TPROXY_MARK || mark_is_tproxy {
+        let listener_l4proto = (unsafe { (*ctx.skb.skb).cb[1] }) as u8;
+        if listener_l4proto != 0 {
+            listener_l4proto
+        } else {
+            packet_mark as u8
+        }
+    } else {
+        match recover_dae0peer_listener_l4proto(ctx) {
+            Some(listener_l4proto) => listener_l4proto,
+            None => return Err(TC_ACT_SHOT),
+        }
+    };
     ctx.set_mark(TPROXY_MARK);
     // Force the packet type to HOST so the IP stack accepts it and returns
     // it to the stack, letting the netfilter PREROUTING TPROXY rule (or the
@@ -982,7 +1024,22 @@ fn do_tproxy_dae0peer_ingress(ctx: &TcContext) -> Verdict {
     // creating proper child sockets for intercepted TCP flows.
     let _ = ctx.change_type(0);
     if listener_l4proto != 0 {
-        let _ = assign_listener(ctx, listener_l4proto);
+        if let Err(errno) = assign_listener(ctx, listener_l4proto) {
+            // Do not silently turn a broken listener handoff into a timeout.
+            // `DaeEvent` has no dedicated errno field; for this event type its
+            // `pid` field carries the positive errno instead.
+            let _ = send_dae_event(
+                DaeEventType::TproxyAssignFailure as u32,
+                errno.wrapping_neg() as u32,
+                None,
+                0,
+                listener_l4proto,
+                None,
+                None,
+                0,
+                0,
+            );
+        }
     }
 
     Ok(TC_ACT_OK)
@@ -1010,17 +1067,9 @@ fn assign_listener(ctx: &TcContext, listener_l4proto: u8) -> Result<(), c_long> 
     // listeners published by userspace.
     let is_v6 = unsafe { (*ctx.skb.skb).protocol as u16 } == ETH_P_IPV6.to_be();
     let key = if listener_l4proto == IPPROTO_TCP as u8 {
-        if is_v6 {
-            KEY_TCP6
-        } else {
-            KEY_TCP4
-        }
+        if is_v6 { KEY_TCP6 } else { KEY_TCP4 }
     } else {
-        if is_v6 {
-            KEY_UDP6
-        } else {
-            KEY_UDP4
-        }
+        if is_v6 { KEY_UDP6 } else { KEY_UDP4 }
     };
 
     let map_ptr = ptr::from_ref(&LISTEN_SOCKET_MAP).cast::<c_void>();

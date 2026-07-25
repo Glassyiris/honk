@@ -154,9 +154,11 @@ experimental {
 
 节点在 `node { }` 中以**分享链接**声明，格式为 `tag: 'scheme://...'`（tag 即节点名）。
 
-解析支持的 scheme：`ss://`、`ssr://`、`socks5://`、`trojan://`、`trojan-go://`、`vmess://`、`vless://`、`hysteria2://`、`tuic://`、`juicity://`、`anytls://`、`http://`、`https://`。
+解析支持的 scheme：`ss://`、`ssr://`、`socks5://`、`trojan://`、`trojan-go://`、`vmess://`、`vless://`、`hysteria2://` / `hy2://`、`tuic://`、`juicity://`、`anytls://`、`http://`、`https://`。
 
 分享链接中的参数会映射到 `Node` 字段：`name`、`protocol`、`address`/`host`、`port`、`password`/`username`、`encryption`、`tls`、`sni`、`transport`、`ws_path`、`ws_host`、`grpc_service`、`mux`，以及 Hy2/TUIC/Juicity/AnyTLS 专用字段。
+
+Hysteria2 的 authority 可携带端口跳跃并集，例如 `:443,8443,40000-50000`；honk 会保留该集合，并在其中至少有两个端口时启用 QUIC 端口跳跃。30 秒的切换行为见 [components.zh.md](./components.zh.md#协议提示)。
 
 完整字段表与协议注意点（含 UDP 支持矩阵）见 [components.zh.md](./components.zh.md)。
 

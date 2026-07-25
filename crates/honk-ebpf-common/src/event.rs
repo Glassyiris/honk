@@ -5,6 +5,9 @@ pub enum DaeEventType {
     Blocked = 0,         // DAE_EVENT_BLOCKED
     UdpConnOverflow = 1, // DAE_EVENT_UDP_CONN_OVERFLOW
     TcpConnOverflow = 2, // DAE_EVENT_TCP_CONN_OVERFLOW
+    /// A TC ingress packet could not be assigned to the transparent
+    /// listener. For this event only, [`DaeEvent::pid`] carries `-errno`.
+    TproxyAssignFailure = 3,
 }
 
 // Matches the C struct dae_event.

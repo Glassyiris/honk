@@ -29,6 +29,25 @@ where
 
 use crate::types::NodeProtocol;
 
+/// An inclusive UDP port range.
+///
+/// Hysteria2 accepts a comma-separated union of individual ports and port
+/// ranges in its URI authority (for example `:443,8443,40000-50000`).  Keep
+/// the compact representation in configuration and expand it only when the
+/// QUIC client needs to choose a hop target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortRange {
+    pub start: u16,
+    pub end: u16,
+}
+
+impl PortRange {
+    /// Iterate over every port in this inclusive range.
+    pub fn ports(self) -> std::ops::RangeInclusive<u16> {
+        self.start..=self.end
+    }
+}
+
 /// A proxy node definition.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Node {
@@ -90,6 +109,10 @@ pub struct Node {
     /// Hysteria2 authentication
     #[serde(default)]
     pub hy2_auth: Option<String>,
+    /// Hysteria2 remote UDP port union used for QUIC port hopping. Empty
+    /// means the regular single [`Self::port`] endpoint.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hy2_port_ranges: Vec<PortRange>,
     /// Hysteria2 obfuscation
     #[serde(default)]
     pub hy2_obfs: Option<String>,
@@ -188,6 +211,22 @@ impl Node {
         } else {
             &self.host
         }
+    }
+
+    /// Expand and de-duplicate configured Hysteria2 hop ranges.
+    ///
+    /// This is intentionally only used by the Hysteria2 outbound. Other
+    /// protocols continue to use the stable, single [`Self::port`] field.
+    pub fn hy2_port_hopping_ports(&self) -> Vec<u16> {
+        let mut ports: Vec<u16> = self
+            .hy2_port_ranges
+            .iter()
+            .copied()
+            .flat_map(PortRange::ports)
+            .collect();
+        ports.sort_unstable();
+        ports.dedup();
+        ports
     }
 }
 

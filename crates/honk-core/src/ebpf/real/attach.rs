@@ -169,9 +169,11 @@ impl RealEbpfBackend {
                         .and_then(|p| p.try_into().ok())
                         .ok_or_else(|| anyhow::anyhow!("{} program not found", name))?;
                     p.load()?;
-                    let link_id =
-                        p.attach(&cgroup_file, aya::programs::CgroupAttachMode::Single)?;
-                    let _link = p.take_link(link_id)?;
+                    // Keep the link owned by the program inside `Ebpf`.
+                    // `take_link()` transfers ownership out of aya; dropping
+                    // that temporary link immediately detaches the cgroup
+                    // program, which silently disables pname routing.
+                    p.attach(&cgroup_file, aya::programs::CgroupAttachMode::Single)?;
                 }
                 let cg_addr_names = [
                     "tproxy_wan_cg_connect4",
@@ -185,9 +187,9 @@ impl RealEbpfBackend {
                         .and_then(|p| p.try_into().ok())
                         .ok_or_else(|| anyhow::anyhow!("{} program not found", name))?;
                     p.load()?;
-                    let link_id =
-                        p.attach(&cgroup_file, aya::programs::CgroupAttachMode::Single)?;
-                    let _link = p.take_link(link_id)?;
+                    // See the CgroupSock branch above: keep this link in the
+                    // program's managed-link set for the backend lifetime.
+                    p.attach(&cgroup_file, aya::programs::CgroupAttachMode::Single)?;
                 }
                 info!("Attached 6 cgroup programs to {}", cgroup_path);
             }

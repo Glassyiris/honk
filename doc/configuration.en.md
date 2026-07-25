@@ -177,9 +177,11 @@ node {
 }
 ```
 
-Supported schemes (parser): `ss://`, `ssr://`, `socks5://`, `trojan://`, `trojan-go://`, `vmess://`, `vless://`, `hysteria2://`, `tuic://`, `juicity://`, `anytls://`, `http://`, `https://`.
+Supported schemes (parser): `ss://`, `ssr://`, `socks5://`, `trojan://`, `trojan-go://`, `vmess://`, `vless://`, `hysteria2://` / `hy2://`, `tuic://`, `juicity://`, `anytls://`, `http://`, `https://`.
 
 Node parameters (credentials, `sni`, transport/ws/grpc options, `mux`, protocol-specific Hy2/TUIC/Juicity/AnyTLS options) are carried by the share link's userinfo/host/query components — the same fields the `Node` model exposes (`name`, `protocol`, `address`/`host`, `port`, `password`/`username`, `encryption`, `tls`, `sni`, `transport`, `ws_path`, `ws_host`, `grpc_service`, `mux`, ...). An explicit `tag:` prefix overrides the name embedded in the link.
+
+For Hysteria2, the authority may carry a port-hop union such as `:443,8443,40000-50000`; honk preserves the union and enables QUIC port hopping when it contains at least two ports. See [components.en.md](./components.en.md#protocol-specific-tips) for its 30-second hop behavior.
 
 See [components.en.md](./components.en.md) for the full field table and protocol notes (including UDP support matrix).
 
