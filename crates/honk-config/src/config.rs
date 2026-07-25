@@ -33,7 +33,7 @@ pub struct GlobalConfig {
     pub tproxy_port: u16,
     #[serde(default = "default_tproxy_mark")]
     pub tproxy_mark: u32,
-    #[serde(default = "default_true")]
+    #[serde(default = "crate::types::default_true")]
     pub tproxy_port_protect: bool,
     #[serde(default)]
     pub pprof_port: u16,
@@ -116,9 +116,6 @@ fn default_tproxy_mark() -> u32 {
 }
 fn default_log_level() -> String {
     "info".into()
-}
-fn default_true() -> bool {
-    true
 }
 fn default_tcp_check_urls() -> Vec<String> {
     vec![

@@ -36,9 +36,7 @@ pub struct Node {
     pub id: uuid::Uuid,
     pub name: String,
     pub protocol: NodeProtocol,
-    /// Server address (host:port)
     pub address: String,
-    /// Server host
     #[serde(default)]
     pub host: String,
     pub port: u16,
@@ -156,16 +154,12 @@ pub struct Node {
     /// Tags for classification
     #[serde(default)]
     pub tags: Vec<String>,
-    /// Subscription ID this node belongs to
     #[serde(default)]
     pub subscription_id: Option<uuid::Uuid>,
-    /// Group ID this node belongs to
     #[serde(default)]
     pub group_id: Option<uuid::Uuid>,
-    /// Created at
     #[serde(default = "chrono::Utc::now")]
     pub created_at: chrono::DateTime<chrono::Utc>,
-    /// Updated at
     #[serde(default = "chrono::Utc::now")]
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -175,12 +169,6 @@ fn default_transport() -> String {
 }
 
 impl Node {
-    /// Build the node's connection URL string.
-    /// Returns something like "ss://..." or "trojan://..."
-    pub fn to_uri(&self) -> String {
-        format!("{}://{}:{}", self.protocol.as_str(), self.host(), self.port)
-    }
-
     /// Get the effective host (use host field or parse from address).
     pub fn host(&self) -> &str {
         if self.host.is_empty() {
@@ -193,7 +181,8 @@ impl Node {
 
 /// A group of nodes for load balancing / failover.
 ///
-/// Modeled after sing-box's outbound groups: Selector (manual) and URLTest (auto).
+/// Modeled after sing-box's outbound groups: Selector (manual), URLTest
+/// (auto), LoadBalance (round-robin) and Fallback (first alive, sticky).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Group {
     #[serde(default = "uuid::Uuid::new_v4")]

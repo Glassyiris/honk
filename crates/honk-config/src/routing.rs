@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 /// A routing rule that matches traffic and sends it to an outbound.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingRule {
-    /// Display name
     #[serde(default)]
     pub name: String,
     /// Match conditions
@@ -60,72 +59,6 @@ pub struct RoutingCondition {
 }
 
 impl RoutingCondition {
-    /// Render the condition back to a dae-style rule expression, e.g.
-    /// `domain(suffix: google.com) && dip(geoip: cn)` — display-only
-    /// (clash `/connections` rule field, logs); not a parse round-trip.
-    pub fn display_expr(&self) -> String {
-        fn fn_call(name: &str, args: &[String]) -> Option<String> {
-            if args.is_empty() {
-                None
-            } else {
-                Some(format!("{}({})", name, args.join(", ")))
-            }
-        }
-        let mut parts: Vec<String> = Vec::new();
-        // All domain-family matchers are one `domain(...)` call (OR within).
-        let mut domain_args: Vec<String> = Vec::new();
-        for v in &self.domain {
-            domain_args.push(format!("full: {v}"));
-        }
-        for v in &self.domain_suffix {
-            domain_args.push(format!("suffix: {v}"));
-        }
-        for v in &self.domain_keyword {
-            domain_args.push(format!("keyword: {v}"));
-        }
-        for v in &self.domain_regex {
-            domain_args.push(format!("regex: {v}"));
-        }
-        for v in &self.geosite {
-            domain_args.push(format!("geosite: {v}"));
-        }
-        if let Some(e) = fn_call("domain", &domain_args) {
-            parts.push(e);
-        }
-        // ip and geo_ip both come from `dip(...)` — keep them in one call
-        // (splitting into two &&-ed calls would change OR into AND).
-        let mut dip_args = self.ip.clone();
-        dip_args.extend(self.geo_ip.iter().map(|c| format!("geoip: {c}")));
-        if let Some(e) = fn_call("dip", &dip_args) {
-            parts.push(e);
-        }
-        if let Some(e) = fn_call("sip", &self.source_ip) {
-            parts.push(e);
-        }
-        if let Some(e) = fn_call("dport", &self.port) {
-            parts.push(e);
-        }
-        if let Some(e) = fn_call("sport", &self.source_port) {
-            parts.push(e);
-        }
-        if let Some(e) = fn_call("l4proto", &self.protocol) {
-            parts.push(e);
-        }
-        if let Some(e) = fn_call("pname", &self.process_name) {
-            parts.push(e);
-        }
-        if let Some(e) = fn_call("mac", &self.mac) {
-            parts.push(e);
-        }
-        if let Some(e) = fn_call("ipversion", &self.ip_version) {
-            parts.push(e);
-        }
-        if let Some(e) = fn_call("dscp", &self.dscp) {
-            parts.push(e);
-        }
-        parts.join(" && ")
-    }
-
     /// Clash-style `(rule, rulePayload)` pair for the matched rule: the
     /// rule's OWN type and payload (e.g. `("GeoIP", "telegram")`), NOT the
     /// connection's domain/IP — `/connections` `metadata.host` already

@@ -94,26 +94,6 @@ impl std::str::FromStr for DialMode {
     }
 }
 
-/// Outbound index type for routing decisions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum OutboundIndex {
-    /// Must rules (highest priority)
-    MustRules,
-    /// Direct connection
-    Direct,
-    /// Block connection
-    Block,
-    /// Control plane routing
-    ControlPlaneRouting,
-    /// Logical OR of multiple outbounds
-    LogicalOr,
-    /// Logical AND of multiple outbounds
-    LogicalAnd,
-    /// Custom index
-    Index(u32),
-}
-
 /// Subscription type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -146,4 +126,27 @@ pub enum DnsProtocol {
     H3,
     /// DNS over QUIC (DoQ, RFC 9250)
     Quic,
+}
+
+/// Serde `default = "..."` helper for boolean fields that default to true.
+pub fn default_true() -> bool {
+    true
+}
+
+/// Parse a duration string like `30s`, `1m`, `500ms` or `2h` into seconds.
+pub fn parse_duration_secs(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if let Some(v) = s.strip_suffix("ms") {
+        return v.parse::<f64>().ok().map(|v| (v / 1000.0).ceil() as u64);
+    }
+    if let Some(v) = s.strip_suffix('s') {
+        return v.parse().ok();
+    }
+    if let Some(v) = s.strip_suffix('m') {
+        return v.parse::<u64>().ok().map(|v| v * 60);
+    }
+    if let Some(v) = s.strip_suffix('h') {
+        return v.parse::<u64>().ok().map(|v| v * 3600);
+    }
+    s.parse().ok()
 }

@@ -1,4 +1,3 @@
-mod lexer;
 mod section_parser;
 #[cfg(test)]
 mod tests;
@@ -869,10 +868,6 @@ fn sni_from_upstream_address(address: &str) -> Option<String> {
     Some(host.to_string())
 }
 
-// ---------------------------------------------------------------------------
-// DNS request/response routing parsers (new dae-shaped model)
-// ---------------------------------------------------------------------------
-
 /// Parse `fixed_domain_ttl { domain: N ... }` into a HashMap.
 fn parse_fixed_domain_ttl(body: &str) -> std::collections::HashMap<String, u32> {
     let mut map = std::collections::HashMap::new();
@@ -1085,10 +1080,6 @@ fn parse_dns_ip_args(args: &[String]) -> (Vec<String>, Vec<String>) {
     }
     (cidrs, geoip)
 }
-
-// ---------------------------------------------------------------------------
-// End of DNS routing parsers
-// ---------------------------------------------------------------------------
 
 fn parse_routing_section(section: &Section) -> Result<RoutingConfig, crate::ConfigError> {
     let mut cfg = RoutingConfig::default();
@@ -1433,32 +1424,7 @@ fn parse_hex_or_dec(s: &str) -> u32 {
 }
 
 fn parse_duration_secs(s: &str) -> u64 {
-    let s = s.trim();
-    if s.ends_with("ms") {
-        return s
-            .trim_end_matches("ms")
-            .parse::<f64>()
-            .map(|v| (v / 1000.0).ceil() as u64)
-            .unwrap_or(0);
-    }
-    if s.ends_with('s') {
-        return s.trim_end_matches('s').parse().unwrap_or(0);
-    }
-    if s.ends_with('m') {
-        return s
-            .trim_end_matches('m')
-            .parse::<u64>()
-            .map(|v| v * 60)
-            .unwrap_or(0);
-    }
-    if s.ends_with('h') {
-        return s
-            .trim_end_matches('h')
-            .parse::<u64>()
-            .map(|v| v * 3600)
-            .unwrap_or(0);
-    }
-    s.parse().unwrap_or(0)
+    crate::types::parse_duration_secs(s).unwrap_or(0)
 }
 
 fn parse_duration_ms(s: &str) -> u64 {

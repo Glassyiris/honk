@@ -4,17 +4,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::DnsProtocol;
 
-// ---------------------------------------------------------------------------
-// DNS configuration (top-level)
-// ---------------------------------------------------------------------------
-
 /// DNS configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DnsConfig {
-    /// Upstream DNS servers
     #[serde(default)]
     pub upstream: Vec<DnsUpstream>,
-    /// Routing rules for DNS requests / responses
     #[serde(default)]
     pub routing: DnsRouting,
     /// DNS request strategy
@@ -32,14 +26,10 @@ pub struct DnsConfig {
 /// A DNS upstream server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DnsUpstream {
-    /// Display name
     pub name: String,
-    /// Server address (ip:port)
     pub address: String,
-    /// DNS protocol
     #[serde(default)]
     pub protocol: DnsProtocol,
-    /// TLS server name
     #[serde(default)]
     pub tls_server_name: Option<String>,
     /// Outbound node/group to route this upstream through (e.g. `proxy`).
@@ -50,10 +40,6 @@ pub struct DnsUpstream {
     #[serde(default)]
     pub outbound: Option<String>,
 }
-
-// ---------------------------------------------------------------------------
-// DNS routing (new dae-shaped model + legacy back-compat)
-// ---------------------------------------------------------------------------
 
 /// DNS routing configuration.
 ///
@@ -92,10 +78,6 @@ impl Default for DnsRouting {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Legacy rule (kept for back-compat)
-// ---------------------------------------------------------------------------
-
 /// A legacy DNS routing rule (domain → upstream).
 ///
 /// Kept as a type alias for backward compatibility. New code should
@@ -110,10 +92,6 @@ pub struct DnsLegacyRule {
     pub upstream: String,
 }
 
-// ---------------------------------------------------------------------------
-// Request routing (new style)
-// ---------------------------------------------------------------------------
-
 /// Request action: what to do with the DNS query.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DnsRequestAction {
@@ -123,12 +101,6 @@ pub enum DnsRequestAction {
     AsIs,
     /// Send to the named upstream.
     Upstream(String),
-}
-
-impl Default for DnsRequestAction {
-    fn default() -> Self {
-        DnsRequestAction::Upstream("default".to_string())
-    }
 }
 
 impl DnsRequestAction {
@@ -141,10 +113,6 @@ impl DnsRequestAction {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Response routing (new style)
-// ---------------------------------------------------------------------------
 
 /// Response action: what to do with the DNS response.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -169,10 +137,6 @@ impl DnsResponseAction {
     }
 }
 
-// ---------------------------------------------------------------------------
-// DNS domain matcher
-// ---------------------------------------------------------------------------
-
 /// How to match a domain name.
 #[derive(Debug, Clone)]
 pub enum DnsDomainMatcher {
@@ -187,10 +151,6 @@ pub enum DnsDomainMatcher {
     /// geosite code — expanded at router build time.
     Geosite(String),
 }
-
-// ---------------------------------------------------------------------------
-// DNS conditions
-// ---------------------------------------------------------------------------
 
 /// One AND-ed condition. Matchers within the condition are OR-ed.
 #[derive(Debug, Clone)]
@@ -227,10 +187,6 @@ pub enum DnsCond {
     },
 }
 
-// ---------------------------------------------------------------------------
-// Request rule
-// ---------------------------------------------------------------------------
-
 /// A single request routing rule.
 ///
 /// All conditions are AND-ed; first matching rule wins.
@@ -242,10 +198,6 @@ pub struct DnsRequestRule {
     pub action: DnsRequestAction,
 }
 
-// ---------------------------------------------------------------------------
-// Response rule
-// ---------------------------------------------------------------------------
-
 /// A single response routing rule.
 ///
 /// All conditions are AND-ed; first matching rule wins.
@@ -256,10 +208,6 @@ pub struct DnsResponseRule {
     /// Action to take when all conditions match.
     pub action: DnsResponseAction,
 }
-
-// ---------------------------------------------------------------------------
-// Request / response routing sets
-// ---------------------------------------------------------------------------
 
 /// Request routing: rules + fallback action.
 #[derive(Debug, Clone)]
@@ -297,14 +245,10 @@ impl Default for DnsResponseRouting {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Serde support for newtypes (manual impls for HashMap + Ser)
-// ---------------------------------------------------------------------------
-
 // All the new routing types live outside the serde tree.  `DnsRouting` only
 // serialises/deserialises the legacy fields; the new request/response blocks
-// are populated by the parser.  The `#[serde(skip)]` below ensures the
-// derived `Deserialize` on `DnsRouting` doesn't try to read them.
+// are populated by the parser, so the manual impls below accept-and-ignore
+// any serialized form and deserialize back to the defaults.
 
 impl Serialize for DnsRequestRouting {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
@@ -332,16 +276,7 @@ impl<'de> Deserialize<'de> for DnsResponseRouting {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Back-compat helpers
-// ---------------------------------------------------------------------------
-
 impl DnsRouting {
-    /// Returns `true` if the request ruleset is empty (only legacy rules).
-    pub fn has_legacy_only(&self) -> bool {
-        self.request.rules.is_empty()
-    }
-
     /// Convert legacy rules into request rules.
     pub fn convert_legacy_rules(&self) -> DnsRequestRouting {
         let mut rules = Vec::with_capacity(self.rules.len());
@@ -392,10 +327,6 @@ fn parse_legacy_pattern(pattern: &str) -> (DnsDomainMatcher, String) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// QTYPE helper
-// ---------------------------------------------------------------------------
-
 /// Parse a QTYPE token (e.g. "a", "AAAA", "https", "65") into a `u16`.
 ///
 /// Returns `None` for unrecognised names.
@@ -423,10 +354,6 @@ pub fn parse_qtype_token(s: &str) -> Option<u16> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// DNS strategy
-// ---------------------------------------------------------------------------
-
 /// DNS resolution strategy.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -444,15 +371,11 @@ pub enum DnsStrategy {
     Both,
 }
 
-// ---------------------------------------------------------------------------
-// Cache config
-// ---------------------------------------------------------------------------
-
 /// DNS cache configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DnsCacheConfig {
     /// Enable DNS cache
-    #[serde(default = "default_true")]
+    #[serde(default = "crate::types::default_true")]
     pub enabled: bool,
     /// Cache TTL in seconds
     #[serde(default = "default_cache_ttl")]
@@ -460,10 +383,6 @@ pub struct DnsCacheConfig {
     /// Maximum cache entries
     #[serde(default = "default_cache_size")]
     pub max_size: usize,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 fn default_cache_ttl() -> u64 {
@@ -477,16 +396,12 @@ fn default_cache_size() -> usize {
 impl Default for DnsCacheConfig {
     fn default() -> Self {
         Self {
-            enabled: default_true(),
+            enabled: crate::types::default_true(),
             ttl: default_cache_ttl(),
             max_size: default_cache_size(),
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// DnsConfig default
-// ---------------------------------------------------------------------------
 
 impl Default for DnsConfig {
     fn default() -> Self {

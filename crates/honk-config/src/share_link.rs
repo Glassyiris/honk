@@ -20,8 +20,8 @@
 //!   URL-safe base64 without padding.
 //!
 //! This is the single share-link parser for the whole workspace: the dae
-//! config parser, the core subscription fetcher, and the API server import
-//! paths all delegate to [`Node::from_share_link`].
+//! config parser and the core subscription fetcher both delegate to
+//! [`Node::from_share_link`].
 
 use std::collections::HashMap;
 
@@ -29,7 +29,7 @@ use base64::Engine as _;
 
 use crate::error::ConfigError;
 use crate::node::Node;
-use crate::types::NodeProtocol;
+use crate::types::{NodeProtocol, parse_duration_secs};
 
 impl Node {
     /// Parse a proxy share link (e.g. `ss://...`, `trojan://...`) into a [`Node`].
@@ -133,7 +133,7 @@ impl Node {
         // would leak the credentials into node lists and dashboards.
         node.name = url
             .fragment()
-            .map(decode_url_fragment)
+            .map(percent_decode_str)
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| format!("{}-{}", scheme, host));
 
@@ -214,8 +214,8 @@ impl Node {
         }
 
         // ECH (Encrypted Client Hello): `ech_config=<base64 ECHConfigList>`
-        // enables real ECH; bare `ech=1` toggles it on without keys (GREASE
-        // only until DNS HTTPS-RR lookup lands).
+        // enables real ECH with static keys; bare `ech=1` enables it without
+        // keys, triggering DNS HTTPS-RR discovery at connect time.
         if let Some(v) = query.get("ech_config").or_else(|| query.get("echconfig")) {
             node.ech_enabled = true;
             node.ech_config = Some(v.clone());
@@ -626,24 +626,6 @@ fn base64_decode_flexible(input: &str) -> Option<Vec<u8>> {
         .ok()
 }
 
-/// Parse a duration string like `30s`, `1m` or `500ms` into seconds.
-fn parse_duration_secs(s: &str) -> Option<u64> {
-    let s = s.trim();
-    if let Some(v) = s.strip_suffix("ms") {
-        return v.parse::<f64>().ok().map(|v| (v / 1000.0).ceil() as u64);
-    }
-    if let Some(v) = s.strip_suffix('s') {
-        return v.parse().ok();
-    }
-    if let Some(v) = s.strip_suffix('m') {
-        return v.parse::<u64>().ok().map(|v| v * 60);
-    }
-    if let Some(v) = s.strip_suffix('h') {
-        return v.parse::<u64>().ok().map(|v| v * 3600);
-    }
-    s.parse().ok()
-}
-
 /// Percent-decode a string into bytes, then lossily into UTF-8.
 fn percent_decode_str(s: &str) -> String {
     let bytes = s.as_bytes();
@@ -662,15 +644,6 @@ fn percent_decode_str(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
-}
-
-/// Decode a percent-encoded URL fragment into a plain UTF-8 string.
-///
-/// Percent-encoded bytes are decoded to raw bytes first and then interpreted
-/// as UTF-8 — decoding each byte as a `char` directly would corrupt any
-/// multi-byte (Chinese / emoji) node name.
-fn decode_url_fragment(fragment: &str) -> String {
-    percent_decode_str(fragment)
 }
 
 fn hex_to_byte(h: u8, l: u8) -> Result<u8, ()> {

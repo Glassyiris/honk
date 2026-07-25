@@ -6,27 +6,20 @@ use crate::types::SubscriptionType;
 /// A proxy subscription (e.g., subscription link).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Subscription {
-    /// Unique subscription ID
     #[serde(default = "uuid::Uuid::new_v4")]
     pub id: uuid::Uuid,
-    /// Display name
     pub name: String,
-    /// Subscription URL
     pub url: String,
-    /// Subscription type
     #[serde(default)]
     pub sub_type: SubscriptionType,
     /// Update interval in seconds (0 = manual)
     #[serde(default = "default_update_interval")]
     pub update_interval: u64,
-    /// User-Agent for fetching
     #[serde(default)]
     pub user_agent: Option<String>,
-    /// Custom headers
     #[serde(default)]
     pub headers: Vec<SubscriptionHeader>,
-    /// Enabled
-    #[serde(default = "default_true")]
+    #[serde(default = "crate::types::default_true")]
     pub enabled: bool,
     /// Last update time
     #[serde(default)]
@@ -37,10 +30,6 @@ pub struct Subscription {
     /// Created at
     #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 fn default_update_interval() -> u64 {
