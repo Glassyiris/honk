@@ -85,7 +85,7 @@ honk 沿用 dae 的内核模型，但并非移植。主要不同点：
 
 #### 配置与路由（用户态）
 
-- [x] dae 语法加载与校验
+- [x] dae 语法加载、include/glob 组合与校验
 - [x] 分享链接解析（ss/ssr/vmess/vless/trojan/anytls/hy2/tuic/juicity/…）
 - [x] 用户态 `Router`（域名/IP/端口/协议/进程/MAC/geosite/geoip）
 - [x] TCP 嗅探（TLS SNI、HTTP Host）；QUIC Initial SNI 解密

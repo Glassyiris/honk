@@ -106,6 +106,7 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 regex = "1"
+glob = "0.3"
 base64 = "0.23"
 bytes = "1"
 rand = "0.10"

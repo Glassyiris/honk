@@ -56,7 +56,7 @@ Status reflects the current tree and unit/integration tests. Prefer re-running `
 
 #### Config & routing (userspace)
 
-- [x] dae syntax load & validate
+- [x] dae syntax load, include/glob composition & validate
 - [x] Share-link parse (ss/ssr/vmess/vless/trojan/anytls/hy2/tuic/juicity/…)
 - [x] Userspace `Router` (domain/IP/port/proto/process/MAC/geosite/geoip)
 - [x] TCP sniff (TLS SNI, HTTP Host); QUIC Initial SNI decrypt
