@@ -36,7 +36,7 @@ include {
 ## 2. 顶层结构
 
 ```text
-include        # 合并其他 .dae 配置文件
+include { ... }      # 合并其他 .dae 配置文件
 global         # 透明代理、健康检查、拨号模式
 node           # 代理节点（分享链接）
 group          # 节点/嵌套组的选择策略
