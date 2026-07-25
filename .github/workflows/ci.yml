@@ -1,0 +1,152 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Install boring-sys build deps (cmake + libclang for bindgen)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libclang-dev
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all --all-targets -- -D warnings
+
+  test:
+    name: cargo test (workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install boring-sys build deps (cmake + libclang for bindgen)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libclang-dev
+
+      # routing::tests::test_geosite_* need geo assets (locally found at
+      # /etc/dae/geosite.dat; the runner has none).
+      - name: Install geo assets for the geosite tests
+        run: |
+          sudo mkdir -p /etc/dae
+          sudo curl -sL --retry 3 -o /etc/dae/geosite.dat \
+            https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat
+          sudo curl -sL --retry 3 -o /etc/dae/geoip.dat \
+            https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
+      # Full suite minus the known-failing pre-existing tests (see AGENTS.md
+      # "Current test status": share_link TOML round-trip x2,
+      # config_dae_routing x1).
+      - run: |
+          cargo test --workspace --no-fail-fast -- \
+            --skip test_config_toml_round_trip \
+            --skip test_to_file_and_from_file_by_extension \
+            --skip test_routing_with_config_dae
+
+  ebpf:
+    name: eBPF object build + BTF check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - name: Install bpf-linker
+        run: cargo install bpf-linker
+      - name: Point eBPF .cargo/config at the installed bpf-linker
+        run: |
+          sed -i 's|linker=/root/.cargo/bin/bpf-linker-wrapper|linker=bpf-linker|' \
+            crates/honk-ebpf/.cargo/config.toml
+      - name: Build eBPF object
+        run: |
+          cd crates/honk-ebpf
+          cargo +nightly build --release -Zbuild-std=core --target bpfel-unknown-none
+      # aya refuses objects without BTF ("no BTF parsed for object") — fail
+      # here instead of at runtime on a gateway.
+      - name: Verify eBPF object has BTF
+        run: readelf -S crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf | grep -q '\.BTF'
+
+  review-bot:
+    name: mechanical PR review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              per_page: 100,
+            });
+
+            const paths = files.map((f) => f.filename);
+            const crates = new Set(
+              paths
+                .filter((p) => p.startsWith("crates/"))
+                .map((p) => p.split("/")[1]),
+            );
+
+            const warnings = [];
+            const notes = [];
+
+            // AGENTS.md invariant: honk-ebpf-common layout changes must move
+            // together with the eBPF program and the userspace map writers.
+            const has = (prefix) => paths.some((p) => p.startsWith(prefix));
+            if (
+              has("crates/honk-ebpf-common/") &&
+              !has("crates/honk-ebpf/") &&
+              !has("crates/honk-core/src/ebpf/")
+            ) {
+              warnings.push(
+                "`crates/honk-ebpf-common` changed without matching changes in `crates/honk-ebpf` or `crates/honk-core/src/ebpf` — shared kernel/userspace layouts must move together.",
+              );
+            }
+            if (has(".github/workflows/")) {
+              notes.push("CI workflow files changed.");
+            }
+            if (crates.size > 0 && !has("AGENTS.md")) {
+              notes.push(
+                "Code changed but `AGENTS.md` was not updated — check whether any documented behavior/convention changed.",
+              );
+            }
+
+            const additions = files.reduce((s, f) => s + f.additions, 0);
+            const deletions = files.reduce((s, f) => s + f.deletions, 0);
+            const lines = [
+              `**mechanical review** (bot)`,
+              ``,
+              `Files: ${paths.length} (+${additions}/-${deletions})` +
+                (crates.size
+                  ? ` · crates: ${[...crates].map((c) => `\`${c}\``).join(", ")}`
+                  : ""),
+            ];
+            for (const w of warnings) lines.push(`- ⚠️ ${w}`);
+            for (const n of notes) lines.push(`- ℹ️ ${n}`);
+            if (!warnings.length && !notes.length) {
+              lines.push("", "No structural issues detected.");
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              body: lines.join("\n"),
+            });

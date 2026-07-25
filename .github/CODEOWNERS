@@ -1,0 +1,7 @@
+# CODEOWNERS — paths that always require human review.
+# Kernel/userspace shared layouts are the most fragile invariant in this
+# repo; a change here must never merge on bot approval alone.
+crates/honk-ebpf/ @Glassyiris
+crates/honk-ebpf-common/ @Glassyiris
+crates/honk-core/src/ebpf/ @Glassyiris
+.github/workflows/ @Glassyiris
