@@ -2,7 +2,7 @@
 
 各主要组件的字段级说明，配合 [configuration.zh.md](./configuration.zh.md) 使用。
 
-配置文件使用 **dae 语法**（`global { ... }`、`node { ... }`、`group { ... }`、`routing { ... }`、`dns { ... }`、`subscription { ... }`、`experimental { ... }` 各节），完整示例见仓库根目录的 `config.dae` 与 `config.min.dae`。
+配置文件使用 **dae 语法**（`include { ... }`、`global { ... }`、`node { ... }`、`group { ... }`、`routing { ... }`、`dns { ... }`、`subscription { ... }`、`experimental { ... }` 各节）。`include` 用于组合 `.dae` 文件，路径与合并规则见 [configuration.zh.md](./configuration.zh.md#拆分配置文件)；完整示例见仓库根目录的 `config.dae` 与 `config.min.dae`。
 
 权威来源：`crates/honk-config/src/*`（dae 解析器在 `crates/honk-config/src/parser/`）、`crates/honk-outbound/src/proxy/`、`crates/honk-core` CLI。
 

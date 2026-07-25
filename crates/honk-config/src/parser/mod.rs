@@ -3,7 +3,8 @@ mod section_parser;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use crate::Config;
 use crate::config::GlobalConfig;
@@ -16,13 +17,362 @@ use crate::subscription::Subscription;
 use regex::Regex;
 use section_parser::Section;
 
+/// Load a dae configuration file, resolving its top-level `include` blocks.
+///
+/// Include paths are relative to the entry configuration's directory, even
+/// when they occur in a nested included file.  Included files must remain
+/// below that directory after symlink resolution.
+pub fn parse_dae_config_file(path: impl AsRef<Path>) -> Result<Config, crate::ConfigError> {
+    let entry = std::fs::canonicalize(path.as_ref())?;
+    let entry_dir = entry.parent().map(Path::to_path_buf).ok_or_else(|| {
+        crate::ConfigError::Include(format!(
+            "entry configuration '{}' has no parent directory",
+            entry.display()
+        ))
+    })?;
+    let mut loader = IncludeLoader {
+        entry_dir,
+        loaded: HashSet::new(),
+        stack: Vec::new(),
+        saw_include: false,
+    };
+    let input = loader.expand_file(&entry)?;
+
+    match parse_dae_config(&input) {
+        Ok(config) => Ok(config),
+        Err(err) if loader.saw_include => Err(crate::ConfigError::Include(format!(
+            "failed to parse configuration after resolving includes: {err}"
+        ))),
+        Err(err) => Err(err),
+    }
+}
+
+struct IncludeLoader {
+    entry_dir: PathBuf,
+    // dae treats a repeated include as a circular include too.  Keep that
+    // behavior, but canonical paths also prevent symlink aliases escaping it.
+    loaded: HashSet<PathBuf>,
+    stack: Vec<PathBuf>,
+    saw_include: bool,
+}
+
+impl IncludeLoader {
+    fn expand_file(&mut self, path: &Path) -> Result<String, crate::ConfigError> {
+        if !self.loaded.insert(path.to_path_buf()) {
+            let mut chain = self
+                .stack
+                .iter()
+                .map(|entry| entry.display().to_string())
+                .collect::<Vec<_>>();
+            chain.push(path.display().to_string());
+            return Err(crate::ConfigError::Include(format!(
+                "circular or duplicate include is not allowed: {}",
+                chain.join(" -> ")
+            )));
+        }
+
+        self.stack.push(path.to_path_buf());
+        let result = (|| {
+            let input = std::fs::read_to_string(path).map_err(|err| {
+                crate::ConfigError::Include(format!(
+                    "failed to read configuration '{}': {err}",
+                    path.display()
+                ))
+            })?;
+            let (has_include, patterns) = extract_include_patterns(&input, path)?;
+            self.saw_include |= has_include;
+
+            // dae merges an entry's own sections before the sections of its
+            // included descendants, regardless of where `include` occurs in
+            // that entry.  Appending recursively gives that preorder.
+            let mut expanded = input;
+            for pattern in patterns {
+                for child in self.expand_pattern(&pattern, path)? {
+                    expanded.push('\n');
+                    expanded.push_str(&self.expand_file(&child)?);
+                }
+            }
+            Ok(expanded)
+        })();
+        self.stack.pop();
+        result
+    }
+
+    fn expand_pattern(
+        &self,
+        pattern: &str,
+        source: &Path,
+    ) -> Result<Vec<PathBuf>, crate::ConfigError> {
+        let pattern_path = Path::new(pattern);
+        let pattern = if pattern_path.is_absolute() {
+            pattern_path.to_path_buf()
+        } else {
+            self.entry_dir.join(pattern_path)
+        };
+        // `glob` gives `**` recursive semantics while dae's filepath.Glob
+        // treats it as an ordinary same-component wildcard.  Normalize the
+        // one divergent form before matching.
+        let pattern = normalize_dae_glob_pattern(&pattern);
+        let pattern_display = pattern.display().to_string();
+        let mut matches = glob::glob(&pattern_display)
+            .map_err(|err| {
+                crate::ConfigError::Include(format!(
+                    "invalid include pattern '{}' in '{}': {err}",
+                    pattern_display,
+                    source.display()
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| {
+                crate::ConfigError::Include(format!(
+                    "failed to expand include pattern '{}' in '{}': {err}",
+                    pattern_display,
+                    source.display()
+                ))
+            })?;
+        matches.sort();
+
+        let mut files = Vec::new();
+        for path in matches {
+            if path.extension().and_then(|ext| ext.to_str()) != Some("dae") {
+                continue;
+            }
+            let metadata = std::fs::metadata(&path).map_err(|err| {
+                crate::ConfigError::Include(format!(
+                    "failed to inspect included path '{}': {err}",
+                    path.display()
+                ))
+            })?;
+            if metadata.is_dir() {
+                continue;
+            }
+
+            let path = std::fs::canonicalize(&path).map_err(|err| {
+                crate::ConfigError::Include(format!(
+                    "failed to resolve included path '{}': {err}",
+                    path.display()
+                ))
+            })?;
+            if !path.starts_with(&self.entry_dir) {
+                return Err(crate::ConfigError::Include(format!(
+                    "included path '{}' is outside entry configuration directory '{}'",
+                    path.display(),
+                    self.entry_dir.display()
+                )));
+            }
+            files.push(path);
+        }
+        Ok(files)
+    }
+}
+
+fn normalize_dae_glob_pattern(pattern: &Path) -> PathBuf {
+    // honk runs on Linux, where `/` is both the dae and native separator.
+    let normalized = pattern
+        .to_string_lossy()
+        .split('/')
+        .map(|component| if component == "**" { "*" } else { component })
+        .collect::<Vec<_>>()
+        .join("/");
+    PathBuf::from(normalized)
+}
+
+/// Extract bare or quoted paths from top-level `include { ... }` blocks.
+/// This intentionally has a small lexer of its own so the file loader also
+/// accepts dae's inline form: `include { 'path with spaces.dae' other.dae }`.
+fn extract_include_patterns(
+    input: &str,
+    source: &Path,
+) -> Result<(bool, Vec<String>), crate::ConfigError> {
+    let bytes = input.as_bytes();
+    let mut index = 0;
+    let mut depth = 0usize;
+    let mut found = false;
+    let mut patterns = Vec::new();
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'#' => skip_line(bytes, &mut index),
+            b'\'' | b'"' => {
+                if let Some(end) = quoted_end(bytes, index) {
+                    index = end;
+                } else {
+                    break;
+                }
+            }
+            b'{' => {
+                depth += 1;
+                index += 1;
+            }
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                index += 1;
+            }
+            byte if depth == 0 && is_ident_start(byte) => {
+                let start = index;
+                index += 1;
+                while index < bytes.len() && is_ident_continue(bytes[index]) {
+                    index += 1;
+                }
+                if &input[start..index] != "include" {
+                    continue;
+                }
+
+                let mut after_name = index;
+                skip_layout(bytes, &mut after_name);
+                if after_name >= bytes.len() || bytes[after_name] != b'{' {
+                    continue;
+                }
+                let (body, end) = include_body(input, after_name, source)?;
+                found = true;
+                patterns.extend(parse_include_body(body, source)?);
+                index = end;
+            }
+            _ => index += 1,
+        }
+    }
+
+    Ok((found, patterns))
+}
+
+fn parse_include_body(body: &str, source: &Path) -> Result<Vec<String>, crate::ConfigError> {
+    let bytes = body.as_bytes();
+    let mut index = 0;
+    let mut patterns = Vec::new();
+
+    while index < bytes.len() {
+        skip_layout(bytes, &mut index);
+        if index >= bytes.len() {
+            break;
+        }
+        if matches!(bytes[index], b'{' | b'}') {
+            return Err(crate::ConfigError::Include(format!(
+                "include section in '{}' accepts only file patterns",
+                source.display()
+            )));
+        }
+
+        let value = if matches!(bytes[index], b'\'' | b'"') {
+            let start = index + 1;
+            let end = quoted_end(bytes, index).ok_or_else(|| {
+                crate::ConfigError::Include(format!(
+                    "unterminated quoted include path in '{}'",
+                    source.display()
+                ))
+            })?;
+            index = end;
+            body[start..end - 1].to_string()
+        } else {
+            let start = index;
+            while index < bytes.len()
+                && !bytes[index].is_ascii_whitespace()
+                && bytes[index] != b'#'
+                && !matches!(bytes[index], b'{' | b'}')
+            {
+                index += 1;
+            }
+            body[start..index].to_string()
+        };
+        if value.is_empty() {
+            return Err(crate::ConfigError::Include(format!(
+                "empty include path in '{}'",
+                source.display()
+            )));
+        }
+        patterns.push(value);
+    }
+
+    Ok(patterns)
+}
+
+fn include_body<'a>(
+    input: &'a str,
+    open_brace: usize,
+    source: &Path,
+) -> Result<(&'a str, usize), crate::ConfigError> {
+    let bytes = input.as_bytes();
+    let mut index = open_brace + 1;
+    let body_start = index;
+    let mut depth = 1usize;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'#' => skip_line(bytes, &mut index),
+            b'\'' | b'"' => {
+                if let Some(end) = quoted_end(bytes, index) {
+                    index = end;
+                } else {
+                    break;
+                }
+            }
+            b'{' => {
+                depth += 1;
+                index += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok((&input[body_start..index], index + 1));
+                }
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+
+    Err(crate::ConfigError::Include(format!(
+        "unclosed include section in '{}'",
+        source.display()
+    )))
+}
+
+fn skip_layout(bytes: &[u8], index: &mut usize) {
+    loop {
+        while *index < bytes.len() && bytes[*index].is_ascii_whitespace() {
+            *index += 1;
+        }
+        if *index < bytes.len() && bytes[*index] == b'#' {
+            skip_line(bytes, index);
+        } else {
+            break;
+        }
+    }
+}
+
+fn skip_line(bytes: &[u8], index: &mut usize) {
+    while *index < bytes.len() && bytes[*index] != b'\n' {
+        *index += 1;
+    }
+}
+
+fn quoted_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let quote = bytes[start];
+    let mut index = start + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            byte if byte == quote => return Some(index + 1),
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+fn is_ident_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_'
+}
+
+fn is_ident_continue(byte: u8) -> bool {
+    is_ident_start(byte) || byte.is_ascii_digit() || byte == b'-'
+}
+
 pub fn parse_dae_config(input: &str) -> Result<Config, crate::ConfigError> {
     let input = strip_comments(input);
     if !input.contains('{') || !input.contains('}') {
         return Err(crate::ConfigError::Parse("not a dae config file".into()));
     }
 
-    let sections = split_sections(&input)?;
+    let sections = merge_top_level_sections(split_sections(&input)?);
     let mut config = Config::default();
 
     for section in &sections {
@@ -210,6 +560,29 @@ fn split_sections(input: &str) -> Result<Vec<Section>, crate::ConfigError> {
     Ok(sections)
 }
 
+/// dae merges repeated top-level sections by appending their items.  Keeping
+/// one body per section lets the existing section parsers retain that order
+/// when a configuration is composed from include files.
+fn merge_top_level_sections(sections: Vec<Section>) -> Vec<Section> {
+    let mut merged = Vec::<Section>::new();
+    let mut indices = HashMap::<String, usize>::new();
+
+    for section in sections {
+        if let Some(&index) = indices.get(&section.name) {
+            let body = &mut merged[index].body;
+            if !body.is_empty() && !section.body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str(&section.body);
+        } else {
+            indices.insert(section.name.clone(), merged.len());
+            merged.push(section);
+        }
+    }
+
+    merged
+}
+
 fn parse_kv_pairs(body: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
     for line in body.lines() {
@@ -336,6 +709,7 @@ fn parse_dns_section(section: &Section) -> Result<DnsConfig, crate::ConfigError>
     let dns_subs =
         split_nested_sections(&section.body, &["upstream", "routing", "fixed_domain_ttl"])?;
     let mut cfg = DnsConfig::default();
+    let mut saw_upstream = false;
     let kv = parse_kv_pairs(dns_subs.first().map(|s| s.body.as_str()).unwrap_or(""));
 
     if let Some(v) = kv.get("ipversion_prefer") {
@@ -354,13 +728,21 @@ fn parse_dns_section(section: &Section) -> Result<DnsConfig, crate::ConfigError>
     for sub in dns_subs.iter().skip(1) {
         match sub.name.as_str() {
             "upstream" => {
-                cfg.upstream = parse_dns_upstreams(&sub.body);
+                if !saw_upstream {
+                    cfg.upstream.clear();
+                    saw_upstream = true;
+                }
+                cfg.upstream.extend(parse_dns_upstreams(&sub.body));
             }
             "routing" => {
-                let req = extract_nested(&sub.body, "request");
-                let resp = extract_nested(&sub.body, "response");
-                if let Some(req_body) = req {
-                    cfg.routing.request = parse_dns_request_routing(&req_body);
+                for req_body in extract_nested_all(&sub.body, "request") {
+                    let has_fallback = has_routing_fallback(&req_body);
+                    let request = parse_dns_request_routing(&req_body);
+                    cfg.routing.request.rules.extend(request.rules);
+                    if !has_fallback {
+                        continue;
+                    }
+                    cfg.routing.request.fallback = request.fallback;
                     // Sync legacy fallback for callers that only look there.
                     if let crate::dns::DnsRequestAction::Upstream(ref name) =
                         cfg.routing.request.fallback
@@ -368,12 +750,18 @@ fn parse_dns_section(section: &Section) -> Result<DnsConfig, crate::ConfigError>
                         cfg.routing.fallback = name.clone();
                     }
                 }
-                if let Some(resp_body) = resp {
-                    cfg.routing.response = parse_dns_response_routing(&resp_body);
+                for resp_body in extract_nested_all(&sub.body, "response") {
+                    let has_fallback = has_routing_fallback(&resp_body);
+                    let response = parse_dns_response_routing(&resp_body);
+                    cfg.routing.response.rules.extend(response.rules);
+                    if has_fallback {
+                        cfg.routing.response.fallback = response.fallback;
+                    }
                 }
             }
             "fixed_domain_ttl" => {
-                cfg.fixed_domain_ttl = parse_fixed_domain_ttl(&sub.body);
+                cfg.fixed_domain_ttl
+                    .extend(parse_fixed_domain_ttl(&sub.body));
             }
             _ => {}
         }
@@ -1147,16 +1535,16 @@ fn split_nested_sections_generic(
                         in_sub = true;
                         depth = 1;
                     } else {
-                        sections.last_mut().unwrap().body.push_str(trimmed);
-                        sections.last_mut().unwrap().body.push('\n');
+                        sections.first_mut().unwrap().body.push_str(trimmed);
+                        sections.first_mut().unwrap().body.push('\n');
                     }
                 } else {
-                    sections.last_mut().unwrap().body.push_str(trimmed);
-                    sections.last_mut().unwrap().body.push('\n');
+                    sections.first_mut().unwrap().body.push_str(trimmed);
+                    sections.first_mut().unwrap().body.push('\n');
                 }
             } else {
-                sections.last_mut().unwrap().body.push_str(trimmed);
-                sections.last_mut().unwrap().body.push('\n');
+                sections.first_mut().unwrap().body.push_str(trimmed);
+                sections.first_mut().unwrap().body.push('\n');
             }
         } else {
             depth += open;
@@ -1187,10 +1575,18 @@ fn split_nested_sections_generic(
     Ok(sections)
 }
 
-fn extract_nested(body: &str, name: &str) -> Option<String> {
-    let sections = split_nested_sections(body, &[name]).ok()?;
-    sections
-        .iter()
-        .find(|s| s.name == name)
-        .map(|s| s.body.clone())
+fn extract_nested_all(body: &str, name: &str) -> Vec<String> {
+    split_nested_sections(body, &[name])
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|section| section.name == name)
+        .map(|section| section.body)
+        .collect()
+}
+
+fn has_routing_fallback(body: &str) -> bool {
+    body.lines().any(|line| {
+        let line = line.trim();
+        line.starts_with("fallback:") || line.starts_with("default:")
+    })
 }
