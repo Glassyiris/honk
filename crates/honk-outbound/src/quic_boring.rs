@@ -899,8 +899,7 @@ mod tests {
     async fn pin_sha256_accepts_matching_cert_and_rejects_others() {
         let (config, cert_der) =
             crate::quic::testutil::server_config_with_cert(&[b"h3"], true).unwrap();
-        let endpoint =
-            quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = endpoint.local_addr().unwrap();
         tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
@@ -1084,15 +1083,14 @@ mod tests {
             crypto::ClientConfig::start_session(Arc::new(rustls_crypto), 1, "localhost", &params)
                 .unwrap();
 
-        let my_cfg =
-            Arc::new(
-                BoringQuicClientConfig::new(BoringQuicOptions {
-                    alpn_wire: b"\x02h3".to_vec(),
-                    skip_cert_verify: true,
-                    ..Default::default()
-                })
-                .unwrap(),
-            );
+        let my_cfg = Arc::new(
+            BoringQuicClientConfig::new(BoringQuicOptions {
+                alpn_wire: b"\x02h3".to_vec(),
+                skip_cert_verify: true,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
         let my_session =
             crypto::ClientConfig::start_session(my_cfg, 1, "localhost", &params).unwrap();
 

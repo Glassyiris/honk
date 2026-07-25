@@ -211,8 +211,8 @@ pub async fn client_config(
         }
         None => None,
     };
-    let crypto = crate::quic_boring::BoringQuicClientConfig::new(
-        crate::quic_boring::BoringQuicOptions {
+    let crypto =
+        crate::quic_boring::BoringQuicClientConfig::new(crate::quic_boring::BoringQuicOptions {
             alpn_wire,
             skip_cert_verify: node.skip_cert_verify,
             chrome: crate::tls::chrome_mode(),
@@ -221,14 +221,15 @@ pub async fn client_config(
                 .tls_pin_sha256
                 .as_deref()
                 .and_then(crate::tls::parse_pin_sha256),
-        },
-    )?;
+        })?;
     let mut cfg = ClientConfig::new(Arc::new(crypto));
 
     let mut transport = TransportConfig::default();
     transport
         .congestion_controller_factory(
-            options.congestion.unwrap_or_else(|| congestion_factory(None)),
+            options
+                .congestion
+                .unwrap_or_else(|| congestion_factory(None)),
         )
         // Protocols like TUIC deliver inbound UDP packets on server-initiated
         // uni streams (one stream per packet) — allow a generous number

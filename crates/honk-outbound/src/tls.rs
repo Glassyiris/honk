@@ -333,7 +333,10 @@ fn base_builder(skip_cert_verify: bool) -> anyhow::Result<boring::ssl::SslConnec
 
 /// Parse a `pinSHA256` value (hex, optionally colon-separated) into 32 bytes.
 pub fn parse_pin_sha256(s: &str) -> Option<[u8; 32]> {
-    let hex: String = s.chars().filter(|c| *c != ':' && !c.is_whitespace()).collect();
+    let hex: String = s
+        .chars()
+        .filter(|c| *c != ':' && !c.is_whitespace())
+        .collect();
     if hex.len() != 64 {
         return None;
     }
@@ -378,10 +381,7 @@ pub fn build_connector(node: &Node) -> anyhow::Result<TlsConnector> {
     let chrome = chrome_mode();
     let ech_config_list = load_ech_config_list(node)?;
 
-    let pin = node
-        .tls_pin_sha256
-        .as_deref()
-        .and_then(parse_pin_sha256);
+    let pin = node.tls_pin_sha256.as_deref().and_then(parse_pin_sha256);
     let mut builder = base_builder(node.skip_cert_verify || pin.is_some())?;
     if let Some(pin) = pin {
         builder.set_custom_verify_callback(SslVerifyMode::PEER, pin_sha256_custom_verify(pin));
