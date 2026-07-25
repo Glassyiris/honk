@@ -8,6 +8,9 @@ pub enum ConfigError {
     #[error("Parse error: {0}")]
     Parse(String),
 
+    #[error("Include error: {0}")]
+    Include(String),
+
     #[error("Validation error: {0}")]
     Validation(String),
 

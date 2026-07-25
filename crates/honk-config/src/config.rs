@@ -266,10 +266,15 @@ impl Config {
             Some("toml") => parse_toml(&content)
                 .or_else(|_| parse_yaml(&content))
                 .or_else(|_| Self::from_json_str(&content)),
-            _ => crate::parser::parse_dae_config(&content)
-                .or_else(|_| parse_toml(&content))
-                .or_else(|_| parse_yaml(&content))
-                .or_else(|_| Self::from_json_str(&content)),
+            _ => match crate::parser::parse_dae_config_file(path) {
+                Ok(config) => Ok(config),
+                // An include directive was recognized, so returning a
+                // structured-format error would hide the actionable cause.
+                Err(err @ crate::ConfigError::Include(_)) => Err(err),
+                Err(_) => parse_toml(&content)
+                    .or_else(|_| parse_yaml(&content))
+                    .or_else(|_| Self::from_json_str(&content)),
+            },
         }
     }
 

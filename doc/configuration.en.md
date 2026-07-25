@@ -8,8 +8,8 @@ For field-by-field component details (every node/group/DNS/CLI option), see [com
 
 honk is configured in the **dae configuration syntax** — the original `{ section { ... } }` language used by [dae](https://github.com/daeuniverse/dae):
 
-- Configuration is organized into **sections**: `global { ... }`, `node { ... }`, `group { ... }`, `routing { ... }`, `dns { ... }`, `subscription { ... }`, `experimental { ... }`.
-- Inside a section, settings are `key: value` pairs, one per line.
+- Configuration is organized into **sections**: `include { ... }`, `global { ... }`, `node { ... }`, `group { ... }`, `routing { ... }`, `dns { ... }`, `subscription { ... }`, `experimental { ... }`.
+- Inside non-`include` sections, settings are `key: value` pairs, one per line.
 - Strings containing special characters (URLs, `+`, `//`, `:`) should be **single-quoted**: `tcp_check_url: 'http://cp.cloudflare.com,1.1.1.1'`.
 - Lists are comma-separated inside a single value: `lan_interface: eth0, eth1`.
 - Durations accept suffixes: `30s`, `50ms`, `5m`, `1h`.
@@ -20,9 +20,26 @@ Repo examples:
 - `config.dae` — full-featured example
 - `config.min.dae` — minimal example (good for dev / `--mock-ebpf`)
 
+### Split configuration files
+
+Use a top-level `include` section to compose a configuration from `.dae` files:
+
+```dae
+include {
+    config.d/*.dae
+    '/etc/honk/config.d/extra config.dae'
+}
+```
+
+- Entries may be bare or quoted and support `*`, `?`, and `[]` glob patterns. Matches are loaded in lexical order; unmatched patterns, directories, and non-`.dae` files are skipped.
+- Relative paths are resolved from the directory of the entry config passed to `--config`, even in nested includes. Absolute paths are accepted only when they remain under that entry directory; symlink targets are checked as well.
+- The entry file's sections are merged first, followed by each included file and its descendants. Later scalar settings override earlier ones; nodes, groups, upstreams, and routing rules append in that order.
+- Repeating a file (including through a cycle) is rejected.
+
 ## 2. Top-level structure
 
 ```text
+include { ... }        # merge additional .dae configuration files
 global { ... }         # transparent proxy, health checks, dial mode, timeouts
 node { ... }           # static proxy nodes (share links)
 group { ... }          # selection policies over nodes / nested groups

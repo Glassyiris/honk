@@ -2,7 +2,7 @@
 
 Field-level reference for every major component. Companion to [configuration.en.md](./configuration.en.md).
 
-honk is configured in the **dae configuration syntax** — sections like `global { ... }`, `node { ... }`, `group { ... }`, `routing { ... }`, `dns { ... }`, `subscription { ... }`, `experimental { ... }` with `key: value` pairs. See the root examples `config.dae` (full-featured) and `config.min.dae` (minimal).
+honk is configured in the **dae configuration syntax** — sections like `include { ... }`, `global { ... }`, `node { ... }`, `group { ... }`, `routing { ... }`, `dns { ... }`, `subscription { ... }`, `experimental { ... }` with `key: value` pairs. `include` composes `.dae` files; see [configuration.en.md](./configuration.en.md#split-configuration-files) for its path and merge rules. See the root examples `config.dae` (full-featured) and `config.min.dae` (minimal).
 
 Source of truth: `crates/honk-config/src/*`, the dae parser in `crates/honk-config/src/parser/`, handlers under `crates/honk-outbound/src/proxy/`, CLI in `crates/honk-core`.
 
