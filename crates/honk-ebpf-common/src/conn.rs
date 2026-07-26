@@ -190,4 +190,5 @@ impl ConntrackArgs {
     }
 }
 
+#[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for ConnState {}
