@@ -307,6 +307,41 @@ async fn test_proxies_structure_and_selector_switch() {
     assert_eq!(resp.status(), 400);
 }
 
+/// Dashboards (metacubexd/zashboard) send PUT/PATCH without a JSON
+/// Content-Type; the API must still accept them (mihomo parity).
+#[tokio::test]
+async fn test_put_and_patch_without_content_type() {
+    let app = spawn_app("", "").await;
+    let client = http_client();
+
+    let resp = client
+        .put(app.url("/proxies/proxy"))
+        .body(r#"{"name":"node-b"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    let db = app.state.cache_db.as_ref().unwrap();
+    assert_eq!(db.load_selector_choice("proxy").as_deref(), Some("node-b"));
+
+    let resp = client
+        .patch(app.url("/configs"))
+        .body(r#"{"mode":"global"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    let body: serde_json::Value = client
+        .get(app.url("/configs"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["mode"], "Global");
+}
+
 /// Parent selector containing a sub-group: the sub-group tag appears in
 /// `all`, is a valid PUT target (persisted + restored on "restart"), and
 /// the selection chain resolves through it to the leaf.

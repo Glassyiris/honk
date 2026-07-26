@@ -188,14 +188,8 @@ mod tests {
     #[test]
     fn extract_strips_single_top_directory() {
         let zip_bytes = make_zip(&[
-            (
-                "dist/index.html",
-                b"<html>zashboard</html>".as_slice(),
-            ),
-            (
-                "dist/assets/app.js",
-                b"console.log(1)".as_slice(),
-            ),
+            ("dist/index.html", b"<html>zashboard</html>".as_slice()),
+            ("dist/assets/app.js", b"console.log(1)".as_slice()),
         ]);
         let dir = tempfile::tempdir().unwrap();
         extract_ui_zip(&zip_bytes, dir.path()).unwrap();
@@ -268,10 +262,7 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_downloads_into_empty_directory() {
-        let zip_bytes = make_zip(&[(
-            "dist/index.html",
-            b"<html>y</html>".as_slice(),
-        )]);
+        let zip_bytes = make_zip(&[("dist/index.html", b"<html>y</html>".as_slice())]);
         let addr = spawn_zip_server(zip_bytes).await;
         let dir = tempfile::tempdir().unwrap();
         let ui_dir = dir.path().join("ui");

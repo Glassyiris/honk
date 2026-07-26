@@ -284,10 +284,12 @@ async fn put_configs() -> StatusCode {
 
 /// PATCH /configs — update specific fields; `{mode}` switches the clash
 /// mode (Rule/Global/Direct, case-insensitive) and persists it to cache.db.
-async fn patch_configs(
-    State(s): State<Arc<ClashState>>,
-    Json(body): Json<serde_json::Value>,
-) -> Response {
+/// The body is parsed regardless of Content-Type (dashboard parity).
+async fn patch_configs(State(s): State<Arc<ClashState>>, body: Bytes) -> Response {
+    let body: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("invalid body: {e}")),
+    };
     if let Some(mode_str) = body.get("mode").and_then(|v| v.as_str()) {
         let Some(mode) = ModeState::normalize(mode_str) else {
             return error_response(
@@ -500,8 +502,15 @@ struct PutProxyBody {
 async fn put_proxy(
     State(s): State<Arc<ClashState>>,
     Path(group_name): Path<String>,
-    Json(body): Json<PutProxyBody>,
+    body: Bytes,
 ) -> Response {
+    // Dashboards (metacubexd/zashboard) PUT the selection without a JSON
+    // Content-Type; accept any content type (mihomo parity) and fail only
+    // on a genuinely malformed body.
+    let body: PutProxyBody = match serde_json::from_slice(&body) {
+        Ok(b) => b,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("invalid body: {e}")),
+    };
     // GLOBAL is a synthetic selector backed by the shared mode state.
     if group_name == "GLOBAL" {
         let config = s.config.read().await;
