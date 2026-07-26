@@ -34,6 +34,7 @@ scp target/x86_64-unknown-linux-musl/release/honk-tool vyos@<网关>:/tmp/
 ```bash
 honk-tool sub <url|file> [--target HOST:PORT] [--url TEST_URL]
               [--timeout SECS] [--concurrency N] [--limit N] [--ua UA]
+              [--v4-target IP:PORT] [--v6-target [IP]:PORT]
 ```
 
 拉取订阅（自动识别 base64 / 原始行 / Clash YAML）或读取本地分享链接文件，
@@ -50,6 +51,11 @@ honk-tool sub <url|file> [--target HOST:PORT] [--url TEST_URL]
   quinn)。
 
 末尾输出双栈存活数和延迟中位数。
+
+**v6 显示 `no-AAAA`?** v4/v6 探测通过解析测试主机挑选对应族的地址。当解析器
+不返回 AAAA 时（典型场景：honk DNS 配置 `ipversion_prefer: 4`,AAAA 应答被抑制）,v6
+显示 `no-AAAA`。可用 dae 风格显式目标跳过 DNS:
+`--v4-target 1.1.1.1:443 --v6-target '[2606:4700:4700::1111]:443'`。
 
 ```text
 $ honk-tool sub https://example.com/sub --limit 3

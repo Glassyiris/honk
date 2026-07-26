@@ -40,6 +40,15 @@ pub struct SubArgs {
     /// User-Agent for the subscription fetch.
     #[arg(long)]
     pub ua: Option<String>,
+    /// Explicit IPv4 target for the v4 probe (dae-style, e.g. 1.1.1.1:443).
+    /// Overrides DNS resolution for that family.
+    #[arg(long)]
+    pub v4_target: Option<SocketAddr>,
+    /// Explicit IPv6 target for the v6 probe (dae-style, e.g.
+    /// [2606:4700:4700::1111]:443).  Use when the resolver gives no AAAA
+    /// (e.g. ipversion_prefer: 4 DNS) or the host has none.
+    #[arg(long)]
+    pub v6_target: Option<SocketAddr>,
 }
 
 struct ProbeOutcome {
@@ -75,9 +84,15 @@ pub async fn run(args: SubArgs) -> anyhow::Result<()> {
             && let Some(node) = pending.next()
         {
             let registry = Arc::clone(&registry);
-            let url = args.url.clone();
-            let (host, port) = (url_host.to_string(), url_port);
-            set.spawn(async move { probe_node(&registry, node, &host, port, url, timeout).await });
+            let targets = Arc::new(ProbeTargets {
+                host: url_host.to_string(),
+                port: url_port,
+                url: args.url.clone(),
+                timeout,
+                v4: args.v4_target,
+                v6: args.v6_target,
+            });
+            set.spawn(async move { probe_node(&registry, node, &targets).await });
             running += 1;
         }
         match set.join_next().await {
@@ -189,26 +204,34 @@ fn print_summary_header(nodes: &[Node]) {
     println!("protocols: {breakdown}\n");
 }
 
+/// Everything a probe run needs to reach the test target.
+struct ProbeTargets {
+    host: String,
+    port: u16,
+    url: Option<String>,
+    timeout: Duration,
+    v4: Option<SocketAddr>,
+    v6: Option<SocketAddr>,
+}
+
 async fn probe_node(
     registry: &ProxyRegistry,
     node: Node,
-    url_host: &str,
-    url_port: u16,
-    url: Option<String>,
-    timeout: Duration,
+    targets: &ProbeTargets,
 ) -> ProbeOutcome {
+    let (url_host, url_port, timeout) = (targets.host.as_str(), targets.port, targets.timeout);
     let server_families = server_families(&node).await;
     let handler = registry.find(node.protocol);
 
-    let v4 = probe_family(registry, &node, url_host, url_port, false, timeout).await;
-    let v6 = probe_family(registry, &node, url_host, url_port, true, timeout).await;
+    let v4 = probe_family(registry, &node, url_host, url_port, false, timeout, targets.v4).await;
+    let v6 = probe_family(registry, &node, url_host, url_port, true, timeout, targets.v6).await;
 
     let udp_dns = probe_udp_dns(registry, &node, timeout).await;
     let udp_quic = probe_udp_quic(registry, &node, url_host, url_port, timeout).await;
 
     let urltest = match handler {
         Some(handler) => {
-            let url = url.unwrap_or_default();
+            let url = targets.url.clone().unwrap_or_default();
             urltest_node(&node, handler, &url, timeout)
                 .await
                 .map_err(|e| e.to_string())
@@ -251,6 +274,9 @@ async fn server_families(node: &Node) -> (bool, bool) {
 
 /// Dial the test host through the node over one address family; measures the
 /// full protocol handshake time (TLS included for TLS-based protocols).
+/// `explicit` (dae-style `--v4-target`/`--v6-target`) skips DNS for that
+/// family — without it the family is `None` ("no-AAAA") when the resolver
+/// returns no address of that family.
 async fn probe_family(
     registry: &ProxyRegistry,
     node: &Node,
@@ -258,13 +284,14 @@ async fn probe_family(
     url_port: u16,
     v6: bool,
     timeout: Duration,
+    explicit: Option<SocketAddr>,
 ) -> Option<Result<Duration, String>> {
-    let addr: SocketAddr = match tokio::net::lookup_host((url_host, url_port)).await {
-        Ok(mut addrs) => match addrs.find(|a| a.is_ipv6() == v6) {
-            Some(a) => a,
-            None => return None, // family not available for the test host
+    let addr: SocketAddr = match explicit {
+        Some(a) => a,
+        None => match tokio::net::lookup_host((url_host, url_port)).await {
+            Ok(mut addrs) => addrs.find(|a| a.is_ipv6() == v6)?,
+            Err(e) => return Some(Err(format!("resolve {url_host}: {e}"))),
         },
-        Err(e) => return Some(Err(format!("resolve {url_host}: {e}"))),
     };
     let start = Instant::now();
     let result = registry.dial(node, addr, Some(url_host), timeout).await;
@@ -281,7 +308,10 @@ fn print_outcome(o: &ProbeOutcome) {
         if o.server_v6 { "+v6" } else { "" }
     );
     let family_str = |r: &Option<Result<Duration, String>>| match r {
-        None => "n/a".to_string(),
+        // None means the resolver returned no address of that family (e.g.
+        // AAAA suppressed by ipversion_prefer: 4) and no explicit
+        // --v4-target/--v6-target was given.
+        None => "no-AAAA".to_string(),
         Some(Ok(d)) => format!("{}ms", d.as_millis()),
         Some(Err(e)) => format!("FAIL({})", short_err(e)),
     };

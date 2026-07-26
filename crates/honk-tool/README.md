@@ -36,6 +36,7 @@ scp target/x86_64-unknown-linux-musl/release/honk-tool vyos@<gateway>:/tmp/
 ```bash
 honk-tool sub <url|file> [--target HOST:PORT] [--url TEST_URL]
               [--timeout SECS] [--concurrency N] [--limit N] [--ua UA]
+              [--v4-target IP:PORT] [--v6-target [IP]:PORT]
 ```
 
 Fetches a subscription (base64 / raw-line / Clash YAML, auto-detected) or
@@ -53,6 +54,12 @@ every node concurrently:
   custom `AsyncUdpSocket` on top of the tunnel.
 
 Ends with alive-per-family counts and the median latency.
+
+**v6 shows `no-AAAA`?** The v4/v6 probes resolve the test host and pick an
+address of each family. When the resolver returns no AAAA (e.g. honk's DNS
+with `ipversion_prefer: 4`, which suppresses AAAA answers), the v6 probe
+reports `no-AAAA`. Pass explicit dae-style targets to skip DNS:
+`--v4-target 1.1.1.1:443 --v6-target '[2606:4700:4700::1111]:443'`.
 
 ```text
 $ honk-tool sub https://example.com/sub --limit 3
