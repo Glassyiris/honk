@@ -6,6 +6,7 @@ members = [
     "crates/honk-ebpf-common",
     "crates/honk-outbound",
     "crates/honk-core",
+    "crates/honk-tool",
 ]
 exclude = ["crates/honk-ebpf"]
 
