@@ -2,7 +2,7 @@
 //! `experimental/clashapi/server_resources.go` equivalent).
 //!
 //! When `experimental.clash_api.external_ui` points at a missing or empty
-//! directory, a background task downloads the Yacd-meta dashboard zip from
+//! directory, a background task downloads the zashboard dashboard zip from
 //! GitHub and extracts it into that directory, stripping the single
 //! top-level archive directory. The download never blocks startup and
 //! failures only log a warning — `ServeDir` keeps returning 404 until the
@@ -15,9 +15,9 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// Default dashboard archive (Yacd-meta `gh-pages` branch).
+/// Default dashboard archive (zashboard release `dist.zip`, latest).
 pub const DEFAULT_UI_DOWNLOAD_URL: &str =
-    "https://github.com/MetaCubeX/Yacd-meta/archive/refs/heads/gh-pages.zip";
+    "https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip";
 
 /// Environment variable overriding [`DEFAULT_UI_DOWNLOAD_URL`].
 pub const UI_DOWNLOAD_URL_ENV: &str = "HONK_UI_DOWNLOAD_URL";
@@ -189,11 +189,11 @@ mod tests {
     fn extract_strips_single_top_directory() {
         let zip_bytes = make_zip(&[
             (
-                "Yacd-meta-gh-pages/index.html",
-                b"<html>yacd</html>".as_slice(),
+                "dist/index.html",
+                b"<html>zashboard</html>".as_slice(),
             ),
             (
-                "Yacd-meta-gh-pages/assets/app.js",
+                "dist/assets/app.js",
                 b"console.log(1)".as_slice(),
             ),
         ]);
@@ -202,14 +202,14 @@ mod tests {
 
         assert_eq!(
             std::fs::read(dir.path().join("index.html")).unwrap(),
-            b"<html>yacd</html>"
+            b"<html>zashboard</html>"
         );
         assert_eq!(
             std::fs::read(dir.path().join("assets/app.js")).unwrap(),
             b"console.log(1)"
         );
         // The top-level archive directory must not appear.
-        assert!(!dir.path().join("Yacd-meta-gh-pages").exists());
+        assert!(!dir.path().join("dist").exists());
     }
 
     #[test]
@@ -269,7 +269,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_downloads_into_empty_directory() {
         let zip_bytes = make_zip(&[(
-            "Yacd-meta-gh-pages/index.html",
+            "dist/index.html",
             b"<html>y</html>".as_slice(),
         )]);
         let addr = spawn_zip_server(zip_bytes).await;

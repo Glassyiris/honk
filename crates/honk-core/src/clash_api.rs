@@ -1,4 +1,4 @@
-//! Clash-compatible REST API server for Yacd / Metacubexd dashboards.
+//! Clash-compatible REST API server for zashboard / Metacubexd dashboards.
 //!
 //! Enabled via `experimental.clash_api.external_controller` and compiled in
 //! with the `clash-api` cargo feature (on by default). Implements the
@@ -332,7 +332,7 @@ fn clash_group_type(policy: GroupPolicy) -> &'static str {
     }
 }
 
-/// Build a single proxy info object used by Yacd/Metacubexd for a group.
+/// Build a single proxy info object used by zashboard/Metacubexd for a group.
 fn build_group_proxy_info(
     group: &Group,
     group_manager: &GroupManager,
@@ -1198,7 +1198,7 @@ async fn flush_dns(State(s): State<Arc<ClashState>>) -> StatusCode {
 }
 
 /// Each group is exposed as a proxy provider holding its members — the
-/// minimal provider document dashboards (Yacd/Metacubexd) render. Nested
+/// minimal provider document dashboards (zashboard/Metacubexd) render. Nested
 /// sub-groups appear under their own tag (their representative leaf
 /// supplies the delay history), matching the `all` member list.
 async fn get_proxy_providers(State(s): State<Arc<ClashState>>) -> Json<serde_json::Value> {
