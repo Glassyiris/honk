@@ -112,18 +112,6 @@ impl ConnectionTracker {
             .collect()
     }
 
-    /// Return the current number of tracked connections.
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Return true if there are no tracked connections.
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
     /// Force-remove a connection by ID (for admin-initiated close).
     pub fn close_connection(&self, id: &str) {
         self.entries.remove(id);

@@ -38,6 +38,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::debug;
 
+use super::addr;
 use super::shadowsocks_2022::{self, Ss2022Method, Ss2022UdpSession};
 use super::{ProxyHandler, ProxyStream, UdpProxySocket};
 
@@ -222,7 +223,7 @@ impl ShadowsocksHandler {
     }
 
     /// Derive the master key from the password using OpenSSL's EVP_BytesToKey.
-    fn master_key(password: &str, key_len: usize) -> Vec<u8> {
+    pub(crate) fn master_key(password: &str, key_len: usize) -> Vec<u8> {
         use md5::{Digest, Md5};
         let mut key = Vec::with_capacity(key_len);
         let mut last = Vec::new();
@@ -235,28 +236,6 @@ impl ShadowsocksHandler {
         }
         key.truncate(key_len);
         key
-    }
-
-    pub(crate) fn encode_address(target: SocketAddr, target_domain: Option<&str>) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(19);
-        if let Some(domain) = target_domain {
-            buf.push(0x03);
-            buf.push(domain.len().min(u8::MAX as usize) as u8);
-            buf.extend_from_slice(domain.as_bytes());
-        } else {
-            match target {
-                SocketAddr::V4(v4) => {
-                    buf.push(0x01);
-                    buf.extend_from_slice(&v4.ip().octets());
-                }
-                SocketAddr::V6(v6) => {
-                    buf.push(0x04);
-                    buf.extend_from_slice(&v6.ip().octets());
-                }
-            }
-        }
-        buf.extend_from_slice(&target.port().to_be_bytes());
-        buf
     }
 
     /// Shared dial tail: connect (or reuse `server`), spawn the appropriate
@@ -324,7 +303,7 @@ impl ProxyHandler for ShadowsocksHandler {
         debug!("Shadowsocks: connecting to {} for target {}", addr, target);
         let server = crate::util::connect_outbound(&addr, connect_timeout).await?;
 
-        let header = Self::encode_address(target, target_domain);
+        let header = addr::encode_address(target, target_domain);
         self.start_relay(method, password, server, header, target, target_domain)
             .await
     }
@@ -339,7 +318,7 @@ impl ProxyHandler for ShadowsocksHandler {
     ) -> anyhow::Result<ProxyStream> {
         let method = node.encryption.as_deref().unwrap_or("aes-128-gcm");
         let password = node.password.as_deref().unwrap_or("");
-        let header = Self::encode_address(target, target_domain);
+        let header = addr::encode_address(target, target_domain);
         self.start_relay(method, password, server, header, target, target_domain)
             .await
     }
@@ -364,7 +343,7 @@ impl ProxyHandler for ShadowsocksHandler {
     ) -> anyhow::Result<UdpProxySocket> {
         let method = node.encryption.as_deref().unwrap_or("aes-128-gcm");
         let password = node.password.as_deref().unwrap_or("");
-        let socks = Self::encode_address(target, target_domain);
+        let socks = addr::encode_address(target, target_domain);
 
         let crypto = if is_2022_method(method) {
             SsUdpCrypto::V2022(Box::new(Ss2022UdpSession::new(Ss2022Method::new(
@@ -575,35 +554,6 @@ pub(crate) fn increment_nonce(nonce: &mut [u8]) {
     }
 }
 
-/// Length in bytes of the SOCKS5-style address at the start of `buf`.
-pub(crate) fn socks_addr_len(buf: &[u8]) -> anyhow::Result<usize> {
-    match buf.first() {
-        Some(0x01) => {
-            if buf.len() < 7 {
-                anyhow::bail!("truncated IPv4 socks address");
-            }
-            Ok(7)
-        }
-        Some(0x03) => {
-            if buf.len() < 2 {
-                anyhow::bail!("truncated domain socks address");
-            }
-            let len = buf[1] as usize;
-            if buf.len() < 2 + len + 2 {
-                anyhow::bail!("truncated domain socks address");
-            }
-            Ok(2 + len + 2)
-        }
-        Some(0x04) => {
-            if buf.len() < 19 {
-                anyhow::bail!("truncated IPv6 socks address");
-            }
-            Ok(19)
-        }
-        other => anyhow::bail!("invalid socks address type {:?}", other),
-    }
-}
-
 /// Legacy AEAD UDP encapsulation: `salt | AEAD(subkey)(addr | payload)`
 /// with a fresh random salt and an all-zero nonce per datagram.
 pub(crate) struct LegacyUdpCrypto {
@@ -654,7 +604,7 @@ impl LegacyUdpCrypto {
         let body = cipher
             .open(&nonce, ciphertext)
             .map_err(|e| anyhow::anyhow!("open UDP packet failed: {:?}", e))?;
-        let skip = socks_addr_len(&body)?;
+        let skip = addr::socks_addr_len(&body)?;
         Ok(body[skip..].to_vec())
     }
 }
@@ -743,25 +693,6 @@ mod tests {
     }
 
     #[test]
-    fn test_address_encoding_ipv4() {
-        let target = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(93, 184, 216, 34), 80));
-        let encoded = ShadowsocksHandler::encode_address(target, None);
-        assert_eq!(encoded[0], 0x01);
-        assert_eq!(&encoded[1..5], &[93, 184, 216, 34]);
-        assert_eq!(&encoded[5..7], &[0x00, 0x50]);
-    }
-
-    #[test]
-    fn test_address_encoding_domain() {
-        let target = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 443));
-        let encoded = ShadowsocksHandler::encode_address(target, Some("example.com"));
-        assert_eq!(encoded[0], 0x03);
-        assert_eq!(encoded[1], 11);
-        assert_eq!(&encoded[2..13], b"example.com");
-        assert_eq!(&encoded[13..15], &[0x01, 0xbb]);
-    }
-
-    #[test]
     fn test_nonce_increment() {
         let mut n = [0u8; 12];
         increment_nonce(&mut n);
@@ -793,25 +724,9 @@ mod tests {
     }
 
     #[test]
-    fn test_socks_addr_len() {
-        let v4 = ShadowsocksHandler::encode_address(
-            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 53)),
-            None,
-        );
-        assert_eq!(socks_addr_len(&v4).unwrap(), 7);
-        let domain = ShadowsocksHandler::encode_address(
-            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 443)),
-            Some("example.com"),
-        );
-        assert_eq!(socks_addr_len(&domain).unwrap(), 15);
-        assert!(socks_addr_len(&[0x05, 1, 2]).is_err());
-        assert!(socks_addr_len(&[0x01, 1]).is_err());
-    }
-
-    #[test]
     fn test_legacy_udp_roundtrip() {
         let crypto = LegacyUdpCrypto::new("aes-128-gcm", "test-password").unwrap();
-        let socks = ShadowsocksHandler::encode_address(
+        let socks = addr::encode_address(
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 53)),
             None,
         );
@@ -826,7 +741,7 @@ mod tests {
     #[test]
     fn test_legacy_udp_roundtrip_chacha() {
         let crypto = LegacyUdpCrypto::new("chacha20-ietf-poly1305", "test-password").unwrap();
-        let socks = ShadowsocksHandler::encode_address(
+        let socks = addr::encode_address(
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), 443)),
             Some("one.one"),
         );
@@ -860,7 +775,7 @@ mod tests {
                 let (n, src) = server.recv_from(&mut buf).await.unwrap();
                 let payload = server_crypto.open(&buf[..n]).unwrap();
                 let reply: Vec<u8> = payload.iter().map(|b| b.to_ascii_uppercase()).collect();
-                let socks = ShadowsocksHandler::encode_address("8.8.8.8:53".parse().unwrap(), None);
+                let socks = addr::encode_address("8.8.8.8:53".parse().unwrap(), None);
                 let packet = server_crypto.seal(&socks, &reply).unwrap();
                 server.send_to(&packet, src).await.unwrap();
             }

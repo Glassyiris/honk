@@ -53,7 +53,6 @@ enum PooledTransport {
 
 pub struct UpstreamPool {
     entries: HashMap<String, UpstreamEntry>,
-    router: Arc<DnsRouter>,
     proxy_registry: Option<Arc<ProxyRegistry>>,
     /// Fallback node list when no [`SharedGroupManager`] is installed (tests).
     nodes: Vec<Node>,
@@ -79,9 +78,12 @@ impl UpstreamPool {
         Self::new_with_proxy(upstreams, router, None, Vec::new(), Vec::new())
     }
 
+    // `router` is accepted for API compatibility with the DnsForwarder
+    // construction pattern (the forwarder owns the router; the pool only
+    // needs upstream entries).
     pub fn new_with_proxy(
         upstreams: &[DnsUpstream],
-        router: Arc<DnsRouter>,
+        _router: Arc<DnsRouter>,
         proxy_registry: Option<Arc<ProxyRegistry>>,
         nodes: Vec<Node>,
         groups: Vec<Group>,
@@ -113,7 +115,6 @@ impl UpstreamPool {
         }
         Ok(Self {
             entries,
-            router,
             proxy_registry,
             nodes,
             groups,
@@ -324,10 +325,6 @@ impl UpstreamPool {
             leaf.as_ref().map(|n| n.name.as_str())
         );
         Ok(leaf)
-    }
-
-    pub fn selector(&self, domain: &str) -> &str {
-        self.router.select_upstream(domain)
     }
 
     pub fn upstream_count(&self) -> usize {

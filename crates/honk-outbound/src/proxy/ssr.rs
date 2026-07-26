@@ -9,141 +9,39 @@
 //!
 //! The handler dials the SSR server, optionally sends a protocol header
 //! (auth_sha1_v4), then performs the standard SS AEAD handshake (salt +
-//! subkey exchange) and relays traffic through a background task.
+//! subkey exchange) and relays traffic through a background task. The AEAD
+//! cipher plumbing is shared with [`super::shadowsocks`]; only the legacy
+//! cipher family is valid here (the 2022 methods are rejected).
 //!
 //! Reference: <https://github.com/shadowsocksrr/shadowsocks-rss/blob/master/doc/protocol.md>
 
 use async_trait::async_trait;
-use hkdf::Hkdf;
 use honk_config::node::Node;
 use honk_config::types::NodeProtocol;
 use rand::Rng;
-use sha1::Sha1;
-use std::fmt;
 use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::debug;
 
+use super::addr;
+use super::shadowsocks::{
+    AeadCipher, CipherConf, ShadowsocksHandler, hkdf_sha1_derive, increment_nonce, write_chunks,
+};
 use super::{ProxyHandler, ProxyStream};
 
-const SS_SUBKEY_INFO: &[u8] = b"ss-subkey";
-const CHUNK_MAX_LEN: usize = 0x3FFF; // 2^14 - 1
 const AUTH_SHA1_V4_CLIENT_ID_LEN: usize = 4;
 const AUTH_SHA1_V4_RESPONSE_LEN: usize = 2;
 
-// Cipher support (same AEAD infrastructure as shadowsocks.rs).
-
-/// Cipher configuration shared by all supported AEAD methods.
-struct CipherConf {
-    key_len: usize,
-    salt_len: usize,
-    nonce_len: usize,
-    tag_len: usize,
-}
-
-impl CipherConf {
-    fn for_method(method: &str) -> anyhow::Result<Self> {
-        match method.to_lowercase().as_str() {
-            "aes-128-gcm" => Ok(CipherConf {
-                key_len: 16,
-                salt_len: 16,
-                nonce_len: 12,
-                tag_len: 16,
-            }),
-            "aes-256-gcm" => Ok(CipherConf {
-                key_len: 32,
-                salt_len: 32,
-                nonce_len: 12,
-                tag_len: 16,
-            }),
-            "chacha20-ietf-poly1305" | "chacha20-poly1305" => Ok(CipherConf {
-                key_len: 32,
-                salt_len: 32,
-                nonce_len: 12,
-                tag_len: 16,
-            }),
-            _ => anyhow::bail!("unsupported SSR cipher: {}", method),
-        }
+/// Cipher lookup for SSR: only the legacy AEAD methods are supported (the
+/// Shadowsocks 2022 family is rejected), erroring as an SSR cipher.
+fn ssr_cipher_conf(method: &str) -> anyhow::Result<CipherConf> {
+    if super::shadowsocks::is_2022_method(method) {
+        anyhow::bail!("unsupported SSR cipher: {}", method);
     }
-}
-
-/// Owned AEAD cipher enum so we can avoid trait-object gymnastics.
-enum AeadCipher {
-    Aes128Gcm(Box<aes_gcm::Aes128Gcm>),
-    Aes256Gcm(Box<aes_gcm::Aes256Gcm>),
-    ChaCha20Poly1305(Box<chacha20poly1305::ChaCha20Poly1305>),
-}
-
-impl AeadCipher {
-    fn new(method: &str, key: &[u8]) -> anyhow::Result<Self> {
-        use aes_gcm::aead::KeyInit;
-        match method.to_lowercase().as_str() {
-            "aes-128-gcm" => Ok(AeadCipher::Aes128Gcm(Box::new(
-                aes_gcm::Aes128Gcm::new_from_slice(key)?,
-            ))),
-            "aes-256-gcm" => Ok(AeadCipher::Aes256Gcm(Box::new(
-                aes_gcm::Aes256Gcm::new_from_slice(key)?,
-            ))),
-            "chacha20-ietf-poly1305" | "chacha20-poly1305" => Ok(AeadCipher::ChaCha20Poly1305(
-                Box::new(chacha20poly1305::ChaCha20Poly1305::new_from_slice(key)?),
-            )),
-            _ => anyhow::bail!("unsupported SSR cipher: {}", method),
-        }
-    }
-
-    fn seal(&self, nonce: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, aes_gcm::aead::Error> {
-        use aes_gcm::aead::Aead;
-        match self {
-            AeadCipher::Aes128Gcm(c) => {
-                let nonce: &aes_gcm::aead::Nonce<aes_gcm::Aes128Gcm> =
-                    nonce.try_into().map_err(|_| aes_gcm::aead::Error)?;
-                c.encrypt(nonce, plaintext)
-            }
-            AeadCipher::Aes256Gcm(c) => {
-                let nonce: &aes_gcm::aead::Nonce<aes_gcm::Aes256Gcm> =
-                    nonce.try_into().map_err(|_| aes_gcm::aead::Error)?;
-                c.encrypt(nonce, plaintext)
-            }
-            AeadCipher::ChaCha20Poly1305(c) => {
-                let nonce: &chacha20poly1305::aead::Nonce<chacha20poly1305::ChaCha20Poly1305> =
-                    nonce.try_into().map_err(|_| aes_gcm::aead::Error)?;
-                c.encrypt(nonce, plaintext)
-            }
-        }
-    }
-
-    fn open(&self, nonce: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, aes_gcm::aead::Error> {
-        use aes_gcm::aead::Aead;
-        match self {
-            AeadCipher::Aes128Gcm(c) => {
-                let nonce: &aes_gcm::aead::Nonce<aes_gcm::Aes128Gcm> =
-                    nonce.try_into().map_err(|_| aes_gcm::aead::Error)?;
-                c.decrypt(nonce, ciphertext)
-            }
-            AeadCipher::Aes256Gcm(c) => {
-                let nonce: &aes_gcm::aead::Nonce<aes_gcm::Aes256Gcm> =
-                    nonce.try_into().map_err(|_| aes_gcm::aead::Error)?;
-                c.decrypt(nonce, ciphertext)
-            }
-            AeadCipher::ChaCha20Poly1305(c) => {
-                let nonce: &chacha20poly1305::aead::Nonce<chacha20poly1305::ChaCha20Poly1305> =
-                    nonce.try_into().map_err(|_| aes_gcm::aead::Error)?;
-                c.decrypt(nonce, ciphertext)
-            }
-        }
-    }
-}
-
-impl fmt::Debug for AeadCipher {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            AeadCipher::Aes128Gcm(_) => f.write_str("Aes128Gcm"),
-            AeadCipher::Aes256Gcm(_) => f.write_str("Aes256Gcm"),
-            AeadCipher::ChaCha20Poly1305(_) => f.write_str("ChaCha20Poly1305"),
-        }
-    }
+    CipherConf::for_method(method)
+        .map_err(|_| anyhow::anyhow!("unsupported SSR cipher: {}", method))
 }
 
 /// Supported SSR protocol plugins.
@@ -222,45 +120,6 @@ impl ShadowsocksRHandler {
         Self
     }
 
-    /// Derive the master key from the password using OpenSSL's EVP_BytesToKey.
-    fn master_key(password: &str, key_len: usize) -> Vec<u8> {
-        use md5::{Digest, Md5};
-        let mut key = Vec::with_capacity(key_len);
-        let mut last = Vec::new();
-        while key.len() < key_len {
-            let mut h = Md5::new();
-            h.update(&last);
-            h.update(password.as_bytes());
-            last = h.finalize().to_vec();
-            key.extend_from_slice(&last);
-        }
-        key.truncate(key_len);
-        key
-    }
-
-    /// Encode the target address in SOCKS5-style format.
-    fn encode_address(target: SocketAddr, target_domain: Option<&str>) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(19);
-        if let Some(domain) = target_domain {
-            buf.push(0x03);
-            buf.push(domain.len().min(u8::MAX as usize) as u8);
-            buf.extend_from_slice(domain.as_bytes());
-        } else {
-            match target {
-                SocketAddr::V4(v4) => {
-                    buf.push(0x01);
-                    buf.extend_from_slice(&v4.ip().octets());
-                }
-                SocketAddr::V6(v6) => {
-                    buf.push(0x04);
-                    buf.extend_from_slice(&v6.ip().octets());
-                }
-            }
-        }
-        buf.extend_from_slice(&target.port().to_be_bytes());
-        buf
-    }
-
     /// Build the auth_sha1_v4 protocol header.
     ///
     /// Format:
@@ -323,6 +182,51 @@ impl ShadowsocksRHandler {
         )
         .into_bytes()
     }
+
+    /// Shared dial tail: derive key material, detect SSR plugins, spawn the
+    /// relay over `server` and wrap the client half.
+    async fn start_relay(
+        &self,
+        node: &Node,
+        server: TcpStream,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+    ) -> anyhow::Result<ProxyStream> {
+        let method = node.encryption.as_deref().unwrap_or("aes-128-gcm");
+        let conf = ssr_cipher_conf(method)?;
+        let password = node.password.as_deref().unwrap_or("");
+        let master_key = ShadowsocksHandler::master_key(password, conf.key_len);
+        let proto = SsrProtocol::from_node(node);
+        let obfs = SsrObfs::from_node(node);
+
+        let addr = format!("{}:{}", node.host(), node.port);
+        debug!(
+            "SSR: connecting to {} for target {} (proto={:?}, obfs={:?})",
+            addr, target, proto, obfs
+        );
+
+        let header = addr::encode_address(target, target_domain);
+        let (client_half, server_half) = tokio::io::duplex(65536);
+
+        tokio::spawn(ssr_relay(
+            server,
+            server_half,
+            method.to_string(),
+            master_key,
+            header,
+            proto,
+            obfs,
+            node.clone(),
+            target,
+            target_domain.map(|s| s.to_string()),
+        ));
+
+        Ok(ProxyStream {
+            stream: Box::new(client_half),
+            target_addr: target,
+            target_domain: target_domain.map(|s| s.to_string()),
+        })
+    }
 }
 
 #[async_trait]
@@ -339,40 +243,13 @@ impl ProxyHandler for ShadowsocksRHandler {
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<ProxyStream> {
         let method = node.encryption.as_deref().unwrap_or("aes-128-gcm");
-        let conf = CipherConf::for_method(method)?;
-        let password = node.password.as_deref().unwrap_or("");
-        let master_key = Self::master_key(password, conf.key_len);
-        let proto = SsrProtocol::from_node(node);
-        let obfs = SsrObfs::from_node(node);
+        // Validate the cipher up front so dial fails fast.
+        ssr_cipher_conf(method)?;
 
         let addr = format!("{}:{}", node.host(), node.port);
-        debug!(
-            "SSR: connecting to {} for target {} (proto={:?}, obfs={:?})",
-            addr, target, proto, obfs
-        );
         let server = crate::util::connect_outbound(&addr, connect_timeout).await?;
 
-        let header = Self::encode_address(target, target_domain);
-        let (client_half, server_half) = tokio::io::duplex(65536);
-
-        tokio::spawn(ssr_relay(
-            server,
-            server_half,
-            method.to_string(),
-            master_key,
-            header,
-            proto,
-            obfs,
-            node.clone(),
-            target,
-            target_domain.map(|s| s.to_string()),
-        ));
-
-        Ok(ProxyStream {
-            stream: Box::new(client_half),
-            target_addr: target,
-            target_domain: target_domain.map(|s| s.to_string()),
-        })
+        self.start_relay(node, server, target, target_domain).await
     }
 
     async fn dial_with_tcp(
@@ -383,34 +260,7 @@ impl ProxyHandler for ShadowsocksRHandler {
         server: TcpStream,
         _connect_timeout: std::time::Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let method = node.encryption.as_deref().unwrap_or("aes-128-gcm");
-        let password = node.password.as_deref().unwrap_or("");
-        let conf = CipherConf::for_method(method)?;
-        let master_key = Self::master_key(password, conf.key_len);
-        let proto = SsrProtocol::from_node(node);
-        let obfs = SsrObfs::from_node(node);
-
-        let header = Self::encode_address(target, target_domain);
-        let (client_half, server_half) = tokio::io::duplex(65536);
-
-        tokio::spawn(ssr_relay(
-            server,
-            server_half,
-            method.to_string(),
-            master_key,
-            header,
-            proto,
-            obfs,
-            node.clone(),
-            target,
-            target_domain.map(|s| s.to_string()),
-        ));
-
-        Ok(ProxyStream {
-            stream: Box::new(client_half),
-            target_addr: target,
-            target_domain: target_domain.map(|s| s.to_string()),
-        })
+        self.start_relay(node, server, target, target_domain).await
     }
 
     async fn test_connectivity(&self, node: &Node) -> bool {
@@ -440,7 +290,7 @@ async fn ssr_relay(
     target: SocketAddr,
     target_domain: Option<String>,
 ) -> anyhow::Result<()> {
-    let conf = CipherConf::for_method(&method)?;
+    let conf = ssr_cipher_conf(&method)?;
 
     // Split streams so read and write directions are independent.
     let (mut server_read, mut server_write) = server.into_split();
@@ -565,63 +415,6 @@ async fn ssr_relay(
     }
 }
 
-// Shared helpers (duplicated from shadowsocks.rs for module independence).
-
-/// Encrypt `payload` as Shadowsocks chunks and write them to the server.
-async fn write_chunks<W>(
-    writer: &mut W,
-    cipher: &AeadCipher,
-    nonce: &mut [u8],
-    payload: &[u8],
-) -> anyhow::Result<()>
-where
-    W: AsyncWriteExt + Unpin,
-{
-    let mut offset = 0;
-    while offset < payload.len() {
-        let end = (offset + CHUNK_MAX_LEN).min(payload.len());
-        let chunk = &payload[offset..end];
-
-        let len = chunk.len() as u16;
-        let mut len_plain = vec![0u8; 2];
-        len_plain.copy_from_slice(&len.to_be_bytes());
-        let len_cipher = cipher
-            .seal(nonce, &len_plain)
-            .map_err(|e| anyhow::anyhow!("encrypt length failed: {:?}", e))?;
-        increment_nonce(nonce);
-
-        let payload_cipher = cipher
-            .seal(nonce, chunk)
-            .map_err(|e| anyhow::anyhow!("encrypt payload failed: {:?}", e))?;
-        increment_nonce(nonce);
-
-        writer.write_all(&len_cipher).await?;
-        writer.write_all(&payload_cipher).await?;
-
-        offset = end;
-    }
-    Ok(())
-}
-
-/// Derive a per-session subkey with HKDF-SHA1.
-fn hkdf_sha1_derive(master_key: &[u8], salt: &[u8], okm: &mut [u8]) {
-    let hk = Hkdf::<Sha1>::new(Some(salt), master_key);
-    hk.expand(SS_SUBKEY_INFO, okm)
-        .expect("valid HKDF output length");
-}
-
-/// Increment a nonce treating it as a little-endian counter.
-fn increment_nonce(nonce: &mut [u8]) {
-    for byte in nonce.iter_mut() {
-        if *byte == 0xFF {
-            *byte = 0;
-        } else {
-            *byte += 1;
-            break;
-        }
-    }
-}
-
 /// HMAC-SHA1 implementation to avoid the `hmac` crate's digest version conflict.
 ///
 /// HMAC(K, m) = H((K' ⊕ opad) || H((K' ⊕ ipad) || m))
@@ -666,7 +459,6 @@ fn hmac_sha1(key: &[u8], message: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, SocketAddrV4};
 
     #[test]
     fn test_proto_origin_default() {
@@ -738,7 +530,7 @@ mod tests {
 
     #[test]
     fn test_evp_bytes_to_key() {
-        let key = ShadowsocksRHandler::master_key("foobar", 32);
+        let key = ShadowsocksHandler::master_key("foobar", 32);
         assert_eq!(key.len(), 32);
         // MD5("foobar") == 3858f62230ac3c915f300c664312c63f
         assert_eq!(
@@ -748,25 +540,6 @@ mod tests {
                 0xc6, 0x3f
             ]
         );
-    }
-
-    #[test]
-    fn test_address_encoding_ipv4() {
-        let target = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(93, 184, 216, 34), 80));
-        let encoded = ShadowsocksRHandler::encode_address(target, None);
-        assert_eq!(encoded[0], 0x01);
-        assert_eq!(&encoded[1..5], &[93, 184, 216, 34]);
-        assert_eq!(&encoded[5..7], &[0x00, 0x50]);
-    }
-
-    #[test]
-    fn test_address_encoding_domain() {
-        let target = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 443));
-        let encoded = ShadowsocksRHandler::encode_address(target, Some("example.com"));
-        assert_eq!(encoded[0], 0x03);
-        assert_eq!(encoded[1], 11);
-        assert_eq!(&encoded[2..13], b"example.com");
-        assert_eq!(&encoded[13..15], &[0x01, 0xbb]);
     }
 
     #[test]
@@ -809,11 +582,11 @@ mod tests {
 
     #[test]
     fn test_cipher_conf_lookup() {
-        assert!(CipherConf::for_method("aes-128-gcm").is_ok());
-        assert!(CipherConf::for_method("AES-256-GCM").is_ok());
-        assert!(CipherConf::for_method("chacha20-ietf-poly1305").is_ok());
-        assert!(CipherConf::for_method("chacha20-poly1305").is_ok());
-        assert!(CipherConf::for_method("rc4-md5").is_err());
+        assert!(ssr_cipher_conf("aes-128-gcm").is_ok());
+        assert!(ssr_cipher_conf("AES-256-GCM").is_ok());
+        assert!(ssr_cipher_conf("chacha20-ietf-poly1305").is_ok());
+        assert!(ssr_cipher_conf("chacha20-poly1305").is_ok());
+        assert!(ssr_cipher_conf("rc4-md5").is_err());
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! Registry-based proxy handler dispatch.
 
+pub(crate) mod addr;
 pub mod anytls;
 pub mod block;
 pub mod direct;
