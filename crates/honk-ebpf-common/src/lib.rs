@@ -349,5 +349,7 @@ pub struct OutboundStats {
     pub _pad: u32,
 }
 
+#[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for RedirectTuple {}
+#[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for RedirectEntry {}

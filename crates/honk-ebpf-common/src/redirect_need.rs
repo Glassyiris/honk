@@ -76,7 +76,11 @@ pub struct PIDName {
     pub pname: [u8; TASK_COMM_LEN],
 }
 
+#[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for TuplesKey {}
+#[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for RoutingHandoffEntry {}
+#[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for DomainRouting {}
+#[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for PIDName {}
