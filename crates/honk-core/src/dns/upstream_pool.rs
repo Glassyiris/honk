@@ -426,17 +426,41 @@ impl UpstreamPool {
         let socket = tokio::net::UdpSocket::from_std(sock2.into())?;
         socket.connect(addr).await?;
 
-        let resp = tokio::time::timeout(dns_query_timeout, async {
+        // Hedged retry: the first attempt gets a third of the budget, so a
+        // single lost datagram costs ~timeout/3 instead of the full timeout;
+        // the retry uses the full budget. (kixdns-style hedge.)
+        let first = (dns_query_timeout / 3).max(Duration::from_millis(200));
+        match Self::udp_roundtrip(&socket, addr, raw_query, first).await {
+            Ok(resp) => Ok(resp),
+            Err(first_err) => {
+                debug!("UDP DNS query to {addr} first attempt: {first_err}; retrying");
+                Self::udp_roundtrip(&socket, addr, raw_query, dns_query_timeout).await
+            }
+        }
+    }
+
+    async fn udp_roundtrip(
+        socket: &tokio::net::UdpSocket,
+        addr: SocketAddr,
+        raw_query: &[u8],
+        budget: Duration,
+    ) -> anyhow::Result<Vec<u8>> {
+        let resp = tokio::time::timeout(budget, async {
             socket.send(raw_query).await?;
             let mut buf = vec![0u8; 4096];
-            let n = socket.recv(&mut buf).await?;
-            buf.truncate(n);
-            Ok::<_, std::io::Error>(buf)
+            loop {
+                let n = socket.recv(&mut buf).await?;
+                // Match the query txid — stray/late answers (hedged retry
+                // duplicates, spoofed junk) are discarded instead of being
+                // cached or pushed into the domain routing map.
+                if n >= 2 && raw_query.len() >= 2 && buf[..2] == raw_query[..2] {
+                    buf.truncate(n);
+                    return Ok::<_, std::io::Error>(buf);
+                }
+            }
         })
         .await
-        .map_err(|_| {
-            anyhow::anyhow!("UDP DNS query to {addr} timed out after {dns_query_timeout:?}")
-        })??;
+        .map_err(|_| anyhow::anyhow!("UDP DNS query to {addr} timed out after {budget:?}"))??;
         Ok(resp)
     }
 
@@ -480,6 +504,18 @@ impl DnsUpstreamPool for UpstreamPool {
             if proxy_node.is_none() {
                 let addr = Self::resolve_udp_addr(entry).await?;
                 let response = Self::query_udp(addr, raw_query, self.dns_query_timeout).await?;
+                // Truncated answer (TC): re-query over TCP (RFC 7766) so the
+                // full response is what gets cached and routed on.
+                if response.len() >= 4 && response[2] & 0x02 != 0 {
+                    debug!(
+                        "DNS upstream '{}' UDP answer has TC set — retrying over TCP",
+                        upstream_name
+                    );
+                    let dial = self.dial_context(entry, None);
+                    let pool = TcpPool::new(dial);
+                    let response = pool.exchange(raw_query).await?;
+                    return Ok(response);
+                }
                 debug!(
                     "DNS upstream '{}' (udp {}) returned {} bytes",
                     upstream_name,
@@ -686,6 +722,92 @@ mod tests {
         assert_eq!(r1, response);
         assert_eq!(r2, response);
         server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_udp_hedged_retry_on_loss() {
+        let response = mock_dns_response(0x1234);
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let resp_clone = response.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            // Drop the first query; answer the hedged retry.
+            let _ = server.recv_from(&mut buf).await.unwrap();
+            let (_n, src) = server.recv_from(&mut buf).await.unwrap();
+            server.send_to(&resp_clone, src).await.unwrap();
+        });
+
+        let upstream = make_upstream("hedged", &server_addr.to_string(), DnsProtocol::Udp);
+        let pool = UpstreamPool::new(&[upstream], make_router()).unwrap();
+        let result = pool
+            .query("hedged", &mock_dns_query(0x1234))
+            .await
+            .expect("hedged retry should succeed");
+        assert_eq!(result, response);
+    }
+
+    #[tokio::test]
+    async fn test_udp_txid_mismatch_discarded() {
+        let wrong = mock_dns_response(0x9999);
+        let right = mock_dns_response(0x1234);
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let right_clone = right.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (_n, src) = server.recv_from(&mut buf).await.unwrap();
+            // Stray/late answer with a foreign txid first, then the real one.
+            server.send_to(&wrong, src).await.unwrap();
+            server.send_to(&right_clone, src).await.unwrap();
+        });
+
+        let upstream = make_upstream("txid", &server_addr.to_string(), DnsProtocol::Udp);
+        let pool = UpstreamPool::new(&[upstream], make_router()).unwrap();
+        let result = pool
+            .query("txid", &mock_dns_query(0x1234))
+            .await
+            .expect("query should succeed");
+        assert_eq!(result, right);
+    }
+
+    #[tokio::test]
+    async fn test_udp_truncated_answer_upgrades_to_tcp() {
+        let mut tc_response = mock_dns_response(0x1234);
+        tc_response[2] |= 0x02; // TC flag
+        let full_response = mock_dns_response(0x1234);
+
+        let udp_server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = udp_server.local_addr().unwrap();
+        let tcp_listener = TcpListener::bind(addr).await.unwrap();
+
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (_n, src) = udp_server.recv_from(&mut buf).await.unwrap();
+            udp_server.send_to(&tc_response, src).await.unwrap();
+        });
+        let full_clone = full_response.clone();
+        tokio::spawn(async move {
+            let (mut stream, _) = tcp_listener.accept().await.unwrap();
+            let mut len_buf = [0u8; 2];
+            stream.read_exact(&mut len_buf).await.unwrap();
+            let qlen = u16::from_be_bytes(len_buf) as usize;
+            let mut qbuf = vec![0u8; qlen];
+            stream.read_exact(&mut qbuf).await.unwrap();
+            let rlen = full_clone.len() as u16;
+            stream.write_all(&rlen.to_be_bytes()).await.unwrap();
+            stream.write_all(&full_clone).await.unwrap();
+        });
+
+        let upstream = make_upstream("tc", &addr.to_string(), DnsProtocol::Udp);
+        let pool = UpstreamPool::new(&[upstream], make_router()).unwrap();
+        let result = pool
+            .query("tc", &mock_dns_query(0x1234))
+            .await
+            .expect("TC upgrade should succeed");
+        assert_eq!(result, full_response);
     }
 
     #[test]
