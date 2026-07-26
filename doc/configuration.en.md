@@ -368,7 +368,7 @@ experimental {
 
 Useful endpoints: `/proxies`, `/proxies/{name}` (PUT selector), `/proxies/{name}/delay`, `/group/{name}/delay`, `/connections`, `/traffic`, `/logs`, `/dns/query`, `/stats`.
 
-Env: `HONK_UI_DOWNLOAD_URL` overrides the default Yacd-meta zip URL when `external_ui` is empty/missing.
+Env: `HONK_UI_DOWNLOAD_URL` overrides the default zashboard zip URL when `external_ui` is empty/missing.
 
 ### Cache file
 

@@ -1,4 +1,5 @@
 use super::*;
+use crate::dns::wire::extract_ips_from_dns_response;
 
 #[cfg(target_os = "linux")]
 const IPV6_TRANSPARENT_OPT: libc::c_int = libc::IPV6_TRANSPARENT;
@@ -987,88 +988,4 @@ impl DomainResolveNotifier for DnsBpfNotifier {
             domain, rule_name, ips
         );
     }
-}
-
-/// Parse IPv4 and IPv6 addresses from a DNS response.
-fn extract_ips_from_dns_response(response: &[u8]) -> Vec<std::net::IpAddr> {
-    let mut ips = Vec::new();
-    if response.len() < 12 {
-        return ips;
-    }
-
-    let ancount = u16::from_be_bytes([response[6], response[7]]) as usize;
-    let mut pos = 12;
-
-    // Skip question section
-    while pos < response.len() && response[pos] != 0 {
-        let label_len = response[pos] as usize;
-        if label_len >= 64 {
-            pos += 2;
-            break;
-        }
-        if label_len == 0 {
-            pos += 1;
-            break;
-        }
-        pos += 1 + label_len;
-    }
-    if pos >= response.len() {
-        return ips;
-    }
-    pos += 1; // Skip terminating zero of qname
-    pos += 4; // Skip QTYPE + QCLASS
-
-    for _ in 0..ancount {
-        if pos + 10 > response.len() {
-            break;
-        }
-        pos = skip_dns_name(response, pos);
-        if pos + 10 > response.len() {
-            break;
-        }
-
-        let qtype = u16::from_be_bytes([response[pos], response[pos + 1]]);
-        let rdlength = u16::from_be_bytes([response[pos + 8], response[pos + 9]]) as usize;
-        pos += 10;
-
-        if pos + rdlength > response.len() {
-            break;
-        }
-
-        match qtype {
-            1 if rdlength == 4 => {
-                let ip = std::net::Ipv4Addr::new(
-                    response[pos],
-                    response[pos + 1],
-                    response[pos + 2],
-                    response[pos + 3],
-                );
-                ips.push(std::net::IpAddr::V4(ip));
-            }
-            28 if rdlength == 16 => {
-                let mut octets = [0u8; 16];
-                octets.copy_from_slice(&response[pos..pos + 16]);
-                ips.push(std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets)));
-            }
-            _ => {}
-        }
-        pos += rdlength;
-    }
-
-    ips
-}
-
-/// Skip a DNS name at `pos` and return the new position.
-fn skip_dns_name(response: &[u8], mut pos: usize) -> usize {
-    while pos < response.len() {
-        let byte = response[pos];
-        if byte == 0 {
-            return pos + 1;
-        }
-        if byte & 0xC0 == 0xC0 {
-            return pos + 2;
-        }
-        pos += 1 + byte as usize;
-    }
-    pos
 }

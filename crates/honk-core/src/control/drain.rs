@@ -9,7 +9,6 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Tracks the state of connection draining during shutdown.
 pub struct DrainTracker {
@@ -95,99 +94,5 @@ impl DrainTracker {
 impl Default for DrainTracker {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// Orchestrates a graceful shutdown sequence:
-/// 1. Detach BPF hooks (restore network immediately)
-/// 2. Stop accepting new connections
-/// 3. Drain existing connections with timeout
-/// 4. Run deferred cleanup functions
-pub struct GracefulShutdown {
-    bpf_hooks_detached: AtomicBool,
-    shutdown_timeout: Duration,
-}
-
-impl GracefulShutdown {
-    pub fn new() -> Self {
-        Self {
-            bpf_hooks_detached: AtomicBool::new(false),
-            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
-        }
-    }
-
-    /// Detach BPF hooks immediately. Safe to call multiple times.
-    ///
-    /// Returns true if this was the first call (hooks were actually detached).
-    pub fn detach_bpf_hooks<F>(&self, detach_fn: F) -> anyhow::Result<bool>
-    where
-        F: FnOnce() -> anyhow::Result<()>,
-    {
-        if self.bpf_hooks_detached.swap(true, Ordering::SeqCst) {
-            return Ok(false);
-        }
-
-        info!("[Shutdown] Detaching BPF hooks to restore network");
-        detach_fn()?;
-        info!("[Shutdown] BPF hooks detached, network restored");
-        Ok(true)
-    }
-
-    /// Execute the full shutdown sequence.
-    pub async fn execute<F, G>(
-        &self,
-        drain_tracker: &DrainTracker,
-        detach_bpf: F,
-        run_deferred: G,
-    ) -> anyhow::Result<()>
-    where
-        F: FnOnce() -> anyhow::Result<()>,
-        G: FnOnce() -> anyhow::Result<()>,
-    {
-        self.detach_bpf_hooks(detach_bpf)?;
-        drain_tracker.drain().await?;
-
-        info!(
-            "[Shutdown] Running deferred cleanup (timeout {:?})",
-            self.shutdown_timeout
-        );
-        let result = tokio::time::timeout(self.shutdown_timeout, async { run_deferred() }).await;
-
-        match result {
-            Ok(Ok(())) => info!("[Shutdown] Cleanup complete"),
-            Ok(Err(e)) => warn!("[Shutdown] Cleanup error: {}", e),
-            Err(_) => warn!("[Shutdown] Cleanup timed out"),
-        }
-        Ok(())
-    }
-}
-
-impl Default for GracefulShutdown {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_graceful_shutdown_detach_once() {
-        let shutdown = GracefulShutdown::new();
-        let mut call_count = 0;
-        let result = shutdown.detach_bpf_hooks(|| {
-            call_count += 1;
-            Ok(())
-        });
-        assert!(result.unwrap());
-        assert_eq!(call_count, 1);
-
-        let result = shutdown.detach_bpf_hooks(|| {
-            call_count += 1;
-            Ok(())
-        });
-        assert!(!result.unwrap());
-        assert_eq!(call_count, 1);
     }
 }

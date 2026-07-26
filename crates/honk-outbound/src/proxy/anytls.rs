@@ -32,6 +32,7 @@ use tokio::task::JoinHandle;
 use tokio::time;
 use tracing::{debug, warn};
 
+use super::addr;
 use super::{ProxyHandler, ProxyStream, UdpProxySocket};
 
 /// sing uot v2 magic address (`protocol/anytls/outbound.go`,
@@ -662,29 +663,6 @@ impl AnyTlsHandler {
         crate::tls::build_connector(node)
     }
 
-    /// Encode the target address in SOCKS5-style format.
-    fn encode_address(target: SocketAddr, target_domain: Option<&str>) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(19);
-        if let Some(domain) = target_domain {
-            buf.push(0x03);
-            buf.push(domain.len().min(u8::MAX as usize) as u8);
-            buf.extend_from_slice(domain.as_bytes());
-        } else {
-            match target {
-                SocketAddr::V4(v4) => {
-                    buf.push(0x01);
-                    buf.extend_from_slice(&v4.ip().octets());
-                }
-                SocketAddr::V6(v6) => {
-                    buf.push(0x04);
-                    buf.extend_from_slice(&v6.ip().octets());
-                }
-            }
-        }
-        buf.extend_from_slice(&target.port().to_be_bytes());
-        buf
-    }
-
     /// Build the client settings frame payload.
     fn settings_payload() -> Vec<u8> {
         let scheme = b"stop=0\n";
@@ -817,7 +795,7 @@ impl ProxyHandler for AnyTlsHandler {
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
         let addr = format!("{}:{}", node.host(), node.port);
-        let target_addr = Self::encode_address(target, target_domain);
+        let target_addr = addr::encode_address(target, target_domain);
 
         if let Some(stream) = Self::open_pooled_stream(&addr, &target_addr).await? {
             return Ok(ProxyStream {
@@ -857,7 +835,7 @@ impl ProxyHandler for AnyTlsHandler {
         _connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
         let addr = format!("{}:{}", node.host(), node.port);
-        let target_addr = Self::encode_address(target, target_domain);
+        let target_addr = addr::encode_address(target, target_domain);
 
         // Try the session pool first (ignoring the provided TCP since we
         // have a faster path via a pre-established session).
@@ -904,7 +882,7 @@ impl ProxyHandler for AnyTlsHandler {
 
         let addr = format!("{}:{}", node.host(), node.port);
         // The stream target is the UoT magic address (SOCKS5 address form).
-        let magic = Self::encode_address("0.0.0.0:0".parse().unwrap(), Some(UOT_MAGIC));
+        let magic = addr::encode_address("0.0.0.0:0".parse().unwrap(), Some(UOT_MAGIC));
         let mut stream = if let Some(s) = Self::open_pooled_stream(&addr, &magic).await? {
             s
         } else {
@@ -923,7 +901,7 @@ impl ProxyHandler for AnyTlsHandler {
         // AddrParser form (0x00/0x01/0x02) — the latter only appears on
         // isConnect=false packets, which we never send.
         let mut request = vec![1u8];
-        request.extend(Self::encode_address(target, target_domain));
+        request.extend(addr::encode_address(target, target_domain));
         tokio::time::timeout(connect_timeout, stream.write_all(&request)).await??;
 
         // Bridge a loopback UDP socket to length-prefixed datagrams on the
@@ -1012,26 +990,6 @@ fn hex_digit(n: u8) -> char {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, SocketAddrV4};
-
-    #[test]
-    fn test_address_encoding_ipv4() {
-        let target = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(93, 184, 216, 34), 443));
-        let encoded = AnyTlsHandler::encode_address(target, None);
-        assert_eq!(encoded[0], 0x01);
-        assert_eq!(&encoded[1..5], &[93, 184, 216, 34]);
-        assert_eq!(&encoded[5..7], &[0x01, 0xbb]);
-    }
-
-    #[test]
-    fn test_address_encoding_domain() {
-        let target = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 80));
-        let encoded = AnyTlsHandler::encode_address(target, Some("example.com"));
-        assert_eq!(encoded[0], 0x03);
-        assert_eq!(encoded[1], 11);
-        assert_eq!(&encoded[2..13], b"example.com");
-        assert_eq!(&encoded[13..15], &[0x00, 0x50]);
-    }
 
     #[test]
     fn test_settings_payload_format() {
@@ -1340,13 +1298,12 @@ mod uot_tests {
         // sing uot.ReadRequest parses the request destination with
         // M.SocksaddrSerializer (SOCKS5 ATYP), so the bytes a dial_udp
         // request carries after the isConnect byte must be SOCKS5 form.
-        let v4 = AnyTlsHandler::encode_address("1.2.3.4:53".parse().unwrap(), None);
+        let v4 = addr::encode_address("1.2.3.4:53".parse().unwrap(), None);
         assert_eq!(v4, vec![0x01, 1, 2, 3, 4, 0, 53]);
-        let v6 = AnyTlsHandler::encode_address("[2606:4700:4700::1111]:853".parse().unwrap(), None);
+        let v6 = addr::encode_address("[2606:4700:4700::1111]:853".parse().unwrap(), None);
         assert_eq!(v6[0], 0x04);
         assert_eq!(v6.len(), 1 + 16 + 2);
-        let fqdn =
-            AnyTlsHandler::encode_address("1.2.3.4:443".parse().unwrap(), Some("example.com"));
+        let fqdn = addr::encode_address("1.2.3.4:443".parse().unwrap(), Some("example.com"));
         assert_eq!(fqdn[0], 0x03);
         assert_eq!(fqdn[1], 11);
         assert_eq!(&fqdn[2..13], b"example.com");

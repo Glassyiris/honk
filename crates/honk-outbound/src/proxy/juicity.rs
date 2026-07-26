@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -37,6 +37,7 @@ use tracing::debug;
 
 use crate::quic::{QuicBiStream, QuicClient};
 
+use super::addr::SocksAddr as JuiceAddr;
 use super::{ProxyHandler, ProxyStream, UdpProxySocket};
 
 const JUICITY_VERSION: u8 = 0x00;
@@ -44,10 +45,6 @@ const CMD_AUTHENTICATE: u8 = 0x00;
 
 const NETWORK_TCP: u8 = 0x01;
 const NETWORK_UDP: u8 = 0x03;
-
-const ATYP_IPV4: u8 = 0x01;
-const ATYP_DOMAIN: u8 = 0x03;
-const ATYP_IPV6: u8 = 0x04;
 
 /// daeuniverse juicity client keep-alive (`dialer.go:58`).
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
@@ -64,98 +61,6 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-/// Juicity address (trojanc metadata wire format).
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum JuiceAddr {
-    V4(SocketAddrV4),
-    V6(SocketAddrV6),
-    Domain(String, u16),
-}
-
-impl JuiceAddr {
-    fn new(target: SocketAddr, target_domain: Option<&str>) -> Self {
-        if let Some(domain) = target_domain {
-            return JuiceAddr::Domain(domain.to_string(), target.port());
-        }
-        match target {
-            SocketAddr::V4(v4) => JuiceAddr::V4(v4),
-            SocketAddr::V6(v6) => JuiceAddr::V6(v6),
-        }
-    }
-
-    fn encoded_len(&self) -> usize {
-        match self {
-            JuiceAddr::V4(_) => 1 + 4 + 2,
-            JuiceAddr::V6(_) => 1 + 16 + 2,
-            JuiceAddr::Domain(d, _) => 1 + 1 + d.len() + 2,
-        }
-    }
-
-    /// trojanc `Metadata.PackTo` (`addr.go:89-111`).
-    fn encode(&self, out: &mut Vec<u8>) {
-        match self {
-            JuiceAddr::V4(v4) => {
-                out.push(ATYP_IPV4);
-                out.extend_from_slice(&v4.ip().octets());
-                out.extend_from_slice(&v4.port().to_be_bytes());
-            }
-            JuiceAddr::V6(v6) => {
-                out.push(ATYP_IPV6);
-                out.extend_from_slice(&v6.ip().octets());
-                out.extend_from_slice(&v6.port().to_be_bytes());
-            }
-            JuiceAddr::Domain(domain, port) => {
-                out.push(ATYP_DOMAIN);
-                out.push(domain.len().min(u8::MAX as usize) as u8);
-                out.extend_from_slice(domain.as_bytes());
-                out.extend_from_slice(&port.to_be_bytes());
-            }
-        }
-    }
-
-    /// trojanc `Metadata.Unpack` (`addr.go:113-148`) from a QUIC stream.
-    async fn read_from_stream(recv: &mut quinn::RecvStream) -> io::Result<JuiceAddr> {
-        let mut atyp = [0u8; 1];
-        read_exact(recv, &mut atyp).await?;
-        match atyp[0] {
-            ATYP_IPV4 => {
-                let mut buf = [0u8; 4 + 2];
-                read_exact(recv, &mut buf).await?;
-                let ip: [u8; 4] = buf[..4].try_into().expect("array length");
-                let port = u16::from_be_bytes(buf[4..].try_into().expect("array length"));
-                Ok(JuiceAddr::V4(SocketAddrV4::new(Ipv4Addr::from(ip), port)))
-            }
-            ATYP_IPV6 => {
-                let mut buf = [0u8; 16 + 2];
-                read_exact(recv, &mut buf).await?;
-                let ip: [u8; 16] = buf[..16].try_into().expect("array length");
-                let port = u16::from_be_bytes(buf[16..].try_into().expect("array length"));
-                Ok(JuiceAddr::V6(SocketAddrV6::new(
-                    Ipv6Addr::from(ip),
-                    port,
-                    0,
-                    0,
-                )))
-            }
-            ATYP_DOMAIN => {
-                let mut len = [0u8; 1];
-                read_exact(recv, &mut len).await?;
-                let mut domain = vec![0u8; len[0] as usize];
-                read_exact(recv, &mut domain).await?;
-                let mut port = [0u8; 2];
-                read_exact(recv, &mut port).await?;
-                let domain = String::from_utf8(domain)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                Ok(JuiceAddr::Domain(domain, u16::from_be_bytes(port)))
-            }
-            other => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unknown metadata type {other:#x}"),
-            )),
-        }
-    }
 }
 
 async fn read_exact(recv: &mut quinn::RecvStream, buf: &mut [u8]) -> io::Result<()> {
@@ -509,6 +414,7 @@ mod tests {
     use super::*;
     use crate::quic::testutil;
     use quinn::VarInt;
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const TEST_UUID: &str = "123e4567-e89b-12d3-a456-426614174000";
@@ -698,11 +604,14 @@ mod tests {
     fn test_metadata_codec() {
         let mut buf = Vec::new();
         JuiceAddr::V4(SocketAddrV4::new(Ipv4Addr::new(93, 184, 216, 34), 80)).encode(&mut buf);
-        assert_eq!(buf, vec![ATYP_IPV4, 93, 184, 216, 34, 0x00, 0x50]);
+        assert_eq!(
+            buf,
+            vec![crate::proxy::addr::ATYP_IPV4, 93, 184, 216, 34, 0x00, 0x50]
+        );
 
         let mut buf = Vec::new();
         JuiceAddr::Domain("example.com".to_string(), 443).encode(&mut buf);
-        assert_eq!(buf[0], ATYP_DOMAIN);
+        assert_eq!(buf[0], crate::proxy::addr::ATYP_DOMAIN);
         assert_eq!(buf[1], 11);
         assert_eq!(&buf[2..13], b"example.com");
         assert_eq!(&buf[13..15], &[0x01, 0xbb]);
@@ -710,7 +619,7 @@ mod tests {
         let mut buf = Vec::new();
         JuiceAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 8080, 0, 0)).encode(&mut buf);
         assert_eq!(buf.len(), 19);
-        assert_eq!(buf[0], ATYP_IPV6);
+        assert_eq!(buf[0], crate::proxy::addr::ATYP_IPV6);
         assert_eq!(&buf[17..19], &[0x1f, 0x90]);
     }
 }

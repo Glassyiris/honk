@@ -25,15 +25,14 @@ use aya_ebpf_bindings::{
         bpf_sock_tuple__bindgen_ty_1__bindgen_ty_2,
     },
     helpers::{
-        bpf_ktime_get_ns, bpf_redirect, bpf_redirect_peer, bpf_skb_load_bytes,
-        bpf_skb_store_bytes,
+        bpf_ktime_get_ns, bpf_redirect, bpf_redirect_peer, bpf_skb_load_bytes, bpf_skb_store_bytes,
     },
 };
 use honk_ebpf_common::{
+    RedirectEntry, RedirectTuple, RoutingMeta, TPROXY_MARK,
     conn::ConnState,
     dae_ip::In6Addr,
     redirect_need::{RoutingHandoffEntry, TuplesKey},
-    RedirectEntry, RedirectTuple, RoutingMeta, TPROXY_MARK,
 };
 use network_types::{
     eth::EthHdr,
@@ -45,9 +44,9 @@ use crate::{
         OUTBOUND_CONNECTIVITY_MAP, PARAM, PKT_SCRATCH_KEY, REDIRECT_TRACK, ROUTE_CTX_SCRATCH_MAP,
         ROUTING_HANDOFF_MAP, ROUTING_META_MAP,
     },
-    route::{RouteCtx, OUTBOUND_BLOCK, OUTBOUND_DIRECT},
+    route::{OUTBOUND_BLOCK, OUTBOUND_DIRECT, RouteCtx},
     sk,
-    transport::{parse_packet, ETH_HLEN, ETH_P_IP, ETH_P_IPV6, IPPROTO_TCP, IPPROTO_UDP},
+    transport::{ETH_HLEN, ETH_P_IP, ETH_P_IPV6, IPPROTO_TCP, IPPROTO_UDP, parse_packet},
 };
 
 const IPV6_BYTE_LENGTH: usize = 16;
@@ -371,61 +370,6 @@ fn wan_outbound_is_alive(ctx: &TcContext, outbound: u8, l4proto: u8, dport: u16)
 
 /// Check if a destination IP is likely a local address where a socket lookup
 /// could find a matching listening socket (RFC 1918, loopback, ULA, link-local).
-/// Returns false for clearly non-local addresses, allowing us to skip the
-/// expensive bpf_sk_lookup_* calls.
-#[inline(always)]
-fn dst_is_likely_local(dst_ip: &In6Addr) -> bool {
-    unsafe {
-        if dst_ip.is_v4_mapped() || dst_ip.is_v4_compat() {
-            let ip = u32::from_be(dst_ip.u6_addr32[3]);
-            // 10.0.0.0/8
-            if (ip & 0xFF000000) == 0x0A000000 {
-                return true;
-            }
-            // 172.16.0.0/12
-            if (ip & 0xFFF00000) == 0xAC100000 {
-                return true;
-            }
-            // 192.168.0.0/16
-            if (ip & 0xFFFF0000) == 0xC0A80000 {
-                return true;
-            }
-            // 127.0.0.0/8 (loopback)
-            if (ip & 0xFF000000) == 0x7F000000 {
-                return true;
-            }
-            // 169.254.0.0/16 (link-local)
-            if (ip & 0xFFFF0000) == 0xA9FE0000 {
-                return true;
-            }
-            false
-        } else {
-            // IPv6
-            let bytes = dst_ip.u6_addr8;
-            // ULA: fd00::/8
-            if bytes[0] == 0xfd {
-                return true;
-            }
-            // Loopback: ::1
-            let mut is_loopback = true;
-            for i in 0..15 {
-                if bytes[i] != 0 {
-                    is_loopback = false;
-                    break;
-                }
-            }
-            if is_loopback && bytes[15] == 1 {
-                return true;
-            }
-            // Link-local: fe80::/10
-            if bytes[0] == 0xfe && (bytes[1] & 0xc0) == 0x80 {
-                return true;
-            }
-            false
-        }
-    }
-}
-
 // #[inline(never)]: shared by lan_ingress_l2/l3. 5-level call chain
 // with 256B baseline stays under the 512B BPF stack limit.
 #[inline(never)]
@@ -447,6 +391,12 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
 
     let ret = parse_packet(ctx, link_h_len, pkt);
     if ret != 0 {
+        return pass_through_classified(ctx);
+    }
+
+    // Broadcast/multicast destinations (DHCP, mDNS, SSDP, LLMNR) must never
+    // be routed, marked, or conntracked — pass through immediately.
+    if crate::transport::dst_is_special(pkt, link_h_len) {
         return pass_through_classified(ctx);
     }
 
@@ -656,11 +606,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             .to_be(),
     ];
 
-    // Socket lookup before routing (NAT loopback detection); only for
-    // likely-local destinations (RFC1918, loopback, ULA, link-local).
-    if dst_is_likely_local(&pkt.tuples.five.dst_ip)
-        && (pkt.l4proto == IPPROTO_TCP || pkt.l4proto == IPPROTO_UDP)
-    {
+    if pkt.l4proto == IPPROTO_TCP || pkt.l4proto == IPPROTO_UDP {
         let mut tuple: bpf_sock_tuple = unsafe { mem::zeroed() };
         let tuple_size: u32;
 
@@ -1010,17 +956,9 @@ fn assign_listener(ctx: &TcContext, listener_l4proto: u8) -> Result<(), c_long> 
     // listeners published by userspace.
     let is_v6 = unsafe { (*ctx.skb.skb).protocol as u16 } == ETH_P_IPV6.to_be();
     let key = if listener_l4proto == IPPROTO_TCP as u8 {
-        if is_v6 {
-            KEY_TCP6
-        } else {
-            KEY_TCP4
-        }
+        if is_v6 { KEY_TCP6 } else { KEY_TCP4 }
     } else {
-        if is_v6 {
-            KEY_UDP6
-        } else {
-            KEY_UDP4
-        }
+        if is_v6 { KEY_UDP6 } else { KEY_UDP4 }
     };
 
     let map_ptr = ptr::from_ref(&LISTEN_SOCKET_MAP).cast::<c_void>();

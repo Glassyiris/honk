@@ -1,8 +1,6 @@
 //! Control plane: TPROXY accept loop, routing, proxy dial, relay, graceful shutdown.
 
-pub mod bind;
 mod connection;
-pub mod core;
 pub mod dns_control;
 pub mod drain;
 pub mod janitor;
@@ -52,8 +50,7 @@ use tracing::{debug, error, info, trace, warn};
 
 pub mod commands {
     use honk_config::{Config, node::Node};
-    use std::time::Duration;
-    use tokio::sync::{mpsc, oneshot};
+    use tokio::sync::mpsc;
 
     #[derive(Debug)]
     #[allow(clippy::large_enum_variant)]
@@ -68,21 +65,8 @@ pub mod commands {
             name: String,
             nodes: Vec<Node>,
         },
-        UpdateNode(Node),
-        RemoveNode(String),
         Shutdown,
         GetStats(mpsc::Sender<super::StatsSnapshot>),
-
-        /// Set the global dial_mode (rule / global / direct).
-        SetMode(String),
-        /// Set the selected node for a Selector group at runtime.
-        SetSelectorChoice(String, String),
-        /// Test per-node TCP connect latency.
-        TestNodeDelay {
-            name: String,
-            url: Option<String>,
-            reply: oneshot::Sender<Option<Duration>>,
-        },
     }
 }
 
@@ -934,37 +918,10 @@ impl ControlPlane {
                             // both commands queue on this single channel.
                             self.apply_runtime_config(new_config, &drain).await;
                         }
-                        Some(ControlCommand::UpdateNode(node)) => {
-                            info!("Updating node: {}", node.name);
-                            let mut config = self.config.write().await;
-                            if let Some(existing) = config.nodes.iter_mut().find(|n| n.id == node.id) {
-                                *existing = node;
-                            } else { config.nodes.push(node); }
-                        }
-                        Some(ControlCommand::RemoveNode(id)) => {
-                            info!("Removing node: {}", id);
-                            let mut config = self.config.write().await;
-                            config.nodes.retain(|n| n.id.to_string() != id);
-                        }
                         Some(ControlCommand::GetStats(tx)) => {
                             let snap = self.stats.snapshot();
                             let total = snap.values().map(|s| s.total_conns as u64).sum();
                             let _ = tx.send(StatsSnapshot { per_outbound: snap, total_connections: total }).await;
-                        }
-                        Some(ControlCommand::SetMode(mode)) => {
-                            info!("Setting global dial_mode to '{}'", mode);
-                            let mut config = self.config.write().await;
-                            config.global.dial_mode = mode;
-                        }
-                        Some(ControlCommand::SetSelectorChoice(group, node)) => {
-                            info!("Setting selector group '{}' to node '{}'", group, node);
-                            self.group_manager
-                                .read()
-                                .set_selector_choice(&group, &node);
-                        }
-                        Some(ControlCommand::TestNodeDelay { name, url, reply }) => {
-                            let latency = self.test_node_delay(&name, url.as_deref()).await;
-                            let _ = reply.send(latency);
                         }
                         Some(ControlCommand::Shutdown) | None => {
                             info!("Control plane shutting down, draining {} active connections",
@@ -1053,35 +1010,5 @@ impl ControlPlane {
             push_result.domain_bitmaps.len()
         );
         Ok(push_result)
-    }
-
-    /// Test TCP connect latency to a node using the node's configured address:port.
-    /// Returns `Some(duration)` on success, `None` on failure.
-    async fn test_node_delay(
-        &self,
-        node_name: &str,
-        url: Option<&str>,
-    ) -> Option<std::time::Duration> {
-        let config = self.config.read().await;
-        let node = config.nodes.iter().find(|n| n.name == node_name).cloned();
-        let delay_timeout = std::time::Duration::from_millis(config.global.connect_timeout_ms);
-        drop(config);
-
-        let node = node?;
-        let addr = if let Some(u) = url {
-            u.to_string()
-        } else {
-            format!("{}:{}", node.host(), node.port)
-        };
-
-        let start = std::time::Instant::now();
-        match tokio::time::timeout(delay_timeout, tokio::net::TcpStream::connect(addr)).await {
-            Ok(Ok(stream)) => {
-                let elapsed = start.elapsed();
-                drop(stream);
-                Some(elapsed)
-            }
-            _ => None,
-        }
     }
 }

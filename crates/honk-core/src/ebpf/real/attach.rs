@@ -631,15 +631,6 @@ impl RealEbpfBackend {
             .unwrap_or(false)
     }
 
-    /// Determine whether an interface is a Linux bridge master.
-    /// Bridge devices have ARPHRD_ETHER but the TC datapath on a bridge master
-    /// sees packets at L3 (Ethernet header already consumed by the bridge
-    /// forwarding path), so they must use the L3 TC programs.
-    #[allow(dead_code)]
-    fn iface_is_bridge_master(iface: &str) -> bool {
-        std::fs::metadata(format!("/sys/class/net/{}/bridge/bridge_id", iface)).is_ok()
-    }
-
     /// Pick the ingress/egress program pair for a LAN interface.
     /// Bridge masters use L3; physical/veth Ethernet interfaces use L2;
     /// everything else falls back to L3.

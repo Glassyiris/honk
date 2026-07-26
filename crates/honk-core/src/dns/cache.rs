@@ -8,6 +8,11 @@
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
+/// Extra window past TTL expiry during which an entry stays in the cache
+/// for serve-stale fallback (RFC 8767) instead of being dropped on the
+/// first post-expiry lookup.
+const STALE_RETENTION: Duration = Duration::from_secs(3600);
+
 /// A cached DNS response entry.
 ///
 /// Contains the raw response bytes along with TTL metadata
@@ -36,14 +41,21 @@ impl CachedEntry {
             .map(|d| d.as_secs())
             .unwrap_or(0)
     }
+    /// Returns `true` once the entry is too old even for serve-stale use
+    /// (past `expires_at + STALE_RETENTION`).
+    #[inline]
+    pub fn is_stale_retention_exceeded(&self) -> bool {
+        Instant::now() >= self.expires_at + STALE_RETENTION
+    }
 }
 
 /// DNS response cache with LRU eviction and TTL-based expiry.
 ///
 /// Internally uses [`lru::LruCache`] for bounded storage
 /// with least-recently-used eviction. TTL checking is performed
-/// at lookup time; stale entries are not returned but may
-/// persist until evicted by newer entries or explicit removal.
+/// at lookup time; expired entries are not returned by [`DnsCache::get`]
+/// but remain available via [`DnsCache::get_stale`] for one hour
+/// (serve-stale, RFC 8767) before being dropped.
 ///
 /// Also maintains a negative cache for NXDOMAIN/SERVFAIL responses
 /// to avoid repeated upstream queries for known-bad domains.
@@ -83,14 +95,28 @@ impl DnsCache {
     ///
     /// Returns `None` if the key is not present **or** if the entry has
     /// expired. Hot keys are promoted in the LRU so repeated lookups keep
-    /// popular domains resident under pressure.
+    /// popular domains resident under pressure. Recently-expired entries
+    /// are kept for [`Self::get_stale`] (serve-stale); only entries past
+    /// the stale-retention window are dropped here.
     pub fn get(&mut self, key: &str) -> Option<&CachedEntry> {
-        // Promote on hit; drop expired entries so capacity is freed promptly.
-        if self.inner.peek(key).is_some_and(|e| e.is_expired()) {
+        if self
+            .inner
+            .peek(key)
+            .is_some_and(|e| e.is_stale_retention_exceeded())
+        {
             self.inner.pop(key);
             return None;
         }
         self.inner.get(key).filter(|entry| !entry.is_expired())
+    }
+
+    /// Look up an entry that is past its TTL but still within the
+    /// serve-stale retention window (RFC 8767 fallback for when the
+    /// upstream query fails). Promotes the key in the LRU like `get`.
+    pub fn get_stale(&mut self, key: &str) -> Option<&CachedEntry> {
+        self.inner
+            .get(key)
+            .filter(|entry| entry.is_expired() && !entry.is_stale_retention_exceeded())
     }
 
     /// Store a DNS response in the cache.
@@ -370,6 +396,37 @@ mod tests {
         cache.put("dns.com:1".into(), resp, 300);
         // Clamped to 1 — entry is present
         assert!(cache.get("dns.com:1").is_some());
+    }
+
+    #[test]
+    fn test_serve_stale_window() {
+        let mut cache = DnsCache::new(10);
+        let resp = make_test_response([93, 184, 216, 34], 0);
+        // min_ttl = 0, clamped to 1 second
+        cache.put("example.com:1".into(), resp.clone(), 0);
+        thread::sleep(Duration::from_secs(2));
+
+        // Expired: normal lookup misses, stale lookup still serves.
+        assert!(cache.get("example.com:1").is_none());
+        let stale = cache.get_stale("example.com:1").expect("stale entry");
+        assert_eq!(stale.response, resp);
+        assert!(stale.is_expired());
+    }
+
+    #[test]
+    fn test_stale_retention_exceeded() {
+        let entry = CachedEntry {
+            response: vec![],
+            expires_at: Instant::now() - Duration::from_secs(7200),
+            min_ttl: 1,
+        };
+        assert!(entry.is_stale_retention_exceeded());
+        let fresh = CachedEntry {
+            response: vec![],
+            expires_at: Instant::now() - Duration::from_secs(10),
+            min_ttl: 1,
+        };
+        assert!(!fresh.is_stale_retention_exceeded());
     }
 
     #[test]

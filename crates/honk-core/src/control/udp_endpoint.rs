@@ -195,15 +195,6 @@ impl UdpEndpoint {
         self.has_reply.load(Ordering::Relaxed)
     }
 
-    #[allow(dead_code)]
-    pub fn acquire(&self) -> bool {
-        if self.dead.load(Ordering::Acquire) {
-            return false;
-        }
-        self.ref_count.fetch_add(1, Ordering::Relaxed);
-        true
-    }
-
     pub fn release(&self) {
         self.ref_count.fetch_sub(1, Ordering::Relaxed);
     }

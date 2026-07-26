@@ -25,9 +25,7 @@ pub use doh::DohClient;
 pub use doh3::Doh3Client;
 pub use doq::DoqClient;
 pub use dot::DotPool;
-pub use framing::{
-    exchange_length_prefixed, force_dns_id_zero, restore_dns_id, write_length_prefixed,
-};
+pub use framing::{exchange_length_prefixed, force_dns_id_zero, restore_dns_id};
 pub use tcp_pool::TcpPool;
 
 use std::sync::Arc;
@@ -110,4 +108,173 @@ impl DialContext {
         let stream = self.dial_tcp().await?;
         Ok(Box::new(stream))
     }
+}
+
+/// Max idle streams kept per DoT / plain-TCP pool.
+const MAX_IDLE_STREAMS: usize = 4;
+
+/// Uniform retry-once wrapper for all transports: on failure, run `reset`
+/// (drop the cached session/connection) and retry the exchange once.
+async fn exchange_with_retry<Once, Fut, Reset, ResetFut>(
+    label: &str,
+    once: Once,
+    reset: Reset,
+) -> anyhow::Result<Vec<u8>>
+where
+    Once: Fn() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Vec<u8>>>,
+    Reset: FnOnce() -> ResetFut,
+    ResetFut: std::future::Future<Output = ()>,
+{
+    match once().await {
+        Ok(resp) => Ok(resp),
+        Err(first) => {
+            tracing::debug!("{label} exchange failed ({first}); invalidating and retrying once");
+            reset().await;
+            once()
+                .await
+                .map_err(|e| anyhow::anyhow!("{label} failed after retry: {e} (first: {first})"))
+        }
+    }
+}
+
+/// Pop an idle stream or dial a fresh one, run one length-prefixed exchange,
+/// and return the stream to the pool on success (DoT / plain-TCP shared shape).
+async fn idle_pool_exchange<S, Dial, DialFut>(
+    idle: &parking_lot::Mutex<Vec<S>>,
+    dial: Dial,
+    raw_query: &[u8],
+    query_timeout: Duration,
+) -> anyhow::Result<Vec<u8>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    Dial: FnOnce() -> DialFut,
+    DialFut: std::future::Future<Output = anyhow::Result<S>>,
+{
+    let taken = idle.lock().pop();
+    let mut stream = match taken {
+        Some(s) => s,
+        None => dial().await?,
+    };
+    let resp = framing::exchange_length_prefixed(&mut stream, raw_query, query_timeout).await?;
+    let mut guard = idle.lock();
+    if guard.len() < MAX_IDLE_STREAMS {
+        guard.push(stream);
+    }
+    Ok(resp)
+}
+
+/// Shared QUIC client config for DNS transports (15s keep-alive, cubic).
+async fn dns_quic_config(alpn: &[&[u8]]) -> anyhow::Result<quinn::ClientConfig> {
+    honk_outbound::quic::client_config(
+        &Default::default(),
+        alpn,
+        honk_outbound::quic::QuicClientOptions {
+            keep_alive: Some(Duration::from_secs(15)),
+            ..honk_outbound::quic::QuicClientOptions::with_congestion(Some("cubic"))
+        },
+    )
+    .await
+}
+
+/// Lazily-created QUIC client endpoint reused across reconnects (DoQ/DoH3).
+struct SharedQuicEndpoint(tokio::sync::Mutex<Option<quinn::Endpoint>>);
+
+impl SharedQuicEndpoint {
+    fn new() -> Self {
+        Self(tokio::sync::Mutex::new(None))
+    }
+
+    async fn get(&self, ipv6: bool) -> anyhow::Result<quinn::Endpoint> {
+        let mut guard = self.0.lock().await;
+        if let Some(ep) = guard.as_ref() {
+            return Ok(ep.clone());
+        }
+        let ep = honk_outbound::quic::client_endpoint(ipv6)
+            .map_err(|e| anyhow::anyhow!("QUIC client endpoint: {e}"))?;
+        *guard = Some(ep.clone());
+        Ok(ep)
+    }
+}
+
+/// Connect `config` to `addr` through the shared endpoint, with a handshake
+/// timeout. `label` prefixes error messages (`DoQ` / `DoH3 QUIC`).
+async fn quic_connect(
+    endpoint: &SharedQuicEndpoint,
+    config: &quinn::ClientConfig,
+    addr: std::net::SocketAddr,
+    sni: &str,
+    timeout: Duration,
+    label: &str,
+) -> anyhow::Result<quinn::Connection> {
+    let ep = endpoint.get(addr.is_ipv6()).await?;
+    let connecting = ep
+        .connect_with(config.clone(), addr, sni)
+        .map_err(|e| anyhow::anyhow!("{label} connect_with: {e}"))?;
+    tokio::time::timeout(timeout, connecting)
+        .await
+        .map_err(|_| anyhow::anyhow!("{label} handshake timed out"))?
+        .map_err(|e| anyhow::anyhow!("{label} handshake: {e}"))
+}
+
+/// `host[:port]` authority string (brackets bare IPv6, elides default 443).
+fn authority(host: &str, port: u16) -> String {
+    let host_fmt = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    if port == 443 {
+        host_fmt
+    } else {
+        format!("{host_fmt}:{port}")
+    }
+}
+
+/// Build the DoH/DoH3 POST request for a DNS message. `content_length` is
+/// set only on the HTTP/2 path; H3 omits it.
+fn build_doh_request(
+    endpoint: &DnsEndpoint,
+    content_length: Option<usize>,
+    label: &str,
+) -> anyhow::Result<http::Request<()>> {
+    let path = if endpoint.path.is_empty() {
+        "/dns-query"
+    } else {
+        endpoint.path.as_str()
+    };
+    let uri = format!(
+        "https://{}{}",
+        authority(&endpoint.host, endpoint.port),
+        path
+    );
+    let mut builder = http::Request::builder()
+        .method(http::Method::POST)
+        .uri(uri)
+        .header("content-type", "application/dns-message")
+        .header("accept", "application/dns-message");
+    if let Some(len) = content_length {
+        builder = builder.header("content-length", len.to_string());
+    }
+    builder
+        .body(())
+        .map_err(|e| anyhow::anyhow!("{label} request build: {e}"))
+}
+
+/// Shared DoH/DoH3 response validation: 2xx status, minimum DNS header size,
+/// then restore the original query ID.
+fn finish_doh_response(
+    label: &str,
+    status: http::StatusCode,
+    mut body: Vec<u8>,
+    orig_id: u16,
+) -> anyhow::Result<Vec<u8>> {
+    if !status.is_success() {
+        anyhow::bail!("{label} HTTP status {status}");
+    }
+    if body.len() < 12 {
+        anyhow::bail!("{label} response too short ({} bytes)", body.len());
+    }
+    framing::restore_dns_id(&mut body, orig_id);
+    Ok(body)
 }
