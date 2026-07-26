@@ -62,7 +62,7 @@ jobs:
       - name: Install Rust nightly (for the eBPF object)
         uses: dtolnay/rust-toolchain@nightly
         with:
-          components: rust-src
+          components: rust-src, llvm-tools
 
       - name: Install system dependencies
         run: |
