@@ -883,7 +883,8 @@ async fn test_e2e_real_server_hop_soak_tcp() {
         return;
     };
     let Ok(target) = std::env::var("HONK_HY2_SOAK_TARGET").map(|v| {
-        v.parse::<SocketAddr>().expect("invalid HONK_HY2_SOAK_TARGET")
+        v.parse::<SocketAddr>()
+            .expect("invalid HONK_HY2_SOAK_TARGET")
     }) else {
         eprintln!("HONK_HY2_SOAK_TARGET unset; skipping TCP soak");
         return;
@@ -897,7 +898,9 @@ async fn test_e2e_real_server_hop_soak_tcp() {
         .expect("soak dial should succeed");
     stream
         .stream
-        .write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes())
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
         .await
         .unwrap();
     // Per-read stall detector: any read gap > 10s counts as 断流.
@@ -911,7 +914,10 @@ async fn test_e2e_real_server_hop_soak_tcp() {
             Ok(Err(e)) => panic!("read error after {total} bytes: {e}"),
             Err(_) => {
                 stalls += 1;
-                eprintln!("STALL #{stalls}: no data for 10s at {total} bytes, t+{:?}", started.elapsed());
+                eprintln!(
+                    "STALL #{stalls}: no data for 10s at {total} bytes, t+{:?}",
+                    started.elapsed()
+                );
                 if stalls >= 3 {
                     panic!("connection stalled 3 times; 断流 reproduced at {total} bytes");
                 }
@@ -933,7 +939,8 @@ async fn test_e2e_real_server_hop_soak_udp() {
         return;
     };
     let Ok(target) = std::env::var("HONK_HY2_SOAK_UDP_TARGET").map(|v| {
-        v.parse::<SocketAddr>().expect("invalid HONK_HY2_SOAK_UDP_TARGET")
+        v.parse::<SocketAddr>()
+            .expect("invalid HONK_HY2_SOAK_UDP_TARGET")
     }) else {
         eprintln!("HONK_HY2_SOAK_UDP_TARGET unset; skipping UDP soak");
         return;
@@ -964,7 +971,10 @@ async fn test_e2e_real_server_hop_soak_udp() {
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    eprintln!("UDP soak done: sent={sent} lost={lost} in {:?}", started.elapsed());
+    eprintln!(
+        "UDP soak done: sent={sent} lost={lost} in {:?}",
+        started.elapsed()
+    );
     assert!(sent > 0);
     assert_eq!(lost, 0, "{lost}/{sent} datagrams lost across hops");
 }

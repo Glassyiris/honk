@@ -124,13 +124,17 @@ impl AliveDialerSet {
                     Ok(Err(err_msg)) => {
                         tracing::debug!(
                             "HTTP health check failed for node '{}' via {}: {}",
-                            node_id, a, err_msg
+                            node_id,
+                            a,
+                            err_msg
                         );
                     }
                     Err(_) => {
                         tracing::debug!(
                             "HTTP health check timed out for node '{}' via {} after {:?}",
-                            node_id, a, timeout
+                            node_id,
+                            a,
+                            timeout
                         );
                     }
                 }
