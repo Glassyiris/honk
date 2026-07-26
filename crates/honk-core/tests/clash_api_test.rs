@@ -249,7 +249,7 @@ async fn test_proxies_structure_and_selector_switch() {
     let proxies = &body["proxies"];
 
     // The Selector group is present with both members.
-    assert_eq!(proxies["proxy"]["type"], "Selector");
+    assert_eq!(proxies["proxy"]["type"], "selector");
     assert_eq!(
         proxies["proxy"]["all"],
         serde_json::json!(["node-a", "node-b"])
@@ -263,7 +263,7 @@ async fn test_proxies_structure_and_selector_switch() {
     assert!(proxies["node-a"]["type"].is_string());
     assert!(proxies["node-a"]["history"].is_array());
     // GLOBAL synthetic group exists with the mode-state selection.
-    assert_eq!(proxies["GLOBAL"]["type"], "Selector");
+    assert_eq!(proxies["GLOBAL"]["type"], "selector");
     assert_eq!(proxies["GLOBAL"]["now"], "proxy");
     assert_eq!(proxies["GLOBAL"]["all"][0], "Proxy");
     // GLOBAL contains the group and both nodes, without duplicates.

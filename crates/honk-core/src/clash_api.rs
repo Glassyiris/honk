@@ -325,10 +325,10 @@ fn clash_protocol_type(protocol: NodeProtocol) -> &'static str {
 /// Map a GroupPolicy to a Clash-compatible type name.
 fn clash_group_type(policy: GroupPolicy) -> &'static str {
     match policy {
-        GroupPolicy::Selector => "Selector",
-        GroupPolicy::URLTest => "URLTest",
-        GroupPolicy::LoadBalance => "LoadBalance",
-        GroupPolicy::Fallback => "Fallback",
+        GroupPolicy::Selector => "selector",
+        GroupPolicy::URLTest => "url_test",
+        GroupPolicy::LoadBalance => "load_balance",
+        GroupPolicy::Fallback => "fallback",
     }
 }
 
@@ -437,7 +437,7 @@ fn build_global_proxy_info(config: &Config, global_selection: &str) -> serde_jso
     };
     serde_json::json!({
         "name": "GLOBAL",
-        "type": "Selector",
+        "type": "selector",
         "all": all,
         "now": now,
     })
