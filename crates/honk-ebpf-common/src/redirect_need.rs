@@ -75,3 +75,8 @@ pub struct PIDName {
     pub pid: u32,
     pub pname: [u8; TASK_COMM_LEN],
 }
+
+unsafe impl aya::Pod for TuplesKey {}
+unsafe impl aya::Pod for RoutingHandoffEntry {}
+unsafe impl aya::Pod for DomainRouting {}
+unsafe impl aya::Pod for PIDName {}

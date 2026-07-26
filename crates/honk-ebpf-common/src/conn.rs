@@ -189,3 +189,5 @@ impl ConntrackArgs {
         }
     }
 }
+
+unsafe impl aya::Pod for ConnState {}

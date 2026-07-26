@@ -10,11 +10,13 @@ path = "src/main.rs"
 
 [dependencies]
 honk-config.workspace = true
+honk-ebpf-common.workspace = true
 honk-outbound.workspace = true
 honk-core = { path = "../honk-core", default-features = false }
 
 anyhow.workspace = true
 clap.workspace = true
+libc.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

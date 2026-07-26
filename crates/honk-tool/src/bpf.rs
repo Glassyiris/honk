@@ -1,0 +1,402 @@
+//! `honk-tool bpf` — quick reads of the running engine's pinned eBPF maps.
+//!
+//! Maps live at `<pin-root>/<NAME>` (default `/sys/fs/bpf`).  These commands
+//! open them via raw `bpf(2)` calls and decode the wire structs — no aya, no
+//! program loading, no attach.
+
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::os::unix::io::RawFd;
+use std::path::{Path, PathBuf};
+
+use anyhow::Context as _;
+use clap::Args;
+use honk_ebpf_common::conn::ConnState;
+use honk_ebpf_common::dae_ip::In6Addr;
+use honk_ebpf_common::redirect_need::{DomainRouting, RoutingHandoffEntry, TuplesKey};
+use honk_ebpf_common::{RedirectEntry, RedirectTuple};
+
+// ---------------------------------------------------------------------------
+// Minimal bpf(2) layer (BPF_OBJ_GET / LOOKUP_ELEM / GET_NEXT_KEY).
+// ---------------------------------------------------------------------------
+
+const BPF_OBJ_GET: i64 = 7;
+const BPF_MAP_LOOKUP_ELEM: i64 = 1;
+const BPF_MAP_GET_NEXT_KEY: i64 = 4;
+
+#[repr(C)]
+#[derive(Default)]
+struct BpfAttr {
+    map_fd: u32,
+    key: u64,
+    value_or_next: u64,
+    flags: u64,
+    next_key: u64,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct BpfObjGetAttr {
+    pathname: u64,
+    bpf_fd: u32,
+    file_flags: u32,
+}
+
+fn bpf(cmd: i64, attr: &mut BpfAttr) -> io::Result<i64> {
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            cmd,
+            attr as *mut BpfAttr,
+            std::mem::size_of::<BpfAttr>() as u32,
+        )
+    };
+    if ret < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(ret)
+    }
+}
+
+fn bpf_obj_get(path: &Path) -> io::Result<RawFd> {
+    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
+    let mut attr = BpfObjGetAttr {
+        pathname: c_path.as_ptr() as u64,
+        ..Default::default()
+    };
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            BPF_OBJ_GET,
+            &mut attr as *mut BpfObjGetAttr,
+            std::mem::size_of::<BpfObjGetAttr>() as u32,
+        )
+    };
+    if ret < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(ret as RawFd)
+    }
+}
+
+fn map_lookup(fd: RawFd, key: &[u8], value: &mut [u8]) -> io::Result<bool> {
+    let mut attr = BpfAttr {
+        map_fd: fd as u32,
+        key: key.as_ptr() as u64,
+        value_or_next: value.as_mut_ptr() as u64,
+        ..Default::default()
+    };
+    match bpf(BPF_MAP_LOOKUP_ELEM, &mut attr) {
+        Ok(_) => Ok(true),
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+fn map_next_key(fd: RawFd, prev: Option<&[u8]>, next: &mut [u8]) -> io::Result<bool> {
+    let mut attr = BpfAttr {
+        map_fd: fd as u32,
+        key: prev.map_or(0, |p| p.as_ptr() as u64),
+        value_or_next: next.as_mut_ptr() as u64,
+        ..Default::default()
+    };
+    match bpf(BPF_MAP_GET_NEXT_KEY, &mut attr) {
+        Ok(_) => Ok(true),
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Iterate every entry of a hash-family map as raw (key, value) byte pairs.
+fn map_entries(fd: RawFd, key_len: usize, value_len: usize) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let mut out = Vec::new();
+    let mut prev: Option<Vec<u8>> = None;
+    loop {
+        let mut key = vec![0u8; key_len];
+        if !map_next_key(fd, prev.as_deref(), &mut key)? {
+            break;
+        }
+        let mut value = vec![0u8; value_len];
+        if map_lookup(fd, &key, &mut value)? {
+            out.push((key.clone(), value));
+        }
+        prev = Some(key);
+    }
+    Ok(out)
+}
+
+fn read_value<T: Copy>(fd: RawFd, key: &[u8]) -> io::Result<Option<T>> {
+    let mut buf = vec![0u8; std::mem::size_of::<T>()];
+    if map_lookup(fd, key, &mut buf)? {
+        Ok(Some(unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const T) }))
+    } else {
+        Ok(None)
+    }
+}
+
+fn read_percpu_sum(fd: RawFd, ncpu: usize, index: u32) -> io::Result<u64> {
+    let mut buf = vec![0u8; ncpu * 8];
+    let mut attr = BpfAttr {
+        map_fd: fd as u32,
+        key: &index as *const u32 as u64,
+        value_or_next: buf.as_mut_ptr() as u64,
+        ..Default::default()
+    };
+    bpf(BPF_MAP_LOOKUP_ELEM, &mut attr)?;
+    let mut total = 0u64;
+    for chunk in buf.as_chunks::<8>().0 {
+        total = total.wrapping_add(u64::from_ne_bytes(*chunk));
+    }
+    Ok(total)
+}
+
+fn possible_cpus() -> usize {
+    std::fs::read_dir("/sys/devices/system/cpu")
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().starts_with("cpu"))
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .chars()
+                        .nth(3)
+                        .is_some_and(|c| c.is_ascii_digit())
+                })
+                .count()
+        })
+        .unwrap_or(1)
+        .max(1)
+}
+
+// ---------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------
+
+#[derive(Args)]
+pub struct BpfArgs {
+    #[command(subcommand)]
+    pub command: BpfCommand,
+}
+
+#[derive(clap::Subcommand)]
+pub enum BpfCommand {
+    /// Dump (or point-query) entries of a pinned map.
+    Show(ShowArgs),
+    /// OUTBOUND_STATS per-outbound counters + conn-state occupancy + overflow.
+    Stats(StatsArgs),
+}
+
+#[derive(Args)]
+pub struct ShowArgs {
+    /// Map: conn-state | redirect-track | domain-routing | routing-handoff
+    pub map: String,
+    /// Only show entries whose src or dst matches this IP.
+    #[arg(long)]
+    pub ip: Option<IpAddr>,
+    /// Max entries to print (0 = all).
+    #[arg(long, default_value_t = 50)]
+    pub limit: usize,
+    /// BPF pin root.
+    #[arg(long, default_value = "/sys/fs/bpf")]
+    pub pin_root: PathBuf,
+}
+
+#[derive(Args)]
+pub struct StatsArgs {
+    /// BPF pin root.
+    #[arg(long, default_value = "/sys/fs/bpf")]
+    pub pin_root: PathBuf,
+}
+
+pub async fn run(args: BpfArgs) -> anyhow::Result<()> {
+    match args.command {
+        BpfCommand::Show(a) => show(a),
+        BpfCommand::Stats(a) => stats(a),
+    }
+}
+
+fn ip_of(addr: &In6Addr) -> IpAddr {
+    let b = unsafe { addr.u6_addr8 };
+    if b[0..10].iter().all(|&x| x == 0) && b[10] == 0xff && b[11] == 0xff {
+        IpAddr::V4(Ipv4Addr::new(b[12], b[13], b[14], b[15]))
+    } else {
+        IpAddr::V6(Ipv6Addr::from(b))
+    }
+}
+
+fn open(pin_root: &Path, name: &str) -> anyhow::Result<RawFd> {
+    let path = pin_root.join(name);
+    bpf_obj_get(&path).with_context(|| format!("open pinned map {}", path.display()))
+}
+
+fn matches_ip(key: &TuplesKey, ip: &Option<IpAddr>) -> bool {
+    match ip {
+        None => true,
+        Some(want) => ip_of(&key.src_ip) == *want || ip_of(&key.dst_ip) == *want,
+    }
+}
+
+fn show(args: ShowArgs) -> anyhow::Result<()> {
+    match args.map.as_str() {
+        "conn-state" => {
+            let fd = open(&args.pin_root, "CONN_STATE_MAP")?;
+            let entries = map_entries(
+                fd,
+                std::mem::size_of::<TuplesKey>(),
+                std::mem::size_of::<ConnState>(),
+            )?;
+            let mut shown = 0usize;
+            for (kb, vb) in &entries {
+                let k: TuplesKey = unsafe { std::ptr::read_unaligned(kb.as_ptr() as *const _) };
+                let v: ConnState = unsafe { std::ptr::read_unaligned(vb.as_ptr() as *const _) };
+                if !matches_ip(&k, &args.ip) || (args.limit > 0 && shown >= args.limit) {
+                    continue;
+                }
+                shown += 1;
+                println!(
+                    "{:?} {}:{} -> {}:{} out={} mark=0x{:x} must={} state={} seen={}",
+                    k.l4proto,
+                    ip_of(&k.src_ip),
+                    k.src_port,
+                    ip_of(&k.dst_ip),
+                    k.dst_port,
+                    unsafe { v.meta.data.outbound },
+                    unsafe { v.meta.data.mark },
+                    unsafe { v.meta.data.must },
+                    v.state,
+                    v.last_seen_ns
+                );
+            }
+            println!("-- {shown}/{} entries", entries.len());
+        }
+        "redirect-track" => {
+            let fd = open(&args.pin_root, "REDIRECT_TRACK")?;
+            let entries = map_entries(
+                fd,
+                std::mem::size_of::<RedirectTuple>(),
+                std::mem::size_of::<RedirectEntry>(),
+            )?;
+            let mut shown = 0usize;
+            for (kb, vb) in &entries {
+                let k: RedirectTuple =
+                    unsafe { std::ptr::read_unaligned(kb.as_ptr() as *const _) };
+                let v: RedirectEntry =
+                    unsafe { std::ptr::read_unaligned(vb.as_ptr() as *const _) };
+                if let Some(want) = &args.ip
+                    && ip_of(&k.src_ip) != *want
+                    && ip_of(&k.dst_ip) != *want
+                {
+                    continue;
+                }
+                if args.limit > 0 && shown >= args.limit {
+                    continue;
+                }
+                shown += 1;
+                println!(
+                    "{} -> {} out={} from_wan={} ifindex={} seen={}",
+                    ip_of(&k.src_ip),
+                    ip_of(&k.dst_ip),
+                    v.outbound,
+                    v.from_wan,
+                    v.ifindex,
+                    v.last_seen_ns
+                );
+            }
+            println!("-- {shown}/{} entries", entries.len());
+        }
+        "domain-routing" => {
+            let fd = open(&args.pin_root, "DOMAIN_ROUTING_MAP")?;
+            let entries = map_entries(fd, 16, std::mem::size_of::<DomainRouting>())?;
+            let mut shown = 0usize;
+            for (kb, vb) in &entries {
+                let mut addr: In6Addr = unsafe { std::mem::zeroed() };
+                unsafe { addr.u6_addr8.copy_from_slice(kb) };
+                let v: DomainRouting =
+                    unsafe { std::ptr::read_unaligned(vb.as_ptr() as *const _) };
+                let ip = ip_of(&addr);
+                if let Some(want) = &args.ip
+                    && ip != *want
+                {
+                    continue;
+                }
+                if args.limit > 0 && shown >= args.limit {
+                    continue;
+                }
+                shown += 1;
+                let rules: Vec<u32> = (0..128u32)
+                    .filter(|i| v.bitmap[(i / 32) as usize] & (1 << (i % 32)) != 0)
+                    .collect();
+                println!("{ip} rules={rules:?}");
+            }
+            println!("-- {shown}/{} entries", entries.len());
+        }
+        "routing-handoff" => {
+            let fd = open(&args.pin_root, "ROUTING_HANDOFF_MAP")?;
+            let entries = map_entries(
+                fd,
+                std::mem::size_of::<TuplesKey>(),
+                std::mem::size_of::<RoutingHandoffEntry>(),
+            )?;
+            let mut shown = 0usize;
+            for (kb, vb) in &entries {
+                let k: TuplesKey = unsafe { std::ptr::read_unaligned(kb.as_ptr() as *const _) };
+                let v: RoutingHandoffEntry =
+                    unsafe { std::ptr::read_unaligned(vb.as_ptr() as *const _) };
+                if !matches_ip(&k, &args.ip) || (args.limit > 0 && shown >= args.limit) {
+                    continue;
+                }
+                shown += 1;
+                println!(
+                    "{:?} {}:{} -> {}:{} out={} mark=0x{:x} must={} seen={}",
+                    k.l4proto,
+                    ip_of(&k.src_ip),
+                    k.src_port,
+                    ip_of(&k.dst_ip),
+                    k.dst_port,
+                    v.result.outbound,
+                    v.result.mark,
+                    v.result.must,
+                    v.last_seen_ns
+                );
+            }
+            println!("-- {shown}/{} entries", entries.len());
+        }
+        other => anyhow::bail!(
+            "unknown map '{other}' (conn-state | redirect-track | domain-routing | routing-handoff)"
+        ),
+    }
+    Ok(())
+}
+
+pub(crate) fn stats(args: StatsArgs) -> anyhow::Result<()> {
+    let ncpu = possible_cpus();
+
+    let fd = open(&args.pin_root, "BPF_STATS_MAP")?;
+    let udp_ovf: u64 = read_value(fd, &0u32.to_ne_bytes())?.unwrap_or(0);
+    let tcp_ovf: u64 = read_value(fd, &1u32.to_ne_bytes())?.unwrap_or(0);
+    println!("conn-state overflow: udp={udp_ovf} tcp={tcp_ovf}");
+
+    let fd = open(&args.pin_root, "CONN_STATE_OCCUPANCY")?;
+    let inserts = read_percpu_sum(fd, ncpu, 0)?;
+    let deletes = read_percpu_sum(fd, ncpu, 1)?;
+    println!(
+        "conn-state occupancy: inserts={inserts} ebpf_deletes={deletes} raw_live={}",
+        inserts.saturating_sub(deletes)
+    );
+
+    let fd = open(&args.pin_root, "OUTBOUND_STATS")?;
+    println!("\noutbound counters (tx_pkts tx_bytes rx_pkts rx_bytes):");
+    for outbound in 0..=255u32 {
+        let base = outbound * 4;
+        let (txp, txb, rxp, rxb) = (
+            read_percpu_sum(fd, ncpu, base)?,
+            read_percpu_sum(fd, ncpu, base + 1)?,
+            read_percpu_sum(fd, ncpu, base + 2)?,
+            read_percpu_sum(fd, ncpu, base + 3)?,
+        );
+        if txp + txb + rxp + rxb > 0 {
+            println!("  outbound {outbound:<4} {txp} {txb} {rxp} {rxb}");
+        }
+    }
+    Ok(())
+}

@@ -348,3 +348,6 @@ pub struct OutboundStats {
     pub errors: u32,
     pub _pad: u32,
 }
+
+unsafe impl aya::Pod for RedirectTuple {}
+unsafe impl aya::Pod for RedirectEntry {}
