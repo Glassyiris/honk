@@ -96,7 +96,7 @@ jobs:
       # on the zig-style target in $ZIGCC_TARGET.
       - name: Install zig (non-native targets)
         if: matrix.target != 'x86_64-unknown-linux-gnu'
-        uses: mlugg/setup-zig@v3
+        uses: mlugg/setup-zig@v2
         with:
           version: 0.14.1
 
