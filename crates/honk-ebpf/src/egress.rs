@@ -302,6 +302,11 @@ pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         return Err(TC_ACT_OK);
     }
 
+    // Broadcast/multicast (DHCPOFFER, mDNS, NetBIOS) is never conn-tracked.
+    if crate::transport::dst_is_special(pkt, link_h_len) {
+        return Err(TC_ACT_OK);
+    }
+
     // Drop NDP REDIRECT packets from localhost to prevent ND proxy interference.
     if skb_ingress_ifindex(ctx) == NOWHERE_IFINDEX && pkt.l4proto == IPPROTO_ICMPV6 {
         // ICMPv6 type is at offset: link_h_len + ipv6hdr(40) + 0(icmp6_type).
@@ -826,6 +831,11 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     let ret = parse_packet(ctx, link_h_len, pkt);
     if ret != 0 {
         // Unsupported or malformed traffic is left untouched.
+        return Err(TC_ACT_OK);
+    }
+
+    // Broadcast/multicast is never re-routed into daens.
+    if crate::transport::dst_is_special(pkt, link_h_len) {
         return Err(TC_ACT_OK);
     }
 

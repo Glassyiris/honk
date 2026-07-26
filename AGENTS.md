@@ -203,7 +203,7 @@ Key runtime invariants (do not break):
 - **Netns discipline:** the process never leaves the host netns; `daens` is entered only through scoped, fully synchronous `with_daens_netns` switches (never `.await` inside — setns is per-thread; the original netns is restored on all exit paths, serialized by a process-wide mutex).
 - **must/block are final:** clash mode override never overrides `block` results or dae `(must)` results.
 - **eBPF connectivity pushes are group-OR:** the per-group alive slot is shared by all members — health callbacks write the OR of leaf-member states, never a single node's state (one dead member would otherwise `TC_ACT_SHOT` the whole group).
-- **Internal traffic is never proxied:** `169.254.0.0/16` and `fd00:686f:6e6b::/64` (honk's own veth), broadcast/multicast.
+- **Internal traffic is never proxied:** `169.254.0.0/16` and `fd00:686f:6e6b::/64` (honk's own veth). **Broadcast/multicast is passed through at the eBPF layer**: `dst_is_special()` (crates/honk-ebpf/src/transport.rs) early-exits L2 broadcast/multicast MAC, 255.255.255.255, 224.0.0.0/4, 0.0.0.0 and ff00::/8 in lan_ingress/lan_egress/wan_egress — DHCP/mDNS/SSDP never enter routing or conntrack (breaks LAN DHCP on OpenWrt otherwise). The NAT-loopback local-socket probe in lan_ingress is unconditional (Go dae parity), so local services like dnsmasq are always detected.
 - Reserved outbound indices: `0 Direct | 1 Block | 2+ user groups | 0xFC MustRules | 0xFD ControlPlaneRouting | 0xFE OR | 0xFF AND`.
 
 ## Build and test commands
