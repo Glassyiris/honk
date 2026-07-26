@@ -555,10 +555,32 @@ pub(crate) mod testutil {
         alpn: &[&[u8]],
         datagrams: bool,
     ) -> anyhow::Result<(ServerConfig, Vec<u8>)> {
+        server_config_impl(alpn, datagrams, false)
+    }
+
+    /// [`server_config`] restricted to TLS 1.3 ChaCha20-Poly1305, forcing the
+    /// peer onto the ChaCha20 header-protection path.
+    pub fn server_config_chacha20(alpn: &[&[u8]], datagrams: bool) -> anyhow::Result<ServerConfig> {
+        server_config_impl(alpn, datagrams, true).map(|(config, _)| config)
+    }
+
+    fn server_config_impl(
+        alpn: &[&[u8]],
+        datagrams: bool,
+        chacha20_only: bool,
+    ) -> anyhow::Result<(ServerConfig, Vec<u8>)> {
         let rcgen::CertifiedKey { cert, signing_key } =
             rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
 
-        let provider = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider();
+        let mut provider = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider();
+        if chacha20_only {
+            // ChaCha20 first so the handshake negotiates it; AES-128 stays
+            // because quinn derives QUIC initial keys from it.
+            provider.cipher_suites = vec![
+                tokio_rustls::rustls::crypto::aws_lc_rs::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
+                tokio_rustls::rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256,
+            ];
+        }
         let mut tls_config =
             tokio_rustls::rustls::ServerConfig::builder_with_provider(provider.into())
                 .with_safe_default_protocol_versions()
@@ -571,6 +593,11 @@ pub(crate) mod testutil {
                     ),
                 )
                 .map_err(|e| anyhow!("TLS server config: {e}"))?;
+        if chacha20_only {
+            // rustls defaults to client order; honk's BoringSSL client offers
+            // AES first, so the suite restriction alone is not enough.
+            tls_config.ignore_client_order = true;
+        }
         tls_config.alpn_protocols = alpn.iter().map(|a| a.to_vec()).collect();
 
         let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
@@ -591,6 +618,19 @@ pub(crate) mod testutil {
     ) -> anyhow::Result<(quinn::Endpoint, std::net::SocketAddr)> {
         let endpoint = quinn::Endpoint::server(
             server_config(alpn, datagrams)?,
+            "127.0.0.1:0".parse().expect("hardcoded bind address"),
+        )?;
+        let addr = endpoint.local_addr()?;
+        Ok((endpoint, addr))
+    }
+
+    /// [`server_endpoint`] restricted to ChaCha20-Poly1305.
+    pub fn server_endpoint_chacha20(
+        alpn: &[&[u8]],
+        datagrams: bool,
+    ) -> anyhow::Result<(quinn::Endpoint, std::net::SocketAddr)> {
+        let endpoint = quinn::Endpoint::server(
+            server_config_chacha20(alpn, datagrams)?,
             "127.0.0.1:0".parse().expect("hardcoded bind address"),
         )?;
         let addr = endpoint.local_addr()?;
@@ -623,4 +663,135 @@ mod brutal_tests {
         cc.on_congestion_event(Instant::now(), Instant::now(), false, 0);
         assert_eq!(cc.window(), before);
     }
+}
+
+// ---------------------------------------------------------------------------
+// QUIC liveness probing through a proxy's UDP tunnel
+// ---------------------------------------------------------------------------
+
+use crate::proxy::UdpProxySocket;
+
+/// quinn [`AsyncUdpSocket`] that drives a proxied UDP tunnel
+/// ([`UdpProxySocket`]): outbound datagrams go to the tunnel's relay address,
+/// and inbound datagrams have their source normalized to the QUIC peer so
+/// quinn's remote-address checks see a stable path (same trick as
+/// hysteria2's port-hop normalization).
+#[derive(Debug)]
+struct UdpProxyQuinnSocket {
+    proxy: Arc<UdpProxySocket>,
+    remote: SocketAddr,
+}
+
+impl quinn::AsyncUdpSocket for UdpProxyQuinnSocket {
+    fn create_io_poller(self: Arc<Self>) -> std::pin::Pin<Box<dyn quinn::UdpPoller>> {
+        #[derive(Debug)]
+        struct Poller(Arc<UdpProxySocket>);
+        impl quinn::UdpPoller for Poller {
+            fn poll_writable(
+                self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                self.0.socket.poll_send_ready(cx)
+            }
+        }
+        Box::pin(Poller(self.proxy.clone()))
+    }
+
+    fn try_send(&self, transmit: &quinn::udp::Transmit) -> io::Result<()> {
+        self.proxy
+            .socket
+            .try_send_to(transmit.contents, self.proxy.relay_addr)
+            .map(|_| ())
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        bufs: &mut [std::io::IoSliceMut<'_>],
+        meta: &mut [quinn::udp::RecvMeta],
+    ) -> std::task::Poll<io::Result<usize>> {
+        let mut count = 0;
+        for (buf, meta_slot) in bufs.iter_mut().zip(meta.iter_mut()) {
+            let mut read_buf = tokio::io::ReadBuf::new(&mut buf[..]);
+            match self.proxy.socket.poll_recv_from(cx, &mut read_buf) {
+                std::task::Poll::Ready(Ok(_addr)) => {
+                    let len = read_buf.filled().len();
+                    *meta_slot = quinn::udp::RecvMeta {
+                        addr: self.remote,
+                        len,
+                        stride: len,
+                        ecn: None,
+                        dst_ip: None,
+                    };
+                    count += 1;
+                }
+                std::task::Poll::Ready(Err(e)) => {
+                    return if count == 0 {
+                        std::task::Poll::Ready(Err(e))
+                    } else {
+                        std::task::Poll::Ready(Ok(count))
+                    };
+                }
+                std::task::Poll::Pending => {
+                    return if count == 0 {
+                        std::task::Poll::Pending
+                    } else {
+                        std::task::Poll::Ready(Ok(count))
+                    };
+                }
+            }
+        }
+        std::task::Poll::Ready(Ok(count))
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.proxy.socket.local_addr()
+    }
+
+    fn max_transmit_segments(&self) -> usize {
+        1
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        1
+    }
+
+    fn may_fragment(&self) -> bool {
+        true
+    }
+}
+
+/// Establish a QUIC connection through a proxied UDP tunnel and time the
+/// handshake.  This is the real QUIC liveness probe: unlike a bare
+/// Version-Negotiation trigger (which many frontends ignore), it proves
+/// TLS-in-QUIC reachability through the node's UDP path.  `config` comes from
+/// [`client_config`] — pass a node with `skip_cert_verify` for pure liveness
+/// probing.
+pub async fn quic_handshake_probe(
+    proxy: UdpProxySocket,
+    target: SocketAddr,
+    server_name: &str,
+    config: &ClientConfig,
+    timeout: Duration,
+) -> anyhow::Result<Duration> {
+    let socket = Arc::new(UdpProxyQuinnSocket {
+        proxy: Arc::new(proxy),
+        remote: target,
+    });
+    let runtime = quinn::default_runtime()
+        .ok_or_else(|| io::Error::other("no async runtime available for QUIC"))?;
+    let endpoint =
+        Endpoint::new_with_abstract_socket(EndpointConfig::default(), None, socket, runtime)?;
+
+    let start = Instant::now();
+    let connecting = endpoint
+        .connect_with(config.clone(), target, server_name)
+        .context("create QUIC connecting")?;
+    let conn = tokio::time::timeout(timeout, connecting)
+        .await
+        .context("QUIC handshake timeout")??;
+    let elapsed = start.elapsed();
+    conn.close(quinn::VarInt::from_u32(0), b"probe");
+    endpoint.close(quinn::VarInt::from_u32(0), b"probe");
+    Ok(elapsed)
 }

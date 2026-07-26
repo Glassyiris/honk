@@ -32,6 +32,7 @@ This file is written for AI coding agents that need to understand, build, test, 
     ├── honk-ebpf-common      # no_std shared eBPF/userspace types (workspace member)
     ├── honk-outbound         # Proxy handlers, groups, health checks (workspace member)
     ├── honk-core             # eBPF proxy engine, library + `honk-core` binary (workspace member)
+    ├── honk-tool             # `honk-tool` CLI toolbox: `sub` subscription/node probing (workspace member)
     └── honk-ebpf             # Kernel eBPF programs (EXCLUDED from workspace, own Cargo.lock)
 ```
 
@@ -177,6 +178,15 @@ CLI (`honk-core` binary):
 - Subcommands (clash-style, **local only — none talks to a running engine**): `mode <rule|global|direct>` (rewrites `global.dial_mode` in the config file), `proxy <group> <node>` (validates existence and prints; persists nothing), `delay <node> [--url HOST:PORT]` (raw TCP connect timing, not a proxied urltest).
 
 Benchmarks: `benches/dns.rs` (criterion, `harness = false`) — DNS endpoint parse, cache get/put, framing, forwarder cache-hit, TcpPool/UpstreamPool exchange. Run: `cargo bench -p honk-core --bench dns` (no external network needed).
+
+### `crates/honk-tool`
+
+The `honk-tool` CLI toolbox (bin crate, diagnostics that don't belong in the engine binary). Deps are honk-config + honk-outbound + honk-core (`default-features = false`, so no axum/aya). Subcommands:
+
+- `sub <url|file> [--target HOST:PORT] [--url TEST_URL] [--timeout SECS] [--concurrency N] [--limit N] [--ua UA]` — fetch a subscription (or read a local share-link file), print per-protocol counts, then probe every node concurrently: server IP families, proxied connectivity to the test host over **both** IPv4 and IPv6 (a full protocol dial through the node via `ProxyRegistry`), and a proxied latency measurement (`urltest_node`). UDP liveness is probed too (minimal DNS A query + a real QUIC handshake via `quic::quic_handshake_probe`). Ends with alive-per-family counts and median latency.
+- `bpf show <conn-state|redirect-track|domain-routing|routing-handoff> [--ip IP] [--limit N]` and `bpf stats` — quick reads of the running engine's pinned maps under `/sys/fs/bpf` (raw `bpf(2)`; no aya, no program load). `stats` prints overflow counters, the `CONN_STATE_OCCUPANCY` gauge, and non-zero per-outbound tx/rx counters.
+- `diagnose [--api URL] [--pin-root PATH]` — one-shot read-only health check: engine process, `daens`/`dae0` presence, daens fwmark rule, pinned maps present, occupancy/overflow, clash API reachability. Exit summary `all checks passed` / `N issue(s) found`.
+- honk-tool is a **static musl binary** for gateway deployment: build with the `build-musl` zig env (`ZIGCC_TARGET=x86_64-linux-musl` + ci wrappers) and scp — a gnu build fails to exec on VyOS.
 
 ## Runtime architecture (data path)
 

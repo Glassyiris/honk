@@ -82,70 +82,66 @@ impl AliveDialerSet {
             return false;
         }
 
-        // Pick at most one address per IP version
-        let mut probe_addrs: Vec<SocketAddr> = Vec::new();
-        let mut any_v4 = false;
-        let mut any_v6 = false;
+        // Try up to 3 addresses per family, stopping at the first success:
+        // the family-death threshold is 1 probe failure, so a single stale
+        // cached address (e.g. a v6 answer from a long-gone DNS cache entry)
+        // would otherwise pin the whole family as dead forever.
+        let mut by_family: [Vec<SocketAddr>; 2] = [Vec::new(), Vec::new()];
         for a in &addrs {
-            if a.is_ipv4() {
-                if !any_v4 {
-                    any_v4 = true;
-                    probe_addrs.push(*a);
-                }
-            } else if !any_v6 {
-                any_v6 = true;
-                probe_addrs.push(*a);
-            }
-            if probe_addrs.len() >= IpVersion::count() {
-                break;
+            let idx = if a.is_ipv4() { 0 } else { 1 };
+            if by_family[idx].len() < 3 {
+                by_family[idx].push(*a);
             }
         }
 
         let mut any_ok = false;
-        for a in &probe_addrs {
-            let ipver = if a.is_ipv4() {
+        for (idx, family_addrs) in by_family.iter().enumerate() {
+            let ipver = if idx == 0 {
                 IpVersion::V4
             } else {
                 IpVersion::V6
             };
+            if family_addrs.is_empty() {
+                self.mark_dead_for(node_id, ProbeDomain::Tcp, ipver);
+                continue;
+            }
 
-            match tokio::time::timeout(timeout, prober.probe_http(node_id, *a)).await {
-                Ok(Ok(elapsed)) => {
-                    tracing::debug!(
-                        "HTTP health check succeeded for node '{}' via {} ({}ms)",
-                        node_id,
-                        a,
-                        elapsed.as_millis()
-                    );
-                    self.record_probe_latency(node_id, ProbeDomain::Tcp, ipver, elapsed);
-                    any_ok = true;
-                }
-                Ok(Err(err_msg)) => {
-                    tracing::debug!(
-                        "HTTP health check failed for node '{}' via {}: {}",
-                        node_id,
-                        a,
-                        err_msg
-                    );
-                    self.mark_dead_for(node_id, ProbeDomain::Tcp, ipver);
-                }
-                Err(_) => {
-                    tracing::debug!(
-                        "HTTP health check timed out for node '{}' via {} after {:?}",
-                        node_id,
-                        a,
-                        timeout
-                    );
-                    self.mark_dead_for(node_id, ProbeDomain::Tcp, ipver);
+            let mut family_ok = false;
+            for a in family_addrs {
+                match tokio::time::timeout(timeout, prober.probe_http(node_id, *a)).await {
+                    Ok(Ok(elapsed)) => {
+                        tracing::debug!(
+                            "HTTP health check succeeded for node '{}' via {} ({}ms)",
+                            node_id,
+                            a,
+                            elapsed.as_millis()
+                        );
+                        self.record_probe_latency(node_id, ProbeDomain::Tcp, ipver, elapsed);
+                        any_ok = true;
+                        family_ok = true;
+                        break;
+                    }
+                    Ok(Err(err_msg)) => {
+                        tracing::debug!(
+                            "HTTP health check failed for node '{}' via {}: {}",
+                            node_id,
+                            a,
+                            err_msg
+                        );
+                    }
+                    Err(_) => {
+                        tracing::debug!(
+                            "HTTP health check timed out for node '{}' via {} after {:?}",
+                            node_id,
+                            a,
+                            timeout
+                        );
+                    }
                 }
             }
-        }
-
-        if !any_v4 {
-            self.mark_dead_for(node_id, ProbeDomain::Tcp, IpVersion::V4);
-        }
-        if !any_v6 {
-            self.mark_dead_for(node_id, ProbeDomain::Tcp, IpVersion::V6);
+            if !family_ok {
+                self.mark_dead_for(node_id, ProbeDomain::Tcp, ipver);
+            }
         }
 
         if any_ok {

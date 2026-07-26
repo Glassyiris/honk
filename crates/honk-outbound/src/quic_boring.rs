@@ -247,10 +247,12 @@ impl BoringHeaderKey {
             }
             Self::ChaCha20(key) => {
                 use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
+                // RFC 9001 §5.4.4: sample[0..4] is the ChaCha20 BLOCK counter;
+                // `StreamCipherSeek::seek` takes a BYTE offset, so convert.
                 let counter = u32::from_le_bytes(sample[..4].try_into().expect("slice length"));
                 let nonce: [u8; 12] = sample[4..16].try_into().expect("slice length");
                 let mut cipher = chacha20::ChaCha20::new(key.into(), &nonce.into());
-                cipher.seek(counter);
+                cipher.seek(u64::from(counter) * 64);
                 let mut mask = [0u8; 5];
                 cipher.apply_keystream(&mut mask);
                 mask
@@ -594,6 +596,8 @@ impl crypto::ClientConfig for BoringQuicClientConfig {
 pub struct BoringHandshakeData {
     /// Negotiated ALPN protocol, if any.
     pub protocol: Option<Vec<u8>>,
+    /// Negotiated TLS 1.3 cipher suite id (RFC 8446 §B.4).
+    pub cipher_suite: u16,
 }
 
 /// quinn `crypto::Session` over a BoringSSL QUIC client handshake.
@@ -684,6 +688,14 @@ impl Session for BoringQuicSession {
         }
         Some(Box::new(BoringHandshakeData {
             protocol: self.ssl.selected_alpn_protocol().map(|p| p.to_vec()),
+            cipher_suite: unsafe {
+                let cipher = boring_sys::SSL_get_current_cipher(self.ssl.as_ptr());
+                if cipher.is_null() {
+                    0
+                } else {
+                    boring_sys::SSL_CIPHER_get_protocol_id(cipher)
+                }
+            },
         }))
     }
 
@@ -875,6 +887,79 @@ mod tests {
     async fn roundtrip(node: &Node) -> anyhow::Result<Vec<u8>> {
         let addr = spawn_echo_server(&[b"h3"]);
         roundtrip_to(node, addr).await
+    }
+
+    /// ChaCha20-Poly1305 interop: the server is restricted to TLS 1.3
+    /// ChaCha20 so QUIC header protection takes the ChaCha20 path
+    /// (regression: the HP block counter was once passed to
+    /// `StreamCipherSeek::seek` as a byte offset, so every ChaCha
+    /// handshake against a real peer failed while same-code
+    /// boring↔boring pairs self-cancelled).
+    #[tokio::test]
+    async fn chacha20_handshake_and_echo() {
+        let (endpoint, addr) =
+            crate::quic::testutil::server_endpoint_chacha20(&[b"h3"], true).unwrap();
+        tokio::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                tokio::spawn(async move {
+                    let Ok(conn) = incoming.await else { return };
+                    loop {
+                        match conn.accept_bi().await {
+                            Ok((mut send, mut recv)) => {
+                                tokio::spawn(async move {
+                                    if let Ok(buf) = recv.read_to_end(usize::MAX).await {
+                                        let _ = send.write_all(&buf).await;
+                                        let _ = send.finish();
+                                    }
+                                });
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                });
+            }
+        });
+        let node = skip_verify_node();
+        let cfg = crate::quic::client_config(&node, &[b"h3"], Default::default())
+            .await
+            .unwrap();
+        let mut endpoint = crate::quic::client_endpoint(false).unwrap();
+        endpoint.set_default_client_config(cfg);
+        let conn = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
+        // The server prefers ChaCha20; if it negotiates AES anyway this test
+        // exercises nothing, so assert the suite explicitly.
+        let suite = conn
+            .handshake_data()
+            .and_then(|d| d.downcast::<BoringHandshakeData>().ok())
+            .map(|d| d.cipher_suite);
+        assert_eq!(
+            suite,
+            Some(TLS13_CHACHA20_POLY1305_SHA256),
+            "server must negotiate ChaCha20 for this test to be meaningful"
+        );
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"ping").await.unwrap();
+        send.finish().unwrap();
+        let echoed = recv.read_to_end(usize::MAX).await.unwrap();
+        assert_eq!(echoed, b"ping");
+    }
+
+    /// RFC 9001 §5.4.4 ChaCha20 HP mask against a vector captured from a live
+    /// quic-go handshake (offline-verified: unmasking yields pn 0..3).
+    #[test]
+    fn chacha20_header_protection_mask_vector() {
+        // "quic hp" derived from server handshake traffic secret a4cbec18…f8db31.
+        let hp: [u8; 32] = [
+            0x1f, 0x09, 0x35, 0x02, 0x8d, 0x22, 0xc4, 0x0a, 0xbe, 0x95, 0x2b, 0x3e, 0xee, 0x3d,
+            0x5c, 0x51, 0x28, 0xbc, 0x74, 0x8f, 0x94, 0x04, 0xc4, 0xbd, 0x34, 0x08, 0x99, 0x51,
+            0xcb, 0xdb, 0x09, 0x4d,
+        ];
+        let sample: [u8; 16] = [
+            0x6c, 0x43, 0x66, 0x29, 0x17, 0x1a, 0x6d, 0xe1, 0x4e, 0x3c, 0xc4, 0xec, 0xb8, 0xdc,
+            0xc3, 0x97,
+        ];
+        let key = BoringHeaderKey::ChaCha20(hp);
+        assert_eq!(key.compute_mask(&sample), [0x24, 0xa2, 0x42, 0x9a, 0xec]);
     }
 
     async fn roundtrip_to(node: &Node, addr: std::net::SocketAddr) -> anyhow::Result<Vec<u8>> {
