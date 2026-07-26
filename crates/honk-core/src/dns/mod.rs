@@ -1,4 +1,4 @@
-//! DNS resolver, listener, forwarder, cache, and routing.
+//! DNS resolver, forwarder, cache, and routing.
 //!
 //! ## Modules
 //!
@@ -7,7 +7,6 @@
 //! - `endpoint` — upstream address / SNI / path parsing
 //! - `transport` — pooled UDP/TCP/DoT/DoH/DoQ/DoH3 clients
 //! - `upstream_pool` — per-upstream DNS query management
-//! - `listener` — UDP/TCP DNS listener (standalone; production uses TPROXY)
 //! - `forwarder` — DNS forwarding engine (cache + upstream + routing)
 //! - `persist` — optional cache.db persistence for DNS answers
 //! - `wire` — shared wire-format parsing helpers
