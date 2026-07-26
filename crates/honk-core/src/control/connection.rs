@@ -704,6 +704,11 @@ impl ControlPlaneHandle {
                                     ProbeDomain::Tcp,
                                     ipver,
                                 );
+                                // sing-box `DeleteURLTestHistory` parity:
+                                // un-rank the node immediately so URLTest
+                                // groups re-select on the next connection
+                                // instead of waiting for the probe cycle.
+                                ctx.alive_set.clear_latency(&node.name);
                                 ctx.alive_set.notify_check_tcp(&node.name);
                                 let msg = e.to_string();
                                 if msg.starts_with("dial timed out after") {
@@ -1396,6 +1401,10 @@ impl ControlPlaneHandle {
                         ProbeDomain::DataUdp,
                         ipver,
                     );
+                    // sing-box `DeleteURLTestHistory` parity: un-rank the
+                    // node immediately for the next selection (see the TCP
+                    // dial path).
+                    self.alive_set.clear_latency(&node.name);
                     self.alive_set.notify_check_tcp(&node.name);
                 }
             }

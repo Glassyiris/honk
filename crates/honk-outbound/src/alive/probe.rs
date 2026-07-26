@@ -108,7 +108,9 @@ impl AliveDialerSet {
 
             let mut family_ok = false;
             for a in family_addrs {
-                match tokio::time::timeout(timeout, prober.probe_http(node_id, *a)).await {
+                match tokio::time::timeout(timeout, prober.probe_http(node_id, *a, &check_url))
+                    .await
+                {
                     Ok(Ok(elapsed)) => {
                         tracing::debug!(
                             "HTTP health check succeeded for node '{}' via {} ({}ms)",
@@ -124,13 +126,17 @@ impl AliveDialerSet {
                     Ok(Err(err_msg)) => {
                         tracing::debug!(
                             "HTTP health check failed for node '{}' via {}: {}",
-                            node_id, a, err_msg
+                            node_id,
+                            a,
+                            err_msg
                         );
                     }
                     Err(_) => {
                         tracing::debug!(
                             "HTTP health check timed out for node '{}' via {} after {:?}",
-                            node_id, a, timeout
+                            node_id,
+                            a,
+                            timeout
                         );
                     }
                 }
@@ -150,6 +156,95 @@ impl AliveDialerSet {
             );
         }
 
+        any_ok
+    }
+
+    /// Probe a group member against a custom per-group check URL
+    /// (sing-box urltest `url` option). `tag` is the member identity the
+    /// result is recorded under (a direct member's node name, or a
+    /// sub-group's tag); `leaf` is the concrete node actually dialed (for
+    /// a sub-group member, its current pick). TCP-only, plain HTTP like
+    /// the global path: try up to 3 resolved addresses (any family),
+    /// first success wins. State is tracked per (tag, url) and never
+    /// touches the global six domains.
+    pub async fn probe_node_with_url(
+        &self,
+        tag: &str,
+        leaf: &str,
+        url: &str,
+        timeout: Duration,
+    ) -> bool {
+        let prober_opt = self.http_prober.read().clone();
+        let Some(ref prober) = prober_opt else {
+            return false;
+        };
+        if url.starts_with("https://") {
+            // The periodic probe is plain HTTP/1.1 only; an https check URL
+            // is downgraded (the request still proves reachability —
+            // redirect/4xx responses count as healthy).
+            tracing::debug!(
+                "check URL '{}' uses https; probing over plain HTTP instead",
+                url
+            );
+        }
+        let addrs = self.check_ips_for_url(url).await;
+        if addrs.is_empty() {
+            tracing::warn!(
+                "Health check found no addresses for '{}' (member '{}')",
+                url,
+                tag
+            );
+            self.record_url_probe_failure(tag, url);
+            return false;
+        }
+
+        let mut any_ok = false;
+        for a in addrs.into_iter().take(3) {
+            match tokio::time::timeout(timeout, prober.probe_http(leaf, a, url)).await {
+                Ok(Ok(elapsed)) => {
+                    tracing::debug!(
+                        "HTTP health check succeeded for member '{}' (leaf '{}') via {} ({}ms, url={})",
+                        tag,
+                        leaf,
+                        a,
+                        elapsed.as_millis(),
+                        url
+                    );
+                    self.record_url_probe_success(tag, url, elapsed);
+                    any_ok = true;
+                    break;
+                }
+                Ok(Err(err_msg)) => {
+                    tracing::debug!(
+                        "HTTP health check failed for member '{}' (leaf '{}') via {} (url={}): {}",
+                        tag,
+                        leaf,
+                        a,
+                        url,
+                        err_msg
+                    );
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        "HTTP health check timed out for member '{}' (leaf '{}') via {} after {:?} (url={})",
+                        tag,
+                        leaf,
+                        a,
+                        timeout,
+                        url
+                    );
+                }
+            }
+        }
+        if !any_ok {
+            tracing::warn!(
+                "Member '{}' (leaf '{}') failed HTTP health check against custom URL '{}'",
+                tag,
+                leaf,
+                url
+            );
+            self.record_url_probe_failure(tag, url);
+        }
         any_ok
     }
 
@@ -341,8 +436,8 @@ impl AliveDialerSet {
     /// Run health check cycle with concurrent probing.
     ///
     /// Uses a `JoinSet` with a semaphore to limit concurrency (default 10,
-    /// matching sing-box).  Nodes in backoff cooldown or permanently stopped
-    /// are skipped.  Emergency probes triggered via `trigger_probe` bypass
+    /// matching sing-box).  Nodes in backoff cooldown are skipped; stopped
+    /// nodes (deep backoff) probe on their slow max_cooldown cadence.  Emergency probes triggered via `trigger_probe` bypass
     /// the semaphore and are handled separately.
     pub async fn run_health_check_cycle_concurrent(
         self: &Arc<Self>,
@@ -371,8 +466,9 @@ impl AliveDialerSet {
             }
             let idx = alive_index(ProbeDomain::Tcp, IpVersion::V4);
             let state = self.read_state(&id, idx);
-            // Skip permanently-backed-off nodes (Go: probeBackoff.stopped).
-            if state.stopped || Instant::now() < state.cooldown_until {
+            // Stopped nodes are probed too — on their slow max_cooldown
+            // cadence — so recovery stays reachable (see `should_probe`).
+            if Instant::now() < state.cooldown_until {
                 continue;
             }
             let this = self.clone();
@@ -390,6 +486,36 @@ impl AliveDialerSet {
                     this.probe_node_udp(&id, timeout).await;
                 }
             });
+        }
+
+        while join_set.join_next().await.is_some() {}
+
+        // Per-group custom check URLs (sing-box urltest `url` option):
+        // probe each group's members against its own target. Members are
+        // (tag, leaf) pairs resolved fresh every cycle — for a sub-group
+        // member the probe dials its CURRENT pick, and the result is
+        // recorded under the sub-group's tag (sing-box RealTag semantics),
+        // so nested groups rank correctly even as sub-picks change.
+        for (group, url) in self.group_check_urls() {
+            if self.is_urltest_group_idle(&group) {
+                tracing::trace!(
+                    "Skipping custom-URL health checks for idle group '{}'",
+                    group
+                );
+                continue;
+            }
+            for (tag, leaf) in self.url_members_for(&group) {
+                if !self.should_probe_url(&tag, &url) {
+                    continue;
+                }
+                let this = self.clone();
+                let url = url.clone();
+                let permit = semaphore.clone();
+                join_set.spawn(async move {
+                    let _p = permit.acquire().await;
+                    this.probe_node_with_url(&tag, &leaf, &url, timeout).await;
+                });
+            }
         }
 
         while join_set.join_next().await.is_some() {}

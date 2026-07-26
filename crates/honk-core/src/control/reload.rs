@@ -171,6 +171,8 @@ impl ControlPlane {
         let (added, removed) = sync_health_check_nodes(&self.alive_set, &config);
         self.alive_set
             .sync_urltest_groups(&urltest_group_registrations(&config));
+        self.alive_set
+            .sync_group_check_urls(&group_check_url_registrations(&config));
         info!(
             "Group manager rebuilt: {} group(s), health checks +{}/-{} node(s)",
             config.groups.len(),
@@ -327,6 +329,27 @@ pub(super) fn urltest_group_registrations(
                 group.name.clone(),
                 members,
                 group.idle_timeout.map(std::time::Duration::from_secs),
+            )
+        })
+        .collect()
+}
+
+/// Build `(group name, check_url)` for every group with a custom
+/// `check_url` (sing-box urltest `url` option) — the input to
+/// [`AliveDialerSet::sync_group_check_urls`]. Selector groups are
+/// excluded (their check_url is ignored, sing-box parity). Members are
+/// resolved dynamically each probe cycle through the group manager (the
+/// url member resolver installed in `ControlPlane`), so sub-group picks
+/// never go stale here.
+pub(super) fn group_check_url_registrations(config: &Config) -> Vec<(String, String)> {
+    config
+        .groups
+        .iter()
+        .filter(|g| g.policy != GroupPolicy::Selector && g.check_url.is_some())
+        .map(|group| {
+            (
+                group.name.clone(),
+                group.check_url.clone().unwrap_or_default(),
             )
         })
         .collect()

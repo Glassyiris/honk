@@ -13,6 +13,14 @@ impl GroupManager {
         let mut group_map: HashMap<String, Group> =
             groups.iter().map(|g| (g.name.clone(), g.clone())).collect();
         break_group_cycles(&mut group_map);
+        for g in groups {
+            if g.check_url.is_some() && g.policy == GroupPolicy::Selector {
+                tracing::warn!(
+                    "group '{}': check_url is ignored on Selector groups (sing-box parity: it is a urltest option)",
+                    g.name
+                );
+            }
+        }
         Self {
             groups: group_map,
             nodes: nodes.iter().map(|n| (n.id, n.clone())).collect(),
@@ -60,7 +68,7 @@ impl GroupManager {
         let mut visited = Vec::new();
         let candidates = self.flatten_candidates(group, domain, ipver, &mut visited, 0);
         let candidates: Vec<Candidate> = self
-            .filter_alive_candidates(candidates, domain, ipver)
+            .filter_alive_candidates(candidates, domain, ipver, group.check_url.as_deref())
             .into_iter()
             .filter(|c| c.node.name != excluded_node_name)
             .collect();
@@ -103,7 +111,8 @@ impl GroupManager {
         self.mark_used(group_name);
         let mut visited = Vec::new();
         let candidates = self.flatten_candidates(group, domain, ipver, &mut visited, 0);
-        let candidates = self.filter_alive_candidates(candidates, domain, ipver);
+        let candidates =
+            self.filter_alive_candidates(candidates, domain, ipver, group.check_url.as_deref());
         if candidates.is_empty() {
             return vec![];
         }
@@ -113,13 +122,14 @@ impl GroupManager {
             GroupPolicy::URLTest => {
                 // Cold start: no latency data on any candidate — race all
                 // alive candidates to land the first connection quickly.
-                let any_data = candidates
-                    .iter()
-                    .any(|c| self.node_latency(c.node, network, ipver) != Duration::MAX);
+                let any_data = candidates.iter().any(|c| {
+                    self.node_latency(c.node, network, ipver, group.check_url.as_deref(), c.tag)
+                        != Duration::MAX
+                });
                 if any_data {
                     vec![self.pick_urltest(&candidates, group, network, ipver)]
                 } else {
-                    self.order_by_latency(candidates, network, ipver)
+                    self.order_by_latency(candidates, network, ipver, group.check_url.as_deref())
                         .into_iter()
                         .map(|c| c.node)
                         .collect()
@@ -491,7 +501,8 @@ impl GroupManager {
         depth: usize,
     ) -> Option<&'a Node> {
         let candidates = self.flatten_candidates(group, domain, ipver, visited, depth);
-        let candidates = self.filter_alive_candidates(candidates, domain, ipver);
+        let candidates =
+            self.filter_alive_candidates(candidates, domain, ipver, group.check_url.as_deref());
         if candidates.is_empty() {
             return None;
         }
@@ -554,6 +565,12 @@ impl GroupManager {
     /// Keep only candidates whose leaf node is alive for the probe domain.
     /// With no alive set (tests) everything passes.
     ///
+    /// When the group has a custom `check_url` (sing-box urltest `url`
+    /// option), TCP liveness and ranking come from the per-(node, url)
+    /// probe state instead of the global one — a node that cannot reach
+    /// the group's own target is excluded here even if it is globally
+    /// healthy. UDP domains always use the global state.
+    ///
     /// DataUDP aliveness is decided per node: a node is selectable when
     /// DataUDP *or* DnsUDP is alive. A node whose UDP domains are BOTH
     /// explicitly dead is excluded even when its TCP is alive — a TCP-only
@@ -569,6 +586,7 @@ impl GroupManager {
         candidates: Vec<Candidate<'a>>,
         domain: ProbeDomain,
         ipver: IpVersion,
+        check_url: Option<&str>,
     ) -> Vec<Candidate<'a>> {
         let Some(ref alive) = self.alive_set else {
             return candidates;
@@ -585,6 +603,19 @@ impl GroupManager {
                         alive.is_alive_for(name, ProbeDomain::Tcp, ipver)
                     }
                 })
+                .collect();
+        }
+        if domain == ProbeDomain::Tcp
+            && let Some(url) = check_url
+        {
+            // Per-URL state is keyed by member TAG (sing-box RealTag
+            // semantics): a sub-group is ranked as a unit — the probe
+            // dialed its current pick and recorded the result under the
+            // sub-group's tag, so a sub-pick change re-evaluates with the
+            // tag's state instead of leaking the old leaf's.
+            return candidates
+                .into_iter()
+                .filter(|c| alive.is_alive_for_url(c.tag, url))
                 .collect();
         }
         candidates
@@ -659,15 +690,41 @@ impl GroupManager {
             if let Some(current) = cache.get(&group.name).and_then(|sel| sel.get(network))
                 && let Some(pos) = candidates.iter().position(|c| c.tag == current.tag)
             {
-                let best_latency = self.node_latency(best.node, network, ipver);
-                // Only switch if best is significantly (≥ tolerance) faster.
-                if best_latency.saturating_add(tolerance) >= current.latency {
+                let best_latency = self.node_latency(
+                    best.node,
+                    network,
+                    ipver,
+                    group.check_url.as_deref(),
+                    best.tag,
+                );
+                // Hysteresis baseline is the incumbent's *current* measured
+                // latency, not the latency recorded when it was selected
+                // (sing-box `Select()` / mihomo `fast()` parity): with the
+                // stale baseline a degraded incumbent could never be
+                // displaced. An incumbent with no current measurement gets
+                // no hysteresis.
+                let current_latency = self.node_latency(
+                    candidates[pos].node,
+                    network,
+                    ipver,
+                    group.check_url.as_deref(),
+                    candidates[pos].tag,
+                );
+                if current_latency != Duration::MAX
+                    && best_latency.saturating_add(tolerance) >= current_latency
+                {
                     return candidates[pos].node;
                 }
             }
         }
 
-        let latency = self.node_latency(best.node, network, ipver);
+        let latency = self.node_latency(
+            best.node,
+            network,
+            ipver,
+            group.check_url.as_deref(),
+            best.tag,
+        );
         if self.cache_urltest_selection(group, network, &best, latency) {
             self.maybe_interrupt(&group.name);
         }
@@ -765,13 +822,15 @@ impl GroupManager {
     fn pick_best_by_latency<'a>(
         &self,
         candidates: &[Candidate<'a>],
-        _group: &Group,
+        group: &Group,
         network: SelectionNetwork,
         ipver: IpVersion,
     ) -> Candidate<'a> {
         candidates
             .iter()
-            .min_by_key(|c| self.node_latency(c.node, network, ipver))
+            .min_by_key(|c| {
+                self.node_latency(c.node, network, ipver, group.check_url.as_deref(), c.tag)
+            })
             .copied()
             .unwrap_or(candidates[0])
     }
@@ -780,17 +839,32 @@ impl GroupManager {
     ///
     /// Ranking uses the **moving average** of recent probe samples (dae's
     /// `min_moving_avg` / `min_avg10` semantics): TCP ranks by the TCP-probe
-    /// average. UDP ranks by the DataUDP then DNS-UDP averages only — a node
+    /// average — or, when the group has a custom `check_url`, by the
+    /// per-(node, url) probe average (sing-box urltest `url` option).
+    /// UDP ranks by the DataUDP then DNS-UDP averages only — a node
     /// with no UDP measurement ranks `Duration::MAX` (never its TCP
     /// latency), so UDP-proven nodes always beat UDP-unproven ones; the
     /// all-no-UDP-data case is handled separately by the TCP mirror in
     /// [`GroupManager::pick_urltest`].
-    fn node_latency(&self, node: &Node, network: SelectionNetwork, ipver: IpVersion) -> Duration {
+    fn node_latency(
+        &self,
+        node: &Node,
+        network: SelectionNetwork,
+        ipver: IpVersion,
+        check_url: Option<&str>,
+        tag: &str,
+    ) -> Duration {
         let latency = match network {
-            SelectionNetwork::Tcp => self
-                .alive_set
-                .as_ref()
-                .and_then(|a| a.get_avg_latency(&node.name, ProbeDomain::Tcp, ipver)),
+            SelectionNetwork::Tcp => match check_url {
+                Some(url) => self
+                    .alive_set
+                    .as_ref()
+                    .and_then(|a| a.get_avg_latency_for_url(tag, url)),
+                None => self
+                    .alive_set
+                    .as_ref()
+                    .and_then(|a| a.get_avg_latency(&node.name, ProbeDomain::Tcp, ipver)),
+            },
             SelectionNetwork::Udp => self
                 .alive_set
                 .as_ref()
@@ -820,8 +894,9 @@ impl GroupManager {
         mut candidates: Vec<Candidate<'a>>,
         network: SelectionNetwork,
         ipver: IpVersion,
+        check_url: Option<&str>,
     ) -> Vec<Candidate<'a>> {
-        candidates.sort_by_key(|c| self.node_latency(c.node, network, ipver));
+        candidates.sort_by_key(|c| self.node_latency(c.node, network, ipver, check_url, c.tag));
         candidates
     }
 }

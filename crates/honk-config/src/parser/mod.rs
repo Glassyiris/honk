@@ -1286,6 +1286,15 @@ fn parse_group_section(section: &Section) -> Result<Vec<Group>, crate::ConfigErr
         if let Some(default) = kv.get("default") {
             group.default = Some(default.trim_matches(|c| c == '\'' || c == '"').to_string());
         }
+        // sing-box URLTestOutboundOptions.URL: per-group health check target
+        // (overrides global tcp_check_url for this group's URLTest selection).
+        if let Some(check_url) = kv.get("check_url") {
+            group.check_url = Some(
+                check_url
+                    .trim_matches(|c| c == '\'' || c == '"')
+                    .to_string(),
+            );
+        }
 
         let filter_lines: Vec<&str> = grp
             .body

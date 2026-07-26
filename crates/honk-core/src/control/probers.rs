@@ -8,7 +8,6 @@ use super::*;
 pub(super) struct ProxyHttpProber {
     config: Arc<RwLock<Config>>,
     proxy_registry: Arc<ProxyRegistry>,
-    check_url: String,
     check_method: String,
 }
 
@@ -16,13 +15,11 @@ impl ProxyHttpProber {
     pub(super) fn new(
         config: Arc<RwLock<Config>>,
         proxy_registry: Arc<ProxyRegistry>,
-        check_url: String,
         check_method: String,
     ) -> Self {
         Self {
             config,
             proxy_registry,
-            check_url,
             check_method,
         }
     }
@@ -44,13 +41,14 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
         &self,
         node_name: &str,
         addr: SocketAddr,
+        url: &str,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<std::time::Duration, String>> + Send + 'static>,
     > {
         let node = self.find_node(node_name);
         let node_name_owned = node_name.to_string();
         let registry = self.proxy_registry.clone();
-        let check_url = self.check_url.clone();
+        let check_url = url.to_string();
         let check_method = self.check_method.clone();
         let config = self.config.clone();
 

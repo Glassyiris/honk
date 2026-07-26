@@ -261,6 +261,7 @@ group {
 | — | `check_url` | null | Override global TCP check URL; not parsed in dae syntax |
 | — | `check_interval` | null | Override interval (s); not parsed in dae syntax |
 | — | `tolerance` | `50` | URLTest hysteresis (ms); `0` = any better; not parsed in dae syntax |
+| `check_url` | — | (global) | Per-group health check target (URLTest groups only, sing-box urltest `url`); dae: `check_url: 'http://...'` |
 | — | `idle_timeout` | null | Stop checks after idle seconds; 0/None = never; not parsed in dae syntax |
 | — | `interrupt_connections` | `false` | Drop flows on selection change; not parsed in dae syntax |
 | — | `created_at` | now | Metadata |
@@ -570,8 +571,12 @@ Configured via `global { ... }` keys (`tcp_check_url`, `udp_check_dns`, `check_i
 | Domains | Tcp, DnsUdp, DataUdp × v4/v6 |
 | TCP probe | HTTP method to `tcp_check_url` or raw connect |
 | UDP probe | DNS to first usable `udp_check_dns` via node `dial_udp` |
+| Per-group check URL | Groups with `check_url` probe members against it (sub-group members via their current pick, keyed by tag — sing-box RealTag); (tag, url) state independent of the global one — dead-for-this-URL excludes the member from that group only |
 | Concurrency | Default batch 10 |
 | Recovery | 2 consecutive successes |
+| Deep backoff | After 10 consecutive failures, probing continues at the max-cooldown (300s) cadence — no permanent stop |
+| Dial failure | Latency history cleared immediately (sing-box `DeleteURLTestHistory`); a node's pooled connections and UDP endpoints are purged when it flips alive→dead |
+| Delay persistence | Last real delay sample per node saved to cache.db (60s writer), restored at startup, 24h age-out |
 | New node grace | ~60s |
 | URLTest idle | `idle_timeout` stops probes for unused groups |
 | eBPF push | Dead outbounds excluded from redirect |

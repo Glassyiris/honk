@@ -500,3 +500,137 @@ fn test_has_udp_state_from_traffic_reports() {
     set2.report_unavailable_traffic("n1", ProbeDomain::Tcp, IpVersion::V4);
     assert!(!set2.has_udp_state("n1"));
 }
+
+/// Stopped nodes (MAX_PROBE_BACKOFF_FAILURES consecutive failures) must
+/// still probe once their (max_cooldown) backoff expires — permanent
+/// starvation would make the recovery path unreachable and kill
+/// single-member Selector groups forever.
+#[test]
+fn test_stopped_node_probes_on_slow_cadence_and_recovers() {
+    let set = AliveDialerSet::new();
+    // Unregistered → outside the grace period, failures count immediately.
+    for _ in 0..10 {
+        set.mark_dead("n1");
+    }
+    let idx_domain = ProbeDomain::Tcp;
+    assert!(set.is_probe_stopped("n1", idx_domain, IpVersion::V4));
+    // Deep backoff cooldown (300s) has not expired → no probe yet.
+    assert!(!set.should_probe("n1", idx_domain, IpVersion::V4));
+
+    // Backdate the cooldown: a stopped node probes again on the slow
+    // cadence (previously it never would).
+    {
+        let mut states = set.states.write();
+        let entry = states.get_mut("n1").unwrap();
+        let idx = alive_index(idx_domain, IpVersion::V4);
+        entry[idx].cooldown_until = Instant::now() - Duration::from_secs(1);
+    }
+    assert!(set.should_probe("n1", idx_domain, IpVersion::V4));
+
+    // Recovery hysteresis still applies: two consecutive successes revive
+    // the node and clear the stopped flag.
+    set.record_probe_latency("n1", idx_domain, IpVersion::V4, Duration::from_millis(50));
+    assert!(!set.is_alive_for("n1", idx_domain, IpVersion::V4));
+    set.record_probe_latency("n1", idx_domain, IpVersion::V4, Duration::from_millis(50));
+    assert!(set.is_alive_for("n1", idx_domain, IpVersion::V4));
+    assert!(!set.is_probe_stopped("n1", idx_domain, IpVersion::V4));
+}
+
+/// The death callback fires on the probe-path alive→dead flip (per
+/// domain/ip-version), not on repeated failures of an already-dead node.
+#[test]
+fn test_death_callback_fires_on_flip_only() {
+    let set = AliveDialerSet::new();
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let calls2 = calls.clone();
+    set.set_death_callback(Some(Box::new(move |node: &str| {
+        calls2.lock().unwrap().push(node.to_string());
+    })));
+
+    // Unregistered → outside grace; TCP probe threshold is 1. mark_dead
+    // covers both IP versions → one call per flipped (domain, ipver).
+    set.mark_dead("n1");
+    assert_eq!(calls.lock().unwrap().len(), 2);
+
+    // Already dead → no more calls for the same domains.
+    set.mark_dead("n1");
+    assert_eq!(calls.lock().unwrap().len(), 2);
+
+    // A different domain flips (UDP probe threshold is 3) → one more call.
+    for _ in 0..3 {
+        set.mark_dead_for("n1", ProbeDomain::DataUdp, IpVersion::V4);
+    }
+    assert_eq!(calls.lock().unwrap().len(), 3);
+}
+
+/// Restored (persisted) delay samples seed ranking data without touching
+/// liveness: an unknown node stays in its default alive state, and a
+/// previously dead node stays dead.
+#[test]
+fn test_restore_latency_seeds_ranking_not_liveness() {
+    let set = AliveDialerSet::new();
+    let at = std::time::SystemTime::now();
+    set.restore_latency("n1", Duration::from_millis(88), at);
+
+    // Ranking data present…
+    assert_eq!(
+        set.get_moving_average("n1", ProbeDomain::Tcp, IpVersion::V4),
+        Some(Duration::from_millis(88))
+    );
+    // …and visible as a real (non-synthetic) display sample.
+    let (d, _t) = set
+        .get_last_real_sample("n1", ProbeDomain::Tcp, IpVersion::V4)
+        .expect("restored sample");
+    assert_eq!(d, Duration::from_millis(88));
+
+    // A dead node is not revived by restoration.
+    set.report_unavailable_forced("n2", ProbeDomain::Tcp, IpVersion::V4);
+    set.restore_latency("n2", Duration::from_millis(50), at);
+    assert!(!set.is_alive_for("n2", ProbeDomain::Tcp, IpVersion::V4));
+}
+
+/// Per-(node, url) state is fully independent of the global six domains:
+/// a node dead for one check URL stays alive globally and for other URLs.
+#[test]
+fn test_url_probe_state_independence() {
+    let set = AliveDialerSet::new();
+    let url_a = "http://a.example";
+    let url_b = "http://b.example";
+
+    set.record_url_probe_success("n1", url_a, Duration::from_millis(40));
+    assert!(set.is_alive_for_url("n1", url_a));
+    assert_eq!(
+        set.get_avg_latency_for_url("n1", url_a),
+        Some(Duration::from_millis(40))
+    );
+
+    // One failure kills (TCP-probe parity) — for url_a only.
+    set.record_url_probe_failure("n1", url_a);
+    assert!(!set.is_alive_for_url("n1", url_a));
+    assert!(set.is_alive_for_url("n1", url_b), "other URL unaffected");
+    assert!(
+        set.is_alive_for("n1", ProbeDomain::Tcp, IpVersion::V4),
+        "global TCP state unaffected"
+    );
+
+    // Recovery hysteresis: two consecutive successes.
+    set.record_url_probe_success("n1", url_a, Duration::from_millis(50));
+    assert!(!set.is_alive_for_url("n1", url_a));
+    set.record_url_probe_success("n1", url_a, Duration::from_millis(50));
+    assert!(set.is_alive_for_url("n1", url_a));
+}
+
+/// sync_group_check_urls drops registrations and prunes state for URLs
+/// no longer used by any group.
+#[test]
+fn test_sync_group_check_urls_prunes_unused_urls() {
+    let set = AliveDialerSet::new();
+    let url_a = "http://a.example";
+    set.sync_group_check_urls(&[("g1".into(), url_a.into())]);
+    set.record_url_probe_failure("n1", url_a);
+    assert!(set.has_url_state("n1", url_a));
+
+    set.sync_group_check_urls(&[]);
+    assert!(set.group_check_urls().is_empty());
+    assert!(!set.has_url_state("n1", url_a), "unused URL state pruned");
+}

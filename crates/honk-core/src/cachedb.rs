@@ -152,6 +152,76 @@ impl CacheDb {
         self.set("clash_mode", mode);
     }
 
+    /// Persist a node's last real delay sample under `delay:{node}`
+    /// (sing-box URLTest history storage parity: selections formed right
+    /// after a restart must not start cold).
+    pub fn save_delay_sample(&self, node: &str, delay_ms: u64, measured_at_unix: u64) {
+        let value = serde_json::json!({
+            "delay_ms": delay_ms,
+            "measured_at": measured_at_unix,
+        });
+        self.set(&format!("delay:{}", node), &value.to_string());
+    }
+
+    /// Load every persisted delay sample no older than `max_age_secs`
+    /// relative to `now_unix`. Stale or malformed entries are skipped and
+    /// lazily deleted. Returns `(node, delay_ms, measured_at_unix)`.
+    pub fn load_delay_samples(&self, now_unix: u64, max_age_secs: u64) -> Vec<(String, u64, u64)> {
+        let prefix = self.wrap("delay:");
+        let escaped = prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let rows: Vec<(String, String)> = {
+            let Ok(conn) = self.conn.lock() else {
+                return Vec::new();
+            };
+            let mut stmt =
+                match conn.prepare("SELECT key, value FROM kv WHERE key LIKE ?1 ESCAPE '\\'") {
+                    Ok(stmt) => stmt,
+                    Err(e) => {
+                        tracing::warn!("cache.db load_delay_samples prepare failed: {}", e);
+                        return Vec::new();
+                    }
+                };
+            match stmt
+                .query_map(params![format!("{}%", escaped)], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::warn!("cache.db load_delay_samples query failed: {}", e);
+                    return Vec::new();
+                }
+            }
+        };
+        let mut out = Vec::new();
+        for (key, value) in rows {
+            let node = key[prefix.len()..].to_string();
+            let parsed = serde_json::from_str::<serde_json::Value>(&value).ok();
+            let (delay_ms, measured_at) = parsed
+                .as_ref()
+                .and_then(|v| {
+                    Some((
+                        v.get("delay_ms")?.as_u64()?,
+                        v.get("measured_at")?.as_u64()?,
+                    ))
+                })
+                .unwrap_or((0, 0));
+            if measured_at == 0
+                || delay_ms == 0
+                || now_unix.saturating_sub(measured_at) > max_age_secs
+            {
+                self.remove(&format!("delay:{}", node));
+                continue;
+            }
+            out.push((node, delay_ms, measured_at));
+        }
+        out
+    }
+
     /// Persist one DNS answer under `dns:{name}:{qtype}`. `answer_json` is
     /// the opaque payload produced by the DNS layer (a JSON document);
     /// `expire_at_unix` is the absolute expiry as seconds since UNIX epoch.
@@ -387,6 +457,30 @@ mod tests {
         // Empty cache_id is yet another (legacy) namespace.
         let plain = CacheDb::open(&cfg(&path, ""), None).unwrap();
         assert!(plain.load_selector_choice("proxy").is_none());
+    }
+
+    #[test]
+    fn delay_sample_save_load_and_age_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.db");
+        let db = CacheDb::open(&cfg(&path, ""), None).unwrap();
+        let now = 1_700_000_000u64;
+
+        db.save_delay_sample("node-a", 123, now - 60);
+        db.save_delay_sample("node-old", 456, now - 25 * 3600);
+
+        let samples = db.load_delay_samples(now, 24 * 3600);
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0], ("node-a".to_string(), 123, now - 60));
+        // Stale entry was lazily deleted.
+        assert!(
+            db.load_delay_samples(now, 24 * 3600).is_empty()
+                || db
+                    .load_delay_samples(now, 24 * 3600)
+                    .iter()
+                    .all(|(n, _, _)| n != "node-old")
+        );
+        assert!(db.get("delay:node-old").is_none());
     }
 
     #[test]

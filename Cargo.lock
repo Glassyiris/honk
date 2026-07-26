@@ -1634,6 +1634,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "honk-tool"
+version = "0.0.1-alpha"
+dependencies = [
+ "anyhow",
+ "clap",
+ "honk-config",
+ "honk-core",
+ "honk-ebpf-common",
+ "honk-outbound",
+ "libc",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "http"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

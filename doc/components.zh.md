@@ -225,6 +225,7 @@ group {
 | `check_url` | string? | null | 覆盖全局 TCP 检查 URL（结构化模型字段，dae 语法无对应键） |
 | `check_interval` | u64? | null | 覆盖间隔（秒）（结构化模型字段，dae 语法无对应键） |
 | `tolerance` | u64 | `50` | URLTest 滞后（ms）；`0` = 任一更优即切（结构化模型字段，dae 语法无对应键；dae 用全局 `check_tolerance`） |
+| `check_url` | string | （全局） | 按组自定义探活目标（仅 URLTest 组，sing-box urltest `url`）；dae：`check_url: 'http://...'` |
 | `idle_timeout` | u64? | null | 空闲后停止检查（秒）；0/None = 永不（结构化模型字段，dae 语法无对应键） |
 | `interrupt_connections` | bool | `false` | 选择变化时打断连接（结构化模型字段，dae 语法无对应键） |
 | `created_at` | datetime | now | 元数据 |
@@ -506,8 +507,12 @@ honk-core delay <node> [--url HOST:PORT]
 | 域 | Tcp、DnsUdp、DataUdp × v4/v6 |
 | TCP 探测 | 对 `tcp_check_url` 发 HTTP，或裸连接 |
 | UDP 探测 | 经节点 `dial_udp` 向 `udp_check_dns` 发 DNS |
+| 按组 check URL | 配了 `check_url` 的组按其目标探测成员（子组成员经其当前选中节点探测，结果记到子组 tag,与 sing-box RealTag 一致）；(tag, url) 状态与全局独立——对该 URL 死亡只把该成员排除出该组 |
 | 并发 | 默认批次 10 |
 | 恢复 | 连续 2 次成功 |
+| 深度退避 | 连续失败 10 次后仍以 max_cooldown（300s）慢速节奏继续探测，不永久停止 |
+| 拨号失败 | 立即清除延迟历史（sing-box `DeleteURLTestHistory`）；节点 alive→dead 翻转时清除其连接池条目并回收 UDP endpoint |
+| 延迟持久化 | 每节点最近真实延迟样本写入 cache.db（60s 周期），启动时恢复，超过 24h 丢弃 |
 | 新节点宽限 | 约 60s |
 | URLTest 空闲 | `idle_timeout` 停止未使用组的探测 |
 | eBPF 推送 | 已死出站不再被 redirect |
