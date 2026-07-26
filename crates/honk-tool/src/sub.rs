@@ -50,6 +50,8 @@ struct ProbeOutcome {
     v4: Option<Result<Duration, String>>,
     v6: Option<Result<Duration, String>>,
     urltest: Result<Duration, String>,
+    udp_dns: Option<Result<Duration, String>>,
+    udp_quic: Option<Result<Duration, String>>,
 }
 
 pub async fn run(args: SubArgs) -> anyhow::Result<()> {
@@ -100,6 +102,14 @@ pub async fn run(args: SubArgs) -> anyhow::Result<()> {
         .iter()
         .filter(|o| matches!(&o.v6, Some(Ok(_))))
         .count();
+    let alive_udp = outcomes
+        .iter()
+        .filter(|o| matches!(&o.udp_dns, Some(Ok(_))))
+        .count();
+    let alive_quic = outcomes
+        .iter()
+        .filter(|o| matches!(&o.udp_quic, Some(Ok(_))))
+        .count();
     let mut latencies: Vec<u128> = outcomes
         .iter()
         .filter_map(|o| o.urltest.as_ref().ok().map(|d| d.as_millis()))
@@ -110,7 +120,7 @@ pub async fn run(args: SubArgs) -> anyhow::Result<()> {
         .map(|v| format!("{v}ms"))
         .unwrap_or_else(|| "n/a".into());
     println!(
-        "\n== {} node(s): v4-proxied {alive_v4}, v6-proxied {alive_v6}, urltest-ok {}, median latency {median}",
+        "\n== {} node(s): v4-proxied {alive_v4}, v6-proxied {alive_v6}, udp-dns {alive_udp}, udp-quic {alive_quic}, urltest-ok {}, median latency {median}",
         outcomes.len(),
         latencies.len()
     );
@@ -193,6 +203,9 @@ async fn probe_node(
     let v4 = probe_family(registry, &node, url_host, url_port, false, timeout).await;
     let v6 = probe_family(registry, &node, url_host, url_port, true, timeout).await;
 
+    let udp_dns = probe_udp_dns(registry, &node, timeout).await;
+    let udp_quic = probe_udp_quic(registry, &node, url_host, url_port, timeout).await;
+
     let urltest = match handler {
         Some(handler) => {
             let url = url.unwrap_or_default();
@@ -211,6 +224,8 @@ async fn probe_node(
         v4,
         v6,
         urltest,
+        udp_dns,
+        udp_quic,
     }
 }
 
@@ -274,14 +289,22 @@ fn print_outcome(o: &ProbeOutcome) {
         Ok(d) => format!("{}ms", d.as_millis()),
         Err(e) => format!("FAIL({})", short_err(e)),
     };
+    let udp_str = |r: &Option<Result<Duration, String>>| match r {
+        None => "n/a".to_string(),
+        Some(Ok(d)) => format!("{}ms", d.as_millis()),
+        Some(Err(e)) if e.contains("not supported") => "unsupp".to_string(),
+        Some(Err(e)) => format!("FAIL({})", short_err(e)),
+    };
     println!(
-        "{:<40} {:<10} {:<6} v4: {:<18} v6: {:<18} urltest: {}",
+        "{:<40} {:<10} {:<6} v4: {:<14} v6: {:<14} urltest: {:<14} dns: {:<14} quic: {}",
         truncate(&o.node_name, 40),
         o.protocol,
         families,
         family_str(&o.v4),
         family_str(&o.v6),
-        urltest_str
+        urltest_str,
+        udp_str(&o.udp_dns),
+        udp_str(&o.udp_quic),
     );
 }
 
@@ -302,4 +325,118 @@ fn split_host_port(s: &str) -> anyhow::Result<(&str, u16)> {
         .rsplit_once(':')
         .with_context(|| format!("target '{s}' must be host:port"))?;
     Ok((host, port.parse()?))
+}
+
+/// Tiny xorshift PRNG seeded from the clock (avoids a rand dependency for the
+/// two probe packet builders).
+fn next_rand(state: &mut u64) -> u64 {
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    x
+}
+
+fn rand_seed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64 | 1)
+        .unwrap_or(0x9e3779b97f4a7c15)
+}
+
+/// UDP probe: one minimal DNS A query through the node's `dial_udp`.
+/// Proves the node's UDP relay path end to end (mirrors the engine's
+/// `probe_node_udp` health check).
+async fn probe_udp_dns(
+    registry: &ProxyRegistry,
+    node: &Node,
+    timeout: Duration,
+) -> Option<Result<Duration, String>> {
+    let dns_server: SocketAddr = "8.8.8.8:53".parse().unwrap();
+    let proxy = match registry.dial_udp(node, dns_server, None, timeout).await {
+        Ok(p) => p,
+        Err(e) => return Some(Err(e.to_string())),
+    };
+
+    // Minimal DNS query: id, RD, qdcount=1, A record for google.com.
+    let mut rng = rand_seed();
+    let id = next_rand(&mut rng) as u16;
+    let mut query = vec![
+        (id >> 8) as u8,
+        id as u8,
+        0x01,
+        0x00, // RD
+        0x00,
+        0x01, // qdcount
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+    ];
+    for label in ["google", "com"] {
+        query.push(label.len() as u8);
+        query.extend_from_slice(label.as_bytes());
+    }
+    query.extend_from_slice(&[0x00, 0x00, 0x01, 0x00, 0x01]); // root, A, IN
+
+    let start = Instant::now();
+    if let Err(e) = proxy.socket.send_to(&query, proxy.relay_addr).await {
+        return Some(Err(format!("dns send: {e}")));
+    }
+    let mut buf = [0u8; 512];
+    match tokio::time::timeout(timeout, proxy.socket.recv_from(&mut buf)).await {
+        Ok(Ok((n, _))) => {
+            if n >= 2 && buf[0] == query[0] && buf[1] == query[1] {
+                Some(Ok(start.elapsed()))
+            } else {
+                Some(Err("dns response id mismatch".into()))
+            }
+        }
+        Ok(Err(e)) => Some(Err(format!("dns recv: {e}"))),
+        Err(_) => Some(Err("dns timeout".into())),
+    }
+}
+
+/// UDP probe for QUIC: run a real QUIC handshake through the node's
+/// `dial_udp` and time it.  Unlike a bare Version-Negotiation trigger (which
+/// most frontends silently drop), this proves TLS-in-QUIC reachability
+/// through the node's UDP path.
+async fn probe_udp_quic(
+    registry: &ProxyRegistry,
+    node: &Node,
+    url_host: &str,
+    url_port: u16,
+    timeout: Duration,
+) -> Option<Result<Duration, String>> {
+    let addr: SocketAddr = match tokio::net::lookup_host((url_host, url_port)).await {
+        Ok(mut addrs) => addrs.find(|a| a.is_ipv4())?,
+        Err(e) => return Some(Err(format!("resolve {url_host}: {e}"))),
+    };
+    let proxy = match registry.dial_udp(node, addr, None, timeout).await {
+        Ok(p) => p,
+        Err(e) => return Some(Err(e.to_string())),
+    };
+
+    // Liveness-only client: skip certificate verification, offer h3.
+    let probe_node = Node {
+        skip_cert_verify: true,
+        sni: Some(url_host.to_string()),
+        ..Default::default()
+    };
+    let config = match honk_outbound::quic::client_config(
+        &probe_node,
+        &[b"h3"],
+        honk_outbound::quic::QuicClientOptions::default(),
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => return Some(Err(format!("quic config: {e}"))),
+    };
+
+    match honk_outbound::quic::quic_handshake_probe(proxy, addr, url_host, &config, timeout).await {
+        Ok(elapsed) => Some(Ok(elapsed)),
+        Err(e) => Some(Err(e.to_string())),
+    }
 }

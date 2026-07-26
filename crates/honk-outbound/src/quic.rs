@@ -624,3 +624,134 @@ mod brutal_tests {
         assert_eq!(cc.window(), before);
     }
 }
+
+// ---------------------------------------------------------------------------
+// QUIC liveness probing through a proxy's UDP tunnel
+// ---------------------------------------------------------------------------
+
+use crate::proxy::UdpProxySocket;
+
+/// quinn [`AsyncUdpSocket`] that drives a proxied UDP tunnel
+/// ([`UdpProxySocket`]): outbound datagrams go to the tunnel's relay address,
+/// and inbound datagrams have their source normalized to the QUIC peer so
+/// quinn's remote-address checks see a stable path (same trick as
+/// hysteria2's port-hop normalization).
+#[derive(Debug)]
+struct UdpProxyQuinnSocket {
+    proxy: Arc<UdpProxySocket>,
+    remote: SocketAddr,
+}
+
+impl quinn::AsyncUdpSocket for UdpProxyQuinnSocket {
+    fn create_io_poller(self: Arc<Self>) -> std::pin::Pin<Box<dyn quinn::UdpPoller>> {
+        #[derive(Debug)]
+        struct Poller(Arc<UdpProxySocket>);
+        impl quinn::UdpPoller for Poller {
+            fn poll_writable(
+                self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                self.0.socket.poll_send_ready(cx)
+            }
+        }
+        Box::pin(Poller(self.proxy.clone()))
+    }
+
+    fn try_send(&self, transmit: &quinn::udp::Transmit) -> io::Result<()> {
+        self.proxy
+            .socket
+            .try_send_to(transmit.contents, self.proxy.relay_addr)
+            .map(|_| ())
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        bufs: &mut [std::io::IoSliceMut<'_>],
+        meta: &mut [quinn::udp::RecvMeta],
+    ) -> std::task::Poll<io::Result<usize>> {
+        let mut count = 0;
+        for (buf, meta_slot) in bufs.iter_mut().zip(meta.iter_mut()) {
+            let mut read_buf = tokio::io::ReadBuf::new(&mut buf[..]);
+            match self.proxy.socket.poll_recv_from(cx, &mut read_buf) {
+                std::task::Poll::Ready(Ok(_addr)) => {
+                    let len = read_buf.filled().len();
+                    *meta_slot = quinn::udp::RecvMeta {
+                        addr: self.remote,
+                        len,
+                        stride: len,
+                        ecn: None,
+                        dst_ip: None,
+                    };
+                    count += 1;
+                }
+                std::task::Poll::Ready(Err(e)) => {
+                    return if count == 0 {
+                        std::task::Poll::Ready(Err(e))
+                    } else {
+                        std::task::Poll::Ready(Ok(count))
+                    };
+                }
+                std::task::Poll::Pending => {
+                    return if count == 0 {
+                        std::task::Poll::Pending
+                    } else {
+                        std::task::Poll::Ready(Ok(count))
+                    };
+                }
+            }
+        }
+        std::task::Poll::Ready(Ok(count))
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.proxy.socket.local_addr()
+    }
+
+    fn max_transmit_segments(&self) -> usize {
+        1
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        1
+    }
+
+    fn may_fragment(&self) -> bool {
+        true
+    }
+}
+
+/// Establish a QUIC connection through a proxied UDP tunnel and time the
+/// handshake.  This is the real QUIC liveness probe: unlike a bare
+/// Version-Negotiation trigger (which many frontends ignore), it proves
+/// TLS-in-QUIC reachability through the node's UDP path.  `config` comes from
+/// [`client_config`] — pass a node with `skip_cert_verify` for pure liveness
+/// probing.
+pub async fn quic_handshake_probe(
+    proxy: UdpProxySocket,
+    target: SocketAddr,
+    server_name: &str,
+    config: &ClientConfig,
+    timeout: Duration,
+) -> anyhow::Result<Duration> {
+    let socket = Arc::new(UdpProxyQuinnSocket {
+        proxy: Arc::new(proxy),
+        remote: target,
+    });
+    let runtime = quinn::default_runtime()
+        .ok_or_else(|| io::Error::other("no async runtime available for QUIC"))?;
+    let endpoint =
+        Endpoint::new_with_abstract_socket(EndpointConfig::default(), None, socket, runtime)?;
+
+    let start = Instant::now();
+    let connecting = endpoint
+        .connect_with(config.clone(), target, server_name)
+        .context("create QUIC connecting")?;
+    let conn = tokio::time::timeout(timeout, connecting)
+        .await
+        .context("QUIC handshake timeout")??;
+    let elapsed = start.elapsed();
+    conn.close(quinn::VarInt::from_u32(0), b"probe");
+    endpoint.close(quinn::VarInt::from_u32(0), b"probe");
+    Ok(elapsed)
+}

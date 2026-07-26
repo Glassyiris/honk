@@ -51,8 +51,17 @@ pub async fn run(args: DiagnoseArgs) -> anyhow::Result<()> {
     }
 
     // 4. Pinned maps.
-    for name in ["CONN_STATE_MAP", "REDIRECT_TRACK", "ROUTING_HANDOFF_MAP", "CONN_STATE_OCCUPANCY"] {
-        check_path(&args.pin_root.join(name).display().to_string(), name, &mut issues);
+    for name in [
+        "CONN_STATE_MAP",
+        "REDIRECT_TRACK",
+        "ROUTING_HANDOFF_MAP",
+        "CONN_STATE_OCCUPANCY",
+    ] {
+        check_path(
+            &args.pin_root.join(name).display().to_string(),
+            name,
+            &mut issues,
+        );
     }
 
     // 5. Occupancy + overflow via the bpf stats path.

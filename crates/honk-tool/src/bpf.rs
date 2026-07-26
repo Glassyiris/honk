@@ -128,7 +128,9 @@ fn map_entries(fd: RawFd, key_len: usize, value_len: usize) -> io::Result<Vec<(V
 fn read_value<T: Copy>(fd: RawFd, key: &[u8]) -> io::Result<Option<T>> {
     let mut buf = vec![0u8; std::mem::size_of::<T>()];
     if map_lookup(fd, key, &mut buf)? {
-        Ok(Some(unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const T) }))
+        Ok(Some(unsafe {
+            std::ptr::read_unaligned(buf.as_ptr() as *const T)
+        }))
     } else {
         Ok(None)
     }
@@ -278,10 +280,8 @@ fn show(args: ShowArgs) -> anyhow::Result<()> {
             )?;
             let mut shown = 0usize;
             for (kb, vb) in &entries {
-                let k: RedirectTuple =
-                    unsafe { std::ptr::read_unaligned(kb.as_ptr() as *const _) };
-                let v: RedirectEntry =
-                    unsafe { std::ptr::read_unaligned(vb.as_ptr() as *const _) };
+                let k: RedirectTuple = unsafe { std::ptr::read_unaligned(kb.as_ptr() as *const _) };
+                let v: RedirectEntry = unsafe { std::ptr::read_unaligned(vb.as_ptr() as *const _) };
                 if let Some(want) = &args.ip
                     && ip_of(&k.src_ip) != *want
                     && ip_of(&k.dst_ip) != *want
@@ -311,8 +311,7 @@ fn show(args: ShowArgs) -> anyhow::Result<()> {
             for (kb, vb) in &entries {
                 let mut addr: In6Addr = unsafe { std::mem::zeroed() };
                 unsafe { addr.u6_addr8.copy_from_slice(kb) };
-                let v: DomainRouting =
-                    unsafe { std::ptr::read_unaligned(vb.as_ptr() as *const _) };
+                let v: DomainRouting = unsafe { std::ptr::read_unaligned(vb.as_ptr() as *const _) };
                 let ip = ip_of(&addr);
                 if let Some(want) = &args.ip
                     && ip != *want
