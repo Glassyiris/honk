@@ -36,14 +36,12 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time;
 
+use super::addr;
 use super::{ProxyHandler, ProxyStream, UdpProxySocket};
 
 const CRLF: &[u8] = b"\r\n";
 const CMD_TCP: u8 = 0x01;
 const CMD_UDP: u8 = 0x03;
-const ATYP_IPV4: u8 = 0x01;
-const ATYP_DOMAIN: u8 = 0x03;
-const ATYP_IPV6: u8 = 0x04;
 
 /// Trojan proxy handler.
 #[derive(Debug, Default, Clone, Copy)]
@@ -52,30 +50,6 @@ pub struct TrojanHandler;
 impl TrojanHandler {
     pub fn new() -> Self {
         Self
-    }
-
-    fn encode_address(target: SocketAddr, target_domain: Option<&str>) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(19);
-        if let Some(domain) = target_domain {
-            buf.push(ATYP_DOMAIN);
-            buf.push(domain.len().min(u8::MAX as usize) as u8);
-            buf.extend_from_slice(domain.as_bytes());
-            buf.extend_from_slice(&target.port().to_be_bytes());
-        } else {
-            match target {
-                SocketAddr::V4(v4) => {
-                    buf.push(ATYP_IPV4);
-                    buf.extend_from_slice(&v4.ip().octets());
-                    buf.extend_from_slice(&v4.port().to_be_bytes());
-                }
-                SocketAddr::V6(v6) => {
-                    buf.push(ATYP_IPV6);
-                    buf.extend_from_slice(&v6.ip().octets());
-                    buf.extend_from_slice(&v6.port().to_be_bytes());
-                }
-            }
-        }
-        buf
     }
 
     /// Format: `hex(sha224(password)) CRLF cmd address CRLF`.
@@ -88,7 +62,7 @@ impl TrojanHandler {
         header.extend_from_slice(hex_sha224(password).as_bytes());
         header.extend_from_slice(CRLF);
         header.push(CMD_TCP);
-        header.extend_from_slice(&Self::encode_address(target, target_domain));
+        header.extend_from_slice(&addr::encode_address(target, target_domain));
         header.extend_from_slice(CRLF);
         header
     }
@@ -189,7 +163,7 @@ impl ProxyHandler for TrojanHandler {
         header.extend_from_slice(hex_sha224(password).as_bytes());
         header.extend_from_slice(CRLF);
         header.push(CMD_UDP);
-        header.extend_from_slice(&Self::encode_address(target, target_domain));
+        header.extend_from_slice(&addr::encode_address(target, target_domain));
         header.extend_from_slice(CRLF);
 
         control.write_all(&header).await?;
@@ -208,7 +182,7 @@ impl ProxyHandler for TrojanHandler {
             control,
             internal,
             external_addr,
-            Self::encode_address(target, target_domain),
+            addr::encode_address(target, target_domain),
         ));
 
         Ok(UdpProxySocket {
@@ -245,36 +219,6 @@ impl ProxyHandler for TrojanHandler {
 /// Idle timeout for the UDP associate bridge (mirrors the AnyTLS UoT bridge).
 const UDP_BRIDGE_IDLE_SECS: u64 = 90;
 
-/// Read one SOCKS5-style address off an associate stream, returning the
-/// number of bytes consumed. Used by the bridge's inbound parser.
-async fn read_stream_address<R: AsyncReadExt + Unpin>(rd: &mut R) -> std::io::Result<()> {
-    let mut atyp = [0u8; 1];
-    rd.read_exact(&mut atyp).await?;
-    match atyp[0] {
-        ATYP_IPV4 => {
-            let mut skip = [0u8; 4 + 2];
-            rd.read_exact(&mut skip).await?;
-        }
-        ATYP_IPV6 => {
-            let mut skip = [0u8; 16 + 2];
-            rd.read_exact(&mut skip).await?;
-        }
-        ATYP_DOMAIN => {
-            let mut len = [0u8; 1];
-            rd.read_exact(&mut len).await?;
-            let mut skip = vec![0u8; len[0] as usize + 2];
-            rd.read_exact(&mut skip).await?;
-        }
-        other => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("trojan UDP packet: unknown ATYP {other:#x}"),
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// Bridge task for UDP associate: frames loopback datagrams as Trojan UDP
 /// packets (`addr | u16 len | CRLF | payload`) on the associate stream and
 /// delivers inbound packets back to the loopback peer. Ends on error, EOF,
@@ -289,7 +233,9 @@ async fn trojan_udp_bridge(
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let reader = tokio::spawn(async move {
         loop {
-            if read_stream_address(&mut rd).await.is_err() {
+            // The address is parsed (and bounds-checked) but discarded: the
+            // bridge replies to the fixed loopback peer regardless.
+            if addr::SocksAddr::read_from_stream(&mut rd).await.is_err() {
                 break;
             }
             let mut len_buf = [0u8; 2];
@@ -383,7 +329,7 @@ mod tests {
         assert_eq!(&header[..56], expected_hash.as_bytes());
         assert_eq!(&header[56..58], CRLF);
         assert_eq!(header[58], CMD_TCP);
-        assert_eq!(header[59], ATYP_IPV4);
+        assert_eq!(header[59], addr::ATYP_IPV4);
         assert_eq!(&header[60..64], &[93, 184, 216, 34]);
         assert_eq!(&header[64..66], &[0x00, 0x50]); // port 80
         assert_eq!(&header[66..68], CRLF);
@@ -401,7 +347,7 @@ mod tests {
         assert_eq!(&header[..56], expected_hash.as_bytes());
         assert_eq!(&header[56..58], CRLF);
         assert_eq!(header[58], CMD_TCP);
-        assert_eq!(header[59], ATYP_DOMAIN);
+        assert_eq!(header[59], addr::ATYP_DOMAIN);
         assert_eq!(header[60], domain.len() as u8);
         assert_eq!(&header[61..72], domain.as_bytes());
         assert_eq!(&header[72..74], &[0x01, 0xbb]); // port 443
@@ -450,7 +396,7 @@ mod tests {
         let external_addr = external.local_addr().unwrap();
         let relay_addr = internal.local_addr().unwrap();
         let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
-        let addr_header = TrojanHandler::encode_address(target, None);
+        let addr_header = addr::encode_address(target, None);
         tokio::spawn(trojan_udp_bridge(
             boxed,
             internal,

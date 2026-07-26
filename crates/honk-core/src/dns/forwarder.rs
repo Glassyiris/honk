@@ -17,6 +17,7 @@ use tracing::{debug, trace, warn};
 
 use super::cache::DnsCache;
 use super::routing::{DnsRequestDecision, DnsResponseDecision, DnsRouter};
+use super::wire::skip_dns_name;
 use honk_config::dns::DnsStrategy;
 use honk_ebpf_common::DAE_BYPASS_MARK;
 
@@ -627,54 +628,7 @@ fn decode_dns_name(data: &[u8], pos: &mut usize) -> Option<String> {
 /// win (fixed override); `0` keeps the answer-section minimum.
 /// Extract A/AAAA answer IPs from a wire-format DNS response.
 pub fn extract_answer_ips(data: &[u8]) -> Vec<IpAddr> {
-    let mut ips = Vec::new();
-    if data.len() < 12 {
-        return ips;
-    }
-    let qdcount = u16::from_be_bytes([data[4], data[5]]) as usize;
-    let ancount = u16::from_be_bytes([data[6], data[7]]) as usize;
-    let mut pos = 12;
-    for _ in 0..qdcount {
-        if !skip_dns_name(data, &mut pos) {
-            return ips;
-        }
-        pos += 4;
-        if pos > data.len() {
-            return ips;
-        }
-    }
-    for _ in 0..ancount {
-        if !skip_dns_name(data, &mut pos) {
-            break;
-        }
-        if pos + 10 > data.len() {
-            break;
-        }
-        let rtype = u16::from_be_bytes([data[pos], data[pos + 1]]);
-        let rdlength = u16::from_be_bytes([data[pos + 8], data[pos + 9]]) as usize;
-        pos += 10;
-        if pos + rdlength > data.len() {
-            break;
-        }
-        match rtype {
-            1 if rdlength == 4 => {
-                ips.push(IpAddr::V4(std::net::Ipv4Addr::new(
-                    data[pos],
-                    data[pos + 1],
-                    data[pos + 2],
-                    data[pos + 3],
-                )));
-            }
-            28 if rdlength == 16 => {
-                let mut octets = [0u8; 16];
-                octets.copy_from_slice(&data[pos..pos + 16]);
-                ips.push(IpAddr::V6(std::net::Ipv6Addr::from(octets)));
-            }
-            _ => {}
-        }
-        pos += rdlength;
-    }
-    ips
+    super::wire::extract_ips_from_dns_response(data)
 }
 
 fn effective_cache_ttl(configured: u32, answer_min_ttl: u32) -> u32 {
@@ -777,36 +731,6 @@ fn extract_min_ttl(data: &[u8]) -> u32 {
     }
 
     if min_ttl == u32::MAX { 60 } else { min_ttl }
-}
-
-/// Advance `pos` past a DNS name (handling label sequences and
-/// compression pointers).  Returns `false` on malformed data.
-fn skip_dns_name(data: &[u8], pos: &mut usize) -> bool {
-    loop {
-        if *pos >= data.len() {
-            return false;
-        }
-        let len = data[*pos];
-        if len == 0 {
-            *pos += 1;
-            return true;
-        }
-        if len & 0xC0 == 0xC0 {
-            // Compression pointer — advance past the 2-byte pointer
-            if *pos + 2 > data.len() {
-                return false;
-            }
-            *pos += 2;
-            return true;
-        }
-        if len > 63 {
-            return false;
-        }
-        *pos += 1 + len as usize;
-        if *pos > data.len() {
-            return false;
-        }
-    }
 }
 
 /// Build the cache key for a domain and query type.

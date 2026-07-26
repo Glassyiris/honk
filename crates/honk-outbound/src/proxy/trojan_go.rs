@@ -43,13 +43,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
+use super::addr::encode_address;
 use super::{AsyncReadWrite, ProxyHandler, ProxyStream};
 
 const CRLF: &[u8] = b"\r\n";
 const CMD_MUX: u8 = 0x7f;
-const ATYP_IPV4: u8 = 0x01;
-const ATYP_DOMAIN: u8 = 0x03;
-const ATYP_IPV6: u8 = 0x04;
 
 /// Trojan-Go proxy handler with multiplexing.
 #[derive(Debug, Default)]
@@ -319,30 +317,6 @@ fn build_mux_header(
     header
 }
 
-fn encode_address(target: SocketAddr, target_domain: Option<&str>) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(19);
-    if let Some(domain) = target_domain {
-        buf.push(ATYP_DOMAIN);
-        buf.push(domain.len().min(u8::MAX as usize) as u8);
-        buf.extend_from_slice(domain.as_bytes());
-        buf.extend_from_slice(&target.port().to_be_bytes());
-    } else {
-        match target {
-            SocketAddr::V4(v4) => {
-                buf.push(ATYP_IPV4);
-                buf.extend_from_slice(&v4.ip().octets());
-                buf.extend_from_slice(&v4.port().to_be_bytes());
-            }
-            SocketAddr::V6(v6) => {
-                buf.push(ATYP_IPV6);
-                buf.extend_from_slice(&v6.ip().octets());
-                buf.extend_from_slice(&v6.port().to_be_bytes());
-            }
-        }
-    }
-    buf
-}
-
 struct MuxProxyStream {
     stream_id: u16,
     read_rx: Mutex<mpsc::UnboundedReceiver<Vec<u8>>>,
@@ -483,7 +457,7 @@ mod tests {
         assert_eq!(&header[56..58], CRLF);
         assert_eq!(header[58], CMD_MUX);
         assert_eq!(&header[59..61], &stream_id.to_be_bytes());
-        assert_eq!(header[61], ATYP_IPV4);
+        assert_eq!(header[61], crate::proxy::addr::ATYP_IPV4);
         assert_eq!(&header[62..66], &[93, 184, 216, 34]);
         assert_eq!(&header[66..68], &[0x00, 0x50]);
         assert_eq!(&header[68..70], CRLF);
@@ -502,7 +476,7 @@ mod tests {
         assert_eq!(&header[56..58], CRLF);
         assert_eq!(header[58], CMD_MUX);
         assert_eq!(&header[59..61], &stream_id.to_be_bytes());
-        assert_eq!(header[61], ATYP_DOMAIN);
+        assert_eq!(header[61], crate::proxy::addr::ATYP_DOMAIN);
         assert_eq!(header[62], domain.len() as u8);
         assert_eq!(&header[63..74], domain.as_bytes());
         assert_eq!(&header[74..76], &[0x01, 0xbb]);

@@ -3,71 +3,18 @@
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use tokio::io::{AsyncRead, AsyncWrite};
-use tracing::debug;
 
-use super::DialContext;
-use super::framing::exchange_length_prefixed;
+use super::{DialContext, exchange_with_retry, idle_pool_exchange};
 use honk_outbound::tls::{TlsConnector, TlsStream};
 
-const MAX_POOL_SIZE: usize = 4;
-
-enum DotStream {
-    Direct(TlsStream<tokio::net::TcpStream>),
-    Proxied(TlsStream<Box<dyn crate::proxy::AsyncReadWrite>>),
-}
-
-impl AsyncRead for DotStream {
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            DotStream::Direct(s) => std::pin::Pin::new(s).poll_read(cx, buf),
-            DotStream::Proxied(s) => std::pin::Pin::new(s).poll_read(cx, buf),
-        }
-    }
-}
-
-impl AsyncWrite for DotStream {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<Result<usize, std::io::Error>> {
-        match self.get_mut() {
-            DotStream::Direct(s) => std::pin::Pin::new(s).poll_write(cx, buf),
-            DotStream::Proxied(s) => std::pin::Pin::new(s).poll_write(cx, buf),
-        }
-    }
-
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        match self.get_mut() {
-            DotStream::Direct(s) => std::pin::Pin::new(s).poll_flush(cx),
-            DotStream::Proxied(s) => std::pin::Pin::new(s).poll_flush(cx),
-        }
-    }
-
-    fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        match self.get_mut() {
-            DotStream::Direct(s) => std::pin::Pin::new(s).poll_shutdown(cx),
-            DotStream::Proxied(s) => std::pin::Pin::new(s).poll_shutdown(cx),
-        }
-    }
-}
+/// TLS stream over either a direct or proxied base connection.
+type PooledStream = TlsStream<Box<dyn crate::proxy::AsyncReadWrite>>;
 
 /// Idle-pool DoT client for one upstream.
 pub struct DotPool {
     dial: DialContext,
     connector: TlsConnector,
-    idle: Mutex<Vec<DotStream>>,
+    idle: Mutex<Vec<PooledStream>>,
 }
 
 impl DotPool {
@@ -76,61 +23,39 @@ impl DotPool {
         Ok(Arc::new(Self {
             dial,
             connector,
-            idle: Mutex::new(Vec::with_capacity(MAX_POOL_SIZE)),
+            idle: Mutex::new(Vec::new()),
         }))
     }
 
     pub async fn exchange(self: &Arc<Self>, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
-        match self.exchange_once(raw_query).await {
-            Ok(resp) => Ok(resp),
-            Err(first) => {
-                debug!("DoT exchange failed ({first}); redialing once");
-                self.exchange_once(raw_query).await.map_err(|e| {
-                    anyhow::anyhow!("DoT query failed after retry: {e} (first: {first})")
-                })
-            }
-        }
+        exchange_with_retry("DoT", || self.exchange_once(raw_query), || async {}).await
     }
 
     async fn exchange_once(&self, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let mut stream = {
-            let taken = self.idle.lock().pop();
-            match taken {
-                Some(s) => s,
-                None => self.dial_tls().await?,
-            }
-        };
-        match exchange_length_prefixed(&mut stream, raw_query, self.dial.query_timeout).await {
-            Ok(resp) => {
-                let mut idle = self.idle.lock();
-                if idle.len() < MAX_POOL_SIZE {
-                    idle.push(stream);
-                }
-                Ok(resp)
-            }
-            Err(e) => Err(e),
-        }
+        idle_pool_exchange(
+            &self.idle,
+            || self.dial_tls(),
+            raw_query,
+            self.dial.query_timeout,
+        )
+        .await
     }
 
-    async fn dial_tls(&self) -> anyhow::Result<DotStream> {
+    async fn dial_tls(&self) -> anyhow::Result<PooledStream> {
         let server_name = self.dial.endpoint.sni.clone();
 
         if self.dial.proxy.is_some() {
             let tcp = self.dial.dial_tcp_boxed().await?;
-            let tls = self
-                .connector
+            self.connector
                 .connect(&server_name, tcp)
                 .await
-                .map_err(|e| anyhow::anyhow!("DoT TLS handshake (via proxy): {e}"))?;
-            Ok(DotStream::Proxied(tls))
+                .map_err(|e| anyhow::anyhow!("DoT TLS handshake (via proxy): {e}"))
         } else {
-            let tcp = self.dial.dial_tcp().await?;
-            let tls = self
-                .connector
+            let tcp: Box<dyn crate::proxy::AsyncReadWrite> = Box::new(self.dial.dial_tcp().await?);
+            self.connector
                 .connect(&server_name, tcp)
                 .await
-                .map_err(|e| anyhow::anyhow!("DoT TLS handshake: {e}"))?;
-            Ok(DotStream::Direct(tls))
+                .map_err(|e| anyhow::anyhow!("DoT TLS handshake: {e}"))
         }
     }
 }
