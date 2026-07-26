@@ -23,7 +23,7 @@ pub struct SubArgs {
     /// Subscription URL (http/https) or a local file with one share link per line.
     pub source: String,
     /// Test target for proxied connectivity/latency (host:port).
-    #[arg(long, default_value = "www.gstatic.com:443")]
+    #[arg(long, default_value = "cp.cloudflare.com:80")]
     pub target: String,
     /// Latency-test URL (defaults to https://www.gstatic.com/generate_204).
     #[arg(long)]
@@ -40,14 +40,14 @@ pub struct SubArgs {
     /// User-Agent for the subscription fetch.
     #[arg(long)]
     pub ua: Option<String>,
-    /// Explicit IPv4 target for the v4 probe (dae-style, e.g. 1.1.1.1:443).
+    /// Explicit IPv4 target for the v4 probe (dae-style, e.g. 1.1.1.1:80).
     /// Overrides DNS resolution for that family.
-    #[arg(long)]
+    #[arg(long, default_value = "1.1.1.1:80")]
     pub v4_target: Option<SocketAddr>,
     /// Explicit IPv6 target for the v6 probe (dae-style, e.g.
-    /// [2606:4700:4700::1111]:443).  Use when the resolver gives no AAAA
+    /// [2606:4700:4700::1111]:80).  Use when the resolver gives no AAAA
     /// (e.g. ipversion_prefer: 4 DNS) or the host has none.
-    #[arg(long)]
+    #[arg(long, default_value = "[2606:4700:4700::1111]:80")]
     pub v6_target: Option<SocketAddr>,
 }
 
@@ -227,7 +227,9 @@ async fn probe_node(
     let v6 = probe_family(registry, &node, url_host, url_port, true, timeout, targets.v6).await;
 
     let udp_dns = probe_udp_dns(registry, &node, timeout).await;
-    let udp_quic = probe_udp_quic(registry, &node, url_host, url_port, timeout).await;
+    // QUIC (HTTP/3) lives on 443 regardless of the TCP check target's port
+    // (the dae default cp.cloudflare.com:80 is TCP-only).
+    let udp_quic = probe_udp_quic(registry, &node, url_host, 443, timeout).await;
 
     let urltest = match handler {
         Some(handler) => {

@@ -40,6 +40,11 @@ honk-tool sub <url|file> [--target HOST:PORT] [--url TEST_URL]
 拉取订阅（自动识别 base64 / 原始行 / Clash YAML）或读取本地分享链接文件，
 打印协议分布，然后并发探测每个节点：
 
+默认目标沿用 dae 的 `tcp_check_url` 三件套：`cp.cloudflare.com:80` 作测试主机、
+`1.1.1.1:80` 探测 v4、`[2606:4700:4700::1111]:80` 探测 v6——即使解析器不返回
+AAAA（如 `ipversion_prefer: 4`）族探测也能工作。可用
+`--target/--v4-target/--v6-target` 覆盖。
+
 - 服务器地址族（节点域名是否解析出 v4/v6);
 - **IPv4 / IPv6 双栈**到测试主机的代理连通性——经节点完成一次完整协议
   拨号（TLS 协议族含 TLS 握手）;

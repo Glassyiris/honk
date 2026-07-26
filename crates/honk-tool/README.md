@@ -43,6 +43,11 @@ Fetches a subscription (base64 / raw-line / Clash YAML, auto-detected) or
 reads a local share-link file, prints the per-protocol breakdown, then probes
 every node concurrently:
 
+Defaults follow dae's `tcp_check_url` triple: `cp.cloudflare.com:80` as the
+test host, `1.1.1.1:80` for v4 and `[2606:4700:4700::1111]:80` for v6 — so
+the family probes work even when the resolver returns no AAAA (e.g.
+`ipversion_prefer: 4`). Override with `--target/--v4-target/--v6-target`.
+
 - server IP families (does the node host resolve to v4/v6?),
 - proxied connectivity to the test host over **IPv4 and IPv6** — a full
   protocol dial through the node (TLS handshake included for TLS protocols),
