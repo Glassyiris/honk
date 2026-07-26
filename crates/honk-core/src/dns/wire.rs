@@ -187,7 +187,7 @@ mod tests {
         let data = [0x50, 0x00];
         let mut pos = 0;
         assert!(!skip_dns_name(&data, &mut pos));
-        // Empty input
+        // Cursor past end
         let mut pos = 3;
         assert!(!skip_dns_name(&data, &mut pos));
     }
