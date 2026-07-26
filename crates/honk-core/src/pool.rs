@@ -231,6 +231,31 @@ impl ConnectionPool {
         }
     }
 
+    /// Drop every pooled connection tied to a proxy node: the bare
+    /// `"host:port"` key plus all `ready|<node_addr>|…` entries. Called
+    /// when the node flips alive→dead — a pooled-but-doomed stream must
+    /// never be handed out (idle/max-age expiry would otherwise keep
+    /// serving it for up to 60s).
+    pub(crate) fn purge_node(&self, node_addr: &str) {
+        let ready_prefix = format!("ready|{}|", node_addr);
+        let mut removed = 0u64;
+        self.entries.retain(|key, arc| {
+            if key == node_addr || key.starts_with(&ready_prefix) {
+                removed += arc.lock().unwrap().len() as u64;
+                false
+            } else {
+                true
+            }
+        });
+        if removed > 0 {
+            self.total_entries.fetch_sub(removed, Ordering::Relaxed);
+            debug!(
+                "Purged {} pooled connections for dead node {}",
+                removed, node_addr
+            );
+        }
+    }
+
     #[allow(dead_code)]
     pub(crate) fn total_pooled(&self) -> u64 {
         self.total_entries.load(Ordering::Relaxed)
@@ -647,5 +672,43 @@ mod tests {
         // payload — proving no greeting/CONNECT was sent on reuse.
         assert_eq!(conn_count.load(Ordering::Relaxed), 1);
         assert_eq!(payload_ok.load(Ordering::Relaxed), 1);
+    }
+
+    /// A dead node's bare AND ready entries must all be purged; other
+    /// nodes' entries stay.
+    #[tokio::test]
+    async fn test_purge_node_removes_bare_and_ready() {
+        let pool = ConnectionPool::new();
+        let server = spawn_hold_open_listener().await;
+        let dead_addr = "dead.example:1080";
+        let other_addr = "other.example:1080";
+        let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
+
+        for addr in [dead_addr, other_addr] {
+            let tcp = TcpStream::connect(server).await.unwrap();
+            pool.deposit_tcp(addr, tcp).await;
+            let key = ConnectionPool::ready_key(addr, target, None);
+            let tcp = TcpStream::connect(server).await.unwrap();
+            pool.deposit_ready(&key, make_ready_stream(tcp, target))
+                .await;
+        }
+        assert_eq!(pool.total_pooled(), 4);
+
+        pool.purge_node(dead_addr);
+        assert_eq!(pool.total_pooled(), 2);
+        assert!(pool.acquire_tcp(dead_addr).await.is_none());
+        assert!(
+            pool.acquire_ready(&ConnectionPool::ready_key(dead_addr, target, None))
+                .await
+                .is_none()
+        );
+        // Other node untouched.
+        assert!(pool.acquire_tcp(other_addr).await.is_some());
+        assert!(
+            pool.acquire_ready(&ConnectionPool::ready_key(other_addr, target, None))
+                .await
+                .is_some()
+        );
+        assert_eq!(pool.total_pooled(), 0);
     }
 }

@@ -196,7 +196,7 @@ flowchart TB
 | 策略 | 行为 |
 | ------ | ------ |
 | **Selector** | 手动固定；Clash API + cache 持久化 |
-| **URLTest** | 最低延迟 + tolerance；TCP/UDP 独立选择；空闲休眠 |
+| **URLTest** | 最低延迟 + tolerance（以现任节点的当前实测延迟为基准，与 sing-box 一致）；TCP/UDP 独立选择；空闲休眠；拨号失败立即清除该节点延迟历史，下一条连接即刻重选；可选 per-group `check_url`，与全局目标独立探测与排序 |
 | **LoadBalance** | 组内存活成员轮询 |
 | **Fallback** | 声明顺序第一个存活；粘性直到死亡 |
 
@@ -205,7 +205,7 @@ flowchart TB
 ### 健康检查（`AliveDialerSet`）
 
 - 每节点状态：TCP / DnsUDP / DataUDP × v4/v6
-- 并发探测（默认批次 10）、恢复滞后、宽限期、指数退避
+- 并发探测（默认批次 10）、恢复滞后、宽限期、指数退避（深度退避节点仍以 max_cooldown 慢速节奏继续探测，永不完全停止）
 - TCP：HTTP HEAD 或裸连接；UDP：经节点自身 `dial_udp` 发 DNS 查询
 - 将连通性推入 eBPF，避免把流量 redirect 到已死出站
 

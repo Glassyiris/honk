@@ -48,6 +48,23 @@ impl DialerCollection {
         self.alive.store(false, Ordering::Release);
     }
 
+    /// Seed a restored (persisted) sample: feeds latency history and the
+    /// moving average WITHOUT touching the alive flag — liveness is
+    /// decided by probes; this only pre-seeds ranking data at startup.
+    pub(crate) fn restore_sample(&self, latency: Duration, at: std::time::SystemTime) {
+        self.latencies.append(LatencySample {
+            latency,
+            at,
+            synthetic: false,
+        });
+        let mut ma = self.moving_average.lock();
+        if *ma == Duration::ZERO {
+            *ma = latency;
+        } else {
+            *ma = (*ma + latency) / 2;
+        }
+    }
+
     #[allow(dead_code)]
     pub(crate) fn set_alive(&self, alive: bool) {
         self.alive.store(alive, Ordering::Release);

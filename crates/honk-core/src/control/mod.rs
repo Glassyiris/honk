@@ -167,6 +167,7 @@ impl ControlPlane {
         // and resumes on the next dial). Members shared with Selector
         // groups are excluded — those are probed unconditionally.
         alive_set.sync_urltest_groups(&urltest_group_registrations(&config));
+        alive_set.sync_group_check_urls(&group_check_url_registrations(&config));
         // Node name → eBPF outbound id for OUTBOUND_CONNECTIVITY_MAP pushes,
         // numbered exactly like push_routing_to_ebpf (group i → UserBase+i).
         // Rebuilt on config reload.
@@ -179,6 +180,23 @@ impl ControlPlane {
         }
         let group_manager =
             GroupManager::with_alive_set(&config.groups, &config.nodes, Some(alive_set.clone()));
+        // Custom-URL member resolution: a group's members are probed via
+        // their current picks (delay_test_members = tag → representative
+        // leaf), so sub-group members are measured through whatever leaf
+        // they currently select, and the tag keeps the result. The cell
+        // keeps working across reloads (the manager inside is swapped).
+        let group_manager = group_manager.into_shared();
+        {
+            let gm_cell = group_manager.clone();
+            alive_set.set_url_member_resolver(Some(Arc::new(move |group: &str| {
+                gm_cell
+                    .read()
+                    .delay_test_members(group)
+                    .into_iter()
+                    .map(|(tag, node)| (tag, node.name))
+                    .collect()
+            })));
+        }
 
         let ebpf_arc = Arc::new(RwLock::new(ebpf));
         let router_arc = Arc::new(RwLock::new(router));
@@ -197,7 +215,7 @@ impl ControlPlane {
             proxy_registry,
             dns_resolver: Arc::new(dns_resolver),
             dns_controller,
-            group_manager: group_manager.into_shared(),
+            group_manager,
             stats: Arc::new(StatsManager::new()),
             drain_tracker: Arc::new(DrainTracker::new()),
             udp_pool: Arc::new(UdpEndpointPool::new()),
@@ -259,6 +277,49 @@ impl ControlPlane {
             .set_persist_callback(Some(Arc::new(move |group, node| {
                 db_cb.save_selector_choice(group, node);
             })));
+
+        // Delay-history persistence (sing-box URLTest history storage
+        // parity): restore the last real delay sample per node so URLTest
+        // groups don't start cold after a restart, then mirror fresh
+        // samples back every minute. Liveness is NOT restored — probes
+        // re-decide that; stale entries (>24h) are dropped on load.
+        {
+            const DELAY_SAMPLE_MAX_AGE_SECS: u64 = 24 * 3600;
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let samples = db.load_delay_samples(now_unix, DELAY_SAMPLE_MAX_AGE_SECS);
+            let mut restored = 0usize;
+            for (node, delay_ms, measured_at) in samples {
+                self.alive_set.restore_latency(
+                    &node,
+                    std::time::Duration::from_millis(delay_ms),
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(measured_at),
+                );
+                restored += 1;
+            }
+            if restored > 0 {
+                info!("cache.db: restored {} persisted delay sample(s)", restored);
+            }
+            let db_delay = db.clone();
+            let alive_for_delay = self.alive_set.clone();
+            let delay_task = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                interval.tick().await; // first snapshot after one period
+                loop {
+                    for (node, latency, at) in alive_for_delay.latency_snapshot() {
+                        let measured_at = at
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        db_delay.save_delay_sample(&node, latency.as_millis() as u64, measured_at);
+                    }
+                    interval.tick().await;
+                }
+            });
+            self.background_tasks.lock().await.push(delay_task);
+        }
 
         // store_dns: restore persisted DNS answers into the shared DNS
         // cache, then mirror future answers into cache.db through a
@@ -493,7 +554,6 @@ impl ControlPlane {
                     let prober = Arc::new(ProxyHttpProber::new(
                         self.config.clone(),
                         self.proxy_registry.clone(),
-                        check_url.clone(),
                         check_method.clone(),
                     ));
                     alive_set
@@ -584,6 +644,27 @@ impl ControlPlane {
                     }
                 });
             }));
+            // Connection-lifecycle hook: when a node flips alive→dead,
+            // purge its pooled connections (bare + ready) and reap the UDP
+            // endpoints bound to it — both would otherwise keep serving a
+            // doomed node until their idle timeouts expire.
+            {
+                let pool = self.connection_pool.clone();
+                let udp_pool = self.udp_pool.clone();
+                let config_for_purge = self.config.clone();
+                alive_set.set_death_callback(Some(Box::new(move |node_name: &str| {
+                    udp_pool.remove_by_node(node_name);
+                    let node_addr = config_for_purge.try_read().ok().and_then(|c| {
+                        c.nodes
+                            .iter()
+                            .find(|n| n.name == node_name)
+                            .map(|n| format!("{}:{}", n.host(), n.port))
+                    });
+                    if let Some(addr) = node_addr {
+                        pool.purge_node(&addr);
+                    }
+                })));
+            }
             let period = std::time::Duration::from_secs(interval_secs);
             let handle = alive_set.spawn_health_check_loop(period, check_timeout);
             self.background_tasks.lock().await.push(handle);

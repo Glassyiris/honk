@@ -443,6 +443,34 @@ impl UdpEndpointPool {
         }
     }
 
+    /// Remove every endpoint dialing through `node_name` — called when the
+    /// node flips alive→dead so its UDP flows stop immediately instead of
+    /// lingering until the NAT/reply idle timeouts reap them.
+    pub fn remove_by_node(&self, node_name: &str) {
+        let keys: Vec<(SocketAddr, SocketAddr)> = self
+            .endpoints
+            .iter()
+            .filter(|ep| ep.node_name == node_name)
+            .map(|ep| {
+                let key = ep.key();
+                (
+                    SocketAddr::new(key.client_ip(), key.client_port),
+                    SocketAddr::new(key.dst_ip(), key.dst_port),
+                )
+            })
+            .collect();
+        let removed = keys.len();
+        for (client, dst) in keys {
+            self.remove(client, dst);
+        }
+        if removed > 0 {
+            debug!(
+                "Removed {} UDP endpoints bound to dead node '{}'",
+                removed, node_name
+            );
+        }
+    }
+
     /// Run a janitor cycle: remove expired endpoints.
     pub fn janitor_cycle(&self) -> usize {
         let expired: Vec<(SocketAddr, SocketAddr)> = self
@@ -757,5 +785,37 @@ mod tests {
             Ordering::Relaxed,
         );
         assert!(ep.get_cached_routing(dst).is_none());
+    }
+
+    #[test]
+    fn test_remove_by_node() {
+        let pool = UdpEndpointPool::new();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let proxy = Arc::new(
+            rt.block_on(tokio::net::UdpSocket::bind("127.0.0.1:0"))
+                .unwrap(),
+        );
+        let relay = make_addr("192.168.1.1", 1080);
+        let dst = make_addr("8.8.8.8", 53);
+        pool.get_or_create(
+            make_addr("10.0.0.1", 12345),
+            dst,
+            proxy.clone(),
+            relay,
+            "dead-node".to_string(),
+        );
+        pool.get_or_create(
+            make_addr("10.0.0.2", 12345),
+            dst,
+            proxy.clone(),
+            relay,
+            "other-node".to_string(),
+        );
+        assert_eq!(pool.len(), 2);
+
+        pool.remove_by_node("dead-node");
+        assert_eq!(pool.len(), 1);
+        assert!(pool.get(make_addr("10.0.0.1", 12345), dst).is_none());
+        assert!(pool.get(make_addr("10.0.0.2", 12345), dst).is_some());
     }
 }

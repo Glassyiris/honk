@@ -196,7 +196,7 @@ Policies (sing-box shaped):
 | Policy | Behavior |
 | -------- | ---------- |
 | **Selector** | Manual pin; Clash API + cache persistence |
-| **URLTest** | Lowest latency + tolerance; separate TCP/UDP selections; idle sleep |
+| **URLTest** | Lowest latency + tolerance vs the incumbent's current measured latency (sing-box parity); separate TCP/UDP selections; idle sleep; dial failure clears the node's latency history so the next connection re-selects; optional per-group `check_url` probed and ranked independently of the global target |
 | **LoadBalance** | Per-group round-robin among alive members |
 | **Fallback** | First alive in declaration order; sticky until death |
 
@@ -205,7 +205,7 @@ Nested groups (`groups` field) flatten recursively (depth ≤ 8) to a single lea
 ### Health (`AliveDialerSet`)
 
 - Per-node states: TCP / DnsUDP / DataUDP × v4/v6
-- Concurrent probes (default batch 10), recovery hysteresis, grace period, exponential backoff
+- Concurrent probes (default batch 10), recovery hysteresis, grace period, exponential backoff (deep-backoff nodes keep probing on the slow max-cooldown cadence — never a full stop)
 - TCP: HTTP HEAD or raw connect; UDP: DNS query through the node’s own `dial_udp`
 - Pushes connectivity into eBPF so dead outbounds are not redirected
 
