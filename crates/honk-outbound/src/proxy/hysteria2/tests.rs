@@ -868,6 +868,107 @@ async fn test_e2e_real_server_udp_dns() {
     );
 }
 
+// --- Temporary port-hopping stall soak (env-gated, not for CI) ---
+//
+//   HONK_HY2_SERVER / HONK_HY2_PASSWORD / HONK_HY2_MPORT / HONK_HY2_MHOP
+//   HONK_HY2_SOAK_TARGET=host:port   TCP: HTTP file server to download from
+//   HONK_HY2_SOAK_PATH=/bigfile.bin  TCP: URL path (default /bigfile.bin)
+//   HONK_HY2_SOAK_UDP_TARGET=h:p     UDP: echo server address
+//   HONK_HY2_SOAK_SECS=120           UDP: soak duration (default 120s)
+
+#[tokio::test]
+async fn test_e2e_real_server_hop_soak_tcp() {
+    let Some(node) = e2e_node() else {
+        eprintln!("HONK_HY2_SERVER unset; skipping hop soak");
+        return;
+    };
+    let Ok(target) = std::env::var("HONK_HY2_SOAK_TARGET").map(|v| {
+        v.parse::<SocketAddr>().expect("invalid HONK_HY2_SOAK_TARGET")
+    }) else {
+        eprintln!("HONK_HY2_SOAK_TARGET unset; skipping TCP soak");
+        return;
+    };
+    let path = std::env::var("HONK_HY2_SOAK_PATH").unwrap_or_else(|_| "/bigfile.bin".into());
+    let handler = Hysteria2Handler::new();
+    let started = std::time::Instant::now();
+    let mut stream = handler
+        .dial(&node, target, None, Duration::from_secs(10))
+        .await
+        .expect("soak dial should succeed");
+    stream
+        .stream
+        .write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    // Per-read stall detector: any read gap > 10s counts as 断流.
+    let mut total = 0usize;
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut stalls = 0u32;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), stream.stream.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => total += n,
+            Ok(Err(e)) => panic!("read error after {total} bytes: {e}"),
+            Err(_) => {
+                stalls += 1;
+                eprintln!("STALL #{stalls}: no data for 10s at {total} bytes, t+{:?}", started.elapsed());
+                if stalls >= 3 {
+                    panic!("connection stalled 3 times; 断流 reproduced at {total} bytes");
+                }
+            }
+        }
+    }
+    eprintln!(
+        "TCP soak done: {total} bytes in {:?}, stalls={stalls}",
+        started.elapsed()
+    );
+    assert!(total > 0);
+    assert_eq!(stalls, 0, "stalls detected during soak");
+}
+
+#[tokio::test]
+async fn test_e2e_real_server_hop_soak_udp() {
+    let Some(node) = e2e_node() else {
+        eprintln!("HONK_HY2_SERVER unset; skipping hop soak");
+        return;
+    };
+    let Ok(target) = std::env::var("HONK_HY2_SOAK_UDP_TARGET").map(|v| {
+        v.parse::<SocketAddr>().expect("invalid HONK_HY2_SOAK_UDP_TARGET")
+    }) else {
+        eprintln!("HONK_HY2_SOAK_UDP_TARGET unset; skipping UDP soak");
+        return;
+    };
+    let secs: u64 = std::env::var("HONK_HY2_SOAK_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120);
+    let handler = Hysteria2Handler::new();
+    let udp = handler
+        .dial_udp(&node, target, None, Duration::from_secs(10))
+        .await
+        .expect("udp dial should succeed");
+    let started = std::time::Instant::now();
+    let mut sent = 0u32;
+    let mut lost = 0u32;
+    let mut buf = [0u8; 256];
+    while started.elapsed() < Duration::from_secs(secs) {
+        sent += 1;
+        let pkt = sent.to_be_bytes();
+        udp.socket.send_to(&pkt, udp.relay_addr).await.unwrap();
+        match tokio::time::timeout(Duration::from_secs(3), udp.socket.recv_from(&mut buf)).await {
+            Ok(Ok((n, _))) => assert_eq!(&buf[..n], &pkt, "echo payload mismatch"),
+            _ => {
+                lost += 1;
+                eprintln!("LOST seq={sent} at t+{:?}", started.elapsed());
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    eprintln!("UDP soak done: sent={sent} lost={lost} in {:?}", started.elapsed());
+    assert!(sent > 0);
+    assert_eq!(lost, 0, "{lost}/{sent} datagrams lost across hops");
+}
+
 #[test]
 fn test_parse_port_hopping() {
     assert_eq!(parse_port_hopping("8080"), Some(vec![8080]));
