@@ -23,7 +23,7 @@ pub struct SubArgs {
     /// Subscription URL (http/https) or a local file with one share link per line.
     pub source: String,
     /// Test target for proxied connectivity/latency (host:port).
-    #[arg(long, default_value = "cp.cloudflare.com:80")]
+    #[arg(long, default_value = "cp.cloudflare.com:443")]
     pub target: String,
     /// Latency-test URL (defaults to https://www.gstatic.com/generate_204).
     #[arg(long)]
@@ -42,12 +42,12 @@ pub struct SubArgs {
     pub ua: Option<String>,
     /// Explicit IPv4 target for the v4 probe (dae-style, e.g. 1.1.1.1:80).
     /// Overrides DNS resolution for that family.
-    #[arg(long, default_value = "1.1.1.1:80")]
+    #[arg(long, default_value = "1.1.1.1:443")]
     pub v4_target: Option<SocketAddr>,
     /// Explicit IPv6 target for the v6 probe (dae-style, e.g.
     /// [2606:4700:4700::1111]:80).  Use when the resolver gives no AAAA
     /// (e.g. ipversion_prefer: 4 DNS) or the host has none.
-    #[arg(long, default_value = "[2606:4700:4700::1111]:80")]
+    #[arg(long, default_value = "[2606:4700:4700::1111]:443")]
     pub v6_target: Option<SocketAddr>,
 }
 
@@ -214,17 +214,19 @@ struct ProbeTargets {
     v6: Option<SocketAddr>,
 }
 
-async fn probe_node(
-    registry: &ProxyRegistry,
-    node: Node,
-    targets: &ProbeTargets,
-) -> ProbeOutcome {
+async fn probe_node(registry: &ProxyRegistry, node: Node, targets: &ProbeTargets) -> ProbeOutcome {
     let (url_host, url_port, timeout) = (targets.host.as_str(), targets.port, targets.timeout);
     let server_families = server_families(&node).await;
     let handler = registry.find(node.protocol);
 
-    let v4 = probe_family(registry, &node, url_host, url_port, false, timeout, targets.v4).await;
-    let v6 = probe_family(registry, &node, url_host, url_port, true, timeout, targets.v6).await;
+    let v4 = probe_family(
+        registry, &node, url_host, url_port, false, timeout, targets.v4,
+    )
+    .await;
+    let v6 = probe_family(
+        registry, &node, url_host, url_port, true, timeout, targets.v6,
+    )
+    .await;
 
     let udp_dns = probe_udp_dns(registry, &node, timeout).await;
     // QUIC (HTTP/3) lives on 443 regardless of the TCP check target's port
@@ -274,11 +276,12 @@ async fn server_families(node: &Node) -> (bool, bool) {
     }
 }
 
-/// Dial the test host through the node over one address family; measures the
-/// full protocol handshake time (TLS included for TLS-based protocols).
-/// `explicit` (dae-style `--v4-target`/`--v6-target`) skips DNS for that
-/// family — without it the family is `None` ("no-AAAA") when the resolver
-/// returns no address of that family.
+/// Probe one address family end-to-end: dial the family-specific target
+/// through the node and time the full HTTP HEAD exchange (TLS handshake
+/// included for https targets).  This is what makes the v4/v6 columns
+/// meaningful — a bare dial() return is free for session-multiplexed
+/// protocols (AnyTLS reuses the pooled session and never waits for the
+/// target), so only a real round-trip proves family reachability.
 async fn probe_family(
     registry: &ProxyRegistry,
     node: &Node,
@@ -295,12 +298,15 @@ async fn probe_family(
             Err(e) => return Some(Err(format!("resolve {url_host}: {e}"))),
         },
     };
-    let start = Instant::now();
-    let result = registry.dial(node, addr, Some(url_host), timeout).await;
-    Some(match result {
-        Ok(_stream) => Ok(start.elapsed()),
-        Err(e) => Err(e.to_string()),
-    })
+    let handler = registry.find(node.protocol)?;
+    // NB: urltest's normalize_url swaps any http:// URL for the default
+    // https one — always probe with an https URL (the default targets all
+    // serve TLS on 443 anyway).
+    let url = format!("https://{url_host}/");
+    match honk_outbound::urltest::urltest_node_addr(node, handler, &url, addr, timeout).await {
+        Ok(d) => Some(Ok(d)),
+        Err(e) => Some(Err(e.to_string())),
+    }
 }
 
 fn print_outcome(o: &ProbeOutcome) {

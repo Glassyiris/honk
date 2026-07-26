@@ -15,6 +15,7 @@ use crate::alive::{AliveDialerSet, IpVersion, ProbeDomain};
 use crate::proxy::{ProxyHandler, ProxyRegistry};
 use anyhow::{Context, anyhow};
 use honk_config::node::Node;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -56,35 +57,61 @@ pub async fn urltest_node(
     };
     let (host, port, is_https) = parse_url_host_port(url)?;
 
-    let fut = async {
-        let resolve = format!("{}:{}", host, port);
-        let addr = tokio::net::lookup_host(&resolve)
-            .await
-            .with_context(|| format!("failed to resolve '{}'", resolve))?
-            .next()
-            .ok_or_else(|| anyhow!("no address resolved for '{}'", resolve))?;
+    let addr = tokio::net::lookup_host(format!("{host}:{port}"))
+        .await
+        .with_context(|| format!("failed to resolve '{host}:{port}'"))?
+        .next()
+        .ok_or_else(|| anyhow!("no address resolved for '{host}:{port}'"))?;
 
+    measure_head_exchange(node, handler, &host, is_https, addr, timeout).await
+}
+
+/// [`urltest_node`] with a caller-chosen destination address (e.g. an
+/// explicit v4/v6 target) — TLS SNI/Host still come from `url`.
+pub async fn urltest_node_addr(
+    node: &Node,
+    handler: &dyn ProxyHandler,
+    url: &str,
+    addr: SocketAddr,
+    timeout: Duration,
+) -> anyhow::Result<Duration> {
+    let url = normalize_url(url);
+    let (host, _, is_https) = parse_url_host_port(url)?;
+    measure_head_exchange(node, handler, &host, is_https, addr, timeout).await
+}
+
+/// Dial `addr` through the node and time the full exchange up to the first
+/// response bytes (TLS handshake + HEAD for https, plain HEAD for http).
+async fn measure_head_exchange(
+    node: &Node,
+    handler: &dyn ProxyHandler,
+    host: &str,
+    is_https: bool,
+    addr: SocketAddr,
+    timeout: Duration,
+) -> anyhow::Result<Duration> {
+    let fut = async {
         let start = Instant::now();
-        let proxy = handler.dial(node, addr, Some(&host), timeout).await?;
+        let proxy = handler.dial(node, addr, Some(host), timeout).await?;
         let stream = proxy.stream;
 
         if is_https {
             let connector = https_connector()?;
             let tls = connector
-                .connect(&host, stream)
+                .connect(host, stream)
                 .await
                 .context("TLS handshake failed")?;
             // The probe offers `h2,http/1.1`; speak whatever was negotiated.
             match tls.ssl().selected_alpn_protocol() {
-                Some(b"h2") => exchange_head_h2(tls, &host).await?,
+                Some(b"h2") => exchange_head_h2(tls, host).await?,
                 _ => {
                     let mut tls = tls;
-                    exchange_head(&mut tls, &host).await?;
+                    exchange_head(&mut tls, host).await?;
                 }
             }
         } else {
             let mut stream = stream;
-            exchange_head(&mut stream, &host).await?;
+            exchange_head(&mut stream, host).await?;
         }
         Ok(start.elapsed())
     };
