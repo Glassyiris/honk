@@ -1,11 +1,9 @@
 //! BPF map utilities for honk-core.
 //!
-//! This module provides LPM trie helpers, batch map operations,
-//! and common utility functions used by both real and mock eBPF backends.
-//! It does not depend on `aya` directly, making it usable by all backends
-//! regardless of whether real eBPF support is compiled in.
-
-use tracing::warn;
+//! This module provides LPM trie helpers and common utility functions used
+//! by both real and mock eBPF backends. It does not depend on `aya`
+//! directly, making it usable by all backends regardless of whether real
+//! eBPF support is compiled in.
 
 pub use honk_ebpf_common::LpmKey;
 
@@ -81,38 +79,6 @@ pub fn lpm_key_bytes(key: &LpmKey) -> [u8; 20] {
     buf
 }
 
-/// Parse an IPv4 address string (e.g. `"192.168.1.1"`) to a `u32` in network
-/// (big-endian) byte order.
-///
-/// # Errors
-///
-/// Returns an error if the string is not a valid dotted-decimal IPv4 address,
-/// or if any octet is out of range.
-///
-/// # Examples
-///
-/// ```
-/// use honk_core::ebpf::maps::parse_ipv4_to_u32;
-///
-/// assert_eq!(parse_ipv4_to_u32("192.168.1.1").unwrap(), 0xc0a80101);
-/// assert_eq!(parse_ipv4_to_u32("10.0.0.0").unwrap(), 0x0a000000);
-/// assert!(parse_ipv4_to_u32("not-an-ip").is_err());
-/// ```
-pub fn parse_ipv4_to_u32(s: &str) -> anyhow::Result<u32> {
-    let parts: Vec<&str> = s.split('.').collect();
-    if parts.len() != 4 {
-        anyhow::bail!("Invalid IPv4: {}", s);
-    }
-    let mut ip: u32 = 0;
-    for (i, part) in parts.iter().enumerate() {
-        let byte: u8 = part
-            .parse()
-            .map_err(|_| anyhow::anyhow!("Invalid IPv4 octet '{}' in '{}'", part, s))?;
-        ip |= (byte as u32) << (24 - i * 8);
-    }
-    Ok(ip)
-}
-
 /// FNV-1a 64-bit hash — must match the eBPF side exactly.
 ///
 /// Used for domain routing lookups with hash-based BPF maps.
@@ -135,75 +101,6 @@ pub fn fnv1a_hash(data: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
-}
-
-/// Simulate a BPF `MAP_BATCH_UPDATE` operation by calling `update_fn`
-/// sequentially.
-///
-/// On kernels that do not support the native `BPF_MAP_BATCH_UPDATE` syscall
-/// (added in Linux 5.6), userspace must fall back to individual insertions.
-/// This function loops from `0..max_entries`, calling `update_fn(i)` for each
-/// index.
-///
-/// If an individual update fails, a warning is logged with the map description
-/// and index, and the accumulated count is returned.  This matches the Go
-/// reference behaviour in `BpfMapBatchUpdate` (`bpf_utils.go`).
-///
-/// Returns the number of entries successfully processed.
-pub fn bpf_batch_update_simulated(
-    map_desc: &str,
-    max_entries: u32,
-    mut update_fn: impl FnMut(usize) -> anyhow::Result<(Vec<u8>, Vec<u8>)>,
-) -> anyhow::Result<usize> {
-    let mut count = 0usize;
-    for i in 0..(max_entries as usize) {
-        match update_fn(i) {
-            Ok(_) => count += 1,
-            Err(e) => {
-                warn!(
-                    "Batch update map '{}' at index {}: {} — {} entries processed",
-                    map_desc, i, e, count
-                );
-                return Ok(count);
-            }
-        }
-    }
-    Ok(count)
-}
-
-/// Simulate a BPF `MAP_BATCH_DELETE` operation by calling `delete_fn` for
-/// each key.
-///
-/// On kernels that do not support the native `BPF_MAP_BATCH_DELETE` syscall,
-/// userspace must fall back to individual deletions.  This function iterates
-/// over `keys`, calling `delete_fn(key_ref)` for each one.
-///
-/// Key-not-found errors are benign (a concurrent delete may have removed the
-/// entry first); they are logged at `WARN` level and skipped without failing
-/// the entire batch.  This behaviour mirrors `BpfMapBatchDelete` in the Go
-/// reference (`bpf_utils.go`).
-///
-/// Returns the number of keys successfully deleted.
-pub fn bpf_batch_delete_simulated<K: AsRef<[u8]>>(
-    map_desc: &str,
-    keys: &[K],
-    mut delete_fn: impl FnMut(&[u8]) -> anyhow::Result<()>,
-) -> anyhow::Result<usize> {
-    let mut deleted = 0usize;
-    for (i, key) in keys.iter().enumerate() {
-        match delete_fn(key.as_ref()) {
-            Ok(()) => deleted += 1,
-            Err(e) => {
-                warn!(
-                    "Batch delete map '{}' at index {} (key already gone): {} — continuing",
-                    map_desc, i, e
-                );
-                // Non-fatal: key-not-found is expected when entries are
-                // concurrently removed.
-            }
-        }
-    }
-    Ok(deleted)
 }
 
 #[cfg(test)]
@@ -258,27 +155,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_ipv4_standard() {
-        assert_eq!(parse_ipv4_to_u32("192.168.1.1").unwrap(), 0xc0a80101);
-        assert_eq!(parse_ipv4_to_u32("10.0.0.0").unwrap(), 0x0a000000);
-        assert_eq!(parse_ipv4_to_u32("0.0.0.0").unwrap(), 0x00000000);
-        assert_eq!(parse_ipv4_to_u32("255.255.255.255").unwrap(), 0xffffffff);
-    }
-
-    #[test]
-    fn test_parse_ipv4_loopback() {
-        assert_eq!(parse_ipv4_to_u32("127.0.0.1").unwrap(), 0x7f000001);
-    }
-
-    #[test]
-    fn test_parse_ipv4_invalid() {
-        assert!(parse_ipv4_to_u32("invalid").is_err());
-        assert!(parse_ipv4_to_u32("1.2.3").is_err());
-        assert!(parse_ipv4_to_u32("1.2.3.4.5").is_err());
-        assert!(parse_ipv4_to_u32("256.0.0.0").is_err());
-    }
-
-    #[test]
     fn test_fnv1a_hash_deterministic() {
         let h1 = fnv1a_hash(b"google.com");
         let h2 = fnv1a_hash(b"google.com");
@@ -311,82 +187,5 @@ mod tests {
         let h1 = fnv1a_hash(b"Google.com");
         let h2 = fnv1a_hash(b"google.com");
         assert_ne!(h1, h2);
-    }
-
-    #[test]
-    fn test_batch_update_all_succeed() {
-        let count =
-            bpf_batch_update_simulated("test_map", 5, |i| Ok((vec![i as u8], vec![i as u8 + 100])))
-                .unwrap();
-        assert_eq!(count, 5);
-    }
-
-    #[test]
-    fn test_batch_update_partial_failure() {
-        let count = bpf_batch_update_simulated("test_map", 10, |i| {
-            if i == 7 {
-                anyhow::bail!("simulated key-already-exists at index {}", i);
-            }
-            Ok((vec![i as u8], vec![i as u8 + 100]))
-        })
-        .unwrap();
-        assert_eq!(count, 7); // 0..7 succeeded, 7 failed
-    }
-
-    #[test]
-    fn test_batch_update_single_entry() {
-        let count = bpf_batch_update_simulated("single_map", 1, |_i| {
-            Ok((b"key".to_vec(), b"val".to_vec()))
-        })
-        .unwrap();
-        assert_eq!(count, 1);
-    }
-
-    #[test]
-    fn test_batch_update_empty() {
-        let count = bpf_batch_update_simulated("empty_map", 0, |_| unreachable!()).unwrap();
-        assert_eq!(count, 0);
-    }
-
-    #[test]
-    fn test_batch_delete_all_succeed() {
-        let keys: Vec<Vec<u8>> = (0..5).map(|i| vec![i as u8]).collect();
-        let mut deleted_indices = Vec::new();
-
-        let count = bpf_batch_delete_simulated("test_map", &keys, |key| {
-            deleted_indices.push(key[0] as usize);
-            Ok(())
-        })
-        .unwrap();
-
-        assert_eq!(count, 5);
-        assert_eq!(deleted_indices, vec![0, 1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn test_batch_delete_key_not_found() {
-        let keys: Vec<Vec<u8>> = (0..5).map(|i| vec![i as u8]).collect();
-        let mut deleted_indices = Vec::new();
-
-        let count = bpf_batch_delete_simulated("test_map", &keys, |key| {
-            let idx = key[0] as usize;
-            if idx == 2 {
-                anyhow::bail!("key not found");
-            }
-            deleted_indices.push(idx);
-            Ok(())
-        })
-        .unwrap();
-
-        // 4 out of 5 succeeded (index 2 was "not found" → skipped)
-        assert_eq!(count, 4);
-        assert_eq!(deleted_indices, vec![0, 1, 3, 4]);
-    }
-
-    #[test]
-    fn test_batch_delete_empty_keys() {
-        let keys: &[Vec<u8>] = &[];
-        let count = bpf_batch_delete_simulated("empty_map", keys, |_| unreachable!()).unwrap();
-        assert_eq!(count, 0);
     }
 }

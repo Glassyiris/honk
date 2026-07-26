@@ -14,11 +14,9 @@
 //! ```
 
 pub mod splice;
-pub mod udp;
 
 use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tracing::{debug, warn};
 
 /// Check whether a connection error is ignorable (normal connection closure).
@@ -198,23 +196,11 @@ where
     }
 }
 
-/// Handle a single proxied connection end-to-end: relay the accepted
-/// client stream against the already-dialed proxy stream.
-pub async fn handle_proxied_connection(
-    client: TcpStream,
-    client_addr: SocketAddr,
-    target: SocketAddr,
-    _target_domain: Option<&str>,
-    proxy_stream: crate::proxy::ProxyStream,
-) -> anyhow::Result<RelayStats> {
-    relay_tcp(client, proxy_stream.stream, client_addr, target).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
 
     /// Test that relay_tcp correctly passes data bidirectionally.
     #[tokio::test]

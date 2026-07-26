@@ -259,20 +259,6 @@ impl PacketSnifferPool {
         }
     }
 
-    /// Check if a flow family has an active sniffer session.
-    #[allow(dead_code)]
-    pub fn has_flow_family_session(&self, key: &PacketSnifferKey) -> bool {
-        let sessions = self.sessions.lock().unwrap();
-        sessions.contains_key(key)
-    }
-
-    /// Remove all sniffer sessions for a flow family.
-    #[allow(dead_code)]
-    pub fn remove_flow_family_sessions(&self, key: &PacketSnifferKey) -> usize {
-        let mut sessions = self.sessions.lock().unwrap();
-        if sessions.remove(key).is_some() { 1 } else { 0 }
-    }
-
     /// Run a janitor cycle: remove expired sessions.
     pub fn janitor_cycle(&self) -> usize {
         let mut sessions = self.sessions.lock().unwrap();
@@ -424,17 +410,5 @@ mod tests {
             pool.feed_quic_initial(key, &data);
         }
         assert!(pool.is_dcid_failed(&key));
-    }
-
-    #[test]
-    fn test_sniffer_pool_has_session() {
-        let pool = PacketSnifferPool::new();
-        let key = test_key();
-        assert!(!pool.has_flow_family_session(&key));
-
-        pool.feed_quic_initial(key, &garbage_initial());
-        assert!(pool.has_flow_family_session(&key));
-        assert_eq!(pool.remove_flow_family_sessions(&key), 1);
-        assert!(!pool.has_flow_family_session(&key));
     }
 }

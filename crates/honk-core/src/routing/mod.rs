@@ -534,15 +534,6 @@ impl Router {
 }
 
 #[derive(Debug, Clone)]
-pub struct RouteResult {
-    pub outbound: String,
-    /// True if the matched rule carries a `(must)` suffix — control plane
-    /// should skip TLS/HTTP sniffing.
-    pub must: bool,
-    pub mark: u32,
-}
-
-#[derive(Debug, Clone)]
 pub struct RouteMatch<'a> {
     pub outbound_name: &'a str,
     pub rule_name: &'a str,

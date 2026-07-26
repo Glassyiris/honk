@@ -122,34 +122,6 @@ fn detect_default_interface() -> Option<String> {
 #[cfg(feature = "ebpf")]
 const DEFAULT_BPF_OBJECT: &[u8] = include_bytes!(env!("HONK_EBPF_OBJECT"));
 
-/// Probe whether the running kernel supports IPv6 transparent sockets.
-///
-/// Some kernels (notably certain container/Cloud hosts) compile out
-/// `IPV6_TRANSPARENT`.  If the option is unavailable, the IPv6 TPROXY
-/// datapath cannot function, so we skip installing ip6tables/ip -6 policy
-/// rules instead of silently dropping IPv6 proxy traffic.
-#[cfg(feature = "ebpf")]
-#[allow(dead_code)]
-fn ipv6_tproxy_supported() -> bool {
-    use socket2::{Domain, Socket, Type};
-    use std::os::unix::io::AsRawFd;
-
-    let Ok(socket) = Socket::new(Domain::IPV6, Type::STREAM, None) else {
-        return false;
-    };
-    let one: libc::c_int = 1;
-    let ret = unsafe {
-        libc::setsockopt(
-            socket.as_raw_fd(),
-            libc::SOL_IPV6,
-            libc::IPV6_TRANSPARENT,
-            &one as *const _ as *const libc::c_void,
-            std::mem::size_of_val(&one) as libc::socklen_t,
-        )
-    };
-    ret == 0
-}
-
 #[derive(clap::Subcommand, Debug)]
 pub enum ClashCommand {
     /// Set clash mode (rule / global / direct)
@@ -1598,36 +1570,6 @@ fn parse_mac_from_ip_link(text: &str) -> Option<String> {
 }
 
 #[cfg(feature = "ebpf")]
-#[allow(dead_code)]
-fn read_peer_mac(ifname: &str) -> anyhow::Result<[u8; 6]> {
-    let output = std::process::Command::new("ip")
-        .args(["link", "show", ifname])
-        .output()?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "failed to read {} MAC: {}",
-            ifname,
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    for line in text.lines() {
-        if let Some(idx) = line.find("link/ether") {
-            let mac_str = line[idx + 10..].split_whitespace().next().unwrap_or("");
-            let parts: Vec<&str> = mac_str.split(':').collect();
-            if parts.len() == 6 {
-                let mut mac = [0u8; 6];
-                for (i, p) in parts.iter().enumerate() {
-                    mac[i] = u8::from_str_radix(p, 16)?;
-                }
-                return Ok(mac);
-            }
-        }
-    }
-    anyhow::bail!("could not parse {} MAC from: {}", ifname, text)
-}
-
-#[cfg(feature = "ebpf")]
 fn set_sysctl(key: &str, value: &str) -> anyhow::Result<()> {
     // Prefer /proc/sys because the standalone `sysctl` binary may not be on
     // PATH in minimal environments (e.g. NixOS containers).
@@ -1650,11 +1592,8 @@ fn set_sysctl(key: &str, value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Return the bridge master of `iface` if it is a bridge slave, otherwise
-/// return `iface` itself.  Used to install TPROXY rules on the L3 input
-/// interface that sees traffic after the bridge forwards it.
-#[cfg(feature = "ebpf")]
-#[allow(dead_code)]
+/// Rename the dae0 veth peer to `desired_peer` when it does not already
+/// exist under that name (e.g. after a stale `dae0` was recreated).
 #[cfg(feature = "ebpf")]
 fn ensure_veth_peer_name(ip: &str, host_if: &str, desired_peer: &str) -> anyhow::Result<()> {
     if std::fs::metadata(format!("/sys/class/net/{}", desired_peer)).is_ok() {
@@ -1695,36 +1634,4 @@ fn ensure_veth_peer_name(ip: &str, host_if: &str, desired_peer: &str) -> anyhow:
     }
     info!("Renamed veth peer {} -> {}", peer, desired_peer);
     Ok(())
-}
-
-#[cfg(feature = "ebpf")]
-#[allow(dead_code)]
-fn dae0peer_mac_params(mac: &[u8; 6]) -> (u32, u32) {
-    // Layout matches the eBPF dae0peer_mac() reconstruction:
-    //   mac[0] = (lo >> 16), mac[1] = (lo >> 24),
-    //   mac[2] = lo,         mac[3] = (lo >> 8),
-    //   mac[4] = (hi >> 24), mac[5] = (hi >> 16)
-    let lo = ((mac[1] as u32) << 24)
-        | ((mac[0] as u32) << 16)
-        | ((mac[3] as u32) << 8)
-        | (mac[2] as u32);
-    let hi = ((mac[4] as u32) << 24) | ((mac[5] as u32) << 16);
-    (hi, lo)
-}
-
-#[cfg(feature = "ebpf")]
-#[allow(dead_code)]
-fn parse_ifindex_from_ip_link(ifname: &str) -> Option<u32> {
-    let output = std::process::Command::new("ip")
-        .args(["link", "show", ifname])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    // BusyBox format: "5: dae0: <...> ..."
-    let line = text.lines().next()?;
-    let idx_part = line.split(':').next()?;
-    idx_part.trim().parse().ok()
 }
