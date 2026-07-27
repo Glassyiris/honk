@@ -123,6 +123,7 @@ The fields below are what a parsed node carries. In dae syntax they are **derive
 | `hy2_disable_mtu_discovery` | bool? | null | Hysteria2 `disablePathMTUDiscovery` |
 | `tls_pin_sha256` | string? | null | Leaf cert SHA-256 pin (`pinSHA256=`) |
 | `tuic_uuid` / `tuic_password` / `tuic_congestion` | string? | null | TUIC |
+| `tuic_init_stream_recv_window` / `tuic_init_conn_recv_window` | u64? | 8 MiB / quinn default | TUIC QUIC receive windows; the 8 MiB stream-window default lifts single-stream throughput on high-RTT links (quinn's 1.25 MiB caps ~12.5 MB/s per 100 ms RTT) |
 | `juicity_uuid` / `juicity_password` | string? | null | Juicity |
 | `anytls_password` | string? | null | AnyTLS secret |
 | `anytls_min_idle_session` | usize? | null | Pool min idle sessions (`min_idle_session=`) |

@@ -127,6 +127,14 @@ pub struct Node {
     /// TUIC congestion control
     #[serde(default)]
     pub tuic_congestion: Option<String>,
+    /// TUIC: initial per-stream receive window (`initStreamReceiveWindow`).
+    /// quinn's default (1.25MB) caps a stream at ~12.5MB/s per 100ms RTT —
+    /// far too small for long-fat links; unset uses honk's larger default.
+    #[serde(default)]
+    pub tuic_init_stream_recv_window: Option<u64>,
+    /// TUIC: initial connection-level receive window (`initConnReceiveWindow`).
+    #[serde(default)]
+    pub tuic_init_conn_recv_window: Option<u64>,
     /// Juicity UUID
     #[serde(default)]
     pub juicity_uuid: Option<String>,

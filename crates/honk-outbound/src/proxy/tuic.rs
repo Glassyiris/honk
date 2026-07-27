@@ -593,12 +593,18 @@ impl TuicHandler {
         }
         // Build outside the lock: client_config is async (ECH discovery).
         let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
-        let config = crate::quic::client_config(
-            node,
-            &[b"tuic"],
-            crate::quic::QuicClientOptions::with_congestion(node.tuic_congestion.as_deref()),
-        )
-        .await?;
+        // quinn's default stream window (1.25MB) caps a single stream at
+        // ~12.5MB/s per 100ms of RTT — unusable on long-fat links. Default
+        // to 8MB (~40MB/s at 200ms); explicit node fields override.
+        let options = crate::quic::QuicClientOptions {
+            congestion: Some(crate::quic::congestion_factory(
+                node.tuic_congestion.as_deref(),
+            )),
+            stream_receive_window: Some(node.tuic_init_stream_recv_window.unwrap_or(8 << 20)),
+            conn_receive_window: node.tuic_init_conn_recv_window,
+            ..Default::default()
+        };
+        let config = crate::quic::client_config(node, &[b"tuic"], options).await?;
         let client = Arc::new(TuicClient {
             quic: QuicClient::new(node.host().to_string(), node.port, server_name, config),
             uuid: *uuid.as_bytes(),

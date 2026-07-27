@@ -288,6 +288,16 @@ impl Node {
             }
         }
 
+        if protocol == NodeProtocol::Tuic {
+            // QUIC flow-control knobs (same spelling as the hy2 fields).
+            if let Some(v) = query.get("initStreamReceiveWindow") {
+                node.tuic_init_stream_recv_window = v.parse().ok();
+            }
+            if let Some(v) = query.get("initConnReceiveWindow") {
+                node.tuic_init_conn_recv_window = v.parse().ok();
+            }
+        }
+
         if protocol == NodeProtocol::AnyTLS {
             // The AnyTLS secret doubles as the session-pool password.
             node.anytls_password = node.password.clone();

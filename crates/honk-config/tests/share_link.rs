@@ -493,6 +493,19 @@ fn test_ech_query_params() {
     let node = Node::from_share_link("tuic://u:p@example.com:443/?ech=1").unwrap();
     assert!(node.ech_enabled);
     assert!(node.ech_config.is_none());
+}
+
+#[test]
+fn test_tuic_window_params() {
+    let node = Node::from_share_link(
+        "tuic://u:p@example.com:443/?initStreamReceiveWindow=4194304&initConnReceiveWindow=16777216",
+    )
+    .unwrap();
+    assert_eq!(node.tuic_init_stream_recv_window, Some(4194304));
+    assert_eq!(node.tuic_init_conn_recv_window, Some(16777216));
+    // Unset by default.
+    let node = Node::from_share_link("tuic://u:p@example.com:443").unwrap();
+    assert_eq!(node.tuic_init_stream_recv_window, None);
 
     // No ECH params: disabled.
     let node = Node::from_share_link("trojan://pass@example.com:443").unwrap();

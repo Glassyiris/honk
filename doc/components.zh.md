@@ -93,6 +93,7 @@ dae 语法中节点**只能以分享链接书写**：`tag: 'scheme://...'` 或�
 | `hy2_disable_mtu_discovery` | bool? | null | Hysteria2 `disablePathMTUDiscovery` |
 | `tls_pin_sha256` | string? | null | 叶证书 SHA-256 固定（`pinSHA256=`） |
 | `tuic_uuid` / `tuic_password` / `tuic_congestion` | string? | null | TUIC |
+| `tuic_init_stream_recv_window` / `tuic_init_conn_recv_window` | u64? | 8 MiB / quinn 默认 | TUIC QUIC 接收窗口；8 MiB 流窗口默认值提升高 RTT 链路单流吞吐（quinn 默认 1.25 MiB 每 100ms RTT 封顶约 12.5MB/s） |
 | `juicity_uuid` / `juicity_password` | string? | null | Juicity |
 | `anytls_password` | string? | null | AnyTLS 密钥（等于链接密码） |
 | `anytls_min_idle_session` | usize? | null | 池最小空闲会话；链接 `min_idle_session` |
