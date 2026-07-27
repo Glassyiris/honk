@@ -538,7 +538,10 @@ impl AnyTlsSessionPool {
     fn spawn_janitor(self: &Arc<Self>, node: Node) -> JoinHandle<()> {
         let pool = Arc::clone(self);
         let addr = format!("{}:{}", node.host(), node.port);
-        let min_idle = node.anytls_min_idle_session.unwrap_or(0);
+        // Default 1 (not sing-box's 0): a single standby session per node
+        // keeps every dial warm after the first — cold dials otherwise pay
+        // TCP connect + TLS handshake (2 RTT) per burst.
+        let min_idle = node.anytls_min_idle_session.unwrap_or(1);
         let check_interval = Duration::from_secs(
             node.anytls_idle_session_check_interval
                 .unwrap_or(DEFAULT_IDLE_CHECK_INTERVAL_SECS),

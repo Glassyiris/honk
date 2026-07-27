@@ -126,7 +126,7 @@ The fields below are what a parsed node carries. In dae syntax they are **derive
 | `tuic_init_stream_recv_window` / `tuic_init_conn_recv_window` | u64? | 8 MiB / quinn default | TUIC QUIC receive windows; the 8 MiB stream-window default lifts single-stream throughput on high-RTT links (quinn's 1.25 MiB caps ~12.5 MB/s per 100 ms RTT) |
 | `juicity_uuid` / `juicity_password` | string? | null | Juicity |
 | `anytls_password` | string? | null | AnyTLS secret |
-| `anytls_min_idle_session` | usize? | null | Pool min idle sessions (`min_idle_session=`) |
+| `anytls_min_idle_session` | usize? | 1 | Pool min idle sessions (`min_idle_session=`); default 1 keeps dials warm (0 = reap all idle sessions) |
 | `anytls_idle_session_check_interval` | u64? | null | Idle check period, s (`idle_session_check_interval=`) |
 | `anytls_idle_session_timeout` | u64? | null | Idle eviction, s (`idle_session_timeout=`) |
 | `mux` | bool | `false` | h2mux multiplexing; **not settable from a share link / dae syntax** |

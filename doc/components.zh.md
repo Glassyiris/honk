@@ -96,7 +96,7 @@ dae 语法中节点**只能以分享链接书写**：`tag: 'scheme://...'` 或�
 | `tuic_init_stream_recv_window` / `tuic_init_conn_recv_window` | u64? | 8 MiB / quinn 默认 | TUIC QUIC 接收窗口；8 MiB 流窗口默认值提升高 RTT 链路单流吞吐（quinn 默认 1.25 MiB 每 100ms RTT 封顶约 12.5MB/s） |
 | `juicity_uuid` / `juicity_password` | string? | null | Juicity |
 | `anytls_password` | string? | null | AnyTLS 密钥（等于链接密码） |
-| `anytls_min_idle_session` | usize? | null | 池最小空闲会话；链接 `min_idle_session` |
+| `anytls_min_idle_session` | usize? | 1 | 池最小空闲会话；链接 `min_idle_session`。默认 1 保持拨号热度（0 = 回收全部空闲会话） |
 | `anytls_idle_session_check_interval` | u64? | null | 空闲检查周期（秒）；链接 `idle_session_check_interval` |
 | `anytls_idle_session_timeout` | u64? | null | 空闲驱逐（秒）；链接 `idle_session_timeout` |
 | `mux` | bool | `false` | h2mux 多路复用（结构化模型字段，分享链接 / dae 语法无对应参数） |
