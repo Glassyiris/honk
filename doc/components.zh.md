@@ -354,7 +354,7 @@ dns {
 | `name` | string | 必填 | Id；dae 中冒号前的名字 |
 | `address` | string | 必填 | `ip:port` 或主机；dae 中取 URI 的主机部分 |
 | `protocol` | enum | `udp` | `udp`/`tcp`/`tls`/`https`/`quic`；dae 中由 URI scheme 决定（`udp://`、`tcp://`、`tcp+udp://`/`udp+tcp://`、`tls://`、`https://`、`h3://`、`quic://`，无 scheme 默认为 UDP） |
-| `tls_server_name` | string? | null | DoT/DoH SNI；dae 语法中当主机名不是 IP 时自动派生 |
+| `tls_server_name` | string? | null | DoT/DoH/DoQ/DoH3 SNI。dae 语法自动从主机名派生；IP 字面量上游需用 URI query 参数显式指定，如 `tls://1.1.1.1:853?tls_server_name=cloudflare-dns.com` |
 | `outbound` | string? | null | 经节点/组发出；dae 中行内后缀 `'uri' -> <name>`（旧：`outbound: name`） |
 
 **运行时说明：** UDP/TCP/DoT/DoH/DoQ/DoH3 均可用（连接复用）。DoT/DoH/TCP 支持 `-> proxy`（经节点/组的 TCP 隧道）；DoQ/DoH3 暂仅直连。经代理的 DNS SOCKS5 UDP 路径不完整（UDP+代理隧道化为 TCP DNS）。

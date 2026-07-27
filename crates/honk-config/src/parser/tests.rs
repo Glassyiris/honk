@@ -90,6 +90,40 @@ dns {
     }
 
     #[test]
+    fn test_parse_dns_upstream_tls_server_name() {
+        let input = r#"
+dns {
+    upstream {
+        cf_dot: 'tls://1.1.1.1:853?tls_server_name=cloudflare-dns.com'
+        cf_doh: 'https://1.1.1.1/dns-query?tls_server_name=cloudflare-dns.com'
+        host_wins: 'tls://one.one.one.one:853?tls_server_name=cloudflare-dns.com'
+    }
+}
+"#;
+        let config = parse_dae_config(input).unwrap();
+        assert_eq!(config.dns.upstream.len(), 3);
+
+        // IP literal + explicit sni: query param stripped from address, sni set.
+        let dot = &config.dns.upstream[0];
+        assert_eq!(dot.protocol, crate::types::DnsProtocol::Tls);
+        assert_eq!(dot.address, "1.1.1.1:853");
+        assert_eq!(dot.tls_server_name.as_deref(), Some("cloudflare-dns.com"));
+
+        let doh = &config.dns.upstream[1];
+        assert_eq!(doh.protocol, crate::types::DnsProtocol::Https);
+        assert_eq!(doh.address, "1.1.1.1/dns-query");
+        assert_eq!(doh.tls_server_name.as_deref(), Some("cloudflare-dns.com"));
+
+        // Explicit sni wins over the host-derived one.
+        let host_wins = &config.dns.upstream[2];
+        assert_eq!(host_wins.address, "one.one.one.one:853");
+        assert_eq!(
+            host_wins.tls_server_name.as_deref(),
+            Some("cloudflare-dns.com")
+        );
+    }
+
+    #[test]
     fn test_parse_routing_rules() {
         let input = r#"
 routing {
@@ -110,10 +144,20 @@ routing {
 node {
     'socks5://localhost:1080'
     mylink: 'ss://LINK'
+    double_quoted: "socks5://localhost:1081"
+    "double_tag": 'socks5://localhost:1082'
+    "double_both": "socks5://localhost:1083"
+    broken: 'not-a-valid-link'
 }
 "#;
         let config = parse_dae_config(input).unwrap();
-        assert!(!config.nodes.is_empty());
+        // `broken` is skipped with a warning; the other five parse.
+        assert_eq!(config.nodes.len(), 5);
+        let names: Vec<&str> = config.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(names.contains(&"mylink"));
+        assert!(names.contains(&"double_quoted"));
+        assert!(names.contains(&"double_tag"));
+        assert!(names.contains(&"double_both"));
     }
 
     #[test]

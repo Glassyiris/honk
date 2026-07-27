@@ -400,7 +400,7 @@ Each upstream is a `name: 'uri'` line; an optional trailing `-> tag` (or legacy 
 | `name` | string | required | Id (the key before `:`) |
 | `address` | string | required | `ip:port` or host (from the URI) |
 | `protocol` | enum | `udp` | From URI scheme: `udp`/`tcp`/`tls`/`https`/`quic` (`tcp+udp`, `h3`/`http3` aliases) |
-| `tls_server_name` | string? | null | DoT/DoH SNI; dae syntax auto-derives from hostname when not an IP |
+| `tls_server_name` | string? | null | DoT/DoH/DoQ/DoH3 SNI. dae syntax auto-derives from the hostname; for IP-literal upstreams set it explicitly as a URI query param, e.g. `tls://1.1.1.1:853?tls_server_name=cloudflare-dns.com` |
 | `outbound` | string? | null | Send via node/group (trailing `-> tag`) |
 
 **Runtime note:** UDP/TCP/DoT/DoH/DoQ/DoH3 work with connection reuse. DoT/DoH/TCP support `-> proxy` (TCP tunnel via node/group). DoQ/DoH3 are direct-only for now. DNS-over-proxy SOCKS5 UDP is incomplete (UDP+proxy tunnels as TCP DNS).

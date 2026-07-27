@@ -799,7 +799,8 @@ fn parse_dns_upstreams(body: &str) -> Vec<crate::dns::DnsUpstream> {
                 (rest.trim_matches('\'').trim_matches('"'), None)
             };
             let (protocol, address) = parse_upstream_uri(uri);
-            let tls_server_name = sni_from_upstream_address(&address);
+            let (address, explicit_sni) = extract_tls_server_name(address);
+            let tls_server_name = explicit_sni.or_else(|| sni_from_upstream_address(&address));
             upstreams.push(crate::dns::DnsUpstream {
                 name,
                 address,
@@ -866,6 +867,35 @@ fn sni_from_upstream_address(address: &str) -> Option<String> {
         return None;
     }
     Some(host.to_string())
+}
+
+/// Strip an explicit `tls_server_name=` query parameter from an upstream
+/// address, e.g. `tls://1.1.1.1:853?tls_server_name=cloudflare-dns.com`.
+/// Needed for IP-literal TLS upstreams whose certificate hostname differs
+/// from the dial address. Other query pairs are preserved.
+fn extract_tls_server_name(address: String) -> (String, Option<String>) {
+    let Some(qpos) = address.find('?') else {
+        return (address, None);
+    };
+    let (base, query) = address.split_at(qpos);
+    let mut sni = None;
+    let mut kept = Vec::new();
+    for pair in query[1..].split('&') {
+        if let Some(v) = pair.strip_prefix("tls_server_name=") {
+            let v = v.trim();
+            if !v.is_empty() {
+                sni = Some(v.to_string());
+            }
+        } else if !pair.is_empty() {
+            kept.push(pair);
+        }
+    }
+    let address = if kept.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{}", kept.join("&"))
+    };
+    (address, sni)
 }
 
 /// Parse `fixed_domain_ttl { domain: N ... }` into a HashMap.
@@ -1243,21 +1273,43 @@ fn parse_node_section(section: &Section) -> Result<Vec<Node>, crate::ConfigError
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        if let Some(pos) = trimmed.find(':') {
-            let tag = trimmed[..pos].trim().trim_matches('\'').to_string();
-            let uri = trimmed[pos + 1..].trim().trim_matches('\'').to_string();
-            if let Ok(mut node) = Node::from_share_link(&uri) {
+        let unquote = |s: &str| s.trim().trim_matches(|c| c == '\'' || c == '"').to_string();
+        // Shapes: `tag: 'uri'` | `'tag': 'uri'` | `'uri'` | bare `scheme://uri`.
+        // The first colon only splits tag/uri when it sits outside any quotes
+        // and is not the URI scheme separator (`://`).
+        let (tag, uri) = if trimmed.starts_with(['\'', '"']) {
+            let q = trimmed.as_bytes()[0] as char;
+            match trimmed[1..].find(q) {
+                Some(rel) => {
+                    let close = 1 + rel;
+                    let after = trimmed[close + 1..].trim_start();
+                    if let Some(rest) = after.strip_prefix(':') {
+                        (trimmed[1..close].to_string(), unquote(rest))
+                    } else {
+                        (String::new(), trimmed[1..close].to_string())
+                    }
+                }
+                None => (String::new(), unquote(trimmed)),
+            }
+        } else if let Some(pos) = trimmed.find(':') {
+            if trimmed[pos..].starts_with("://") || trimmed[..pos].contains(char::is_whitespace) {
+                (String::new(), trimmed.to_string())
+            } else {
+                (unquote(&trimmed[..pos]), unquote(&trimmed[pos + 1..]))
+            }
+        } else {
+            (String::new(), unquote(trimmed))
+        };
+        match Node::from_share_link(&uri) {
+            Ok(mut node) => {
                 if !tag.is_empty() {
                     node.name = tag;
                 }
                 nodes.push(node);
             }
-        } else if let Some(uri) = trimmed
-            .strip_prefix('\'')
-            .and_then(|s| s.strip_suffix('\''))
-            && let Ok(node) = Node::from_share_link(uri)
-        {
-            nodes.push(node);
+            Err(e) => {
+                eprintln!("node section: skipping unparseable entry '{trimmed}': {e}");
+            }
         }
     }
     Ok(nodes)

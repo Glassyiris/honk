@@ -9,7 +9,7 @@
 honk 使用原始的 **dae 配置语法**（`{ section { ... } }`）作为配置格式，配置文件通常以 `.dae` 结尾。语法要点：
 
 - 顶层由若干 `section { ... }` 组成（包括 `include { ... }`）；`#` 为行注释。
-- 除 `include` 外，键值对写作 `key: value`；含特殊字符的值用单引号包裹（如 `tcp_check_url: 'http://cp.cloudflare.com,1.1.1.1'`）。
+- 除 `include` 外，键值对写作 `key: value`；含特殊字符的值用引号包裹（单双引号均可，如 `tcp_check_url: 'http://cp.cloudflare.com,1.1.1.1'`）。
 - 列表值用逗号分隔写在同一行（如 `lan_interface: eth0, eth1`）。
 
 仓库内示例：
@@ -169,7 +169,7 @@ experimental {
 
 ## 6. 节点与分享链接
 
-节点在 `node { }` 中以**分享链接**声明，格式为 `tag: 'scheme://...'`（tag 即节点名）。
+节点在 `node { }` 中以**分享链接**声明，格式为 `tag: 'scheme://...'`（tag 即节点名），也接受不带 tag 的裸链接。单引号、双引号均可；解析失败的条目会在 stderr 打警告并跳过。
 
 解析支持的 scheme：`ss://`、`ssr://`、`socks5://`、`trojan://`、`trojan-go://`、`vmess://`、`vless://`、`hysteria2://`、`tuic://`、`juicity://`、`anytls://`、`http://`、`https://`。
 

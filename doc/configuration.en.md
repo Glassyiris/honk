@@ -10,7 +10,7 @@ honk is configured in the **dae configuration syntax** — the original `{ secti
 
 - Configuration is organized into **sections**: `include { ... }`, `global { ... }`, `node { ... }`, `group { ... }`, `routing { ... }`, `dns { ... }`, `subscription { ... }`, `experimental { ... }`.
 - Inside non-`include` sections, settings are `key: value` pairs, one per line.
-- Strings containing special characters (URLs, `+`, `//`, `:`) should be **single-quoted**: `tcp_check_url: 'http://cp.cloudflare.com,1.1.1.1'`.
+- Strings containing special characters (URLs, `+`, `//`, `:`) should be **quoted** (single or double quotes both work): `tcp_check_url: 'http://cp.cloudflare.com,1.1.1.1'`.
 - Lists are comma-separated inside a single value: `lan_interface: eth0, eth1`.
 - Durations accept suffixes: `30s`, `50ms`, `5m`, `1h`.
 - `#` starts a comment (whole-line or trailing).
@@ -185,7 +185,7 @@ All of these live in the `global { ... }` section:
 
 ## 6. Nodes and share links
 
-Nodes are declared as **share links** inside the `node { ... }` section, either with an explicit tag or bare:
+Nodes are declared as **share links** inside the `node { ... }` section, either with an explicit tag or bare. Single- and double-quoted forms are both accepted; an entry that fails to parse is skipped with a warning on stderr:
 
 ```dae
 node {
