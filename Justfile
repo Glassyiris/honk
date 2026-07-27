@@ -98,6 +98,10 @@ outbound-ci:
 outbound-ci-e2e:
     ci/outbound-ci.sh --with-e2e-env
 
+# DNS subsystem gate (fmt + clippy + config/dns/control/outbound suites)
+dns-ci:
+    ci/dns-ci.sh
+
 # ── Run ──────────────────────────────────────────────────
 
 # Run honk-core with eBPF (clash API comes from config.dae experimental section)

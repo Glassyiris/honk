@@ -411,24 +411,17 @@ impl AliveDialerSet {
         // fallback IPs (comma-separated) are merged in so probes still have
         // targets even when DNS resolution fails.
         if let Some(hostname) = Self::parse_url_host(&check_url) {
-            match tokio::net::lookup_host(format!("{}:80", hostname)).await {
-                Ok(addrs) => {
-                    let ips = Self::merge_check_addrs(addrs.collect(), &check_url);
-                    tracing::info!(
-                        "Health check DNS resolved '{}' → {} IPs",
-                        hostname,
-                        ips.len()
-                    );
-                    *self.check_url_ips.write() = ips;
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to resolve health check URL '{}': {}", hostname, e);
-                    let ips = Self::merge_check_addrs(Vec::new(), &check_url);
-                    if !ips.is_empty() {
-                        *self.check_url_ips.write() = ips;
-                    }
-                }
+            let addrs = self.resolve_host(&hostname, 80).await;
+            if addrs.is_empty() {
+                tracing::warn!("Failed to resolve health check URL '{}'", hostname);
             }
+            let ips = Self::merge_check_addrs(addrs, &check_url);
+            tracing::info!(
+                "Health check DNS resolved '{}' → {} IPs",
+                hostname,
+                ips.len()
+            );
+            *self.check_url_ips.write() = ips;
         } else {
             // No URL hostname at all — literal-only form.
             let ips = Self::merge_check_addrs(Vec::new(), &check_url);

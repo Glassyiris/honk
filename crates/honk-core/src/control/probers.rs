@@ -288,7 +288,10 @@ pub(super) fn build_dns_probe_query() -> Vec<u8> {
 /// (e.g. dns.google), which would send every probe to a black hole.
 /// Falls back to [`DEFAULT_UDP_CHECK_DNS`] when the list is empty or no
 /// entry resolves.
-pub(super) async fn resolve_udp_check_target(raws: &[String]) -> SocketAddr {
+pub(super) async fn resolve_udp_check_target(
+    raws: &[String],
+    resolver: Option<crate::outbound::ResolveHook>,
+) -> SocketAddr {
     let fallback: SocketAddr = DEFAULT_UDP_CHECK_DNS
         .parse()
         .expect("hardcoded default UDP check DNS address");
@@ -306,7 +309,8 @@ pub(super) async fn resolve_udp_check_target(raws: &[String]) -> SocketAddr {
             return SocketAddr::new(ip, 53);
         }
     }
-    // Second pass: first domain entry, resolved via system DNS.
+    // Second pass: first domain entry, resolved through the internal DNS
+    // resolver when installed (system lookup otherwise).
     if let Some(raw) = entries.first() {
         let (host, port) = match raw.rsplit_once(':') {
             Some((h, p)) => match p.parse::<u16>() {
@@ -315,15 +319,20 @@ pub(super) async fn resolve_udp_check_target(raws: &[String]) -> SocketAddr {
             },
             None => (*raw, 53),
         };
-        match tokio::net::lookup_host((host, port)).await {
-            Ok(mut addrs) => return addrs.next().unwrap_or(fallback),
-            Err(e) => {
-                warn!(
-                    "Failed to resolve udp_check_dns '{}': {}; using {}",
-                    raw, e, fallback
-                );
-            }
+        let addrs = match resolver {
+            Some(resolve) => resolve(host.to_string(), port).await,
+            None => tokio::net::lookup_host((host, port))
+                .await
+                .map(|it| it.collect())
+                .unwrap_or_default(),
+        };
+        if let Some(addr) = addrs.into_iter().next() {
+            return addr;
         }
+        warn!(
+            "Failed to resolve udp_check_dns '{}'; using {}",
+            raw, fallback
+        );
     }
     fallback
 }

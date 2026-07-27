@@ -240,9 +240,18 @@ impl AliveDialerSet {
     /// Raw TCP connect health check (fallback when no HTTP prober configured).
     async fn probe_node_tcp(&self, node_id: &str, node_addr: &str, timeout: Duration) -> bool {
         let addr = node_addr.to_string();
-        let addrs: Vec<_> = match tokio::net::lookup_host(&addr).await {
-            Ok(it) => it.collect(),
-            Err(_) => {
+        let (host, port) = match addr.rsplit_once(':') {
+            Some((h, p)) => match p.parse::<u16>() {
+                Ok(port) => (h.to_string(), port),
+                Err(_) => (addr.clone(), 80),
+            },
+            None => (addr.clone(), 80),
+        };
+        let addrs: Vec<_> = {
+            let out = self.resolve_host(&host, port).await;
+            if !out.is_empty() {
+                out
+            } else {
                 tracing::warn!(
                     "Health check DNS resolution failed for node '{}' ({}): system lookup failed",
                     node_id,

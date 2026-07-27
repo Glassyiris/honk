@@ -26,6 +26,27 @@ pub const DEFAULT_URLTEST_URL: &str = "https://www.gstatic.com/generate_204";
 /// Default per-node measurement timeout.
 pub const DEFAULT_URLTEST_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Optional resolver for check-URL hosts: `(host, port) → addr`.
+/// honk-core installs the DNS-forwarder-backed resolver so delay
+/// measurements share the internal DNS stack; unset means the raw system
+/// resolver (tests, tools).
+pub type UrltestResolver = std::sync::Arc<
+    dyn Fn(
+            String,
+            u16,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<SocketAddr>> + Send>>
+        + Send
+        + Sync,
+>;
+
+static URLTEST_RESOLVER: std::sync::LazyLock<parking_lot::RwLock<Option<UrltestResolver>>> =
+    std::sync::LazyLock::new(|| parking_lot::RwLock::new(None));
+
+/// Install the resolver used for subsequent [`urltest_node`] measurements.
+pub fn set_urltest_resolver(hook: UrltestResolver) {
+    *URLTEST_RESOLVER.write() = Some(hook);
+}
+
 /// Maximum concurrent node measurements inside [`urltest_group`]
 /// (matches sing-box's health check concurrency).
 pub const URLTEST_MAX_CONCURRENT: usize = 10;
@@ -57,11 +78,21 @@ pub async fn urltest_node(
     };
     let (host, port, is_https) = parse_url_host_port(url)?;
 
-    let addr = tokio::net::lookup_host(format!("{host}:{port}"))
-        .await
-        .with_context(|| format!("failed to resolve '{host}:{port}'"))?
-        .next()
-        .ok_or_else(|| anyhow!("no address resolved for '{host}:{port}'"))?;
+    let addr = {
+        let hook = URLTEST_RESOLVER.read().clone();
+        match hook {
+            Some(hook) => hook(host.clone(), port)
+                .await
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow!("no address resolved for '{host}:{port}'"))?,
+            None => tokio::net::lookup_host(format!("{host}:{port}"))
+                .await
+                .with_context(|| format!("failed to resolve '{host}:{port}'"))?
+                .next()
+                .ok_or_else(|| anyhow!("no address resolved for '{host}:{port}'"))?,
+        }
+    };
 
     measure_head_exchange(node, handler, &host, is_https, addr, timeout).await
 }
@@ -311,6 +342,40 @@ fn validate_status(buf: &[u8]) -> anyhow::Result<()> {
         return Err(anyhow!("bad status code: {}", code));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod resolver_hook_tests {
+    use super::*;
+
+    /// The installed hook is consulted before the system resolver.
+    #[tokio::test]
+    async fn hook_supplies_urltest_addresses() {
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called2 = called.clone();
+        set_urltest_resolver(std::sync::Arc::new(move |host, port| {
+            let called2 = called2.clone();
+            Box::pin(async move {
+                called2.store(true, std::sync::atomic::Ordering::Relaxed);
+                assert_eq!(host, "example.invalid");
+                assert_eq!(port, 443);
+                vec!["127.0.0.1:443".parse().unwrap()]
+            })
+        }));
+        let node = Node::default();
+        // The dial itself fails (nothing on 127.0.0.1:443) but the hook
+        // must have been consulted first.
+        let handler = crate::proxy::direct::DirectHandler::new();
+        let _ = urltest_node(
+            &node,
+            &handler,
+            "https://example.invalid/",
+            Duration::from_millis(50),
+        )
+        .await;
+        assert!(called.load(std::sync::atomic::Ordering::Relaxed));
+        *URLTEST_RESOLVER.write() = None;
+    }
 }
 
 #[cfg(test)]
