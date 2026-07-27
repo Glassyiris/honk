@@ -24,24 +24,24 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context as _, anyhow};
 use async_trait::async_trait;
 use honk_config::node::Node;
 use honk_config::types::NodeProtocol;
-use parking_lot::Mutex;
 use tracing::debug;
 
-use crate::quic::{QuicBiStream, QuicClient};
+use crate::quic::{
+    ClientCache, QuicClient, QuicConnState, now_secs, recv_read_exact as read_exact,
+};
 
 use super::addr::SocksAddr as JuiceAddr;
 use super::{ProxyHandler, ProxyStream, UdpProxySocket};
 
 const JUICITY_VERSION: u8 = 0x00;
-const CMD_AUTHENTICATE: u8 = 0x00;
 
 const NETWORK_TCP: u8 = 0x01;
 const NETWORK_UDP: u8 = 0x03;
@@ -55,19 +55,6 @@ const CONN_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const AUTH_GRACE: Duration = Duration::from_millis(150);
 /// Tear down a UDP session bridge after this long without traffic.
 const UDP_BRIDGE_IDLE: Duration = Duration::from_secs(90);
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-async fn read_exact(recv: &mut quinn::RecvStream, buf: &mut [u8]) -> io::Result<()> {
-    recv.read_exact(buf)
-        .await
-        .map_err(|e| io::Error::new(io::ErrorKind::UnexpectedEof, e))
-}
 
 /// Read one inbound UDP frame (`[metadata][len u16][payload]`); the address
 /// is returned alongside the payload for completeness but relayed sessions
@@ -94,6 +81,16 @@ struct JuicityConnState {
     last_activity: Arc<AtomicU64>,
 }
 
+impl QuicConnState for JuicityConnState {
+    fn touch(&self) {
+        self.last_activity.store(now_secs(), Ordering::Relaxed);
+    }
+
+    fn open_counter(&self) -> &Arc<AtomicUsize> {
+        &self.open
+    }
+}
+
 impl JuicityConnState {
     fn new(conn: quinn::Connection, auth_stream: quinn::SendStream) -> Self {
         let state = Self {
@@ -102,32 +99,15 @@ impl JuicityConnState {
             open: Arc::new(AtomicUsize::new(0)),
             last_activity: Arc::new(AtomicU64::new(now_secs())),
         };
-        let open = Arc::downgrade(&state.open);
-        let last_activity = Arc::downgrade(&state.last_activity);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(KEEP_ALIVE_INTERVAL);
-            interval.tick().await;
-            loop {
-                interval.tick().await;
-                if conn.close_reason().is_some() {
-                    break;
-                }
-                let (Some(open), Some(last)) = (open.upgrade(), last_activity.upgrade()) else {
-                    conn.close(quinn::VarInt::from_u32(0), b"state dropped");
-                    break;
-                };
-                let idle = now_secs().saturating_sub(last.load(Ordering::Relaxed));
-                if open.load(Ordering::Relaxed) == 0 && idle > CONN_IDLE_TIMEOUT.as_secs() {
-                    conn.close(quinn::VarInt::from_u32(0), b"idle");
-                    break;
-                }
-            }
-        });
+        crate::quic::spawn_conn_reaper(
+            conn,
+            Arc::downgrade(&state.open),
+            Arc::downgrade(&state.last_activity),
+            KEEP_ALIVE_INTERVAL,
+            CONN_IDLE_TIMEOUT,
+            None,
+        );
         state
-    }
-
-    fn touch(&self) {
-        self.last_activity.store(now_secs(), Ordering::Relaxed);
     }
 }
 
@@ -146,41 +126,18 @@ impl JuicityClient {
         let password = self.password.clone();
         self.quic
             .connection_with(connect_timeout, move |conn| async move {
-                let auth_stream = authenticate(&conn, &uuid, &password).await?;
+                let auth_stream = crate::quic::exporter_auth(
+                    &conn,
+                    &uuid,
+                    &password,
+                    JUICITY_VERSION,
+                    false,
+                    AUTH_GRACE,
+                )
+                .await?;
                 Ok(JuicityConnState::new(conn, auth_stream))
             })
             .await
-    }
-}
-
-/// Juicity authenticate: same TUIC exporter token, version byte 0x00
-/// (`client.go:122-141`). Returns the still-open auth stream.
-async fn authenticate(
-    conn: &quinn::Connection,
-    uuid: &[u8; 16],
-    password: &str,
-) -> anyhow::Result<quinn::SendStream> {
-    let mut token = [0u8; 32];
-    conn.export_keying_material(&mut token, uuid, password.as_bytes())
-        .map_err(|e| anyhow!("Juicity: TLS keying material export failed: {e:?}"))?;
-    let mut auth = Vec::with_capacity(2 + 16 + 32);
-    auth.push(JUICITY_VERSION);
-    auth.push(CMD_AUTHENTICATE);
-    auth.extend_from_slice(uuid);
-    auth.extend_from_slice(&token);
-    let mut stream = conn
-        .open_uni()
-        .await
-        .context("Juicity: open authenticate stream")?;
-    stream
-        .write_all(&auth)
-        .await
-        .context("Juicity: send authenticate")?;
-    // Bad credentials are signalled by the server closing the connection;
-    // give it a brief grace period to do so (no protocol-level auth ack).
-    tokio::select! {
-        e = conn.closed() => Err(anyhow!("Juicity: connection closed during authentication: {e}")),
-        _ = tokio::time::sleep(AUTH_GRACE) => Ok(stream),
     }
 }
 
@@ -189,8 +146,8 @@ async fn authenticate(
 pub struct JuicityHandler;
 
 /// Shared Juicity clients keyed by server + credentials (anytls pool parity).
-static CLIENTS: LazyLock<Mutex<HashMap<String, Arc<JuicityClient>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static CLIENTS: ClientCache<JuicityClient> =
+    ClientCache::new(|| parking_lot::Mutex::new(HashMap::new()));
 
 impl JuicityHandler {
     pub fn new() -> Self {
@@ -220,33 +177,26 @@ impl JuicityHandler {
             node.sni.as_deref().unwrap_or(""),
             node.skip_cert_verify
         );
-        if let Some(client) = CLIENTS.lock().get(&key) {
-            return Ok(Arc::clone(client));
-        }
-        // Build outside the lock: client_config is async (ECH discovery).
         let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
-        // Upstream juicity (Go and juicity-rs) defaults to BBR on the client
-        // when no congestion_control is configured.
-        let config = crate::quic::client_config(
-            node,
-            &[b"h3"],
-            crate::quic::QuicClientOptions {
-                keep_alive: Some(KEEP_ALIVE_INTERVAL),
-                ..crate::quic::QuicClientOptions::with_congestion(Some("bbr"))
-            },
-        )
-        .await?;
-        let client = Arc::new(JuicityClient {
-            quic: QuicClient::new(node.host().to_string(), node.port, server_name, config),
-            uuid: *uuid.as_bytes(),
-            password,
-        });
-        // Another task may have won the race — reuse theirs.
-        let mut clients = CLIENTS.lock();
-        Ok(clients
-            .entry(key)
-            .or_insert_with(|| Arc::clone(&client))
-            .clone())
+        crate::quic::cached_client(&CLIENTS, key, || async move {
+            // Upstream juicity (Go and juicity-rs) defaults to BBR on the client
+            // when no congestion_control is configured.
+            let config = crate::quic::client_config(
+                node,
+                &[b"h3"],
+                crate::quic::QuicClientOptions {
+                    keep_alive: Some(KEEP_ALIVE_INTERVAL),
+                    ..crate::quic::QuicClientOptions::with_congestion(Some("bbr"))
+                },
+            )
+            .await?;
+            Ok(Arc::new(JuicityClient {
+                quic: QuicClient::new(node.host().to_string(), node.port, server_name, config),
+                uuid: *uuid.as_bytes(),
+                password,
+            }))
+        })
+        .await
     }
 
     /// Open a bi stream and write the juicity request header
@@ -282,33 +232,26 @@ impl ProxyHandler for JuicityHandler {
     ) -> anyhow::Result<ProxyStream> {
         let client = Self::client_for(node).await?;
         let addr = JuiceAddr::new(target, target_domain);
-        let mut last_err: Option<anyhow::Error> = None;
-        // Retry once with a fresh connection when the stream open fails on a
-        // half-dead cached connection.
-        for attempt in 0..2 {
-            let (conn, state) = client.connection(connect_timeout).await?;
-            state.touch();
-            match Self::open_stream(&conn, NETWORK_TCP, &addr).await {
-                Ok((send, recv)) => {
-                    state.open.fetch_add(1, Ordering::Relaxed);
-                    let open = Arc::clone(&state.open);
-                    let stream = QuicBiStream::new(send, recv).with_on_drop(move || {
-                        open.fetch_sub(1, Ordering::Relaxed);
-                    });
-                    return Ok(ProxyStream {
-                        stream: Box::new(stream),
-                        target_addr: target,
-                        target_domain: target_domain.map(str::to_string),
-                    });
-                }
-                Err(e) => {
-                    debug!("Juicity: stream open failed (attempt {attempt}): {e}");
-                    client.quic.invalidate(&conn).await;
-                    last_err = Some(e);
-                }
-            }
-        }
-        Err(last_err.expect("loop runs at least once"))
+        let stream = crate::quic::dial_quic_stream(
+            &client.quic,
+            |timeout| {
+                let client = Arc::clone(&client);
+                async move { client.connection(timeout).await }
+            },
+            connect_timeout,
+            move |conn| {
+                let addr = addr.clone();
+                async move { Self::open_stream(&conn, NETWORK_TCP, &addr).await }
+            },
+            |_| true,
+            "Juicity",
+        )
+        .await?;
+        Ok(ProxyStream {
+            stream: Box::new(stream),
+            target_addr: target,
+            target_domain: target_domain.map(str::to_string),
+        })
     }
 
     async fn dial_udp(
@@ -319,23 +262,39 @@ impl ProxyHandler for JuicityHandler {
         connect_timeout: Duration,
     ) -> anyhow::Result<UdpProxySocket> {
         let client = Self::client_for(node).await?;
-        let (conn, state) = client.connection(connect_timeout).await?;
-        state.touch();
         let target_addr = JuiceAddr::new(target, target_domain);
-        let (mut send, mut recv) = Self::open_stream(&conn, NETWORK_UDP, &target_addr).await?;
+        // Same retry skeleton as TCP dials: a dead cached connection must not
+        // fail the UDP session outright (it would otherwise surface as a
+        // one-shot stream-open error on the half-dead connection).
+        let stream_addr = target_addr.clone();
+        let stream = crate::quic::dial_quic_stream(
+            &client.quic,
+            |timeout| {
+                let client = Arc::clone(&client);
+                async move { client.connection(timeout).await }
+            },
+            connect_timeout,
+            move |conn| {
+                let addr = stream_addr.clone();
+                async move { Self::open_stream(&conn, NETWORK_UDP, &addr).await }
+            },
+            |_| true,
+            "Juicity",
+        )
+        .await?;
+        // The guard carries the connection's open-stream accounting; it must
+        // live as long as the bridge.
+        let (mut send, mut recv, guard) = stream.into_parts();
 
         // Bridge the QUIC stream to a local UDP socket pair: the relay sends
         // raw payloads to `relay_addr` on the returned socket and receives
         // replies from the same address (see UdpProxySocket users).
-        let external = crate::util::udp_loopback_bind().await?;
-        let internal = crate::util::udp_loopback_bind().await?;
-        let external_addr = external.local_addr()?;
-        let relay_addr = internal.local_addr()?;
+        let (external, internal, external_addr, relay_addr) =
+            crate::util::udp_loopback_pair().await?;
         let internal = Arc::new(internal);
 
-        state.open.fetch_add(1, Ordering::Relaxed);
-        let bridge_state = Arc::clone(&state);
         tokio::spawn(async move {
+            let _guard = guard;
             let writer = {
                 let internal = Arc::clone(&internal);
                 let target_addr = target_addr.clone();
@@ -375,7 +334,6 @@ impl ProxyHandler for JuicityHandler {
                 _ = reader => {},
                 _ = tokio::time::sleep(UDP_BRIDGE_IDLE) => {},
             }
-            bridge_state.open.fetch_sub(1, Ordering::Relaxed);
         });
 
         Ok(UdpProxySocket {
@@ -416,6 +374,10 @@ mod tests {
     use quinn::VarInt;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// AUTHENTICATE command byte (the shared `exporter_auth` writes it
+    /// inline; only the test server decodes it).
+    const CMD_AUTHENTICATE: u8 = 0x00;
 
     const TEST_UUID: &str = "123e4567-e89b-12d3-a456-426614174000";
     const TEST_PASSWORD: &str = "juicity-test-password";

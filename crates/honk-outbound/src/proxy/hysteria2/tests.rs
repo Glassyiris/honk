@@ -1,5 +1,8 @@
 use super::*;
 use crate::quic::testutil;
+use std::time::Instant;
+
+use parking_lot::Mutex;
 use std::sync::atomic::AtomicBool;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -499,12 +502,14 @@ fn test_fragmentation_and_defrag() {
     assert_eq!(frags.len(), 3);
     assert!(frags.iter().all(|f| f.len() <= 1200));
     // Every fragment repeats the full header (sing parity).
-    let mut map: HashMap<u16, DefragBuffer> = HashMap::new();
+    let mut defrag = Defragmenter::new();
     let mut out = None;
     for pkt in frags.iter().rev() {
         let msg = decode_udp_message(pkt).unwrap();
         assert_eq!(msg.addr, "8.8.8.8:53");
-        out = feed_defrag(&mut map, msg).or(out);
+        out = defrag
+            .feed(msg.packet_id, msg.frag_id, msg.frag_total, msg.data)
+            .or(out);
     }
     assert_eq!(out.expect("reassembled payload"), data);
 }

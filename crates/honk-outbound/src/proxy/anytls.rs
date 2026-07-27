@@ -1109,10 +1109,8 @@ impl ProxyHandler for AnyTlsHandler {
         // Bridge a loopback UDP socket to length-prefixed datagrams on the
         // stream: the relay talks raw payloads to `relay_addr`, the bridge
         // frames them onto the AnyTLS stream.
-        let external = crate::util::udp_loopback_bind().await?;
-        let internal = crate::util::udp_loopback_bind().await?;
-        let external_addr = external.local_addr()?;
-        let relay_addr = internal.local_addr()?;
+        let (external, internal, external_addr, relay_addr) =
+            crate::util::udp_loopback_pair().await?;
         tokio::spawn(uot_bridge(
             stream,
             internal,
@@ -1493,10 +1491,8 @@ mod uot_tests {
     #[tokio::test]
     async fn test_uot_bridge_roundtrip() {
         let (client_half, mut server_half) = tokio::io::duplex(65536);
-        let external = crate::util::udp_loopback_bind().await.unwrap();
-        let internal = crate::util::udp_loopback_bind().await.unwrap();
-        let external_addr = external.local_addr().unwrap();
-        let relay_addr = internal.local_addr().unwrap();
+        let (external, internal, external_addr, relay_addr) =
+            crate::util::udp_loopback_pair().await.unwrap();
         tokio::spawn(uot_bridge(
             client_half,
             internal,
@@ -1529,9 +1525,8 @@ mod uot_tests {
     #[tokio::test]
     async fn test_uot_bridge_v1_packet_response() {
         let (client_half, mut server_half) = tokio::io::duplex(65536);
-        let external = crate::util::udp_loopback_bind().await.unwrap();
-        let internal = crate::util::udp_loopback_bind().await.unwrap();
-        let external_addr = external.local_addr().unwrap();
+        let (external, internal, external_addr, _relay_addr) =
+            crate::util::udp_loopback_pair().await.unwrap();
         tokio::spawn(uot_bridge(
             client_half,
             internal,
@@ -1556,9 +1551,8 @@ mod uot_tests {
     #[tokio::test]
     async fn test_uot_bridge_v2_with_atyp_like_prefix() {
         let (client_half, mut server_half) = tokio::io::duplex(65536);
-        let external = crate::util::udp_loopback_bind().await.unwrap();
-        let internal = crate::util::udp_loopback_bind().await.unwrap();
-        let external_addr = external.local_addr().unwrap();
+        let (external, internal, external_addr, _relay_addr) =
+            crate::util::udp_loopback_pair().await.unwrap();
         tokio::spawn(uot_bridge(
             client_half,
             internal,
