@@ -65,8 +65,18 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                     .map_err(|_| "config lock busy".to_string())?;
                 std::time::Duration::from_millis(config.global.connect_timeout_ms)
             };
+            // Proxy nodes dial the check URL by domain: the node's egress
+            // resolver answers it, which both proves the real user path and
+            // sidesteps local DNS poisoning (a poisoned system answer turns
+            // every check into an "empty HTTP response" from a black hole).
+            // `direct` keeps the pre-resolved IP — its reality IS local DNS.
+            let domain = if node.name == "direct" {
+                None
+            } else {
+                url_host(&check_url)
+            };
             let proxy = handler
-                .dial(&node, addr, None, connect_timeout)
+                .dial(&node, addr, domain.as_deref(), connect_timeout)
                 .await
                 .map_err(|e| format!("dial failed: {}", e))?;
 
@@ -78,6 +88,21 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
             Ok(elapsed)
         })
     }
+}
+
+/// Bare host part of a check URL (`http://host[:port]/path` → `host`).
+fn url_host(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let host_port = rest.split('/').next()?;
+    let host = host_port.split(':').next()?;
+    if host.is_empty() {
+        return None;
+    }
+    // An IP literal is not a domain to dial by name.
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    Some(host.to_string())
 }
 
 impl ProxyHttpProber {
