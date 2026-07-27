@@ -254,6 +254,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // Make `direct` usable as a group member without declaring it in the
     // config (maps to DirectHandler via the HTTP protocol).
     config.ensure_builtin_nodes();
+    // Traffic to the gateway's own addresses always goes direct (must),
+    // keeping admin/API access alive even when every node is down.
+    config.ensure_local_direct_rules();
 
     // Effective log level: --debug flag > RUST_LOG env > config log_level >
     // "info".
@@ -836,6 +839,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                         continue;
                     }
                     new_config.ensure_builtin_nodes();
+                    new_config.ensure_local_direct_rules();
                     // The on-disk config contains no subscription nodes (they
                     // exist only in memory), so a naive reload would empty
                     // every subscription-fed group until the next periodic

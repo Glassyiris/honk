@@ -255,12 +255,22 @@ Geo 资源：将 `geoip.dat` / `geosite.dat` 放到运行时可加载的位置�
 ```dae
 routing {
     pname(dnsmasq) && l4proto(udp) && dport(53) -> direct(must)
-    dip(geoip: private) -> direct
+    dip(geoip: private) -> direct(must)
     domain(geosite: geolocation-cn) -> direct
     domain(suffix: google.com) -> proxy
     fallback: direct
 }
 ```
+
+### 节点失效时的行为（fail-closed 语义）
+
+honk 的数据面与 Go dae 一样是 fail-closed：健康检查判定 outbound 死亡后，eBPF 会**直接丢弃**路由到该 outbound 的新流（`TC_ACT_SHOT`)。如果 `fallback` 指向单个节点，节点死亡意味着所有代理流量被丢——这是有意设计（不做静默直连泄漏），不是 bug。53 端口 DNS(TCP 与 UDP）始终豁免，仍会到达控制面，因此配一条直连 DNS 上游可以在节点故障期间保住域名解析。
+
+为保证路由器自身在任何情况下都可达：
+
+- honk 启动和每次 reload 时会自动注入 `dip(<所有 lan/wan 接口地址>) -> direct(must)`，管理后台 / SSH / clash API 不依赖节点健康。
+- 建议加 `dip(geoip: private) -> direct(must)` 覆盖 LAN 内其他设备（打印机、NAS、其他路由），与 dae 示例配置一致，零成本。
+- 公网韧性：`fallback` 指向 `fallback` 策略组（≥2 个节点自动切换），并至少保留一条直连 DNS 上游（如 `udp://223.5.5.5`)。
 
 ## 9. DNS
 

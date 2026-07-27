@@ -111,6 +111,63 @@ pub struct GlobalConfig {
 fn default_tproxy_port() -> u16 {
     12345
 }
+
+/// Host CIDRs (`addr/32`, `addr/128`) for every global-scoped address on
+/// `iface`, read via `ip -o addr show dev`. The literal `auto` resolves
+/// through the default route's dev. Missing interfaces/tools yield an
+/// empty list — best effort by design.
+fn interface_host_cidrs(iface: &str) -> Vec<String> {
+    let iface = iface.trim();
+    let owned;
+    let iface = if iface.eq_ignore_ascii_case("auto") {
+        owned = default_route_iface().unwrap_or_default();
+        if owned.is_empty() {
+            return Vec::new();
+        }
+        owned.as_str()
+    } else {
+        iface
+    };
+    let Ok(out) = std::process::Command::new("ip")
+        .args(["-o", "addr", "show", "dev", iface])
+        .output()
+    else {
+        return Vec::new();
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut cidrs = Vec::new();
+    for line in stdout.lines() {
+        if line.contains("scope link") {
+            continue;
+        }
+        let mut tokens = line.split_whitespace();
+        let Some(pos) = tokens.position(|t| t == "inet" || t == "inet6") else {
+            continue;
+        };
+        let is_v6 = line.split_whitespace().nth(pos) == Some("inet6");
+        let Some(addr) = line.split_whitespace().nth(pos + 1) else {
+            continue;
+        };
+        let host = addr.split('/').next().unwrap_or(addr);
+        cidrs.push(format!("{host}/{}", if is_v6 { 128 } else { 32 }));
+    }
+    cidrs
+}
+
+/// Interface name owning the first default route, if any.
+fn default_route_iface() -> Option<String> {
+    let out = std::process::Command::new("ip")
+        .args(["route", "show", "default"])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout.lines().next()?;
+    let mut tokens = line.split_whitespace();
+    tokens
+        .position(|t| t == "dev")
+        .and_then(|p| line.split_whitespace().nth(p + 1).map(str::to_string))
+}
+
 fn default_tproxy_mark() -> u32 {
     0x08000000
 }
@@ -242,6 +299,45 @@ impl Config {
         });
     }
 
+    /// Inject must-direct routing rules for every address assigned to the
+    /// configured lan/wan interfaces, so traffic to the gateway itself
+    /// (admin UI, SSH, clash API) bypasses the proxy even when every node
+    /// is dead. `must` rules never finalize, so user rules can still
+    /// override; without any match these save local traffic from a
+    /// proxied fallback (and from the eBPF fail-closed drop when the
+    /// fallback outbound is down).
+    ///
+    /// Best-effort and idempotent: interfaces that cannot be read
+    /// (missing, `auto` without a default route) are skipped.
+    pub fn ensure_local_direct_rules(&mut self) {
+        const MARK: &str = "__local_direct_";
+        if self.routing.rules.iter().any(|r| r.name.starts_with(MARK)) {
+            return;
+        }
+        let mut cidrs = Vec::new();
+        for iface in &self.global.lan_interface {
+            cidrs.extend(interface_host_cidrs(iface));
+        }
+        for iface in &self.global.wan_interface {
+            cidrs.extend(interface_host_cidrs(iface));
+        }
+        cidrs.sort();
+        cidrs.dedup();
+        for cidr in cidrs {
+            self.routing.rules.push(crate::routing::RoutingRule {
+                name: format!("{MARK}{cidr}"),
+                condition: crate::routing::RoutingCondition {
+                    ip: vec![cidr.clone()],
+                    ..Default::default()
+                },
+                outbound: crate::routing::RoutingOutbound::Simple("direct".to_string()),
+                priority: 0,
+                must: true,
+                mark: 0,
+            });
+        }
+    }
+
     pub fn from_file(path: &str) -> Result<Self, crate::ConfigError> {
         let content = std::fs::read_to_string(path)?;
 
@@ -365,5 +461,35 @@ mod builtin_nodes_tests {
         config.ensure_builtin_nodes();
         assert_eq!(config.nodes.len(), 1);
         assert_eq!(config.nodes[0].host, "custom.example.com");
+    }
+
+    #[test]
+    fn test_ensure_local_direct_rules_injects_and_is_idempotent() {
+        let mut config = Config::default();
+        config.global.lan_interface = vec!["lo".to_string()];
+        config.global.wan_interface = vec!["definitely-not-an-iface0".to_string()];
+        config.ensure_local_direct_rules();
+
+        let injected: Vec<_> = config
+            .routing
+            .rules
+            .iter()
+            .filter(|r| r.name.starts_with("__local_direct_"))
+            .collect();
+        // lo carries 127.0.0.1 and ::1 (host scope) on every Linux host.
+        assert!(
+            injected
+                .iter()
+                .any(|r| r.condition.ip == vec!["127.0.0.1/32".to_string()]),
+            "loopback v4 must be injected: {injected:?}"
+        );
+        assert!(injected.iter().all(|r| r.must));
+        assert!(injected.iter().all(
+            |r| matches!(&r.outbound, crate::routing::RoutingOutbound::Simple(o) if o == "direct")
+        ));
+
+        let count = config.routing.rules.len();
+        config.ensure_local_direct_rules();
+        assert_eq!(config.routing.rules.len(), count, "must be idempotent");
     }
 }

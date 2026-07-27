@@ -348,7 +348,10 @@ fn load_redirect_tuple(ctx: &TcContext) -> Result<RedirectTuple, c_long> {
 
 #[inline(always)]
 fn wan_outbound_is_alive(ctx: &TcContext, outbound: u8, l4proto: u8, dport: u16) -> bool {
-    if l4proto == IPPROTO_UDP && dport == 53 {
+    // DNS must always reach the control plane regardless of outbound health
+    // (Go dae tproxy.c:2606 — userspace DNS handles its own fallback);
+    // applies to both TCP and UDP port 53.
+    if dport == 53 {
         return true;
     }
 
