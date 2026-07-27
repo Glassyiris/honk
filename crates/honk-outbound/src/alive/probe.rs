@@ -52,23 +52,12 @@ impl AliveDialerSet {
         // alone never leaves the probe without targets.
         let cached = self.check_url_ips.read().clone();
         let addrs: Vec<SocketAddr> = if cached.is_empty() {
-            // Cache miss — try one-time resolution as fallback.
-            match tokio::net::lookup_host(format!("{}:80", hostname)).await {
-                Ok(it) => {
-                    let ips = Self::merge_check_addrs(it.collect(), &check_url);
-                    *self.check_url_ips.write() = ips.clone();
-                    ips
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Health check DNS resolution failed for '{}' (node '{}'): {}",
-                        hostname,
-                        node_id,
-                        e
-                    );
-                    Self::merge_check_addrs(Vec::new(), &check_url)
-                }
-            }
+            // Cache miss — one-time resolution via the installed resolver
+            // (system lookup is the fallback inside resolve_host).
+            let resolved = self.resolve_host(&hostname, 80).await;
+            let ips = Self::merge_check_addrs(resolved, &check_url);
+            *self.check_url_ips.write() = ips.clone();
+            ips
         } else {
             cached
         };
@@ -253,12 +242,11 @@ impl AliveDialerSet {
         let addr = node_addr.to_string();
         let addrs: Vec<_> = match tokio::net::lookup_host(&addr).await {
             Ok(it) => it.collect(),
-            Err(e) => {
+            Err(_) => {
                 tracing::warn!(
-                    "Health check DNS resolution failed for node '{}' ({}): {}",
+                    "Health check DNS resolution failed for node '{}' ({}): system lookup failed",
                     node_id,
-                    addr,
-                    e
+                    addr
                 );
                 self.mark_dead_for(node_id, ProbeDomain::Tcp, IpVersion::V4);
                 self.mark_dead_for(node_id, ProbeDomain::Tcp, IpVersion::V6);

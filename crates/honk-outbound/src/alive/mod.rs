@@ -249,6 +249,20 @@ pub struct ProbeRecord {
 /// Maximum probe history entries per node per domain/IP version.
 const MAX_PROBE_HISTORY: usize = 100;
 
+/// Domain resolver for health-check targets: `(host, port) → addrs`.
+/// honk-core installs the DNS-forwarder-backed resolver so all health-check
+/// name resolution shares honk's own DNS stack (routing, cache, serve-stale)
+/// instead of the raw system resolver; bootstrap DNS stays for node
+/// hostnames and startup.
+pub type ResolveHook = Arc<
+    dyn Fn(
+            String,
+            u16,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<SocketAddr>> + Send>>
+        + Send
+        + Sync,
+>;
+
 pub struct AliveDialerSet {
     /// Uses parking_lot RwLock/Mutex for synchronous, uncontended access on the
     /// async runtime (parking_lot blocks OS threads without runtime awareness).
@@ -290,6 +304,8 @@ pub struct AliveDialerSet {
     probe_history: RwLock<HashMap<(String, usize), Vec<ProbeRecord>>>,
     /// Node name → eBPF outbound index resolver for connectivity pushes.
     outbound_resolver: RwLock<Option<OutboundIdResolver>>,
+    /// DNS resolver for check targets (system lookup when unset).
+    resolver: RwLock<Option<ResolveHook>>,
     /// Last activity timestamp per URLTest group (lazy start: absent = idle).
     group_last_active: RwLock<HashMap<String, Instant>>,
     /// node name → URLTest groups it belongs to (for idle suspension).
@@ -324,6 +340,7 @@ impl AliveDialerSet {
             registered: RwLock::new(HashMap::new()),
             ebpf_callback: RwLock::new(None),
             death_callback: RwLock::new(None),
+            resolver: RwLock::new(None),
             failure_threshold: 3,
             base_cooldown: Duration::from_secs(5),
             max_cooldown: Duration::from_secs(300),
@@ -412,16 +429,39 @@ impl AliveDialerSet {
         *self.udp_prober.write() = Some(prober);
     }
 
+    /// Install the DNS resolver for health-check targets (see [`ResolveHook`]).
+    pub fn set_resolver(&self, hook: ResolveHook) {
+        *self.resolver.write() = Some(hook);
+    }
+
+    /// Resolve `host` via the installed hook, falling back to the system
+    /// resolver when no hook is set or the hook finds nothing.
+    pub async fn resolve_host(&self, host: &str, port: u16) -> Vec<SocketAddr> {
+        let hook = self.resolver.read().clone();
+        if let Some(hook) = hook {
+            let out = hook(host.to_string(), port).await;
+            if !out.is_empty() {
+                return out;
+            }
+            tracing::debug!("health-check resolver found nothing for {host}; system fallback");
+        }
+        tokio::net::lookup_host(format!("{host}:{port}"))
+            .await
+            .map(|it| it.collect())
+            .unwrap_or_default()
+    }
+
     /// Refresh the cached check URL IPs.  Called at the start of each full
     /// health check cycle so DNS record changes are eventually picked up.
     /// Matches Go's `TcpCheckOptionRaw.Reset()`.
     pub async fn refresh_check_ips(&self) {
         let check_url = self.check_url.read().clone();
-        if let Some(hostname) = Self::parse_url_host(&check_url)
-            && let Ok(addrs) = tokio::net::lookup_host(format!("{}:80", hostname)).await
-        {
-            let ips = Self::merge_check_addrs(addrs.collect(), &check_url);
-            *self.check_url_ips.write() = ips;
+        if let Some(hostname) = Self::parse_url_host(&check_url) {
+            let addrs = self.resolve_host(&hostname, 80).await;
+            if !addrs.is_empty() {
+                let ips = Self::merge_check_addrs(addrs, &check_url);
+                *self.check_url_ips.write() = ips;
+            }
         }
     }
 
@@ -1163,13 +1203,10 @@ impl AliveDialerSet {
             return ips.clone();
         }
         let ips = match Self::parse_url_host(url) {
-            Some(hostname) => match tokio::net::lookup_host(format!("{}:80", hostname)).await {
-                Ok(addrs) => Self::merge_check_addrs(addrs.collect(), url),
-                Err(e) => {
-                    tracing::warn!("Health check URL '{}' DNS resolution failed: {}", url, e);
-                    Self::merge_check_addrs(Vec::new(), url)
-                }
-            },
+            Some(hostname) => {
+                let addrs = self.resolve_host(&hostname, 80).await;
+                Self::merge_check_addrs(addrs, url)
+            }
             None => Self::merge_check_addrs(Vec::new(), url),
         };
         self.url_check_ips

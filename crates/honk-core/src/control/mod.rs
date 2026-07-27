@@ -137,6 +137,7 @@ impl ControlPlane {
         let alive_set = Arc::new(
             crate::outbound::AliveDialerSet::new().with_so_mark(honk_ebpf_common::DAE_BYPASS_MARK),
         );
+        let dns_resolver = Arc::new(dns_resolver);
         // Register health checks per the config's group membership; reload
         // re-runs the same sync via `reload_group_manager`.
         let (added, _) = sync_health_check_nodes(&alive_set, &config);
@@ -191,13 +192,31 @@ impl ControlPlane {
             ebpf_arc.clone(),
             router_arc.clone(),
         ));
+        // Health-check name resolution shares honk's own DNS forwarder
+        // (routing / cache / serve-stale, and always the *current* forwarder
+        // across reloads) instead of the raw system resolver; bootstrap DNS
+        // stays for node hostnames and startup.
+        {
+            let controller = dns_controller.clone();
+            alive_set.set_resolver(Arc::new(move |host: String, port: u16| {
+                let controller = controller.clone();
+                Box::pin(async move {
+                    controller
+                        .resolve_domain(&host)
+                        .await
+                        .into_iter()
+                        .map(|ip| std::net::SocketAddr::new(ip, port))
+                        .collect()
+                })
+            }));
+        }
 
         let control_plane = Self {
             config: config_arc,
             ebpf: ebpf_arc,
             router: router_arc,
             proxy_registry,
-            dns_resolver: Arc::new(dns_resolver),
+            dns_resolver,
             dns_controller,
             group_manager,
             stats: Arc::new(StatsManager::new()),

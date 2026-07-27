@@ -146,6 +146,21 @@ impl DnsController {
         }
     }
 
+    /// Resolve a domain (A + AAAA) through the *currently installed*
+    /// forwarder — reload-safe, unlike holding a resolver from startup.
+    /// Used by the health-check resolver hook.
+    pub async fn resolve_domain(&self, domain: &str) -> Vec<std::net::IpAddr> {
+        let mut out = Vec::new();
+        for qtype in [1u16, 28] {
+            let query = crate::dns::forwarder::build_dns_query(domain, qtype);
+            let forwarder = self.forwarder.read().await;
+            if let Ok(resp) = forwarder.resolve(&query).await {
+                out.extend(crate::dns::forwarder::extract_answer_ips(&resp));
+            }
+        }
+        out
+    }
+
     /// Replace the DNS forwarder used by this controller (e.g. after config
     /// reload changed the upstream list or outbound routing).
     pub async fn set_forwarder(&self, forwarder: Arc<DnsForwarder>) {
