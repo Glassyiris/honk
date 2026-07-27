@@ -1344,10 +1344,16 @@ impl AliveDialerSet {
 
     /// Merge resolved and literal check-target addresses, deduplicated.
     fn merge_check_addrs(resolved: Vec<SocketAddr>, check_url: &str) -> Vec<SocketAddr> {
-        let mut ips = resolved;
-        ips.extend(Self::parse_check_literals(check_url));
-        ips.sort();
-        ips.dedup();
+        // Operator-declared literal fallbacks are the trusted anchors and
+        // are tried first: resolved answers can be DNS-poisoned, and the
+        // per-family probe window (first 3) would otherwise fill with
+        // poisoned entries and starve the good literals out entirely.
+        let mut ips = Self::parse_check_literals(check_url);
+        for a in resolved {
+            if !ips.contains(&a) {
+                ips.push(a);
+            }
+        }
         ips
     }
 }
@@ -1355,6 +1361,24 @@ impl AliveDialerSet {
 impl Default for AliveDialerSet {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod merge_check_addrs_tests {
+    use super::*;
+
+    #[test]
+    fn literals_come_before_resolved_even_when_they_sort_later() {
+        let literal: SocketAddr = "142.250.197.238:80".parse().unwrap();
+        let poisoned: SocketAddr = "58.63.233.33:80".parse().unwrap();
+        let merged = AliveDialerSet::merge_check_addrs(
+            vec![poisoned],
+            "http://www.google-analytics.com/generate_204,142.250.197.238",
+        );
+        assert_eq!(merged.first(), Some(&literal));
+        assert!(merged.contains(&poisoned));
+        assert_eq!(merged.len(), 2);
     }
 }
 

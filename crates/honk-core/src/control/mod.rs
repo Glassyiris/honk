@@ -563,9 +563,9 @@ impl ControlPlane {
             {
                 let dns_raw = {
                     let c = self.config.read().await;
-                    c.global.udp_check_dns.first().cloned()
+                    c.global.udp_check_dns.clone()
                 };
-                let dns_target = resolve_udp_check_target(dns_raw).await;
+                let dns_target = resolve_udp_check_target(&dns_raw).await;
                 alive_set.set_udp_probe(Arc::new(ProxyUdpProber::new(
                     self.config.clone(),
                     self.proxy_registry.clone(),

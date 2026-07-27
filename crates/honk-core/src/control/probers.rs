@@ -256,41 +256,51 @@ pub(super) fn build_dns_probe_query() -> Vec<u8> {
 }
 
 /// Resolve the UDP health check target from `global.udp_check_dns`
-/// (first entry, dae semantics: `host[:port]`, default port 53).
-/// Falls back to [`DEFAULT_UDP_CHECK_DNS`] when unset or unresolvable.
-pub(super) async fn resolve_udp_check_target(raw: Option<String>) -> SocketAddr {
+/// (dae semantics: `host[:port]` list, default port 53).
+///
+/// IP literals in the list are preferred over domain entries: the system
+/// resolver can return DNS-poisoned answers for popular check domains
+/// (e.g. dns.google), which would send every probe to a black hole.
+/// Falls back to [`DEFAULT_UDP_CHECK_DNS`] when the list is empty or no
+/// entry resolves.
+pub(super) async fn resolve_udp_check_target(raws: &[String]) -> SocketAddr {
     let fallback: SocketAddr = DEFAULT_UDP_CHECK_DNS
         .parse()
         .expect("hardcoded default UDP check DNS address");
-    let Some(raw) = raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
-        return fallback;
-    };
-    // Full socket address (v4, or bracketed v6 with port).
-    if let Ok(addr) = raw.parse::<SocketAddr>() {
-        return addr;
-    }
-    // Bare IP literal → default DNS port.
-    if let Ok(ip) = raw.parse::<std::net::IpAddr>() {
-        return SocketAddr::new(ip, 53);
-    }
-    // host[:port] → resolve via system DNS.
-    let (host, port) = match raw.rsplit_once(':') {
-        Some((h, p)) => match p.parse::<u16>() {
-            Ok(port) => (h, port),
-            Err(_) => (raw.as_str(), 53),
-        },
-        None => (raw.as_str(), 53),
-    };
-    match tokio::net::lookup_host((host, port)).await {
-        Ok(mut addrs) => addrs.next().unwrap_or(fallback),
-        Err(e) => {
-            warn!(
-                "Failed to resolve udp_check_dns '{}': {}; using {}",
-                raw, e, fallback
-            );
-            fallback
+    let entries: Vec<&str> = raws
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    // First pass: literal IPs (full socket addr or bare IP with default port).
+    for raw in &entries {
+        if let Ok(addr) = raw.parse::<SocketAddr>() {
+            return addr;
+        }
+        if let Ok(ip) = raw.parse::<std::net::IpAddr>() {
+            return SocketAddr::new(ip, 53);
         }
     }
+    // Second pass: first domain entry, resolved via system DNS.
+    if let Some(raw) = entries.first() {
+        let (host, port) = match raw.rsplit_once(':') {
+            Some((h, p)) => match p.parse::<u16>() {
+                Ok(port) => (h, port),
+                Err(_) => (*raw, 53),
+            },
+            None => (*raw, 53),
+        };
+        match tokio::net::lookup_host((host, port)).await {
+            Ok(mut addrs) => return addrs.next().unwrap_or(fallback),
+            Err(e) => {
+                warn!(
+                    "Failed to resolve udp_check_dns '{}': {}; using {}",
+                    raw, e, fallback
+                );
+            }
+        }
+    }
+    fallback
 }
 
 /// Returns true if `ip` belongs to honk's own dae0 veth subnets.

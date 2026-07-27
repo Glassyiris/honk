@@ -12,29 +12,34 @@ fn test_build_dns_probe_query() {
 #[tokio::test]
 async fn test_resolve_udp_check_target() {
     let fallback: SocketAddr = "8.8.8.8:53".parse().unwrap();
-    assert_eq!(resolve_udp_check_target(None).await, fallback);
-    assert_eq!(resolve_udp_check_target(Some("   ".into())).await, fallback);
+    assert_eq!(resolve_udp_check_target(&[]).await, fallback);
+    assert_eq!(resolve_udp_check_target(&["   ".into()]).await, fallback);
     // Bare IP literals get the default DNS port.
     assert_eq!(
-        resolve_udp_check_target(Some("1.1.1.1".into())).await,
+        resolve_udp_check_target(&["1.1.1.1".into()]).await,
         "1.1.1.1:53".parse().unwrap()
     );
     assert_eq!(
-        resolve_udp_check_target(Some("2001:4860:4860::8888".into())).await,
+        resolve_udp_check_target(&["2001:4860:4860::8888".into()]).await,
         "[2001:4860:4860::8888]:53".parse().unwrap()
     );
     // Full socket addresses (v4 or bracketed v6) are kept as-is.
     assert_eq!(
-        resolve_udp_check_target(Some("1.1.1.1:5353".into())).await,
+        resolve_udp_check_target(&["1.1.1.1:5353".into()]).await,
         "1.1.1.1:5353".parse().unwrap()
     );
     assert_eq!(
-        resolve_udp_check_target(Some("[2606:4700:4700::1111]:53".into())).await,
+        resolve_udp_check_target(&["[2606:4700:4700::1111]:53".into()]).await,
         "[2606:4700:4700::1111]:53".parse().unwrap()
+    );
+    // Literals win over domain entries anywhere in the list (poison-proof).
+    assert_eq!(
+        resolve_udp_check_target(&["dns.google".into(), "8.8.8.8".into()]).await,
+        "8.8.8.8:53".parse().unwrap()
     );
     // host:port resolves via the system resolver ("localhost" needs no
     // external network).
-    let addr = resolve_udp_check_target(Some("localhost:5353".into())).await;
+    let addr = resolve_udp_check_target(&["localhost:5353".into()]).await;
     assert_eq!(addr.port(), 5353);
     assert!(addr.ip().is_loopback());
 }
