@@ -674,15 +674,23 @@ impl AnyTlsHandler {
     /// Build the client settings frame payload.
     fn settings_payload() -> Vec<u8> {
         let scheme = b"stop=0\n";
-        let md5 = md5_hex(scheme);
+        use md5::Digest as _;
+        use std::fmt::Write as _;
+        let md5 = md5::Md5::digest(scheme)
+            .iter()
+            .fold(String::with_capacity(32), |mut s, b| {
+                let _ = write!(s, "{b:02x}");
+                s
+            });
         format!("v=2\nclient=dae\npadding-md5={}\n", md5).into_bytes()
     }
     /// Lazily start the pool janitor for this node (once per address).
     fn ensure_janitor(node: &Node) {
-        let min_idle = node.anytls_min_idle_session.unwrap_or(0);
-        if min_idle == 0 {
-            return;
-        }
+        // Always run the janitor: it pre-establishes min_idle sessions
+        // (default 1) and, just as importantly, reaps idle-expired ones —
+        // skipping it entirely leaks idle sessions into the pool forever.
+        // An explicit `min_idle_session=0` disables standby sessions only,
+        // never pruning.
         let addr = format!("{}:{}", node.host(), node.port);
         {
             let mut guard = JANITORS.lock().unwrap();
@@ -692,7 +700,8 @@ impl AnyTlsHandler {
         }
         debug!(
             "AnyTLS pool: starting janitor for {} (min_idle={})",
-            addr, min_idle
+            addr,
+            node.anytls_min_idle_session.unwrap_or(1)
         );
         SESSION_POOL.spawn_janitor(node.clone());
     }
@@ -1120,17 +1129,6 @@ impl ProxyHandler for AnyTlsHandler {
             _control: None,
         })
     }
-
-    async fn test_connectivity(&self, node: &Node) -> bool {
-        let addr = format!("{}:{}", node.host(), node.port);
-        match crate::util::connect_outbound(&addr, std::time::Duration::from_secs(3)).await {
-            Ok(_) => true,
-            Err(e) => {
-                debug!("AnyTLS connectivity test failed for {}: {}", node.name, e);
-                false
-            }
-        }
-    }
 }
 
 /// Write a single AnyTLS frame.
@@ -1167,25 +1165,6 @@ where
 }
 
 /// Compute the lowercase hex MD5 digest of a byte slice.
-fn md5_hex(data: &[u8]) -> String {
-    use md5::{Digest, Md5};
-    let hash = Md5::digest(data);
-    let mut out = String::with_capacity(hash.len() * 2);
-    for byte in hash {
-        out.push(hex_digit(byte >> 4));
-        out.push(hex_digit(byte & 0x0f));
-    }
-    out
-}
-
-fn hex_digit(n: u8) -> char {
-    match n {
-        0..=9 => (b'0' + n) as char,
-        10..=15 => (b'a' + (n - 10)) as char,
-        _ => unreachable!(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

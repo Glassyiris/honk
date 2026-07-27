@@ -60,28 +60,29 @@ const LEVEL_EARLY_DATA: usize = 1;
 const LEVEL_HANDSHAKE: usize = 2;
 const LEVEL_APPLICATION: usize = 3;
 
-/// HKDF-Expand-Label (RFC 8446 §7.1), SHA-256 variant.
-fn hkdf_expand_label_sha256(secret: &[u8], label: &str, out: &mut [u8]) {
+/// HKDF-Expand-Label `info` block (RFC 8446 §7.1).
+fn expand_label_info(label: &str, out_len: usize) -> Vec<u8> {
     let full_label = format!("tls13 {label}");
     let mut info = Vec::with_capacity(3 + full_label.len() + 1);
-    info.extend_from_slice(&(out.len() as u16).to_be_bytes());
+    info.extend_from_slice(&(out_len as u16).to_be_bytes());
     info.push(full_label.len() as u8);
     info.extend_from_slice(full_label.as_bytes());
     info.push(0); // empty context
+    info
+}
+
+/// HKDF-Expand-Label (RFC 8446 §7.1), SHA-256 variant.
+fn hkdf_expand_label_sha256(secret: &[u8], label: &str, out: &mut [u8]) {
     let hk = Hkdf::<Sha256>::from_prk(secret).expect("traffic secret shorter than hash");
-    hk.expand(&info, out).expect("okm length within limits");
+    hk.expand(&expand_label_info(label, out.len()), out)
+        .expect("okm length within limits");
 }
 
 /// HKDF-Expand-Label (RFC 8446 §7.1), SHA-384 variant.
 fn hkdf_expand_label_sha384(secret: &[u8], label: &str, out: &mut [u8]) {
-    let full_label = format!("tls13 {label}");
-    let mut info = Vec::with_capacity(3 + full_label.len() + 1);
-    info.extend_from_slice(&(out.len() as u16).to_be_bytes());
-    info.push(full_label.len() as u8);
-    info.extend_from_slice(full_label.as_bytes());
-    info.push(0); // empty context
     let hk = Hkdf::<Sha384>::from_prk(secret).expect("traffic secret shorter than hash");
-    hk.expand(&info, out).expect("okm length within limits");
+    hk.expand(&expand_label_info(label, out.len()), out)
+        .expect("okm length within limits");
 }
 
 /// A TLS 1.3 traffic secret plus the suite it belongs to.
@@ -591,7 +592,11 @@ impl crypto::ClientConfig for BoringQuicClientConfig {
         }
         // Resume a cached ticket when we have one for this server (PSK
         // handshake; the server may additionally accept 0-RTT early data).
-        if let Some(&session) = SESSION_TICKETS.lock().get(server_name) {
+        // pinSHA256 nodes never resume: PSK skips certificate verification,
+        // so a ticket cached under a non-pin config would bypass the pin.
+        if !self.has_pin
+            && let Some(&session) = SESSION_TICKETS.lock().get(server_name)
+        {
             unsafe {
                 boring_sys::SSL_set_session(ssl.as_ptr(), session as *mut boring_sys::SSL_SESSION)
             };
@@ -1051,6 +1056,79 @@ mod tests {
         // Wait for ticket issuance before the next connection in real usage;
         // the rustls test server sends tickets with the first flight, but
         // give the cache a beat to settle on slow machines.
+    }
+
+    /// A pinSHA256 node must NOT resume a ticket cached for the same host by
+    /// a non-pin config — resumption skips certificate verification and
+    /// would silently bypass the pin.
+    #[tokio::test]
+    async fn pin_config_never_resumes_cached_ticket() {
+        let addr = spawn_echo_server(&[b"h3"]);
+        // Prime the cache via a non-pin connection.
+        let node = skip_verify_node();
+        let cfg = crate::quic::client_config(&node, &[b"h3"], Default::default())
+            .await
+            .unwrap();
+        let mut endpoint = crate::quic::client_endpoint(false).unwrap();
+        endpoint.set_default_client_config(cfg);
+        let conn = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"ping").await.unwrap();
+        send.finish().unwrap();
+        let _ = recv.read_to_end(16).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        conn.close(0u32.into(), b"done");
+
+        // Same host with the correct pin set: the handshake must succeed,
+        // but it must be a full handshake — never a resumed one.
+        let (config, cert_der) =
+            crate::quic::testutil::server_config_with_cert(&[b"h3"], true).unwrap();
+        let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr2 = endpoint.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                tokio::spawn(async move {
+                    let Ok(conn) = incoming.await else { return };
+                    loop {
+                        match conn.accept_bi().await {
+                            Ok((mut send, mut recv)) => {
+                                tokio::spawn(async move {
+                                    if let Ok(buf) = recv.read_to_end(usize::MAX).await {
+                                        let _ = send.write_all(&buf).await;
+                                        let _ = send.finish();
+                                    }
+                                });
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                });
+            }
+        });
+        let pin_bytes =
+            boring::hash::hash(boring::hash::MessageDigest::sha256(), &cert_der).unwrap();
+        let pin: String = pin_bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let mut pinned = skip_verify_node();
+        pinned.tls_pin_sha256 = Some(pin);
+        let cfg = crate::quic::client_config(&pinned, &[b"h3"], Default::default())
+            .await
+            .unwrap();
+        let mut endpoint2 = crate::quic::client_endpoint(false).unwrap();
+        endpoint2.set_default_client_config(cfg);
+        let conn = endpoint2
+            .connect(addr2, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let data = conn
+            .handshake_data()
+            .and_then(|d| d.downcast::<BoringHandshakeData>().ok())
+            .expect("handshake data");
+        assert!(
+            !data.session_reused,
+            "pin configs must never resume (PSK would bypass the pin)"
+        );
+        conn.close(0u32.into(), b"done");
     }
 
     /// RFC 9001 §5.4.4 ChaCha20 HP mask against a vector captured from a live
