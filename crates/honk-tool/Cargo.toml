@@ -1,0 +1,22 @@
+[package]
+name = "honk-tool"
+version = "0.0.1-alpha"
+edition = "2024"
+description = "honk CLI toolbox: subscription checks, datapath diagnostics"
+
+[[bin]]
+name = "honk-tool"
+path = "src/main.rs"
+
+[dependencies]
+honk-config.workspace = true
+honk-ebpf-common.workspace = true
+honk-outbound.workspace = true
+honk-core = { path = "../honk-core", default-features = false }
+
+anyhow.workspace = true
+clap.workspace = true
+libc.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

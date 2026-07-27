@@ -28,6 +28,30 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Per-(node, check_url) probe state for URLTest groups with a custom
+/// `check_url` (sing-box urltest `url` option). Deliberately simpler than
+/// [`PerProtocolState`]: TCP-only, no traffic counters, no permanent stop
+/// (deep backoff keeps probing on the max-cooldown cadence, same as the
+/// global probe path).
+#[derive(Debug, Clone)]
+struct UrlProbeState {
+    alive: bool,
+    consecutive_failures: u32,
+    consecutive_successes: u32,
+    cooldown_until: Instant,
+}
+
+impl UrlProbeState {
+    fn new() -> Self {
+        Self {
+            alive: true,
+            consecutive_failures: 0,
+            consecutive_successes: 0,
+            cooldown_until: Instant::now(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProbeDomain {
     Tcp = 0,
@@ -82,13 +106,16 @@ pub type ProtocolDomain = ProbeDomain;
 /// Trait for HTTP-based health check probing through proxy nodes.
 ///
 /// Implemented by `honk-core` to route HTTP requests through the proxy
-/// registry, matching Go's `Dialer.HttpCheck`.  Returns the measured
-/// round-trip latency on success, or an error string on failure.
+/// registry, matching Go's `Dialer.HttpCheck`. `url` is the check target
+/// (global `tcp_check_url`, or a group's custom `check_url`); `addr` is a
+/// pre-resolved IP for that URL's host. Returns the measured round-trip
+/// latency on success, or an error string on failure.
 pub trait HttpProber: Send + Sync {
     fn probe_http(
         &self,
         node_name: &str,
         addr: SocketAddr,
+        url: &str,
     ) -> Pin<Box<dyn Future<Output = Result<Duration, String>> + Send + 'static>>;
 }
 
@@ -151,7 +178,8 @@ struct PerProtocolState {
     /// Traffic-based consecutive failures (separate counter, higher thresholds).
     traffic_failures: u32,
     cooldown_until: Instant,
-    /// When true, periodic probes are permanently stopped until resuscitation.
+    /// When true, the node is in deep backoff: probes continue on the slow
+    /// max_cooldown cadence until resuscitation.
     stopped: bool,
 }
 
@@ -187,6 +215,17 @@ fn fresh_states() -> [PerProtocolState; ALIVE_STATES_PER_NODE] {
 
 type EbpfAliveCallback = Box<dyn Fn(u8, u32, u32, bool) + Send + Sync>;
 
+/// Callback fired when a node's (domain, ip-version) state flips
+/// alive→dead on the probe path (same trigger as the eBPF connectivity
+/// push). honk-core purges pooled connections and UDP endpoints bound to
+/// the node from it. Fires once per domain/ip-version flip — handlers
+/// must be idempotent.
+type DeathCallback = Box<dyn Fn(&str) + Send + Sync>;
+
+/// Resolves a custom-check-URL group's member tags to `(tag, current
+/// leaf node)` pairs for probing (see `url_member_resolver`).
+pub type UrlMemberResolver = Arc<dyn Fn(&str) -> Vec<(String, String)> + Send + Sync>;
+
 /// Default URLTest group idle timeout when the group config has none
 /// (sing-box default: 30 minutes). Periodic probing of a URLTest group's
 /// members pauses while the group is idle and resumes on the next selection.
@@ -218,6 +257,7 @@ pub struct AliveDialerSet {
     collections: RwLock<HashMap<String, [Arc<DialerCollection>; ALIVE_STATES_PER_NODE]>>,
     registered: RwLock<HashMap<String, String>>,
     ebpf_callback: RwLock<Option<EbpfAliveCallback>>,
+    death_callback: RwLock<Option<DeathCallback>>,
     /// Deprecated: per-protocol thresholds are now used via probe_failure_threshold/traffic_failure_threshold.
     #[allow(dead_code)]
     failure_threshold: u32,
@@ -258,6 +298,21 @@ pub struct AliveDialerSet {
     urltest_group_members: RwLock<HashMap<String, Vec<String>>>,
     /// URLTest group → idle timeout (probing pauses past it).
     urltest_group_timeout: RwLock<HashMap<String, Duration>>,
+    /// Group → custom check URL for per-group health check targets
+    /// (sing-box urltest `url` option). Members are resolved dynamically
+    /// each probe cycle through `url_member_resolver` — sub-group picks
+    /// change over time, a static list would go stale.
+    group_check_urls: RwLock<HashMap<String, String>>,
+    /// Resolves a group's member tags to `(tag, current leaf node)` pairs
+    /// for custom-URL probing (installed by honk-core via the group
+    /// manager; direct members map to themselves).
+    url_member_resolver: RwLock<Option<UrlMemberResolver>>,
+    /// (node, check_url) → probe state (TCP-only, see [`UrlProbeState`]).
+    url_states: RwLock<HashMap<(String, String), UrlProbeState>>,
+    /// (node, check_url) → latency collection for selection ranking.
+    url_collections: RwLock<HashMap<(String, String), Arc<DialerCollection>>>,
+    /// check_url → cached resolved IPs (same caching as `check_url_ips`).
+    url_check_ips: RwLock<HashMap<String, Vec<SocketAddr>>>,
 }
 
 impl AliveDialerSet {
@@ -268,6 +323,7 @@ impl AliveDialerSet {
             collections: RwLock::new(HashMap::new()),
             registered: RwLock::new(HashMap::new()),
             ebpf_callback: RwLock::new(None),
+            death_callback: RwLock::new(None),
             failure_threshold: 3,
             base_cooldown: Duration::from_secs(5),
             max_cooldown: Duration::from_secs(300),
@@ -288,6 +344,11 @@ impl AliveDialerSet {
             node_urltest_groups: RwLock::new(HashMap::new()),
             urltest_group_members: RwLock::new(HashMap::new()),
             urltest_group_timeout: RwLock::new(HashMap::new()),
+            group_check_urls: RwLock::new(HashMap::new()),
+            url_member_resolver: RwLock::new(None),
+            url_states: RwLock::new(HashMap::new()),
+            url_collections: RwLock::new(HashMap::new()),
+            url_check_ips: RwLock::new(HashMap::new()),
         }
     }
 
@@ -366,6 +427,12 @@ impl AliveDialerSet {
 
     pub fn set_ebpf_callback(&self, cb: EbpfAliveCallback) {
         *self.ebpf_callback.write() = Some(cb);
+    }
+
+    /// Install the callback fired when a node's state flips alive→dead
+    /// (see [`DeathCallback`]). Re-callable; pass `None` to remove.
+    pub fn set_death_callback(&self, cb: Option<DeathCallback>) {
+        *self.death_callback.write() = cb;
     }
 
     /// Install the node name → eBPF outbound index resolver used by
@@ -594,6 +661,9 @@ impl AliveDialerSet {
             let still_alive = self.read_state(node_id, idx).alive;
             if !still_alive {
                 self.push_ebpf(node_id, domain, ipver, false);
+                if let Some(ref cb) = *self.death_callback.read() {
+                    cb(node_id);
+                }
             }
         }
         let coll = self.get_or_create_collection(node_id, idx);
@@ -688,7 +758,9 @@ impl AliveDialerSet {
         self.trigger_probe(node_id);
     }
 
-    /// Whether periodic probes are stopped for this node (Go: probeBackoff.stopped).
+    /// Whether this node is in deep backoff (MAX_PROBE_BACKOFF_FAILURES
+    /// consecutive failures). Such nodes still probe on the slow
+    /// max_cooldown cadence; the flag is informational (API/diagnostics).
     /// Emergency probes can still be triggered via `notify_check_*`.
     pub fn is_probe_stopped(&self, node_id: &str, domain: ProbeDomain, ipver: IpVersion) -> bool {
         let idx = alive_index(domain, ipver);
@@ -820,9 +892,7 @@ impl AliveDialerSet {
         let idx = alive_index(domain, ipver);
         let cols = self.collections.read();
         let coll = cols.get(node_id).map(|arr| &arr[idx])?;
-        coll.latencies
-            .last_real_sample()
-            .map(|s| (s.latency, s.at))
+        coll.latencies.last_real_sample().map(|s| (s.latency, s.at))
     }
 
     /// Moving average of the recent probe samples for the same
@@ -847,6 +917,31 @@ impl AliveDialerSet {
     /// next successful measurement.
     pub fn clear_latency(&self, node_id: &str) {
         self.collections.write().remove(node_id);
+    }
+
+    /// Seed a persisted delay sample into the node's TCP-v4 latency
+    /// history (cache.db warm start). Does NOT touch alive state — probes
+    /// decide liveness; this only pre-seeds ranking data so URLTest groups
+    /// don't start cold after a restart.
+    pub fn restore_latency(&self, node_id: &str, latency: Duration, at: std::time::SystemTime) {
+        let idx = alive_index(ProbeDomain::Tcp, IpVersion::V4);
+        let coll = self.get_or_create_collection(node_id, idx);
+        coll.restore_sample(latency, at);
+    }
+
+    /// Snapshot every node's last real TCP-v4 latency sample for
+    /// persistence. Synthetic (failure) samples are excluded.
+    pub fn latency_snapshot(&self) -> Vec<(String, Duration, std::time::SystemTime)> {
+        let idx = alive_index(ProbeDomain::Tcp, IpVersion::V4);
+        let cols = self.collections.read();
+        cols.iter()
+            .filter_map(|(node, arr)| {
+                arr[idx]
+                    .latencies
+                    .last_real_sample()
+                    .map(|s| (node.clone(), s.latency, s.at))
+            })
+            .collect()
     }
 
     pub fn register_node(&self, node_id: String, address: String) {
@@ -880,9 +975,14 @@ impl AliveDialerSet {
     pub fn should_probe(&self, node_id: &str, domain: ProbeDomain, ipver: IpVersion) -> bool {
         let idx = alive_index(domain, ipver);
         let state = self.read_state(node_id, idx);
-        // Respect permanent backoff stop (Go: probeBackoff.stopped).
-        // Emergency probes bypass this via triggered checks.
-        !state.stopped && Instant::now() >= state.cooldown_until
+        // Stopped nodes (MAX_PROBE_BACKOFF_FAILURES consecutive failures)
+        // still probe, just on the slow max_cooldown cadence their backoff
+        // has grown to — never probing again would make the
+        // 2-consecutive-success recovery path unreachable and permanently
+        // kill single-member Selector groups (sing-box re-tests every
+        // interval unconditionally). Emergency probes bypass this via
+        // triggered checks.
+        Instant::now() >= state.cooldown_until
     }
 
     /// Register a URLTest group for idle-aware probe suspension.
@@ -911,6 +1011,171 @@ impl AliveDialerSet {
                 .or_default()
                 .push(group.to_string());
         }
+    }
+
+    /// Replace the whole custom check-URL table (config reload), same
+    /// shape as [`AliveDialerSet::sync_urltest_groups`]: `groups` is
+    /// `(group name, check_url)` for every group that has a custom
+    /// `check_url`. Entries for groups absent from `groups` are dropped;
+    /// per-(tag, url) probe state and latency data survive as long as the
+    /// URL itself is still in use by some group.
+    pub fn sync_group_check_urls(&self, groups: &[(String, String)]) {
+        {
+            let mut map = self.group_check_urls.write();
+            map.clear();
+            for (group, url) in groups {
+                map.insert(group.clone(), url.clone());
+            }
+        }
+        let active_urls: HashSet<String> = self.group_check_urls.read().values().cloned().collect();
+        self.url_check_ips
+            .write()
+            .retain(|url, _| active_urls.contains(url));
+        self.url_states
+            .write()
+            .retain(|(_, url), _| active_urls.contains(url));
+        self.url_collections
+            .write()
+            .retain(|(_, url), _| active_urls.contains(url));
+    }
+
+    /// Groups with a custom check URL: `(group name, url)`.
+    pub fn group_check_urls(&self) -> Vec<(String, String)> {
+        self.group_check_urls
+            .read()
+            .iter()
+            .map(|(g, u)| (g.clone(), u.clone()))
+            .collect()
+    }
+
+    /// Install the member-tag → leaf resolver used by custom-URL probing
+    /// (see the `group_check_urls` field docs).
+    pub fn set_url_member_resolver(&self, resolver: Option<UrlMemberResolver>) {
+        *self.url_member_resolver.write() = resolver;
+    }
+
+    /// Resolve a custom-URL group's members to `(tag, leaf)` pairs through
+    /// the installed resolver. Empty when no resolver is installed (tests
+    /// drive the per-url state directly).
+    pub fn url_members_for(&self, group: &str) -> Vec<(String, String)> {
+        self.url_member_resolver
+            .read()
+            .as_ref()
+            .map(|r| r(group))
+            .unwrap_or_default()
+    }
+
+    /// Whether the member is alive for a custom check URL. The key is
+    /// the member TAG (a direct member's node name, or a sub-group's
+    /// tag — sing-box RealTag semantics): the parent ranks sub-groups as
+    /// units. Members never probed default to alive (same as the global
+    /// path).
+    pub fn is_alive_for_url(&self, node_id: &str, url: &str) -> bool {
+        self.url_states
+            .read()
+            .get(&(node_id.to_string(), url.to_string()))
+            .map(|s| s.alive)
+            .unwrap_or(true)
+    }
+
+    /// Whether any probe result has been recorded for (member tag, url).
+    pub fn has_url_state(&self, node_id: &str, url: &str) -> bool {
+        self.url_states
+            .read()
+            .contains_key(&(node_id.to_string(), url.to_string()))
+    }
+
+    /// Moving-average latency for (member tag, check_url) — the ranking
+    /// metric for URLTest groups with a custom check URL.
+    pub fn get_avg_latency_for_url(&self, node_id: &str, url: &str) -> Option<Duration> {
+        let cols = self.url_collections.read();
+        let coll = cols.get(&(node_id.to_string(), url.to_string()))?;
+        let ma = coll.moving_average_duration();
+        if ma > Duration::ZERO { Some(ma) } else { None }
+    }
+
+    /// Record a successful custom-URL probe (recovery hysteresis mirrors
+    /// the global path: a dead node needs RECOVERY_SUCCESSES_NEEDED
+    /// consecutive successes to revive).
+    pub(crate) fn record_url_probe_success(&self, node_id: &str, url: &str, latency: Duration) {
+        let key = (node_id.to_string(), url.to_string());
+        {
+            let mut states = self.url_states.write();
+            let e = states.entry(key.clone()).or_insert_with(UrlProbeState::new);
+            if e.alive {
+                e.consecutive_failures = 0;
+                e.consecutive_successes = 0;
+                e.cooldown_until = Instant::now();
+            } else {
+                e.consecutive_successes += 1;
+                e.consecutive_failures = 0;
+                if e.consecutive_successes >= RECOVERY_SUCCESSES_NEEDED {
+                    e.alive = true;
+                    e.consecutive_successes = 0;
+                    e.cooldown_until = Instant::now();
+                }
+            }
+        }
+        let coll = {
+            let mut cols = self.url_collections.write();
+            cols.entry(key)
+                .or_insert_with(|| Arc::new(DialerCollection::new()))
+                .clone()
+        };
+        if self.is_alive_for_url(node_id, url) {
+            coll.mark_available(latency);
+        }
+    }
+
+    /// Record a failed custom-URL probe: TCP-probe parity — a single
+    /// failure kills the node for this URL; backoff 5s→300s with no
+    /// permanent stop.
+    pub(crate) fn record_url_probe_failure(&self, node_id: &str, url: &str) {
+        let key = (node_id.to_string(), url.to_string());
+        let mut states = self.url_states.write();
+        let e = states.entry(key).or_insert_with(UrlProbeState::new);
+        e.consecutive_successes = 0;
+        e.consecutive_failures += 1;
+        let backoff = self
+            .base_cooldown
+            .saturating_mul(2u32.pow(e.consecutive_failures.min(8)))
+            .min(self.max_cooldown);
+        e.cooldown_until = Instant::now() + backoff;
+        if e.consecutive_failures >= probe_failure_threshold(ProbeDomain::Tcp) {
+            e.alive = false;
+        }
+    }
+
+    /// Whether a (node, url) probe is due (deep backoff still probes on
+    /// the slow cadence, matching the global path).
+    fn should_probe_url(&self, node_id: &str, url: &str) -> bool {
+        self.url_states
+            .read()
+            .get(&(node_id.to_string(), url.to_string()))
+            .map(|s| Instant::now() >= s.cooldown_until)
+            .unwrap_or(true)
+    }
+
+    /// Cached resolved IPs for a custom check URL, resolving on first use
+    /// (same caching + literal-fallback semantics as the global check URL).
+    async fn check_ips_for_url(&self, url: &str) -> Vec<SocketAddr> {
+        if let Some(ips) = self.url_check_ips.read().get(url) {
+            return ips.clone();
+        }
+        let ips = match Self::parse_url_host(url) {
+            Some(hostname) => match tokio::net::lookup_host(format!("{}:80", hostname)).await {
+                Ok(addrs) => Self::merge_check_addrs(addrs.collect(), url),
+                Err(e) => {
+                    tracing::warn!("Health check URL '{}' DNS resolution failed: {}", url, e);
+                    Self::merge_check_addrs(Vec::new(), url)
+                }
+            },
+            None => Self::merge_check_addrs(Vec::new(), url),
+        };
+        self.url_check_ips
+            .write()
+            .insert(url.to_string(), ips.clone());
+        ips
     }
 
     /// Replace the whole URLTest group table (config reload).

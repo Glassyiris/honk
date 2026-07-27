@@ -418,6 +418,33 @@ group {
 }
 
 #[test]
+fn test_parse_group_check_url() {
+    let input = r#"
+group {
+    ai {
+        filter: name(keyword: 'sg')
+        policy: urltest
+        check_url: 'http://chatgpt.com/cdn-cgi/trace'
+        final: direct
+    }
+    plain {
+        filter: name(keyword: 'hk')
+        policy: urltest
+    }
+}
+"#;
+    let config = parse_dae_config(input).unwrap();
+    let g = config.groups.iter().find(|g| g.name == "ai").unwrap();
+    assert_eq!(
+        g.check_url.as_deref(),
+        Some("http://chatgpt.com/cdn-cgi/trace")
+    );
+    assert_eq!(g.final_outbound.as_deref(), Some("direct"));
+    let plain = config.groups.iter().find(|g| g.name == "plain").unwrap();
+    assert_eq!(plain.check_url, None);
+}
+
+#[test]
 fn test_group_name_filter_exact_multi_and_regex() {
     // Plain name() params are exact-match, comma-separated values OR-ed;
     // regex: gives a raw pattern (Go dae filter.go parity).
@@ -452,7 +479,15 @@ group {
         let mut v: Vec<String> = g
             .nodes
             .iter()
-            .map(|id| config.nodes.iter().find(|n| n.id == *id).unwrap().name.clone())
+            .map(|id| {
+                config
+                    .nodes
+                    .iter()
+                    .find(|n| n.id == *id)
+                    .unwrap()
+                    .name
+                    .clone()
+            })
             .collect();
         v.sort();
         v

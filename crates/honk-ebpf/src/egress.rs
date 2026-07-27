@@ -302,6 +302,11 @@ pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         return Err(TC_ACT_OK);
     }
 
+    // Broadcast/multicast (DHCPOFFER, mDNS, NetBIOS) is never conn-tracked.
+    if crate::transport::dst_is_special(pkt, link_h_len) {
+        return Err(TC_ACT_OK);
+    }
+
     // Drop NDP REDIRECT packets from localhost to prevent ND proxy interference.
     if skb_ingress_ifindex(ctx) == NOWHERE_IFINDEX && pkt.l4proto == IPPROTO_ICMPV6 {
         // ICMPv6 type is at offset: link_h_len + ipv6hdr(40) + 0(icmp6_type).
@@ -545,7 +550,7 @@ fn do_tproxy_wan_egress_tcp(
     // Write routing handoff entry for the control plane.  Only the SYN that
     // starts the connection needs one: userspace consumes handoffs once per
     // accepted connection, so per-packet writes on established flows would
-    // just churn the LRU map until the janitor sweeps them.
+    // just churn the map until the janitor sweeps them.
     if tcp_state_syn {
         let mut handoff: RoutingHandoffEntry = unsafe { mem::zeroed() };
         handoff.last_seen_ns = unsafe { bpf_ktime_get_ns() };
@@ -826,6 +831,11 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     let ret = parse_packet(ctx, link_h_len, pkt);
     if ret != 0 {
         // Unsupported or malformed traffic is left untouched.
+        return Err(TC_ACT_OK);
+    }
+
+    // Broadcast/multicast is never re-routed into daens.
+    if crate::transport::dst_is_special(pkt, link_h_len) {
         return Err(TC_ACT_OK);
     }
 

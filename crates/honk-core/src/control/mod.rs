@@ -1,8 +1,6 @@
 //! Control plane: TPROXY accept loop, routing, proxy dial, relay, graceful shutdown.
 
-pub mod bind;
 mod connection;
-pub mod core;
 pub mod dns_control;
 pub mod drain;
 pub mod janitor;
@@ -52,8 +50,7 @@ use tracing::{debug, error, info, trace, warn};
 
 pub mod commands {
     use honk_config::{Config, node::Node};
-    use std::time::Duration;
-    use tokio::sync::{mpsc, oneshot};
+    use tokio::sync::mpsc;
 
     #[derive(Debug)]
     #[allow(clippy::large_enum_variant)]
@@ -68,21 +65,8 @@ pub mod commands {
             name: String,
             nodes: Vec<Node>,
         },
-        UpdateNode(Node),
-        RemoveNode(String),
         Shutdown,
         GetStats(mpsc::Sender<super::StatsSnapshot>),
-
-        /// Set the global dial_mode (rule / global / direct).
-        SetMode(String),
-        /// Set the selected node for a Selector group at runtime.
-        SetSelectorChoice(String, String),
-        /// Test per-node TCP connect latency.
-        TestNodeDelay {
-            name: String,
-            url: Option<String>,
-            reply: oneshot::Sender<Option<Duration>>,
-        },
     }
 }
 
@@ -167,6 +151,7 @@ impl ControlPlane {
         // and resumes on the next dial). Members shared with Selector
         // groups are excluded — those are probed unconditionally.
         alive_set.sync_urltest_groups(&urltest_group_registrations(&config));
+        alive_set.sync_group_check_urls(&group_check_url_registrations(&config));
         // Node name → eBPF outbound id for OUTBOUND_CONNECTIVITY_MAP pushes,
         // numbered exactly like push_routing_to_ebpf (group i → UserBase+i).
         // Rebuilt on config reload.
@@ -179,6 +164,23 @@ impl ControlPlane {
         }
         let group_manager =
             GroupManager::with_alive_set(&config.groups, &config.nodes, Some(alive_set.clone()));
+        // Custom-URL member resolution: a group's members are probed via
+        // their current picks (delay_test_members = tag → representative
+        // leaf), so sub-group members are measured through whatever leaf
+        // they currently select, and the tag keeps the result. The cell
+        // keeps working across reloads (the manager inside is swapped).
+        let group_manager = group_manager.into_shared();
+        {
+            let gm_cell = group_manager.clone();
+            alive_set.set_url_member_resolver(Some(Arc::new(move |group: &str| {
+                gm_cell
+                    .read()
+                    .delay_test_members(group)
+                    .into_iter()
+                    .map(|(tag, node)| (tag, node.name))
+                    .collect()
+            })));
+        }
 
         let ebpf_arc = Arc::new(RwLock::new(ebpf));
         let router_arc = Arc::new(RwLock::new(router));
@@ -197,7 +199,7 @@ impl ControlPlane {
             proxy_registry,
             dns_resolver: Arc::new(dns_resolver),
             dns_controller,
-            group_manager: group_manager.into_shared(),
+            group_manager,
             stats: Arc::new(StatsManager::new()),
             drain_tracker: Arc::new(DrainTracker::new()),
             udp_pool: Arc::new(UdpEndpointPool::new()),
@@ -259,6 +261,49 @@ impl ControlPlane {
             .set_persist_callback(Some(Arc::new(move |group, node| {
                 db_cb.save_selector_choice(group, node);
             })));
+
+        // Delay-history persistence (sing-box URLTest history storage
+        // parity): restore the last real delay sample per node so URLTest
+        // groups don't start cold after a restart, then mirror fresh
+        // samples back every minute. Liveness is NOT restored — probes
+        // re-decide that; stale entries (>24h) are dropped on load.
+        {
+            const DELAY_SAMPLE_MAX_AGE_SECS: u64 = 24 * 3600;
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let samples = db.load_delay_samples(now_unix, DELAY_SAMPLE_MAX_AGE_SECS);
+            let mut restored = 0usize;
+            for (node, delay_ms, measured_at) in samples {
+                self.alive_set.restore_latency(
+                    &node,
+                    std::time::Duration::from_millis(delay_ms),
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(measured_at),
+                );
+                restored += 1;
+            }
+            if restored > 0 {
+                info!("cache.db: restored {} persisted delay sample(s)", restored);
+            }
+            let db_delay = db.clone();
+            let alive_for_delay = self.alive_set.clone();
+            let delay_task = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                interval.tick().await; // first snapshot after one period
+                loop {
+                    for (node, latency, at) in alive_for_delay.latency_snapshot() {
+                        let measured_at = at
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        db_delay.save_delay_sample(&node, latency.as_millis() as u64, measured_at);
+                    }
+                    interval.tick().await;
+                }
+            });
+            self.background_tasks.lock().await.push(delay_task);
+        }
 
         // store_dns: restore persisted DNS answers into the shared DNS
         // cache, then mirror future answers into cache.db through a
@@ -417,6 +462,42 @@ impl ControlPlane {
             tasks.push(janitor.spawn());
             info!("BPF map janitor started");
 
+            // Retire conntrack entries as UDP endpoints die (event-driven
+            // lifecycle; the datapath/janitor timeouts remain the backstop),
+            // and drop the flow from the clash-API tracker.
+            let (remove_tx, mut remove_rx) = tokio::sync::mpsc::unbounded_channel::<(
+                std::net::SocketAddr,
+                std::net::SocketAddr,
+                Option<String>,
+            )>();
+            self.udp_pool.set_remove_sink(remove_tx);
+            let ebpf = self.ebpf.clone();
+            let tracker = self.connection_tracker.clone();
+            tasks.push(tokio::spawn(async move {
+                while let Some((client, dst, conn_id)) = remove_rx.recv().await {
+                    if let Some(id) = conn_id {
+                        tracker.remove(&id);
+                    }
+                    let fwd = crate::control::connection::build_tuples_key(
+                        dst.ip(),
+                        dst.port(),
+                        client.ip(),
+                        client.port(),
+                        17, // UDP
+                    );
+                    let mut rev = fwd;
+                    std::mem::swap(&mut rev.src_ip, &mut rev.dst_ip);
+                    std::mem::swap(&mut rev.src_port, &mut rev.dst_port);
+                    let mut ebpf = ebpf.write().await;
+                    for key in [&fwd, &rev] {
+                        if ebpf.udp_conn_state_remove(key).is_ok() {
+                            crate::ebpf::USERSPACE_CONN_STATE_DELETES
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
+            }));
+
             tasks.push(self.udp_pool.spawn_janitor());
 
             tasks.push(self.sniffer_pool.spawn_janitor());
@@ -457,7 +538,6 @@ impl ControlPlane {
                     let prober = Arc::new(ProxyHttpProber::new(
                         self.config.clone(),
                         self.proxy_registry.clone(),
-                        check_url.clone(),
                         check_method.clone(),
                     ));
                     alive_set
@@ -548,6 +628,27 @@ impl ControlPlane {
                     }
                 });
             }));
+            // Connection-lifecycle hook: when a node flips alive→dead,
+            // purge its pooled connections (bare + ready) and reap the UDP
+            // endpoints bound to it — both would otherwise keep serving a
+            // doomed node until their idle timeouts expire.
+            {
+                let pool = self.connection_pool.clone();
+                let udp_pool = self.udp_pool.clone();
+                let config_for_purge = self.config.clone();
+                alive_set.set_death_callback(Some(Box::new(move |node_name: &str| {
+                    udp_pool.remove_by_node(node_name);
+                    let node_addr = config_for_purge.try_read().ok().and_then(|c| {
+                        c.nodes
+                            .iter()
+                            .find(|n| n.name == node_name)
+                            .map(|n| format!("{}:{}", n.host(), n.port))
+                    });
+                    if let Some(addr) = node_addr {
+                        pool.purge_node(&addr);
+                    }
+                })));
+            }
             let period = std::time::Duration::from_secs(interval_secs);
             let handle = alive_set.spawn_health_check_loop(period, check_timeout);
             self.background_tasks.lock().await.push(handle);
@@ -817,37 +918,10 @@ impl ControlPlane {
                             // both commands queue on this single channel.
                             self.apply_runtime_config(new_config, &drain).await;
                         }
-                        Some(ControlCommand::UpdateNode(node)) => {
-                            info!("Updating node: {}", node.name);
-                            let mut config = self.config.write().await;
-                            if let Some(existing) = config.nodes.iter_mut().find(|n| n.id == node.id) {
-                                *existing = node;
-                            } else { config.nodes.push(node); }
-                        }
-                        Some(ControlCommand::RemoveNode(id)) => {
-                            info!("Removing node: {}", id);
-                            let mut config = self.config.write().await;
-                            config.nodes.retain(|n| n.id.to_string() != id);
-                        }
                         Some(ControlCommand::GetStats(tx)) => {
                             let snap = self.stats.snapshot();
                             let total = snap.values().map(|s| s.total_conns as u64).sum();
                             let _ = tx.send(StatsSnapshot { per_outbound: snap, total_connections: total }).await;
-                        }
-                        Some(ControlCommand::SetMode(mode)) => {
-                            info!("Setting global dial_mode to '{}'", mode);
-                            let mut config = self.config.write().await;
-                            config.global.dial_mode = mode;
-                        }
-                        Some(ControlCommand::SetSelectorChoice(group, node)) => {
-                            info!("Setting selector group '{}' to node '{}'", group, node);
-                            self.group_manager
-                                .read()
-                                .set_selector_choice(&group, &node);
-                        }
-                        Some(ControlCommand::TestNodeDelay { name, url, reply }) => {
-                            let latency = self.test_node_delay(&name, url.as_deref()).await;
-                            let _ = reply.send(latency);
                         }
                         Some(ControlCommand::Shutdown) | None => {
                             info!("Control plane shutting down, draining {} active connections",
@@ -936,35 +1010,5 @@ impl ControlPlane {
             push_result.domain_bitmaps.len()
         );
         Ok(push_result)
-    }
-
-    /// Test TCP connect latency to a node using the node's configured address:port.
-    /// Returns `Some(duration)` on success, `None` on failure.
-    async fn test_node_delay(
-        &self,
-        node_name: &str,
-        url: Option<&str>,
-    ) -> Option<std::time::Duration> {
-        let config = self.config.read().await;
-        let node = config.nodes.iter().find(|n| n.name == node_name).cloned();
-        let delay_timeout = std::time::Duration::from_millis(config.global.connect_timeout_ms);
-        drop(config);
-
-        let node = node?;
-        let addr = if let Some(u) = url {
-            u.to_string()
-        } else {
-            format!("{}:{}", node.host(), node.port)
-        };
-
-        let start = std::time::Instant::now();
-        match tokio::time::timeout(delay_timeout, tokio::net::TcpStream::connect(addr)).await {
-            Ok(Ok(stream)) => {
-                let elapsed = start.elapsed();
-                drop(stream);
-                Some(elapsed)
-            }
-            _ => None,
-        }
     }
 }

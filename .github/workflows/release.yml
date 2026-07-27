@@ -15,7 +15,7 @@ jobs:
     name: cargo test (workspace)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - name: Install boring-sys build deps (cmake + libclang for bindgen)
         run: |
@@ -52,7 +52,7 @@ jobs:
           - aarch64-unknown-linux-gnu
           - aarch64-unknown-linux-musl
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust stable (with target)
         uses: dtolnay/rust-toolchain@stable
@@ -62,7 +62,7 @@ jobs:
       - name: Install Rust nightly (for the eBPF object)
         uses: dtolnay/rust-toolchain@nightly
         with:
-          components: rust-src
+          components: rust-src, llvm-tools
 
       - name: Install system dependencies
         run: |
@@ -141,7 +141,7 @@ jobs:
           tar -czf "$name.tar.gz" -C dist "$name"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: honk-core-${{ matrix.target }}
           path: honk-core-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
@@ -153,7 +153,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: dist
           merge-multiple: true

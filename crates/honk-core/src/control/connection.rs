@@ -101,37 +101,45 @@ pub(super) fn is_tcp_stream_alive(stream: &TcpStream) -> bool {
     ret == 0 && err == 0
 }
 
-impl ControlPlaneHandle {
-    fn build_tuples_key(
-        dst_ip: std::net::IpAddr,
-        dst_port: u16,
-        src_ip: std::net::IpAddr,
-        src_port: u16,
-        l4proto: u8,
-    ) -> TuplesKey {
-        let mut key = TuplesKey::default();
-        match dst_ip {
-            std::net::IpAddr::V4(ip) => {
-                key.dst_ip[10] = 0xff;
-                key.dst_ip[11] = 0xff;
-                key.dst_ip[12..16].copy_from_slice(&ip.octets());
-            }
-            std::net::IpAddr::V6(ip) => key.dst_ip.copy_from_slice(&ip.octets()),
+/// Build the eBPF conntrack key for a flow: IPs as 16-byte v4-mapped
+/// addresses, ports in host byte order, `l4proto` as the IANA number.
+pub(crate) fn build_tuples_key(
+    dst_ip: std::net::IpAddr,
+    dst_port: u16,
+    src_ip: std::net::IpAddr,
+    src_port: u16,
+    l4proto: u8,
+) -> TuplesKey {
+    // mem::zeroed, NOT TuplesKey::default(): the struct has 3 implicit
+    // padding bytes after l4proto (37 field bytes in a 40-byte repr(C)
+    // layout), and Rust does not guarantee padding is zeroed on field-wise
+    // initialization.  The kernel hashes all 40 key bytes, and the datapath
+    // writes keys from a zeroed scratch buffer — a garbage-padded userspace
+    // key never matches (lookups/deletes silently ENOENT).
+    let mut key: TuplesKey = unsafe { std::mem::zeroed() };
+    match dst_ip {
+        std::net::IpAddr::V4(ip) => {
+            key.dst_ip[10] = 0xff;
+            key.dst_ip[11] = 0xff;
+            key.dst_ip[12..16].copy_from_slice(&ip.octets());
         }
-        match src_ip {
-            std::net::IpAddr::V4(ip) => {
-                key.src_ip[10] = 0xff;
-                key.src_ip[11] = 0xff;
-                key.src_ip[12..16].copy_from_slice(&ip.octets());
-            }
-            std::net::IpAddr::V6(ip) => key.src_ip.copy_from_slice(&ip.octets()),
-        }
-        key.dst_port = dst_port;
-        key.src_port = src_port;
-        key.l4proto = l4proto;
-        key
+        std::net::IpAddr::V6(ip) => key.dst_ip.copy_from_slice(&ip.octets()),
     }
+    match src_ip {
+        std::net::IpAddr::V4(ip) => {
+            key.src_ip[10] = 0xff;
+            key.src_ip[11] = 0xff;
+            key.src_ip[12..16].copy_from_slice(&ip.octets());
+        }
+        std::net::IpAddr::V6(ip) => key.src_ip.copy_from_slice(&ip.octets()),
+    }
+    key.dst_port = dst_port;
+    key.src_port = src_port;
+    key.l4proto = l4proto;
+    key
+}
 
+impl ControlPlaneHandle {
     /// Look up the eBPF routing handoff entry for a connection, consuming it.
     ///
     /// Only a read lock is taken: `routing_handoff_take` performs raw bpf()
@@ -260,7 +268,7 @@ impl ControlPlaneHandle {
             return Ok(());
         }
 
-        let tuples = Self::build_tuples_key(
+        let tuples = build_tuples_key(
             original_dst.ip(),
             original_dst.port(),
             client_addr.ip(),
@@ -362,12 +370,25 @@ impl ControlPlaneHandle {
         // Router. `must` marks dae `(must)`-rule results (handoff must flag
         // or a must-matched userspace rule) — final decisions exempt from
         // the clash mode override below.
+        //
+        // Domain dial modes (domain / domain+ / domain++): an eBPF decision
+        // made without domain knowledge (e.g. fallback direct for an
+        // unlearned IP) is preliminary — once a domain is sniffed (and, in
+        // `domain` mode, verified), re-run the userspace router with it so
+        // domain rules apply.  must and block results stay final; only Ip
+        // mode takes the handoff decision as-is.
+        let reroute_by_sniffed_domain = !matches!(dial_mode, DialMode::Ip)
+            && domain.is_some()
+            && handoff
+                .as_ref()
+                .is_some_and(|ho| ho.must == 0 && ho.outbound != OutboundIndex::Block as u8);
         let (outbound_name, must) = if let Some(ref ho) = handoff {
             debug!(
                 "eBPF handoff: outbound={}, mark=0x{:x}, dscp={}",
                 ho.outbound, ho.mark, ho.dscp
             );
-            if ho.outbound == OutboundIndex::ControlPlaneRouting as u8 {
+            if ho.outbound == OutboundIndex::ControlPlaneRouting as u8 || reroute_by_sniffed_domain
+            {
                 let router = self.router.read().await;
                 let (name, must) = router.route_with_must(&conn_info);
                 (name.to_string(), must)
@@ -683,6 +704,11 @@ impl ControlPlaneHandle {
                                     ProbeDomain::Tcp,
                                     ipver,
                                 );
+                                // sing-box `DeleteURLTestHistory` parity:
+                                // un-rank the node immediately so URLTest
+                                // groups re-select on the next connection
+                                // instead of waiting for the probe cycle.
+                                ctx.alive_set.clear_latency(&node.name);
                                 ctx.alive_set.notify_check_tcp(&node.name);
                                 let msg = e.to_string();
                                 if msg.starts_with("dial timed out after") {
@@ -826,12 +852,12 @@ impl ControlPlaneHandle {
 
         let conn_id = uuid::Uuid::new_v4().to_string();
         // Clash-shaped matched rule + dial chain for /connections: rule and
-        // rulePayload describe the RULE (type + own payload, "Match" =
+        // rulePayload describe the RULE (type + own payload, "Fallback" =
         // fallback), while metadata.host keeps the connection's domain.
         // chains is the selection path leaf-first ([leaf, .., topGroup]).
         let (rule, rule_payload) = matched_rule
             .clone()
-            .unwrap_or_else(|| ("Match".to_string(), String::new()));
+            .unwrap_or_else(|| ("Fallback".to_string(), String::new()));
         let chains = {
             let gm = self.group_manager.read();
             let mut chain = gm.selection_chain(&outbound_name);
@@ -1009,6 +1035,31 @@ impl ControlPlaneHandle {
             }
         }
 
+        // Event-driven lifecycle: the userspace relay has ended, so this
+        // flow's conntrack entries are dead state — retire both directions
+        // now instead of leaving them to the datapath/janitor timeouts
+        // (the model dae's SessionManager releaseFlow uses).  Late FIN/ACK
+        // stragglers hitting an empty entry simply pass through, which is
+        // harmless for a closed flow.
+        let mut reversed = tuples;
+        std::mem::swap(&mut reversed.src_ip, &mut reversed.dst_ip);
+        std::mem::swap(&mut reversed.src_port, &mut reversed.dst_port);
+        {
+            let mut ebpf = self.ebpf.write().await;
+            let mut removed = 0u32;
+            for key in [&tuples, &reversed] {
+                if ebpf.tcp_conn_state_remove(key).is_ok() {
+                    removed += 1;
+                    crate::ebpf::USERSPACE_CONN_STATE_DELETES
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            debug!(
+                "conn-state retire: {} -> {} removed {} entr(ies)",
+                client_addr, resolved_target, removed
+            );
+        }
+
         if let (Some(ref ho), Some(ref domain)) = (handoff, sniff_result.domain)
             && (ho.outbound >= OutboundIndex::UserBase as u8
                 || ho.outbound == OutboundIndex::Direct as u8)
@@ -1160,11 +1211,12 @@ impl ControlPlaneHandle {
             }
             ep.mark_sent();
             ep.refresh();
+            ep.tracker_upload(data.len() as u64);
             ep.proxy_socket.send_to(&data, ep.relay_addr).await?;
             return Ok(());
         }
 
-        let tuples = Self::build_tuples_key(
+        let tuples = build_tuples_key(
             original_dst.ip(),
             original_dst.port(),
             client_addr.ip(),
@@ -1207,6 +1259,14 @@ impl ControlPlaneHandle {
         // Clash mode override (Direct/Global); must/block results are never
         // overridden — same semantics as the TCP path.
         let outbound_name = self.apply_mode_override(outbound_name, must).await;
+
+        // Matched-rule identity for the /connections display (same as TCP).
+        let matched_rule = {
+            let router = self.router.read().await;
+            router
+                .route_full(&conn_info)
+                .map(|m| (m.rule_type.to_string(), m.rule_payload.to_string()))
+        };
 
         self.stats.record_connection(&outbound_name);
 
@@ -1277,6 +1337,44 @@ impl ControlPlaneHandle {
                     endpoint.record_pending_reply_peer(proxy.relay_addr);
                     endpoint.cache_routing_result(original_dst, outbound_index);
 
+                    // Register the flow in the clash-API tracker once per
+                    // endpoint (one endpoint == one UDP "connection"), with
+                    // live byte counters shared by the send/reply paths.
+                    if is_new {
+                        let conn_id = uuid::Uuid::new_v4().to_string();
+                        let (rule, rule_payload) = matched_rule
+                            .clone()
+                            .unwrap_or_else(|| ("Fallback".to_string(), String::new()));
+                        let chains = {
+                            let gm = self.group_manager.read();
+                            let mut chain = gm.selection_chain(&outbound_name);
+                            if chain.last() != Some(&node.name) {
+                                chain.push(node.name.clone());
+                            }
+                            chain.reverse();
+                            chain
+                        };
+                        let (conn_upload, conn_download) = endpoint.byte_counters();
+                        self.connection_tracker.register(
+                            crate::connection_tracker::ConnectionEntry {
+                                id: conn_id.clone(),
+                                source: client_addr.to_string(),
+                                destination: original_dst.to_string(),
+                                proxy: node.name.clone(),
+                                rule,
+                                rule_payload,
+                                chains,
+                                upload: conn_upload,
+                                download: conn_download,
+                                start_time: std::time::Instant::now(),
+                                domain: quic_domain.clone(),
+                                network: "udp".to_string(),
+                            },
+                        );
+                        endpoint.set_tracker(conn_id);
+                    }
+                    endpoint.tracker_upload(client_to_proxy);
+
                     if is_new {
                         UdpEndpointPool::spawn_reply_handler(
                             endpoint,
@@ -1303,6 +1401,10 @@ impl ControlPlaneHandle {
                         ProbeDomain::DataUdp,
                         ipver,
                     );
+                    // sing-box `DeleteURLTestHistory` parity: un-rank the
+                    // node immediately for the next selection (see the TCP
+                    // dial path).
+                    self.alive_set.clear_latency(&node.name);
                     self.alive_set.notify_check_tcp(&node.name);
                 }
             }
@@ -1336,6 +1438,15 @@ impl ControlPlaneHandle {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<crate::proxy::ProxyStream> {
+        // The built-in block node shares NodeProtocol::HTTP with direct;
+        // reject here before find() resolves it to DirectHandler (and before
+        // any pool lookup under its meaningless ":0" address).
+        if node.name == "block" {
+            use crate::proxy::ProxyHandler as _;
+            return crate::proxy::block::BlockHandler::new()
+                .dial(node, target, target_domain, connect_timeout)
+                .await;
+        }
         static POOL_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let pool_disabled = *POOL_DISABLED.get_or_init(|| {
             std::env::var("HONK_POOL_DISABLE")

@@ -116,7 +116,12 @@ The fields below are what a parsed node carries. In dae syntax they are **derive
 | `network` | string? | null | V2Ray-style network hint |
 | `ws_path` / `ws_host` | string? | null | WebSocket (share-link `path=`/`host=`) |
 | `grpc_service` | string? | null | gRPC service name (`serviceName=`) |
-| `hy2_auth` / `hy2_obfs` | string? | null | Hysteria2 |
+| `hy2_auth` / `hy2_obfs` | string? | null | Hysteria2 auth / salamander obfs password |
+| `hy2_up_mbps` / `hy2_down_mbps` | u32? | null | Hysteria2 brutal bandwidth (`upmbps`/`downmbps`) |
+| `hy2_port_hopping` / `hy2_hop_interval` | string? / u64? | null | Hysteria2 port hopping (`mport`/`mhop`) |
+| `hy2_init_stream_recv_window` / `hy2_init_conn_recv_window` | u64? | null | Hysteria2 QUIC receive windows |
+| `hy2_disable_mtu_discovery` | bool? | null | Hysteria2 `disablePathMTUDiscovery` |
+| `tls_pin_sha256` | string? | null | Leaf cert SHA-256 pin (`pinSHA256=`) |
 | `tuic_uuid` / `tuic_password` / `tuic_congestion` | string? | null | TUIC |
 | `juicity_uuid` / `juicity_password` | string? | null | Juicity |
 | `anytls_password` | string? | null | AnyTLS secret |
@@ -143,7 +148,7 @@ The fields below are what a parsed node carries. In dae syntax they are **derive
 | `vless` | | Yes | No | Header UDP exists in tests only |
 | `socks5` | | Yes | Yes | UDP ASSOCIATE |
 | `http` | | Yes* | — | Mapped through direct-style dial |
-| `hysteria2` | | Yes | Yes | Real QUIC/H3; salamander; BBR (no brutal) |
+| `hysteria2` | | Yes | Yes | Real QUIC/H3; salamander; brutal (with bandwidth) or BBR; port hopping |
 | `tuic` | | Yes | Yes | TUIC v5 / quinn |
 | `juicity` | | Yes | Yes | quinn bi-stream UDP |
 | `anytls` | | Yes | Yes | Session pool + UoT v2 |
@@ -201,7 +206,13 @@ node {
 
 **Hysteria2 / TUIC / Juicity**
 
-Prefer share links; the `hy2_*` / `tuic_*` / `juicity_*` fields are derived from them. QUIC ALPN/congestion follow handler defaults (Hy2 uses BBR).
+Prefer share links; the `hy2_*` / `tuic_*` / `juicity_*` fields are derived from them. QUIC ALPN/congestion follow handler defaults (Hy2 uses BBR without bandwidth hints). For hysteria2 the userinfo carries the auth secret (→ `hy2_auth`), `obfs=salamander&obfs-password=<pwd>` maps to `hy2_obfs`, `upmbps`/`downmbps` enable the brutal sender and the `Hysteria-CC-RX` advertisement, `mport`/`mhop` enable client-side port hopping (the server must DNAT the range onto its listen port), `pinSHA256=<hex>` pins the leaf certificate fingerprint (replacing PKI/hostname checks), and `initStreamReceiveWindow`/`initConnReceiveWindow`/`disablePathMTUDiscovery` tune the QUIC transport:
+
+```dae
+node {
+    hy2: 'hysteria2://secret@example.com:443?sni=example.com&insecure=1&obfs=salamander&obfs-password=obfspw&upmbps=50&downmbps=200&mport=20000-30000&mhop=30#hy2'
+}
+```
 
 ### Share-link schemes
 
@@ -250,6 +261,7 @@ group {
 | — | `check_url` | null | Override global TCP check URL; not parsed in dae syntax |
 | — | `check_interval` | null | Override interval (s); not parsed in dae syntax |
 | — | `tolerance` | `50` | URLTest hysteresis (ms); `0` = any better; not parsed in dae syntax |
+| `check_url` | — | (global) | Per-group health check target (URLTest groups only, sing-box urltest `url`); dae: `check_url: 'http://...'` |
 | — | `idle_timeout` | null | Stop checks after idle seconds; 0/None = never; not parsed in dae syntax |
 | — | `interrupt_connections` | `false` | Drop flows on selection change; not parsed in dae syntax |
 | — | `created_at` | now | Metadata |
@@ -559,8 +571,12 @@ Configured via `global { ... }` keys (`tcp_check_url`, `udp_check_dns`, `check_i
 | Domains | Tcp, DnsUdp, DataUdp × v4/v6 |
 | TCP probe | HTTP method to `tcp_check_url` or raw connect |
 | UDP probe | DNS to first usable `udp_check_dns` via node `dial_udp` |
+| Per-group check URL | Groups with `check_url` probe members against it (sub-group members via their current pick, keyed by tag — sing-box RealTag); (tag, url) state independent of the global one — dead-for-this-URL excludes the member from that group only |
 | Concurrency | Default batch 10 |
 | Recovery | 2 consecutive successes |
+| Deep backoff | After 10 consecutive failures, probing continues at the max-cooldown (300s) cadence — no permanent stop |
+| Dial failure | Latency history cleared immediately (sing-box `DeleteURLTestHistory`); a node's pooled connections and UDP endpoints are purged when it flips alive→dead |
+| Delay persistence | Last real delay sample per node saved to cache.db (60s writer), restored at startup, 24h age-out |
 | New node grace | ~60s |
 | URLTest idle | `idle_timeout` stops probes for unused groups |
 | eBPF push | Dead outbounds excluded from redirect |

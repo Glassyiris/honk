@@ -205,35 +205,29 @@ impl ConnectionPool {
         );
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn preconnect_arc(pool: &Arc<Self>, addr: String, count: usize) {
-        let pool = Arc::clone(pool);
-        tokio::spawn(async move {
-            for _ in 0..count {
-                match honk_outbound::util::connect_outbound(&addr, Duration::from_secs(10)).await {
-                    Ok(stream) => pool.deposit_tcp(&addr, stream).await,
-                    Err(e) => {
-                        debug!("Preconnect to {} failed: {}", addr, e);
-                        break;
-                    }
-                }
+    /// Drop every pooled connection tied to a proxy node: the bare
+    /// `"host:port"` key plus all `ready|<node_addr>|…` entries. Called
+    /// when the node flips alive→dead — a pooled-but-doomed stream must
+    /// never be handed out (idle/max-age expiry would otherwise keep
+    /// serving it for up to 60s).
+    pub(crate) fn purge_node(&self, node_addr: &str) {
+        let ready_prefix = format!("ready|{}|", node_addr);
+        let mut removed = 0u64;
+        self.entries.retain(|key, arc| {
+            if key == node_addr || key.starts_with(&ready_prefix) {
+                removed += arc.lock().unwrap().len() as u64;
+                false
+            } else {
+                true
             }
         });
-    }
-
-    #[allow(dead_code)]
-    pub(crate) async fn evict_host(&self, addr: &str) {
-        if let Some((_key, arc)) = self.entries.remove(addr) {
-            let count = arc.lock().unwrap().len();
-            self.total_entries
-                .fetch_sub(count as u64, Ordering::Relaxed);
-            trace!("Evicted {} pooled connections for {}", count, addr);
+        if removed > 0 {
+            self.total_entries.fetch_sub(removed, Ordering::Relaxed);
+            debug!(
+                "Purged {} pooled connections for dead node {}",
+                removed, node_addr
+            );
         }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn total_pooled(&self) -> u64 {
-        self.total_entries.load(Ordering::Relaxed)
     }
 
     pub(crate) async fn prune_expired(&self) -> usize {
@@ -418,25 +412,9 @@ mod tests {
 
         let stream = TcpStream::connect(&addr).await.unwrap();
         pool.deposit_tcp(&addr, stream).await;
-        assert_eq!(pool.total_pooled(), 1);
 
         let acquired = pool.acquire_tcp(&addr).await;
         assert!(acquired.is_some());
-        assert_eq!(pool.total_pooled(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_pool_evict_host() {
-        let pool = ConnectionPool::new();
-        let addr = spawn_hold_open_listener().await.to_string();
-
-        let s = TcpStream::connect(&addr).await.unwrap();
-        pool.deposit_tcp(&addr, s).await;
-        assert_eq!(pool.total_pooled(), 1);
-
-        pool.evict_host(&addr).await;
-        assert_eq!(pool.total_pooled(), 0);
-        assert!(pool.acquire_tcp(&addr).await.is_none());
     }
 
     #[tokio::test]
@@ -449,7 +427,12 @@ mod tests {
                 pool.deposit_tcp(&addr, s).await;
             }
         }
-        assert!(pool.total_pooled() <= MAX_PER_HOST as u64);
+        // Only MAX_PER_HOST entries are retained; the rest can be acquired
+        // and then the pool is empty.
+        for _ in 0..MAX_PER_HOST {
+            assert!(pool.acquire_tcp(&addr).await.is_some());
+        }
+        assert!(pool.acquire_tcp(&addr).await.is_none());
     }
 
     #[tokio::test]
@@ -464,11 +447,9 @@ mod tests {
         let tcp = TcpStream::connect(server_addr).await.unwrap();
         pool.deposit_ready(&key, make_ready_stream(tcp, target))
             .await;
-        assert_eq!(pool.total_pooled(), 1);
 
         let ready = pool.acquire_ready(&key).await.expect("ready entry");
         assert_eq!(ready.target_addr, target);
-        assert_eq!(pool.total_pooled(), 0);
         // A checkout removes the entry: a second acquire must miss.
         assert!(pool.acquire_ready(&key).await.is_none());
         drop(ready);
@@ -502,7 +483,6 @@ mod tests {
             .await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(pool.acquire_ready(&key).await.is_none());
-        assert_eq!(pool.total_pooled(), 0);
 
         // Bare entries still use the default 60s TTL and survive.
         let bare_tcp = TcpStream::connect(server_addr).await.unwrap();
@@ -541,7 +521,6 @@ mod tests {
         let key = ConnectionPool::ready_key("proxy.example:1080", target, None);
         pool.deposit_ready(&key, stream).await;
         assert!(pool.acquire_ready(&key).await.is_none());
-        assert_eq!(pool.total_pooled(), 0);
     }
 
     /// End-to-end: a SOCKS5 stream pooled after a full dial is reused
@@ -647,5 +626,39 @@ mod tests {
         // payload — proving no greeting/CONNECT was sent on reuse.
         assert_eq!(conn_count.load(Ordering::Relaxed), 1);
         assert_eq!(payload_ok.load(Ordering::Relaxed), 1);
+    }
+
+    /// A dead node's bare AND ready entries must all be purged; other
+    /// nodes' entries stay.
+    #[tokio::test]
+    async fn test_purge_node_removes_bare_and_ready() {
+        let pool = ConnectionPool::new();
+        let server = spawn_hold_open_listener().await;
+        let dead_addr = "dead.example:1080";
+        let other_addr = "other.example:1080";
+        let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
+
+        for addr in [dead_addr, other_addr] {
+            let tcp = TcpStream::connect(server).await.unwrap();
+            pool.deposit_tcp(addr, tcp).await;
+            let key = ConnectionPool::ready_key(addr, target, None);
+            let tcp = TcpStream::connect(server).await.unwrap();
+            pool.deposit_ready(&key, make_ready_stream(tcp, target))
+                .await;
+        }
+        pool.purge_node(dead_addr);
+        assert!(pool.acquire_tcp(dead_addr).await.is_none());
+        assert!(
+            pool.acquire_ready(&ConnectionPool::ready_key(dead_addr, target, None))
+                .await
+                .is_none()
+        );
+        // Other node untouched.
+        assert!(pool.acquire_tcp(other_addr).await.is_some());
+        assert!(
+            pool.acquire_ready(&ConnectionPool::ready_key(other_addr, target, None))
+                .await
+                .is_some()
+        );
     }
 }

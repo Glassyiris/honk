@@ -36,9 +36,7 @@ pub struct Node {
     pub id: uuid::Uuid,
     pub name: String,
     pub protocol: NodeProtocol,
-    /// Server address (host:port)
     pub address: String,
-    /// Server host
     #[serde(default)]
     pub host: String,
     pub port: u16,
@@ -93,6 +91,33 @@ pub struct Node {
     /// Hysteria2 obfuscation
     #[serde(default)]
     pub hy2_obfs: Option<String>,
+    /// Hysteria2 upload bandwidth in Mbps; enables the brutal sender when set
+    #[serde(default)]
+    pub hy2_up_mbps: Option<u32>,
+    /// Hysteria2 download bandwidth in Mbps (advertised via `Hysteria-CC-RX`)
+    #[serde(default)]
+    pub hy2_down_mbps: Option<u32>,
+    /// Hysteria2 port hopping list (`mport`: "20000-30000" or "p1,p2,...")
+    #[serde(default)]
+    pub hy2_port_hopping: Option<String>,
+    /// Hysteria2 port hopping interval in seconds (`mhop`, default 30)
+    #[serde(default)]
+    pub hy2_hop_interval: Option<u64>,
+    /// SHA-256 fingerprint of the peer leaf certificate (hex); replaces PKI
+    /// and hostname verification when set (`pinSHA256`)
+    #[serde(default)]
+    pub tls_pin_sha256: Option<String>,
+    /// Hysteria2 initial stream receive window in bytes
+    /// (`initStreamReceiveWindow`)
+    #[serde(default)]
+    pub hy2_init_stream_recv_window: Option<u64>,
+    /// Hysteria2 initial connection receive window in bytes
+    /// (`initConnReceiveWindow`)
+    #[serde(default)]
+    pub hy2_init_conn_recv_window: Option<u64>,
+    /// Hysteria2: disable QUIC path MTU discovery (`disablePathMTUDiscovery`)
+    #[serde(default)]
+    pub hy2_disable_mtu_discovery: Option<bool>,
     /// TUIC UUID
     #[serde(default)]
     pub tuic_uuid: Option<String>,
@@ -129,16 +154,12 @@ pub struct Node {
     /// Tags for classification
     #[serde(default)]
     pub tags: Vec<String>,
-    /// Subscription ID this node belongs to
     #[serde(default)]
     pub subscription_id: Option<uuid::Uuid>,
-    /// Group ID this node belongs to
     #[serde(default)]
     pub group_id: Option<uuid::Uuid>,
-    /// Created at
     #[serde(default = "chrono::Utc::now")]
     pub created_at: chrono::DateTime<chrono::Utc>,
-    /// Updated at
     #[serde(default = "chrono::Utc::now")]
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -148,12 +169,6 @@ fn default_transport() -> String {
 }
 
 impl Node {
-    /// Build the node's connection URL string.
-    /// Returns something like "ss://..." or "trojan://..."
-    pub fn to_uri(&self) -> String {
-        format!("{}://{}:{}", self.protocol.as_str(), self.host(), self.port)
-    }
-
     /// Get the effective host (use host field or parse from address).
     pub fn host(&self) -> &str {
         if self.host.is_empty() {
@@ -166,7 +181,8 @@ impl Node {
 
 /// A group of nodes for load balancing / failover.
 ///
-/// Modeled after sing-box's outbound groups: Selector (manual) and URLTest (auto).
+/// Modeled after sing-box's outbound groups: Selector (manual), URLTest
+/// (auto), LoadBalance (round-robin) and Fallback (first alive, sticky).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Group {
     #[serde(default = "uuid::Uuid::new_v4")]

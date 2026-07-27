@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -39,6 +39,7 @@ use tracing::debug;
 
 use crate::quic::{QuicBiStream, QuicClient};
 
+use super::addr::{self, SocksAddr};
 use super::{ProxyHandler, ProxyStream, UdpProxySocket};
 
 const TUIC_VERSION: u8 = 0x05;
@@ -49,9 +50,6 @@ const CMD_PACKET: u8 = 0x02;
 const CMD_DISSOCIATE: u8 = 0x03;
 const CMD_HEARTBEAT: u8 = 0x04;
 
-const ATYP_DOMAIN: u8 = 0x00;
-const ATYP_IPV4: u8 = 0x01;
-const ATYP_IPV6: u8 = 0x02;
 const ATYP_NONE: u8 = 0xff;
 
 /// sing-quic default heartbeat interval (`client.go:55-57`).
@@ -75,102 +73,41 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// TUIC address (sing socksaddr wire format).
+/// TUIC address: the shared SOCKS5-style address encoded under sing's
+/// socksaddr ATYP numbering ([`addr::ATYP_SING`]), plus TUIC's own
+/// ATYP_NONE (0xff) marker used on continuation fragments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TuicAddr {
     None,
-    V4(SocketAddrV4),
-    V6(SocketAddrV6),
-    Domain(String, u16),
+    Addr(SocksAddr),
 }
 
 impl TuicAddr {
     fn new(target: SocketAddr, target_domain: Option<&str>) -> Self {
-        if let Some(domain) = target_domain {
-            return TuicAddr::Domain(domain.to_string(), target.port());
-        }
-        match target {
-            SocketAddr::V4(v4) => TuicAddr::V4(v4),
-            SocketAddr::V6(v6) => TuicAddr::V6(v6),
-        }
+        TuicAddr::Addr(SocksAddr::new(target, target_domain))
     }
 
     fn encoded_len(&self) -> usize {
         match self {
             TuicAddr::None => 1,
-            TuicAddr::V4(_) => 1 + 4 + 2,
-            TuicAddr::V6(_) => 1 + 16 + 2,
-            TuicAddr::Domain(d, _) => 1 + 1 + d.len() + 2,
+            TuicAddr::Addr(a) => a.encoded_len(),
         }
     }
 
     fn encode(&self, out: &mut Vec<u8>) {
         match self {
             TuicAddr::None => out.push(ATYP_NONE),
-            TuicAddr::V4(v4) => {
-                out.push(ATYP_IPV4);
-                out.extend_from_slice(&v4.ip().octets());
-                out.extend_from_slice(&v4.port().to_be_bytes());
-            }
-            TuicAddr::V6(v6) => {
-                out.push(ATYP_IPV6);
-                out.extend_from_slice(&v6.ip().octets());
-                out.extend_from_slice(&v6.port().to_be_bytes());
-            }
-            TuicAddr::Domain(domain, port) => {
-                out.push(ATYP_DOMAIN);
-                out.push(domain.len().min(u8::MAX as usize) as u8);
-                out.extend_from_slice(domain.as_bytes());
-                out.extend_from_slice(&port.to_be_bytes());
-            }
+            TuicAddr::Addr(a) => a.encode_with(out, addr::ATYP_SING),
         }
     }
 
     /// Decode from a byte slice, advancing the cursor past the address.
     fn decode(cursor: &mut &[u8]) -> io::Result<TuicAddr> {
-        fn take<'a>(cursor: &mut &'a [u8], n: usize) -> io::Result<&'a [u8]> {
-            if cursor.len() < n {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "short address",
-                ));
-            }
-            let (head, tail) = cursor.split_at(n);
-            *cursor = tail;
-            Ok(head)
+        if cursor.first() == Some(&ATYP_NONE) {
+            *cursor = &cursor[1..];
+            return Ok(TuicAddr::None);
         }
-        let atyp = take(cursor, 1)?[0];
-        match atyp {
-            ATYP_IPV4 => {
-                let ip: [u8; 4] = take(cursor, 4)?.try_into().expect("slice length checked");
-                let port = u16::from_be_bytes(take(cursor, 2)?.try_into().expect("len checked"));
-                Ok(TuicAddr::V4(SocketAddrV4::new(Ipv4Addr::from(ip), port)))
-            }
-            ATYP_IPV6 => {
-                let ip: [u8; 16] = take(cursor, 16)?.try_into().expect("slice length checked");
-                let port = u16::from_be_bytes(take(cursor, 2)?.try_into().expect("len checked"));
-                Ok(TuicAddr::V6(SocketAddrV6::new(
-                    Ipv6Addr::from(ip),
-                    port,
-                    0,
-                    0,
-                )))
-            }
-            ATYP_DOMAIN => {
-                let len = take(cursor, 1)?[0] as usize;
-                let domain = take(cursor, len)?;
-                let domain = std::str::from_utf8(domain)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
-                    .to_string();
-                let port = u16::from_be_bytes(take(cursor, 2)?.try_into().expect("len checked"));
-                Ok(TuicAddr::Domain(domain, port))
-            }
-            ATYP_NONE => Ok(TuicAddr::None),
-            other => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unknown address type {other:#x}"),
-            )),
-        }
+        SocksAddr::decode_with(cursor, addr::ATYP_SING).map(TuicAddr::Addr)
     }
 
     /// Read an address from a QUIC stream (used for inbound UDP-over-stream
@@ -178,43 +115,12 @@ impl TuicAddr {
     async fn read_from_stream(recv: &mut quinn::RecvStream) -> io::Result<TuicAddr> {
         let mut atyp = [0u8; 1];
         read_exact(recv, &mut atyp).await?;
-        match atyp[0] {
-            ATYP_IPV4 => {
-                let mut buf = [0u8; 4 + 2];
-                read_exact(recv, &mut buf).await?;
-                let ip: [u8; 4] = buf[..4].try_into().expect("array length");
-                let port = u16::from_be_bytes(buf[4..].try_into().expect("array length"));
-                Ok(TuicAddr::V4(SocketAddrV4::new(Ipv4Addr::from(ip), port)))
-            }
-            ATYP_IPV6 => {
-                let mut buf = [0u8; 16 + 2];
-                read_exact(recv, &mut buf).await?;
-                let ip: [u8; 16] = buf[..16].try_into().expect("array length");
-                let port = u16::from_be_bytes(buf[16..].try_into().expect("array length"));
-                Ok(TuicAddr::V6(SocketAddrV6::new(
-                    Ipv6Addr::from(ip),
-                    port,
-                    0,
-                    0,
-                )))
-            }
-            ATYP_DOMAIN => {
-                let mut len = [0u8; 1];
-                read_exact(recv, &mut len).await?;
-                let mut domain = vec![0u8; len[0] as usize];
-                read_exact(recv, &mut domain).await?;
-                let mut port = [0u8; 2];
-                read_exact(recv, &mut port).await?;
-                let domain = String::from_utf8(domain)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                Ok(TuicAddr::Domain(domain, u16::from_be_bytes(port)))
-            }
-            ATYP_NONE => Ok(TuicAddr::None),
-            other => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unknown address type {other:#x}"),
-            )),
+        if atyp[0] == ATYP_NONE {
+            return Ok(TuicAddr::None);
         }
+        SocksAddr::read_body(atyp[0], recv, addr::ATYP_SING)
+            .await
+            .map(TuicAddr::Addr)
     }
 }
 
@@ -687,9 +593,12 @@ impl TuicHandler {
         }
         // Build outside the lock: client_config is async (ECH discovery).
         let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
-        let config =
-            crate::quic::client_config(node, &[b"tuic"], node.tuic_congestion.as_deref(), None)
-                .await?;
+        let config = crate::quic::client_config(
+            node,
+            &[b"tuic"],
+            crate::quic::QuicClientOptions::with_congestion(node.tuic_congestion.as_deref()),
+        )
+        .await?;
         let client = Arc::new(TuicClient {
             quic: QuicClient::new(node.host().to_string(), node.port, server_name, config),
             uuid: *uuid.as_bytes(),
@@ -697,7 +606,10 @@ impl TuicHandler {
         });
         // Another task may have won the race — reuse theirs.
         let mut clients = CLIENTS.lock();
-        Ok(clients.entry(key).or_insert_with(|| Arc::clone(&client)).clone())
+        Ok(clients
+            .entry(key)
+            .or_insert_with(|| Arc::clone(&client))
+            .clone())
     }
 
     async fn send_udp(
@@ -906,6 +818,7 @@ mod tests {
     use super::*;
     use crate::quic::testutil;
     use quinn::VarInt;
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const TEST_UUID: &str = "123e4567-e89b-12d3-a456-426614174000";
@@ -1159,14 +1072,17 @@ mod tests {
     #[test]
     fn test_addr_codec_roundtrip() {
         let cases = [
-            TuicAddr::V4(SocketAddrV4::new(Ipv4Addr::new(93, 184, 216, 34), 80)),
-            TuicAddr::V6(SocketAddrV6::new(
+            TuicAddr::Addr(SocksAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::new(93, 184, 216, 34),
+                80,
+            ))),
+            TuicAddr::Addr(SocksAddr::V6(SocketAddrV6::new(
                 Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
                 443,
                 0,
                 0,
-            )),
-            TuicAddr::Domain("example.com".to_string(), 8080),
+            ))),
+            TuicAddr::Addr(SocksAddr::Domain("example.com".to_string(), 8080)),
             TuicAddr::None,
         ];
         for addr in cases {
@@ -1182,7 +1098,10 @@ mod tests {
 
     #[test]
     fn test_udp_message_codec_roundtrip() {
-        let addr = TuicAddr::V4(SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 53));
+        let addr = TuicAddr::Addr(SocksAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::new(8, 8, 8, 8),
+            53,
+        )));
         let pkt = encode_udp_packet(7, 42, 1, 0, &addr, b"payload");
         assert_eq!(pkt[0], TUIC_VERSION);
         assert_eq!(pkt[1], CMD_PACKET);
@@ -1197,7 +1116,10 @@ mod tests {
 
     #[test]
     fn test_fragmentation_and_defrag() {
-        let addr = TuicAddr::V4(SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 53));
+        let addr = TuicAddr::Addr(SocksAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::new(8, 8, 8, 8),
+            53,
+        )));
         let data = vec![0xabu8; 3000];
         let max = 1200;
         let frags = fragment_udp_packets(1, 99, &addr, &data, max).unwrap();
@@ -1216,7 +1138,7 @@ mod tests {
 
     #[test]
     fn test_fragmentation_small_packet_not_fragmented() {
-        let addr = TuicAddr::Domain("example.com".to_string(), 443);
+        let addr = TuicAddr::Addr(SocksAddr::Domain("example.com".to_string(), 443));
         let data = b"tiny";
         let frags = fragment_udp_packets(1, 1, &addr, data, 1200).unwrap();
         assert_eq!(frags.len(), 1);

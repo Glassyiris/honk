@@ -7,7 +7,7 @@ pub struct ClashApiConfig {
     /// API is disabled when empty.
     #[serde(default)]
     pub external_controller: String,
-    /// Path to external UI static files (e.g. "yacd").
+    /// Path to external UI static files (e.g. "zashboard").
     #[serde(default)]
     pub external_ui: String,
     /// Bearer token secret for API authentication.

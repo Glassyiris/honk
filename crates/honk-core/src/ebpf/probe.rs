@@ -10,10 +10,10 @@
 //! straight to the per-element fallback without touching the kernel.
 //!
 //! The latch is per command, not per (command, map): every map the batch
-//! paths touch belongs to the htab family (`REDIRECT_TRACK` and
-//! `ROUTING_HANDOFF_MAP` are LRU hash, `COOKIE_PID_MAP` is plain hash),
-//! and `BPF_MAP_UPDATE_BATCH` is only used on the `ROUTING_MAP` array, so
-//! a single verdict per command is valid for all of them.
+//! paths touch belongs to the htab family (`REDIRECT_TRACK`,
+//! `ROUTING_HANDOFF_MAP`, `CONN_STATE_MAP` and `COOKIE_PID_MAP` are plain
+//! hash), and `BPF_MAP_UPDATE_BATCH` is only used on the `ROUTING_MAP`
+//! array, so a single verdict per command is valid for all of them.
 
 use std::ffi::c_long;
 use std::sync::atomic::{AtomicU8, Ordering};

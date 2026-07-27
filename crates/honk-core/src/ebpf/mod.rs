@@ -8,6 +8,14 @@ pub mod real;
 
 use async_trait::async_trait;
 use honk_ebpf_common::*;
+use std::sync::atomic::AtomicU64;
+
+/// Cumulative conn-state entries deleted by userspace (TCP relay teardown,
+/// UDP endpoint reaper), for the janitor's occupancy gauge.  eBPF-side
+/// inserts/deletes are counted by the `CONN_STATE_OCCUPANCY` map; deletions
+/// initiated from userspace must be accounted separately or the gauge
+/// overestimates live occupancy between sweep calibrations.
+pub static USERSPACE_CONN_STATE_DELETES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct BpfLoadParams {
@@ -260,11 +268,26 @@ pub trait EbpfBackend: Send + Sync {
     fn clear_outbound_stats(&mut self, outbound: OutboundIndex) -> anyhow::Result<()>;
     fn get_bpf_stats(&self, key: u32) -> anyhow::Result<Option<u64>>;
 
-    // CONN_STATE_MAP is deliberately NOT scanned from userspace: the eBPF
-    // datapath expires entries lazily on every hit (contrack.rs) and the
-    // map is an LRU hash that evicts under pressure, so cold entries only
-    // cost memory.  The janitor therefore only sweeps the three maps below
-    // and derives its pressure mode from the kernel overflow counters.
+    // CONN_STATE_MAP is a plain hash: the datapath expires entries lazily on
+    // hit, and the janitor sweeps it proactively with state-based timeouts
+    // (mirroring the datapath's own expiry rules).  The kernel never evicts
+    // on its own — silent LRU eviction could re-route or break live flows.
+
+    /// Snapshot all (key, entry) pairs from CONN_STATE_MAP.
+    /// Same consistency notes as [`Self::redirect_track_snapshot`].
+    fn conn_state_snapshot(&self, out: &mut Vec<(TuplesKey, ConnState)>) -> anyhow::Result<()>;
+
+    /// Remove multiple CONN_STATE_MAP entries (batched when supported).
+    fn conn_state_remove_batch(&mut self, keys: &[TuplesKey]) -> anyhow::Result<()>;
+
+    /// Read the datapath's CONN_STATE_MAP occupancy counters:
+    /// `(cumulative_inserts, cumulative_ebpf_deletes)`.  Userspace combines
+    /// these with its own janitor-delete accounting to estimate live
+    /// occupancy between sweeps (see `CONN_STATE_OCCUPANCY` in the eBPF
+    /// maps).  Backends without the gauge return `(0, 0)`.
+    fn conn_state_occupancy(&self) -> anyhow::Result<(u64, u64)> {
+        Ok((0, 0))
+    }
 
     /// Snapshot all (key, entry) pairs from REDIRECT_TRACK.
     ///

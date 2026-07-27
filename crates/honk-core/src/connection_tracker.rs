@@ -15,7 +15,7 @@ pub struct ConnectionSnapshot {
     pub source: String,
     pub destination: String,
     pub proxy: String,
-    /// Matched routing rule (dae expression; "Match" = fallback).
+    /// Matched routing rule (dae expression; "Fallback" = fallback).
     pub rule: String,
     /// Value that drove the match (sniffed domain or destination IP).
     pub rule_payload: String,
@@ -110,18 +110,6 @@ impl ConnectionTracker {
             .iter()
             .map(|ref_multi| ref_multi.value().snapshot())
             .collect()
-    }
-
-    /// Return the current number of tracked connections.
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Return true if there are no tracked connections.
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
     }
 
     /// Force-remove a connection by ID (for admin-initiated close).

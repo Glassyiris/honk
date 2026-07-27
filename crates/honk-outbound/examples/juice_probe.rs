@@ -28,7 +28,12 @@ async fn main() -> anyhow::Result<()> {
             juicity_password: Some("33440f5a7608".into()),
             ..Default::default()
         };
-        let config = quic::client_config(&node, &[b"h3"], Some("bbr"), None).await?;
+        let config = quic::client_config(
+            &node,
+            &[b"h3"],
+            quic::QuicClientOptions::with_congestion(Some("bbr")),
+        )
+        .await?;
         let ip = honk_outbound::bootstrap::resolve(&host)
             .await?
             .into_iter()
@@ -44,11 +49,7 @@ async fn main() -> anyhow::Result<()> {
         .await;
         match result {
             Ok(Ok(conn)) => {
-                println!(
-                    "chrome={}: CONNECTED rtt={:?}",
-                    chrome,
-                    conn.rtt()
-                );
+                println!("chrome={}: CONNECTED rtt={:?}", chrome, conn.rtt());
                 conn.close(0u32.into(), b"done");
             }
             Ok(Err(e)) => println!("chrome={}: connect error: {}", chrome, e),

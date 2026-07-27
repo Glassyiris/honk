@@ -120,6 +120,9 @@ honk 沿用 dae 的内核模型，但并非移植。主要不同点：
 - [ ] REALITY + uTLS（**已延期** — rustls 缺成熟 hook）
 - [ ] smux/yamux；h2mux 与官方 sing-box multiplex inbound 的验证互通
 - [x] 真正的 DoT/DoH/DoQ/DoH3 上游（TLS/H2/QUIC 会话复用）
+- [x] Hysteria2 brutal（上下行 Mbps）、端口跳跃（`mport`/`mhop`）、`pinSHA256`、QUIC 接收窗口/PMTUD 参数；已对官方服务器实测验证
+- [ ] Hysteria2 残留：`maxStreamReceiveWindow`/`maxConnReceiveWindow`（quinn 无自动调窗对应）、`fastOpen`、UDP 会话/连接空闲超时可配（当前硬编码 90s/120s）
+- [x] QUIC 客户端选项整合：`QuicClientOptions` 管传输调优，`BoringQuicOptions` 管 TLS 后端
 - [ ] FakeIP 引擎
 - [ ] 内核侧 eBPF DNS 应答缓存（用户态缓存已有）
 - [ ] 一致性哈希负载均衡（轮询 LoadBalance 已有）

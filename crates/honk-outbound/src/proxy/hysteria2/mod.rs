@@ -27,10 +27,12 @@
 //!   every UDP datagram on the wire gets an 8-byte random salt prefix and the
 //!   payload XORed with `BLAKE2b-256(password ++ salt)` repeated. Implemented
 //!   as a custom quinn `AsyncUdpSocket` (`SalamanderSocket`).
-//! - **Congestion control**: the official "brutal" sender requires configured
-//!   bandwidth (`SendBPS`/`ReceiveBPS`); the `Node` schema has no bandwidth
-//!   fields, so `Hysteria-CC-RX: 0` is sent and the connection runs BBR —
-//!   sing-quic's non-brutal default (`client.go:580-588`).
+//! - **Congestion control**: without bandwidth hints the connection runs BBR
+//!   and sends `Hysteria-CC-RX: 0` (sing-quic's non-brutal default,
+//!   `client.go:580-588`). When `hy2_up_mbps` is set the send side uses a
+//!   fixed-rate brutal sender ([`crate::quic::BrutalConfig`]); when
+//!   `hy2_down_mbps` is set it is advertised via `Hysteria-CC-RX` so the
+//!   server's brutal sender paces the downlink.
 //!
 //! ## HTTP/3 layer
 //!
@@ -189,10 +191,10 @@ fn random_padding(min: usize, max: usize) -> String {
 }
 
 /// Auth request: HEADERS frame for `POST https://hysteria/auth`
-/// (`client.go:540-549`, `protocol/http.go:41-45`). The `Hysteria-CC-RX`
-/// header advertises our receive bandwidth; 0 = unset (no `Node` bandwidth
-/// fields exist, so the brutal sender never applies and BBR is used).
-fn auth_request_frame(password: &str) -> Vec<u8> {
+/// (`client.go:540-549`, `protocol/http.go:41-45`). `rx_bps` is our receive
+/// bandwidth in bits/s; 0 = unset (server falls back to its configured
+/// congestion controller instead of brutal).
+fn auth_request_frame(password: &str, rx_bps: u64) -> Vec<u8> {
     let padding = random_padding(AUTH_PADDING_MIN, AUTH_PADDING_MAX);
     let section = qpack_encode_request_fields(&[
         (":authority", URL_HOST),
@@ -200,7 +202,7 @@ fn auth_request_frame(password: &str) -> Vec<u8> {
         (":path", URL_PATH),
         (":scheme", "https"),
         (HEADER_AUTH, password),
-        (HEADER_CC_RX, "0"),
+        (HEADER_CC_RX, &rx_bps.to_string()),
         (HEADER_PADDING, padding.as_str()),
         ("content-length", "0"),
     ]);
@@ -476,6 +478,11 @@ impl Hy2ConnState {
                     let tx = sessions.lock().get(&msg.session_id).cloned();
                     if let Some(tx) = tx {
                         let _ = tx.send(msg);
+                    } else {
+                        debug!(
+                            session_id = msg.session_id,
+                            "Hysteria2 UDP: datagram for unknown session dropped"
+                        );
                     }
                 }
                 // Connection died: drop all session senders so bridges end.
@@ -529,6 +536,8 @@ impl Hy2ConnState {
 struct Hy2Client {
     quic: QuicClient<Hy2ConnState>,
     password: String,
+    /// Receive bandwidth advertised in the auth exchange, bits/s (0 = unset).
+    rx_bps: u64,
 }
 
 impl Hy2Client {
@@ -537,9 +546,10 @@ impl Hy2Client {
         connect_timeout: Duration,
     ) -> anyhow::Result<(quinn::Connection, Arc<Hy2ConnState>)> {
         let password = self.password.clone();
+        let rx_bps = self.rx_bps;
         self.quic
             .connection_with(connect_timeout, move |conn| async move {
-                authenticate(&conn, &password, connect_timeout).await
+                authenticate(&conn, &password, rx_bps, connect_timeout).await
             })
             .await
     }
@@ -551,6 +561,7 @@ impl Hy2Client {
 async fn authenticate(
     conn: &quinn::Connection,
     password: &str,
+    rx_bps: u64,
     timeout: Duration,
 ) -> anyhow::Result<Hy2ConnState> {
     tokio::time::timeout(timeout, async {
@@ -586,7 +597,7 @@ async fn authenticate(
             .open_bi()
             .await
             .context("Hysteria2: open auth stream")?;
-        send.write_all(&auth_request_frame(password))
+        send.write_all(&auth_request_frame(password, rx_bps))
             .await
             .context("Hysteria2: send auth request")?;
         send.finish().context("Hysteria2: finish auth request")?;
@@ -650,41 +661,80 @@ impl Hysteria2Handler {
     async fn client_for(node: &Node) -> anyhow::Result<Arc<Hy2Client>> {
         let password = Self::resolve_password(node);
         let obfs = node.hy2_obfs.as_deref().filter(|s| !s.is_empty());
+        // Receive bandwidth for the auth header, bits/s (0 = unset).
+        let rx_bps = u64::from(node.hy2_down_mbps.unwrap_or(0)) * 1_000_000;
+        // Port hopping (`mport`/`mhop`): destination port rotates among the
+        // list every interval (default 30s, official client parity).
+        let hop = node
+            .hy2_port_hopping
+            .as_deref()
+            .and_then(parse_port_hopping)
+            .map(|ports| {
+                (
+                    ports,
+                    Duration::from_secs(node.hy2_hop_interval.unwrap_or(30).max(1)),
+                )
+            });
         let key = format!(
-            "{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
             node.host(),
             node.port,
             password,
             node.sni.as_deref().unwrap_or(""),
             node.skip_cert_verify,
-            obfs.unwrap_or("")
+            obfs.unwrap_or(""),
+            node.hy2_up_mbps.unwrap_or(0),
+            rx_bps,
+            node.hy2_port_hopping.as_deref().unwrap_or(""),
+            node.hy2_hop_interval.unwrap_or(0),
         );
         if let Some(client) = CLIENTS.lock().get(&key) {
             return Ok(Arc::clone(client));
         }
         // Build outside the lock: client_config is async (ECH discovery).
         let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
-        // ALPN "h3" (hysteria2 runs its auth over HTTP/3, `client.go:100-102`)
-        // and BBR congestion control: sing-quic's default when no bandwidth
-        // is configured (`client.go:580-588`). The brutal sender needs
-        // configured bandwidth, which the Node schema has no fields for.
-        let config =
-            crate::quic::client_config(node, &[b"h3"], Some("bbr"), Some(KEEP_ALIVE_INTERVAL))
-                .await?;
+        // ALPN "h3" (hysteria2 runs its auth over HTTP/3, `client.go:100-102`).
+        // With `hy2_up_mbps` the send side runs a fixed-rate brutal sender;
+        // otherwise BBR — sing-quic's default when no bandwidth is
+        // configured (`client.go:580-588`).
+        let factory: Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> =
+            match node.hy2_up_mbps {
+                Some(mbps) if mbps > 0 => Arc::new(crate::quic::BrutalConfig::from_bps(
+                    u64::from(mbps) * 1_000_000,
+                )),
+                _ => crate::quic::congestion_factory(Some("bbr")),
+            };
+        let config = crate::quic::client_config(
+            node,
+            &[b"h3"],
+            crate::quic::QuicClientOptions {
+                congestion: Some(factory),
+                keep_alive: Some(KEEP_ALIVE_INTERVAL),
+                stream_receive_window: node.hy2_init_stream_recv_window,
+                conn_receive_window: node.hy2_init_conn_recv_window,
+                disable_mtu_discovery: node.hy2_disable_mtu_discovery == Some(true),
+            },
+        )
+        .await?;
         let quic = QuicClient::new(node.host().to_string(), node.port, server_name, config);
-        let quic = match obfs {
-            Some(obfs_password) => quic.with_endpoint_factory(salamander_endpoint_factory(
-                Arc::from(obfs_password.as_bytes()),
+        let quic = match (obfs, hop) {
+            (None, None) => quic,
+            (obfs, hop) => quic.with_endpoint_factory(hy2_endpoint_factory(
+                obfs.map(|p| Arc::from(p.as_bytes())),
+                hop,
             )),
-            None => quic,
         };
         let client = Arc::new(Hy2Client {
             quic,
             password: password.to_string(),
+            rx_bps,
         });
         // Another task may have won the race — reuse theirs.
         let mut clients = CLIENTS.lock();
-        Ok(clients.entry(key).or_insert_with(|| Arc::clone(&client)).clone())
+        Ok(clients
+            .entry(key)
+            .or_insert_with(|| Arc::clone(&client))
+            .clone())
     }
 }
 

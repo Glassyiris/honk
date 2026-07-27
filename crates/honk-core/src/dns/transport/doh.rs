@@ -9,13 +9,12 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use h2::client::{SendRequest, handshake};
-use http::Request;
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::debug;
 
-use super::DialContext;
-use super::framing::{force_dns_id_zero, restore_dns_id};
+use super::framing::force_dns_id_zero;
+use super::{DialContext, build_doh_request, exchange_with_retry, finish_doh_response};
 use honk_outbound::tls::TlsConnector;
 
 type H2Sender = SendRequest<Bytes>;
@@ -39,40 +38,23 @@ impl DohClient {
     }
 
     pub async fn exchange(self: &Arc<Self>, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
-        match self.exchange_once(raw_query, false).await {
-            Ok(r) => Ok(r),
-            Err(first) => {
-                debug!("DoH exchange failed ({first}); resetting session and retrying");
+        exchange_with_retry(
+            "DoH",
+            || self.exchange_once(raw_query),
+            || async {
                 *self.session.lock() = None;
-                self.exchange_once(raw_query, true)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("DoH failed after retry: {e} (first: {first})"))
-            }
-        }
+            },
+        )
+        .await
     }
 
-    async fn exchange_once(&self, raw_query: &[u8], force_new: bool) -> anyhow::Result<Vec<u8>> {
-        let mut sender = self.get_sender(force_new).await?;
+    async fn exchange_once(&self, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let mut sender = self.get_sender().await?;
 
         let mut wire = raw_query.to_vec();
         let orig_id = force_dns_id_zero(&mut wire);
 
-        let path = if self.dial.endpoint.path.is_empty() {
-            "/dns-query"
-        } else {
-            self.dial.endpoint.path.as_str()
-        };
-        let authority = authority(&self.dial.endpoint.host, self.dial.endpoint.port);
-        let uri = format!("https://{authority}{path}");
-
-        let req = Request::builder()
-            .method("POST")
-            .uri(&uri)
-            .header("content-type", "application/dns-message")
-            .header("accept", "application/dns-message")
-            .header("content-length", wire.len().to_string())
-            .body(())
-            .map_err(|e| anyhow::anyhow!("DoH request build: {e}"))?;
+        let req = build_doh_request(&self.dial.endpoint, Some(wire.len()), "DoH")?;
 
         let (response_fut, mut send_stream) = sender
             .send_request(req, false)
@@ -105,18 +87,11 @@ impl DohClient {
             }
         }
 
-        if !status.is_success() {
-            anyhow::bail!("DoH HTTP status {status}");
-        }
-        if buf.len() < 12 {
-            anyhow::bail!("DoH response too short ({} bytes)", buf.len());
-        }
-        restore_dns_id(&mut buf, orig_id);
-        Ok(buf)
+        finish_doh_response("DoH", status, buf, orig_id)
     }
 
-    async fn get_sender(&self, force_new: bool) -> anyhow::Result<H2Sender> {
-        if !force_new && let Some(s) = self.session.lock().clone() {
+    async fn get_sender(&self) -> anyhow::Result<H2Sender> {
+        if let Some(s) = self.session.lock().clone() {
             return Ok(s);
         }
         let sender = self.handshake().await?;
@@ -159,17 +134,4 @@ where
         }
     });
     Ok(sender)
-}
-
-fn authority(host: &str, port: u16) -> String {
-    let host_fmt = if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]")
-    } else {
-        host.to_string()
-    };
-    if port == 443 {
-        host_fmt
-    } else {
-        format!("{host_fmt}:{port}")
-    }
 }

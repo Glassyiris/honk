@@ -1,4 +1,4 @@
-//! DNS resolver, listener, forwarder, cache, and routing.
+//! DNS resolver, forwarder, cache, and routing.
 //!
 //! ## Modules
 //!
@@ -7,9 +7,9 @@
 //! - `endpoint` — upstream address / SNI / path parsing
 //! - `transport` — pooled UDP/TCP/DoT/DoH/DoQ/DoH3 clients
 //! - `upstream_pool` — per-upstream DNS query management
-//! - `listener` — UDP/TCP DNS listener (standalone; production uses TPROXY)
 //! - `forwarder` — DNS forwarding engine (cache + upstream + routing)
 //! - `persist` — optional cache.db persistence for DNS answers
+//! - `wire` — shared wire-format parsing helpers
 //!
 //! ## `DnsResolver`
 //!
@@ -26,10 +26,9 @@ pub mod persist;
 pub mod routing;
 pub mod transport;
 pub mod upstream_pool;
+pub(crate) mod wire;
 
-pub mod listener;
-
-use honk_config::dns::{DnsConfig, DnsUpstream};
+use honk_config::dns::DnsConfig;
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -53,8 +52,6 @@ pub struct ResolvedAddr {
 /// injected). A small process-local domain cache sits in front to avoid
 /// re-issuing A+AAAA pairs for hot names.
 pub struct DnsResolver {
-    /// DNS configuration (routing helpers, strategy)
-    config: DnsConfig,
     /// In-memory cache for fast domain lookups (application layer)
     cache: Arc<RwLock<lru::LruCache<String, (ResolvedAddr, std::time::Instant)>>>,
     /// Upstream wire-format forwarder (UDP/TCP/DoT/DoH/DoQ/DoH3)
@@ -70,7 +67,6 @@ impl DnsResolver {
     pub fn new(config: &DnsConfig) -> anyhow::Result<Self> {
         let forwarder = build_forwarder_from_config(config)?;
         Ok(Self {
-            config: config.clone(),
             cache: new_app_cache(config.cache.max_size),
             forwarder,
         })
@@ -82,7 +78,6 @@ impl DnsResolver {
         forwarder: Arc<crate::dns::forwarder::DnsForwarder>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
-            config: config.clone(),
             cache: new_app_cache(config.cache.max_size),
             forwarder,
         })
@@ -223,20 +218,6 @@ impl DnsResolver {
 
         Ok(resolved)
     }
-
-    /// Route a domain to the appropriate upstream based on DNS routing rules.
-    pub fn route_domain(&self, domain: &str) -> Option<&DnsUpstream> {
-        for rule in &self.config.routing.rules {
-            if domain_matches(domain, &rule.domain) {
-                return self
-                    .config
-                    .upstream
-                    .iter()
-                    .find(|u| u.name == rule.upstream);
-            }
-        }
-        None
-    }
 }
 
 fn new_app_cache(
@@ -264,100 +245,20 @@ fn build_forwarder_from_config(
     ))
 }
 
-/// Check if a domain matches a routing pattern.
-fn domain_matches(domain: &str, pattern: &str) -> bool {
-    if let Some(regex_str) = pattern.strip_prefix("regex:") {
-        regex::Regex::new(regex_str)
-            .map(|re| re.is_match(domain))
-            .unwrap_or(false)
-    } else if let Some(suffix) = pattern.strip_prefix("suffix:") {
-        domain.ends_with(suffix) || domain == &suffix[1..]
-    } else if let Some(keyword) = pattern.strip_prefix("keyword:") {
-        domain.contains(keyword)
-    } else if let Some(full) = pattern.strip_prefix("full:") {
-        domain == full
-    } else {
-        // Default: full match
-        domain == pattern
-    }
-}
-
 /// Parse A/AAAA records from a DNS response.
 /// Returns (domain, min_ttl, ips) on success.
 fn parse_a_aaaa_from_response(response: &[u8]) -> Option<(String, u32, Vec<IpAddr>)> {
-    if response.len() < 12 {
+    let pairs = wire::extract_ips_with_ttl(response);
+    if pairs.is_empty() {
         return None;
     }
-    let ancount = u16::from_be_bytes([response[6], response[7]]) as usize;
-    let mut pos = 12;
-    // Skip question section
-    while pos < response.len() && response[pos] != 0 {
-        let label_len = response[pos] as usize;
-        if label_len >= 64 {
-            pos += 2;
-            break;
-        }
-        if label_len == 0 {
-            pos += 1;
-            break;
-        }
-        pos += 1 + label_len;
-    }
-    if pos >= response.len() {
-        return None;
-    }
-    pos += 1; // terminating zero
-    pos += 4; // QTYPE + QCLASS
-
-    let mut ips = Vec::new();
     let mut min_ttl = u32::MAX;
-    for _ in 0..ancount {
-        if pos + 10 > response.len() {
-            break;
+    let mut ips = Vec::with_capacity(pairs.len());
+    for (ip, ttl) in pairs {
+        if ttl > 0 {
+            min_ttl = min_ttl.min(ttl);
         }
-        pos = skip_dns_name(response, pos);
-        if pos + 10 > response.len() {
-            break;
-        }
-        let qtype = u16::from_be_bytes([response[pos], response[pos + 1]]);
-        let ttl = u32::from_be_bytes([
-            response[pos + 4],
-            response[pos + 5],
-            response[pos + 6],
-            response[pos + 7],
-        ]);
-        let rdlength = u16::from_be_bytes([response[pos + 8], response[pos + 9]]) as usize;
-        pos += 10;
-        if pos + rdlength > response.len() {
-            break;
-        }
-        match qtype {
-            1 if rdlength == 4 => {
-                ips.push(IpAddr::V4(std::net::Ipv4Addr::new(
-                    response[pos],
-                    response[pos + 1],
-                    response[pos + 2],
-                    response[pos + 3],
-                )));
-                if ttl > 0 {
-                    min_ttl = min_ttl.min(ttl);
-                }
-            }
-            28 if rdlength == 16 => {
-                let mut octets = [0u8; 16];
-                octets.copy_from_slice(&response[pos..pos + 16]);
-                ips.push(IpAddr::V6(std::net::Ipv6Addr::from(octets)));
-                if ttl > 0 {
-                    min_ttl = min_ttl.min(ttl);
-                }
-            }
-            _ => {}
-        }
-        pos += rdlength;
-    }
-
-    if ips.is_empty() {
-        return None;
+        ips.push(ip);
     }
     if min_ttl == u32::MAX {
         min_ttl = 60;
@@ -365,38 +266,9 @@ fn parse_a_aaaa_from_response(response: &[u8]) -> Option<(String, u32, Vec<IpAdd
     Some((String::new(), min_ttl, ips))
 }
 
-fn skip_dns_name(response: &[u8], mut pos: usize) -> usize {
-    while pos < response.len() {
-        let byte = response[pos];
-        if byte == 0 {
-            return pos + 1;
-        }
-        if byte & 0xC0 == 0xC0 {
-            return pos + 2;
-        }
-        pos += 1 + byte as usize;
-    }
-    pos
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_domain_matches() {
-        assert!(domain_matches("google.com", "google.com"));
-        assert!(domain_matches("www.google.com", "suffix:.google.com"));
-        assert!(domain_matches("google.com", "suffix:google.com"));
-        assert!(domain_matches("ads.example.com", "keyword:ads"));
-        assert!(domain_matches("example.com", "full:example.com"));
-        assert!(domain_matches("notgoogle.com", "suffix:google.com"));
-        assert!(!domain_matches("notgoogle.com", "suffix:.google.com"));
-        assert!(domain_matches(
-            "test.example.com",
-            "regex:.*\\.example\\.com"
-        ));
-    }
 
     #[test]
     fn test_dns_config_default() {

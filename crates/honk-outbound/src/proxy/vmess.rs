@@ -54,6 +54,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::debug;
 
+use super::addr::{self, SocksAddr};
 use super::{AsyncReadWrite, ProxyHandler, ProxyStream};
 
 /// VMess AEAD version byte.
@@ -72,11 +73,7 @@ const GCM_TAG_LEN: usize = 16;
 /// AES-128-GCM nonce length.
 const NONCE_LEN: usize = 12;
 /// Maximum plaintext payload per AEAD chunk (same as Shadowsocks).
-const CHUNK_MAX_LEN: usize = 0x3FFF; // 16383
-
-const ATYP_IPV4: u8 = 0x01;
-const ATYP_DOMAIN: u8 = 0x02;
-const ATYP_IPV6: u8 = 0x03;
+const CHUNK_MAX_LEN: usize = 0x3FFF; // 16383;
 
 /// VMess AEAD proxy handler.
 #[derive(Debug, Default, Clone, Copy)]
@@ -87,26 +84,12 @@ impl VmessHandler {
         Self
     }
 
-    /// Encode target address in V2Ray ATYP format.
+    /// Encode target address in the V2Ray ATYP format (domain = 0x02,
+    /// IPv6 = 0x03 — not the SOCKS5 numbering).
     fn encode_address(target: SocketAddr, target_domain: Option<&str>) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(19);
-        if let Some(domain) = target_domain {
-            buf.push(ATYP_DOMAIN);
-            buf.push(domain.len().min(u8::MAX as usize) as u8);
-            buf.extend_from_slice(domain.as_bytes());
-        } else {
-            match target {
-                SocketAddr::V4(v4) => {
-                    buf.push(ATYP_IPV4);
-                    buf.extend_from_slice(&v4.ip().octets());
-                }
-                SocketAddr::V6(v6) => {
-                    buf.push(ATYP_IPV6);
-                    buf.extend_from_slice(&v6.ip().octets());
-                }
-            }
-        }
-        buf.extend_from_slice(&target.port().to_be_bytes());
+        let socks = SocksAddr::new(target, target_domain);
+        let mut buf = Vec::with_capacity(socks.encoded_len());
+        socks.encode_with(&mut buf, addr::ATYP_VMESS);
         buf
     }
 
@@ -483,7 +466,6 @@ fn increment_nonce(nonce: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 
     #[test]
     fn test_derive_cmd_key() {
@@ -569,48 +551,6 @@ mod tests {
         let decrypted =
             VmessHandler::open(&cmd_key, &nonce, &encrypted).expect("decrypt instruction");
         assert_eq!(decrypted, inst);
-    }
-
-    #[test]
-    fn test_encode_address_ipv4() {
-        let target = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(93, 184, 216, 34), 80));
-        let encoded = VmessHandler::encode_address(target, None);
-        assert_eq!(encoded[0], ATYP_IPV4);
-        assert_eq!(&encoded[1..5], &[93, 184, 216, 34]);
-        assert_eq!(&encoded[5..7], &[0x00, 0x50]);
-        assert_eq!(encoded.len(), 7);
-    }
-
-    #[test]
-    fn test_encode_address_domain() {
-        let target = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 443));
-        let encoded = VmessHandler::encode_address(target, Some("example.com"));
-        assert_eq!(encoded[0], ATYP_DOMAIN);
-        assert_eq!(encoded[1], 11);
-        assert_eq!(&encoded[2..13], b"example.com");
-        assert_eq!(&encoded[13..15], &[0x01, 0xbb]);
-        assert_eq!(encoded.len(), 15);
-    }
-
-    #[test]
-    fn test_encode_address_ipv6() {
-        let target = SocketAddr::V6(SocketAddrV6::new(
-            Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1),
-            8080,
-            0,
-            0,
-        ));
-        let encoded = VmessHandler::encode_address(target, None);
-        assert_eq!(encoded[0], ATYP_IPV6);
-        assert_eq!(
-            &encoded[1..17],
-            &[
-                0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x01,
-            ]
-        );
-        assert_eq!(&encoded[17..19], &[0x1f, 0x90]);
-        assert_eq!(encoded.len(), 19);
     }
 
     #[test]
@@ -753,7 +693,7 @@ mod tests {
             let addr = body_cipher
                 .decrypt(addr_nonce.into(), addr_ct.as_slice())
                 .expect("address decrypts");
-            assert_eq!(addr[0], ATYP_IPV4);
+            assert_eq!(addr[0], addr::ATYP_VMESS.ipv4);
             assert_eq!(&addr[1..5], &[93, 184, 216, 34]);
             assert_eq!(&addr[5..7], &[0x00, 0x50]); // port 80
         });

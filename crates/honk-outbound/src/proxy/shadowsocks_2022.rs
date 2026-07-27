@@ -28,7 +28,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::debug;
 
-use super::shadowsocks::{AeadCipher, increment_nonce, socks_addr_len, write_chunks};
+use super::addr::socks_addr_len;
+use super::shadowsocks::{AeadCipher, increment_nonce, write_chunks};
 
 const HEADER_TYPE_CLIENT: u8 = 0;
 const HEADER_TYPE_SERVER: u8 = 1;
@@ -857,7 +858,7 @@ mod tests {
 
     fn udp_target() -> (Vec<u8>, SocketAddr) {
         let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
-        (ShadowsocksHandler::encode_address(target, None), target)
+        (crate::proxy::addr::encode_address(target, None), target)
     }
 
     /// Server-side parse of an AES-construction client packet; returns
@@ -1214,7 +1215,7 @@ mod tests {
         let server_addr = server.local_addr().unwrap();
         let server_method = Ss2022Method::new("2022-blake3-aes-256-gcm", psk_b64).unwrap();
         let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
-        let socks = ShadowsocksHandler::encode_address(target, None);
+        let socks = crate::proxy::addr::encode_address(target, None);
 
         tokio::spawn(async move {
             let mut buf = [0u8; 65536];

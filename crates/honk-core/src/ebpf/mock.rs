@@ -443,6 +443,26 @@ impl EbpfBackend for MockEbpfBackend {
         Ok(())
     }
 
+    fn conn_state_snapshot(&self, out: &mut Vec<(TuplesKey, ConnState)>) -> anyhow::Result<()> {
+        for (kb, entry) in self
+            .tcp_conn_states
+            .iter()
+            .chain(self.udp_conn_states.iter())
+        {
+            out.push((Self::bytes_to_tuples_key(kb), *entry));
+        }
+        Ok(())
+    }
+
+    fn conn_state_remove_batch(&mut self, keys: &[TuplesKey]) -> anyhow::Result<()> {
+        for key in keys {
+            let kb = Self::tuples_key_bytes(key);
+            self.tcp_conn_states.remove(&kb);
+            self.udp_conn_states.remove(&kb);
+        }
+        Ok(())
+    }
+
     fn cookie_pid_remove_batch(&mut self, cookies: &[u64]) -> anyhow::Result<()> {
         for cookie in cookies {
             self.cookie_pids.remove(cookie);
@@ -480,12 +500,7 @@ impl EbpfBackend for MockEbpfBackend {
 
 /// FNV-1a hash function (same as eBPF side).
 fn fnv1a_hash(data: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for &byte in data {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
+    super::maps::fnv1a_hash(data)
 }
 
 /// Parse an IPv4 string to u32.
@@ -768,6 +783,44 @@ mod tests {
         assert!(backend.redirect_tracks.is_empty());
         assert!(backend.cookie_pids.is_empty());
         assert!(backend.routing_handoffs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_conn_state_snapshot_and_remove_batch() {
+        let mut backend = MockEbpfBackend::new();
+
+        let tcp_key = TuplesKey {
+            src_ip: In6Addr::default(),
+            dst_ip: In6Addr::default(),
+            src_port: 4000,
+            dst_port: 443,
+            l4proto: 6,
+        };
+        let udp_key = TuplesKey {
+            l4proto: 17,
+            ..tcp_key
+        };
+        let state = ConnState {
+            last_seen_ns: 999,
+            ..Default::default()
+        };
+        backend.tcp_conn_state_store(&tcp_key, &state).unwrap();
+        backend.udp_conn_state_store(&udp_key, &state).unwrap();
+
+        let mut out = Vec::new();
+        backend.conn_state_snapshot(&mut out).unwrap();
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|(_, s)| s.last_seen_ns == 999));
+
+        backend
+            .conn_state_remove_batch(&[tcp_key, udp_key])
+            .unwrap();
+        assert!(backend.tcp_conn_states.is_empty());
+        assert!(backend.udp_conn_states.is_empty());
+
+        let mut out = Vec::new();
+        backend.conn_state_snapshot(&mut out).unwrap();
+        assert!(out.is_empty());
     }
 
     #[test]

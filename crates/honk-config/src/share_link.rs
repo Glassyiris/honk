@@ -20,8 +20,8 @@
 //!   URL-safe base64 without padding.
 //!
 //! This is the single share-link parser for the whole workspace: the dae
-//! config parser, the core subscription fetcher, and the API server import
-//! paths all delegate to [`Node::from_share_link`].
+//! config parser and the core subscription fetcher both delegate to
+//! [`Node::from_share_link`].
 
 use std::collections::HashMap;
 
@@ -29,7 +29,7 @@ use base64::Engine as _;
 
 use crate::error::ConfigError;
 use crate::node::Node;
-use crate::types::NodeProtocol;
+use crate::types::{NodeProtocol, parse_duration_secs};
 
 impl Node {
     /// Parse a proxy share link (e.g. `ss://...`, `trojan://...`) into a [`Node`].
@@ -133,7 +133,7 @@ impl Node {
         // would leak the credentials into node lists and dashboards.
         node.name = url
             .fragment()
-            .map(decode_url_fragment)
+            .map(percent_decode_str)
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| format!("{}-{}", scheme, host));
 
@@ -207,9 +207,15 @@ impl Node {
             node.skip_cert_verify = v == "1" || v.eq_ignore_ascii_case("true");
         }
 
+        // Certificate SHA-256 pin (`pinSHA256=<hex>`) — replaces PKI
+        // verification with a leaf-certificate fingerprint check.
+        if let Some(v) = query.get("pinSHA256").or_else(|| query.get("pin_sha256")) {
+            node.tls_pin_sha256 = Some(v.clone());
+        }
+
         // ECH (Encrypted Client Hello): `ech_config=<base64 ECHConfigList>`
-        // enables real ECH; bare `ech=1` toggles it on without keys (GREASE
-        // only until DNS HTTPS-RR lookup lands).
+        // enables real ECH with static keys; bare `ech=1` enables it without
+        // keys, triggering DNS HTTPS-RR discovery at connect time.
         if let Some(v) = query.get("ech_config").or_else(|| query.get("echconfig")) {
             node.ech_enabled = true;
             node.ech_config = Some(v.clone());
@@ -238,6 +244,48 @@ impl Node {
             .or_else(|| query.get("plugin_opts"))
         {
             node.plugin_opts = Some(v.clone());
+        }
+
+        if protocol == NodeProtocol::Hysteria2 {
+            // hy2 puts the auth secret bare in the userinfo
+            // (`hysteria2://password@host`); the handler reads `hy2_auth`
+            // first and falls back to `password`, so populate both.
+            if node.hy2_auth.is_none() {
+                node.hy2_auth = node.username.clone();
+            }
+            if node.password.is_none() {
+                node.password = node.username.clone();
+            }
+            // Salamander obfuscation: `obfs=salamander&obfs-password=...`.
+            if query.get("obfs").is_some_and(|v| v == "salamander")
+                && let Some(v) = query.get("obfs-password").filter(|s| !s.is_empty())
+            {
+                node.hy2_obfs = Some(v.clone());
+            }
+            // Brutal bandwidth hints (`upmbps`/`downmbps`).
+            if let Some(v) = query.get("upmbps") {
+                node.hy2_up_mbps = v.parse().ok();
+            }
+            if let Some(v) = query.get("downmbps") {
+                node.hy2_down_mbps = v.parse().ok();
+            }
+            // Port hopping (`mport=20000-30000` / `mport=p1,p2`, `mhop=secs`).
+            if let Some(v) = query.get("mport").filter(|s| !s.is_empty()) {
+                node.hy2_port_hopping = Some(v.clone());
+            }
+            if let Some(v) = query.get("mhop") {
+                node.hy2_hop_interval = v.parse().ok();
+            }
+            // QUIC flow-control / MTU knobs (hy2 client config parity).
+            if let Some(v) = query.get("initStreamReceiveWindow") {
+                node.hy2_init_stream_recv_window = v.parse().ok();
+            }
+            if let Some(v) = query.get("initConnReceiveWindow") {
+                node.hy2_init_conn_recv_window = v.parse().ok();
+            }
+            if let Some(v) = query.get("disablePathMTUDiscovery") {
+                node.hy2_disable_mtu_discovery = Some(v == "1" || v.eq_ignore_ascii_case("true"));
+            }
         }
 
         if protocol == NodeProtocol::AnyTLS {
@@ -578,24 +626,6 @@ fn base64_decode_flexible(input: &str) -> Option<Vec<u8>> {
         .ok()
 }
 
-/// Parse a duration string like `30s`, `1m` or `500ms` into seconds.
-fn parse_duration_secs(s: &str) -> Option<u64> {
-    let s = s.trim();
-    if let Some(v) = s.strip_suffix("ms") {
-        return v.parse::<f64>().ok().map(|v| (v / 1000.0).ceil() as u64);
-    }
-    if let Some(v) = s.strip_suffix('s') {
-        return v.parse().ok();
-    }
-    if let Some(v) = s.strip_suffix('m') {
-        return v.parse::<u64>().ok().map(|v| v * 60);
-    }
-    if let Some(v) = s.strip_suffix('h') {
-        return v.parse::<u64>().ok().map(|v| v * 3600);
-    }
-    s.parse().ok()
-}
-
 /// Percent-decode a string into bytes, then lossily into UTF-8.
 fn percent_decode_str(s: &str) -> String {
     let bytes = s.as_bytes();
@@ -614,15 +644,6 @@ fn percent_decode_str(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
-}
-
-/// Decode a percent-encoded URL fragment into a plain UTF-8 string.
-///
-/// Percent-encoded bytes are decoded to raw bytes first and then interpreted
-/// as UTF-8 — decoding each byte as a `char` directly would corrupt any
-/// multi-byte (Chinese / emoji) node name.
-fn decode_url_fragment(fragment: &str) -> String {
-    percent_decode_str(fragment)
 }
 
 fn hex_to_byte(h: u8, l: u8) -> Result<u8, ()> {

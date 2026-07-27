@@ -249,7 +249,7 @@ async fn test_proxies_structure_and_selector_switch() {
     let proxies = &body["proxies"];
 
     // The Selector group is present with both members.
-    assert_eq!(proxies["proxy"]["type"], "Selector");
+    assert_eq!(proxies["proxy"]["type"], "selector");
     assert_eq!(
         proxies["proxy"]["all"],
         serde_json::json!(["node-a", "node-b"])
@@ -263,7 +263,7 @@ async fn test_proxies_structure_and_selector_switch() {
     assert!(proxies["node-a"]["type"].is_string());
     assert!(proxies["node-a"]["history"].is_array());
     // GLOBAL synthetic group exists with the mode-state selection.
-    assert_eq!(proxies["GLOBAL"]["type"], "Selector");
+    assert_eq!(proxies["GLOBAL"]["type"], "selector");
     assert_eq!(proxies["GLOBAL"]["now"], "proxy");
     assert_eq!(proxies["GLOBAL"]["all"][0], "Proxy");
     // GLOBAL contains the group and both nodes, without duplicates.
@@ -305,6 +305,41 @@ async fn test_proxies_structure_and_selector_switch() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 400);
+}
+
+/// Dashboards (metacubexd/zashboard) send PUT/PATCH without a JSON
+/// Content-Type; the API must still accept them (mihomo parity).
+#[tokio::test]
+async fn test_put_and_patch_without_content_type() {
+    let app = spawn_app("", "").await;
+    let client = http_client();
+
+    let resp = client
+        .put(app.url("/proxies/proxy"))
+        .body(r#"{"name":"node-b"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    let db = app.state.cache_db.as_ref().unwrap();
+    assert_eq!(db.load_selector_choice("proxy").as_deref(), Some("node-b"));
+
+    let resp = client
+        .patch(app.url("/configs"))
+        .body(r#"{"mode":"global"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    let body: serde_json::Value = client
+        .get(app.url("/configs"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["mode"], "Global");
 }
 
 /// Parent selector containing a sub-group: the sub-group tag appears in

@@ -247,10 +247,12 @@ impl BoringHeaderKey {
             }
             Self::ChaCha20(key) => {
                 use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
+                // RFC 9001 §5.4.4: sample[0..4] is the ChaCha20 BLOCK counter;
+                // `StreamCipherSeek::seek` takes a BYTE offset, so convert.
                 let counter = u32::from_le_bytes(sample[..4].try_into().expect("slice length"));
                 let nonce: [u8; 12] = sample[4..16].try_into().expect("slice length");
                 let mut cipher = chacha20::ChaCha20::new(key.into(), &nonce.into());
-                cipher.seek(counter);
+                cipher.seek(u64::from(counter) * 64);
                 let mut mask = [0u8; 5];
                 cipher.apply_keystream(&mut mask);
                 mask
@@ -442,6 +444,23 @@ static QUIC_METHOD: boring_sys::SSL_QUIC_METHOD = boring_sys::SSL_QUIC_METHOD {
     send_alert: Some(on_send_alert),
 };
 
+/// Options for [`BoringQuicClientConfig::new`].
+#[derive(Default)]
+pub struct BoringQuicOptions {
+    /// ALPN protocol list in TLS wire format (length-prefixed entries),
+    /// e.g. `b"\x02h3"` for Hysteria2/Juicity.
+    pub alpn_wire: Vec<u8>,
+    /// Skip all certificate verification.
+    pub skip_cert_verify: bool,
+    /// Chrome ClientHello fingerprint.
+    pub chrome: bool,
+    /// Static ECHConfigList; ECH GREASE applies when `chrome` and unset.
+    pub ech_config_list: Option<Arc<Vec<u8>>>,
+    /// pinSHA256 leaf-certificate fingerprint; replaces PKI and hostname
+    /// verification when set.
+    pub pin_sha256: Option<[u8; 32]>,
+}
+
 /// `crypto::ClientConfig` backed by a BoringSSL `SSL_CTX` (TLS 1.3 only).
 pub struct BoringQuicClientConfig {
     ctx: SslContext,
@@ -452,20 +471,27 @@ pub struct BoringQuicClientConfig {
 }
 
 impl BoringQuicClientConfig {
-    /// Build the config. `alpn` is the protocol list in TLS wire format
-    /// (length-prefixed entries), e.g. `b"\x02h3"` for Hysteria2/Juicity.
-    pub fn new(
-        alpn_wire: Vec<u8>,
-        skip_cert_verify: bool,
-        chrome: bool,
-        ech_config_list: Option<Arc<Vec<u8>>>,
-    ) -> anyhow::Result<Self> {
+    /// Build the config from [`BoringQuicOptions`].
+    pub fn new(options: BoringQuicOptions) -> anyhow::Result<Self> {
+        let BoringQuicOptions {
+            alpn_wire,
+            skip_cert_verify,
+            chrome,
+            ech_config_list,
+            pin_sha256,
+        } = options;
         let mut builder = SslContext::builder(SslMethod::tls())?;
         // QUIC mandates TLS 1.3.
         builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
         builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
 
-        if skip_cert_verify {
+        if let Some(pin) = pin_sha256 {
+            // pinSHA256: fingerprint check replaces PKI + hostname checks.
+            builder.set_custom_verify_callback(
+                SslVerifyMode::PEER,
+                crate::tls::pin_sha256_custom_verify(pin),
+            );
+        } else if skip_cert_verify {
             builder.set_verify(SslVerifyMode::NONE);
         } else {
             builder.set_verify(SslVerifyMode::PEER);
@@ -482,7 +508,7 @@ impl BoringQuicClientConfig {
             ctx: builder.build(),
             alpn_wire,
             chrome,
-            verify: !skip_cert_verify,
+            verify: !skip_cert_verify && pin_sha256.is_none(),
             ech_config_list,
         })
     }
@@ -570,6 +596,8 @@ impl crypto::ClientConfig for BoringQuicClientConfig {
 pub struct BoringHandshakeData {
     /// Negotiated ALPN protocol, if any.
     pub protocol: Option<Vec<u8>>,
+    /// Negotiated TLS 1.3 cipher suite id (RFC 8446 §B.4).
+    pub cipher_suite: u16,
 }
 
 /// quinn `crypto::Session` over a BoringSSL QUIC client handshake.
@@ -660,6 +688,14 @@ impl Session for BoringQuicSession {
         }
         Some(Box::new(BoringHandshakeData {
             protocol: self.ssl.selected_alpn_protocol().map(|p| p.to_vec()),
+            cipher_suite: unsafe {
+                let cipher = boring_sys::SSL_get_current_cipher(self.ssl.as_ptr());
+                if cipher.is_null() {
+                    0
+                } else {
+                    boring_sys::SSL_CIPHER_get_protocol_id(cipher)
+                }
+            },
         }))
     }
 
@@ -849,12 +885,89 @@ mod tests {
     }
 
     async fn roundtrip(node: &Node) -> anyhow::Result<Vec<u8>> {
+        let addr = spawn_echo_server(&[b"h3"]);
+        roundtrip_to(node, addr).await
+    }
+
+    /// ChaCha20-Poly1305 interop: the server is restricted to TLS 1.3
+    /// ChaCha20 so QUIC header protection takes the ChaCha20 path
+    /// (regression: the HP block counter was once passed to
+    /// `StreamCipherSeek::seek` as a byte offset, so every ChaCha
+    /// handshake against a real peer failed while same-code
+    /// boring↔boring pairs self-cancelled).
+    #[tokio::test]
+    async fn chacha20_handshake_and_echo() {
+        let (endpoint, addr) =
+            crate::quic::testutil::server_endpoint_chacha20(&[b"h3"], true).unwrap();
+        tokio::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                tokio::spawn(async move {
+                    let Ok(conn) = incoming.await else { return };
+                    loop {
+                        match conn.accept_bi().await {
+                            Ok((mut send, mut recv)) => {
+                                tokio::spawn(async move {
+                                    if let Ok(buf) = recv.read_to_end(usize::MAX).await {
+                                        let _ = send.write_all(&buf).await;
+                                        let _ = send.finish();
+                                    }
+                                });
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                });
+            }
+        });
+        let node = skip_verify_node();
+        let cfg = crate::quic::client_config(&node, &[b"h3"], Default::default())
+            .await
+            .unwrap();
+        let mut endpoint = crate::quic::client_endpoint(false).unwrap();
+        endpoint.set_default_client_config(cfg);
+        let conn = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
+        // The server prefers ChaCha20; if it negotiates AES anyway this test
+        // exercises nothing, so assert the suite explicitly.
+        let suite = conn
+            .handshake_data()
+            .and_then(|d| d.downcast::<BoringHandshakeData>().ok())
+            .map(|d| d.cipher_suite);
+        assert_eq!(
+            suite,
+            Some(TLS13_CHACHA20_POLY1305_SHA256),
+            "server must negotiate ChaCha20 for this test to be meaningful"
+        );
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"ping").await.unwrap();
+        send.finish().unwrap();
+        let echoed = recv.read_to_end(usize::MAX).await.unwrap();
+        assert_eq!(echoed, b"ping");
+    }
+
+    /// RFC 9001 §5.4.4 ChaCha20 HP mask against a vector captured from a live
+    /// quic-go handshake (offline-verified: unmasking yields pn 0..3).
+    #[test]
+    fn chacha20_header_protection_mask_vector() {
+        // "quic hp" derived from server handshake traffic secret a4cbec18…f8db31.
+        let hp: [u8; 32] = [
+            0x1f, 0x09, 0x35, 0x02, 0x8d, 0x22, 0xc4, 0x0a, 0xbe, 0x95, 0x2b, 0x3e, 0xee, 0x3d,
+            0x5c, 0x51, 0x28, 0xbc, 0x74, 0x8f, 0x94, 0x04, 0xc4, 0xbd, 0x34, 0x08, 0x99, 0x51,
+            0xcb, 0xdb, 0x09, 0x4d,
+        ];
+        let sample: [u8; 16] = [
+            0x6c, 0x43, 0x66, 0x29, 0x17, 0x1a, 0x6d, 0xe1, 0x4e, 0x3c, 0xc4, 0xec, 0xb8, 0xdc,
+            0xc3, 0x97,
+        ];
+        let key = BoringHeaderKey::ChaCha20(hp);
+        assert_eq!(key.compute_mask(&sample), [0x24, 0xa2, 0x42, 0x9a, 0xec]);
+    }
+
+    async fn roundtrip_to(node: &Node, addr: std::net::SocketAddr) -> anyhow::Result<Vec<u8>> {
         let _ = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::TRACE)
             .with_test_writer()
             .try_init();
-        let addr = spawn_echo_server(&[b"h3"]);
-        let cfg = crate::quic::client_config(node, &[b"h3"], None, None).await?;
+        let cfg = crate::quic::client_config(node, &[b"h3"], Default::default()).await?;
         let mut endpoint = crate::quic::client_endpoint(false)?;
         endpoint.set_default_client_config(cfg);
         let conn = endpoint.connect(addr, "localhost")?.await?;
@@ -863,6 +976,58 @@ mod tests {
         send.finish()?;
         let echoed = recv.read_to_end(usize::MAX).await?;
         Ok(echoed)
+    }
+
+    /// pinSHA256: the handshake succeeds when the server leaf matches the
+    /// pin and fails otherwise — with PKI/hostname checks fully replaced.
+    #[tokio::test]
+    async fn pin_sha256_accepts_matching_cert_and_rejects_others() {
+        let (config, cert_der) =
+            crate::quic::testutil::server_config_with_cert(&[b"h3"], true).unwrap();
+        let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                tokio::spawn(async move {
+                    let Ok(conn) = incoming.await else { return };
+                    loop {
+                        match conn.accept_bi().await {
+                            Ok((mut send, mut recv)) => {
+                                tokio::spawn(async move {
+                                    if let Ok(buf) = recv.read_to_end(usize::MAX).await {
+                                        let _ = send.write_all(&buf).await;
+                                        let _ = send.finish();
+                                    }
+                                });
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                });
+            }
+        });
+
+        use sha2::Digest as _;
+        let pin_hex = sha2::Sha256::digest(&cert_der)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+
+        // Matching pin works even though the cert is self-signed and the
+        // node does not skip verification.
+        let node = Node {
+            tls_pin_sha256: Some(pin_hex),
+            ..Default::default()
+        };
+        let echoed = roundtrip_to(&node, addr).await.unwrap();
+        assert_eq!(&echoed, b"ping");
+
+        // A mismatched pin fails the handshake.
+        let node = Node {
+            tls_pin_sha256: Some("00".repeat(32)),
+            ..Default::default()
+        };
+        assert!(roundtrip_to(&node, addr).await.is_err());
     }
 
     /// Baseline: standard (non-Chrome) mode round-trips through a rustls server.
@@ -1003,8 +1168,14 @@ mod tests {
             crypto::ClientConfig::start_session(Arc::new(rustls_crypto), 1, "localhost", &params)
                 .unwrap();
 
-        let my_cfg =
-            Arc::new(BoringQuicClientConfig::new(b"\x02h3".to_vec(), true, false, None).unwrap());
+        let my_cfg = Arc::new(
+            BoringQuicClientConfig::new(BoringQuicOptions {
+                alpn_wire: b"\x02h3".to_vec(),
+                skip_cert_verify: true,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
         let my_session =
             crypto::ClientConfig::start_session(my_cfg, 1, "localhost", &params).unwrap();
 

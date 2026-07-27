@@ -3,77 +3,45 @@
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use tracing::debug;
 
-use super::DialContext;
-use super::framing::exchange_length_prefixed;
+use super::{DialContext, exchange_with_retry, idle_pool_exchange};
 
-const MAX_POOL_SIZE: usize = 4;
-
-enum TcpStreamSlot {
-    Direct(tokio::net::TcpStream),
-    Boxed(Box<dyn crate::proxy::AsyncReadWrite>),
-}
+/// Direct or proxied pooled TCP stream.
+type PooledStream = Box<dyn crate::proxy::AsyncReadWrite>;
 
 /// Idle-pool plain-TCP DNS client for one upstream.
 pub struct TcpPool {
     dial: DialContext,
-    idle: Mutex<Vec<TcpStreamSlot>>,
+    idle: Mutex<Vec<PooledStream>>,
 }
 
 impl TcpPool {
     pub fn new(dial: DialContext) -> Arc<Self> {
         Arc::new(Self {
             dial,
-            idle: Mutex::new(Vec::with_capacity(MAX_POOL_SIZE)),
+            idle: Mutex::new(Vec::new()),
         })
     }
 
     pub async fn exchange(self: &Arc<Self>, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
-        match self.exchange_once(raw_query).await {
-            Ok(r) => Ok(r),
-            Err(first) => {
-                debug!("TCP DNS exchange failed ({first}); redialing once");
-                self.exchange_once(raw_query).await.map_err(|e| {
-                    anyhow::anyhow!("TCP DNS failed after retry: {e} (first: {first})")
-                })
-            }
-        }
+        exchange_with_retry("TCP DNS", || self.exchange_once(raw_query), || async {}).await
     }
 
     async fn exchange_once(&self, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let mut slot = {
-            let taken = self.idle.lock().pop();
-            match taken {
-                Some(s) => s,
-                None => self.dial_new().await?,
-            }
-        };
-        let result = match &mut slot {
-            TcpStreamSlot::Direct(s) => {
-                exchange_length_prefixed(s, raw_query, self.dial.query_timeout).await
-            }
-            TcpStreamSlot::Boxed(s) => {
-                exchange_length_prefixed(s, raw_query, self.dial.query_timeout).await
-            }
-        };
-        match result {
-            Ok(resp) => {
-                let mut idle = self.idle.lock();
-                if idle.len() < MAX_POOL_SIZE {
-                    idle.push(slot);
-                }
-                Ok(resp)
-            }
-            Err(e) => Err(e),
-        }
+        idle_pool_exchange(
+            &self.idle,
+            || self.dial_new(),
+            raw_query,
+            self.dial.query_timeout,
+        )
+        .await
     }
 
-    async fn dial_new(&self) -> anyhow::Result<TcpStreamSlot> {
+    async fn dial_new(&self) -> anyhow::Result<PooledStream> {
         if self.dial.proxy.is_some() {
-            Ok(TcpStreamSlot::Boxed(self.dial.dial_tcp_boxed().await?))
+            self.dial.dial_tcp_boxed().await
         } else {
-            Ok(TcpStreamSlot::Direct(self.dial.dial_tcp().await?))
+            Ok(Box::new(self.dial.dial_tcp().await?))
         }
     }
 }

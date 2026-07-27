@@ -10,60 +10,51 @@ use std::time::Duration;
 use bytes::{Buf, Bytes};
 use h3::client::SendRequest;
 use h3_quinn::Connection as H3QuinnConnection;
-use http::{Method, Request};
-use quinn::{ClientConfig, Endpoint};
+use quinn::ClientConfig;
 use tokio::sync::Mutex;
 use tracing::debug;
 
 use crate::dns::endpoint::DnsEndpoint;
 
-use super::framing::{force_dns_id_zero, restore_dns_id};
+use super::framing::force_dns_id_zero;
+use super::{
+    SharedQuicEndpoint, build_doh_request, dns_quic_config, exchange_with_retry,
+    finish_doh_response, quic_connect,
+};
+
+type H3Sender = SendRequest<h3_quinn::OpenStreams, Bytes>;
 
 /// DoH3 client for one upstream.
 pub struct Doh3Client {
     endpoint: DnsEndpoint,
     query_timeout: Duration,
     quic_config: ClientConfig,
-    state: Mutex<Doh3State>,
-}
-
-struct Doh3State {
-    ep: Option<Endpoint>,
+    quic_ep: SharedQuicEndpoint,
     /// Open H3 request sender; `None` forces redial.
-    sender: Option<SendRequest<h3_quinn::OpenStreams, Bytes>>,
+    sender: Mutex<Option<H3Sender>>,
 }
 
 impl Doh3Client {
     pub async fn new(endpoint: DnsEndpoint, query_timeout: Duration) -> anyhow::Result<Arc<Self>> {
-        let quic_config = honk_outbound::quic::client_config(
-            &Default::default(),
-            &[b"h3"],
-            Some("cubic"),
-            Some(Duration::from_secs(15)),
-        )
-        .await?;
+        let quic_config = dns_quic_config(&[b"h3"]).await?;
         Ok(Arc::new(Self {
             endpoint,
             query_timeout,
             quic_config,
-            state: Mutex::new(Doh3State {
-                ep: None,
-                sender: None,
-            }),
+            quic_ep: SharedQuicEndpoint::new(),
+            sender: Mutex::new(None),
         }))
     }
 
     pub async fn exchange(self: &Arc<Self>, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
-        match self.exchange_once(raw_query).await {
-            Ok(r) => Ok(r),
-            Err(first) => {
-                debug!("DoH3 exchange failed ({first}); resetting and retrying");
-                self.state.lock().await.sender = None;
-                self.exchange_once(raw_query)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("DoH3 failed after retry: {e} (first: {first})"))
-            }
-        }
+        exchange_with_retry(
+            "DoH3",
+            || self.exchange_once(raw_query),
+            || async {
+                self.sender.lock().await.take();
+            },
+        )
+        .await
     }
 
     async fn exchange_once(&self, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
@@ -72,21 +63,7 @@ impl Doh3Client {
         let mut wire = raw_query.to_vec();
         let orig_id = force_dns_id_zero(&mut wire);
 
-        let path = if self.endpoint.path.is_empty() {
-            "/dns-query"
-        } else {
-            self.endpoint.path.as_str()
-        };
-        let authority = authority(&self.endpoint.host, self.endpoint.port);
-        let uri = format!("https://{authority}{path}");
-
-        let req = Request::builder()
-            .method(Method::POST)
-            .uri(uri)
-            .header("content-type", "application/dns-message")
-            .header("accept", "application/dns-message")
-            .body(())
-            .map_err(|e| anyhow::anyhow!("DoH3 request build: {e}"))?;
+        let req = build_doh_request(&self.endpoint, None, "DoH3")?;
 
         let mut stream = sender
             .send_request(req)
@@ -127,45 +104,27 @@ impl Doh3Client {
             }
         }
 
-        if !status.is_success() {
-            anyhow::bail!("DoH3 HTTP status {status}");
-        }
-        if buf.len() < 12 {
-            anyhow::bail!("DoH3 response too short ({} bytes)", buf.len());
-        }
-        restore_dns_id(&mut buf, orig_id);
-        Ok(buf)
+        finish_doh_response("DoH3", status, buf, orig_id)
     }
 
-    async fn get_sender(&self) -> anyhow::Result<SendRequest<h3_quinn::OpenStreams, Bytes>> {
+    async fn get_sender(&self) -> anyhow::Result<H3Sender> {
         {
-            let st = self.state.lock().await;
-            if let Some(s) = st.sender.clone() {
+            let sender = self.sender.lock().await;
+            if let Some(s) = sender.clone() {
                 return Ok(s);
             }
         }
 
         let addr: SocketAddr = self.endpoint.resolve_addr().await?;
-        let ipv6 = addr.is_ipv6();
-
-        let ep = {
-            let mut st = self.state.lock().await;
-            if st.ep.is_none() {
-                let ep = honk_outbound::quic::client_endpoint(ipv6)
-                    .map_err(|e| anyhow::anyhow!("DoH3 endpoint: {e}"))?;
-                st.ep = Some(ep);
-            }
-            st.ep.as_ref().expect("endpoint just inserted").clone()
-        };
-
-        let connecting = ep
-            .connect_with(self.quic_config.clone(), addr, &self.endpoint.sni)
-            .map_err(|e| anyhow::anyhow!("DoH3 connect_with: {e}"))?;
-
-        let conn = tokio::time::timeout(self.query_timeout, connecting)
-            .await
-            .map_err(|_| anyhow::anyhow!("DoH3 QUIC handshake timed out"))?
-            .map_err(|e| anyhow::anyhow!("DoH3 QUIC handshake: {e}"))?;
+        let conn = quic_connect(
+            &self.quic_ep,
+            &self.quic_config,
+            addr,
+            &self.endpoint.sni,
+            self.query_timeout,
+            "DoH3 QUIC",
+        )
+        .await?;
 
         let quinn_conn = H3QuinnConnection::new(conn);
         let (mut driver, sender) = h3::client::new(quinn_conn)
@@ -179,20 +138,7 @@ impl Doh3Client {
             debug!("DoH3 driver closed: {err}");
         });
 
-        self.state.lock().await.sender = Some(sender.clone());
+        *self.sender.lock().await = Some(sender.clone());
         Ok(sender)
-    }
-}
-
-fn authority(host: &str, port: u16) -> String {
-    let host_fmt = if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]")
-    } else {
-        host.to_string()
-    };
-    if port == 443 {
-        host_fmt
-    } else {
-        format!("{host_fmt}:{port}")
     }
 }

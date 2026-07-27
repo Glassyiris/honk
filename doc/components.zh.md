@@ -86,7 +86,12 @@ dae 语法中节点**只能以分享链接书写**：`tag: 'scheme://...'` 或�
 | `network` | string? | null | V2Ray 风格 network 提示 |
 | `ws_path` / `ws_host` | string? | null | WebSocket；链接 `path` / `host` 参数 |
 | `grpc_service` | string? | null | gRPC service 名；链接 `serviceName` 参数 |
-| `hy2_auth` / `hy2_obfs` | string? | null | Hysteria2 |
+| `hy2_auth` / `hy2_obfs` | string? | null | Hysteria2 认证 / salamander 混淆密码 |
+| `hy2_up_mbps` / `hy2_down_mbps` | u32? | null | Hysteria2 brutal 带宽（`upmbps`/`downmbps`） |
+| `hy2_port_hopping` / `hy2_hop_interval` | string? / u64? | null | Hysteria2 端口跳跃（`mport`/`mhop`） |
+| `hy2_init_stream_recv_window` / `hy2_init_conn_recv_window` | u64? | null | Hysteria2 QUIC 接收窗口 |
+| `hy2_disable_mtu_discovery` | bool? | null | Hysteria2 `disablePathMTUDiscovery` |
+| `tls_pin_sha256` | string? | null | 叶证书 SHA-256 固定（`pinSHA256=`） |
 | `tuic_uuid` / `tuic_password` / `tuic_congestion` | string? | null | TUIC |
 | `juicity_uuid` / `juicity_password` | string? | null | Juicity |
 | `anytls_password` | string? | null | AnyTLS 密钥（等于链接密码） |
@@ -113,7 +118,7 @@ dae 语法中节点**只能以分享链接书写**：`tag: 'scheme://...'` 或�
 | `vless` | | 是 | 否 | 头里的 UDP 仅测试存在 |
 | `socks5` | | 是 | 是 | UDP ASSOCIATE |
 | `http` | | 是* | — | 走类似 direct 的拨号 |
-| `hysteria2` | | 是 | 是 | 真实 QUIC/H3；salamander；BBR（无 brutal） |
+| `hysteria2` | | 是 | 是 | 真实 QUIC/H3；salamander；brutal（配带宽时）或 BBR；端口跳跃 |
 | `tuic` | | 是 | 是 | TUIC v5 / quinn |
 | `juicity` | | 是 | 是 | quinn 双向流 UDP |
 | `anytls` | | 是 | 是 | 会话池 + UoT v2 |
@@ -169,7 +174,13 @@ node {
 
 **Hysteria2 / TUIC / Juicity**
 
-使用分享链接（`hysteria2://` / `tuic://` / `juicity://`），链接解析后填充 `hy2_*` / `tuic_*` / `juicity_*` 字段。QUIC ALPN/拥塞控制跟随 Handler 默认（Hy2 使用 BBR）。
+使用分享链接（`hysteria2://` / `tuic://` / `juicity://`），链接解析后填充 `hy2_*` / `tuic_*` / `juicity_*` 字段。QUIC ALPN/拥塞控制跟随 Handler 默认（无带宽提示时 Hy2 使用 BBR）。hysteria2 链接中 userinfo 为认证密钥（→ `hy2_auth`），`obfs=salamander&obfs-password=<pwd>` 映射到 `hy2_obfs`，`upmbps`/`downmbps` 启用 brutal 发送端并通过 `Hysteria-CC-RX` 通告下行带宽，`mport`/`mhop` 启用客户端端口跳跃（服务端需将端口段 DNAT 到监听端口），`pinSHA256=<hex>` 固定叶证书指纹（替代 PKI/域名校验），`initStreamReceiveWindow`/`initConnReceiveWindow`/`disablePathMTUDiscovery` 调整 QUIC 传输参数：
+
+```dae
+node {
+    hy2: 'hysteria2://secret@example.com:443?sni=example.com&insecure=1&obfs=salamander&obfs-password=obfspw&upmbps=50&downmbps=200&mport=20000-30000&mhop=30#hy2'
+}
+```
 
 ### 分享链接 scheme
 
@@ -214,6 +225,7 @@ group {
 | `check_url` | string? | null | 覆盖全局 TCP 检查 URL（结构化模型字段，dae 语法无对应键） |
 | `check_interval` | u64? | null | 覆盖间隔（秒）（结构化模型字段，dae 语法无对应键） |
 | `tolerance` | u64 | `50` | URLTest 滞后（ms）；`0` = 任一更优即切（结构化模型字段，dae 语法无对应键；dae 用全局 `check_tolerance`） |
+| `check_url` | string | （全局） | 按组自定义探活目标（仅 URLTest 组，sing-box urltest `url`）；dae：`check_url: 'http://...'` |
 | `idle_timeout` | u64? | null | 空闲后停止检查（秒）；0/None = 永不（结构化模型字段，dae 语法无对应键） |
 | `interrupt_connections` | bool | `false` | 选择变化时打断连接（结构化模型字段，dae 语法无对应键） |
 | `created_at` | datetime | now | 元数据 |
@@ -495,8 +507,12 @@ honk-core delay <node> [--url HOST:PORT]
 | 域 | Tcp、DnsUdp、DataUdp × v4/v6 |
 | TCP 探测 | 对 `tcp_check_url` 发 HTTP，或裸连接 |
 | UDP 探测 | 经节点 `dial_udp` 向 `udp_check_dns` 发 DNS |
+| 按组 check URL | 配了 `check_url` 的组按其目标探测成员（子组成员经其当前选中节点探测，结果记到子组 tag,与 sing-box RealTag 一致）；(tag, url) 状态与全局独立——对该 URL 死亡只把该成员排除出该组 |
 | 并发 | 默认批次 10 |
 | 恢复 | 连续 2 次成功 |
+| 深度退避 | 连续失败 10 次后仍以 max_cooldown（300s）慢速节奏继续探测，不永久停止 |
+| 拨号失败 | 立即清除延迟历史（sing-box `DeleteURLTestHistory`）；节点 alive→dead 翻转时清除其连接池条目并回收 UDP endpoint |
+| 延迟持久化 | 每节点最近真实延迟样本写入 cache.db（60s 周期），启动时恢复，超过 24h 丢弃 |
 | 新节点宽限 | 约 60s |
 | URLTest 空闲 | `idle_timeout` 停止未使用组的探测 |
 | eBPF 推送 | 已死出站不再被 redirect |

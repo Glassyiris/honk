@@ -331,6 +331,44 @@ fn base_builder(skip_cert_verify: bool) -> anyhow::Result<boring::ssl::SslConnec
     Ok(builder)
 }
 
+/// Parse a `pinSHA256` value (hex, optionally colon-separated) into 32 bytes.
+pub fn parse_pin_sha256(s: &str) -> Option<[u8; 32]> {
+    let hex: String = s
+        .chars()
+        .filter(|c| *c != ':' && !c.is_whitespace())
+        .collect();
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Custom verify callback matching the peer leaf certificate's SHA-256
+/// against a configured pin (`pinSHA256` semantics: replaces PKI chain and
+/// hostname verification entirely).
+pub fn pin_sha256_custom_verify(
+    pin: [u8; 32],
+) -> impl Fn(&mut boring::ssl::SslRef) -> Result<(), boring::ssl::SslVerifyError> + Send + Sync + 'static
+{
+    move |ssl| {
+        let matches = ssl
+            .peer_certificate()
+            .and_then(|cert| cert.digest(boring::hash::MessageDigest::sha256()).ok())
+            .is_some_and(|digest| digest.as_ref() == pin);
+        if matches {
+            Ok(())
+        } else {
+            Err(boring::ssl::SslVerifyError::Invalid(
+                boring::ssl::SslAlert::BAD_CERTIFICATE,
+            ))
+        }
+    }
+}
+
 fn apply_chrome_ctx(builder: &mut boring::ssl::SslConnectorBuilder) -> anyhow::Result<()> {
     builder.set_grease_enabled(true);
     builder.set_sigalgs_list(CHROME_SIGALGS)?;
@@ -343,7 +381,11 @@ pub fn build_connector(node: &Node) -> anyhow::Result<TlsConnector> {
     let chrome = chrome_mode();
     let ech_config_list = load_ech_config_list(node)?;
 
-    let mut builder = base_builder(node.skip_cert_verify)?;
+    let pin = node.tls_pin_sha256.as_deref().and_then(parse_pin_sha256);
+    let mut builder = base_builder(node.skip_cert_verify || pin.is_some())?;
+    if let Some(pin) = pin {
+        builder.set_custom_verify_callback(SslVerifyMode::PEER, pin_sha256_custom_verify(pin));
+    }
     if chrome {
         apply_chrome_ctx(&mut builder)?;
         builder.set_alpn_protos(CHROME_ALPN_WIRE)?;
@@ -643,7 +685,8 @@ mod tests {
     }
 
     #[test]
-    fn decode_ech_base64_variants() {        let raw = b"\xff\x00abc";
+    fn decode_ech_base64_variants() {
+        let raw = b"\xff\x00abc";
         for encoded in [
             general_purpose::STANDARD.encode(raw),
             general_purpose::URL_SAFE.encode(raw),
@@ -726,7 +769,11 @@ mod tests {
         )));
         assert_eq!(discover_ech_config("ech-neg-unique.test").await, None);
         assert_eq!(discover_ech_config("ech-neg-unique.test").await, None);
-        assert_eq!(count.load(AOrd::SeqCst), 1, "negative lookup must hit cache");
+        assert_eq!(
+            count.load(AOrd::SeqCst),
+            1,
+            "negative lookup must hit cache"
+        );
 
         // IP literals never query.
         assert_eq!(discover_ech_config("203.0.113.7").await, None);
@@ -762,5 +809,23 @@ mod tests {
         stream.shutdown().await.unwrap();
         assert_eq!(server.join().unwrap(), b"ok");
         crate::bootstrap::set_global(None);
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+
+    #[test]
+    fn parse_pin_sha256_variants() {
+        let hex = "a".repeat(64);
+        assert!(parse_pin_sha256(&hex).is_some());
+        let colon = (0..32).map(|_| "ab").collect::<Vec<_>>().join(":");
+        assert!(parse_pin_sha256(&colon).is_some());
+        assert_eq!(parse_pin_sha256(&colon).unwrap(), [0xab; 32]);
+        assert!(parse_pin_sha256("zz").is_none());
+        assert!(parse_pin_sha256("abcd").is_none());
+        // Uppercase hex is valid.
+        assert!(parse_pin_sha256(&"AB".repeat(32)).is_some());
     }
 }

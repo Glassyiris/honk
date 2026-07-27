@@ -185,7 +185,7 @@ experimental {
         default_mode: 'Rule'
     }
     cache_file {
-        enabled: false
+        enabled: true
         path: 'cache.db'
         cache_id: ''
         store_fakeip: false

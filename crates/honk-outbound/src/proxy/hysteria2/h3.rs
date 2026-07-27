@@ -622,18 +622,24 @@ pub(super) const H3_FRAME_SETTINGS: u64 = 0x04;
 pub(super) const H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY: u64 = 0x01;
 pub(super) const H3_SETTINGS_QPACK_BLOCKED_STREAMS: u64 = 0x07;
 pub(super) const H3_SETTINGS_ENABLE_CONNECT_PROTOCOL: u64 = 0x08;
-pub(super) const H3_SETTINGS_DATAGRAM: u64 = 0x33;
 
 /// Client connection preface: control stream type + SETTINGS frame. Mirrors
 /// the settings quic-go's http3 client sends (`http3/client.go:119-125`):
-/// no QPACK dynamic table, extended CONNECT and H3 datagrams enabled.
+/// no QPACK dynamic table, extended CONNECT enabled.
+///
+/// `H3_SETTINGS_DATAGRAM` must NOT be sent: the official hysteria2 client
+/// leaves it off (`http3.Transport.EnableDatagrams` unset). Advertising it
+/// makes the server's quic-go http3 layer spawn its own `ReceiveDatagram`
+/// loop (`http3/conn.go`), which races hysteria's UDP session manager for
+/// every QUIC datagram and silently swallows the ones it wins — the
+/// longest-waiting reader wins, which deterministically eats the first
+/// datagram after connect.
 pub(super) fn client_preface() -> Vec<u8> {
     let mut payload = Vec::new();
     for (id, value) in [
         (H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY, 0),
         (H3_SETTINGS_QPACK_BLOCKED_STREAMS, 0),
         (H3_SETTINGS_ENABLE_CONNECT_PROTOCOL, 1),
-        (H3_SETTINGS_DATAGRAM, 1),
     ] {
         write_varint(&mut payload, id);
         write_varint(&mut payload, value);

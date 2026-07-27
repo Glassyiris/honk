@@ -20,9 +20,7 @@ pub fn set_mark_best_effort(socket: &socket2::Socket, mark: u32) -> io::Result<(
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
-                tracing::debug!(
-                    "SO_MARK denied (unprivileged); continuing without bypass mark"
-                );
+                tracing::debug!("SO_MARK denied (unprivileged); continuing without bypass mark");
             });
             Ok(())
         }

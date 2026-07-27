@@ -137,52 +137,161 @@ pub(super) fn salamander_open(password: &[u8], buf: &mut [u8]) -> Option<usize> 
     Some(len)
 }
 
-/// quinn `AsyncUdpSocket` that applies salamander obfuscation to every
-/// datagram, letting QUIC run transparently over the obfuscated channel
-/// (`client.go:275-277`).
+/// quinn `AsyncUdpSocket` for hysteria2 with optional salamander
+/// obfuscation and optional client-side port hopping (`mport`/`mhop`).
 ///
 /// Built directly on a tokio socket (no GSO/GRO segmentation), so every
 /// `Transmit`/`RecvMeta` carries exactly one datagram to (de)obfuscate.
 #[derive(Debug)]
-pub(super) struct SalamanderSocket {
+pub(super) struct Hy2UdpSocket {
     // pub(super): hysteria2 tests construct the socket directly for the
     // obfuscated-server fixture.
     pub(super) socket: Arc<tokio::net::UdpSocket>,
-    pub(super) password: Arc<[u8]>,
+    /// Salamander obfuscation password; `None` sends/receives plaintext.
+    pub(super) obfs: Option<Arc<[u8]>>,
+    pub(super) hop: Mutex<Option<HopState>>,
 }
 
-impl SalamanderSocket {
-    fn new(ipv6: bool, password: Arc<[u8]>) -> io::Result<Self> {
+impl Hy2UdpSocket {
+    fn new(
+        ipv6: bool,
+        obfs: Option<Arc<[u8]>>,
+        hop: Option<(Vec<u16>, Duration)>,
+    ) -> io::Result<Self> {
         let std_socket = crate::quic::marked_udp_socket(ipv6)?;
         let socket = tokio::net::UdpSocket::from_std(std_socket)?;
         Ok(Self {
             socket: Arc::new(socket),
-            password,
+            obfs,
+            hop: Mutex::new(hop.map(|(ports, interval)| HopState::new(ports, interval))),
         })
     }
 }
 
+/// Client-side port hopping state: every `interval` the next outbound
+/// datagram goes to a random different port from the hopping list (the
+/// official client's `hopLoop`; the server side is expected to DNAT the
+/// whole range onto its listen port).
 #[derive(Debug)]
-pub(super) struct SalamanderPoller {
+pub(super) struct HopState {
+    ports: Vec<u16>,
+    interval: Duration,
+    pub(super) last_hop: Instant,
+    current: Option<u16>,
+    /// The connection's nominal remote port (learned from the first send).
+    /// Received packets have their source port rewritten to it: with
+    /// server-side DNAT, reply sources are rewritten to the hop port by
+    /// conntrack, and QUIC must see a stable peer address (sing-quic's
+    /// hopping conn does the same substitution).
+    base: Option<u16>,
+}
+
+impl HopState {
+    pub(super) fn new(ports: Vec<u16>, interval: Duration) -> Self {
+        Self {
+            ports,
+            interval,
+            last_hop: Instant::now(),
+            current: None,
+            base: None,
+        }
+    }
+
+    /// Destination port for the next outbound datagram. The very first call
+    /// already hops (official client parity: the initial handshake dials a
+    /// random port from the hopping list, never the base port — mixing a
+    /// direct base-port flow with DNAT'd hop flows makes NAT clash
+    /// resolution remap the source port mid-connection).
+    pub(super) fn port(&mut self, base: u16) -> u16 {
+        if self.ports.is_empty() {
+            return base;
+        }
+        self.base.get_or_insert(base);
+        if let Some(current) = self.current
+            && self.last_hop.elapsed() < self.interval
+        {
+            return current;
+        }
+        let next = if self.ports.len() == 1 {
+            self.ports[0]
+        } else {
+            let mut rng = rand::rng();
+            loop {
+                let p = self.ports[rng.random_range(0..self.ports.len())];
+                if Some(p) != self.current {
+                    break p;
+                }
+            }
+        };
+        self.current = Some(next);
+        self.last_hop = Instant::now();
+        next
+    }
+
+    /// Nominal remote port for receive-side source rewriting (see above).
+    pub(super) fn base_port(&self) -> Option<u16> {
+        self.base
+    }
+}
+
+/// Parse an `mport` list (`20000-30000` / `8080,8888-8890`) into ports.
+pub(super) fn parse_port_hopping(spec: &str) -> Option<Vec<u16>> {
+    let mut ports = Vec::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        match part.split_once('-') {
+            Some((lo, hi)) => {
+                let lo: u16 = lo.trim().parse().ok()?;
+                let hi: u16 = hi.trim().parse().ok()?;
+                if hi < lo {
+                    return None;
+                }
+                ports.extend(lo..=hi);
+            }
+            None => ports.push(part.parse().ok()?),
+        }
+    }
+    (!ports.is_empty()).then_some(ports)
+}
+
+#[derive(Debug)]
+pub(super) struct Hy2UdpPoller {
     socket: Arc<tokio::net::UdpSocket>,
 }
 
-impl UdpPoller for SalamanderPoller {
+impl UdpPoller for Hy2UdpPoller {
     fn poll_writable(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.socket.poll_send_ready(cx)
     }
 }
 
-impl AsyncUdpSocket for SalamanderSocket {
+impl AsyncUdpSocket for Hy2UdpSocket {
     fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
-        Box::pin(SalamanderPoller {
+        Box::pin(Hy2UdpPoller {
             socket: Arc::clone(&self.socket),
         })
     }
 
     fn try_send(&self, transmit: &quinn::udp::Transmit) -> io::Result<()> {
-        let packet = salamander_seal(&self.password, transmit.contents);
-        self.socket.try_send_to(&packet, transmit.destination)?;
+        let dest = match &mut *self.hop.lock() {
+            Some(state) => SocketAddr::new(
+                transmit.destination.ip(),
+                state.port(transmit.destination.port()),
+            ),
+            None => transmit.destination,
+        };
+        match &self.obfs {
+            Some(password) => {
+                let packet = salamander_seal(password, transmit.contents);
+                self.socket.try_send_to(&packet, dest)?;
+            }
+            None => {
+                self.socket.try_send_to(transmit.contents, dest)?;
+            }
+        }
         Ok(())
     }
 
@@ -197,7 +306,18 @@ impl AsyncUdpSocket for SalamanderSocket {
             let mut read_buf = ReadBuf::new(&mut buf[..]);
             match self.socket.poll_recv_from(cx, &mut read_buf) {
                 Poll::Ready(Ok(addr)) => {
-                    if let Some(len) = salamander_open(&self.password, read_buf.filled_mut()) {
+                    let len = match &self.obfs {
+                        Some(password) => salamander_open(password, read_buf.filled_mut()),
+                        None => Some(read_buf.filled().len()),
+                    };
+                    if let Some(len) = len {
+                        // With port hopping, DNAT on the server side rewrites
+                        // reply sources to the current hop port; present the
+                        // nominal remote to QUIC instead (see `HopState`).
+                        let addr = match self.hop.lock().as_ref().and_then(|h| h.base_port()) {
+                            Some(base) => SocketAddr::new(addr.ip(), base),
+                            None => addr,
+                        };
                         *meta_slot = quinn::udp::RecvMeta {
                             addr,
                             len,
@@ -240,12 +360,14 @@ impl AsyncUdpSocket for SalamanderSocket {
     }
 }
 
-/// Endpoint factory for salamander-obfuscated QUIC connections.
-pub(super) fn salamander_endpoint_factory(
-    password: Arc<[u8]>,
+/// Endpoint factory for hysteria2 QUIC connections with optional salamander
+/// obfuscation and/or port hopping (`client.go:275-277`).
+pub(super) fn hy2_endpoint_factory(
+    obfs: Option<Arc<[u8]>>,
+    hop: Option<(Vec<u16>, Duration)>,
 ) -> impl Fn(bool) -> io::Result<Endpoint> + Send + Sync {
     move |ipv6| {
-        let socket = Arc::new(SalamanderSocket::new(ipv6, Arc::clone(&password))?);
+        let socket = Arc::new(Hy2UdpSocket::new(ipv6, obfs.clone(), hop.clone())?);
         let runtime = quinn::default_runtime()
             .ok_or_else(|| io::Error::other("no async runtime available for QUIC"))?;
         Endpoint::new_with_abstract_socket(EndpointConfig::default(), None, socket, runtime)

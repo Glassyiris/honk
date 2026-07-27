@@ -128,8 +128,6 @@ pub struct DnsRouter {
     response_fallback: DnsResponseAction,
     /// Per-domain fixed TTL. Some(0) = never cache; Some(n) = cache with TTL n.
     fixed_domain_ttl: HashMap<String, u32>,
-    /// The fallback upstream name (best-effort for legacy callers).
-    fallback_name: String,
     /// Total rule count (request + response).
     rule_count: usize,
 }
@@ -198,12 +196,6 @@ impl DnsRouter {
             });
         }
 
-        let fallback_name = match &request.fallback {
-            DnsRequestAction::Upstream(name) => name.clone(),
-            DnsRequestAction::Reject => "reject".to_string(),
-            DnsRequestAction::AsIs => "asis".to_string(),
-        };
-
         let rule_count = request_rules.len() + response_rules.len();
 
         Ok(Self {
@@ -212,7 +204,6 @@ impl DnsRouter {
             response_rules,
             response_fallback: response.fallback.clone(),
             fixed_domain_ttl: fixed_domain_ttl.clone(),
-            fallback_name,
             rule_count,
         })
     }
@@ -303,11 +294,6 @@ impl DnsRouter {
     // -----------------------------------------------------------------------
     // Accessors
     // -----------------------------------------------------------------------
-
-    /// Best-effort fallback upstream name for legacy callers.
-    pub fn fallback_upstream(&self) -> &str {
-        &self.fallback_name
-    }
 
     /// Total number of compiled rules (request + response).
     pub fn rule_count(&self) -> usize {
@@ -883,15 +869,5 @@ mod tests {
         };
         let router = DnsRouter::new(&routing).unwrap();
         assert_eq!(router.rule_count(), 1);
-    }
-
-    #[test]
-    fn test_fallback_upstream() {
-        let routing = DnsRouting {
-            fallback: "myfallback".into(),
-            ..Default::default()
-        };
-        let router = DnsRouter::new(&routing).unwrap();
-        assert_eq!(router.fallback_upstream(), "myfallback");
     }
 }

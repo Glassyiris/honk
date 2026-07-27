@@ -18,7 +18,7 @@ where
     read_length_prefixed(stream, query_timeout).await
 }
 
-pub async fn write_length_prefixed<S>(stream: &mut S, raw_query: &[u8]) -> anyhow::Result<()>
+pub(super) async fn write_length_prefixed<S>(stream: &mut S, raw_query: &[u8]) -> anyhow::Result<()>
 where
     S: AsyncWrite + Unpin,
 {
@@ -30,7 +30,7 @@ where
     Ok(())
 }
 
-pub async fn read_length_prefixed<S>(
+pub(super) async fn read_length_prefixed<S>(
     stream: &mut S,
     query_timeout: Duration,
 ) -> anyhow::Result<Vec<u8>>

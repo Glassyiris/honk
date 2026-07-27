@@ -273,12 +273,33 @@ Geo assets: place `geoip.dat` / `geosite.dat` where the runtime can load them (r
 ```dae
 routing {
     pname(dnsmasq) && l4proto(udp) && dport(53) -> direct(must)
-    dip(geoip: private) -> direct
+    dip(geoip: private) -> direct(must)
     domain(geosite: geolocation-cn) -> direct
     domain(suffix: google.com) -> proxy
     fallback: direct
 }
 ```
+
+### When nodes fail (fail-closed semantics)
+
+honk follows Go dae's fail-closed datapath: once health checking marks an
+outbound dead, eBPF **drops** new flows routed to it (`TC_ACT_SHOT`). With a
+single-node `fallback`, a dead node means all proxied traffic is dropped —
+this is intentional (no silent direct leakage), not a bug. DNS to port 53
+(TCP and UDP) is always exempted and still reaches the control plane, so a
+direct-pinned DNS upstream keeps name resolution alive during an outage.
+
+To keep the router itself reachable no matter what:
+
+- honk auto-injects `dip(<every lan/wan interface address>) -> direct(must)`
+  at startup and on each reload, so the admin UI / SSH / clash API never
+  depend on node health.
+- Add `dip(geoip: private) -> direct(must)` to cover the rest of the LAN
+  (printers, other routers, NAS) — it costs nothing and matches dae's
+  example config.
+- For internet resilience, point `fallback` at a `fallback`-policy group
+  with two or more nodes instead of a single node, and keep at least one
+  DNS upstream on a direct path (e.g. `udp://223.5.5.5`).
 
 ## 9. DNS
 
@@ -368,7 +389,7 @@ experimental {
 
 Useful endpoints: `/proxies`, `/proxies/{name}` (PUT selector), `/proxies/{name}/delay`, `/group/{name}/delay`, `/connections`, `/traffic`, `/logs`, `/dns/query`, `/stats`.
 
-Env: `HONK_UI_DOWNLOAD_URL` overrides the default Yacd-meta zip URL when `external_ui` is empty/missing.
+Env: `HONK_UI_DOWNLOAD_URL` overrides the default zashboard zip URL when `external_ui` is empty/missing.
 
 ### Cache file
 

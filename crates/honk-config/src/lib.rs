@@ -19,4 +19,3 @@ pub mod types;
 
 pub use config::Config;
 pub use error::ConfigError;
-pub use experimental::ExperimentalConfig;

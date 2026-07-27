@@ -114,9 +114,10 @@ async fn start_obfs_server(password: &'static str, obfs_password: &'static [u8])
     let config = testutil::server_config(&[b"h3"], true).unwrap();
     let std_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     std_socket.set_nonblocking(true).unwrap();
-    let socket = Arc::new(SalamanderSocket {
+    let socket = Arc::new(Hy2UdpSocket {
         socket: Arc::new(tokio::net::UdpSocket::from_std(std_socket).unwrap()),
-        password: Arc::from(obfs_password),
+        obfs: Some(Arc::from(obfs_password)),
+        hop: Mutex::new(None),
     });
     let runtime = quinn::default_runtime().unwrap();
     let endpoint = Endpoint::new_with_abstract_socket(
@@ -714,4 +715,307 @@ async fn test_salamander_wrong_obfs_password_rejected() {
         .dial(&node, target, None, Duration::from_secs(1))
         .await;
     assert!(result.is_err(), "wrong obfs password must fail the dial");
+}
+
+// --- E2E against a real, officially-deployed hysteria2 server ---
+//
+// Gated on environment variables so CI is unaffected:
+//   HONK_HY2_SERVER=host:port   (required; tests skip silently without it)
+//   HONK_HY2_PASSWORD=...       (server auth password)
+//   HONK_HY2_OBFS=...           (optional salamander obfs password)
+
+fn e2e_node() -> Option<Node> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+    let server = std::env::var("HONK_HY2_SERVER").ok()?;
+    let (host, port) = server.rsplit_once(':')?;
+    let port: u16 = port.parse().ok()?;
+    Some(Node {
+        name: "hy2-e2e".to_string(),
+        protocol: NodeProtocol::Hysteria2,
+        host: host.to_string(),
+        address: server,
+        port,
+        hy2_auth: std::env::var("HONK_HY2_PASSWORD").ok(),
+        hy2_obfs: std::env::var("HONK_HY2_OBFS")
+            .ok()
+            .filter(|s| !s.is_empty()),
+        hy2_up_mbps: std::env::var("HONK_HY2_UP_MBPS")
+            .ok()
+            .and_then(|v| v.parse().ok()),
+        hy2_down_mbps: std::env::var("HONK_HY2_DOWN_MBPS")
+            .ok()
+            .and_then(|v| v.parse().ok()),
+        hy2_port_hopping: std::env::var("HONK_HY2_MPORT")
+            .ok()
+            .filter(|s| !s.is_empty()),
+        hy2_hop_interval: std::env::var("HONK_HY2_MHOP")
+            .ok()
+            .and_then(|v| v.parse().ok()),
+        tls_pin_sha256: std::env::var("HONK_HY2_PIN").ok().filter(|s| !s.is_empty()),
+        hy2_init_stream_recv_window: std::env::var("HONK_HY2_STREAM_RWND")
+            .ok()
+            .and_then(|v| v.parse().ok()),
+        hy2_init_conn_recv_window: std::env::var("HONK_HY2_CONN_RWND")
+            .ok()
+            .and_then(|v| v.parse().ok()),
+        hy2_disable_mtu_discovery: std::env::var("HONK_HY2_DISABLE_PMTUD")
+            .ok()
+            .and_then(|v| v.parse::<u8>().ok())
+            .map(|v| v == 1),
+        // Deployed with a self-signed certificate.
+        skip_cert_verify: true,
+        ..Default::default()
+    })
+}
+
+#[tokio::test]
+async fn test_e2e_real_server_tcp_http() {
+    let Some(node) = e2e_node() else {
+        eprintln!("HONK_HY2_SERVER unset; skipping real-server e2e");
+        return;
+    };
+    let handler = Hysteria2Handler::new();
+    let target: SocketAddr = "104.18.0.204:80".parse().unwrap(); // www.gstatic.com
+    let mut stream = handler
+        .dial(
+            &node,
+            target,
+            Some("www.gstatic.com"),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("dial through real server should succeed");
+    stream
+        .stream
+        .write_all(
+            b"GET /generate_204 HTTP/1.1\r\nHost: www.gstatic.com\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        stream.stream.read_to_end(&mut response),
+    )
+    .await
+    .expect("response timed out")
+    .unwrap();
+    let head = String::from_utf8_lossy(&response);
+    assert!(
+        head.starts_with("HTTP/1.1 204"),
+        "expected 204 from generate_204, got: {}",
+        &head[..head.len().min(200)]
+    );
+}
+
+#[tokio::test]
+async fn test_e2e_real_server_udp_dns() {
+    let Some(node) = e2e_node() else {
+        eprintln!("HONK_HY2_SERVER unset; skipping real-server e2e");
+        return;
+    };
+    let handler = Hysteria2Handler::new();
+    let target: SocketAddr = std::env::var("HONK_HY2_UDP_TARGET")
+        .unwrap_or_else(|_| "8.8.8.8:53".to_string())
+        .parse()
+        .expect("invalid HONK_HY2_UDP_TARGET");
+    let udp = handler
+        .dial_udp(&node, target, None, Duration::from_secs(10))
+        .await
+        .expect("dial_udp through real server should succeed");
+    if std::env::var("HONK_HY2_DELAY_MS").is_ok() {
+        let ms: u64 = std::env::var("HONK_HY2_DELAY_MS").unwrap().parse().unwrap();
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+
+    // Minimal DNS query: example.com A, RD=1.
+    let mut query = vec![
+        0x12, 0x34, // id
+        0x01, 0x00, // flags: RD
+        0x00, 0x01, // qdcount
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // an/ns/ar count
+    ];
+    for label in ["example", "com"] {
+        query.push(label.len() as u8);
+        query.extend_from_slice(label.as_bytes());
+    }
+    query.extend_from_slice(&[0x00, 0x00, 0x01, 0x00, 0x01]); // root, A, IN
+
+    // QUIC datagrams are fire-and-forget: a single packet lost on a
+    // throttled path kills the exchange, so retry like a real stub resolver.
+    let mut buf = vec![0u8; 2048];
+    let mut received = None;
+    for attempt in 0..5 {
+        udp.socket.send_to(&query, udp.relay_addr).await.unwrap();
+        match tokio::time::timeout(Duration::from_secs(4), udp.socket.recv_from(&mut buf)).await {
+            Ok(Ok((n, _))) => {
+                received = Some(n);
+                break;
+            }
+            _ => eprintln!("DNS attempt {attempt} timed out; retrying"),
+        }
+    }
+    let n = received.expect("DNS reply timed out on all attempts");
+    assert!(n >= 12, "DNS reply too short: {n} bytes");
+    assert_eq!(&buf[0..2], &[0x12, 0x34], "DNS id mismatch");
+    assert_eq!(buf[3] & 0x0f, 0, "DNS rcode must be NOERROR");
+    assert!(
+        u16::from_be_bytes([buf[6], buf[7]]) >= 1,
+        "expected at least one answer"
+    );
+}
+
+// --- Temporary port-hopping stall soak (env-gated, not for CI) ---
+//
+//   HONK_HY2_SERVER / HONK_HY2_PASSWORD / HONK_HY2_MPORT / HONK_HY2_MHOP
+//   HONK_HY2_SOAK_TARGET=host:port   TCP: HTTP file server to download from
+//   HONK_HY2_SOAK_PATH=/bigfile.bin  TCP: URL path (default /bigfile.bin)
+//   HONK_HY2_SOAK_UDP_TARGET=h:p     UDP: echo server address
+//   HONK_HY2_SOAK_SECS=120           UDP: soak duration (default 120s)
+
+#[tokio::test]
+async fn test_e2e_real_server_hop_soak_tcp() {
+    let Some(node) = e2e_node() else {
+        eprintln!("HONK_HY2_SERVER unset; skipping hop soak");
+        return;
+    };
+    let Ok(target) = std::env::var("HONK_HY2_SOAK_TARGET").map(|v| {
+        v.parse::<SocketAddr>()
+            .expect("invalid HONK_HY2_SOAK_TARGET")
+    }) else {
+        eprintln!("HONK_HY2_SOAK_TARGET unset; skipping TCP soak");
+        return;
+    };
+    let path = std::env::var("HONK_HY2_SOAK_PATH").unwrap_or_else(|_| "/bigfile.bin".into());
+    let handler = Hysteria2Handler::new();
+    let started = std::time::Instant::now();
+    let mut stream = handler
+        .dial(&node, target, None, Duration::from_secs(10))
+        .await
+        .expect("soak dial should succeed");
+    stream
+        .stream
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
+        .await
+        .unwrap();
+    // Per-read stall detector: any read gap > 10s counts as 断流.
+    let mut total = 0usize;
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut stalls = 0u32;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), stream.stream.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => total += n,
+            Ok(Err(e)) => panic!("read error after {total} bytes: {e}"),
+            Err(_) => {
+                stalls += 1;
+                eprintln!(
+                    "STALL #{stalls}: no data for 10s at {total} bytes, t+{:?}",
+                    started.elapsed()
+                );
+                if stalls >= 3 {
+                    panic!("connection stalled 3 times; 断流 reproduced at {total} bytes");
+                }
+            }
+        }
+    }
+    eprintln!(
+        "TCP soak done: {total} bytes in {:?}, stalls={stalls}",
+        started.elapsed()
+    );
+    assert!(total > 0);
+    assert_eq!(stalls, 0, "stalls detected during soak");
+}
+
+#[tokio::test]
+async fn test_e2e_real_server_hop_soak_udp() {
+    let Some(node) = e2e_node() else {
+        eprintln!("HONK_HY2_SERVER unset; skipping hop soak");
+        return;
+    };
+    let Ok(target) = std::env::var("HONK_HY2_SOAK_UDP_TARGET").map(|v| {
+        v.parse::<SocketAddr>()
+            .expect("invalid HONK_HY2_SOAK_UDP_TARGET")
+    }) else {
+        eprintln!("HONK_HY2_SOAK_UDP_TARGET unset; skipping UDP soak");
+        return;
+    };
+    let secs: u64 = std::env::var("HONK_HY2_SOAK_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120);
+    let handler = Hysteria2Handler::new();
+    let udp = handler
+        .dial_udp(&node, target, None, Duration::from_secs(10))
+        .await
+        .expect("udp dial should succeed");
+    let started = std::time::Instant::now();
+    let mut sent = 0u32;
+    let mut lost = 0u32;
+    let mut buf = [0u8; 256];
+    while started.elapsed() < Duration::from_secs(secs) {
+        sent += 1;
+        let pkt = sent.to_be_bytes();
+        udp.socket.send_to(&pkt, udp.relay_addr).await.unwrap();
+        match tokio::time::timeout(Duration::from_secs(3), udp.socket.recv_from(&mut buf)).await {
+            Ok(Ok((n, _))) => assert_eq!(&buf[..n], &pkt, "echo payload mismatch"),
+            _ => {
+                lost += 1;
+                eprintln!("LOST seq={sent} at t+{:?}", started.elapsed());
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    eprintln!(
+        "UDP soak done: sent={sent} lost={lost} in {:?}",
+        started.elapsed()
+    );
+    assert!(sent > 0);
+    assert_eq!(lost, 0, "{lost}/{sent} datagrams lost across hops");
+}
+
+#[test]
+fn test_parse_port_hopping() {
+    assert_eq!(parse_port_hopping("8080"), Some(vec![8080]));
+    assert_eq!(
+        parse_port_hopping("20000-20003"),
+        Some(vec![20000, 20001, 20002, 20003])
+    );
+    assert_eq!(
+        parse_port_hopping("8080, 9000-9001"),
+        Some(vec![8080, 9000, 9001])
+    );
+    assert_eq!(parse_port_hopping(""), None);
+    assert_eq!(parse_port_hopping("abc"), None);
+    assert_eq!(parse_port_hopping("9000-8000"), None);
+}
+
+#[test]
+fn test_hop_state_rotation() {
+    // Empty list keeps the base port.
+    let mut hop = HopState::new(vec![], Duration::from_millis(10));
+    assert_eq!(hop.port(8443), 8443);
+
+    // Single port: hops to it immediately (the base port differs).
+    let mut hop = HopState::new(vec![20000], Duration::from_millis(10));
+    hop.last_hop = Instant::now() - Duration::from_secs(1);
+    assert_eq!(hop.port(8443), 20000);
+    // Within the interval the port stays put.
+    assert_eq!(hop.port(8443), 20000);
+
+    // Multiple ports: a hop always lands in the list and off the current port.
+    let mut hop = HopState::new(vec![20000, 20001, 20002], Duration::from_millis(10));
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..10 {
+        hop.last_hop = Instant::now() - Duration::from_secs(1);
+        let p = hop.port(8443);
+        assert!((20000..=20002).contains(&p));
+        seen.insert(p);
+    }
+    assert!(seen.len() > 1, "hops should visit multiple ports: {seen:?}");
 }

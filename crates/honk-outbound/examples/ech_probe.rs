@@ -63,7 +63,9 @@ async fn main() -> anyhow::Result<()> {
         stream.ssl().ech_accepted()
     );
 
-    let req = format!("GET /ech-check.php HTTP/1.1\r\nHost: {host}\r\nUser-Agent: honk-ech-probe\r\nConnection: close\r\n\r\n");
+    let req = format!(
+        "GET /ech-check.php HTTP/1.1\r\nHost: {host}\r\nUser-Agent: honk-ech-probe\r\nConnection: close\r\n\r\n"
+    );
     stream.write_all(req.as_bytes()).await?;
     let mut buf = Vec::new();
     let _ = stream.read_to_end(&mut buf).await;

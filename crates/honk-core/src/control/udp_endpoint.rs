@@ -62,6 +62,13 @@ pub struct UdpEndpoint {
     pending_reply_count: AtomicU64,
     /// Next ring position to write.
     pending_reply_next: AtomicU64,
+    /// Live byte counters shared with the clash-API tracker entry (plain
+    /// atomics — the per-packet path must not take a lock).
+    upload: Arc<AtomicU64>,
+    download: Arc<AtomicU64>,
+    /// Clash-API tracker connection id; set once at registration, taken at
+    /// removal.  Not touched on the per-packet path.
+    tracker_id: Mutex<Option<String>>,
 }
 
 impl UdpEndpoint {
@@ -96,7 +103,36 @@ impl UdpEndpoint {
             ),
             pending_reply_count: AtomicU64::new(0),
             pending_reply_next: AtomicU64::new(0),
+            upload: Arc::new(AtomicU64::new(0)),
+            download: Arc::new(AtomicU64::new(0)),
+            tracker_id: Mutex::new(None),
         }
+    }
+
+    /// Bind the clash-API tracker entry to this endpoint: the entry shares
+    /// the endpoint's atomic counters, and `conn_id` is stored for removal.
+    pub fn set_tracker(&self, conn_id: String) {
+        *self.tracker_id.lock().unwrap() = Some(conn_id);
+    }
+
+    /// Counter clones for the tracker entry.
+    pub fn byte_counters(&self) -> (Arc<AtomicU64>, Arc<AtomicU64>) {
+        (self.upload.clone(), self.download.clone())
+    }
+
+    /// Count client→proxy bytes (lock-free).
+    pub fn tracker_upload(&self, n: u64) {
+        self.upload.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Count proxy→client bytes (lock-free).
+    pub fn tracker_download(&self, n: u64) {
+        self.download.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Take the tracker connection id (on endpoint removal).
+    pub fn take_tracker_id(&self) -> Option<String> {
+        self.tracker_id.lock().unwrap().take()
     }
 
     pub fn is_expired(&self) -> bool {
@@ -157,15 +193,6 @@ impl UdpEndpoint {
 
     pub fn has_reply(&self) -> bool {
         self.has_reply.load(Ordering::Relaxed)
-    }
-
-    #[allow(dead_code)]
-    pub fn acquire(&self) -> bool {
-        if self.dead.load(Ordering::Acquire) {
-            return false;
-        }
-        self.ref_count.fetch_add(1, Ordering::Relaxed);
-        true
     }
 
     pub fn release(&self) {
@@ -291,17 +318,58 @@ impl EndpointKey {
             dst_port: dst.port(),
         }
     }
+
+    /// Convert a stored 16-byte address back to `IpAddr`, unwrapping the
+    /// v4-mapped form written by `new()`.
+    fn ip_addr(bytes: &[u8; 16]) -> std::net::IpAddr {
+        if bytes[0..10].iter().all(|&b| b == 0) && bytes[10] == 0xff && bytes[11] == 0xff {
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                bytes[12], bytes[13], bytes[14], bytes[15],
+            ))
+        } else {
+            std::net::IpAddr::V6(std::net::Ipv6Addr::from(*bytes))
+        }
+    }
+
+    fn client_ip(&self) -> std::net::IpAddr {
+        Self::ip_addr(&self.client_ip)
+    }
+
+    fn dst_ip(&self) -> std::net::IpAddr {
+        Self::ip_addr(&self.dst_ip)
+    }
 }
+
+/// Message sent to the endpoint-removal sink: `(client, dst, conn_id)`.
+type EndpointRemoval = (SocketAddr, SocketAddr, Option<String>);
 
 /// Pool of UDP endpoints with LRU-like eviction.
 pub struct UdpEndpointPool {
     endpoints: DashMap<EndpointKey, Arc<UdpEndpoint>>,
+    /// Sink notified whenever an endpoint is removed; the control plane uses
+    /// it to retire the flow's conntrack entries promptly instead of waiting
+    /// for the datapath/janitor timeouts, and to drop the flow from the
+    /// clash-API tracker.
+    remove_sink: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<EndpointRemoval>>>,
 }
 
 impl UdpEndpointPool {
     pub fn new() -> Self {
         Self {
             endpoints: DashMap::new(),
+            remove_sink: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Register the endpoint-removal sink (called once at control-plane
+    /// startup).
+    pub fn set_remove_sink(&self, tx: tokio::sync::mpsc::UnboundedSender<EndpointRemoval>) {
+        *self.remove_sink.lock().unwrap() = Some(tx);
+    }
+
+    fn notify_removed(&self, client: SocketAddr, dst: SocketAddr, conn_id: Option<String>) {
+        if let Some(tx) = &*self.remove_sink.lock().unwrap() {
+            let _ = tx.send((client, dst, conn_id));
         }
     }
 
@@ -362,21 +430,56 @@ impl UdpEndpointPool {
         let key = EndpointKey::new(client, dst);
         if let Some((_, ep)) = self.endpoints.remove(&key) {
             ep.kill();
+            self.notify_removed(client, dst, ep.take_tracker_id());
+        }
+    }
+
+    /// Remove every endpoint dialing through `node_name` — called when the
+    /// node flips alive→dead so its UDP flows stop immediately instead of
+    /// lingering until the NAT/reply idle timeouts reap them.
+    pub fn remove_by_node(&self, node_name: &str) {
+        let keys: Vec<(SocketAddr, SocketAddr)> = self
+            .endpoints
+            .iter()
+            .filter(|ep| ep.node_name == node_name)
+            .map(|ep| {
+                let key = ep.key();
+                (
+                    SocketAddr::new(key.client_ip(), key.client_port),
+                    SocketAddr::new(key.dst_ip(), key.dst_port),
+                )
+            })
+            .collect();
+        let removed = keys.len();
+        for (client, dst) in keys {
+            self.remove(client, dst);
+        }
+        if removed > 0 {
+            debug!(
+                "Removed {} UDP endpoints bound to dead node '{}'",
+                removed, node_name
+            );
         }
     }
 
     /// Run a janitor cycle: remove expired endpoints.
     pub fn janitor_cycle(&self) -> usize {
-        let before = self.endpoints.len();
-        self.endpoints.retain(|_, ep| {
-            if ep.ref_count() <= 0 && ep.is_expired() {
-                ep.kill();
-                false
-            } else {
-                true
-            }
-        });
-        let removed = before - self.endpoints.len();
+        let expired: Vec<(SocketAddr, SocketAddr)> = self
+            .endpoints
+            .iter()
+            .filter(|ep| ep.ref_count() <= 0 && ep.is_expired())
+            .map(|ep| {
+                let key = ep.key();
+                (
+                    SocketAddr::new(key.client_ip(), key.client_port),
+                    SocketAddr::new(key.dst_ip(), key.dst_port),
+                )
+            })
+            .collect();
+        let removed = expired.len();
+        for (client, dst) in expired {
+            self.remove(client, dst);
+        }
         if removed > 0 {
             debug!("UDP endpoint janitor removed {} expired endpoints", removed);
         }
@@ -453,6 +556,7 @@ impl UdpEndpointPool {
                             continue;
                         }
                         endpoint.mark_reply();
+                        endpoint.tracker_download(n as u64);
                         // A reply is the only proof a UDP path actually works
                         // (a UoT-blackhole server accepts sends but never
                         // answers); report liveness on receipt, not on send.
@@ -672,5 +776,37 @@ mod tests {
             Ordering::Relaxed,
         );
         assert!(ep.get_cached_routing(dst).is_none());
+    }
+
+    #[test]
+    fn test_remove_by_node() {
+        let pool = UdpEndpointPool::new();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let proxy = Arc::new(
+            rt.block_on(tokio::net::UdpSocket::bind("127.0.0.1:0"))
+                .unwrap(),
+        );
+        let relay = make_addr("192.168.1.1", 1080);
+        let dst = make_addr("8.8.8.8", 53);
+        pool.get_or_create(
+            make_addr("10.0.0.1", 12345),
+            dst,
+            proxy.clone(),
+            relay,
+            "dead-node".to_string(),
+        );
+        pool.get_or_create(
+            make_addr("10.0.0.2", 12345),
+            dst,
+            proxy.clone(),
+            relay,
+            "other-node".to_string(),
+        );
+        assert_eq!(pool.len(), 2);
+
+        pool.remove_by_node("dead-node");
+        assert_eq!(pool.len(), 1);
+        assert!(pool.get(make_addr("10.0.0.1", 12345), dst).is_none());
+        assert!(pool.get(make_addr("10.0.0.2", 12345), dst).is_some());
     }
 }

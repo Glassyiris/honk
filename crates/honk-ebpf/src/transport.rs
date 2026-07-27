@@ -96,6 +96,28 @@ pub const ERR_UNKNOWN_PROTO: c_long = -3;
 /// Unsupported packet type (not IP); pass through.
 pub const PASS_UNSUPPORTED: c_long = 1;
 
+/// Destinations that must never enter routing/conntrack: L2
+/// broadcast/multicast, IPv4 limited broadcast + multicast + 0.0.0.0, IPv6
+/// multicast. DHCP, mDNS, SSDP and LLMNR ride these — routing them through
+/// the proxy breaks LAN service discovery (and DHCP leases on OpenWrt).
+/// The L2 check (I/G bit) needs no netmask math and covers subnet-directed
+/// broadcasts for free.
+#[inline(always)]
+pub fn dst_is_special(pkt: &ParsedPacket, link_h_len: u32) -> bool {
+    if link_h_len == ETH_HLEN && pkt.ethh.dst_addr[0] & 1 != 0 {
+        return true;
+    }
+    let dst = &pkt.tuples.five.dst_ip;
+    if dst.is_v4_mapped() {
+        let ip = u32::from_be(unsafe { dst.u6_addr32[3] });
+        // 0.0.0.0 / 255.255.255.255 / 224.0.0.0/4
+        ip == 0 || ip == 0xFFFFFFFF || (ip & 0xF0000000) == 0xE0000000
+    } else {
+        // ff00::/8
+        (unsafe { dst.u6_addr8[0] }) == 0xFF
+    }
+}
+
 trait ParseTransportExt {
     fn parse_fast(&mut self, ctx: &TcContext, link_h_len: u32) -> Result<(), c_long>;
     fn parse_slow(&mut self, ctx: &TcContext, link_h_len: u32) -> Result<(), c_long>;

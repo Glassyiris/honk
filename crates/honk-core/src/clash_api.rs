@@ -1,4 +1,4 @@
-//! Clash-compatible REST API server for Yacd / Metacubexd dashboards.
+//! Clash-compatible REST API server for zashboard / Metacubexd dashboards.
 //!
 //! Enabled via `experimental.clash_api.external_controller` and compiled in
 //! with the `clash-api` cargo feature (on by default). Implements the
@@ -284,10 +284,12 @@ async fn put_configs() -> StatusCode {
 
 /// PATCH /configs — update specific fields; `{mode}` switches the clash
 /// mode (Rule/Global/Direct, case-insensitive) and persists it to cache.db.
-async fn patch_configs(
-    State(s): State<Arc<ClashState>>,
-    Json(body): Json<serde_json::Value>,
-) -> Response {
+/// The body is parsed regardless of Content-Type (dashboard parity).
+async fn patch_configs(State(s): State<Arc<ClashState>>, body: Bytes) -> Response {
+    let body: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("invalid body: {e}")),
+    };
     if let Some(mode_str) = body.get("mode").and_then(|v| v.as_str()) {
         let Some(mode) = ModeState::normalize(mode_str) else {
             return error_response(
@@ -325,14 +327,14 @@ fn clash_protocol_type(protocol: NodeProtocol) -> &'static str {
 /// Map a GroupPolicy to a Clash-compatible type name.
 fn clash_group_type(policy: GroupPolicy) -> &'static str {
     match policy {
-        GroupPolicy::Selector => "Selector",
-        GroupPolicy::URLTest => "URLTest",
-        GroupPolicy::LoadBalance => "LoadBalance",
-        GroupPolicy::Fallback => "Fallback",
+        GroupPolicy::Selector => "selector",
+        GroupPolicy::URLTest => "url_test",
+        GroupPolicy::LoadBalance => "load_balance",
+        GroupPolicy::Fallback => "fallback",
     }
 }
 
-/// Build a single proxy info object used by Yacd/Metacubexd for a group.
+/// Build a single proxy info object used by zashboard/Metacubexd for a group.
 fn build_group_proxy_info(
     group: &Group,
     group_manager: &GroupManager,
@@ -437,7 +439,7 @@ fn build_global_proxy_info(config: &Config, global_selection: &str) -> serde_jso
     };
     serde_json::json!({
         "name": "GLOBAL",
-        "type": "Selector",
+        "type": "selector",
         "all": all,
         "now": now,
     })
@@ -500,8 +502,15 @@ struct PutProxyBody {
 async fn put_proxy(
     State(s): State<Arc<ClashState>>,
     Path(group_name): Path<String>,
-    Json(body): Json<PutProxyBody>,
+    body: Bytes,
 ) -> Response {
+    // Dashboards (metacubexd/zashboard) PUT the selection without a JSON
+    // Content-Type; accept any content type (mihomo parity) and fail only
+    // on a genuinely malformed body.
+    let body: PutProxyBody = match serde_json::from_slice(&body) {
+        Ok(b) => b,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("invalid body: {e}")),
+    };
     // GLOBAL is a synthetic selector backed by the shared mode state.
     if group_name == "GLOBAL" {
         let config = s.config.read().await;
@@ -1198,7 +1207,7 @@ async fn flush_dns(State(s): State<Arc<ClashState>>) -> StatusCode {
 }
 
 /// Each group is exposed as a proxy provider holding its members — the
-/// minimal provider document dashboards (Yacd/Metacubexd) render. Nested
+/// minimal provider document dashboards (zashboard/Metacubexd) render. Nested
 /// sub-groups appear under their own tag (their representative leaf
 /// supplies the delay history), matching the `all` member list.
 async fn get_proxy_providers(State(s): State<Arc<ClashState>>) -> Json<serde_json::Value> {

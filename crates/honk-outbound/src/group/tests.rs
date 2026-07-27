@@ -1174,3 +1174,218 @@ fn test_user_style_nested_layout() {
         vec!["fb", "🥤 singal", "singal-1"]
     );
 }
+
+/// URLTest hysteresis baseline is the incumbent's *current* measured
+/// latency (sing-box `Select()` parity), not the latency recorded when it
+/// was selected: a degraded incumbent must be displaced once a challenger
+/// beats its current latency by ≥ tolerance.
+#[test]
+fn test_urltest_switches_when_incumbent_degrades() {
+    let (n1, n2) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let nodes = vec![make_node(n1, "a"), make_node(n2, "b")];
+    let alive = Arc::new(AliveDialerSet::new());
+    let m = GroupManager::with_alive_set(
+        &[make_group("g", GroupPolicy::URLTest, vec![n1, n2])],
+        &nodes,
+        Some(alive.clone()),
+    );
+    // 'a' wins the first selection at 10ms (moving average starts at 10).
+    alive.record_probe_latency(
+        "a",
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(10),
+    );
+    alive.record_probe_latency(
+        "b",
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(100),
+    );
+    assert_eq!(m.select_node("g").unwrap().name, "a");
+
+    // 'a' degrades: a 400ms sample moves its average to (10+400)/2 = 205ms.
+    // 'b' (100ms) now beats a's *current* latency by > tolerance (50ms) and
+    // must take over — the stale 10ms baseline would have kept 'a' forever.
+    alive.record_probe_latency(
+        "a",
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(400),
+    );
+    assert_eq!(m.select_node("g").unwrap().name, "b");
+}
+
+/// Within tolerance of the incumbent's current latency, the selection is
+/// stable (no flapping).
+#[test]
+fn test_urltest_keeps_incumbent_within_tolerance_of_current_latency() {
+    let (n1, n2) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let nodes = vec![make_node(n1, "a"), make_node(n2, "b")];
+    let alive = Arc::new(AliveDialerSet::new());
+    let m = GroupManager::with_alive_set(
+        &[make_group("g", GroupPolicy::URLTest, vec![n1, n2])],
+        &nodes,
+        Some(alive.clone()),
+    );
+    alive.record_probe_latency(
+        "a",
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(10),
+    );
+    alive.record_probe_latency(
+        "b",
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(80),
+    );
+    assert_eq!(m.select_node("g").unwrap().name, "a");
+
+    // 'a' drifts to (10+190)/2 = 100ms; 'b' at 80ms is faster but within
+    // the 50ms tolerance of a's current latency → keep 'a'.
+    alive.record_probe_latency(
+        "a",
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(190),
+    );
+    assert_eq!(m.select_node("g").unwrap().name, "a");
+}
+
+/// After a dial failure clears the node's latency history (sing-box
+/// `DeleteURLTestHistory` parity), the URLTest group's next selection must
+/// move to the next-best measured node instead of waiting for the probe
+/// cycle.
+#[test]
+fn test_urltest_reselects_after_latency_cleared() {
+    let (n1, n2) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let nodes = vec![make_node(n1, "a"), make_node(n2, "b")];
+    let alive = Arc::new(AliveDialerSet::new());
+    let m = GroupManager::with_alive_set(
+        &[make_group("g", GroupPolicy::URLTest, vec![n1, n2])],
+        &nodes,
+        Some(alive.clone()),
+    );
+    alive.record_probe_latency(
+        "a",
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(10),
+    );
+    alive.record_probe_latency(
+        "b",
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(100),
+    );
+    assert_eq!(m.select_node("g").unwrap().name, "a");
+
+    // Dial to 'a' fails → history cleared → next selection is 'b'.
+    alive.clear_latency("a");
+    assert_eq!(m.select_node("g").unwrap().name, "b");
+}
+
+/// A URLTest group with a custom check_url ranks and filters by the
+/// per-(node, url) probe state, not the global one (sing-box urltest
+/// `url` option): a node globally healthy but dead for the group's URL
+/// is excluded; ranking uses per-URL latency.
+#[test]
+fn test_urltest_group_custom_check_url_selection() {
+    let (n1, n2) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let nodes = vec![make_node(n1, "a"), make_node(n2, "b")];
+    let url = "http://chatgpt.example/trace";
+    let mut group = make_group("g", GroupPolicy::URLTest, vec![n1, n2]);
+    group.check_url = Some(url.to_string());
+    let alive = Arc::new(AliveDialerSet::new());
+    alive.sync_group_check_urls(&[("g".into(), url.into())]);
+    let m = GroupManager::with_alive_set(&[group], &nodes, Some(alive.clone()));
+
+    // Global: a is faster. Per-URL: b is faster → b wins.
+    alive.record_probe_latency(
+        "a",
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(10),
+    );
+    alive.record_probe_latency(
+        "b",
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(500),
+    );
+    alive.record_url_probe_success("a", url, Duration::from_millis(200));
+    alive.record_url_probe_success("b", url, Duration::from_millis(100));
+    assert_eq!(m.select_node("g").unwrap().name, "b");
+
+    // b dies for the group's URL (but stays globally alive) → a wins.
+    alive.record_url_probe_failure("b", url);
+    assert!(alive.is_alive_for("b", ProbeDomain::Tcp, IpVersion::V4));
+    assert_eq!(m.select_node("g").unwrap().name, "a");
+}
+
+/// Groups without check_url keep the global behaviour (regression).
+#[test]
+fn test_urltest_group_without_check_url_uses_global_state() {
+    let (n1, n2) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let nodes = vec![make_node(n1, "a"), make_node(n2, "b")];
+    let alive = Arc::new(AliveDialerSet::new());
+    let m = GroupManager::with_alive_set(
+        &[make_group("g", GroupPolicy::URLTest, vec![n1, n2])],
+        &nodes,
+        Some(alive.clone()),
+    );
+    alive.record_probe_latency(
+        "a",
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(10),
+    );
+    alive.record_probe_latency(
+        "b",
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(100),
+    );
+    assert_eq!(m.select_node("g").unwrap().name, "a");
+    // A stray per-URL failure for 'a' must not leak into this group.
+    alive.record_url_probe_failure("a", "http://unrelated.example");
+    assert_eq!(m.select_node("g").unwrap().name, "a");
+}
+
+/// Nested group with a custom check_url: the parent's per-URL state is
+/// keyed by the SUB-GROUP TAG (sing-box RealTag semantics) — the parent
+/// ranks sub-groups as units, independent of which leaf each sub-group
+/// currently picks.
+#[test]
+fn test_nested_group_check_url_ranks_subgroups_by_tag() {
+    let (n1, n2) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let nodes = vec![make_node(n1, "hk-1"), make_node(n2, "us-1")];
+    let url = "http://chatgpt.example/trace";
+    let hk = make_subgroup("hk", GroupPolicy::URLTest, &[]);
+    let us = make_subgroup("us", GroupPolicy::URLTest, &[]);
+    let mut hk = hk;
+    hk.nodes = vec![n1];
+    let mut us = us;
+    us.nodes = vec![n2];
+    let mut parent = make_group("ai", GroupPolicy::URLTest, vec![]);
+    parent.groups = vec!["hk".into(), "us".into()];
+    parent.check_url = Some(url.to_string());
+
+    let alive = Arc::new(AliveDialerSet::new());
+    let m = GroupManager::with_alive_set(&[parent, hk, us], &nodes, Some(alive.clone()));
+
+    // Per-URL probe results recorded under the sub-group tags: hk faster.
+    alive.record_url_probe_success("hk", url, Duration::from_millis(120));
+    alive.record_url_probe_success("us", url, Duration::from_millis(300));
+    let sel = m.select_node("ai").unwrap();
+    assert_eq!(sel.name, "hk-1");
+    assert_eq!(m.selection_chain("ai"), vec!["ai", "hk", "hk-1"]);
+
+    // hk dies FOR THE PARENT'S URL (its own/global state untouched) →
+    // the parent switches to us even though hk-1 is globally healthy.
+    alive.record_url_probe_failure("hk", url);
+    assert!(alive.is_alive_for("hk-1", ProbeDomain::Tcp, IpVersion::V4));
+    let sel = m.select_node("ai").unwrap();
+    assert_eq!(sel.name, "us-1");
+}
