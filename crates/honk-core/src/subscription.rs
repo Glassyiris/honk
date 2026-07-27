@@ -8,6 +8,26 @@ use honk_config::node::Node;
 use honk_config::subscription::Subscription;
 use honk_config::types::{NodeProtocol, SubscriptionType};
 
+/// reqwest DNS resolver backed by honk's bootstrap resolver
+/// (bypass-marked UDP/TCP), so subscription fetches do not depend on the
+/// system resolver — which on a polluted network can hand back poisoned
+/// answers and kill the subscription download.
+struct BootstrapDnsResolve;
+
+impl reqwest::dns::Resolve for BootstrapDnsResolve {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let ips = honk_outbound::bootstrap::resolve(&host).await?;
+            let addrs: Vec<std::net::SocketAddr> = ips
+                .into_iter()
+                .map(|ip| std::net::SocketAddr::new(ip, 0))
+                .collect();
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
 /// Manager for fetching and parsing proxy subscriptions.
 pub struct SubscriptionManager {
     client: reqwest::Client,
@@ -17,6 +37,7 @@ impl SubscriptionManager {
     pub fn new() -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
+            .dns_resolver(std::sync::Arc::new(BootstrapDnsResolve))
             .build()?;
         Ok(Self { client })
     }
