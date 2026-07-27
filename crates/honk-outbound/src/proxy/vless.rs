@@ -195,17 +195,6 @@ impl ProxyHandler for VLessHandler {
             target_domain: target_domain.map(|s| s.to_string()),
         })
     }
-
-    async fn test_connectivity(&self, node: &Node) -> bool {
-        let addr = format!("{}:{}", node.host(), node.port);
-        match crate::util::connect_outbound(&addr, std::time::Duration::from_secs(3)).await {
-            Ok(_stream) => true,
-            Err(e) => {
-                tracing::debug!("VLESS connectivity test failed for {}: {}", node.name, e);
-                false
-            }
-        }
-    }
 }
 
 #[cfg(test)]

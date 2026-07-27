@@ -22,14 +22,18 @@ impl DialerCollection {
         }
     }
 
-    pub(crate) fn mark_available(&self, latency: Duration) {
-        self.latencies.append(LatencySample::real(latency));
+    fn update_moving_average(&self, latency: Duration) {
         let mut ma = self.moving_average.lock();
         if *ma == Duration::ZERO {
             *ma = latency;
         } else {
             *ma = (*ma + latency) / 2;
         }
+    }
+
+    pub(crate) fn mark_available(&self, latency: Duration) {
+        self.latencies.append(LatencySample::real(latency));
+        self.update_moving_average(latency);
         self.alive.store(true, Ordering::Release);
     }
 
@@ -39,12 +43,7 @@ impl DialerCollection {
         // measured delay (clash history would show a bogus 10000ms).
         self.latencies
             .append(LatencySample::synthetic(TIMEOUT_LATENCY));
-        let mut ma = self.moving_average.lock();
-        if *ma == Duration::ZERO {
-            *ma = TIMEOUT_LATENCY;
-        } else {
-            *ma = (*ma + TIMEOUT_LATENCY) / 2;
-        }
+        self.update_moving_average(TIMEOUT_LATENCY);
         self.alive.store(false, Ordering::Release);
     }
 
@@ -57,12 +56,7 @@ impl DialerCollection {
             at,
             synthetic: false,
         });
-        let mut ma = self.moving_average.lock();
-        if *ma == Duration::ZERO {
-            *ma = latency;
-        } else {
-            *ma = (*ma + latency) / 2;
-        }
+        self.update_moving_average(latency);
     }
 
     #[allow(dead_code)]

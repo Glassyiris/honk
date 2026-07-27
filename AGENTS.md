@@ -247,6 +247,8 @@ cargo +nightly build --release -Zbuild-std=core --target bpfel-unknown-none
 | -------- | --------- |
 | `build` / `check` / `lint` / `fmt` | `cargo build --release` / `check` / `clippy --all -D warnings` / `fmt --all` |
 | `test` / `test-ci` / `test-core` / `test-config` / `test-ebpf` | Test suites (`test` = full incl. known failures; `test-ci` = CI gate with the 3 known failures skipped; `test-ebpf` = honk-ebpf-common only) |
+| `outbound-ci` / `outbound-ci-e2e` | honk-outbound gate (`ci/outbound-ci.sh`: fmt + clippy + honk-config & honk-outbound suites; `...-e2e` adds live hy2 e2e via `HONK_HY2_SERVER=`) — run after every outbound change |
+| `outbound-ci` / `outbound-ci-e2e` | honk-outbound gate (`ci/outbound-ci.sh`: fmt + clippy + honk-config & honk-outbound suites; `...-e2e` adds live hy2 e2e via `HONK_HY2_SERVER=`) — run after every outbound change |
 | `build-core` / `build-core-ebpf` | honk-core with `ebpf` feature |
 | `build-musl` | Static musl build (`x86_64-unknown-linux-musl`, for VyOS/Debian) via the `ci/zigcc`/`ci/zigcxx` zig wrappers + `link-self-contained=no` (needs zig 0.14+) |
 | `build-ebpf` | eBPF object standalone (nightly, `bpfel-unknown-none`) — warns when `RUSTFLAGS` is set (it overrides the crate's `--btf` rustflags) and verifies the object actually has `.BTF` (aya refuses BTF-less objects) |

@@ -184,6 +184,17 @@ struct PerProtocolState {
 }
 
 impl PerProtocolState {
+    /// Mark the domain alive and clear every failure/backoff counter
+    /// (shared by all probe/traffic success paths).
+    fn reset_on_success(&mut self) {
+        self.alive = true;
+        self.consecutive_failures = 0;
+        self.consecutive_successes = 0;
+        self.traffic_failures = 0;
+        self.stopped = false;
+        self.cooldown_until = Instant::now();
+    }
+
     fn new() -> Self {
         Self {
             alive: true,
@@ -329,6 +340,12 @@ pub struct AliveDialerSet {
     url_collections: RwLock<HashMap<(String, String), Arc<DialerCollection>>>,
     /// check_url → cached resolved IPs (same caching as `check_url_ips`).
     url_check_ips: RwLock<HashMap<String, Vec<SocketAddr>>>,
+}
+
+/// Exponential probe backoff: `base * 2^min(failures, 8)`, capped at `max`.
+fn probe_backoff(base: Duration, max: Duration, consecutive_failures: u32) -> Duration {
+    base.saturating_mul(2u32.pow(consecutive_failures.min(8)))
+        .min(max)
 }
 
 impl AliveDialerSet {
@@ -585,12 +602,7 @@ impl AliveDialerSet {
         let idx = alive_index(domain, ipver);
         let was_alive = self.with_state(node_id, idx, |e| {
             let was = e.alive;
-            e.alive = true;
-            e.consecutive_failures = 0;
-            e.consecutive_successes = 0;
-            e.traffic_failures = 0;
-            e.stopped = false;
-            e.cooldown_until = Instant::now();
+            e.reset_on_success();
             was
         });
         if !was_alive {
@@ -682,10 +694,7 @@ impl AliveDialerSet {
             } else {
                 e.consecutive_failures += 1;
                 let f = e.consecutive_failures;
-                let backoff = self
-                    .base_cooldown
-                    .saturating_mul(2u32.pow(f.min(8)))
-                    .min(self.max_cooldown);
+                let backoff = probe_backoff(self.base_cooldown, self.max_cooldown, f);
                 e.cooldown_until = Instant::now() + backoff;
                 if f >= MAX_PROBE_BACKOFF_FAILURES {
                     e.stopped = true;
@@ -750,11 +759,7 @@ impl AliveDialerSet {
         let idx = alive_index(domain, ipver);
         let was_alive = self.with_state(node_id, idx, |e| {
             let was = e.alive;
-            e.alive = true;
-            e.consecutive_failures = 0;
-            e.consecutive_successes = 0;
-            e.traffic_failures = 0;
-            e.stopped = false;
+            e.reset_on_success();
             was
         });
         if !was_alive {
@@ -848,12 +853,7 @@ impl AliveDialerSet {
             let was = e.alive;
             if was {
                 // Already alive: straightforward reset.
-                e.alive = true;
-                e.consecutive_failures = 0;
-                e.consecutive_successes = 0;
-                e.traffic_failures = 0;
-                e.stopped = false;
-                e.cooldown_until = Instant::now();
+                e.reset_on_success();
                 false
             } else {
                 // Was dead: apply recovery hysteresis.
@@ -1176,10 +1176,11 @@ impl AliveDialerSet {
         let e = states.entry(key).or_insert_with(UrlProbeState::new);
         e.consecutive_successes = 0;
         e.consecutive_failures += 1;
-        let backoff = self
-            .base_cooldown
-            .saturating_mul(2u32.pow(e.consecutive_failures.min(8)))
-            .min(self.max_cooldown);
+        let backoff = probe_backoff(
+            self.base_cooldown,
+            self.max_cooldown,
+            e.consecutive_failures,
+        );
         e.cooldown_until = Instant::now() + backoff;
         if e.consecutive_failures >= probe_failure_threshold(ProbeDomain::Tcp) {
             e.alive = false;
@@ -1457,111 +1458,5 @@ impl StickyCache {
         let n = c.len();
         c.retain(|_, (_, e)| Instant::now() < *e);
         n - c.len()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NodeState {
-    Healthy,
-    Degraded,
-    Failed,
-    Recovering,
-}
-
-impl RecoveryEntry {
-    fn new() -> Self {
-        Self {
-            state: NodeState::Healthy,
-            consecutive_failures: 0,
-            cooldown_until: Instant::now(),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct RecoveryEntry {
-    state: NodeState,
-    consecutive_failures: u32,
-    cooldown_until: Instant,
-}
-
-pub struct RecoveryState {
-    entries: Mutex<HashMap<String, [RecoveryEntry; ProbeDomain::count()]>>,
-    failure_threshold: u32,
-    base_cooldown: Duration,
-    max_cooldown: Duration,
-}
-
-impl RecoveryState {
-    pub fn new(failure_threshold: u32, base_cooldown: Duration, max_cooldown: Duration) -> Self {
-        Self {
-            entries: Mutex::new(HashMap::new()),
-            failure_threshold,
-            base_cooldown,
-            max_cooldown,
-        }
-    }
-
-    fn with_entry<F, R>(&self, node: &str, domain: ProbeDomain, f: F) -> R
-    where
-        F: FnOnce(&mut RecoveryEntry) -> R,
-    {
-        let mut entries = self.entries.lock();
-        let arr = entries.entry(node.into()).or_insert_with(|| {
-            [
-                RecoveryEntry::new(),
-                RecoveryEntry::new(),
-                RecoveryEntry::new(),
-            ]
-        });
-        f(&mut arr[domain as usize])
-    }
-
-    fn read_entry(&self, node: &str, domain: ProbeDomain) -> RecoveryEntry {
-        self.entries
-            .lock()
-            .get(node)
-            .map(|e| e[domain as usize].clone())
-            .unwrap_or_else(RecoveryEntry::new)
-    }
-
-    pub fn should_probe(&self, node: &str, domain: ProbeDomain) -> bool {
-        Instant::now() >= self.read_entry(node, domain).cooldown_until
-    }
-
-    pub fn report_success(&self, node: &str, domain: ProbeDomain) {
-        self.with_entry(node, domain, |e| {
-            e.consecutive_failures = 0;
-            e.state = NodeState::Healthy;
-            e.cooldown_until = Instant::now();
-        });
-    }
-
-    pub fn report_failure(&self, node: &str, domain: ProbeDomain) -> NodeState {
-        self.with_entry(node, domain, |e| {
-            e.consecutive_failures += 1;
-            let backoff = self
-                .base_cooldown
-                .saturating_mul(2u32.pow(e.consecutive_failures.min(8)))
-                .min(self.max_cooldown);
-            e.cooldown_until = Instant::now() + backoff;
-            e.state = if e.consecutive_failures >= self.failure_threshold {
-                NodeState::Failed
-            } else {
-                NodeState::Degraded
-            };
-            e.state
-        })
-    }
-
-    pub fn get_state(&self, node: &str, domain: ProbeDomain) -> NodeState {
-        self.read_entry(node, domain).state
-    }
-
-    pub fn is_usable(&self, node: &str, domain: ProbeDomain) -> bool {
-        matches!(
-            self.get_state(node, domain),
-            NodeState::Healthy | NodeState::Degraded
-        )
     }
 }

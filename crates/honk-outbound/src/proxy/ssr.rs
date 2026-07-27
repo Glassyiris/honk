@@ -262,17 +262,6 @@ impl ProxyHandler for ShadowsocksRHandler {
     ) -> anyhow::Result<ProxyStream> {
         self.start_relay(node, server, target, target_domain).await
     }
-
-    async fn test_connectivity(&self, node: &Node) -> bool {
-        let addr = format!("{}:{}", node.host(), node.port);
-        match crate::util::connect_outbound(&addr, std::time::Duration::from_secs(3)).await {
-            Ok(_) => true,
-            Err(e) => {
-                debug!("SSR connectivity test failed for {}: {}", node.name, e);
-                false
-            }
-        }
-    }
 }
 
 /// Background relay for SSR: optional SSR protocol header → obfs hello →

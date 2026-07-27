@@ -150,29 +150,6 @@ fn test_sticky_cache_ttl() {
     assert!(c.get_sticky("x").is_none());
 }
 
-#[test]
-fn test_recovery_state_transitions() {
-    let rs = RecoveryState::new(3, Duration::from_secs(1), Duration::from_secs(300));
-    let d = ProbeDomain::Tcp;
-    assert_eq!(rs.get_state("n", d), NodeState::Healthy);
-    rs.report_failure("n", d);
-    assert_eq!(rs.get_state("n", d), NodeState::Degraded);
-    rs.report_failure("n", d);
-    rs.report_failure("n", d);
-    assert_eq!(rs.get_state("n", d), NodeState::Failed);
-    rs.report_success("n", d);
-    assert_eq!(rs.get_state("n", d), NodeState::Healthy);
-}
-
-#[test]
-fn test_should_probe_backoff() {
-    let rs = RecoveryState::new(3, Duration::from_millis(1), Duration::from_secs(5));
-    rs.report_failure("n", ProbeDomain::Tcp);
-    assert_eq!(rs.get_state("n", ProbeDomain::Tcp), NodeState::Degraded);
-    rs.report_success("n", ProbeDomain::Tcp);
-    assert!(rs.is_usable("n", ProbeDomain::Tcp));
-}
-
 #[tokio::test]
 async fn test_urltest_idle_suspension() {
     let set = AliveDialerSet::new();

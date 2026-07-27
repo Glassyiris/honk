@@ -405,17 +405,6 @@ impl ProxyHandler for Socks5Handler {
         })
     }
 
-    async fn test_connectivity(&self, node: &Node) -> bool {
-        let addr = format!("{}:{}", node.host(), node.port);
-        match crate::util::connect_outbound(&addr, std::time::Duration::from_secs(3)).await {
-            Ok(_stream) => true,
-            Err(e) => {
-                debug!("SOCKS5 connectivity test failed for {}: {}", node.name, e);
-                false
-            }
-        }
-    }
-
     /// After the greeting (+ optional RFC 1929 auth) and a successful
     /// CONNECT reply, the connection is a pure data channel bound to the
     /// requested target — the server sends nothing of its own before

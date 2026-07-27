@@ -90,6 +90,14 @@ test-config:
 test-ebpf:
     cargo test -p honk-ebpf-common
 
+# Full honk-outbound gate after outbound changes (fmt + clippy + config & outbound suites)
+outbound-ci:
+    ci/outbound-ci.sh
+
+# outbound-ci plus live hysteria2 e2e (needs HONK_HY2_SERVER=...)
+outbound-ci-e2e:
+    ci/outbound-ci.sh --with-e2e-env
+
 # ── Run ──────────────────────────────────────────────────
 
 # Run honk-core with eBPF (clash API comes from config.dae experimental section)

@@ -259,22 +259,12 @@ pub async fn client_config(
 /// Public so protocol handlers that wrap the socket themselves (Hysteria2's
 /// salamander obfuscation) can reuse the same marking logic.
 pub fn marked_udp_socket(ipv6: bool) -> io::Result<std::net::UdpSocket> {
-    let domain = if ipv6 {
-        socket2::Domain::IPV6
-    } else {
-        socket2::Domain::IPV4
-    };
-    let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, None)?;
-    socket.set_nonblocking(true)?;
-    #[cfg(target_os = "linux")]
-    crate::util::set_mark_best_effort(&socket, honk_ebpf_common::DAE_BYPASS_MARK)?;
     let bind_addr: SocketAddr = if ipv6 {
         "[::]:0".parse().expect("hardcoded IPv6 bind address")
     } else {
         "0.0.0.0:0".parse().expect("hardcoded IPv4 bind address")
     };
-    socket.bind(&bind_addr.into())?;
-    Ok(socket.into())
+    crate::util::marked_udp_socket(bind_addr)
 }
 
 /// Create a client-only quinn [`Endpoint`] on a marked UDP socket for the

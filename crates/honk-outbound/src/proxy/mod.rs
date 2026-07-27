@@ -154,7 +154,23 @@ pub trait ProxyHandler: Send + Sync {
         Err(anyhow::anyhow!("UDP not supported for this protocol"))
     }
 
-    async fn test_connectivity(&self, node: &Node) -> bool;
+    /// Raw TCP reachability check against the node server. Handlers share
+    /// this default; `direct`/`block` keep their own overrides.
+    async fn test_connectivity(&self, node: &Node) -> bool {
+        let addr = format!("{}:{}", node.host(), node.port);
+        match crate::util::connect_outbound(&addr, std::time::Duration::from_secs(3)).await {
+            Ok(_stream) => true,
+            Err(e) => {
+                tracing::debug!(
+                    "{} connectivity test failed for {}: {}",
+                    self.protocol().as_str(),
+                    node.name,
+                    e
+                );
+                false
+            }
+        }
+    }
 
     /// The provided `tcp` stream is already connected to the proxy
     /// server.  Handlers that support connection pooling should

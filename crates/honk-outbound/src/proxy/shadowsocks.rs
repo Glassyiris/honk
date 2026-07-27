@@ -405,20 +405,6 @@ impl ProxyHandler for ShadowsocksHandler {
             _control: None,
         })
     }
-
-    async fn test_connectivity(&self, node: &Node) -> bool {
-        let addr = format!("{}:{}", node.host(), node.port);
-        match crate::util::connect_outbound(&addr, std::time::Duration::from_secs(3)).await {
-            Ok(_) => true,
-            Err(e) => {
-                debug!(
-                    "Shadowsocks connectivity test failed for {}: {}",
-                    node.name, e
-                );
-                false
-            }
-        }
-    }
 }
 
 /// Background relay: encrypt client->server, decrypt server->client.

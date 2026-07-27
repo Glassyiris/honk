@@ -283,17 +283,6 @@ impl ProxyHandler for TrojanGoHandler {
         self.dial(_node, target, target_domain, connect_timeout)
             .await
     }
-
-    async fn test_connectivity(&self, node: &Node) -> bool {
-        let addr = format!("{}:{}", node.host(), node.port);
-        match crate::util::connect_outbound(&addr, std::time::Duration::from_secs(3)).await {
-            Ok(_stream) => true,
-            Err(e) => {
-                tracing::debug!("TrojanGo connectivity test failed for {}: {}", node.name, e);
-                false
-            }
-        }
-    }
 }
 
 /// Build the Trojan-Go mux request header.

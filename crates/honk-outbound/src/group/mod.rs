@@ -18,9 +18,10 @@
 
 use honk_config::group::{Group, GroupPolicy};
 use honk_config::node::Node;
+use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::alive::{AliveDialerSet, IpVersion, ProbeDomain};

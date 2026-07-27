@@ -194,17 +194,6 @@ impl ProxyHandler for TrojanHandler {
         })
     }
 
-    async fn test_connectivity(&self, node: &Node) -> bool {
-        let addr = format!("{}:{}", node.host(), node.port);
-        match crate::util::connect_outbound(&addr, std::time::Duration::from_secs(3)).await {
-            Ok(_stream) => true,
-            Err(e) => {
-                tracing::debug!("Trojan connectivity test failed for {}: {}", node.name, e);
-                false
-            }
-        }
-    }
-
     /// Poolable only on the plain TCP transport: `dial()` completes the
     /// TLS handshake (if enabled) and writes the one-shot request header;
     /// Trojan defines no server handshake reply, so the stream is then a

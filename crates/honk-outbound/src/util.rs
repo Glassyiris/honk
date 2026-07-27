@@ -2,7 +2,6 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::os::fd::AsRawFd;
 use std::time::Duration;
 use tokio::net::TcpStream;
 
@@ -28,6 +27,40 @@ pub fn set_mark_best_effort(socket: &socket2::Socket, mark: u32) -> io::Result<(
     }
 }
 
+/// Apply TCP keepalive tuning (idle 60s, interval 10s, 3 probes) via
+/// socket2's safe API — no raw setsockopt.
+#[cfg(target_os = "linux")]
+fn apply_tcp_keepalive(socket: &socket2::Socket) -> io::Result<()> {
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(60))
+        .with_interval(Duration::from_secs(10))
+        .with_retries(3);
+    socket.set_tcp_keepalive(&keepalive)
+}
+
+/// Create a nonblocking TCP socket for `addr`, nodelay + keepalive tuned,
+/// optionally `SO_MARK`ed so the eBPF datapath treats it as control-plane
+/// traffic and does not re-route it.
+fn new_tcp_socket(addr: &SocketAddr, mark: Option<u32>) -> io::Result<socket2::Socket> {
+    let domain = if addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, None)?;
+    socket.set_nonblocking(true)?;
+    socket.set_tcp_nodelay(true)?;
+    socket.set_keepalive(true)?;
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(mark) = mark {
+            set_mark_best_effort(&socket, mark)?;
+        }
+        apply_tcp_keepalive(&socket)?;
+    }
+    Ok(socket)
+}
+
 /// Create a TCP stream to `addr`, optionally setting `SO_MARK` before the
 /// handshake so the local eBPF datapath treats it as control-plane traffic
 /// and does not re-route it.
@@ -36,147 +69,26 @@ pub async fn connect_marked_addr(
     mark: Option<u32>,
     connect_timeout: Duration,
 ) -> io::Result<TcpStream> {
-    if let Some(mark) = mark {
-        let domain = if addr.is_ipv4() {
-            socket2::Domain::IPV4
-        } else {
-            socket2::Domain::IPV6
-        };
-        let socket = socket2::Socket::new(domain, socket2::Type::STREAM, None)?;
-        socket.set_nonblocking(true)?;
-        socket.set_tcp_nodelay(true)?;
-        socket.set_keepalive(true)?;
-        #[cfg(target_os = "linux")]
+    let socket = new_tcp_socket(&addr, mark)?;
+    match socket.connect(&addr.into()) {
+        Ok(()) => {
+            let std_stream: std::net::TcpStream = socket.into();
+            TcpStream::from_std(std_stream)
+        }
+        Err(e)
+            if e.kind() == io::ErrorKind::WouldBlock || e.raw_os_error() == Some(EINPROGRESS) =>
         {
-            set_mark_best_effort(&socket, mark)?;
-            unsafe {
-                let fd = socket.as_raw_fd();
-                let keepidle: libc::c_int = 60;
-                let keepintvl: libc::c_int = 10;
-                let keepcnt: libc::c_int = 3;
-                if libc::setsockopt(
-                    fd,
-                    libc::IPPROTO_TCP,
-                    libc::TCP_KEEPIDLE,
-                    &keepidle as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                ) < 0
-                {
-                    return Err(io::Error::last_os_error());
-                }
-                if libc::setsockopt(
-                    fd,
-                    libc::IPPROTO_TCP,
-                    libc::TCP_KEEPINTVL,
-                    &keepintvl as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                ) < 0
-                {
-                    return Err(io::Error::last_os_error());
-                }
-                if libc::setsockopt(
-                    fd,
-                    libc::IPPROTO_TCP,
-                    libc::TCP_KEEPCNT,
-                    &keepcnt as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                ) < 0
-                {
-                    return Err(io::Error::last_os_error());
-                }
+            let std_stream: std::net::TcpStream = socket.into();
+            let stream = TcpStream::from_std(std_stream)?;
+            tokio::time::timeout(connect_timeout, stream.writable())
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timeout"))??;
+            if let Some(e) = stream.take_error()? {
+                return Err(e);
             }
+            Ok(stream)
         }
-
-        match socket.connect(&addr.into()) {
-            Ok(()) => {
-                let std_stream: std::net::TcpStream = socket.into();
-                TcpStream::from_std(std_stream)
-            }
-            Err(e)
-                if e.kind() == io::ErrorKind::WouldBlock
-                    || e.raw_os_error() == Some(EINPROGRESS) =>
-            {
-                let std_stream: std::net::TcpStream = socket.into();
-                let stream = TcpStream::from_std(std_stream)?;
-                tokio::time::timeout(connect_timeout, stream.writable())
-                    .await
-                    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timeout"))??;
-                if let Some(e) = stream.take_error()? {
-                    return Err(e);
-                }
-                Ok(stream)
-            }
-            Err(e) => Err(e),
-        }
-    } else {
-        let domain = if addr.is_ipv4() {
-            socket2::Domain::IPV4
-        } else {
-            socket2::Domain::IPV6
-        };
-        let socket = socket2::Socket::new(domain, socket2::Type::STREAM, None)?;
-        socket.set_nonblocking(true)?;
-        socket.set_tcp_nodelay(true)?;
-        socket.set_keepalive(true)?;
-        #[cfg(target_os = "linux")]
-        unsafe {
-            let fd = socket.as_raw_fd();
-            let keepidle: libc::c_int = 60;
-            let keepintvl: libc::c_int = 10;
-            let keepcnt: libc::c_int = 3;
-            if libc::setsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_KEEPIDLE,
-                &keepidle as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            ) < 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-            if libc::setsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_KEEPINTVL,
-                &keepintvl as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            ) < 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-            if libc::setsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_KEEPCNT,
-                &keepcnt as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            ) < 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-        }
-
-        match socket.connect(&addr.into()) {
-            Ok(()) => {
-                let std_stream: std::net::TcpStream = socket.into();
-                TcpStream::from_std(std_stream)
-            }
-            Err(e)
-                if e.kind() == io::ErrorKind::WouldBlock
-                    || e.raw_os_error() == Some(EINPROGRESS) =>
-            {
-                let std_stream: std::net::TcpStream = socket.into();
-                let stream = TcpStream::from_std(std_stream)?;
-                tokio::time::timeout(connect_timeout, stream.writable())
-                    .await
-                    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timeout"))??;
-                if let Some(e) = stream.take_error()? {
-                    return Err(e);
-                }
-                Ok(stream)
-            }
-            Err(e) => Err(e),
-        }
+        Err(e) => Err(e),
     }
 }
 
@@ -222,7 +134,8 @@ pub async fn connect_outbound(addr: &str, connect_timeout: Duration) -> io::Resu
 /// parity).  Use for every UDP socket the control plane originates — proxy
 /// relay sockets, direct UDP, DNS upstream — otherwise `wan_egress` would
 /// classify and redirect the packets back into daens, creating a loop.
-pub async fn udp_marked_bind(bind_addr: SocketAddr) -> io::Result<tokio::net::UdpSocket> {
+/// Single bypass-mark implementation shared with `quic::marked_udp_socket`.
+pub fn marked_udp_socket(bind_addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
     let domain = if bind_addr.is_ipv4() {
         socket2::Domain::IPV4
     } else {
@@ -233,7 +146,12 @@ pub async fn udp_marked_bind(bind_addr: SocketAddr) -> io::Result<tokio::net::Ud
     #[cfg(target_os = "linux")]
     set_mark_best_effort(&socket, honk_ebpf_common::DAE_BYPASS_MARK)?;
     socket.bind(&bind_addr.into())?;
-    tokio::net::UdpSocket::from_std(socket.into())
+    Ok(socket.into())
+}
+
+/// [`marked_udp_socket`] as a tokio socket.
+pub async fn udp_marked_bind(bind_addr: SocketAddr) -> io::Result<tokio::net::UdpSocket> {
+    tokio::net::UdpSocket::from_std(marked_udp_socket(bind_addr)?)
 }
 
 /// Bind a loopback UDP socket for a local protocol bridge (QUIC UDP sessions
