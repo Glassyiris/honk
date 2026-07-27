@@ -169,3 +169,22 @@ pub async fn udp_loopback_bind() -> io::Result<tokio::net::UdpSocket> {
         Err(e) => Err(e),
     }
 }
+
+/// Bind the loopback UDP socket pair for a local protocol bridge (QUIC UDP
+/// sessions and stream tunnels are re-exported to the relay as loopback
+/// datagrams). Returns `(external, internal, external_addr, relay_addr)`:
+/// the relay sends raw payloads to `relay_addr` on `external` and receives
+/// replies from the same address; the bridge task talks to `external_addr`
+/// on `internal`.
+pub async fn udp_loopback_pair() -> io::Result<(
+    tokio::net::UdpSocket,
+    tokio::net::UdpSocket,
+    SocketAddr,
+    SocketAddr,
+)> {
+    let external = udp_loopback_bind().await?;
+    let internal = udp_loopback_bind().await?;
+    let external_addr = external.local_addr()?;
+    let relay_addr = internal.local_addr()?;
+    Ok((external, internal, external_addr, relay_addr))
+}

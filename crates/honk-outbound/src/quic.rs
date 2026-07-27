@@ -16,13 +16,19 @@
 //! - [`QuicBiStream`] — `AsyncRead + AsyncWrite` wrapper pairing a quinn
 //!   [`SendStream`]/[`RecvStream`] so it can be boxed into a
 //!   [`crate::proxy::ProxyStream`].
+//! - Small pieces shared verbatim by the three protocol handlers:
+//!   [`now_secs`], [`recv_read_exact`], the UDP fragment [`defrag`] module,
+//!   [`cached_client`], [`exporter_auth`], [`spawn_conn_reaper`] and the
+//!   [`dial_quic_stream`] retry skeleton.
 
+use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Weak};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, anyhow};
 use quinn::congestion;
@@ -32,7 +38,7 @@ use quinn::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::Mutex;
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Map a congestion-control name (`cubic` / `new_reno` / `bbr`, as used by
 /// sing-box and dae node configs) to a quinn controller factory.
@@ -251,6 +257,108 @@ pub async fn client_config(
     Ok(cfg)
 }
 
+/// Current unix time in seconds (0 on clock skew); used for the idle
+/// accounting of shared connections.
+pub(crate) fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// `RecvStream::read_exact` with quinn's error mapped to
+/// `io::ErrorKind::UnexpectedEof` (protocol framing helpers return
+/// `io::Result`).
+pub(crate) async fn recv_read_exact(recv: &mut RecvStream, buf: &mut [u8]) -> io::Result<()> {
+    recv.read_exact(buf)
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::UnexpectedEof, e))
+}
+
+/// UDP fragment reassembly shared by the TUIC and Hysteria2 session bridges
+/// (sing `udpDefragger` parity).
+pub(crate) mod defrag {
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    /// Maximum pending fragmented packets kept for reassembly per session.
+    const DEFRAG_MAX_PENDING: usize = 64;
+    /// Maximum age of a pending fragmented packet before it is dropped.
+    const DEFRAG_MAX_AGE: Duration = Duration::from_secs(10);
+
+    /// Reassembly state for one fragmented packet.
+    struct DefragBuffer {
+        frags: Vec<Option<Vec<u8>>>,
+        count: usize,
+        updated: Instant,
+    }
+
+    /// Reassembles fragmented UDP packets, bounding memory by capping the
+    /// number of pending packets and expiring stale ones.
+    #[derive(Default)]
+    pub(crate) struct Defragmenter {
+        map: HashMap<u16, DefragBuffer>,
+    }
+
+    impl Defragmenter {
+        pub(crate) fn new() -> Self {
+            Self::default()
+        }
+
+        /// Feed one fragment; returns the reassembled payload when the last
+        /// missing fragment arrives. Unfragmented packets (`frag_total <= 1`)
+        /// pass through immediately; invalid or duplicate fragments are
+        /// dropped (`None`).
+        pub(crate) fn feed(
+            &mut self,
+            packet_id: u16,
+            frag_id: u8,
+            frag_total: u8,
+            data: Vec<u8>,
+        ) -> Option<Vec<u8>> {
+            if frag_total <= 1 {
+                return Some(data);
+            }
+            if frag_id >= frag_total {
+                return None;
+            }
+            let map = &mut self.map;
+            if map.len() >= DEFRAG_MAX_PENDING && !map.contains_key(&packet_id) {
+                map.retain(|_, b| b.updated.elapsed() < DEFRAG_MAX_AGE);
+                if map.len() >= DEFRAG_MAX_PENDING {
+                    return None;
+                }
+            }
+            let frag_total = frag_total as usize;
+            let entry = map.entry(packet_id).or_insert_with(|| DefragBuffer {
+                frags: (0..frag_total).map(|_| None).collect(),
+                count: 0,
+                updated: Instant::now(),
+            });
+            if entry.frags.len() != frag_total {
+                entry.frags = (0..frag_total).map(|_| None).collect();
+                entry.count = 0;
+            }
+            let frag_id = frag_id as usize;
+            if entry.frags[frag_id].is_some() {
+                return None;
+            }
+            entry.frags[frag_id] = Some(data);
+            entry.count += 1;
+            entry.updated = Instant::now();
+            if entry.count != entry.frags.len() {
+                return None;
+            }
+            let entry = map.remove(&packet_id).expect("entry just inserted");
+            let mut data = Vec::new();
+            for frag in entry.frags.into_iter().flatten() {
+                data.extend_from_slice(&frag);
+            }
+            Some(data)
+        }
+    }
+}
+
 /// Bind a non-blocking UDP socket with `SO_MARK` set so the local eBPF
 /// datapath treats QUIC packets to the proxy server as control-plane traffic
 /// and does not re-route them (same bypass as `util::udp_marked_bind`; QUIC
@@ -448,13 +556,27 @@ impl<C> QuicClient<C> {
 /// A QUIC bidirectional stream as a single `AsyncRead + AsyncWrite` object.
 ///
 /// Dropping the send half finishes the stream (sends FIN), which is what the
-/// relay's half-close semantics rely on. `on_drop` lets the owning protocol
-/// track open-stream counts (for idle connection reaping) without wrapping
-/// the stream again.
+/// relay's half-close semantics rely on. The [`StreamDropGuard`] lets the
+/// owning protocol track open-stream counts (for idle connection reaping)
+/// without wrapping the stream again.
 pub struct QuicBiStream {
     send: SendStream,
     recv: RecvStream,
-    on_drop: Option<Box<dyn Fn() + Send + Sync>>,
+    guard: StreamDropGuard,
+}
+
+/// Fires the registered callback when dropped. Lives inside
+/// [`QuicBiStream`]; users that split the stream into its raw quinn halves
+/// ([`QuicBiStream::into_parts`]) keep the guard for the same lifetime
+/// accounting.
+pub(crate) struct StreamDropGuard(Option<Box<dyn Fn() + Send + Sync>>);
+
+impl Drop for StreamDropGuard {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
+    }
 }
 
 impl std::fmt::Debug for QuicBiStream {
@@ -471,22 +593,21 @@ impl QuicBiStream {
         Self {
             send,
             recv,
-            on_drop: None,
+            guard: StreamDropGuard(None),
         }
     }
 
     /// Register a callback fired when this stream object is dropped.
     pub fn with_on_drop(mut self, f: impl Fn() + Send + Sync + 'static) -> Self {
-        self.on_drop = Some(Box::new(f));
+        self.guard.0 = Some(Box::new(f));
         self
     }
-}
 
-impl Drop for QuicBiStream {
-    fn drop(&mut self) {
-        if let Some(f) = &self.on_drop {
-            f();
-        }
+    /// Split into the raw quinn halves plus the drop guard (open-stream
+    /// accounting) — for users that drive the halves separately, e.g. UDP
+    /// session bridges.
+    pub(crate) fn into_parts(self) -> (SendStream, RecvStream, StreamDropGuard) {
+        (self.send, self.recv, self.guard)
     }
 }
 
@@ -518,6 +639,181 @@ impl AsyncWrite for QuicBiStream {
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         AsyncWrite::poll_shutdown(Pin::new(&mut self.send), cx)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Shared skeletons for the TUIC / Juicity / Hysteria2 protocol handlers
+// ---------------------------------------------------------------------------
+
+/// Per-connection state shared by the QUIC proxy handlers: the activity
+/// bookkeeping used by the dial retry skeleton and the idle reaper.
+pub(crate) trait QuicConnState: Send + Sync + 'static {
+    /// Record activity on the connection (resets the idle reaper).
+    fn touch(&self);
+    /// Counter of open streams/bridges on this connection.
+    fn open_counter(&self) -> &Arc<AtomicUsize>;
+}
+
+/// Shared per-server protocol-client cache (TUIC/Juicity/Hysteria2 pool
+/// parity): a `LazyLock` map keyed by server + credentials.
+pub(crate) type ClientCache<C> = LazyLock<parking_lot::Mutex<HashMap<String, Arc<C>>>>;
+
+/// Look up a cached per-server protocol client, building and inserting it
+/// when missing. The build runs outside the lock (it is async — ECH
+/// discovery), so a concurrent task may have won the race; in that case the
+/// existing entry is reused and the freshly built one dropped.
+pub(crate) async fn cached_client<C, F, Fut>(
+    cache: &'static ClientCache<C>,
+    key: String,
+    build: F,
+) -> anyhow::Result<Arc<C>>
+where
+    C: Send + Sync + 'static,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Arc<C>>>,
+{
+    if let Some(client) = cache.lock().get(&key) {
+        return Ok(Arc::clone(client));
+    }
+    let client = build().await?;
+    // Another task may have won the race — reuse theirs.
+    Ok(cache.lock().entry(key).or_insert(client).clone())
+}
+
+/// TUIC-style exporter authentication (sing `clientHandshake`,
+/// `client.go:197-214`): one uni stream carrying
+/// `[version, 0x00, uuid(16), token(32)]` where
+/// `token = TLS ExportKeyingMaterial(label = uuid, context = password, 32)`.
+/// Juicity reuses the same frame with version 0x00 and keeps the stream
+/// open (`finish = false`); TUIC finishes it right after the write.
+///
+/// There is no positive auth acknowledgement: a server that rejects the
+/// credentials closes the connection, so the call waits a brief `grace`
+/// period for that to surface as a dial error here instead of a stream
+/// failure on the first proxied connection. Returns the auth stream.
+pub(crate) async fn exporter_auth(
+    conn: &Connection,
+    uuid: &[u8; 16],
+    password: &str,
+    version: u8,
+    finish: bool,
+    grace: Duration,
+) -> anyhow::Result<SendStream> {
+    let mut token = [0u8; 32];
+    conn.export_keying_material(&mut token, uuid, password.as_bytes())
+        .map_err(|e| anyhow!("QUIC exporter auth: TLS keying material export failed: {e:?}"))?;
+    let mut auth = Vec::with_capacity(2 + 16 + 32);
+    auth.push(version);
+    auth.push(0x00); // CMD_AUTHENTICATE
+    auth.extend_from_slice(uuid);
+    auth.extend_from_slice(&token);
+    let mut stream = conn
+        .open_uni()
+        .await
+        .context("QUIC exporter auth: open authenticate stream")?;
+    stream
+        .write_all(&auth)
+        .await
+        .context("QUIC exporter auth: send authenticate")?;
+    if finish {
+        stream
+            .finish()
+            .context("QUIC exporter auth: finish authenticate stream")?;
+    }
+    tokio::select! {
+        e = conn.closed() => Err(anyhow!("QUIC exporter auth: connection closed during authentication: {e}")),
+        _ = tokio::time::sleep(grace) => Ok(stream),
+    }
+}
+
+/// Per-tick callback for [`spawn_conn_reaper`] (TUIC's heartbeat datagram);
+/// returning false ends the reaper loop.
+type ReaperTick = Box<dyn Fn(&Connection) -> bool + Send + 'static>;
+
+/// Spawn the idle-connection reaper shared by the QUIC protocol handlers:
+/// every `interval`, close the connection when the owning protocol state was
+/// dropped ("state dropped") or when it has had no open streams/bridges for
+/// `idle_timeout` ("idle"). `on_tick` runs after the liveness checks (TUIC's
+/// heartbeat datagram); returning false ends the loop.
+pub(crate) fn spawn_conn_reaper(
+    conn: Connection,
+    open: Weak<AtomicUsize>,
+    last_activity: Weak<AtomicU64>,
+    interval: Duration,
+    idle_timeout: Duration,
+    on_tick: Option<ReaperTick>,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            if conn.close_reason().is_some() {
+                break;
+            }
+            let (Some(open), Some(last)) = (open.upgrade(), last_activity.upgrade()) else {
+                // Protocol state dropped: nothing can use this connection.
+                conn.close(VarInt::from_u32(0), b"state dropped");
+                break;
+            };
+            let idle = now_secs().saturating_sub(last.load(Ordering::Relaxed));
+            if open.load(Ordering::Relaxed) == 0 && idle > idle_timeout.as_secs() {
+                conn.close(VarInt::from_u32(0), b"idle");
+                break;
+            }
+            if let Some(on_tick) = &on_tick
+                && !on_tick(&conn)
+            {
+                break;
+            }
+        }
+    });
+}
+
+/// Shared TCP-over-QUIC dial skeleton (TUIC/Juicity/Hysteria2): get the
+/// shared connection via `connect` (re-dialing when needed), run the
+/// protocol's stream handshake (`make`), and retry once with a fresh
+/// connection when the handshake fails on a half-dead cached connection and
+/// `retryable` allows it (Hysteria2's server-side refusals are not
+/// retryable). The returned stream decrements the connection's open counter
+/// on drop.
+pub(crate) async fn dial_quic_stream<S, Connect, Fut, Make, MakeFut>(
+    client: &QuicClient<S>,
+    connect: Connect,
+    connect_timeout: Duration,
+    make: Make,
+    retryable: impl Fn(&anyhow::Error) -> bool,
+    proto: &'static str,
+) -> anyhow::Result<QuicBiStream>
+where
+    S: QuicConnState,
+    Connect: Fn(Duration) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<(Connection, Arc<S>)>>,
+    Make: Fn(Connection) -> MakeFut,
+    MakeFut: std::future::Future<Output = anyhow::Result<(SendStream, RecvStream)>>,
+{
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0..2 {
+        let (conn, state) = connect(connect_timeout).await?;
+        state.touch();
+        match make(conn.clone()).await {
+            Ok((send, recv)) => {
+                let open = Arc::clone(state.open_counter());
+                open.fetch_add(1, Ordering::Relaxed);
+                let stream = QuicBiStream::new(send, recv).with_on_drop(move || {
+                    open.fetch_sub(1, Ordering::Relaxed);
+                });
+                return Ok(stream);
+            }
+            Err(e) if retryable(&e) => {
+                debug!("{proto}: stream open failed (attempt {attempt}): {e}");
+                client.invalidate(&conn).await;
+                last_err = Some(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.expect("loop runs at least once"))
 }
 
 #[cfg(test)]
