@@ -39,6 +39,11 @@ use super::{ProxyHandler, ProxyStream, UdpProxySocket};
 /// `common/uot/protocol.go`): UDP-over-TCP streams are opened to this
 /// pseudo-target inside the AnyTLS session.
 const UOT_MAGIC: &str = "sp.v2.udp-over-tcp.arpa";
+
+/// UoT v1 packet address types (sing uot v1 / non-connect form).
+const UOT_V1_ATYP_V4: u8 = 0x00;
+const UOT_V1_ATYP_V6: u8 = 0x01;
+const UOT_V1_ATYP_DOMAIN: u8 = 0x02;
 /// Idle timeout for the UDP bridge task (matches the TUIC bridge).
 const UDP_BRIDGE_IDLE_SECS: u64 = 90;
 
@@ -719,6 +724,194 @@ impl AnyTlsHandler {
     }
 }
 
+/// UoT response framing detected per stream. The sing-box spec's connect
+/// mode is `u16be len + payload`, but some third-party servers answer
+/// connect requests in the v1 packet layout (`atyp + addr + port +
+/// u16be len + payload`) — detected on the first datagram by matching the
+/// echoed destination, never by guessing from the length bytes (a v2
+/// length high byte can look like a v1 atyp).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum UotMode {
+    V2Connect,
+    V1Packet,
+}
+
+/// Buffered frame reader for the response direction of a UoT stream.
+struct UotFrameReader<R> {
+    rd: R,
+    buf: Vec<u8>,
+    mode: Option<UotMode>,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> UotFrameReader<R> {
+    fn new(rd: R) -> Self {
+        Self {
+            rd,
+            buf: Vec::with_capacity(4096),
+            mode: None,
+        }
+    }
+
+    /// Fill the buffer to `need` bytes. Returns Err on EOF.
+    async fn fill(&mut self, need: usize) -> std::io::Result<()> {
+        let mut chunk = [0u8; 4096];
+        while self.buf.len() < need {
+            let n = tokio::io::AsyncReadExt::read(&mut self.rd, &mut chunk).await?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "UoT stream closed",
+                ));
+            }
+            self.buf.extend_from_slice(&chunk[..n]);
+        }
+        Ok(())
+    }
+
+    /// Bounded fill used only while the framing is still undetected: a tiny
+    /// first datagram (a few bytes) must not deadlock the decision — after
+    /// the grace period the spec framing (v2 connect) wins.
+    async fn fill_grace(&mut self, need: usize) -> std::io::Result<()> {
+        match tokio::time::timeout(Duration::from_millis(500), self.fill(need)).await {
+            Ok(r) => r,
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "UoT mode detect grace expired",
+            )),
+        }
+    }
+
+    /// Read one datagram payload, detecting the framing on the first call.
+    /// `target`/`target_domain` is the destination of the UoT connect
+    /// request, which v1-format servers echo as the packet source.
+    async fn next_datagram(
+        &mut self,
+        target: &SocketAddr,
+        target_domain: Option<&str>,
+    ) -> std::io::Result<Vec<u8>> {
+        loop {
+            match self.mode {
+                Some(UotMode::V2Connect) => {
+                    self.fill(2).await?;
+                    let len = u16::from_be_bytes([self.buf[0], self.buf[1]]) as usize;
+                    self.fill(2 + len).await?;
+                    return Ok(self.buf.drain(..2 + len).skip(2).collect());
+                }
+                Some(UotMode::V1Packet) => {
+                    let (header, payload_len) = self.parse_v1_header().await?;
+                    self.fill(header + payload_len).await?;
+                    return Ok(self
+                        .buf
+                        .drain(..header + payload_len)
+                        .skip(header)
+                        .collect());
+                }
+                None => {
+                    self.fill_grace(1).await?;
+                    if self.buf[0] > UOT_V1_ATYP_DOMAIN {
+                        self.mode = Some(UotMode::V2Connect);
+                        continue;
+                    }
+                    match self.parse_v1_header_grace().await {
+                        Ok((header, _)) => {
+                            // A v1 server echoes the connect destination as the
+                            // packet source; a mismatch means the bytes were really
+                            // a v2 length prefix (e.g. 0x00..0x02) after all.
+                            if self
+                                .v1_header_matches(header, target, target_domain)
+                                .await?
+                            {
+                                self.mode = Some(UotMode::V1Packet);
+                            } else {
+                                self.mode = Some(UotMode::V2Connect);
+                            }
+                        }
+                        // Not enough bytes to decide within the grace
+                        // period: fall back to the spec framing.
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            self.mode = Some(UotMode::V2Connect);
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Parse the v1 packet header length and payload length at `buf[0]`.
+    async fn parse_v1_header(&mut self) -> std::io::Result<(usize, usize)> {
+        self.parse_v1_header_inner(false).await
+    }
+
+    /// Grace-period variant used only while the framing is undetected.
+    async fn parse_v1_header_grace(&mut self) -> std::io::Result<(usize, usize)> {
+        self.parse_v1_header_inner(true).await
+    }
+
+    async fn parse_v1_header_inner(&mut self, grace: bool) -> std::io::Result<(usize, usize)> {
+        const BAD: &str = "invalid UoT v1 packet header";
+        macro_rules! fill {
+            ($n:expr) => {
+                if grace {
+                    self.fill_grace($n).await?
+                } else {
+                    self.fill($n).await?
+                }
+            };
+        }
+        fill!(1);
+        let atyp = self.buf[0];
+        let addr_len = match atyp {
+            UOT_V1_ATYP_V4 => 4,
+            UOT_V1_ATYP_V6 => 16,
+            UOT_V1_ATYP_DOMAIN => {
+                fill!(2);
+                1 + self.buf[1] as usize
+            }
+            _ => {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, BAD));
+            }
+        };
+        let header = 1 + addr_len + 2 + 2;
+        fill!(header);
+        let len_at = 1 + addr_len + 2;
+        let payload_len = u16::from_be_bytes([self.buf[len_at], self.buf[len_at + 1]]) as usize;
+        Ok((header, payload_len))
+    }
+
+    /// Whether the v1 header currently in `buf` echoes the connect
+    /// destination (source == the requested target).
+    async fn v1_header_matches(
+        &self,
+        header: usize,
+        target: &SocketAddr,
+        target_domain: Option<&str>,
+    ) -> std::io::Result<bool> {
+        let atyp = self.buf[0];
+        let addr_end = header - 4; // before port(2) + len(2)
+        let port = u16::from_be_bytes([self.buf[addr_end], self.buf[addr_end + 1]]);
+        if port != target.port() {
+            return Ok(false);
+        }
+        let matched = match atyp {
+            UOT_V1_ATYP_V4 => {
+                let ip =
+                    std::net::Ipv4Addr::new(self.buf[1], self.buf[2], self.buf[3], self.buf[4]);
+                target.ip() == std::net::IpAddr::V4(ip)
+            }
+            UOT_V1_ATYP_V6 => {
+                let ip: [u8; 16] = self.buf[1..17].try_into().unwrap_or([0; 16]);
+                target.ip() == std::net::IpAddr::V6(ip.into())
+            }
+            _ => {
+                let domain = String::from_utf8_lossy(&self.buf[2..addr_end]).to_string();
+                Some(domain.as_str()) == target_domain
+            }
+        };
+        Ok(matched)
+    }
+}
+
 /// Bridge task for UoT: forwards payloads between the loopback UDP socket
 /// and length-prefixed datagrams on the AnyTLS stream. Ends on error, EOF,
 /// or after [`UDP_BRIDGE_IDLE_SECS`] without activity.
@@ -726,20 +919,17 @@ async fn uot_bridge(
     stream: tokio::io::DuplexStream,
     internal: tokio::net::UdpSocket,
     external_addr: SocketAddr,
+    target: SocketAddr,
+    target_domain: Option<String>,
 ) {
-    let (mut rd, mut wr) = tokio::io::split(stream);
+    let (rd, mut wr) = tokio::io::split(stream);
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let reader = tokio::spawn(async move {
-        loop {
-            let mut len_buf = [0u8; 2];
-            if rd.read_exact(&mut len_buf).await.is_err() {
-                break;
-            }
-            let len = u16::from_be_bytes(len_buf) as usize;
-            let mut data = vec![0u8; len];
-            if rd.read_exact(&mut data).await.is_err() {
-                break;
-            }
+        let mut frames = UotFrameReader::new(rd);
+        while let Ok(data) = frames
+            .next_datagram(&target, target_domain.as_deref())
+            .await
+        {
             if tx.send(data).is_err() {
                 break;
             }
@@ -911,7 +1101,13 @@ impl ProxyHandler for AnyTlsHandler {
         let internal = crate::util::udp_loopback_bind().await?;
         let external_addr = external.local_addr()?;
         let relay_addr = internal.local_addr()?;
-        tokio::spawn(uot_bridge(stream, internal, external_addr));
+        tokio::spawn(uot_bridge(
+            stream,
+            internal,
+            external_addr,
+            target,
+            target_domain.map(str::to_string),
+        ));
 
         Ok(UdpProxySocket {
             socket: Arc::new(external),
@@ -1319,7 +1515,13 @@ mod uot_tests {
         let internal = crate::util::udp_loopback_bind().await.unwrap();
         let external_addr = external.local_addr().unwrap();
         let relay_addr = internal.local_addr().unwrap();
-        tokio::spawn(uot_bridge(client_half, internal, external_addr));
+        tokio::spawn(uot_bridge(
+            client_half,
+            internal,
+            external_addr,
+            "8.8.8.8:53".parse().unwrap(),
+            None,
+        ));
 
         // Outbound: payload from the loopback peer becomes [len][payload].
         external.send_to(b"ping", relay_addr).await.unwrap();
@@ -1337,5 +1539,57 @@ mod uot_tests {
         let (n, from) = external.recv_from(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"pong");
         assert_eq!(from, relay_addr);
+    }
+
+    /// Third-party servers (e.g. nexi) answer UoT connect requests in the
+    /// v1 packet layout; the bridge must detect that framing by the echoed
+    /// destination instead of eating the atyp byte as a length prefix.
+    #[tokio::test]
+    async fn test_uot_bridge_v1_packet_response() {
+        let (client_half, mut server_half) = tokio::io::duplex(65536);
+        let external = crate::util::udp_loopback_bind().await.unwrap();
+        let internal = crate::util::udp_loopback_bind().await.unwrap();
+        let external_addr = external.local_addr().unwrap();
+        tokio::spawn(uot_bridge(
+            client_half,
+            internal,
+            external_addr,
+            "8.8.8.8:53".parse().unwrap(),
+            None,
+        ));
+
+        // v1 packet: atyp=v4, addr=8.8.8.8, port=53, len=4, "pong".
+        server_half
+            .write_all(&[0x00, 8, 8, 8, 8, 0x00, 53, 0x00, 4])
+            .await
+            .unwrap();
+        server_half.write_all(b"pong").await.unwrap();
+        let mut buf = [0u8; 16];
+        let (n, _from) = external.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"pong");
+    }
+
+    /// A v2-format datagram whose length high byte is a valid v1 atyp must
+    /// NOT be misdetected as v1 (destination mismatch falls back to v2).
+    #[tokio::test]
+    async fn test_uot_bridge_v2_with_atyp_like_prefix() {
+        let (client_half, mut server_half) = tokio::io::duplex(65536);
+        let external = crate::util::udp_loopback_bind().await.unwrap();
+        let internal = crate::util::udp_loopback_bind().await.unwrap();
+        let external_addr = external.local_addr().unwrap();
+        tokio::spawn(uot_bridge(
+            client_half,
+            internal,
+            external_addr,
+            "8.8.8.8:53".parse().unwrap(),
+            None,
+        ));
+
+        // v2 connect datagram: len=4 (high byte 0x00 == atyp v4), "pong".
+        server_half.write_all(&[0x00, 0x04]).await.unwrap();
+        server_half.write_all(b"pong").await.unwrap();
+        let mut buf = [0u8; 16];
+        let (n, _from) = external.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"pong");
     }
 }

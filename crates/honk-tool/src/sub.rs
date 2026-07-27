@@ -428,7 +428,8 @@ async fn probe_udp_dns(
             if n >= 2 && buf[0] == query[0] && buf[1] == query[1] {
                 Some(Ok(start.elapsed()))
             } else {
-                Some(Err("dns response id mismatch".into()))
+                let hex: String = buf[..n.min(8)].iter().map(|b| format!("{b:02x}")).collect();
+                Some(Err(format!("dns response id mismatch (n={n} hex={hex})")))
             }
         }
         Ok(Err(e)) => Some(Err(format!("dns recv: {e}"))),
