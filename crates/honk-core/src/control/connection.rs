@@ -1315,13 +1315,22 @@ impl ControlPlaneHandle {
                     proxy.socket.send_to(&data, proxy.relay_addr).await?;
                     let client_to_proxy: u64 = data.len() as u64;
 
-                    let (endpoint, is_new) = self.udp_pool.get_or_create(
+                    let Some((endpoint, is_new)) = self.udp_pool.get_or_create(
                         client_addr,
                         original_dst,
                         proxy.socket,
                         proxy.relay_addr,
                         node.name.clone(),
-                    );
+                    ) else {
+                        // Pool at capacity: the datagram was already sent;
+                        // without an endpoint there is no reply path, so stop
+                        // here instead of queueing unbounded state.
+                        debug!(
+                            "UDP endpoint pool full; dropping mapping {} -> {}",
+                            client_addr, original_dst
+                        );
+                        return Ok(());
+                    };
                     if is_new {
                         debug!(
                             "Proxying UDP {} -> {} via {} (new endpoint)",

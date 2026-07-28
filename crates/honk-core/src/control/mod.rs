@@ -904,16 +904,18 @@ impl ControlPlane {
                                 continue;
                             }
                             let data = bytes::Bytes::copy_from_slice(&udp4_buf[..n]);
-                            let permit = self.concurrency_limit.clone().try_acquire_owned();
+                            // At capacity, drop the datagram instead of
+                            // queueing a task that waits on the semaphore —
+                            // UDP tolerates loss; unbounded pending tasks do not.
+                            let Ok(permit) = self.concurrency_limit.clone().try_acquire_owned()
+                            else {
+                                continue;
+                            };
                             let handle = self.spawn_handle();
                             let sock = udp4_socket.clone();
                             let drain = drain.clone();
-                            let limit = self.concurrency_limit.clone();
                             tokio::spawn(async move {
-                                let _permit = match permit {
-                                    Ok(p) => Some(p),
-                                    Err(_) => limit.acquire_owned().await.ok(),
-                                };
+                                let _permit = permit;
                                 let _guard = ConnectionGuard::new(drain);
                                 if let Err(e) = handle.serve_udp_connection(sock, data, src_addr, original_dst).await {
                                     warn!("Error handling UDP from {} (orig {}): {}", src_addr, original_dst, e);
@@ -941,16 +943,17 @@ impl ControlPlane {
                                 continue;
                             }
                             let data = bytes::Bytes::copy_from_slice(&udp6_buf[..n]);
-                            let permit = self.concurrency_limit.clone().try_acquire_owned();
+                            // Same as the v4 path: drop instead of queueing
+                            // a pending task when at capacity.
+                            let Ok(permit) = self.concurrency_limit.clone().try_acquire_owned()
+                            else {
+                                continue;
+                            };
                             let handle = self.spawn_handle();
                             let sock = udp6_socket.clone().expect("udp6_socket present");
                             let drain = drain.clone();
-                            let limit = self.concurrency_limit.clone();
                             tokio::spawn(async move {
-                                let _permit = match permit {
-                                    Ok(p) => Some(p),
-                                    Err(_) => limit.acquire_owned().await.ok(),
-                                };
+                                let _permit = permit;
                                 let _guard = ConnectionGuard::new(drain);
                                 if let Err(e) = handle.serve_udp_connection(sock, data, src_addr, original_dst).await {
                                     warn!("Error handling UDPv6 from {} (orig {}): {}", src_addr, original_dst, e);

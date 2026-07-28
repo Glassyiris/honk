@@ -21,6 +21,11 @@ const JANITOR_INTERVAL: Duration = Duration::from_secs(5);
 const REPLY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// TTL for the per-endpoint UDP routing result cache.
 const ROUTING_CACHE_TTL: Duration = Duration::from_secs(30);
+/// Hard cap on pooled endpoints. A unique-tuple UDP flood must not be able
+/// to grow the pool (and with it sockets, reply tasks and memory) without
+/// bound — at the cap new mappings are refused and the datagram is dropped,
+/// which UDP tolerates by design.
+const MAX_ENDPOINTS: usize = 8192;
 
 /// A pooled UDP endpoint representing one NAT mapping.
 pub struct UdpEndpoint {
@@ -386,7 +391,8 @@ impl UdpEndpointPool {
     }
 
     /// Get or create an endpoint for the given client→dst mapping.
-    /// Returns (endpoint, is_new) where is_new indicates whether this was just created.
+    /// Returns `(endpoint, is_new)`, or `None` when the pool is at its hard
+    /// capacity cap (caller should drop the datagram).
     pub fn get_or_create(
         &self,
         client: SocketAddr,
@@ -394,8 +400,22 @@ impl UdpEndpointPool {
         proxy_socket: Arc<UdpSocket>,
         relay_addr: SocketAddr,
         node_name: String,
-    ) -> (Arc<UdpEndpoint>, bool) {
+    ) -> Option<(Arc<UdpEndpoint>, bool)> {
         let key = EndpointKey::new(client, dst);
+        // Capacity check BEFORE taking the entry lock — `DashMap::len()`
+        // takes every shard's read lock and would deadlock against the
+        // entry's write lock. At the cap, existing mappings still refresh;
+        // only brand-new ones are refused (a few over-shoot under races is
+        // fine for a flood ceiling).
+        if self.endpoints.len() >= MAX_ENDPOINTS {
+            return self.get(client, dst).map(|ep| (ep, false)).or_else(|| {
+                debug!(
+                    "UDP endpoint pool at capacity ({}); dropping new mapping {} -> {}",
+                    MAX_ENDPOINTS, client, dst
+                );
+                None
+            });
+        }
         // entry() holds the shard lock across the whole check-and-insert,
         // preserving the old global-mutex semantics (no duplicate endpoint
         // can be created for the same key by a racing task).
@@ -409,18 +429,18 @@ impl UdpEndpointPool {
                     // without a matching release pinned every reused
                     // endpoint in the pool forever (the UDP socket leak).
                     existing.refresh();
-                    return (Arc::clone(existing), false);
+                    return Some((Arc::clone(existing), false));
                 }
                 // Dead endpoint: replace it atomically (equivalent to the
                 // old remove-then-insert under the global lock).
                 let ep = Arc::new(UdpEndpoint::new(proxy_socket, relay_addr, node_name));
                 occ.insert(Arc::clone(&ep));
-                (ep, true)
+                Some((ep, true))
             }
             dashmap::mapref::entry::Entry::Vacant(vac) => {
                 let ep = Arc::new(UdpEndpoint::new(proxy_socket, relay_addr, node_name));
                 vac.insert(Arc::clone(&ep));
-                (ep, true)
+                Some((ep, true))
             }
         }
     }
@@ -591,6 +611,11 @@ impl UdpEndpointPool {
                 }
             }
             endpoint.release();
+            // Lifecycle consistency: when the reply task exits, the endpoint
+            // must die with it — otherwise the fast path keeps forwarding
+            // client packets into a mapping nobody reads replies for, and
+            // the client sees a black hole until the janitor reaps it.
+            endpoint.kill();
         })
     }
 
@@ -708,12 +733,14 @@ mod tests {
         );
         let relay = make_addr("192.168.1.1", 1080);
 
-        let (_ep, is_new) =
-            pool.get_or_create(client, dst, proxy.clone(), relay, "test-node".to_string());
+        let (_ep, is_new) = pool
+            .get_or_create(client, dst, proxy.clone(), relay, "test-node".to_string())
+            .unwrap();
         assert!(is_new, "first call should be new");
 
-        let (_ep2, is_new2) =
-            pool.get_or_create(client, dst, proxy, relay, "test-node".to_string());
+        let (_ep2, is_new2) = pool
+            .get_or_create(client, dst, proxy, relay, "test-node".to_string())
+            .unwrap();
         assert!(!is_new2, "second call should return existing");
     }
 
@@ -794,14 +821,16 @@ mod tests {
             proxy.clone(),
             relay,
             "dead-node".to_string(),
-        );
+        )
+        .unwrap();
         pool.get_or_create(
             make_addr("10.0.0.2", 12345),
             dst,
             proxy.clone(),
             relay,
             "other-node".to_string(),
-        );
+        )
+        .unwrap();
         assert_eq!(pool.len(), 2);
 
         pool.remove_by_node("dead-node");
