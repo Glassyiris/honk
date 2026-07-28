@@ -219,14 +219,15 @@ impl DnsForwarder {
 
         if self.cache_enabled && !bypass_cache_read {
             let mut cache = self.cache.lock().await;
-            if cache.is_negative(&cache_key) {
+            if let Some(rcode) = cache.negative_rcode(&cache_key) {
                 debug!(
-                    "DNS forwarder: negative cache hit for {} — skipping upstream",
-                    domain
+                    "DNS forwarder: negative cache hit for {} (rcode={}) — skipping upstream",
+                    domain, rcode
                 );
-                return Err(anyhow::anyhow!(
-                    "negative cache hit for {} (NXDOMAIN/SERVFAIL)",
-                    domain
+                // Answer with the cached rcode instead of an opaque error:
+                // NXDOMAIN is a valid answer, not a SERVFAIL.
+                return Ok(crate::control::dns_control::build_dns_error_response(
+                    raw_query, rcode,
                 ));
             }
             if let Some(entry) = cache.get(&cache_key) {
@@ -311,7 +312,7 @@ impl DnsForwarder {
                 if self.cache_enabled {
                     let neg_ttl = extract_soa_negative_ttl(&response, 60);
                     let mut cache = self.cache.lock().await;
-                    cache.put_negative(cache_key.clone(), neg_ttl);
+                    cache.put_negative(cache_key.clone(), neg_ttl, rcode);
                     debug!(
                         "DNS forwarder: negative cache stored for {} (rcode={}, ttl={}s)",
                         domain, rcode, neg_ttl
@@ -507,7 +508,7 @@ impl DnsForwarder {
         let sibling_key = dns_cache_key(domain, preferred_qtype);
         if self.cache_enabled {
             let mut cache = self.cache.lock().await;
-            if cache.is_negative(&sibling_key) {
+            if cache.negative_rcode(&sibling_key).is_some() {
                 return false;
             }
             if let Some(entry) = cache.get(&sibling_key) {
@@ -1914,5 +1915,47 @@ mod tests {
             0,
             "A must be suppressed when AAAA answers exist"
         );
+    }
+
+    /// A cached NXDOMAIN must be answered as NXDOMAIN (rcode 3), never
+    /// upgraded to SERVFAIL — the two have opposite client semantics.
+    #[tokio::test]
+    async fn test_negative_cache_returns_nxdomain_not_servfail() {
+        let mut nx = make_a_response([93, 184, 216, 34], 60);
+        nx[3] = 0x83; // QR + RA + NXDOMAIN
+        let mock = Arc::new(MockUpstream::new(nx));
+        let cache = test_cache();
+        let forwarder = DnsForwarder::new(mock.clone(), cache, test_router());
+        let query = make_a_query();
+
+        let resp = forwarder.resolve(&query).await.expect("first nxdomain");
+        assert_eq!(resp[3] & 0x0f, 3);
+        assert_eq!(mock.call_count.load(Ordering::SeqCst), 1);
+
+        let resp2 = forwarder.resolve(&query).await.expect("cached nxdomain");
+        assert_eq!(resp2[3] & 0x0f, 3, "cached negative must stay NXDOMAIN");
+        assert_eq!(resp2[0..2], query[0..2], "txid must match the query");
+        assert_eq!(
+            mock.call_count.load(Ordering::SeqCst),
+            1,
+            "negative hit must not re-query upstream"
+        );
+    }
+
+    /// A cached SERVFAIL stays SERVFAIL (rcode 2) on later hits.
+    #[tokio::test]
+    async fn test_negative_cache_keeps_servfail_rcode() {
+        let mut sf = make_a_response([93, 184, 216, 34], 1);
+        sf[3] = 0x82; // QR + RA + SERVFAIL
+        let mock = Arc::new(MockUpstream::new(sf));
+        let cache = test_cache();
+        let forwarder = DnsForwarder::new(mock.clone(), cache, test_router());
+        let query = make_a_query();
+
+        let _ = forwarder.resolve(&query).await;
+        // Second hit: still rcode 2, no extra upstream call.
+        let resp2 = forwarder.resolve(&query).await.expect("cached servfail");
+        assert_eq!(resp2[3] & 0x0f, 2);
+        assert_eq!(mock.call_count.load(Ordering::SeqCst), 1);
     }
 }

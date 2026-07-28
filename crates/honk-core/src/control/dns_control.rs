@@ -217,8 +217,10 @@ impl DnsController {
             return Ok(false);
         }
 
-        match self.concurrency_limit.try_acquire() {
-            Ok(_permit) => {}
+        // Hold the permit until the response is written — acquiring and
+        // immediately dropping it would make the concurrency limit a no-op.
+        let _permit = match self.concurrency_limit.try_acquire() {
+            Ok(permit) => permit,
             Err(_) => {
                 debug!("DNS concurrency limit reached; sending SERVFAIL");
                 let servfail = build_dns_servfail(data);
@@ -226,7 +228,7 @@ impl DnsController {
                     super::send_udp_reply_from_orig_dst(&servfail, client_addr, original_dst).await;
                 return Ok(true);
             }
-        }
+        };
 
         debug!(
             "DNS controller (UDP): forwarding query from {}",
@@ -302,11 +304,14 @@ impl DnsController {
                 return Ok(true);
             }
 
-            let resp = if self.concurrency_limit.try_acquire().is_ok() {
-                self.resolve_with_singleflight(&dns_data, Some(original_dst))
-                    .await
-            } else {
-                build_dns_servfail(&dns_data)
+            // Same as the UDP path: the permit must stay alive until the
+            // response is written.
+            let resp = match self.concurrency_limit.try_acquire() {
+                Ok(_permit) => {
+                    self.resolve_with_singleflight(&dns_data, Some(original_dst))
+                        .await
+                }
+                Err(_) => build_dns_servfail(&dns_data),
             };
             write_tcp_dns_response(stream, &resp).await?;
         }
@@ -318,29 +323,53 @@ impl DnsController {
         data: &[u8],
         original_dst: Option<SocketAddr>,
     ) -> Vec<u8> {
+        // Key covers the original destination too: `asis` queries to
+        // different upstream servers must never share one flight.
         let cache_key = match crate::dns::forwarder::parse_dns_question(data) {
-            Some((domain, qtype)) => format!("{}:{}", domain, qtype),
+            Some((domain, qtype)) => {
+                format!(
+                    "{}:{}:{}",
+                    domain,
+                    qtype,
+                    original_dst
+                        .map(|a| a.ip())
+                        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+                )
+            }
             None => return self.resolve_and_notify(data, original_dst).await.0,
         };
 
-        let maybe_rx = self.in_flight.get(&cache_key).map(|tx| tx.subscribe());
+        use dashmap::mapref::entry::Entry;
+        let rx = match self.in_flight.entry(cache_key.clone()) {
+            Entry::Occupied(e) => Some(e.get().subscribe()),
+            Entry::Vacant(e) => {
+                let (tx, _) = broadcast::channel(1);
+                e.insert(tx.clone());
+                None // leader
+            }
+        };
 
-        if let Some(mut rx) = maybe_rx
-            && let Ok(resp) = rx.recv().await
-        {
-            debug!("DNS singleflight: reused result for {}", cache_key);
-            return resp;
+        if let Some(mut rx) = rx {
+            match rx.recv().await {
+                Ok(resp) => {
+                    debug!("DNS singleflight: reused result for {}", cache_key);
+                    // The shared response carries the leader's transaction
+                    // ID; restore this query's own or clients will drop it.
+                    return with_own_txid(resp, data);
+                }
+                Err(_) => {
+                    // Leader dropped without answering (panic/cancel): clear
+                    // the stale entry and retry as a fresh flight.
+                    self.in_flight.remove(&cache_key);
+                    return Box::pin(self.resolve_with_singleflight(data, original_dst)).await;
+                }
+            }
         }
-        // Sender dropped — fall through to execute the query ourselves.
-
-        let (tx, _) = broadcast::channel(1);
-        self.in_flight.insert(cache_key.clone(), tx.clone());
 
         let (response, _) = self.resolve_and_notify(data, original_dst).await;
-
-        let _ = tx.send(response.clone());
-        self.in_flight.remove(&cache_key);
-
+        if let Some((_, tx)) = self.in_flight.remove(&cache_key) {
+            let _ = tx.send(response.clone());
+        }
         response
     }
 
@@ -572,12 +601,28 @@ fn is_dns_query(data: &[u8]) -> bool {
 }
 
 fn build_dns_servfail(query: &[u8]) -> Vec<u8> {
+    build_dns_error_response(query, 2)
+}
+
+/// Minimal error response: the query with QR/RA set and the given rcode.
+/// Counts are left as-is (a query has no answers anyway).
+pub(crate) fn build_dns_error_response(query: &[u8], rcode: u8) -> Vec<u8> {
     if query.len() < 12 {
         return vec![0u8; 12];
     }
     let mut resp = query.to_vec();
-    resp[2] = 0x81;
-    resp[3] = 0x82;
+    resp[2] = 0x81; // QR + RD
+    resp[3] = 0x80 | (rcode & 0x0f); // RA + rcode
+    resp
+}
+
+/// Rewrite the response's transaction ID to match this query — required
+/// when a singleflight leader's response is shared with waiting clients.
+fn with_own_txid(mut resp: Vec<u8>, query: &[u8]) -> Vec<u8> {
+    if resp.len() >= 2 && query.len() >= 2 {
+        resp[0] = query[0];
+        resp[1] = query[1];
+    }
     resp
 }
 
@@ -593,4 +638,95 @@ async fn write_tcp_dns_response(stream: &mut TcpStream, response: &[u8]) -> anyh
 /// Should be called after ControlPlane construction.
 pub fn spawn_dns_workers(dns_controller: &Arc<DnsController>) -> tokio::task::JoinHandle<()> {
     dns_controller.spawn_route_refresh_worker()
+}
+
+#[cfg(test)]
+mod singleflight_tests {
+    use super::*;
+    use crate::dns::forwarder::{DnsForwarder, DnsUpstreamPool};
+    use crate::routing::Router;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct SlowUpstream {
+        calls: AtomicUsize,
+        delay: Duration,
+        response: Vec<u8>,
+    }
+
+    #[async_trait::async_trait]
+    impl DnsUpstreamPool for SlowUpstream {
+        async fn query(&self, _name: &str, _raw: &[u8]) -> anyhow::Result<Vec<u8>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            Ok(self.response.clone())
+        }
+    }
+
+    fn test_controller(
+        response: Vec<u8>,
+        delay: Duration,
+    ) -> (Arc<DnsController>, Arc<SlowUpstream>) {
+        let upstream = Arc::new(SlowUpstream {
+            calls: AtomicUsize::new(0),
+            delay,
+            response,
+        });
+        let forwarder = Arc::new(DnsForwarder::new(
+            upstream.clone(),
+            Arc::new(tokio::sync::Mutex::new(crate::dns::cache::DnsCache::new(
+                16,
+            ))),
+            Arc::new(
+                crate::dns::routing::DnsRouter::new_from_dns_config(
+                    &honk_config::dns::DnsConfig::default(),
+                )
+                .unwrap(),
+            ),
+        ));
+        let controller = Arc::new(DnsController::new(
+            forwarder,
+            Arc::new(RwLock::new(Box::new(
+                crate::ebpf::mock::MockEbpfBackend::new(),
+            ))),
+            Arc::new(RwLock::new(Router::new(&[], "direct").unwrap())),
+        ));
+        (controller, upstream)
+    }
+
+    fn query_with_txid(domain: &str, txid: u16) -> Vec<u8> {
+        let mut q = crate::dns::forwarder::build_dns_query(domain, 1);
+        q[0..2].copy_from_slice(&txid.to_be_bytes());
+        q
+    }
+
+    fn response_with_txid(domain: &str, txid: u16) -> Vec<u8> {
+        let mut resp = crate::dns::forwarder::build_dns_query(domain, 1);
+        resp[0..2].copy_from_slice(&txid.to_be_bytes());
+        resp[2] = 0x81;
+        resp[3] = 0x80;
+        resp
+    }
+
+    /// Concurrent duplicate queries share one upstream flight, and each
+    /// waiter gets the response with its OWN transaction id restored.
+    #[tokio::test]
+    async fn singleflight_dedups_and_restores_txid() {
+        let (controller, upstream) = test_controller(
+            response_with_txid("example.com", 0x1111),
+            Duration::from_millis(100),
+        );
+        let q1 = query_with_txid("example.com", 0xaaaa);
+        let q2 = query_with_txid("example.com", 0xbbbb);
+        let (r1, r2) = tokio::join!(
+            controller.resolve_with_singleflight(&q1, None),
+            controller.resolve_with_singleflight(&q2, None),
+        );
+        assert_eq!(&r1[0..2], &q1[0..2], "waiter 1 keeps its own txid");
+        assert_eq!(&r2[0..2], &q2[0..2], "waiter 2 keeps its own txid");
+        assert_eq!(
+            upstream.calls.load(Ordering::SeqCst),
+            1,
+            "deduped to one upstream query"
+        );
+    }
 }

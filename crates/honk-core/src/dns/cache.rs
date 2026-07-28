@@ -66,8 +66,8 @@ impl CachedEntry {
 /// a single branch.
 pub struct DnsCache {
     inner: lru::LruCache<String, CachedEntry>,
-    /// Negative cache — maps cache key to expiry time for NXDOMAIN/SERVFAIL.
-    negative: lru::LruCache<String, Instant>,
+    /// Negative cache — maps cache key to (expiry, rcode) for NXDOMAIN/SERVFAIL.
+    negative: lru::LruCache<String, (Instant, u8)>,
     /// Optional persistence sink for positive answers (store_dns).
     persister: Option<super::persist::DnsCachePersister>,
 }
@@ -152,21 +152,24 @@ impl DnsCache {
         self.inner.put(key, entry);
     }
 
-    /// Store a negative cache entry (NXDOMAIN/SERVFAIL).
+    /// Store a negative cache entry (NXDOMAIN/SERVFAIL), keeping the rcode
+    /// so a later hit can be answered with the correct one.
     ///
     /// The entry expires after `ttl` seconds (default: 60s for negative responses).
-    pub fn put_negative(&mut self, key: String, ttl: u32) {
+    pub fn put_negative(&mut self, key: String, ttl: u32, rcode: u8) {
         let ttl = ttl.clamp(1, 300);
-        self.negative
-            .put(key, Instant::now() + Duration::from_secs(ttl as u64));
+        self.negative.put(
+            key,
+            (Instant::now() + Duration::from_secs(ttl as u64), rcode),
+        );
     }
 
-    /// Check if a key is in the negative cache (known NXDOMAIN/SERVFAIL).
-    pub fn is_negative(&self, key: &str) -> bool {
+    /// The rcode of a live negative entry, if any (2=SERVFAIL, 3=NXDOMAIN).
+    pub fn negative_rcode(&self, key: &str) -> Option<u8> {
         self.negative
             .peek(key)
-            .map(|expires| Instant::now() < *expires)
-            .unwrap_or(false)
+            .filter(|(expires, _)| Instant::now() < *expires)
+            .map(|(_, rcode)| *rcode)
     }
 
     /// Remove a negative cache entry.
@@ -180,7 +183,7 @@ impl DnsCache {
         let expired: Vec<String> = self
             .negative
             .iter()
-            .filter(|(_, expires)| now >= **expires)
+            .filter(|(_, (expires, _))| now >= *expires)
             .map(|(k, _)| k.clone())
             .collect();
         for k in expired {

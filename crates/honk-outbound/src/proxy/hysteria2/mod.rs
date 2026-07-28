@@ -367,7 +367,11 @@ fn fragment_udp_message(
     Ok(out)
 }
 
-type SessionMap = Arc<parking_lot::Mutex<HashMap<u32, mpsc::UnboundedSender<UdpInbound>>>>;
+type SessionMap = Arc<parking_lot::Mutex<HashMap<u32, mpsc::Sender<UdpInbound>>>>;
+
+/// Per-session inbound queue depth. UDP semantics: a full queue drops the
+/// datagram rather than queueing without bound.
+const UDP_SESSION_QUEUE_CAP: usize = 256;
 
 /// Per-QUIC-connection protocol state (demux maps, counters, reaper task).
 struct Hy2ConnState {
@@ -424,7 +428,7 @@ impl Hy2ConnState {
                     };
                     let tx = sessions.lock().get(&msg.session_id).cloned();
                     if let Some(tx) = tx {
-                        let _ = tx.send(msg);
+                        let _ = tx.try_send(msg); // drop on a full queue (UDP semantics)
                     } else {
                         debug!(
                             session_id = msg.session_id,
@@ -741,7 +745,7 @@ impl ProxyHandler for Hysteria2Handler {
         let (external, internal, external_addr, relay_addr) =
             crate::util::udp_loopback_pair().await?;
 
-        let (tx, mut rx) = mpsc::unbounded_channel::<UdpInbound>();
+        let (tx, mut rx) = mpsc::channel::<UdpInbound>(UDP_SESSION_QUEUE_CAP);
         state.sessions.lock().insert(session_id, tx);
 
         let bridge_state = Arc::clone(&state);
