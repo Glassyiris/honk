@@ -50,16 +50,27 @@ const CRLF: &[u8] = b"\r\n";
 const CMD_MUX: u8 = 0x7f;
 
 /// Trojan-Go proxy handler with multiplexing.
-#[derive(Debug, Default)]
 pub struct TrojanGoHandler {
-    /// Connection pool: `host:port` → `MuxConnection`
-    pool: Mutex<HashMap<String, Arc<MuxConnection>>>,
+    /// Connection pool: `host:port|fingerprint` → mux connections
+    /// (SessionPool: hard cap, dial single-flight + backoff).
+    pool: crate::session::SessionPool<MuxConnection>,
+}
+
+impl Default for TrojanGoHandler {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TrojanGoHandler {
     pub fn new() -> Self {
         Self {
-            pool: Mutex::new(HashMap::new()),
+            pool: crate::session::SessionPool::new(crate::session::SessionPoolConfig {
+                // One mux connection per key is the norm; scheduling is
+                // least-loaded without a stream cap.
+                max_streams_per_session: usize::MAX,
+                ..Default::default()
+            }),
         }
     }
 
@@ -107,24 +118,15 @@ impl TrojanGoHandler {
                 node.tls
             )
         };
-        {
-            let pool = self.pool.lock().unwrap();
-            if let Some(mux) = pool.get(&host_key)
-                && !mux.is_closed()
-            {
-                return Ok(Arc::clone(mux));
-            }
-        }
-
-        let stream = Self::connect_server(node, connect_timeout).await?;
-        let (mux, read_half) = MuxConnection::new(host_key.clone(), stream);
-        let mux = Arc::new(mux);
-        mux.spawn_demux_task(read_half);
-        {
-            let mut pool = self.pool.lock().unwrap();
-            pool.insert(host_key, Arc::clone(&mux));
-        }
-        Ok(mux)
+        self.pool
+            .offer(&host_key, || async {
+                let stream = Self::connect_server(node, connect_timeout).await?;
+                let (mux, read_half) = MuxConnection::new(host_key.clone(), stream);
+                let mux = Arc::new(mux);
+                mux.spawn_demux_task(read_half);
+                Ok(mux)
+            })
+            .await
     }
 }
 
@@ -173,6 +175,17 @@ impl MuxConnection {
 
     fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
+    }
+
+    /// Close the connection: flag it, EOF every stream (their senders
+    /// drop), and shut the write half down. Idempotent.
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.readers.lock().unwrap().clear();
+        let writer = Arc::clone(&self.writer);
+        tokio::spawn(async move {
+            let _ = writer.lock().await.shutdown().await;
+        });
     }
 
     fn alloc_stream_id(&self) -> u16 {
@@ -238,6 +251,18 @@ impl MuxConnection {
                 }
             }
         });
+    }
+}
+
+impl crate::session::ManagedSession for MuxConnection {
+    fn active_streams(&self) -> usize {
+        self.readers.lock().unwrap().len()
+    }
+    fn is_closed(&self) -> bool {
+        self.is_closed()
+    }
+    fn close(&self) {
+        MuxConnection::close(self)
     }
 }
 
