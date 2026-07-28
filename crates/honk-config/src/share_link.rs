@@ -296,6 +296,21 @@ impl Node {
             if let Some(v) = query.get("initConnReceiveWindow") {
                 node.tuic_init_conn_recv_window = v.parse().ok();
             }
+            if let Some(v) = query.get("congestion_control") {
+                let v = v.trim();
+                if !v.is_empty() {
+                    node.tuic_congestion = Some(v.to_string());
+                }
+            }
+            // ALPN override (e.g. `alpn=h3` for HTTP/3-camouflaged servers);
+            // comma-separated for multiple. Without this the handler would
+            // always offer `tuic` and the handshake is rejected.
+            if let Some(v) = query.get("alpn") {
+                let v = v.trim();
+                if !v.is_empty() {
+                    node.tuic_alpn = Some(v.to_string());
+                }
+            }
         }
 
         if protocol == NodeProtocol::AnyTLS {

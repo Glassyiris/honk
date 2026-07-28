@@ -428,16 +428,33 @@ impl TuicHandler {
             .or(node.password.as_deref())
             .unwrap_or("")
             .to_string();
+        let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
+        // ALPN override from the share link (`alpn=h3`, comma-separated);
+        // servers configured without `tuic` in their ALPN list reject the
+        // handshake at the TLS layer otherwise.
+        let alpn: Vec<Vec<u8>> = node
+            .tuic_alpn
+            .as_deref()
+            .map(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(|p| p.as_bytes().to_vec())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| vec![b"tuic".to_vec()]);
+        let alpn_key = node.tuic_alpn.as_deref().unwrap_or("").to_string();
         let key = format!(
-            "{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}",
             node.host(),
             node.port,
             uuid_str,
             password,
             node.sni.as_deref().unwrap_or(""),
-            node.skip_cert_verify
+            node.skip_cert_verify,
+            alpn_key,
         );
-        let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
         // quinn's default stream window (1.25MB) caps a single stream at
         // ~12.5MB/s per 100ms of RTT — unusable on long-fat links. Default
         // to 8MB (~40MB/s at 200ms); explicit node fields override.
@@ -450,7 +467,8 @@ impl TuicHandler {
             ..Default::default()
         };
         crate::quic::cached_client(&CLIENTS, key, || async move {
-            let config = crate::quic::client_config(node, &[b"tuic"], options).await?;
+            let alpn_refs: Vec<&[u8]> = alpn.iter().map(Vec::as_slice).collect();
+            let config = crate::quic::client_config(node, &alpn_refs, options).await?;
             Ok(Arc::new(TuicClient {
                 quic: QuicClient::new(node.host().to_string(), node.port, server_name, config),
                 uuid: *uuid.as_bytes(),
@@ -687,7 +705,15 @@ mod tests {
     /// with the same TLS exporter, echoes CONNECT streams back, echoes UDP
     /// packets back on the path they arrived (datagram or uni stream).
     async fn start_server(datagrams: bool, password: &'static str) -> SocketAddr {
-        let (endpoint, addr) = testutil::server_endpoint(&[b"tuic"], datagrams).unwrap();
+        start_server_with_alpn(&[b"tuic"], datagrams, password).await
+    }
+
+    async fn start_server_with_alpn(
+        alpn: &[&[u8]],
+        datagrams: bool,
+        password: &'static str,
+    ) -> SocketAddr {
+        let (endpoint, addr) = testutil::server_endpoint(alpn, datagrams).unwrap();
         tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
                 tokio::spawn(async move {
@@ -843,6 +869,35 @@ mod tests {
             .await;
         assert!(result.is_err(), "bad password must fail the dial");
         assert!(!handler.test_connectivity(&node).await);
+    }
+
+    #[tokio::test]
+    async fn test_custom_alpn() {
+        // Server only accepts `h3` (HTTP/3-camouflaged TUIC deployment).
+        let server_addr = start_server_with_alpn(&[b"h3"], true, TEST_PASSWORD).await;
+        let handler = TuicHandler::new();
+        let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
+
+        // Share-link `alpn=h3` is honored: the handshake succeeds.
+        let node = Node {
+            tuic_alpn: Some("h3".to_string()),
+            ..test_node(server_addr.port(), TEST_PASSWORD)
+        };
+        let mut stream = handler
+            .dial(&node, target, None, Duration::from_secs(5))
+            .await
+            .expect("matching custom ALPN should connect");
+        stream.stream.write_all(b"alpn").await.unwrap();
+        let mut buf = [0u8; 16];
+        let n = stream.stream.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"alpn");
+
+        // Default ALPN (`tuic`) is rejected at the TLS layer.
+        let node = test_node(server_addr.port(), TEST_PASSWORD);
+        let result = handler
+            .dial(&node, target, None, Duration::from_secs(5))
+            .await;
+        assert!(result.is_err(), "mismatched ALPN must fail the handshake");
     }
 
     #[tokio::test]

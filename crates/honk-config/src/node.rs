@@ -127,6 +127,11 @@ pub struct Node {
     /// TUIC congestion control
     #[serde(default)]
     pub tuic_congestion: Option<String>,
+    /// TUIC ALPN (share-link `alpn=`; comma-separated for multiple).
+    /// Defaults to `tuic` when unset — servers configured with e.g. `h3`
+    /// (HTTP/3 camouflage) reject the handshake otherwise.
+    #[serde(default)]
+    pub tuic_alpn: Option<String>,
     /// TUIC: initial per-stream receive window (`initStreamReceiveWindow`).
     /// quinn's default (1.25MB) caps a stream at ~12.5MB/s per 100ms RTT —
     /// far too small for long-fat links; unset uses honk's larger default.
