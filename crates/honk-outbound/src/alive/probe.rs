@@ -8,6 +8,14 @@ impl AliveDialerSet {
     /// proxy node, validating the status code.
     /// Falls back to raw TCP connect when no prober is set.
     pub async fn probe_node(&self, node_id: &str, timeout: Duration) -> bool {
+        // direct/block have no meaningful probe target: the check URL is
+        // picked for proxied egress and is commonly unreachable over a
+        // direct connection (e.g. google-analytics from CN), so probing
+        // flaps direct dead every cycle only for real traffic to revive it
+        // seconds later. Their liveness is driven by traffic reports alone.
+        if matches!(node_id, "direct" | "block") {
+            return true;
+        }
         let addr = self.registered.read().get(node_id).cloned();
         let Some(addr) = addr else { return false };
 
@@ -163,6 +171,10 @@ impl AliveDialerSet {
         url: &str,
         timeout: Duration,
     ) -> bool {
+        // direct/block exemption, same rationale as probe_node.
+        if matches!(leaf, "direct" | "block") {
+            return true;
+        }
         let prober_opt = self.http_prober.read().clone();
         let Some(ref prober) = prober_opt else {
             return false;
@@ -374,6 +386,12 @@ impl AliveDialerSet {
     /// TCP-fallback selection semantics (see
     /// [`AliveDialerSet::has_udp_state`]).
     pub async fn probe_node_udp(&self, node_id: &str, timeout: Duration) -> bool {
+        // Same exemption as probe_node: direct/block UDP liveness is
+        // traffic-driven, and the UDP check target (e.g. 8.8.8.8) is not a
+        // reliable direct-egress signal either.
+        if matches!(node_id, "direct" | "block") {
+            return true;
+        }
         // Clone the Arc out of the lock before awaiting (parking_lot guard
         // is !Send).
         let prober_opt = self.udp_prober.read().clone();

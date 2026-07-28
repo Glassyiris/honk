@@ -611,3 +611,30 @@ fn test_sync_group_check_urls_prunes_unused_urls() {
     assert!(set.group_check_urls().is_empty());
     assert!(!set.has_url_state("n1", url_a), "unused URL state pruned");
 }
+
+/// direct/block are exempt from probes: the check URL is chosen for
+/// proxied egress and flaps direct dead when it is unreachable over a
+/// direct connection. Their liveness is traffic-driven. The exemption
+/// must not touch any alive state (unknown defaults to alive).
+#[tokio::test]
+async fn test_direct_block_probe_exempt() {
+    let set = AliveDialerSet::new();
+    set.register_node("direct".into(), String::new());
+    set.register_node("block".into(), String::new());
+    assert!(set.probe_node("direct", Duration::from_millis(1)).await);
+    assert!(set.probe_node("block", Duration::from_millis(1)).await);
+    assert!(set.probe_node_udp("direct", Duration::from_millis(1)).await);
+    assert!(set.probe_node_udp("block", Duration::from_millis(1)).await);
+    assert!(
+        set.probe_node_with_url(
+            "direct",
+            "direct",
+            "http://x.example",
+            Duration::from_millis(1)
+        )
+        .await
+    );
+    // No failure state was recorded by any of the exempt probes.
+    assert!(set.is_alive_for("direct", ProbeDomain::Tcp, IpVersion::V4));
+    assert!(set.is_alive_for("block", ProbeDomain::Tcp, IpVersion::V4));
+}
