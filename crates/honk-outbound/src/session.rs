@@ -105,6 +105,8 @@ impl<S> Default for KeyPool<S> {
 
 /// Aggregate pool metrics (clash-API / diagnostics snapshot).
 #[derive(Debug, Clone, Default)]
+// Used by the clash API once pools are wired into it.
+#[allow(dead_code)]
 pub struct PoolMetrics {
     pub keys: usize,
     pub sessions: usize,
@@ -251,6 +253,8 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
     }
 
     /// Current metrics snapshot across all keys.
+    // Used by the clash API once pools are wired into it.
+    #[allow(dead_code)]
     pub fn metrics(&self) -> PoolMetrics {
         let keys = self.keys.lock();
         PoolMetrics {
@@ -268,6 +272,8 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
     /// Start the per-key janitor (prune closed/expired, prewarm to
     /// `min_idle`) once; subsequent calls are no-ops. `prewarm` dials a
     /// fresh session and is only called when below `min_idle`.
+    // First consumer: the AnyTLS pool migration (P1.6).
+    #[allow(dead_code)]
     pub fn ensure_janitor<F, Fut>(self: &Arc<Self>, key: &str, prewarm: F)
     where
         F: Fn() -> Fut + Send + Sync + 'static,
@@ -330,6 +336,8 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
     }
 
     /// Close every session and clear the pool (reload/shutdown).
+    // Wired into reload/shutdown with the RuntimeGeneration work.
+    #[allow(dead_code)]
     pub fn shutdown(&self) {
         let sessions: Vec<Arc<S>> = {
             let mut keys = self.keys.lock();
