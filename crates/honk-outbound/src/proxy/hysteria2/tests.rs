@@ -17,6 +17,11 @@ fn test_node(port: u16, password: &str) -> Node {
         address: format!("127.0.0.1:{port}"),
         port,
         hy2_auth: Some(password.to_string()),
+        // Loopback has no loss, so PMTU discovery would climb to 1452 and
+        // the client would fragment UDP payloads above what the peer (capped
+        // by our advertised 1252 max_udp_payload_size) can send back. Real
+        // lossy links keep PMTUD near the advertised value anyway.
+        hy2_disable_mtu_discovery: Some(true),
         skip_cert_verify: true,
         ..Default::default()
     }

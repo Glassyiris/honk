@@ -166,6 +166,7 @@ async fn measure_head_exchange(
     let fut = async {
         let start = Instant::now();
         let proxy = handler.dial(node, addr, Some(host), timeout).await?;
+        tracing::debug!(node = %node.name, %addr, "urltest: dial established");
         let stream = proxy.stream;
 
         if is_https {
@@ -174,6 +175,11 @@ async fn measure_head_exchange(
                 .connect(host, stream)
                 .await
                 .context("TLS handshake failed")?;
+            tracing::debug!(
+                node = %node.name,
+                alpn = ?tls.ssl().selected_alpn_protocol().map(|p| String::from_utf8_lossy(p).into_owned()),
+                "urltest: TLS established"
+            );
             // The probe offers `h2,http/1.1`; speak whatever was negotiated.
             match tls.ssl().selected_alpn_protocol() {
                 Some(b"h2") => exchange_head_h2(tls, host).await?,
@@ -186,6 +192,7 @@ async fn measure_head_exchange(
             let mut stream = stream;
             exchange_head(&mut stream, host).await?;
         }
+        tracing::debug!(node = %node.name, elapsed_ms = start.elapsed().as_millis(), "urltest: exchange complete");
         Ok(start.elapsed())
     };
 

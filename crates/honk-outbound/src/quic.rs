@@ -395,9 +395,9 @@ pub fn client_endpoint_with_mtu(ipv6: bool, max_udp_payload_size: u16) -> io::Re
     let socket = marked_udp_socket(ipv6)?;
     let runtime = quinn::default_runtime()
         .ok_or_else(|| io::Error::other("no async runtime available for QUIC"))?;
-    let socket = Arc::new(NoGsoUdpSocket {
-        socket: Arc::new(tokio::net::UdpSocket::from_std(socket)?),
-    });
+    let io = Arc::new(tokio::net::UdpSocket::from_std(socket)?);
+    let inner = quinn::udp::UdpSocketState::new((&*io).into())?;
+    let socket = Arc::new(NoGsoUdpSocket { io, inner });
     Endpoint::new_with_abstract_socket(
         endpoint_config_with_mtu(max_udp_payload_size)?,
         None,
@@ -414,29 +414,29 @@ pub(crate) fn endpoint_config_with_mtu(mtu: u16) -> io::Result<EndpointConfig> {
     Ok(config)
 }
 
-/// Plain tokio UDP socket as a quinn `AsyncUdpSocket` with **GSO disabled**
-/// (`max_transmit_segments = 1`): every datagram goes out on its own.
-/// quinn's stock socket merges a flight into one GSO super-packet, and on
-/// at least one measured PPPoE uplink the second segment of that
-/// super-packet is deterministically dropped — the server never receives
-/// the second Initial and the handshake stalls forever, while sing-box
-/// (quic-go, no GSO) works on the same path.
+/// quinn's stock tokio socket behavior (ECN, GRO, cmsgs) with **GSO
+/// disabled** (`max_transmit_segments = 1`): every datagram goes out on its
+/// own, dodging PPPoE uplinks that drop later segments of a GSO
+/// super-packet. This is quinn's own `runtime/tokio.rs` socket with a
+/// one-line change, so nothing else (ECN signaling, GRO receives, pktinfo)
+/// diverges from the stock path.
 #[derive(Debug)]
 struct NoGsoUdpSocket {
-    socket: Arc<tokio::net::UdpSocket>,
+    io: Arc<tokio::net::UdpSocket>,
+    inner: quinn::udp::UdpSocketState,
 }
 
 impl quinn::AsyncUdpSocket for NoGsoUdpSocket {
     fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn quinn::UdpPoller>> {
         Box::pin(NoGsoUdpPoller {
-            socket: Arc::clone(&self.socket),
+            socket: Arc::clone(&self.io),
         })
     }
 
     fn try_send(&self, transmit: &quinn::udp::Transmit) -> io::Result<()> {
-        self.socket
-            .try_send_to(transmit.contents, transmit.destination)?;
-        Ok(())
+        self.io.try_io(tokio::io::Interest::WRITABLE, || {
+            self.inner.send((&self.io).into(), transmit)
+        })
     }
 
     fn poll_recv(
@@ -445,52 +445,32 @@ impl quinn::AsyncUdpSocket for NoGsoUdpSocket {
         bufs: &mut [std::io::IoSliceMut<'_>],
         meta: &mut [quinn::udp::RecvMeta],
     ) -> Poll<io::Result<usize>> {
-        let mut count = 0;
-        for (buf, meta_slot) in bufs.iter_mut().zip(meta.iter_mut()) {
-            let mut read_buf = ReadBuf::new(&mut buf[..]);
-            match self.socket.poll_recv_from(cx, &mut read_buf) {
-                Poll::Ready(Ok(addr)) => {
-                    let len = read_buf.filled().len();
-                    *meta_slot = quinn::udp::RecvMeta {
-                        addr,
-                        len,
-                        stride: len,
-                        ecn: None,
-                        dst_ip: None,
-                    };
-                    count += 1;
-                }
-                Poll::Ready(Err(e)) => {
-                    return if count == 0 {
-                        Poll::Ready(Err(e))
-                    } else {
-                        Poll::Ready(Ok(count))
-                    };
-                }
-                Poll::Pending => {
-                    return if count == 0 {
-                        Poll::Pending
-                    } else {
-                        Poll::Ready(Ok(count))
-                    };
-                }
+        loop {
+            std::task::ready!(self.io.poll_recv_ready(cx))?;
+            match self.io.try_io(tokio::io::Interest::READABLE, || {
+                self.inner.recv((&self.io).into(), bufs, meta)
+            }) {
+                Ok(res) => return Poll::Ready(Ok(res)),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Poll::Ready(Err(e)),
             }
         }
-        Poll::Ready(Ok(count))
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.socket.local_addr()
+        self.io.local_addr()
     }
 
-    /// Plain tokio socket without DONTFRAG; `true` also keeps quinn from
-    /// assuming the path is MTU-probe safe on lossy links.
     fn may_fragment(&self) -> bool {
-        true
+        self.inner.may_fragment()
     }
 
     fn max_transmit_segments(&self) -> usize {
         1
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        self.inner.gro_segments()
     }
 }
 
