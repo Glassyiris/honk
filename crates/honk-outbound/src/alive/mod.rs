@@ -302,6 +302,11 @@ pub struct AliveDialerSet {
     http_prober: RwLock<Option<HttpProberRef>>,
     check_url: RwLock<String>,
     check_method: RwLock<String>,
+    /// Probe target for the `direct` node (`host:port`): the proxy check URL
+    /// is meaningless for direct egress, so direct is measured with a raw
+    /// TCP connect against the bootstrap resolver instead. Defaults to
+    /// [`DEFAULT_DIRECT_CHECK_ADDR`].
+    direct_check_addr: RwLock<String>,
     /// Cached resolved IPs from the check URL hostname (Go: TcpCheckOption.Ip46).
     /// Resolved once at startup; refreshed on `refresh_check_ips()`.
     check_url_ips: RwLock<Vec<SocketAddr>>,
@@ -342,6 +347,10 @@ pub struct AliveDialerSet {
     url_check_ips: RwLock<HashMap<String, Vec<SocketAddr>>>,
 }
 
+/// Default probe target for the `direct` node when no `bootstrap_resolver`
+/// is configured: a directly-reachable, anycasted resolver.
+pub const DEFAULT_DIRECT_CHECK_ADDR: &str = "223.5.5.5:53";
+
 /// Exponential probe backoff: `base * 2^min(failures, 8)`, capped at `max`.
 fn probe_backoff(base: Duration, max: Duration, consecutive_failures: u32) -> Duration {
     base.saturating_mul(2u32.pow(consecutive_failures.min(8)))
@@ -369,6 +378,7 @@ impl AliveDialerSet {
             http_prober: RwLock::new(None),
             check_url: RwLock::new(String::new()),
             check_method: RwLock::new(String::new()),
+            direct_check_addr: RwLock::new(DEFAULT_DIRECT_CHECK_ADDR.to_string()),
             check_url_ips: RwLock::new(Vec::new()),
             udp_prober: RwLock::new(None),
             node_registered_at: RwLock::new(HashMap::new()),
@@ -390,6 +400,12 @@ impl AliveDialerSet {
     pub fn with_so_mark(mut self, mark: u32) -> Self {
         self.so_mark = Some(mark);
         self
+    }
+
+    /// Override the `direct` node's probe target (`host:port`). honk-core
+    /// installs the configured `bootstrap_resolver` here.
+    pub fn set_direct_check_addr(&self, addr: String) {
+        *self.direct_check_addr.write() = addr;
     }
 
     /// Configure HTTP-based health checks from config (Go: TcpCheckOption).

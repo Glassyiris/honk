@@ -47,6 +47,26 @@ pub fn set_urltest_resolver(hook: UrltestResolver) {
     *URLTEST_RESOLVER.write() = Some(hook);
 }
 
+/// direct urltest target override, installed by honk-core alongside
+/// `AliveDialerSet::set_direct_check_addr`. Falls back to the bootstrap
+/// resolver address, then to [`crate::alive::DEFAULT_DIRECT_CHECK_ADDR`].
+/// Kept separate from the bootstrap global so measurements never race
+/// bootstrap resolver users (ECH discovery, node dials).
+static URLTEST_DIRECT_TARGET: std::sync::LazyLock<parking_lot::RwLock<Option<SocketAddr>>> =
+    std::sync::LazyLock::new(|| parking_lot::RwLock::new(None));
+
+/// Install the direct urltest target (`host:port` of the direct probe).
+pub fn set_urltest_direct_target(target: SocketAddr) {
+    *URLTEST_DIRECT_TARGET.write() = Some(target);
+}
+
+fn direct_target() -> SocketAddr {
+    URLTEST_DIRECT_TARGET
+        .read()
+        .or_else(crate::bootstrap::global_server)
+        .unwrap_or_else(|| crate::alive::DEFAULT_DIRECT_CHECK_ADDR.parse().unwrap())
+}
+
 /// Maximum concurrent node measurements inside [`urltest_group`]
 /// (matches sing-box's health check concurrency).
 pub const URLTEST_MAX_CONCURRENT: usize = 10;
@@ -76,6 +96,28 @@ pub async fn urltest_node(
     } else {
         timeout
     };
+    // direct: the check URL is chosen for proxied egress and is commonly
+    // unreachable over a direct connection (e.g. google-analytics from CN),
+    // so measure a raw connect against the bootstrap resolver instead —
+    // the same target the periodic direct probe uses. A failed exchange
+    // here previously also cleared direct's latency history (sing-box
+    // delete-on-failure), leaving dashboards with no direct delay at all.
+    if node.name == honk_config::Config::BUILTIN_DIRECT_NODE {
+        let target = direct_target();
+        let start = Instant::now();
+        tokio::time::timeout(
+            timeout,
+            crate::util::connect_marked_addr(
+                target,
+                Some(honk_ebpf_common::DAE_BYPASS_MARK),
+                timeout,
+            ),
+        )
+        .await
+        .context("direct urltest timed out")?
+        .context("direct urltest connect failed")?;
+        return Ok(start.elapsed());
+    }
     let (host, port, is_https) = parse_url_host_port(url)?;
 
     let addr = {
@@ -615,5 +657,36 @@ mod tests {
                 None
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod direct_urltest_tests {
+    use super::*;
+
+    /// direct is measured against the direct target (a raw connect to the
+    /// bootstrap resolver address), never against the proxy check URL
+    /// through the node. Uses the dedicated injection point so the test
+    /// never races bootstrap resolver users (ECH discovery tests).
+    #[tokio::test]
+    async fn direct_urltest_uses_direct_target() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        set_urltest_direct_target(addr);
+        let node = Node {
+            name: honk_config::Config::BUILTIN_DIRECT_NODE.to_string(),
+            ..Default::default()
+        };
+        let handler = crate::proxy::direct::DirectHandler::new();
+        let latency = urltest_node(
+            &node,
+            &handler,
+            "http://unreachable.invalid",
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("direct urltest measures the direct-target connect");
+        assert!(latency < Duration::from_secs(2));
+        *URLTEST_DIRECT_TARGET.write() = None;
     }
 }

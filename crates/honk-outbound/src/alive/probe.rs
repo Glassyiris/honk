@@ -8,13 +8,19 @@ impl AliveDialerSet {
     /// proxy node, validating the status code.
     /// Falls back to raw TCP connect when no prober is set.
     pub async fn probe_node(&self, node_id: &str, timeout: Duration) -> bool {
-        // direct/block have no meaningful probe target: the check URL is
-        // picked for proxied egress and is commonly unreachable over a
-        // direct connection (e.g. google-analytics from CN), so probing
-        // flaps direct dead every cycle only for real traffic to revive it
-        // seconds later. Their liveness is driven by traffic reports alone.
-        if matches!(node_id, "direct" | "block") {
+        // block has no liveness to measure.
+        if node_id == "block" {
             return true;
+        }
+        // direct is measured against the bootstrap resolver (default
+        // 223.5.5.5:53) with a raw connect: the proxy check URL is chosen
+        // for proxied egress and is commonly unreachable over a direct
+        // connection (e.g. google-analytics from CN), so probing it flapped
+        // direct dead every cycle only for real traffic to revive it
+        // seconds later.
+        if node_id == "direct" {
+            let target = self.direct_check_addr.read().clone();
+            return self.probe_node_tcp(node_id, &target, timeout).await;
         }
         let addr = self.registered.read().get(node_id).cloned();
         let Some(addr) = addr else { return false };

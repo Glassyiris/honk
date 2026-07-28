@@ -47,6 +47,14 @@ pub fn set_global(resolver: Option<BootstrapResolver>) {
     *GLOBAL.write().unwrap() = resolver;
 }
 
+/// The configured bootstrap resolver's server address, if any. Also used
+/// as the `direct` node's probe/urltest target: a plain directly-reachable
+/// DNS server is exactly what direct-egress latency should be measured
+/// against.
+pub fn global_server() -> Option<SocketAddr> {
+    GLOBAL.read().unwrap().map(|r| r.server)
+}
+
 /// Resolve `host` to IP addresses, preferring the configured bootstrap
 /// resolver (direct, bypass-marked) and falling back to the system resolver.
 pub async fn resolve(host: &str) -> io::Result<Vec<IpAddr>> {

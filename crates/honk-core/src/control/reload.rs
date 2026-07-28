@@ -31,6 +31,15 @@ impl ControlPlane {
                         &self.config.read().await.global.bootstrap_resolver,
                     ),
                 );
+                // direct's probe target follows the bootstrap resolver.
+                let direct_target =
+                    super::direct_check_addr(&self.config.read().await.global.bootstrap_resolver);
+                self.alive_set.set_direct_check_addr(direct_target.clone());
+                honk_outbound::urltest::set_urltest_direct_target(
+                    direct_target
+                        .parse()
+                        .expect("direct check addr is a SocketAddr"),
+                );
                 // Refresh node→outbound id mapping so
                 // OUTBOUND_CONNECTIVITY_MAP pushes use
                 // the new group ordering.

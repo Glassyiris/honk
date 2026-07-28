@@ -612,19 +612,41 @@ fn test_sync_group_check_urls_prunes_unused_urls() {
     assert!(!set.has_url_state("n1", url_a), "unused URL state pruned");
 }
 
-/// direct/block are exempt from probes: the check URL is chosen for
-/// proxied egress and flaps direct dead when it is unreachable over a
-/// direct connection. Their liveness is traffic-driven. The exemption
-/// must not touch any alive state (unknown defaults to alive).
+/// block is exempt from probes — there is no liveness to measure. The
+/// exemption must not touch any alive state (unknown defaults to alive).
 #[tokio::test]
-async fn test_direct_block_probe_exempt() {
+async fn test_block_probe_exempt() {
+    let set = AliveDialerSet::new();
+    set.register_node("block".into(), String::new());
+    assert!(set.probe_node("block", Duration::from_millis(1)).await);
+    assert!(set.probe_node_udp("block", Duration::from_millis(1)).await);
+    assert!(
+        set.probe_node_with_url(
+            "block",
+            "block",
+            "http://x.example",
+            Duration::from_millis(1)
+        )
+        .await
+    );
+    assert!(set.is_alive_for("block", ProbeDomain::Tcp, IpVersion::V4));
+}
+
+/// direct is probed against the dedicated direct check target (bootstrap
+/// resolver; default 223.5.5.5:53) instead of the proxy check URL, so the
+/// clash API gets a real direct latency. Uses a loopback listener as the
+/// target; per-group custom-URL and UDP probes stay exempt.
+#[tokio::test]
+async fn test_direct_probe_uses_direct_check_addr() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
     let set = AliveDialerSet::new();
     set.register_node("direct".into(), String::new());
-    set.register_node("block".into(), String::new());
-    assert!(set.probe_node("direct", Duration::from_millis(1)).await);
-    assert!(set.probe_node("block", Duration::from_millis(1)).await);
+    set.set_direct_check_addr(format!("127.0.0.1:{port}"));
+    assert!(set.probe_node("direct", Duration::from_secs(2)).await);
+    assert!(set.is_alive_for("direct", ProbeDomain::Tcp, IpVersion::V4));
+    // UDP and per-group custom-URL probes remain exempt.
     assert!(set.probe_node_udp("direct", Duration::from_millis(1)).await);
-    assert!(set.probe_node_udp("block", Duration::from_millis(1)).await);
     assert!(
         set.probe_node_with_url(
             "direct",
@@ -634,7 +656,4 @@ async fn test_direct_block_probe_exempt() {
         )
         .await
     );
-    // No failure state was recorded by any of the exempt probes.
-    assert!(set.is_alive_for("direct", ProbeDomain::Tcp, IpVersion::V4));
-    assert!(set.is_alive_for("block", ProbeDomain::Tcp, IpVersion::V4));
 }

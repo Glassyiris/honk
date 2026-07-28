@@ -137,6 +137,17 @@ impl ControlPlane {
         let alive_set = Arc::new(
             crate::outbound::AliveDialerSet::new().with_so_mark(honk_ebpf_common::DAE_BYPASS_MARK),
         );
+        // direct is probed against the bootstrap resolver rather than the
+        // proxy check URL (which is unreachable over direct egress), so the
+        // clash API gets a real direct latency too. The urltest (on-demand
+        // delay) path shares the same target.
+        let direct_target = direct_check_addr(&config.global.bootstrap_resolver);
+        alive_set.set_direct_check_addr(direct_target.clone());
+        honk_outbound::urltest::set_urltest_direct_target(
+            direct_target
+                .parse()
+                .expect("direct check addr is a SocketAddr"),
+        );
         let dns_resolver = Arc::new(dns_resolver);
         // Register health checks per the config's group membership; reload
         // re-runs the same sync via `reload_group_manager`.
@@ -1060,5 +1071,19 @@ impl ControlPlane {
             push_result.domain_bitmaps.len()
         );
         Ok(push_result)
+    }
+}
+
+/// direct probe target: the configured `bootstrap_resolver` (scheme
+/// stripped), falling back to the built-in default when unset/invalid.
+/// The bootstrap resolver is a plain directly-reachable DNS server, which
+/// is exactly what a direct-egress health probe should measure.
+pub(crate) fn direct_check_addr(bootstrap_resolver: &str) -> String {
+    let s = bootstrap_resolver.trim();
+    let s = s.split_once("://").map(|(_, rest)| rest).unwrap_or(s);
+    if s.parse::<std::net::SocketAddr>().is_ok() {
+        s.to_string()
+    } else {
+        crate::outbound::DEFAULT_DIRECT_CHECK_ADDR.to_string()
     }
 }
