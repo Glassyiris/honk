@@ -102,6 +102,10 @@ outbound-ci-e2e:
 dns-ci:
     ci/dns-ci.sh
 
+# clash API gate (clash_api_test + integration_test)
+clash-ci:
+    ci/clash-ci.sh
+
 # ── Run ──────────────────────────────────────────────────
 
 # Run honk-core with eBPF (clash API comes from config.dae experimental section)
