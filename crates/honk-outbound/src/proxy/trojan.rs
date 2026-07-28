@@ -219,7 +219,9 @@ async fn trojan_udp_bridge(
     addr_header: Vec<u8>,
 ) {
     let (mut rd, mut wr) = tokio::io::split(stream);
-    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    // Bounded: a slow loopback writer must not let tunnel reads queue
+    // without bound; UDP drops instead.
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
     let reader = tokio::spawn(async move {
         loop {
             // The address is parsed (and bounds-checked) but discarded: the
@@ -240,8 +242,11 @@ async fn trojan_udp_bridge(
             if rd.read_exact(&mut data).await.is_err() {
                 break;
             }
-            if tx.send(data).is_err() {
-                break;
+            match tx.try_send(data) {
+                Ok(()) => {}
+                // Full queue: drop this datagram (UDP semantics), keep reading.
+                Err(mpsc::error::TrySendError::Full(_)) => continue,
+                Err(mpsc::error::TrySendError::Closed(_)) => break,
             }
         }
     });

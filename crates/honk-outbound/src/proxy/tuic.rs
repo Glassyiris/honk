@@ -250,7 +250,11 @@ fn fragment_udp_packets(
     Ok(out)
 }
 
-type SessionMap = Arc<parking_lot::Mutex<HashMap<u16, mpsc::UnboundedSender<UdpInbound>>>>;
+type SessionMap = Arc<parking_lot::Mutex<HashMap<u16, mpsc::Sender<UdpInbound>>>>;
+
+/// Per-session inbound queue depth. UDP semantics: when the bridge falls
+/// behind, excess datagrams are dropped (never queue unboundedly).
+const UDP_SESSION_QUEUE_CAP: usize = 256;
 
 /// Per-QUIC-connection protocol state (demux maps, counters, task set).
 struct TuicConnState {
@@ -338,7 +342,7 @@ impl TuicConnState {
                     if let Ok(msg) = decode_udp_message(&data[2..]) {
                         let tx = sessions.lock().get(&msg.session_id).cloned();
                         if let Some(tx) = tx {
-                            let _ = tx.send(msg);
+                            let _ = tx.try_send(msg); // drop on a full queue (UDP semantics)
                         }
                     }
                 }
@@ -370,7 +374,7 @@ impl TuicConnState {
                 if let Ok(msg) = read_udp_message_stream(&mut recv).await {
                     let tx = sessions.lock().get(&msg.session_id).cloned();
                     if let Some(tx) = tx {
-                        let _ = tx.send(msg);
+                        let _ = tx.try_send(msg); // drop on a full queue (UDP semantics)
                     }
                 }
             });
@@ -582,7 +586,7 @@ impl ProxyHandler for TuicHandler {
         let (external, internal, external_addr, relay_addr) =
             crate::util::udp_loopback_pair().await?;
 
-        let (tx, mut rx) = mpsc::unbounded_channel::<UdpInbound>();
+        let (tx, mut rx) = mpsc::channel::<UdpInbound>(UDP_SESSION_QUEUE_CAP);
         state.sessions.lock().insert(session_id, tx);
 
         let bridge_state = Arc::clone(&state);

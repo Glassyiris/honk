@@ -67,6 +67,9 @@ const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30;
 
 /// Buffer of the user-facing half of a stream (matches the old pool).
 const STREAM_DUPLEX_BUFFER: usize = 65536;
+/// Per-stream demux queue depth (frames). Full queues apply backpressure
+/// to the session demux instead of growing without bound.
+const STREAM_QUEUE_CAP: usize = 64;
 
 /// Transport halves behind trait objects so tests can drive a session over
 /// an in-memory duplex instead of a real TLS connection.
@@ -107,7 +110,7 @@ struct AnyTlsSession {
     /// frames through this mutex.
     writer: Arc<tokio::sync::Mutex<BoxedWriter>>,
     /// Open streams: sid → demux delivery channel.
-    streams: Mutex<HashMap<u32, mpsc::UnboundedSender<StreamEvent>>>,
+    streams: Mutex<HashMap<u32, mpsc::Sender<StreamEvent>>>,
     /// Stream id allocator (sing `streamId`); first stream gets sid 1.
     next_sid: AtomicU32,
     /// Set once the TLS connection dies or an ALERT arrives; idempotent
@@ -203,7 +206,7 @@ impl AnyTlsSession {
         }
         let sid = self.next_sid.fetch_add(1, Ordering::Relaxed) + 1;
         let (client_half, stream_half) = tokio::io::duplex(STREAM_DUPLEX_BUFFER);
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(STREAM_QUEUE_CAP);
         self.streams.lock().unwrap().insert(sid, tx);
 
         // SYN, then the first PSH carrying the target address — one writer
@@ -271,12 +274,15 @@ impl AnyTlsSession {
         debug!("AnyTLS session {} for {} closed", self.seq, self.addr);
     }
 
-    /// Deliver a server payload frame to its stream.
-    fn dispatch_data(&self, sid: u32, data: Vec<u8>) {
+    /// Deliver a server payload frame to its stream, applying backpressure
+    /// when the stream's bounded queue is full (a slow consumer slows the
+    /// demux, which is the standard mux head-of-line trade-off — the only
+    /// alternative, dropping TCP data, is not one).
+    async fn dispatch_data(&self, sid: u32, data: Vec<u8>) {
         let tx = self.streams.lock().unwrap().get(&sid).cloned();
         match tx {
             Some(tx) => {
-                if tx.send(StreamEvent::Data(data)).is_err() {
+                if tx.send(StreamEvent::Data(data)).await.is_err() {
                     // Stream task died without unregistering; clean up.
                     self.streams.lock().unwrap().remove(&sid);
                 }
@@ -294,10 +300,10 @@ impl AnyTlsSession {
 
     /// Deliver a server FIN to its stream. The stream task unregisters
     /// itself when it processes the event.
-    fn dispatch_fin(&self, sid: u32) {
+    async fn dispatch_fin(&self, sid: u32) {
         let tx = self.streams.lock().unwrap().get(&sid).cloned();
         if let Some(tx) = tx {
-            let _ = tx.send(StreamEvent::Fin);
+            let _ = tx.send(StreamEvent::Fin).await;
         }
     }
 }
@@ -314,8 +320,8 @@ async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedReader) {
             }
         };
         match cmd {
-            CMD_PSH => session.dispatch_data(sid, data),
-            CMD_FIN => session.dispatch_fin(sid),
+            CMD_PSH => session.dispatch_data(sid, data).await,
+            CMD_FIN => session.dispatch_fin(sid).await,
             CMD_SYNACK => {
                 // sing: a SYNACK carrying data reports a dial error for the
                 // stream (an empty SYNACK is a pure handshake ack — ignore).
@@ -326,7 +332,7 @@ async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedReader) {
                         sid,
                         String::from_utf8_lossy(&data)
                     );
-                    session.dispatch_fin(sid);
+                    session.dispatch_fin(sid).await;
                 }
             }
             CMD_HEART_REQUEST => {
@@ -373,7 +379,7 @@ async fn stream_task(
     session: Arc<AnyTlsSession>,
     sid: u32,
     mut stream_half: tokio::io::DuplexStream,
-    mut rx: mpsc::UnboundedReceiver<StreamEvent>,
+    mut rx: mpsc::Receiver<StreamEvent>,
 ) {
     let mut buf = vec![0u8; 65536];
     let mut notify_fin = false;
@@ -935,15 +941,18 @@ async fn uot_bridge(
     target_domain: Option<String>,
 ) {
     let (rd, mut wr) = tokio::io::split(stream);
-    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    // Bounded: UDP semantics — drop on a full queue, never queue unboundedly.
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
     let reader = tokio::spawn(async move {
         let mut frames = UotFrameReader::new(rd);
         while let Ok(data) = frames
             .next_datagram(&target, target_domain.as_deref())
             .await
         {
-            if tx.send(data).is_err() {
-                break;
+            match tx.try_send(data) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => continue,
+                Err(mpsc::error::TrySendError::Closed(_)) => break,
             }
         }
     });
