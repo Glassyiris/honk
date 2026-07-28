@@ -662,7 +662,15 @@ async fn connect_transport(
 
     let tcp = match tcp {
         Some(tcp) => tcp,
-        None => crate::util::connect_outbound(addr, connect_timeout).await?,
+        // `addr` is the pool key (host:port plus an auth/TLS fingerprint),
+        // not a dial target — always dial the node's own address.
+        None => {
+            crate::util::connect_outbound(
+                &format!("{}:{}", node.host(), node.port),
+                connect_timeout,
+            )
+            .await?
+        }
     };
     debug!("AnyTLS: TCP connected to {}", addr);
 
