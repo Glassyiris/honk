@@ -42,7 +42,7 @@ use crate::quic::{
 };
 
 use super::addr::{self, SocksAddr};
-use super::{ProxyHandler, ProxyStream, UdpProxySocket};
+use super::{PacketTransport, ProxyHandler, ProxyStream, UdpProxySocket};
 
 const TUIC_VERSION: u8 = 0x05;
 
@@ -654,6 +654,31 @@ impl ProxyHandler for TuicHandler {
         })
     }
 
+    async fn dial_udp_transport(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        let client = Self::client_for(node).await?;
+        let (_conn, state) = client.connection(connect_timeout).await?;
+        state.touch();
+        let session_id = state.alloc_session();
+        let (tx, rx) = mpsc::channel::<UdpInbound>(UDP_SESSION_QUEUE_CAP);
+        state.sessions.lock().insert(session_id, tx);
+        state.open.fetch_add(1, Ordering::Relaxed);
+        Ok(Arc::new(TuicUdpTransport {
+            state,
+            session_id,
+            packet_id: AtomicU16::new(0),
+            rx: tokio::sync::Mutex::new(rx),
+            defrag: tokio::sync::Mutex::new(Defragmenter::new()),
+            target_addr: TuicAddr::new(target, target_domain),
+            target,
+        }))
+    }
+
     async fn dial_with_tcp(
         &self,
         _node: &Node,
@@ -671,6 +696,84 @@ impl ProxyHandler for TuicHandler {
             Err(e) => {
                 debug!("TUIC connectivity test failed for {}: {}", node.name, e);
                 false
+            }
+        }
+    }
+}
+
+/// Framed UDP transport over a TUIC session — the P1.5 replacement for the
+/// loopback bridge: PACKET frames go straight onto the shared QUIC
+/// connection (datagrams, or uni streams when datagrams were not negotiated)
+/// and inbound frames arrive through the connection's session demux queue.
+struct TuicUdpTransport {
+    state: Arc<TuicConnState>,
+    session_id: u16,
+    packet_id: AtomicU16,
+    rx: tokio::sync::Mutex<mpsc::Receiver<UdpInbound>>,
+    defrag: tokio::sync::Mutex<Defragmenter>,
+    target_addr: TuicAddr,
+    target: SocketAddr,
+}
+
+impl std::fmt::Debug for TuicUdpTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TuicUdpTransport")
+            .field("session_id", &self.session_id)
+            .field("target", &self.target)
+            .finish()
+    }
+}
+
+impl Drop for TuicUdpTransport {
+    fn drop(&mut self) {
+        self.state.sessions.lock().remove(&self.session_id);
+        self.state.open.fetch_sub(1, Ordering::Relaxed);
+        let conn = self.state.conn.clone();
+        let session_id = self.session_id;
+        tokio::spawn(async move {
+            TuicHandler::send_dissociate(&conn, session_id).await;
+        });
+    }
+}
+
+#[async_trait]
+impl PacketTransport for TuicUdpTransport {
+    fn relay_addr(&self) -> SocketAddr {
+        self.target
+    }
+
+    async fn send_packet(&self, data: &[u8]) -> io::Result<()> {
+        let packet_id = self.packet_id.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        TuicHandler::send_udp(
+            &self.state,
+            self.session_id,
+            packet_id,
+            &self.target_addr,
+            data,
+        )
+        .await
+        .map_err(io::Error::other)
+    }
+
+    async fn recv_packet(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        loop {
+            let msg = self.rx.lock().await.recv().await.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::ConnectionAborted, "TUIC connection closed")
+            })?;
+            let complete = self
+                .defrag
+                .lock()
+                .await
+                .feed(msg.packet_id, msg.frag_id, msg.frag_total, msg.data);
+            if let Some(data) = complete {
+                if data.len() > buf.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "TUIC packet exceeds buffer",
+                    ));
+                }
+                buf[..data.len()].copy_from_slice(&data);
+                return Ok((data.len(), self.target));
             }
         }
     }
@@ -950,6 +1053,50 @@ mod tests {
             .expect("reply timed out")
             .unwrap();
         assert_eq!(src, udp.relay_addr);
+        assert_eq!(&buf[..n], b"stream-query");
+    }
+
+    #[tokio::test]
+    async fn test_udp_transport_native_datagram_echo() {
+        let server_addr = start_server(true, TEST_PASSWORD).await;
+        let node = test_node(server_addr.port(), TEST_PASSWORD);
+        let handler = TuicHandler::new();
+        let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
+
+        let transport = handler
+            .dial_udp_transport(&node, target, None, Duration::from_secs(5))
+            .await
+            .expect("dial_udp_transport should succeed");
+        assert_eq!(transport.relay_addr(), target);
+        transport.send_packet(b"dns-query").await.unwrap();
+        let mut buf = [0u8; 256];
+        let (n, src) = tokio::time::timeout(Duration::from_secs(5), transport.recv_packet(&mut buf))
+            .await
+            .expect("reply timed out")
+            .unwrap();
+        assert_eq!(src, target);
+        assert_eq!(&buf[..n], b"dns-query");
+    }
+
+    #[tokio::test]
+    async fn test_udp_transport_over_stream_echo() {
+        // Server without QUIC datagram support → UDP-over-stream fallback.
+        let server_addr = start_server(false, TEST_PASSWORD).await;
+        let node = test_node(server_addr.port(), TEST_PASSWORD);
+        let handler = TuicHandler::new();
+        let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
+
+        let transport = handler
+            .dial_udp_transport(&node, target, None, Duration::from_secs(5))
+            .await
+            .expect("dial_udp_transport should succeed");
+        transport.send_packet(b"stream-query").await.unwrap();
+        let mut buf = [0u8; 256];
+        let (n, src) = tokio::time::timeout(Duration::from_secs(5), transport.recv_packet(&mut buf))
+            .await
+            .expect("reply timed out")
+            .unwrap();
+        assert_eq!(src, target);
         assert_eq!(&buf[..n], b"stream-query");
     }
 
