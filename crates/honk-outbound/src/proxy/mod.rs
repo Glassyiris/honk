@@ -156,10 +156,7 @@ pub struct UdpSocketTransport {
 
 impl UdpSocketTransport {
     pub fn new(socket: Arc<tokio::net::UdpSocket>, relay_addr: SocketAddr) -> Self {
-        Self {
-            socket,
-            relay_addr,
-        }
+        Self { socket, relay_addr }
     }
 }
 
@@ -198,6 +195,26 @@ pub trait ProxyHandler: Send + Sync {
         _connect_timeout: Duration,
     ) -> anyhow::Result<UdpProxySocket> {
         Err(anyhow::anyhow!("UDP not supported for this protocol"))
+    }
+
+    /// Framed UDP transport for a flow. The default wraps `dial_udp`'s socket
+    /// (direct target, socks5 relay, or a legacy loopback bridge) in
+    /// [`UdpSocketTransport`]; tunnel protocols override it with a real
+    /// framed transport (no loopback).
+    async fn dial_udp_transport(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        let proxy = self
+            .dial_udp(node, target, target_domain, connect_timeout)
+            .await?;
+        Ok(Arc::new(UdpSocketTransport::new(
+            proxy.socket,
+            proxy.relay_addr,
+        )))
     }
 
     /// Raw TCP reachability check against the node server. Handlers share
@@ -349,6 +366,28 @@ impl ProxyRegistry {
 
         handler
             .dial_udp(node, target, target_domain, connect_timeout)
+            .await
+    }
+
+    /// Framed UDP transport for a flow, dispatching to the node's handler
+    /// (see [`ProxyHandler::dial_udp_transport`]).
+    pub async fn dial_udp_transport(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        if node.name == "block" {
+            return BlockHandler::new()
+                .dial_udp_transport(node, target, target_domain, connect_timeout)
+                .await;
+        }
+        let handler = self
+            .find(node.protocol)
+            .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", node.protocol))?;
+        handler
+            .dial_udp_transport(node, target, target_domain, connect_timeout)
             .await
     }
 

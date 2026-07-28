@@ -236,24 +236,23 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
             };
 
             let start = std::time::Instant::now();
-            let proxy = handler
-                .dial_udp(&node, dns_target, None, connect_timeout)
+            let transport = handler
+                .dial_udp_transport(&node, dns_target, None, connect_timeout)
                 .await
                 .map_err(|e| format!("UDP dial failed: {}", e))?;
 
             // One minimal DNS query; any well-formed answer proves the
             // node's UDP path round-trips end to end.
             let query = build_dns_probe_query();
-            proxy
-                .socket
-                .send_to(&query, proxy.relay_addr)
+            transport
+                .send_packet(&query)
                 .await
                 .map_err(|e| format!("UDP probe send failed: {}", e))?;
 
             let mut buf = [0u8; 512];
-            let n = tokio::time::timeout(
+            let (n, _src) = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                proxy.socket.recv(&mut buf),
+                transport.recv_packet(&mut buf),
             )
             .await
             .map_err(|_| "UDP probe recv timeout".to_string())?
