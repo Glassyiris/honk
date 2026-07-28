@@ -415,10 +415,12 @@ impl ControlPlane {
         self.dns_controller.cache().await
     }
 
-    /// Shared handle to the DNS forwarder (used by the clash API
-    /// `/dns/query` endpoint).
-    pub async fn dns_forwarder(&self) -> crate::dns::forwarder::DnsForwarder {
-        self.dns_controller.forwarder().await
+    /// Shared cell of the current DNS forwarder (used by the clash API
+    /// `/dns/query` endpoint so it follows config reloads).
+    pub fn dns_forwarder_cell(
+        &self,
+    ) -> Arc<tokio::sync::RwLock<crate::dns::forwarder::DnsForwarder>> {
+        self.dns_controller.forwarder_cell()
     }
 
     pub fn command_sender(&self) -> mpsc::Sender<ControlCommand> {

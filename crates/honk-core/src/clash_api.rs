@@ -59,9 +59,12 @@ pub struct ClashState {
     pub log_tx: tokio::sync::broadcast::Sender<logs::LogEvent>,
     /// DNS response cache cleared by `/cache/dns/flush`.
     pub dns_cache: Arc<tokio::sync::Mutex<crate::dns::cache::DnsCache>>,
-    /// DNS forwarder used by `/dns/query` (same cache/routing/upstream
-    /// pipeline as intercepted DNS traffic).
-    pub dns_forwarder: crate::dns::forwarder::DnsForwarder,
+    /// Shared cell of the control plane's DNS forwarder (same
+    /// cache/routing/upstream pipeline as intercepted DNS traffic).
+    /// A cell, not a snapshot: a config reload swaps the forwarder and
+    /// `/dns/query` must follow — a startup-time clone silently served
+    /// the stale upstream/routing set forever.
+    pub dns_forwarder: Arc<tokio::sync::RwLock<crate::dns::forwarder::DnsForwarder>>,
 }
 
 pub fn router(state: Arc<ClashState>) -> Router {
@@ -1175,7 +1178,11 @@ async fn get_dns_query(
     };
 
     let query = crate::dns::forwarder::build_dns_query(&name, qtype);
-    match s.dns_forwarder.resolve(&query).await {
+    let result = {
+        let forwarder = s.dns_forwarder.read().await;
+        forwarder.resolve(&query).await
+    };
+    match result {
         Ok(resp) => Json(doh::response_json(&name, qtype, &resp)).into_response(),
         // Upstream error or negative-cache hit: report SERVFAIL-style.
         Err(e) => {

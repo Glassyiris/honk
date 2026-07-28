@@ -711,7 +711,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                         external_ui: clash_cfg.external_ui.clone(),
                         log_tx: clash_log_tx.clone(),
                         dns_cache: control_plane.dns_cache().await,
-                        dns_forwarder: control_plane.dns_forwarder().await,
+                        dns_forwarder: control_plane.dns_forwarder_cell(),
                     });
                     tokio::spawn(clash_api::serve(state, listen));
                 }

@@ -184,6 +184,12 @@ impl DnsController {
         self.forwarder.read().await.clone()
     }
 
+    /// Shared cell of the currently installed forwarder: callers holding
+    /// this see reloads immediately (unlike a one-shot `forwarder()` clone).
+    pub fn forwarder_cell(&self) -> Arc<RwLock<DnsForwarder>> {
+        self.forwarder.clone()
+    }
+
     /// Spawn the periodic route refresh worker.
     pub fn spawn_route_refresh_worker(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let this = self.clone();

@@ -140,10 +140,10 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
 
     let (log_tx, _) = tokio::sync::broadcast::channel(16);
     let dns_cache = Arc::new(tokio::sync::Mutex::new(DnsCache::new(16)));
-    let dns_forwarder = test_dns_forwarder(
+    let dns_forwarder = Arc::new(tokio::sync::RwLock::new(test_dns_forwarder(
         dns_cache.clone(),
         a_record_response([93, 184, 216, 34], 300),
-    );
+    )));
     let state = Arc::new(ClashState {
         config: Arc::new(tokio::sync::RwLock::new(config)),
         stats: Arc::new(StatsManager::new()),
@@ -1056,7 +1056,10 @@ async fn test_dns_query_upstream_and_nxdomain() {
     assert_eq!(body["Answer"][0]["data"], "93.184.216.34");
 
     // NXDOMAIN: swap in a forwarder whose upstream returns RCODE 3.
-    let nx_forwarder = test_dns_forwarder(app.state.dns_cache.clone(), nxdomain_response());
+    let nx_forwarder = Arc::new(tokio::sync::RwLock::new(test_dns_forwarder(
+        app.state.dns_cache.clone(),
+        nxdomain_response(),
+    )));
     let state = Arc::new(ClashState {
         dns_forwarder: nx_forwarder,
         config: app.state.config.clone(),
