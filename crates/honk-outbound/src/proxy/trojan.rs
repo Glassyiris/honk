@@ -24,6 +24,7 @@
 //!
 //! Reference: <https://trojan-gfw.github.io/trojan/protocol>
 
+use super::{AsyncReadWrite, PacketTransport};
 use async_trait::async_trait;
 use honk_config::node::Node;
 use honk_config::types::NodeProtocol;
@@ -32,7 +33,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
-use super::{AsyncReadWrite, PacketTransport};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time;
