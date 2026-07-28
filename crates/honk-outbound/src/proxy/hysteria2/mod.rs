@@ -49,7 +49,7 @@ use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -68,7 +68,7 @@ use crate::quic::{
     ClientCache, QuicClient, QuicConnState, now_secs, recv_read_exact as read_exact,
 };
 
-use super::{ProxyHandler, ProxyStream, UdpProxySocket};
+use super::{PacketTransport, ProxyHandler, ProxyStream, UdpProxySocket};
 
 /// Auth request target: `POST https://hysteria/auth` (`protocol/http.go:8-10`).
 const URL_HOST: &str = "hysteria";
@@ -829,6 +829,42 @@ impl ProxyHandler for Hysteria2Handler {
         })
     }
 
+    async fn dial_udp_transport(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        let client = Self::client_for(node).await?;
+        let (conn, state) = client.connection(connect_timeout).await?;
+        if state.udp_disabled {
+            anyhow::bail!("Hysteria2: UDP disabled by server");
+        }
+        let max_datagram = conn
+            .max_datagram_size()
+            .ok_or_else(|| anyhow!("Hysteria2: peer does not support QUIC datagrams"))?;
+        state.touch();
+        let session_id = state.alloc_session();
+        let addr = target_string(target, target_domain);
+        if addr.len() as u64 > MAX_ADDRESS_LENGTH {
+            anyhow::bail!("Hysteria2: target address too long");
+        }
+        let (tx, rx) = mpsc::channel::<UdpInbound>(UDP_SESSION_QUEUE_CAP);
+        state.sessions.lock().insert(session_id, tx);
+        state.open.fetch_add(1, Ordering::Relaxed);
+        Ok(Arc::new(Hy2UdpTransport {
+            state,
+            session_id,
+            packet_id: AtomicU16::new(0),
+            rx: tokio::sync::Mutex::new(rx),
+            defrag: tokio::sync::Mutex::new(Defragmenter::new()),
+            addr,
+            max_datagram,
+            target,
+        }))
+    }
+
     async fn dial_with_tcp(
         &self,
         _node: &Node,
@@ -849,6 +885,93 @@ impl ProxyHandler for Hysteria2Handler {
                     node.name, e
                 );
                 false
+            }
+        }
+    }
+}
+
+/// Framed UDP transport over the shared Hysteria2 QUIC connection — the
+/// P1.5 replacement for the loopback bridge: UDP message datagrams go
+/// straight onto the connection and inbound datagrams arrive through the
+/// session demux queue.
+struct Hy2UdpTransport {
+    state: Arc<Hy2ConnState>,
+    session_id: u32,
+    packet_id: AtomicU16,
+    rx: tokio::sync::Mutex<mpsc::Receiver<UdpInbound>>,
+    defrag: tokio::sync::Mutex<Defragmenter>,
+    addr: String,
+    max_datagram: usize,
+    target: SocketAddr,
+}
+
+impl std::fmt::Debug for Hy2UdpTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Hy2UdpTransport")
+            .field("session_id", &self.session_id)
+            .field("target", &self.target)
+            .finish()
+    }
+}
+
+impl Drop for Hy2UdpTransport {
+    fn drop(&mut self) {
+        self.state.sessions.lock().remove(&self.session_id);
+        self.state.open.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[async_trait]
+impl PacketTransport for Hy2UdpTransport {
+    fn relay_addr(&self) -> SocketAddr {
+        self.target
+    }
+
+    async fn send_packet(&self, data: &[u8]) -> io::Result<()> {
+        if data.len() > MAX_UDP_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "hysteria2 datagram too large",
+            ));
+        }
+        self.state.touch();
+        let packet_id = self.packet_id.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        let packets = fragment_udp_message(
+            self.session_id,
+            packet_id,
+            &self.addr,
+            data,
+            self.max_datagram,
+        )
+        .map_err(io::Error::other)?;
+        for packet in packets {
+            self.state
+                .conn
+                .send_datagram(bytes::Bytes::from(packet))
+                .map_err(io::Error::other)?;
+        }
+        Ok(())
+    }
+
+    async fn recv_packet(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        loop {
+            let msg = self.rx.lock().await.recv().await.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::ConnectionAborted, "hysteria2 connection closed")
+            })?;
+            let complete = self
+                .defrag
+                .lock()
+                .await
+                .feed(msg.packet_id, msg.frag_id, msg.frag_total, msg.data);
+            if let Some(data) = complete {
+                if data.len() > buf.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "hysteria2 packet exceeds buffer",
+                    ));
+                }
+                buf[..data.len()].copy_from_slice(&data);
+                return Ok((data.len(), self.target));
             }
         }
     }
