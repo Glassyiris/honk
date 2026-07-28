@@ -848,7 +848,12 @@ impl<R: tokio::io::AsyncRead + Unpin> UotFrameReader<R> {
                         .collect());
                 }
                 None => {
-                    self.fill_grace(1).await?;
+                    // Wait indefinitely for the first byte — a slow first
+                    // reply (long proxied RTT) must not kill the flow; the
+                    // caller owns the idle timeout. The grace below only
+                    // bounds the disambiguation once bytes have started
+                    // arriving.
+                    self.fill(1).await?;
                     if self.buf[0] > UOT_V1_ATYP_DOMAIN {
                         self.mode = Some(UotMode::V2Connect);
                         continue;
