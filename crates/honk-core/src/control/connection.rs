@@ -1212,7 +1212,7 @@ impl ControlPlaneHandle {
             ep.mark_sent();
             ep.refresh();
             ep.tracker_upload(data.len() as u64);
-            ep.proxy_socket.send_to(&data, ep.relay_addr).await?;
+            ep.proxy_socket.send_packet(&data).await?;
             return Ok(());
         }
 
@@ -1308,18 +1308,19 @@ impl ControlPlaneHandle {
         for node in &candidates {
             match self
                 .proxy_registry
-                .dial_udp(node, original_dst, None, connect_timeout)
+                .dial_udp_transport(node, original_dst, None, connect_timeout)
                 .await
             {
-                Ok(proxy) => {
-                    proxy.socket.send_to(&data, proxy.relay_addr).await?;
+                Ok(transport) => {
+                    let relay_addr = transport.relay_addr();
+                    transport.send_packet(&data).await?;
                     let client_to_proxy: u64 = data.len() as u64;
 
                     let Some((endpoint, is_new)) = self.udp_pool.get_or_create(
                         client_addr,
                         original_dst,
-                        proxy.socket,
-                        proxy.relay_addr,
+                        transport,
+                        relay_addr,
                         node.name.clone(),
                     ) else {
                         // Pool at capacity: the datagram was already sent;
@@ -1343,7 +1344,7 @@ impl ControlPlaneHandle {
                         );
                     }
                     endpoint.mark_sent();
-                    endpoint.record_pending_reply_peer(proxy.relay_addr);
+                    endpoint.record_pending_reply_peer(relay_addr);
                     endpoint.cache_routing_result(original_dst, outbound_index);
 
                     // Register the flow in the clash-API tracker once per

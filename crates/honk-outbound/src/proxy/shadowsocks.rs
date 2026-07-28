@@ -40,7 +40,7 @@ use tracing::debug;
 
 use super::addr;
 use super::shadowsocks_2022::{self, Ss2022Method, Ss2022UdpSession};
-use super::{ProxyHandler, ProxyStream, UdpProxySocket};
+use super::{PacketTransport, ProxyHandler, ProxyStream, UdpProxySocket};
 
 pub(crate) const SS_SUBKEY_INFO: &[u8] = b"ss-subkey";
 pub(crate) const CHUNK_MAX_LEN: usize = 0x3FFF; // 2^14 - 1
@@ -341,45 +341,8 @@ impl ProxyHandler for ShadowsocksHandler {
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<UdpProxySocket> {
-        let method = node.encryption.as_deref().unwrap_or("aes-128-gcm");
-        let password = node.password.as_deref().unwrap_or("");
-        let socks = addr::encode_address(target, target_domain);
-
-        let crypto = if is_2022_method(method) {
-            SsUdpCrypto::V2022(Box::new(Ss2022UdpSession::new(Ss2022Method::new(
-                method, password,
-            )?)?))
-        } else {
-            SsUdpCrypto::Legacy(LegacyUdpCrypto::new(method, password)?)
-        };
-
-        // Resolve the server address up front: the bridge socket is
-        // connected, which also pins the reply peer.
-        let lookup = format!("{}:{}", node.host(), node.port);
-        let server_addr = tokio::time::timeout(connect_timeout, async {
-            let ips = crate::bootstrap::resolve(node.host()).await?;
-            ips.into_iter()
-                .next()
-                .map(|ip| SocketAddr::new(ip, node.port))
-                .ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::NotFound, "no address for host")
-                })
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("Shadowsocks UDP: resolve {} timed out", lookup))??;
-
-        // Server-facing socket (bypass-marked so eBPF does not re-route it).
-        let bind_addr: SocketAddr = if server_addr.is_ipv4() {
-            "0.0.0.0:0".parse().expect("hardcoded IPv4 bind address")
-        } else {
-            "[::]:0".parse().expect("hardcoded IPv6 bind address")
-        };
-        let outbound = crate::util::udp_marked_bind(bind_addr).await?;
-        outbound.connect(server_addr).await?;
-        debug!(
-            "Shadowsocks UDP: bridging to {} for target {}",
-            server_addr, target
-        );
+        let (crypto, outbound, socks) =
+            Self::udp_server_session(node, target, target_domain, connect_timeout).await?;
 
         // Loopback pair: the core talks raw payloads to `front` via
         // `relay_addr` (the address of `back`).
@@ -404,6 +367,129 @@ impl ProxyHandler for ShadowsocksHandler {
             target_domain: target_domain.map(|s| s.to_string()),
             _control: None,
         })
+    }
+
+    async fn dial_udp_transport(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        let (crypto, outbound, socks) =
+            Self::udp_server_session(node, target, target_domain, connect_timeout).await?;
+        Ok(Arc::new(SsUdpTransport {
+            socket: Arc::new(outbound),
+            crypto: tokio::sync::Mutex::new(crypto),
+            socks,
+            target,
+        }))
+    }
+}
+
+impl ShadowsocksHandler {
+    /// Set up a UDP relay session towards the server: cipher state plus a
+    /// connected, bypass-marked server-facing socket.
+    async fn udp_server_session(
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<(SsUdpCrypto, tokio::net::UdpSocket, Vec<u8>)> {
+        let method = node.encryption.as_deref().unwrap_or("aes-128-gcm");
+        let password = node.password.as_deref().unwrap_or("");
+        let socks = addr::encode_address(target, target_domain);
+
+        let crypto = if is_2022_method(method) {
+            SsUdpCrypto::V2022(Box::new(Ss2022UdpSession::new(Ss2022Method::new(
+                method, password,
+            )?)?))
+        } else {
+            SsUdpCrypto::Legacy(LegacyUdpCrypto::new(method, password)?)
+        };
+
+        // Resolve the server address up front: the session socket is
+        // connected, which also pins the reply peer.
+        let lookup = format!("{}:{}", node.host(), node.port);
+        let server_addr = tokio::time::timeout(connect_timeout, async {
+            let ips = crate::bootstrap::resolve(node.host()).await?;
+            ips.into_iter()
+                .next()
+                .map(|ip| SocketAddr::new(ip, node.port))
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::NotFound, "no address for host")
+                })
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("Shadowsocks UDP: resolve {} timed out", lookup))??;
+
+        // Server-facing socket (bypass-marked so eBPF does not re-route it).
+        let bind_addr: SocketAddr = if server_addr.is_ipv4() {
+            "0.0.0.0:0".parse().expect("hardcoded IPv4 bind address")
+        } else {
+            "[::]:0".parse().expect("hardcoded IPv6 bind address")
+        };
+        let outbound = crate::util::udp_marked_bind(bind_addr).await?;
+        outbound.connect(server_addr).await?;
+        debug!(
+            "Shadowsocks UDP: session to {} for target {}",
+            server_addr, target
+        );
+        Ok((crypto, outbound, socks))
+    }
+}
+
+/// Framed Shadowsocks UDP transport — the P1.5 replacement for the loopback
+/// bridge: datagrams are sealed/opened in place and go straight over the
+/// connected server-facing socket.
+struct SsUdpTransport {
+    socket: Arc<tokio::net::UdpSocket>,
+    crypto: tokio::sync::Mutex<SsUdpCrypto>,
+    socks: Vec<u8>,
+    target: SocketAddr,
+}
+
+impl fmt::Debug for SsUdpTransport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SsUdpTransport")
+            .field("target", &self.target)
+            .finish()
+    }
+}
+
+#[async_trait]
+impl PacketTransport for SsUdpTransport {
+    fn relay_addr(&self) -> SocketAddr {
+        self.target
+    }
+
+    async fn send_packet(&self, data: &[u8]) -> std::io::Result<()> {
+        let packet = self
+            .crypto
+            .lock()
+            .await
+            .seal(&self.socks, self.target.port(), data)
+            .map_err(std::io::Error::other)?;
+        self.socket.send(&packet).await?;
+        Ok(())
+    }
+
+    async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        let n = self.socket.recv(buf).await?;
+        let payload = self
+            .crypto
+            .lock()
+            .await
+            .open(&buf[..n])
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        if payload.len() > buf.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "shadowsocks packet exceeds buffer",
+            ));
+        }
+        buf[..payload.len()].copy_from_slice(&payload);
+        Ok((payload.len(), self.target))
     }
 }
 
@@ -792,6 +878,52 @@ mod tests {
         let mut buf = [0u8; 65536];
         let (n, src) = proxy.socket.recv_from(&mut buf).await.unwrap();
         assert_eq!(src, proxy.relay_addr);
+        assert_eq!(&buf[..n], b"HELLO DNS");
+    }
+
+    /// Same as `test_dial_udp_legacy_end_to_end` but through the framed
+    /// `dial_udp_transport` path (no loopback pair).
+    #[tokio::test]
+    async fn test_dial_udp_transport_legacy_end_to_end() {
+        use honk_config::types::NodeProtocol;
+
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let server_crypto = LegacyUdpCrypto::new("aes-128-gcm", "test-password").unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 65536];
+            loop {
+                let (n, src) = server.recv_from(&mut buf).await.unwrap();
+                let payload = server_crypto.open(&buf[..n]).unwrap();
+                let reply: Vec<u8> = payload.iter().map(|b| b.to_ascii_uppercase()).collect();
+                let socks = addr::encode_address("8.8.8.8:53".parse().unwrap(), None);
+                let packet = server_crypto.seal(&socks, &reply).unwrap();
+                server.send_to(&packet, src).await.unwrap();
+            }
+        });
+
+        let node = Node {
+            name: "test-ss-udp".into(),
+            protocol: NodeProtocol::SS,
+            address: server_addr.ip().to_string(),
+            host: String::new(),
+            port: server_addr.port(),
+            encryption: Some("aes-128-gcm".to_string()),
+            password: Some("test-password".to_string()),
+            ..Default::default()
+        };
+        let handler = ShadowsocksHandler::new();
+        let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let transport = handler
+            .dial_udp_transport(&node, target, None, std::time::Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(transport.relay_addr(), target);
+
+        transport.send_packet(b"hello dns").await.unwrap();
+        let mut buf = [0u8; 65536];
+        let (n, src) = transport.recv_packet(&mut buf).await.unwrap();
+        assert_eq!(src, target);
         assert_eq!(&buf[..n], b"HELLO DNS");
     }
 }

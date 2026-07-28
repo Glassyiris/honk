@@ -138,7 +138,15 @@ async fn udp_fast_path_hit_forwards_inline() {
     let client = addr("10.0.0.1:12345");
     let dst = addr("203.0.113.1:443");
     let (_ep, is_new) = pool
-        .get_or_create(client, dst, proxy, echo_addr, "test-node".to_string())
+        .get_or_create(
+            client,
+            dst,
+            std::sync::Arc::new(honk_outbound::proxy::UdpSocketTransport::new(
+                proxy, echo_addr,
+            )),
+            echo_addr,
+            "test-node".to_string(),
+        )
         .unwrap();
     assert!(is_new);
 
@@ -165,7 +173,10 @@ async fn udp_fast_path_dns_goes_slow_even_with_endpoint() {
         .get_or_create(
             client,
             dst,
-            proxy,
+            std::sync::Arc::new(honk_outbound::proxy::UdpSocketTransport::new(
+                proxy,
+                addr("127.0.0.1:9"),
+            )),
             addr("127.0.0.1:9"),
             "test-node".to_string(),
         )
@@ -186,7 +197,15 @@ async fn udp_fast_path_non_dns_port53_forwards() {
     let client = addr("10.0.0.1:12345");
     let dst = addr("203.0.113.1:53");
     let (_ep, is_new) = pool
-        .get_or_create(client, dst, proxy, echo_addr, "test-node".to_string())
+        .get_or_create(
+            client,
+            dst,
+            std::sync::Arc::new(honk_outbound::proxy::UdpSocketTransport::new(
+                proxy, echo_addr,
+            )),
+            echo_addr,
+            "test-node".to_string(),
+        )
         .unwrap();
     assert!(is_new);
 

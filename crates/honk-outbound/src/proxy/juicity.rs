@@ -39,7 +39,7 @@ use crate::quic::{
 };
 
 use super::addr::SocksAddr as JuiceAddr;
-use super::{ProxyHandler, ProxyStream, UdpProxySocket};
+use super::{PacketTransport, ProxyHandler, ProxyStream, UdpProxySocket};
 
 const JUICITY_VERSION: u8 = 0x00;
 
@@ -345,6 +345,41 @@ impl ProxyHandler for JuicityHandler {
         })
     }
 
+    async fn dial_udp_transport(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        let client = Self::client_for(node).await?;
+        let stream_addr = JuiceAddr::new(target, target_domain);
+        let addr = stream_addr.clone();
+        let stream = crate::quic::dial_quic_stream(
+            &client.quic,
+            |timeout| {
+                let client = Arc::clone(&client);
+                async move { client.connection(timeout).await }
+            },
+            connect_timeout,
+            move |conn| {
+                let addr = addr.clone();
+                async move { Self::open_stream(&conn, NETWORK_UDP, &addr).await }
+            },
+            |_| true,
+            "Juicity",
+        )
+        .await?;
+        let (send, recv, guard) = stream.into_parts();
+        Ok(Arc::new(JuicityUdpTransport {
+            send: tokio::sync::Mutex::new(send),
+            recv: tokio::sync::Mutex::new(recv),
+            _guard: guard,
+            target_addr: stream_addr,
+            target,
+        }))
+    }
+
     async fn dial_with_tcp(
         &self,
         _node: &Node,
@@ -364,6 +399,67 @@ impl ProxyHandler for JuicityHandler {
                 false
             }
         }
+    }
+}
+
+/// Framed UDP transport over a Juicity UDP bi stream — the P1.5 replacement
+/// for the loopback bridge: datagrams are framed as
+/// `[metadata][len u16][payload]` directly on the QUIC stream.
+struct JuicityUdpTransport {
+    send: tokio::sync::Mutex<quinn::SendStream>,
+    recv: tokio::sync::Mutex<quinn::RecvStream>,
+    /// Keeps the connection's open-stream accounting alive for the
+    /// transport's lifetime (see `QuicBiStream::into_parts`).
+    _guard: crate::quic::StreamDropGuard,
+    target_addr: JuiceAddr,
+    target: SocketAddr,
+}
+
+impl std::fmt::Debug for JuicityUdpTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JuicityUdpTransport")
+            .field("target", &self.target)
+            .finish()
+    }
+}
+
+#[async_trait]
+impl PacketTransport for JuicityUdpTransport {
+    fn relay_addr(&self) -> SocketAddr {
+        self.target
+    }
+
+    async fn send_packet(&self, data: &[u8]) -> io::Result<()> {
+        if data.len() > u16::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "juicity datagram too large",
+            ));
+        }
+        // SealUDP: `[metadata][len u16][payload]`
+        // (`stream_packet_conn.go:83-90`).
+        let mut frame = Vec::with_capacity(self.target_addr.encoded_len() + 2 + data.len());
+        self.target_addr.encode(&mut frame);
+        frame.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        frame.extend_from_slice(data);
+        self.send
+            .lock()
+            .await
+            .write_all(&frame)
+            .await
+            .map_err(io::Error::other)
+    }
+
+    async fn recv_packet(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        let (_addr, payload) = read_udp_frame(&mut *self.recv.lock().await).await?;
+        if payload.len() > buf.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "juicity datagram exceeds buffer",
+            ));
+        }
+        buf[..payload.len()].copy_from_slice(&payload);
+        Ok((payload.len(), self.target))
     }
 }
 
@@ -556,6 +652,37 @@ mod tests {
         // A second datagram on the same session must work too.
         udp.socket.send_to(b"second", udp.relay_addr).await.unwrap();
         let (n, _) = tokio::time::timeout(Duration::from_secs(5), udp.socket.recv_from(&mut buf))
+            .await
+            .expect("reply timed out")
+            .unwrap();
+        assert_eq!(&buf[..n], b"second");
+    }
+
+    #[tokio::test]
+    async fn test_udp_transport_echo() {
+        let server_addr = start_server(TEST_PASSWORD).await;
+        let node = test_node(server_addr.port(), TEST_PASSWORD);
+        let handler = JuicityHandler::new();
+        let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
+
+        let transport = handler
+            .dial_udp_transport(&node, target, None, Duration::from_secs(5))
+            .await
+            .expect("dial_udp_transport should succeed");
+        assert_eq!(transport.relay_addr(), target);
+        transport.send_packet(b"dns-query").await.unwrap();
+        let mut buf = [0u8; 256];
+        let (n, src) =
+            tokio::time::timeout(Duration::from_secs(5), transport.recv_packet(&mut buf))
+                .await
+                .expect("reply timed out")
+                .unwrap();
+        assert_eq!(src, target);
+        assert_eq!(&buf[..n], b"dns-query");
+
+        // A second datagram on the same session must work too.
+        transport.send_packet(b"second").await.unwrap();
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), transport.recv_packet(&mut buf))
             .await
             .expect("reply timed out")
             .unwrap();

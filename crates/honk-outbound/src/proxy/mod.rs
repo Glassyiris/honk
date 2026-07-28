@@ -131,6 +131,49 @@ pub struct UdpProxySocket {
     pub _control: Option<tokio::net::TcpStream>,
 }
 
+/// Framed UDP packet transport — the long-term replacement for per-flow
+/// loopback bridges. Native UDP protocols wrap a real `UdpSocket`; tunnel
+/// protocols implement their framing directly on the tunnel instead of
+/// bouncing datagrams through a loopback socket pair (extra FD + bridge
+/// task + 1–2 copies per packet).
+#[async_trait]
+pub trait PacketTransport: Send + Sync + Debug {
+    /// The relay target a flow reports as its destination.
+    fn relay_addr(&self) -> SocketAddr;
+    async fn send_packet(&self, data: &[u8]) -> std::io::Result<()>;
+    async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)>;
+}
+
+/// Adapter presenting any `UdpSocket` — a direct target, a socks5
+/// server-assigned relay, or a legacy loopback bridge — as a
+/// [`PacketTransport`]. Lets tunnel protocols migrate to framed transports
+/// incrementally instead of one flag-day rewrite.
+#[derive(Debug)]
+pub struct UdpSocketTransport {
+    socket: Arc<tokio::net::UdpSocket>,
+    relay_addr: SocketAddr,
+}
+
+impl UdpSocketTransport {
+    pub fn new(socket: Arc<tokio::net::UdpSocket>, relay_addr: SocketAddr) -> Self {
+        Self { socket, relay_addr }
+    }
+}
+
+#[async_trait]
+impl PacketTransport for UdpSocketTransport {
+    fn relay_addr(&self) -> SocketAddr {
+        self.relay_addr
+    }
+    async fn send_packet(&self, data: &[u8]) -> std::io::Result<()> {
+        self.socket.send_to(data, self.relay_addr).await?;
+        Ok(())
+    }
+    async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        self.socket.recv_from(buf).await
+    }
+}
+
 #[async_trait]
 pub trait ProxyHandler: Send + Sync {
     fn protocol(&self) -> NodeProtocol;
@@ -152,6 +195,26 @@ pub trait ProxyHandler: Send + Sync {
         _connect_timeout: Duration,
     ) -> anyhow::Result<UdpProxySocket> {
         Err(anyhow::anyhow!("UDP not supported for this protocol"))
+    }
+
+    /// Framed UDP transport for a flow. The default wraps `dial_udp`'s socket
+    /// (direct target, socks5 relay, or a legacy loopback bridge) in
+    /// [`UdpSocketTransport`]; tunnel protocols override it with a real
+    /// framed transport (no loopback).
+    async fn dial_udp_transport(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        let proxy = self
+            .dial_udp(node, target, target_domain, connect_timeout)
+            .await?;
+        Ok(Arc::new(UdpSocketTransport::new(
+            proxy.socket,
+            proxy.relay_addr,
+        )))
     }
 
     /// Raw TCP reachability check against the node server. Handlers share
@@ -303,6 +366,28 @@ impl ProxyRegistry {
 
         handler
             .dial_udp(node, target, target_domain, connect_timeout)
+            .await
+    }
+
+    /// Framed UDP transport for a flow, dispatching to the node's handler
+    /// (see [`ProxyHandler::dial_udp_transport`]).
+    pub async fn dial_udp_transport(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        if node.name == "block" {
+            return BlockHandler::new()
+                .dial_udp_transport(node, target, target_domain, connect_timeout)
+                .await;
+        }
+        let handler = self
+            .find(node.protocol)
+            .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", node.protocol))?;
+        handler
+            .dial_udp_transport(node, target, target_domain, connect_timeout)
             .await
     }
 

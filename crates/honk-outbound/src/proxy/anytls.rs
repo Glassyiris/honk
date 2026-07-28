@@ -25,7 +25,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -33,7 +33,7 @@ use tokio::time;
 use tracing::{debug, warn};
 
 use super::addr;
-use super::{ProxyHandler, ProxyStream, UdpProxySocket};
+use super::{PacketTransport, ProxyHandler, ProxyStream, UdpProxySocket};
 
 /// sing uot v2 magic address (`protocol/anytls/outbound.go`,
 /// `common/uot/protocol.go`): UDP-over-TCP streams are opened to this
@@ -662,7 +662,15 @@ async fn connect_transport(
 
     let tcp = match tcp {
         Some(tcp) => tcp,
-        None => crate::util::connect_outbound(addr, connect_timeout).await?,
+        // `addr` is the pool key (host:port plus an auth/TLS fingerprint),
+        // not a dial target — always dial the node's own address.
+        None => {
+            crate::util::connect_outbound(
+                &format!("{}:{}", node.host(), node.port),
+                connect_timeout,
+            )
+            .await?
+        }
     };
     debug!("AnyTLS: TCP connected to {}", addr);
 
@@ -848,7 +856,12 @@ impl<R: tokio::io::AsyncRead + Unpin> UotFrameReader<R> {
                         .collect());
                 }
                 None => {
-                    self.fill_grace(1).await?;
+                    // Wait indefinitely for the first byte — a slow first
+                    // reply (long proxied RTT) must not kill the flow; the
+                    // caller owns the idle timeout. The grace below only
+                    // bounds the disambiguation once bytes have started
+                    // arriving.
+                    self.fill(1).await?;
                     if self.buf[0] > UOT_V1_ATYP_DOMAIN {
                         self.mode = Some(UotMode::V2Connect);
                         continue;
@@ -1158,6 +1171,151 @@ impl ProxyHandler for AnyTlsHandler {
             target_domain: target_domain.map(str::to_string),
             _control: None,
         })
+    }
+
+    async fn dial_udp_transport(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        if let Some(ref network) = node.network
+            && !network
+                .split(',')
+                .any(|n| n.trim().eq_ignore_ascii_case("udp"))
+        {
+            anyhow::bail!("node '{}' does not allow UDP", node.name);
+        }
+
+        let addr = pool_key(node);
+        let magic = addr::encode_address("0.0.0.0:0".parse().unwrap(), Some(UOT_MAGIC));
+        let mut stream = if let Some(s) = Self::open_pooled_stream(&addr, &magic).await? {
+            s
+        } else {
+            Self::ensure_janitor(node);
+            let (read, write, auth, settings) =
+                connect_transport(node, &addr, connect_timeout, None).await?;
+            let session =
+                AnyTlsSession::establish(&SESSION_POOL, &addr, read, write, &auth, &settings)
+                    .await?;
+            session.open_stream(magic).await?
+        };
+
+        // UoT request: isConnect=true + destination in SOCKS5 address form.
+        let mut request = vec![1u8];
+        request.extend(addr::encode_address(target, target_domain));
+        tokio::time::timeout(connect_timeout, stream.write_all(&request)).await??;
+
+        let (rd, wr) = tokio::io::split(stream);
+        Ok(Arc::new(AnyTlsUotTransport::new(
+            rd,
+            wr,
+            target,
+            target_domain.map(str::to_string),
+        )))
+    }
+}
+
+/// Framed UoT transport over a multiplexed AnyTLS stream — the P1.5
+/// replacement for the loopback bridge: datagrams are length-prefixed
+/// directly on the UoT stream, no loopback socket pair.
+///
+/// A dedicated drain task always pulls datagrams off the stream into a
+/// bounded queue, dropping on overflow. This is load-bearing, not an
+/// optimization: the session demux blocks when a stream's dispatch queue is
+/// full, so a UoT stream that stops being read (its endpoint's reply
+/// handler exited on error/idle while the endpoint lives on) would
+/// otherwise backpressure the whole session and stall every TCP and UDP
+/// flow multiplexed on it — exactly what the old loopback bridge's eager
+/// reader prevented.
+struct AnyTlsUotTransport {
+    writer: tokio::sync::Mutex<WriteHalf<tokio::io::DuplexStream>>,
+    rx: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
+    drain: tokio::task::AbortHandle,
+    target: SocketAddr,
+}
+
+/// Depth of the drain queue. UDP semantics: drop on a full queue, never
+/// queue unboundedly (matches the old bridge's 256).
+const UOT_DRAIN_QUEUE_CAP: usize = 256;
+
+impl AnyTlsUotTransport {
+    fn new(
+        rd: ReadHalf<tokio::io::DuplexStream>,
+        wr: WriteHalf<tokio::io::DuplexStream>,
+        target: SocketAddr,
+        target_domain: Option<String>,
+    ) -> Self {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(UOT_DRAIN_QUEUE_CAP);
+        let drain_target_domain = target_domain.clone();
+        let drain = tokio::spawn(async move {
+            let mut frames = UotFrameReader::new(rd);
+            while let Ok(data) = frames
+                .next_datagram(&target, drain_target_domain.as_deref())
+                .await
+            {
+                match tx.try_send(data) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => continue,
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                }
+            }
+        });
+        Self {
+            writer: tokio::sync::Mutex::new(wr),
+            rx: tokio::sync::Mutex::new(rx),
+            drain: drain.abort_handle(),
+            target,
+        }
+    }
+}
+
+impl Drop for AnyTlsUotTransport {
+    fn drop(&mut self) {
+        self.drain.abort();
+    }
+}
+
+impl std::fmt::Debug for AnyTlsUotTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnyTlsUotTransport")
+            .field("target", &self.target)
+            .finish()
+    }
+}
+
+#[async_trait]
+impl PacketTransport for AnyTlsUotTransport {
+    fn relay_addr(&self) -> SocketAddr {
+        self.target
+    }
+
+    async fn send_packet(&self, data: &[u8]) -> std::io::Result<()> {
+        if data.len() > u16::MAX as usize {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "uot datagram too large",
+            ));
+        }
+        let mut frame = Vec::with_capacity(2 + data.len());
+        frame.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        frame.extend_from_slice(data);
+        self.writer.lock().await.write_all(&frame).await
+    }
+
+    async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        let data = self.rx.lock().await.recv().await.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "UoT stream closed")
+        })?;
+        if data.len() > buf.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "uot datagram exceeds buffer",
+            ));
+        }
+        buf[..data.len()].copy_from_slice(&data);
+        Ok((data.len(), self.target))
     }
 }
 
@@ -1599,5 +1757,62 @@ mod uot_tests {
         let mut buf = [0u8; 16];
         let (n, _from) = external.recv_from(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"pong");
+    }
+}
+
+#[cfg(test)]
+mod uot_transport_tests {
+    use super::*;
+
+    /// UoT v2 framing: send writes `u16 len + payload`; recv reads the same
+    /// back (V2Connect mode). Round-tripped over a duplex pair.
+    #[tokio::test]
+    async fn uot_transport_frame_roundtrip() {
+        let (client, mut server) = tokio::io::duplex(8192);
+        let target: SocketAddr = "93.184.216.34:53".parse().unwrap();
+        let (rd, wr) = tokio::io::split(client);
+        let transport = AnyTlsUotTransport::new(rd, wr, target, None);
+
+        transport.send_packet(b"dns-packet").await.unwrap();
+        let mut len_buf = [0u8; 2];
+        server.read_exact(&mut len_buf).await.unwrap();
+        assert_eq!(u16::from_be_bytes(len_buf) as usize, 10);
+        let mut payload = [0u8; 10];
+        server.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"dns-packet");
+
+        // server → client v2 frame
+        server.write_all(&5u16.to_be_bytes()).await.unwrap();
+        server.write_all(b"pong!").await.unwrap();
+        let mut buf = [0u8; 64];
+        let (n, src) = transport.recv_packet(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"pong!");
+        assert_eq!(src, target);
+    }
+
+    /// Backpressure guard: when the consumer stops reading, the drain task
+    /// must keep pulling datagrams off the stream and drop overflow, so the
+    /// session demux never blocks on a stale UoT stream.
+    #[tokio::test]
+    async fn uot_transport_drains_when_consumer_stops() {
+        let (client, mut server) = tokio::io::duplex(65536);
+        let target: SocketAddr = "93.184.216.34:53".parse().unwrap();
+        let (rd, wr) = tokio::io::split(client);
+        let transport = AnyTlsUotTransport::new(rd, wr, target, None);
+
+        // Flood more datagrams than the drain queue holds without any
+        // recv_packet call; the writes must not block (drain drops excess).
+        for _ in 0..(UOT_DRAIN_QUEUE_CAP * 4) {
+            server.write_all(&5u16.to_be_bytes()).await.unwrap();
+            server.write_all(b"flood").await.unwrap();
+        }
+        // The transport still works afterwards.
+        transport.send_packet(b"ping").await.unwrap();
+        let mut buf = [0u8; 64];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), transport.recv_packet(&mut buf))
+            .await
+            .expect("recv must not stall")
+            .unwrap();
+        assert_eq!(&buf[..n], b"flood");
     }
 }
