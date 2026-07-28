@@ -1094,8 +1094,9 @@ async fn test_dns_query_upstream_and_nxdomain() {
     assert_eq!(body["Status"], 3, "NXDOMAIN maps to Status 3");
     assert_eq!(body["Answer"].as_array().unwrap().len(), 0);
 
-    // The NXDOMAIN is now in the negative cache; the same query again hits
-    // the negative-cache error path and reports SERVFAIL-style Status 2.
+    // The NXDOMAIN is now in the negative cache; the same query again is
+    // answered from it with the same proper NXDOMAIN Status 3 (a negative
+    // hit must not degrade into SERVFAIL).
     let body: serde_json::Value = client
         .get(format!("http://{}/dns/query?name=nx.example.com", addr))
         .send()
@@ -1104,7 +1105,8 @@ async fn test_dns_query_upstream_and_nxdomain() {
         .json()
         .await
         .unwrap();
-    assert_eq!(body["Status"], 2);
+    assert_eq!(body["Status"], 3);
+    assert_eq!(body["Answer"].as_array().unwrap().len(), 0);
 }
 
 #[tokio::test]
