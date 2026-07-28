@@ -122,6 +122,28 @@ impl VLessHandler {
     }
 }
 
+impl VLessHandler {
+    /// Read and validate the VLESS response header:
+    /// `[version(1)][addon_len(1)][addon(addon_len)]`. Reading only the
+    /// version byte would leave any addon bytes to corrupt the stream.
+    async fn read_response_header(stream: &mut Box<dyn AsyncReadWrite>) -> anyhow::Result<()> {
+        use tokio::io::AsyncReadExt;
+        let mut head = [0u8; 2];
+        stream.read_exact(&mut head).await?;
+        if head[0] != 0x00 {
+            anyhow::bail!("VLESS: server rejected request (code 0x{:02x})", head[0]);
+        }
+        let addon_len = head[1] as usize;
+        if addon_len > 0 {
+            // Protobuf addon is informational; consume it so it does not
+            // leak into the relayed stream.
+            let mut addon = vec![0u8; addon_len];
+            stream.read_exact(&mut addon).await?;
+        }
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl ProxyHandler for VLessHandler {
     fn protocol(&self) -> NodeProtocol {
@@ -142,18 +164,7 @@ impl ProxyHandler for VLessHandler {
         let mut stream = Self::connect_server(node, connect_timeout).await?;
         stream.write_all(&header).await?;
 
-        // Read 1-byte response (0x00 = success)
-        {
-            use tokio::io::AsyncReadExt;
-            let mut response = [0u8; 1];
-            stream.read_exact(&mut response).await?;
-            if response[0] != 0x00 {
-                anyhow::bail!(
-                    "VLESS: server rejected request (code 0x{:02x})",
-                    response[0]
-                );
-            }
-        }
+        Self::read_response_header(&mut stream).await?;
 
         Ok(ProxyStream {
             stream,
@@ -177,17 +188,7 @@ impl ProxyHandler for VLessHandler {
         let mut stream = Self::wrap_transport(node, tcp).await?;
         stream.write_all(&header).await?;
 
-        {
-            use tokio::io::AsyncReadExt;
-            let mut response = [0u8; 1];
-            stream.read_exact(&mut response).await?;
-            if response[0] != 0x00 {
-                anyhow::bail!(
-                    "VLESS: server rejected request (code 0x{:02x})",
-                    response[0]
-                );
-            }
-        }
+        Self::read_response_header(&mut stream).await?;
 
         Ok(ProxyStream {
             stream,
@@ -310,9 +311,10 @@ mod tests {
             assert_eq!(&header[1..17], &uuid_bytes);
             assert_eq!(header[18], CMD_TCP);
 
-            // Accept with the 1-byte response, then expect relayed payload.
+            // Accept with the 2-byte response header (version + addon_len=0),
+            // then expect relayed payload.
             ws.send(tokio_tungstenite::tungstenite::Message::Binary(
-                vec![0x00].into(),
+                vec![0x00, 0x00].into(),
             ))
             .await
             .unwrap();
