@@ -79,22 +79,29 @@ const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// `TCPTimeout` parity); session dials use the caller's connect timeout.
 const SESSION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Cache key for h2mux sessions: one session pool per server TLS identity.
+/// Cache key for h2mux sessions: one session pool per server identity,
+/// including the auth/TLS fingerprint so nodes sharing an endpoint but
+/// differing in password/uuid/SNI/verify never share a session.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SessionKey {
     host: String,
     port: u16,
     tls: bool,
     sni: Option<String>,
+    password_hash: String,
+    skip_cert_verify: bool,
 }
 
 impl SessionKey {
     fn from_node(node: &Node) -> Self {
+        let password = node.password.as_deref().unwrap_or("");
         Self {
             host: node.host().to_string(),
             port: node.port,
             tls: node.tls,
             sni: node.sni.clone(),
+            password_hash: blake3::hash(password.as_bytes()).to_hex().as_str()[..8].to_string(),
+            skip_cert_verify: node.skip_cert_verify,
         }
     }
 }

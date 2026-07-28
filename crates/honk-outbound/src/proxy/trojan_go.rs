@@ -89,7 +89,24 @@ impl TrojanGoHandler {
         node: &Node,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<Arc<MuxConnection>> {
-        let host_key = format!("{}:{}", node.host(), node.port);
+        // Pool key = host:port + auth/TLS fingerprint, so nodes sharing an
+        // endpoint but differing in password/SNI/verify never share a mux
+        // connection (and a reload changing those can't reuse a stale one).
+        let host_key = {
+            let pw_hash = &blake3::hash(node.password.as_deref().unwrap_or("").as_bytes())
+                .to_hex()
+                .as_str()[..8]
+                .to_string();
+            format!(
+                "{}:{}|{}|{}|{}|{}",
+                node.host(),
+                node.port,
+                pw_hash,
+                node.sni.as_deref().unwrap_or(""),
+                node.skip_cert_verify,
+                node.tls
+            )
+        };
         {
             let pool = self.pool.lock().unwrap();
             if let Some(mux) = pool.get(&host_key)
