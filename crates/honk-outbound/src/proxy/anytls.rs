@@ -84,6 +84,29 @@ pub struct AnyTlsHandler;
 static SESSION_POOL: LazyLock<Arc<AnyTlsSessionPool>> =
     LazyLock::new(|| Arc::new(AnyTlsSessionPool::new()));
 
+/// Pool key for a node: `host:port` plus a fingerprint of the auth/TLS
+/// configuration. Previously the key was only `host:port`, so two nodes
+/// sharing an endpoint but differing in password/SNI/verify would wrongly
+/// multiplex onto the same session (and a reload changing those fields
+/// would silently reuse a session built for the old config). The password
+/// is hashed — never stored in the clear in the key.
+fn pool_key(node: &Node) -> String {
+    let password = node
+        .anytls_password
+        .as_deref()
+        .or(node.password.as_deref())
+        .unwrap_or("");
+    let pw_hash = &blake3::hash(password.as_bytes()).to_hex().as_str()[..8].to_string();
+    format!(
+        "{}:{}|{}|{}|{}",
+        node.host(),
+        node.port,
+        pw_hash,
+        node.sni.as_deref().unwrap_or(""),
+        node.skip_cert_verify,
+    )
+}
+
 /// Node addresses that already have a running pool janitor.
 static JANITORS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
@@ -543,7 +566,7 @@ impl AnyTlsSessionPool {
     /// `AnyTlsSessionPool` drop / cancellation).
     fn spawn_janitor(self: &Arc<Self>, node: Node) -> JoinHandle<()> {
         let pool = Arc::clone(self);
-        let addr = format!("{}:{}", node.host(), node.port);
+        let addr = pool_key(&node);
         // Default 1 (not sing-box's 0): a single standby session per node
         // keeps every dial warm after the first — cold dials otherwise pay
         // TCP connect + TLS handshake (2 RTT) per burst.
@@ -697,7 +720,7 @@ impl AnyTlsHandler {
         // skipping it entirely leaks idle sessions into the pool forever.
         // An explicit `min_idle_session=0` disables standby sessions only,
         // never pruning.
-        let addr = format!("{}:{}", node.host(), node.port);
+        let addr = pool_key(node);
         {
             let mut guard = JANITORS.lock().unwrap();
             if !guard.insert(addr.clone()) {
@@ -1005,7 +1028,7 @@ impl ProxyHandler for AnyTlsHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let addr = format!("{}:{}", node.host(), node.port);
+        let addr = pool_key(node);
         let target_addr = addr::encode_address(target, target_domain);
 
         if let Some(stream) = Self::open_pooled_stream(&addr, &target_addr).await? {
@@ -1045,7 +1068,7 @@ impl ProxyHandler for AnyTlsHandler {
         tcp: TcpStream,
         _connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let addr = format!("{}:{}", node.host(), node.port);
+        let addr = pool_key(node);
         let target_addr = addr::encode_address(target, target_domain);
 
         // Try the session pool first (ignoring the provided TCP since we
@@ -1091,7 +1114,7 @@ impl ProxyHandler for AnyTlsHandler {
             anyhow::bail!("node '{}' does not allow UDP", node.name);
         }
 
-        let addr = format!("{}:{}", node.host(), node.port);
+        let addr = pool_key(node);
         // The stream target is the UoT magic address (SOCKS5 address form).
         let magic = addr::encode_address("0.0.0.0:0".parse().unwrap(), Some(UOT_MAGIC));
         let mut stream = if let Some(s) = Self::open_pooled_stream(&addr, &magic).await? {
