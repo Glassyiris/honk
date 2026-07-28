@@ -1208,23 +1208,73 @@ impl ProxyHandler for AnyTlsHandler {
         tokio::time::timeout(connect_timeout, stream.write_all(&request)).await??;
 
         let (rd, wr) = tokio::io::split(stream);
-        Ok(Arc::new(AnyTlsUotTransport {
-            writer: tokio::sync::Mutex::new(wr),
-            reader: tokio::sync::Mutex::new(UotFrameReader::new(rd)),
+        Ok(Arc::new(AnyTlsUotTransport::new(
+            rd,
+            wr,
             target,
-            target_domain: target_domain.map(str::to_string),
-        }))
+            target_domain.map(str::to_string),
+        )))
     }
 }
 
 /// Framed UoT transport over a multiplexed AnyTLS stream — the P1.5
 /// replacement for the loopback bridge: datagrams are length-prefixed
-/// directly on the UoT stream, no loopback socket pair / bridge task.
+/// directly on the UoT stream, no loopback socket pair.
+///
+/// A dedicated drain task always pulls datagrams off the stream into a
+/// bounded queue, dropping on overflow. This is load-bearing, not an
+/// optimization: the session demux blocks when a stream's dispatch queue is
+/// full, so a UoT stream that stops being read (its endpoint's reply
+/// handler exited on error/idle while the endpoint lives on) would
+/// otherwise backpressure the whole session and stall every TCP and UDP
+/// flow multiplexed on it — exactly what the old loopback bridge's eager
+/// reader prevented.
 struct AnyTlsUotTransport {
     writer: tokio::sync::Mutex<WriteHalf<tokio::io::DuplexStream>>,
-    reader: tokio::sync::Mutex<UotFrameReader<ReadHalf<tokio::io::DuplexStream>>>,
+    rx: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
+    drain: tokio::task::AbortHandle,
     target: SocketAddr,
-    target_domain: Option<String>,
+}
+
+/// Depth of the drain queue. UDP semantics: drop on a full queue, never
+/// queue unboundedly (matches the old bridge's 256).
+const UOT_DRAIN_QUEUE_CAP: usize = 256;
+
+impl AnyTlsUotTransport {
+    fn new(
+        rd: ReadHalf<tokio::io::DuplexStream>,
+        wr: WriteHalf<tokio::io::DuplexStream>,
+        target: SocketAddr,
+        target_domain: Option<String>,
+    ) -> Self {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(UOT_DRAIN_QUEUE_CAP);
+        let drain_target_domain = target_domain.clone();
+        let drain = tokio::spawn(async move {
+            let mut frames = UotFrameReader::new(rd);
+            while let Ok(data) = frames
+                .next_datagram(&target, drain_target_domain.as_deref())
+                .await
+            {
+                match tx.try_send(data) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => continue,
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                }
+            }
+        });
+        Self {
+            writer: tokio::sync::Mutex::new(wr),
+            rx: tokio::sync::Mutex::new(rx),
+            drain: drain.abort_handle(),
+            target,
+        }
+    }
+}
+
+impl Drop for AnyTlsUotTransport {
+    fn drop(&mut self) {
+        self.drain.abort();
+    }
 }
 
 impl std::fmt::Debug for AnyTlsUotTransport {
@@ -1255,12 +1305,9 @@ impl PacketTransport for AnyTlsUotTransport {
     }
 
     async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
-        let data = self
-            .reader
-            .lock()
-            .await
-            .next_datagram(&self.target, self.target_domain.as_deref())
-            .await?;
+        let data = self.rx.lock().await.recv().await.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "UoT stream closed")
+        })?;
         if data.len() > buf.len() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -1724,12 +1771,7 @@ mod uot_transport_tests {
         let (client, mut server) = tokio::io::duplex(8192);
         let target: SocketAddr = "93.184.216.34:53".parse().unwrap();
         let (rd, wr) = tokio::io::split(client);
-        let transport = AnyTlsUotTransport {
-            writer: tokio::sync::Mutex::new(wr),
-            reader: tokio::sync::Mutex::new(UotFrameReader::new(rd)),
-            target,
-            target_domain: None,
-        };
+        let transport = AnyTlsUotTransport::new(rd, wr, target, None);
 
         transport.send_packet(b"dns-packet").await.unwrap();
         let mut len_buf = [0u8; 2];
@@ -1746,5 +1788,31 @@ mod uot_transport_tests {
         let (n, src) = transport.recv_packet(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"pong!");
         assert_eq!(src, target);
+    }
+
+    /// Backpressure guard: when the consumer stops reading, the drain task
+    /// must keep pulling datagrams off the stream and drop overflow, so the
+    /// session demux never blocks on a stale UoT stream.
+    #[tokio::test]
+    async fn uot_transport_drains_when_consumer_stops() {
+        let (client, mut server) = tokio::io::duplex(65536);
+        let target: SocketAddr = "93.184.216.34:53".parse().unwrap();
+        let (rd, wr) = tokio::io::split(client);
+        let transport = AnyTlsUotTransport::new(rd, wr, target, None);
+
+        // Flood more datagrams than the drain queue holds without any
+        // recv_packet call; the writes must not block (drain drops excess).
+        for _ in 0..(UOT_DRAIN_QUEUE_CAP * 4) {
+            server.write_all(&5u16.to_be_bytes()).await.unwrap();
+            server.write_all(b"flood").await.unwrap();
+        }
+        // The transport still works afterwards.
+        transport.send_packet(b"ping").await.unwrap();
+        let mut buf = [0u8; 64];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), transport.recv_packet(&mut buf))
+            .await
+            .expect("recv must not stall")
+            .unwrap();
+        assert_eq!(&buf[..n], b"flood");
     }
 }
