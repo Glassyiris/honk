@@ -38,10 +38,6 @@ pub struct SessionPoolConfig {
     /// Soft per-session stream cap: sessions at or above it are skipped
     /// by the scheduler (a new session is dialed instead).
     pub max_streams_per_session: usize,
-    /// Standby sessions the janitor keeps established per key.
-    pub min_idle: usize,
-    /// Sessions with zero streams for this long are closed.
-    pub idle_timeout: Duration,
     /// Janitor tick (prune + prewarm cadence).
     pub janitor_interval: Duration,
     /// First dial-failure backoff; doubles per consecutive failure up to
@@ -56,8 +52,6 @@ impl Default for SessionPoolConfig {
         Self {
             max_sessions: 8,
             max_streams_per_session: 8,
-            min_idle: 0,
-            idle_timeout: Duration::from_secs(60),
             janitor_interval: Duration::from_secs(30),
             dial_backoff: Duration::from_secs(1),
             max_dial_backoff: Duration::from_secs(30),
@@ -272,10 +266,17 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
     /// Start the per-key janitor (prune closed/expired, prewarm to
     /// `min_idle`) once; subsequent calls are no-ops. `prewarm` dials a
     /// fresh session and is only called when below `min_idle`.
+    /// `min_idle`/`idle_timeout` are per-key (node-level policies, e.g.
+    /// AnyTLS's node fields).
     // First consumer: the AnyTLS pool migration (P1.6).
     #[allow(dead_code)]
-    pub fn ensure_janitor<F, Fut>(self: &Arc<Self>, key: &str, prewarm: F)
-    where
+    pub fn ensure_janitor<F, Fut>(
+        self: &Arc<Self>,
+        key: &str,
+        min_idle: usize,
+        idle_timeout: Duration,
+        prewarm: F,
+    ) where
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = anyhow::Result<Arc<S>>> + Send,
     {
@@ -313,8 +314,8 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                             continue;
                         }
                         let since = idle_since.entry(ptr).or_insert(now);
-                        if now.duration_since(*since) >= pool.config.idle_timeout
-                            && live.len() - to_close.len() > pool.config.min_idle
+                        if now.duration_since(*since) >= idle_timeout
+                            && live.len() - to_close.len() > min_idle
                         {
                             to_close.push(Arc::clone(s));
                         }
@@ -326,7 +327,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                 }
                 // Prewarm to min_idle.
                 let current = pool.keys.lock().get(&key).map_or(0, |p| p.sessions.len());
-                if current < pool.config.min_idle
+                if current < min_idle
                     && let Ok(s) = pool.offer(&key, &prewarm).await
                 {
                     drop(s);

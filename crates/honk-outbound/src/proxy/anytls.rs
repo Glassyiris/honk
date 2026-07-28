@@ -20,15 +20,16 @@ use async_trait::async_trait;
 use honk_config::node::Node;
 use honk_config::types::NodeProtocol;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, Weak};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 use tokio::time;
 use tracing::{debug, warn};
 
@@ -81,8 +82,22 @@ type BoxedWriter = Box<dyn AsyncWrite + Send + Unpin>;
 pub struct AnyTlsHandler;
 
 /// Global session pool, shared across all AnyTlsHandler instances.
-static SESSION_POOL: LazyLock<Arc<AnyTlsSessionPool>> =
-    LazyLock::new(|| Arc::new(AnyTlsSessionPool::new()));
+/// Process-wide AnyTLS session pool ([`crate::session::SessionPool`] —
+/// hard session cap, least-loaded scheduling, dial single-flight +
+/// backoff; the per-key janitor keeps `min_idle` standby sessions and
+/// reaps idle-expired ones).
+static SESSION_POOL: LazyLock<Arc<crate::session::SessionPool<AnyTlsSession>>> =
+    LazyLock::new(|| {
+        Arc::new(crate::session::SessionPool::new(
+            crate::session::SessionPoolConfig {
+                // Least-loaded scheduling without a stream cap (sing-anytls
+                // parity); the hard session cap still applies.
+                max_streams_per_session: usize::MAX,
+                janitor_interval: Duration::from_secs(DEFAULT_IDLE_CHECK_INTERVAL_SECS),
+                ..Default::default()
+            },
+        ))
+    });
 
 /// Pool key for a node: `host:port` plus a fingerprint of the auth/TLS
 /// configuration. Previously the key was only `host:port`, so two nodes
@@ -106,9 +121,6 @@ fn pool_key(node: &Node) -> String {
         node.skip_cert_verify,
     )
 }
-
-/// Node addresses that already have a running pool janitor.
-static JANITORS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// Monotonic session id for pool bookkeeping (sing `sessionCounter`).
 static SESSION_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -141,20 +153,16 @@ struct AnyTlsSession {
     closed: AtomicBool,
     /// Number of currently open streams.
     active_streams: AtomicUsize,
-    /// When the session last had zero open streams (janitor idle expiry).
-    idle_since: Mutex<Instant>,
     /// Demux task handle, aborted on close.
     demux: Mutex<Option<tokio::task::AbortHandle>>,
-    /// Owning pool (weak — the pool owns the session, not vice versa).
-    pool: Weak<AnyTlsSessionPool>,
 }
 
 impl AnyTlsSession {
     /// Establish a session on a connected transport: write the auth blob
-    /// and the settings frame (sid 0, sing `Session.Run` parity), spawn the
-    /// demux task, and register the session in the pool.
+    /// and the settings frame (sid 0, sing `Session.Run` parity) and spawn
+    /// the demux task. Pool membership is the caller's business (the
+    /// [`SessionPool`] offer/insert paths).
     async fn establish(
-        pool: &Arc<AnyTlsSessionPool>,
         addr: &str,
         transport_read: BoxedReader,
         mut transport_write: BoxedWriter,
@@ -173,9 +181,7 @@ impl AnyTlsSession {
             next_sid: AtomicU32::new(0),
             closed: AtomicBool::new(false),
             active_streams: AtomicUsize::new(0),
-            idle_since: Mutex::new(Instant::now()),
             demux: Mutex::new(None),
-            pool: Arc::downgrade(pool),
         });
 
         let demux_handle = {
@@ -184,7 +190,6 @@ impl AnyTlsSession {
         };
         *session.demux.lock().unwrap() = Some(demux_handle.abort_handle());
 
-        pool.insert(addr, Arc::clone(&session));
         debug!("AnyTLS session {} for {} established", session.seq, addr);
         Ok(session)
     }
@@ -195,17 +200,6 @@ impl AnyTlsSession {
 
     fn active_streams(&self) -> usize {
         self.active_streams.load(Ordering::Relaxed)
-    }
-
-    /// How long the session has had zero open streams.
-    fn idle_for(&self) -> Duration {
-        self.idle_since.lock().unwrap().elapsed()
-    }
-
-    /// Restart the idle clock (janitor refresh within the min_idle budget,
-    /// and the transition to zero open streams).
-    fn touch_idle(&self) {
-        *self.idle_since.lock().unwrap() = Instant::now();
     }
 
     /// Write a single frame through the shared writer.
@@ -270,15 +264,15 @@ impl AnyTlsSession {
         if notify_fin && was_registered && !self.is_closed() {
             let _ = self.write_frame(CMD_FIN, sid, &[]).await;
         }
-        if self.active_streams.fetch_sub(1, Ordering::Relaxed) == 1 {
-            self.touch_idle();
-        }
+        self.active_streams.fetch_sub(1, Ordering::Relaxed);
         debug!("AnyTLS session {} sid={} stream ended", self.seq, sid);
     }
 
     /// Close the session: flag it, drop all stream dispatch channels (their
     /// tasks EOF the client side and exit), stop the demux, shut down the
-    /// write half, and remove the session from the pool. Idempotent.
+    /// write half. Idempotent. Pool pruning happens on the next
+    /// `SessionPool::offer`/janitor pass (closed sessions are retained
+    /// never).
     fn close(&self) {
         if self.closed.swap(true, Ordering::SeqCst) {
             return;
@@ -291,9 +285,6 @@ impl AnyTlsSession {
         tokio::spawn(async move {
             let _ = writer.lock().await.shutdown().await;
         });
-        if let Some(pool) = self.pool.upgrade() {
-            pool.remove(&self.addr, self.seq);
-        }
         debug!("AnyTLS session {} for {} closed", self.seq, self.addr);
     }
 
@@ -453,198 +444,29 @@ async fn stream_task(
     session.end_stream(sid, notify_fin).await;
 }
 
-/// Per-node pool of multiplexed AnyTLS sessions.
-struct AnyTlsSessionPool {
-    sessions: Mutex<HashMap<String, Vec<Arc<AnyTlsSession>>>>,
-}
-
-impl AnyTlsSessionPool {
-    fn new() -> Self {
-        Self {
-            sessions: Mutex::new(HashMap::new()),
-        }
+impl crate::session::ManagedSession for AnyTlsSession {
+    // The inherent methods of the same names do the real work.
+    fn active_streams(&self) -> usize {
+        self.active_streams.load(Ordering::Relaxed)
     }
-
-    fn insert(&self, addr: &str, session: Arc<AnyTlsSession>) {
-        self.sessions
-            .lock()
-            .unwrap()
-            .entry(addr.to_string())
-            .or_default()
-            .push(session);
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
     }
-
-    fn remove(&self, addr: &str, seq: u64) {
-        let mut guard = self.sessions.lock().unwrap();
-        if let Some(list) = guard.get_mut(addr) {
-            list.retain(|s| s.seq != seq);
-            if list.is_empty() {
-                guard.remove(addr);
-            }
-        }
-    }
-
-    /// Pick a live session for `addr` — the one with the fewest open
-    /// streams (spreads load and naturally skips closed-but-unreaped
-    /// sessions). Returns `None` when no healthy session exists.
-    fn acquire_session(&self, addr: &str) -> Option<Arc<AnyTlsSession>> {
-        let guard = self.sessions.lock().unwrap();
-        guard
-            .get(addr)?
-            .iter()
-            .filter(|s| !s.is_closed())
-            .min_by_key(|s| s.active_streams())
-            .cloned()
-    }
-
-    /// Number of live sessions with no open streams (janitor min_idle
-    /// bookkeeping).
-    fn idle_count(&self, addr: &str) -> usize {
-        let guard = self.sessions.lock().unwrap();
-        guard
-            .get(addr)
-            .map(|list| {
-                list.iter()
-                    .filter(|s| !s.is_closed() && s.active_streams() == 0)
-                    .count()
-            })
-            .unwrap_or(0)
-    }
-
-    /// Number of sessions currently tracked for `addr` (tests).
-    #[cfg(test)]
-    fn session_count(&self, addr: &str) -> usize {
-        let guard = self.sessions.lock().unwrap();
-        guard.get(addr).map(|v| v.len()).unwrap_or(0)
-    }
-
-    /// Split `sessions` into (kept, to_close) per the janitor policy
-    /// (sing-anytls `idleCleanupExpTime` parity, iterating newest first):
-    /// closed sessions always go; sessions with no open streams idle for
-    /// longer than `idle_timeout` go too, except the `min_idle` most
-    /// recently used ones, whose idle clock is refreshed instead. Sessions
-    /// with open streams are always kept and do not consume the `min_idle`
-    /// budget (it applies to idle sessions only, as in sing).
-    fn prune_sessions(
-        sessions: &[Arc<AnyTlsSession>],
-        min_idle: usize,
-        idle_timeout: Duration,
-    ) -> (Vec<Arc<AnyTlsSession>>, Vec<Arc<AnyTlsSession>>) {
-        let mut kept = Vec::with_capacity(sessions.len());
-        let mut to_close = Vec::new();
-        let mut idle_kept = 0usize;
-        // Vec order is creation order (oldest first); iterate newest first.
-        for s in sessions.iter().rev() {
-            if s.is_closed() {
-                to_close.push(Arc::clone(s));
-                continue;
-            }
-            let idle = s.active_streams() == 0;
-            let expired = idle && s.idle_for() >= idle_timeout;
-            if !idle {
-                // Serving streams — never reaped by the idle janitor.
-                kept.push(Arc::clone(s));
-            } else if !expired || idle_kept < min_idle {
-                if expired {
-                    // Kept within the min_idle budget: refresh its clock.
-                    s.touch_idle();
-                }
-                idle_kept += 1;
-                kept.push(Arc::clone(s));
-            } else {
-                to_close.push(Arc::clone(s));
-            }
-        }
-        kept.reverse();
-        (kept, to_close)
-    }
-
-    /// Spawn a background janitor task that periodically prunes expired
-    /// sessions and maintains `min_idle` sessions per node.
-    ///
-    /// The returned `JoinHandle` resolves when the janitor exits (only on
-    /// `AnyTlsSessionPool` drop / cancellation).
-    fn spawn_janitor(self: &Arc<Self>, node: Node) -> JoinHandle<()> {
-        let pool = Arc::clone(self);
-        let addr = pool_key(&node);
-        // Default 1 (not sing-box's 0): a single standby session per node
-        // keeps every dial warm after the first — cold dials otherwise pay
-        // TCP connect + TLS handshake (2 RTT) per burst.
-        let min_idle = node.anytls_min_idle_session.unwrap_or(1);
-        let check_interval = Duration::from_secs(
-            node.anytls_idle_session_check_interval
-                .unwrap_or(DEFAULT_IDLE_CHECK_INTERVAL_SECS),
-        );
-        let idle_timeout = Duration::from_secs(
-            node.anytls_idle_session_timeout
-                .unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS),
-        );
-
-        tokio::spawn(async move {
-            let mut interval = time::interval(check_interval);
-            // First tick fires immediately.
-            interval.tick().await;
-
-            loop {
-                interval.tick().await;
-
-                // Prune closed/expired sessions. Closing happens outside
-                // the pool lock: `close()` re-enters it via `pool.remove`.
-                let to_close = {
-                    let mut guard = pool.sessions.lock().unwrap();
-                    match guard.get_mut(&addr) {
-                        Some(list) => {
-                            let (kept, to_close) =
-                                Self::prune_sessions(list, min_idle, idle_timeout);
-                            *list = kept;
-                            to_close
-                        }
-                        None => Vec::new(),
-                    }
-                };
-                for session in to_close {
-                    debug!(
-                        "AnyTLS pool janitor: reaping session {} for {}",
-                        session.seq, addr,
-                    );
-                    session.close();
-                }
-
-                let current = pool.idle_count(&addr);
-                if current < min_idle {
-                    let needed = min_idle - current;
-                    debug!(
-                        "AnyTLS pool janitor: replenishing {} sessions for {}",
-                        needed, addr,
-                    );
-                    for _ in 0..needed {
-                        match pre_establish_session(&node, &addr, Duration::from_secs(10)).await {
-                            Ok(()) => {}
-                            Err(e) => {
-                                warn!(
-                                    "AnyTLS pool janitor: failed to pre-establish session for {}: {}",
-                                    addr, e,
-                                );
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        })
+    fn close(&self) {
+        AnyTlsSession::close(self)
     }
 }
 
-/// Pre-establish a fresh TLS + AnyTLS session and register it in the pool.
-async fn pre_establish_session(
+/// Dial a fresh TLS + AnyTLS session (the `SessionPool::offer` dial
+/// closure and the janitor's prewarm share this).
+async fn dial_session(
     node: &Node,
     addr: &str,
     connect_timeout: Duration,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Arc<AnyTlsSession>> {
     let (read, write, auth, settings) =
         connect_transport(node, addr, connect_timeout, None).await?;
-    AnyTlsSession::establish(&SESSION_POOL, addr, read, write, &auth, &settings).await?;
-    Ok(())
+    AnyTlsSession::establish(addr, read, write, &auth, &settings).await
 }
 
 /// Connect to the AnyTLS server (using `tcp` when the caller provides a
@@ -729,47 +551,54 @@ impl AnyTlsHandler {
         // An explicit `min_idle_session=0` disables standby sessions only,
         // never pruning.
         let addr = pool_key(node);
-        {
-            let mut guard = JANITORS.lock().unwrap();
-            if !guard.insert(addr.clone()) {
-                return; // janitor already running for this address
-            }
-        }
-        debug!(
-            "AnyTLS pool: starting janitor for {} (min_idle={})",
-            addr,
-            node.anytls_min_idle_session.unwrap_or(1)
+        // Default 1 (not sing-box's 0): a single standby session per node
+        // keeps every dial warm after the first — cold dials otherwise pay
+        // TCP connect + TLS handshake (2 RTT) per burst.
+        let min_idle = node.anytls_min_idle_session.unwrap_or(1);
+        let idle_timeout = Duration::from_secs(
+            node.anytls_idle_session_timeout
+                .unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS),
         );
-        SESSION_POOL.spawn_janitor(node.clone());
+        let prewarm_node = node.clone();
+        let prewarm_addr = addr.clone();
+        SESSION_POOL.ensure_janitor(&addr, min_idle, idle_timeout, move || {
+            let node = prewarm_node.clone();
+            let addr = prewarm_addr.clone();
+            async move { dial_session(&node, &addr, Duration::from_secs(10)).await }
+        });
     }
 
-    /// Open a stream to `target_addr`, multiplexing onto a healthy pooled
-    /// session when one exists.
+    /// Open a stream to `target_addr` on a pooled session, dialing one on
+    /// demand (single-flight). One retry on a session that fails mid-open.
     async fn open_pooled_stream(
+        node: &Node,
         addr: &str,
         target_addr: &[u8],
-    ) -> anyhow::Result<Option<tokio::io::DuplexStream>> {
-        let Some(session) = SESSION_POOL.acquire_session(addr) else {
-            return Ok(None);
-        };
-        match session.open_stream(target_addr.to_vec()).await {
-            Ok(stream) => {
-                debug!(
-                    "AnyTLS: multiplexing on session {} for {} ({} open stream(s))",
-                    session.seq,
-                    addr,
-                    session.active_streams(),
-                );
-                Ok(Some(stream))
-            }
-            Err(e) => {
-                debug!(
-                    "AnyTLS: pooled session for {} unusable ({}); dialing fresh",
-                    addr, e
-                );
-                Ok(None)
+        connect_timeout: Duration,
+    ) -> anyhow::Result<tokio::io::DuplexStream> {
+        Self::ensure_janitor(node);
+        let mut last_err: Option<anyhow::Error> = None;
+        for _attempt in 0..2 {
+            let session = SESSION_POOL
+                .offer(addr, || dial_session(node, addr, connect_timeout))
+                .await?;
+            match session.open_stream(target_addr.to_vec()).await {
+                Ok(stream) => {
+                    debug!(
+                        "AnyTLS: multiplexing on session {} for {} ({} open stream(s))",
+                        session.seq,
+                        addr,
+                        session.active_streams(),
+                    );
+                    return Ok(stream);
+                }
+                Err(e) => {
+                    SESSION_POOL.invalidate(addr, &session);
+                    last_err = Some(e);
+                }
             }
         }
+        Err(last_err.expect("open_pooled_stream attempts always record an error"))
     }
 }
 
@@ -1043,28 +872,11 @@ impl ProxyHandler for AnyTlsHandler {
     ) -> anyhow::Result<ProxyStream> {
         let addr = pool_key(node);
         let target_addr = addr::encode_address(target, target_domain);
-
-        if let Some(stream) = Self::open_pooled_stream(&addr, &target_addr).await? {
-            return Ok(ProxyStream {
-                stream: Box::new(stream),
-                target_addr: target,
-                target_domain: target_domain.map(|s| s.to_string()),
-            });
-        }
-
-        // Pool miss – make sure the janitor keeps the pool filled, then
-        // establish a fresh session and open the stream on it.
-        Self::ensure_janitor(node);
-
         debug!(
             "AnyTLS: connecting to {} for target {} (tls={} sni={:?} skip={})",
             addr, target, node.tls, node.sni, node.skip_cert_verify
         );
-        let (read, write, auth, settings) =
-            connect_transport(node, &addr, connect_timeout, None).await?;
-        let session =
-            AnyTlsSession::establish(&SESSION_POOL, &addr, read, write, &auth, &settings).await?;
-        let stream = session.open_stream(target_addr).await?;
+        let stream = Self::open_pooled_stream(node, &addr, &target_addr, connect_timeout).await?;
 
         Ok(ProxyStream {
             stream: Box::new(stream),
@@ -1084,23 +896,11 @@ impl ProxyHandler for AnyTlsHandler {
         let addr = pool_key(node);
         let target_addr = addr::encode_address(target, target_domain);
 
-        // Try the session pool first (ignoring the provided TCP since we
-        // have a faster path via a pre-established session).
-        if let Some(stream) = Self::open_pooled_stream(&addr, &target_addr).await? {
-            drop(tcp);
-            return Ok(ProxyStream {
-                stream: Box::new(stream),
-                target_addr: target,
-                target_domain: target_domain.map(|s| s.to_string()),
-            });
-        }
-
         Self::ensure_janitor(node);
-
         let (read, write, auth, settings) =
             connect_transport(node, &addr, _connect_timeout, Some(tcp)).await?;
-        let session =
-            AnyTlsSession::establish(&SESSION_POOL, &addr, read, write, &auth, &settings).await?;
+        let session = AnyTlsSession::establish(&addr, read, write, &auth, &settings).await?;
+        SESSION_POOL.insert(&addr, &session);
         let stream = session.open_stream(target_addr).await?;
 
         Ok(ProxyStream {
@@ -1130,17 +930,7 @@ impl ProxyHandler for AnyTlsHandler {
         let addr = pool_key(node);
         // The stream target is the UoT magic address (SOCKS5 address form).
         let magic = addr::encode_address("0.0.0.0:0".parse().unwrap(), Some(UOT_MAGIC));
-        let mut stream = if let Some(s) = Self::open_pooled_stream(&addr, &magic).await? {
-            s
-        } else {
-            Self::ensure_janitor(node);
-            let (read, write, auth, settings) =
-                connect_transport(node, &addr, connect_timeout, None).await?;
-            let session =
-                AnyTlsSession::establish(&SESSION_POOL, &addr, read, write, &auth, &settings)
-                    .await?;
-            session.open_stream(magic).await?
-        };
+        let mut stream = Self::open_pooled_stream(node, &addr, &magic, connect_timeout).await?;
 
         // UoT request: isConnect=true + destination in SOCKS5 address form.
         // sing's uot.ReadRequest parses the destination with
@@ -1190,17 +980,7 @@ impl ProxyHandler for AnyTlsHandler {
 
         let addr = pool_key(node);
         let magic = addr::encode_address("0.0.0.0:0".parse().unwrap(), Some(UOT_MAGIC));
-        let mut stream = if let Some(s) = Self::open_pooled_stream(&addr, &magic).await? {
-            s
-        } else {
-            Self::ensure_janitor(node);
-            let (read, write, auth, settings) =
-                connect_transport(node, &addr, connect_timeout, None).await?;
-            let session =
-                AnyTlsSession::establish(&SESSION_POOL, &addr, read, write, &auth, &settings)
-                    .await?;
-            session.open_stream(magic).await?
-        };
+        let mut stream = Self::open_pooled_stream(node, &addr, &magic, connect_timeout).await?;
 
         // UoT request: isConnect=true + destination in SOCKS5 address form.
         let mut request = vec![1u8];
@@ -1390,14 +1170,10 @@ mod tests {
 
     /// Establish a session over an in-memory duplex; returns the session
     /// and the server end of the transport.
-    async fn establish_test_session(
-        pool: &Arc<AnyTlsSessionPool>,
-        addr: &str,
-    ) -> (Arc<AnyTlsSession>, tokio::io::DuplexStream) {
+    async fn establish_test_session(addr: &str) -> (Arc<AnyTlsSession>, tokio::io::DuplexStream) {
         let (client_end, server_end) = tokio::io::duplex(1 << 20);
         let (read, write) = tokio::io::split(client_end);
         let session = AnyTlsSession::establish(
-            pool,
             addr,
             Box::new(read),
             Box::new(write),
@@ -1458,26 +1234,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_pool_acquire_empty() {
-        let pool = AnyTlsSessionPool::new();
-        assert!(pool.acquire_session("127.0.0.1:9999").is_none());
-    }
-
-    #[tokio::test]
-    async fn test_establish_registers_and_acquires() {
-        let pool = Arc::new(AnyTlsSessionPool::new());
+    async fn test_pool_offer_reuses_and_invalidates() {
+        let pool = crate::session::SessionPool::new(crate::session::SessionPoolConfig::default());
         let addr = "127.0.0.1:1234";
-        let (session, mut server) = establish_test_session(&pool, addr).await;
+        let (session, mut server) = establish_test_session(addr).await;
         expect_handshake(&mut server).await;
+        pool.insert(addr, &session);
 
-        assert_eq!(pool.session_count(addr), 1);
-        let acquired = pool.acquire_session(addr).expect("session is live");
-        assert_eq!(acquired.seq, session.seq);
+        // A live pooled session is offered without dialing.
+        let offered = pool
+            .offer(addr, || async { anyhow::bail!("must not dial") })
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&session, &offered));
 
-        // Closing the session evicts it from the pool.
-        session.close();
-        assert!(pool.acquire_session(addr).is_none());
-        assert_eq!(pool.session_count(addr), 0);
+        // Invalidation closes it; the next offer dials (fails here).
+        pool.invalidate(addr, &session);
+        assert!(session.is_closed());
+        assert!(
+            pool.offer(addr, || async { anyhow::bail!("no server") })
+                .await
+                .is_err()
+        );
     }
 
     /// Write `payload` on `stream` and assert it echoes back intact.
@@ -1495,9 +1273,8 @@ mod tests {
     /// parallel (sing-anytls semantics).
     #[tokio::test]
     async fn test_concurrent_streams_on_one_session() {
-        let pool = Arc::new(AnyTlsSessionPool::new());
         let addr = "127.0.0.1:443";
-        let (session, mut server) = establish_test_session(&pool, addr).await;
+        let (session, mut server) = establish_test_session(addr).await;
         expect_handshake(&mut server).await;
         let mut addr_rx = spawn_echo_server(server);
 
@@ -1545,7 +1322,6 @@ mod tests {
         .await
         .expect("streams drain");
         assert!(!session.is_closed());
-        assert_eq!(pool.idle_count(addr), 1);
 
         // The same session serves another stream afterwards.
         let mut s4 = session.open_stream(target(4)).await.unwrap();
@@ -1562,9 +1338,8 @@ mod tests {
     /// session itself are unaffected.
     #[tokio::test]
     async fn test_server_fin_closes_only_that_stream() {
-        let pool = Arc::new(AnyTlsSessionPool::new());
         let addr = "127.0.0.1:1443";
-        let (session, mut server) = establish_test_session(&pool, addr).await;
+        let (session, mut server) = establish_test_session(addr).await;
         expect_handshake(&mut server).await;
 
         let target = vec![0x01, 127, 0, 0, 1, 0x00, 0x50];
@@ -1603,55 +1378,6 @@ mod tests {
 
         assert!(!session.is_closed());
         assert_eq!(session.active_streams(), 1);
-    }
-
-    /// Janitor pruning: closed sessions go, idle-expired sessions go beyond
-    /// the min_idle newest, active sessions are always kept.
-    #[tokio::test]
-    async fn test_prune_sessions_policy() {
-        let pool = Arc::new(AnyTlsSessionPool::new());
-        let addr = "127.0.0.1:2443";
-
-        // Three idle sessions (creation order: s1 oldest … s3 newest),
-        // one with an open stream, one already closed.
-        let mut sessions = Vec::new();
-        for _ in 0..3 {
-            let (s, _server) = establish_test_session(&pool, addr).await;
-            sessions.push(s);
-        }
-        let (active, _server) = establish_test_session(&pool, addr).await;
-        // Give the "active" session a real open stream (SYN+PSH just lands
-        // in the in-memory transport buffer — no server needed).
-        let _open = active
-            .open_stream(vec![0x01, 127, 0, 0, 1, 0x00, 0x50])
-            .await
-            .unwrap();
-        let (closed, server) = establish_test_session(&pool, addr).await;
-        drop(server);
-        closed.close();
-        sessions.push(Arc::clone(&active));
-        sessions.push(closed.clone());
-
-        // idle_timeout = 0 → every idle session is expired. min_idle = 1.
-        let (kept, to_close) =
-            AnyTlsSessionPool::prune_sessions(&sessions, 1, Duration::from_secs(0));
-
-        // Kept: the active session plus the single newest idle one.
-        assert_eq!(kept.len(), 2);
-        assert!(kept.iter().any(|s| s.seq == active.seq));
-        assert!(!kept.iter().any(|s| s.seq == closed.seq));
-        // Closed + two older idle sessions reaped.
-        assert_eq!(to_close.len(), 3);
-        assert!(to_close.iter().any(|s| s.seq == closed.seq));
-        // The min_idle-kept session had its idle clock refreshed.
-        let kept_idle = kept.iter().find(|s| s.seq != active.seq).unwrap();
-        assert!(kept_idle.idle_for() < Duration::from_secs(5));
-
-        // With min_idle = 0 everything idle is reaped; the active one stays.
-        let (kept, to_close) =
-            AnyTlsSessionPool::prune_sessions(&sessions, 0, Duration::from_secs(0));
-        assert_eq!(kept.len(), 1);
-        assert_eq!(to_close.len(), 4);
     }
 }
 
