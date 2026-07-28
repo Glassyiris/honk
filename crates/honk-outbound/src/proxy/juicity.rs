@@ -672,10 +672,11 @@ mod tests {
         assert_eq!(transport.relay_addr(), target);
         transport.send_packet(b"dns-query").await.unwrap();
         let mut buf = [0u8; 256];
-        let (n, src) = tokio::time::timeout(Duration::from_secs(5), transport.recv_packet(&mut buf))
-            .await
-            .expect("reply timed out")
-            .unwrap();
+        let (n, src) =
+            tokio::time::timeout(Duration::from_secs(5), transport.recv_packet(&mut buf))
+                .await
+                .expect("reply timed out")
+                .unwrap();
         assert_eq!(src, target);
         assert_eq!(&buf[..n], b"dns-query");
 

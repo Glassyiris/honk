@@ -935,7 +935,10 @@ impl PacketTransport for Hy2UdpTransport {
             ));
         }
         self.state.touch();
-        let packet_id = self.packet_id.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        let packet_id = self
+            .packet_id
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
         let packets = fragment_udp_message(
             self.session_id,
             packet_id,
@@ -956,13 +959,16 @@ impl PacketTransport for Hy2UdpTransport {
     async fn recv_packet(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         loop {
             let msg = self.rx.lock().await.recv().await.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::ConnectionAborted, "hysteria2 connection closed")
+                io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "hysteria2 connection closed",
+                )
             })?;
-            let complete = self
-                .defrag
-                .lock()
-                .await
-                .feed(msg.packet_id, msg.frag_id, msg.frag_total, msg.data);
+            let complete =
+                self.defrag
+                    .lock()
+                    .await
+                    .feed(msg.packet_id, msg.frag_id, msg.frag_total, msg.data);
             if let Some(data) = complete {
                 if data.len() > buf.len() {
                     return Err(io::Error::new(

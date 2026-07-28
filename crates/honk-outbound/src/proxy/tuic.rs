@@ -743,7 +743,10 @@ impl PacketTransport for TuicUdpTransport {
     }
 
     async fn send_packet(&self, data: &[u8]) -> io::Result<()> {
-        let packet_id = self.packet_id.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        let packet_id = self
+            .packet_id
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
         TuicHandler::send_udp(
             &self.state,
             self.session_id,
@@ -760,11 +763,11 @@ impl PacketTransport for TuicUdpTransport {
             let msg = self.rx.lock().await.recv().await.ok_or_else(|| {
                 io::Error::new(io::ErrorKind::ConnectionAborted, "TUIC connection closed")
             })?;
-            let complete = self
-                .defrag
-                .lock()
-                .await
-                .feed(msg.packet_id, msg.frag_id, msg.frag_total, msg.data);
+            let complete =
+                self.defrag
+                    .lock()
+                    .await
+                    .feed(msg.packet_id, msg.frag_id, msg.frag_total, msg.data);
             if let Some(data) = complete {
                 if data.len() > buf.len() {
                     return Err(io::Error::new(
@@ -1070,10 +1073,11 @@ mod tests {
         assert_eq!(transport.relay_addr(), target);
         transport.send_packet(b"dns-query").await.unwrap();
         let mut buf = [0u8; 256];
-        let (n, src) = tokio::time::timeout(Duration::from_secs(5), transport.recv_packet(&mut buf))
-            .await
-            .expect("reply timed out")
-            .unwrap();
+        let (n, src) =
+            tokio::time::timeout(Duration::from_secs(5), transport.recv_packet(&mut buf))
+                .await
+                .expect("reply timed out")
+                .unwrap();
         assert_eq!(src, target);
         assert_eq!(&buf[..n], b"dns-query");
     }
@@ -1092,10 +1096,11 @@ mod tests {
             .expect("dial_udp_transport should succeed");
         transport.send_packet(b"stream-query").await.unwrap();
         let mut buf = [0u8; 256];
-        let (n, src) = tokio::time::timeout(Duration::from_secs(5), transport.recv_packet(&mut buf))
-            .await
-            .expect("reply timed out")
-            .unwrap();
+        let (n, src) =
+            tokio::time::timeout(Duration::from_secs(5), transport.recv_packet(&mut buf))
+                .await
+                .expect("reply timed out")
+                .unwrap();
         assert_eq!(src, target);
         assert_eq!(&buf[..n], b"stream-query");
     }
