@@ -39,7 +39,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
@@ -100,8 +100,9 @@ impl TrojanGoHandler {
         }
 
         let stream = Self::connect_server(node, connect_timeout).await?;
-        let mux = Arc::new(MuxConnection::new(host_key.clone(), stream));
-        mux.spawn_demux_task();
+        let (mux, read_half) = MuxConnection::new(host_key.clone(), stream);
+        let mux = Arc::new(mux);
+        mux.spawn_demux_task(read_half);
         {
             let mut pool = self.pool.lock().unwrap();
             pool.insert(host_key, Arc::clone(&mux));
@@ -111,11 +112,16 @@ impl TrojanGoHandler {
 }
 
 /// A single multiplexed connection to a Trojan-Go server.
+///
+/// The connection is split at setup: the demux task owns the read half
+/// (no lock), writers share the write half under a mutex. Previously one
+/// mutex covered both, so the demux task held it across `read().await`
+/// and every writer starved until data arrived (P0 audit, trojan_go.rs).
 struct MuxConnection {
     #[allow(dead_code)]
     host_key: String,
-    conn: Arc<tokio::sync::Mutex<Box<dyn AsyncReadWrite>>>,
-    readers: Arc<Mutex<HashMap<u16, mpsc::UnboundedSender<Vec<u8>>>>>,
+    writer: Arc<tokio::sync::Mutex<WriteHalf<Box<dyn AsyncReadWrite>>>>,
+    readers: Arc<Mutex<HashMap<u16, mpsc::Sender<Vec<u8>>>>>,
     next_id: AtomicU16,
     closed: AtomicBool,
 }
@@ -131,14 +137,21 @@ impl std::fmt::Debug for MuxConnection {
 }
 
 impl MuxConnection {
-    fn new(host_key: String, conn: Box<dyn AsyncReadWrite>) -> Self {
-        Self {
-            host_key,
-            conn: Arc::new(tokio::sync::Mutex::new(conn)),
-            readers: Arc::new(Mutex::new(HashMap::new())),
-            next_id: AtomicU16::new(0),
-            closed: AtomicBool::new(false),
-        }
+    fn new(
+        host_key: String,
+        conn: Box<dyn AsyncReadWrite>,
+    ) -> (Self, ReadHalf<Box<dyn AsyncReadWrite>>) {
+        let (read_half, write_half) = tokio::io::split(conn);
+        (
+            Self {
+                host_key,
+                writer: Arc::new(tokio::sync::Mutex::new(write_half)),
+                readers: Arc::new(Mutex::new(HashMap::new())),
+                next_id: AtomicU16::new(0),
+                closed: AtomicBool::new(false),
+            },
+            read_half,
+        )
     }
 
     fn is_closed(&self) -> bool {
@@ -157,8 +170,7 @@ impl MuxConnection {
     /// Spawn a background task that reads from the TCP connection,
     /// demuxes frames by stream_id, and routes payloads to the
     /// appropriate per-stream channel.
-    fn spawn_demux_task(self: &Arc<Self>) {
-        let conn = Arc::clone(&self.conn);
+    fn spawn_demux_task(self: &Arc<Self>, mut read_half: ReadHalf<Box<dyn AsyncReadWrite>>) {
         let readers = Arc::clone(&self.readers);
         let this = Arc::clone(self);
 
@@ -168,8 +180,7 @@ impl MuxConnection {
             let mut buf = vec![0u8; 65536];
             let mut carry = Vec::new();
             loop {
-                let mut conn_guard = conn.lock().await;
-                let n = match conn_guard.read(&mut buf).await {
+                let n = match read_half.read(&mut buf).await {
                     Ok(0) => {
                         this.closed.store(true, Ordering::Release);
                         break;
@@ -182,7 +193,6 @@ impl MuxConnection {
                     }
                 };
                 let read_data = &buf[..n];
-                drop(conn_guard);
 
                 let mut data = carry;
                 data.extend_from_slice(read_data);
@@ -202,9 +212,11 @@ impl MuxConnection {
                     let payload = data[offset..offset + len].to_vec();
                     offset += len;
 
-                    let readers = readers.lock().unwrap();
-                    if let Some(tx) = readers.get(&stream_id) {
-                        let _ = tx.send(payload);
+                    let tx = readers.lock().unwrap().get(&stream_id).cloned();
+                    if let Some(tx) = tx {
+                        // Bounded per-stream queue with backpressure (TCP
+                        // data must not be dropped).
+                        let _ = tx.send(payload).await;
                     }
                 }
             }
@@ -231,9 +243,11 @@ impl ProxyHandler for TrojanGoHandler {
 
         let header = build_mux_header(password, stream_id, target, target_domain);
 
-        let (read_tx, read_rx) = mpsc::unbounded_channel();
-
-        let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        // Inbound (demux → stream): bounded frames with demux backpressure.
+        let (read_tx, read_rx) = mpsc::channel(64);
+        // Outbound (stream → conn): a bounded duplex (64 KiB) so a slow
+        // connection backpressures the writer instead of growing a queue.
+        let (client_write, mut stream_read) = tokio::io::duplex(64 * 1024);
 
         {
             let mut readers = mux.readers.lock().unwrap();
@@ -241,27 +255,34 @@ impl ProxyHandler for TrojanGoHandler {
         }
 
         {
-            let mut conn = mux.conn.lock().await;
-            conn.write_all(&header).await?;
+            let mut w = mux.writer.lock().await;
+            w.write_all(&header).await?;
         }
 
-        let conn = Arc::clone(&mux.conn);
+        let writer = Arc::clone(&mux.writer);
         let sid = stream_id;
         tokio::spawn(async move {
-            while let Some(payload) = write_rx.recv().await {
-                let mut frame = Vec::with_capacity(4 + payload.len());
-                frame.extend_from_slice(&sid.to_be_bytes());
-                frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-                frame.extend_from_slice(&payload);
-                let mut conn = conn.lock().await;
-                if conn.write_all(&frame).await.is_err() {
-                    break;
+            let mut buf = vec![0u8; 65536];
+            loop {
+                match stream_read.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let mut frame = Vec::with_capacity(4 + n);
+                        frame.extend_from_slice(&sid.to_be_bytes());
+                        frame.extend_from_slice(&(n as u16).to_be_bytes());
+                        frame.extend_from_slice(&buf[..n]);
+                        let mut w = writer.lock().await;
+                        if w.write_all(&frame).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
                 }
             }
         });
 
         let proxy_stream =
-            MuxProxyStream::new(stream_id, read_rx, write_tx, Arc::clone(&mux.readers));
+            MuxProxyStream::new(stream_id, read_rx, client_write, Arc::clone(&mux.readers));
 
         Ok(ProxyStream {
             stream: Box::new(proxy_stream),
@@ -308,11 +329,11 @@ fn build_mux_header(
 
 struct MuxProxyStream {
     stream_id: u16,
-    read_rx: Mutex<mpsc::UnboundedReceiver<Vec<u8>>>,
-    write_tx: mpsc::UnboundedSender<Vec<u8>>,
+    read_rx: Mutex<mpsc::Receiver<Vec<u8>>>,
+    write_half: tokio::io::DuplexStream,
     read_buf: Vec<u8>,
     read_pos: usize,
-    readers: Arc<Mutex<HashMap<u16, mpsc::UnboundedSender<Vec<u8>>>>>,
+    readers: Arc<Mutex<HashMap<u16, mpsc::Sender<Vec<u8>>>>>,
 }
 
 impl std::fmt::Debug for MuxProxyStream {
@@ -328,14 +349,14 @@ impl std::fmt::Debug for MuxProxyStream {
 impl MuxProxyStream {
     fn new(
         stream_id: u16,
-        read_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-        write_tx: mpsc::UnboundedSender<Vec<u8>>,
-        readers: Arc<Mutex<HashMap<u16, mpsc::UnboundedSender<Vec<u8>>>>>,
+        read_rx: mpsc::Receiver<Vec<u8>>,
+        write_half: tokio::io::DuplexStream,
+        readers: Arc<Mutex<HashMap<u16, mpsc::Sender<Vec<u8>>>>>,
     ) -> Self {
         Self {
             stream_id,
             read_rx: Mutex::new(read_rx),
-            write_tx,
+            write_half,
             read_buf: Vec::new(),
             read_pos: 0,
             readers,
@@ -391,24 +412,20 @@ impl AsyncRead for MuxProxyStream {
 impl AsyncWrite for MuxProxyStream {
     fn poll_write(
         self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        match self.write_tx.send(buf.to_vec()) {
-            Ok(()) => Poll::Ready(Ok(buf.len())),
-            Err(_) => Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "mux write channel closed",
-            ))),
-        }
+        // Bounded duplex: a full buffer backpressures here (Pending) until
+        // the forward task drains it into the connection.
+        Pin::new(&mut self.get_mut().write_half).poll_write(cx, buf)
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().write_half).poll_flush(cx)
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().write_half).poll_shutdown(cx)
     }
 }
 
@@ -473,7 +490,8 @@ mod tests {
 
     #[test]
     fn test_stream_id_alloc_skips_zero() {
-        let conn = MuxConnection::new("test:443".into(), Box::new(tokio::io::duplex(1024).0));
+        let (conn, _rd) =
+            MuxConnection::new("test:443".into(), Box::new(tokio::io::duplex(1024).0));
         let id = conn.alloc_stream_id();
         assert_ne!(id, 0);
         let id2 = conn.alloc_stream_id();
