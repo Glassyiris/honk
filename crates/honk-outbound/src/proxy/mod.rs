@@ -131,6 +131,52 @@ pub struct UdpProxySocket {
     pub _control: Option<tokio::net::TcpStream>,
 }
 
+/// Framed UDP packet transport — the long-term replacement for per-flow
+/// loopback bridges. Native UDP protocols wrap a real `UdpSocket`; tunnel
+/// protocols implement their framing directly on the tunnel instead of
+/// bouncing datagrams through a loopback socket pair (extra FD + bridge
+/// task + 1–2 copies per packet).
+#[async_trait]
+pub trait PacketTransport: Send + Sync + Debug {
+    /// The relay target a flow reports as its destination.
+    fn relay_addr(&self) -> SocketAddr;
+    async fn send_packet(&self, data: &[u8]) -> std::io::Result<()>;
+    async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)>;
+}
+
+/// Adapter presenting any `UdpSocket` — a direct target, a socks5
+/// server-assigned relay, or a legacy loopback bridge — as a
+/// [`PacketTransport`]. Lets tunnel protocols migrate to framed transports
+/// incrementally instead of one flag-day rewrite.
+#[derive(Debug)]
+pub struct UdpSocketTransport {
+    socket: Arc<tokio::net::UdpSocket>,
+    relay_addr: SocketAddr,
+}
+
+impl UdpSocketTransport {
+    pub fn new(socket: Arc<tokio::net::UdpSocket>, relay_addr: SocketAddr) -> Self {
+        Self {
+            socket,
+            relay_addr,
+        }
+    }
+}
+
+#[async_trait]
+impl PacketTransport for UdpSocketTransport {
+    fn relay_addr(&self) -> SocketAddr {
+        self.relay_addr
+    }
+    async fn send_packet(&self, data: &[u8]) -> std::io::Result<()> {
+        self.socket.send_to(data, self.relay_addr).await?;
+        Ok(())
+    }
+    async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        self.socket.recv_from(buf).await
+    }
+}
+
 #[async_trait]
 pub trait ProxyHandler: Send + Sync {
     fn protocol(&self) -> NodeProtocol;
