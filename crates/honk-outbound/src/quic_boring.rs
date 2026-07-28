@@ -594,12 +594,18 @@ impl crypto::ClientConfig for BoringQuicClientConfig {
         // handshake; the server may additionally accept 0-RTT early data).
         // pinSHA256 nodes never resume: PSK skips certificate verification,
         // so a ticket cached under a non-pin config would bypass the pin.
+        // The key is recorded so a rejected ticket can be evicted — a stale
+        // ticket (server restart, different server behind the same SNI, or
+        // a session minted under a pre-reload SSL_CTX) must not poison every
+        // subsequent dial until process restart.
+        let mut resume_key = None;
         if !self.has_pin
             && let Some(&session) = SESSION_TICKETS.lock().get(server_name)
         {
             unsafe {
                 boring_sys::SSL_set_session(ssl.as_ptr(), session as *mut boring_sys::SSL_SESSION)
             };
+            resume_key = Some(server_name.to_string());
         }
         ssl.set_alpn_protos(&self.alpn_wire)
             .expect("invalid ALPN wire format");
@@ -654,6 +660,7 @@ impl crypto::ClientConfig for BoringQuicClientConfig {
             got_handshake_data: false,
             driven: false,
             cur_1rtt: None,
+            resume_key,
         }))
     }
 }
@@ -683,6 +690,9 @@ struct BoringQuicSession {
     driven: bool,
     /// Current 1-RTT (read, write) secrets for key updates.
     cur_1rtt: Option<(TrafficSecrets, TrafficSecrets)>,
+    /// Hostname whose cached ticket was offered on this handshake; evicted
+    /// from the cache if the handshake fails.
+    resume_key: Option<String>,
 }
 
 impl BoringQuicSession {
@@ -701,6 +711,16 @@ impl BoringQuicSession {
             return Ok(());
         }
         let reason = ErrorStack::get().to_string();
+        // The cached ticket was rejected (server restart, a different server
+        // behind the same SNI, or a session minted under a pre-reload
+        // SSL_CTX). Evict it so the next dial starts a full handshake
+        // instead of failing on the same ticket forever.
+        if let Some(key) = self.resume_key.take() {
+            let old = SESSION_TICKETS.lock().remove(&key);
+            if let Some(old) = old {
+                unsafe { boring_sys::SSL_SESSION_free(old as *mut boring_sys::SSL_SESSION) };
+            }
+        }
         Err(self.fatal_error(&reason))
     }
 
@@ -1017,6 +1037,57 @@ mod tests {
         send.finish().unwrap();
         let echoed = recv.read_to_end(usize::MAX).await.unwrap();
         assert_eq!(echoed, b"ping");
+    }
+
+    /// A ticket cached under a rebuilt client config (post-reload SSL_CTX)
+    /// or rejected by the server must be evicted on handshake failure —
+    /// never poison every later dial until process restart. Production
+    /// regression: after a SIGHUP reload pointed a node at a different
+    /// server with the same SNI, every dial failed on the stale ticket.
+    #[tokio::test]
+    async fn rejected_ticket_is_evicted() {
+        let addr = spawn_echo_server(&[b"h3"]);
+        let node = skip_verify_node();
+        // Prime the cache under the first client config (SSL_CTX #1).
+        let cfg1 = crate::quic::client_config(&node, &[b"h3"], Default::default())
+            .await
+            .unwrap();
+        let mut endpoint = crate::quic::client_endpoint(false).unwrap();
+        endpoint.set_default_client_config(cfg1);
+        let conn = endpoint.connect(addr, "evict.test").unwrap().await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"ping").await.unwrap();
+        send.finish().unwrap();
+        let _ = recv.read_to_end(16).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        conn.close(0u32.into(), b"done");
+        assert!(SESSION_TICKETS.lock().contains_key("evict.test"));
+
+        // Rebuild the client config (SSL_CTX #2, as a reload would) and dial
+        // twice: whatever happens with the cross-context ticket on the first
+        // dial, the second must succeed — the cache can never stay poisoned.
+        let cfg2 = crate::quic::client_config(&node, &[b"h3"], Default::default())
+            .await
+            .unwrap();
+        for attempt in 0..2 {
+            let mut endpoint = crate::quic::client_endpoint(false).unwrap();
+            endpoint.set_default_client_config(cfg2.clone());
+            match endpoint.connect(addr, "evict.test").unwrap().await {
+                Ok(conn) => {
+                    conn.close(0u32.into(), b"done");
+                    if attempt == 1 {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    assert_eq!(attempt, 0, "second dial must succeed, got: {e}");
+                    assert!(
+                        !SESSION_TICKETS.lock().contains_key("evict.test"),
+                        "rejected ticket must be evicted after the failed dial"
+                    );
+                }
+            }
+        }
     }
 
     /// TLS 1.3 session resumption: a second connection to the same server
