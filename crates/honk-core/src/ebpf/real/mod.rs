@@ -624,6 +624,26 @@ impl EbpfBackend for RealEbpfBackend {
         self.map_snapshot("CONN_STATE_MAP", out)
     }
 
+    fn conn_state_for_each_chunk(
+        &self,
+        chunk_size: usize,
+        visit: &mut crate::ebpf::ConnStateChunkVisitor<'_>,
+    ) -> anyhow::Result<()> {
+        let bpf = self.bpf()?;
+        // Stream chunks straight from the kernel when LOOKUP_BATCH is
+        // available; otherwise fall back to the snapshot-based default.
+        if syscall::bpf_lookup_batch_scan_cb(bpf, &self.cap_lookup_batch, "CONN_STATE_MAP", visit)?
+        {
+            return Ok(());
+        }
+        let mut entries = Vec::new();
+        self.map_snapshot("CONN_STATE_MAP", &mut entries)?;
+        for chunk in entries.chunks(chunk_size.max(1)) {
+            visit(chunk);
+        }
+        Ok(())
+    }
+
     fn conn_state_remove_batch(&mut self, keys: &[TuplesKey]) -> anyhow::Result<()> {
         self.map_delete_batch("CONN_STATE_MAP", keys)
     }

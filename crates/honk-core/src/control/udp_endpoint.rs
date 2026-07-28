@@ -454,14 +454,16 @@ impl UdpEndpointPool {
         }
     }
 
-    /// Remove every endpoint dialing through `node_name` — called when the
-    /// node flips alive→dead so its UDP flows stop immediately instead of
-    /// lingering until the NAT/reply idle timeouts reap them.
+    /// Remove every *unproven* endpoint dialing through `node_name` — called
+    /// when the node flips alive→dead. Mirrors dae's `checkUdpEndpointHealth`:
+    /// only endpoints that have never forwarded a packet are reaped
+    /// immediately; established flows (has_sent) are left to the NAT/reply
+    /// timeouts so a transient probe failure can't kill an active session.
     pub fn remove_by_node(&self, node_name: &str) {
         let keys: Vec<(SocketAddr, SocketAddr)> = self
             .endpoints
             .iter()
-            .filter(|ep| ep.node_name == node_name)
+            .filter(|ep| ep.node_name == node_name && !ep.has_sent.load(Ordering::Relaxed))
             .map(|ep| {
                 let key = ep.key();
                 (

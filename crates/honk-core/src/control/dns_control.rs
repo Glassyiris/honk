@@ -25,8 +25,12 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{RwLock, Semaphore, broadcast};
 use tracing::debug;
 
-/// Max concurrent DNS queries before SERVFAIL degradation.
-const DEFAULT_MAX_CONCURRENT_QUERIES: usize = 256;
+/// Max concurrent in-flight DNS queries. Sized like dae's (16384 @ ~4KB
+/// each) but conservative: 2048 ≈ 8MB of in-flight state, comfortably
+/// covering thousands of QPS before degradation. Over the limit the answer
+/// is REFUSED, not SERVFAIL — SERVFAIL invites client retry storms, REFUSED
+/// says "busy, back off".
+const DEFAULT_MAX_CONCURRENT_QUERIES: usize = 2048;
 
 /// Interval for periodic DNS cache route refresh.
 const ROUTE_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
@@ -222,8 +226,8 @@ impl DnsController {
         let _permit = match self.concurrency_limit.try_acquire() {
             Ok(permit) => permit,
             Err(_) => {
-                debug!("DNS concurrency limit reached; sending SERVFAIL");
-                let servfail = build_dns_servfail(data);
+                debug!("DNS concurrency limit reached; sending REFUSED");
+                let servfail = build_dns_refused(data);
                 let _ =
                     super::send_udp_reply_from_orig_dst(&servfail, client_addr, original_dst).await;
                 return Ok(true);
@@ -282,7 +286,7 @@ impl DnsController {
             self.resolve_with_singleflight(&dns_data, Some(original_dst))
                 .await
         } else {
-            build_dns_servfail(&dns_data)
+            build_dns_refused(&dns_data)
         };
         write_tcp_dns_response(stream, &response).await?;
 
@@ -311,7 +315,7 @@ impl DnsController {
                     self.resolve_with_singleflight(&dns_data, Some(original_dst))
                         .await
                 }
-                Err(_) => build_dns_servfail(&dns_data),
+                Err(_) => build_dns_refused(&dns_data),
             };
             write_tcp_dns_response(stream, &resp).await?;
         }
@@ -602,6 +606,12 @@ fn is_dns_query(data: &[u8]) -> bool {
 
 fn build_dns_servfail(query: &[u8]) -> Vec<u8> {
     build_dns_error_response(query, 2)
+}
+
+/// REFUSED (rcode 5) for concurrency-limit degradation: tells the client to
+/// back off instead of retrying into the storm (unlike SERVFAIL).
+fn build_dns_refused(query: &[u8]) -> Vec<u8> {
+    build_dns_error_response(query, 5)
 }
 
 /// Minimal error response: the query with QR/RA set and the given rcode.

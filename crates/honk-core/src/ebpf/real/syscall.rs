@@ -287,6 +287,73 @@ pub fn bpf_lookup_batch_scan<K: Copy, V: Copy>(
     }
 }
 
+/// Streaming variant of [`bpf_lookup_batch_scan`]: invokes `visit` once per
+/// chunk instead of accumulating the whole map, so memory stays bounded by
+/// `BPF_BATCH_CHUNK` regardless of map size. Same fallback contract —
+/// `Ok(false)` when the kernel lacks `BPF_MAP_LOOKUP_BATCH`.
+pub fn bpf_lookup_batch_scan_cb<K: Copy, V: Copy>(
+    bpf: &Ebpf,
+    cap: &BatchCapability,
+    map: &str,
+    visit: &mut dyn FnMut(&[(K, V)]),
+) -> anyhow::Result<bool> {
+    if cap.is_unsupported() {
+        return Ok(false);
+    }
+    let fd = map_fd(bpf, map)?;
+    let ksz = core::mem::size_of::<K>();
+    let vsz = core::mem::size_of::<V>();
+    let mut keys_buf = vec![0u8; BPF_BATCH_CHUNK * ksz];
+    let mut vals_buf = vec![0u8; BPF_BATCH_CHUNK * vsz];
+    let mut next_key = vec![0u8; ksz];
+    let mut in_batch: Option<Vec<u8>> = None;
+    let mut chunk: Vec<(K, V)> = Vec::with_capacity(BPF_BATCH_CHUNK);
+    loop {
+        let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
+        attr.batch.map_fd = fd as u32;
+        attr.batch.in_batch = in_batch.as_ref().map_or(0, |b| b.as_ptr() as u64);
+        attr.batch.out_batch = next_key.as_mut_ptr() as u64;
+        attr.batch.keys = keys_buf.as_mut_ptr() as u64;
+        attr.batch.values = vals_buf.as_mut_ptr() as u64;
+        attr.batch.count = BPF_BATCH_CHUNK as u32;
+        let res = unsafe { bpf_syscall(BPF_MAP_LOOKUP_BATCH as c_long, &mut attr) };
+        if !cap.observe(res) {
+            debug!(
+                "bpf lookup_batch({}) unsupported, using GET_NEXT_KEY walk",
+                map
+            );
+            return Ok(false);
+        }
+        match res {
+            Ok(()) => {
+                let n = unsafe { attr.batch.count } as usize;
+                chunk.clear();
+                for i in 0..n {
+                    let k = unsafe {
+                        core::ptr::read_unaligned(keys_buf[i * ksz..].as_ptr() as *const K)
+                    };
+                    let v = unsafe {
+                        core::ptr::read_unaligned(vals_buf[i * vsz..].as_ptr() as *const V)
+                    };
+                    chunk.push((k, v));
+                }
+                if !chunk.is_empty() {
+                    visit(&chunk);
+                }
+                if n == BPF_BATCH_CHUNK {
+                    in_batch = Some(next_key.clone());
+                } else {
+                    return Ok(true);
+                }
+            }
+            Err(ENOENT) => return Ok(true),
+            Err(e) => {
+                return Err(anyhow::anyhow!("bpf lookup_batch({}) errno={}", map, e));
+            }
+        }
+    }
+}
+
 /// Delete `keys` with `BPF_MAP_DELETE_BATCH` (hash/LRU-hash maps, kernel
 /// 5.6+).  Returns `Ok(true)` when the batch path ran (keys already gone
 /// are tolerated), `Ok(false)` when the kernel lacks the command.

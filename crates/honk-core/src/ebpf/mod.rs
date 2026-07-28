@@ -60,6 +60,9 @@ pub struct LpmKeepSet {
     pub mac: std::collections::HashSet<[u8; 20]>,
 }
 
+/// Callback for [`EbpfBackend::conn_state_for_each_chunk`].
+pub type ConnStateChunkVisitor<'a> = dyn FnMut(&[(TuplesKey, ConnState)]) + 'a;
+
 #[async_trait]
 pub trait EbpfBackend: Send + Sync {
     fn detach_hooks(&mut self) -> anyhow::Result<()> {
@@ -279,6 +282,24 @@ pub trait EbpfBackend: Send + Sync {
 
     /// Remove multiple CONN_STATE_MAP entries (batched when supported).
     fn conn_state_remove_batch(&mut self, keys: &[TuplesKey]) -> anyhow::Result<()>;
+
+    /// Visit CONN_STATE_MAP entries in bounded chunks without accumulating
+    /// the whole map (524K entries would otherwise spike memory on every
+    /// sweep). Backends with `BPF_MAP_LOOKUP_BATCH` stream chunks straight
+    /// from the kernel; others fall back to a snapshot chunked into visits
+    /// (fine for small/mock maps).
+    fn conn_state_for_each_chunk(
+        &self,
+        chunk_size: usize,
+        visit: &mut ConnStateChunkVisitor<'_>,
+    ) -> anyhow::Result<()> {
+        let mut entries = Vec::new();
+        self.conn_state_snapshot(&mut entries)?;
+        for chunk in entries.chunks(chunk_size.max(1)) {
+            visit(chunk);
+        }
+        Ok(())
+    }
 
     /// Read the datapath's CONN_STATE_MAP occupancy counters:
     /// `(cumulative_inserts, cumulative_ebpf_deletes)`.  Userspace combines
