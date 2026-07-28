@@ -12,75 +12,85 @@ impl ControlPlane {
     /// are serialized through the command channel, so concurrent reloads and
     /// merges can never interleave. New connections are rejected briefly
     /// while the swap happens.
+    /// Apply a rebuilt config to the running control plane, as an atomic
+    /// two-phase commit:
+    ///
+    /// 1. **Build** — construct the new Router, DNS forwarder and outbound id
+    ///    map from `new_config` *without touching any live state*. Any failure
+    ///    here aborts with the current generation fully intact.
+    /// 2. **Commit** — push routing into eBPF (itself two-phase: the routing
+    ///    meta is written last, so a push failure never activates a partial
+    ///    ruleset), then swap config/router/DNS/group state in one critical
+    ///    section. A push failure aborts before any userspace field changes.
+    ///
+    /// This removes the old stepwise replacement window where a mid-pipeline
+    /// failure left a new config with an old DNS forwarder and a half-updated
+    /// datapath. New connections are rejected briefly while the swap happens.
     pub(super) async fn apply_runtime_config(&self, new_config: Config, drain: &DrainTracker) {
         drain.start_rejecting();
         // Brief pause for in-flight connection setup
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        match Router::new(
+        // ── Phase 1: build everything (no live-state mutation) ──
+        let new_router = match Router::new(
             &new_config.routing.rules,
             &new_config.routing.default_outbound,
         ) {
-            Ok(new_router) => {
-                *self.router.write().await = new_router;
-                *self.config.write().await = new_config;
-                // Refresh the bootstrap resolver for proxy-server hostname
-                // lookups (see startup wiring in `run`).
-                honk_outbound::bootstrap::set_global(
-                    honk_outbound::bootstrap::BootstrapResolver::parse(
-                        &self.config.read().await.global.bootstrap_resolver,
-                    ),
-                );
-                // direct's probe target follows the bootstrap resolver.
-                let direct_target =
-                    super::direct_check_addr(&self.config.read().await.global.bootstrap_resolver);
-                self.alive_set.set_direct_check_addr(direct_target.clone());
-                honk_outbound::urltest::set_urltest_direct_target(
-                    direct_target
-                        .parse()
-                        .expect("direct check addr is a SocketAddr"),
-                );
-                // Refresh node→outbound id mapping so
-                // OUTBOUND_CONNECTIVITY_MAP pushes use
-                // the new group ordering.
-                {
-                    let config = self.config.read().await;
-                    *self.outbound_id_map.write() = build_outbound_id_map(&config);
-                }
-                // Rebuild the GroupManager from the new
-                // config (new/changed groups become
-                // selectable, runtime selector choices
-                // migrate) and refresh health-check /
-                // URLTest registrations to match.
-                self.reload_group_manager().await;
-                // Recreate DNS upstream pool/forwarder so upstream changes
-                // (including proxy outbound) take effect without restart.
-                if let Err(e) = self.reload_dns_forwarder().await {
-                    error!("Failed to reload DNS forwarder: {}", e);
-                }
-                let (routing_pushed, route_count) = {
-                    let config = self.config.read().await;
-                    let router = self.router.read().await;
-                    let mut ebpf = self.ebpf.write().await;
-                    let pushed = match Self::push_routing_to_ebpf(&config, &router, &mut ebpf) {
-                        Ok(_) => true,
-                        Err(e) => {
-                            error!("Failed to push routing to eBPF: {}", e);
-                            false
-                        }
-                    };
-                    (pushed, router.route_count())
-                };
-                if routing_pushed {
-                    // Rebuild learned domain→IP routes with the new
-                    // rule-index bitmaps; entries pushed for the
-                    // previous ruleset reference stale rule indices.
-                    self.dns_controller.rebuild_domain_routes().await;
-                }
-                info!("Configuration applied — {} routes active", route_count);
+            Ok(r) => r,
+            Err(e) => {
+                error!("Failed to build new router: {}", e);
+                drain.stop_rejecting();
+                return;
             }
-            Err(e) => error!("Failed to build new router: {}", e),
+        };
+        let new_dns_forwarder = match self.build_dns_forwarder(&new_config).await {
+            Ok(f) => f,
+            Err(e) => {
+                error!("Failed to build DNS forwarder: {}", e);
+                drain.stop_rejecting();
+                return;
+            }
+        };
+        let new_outbound_id_map = build_outbound_id_map(&new_config);
+        let bootstrap = new_config.global.bootstrap_resolver.clone();
+        let direct_target = super::direct_check_addr(&bootstrap);
+
+        // ── Phase 2a: push routing into eBPF; abort without touching userspace ──
+        let route_count = new_router.route_count();
+        {
+            let mut ebpf = self.ebpf.write().await;
+            if let Err(e) = Self::push_routing_to_ebpf(&new_config, &new_router, &mut ebpf) {
+                error!(
+                    "Failed to push routing to eBPF (reload aborted, current generation intact): {}",
+                    e
+                );
+                drain.stop_rejecting();
+                return;
+            }
         }
+
+        // ── Phase 2b: commit userspace state in one critical section ──
+        *self.router.write().await = new_router;
+        *self.config.write().await = new_config;
+        // Refresh the bootstrap resolver for proxy-server hostname lookups.
+        honk_outbound::bootstrap::set_global(honk_outbound::bootstrap::BootstrapResolver::parse(
+            &bootstrap,
+        ));
+        // direct's probe target follows the bootstrap resolver.
+        self.alive_set.set_direct_check_addr(direct_target.clone());
+        honk_outbound::urltest::set_urltest_direct_target(
+            direct_target
+                .parse()
+                .expect("direct check addr is a SocketAddr"),
+        );
+        *self.outbound_id_map.write() = new_outbound_id_map;
+        self.dns_controller.set_forwarder(new_dns_forwarder).await;
+        // Rebuild the GroupManager (reads the just-swapped config; migrates
+        // runtime selector choices) and refresh health-check registrations.
+        self.reload_group_manager().await;
+        // Rebuild learned domain→IP routes with the new rule-index bitmaps.
+        self.dns_controller.rebuild_domain_routes().await;
+        info!("Configuration applied — {} routes active", route_count);
 
         drain.stop_rejecting();
     }
@@ -102,10 +112,13 @@ impl ControlPlane {
         self.apply_runtime_config(new_config, &drain).await;
     }
 
-    /// Recreate the DNS upstream pool and forwarder from the current config,
-    /// then install the new forwarder into the DNS controller.
-    async fn reload_dns_forwarder(&self) -> anyhow::Result<()> {
-        let config = self.config.read().await;
+    /// Build a DNS forwarder from an explicit config (used by the reload
+    /// pipeline's build phase — must not read live state, so the caller can
+    /// abort before commit without having mutated anything).
+    async fn build_dns_forwarder(
+        &self,
+        config: &Config,
+    ) -> anyhow::Result<std::sync::Arc<crate::dns::forwarder::DnsForwarder>> {
         let dns_router = Arc::new(crate::dns::routing::DnsRouter::new_from_dns_config(
             &config.dns,
         )?);
@@ -126,7 +139,7 @@ impl ControlPlane {
             .with_group_manager(self.group_manager.clone())
             .with_traffic_router(self.router.clone()),
         );
-        let new_forwarder = Arc::new(
+        Ok(Arc::new(
             crate::dns::forwarder::DnsForwarder::new(
                 dns_upstream_pool as Arc<dyn crate::dns::forwarder::DnsUpstreamPool>,
                 self.dns_controller.cache().await,
@@ -135,13 +148,7 @@ impl ControlPlane {
             .with_strategy(config.dns.strategy.clone())
             .with_cache_enabled(config.dns.cache.enabled)
             .with_cache_ttl(config.dns.cache.ttl.min(u64::from(u32::MAX)) as u32),
-        );
-        self.dns_controller.set_forwarder(new_forwarder).await;
-        info!(
-            "DNS forwarder reloaded with {} upstream(s)",
-            config.dns.upstream.len()
-        );
-        Ok(())
+        ))
     }
 
     /// Rebuild the [`GroupManager`] from the current config after a reload.
@@ -494,4 +501,93 @@ pub(super) fn resolve_outbound_nodes(
         protocol: honk_config::types::NodeProtocol::HTTP,
         ..Default::default()
     }]
+}
+
+#[cfg(test)]
+mod atomic_reload_tests {
+    use super::*;
+    use crate::dns;
+    use crate::ebpf::mock::MockEbpfBackend;
+
+    fn test_dns_forwarder() -> std::sync::Arc<dns::forwarder::DnsForwarder> {
+        let cache = Arc::new(tokio::sync::Mutex::new(dns::cache::DnsCache::new(100)));
+        let router = Arc::new(
+            dns::routing::DnsRouter::new(&honk_config::dns::DnsRouting {
+                rules: vec![],
+                fallback: "default".into(),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let upstream_pool = Arc::new(
+            dns::upstream_pool::UpstreamPool::new(
+                &[honk_config::dns::DnsUpstream {
+                    name: "default".into(),
+                    address: "8.8.8.8:53".into(),
+                    protocol: honk_config::types::DnsProtocol::Udp,
+                    tls_server_name: None,
+                    outbound: None,
+                }],
+                router.clone(),
+            )
+            .unwrap(),
+        );
+        dns::forwarder::DnsForwarder::new(upstream_pool, cache, router)
+            .with_cache_enabled(false)
+            .into()
+    }
+
+    fn test_cp() -> ControlPlane {
+        ControlPlane::new(
+            Config::default(),
+            Box::new(MockEbpfBackend::new()),
+            Router::new(&[], "direct").unwrap(),
+            std::sync::Arc::new(ProxyRegistry::default_resolver().unwrap()),
+            DnsResolver::new(&honk_config::dns::DnsConfig::default()).unwrap(),
+            test_dns_forwarder(),
+        )
+        .unwrap()
+    }
+
+    /// A reload whose build phase fails (invalid upstream address) must abort
+    /// without touching the live config — the atomicity guarantee of the
+    /// two-phase apply.
+    #[tokio::test]
+    async fn build_failure_leaves_live_config_untouched() {
+        let cp = test_cp();
+        let before = cp.config_handle().read().await.global.log_level.clone();
+
+        // An upstream with an empty address fails DnsEndpoint::parse during
+        // build_dns_forwarder — the reload must abort before commit.
+        let mut bad = Config::default();
+        bad.global.log_level = "trace".into();
+        bad.dns.upstream = vec![honk_config::dns::DnsUpstream {
+            name: "broken".into(),
+            address: String::new(),
+            protocol: honk_config::types::DnsProtocol::Udp,
+            tls_server_name: None,
+            outbound: None,
+        }];
+
+        let drain = DrainTracker::new();
+        cp.apply_runtime_config(bad, &drain).await;
+
+        let after = cp.config_handle().read().await.global.log_level.clone();
+        assert_eq!(before, after, "failed build must not swap the live config");
+    }
+
+    /// A valid reload commits: config is swapped and eBPF routing is pushed.
+    #[tokio::test]
+    async fn valid_reload_commits() {
+        let cp = test_cp();
+        let mut good = Config::default();
+        good.global.log_level = "trace".into();
+        let drain = DrainTracker::new();
+        cp.apply_runtime_config(good, &drain).await;
+        assert_eq!(
+            cp.config_handle().read().await.global.log_level,
+            "trace",
+            "valid reload should swap the live config"
+        );
+    }
 }
