@@ -57,7 +57,7 @@ use anyhow::{Context as _, anyhow};
 use async_trait::async_trait;
 use honk_config::node::Node;
 use honk_config::types::NodeProtocol;
-use quinn::{AsyncUdpSocket, Endpoint, EndpointConfig, UdpPoller};
+use quinn::{AsyncUdpSocket, Endpoint, UdpPoller};
 use rand::RngExt;
 use tokio::io::ReadBuf;
 use tokio::sync::mpsc;

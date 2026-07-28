@@ -1330,6 +1330,30 @@ mod tests {
         assert_eq!(&buf[18..22], &unhex("7b9aec34")[..], "masked packet number");
     }
 
+    /// AEAD round-trip across payload sizes: catches backend miscompiles
+    /// that only manifest on longer GHASH/assembly paths (a musl/zig-built
+    /// BoringSSL failed open() on 1280B packets while small ones passed).
+    #[test]
+    fn aes_gcm_payload_size_gradient() {
+        let secrets = TrafficSecrets {
+            suite: TLS13_AES_128_GCM_SHA256,
+            secret: vec![7u8; 32],
+        };
+        let pkt = BoringPacketKey::new(&secrets).unwrap();
+        for size in [64usize, 256, 512, 1000, 1100, 1150, 1200, 1280, 1452, 4096] {
+            let header = b"hdr".to_vec();
+            let payload = vec![0xabu8; size];
+            // PacketKey::encrypt expects the tag space (16 bytes) to be
+            // already present at the end of `buf`.
+            let mut buf = [header.clone(), payload.clone(), vec![0u8; 16]].concat();
+            pkt.encrypt(42, &mut buf, header.len());
+            let mut protected = bytes::BytesMut::from(&buf[header.len()..]);
+            pkt.decrypt(42, &buf[..header.len()], &mut protected)
+                .unwrap_or_else(|_| panic!("decrypt failed at size {size}"));
+            assert_eq!(&protected[..], &payload[..], "mismatch at size {size}");
+        }
+    }
+
     /// Cross-implementation check: encrypt with rustls initial keys, decrypt
     /// with ours (and vice versa). Any key-derivation or AEAD-usage
     /// divergence from rustls shows up here before live interop is attempted.

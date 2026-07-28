@@ -1,5 +1,6 @@
 use super::*;
 use crate::quic::testutil;
+use quinn::EndpointConfig;
 use std::time::Instant;
 
 use parking_lot::Mutex;

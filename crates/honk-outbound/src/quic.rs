@@ -377,11 +377,132 @@ pub fn marked_udp_socket(ipv6: bool) -> io::Result<std::net::UdpSocket> {
 
 /// Create a client-only quinn [`Endpoint`] on a marked UDP socket for the
 /// given address family.
+///
+/// The endpoint advertises `max_udp_payload_size = 1252` instead of quinn's
+/// 1472: on PPPoE/tunneled last miles, larger downlink UDP datagrams are
+/// silently black-holed (measured on a CN PPPoE line: ≤1260B echoes pass,
+/// 1280B all lost), which kills every QUIC handshake whose ServerHello
+/// flight exceeds the threshold. 1252 matches quic-go's default; going
+/// lower (e.g. the RFC minimum 1200) shrinks the server's flight allowance
+/// below its anti-amplification budget (3× the client Initial) and can
+/// deadlock handshakes against large certificate chains.
 pub fn client_endpoint(ipv6: bool) -> io::Result<Endpoint> {
+    client_endpoint_with_mtu(ipv6, 1252)
+}
+
+/// [`client_endpoint`] with an explicit advertised `max_udp_payload_size`.
+pub fn client_endpoint_with_mtu(ipv6: bool, max_udp_payload_size: u16) -> io::Result<Endpoint> {
     let socket = marked_udp_socket(ipv6)?;
     let runtime = quinn::default_runtime()
         .ok_or_else(|| io::Error::other("no async runtime available for QUIC"))?;
-    Endpoint::new(EndpointConfig::default(), None, socket, runtime)
+    let socket = Arc::new(NoGsoUdpSocket {
+        socket: Arc::new(tokio::net::UdpSocket::from_std(socket)?),
+    });
+    Endpoint::new_with_abstract_socket(
+        endpoint_config_with_mtu(max_udp_payload_size)?,
+        None,
+        socket,
+        runtime,
+    )
+}
+
+/// EndpointConfig advertising `max_udp_payload_size` (see `client_endpoint`
+/// for why 1252 is the safe default on PMTU-black-holed last miles).
+pub(crate) fn endpoint_config_with_mtu(mtu: u16) -> io::Result<EndpointConfig> {
+    let mut config = EndpointConfig::default();
+    config.max_udp_payload_size(mtu).map_err(io::Error::other)?;
+    Ok(config)
+}
+
+/// Plain tokio UDP socket as a quinn `AsyncUdpSocket` with **GSO disabled**
+/// (`max_transmit_segments = 1`): every datagram goes out on its own.
+/// quinn's stock socket merges a flight into one GSO super-packet, and on
+/// at least one measured PPPoE uplink the second segment of that
+/// super-packet is deterministically dropped — the server never receives
+/// the second Initial and the handshake stalls forever, while sing-box
+/// (quic-go, no GSO) works on the same path.
+#[derive(Debug)]
+struct NoGsoUdpSocket {
+    socket: Arc<tokio::net::UdpSocket>,
+}
+
+impl quinn::AsyncUdpSocket for NoGsoUdpSocket {
+    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn quinn::UdpPoller>> {
+        Box::pin(NoGsoUdpPoller {
+            socket: Arc::clone(&self.socket),
+        })
+    }
+
+    fn try_send(&self, transmit: &quinn::udp::Transmit) -> io::Result<()> {
+        self.socket
+            .try_send_to(transmit.contents, transmit.destination)?;
+        Ok(())
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut Context<'_>,
+        bufs: &mut [std::io::IoSliceMut<'_>],
+        meta: &mut [quinn::udp::RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        let mut count = 0;
+        for (buf, meta_slot) in bufs.iter_mut().zip(meta.iter_mut()) {
+            let mut read_buf = ReadBuf::new(&mut buf[..]);
+            match self.socket.poll_recv_from(cx, &mut read_buf) {
+                Poll::Ready(Ok(addr)) => {
+                    let len = read_buf.filled().len();
+                    *meta_slot = quinn::udp::RecvMeta {
+                        addr,
+                        len,
+                        stride: len,
+                        ecn: None,
+                        dst_ip: None,
+                    };
+                    count += 1;
+                }
+                Poll::Ready(Err(e)) => {
+                    return if count == 0 {
+                        Poll::Ready(Err(e))
+                    } else {
+                        Poll::Ready(Ok(count))
+                    };
+                }
+                Poll::Pending => {
+                    return if count == 0 {
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(Ok(count))
+                    };
+                }
+            }
+        }
+        Poll::Ready(Ok(count))
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
+    /// Plain tokio socket without DONTFRAG; `true` also keeps quinn from
+    /// assuming the path is MTU-probe safe on lossy links.
+    fn may_fragment(&self) -> bool {
+        true
+    }
+
+    fn max_transmit_segments(&self) -> usize {
+        1
+    }
+}
+
+#[derive(Debug)]
+struct NoGsoUdpPoller {
+    socket: Arc<tokio::net::UdpSocket>,
+}
+
+impl quinn::UdpPoller for NoGsoUdpPoller {
+    fn poll_writable(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.socket.poll_send_ready(cx)
+    }
 }
 
 struct State<C> {
@@ -1067,7 +1188,7 @@ pub async fn quic_handshake_probe(
     let runtime = quinn::default_runtime()
         .ok_or_else(|| io::Error::other("no async runtime available for QUIC"))?;
     let endpoint =
-        Endpoint::new_with_abstract_socket(EndpointConfig::default(), None, socket, runtime)?;
+        Endpoint::new_with_abstract_socket(endpoint_config_with_mtu(1252)?, None, socket, runtime)?;
 
     let start = Instant::now();
     let connecting = endpoint

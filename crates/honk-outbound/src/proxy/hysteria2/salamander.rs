@@ -373,6 +373,11 @@ pub(super) fn hy2_endpoint_factory(
         let socket = Arc::new(Hy2UdpSocket::new(ipv6, obfs.clone(), hop.clone())?);
         let runtime = quinn::default_runtime()
             .ok_or_else(|| io::Error::other("no async runtime available for QUIC"))?;
-        Endpoint::new_with_abstract_socket(EndpointConfig::default(), None, socket, runtime)
+        Endpoint::new_with_abstract_socket(
+            crate::quic::endpoint_config_with_mtu(1252)?,
+            None,
+            socket,
+            runtime,
+        )
     }
 }
