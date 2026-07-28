@@ -906,6 +906,10 @@ pub(super) async fn udp_fast_path(
             "UDP fast path send to {} for {} -> {} failed: {}",
             ep.relay_addr, client_addr, original_dst, e
         );
+        // A dead transport (session/stream closed) can never deliver for
+        // this endpoint again; mark it dead so the next datagram creates a
+        // fresh endpoint instead of black-holing until the timeouts reap it.
+        ep.kill();
     }
     true
 }
