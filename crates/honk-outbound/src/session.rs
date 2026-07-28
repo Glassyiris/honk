@@ -238,6 +238,18 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         }
     }
 
+    /// Insert an externally-established session (e.g. one built on a
+    /// pooled TCP stream) when the key is under the hard cap; the caller
+    /// keeps using it either way.
+    pub fn insert(&self, key: &str, session: &Arc<S>) {
+        let mut keys = self.keys.lock();
+        let pool = keys.entry(key.to_string()).or_default();
+        pool.sessions.retain(|s| !s.is_closed());
+        if pool.sessions.len() < self.config.max_sessions {
+            pool.sessions.push(Arc::clone(session));
+        }
+    }
+
     /// Current metrics snapshot across all keys.
     pub fn metrics(&self) -> PoolMetrics {
         let keys = self.keys.lock();
