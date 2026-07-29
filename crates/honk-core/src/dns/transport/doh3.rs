@@ -5,6 +5,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 use bytes::{Buf, Bytes};
@@ -17,6 +18,8 @@ use tracing::debug;
 use crate::dns::endpoint::DnsEndpoint;
 
 use super::framing::force_dns_id_zero;
+use super::lifecycle::LifecycleSlot;
+use super::owned_task::OwnedTask;
 use super::{
     SharedQuicEndpoint, build_doh_request, dns_quic_config, exchange_with_retry,
     finish_doh_response, quic_connect,
@@ -24,25 +27,40 @@ use super::{
 
 type H3Sender = SendRequest<h3_quinn::OpenStreams, Bytes>;
 
+struct H3Session {
+    sender: Mutex<Option<H3Sender>>,
+    connection: quinn::Connection,
+    driver: OwnedTask,
+}
+
 /// DoH3 client for one upstream.
 pub struct Doh3Client {
     endpoint: DnsEndpoint,
     query_timeout: Duration,
     quic_config: ClientConfig,
     quic_ep: SharedQuicEndpoint,
-    /// Open H3 request sender; `None` forces redial.
-    sender: Mutex<Option<H3Sender>>,
+    session: LifecycleSlot<H3Session>,
+    active_tasks: Arc<AtomicUsize>,
 }
 
 impl Doh3Client {
     pub async fn new(endpoint: DnsEndpoint, query_timeout: Duration) -> anyhow::Result<Arc<Self>> {
+        Self::new_tracked(endpoint, query_timeout, Arc::new(AtomicUsize::new(0))).await
+    }
+
+    pub(crate) async fn new_tracked(
+        endpoint: DnsEndpoint,
+        query_timeout: Duration,
+        active_tasks: Arc<AtomicUsize>,
+    ) -> anyhow::Result<Arc<Self>> {
         let quic_config = dns_quic_config(&[b"h3"]).await?;
         Ok(Arc::new(Self {
             endpoint,
             query_timeout,
             quic_config,
             quic_ep: SharedQuicEndpoint::new(),
-            sender: Mutex::new(None),
+            session: LifecycleSlot::new(),
+            active_tasks,
         }))
     }
 
@@ -51,7 +69,7 @@ impl Doh3Client {
             "DoH3",
             || self.exchange_once(raw_query),
             || async {
-                self.sender.lock().await.take();
+                self.close_session().await;
             },
         )
         .await
@@ -108,13 +126,16 @@ impl Doh3Client {
     }
 
     async fn get_sender(&self) -> anyhow::Result<H3Sender> {
-        {
-            let sender = self.sender.lock().await;
-            if let Some(s) = sender.clone() {
-                return Ok(s);
-            }
-        }
+        let session = self.session.acquire(|| self.handshake()).await?;
+        session
+            .sender
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("DoH3 session is closing"))
+    }
 
+    async fn handshake(&self) -> anyhow::Result<H3Session> {
         let addr: SocketAddr = self.endpoint.resolve_addr().await?;
         let conn = quic_connect(
             &self.quic_ep,
@@ -126,19 +147,42 @@ impl Doh3Client {
         )
         .await?;
 
-        let quinn_conn = H3QuinnConnection::new(conn);
+        let quinn_conn = H3QuinnConnection::new(conn.clone());
         let (mut driver, sender) = h3::client::new(quinn_conn)
             .await
             .map_err(|e| anyhow::anyhow!("DoH3 h3::client::new: {e}"))?;
 
-        // poll_close resolves with ConnectionError (not Result) when the
-        // connection ends — drive it on a background task for the session life.
-        tokio::spawn(async move {
-            let err = futures::future::poll_fn(|cx| driver.poll_close(cx)).await;
-            debug!("DoH3 driver closed: {err}");
-        });
+        let driver = OwnedTask::spawn(
+            async move {
+                let error = futures::future::poll_fn(|cx| driver.poll_close(cx)).await;
+                debug!(
+                    error = %error,
+                    transport = "doh3",
+                    "dns transport driver stopped"
+                );
+            },
+            Arc::clone(&self.active_tasks),
+        );
+        Ok(H3Session {
+            sender: Mutex::new(Some(sender)),
+            connection: conn,
+            driver,
+        })
+    }
 
-        *self.sender.lock().await = Some(sender.clone());
-        Ok(sender)
+    async fn close_session(&self) {
+        let timeout = self.query_timeout;
+        self.session
+            .close(|session| async move {
+                session.sender.lock().await.take();
+                session.connection.close(0_u32.into(), b"shutdown");
+                session.driver.shutdown(timeout).await;
+            })
+            .await;
+    }
+
+    pub(crate) async fn close(&self) {
+        self.close_session().await;
+        self.quic_ep.close().await;
     }
 }

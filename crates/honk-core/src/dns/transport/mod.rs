@@ -16,16 +16,23 @@ mod doh3;
 mod doq;
 mod dot;
 mod framing;
+mod lifecycle;
+mod owned_task;
 mod tcp_pool;
 
 #[cfg(test)]
+mod idle_pool_tests;
+#[cfg(test)]
 mod tests_proto;
+#[cfg(test)]
+mod upstream_lifecycle_tests;
 
 pub use doh::DohClient;
 pub use doh3::Doh3Client;
 pub use doq::DoqClient;
 pub use dot::DotPool;
 pub use framing::{exchange_length_prefixed, force_dns_id_zero, restore_dns_id};
+pub(crate) use lifecycle::LifecycleSlot;
 pub use tcp_pool::TcpPool;
 
 use std::sync::Arc;
@@ -113,6 +120,11 @@ impl DialContext {
 /// Max idle streams kept per DoT / plain-TCP pool.
 const MAX_IDLE_STREAMS: usize = 4;
 
+enum IdlePoolState {
+    Open,
+    Closed,
+}
+
 /// Uniform retry-once wrapper for all transports: on failure, run `reset`
 /// (drop the cached session/connection) and retry the exchange once.
 async fn exchange_with_retry<Once, Fut, Reset, ResetFut>(
@@ -141,6 +153,7 @@ where
 /// Pop an idle stream or dial a fresh one, run one length-prefixed exchange,
 /// and return the stream to the pool on success (DoT / plain-TCP shared shape).
 async fn idle_pool_exchange<S, Dial, DialFut>(
+    lifecycle: &tokio::sync::RwLock<IdlePoolState>,
     idle: &parking_lot::Mutex<Vec<S>>,
     dial: Dial,
     raw_query: &[u8],
@@ -151,6 +164,11 @@ where
     Dial: FnOnce() -> DialFut,
     DialFut: std::future::Future<Output = anyhow::Result<S>>,
 {
+    let lifecycle = lifecycle.read().await;
+    match *lifecycle {
+        IdlePoolState::Open => {}
+        IdlePoolState::Closed => anyhow::bail!("DNS transport pool is closed"),
+    }
     let taken = idle.lock().pop();
     let mut stream = match taken {
         Some(s) => s,
@@ -161,7 +179,28 @@ where
     if guard.len() < MAX_IDLE_STREAMS {
         guard.push(stream);
     }
+    drop(lifecycle);
     Ok(resp)
+}
+
+async fn close_idle_pool<S>(
+    lifecycle: &tokio::sync::RwLock<IdlePoolState>,
+    idle: &parking_lot::Mutex<Vec<S>>,
+    timeout: Duration,
+) where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+
+    let mut lifecycle = lifecycle.write().await;
+    match *lifecycle {
+        IdlePoolState::Closed => return,
+        IdlePoolState::Open => *lifecycle = IdlePoolState::Closed,
+    }
+    let streams = std::mem::take(&mut *idle.lock());
+    for mut stream in streams {
+        let _ = tokio::time::timeout(timeout, stream.shutdown()).await;
+    }
 }
 
 /// Shared QUIC client config for DNS transports (15s keep-alive, cubic).
@@ -194,6 +233,14 @@ impl SharedQuicEndpoint {
             .map_err(|e| anyhow::anyhow!("QUIC client endpoint: {e}"))?;
         *guard = Some(ep.clone());
         Ok(ep)
+    }
+
+    async fn close(&self) {
+        let endpoint = self.0.lock().await.take();
+        if let Some(endpoint) = endpoint {
+            endpoint.close(0_u32.into(), b"shutdown");
+            endpoint.wait_idle().await;
+        }
     }
 }
 

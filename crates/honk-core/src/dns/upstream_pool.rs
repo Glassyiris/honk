@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use honk_config::dns::DnsUpstream;
@@ -23,7 +24,7 @@ use super::endpoint::DnsEndpoint;
 use super::forwarder::DnsUpstreamPool;
 use super::routing::DnsRouter;
 use super::transport::{
-    DialContext, Doh3Client, DohClient, DoqClient, DotPool, ProxyDial, TcpPool,
+    DialContext, Doh3Client, DohClient, DoqClient, DotPool, LifecycleSlot, ProxyDial, TcpPool,
 };
 use crate::proxy::ProxyRegistry;
 use crate::routing::{ConnectionInfo, Router};
@@ -40,7 +41,12 @@ struct UpstreamEntry {
     /// - `""` (empty key): direct dial (no `outbound:` / `direct`)
     /// - node name: session pinned to that leaf so URLTest/Selector switches
     ///   open a fresh tunnel instead of reusing another node's H2/TLS pool.
-    transports: tokio::sync::Mutex<HashMap<String, Arc<PooledTransport>>>,
+    transports: parking_lot::Mutex<HashMap<TransportKey, Arc<LifecycleSlot<PooledTransport>>>>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct TransportKey {
+    resolved_leaf: Option<String>,
 }
 
 enum PooledTransport {
@@ -49,6 +55,31 @@ enum PooledTransport {
     Doh(Arc<DohClient>),
     Doq(Arc<DoqClient>),
     Doh3(Arc<Doh3Client>),
+}
+
+impl PooledTransport {
+    async fn close(&self) {
+        match self {
+            Self::Tcp(transport) => transport.close().await,
+            Self::Dot(transport) => transport.close().await,
+            Self::Doh(transport) => transport.close().await,
+            Self::Doq(transport) => transport.close().await,
+            Self::Doh3(transport) => transport.close().await,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TransportLifecycleStats {
+    pub init_count: usize,
+    pub close_count: usize,
+    pub tasks: usize,
+}
+
+enum PoolState {
+    Open,
+    Closing,
+    Closed,
 }
 
 pub struct UpstreamPool {
@@ -71,6 +102,8 @@ pub struct UpstreamPool {
     traffic_router: parking_lot::RwLock<Option<Arc<AsyncRwLock<Router>>>>,
     dns_query_timeout: Duration,
     dns_dial_timeout: Duration,
+    active_transport_tasks: Arc<AtomicUsize>,
+    shutdown: tokio::sync::RwLock<PoolState>,
 }
 
 impl UpstreamPool {
@@ -109,7 +142,7 @@ impl UpstreamPool {
                     endpoint,
                     address: upstream.address.clone(),
                     outbound: upstream.outbound.clone(),
-                    transports: tokio::sync::Mutex::new(HashMap::new()),
+                    transports: parking_lot::Mutex::new(HashMap::new()),
                 },
             );
         }
@@ -122,6 +155,8 @@ impl UpstreamPool {
             traffic_router: parking_lot::RwLock::new(None),
             dns_query_timeout: Duration::from_secs(3),
             dns_dial_timeout: Duration::from_secs(10),
+            active_transport_tasks: Arc::new(AtomicUsize::new(0)),
+            shutdown: tokio::sync::RwLock::new(PoolState::Open),
         })
     }
 
@@ -359,13 +394,21 @@ impl UpstreamPool {
         Ok(match protocol {
             DnsProtocol::Tcp => PooledTransport::Tcp(TcpPool::new(dial)),
             DnsProtocol::Tls => PooledTransport::Dot(DotPool::new(dial)?),
-            DnsProtocol::Https => PooledTransport::Doh(DohClient::new(dial)?),
+            DnsProtocol::Https => PooledTransport::Doh(DohClient::new_tracked(
+                dial,
+                Arc::clone(&self.active_transport_tasks),
+            )?),
             DnsProtocol::Quic => {
                 PooledTransport::Doq(DoqClient::new(endpoint, query_timeout).await?)
             }
-            DnsProtocol::H3 => {
-                PooledTransport::Doh3(Doh3Client::new(endpoint, query_timeout).await?)
-            }
+            DnsProtocol::H3 => PooledTransport::Doh3(
+                Doh3Client::new_tracked(
+                    endpoint,
+                    query_timeout,
+                    Arc::clone(&self.active_transport_tasks),
+                )
+                .await?,
+            ),
             DnsProtocol::Udp => anyhow::bail!("internal: UDP has no pooled transport"),
         })
     }
@@ -376,21 +419,71 @@ impl UpstreamPool {
         entry: &UpstreamEntry,
         proxy_node: Option<&Node>,
     ) -> anyhow::Result<Arc<PooledTransport>> {
-        let key = proxy_node.map(|n| n.name.clone()).unwrap_or_default();
-        {
-            let guard = entry.transports.lock().await;
-            if let Some(t) = guard.get(&key) {
-                return Ok(t.clone());
-            }
+        let key = TransportKey {
+            resolved_leaf: proxy_node.map(|node| node.name.clone()),
+        };
+        let slot = {
+            let mut transports = entry.transports.lock();
+            Arc::clone(
+                transports
+                    .entry(key)
+                    .or_insert_with(|| Arc::new(LifecycleSlot::new())),
+            )
+        };
+        slot.acquire(|| self.build_transport(entry, proxy_node))
+            .await
+    }
+
+    pub fn lifecycle_stats(&self) -> TransportLifecycleStats {
+        let (init_count, close_count) = self
+            .entries
+            .values()
+            .flat_map(|entry| {
+                entry
+                    .transports
+                    .lock()
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .fold((0, 0), |(initializations, closes), slot| {
+                (
+                    initializations + slot.init_count(),
+                    closes + slot.close_count(),
+                )
+            });
+        TransportLifecycleStats {
+            init_count,
+            close_count,
+            tasks: self.active_transport_tasks.load(Ordering::SeqCst),
         }
-        let built = Arc::new(self.build_transport(entry, proxy_node).await?);
-        let mut guard = entry.transports.lock().await;
-        // Another task may have won the race — reuse theirs.
-        if let Some(t) = guard.get(&key) {
-            return Ok(t.clone());
+    }
+
+    pub async fn close(&self) {
+        let mut shutdown = self.shutdown.write().await;
+        match *shutdown {
+            PoolState::Open | PoolState::Closing => *shutdown = PoolState::Closing,
+            PoolState::Closed => return,
         }
-        guard.insert(key, built.clone());
-        Ok(built)
+        let slots = self
+            .entries
+            .values()
+            .flat_map(|entry| {
+                entry
+                    .transports
+                    .lock()
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        for slot in slots {
+            slot.close(|transport| async move {
+                transport.close().await;
+            })
+            .await;
+        }
+        *shutdown = PoolState::Closed;
     }
 
     async fn query_udp(
@@ -488,6 +581,13 @@ impl DnsUpstreamPool for UpstreamPool {
             .resolve_dial_leaf(entry)
             .await
             .map_err(|e| anyhow::anyhow!("DNS upstream '{upstream_name}': {e}"))?;
+        let shutdown = self.shutdown.read().await;
+        match *shutdown {
+            PoolState::Open => {}
+            PoolState::Closing | PoolState::Closed => {
+                anyhow::bail!("DNS upstream pool is closed")
+            }
+        }
         debug!(
             "DNS upstream '{}' dial leaf={:?} (forced={})",
             upstream_name,
@@ -561,6 +661,7 @@ impl DnsUpstreamPool for UpstreamPool {
                 .unwrap_or("direct"),
             response.len()
         );
+        drop(shutdown);
         Ok(response)
     }
 }
