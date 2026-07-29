@@ -58,8 +58,11 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 /// Close the shared QUIC connection after this long without any open stream.
 const CONN_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Grace period after sending AUTHENTICATE for the server to reject bad
-/// credentials by closing the connection.
-const AUTH_GRACE: Duration = Duration::from_millis(150);
+/// credentials by closing the connection. Zero: a bad password fails the
+/// first stream open an RTT later with the same clarity — every cold dial
+/// otherwise pays a fixed 150ms (measured: 160ms cold TUIC connect vs
+/// dae's 85ms).
+const AUTH_GRACE: Duration = Duration::ZERO;
 /// Tear down a UDP session bridge after this long without traffic.
 const UDP_BRIDGE_IDLE: Duration = Duration::from_secs(90);
 
@@ -474,7 +477,8 @@ impl TuicHandler {
             let alpn_refs: Vec<&[u8]> = alpn.iter().map(Vec::as_slice).collect();
             let config = crate::quic::client_config(node, &alpn_refs, options).await?;
             Ok(Arc::new(TuicClient {
-                quic: QuicClient::new(node.host().to_string(), node.port, server_name, config),
+                quic: QuicClient::new(node.host().to_string(), node.port, server_name, config)
+                    .with_max_udp_payload_size(node.quic_mtu.unwrap_or(1252)),
                 uuid: *uuid.as_bytes(),
                 password,
             }))
@@ -692,7 +696,19 @@ impl ProxyHandler for TuicHandler {
 
     async fn test_connectivity(&self, node: &Node) -> bool {
         match Self::client_for(node).await {
-            Ok(client) => client.connection(Duration::from_secs(5)).await.is_ok(),
+            // With the zero auth grace on the dial path, a wrong password is
+            // only visible when the server closes the connection (~1 RTT) —
+            // wait for that here, scaled to the measured RTT.
+            Ok(client) => match client.connection(Duration::from_secs(5)).await {
+                Ok((conn, _)) => {
+                    let wait = (2 * conn.rtt()).max(Duration::from_millis(2));
+                    tokio::select! {
+                        _ = conn.closed() => false,
+                        _ = tokio::time::sleep(wait) => true,
+                    }
+                }
+                Err(_) => false,
+            },
             Err(e) => {
                 debug!("TUIC connectivity test failed for {}: {}", node.name, e);
                 false
@@ -974,10 +990,13 @@ mod tests {
         let handler = TuicHandler::new();
         let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
 
-        let result = handler
+        // TUIC has no auth response, so the dial proceeds optimistically
+        // (zero auth grace, sing-quic/dae parity); the rejection surfaces
+        // ~1 RTT later when the server closes the connection. The
+        // connectivity probe (which waits for exactly that) must say no.
+        let _ = handler
             .dial(&node, target, None, Duration::from_secs(5))
             .await;
-        assert!(result.is_err(), "bad password must fail the dial");
         assert!(!handler.test_connectivity(&node).await);
     }
 

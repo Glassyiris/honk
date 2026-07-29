@@ -118,6 +118,12 @@ pub struct Node {
     /// Hysteria2: disable QUIC path MTU discovery (`disablePathMTUDiscovery`)
     #[serde(default)]
     pub hy2_disable_mtu_discovery: Option<bool>,
+    /// QUIC protocols (hy2/tuic/juicity): advertised `max_udp_payload_size`
+    /// cap (share-link `mtu=`). Default 1252 is safe on PMTU-black-holed
+    /// last miles; raise it (e.g. 1452) on paths known to carry it —
+    /// bigger datagrams directly lower the per-packet cost ceiling.
+    #[serde(default)]
+    pub quic_mtu: Option<u16>,
     /// TUIC UUID
     #[serde(default)]
     pub tuic_uuid: Option<String>,

@@ -227,6 +227,13 @@ pub async fn client_config(
                 .tls_pin_sha256
                 .as_deref()
                 .and_then(crate::tls::parse_pin_sha256),
+            // Tickets belong to a server, not a hostname: different protocols
+            // (and different servers) sharing an SNI must never cross-resume.
+            ticket_key: Some(format!(
+                "{}|{}",
+                node.sni.clone().unwrap_or_else(|| node.host().to_string()),
+                node.port,
+            )),
         })?;
     let mut cfg = ClientConfig::new(Arc::new(crypto));
 
@@ -510,6 +517,9 @@ pub struct QuicClient<C> {
     /// run QUIC over a salamander-obfuscated socket; when unset the plain
     /// marked socket from [`client_endpoint`] is used.
     endpoint_factory: Option<Arc<dyn Fn(bool) -> io::Result<Endpoint> + Send + Sync>>,
+    /// Advertised `max_udp_payload_size` cap for the default endpoint (see
+    /// [`client_endpoint`] for the safe 1252 default).
+    mtu: u16,
     state: Mutex<State<C>>,
 }
 
@@ -526,11 +536,21 @@ impl<C> QuicClient<C> {
             server_name: server_name.into(),
             config,
             endpoint_factory: None,
+            mtu: 1252,
             state: Mutex::new(State {
                 endpoint: None,
                 conn: None,
             }),
         }
+    }
+
+    /// Advertise a larger `max_udp_payload_size` on paths known to carry it
+    /// (anything but PMTU-black-holed last miles — see [`client_endpoint`]).
+    /// Larger datagrams directly lower the per-packet processing cost that
+    /// caps single-connection QUIC throughput (~180k pps at 1252B).
+    pub fn with_max_udp_payload_size(mut self, mtu: u16) -> Self {
+        self.mtu = mtu;
+        self
     }
 
     /// Use a custom endpoint constructor instead of [`client_endpoint`] (see
@@ -586,7 +606,7 @@ impl<C> QuicClient<C> {
                 _ => {
                     let ep = match &self.endpoint_factory {
                         Some(factory) => factory(ipv6),
-                        None => client_endpoint(ipv6),
+                        None => client_endpoint_with_mtu(ipv6, self.mtu),
                     }
                     .with_context(|| format!("create QUIC endpoint (ipv6={ipv6})"))?;
                     state.endpoint = Some((ipv6, ep.clone()));

@@ -368,6 +368,9 @@ struct QuicCryptoState {
     /// pinSHA256 connections never resume: a resumed PSK session would
     /// bypass the pin check on a later (possibly different-pin) config.
     allow_resumption: bool,
+    /// Session-ticket cache key for `on_new_session_cb` (SNI|port — see
+    /// [`BoringQuicOptions::ticket_key`]); falls back to the server name.
+    ticket_key: Option<String>,
 }
 
 static EX_DATA_INDEX: LazyLock<i32> = LazyLock::new(|| unsafe {
@@ -462,17 +465,26 @@ unsafe extern "C" fn on_new_session_cb(
     ssl: *mut boring_sys::SSL,
     session: *mut boring_sys::SSL_SESSION,
 ) -> i32 {
-    let name =
-        unsafe { boring_sys::SSL_get_servername(ssl, boring_sys::TLSEXT_NAMETYPE_host_name) };
-    if name.is_null() {
+    let state = unsafe { state_of(ssl) };
+    if !state.allow_resumption {
         return 0;
     }
-    if !unsafe { state_of(ssl) }.allow_resumption {
-        return 0;
-    }
-    let name = unsafe { std::ffi::CStr::from_ptr(name) }
-        .to_string_lossy()
-        .into_owned();
+    // SNI|port key when the config carries one (never cross-resume between
+    // different servers sharing an SNI); the bare server name otherwise.
+    let name = match state.ticket_key.clone() {
+        Some(key) => key,
+        None => {
+            let name = unsafe {
+                boring_sys::SSL_get_servername(ssl, boring_sys::TLSEXT_NAMETYPE_host_name)
+            };
+            if name.is_null() {
+                return 0;
+            }
+            unsafe { std::ffi::CStr::from_ptr(name) }
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
     unsafe { boring_sys::SSL_SESSION_up_ref(session) };
     let mut map = SESSION_TICKETS.lock();
     if let Some(old) = map.insert(name, session as usize) {
@@ -496,6 +508,10 @@ pub struct BoringQuicOptions {
     /// pinSHA256 leaf-certificate fingerprint; replaces PKI and hostname
     /// verification when set.
     pub pin_sha256: Option<[u8; 32]>,
+    /// Session-ticket cache key (defaults to the server name). Servers are
+    /// identified by SNI|port so different servers sharing an SNI (e.g. one
+    /// certificate deployed on two protocol servers) never cross-resume.
+    pub ticket_key: Option<String>,
 }
 
 /// `crypto::ClientConfig` backed by a BoringSSL `SSL_CTX` (TLS 1.3 only).
@@ -506,6 +522,8 @@ pub struct BoringQuicClientConfig {
     ech_config_list: Option<Arc<Vec<u8>>>,
     /// pinSHA256 is in use: resumption disabled (PSK would bypass the pin).
     has_pin: bool,
+    /// Session-ticket cache key (defaults to the server name when unset).
+    ticket_key: Option<String>,
 }
 
 impl BoringQuicClientConfig {
@@ -517,6 +535,7 @@ impl BoringQuicClientConfig {
             chrome,
             ech_config_list,
             pin_sha256,
+            ticket_key,
         } = options;
         let mut builder = SslContext::builder(SslMethod::tls())?;
         // QUIC mandates TLS 1.3.
@@ -559,6 +578,7 @@ impl BoringQuicClientConfig {
             chrome,
             ech_config_list,
             has_pin: pin_sha256.is_some(),
+            ticket_key,
         })
     }
 }
@@ -599,13 +619,18 @@ impl crypto::ClientConfig for BoringQuicClientConfig {
         // a session minted under a pre-reload SSL_CTX) must not poison every
         // subsequent dial until process restart.
         let mut resume_key = None;
+        let lookup_key = self
+            .ticket_key
+            .clone()
+            .unwrap_or_else(|| server_name.to_string());
         if !self.has_pin
-            && let Some(&session) = SESSION_TICKETS.lock().get(server_name)
+            && let Some(&session) = SESSION_TICKETS.lock().get(&lookup_key)
         {
             unsafe {
                 boring_sys::SSL_set_session(ssl.as_ptr(), session as *mut boring_sys::SSL_SESSION)
             };
-            resume_key = Some(server_name.to_string());
+            resume_key = Some(lookup_key);
+            tracing::debug!(server_name, "QUIC TLS: offering cached session ticket");
         }
         ssl.set_alpn_protos(&self.alpn_wire)
             .expect("invalid ALPN wire format");
@@ -638,6 +663,7 @@ impl crypto::ClientConfig for BoringQuicClientConfig {
 
         let state = Box::new(QuicCryptoState {
             allow_resumption: !self.has_pin,
+            ticket_key: self.ticket_key.clone(),
             ..Default::default()
         });
         let ok = unsafe {
@@ -703,23 +729,48 @@ impl BoringQuicSession {
         // "feed me more", which arrives via the next read_handshake.
         let ret = unsafe { boring_sys::SSL_do_handshake(self.ssl.as_ptr()) };
         if ret == 1 {
-            self.state.handshake_complete = true;
+            // `SSL_in_init` is authoritative (BoringSSL mock parity): a
+            // resumed handshake can return 1 here while still in init.
+            self.state.handshake_complete =
+                unsafe { boring_sys::SSL_in_init(self.ssl.as_ptr()) } == 0;
             return Ok(());
         }
         let code = unsafe { boring_sys::SSL_get_error(self.ssl.as_ptr(), ret) };
         if code as u32 == boring_sys::SSL_ERROR_WANT_READ as u32 {
             return Ok(());
         }
+        if code as u32 == boring_sys::SSL_ERROR_EARLY_DATA_REJECTED as u32 {
+            // The server rejected 0-RTT (every official server does): reset
+            // and continue the handshake without early data — the BoringSSL
+            // contract (ssl.h:3362), not a ticket rejection.
+            unsafe { boring_sys::SSL_reset_early_data_reject(self.ssl.as_ptr()) };
+            return self.drive_handshake();
+        }
         let reason = ErrorStack::get().to_string();
+        // Log the full error queue (BoringSSL file/line per entry) — needed
+        // to pin down which call raises INVALID_OPERATION on resumed
+        // handshakes.
+        for e in ErrorStack::get().errors() {
+            tracing::debug!(
+                file = e.file(),
+                line = e.line(),
+                library = e.library(),
+                reason = e.reason(),
+                "QUIC TLS handshake error queue entry"
+            );
+        }
         // The cached ticket was rejected (server restart, a different server
         // behind the same SNI, or a session minted under a pre-reload
         // SSL_CTX). Evict it so the next dial starts a full handshake
         // instead of failing on the same ticket forever.
         if let Some(key) = self.resume_key.take() {
+            tracing::debug!(server_name = %key, error = %reason, "QUIC TLS: evicting rejected session ticket");
             let old = SESSION_TICKETS.lock().remove(&key);
             if let Some(old) = old {
                 unsafe { boring_sys::SSL_SESSION_free(old as *mut boring_sys::SSL_SESSION) };
             }
+        } else {
+            tracing::debug!(error = %reason, "QUIC TLS: handshake failed with no ticket offered");
         }
         Err(self.fatal_error(&reason))
     }
@@ -824,14 +875,28 @@ impl Session for BoringQuicSession {
             return Err(self.fatal_error("unexpected CRYPTO data at this level"));
         }
 
-        if self.state.handshake_complete {
-            let ok = unsafe { boring_sys::SSL_process_quic_post_handshake(self.ssl.as_ptr()) };
-            if ok != 1 {
-                return Err(self.fatal_error(&ErrorStack::get().to_string()));
-            }
-        } else {
+        // Branch on BoringSSL's own in-init state (its mock_quic_transport
+        // does exactly this), not our flag: a resumed handshake can have
+        // `SSL_do_handshake` return 1 while `SSL_in_init` is still true,
+        // and calling `SSL_process_quic_post_handshake` then fails with
+        // ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED.
+        if unsafe { boring_sys::SSL_in_init(self.ssl.as_ptr()) } == 1 {
             self.driven = true;
             self.drive_handshake()?;
+        } else {
+            let ok = unsafe { boring_sys::SSL_process_quic_post_handshake(self.ssl.as_ptr()) };
+            if ok != 1 {
+                for e in ErrorStack::get().errors() {
+                    tracing::debug!(
+                        file = e.file(),
+                        line = e.line(),
+                        library = e.library(),
+                        reason = e.reason(),
+                        "QUIC TLS post-handshake error queue entry"
+                    );
+                }
+                return Err(self.fatal_error(&ErrorStack::get().to_string()));
+            }
         }
 
         if !self.got_handshake_data
@@ -1047,7 +1112,11 @@ mod tests {
     #[tokio::test]
     async fn rejected_ticket_is_evicted() {
         let addr = spawn_echo_server(&[b"h3"]);
-        let node = skip_verify_node();
+        let node = Node {
+            address: "127.0.0.1:0".to_string(),
+            ..skip_verify_node()
+        };
+        let ticket_key = format!("{}|{}", node.host(), node.port);
         // Prime the cache under the first client config (SSL_CTX #1).
         let cfg1 = crate::quic::client_config(&node, &[b"h3"], Default::default())
             .await
@@ -1061,7 +1130,7 @@ mod tests {
         let _ = recv.read_to_end(16).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         conn.close(0u32.into(), b"done");
-        assert!(SESSION_TICKETS.lock().contains_key("evict.test"));
+        assert!(SESSION_TICKETS.lock().contains_key(&ticket_key));
 
         // Rebuild the client config (SSL_CTX #2, as a reload would) and dial
         // twice: whatever happens with the cross-context ticket on the first
@@ -1082,7 +1151,7 @@ mod tests {
                 Err(e) => {
                     assert_eq!(attempt, 0, "second dial must succeed, got: {e}");
                     assert!(
-                        !SESSION_TICKETS.lock().contains_key("evict.test"),
+                        !SESSION_TICKETS.lock().contains_key(&ticket_key),
                         "rejected ticket must be evicted after the failed dial"
                     );
                 }

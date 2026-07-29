@@ -637,11 +637,14 @@ impl Hysteria2Handler {
             )
             .await?;
             let quic = QuicClient::new(node.host().to_string(), node.port, server_name, config);
+            let mtu = node.quic_mtu.unwrap_or(1252);
+            let quic = quic.with_max_udp_payload_size(mtu);
             let quic = match (obfs, hop) {
                 (None, None) => quic,
                 (obfs, hop) => quic.with_endpoint_factory(hy2_endpoint_factory(
                     obfs.map(|p| Arc::from(p.as_bytes())),
                     hop,
+                    mtu,
                 )),
             };
             Ok(Arc::new(Hy2Client {

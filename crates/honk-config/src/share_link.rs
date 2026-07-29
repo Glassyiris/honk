@@ -288,6 +288,16 @@ impl Node {
             }
         }
 
+        // QUIC payload-size cap (`mtu=`, hy2/tuic/juicity): default 1252
+        // (PMTU-safe); raise on paths known to carry bigger datagrams.
+        if matches!(
+            protocol,
+            NodeProtocol::Hysteria2 | NodeProtocol::Tuic | NodeProtocol::Juicity
+        ) && let Some(v) = query.get("mtu")
+        {
+            node.quic_mtu = v.parse().ok();
+        }
+
         if protocol == NodeProtocol::Tuic {
             // QUIC flow-control knobs (same spelling as the hy2 fields).
             if let Some(v) = query.get("initStreamReceiveWindow") {

@@ -51,8 +51,9 @@ const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 /// Close the shared QUIC connection after this long without any open stream.
 const CONN_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Grace period after sending AUTHENTICATE for the server to reject bad
-/// credentials by closing the connection.
-const AUTH_GRACE: Duration = Duration::from_millis(150);
+/// credentials by closing the connection. Zero (tuic parity): bad
+/// credentials fail the first stream open an RTT later instead.
+const AUTH_GRACE: Duration = Duration::ZERO;
 /// Tear down a UDP session bridge after this long without traffic.
 const UDP_BRIDGE_IDLE: Duration = Duration::from_secs(90);
 
@@ -191,7 +192,8 @@ impl JuicityHandler {
             )
             .await?;
             Ok(Arc::new(JuicityClient {
-                quic: QuicClient::new(node.host().to_string(), node.port, server_name, config),
+                quic: QuicClient::new(node.host().to_string(), node.port, server_name, config)
+                    .with_max_udp_payload_size(node.quic_mtu.unwrap_or(1252)),
                 uuid: *uuid.as_bytes(),
                 password,
             }))
@@ -393,7 +395,18 @@ impl ProxyHandler for JuicityHandler {
 
     async fn test_connectivity(&self, node: &Node) -> bool {
         match Self::client_for(node).await {
-            Ok(client) => client.connection(Duration::from_secs(5)).await.is_ok(),
+            // Zero auth grace on the dial path (tuic parity): wait ~1 RTT
+            // for the server to close on bad credentials.
+            Ok(client) => match client.connection(Duration::from_secs(5)).await {
+                Ok((conn, _)) => {
+                    let wait = (2 * conn.rtt()).max(Duration::from_millis(2));
+                    tokio::select! {
+                        _ = conn.closed() => false,
+                        _ = tokio::time::sleep(wait) => true,
+                    }
+                }
+                Err(_) => false,
+            },
             Err(e) => {
                 debug!("Juicity connectivity test failed for {}: {}", node.name, e);
                 false
@@ -619,10 +632,12 @@ mod tests {
         let handler = JuicityHandler::new();
         let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
 
-        let result = handler
+        // Optimistic auth (zero grace, tuic parity): the rejection surfaces
+        // ~1 RTT later when the server closes the connection; the
+        // connectivity probe (which waits for it) must say no.
+        let _ = handler
             .dial(&node, target, None, Duration::from_secs(5))
             .await;
-        assert!(result.is_err(), "bad password must fail the dial");
         assert!(!handler.test_connectivity(&node).await);
     }
 
