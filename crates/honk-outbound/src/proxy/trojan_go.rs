@@ -145,6 +145,9 @@ struct MuxConnection {
     readers: Arc<Mutex<HashMap<u16, mpsc::Sender<Vec<u8>>>>>,
     next_id: AtomicU16,
     closed: AtomicBool,
+    /// First close reason wins; kept for diagnostics (later failures do
+    /// not overwrite it).
+    close_reason: Mutex<Option<String>>,
 }
 
 impl std::fmt::Debug for MuxConnection {
@@ -153,6 +156,7 @@ impl std::fmt::Debug for MuxConnection {
             .field("host_key", &self.host_key)
             .field("next_id", &self.next_id)
             .field("closed", &self.closed)
+            .field("close_reason", &self.close_reason)
             .finish_non_exhaustive()
     }
 }
@@ -170,6 +174,7 @@ impl MuxConnection {
                 readers: Arc::new(Mutex::new(HashMap::new())),
                 next_id: AtomicU16::new(0),
                 closed: AtomicBool::new(false),
+                close_reason: Mutex::new(None),
             },
             read_half,
         )
@@ -188,6 +193,20 @@ impl MuxConnection {
         tokio::spawn(async move {
             let _ = writer.lock().await.shutdown().await;
         });
+    }
+
+    /// Fail the connection once: record the first close reason, then
+    /// close (every logical stream EOFs, no new streams are served).
+    /// The pool prunes on the next offer pass — the session does not
+    /// back-reference the pool.
+    fn fail_session(&self, reason: impl Into<String>) {
+        {
+            let mut slot = self.close_reason.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(reason.into());
+            }
+        }
+        self.close();
     }
 
     fn alloc_stream_id(&self) -> u16 {
@@ -214,13 +233,13 @@ impl MuxConnection {
             loop {
                 let n = match read_half.read(&mut buf).await {
                     Ok(0) => {
-                        this.closed.store(true, Ordering::Release);
+                        this.fail_session("demux read EOF");
                         break;
                     }
                     Ok(n) => n,
                     Err(e) => {
                         tracing::debug!("TrojanGo mux read error: {}", e);
-                        this.closed.store(true, Ordering::Release);
+                        this.fail_session(format!("demux read error: {e}"));
                         break;
                     }
                 };
@@ -289,6 +308,9 @@ impl ProxyHandler for TrojanGoHandler {
     ) -> anyhow::Result<ProxyStream> {
         let password = node.password.as_deref().unwrap_or("");
         let mux = self.get_mux(node, connect_timeout).await?;
+        if mux.is_closed() {
+            anyhow::bail!("Trojan-Go mux connection is closed");
+        }
         let stream_id = mux.alloc_stream_id();
 
         let header = build_mux_header(password, stream_id, target, target_domain);
@@ -310,6 +332,7 @@ impl ProxyHandler for TrojanGoHandler {
         }
 
         let writer = Arc::clone(&mux.writer);
+        let mux_for_fail = Arc::clone(&mux);
         let sid = stream_id;
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
@@ -323,6 +346,9 @@ impl ProxyHandler for TrojanGoHandler {
                         frame.extend_from_slice(&buf[..n]);
                         let mut w = writer.lock().await;
                         if w.write_all(&frame).await.is_err() {
+                            // A failed frame write breaks the session's
+                            // framing: propagate to every logical stream.
+                            mux_for_fail.fail_session("frame write error");
                             break;
                         }
                     }
@@ -500,6 +526,38 @@ fn hex_digit(n: u8) -> char {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 0.5.3: a physical EOF on the demux read half must propagate —
+    /// the session closes and every logical stream's receiver EOFs
+    /// (previously only the closed flag was set and streams hung).
+    #[tokio::test]
+    async fn test_demux_eof_fails_session_and_streams() {
+        let (client_end, server_end) = tokio::io::duplex(4096);
+        let (conn, read_half) = MuxConnection::new("test:443".into(), Box::new(client_end));
+        let conn = Arc::new(conn);
+        conn.spawn_demux_task(read_half);
+
+        let (tx, mut rx) = mpsc::channel(8);
+        conn.readers.lock().unwrap().insert(1, tx);
+
+        drop(server_end); // physical EOF
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while rx.recv().await.is_some() {}
+        })
+        .await
+        .expect("stream never EOFed after physical EOF");
+        assert!(conn.is_closed());
+        assert_eq!(
+            conn.close_reason.lock().unwrap().as_deref(),
+            Some("demux read EOF")
+        );
+        // First close reason wins.
+        conn.fail_session("later failure");
+        assert_eq!(
+            conn.close_reason.lock().unwrap().as_deref(),
+            Some("demux read EOF")
+        );
+    }
 
     #[test]
     fn test_mux_header_basic() {
