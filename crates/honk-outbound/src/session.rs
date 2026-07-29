@@ -5,17 +5,21 @@
 //! What this centralizes (previously re-implemented, slightly
 //! differently, per protocol):
 //!
-//! - one pool per [`PoolKey`] (host:port + auth/TLS fingerprint — the
-//!   protocols already build these), with a hard session cap;
-//! - least-loaded scheduling: the live session with the fewest active
-//!   streams below the soft per-session cap is offered first;
-//! - per-key dial single-flight: concurrent dials share one in-flight
-//!   session establishment instead of stampeding the server;
+//! - one pool per key (per-node constant in the runtime-registry world),
+//!   with a hard session cap;
+//! - least-loaded scheduling over `Active` sessions (Draining ones take
+//!   no new channels);
+//! - **pool-owned dial single-flight**: the first caller to find no
+//!   in-flight dial registers it and the pool spawns the dial task — a
+//!   cancelled caller only ends its own wait, never the shared dial
+//!   (outcomes broadcast to every waiter);
 //! - dial circuit breaker: consecutive establishment failures back off
 //!   exponentially before the pool dials again (a dead server must not
 //!   eat a TCP connect per proxied flow);
-//! - idle reaping and optional prewarm (`min_idle`) via one janitor per
-//!   key;
+//! - RAII stream-slot permits (`SessionPermit`) as the single capacity
+//!   truth, and [`SessionPool::open_with`] for atomic reserve+open;
+//! - idle reaping, jittered max-age drains and optional prewarm
+//!   (`min_idle`) via one janitor per key;
 //! - a metrics snapshot (sessions, streams, dial failures) per key.
 //!
 //! What stays protocol-owned: session establishment, stream open,

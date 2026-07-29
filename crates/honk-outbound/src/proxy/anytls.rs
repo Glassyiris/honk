@@ -7,7 +7,9 @@
 //!   (`PSH` → stream payload, `FIN` → stream EOF, heartbeats answered at
 //!   session level);
 //! - an atomic `sid` allocator hands out stream ids (starting at 1);
-//! - the write half is shared behind a mutex (sing `connLock` parity);
+//! - every frame goes out through the single ordered **writer task** (an
+//!   ordered command queue — no cross-stream mutex, and a cancelled caller
+//!   can never truncate a queued frame);
 //! - dialing on a healthy pooled session just opens a new `sid` (SYN + the
 //!   first PSH carrying the target address) — no exclusive session borrow;
 //! - a stream ends with FIN in either direction; the session itself is
@@ -69,8 +71,9 @@ const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30;
 
 /// Buffer of the user-facing half of a stream (matches the old pool).
 const STREAM_DUPLEX_BUFFER: usize = 65536;
-/// Per-stream demux queue depth (frames). Full queues apply backpressure
-/// to the session demux instead of growing without bound.
+/// Per-stream demux queue depth (frames). A full queue applies bounded
+/// backpressure to the session demux (see [`HOL_STALL_TIMEOUT`]) instead
+/// of growing without bound.
 const STREAM_QUEUE_CAP: usize = 64;
 
 /// Transport halves behind trait objects so tests can drive a session over
@@ -153,8 +156,9 @@ enum StreamEvent {
 /// Per-stream demux delivery channel.
 #[derive(Clone)]
 enum StreamSink {
-    /// TCP streams: bounded queue with demux backpressure (data must not
-    /// be dropped).
+    /// TCP streams: bounded queue with bounded backpressure (payload
+    /// must not be dropped; a consumer stalled past `HOL_STALL_TIMEOUT`
+    /// gets only its own stream killed).
     Tcp(mpsc::Sender<StreamEvent>),
     /// UoT streams: drop-on-full (UDP semantics) — a slow consumer must
     /// never backpressure the session demux, or one hot UDP flow wedges
@@ -163,7 +167,7 @@ enum StreamSink {
 }
 
 impl StreamSink {
-    /// Deliver a payload frame: backpressure for TCP, drop-on-full for UoT.
+    /// Deliver a payload frame: demux-bounded for TCP, drop-on-full for UoT.
     /// Returns false when the receiver is gone (stream died unregistered).
     async fn send_data(&self, data: Vec<u8>) -> bool {
         match self {
@@ -507,13 +511,13 @@ impl AnyTlsSession {
         Ok(())
     }
 
-    /// Register a sid and write the SYN+PSH opening pair under one writer
-    /// lock (never interleaved with other streams). The caller proves
-    /// capacity with `permit` (from `try_reserve`); the returned guard
-    /// owns both the registration and the slot until the caller commits;
-    /// a write failure or a cancellation removes the sid, and a
-    /// possibly-partial frame on the wire closes the session (sing
-    /// `writeControlFrame` parity).
+    /// Register a sid and enqueue the SYN+PSH opening pair as one atomic
+    /// batch (never interleaved with another stream's frame). The caller
+    /// proves capacity with `permit` (from `try_reserve`); the returned
+    /// guard owns both the registration and the slot until the caller
+    /// commits; abandoning it removes the sid and cleans the server's
+    /// side with a FIN (the writer queue makes partial frames
+    /// impossible).
     async fn register_and_open(
         self: &Arc<Self>,
         target_addr: Vec<u8>,
@@ -607,8 +611,9 @@ impl AnyTlsSession {
 
     /// Open a TCP stream with the direct data path (no stream task, no
     /// duplex): inbound frames arrive through the demux queue, outbound
-    /// frames go straight to the session writer. Backpressure is kept (Tcp
-    /// sink) — TCP payload must not be dropped, unlike UoT.
+    /// frames go through the ordered writer queue. Bounded backpressure
+    /// on both ends (Tcp sink inbound, writer-queue permits outbound) —
+    /// TCP payload must not be dropped, unlike UoT.
     async fn open_stream_direct(
         self: &Arc<Self>,
         target_addr: Vec<u8>,
