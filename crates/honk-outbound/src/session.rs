@@ -46,6 +46,10 @@ pub struct SessionPoolConfig {
     pub dial_backoff: Duration,
     /// Cap for the dial-failure backoff.
     pub max_dial_backoff: Duration,
+    /// Max session age before it drains (no new streams; existing ones
+    /// finish). Jittered ±10% per session to avoid reconnect storms.
+    /// `None` = sessions never age out.
+    pub max_session_age: Option<Duration>,
 }
 
 impl Default for SessionPoolConfig {
@@ -56,6 +60,7 @@ impl Default for SessionPoolConfig {
             janitor_interval: Duration::from_secs(30),
             dial_backoff: Duration::from_secs(1),
             max_dial_backoff: Duration::from_secs(30),
+            max_session_age: None,
         }
     }
 }
@@ -109,7 +114,7 @@ pub trait ManagedSession: Send + Sync {
     fn is_closed(&self) -> bool;
     /// Close the session (idle reap, pool shutdown).
     fn close(&self);
-    /// Lifecycle state; `Draining` takes no new permits. Default derives
+    /// Session state; `Draining` takes no new permits. Default derives
     /// from `is_closed` (legacy sessions without a real machine).
     fn state(&self) -> SessionState {
         if self.is_closed() {
@@ -118,10 +123,13 @@ pub trait ManagedSession: Send + Sync {
             SessionState::Active
         }
     }
+    /// When the session was established (max-age drains; default `now`
+    /// means "never ages out" for legacy sessions).
+    fn created_at(&self) -> Instant {
+        Instant::now()
+    }
     /// Stop accepting new logical channels (GOAWAY, max-age); existing
     /// ones run to the end and the session closes at zero.
-    // Wired to GOAWAY/max-age hooks in 3B.
-    #[allow(dead_code)]
     fn begin_drain(&self) {}
     /// Atomically reserve one stream slot: check `Active` → acquire →
     /// re-check `Active` (a session that began draining in between
@@ -347,7 +355,11 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                 if let Some(s) = pool
                     .sessions
                     .iter()
-                    .filter(|s| s.active_streams() < self.config.max_streams_per_session)
+                    // Draining sessions take no new channels.
+                    .filter(|s| {
+                        s.state() == SessionState::Active
+                            && s.active_streams() < self.config.max_streams_per_session
+                    })
                     .min_by_key(|s| s.active_streams())
                 {
                     Step::Have(Arc::clone(s))
@@ -589,6 +601,9 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
             // Per-session zero-stream streak start, keyed by Arc identity
             // (positions in the vec shift as sessions come and go).
             let mut idle_since: HashMap<usize, Instant> = HashMap::new();
+            // Per-session max-age deadline (jittered ±10% by pointer so a
+            // fleet of same-age sessions never reconnects in lockstep).
+            let mut drain_at: HashMap<usize, Instant> = HashMap::new();
             loop {
                 tokio::select! {
                     _ = interval.tick() => {}
@@ -604,8 +619,24 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                     let mut to_close = Vec::new();
                     idle_since
                         .retain(|ptr, _| live.iter().any(|s| Arc::as_ptr(s) as usize == *ptr));
+                    drain_at.retain(|ptr, _| live.iter().any(|s| Arc::as_ptr(s) as usize == *ptr));
                     for s in &live {
                         let ptr = Arc::as_ptr(s) as usize;
+                        // Max-age drain: stop taking new streams past the
+                        // jittered deadline; close once fully drained.
+                        if let Some(max_age) = pool.config.max_session_age {
+                            let deadline = drain_at.entry(ptr).or_insert_with(|| {
+                                let jitter = 0.9 + ((ptr % 200) as f64) / 1000.0;
+                                s.created_at() + max_age.mul_f64(jitter)
+                            });
+                            if now >= *deadline {
+                                s.begin_drain();
+                            }
+                        }
+                        if s.state() == SessionState::Draining && s.active_streams() == 0 {
+                            to_close.push(Arc::clone(s));
+                            continue;
+                        }
                         if s.active_streams() > 0 {
                             idle_since.remove(&ptr);
                             continue;
@@ -680,6 +711,7 @@ mod tests {
     struct TestSession {
         streams: AtomicUsize,
         closed: AtomicBool,
+        state: AtomicUsize,
     }
 
     impl TestSession {
@@ -687,6 +719,7 @@ mod tests {
             Arc::new(Self {
                 streams: AtomicUsize::new(0),
                 closed: AtomicBool::new(false),
+                state: AtomicUsize::new(0),
             })
         }
     }
@@ -700,6 +733,16 @@ mod tests {
         }
         fn close(&self) {
             self.closed.store(true, Ordering::Relaxed);
+        }
+        fn state(&self) -> SessionState {
+            match self.state.load(Ordering::Relaxed) {
+                _ if self.is_closed() => SessionState::Closed,
+                0 => SessionState::Active,
+                _ => SessionState::Draining,
+            }
+        }
+        fn begin_drain(&self) {
+            self.state.store(1, Ordering::Relaxed);
         }
     }
 
@@ -897,6 +940,35 @@ mod tests {
             s.closed.load(Ordering::Relaxed),
             "insert after shutdown closes the session"
         );
+    }
+
+    /// v2 max-age: past the jittered deadline the session drains (no new
+    /// channels) and the janitor closes it once empty.
+    #[tokio::test(start_paused = true)]
+    async fn max_age_drains_and_janitor_closes_empty_session() {
+        let pool = Arc::new(pool(SessionPoolConfig {
+            max_session_age: Some(Duration::from_secs(60)),
+            janitor_interval: Duration::from_secs(5),
+            ..Default::default()
+        }));
+        pool.ensure_janitor("k", 0, Duration::from_secs(3600), || async {
+            unreachable!("no prewarm")
+        });
+        let session = pool
+            .offer("k", || async { Ok(TestSession::new()) })
+            .await
+            .unwrap();
+        assert_eq!(session.state(), SessionState::Active);
+        // Past 60s × 1.1 (the worst jitter), the janitor has drained it
+        // (an empty session may already be closed in the same tick).
+        tokio::time::sleep(Duration::from_secs(80)).await;
+        assert!(
+            session.state() == SessionState::Draining || session.is_closed(),
+            "past max-age the session drains"
+        );
+        // Drained and empty: the janitor closes it.
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        assert!(session.is_closed());
     }
 
     #[tokio::test(start_paused = true)]

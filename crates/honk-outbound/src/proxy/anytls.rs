@@ -21,7 +21,6 @@ use honk_config::node::Node;
 use honk_config::types::NodeProtocol;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-#[cfg(test)]
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -31,6 +30,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time;
+use tokio::time::Instant;
 use tracing::{debug, warn};
 
 use super::addr;
@@ -127,6 +127,9 @@ pub(crate) fn session_pool_config() -> crate::session::SessionPoolConfig {
         max_sessions: 2,
         max_streams_per_session: MAX_STREAMS_PER_SESSION,
         janitor_interval: Duration::from_secs(DEFAULT_IDLE_CHECK_INTERVAL_SECS),
+        // Sessions rotate out after ~30 min (jittered ±10% per session,
+        // so a batch of same-age sessions never reconnects in lockstep).
+        max_session_age: Some(Duration::from_secs(30 * 60)),
         ..Default::default()
     }
 }
@@ -139,8 +142,12 @@ static SESSION_SEQ: AtomicU64 = AtomicU64::new(1);
 enum StreamEvent {
     /// Server payload for this stream.
     Data(Vec<u8>),
-    /// Server closed the stream (FIN, or SYNACK error report).
+    /// Server closed the stream (clean FIN).
     Fin,
+    /// Stream-level failure: server-reported open error (SYNACK with
+    /// data) or a local HOL kill. Surfaces as a read error, not a clean
+    /// EOF (a truncated TCP stream must never look like a clean close).
+    Error(Arc<anyhow::Error>),
 }
 
 /// Per-stream demux delivery channel.
@@ -176,6 +183,20 @@ impl StreamSink {
             }
             StreamSink::Uot(tx) => {
                 let _ = tx.try_send(StreamEvent::Fin);
+            }
+        }
+    }
+
+    /// Deliver a stream-level failure (open error). Same delivery
+    /// semantics as FIN: never dropped for TCP.
+    async fn send_error(&self, err: anyhow::Error) {
+        let event = StreamEvent::Error(Arc::new(err));
+        match self {
+            StreamSink::Tcp(tx) => {
+                let _ = tx.send(event).await;
+            }
+            StreamSink::Uot(tx) => {
+                let _ = tx.try_send(event);
             }
         }
     }
@@ -215,11 +236,108 @@ impl Drop for StreamRegistration {
         }
         self.session.streams.lock().unwrap().remove(&self.sid);
         if self.frame_started {
-            // A partial frame may be on the wire: the session's framing
-            // is no longer trustworthy.
-            self.session.close();
+            // The opening frames are already queued (the writer queue
+            // makes partial frames impossible): clean up the server's
+            // side with a FIN instead of killing a healthy session.
+            let _ = self
+                .session
+                .enqueue_control(CMD_FIN, self.sid, bytes::Bytes::new());
         }
         // `permit` drops here too: the slot is released exactly once.
+    }
+}
+
+/// One ordered writer command. Data commands hold a queue permit until
+/// popped (bounded → backpressure); control commands ride the reserved
+/// headroom so SYN/FIN can never be starved by payload.
+enum FrameCommand {
+    Data {
+        sid: u32,
+        payload: bytes::Bytes,
+        _permit: tokio::sync::OwnedSemaphorePermit,
+    },
+    Control {
+        cmd: u8,
+        sid: u32,
+        payload: bytes::Bytes,
+    },
+}
+
+/// Session writer queue: every frame goes out in enqueue order through a
+/// single task — no cross-stream mutex, and a cancelled caller can never
+/// truncate a queued frame (only a physical write failure closes the
+/// session). Data capacity is `WRITER_QUEUE_CAP - WRITER_CONTROL_RESERVED`;
+/// control frames take the reserved headroom.
+struct WriterQueue {
+    queue: Mutex<std::collections::VecDeque<FrameCommand>>,
+    notify: tokio::sync::Notify,
+    data_permits: Arc<tokio::sync::Semaphore>,
+}
+
+/// Total writer-queue depth (data + control headroom).
+const WRITER_QUEUE_CAP: usize = 1024;
+/// Slots reserved for control frames (SYN/FIN/HEART) — data can never
+/// fill the queue past `WRITER_QUEUE_CAP - WRITER_CONTROL_RESERVED`.
+const WRITER_CONTROL_RESERVED: usize = 128;
+
+impl WriterQueue {
+    fn new() -> Self {
+        Self {
+            queue: Mutex::new(std::collections::VecDeque::new()),
+            notify: tokio::sync::Notify::new(),
+            data_permits: Arc::new(tokio::sync::Semaphore::new(
+                WRITER_QUEUE_CAP - WRITER_CONTROL_RESERVED,
+            )),
+        }
+    }
+
+    /// Push commands atomically as one batch (the SYN+PSH opening pair is
+    /// never interleaved with another stream's frame).
+    fn push_batch(&self, cmds: impl IntoIterator<Item = FrameCommand>) {
+        self.queue.lock().unwrap().extend(cmds);
+        self.notify.notify_one();
+    }
+
+    async fn pop(&self) -> FrameCommand {
+        loop {
+            if let Some(cmd) = self.queue.lock().unwrap().pop_front() {
+                return cmd;
+            }
+            self.notify.notified().await;
+        }
+    }
+
+    fn clear(&self) {
+        self.queue.lock().unwrap().clear();
+    }
+}
+
+/// The single writer task for a session: drains the queue in order,
+/// flushing per frame. A physical write failure kills the session (sing
+/// `writeControlFrame` parity) — frames already queued are lost with it.
+async fn session_writer(
+    session: Arc<AnyTlsSession>,
+    mut write: BoxedWriter,
+    queue: Arc<WriterQueue>,
+) {
+    loop {
+        let cmd = queue.pop().await;
+        let (cmd_id, sid, payload) = match &cmd {
+            FrameCommand::Data { sid, payload, .. } => (CMD_PSH, *sid, payload),
+            FrameCommand::Control { cmd, sid, payload } => (*cmd, *sid, payload),
+        };
+        let failed = match write_frame(&mut write, cmd_id, sid, payload).await {
+            Ok(()) => write.flush().await.is_err(),
+            Err(_) => true,
+        };
+        if failed {
+            debug!("AnyTLS session {} writer failed, closing", session.seq);
+            session.fail(anyhow::anyhow!("writer task write failed"));
+            break;
+        }
+        if session.is_closed() {
+            break;
+        }
     }
 }
 
@@ -238,9 +356,11 @@ pub(crate) struct AnyTlsSession {
     seq: u64,
     /// Pool key (`host:port` of the AnyTLS server).
     addr: String,
-    /// Shared frame writer (sing `connLock`): all streams serialize their
-    /// frames through this mutex.
-    writer: Arc<tokio::sync::Mutex<BoxedWriter>>,
+    /// Ordered writer queue: every frame goes out through the single
+    /// writer task (no cross-stream mutex, uncancellable once queued).
+    writer_q: Arc<WriterQueue>,
+    /// Writer task handle, aborted on close.
+    writer_task: Mutex<Option<tokio::task::AbortHandle>>,
     /// Open streams: sid → demux delivery channel.
     streams: Mutex<HashMap<u32, StreamSink>>,
     /// Stream id allocator (sing `streamId`); first stream gets sid 1.
@@ -248,9 +368,18 @@ pub(crate) struct AnyTlsSession {
     /// Set once the TLS connection dies or an ALERT arrives; idempotent
     /// close via [`AnyTlsSession::close`].
     closed: AtomicBool,
+    /// Establishment time (max-age drains).
+    created: Instant,
     /// Lifecycle: Active → Draining → Closed (a usize of
     /// [`crate::session::SessionState`] discriminants).
     session_state: AtomicUsize,
+    /// First physical-failure reason (demux read error, writer failure):
+    /// streams report it after draining queued data — a dead session is
+    /// never a clean EOF.
+    terminal_error: std::sync::OnceLock<Arc<anyhow::Error>>,
+    /// Streams killed locally (HOL slow-consumer): their readers see a
+    /// reset after the queued data drains, not a clean EOF.
+    killed_streams: Mutex<HashSet<u32>>,
     /// Stream-slot capacity: the single capacity truth (replaces the old
     /// active_streams counter — a permit outlives the counter's races).
     stream_permits: Arc<tokio::sync::Semaphore>,
@@ -277,11 +406,15 @@ impl AnyTlsSession {
         let session = Arc::new(Self {
             seq: SESSION_SEQ.fetch_add(1, Ordering::Relaxed),
             addr: addr.to_string(),
-            writer: Arc::new(tokio::sync::Mutex::new(transport_write)),
+            writer_q: Arc::new(WriterQueue::new()),
+            writer_task: Mutex::new(None),
             streams: Mutex::new(HashMap::new()),
             next_sid: AtomicU32::new(0),
             closed: AtomicBool::new(false),
+            created: Instant::now(),
             session_state: AtomicUsize::new(crate::session::SessionState::Active as usize),
+            terminal_error: std::sync::OnceLock::new(),
+            killed_streams: Mutex::new(HashSet::new()),
             stream_permits: Arc::new(tokio::sync::Semaphore::new(MAX_STREAMS_PER_SESSION)),
             demux: Mutex::new(None),
         });
@@ -291,6 +424,12 @@ impl AnyTlsSession {
             tokio::spawn(async move { session_demux(session, transport_read).await })
         };
         *session.demux.lock().unwrap() = Some(demux_handle.abort_handle());
+        let writer_handle = {
+            let session = Arc::clone(&session);
+            let queue = Arc::clone(&session.writer_q);
+            tokio::spawn(async move { session_writer(session, transport_write, queue).await })
+        };
+        *session.writer_task.lock().unwrap() = Some(writer_handle.abort_handle());
 
         debug!("AnyTLS session {} for {} established", session.seq, addr);
         Ok(session)
@@ -306,11 +445,65 @@ impl AnyTlsSession {
         MAX_STREAMS_PER_SESSION - self.stream_permits.available_permits()
     }
 
-    /// Write a single frame through the shared writer.
-    async fn write_frame(&self, cmd: u8, sid: u32, data: &[u8]) -> anyhow::Result<()> {
-        let mut w = self.writer.lock().await;
-        write_frame(&mut *w, cmd, sid, data).await?;
-        w.flush().await?;
+    /// Enqueue a control frame (SYN/FIN/HEART): ordered, reserved
+    /// headroom, uncancellable once queued. Fails only when the session
+    /// is already closed.
+    fn enqueue_control(&self, cmd: u8, sid: u32, payload: bytes::Bytes) -> std::io::Result<()> {
+        if self.is_closed() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "AnyTLS session is closed",
+            ));
+        }
+        self.writer_q
+            .push_batch([FrameCommand::Control { cmd, sid, payload }]);
+        Ok(())
+    }
+
+    /// Enqueue a payload PSH for a stream: bounded by the writer-queue
+    /// data permits, so a fast stream backpressures here instead of
+    /// growing memory. Uncancellable once queued.
+    async fn enqueue_data(&self, sid: u32, payload: bytes::Bytes) -> std::io::Result<()> {
+        if self.is_closed() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "AnyTLS session is closed",
+            ));
+        }
+        let permit = Arc::clone(&self.writer_q.data_permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "AnyTLS writer queue is closed",
+                )
+            })?;
+        self.writer_q.push_batch([FrameCommand::Data {
+            sid,
+            payload,
+            _permit: permit,
+        }]);
+        Ok(())
+    }
+
+    /// Enqueue a UoT datagram: drop-on-full (UDP semantics) — a hot UDP
+    /// flow must never backpressure the session writer.
+    fn enqueue_uot(&self, sid: u32, payload: bytes::Bytes) -> std::io::Result<()> {
+        if self.is_closed() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "AnyTLS session is closed",
+            ));
+        }
+        let Ok(permit) = Arc::clone(&self.writer_q.data_permits).try_acquire_owned() else {
+            return Ok(()); // saturated: drop the datagram
+        };
+        self.writer_q.push_batch([FrameCommand::Data {
+            sid,
+            payload,
+            _permit: permit,
+        }]);
         Ok(())
     }
 
@@ -341,29 +534,26 @@ impl AnyTlsSession {
             committed: false,
             permit: Some(permit),
         };
-        let open_result: std::io::Result<()> = async {
-            let mut w = self.writer.lock().await;
-            write_frame(&mut *w, CMD_SYN, sid, &[]).await?;
-            write_frame(&mut *w, CMD_PSH, sid, &target_addr).await?;
-            w.flush().await
+        // The opening pair goes out as one atomic batch — never
+        // interleaved with another stream's frame, never truncated (a
+        // physical write failure closes the session in the writer task).
+        if self.is_closed() {
+            return Err(anyhow::anyhow!("AnyTLS session {} is closed", self.seq));
         }
-        .await;
-        match open_result {
-            Ok(()) => {
-                guard.frame_started = false;
-                Ok((sid, rx, guard))
-            }
-            Err(e) => {
-                // Dropping the guard removes the sid, releases the slot,
-                // and closes the session (frame_started).
-                Err(anyhow::anyhow!(
-                    "AnyTLS session {} open sid={}: {}",
-                    self.seq,
-                    sid,
-                    e
-                ))
-            }
-        }
+        self.writer_q.push_batch([
+            FrameCommand::Control {
+                cmd: CMD_SYN,
+                sid,
+                payload: bytes::Bytes::new(),
+            },
+            FrameCommand::Control {
+                cmd: CMD_PSH,
+                sid,
+                payload: bytes::Bytes::from(target_addr),
+            },
+        ]);
+        guard.frame_started = false;
+        Ok((sid, rx, guard))
     }
 
     /// Open a new stream on this session (sing `Session.OpenStream`):
@@ -412,15 +602,7 @@ impl AnyTlsSession {
     /// Write one PSH frame for a UoT stream (datagrams go directly on the
     /// session, no stream task in between).
     async fn write_uot_frame(&self, sid: u32, data: &[u8]) -> std::io::Result<()> {
-        if self.is_closed() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionAborted,
-                "AnyTLS session is closed",
-            ));
-        }
-        let mut w = self.writer.lock().await;
-        write_frame(&mut *w, CMD_PSH, sid, data).await?;
-        w.flush().await
+        self.enqueue_uot(sid, bytes::Bytes::copy_from_slice(data))
     }
 
     /// Open a TCP stream with the direct data path (no stream task, no
@@ -445,8 +627,8 @@ impl AnyTlsSession {
     /// (released when the transport drops it), never this map's.
     async fn end_uot_stream(&self, sid: u32) {
         let was_registered = self.streams.lock().unwrap().remove(&sid).is_some();
-        if was_registered && !self.is_closed() {
-            let _ = self.write_frame(CMD_FIN, sid, &[]).await;
+        if was_registered {
+            let _ = self.enqueue_control(CMD_FIN, sid, bytes::Bytes::new());
         }
         debug!("AnyTLS session {} sid={} uot stream ended", self.seq, sid);
     }
@@ -459,10 +641,17 @@ impl AnyTlsSession {
         // No FIN back when the server already closed its side (dispatch_fin
         // leaves the entry registered; `notify_fin` distinguishes the
         // client-initiated close) or when the whole session is gone.
-        if notify_fin && was_registered && !self.is_closed() {
-            let _ = self.write_frame(CMD_FIN, sid, &[]).await;
+        if notify_fin && was_registered {
+            let _ = self.enqueue_control(CMD_FIN, sid, bytes::Bytes::new());
         }
         debug!("AnyTLS session {} sid={} stream ended", self.seq, sid);
+    }
+
+    /// Record the first physical-failure reason and close: streams
+    /// report the reason after draining queued data.
+    fn fail(&self, reason: anyhow::Error) {
+        let _ = self.terminal_error.set(Arc::new(reason));
+        self.close();
     }
 
     /// Close the session: flag it, drop all stream dispatch channels (their
@@ -482,19 +671,48 @@ impl AnyTlsSession {
         if let Some(handle) = self.demux.lock().unwrap().take() {
             handle.abort();
         }
-        let writer = Arc::clone(&self.writer);
-        tokio::spawn(async move {
-            let _ = writer.lock().await.shutdown().await;
-        });
+        if let Some(handle) = self.writer_task.lock().unwrap().take() {
+            handle.abort();
+        }
+        self.writer_q.clear();
         debug!("AnyTLS session {} for {} closed", self.seq, self.addr);
     }
 
     /// Deliver a server payload frame to its stream. TCP sinks apply
     /// backpressure (their data must not be dropped); UoT sinks drop on a
     /// full queue (UDP semantics — the demux never blocks on them).
+    /// Deliver a server payload frame to its stream. TCP sinks use
+    /// try_send: a slow consumer must never stall the whole session's
+    /// demux — the stream is killed (server told with a non-blocking
+    /// FIN; the already-queued data still drains to the reader before
+    /// the close) instead of blocking every other stream. UoT sinks
+    /// drop on full (UDP semantics).
     async fn dispatch_data(&self, sid: u32, data: Vec<u8>) {
         let sink = self.streams.lock().unwrap().get(&sid).cloned();
         match sink {
+            Some(StreamSink::Tcp(tx)) => match tx.try_send(StreamEvent::Data(data)) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    warn!(
+                        "AnyTLS session {} sid={} killed: slow consumer (HOL)",
+                        self.seq, sid
+                    );
+                    // The reader sees a reset (not a clean EOF) after the
+                    // already-queued data drains.
+                    self.killed_streams.lock().unwrap().insert(sid);
+                    self.streams.lock().unwrap().remove(&sid);
+                    if self
+                        .enqueue_control(CMD_FIN, sid, bytes::Bytes::new())
+                        .is_err()
+                    {
+                        // The writer queue is gone too — the session is dead.
+                        self.fail(anyhow::anyhow!("writer queue unavailable on HOL kill"));
+                    }
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.streams.lock().unwrap().remove(&sid);
+                }
+            },
             Some(sink) => {
                 if !sink.send_data(data).await {
                     // Stream task died without unregistering; clean up.
@@ -520,16 +738,27 @@ impl AnyTlsSession {
             sink.send_fin().await;
         }
     }
+
+    /// Deliver a stream-level failure (server-reported open error): the
+    /// reader sees an error, not a clean EOF.
+    async fn dispatch_error(&self, sid: u32, err: anyhow::Error) {
+        let sink = self.streams.lock().unwrap().get(&sid).cloned();
+        if let Some(sink) = sink {
+            sink.send_error(err).await;
+        }
+    }
 }
 
 /// Session receive loop (sing `Session.recvLoop`): read frames and dispatch
 /// by sid. Any read failure or server ALERT closes the whole session.
 async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedReader) {
+    let mut fail_reason: Option<anyhow::Error> = None;
     loop {
         let (cmd, sid, data) = match read_frame(&mut read).await {
             Ok(frame) => frame,
             Err(e) => {
                 debug!("AnyTLS session {} demux read failed: {}", session.seq, e);
+                fail_reason = Some(anyhow::anyhow!("demux read failed: {e}"));
                 break;
             }
         };
@@ -539,6 +768,8 @@ async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedReader) {
             CMD_SYNACK => {
                 // sing: a SYNACK carrying data reports a dial error for the
                 // stream (an empty SYNACK is a pure handshake ack — ignore).
+                // The target refused — a typed stream error, not a clean
+                // EOF (the session stays healthy).
                 if !data.is_empty() {
                     debug!(
                         "AnyTLS session {} sid={} remote dial error: {}",
@@ -546,13 +777,17 @@ async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedReader) {
                         sid,
                         String::from_utf8_lossy(&data)
                     );
-                    session.dispatch_fin(sid).await;
+                    session
+                        .dispatch_error(
+                            sid,
+                            anyhow::anyhow!("target refused: {}", String::from_utf8_lossy(&data)),
+                        )
+                        .await;
                 }
             }
             CMD_HEART_REQUEST => {
                 if session
-                    .write_frame(CMD_HEART_RESPONSE, sid, &[])
-                    .await
+                    .enqueue_control(CMD_HEART_RESPONSE, sid, bytes::Bytes::new())
                     .is_err()
                 {
                     break;
@@ -582,7 +817,10 @@ async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedReader) {
             }
         }
     }
-    session.close();
+    match fail_reason {
+        Some(e) => session.fail(e),
+        None => session.close(),
+    }
 }
 
 /// Per-stream task: pumps client payload into PSH frames and delivers
@@ -612,9 +850,12 @@ async fn stream_task(
                             break;
                         }
                     }
-                    Some(StreamEvent::Fin) | None => {
-                        // Server closed the stream, or the session died and
-                        // dropped the dispatch channels.
+                    Some(StreamEvent::Fin) | Some(StreamEvent::Error(_)) | None => {
+                        // Server closed the stream, a stream-level
+                        // failure, or the session died and dropped the
+                        // dispatch channels (the legacy duplex path
+                        // cannot carry the error itself — EOF is the
+                        // best it can signal).
                         let _ = stream_half.shutdown().await;
                         break;
                     }
@@ -628,9 +869,11 @@ async fn stream_task(
                         break;
                     }
                     Ok(n) => {
-                        if let Err(e) = session.write_frame(CMD_PSH, sid, &buf[..n]).await {
-                            debug!("AnyTLS sid={} PSH write failed: {}", sid, e);
-                            session.close();
+                        if let Err(e) = session
+                            .enqueue_data(sid, bytes::Bytes::copy_from_slice(&buf[..n]))
+                            .await
+                        {
+                            debug!("AnyTLS sid={} PSH enqueue failed: {}", sid, e);
                             break;
                         }
                     }
@@ -673,6 +916,9 @@ impl crate::session::ManagedSession for AnyTlsSession {
             Ordering::AcqRel,
             Ordering::Acquire,
         );
+    }
+    fn created_at(&self) -> Instant {
+        self.created
     }
     /// Active → acquire → re-check Active: a session that began draining
     /// in between releases the slot immediately instead of taking one
@@ -864,6 +1110,10 @@ pub(crate) struct AnyTlsStream {
     /// EOF is owed to the next poll (a consumed Fin is otherwise lost
     /// and the relay hangs forever).
     read_eof: bool,
+    /// A stream-level failure consumed after data was already delivered
+    /// in the same poll: the error is owed to the next poll (data
+    /// first, then the error — never silently merge them).
+    read_err: Option<std::io::Error>,
     /// In-flight PSH/FIN write (owns the payload — cancelling the caller's
     /// write future can never lose data).
     write_fut:
@@ -888,6 +1138,7 @@ impl AnyTlsStream {
             read_buf: Vec::new(),
             read_pos: 0,
             read_eof: false,
+            read_err: None,
             write_fut: None,
             fin_sent: false,
             _permit: permit,
@@ -901,7 +1152,7 @@ impl AnyTlsStream {
         let sid = self.sid;
         self.write_fut = Some(Box::pin(async move {
             session
-                .write_frame(CMD_PSH, sid, &data)
+                .enqueue_data(sid, bytes::Bytes::from(data))
                 .await
                 .map_err(|e| std::io::Error::other(e.to_string()))
         }));
@@ -938,6 +1189,11 @@ impl tokio::io::AsyncRead for AnyTlsStream {
             // owed from that poll is delivered now (and stays delivered).
             return std::task::Poll::Ready(Ok(()));
         }
+        if let Some(e) = this.read_err.take() {
+            // The error owed from the data-first poll.
+            this.read_eof = true;
+            return std::task::Poll::Ready(Err(e));
+        }
         // Drain as many queued frames as fit: servers that emit small
         // frames would otherwise cost one relay wakeup per frame.
         let mut got_any = this.read_pos < this.read_buf.len();
@@ -971,12 +1227,59 @@ impl tokio::io::AsyncRead for AnyTlsStream {
                     this.read_buf = data;
                     got_any = true;
                 }
-                std::task::Poll::Ready(Some(StreamEvent::Fin)) | std::task::Poll::Ready(None) => {
+                std::task::Poll::Ready(Some(StreamEvent::Error(e))) => {
+                    let err =
+                        std::io::Error::new(std::io::ErrorKind::ConnectionReset, e.to_string());
+                    // Data already in `out` this poll would be discarded
+                    // with an error: deliver the data, owe the error.
+                    if got_any {
+                        this.read_err = Some(err);
+                        return std::task::Poll::Ready(Ok(()));
+                    }
+                    this.read_eof = true;
+                    return std::task::Poll::Ready(Err(err));
+                }
+                std::task::Poll::Ready(Some(StreamEvent::Fin)) => {
                     // Consume the EOF event exactly once. If this poll
                     // already delivered data, the caller must see that
                     // data as a successful read; the EOF is owed to the
                     // next poll via `read_eof` (returning it now would
                     // either discard the data or lose the Fin).
+                    this.read_eof = true;
+                    return std::task::Poll::Ready(Ok(()));
+                }
+                std::task::Poll::Ready(None) => {
+                    // Channel disconnected: a session failure is an
+                    // error (not a clean EOF); a locally HOL-killed
+                    // stream is a reset; anything else is a clean end.
+                    let pending: Option<std::io::Error> =
+                        if let Some(e) = this.session.terminal_error.get() {
+                            Some(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionAborted,
+                                e.to_string(),
+                            ))
+                        } else if this
+                            .session
+                            .killed_streams
+                            .lock()
+                            .unwrap()
+                            .remove(&this.sid)
+                        {
+                            Some(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionReset,
+                                "stream killed: slow consumer (HOL)",
+                            ))
+                        } else {
+                            None
+                        };
+                    if let Some(err) = pending {
+                        if got_any {
+                            this.read_err = Some(err);
+                            return std::task::Poll::Ready(Ok(()));
+                        }
+                        this.read_eof = true;
+                        return std::task::Poll::Ready(Err(err));
+                    }
                     this.read_eof = true;
                     return std::task::Poll::Ready(Ok(()));
                 }
@@ -1055,8 +1358,7 @@ impl tokio::io::AsyncWrite for AnyTlsStream {
                 Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>,
             > = Box::pin(async move {
                 session
-                    .write_frame(CMD_FIN, sid, &[])
-                    .await
+                    .enqueue_control(CMD_FIN, sid, bytes::Bytes::new())
                     .map_err(|e| std::io::Error::other(e.to_string()))
             });
             self.write_fut = Some(fut);
@@ -1740,6 +2042,10 @@ impl PacketTransport for AnyTlsUotTransport {
                 std::io::ErrorKind::UnexpectedEof,
                 "UoT stream closed by server",
             )),
+            StreamEvent::Error(e) => Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                e.to_string(),
+            )),
         }
     }
 }
@@ -2045,10 +2351,12 @@ mod tests {
         );
     }
 
-    /// 0.5.2: dropping mid-frame conservatively closes the session.
+    /// v2 writer queue: an abandoned mid-open registration cleans up
+    /// with a FIN (the queue makes partial frames impossible) — the
+    /// session survives.
     #[tokio::test]
-    async fn test_registration_guard_partial_frame_closes_session() {
-        let (session, _server) = establish_test_session("127.0.0.1:443").await;
+    async fn test_registration_guard_partial_frame_sends_fin() {
+        let (session, mut server) = establish_test_session("127.0.0.1:443").await;
         let sid = 13u32;
         let (tx, _rx) = mpsc::channel(STREAM_QUEUE_CAP);
         session
@@ -2066,8 +2374,21 @@ mod tests {
                 permit: Some(permit),
             };
         }
-        assert!(session.is_closed());
+        assert!(
+            !session.is_closed(),
+            "no partial frames with the writer queue: session survives"
+        );
         assert!(session.streams.lock().unwrap().get(&sid).is_none());
+        // The FIN for the abandoned sid went out (after the handshake
+        // blob + settings frame).
+        expect_handshake(&mut server).await;
+        let (cmd, got_sid, _) =
+            tokio::time::timeout(Duration::from_secs(2), read_frame(&mut server))
+                .await
+                .expect("FIN frame")
+                .unwrap();
+        assert_eq!(cmd, CMD_FIN);
+        assert_eq!(got_sid, sid);
     }
 
     /// v2: commit moves the capacity slot to the caller; end_stream only
@@ -2116,6 +2437,71 @@ mod tests {
         );
         session.close();
         assert_eq!(session.state(), SessionState::Closed);
+    }
+
+    /// 3B-3: a SYNACK carrying a dial error surfaces as a stream error
+    /// (not a clean EOF) and the session stays healthy.
+    #[tokio::test]
+    async fn test_synack_with_data_surfaces_open_error() {
+        let (session, mut server) = establish_test_session("127.0.0.1:443").await;
+        expect_handshake(&mut server).await;
+        let permit = session.try_reserve().unwrap();
+        let mut stream = session
+            .open_stream_direct(vec![0x01, 1, 2, 3, 4, 0, 80], permit)
+            .await
+            .unwrap();
+        let (cmd, sid, _) = read_frame(&mut server).await.unwrap();
+        assert_eq!(cmd, CMD_SYN);
+        let (cmd, _, _) = read_frame(&mut server).await.unwrap();
+        assert_eq!(cmd, CMD_PSH);
+        write_frame(&mut server, CMD_SYNACK, sid, b"refused: banned")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 16];
+        let err = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
+            .await
+            .expect("read settles")
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
+        assert!(err.to_string().contains("refused"));
+        assert!(!session.is_closed(), "target refusal keeps the session");
+    }
+
+    /// 3B-2: a full TCP sink queue kills just that stream — the queued
+    /// data still drains, then the reader sees a reset (never a clean
+    /// EOF), and the session survives.
+    #[tokio::test]
+    async fn test_hol_slow_consumer_reset_after_queue_drains() {
+        let (session, _server) = establish_test_session("127.0.0.1:443").await;
+        let sid = 21u32;
+        let (tx, rx) = mpsc::channel(STREAM_QUEUE_CAP);
+        session
+            .streams
+            .lock()
+            .unwrap()
+            .insert(sid, StreamSink::Tcp(tx));
+        let permit = session.try_reserve().unwrap();
+        let mut stream = AnyTlsStream::new(Arc::clone(&session), sid, rx, permit);
+        let sink = session.streams.lock().unwrap().get(&sid).cloned().unwrap();
+        for _ in 0..STREAM_QUEUE_CAP {
+            sink.send_data(vec![1u8; 8]).await;
+        }
+        drop(sink); // the test's clone must not keep the channel alive
+        // The next dispatch finds a full queue: HOL kill.
+        session.dispatch_data(sid, vec![2u8; 8]).await;
+        assert!(session.streams.lock().unwrap().get(&sid).is_none());
+        let mut buf = vec![0u8; STREAM_QUEUE_CAP * 8];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert!(buf.iter().all(|&b| b == 1), "queued data drains first");
+        let err = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut [0u8; 1]))
+            .await
+            .expect("read settles")
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
+        assert!(
+            !session.is_closed(),
+            "a killed stream must not kill the session"
+        );
     }
 
     /// Direct-path stream: multi-frame bulk write echoes back intact, and a
