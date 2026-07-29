@@ -652,7 +652,7 @@ async fn connect_transport(
     let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
     let tls = connector.connect(&server_name, tcp).await?;
     debug!("AnyTLS: TLS handshake completed with {}", addr);
-    let (read, write) = tokio::io::split(tls);
+    let (read, write) = tokio::io::split(crate::tls::BatchRead::new(tls));
 
     let mut auth = Vec::with_capacity(34);
     auth.extend_from_slice(&auth_key);

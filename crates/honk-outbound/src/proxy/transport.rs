@@ -95,7 +95,7 @@ pub(crate) async fn maybe_tls_wrap(
         let connector = crate::tls::build_connector(node)?;
         let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
         let tls_stream = connector.connect(&server_name, stream).await?;
-        Ok(Box::new(tls_stream))
+        Ok(Box::new(crate::tls::BatchRead::new(tls_stream)))
     } else {
         Ok(Box::new(stream))
     }

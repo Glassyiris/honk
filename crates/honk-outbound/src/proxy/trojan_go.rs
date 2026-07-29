@@ -87,7 +87,9 @@ impl TrojanGoHandler {
         let stream: Box<dyn AsyncReadWrite> = if node.tls {
             let connector = Self::build_tls_connector(node)?;
             let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
-            Box::new(connector.connect(&server_name, stream).await?)
+            Box::new(crate::tls::BatchRead::new(
+                connector.connect(&server_name, stream).await?,
+            ))
         } else {
             Box::new(stream)
         };
