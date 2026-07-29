@@ -171,6 +171,15 @@ pub struct SessionPool<S: ManagedSession + 'static> {
     shutdown_tx: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
+impl<S: ManagedSession + 'static> std::fmt::Debug for SessionPool<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionPool")
+            .field("state", &self.state())
+            .field("keys", &self.keys.lock().len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl<S: ManagedSession + 'static> Clone for SessionPool<S> {
     fn clone(&self) -> Self {
         Self {
@@ -475,8 +484,6 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
     /// Shut the pool down: reject offers/inserts/prewarms, abort the
     /// in-flight dial, wake every waiter with PoolClosed, close all
     /// sessions, and stop the janitor. Terminal and idempotent.
-    // Wired into reload/shutdown with the runtime-registry work (2A/2B).
-    #[allow(dead_code)]
     pub fn shutdown(&self) {
         if self
             .state

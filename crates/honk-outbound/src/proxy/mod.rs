@@ -277,6 +277,15 @@ pub trait ProxyHandler: Send + Sync {
         let _ = node;
         true
     }
+
+    /// Install the per-node runtime registry (session-layer ownership).
+    /// Handlers with pooled sessions (AnyTLS, Trojan-Go, h2mux) resolve
+    /// their node's pool through it; the default is a no-op for stateless
+    /// handlers. The shared cell swaps its contents on reload, so this is
+    /// installed once at startup.
+    fn set_runtime_registry(&self, cell: crate::runtime::SharedRuntimeRegistry) {
+        let _ = cell;
+    }
 }
 
 pub struct ProxyRegistry {
@@ -287,6 +296,14 @@ impl ProxyRegistry {
     pub fn new() -> Self {
         Self {
             handlers: Vec::new(),
+        }
+    }
+
+    /// Hand the per-node runtime registry to every handler (see
+    /// [`ProxyHandler::set_runtime_registry`]).
+    pub fn install_runtime_registry(&self, cell: crate::runtime::SharedRuntimeRegistry) {
+        for handler in &self.handlers {
+            handler.set_runtime_registry(cell.clone());
         }
     }
 

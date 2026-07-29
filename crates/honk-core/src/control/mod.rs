@@ -192,6 +192,9 @@ impl ControlPlane {
             honk_outbound::runtime::OutboundRuntimeRegistry::build(&config.nodes)
                 .map_err(|e| anyhow::anyhow!("invalid node set: {}", e))?
                 .into_shared();
+        // Hand the registry to handlers with pooled sessions (AnyTLS);
+        // the shared cell swaps contents on reload, installed once.
+        proxy_registry.install_runtime_registry(runtime_registry.clone());
         {
             let gm_cell = group_manager.clone();
             alive_set.set_url_member_resolver(Some(Arc::new(move |group: &str| {

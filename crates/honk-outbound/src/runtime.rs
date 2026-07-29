@@ -55,15 +55,33 @@ impl OutboundCapabilities {
     }
 }
 
-/// The session-layer runtime for one node. Empty in phase 2A; later
-/// phases attach the real owners:
-/// - 2B: `AnyTls(Arc<SessionPool<AnyTlsSession>>)`
+/// The session-layer runtime for one node. Later phases attach the
+/// remaining owners:
 /// - 4A: `TrojanGo(Arc<SessionPool<MuxConnection>>)`
 /// - 4B: `H2(Arc<SessionPool<MuxSession>>)`
 /// - 4C: `Quic` runtimes (hy2/tuic/juicity, not a shared SessionPool)
 #[derive(Debug)]
 pub enum ProtocolRuntime {
     None,
+    /// AnyTLS: the node's own session pool (2B). One pool per node — no
+    /// static/global pool, no shared string keys.
+    AnyTls(AnyTlsRuntime),
+}
+
+/// AnyTLS session runtime: owns the node's `SessionPool`.
+#[derive(Debug)]
+pub struct AnyTlsRuntime {
+    pub(crate) pool: Arc<crate::proxy::anytls::AnyTlsPool>,
+}
+
+impl AnyTlsRuntime {
+    fn new() -> Self {
+        Self {
+            pool: Arc::new(crate::session::SessionPool::new(
+                crate::proxy::anytls::session_pool_config(),
+            )),
+        }
+    }
 }
 
 /// The minimal per-node runtime entry (the honest, minimal
@@ -106,10 +124,14 @@ impl OutboundRuntimeRegistry {
             if node.id.is_nil() {
                 return Err(RuntimeRegistryError::NilId(node.name.clone()));
             }
+            let protocol_runtime = match node.protocol {
+                NodeProtocol::AnyTLS => ProtocolRuntime::AnyTls(AnyTlsRuntime::new()),
+                _ => ProtocolRuntime::None,
+            };
             let runtime = Arc::new(NodeRuntime {
                 node: Arc::new(node.clone()),
                 capabilities: OutboundCapabilities::for_node(node),
-                runtime: ProtocolRuntime::None,
+                runtime: protocol_runtime,
             });
             if let Some(prev) = map.insert(node.id, Arc::clone(&runtime)) {
                 return Err(RuntimeRegistryError::DuplicateId(
@@ -139,9 +161,16 @@ impl OutboundRuntimeRegistry {
         self.nodes.is_empty()
     }
 
-    /// Shut down every owned runtime. A no-op in phase 2A (nothing is
-    /// owned yet); later phases close session pools here. Idempotent.
-    pub fn shutdown(&self) {}
+    /// Shut down every owned runtime: AnyTLS pools are shut down
+    /// (offers/inserts/prewarms rejected, waiters woken, sessions closed,
+    /// janitor exits). Idempotent.
+    pub fn shutdown(&self) {
+        for runtime in self.nodes.values() {
+            if let ProtocolRuntime::AnyTls(anytls) = &runtime.runtime {
+                anytls.pool.shutdown();
+            }
+        }
+    }
 }
 
 #[cfg(test)]

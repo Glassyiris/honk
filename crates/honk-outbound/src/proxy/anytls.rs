@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -77,49 +77,53 @@ const STREAM_QUEUE_CAP: usize = 64;
 type BoxedReader = Box<dyn AsyncRead + Send + Unpin>;
 type BoxedWriter = Box<dyn AsyncWrite + Send + Unpin>;
 
-/// AnyTLS proxy handler.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct AnyTlsHandler;
+/// AnyTLS proxy handler. Stateless except for the runtime-registry
+/// handle (installed by the control plane) and a fallback pool used when
+/// no registry is installed (unit tests, standalone use).
+#[derive(Debug, Default, Clone)]
+pub struct AnyTlsHandler {
+    runtime_registry: Arc<parking_lot::RwLock<Option<crate::runtime::SharedRuntimeRegistry>>>,
+    fallback_pool: std::sync::OnceLock<Arc<AnyTlsPool>>,
+}
 
-/// Global session pool, shared across all AnyTlsHandler instances.
-/// Process-wide AnyTLS session pool ([`crate::session::SessionPool`] —
-/// hard session cap, least-loaded scheduling, dial single-flight +
-/// backoff; the per-key janitor keeps `min_idle` standby sessions and
-/// reaps idle-expired ones).
-static SESSION_POOL: LazyLock<Arc<crate::session::SessionPool<AnyTlsSession>>> =
-    LazyLock::new(|| {
-        Arc::new(crate::session::SessionPool::new(
-            crate::session::SessionPoolConfig {
-                // Least-loaded scheduling without a stream cap (sing-anytls
-                // parity); the hard session cap still applies.
-                max_streams_per_session: usize::MAX,
-                janitor_interval: Duration::from_secs(DEFAULT_IDLE_CHECK_INTERVAL_SECS),
-                ..Default::default()
-            },
-        ))
-    });
+impl AnyTlsHandler {
+    /// The session pool for `node`: its runtime-registry pool when the
+    /// control plane installed one, otherwise this handler's own.
+    fn node_pool(&self, node: &Node) -> anyhow::Result<Arc<AnyTlsPool>> {
+        if let Some(cell) = self.runtime_registry.read().as_ref() {
+            let runtime = cell
+                .read()
+                .get(&node.id)
+                .ok_or_else(|| anyhow::anyhow!("node '{}' not in runtime registry", node.name))?;
+            return match &runtime.runtime {
+                crate::runtime::ProtocolRuntime::AnyTls(rt) => Ok(Arc::clone(&rt.pool)),
+                crate::runtime::ProtocolRuntime::None => Err(anyhow::anyhow!(
+                    "node '{}' has no AnyTLS runtime",
+                    node.name
+                )),
+            };
+        }
+        Ok(Arc::clone(self.fallback_pool.get_or_init(|| {
+            Arc::new(crate::session::SessionPool::new(session_pool_config()))
+        })))
+    }
+}
 
-/// Pool key for a node: `host:port` plus a fingerprint of the auth/TLS
-/// configuration. Previously the key was only `host:port`, so two nodes
-/// sharing an endpoint but differing in password/SNI/verify would wrongly
-/// multiplex onto the same session (and a reload changing those fields
-/// would silently reuse a session built for the old config). The password
-/// is hashed — never stored in the clear in the key.
-fn pool_key(node: &Node) -> String {
-    let password = node
-        .anytls_password
-        .as_deref()
-        .or(node.password.as_deref())
-        .unwrap_or("");
-    let pw_hash = &blake3::hash(password.as_bytes()).to_hex().as_str()[..8].to_string();
-    format!(
-        "{}:{}|{}|{}|{}",
-        node.host(),
-        node.port,
-        pw_hash,
-        node.sni.as_deref().unwrap_or(""),
-        node.skip_cert_verify,
-    )
+/// Key inside a node's own session pool. Pools are per-node (runtime
+/// registry), so the key is a constant — the old `host:port|tls|sni|
+/// pwhash|verify` fingerprint existed only to disambiguate the shared
+/// static pool, and it also kept a password hash around for no reason.
+pub(crate) const POOL_KEY: &str = "self";
+
+/// Pool configuration for one AnyTLS node (least-loaded scheduling
+/// without a stream cap (sing-anytls parity); the hard session cap still
+/// applies). Shared by the runtime-registry pools and handler fallbacks.
+pub(crate) fn session_pool_config() -> crate::session::SessionPoolConfig {
+    crate::session::SessionPoolConfig {
+        max_streams_per_session: usize::MAX,
+        janitor_interval: Duration::from_secs(DEFAULT_IDLE_CHECK_INTERVAL_SECS),
+        ..Default::default()
+    }
 }
 
 /// Monotonic session id for pool bookkeeping (sing `sessionCounter`).
@@ -218,9 +222,12 @@ impl Drop for StreamRegistration {
     }
 }
 
+/// Session pool type for one AnyTLS node (runtime-registry owned).
+pub(crate) type AnyTlsPool = crate::session::SessionPool<AnyTlsSession>;
+
 /// A multiplexed AnyTLS session: one TLS connection carrying any number of
 /// concurrent streams (sing-anytls `Session`).
-struct AnyTlsSession {
+pub(crate) struct AnyTlsSession {
     /// Unique id within the pool (used for removal on close).
     seq: u64,
     /// Pool key (`host:port` of the AnyTLS server).
@@ -692,7 +699,7 @@ async fn connect_transport(
 impl AnyTlsHandler {
     /// Create a new AnyTLS handler.
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 
     /// Resolve the AnyTLS password: generic password first, then the
@@ -722,14 +729,14 @@ impl AnyTlsHandler {
             });
         format!("v=2\nclient=dae\npadding-md5={}\n", md5).into_bytes()
     }
-    /// Lazily start the pool janitor for this node (once per address).
-    fn ensure_janitor(node: &Node) {
+    /// Lazily start the pool janitor for this node (once per pool).
+    fn ensure_janitor(node: &Node, pool: &Arc<AnyTlsPool>) {
         // Always run the janitor: it pre-establishes min_idle sessions
         // (default 1) and, just as importantly, reaps idle-expired ones —
         // skipping it entirely leaks idle sessions into the pool forever.
         // An explicit `min_idle_session=0` disables standby sessions only,
         // never pruning.
-        let addr = pool_key(node);
+        let label = format!("{}:{}", node.host(), node.port);
         // Default 1 (not sing-box's 0): a single standby session per node
         // keeps every dial warm after the first — cold dials otherwise pay
         // TCP connect + TLS handshake (2 RTT) per burst.
@@ -739,27 +746,28 @@ impl AnyTlsHandler {
                 .unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS),
         );
         let prewarm_node = node.clone();
-        let prewarm_addr = addr.clone();
-        SESSION_POOL.ensure_janitor(&addr, min_idle, idle_timeout, move || {
+        pool.ensure_janitor(POOL_KEY, min_idle, idle_timeout, move || {
             let node = prewarm_node.clone();
-            let addr = prewarm_addr.clone();
-            async move { dial_session(&node, &addr, Duration::from_secs(10)).await }
+            let label = label.clone();
+            async move { dial_session(&node, &label, Duration::from_secs(10)).await }
         });
     }
 
     /// Open a stream to `target_addr` on a pooled session, dialing one on
     /// demand (single-flight). One retry on a session that fails mid-open.
     async fn open_pooled_stream(
+        &self,
         node: &Node,
         addr: &str,
         target_addr: &[u8],
         connect_timeout: Duration,
     ) -> anyhow::Result<AnyTlsStream> {
-        Self::ensure_janitor(node);
+        let pool = self.node_pool(node)?;
+        Self::ensure_janitor(node, &pool);
         let mut last_err: Option<anyhow::Error> = None;
         for _attempt in 0..2 {
-            let session = SESSION_POOL
-                .offer(addr, || dial_session(node, addr, connect_timeout))
+            let session = pool
+                .offer(POOL_KEY, || dial_session(node, addr, connect_timeout))
                 .await?;
             match session.open_stream_direct(target_addr.to_vec()).await {
                 Ok((sid, rx)) => {
@@ -772,7 +780,7 @@ impl AnyTlsHandler {
                     return Ok(AnyTlsStream::new(session, sid, rx));
                 }
                 Err(e) => {
-                    SESSION_POOL.invalidate(addr, &session);
+                    pool.invalidate(POOL_KEY, &session);
                     last_err = Some(e);
                 }
             }
@@ -1257,6 +1265,10 @@ impl ProxyHandler for AnyTlsHandler {
         false
     }
 
+    fn set_runtime_registry(&self, cell: crate::runtime::SharedRuntimeRegistry) {
+        *self.runtime_registry.write() = Some(cell);
+    }
+
     async fn dial(
         &self,
         node: &Node,
@@ -1264,13 +1276,15 @@ impl ProxyHandler for AnyTlsHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let addr = pool_key(node);
+        let addr = format!("{}:{}", node.host(), node.port);
         let target_addr = addr::encode_address(target, target_domain);
         debug!(
             "AnyTLS: connecting to {} for target {} (tls={} sni={:?} skip={})",
             addr, target, node.tls, node.sni, node.skip_cert_verify
         );
-        let stream = Self::open_pooled_stream(node, &addr, &target_addr, connect_timeout).await?;
+        let stream = self
+            .open_pooled_stream(node, &addr, &target_addr, connect_timeout)
+            .await?;
 
         Ok(ProxyStream {
             stream: Box::new(stream),
@@ -1287,14 +1301,15 @@ impl ProxyHandler for AnyTlsHandler {
         tcp: TcpStream,
         _connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let addr = pool_key(node);
+        let addr = format!("{}:{}", node.host(), node.port);
         let target_addr = addr::encode_address(target, target_domain);
 
-        Self::ensure_janitor(node);
+        let pool = self.node_pool(node)?;
+        Self::ensure_janitor(node, &pool);
         let (read, write, auth, settings) =
             connect_transport(node, &addr, _connect_timeout, Some(tcp)).await?;
         let session = AnyTlsSession::establish(&addr, read, write, &auth, &settings).await?;
-        SESSION_POOL.insert(&addr, &session);
+        pool.insert(POOL_KEY, &session);
         let (sid, rx) = session.open_stream_direct(target_addr).await?;
 
         Ok(ProxyStream {
@@ -1321,23 +1336,24 @@ impl ProxyHandler for AnyTlsHandler {
             anyhow::bail!("node '{}' does not allow UDP", node.name);
         }
 
-        let addr = pool_key(node);
+        let addr = format!("{}:{}", node.host(), node.port);
         // The stream target is the UoT magic address (SOCKS5 address form).
         let magic = addr::encode_address("0.0.0.0:0".parse().unwrap(), Some(UOT_MAGIC));
-        Self::ensure_janitor(node);
+        let pool = self.node_pool(node)?;
+        Self::ensure_janitor(node, &pool);
         // Legacy loopback path: needs a duplex stream for `uot_bridge`
         // (the production UDP path is `dial_udp_transport`).
         let mut stream = {
             let mut attempt = 0;
             loop {
                 attempt += 1;
-                let session = SESSION_POOL
-                    .offer(&addr, || dial_session(node, &addr, connect_timeout))
+                let session = pool
+                    .offer(POOL_KEY, || dial_session(node, &addr, connect_timeout))
                     .await?;
                 match session.open_stream(magic.clone()).await {
                     Ok(s) => break s,
                     Err(e) => {
-                        SESSION_POOL.invalidate(&addr, &session);
+                        pool.invalidate(POOL_KEY, &session);
                         if attempt >= 2 {
                             return Err(e);
                         }
@@ -1392,19 +1408,20 @@ impl ProxyHandler for AnyTlsHandler {
             anyhow::bail!("node '{}' does not allow UDP", node.name);
         }
 
-        let addr = pool_key(node);
+        let addr = format!("{}:{}", node.host(), node.port);
         let magic = addr::encode_address("0.0.0.0:0".parse().unwrap(), Some(UOT_MAGIC));
-        Self::ensure_janitor(node);
+        let pool = self.node_pool(node)?;
+        Self::ensure_janitor(node, &pool);
         let mut attempt = 0;
         let (session, sid, rx, mut guard) = loop {
             attempt += 1;
-            let session = SESSION_POOL
-                .offer(&addr, || dial_session(node, &addr, connect_timeout))
+            let session = pool
+                .offer(POOL_KEY, || dial_session(node, &addr, connect_timeout))
                 .await?;
             match session.open_uot_stream(magic.clone()).await {
                 Ok((sid, rx, guard)) => break (session, sid, rx, guard),
                 Err(e) => {
-                    SESSION_POOL.invalidate(&addr, &session);
+                    pool.invalidate(POOL_KEY, &session);
                     if attempt >= 2 {
                         return Err(e);
                     }
@@ -1694,6 +1711,46 @@ mod tests {
 
         node.anytls_password = None;
         assert_eq!(AnyTlsHandler::resolve_password(&node), "generic-secret");
+    }
+
+    /// 2B: with a runtime registry installed, the handler dials through
+    /// the node's registry-owned pool; without one, its own fallback.
+    #[test]
+    fn test_node_pool_prefers_registry() {
+        let node = Node {
+            name: "test".into(),
+            protocol: NodeProtocol::AnyTLS,
+            ..Default::default()
+        };
+        let handler = AnyTlsHandler::new();
+        // No registry: fallback pool, shared across calls.
+        let p1 = handler.node_pool(&node).unwrap();
+        let p2 = handler.node_pool(&node).unwrap();
+        assert!(Arc::ptr_eq(&p1, &p2));
+
+        let registry = crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node))
+            .unwrap()
+            .into_shared();
+        let handler2 = AnyTlsHandler::new();
+        handler2.set_runtime_registry(registry.clone());
+        let pool = handler2.node_pool(&node).unwrap();
+        let registry_pool = match &registry.read().get(&node.id).unwrap().runtime {
+            crate::runtime::ProtocolRuntime::AnyTls(rt) => Arc::clone(&rt.pool),
+            crate::runtime::ProtocolRuntime::None => panic!("expected AnyTls runtime"),
+        };
+        assert!(Arc::ptr_eq(&pool, &registry_pool));
+        assert!(
+            handler2.fallback_pool.get().is_none(),
+            "registry path must not touch the fallback"
+        );
+
+        // A node absent from the registry is an explicit error.
+        let other = Node {
+            name: "other".into(),
+            protocol: NodeProtocol::AnyTLS,
+            ..Default::default()
+        };
+        assert!(handler2.node_pool(&other).is_err());
     }
 
     const TEST_AUTH: &[u8] = b"test-auth";
