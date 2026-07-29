@@ -408,20 +408,19 @@ impl TuicClient {
     }
 }
 
-/// TUIC proxy handler.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct TuicHandler;
-
-/// Shared TUIC clients keyed by server + credentials (anytls pool parity).
-static CLIENTS: ClientCache<TuicClient> =
-    ClientCache::new(|| parking_lot::Mutex::new(HashMap::new()));
+/// TUIC proxy handler. Stateless except its per-server client cache
+/// (owned per handler instance — never process-global).
+#[derive(Debug, Default, Clone)]
+pub struct TuicHandler {
+    clients: ClientCache<TuicClient>,
+}
 
 impl TuicHandler {
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 
-    async fn client_for(node: &Node) -> anyhow::Result<Arc<TuicClient>> {
+    async fn client_for(&self, node: &Node) -> anyhow::Result<Arc<TuicClient>> {
         let uuid_str = node
             .tuic_uuid
             .as_deref()
@@ -453,11 +452,10 @@ impl TuicHandler {
             .unwrap_or_else(|| vec![b"tuic".to_vec()]);
         let alpn_key = node.tuic_alpn.as_deref().unwrap_or("").to_string();
         let key = format!(
-            "{}|{}|{}|{}|{}|{}|{}",
+            "{}:{}|{}|{}|{}|{}",
             node.host(),
             node.port,
-            uuid_str,
-            password,
+            crate::quic::key_fingerprint(&[uuid_str, &password]),
             node.sni.as_deref().unwrap_or(""),
             node.skip_cert_verify,
             alpn_key,
@@ -474,7 +472,7 @@ impl TuicHandler {
             max_udp_payload_size: node.quic_mtu,
             ..Default::default()
         };
-        crate::quic::cached_client(&CLIENTS, key, || async move {
+        crate::quic::cached_client(&self.clients, key, || async move {
             let alpn_refs: Vec<&[u8]> = alpn.iter().map(Vec::as_slice).collect();
             let config = crate::quic::client_config(node, &alpn_refs, options).await?;
             Ok(Arc::new(TuicClient {
@@ -538,7 +536,7 @@ impl ProxyHandler for TuicHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let client = Self::client_for(node).await?;
+        let client = self.client_for(node).await?;
         let addr = TuicAddr::new(target, target_domain);
         let stream = crate::quic::dial_quic_stream(
             &client.quic,
@@ -579,7 +577,7 @@ impl ProxyHandler for TuicHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<UdpProxySocket> {
-        let client = Self::client_for(node).await?;
+        let client = self.client_for(node).await?;
         let (conn, state) = client.connection(connect_timeout).await?;
         state.touch();
         let session_id = state.alloc_session();
@@ -666,7 +664,7 @@ impl ProxyHandler for TuicHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        let client = Self::client_for(node).await?;
+        let client = self.client_for(node).await?;
         let (_conn, state) = client.connection(connect_timeout).await?;
         state.touch();
         let session_id = state.alloc_session();
@@ -696,7 +694,7 @@ impl ProxyHandler for TuicHandler {
     }
 
     async fn test_connectivity(&self, node: &Node) -> bool {
-        match Self::client_for(node).await {
+        match self.client_for(node).await {
             // With the zero auth grace on the dial path, a wrong password is
             // only visible when the server closes the connection (~1 RTT) —
             // wait for that here, scaled to the measured RTT.

@@ -26,7 +26,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Weak};
+use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -542,10 +542,14 @@ struct State<C> {
 ///
 /// Keeps at most one active QUIC connection to the server and re-dials on
 /// demand (first use, connection loss, or explicit [`QuicClient::invalidate`]).
-/// The generic `C` is the protocol-specific per-connection state (demux maps,
-/// background task handles, ...), built by the `setup` closure inside the
-/// single-flight critical section so concurrent dialers share exactly one
-/// handshake.
+/// **Rotation overlaps by construction**: a flow owns its `(Connection,
+/// Arc<C>)` pair, so when the holder detects the connection's close reason
+/// and dials a fresh one, in-flight streams/datagram flows finish on the
+/// old connection while new flows land on the new one — one Active plus
+/// one draining, without a hard cut. The generic `C` is the
+/// protocol-specific per-connection state (demux maps, background task
+/// handles, ...), built by the `setup` closure inside the single-flight
+/// critical section so concurrent dialers share exactly one handshake.
 pub struct QuicClient<C> {
     server_host: String,
     server_port: u16,
@@ -814,16 +818,61 @@ pub(crate) trait QuicConnState: Send + Sync + 'static {
     fn open_counter(&self) -> &Arc<AtomicUsize>;
 }
 
-/// Shared per-server protocol-client cache (TUIC/Juicity/Hysteria2 pool
-/// parity): a `LazyLock` map keyed by server + credentials.
-pub(crate) type ClientCache<C> = LazyLock<parking_lot::Mutex<HashMap<String, Arc<C>>>>;
+/// Per-server protocol-client cache (TUIC/Juicity/Hysteria2 pool
+/// parity): an owned map keyed by server + credential **fingerprint** —
+/// one per handler instance, never process-global, and never holding a
+/// cleartext password in the key.
+pub(crate) struct ClientCache<C> {
+    map: Arc<parking_lot::Mutex<HashMap<String, Arc<C>>>>,
+}
+
+impl<C> ClientCache<C> {
+    pub(crate) fn new() -> Self {
+        Self {
+            map: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl<C> Default for ClientCache<C> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<C> Clone for ClientCache<C> {
+    fn clone(&self) -> Self {
+        Self {
+            map: Arc::clone(&self.map),
+        }
+    }
+}
+
+impl<C> std::fmt::Debug for ClientCache<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientCache")
+            .field("entries", &self.map.lock().len())
+            .finish()
+    }
+}
+
+/// blake3 fingerprint (16 hex chars) for cache keys: credentials never
+/// sit in keys in the clear.
+pub(crate) fn key_fingerprint(parts: &[&str]) -> String {
+    let mut h = blake3::Hasher::new();
+    for p in parts {
+        h.update(p.as_bytes());
+        h.update(b"|");
+    }
+    h.finalize().to_hex()[..16].to_string()
+}
 
 /// Look up a cached per-server protocol client, building and inserting it
 /// when missing. The build runs outside the lock (it is async — ECH
 /// discovery), so a concurrent task may have won the race; in that case the
 /// existing entry is reused and the freshly built one dropped.
 pub(crate) async fn cached_client<C, F, Fut>(
-    cache: &'static ClientCache<C>,
+    cache: &ClientCache<C>,
     key: String,
     build: F,
 ) -> anyhow::Result<Arc<C>>
@@ -832,12 +881,12 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<Arc<C>>>,
 {
-    if let Some(client) = cache.lock().get(&key) {
+    if let Some(client) = cache.map.lock().get(&key) {
         return Ok(Arc::clone(client));
     }
     let client = build().await?;
     // Another task may have won the race — reuse theirs.
-    Ok(cache.lock().entry(key).or_insert(client).clone())
+    Ok(cache.map.lock().entry(key).or_insert(client).clone())
 }
 
 /// TUIC-style exporter authentication (sing `clientHandshake`,

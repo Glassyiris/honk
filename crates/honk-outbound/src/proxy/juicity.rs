@@ -21,7 +21,6 @@
 //! - Keep-alive: QUIC keep-alive every 5s (`dialer.go:58`); there is no
 //!   application-level heartbeat command.
 
-use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -142,20 +141,19 @@ impl JuicityClient {
     }
 }
 
-/// Juicity proxy handler.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct JuicityHandler;
-
-/// Shared Juicity clients keyed by server + credentials (anytls pool parity).
-static CLIENTS: ClientCache<JuicityClient> =
-    ClientCache::new(|| parking_lot::Mutex::new(HashMap::new()));
+/// Juicity proxy handler. Stateless except its per-server client cache
+/// (owned per handler instance — never process-global).
+#[derive(Debug, Default, Clone)]
+pub struct JuicityHandler {
+    clients: ClientCache<JuicityClient>,
+}
 
 impl JuicityHandler {
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 
-    async fn client_for(node: &Node) -> anyhow::Result<Arc<JuicityClient>> {
+    async fn client_for(&self, node: &Node) -> anyhow::Result<Arc<JuicityClient>> {
         let uuid_str = node
             .juicity_uuid
             .as_deref()
@@ -170,16 +168,15 @@ impl JuicityHandler {
             .unwrap_or("")
             .to_string();
         let key = format!(
-            "{}|{}|{}|{}|{}|{}",
+            "{}:{}|{}|{}|{}",
             node.host(),
             node.port,
-            uuid_str,
-            password,
+            crate::quic::key_fingerprint(&[uuid_str, &password]),
             node.sni.as_deref().unwrap_or(""),
             node.skip_cert_verify
         );
         let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
-        crate::quic::cached_client(&CLIENTS, key, || async move {
+        crate::quic::cached_client(&self.clients, key, || async move {
             // Upstream juicity (Go and juicity-rs) defaults to BBR on the client
             // when no congestion_control is configured.
             let config = crate::quic::client_config(
@@ -233,7 +230,7 @@ impl ProxyHandler for JuicityHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let client = Self::client_for(node).await?;
+        let client = self.client_for(node).await?;
         let addr = JuiceAddr::new(target, target_domain);
         let stream = crate::quic::dial_quic_stream(
             &client.quic,
@@ -264,7 +261,7 @@ impl ProxyHandler for JuicityHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<UdpProxySocket> {
-        let client = Self::client_for(node).await?;
+        let client = self.client_for(node).await?;
         let target_addr = JuiceAddr::new(target, target_domain);
         // Same retry skeleton as TCP dials: a dead cached connection must not
         // fail the UDP session outright (it would otherwise surface as a
@@ -355,7 +352,7 @@ impl ProxyHandler for JuicityHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        let client = Self::client_for(node).await?;
+        let client = self.client_for(node).await?;
         let stream_addr = JuiceAddr::new(target, target_domain);
         let addr = stream_addr.clone();
         let stream = crate::quic::dial_quic_stream(
@@ -395,7 +392,7 @@ impl ProxyHandler for JuicityHandler {
     }
 
     async fn test_connectivity(&self, node: &Node) -> bool {
-        match Self::client_for(node).await {
+        match self.client_for(node).await {
             // Zero auth grace on the dial path (tuic parity): wait ~1 RTT
             // for the server to close on bad credentials.
             Ok(client) => match client.connection(Duration::from_secs(5)).await {
