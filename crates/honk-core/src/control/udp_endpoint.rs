@@ -604,7 +604,13 @@ impl UdpEndpointPool {
                         );
                     }
                     Ok(Err(e)) => {
-                        warn!("UDP reply handler recv error: {}", e);
+                        // A closed association (server FIN/EOF) is normal
+                        // teardown, not a malfunction — keep it out of WARN.
+                        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                            debug!("UDP reply handler closed: {}", e);
+                        } else {
+                            warn!("UDP reply handler recv error: {}", e);
+                        }
                         break;
                     }
                     Err(_) => {

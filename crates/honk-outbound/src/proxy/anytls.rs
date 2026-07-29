@@ -822,25 +822,52 @@ impl tokio::io::AsyncRead for AnyTlsStream {
         cx: &mut std::task::Context<'_>,
         out: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        if self.read_pos == self.read_buf.len() {
-            let this = self.as_mut().get_mut();
+        let this = self.as_mut().get_mut();
+        // Drain as many queued frames as fit: servers that emit small
+        // frames would otherwise cost one relay wakeup per frame.
+        let mut got_any = this.read_pos < this.read_buf.len();
+        loop {
+            // Copy what the current frame buffer has.
+            let n = (this.read_buf.len() - this.read_pos).min(out.remaining());
+            if n > 0 {
+                out.put_slice(&this.read_buf[this.read_pos..this.read_pos + n]);
+                this.read_pos += n;
+            }
+            if out.remaining() == 0 {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            // Frame consumed: fetch the next one (now, not next wakeup).
             this.read_buf.clear();
             this.read_pos = 0;
-            match this.rx.poll_recv(cx) {
+            let next = if got_any {
+                // Already have data for the caller: never block for more.
+                match this.rx.try_recv() {
+                    Ok(ev) => std::task::Poll::Ready(Some(ev)),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => std::task::Poll::Pending,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        std::task::Poll::Ready(None)
+                    }
+                }
+            } else {
+                this.rx.poll_recv(cx)
+            };
+            match next {
                 std::task::Poll::Ready(Some(StreamEvent::Data(data))) => {
                     this.read_buf = data;
+                    got_any = true;
                 }
                 std::task::Poll::Ready(Some(StreamEvent::Fin)) | std::task::Poll::Ready(None) => {
-                    return std::task::Poll::Ready(Ok(())); // EOF
+                    return std::task::Poll::Ready(Ok(())); // EOF (deliver prior data first)
                 }
-                std::task::Poll::Pending => return std::task::Poll::Pending,
+                std::task::Poll::Pending => {
+                    return if got_any {
+                        std::task::Poll::Ready(Ok(()))
+                    } else {
+                        std::task::Poll::Pending
+                    };
+                }
             }
         }
-        let this = self.as_mut().get_mut();
-        let n = (this.read_buf.len() - this.read_pos).min(out.remaining());
-        out.put_slice(&this.read_buf[this.read_pos..this.read_pos + n]);
-        this.read_pos += n;
-        std::task::Poll::Ready(Ok(()))
     }
 }
 
