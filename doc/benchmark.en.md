@@ -99,6 +99,32 @@ bash /root/flood-test.sh 100000 20000
 | anytls (Go server) | — | 3.21 Gbps | — |
 | ss2022 4-stream | 5.51 Gbps | 5.05 Gbps | 92% |
 
+### Three-way (2026-07-29, honk v0.0.1.beta.23 + sing-box 1.13.14)
+
+Same-time A/B/C. CPU in parentheses = cores used during the run; cold =
+first request after engine start.
+
+| Protocol | dae | sing-box | honk |
+| --- | --- | --- | --- |
+| hy2 | 2.10 Gbps (1.28c) | 2.10 Gbps (1.58c) | 1.93 Gbps (0.97c) |
+| tuic | 1.80 Gbps (1.07c) | 2.09 Gbps (1.56c) | 2.10 Gbps (1.07c) |
+| ss2022 | 1.51 Gbps (1.01c) | 1.47 Gbps (1.15c) | 1.30 Gbps (1.01c) |
+| trojan | 4.15 Gbps (1.03c) | 4.52 Gbps (1.68c) | 3.99 Gbps (1.03c) |
+| anytls (sb server) | — | 3.02 Gbps (1.01c) | 3.12 Gbps (1.04c) |
+| anytls (Go server) | — | 4.46 Gbps (1.57c) | 3.54 Gbps (1.16c) |
+| cold connect | 6–85 ms | 6–8 ms | 1–6 ms |
+| RSS | 61–65 MB | 51–52 MB | 14–16 MB |
+
+Takeaways: honk has the lowest CPU per Gbps everywhere, ~4x less memory,
+and the fastest cold connects. Remaining gaps: hy2 −8% vs both, ss2022
+−12% vs dae, trojan −12% vs sing-box, anytls-vs-Go-server −21% vs
+sing-box (see `doc/benchmark.*.md` history for the ss2022 codec rewrite
+that closed most of its gap).
+
+The sing-box engine runs inside the client netns with a TUN inbound
+(`sb-client.json`, outbounds bound to `veth-client` so its own dials
+escape the tun); honk/dae run on the root namespace as before.
+
 ### Cold first-connect latency (ms, health checks off, 3 runs)
 
 | Protocol | dae | honk | note |

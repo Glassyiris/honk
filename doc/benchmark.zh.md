@@ -93,6 +93,30 @@ bash /root/flood-test.sh 100000 20000
 | anytls(Go server) | — | 3.21 Gbps | — |
 | ss2022 4 流 | 5.51 Gbps | 5.05 Gbps | 92% |
 
+### 三方对比（2026-07-29,honk v0.0.1.beta.23 + sing-box 1.13.14)
+
+同时间 A/B/C。括号内 CPU = 测试期间核数;cold = 引擎启动后首个请求。
+
+| 协议 | dae | sing-box | honk |
+| --- | --- | --- | --- |
+| hy2 | 2.10 Gbps (1.28c) | 2.10 Gbps (1.58c) | 1.93 Gbps (0.97c) |
+| tuic | 1.80 Gbps (1.07c) | 2.09 Gbps (1.56c) | 2.10 Gbps (1.07c) |
+| ss2022 | 1.51 Gbps (1.01c) | 1.47 Gbps (1.15c) | 1.30 Gbps (1.01c) |
+| trojan | 4.15 Gbps (1.03c) | 4.52 Gbps (1.68c) | 3.99 Gbps (1.03c) |
+| anytls(sb server) | — | 3.02 Gbps (1.01c) | 3.12 Gbps (1.04c) |
+| anytls(Go server) | — | 4.46 Gbps (1.57c) | 3.54 Gbps (1.16c) |
+| 冷建连 | 6–85 ms | 6–8 ms | 1–6 ms |
+| RSS | 61–65 MB | 51–52 MB | 14–16 MB |
+
+结论:honk 在所有协议上 CPU/Gbps 最低、内存约为 1/4、冷建连最快。
+剩余差距:hy2 比两者低 8%,ss2022 比 dae 低 12%,trojan 比 sing-box
+低 12%,anytls 对 Go server 比 sing-box 低 21%(ss2022 的 codec 重写
+已收复大部分差距,见历史提交)。
+
+sing-box 引擎以 TUN 入口跑在客户端 netns 内(`sb-client.json`,各
+outbound 绑定 `veth-client` 使自身拨号绕出 tun);honk/dae 照旧跑在
+根命名空间。
+
 ### 冷建连延迟（ms，健康检查关闭，3 次）
 
 | 协议 | dae | honk | 备注 |
