@@ -172,6 +172,46 @@ impl StreamSink {
     }
 }
 
+/// Ownership token for one registered stream id: the session's active
+/// count moves exactly once in each direction through this token, and a
+/// registration abandoned mid-handshake is cleaned up on Drop. Commit
+/// boundaries: TCP streams commit when the SYN+PSH opening pair is
+/// written; UoT streams commit only after the UoT request is fully
+/// written and the transport is constructed.
+struct StreamRegistration {
+    session: Arc<AnyTlsSession>,
+    sid: u32,
+    /// Open frames completed; the active count was incremented (once).
+    counted: bool,
+    /// A frame write is in progress: a partial frame may be on the wire.
+    frame_started: bool,
+    /// Lifecycle handed to the caller; Drop is then a no-op.
+    committed: bool,
+}
+
+impl StreamRegistration {
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for StreamRegistration {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let was_registered = self.session.streams.lock().unwrap().remove(&self.sid).is_some();
+        if self.counted && was_registered {
+            self.session.active_streams.fetch_sub(1, Ordering::Relaxed);
+        }
+        if self.frame_started {
+            // A partial frame may be on the wire: the session's framing
+            // is no longer trustworthy.
+            self.session.close();
+        }
+    }
+}
+
 /// A multiplexed AnyTLS session: one TLS connection carrying any number of
 /// concurrent streams (sing-anytls `Session`).
 struct AnyTlsSession {
@@ -248,6 +288,57 @@ impl AnyTlsSession {
         Ok(())
     }
 
+    /// Register a sid and write the SYN+PSH opening pair under one writer
+    /// lock (never interleaved with other streams). The returned guard
+    /// owns the registration until the caller commits; a write failure or
+    /// a cancellation removes the sid, and a possibly-partial frame on
+    /// the wire closes the session (sing `writeControlFrame` parity).
+    async fn register_and_open(
+        self: &Arc<Self>,
+        target_addr: Vec<u8>,
+        queue_cap: usize,
+        sink: fn(mpsc::Sender<StreamEvent>) -> StreamSink,
+    ) -> anyhow::Result<(u32, mpsc::Receiver<StreamEvent>, StreamRegistration)> {
+        if self.is_closed() {
+            anyhow::bail!("AnyTLS session {} is closed", self.seq);
+        }
+        let sid = self.next_sid.fetch_add(1, Ordering::Relaxed) + 1;
+        let (tx, rx) = mpsc::channel(queue_cap);
+        self.streams.lock().unwrap().insert(sid, sink(tx));
+        let mut guard = StreamRegistration {
+            session: Arc::clone(self),
+            sid,
+            counted: false,
+            frame_started: true,
+            committed: false,
+        };
+        let open_result: std::io::Result<()> = async {
+            let mut w = self.writer.lock().await;
+            write_frame(&mut *w, CMD_SYN, sid, &[]).await?;
+            write_frame(&mut *w, CMD_PSH, sid, &target_addr).await?;
+            w.flush().await
+        }
+        .await;
+        match open_result {
+            Ok(()) => {
+                self.active_streams.fetch_add(1, Ordering::Relaxed);
+                guard.counted = true;
+                guard.frame_started = false;
+                Ok((sid, rx, guard))
+            }
+            Err(e) => {
+                // Dropping the guard removes the sid and closes the
+                // session (frame_started).
+                Err(anyhow::anyhow!(
+                    "AnyTLS session {} open sid={}: {}",
+                    self.seq,
+                    sid,
+                    e
+                ))
+            }
+        }
+    }
+
     /// Open a new stream on this session (sing `Session.OpenStream`):
     /// allocate a sid, send SYN + the first PSH carrying the target
     /// address, and return the user-facing half of the stream. Many
@@ -256,39 +347,11 @@ impl AnyTlsSession {
         self: &Arc<Self>,
         target_addr: Vec<u8>,
     ) -> anyhow::Result<tokio::io::DuplexStream> {
-        if self.is_closed() {
-            anyhow::bail!("AnyTLS session {} is closed", self.seq);
-        }
-        let sid = self.next_sid.fetch_add(1, Ordering::Relaxed) + 1;
+        let (sid, rx, guard) = self
+            .register_and_open(target_addr, STREAM_QUEUE_CAP, StreamSink::Tcp)
+            .await?;
+        guard.commit();
         let (client_half, stream_half) = tokio::io::duplex(STREAM_DUPLEX_BUFFER);
-        let (tx, rx) = mpsc::channel(STREAM_QUEUE_CAP);
-        self.streams
-            .lock()
-            .unwrap()
-            .insert(sid, StreamSink::Tcp(tx));
-
-        // SYN, then the first PSH carrying the target address — one writer
-        // lock so the opening pair is never interleaved with other streams.
-        let open_result: std::io::Result<()> = async {
-            let mut w = self.writer.lock().await;
-            write_frame(&mut *w, CMD_SYN, sid, &[]).await?;
-            write_frame(&mut *w, CMD_PSH, sid, &target_addr).await?;
-            w.flush().await
-        }
-        .await;
-        if let Err(e) = open_result {
-            self.streams.lock().unwrap().remove(&sid);
-            // sing `writeControlFrame`: a write failure kills the session.
-            self.close();
-            return Err(anyhow::anyhow!(
-                "AnyTLS session {} open sid={}: {}",
-                self.seq,
-                sid,
-                e
-            ));
-        }
-
-        self.active_streams.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(stream_task(Arc::clone(self), sid, stream_half, rx));
         debug!("AnyTLS session {} opened sid={}", self.seq, sid);
         Ok(client_half)
@@ -301,42 +364,19 @@ impl AnyTlsSession {
     /// backpressure the session demux — before this, one burst past the
     /// stream's buffers wedged the whole session (demux blocks on a full
     /// per-stream queue) and every flow on it died.
+    ///
+    /// The returned guard is **uncommitted**: the caller must drive the
+    /// UoT request write and then [`StreamRegistration::commit`] —
+    /// abandoning the stream in between cleans up sid and count.
     async fn open_uot_stream(
         self: &Arc<Self>,
         target_addr: Vec<u8>,
-    ) -> anyhow::Result<(u32, mpsc::Receiver<StreamEvent>)> {
-        if self.is_closed() {
-            anyhow::bail!("AnyTLS session {} is closed", self.seq);
-        }
-        let sid = self.next_sid.fetch_add(1, Ordering::Relaxed) + 1;
-        let (tx, rx) = mpsc::channel(UOT_DRAIN_QUEUE_CAP);
-        self.streams
-            .lock()
-            .unwrap()
-            .insert(sid, StreamSink::Uot(tx));
-
-        let open_result: std::io::Result<()> = async {
-            let mut w = self.writer.lock().await;
-            write_frame(&mut *w, CMD_SYN, sid, &[]).await?;
-            write_frame(&mut *w, CMD_PSH, sid, &target_addr).await?;
-            w.flush().await
-        }
-        .await;
-        if let Err(e) = open_result {
-            self.streams.lock().unwrap().remove(&sid);
-            // sing `writeControlFrame`: a write failure kills the session.
-            self.close();
-            return Err(anyhow::anyhow!(
-                "AnyTLS session {} open uot sid={}: {}",
-                self.seq,
-                sid,
-                e
-            ));
-        }
-
-        self.active_streams.fetch_add(1, Ordering::Relaxed);
+    ) -> anyhow::Result<(u32, mpsc::Receiver<StreamEvent>, StreamRegistration)> {
+        let (sid, rx, guard) = self
+            .register_and_open(target_addr, UOT_DRAIN_QUEUE_CAP, StreamSink::Uot)
+            .await?;
         debug!("AnyTLS session {} opened uot sid={}", self.seq, sid);
-        Ok((sid, rx))
+        Ok((sid, rx, guard))
     }
 
     /// Write one PSH frame for a UoT stream (datagrams go directly on the
@@ -361,36 +401,10 @@ impl AnyTlsSession {
         self: &Arc<Self>,
         target_addr: Vec<u8>,
     ) -> anyhow::Result<(u32, mpsc::Receiver<StreamEvent>)> {
-        if self.is_closed() {
-            anyhow::bail!("AnyTLS session {} is closed", self.seq);
-        }
-        let sid = self.next_sid.fetch_add(1, Ordering::Relaxed) + 1;
-        let (tx, rx) = mpsc::channel(STREAM_QUEUE_CAP);
-        self.streams
-            .lock()
-            .unwrap()
-            .insert(sid, StreamSink::Tcp(tx));
-
-        let open_result: std::io::Result<()> = async {
-            let mut w = self.writer.lock().await;
-            write_frame(&mut *w, CMD_SYN, sid, &[]).await?;
-            write_frame(&mut *w, CMD_PSH, sid, &target_addr).await?;
-            w.flush().await
-        }
-        .await;
-        if let Err(e) = open_result {
-            self.streams.lock().unwrap().remove(&sid);
-            // sing `writeControlFrame`: a write failure kills the session.
-            self.close();
-            return Err(anyhow::anyhow!(
-                "AnyTLS session {} open sid={}: {}",
-                self.seq,
-                sid,
-                e
-            ));
-        }
-
-        self.active_streams.fetch_add(1, Ordering::Relaxed);
+        let (sid, rx, guard) = self
+            .register_and_open(target_addr, STREAM_QUEUE_CAP, StreamSink::Tcp)
+            .await?;
+        guard.commit();
         debug!("AnyTLS session {} opened direct sid={}", self.seq, sid);
         Ok((sid, rx))
     }
@@ -402,7 +416,11 @@ impl AnyTlsSession {
         if was_registered && !self.is_closed() {
             let _ = self.write_frame(CMD_FIN, sid, &[]).await;
         }
-        self.active_streams.fetch_sub(1, Ordering::Relaxed);
+        // Exactly-once: only a sid that was actually registered decrements
+        // (a registration guard may already have cleaned it up).
+        if was_registered {
+            self.active_streams.fetch_sub(1, Ordering::Relaxed);
+        }
         debug!("AnyTLS session {} sid={} uot stream ended", self.seq, sid);
     }
 
@@ -417,7 +435,10 @@ impl AnyTlsSession {
         if notify_fin && was_registered && !self.is_closed() {
             let _ = self.write_frame(CMD_FIN, sid, &[]).await;
         }
-        self.active_streams.fetch_sub(1, Ordering::Relaxed);
+        // Exactly-once: see end_uot_stream.
+        if was_registered {
+            self.active_streams.fetch_sub(1, Ordering::Relaxed);
+        }
         debug!("AnyTLS session {} sid={} stream ended", self.seq, sid);
     }
 
@@ -1369,13 +1390,13 @@ impl ProxyHandler for AnyTlsHandler {
         let magic = addr::encode_address("0.0.0.0:0".parse().unwrap(), Some(UOT_MAGIC));
         Self::ensure_janitor(node);
         let mut attempt = 0;
-        let (session, sid, rx) = loop {
+        let (session, sid, rx, mut guard) = loop {
             attempt += 1;
             let session = SESSION_POOL
                 .offer(&addr, || dial_session(node, &addr, connect_timeout))
                 .await?;
             match session.open_uot_stream(magic.clone()).await {
-                Ok((sid, rx)) => break (session, sid, rx),
+                Ok((sid, rx, guard)) => break (session, sid, rx, guard),
                 Err(e) => {
                     SESSION_POOL.invalidate(&addr, &session);
                     if attempt >= 2 {
@@ -1386,9 +1407,25 @@ impl ProxyHandler for AnyTlsHandler {
         };
 
         // UoT request: isConnect=true + destination in SOCKS5 address form.
+        // The registration commits only after the request is fully written
+        // and the transport exists; a timeout/cancel/error in between
+        // drops the guard (sid + count cleaned, session closed on a
+        // possibly-partial frame).
         let mut request = vec![1u8];
         request.extend(addr::encode_address(target, target_domain));
-        tokio::time::timeout(connect_timeout, session.write_uot_frame(sid, &request)).await??;
+        guard.frame_started = true;
+        let request_written = tokio::time::timeout(
+            connect_timeout,
+            session.write_uot_frame(sid, &request),
+        )
+        .await;
+        match request_written {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e.into()),
+            Err(elapsed) => return Err(elapsed.into()),
+        }
+        guard.frame_started = false;
+        guard.commit();
 
         Ok(Arc::new(AnyTlsUotTransport {
             session,
@@ -1818,6 +1855,88 @@ mod tests {
         assert_eq!(n, 0);
     }
 
+    /// 0.5.2: an uncommitted registration cleans sid + count on drop.
+    #[tokio::test]
+    async fn test_registration_guard_drop_cleans_uncommitted() {
+        let (session, _server) = establish_test_session("127.0.0.1:443").await;
+        let sid = 11u32;
+        let (tx, _rx) = mpsc::channel(STREAM_QUEUE_CAP);
+        session
+            .streams
+            .lock()
+            .unwrap()
+            .insert(sid, StreamSink::Tcp(tx));
+        session.active_streams.fetch_add(1, Ordering::Relaxed);
+        let before = session.active_streams();
+        {
+            let _guard = StreamRegistration {
+                session: Arc::clone(&session),
+                sid,
+                counted: true,
+                frame_started: false,
+                committed: false,
+            };
+        }
+        assert_eq!(session.active_streams(), before - 1);
+        assert!(session.streams.lock().unwrap().get(&sid).is_none());
+        assert!(
+            !session.is_closed(),
+            "no frame was started: session must survive"
+        );
+    }
+
+    /// 0.5.2: dropping mid-frame conservatively closes the session.
+    #[tokio::test]
+    async fn test_registration_guard_partial_frame_closes_session() {
+        let (session, _server) = establish_test_session("127.0.0.1:443").await;
+        let sid = 13u32;
+        let (tx, _rx) = mpsc::channel(STREAM_QUEUE_CAP);
+        session
+            .streams
+            .lock()
+            .unwrap()
+            .insert(sid, StreamSink::Tcp(tx));
+        {
+            let _guard = StreamRegistration {
+                session: Arc::clone(&session),
+                sid,
+                counted: false,
+                frame_started: true,
+                committed: false,
+            };
+        }
+        assert!(session.is_closed());
+        assert!(session.streams.lock().unwrap().get(&sid).is_none());
+    }
+
+    /// 0.5.2: commit makes the guard inert; end_stream counts exactly once.
+    #[tokio::test]
+    async fn test_registration_commit_then_end_stream_counts_once() {
+        let (session, _server) = establish_test_session("127.0.0.1:443").await;
+        let sid = 17u32;
+        let (tx, _rx) = mpsc::channel(STREAM_QUEUE_CAP);
+        session
+            .streams
+            .lock()
+            .unwrap()
+            .insert(sid, StreamSink::Tcp(tx));
+        session.active_streams.fetch_add(1, Ordering::Relaxed);
+        let guard = StreamRegistration {
+            session: Arc::clone(&session),
+            sid,
+            counted: true,
+            frame_started: false,
+            committed: false,
+        };
+        guard.commit();
+        assert_eq!(session.active_streams(), 1);
+        session.end_stream(sid, false).await;
+        assert_eq!(session.active_streams(), 0);
+        // A second end for the same sid must not underflow the count.
+        session.end_stream(sid, false).await;
+        assert_eq!(session.active_streams(), 0);
+    }
+
     /// Direct-path stream: multi-frame bulk write echoes back intact, and a
     /// server FIN surfaces as read EOF.
     #[tokio::test]
@@ -2110,10 +2229,11 @@ mod uot_transport_tests {
         assert_eq!(auth, TEST_AUTH);
         let (cmd, _, _) = read_frame(&mut server_end).await.unwrap();
         assert_eq!(cmd, CMD_SETTINGS);
-        let (sid, rx) = session
+        let (sid, rx, guard) = session
             .open_uot_stream(vec![0x01, 0, 0, 0, 0, 0, 0])
             .await
             .unwrap();
+        guard.commit();
         // Consume the opening pair (SYN + address PSH).
         let (cmd, _, _) = read_frame(&mut server_end).await.unwrap();
         assert_eq!(cmd, CMD_SYN);
