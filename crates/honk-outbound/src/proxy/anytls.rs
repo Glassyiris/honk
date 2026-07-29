@@ -2504,6 +2504,55 @@ mod tests {
         );
     }
 
+    /// Ad-hoc bulk-transfer check for the writer-queue path (50MB echo).
+    #[tokio::test]
+    async fn test_bulk_50mb() {
+        let addr = "127.0.0.1:443";
+        let (session, mut server) = establish_test_session(addr).await;
+        expect_handshake(&mut server).await;
+        let mut addr_rx = spawn_echo_server(server);
+
+        let target = vec![0x01, 127, 0, 0, 1, 0x01, 0xbb];
+        let permit = session.try_reserve().unwrap();
+        let stream = session
+            .open_stream_direct(target.clone(), permit)
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), addr_rx.recv())
+            .await
+            .unwrap();
+
+        let payload: Vec<u8> = (0..50_000_000u32).map(|i| (i % 251) as u8).collect();
+        let t0 = std::time::Instant::now();
+        let (mut rd, mut wr) = tokio::io::split(stream);
+        // Writer and reader run concurrently (a sequential test deadlocks
+        // by design: the echo can only flow while both move).
+        let writer = {
+            let payload = payload.clone();
+            tokio::spawn(async move {
+                for chunk in payload.chunks(65536) {
+                    wr.write_all(chunk).await.unwrap();
+                }
+            })
+        };
+        let reader = tokio::spawn(async move {
+            let mut received = vec![0u8; 50_000_000];
+            rd.read_exact(&mut received).await.unwrap();
+            received
+        });
+        let (w, r) = tokio::join!(writer, reader);
+        w.unwrap();
+        let received = r.unwrap();
+        assert_eq!(received.len(), 50_000_000);
+        assert!(
+            received
+                .iter()
+                .enumerate()
+                .all(|(i, &b)| b == (i as u32 % 251) as u8)
+        );
+        eprintln!("50MB echoed in {:?}", t0.elapsed());
+    }
+
     /// Direct-path stream: multi-frame bulk write echoes back intact, and a
     /// server FIN surfaces as read EOF.
     #[tokio::test]
