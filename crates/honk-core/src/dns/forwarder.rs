@@ -12,17 +12,20 @@ use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
+use thiserror::Error;
 use tokio::sync::Mutex;
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 
 use super::cache::DnsCache;
-use super::routing::{DnsRequestDecision, DnsResponseDecision, DnsRouter};
+use super::engine::{DnsEngine, EngineError, PreparedQuery};
+use super::outcome::{DnsOutcome, EffectiveExpiry, OutcomeParts, OutcomeStatus, Provenance};
+use super::planner::{RequestScope, ResponseTraversal};
+use super::policy::PolicyId;
+use super::response::{ResponseError, ResponseTemplate};
+use super::routing::DnsRouter;
 use super::wire::skip_dns_name;
-use honk_config::dns::DnsStrategy;
+use honk_config::dns::{DnsConfig, DnsStrategy};
 use honk_ebpf_common::DAE_BYPASS_MARK;
-
-/// dae response-routing re-query depth cap (`MaxDnsLookupDepth`).
-const MAX_DNS_LOOKUP_DEPTH: usize = 3;
 
 /// Abstraction over a pool of DNS upstream servers.
 ///
@@ -33,6 +36,30 @@ pub trait DnsUpstreamPool: Send + Sync {
     /// Send a raw DNS query to the named upstream and return the
     /// raw wire-format response.
     async fn query(&self, upstream_name: &str, raw_query: &[u8]) -> anyhow::Result<Vec<u8>>;
+}
+
+#[derive(Debug, Error)]
+pub enum DnsForwardError {
+    #[error(transparent)]
+    Engine(#[from] EngineError),
+    #[error("DNS exchange with upstream '{upstream}' failed: {source}")]
+    Exchange {
+        upstream: String,
+        #[source]
+        source: anyhow::Error,
+    },
+    #[error(transparent)]
+    Response(#[from] ResponseError),
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+    #[error("rejected DNS request escaped the request-plan branch")]
+    RejectedPlanEscaped,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ResolveMode {
+    Strict,
+    Compatibility,
 }
 
 /// Notifier called when a domain is resolved (cache miss → upstream query).
@@ -72,19 +99,20 @@ pub trait DomainResolveNotifier: Send + Sync {
 /// ```
 #[derive(Clone)]
 pub struct DnsForwarder {
-    upstream_pool: Arc<dyn DnsUpstreamPool>,
-    cache: Arc<Mutex<DnsCache>>,
-    routing: Arc<DnsRouter>,
-    strategy: DnsStrategy,
+    pub(crate) upstream_pool: Arc<dyn DnsUpstreamPool>,
+    pub(crate) cache: Arc<Mutex<DnsCache>>,
+    pub(crate) routing: Arc<DnsRouter>,
+    pub(crate) strategy: DnsStrategy,
     /// When false, skip positive/negative cache lookups and inserts
     /// (`dns.optimistic_cache` / `cache.enabled`).
-    cache_enabled: bool,
+    pub(crate) cache_enabled: bool,
     /// Fixed positive-cache TTL in seconds (`dns.optimistic_cache_ttl` /
     /// `cache.ttl`). Overrides answer-section min TTL when storing entries
     /// and when rewriting wire TTLs on the way into the cache. `0` falls
     /// back to the answer min TTL (default path uses 600).
-    cache_ttl: u32,
-    notifier: Option<Arc<dyn DomainResolveNotifier>>,
+    pub(crate) cache_ttl: u32,
+    pub(crate) notifier: Option<Arc<dyn DomainResolveNotifier>>,
+    pub(crate) policy_id: Option<PolicyId>,
     /// Cache keys with an in-flight stale-while-revalidate background
     /// refresh; deduplicates refresh storms for hot expiring entries.
     refreshing: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
@@ -106,6 +134,7 @@ impl DnsForwarder {
             // 0 = keep answer min TTL until `with_cache_ttl` is applied from config.
             cache_ttl: 0,
             notifier: None,
+            policy_id: None,
             refreshing: Default::default(),
         }
     }
@@ -125,6 +154,7 @@ impl DnsForwarder {
             cache_enabled: true,
             cache_ttl: 0,
             notifier: Some(notifier),
+            policy_id: None,
             refreshing: Default::default(),
         }
     }
@@ -151,6 +181,17 @@ impl DnsForwarder {
         self
     }
 
+    pub fn with_policy_id(mut self, policy_id: PolicyId) -> Self {
+        self.policy_id = Some(policy_id);
+        self
+    }
+
+    pub fn with_policy_from_config(self, config: &DnsConfig) -> anyhow::Result<Self> {
+        let policy_id =
+            PolicyId::from_config(config).context("failed to derive DNS policy identity")?;
+        Ok(self.with_policy_id(policy_id))
+    }
+
     /// Return a clone of the underlying cache Arc.
     pub fn cache(&self) -> Arc<Mutex<DnsCache>> {
         self.cache.clone()
@@ -158,7 +199,11 @@ impl DnsForwarder {
 
     /// Resolve a raw DNS query (no original destination for `asis`).
     pub async fn resolve(&self, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
-        self.resolve_with_context(raw_query, None).await
+        Ok(self
+            .resolve_inner(raw_query, None, false, ResolveMode::Compatibility)
+            .await?
+            .rendered()
+            .to_vec())
     }
 
     /// Resolve a raw DNS query with optional original destination.
@@ -171,7 +216,24 @@ impl DnsForwarder {
         raw_query: &[u8],
         original_dst: Option<SocketAddr>,
     ) -> anyhow::Result<Vec<u8>> {
-        self.resolve_inner(raw_query, original_dst, false).await
+        Ok(self
+            .resolve_inner(raw_query, original_dst, false, ResolveMode::Compatibility)
+            .await?
+            .rendered()
+            .to_vec())
+    }
+
+    pub async fn resolve_outcome(&self, raw_query: &[u8]) -> Result<DnsOutcome, DnsForwardError> {
+        self.resolve_outcome_with_context(raw_query, None).await
+    }
+
+    pub async fn resolve_outcome_with_context(
+        &self,
+        raw_query: &[u8],
+        original_dst: Option<SocketAddr>,
+    ) -> Result<DnsOutcome, DnsForwardError> {
+        self.resolve_inner(raw_query, original_dst, false, ResolveMode::Strict)
+            .await
     }
 
     /// `bypass_cache_read` skips the cache/negative lookup — used by the
@@ -182,237 +244,68 @@ impl DnsForwarder {
         raw_query: &[u8],
         original_dst: Option<SocketAddr>,
         bypass_cache_read: bool,
-    ) -> anyhow::Result<Vec<u8>> {
-        debug!("DNS forwarder: resolving {} bytes", raw_query.len());
-
-        let (domain, qtype) = parse_dns_question(raw_query)
-            .with_context(|| "failed to parse DNS question section")?;
-        let cache_key = dns_cache_key(&domain, qtype);
-
-        debug!(
-            "DNS forwarder: query {} QTYPE={} (key={})",
-            domain, qtype, cache_key
-        );
-
-        // IP-version strategy: `*_only` modes answer the other family's
-        // query with NODATA right here; prefer modes forward both families
-        // and are enforced at response time (see `apply_prefer_strategy`).
-        if is_filtered_qtype(qtype, &self.strategy) {
-            debug!(
-                "DNS forwarder: dropping {} query due to strategy {:?}",
-                qtype_name(qtype),
-                self.strategy
-            );
-            return Ok(make_empty_response(raw_query, &domain, qtype));
-        }
-
-        // Request routing runs *before* cache (dae order) so reject always wins
-        // over a stale positive entry and asis is never short-circuited.
-        let decision = self.routing.select_request(&domain, qtype);
-        match &decision {
-            DnsRequestDecision::Reject => {
-                debug!("DNS forwarder: request reject for {}", domain);
-                return Ok(make_empty_response(raw_query, &domain, qtype));
-            }
-            DnsRequestDecision::AsIs | DnsRequestDecision::Upstream(_) => {}
-        }
-
-        if self.cache_enabled && !bypass_cache_read {
-            let mut cache = self.cache.lock().await;
-            if let Some(rcode) = cache.negative_rcode(&cache_key) {
-                debug!(
-                    "DNS forwarder: negative cache hit for {} (rcode={}) — skipping upstream",
-                    domain, rcode
-                );
-                // Answer with the cached rcode instead of an opaque error:
-                // NXDOMAIN is a valid answer, not a SERVFAIL.
-                return Ok(crate::control::dns_control::build_dns_error_response(
-                    raw_query, rcode,
-                ));
-            }
-            if let Some(entry) = cache.get(&cache_key) {
-                debug!(
-                    "DNS forwarder: cache hit for {} (ttl_remaining={}s)",
-                    domain,
-                    entry.remaining_ttl_secs()
-                );
-                // Stale-while-revalidate: hot entries nearing expiry are
-                // refreshed in the background (deduplicated) so the next
-                // lookup never pays the upstream latency.
-                let refresh_after = (entry.min_ttl as u64 / 10).max(1);
-                if entry.remaining_ttl_secs() <= refresh_after {
-                    self.maybe_spawn_refresh(cache_key.clone(), raw_query, original_dst);
-                }
-                let mut response = entry.response.clone();
-                if response.len() >= 2 && raw_query.len() >= 2 {
-                    response[0..2].copy_from_slice(&raw_query[0..2]);
-                }
-                // Drop the lock before the prefer check: it re-locks the cache
-                // and may issue a sibling query.
-                drop(cache);
-                return self
-                    .apply_prefer_strategy(raw_query, &domain, qtype, response, original_dst)
-                    .await;
-            }
-        }
-
-        let upstream_result: anyhow::Result<(Vec<u8>, String)> = match decision {
-            DnsRequestDecision::AsIs => {
-                let resp = self
-                    .query_asis(raw_query, original_dst)
-                    .await
-                    .with_context(|| format!("asis query failed for {domain}"));
-                resp.map(|r| (r, "asis".to_string()))
-            }
-            DnsRequestDecision::Upstream(name) => {
-                debug!("DNS forwarder: routing {} → upstream '{}'", domain, name);
-                let resp = self
-                    .upstream_pool
-                    .query(&name, raw_query)
-                    .await
-                    .with_context(|| format!("upstream '{name}' query failed for {domain}"));
-                resp.map(|r| (r, name))
-            }
-            DnsRequestDecision::Reject => unreachable!("reject handled above"),
-        };
-        let (mut response, mut upstream_name) = match upstream_result {
-            Ok(ok) => ok,
-            Err(e) => {
-                // RFC 8767 serve-stale: an upstream failure must not take
-                // down resolution for names we still hold recently-expired
-                // answers for.
-                if let Some(stale) = self.try_serve_stale(&cache_key, raw_query, &domain).await {
-                    return self
-                        .apply_prefer_strategy(raw_query, &domain, qtype, stale, original_dst)
-                        .await;
-                }
-                return Err(e);
-            }
-        };
-
-        // Response routing: accept / reject / re-query (depth capped).
-        for depth in 0..MAX_DNS_LOOKUP_DEPTH {
-            let rcode = if response.len() >= 4 {
-                response[3] & 0x0F
-            } else {
-                0
-            };
-            // Don't re-route hard failures — return them (and negative-cache).
-            if rcode == 2 || rcode == 3 {
-                // SERVFAIL: serve a stale positive entry if we have one —
-                // the authoritative server failing must not shadow a name
-                // we recently resolved (RFC 8767).
-                if rcode == 2
-                    && let Some(stale) = self.try_serve_stale(&cache_key, raw_query, &domain).await
-                {
-                    return self
-                        .apply_prefer_strategy(raw_query, &domain, qtype, stale, original_dst)
-                        .await;
-                }
-                if self.cache_enabled {
-                    let neg_ttl = extract_soa_negative_ttl(&response, 60);
-                    let mut cache = self.cache.lock().await;
-                    cache.put_negative(cache_key.clone(), neg_ttl, rcode);
-                    debug!(
-                        "DNS forwarder: negative cache stored for {} (rcode={}, ttl={}s)",
-                        domain, rcode, neg_ttl
-                    );
-                }
-                if response.len() >= 2 && raw_query.len() >= 2 {
-                    response[0..2].copy_from_slice(&raw_query[0..2]);
-                }
-                return Ok(response);
-            }
-
-            let ips = extract_answer_ips(&response);
-            match self
-                .routing
-                .select_response(&domain, qtype, &ips, &upstream_name)
-            {
-                DnsResponseDecision::Accept => break,
-                DnsResponseDecision::Reject => {
-                    debug!(
-                        "DNS forwarder: response reject for {} via {}",
-                        domain, upstream_name
-                    );
-                    response = make_empty_response(raw_query, &domain, qtype);
-                    break;
-                }
-                DnsResponseDecision::Requery(next) => {
-                    if depth + 1 >= MAX_DNS_LOOKUP_DEPTH {
-                        warn!(
-                            "DNS forwarder: response re-query depth exceeded for {} (last={})",
-                            domain, next
-                        );
-                        break;
-                    }
-                    if next == upstream_name {
-                        debug!(
-                            "DNS forwarder: response re-query to same upstream '{}' — accepting",
-                            next
-                        );
-                        break;
-                    }
-                    debug!(
-                        "DNS forwarder: response re-query {} → '{}' (depth={})",
-                        domain,
-                        next,
-                        depth + 1
-                    );
-                    response = self
-                        .upstream_pool
-                        .query(&next, raw_query)
-                        .await
-                        .with_context(|| {
-                            format!("response re-query upstream '{next}' failed for {domain}")
-                        })?;
-                    upstream_name = next;
-                }
-            }
-        }
-
-        // Cache TTL: fixed_domain_ttl wins when set; else optimistic_cache_ttl
-        // override; else answer min TTL. fixed=0 means do not cache.
-        let skip_cache = matches!(self.routing.fixed_ttl(&domain), Some(0));
-        let answer_ttl = extract_min_ttl(&response);
-        let cache_ttl = match self.routing.fixed_ttl(&domain) {
-            Some(0) => 0,
-            Some(fixed) => fixed,
-            None => effective_cache_ttl(self.cache_ttl, answer_ttl),
-        };
-
-        if self.cache_enabled && !skip_cache && cache_ttl > 0 {
-            rewrite_answer_ttls(&mut response, cache_ttl);
-            let mut cache = self.cache.lock().await;
-            cache.put(cache_key, response.clone(), cache_ttl);
-        }
-
-        if let Some(ref notifier) = self.notifier {
-            notifier.on_domain_resolved(&domain, &response);
-        }
-
-        if response.len() >= 2 && raw_query.len() >= 2 {
-            response[0..2].copy_from_slice(&raw_query[0..2]);
-        }
-
-        debug!(
-            "DNS forwarder: resolved {} via '{}' (cache_ttl={}s answer_ttl={}s, {} bytes)",
-            domain,
-            upstream_name,
-            cache_ttl,
-            answer_ttl,
-            response.len()
-        );
-
-        self.apply_prefer_strategy(raw_query, &domain, qtype, response, original_dst)
+        mode: ResolveMode,
+    ) -> Result<DnsOutcome, DnsForwardError> {
+        super::engine::pipeline::resolve(self, raw_query, original_dst, bypass_cache_read, mode)
             .await
+    }
+
+    pub(crate) async fn exchange(
+        &self,
+        scope: &RequestScope,
+        raw_query: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
+        match scope {
+            RequestScope::Upstream(upstream) => {
+                self.upstream_pool.query(upstream.as_str(), raw_query).await
+            }
+            RequestScope::AsIs(destination) => self.query_asis(raw_query, Some(*destination)).await,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn outcome_from_wire(
+        &self,
+        engine: &DnsEngine,
+        prepared: &PreparedQuery,
+        reusable: Vec<u8>,
+        status: OutcomeStatus,
+        provenance: Provenance,
+        expiry: EffectiveExpiry,
+        logical_upstream: Option<String>,
+        final_upstream: Option<String>,
+        requery_history: Vec<String>,
+        mode: ResolveMode,
+    ) -> Result<DnsOutcome, DnsForwardError> {
+        let template = match ResponseTemplate::validate(prepared.query(), &reusable) {
+            Ok(template) => Some(template),
+            Err(_) if matches!(mode, ResolveMode::Compatibility) => None,
+            Err(error) => return Err(error.into()),
+        };
+        let rendered = match &template {
+            Some(template) => template.render(prepared.query())?,
+            None => patch_txid(reusable.clone(), prepared.query().txid().get()),
+        };
+        Ok(DnsOutcome::new(OutcomeParts {
+            status,
+            response_class: super::engine::classify_response(&reusable),
+            provenance,
+            expiry,
+            logical_upstream,
+            final_upstream,
+            requery_history,
+            reusable,
+            rendered,
+            template,
+            policy_id: engine.policy_id().cloned(),
+        }))
     }
 
     /// RFC 8767 serve-stale: fall back to a recently-expired cache entry
     /// when the upstream phase fails. TTLs are rewritten to
     /// [`SERVE_STALE_TTL_SECS`] so the client re-asks soon, and the txid is
     /// patched to the caller's query.
-    async fn try_serve_stale(
+    pub(crate) async fn try_serve_stale(
         &self,
         cache_key: &str,
         raw_query: &[u8],
@@ -440,14 +333,17 @@ impl DnsForwarder {
     /// expiry (stale-while-revalidate). The refresh bypasses the cache read
     /// so it always reaches the upstream; the normal pipeline writes the
     /// fresh answer back.
-    fn maybe_spawn_refresh(
+    pub(crate) fn maybe_spawn_refresh(
         &self,
         cache_key: String,
         raw_query: &[u8],
         original_dst: Option<SocketAddr>,
     ) {
         {
-            let mut set = self.refreshing.lock().unwrap();
+            let mut set = self
+                .refreshing
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !set.insert(cache_key.clone()) {
                 return;
             }
@@ -455,11 +351,16 @@ impl DnsForwarder {
         let this = self.clone();
         let query = raw_query.to_vec();
         tokio::spawn(async move {
-            let result = this.resolve_inner(&query, original_dst, true).await;
+            let result = this
+                .resolve_inner(&query, original_dst, true, ResolveMode::Compatibility)
+                .await;
             if let Err(e) = result {
                 debug!("DNS forwarder: background refresh failed: {e:#}");
             }
-            this.refreshing.lock().unwrap().remove(&cache_key);
+            this.refreshing
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&cache_key);
         });
     }
 
@@ -467,7 +368,7 @@ impl DnsForwarder {
     /// when the preferred family has answers for the same name, suppress the
     /// non-preferred family's response with NODATA; otherwise return it
     /// unchanged. Only-modes are handled earlier at request time.
-    async fn apply_prefer_strategy(
+    pub(crate) async fn apply_prefer_strategy(
         &self,
         raw_query: &[u8],
         domain: &str,
@@ -736,6 +637,7 @@ pub fn extract_answer_ips(data: &[u8]) -> Vec<IpAddr> {
     super::wire::extract_ips_from_dns_response(data)
 }
 
+#[cfg(test)]
 fn effective_cache_ttl(configured: u32, answer_min_ttl: u32) -> u32 {
     if configured > 0 {
         configured
@@ -746,12 +648,27 @@ fn effective_cache_ttl(configured: u32, answer_min_ttl: u32) -> u32 {
 
 /// TTL advertised on answers served from the serve-stale fallback: small
 /// enough that clients retry soon and pick up the recovery.
-const SERVE_STALE_TTL_SECS: u32 = 30;
+pub(crate) const SERVE_STALE_TTL_SECS: u32 = 30;
+
+pub(crate) fn traversal_strings(traversal: &ResponseTraversal) -> Vec<String> {
+    traversal
+        .path()
+        .iter()
+        .map(|upstream| upstream.as_str().to_owned())
+        .collect()
+}
+
+fn patch_txid(mut response: Vec<u8>, txid: u16) -> Vec<u8> {
+    if let Some(bytes) = response.get_mut(0..2) {
+        bytes.copy_from_slice(&txid.to_be_bytes());
+    }
+    response
+}
 
 /// RFC 2308 §5 negative-cache TTL: `min(SOA TTL, SOA MINIMUM)` from the
 /// authority section, falling back to `default_ttl` when no SOA record is
 /// present (or the message is malformed).
-fn extract_soa_negative_ttl(data: &[u8], default_ttl: u32) -> u32 {
+pub(crate) fn extract_soa_negative_ttl(data: &[u8], default_ttl: u32) -> u32 {
     if data.len() < 12 {
         return default_ttl;
     }
@@ -800,7 +717,7 @@ fn extract_soa_negative_ttl(data: &[u8], default_ttl: u32) -> u32 {
 ///
 /// Used so cached (and client-visible) records reflect `optimistic_cache_ttl`
 /// rather than the upstream's original values. Malformed tails are left as-is.
-fn rewrite_answer_ttls(data: &mut [u8], ttl: u32) {
+pub(crate) fn rewrite_answer_ttls(data: &mut [u8], ttl: u32) {
     if data.len() < 12 {
         return;
     }
@@ -840,7 +757,7 @@ fn rewrite_answer_ttls(data: &mut [u8], ttl: u32) {
 
 /// Extract the minimum positive TTL from all answer/authority/additional
 /// records in a DNS response.  Returns 60 if no TTL is found.
-fn extract_min_ttl(data: &[u8]) -> u32 {
+pub(crate) fn extract_min_ttl(data: &[u8]) -> u32 {
     if data.len() < 12 {
         return 60;
     }
@@ -891,14 +808,14 @@ fn extract_min_ttl(data: &[u8]) -> u32 {
 }
 
 /// Build the cache key for a domain and query type.
-fn dns_cache_key(domain: &str, qtype: u16) -> String {
+pub(crate) fn dns_cache_key(domain: &str, qtype: u16) -> String {
     format!("{}:{}", domain, qtype)
 }
 
 /// Return `true` if the given query type is hard-filtered at request time.
 /// Only the `*_only` strategies filter here; prefer strategies forward both
 /// families and suppress at response time instead.
-fn is_filtered_qtype(qtype: u16, strategy: &DnsStrategy) -> bool {
+pub(crate) fn is_filtered_qtype(qtype: u16, strategy: &DnsStrategy) -> bool {
     match strategy {
         DnsStrategy::Ipv4Only => qtype == 28, // AAAA
         DnsStrategy::Ipv6Only => qtype == 1,  // A
@@ -917,7 +834,7 @@ fn response_has_family_ips(response: &[u8], qtype: u16) -> bool {
 }
 
 /// Human-readable qtype name for logging.
-fn qtype_name(qtype: u16) -> &'static str {
+pub(crate) fn qtype_name(qtype: u16) -> &'static str {
     match qtype {
         1 => "A",
         28 => "AAAA",
@@ -931,7 +848,7 @@ fn qtype_name(qtype: u16) -> &'static str {
 
 /// Build a NODATA response (NOERROR, zero answers) for a filtered query,
 /// preserving the query's transaction ID and question section.
-fn make_empty_response(query: &[u8], domain: &str, qtype: u16) -> Vec<u8> {
+pub(crate) fn make_empty_response(query: &[u8], domain: &str, qtype: u16) -> Vec<u8> {
     let mut resp = Vec::with_capacity(256);
     // Transaction ID (first two bytes of the query).
     resp.extend_from_slice(&query[0..2.min(query.len())]);
@@ -1141,6 +1058,40 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert_eq!(calls, 2, "background refresh should re-query upstream");
+    }
+
+    #[tokio::test]
+    async fn poisoned_refresh_ownership_does_not_panic_or_leak_key() {
+        let mock = Arc::new(MockUpstream::new(make_a_response([7, 7, 7, 7], 60)));
+        let forwarder = DnsForwarder::new(mock, test_cache(), test_router());
+        let refreshing = forwarder.refreshing.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = refreshing.lock().expect("initial lock");
+            panic!("poison refresh ownership");
+        })
+        .join();
+        let query = make_a_query();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            forwarder.maybe_spawn_refresh("example.com:1".to_owned(), &query, None);
+        }));
+
+        assert!(result.is_ok(), "poisoned refresh ownership must recover");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let is_empty = forwarder
+                    .refreshing
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_empty();
+                if is_empty {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("refresh cleanup");
     }
 
     /// RFC 2308 §5: negative TTL = min(SOA TTL, SOA MINIMUM).

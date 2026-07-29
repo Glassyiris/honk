@@ -154,10 +154,10 @@ impl DnsController {
     /// forwarder — reload-safe, unlike holding a resolver from startup.
     /// Used by the health-check resolver hook.
     pub async fn resolve_domain(&self, domain: &str) -> Vec<std::net::IpAddr> {
+        let forwarder = { self.forwarder.read().await.clone() };
         let mut out = Vec::new();
         for qtype in [1u16, 28] {
             let query = crate::dns::forwarder::build_dns_query(domain, qtype);
-            let forwarder = self.forwarder.read().await;
             if let Ok(resp) = forwarder.resolve(&query).await {
                 out.extend(crate::dns::forwarder::extract_answer_ips(&resp));
             }
@@ -336,6 +336,9 @@ impl DnsController {
         data: &[u8],
         original_dst: Option<SocketAddr>,
     ) -> Vec<u8> {
+        if !is_singleflight_eligible(data) {
+            return self.resolve_and_notify(data, original_dst).await.0;
+        }
         // Key covers the original destination too: `asis` queries to
         // different upstream servers must never share one flight.
         let cache_key = match crate::dns::forwarder::parse_dns_question(data) {
@@ -392,7 +395,7 @@ impl DnsController {
         data: &[u8],
         original_dst: Option<SocketAddr>,
     ) -> (Vec<u8>, bool) {
-        let forwarder = self.forwarder.read().await;
+        let forwarder = { self.forwarder.read().await.clone() };
         match forwarder.resolve_with_context(data, original_dst).await {
             Ok(resp) => {
                 self.notify_bpf_update(data, &resp).await;
@@ -635,6 +638,10 @@ pub(crate) fn build_dns_error_response(query: &[u8], rcode: u8) -> Vec<u8> {
     resp
 }
 
+fn is_singleflight_eligible(data: &[u8]) -> bool {
+    crate::dns::query::QueryContext::parse(data).is_ok_and(|query| query.is_coalescable())
+}
+
 /// Rewrite the response's transaction ID to match this query — required
 /// when a singleflight leader's response is shared with waiting clients.
 fn with_own_txid(mut resp: Vec<u8>, query: &[u8]) -> Vec<u8> {
@@ -754,6 +761,14 @@ mod singleflight_tests {
         resp
     }
 
+    fn multi_question_query(txid: u16) -> Vec<u8> {
+        let mut query = query_with_txid("example.com", txid);
+        let second = query_with_txid("other.example", txid);
+        query[4..6].copy_from_slice(&2_u16.to_be_bytes());
+        query.extend_from_slice(&second[12..]);
+        query
+    }
+
     /// Concurrent duplicate queries share one upstream flight, and each
     /// waiter gets the response with its OWN transaction id restored.
     #[tokio::test]
@@ -774,6 +789,181 @@ mod singleflight_tests {
             upstream.calls.load(Ordering::SeqCst),
             1,
             "deduped to one upstream query"
+        );
+    }
+
+    #[tokio::test]
+    async fn ineligible_queries_bypass_singleflight() {
+        let (controller, upstream) = test_controller(
+            response_with_txid("example.com", 0x1111),
+            Duration::from_millis(100),
+        );
+        let first = multi_question_query(0xaaaa);
+        let second = multi_question_query(0xbbbb);
+
+        let _ = tokio::join!(
+            controller.resolve_with_singleflight(&first, None),
+            controller.resolve_with_singleflight(&second, None),
+        );
+
+        assert_eq!(
+            upstream.calls.load(Ordering::SeqCst),
+            2,
+            "ineligible requests must not share an upstream flight"
+        );
+    }
+
+    struct SnapshotUpstream {
+        ip: [u8; 4],
+        calls: AtomicUsize,
+        entered: Option<Arc<Notify>>,
+        release: Option<Arc<Notify>>,
+    }
+
+    #[async_trait::async_trait]
+    impl DnsUpstreamPool for SnapshotUpstream {
+        async fn query(&self, _name: &str, raw: &[u8]) -> anyhow::Result<Vec<u8>> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0
+                && let (Some(entered), Some(release)) = (&self.entered, &self.release)
+            {
+                entered.notify_one();
+                release.notified().await;
+            }
+            Ok(a_response(raw, self.ip))
+        }
+    }
+
+    fn a_response(query: &[u8], ip: [u8; 4]) -> Vec<u8> {
+        let mut response = query.to_vec();
+        response[2] = 0x81;
+        response[3] = 0x80;
+        response[6..8].copy_from_slice(&1_u16.to_be_bytes());
+        response.extend_from_slice(&[
+            0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 30, 0, 4, ip[0], ip[1], ip[2], ip[3],
+        ]);
+        response
+    }
+
+    fn snapshot_forwarder(upstream: Arc<SnapshotUpstream>) -> Arc<DnsForwarder> {
+        Arc::new(
+            DnsForwarder::new(
+                upstream,
+                Arc::new(tokio::sync::Mutex::new(crate::dns::cache::DnsCache::new(
+                    16,
+                ))),
+                Arc::new(
+                    crate::dns::routing::DnsRouter::new_from_dns_config(
+                        &honk_config::dns::DnsConfig::default(),
+                    )
+                    .expect("router"),
+                ),
+            )
+            .with_cache_enabled(false),
+        )
+    }
+
+    fn snapshot_controller(forwarder: Arc<DnsForwarder>) -> Arc<DnsController> {
+        Arc::new(DnsController::new(
+            forwarder,
+            Arc::new(RwLock::new(Box::new(
+                crate::ebpf::mock::MockEbpfBackend::new(),
+            ))),
+            Arc::new(RwLock::new(Router::new(&[], "direct").expect("router"))),
+        ))
+    }
+
+    #[tokio::test]
+    async fn set_forwarder_does_not_wait_for_resolve_and_notify_exchange() {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let old = snapshot_forwarder(Arc::new(SnapshotUpstream {
+            ip: [192, 0, 2, 1],
+            calls: AtomicUsize::new(0),
+            entered: Some(entered.clone()),
+            release: Some(release.clone()),
+        }));
+        let controller = snapshot_controller(old);
+        let query = crate::dns::forwarder::build_dns_query("example.com", 1);
+        let running = {
+            let controller = controller.clone();
+            let query = query.clone();
+            tokio::spawn(async move { controller.resolve_and_notify(&query, None).await })
+        };
+        entered.notified().await;
+        let new = snapshot_forwarder(Arc::new(SnapshotUpstream {
+            ip: [198, 51, 100, 2],
+            calls: AtomicUsize::new(0),
+            entered: None,
+            release: None,
+        }));
+
+        let publication =
+            tokio::time::timeout(Duration::from_millis(100), controller.set_forwarder(new)).await;
+        if publication.is_err() {
+            release.notify_waiters();
+            let _ = running.await;
+            panic!("set_forwarder waited for the old upstream exchange");
+        }
+        assert!(!running.is_finished(), "old query must remain paused");
+        release.notify_waiters();
+        let (old_response, _) = running.await.expect("old query task");
+        let (new_response, _) = controller.resolve_and_notify(&query, None).await;
+
+        assert_eq!(
+            crate::dns::forwarder::extract_answer_ips(&old_response),
+            ["192.0.2.1".parse::<std::net::IpAddr>().expect("old IP")]
+        );
+        assert_eq!(
+            crate::dns::forwarder::extract_answer_ips(&new_response),
+            ["198.51.100.2".parse::<std::net::IpAddr>().expect("new IP")]
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_domain_keeps_old_snapshot_without_blocking_publication() {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let old = snapshot_forwarder(Arc::new(SnapshotUpstream {
+            ip: [192, 0, 2, 3],
+            calls: AtomicUsize::new(0),
+            entered: Some(entered.clone()),
+            release: Some(release.clone()),
+        }));
+        let controller = snapshot_controller(old);
+        let running = {
+            let controller = controller.clone();
+            tokio::spawn(async move { controller.resolve_domain("example.com").await })
+        };
+        entered.notified().await;
+        let new = snapshot_forwarder(Arc::new(SnapshotUpstream {
+            ip: [198, 51, 100, 4],
+            calls: AtomicUsize::new(0),
+            entered: None,
+            release: None,
+        }));
+
+        let publication =
+            tokio::time::timeout(Duration::from_millis(100), controller.set_forwarder(new)).await;
+        if publication.is_err() {
+            release.notify_waiters();
+            let _ = running.await;
+            panic!("set_forwarder waited for resolve_domain");
+        }
+        assert!(!running.is_finished(), "old lookup must remain paused");
+        release.notify_waiters();
+        let old_ips = running.await.expect("old lookup task");
+        let new_ips = controller.resolve_domain("example.com").await;
+
+        assert!(
+            old_ips
+                .iter()
+                .all(|ip| { *ip == "192.0.2.3".parse::<std::net::IpAddr>().expect("old IP") })
+        );
+        assert!(
+            new_ips
+                .iter()
+                .all(|ip| { *ip == "198.51.100.4".parse::<std::net::IpAddr>().expect("new IP") })
         );
     }
 

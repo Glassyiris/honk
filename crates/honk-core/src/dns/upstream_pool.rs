@@ -460,10 +460,12 @@ impl UpstreamPool {
     }
 
     pub async fn close(&self) {
-        let mut shutdown = self.shutdown.write().await;
-        match *shutdown {
-            PoolState::Open | PoolState::Closing => *shutdown = PoolState::Closing,
-            PoolState::Closed => return,
+        {
+            let mut shutdown = self.shutdown.write().await;
+            match *shutdown {
+                PoolState::Open | PoolState::Closing => *shutdown = PoolState::Closing,
+                PoolState::Closed => return,
+            }
         }
         let slots = self
             .entries
@@ -483,7 +485,7 @@ impl UpstreamPool {
             })
             .await;
         }
-        *shutdown = PoolState::Closed;
+        *self.shutdown.write().await = PoolState::Closed;
     }
 
     async fn query_udp(
@@ -581,8 +583,7 @@ impl DnsUpstreamPool for UpstreamPool {
             .resolve_dial_leaf(entry)
             .await
             .map_err(|e| anyhow::anyhow!("DNS upstream '{upstream_name}': {e}"))?;
-        let shutdown = self.shutdown.read().await;
-        match *shutdown {
+        match *self.shutdown.read().await {
             PoolState::Open => {}
             PoolState::Closing | PoolState::Closed => {
                 anyhow::bail!("DNS upstream pool is closed")
@@ -661,7 +662,6 @@ impl DnsUpstreamPool for UpstreamPool {
                 .unwrap_or("direct"),
             response.len()
         );
-        drop(shutdown);
         Ok(response)
     }
 }

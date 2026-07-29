@@ -1178,10 +1178,8 @@ async fn get_dns_query(
     };
 
     let query = crate::dns::forwarder::build_dns_query(&name, qtype);
-    let result = {
-        let forwarder = s.dns_forwarder.read().await;
-        forwarder.resolve(&query).await
-    };
+    let forwarder = { s.dns_forwarder.read().await.clone() };
+    let result = forwarder.resolve(&query).await;
     match result {
         Ok(resp) => Json(doh::response_json(&name, qtype, &resp)).into_response(),
         // Upstream error or negative-cache hit: report SERVFAIL-style.

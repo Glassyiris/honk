@@ -27,6 +27,12 @@ pub struct CachedEntry {
     pub min_ttl: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NegativeCacheHit {
+    pub rcode: u8,
+    pub remaining_ttl: Duration,
+}
+
 impl CachedEntry {
     /// Returns `true` if the current time is past `expires_at`.
     #[inline]
@@ -152,6 +158,18 @@ impl DnsCache {
         self.inner.put(key, entry);
     }
 
+    #[cfg(test)]
+    pub(crate) fn insert_expired_for_test(&mut self, key: String, response: Vec<u8>, min_ttl: u32) {
+        self.inner.put(
+            key,
+            CachedEntry {
+                response,
+                expires_at: Instant::now() - Duration::from_secs(1),
+                min_ttl,
+            },
+        );
+    }
+
     /// Store a negative cache entry (NXDOMAIN/SERVFAIL), keeping the rcode
     /// so a later hit can be answered with the correct one.
     ///
@@ -166,10 +184,22 @@ impl DnsCache {
 
     /// The rcode of a live negative entry, if any (2=SERVFAIL, 3=NXDOMAIN).
     pub fn negative_rcode(&self, key: &str) -> Option<u8> {
-        self.negative
-            .peek(key)
-            .filter(|(expires, _)| Instant::now() < *expires)
-            .map(|(_, rcode)| *rcode)
+        self.negative_hit(key).map(|hit| hit.rcode)
+    }
+
+    pub fn negative_hit(&self, key: &str) -> Option<NegativeCacheHit> {
+        let now = Instant::now();
+        self.negative.peek(key).and_then(|(expires, rcode)| {
+            expires.checked_duration_since(now).map(|remaining| {
+                let rounded_secs = remaining
+                    .as_secs()
+                    .saturating_add(u64::from(remaining.subsec_nanos() > 0));
+                NegativeCacheHit {
+                    rcode: *rcode,
+                    remaining_ttl: Duration::from_secs(rounded_secs),
+                }
+            })
+        })
     }
 
     /// Remove a negative cache entry.

@@ -21,7 +21,9 @@
 
 pub mod cache;
 pub mod endpoint;
+pub mod engine;
 pub mod forwarder;
+pub mod outcome;
 pub mod persist;
 pub mod planner;
 pub mod policy;
@@ -245,7 +247,8 @@ fn build_forwarder_from_config(
         forwarder::DnsForwarder::new(pool, dns_cache, router)
             .with_strategy(config.strategy.clone())
             .with_cache_enabled(config.cache.enabled)
-            .with_cache_ttl(config.cache.ttl.min(u64::from(u32::MAX)) as u32),
+            .with_cache_ttl(config.cache.ttl.min(u64::from(u32::MAX)) as u32)
+            .with_policy_from_config(config)?,
     ))
 }
 

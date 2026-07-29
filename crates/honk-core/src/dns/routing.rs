@@ -18,6 +18,20 @@ use crate::routing::GeoAssets;
 use crate::routing::GeositeMatcher;
 use tracing::{debug, warn};
 
+fn request_upstream(action: &DnsRequestAction) -> Option<&str> {
+    match action {
+        DnsRequestAction::Reject | DnsRequestAction::AsIs => None,
+        DnsRequestAction::Upstream(name) => Some(name),
+    }
+}
+
+fn response_upstream(action: &DnsResponseAction) -> Option<&str> {
+    match action {
+        DnsResponseAction::Accept | DnsResponseAction::Reject => None,
+        DnsResponseAction::Upstream(name) => Some(name),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Decision types
 // ---------------------------------------------------------------------------
@@ -43,6 +57,7 @@ pub enum DnsResponseDecision {
 // ---------------------------------------------------------------------------
 
 /// Pre-compiled domain matcher.
+#[derive(Clone)]
 enum CompiledDomainMatcher {
     Full(String),
     Suffix(String),
@@ -78,6 +93,7 @@ impl CompiledDomainMatcher {
 }
 
 /// Pre-compiled single condition.
+#[derive(Clone)]
 enum CompiledCond {
     Qname {
         not: bool,
@@ -102,6 +118,7 @@ enum CompiledCond {
 // Compiled request rule
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct CompiledRequestRule {
     conditions: Vec<CompiledCond>,
     action: DnsRequestAction,
@@ -111,6 +128,7 @@ struct CompiledRequestRule {
 // Compiled response rule
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct CompiledResponseRule {
     conditions: Vec<CompiledCond>,
     action: DnsResponseAction,
@@ -121,6 +139,7 @@ struct CompiledResponseRule {
 // ---------------------------------------------------------------------------
 
 /// DNS router that selects upstreams based on domain, qtype, and response metadata.
+#[derive(Clone)]
 pub struct DnsRouter {
     request_rules: Vec<CompiledRequestRule>,
     request_fallback: DnsRequestAction,
@@ -289,6 +308,24 @@ impl DnsRouter {
     /// Look up the fixed TTL for a domain. `Some(0)` disables caching.
     pub fn fixed_ttl(&self, domain: &str) -> Option<u32> {
         self.fixed_domain_ttl.get(domain).copied()
+    }
+
+    pub(crate) fn upstream_names(&self) -> std::collections::BTreeSet<String> {
+        let request = self
+            .request_rules
+            .iter()
+            .filter_map(|rule| request_upstream(&rule.action))
+            .chain(request_upstream(&self.request_fallback));
+        let response = self
+            .response_rules
+            .iter()
+            .filter_map(|rule| response_upstream(&rule.action))
+            .chain(response_upstream(&self.response_fallback));
+        request
+            .chain(response)
+            .chain(std::iter::once("default"))
+            .map(str::to_owned)
+            .collect()
     }
 
     // -----------------------------------------------------------------------
