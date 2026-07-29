@@ -35,6 +35,7 @@ use tracing::{debug, warn};
 
 use super::addr;
 use super::{PacketTransport, ProxyHandler, ProxyStream, UdpProxySocket};
+use crate::session::ManagedSession as _;
 
 /// sing uot v2 magic address (`protocol/anytls/outbound.go`,
 /// `common/uot/protocol.go`): UDP-over-TCP streams are opened to this
@@ -120,7 +121,11 @@ pub(crate) const POOL_KEY: &str = "self";
 /// applies). Shared by the runtime-registry pools and handler fallbacks.
 pub(crate) fn session_pool_config() -> crate::session::SessionPoolConfig {
     crate::session::SessionPoolConfig {
-        max_streams_per_session: usize::MAX,
+        // v3.1 sizing: two sessions per node, 128 streams each (initial
+        // values, tune by load test). The per-session semaphore is the
+        // capacity truth; this cap only steers least-loaded scheduling.
+        max_sessions: 2,
+        max_streams_per_session: MAX_STREAMS_PER_SESSION,
         janitor_interval: Duration::from_secs(DEFAULT_IDLE_CHECK_INTERVAL_SECS),
         ..Default::default()
     }
@@ -185,17 +190,21 @@ impl StreamSink {
 struct StreamRegistration {
     session: Arc<AnyTlsSession>,
     sid: u32,
-    /// Open frames completed; the active count was incremented (once).
-    counted: bool,
     /// A frame write is in progress: a partial frame may be on the wire.
     frame_started: bool,
     /// Lifecycle handed to the caller; Drop is then a no-op.
     committed: bool,
+    /// Stream-slot capacity reserved for this registration. Moves to the
+    /// stream on commit; released on an abandoned registration (the
+    /// semaphore is the only capacity truth).
+    permit: Option<crate::session::SessionPermit<AnyTlsSession>>,
 }
 
 impl StreamRegistration {
-    fn commit(mut self) {
+    /// Hand the lifecycle (and the capacity slot) to the caller's stream.
+    fn commit(mut self) -> crate::session::SessionPermit<AnyTlsSession> {
         self.committed = true;
+        self.permit.take().expect("registration owns a permit")
     }
 }
 
@@ -204,26 +213,23 @@ impl Drop for StreamRegistration {
         if self.committed {
             return;
         }
-        let was_registered = self
-            .session
-            .streams
-            .lock()
-            .unwrap()
-            .remove(&self.sid)
-            .is_some();
-        if self.counted && was_registered {
-            self.session.active_streams.fetch_sub(1, Ordering::Relaxed);
-        }
+        self.session.streams.lock().unwrap().remove(&self.sid);
         if self.frame_started {
             // A partial frame may be on the wire: the session's framing
             // is no longer trustworthy.
             self.session.close();
         }
+        // `permit` drops here too: the slot is released exactly once.
     }
 }
 
 /// Session pool type for one AnyTLS node (runtime-registry owned).
 pub(crate) type AnyTlsPool = crate::session::SessionPool<AnyTlsSession>;
+
+/// Per-session stream capacity (v3.1): the semaphore is the single
+/// capacity truth — 128 concurrent streams per session (initial value,
+/// tune by load test).
+pub(crate) const MAX_STREAMS_PER_SESSION: usize = 128;
 
 /// A multiplexed AnyTLS session: one TLS connection carrying any number of
 /// concurrent streams (sing-anytls `Session`).
@@ -242,8 +248,12 @@ pub(crate) struct AnyTlsSession {
     /// Set once the TLS connection dies or an ALERT arrives; idempotent
     /// close via [`AnyTlsSession::close`].
     closed: AtomicBool,
-    /// Number of currently open streams.
-    active_streams: AtomicUsize,
+    /// Lifecycle: Active → Draining → Closed (a usize of
+    /// [`crate::session::SessionState`] discriminants).
+    session_state: AtomicUsize,
+    /// Stream-slot capacity: the single capacity truth (replaces the old
+    /// active_streams counter — a permit outlives the counter's races).
+    stream_permits: Arc<tokio::sync::Semaphore>,
     /// Demux task handle, aborted on close.
     demux: Mutex<Option<tokio::task::AbortHandle>>,
 }
@@ -271,7 +281,8 @@ impl AnyTlsSession {
             streams: Mutex::new(HashMap::new()),
             next_sid: AtomicU32::new(0),
             closed: AtomicBool::new(false),
-            active_streams: AtomicUsize::new(0),
+            session_state: AtomicUsize::new(crate::session::SessionState::Active as usize),
+            stream_permits: Arc::new(tokio::sync::Semaphore::new(MAX_STREAMS_PER_SESSION)),
             demux: Mutex::new(None),
         });
 
@@ -289,8 +300,10 @@ impl AnyTlsSession {
         self.closed.load(Ordering::SeqCst)
     }
 
+    /// Open streams on this session (capacity taken from the semaphore —
+    /// the single truth; `MAX_STREAMS_PER_SESSION - available`).
     fn active_streams(&self) -> usize {
-        self.active_streams.load(Ordering::Relaxed)
+        MAX_STREAMS_PER_SESSION - self.stream_permits.available_permits()
     }
 
     /// Write a single frame through the shared writer.
@@ -302,15 +315,18 @@ impl AnyTlsSession {
     }
 
     /// Register a sid and write the SYN+PSH opening pair under one writer
-    /// lock (never interleaved with other streams). The returned guard
-    /// owns the registration until the caller commits; a write failure or
-    /// a cancellation removes the sid, and a possibly-partial frame on
-    /// the wire closes the session (sing `writeControlFrame` parity).
+    /// lock (never interleaved with other streams). The caller proves
+    /// capacity with `permit` (from `try_reserve`); the returned guard
+    /// owns both the registration and the slot until the caller commits;
+    /// a write failure or a cancellation removes the sid, and a
+    /// possibly-partial frame on the wire closes the session (sing
+    /// `writeControlFrame` parity).
     async fn register_and_open(
         self: &Arc<Self>,
         target_addr: Vec<u8>,
         queue_cap: usize,
         sink: fn(mpsc::Sender<StreamEvent>) -> StreamSink,
+        permit: crate::session::SessionPermit<Self>,
     ) -> anyhow::Result<(u32, mpsc::Receiver<StreamEvent>, StreamRegistration)> {
         if self.is_closed() {
             anyhow::bail!("AnyTLS session {} is closed", self.seq);
@@ -321,9 +337,9 @@ impl AnyTlsSession {
         let mut guard = StreamRegistration {
             session: Arc::clone(self),
             sid,
-            counted: false,
             frame_started: true,
             committed: false,
+            permit: Some(permit),
         };
         let open_result: std::io::Result<()> = async {
             let mut w = self.writer.lock().await;
@@ -334,14 +350,12 @@ impl AnyTlsSession {
         .await;
         match open_result {
             Ok(()) => {
-                self.active_streams.fetch_add(1, Ordering::Relaxed);
-                guard.counted = true;
                 guard.frame_started = false;
                 Ok((sid, rx, guard))
             }
             Err(e) => {
-                // Dropping the guard removes the sid and closes the
-                // session (frame_started).
+                // Dropping the guard removes the sid, releases the slot,
+                // and closes the session (frame_started).
                 Err(anyhow::anyhow!(
                     "AnyTLS session {} open sid={}: {}",
                     self.seq,
@@ -359,13 +373,14 @@ impl AnyTlsSession {
     async fn open_stream(
         self: &Arc<Self>,
         target_addr: Vec<u8>,
+        permit: crate::session::SessionPermit<Self>,
     ) -> anyhow::Result<tokio::io::DuplexStream> {
         let (sid, rx, guard) = self
-            .register_and_open(target_addr, STREAM_QUEUE_CAP, StreamSink::Tcp)
+            .register_and_open(target_addr, STREAM_QUEUE_CAP, StreamSink::Tcp, permit)
             .await?;
-        guard.commit();
+        let permit = guard.commit();
         let (client_half, stream_half) = tokio::io::duplex(STREAM_DUPLEX_BUFFER);
-        tokio::spawn(stream_task(Arc::clone(self), sid, stream_half, rx));
+        tokio::spawn(stream_task(Arc::clone(self), sid, stream_half, rx, permit));
         debug!("AnyTLS session {} opened sid={}", self.seq, sid);
         Ok(client_half)
     }
@@ -380,13 +395,15 @@ impl AnyTlsSession {
     ///
     /// The returned guard is **uncommitted**: the caller must drive the
     /// UoT request write and then [`StreamRegistration::commit`] —
-    /// abandoning the stream in between cleans up sid and count.
+    /// abandoning the stream in between cleans up the sid and releases
+    /// the slot.
     async fn open_uot_stream(
         self: &Arc<Self>,
         target_addr: Vec<u8>,
+        permit: crate::session::SessionPermit<Self>,
     ) -> anyhow::Result<(u32, mpsc::Receiver<StreamEvent>, StreamRegistration)> {
         let (sid, rx, guard) = self
-            .register_and_open(target_addr, UOT_DRAIN_QUEUE_CAP, StreamSink::Uot)
+            .register_and_open(target_addr, UOT_DRAIN_QUEUE_CAP, StreamSink::Uot, permit)
             .await?;
         debug!("AnyTLS session {} opened uot sid={}", self.seq, sid);
         Ok((sid, rx, guard))
@@ -413,26 +430,23 @@ impl AnyTlsSession {
     async fn open_stream_direct(
         self: &Arc<Self>,
         target_addr: Vec<u8>,
-    ) -> anyhow::Result<(u32, mpsc::Receiver<StreamEvent>)> {
+        permit: crate::session::SessionPermit<Self>,
+    ) -> anyhow::Result<AnyTlsStream> {
         let (sid, rx, guard) = self
-            .register_and_open(target_addr, STREAM_QUEUE_CAP, StreamSink::Tcp)
+            .register_and_open(target_addr, STREAM_QUEUE_CAP, StreamSink::Tcp, permit)
             .await?;
-        guard.commit();
+        let permit = guard.commit();
         debug!("AnyTLS session {} opened direct sid={}", self.seq, sid);
-        Ok((sid, rx))
+        Ok(AnyTlsStream::new(Arc::clone(self), sid, rx, permit))
     }
 
     /// Unregister a UoT stream (FIN to the server), mirroring
-    /// [`Self::end_stream`].
+    /// [`Self::end_stream`]. Stream capacity is the permit's business
+    /// (released when the transport drops it), never this map's.
     async fn end_uot_stream(&self, sid: u32) {
         let was_registered = self.streams.lock().unwrap().remove(&sid).is_some();
         if was_registered && !self.is_closed() {
             let _ = self.write_frame(CMD_FIN, sid, &[]).await;
-        }
-        // Exactly-once: only a sid that was actually registered decrements
-        // (a registration guard may already have cleaned it up).
-        if was_registered {
-            self.active_streams.fetch_sub(1, Ordering::Relaxed);
         }
         debug!("AnyTLS session {} sid={} uot stream ended", self.seq, sid);
     }
@@ -448,10 +462,6 @@ impl AnyTlsSession {
         if notify_fin && was_registered && !self.is_closed() {
             let _ = self.write_frame(CMD_FIN, sid, &[]).await;
         }
-        // Exactly-once: see end_uot_stream.
-        if was_registered {
-            self.active_streams.fetch_sub(1, Ordering::Relaxed);
-        }
         debug!("AnyTLS session {} sid={} stream ended", self.seq, sid);
     }
 
@@ -464,6 +474,10 @@ impl AnyTlsSession {
         if self.closed.swap(true, Ordering::SeqCst) {
             return;
         }
+        self.session_state.store(
+            crate::session::SessionState::Closed as usize,
+            Ordering::Release,
+        );
         self.streams.lock().unwrap().clear();
         if let Some(handle) = self.demux.lock().unwrap().take() {
             handle.abort();
@@ -580,6 +594,8 @@ async fn stream_task(
     sid: u32,
     mut stream_half: tokio::io::DuplexStream,
     mut rx: mpsc::Receiver<StreamEvent>,
+    // The capacity slot for this stream; released when the task exits.
+    _permit: crate::session::SessionPermit<AnyTlsSession>,
 ) {
     let mut buf = vec![0u8; 65536];
     let mut notify_fin = false;
@@ -633,13 +649,45 @@ async fn stream_task(
 impl crate::session::ManagedSession for AnyTlsSession {
     // The inherent methods of the same names do the real work.
     fn active_streams(&self) -> usize {
-        self.active_streams.load(Ordering::Relaxed)
+        MAX_STREAMS_PER_SESSION - self.stream_permits.available_permits()
     }
     fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
     }
     fn close(&self) {
         AnyTlsSession::close(self)
+    }
+    fn state(&self) -> crate::session::SessionState {
+        match self.session_state.load(Ordering::Acquire) {
+            0 => crate::session::SessionState::Active,
+            1 => crate::session::SessionState::Draining,
+            _ => crate::session::SessionState::Closed,
+        }
+    }
+    /// GOAWAY/max-age: stop taking new streams; the pool stops offering
+    /// this session and existing streams run to the end.
+    fn begin_drain(&self) {
+        let _ = self.session_state.compare_exchange(
+            crate::session::SessionState::Active as usize,
+            crate::session::SessionState::Draining as usize,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+    /// Active → acquire → re-check Active: a session that began draining
+    /// in between releases the slot immediately instead of taking one
+    /// more stream it will never serve.
+    fn try_reserve(self: &Arc<Self>) -> Option<crate::session::SessionPermit<Self>> {
+        use crate::session::{SessionPermit, SessionState};
+        if self.state() != SessionState::Active {
+            return None;
+        }
+        let permit = Arc::clone(&self.stream_permits).try_acquire_owned().ok()?;
+        if self.state() != SessionState::Active {
+            drop(permit);
+            return None;
+        }
+        Some(SessionPermit::new(Arc::clone(self), permit))
     }
 }
 
@@ -764,28 +812,40 @@ impl AnyTlsHandler {
     ) -> anyhow::Result<AnyTlsStream> {
         let pool = self.node_pool(node)?;
         Self::ensure_janitor(node, &pool);
-        let mut last_err: Option<anyhow::Error> = None;
-        for _attempt in 0..2 {
-            let session = pool
-                .offer(POOL_KEY, || dial_session(node, addr, connect_timeout))
-                .await?;
-            match session.open_stream_direct(target_addr.to_vec()).await {
-                Ok((sid, rx)) => {
+        // The dial future must be 'static (pool-owned dial task) and the
+        // closure Clone (open_with retries once): own clones.
+        let dial_node = node.clone();
+        let dial_addr = addr.to_string();
+        let target = target_addr.to_vec();
+        pool.open_with(
+            POOL_KEY,
+            move || {
+                let node = dial_node.clone();
+                let addr = dial_addr.clone();
+                async move { dial_session(&node, &addr, connect_timeout).await }
+            },
+            move |session, permit| {
+                let target = target.clone();
+                async move {
                     debug!(
-                        "AnyTLS: multiplexing on session {} for {} ({} open stream(s))",
+                        "AnyTLS: multiplexing on session {} ({} open stream(s))",
                         session.seq,
-                        addr,
                         session.active_streams(),
                     );
-                    return Ok(AnyTlsStream::new(session, sid, rx));
+                    match session.open_stream_direct(target, permit).await {
+                        Ok(stream) => Ok(stream),
+                        // A write failure kills the session (sing parity):
+                        // retry on a fresh one; everything else is refused.
+                        Err(e) => Err(if session.is_closed() {
+                            crate::session::OpenError::Session(e)
+                        } else {
+                            crate::session::OpenError::Refused(e)
+                        }),
+                    }
                 }
-                Err(e) => {
-                    pool.invalidate(POOL_KEY, &session);
-                    last_err = Some(e);
-                }
-            }
-        }
-        Err(last_err.expect("open_pooled_stream attempts always record an error"))
+            },
+        )
+        .await
     }
 }
 
@@ -809,10 +869,18 @@ pub(crate) struct AnyTlsStream {
     write_fut:
         Option<std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>>,
     fin_sent: bool,
+    /// Stream-slot capacity, held for the stream's whole life (released
+    /// on Drop).
+    _permit: crate::session::SessionPermit<AnyTlsSession>,
 }
 
 impl AnyTlsStream {
-    fn new(session: Arc<AnyTlsSession>, sid: u32, rx: mpsc::Receiver<StreamEvent>) -> Self {
+    fn new(
+        session: Arc<AnyTlsSession>,
+        sid: u32,
+        rx: mpsc::Receiver<StreamEvent>,
+        permit: crate::session::SessionPermit<AnyTlsSession>,
+    ) -> Self {
         Self {
             session,
             sid,
@@ -822,6 +890,7 @@ impl AnyTlsStream {
             read_eof: false,
             write_fut: None,
             fin_sent: false,
+            _permit: permit,
         }
     }
 
@@ -1310,10 +1379,13 @@ impl ProxyHandler for AnyTlsHandler {
             connect_transport(node, &addr, _connect_timeout, Some(tcp)).await?;
         let session = AnyTlsSession::establish(&addr, read, write, &auth, &settings).await?;
         pool.insert(POOL_KEY, &session);
-        let (sid, rx) = session.open_stream_direct(target_addr).await?;
+        let permit = session
+            .try_reserve()
+            .ok_or_else(|| anyhow::anyhow!("fresh AnyTLS session has no stream capacity"))?;
+        let stream = session.open_stream_direct(target_addr, permit).await?;
 
         Ok(ProxyStream {
-            stream: Box::new(AnyTlsStream::new(session, sid, rx)),
+            stream: Box::new(stream),
             target_addr: target,
             target_domain: target_domain.map(|s| s.to_string()),
         })
@@ -1347,10 +1419,21 @@ impl ProxyHandler for AnyTlsHandler {
             let mut attempt = 0;
             loop {
                 attempt += 1;
+                let dial_node = node.clone();
+                let dial_addr = addr.clone();
                 let session = pool
-                    .offer(POOL_KEY, || dial_session(node, &addr, connect_timeout))
+                    .offer(POOL_KEY, move || async move {
+                        dial_session(&dial_node, &dial_addr, connect_timeout).await
+                    })
                     .await?;
-                match session.open_stream(magic.clone()).await {
+                let Some(permit) = session.try_reserve() else {
+                    pool.invalidate(POOL_KEY, &session);
+                    if attempt >= 2 {
+                        return Err(anyhow::anyhow!("AnyTLS session has no stream capacity"));
+                    }
+                    continue;
+                };
+                match session.open_stream(magic.clone(), permit).await {
                     Ok(s) => break s,
                     Err(e) => {
                         pool.invalidate(POOL_KEY, &session);
@@ -1415,10 +1498,21 @@ impl ProxyHandler for AnyTlsHandler {
         let mut attempt = 0;
         let (session, sid, rx, mut guard) = loop {
             attempt += 1;
+            let dial_node = node.clone();
+            let dial_addr = addr.clone();
             let session = pool
-                .offer(POOL_KEY, || dial_session(node, &addr, connect_timeout))
+                .offer(POOL_KEY, move || async move {
+                    dial_session(&dial_node, &dial_addr, connect_timeout).await
+                })
                 .await?;
-            match session.open_uot_stream(magic.clone()).await {
+            let Some(permit) = session.try_reserve() else {
+                pool.invalidate(POOL_KEY, &session);
+                if attempt >= 2 {
+                    return Err(anyhow::anyhow!("AnyTLS session has no stream capacity"));
+                }
+                continue;
+            };
+            match session.open_uot_stream(magic.clone(), permit).await {
                 Ok((sid, rx, guard)) => break (session, sid, rx, guard),
                 Err(e) => {
                     pool.invalidate(POOL_KEY, &session);
@@ -1445,7 +1539,7 @@ impl ProxyHandler for AnyTlsHandler {
             Err(elapsed) => return Err(elapsed.into()),
         }
         guard.frame_started = false;
-        guard.commit();
+        let permit = guard.commit();
 
         Ok(Arc::new(AnyTlsUotTransport {
             session,
@@ -1454,6 +1548,7 @@ impl ProxyHandler for AnyTlsHandler {
             mode: tokio::sync::Mutex::new(None),
             target,
             target_domain: target_domain.map(str::to_string),
+            _permit: permit,
         }))
     }
 }
@@ -1473,6 +1568,8 @@ struct AnyTlsUotTransport {
     mode: tokio::sync::Mutex<Option<UotMode>>,
     target: SocketAddr,
     target_domain: Option<String>,
+    /// Stream-slot capacity, held for the transport's life.
+    _permit: crate::session::SessionPermit<AnyTlsSession>,
 }
 
 impl AnyTlsUotTransport {
@@ -1870,7 +1967,8 @@ mod tests {
             .lock()
             .unwrap()
             .insert(sid, StreamSink::Tcp(tx));
-        let mut stream = AnyTlsStream::new(Arc::clone(&session), sid, rx);
+        let permit = session.try_reserve().unwrap();
+        let mut stream = AnyTlsStream::new(Arc::clone(&session), sid, rx, permit);
 
         let sink = session.streams.lock().unwrap().get(&sid).cloned().unwrap();
         sink.send_data(b"hello".to_vec()).await;
@@ -1901,7 +1999,8 @@ mod tests {
             .lock()
             .unwrap()
             .insert(sid, StreamSink::Tcp(tx));
-        let mut stream = AnyTlsStream::new(Arc::clone(&session), sid, rx);
+        let permit = session.try_reserve().unwrap();
+        let mut stream = AnyTlsStream::new(Arc::clone(&session), sid, rx, permit);
 
         let sink = session.streams.lock().unwrap().get(&sid).cloned().unwrap();
         sink.send_data(b"aa".to_vec()).await;
@@ -1915,7 +2014,8 @@ mod tests {
         assert_eq!(n, 0);
     }
 
-    /// 0.5.2: an uncommitted registration cleans sid + count on drop.
+    /// 0.5.2/v2: an uncommitted registration cleans the sid and releases
+    /// the capacity slot on drop.
     #[tokio::test]
     async fn test_registration_guard_drop_cleans_uncommitted() {
         let (session, _server) = establish_test_session("127.0.0.1:443").await;
@@ -1926,19 +2026,19 @@ mod tests {
             .lock()
             .unwrap()
             .insert(sid, StreamSink::Tcp(tx));
-        session.active_streams.fetch_add(1, Ordering::Relaxed);
-        let before = session.active_streams();
+        let permit = session.try_reserve().unwrap();
+        assert_eq!(session.active_streams(), 1);
         {
             let _guard = StreamRegistration {
                 session: Arc::clone(&session),
                 sid,
-                counted: true,
                 frame_started: false,
                 committed: false,
+                permit: Some(permit),
             };
         }
-        assert_eq!(session.active_streams(), before - 1);
         assert!(session.streams.lock().unwrap().get(&sid).is_none());
+        assert_eq!(session.active_streams(), 0, "the slot is released");
         assert!(
             !session.is_closed(),
             "no frame was started: session must survive"
@@ -1956,22 +2056,24 @@ mod tests {
             .lock()
             .unwrap()
             .insert(sid, StreamSink::Tcp(tx));
+        let permit = session.try_reserve().unwrap();
         {
             let _guard = StreamRegistration {
                 session: Arc::clone(&session),
                 sid,
-                counted: false,
                 frame_started: true,
                 committed: false,
+                permit: Some(permit),
             };
         }
         assert!(session.is_closed());
         assert!(session.streams.lock().unwrap().get(&sid).is_none());
     }
 
-    /// 0.5.2: commit makes the guard inert; end_stream counts exactly once.
+    /// v2: commit moves the capacity slot to the caller; end_stream only
+    /// unregisters — the semaphore is the count.
     #[tokio::test]
-    async fn test_registration_commit_then_end_stream_counts_once() {
+    async fn test_registration_commit_moves_permit() {
         let (session, _server) = establish_test_session("127.0.0.1:443").await;
         let sid = 17u32;
         let (tx, _rx) = mpsc::channel(STREAM_QUEUE_CAP);
@@ -1980,21 +2082,40 @@ mod tests {
             .lock()
             .unwrap()
             .insert(sid, StreamSink::Tcp(tx));
-        session.active_streams.fetch_add(1, Ordering::Relaxed);
         let guard = StreamRegistration {
             session: Arc::clone(&session),
             sid,
-            counted: true,
             frame_started: false,
             committed: false,
+            permit: Some(session.try_reserve().unwrap()),
         };
-        guard.commit();
+        let permit = guard.commit();
         assert_eq!(session.active_streams(), 1);
         session.end_stream(sid, false).await;
+        assert_eq!(
+            session.active_streams(),
+            1,
+            "end_stream only unregisters; the permit is the count"
+        );
+        drop(permit);
         assert_eq!(session.active_streams(), 0);
-        // A second end for the same sid must not underflow the count.
-        session.end_stream(sid, false).await;
-        assert_eq!(session.active_streams(), 0);
+    }
+
+    /// v2: a draining session takes no new permits, even after slots free.
+    #[tokio::test]
+    async fn test_try_reserve_rejects_draining() {
+        use crate::session::{ManagedSession as _, SessionState};
+        let (session, _server) = establish_test_session("127.0.0.1:443").await;
+        let permit = session.try_reserve().unwrap();
+        session.begin_drain();
+        assert!(session.try_reserve().is_none(), "draining takes no permits");
+        drop(permit);
+        assert!(
+            session.try_reserve().is_none(),
+            "still draining after slots free"
+        );
+        session.close();
+        assert_eq!(session.state(), SessionState::Closed);
     }
 
     /// Direct-path stream: multi-frame bulk write echoes back intact, and a
@@ -2007,15 +2128,18 @@ mod tests {
         let mut addr_rx = spawn_echo_server(server);
 
         let target = vec![0x01, 127, 0, 0, 1, 0x01, 0xbb];
-        let (sid, rx) = session.open_stream_direct(target.clone()).await.unwrap();
-        let mut stream = AnyTlsStream::new(Arc::clone(&session), sid, rx);
+        let permit = session.try_reserve().unwrap();
+        let mut stream = session
+            .open_stream_direct(target.clone(), permit)
+            .await
+            .unwrap();
 
         // Server got SYN + the address PSH.
         let (got_sid, got_addr) = tokio::time::timeout(Duration::from_secs(2), addr_rx.recv())
             .await
             .expect("address frame")
             .unwrap();
-        assert_eq!(got_sid, sid);
+        assert_eq!(got_sid, stream.sid);
         assert_eq!(got_addr, target);
 
         // ~150KB in three writes (spans multiple u16 frames).
@@ -2054,9 +2178,9 @@ mod tests {
         // Open three streams concurrently on the same session.
         let target = |b: u8| vec![0x01, 127, 0, 0, b, 0x01, 0xbb];
         let (s1, s2, s3) = tokio::join!(
-            session.open_stream(target(1)),
-            session.open_stream(target(2)),
-            session.open_stream(target(3)),
+            session.open_stream(target(1), session.try_reserve().unwrap()),
+            session.open_stream(target(2), session.try_reserve().unwrap()),
+            session.open_stream(target(3), session.try_reserve().unwrap()),
         );
         let (mut s1, mut s2, mut s3) = (s1.unwrap(), s2.unwrap(), s3.unwrap());
         assert_eq!(session.active_streams(), 3);
@@ -2097,7 +2221,10 @@ mod tests {
         assert!(!session.is_closed());
 
         // The same session serves another stream afterwards.
-        let mut s4 = session.open_stream(target(4)).await.unwrap();
+        let mut s4 = session
+            .open_stream(target(4), session.try_reserve().unwrap())
+            .await
+            .unwrap();
         let (sid, a) = tokio::time::timeout(Duration::from_secs(2), addr_rx.recv())
             .await
             .expect("address frame")
@@ -2116,8 +2243,14 @@ mod tests {
         expect_handshake(&mut server).await;
 
         let target = vec![0x01, 127, 0, 0, 1, 0x00, 0x50];
-        let mut s1 = session.open_stream(target.clone()).await.unwrap();
-        let mut s2 = session.open_stream(target.clone()).await.unwrap();
+        let mut s1 = session
+            .open_stream(target.clone(), session.try_reserve().unwrap())
+            .await
+            .unwrap();
+        let mut s2 = session
+            .open_stream(target.clone(), session.try_reserve().unwrap())
+            .await
+            .unwrap();
 
         // Server: consume both opening sequences, then FIN sid=1 only.
         for expected_sid in 1..=2u32 {
@@ -2289,11 +2422,12 @@ mod uot_transport_tests {
         assert_eq!(auth, TEST_AUTH);
         let (cmd, _, _) = read_frame(&mut server_end).await.unwrap();
         assert_eq!(cmd, CMD_SETTINGS);
+        let permit = session.try_reserve().unwrap();
         let (sid, rx, guard) = session
-            .open_uot_stream(vec![0x01, 0, 0, 0, 0, 0, 0])
+            .open_uot_stream(vec![0x01, 0, 0, 0, 0, 0, 0], permit)
             .await
             .unwrap();
-        guard.commit();
+        let permit = guard.commit();
         // Consume the opening pair (SYN + address PSH).
         let (cmd, _, _) = read_frame(&mut server_end).await.unwrap();
         assert_eq!(cmd, CMD_SYN);
@@ -2307,6 +2441,7 @@ mod uot_transport_tests {
                 mode: tokio::sync::Mutex::new(None),
                 target,
                 target_domain: None,
+                _permit: permit,
             }),
             server_end,
         )

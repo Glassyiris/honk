@@ -120,10 +120,12 @@ impl TrojanGoHandler {
                 node.tls
             )
         };
+        let dial_node = node.clone();
+        let dial_host_key = host_key.clone();
         self.pool
-            .offer(&host_key, || async {
-                let stream = Self::connect_server(node, connect_timeout).await?;
-                let (mux, read_half) = MuxConnection::new(host_key.clone(), stream);
+            .offer(&host_key, move || async move {
+                let stream = Self::connect_server(&dial_node, connect_timeout).await?;
+                let (mux, read_half) = MuxConnection::new(dial_host_key.clone(), stream);
                 let mux = Arc::new(mux);
                 mux.spawn_demux_task(read_half);
                 Ok(mux)

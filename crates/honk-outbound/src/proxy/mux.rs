@@ -149,9 +149,11 @@ pub(crate) async fn open_stream(
     let key = pool_key(node);
     let mut last_err: Option<anyhow::Error> = None;
     for _attempt in 0..2 {
+        let dial_node = node.clone();
+        let dial_key = key.clone();
         let session = match POOL
-            .offer(&key, || async {
-                dial_session(node, &key, connect_timeout).await
+            .offer(&key, move || async move {
+                dial_session(&dial_node, &dial_key, connect_timeout).await
             })
             .await
         {

@@ -60,6 +60,46 @@ impl Default for SessionPoolConfig {
     }
 }
 
+/// Lifecycle of an established session. `Connecting` is not here — it
+/// lives in the pool's inflight dial; writer/demux failures go straight
+/// to `Closed`; GOAWAY/max-age go through `Draining` (no new permits,
+/// existing channels finish).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionState {
+    Active,
+    Draining,
+    Closed,
+}
+
+/// RAII stream-slot reservation on one session — the single capacity
+/// truth. Released on Drop (stream end, failed open, caller cancel).
+pub struct SessionPermit<S> {
+    session: Arc<S>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl<S> SessionPermit<S> {
+    pub fn new(session: Arc<S>, permit: tokio::sync::OwnedSemaphorePermit) -> Self {
+        Self {
+            session,
+            _permit: permit,
+        }
+    }
+
+    /// The session this permit reserves capacity on.
+    // Used by the typed-event/writer work (3B).
+    #[allow(dead_code)]
+    pub fn session(&self) -> &Arc<S> {
+        &self.session
+    }
+}
+
+impl<S> std::fmt::Debug for SessionPermit<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionPermit").finish_non_exhaustive()
+    }
+}
+
 /// What the pool needs to know about a session; everything else stays
 /// with the protocol.
 pub trait ManagedSession: Send + Sync {
@@ -69,6 +109,32 @@ pub trait ManagedSession: Send + Sync {
     fn is_closed(&self) -> bool;
     /// Close the session (idle reap, pool shutdown).
     fn close(&self);
+    /// Lifecycle state; `Draining` takes no new permits. Default derives
+    /// from `is_closed` (legacy sessions without a real machine).
+    fn state(&self) -> SessionState {
+        if self.is_closed() {
+            SessionState::Closed
+        } else {
+            SessionState::Active
+        }
+    }
+    /// Stop accepting new logical channels (GOAWAY, max-age); existing
+    /// ones run to the end and the session closes at zero.
+    // Wired to GOAWAY/max-age hooks in 3B.
+    #[allow(dead_code)]
+    fn begin_drain(&self) {}
+    /// Atomically reserve one stream slot: check `Active` → acquire →
+    /// re-check `Active` (a session that began draining in between
+    /// releases the permit immediately and reports `None`). Default `None`
+    /// means "no capacity tracking" (legacy protocols not yet on
+    /// [`SessionPool::open_with`]).
+    fn try_reserve(self: &Arc<Self>) -> Option<SessionPermit<Self>>
+    where
+        Self: Sized,
+    {
+        let _ = self;
+        None
+    }
 }
 
 /// Pool lifecycle: shutdown is terminal and idempotent — offers, inserts
@@ -91,15 +157,48 @@ impl From<usize> for PoolState {
     }
 }
 
+/// Signal broadcast when a pool-owned dial completes.
+#[derive(Clone)]
+enum DialSignal {
+    /// Dial still in flight.
+    Pending,
+    /// Dial completed — re-check the pool (session inserted or backoff
+    /// recorded).
+    Done,
+    /// Dial failed — waiters surface the error themselves.
+    Failed(Arc<anyhow::Error>),
+}
+
+/// How a protocol open failed, for the pool's retry decision.
+pub enum OpenError {
+    /// The session died mid-open: retire it; the pool may retry once on
+    /// a fresh session (SYN/first frame was not committed yet — retrying
+    /// cannot duplicate a request).
+    Session(anyhow::Error),
+    /// The target/protocol refused or auth failed: the session is
+    /// healthy — surface immediately, never retry.
+    Refused(anyhow::Error),
+}
+
+impl OpenError {
+    // Used by the typed-event mapping (3B).
+    #[allow(dead_code)]
+    pub fn into_inner(self) -> anyhow::Error {
+        match self {
+            OpenError::Session(e) | OpenError::Refused(e) => e,
+        }
+    }
+}
+
 /// Per-key pool state.
 struct KeyPool<S> {
     sessions: Vec<Arc<S>>,
     /// While a dial is in flight this is `Some((inflight_id, sender))`;
-    /// waiters `wait_for(> 0)` on a receiver cloned under the lock
+    /// waiters `wait_for(!Pending)` on a receiver cloned under the lock
     /// (race-free — `watch::Receiver::wait_for` evaluates the predicate
     /// against the current value before parking). The inflight id lets a
     /// [`DialGuard`] clear only its own dial.
-    dial_done: Option<(u64, tokio::sync::watch::Sender<u64>)>,
+    dial_done: Option<(u64, tokio::sync::watch::Sender<DialSignal>)>,
     /// Next inflight-dial id.
     next_inflight_id: u64,
     /// Consecutive dial failures and when the next dial is allowed.
@@ -169,6 +268,8 @@ pub struct SessionPool<S: ManagedSession + 'static> {
     dial_failures_total: Arc<AtomicUsize>,
     state: Arc<AtomicUsize>,
     shutdown_tx: Arc<tokio::sync::watch::Sender<bool>>,
+    /// Pool-owned dial task handles (aborted on shutdown).
+    tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 impl<S: ManagedSession + 'static> std::fmt::Debug for SessionPool<S> {
@@ -188,6 +289,7 @@ impl<S: ManagedSession + 'static> Clone for SessionPool<S> {
             dial_failures_total: Arc::clone(&self.dial_failures_total),
             state: Arc::clone(&self.state),
             shutdown_tx: Arc::clone(&self.shutdown_tx),
+            tasks: Arc::clone(&self.tasks),
         }
     }
 }
@@ -201,6 +303,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
             dial_failures_total: Arc::new(AtomicUsize::new(0)),
             state: Arc::new(AtomicUsize::new(PoolState::Running as usize)),
             shutdown_tx: Arc::new(shutdown_tx),
+            tasks: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -213,12 +316,15 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
     }
 
     /// Offer the least-loaded live session, dialing one when none is
-    /// usable. Concurrent dials for the same key share one establishment
-    /// (single-flight); repeated failures back off per key.
+    /// usable. Concurrent dials for the same key share one establishment:
+    /// the FIRST caller to find no inflight registers the dial and the
+    /// pool spawns it as an owned task — cancelling any caller only ends
+    /// its own wait, never the shared dial. Dial failures broadcast to
+    /// every waiter; repeated failures back off per key.
     pub async fn offer<F, Fut>(&self, key: &str, dial: F) -> anyhow::Result<Arc<S>>
     where
-        F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = anyhow::Result<Arc<S>>>,
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = anyhow::Result<Arc<S>>> + Send + 'static,
     {
         let mut dial = Some(dial);
         let mut shutdown_rx = self.shutdown_tx.subscribe();
@@ -226,12 +332,12 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
             if self.state() != PoolState::Running {
                 return Err(Self::pool_closed_err());
             }
-            // Phase 1: pick a live session, register as the dialer, or
-            // park on the in-flight dial.
+            // Phase 1: pick a live session, register the dial, or park on
+            // the in-flight one.
             enum Step<S> {
                 Have(Arc<S>),
-                Dial(u64, tokio::sync::watch::Sender<u64>),
-                Wait(tokio::sync::watch::Receiver<u64>),
+                Register(u64, tokio::sync::watch::Sender<DialSignal>),
+                Wait(tokio::sync::watch::Receiver<DialSignal>),
                 Backoff(Duration),
             }
             let step = {
@@ -261,9 +367,9 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                 } else {
                     let id = pool.next_inflight_id;
                     pool.next_inflight_id += 1;
-                    let (tx, _) = tokio::sync::watch::channel(0u64);
+                    let (tx, _) = tokio::sync::watch::channel(DialSignal::Pending);
                     pool.dial_done = Some((id, tx.clone()));
-                    Step::Dial(id, tx)
+                    Step::Register(id, tx)
                 }
             };
 
@@ -278,80 +384,86 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                     }
                 }
                 Step::Wait(mut rx) => {
-                    tokio::select! {
+                    let signal = tokio::select! {
                         // `wait_for` checks the current value first — no
                         // race with a dial that completed before parking.
-                        r = rx.wait_for(|v| *v > 0) => { let _ = r; }
+                        r = rx.wait_for(|s| !matches!(s, DialSignal::Pending)) => {
+                            match r {
+                                Ok(v) => v.clone(),
+                                // Sender dropped (leader cancelled): the
+                                // inflight entry is gone — re-elect.
+                                Err(_) => DialSignal::Done,
+                            }
+                        }
                         _ = shutdown_rx.changed() => {
                             return Err(Self::pool_closed_err());
                         }
+                    };
+                    if let DialSignal::Failed(e) = signal {
+                        return Err(anyhow::anyhow!(e).context("session dial failed"));
                     }
                 }
-                Step::Dial(id, done) => {
-                    let mut guard = DialGuard {
-                        keys: Arc::clone(&self.keys),
-                        key: key.to_string(),
-                        inflight_id: id,
-                        armed: true,
-                    };
+                Step::Register(id, done) => {
+                    // Pool-owned dial task: no caller's cancellation can
+                    // poison it; the DialGuard is the panic backstop.
                     let dial_fut = dial.take().expect("one dial closure")();
-                    let result = tokio::select! {
-                        r = std::panic::AssertUnwindSafe(dial_fut).catch_unwind() => r,
-                        // Pool shutdown aborts the dial without penalizing
-                        // the node; the guard clears the inflight entry.
-                        _ = shutdown_rx.changed() => {
-                            return Err(Self::pool_closed_err());
-                        }
-                    };
-                    // Completion: clear the inflight entry under the lock
-                    // and wake the waiters.
-                    {
-                        let mut keys = self.keys.lock();
-                        let pool = keys.entry(key.to_string()).or_default();
-                        if pool.dial_done.as_ref().map(|(i, _)| *i) == Some(id) {
-                            pool.dial_done = None;
-                        }
-                    }
-                    guard.armed = false;
-                    let _ = done.send(1);
-                    match result {
-                        Ok(Ok(session)) => {
-                            let mut keys = self.keys.lock();
-                            let pool = keys.entry(key.to_string()).or_default();
-                            pool.dial_failures = 0;
-                            pool.next_dial_at = None;
-                            pool.sessions.push(Arc::clone(&session));
-                            return Ok(session);
-                        }
-                        Ok(Err(e)) => {
-                            self.dial_failures_total.fetch_add(1, Ordering::Relaxed);
-                            let mut keys = self.keys.lock();
-                            let pool = keys.entry(key.to_string()).or_default();
-                            pool.dial_failures += 1;
-                            let shift = pool.dial_failures.min(8) - 1;
-                            let backoff = (self.config.dial_backoff.saturating_mul(1u32 << shift))
-                                .min(self.config.max_dial_backoff);
-                            pool.next_dial_at = Some(Instant::now() + backoff);
-                            return Err(e.context(anyhow!(
-                                "session dial failed ({} consecutive, backoff {:?})",
-                                pool.dial_failures,
-                                backoff
-                            )));
-                        }
-                        Err(_panic) => {
-                            // A panicking dial is an internal failure:
-                            // short backoff, waiters re-elect.
-                            self.dial_failures_total.fetch_add(1, Ordering::Relaxed);
-                            let mut keys = self.keys.lock();
-                            let pool = keys.entry(key.to_string()).or_default();
-                            pool.dial_failures += 1;
-                            pool.next_dial_at = Some(Instant::now() + self.config.dial_backoff);
-                            return Err(anyhow!(
-                                "session dial panicked (backoff {:?})",
-                                self.config.dial_backoff
-                            ));
-                        }
-                    }
+                    let task_keys = Arc::clone(&self.keys);
+                    let task_key = key.to_string();
+                    let failures_total = Arc::clone(&self.dial_failures_total);
+                    let config = self.config.clone();
+                    let handle = tokio::spawn(async move {
+                        let mut guard = DialGuard {
+                            keys: Arc::clone(&task_keys),
+                            key: task_key.clone(),
+                            inflight_id: id,
+                            armed: true,
+                        };
+                        let result = std::panic::AssertUnwindSafe(dial_fut).catch_unwind().await;
+                        let signal = {
+                            let mut keys = task_keys.lock();
+                            let pool = keys.entry(task_key.clone()).or_default();
+                            if pool.dial_done.as_ref().map(|(i, _)| *i) == Some(id) {
+                                pool.dial_done = None;
+                            }
+                            guard.armed = false;
+                            match result {
+                                Ok(Ok(session)) => {
+                                    pool.dial_failures = 0;
+                                    pool.next_dial_at = None;
+                                    pool.sessions.push(session);
+                                    DialSignal::Done
+                                }
+                                Ok(Err(e)) => {
+                                    failures_total.fetch_add(1, Ordering::Relaxed);
+                                    pool.dial_failures += 1;
+                                    let shift = pool.dial_failures.min(8) - 1;
+                                    let backoff =
+                                        (config.dial_backoff.saturating_mul(1u32 << shift))
+                                            .min(config.max_dial_backoff);
+                                    pool.next_dial_at = Some(Instant::now() + backoff);
+                                    DialSignal::Failed(Arc::new(e.context(anyhow!(
+                                        "session dial failed ({} consecutive, backoff {:?})",
+                                        pool.dial_failures,
+                                        backoff
+                                    ))))
+                                }
+                                Err(_panic) => {
+                                    // A panicking dial is an internal
+                                    // failure: short backoff.
+                                    failures_total.fetch_add(1, Ordering::Relaxed);
+                                    pool.dial_failures += 1;
+                                    pool.next_dial_at = Some(Instant::now() + config.dial_backoff);
+                                    DialSignal::Failed(Arc::new(anyhow!(
+                                        "session dial panicked (backoff {:?})",
+                                        config.dial_backoff
+                                    )))
+                                }
+                            }
+                        };
+                        let _ = done.send(signal);
+                    });
+                    self.tasks.lock().push(handle);
+                    // Fall through: wait on the dial like everyone else.
                 }
             }
         }
@@ -364,6 +476,46 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         if let Some(pool) = keys.get_mut(key) {
             pool.sessions.retain(|s| !Arc::ptr_eq(s, session));
         }
+    }
+
+    /// Open a logical channel on a pooled session: atomically reserve a
+    /// stream slot on an Active session, then run the protocol open.
+    /// Reserve and open never race the session cap — the permit is taken
+    /// before the open starts. A session that dies mid-open is retired
+    /// and the open retried once on a fresh session; protocol refusals
+    /// and auth errors ([`OpenError::Refused`]) are returned as-is.
+    pub async fn open_with<T, D, DFut, O, OFut>(
+        &self,
+        key: &str,
+        dial: D,
+        open: O,
+    ) -> anyhow::Result<T>
+    where
+        D: FnOnce() -> DFut + Clone + Send + 'static,
+        DFut: std::future::Future<Output = anyhow::Result<Arc<S>>> + Send + 'static,
+        O: Fn(Arc<S>, SessionPermit<S>) -> OFut,
+        OFut: std::future::Future<Output = Result<T, OpenError>>,
+    {
+        let mut last_err: Option<anyhow::Error> = None;
+        for _attempt in 0..2 {
+            let session = self.offer(key, dial.clone()).await?;
+            let Some(permit) = session.try_reserve() else {
+                // Draining/closed or saturated between offer and reserve:
+                // prune and retry — the pool dials a fresh session.
+                self.invalidate(key, &session);
+                last_err = Some(anyhow!("session has no stream capacity"));
+                continue;
+            };
+            match open(Arc::clone(&session), permit).await {
+                Ok(t) => return Ok(t),
+                Err(OpenError::Refused(e)) => return Err(e),
+                Err(OpenError::Session(e)) => {
+                    self.invalidate(key, &session);
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.expect("open_with attempts always record an error"))
     }
 
     /// Insert an externally-established session (e.g. one built on a
@@ -414,8 +566,8 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         idle_timeout: Duration,
         prewarm: F,
     ) where
-        F: Fn() -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = anyhow::Result<Arc<S>>> + Send,
+        F: Fn() -> Fut + Send + Sync + Clone + 'static,
+        Fut: std::future::Future<Output = anyhow::Result<Arc<S>>> + Send + 'static,
     {
         if self.state() != PoolState::Running {
             return;
@@ -473,7 +625,12 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                 // Prewarm to min_idle (rejected once the pool is shut).
                 let current = pool.keys.lock().get(&key).map_or(0, |p| p.sessions.len());
                 if current < min_idle
-                    && let Ok(s) = pool.offer(&key, &prewarm).await
+                    && let Ok(s) = pool
+                        .offer(&key, {
+                            let prewarm = prewarm.clone();
+                            move || prewarm()
+                        })
+                        .await
                 {
                     drop(s);
                 }
@@ -498,6 +655,10 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
             return; // already shutting down or closed
         }
         let _ = self.shutdown_tx.send(true);
+        // Abort pool-owned dial tasks; the janitor exits on the signal.
+        for task in self.tasks.lock().drain(..) {
+            task.abort();
+        }
         let sessions: Vec<Arc<S>> = {
             let mut keys = self.keys.lock();
             keys.drain().flat_map(|(_, p)| p.sessions).collect()
@@ -515,6 +676,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
 
+    #[derive(Debug)]
     struct TestSession {
         streams: AtomicUsize,
         closed: AtomicBool,
@@ -620,45 +782,84 @@ mod tests {
         assert_eq!(pool.metrics().sessions, 2);
     }
 
-    /// Phase 1 (P0): a leader cancelled inside `dial().await` must not
-    /// poison the key — the inflight entry clears, a waiter re-elects
-    /// and completes, and the failure count stays untouched.
+    /// v2 (pool-owned dial): cancelling a caller never stops the shared
+    /// dial — the waiter still receives the session the pool task
+    /// establishes, and no second dial is stamped (single-flight).
     #[tokio::test(start_paused = true)]
-    async fn leader_abort_waiter_reelects_and_clears_inflight() {
+    async fn caller_cancel_does_not_stop_shared_dial() {
         let pool = Arc::new(pool(SessionPoolConfig::default()));
+        let (tx, rx) = tokio::sync::oneshot::channel::<Arc<TestSession>>();
         let p1 = Arc::clone(&pool);
         let leader = tokio::spawn(async move {
-            p1.offer("k", || async {
-                futures_util::future::pending::<anyhow::Result<Arc<TestSession>>>().await
+            p1.offer("k", move || async move {
+                let s: anyhow::Result<Arc<TestSession>> = Ok(rx.await.expect("trigger"));
+                s
             })
             .await
         });
-        let waiter_dials = Arc::new(AtomicUsize::new(0));
-        let dials = Arc::clone(&waiter_dials);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        leader.abort();
+        let _ = leader.await;
+        let dials = Arc::new(AtomicUsize::new(0));
+        let d = Arc::clone(&dials);
         let p2 = Arc::clone(&pool);
         let waiter = tokio::spawn(async move {
             p2.offer("k", move || async move {
-                dials.fetch_add(1, Ordering::Relaxed);
+                d.fetch_add(1, Ordering::Relaxed);
                 Ok(TestSession::new())
             })
             .await
         });
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        leader.abort();
-        let _ = leader.await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            dials.load(Ordering::Relaxed),
+            0,
+            "single-flight: the shared dial keeps running, no second dial"
+        );
+        tx.send(TestSession::new()).unwrap();
         let session = tokio::time::timeout(Duration::from_secs(5), waiter)
             .await
-            .expect("waiter stuck after leader abort")
+            .expect("waiter stuck behind the shared dial")
             .unwrap()
             .unwrap();
-        assert_eq!(waiter_dials.load(Ordering::Relaxed), 1);
+        assert!(!session.is_closed());
         assert!(pool.keys.lock().get("k").unwrap().dial_done.is_none());
-        assert_eq!(
-            pool.keys.lock().get("k").unwrap().dial_failures,
-            0,
-            "caller cancellation must not penalize the node"
-        );
-        drop(session);
+        assert_eq!(pool.keys.lock().get("k").unwrap().dial_failures, 0);
+    }
+
+    /// v2: a panicking dial surfaces as an internal failure to every
+    /// waiter; the inflight entry clears and the next offer re-dials.
+    #[tokio::test(start_paused = true)]
+    async fn dial_panic_wakes_waiters_and_reelects() {
+        let pool = Arc::new(pool(SessionPoolConfig::default()));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let a = Arc::clone(&attempts);
+        let result = pool
+            .offer("k", move || {
+                let n = a.fetch_add(1, Ordering::Relaxed);
+                async move {
+                    if n == 0 {
+                        panic!("boom")
+                    } else {
+                        Ok(TestSession::new())
+                    }
+                }
+            })
+            .await;
+        assert!(result.is_err(), "panicking dial surfaces as failure");
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        assert!(pool.keys.lock().get("k").unwrap().dial_done.is_none());
+        // Past the short backoff, a fresh offer re-dials and succeeds.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let a2 = Arc::clone(&attempts);
+        let session = pool
+            .offer("k", move || {
+                a2.fetch_add(1, Ordering::Relaxed);
+                async { Ok(TestSession::new()) }
+            })
+            .await
+            .unwrap();
+        assert!(!session.is_closed());
     }
 
     /// Phase 1: shutdown aborts the in-flight dial (leader), wakes every
