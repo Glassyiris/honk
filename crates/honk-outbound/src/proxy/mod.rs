@@ -10,6 +10,7 @@ pub(crate) mod mux;
 pub mod shadowsocks;
 pub(crate) mod shadowsocks_2022;
 pub mod socks5;
+pub(crate) mod ss_stream;
 pub mod ssr;
 pub(crate) mod transport;
 pub mod trojan;

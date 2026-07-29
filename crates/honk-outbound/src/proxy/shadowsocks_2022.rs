@@ -24,15 +24,15 @@
 
 use rand::Rng;
 use rand::RngExt;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tracing::debug;
 
 use super::addr::socks_addr_len;
-use super::shadowsocks::{AeadCipher, increment_nonce, write_chunks};
+use super::shadowsocks::{AeadCipher, increment_nonce};
 
 const HEADER_TYPE_CLIENT: u8 = 0;
-const HEADER_TYPE_SERVER: u8 = 1;
+pub(crate) const HEADER_TYPE_SERVER: u8 = 1;
 /// sing-shadowsocks2 `MaxPaddingLength`.
 const MAX_PADDING_LENGTH: usize = 900;
 /// sing-shadowsocks2 `PacketMinimalHeaderSize`.
@@ -40,11 +40,11 @@ const UDP_MINIMAL_PACKET_SIZE: usize = 30;
 /// XChaCha20-Poly1305 nonce size (sing-shadowsocks2 `PacketNonceSize`).
 const UDP_XNONCE_SIZE: usize = 24;
 /// AEAD tag size.
-const TAG_LEN: usize = 16;
+pub(crate) const TAG_LEN: usize = 16;
 /// AEAD nonce size for the stream ciphers.
-const NONCE_LEN: usize = 12;
+pub(crate) const NONCE_LEN: usize = 12;
 
-fn unix_timestamp() -> u64 {
+pub(crate) fn unix_timestamp() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -59,7 +59,7 @@ fn unix_timestamp() -> u64 {
 /// (EIH, AES methods only).
 pub(crate) struct Ss2022Method {
     method: String,
-    key_len: usize,
+    pub(crate) key_len: usize,
     psks: Vec<Vec<u8>>,
     /// `psk_hashes[i] = BLAKE3(psks[i + 1])[..16]` — the EIH plaintexts.
     ///
@@ -138,11 +138,11 @@ impl Ss2022Method {
         blake3::derive_key("shadowsocks 2022 session subkey", &material)[..self.key_len].to_vec()
     }
 
-    fn session_subkey(&self, salt: &[u8]) -> Vec<u8> {
+    pub(crate) fn session_subkey(&self, salt: &[u8]) -> Vec<u8> {
         self.session_subkey_with(self.encryption_psk(), salt)
     }
 
-    fn aead(&self, subkey: &[u8]) -> anyhow::Result<AeadCipher> {
+    pub(crate) fn aead(&self, subkey: &[u8]) -> anyhow::Result<AeadCipher> {
         AeadCipher::new(&self.method, subkey)
     }
 
@@ -286,21 +286,16 @@ impl SlidingWindow {
     }
 }
 
-/// Background relay for a Shadowsocks 2022 TCP connection.
-///
-/// Writes the request (salt, EIH, fixed + variable header chunks) up front,
-/// then streams chunked ciphertext in both directions. The response fixed
-/// header is validated (type, timestamp, echoed request salt) before any
-/// payload is delivered to the client.
-pub(crate) async fn shadowsocks_2022_relay(
-    server: TcpStream,
-    client: tokio::io::DuplexStream,
+/// Dial a Shadowsocks 2022 TCP connection: write the request (salt, EIH,
+/// header chunks) and return the codec stream. The response prologue
+/// (salt + validated fixed header) is driven lazily from the read path —
+/// reading it inline would deadlock against servers that only answer after
+/// the first client payload chunk.
+pub(crate) async fn dial_stream(
+    mut server: TcpStream,
     method: Ss2022Method,
     socks_header: Vec<u8>,
-) -> anyhow::Result<()> {
-    let (mut server_read, mut server_write) = server.into_split();
-    let (mut client_read, mut client_write) = tokio::io::split(client);
-
+) -> anyhow::Result<crate::proxy::ss_stream::SsStream> {
     // Request: salt | EIH* | enc(fixed header) | enc(variable header)
     let mut request_salt = vec![0u8; method.key_len];
     rand::rng().fill_bytes(&mut request_salt);
@@ -308,7 +303,7 @@ pub(crate) async fn shadowsocks_2022_relay(
     let send_cipher = method.aead(&send_subkey)?;
     let mut send_nonce = vec![0u8; NONCE_LEN];
 
-    // No initial payload is available (the relay starts before the client
+    // No initial payload is available (the dial returns before the client
     // writes), so padding must be non-zero (SIP022 3.1.4).
     let padding_len = rand::rng().random_range(1..=MAX_PADDING_LENGTH);
     let variable_header_len = socks_header.len() + 2 + padding_len;
@@ -347,81 +342,18 @@ pub(crate) async fn shadowsocks_2022_relay(
     increment_nonce(&mut send_nonce);
 
     // SIP022 3.1.4: salt + header chunks MUST go out in a single write.
-    server_write.write_all(&request).await?;
+    server.write_all(&request).await?;
 
-    let c2s = async {
-        let mut buf = vec![0u8; 65536];
-        loop {
-            let n = client_read.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            write_chunks(&mut server_write, &send_cipher, &mut send_nonce, &buf[..n]).await?;
-        }
-        Ok::<(), anyhow::Error>(())
+    let prologue = crate::proxy::ss_stream::Ss2022Prologue {
+        method,
+        request_salt,
     };
-
-    let s2c = async {
-        let mut recv_salt = vec![0u8; method.key_len];
-        server_read.read_exact(&mut recv_salt).await?;
-        let recv_subkey = method.session_subkey(&recv_salt);
-        let recv_cipher = method.aead(&recv_subkey)?;
-        let mut recv_nonce = vec![0u8; NONCE_LEN];
-
-        // Fixed response header chunk: type | timestamp | request salt | length.
-        let fixed_len = 1 + 8 + method.key_len + 2;
-        let mut fixed_buf = vec![0u8; fixed_len + TAG_LEN];
-        server_read.read_exact(&mut fixed_buf).await?;
-        let fixed = recv_cipher
-            .open(&recv_nonce, &fixed_buf)
-            .map_err(|e| anyhow::anyhow!("open response header failed: {:?}", e))?;
-        increment_nonce(&mut recv_nonce);
-        if fixed[0] != HEADER_TYPE_SERVER {
-            anyhow::bail!("bad response header type {}", fixed[0]);
-        }
-        let ts = u64::from_be_bytes(fixed[1..9].try_into().expect("8-byte timestamp"));
-        let diff = unix_timestamp().abs_diff(ts);
-        if diff > 30 {
-            anyhow::bail!("bad response timestamp (diff {}s)", diff);
-        }
-        if fixed[9..9 + method.key_len] != request_salt[..] {
-            anyhow::bail!("response request-salt mismatch");
-        }
-        let first_len = u16::from_be_bytes([fixed[fixed_len - 2], fixed[fixed_len - 1]]) as usize;
-
-        // First payload chunk (length declared by the fixed header).
-        let mut first = vec![0u8; first_len + TAG_LEN];
-        server_read.read_exact(&mut first).await?;
-        let first_payload = recv_cipher
-            .open(&recv_nonce, &first)
-            .map_err(|e| anyhow::anyhow!("open first response chunk failed: {:?}", e))?;
-        increment_nonce(&mut recv_nonce);
-        client_write.write_all(&first_payload).await?;
-
-        // Subsequent length/payload chunks.
-        let mut len_buf = vec![0u8; 2 + TAG_LEN];
-        loop {
-            server_read.read_exact(&mut len_buf).await?;
-            let len_plain = recv_cipher
-                .open(&recv_nonce, &len_buf)
-                .map_err(|e| anyhow::anyhow!("decrypt length failed: {:?}", e))?;
-            increment_nonce(&mut recv_nonce);
-            let len = u16::from_be_bytes([len_plain[0], len_plain[1]]) as usize;
-
-            let mut payload = vec![0u8; len + TAG_LEN];
-            server_read.read_exact(&mut payload).await?;
-            let plain = recv_cipher
-                .open(&recv_nonce, &payload)
-                .map_err(|e| anyhow::anyhow!("decrypt payload failed: {:?}", e))?;
-            increment_nonce(&mut recv_nonce);
-            client_write.write_all(&plain).await?;
-        }
-    };
-
-    tokio::select! {
-        r = c2s => r,
-        r = s2c => r,
-    }
+    Ok(crate::proxy::ss_stream::SsStream::new_2022(
+        server,
+        send_cipher,
+        send_nonce,
+        prologue,
+    ))
 }
 
 /// Client-side Shadowsocks 2022 UDP session.
@@ -667,6 +599,7 @@ mod tests {
     use honk_config::node::Node;
     use honk_config::types::NodeProtocol;
     use std::net::SocketAddr;
+    use tokio::io::AsyncReadExt;
 
     fn hex(s: &str) -> Vec<u8> {
         (0..s.len())

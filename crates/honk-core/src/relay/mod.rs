@@ -149,7 +149,7 @@ where
 
     debug!("TCP relay started: {} → {}", client_addr, target_addr);
 
-    const RELAY_BUF_SIZE: usize = 16 * 1024;
+    const RELAY_BUF_SIZE: usize = 128 * 1024;
 
     let result = tokio::io::copy_bidirectional_with_sizes(
         &mut client,
