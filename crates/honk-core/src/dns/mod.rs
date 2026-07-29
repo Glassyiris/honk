@@ -23,6 +23,8 @@ pub mod cache;
 pub mod endpoint;
 pub mod forwarder;
 pub mod persist;
+pub mod planner;
+pub mod policy;
 pub mod query;
 pub mod response;
 pub mod routing;
