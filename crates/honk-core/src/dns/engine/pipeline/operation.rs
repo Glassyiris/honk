@@ -4,6 +4,7 @@ use std::time::Duration;
 use tracing::debug;
 
 use super::cache;
+use crate::dns::cache::{CacheKey, OperationKind};
 use crate::dns::engine::{DnsEngine, PreparedQuery, ResponseDirective};
 use crate::dns::forwarder::{
     DnsForwardError, DnsForwarder, ResolveMode, SERVE_STALE_TTL_SECS, make_empty_response,
@@ -113,10 +114,16 @@ pub(super) async fn run(
         }
     };
 
+    let exact_cache_key = CacheKey::new(
+        prepared.query(),
+        engine.policy_id().cloned(),
+        request_scope,
+        OperationKind::Resolve,
+    );
     let expiry = cache::store(
         forwarder,
         prepared,
-        cache_key,
+        &exact_cache_key,
         &mut response,
         class,
         reuse_eligible,

@@ -356,11 +356,18 @@ impl ControlPlane {
         // not immediately re-persisted.
         if cache_cfg.store_dns {
             let dns_cache = self.dns_controller.cache().await;
-            let restored = crate::dns::persist::restore_dns_cache(&db, &dns_cache).await;
-            if restored > 0 {
-                info!("cache.db: restored {} persisted DNS answer(s)", restored);
-            }
             let persister = crate::dns::persist::DnsCachePersister::spawn(db.clone());
+            let policy = {
+                let config = self.config.read().await;
+                crate::dns::policy::PolicyId::from_config(&config.dns).ok()
+            };
+            match persister.restore_cache(&dns_cache, policy).await {
+                Ok(restored) if restored > 0 => {
+                    info!("cache.db: restored {} persisted DNS answer(s)", restored);
+                }
+                Ok(_) => {}
+                Err(error) => warn!(%error, "cache.db DNS restore failed"),
+            }
             dns_cache.lock().await.set_persister(Some(persister));
         }
 
@@ -1015,6 +1022,13 @@ impl ControlPlane {
             }
         }
 
+        let dns_cache = self.dns_controller.cache().await;
+        let persistence = dns_cache.lock().await.persistence();
+        if let Some(persistence) = persistence
+            && let Err(error) = persistence.shutdown().await
+        {
+            warn!(%error, "DNS persistence shutdown failed");
+        }
         ebpf.write().await.cleanup().await?;
         info!("Control plane stopped");
         Ok(())

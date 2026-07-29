@@ -90,6 +90,22 @@ impl CacheKey {
         self.operation
     }
 
+    pub(crate) fn wire_identity(&self) -> &[u8] {
+        &self.wire_identity
+    }
+
+    pub(crate) const fn ingress(&self) -> IngressProfile {
+        self.ingress
+    }
+
+    pub(crate) const fn policy_id(&self) -> Option<&PolicyId> {
+        self.policy_id.as_ref()
+    }
+
+    pub(crate) const fn scope(&self) -> &RequestScope {
+        &self.scope
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(
         wire_identity: Vec<u8>,
@@ -247,6 +263,10 @@ impl DnsCache {
     /// control plane when `experimental.cache_file.store_dns` is enabled.
     pub fn set_persister(&mut self, persister: Option<super::persist::DnsCachePersister>) {
         *lock(&self.service.persister) = persister;
+    }
+
+    pub fn persistence(&self) -> Option<super::persist::DnsCachePersister> {
+        self.service.persistence()
     }
 
     #[cfg(test)]

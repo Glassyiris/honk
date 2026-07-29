@@ -55,6 +55,10 @@ impl DnsCacheService {
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
     }
+
+    pub(crate) fn persistence(&self) -> Option<crate::dns::persist::DnsCachePersister> {
+        lock(&self.persister).clone()
+    }
 }
 
 struct ActiveGuard(Arc<AtomicUsize>);

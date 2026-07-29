@@ -1,234 +1,237 @@
-//! Optional DNS cache persistence (sing-box `cache_file.store_dns`).
+//! Rollback-safe exact-key DNS cache persistence.
 //!
-//! When enabled, every positive answer inserted into the shared
-//! [`DnsCache`](super::cache::DnsCache) is mirrored to cache.db: the cache
-//! forwards a [`DnsPersistEntry`] over an unbounded channel, and a
-//! background task batches the entries and writes them through
-//! [`CacheDb::save_dns_answer`](crate::cachedb::CacheDb::save_dns_answer)
-//! (sing-box `SaveDNSCacheAsync` semantics). On startup,
-//! [`restore_dns_cache`] loads the still-fresh answers back into the cache.
-//!
-//! When `store_dns` is false no persister is installed, the cache keeps a
-//! `None` sink, and the overhead is a single branch per insert.
+//! Version-two entries live under `dns:v2:` and never modify or consume the
+//! legacy `dns:` representation. A bounded actor owns SQLite writes and
+//! linearizes explicit flushes with an epoch barrier.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
-use base64::Engine as _;
-use tokio::sync::{Mutex, mpsc};
+use thiserror::Error;
+use tokio::sync::{mpsc, oneshot};
 
-use super::cache::DnsCache;
+use super::cache::{CacheKey, DnsCacheService};
+use super::policy::PolicyId;
 use crate::cachedb::CacheDb;
 
-/// How often the background writer flushes pending entries to cache.db.
-const PERSIST_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
+mod codec;
+mod worker;
 
-/// One DNS answer queued for persistence.
-#[derive(Debug)]
-pub struct DnsPersistEntry {
-    pub name: String,
-    pub qtype: u16,
-    /// Raw wire-format DNS response bytes.
-    pub response: Vec<u8>,
-    /// Absolute expiry (seconds since UNIX epoch).
-    pub expire_at_unix: u64,
+const COMMAND_CAPACITY: usize = 4096;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PersistCounters {
+    pub queued: usize,
+    pub pending: usize,
+    pub dropped_full: u64,
+    pub dropped_pending_full: u64,
+    pub dropped_closed: u64,
+    pub old_epoch_discarded: u64,
+    pub written: u64,
+    pub restored: u64,
+    pub stale: u64,
+    pub corrupt: u64,
+    pub version_mismatch: u64,
+    pub policy_mismatch: u64,
+    pub db_errors: u64,
+    pub write_attempts: u64,
 }
 
-/// Cheap-cloneable handle to the background DNS cache writer.
-///
-/// Installed into the shared [`DnsCache`] via
-/// [`DnsCache::set_persister`](super::cache::DnsCache::set_persister).
-/// Sending is non-blocking; a full or closed channel drops the entry
-/// (persistence is best-effort and never stalls the DNS path).
-#[derive(Debug, Clone)]
+#[derive(Default)]
+struct CounterSet {
+    queued: AtomicUsize,
+    pending: AtomicUsize,
+    dropped_full: AtomicU64,
+    dropped_pending_full: AtomicU64,
+    dropped_closed: AtomicU64,
+    old_epoch_discarded: AtomicU64,
+    written: AtomicU64,
+    restored: AtomicU64,
+    stale: AtomicU64,
+    corrupt: AtomicU64,
+    version_mismatch: AtomicU64,
+    policy_mismatch: AtomicU64,
+    db_errors: AtomicU64,
+    write_attempts: AtomicU64,
+}
+
+impl CounterSet {
+    fn snapshot(&self) -> PersistCounters {
+        PersistCounters {
+            queued: self.queued.load(Ordering::Relaxed),
+            pending: self.pending.load(Ordering::Relaxed),
+            dropped_full: self.dropped_full.load(Ordering::Relaxed),
+            dropped_pending_full: self.dropped_pending_full.load(Ordering::Relaxed),
+            dropped_closed: self.dropped_closed.load(Ordering::Relaxed),
+            old_epoch_discarded: self.old_epoch_discarded.load(Ordering::Relaxed),
+            written: self.written.load(Ordering::Relaxed),
+            restored: self.restored.load(Ordering::Relaxed),
+            stale: self.stale.load(Ordering::Relaxed),
+            corrupt: self.corrupt.load(Ordering::Relaxed),
+            version_mismatch: self.version_mismatch.load(Ordering::Relaxed),
+            policy_mismatch: self.policy_mismatch.load(Ordering::Relaxed),
+            db_errors: self.db_errors.load(Ordering::Relaxed),
+            write_attempts: self.write_attempts.load(Ordering::Relaxed),
+        }
+    }
+}
+
+struct Put {
+    epoch: u64,
+    key: CacheKey,
+    response: Vec<u8>,
+    expire_at_unix: u64,
+}
+
+enum Command {
+    Put(Put),
+    Flush {
+        epoch: u64,
+        ack: oneshot::Sender<Result<(), PersistControlError>>,
+    },
+    Restore {
+        cache: Arc<DnsCacheService>,
+        policy: Option<PolicyId>,
+        ack: oneshot::Sender<usize>,
+    },
+    Shutdown {
+        ack: oneshot::Sender<Result<(), PersistControlError>>,
+    },
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum PersistControlError {
+    #[error("DNS persistence writer is closed")]
+    Closed,
+    #[error("DNS persistence writer stopped before acknowledging the command")]
+    AckDropped,
+    #[error("DNS persistence worker thread failed")]
+    WorkerFailed,
+    #[error("DNS persistence database operation failed: {0}")]
+    Database(String),
+}
+
+#[derive(Clone)]
 pub struct DnsCachePersister {
-    tx: mpsc::UnboundedSender<DnsPersistEntry>,
+    tx: mpsc::Sender<Command>,
+    epoch: Arc<AtomicU64>,
+    counters: Arc<CounterSet>,
+    worker: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+}
+
+impl std::fmt::Debug for DnsCachePersister {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DnsCachePersister")
+            .field("epoch", &self.epoch.load(Ordering::SeqCst))
+            .field("counters", &self.counters())
+            .finish_non_exhaustive()
+    }
 }
 
 impl DnsCachePersister {
-    /// Spawn the background batch writer draining into `db`.
     pub fn spawn(db: Arc<CacheDb>) -> Self {
-        let (tx, mut rx) = mpsc::unbounded_channel::<DnsPersistEntry>();
-        tokio::spawn(async move {
-            // Newest entry per (name, qtype) wins; flushed periodically.
-            let mut pending: HashMap<(String, u16), DnsPersistEntry> = HashMap::new();
-            let mut tick = tokio::time::interval(PERSIST_FLUSH_INTERVAL);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tokio::select! {
-                    maybe = rx.recv() => {
-                        match maybe {
-                            Some(entry) => {
-                                pending.insert((entry.name.clone(), entry.qtype), entry);
-                            }
-                            // All senders dropped — final flush, then exit.
-                            None => {
-                                flush_pending(&db, &mut pending);
-                                break;
-                            }
-                        }
-                    }
-                    _ = tick.tick() => {
-                        flush_pending(&db, &mut pending);
-                    }
-                }
-            }
+        let (tx, rx) = mpsc::channel(COMMAND_CAPACITY);
+        let counters = Arc::new(CounterSet::default());
+        let worker_counters = Arc::clone(&counters);
+        let handle = std::thread::Builder::new()
+            .name("honk-dns-persist".to_string())
+            .spawn(move || worker::run(db, rx, worker_counters))
+            .ok();
+        Self {
+            tx,
+            epoch: Arc::new(AtomicU64::new(0)),
+            counters,
+            worker: Arc::new(Mutex::new(handle)),
+        }
+    }
+
+    pub(crate) fn save(&self, key: CacheKey, response: Vec<u8>, expire_at_unix: u64) {
+        let command = Command::Put(Put {
+            epoch: self.epoch.load(Ordering::SeqCst),
+            key,
+            response,
+            expire_at_unix,
         });
-        Self { tx }
+        self.counters.queued.fetch_add(1, Ordering::Relaxed);
+        match self.tx.try_send(command) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.counters.queued.fetch_sub(1, Ordering::Relaxed);
+                self.counters.dropped_full.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.counters.queued.fetch_sub(1, Ordering::Relaxed);
+                self.counters.dropped_closed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
-    /// Queue one answer for persistence (non-blocking, best-effort).
-    pub fn save(&self, entry: DnsPersistEntry) {
-        let _ = self.tx.send(entry);
+    pub async fn restore(
+        &self,
+        cache: Arc<DnsCacheService>,
+        policy: Option<PolicyId>,
+    ) -> Result<usize, PersistControlError> {
+        let (ack, receive) = oneshot::channel();
+        self.send_control(Command::Restore { cache, policy, ack })
+            .await?;
+        receive.await.map_err(|_| PersistControlError::AckDropped)
+    }
+
+    pub async fn restore_cache(
+        &self,
+        cache: &Arc<tokio::sync::Mutex<super::cache::DnsCache>>,
+        policy: Option<PolicyId>,
+    ) -> Result<usize, PersistControlError> {
+        let service = cache.lock().await.service();
+        self.restore(service, policy).await
+    }
+
+    pub async fn flush(&self) -> Result<(), PersistControlError> {
+        let epoch = self.epoch.fetch_add(1, Ordering::SeqCst).saturating_add(1);
+        let (ack, receive) = oneshot::channel();
+        self.send_control(Command::Flush { epoch, ack }).await?;
+        receive.await.map_err(|_| PersistControlError::AckDropped)?
+    }
+
+    pub async fn shutdown(&self) -> Result<(), PersistControlError> {
+        let (ack, receive) = oneshot::channel();
+        self.send_control(Command::Shutdown { ack }).await?;
+        let result = receive.await.map_err(|_| PersistControlError::AckDropped)?;
+        let handle = self
+            .worker
+            .lock()
+            .map_err(|_| PersistControlError::WorkerFailed)?
+            .take();
+        if let Some(handle) = handle {
+            tokio::task::spawn_blocking(move || handle.join())
+                .await
+                .map_err(|_| PersistControlError::WorkerFailed)?
+                .map_err(|_| PersistControlError::WorkerFailed)?;
+        }
+        result
+    }
+
+    pub fn counters(&self) -> PersistCounters {
+        self.counters.snapshot()
+    }
+
+    async fn send_control(&self, command: Command) -> Result<(), PersistControlError> {
+        self.counters.queued.fetch_add(1, Ordering::Relaxed);
+        if self.tx.send(command).await.is_err() {
+            self.counters.queued.fetch_sub(1, Ordering::Relaxed);
+            return Err(PersistControlError::Closed);
+        }
+        Ok(())
     }
 }
 
-/// Write all pending entries and clear the batch. Failures only warn.
-fn flush_pending(db: &CacheDb, pending: &mut HashMap<(String, u16), DnsPersistEntry>) {
-    if pending.is_empty() {
-        return;
-    }
-    for entry in pending.drain().map(|(_, e)| e) {
-        db.save_dns_answer(
-            &entry.name,
-            entry.qtype,
-            &encode_answer(&entry.response),
-            entry.expire_at_unix,
-        );
-    }
-}
-
-/// Encode raw wire-format response bytes as the JSON payload stored by
-/// [`CacheDb::save_dns_answer`]. Kept deliberately small: `{"r": base64}`.
-pub fn encode_answer(response: &[u8]) -> String {
-    serde_json::json!({
-        "r": base64::engine::general_purpose::STANDARD.encode(response),
-    })
-    .to_string()
-}
-
-/// Inverse of [`encode_answer`]; `None` on malformed payloads.
-pub fn decode_answer(answer_json: &str) -> Option<Vec<u8>> {
-    let value = serde_json::from_str::<serde_json::Value>(answer_json).ok()?;
-    let b64 = value.get("r")?.as_str()?;
-    base64::engine::general_purpose::STANDARD.decode(b64).ok()
-}
-
-/// Current UNIX time in seconds (0 on clock skew before the epoch).
 pub fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|duration| duration.as_secs())
         .unwrap_or(0)
 }
 
-/// Load every still-fresh persisted answer from cache.db into `cache`.
-/// Returns the number of restored entries. Call once at startup, before
-/// installing the persister, so restored entries are not re-persisted.
-pub async fn restore_dns_cache(db: &CacheDb, cache: &Arc<Mutex<DnsCache>>) -> usize {
-    let now = unix_now();
-    let answers = db.load_dns_answers(now);
-    if answers.is_empty() {
-        return 0;
-    }
-    let mut cache = cache.lock().await;
-    let mut restored = 0;
-    for answer in answers {
-        let ttl = answer.expire_at_unix.saturating_sub(now);
-        let Ok(ttl) = u32::try_from(ttl) else {
-            continue;
-        };
-        if ttl == 0 {
-            continue;
-        }
-        let Some(response) = decode_answer(&answer.answer_json) else {
-            continue;
-        };
-        cache.put(format!("{}:{}", answer.name, answer.qtype), response, ttl);
-        restored += 1;
-    }
-    restored
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use honk_config::experimental::CacheFileConfig;
-
-    fn test_db(dir: &tempfile::TempDir) -> Arc<CacheDb> {
-        let cfg = CacheFileConfig {
-            enabled: true,
-            path: dir.path().join("cache.db").to_str().unwrap().to_string(),
-            cache_id: String::new(),
-            store_fakeip: false,
-            store_dns: true,
-        };
-        Arc::new(CacheDb::open(&cfg, None).expect("cache.db opens"))
-    }
-
-    #[test]
-    fn answer_payload_roundtrip() {
-        let bytes = b"\x00\x01raw-dns-bytes\xff".to_vec();
-        let json = encode_answer(&bytes);
-        assert_eq!(decode_answer(&json).as_deref(), Some(bytes.as_slice()));
-        assert!(decode_answer("not json").is_none());
-        assert!(decode_answer(r#"{"x":1}"#).is_none());
-    }
-
-    #[tokio::test]
-    async fn persister_batches_writes_to_db() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = test_db(&dir);
-        let persister = DnsCachePersister::spawn(db.clone());
-        let expire = unix_now() + 300;
-
-        persister.save(DnsPersistEntry {
-            name: "example.com".into(),
-            qtype: 1,
-            response: b"wire-bytes".to_vec(),
-            expire_at_unix: expire,
-        });
-        // A second entry for the same key overwrites the first in the batch.
-        persister.save(DnsPersistEntry {
-            name: "example.com".into(),
-            qtype: 1,
-            response: b"wire-bytes-v2".to_vec(),
-            expire_at_unix: expire,
-        });
-
-        // Wait for at least one flush interval.
-        tokio::time::sleep(PERSIST_FLUSH_INTERVAL * 4).await;
-
-        let answers = db.load_dns_answers(unix_now());
-        assert_eq!(answers.len(), 1);
-        assert_eq!(answers[0].name, "example.com");
-        assert_eq!(
-            decode_answer(&answers[0].answer_json).as_deref(),
-            Some(b"wire-bytes-v2".as_slice())
-        );
-    }
-
-    #[tokio::test]
-    async fn restore_loads_fresh_answers_with_remaining_ttl() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = test_db(&dir);
-        let now = unix_now();
-        db.save_dns_answer("example.com", 1, &encode_answer(b"wire-bytes"), now + 300);
-        db.save_dns_answer("stale.com", 1, &encode_answer(b"old"), now - 1);
-
-        let cache = Arc::new(Mutex::new(DnsCache::new(16)));
-        let restored = restore_dns_cache(&db, &cache).await;
-        assert_eq!(restored, 1);
-
-        let mut cache = cache.lock().await;
-        let entry = cache.get("example.com:1").expect("restored entry");
-        assert_eq!(entry.response, b"wire-bytes");
-        let remaining = entry.remaining_ttl_secs();
-        assert!(
-            (295..=300).contains(&remaining),
-            "remaining ttl ~300s, got {remaining}"
-        );
-        assert!(cache.get("stale.com:1").is_none());
-    }
-}
+mod tests;

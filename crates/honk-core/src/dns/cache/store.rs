@@ -2,7 +2,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use super::{CacheValue, CachedEntry, DnsCacheService, NegativeCacheHit, lock};
+use super::{CacheKey, CacheValue, CachedEntry, DnsCacheService, NegativeCacheHit, lock};
 
 impl DnsCacheService {
     pub fn get(&self, key: &str) -> Option<CachedEntry> {
@@ -46,17 +46,23 @@ impl DnsCacheService {
 
     pub fn put(&self, key: String, response: Vec<u8>, min_ttl: u32) {
         let ttl = min_ttl.max(1);
-        if let Some(persister) = lock(&self.persister).clone()
-            && let Some((name, qtype)) = key.rsplit_once(':')
-            && let Ok(qtype) = qtype.parse::<u16>()
-        {
-            persister.save(crate::dns::persist::DnsPersistEntry {
-                name: name.to_string(),
-                qtype,
-                response: response.clone(),
-                expire_at_unix: crate::dns::persist::unix_now() + u64::from(ttl),
-            });
+        self.put_restored(key, response, ttl);
+    }
+
+    pub(crate) fn put_exact(&self, key: CacheKey, response: Vec<u8>, min_ttl: u32) {
+        let ttl = min_ttl.max(1);
+        if let Some(persister) = lock(&self.persister).clone() {
+            persister.save(
+                key.clone(),
+                response.clone(),
+                crate::dns::persist::unix_now() + u64::from(ttl),
+            );
         }
+        self.put_restored(key.storage_key(), response, ttl);
+    }
+
+    pub(crate) fn put_restored(&self, key: String, response: Vec<u8>, min_ttl: u32) {
+        let ttl = min_ttl.max(1);
         let entry = CachedEntry {
             response,
             expires_at: Instant::now() + Duration::from_secs(u64::from(ttl)),

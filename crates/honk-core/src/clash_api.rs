@@ -1203,9 +1203,16 @@ async fn flush_fakeip(State(s): State<Arc<ClashState>>) -> StatusCode {
 }
 
 async fn flush_dns(State(s): State<Arc<ClashState>>) -> StatusCode {
-    s.dns_cache.lock().await.clear();
-    // Also drop the persisted (store_dns) answers, if any.
-    if let Some(ref db) = s.cache_db {
+    let persistence = {
+        let mut cache = s.dns_cache.lock().await;
+        cache.clear();
+        cache.persistence()
+    };
+    if let Some(persistence) = persistence {
+        if let Err(error) = persistence.flush().await {
+            tracing::warn!(%error, "DNS persistence flush command failed");
+        }
+    } else if let Some(ref db) = s.cache_db {
         db.flush_dns();
     }
     StatusCode::NO_CONTENT

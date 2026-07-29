@@ -16,10 +16,20 @@ use rusqlite::{Connection, params};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+#[derive(Debug, thiserror::Error)]
+pub enum CacheDbError {
+    #[error("cache.db connection lock is poisoned")]
+    LockPoisoned,
+    #[error("cache.db operation failed: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+}
+
 pub struct CacheDb {
     conn: Mutex<Connection>,
     /// Key namespace prefix derived from `cache_id` ("" when empty).
     prefix: String,
+    #[cfg(test)]
+    write_attempted: std::sync::atomic::AtomicBool,
 }
 
 impl CacheDb {
@@ -75,6 +85,8 @@ impl CacheDb {
         Some(Self {
             conn: Mutex::new(conn),
             prefix,
+            #[cfg(test)]
+            write_attempted: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -134,6 +146,59 @@ impl CacheDb {
         {
             tracing::warn!("cache.db flush_prefix '{}' failed: {}", prefix, e);
         }
+    }
+
+    pub(crate) fn write_dns_v2(&self, entries: &[(String, Vec<u8>)]) -> Result<(), CacheDbError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        self.write_attempted
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut conn = self.conn.lock().map_err(|_| CacheDbError::LockPoisoned)?;
+        let transaction = conn.transaction()?;
+        {
+            let mut statement =
+                transaction.prepare("INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)")?;
+            for (suffix, value) in entries {
+                statement.execute(params![self.wrap(&format!("dns:v2:{suffix}")), value])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn load_dns_v2(&self) -> Result<Vec<(String, Vec<u8>)>, CacheDbError> {
+        let prefix = self.wrap("dns:v2:");
+        let escaped = escape_like_prefix(&prefix);
+        let conn = self.conn.lock().map_err(|_| CacheDbError::LockPoisoned)?;
+        let mut statement =
+            conn.prepare("SELECT key, value FROM kv WHERE key LIKE ?1 ESCAPE '\\'")?;
+        let rows = statement.query_map(params![format!("{escaped}%")], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        rows.map(|row| {
+            let (key, value) = row?;
+            let suffix = key
+                .strip_prefix(&prefix)
+                .ok_or(rusqlite::Error::InvalidQuery)?
+                .to_string();
+            Ok((suffix, value))
+        })
+        .collect::<Result<Vec<_>, rusqlite::Error>>()
+        .map_err(CacheDbError::from)
+    }
+
+    pub(crate) fn flush_dns_namespaces(&self) -> Result<(), CacheDbError> {
+        let legacy = escape_like_prefix(&self.wrap("dns:"));
+        let v2 = escape_like_prefix(&self.wrap("dns:v2:"));
+        let conn = self.conn.lock().map_err(|_| CacheDbError::LockPoisoned)?;
+        conn.execute(
+            "DELETE FROM kv
+             WHERE key LIKE ?1 ESCAPE '\\' OR key LIKE ?2 ESCAPE '\\'",
+            params![format!("{legacy}%"), format!("{v2}%")],
+        )?;
+        Ok(())
     }
 
     pub fn load_selector_choice(&self, group: &str) -> Option<String> {
@@ -241,6 +306,7 @@ impl CacheDb {
     /// Expired (or malformed) entries are skipped and lazily deleted.
     pub fn load_dns_answers(&self, now_unix: u64) -> Vec<PersistedDnsAnswer> {
         let prefix = self.wrap("dns:");
+        let v2_prefix = self.wrap("dns:v2:");
         let escaped = prefix
             .replace('\\', "\\\\")
             .replace('%', "\\%")
@@ -249,18 +315,24 @@ impl CacheDb {
             let Ok(conn) = self.conn.lock() else {
                 return Vec::new();
             };
-            let mut stmt =
-                match conn.prepare("SELECT key, value FROM kv WHERE key LIKE ?1 ESCAPE '\\'") {
-                    Ok(stmt) => stmt,
-                    Err(e) => {
-                        tracing::warn!("cache.db load_dns_answers prepare failed: {}", e);
-                        return Vec::new();
-                    }
-                };
+            let mut stmt = match conn.prepare(
+                "SELECT key, value FROM kv
+                 WHERE key LIKE ?1 ESCAPE '\\' AND key NOT LIKE ?2 ESCAPE '\\'",
+            ) {
+                Ok(stmt) => stmt,
+                Err(e) => {
+                    tracing::warn!("cache.db load_dns_answers prepare failed: {}", e);
+                    return Vec::new();
+                }
+            };
             match stmt
-                .query_map(params![format!("{}%", escaped)], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-                })
+                .query_map(
+                    params![
+                        format!("{}%", escaped),
+                        format!("{}%", escape_like_prefix(&v2_prefix))
+                    ],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                )
                 .map(|rows| rows.filter_map(|r| r.ok()).collect())
             {
                 Ok(rows) => rows,
@@ -279,6 +351,9 @@ impl CacheDb {
             let Some(rest) = key.strip_prefix("dns:") else {
                 continue;
             };
+            if rest.starts_with("v2:") {
+                continue;
+            }
             // The key is `dns:{name}:{qtype}`; DNS names never contain ':'.
             let Some((name, qtype)) = rest.rsplit_once(':') else {
                 continue;
@@ -320,7 +395,29 @@ impl CacheDb {
 
     /// Delete all persisted DNS answers (`dns:` prefix).
     pub fn flush_dns(&self) {
-        self.flush_prefix("dns:");
+        if let Err(error) = self.flush_dns_namespaces() {
+            tracing::warn!(%error, "cache.db DNS flush failed");
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_query_only_for_test(&self, enabled: bool) {
+        if let Ok(conn) = self.conn.lock() {
+            let _ = conn.pragma_update(None, "query_only", enabled);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lock_for_test(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn write_attempted_for_test(&self) -> bool {
+        self.write_attempted
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -350,6 +447,13 @@ fn open_and_check(path: &Path) -> Result<Connection, String> {
         return Err(format!("quick_check returned '{}'", ok));
     }
     Ok(conn)
+}
+
+fn escape_like_prefix(prefix: &str) -> String {
+    prefix
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 /// Rename a corrupt database file aside (`<name>.corrupt-<unix_ts>`) and
@@ -614,5 +718,88 @@ mod tests {
             1,
             "flushing namespace b must not touch namespace a"
         );
+    }
+
+    #[test]
+    fn legacy_loader_skips_v2_blob_without_touching_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.db");
+        let db = CacheDb::open(&cfg(&path, ""), None).unwrap();
+        let now = 1_000_000u64;
+        db.save_dns_answer("legacy.example", 1, r#"{"r":"QUJD"}"#, now + 300);
+        db.write_dns_v2(&[("opaque".to_string(), vec![0, 1, 2, 3])])
+            .unwrap();
+
+        let legacy = db.load_dns_answers(now);
+
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(legacy[0].name, "legacy.example");
+        assert_eq!(db.load_dns_v2().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn dns_flush_clears_both_namespaces_for_current_cache_id_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.db");
+        let now = 1_000_000u64;
+        let first = CacheDb::open(&cfg(&path, "first"), None).unwrap();
+        let second = CacheDb::open(&cfg(&path, "second"), None).unwrap();
+        for db in [&first, &second] {
+            db.save_dns_answer("example.com", 1, r#"{"r":"QUJD"}"#, now + 300);
+            db.write_dns_v2(&[("opaque".to_string(), vec![0, 1, 2, 3])])
+                .unwrap();
+            db.save_selector_choice("proxy", "node-a");
+        }
+
+        first.flush_dns_namespaces().unwrap();
+
+        assert!(first.load_dns_answers(now).is_empty());
+        assert!(first.load_dns_v2().unwrap().is_empty());
+        assert_eq!(
+            first.load_selector_choice("proxy").as_deref(),
+            Some("node-a")
+        );
+        assert_eq!(second.load_dns_answers(now).len(), 1);
+        assert_eq!(second.load_dns_v2().unwrap().len(), 1);
+        assert_eq!(
+            second.load_selector_choice("proxy").as_deref(),
+            Some("node-a")
+        );
+    }
+
+    #[test]
+    fn v2_blob_keeps_schema_version_and_non_dns_rows_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.db");
+        let db = CacheDb::open(&cfg(&path, ""), None).unwrap();
+        db.save_selector_choice("proxy", "node-a");
+        db.write_dns_v2(&[("opaque".to_string(), vec![0, 255, 1])])
+            .unwrap();
+
+        let conn = db.conn.lock().unwrap();
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let selector: String = conn
+            .query_row(
+                "SELECT value FROM kv WHERE key = 'selector:proxy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let value_type: String = conn
+            .query_row(
+                "SELECT typeof(value) FROM kv WHERE key = 'dns:v2:opaque'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "1");
+        assert_eq!(selector, "node-a");
+        assert_eq!(value_type, "blob");
     }
 }

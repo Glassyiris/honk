@@ -90,7 +90,7 @@ pub(super) async fn lookup(
 pub(super) async fn store(
     forwarder: &DnsForwarder,
     prepared: &PreparedQuery,
-    cache_key: &str,
+    cache_key: &CacheKey,
     response: &mut [u8],
     class: ResponseClass,
     reuse_eligible: bool,
@@ -102,10 +102,11 @@ pub(super) async fn store(
         let negative_ttl = extract_soa_negative_ttl(response, 60).clamp(1, 300);
         if forwarder.cache_enabled {
             let rcode = response.get(3).copied().unwrap_or_default() & 0x0f;
-            forwarder
-                .cache_service()
-                .await
-                .put_negative(cache_key.to_owned(), negative_ttl, rcode);
+            forwarder.cache_service().await.put_negative(
+                cache_key.storage_key(),
+                negative_ttl,
+                rcode,
+            );
         }
         return EffectiveExpiry::cacheable(std::time::Duration::from_secs(u64::from(negative_ttl)));
     }
@@ -119,10 +120,11 @@ pub(super) async fn store(
     if forwarder.cache_enabled && expiry.is_cacheable() {
         let cache_ttl = expiry.ttl().as_secs().min(u64::from(u32::MAX)) as u32;
         rewrite_answer_ttls(response, cache_ttl);
-        forwarder
-            .cache_service()
-            .await
-            .put(cache_key.to_owned(), response.to_owned(), cache_ttl);
+        forwarder.cache_service().await.put_exact(
+            cache_key.clone(),
+            response.to_owned(),
+            cache_ttl,
+        );
     }
     expiry
 }
