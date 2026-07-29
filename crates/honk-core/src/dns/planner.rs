@@ -21,7 +21,7 @@ impl UpstreamTag {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RequestScope {
     Upstream(UpstreamTag),
     AsIs(SocketAddr),

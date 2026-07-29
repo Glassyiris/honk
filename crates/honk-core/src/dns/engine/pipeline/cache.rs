@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use tracing::debug;
 
 use super::super::{DnsEngine, PreparedQuery, effective_expiry};
+use crate::dns::cache::CacheKey;
 use crate::dns::forwarder::{
     DnsForwardError, DnsForwarder, ResolveMode, extract_min_ttl, extract_soa_negative_ttl,
     rewrite_answer_ttls,
@@ -17,13 +18,15 @@ pub(super) async fn lookup(
     raw_query: &[u8],
     original_dst: Option<SocketAddr>,
     cache_key: &str,
+    refresh_key: &CacheKey,
     bypass_cache_read: bool,
+    allow_refresh: bool,
     mode: ResolveMode,
 ) -> Result<Option<DnsOutcome>, DnsForwardError> {
     if !forwarder.cache_enabled || bypass_cache_read {
         return Ok(None);
     }
-    let mut cache = forwarder.cache.lock().await;
+    let cache = forwarder.cache_service().await;
     if let Some(hit) = cache.negative_hit(cache_key) {
         debug!(
             domain = prepared.domain(),
@@ -31,7 +34,6 @@ pub(super) async fn lookup(
             "DNS forwarder: negative cache hit"
         );
         let response = crate::control::dns_control::build_dns_error_response(raw_query, hit.rcode);
-        drop(cache);
         return forwarder
             .outcome_from_wire(
                 engine,
@@ -56,11 +58,10 @@ pub(super) async fn lookup(
         remaining, "DNS forwarder: positive cache hit"
     );
     let refresh_after = (entry.min_ttl as u64 / 10).max(1);
-    if remaining <= refresh_after {
-        forwarder.maybe_spawn_refresh(cache_key.to_owned(), raw_query, original_dst);
+    if allow_refresh && remaining <= refresh_after {
+        forwarder.maybe_spawn_refresh(cache.clone(), raw_query, original_dst, refresh_key.clone());
     }
     let response = entry.response.clone();
-    drop(cache);
     let response = forwarder
         .apply_prefer_strategy(
             raw_query,
@@ -102,8 +103,7 @@ pub(super) async fn store(
         if forwarder.cache_enabled {
             let rcode = response.get(3).copied().unwrap_or_default() & 0x0f;
             forwarder
-                .cache
-                .lock()
+                .cache_service()
                 .await
                 .put_negative(cache_key.to_owned(), negative_ttl, rcode);
         }
@@ -120,8 +120,7 @@ pub(super) async fn store(
         let cache_ttl = expiry.ttl().as_secs().min(u64::from(u32::MAX)) as u32;
         rewrite_answer_ttls(response, cache_ttl);
         forwarder
-            .cache
-            .lock()
+            .cache_service()
             .await
             .put(cache_key.to_owned(), response.to_owned(), cache_ttl);
     }

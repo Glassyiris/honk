@@ -10,12 +10,12 @@ use honk_config::dns::{
 };
 use tokio::sync::Mutex;
 
-use crate::dns::cache::DnsCache;
+use crate::dns::cache::{CacheKey, DnsCache, OperationKind};
 use crate::dns::forwarder::{
     DnsForwardError, DnsForwarder, DnsUpstreamPool, DomainResolveNotifier, build_dns_query,
 };
 use crate::dns::outcome::{OutcomeStatus, Provenance, ResponseClass};
-use crate::dns::planner::PlanError;
+use crate::dns::planner::{PlanError, RequestPlan};
 use crate::dns::routing::DnsRouter;
 
 #[test]
@@ -328,22 +328,32 @@ async fn stale_outcome_covers_upstream_error_and_servfail_without_sleeping() {
     let query = build_dns_query("example.com", 1);
     let cached = response(&query, [9, 9, 9, 9], 30);
     let cache = Arc::new(Mutex::new(DnsCache::new(8)));
+    let routing = router("first", Vec::new(), None);
+    let engine = super::DnsEngine::from_router(&routing, None).expect("engine");
+    let prepared = engine.prepare(&query, None).expect("prepared");
+    let RequestPlan::Exchange(scope) = prepared.plan() else {
+        panic!("exchange plan");
+    };
+    let cache_key = CacheKey::new(
+        prepared.query(),
+        None,
+        scope.clone(),
+        OperationKind::Resolve,
+    )
+    .storage_key();
     cache
         .lock()
         .await
-        .insert_expired_for_test("example.com:1".to_owned(), cached, 30);
+        .insert_expired_for_test(cache_key, cached, 30);
     let error_forwarder = DnsForwarder::new(
         exchange([("first", Err(anyhow::anyhow!("offline")))], None),
         cache.clone(),
-        router("first", Vec::new(), None),
+        routing.clone(),
     );
     let mut servfail = response(&query, [1, 1, 1, 1], 30);
     servfail[3] = 0x82;
-    let servfail_forwarder = DnsForwarder::new(
-        exchange([("first", Ok(servfail))], None),
-        cache,
-        router("first", Vec::new(), None),
-    );
+    let servfail_forwarder =
+        DnsForwarder::new(exchange([("first", Ok(servfail))], None), cache, routing);
 
     // When
     let on_error = error_forwarder

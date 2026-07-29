@@ -13,10 +13,10 @@ use std::time::Duration;
 use anyhow::Context;
 use async_trait::async_trait;
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 use tracing::{debug, trace};
 
-use super::cache::DnsCache;
+use super::cache::{DnsCache, DnsCacheService};
 use super::engine::{DnsEngine, EngineError, PreparedQuery};
 use super::outcome::{DnsOutcome, EffectiveExpiry, OutcomeParts, OutcomeStatus, Provenance};
 use super::planner::{RequestScope, ResponseTraversal};
@@ -101,6 +101,7 @@ pub trait DomainResolveNotifier: Send + Sync {
 pub struct DnsForwarder {
     pub(crate) upstream_pool: Arc<dyn DnsUpstreamPool>,
     pub(crate) cache: Arc<Mutex<DnsCache>>,
+    cache_service: Arc<OnceCell<Arc<DnsCacheService>>>,
     pub(crate) routing: Arc<DnsRouter>,
     pub(crate) strategy: DnsStrategy,
     /// When false, skip positive/negative cache lookups and inserts
@@ -113,9 +114,6 @@ pub struct DnsForwarder {
     pub(crate) cache_ttl: u32,
     pub(crate) notifier: Option<Arc<dyn DomainResolveNotifier>>,
     pub(crate) policy_id: Option<PolicyId>,
-    /// Cache keys with an in-flight stale-while-revalidate background
-    /// refresh; deduplicates refresh storms for hot expiring entries.
-    refreshing: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl DnsForwarder {
@@ -128,6 +126,7 @@ impl DnsForwarder {
         Self {
             upstream_pool,
             cache,
+            cache_service: Arc::new(OnceCell::new()),
             routing,
             strategy: DnsStrategy::default(),
             cache_enabled: true,
@@ -135,7 +134,6 @@ impl DnsForwarder {
             cache_ttl: 0,
             notifier: None,
             policy_id: None,
-            refreshing: Default::default(),
         }
     }
 
@@ -149,13 +147,13 @@ impl DnsForwarder {
         Self {
             upstream_pool,
             cache,
+            cache_service: Arc::new(OnceCell::new()),
             routing,
             strategy: DnsStrategy::default(),
             cache_enabled: true,
             cache_ttl: 0,
             notifier: Some(notifier),
             policy_id: None,
-            refreshing: Default::default(),
         }
     }
 
@@ -195,6 +193,14 @@ impl DnsForwarder {
     /// Return a clone of the underlying cache Arc.
     pub fn cache(&self) -> Arc<Mutex<DnsCache>> {
         self.cache.clone()
+    }
+
+    pub(crate) async fn cache_service(&self) -> Arc<DnsCacheService> {
+        Arc::clone(
+            self.cache_service
+                .get_or_init(|| async { self.cache.lock().await.service() })
+                .await,
+        )
     }
 
     /// Resolve a raw DNS query (no original destination for `asis`).
@@ -314,10 +320,9 @@ impl DnsForwarder {
         if !self.cache_enabled {
             return None;
         }
-        let mut cache = self.cache.lock().await;
+        let cache = self.cache_service().await;
         let entry = cache.get_stale(cache_key)?;
         let mut response = entry.response.clone();
-        drop(cache);
         rewrite_answer_ttls(&mut response, SERVE_STALE_TTL_SECS);
         if response.len() >= 2 && raw_query.len() >= 2 {
             response[0..2].copy_from_slice(&raw_query[0..2]);
@@ -335,33 +340,35 @@ impl DnsForwarder {
     /// fresh answer back.
     pub(crate) fn maybe_spawn_refresh(
         &self,
-        cache_key: String,
+        cache: Arc<DnsCacheService>,
         raw_query: &[u8],
         original_dst: Option<SocketAddr>,
+        flight_key: crate::dns::cache::CacheKey,
     ) {
-        {
-            let mut set = self
-                .refreshing
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !set.insert(cache_key.clone()) {
-                return;
-            }
-        }
+        let crate::dns::singleflight::FlightRole::Leader(owner) =
+            cache.singleflight().acquire(flight_key)
+        else {
+            return;
+        };
         let this = self.clone();
         let query = raw_query.to_vec();
-        tokio::spawn(async move {
-            let result = this
-                .resolve_inner(&query, original_dst, true, ResolveMode::Compatibility)
-                .await;
-            if let Err(e) = result {
-                debug!("DNS forwarder: background refresh failed: {e:#}");
+        let spawned = cache.spawn_refresh(async move {
+            let result = super::engine::pipeline::resolve_with_owner(
+                &this,
+                &query,
+                original_dst,
+                true,
+                ResolveMode::Compatibility,
+                Some(owner),
+            )
+            .await;
+            if let Err(error) = result {
+                debug!("DNS forwarder: background refresh failed: {error:#}");
             }
-            this.refreshing
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&cache_key);
         });
+        if !spawned {
+            debug!("DNS forwarder: refresh service is closed");
+        }
     }
 
     /// Prefer-mode strategy (sing-box / dae `ipversion_prefer` semantics):
@@ -408,7 +415,7 @@ impl DnsForwarder {
     ) -> bool {
         let sibling_key = dns_cache_key(domain, preferred_qtype);
         if self.cache_enabled {
-            let mut cache = self.cache.lock().await;
+            let cache = self.cache_service().await;
             if cache.negative_rcode(&sibling_key).is_some() {
                 return false;
             }
@@ -980,6 +987,231 @@ mod tests {
         }
     }
 
+    struct GatedUpstream {
+        response: Vec<u8>,
+        call_count: AtomicUsize,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl DnsUpstreamPool for GatedUpstream {
+        async fn query(&self, _: &str, _: &[u8]) -> anyhow::Result<Vec<u8>> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(self.response.clone())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn identical_concurrent_queries_share_one_exchange_and_render_each_txid() {
+        // Given
+        const CALLERS: usize = 128;
+        let upstream = Arc::new(GatedUpstream {
+            response: make_a_response([192, 0, 2, 1], 300),
+            call_count: AtomicUsize::new(0),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let cache = test_cache();
+        let forwarder = Arc::new(DnsForwarder::new(
+            upstream.clone(),
+            cache.clone(),
+            test_router(),
+        ));
+        let start = Arc::new(tokio::sync::Barrier::new(CALLERS + 1));
+        let mut tasks = tokio::task::JoinSet::new();
+        for txid in 1..=CALLERS {
+            let forwarder = Arc::clone(&forwarder);
+            let start = Arc::clone(&start);
+            tasks.spawn(async move {
+                let mut query = make_a_query();
+                query[0..2].copy_from_slice(
+                    &u16::try_from(txid)
+                        .expect("caller count fits u16")
+                        .to_be_bytes(),
+                );
+                start.wait().await;
+                forwarder.resolve(&query).await
+            });
+        }
+        start.wait().await;
+        upstream.entered.notified().await;
+        let flights = cache.lock().await.singleflight();
+        while flights.counters().waiters < u64::try_from(CALLERS - 1).expect("count") {
+            tokio::task::yield_now().await;
+        }
+
+        // When
+        upstream.release.notify_one();
+        let mut txids = Vec::with_capacity(CALLERS);
+        while let Some(joined) = tasks.join_next().await {
+            let response = joined.expect("task").expect("resolve");
+            txids.push(u16::from_be_bytes([response[0], response[1]]));
+        }
+
+        // Then
+        txids.sort_unstable();
+        assert_eq!(
+            txids,
+            (1..=u16::try_from(CALLERS).expect("count")).collect::<Vec<_>>()
+        );
+        assert_eq!(upstream.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(flights.active_len(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_leader_wakes_all_waiters_to_one_successor_operation() {
+        const CALLERS: usize = 128;
+        struct CancelUpstream {
+            response: Vec<u8>,
+            calls: AtomicUsize,
+            first_entered: tokio::sync::Notify,
+            successor_entered: tokio::sync::Notify,
+            release_successor: tokio::sync::Notify,
+        }
+        #[async_trait]
+        impl DnsUpstreamPool for CancelUpstream {
+            async fn query(&self, _: &str, _: &[u8]) -> anyhow::Result<Vec<u8>> {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    self.first_entered.notify_one();
+                    std::future::pending::<()>().await;
+                }
+                self.successor_entered.notify_one();
+                self.release_successor.notified().await;
+                Ok(self.response.clone())
+            }
+        }
+
+        let upstream = Arc::new(CancelUpstream {
+            response: make_a_response([192, 0, 2, 9], 300),
+            calls: AtomicUsize::new(0),
+            first_entered: tokio::sync::Notify::new(),
+            successor_entered: tokio::sync::Notify::new(),
+            release_successor: tokio::sync::Notify::new(),
+        });
+        let forwarder = Arc::new(DnsForwarder::new(
+            upstream.clone(),
+            test_cache(),
+            test_router(),
+        ));
+        let service = forwarder.cache_service().await;
+        let mut leader_query = make_a_query();
+        leader_query[0..2].copy_from_slice(&1_u16.to_be_bytes());
+        let leader = {
+            let forwarder = Arc::clone(&forwarder);
+            tokio::spawn(async move { forwarder.resolve(&leader_query).await })
+        };
+        upstream.first_entered.notified().await;
+
+        let start = Arc::new(tokio::sync::Barrier::new(CALLERS));
+        let mut survivors = tokio::task::JoinSet::new();
+        for txid in 2..=CALLERS {
+            let forwarder = Arc::clone(&forwarder);
+            let start = Arc::clone(&start);
+            survivors.spawn(async move {
+                let mut query = make_a_query();
+                query[0..2].copy_from_slice(
+                    &u16::try_from(txid)
+                        .expect("caller count fits u16")
+                        .to_be_bytes(),
+                );
+                start.wait().await;
+                forwarder.resolve(&query).await
+            });
+        }
+        start.wait().await;
+        while service.flight_counters().waiters < u64::try_from(CALLERS - 1).expect("count") {
+            tokio::task::yield_now().await;
+        }
+
+        leader.abort();
+        assert!(leader.await.expect_err("cancelled").is_cancelled());
+        upstream.successor_entered.notified().await;
+        while service.flight_counters().waiters
+            < u64::try_from((CALLERS - 1) + (CALLERS - 2)).expect("count")
+        {
+            tokio::task::yield_now().await;
+        }
+        upstream.release_successor.notify_one();
+
+        let mut completed = 0;
+        while let Some(joined) = survivors.join_next().await {
+            joined.expect("task").expect("resolve");
+            completed += 1;
+        }
+        let counters = service.flight_counters();
+        assert_eq!(completed, CALLERS - 1);
+        assert_eq!(upstream.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(counters.leaders, 2);
+        assert_eq!(counters.aborts, 1);
+        assert_eq!(counters.retries, u64::try_from(CALLERS - 1).expect("count"));
+        assert_eq!(service.active_flights(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delayed_preflight_miss_does_not_open_a_second_exchange_after_cache_publish() {
+        // Given
+        const CALLERS: usize = 128;
+        let upstream = Arc::new(MockUpstream::new(make_a_response([192, 0, 2, 1], 300)));
+        let forwarder = Arc::new(DnsForwarder::new(
+            upstream.clone(),
+            test_cache(),
+            test_router(),
+        ));
+        let start = Arc::new(tokio::sync::Barrier::new(CALLERS + 1));
+        let mut tasks = tokio::task::JoinSet::new();
+        for txid in 1..=CALLERS {
+            let forwarder = Arc::clone(&forwarder);
+            let start = Arc::clone(&start);
+            tasks.spawn(async move {
+                let mut query = make_a_query();
+                query[0..2].copy_from_slice(
+                    &u16::try_from(txid)
+                        .expect("caller count fits u16")
+                        .to_be_bytes(),
+                );
+                start.wait().await;
+                forwarder.resolve(&query).await
+            });
+        }
+        start.wait().await;
+
+        // When
+        while let Some(joined) = tasks.join_next().await {
+            joined.expect("task").expect("resolve");
+        }
+
+        // Then
+        assert_eq!(
+            upstream.call_count.load(Ordering::SeqCst),
+            1,
+            "a caller delayed after its cache miss opened a second exchange"
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarding_hot_path_is_not_serialized_by_compatibility_cache_mutex() {
+        let cache = test_cache();
+        let forwarder = DnsForwarder::new(
+            Arc::new(MockUpstream::new(make_a_response([192, 0, 2, 3], 300))),
+            cache.clone(),
+            test_router(),
+        );
+        let _service = forwarder.cache_service().await;
+        let _compatibility_guard = cache.lock().await;
+
+        let result =
+            tokio::time::timeout(Duration::from_secs(1), forwarder.resolve(&make_a_query()))
+                .await
+                .expect("compatibility mutex must not block service")
+                .expect("resolve");
+
+        assert_eq!(&result[result.len() - 4..], &[192, 0, 2, 3]);
+    }
+
     /// Mock upstream that always fails (serve-stale tests).
     struct FailUpstream;
 
@@ -1060,38 +1292,62 @@ mod tests {
         assert_eq!(calls, 2, "background refresh should re-query upstream");
     }
 
-    #[tokio::test]
-    async fn poisoned_refresh_ownership_does_not_panic_or_leak_key() {
-        let mock = Arc::new(MockUpstream::new(make_a_response([7, 7, 7, 7], 60)));
-        let forwarder = DnsForwarder::new(mock, test_cache(), test_router());
-        let refreshing = forwarder.refreshing.clone();
-        let _ = std::thread::spawn(move || {
-            let _guard = refreshing.lock().expect("initial lock");
-            panic!("poison refresh ownership");
-        })
-        .join();
-        let query = make_a_query();
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            forwarder.maybe_spawn_refresh("example.com:1".to_owned(), &query, None);
-        }));
-
-        assert!(result.is_ok(), "poisoned refresh ownership must recover");
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let is_empty = forwarder
-                    .refreshing
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .is_empty();
-                if is_empty {
-                    break;
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn hot_near_expiry_hits_own_one_refresh_task_and_close_cleans_it() {
+        const CALLERS: usize = 128;
+        struct RefreshUpstream {
+            response: Vec<u8>,
+            calls: AtomicUsize,
+            refresh_entered: tokio::sync::Notify,
+        }
+        #[async_trait]
+        impl DnsUpstreamPool for RefreshUpstream {
+            async fn query(&self, _: &str, _: &[u8]) -> anyhow::Result<Vec<u8>> {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                if call > 0 {
+                    self.refresh_entered.notify_one();
+                    std::future::pending::<()>().await;
                 }
-                tokio::task::yield_now().await;
+                Ok(self.response.clone())
             }
-        })
-        .await
-        .expect("refresh cleanup");
+        }
+
+        let upstream = Arc::new(RefreshUpstream {
+            response: make_a_response([192, 0, 2, 10], 2),
+            calls: AtomicUsize::new(0),
+            refresh_entered: tokio::sync::Notify::new(),
+        });
+        let forwarder = Arc::new(DnsForwarder::new(
+            upstream.clone(),
+            test_cache(),
+            test_router(),
+        ));
+        let service = forwarder.cache_service().await;
+        forwarder.resolve(&make_a_query()).await.expect("prime");
+        tokio::time::sleep(Duration::from_millis(1900)).await;
+
+        let start = Arc::new(tokio::sync::Barrier::new(CALLERS + 1));
+        let mut callers = tokio::task::JoinSet::new();
+        for _ in 0..CALLERS {
+            let forwarder = Arc::clone(&forwarder);
+            let start = Arc::clone(&start);
+            callers.spawn(async move {
+                start.wait().await;
+                forwarder.resolve(&make_a_query()).await
+            });
+        }
+        start.wait().await;
+        while let Some(joined) = callers.join_next().await {
+            joined.expect("task").expect("cache hit");
+        }
+        upstream.refresh_entered.notified().await;
+
+        assert_eq!(upstream.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(service.refresh_task_count(), 1);
+        assert_eq!(service.active_flights(), 1);
+        service.close_refresh_tasks().await;
+        assert_eq!(service.refresh_task_count(), 0);
+        assert_eq!(service.active_flights(), 0);
     }
 
     /// RFC 2308 §5: negative TTL = min(SOA TTL, SOA MINIMUM).
@@ -1416,8 +1672,9 @@ mod tests {
         );
 
         {
-            let mut guard = cache.lock().await;
-            let entry = guard.get("example.com:1").expect("cached");
+            let guard = cache.lock().await;
+            let entries = guard.positive_entries_for_test();
+            let entry = entries.first().expect("cached");
             assert_eq!(entry.min_ttl, 600);
             assert_eq!(extract_min_ttl(&entry.response), 600);
             // Lifetime should be ~600s, not 30s.
@@ -1596,6 +1853,225 @@ mod tests {
         let result = forwarder.resolve(&query).await.expect("resolve");
         assert_eq!(mock.calls.load(Ordering::SeqCst), 2, "polluted then clean");
         assert_eq!(&result[result.len() - 4..], &[8, 8, 8, 8]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_response_requery_is_one_logical_flight() {
+        use honk_config::dns::{
+            DnsCond, DnsRequestAction, DnsRequestRouting, DnsResponseAction, DnsResponseRouting,
+            DnsResponseRule,
+        };
+
+        const CALLERS: usize = 128;
+        struct RequeryUpstream {
+            initial_calls: AtomicUsize,
+            fallback_calls: AtomicUsize,
+            initial_entered: tokio::sync::Notify,
+            initial_release: tokio::sync::Notify,
+            polluted: Vec<u8>,
+            clean: Vec<u8>,
+        }
+        #[async_trait]
+        impl DnsUpstreamPool for RequeryUpstream {
+            async fn query(&self, upstream: &str, _: &[u8]) -> anyhow::Result<Vec<u8>> {
+                if upstream == "fallback" {
+                    self.fallback_calls.fetch_add(1, Ordering::SeqCst);
+                    return Ok(self.clean.clone());
+                }
+                self.initial_calls.fetch_add(1, Ordering::SeqCst);
+                self.initial_entered.notify_one();
+                self.initial_release.notified().await;
+                Ok(self.polluted.clone())
+            }
+        }
+
+        let upstream = Arc::new(RequeryUpstream {
+            initial_calls: AtomicUsize::new(0),
+            fallback_calls: AtomicUsize::new(0),
+            initial_entered: tokio::sync::Notify::new(),
+            initial_release: tokio::sync::Notify::new(),
+            polluted: make_a_response([10, 0, 0, 1], 60),
+            clean: make_a_response([8, 8, 8, 8], 60),
+        });
+        let router = Arc::new(
+            DnsRouter::new(&DnsRouting {
+                request: DnsRequestRouting {
+                    rules: Vec::new(),
+                    fallback: DnsRequestAction::Upstream("initial".into()),
+                },
+                response: DnsResponseRouting {
+                    rules: vec![DnsResponseRule {
+                        conditions: vec![DnsCond::Ip {
+                            not: false,
+                            cidrs: vec!["10.0.0.0/8".into()],
+                            geoip: Vec::new(),
+                        }],
+                        action: DnsResponseAction::Upstream("fallback".into()),
+                    }],
+                    fallback: DnsResponseAction::Accept,
+                },
+                ..Default::default()
+            })
+            .expect("router"),
+        );
+        let cache = test_cache();
+        let flights = cache.lock().await.singleflight();
+        let forwarder = Arc::new(DnsForwarder::new(upstream.clone(), cache, router));
+        let start = Arc::new(tokio::sync::Barrier::new(CALLERS + 1));
+        let mut tasks = tokio::task::JoinSet::new();
+        for txid in 1..=CALLERS {
+            let forwarder = Arc::clone(&forwarder);
+            let start = Arc::clone(&start);
+            tasks.spawn(async move {
+                let mut query = make_a_query();
+                query[0..2].copy_from_slice(
+                    &u16::try_from(txid)
+                        .expect("caller count fits u16")
+                        .to_be_bytes(),
+                );
+                start.wait().await;
+                forwarder.resolve(&query).await
+            });
+        }
+        start.wait().await;
+        upstream.initial_entered.notified().await;
+        while flights.counters().waiters < u64::try_from(CALLERS - 1).expect("count") {
+            tokio::task::yield_now().await;
+        }
+
+        upstream.initial_release.notify_one();
+        let mut txids = Vec::with_capacity(CALLERS);
+        while let Some(joined) = tasks.join_next().await {
+            let response = joined.expect("task").expect("resolve");
+            assert_eq!(&response[response.len() - 4..], &[8, 8, 8, 8]);
+            txids.push(u16::from_be_bytes([response[0], response[1]]));
+        }
+        txids.sort_unstable();
+        assert_eq!(
+            txids,
+            (1..=u16::try_from(CALLERS).expect("count")).collect::<Vec<_>>()
+        );
+        assert_eq!(upstream.initial_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(upstream.fallback_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(flights.active_len(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn response_requery_error_stays_unpublished_and_waiters_retry_once() {
+        use honk_config::dns::{
+            DnsCond, DnsRequestAction, DnsRequestRouting, DnsResponseAction, DnsResponseRouting,
+            DnsResponseRule,
+        };
+
+        const CALLERS: usize = 128;
+        struct RetryUpstream {
+            initial_calls: AtomicUsize,
+            fallback_calls: AtomicUsize,
+            initial_entered: tokio::sync::Notify,
+            initial_release: tokio::sync::Notify,
+            successor_entered: tokio::sync::Notify,
+            successor_release: tokio::sync::Notify,
+            polluted: Vec<u8>,
+            clean: Vec<u8>,
+        }
+        #[async_trait]
+        impl DnsUpstreamPool for RetryUpstream {
+            async fn query(&self, upstream: &str, _: &[u8]) -> anyhow::Result<Vec<u8>> {
+                if upstream == "fallback" {
+                    let call = self.fallback_calls.fetch_add(1, Ordering::SeqCst);
+                    if call == 0 {
+                        anyhow::bail!("first fallback failed");
+                    }
+                    return Ok(self.clean.clone());
+                }
+                let call = self.initial_calls.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    self.initial_entered.notify_one();
+                    self.initial_release.notified().await;
+                } else if call == 1 {
+                    self.successor_entered.notify_one();
+                    self.successor_release.notified().await;
+                }
+                Ok(self.polluted.clone())
+            }
+        }
+
+        let upstream = Arc::new(RetryUpstream {
+            initial_calls: AtomicUsize::new(0),
+            fallback_calls: AtomicUsize::new(0),
+            initial_entered: tokio::sync::Notify::new(),
+            initial_release: tokio::sync::Notify::new(),
+            successor_entered: tokio::sync::Notify::new(),
+            successor_release: tokio::sync::Notify::new(),
+            polluted: make_a_response([10, 0, 0, 1], 60),
+            clean: make_a_response([8, 8, 4, 4], 60),
+        });
+        let router = Arc::new(
+            DnsRouter::new(&DnsRouting {
+                request: DnsRequestRouting {
+                    rules: Vec::new(),
+                    fallback: DnsRequestAction::Upstream("initial".into()),
+                },
+                response: DnsResponseRouting {
+                    rules: vec![DnsResponseRule {
+                        conditions: vec![DnsCond::Ip {
+                            not: false,
+                            cidrs: vec!["10.0.0.0/8".into()],
+                            geoip: Vec::new(),
+                        }],
+                        action: DnsResponseAction::Upstream("fallback".into()),
+                    }],
+                    fallback: DnsResponseAction::Accept,
+                },
+                ..Default::default()
+            })
+            .expect("router"),
+        );
+        let forwarder = Arc::new(DnsForwarder::new(upstream.clone(), test_cache(), router));
+        let service = forwarder.cache_service().await;
+        let start = Arc::new(tokio::sync::Barrier::new(CALLERS + 1));
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..CALLERS {
+            let forwarder = Arc::clone(&forwarder);
+            let start = Arc::clone(&start);
+            tasks.spawn(async move {
+                start.wait().await;
+                forwarder.resolve(&make_a_query()).await
+            });
+        }
+        start.wait().await;
+        upstream.initial_entered.notified().await;
+        while service.flight_counters().waiters < u64::try_from(CALLERS - 1).expect("count") {
+            tokio::task::yield_now().await;
+        }
+        upstream.initial_release.notify_one();
+        upstream.successor_entered.notified().await;
+        while service.flight_counters().waiters
+            < u64::try_from((CALLERS - 1) + (CALLERS - 2)).expect("count")
+        {
+            tokio::task::yield_now().await;
+        }
+        upstream.successor_release.notify_one();
+
+        let mut successes = 0;
+        let mut failures = 0;
+        while let Some(joined) = tasks.join_next().await {
+            match joined.expect("task") {
+                Ok(response) => {
+                    assert_eq!(&response[response.len() - 4..], &[8, 8, 4, 4]);
+                    successes += 1;
+                }
+                Err(_) => failures += 1,
+            }
+        }
+        let counters = service.flight_counters();
+        assert_eq!((successes, failures), (CALLERS - 1, 1));
+        assert_eq!(upstream.initial_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(upstream.fallback_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(counters.leaders, 2);
+        assert_eq!(counters.aborts, 1);
+        assert_eq!(counters.retries, u64::try_from(CALLERS - 1).expect("count"));
+        assert_eq!(service.active_flights(), 0);
     }
 
     #[tokio::test]

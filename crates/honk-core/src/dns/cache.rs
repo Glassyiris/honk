@@ -6,12 +6,113 @@
 //! expired entries are transparently skipped on lookup.
 
 use std::num::NonZeroUsize;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex as StdMutex, MutexGuard};
 use std::time::{Duration, Instant};
+
+use super::planner::RequestScope;
+use super::policy::PolicyId;
+use super::query::{IngressProfile, QueryContext};
+use super::singleflight::Singleflight;
+
+mod compatibility;
+mod service;
+mod store;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum OperationKind {
+    Resolve,
+    Refresh,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheCounters {
+    pub hits: u64,
+    pub misses: u64,
+    pub stale: u64,
+}
+
+#[derive(Default)]
+struct CacheCounterSet {
+    hits: AtomicU64,
+    misses: AtomicU64,
+    stale: AtomicU64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct CacheKey {
+    wire_identity: Arc<[u8]>,
+    ingress: IngressProfile,
+    policy_id: Option<PolicyId>,
+    scope: RequestScope,
+    operation: OperationKind,
+}
+
+impl CacheKey {
+    pub(crate) fn new(
+        query: &QueryContext,
+        policy_id: Option<PolicyId>,
+        scope: RequestScope,
+        operation: OperationKind,
+    ) -> Self {
+        Self {
+            wire_identity: Arc::from(query.canonical_wire()),
+            ingress: query.ingress(),
+            policy_id,
+            scope,
+            operation,
+        }
+    }
+
+    pub(crate) fn storage_key(&self) -> String {
+        use std::fmt::Write;
+
+        let mut key = String::with_capacity(self.wire_identity.len() * 2 + 128);
+        for byte in self.wire_identity.iter() {
+            let _ = write!(key, "{byte:02x}");
+        }
+        let _ = write!(
+            key,
+            "|{:?}|{}|{:?}|{:?}",
+            self.ingress,
+            self.policy_id
+                .as_ref()
+                .map(PolicyId::digest_hex)
+                .unwrap_or_default(),
+            self.scope,
+            self.operation
+        );
+        key
+    }
+
+    pub(crate) const fn operation(&self) -> OperationKind {
+        self.operation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        wire_identity: Vec<u8>,
+        ingress: IngressProfile,
+        scope: RequestScope,
+        operation: OperationKind,
+    ) -> Self {
+        Self {
+            wire_identity: wire_identity.into(),
+            ingress,
+            policy_id: None,
+            scope,
+            operation,
+        }
+    }
+}
 
 /// Extra window past TTL expiry during which an entry stays in the cache
 /// for serve-stale fallback (RFC 8767) instead of being dropped on the
 /// first post-expiry lookup.
 const STALE_RETENTION: Duration = Duration::from_secs(3600);
+static ZERO_CAPACITY_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// A cached DNS response entry.
 ///
@@ -71,195 +172,109 @@ impl CachedEntry {
 /// cache.db by a background writer; with no persister the insert path pays
 /// a single branch.
 pub struct DnsCache {
-    inner: lru::LruCache<String, CachedEntry>,
-    /// Negative cache — maps cache key to (expiry, rcode) for NXDOMAIN/SERVFAIL.
-    negative: lru::LruCache<String, (Instant, u8)>,
-    /// Optional persistence sink for positive answers (store_dns).
-    persister: Option<super::persist::DnsCachePersister>,
+    service: Arc<DnsCacheService>,
+}
+
+pub struct DnsCacheService {
+    shards: Vec<StdMutex<lru::LruCache<String, CacheValue>>>,
+    flights: Singleflight,
+    counters: CacheCounterSet,
+    persister: StdMutex<Option<super::persist::DnsCachePersister>>,
+    refresh_tasks: StdMutex<RefreshTasks>,
+    active_refresh_tasks: Arc<AtomicUsize>,
+}
+
+struct RefreshTasks {
+    tasks: tokio::task::JoinSet<()>,
+    closed: bool,
+}
+
+enum CacheValue {
+    Positive(CachedEntry),
+    Negative { expires_at: Instant, rcode: u8 },
 }
 
 impl DnsCache {
     /// Create a new DNS cache with the given maximum number of entries.
     ///
-    /// A `max_size` of 0 is silently clamped to 1.
+    /// Capacity is divided exactly across at most 16 shards. Eviction is LRU
+    /// within a shard, so one hot shard cannot evict entries in another.
     pub fn new(max_size: usize) -> Self {
-        let cap = NonZeroUsize::new(max_size.max(1)).expect("max_size must be > 0");
-        Self {
-            inner: lru::LruCache::new(cap),
-            negative: lru::LruCache::new(cap),
-            persister: None,
+        let capacity = max_size.max(1);
+        if max_size == 0
+            && ZERO_CAPACITY_WARNED
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            tracing::warn!(
+                requested = max_size,
+                effective = capacity,
+                "DNS cache capacity clamped"
+            );
         }
+        let shard_count = capacity.min(16);
+        let quotient = capacity / shard_count;
+        let remainder = capacity % shard_count;
+        let shards = (0..shard_count)
+            .map(|index| {
+                let shard_capacity = quotient + usize::from(index < remainder);
+                StdMutex::new(lru::LruCache::new(
+                    NonZeroUsize::new(shard_capacity)
+                        .unwrap_or_else(|| unreachable!("shard capacity is positive")),
+                ))
+            })
+            .collect();
+        Self {
+            service: Arc::new(DnsCacheService {
+                shards,
+                flights: Singleflight::default(),
+                counters: CacheCounterSet::default(),
+                persister: StdMutex::new(None),
+                refresh_tasks: StdMutex::new(RefreshTasks {
+                    tasks: tokio::task::JoinSet::new(),
+                    closed: false,
+                }),
+                active_refresh_tasks: Arc::new(AtomicUsize::new(0)),
+            }),
+        }
+    }
+
+    pub(crate) fn service(&self) -> Arc<DnsCacheService> {
+        Arc::clone(&self.service)
     }
 
     /// Install (or remove) the cache.db persistence sink. Wired by the
     /// control plane when `experimental.cache_file.store_dns` is enabled.
     pub fn set_persister(&mut self, persister: Option<super::persist::DnsCachePersister>) {
-        self.persister = persister;
-    }
-
-    /// Look up a cached DNS response by key.
-    ///
-    /// Returns `None` if the key is not present **or** if the entry has
-    /// expired. Hot keys are promoted in the LRU so repeated lookups keep
-    /// popular domains resident under pressure. Recently-expired entries
-    /// are kept for [`Self::get_stale`] (serve-stale); only entries past
-    /// the stale-retention window are dropped here.
-    pub fn get(&mut self, key: &str) -> Option<&CachedEntry> {
-        if self
-            .inner
-            .peek(key)
-            .is_some_and(|e| e.is_stale_retention_exceeded())
-        {
-            self.inner.pop(key);
-            return None;
-        }
-        self.inner.get(key).filter(|entry| !entry.is_expired())
-    }
-
-    /// Look up an entry that is past its TTL but still within the
-    /// serve-stale retention window (RFC 8767 fallback for when the
-    /// upstream query fails). Promotes the key in the LRU like `get`.
-    pub fn get_stale(&mut self, key: &str) -> Option<&CachedEntry> {
-        self.inner
-            .get(key)
-            .filter(|entry| entry.is_expired() && !entry.is_stale_retention_exceeded())
-    }
-
-    /// Store a DNS response in the cache.
-    ///
-    /// The entry will expire after `min_ttl` seconds. If the
-    /// cache is full the least-recently-used entry is evicted.
-    ///
-    /// A `min_ttl` of 0 is clamped to 1 second to avoid
-    /// immediate expiry.
-    ///
-    /// When a persister is installed the answer is also queued for
-    /// asynchronous cache.db persistence (non-blocking).
-    pub fn put(&mut self, key: String, response: Vec<u8>, min_ttl: u32) {
-        let ttl = min_ttl.max(1);
-        if let Some(ref persister) = self.persister {
-            // The key is `{name}:{qtype}` (DNS names never contain ':').
-            if let Some((name, qtype)) = key.rsplit_once(':')
-                && let Ok(qtype) = qtype.parse::<u16>()
-            {
-                persister.save(super::persist::DnsPersistEntry {
-                    name: name.to_string(),
-                    qtype,
-                    response: response.clone(),
-                    expire_at_unix: super::persist::unix_now() + ttl as u64,
-                });
-            }
-        }
-        let entry = CachedEntry {
-            response,
-            expires_at: Instant::now() + Duration::from_secs(ttl as u64),
-            min_ttl,
-        };
-        self.inner.put(key, entry);
+        *lock(&self.service.persister) = persister;
     }
 
     #[cfg(test)]
-    pub(crate) fn insert_expired_for_test(&mut self, key: String, response: Vec<u8>, min_ttl: u32) {
-        self.inner.put(
-            key,
-            CachedEntry {
-                response,
-                expires_at: Instant::now() - Duration::from_secs(1),
-                min_ttl,
-            },
-        );
+    pub(crate) fn singleflight(&self) -> Singleflight {
+        self.service.singleflight()
     }
 
-    /// Store a negative cache entry (NXDOMAIN/SERVFAIL), keeping the rcode
-    /// so a later hit can be answered with the correct one.
-    ///
-    /// The entry expires after `ttl` seconds (default: 60s for negative responses).
-    pub fn put_negative(&mut self, key: String, ttl: u32, rcode: u8) {
-        let ttl = ttl.clamp(1, 300);
-        self.negative.put(
-            key,
-            (Instant::now() + Duration::from_secs(ttl as u64), rcode),
-        );
-    }
-
-    /// The rcode of a live negative entry, if any (2=SERVFAIL, 3=NXDOMAIN).
-    pub fn negative_rcode(&self, key: &str) -> Option<u8> {
-        self.negative_hit(key).map(|hit| hit.rcode)
-    }
-
-    pub fn negative_hit(&self, key: &str) -> Option<NegativeCacheHit> {
-        let now = Instant::now();
-        self.negative.peek(key).and_then(|(expires, rcode)| {
-            expires.checked_duration_since(now).map(|remaining| {
-                let rounded_secs = remaining
-                    .as_secs()
-                    .saturating_add(u64::from(remaining.subsec_nanos() > 0));
-                NegativeCacheHit {
-                    rcode: *rcode,
-                    remaining_ttl: Duration::from_secs(rounded_secs),
-                }
-            })
-        })
-    }
-
-    /// Remove a negative cache entry.
-    pub fn clear_negative(&mut self, key: &str) {
-        self.negative.pop(key);
-    }
-
-    /// Remove all expired negative cache entries.
-    pub fn purge_expired_negatives(&mut self) {
-        let now = Instant::now();
-        let expired: Vec<String> = self
-            .negative
-            .iter()
-            .filter(|(_, (expires, _))| now >= *expires)
-            .map(|(k, _)| k.clone())
-            .collect();
-        for k in expired {
-            self.negative.pop(&k);
+    pub fn counters(&self) -> CacheCounters {
+        CacheCounters {
+            hits: self.service.counters.hits.load(Ordering::Relaxed),
+            misses: self.service.counters.misses.load(Ordering::Relaxed),
+            stale: self.service.counters.stale.load(Ordering::Relaxed),
         }
     }
 
-    /// Remove all entries from both caches.
-    pub fn clear(&mut self) {
-        self.inner.clear();
-        self.negative.clear();
+    pub fn flight_counters(&self) -> super::singleflight::FlightCounters {
+        self.service.flight_counters()
     }
 
-    /// Remove all entries that have expired (both positive and negative).
-    pub fn purge_expired(&mut self) {
-        // Positive cache
-        let expired: Vec<String> = self
-            .inner
-            .iter()
-            .filter(|(_, entry)| entry.is_expired())
-            .map(|(key, _)| key.clone())
-            .collect();
-        for key in expired {
-            self.inner.pop(&key);
-        }
-        // Negative cache
-        self.purge_expired_negatives();
+    pub fn active_flights(&self) -> usize {
+        self.service.active_flights()
     }
+}
 
-    /// Remove an entry from the cache.
-    ///
-    /// Returns the removed [`CachedEntry`] if it was present and
-    /// not already evicted.
-    pub fn remove(&mut self, key: &str) -> Option<CachedEntry> {
-        self.inner.pop(key)
-    }
-
-    /// Return the current number of entries (including stale ones).
-    pub fn len(&self) -> usize {
-        self.inner.len()
-    }
-
-    /// Return `true` if the cache contains no entries.
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
+fn lock<T>(mutex: &StdMutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]
@@ -356,22 +371,136 @@ mod tests {
         let mut cache = DnsCache::new(2);
         let r1 = make_test_response([1, 1, 1, 1], 300);
         let r2 = make_test_response([2, 2, 2, 2], 300);
-        let r3 = make_test_response([3, 3, 3, 3], 300);
+        let keys: Vec<String> = (0..100)
+            .map(|index| format!("same-shard-{index}:1"))
+            .filter(|key| cache.shard_index(key) == 0)
+            .take(2)
+            .collect();
+        let first = keys.first().expect("first key").clone();
+        let second = keys.get(1).expect("second key").clone();
 
-        cache.put("a.com:1".into(), r1.clone(), 300);
-        cache.put("b.com:1".into(), r2.clone(), 300);
+        cache.put(first.clone(), r1, 300);
+        cache.put(second.clone(), r2, 300);
 
-        assert!(cache.get("a.com:1").is_some());
-        assert!(cache.get("b.com:1").is_some());
+        assert!(cache.get(&first).is_none());
+        assert!(cache.get(&second).is_some());
+    }
 
-        cache.put("c.com:1".into(), r3.clone(), 300);
+    #[test]
+    fn shard_capacities_sum_exactly_and_clamp_count() {
+        for capacity in 1..=33 {
+            let cache = DnsCache::new(capacity);
+            let capacities = cache.shard_capacities();
+            assert_eq!(capacities.len(), capacity.min(16));
+            assert_eq!(capacities.iter().sum::<usize>(), capacity);
+            assert!(capacities.windows(2).all(|pair| pair[0] >= pair[1]));
+            assert!(capacities.windows(2).all(|pair| pair[0] - pair[1] <= 1));
+        }
+    }
 
-        assert!(
-            cache.get("a.com:1").is_none(),
-            "a.com should have been evicted"
+    #[test]
+    fn exact_key_separates_wire_profile_policy_scope_and_operation() {
+        // Given
+        let base_wire = crate::dns::forwarder::build_dns_query("Example.com", 1);
+        let base_query = QueryContext::parse(&base_wire).expect("base query");
+        let scope = RequestScope::Upstream(
+            crate::dns::planner::UpstreamTag::new("default").expect("scope"),
         );
-        assert!(cache.get("b.com:1").is_some());
-        assert!(cache.get("c.com:1").is_some());
+        let base = CacheKey::new(&base_query, None, scope.clone(), OperationKind::Resolve);
+        let mut variants = Vec::new();
+        for mutate in [
+            |wire: &mut Vec<u8>| wire[13] = b'e',
+            |wire: &mut Vec<u8>| wire[2] ^= 0x10,
+            |wire: &mut Vec<u8>| {
+                let end = wire.len();
+                wire[end - 1] = 3;
+            },
+        ] {
+            let mut wire = base_wire.clone();
+            mutate(&mut wire);
+            variants.push(CacheKey::new(
+                &QueryContext::parse(&wire).expect("wire variant"),
+                None,
+                scope.clone(),
+                OperationKind::Resolve,
+            ));
+        }
+        let mut edns_wire = base_wire.clone();
+        edns_wire[10..12].copy_from_slice(&1_u16.to_be_bytes());
+        edns_wire.extend_from_slice(&[0, 0, 41, 4, 208, 0, 0, 0, 0, 0, 0]);
+        variants.push(CacheKey::new(
+            &QueryContext::parse(&edns_wire).expect("edns"),
+            None,
+            scope.clone(),
+            OperationKind::Resolve,
+        ));
+        variants.push(CacheKey::new(
+            &QueryContext::parse_with_profile(&base_wire, IngressProfile::Tcp).expect("profile"),
+            None,
+            scope.clone(),
+            OperationKind::Resolve,
+        ));
+        variants.push(CacheKey::new(
+            &base_query,
+            Some(PolicyId::from_config(&Default::default()).expect("policy")),
+            scope.clone(),
+            OperationKind::Resolve,
+        ));
+        variants.push(CacheKey::new(
+            &base_query,
+            None,
+            RequestScope::Upstream(
+                crate::dns::planner::UpstreamTag::new("other").expect("other scope"),
+            ),
+            OperationKind::Resolve,
+        ));
+        variants.push(CacheKey::new(
+            &base_query,
+            None,
+            scope,
+            OperationKind::Refresh,
+        ));
+
+        // When / Then
+        assert!(variants.iter().all(|variant| variant != &base));
+        assert!(
+            variants
+                .iter()
+                .all(|variant| variant.storage_key() != base.storage_key())
+        );
+    }
+
+    #[test]
+    fn cache_counters_are_exact_for_hit_miss_and_stale_paths() {
+        // Given
+        let mut cache = DnsCache::new(8);
+        let response = make_test_response([192, 0, 2, 1], 60);
+
+        // When
+        assert!(cache.get("missing").is_none());
+        cache.put("live".into(), response.clone(), 60);
+        assert!(cache.get("live").is_some());
+        cache.insert_expired_for_test("stale".into(), response, 60);
+        assert!(cache.get("stale").is_none());
+        assert!(cache.get_stale("stale").is_some());
+        cache.put_negative("negative".into(), 60, 3);
+        assert!(cache.negative_hit("negative").is_some());
+        cache.insert_beyond_stale_retention_for_test(
+            "retention-exceeded".into(),
+            make_test_response([192, 0, 2, 2], 60),
+            60,
+        );
+        assert!(cache.get("retention-exceeded").is_none());
+
+        // Then
+        assert_eq!(
+            cache.counters(),
+            CacheCounters {
+                hits: 2,
+                misses: 3,
+                stale: 1,
+            }
+        );
     }
 
     #[test]

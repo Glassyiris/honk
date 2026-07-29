@@ -22,7 +22,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::{RwLock, Semaphore, broadcast};
+use tokio::sync::{RwLock, Semaphore};
 use tracing::debug;
 
 /// Max concurrent in-flight DNS queries. Sized like dae's (16384 @ ~4KB
@@ -123,11 +123,6 @@ pub struct DnsController {
     /// matches any domain rule without touching unrelated map entries.
     pushed_ips: DashMap<std::net::IpAddr, ()>,
 
-    /// In-flight query deduplication: (key → broadcast sender).
-    /// When multiple clients query the same domain simultaneously,
-    /// only one upstream request is made and the result is broadcast.
-    in_flight: DashMap<String, broadcast::Sender<Vec<u8>>>,
-
     /// Semaphore limiting concurrent DNS queries.
     concurrency_limit: Semaphore,
 }
@@ -145,7 +140,6 @@ impl DnsController {
             route_cache: DomainRouteCache::new(),
             learned_routes: DashMap::new(),
             pushed_ips: DashMap::new(),
-            in_flight: DashMap::new(),
             concurrency_limit: Semaphore::new(DEFAULT_MAX_CONCURRENT_QUERIES),
         }
     }
@@ -336,57 +330,7 @@ impl DnsController {
         data: &[u8],
         original_dst: Option<SocketAddr>,
     ) -> Vec<u8> {
-        if !is_singleflight_eligible(data) {
-            return self.resolve_and_notify(data, original_dst).await.0;
-        }
-        // Key covers the original destination too: `asis` queries to
-        // different upstream servers must never share one flight.
-        let cache_key = match crate::dns::forwarder::parse_dns_question(data) {
-            Some((domain, qtype)) => {
-                format!(
-                    "{}:{}:{}",
-                    domain,
-                    qtype,
-                    original_dst
-                        .map(|a| a.ip())
-                        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
-                )
-            }
-            None => return self.resolve_and_notify(data, original_dst).await.0,
-        };
-
-        use dashmap::mapref::entry::Entry;
-        let rx = match self.in_flight.entry(cache_key.clone()) {
-            Entry::Occupied(e) => Some(e.get().subscribe()),
-            Entry::Vacant(e) => {
-                let (tx, _) = broadcast::channel(1);
-                e.insert(tx.clone());
-                None // leader
-            }
-        };
-
-        if let Some(mut rx) = rx {
-            match rx.recv().await {
-                Ok(resp) => {
-                    debug!("DNS singleflight: reused result for {}", cache_key);
-                    // The shared response carries the leader's transaction
-                    // ID; restore this query's own or clients will drop it.
-                    return with_own_txid(resp, data);
-                }
-                Err(_) => {
-                    // Leader dropped without answering (panic/cancel): clear
-                    // the stale entry and retry as a fresh flight.
-                    self.in_flight.remove(&cache_key);
-                    return Box::pin(self.resolve_with_singleflight(data, original_dst)).await;
-                }
-            }
-        }
-
-        let (response, _) = self.resolve_and_notify(data, original_dst).await;
-        if let Some((_, tx)) = self.in_flight.remove(&cache_key) {
-            let _ = tx.send(response.clone());
-        }
-        response
+        self.resolve_and_notify(data, original_dst).await.0
     }
 
     /// Resolve a raw DNS query and notify BPF on success.
@@ -635,20 +579,6 @@ pub(crate) fn build_dns_error_response(query: &[u8], rcode: u8) -> Vec<u8> {
     let mut resp = query.to_vec();
     resp[2] = 0x81; // QR + RD
     resp[3] = 0x80 | (rcode & 0x0f); // RA + rcode
-    resp
-}
-
-fn is_singleflight_eligible(data: &[u8]) -> bool {
-    crate::dns::query::QueryContext::parse(data).is_ok_and(|query| query.is_coalescable())
-}
-
-/// Rewrite the response's transaction ID to match this query — required
-/// when a singleflight leader's response is shared with waiting clients.
-fn with_own_txid(mut resp: Vec<u8>, query: &[u8]) -> Vec<u8> {
-    if resp.len() >= 2 && query.len() >= 2 {
-        resp[0] = query[0];
-        resp[1] = query[1];
-    }
     resp
 }
 

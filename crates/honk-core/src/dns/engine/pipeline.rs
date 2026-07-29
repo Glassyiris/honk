@@ -1,17 +1,17 @@
 use std::net::SocketAddr;
-use std::time::Duration;
 
 use tracing::debug;
 
-use super::{DnsEngine, ResponseDirective};
-use crate::dns::forwarder::{
-    DnsForwardError, DnsForwarder, ResolveMode, SERVE_STALE_TTL_SECS, dns_cache_key,
-    is_filtered_qtype, make_empty_response, qtype_name, traversal_strings,
-};
-use crate::dns::outcome::{DnsOutcome, EffectiveExpiry, OutcomeStatus, Provenance, ResponseClass};
-use crate::dns::planner::{RequestPlan, ResponseTraversal};
+use super::DnsEngine;
+use crate::dns::cache::{CacheKey, OperationKind};
+use crate::dns::forwarder::{DnsForwardError, DnsForwarder, ResolveMode, is_filtered_qtype};
+use crate::dns::outcome::{DnsOutcome, OutcomeStatus};
+use crate::dns::planner::RequestPlan;
+use crate::dns::singleflight::{FlightLeader, FlightRole};
 
 mod cache;
+mod flight;
+mod operation;
 mod plan;
 
 use plan::{rejected_outcome, request_exchange};
@@ -23,28 +23,45 @@ pub(crate) async fn resolve(
     bypass_cache_read: bool,
     mode: ResolveMode,
 ) -> Result<DnsOutcome, DnsForwardError> {
+    resolve_with_owner(
+        forwarder,
+        raw_query,
+        original_dst,
+        bypass_cache_read,
+        mode,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn resolve_with_owner(
+    forwarder: &DnsForwarder,
+    raw_query: &[u8],
+    original_dst: Option<SocketAddr>,
+    bypass_cache_read: bool,
+    mode: ResolveMode,
+    refresh_owner: Option<FlightLeader>,
+) -> Result<DnsOutcome, DnsForwardError> {
     debug!("DNS forwarder: resolving {} bytes", raw_query.len());
     let engine = DnsEngine::from_router(&forwarder.routing, forwarder.policy_id.clone())?;
     let prepared = match mode {
         ResolveMode::Strict => engine.prepare(raw_query, original_dst)?,
         ResolveMode::Compatibility => engine.prepare_compatibility(raw_query, original_dst)?,
     };
-    let domain = prepared.domain();
     let qtype = prepared.qtype();
-    let cache_key = dns_cache_key(domain, qtype);
     let reuse_eligible = prepared.is_cacheable() && prepared.is_coalescable();
 
-    debug!(
-        domain,
-        qtype, cache_key, reuse_eligible, "DNS forwarder: planned query"
-    );
-
     if is_filtered_qtype(qtype, &forwarder.strategy) {
-        debug!(
-            qtype = qtype_name(qtype),
-            strategy = ?forwarder.strategy,
-            "DNS forwarder: dropping query due to strategy"
+        return rejected_outcome(
+            forwarder,
+            &engine,
+            &prepared,
+            raw_query,
+            mode,
+            OutcomeStatus::Rejected,
         );
+    }
+    if matches!(prepared.plan(), RequestPlan::Reject) {
         return rejected_outcome(
             forwarder,
             &engine,
@@ -55,21 +72,20 @@ pub(crate) async fn resolve(
         );
     }
 
-    match prepared.plan() {
-        RequestPlan::Reject => {
-            debug!(domain, "DNS forwarder: request rejected");
-            return rejected_outcome(
-                forwarder,
-                &engine,
-                &prepared,
-                raw_query,
-                mode,
-                OutcomeStatus::Rejected,
-            );
-        }
-        RequestPlan::Exchange(_) => {}
-    }
-
+    let (logical_upstream, request_scope) = request_exchange(&prepared)?;
+    let resolve_key = CacheKey::new(
+        prepared.query(),
+        engine.policy_id().cloned(),
+        request_scope.clone(),
+        OperationKind::Resolve,
+    );
+    let cache_key = resolve_key.storage_key();
+    let refresh_key = CacheKey::new(
+        prepared.query(),
+        engine.policy_id().cloned(),
+        request_scope.clone(),
+        OperationKind::Refresh,
+    );
     if reuse_eligible
         && let Some(outcome) = cache::lookup(
             forwarder,
@@ -78,7 +94,9 @@ pub(crate) async fn resolve(
             raw_query,
             original_dst,
             &cache_key,
+            &refresh_key,
             bypass_cache_read,
+            true,
             mode,
         )
         .await?
@@ -86,140 +104,148 @@ pub(crate) async fn resolve(
         return Ok(outcome);
     }
 
-    let (logical_upstream, request_scope) = request_exchange(&prepared)?;
-    let upstream_result = forwarder.exchange(request_scope, raw_query).await;
-    let (mut response, mut upstream_name) = match upstream_result {
-        Ok(response) => (response, logical_upstream.clone()),
-        Err(source) => {
-            if reuse_eligible
-                && let Some(stale) = forwarder
-                    .try_serve_stale(&cache_key, raw_query, domain)
-                    .await
-            {
-                let stale = forwarder
-                    .apply_prefer_strategy(raw_query, domain, qtype, stale, original_dst)
-                    .await?;
-                return forwarder.outcome_from_wire(
+    if let Some(owner) = refresh_owner {
+        return run_as_leader(
+            owner,
+            forwarder,
+            &engine,
+            &prepared,
+            raw_query,
+            original_dst,
+            &cache_key,
+            logical_upstream,
+            request_scope.clone(),
+            reuse_eligible,
+            mode,
+        )
+        .await;
+    }
+
+    let operation = if bypass_cache_read {
+        OperationKind::Refresh
+    } else {
+        OperationKind::Resolve
+    };
+    let flight_key = CacheKey::new(
+        prepared.query(),
+        engine.policy_id().cloned(),
+        request_scope.clone(),
+        operation,
+    );
+    let flights = forwarder.cache_service().await.singleflight();
+    loop {
+        match flights.acquire(flight_key.clone()) {
+            FlightRole::Bypass => {
+                return operation::run(
+                    forwarder,
                     &engine,
                     &prepared,
-                    stale,
-                    OutcomeStatus::Accepted,
-                    Provenance::Stale,
-                    EffectiveExpiry::cacheable(Duration::from_secs(u64::from(
-                        SERVE_STALE_TTL_SECS,
-                    ))),
-                    Some(logical_upstream.as_str().to_owned()),
-                    Some(logical_upstream.as_str().to_owned()),
-                    vec![logical_upstream.as_str().to_owned()],
+                    raw_query,
+                    original_dst,
+                    &cache_key,
+                    logical_upstream,
+                    request_scope.clone(),
+                    reuse_eligible,
                     mode,
-                );
+                )
+                .await;
             }
-            return Err(DnsForwardError::Exchange {
-                upstream: logical_upstream.as_str().to_owned(),
-                source,
-            });
-        }
-    };
-
-    let mut traversal = ResponseTraversal::start(logical_upstream.clone());
-    let (status, class) = loop {
-        match engine.analyze(
-            &prepared,
-            traversal,
-            response,
-            matches!(mode, ResolveMode::Strict),
-        )? {
-            ResponseDirective::Accept {
-                response: analyzed,
-                traversal: accepted,
-            } => {
-                response = analyzed.wire;
-                traversal = accepted;
-                if reuse_eligible
-                    && analyzed.class == ResponseClass::Servfail
-                    && let Some(stale) = forwarder
-                        .try_serve_stale(&cache_key, raw_query, domain)
-                        .await
-                {
-                    let stale = forwarder
-                        .apply_prefer_strategy(raw_query, domain, qtype, stale, original_dst)
-                        .await?;
-                    return forwarder.outcome_from_wire(
+            FlightRole::Ready(template) => {
+                return flight::waiter_outcome(
+                    forwarder,
+                    &engine,
+                    &prepared,
+                    raw_query,
+                    original_dst,
+                    &cache_key,
+                    &refresh_key,
+                    bypass_cache_read,
+                    mode,
+                    template,
+                )
+                .await;
+            }
+            FlightRole::Waiter(waiter) => match waiter.receive().await {
+                Some(template) => {
+                    return flight::waiter_outcome(
+                        forwarder,
                         &engine,
                         &prepared,
-                        stale,
-                        OutcomeStatus::Accepted,
-                        Provenance::Stale,
-                        EffectiveExpiry::cacheable(Duration::from_secs(u64::from(
-                            SERVE_STALE_TTL_SECS,
-                        ))),
-                        Some(logical_upstream.as_str().to_owned()),
-                        Some(upstream_name.as_str().to_owned()),
-                        traversal_strings(&traversal),
+                        raw_query,
+                        original_dst,
+                        &cache_key,
+                        &refresh_key,
+                        bypass_cache_read,
                         mode,
-                    );
+                        template,
+                    )
+                    .await;
                 }
-                break (OutcomeStatus::Accepted, analyzed.class);
-            }
-            ResponseDirective::Reject {
-                response: analyzed,
-                traversal: rejected,
-            } => {
-                response = make_empty_response(raw_query, domain, qtype);
-                traversal = rejected;
-                break (OutcomeStatus::Rejected, analyzed.class);
-            }
-            ResponseDirective::Requery {
-                upstream,
-                traversal: next,
-            } => {
-                response = forwarder
-                    .upstream_pool
-                    .query(upstream.as_str(), raw_query)
-                    .await
-                    .map_err(|source| DnsForwardError::Exchange {
-                        upstream: upstream.as_str().to_owned(),
-                        source,
-                    })?;
-                upstream_name = upstream;
-                traversal = next;
+                None => continue,
+            },
+            FlightRole::Leader(leader) => {
+                if !bypass_cache_read
+                    && let Some(outcome) = cache::lookup(
+                        forwarder,
+                        &engine,
+                        &prepared,
+                        raw_query,
+                        original_dst,
+                        &cache_key,
+                        &refresh_key,
+                        false,
+                        true,
+                        mode,
+                    )
+                    .await?
+                {
+                    return Ok(flight::publish_outcome(leader, outcome));
+                }
+                return run_as_leader(
+                    leader,
+                    forwarder,
+                    &engine,
+                    &prepared,
+                    raw_query,
+                    original_dst,
+                    &cache_key,
+                    logical_upstream,
+                    request_scope.clone(),
+                    reuse_eligible,
+                    mode,
+                )
+                .await;
             }
         }
-    };
-
-    let expiry = cache::store(
-        forwarder,
-        &prepared,
-        &cache_key,
-        &mut response,
-        class,
-        reuse_eligible,
-    )
-    .await;
-    if let Some(notifier) = &forwarder.notifier {
-        notifier.on_domain_resolved(domain, &response);
     }
-    debug!(
-        domain,
-        upstream = upstream_name.as_str(),
-        ttl = expiry.ttl().as_secs(),
-        bytes = response.len(),
-        "DNS forwarder: resolved query"
-    );
+}
 
-    let response = forwarder
-        .apply_prefer_strategy(raw_query, domain, qtype, response, original_dst)
-        .await?;
-    forwarder.outcome_from_wire(
-        &engine,
-        &prepared,
-        response,
-        status,
-        Provenance::Upstream,
-        expiry,
-        Some(logical_upstream.as_str().to_owned()),
-        Some(upstream_name.as_str().to_owned()),
-        traversal_strings(&traversal),
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run_as_leader(
+    leader: FlightLeader,
+    forwarder: &DnsForwarder,
+    engine: &DnsEngine,
+    prepared: &super::PreparedQuery,
+    raw_query: &[u8],
+    original_dst: Option<SocketAddr>,
+    cache_key: &str,
+    logical_upstream: crate::dns::planner::UpstreamTag,
+    request_scope: crate::dns::planner::RequestScope,
+    reuse_eligible: bool,
+    mode: ResolveMode,
+) -> Result<DnsOutcome, DnsForwardError> {
+    let outcome = operation::run(
+        forwarder,
+        engine,
+        prepared,
+        raw_query,
+        original_dst,
+        cache_key,
+        logical_upstream,
+        request_scope,
+        reuse_eligible,
         mode,
     )
+    .await?;
+    Ok(flight::publish_outcome(leader, outcome))
 }
