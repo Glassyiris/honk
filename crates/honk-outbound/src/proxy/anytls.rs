@@ -764,6 +764,11 @@ pub(crate) struct AnyTlsStream {
     rx: mpsc::Receiver<StreamEvent>,
     read_buf: Vec<u8>,
     read_pos: usize,
+    /// Set when the Fin/disconnect event was consumed in the same poll
+    /// that also delivered data: the data goes out now, the zero-byte
+    /// EOF is owed to the next poll (a consumed Fin is otherwise lost
+    /// and the relay hangs forever).
+    read_eof: bool,
     /// In-flight PSH/FIN write (owns the payload — cancelling the caller's
     /// write future can never lose data).
     write_fut:
@@ -779,6 +784,7 @@ impl AnyTlsStream {
             rx,
             read_buf: Vec::new(),
             read_pos: 0,
+            read_eof: false,
             write_fut: None,
             fin_sent: false,
         }
@@ -823,6 +829,11 @@ impl tokio::io::AsyncRead for AnyTlsStream {
         out: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.as_mut().get_mut();
+        if this.read_eof {
+            // The Fin/disconnect was already consumed; the zero-byte EOF
+            // owed from that poll is delivered now (and stays delivered).
+            return std::task::Poll::Ready(Ok(()));
+        }
         // Drain as many queued frames as fit: servers that emit small
         // frames would otherwise cost one relay wakeup per frame.
         let mut got_any = this.read_pos < this.read_buf.len();
@@ -857,7 +868,13 @@ impl tokio::io::AsyncRead for AnyTlsStream {
                     got_any = true;
                 }
                 std::task::Poll::Ready(Some(StreamEvent::Fin)) | std::task::Poll::Ready(None) => {
-                    return std::task::Poll::Ready(Ok(())); // EOF (deliver prior data first)
+                    // Consume the EOF event exactly once. If this poll
+                    // already delivered data, the caller must see that
+                    // data as a successful read; the EOF is owed to the
+                    // next poll via `read_eof` (returning it now would
+                    // either discard the data or lose the Fin).
+                    this.read_eof = true;
+                    return std::task::Poll::Ready(Ok(()));
                 }
                 std::task::Poll::Pending => {
                     return if got_any {
@@ -1741,6 +1758,64 @@ mod tests {
             .expect("echo timed out")
             .unwrap();
         assert_eq!(buf, payload);
+    }
+
+    /// Regression (113666e): Data+Fin enqueued before the first poll must
+    /// deliver the data first and a zero-byte EOF next — the batched drain
+    /// must not eat the Fin and hang the relay.
+    #[tokio::test]
+    async fn test_data_fin_same_batch_delivers_data_then_eof() {
+        let (session, _server) = establish_test_session("127.0.0.1:443").await;
+        let sid = 7u32;
+        let (tx, rx) = mpsc::channel(STREAM_QUEUE_CAP);
+        session
+            .streams
+            .lock()
+            .unwrap()
+            .insert(sid, StreamSink::Tcp(tx));
+        let mut stream = AnyTlsStream::new(Arc::clone(&session), sid, rx);
+
+        let sink = session.streams.lock().unwrap().get(&sid).cloned().unwrap();
+        sink.send_data(b"hello".to_vec()).await;
+        sink.send_fin().await;
+
+        let mut buf = [0u8; 64];
+        let n = stream.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"hello");
+        // The consumed Fin must surface as EOF, not a permanent Pending.
+        let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
+            .await
+            .expect("EOF never delivered — Fin was eaten")
+            .unwrap();
+        assert_eq!(n, 0);
+        // EOF is sticky.
+        let n = stream.read(&mut buf).await.unwrap();
+        assert_eq!(n, 0);
+    }
+
+    /// Same-batch variant with multiple data frames before the Fin.
+    #[tokio::test]
+    async fn test_multi_data_fin_same_batch() {
+        let (session, _server) = establish_test_session("127.0.0.1:443").await;
+        let sid = 9u32;
+        let (tx, rx) = mpsc::channel(STREAM_QUEUE_CAP);
+        session
+            .streams
+            .lock()
+            .unwrap()
+            .insert(sid, StreamSink::Tcp(tx));
+        let mut stream = AnyTlsStream::new(Arc::clone(&session), sid, rx);
+
+        let sink = session.streams.lock().unwrap().get(&sid).cloned().unwrap();
+        sink.send_data(b"aa".to_vec()).await;
+        sink.send_data(b"bbb".to_vec()).await;
+        sink.send_fin().await;
+
+        let mut buf = [0u8; 64];
+        let n = stream.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"aabbb", "both frames batch into one read");
+        let n = stream.read(&mut buf).await.unwrap();
+        assert_eq!(n, 0);
     }
 
     /// Direct-path stream: multi-frame bulk write echoes back intact, and a
