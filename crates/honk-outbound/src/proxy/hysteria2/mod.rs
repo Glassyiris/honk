@@ -633,6 +633,7 @@ impl Hysteria2Handler {
                     stream_receive_window: node.hy2_init_stream_recv_window,
                     conn_receive_window: node.hy2_init_conn_recv_window,
                     disable_mtu_discovery: node.hy2_disable_mtu_discovery == Some(true),
+                    max_udp_payload_size: node.quic_mtu,
                 },
             )
             .await?;

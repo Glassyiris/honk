@@ -13,7 +13,16 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
-use super::shadowsocks::{AeadCipher, RELAY_BATCH, decrypt_chunks_in_place, seal_chunks_into};
+use super::shadowsocks::{
+    AeadCipher, CipherConf, RELAY_BATCH, decrypt_chunks_in_place, hkdf_sha1_derive,
+    seal_chunks_into,
+};
+
+/// Send/recv batch buffers (64KB batch + chunk/tag overhead). Sized to keep
+/// a connection under ~300KB including the control-plane relay buffers —
+/// 256KB-per-side buffers made 10k concurrent SS connections multi-GB.
+const SEND_BUF_CAP: usize = RELAY_BATCH + 8192;
+const RECV_BUF_CAP: usize = RELAY_BATCH + 8192;
 
 /// Response-prologue driver for 2022 connections: read and validate the
 /// server's salt + fixed header (+ first payload chunk) from the read
@@ -53,6 +62,7 @@ pub(crate) struct SsStream {
 }
 
 impl SsStream {
+    #[cfg(test)]
     pub(crate) fn new(
         inner: TcpStream,
         send_cipher: AeadCipher,
@@ -66,13 +76,13 @@ impl SsStream {
             read_half: Some(read_half),
             send_cipher,
             send_nonce,
-            send_buf: Vec::with_capacity(RELAY_BATCH + 8192),
+            send_buf: Vec::with_capacity(SEND_BUF_CAP),
             send_off: 0,
             recv_cipher: Some(recv_cipher),
             recv_nonce,
             recv_prologue: None,
             recv_pending_len: None,
-            recv_buf: vec![0u8; RELAY_BATCH + 8192],
+            recv_buf: vec![0u8; RECV_BUF_CAP],
             plain_start: 0,
             plain_end: 0,
             carry: 0,
@@ -94,13 +104,41 @@ impl SsStream {
             read_half: None,
             send_cipher,
             send_nonce,
-            send_buf: Vec::with_capacity(RELAY_BATCH + 8192),
+            send_buf: Vec::with_capacity(SEND_BUF_CAP),
             send_off: 0,
             recv_cipher: None,
             recv_nonce: vec![0u8; 12],
             recv_prologue: Some(recv_prologue),
             recv_pending_len: None,
-            recv_buf: vec![0u8; RELAY_BATCH + 8192],
+            recv_buf: vec![0u8; RECV_BUF_CAP],
+            plain_start: 0,
+            plain_end: 0,
+            carry: 0,
+        }
+    }
+
+    /// Legacy constructor: only the request side (salt + header chunk) is
+    /// written in `dial`; the response salt is read from the read path.
+    pub(crate) fn new_legacy(
+        inner: TcpStream,
+        send_cipher: AeadCipher,
+        send_nonce: Vec<u8>,
+        prologue: LegacyPrologue,
+    ) -> Self {
+        let (read_half, write_half) = inner.into_split();
+        let recv_prologue: PrologueFuture = Box::pin(prologue.run(read_half));
+        Self {
+            write_half,
+            read_half: None,
+            send_cipher,
+            send_nonce,
+            send_buf: Vec::with_capacity(SEND_BUF_CAP),
+            send_off: 0,
+            recv_cipher: None,
+            recv_nonce: vec![0u8; 12],
+            recv_prologue: Some(recv_prologue),
+            recv_pending_len: None,
+            recv_buf: vec![0u8; RECV_BUF_CAP],
             plain_start: 0,
             plain_end: 0,
             carry: 0,
@@ -186,7 +224,15 @@ impl AsyncRead for SsStream {
                 }
             }
             if filled == 0 && eof {
-                // EOF with no plaintext left.
+                // EOF: a truncated tail (incomplete chunk or a decrypted
+                // length without its payload) is a stream error, not a
+                // clean close.
+                if this.carry > 0 || this.recv_pending_len.is_some() {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "ss stream closed mid-chunk",
+                    )));
+                }
                 return Poll::Ready(Ok(()));
             }
             let total = this.carry + filled;
@@ -235,21 +281,55 @@ impl AsyncWrite for SsStream {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.as_mut().get_mut();
-        if this.send_off == this.send_buf.len() {
-            // Nothing pending: seal the whole caller buffer as chunks.
-            this.send_buf.clear();
-            this.send_off = 0;
-            seal_chunks_into(
-                &this.send_cipher,
-                &mut this.send_nonce,
-                buf,
-                &mut this.send_buf,
-            )
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        // Flush pending ciphertext first; only then take new plaintext.
+        match this.poll_flush_ciphertext(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
         }
-        while this.send_off < this.send_buf.len() {
-            let n = match Pin::new(&mut this.write_half)
-                .poll_write(cx, &this.send_buf[this.send_off..])
+        // Take as much of the caller's buffer as the batch buffer holds.
+        // Once sealed, the bytes are OWNED by the stream (they flush via
+        // poll_flush / later writes), so returning Ok(n) here honors the
+        // AsyncWrite contract — unlike the previous version, which could
+        // return Pending after already consuming plaintext (advancing the
+        // nonce and writing partial ciphertext). After the flush above the
+        // buffer is empty, so non-empty writes are always fully accepted.
+        let accepted = buf.len().min(SEND_BUF_CAP - this.send_buf.len());
+        seal_chunks_into(
+            &this.send_cipher,
+            &mut this.send_nonce,
+            &buf[..accepted],
+            &mut this.send_buf,
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        // Best-effort immediate flush; unwritten ciphertext stays buffered.
+        let _ = this.poll_flush_ciphertext(cx);
+        Poll::Ready(Ok(accepted))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.as_mut().get_mut();
+        match this.poll_flush_ciphertext(cx) {
+            Poll::Ready(Ok(())) => Pin::new(&mut this.write_half).poll_flush(cx),
+            other => other,
+        }
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.as_mut().poll_flush(cx) {
+            Poll::Ready(Ok(())) => Pin::new(&mut self.write_half).poll_shutdown(cx),
+            other => other,
+        }
+    }
+}
+
+impl SsStream {
+    /// Drive the sealed buffer toward the socket; `Ok(())` means fully
+    /// drained (buffer reset).
+    fn poll_flush_ciphertext(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while self.send_off < self.send_buf.len() {
+            let n = match Pin::new(&mut self.write_half)
+                .poll_write(cx, &self.send_buf[self.send_off..])
             {
                 Poll::Ready(Ok(0)) => {
                     return Poll::Ready(Err(io::Error::new(
@@ -261,42 +341,35 @@ impl AsyncWrite for SsStream {
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             };
-            this.send_off += n;
+            self.send_off += n;
         }
-        // Fully flushed: reset for the next write.
-        this.send_buf.clear();
-        this.send_off = 0;
-        Poll::Ready(Ok(buf.len()))
+        self.send_buf.clear();
+        self.send_off = 0;
+        Poll::Ready(Ok(()))
     }
+}
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let this = self.as_mut().get_mut();
-        while this.send_off < this.send_buf.len() {
-            let n = match Pin::new(&mut this.write_half)
-                .poll_write(cx, &this.send_buf[this.send_off..])
-            {
-                Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "ss stream flush write zero",
-                    )));
-                }
-                Poll::Ready(Ok(n)) => n,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            };
-            this.send_off += n;
-        }
-        this.send_buf.clear();
-        this.send_off = 0;
-        Pin::new(&mut this.write_half).poll_flush(cx)
-    }
+/// Legacy response prologue: read the server's salt (may be delayed until
+/// the first target payload — hence read from the read path, not `dial`).
+pub(crate) struct LegacyPrologue {
+    pub(crate) conf: CipherConf,
+    pub(crate) master_key: Vec<u8>,
+    pub(crate) method: String,
+}
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.as_mut().poll_flush(cx) {
-            Poll::Ready(Ok(())) => Pin::new(&mut self.write_half).poll_shutdown(cx),
-            other => other,
-        }
+impl LegacyPrologue {
+    async fn run(
+        self,
+        mut read_half: OwnedReadHalf,
+    ) -> io::Result<(OwnedReadHalf, AeadCipher, Vec<u8>, Vec<u8>)> {
+        let mut recv_salt = vec![0u8; self.conf.salt_len];
+        read_half.read_exact(&mut recv_salt).await?;
+        let mut recv_subkey = vec![0u8; self.conf.key_len];
+        hkdf_sha1_derive(&self.master_key, &recv_salt, &mut recv_subkey);
+        let recv_cipher = AeadCipher::new(&self.method, &recv_subkey)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let recv_nonce = vec![0u8; self.conf.nonce_len];
+        Ok((read_half, recv_cipher, recv_nonce, Vec::new()))
     }
 }
 
@@ -375,4 +448,264 @@ pub(crate) async fn write_all_sealed(
     seal_chunks_into(cipher, nonce, payload, &mut out)?;
     inner.write_all(&out).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proxy::shadowsocks::{CipherConf, ShadowsocksHandler, hkdf_sha1_derive};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const METHOD: &str = "aes-128-gcm";
+    const PASSWORD: &str = "test-password";
+
+    fn ciphers(master: &[u8], c2s_salt: &[u8], s2c_salt: &[u8]) -> (AeadCipher, AeadCipher) {
+        let conf = CipherConf::for_method(METHOD).unwrap();
+        let mut c2s_subkey = vec![0u8; conf.key_len];
+        hkdf_sha1_derive(master, c2s_salt, &mut c2s_subkey);
+        let mut s2c_subkey = vec![0u8; conf.key_len];
+        hkdf_sha1_derive(master, s2c_salt, &mut s2c_subkey);
+        (
+            AeadCipher::new(METHOD, &c2s_subkey).unwrap(),
+            AeadCipher::new(METHOD, &s2c_subkey).unwrap(),
+        )
+    }
+
+    fn legacy_stream(
+        server: TcpStream,
+        send_cipher: AeadCipher,
+        recv_cipher: AeadCipher,
+    ) -> SsStream {
+        SsStream::new(
+            server,
+            send_cipher,
+            vec![0u8; 12],
+            recv_cipher,
+            vec![0u8; 12],
+        )
+    }
+
+    /// AsyncWrite contract: a peer that accepts only a few bytes at a time
+    /// (forcing Pending flushes) must still receive a byte-exact stream,
+    /// and a write issued after a Pending must not lose or duplicate data.
+    #[tokio::test]
+    async fn poll_write_contract_under_backpressure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let conf = CipherConf::for_method(METHOD).unwrap();
+        let master = ShadowsocksHandler::master_key(PASSWORD, conf.key_len);
+        let c2s_salt = vec![7u8; conf.salt_len];
+        let s2c_salt = vec![9u8; conf.salt_len];
+        let (send_cipher, peer_read_cipher) = ciphers(&master, &c2s_salt, &s2c_salt);
+
+        let peer_master = master.clone();
+        let peer_salt = c2s_salt.clone();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Slow reader: tiny reads with a delay so the writer's flush
+            // path repeatedly hits Pending.
+            let mut plain_seen = Vec::new();
+            let mut buf = vec![0u8; 4096];
+            let mut carry = 0usize;
+            let mut pending_len = None;
+            let mut nonce = vec![0u8; 12];
+            let conf = CipherConf::for_method(METHOD).unwrap();
+            let m = ShadowsocksHandler::master_key(PASSWORD, conf.key_len);
+            let mut subkey = vec![0u8; conf.key_len];
+            hkdf_sha1_derive(&m, &peer_salt, &mut subkey);
+            let read_cipher = AeadCipher::new(METHOD, &subkey).unwrap();
+            loop {
+                let n = sock.read(&mut buf[carry..carry + 977]).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                let total = carry + n;
+                let (out_len, rest) = decrypt_chunks_in_place(
+                    &read_cipher,
+                    &mut nonce,
+                    &mut pending_len,
+                    &mut buf,
+                    total,
+                    conf.tag_len,
+                )
+                .unwrap();
+                plain_seen.extend_from_slice(&buf[..out_len]);
+                if rest > 0 {
+                    buf.copy_within(out_len..out_len + rest, 0);
+                }
+                carry = rest;
+                if plain_seen.len() >= 300_000 {
+                    break;
+                }
+            }
+            let _ = peer_master;
+            let expected: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+            assert_eq!(plain_seen, expected);
+        });
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        let mut stream = legacy_stream(client, send_cipher, peer_read_cipher);
+        let payload: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        // Many writes of varying size; write_all retries transparently.
+        let mut off = 0;
+        for chunk in [100_000usize, 1, 77, 150_000, 49_922] {
+            let end = (off + chunk).min(payload.len());
+            stream.write_all(&payload[off..end]).await.unwrap();
+            off = end;
+        }
+        assert_eq!(off, payload.len());
+        stream.flush().await.unwrap();
+        drop(stream);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+
+    /// Legacy AEAD: a server that sends its response salt only AFTER the
+    /// first client payload chunk (the strictest valid behavior) must not
+    /// deadlock dial() and must receive that first chunk.
+    #[tokio::test]
+    async fn legacy_deferred_response_salt() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let conf = CipherConf::for_method(METHOD).unwrap();
+        let _master = ShadowsocksHandler::master_key(PASSWORD, conf.key_len);
+
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let m = ShadowsocksHandler::master_key(PASSWORD, conf.key_len);
+            // Client salt, then the header chunk (sealed).
+            let mut c2s_salt = vec![0u8; conf.salt_len];
+            sock.read_exact(&mut c2s_salt).await.unwrap();
+            let mut subkey = vec![0u8; conf.key_len];
+            hkdf_sha1_derive(&m, &c2s_salt, &mut subkey);
+            let c2s_cipher = AeadCipher::new(METHOD, &subkey).unwrap();
+            let mut c2s_nonce = vec![0u8; conf.nonce_len];
+
+            // Read until BOTH the header chunk and the first payload chunk
+            // have arrived (they may share one TCP segment).
+            let mut buf = vec![0u8; 8192];
+            let mut carry = 0usize;
+            let mut pending_len = None;
+            let mut plain_seen: Vec<u8> = Vec::new();
+            let header_len = 4usize; // "t:80"
+            while plain_seen.len() < header_len + 4 {
+                let n = sock.read(&mut buf[carry..]).await.unwrap();
+                if n == 0 {
+                    panic!("client closed before first payload");
+                }
+                let total = carry + n;
+                let (out_len, rest) = decrypt_chunks_in_place(
+                    &c2s_cipher,
+                    &mut c2s_nonce,
+                    &mut pending_len,
+                    &mut buf,
+                    total,
+                    conf.tag_len,
+                )
+                .unwrap();
+                plain_seen.extend_from_slice(&buf[..out_len]);
+                if rest > 0 {
+                    buf.copy_within(out_len..out_len + rest, 0);
+                }
+                carry = rest;
+            }
+            assert_eq!(&plain_seen[..header_len], b"t:80");
+            assert_eq!(&plain_seen[header_len..header_len + 4], b"ping");
+            sock.write_all(&[9u8; 16]).await.unwrap();
+            let mut s2c_subkey = vec![0u8; conf.key_len];
+            hkdf_sha1_derive(&m, &[9u8; 16], &mut s2c_subkey);
+            let s2c_cipher = AeadCipher::new(METHOD, &s2c_subkey).unwrap();
+            let mut s2c_nonce = vec![0u8; conf.nonce_len];
+            let mut sealed = Vec::new();
+            seal_chunks_into(&s2c_cipher, &mut s2c_nonce, b"pong", &mut sealed).unwrap();
+            sock.write_all(&sealed).await.unwrap();
+        });
+
+        let node_server = TcpStream::connect(addr).await.unwrap();
+        let send_master = ShadowsocksHandler::master_key(PASSWORD, conf.key_len);
+        let c2s_salt = vec![7u8; conf.salt_len];
+        let mut send_subkey = vec![0u8; conf.key_len];
+        hkdf_sha1_derive(&send_master, &c2s_salt, &mut send_subkey);
+        let send_cipher = AeadCipher::new(METHOD, &send_subkey).unwrap();
+
+        let mut server = node_server;
+        server.write_all(&c2s_salt).await.unwrap();
+        let mut send_nonce = vec![0u8; conf.nonce_len];
+        write_all_sealed(&mut server, &send_cipher, &mut send_nonce, b"t:80")
+            .await
+            .unwrap();
+
+        let prologue = LegacyPrologue {
+            conf,
+            master_key: send_master,
+            method: METHOD.to_string(),
+        };
+        // Emulate the handler's legacy dial tail.
+        let (read_half, write_half) = server.into_split();
+        let mut stream = SsStream {
+            write_half,
+            read_half: None,
+            send_cipher,
+            send_nonce,
+            send_buf: Vec::with_capacity(SEND_BUF_CAP),
+            send_off: 0,
+            recv_cipher: None,
+            recv_nonce: vec![0u8; 12],
+            recv_prologue: Some(Box::pin(prologue.run(read_half))),
+            recv_pending_len: None,
+            recv_buf: vec![0u8; RECV_BUF_CAP],
+            plain_start: 0,
+            plain_end: 0,
+            carry: 0,
+        };
+        // The payload goes out BEFORE the server salt exists anywhere.
+        stream.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_exact(&mut buf),
+        )
+        .await
+        .expect("response timed out")
+        .unwrap();
+        assert_eq!(&buf, b"pong");
+    }
+
+    /// EOF with a truncated chunk tail is UnexpectedEof, not a clean close.
+    #[tokio::test]
+    async fn truncated_tail_is_unexpected_eof() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let conf = CipherConf::for_method(METHOD).unwrap();
+        let master = ShadowsocksHandler::master_key(PASSWORD, conf.key_len);
+        let c2s_salt = vec![7u8; conf.salt_len];
+        let s2c_salt = vec![9u8; conf.salt_len];
+        let (send_cipher, peer_read_cipher) = ciphers(&master, &c2s_salt, &s2c_salt);
+
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            // Close immediately after a partial write (garbage tail).
+            drop(sock);
+        });
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        let mut stream = legacy_stream(client, send_cipher, peer_read_cipher);
+        // Manually place a truncated chunk into the recv path: seal a chunk
+        // with the peer's cipher, feed only half of it via the socket.
+        let mut sealed = Vec::new();
+        let peer_master = ShadowsocksHandler::master_key(PASSWORD, conf.key_len);
+        let mut sub = vec![0u8; conf.key_len];
+        hkdf_sha1_derive(&peer_master, &s2c_salt, &mut sub);
+        let s2c = AeadCipher::new(METHOD, &sub).unwrap();
+        let mut nonce = vec![0u8; 12];
+        seal_chunks_into(&s2c, &mut nonce, b"hello-tail", &mut sealed).unwrap();
+        stream.recv_buf[..sealed.len() / 2].copy_from_slice(&sealed[..sealed.len() / 2]);
+        stream.carry = sealed.len() / 2;
+        let mut buf = [0u8; 64];
+        let err = stream
+            .read(&mut buf)
+            .await
+            .expect_err("must fail on truncated tail");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
 }

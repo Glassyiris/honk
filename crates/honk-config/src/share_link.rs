@@ -288,14 +288,20 @@ impl Node {
             }
         }
 
-        // QUIC payload-size cap (`mtu=`, hy2/tuic/juicity): default 1252
-        // (PMTU-safe); raise on paths known to carry bigger datagrams.
+        // QUIC payload-size cap (`mtu=`, hy2/tuic/juicity): 1200..=65527,
+        // out-of-range values dropped at parse time (clamped downstream).
         if matches!(
             protocol,
             NodeProtocol::Hysteria2 | NodeProtocol::Tuic | NodeProtocol::Juicity
         ) && let Some(v) = query.get("mtu")
         {
-            node.quic_mtu = v.parse().ok();
+            // Out-of-range values are dropped at parse time (clamped
+            // downstream as well).
+            if let Ok(mtu) = v.parse::<u16>()
+                && (1200..=65527).contains(&mtu)
+            {
+                node.quic_mtu = Some(mtu);
+            }
         }
 
         if protocol == NodeProtocol::Tuic {

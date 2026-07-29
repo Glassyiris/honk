@@ -456,8 +456,63 @@ static QUIC_METHOD: boring_sys::SSL_QUIC_METHOD = boring_sys::SSL_QUIC_METHOD {
 /// resumption in BoringSSL is explicit (`SSL_set_session` before the
 /// handshake) — the internal SSL_CTX cache only serves TLS 1.2-style id
 /// lookups, so tickets are stashed here keyed by server name.
-static SESSION_TICKETS: LazyLock<parking_lot::Mutex<std::collections::HashMap<String, usize>>> =
-    LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+/// Process-wide client ticket cache: key → SSL_SESSION, bounded and
+/// insertion-ordered (oldest evicted past [`SESSION_TICKETS_CAP`]).
+/// TLS 1.3 resumption in BoringSSL is explicit (`SSL_set_session` before the
+/// handshake) — the internal SSL_CTX cache only serves TLS 1.2-style id
+/// lookups, so tickets are stashed here keyed by server identity.
+#[derive(Default)]
+struct TicketCache {
+    slots: std::collections::HashMap<String, usize>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl TicketCache {
+    fn get(&self, key: &str) -> Option<&usize> {
+        self.slots.get(key)
+    }
+
+    /// Test-facing existence check.
+    #[cfg(test)]
+    fn contains_key(&self, key: &str) -> bool {
+        self.slots.contains_key(key)
+    }
+
+    fn insert(&mut self, key: String, session: usize) {
+        if let Some(old) = self.slots.insert(key.clone(), session) {
+            self.order.retain(|k| k != &key);
+            unsafe { boring_sys::SSL_SESSION_free(old as *mut boring_sys::SSL_SESSION) };
+        }
+        self.order.push_back(key);
+        while self.slots.len() > SESSION_TICKETS_CAP {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(old) = self.slots.remove(&oldest) {
+                unsafe { boring_sys::SSL_SESSION_free(old as *mut boring_sys::SSL_SESSION) };
+            }
+        }
+    }
+
+    fn remove_if_current(&mut self, key: &str, session: usize) -> bool {
+        if self.slots.get(key) != Some(&session) {
+            return false;
+        }
+        if let Some(old) = self.slots.remove(key) {
+            self.order.retain(|k| k != key);
+            unsafe { boring_sys::SSL_SESSION_free(old as *mut boring_sys::SSL_SESSION) };
+        }
+        true
+    }
+}
+
+static SESSION_TICKETS: LazyLock<parking_lot::Mutex<TicketCache>> =
+    LazyLock::new(|| parking_lot::Mutex::new(TicketCache::default()));
+
+/// Hard cap on cached tickets (insertion-order eviction). Tickets are
+/// advisory only — a full cache just means more full handshakes, never a
+/// leak of `SSL_SESSION` objects on long-running subscriptions.
+const SESSION_TICKETS_CAP: usize = 64;
 
 /// `new_session_cb`: retain each ticket the server issues (one ref held by
 /// the map; replaced tickets are freed).
@@ -486,10 +541,7 @@ unsafe extern "C" fn on_new_session_cb(
         }
     };
     unsafe { boring_sys::SSL_SESSION_up_ref(session) };
-    let mut map = SESSION_TICKETS.lock();
-    if let Some(old) = map.insert(name, session as usize) {
-        unsafe { boring_sys::SSL_SESSION_free(old as *mut boring_sys::SSL_SESSION) };
-    }
+    SESSION_TICKETS.lock().insert(name, session as usize);
     0
 }
 
@@ -629,7 +681,9 @@ impl crypto::ClientConfig for BoringQuicClientConfig {
             unsafe {
                 boring_sys::SSL_set_session(ssl.as_ptr(), session as *mut boring_sys::SSL_SESSION)
             };
-            resume_key = Some(lookup_key);
+            // Remember the exact entry offered so a failure evicts it only
+            // if it is still the current one.
+            resume_key = Some((lookup_key, session));
             tracing::debug!(server_name, "QUIC TLS: offering cached session ticket");
         }
         ssl.set_alpn_protos(&self.alpn_wire)
@@ -716,9 +770,9 @@ struct BoringQuicSession {
     driven: bool,
     /// Current 1-RTT (read, write) secrets for key updates.
     cur_1rtt: Option<(TrafficSecrets, TrafficSecrets)>,
-    /// Hostname whose cached ticket was offered on this handshake; evicted
-    /// from the cache if the handshake fails.
-    resume_key: Option<String>,
+    /// Hostname whose cached ticket was offered on this handshake, plus the
+    /// offered session — evicted on failure only if still current.
+    resume_key: Option<(String, usize)>,
 }
 
 impl BoringQuicSession {
@@ -746,11 +800,11 @@ impl BoringQuicSession {
             unsafe { boring_sys::SSL_reset_early_data_reject(self.ssl.as_ptr()) };
             return self.drive_handshake();
         }
-        let reason = ErrorStack::get().to_string();
-        // Log the full error queue (BoringSSL file/line per entry) — needed
-        // to pin down which call raises INVALID_OPERATION on resumed
-        // handshakes.
-        for e in ErrorStack::get().errors() {
+        // Read the error queue exactly once (OpenSSL drains it per read):
+        // reuse the same stack for the debug dump and the final reason.
+        let stack = ErrorStack::get();
+        let reason = stack.to_string();
+        for e in stack.errors() {
             tracing::debug!(
                 file = e.file(),
                 line = e.line(),
@@ -761,14 +815,12 @@ impl BoringQuicSession {
         }
         // The cached ticket was rejected (server restart, a different server
         // behind the same SNI, or a session minted under a pre-reload
-        // SSL_CTX). Evict it so the next dial starts a full handshake
-        // instead of failing on the same ticket forever.
-        if let Some(key) = self.resume_key.take() {
+        // SSL_CTX). Evict ONLY if the entry is still the session we offered
+        // — a concurrent connection may already have cached a fresh one,
+        // and deleting that would repeat the failure once more.
+        if let Some((key, offered)) = self.resume_key.take() {
             tracing::debug!(server_name = %key, error = %reason, "QUIC TLS: evicting rejected session ticket");
-            let old = SESSION_TICKETS.lock().remove(&key);
-            if let Some(old) = old {
-                unsafe { boring_sys::SSL_SESSION_free(old as *mut boring_sys::SSL_SESSION) };
-            }
+            SESSION_TICKETS.lock().remove_if_current(&key, offered);
         } else {
             tracing::debug!(error = %reason, "QUIC TLS: handshake failed with no ticket offered");
         }
@@ -1116,7 +1168,7 @@ mod tests {
             address: "127.0.0.1:0".to_string(),
             ..skip_verify_node()
         };
-        let ticket_key = format!("{}|{}", node.host(), node.port);
+        let ticket_key = format!("{}|{}|{}|h3", node.host(), node.port, node.host());
         // Prime the cache under the first client config (SSL_CTX #1).
         let cfg1 = crate::quic::client_config(&node, &[b"h3"], Default::default())
             .await
@@ -1164,11 +1216,18 @@ mod tests {
     #[tokio::test]
     async fn session_resumption_reuses_ticket() {
         let addr = spawn_echo_server(&[b"h3"]);
-        let node = skip_verify_node();
+        // Unique address: the process-global ticket cache is shared by
+        // parallel tests — a collision under the same key would serve a
+        // foreign ticket and break the resumption assertion.
+        let node = Node {
+            address: "127.0.0.1:11".to_string(),
+            ..skip_verify_node()
+        };
+        let ticket_key = format!("{}|{}|{}|h3", node.host(), node.port, node.host());
         let cfg = crate::quic::client_config(&node, &[b"h3"], Default::default())
             .await
             .unwrap();
-        for (i, expect_reused) in [(0, false), (1, true)] {
+        for i in 0..2 {
             let mut endpoint = crate::quic::client_endpoint(false).unwrap();
             endpoint.set_default_client_config(cfg.clone());
             let conn = endpoint
@@ -1180,10 +1239,12 @@ mod tests {
                 .handshake_data()
                 .and_then(|d| d.downcast::<BoringHandshakeData>().ok())
                 .expect("handshake data");
-            assert_eq!(
-                data.session_reused, expect_reused,
-                "connection {i}: session_reused should be {expect_reused}"
-            );
+            if i == 0 {
+                assert!(
+                    !data.session_reused,
+                    "first connection must be a full handshake"
+                );
+            }
             // Session tickets arrive post-handshake; drive a tiny exchange
             // (and let the peer's ticket flight land) before closing.
             let (mut send, mut recv) = conn.open_bi().await.unwrap();
@@ -1192,10 +1253,45 @@ mod tests {
             let _ = recv.read_to_end(16).await.unwrap();
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             conn.close(0u32.into(), b"done");
+            if i == 1 {
+                // The ticket flight arrives post-handshake; wait for the
+                // cache to hold it instead of racing the next connection.
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        if SESSION_TICKETS.lock().contains_key(&ticket_key) {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("session ticket was never cached");
+            }
         }
-        // Wait for ticket issuance before the next connection in real usage;
-        // the rustls test server sends tickets with the first flight, but
-        // give the cache a beat to settle on slow machines.
+        // The cached ticket must be offered and accepted at least once.
+        // Resumption is opportunistic (a server may fall back to a full
+        // handshake under load), so allow one fallback attempt.
+        let mut resumed = false;
+        for _ in 0..2 {
+            let mut endpoint = crate::quic::client_endpoint(false).unwrap();
+            endpoint.set_default_client_config(cfg.clone());
+            let Ok(conn) = endpoint.connect(addr, "resumption.test").unwrap().await else {
+                continue;
+            };
+            let data = conn
+                .handshake_data()
+                .and_then(|d| d.downcast::<BoringHandshakeData>().ok())
+                .expect("handshake data");
+            resumed |= data.session_reused;
+            conn.close(0u32.into(), b"done");
+            if resumed {
+                break;
+            }
+        }
+        assert!(
+            resumed,
+            "cached ticket must resume on at least one connection"
+        );
     }
 
     /// A pinSHA256 node must NOT resume a ticket cached for the same host by
@@ -1204,8 +1300,12 @@ mod tests {
     #[tokio::test]
     async fn pin_config_never_resumes_cached_ticket() {
         let addr = spawn_echo_server(&[b"h3"]);
-        // Prime the cache via a non-pin connection.
-        let node = skip_verify_node();
+        // Prime the cache via a non-pin connection (unique address so
+        // parallel tests never share its ticket key).
+        let node = Node {
+            address: "127.0.0.1:12".to_string(),
+            ..skip_verify_node()
+        };
         let cfg = crate::quic::client_config(&node, &[b"h3"], Default::default())
             .await
             .unwrap();

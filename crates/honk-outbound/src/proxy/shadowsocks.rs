@@ -34,7 +34,7 @@ use sha1::Sha1;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tracing::debug;
 
@@ -349,8 +349,10 @@ impl ShadowsocksHandler {
             let master_key = Self::master_key(password, conf.key_len);
             let mut server = server;
 
-            // Legacy prologue: send salt, header in the first sealed chunk,
-            // then read the response salt.
+            // Legacy prologue: send salt and the header chunk, then return.
+            // The response salt is read from the read path (2022 parity) —
+            // servers may delay it until the first target payload, so
+            // reading it here would deadlock dial().
             let mut send_salt = vec![0u8; conf.salt_len];
             rand::rng().fill_bytes(&mut send_salt);
             let mut send_subkey = vec![0u8; conf.key_len];
@@ -367,19 +369,16 @@ impl ShadowsocksHandler {
             )
             .await?;
 
-            let mut recv_salt = vec![0u8; conf.salt_len];
-            server.read_exact(&mut recv_salt).await?;
-            let mut recv_subkey = vec![0u8; conf.key_len];
-            hkdf_sha1_derive(&master_key, &recv_salt, &mut recv_subkey);
-            let recv_cipher = AeadCipher::new(method, &recv_subkey)?;
-            let recv_nonce = vec![0u8; conf.nonce_len];
-
-            Box::new(crate::proxy::ss_stream::SsStream::new(
+            let prologue = crate::proxy::ss_stream::LegacyPrologue {
+                conf,
+                master_key,
+                method: method.to_string(),
+            };
+            Box::new(crate::proxy::ss_stream::SsStream::new_legacy(
                 server,
                 send_cipher,
                 send_nonce,
-                recv_cipher,
-                recv_nonce,
+                prologue,
             ))
         };
         Ok(ProxyStream {
@@ -642,10 +641,10 @@ where
     Ok(())
 }
 
-/// Steady-state relay read batch (256KB): one client read + one server
-/// write per batch, chunk-sealed in place — no per-chunk allocations or
-/// per-chunk write syscalls (the old per-16KB loop capped ~0.9Gbps).
-pub(crate) const RELAY_BATCH: usize = 256 * 1024;
+/// Steady-state relay read batch (64KB = 4 chunks): batched seal/decrypt
+/// without the per-connection memory cost of the old 256KB draft — see
+/// ss_stream.rs for why it is not larger.
+pub(crate) const RELAY_BATCH: usize = 64 * 1024;
 
 /// Seal `payload` as Shadowsocks chunks into `out` (cleared first). One
 /// allocation-free pass in steady state.
@@ -874,6 +873,7 @@ async fn shadowsocks_udp_bridge(
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, SocketAddrV4};
+    use tokio::io::AsyncReadExt;
 
     #[test]
     fn test_evp_bytes_to_key() {

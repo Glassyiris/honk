@@ -471,6 +471,7 @@ impl TuicHandler {
             )),
             stream_receive_window: Some(node.tuic_init_stream_recv_window.unwrap_or(8 << 20)),
             conn_receive_window: node.tuic_init_conn_recv_window,
+            max_udp_payload_size: node.quic_mtu,
             ..Default::default()
         };
         crate::quic::cached_client(&CLIENTS, key, || async move {
@@ -704,7 +705,11 @@ impl ProxyHandler for TuicHandler {
                     let wait = (2 * conn.rtt()).max(Duration::from_millis(2));
                     tokio::select! {
                         _ = conn.closed() => false,
-                        _ = tokio::time::sleep(wait) => true,
+                        _ = tokio::time::sleep(wait) => {
+                            // Re-check after the wait: a close racing the
+                            // sleep may not have won the select.
+                            conn.close_reason().is_none()
+                        }
                     }
                 }
                 Err(_) => false,

@@ -187,6 +187,7 @@ impl JuicityHandler {
                 &[b"h3"],
                 crate::quic::QuicClientOptions {
                     keep_alive: Some(KEEP_ALIVE_INTERVAL),
+                    max_udp_payload_size: node.quic_mtu,
                     ..crate::quic::QuicClientOptions::with_congestion(Some("bbr"))
                 },
             )
@@ -402,7 +403,11 @@ impl ProxyHandler for JuicityHandler {
                     let wait = (2 * conn.rtt()).max(Duration::from_millis(2));
                     tokio::select! {
                         _ = conn.closed() => false,
-                        _ = tokio::time::sleep(wait) => true,
+                        _ = tokio::time::sleep(wait) => {
+                            // Re-check after the wait (tuic parity): a close
+                            // racing the sleep may not have won the select.
+                            conn.close_reason().is_none()
+                        }
                     }
                 }
                 Err(_) => false,

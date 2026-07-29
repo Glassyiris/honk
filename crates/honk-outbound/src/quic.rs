@@ -178,6 +178,11 @@ pub struct QuicClientOptions {
     pub conn_receive_window: Option<u64>,
     /// Disable QUIC path MTU discovery.
     pub disable_mtu_discovery: bool,
+    /// UDP payload size (NOT link MTU): applied as the send-side
+    /// `initial_mtu` and the PMTUD upper bound; the endpoint's
+    /// `max_udp_payload_size` (receive advertisement) is set separately by
+    /// the protocol handler from the same node field.
+    pub max_udp_payload_size: Option<u16>,
 }
 
 impl QuicClientOptions {
@@ -227,12 +232,19 @@ pub async fn client_config(
                 .tls_pin_sha256
                 .as_deref()
                 .and_then(crate::tls::parse_pin_sha256),
-            // Tickets belong to a server, not a hostname: different protocols
-            // (and different servers) sharing an SNI must never cross-resume.
+            // Tickets belong to a specific service, not a hostname:
+            // address|port|SNI|ALPN — different protocols, different
+            // servers behind one certificate, and reloaded configs never
+            // cross-resume into each other.
             ticket_key: Some(format!(
-                "{}|{}",
-                node.sni.clone().unwrap_or_else(|| node.host().to_string()),
+                "{}|{}|{}|{}",
+                node.host(),
                 node.port,
+                node.sni.clone().unwrap_or_else(|| node.host().to_string()),
+                alpn.iter()
+                    .map(|p| String::from_utf8_lossy(p).into_owned())
+                    .collect::<Vec<_>>()
+                    .join(","),
             )),
         })?;
     let mut cfg = ClientConfig::new(Arc::new(crypto));
@@ -253,6 +265,18 @@ pub async fn client_config(
     }
     if let Some(w) = options.conn_receive_window {
         transport.receive_window(VarInt::from_u64(w)?);
+    }
+    if let Some(mtu) = options.max_udp_payload_size {
+        // UDP payload size, not link MTU. Valid range per RFC 9000 (initial
+        // packets must carry 1200) and quinn's cap; invalid values are
+        // clamped rather than failing the first dial later.
+        let mtu = mtu.clamp(1200, 65527);
+        transport.initial_mtu(mtu);
+        if !options.disable_mtu_discovery {
+            let mut mtud = quinn::MtuDiscoveryConfig::default();
+            mtud.upper_bound(mtu);
+            transport.mtu_discovery_config(Some(mtud));
+        }
     }
     if options.disable_mtu_discovery {
         transport.mtu_discovery_config(None);
