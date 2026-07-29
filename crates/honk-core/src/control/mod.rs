@@ -92,6 +92,9 @@ pub struct ControlPlane {
     dns_resolver: Arc<DnsResolver>,
     dns_controller: Arc<crate::control::dns_control::DnsController>,
     group_manager: SharedGroupManager,
+    /// Per-node runtime ownership (v3.1 phase 2A): the single owner of
+    /// every outbound's session-layer resources, keyed by Node.id.
+    runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
     stats: Arc<StatsManager>,
     drain_tracker: Arc<DrainTracker>,
     udp_pool: Arc<UdpEndpointPool>,
@@ -182,6 +185,13 @@ impl ControlPlane {
         // they currently select, and the tag keeps the result. The cell
         // keeps working across reloads (the manager inside is swapped).
         let group_manager = group_manager.into_shared();
+        // Per-node runtime registry (single owner of session-layer
+        // resources, keyed by Node.id). Invalid node sets (nil/duplicate
+        // UUIDs) are a fatal config error at startup.
+        let runtime_registry =
+            honk_outbound::runtime::OutboundRuntimeRegistry::build(&config.nodes)
+                .map_err(|e| anyhow::anyhow!("invalid node set: {}", e))?
+                .into_shared();
         {
             let gm_cell = group_manager.clone();
             alive_set.set_url_member_resolver(Some(Arc::new(move |group: &str| {
@@ -244,6 +254,7 @@ impl ControlPlane {
             dns_resolver,
             dns_controller,
             group_manager,
+            runtime_registry,
             stats: Arc::new(StatsManager::new()),
             drain_tracker: Arc::new(DrainTracker::new()),
             udp_pool: Arc::new(UdpEndpointPool::new()),
@@ -407,6 +418,11 @@ impl ControlPlane {
 
     pub fn proxy_registry(&self) -> Arc<ProxyRegistry> {
         self.proxy_registry.clone()
+    }
+
+    /// Shared per-node runtime registry (session-layer ownership).
+    pub fn runtime_registry(&self) -> honk_outbound::runtime::SharedRuntimeRegistry {
+        self.runtime_registry.clone()
     }
 
     /// Shared handle to the DNS response cache (used by the clash API

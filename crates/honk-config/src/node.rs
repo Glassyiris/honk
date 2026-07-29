@@ -30,7 +30,7 @@ where
 use crate::types::NodeProtocol;
 
 /// A proxy node definition.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
     #[serde(default = "uuid::Uuid::new_v4")]
     pub id: uuid::Uuid,
@@ -187,6 +187,69 @@ pub struct Node {
 
 fn default_transport() -> String {
     "tcp".to_string()
+}
+
+impl Default for Node {
+    /// serde's `id` field default (new_v4) must hold for every
+    /// construction path — the runtime registry keys on `Node.id`, and
+    /// the derive-Default nil UUID would break it (e.g. the built-in
+    /// `direct` node).
+    fn default() -> Self {
+        Self {
+            id: uuid::Uuid::new_v4(),
+            name: String::new(),
+            protocol: NodeProtocol::default(),
+            address: String::new(),
+            host: String::new(),
+            port: 0,
+            username: None,
+            password: None,
+            encryption: None,
+            plugin: None,
+            plugin_opts: None,
+            transport: default_transport(),
+            tls: false,
+            sni: None,
+            skip_cert_verify: false,
+            ech_enabled: false,
+            ech_config: None,
+            ech_config_path: None,
+            network: None,
+            ws_path: None,
+            ws_host: None,
+            grpc_service: None,
+            hy2_auth: None,
+            hy2_obfs: None,
+            hy2_up_mbps: None,
+            hy2_down_mbps: None,
+            hy2_port_hopping: None,
+            hy2_hop_interval: None,
+            tls_pin_sha256: None,
+            hy2_init_stream_recv_window: None,
+            hy2_init_conn_recv_window: None,
+            hy2_disable_mtu_discovery: None,
+            quic_mtu: None,
+            tuic_uuid: None,
+            tuic_password: None,
+            tuic_congestion: None,
+            tuic_alpn: None,
+            tuic_init_stream_recv_window: None,
+            tuic_init_conn_recv_window: None,
+            juicity_uuid: None,
+            juicity_password: None,
+            anytls_password: None,
+            anytls_min_idle_session: None,
+            anytls_idle_session_check_interval: None,
+            anytls_idle_session_timeout: None,
+            mux: false,
+            mark: None,
+            tags: Vec::new(),
+            subscription_id: None,
+            group_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
 }
 
 impl Node {

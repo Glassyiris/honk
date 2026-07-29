@@ -52,6 +52,17 @@ impl ControlPlane {
             }
         };
         let new_outbound_id_map = build_outbound_id_map(&new_config);
+        // Per-node runtime registry for the next generation; invalid node
+        // sets (nil/duplicate UUIDs) abort the reload untouched.
+        let new_runtime_registry =
+            match honk_outbound::runtime::OutboundRuntimeRegistry::build(&new_config.nodes) {
+                Ok(r) => r,
+                Err(e) => {
+                    error!("Failed to build runtime registry (reload aborted): {}", e);
+                    drain.stop_rejecting();
+                    return;
+                }
+            };
         let bootstrap = new_config.global.bootstrap_resolver.clone();
         let direct_target = super::direct_check_addr(&bootstrap);
 
@@ -88,6 +99,12 @@ impl ControlPlane {
         // Rebuild the GroupManager (reads the just-swapped config; migrates
         // runtime selector choices) and refresh health-check registrations.
         self.reload_group_manager().await;
+        // Swap the runtime registry and shut the old generation's down.
+        let old_registry = std::mem::replace(
+            &mut *self.runtime_registry.write(),
+            Arc::new(new_runtime_registry),
+        );
+        old_registry.shutdown();
         // Rebuild learned domain→IP routes with the new rule-index bitmaps.
         self.dns_controller.rebuild_domain_routes().await;
         info!("Configuration applied — {} routes active", route_count);

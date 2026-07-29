@@ -200,7 +200,13 @@ impl Drop for StreamRegistration {
         if self.committed {
             return;
         }
-        let was_registered = self.session.streams.lock().unwrap().remove(&self.sid).is_some();
+        let was_registered = self
+            .session
+            .streams
+            .lock()
+            .unwrap()
+            .remove(&self.sid)
+            .is_some();
         if self.counted && was_registered {
             self.session.active_streams.fetch_sub(1, Ordering::Relaxed);
         }
@@ -1414,11 +1420,8 @@ impl ProxyHandler for AnyTlsHandler {
         let mut request = vec![1u8];
         request.extend(addr::encode_address(target, target_domain));
         guard.frame_started = true;
-        let request_written = tokio::time::timeout(
-            connect_timeout,
-            session.write_uot_frame(sid, &request),
-        )
-        .await;
+        let request_written =
+            tokio::time::timeout(connect_timeout, session.write_uot_frame(sid, &request)).await;
         match request_written {
             Ok(Ok(())) => {}
             Ok(Err(e)) => return Err(e.into()),
