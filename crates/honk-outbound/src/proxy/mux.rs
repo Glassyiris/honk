@@ -1,4 +1,5 @@
-//! h2mux stream multiplexing for the stream-transport layer.
+//! h2mux stream multiplexing for the stream-transport layer —
+//! **honk h2 carrier**, not sing-mux compatible.
 //!
 //! When `node.mux` is set, the trojan/VMess/VLESS dial path upgrades its
 //! TCP (+TLS) connection to a shared HTTP/2 session and each dial opens a
@@ -6,7 +7,17 @@
 //! sing-mux's `h2mux` protocol (`mux = true` means h2mux; smux/yamux are
 //! not implemented).
 //!
-//! # Wire format (sing-mux alignment)
+//! # Compatibility (4B decision gate)
+//!
+//! honk writes the proxy handshake onto each h2 stream, while sing-mux
+//! wraps streams in its own outer handshake + per-stream `StreamRequest`.
+//! An interop gate test against an official sing-box multiplex inbound
+//! (`trojan_mux_against_sing_box`, run with `--ignored`) fails with
+//! "stream closed because of a broken pipe" — **official sing-mux
+//! inbounds reject this implementation**. Use it only with servers that
+//! follow the same honk h2-carrier convention.
+//!
+//! # Wire format
 //!
 //! - **Session header**: before the HTTP/2 client preface the client writes
 //!   the sing-mux session request `version(1) | protocol(1)` = `0x00 0x02`
@@ -475,6 +486,7 @@ impl AsyncWrite for MuxStream {
 mod tests {
     use super::*;
     use honk_config::types::NodeProtocol;
+    use std::net::SocketAddr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -773,5 +785,47 @@ mod tests {
         assert_eq!(&buf, b"pong");
 
         server.await.unwrap();
+    }
+
+    /// 4B decision gate: honk's h2mux against an **official sing-box
+    /// multiplex inbound**. honk writes the proxy handshake onto each h2
+    /// stream instead of sing-mux's outer handshake + per-stream
+    /// StreamRequest, so this tells us whether the two are compatible.
+    /// Run with:
+    ///   sing-box run -c /tmp/lab-bin/sb-mux-h2.json   # trojan+multiplex on :2448
+    ///   cargo test -p honk-outbound --lib trojan_mux_against_sing_box -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs a sing-box multiplex server on 127.0.0.1:2448"]
+    async fn trojan_mux_against_sing_box() {
+        let node = Node {
+            name: "trojan-mux".into(),
+            protocol: NodeProtocol::Trojan,
+            address: "127.0.0.1:2448".into(),
+            host: "127.0.0.1".into(),
+            port: 2448,
+            password: Some("testpass123".into()),
+            tls: true,
+            skip_cert_verify: true,
+            mux: true,
+            ..Default::default()
+        };
+        let handler = crate::proxy::trojan::TrojanHandler::new();
+        let target: SocketAddr = "127.0.0.1:8000".parse().unwrap();
+        let stream = crate::proxy::ProxyHandler::dial(&handler, &node, target, None, TEST_TIMEOUT)
+            .await
+            .expect("mux dial failed");
+        let mut stream = stream.stream;
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 512];
+        let n = stream.read(&mut buf).await.unwrap();
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            resp.contains(" 200") || resp.contains(" 301") || resp.contains(" 404"),
+            "mux request did not get an HTTP status: {}",
+            &resp[..resp.len().min(160)]
+        );
     }
 }

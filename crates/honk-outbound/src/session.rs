@@ -422,7 +422,13 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                 Step::Register(id, done) => {
                     // Pool-owned dial task: no caller's cancellation can
                     // poison it; the DialGuard is the panic backstop.
-                    let dial_fut = dial.take().expect("one dial closure")();
+                    let Some(dial_fut) = dial.take().map(|d| d()) else {
+                        // A previous Register in this very call consumed
+                        // the closure, and the freshly dialed session was
+                        // dead on arrival (pruned before it could be
+                        // offered) — fail instead of panic/re-dialing.
+                        return Err(anyhow!("session established but immediately unusable"));
+                    };
                     let task_keys = Arc::clone(&self.keys);
                     let task_key = key.to_string();
                     let failures_total = Arc::clone(&self.dial_failures_total);
