@@ -117,6 +117,20 @@ sing-box 引擎以 TUN 入口跑在客户端 netns 内(`sb-client.json`,各
 outbound 绑定 `veth-client` 使自身拨号绕出 tun);honk/dae 照旧跑在
 根命名空间。
 
+### 内联优化后复测(2026-07-29,honk dev @ edd5d8f)
+
+anytls 数据面内联(`AnyTlsStream`,取消每流 relay task/duplex)与
+ss `poll_read` 快路径(直接解密进调用方缓冲)之后:
+
+| 协议 | sing-box | honk 优化前 | honk 优化后 |
+| --- | --- | --- | --- |
+| ss2022 | 1.47 Gbps | 1.30 Gbps | **1.45 Gbps** |
+| anytls(sb server) | 3.02 Gbps | 3.12 Gbps | **3.14 Gbps** |
+| anytls(Go server) | 4.46 Gbps | 3.54 Gbps | **4.37 Gbps** |
+
+ss2022 已与 sing-box 持平(比 dae 低 4%);anytls 两种 server 都
+追平 sing-box,CPU 约 0.9 核。剩余差距:hy2 −8%、trojan −12%。
+
 ### 冷建连延迟（ms，健康检查关闭，3 次）
 
 | 协议 | dae | honk | 备注 |

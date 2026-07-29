@@ -125,6 +125,21 @@ The sing-box engine runs inside the client netns with a TUN inbound
 (`sb-client.json`, outbounds bound to `veth-client` so its own dials
 escape the tun); honk/dae run on the root namespace as before.
 
+### Post-inline re-test (2026-07-29, honk dev @ edd5d8f)
+
+After inlining the anytls data path (`AnyTlsStream`, no per-stream relay
+task/duplex) and the ss `poll_read` fast path (decrypt straight into the
+caller's buffer):
+
+| Protocol | sing-box | honk before | honk after |
+| --- | --- | --- | --- |
+| ss2022 | 1.47 Gbps | 1.30 Gbps | **1.45 Gbps** |
+| anytls (sb server) | 3.02 Gbps | 3.12 Gbps | **3.14 Gbps** |
+| anytls (Go server) | 4.46 Gbps | 3.54 Gbps | **4.37 Gbps** |
+
+ss2022 is now at sing-box parity (−4% vs dae); anytls matches sing-box
+on both servers at ~0.9 cores. Remaining gaps: hy2 −8%, trojan −12%.
+
 ### Cold first-connect latency (ms, health checks off, 3 runs)
 
 | Protocol | dae | honk | note |
