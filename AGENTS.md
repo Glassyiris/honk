@@ -10,7 +10,7 @@ This file is written for AI coding agents that need to understand, build, test, 
 - Shared configuration types and parsers (`honk-config`) parse the original dae `{ section { ... } }` configuration syntax — the primary and only documented config format.
 - Status: **experimental alpha** (`v0.0.1-alpha`). Expect breaking changes.
 - License: **GPL-3.0-only**. Repository: <https://github.com/Glassyiris/honk>
-- Documentation: `README.md` / `README_CN.md` (bilingual overview, feature checklist, TODO list) and `doc/` — `design.en.md`, `configuration.en.md`, `components.en.md` (plus `.zh.md` translations), all currently in sync with the code.
+- Documentation: `README.md` / `README_CN.md` (bilingual overview, feature checklist, TODO list) and `doc/` — `design.en.md`, `configuration.en.md`, `components.en.md`, `benchmark.en.md` (lab topology, how to run, honk-vs-dae results; plus `.zh.md` translations), all currently in sync with the code.
 
 ## Repository layout
 
@@ -24,7 +24,7 @@ This file is written for AI coding agents that need to understand, build, test, 
 ├── config.dae                # Full-featured example config (production-leaning)
 ├── config.min.dae            # Minimal example (good for --mock-ebpf dev)
 ├── example.dae               # Annotated example (Chinese comments)
-├── doc/                      # design / configuration / components docs (en + zh)
+├── doc/                      # design / configuration / components / benchmark docs (en + zh)
 ├── ci/                       # zigcc/zigcxx: zig cc/c++ wrappers for cross builds (strip CMake's clang-style --target from boring-sys ASM rules + rustc's aarch64 errata linker args; used by build-musl and the release workflow); zig-bindgen-env: derive BINDGEN_EXTRA_CLANG_ARGS from `zig cc -E -v` for cross bindgen
 ├── .github/workflows/        # release.yml: tag-triggered test + cross-build + GitHub Release
 └── crates/
