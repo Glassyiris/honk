@@ -766,9 +766,10 @@ impl ControlPlaneHandle {
                     let registry = ctx.proxy_registry.clone();
                     let target_domain = target_domain.clone();
                     tokio::spawn(async move {
-                        let ready_capable = registry
+                        let (ready_capable, bare_capable) = registry
                             .find(node.protocol)
-                            .is_some_and(|h| h.pool_ready_streams(&node));
+                            .map(|h| (h.pool_ready_streams(&node), h.pool_bare_tcp(&node)))
+                            .unwrap_or((false, false));
                         if ready_capable {
                             let key = ConnectionPool::ready_key(
                                 &node_addr,
@@ -789,6 +790,11 @@ impl ControlPlaneHandle {
                                     );
                                 }
                             }
+                            return;
+                        }
+                        if !bare_capable {
+                            // Multiplexed protocols pool whole sessions
+                            // instead; a bare TCP is useless to them.
                             return;
                         }
                         match honk_outbound::util::connect_outbound(&node_addr, connect_timeout)
@@ -962,9 +968,10 @@ impl ControlPlaneHandle {
                     let registry = self.proxy_registry.clone();
                     let target_domain = target_domain.clone();
                     tokio::spawn(async move {
-                        let ready_capable = registry
+                        let (ready_capable, bare_capable) = registry
                             .find(node.protocol)
-                            .is_some_and(|h| h.pool_ready_streams(&node));
+                            .map(|h| (h.pool_ready_streams(&node), h.pool_bare_tcp(&node)))
+                            .unwrap_or((false, false));
                         if ready_capable {
                             let key = ConnectionPool::ready_key(
                                 &node_addr,
@@ -990,6 +997,11 @@ impl ControlPlaneHandle {
                                     );
                                 }
                             }
+                            return;
+                        }
+                        if !bare_capable {
+                            // Multiplexed protocols pool whole sessions
+                            // instead; a bare TCP is useless to them.
                             return;
                         }
                         match honk_outbound::util::connect_outbound(&node_addr, connect_timeout)
@@ -1484,8 +1496,13 @@ impl ControlPlaneHandle {
                 }
             }
 
-            // Bare pool: raw TCP to the proxy server.
-            if let Some(tcp) = pool.acquire_tcp(&addr).await {
+            // Bare pool: raw TCP to the proxy server. Multiplexed
+            // protocols opt out (pool_bare_tcp): their session pool
+            // already holds warm connections and a bare hit would force
+            // a new mux session per flow.
+            if handler.pool_bare_tcp(node)
+                && let Some(tcp) = pool.acquire_tcp(&addr).await
+            {
                 tracing::debug!("Pooled TCP to {} acquired for {}", addr, target);
                 return handler
                     .dial_with_tcp(node, target, target_domain, tcp, connect_timeout)

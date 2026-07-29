@@ -265,6 +265,18 @@ pub trait ProxyHandler: Send + Sync {
         let _ = node;
         false
     }
+
+    /// Whether bare-TCP pool hits are useful for this node. Multiplexed
+    /// protocols (AnyTLS, Trojan-Go, h2mux) keep their own warm session
+    /// pools; a pooled bare TCP forces a brand-new mux session per flow —
+    /// worse than reusing the session pool, and sessions created over the
+    /// pool cap leak. Return `false` for those; the dial then always goes
+    /// through the session pool. The default is `true` (single-connection
+    /// protocols where skipping the TCP handshake helps).
+    fn pool_bare_tcp(&self, node: &Node) -> bool {
+        let _ = node;
+        true
+    }
 }
 
 pub struct ProxyRegistry {

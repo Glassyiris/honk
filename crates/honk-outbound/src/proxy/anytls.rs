@@ -1178,6 +1178,14 @@ impl ProxyHandler for AnyTlsHandler {
         NodeProtocol::AnyTLS
     }
 
+    /// Multiplexed: the session pool already keeps warm connections; a
+    /// pooled bare TCP would force a new session (TLS + auth) per flow,
+    /// and sessions created over the pool cap leak (orphaned from the
+    /// janitor, held forever by their demux task).
+    fn pool_bare_tcp(&self, _node: &Node) -> bool {
+        false
+    }
+
     async fn dial(
         &self,
         node: &Node,

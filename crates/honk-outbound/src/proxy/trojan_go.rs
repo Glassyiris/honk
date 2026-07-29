@@ -274,6 +274,12 @@ impl ProxyHandler for TrojanGoHandler {
         NodeProtocol::TrojanGo
     }
 
+    /// Multiplexed (own smux-style mux on SessionPool): bare-TCP pooling
+    /// would force a new mux session per flow — see AnyTlsHandler.
+    fn pool_bare_tcp(&self, _node: &Node) -> bool {
+        false
+    }
+
     async fn dial(
         &self,
         node: &Node,

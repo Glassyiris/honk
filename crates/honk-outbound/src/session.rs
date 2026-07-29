@@ -235,15 +235,15 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
     }
 
     /// Insert an externally-established session (e.g. one built on a
-    /// pooled TCP stream) when the key is under the hard cap; the caller
-    /// keeps using it either way.
+    /// pooled TCP stream). The session is always tracked — even over the
+    /// hard cap: an untracked session is orphaned from the janitor while
+    /// its demux task holds it (and its TCP connection) open forever.
+    /// Over-cap entries are transient; the janitor reaps them when idle.
     pub fn insert(&self, key: &str, session: &Arc<S>) {
         let mut keys = self.keys.lock();
         let pool = keys.entry(key.to_string()).or_default();
         pool.sessions.retain(|s| !s.is_closed());
-        if pool.sessions.len() < self.config.max_sessions {
-            pool.sessions.push(Arc::clone(session));
-        }
+        pool.sessions.push(Arc::clone(session));
     }
 
     /// Current metrics snapshot across all keys.
@@ -439,6 +439,25 @@ mod tests {
         s2.streams.store(3, Ordering::Relaxed); // over cap
         let s3 = mk(&pool, Arc::clone(&dial_count)).await;
         assert!(Arc::ptr_eq(&s1, &s3), "least-loaded below cap wins");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn insert_over_cap_still_tracked() {
+        let pool = pool(SessionPoolConfig {
+            max_sessions: 1,
+            ..Default::default()
+        });
+        let s1 = TestSession::new();
+        let s2 = TestSession::new();
+        pool.insert("k", &s1);
+        pool.insert("k", &s2); // over the cap: must still be tracked
+        let offered = pool
+            .offer("k", || async { unreachable!("no dial needed") })
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&offered, &s1) || Arc::ptr_eq(&offered, &s2));
+        // An orphaned (untracked) session would be invisible here.
+        assert_eq!(pool.metrics().sessions, 2);
     }
 
     #[tokio::test(start_paused = true)]
