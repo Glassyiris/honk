@@ -66,9 +66,10 @@ impl TrojanGoHandler {
     pub fn new() -> Self {
         Self {
             pool: crate::session::SessionPool::new(crate::session::SessionPoolConfig {
-                // One mux connection per key is the norm; scheduling is
-                // least-loaded without a stream cap.
-                max_streams_per_session: usize::MAX,
+                // Two mux connections per key at most, 128 streams each
+                // (initial values, tune by load test).
+                max_sessions: 2,
+                max_streams_per_session: MAX_STREAMS_PER_MUX,
                 ..Default::default()
             }),
         }
@@ -133,6 +134,11 @@ impl TrojanGoHandler {
             .await
     }
 }
+
+/// Max concurrent streams per mux connection. Each stream costs a
+/// channel and buffers; beyond this the pool dials a second connection
+/// instead of piling onto one.
+const MAX_STREAMS_PER_MUX: usize = 128;
 
 /// A single multiplexed connection to a Trojan-Go server.
 ///
@@ -211,13 +217,22 @@ impl MuxConnection {
         self.close();
     }
 
-    fn alloc_stream_id(&self) -> u16 {
-        loop {
+    /// Allocate an unused stream id: bounded scan over the u16 space,
+    /// skipping ids still active in `readers` (wrap-around safe), and
+    /// `None` when the connection is at capacity. The id is released
+    /// when the stream drops out of `readers` (MuxProxyStream::Drop).
+    fn alloc_stream_id(&self) -> Option<u16> {
+        let readers = self.readers.lock().unwrap();
+        if readers.len() >= MAX_STREAMS_PER_MUX {
+            return None;
+        }
+        for _ in 0..=u16::MAX {
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-            if id != 0 {
-                return id;
+            if id != 0 && !readers.contains_key(&id) {
+                return Some(id);
             }
         }
+        None
     }
 
     /// Spawn a background task that reads from the TCP connection,
@@ -267,9 +282,24 @@ impl MuxConnection {
 
                     let tx = readers.lock().unwrap().get(&stream_id).cloned();
                     if let Some(tx) = tx {
-                        // Bounded per-stream queue with backpressure (TCP
-                        // data must not be dropped).
-                        let _ = tx.send(payload).await;
+                        // Trojan-Go has no reliable per-stream reset: one
+                        // stalled consumer must not wedge the whole mux —
+                        // close the connection (every stream EOFs and the
+                        // pool dials a fresh one).
+                        match tx.try_send(payload) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                tracing::warn!(
+                                    "TrojanGo mux: stream {} consumer stalled (HOL) — closing mux",
+                                    stream_id
+                                );
+                                this.fail_session("stream consumer stalled (HOL)");
+                                break;
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                readers.lock().unwrap().remove(&stream_id);
+                            }
+                        }
                     }
                 }
             }
@@ -286,6 +316,28 @@ impl crate::session::ManagedSession for MuxConnection {
     }
     fn close(&self) {
         MuxConnection::close(self)
+    }
+}
+
+/// RAII cleanup for an uncommitted mux stream: on drop it frees the sid
+/// (and closes the whole mux when a possibly-partial header frame may
+/// be on the wire — the framing is no longer trustworthy).
+struct MuxStreamGuard {
+    mux: Arc<MuxConnection>,
+    sid: u16,
+    committed: bool,
+    frame_started: bool,
+}
+
+impl Drop for MuxStreamGuard {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        self.mux.readers.lock().unwrap().remove(&self.sid);
+        if self.frame_started {
+            self.mux.fail_session("cancelled mid-header write");
+        }
     }
 }
 
@@ -313,25 +365,40 @@ impl ProxyHandler for TrojanGoHandler {
         if mux.is_closed() {
             anyhow::bail!("Trojan-Go mux connection is closed");
         }
-        let stream_id = mux.alloc_stream_id();
+        let Some(stream_id) = mux.alloc_stream_id() else {
+            anyhow::bail!(
+                "Trojan-Go mux stream capacity exhausted ({})",
+                MAX_STREAMS_PER_MUX
+            );
+        };
 
         let header = build_mux_header(password, stream_id, target, target_domain);
 
-        // Inbound (demux → stream): bounded frames with demux backpressure.
+        // Inbound (demux → stream): bounded frames; a stalled consumer
+        // fails the whole mux (Trojan-Go has no per-stream reset).
         let (read_tx, read_rx) = mpsc::channel(64);
         // Outbound (stream → conn): a bounded duplex (64 KiB) so a slow
         // connection backpressures the writer instead of growing a queue.
         let (client_write, mut stream_read) = tokio::io::duplex(64 * 1024);
 
-        {
-            let mut readers = mux.readers.lock().unwrap();
-            readers.insert(stream_id, read_tx);
-        }
+        mux.readers.lock().unwrap().insert(stream_id, read_tx);
 
-        {
+        // Cancellation mid-header leaves a possibly-partial frame on the
+        // wire: the guard frees the sid and fails the mux conservatively.
+        let mut guard = MuxStreamGuard {
+            mux: Arc::clone(&mux),
+            sid: stream_id,
+            committed: false,
+            frame_started: true,
+        };
+        let header_written = {
             let mut w = mux.writer.lock().await;
-            w.write_all(&header).await?;
-        }
+            w.write_all(&header).await
+        };
+        header_written?;
+        guard.frame_started = false;
+        guard.committed = true;
+        drop(guard);
 
         let writer = Arc::clone(&mux.writer);
         let mux_for_fail = Arc::clone(&mux);
@@ -602,10 +669,101 @@ mod tests {
     fn test_stream_id_alloc_skips_zero() {
         let (conn, _rd) =
             MuxConnection::new("test:443".into(), Box::new(tokio::io::duplex(1024).0));
-        let id = conn.alloc_stream_id();
+        let id = conn.alloc_stream_id().unwrap();
         assert_ne!(id, 0);
-        let id2 = conn.alloc_stream_id();
+        let id2 = conn.alloc_stream_id().unwrap();
         assert_ne!(id, id2);
         assert_ne!(id2, 0);
+    }
+
+    /// 4A: allocation wraps the u16 space without colliding with active
+    /// streams, and reports exhaustion at the stream cap.
+    #[test]
+    fn test_stream_id_wrap_and_capacity() {
+        let (conn, _rd) =
+            MuxConnection::new("test:443".into(), Box::new(tokio::io::duplex(1024).0));
+        // An active id right after the wrap point must be skipped.
+        conn.next_id.store(u16::MAX - 1, Ordering::Relaxed);
+        let (tx, _rx) = mpsc::channel(1);
+        conn.readers.lock().unwrap().insert(1, tx);
+        let first = conn.alloc_stream_id().unwrap();
+        assert_eq!(first, u16::MAX - 1);
+        let wrapped = conn.alloc_stream_id().unwrap();
+        assert_eq!(wrapped, u16::MAX);
+        let second = conn.alloc_stream_id().unwrap();
+        assert_eq!(
+            second, 2,
+            "id 1 is active: wrap skips it instead of colliding"
+        );
+
+        // Fill to the cap: allocation fails instead of overcommitting.
+        let (conn2, _rd2) =
+            MuxConnection::new("test:443".into(), Box::new(tokio::io::duplex(1024).0));
+        for sid in 1..=MAX_STREAMS_PER_MUX as u16 {
+            let (tx, _rx) = mpsc::channel(1);
+            conn2.readers.lock().unwrap().insert(sid, tx);
+        }
+        assert!(conn2.alloc_stream_id().is_none());
+        // Releasing one frees allocation again.
+        conn2.readers.lock().unwrap().remove(&7);
+        assert!(conn2.alloc_stream_id().is_some());
+    }
+
+    /// 4A: an uncommitted guard frees the sid and fails the mux when a
+    /// partial header frame may be on the wire.
+    #[tokio::test]
+    async fn test_mux_stream_guard_drop_fails_mux() {
+        let (conn, _rd) =
+            MuxConnection::new("test:443".into(), Box::new(tokio::io::duplex(1024).0));
+        let conn = Arc::new(conn);
+        let (tx, _rx) = mpsc::channel(1);
+        conn.readers.lock().unwrap().insert(9, tx);
+        {
+            let _guard = MuxStreamGuard {
+                mux: Arc::clone(&conn),
+                sid: 9,
+                committed: false,
+                frame_started: true,
+            };
+        }
+        assert!(conn.readers.lock().unwrap().get(&9).is_none());
+        assert!(conn.is_closed());
+        assert_eq!(
+            conn.close_reason.lock().unwrap().as_deref(),
+            Some("cancelled mid-header write")
+        );
+    }
+
+    /// 4A: a full stream queue fails the whole mux (no per-stream reset
+    /// exists in Trojan-Go — a stalled consumer must not wedge it).
+    #[tokio::test]
+    async fn test_demux_hol_full_queue_fails_mux() {
+        let (client_end, mut server_end) = tokio::io::duplex(4096);
+        let (conn, read_half) = MuxConnection::new("test:443".into(), Box::new(client_end));
+        let conn = Arc::new(conn);
+        conn.spawn_demux_task(read_half);
+        // Fill stream 1's queue to the cap without a consumer.
+        let (tx, _rx) = mpsc::channel(64);
+        for _ in 0..64 {
+            tx.try_send(vec![0u8; 8]).unwrap();
+        }
+        conn.readers.lock().unwrap().insert(1, tx);
+        // One more frame from the "server": header + 4-byte payload.
+        use tokio::io::AsyncWriteExt as _;
+        server_end
+            .write_all(&[0, 1, 0, 4, 1, 2, 3, 4])
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !conn.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("mux never failed on a stalled consumer");
+        assert_eq!(
+            conn.close_reason.lock().unwrap().as_deref(),
+            Some("stream consumer stalled (HOL)")
+        );
     }
 }
