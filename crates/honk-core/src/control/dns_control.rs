@@ -282,13 +282,18 @@ impl DnsController {
             client_addr
         );
 
-        let response = if self.concurrency_limit.try_acquire().is_ok() {
-            self.resolve_with_singleflight(&dns_data, Some(original_dst))
-                .await
-        } else {
-            build_dns_refused(&dns_data)
-        };
-        write_tcp_dns_response(stream, &response).await?;
+        match self.concurrency_limit.try_acquire() {
+            Ok(_permit) => {
+                let response = self
+                    .resolve_with_singleflight(&dns_data, Some(original_dst))
+                    .await;
+                write_tcp_dns_response(stream, &response).await?;
+            }
+            Err(_) => {
+                let response = build_dns_refused(&dns_data);
+                write_tcp_dns_response(stream, &response).await?;
+            }
+        }
 
         loop {
             if stream.read_exact(&mut len_buf).await.is_err() {
@@ -310,14 +315,18 @@ impl DnsController {
 
             // Same as the UDP path: the permit must stay alive until the
             // response is written.
-            let resp = match self.concurrency_limit.try_acquire() {
+            match self.concurrency_limit.try_acquire() {
                 Ok(_permit) => {
-                    self.resolve_with_singleflight(&dns_data, Some(original_dst))
-                        .await
+                    let response = self
+                        .resolve_with_singleflight(&dns_data, Some(original_dst))
+                        .await;
+                    write_tcp_dns_response(stream, &response).await?;
                 }
-                Err(_) => build_dns_refused(&dns_data),
-            };
-            write_tcp_dns_response(stream, &resp).await?;
+                Err(_) => {
+                    let response = build_dns_refused(&dns_data);
+                    write_tcp_dns_response(stream, &response).await?;
+                }
+            }
         }
     }
 
@@ -656,6 +665,7 @@ mod singleflight_tests {
     use crate::dns::forwarder::{DnsForwarder, DnsUpstreamPool};
     use crate::routing::Router;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
 
     struct SlowUpstream {
         calls: AtomicUsize,
@@ -703,6 +713,33 @@ mod singleflight_tests {
         (controller, upstream)
     }
 
+    fn controller_with_limit(
+        upstream: Arc<dyn DnsUpstreamPool>,
+        max_concurrent_queries: usize,
+    ) -> Arc<DnsController> {
+        let forwarder = Arc::new(DnsForwarder::new(
+            upstream,
+            Arc::new(tokio::sync::Mutex::new(crate::dns::cache::DnsCache::new(
+                16,
+            ))),
+            Arc::new(
+                crate::dns::routing::DnsRouter::new_from_dns_config(
+                    &honk_config::dns::DnsConfig::default(),
+                )
+                .unwrap(),
+            ),
+        ));
+        let mut controller = DnsController::new(
+            forwarder,
+            Arc::new(RwLock::new(Box::new(
+                crate::ebpf::mock::MockEbpfBackend::new(),
+            ))),
+            Arc::new(RwLock::new(Router::new(&[], "direct").unwrap())),
+        );
+        controller.concurrency_limit = Semaphore::new(max_concurrent_queries);
+        Arc::new(controller)
+    }
+
     fn query_with_txid(domain: &str, txid: u16) -> Vec<u8> {
         let mut q = crate::dns::forwarder::build_dns_query(domain, 1);
         q[0..2].copy_from_slice(&txid.to_be_bytes());
@@ -738,5 +775,183 @@ mod singleflight_tests {
             1,
             "deduped to one upstream query"
         );
+    }
+
+    struct BlockingFirstUpstream {
+        first_entered: Notify,
+        release_first: Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl DnsUpstreamPool for BlockingFirstUpstream {
+        async fn query(&self, _name: &str, raw: &[u8]) -> anyhow::Result<Vec<u8>> {
+            let (domain, _) =
+                crate::dns::forwarder::parse_dns_question(raw).expect("valid test query");
+            if domain == "first.example" {
+                self.first_entered.notify_one();
+                self.release_first.notified().await;
+            }
+            Ok(response_with_txid(
+                &domain,
+                u16::from_be_bytes([raw[0], raw[1]]),
+            ))
+        }
+    }
+
+    async fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+        (client.unwrap(), accepted.unwrap().0)
+    }
+
+    async fn write_tcp_query(stream: &mut TcpStream, query: &[u8]) {
+        use tokio::io::AsyncWriteExt;
+        stream
+            .write_all(&(query.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        stream.write_all(query).await.unwrap();
+    }
+
+    async fn read_tcp_response(stream: &mut TcpStream) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+        let mut len = [0u8; 2];
+        stream.read_exact(&mut len).await.unwrap();
+        let mut response = vec![0u8; u16::from_be_bytes(len) as usize];
+        stream.read_exact(&mut response).await.unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn first_tcp_frame_holds_permit_until_response_is_written() {
+        let upstream = Arc::new(BlockingFirstUpstream {
+            first_entered: Notify::new(),
+            release_first: Notify::new(),
+        });
+        let controller = controller_with_limit(upstream.clone(), 1);
+        let original_dst: SocketAddr = "127.0.0.1:53".parse().unwrap();
+
+        let (mut first_client, mut first_server) = tcp_pair().await;
+        let first_controller = controller.clone();
+        let first_task = tokio::spawn(async move {
+            first_controller
+                .handle_tcp_dns(
+                    &mut first_server,
+                    "127.0.0.1:10001".parse().unwrap(),
+                    original_dst,
+                )
+                .await
+        });
+        write_tcp_query(&mut first_client, &query_with_txid("first.example", 0x1111)).await;
+        upstream.first_entered.notified().await;
+
+        let (mut second_client, mut second_server) = tcp_pair().await;
+        let second_controller = controller.clone();
+        let second_task = tokio::spawn(async move {
+            second_controller
+                .handle_tcp_dns(
+                    &mut second_server,
+                    "127.0.0.1:10002".parse().unwrap(),
+                    original_dst,
+                )
+                .await
+        });
+        write_tcp_query(
+            &mut second_client,
+            &query_with_txid("second.example", 0x2222),
+        )
+        .await;
+        let second_response = read_tcp_response(&mut second_client).await;
+
+        assert_eq!(
+            second_response[3] & 0x0f,
+            5,
+            "a distinct first-frame query must be REFUSED while the sole permit is held"
+        );
+
+        upstream.release_first.notify_one();
+        let first_response = read_tcp_response(&mut first_client).await;
+        assert_eq!(first_response[3] & 0x0f, 0);
+        drop(first_client);
+        drop(second_client);
+        first_task.await.unwrap().unwrap();
+        second_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_first_tcp_frame_releases_permit() {
+        let upstream = Arc::new(BlockingFirstUpstream {
+            first_entered: Notify::new(),
+            release_first: Notify::new(),
+        });
+        let controller = controller_with_limit(upstream.clone(), 1);
+        let original_dst: SocketAddr = "127.0.0.1:53".parse().unwrap();
+
+        let (mut first_client, mut first_server) = tcp_pair().await;
+        let first_controller = controller.clone();
+        let first_task = tokio::spawn(async move {
+            first_controller
+                .handle_tcp_dns(
+                    &mut first_server,
+                    "127.0.0.1:10003".parse().unwrap(),
+                    original_dst,
+                )
+                .await
+        });
+        write_tcp_query(&mut first_client, &query_with_txid("first.example", 0x3333)).await;
+        upstream.first_entered.notified().await;
+        first_task.abort();
+        assert!(first_task.await.unwrap_err().is_cancelled());
+        drop(first_client);
+
+        let (mut resumed_client, mut resumed_server) = tcp_pair().await;
+        let resumed_controller = controller.clone();
+        let resumed_task = tokio::spawn(async move {
+            resumed_controller
+                .handle_tcp_dns(
+                    &mut resumed_server,
+                    "127.0.0.1:10004".parse().unwrap(),
+                    original_dst,
+                )
+                .await
+        });
+        write_tcp_query(
+            &mut resumed_client,
+            &query_with_txid("resumed.example", 0x4444),
+        )
+        .await;
+        let resumed_response = read_tcp_response(&mut resumed_client).await;
+        assert_eq!(
+            resumed_response[3] & 0x0f,
+            0,
+            "cancelling the permit owner must allow a new first-frame query"
+        );
+        drop(resumed_client);
+        resumed_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_first_tcp_frame_is_not_handled() {
+        use tokio::io::AsyncWriteExt;
+
+        let (controller, _) =
+            test_controller(response_with_txid("example.com", 0x5555), Duration::ZERO);
+        let (mut client, mut server) = tcp_pair().await;
+        let task = tokio::spawn(async move {
+            controller
+                .handle_tcp_dns(
+                    &mut server,
+                    "127.0.0.1:10005".parse().unwrap(),
+                    "127.0.0.1:53".parse().unwrap(),
+                )
+                .await
+        });
+        client.write_all(&5u16.to_be_bytes()).await.unwrap();
+        client.write_all(&[0u8; 5]).await.unwrap();
+
+        assert!(!task.await.unwrap().unwrap());
     }
 }

@@ -450,6 +450,16 @@ mod tests {
         assert_eq!(cfg.routing.fallback, "upstream");
         assert!(cfg.routing.request.rules.is_empty());
         assert!(cfg.routing.response.rules.is_empty());
+        assert!(matches!(cfg.strategy, DnsStrategy::Both));
+    }
+
+    #[test]
+    fn missing_strategy_uses_both_for_serde_configs() {
+        let cfg: DnsConfig = serde_json::from_str(
+            r#"{"upstream":[{"name":"a","address":"223.5.5.5:53","protocol":"udp"}]}"#,
+        )
+        .unwrap();
+        assert!(matches!(cfg.strategy, DnsStrategy::Both));
     }
 
     #[test]
@@ -524,6 +534,87 @@ mod tests {
             converted.fallback,
             DnsRequestAction::Upstream("default".to_string())
         );
+    }
+
+    #[test]
+    fn legacy_conversion_preserves_rule_order_and_matcher_kind() {
+        let routing = DnsRouting {
+            rules: vec![
+                DnsLegacyRule {
+                    domain: "suffix:.cn".into(),
+                    upstream: "cn".into(),
+                },
+                DnsLegacyRule {
+                    domain: "keyword:ads".into(),
+                    upstream: "block".into(),
+                },
+                DnsLegacyRule {
+                    domain: "full:example.com".into(),
+                    upstream: "exact".into(),
+                },
+                DnsLegacyRule {
+                    domain: "regex:^api\\\\.".into(),
+                    upstream: "regex".into(),
+                },
+                DnsLegacyRule {
+                    domain: "bare.example".into(),
+                    upstream: "bare".into(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let converted = routing.convert_legacy_rules();
+        let actions = converted
+            .rules
+            .iter()
+            .map(|rule| &rule.action)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actions,
+            vec![
+                &DnsRequestAction::Upstream("cn".into()),
+                &DnsRequestAction::Upstream("block".into()),
+                &DnsRequestAction::Upstream("exact".into()),
+                &DnsRequestAction::Upstream("regex".into()),
+                &DnsRequestAction::Upstream("bare".into()),
+            ]
+        );
+
+        fn matcher_kind(rule: &DnsRequestRule) -> &DnsDomainMatcher {
+            match &rule.conditions[0] {
+                DnsCond::Qname { matchers, .. } => &matchers[0],
+                _ => panic!("legacy conversion must produce qname conditions"),
+            }
+        }
+        assert!(matches!(
+            matcher_kind(&converted.rules[0]),
+            DnsDomainMatcher::Suffix(value) if value == ".cn"
+        ));
+        assert!(matches!(
+            matcher_kind(&converted.rules[1]),
+            DnsDomainMatcher::Keyword(value) if value == "ads"
+        ));
+        assert!(matches!(
+            matcher_kind(&converted.rules[2]),
+            DnsDomainMatcher::Full(value) if value == "example.com"
+        ));
+        assert!(matches!(
+            matcher_kind(&converted.rules[3]),
+            DnsDomainMatcher::Regex(value) if value == "^api\\\\."
+        ));
+        assert!(matches!(
+            matcher_kind(&converted.rules[4]),
+            DnsDomainMatcher::Full(value) if value == "bare.example"
+        ));
+    }
+
+    #[test]
+    fn zero_cache_size_remains_accepted_for_runtime_clamping() {
+        let cfg: DnsConfig =
+            serde_json::from_str(r#"{"cache":{"enabled":true,"ttl":0,"max_size":0}}"#).unwrap();
+        assert_eq!(cfg.cache.max_size, 0);
+        assert_eq!(cfg.cache.ttl, 0);
     }
 
     #[test]
