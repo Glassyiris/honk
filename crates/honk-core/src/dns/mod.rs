@@ -23,6 +23,8 @@ pub mod cache;
 pub mod endpoint;
 pub mod forwarder;
 pub mod persist;
+pub mod query;
+pub mod response;
 pub mod routing;
 pub mod transport;
 pub mod upstream_pool;

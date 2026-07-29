@@ -1,0 +1,198 @@
+use std::ops::Range;
+
+use thiserror::Error;
+
+use super::query::{IngressProfile, QueryContext, TxId, parse_name};
+
+const HEADER_LEN: usize = 12;
+const QR: u16 = 0x8000;
+const TC: u16 = 0x0200;
+const OPCODE_MASK: u16 = 0x7800;
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ResponseError {
+    #[error("DNS response is shorter than its header")]
+    HeaderTruncated,
+    #[error("DNS response has QR clear")]
+    QueryMessage,
+    #[error("DNS response opcode does not match the request")]
+    OpcodeMismatch,
+    #[error("DNS response question does not match the request")]
+    QuestionMismatch,
+    #[error("DNS response contains a malformed record")]
+    MalformedRecord,
+    #[error("DNS response has trailing bytes")]
+    TrailingBytes,
+    #[error("truncated response is incompatible with the request ingress profile")]
+    IncompatibleProfile,
+    #[error("response template used with a different exact request")]
+    RequestIdentityMismatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Section {
+    Answer,
+    Authority,
+    Additional,
+}
+
+#[derive(Debug, Clone)]
+struct RecordBoundary {
+    section: Section,
+    wire: Range<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResponseTemplate {
+    request_identity: Vec<u8>,
+    wire: Vec<u8>,
+    question_end: usize,
+    records: Vec<RecordBoundary>,
+}
+
+impl ResponseTemplate {
+    pub fn validate(request: &QueryContext, response: &[u8]) -> Result<Self, ResponseError> {
+        if response.len() < HEADER_LEN {
+            return Err(ResponseError::HeaderTruncated);
+        }
+        let flags = read_u16(response, 2)?;
+        if flags & QR == 0 {
+            return Err(ResponseError::QueryMessage);
+        }
+        if flags & OPCODE_MASK != request.flags() & OPCODE_MASK {
+            return Err(ResponseError::OpcodeMismatch);
+        }
+        if flags & TC != 0 && !matches!(request.ingress(), IngressProfile::Udp { .. }) {
+            return Err(ResponseError::IncompatibleProfile);
+        }
+        let qdcount = read_u16(response, 4)?;
+        if usize::from(qdcount) != request.questions().len() {
+            return Err(ResponseError::QuestionMismatch);
+        }
+        let mut cursor = HEADER_LEN;
+        for (expected_name, expected_type, expected_class) in request.questions() {
+            let (name, name_end) =
+                parse_name(response, cursor).map_err(|_| ResponseError::QuestionMismatch)?;
+            let qtype = read_u16(response, name_end)?;
+            let qclass = read_u16(response, name_end + 2)?;
+            if &name != expected_name
+                || qtype != expected_type.get()
+                || qclass != expected_class.get()
+            {
+                return Err(ResponseError::QuestionMismatch);
+            }
+            cursor = name_end + 4;
+        }
+        let question_end = cursor;
+        let sections = [
+            (Section::Answer, read_u16(response, 6)?),
+            (Section::Authority, read_u16(response, 8)?),
+            (Section::Additional, read_u16(response, 10)?),
+        ];
+        let mut records = Vec::new();
+        for (section, count) in sections {
+            for _ in 0..count {
+                let start = cursor;
+                cursor = record_end(response, cursor)?;
+                records.push(RecordBoundary {
+                    section,
+                    wire: start..cursor,
+                });
+            }
+        }
+        if cursor != response.len() {
+            return Err(ResponseError::TrailingBytes);
+        }
+        Ok(Self {
+            request_identity: request.canonical_wire().to_vec(),
+            wire: response.to_vec(),
+            question_end,
+            records,
+        })
+    }
+
+    pub fn render(&self, caller: &QueryContext) -> Result<Vec<u8>, ResponseError> {
+        if caller.canonical_wire() != self.request_identity {
+            return Err(ResponseError::RequestIdentityMismatch);
+        }
+        match caller.ingress() {
+            IngressProfile::Udp { advertised_size } => {
+                self.render_udp(caller.txid(), usize::from(advertised_size))
+            }
+            IngressProfile::Tcp | IngressProfile::Api | IngressProfile::Internal => {
+                let mut response = self.wire.clone();
+                set_txid(&mut response, caller.txid())?;
+                Ok(response)
+            }
+        }
+    }
+
+    fn render_udp(&self, txid: TxId, limit: usize) -> Result<Vec<u8>, ResponseError> {
+        if self.wire.len() <= limit {
+            let mut response = self.wire.clone();
+            set_txid(&mut response, txid)?;
+            return Ok(response);
+        }
+        let prefix = self
+            .wire
+            .get(..self.question_end)
+            .ok_or(ResponseError::MalformedRecord)?;
+        let mut response = Vec::with_capacity(limit.max(prefix.len()));
+        response.extend_from_slice(prefix);
+        let mut counts = [0u16; 3];
+        for record in &self.records {
+            let record_wire = self
+                .wire
+                .get(record.wire.clone())
+                .ok_or(ResponseError::MalformedRecord)?;
+            if response.len().saturating_add(record_wire.len()) > limit {
+                break;
+            }
+            response.extend_from_slice(record_wire);
+            let index = match record.section {
+                Section::Answer => 0,
+                Section::Authority => 1,
+                Section::Additional => 2,
+            };
+            counts[index] = counts[index].saturating_add(1);
+        }
+        set_txid(&mut response, txid)?;
+        let flags = read_u16(&response, 2)? | TC;
+        write_u16(&mut response, 2, flags)?;
+        write_u16(&mut response, 6, counts[0])?;
+        write_u16(&mut response, 8, counts[1])?;
+        write_u16(&mut response, 10, counts[2])?;
+        Ok(response)
+    }
+}
+
+fn record_end(response: &[u8], start: usize) -> Result<usize, ResponseError> {
+    let (_, name_end) = parse_name(response, start).map_err(|_| ResponseError::MalformedRecord)?;
+    let rdlength = usize::from(read_u16(response, name_end + 8)?);
+    (name_end + 10)
+        .checked_add(rdlength)
+        .filter(|end| *end <= response.len())
+        .ok_or(ResponseError::MalformedRecord)
+}
+
+fn set_txid(response: &mut [u8], txid: TxId) -> Result<(), ResponseError> {
+    write_u16(response, 0, txid.get())
+}
+
+fn read_u16(response: &[u8], offset: usize) -> Result<u16, ResponseError> {
+    let bytes = response
+        .get(offset..offset + 2)
+        .ok_or(ResponseError::MalformedRecord)?;
+    Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+}
+
+fn write_u16(response: &mut [u8], offset: usize, value: u16) -> Result<(), ResponseError> {
+    response
+        .get_mut(offset..offset + 2)
+        .ok_or(ResponseError::MalformedRecord)?
+        .copy_from_slice(&value.to_be_bytes());
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests;
