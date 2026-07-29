@@ -428,7 +428,13 @@ pub fn client_endpoint_with_mtu(ipv6: bool, max_udp_payload_size: u16) -> io::Re
         .ok_or_else(|| io::Error::other("no async runtime available for QUIC"))?;
     let io = Arc::new(tokio::net::UdpSocket::from_std(socket)?);
     let inner = quinn::udp::UdpSocketState::new((&*io).into())?;
-    let socket = Arc::new(NoGsoUdpSocket { io, inner });
+    static GSO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let gso = *GSO.get_or_init(|| {
+        std::env::var("HONK_QUIC_GSO")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    });
+    let socket = Arc::new(NoGsoUdpSocket { io, inner, gso });
     Endpoint::new_with_abstract_socket(
         endpoint_config_with_mtu(max_udp_payload_size)?,
         None,
@@ -451,10 +457,15 @@ pub(crate) fn endpoint_config_with_mtu(mtu: u16) -> io::Result<EndpointConfig> {
 /// super-packet. This is quinn's own `runtime/tokio.rs` socket with a
 /// one-line change, so nothing else (ECN signaling, GRO receives, pktinfo)
 /// diverges from the stock path.
+///
+/// `HONK_QUIC_GSO=1` opts back into kernel UDP GSO (a 10-20% single-flow
+/// throughput win on non-PPPoE paths; keep it off where the uplink drops
+/// GSO segments).
 #[derive(Debug)]
 struct NoGsoUdpSocket {
     io: Arc<tokio::net::UdpSocket>,
     inner: quinn::udp::UdpSocketState,
+    gso: bool,
 }
 
 impl quinn::AsyncUdpSocket for NoGsoUdpSocket {
@@ -497,7 +508,11 @@ impl quinn::AsyncUdpSocket for NoGsoUdpSocket {
     }
 
     fn max_transmit_segments(&self) -> usize {
-        1
+        if self.gso {
+            self.inner.max_gso_segments()
+        } else {
+            1
+        }
     }
 
     fn max_receive_segments(&self) -> usize {
