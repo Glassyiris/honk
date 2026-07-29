@@ -191,6 +191,51 @@ impl AsyncRead for SsStream {
             }
         }
 
+        if self.plain_start == self.plain_end && self.carry == 0 {
+            // Fast path (steady state): read the batch straight into the
+            // caller's buffer and decrypt in place — no staging-buffer copy.
+            let this = self.as_mut().get_mut();
+            let tag_len = this.tag_len();
+            let n = {
+                let read_half = this.read_half.as_mut().expect("prologue completed");
+                let mut read_buf = ReadBuf::new(out.initialize_unfilled());
+                match Pin::new(read_half).poll_read(cx, &mut read_buf) {
+                    Poll::Ready(Ok(())) => read_buf.filled().len(),
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            };
+            let (out_len, rest) = decrypt_chunks_in_place(
+                this.recv_cipher.as_ref().expect("prologue completed"),
+                &mut this.recv_nonce,
+                &mut this.recv_pending_len,
+                &mut out.initialize_unfilled()[..n],
+                n,
+                tag_len,
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            if n == 0 {
+                // Clean EOF (the fast path runs only with an empty carry).
+                return Poll::Ready(Ok(()));
+            }
+            // Plaintext is compacted at the front of the caller's buffer
+            // and the incomplete tail sits right behind it
+            // (decrypt_chunks_in_place already moved it): hand the tail to
+            // the staging buffer as carry.
+            if rest > 0 {
+                let buf = out.initialize_unfilled();
+                this.recv_buf[..rest].copy_from_slice(&buf[out_len..out_len + rest]);
+                this.carry = rest;
+            }
+            if out_len > 0 {
+                out.advance(out_len);
+                return Poll::Ready(Ok(()));
+            }
+            // The caller's buffer was too small for even one chunk
+            // (everything landed in carry): fall through to the staging
+            // path — advancing 0 bytes here would look like EOF.
+        }
+
         if self.plain_start == self.plain_end {
             // No buffered plaintext: pull and decrypt the next batch.
             // Greedily drain the socket while data is immediately

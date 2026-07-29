@@ -353,6 +353,48 @@ impl AnyTlsSession {
         w.flush().await
     }
 
+    /// Open a TCP stream with the direct data path (no stream task, no
+    /// duplex): inbound frames arrive through the demux queue, outbound
+    /// frames go straight to the session writer. Backpressure is kept (Tcp
+    /// sink) — TCP payload must not be dropped, unlike UoT.
+    async fn open_stream_direct(
+        self: &Arc<Self>,
+        target_addr: Vec<u8>,
+    ) -> anyhow::Result<(u32, mpsc::Receiver<StreamEvent>)> {
+        if self.is_closed() {
+            anyhow::bail!("AnyTLS session {} is closed", self.seq);
+        }
+        let sid = self.next_sid.fetch_add(1, Ordering::Relaxed) + 1;
+        let (tx, rx) = mpsc::channel(STREAM_QUEUE_CAP);
+        self.streams
+            .lock()
+            .unwrap()
+            .insert(sid, StreamSink::Tcp(tx));
+
+        let open_result: std::io::Result<()> = async {
+            let mut w = self.writer.lock().await;
+            write_frame(&mut *w, CMD_SYN, sid, &[]).await?;
+            write_frame(&mut *w, CMD_PSH, sid, &target_addr).await?;
+            w.flush().await
+        }
+        .await;
+        if let Err(e) = open_result {
+            self.streams.lock().unwrap().remove(&sid);
+            // sing `writeControlFrame`: a write failure kills the session.
+            self.close();
+            return Err(anyhow::anyhow!(
+                "AnyTLS session {} open sid={}: {}",
+                self.seq,
+                sid,
+                e
+            ));
+        }
+
+        self.active_streams.fetch_add(1, Ordering::Relaxed);
+        debug!("AnyTLS session {} opened direct sid={}", self.seq, sid);
+        Ok((sid, rx))
+    }
+
     /// Unregister a UoT stream (FIN to the server), mirroring
     /// [`Self::end_stream`].
     async fn end_uot_stream(&self, sid: u32) {
@@ -685,22 +727,22 @@ impl AnyTlsHandler {
         addr: &str,
         target_addr: &[u8],
         connect_timeout: Duration,
-    ) -> anyhow::Result<tokio::io::DuplexStream> {
+    ) -> anyhow::Result<AnyTlsStream> {
         Self::ensure_janitor(node);
         let mut last_err: Option<anyhow::Error> = None;
         for _attempt in 0..2 {
             let session = SESSION_POOL
                 .offer(addr, || dial_session(node, addr, connect_timeout))
                 .await?;
-            match session.open_stream(target_addr.to_vec()).await {
-                Ok(stream) => {
+            match session.open_stream_direct(target_addr.to_vec()).await {
+                Ok((sid, rx)) => {
                     debug!(
                         "AnyTLS: multiplexing on session {} for {} ({} open stream(s))",
                         session.seq,
                         addr,
                         session.active_streams(),
                     );
-                    return Ok(stream);
+                    return Ok(AnyTlsStream::new(session, sid, rx));
                 }
                 Err(e) => {
                     SESSION_POOL.invalidate(addr, &session);
@@ -709,6 +751,169 @@ impl AnyTlsHandler {
             }
         }
         Err(last_err.expect("open_pooled_stream attempts always record an error"))
+    }
+}
+
+/// Direct-path AnyTLS stream: `AsyncRead`/`AsyncWrite` over a session
+/// stream without the stream task and duplex the old path had (those cost
+/// two task hops and two copies per byte — the SS codec review's
+/// measurement, applied here).
+pub(crate) struct AnyTlsStream {
+    session: Arc<AnyTlsSession>,
+    sid: u32,
+    rx: mpsc::Receiver<StreamEvent>,
+    read_buf: Vec<u8>,
+    read_pos: usize,
+    /// In-flight PSH/FIN write (owns the payload — cancelling the caller's
+    /// write future can never lose data).
+    write_fut:
+        Option<std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>>,
+    fin_sent: bool,
+}
+
+impl AnyTlsStream {
+    fn new(session: Arc<AnyTlsSession>, sid: u32, rx: mpsc::Receiver<StreamEvent>) -> Self {
+        Self {
+            session,
+            sid,
+            rx,
+            read_buf: Vec::new(),
+            read_pos: 0,
+            write_fut: None,
+            fin_sent: false,
+        }
+    }
+
+    /// Queue a PSH frame for up to `u16::MAX` payload bytes; the future
+    /// owns the payload until flushed.
+    fn queue_write(&mut self, data: Vec<u8>) {
+        let session = Arc::clone(&self.session);
+        let sid = self.sid;
+        self.write_fut = Some(Box::pin(async move {
+            session
+                .write_frame(CMD_PSH, sid, &data)
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        }));
+    }
+}
+
+impl std::fmt::Debug for AnyTlsStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnyTlsStream")
+            .field("sid", &self.sid)
+            .field("pending_read", &(self.read_buf.len() - self.read_pos))
+            .finish()
+    }
+}
+
+impl Drop for AnyTlsStream {
+    fn drop(&mut self) {
+        let session = Arc::clone(&self.session);
+        let sid = self.sid;
+        let notify_fin = !self.fin_sent;
+        tokio::spawn(async move { session.end_stream(sid, notify_fin).await });
+    }
+}
+
+impl tokio::io::AsyncRead for AnyTlsStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        out: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.read_pos == self.read_buf.len() {
+            let this = self.as_mut().get_mut();
+            this.read_buf.clear();
+            this.read_pos = 0;
+            match this.rx.poll_recv(cx) {
+                std::task::Poll::Ready(Some(StreamEvent::Data(data))) => {
+                    this.read_buf = data;
+                }
+                std::task::Poll::Ready(Some(StreamEvent::Fin)) | std::task::Poll::Ready(None) => {
+                    return std::task::Poll::Ready(Ok(())); // EOF
+                }
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+            }
+        }
+        let this = self.as_mut().get_mut();
+        let n = (this.read_buf.len() - this.read_pos).min(out.remaining());
+        out.put_slice(&this.read_buf[this.read_pos..this.read_pos + n]);
+        this.read_pos += n;
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl tokio::io::AsyncWrite for AnyTlsStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        // Frames are u16-length-prefixed: take up to one full frame per
+        // call (the caller retries with the remainder).
+        let chunk = buf.len().min(u16::MAX as usize);
+        if chunk == 0 {
+            return std::task::Poll::Ready(Ok(0));
+        }
+        if self.write_fut.is_none() {
+            self.queue_write(buf[..chunk].to_vec());
+        }
+        let this = self.as_mut().get_mut();
+        let fut = this.write_fut.as_mut().expect("just queued");
+        match fut.as_mut().poll(cx) {
+            std::task::Poll::Ready(Ok(())) => {
+                this.write_fut = None;
+                std::task::Poll::Ready(Ok(chunk))
+            }
+            std::task::Poll::Ready(Err(e)) => {
+                this.write_fut = None;
+                std::task::Poll::Ready(Err(e))
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if let Some(fut) = self.write_fut.as_mut() {
+            match fut.as_mut().poll(cx) {
+                std::task::Poll::Ready(Ok(())) => self.write_fut = None,
+                std::task::Poll::Ready(Err(e)) => {
+                    self.write_fut = None;
+                    return std::task::Poll::Ready(Err(e));
+                }
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+            }
+        }
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.as_mut().poll_flush(cx) {
+            std::task::Poll::Ready(Ok(())) => {}
+            other => return other,
+        }
+        if !self.fin_sent {
+            self.fin_sent = true;
+            let session = Arc::clone(&self.session);
+            let sid = self.sid;
+            let fut: std::pin::Pin<
+                Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>,
+            > = Box::pin(async move {
+                session
+                    .write_frame(CMD_FIN, sid, &[])
+                    .await
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+            });
+            self.write_fut = Some(fut);
+        }
+        self.poll_flush(cx)
     }
 }
 
@@ -1011,10 +1216,10 @@ impl ProxyHandler for AnyTlsHandler {
             connect_transport(node, &addr, _connect_timeout, Some(tcp)).await?;
         let session = AnyTlsSession::establish(&addr, read, write, &auth, &settings).await?;
         SESSION_POOL.insert(&addr, &session);
-        let stream = session.open_stream(target_addr).await?;
+        let (sid, rx) = session.open_stream_direct(target_addr).await?;
 
         Ok(ProxyStream {
-            stream: Box::new(stream),
+            stream: Box::new(AnyTlsStream::new(session, sid, rx)),
             target_addr: target,
             target_domain: target_domain.map(|s| s.to_string()),
         })
@@ -1040,7 +1245,27 @@ impl ProxyHandler for AnyTlsHandler {
         let addr = pool_key(node);
         // The stream target is the UoT magic address (SOCKS5 address form).
         let magic = addr::encode_address("0.0.0.0:0".parse().unwrap(), Some(UOT_MAGIC));
-        let mut stream = Self::open_pooled_stream(node, &addr, &magic, connect_timeout).await?;
+        Self::ensure_janitor(node);
+        // Legacy loopback path: needs a duplex stream for `uot_bridge`
+        // (the production UDP path is `dial_udp_transport`).
+        let mut stream = {
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                let session = SESSION_POOL
+                    .offer(&addr, || dial_session(node, &addr, connect_timeout))
+                    .await?;
+                match session.open_stream(magic.clone()).await {
+                    Ok(s) => break s,
+                    Err(e) => {
+                        SESSION_POOL.invalidate(&addr, &session);
+                        if attempt >= 2 {
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+        };
 
         // UoT request: isConnect=true + destination in SOCKS5 address form.
         // sing's uot.ReadRequest parses the destination with
@@ -1481,6 +1706,51 @@ mod tests {
             .expect("echo timed out")
             .unwrap();
         assert_eq!(buf, payload);
+    }
+
+    /// Direct-path stream: multi-frame bulk write echoes back intact, and a
+    /// server FIN surfaces as read EOF.
+    #[tokio::test]
+    async fn test_direct_stream_roundtrip_and_fin() {
+        let addr = "127.0.0.1:443";
+        let (session, mut server) = establish_test_session(addr).await;
+        expect_handshake(&mut server).await;
+        let mut addr_rx = spawn_echo_server(server);
+
+        let target = vec![0x01, 127, 0, 0, 1, 0x01, 0xbb];
+        let (sid, rx) = session.open_stream_direct(target.clone()).await.unwrap();
+        let mut stream = AnyTlsStream::new(Arc::clone(&session), sid, rx);
+
+        // Server got SYN + the address PSH.
+        let (got_sid, got_addr) = tokio::time::timeout(Duration::from_secs(2), addr_rx.recv())
+            .await
+            .expect("address frame")
+            .unwrap();
+        assert_eq!(got_sid, sid);
+        assert_eq!(got_addr, target);
+
+        // ~150KB in three writes (spans multiple u16 frames).
+        let payload: Vec<u8> = (0..150_000u32).map(|i| (i % 251) as u8).collect();
+        stream.write_all(&payload[..70000]).await.unwrap();
+        stream.write_all(&payload[70000..140000]).await.unwrap();
+        stream.write_all(&payload[140000..]).await.unwrap();
+
+        let mut received = vec![0u8; payload.len()];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut received))
+            .await
+            .expect("echo timed out")
+            .unwrap();
+        assert_eq!(received, payload);
+
+        // Server FIN → EOF: our shutdown sent FIN; the echo server answers
+        // FIN → read EOF.
+        stream.shutdown().await.unwrap();
+        let mut b = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut b))
+            .await
+            .expect("FIN read timed out")
+            .unwrap();
+        assert_eq!(n, 0);
     }
 
     /// Three concurrent streams multiplexed on one session, echoing in
