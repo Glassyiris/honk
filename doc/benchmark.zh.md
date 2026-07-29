@@ -117,19 +117,25 @@ sing-box 引擎以 TUN 入口跑在客户端 netns 内(`sb-client.json`,各
 outbound 绑定 `veth-client` 使自身拨号绕出 tun);honk/dae 照旧跑在
 根命名空间。
 
-### 内联优化后复测(2026-07-29,honk dev @ edd5d8f)
+### 内联优化后变更(2026-07-29,honk dev)
 
-anytls 数据面内联(`AnyTlsStream`,取消每流 relay task/duplex)与
-ss `poll_read` 快路径(直接解密进调用方缓冲)之后:
+三方对比之后落地了三个数据面改动:anytls 直通流(`AnyTlsStream`,
+取消每流 relay task/duplex)、ss `poll_read` 快路径(直接解密进
+调用方缓冲)、TLS 批量读(`BatchRead`:BoringSSL 每次 `SSL_read`
+只返回一条 ~16 KiB record,包装器把内层一直读到缓冲满或 Pending)。
+
+目前诚实复测结果(已校验引擎 CPU 非零以证明代理路径):
 
 | 协议 | sing-box | honk 优化前 | honk 优化后 |
 | --- | --- | --- | --- |
-| ss2022 | 1.47 Gbps | 1.30 Gbps | **1.45 Gbps** |
-| anytls(sb server) | 3.02 Gbps | 3.12 Gbps | **3.14 Gbps** |
-| anytls(Go server) | 4.46 Gbps | 3.54 Gbps | **4.37 Gbps** |
+| trojan(TLS BatchRead) | 4.52 Gbps (1.68c) | 3.99 Gbps (1.03c) | **4.45 Gbps (~1.0c)** |
 
-ss2022 已与 sing-box 持平(比 dae 低 4%);anytls 两种 server 都
-追平 sing-box,CPU 约 0.9 核。剩余差距:hy2 −8%、trojan −12%。
+trojan 已追平 sing-box(差 2%),CPU 约为其 60%。
+
+注:本节早期版本列过 ss2022 1.45 / anytls 3.14 / 4.37 Gbps,已
+作废——当时实验 netns 里残留一个 sing-box TUN 客户端占用策略
+路由,测到的其实是 sing-box 而非 honk。ss2022/anytls 的复测
+等待 .70 实验室服务恢复。
 
 ### 冷建连延迟（ms，健康检查关闭，3 次）
 

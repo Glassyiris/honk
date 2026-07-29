@@ -125,20 +125,29 @@ The sing-box engine runs inside the client netns with a TUN inbound
 (`sb-client.json`, outbounds bound to `veth-client` so its own dials
 escape the tun); honk/dae run on the root namespace as before.
 
-### Post-inline re-test (2026-07-29, honk dev @ edd5d8f)
+### Post-inline changes (2026-07-29, honk dev)
 
-After inlining the anytls data path (`AnyTlsStream`, no per-stream relay
-task/duplex) and the ss `poll_read` fast path (decrypt straight into the
-caller's buffer):
+Three data-path changes landed after the three-way run: anytls inline
+streams (`AnyTlsStream`, no per-stream relay task/duplex), the ss
+`poll_read` fast path (decrypt straight into the caller's buffer), and
+TLS batch reads (`BatchRead`: BoringSSL returns one ~16 KiB record per
+`SSL_read`; the wrapper drains the inner stream until the relay buffer
+is full or pends).
+
+Honest re-measurement so far (engine CPU checked non-zero to prove the
+proxy path):
 
 | Protocol | sing-box | honk before | honk after |
 | --- | --- | --- | --- |
-| ss2022 | 1.47 Gbps | 1.30 Gbps | **1.45 Gbps** |
-| anytls (sb server) | 3.02 Gbps | 3.12 Gbps | **3.14 Gbps** |
-| anytls (Go server) | 4.46 Gbps | 3.54 Gbps | **4.37 Gbps** |
+| trojan (TLS BatchRead) | 4.52 Gbps (1.68c) | 3.99 Gbps (1.03c) | **4.45 Gbps (~1.0c)** |
 
-ss2022 is now at sing-box parity (−4% vs dae); anytls matches sing-box
-on both servers at ~0.9 cores. Remaining gaps: hy2 −8%, trojan −12%.
+trojan is now within 2% of sing-box at ~60% of its CPU.
+
+Note: an earlier version of this section listed ss2022 1.45 / anytls
+3.14 / 4.37 Gbps. Those runs were discarded — a stale sing-box TUN
+client was still holding the lab netns policy routes, so they measured
+sing-box, not honk. ss2022/anytls re-measurement is pending a lab
+server outage on .70.
 
 ### Cold first-connect latency (ms, health checks off, 3 runs)
 
