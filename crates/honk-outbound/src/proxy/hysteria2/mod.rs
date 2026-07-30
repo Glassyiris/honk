@@ -629,8 +629,12 @@ impl Hysteria2Handler {
                 crate::quic::QuicClientOptions {
                     congestion: Some(factory),
                     keep_alive: Some(KEEP_ALIVE_INTERVAL),
-                    stream_receive_window: node.hy2_init_stream_recv_window,
-                    conn_receive_window: node.hy2_init_conn_recv_window,
+                    // Download throughput is capped by our advertised receive
+                    // windows (window/RTT): quinn's 1.25 MiB stream default
+                    // tops out around 2 Gbps on a LAN. Match the TUIC
+                    // defaults (8 MiB stream / 32 MiB conn).
+                    stream_receive_window: node.hy2_init_stream_recv_window.or(Some(8 << 20)),
+                    conn_receive_window: node.hy2_init_conn_recv_window.or(Some(32 << 20)),
                     disable_mtu_discovery: node.hy2_disable_mtu_discovery == Some(true),
                     max_udp_payload_size: node.quic_mtu,
                 },

@@ -462,6 +462,19 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     #[cfg(not(feature = "ebpf"))]
     let _dae0_guard: Option<()>;
     if !mock_mode {
+        // QUIC socket headroom: the default 208 KiB rmem/wmem caps a
+        // ~1ms-RTT QUIC path at ~2 Gbps (setsockopt is clamped to 2×max).
+        // Raise the ceiling so the 8 MiB SO_RCVBUF/SO_SNDBUF requests in
+        // honk-outbound's marked_udp_socket actually land. Best-effort —
+        // caps, not allocations.
+        for (key, val) in [
+            ("net.core.rmem_max", "16777216"),
+            ("net.core.wmem_max", "16777216"),
+        ] {
+            if let Err(e) = set_sysctl(key, val) {
+                warn!("failed to set {}={}: {}", key, val, e);
+            }
+        }
         #[cfg(feature = "ebpf")]
         {
             let lan_ifname = resolve_interface(
@@ -1632,7 +1645,6 @@ fn parse_mac_from_ip_link(text: &str) -> Option<String> {
     None
 }
 
-#[cfg(feature = "ebpf")]
 fn set_sysctl(key: &str, value: &str) -> anyhow::Result<()> {
     // Prefer /proc/sys because the standalone `sysctl` binary may not be on
     // PATH in minimal environments (e.g. NixOS containers).

@@ -145,6 +145,18 @@ pub fn marked_udp_socket(bind_addr: SocketAddr) -> io::Result<std::net::UdpSocke
     socket.set_nonblocking(true)?;
     #[cfg(target_os = "linux")]
     set_mark_best_effort(&socket, honk_ebpf_common::DAE_BYPASS_MARK)?;
+    // QUIC throughput is buffer-bound: the default 208 KiB rmem caps a
+    // ~1ms-RTT path at ~2 Gbps (quic-go sets ~7 MiB and lands dae at ~3
+    // Gbps). Request 8 MiB; the kernel clamps to 2×rmem_max, and honk-core
+    // raises rmem_max/wmem_max at startup when auto-config is enabled.
+    // Best-effort: sockets that don't need it (DNS queries) waste nothing
+    // because buffers grow on demand.
+    #[cfg(target_os = "linux")]
+    {
+        const QUIC_SOCK_BUF: usize = 8 << 20;
+        let _ = socket.set_recv_buffer_size(QUIC_SOCK_BUF);
+        let _ = socket.set_send_buffer_size(QUIC_SOCK_BUF);
+    }
     socket.bind(&bind_addr.into())?;
     Ok(socket.into())
 }
