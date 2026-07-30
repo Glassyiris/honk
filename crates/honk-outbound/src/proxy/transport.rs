@@ -226,8 +226,12 @@ async fn wrap_grpc(
     let service = node.grpc_service.as_deref().unwrap_or("GunService");
     let path = format!("/{}/Tun", service);
     let authority = node.host().to_string();
+    // gRPC servers (sing-box) reject :scheme http over a TLS connection.
+    let scheme = if node.tls { "https" } else { "http" };
 
-    Ok(Box::new(GrpcStream::new(stream, &path, &authority).await?))
+    Ok(Box::new(
+        GrpcStream::new(stream, &path, &authority, scheme).await?,
+    ))
 }
 
 /// Minimal gRPC client that wraps a TCP/TLS stream with HTTP/2
@@ -263,13 +267,13 @@ const H2_HEADERS: u8 = 0x1;
 const H2_SETTINGS: u8 = 0x4;
 
 const H2_FLAG_END_HEADERS: u8 = 0x04;
-const H2_FLAG_END_STREAM: u8 = 0x01;
 
 impl GrpcStream {
     async fn new(
         inner: Box<dyn AsyncReadWrite>,
         path: &str,
         authority: &str,
+        scheme: &str,
     ) -> anyhow::Result<Self> {
         let mut s = Self {
             inner,
@@ -280,7 +284,7 @@ impl GrpcStream {
         };
         s.send_preface().await?;
         s.send_settings().await?;
-        s.send_headers_frame(path, authority).await?;
+        s.send_headers_frame(path, authority, scheme).await?;
         Ok(s)
     }
 
@@ -309,7 +313,12 @@ impl GrpcStream {
     }
 
     /// Send a HEADERS frame to open stream 1 with gRPC pseudo-headers.
-    async fn send_headers_frame(&mut self, path: &str, authority: &str) -> anyhow::Result<()> {
+    async fn send_headers_frame(
+        &mut self,
+        path: &str,
+        authority: &str,
+        scheme: &str,
+    ) -> anyhow::Result<()> {
         let mut hpack = Vec::with_capacity(128);
 
         // :method: POST — literal header field with incremental indexing
@@ -319,10 +328,10 @@ impl GrpcStream {
         hpack.push(0x04);
         hpack.extend_from_slice(b"POST");
 
-        // :scheme: http — same pattern, static idx 6 = ":scheme"
+        // :scheme — same pattern, static idx 6 = ":scheme"
         hpack.push(0x46);
-        hpack.push(0x04);
-        hpack.extend_from_slice(b"http");
+        hpack.push(scheme.len() as u8);
+        hpack.extend_from_slice(scheme.as_bytes());
 
         // :path: <path> — static idx 4 = ":path"
         hpack.push(0x44);
@@ -355,7 +364,10 @@ impl GrpcStream {
             (payload_len >> 8) as u8,
             payload_len as u8,
             H2_HEADERS,
-            H2_FLAG_END_HEADERS | H2_FLAG_END_STREAM,
+            // gRPC is bidirectional streaming: DATA frames follow, so the
+            // HEADERS frame must NOT carry END_STREAM (servers reject
+            // writes on a client-closed stream with 400).
+            H2_FLAG_END_HEADERS,
             ((self.stream_id >> 24) & 0x7F) as u8,
             (self.stream_id >> 16) as u8,
             (self.stream_id >> 8) as u8,
