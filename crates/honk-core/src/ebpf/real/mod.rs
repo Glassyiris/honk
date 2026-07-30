@@ -112,9 +112,11 @@ impl RealEbpfBackend {
 
 mod attach;
 mod events;
+mod iface_watch;
 mod syscall;
 
 pub use events::*;
+pub use iface_watch::IfaceWatcher;
 pub use syscall::*;
 
 fn conn_key(outbound: u8, domain: u32, ipver: u32) -> u32 {
@@ -306,6 +308,21 @@ impl RealEbpfBackend {
 
 #[async_trait]
 impl EbpfBackend for RealEbpfBackend {
+    fn attach_dynamic_interface(
+        &mut self,
+        ifname: &str,
+        role: super::IfaceRole,
+        single_homed: bool,
+    ) -> anyhow::Result<()> {
+        match role {
+            super::IfaceRole::Lan => self.attach_lan(ifname, single_homed),
+            super::IfaceRole::Wan => {
+                self.attach_wan_egress(ifname)?;
+                self.attach_wan_ingress(ifname)
+            }
+        }
+    }
+
     fn set_param(&mut self, _key: ParamKey, _value: u32) -> anyhow::Result<()> {
         // The Rust eBPF code uses Global<DaeParam> instead of PARAM_MAP.
         // All parameters are set via inject() which writes to the global.
