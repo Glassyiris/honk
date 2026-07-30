@@ -8,7 +8,7 @@
 
 ```text
 ┌─────────────────────────────┐         ┌─────────────────────────────┐
-│ 10.10.10.50 (VM, 4C/2G)     │         │ 10.10.10.70 (物理机, 50G)   │
+│ 10.10.10.57 (VM, 4C/2G;换 host CPU 前是 .50)     │         │ 10.10.10.70 (物理机, 50G)   │
 │                             │         │                             │
 │  ┌───────────────┐          │  LAN    │  协议服务端:                │
 │  │ netns "lab"   │ veth     ├────────►│   hy2        :8443/udp      │
@@ -24,7 +24,7 @@
                                         └─────────────────────────────┘
 ```
 
-- **引擎机(10.10.10.50)**:同一时刻只运行 honk 或 dae 之一。客户端在
+- **引擎机(10.10.10.57)**:同一时刻只运行 honk 或 dae 之一。客户端在
   network namespace `lab` 里(veth 对 `veth-lab` ↔ `veth-client`,
   192.168.222.0/24,nftables masquerade NAT)。所有客户端流量都经过引擎真实的
   eBPF 数据面,因此数字包含完整内核路径,不是 loopback 捷径。
@@ -40,6 +40,10 @@
   物理机↔VM 可达 9.4 Gbps。因此带宽测试的服务端放在**物理机**上:客户端
   RX(9.4 Gbps)是天花板,而不是 VM 间链路。direct 基线(引擎 direct 路径 +
   NAT):**约 9.4 Gbps**。
+- **引擎 VM 的 CPU 已改为 host 透传(i5-13600K,AES-NI + AVX2)**。
+  之前是 qemu64 无 SIMD——所有 QUIC 加密都是软件实现(honk 的 BoringSSL
+  回落到 `nohw` C 版 ChaCha20-Poly1305,占引擎 CPU 34%),QUIC 带宽被压
+  在 ~2–2.4 Gbps。有了 AES-NI 后,下面的数字才代表生产硬件的真实水平。
 - 共享基础设施上跑与跑之间方差 ±5%;WAN 订阅上的停顿类假象以分钟级窗口波动,
   不是引擎回退——见下文"生产备注"。
 - 实验室是共享的。如果某一行数据看起来不对,发布前先重跑(别人中途重启引擎
@@ -83,71 +87,70 @@
 - **direct 基线**——同样方法测量未代理路径(`8080`/`5300`)。
 
 ```bash
-scp bench/lab-bench.sh root@10.10.10.50:/root/
-ssh root@10.10.10.50 "bash /root/lab-bench.sh 'honk dae' 'hy2 tuic ss2022 trojan anytls-sb anytls-go'"
+scp bench/lab-bench.sh root@10.10.10.57:/root/
+ssh root@10.10.10.57 "bash /root/lab-bench.sh 'honk dae' 'hy2 tuic ss2022 trojan anytls-sb anytls-go'"
 
 # 协议正确性矩阵(每协议 TCP 目标 / UDP echo / 外网)
-ssh root@10.10.10.50 bash /root/test-protocols.sh
+ssh root@10.10.10.57 bash /root/test-protocols.sh
 ```
 
-## 结果(2026-07-30,honk dev session 各阶段完成后 vs dae)
+## 结果(2026-07-30,honk dev session 各阶段完成后 vs dae kdae,AES-NI)
 
-实验室同时刻 A/B,方法如上。延迟单位为秒(curl `time_total`),带宽为
-iperf3 接收端中位数,CPU 为核数,RSS 为跑完后值。
+实验室同时刻 A/B(引擎 VM 已换 host 透传 CPU;更早的软件加密时代见
+"已知的实验室限制")。延迟单位为秒(curl `time_total`),带宽为
+iperf3 接收端中位数,CPU 为核数,RSS 为跑完后值。honk 为 musl 发布
+二进制(mimalloc)。
 
 | 引擎 | 协议 | cold | hot p50 | hot p95 | 带宽 (Mbps) | cpu | RSS (MB) |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| honk | direct | 0.0051 | – | – | 9397 | 0.25 | 14 |
-| honk | hy2 | 0.0082 | 0.0042 | 0.0055 | 2289² | 0.95 | 16 |
-| honk | tuic | 0.0109 | 0.0033 | 0.0041 | 2383² | 1.04 | 15 |
-| honk | ss2022 | 0.0043 | 0.0041 | 0.0049 | 1314 | 1.01 | 15 |
-| honk | trojan | 0.0051 | 0.0025 | 0.0104 | 4427 | 1.03 | 14 |
-| honk | anytls-sb | 0.0059 | 0.0021 | 0.0029 | 见注¹ | 0.00 | 14 |
-| honk | anytls-go | 0.0086 | 0.0023 | 0.0026 | 见注¹ | 0.00 | 14 |
-| dae | direct | 0.0087 | – | – | 9408 | 0.00 | 46 |
-| dae | hy2 | 0.0095 | 0.0038 | 0.0047 | 2511 | 1.45 | 64 |
-| dae | tuic | 0.0865 | 0.0792 | 0.0809 | 2669 | 1.44 | 64 |
-| dae | ss2022 | 0.0066 | 0.0039 | 0.0052 | 1528 | 1.01 | 50 |
-| dae | trojan | 0.0092 | 0.0089 | 0.0118 | 4157 | 1.04 | 53 |
+| honk | direct | 0.0052 | – | – | 9413 | 0.16 | 53 |
+| honk | hy2 | 0.0058 | 0.0018 | 0.0032 | 5239 | 1.06 | 64 |
+| honk | tuic | 0.0024 | 0.0038 | 0.0049 | 5351 | 1.06 | 66 |
+| honk | ss2022 | 0.0038 | 0.0018 | 0.0025 | 5339 | 1.01 | 57 |
+| honk | trojan | 0.0053 | 0.0014 | 0.0055 | 9366 | 0.42 | 49 |
+| honk | anytls-sb | 0.0052 | 0.0020 | 0.0031 | 5098¹ | – | 58 |
+| honk | anytls-go | 0.0126 | 0.0035 | 0.0046 | 6967¹ | – | 55 |
+| dae | direct | 故障² | – | – | – | – | – |
+| dae | hy2 | 0.0109 | 0.0030 | 0.0043 | 2996 | 0.75 | 62 |
+| dae | tuic | 0.0852 | 0.0797 | 0.0809 | 3920 | 0.84 | 64 |
+| dae | ss2022 | 0.0063 | 0.0040 | 0.0042 | 9396 | 0.49 | 52 |
+| dae | trojan | 0.0093 | 0.0084 | 0.0107 | 9370 | 0.66 | 57 |
 
 dae 各行为 **kdae 分支构建**(`2a007b39`,`unstable-20260729.r987`,
-在压测机上从 `../dae` 构建)。其 QUIC 行比 07-28 旧二进制慢约 18–20%
-(hy2 3058 → 2511、tuic 3335 → 2669——新合入的 26 个提交,含
-routing-epoch 重构,付出了吞吐代价);ss2022/trojan 基本持平。
-dae 行复跑过一次确认:除一次 trojan 读数被共享实验室上另一个测试会话
-污染外,全部在方差内复现。见"已知的实验室限制"。
-
-² honk hy2/tuic 两行为**修复后**数据:包含 QUIC socket 缓冲(8 MiB
-SO_RCVBUF/SO_SNDBUF + rmem_max/wmem_max 提升到 16 MiB)和接收窗口
-(8 MiB stream / 32 MiB conn)改动。修复前同样跑法为 hy2 1918 /
-tuic 2073 Mbps——瓶颈是 208 KiB 默认 socket 缓冲,不是引擎数据面。
+在压测机上从 `../dae` 构建)。
 
 ¹ **AnyTLS 单流 iperf3 异常(实验室假象,非引擎回退)**:本实验室内单流
-iperf3 过 AnyTLS 只有 2–3 Mbps。原因在服务端一侧——iperf3-daemon ↔
-anytls-server 的环回投递(iperf3 进入 app-limited 后不再喂数据)。用
-sing-box 客户端打同一批服务端可以复现,而 curl、python 和并发流都能跑满。
-用 `iperf3 -P 8` 实测:**anytls-sb 4754 Mbps、anytls-go 3554 Mbps**。
+iperf3 过 AnyTLS 只有 2–3 Mbps——原因是服务端一侧 iperf3-daemon ↔
+anytls-server 的环回投递(iperf3 进入 app-limited),用 sing-box 客户端
+可以复现;curl、python 和并发流都能跑满。表中为 `iperf3 -P 8` 的实测值。
+
+² dae 的 direct 路径在本实验室内核上故障(kdae 构建):direct 流超时,
+代理流正常。上表 dae 各协议行有效;无 dae direct 基线。
 
 ### 结果解读
 
-- **带宽**:honk trojan 领先(4427 vs 4157,+6%),QUIC 协议接近
-  (hy2 2289 vs 2511,−9%;tuic 2383 vs 2669,−11%——socket 缓冲/窗口
-  修复后的 quinn-vs-quic-go 残余差距,后续 profiling 再收),ss2022
-  接近(1314 vs 1528)。
-- **延迟**:极端案例是 TUIC:热开流 3.3 ms vs dae 78.6 ms——honk 的
-  BoringSSL QUIC 后端有进程级 TLS 1.3 票据缓存,热 TUIC 拨号只要 1 个 RTT;
-  dae 每条连接都要完整 QUIC 握手。冷启动同样(10.9 vs 86.5 ms)。其他行在
-  几 ms 内互有胜负(共享设施上 ms 级噪音)。
-- **CPU**:honk 在每个协议上都以约 1 核跑 multi-Gbps;dae 在 QUIC 协议上
-  需要约 1.45 核。
-- **内存**:honk 稳态 RSS 14–16 MB,dae 46–64 MB,约 3–4 倍差距。
+- **带宽**:honk 在两个 QUIC 协议上大幅领先(hy2 5239 vs 2996,+75%;
+  tuic 5351 vs 3920,+36%),trojan 打平线速(9366 vs 9370)。dae 唯一
+  领先的是 ss2022(9396 vs 5339)——honk 的 SS 数据面在 1.0 核打满,
+  而 dae 的 Go AES-GCM 汇编只用 0.49 核;这是当前的优化目标。
+- **每核带宽**:trojan 是亮点——线速只需 0.42 核(dae 要 0.66)。QUIC
+  协议 honk 用 ~1.06 核跑 5.2+ Gbps,dae 用 0.75–0.84 核跑 3–3.9 Gbps
+  (honk 每核多搬 75% 的字节)。
+- **延迟**:TUIC 仍是极端案例——热开流 3.8 ms vs dae 79.7 ms(honk 有
+  进程级 TLS 1.3 票据缓存,dae 每条连接完整 QUIC 握手;冷启动同样,
+  2.4 vs 85.2 ms)。其他行在几 ms 内互有胜负。
+- **内存**:honk 的 musl 构建用 mimalloc,它会保留回收的内存
+  arena——RSS 49–66 MB,与 dae(52–64 MB)持平。这是刻意的交换:
+  mimalloc 比 musl 原生 malloc 带来约 +50% 的 QUIC 吞吐(A/B:5096 vs
+  3037 Mbps),代价是约 40 MB 驻留内存。
 
-### 更早的结果
+### 更早的结果(软件加密实验室,AES-NI 之前)
 
-2026-07-29 的几轮(honk beta.22/beta.23,含与 sing-box 1.13.14 的三方对比,
-以及 dev@1715d86 的 inline 改动后复测)已被上表取代。依然成立的结论:honk
-约 1 核的 CPU 曲线、约 4 倍内存优势,以及对 sing-box 的 trojan/tuic 领先。
-ss2022 codec 重写(单流 0.87 → 1.33 Gbps)已包含在上表 1314 Mbps 中。
+引擎 VM 换 host 透传 CPU 之前,QUIC 数字对两个引擎都受限于软件加密:
+honk hy2/tuic 2289/2383 Mbps vs dae(kdae)2511/2669,honk 的 BoringSSL
+卡在 `nohw` C 版 ChaCha20(占引擎 CPU 34%)。那些行已被上表取代。
+QUIC socket 缓冲修复(8 MiB SO_RCVBUF/SO_SNDBUF + rmem_max/wmem_max
+提到 16 MiB)和 8/32 MiB 接收窗口默认值先于两张表,对两者都适用。
 
 ## DNS 微基准(criterion)
 

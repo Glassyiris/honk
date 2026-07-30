@@ -54,6 +54,10 @@ socket2.workspace = true
 bytes.workspace = true
 pin-project-lite.workspace = true
 
+# musl's stock malloc is slow under contention (visible as ~8% malloc+lock
+# time in perf); mimalloc is the allocator for the shipped binary.
+mimalloc = "0.1"
+
 # Encoding
 base64.workspace = true
 percent-encoding.workspace = true

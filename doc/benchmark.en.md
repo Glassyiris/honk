@@ -9,7 +9,7 @@ repo so the setup and the numbers stay in sync with the code.
 
 ```text
 ┌─────────────────────────────┐         ┌─────────────────────────────┐
-│ 10.10.10.50 (VM, 4C/2G)     │         │ 10.10.10.70 (physical, 50G) │
+│ 10.10.10.57 (VM, 4C/2G; was .50 before the host-CPU rebuild)     │         │ 10.10.10.70 (physical, 50G) │
 │                             │         │                             │
 │  ┌───────────────┐          │  LAN    │  Protocol servers:          │
 │  │ netns "lab"   │ veth     ├────────►│   hy2        :8443/udp      │
@@ -25,7 +25,7 @@ repo so the setup and the numbers stay in sync with the code.
                                         └─────────────────────────────┘
 ```
 
-- **Engine host (10.10.10.50)**: runs either honk or dae (never both). The
+- **Engine host (10.10.10.57)**: runs either honk or dae (never both). The
   client lives in network namespace `lab` (veth pair `veth-lab` ↔
   `veth-client`, 192.168.222.0/24, NAT via nftables masquerade). All client
   traffic crosses the engine's real eBPF datapath, so numbers include the
@@ -43,6 +43,12 @@ repo so the setup and the numbers stay in sync with the code.
   servers therefore live on the **physical** host: client RX (9.4 Gbps) is
   the ceiling, not the inter-VM link. Direct baseline (engine direct path +
   NAT): **~9.4 Gbps**.
+- **Engine VM CPU is host-passthrough (i5-13600K, AES-NI + AVX2)**. It
+  used to be qemu64 with no SIMD — all QUIC crypto was software (honk's
+  BoringSSL fell back to its `nohw` C ChaCha20-Poly1305, 34% of engine
+  CPU), and QUIC bandwidth capped ~2–2.4 Gbps for both engines. With
+  AES-NI the numbers below are crypto-representative of production
+  hardware.
 - Run-to-run variance on shared infrastructure is ±5%; stall-type artifacts
   on WAN subscriptions fluctuate on multi-minute windows and are not engine
   regressions — see "Production notes" below.
@@ -94,81 +100,77 @@ Per engine × protocol:
   (`8080`/`5300`).
 
 ```bash
-scp bench/lab-bench.sh root@10.10.10.50:/root/
-ssh root@10.10.10.50 "bash /root/lab-bench.sh 'honk dae' 'hy2 tuic ss2022 trojan anytls-sb anytls-go'"
+scp bench/lab-bench.sh root@10.10.10.57:/root/
+ssh root@10.10.10.57 "bash /root/lab-bench.sh 'honk dae' 'hy2 tuic ss2022 trojan anytls-sb anytls-go'"
 
 # Protocol correctness matrix (TCP target / UDP echo / internet per protocol)
-ssh root@10.10.10.50 bash /root/test-protocols.sh
+ssh root@10.10.10.57 bash /root/test-protocols.sh
 ```
 
-## Results (2026-07-30, honk dev post-session-phases vs dae)
+## Results (2026-07-30, honk dev post-session-phases vs dae kdae, AES-NI)
 
-Same-time A/B on the lab; full methodology above. Latencies in seconds
-(curl `time_total`), bandwidth is the iperf3 receiver median, CPU in cores,
-RSS after the run.
+Same-time A/B on the lab (engine VM with host-passthrough CPU; see "Known
+lab limits" for the earlier software-crypto era). Latencies in seconds
+(curl `time_total`), bandwidth is the iperf3 receiver median, CPU in
+cores, RSS after the run. honk runs the musl release binary (mimalloc).
 
 | engine | protocol | cold | hot p50 | hot p95 | bw (Mbps) | cpu | RSS (MB) |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| honk | direct | 0.0051 | – | – | 9397 | 0.25 | 14 |
-| honk | hy2 | 0.0082 | 0.0042 | 0.0055 | 2289² | 0.95 | 16 |
-| honk | tuic | 0.0109 | 0.0033 | 0.0041 | 2383² | 1.04 | 15 |
-| honk | ss2022 | 0.0043 | 0.0041 | 0.0049 | 1314 | 1.01 | 15 |
-| honk | trojan | 0.0051 | 0.0025 | 0.0104 | 4427 | 1.03 | 14 |
-| honk | anytls-sb | 0.0059 | 0.0021 | 0.0029 | see note¹ | 0.00 | 14 |
-| honk | anytls-go | 0.0086 | 0.0023 | 0.0026 | see note¹ | 0.00 | 14 |
-| dae | direct | 0.0087 | – | – | 9408 | 0.00 | 46 |
-| dae | hy2 | 0.0095 | 0.0038 | 0.0047 | 2511 | 1.45 | 64 |
-| dae | tuic | 0.0865 | 0.0792 | 0.0809 | 2669 | 1.44 | 64 |
-| dae | ss2022 | 0.0066 | 0.0039 | 0.0052 | 1528 | 1.01 | 50 |
-| dae | trojan | 0.0092 | 0.0089 | 0.0118 | 4157 | 1.04 | 53 |
+| honk | direct | 0.0052 | – | – | 9413 | 0.16 | 53 |
+| honk | hy2 | 0.0058 | 0.0018 | 0.0032 | 5239 | 1.06 | 64 |
+| honk | tuic | 0.0024 | 0.0038 | 0.0049 | 5351 | 1.06 | 66 |
+| honk | ss2022 | 0.0038 | 0.0018 | 0.0025 | 5339 | 1.01 | 57 |
+| honk | trojan | 0.0053 | 0.0014 | 0.0055 | 9366 | 0.42 | 49 |
+| honk | anytls-sb | 0.0052 | 0.0020 | 0.0031 | 5098¹ | – | 58 |
+| honk | anytls-go | 0.0126 | 0.0035 | 0.0046 | 6967¹ | – | 55 |
+| dae | direct | broken² | – | – | – | – | – |
+| dae | hy2 | 0.0109 | 0.0030 | 0.0043 | 2996 | 0.75 | 62 |
+| dae | tuic | 0.0852 | 0.0797 | 0.0809 | 3920 | 0.84 | 64 |
+| dae | ss2022 | 0.0063 | 0.0040 | 0.0042 | 9396 | 0.49 | 52 |
+| dae | trojan | 0.0093 | 0.0084 | 0.0107 | 9370 | 0.66 | 57 |
 
 The dae rows are the **kdae branch build** (`2a007b39`,
-`unstable-20260729.r987`), built from `../dae` on the bench host. Its QUIC
-rows are ~18–20% slower than the previous 07-28 binary (hy2 3058 → 2511,
-tuic 3335 → 2669 — the 26 new commits, routing-epoch refactor included,
-cost throughput); ss2022/trojan are unchanged. dae rows were re-run once
-to confirm: every number reproduced within variance except one trojan
-reading polluted by another test session on the shared lab. See "Known
-lab limits".
-
-² honk hy2/tuic rows are **post-fix**: they include the QUIC socket-buffer
-(8 MiB SO_RCVBUF/SO_SNDBUF + rmem_max/wmem_max raised to 16 MiB) and
-receive-window (8 MiB stream / 32 MiB conn) changes. Before them the same
-runs read hy2 1918 / tuic 2073 Mbps — the 208 KiB default socket buffer
-was the cap, not the engine's datapath.
+`unstable-20260729.r987`), built from `../dae` on the bench host.
 
 ¹ **AnyTLS single-stream iperf3 anomaly (lab artifact, not an engine
 regression)**: single-stream iperf3 through AnyTLS reads 2–3 Mbps in this
-lab. The cause is on the server host — iperf3-daemon ↔ anytls-server
-loopback delivery (iperf3 goes app-limited and stops feeding data). It
-reproduces with a sing-box client over the same servers, while curl,
-python and parallel streams all run at line rate. Measured with
-`iperf3 -P 8`: **anytls-sb 4754 Mbps, anytls-go 3554 Mbps**.
+lab — the cause is iperf3-daemon ↔ anytls-server loopback delivery on the
+server host (iperf3 goes app-limited), reproducible with a sing-box
+client; curl, python and parallel streams run at line rate. The table
+shows `iperf3 -P 8` measurements.
+
+² dae's direct path is broken on this lab kernel (kdae build): direct
+flows time out while proxied flows work. All dae protocol rows above are
+valid; there is no dae direct baseline.
 
 ### Reading the table
 
-- **Bandwidth**: honk leads trojan (4427 vs 4157, +6%) and is close on the
-  QUIC protocols (hy2 2289 vs 2511, −9%; tuic 2383 vs 2669, −11% — the
-  residual quinn-vs-quic-go gap after the socket-buffer/window fix;
-  profiling is future work); ss2022 is close (1314 vs 1528).
-- **Latency**: the extreme case is TUIC: 3.3 ms hot vs dae's 78.6 ms —
-  honk's BoringSSL QUIC backend resumes TLS 1.3 sessions from a
-  process-wide ticket cache, so a warm TUIC dial is one RTT; dae pays a
-  full QUIC handshake per connection. Cold TUIC tells the same story
-  (10.9 vs 86.5 ms). Other rows are within a few ms both ways (ms-level
-  noise on shared infrastructure).
-- **CPU**: honk holds ~1 core at multi-Gbps on every protocol; dae needs
-  ~1.45 cores on the QUIC protocols.
-- **Memory**: honk idles ~3–4× leaner (14–16 MB vs 46–64 MB RSS).
+- **Bandwidth**: honk leads on both QUIC protocols by a wide margin
+  (hy2 5239 vs 2996, +75%; tuic 5351 vs 3920, +36%) and ties trojan at
+  line rate (9366 vs 9370). dae's only win is ss2022 (9396 vs 5339) —
+  honk's SS data path is single-core-bound at 1.0 cores while dae's Go
+  AES-GCM assembly idles at 0.49; that is the current optimization target.
+- **CPU per Gbps**: honk trojan is the standout — line rate at 0.42 cores
+  (dae needs 0.66). QUIC protocols cost honk ~1.06 cores at 5.2+ Gbps vs
+  dae's 0.75–0.84 at 3–3.9 Gbps (honk moves 75% more bytes per core).
+- **Latency**: TUIC remains the extreme case — 3.8 ms hot vs dae's 79.7 ms
+  (honk resumes TLS 1.3 sessions from a process-wide ticket cache; dae
+  pays a full QUIC handshake per connection; cold tells the same story,
+  2.4 vs 85.2 ms). Other rows are within a few ms both ways.
+- **Memory**: honk's musl build uses mimalloc, which retains freed arenas
+  — RSS 49–66 MB, at parity with dae (52–64 MB). The trade is deliberate:
+  mimalloc buys ~+50% QUIC throughput over musl's stock malloc (5096 vs
+  3037 Mbps A/B) for ~40 MB of retained memory.
 
-### Earlier results
+### Earlier results (software-crypto lab, pre-AES-NI)
 
-The 2026-07-29 runs (honk beta.22/beta.23, including the three-way with
-sing-box 1.13.14 and the post-inline re-measurement at dev@1715d86) are
-superseded by the table above. Numbers that carried over unchanged: honk's
-~1-core CPU profile, the 4× memory advantage, and the trojan/tuic wins
-over sing-box. The ss2022 codec rewrite (0.87 → 1.33 Gbps single-stream)
-is in the 1314 Mbps figure above.
+Before the engine VM got a host-passthrough CPU, QUIC numbers were
+software-crypto-bound for both engines: honk hy2/tuic 2289/2383 Mbps vs
+dae(kdae) 2511/2669, with honk's BoringSSL stuck on `nohw` C ChaCha20
+(34% of engine CPU). Those rows are superseded by the table above. The
+QUIC socket-buffer fix (8 MiB SO_RCVBUF/SO_SNDBUF + rmem_max/wmem_max at
+16 MiB) and the 8/32 MiB receive-window defaults predate both tables and
+apply to both.
 
 ## DNS micro-benchmarks (criterion)
 

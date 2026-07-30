@@ -25,11 +25,11 @@ dae has no AnyTLS support; `anytls-*` rows are skipped for it.
 
 ## Usage
 
-The script runs **on the engine host** (10.10.10.50):
+The script runs **on the engine host** (10.10.10.57):
 
 ```bash
-scp bench/lab-bench.sh root@10.10.10.50:/root/
-ssh root@10.10.10.50 "bash /root/lab-bench.sh 'honk dae' 'hy2 tuic ss2022 trojan anytls-sb anytls-go'"
+scp bench/lab-bench.sh root@10.10.10.57:/root/
+ssh root@10.10.10.57 "bash /root/lab-bench.sh 'honk dae' 'hy2 tuic ss2022 trojan anytls-sb anytls-go'"
 # args: [engines] [protocols] — both are space lists inside one arg
 ```
 
