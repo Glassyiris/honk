@@ -419,6 +419,14 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), crate::ConfigError> {
+        // The eBPF datapath has the mark compiled in; userspace cannot inject
+        // a different value, so a custom mark would silently break the proxy.
+        if self.global.tproxy_mark != default_tproxy_mark() {
+            return Err(crate::ConfigError::Validation(format!(
+                "global.tproxy_mark must be {:#x} (compiled into the eBPF datapath)",
+                default_tproxy_mark()
+            )));
+        }
         for node in &self.nodes {
             if node.name.is_empty() {
                 return Err(crate::ConfigError::Validation(
