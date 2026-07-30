@@ -116,16 +116,20 @@ RSS after the run.
 | honk | trojan | 0.0051 | 0.0025 | 0.0104 | 4427 | 1.03 | 14 |
 | honk | anytls-sb | 0.0059 | 0.0021 | 0.0029 | see note¹ | 0.00 | 14 |
 | honk | anytls-go | 0.0086 | 0.0023 | 0.0026 | see note¹ | 0.00 | 14 |
-| dae | direct | 0.0055 | – | – | 9410 | 0.00 | 46 |
-| dae | hy2 | 0.0061 | 0.0016 | 0.0021 | 3058 | 1.67 | 65 |
-| dae | tuic | 0.0808 | 0.0786 | 0.0793 | 3335 | 1.70 | 63 |
-| dae | ss2022 | 0.0073 | 0.0022 | 0.0029 | 1511 | 1.01 | 52 |
-| dae | trojan | 0.0103 | 0.0082 | 0.0105 | 4178 | 1.03 | 54 |
+| dae | direct | 0.0087 | – | – | 9408 | 0.00 | 46 |
+| dae | hy2 | 0.0095 | 0.0038 | 0.0047 | 2511 | 1.45 | 64 |
+| dae | tuic | 0.0865 | 0.0792 | 0.0809 | 2669 | 1.44 | 64 |
+| dae | ss2022 | 0.0066 | 0.0039 | 0.0052 | 1528 | 1.01 | 50 |
+| dae | trojan | 0.0092 | 0.0089 | 0.0118 | 4157 | 1.04 | 53 |
 
-The dae rows were re-run once to confirm: every number reproduced within
-variance except trojan bandwidth, whose first reading (654 Mbps at
-0.16 cores) was polluted by another test session restarting engines on the
-shared lab mid-run. See "Known lab limits".
+The dae rows are the **kdae branch build** (`2a007b39`,
+`unstable-20260729.r987`), built from `../dae` on the bench host. Its QUIC
+rows are ~18–20% slower than the previous 07-28 binary (hy2 3058 → 2511,
+tuic 3335 → 2669 — the 26 new commits, routing-epoch refactor included,
+cost throughput); ss2022/trojan are unchanged. dae rows were re-run once
+to confirm: every number reproduced within variance except one trojan
+reading polluted by another test session on the shared lab. See "Known
+lab limits".
 
 ² honk hy2/tuic rows are **post-fix**: they include the QUIC socket-buffer
 (8 MiB SO_RCVBUF/SO_SNDBUF + rmem_max/wmem_max raised to 16 MiB) and
@@ -143,19 +147,19 @@ python and parallel streams all run at line rate. Measured with
 
 ### Reading the table
 
-- **Bandwidth**: honk leads trojan (4427 vs 4178, +6%) and trails on the
-  QUIC protocols (hy2 2289 vs 3058, tuic 2383 vs 3335 — the residual
-  quinn-vs-quic-go gap after the socket-buffer/window fix; profiling is
-  future work); ss2022 is close (1314 vs 1511).
+- **Bandwidth**: honk leads trojan (4427 vs 4157, +6%) and is close on the
+  QUIC protocols (hy2 2289 vs 2511, −9%; tuic 2383 vs 2669, −11% — the
+  residual quinn-vs-quic-go gap after the socket-buffer/window fix;
+  profiling is future work); ss2022 is close (1314 vs 1528).
 - **Latency**: the extreme case is TUIC: 3.3 ms hot vs dae's 78.6 ms —
   honk's BoringSSL QUIC backend resumes TLS 1.3 sessions from a
   process-wide ticket cache, so a warm TUIC dial is one RTT; dae pays a
   full QUIC handshake per connection. Cold TUIC tells the same story
-  (10.9 vs 80.8 ms). Other rows are within a few ms both ways (ms-level
+  (10.9 vs 86.5 ms). Other rows are within a few ms both ways (ms-level
   noise on shared infrastructure).
 - **CPU**: honk holds ~1 core at multi-Gbps on every protocol; dae needs
-  1.7 cores on the QUIC protocols.
-- **Memory**: honk idles ~3–4× leaner (14–16 MB vs 46–65 MB RSS).
+  ~1.45 cores on the QUIC protocols.
+- **Memory**: honk idles ~3–4× leaner (14–16 MB vs 46–64 MB RSS).
 
 ### Earlier results
 
