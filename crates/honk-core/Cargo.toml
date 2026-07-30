@@ -57,6 +57,9 @@ pin-project-lite.workspace = true
 # musl's stock malloc is slow under contention (visible as ~8% malloc+lock
 # time in perf); mimalloc is the allocator for the shipped binary.
 mimalloc = "0.1"
+# Same sys crate instance as mimalloc's (cargo feature unification), used
+# for mi_collect from the binary's maintenance task.
+libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
 
 # Encoding
 base64.workspace = true
