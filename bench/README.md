@@ -49,10 +49,9 @@ Stdout is a markdown table; raw TSV appends to `/root/bench-results.tsv`.
 
 ## Known measurement traps
 
-- **Single-stream iperf3 through AnyTLS reads ~2-3 Mbps in this lab** —
-  an iperf3-daemon ↔ anytls-server loopback delivery artifact on the
-  server host (reproducible with a sing-box client; curl/python and
-  `-P 8` parallel streams run at multi-Gbps). Measure AnyTLS bandwidth
-  with `iperf3 -P 8` and say so in the table.
 - The lab is shared. Another session restarting engines mid-run corrupts
   numbers — re-run any row that looks off before publishing.
+- Historical (fixed): single-stream iperf3 through AnyTLS read 2–3 Mbps
+  because honk killed streams instantly on a full demux queue. Fixed by
+  bounded HOL backpressure; single-stream anytls numbers are now valid
+  and included in the table.

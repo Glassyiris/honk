@@ -121,23 +121,29 @@ cores, RSS after the run. honk runs the musl release binary (mimalloc).
 | honk | tuic | 0.0024 | 0.0038 | 0.0049 | 5351 | 1.06 | 66 |
 | honk | ss2022 | 0.0038 | 0.0018 | 0.0025 | 9388 | 0.37 | 57 |
 | honk | trojan | 0.0053 | 0.0014 | 0.0055 | 9366 | 0.42 | 49 |
-| honk | anytls-sb | 0.0052 | 0.0020 | 0.0031 | 5098¹ | – | 58 |
-| honk | anytls-go | 0.0126 | 0.0035 | 0.0046 | 6967¹ | – | 55 |
+| honk | anytls-sb | 0.0052 | 0.0020 | 0.0031 | 4954¹ | – | 58 |
+| honk | anytls-go | 0.0126 | 0.0035 | 0.0046 | 9272¹ | – | 55 |
 | dae | direct | broken² | – | – | – | – | – |
 | dae | hy2 | 0.0109 | 0.0030 | 0.0043 | 2996 | 0.75 | 62 |
 | dae | tuic | 0.0852 | 0.0797 | 0.0809 | 3920 | 0.84 | 64 |
 | dae | ss2022 | 0.0063 | 0.0040 | 0.0042 | 9396 | 0.49 | 52 |
 | dae | trojan | 0.0093 | 0.0084 | 0.0107 | 9370 | 0.66 | 57 |
+| dae | anytls-sb | 0.0088 | 0.0014 | 0.0023 | 9155 | 0.60 | 58 |
+| dae | anytls-go | 0.0044 | 0.0017 | 0.0021 | 9379 | 0.62 | 59 |
 
 The dae rows are the **kdae branch build** (`2a007b39`,
-`unstable-20260729.r987`), built from `../dae` on the bench host.
+`unstable-20260729.r987`), built from `../dae` on the bench host — the
+first dae build with AnyTLS support.
 
-¹ **AnyTLS single-stream iperf3 anomaly (lab artifact, not an engine
-regression)**: single-stream iperf3 through AnyTLS reads 2–3 Mbps in this
-lab — the cause is iperf3-daemon ↔ anytls-server loopback delivery on the
-server host (iperf3 goes app-limited), reproducible with a sing-box
-client; curl, python and parallel streams run at line rate. The table
-shows `iperf3 -P 8` measurements.
+¹ honk's anytls rows carry a history: single-stream iperf3 used to read
+2–3 Mbps here. The cause was honk's own — a full per-stream demux queue
+(64 frames) triggered an *instant* stream kill, which fired 22 ms into a
+single-stream run when the server's initial flight outran the fresh
+relay task; the server then flooded the pooled session with PSH frames
+for the dead sid. Fixed by real bounded HOL backpressure (the demux
+parks up to 5 s on a full queue before killing). anytls-go now matches
+dae; anytls-sb trails (the sing-box server emits patterns dae tolerates
+better — future work).
 
 ² dae's direct path is broken on this lab kernel (kdae build): direct
 flows time out while proxied flows work. All dae protocol rows above are
@@ -145,13 +151,15 @@ valid; there is no dae direct baseline.
 
 ### Reading the table
 
-- **Bandwidth**: honk leads or ties on every protocol. hy2 5239 vs 2996
-  (+75%), tuic 5351 vs 3920 (+36%), trojan at line rate 9366 vs 9370,
-  ss2022 at line rate 9388 vs 9396 (−0.1%, a tie). ss2022 got there via
-  the BoringSSL AEAD swap: RustCrypto's aes-gcm measured 0.4–0.5 GB/s
-  (AES-NI path not engaged) vs BoringSSL's 3.3–6.7 GB/s
-  (`benches/ss_aead.rs`), and the swap took the row from 5339 Mbps /
-  1.01 cores to 9388 / 0.37 — now also ahead of dae on CPU (0.37 vs 0.49).
+- **Bandwidth**: honk leads or ties on every TCP-based protocol. hy2 5239
+  vs 2996 (+75%), tuic 5351 vs 3920 (+36%), trojan at line rate 9366 vs
+  9370, ss2022 at line rate 9388 vs 9396 (−0.1%, a tie), anytls-go 9272
+  vs 9379 (a tie). The one remaining gap is anytls against the sing-box
+  server: 4954 vs dae's 9155. ss2022 got to line rate via the BoringSSL
+  AEAD swap: RustCrypto's aes-gcm measured 0.4–0.5 GB/s (AES-NI path not
+  engaged) vs BoringSSL's 3.3–6.7 GB/s (`benches/ss_aead.rs`), and the
+  swap took the row from 5339 Mbps / 1.01 cores to 9388 / 0.37 — now
+  also ahead of dae on CPU (0.37 vs 0.49).
 - **CPU per Gbps**: honk trojan is the standout — line rate at 0.42 cores
   (dae needs 0.66). QUIC protocols cost honk ~1.06 cores at 5.2+ Gbps vs
   dae's 0.75–0.84 at 3–3.9 Gbps (honk moves 75% more bytes per core).

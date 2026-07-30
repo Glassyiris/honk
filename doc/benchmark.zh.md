@@ -108,34 +108,39 @@ iperf3 接收端中位数,CPU 为核数,RSS 为跑完后值。honk 为 musl 发�
 | honk | tuic | 0.0024 | 0.0038 | 0.0049 | 5351 | 1.06 | 66 |
 | honk | ss2022 | 0.0038 | 0.0018 | 0.0025 | 9388 | 0.37 | 57 |
 | honk | trojan | 0.0053 | 0.0014 | 0.0055 | 9366 | 0.42 | 49 |
-| honk | anytls-sb | 0.0052 | 0.0020 | 0.0031 | 5098¹ | – | 58 |
-| honk | anytls-go | 0.0126 | 0.0035 | 0.0046 | 6967¹ | – | 55 |
+| honk | anytls-sb | 0.0052 | 0.0020 | 0.0031 | 4954¹ | – | 58 |
+| honk | anytls-go | 0.0126 | 0.0035 | 0.0046 | 9272¹ | – | 55 |
 | dae | direct | 故障² | – | – | – | – | – |
 | dae | hy2 | 0.0109 | 0.0030 | 0.0043 | 2996 | 0.75 | 62 |
 | dae | tuic | 0.0852 | 0.0797 | 0.0809 | 3920 | 0.84 | 64 |
 | dae | ss2022 | 0.0063 | 0.0040 | 0.0042 | 9396 | 0.49 | 52 |
 | dae | trojan | 0.0093 | 0.0084 | 0.0107 | 9370 | 0.66 | 57 |
+| dae | anytls-sb | 0.0088 | 0.0014 | 0.0023 | 9155 | 0.60 | 58 |
+| dae | anytls-go | 0.0044 | 0.0017 | 0.0021 | 9379 | 0.62 | 59 |
 
 dae 各行为 **kdae 分支构建**(`2a007b39`,`unstable-20260729.r987`,
-在压测机上从 `../dae` 构建)。
+在压测机上从 `../dae` 构建)——第一个支持 AnyTLS 的 dae 构建。
 
-¹ **AnyTLS 单流 iperf3 异常(实验室假象,非引擎回退)**:本实验室内单流
-iperf3 过 AnyTLS 只有 2–3 Mbps——原因是服务端一侧 iperf3-daemon ↔
-anytls-server 的环回投递(iperf3 进入 app-limited),用 sing-box 客户端
-可以复现;curl、python 和并发流都能跑满。表中为 `iperf3 -P 8` 的实测值。
+¹ honk 的 anytls 两行有一段历史:单流 iperf3 曾只有 2–3 Mbps。根因在
+honk 自身——单流 demux 队列满(64 帧)会**立即**杀流,单流测试中服务器
+的初始飞行快过新建 relay 任务,22ms 就触发杀流;随后服务器继续向池化
+会话灌死 sid 的 PSH 垃圾帧。修复为真正的有界 HOL 背压(队列满时 demux
+最多等 5s 再杀)。anytls-go 现在与 dae 持平;anytls-sb 落后(sing-box
+服务端的帧模式 dae 容忍得更好——后续工作)。
 
 ² dae 的 direct 路径在本实验室内核上故障(kdae 构建):direct 流超时,
 代理流正常。上表 dae 各协议行有效;无 dae direct 基线。
 
 ### 结果解读
 
-- **带宽**:honk 在所有协议上领先或打平。hy2 5239 vs 2996(+75%)、
+- **带宽**:honk 在所有 TCP 协议上领先或打平。hy2 5239 vs 2996(+75%)、
   tuic 5351 vs 3920(+36%)、trojan 线速 9366 vs 9370、ss2022 线速
-  9388 vs 9396(−0.1%,平)。ss2022 靠 BoringSSL AEAD 替换达成:
-  RustCrypto aes-gcm 实测 0.4–0.5 GB/s(AES-NI 路径未启用)vs
-  BoringSSL 3.3–6.7 GB/s(`benches/ss_aead.rs`),替换把该行从
-  5339 Mbps / 1.01 核提到 9388 / 0.37 核——CPU 也反超 dae
-  (0.37 vs 0.49)。
+  9388 vs 9396(−0.1%,平)、anytls-go 9272 vs 9379(平)。唯一剩余的
+  差距是对 sing-box 服务端的 anytls:4954 vs dae 9155。ss2022 靠
+  BoringSSL AEAD 替换达成线速:RustCrypto aes-gcm 实测 0.4–0.5 GB/s
+  (AES-NI 路径未启用)vs BoringSSL 3.3–6.7 GB/s(`benches/ss_aead.rs`),
+  替换把该行从 5339 Mbps / 1.01 核提到 9388 / 0.37 核——CPU 也反超
+  dae(0.37 vs 0.49)。
 - **每核带宽**:trojan 是亮点——线速只需 0.42 核(dae 要 0.66)。QUIC
   协议 honk 用 ~1.06 核跑 5.2+ Gbps,dae 用 0.75–0.84 核跑 3–3.9 Gbps
   (honk 每核多搬 75% 的字节)。
