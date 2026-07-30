@@ -28,8 +28,11 @@ fn representative_config() -> DnsConfig {
 }
 
 #[test]
-fn canonical_policy_matches_golden_vector_when_reconstructed() {
+fn dns_v2_persistence_cache_identity_matches_external_golden_contract() {
     // Given
+    // This externally versioned `dns:v2` byte vector is persisted and used as
+    // cache identity; it intentionally does not derive expectations from the
+    // encoder implementation under test.
     let first = representative_config();
     let second = representative_config();
 
