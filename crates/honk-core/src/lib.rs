@@ -766,6 +766,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                         proxy_registry: control_plane.proxy_registry(),
                         mode_state,
                         secret: clash_cfg.secret.clone(),
+                        connection_pool: control_plane.connection_pool(),
                         external_ui: clash_cfg.external_ui.clone(),
                         log_tx: clash_log_tx.clone(),
                         dns_cache: control_plane.dns_cache().await,

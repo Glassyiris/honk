@@ -401,6 +401,12 @@ impl ControlPlane {
         self.stats.clone()
     }
 
+    /// Shared connection pool (bare TCP + ready streams) for the clash
+    /// API's pool metrics.
+    pub fn connection_pool(&self) -> Arc<ConnectionPool> {
+        self.connection_pool.clone()
+    }
+
     pub fn alive_set(&self) -> Arc<crate::outbound::AliveDialerSet> {
         self.alive_set.clone()
     }

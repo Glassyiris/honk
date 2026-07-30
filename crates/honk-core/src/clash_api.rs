@@ -53,6 +53,8 @@ pub struct ClashState {
     pub mode_state: SharedModeState,
     /// Bearer secret from `experimental.clash_api.secret`; empty = no auth.
     pub secret: String,
+    /// Shared connection pool (ready-pool hit/miss metrics in `/stats`).
+    pub connection_pool: Arc<crate::pool::ConnectionPool>,
     /// External UI directory (`experimental.clash_api.external_ui`).
     pub external_ui: String,
     /// Broadcast channel fed by the clash log tracing layer.
@@ -879,7 +881,15 @@ async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json
             })
         })
         .collect();
-    Json(serde_json::json!({"outbounds": per_outbound}))
+    let pool = s.connection_pool.ready_metrics();
+    Json(serde_json::json!({
+        "outbounds": per_outbound,
+        "pool": {
+            "readyHits": pool.hits,
+            "readyMisses": pool.misses,
+            "entries": pool.entries,
+        },
+    }))
 }
 
 #[derive(Debug, serde::Deserialize)]

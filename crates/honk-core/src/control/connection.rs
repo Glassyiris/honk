@@ -766,9 +766,15 @@ impl ControlPlaneHandle {
                     let registry = ctx.proxy_registry.clone();
                     let target_domain = target_domain.clone();
                     tokio::spawn(async move {
+                        let caps = honk_outbound::runtime::OutboundCapabilities::for_node(&node);
                         let (ready_capable, bare_capable) = registry
                             .find(node.protocol)
-                            .map(|h| (h.pool_ready_streams(&node), h.pool_bare_tcp(&node)))
+                            .map(|h| {
+                                (
+                                    h.pool_ready_streams(&node) && caps.tcp && !caps.multiplexed,
+                                    h.pool_bare_tcp(&node),
+                                )
+                            })
                             .unwrap_or((false, false));
                         if ready_capable {
                             let key = ConnectionPool::ready_key(
@@ -776,6 +782,11 @@ impl ControlPlaneHandle {
                                 target,
                                 target_domain.as_deref(),
                             );
+                            // Only hot targets earn a speculative ready
+                            // dial; a one-off flow gets none.
+                            if !pool.note_target(&key) {
+                                return;
+                            }
                             match registry
                                 .dial(&node, target, target_domain.as_deref(), connect_timeout)
                                 .await
@@ -968,9 +979,15 @@ impl ControlPlaneHandle {
                     let registry = self.proxy_registry.clone();
                     let target_domain = target_domain.clone();
                     tokio::spawn(async move {
+                        let caps = honk_outbound::runtime::OutboundCapabilities::for_node(&node);
                         let (ready_capable, bare_capable) = registry
                             .find(node.protocol)
-                            .map(|h| (h.pool_ready_streams(&node), h.pool_bare_tcp(&node)))
+                            .map(|h| {
+                                (
+                                    h.pool_ready_streams(&node) && caps.tcp && !caps.multiplexed,
+                                    h.pool_bare_tcp(&node),
+                                )
+                            })
                             .unwrap_or((false, false));
                         if ready_capable {
                             let key = ConnectionPool::ready_key(
@@ -978,6 +995,11 @@ impl ControlPlaneHandle {
                                 resolved_target,
                                 target_domain.as_deref(),
                             );
+                            // Only hot targets earn a speculative ready
+                            // dial; a one-off flow gets none.
+                            if !pool.note_target(&key) {
+                                return;
+                            }
                             match registry
                                 .dial(
                                     &node,
