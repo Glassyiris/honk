@@ -522,9 +522,16 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         for _attempt in 0..2 {
             let session = self.offer(key, dial.clone()).await?;
             let Some(permit) = session.try_reserve() else {
-                // Draining/closed or saturated between offer and reserve:
-                // prune and retry — the pool dials a fresh session.
-                self.invalidate(key, &session);
+                if session.state() != SessionState::Active {
+                    // Draining/closed between offer and reserve: prune and
+                    // retry — the pool dials a fresh session.
+                    self.invalidate(key, &session);
+                }
+                // Saturated between offer and reserve: the session stays —
+                // it is healthy and its streams are alive, killing it
+                // would nuke up to a full session of live traffic (the
+                // "full-capacity false kill"). Retry instead: offer picks
+                // another session, dials a new one, or backs off at the cap.
                 last_err = Some(anyhow!("session has no stream capacity"));
                 continue;
             };
@@ -814,6 +821,73 @@ mod tests {
         s2.streams.store(3, Ordering::Relaxed); // over cap
         let s3 = mk(&pool, Arc::clone(&dial_count)).await;
         assert!(Arc::ptr_eq(&s1, &s3), "least-loaded below cap wins");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn saturated_session_is_not_killed() {
+        // "full-capacity false kill": a session that momentarily reports
+        // no stream capacity must be RETRIED, never closed — its streams
+        // are still live.
+        #[derive(Debug)]
+        struct CappedSession {
+            closed: AtomicBool,
+            sem: Arc<tokio::sync::Semaphore>,
+        }
+        impl ManagedSession for CappedSession {
+            fn active_streams(&self) -> usize {
+                0
+            }
+            fn is_closed(&self) -> bool {
+                self.closed.load(Ordering::Relaxed)
+            }
+            fn close(&self) {
+                self.closed.store(true, Ordering::Relaxed);
+            }
+            fn try_reserve(self: &Arc<Self>) -> Option<SessionPermit<Self>> {
+                if self.is_closed() {
+                    return None;
+                }
+                let p = Arc::clone(&self.sem).try_acquire_owned().ok()?;
+                Some(SessionPermit::new(Arc::clone(self), p))
+            }
+        }
+
+        let pool = SessionPool::<CappedSession>::new(SessionPoolConfig {
+            max_sessions: 1,
+            ..Default::default()
+        });
+        let session = Arc::new(CappedSession {
+            closed: AtomicBool::new(false),
+            sem: Arc::new(tokio::sync::Semaphore::new(1)),
+        });
+        // Saturate the only stream slot.
+        let held = Arc::clone(&session.sem).acquire_owned().await.unwrap();
+        pool.insert("k", &session);
+
+        // open_with must fail (only one session, saturated) but must NOT
+        // close the session.
+        let r = pool
+            .open_with(
+                "k",
+                || async { anyhow::bail!("no fresh dial expected") },
+                |_s, _p| async { Ok::<_, OpenError>(()) },
+            )
+            .await;
+        assert!(r.is_err(), "saturated pool must error after retries");
+        assert!(
+            !session.is_closed(),
+            "a saturated-but-healthy session must not be closed"
+        );
+        drop(held);
+
+        // Capacity frees up: the next open succeeds on the same session.
+        pool.open_with(
+            "k",
+            || async { anyhow::bail!("no dial needed") },
+            |_s, _p| async { Ok::<_, OpenError>(()) },
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test(start_paused = true)]
