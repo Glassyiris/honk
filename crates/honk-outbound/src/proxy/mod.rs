@@ -4,6 +4,7 @@ pub(crate) mod addr;
 pub mod anytls;
 pub mod block;
 pub mod direct;
+pub mod http;
 pub mod hysteria2;
 pub mod juicity;
 pub(crate) mod mux;
@@ -25,6 +26,7 @@ use block::BlockHandler;
 use direct::DirectHandler;
 use honk_config::node::Node;
 use honk_config::types::NodeProtocol;
+use http::HttpConnectHandler;
 use hysteria2::Hysteria2Handler;
 use juicity::JuicityHandler;
 use shadowsocks::ShadowsocksHandler;
@@ -348,6 +350,13 @@ impl ProxyRegistry {
         // block by name so routed block traffic is actually rejected.
         if node.name == "block" {
             return BlockHandler::new()
+                .dial(node, target, target_domain, connect_timeout)
+                .await;
+        }
+        // Real http-proxy nodes (anything but the built-ins) were silently
+        // direct through the same marker: use the CONNECT handler instead.
+        if node.protocol == NodeProtocol::HTTP && node.name != "direct" {
+            return HttpConnectHandler::new()
                 .dial(node, target, target_domain, connect_timeout)
                 .await;
         }
