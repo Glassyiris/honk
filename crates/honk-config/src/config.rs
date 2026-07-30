@@ -128,44 +128,63 @@ fn interface_host_cidrs(iface: &str) -> Vec<String> {
     } else {
         iface
     };
-    let Ok(out) = std::process::Command::new("ip")
-        .args(["-o", "addr", "show", "dev", iface])
-        .output()
-    else {
-        return Vec::new();
-    };
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    // getifaddrs(3) — no `ip` subprocess needed. Link-local addresses
+    // (v4 169.254/16, v6 fe80::/10) are excluded, matching the old
+    // "not scope link" filter.
     let mut cidrs = Vec::new();
-    for line in stdout.lines() {
-        if line.contains("scope link") {
-            continue;
+    // SAFETY: getifaddrs allocates a linked list freed by freeifaddrs;
+    // all pointers are checked before dereference.
+    unsafe {
+        let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut head) != 0 {
+            return cidrs;
         }
-        let mut tokens = line.split_whitespace();
-        let Some(pos) = tokens.position(|t| t == "inet" || t == "inet6") else {
-            continue;
-        };
-        let is_v6 = line.split_whitespace().nth(pos) == Some("inet6");
-        let Some(addr) = line.split_whitespace().nth(pos + 1) else {
-            continue;
-        };
-        let host = addr.split('/').next().unwrap_or(addr);
-        cidrs.push(format!("{host}/{}", if is_v6 { 128 } else { 32 }));
+        let mut cur = head;
+        while !cur.is_null() {
+            let ifa = &*cur;
+            let name = std::ffi::CStr::from_ptr(ifa.ifa_name).to_string_lossy();
+            if name == iface && !ifa.ifa_addr.is_null() {
+                let family = (*ifa.ifa_addr).sa_family as i32;
+                if family == libc::AF_INET {
+                    // s_addr is network byte order in memory — read it in
+                    // native order to get the wire bytes as-is.
+                    let a = (*(ifa.ifa_addr as *const libc::sockaddr_in))
+                        .sin_addr
+                        .s_addr
+                        .to_ne_bytes();
+                    if !(a[0] == 169 && a[1] == 254) {
+                        cidrs.push(format!("{}.{}.{}.{}/32", a[0], a[1], a[2], a[3]));
+                    }
+                } else if family == libc::AF_INET6 {
+                    let a = (*(ifa.ifa_addr as *const libc::sockaddr_in6))
+                        .sin6_addr
+                        .s6_addr;
+                    if !(a[0] == 0xfe && (a[1] & 0xc0) == 0x80) {
+                        cidrs.push(format!("{}/128", std::net::Ipv6Addr::from(a)));
+                    }
+                }
+            }
+            cur = ifa.ifa_next;
+        }
+        libc::freeifaddrs(head);
     }
     cidrs
 }
 
-/// Interface name owning the first default route, if any.
+/// Interface name owning the first default route, if any
+/// (/proc/net/route — no `ip route` subprocess needed).
 fn default_route_iface() -> Option<String> {
-    let out = std::process::Command::new("ip")
-        .args(["route", "show", "default"])
-        .output()
-        .ok()?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let line = stdout.lines().next()?;
-    let mut tokens = line.split_whitespace();
-    tokens
-        .position(|t| t == "dev")
-        .and_then(|p| line.split_whitespace().nth(p + 1).map(str::to_string))
+    let text = std::fs::read_to_string("/proc/net/route").ok()?;
+    for line in text.lines().skip(1) {
+        let mut tokens = line.split_whitespace();
+        let (Some(name), Some(dest)) = (tokens.next(), tokens.next()) else {
+            continue;
+        };
+        if dest == "00000000" {
+            return Some(name.to_string());
+        }
+    }
+    None
 }
 
 fn default_tproxy_mark() -> u32 {

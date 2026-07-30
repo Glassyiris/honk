@@ -644,28 +644,35 @@ impl RealEbpfBackend {
         }
     }
 
-    /// Read the IPv4 address of an interface in big-endian u32, or 0.
+    /// Read the IPv4 address of an interface in big-endian u32, or 0
+    /// (getifaddrs — no `ip` subprocess needed).
     fn iface_ipv4(iface: &str) -> u32 {
-        let output = match std::process::Command::new("ip")
-            .args(["-4", "-o", "addr", "show", iface])
-            .output()
-        {
-            Ok(o) => o,
-            Err(_) => return 0,
-        };
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            if let Some(inet_pos) = line.find("inet ") {
-                let rest = &line[inet_pos + 5..];
-                if let Some(slash_pos) = rest.find('/') {
-                    let ip_str = &rest[..slash_pos];
-                    if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
-                        return u32::from_be_bytes(ip.octets());
-                    }
-                }
+        // SAFETY: getifaddrs allocates a linked list freed by freeifaddrs;
+        // all pointers are checked before dereference.
+        unsafe {
+            let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+            if libc::getifaddrs(&mut head) != 0 {
+                return 0;
             }
+            let mut result = 0u32;
+            let mut cur = head;
+            while !cur.is_null() {
+                let ifa = &*cur;
+                let name = std::ffi::CStr::from_ptr(ifa.ifa_name).to_string_lossy();
+                if name == iface
+                    && !ifa.ifa_addr.is_null()
+                    && (*ifa.ifa_addr).sa_family as i32 == libc::AF_INET
+                {
+                    result = (*(ifa.ifa_addr as *const libc::sockaddr_in))
+                        .sin_addr
+                        .s_addr;
+                    break;
+                }
+                cur = ifa.ifa_next;
+            }
+            libc::freeifaddrs(head);
+            result
         }
-        0
     }
 
     /// Read the kernel ifindex for an interface, or 0 if it cannot be read.
