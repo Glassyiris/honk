@@ -4,7 +4,7 @@
 //! legacy `dns:` representation. A bounded actor owns SQLite writes and
 //! linearizes explicit flushes with an epoch barrier.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
@@ -15,66 +15,13 @@ use super::policy::PolicyId;
 use crate::cachedb::CacheDb;
 
 mod codec;
+mod counters;
 mod worker;
 
+use counters::CounterSet;
+pub use counters::PersistCounters;
+
 const COMMAND_CAPACITY: usize = 4096;
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct PersistCounters {
-    pub queued: usize,
-    pub pending: usize,
-    pub dropped_full: u64,
-    pub dropped_pending_full: u64,
-    pub dropped_closed: u64,
-    pub old_epoch_discarded: u64,
-    pub written: u64,
-    pub restored: u64,
-    pub stale: u64,
-    pub corrupt: u64,
-    pub version_mismatch: u64,
-    pub policy_mismatch: u64,
-    pub db_errors: u64,
-    pub write_attempts: u64,
-}
-
-#[derive(Default)]
-struct CounterSet {
-    queued: AtomicUsize,
-    pending: AtomicUsize,
-    dropped_full: AtomicU64,
-    dropped_pending_full: AtomicU64,
-    dropped_closed: AtomicU64,
-    old_epoch_discarded: AtomicU64,
-    written: AtomicU64,
-    restored: AtomicU64,
-    stale: AtomicU64,
-    corrupt: AtomicU64,
-    version_mismatch: AtomicU64,
-    policy_mismatch: AtomicU64,
-    db_errors: AtomicU64,
-    write_attempts: AtomicU64,
-}
-
-impl CounterSet {
-    fn snapshot(&self) -> PersistCounters {
-        PersistCounters {
-            queued: self.queued.load(Ordering::Relaxed),
-            pending: self.pending.load(Ordering::Relaxed),
-            dropped_full: self.dropped_full.load(Ordering::Relaxed),
-            dropped_pending_full: self.dropped_pending_full.load(Ordering::Relaxed),
-            dropped_closed: self.dropped_closed.load(Ordering::Relaxed),
-            old_epoch_discarded: self.old_epoch_discarded.load(Ordering::Relaxed),
-            written: self.written.load(Ordering::Relaxed),
-            restored: self.restored.load(Ordering::Relaxed),
-            stale: self.stale.load(Ordering::Relaxed),
-            corrupt: self.corrupt.load(Ordering::Relaxed),
-            version_mismatch: self.version_mismatch.load(Ordering::Relaxed),
-            policy_mismatch: self.policy_mismatch.load(Ordering::Relaxed),
-            db_errors: self.db_errors.load(Ordering::Relaxed),
-            write_attempts: self.write_attempts.load(Ordering::Relaxed),
-        }
-    }
-}
 
 struct Put {
     epoch: u64,
