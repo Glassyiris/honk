@@ -2,10 +2,10 @@
 //!
 //! A custom tracing [`Layer`] formats every event into a single-line
 //! payload and broadcasts it on a `tokio::sync::broadcast` channel. The
-//! layer is installed unconditionally at tracing init (before the config is
-//! even loaded), so early startup logs are available to WS subscribers.
-//! The channel has a bounded capacity; slow subscribers hit `Lagged` and
-//! simply skip ahead (log streaming is best-effort).
+//! channel has a bounded capacity; slow subscribers hit `Lagged` and
+//! simply skip ahead (log streaming is best-effort). With no subscribers
+//! the layer skips formatting entirely, so subscribers see events from
+//! their subscription time onward, not a replayed history.
 
 use std::fmt::Write as _;
 use tokio::sync::broadcast;
@@ -77,6 +77,12 @@ where
     S: tracing::Subscriber,
 {
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+        // Formatting costs a String per event and this layer is unfiltered,
+        // so the data path would otherwise pay it for every debug event even
+        // at log_level=info. Nobody watching means nobody to format for.
+        if self.tx.receiver_count() == 0 {
+            return;
+        }
         let mut fields = EventFields::default();
         event.record(&mut fields);
         let payload = if fields.message.is_empty() {
