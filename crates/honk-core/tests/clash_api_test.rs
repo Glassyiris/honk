@@ -1064,7 +1064,6 @@ async fn test_dns_query_upstream_and_nxdomain() {
         nxdomain_response(),
     )));
     let state = Arc::new(ClashState {
-        dns_service: nx_service,
         config: app.state.config.clone(),
         stats: app.state.stats.clone(),
         alive_set: app.state.alive_set.clone(),
