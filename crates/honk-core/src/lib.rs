@@ -76,7 +76,7 @@ fn raise_nofile_rlimit() -> anyhow::Result<()> {
 
 /// Resolve an interface name, expanding `"auto"` or empty to the default route interface.
 #[cfg(feature = "ebpf")]
-fn resolve_interface(name: &str) -> String {
+pub(crate) fn resolve_interface(name: &str) -> String {
     if name == "auto" || name.is_empty() {
         detect_default_interface().unwrap_or_else(|| {
             warn!("could not detect default route interface; falling back to 'lo'");
@@ -502,6 +502,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         _dae0_guard = None;
     }
 
+    #[cfg(feature = "ebpf")]
+    let mut attached_ifaces: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
     let mut ebpf_backend: Box<dyn ebpf::EbpfBackend> = if cli.mock_ebpf {
         info!("Using mock eBPF backend");
         Box::new(ebpf::mock::MockEbpfBackend::new())
@@ -557,14 +560,38 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             )
             .await?;
 
+            let ifindex_of = |name: &str| -> Option<u32> {
+                std::fs::read_to_string(format!("/sys/class/net/{name}/ifindex"))
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok())
+            };
+            if let Some(i) = ifindex_of(&primary_lan) {
+                attached_ifaces.insert(primary_lan.clone(), i);
+            }
+            if !single_homed
+                && !primary_wan.is_empty()
+                && let Some(i) = ifindex_of(&primary_wan)
+            {
+                attached_ifaces.insert(primary_wan.clone(), i);
+            }
             for extra_lan in lan_ifnames.iter().skip(1) {
-                if let Err(e) = backend.attach_lan(extra_lan, single_homed) {
-                    warn!("Failed to attach LAN programs to {}: {}", extra_lan, e);
+                match backend.attach_lan(extra_lan, single_homed) {
+                    Ok(()) => {
+                        if let Some(i) = ifindex_of(extra_lan) {
+                            attached_ifaces.insert(extra_lan.clone(), i);
+                        }
+                    }
+                    Err(e) => warn!("Failed to attach LAN programs to {}: {}", extra_lan, e),
                 }
             }
             for extra_wan in wan_ifnames.iter().skip(1) {
-                if let Err(e) = backend.attach_wan_egress(extra_wan) {
-                    warn!("Failed to attach WAN egress to {}: {}", extra_wan, e);
+                match backend.attach_wan_egress(extra_wan) {
+                    Ok(()) => {
+                        if let Some(i) = ifindex_of(extra_wan) {
+                            attached_ifaces.insert(extra_wan.clone(), i);
+                        }
+                    }
+                    Err(e) => warn!("Failed to attach WAN egress to {}: {}", extra_wan, e),
                 }
                 if let Err(e) = backend.attach_wan_ingress(extra_wan) {
                     warn!("Failed to attach WAN ingress to {}: {}", extra_wan, e);
@@ -711,6 +738,17 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         dns_forwarder,
         dns_upstream_pool.clone(),
     )?;
+
+    #[cfg(feature = "ebpf")]
+    let iface_watcher = if !cli.mock_ebpf {
+        ebpf::real::IfaceWatcher::spawn(
+            control_plane.ebpf_handle(),
+            control_plane.config_handle(),
+            attached_ifaces,
+        )
+    } else {
+        None
+    };
 
     // Wire GroupManager into DNS outbound selection (Selector/URLTest/…).
     dns_upstream_pool.set_group_manager(Some(control_plane.group_manager()));
@@ -1028,6 +1066,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     info!("honk-core is running. Press Ctrl+C to stop.");
     control_plane.run().await?;
+
+    #[cfg(feature = "ebpf")]
+    if let Some(watcher) = iface_watcher {
+        watcher.shutdown().await;
+    }
 
     // Signal systemd that we're stopping (Type=notify)
     #[cfg(target_os = "linux")]

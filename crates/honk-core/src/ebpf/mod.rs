@@ -95,6 +95,14 @@ impl DomainRouteWriteError {
     }
 }
 
+/// Which config list an interface came from; selects the TC programs a
+/// dynamic attach installs on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IfaceRole {
+    Lan,
+    Wan,
+}
+
 #[async_trait]
 pub trait EbpfBackend: Send + Sync {
     fn inject_routing_fault(
@@ -173,6 +181,19 @@ pub trait EbpfBackend: Send + Sync {
     }
 
     async fn cleanup(&mut self) -> anyhow::Result<()>;
+
+    /// Attach TC programs to a configured interface that appeared after
+    /// startup.  Best-effort: per-program failures are logged inside the
+    /// backend, and attaching an interface whose kernel hook was torn down
+    /// (delete + recreate) is the intended use.
+    fn attach_dynamic_interface(
+        &mut self,
+        _ifname: &str,
+        _role: IfaceRole,
+        _single_homed: bool,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     fn set_param(&mut self, key: ParamKey, value: u32) -> anyhow::Result<()>;
     fn get_param(&self, key: ParamKey) -> anyhow::Result<Option<u32>>;

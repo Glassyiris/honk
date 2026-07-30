@@ -475,6 +475,11 @@ impl ControlPlane {
         self.config.clone()
     }
 
+    /// Shared backend cell, used by the interface watcher for dynamic attach.
+    pub fn ebpf_handle(&self) -> Arc<RwLock<Box<dyn EbpfBackend>>> {
+        self.ebpf.clone()
+    }
+
     pub fn stats_handle(&self) -> Arc<StatsManager> {
         self.stats.clone()
     }
