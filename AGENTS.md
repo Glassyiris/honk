@@ -25,6 +25,7 @@ This file is written for AI coding agents that need to understand, build, test, 
 ├── config.min.dae            # Minimal example (good for --mock-ebpf dev)
 ├── example.dae               # Annotated example (Chinese comments)
 ├── doc/                      # design / configuration / components / benchmark docs (en + zh)
+├── bench/                    # lab-bench.sh: unified honk-vs-dae A/B harness (runs on the engine host; README has usage + measurement traps)
 ├── ci/                       # zigcc/zigcxx: zig cc/c++ wrappers for cross builds (strip CMake's clang-style --target from boring-sys ASM rules + rustc's aarch64 errata linker args; used by build-musl and the release workflow); zig-bindgen-env: derive BINDGEN_EXTRA_CLANG_ARGS from `zig cc -E -v` for cross bindgen
 ├── .github/workflows/        # release.yml: tag-triggered test + cross-build + GitHub Release
 └── crates/
@@ -178,7 +179,7 @@ CLI (`honk-core` binary):
 - Flags: `--config/-c` (default `/etc/honk/config.dae`), `--bpf-object/-b`, `--bpf-pin-root` (default `/sys/fs/bpf`), `--debug/-d`, `--mock-ebpf`. Log-level order: `--debug` → `RUST_LOG` → `global.log_level` → `info`.
 - Subcommands (clash-style, **local only — none talks to a running engine**): `mode <rule|global|direct>` (rewrites `global.dial_mode` in the config file), `proxy <group> <node>` (validates existence and prints; persists nothing), `delay <node> [--url HOST:PORT]` (raw TCP connect timing, not a proxied urltest).
 
-Benchmarks: `benches/dns.rs` (criterion, `harness = false`) — DNS endpoint parse, cache get/put, framing, forwarder cache-hit, TcpPool/UpstreamPool exchange. Run: `cargo bench -p honk-core --bench dns` (no external network needed).
+Benchmarks: `benches/dns.rs` (criterion, `harness = false`) — DNS endpoint parse, cache get/put + 90/10 mix, per-query routing match, framing, forwarder cache-hit, TcpPool/UpstreamPool exchange (mock servers must set nodelay or TCP exchanges measure Nagle, not the code). Run: `cargo bench -p honk-core --bench dns` (no external network needed).
 
 ### `crates/honk-tool`
 

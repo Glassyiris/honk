@@ -1,15 +1,21 @@
-//! DNS micro-benchmarks (cache, framing, endpoint parse, forwarder path).
+//! DNS micro-benchmarks (cache, routing match, framing, endpoint parse,
+//! forwarder path).
 //!
 //! Run with:
 //!   cargo bench -p honk-core --bench dns
 //!
-//! Focuses on hot-path userspace costs that matter under concurrent DNS load.
+//! Focuses on hot-path userspace costs that matter under concurrent DNS load:
+//! per-query routing decisions, cache get/put under a read-heavy mix, and the
+//! pooled upstream exchange paths.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use honk_config::dns::{DnsRouting, DnsUpstream};
+use honk_config::dns::{
+    DnsCond, DnsDomainMatcher, DnsRequestAction, DnsRequestRouting, DnsRequestRule, DnsRouting,
+    DnsUpstream,
+};
 use honk_config::types::DnsProtocol;
 use honk_core::dns::cache::DnsCache;
 use honk_core::dns::endpoint::DnsEndpoint;
@@ -47,6 +53,23 @@ fn mock_response(txid: u16) -> Vec<u8> {
         0x00, 0x00, 0x01,
     ]);
     v
+}
+
+/// Spawn a loopback UDP upstream that answers every query with `mock_response`.
+async fn spawn_udp_upstream() -> std::net::SocketAddr {
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = sock.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 512];
+        loop {
+            let Ok((_, src)) = sock.recv_from(&mut buf).await else {
+                break;
+            };
+            let txid = u16::from_be_bytes([buf[0], buf[1]]);
+            let _ = sock.send_to(&mock_response(txid), src).await;
+        }
+    });
+    addr
 }
 
 fn bench_endpoint_parse(c: &mut Criterion) {
@@ -92,6 +115,90 @@ fn bench_cache(c: &mut Criterion) {
             );
         });
     });
+    // Read-heavy production mix: ~90% hits against a warm working set,
+    // 10% inserts churning the LRU.
+    g.bench_function("mixed_90r_10w", |b| {
+        let mut i = 0u32;
+        b.iter(|| {
+            i = i.wrapping_add(1);
+            if i.is_multiple_of(10) {
+                cache.put(format!("mix{i}.example.com:1"), resp.clone(), 60);
+            } else {
+                black_box(cache.get("host42.example.com:1"));
+            }
+        });
+    });
+    g.finish();
+}
+
+/// Per-query routing decision: the one piece of the DNS hot path that runs
+/// for EVERY intercepted query before the cache/upstream is touched.
+fn bench_routing_match(c: &mut Criterion) {
+    let routing = DnsRouting {
+        request: DnsRequestRouting {
+            rules: vec![
+                DnsRequestRule {
+                    conditions: vec![DnsCond::Qtype {
+                        not: false,
+                        types: vec![65], // HTTPS RR
+                    }],
+                    action: DnsRequestAction::Reject,
+                },
+                DnsRequestRule {
+                    conditions: vec![DnsCond::Qname {
+                        not: false,
+                        matchers: vec![
+                            DnsDomainMatcher::Suffix("ads.example.com".into()),
+                            DnsDomainMatcher::Keyword("tracker".into()),
+                        ],
+                    }],
+                    action: DnsRequestAction::Reject,
+                },
+                DnsRequestRule {
+                    conditions: vec![DnsCond::Qname {
+                        not: false,
+                        matchers: vec![DnsDomainMatcher::Suffix("cn".into())],
+                    }],
+                    action: DnsRequestAction::Upstream("alidns".into()),
+                },
+                DnsRequestRule {
+                    conditions: vec![
+                        DnsCond::Qname {
+                            not: false,
+                            matchers: vec![DnsDomainMatcher::Full("www.corp.example".into())],
+                        },
+                        DnsCond::Qtype {
+                            not: false,
+                            types: vec![1],
+                        },
+                    ],
+                    action: DnsRequestAction::Upstream("local".into()),
+                },
+            ],
+            fallback: DnsRequestAction::Upstream("default".into()),
+        },
+        ..Default::default()
+    };
+    let router = DnsRouter::new(&routing).unwrap();
+
+    let mut g = c.benchmark_group("dns_routing_match");
+    g.throughput(Throughput::Elements(1));
+    for (label, domain, qtype) in [
+        ("first_rule_hit", "foo.ads.example.com", 1u16),
+        ("mid_rule_hit", "www.baidu.cn", 1u16),
+        ("fallback", "www.google.com", 1u16),
+        ("negated_qtype", "www.google.com", 65u16),
+    ] {
+        g.bench_with_input(
+            BenchmarkId::from_parameter(label),
+            &(domain, qtype),
+            |b, (domain, qtype)| {
+                b.iter(|| {
+                    black_box(router.select_request(black_box(domain), black_box(*qtype)));
+                });
+            },
+        );
+    }
     g.finish();
 }
 
@@ -113,21 +220,8 @@ fn bench_build_query(c: &mut Criterion) {
 
 fn bench_forwarder_cache_hit(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
-    // Spin a tiny UDP upstream once, populate cache, then bench cache hits.
-    let (fw, _addr) = rt.block_on(async {
-        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = sock.local_addr().unwrap();
-        tokio::spawn(async move {
-            let mut buf = [0u8; 512];
-            loop {
-                let Ok((n, src)) = sock.recv_from(&mut buf).await else {
-                    break;
-                };
-                let txid = u16::from_be_bytes([buf[0], buf[1]]);
-                let _ = sock.send_to(&mock_response(txid), src).await;
-                let _ = n;
-            }
-        });
+    let fw = rt.block_on(async {
+        let addr = spawn_udp_upstream().await;
         let ups = [DnsUpstream {
             name: "default".into(),
             address: addr.to_string(),
@@ -148,7 +242,7 @@ fn bench_forwarder_cache_hit(c: &mut Criterion) {
         let fw = DnsForwarder::new(pool, cache, router);
         let q = build_dns_query("example.com", 1);
         let _ = fw.resolve(&q).await.unwrap();
-        (fw, addr)
+        fw
     });
 
     let q = build_dns_query("example.com", 1);
@@ -173,6 +267,9 @@ fn bench_tcp_pool_exchange(c: &mut Criterion) {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     break;
                 };
+                // Real DNS servers run nodelay; without it Nagle + delayed
+                // ACK adds ~40ms to every benchmark exchange.
+                let _ = stream.set_nodelay(true);
                 tokio::spawn(async move {
                     loop {
                         let mut len = [0u8; 2];
@@ -224,19 +321,7 @@ fn bench_tcp_pool_exchange(c: &mut Criterion) {
 fn bench_udp_pool_exchange(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let (pool_name, pool) = rt.block_on(async {
-        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = sock.local_addr().unwrap();
-        tokio::spawn(async move {
-            let mut buf = [0u8; 512];
-            loop {
-                let Ok((n, src)) = sock.recv_from(&mut buf).await else {
-                    break;
-                };
-                let txid = u16::from_be_bytes([buf[0], buf[1]]);
-                let _ = sock.send_to(&mock_response(txid), src).await;
-                let _ = n;
-            }
-        });
+        let addr = spawn_udp_upstream().await;
         let ups = [DnsUpstream {
             name: "u".into(),
             address: addr.to_string(),
@@ -303,6 +388,7 @@ criterion_group!(
     benches,
     bench_endpoint_parse,
     bench_cache,
+    bench_routing_match,
     bench_framing_id,
     bench_build_query,
     bench_forwarder_cache_hit,
