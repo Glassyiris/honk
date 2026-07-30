@@ -2,10 +2,9 @@
 
 use std::sync::Arc;
 
-use parking_lot::Mutex;
-
-use super::{DialContext, exchange_with_retry, idle_pool_exchange};
+use super::{DialContext, IdlePoolState, close_idle_pool, exchange_with_retry, idle_pool_exchange};
 use honk_outbound::tls::{TlsConnector, TlsStream};
+use parking_lot::Mutex;
 
 /// TLS stream over either a direct or proxied base connection.
 type PooledStream = TlsStream<Box<dyn crate::proxy::AsyncReadWrite>>;
@@ -14,6 +13,7 @@ type PooledStream = TlsStream<Box<dyn crate::proxy::AsyncReadWrite>>;
 pub struct DotPool {
     dial: DialContext,
     connector: TlsConnector,
+    lifecycle: tokio::sync::RwLock<IdlePoolState>,
     idle: Mutex<Vec<PooledStream>>,
 }
 
@@ -23,6 +23,7 @@ impl DotPool {
         Ok(Arc::new(Self {
             dial,
             connector,
+            lifecycle: tokio::sync::RwLock::new(IdlePoolState::Open),
             idle: Mutex::new(Vec::new()),
         }))
     }
@@ -33,6 +34,7 @@ impl DotPool {
 
     async fn exchange_once(&self, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
         idle_pool_exchange(
+            &self.lifecycle,
             &self.idle,
             || self.dial_tls(),
             raw_query,
@@ -57,5 +59,9 @@ impl DotPool {
                 .await
                 .map_err(|e| anyhow::anyhow!("DoT TLS handshake: {e}"))
         }
+    }
+
+    pub(crate) async fn close(&self) {
+        close_idle_pool(&self.lifecycle, &self.idle, self.dial.query_timeout).await;
     }
 }

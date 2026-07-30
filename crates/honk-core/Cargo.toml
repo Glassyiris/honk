@@ -108,6 +108,7 @@ default = ["clash-api"]
 ebpf = ["aya", "aya-obj", "aya-log"]
 # Enable the Clash-compatible REST API (experimental.clash_api)
 clash-api = ["dep:axum", "dep:tower-http"]
+dns-bench = []
 
 [build-dependencies]
 anyhow.workspace = true
@@ -124,7 +125,9 @@ rustls-pemfile.workspace = true
 webpki-roots.workspace = true
 criterion = { version = "0.8", features = ["async_tokio", "html_reports"] }
 futures-util = "0.3"
+stats_alloc = "0.1.10"
 
 [[bench]]
 name = "dns"
 harness = false
+required-features = ["dns-bench"]

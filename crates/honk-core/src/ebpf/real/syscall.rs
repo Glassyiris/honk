@@ -103,6 +103,31 @@ pub fn bpf_hash_insert(bpf: &mut Ebpf, map: &str, key: &[u8], value: &[u8]) -> a
     Ok(())
 }
 
+pub fn bpf_hash_insert_domain(
+    bpf: &mut Ebpf,
+    map: &str,
+    key: &[u8],
+    value: &[u8],
+) -> Result<(), super::super::DomainRouteWriteError> {
+    let fd = map_fd_mut(bpf, map).map_err(super::super::DomainRouteWriteError::Other)?;
+    let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
+    attr.__bindgen_anon_2.map_fd = fd as u32;
+    attr.__bindgen_anon_2.key = key.as_ptr() as u64;
+    attr.__bindgen_anon_2.__bindgen_anon_1.value = value.as_ptr() as u64;
+    attr.__bindgen_anon_2.flags = BPF_ANY;
+    match unsafe { bpf_syscall(BPF_MAP_UPDATE_ELEM as c_long, &mut attr) } {
+        Ok(()) => Ok(()),
+        Err(errno) if errno == libc::ENOSPC as c_long => {
+            Err(super::super::DomainRouteWriteError::MapFull)
+        }
+        Err(errno) => Err(super::super::DomainRouteWriteError::Other(anyhow::anyhow!(
+            "bpf update({}) errno={}",
+            map,
+            errno
+        ))),
+    }
+}
+
 pub fn bpf_hash_lookup(
     bpf: &Ebpf,
     map: &str,

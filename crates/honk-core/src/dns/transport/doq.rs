@@ -8,14 +8,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use quinn::{ClientConfig, Connection};
-use tokio::sync::Mutex;
-
 use crate::dns::endpoint::DnsEndpoint;
+use quinn::{ClientConfig, Connection};
 
 use super::framing::{
     force_dns_id_zero, read_length_prefixed, restore_dns_id, write_length_prefixed,
 };
+use super::lifecycle::LifecycleSlot;
 use super::{SharedQuicEndpoint, dns_quic_config, exchange_with_retry, quic_connect};
 
 /// DoQ client for one upstream.
@@ -24,7 +23,7 @@ pub struct DoqClient {
     query_timeout: Duration,
     quic_config: ClientConfig,
     quic_ep: SharedQuicEndpoint,
-    conn: Mutex<Option<Connection>>,
+    connection: LifecycleSlot<Connection>,
 }
 
 impl DoqClient {
@@ -35,7 +34,7 @@ impl DoqClient {
             query_timeout,
             quic_config,
             quic_ep: SharedQuicEndpoint::new(),
-            conn: Mutex::new(None),
+            connection: LifecycleSlot::new(),
         }))
     }
 
@@ -44,7 +43,7 @@ impl DoqClient {
             "DoQ",
             || self.exchange_once(raw_query),
             || async {
-                self.conn.lock().await.take();
+                self.close_connection().await;
             },
         )
         .await
@@ -69,15 +68,16 @@ impl DoqClient {
     }
 
     async fn get_conn(&self) -> anyhow::Result<Connection> {
-        {
-            let conn = self.conn.lock().await;
-            if let Some(c) = conn.clone()
-                && c.close_reason().is_none()
-            {
-                return Ok(c);
-            }
+        let connection = self.connection.acquire(|| self.dial()).await?;
+        if connection.close_reason().is_some() {
+            self.close_connection().await;
+            return self
+                .connection
+                .acquire(|| self.dial())
+                .await
+                .map(|c| (*c).clone());
         }
-        self.dial().await
+        Ok((*connection).clone())
     }
 
     async fn dial(&self) -> anyhow::Result<Connection> {
@@ -91,7 +91,20 @@ impl DoqClient {
             "DoQ",
         )
         .await?;
-        *self.conn.lock().await = Some(conn.clone());
         Ok(conn)
+    }
+
+    async fn close_connection(&self) {
+        self.connection
+            .close(|connection| async move {
+                connection.close(0_u32.into(), b"shutdown");
+                let _ = connection.closed().await;
+            })
+            .await;
+    }
+
+    pub(crate) async fn close(&self) {
+        self.close_connection().await;
+        self.quic_ep.close().await;
     }
 }

@@ -323,6 +323,22 @@ dns {
   - H2/TLS 会话按 **leaf 节点** 缓存。旧写法 `outbound: tag` 仍接受。
 - 内部 `sub()` / `node()` / `subnode()` 选择器会解析并忽略（仅客户端 DNS）。
 
+**兼容性与生命周期：**
+
+- 未配置 `ipversion_prefer` 时保留实际的 `DnsConfig` 默认值 `both`，符合资格的
+  A 与 AAAA 工作并发执行。设置 `4` 或 `6` 选择相应的偏好模式；没有新增配置面。
+- 缓存与 singleflight 仅适用于标准单问题 QUERY：answer/authority 计数为零，最多
+  一个无 option 的 EDNS-v0 OPT。受支持的 RD/AD/CD 与 DO 状态、精确 question wire、
+  UDP size、调用方 profile、策略和逻辑目的地都属于 identity。多问题、异常 flags、
+  EDNS option（包括 ECS/COOKIE）和 EDNS-v1 请求仍会转发，但绕过缓存与合并。
+- 重载一次发布包含策略、路由、组、transport 与投影的完整 DNS runtime generation。
+  已有请求在旧 generation 上持有 lease，新请求使用替换版本。runtime 退役与池化
+  transport 关闭都有界且会被等待。
+- DNS 可观测性仅供内部使用。相互独立、单调递增的 atomic counter 使请求记录保持
+  non-blocking。内部 best-effort scrape 逐项读取，不承诺 counter 之间的一致性。
+  失败日志仅使用有界 `error_kind` 分类和 transport label 等有界字段，不记录 query name、
+  upstream 地址或自由格式 error payload。没有新增 DNS endpoint、配置项或 API。
+
 ## 10. 订阅（subscription）
 
 ```dae
@@ -370,7 +386,10 @@ experimental {
 }
 ```
 
-持久化 Selector 选择与 Clash 模式；可选将 DNS 应答存在 `dns:` kv 前缀下。
+持久化 Selector 选择与 Clash 模式。DNS 应答使用 `dns:v2:` key 命名空间下的版本化
+`HDNS` 记录。升级时此命名空间冷启动：旧 DNS 行既不导入也不删除。恢复仅接受未过期、
+结构正确且 wire identity 与策略相符的行。回滚到 v2 之前的版本时会忽略 v2 行，因此
+这些行可以安全留在 `cache.db` 中。
 
 ## 12. 使用配置运行
 
@@ -404,4 +423,5 @@ CLI 参数：`--config` / `-c`、`--bpf-object` / `-b`、`--bpf-pin-root`、`--d
 
 - [设计文档](./design.zh.md)
 - [组件详细配置](./components.zh.md)
+- [DNS 灰度与回滚操作手册](./dns-rollout.zh.md)
 - 仓库示例：`config.dae`、`config.min.dae`

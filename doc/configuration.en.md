@@ -358,6 +358,28 @@ Upstream URIs take a scheme prefix: `udp://`, `tcp://`, `tcp+udp://`, `tls://`, 
   - H2/TLS sessions are cached **per leaf node**. Legacy `outbound: tag` is still accepted.
 - Internal `sub()` / `node()` / `subnode()` request selectors are parsed and ignored (client DNS only).
 
+**Compatibility and lifecycle:**
+
+- Omitting `ipversion_prefer` keeps the actual `DnsConfig` default, `both`.
+  Eligible A and AAAA work runs concurrently. Setting `4` or `6` selects the
+  corresponding preference mode; it does not add a new configuration surface.
+- Cache and singleflight apply only to a standard one-question QUERY with no
+  answer/authority records and at most one option-free EDNS-v0 OPT. Supported
+  RD/AD/CD and DO state, exact question wire, UDP size, caller profile, policy,
+  and logical destination are part of identity. Multi-question, unusual flags,
+  EDNS options (including ECS/COOKIE), and EDNS-v1 requests still forward but
+  bypass cache and coalescing.
+- Reload publishes one coherent DNS runtime generation containing policy,
+  routing, groups, transports, and projection. Existing requests keep their
+  lease on the old generation while new requests use the replacement. Runtime
+  retirement and pooled transport shutdown are bounded and awaited.
+- DNS observability is internal. Independent monotonic atomic counters keep
+  request recording non-blocking. An internal best-effort scrape loads fields
+  separately and does not promise cross-counter coherence. Failure logs use
+  bounded `error_kind` classes and bounded fields such as the transport label,
+  without query names, upstream addresses, or free-form error payloads. No
+  DNS endpoint, config key, or API was added.
+
 ## 10. Subscriptions
 
 ```dae
@@ -405,7 +427,11 @@ experimental {
 }
 ```
 
-Persists selector choices and clash mode; optionally DNS answers under a `dns:` kv prefix.
+Persists selector choices and clash mode. DNS answers use versioned `HDNS`
+records under the `dns:v2:` key namespace. Upgrade starts this namespace cold:
+legacy DNS rows are not imported or deleted. Restore accepts only unexpired,
+well-formed rows with matching wire identity and policy. A pre-v2 rollback
+ignores v2 rows, so they may remain safely in `cache.db`.
 
 ## 12. Running with a config
 
@@ -438,5 +464,6 @@ Subcommands: `mode`, `proxy`, `delay` (see [components.en.md](./components.en.md
 ## 14. Related docs
 
 - [Design](./design.en.md)
+- [DNS canary and rollback runbook](./dns-rollout.en.md)
 - [Component reference](./components.en.md)
 - Root examples: `config.dae`, `config.min.dae`

@@ -63,8 +63,66 @@ pub struct LpmKeepSet {
 /// Callback for [`EbpfBackend::conn_state_for_each_chunk`].
 pub type ConnStateChunkVisitor<'a> = dyn FnMut(&[(TuplesKey, ConnState)]) + 'a;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutingPushPhase {
+    Rules,
+    DestinationLpm,
+    SourceLpm,
+    MacLpm,
+    Meta,
+    ClearTail,
+    PruneLpm,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectionMapOperation {
+    Set,
+    Remove,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum DomainRouteWriteError {
+    #[error("domain routing map capacity exhausted")]
+    MapFull,
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+impl DomainRouteWriteError {
+    pub const fn is_map_full(&self) -> bool {
+        matches!(self, Self::MapFull)
+    }
+}
+
 #[async_trait]
 pub trait EbpfBackend: Send + Sync {
+    fn inject_routing_fault(
+        &mut self,
+        _phase: RoutingPushPhase,
+        _times: usize,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("routing fault injection is unsupported")
+    }
+    #[cfg(test)]
+    fn inject_projection_fault(
+        &mut self,
+        _operation: ProjectionMapOperation,
+        _times: usize,
+        _map_full: bool,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("projection fault injection is unsupported")
+    }
+    #[cfg(test)]
+    fn projection_map_snapshot(&self) -> Vec<([u8; 20], DomainRouting)> {
+        Vec::new()
+    }
+    #[cfg(test)]
+    fn projection_write_log(&self) -> Vec<ProjectionMapOperation> {
+        Vec::new()
+    }
+    #[cfg(test)]
+    fn clear_projection_write_log(&mut self) {}
     fn detach_hooks(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
@@ -188,13 +246,13 @@ pub trait EbpfBackend: Send + Sync {
         &mut self,
         _ip_key: &LpmKey,
         _bitmap: &DomainRouting,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), DomainRouteWriteError> {
         Ok(())
     }
     /// Remove the DOMAIN_ROUTING_MAP entry for `ip_key` (16-byte IP key).
     /// Used by the domain-route rebuild for learned IPs whose domain no
     /// longer matches any domain rule under the current ruleset.
-    fn remove_domain_ip_bitmap(&mut self, _ip_key: &LpmKey) -> anyhow::Result<()> {
+    fn remove_domain_ip_bitmap(&mut self, _ip_key: &LpmKey) -> Result<(), DomainRouteWriteError> {
         Ok(())
     }
     fn add_ip_route(&mut self, prefix: &str, outbound: OutboundIndex) -> anyhow::Result<()>;

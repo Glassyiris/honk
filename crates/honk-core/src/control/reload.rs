@@ -30,6 +30,7 @@ impl ControlPlane {
         drain.start_rejecting();
         // Brief pause for in-flight connection setup
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let old_plan = self.active_routing_plan.read().clone();
 
         // ── Phase 1: build everything (no live-state mutation) ──
         let new_router = match Router::new(
@@ -39,15 +40,47 @@ impl ControlPlane {
             Ok(r) => r,
             Err(e) => {
                 error!("Failed to build new router: {}", e);
-                drain.stop_rejecting();
+                self.stop_reload_rejection_if_healthy(drain);
                 return;
             }
         };
-        let new_dns_forwarder = match self.build_dns_forwarder(&new_config).await {
-            Ok(f) => f,
+        let pinned_router = match Router::new(
+            &new_config.routing.rules,
+            &new_config.routing.default_outbound,
+        ) {
+            Ok(router) => Arc::new(router),
+            Err(error) => {
+                error!(%error, "Failed to build pinned DNS traffic router");
+                self.stop_reload_rejection_if_healthy(drain);
+                return;
+            }
+        };
+        let new_group_manager = Arc::new(GroupManager::with_alive_set(
+            &new_config.groups,
+            &new_config.nodes,
+            Some(Arc::clone(&self.alive_set)),
+        ));
+        new_group_manager.migrate_selector_choices_from(&self.group_manager.read());
+        let (new_dns_forwarder, new_upstream_pool) = match self
+            .build_dns_forwarder(
+                &new_config,
+                Arc::clone(&pinned_router),
+                Arc::clone(&new_group_manager),
+            )
+            .await
+        {
+            Ok(runtime) => runtime,
             Err(e) => {
                 error!("Failed to build DNS forwarder: {}", e);
-                drain.stop_rejecting();
+                self.stop_reload_rejection_if_healthy(drain);
+                return;
+            }
+        };
+        let policy_id = match crate::dns::policy::PolicyId::from_config(&new_config.dns) {
+            Ok(policy_id) => policy_id,
+            Err(error) => {
+                error!(%error, "Failed to build DNS policy identity");
+                self.stop_reload_rejection_if_healthy(drain);
                 return;
             }
         };
@@ -65,51 +98,141 @@ impl ControlPlane {
             };
         let bootstrap = new_config.global.bootstrap_resolver.clone();
         let direct_target = super::direct_check_addr(&bootstrap);
-
-        // ── Phase 2a: push routing into eBPF; abort without touching userspace ──
-        let route_count = new_router.route_count();
-        {
-            let mut ebpf = self.ebpf.write().await;
-            if let Err(e) = Self::push_routing_to_ebpf(&new_config, &new_router, &mut ebpf) {
-                error!(
-                    "Failed to push routing to eBPF (reload aborted, current generation intact): {}",
-                    e
-                );
-                drain.stop_rejecting();
+        let direct_target_socket = match direct_target.parse() {
+            Ok(target) => target,
+            Err(error) => {
+                error!(%error, "Failed to prepare direct health-check target");
+                self.stop_reload_rejection_if_healthy(drain);
                 return;
             }
+        };
+        let bootstrap_resolver = honk_outbound::bootstrap::BootstrapResolver::parse(&bootstrap);
+        let new_plan = match Self::compile_routing_plan(&new_config, &new_router) {
+            Ok(plan) => Arc::new(plan),
+            Err(error) => {
+                error!(%error, "Failed to compile routing publication");
+                self.stop_reload_rejection_if_healthy(drain);
+                return;
+            }
+        };
+        let push_result = new_plan.result();
+        let generation = crate::dns::runtime::RuntimeGeneration::new(
+            self.dns_controller
+                .runtime_provider()
+                .current_generation()
+                .get()
+                .saturating_add(1),
+        );
+        let persistence = {
+            let current = self.dns_controller.runtime_provider().acquire();
+            Arc::clone(current.runtime().persistence())
+        };
+        let projection_snapshot = Arc::new(crate::dns::runtime::RoutingProjectionSnapshot::new(
+            generation.get(),
+            Arc::clone(&pinned_router),
+            push_result.domain_bitmaps,
+        ));
+        let new_runtime =
+            crate::dns::runtime::DnsRuntime::new(crate::dns::runtime::DnsRuntimeParts {
+                generation,
+                forwarder: Arc::clone(&new_dns_forwarder),
+                router: Arc::clone(&pinned_router),
+                group_manager: Arc::clone(&new_group_manager),
+                policy_id,
+                routing_projection: Arc::clone(&projection_snapshot),
+                cache: self.dns_controller.cache().await,
+                persistence,
+                transport: new_upstream_pool,
+            });
+
+        let route_count = new_router.route_count();
+        {
+            let mut router_guard = self.router.write().await;
+            let mut config_guard = self.config.write().await;
+            let mut ebpf = self.ebpf.write().await;
+            let mut group_guard = self.group_manager.write();
+            let mut outbound_guard = self.outbound_id_map.write();
+            let mut plan_guard = self.active_routing_plan.write();
+            let provider = self.dns_controller.runtime_provider();
+            let publication = provider.prepare_publication(new_runtime);
+
+            if let Err(error) =
+                routing_matcher::RoutingMatcherBuilder::push_plan(ebpf.as_mut(), &new_plan)
+            {
+                match routing_matcher::RoutingMatcherBuilder::push_plan(ebpf.as_mut(), &old_plan) {
+                    Ok(_) => {
+                        error!(
+                            %error,
+                            "Failed to push routing to eBPF; exact active plan replayed"
+                        );
+                        self.stop_reload_rejection_if_healthy(drain);
+                    }
+                    Err(replay_error) => {
+                        error!(
+                            %error,
+                            %replay_error,
+                            "Routing push and active-plan replay failed; datapath unhealthy"
+                        );
+                        self.datapath_healthy
+                            .store(false, std::sync::atomic::Ordering::Release);
+                        self.drain_tracker.start_rejecting();
+                    }
+                }
+                return;
+            }
+
+            publication.commit();
+            *router_guard = new_router;
+            *config_guard = new_config;
+            *group_guard = Arc::clone(&new_group_manager);
+            *outbound_guard = new_outbound_id_map;
+            *plan_guard = Arc::clone(&new_plan);
         }
 
-        // ── Phase 2b: commit userspace state in one critical section ──
-        *self.router.write().await = new_router;
-        *self.config.write().await = new_config;
-        // Refresh the bootstrap resolver for proxy-server hostname lookups.
-        honk_outbound::bootstrap::set_global(honk_outbound::bootstrap::BootstrapResolver::parse(
-            &bootstrap,
-        ));
-        // direct's probe target follows the bootstrap resolver.
-        self.alive_set.set_direct_check_addr(direct_target.clone());
-        honk_outbound::urltest::set_urltest_direct_target(
-            direct_target
-                .parse()
-                .expect("direct check addr is a SocketAddr"),
+        self.dns_controller
+            .update_projection_snapshot(projection_snapshot);
+        routing_matcher::RoutingMatcherBuilder::activate_projection(&new_plan);
+        honk_outbound::bootstrap::set_global(bootstrap_resolver);
+        self.alive_set.set_direct_check_addr(direct_target);
+        honk_outbound::urltest::set_urltest_direct_target(direct_target_socket);
+        install_interrupt_callback(
+            &new_group_manager,
+            &self.group_manager,
+            &self.connection_tracker,
         );
-        *self.outbound_id_map.write() = new_outbound_id_map;
-        self.dns_controller.set_forwarder(new_dns_forwarder).await;
-        // Rebuild the GroupManager (reads the just-swapped config; migrates
-        // runtime selector choices) and refresh health-check registrations.
-        self.reload_group_manager().await;
-        // Swap the runtime registry and shut the old generation's down.
+        // Swap the per-node runtime registry (session-layer ownership) into
+        // the committed generation, then shut the old generation's down.
         let old_registry = std::mem::replace(
             &mut *self.runtime_registry.write(),
             Arc::new(new_runtime_registry),
         );
         old_registry.shutdown();
-        // Rebuild learned domain→IP routes with the new rule-index bitmaps.
-        self.dns_controller.rebuild_domain_routes().await;
+        if let Some(ref db) = self.cache_db {
+            let db_cb = Arc::clone(db);
+            new_group_manager.set_persist_callback(Some(Arc::new(move |group, node| {
+                db_cb.save_selector_choice(group, node);
+            })));
+        }
+        {
+            let config = self.config.read().await;
+            let _ = sync_health_check_nodes(&self.alive_set, &config);
+            self.alive_set
+                .sync_urltest_groups(&urltest_group_registrations(&config));
+            self.alive_set
+                .sync_group_check_urls(&group_check_url_registrations(&config));
+        }
         info!("Configuration applied — {} routes active", route_count);
 
-        drain.stop_rejecting();
+        self.stop_reload_rejection_if_healthy(drain);
+    }
+
+    fn stop_reload_rejection_if_healthy(&self, drain: &DrainTracker) {
+        if self.is_datapath_healthy() {
+            drain.stop_rejecting();
+        } else {
+            drain.start_rejecting();
+            self.drain_tracker.start_rejecting();
+        }
     }
 
     /// Merge freshly fetched subscription nodes into the running config,
@@ -135,17 +258,25 @@ impl ControlPlane {
     async fn build_dns_forwarder(
         &self,
         config: &Config,
-    ) -> anyhow::Result<std::sync::Arc<crate::dns::forwarder::DnsForwarder>> {
+        router: Arc<Router>,
+        group_manager: Arc<GroupManager>,
+    ) -> anyhow::Result<(
+        Arc<crate::dns::forwarder::DnsForwarder>,
+        Arc<crate::dns::upstream_pool::UpstreamPool>,
+    )> {
         let dns_router = Arc::new(crate::dns::routing::DnsRouter::new_from_dns_config(
             &config.dns,
         )?);
         let dns_upstream_pool = Arc::new(
-            crate::dns::upstream_pool::UpstreamPool::new_with_proxy(
+            crate::dns::upstream_pool::UpstreamPool::new_with_proxy_and_bootstrap(
                 &config.dns.upstream,
                 dns_router.clone(),
                 Some(self.proxy_registry.clone()),
                 config.nodes.clone(),
                 config.groups.clone(),
+                honk_outbound::bootstrap::BootstrapResolver::parse(
+                    &config.global.bootstrap_resolver,
+                ),
             )?
             .with_timeouts(
                 std::time::Duration::from_millis(config.global.dns_resolve_timeout_ms),
@@ -153,19 +284,21 @@ impl ControlPlane {
             )
             // Same SharedGroupManager + traffic Router cells as the data path
             // (dae: Route DNS server IP; explicit `-> tag` still forces a group).
-            .with_group_manager(self.group_manager.clone())
-            .with_traffic_router(self.router.clone()),
+            .with_group_manager_snapshot(group_manager)
+            .with_traffic_router_snapshot(router),
         );
-        Ok(Arc::new(
+        let forwarder = Arc::new(
             crate::dns::forwarder::DnsForwarder::new(
-                dns_upstream_pool as Arc<dyn crate::dns::forwarder::DnsUpstreamPool>,
+                Arc::clone(&dns_upstream_pool) as Arc<dyn crate::dns::forwarder::DnsUpstreamPool>,
                 self.dns_controller.cache().await,
                 dns_router,
             )
             .with_strategy(config.dns.strategy.clone())
             .with_cache_enabled(config.dns.cache.enabled)
-            .with_cache_ttl(config.dns.cache.ttl.min(u64::from(u32::MAX)) as u32),
-        ))
+            .with_cache_ttl(config.dns.cache.ttl.min(u64::from(u32::MAX)) as u32)
+            .with_policy_from_config(&config.dns)?,
+        );
+        Ok((forwarder, dns_upstream_pool))
     }
 
     /// Rebuild the [`GroupManager`] from the current config after a reload.
@@ -524,6 +657,7 @@ pub(super) fn resolve_outbound_nodes(
 mod atomic_reload_tests {
     use super::*;
     use crate::dns;
+    use crate::ebpf::RoutingPushPhase;
     use crate::ebpf::mock::MockEbpfBackend;
 
     fn test_dns_forwarder() -> std::sync::Arc<dns::forwarder::DnsForwarder> {
@@ -597,6 +731,13 @@ mod atomic_reload_tests {
     #[tokio::test]
     async fn valid_reload_commits() {
         let cp = test_cp();
+        let before_runtime = cp.dns_controller.runtime_provider().acquire();
+        let persistence_id = before_runtime.runtime().persistence().identity();
+        assert_eq!(
+            before_runtime.runtime().routing_projection().generation(),
+            0
+        );
+        drop(before_runtime);
         let mut good = Config::default();
         good.global.log_level = "trace".into();
         let drain = DrainTracker::new();
@@ -606,5 +747,58 @@ mod atomic_reload_tests {
             "trace",
             "valid reload should swap the live config"
         );
+        let after_runtime = cp.dns_controller.runtime_provider().acquire();
+        assert_eq!(
+            after_runtime.runtime().persistence().identity(),
+            persistence_id
+        );
+        assert_eq!(after_runtime.runtime().routing_projection().generation(), 1);
+    }
+
+    #[tokio::test]
+    async fn routing_push_failure_replays_old_plan_and_keeps_userspace_generation() {
+        let cp = test_cp();
+        cp.ebpf
+            .write()
+            .await
+            .inject_routing_fault(RoutingPushPhase::Meta, 1)
+            .unwrap();
+        let mut replacement = Config::default();
+        replacement.global.log_level = "trace".into();
+
+        cp.apply_runtime_config(replacement, &DrainTracker::new())
+            .await;
+
+        assert_eq!(
+            cp.config_handle().read().await.global.log_level,
+            Config::default().global.log_level
+        );
+        assert!(cp.is_datapath_healthy());
+        assert!(!cp.drain_tracker.should_reject());
+    }
+
+    #[tokio::test]
+    async fn replay_failure_marks_unhealthy_and_rejects_connections() {
+        let cp = test_cp();
+        cp.ebpf
+            .write()
+            .await
+            .inject_routing_fault(RoutingPushPhase::Meta, 2)
+            .unwrap();
+
+        cp.apply_runtime_config(Config::default(), &DrainTracker::new())
+            .await;
+
+        assert!(!cp.is_datapath_healthy());
+        assert!(cp.drain_tracker.should_reject());
+
+        let mut invalid = Config::default();
+        invalid.dns.upstream[0].address.clear();
+        cp.apply_runtime_config(invalid, &DrainTracker::new()).await;
+        cp.apply_runtime_config(Config::default(), &DrainTracker::new())
+            .await;
+
+        assert!(!cp.is_datapath_healthy());
+        assert!(cp.drain_tracker.should_reject());
     }
 }

@@ -14,7 +14,14 @@ const EINPROGRESS: i32 = libc::EINPROGRESS;
 /// Non-EPERM errors are real failures and propagate.
 #[cfg(target_os = "linux")]
 pub fn set_mark_best_effort(socket: &socket2::Socket, mark: u32) -> io::Result<()> {
-    match socket.set_mark(mark) {
+    set_mark_result_best_effort(socket.set_mark(mark))
+}
+
+/// Apply the best-effort `SO_MARK` error contract to an already attempted
+/// mark operation. This is also the deterministic injection seam for callers.
+#[cfg(target_os = "linux")]
+pub fn set_mark_result_best_effort(result: io::Result<()>) -> io::Result<()> {
+    match result {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
             static ONCE: std::sync::Once = std::sync::Once::new();

@@ -426,18 +426,28 @@ impl EbpfBackend for RealEbpfBackend {
         &mut self,
         ip_key: &LpmKey,
         bitmap: &DomainRouting,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), super::DomainRouteWriteError> {
         // Overwrite (not OR) so bitmaps from previous rule generations are
         // fully replaced.  Key is the 16-byte IP data, as in add_domain_ip_bitmap.
         let key_bytes = unsafe { as_bytes(&ip_key.data) };
-        bpf_hash_insert(self.bpf_mut()?, "DOMAIN_ROUTING_MAP", key_bytes, unsafe {
+        let bpf = self
+            .bpf_mut()
+            .map_err(super::DomainRouteWriteError::Other)?;
+        bpf_hash_insert_domain(bpf, "DOMAIN_ROUTING_MAP", key_bytes, unsafe {
             as_bytes(bitmap)
         })
     }
 
-    fn remove_domain_ip_bitmap(&mut self, ip_key: &LpmKey) -> anyhow::Result<()> {
+    fn remove_domain_ip_bitmap(
+        &mut self,
+        ip_key: &LpmKey,
+    ) -> Result<(), super::DomainRouteWriteError> {
         let key_bytes = unsafe { as_bytes(&ip_key.data) };
-        bpf_hash_delete(self.bpf_mut()?, "DOMAIN_ROUTING_MAP", key_bytes)
+        let bpf = self
+            .bpf_mut()
+            .map_err(super::DomainRouteWriteError::Other)?;
+        bpf_hash_delete(bpf, "DOMAIN_ROUTING_MAP", key_bytes)
+            .map_err(super::DomainRouteWriteError::Other)
     }
 
     fn add_ip_route(&mut self, prefix: &str, outbound: OutboundIndex) -> anyhow::Result<()> {
@@ -490,9 +500,6 @@ impl EbpfBackend for RealEbpfBackend {
     }
 
     fn clear_routing_map_tail(&mut self, start: u32) -> anyhow::Result<()> {
-        // Best-effort post-commit cleanup: the slots above `start` are already
-        // inactive (the rule count switched first), so individual failures only
-        // leave inert entries that the next push will overwrite or zero again.
         let count = MAX_MATCH_SET_LEN.saturating_sub(start);
         if count == 0 {
             return Ok(());
@@ -509,11 +516,11 @@ impl EbpfBackend for RealEbpfBackend {
         ) {
             Ok(true) => return Ok(()),
             Ok(false) => {}
-            Err(e) => debug!("update_batch(ROUTING_MAP) tail clear failed: {}", e),
+            Err(e) => return Err(e),
         }
         let d = MatchSet::default();
         for i in start..MAX_MATCH_SET_LEN {
-            let _ = self.array_set("ROUTING_MAP", i, &d);
+            self.array_set("ROUTING_MAP", i, &d)?;
         }
         Ok(())
     }
@@ -533,7 +540,7 @@ impl EbpfBackend for RealEbpfBackend {
                     raw.copy_from_slice(&kb[..20]);
                 }
                 if !keys.contains(&raw) {
-                    let _ = bpf_hash_delete(self.bpf_mut()?, map_name, &kb);
+                    bpf_hash_delete(self.bpf_mut()?, map_name, &kb)?;
                 }
             }
         }

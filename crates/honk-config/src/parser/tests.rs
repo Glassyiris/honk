@@ -805,3 +805,156 @@ dns {
         _ => panic!("expected Qname"),
     }
 }
+
+#[test]
+fn test_parse_dns_upstream_aliases_are_equivalent() {
+    let input = r#"
+dns {
+    upstream {
+        modern: 'https://dns.example/dns-query' -> proxy
+        legacy: 'https://dns.example/dns-query' outbound: proxy
+    }
+}
+"#;
+    let config = parse_dae_config(input).unwrap();
+    assert_eq!(config.dns.upstream.len(), 2);
+    let modern = &config.dns.upstream[0];
+    let legacy = &config.dns.upstream[1];
+    assert_eq!(modern.protocol, legacy.protocol);
+    assert_eq!(modern.address, legacy.address);
+    assert_eq!(modern.tls_server_name, legacy.tls_server_name);
+    assert_eq!(modern.outbound, legacy.outbound);
+    assert_eq!(modern.outbound.as_deref(), Some("proxy"));
+}
+
+#[test]
+fn test_parse_dns_duplicate_sections_preserve_source_order() {
+    let input = r#"
+dns {
+    upstream {
+        first: 'udp://1.1.1.1:53'
+    }
+    upstream {
+        second: 'udp://8.8.8.8:53'
+    }
+    routing {
+        request {
+            qname(full:example.test) -> first
+        }
+    }
+    routing {
+        request {
+            qname(full:example.test) -> second
+        }
+    }
+}
+"#;
+    let config = parse_dae_config(input).unwrap();
+    let upstream_names = config
+        .dns
+        .upstream
+        .iter()
+        .map(|upstream| upstream.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(upstream_names, ["first", "second"]);
+    let actions = config
+        .dns
+        .routing
+        .request
+        .rules
+        .iter()
+        .map(|rule| &rule.action)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actions,
+        [
+            &crate::dns::DnsRequestAction::Upstream("first".into()),
+            &crate::dns::DnsRequestAction::Upstream("second".into()),
+        ]
+    );
+}
+
+#[test]
+fn test_parse_dns_request_response_order_is_first_match_relevant() {
+    let request_input = r#"
+dns {
+    routing {
+        request {
+            qname(full:example.test) -> first
+            qname(full:example.test) -> second
+            fallback: default
+        }
+    }
+}
+"#;
+    let request_config = parse_dae_config(request_input).unwrap();
+    let request_actions = request_config
+        .dns
+        .routing
+        .request
+        .rules
+        .iter()
+        .map(|rule| &rule.action)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        request_actions,
+        [
+            &crate::dns::DnsRequestAction::Upstream("first".into()),
+            &crate::dns::DnsRequestAction::Upstream("second".into()),
+        ]
+    );
+
+    let response_input = r#"
+dns {
+    routing {
+        response {
+            ip(geoip:private) && !qname(geosite:cn) -> accept
+            upstream(googledns) -> reject
+            fallback: accept
+        }
+    }
+}
+"#;
+    let response_config = parse_dae_config(response_input).unwrap();
+    let response_actions = response_config
+        .dns
+        .routing
+        .response
+        .rules
+        .iter()
+        .map(|rule| &rule.action)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        response_actions,
+        [
+            &crate::dns::DnsResponseAction::Accept,
+            &crate::dns::DnsResponseAction::Reject,
+        ]
+    );
+}
+
+#[test]
+fn test_parse_dns_accepted_invalid_values_keep_fallbacks() {
+    let input = r#"
+dns {
+    ipversion_prefer: 9
+    optimistic_cache: maybe
+    optimistic_cache_ttl: not-a-duration
+    max_cache_size: not-a-number
+}
+"#;
+    let config = parse_dae_config(input).unwrap();
+    assert!(matches!(
+        config.dns.strategy,
+        crate::dns::DnsStrategy::PreferIpv4
+    ));
+    assert!(!config.dns.cache.enabled);
+    assert_eq!(config.dns.cache.ttl, 60);
+    assert_eq!(config.dns.cache.max_size, 10000);
+}
+
+#[test]
+fn test_parse_dns_zero_max_cache_size_is_preserved_for_runtime_clamp() {
+    let config = parse_dae_config("dns {\n    max_cache_size: 0\n}\n").unwrap();
+    assert_eq!(config.dns.cache.max_size, 0);
+}

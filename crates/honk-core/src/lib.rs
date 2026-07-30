@@ -671,12 +671,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // Keep a concrete Arc so we can attach SharedGroupManager after the
     // control plane builds it (same cell traffic dials use).
     let dns_upstream_pool = std::sync::Arc::new(
-        dns::upstream_pool::UpstreamPool::new_with_proxy(
+        dns::upstream_pool::UpstreamPool::new_with_proxy_and_bootstrap(
             &config.dns.upstream,
             dns_router.clone(),
             Some(proxy_registry.clone()),
             config.nodes.clone(),
             config.groups.clone(),
+            honk_outbound::bootstrap::BootstrapResolver::parse(&config.global.bootstrap_resolver),
         )?
         .with_timeouts(
             std::time::Duration::from_millis(config.global.dns_resolve_timeout_ms),
@@ -697,20 +698,18 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         )
         .with_strategy(config.dns.strategy.clone())
         .with_cache_enabled(config.dns.cache.enabled)
-        .with_cache_ttl(config.dns.cache.ttl.min(u64::from(u32::MAX)) as u32),
+        .with_cache_ttl(config.dns.cache.ttl.min(u64::from(u32::MAX)) as u32)
+        .with_policy_from_config(&config.dns)?,
     );
     info!("DNS forwarder ready");
 
-    let dns_resolver = dns::DnsResolver::with_forwarder(&config.dns, dns_forwarder.clone())?;
-    info!("DNS resolver ready");
-
-    let mut control_plane = control::ControlPlane::new(
+    let mut control_plane = control::ControlPlane::new_with_upstream_pool(
         config,
         ebpf_backend,
         router,
         proxy_registry,
-        dns_resolver,
         dns_forwarder,
+        dns_upstream_pool.clone(),
     )?;
 
     // Wire GroupManager into DNS outbound selection (Selector/URLTest/…).
@@ -784,8 +783,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                         connection_pool: control_plane.connection_pool(),
                         external_ui: clash_cfg.external_ui.clone(),
                         log_tx: clash_log_tx.clone(),
-                        dns_cache: control_plane.dns_cache().await,
-                        dns_forwarder: control_plane.dns_forwarder_cell(),
+                        dns_service: control_plane.dns_service(),
                     });
                     tokio::spawn(clash_api::serve(state, listen));
                 }

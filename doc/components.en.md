@@ -386,10 +386,10 @@ dns {
 | ------- | -------------- | --------- | --------- |
 | `upstream { ... }` | `upstream` | one `default` @ 223.5.5.5 UDP | Servers |
 | `routing { ... }` | `routing` | fallback default | Request routing |
-| `ipversion_prefer` | `strategy` | `preferipv4` | Address family (`4`/`6`) |
+| `ipversion_prefer` | `strategy` | `both` when omitted; `preferipv4`/`preferipv6` when set to `4`/`6` | Address-family preference (`4`/`6`) |
 | `optimistic_cache` | `cache.enabled` | `true` | Cache on/off |
 | `optimistic_cache_ttl` | `cache.ttl` | `600` | Fixed positive-cache TTL (overrides answer min TTL; `0` keeps answer TTL) |
-| `max_cache_size` | `cache.max_size` | `10000` | Max entries (must be > 0) |
+| `max_cache_size` | `cache.max_size` | `10000` | Max entries; `0` is accepted, warned, and clamped to `1` |
 
 ### Upstream
 
@@ -421,13 +421,41 @@ Internal values: `preferipv4` | `preferipv6` | `ipv4only` | `ipv6only` | `both`.
 
 - `ipv4only` / `ipv6only`: the other family's queries are answered NODATA at request time and never forwarded upstream.
 - `preferipv4` / `preferipv6`: both families are forwarded. When the preferred family has answers for the name, the other family's response is suppressed (NODATA); when it has none, the other family's answers are returned (fallback allowed). The preferred-family check costs one extra upstream query per name on cache miss.
-- `both`: no filtering.
+- `both`: the default `DnsConfig` strategy; eligible A and AAAA queries are forwarded concurrently and neither family is suppressed. A missing `ipversion_prefer` in honk's config keeps this default.
 
 dae: `ipversion_prefer: 4` maps to `preferipv4`, `6` to `preferipv6` (anything else = `preferipv4`). The only-modes are not expressible in dae syntax.
 
 ### Cache
 
-Persistence of DNS answers across restarts: `experimental { cache_file { store_dns: true } }`.
+Persistence of DNS answers across restarts: `experimental { cache_file { store_dns: true } }`. Entries use the rollback-safe `dns:v2:` namespace and are restored only when their expiry, wire identity, ingress profile, scope, operation, and policy match. The v2 namespace starts cold and leaves legacy rows untouched. Older binaries ignore v2 rows, so a rollback can leave them in `cache.db` without changing behavior.
+
+Cache and singleflight eligibility are intentionally shared. Only a standard
+single-question QUERY with no answer/authority records and at most one
+option-free EDNS-v0 OPT is eligible. RD/AD/CD, DO, exact question wire, UDP
+size, ingress profile, policy, scope, and operation remain isolated in the
+key. Unsupported flags, EDNS options (including ECS/COOKIE), EDNS-v1, and
+multi-question messages bypass both optimizations; cancellation releases the
+flight.
+
+### Runtime and observability
+
+Reload swaps one coherent generation containing DNS policy, Router,
+GroupManager snapshot, transport manager, and routing projection. Leases let
+old requests drain; the retirement deadline and retained-generation cap bound
+shutdown, and transport initialization/close is single-flight and idempotent.
+
+Independent monotonic counters cover hit/miss/stale, flight
+saturation/cancel/retry, persistence drop/flush failure, runtime retirement,
+transport init/reset, projection failure/retry, and outcome classes. Recording
+does not block on a shared gate. The internal best-effort scrape loads fields
+separately and does not provide cross-counter coherence. Failure logs use
+bounded `error_kind` values: forwarder
+`engine`/`exchange`/`response`/`internal`/`rejected_plan`, persistence
+`worker_closed`/`ack_dropped`/`worker_failed`/`database`, projection
+`map_full`/`backend_write`, and transport `exchange_failed` with a bounded
+transport label. They do not log query names, upstream addresses, or
+free-form errors. `/stats` remains the outbound statistics surface; no public
+DNS metric, endpoint, API, or tuning key is added.
 
 ---
 
@@ -590,4 +618,5 @@ UDP selection exclusion: both UDP domains explicitly dead → not selected for U
 
 - [Design](./design.en.md)
 - [Configuration guide](./configuration.en.md)
+- [DNS canary and rollback runbook](./dns-rollout.en.md)
 - Examples: `config.dae`, `config.min.dae`

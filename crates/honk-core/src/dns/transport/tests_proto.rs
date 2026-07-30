@@ -16,7 +16,7 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs
 use tokio_rustls::rustls::{self, ServerConfig};
 
 use crate::dns::endpoint::DnsEndpoint;
-use crate::dns::forwarder::{DnsForwarder, DnsUpstreamPool, build_dns_query};
+use crate::dns::forwarder::{DnsForwarder, DnsUpstreamPool, build_dns_query, parse_dns_question};
 use crate::dns::routing::DnsRouter;
 use crate::dns::transport::{DialContext, DohClient, DotPool, TcpPool};
 use crate::dns::upstream_pool::UpstreamPool;
@@ -413,12 +413,29 @@ async fn forwarder_cache_hit_all_protocols_udp() {
 async fn resolver_uses_forwarder_stack() {
     let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = udp.local_addr().unwrap();
-    tokio::spawn(async move {
+    let responder = tokio::spawn(async move {
         let mut buf = [0u8; 512];
-        let (n, src) = udp.recv_from(&mut buf).await.unwrap();
-        let txid = u16::from_be_bytes([buf[0], buf[1]]);
-        let _ = udp.send_to(&mock_dns_response(txid), src).await;
-        let _ = n;
+        let mut qtypes = Vec::with_capacity(2);
+        for _ in 0..2 {
+            let (n, src) = udp.recv_from(&mut buf).await?;
+            let txid = u16::from_be_bytes([buf[0], buf[1]]);
+            let qtype = parse_dns_question(&buf[..n])
+                .map(|(_, qtype)| qtype)
+                .ok_or_else(|| anyhow::anyhow!("malformed DNS question"))?;
+            qtypes.push(qtype);
+            let response = match qtype {
+                1 => mock_dns_response(txid),
+                28 => {
+                    let mut response = buf[..n].to_vec();
+                    response[2] = 0x81;
+                    response[3] = 0x80;
+                    response
+                }
+                other => anyhow::bail!("unexpected DNS qtype: {other}"),
+            };
+            udp.send_to(&response, src).await?;
+        }
+        anyhow::Ok(qtypes)
     });
 
     let mut cfg = honk_config::dns::DnsConfig {
@@ -432,9 +449,19 @@ async fn resolver_uses_forwarder_stack() {
     cfg.routing.fallback = "default".into();
     let resolver = DnsResolver::new(&cfg).unwrap();
     let r = resolver.resolve("example.com").await.unwrap();
-    assert!(!r.ipv4.is_empty() || !r.ipv6.is_empty() || true);
-    // A response has 127.0.0.1
-    assert!(r.ipv4.iter().any(|ip| ip.to_string() == "127.0.0.1") || r.ipv4.is_empty());
+    assert_eq!(
+        r.ipv4,
+        ["127.0.0.1"
+            .parse::<std::net::IpAddr>()
+            .expect("loopback IPv4")]
+    );
+    assert!(r.ipv6.is_empty());
+    let mut qtypes = responder
+        .await
+        .expect("DNS responder task")
+        .expect("DNS responder I/O");
+    qtypes.sort_unstable();
+    assert_eq!(qtypes, [1, 28], "exactly one A and one AAAA datagram");
 }
 
 #[test]

@@ -7,7 +7,7 @@
 #![cfg(feature = "clash-api")]
 
 use honk_config::Config;
-use honk_config::dns::DnsRouting;
+use honk_config::dns::{DnsConfig, DnsRouting};
 use honk_config::experimental::CacheFileConfig;
 use honk_config::node::{Group, Node};
 use honk_config::types::NodeProtocol;
@@ -140,8 +140,8 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
 
     let (log_tx, _) = tokio::sync::broadcast::channel(16);
     let dns_cache = Arc::new(tokio::sync::Mutex::new(DnsCache::new(16)));
-    let dns_forwarder = Arc::new(tokio::sync::RwLock::new(test_dns_forwarder(
-        dns_cache.clone(),
+    let dns_service = honk_core::dns::DnsService::with_forwarder(Arc::new(test_dns_forwarder(
+        dns_cache,
         a_record_response([93, 184, 216, 34], 300),
     )));
     let state = Arc::new(ClashState {
@@ -156,8 +156,7 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
         secret: secret.to_string(),
         external_ui: external_ui.to_string(),
         log_tx,
-        dns_cache,
-        dns_forwarder,
+        dns_service,
         connection_pool: Arc::new(honk_core::pool::ConnectionPool::new()),
     });
 
@@ -778,13 +777,15 @@ async fn test_cache_flush_endpoints() {
     let now = honk_core::dns::persist::unix_now();
     db.save_dns_answer("example.com", 1, r#"{"r":"QUJD"}"#, now + 300);
     app.state
-        .dns_cache
+        .dns_service
+        .cache()
         .lock()
         .await
         .put("example.com:1".into(), vec![1, 2, 3], 300);
     assert!(
         app.state
-            .dns_cache
+            .dns_service
+            .cache()
             .lock()
             .await
             .get("example.com:1")
@@ -800,7 +801,8 @@ async fn test_cache_flush_endpoints() {
     assert_eq!(resp.status(), 204);
     assert!(
         app.state
-            .dns_cache
+            .dns_service
+            .cache()
             .lock()
             .await
             .get("example.com:1")
@@ -1016,7 +1018,7 @@ async fn test_dns_query_from_cache() {
     let client = http_client();
 
     // Pre-seed the shared DNS cache so the forwarder answers from cache.
-    app.state.dns_cache.lock().await.put(
+    app.state.dns_service.cache().lock().await.put(
         "example.com:1".into(),
         a_record_response([93, 184, 216, 34], 300),
         300,
@@ -1057,12 +1059,12 @@ async fn test_dns_query_upstream_and_nxdomain() {
     assert_eq!(body["Answer"][0]["data"], "93.184.216.34");
 
     // NXDOMAIN: swap in a forwarder whose upstream returns RCODE 3.
-    let nx_forwarder = Arc::new(tokio::sync::RwLock::new(test_dns_forwarder(
-        app.state.dns_cache.clone(),
+    let nx_service = honk_core::dns::DnsService::with_forwarder(Arc::new(test_dns_forwarder(
+        app.state.dns_service.cache(),
         nxdomain_response(),
     )));
     let state = Arc::new(ClashState {
-        dns_forwarder: nx_forwarder,
+        dns_service: nx_service,
         config: app.state.config.clone(),
         stats: app.state.stats.clone(),
         alive_set: app.state.alive_set.clone(),
@@ -1074,7 +1076,7 @@ async fn test_dns_query_upstream_and_nxdomain() {
         secret: String::new(),
         external_ui: String::new(),
         log_tx: app.state.log_tx.clone(),
-        dns_cache: app.state.dns_cache.clone(),
+        dns_service: nx_service,
         connection_pool: app.state.connection_pool.clone(),
     });
     let nx_app = clash_api::router(state);
@@ -1186,47 +1188,56 @@ async fn test_store_dns_persister_end_to_end() {
     };
     let db = Arc::new(CacheDb::open(&cache_cfg, None).unwrap());
 
-    // Restore (empty db → nothing) then install the persister, mirroring
-    // ControlPlane::init_cache_db.
     let dns_cache = Arc::new(tokio::sync::Mutex::new(DnsCache::new(16)));
+    let dns_config = DnsConfig::default();
+    let policy = honk_core::dns::policy::PolicyId::from_config(&dns_config).unwrap();
+    let persister = honk_core::dns::persist::DnsCachePersister::spawn(db.clone());
     assert_eq!(
-        honk_core::dns::persist::restore_dns_cache(&db, &dns_cache).await,
+        persister
+            .restore_cache(&dns_cache, Some(policy.clone()))
+            .await
+            .expect("initial restore"),
         0
     );
-    let persister = honk_core::dns::persist::DnsCachePersister::spawn(db.clone());
-    dns_cache.lock().await.set_persister(Some(persister));
-
-    // A cache insert is mirrored to cache.db by the background writer.
-    dns_cache.lock().await.put(
-        "example.com:1".into(),
-        a_record_response([1, 2, 3, 4], 300),
-        300,
-    );
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    let answers = db.load_dns_answers(honk_core::dns::persist::unix_now());
-    assert_eq!(answers.len(), 1);
-    assert_eq!(answers[0].name, "example.com");
-    assert_eq!(answers[0].qtype, 1);
-
-    // A "restart" restores the entry into a fresh cache.
-    let fresh_cache = Arc::new(tokio::sync::Mutex::new(DnsCache::new(16)));
-    assert_eq!(
-        honk_core::dns::persist::restore_dns_cache(&db, &fresh_cache).await,
-        1
-    );
-    let entry = fresh_cache
+    dns_cache
         .lock()
         .await
-        .get("example.com:1")
-        .expect("restored entry")
-        .clone();
-    assert_eq!(entry.response, a_record_response([1, 2, 3, 4], 300));
+        .set_persister(Some(persister.clone()));
+    let forwarder = test_dns_forwarder(dns_cache.clone(), a_record_response([1, 2, 3, 4], 300))
+        .with_policy_from_config(&dns_config)
+        .unwrap();
+    let response = forwarder
+        .resolve(&build_dns_query("example.com", 1))
+        .await
+        .expect("initial resolve");
+    assert_eq!(response, a_record_response([1, 2, 3, 4], 300));
+    persister.shutdown().await.expect("persistence shutdown");
+    assert_eq!(persister.counters().written, 1);
 
-    // And the forwarder can answer /dns/query from the restored cache.
-    let forwarder = test_dns_forwarder(fresh_cache, nxdomain_response());
+    let now = honk_core::dns::persist::unix_now();
+    db.save_dns_answer("legacy.example", 1, r#"{"r":"TEVHQUNZ"}"#, now + 300);
+    let fresh_cache = Arc::new(tokio::sync::Mutex::new(DnsCache::new(16)));
+    let restart = honk_core::dns::persist::DnsCachePersister::spawn(db.clone());
+    assert_eq!(
+        restart
+            .restore_cache(&fresh_cache, Some(policy))
+            .await
+            .expect("restart restore"),
+        1
+    );
+
+    let forwarder = test_dns_forwarder(fresh_cache, nxdomain_response())
+        .with_policy_from_config(&dns_config)
+        .unwrap();
     let resp = forwarder
         .resolve(&build_dns_query("example.com", 1))
         .await
         .unwrap();
     assert_eq!(resp, a_record_response([1, 2, 3, 4], 300));
+    restart.shutdown().await.expect("restart shutdown");
+    assert_eq!(
+        db.load_dns_answers(now).len(),
+        1,
+        "v2 restart must leave rollback-compatible legacy rows untouched"
+    );
 }

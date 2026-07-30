@@ -22,6 +22,7 @@ pub struct DnsEndpoint {
     pub path: String,
     /// TLS/QUIC server name (SNI). Falls back to `host` when host is not an IP.
     pub sni: String,
+    bootstrap_resolver: Option<honk_outbound::bootstrap::BootstrapResolver>,
 }
 
 impl DnsEndpoint {
@@ -31,6 +32,15 @@ impl DnsEndpoint {
         address: &str,
         protocol: DnsProtocol,
         tls_server_name: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        Self::parse_with_resolver(address, protocol, tls_server_name, None)
+    }
+
+    pub(crate) fn parse_with_resolver(
+        address: &str,
+        protocol: DnsProtocol,
+        tls_server_name: Option<&str>,
+        bootstrap_resolver: Option<honk_outbound::bootstrap::BootstrapResolver>,
     ) -> anyhow::Result<Self> {
         let address = address.trim();
         if address.is_empty() {
@@ -62,6 +72,7 @@ impl DnsEndpoint {
             port,
             path,
             sni,
+            bootstrap_resolver,
         })
     }
 
@@ -81,10 +92,17 @@ impl DnsEndpoint {
     /// Callers that dial should iterate this list rather than only the first
     /// address — `lookup_host` often returns unreachable AAAA first.
     pub async fn resolve_addrs(&self) -> anyhow::Result<Vec<SocketAddr>> {
+        self.resolve_addrs_with(self.bootstrap_resolver).await
+    }
+
+    async fn resolve_addrs_with(
+        &self,
+        bootstrap_resolver: Option<honk_outbound::bootstrap::BootstrapResolver>,
+    ) -> anyhow::Result<Vec<SocketAddr>> {
         if let Ok(ip) = self.host.parse::<IpAddr>() {
             return Ok(vec![SocketAddr::new(ip, self.port)]);
         }
-        let ips = honk_outbound::bootstrap::resolve(&self.host)
+        let ips = honk_outbound::bootstrap::resolve_with(bootstrap_resolver, &self.host)
             .await
             .map_err(|e| anyhow::anyhow!("bootstrap resolve '{}': {}", self.host, e))?;
         if ips.is_empty() {
@@ -220,5 +238,59 @@ mod tests {
         let ep = DnsEndpoint::parse("dns.google", DnsProtocol::H3, None).unwrap();
         assert_eq!(ep.port, 443);
         assert_eq!(ep.path, "/dns-query");
+    }
+
+    #[tokio::test]
+    async fn resolve_addrs_uses_the_captured_bootstrap_resolver() {
+        // Given
+        let old = spawn_bootstrap_server([192, 0, 2, 10]).await;
+        let replacement = spawn_bootstrap_server([198, 51, 100, 20]).await;
+        let endpoint = DnsEndpoint::parse("runtime.test:853", DnsProtocol::Tls, None).unwrap();
+        let old_resolver =
+            honk_outbound::bootstrap::BootstrapResolver::parse(&format!("udp://{old}")).unwrap();
+        let replacement_resolver =
+            honk_outbound::bootstrap::BootstrapResolver::parse(&format!("udp://{replacement}"))
+                .unwrap();
+
+        // When
+        let old_addrs = endpoint
+            .resolve_addrs_with(Some(old_resolver))
+            .await
+            .unwrap();
+        let replacement_addrs = endpoint
+            .resolve_addrs_with(Some(replacement_resolver))
+            .await
+            .unwrap();
+
+        // Then
+        assert_eq!(old_addrs[0].ip(), IpAddr::V4([192, 0, 2, 10].into()));
+        assert_eq!(
+            replacement_addrs[0].ip(),
+            IpAddr::V4([198, 51, 100, 20].into())
+        );
+    }
+
+    async fn spawn_bootstrap_server(ip: [u8; 4]) -> SocketAddr {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let mut query = [0u8; 512];
+                let (length, peer) = socket.recv_from(&mut query).await.unwrap();
+                let query = &query[..length];
+                let qtype = u16::from_be_bytes([query[length - 4], query[length - 3]]);
+                let mut response = query.to_vec();
+                response[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
+                response[6..8].copy_from_slice(&u16::from(qtype == 1).to_be_bytes());
+                if qtype == 1 {
+                    response.extend_from_slice(&[
+                        0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04,
+                    ]);
+                    response.extend_from_slice(&ip);
+                }
+                socket.send_to(&response, peer).await.unwrap();
+            }
+        });
+        address
     }
 }
