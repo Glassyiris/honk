@@ -1,13 +1,14 @@
+mod normalize;
 mod wire;
 
 use std::collections::BTreeMap;
-use std::net::IpAddr;
 
 use honk_config::dns::{
     DnsCond, DnsConfig, DnsDomainMatcher, DnsRequestAction, DnsRequestRouting, DnsResponseAction,
 };
 use honk_config::types::DnsProtocol;
 
+use self::normalize::{exact, host, lowercase};
 use self::wire::Writer;
 use super::PolicyError;
 use crate::dns::endpoint::DnsEndpoint;
@@ -215,39 +216,4 @@ fn protocol(value: DnsProtocol) -> u8 {
         DnsProtocol::H3 => 4,
         DnsProtocol::Quic => 5,
     }
-}
-
-fn exact(value: &str, field: &'static str) -> Result<String, PolicyError> {
-    if value.is_empty() {
-        return Err(PolicyError::EmptyName { field });
-    }
-    Ok(value.to_string())
-}
-
-fn lowercase(value: &str, field: &'static str) -> Result<String, PolicyError> {
-    if value.is_empty() {
-        return Err(PolicyError::EmptyName { field });
-    }
-    Ok(value.to_lowercase())
-}
-
-fn host(value: &str) -> Result<String, PolicyError> {
-    if let Ok(ip) = value.parse::<IpAddr>() {
-        return Ok(ip.to_string());
-    }
-    let normalized = value.trim().trim_end_matches('.').to_lowercase();
-    if normalized.is_empty() {
-        return Err(PolicyError::EmptyName {
-            field: "endpoint host",
-        });
-    }
-    if normalized.contains(':')
-        || normalized.chars().any(char::is_whitespace)
-        || normalized.split('.').any(str::is_empty)
-    {
-        return Err(PolicyError::InvalidHost {
-            value: value.to_string(),
-        });
-    }
-    Ok(normalized)
 }
