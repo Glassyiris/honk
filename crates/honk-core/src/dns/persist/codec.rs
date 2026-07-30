@@ -9,9 +9,12 @@ use crate::dns::policy::PolicyId;
 use crate::dns::query::{IngressProfile, QueryContext};
 use crate::dns::response::ResponseTemplate;
 
+mod reader;
+
+use reader::Reader;
+
 const MAGIC: &[u8; 4] = b"HDNS";
 const VERSION: u8 = 2;
-const MAX_FIELD_LEN: usize = 1 << 20;
 
 pub(super) struct EncodedEntry {
     pub suffix: String,
@@ -213,52 +216,4 @@ fn digest_hex(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
-}
-
-struct Reader<'a> {
-    remaining: &'a [u8],
-}
-
-impl<'a> Reader<'a> {
-    const fn new(bytes: &'a [u8]) -> Self {
-        Self { remaining: bytes }
-    }
-
-    fn take(&mut self, len: usize) -> Result<&'a [u8], DecodeError> {
-        let (value, remaining) = self
-            .remaining
-            .split_at_checked(len)
-            .ok_or(DecodeError::Corrupt)?;
-        self.remaining = remaining;
-        Ok(value)
-    }
-
-    fn byte(&mut self) -> Result<u8, DecodeError> {
-        Ok(self.take(1)?[0])
-    }
-
-    fn u16(&mut self) -> Result<u16, DecodeError> {
-        let bytes = <[u8; 2]>::try_from(self.take(2)?).map_err(|_| DecodeError::Corrupt)?;
-        Ok(u16::from_be_bytes(bytes))
-    }
-
-    fn u64(&mut self) -> Result<u64, DecodeError> {
-        let bytes = <[u8; 8]>::try_from(self.take(8)?).map_err(|_| DecodeError::Corrupt)?;
-        Ok(u64::from_be_bytes(bytes))
-    }
-
-    fn bytes(&mut self) -> Result<&'a [u8], DecodeError> {
-        let length = usize::try_from(u32::from_be_bytes(
-            <[u8; 4]>::try_from(self.take(4)?).map_err(|_| DecodeError::Corrupt)?,
-        ))
-        .map_err(|_| DecodeError::Corrupt)?;
-        if length > MAX_FIELD_LEN {
-            return Err(DecodeError::Corrupt);
-        }
-        self.take(length)
-    }
-
-    const fn is_empty(&self) -> bool {
-        self.remaining.is_empty()
-    }
 }

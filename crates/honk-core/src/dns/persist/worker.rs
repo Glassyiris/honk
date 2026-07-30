@@ -5,9 +5,11 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use super::codec::{self, DecodeError};
+use super::codec;
 use super::{COMMAND_CAPACITY, Command, CounterSet, PersistControlError, Put};
 use crate::cachedb::CacheDb;
+
+mod restore;
 
 const FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 const PENDING_CAPACITY: usize = COMMAND_CAPACITY;
@@ -72,7 +74,7 @@ async fn run_loop(
                         let _ = ack.send(result);
                     }
                     Command::Restore { cache, policy, ack } => {
-                        let restored = restore(&db, &cache, policy.as_ref(), &counters);
+                        let restored = restore::restore(&db, &cache, policy.as_ref(), &counters);
                         let _ = ack.send(restored);
                     }
                     Command::Shutdown { ack } => {
@@ -205,49 +207,4 @@ fn discard_before(pending: &mut HashMap<String, Pending>, epoch: u64, counters: 
         Ordering::Relaxed,
     );
     counters.pending.store(pending.len(), Ordering::Relaxed);
-}
-
-fn restore(
-    db: &CacheDb,
-    cache: &crate::dns::cache::DnsCacheService,
-    policy: Option<&crate::dns::policy::PolicyId>,
-    counters: &CounterSet,
-) -> usize {
-    let rows = match db.load_dns_v2() {
-        Ok(rows) => rows,
-        Err(error) => {
-            counters.db_errors.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(%error, "DNS persistence restore query failed");
-            return 0;
-        }
-    };
-    let now = super::unix_now();
-    let mut restored = 0usize;
-    for (suffix, bytes) in rows {
-        match codec::decode(&suffix, &bytes, policy) {
-            Ok(entry) if entry.expire_at_unix <= now => {
-                counters.stale.fetch_add(1, Ordering::Relaxed);
-            }
-            Ok(entry) => {
-                let remaining = entry.expire_at_unix.saturating_sub(now);
-                let Ok(ttl) = u32::try_from(remaining) else {
-                    counters.corrupt.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                };
-                cache.put_restored(entry.key.storage_key(), entry.response, ttl);
-                restored = restored.saturating_add(1);
-                counters.restored.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(DecodeError::Version(_)) => {
-                counters.version_mismatch.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(DecodeError::PolicyMismatch) => {
-                counters.policy_mismatch.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(DecodeError::Collision | DecodeError::Corrupt) => {
-                counters.corrupt.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-    restored
 }
