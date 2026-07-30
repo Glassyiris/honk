@@ -2,91 +2,29 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use tokio::sync::Notify;
 
 use super::cache::DnsCache;
 use super::forwarder::DnsForwarder;
 use super::policy::PolicyId;
-use super::upstream_pool::UpstreamPool;
 use crate::group::GroupManager;
 use crate::routing::Router;
 
 pub(crate) const RETIREMENT_DEADLINE: Duration = Duration::from_secs(30);
 pub(crate) const MAX_RETIRED_RUNTIMES: usize = 4;
-static NEXT_PERSISTENCE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 mod provider;
 pub(crate) use provider::DnsServiceProvider;
+mod resources;
+pub(crate) use resources::{ProcessPersistenceHandle, RuntimeTransport};
+mod state;
+pub(crate) use state::{RuntimeGeneration, RuntimeState};
+#[cfg(test)]
+mod prefetch_tests;
 #[cfg(test)]
 mod tests;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct RuntimeGeneration(u64);
-
-impl RuntimeGeneration {
-    pub(crate) const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    pub(crate) const fn get(self) -> u64 {
-        self.0
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub(crate) enum RuntimeState {
-    Active,
-    Draining,
-    Closing,
-    Closed,
-}
-
-impl RuntimeState {
-    const fn from_raw(value: u8) -> Self {
-        match value {
-            0 => Self::Active,
-            1 => Self::Draining,
-            2 => Self::Closing,
-            _ => Self::Closed,
-        }
-    }
-}
-
 pub(crate) use super::projection::RoutingProjectionSnapshot;
-
-#[async_trait]
-pub(crate) trait RuntimeTransport: Send + Sync {
-    async fn close(&self);
-}
-
-#[async_trait]
-impl RuntimeTransport for UpstreamPool {
-    async fn close(&self) {
-        UpstreamPool::close(self).await;
-    }
-}
-
-pub(crate) struct ProcessPersistenceHandle {
-    #[allow(dead_code)]
-    identity: u64,
-    _cache: Arc<tokio::sync::Mutex<DnsCache>>,
-}
-
-impl ProcessPersistenceHandle {
-    pub(crate) fn new(cache: Arc<tokio::sync::Mutex<DnsCache>>) -> Arc<Self> {
-        Arc::new(Self {
-            identity: NEXT_PERSISTENCE_ID.fetch_add(1, Ordering::Relaxed),
-            _cache: cache,
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn identity(&self) -> u64 {
-        self.identity
-    }
-}
 
 pub(crate) struct DnsRuntimeParts {
     pub(crate) generation: RuntimeGeneration,
@@ -224,6 +162,7 @@ impl DnsRuntime {
             self.wait_closed().await;
             return;
         }
+        self.parts.forwarder.shutdown_prefetch().await;
         self.parts.transport.close().await;
         self.state
             .store(RuntimeState::Closed as u8, Ordering::Release);

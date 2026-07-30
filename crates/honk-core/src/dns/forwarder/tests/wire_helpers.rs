@@ -1,7 +1,12 @@
 #[tokio::test]
 async fn test_prefetch_warms_cache() {
     let response = make_a_response([1, 2, 3, 4], 300);
-    let mock = Arc::new(MockUpstream::new(response.clone()));
+    let mock = Arc::new(GatedUpstream {
+        response: response.clone(),
+        call_count: AtomicUsize::new(0),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
     let cache = test_cache();
     let forwarder = DnsForwarder::new(
         mock.clone() as Arc<dyn DnsUpstreamPool>,
@@ -11,21 +16,16 @@ async fn test_prefetch_warms_cache() {
 
     let domains: Vec<String> = vec!["example.com".into()];
     forwarder.prefetch(&domains);
-
-    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    mock.entered.notified().await;
+    mock.release.notify_one();
+    forwarder.prefetch_tasks.wait_empty().await;
 
     let query = make_a_query();
     let result = forwarder.resolve(&query).await.expect("resolve");
     assert_eq!(result, response);
 
-    // The upstream should have been called at least once (by prefetch),
-    // but resolve itself may or may not call it depending on timing
     let calls = mock.call_count.load(Ordering::SeqCst);
-    assert!(
-        calls >= 1,
-        "expected at least 1 upstream call for prefetch, got {}",
-        calls
-    );
+    assert_eq!(calls, 1, "resolve must use the prefetched cache entry");
 }
 
 #[test]

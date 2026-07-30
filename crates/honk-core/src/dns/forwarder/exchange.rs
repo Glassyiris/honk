@@ -184,8 +184,8 @@ impl DnsForwarder {
         for domain in domains {
             let domain = domain.clone();
             let query = build_dns_query(&domain, 1);
-            let forwarder = self.clone();
-            tokio::spawn(async move {
+            let forwarder = self.background_clone();
+            let _ = self.prefetch_tasks.spawn(async move {
                 match forwarder
                     .resolve_with_profile(&query, IngressProfile::Internal)
                     .await

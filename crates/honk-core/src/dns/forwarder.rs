@@ -131,6 +131,7 @@ pub struct DnsForwarder {
     pub(crate) cache_ttl: u32,
     pub(crate) notifier: Option<Arc<dyn DomainResolveNotifier>>,
     pub(crate) policy_id: Option<PolicyId>,
+    prefetch_tasks: Arc<prefetch::PrefetchTasks>,
 }
 
 impl DnsForwarder {
@@ -151,6 +152,7 @@ impl DnsForwarder {
             cache_ttl: 0,
             notifier: None,
             policy_id: None,
+            prefetch_tasks: prefetch::PrefetchTasks::new(),
         }
     }
 
@@ -171,6 +173,7 @@ impl DnsForwarder {
             cache_ttl: 0,
             notifier: Some(notifier),
             policy_id: None,
+            prefetch_tasks: prefetch::PrefetchTasks::new(),
         }
     }
 
@@ -219,10 +222,30 @@ impl DnsForwarder {
                 .await,
         )
     }
+
+    fn background_clone(&self) -> Self {
+        Self {
+            upstream_pool: Arc::clone(&self.upstream_pool),
+            cache: Arc::clone(&self.cache),
+            cache_service: Arc::clone(&self.cache_service),
+            routing: Arc::clone(&self.routing),
+            strategy: self.strategy.clone(),
+            cache_enabled: self.cache_enabled,
+            cache_ttl: self.cache_ttl,
+            notifier: self.notifier.clone(),
+            policy_id: self.policy_id.clone(),
+            prefetch_tasks: prefetch::PrefetchTasks::closed(),
+        }
+    }
+
+    pub(crate) async fn shutdown_prefetch(&self) {
+        self.prefetch_tasks.shutdown().await;
+    }
 }
 
 mod exchange;
 mod message;
+mod prefetch;
 mod resolution;
 mod response;
 mod strategy;
