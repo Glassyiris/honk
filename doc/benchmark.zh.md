@@ -98,8 +98,8 @@ iperf3 接收端中位数,CPU 为核数,RSS 为跑完后值。
 | 引擎 | 协议 | cold | hot p50 | hot p95 | 带宽 (Mbps) | cpu | RSS (MB) |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | honk | direct | 0.0051 | – | – | 9397 | 0.25 | 14 |
-| honk | hy2 | 0.0082 | 0.0042 | 0.0055 | 1918 | 0.95 | 16 |
-| honk | tuic | 0.0109 | 0.0033 | 0.0041 | 2073 | 1.04 | 15 |
+| honk | hy2 | 0.0082 | 0.0042 | 0.0055 | 2289² | 0.95 | 16 |
+| honk | tuic | 0.0109 | 0.0033 | 0.0041 | 2383² | 1.04 | 15 |
 | honk | ss2022 | 0.0043 | 0.0041 | 0.0049 | 1314 | 1.01 | 15 |
 | honk | trojan | 0.0051 | 0.0025 | 0.0104 | 4427 | 1.03 | 14 |
 | honk | anytls-sb | 0.0059 | 0.0021 | 0.0029 | 见注¹ | 0.00 | 14 |
@@ -114,6 +114,11 @@ dae 各行复跑过一次确认:除 trojan 带宽外全部在方差内复现;tro
 (654 Mbps、0.16 核)是被共享实验室上另一个测试会话中途重启引擎污染的。
 见"已知的实验室限制"。
 
+² honk hy2/tuic 两行为**修复后**数据:包含 QUIC socket 缓冲(8 MiB
+SO_RCVBUF/SO_SNDBUF + rmem_max/wmem_max 提升到 16 MiB)和接收窗口
+(8 MiB stream / 32 MiB conn)改动。修复前同样跑法为 hy2 1918 /
+tuic 2073 Mbps——瓶颈是 208 KiB 默认 socket 缓冲,不是引擎数据面。
+
 ¹ **AnyTLS 单流 iperf3 异常(实验室假象,非引擎回退)**:本实验室内单流
 iperf3 过 AnyTLS 只有 2–3 Mbps。原因在服务端一侧——iperf3-daemon ↔
 anytls-server 的环回投递(iperf3 进入 app-limited 后不再喂数据)。用
@@ -123,8 +128,9 @@ sing-box 客户端打同一批服务端可以复现,而 curl、python 和并发�
 ### 结果解读
 
 - **带宽**:honk trojan 领先(4427 vs 4178,+6%),QUIC 协议落后
-  (hy2 1918 vs 3058、tuic 2073 vs 3335——拥塞控制和窗口调优仍是待办),
-  ss2022 接近(1314 vs 1511)。
+  (hy2 2289 vs 3058、tuic 2383 vs 3335——socket 缓冲/窗口修复后的
+  quinn-vs-quic-go 残余差距,后续 profiling 再收),ss2022 接近
+  (1314 vs 1511)。
 - **延迟**:极端案例是 TUIC:热开流 3.3 ms vs dae 78.6 ms——honk 的
   BoringSSL QUIC 后端有进程级 TLS 1.3 票据缓存,热 TUIC 拨号只要 1 个 RTT;
   dae 每条连接都要完整 QUIC 握手。冷启动同样(10.9 vs 80.8 ms)。其他行在

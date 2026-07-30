@@ -110,8 +110,8 @@ RSS after the run.
 | engine | protocol | cold | hot p50 | hot p95 | bw (Mbps) | cpu | RSS (MB) |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | honk | direct | 0.0051 | – | – | 9397 | 0.25 | 14 |
-| honk | hy2 | 0.0082 | 0.0042 | 0.0055 | 1918 | 0.95 | 16 |
-| honk | tuic | 0.0109 | 0.0033 | 0.0041 | 2073 | 1.04 | 15 |
+| honk | hy2 | 0.0082 | 0.0042 | 0.0055 | 2289² | 0.95 | 16 |
+| honk | tuic | 0.0109 | 0.0033 | 0.0041 | 2383² | 1.04 | 15 |
 | honk | ss2022 | 0.0043 | 0.0041 | 0.0049 | 1314 | 1.01 | 15 |
 | honk | trojan | 0.0051 | 0.0025 | 0.0104 | 4427 | 1.03 | 14 |
 | honk | anytls-sb | 0.0059 | 0.0021 | 0.0029 | see note¹ | 0.00 | 14 |
@@ -127,6 +127,12 @@ variance except trojan bandwidth, whose first reading (654 Mbps at
 0.16 cores) was polluted by another test session restarting engines on the
 shared lab mid-run. See "Known lab limits".
 
+² honk hy2/tuic rows are **post-fix**: they include the QUIC socket-buffer
+(8 MiB SO_RCVBUF/SO_SNDBUF + rmem_max/wmem_max raised to 16 MiB) and
+receive-window (8 MiB stream / 32 MiB conn) changes. Before them the same
+runs read hy2 1918 / tuic 2073 Mbps — the 208 KiB default socket buffer
+was the cap, not the engine's datapath.
+
 ¹ **AnyTLS single-stream iperf3 anomaly (lab artifact, not an engine
 regression)**: single-stream iperf3 through AnyTLS reads 2–3 Mbps in this
 lab. The cause is on the server host — iperf3-daemon ↔ anytls-server
@@ -138,8 +144,9 @@ python and parallel streams all run at line rate. Measured with
 ### Reading the table
 
 - **Bandwidth**: honk leads trojan (4427 vs 4178, +6%) and trails on the
-  QUIC protocols (hy2 1918 vs 3058, tuic 2073 vs 3335 — congestion-control
-  and window tuning remain open work); ss2022 is close (1314 vs 1511).
+  QUIC protocols (hy2 2289 vs 3058, tuic 2383 vs 3335 — the residual
+  quinn-vs-quic-go gap after the socket-buffer/window fix; profiling is
+  future work); ss2022 is close (1314 vs 1511).
 - **Latency**: the extreme case is TUIC: 3.3 ms hot vs dae's 78.6 ms —
   honk's BoringSSL QUIC backend resumes TLS 1.3 sessions from a
   process-wide ticket cache, so a warm TUIC dial is one RTT; dae pays a
