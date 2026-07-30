@@ -28,8 +28,14 @@ impl ControlPlane {
     /// datapath. New connections are rejected briefly while the swap happens.
     pub(super) async fn apply_runtime_config(&self, new_config: Config, drain: &DrainTracker) {
         drain.start_rejecting();
-        // Brief pause for in-flight connection setup
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // An old initializer must not publish a Ready endpoint across this
+        // runtime/config generation. Reject first, broadcast cancellation,
+        // and wait for lease Drop before touching live configuration.
+        if !self.udp_pool.cancel_initializers_and_wait().await {
+            error!("UDP initializer cancellation timed out; reload aborted before config swap");
+            drain.stop_rejecting();
+            return;
+        }
 
         // ── Phase 1: build everything (no live-state mutation) ──
         let new_router = match Router::new(
@@ -523,8 +529,10 @@ pub(super) fn resolve_outbound_nodes(
 #[cfg(test)]
 mod atomic_reload_tests {
     use super::*;
+    use crate::control::udp_endpoint::{EndpointReservation, UdpEndpoint};
     use crate::dns;
     use crate::ebpf::mock::MockEbpfBackend;
+    use crate::stats::StatsManager;
 
     fn test_dns_forwarder() -> std::sync::Arc<dns::forwarder::DnsForwarder> {
         let cache = Arc::new(tokio::sync::Mutex::new(dns::cache::DnsCache::new(100)));
@@ -591,6 +599,235 @@ mod atomic_reload_tests {
 
         let after = cp.config_handle().read().await.global.log_level.clone();
         assert_eq!(before, after, "failed build must not swap the live config");
+    }
+
+    #[tokio::test]
+    async fn reload_cancels_initializing_generation_before_swap_and_keeps_ready_endpoint() {
+        use honk_outbound::proxy::PacketTransport;
+        use std::io;
+        use std::sync::Mutex;
+        use tokio::sync::Notify;
+
+        /// Minimal scripted transport local to this reload test so we can
+        /// prove a real driver survives production cancel/reload.
+        #[derive(Debug)]
+        struct ReloadTestTransport {
+            relay: std::net::SocketAddr,
+            sent: Mutex<Vec<Vec<u8>>>,
+            progress: Notify,
+        }
+
+        #[async_trait::async_trait]
+        impl PacketTransport for ReloadTestTransport {
+            fn relay_addr(&self) -> std::net::SocketAddr {
+                self.relay
+            }
+
+            async fn send_packet(&self, data: &[u8]) -> io::Result<()> {
+                self.sent.lock().unwrap().push(data.to_vec());
+                self.progress.notify_waiters();
+                Ok(())
+            }
+
+            async fn recv_packet(
+                &self,
+                _buf: &mut [u8],
+            ) -> io::Result<(usize, std::net::SocketAddr)> {
+                // Leave receive pending for the life of the driver.
+                std::future::pending().await
+            }
+        }
+
+        impl ReloadTestTransport {
+            async fn wait_for_send_count(&self, count: usize) {
+                loop {
+                    if self.sent.lock().unwrap().len() >= count {
+                        return;
+                    }
+                    self.progress.notified().await;
+                }
+            }
+
+            fn sent_packets(&self) -> Vec<Vec<u8>> {
+                self.sent.lock().unwrap().clone()
+            }
+        }
+
+        let cp = test_cp();
+        let pool = cp.udp_pool.clone();
+        let stats = Arc::new(StatsManager::new());
+        let ready_client: std::net::SocketAddr = "10.0.0.1:53000".parse().unwrap();
+        let initializing_client: std::net::SocketAddr = "10.0.0.2:53000".parse().unwrap();
+        let dst: std::net::SocketAddr = "203.0.113.2:443".parse().unwrap();
+        let relay: std::net::SocketAddr = "192.0.2.10:1080".parse().unwrap();
+
+        let ready_permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .try_acquire_owned()
+            .unwrap();
+        let mut ready_lease = match pool.reserve_or_enqueue(
+            ready_client,
+            dst,
+            b"ready-first",
+            ready_permit,
+            &stats,
+        ) {
+            EndpointReservation::Initializing(lease) => lease,
+            _ => panic!("ready fixture must reserve an initializing entry"),
+        };
+        let transport = Arc::new(ReloadTestTransport {
+            relay,
+            sent: Mutex::new(Vec::new()),
+            progress: Notify::new(),
+        });
+        let ready_endpoint = Arc::new(UdpEndpoint::new(
+            transport.clone() as Arc<dyn PacketTransport>,
+            relay,
+            "ready-node".into(),
+        ));
+        let queue_rx = ready_lease.take_queue_receiver().unwrap();
+        let reply_socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mut driver = pool.spawn_driver(
+            ready_client,
+            dst,
+            ready_lease.generation(),
+            Arc::clone(&ready_endpoint),
+            queue_rx,
+            reply_socket,
+            Arc::new(honk_outbound::alive::AliveDialerSet::new()),
+            Arc::clone(&stats),
+            "ready-node".into(),
+        );
+        driver.wait_ready().await.unwrap();
+        assert!(ready_lease.commit_ready(Arc::clone(&ready_endpoint)));
+        driver
+            .start(ready_lease.take_first().unwrap())
+            .expect("driver start");
+        driver.wait_first_ack().await.unwrap();
+        // Production drops a committed lease after the first-send ack; only
+        // the Ready driver, not an initializer guard, survives into reload.
+        drop(ready_lease);
+
+        let init_permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .try_acquire_owned()
+            .unwrap();
+        let initializing_lease = match pool.reserve_or_enqueue(
+            initializing_client,
+            dst,
+            b"initializing",
+            init_permit,
+            &stats,
+        ) {
+            EndpointReservation::Initializing(lease) => lease,
+            _ => panic!("reload fixture must reserve an initializing entry"),
+        };
+        let mut cancellation = initializing_lease.cancellation();
+        let initializer = tokio::spawn(async move {
+            cancellation
+                .changed()
+                .await
+                .expect("reload must broadcast initializer cancellation");
+            drop(initializing_lease);
+        });
+
+        let mut new_config = Config::default();
+        new_config.global.log_level = "trace".into();
+        let drain = DrainTracker::new();
+        cp.apply_runtime_config(new_config, &drain).await;
+        initializer.await.unwrap();
+
+        assert!(pool.get(initializing_client, dst).is_none());
+        assert!(
+            Arc::ptr_eq(&pool.get(ready_client, dst).unwrap(), &ready_endpoint),
+            "ordinary reload must not retire Ready endpoint drivers"
+        );
+
+        // After production reload cancellation the Ready driver must still
+        // accept and deliver a steady packet (or at least enqueue+transport).
+        let follower_permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .try_acquire_owned()
+            .unwrap();
+        assert!(matches!(
+            pool.reserve_or_enqueue(ready_client, dst, b"after-reload", follower_permit, &stats,),
+            EndpointReservation::Enqueued
+        ));
+        transport.wait_for_send_count(2).await;
+        assert_eq!(
+            transport.sent_packets(),
+            vec![b"ready-first".to_vec(), b"after-reload".to_vec()]
+        );
+
+        let replacement_permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .try_acquire_owned()
+            .unwrap();
+        assert!(matches!(
+            pool.reserve_or_enqueue(
+                initializing_client,
+                dst,
+                b"next-generation",
+                replacement_permit,
+                &stats,
+            ),
+            EndpointReservation::Initializing(_)
+        ));
+        assert_eq!(cp.config_handle().read().await.global.log_level, "trace");
+        pool.remove(ready_client, dst);
+        pool.remove(initializing_client, dst);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reload_timeout_keeps_runtime_and_restores_admission() {
+        let cp = Arc::new(test_cp());
+        let pool = cp.udp_pool.clone();
+        let stats = Arc::new(StatsManager::new());
+        let client: std::net::SocketAddr = "10.0.0.9:53000".parse().unwrap();
+        let dst: std::net::SocketAddr = "203.0.113.9:443".parse().unwrap();
+        let slow_permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .try_acquire_owned()
+            .unwrap();
+        let lease = match pool.reserve_or_enqueue(client, dst, b"held", slow_permit, &stats) {
+            EndpointReservation::Initializing(lease) => lease,
+            _ => panic!("timeout fixture must hold a real initializer lease"),
+        };
+        let mut cancellation = lease.cancellation();
+        let before = cp.config_handle().read().await.global.log_level.clone();
+        let mut next = Config::default();
+        next.global.log_level = "trace".into();
+        let drain = Arc::new(DrainTracker::new());
+        let reloading_cp = Arc::clone(&cp);
+        let reloading_drain = Arc::clone(&drain);
+        let reloader = tokio::spawn(async move {
+            reloading_cp
+                .apply_runtime_config(next, reloading_drain.as_ref())
+                .await;
+        });
+
+        cancellation
+            .changed()
+            .await
+            .expect("reload must cancel the held initializer before waiting");
+        assert!(
+            drain.should_reject(),
+            "reload must fail closed while it waits"
+        );
+        tokio::time::advance(Duration::from_secs(5) + Duration::from_millis(1)).await;
+        reloader.await.unwrap();
+
+        assert_eq!(
+            cp.config_handle().read().await.global.log_level,
+            before,
+            "a timed-out initializer must prevent the runtime/config swap"
+        );
+        assert!(
+            !drain.should_reject(),
+            "an aborted reload must restore admission after its timeout"
+        );
+        assert_eq!(
+            pool.len(),
+            1,
+            "the real initializer remains held until its owner drops it"
+        );
+        drop(lease);
+        assert!(pool.is_empty());
     }
 
     /// A valid reload commits: config is swapped and eBPF routing is pushed.

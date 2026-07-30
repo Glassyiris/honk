@@ -840,21 +840,20 @@ pub(super) fn might_be_dns_query(data: &[u8]) -> bool {
     crate::dns::forwarder::parse_dns_question(data).is_some()
 }
 
-/// UDP datapath fast path: forward a datagram belonging to an established
-/// endpoint inline in the accept loop.
+/// UDP datapath fast path: classify/drop and, for a live Ready endpoint,
+/// perform a bounded synchronous `try_enqueue` in the accept loop.
 ///
-/// Runs on the reusable receive buffer — no task spawn, no heap copy, no
-/// QUIC sniffer, no concurrency permit. Returns `true` when the datagram was
-/// fully handled (forwarded or dropped) and the accept loop can move on to
-/// the next packet; `false` when it must take the slow path
-/// (`serve_udp_connection`): new-flow setup or a possible DNS query.
+/// Runs on the reusable receive buffer with no task spawn, no QUIC sniffer,
+/// and no slow-path concurrency permit. Ready hits may copy into the
+/// bounded per-flow queue (permits first). Returns `true` when the datagram
+/// was fully handled (enqueued, drop-newest, or dropped by pre-checks) and
+/// the accept loop can move on; `false` when it must take the slow path:
+/// Initializing followers, new-flow setup, or a possible DNS query.
 ///
-/// Semantics match the endpoint-reuse branch of `serve_udp_connection`
-/// (same drop pre-checks and `mark_sent`/`refresh`), while this function is
-/// the sole production owner of endpoint hit/miss accounting. Skipping the
-/// QUIC sniffer on hits is safe because an established
-/// endpoint means routing for this flow was already decided when its first
-/// packet took the slow path.
+/// This function is the sole production owner of endpoint hit/miss
+/// accounting. Skipping the QUIC sniffer on Ready hits is safe because
+/// routing for this flow was already decided when its first packet took the
+/// slow path.
 pub(super) async fn udp_fast_path(
     udp_pool: &UdpEndpointPool,
     stats: &StatsManager,
@@ -885,36 +884,34 @@ pub(super) async fn udp_fast_path(
         return false;
     }
 
-    // Only established flows are forwarded inline; a miss means a new flow
-    // whose first packet needs the slow path (sniff, handoff, route, dial).
-    let Some(ep) = udp_pool.get(client_addr, original_dst) else {
+    // The receive loop only performs a synchronous bounded enqueue. Transport
+    // I/O belongs exclusively to the per-endpoint driver, so a blocked send
+    // on one flow cannot delay classification of another datagram.
+    let Some(result) = udp_pool.fast_path_enqueue(client_addr, original_dst, data, stats) else {
         stats.record_udp_endpoint_miss();
         return false;
     };
     stats.record_udp_endpoint_hit();
 
-    debug!("UDP endpoint reuse for {} -> {}", client_addr, original_dst);
-    // Routing-cache probe: preserves the lazy TTL invalidation side effect
-    // of the slow-path hit branch (the value itself is only logged there).
-    if let Some(_cached_outbound) = ep.get_cached_routing(original_dst) {
+    debug!(
+        "UDP endpoint enqueue for {} -> {}",
+        client_addr, original_dst
+    );
+    // Keep the cache's lazy TTL invalidation behavior without sending from
+    // the receive loop. The driver owns mark_sent, refresh and byte counts
+    // after a real PacketTransport send succeeds.
+    if let Some(ep) = udp_pool.get(client_addr, original_dst)
+        && ep.get_cached_routing(original_dst).is_some()
+    {
         debug!(
             "UDP routing cache hit for {} -> {}",
             client_addr, original_dst
         );
     }
-    ep.mark_sent();
-    ep.refresh();
-    ep.tracker_upload(data.len() as u64);
-    if let Err(e) = ep.proxy_socket.send_packet(data).await {
-        warn!(
-            "UDP fast path send to {} for {} -> {} failed: {}",
-            ep.relay_addr, client_addr, original_dst, e
-        );
-        // A dead transport (session/stream closed) can never deliver for
-        // this endpoint again; mark it dead so the next datagram creates a
-        // fresh endpoint instead of black-holing until the timeouts reap it.
-        ep.kill();
-    }
+    debug_assert!(matches!(
+        result,
+        EndpointReservation::Enqueued | EndpointReservation::QueueFull
+    ));
     true
 }
 

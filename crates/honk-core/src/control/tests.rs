@@ -1,4 +1,5 @@
 use super::*;
+use crate::control::udp_endpoint::UdpEndpoint;
 
 #[test]
 fn test_build_dns_probe_query() {
@@ -107,6 +108,42 @@ fn dns_query_payload() -> Vec<u8> {
     q
 }
 
+async fn ready_udp_endpoint(
+    pool: &Arc<UdpEndpointPool>,
+    stats: &Arc<StatsManager>,
+    client: SocketAddr,
+    dst: SocketAddr,
+    transport: Arc<dyn honk_outbound::proxy::PacketTransport>,
+    relay: SocketAddr,
+) -> Arc<UdpEndpoint> {
+    let slow_permit = Arc::new(tokio::sync::Semaphore::new(1))
+        .try_acquire_owned()
+        .unwrap();
+    let mut lease = match pool.reserve_or_enqueue(client, dst, b"bootstrap", slow_permit, stats) {
+        crate::control::udp_endpoint::EndpointReservation::Initializing(lease) => lease,
+        _ => panic!("test endpoint must reserve a fresh lease"),
+    };
+    let endpoint = Arc::new(UdpEndpoint::new(transport, relay, "test-node".into()));
+    let queue_rx = lease.take_queue_receiver().unwrap();
+    let reply_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let mut driver = pool.spawn_driver(
+        client,
+        dst,
+        lease.generation(),
+        Arc::clone(&endpoint),
+        queue_rx,
+        reply_socket,
+        Arc::new(crate::outbound::AliveDialerSet::new()),
+        stats.clone(),
+        "test-node".into(),
+    );
+    driver.wait_ready().await.unwrap();
+    assert!(lease.commit_ready(Arc::clone(&endpoint)));
+    driver.start(lease.take_first().unwrap()).unwrap();
+    driver.wait_first_ack().await.unwrap();
+    endpoint
+}
+
 #[test]
 fn might_be_dns_query_matches_controller_condition() {
     // Real query: consumed by the DNS controller.
@@ -133,34 +170,35 @@ async fn udp_fast_path_miss_goes_slow() {
 }
 
 #[tokio::test]
-async fn udp_fast_path_hit_forwards_inline() {
+async fn udp_fast_path_hit_enqueues_for_the_endpoint_driver() {
     let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let echo_addr = echo.local_addr().unwrap();
     let proxy = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let proxy_addr = proxy.local_addr().unwrap();
-    let pool = UdpEndpointPool::new();
-    let stats = StatsManager::new();
+    let pool = Arc::new(UdpEndpointPool::new());
+    let stats = Arc::new(StatsManager::new());
     let client = addr("10.0.0.1:12345");
     let dst = addr("203.0.113.1:443");
-    let (_ep, is_new) = pool
-        .get_or_create(
-            client,
-            dst,
-            std::sync::Arc::new(honk_outbound::proxy::UdpSocketTransport::new(
-                proxy, echo_addr,
-            )),
-            echo_addr,
-            "test-node".to_string(),
-        )
-        .unwrap();
-    assert!(is_new);
+    ready_udp_endpoint(
+        &pool,
+        &stats,
+        client,
+        dst,
+        Arc::new(honk_outbound::proxy::UdpSocketTransport::new(
+            proxy, echo_addr,
+        )),
+        echo_addr,
+    )
+    .await;
 
+    let mut buf = [0u8; 64];
+    // First packet was delivered through the driver start barrier.
+    echo.recv_from(&mut buf).await.unwrap();
     assert!(udp_fast_path(&pool, &stats, b"hello", client, dst).await);
     let udp = stats.udp_snapshot();
     assert_eq!(udp.endpoint_hits, 1);
     assert_eq!(udp.endpoint_misses, 0);
 
-    let mut buf = [0u8; 64];
     let (n, from) = tokio::time::timeout(Duration::from_secs(2), echo.recv_from(&mut buf))
         .await
         .expect("echo timed out")
@@ -171,26 +209,25 @@ async fn udp_fast_path_hit_forwards_inline() {
 
 #[tokio::test]
 async fn udp_fast_path_dns_goes_slow_even_with_endpoint() {
-    // A real DNS query must reach the DNS controller even when an
-    // endpoint exists for (client, dst) — today's order is DNS first.
-    let pool = UdpEndpointPool::new();
-    let stats = StatsManager::new();
+    // A real DNS query must reach the DNS controller even when an endpoint
+    // driver already owns this tuple.
+    let pool = Arc::new(UdpEndpointPool::new());
+    let stats = Arc::new(StatsManager::new());
     let client = addr("10.0.0.1:12345");
     let dst = addr("203.0.113.1:53");
     let proxy = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-    let (_ep, is_new) = pool
-        .get_or_create(
-            client,
-            dst,
-            std::sync::Arc::new(honk_outbound::proxy::UdpSocketTransport::new(
-                proxy,
-                addr("127.0.0.1:9"),
-            )),
+    ready_udp_endpoint(
+        &pool,
+        &stats,
+        client,
+        dst,
+        Arc::new(honk_outbound::proxy::UdpSocketTransport::new(
+            proxy,
             addr("127.0.0.1:9"),
-            "test-node".to_string(),
-        )
-        .unwrap();
-    assert!(is_new);
+        )),
+        addr("127.0.0.1:9"),
+    )
+    .await;
 
     assert!(!udp_fast_path(&pool, &stats, &dns_query_payload(), client, dst).await);
     let udp = stats.udp_snapshot();
@@ -200,33 +237,33 @@ async fn udp_fast_path_dns_goes_slow_even_with_endpoint() {
 
 #[tokio::test]
 async fn udp_fast_path_non_dns_port53_forwards() {
-    // Garbage to port 53 is not a DNS query: the endpoint forwards it,
+    // Garbage to port 53 is not a DNS query: the endpoint driver forwards it,
     // exactly like the slow path does after handle_udp_dns declines.
     let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let echo_addr = echo.local_addr().unwrap();
     let proxy = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-    let pool = UdpEndpointPool::new();
-    let stats = StatsManager::new();
+    let pool = Arc::new(UdpEndpointPool::new());
+    let stats = Arc::new(StatsManager::new());
     let client = addr("10.0.0.1:12345");
     let dst = addr("203.0.113.1:53");
-    let (_ep, is_new) = pool
-        .get_or_create(
-            client,
-            dst,
-            std::sync::Arc::new(honk_outbound::proxy::UdpSocketTransport::new(
-                proxy, echo_addr,
-            )),
-            echo_addr,
-            "test-node".to_string(),
-        )
-        .unwrap();
-    assert!(is_new);
+    ready_udp_endpoint(
+        &pool,
+        &stats,
+        client,
+        dst,
+        Arc::new(honk_outbound::proxy::UdpSocketTransport::new(
+            proxy, echo_addr,
+        )),
+        echo_addr,
+    )
+    .await;
 
+    let mut buf = [0u8; 64];
+    echo.recv_from(&mut buf).await.unwrap();
     let garbage = [0u8; 20]; // QR=0 but qdcount=0 — not a DNS query
     assert!(udp_fast_path(&pool, &stats, &garbage, client, dst).await);
     assert_eq!(stats.udp_snapshot().endpoint_hits, 1);
 
-    let mut buf = [0u8; 64];
     let (n, _) = tokio::time::timeout(Duration::from_secs(2), echo.recv_from(&mut buf))
         .await
         .expect("echo timed out")
@@ -424,10 +461,37 @@ fn domain_reality_same_family_wrong_ip_is_mismatch() {
 enum UdpTestMode {
     DialError,
     SendError,
+    /// Records real application-send attempts made by the production
+    /// PacketTransport call path.
+    CountSends(Arc<std::sync::atomic::AtomicUsize>),
+    /// Counts dial and send attempts while making the first application send
+    /// ambiguous. A later candidate must never be tried after that send.
+    CountFirstSendError {
+        dials: Arc<std::sync::atomic::AtomicUsize>,
+        sends: Arc<std::sync::atomic::AtomicUsize>,
+    },
+    CountDialAndSend {
+        dials: Arc<std::sync::atomic::AtomicUsize>,
+        sends: Arc<std::sync::atomic::AtomicUsize>,
+    },
+    CountDialError {
+        dials: Arc<std::sync::atomic::AtomicUsize>,
+    },
     Success,
     Hold {
         entered: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
+    },
+    HoldAndCount {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        dials: Arc<std::sync::atomic::AtomicUsize>,
+    },
+    HoldAndCountDialAndSend {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        dials: Arc<std::sync::atomic::AtomicUsize>,
+        sends: Arc<std::sync::atomic::AtomicUsize>,
     },
 }
 
@@ -444,14 +508,47 @@ impl honk_outbound::proxy::PacketTransport for UdpTestTransport {
     }
 
     async fn send_packet(&self, _data: &[u8]) -> std::io::Result<()> {
-        match self.mode {
+        match &self.mode {
             UdpTestMode::SendError => Err(std::io::Error::other("first UDP send failed")),
+            UdpTestMode::CountSends(sends) => {
+                sends.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            UdpTestMode::CountFirstSendError { sends, .. } => {
+                sends.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Err(std::io::Error::other("ambiguous first UDP send failure"))
+            }
+            UdpTestMode::CountDialAndSend { sends, .. }
+            | UdpTestMode::HoldAndCountDialAndSend { sends, .. } => {
+                sends.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
 
     async fn recv_packet(&self, _buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
         Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
+    }
+}
+
+#[derive(Debug)]
+struct UdpTestReplySocketFactory;
+
+impl crate::control::udp_endpoint::UdpReplySocketFactory for UdpTestReplySocketFactory {
+    fn create(&self, _original_dst: SocketAddr) -> std::io::Result<UdpSocket> {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        socket.set_nonblocking(true)?;
+        UdpSocket::from_std(socket)
+    }
+}
+
+#[derive(Debug)]
+struct FailingUdpTestReplySocketFactory;
+
+impl crate::control::udp_endpoint::UdpReplySocketFactory for FailingUdpTestReplySocketFactory {
+    fn create(&self, _original_dst: SocketAddr) -> std::io::Result<UdpSocket> {
+        Err(std::io::Error::other("scripted anyfrom setup failure"))
     }
 }
 
@@ -485,12 +582,41 @@ impl honk_outbound::proxy::ProxyHandler for UdpTestHandler {
         _target_domain: Option<&str>,
         _connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn honk_outbound::proxy::PacketTransport>> {
-        if let UdpTestMode::Hold { entered, release } = &self.mode {
-            entered.notify_one();
-            release.notified().await;
+        match &self.mode {
+            UdpTestMode::Hold { entered, release } => {
+                entered.notify_one();
+                release.notified().await;
+            }
+            UdpTestMode::HoldAndCount {
+                entered,
+                release,
+                dials,
+            } => {
+                dials.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                entered.notify_one();
+                release.notified().await;
+            }
+            UdpTestMode::CountFirstSendError { dials, .. }
+            | UdpTestMode::CountDialAndSend { dials, .. }
+            | UdpTestMode::CountDialError { dials } => {
+                dials.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            UdpTestMode::HoldAndCountDialAndSend {
+                entered,
+                release,
+                dials,
+                ..
+            } => {
+                dials.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                entered.notify_one();
+                release.notified().await;
+            }
+            _ => {}
         }
-        match self.mode {
-            UdpTestMode::DialError => Err(anyhow::anyhow!("UDP dial failed")),
+        match &self.mode {
+            UdpTestMode::DialError | UdpTestMode::CountDialError { .. } => {
+                Err(anyhow::anyhow!("UDP dial failed"))
+            }
             _ => Ok(Arc::new(UdpTestTransport {
                 mode: self.mode.clone(),
                 relay: target,
@@ -538,6 +664,34 @@ fn udp_test_node() -> Node {
 }
 
 fn udp_test_handle(config: Config, mode: UdpTestMode, capacity: usize) -> ControlPlaneHandle {
+    udp_test_handle_with_reply_factory(config, mode, capacity, Arc::new(UdpTestReplySocketFactory))
+}
+
+/// Uses ControlPlane's production endpoint pool unchanged. The blocked-dial
+/// death test needs this so the callback installed during ControlPlane::new
+/// owns the same pool that contains the real Initializing reservation.
+fn udp_test_handle_with_default_pool(config: Config, mode: UdpTestMode) -> ControlPlaneHandle {
+    let router = Router::new(&config.routing.rules, &config.routing.default_outbound).unwrap();
+    let mut registry = honk_outbound::proxy::ProxyRegistry::new();
+    registry.register(Box::new(UdpTestHandler { mode }));
+    ControlPlane::new(
+        config,
+        Box::new(crate::ebpf::mock::MockEbpfBackend::new()),
+        router,
+        Arc::new(registry),
+        DnsResolver::new(&honk_config::dns::DnsConfig::default()).unwrap(),
+        udp_test_forwarder(),
+    )
+    .unwrap()
+    .spawn_handle()
+}
+
+fn udp_test_handle_with_reply_factory(
+    config: Config,
+    mode: UdpTestMode,
+    capacity: usize,
+    reply_socket_factory: Arc<dyn crate::control::udp_endpoint::UdpReplySocketFactory>,
+) -> ControlPlaneHandle {
     let router = Router::new(&config.routing.rules, &config.routing.default_outbound).unwrap();
     let mut registry = honk_outbound::proxy::ProxyRegistry::new();
     registry.register(Box::new(UdpTestHandler { mode }));
@@ -550,19 +704,40 @@ fn udp_test_handle(config: Config, mode: UdpTestMode, capacity: usize) -> Contro
         udp_test_forwarder(),
     )
     .unwrap();
-    control_plane.udp_pool = Arc::new(UdpEndpointPool::with_capacity_limit(capacity));
+    control_plane.udp_pool = Arc::new(UdpEndpointPool::with_reply_socket_factory(
+        capacity,
+        reply_socket_factory,
+    ));
     control_plane.spawn_handle()
 }
 
 async fn serve_test_udp(handle: &ControlPlaneHandle) -> anyhow::Result<()> {
-    handle
-        .serve_udp_connection(
-            Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
-            bytes::Bytes::from_static(b"UDP test packet"),
-            addr("10.0.0.2:53000"),
-            addr("203.0.113.2:443"),
-        )
-        .await
+    let client = addr("10.0.0.2:53000");
+    let dst = addr("203.0.113.2:443");
+    let slow_permit = Arc::new(tokio::sync::Semaphore::new(1))
+        .try_acquire_owned()
+        .expect("test slow permit");
+    let reservation = handle.udp_pool.reserve_or_enqueue(
+        client,
+        dst,
+        b"UDP test packet",
+        slow_permit,
+        &handle.stats,
+    );
+    match reservation {
+        crate::control::udp_endpoint::EndpointReservation::Initializing(lease) => {
+            handle
+                .serve_udp_connection(
+                    lease,
+                    Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+                )
+                .await
+        }
+        crate::control::udp_endpoint::EndpointReservation::Enqueued
+        | crate::control::udp_endpoint::EndpointReservation::CapacityRejected
+        | crate::control::udp_endpoint::EndpointReservation::QueueFull
+        | crate::control::udp_endpoint::EndpointReservation::QueueClosed => Ok(()),
+    }
 }
 
 fn assert_udp_outbound(
@@ -618,14 +793,53 @@ async fn udp_stats_lifecycle_dial_error_closes_guard_and_samples_dial() {
 }
 
 #[tokio::test]
-async fn udp_stats_lifecycle_capacity_after_send_closes_guard() {
+async fn udp_init_lease_capacity_rejection_happens_before_route_or_send() {
     let config = udp_test_config("udp-test", vec![udp_test_node()], vec![]);
     let handle = udp_test_handle(config, UdpTestMode::Success, 0);
     let stats = handle.stats.clone();
 
     serve_test_udp(&handle).await.unwrap();
 
-    assert_udp_outbound(&stats, "udp-test", 1, 0, 0);
+    assert!(stats.snapshot().is_empty());
+    let udp = stats.udp_snapshot();
+    assert_eq!(udp.capacity_rejections, 1);
+    assert_eq!(udp.route_latency.count, 0);
+}
+
+#[tokio::test]
+async fn udp_init_lease_capacity_rejection_sends_zero() {
+    let sends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let config = udp_test_config("udp-test", vec![udp_test_node()], vec![]);
+    let handle = udp_test_handle(config, UdpTestMode::CountSends(sends.clone()), 0);
+
+    serve_test_udp(&handle).await.unwrap();
+
+    assert_eq!(
+        sends.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "endpoint reservation must reject at capacity before application send"
+    );
+}
+
+#[tokio::test]
+async fn udp_init_lease_reply_factory_failure_sends_zero() {
+    let sends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let config = udp_test_config("udp-test", vec![udp_test_node()], vec![]);
+    let handle = udp_test_handle_with_reply_factory(
+        config,
+        UdpTestMode::CountSends(sends.clone()),
+        1,
+        Arc::new(FailingUdpTestReplySocketFactory),
+    );
+
+    assert!(serve_test_udp(&handle).await.is_err());
+
+    assert_eq!(
+        sends.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "anyfrom setup failure must happen before the first application send"
+    );
+    assert!(handle.udp_pool.is_empty());
 }
 
 #[tokio::test]
@@ -637,6 +851,52 @@ async fn udp_stats_lifecycle_first_send_error_closes_guard_and_records_error() {
     assert!(serve_test_udp(&handle).await.is_err());
 
     assert_udp_outbound(&stats, "udp-test", 1, 0, 1);
+}
+
+#[tokio::test]
+async fn udp_first_send_failure_does_not_replay_to_another_candidate() {
+    let first = udp_test_node();
+    let second = Node {
+        id: uuid::Uuid::new_v4(),
+        name: "udp-test-second".into(),
+        protocol: honk_config::types::NodeProtocol::HTTP,
+        address: "127.0.0.1".into(),
+        port: 10,
+        ..Default::default()
+    };
+    let config = udp_test_config(
+        "udp-group",
+        vec![first.clone(), second.clone()],
+        vec![Group {
+            name: "udp-group".into(),
+            policy: honk_config::group::GroupPolicy::Selector,
+            nodes: vec![first.id, second.id],
+            ..Default::default()
+        }],
+    );
+    let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let handle = udp_test_handle(
+        config,
+        UdpTestMode::CountFirstSendError {
+            dials: dials.clone(),
+            sends: sends.clone(),
+        },
+        2,
+    );
+
+    assert!(serve_test_udp(&handle).await.is_err());
+
+    assert_eq!(
+        sends.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the selected transport receives exactly one application-send attempt"
+    );
+    assert_eq!(
+        dials.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "an ambiguous first-send failure must not dial a later candidate"
+    );
 }
 
 #[tokio::test]
@@ -665,6 +925,167 @@ async fn udp_stats_lifecycle_slow_future_cancellation_drops_guard_without_error(
 }
 
 #[tokio::test]
+async fn udp_init_lease_concurrent_first_packets_make_one_reservation_and_one_dial() {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let config = udp_test_config("udp-test", vec![udp_test_node()], vec![]);
+    let handle = udp_test_handle(
+        config,
+        UdpTestMode::HoldAndCount {
+            entered: entered.clone(),
+            release: release.clone(),
+            dials: dials.clone(),
+        },
+        1,
+    );
+    let first_handle = handle.clone();
+    let first = tokio::spawn(async move { serve_test_udp(&first_handle).await });
+
+    tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .expect("first packet did not reach the injected dialer");
+    assert_eq!(dials.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+    serve_test_udp(&handle)
+        .await
+        .expect("concurrent follower must enqueue behind the reservation");
+    assert_eq!(
+        dials.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "concurrent first packets must not create a second initializer"
+    );
+
+    release.notify_one();
+    first.await.unwrap().unwrap();
+    assert_eq!(dials.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn udp_node_dead_before_production_dial_has_zero_dials_and_sends() {
+    let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let config = udp_test_config("udp-test", vec![udp_test_node()], vec![]);
+    let handle = udp_test_handle(
+        config,
+        UdpTestMode::CountDialAndSend {
+            dials: dials.clone(),
+            sends: sends.clone(),
+        },
+        1,
+    );
+
+    handle.alive_set.report_unavailable_forced(
+        "udp-test",
+        crate::outbound::ProbeDomain::DataUdp,
+        crate::outbound::IpVersion::V4,
+    );
+    // Trigger the production death callback as well; this ungrouped test
+    // node has no startup grace registration, so one TCP death linearizes it.
+    handle.alive_set.mark_dead("udp-test");
+    serve_test_udp(&handle).await.unwrap();
+
+    assert_eq!(dials.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(sends.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn udp_authoritative_selection_stops_after_single_candidate_dial_failure() {
+    let first = udp_test_node();
+    let second = Node {
+        id: uuid::Uuid::new_v4(),
+        name: "udp-test-second".into(),
+        protocol: honk_config::types::NodeProtocol::HTTP,
+        address: "127.0.0.1".into(),
+        port: 10,
+        ..Default::default()
+    };
+    let config = udp_test_config(
+        "udp-group",
+        vec![first.clone(), second.clone()],
+        vec![Group {
+            name: "udp-group".into(),
+            policy: honk_config::group::GroupPolicy::Selector,
+            nodes: vec![first.id, second.id],
+            ..Default::default()
+        }],
+    );
+    let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let handle = udp_test_handle(
+        config,
+        UdpTestMode::CountDialError {
+            dials: dials.clone(),
+        },
+        2,
+    );
+
+    serve_test_udp(&handle).await.unwrap();
+
+    assert_eq!(
+        dials.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "Selector is authoritative: pre-send failure does not invent a second candidate"
+    );
+}
+
+#[tokio::test]
+async fn udp_production_death_callback_removes_blocked_dial_before_send() {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let target = udp_test_node();
+    let unrelated = Node {
+        id: uuid::Uuid::new_v4(),
+        name: "health-registered-other".into(),
+        protocol: honk_config::types::NodeProtocol::HTTP,
+        address: "127.0.0.1".into(),
+        port: 10,
+        ..Default::default()
+    };
+    // Keep the selected direct node out of the health-check registration so
+    // the public death transition is not hidden by the startup grace period.
+    let config = udp_test_config(
+        "udp-test",
+        vec![target, unrelated.clone()],
+        vec![Group {
+            name: "unrelated-health-group".into(),
+            policy: honk_config::group::GroupPolicy::Selector,
+            nodes: vec![unrelated.id],
+            ..Default::default()
+        }],
+    );
+    let handle = udp_test_handle_with_default_pool(
+        config,
+        UdpTestMode::HoldAndCountDialAndSend {
+            entered: entered.clone(),
+            release: release.clone(),
+            dials: dials.clone(),
+            sends: sends.clone(),
+        },
+    );
+    let task_handle = handle.clone();
+    let task = tokio::spawn(async move { serve_test_udp(&task_handle).await });
+    tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .expect("production ProxyRegistry dial must block after node bind");
+
+    handle.alive_set.mark_dead("udp-test");
+    assert!(
+        handle.udp_pool.is_empty(),
+        "the actual ControlPlane death callback must retire the bound Initializing entry"
+    );
+    release.notify_one();
+    assert!(task.await.unwrap().is_err());
+    assert_eq!(dials.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(
+        sends.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "death during the production blocked dial must prevent application send"
+    );
+}
+
+#[tokio::test]
 async fn udp_stats_lifecycle_success_and_reply_eof_close_guard() {
     let config = udp_test_config("udp-test", vec![udp_test_node()], vec![]);
     let handle = udp_test_handle(config, UdpTestMode::Success, 1);
@@ -674,6 +1095,28 @@ async fn udp_stats_lifecycle_success_and_reply_eof_close_guard() {
     tokio::task::yield_now().await;
 
     assert_udp_outbound(&stats, "udp-test", 1, 0, 0);
+}
+
+#[test]
+fn udp_slow_admission_is_identical_for_ipv4_and_ipv6() {
+    for (client, dst) in [
+        (addr("10.0.0.2:53000"), addr("203.0.113.2:443")),
+        (addr("[2001:db8::2]:53000"), addr("[2001:db8::3]:443")),
+    ] {
+        let pool = Arc::new(UdpEndpointPool::with_capacity_limit(1));
+        let stats = Arc::new(StatsManager::new());
+        let slow = Arc::new(tokio::sync::Semaphore::new(1));
+        let lease =
+            super::reserve_udp_slow_path(&pool, &stats, &slow, client, dst, b"family-symmetric")
+                .expect("both listener families must admit before reserving");
+        assert_eq!(pool.len(), 1);
+        let udp = stats.udp_snapshot();
+        assert_eq!(udp.slow_permit_accepted, 1);
+        assert_eq!(udp.capacity_rejections, 0);
+        assert_eq!(udp.queue_accepted, 0);
+        drop(lease);
+        assert!(pool.is_empty());
+    }
 }
 
 #[tokio::test]
@@ -702,4 +1145,333 @@ async fn udp_stats_lifecycle_slow_permit_full_rejects_without_outbound_total() {
     assert_eq!(udp.slow_permit_accepted, 1);
     assert_eq!(udp.slow_permit_rejected, 1);
     assert!(stats.snapshot().is_empty());
+}
+
+fn production_dns_controller(
+    upstream_calls: Arc<std::sync::atomic::AtomicUsize>,
+    response: Vec<u8>,
+) -> Arc<crate::control::dns_control::DnsController> {
+    use crate::dns::forwarder::{DnsForwarder, DnsUpstreamPool};
+
+    struct CountingUpstream {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        response: Vec<u8>,
+    }
+
+    #[async_trait::async_trait]
+    impl DnsUpstreamPool for CountingUpstream {
+        async fn query(&self, _name: &str, _raw: &[u8]) -> anyhow::Result<Vec<u8>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.response.clone())
+        }
+    }
+
+    let upstream = Arc::new(CountingUpstream {
+        calls: upstream_calls,
+        response,
+    });
+    let router =
+        Arc::new(
+            crate::dns::routing::DnsRouter::new_from_dns_config(
+                &honk_config::dns::DnsConfig::default(),
+            )
+            .unwrap(),
+        );
+    let forwarder = Arc::new(
+        DnsForwarder::new(
+            upstream,
+            Arc::new(tokio::sync::Mutex::new(crate::dns::cache::DnsCache::new(
+                16,
+            ))),
+            router,
+        )
+        .with_cache_enabled(false),
+    );
+    Arc::new(crate::control::dns_control::DnsController::new(
+        forwarder,
+        Arc::new(tokio::sync::RwLock::new(Box::new(
+            crate::ebpf::mock::MockEbpfBackend::new(),
+        ))),
+        Arc::new(tokio::sync::RwLock::new(
+            Router::new(&[], "direct").unwrap(),
+        )),
+    ))
+}
+
+fn dns_response_payload() -> Vec<u8> {
+    let mut resp = dns_query_payload();
+    resp[2] = 0x81;
+    resp[3] = 0x80;
+    resp
+}
+
+fn production_dns_controller_with_upstream(
+    upstream: Arc<dyn crate::dns::forwarder::DnsUpstreamPool>,
+) -> Arc<crate::control::dns_control::DnsController> {
+    let router =
+        Arc::new(
+            crate::dns::routing::DnsRouter::new_from_dns_config(
+                &honk_config::dns::DnsConfig::default(),
+            )
+            .unwrap(),
+        );
+    let forwarder = Arc::new(
+        crate::dns::forwarder::DnsForwarder::new(
+            upstream,
+            Arc::new(tokio::sync::Mutex::new(crate::dns::cache::DnsCache::new(
+                16,
+            ))),
+            router,
+        )
+        .with_cache_enabled(false),
+    );
+    Arc::new(crate::control::dns_control::DnsController::new(
+        forwarder,
+        Arc::new(tokio::sync::RwLock::new(Box::new(
+            crate::ebpf::mock::MockEbpfBackend::new(),
+        ))),
+        Arc::new(tokio::sync::RwLock::new(
+            Router::new(&[], "direct").unwrap(),
+        )),
+    ))
+}
+
+#[tokio::test]
+async fn udp_dns_dispatch_registers_connection_guard_before_task_poll() {
+    struct BlockingUpstream {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::dns::forwarder::DnsUpstreamPool for BlockingUpstream {
+        async fn query(&self, _name: &str, _raw: &[u8]) -> anyhow::Result<Vec<u8>> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(dns_response_payload())
+        }
+    }
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let config = udp_test_config("udp-test", vec![udp_test_node()], vec![]);
+    let router = Router::new(&config.routing.rules, &config.routing.default_outbound).unwrap();
+    let mut registry = honk_outbound::proxy::ProxyRegistry::new();
+    registry.register(Box::new(UdpTestHandler {
+        mode: UdpTestMode::Success,
+    }));
+    let mut plane = ControlPlane::new(
+        config,
+        Box::new(crate::ebpf::mock::MockEbpfBackend::new()),
+        router,
+        Arc::new(registry),
+        DnsResolver::new(&honk_config::dns::DnsConfig::default()).unwrap(),
+        udp_test_forwarder(),
+    )
+    .unwrap();
+    plane.dns_controller = production_dns_controller_with_upstream(Arc::new(BlockingUpstream {
+        entered: entered.clone(),
+        release: release.clone(),
+    }));
+    let drain = Arc::new(DrainTracker::new());
+    let listener = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let client = addr("10.0.0.3:53000");
+    let dst = addr("203.0.113.3:53");
+
+    super::dispatch_udp_slow_path(&plane, &drain, &listener, client, dst, &dns_query_payload());
+    assert_eq!(
+        drain.active_count(),
+        1,
+        "DNS work must be drain-counted when the dispatcher returns, before the spawned task polls"
+    );
+    tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .expect("production DNS controller must receive the slow-path query");
+
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if drain.active_count() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("DNS task must release its ConnectionGuard after completion");
+}
+
+/// Production-branch DNS path with an existing Ready endpoint: the shared
+/// slow-path helper must run DnsController first and must not enqueue onto
+/// the proxy driver.
+#[tokio::test]
+async fn udp_dns_with_ready_endpoint_uses_controller_not_queue() {
+    let pool = Arc::new(UdpEndpointPool::new());
+    let stats = Arc::new(StatsManager::new());
+    let client = addr("10.0.0.1:12345");
+    let dst = addr("203.0.113.1:53");
+    let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo.local_addr().unwrap();
+    let proxy = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    ready_udp_endpoint(
+        &pool,
+        &stats,
+        client,
+        dst,
+        Arc::new(honk_outbound::proxy::UdpSocketTransport::new(
+            proxy, echo_addr,
+        )),
+        echo_addr,
+    )
+    .await;
+    // Drain the bootstrap first packet from the echo socket.
+    let mut buf = [0u8; 64];
+    echo.recv_from(&mut buf).await.unwrap();
+
+    let upstream_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let dns = production_dns_controller(upstream_calls.clone(), dns_response_payload());
+    let slow = Arc::new(tokio::sync::Semaphore::new(1));
+    let query = dns_query_payload();
+
+    // Fast path must force DNS-shaped traffic slow even with Ready present.
+    assert!(!udp_fast_path(&pool, &stats, &query, client, dst).await);
+
+    match super::begin_udp_slow_path(&pool, &stats, &slow, client, dst, &query) {
+        super::UdpSlowPathWork::DnsThenMaybeInitialize { permit, data } => {
+            let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let lease = super::complete_udp_dns_slow_path(
+                &pool,
+                &stats,
+                dns.as_ref(),
+                &listener,
+                client,
+                dst,
+                permit,
+                &data,
+            )
+            .await;
+            assert!(
+                lease.is_none(),
+                "DNS controller must handle the packet without reserve/enqueue"
+            );
+        }
+        _other => panic!(
+            "DNS-shaped Ready traffic must take DnsThenMaybeInitialize, got unexpected variant"
+        ),
+    }
+
+    assert_eq!(
+        upstream_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "production DnsController must run for Ready+DNS"
+    );
+    // No follower was enqueued onto the Ready driver.
+    assert_eq!(stats.udp_snapshot().queue_accepted, 0);
+    let recv = tokio::time::timeout(Duration::from_millis(50), echo.recv_from(&mut buf)).await;
+    assert!(
+        recv.is_err(),
+        "DNS query must not be forwarded to the proxy transport"
+    );
+}
+
+/// Production-branch DNS path while an Initializing entry owns the tuple:
+/// controller still runs first; the Initializing queue must not grow.
+#[tokio::test]
+async fn udp_dns_with_initializing_endpoint_uses_controller_not_queue() {
+    let pool = Arc::new(UdpEndpointPool::new());
+    let stats = Arc::new(StatsManager::new());
+    let client = addr("10.0.0.1:12345");
+    let dst = addr("203.0.113.1:53");
+    let init_permit = Arc::new(tokio::sync::Semaphore::new(1))
+        .try_acquire_owned()
+        .unwrap();
+    let lease = match pool.reserve_or_enqueue(client, dst, b"bootstrap", init_permit, &stats) {
+        crate::control::udp_endpoint::EndpointReservation::Initializing(lease) => lease,
+        _ => panic!("DNS+Initializing fixture must reserve"),
+    };
+    let queue_before = stats.udp_snapshot().queue_accepted;
+
+    let upstream_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let dns = production_dns_controller(upstream_calls.clone(), dns_response_payload());
+    let slow = Arc::new(tokio::sync::Semaphore::new(1));
+    let query = dns_query_payload();
+
+    assert!(!udp_fast_path(&pool, &stats, &query, client, dst).await);
+    match super::begin_udp_slow_path(&pool, &stats, &slow, client, dst, &query) {
+        super::UdpSlowPathWork::DnsThenMaybeInitialize { permit, data } => {
+            let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let maybe_lease = super::complete_udp_dns_slow_path(
+                &pool,
+                &stats,
+                dns.as_ref(),
+                &listener,
+                client,
+                dst,
+                permit,
+                &data,
+            )
+            .await;
+            assert!(maybe_lease.is_none());
+        }
+        _ => panic!("DNS-shaped Initializing traffic must take DnsThenMaybeInitialize"),
+    }
+
+    assert_eq!(upstream_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        stats.udp_snapshot().queue_accepted,
+        queue_before,
+        "DNS must not enqueue onto the Initializing follower queue"
+    );
+    assert!(lease.still_initializing());
+    drop(lease);
+}
+
+/// Initializing followers must not use the direct fast queue path. With a
+/// zero-permit semaphore the shared dispatch helper rejects without copying
+/// or queue growth; with a permit it enqueues exactly once.
+#[tokio::test]
+async fn udp_initializing_follower_requires_slow_permit_via_shared_helper() {
+    let pool = Arc::new(UdpEndpointPool::new());
+    let stats = Arc::new(StatsManager::new());
+    let client = addr("10.0.0.2:53000");
+    let dst = addr("203.0.113.2:443");
+    let init_permit = Arc::new(tokio::sync::Semaphore::new(1))
+        .try_acquire_owned()
+        .unwrap();
+    let lease = match pool.reserve_or_enqueue(client, dst, b"first", init_permit, &stats) {
+        crate::control::udp_endpoint::EndpointReservation::Initializing(lease) => lease,
+        _ => panic!("follower fixture must initialize"),
+    };
+
+    // Fast path must miss for Initializing — no direct enqueue, no copy.
+    assert!(!udp_fast_path(&pool, &stats, b"follower", client, dst).await);
+    assert_eq!(stats.udp_snapshot().endpoint_misses, 1);
+    assert_eq!(stats.udp_snapshot().queue_accepted, 0);
+
+    let zero = Arc::new(tokio::sync::Semaphore::new(0));
+    match super::begin_udp_slow_path(&pool, &stats, &zero, client, dst, b"follower") {
+        super::UdpSlowPathWork::Done => {}
+        _ => panic!("zero slow permit must not reserve or enqueue"),
+    }
+    let udp = stats.udp_snapshot();
+    assert_eq!(udp.slow_permit_rejected, 1);
+    assert_eq!(udp.queue_accepted, 0);
+
+    let open = Arc::new(tokio::sync::Semaphore::new(1));
+    match super::begin_udp_slow_path(&pool, &stats, &open, client, dst, b"follower") {
+        super::UdpSlowPathWork::Done => {}
+        super::UdpSlowPathWork::Initialize(_) => {
+            panic!("Initializing follower must enqueue, not create a second lease")
+        }
+        super::UdpSlowPathWork::DnsThenMaybeInitialize { .. } => {
+            panic!("non-DNS follower must not take the DNS branch")
+        }
+    }
+    let udp = stats.udp_snapshot();
+    assert_eq!(udp.slow_permit_accepted, 1);
+    assert_eq!(
+        udp.queue_accepted, 1,
+        "with a slow permit the follower enqueues exactly once"
+    );
+    drop(lease);
 }

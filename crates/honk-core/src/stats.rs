@@ -300,6 +300,46 @@ impl StatsManager {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record an exact endpoint-capacity reservation rejection.
+    pub fn record_udp_capacity_rejection(&self) {
+        self.udp.capacity_rejections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a bounded endpoint-driver queue admission.
+    pub fn record_udp_queue_accepted(&self) {
+        self.udp.queue_accepted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record drop-newest because a per-flow or global queue bound was full.
+    pub fn record_udp_queue_full(&self) {
+        self.udp.queue_full.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a queue attempt against a closing/closed endpoint driver.
+    pub fn record_udp_queue_closed(&self) {
+        self.udp.queue_closed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record synchronous anyfrom preparation latency before driver commit.
+    pub fn record_udp_reply_ready_latency(&self, elapsed: std::time::Duration) {
+        self.udp.reply_ready_latency.record(elapsed);
+    }
+
+    /// Record the fixed five-second first-send attempt latency.
+    pub fn record_udp_first_send_latency(&self, elapsed: std::time::Duration) {
+        self.udp.first_send_latency.record(elapsed);
+    }
+
+    /// Record a first-send error or timeout (both are ambiguous sends).
+    pub fn record_udp_first_send_failure(&self) {
+        self.udp.first_send_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record the first reply successfully reinjected to the client.
+    pub fn record_udp_first_reply_latency(&self, elapsed: std::time::Duration) {
+        self.udp.first_reply_latency.record(elapsed);
+    }
+
     /// Record rejection of a UDP slow-path admission while draining.
     pub fn record_udp_slow_permit_closed(&self) {
         self.udp.slow_permit_closed.fetch_add(1, Ordering::Relaxed);
