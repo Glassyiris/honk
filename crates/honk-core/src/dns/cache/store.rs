@@ -120,7 +120,9 @@ impl DnsCacheService {
             key,
             CacheValue::Positive(CachedEntry {
                 response,
-                expires_at: Instant::now() - super::STALE_RETENTION - Duration::from_secs(1),
+                expires_at: Instant::now()
+                    - super::storage::STALE_RETENTION
+                    - Duration::from_secs(1),
                 min_ttl,
             }),
         );

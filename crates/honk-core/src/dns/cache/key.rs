@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
-use super::{CacheKey, OperationKind};
 use crate::dns::planner::RequestScope;
 use crate::dns::policy::PolicyId;
 use crate::dns::query::{IngressProfile, QueryContext};
@@ -18,6 +17,21 @@ const FIELD_INGRESS: u8 = 0x02;
 const FIELD_POLICY: u8 = 0x03;
 const FIELD_SCOPE: u8 = 0x04;
 const FIELD_OPERATION: u8 = 0x05;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum OperationKind {
+    Resolve,
+    Refresh,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct CacheKey {
+    wire_identity: Arc<[u8]>,
+    ingress: IngressProfile,
+    policy_id: Option<PolicyId>,
+    scope: RequestScope,
+    operation: OperationKind,
+}
 
 impl CacheKey {
     pub(crate) fn new(

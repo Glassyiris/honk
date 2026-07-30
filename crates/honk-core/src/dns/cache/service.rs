@@ -1,7 +1,79 @@
+use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use super::{CacheCounters, DnsCacheService, PublicationEpoch, lock};
+use super::counters::CacheCounterSet;
+use super::{CacheValue, DnsCache, Singleflight, lock};
+
+static ZERO_CAPACITY_WARNED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PublicationEpoch(pub(super) u64);
+
+pub struct DnsCacheService {
+    pub(super) shards: Vec<Mutex<lru::LruCache<String, CacheValue>>>,
+    pub(super) flights: Singleflight,
+    pub(super) counters: CacheCounterSet,
+    pub(super) persister: Mutex<Option<crate::dns::persist::DnsCachePersister>>,
+    pub(super) refresh_tasks: Mutex<RefreshTasks>,
+    pub(super) active_refresh_tasks: Arc<AtomicUsize>,
+}
+
+pub(super) struct RefreshTasks {
+    pub(super) tasks: tokio::task::JoinSet<()>,
+    pub(super) closed: bool,
+    pub(super) publication_epoch: u64,
+    pub(super) accepting_publications: bool,
+}
+
+impl DnsCache {
+    /// Create a new DNS cache with the given maximum number of entries.
+    ///
+    /// Capacity is divided exactly across at most 16 shards. Eviction is LRU
+    /// within a shard, so one hot shard cannot evict entries in another.
+    pub fn new(max_size: usize) -> Self {
+        let capacity = max_size.max(1);
+        if max_size == 0
+            && ZERO_CAPACITY_WARNED
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            tracing::warn!(
+                requested = max_size,
+                effective = capacity,
+                "DNS cache capacity clamped"
+            );
+        }
+        let shard_count = capacity.min(16);
+        let quotient = capacity / shard_count;
+        let remainder = capacity % shard_count;
+        let shards = (0..shard_count)
+            .map(|index| {
+                let shard_capacity = quotient + usize::from(index < remainder);
+                Mutex::new(lru::LruCache::new(
+                    NonZeroUsize::new(shard_capacity)
+                        .unwrap_or_else(|| unreachable!("shard capacity is positive")),
+                ))
+            })
+            .collect();
+        Self {
+            service: Arc::new(DnsCacheService {
+                shards,
+                flights: Singleflight::default(),
+                counters: CacheCounterSet::default(),
+                persister: Mutex::new(None),
+                refresh_tasks: Mutex::new(RefreshTasks {
+                    tasks: tokio::task::JoinSet::new(),
+                    closed: false,
+                    publication_epoch: 0,
+                    accepting_publications: true,
+                }),
+                active_refresh_tasks: Arc::new(AtomicUsize::new(0)),
+            }),
+        }
+    }
+}
 
 pub(crate) struct PublicationFlushGuard {
     service: Arc<DnsCacheService>,
@@ -44,14 +116,6 @@ impl DnsCacheService {
 
     pub(crate) fn singleflight(&self) -> super::Singleflight {
         self.flights.clone()
-    }
-
-    pub fn counters(&self) -> CacheCounters {
-        CacheCounters {
-            hits: self.counters.hits.load(Ordering::Relaxed),
-            misses: self.counters.misses.load(Ordering::Relaxed),
-            stale: self.counters.stale.load(Ordering::Relaxed),
-        }
     }
 
     pub fn flight_counters(&self) -> crate::dns::singleflight::FlightCounters {
