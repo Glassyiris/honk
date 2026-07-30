@@ -267,6 +267,31 @@ enum FrameCommand {
     },
 }
 
+impl FrameCommand {
+    /// Serialized size (header + payload).
+    fn wire_len(&self) -> usize {
+        let payload = match self {
+            FrameCommand::Data { payload, .. } | FrameCommand::Control { payload, .. } => {
+                payload.len()
+            }
+        };
+        FRAME_HEADER_LEN + payload
+    }
+
+    /// Append the serialized frame to `buf`.
+    fn encode_into(&self, buf: &mut bytes::BytesMut) {
+        use bytes::BufMut as _;
+        let (cmd, sid, payload) = match self {
+            FrameCommand::Data { sid, payload, .. } => (CMD_PSH, *sid, payload),
+            FrameCommand::Control { cmd, sid, payload } => (*cmd, *sid, payload),
+        };
+        buf.put_u8(cmd);
+        buf.put_u32(sid);
+        buf.put_u16(payload.len() as u16);
+        buf.extend_from_slice(payload);
+    }
+}
+
 /// Session writer queue: every frame goes out in enqueue order through a
 /// single task — no cross-stream mutex, and a cancelled caller can never
 /// truncate a queued frame (only a physical write failure closes the
@@ -311,29 +336,71 @@ impl WriterQueue {
         }
     }
 
+    /// Move up to `max_frames` already-queued commands (staying under
+    /// `max_bytes` of serialized payload) to the end of `out` without
+    /// blocking. Only drains what is queued *now* — never waits, so it adds
+    /// no latency to a live writer loop.
+    fn drain_available(&self, out: &mut Vec<FrameCommand>, max_frames: usize, max_bytes: usize) {
+        let mut q = self.queue.lock().unwrap();
+        let mut bytes = 0usize;
+        let mut taken = 0usize;
+        while taken < max_frames {
+            let Some(front) = q.front() else { break };
+            let next = bytes + front.wire_len();
+            if taken > 0 && next > max_bytes {
+                break;
+            }
+            bytes = next;
+            out.push(q.pop_front().expect("front checked"));
+            taken += 1;
+        }
+    }
+
     fn clear(&self) {
         self.queue.lock().unwrap().clear();
     }
 }
 
-/// The single writer task for a session: drains the queue in order,
-/// flushing per frame. A physical write failure kills the session (sing
-/// `writeControlFrame` parity) — frames already queued are lost with it.
+/// Batch caps for the writer's opportunistic gather: after the blocking
+/// pop, at most this many extra queued frames (or this many serialized
+/// bytes) ride the same `write_all` + single `flush`. Only what is already
+/// queued is taken — batching never waits, so it adds no latency.
+const WRITER_BATCH_MAX_FRAMES: usize = 64;
+const WRITER_BATCH_MAX_BYTES: usize = 256 * 1024;
+
+/// The single writer task for a session: drains the queue in order and
+/// gather-writes whole batches per flush — one `write_all` of the
+/// concatenated frames instead of a header/payload write pair plus flush
+/// per frame (profiling showed flush-per-frame dominating CPU at line
+/// rate). Order is preserved; framing is byte-level so batches are
+/// transparent to the peer. A physical write failure kills the session
+/// (sing `writeControlFrame` parity) — frames already queued are lost
+/// with it.
 async fn session_writer(
     session: Arc<AnyTlsSession>,
     mut write: BoxedWriter,
     queue: Arc<WriterQueue>,
 ) {
+    let mut batch: Vec<FrameCommand> = Vec::with_capacity(WRITER_BATCH_MAX_FRAMES);
+    let mut buf = bytes::BytesMut::with_capacity(64 * 1024);
     loop {
-        let cmd = queue.pop().await;
-        let (cmd_id, sid, payload) = match &cmd {
-            FrameCommand::Data { sid, payload, .. } => (CMD_PSH, *sid, payload),
-            FrameCommand::Control { cmd, sid, payload } => (*cmd, *sid, payload),
-        };
-        let failed = match write_frame(&mut write, cmd_id, sid, payload).await {
+        batch.push(queue.pop().await);
+        queue.drain_available(
+            &mut batch,
+            WRITER_BATCH_MAX_FRAMES - 1,
+            WRITER_BATCH_MAX_BYTES,
+        );
+        buf.clear();
+        for cmd in &batch {
+            cmd.encode_into(&mut buf);
+        }
+        let failed = match write.write_all(&buf).await {
             Ok(()) => write.flush().await.is_err(),
             Err(_) => true,
         };
+        // Dropping the batch here releases data permits only after the
+        // bytes are actually written — backpressure spans the write.
+        batch.clear();
         if failed {
             debug!("AnyTLS session {} writer failed, closing", session.seq);
             session.fail(anyhow::anyhow!("writer task write failed"));
@@ -2119,6 +2186,88 @@ mod tests {
 
         node.anytls_password = None;
         assert_eq!(AnyTlsHandler::resolve_password(&node), "generic-secret");
+    }
+
+    #[tokio::test]
+    async fn test_writer_batch_encoding_matches_sequential_frames() {
+        let q = WriterQueue::new();
+        let sem = Arc::new(tokio::sync::Semaphore::new(2));
+        let p1 = sem.clone().acquire_owned().await.unwrap();
+        let p2 = sem.clone().acquire_owned().await.unwrap();
+        q.push_batch([
+            FrameCommand::Control {
+                cmd: CMD_SYN,
+                sid: 1,
+                payload: bytes::Bytes::from_static(b"addr"),
+            },
+            FrameCommand::Data {
+                sid: 1,
+                payload: bytes::Bytes::from_static(b"hello"),
+                _permit: p1,
+            },
+            FrameCommand::Data {
+                sid: 2,
+                payload: bytes::Bytes::from_static(b"world"),
+                _permit: p2,
+            },
+            FrameCommand::Control {
+                cmd: CMD_FIN,
+                sid: 2,
+                payload: bytes::Bytes::new(),
+            },
+        ]);
+        let mut batch = vec![q.pop().await];
+        q.drain_available(
+            &mut batch,
+            WRITER_BATCH_MAX_FRAMES - 1,
+            WRITER_BATCH_MAX_BYTES,
+        );
+        assert_eq!(batch.len(), 4);
+        let mut buf = bytes::BytesMut::new();
+        for cmd in &batch {
+            cmd.encode_into(&mut buf);
+        }
+
+        let mut reference: Vec<u8> = Vec::new();
+        write_frame(&mut reference, CMD_SYN, 1, b"addr")
+            .await
+            .unwrap();
+        write_frame(&mut reference, CMD_PSH, 1, b"hello")
+            .await
+            .unwrap();
+        write_frame(&mut reference, CMD_PSH, 2, b"world")
+            .await
+            .unwrap();
+        write_frame(&mut reference, CMD_FIN, 2, b"").await.unwrap();
+        assert_eq!(&buf[..], &reference[..]);
+    }
+
+    #[tokio::test]
+    async fn test_writer_batch_caps() {
+        let q = WriterQueue::new();
+        let payload = bytes::Bytes::from(vec![7u8; 100]);
+        for sid in 0..5u32 {
+            q.push_batch([FrameCommand::Control {
+                cmd: CMD_WASTE,
+                sid,
+                payload: payload.clone(),
+            }]);
+        }
+        // Frame cap: only 2 of 5.
+        let mut batch = Vec::new();
+        q.drain_available(&mut batch, 2, usize::MAX);
+        assert_eq!(batch.len(), 2);
+
+        // Byte cap: wire_len is 107 per frame, cap 300 fits exactly 2 more
+        // (always taking at least one for forward progress).
+        let mut batch = Vec::new();
+        q.drain_available(&mut batch, usize::MAX, 300);
+        assert_eq!(batch.len(), 2);
+
+        let mut batch = Vec::new();
+        q.drain_available(&mut batch, usize::MAX, usize::MAX);
+        assert_eq!(batch.len(), 1);
+        assert!(q.queue.lock().unwrap().is_empty());
     }
 
     /// 2B: with a runtime registry installed, the handler dials through
