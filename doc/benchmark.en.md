@@ -130,10 +130,20 @@ cores, RSS after the run. honk runs the musl release binary (mimalloc).
 | dae | trojan | 0.0093 | 0.0084 | 0.0107 | 9370 | 0.66 | 57 |
 | dae | anytls-sb | 0.0088 | 0.0014 | 0.0023 | 9155 | 0.60 | 58 |
 | dae | anytls-go | 0.0044 | 0.0017 | 0.0021 | 9379 | 0.62 | 59 |
+| sing-box | direct | 0.0044 | – | – | 9410 | 0.41 | 47 |
+| sing-box | hy2 | 0.0143 | 0.0014 | 0.0018 | 2930 | 0.88 | 52 |
+| sing-box | tuic | 0.0102 | 0.0029 | 0.0048 | 2808 | 0.86 | 50 |
+| sing-box | ss2022 | 0.0042 | 0.0040 | 0.0056 | 9390 | 1.19 | 49 |
+| sing-box | trojan | 0.0112 | 0.0068 | 0.0104 | 9368 | 0.78 | 47 |
+| sing-box | anytls-sb | 0.0113 | 0.0035 | 0.0041 | 5996 | 0.59 | 49 |
+| sing-box | anytls-go | 0.0129 | 0.0023 | 0.0028 | 9252 | 0.95 | 46 |
 
 The dae rows are the **kdae branch build** (`2a007b39`,
 `unstable-20260729.r987`), built from `../dae` on the bench host — the
-first dae build with AnyTLS support.
+first dae build with AnyTLS support. The sing-box rows are **1.13.14**
+running as a TUN client *inside* the lab netns (`bench/sb-client.json`
+deployed to the engine host; per-port route rules mirror the engine
+configs, outbounds bound to `veth-client`).
 
 ¹ honk's anytls rows carry a history: single-stream iperf3 used to read
 2–3 Mbps here. The cause was honk's own — a full per-stream demux queue
@@ -151,18 +161,19 @@ valid; there is no dae direct baseline.
 
 ### Reading the table
 
-- **Bandwidth**: honk leads or ties on every TCP-based protocol. hy2 5239
-  vs 2996 (+75%), tuic 5351 vs 3920 (+36%), trojan at line rate 9366 vs
-  9370, ss2022 at line rate 9388 vs 9396 (−0.1%, a tie), anytls-go 9272
-  vs 9379 (a tie). The one remaining gap is anytls against the sing-box
-  server: 4954 vs dae's 9155. ss2022 got to line rate via the BoringSSL
-  AEAD swap: RustCrypto's aes-gcm measured 0.4–0.5 GB/s (AES-NI path not
+- **Bandwidth**: honk leads or ties everywhere. hy2 5239 (+75% vs dae,
+  +79% vs sing-box), tuic 5351 (+36% / +90%), trojan and ss2022 at line
+  rate with dae and sing-box, anytls-go 9272 (three-way tie). The one
+  remaining gap is anytls against the sing-box server: honk 4954 vs dae
+  9155 / sing-box 5996. ss2022 got to line rate via the BoringSSL AEAD
+  swap: RustCrypto's aes-gcm measured 0.4–0.5 GB/s (AES-NI path not
   engaged) vs BoringSSL's 3.3–6.7 GB/s (`benches/ss_aead.rs`), and the
   swap took the row from 5339 Mbps / 1.01 cores to 9388 / 0.37 — now
   also ahead of dae on CPU (0.37 vs 0.49).
-- **CPU per Gbps**: honk trojan is the standout — line rate at 0.42 cores
-  (dae needs 0.66). QUIC protocols cost honk ~1.06 cores at 5.2+ Gbps vs
-  dae's 0.75–0.84 at 3–3.9 Gbps (honk moves 75% more bytes per core).
+- **CPU per Gbps**: honk is the most efficient engine on every line-rate
+  row — trojan 0.42 cores (dae 0.66, sing-box 0.78), ss2022 0.37 (dae
+  0.49, sing-box 1.19). QUIC protocols cost honk ~1.06 cores at
+  5.2+ Gbps; dae/sing-box need 0.75–0.88 for 2.8–3.9 Gbps.
 - **Latency**: TUIC remains the extreme case — 3.8 ms hot vs dae's 79.7 ms
   (honk resumes TLS 1.3 sessions from a process-wide ticket cache; dae
   pays a full QUIC handshake per connection; cold tells the same story,

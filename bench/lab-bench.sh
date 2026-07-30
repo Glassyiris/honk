@@ -1,9 +1,10 @@
 #!/bin/bash
-# lab-bench.sh — honk vs dae A/B protocol benchmark on the lab.
+# lab-bench.sh — honk vs dae vs sing-box A/B protocol benchmark on the lab.
 #
-# Runs ON the engine host (10.10.10.50). Client lives in netns "lab" so all
-# measured traffic crosses the real eBPF/TPROXY datapath. One script replaces
-# the old bench.sh / bench-cold.sh / bench-cpu.sh / bench-honest.sh set.
+# Runs ON the engine host (10.10.10.57). Client lives in netns "lab" so all
+# measured traffic crosses the real datapath (eBPF/TPROXY for honk/dae;
+# a TUN client inside the netns for sing-box). One script replaces the old
+# bench.sh / bench-cold.sh / bench-cpu.sh / bench-honest.sh set.
 #
 # Per engine × protocol:
 #   cold   — first-request latency on a freshly restarted engine, 3 runs
@@ -67,8 +68,11 @@ stop_engines() {
     # matching its own command line.
     pkill -f "/root/hon[k]" 2>/dev/null
     pkill -f "/root/da[e] run" 2>/dev/null
+    local sb_running
+    sb_running=$(pgrep -f "sing-bo[x] run" 2>/dev/null)
+    pkill -f "sing-bo[x] run" 2>/dev/null
     # honk holds a singleton flock and may take seconds to drain — wait
-    # until BOTH engines are gone.
+    # until ALL engines are gone.
     for _ in $(seq 1 30); do
         pgrep -f "/root/hon[k]" >/dev/null && {
             sleep 1
@@ -78,13 +82,21 @@ stop_engines() {
             sleep 1
             continue
         }
+        pgrep -f "sing-bo[x] run" >/dev/null && {
+            sleep 1
+            continue
+        }
         break
     done
+    # sing-box's TUN auto_route rewrites the lab netns routing table —
+    # rebuild the netns after it ran or the next engine sees stale routes.
+    [ -n "$sb_running" ] && bash /root/setup-netns.sh >/dev/null 2>&1
 }
 
 start_engine() { # engine → prints pid
     stop_engines
-    if [ "$1" = honk ]; then
+    case $1 in
+    honk)
         setsid /root/honk --config /root/honk-lab.dae >/root/honk.log 2>&1 </dev/null &
         for _ in $(seq 1 20); do
             curl -s -m 2 http://127.0.0.1:9090/version >/dev/null 2>&1 && break
@@ -94,11 +106,22 @@ start_engine() { # engine → prints pid
         # (zero CPU, misleading metrics) — anchor on the clash API listener.
         # (.50 grep has no -P; use sed.)
         ss -tlnp | grep ':9090 ' | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1
-    else
+        ;;
+    dae)
         setsid /root/dae run -c /root/dae-lab.dae >/root/dae.log 2>&1 </dev/null &
         sleep 4
         pgrep -f "/root/da[e] run" | head -1
-    fi
+        ;;
+    sing-box)
+        # sing-box runs INSIDE the lab netns as a TUN client (not a
+        # gateway): client traffic hits the TUN, per-port route rules pick
+        # the outbound, outbounds dial out via veth-client.
+        ip netns exec $N setsid /root/sing-box run -c /root/sb-client.json \
+            >/root/sb.log 2>&1 </dev/null &
+        sleep 4
+        pgrep -f "sing-bo[x] run" | head -1
+        ;;
+    esac
 }
 
 ncurl() { # port → time_total (seconds, empty on failure)

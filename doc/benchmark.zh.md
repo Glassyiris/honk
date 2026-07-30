@@ -117,9 +117,19 @@ iperf3 接收端中位数,CPU 为核数,RSS 为跑完后值。honk 为 musl 发�
 | dae | trojan | 0.0093 | 0.0084 | 0.0107 | 9370 | 0.66 | 57 |
 | dae | anytls-sb | 0.0088 | 0.0014 | 0.0023 | 9155 | 0.60 | 58 |
 | dae | anytls-go | 0.0044 | 0.0017 | 0.0021 | 9379 | 0.62 | 59 |
+| sing-box | direct | 0.0044 | – | – | 9410 | 0.41 | 47 |
+| sing-box | hy2 | 0.0143 | 0.0014 | 0.0018 | 2930 | 0.88 | 52 |
+| sing-box | tuic | 0.0102 | 0.0029 | 0.0048 | 2808 | 0.86 | 50 |
+| sing-box | ss2022 | 0.0042 | 0.0040 | 0.0056 | 9390 | 1.19 | 49 |
+| sing-box | trojan | 0.0112 | 0.0068 | 0.0104 | 9368 | 0.78 | 47 |
+| sing-box | anytls-sb | 0.0113 | 0.0035 | 0.0041 | 5996 | 0.59 | 49 |
+| sing-box | anytls-go | 0.0129 | 0.0023 | 0.0028 | 9252 | 0.95 | 46 |
 
 dae 各行为 **kdae 分支构建**(`2a007b39`,`unstable-20260729.r987`,
 在压测机上从 `../dae` 构建)——第一个支持 AnyTLS 的 dae 构建。
+sing-box 各行为 **1.13.14**,以 TUN 客户端身份跑在 lab netns **内部**
+(`bench/sb-client.json` 部署到引擎机;按端口的路由规则与引擎配置一致,
+outbound 绑定 `veth-client`)。
 
 ¹ honk 的 anytls 两行有一段历史:单流 iperf3 曾只有 2–3 Mbps。根因在
 honk 自身——单流 demux 队列满(64 帧)会**立即**杀流,单流测试中服务器
@@ -133,17 +143,18 @@ honk 自身——单流 demux 队列满(64 帧)会**立即**杀流,单流测试�
 
 ### 结果解读
 
-- **带宽**:honk 在所有 TCP 协议上领先或打平。hy2 5239 vs 2996(+75%)、
-  tuic 5351 vs 3920(+36%)、trojan 线速 9366 vs 9370、ss2022 线速
-  9388 vs 9396(−0.1%,平)、anytls-go 9272 vs 9379(平)。唯一剩余的
-  差距是对 sing-box 服务端的 anytls:4954 vs dae 9155。ss2022 靠
+- **带宽**:honk 全面领先或打平。hy2 5239(+75% vs dae、+79% vs
+  sing-box)、tuic 5351(+36% / +90%)、trojan 和 ss2022 与两家同为
+  线速、anytls-go 9272(三方持平)。唯一剩余的差距是对 sing-box
+  服务端的 anytls:honk 4954 vs dae 9155 / sing-box 5996。ss2022 靠
   BoringSSL AEAD 替换达成线速:RustCrypto aes-gcm 实测 0.4–0.5 GB/s
   (AES-NI 路径未启用)vs BoringSSL 3.3–6.7 GB/s(`benches/ss_aead.rs`),
   替换把该行从 5339 Mbps / 1.01 核提到 9388 / 0.37 核——CPU 也反超
   dae(0.37 vs 0.49)。
-- **每核带宽**:trojan 是亮点——线速只需 0.42 核(dae 要 0.66)。QUIC
-  协议 honk 用 ~1.06 核跑 5.2+ Gbps,dae 用 0.75–0.84 核跑 3–3.9 Gbps
-  (honk 每核多搬 75% 的字节)。
+- **每核带宽**:honk 在每一行线速协议上效率最高——trojan 0.42 核
+  (dae 0.66、sing-box 0.78),ss2022 0.37 核(dae 0.49、sing-box
+  1.19)。QUIC 协议 honk 用 ~1.06 核跑 5.2+ Gbps;dae/sing-box 要
+  0.75–0.88 核跑 2.8–3.9 Gbps。
 - **延迟**:TUIC 仍是极端案例——热开流 3.8 ms vs dae 79.7 ms(honk 有
   进程级 TLS 1.3 票据缓存,dae 每条连接完整 QUIC 握手;冷启动同样,
   2.4 vs 85.2 ms)。其他行在几 ms 内互有胜负。

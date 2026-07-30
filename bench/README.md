@@ -55,3 +55,14 @@ Stdout is a markdown table; raw TSV appends to `/root/bench-results.tsv`.
   because honk killed streams instantly on a full demux queue. Fixed by
   bounded HOL backpressure; single-stream anytls numbers are now valid
   and included in the table.
+
+## sing-box as a third engine
+
+`lab-bench.sh sing-box '<protos>'` runs sing-box 1.13.14 as a TUN client
+**inside** the lab netns (`bench/sb-client.json` → `/root/sb-client.json`,
+binary at `/root/sing-box`): client traffic hits the TUN, per-port route
+rules pick the outbound, outbounds bind `veth-client`. Because no gateway
+engine is running, the host must plain-forward lab traffic — the harness
+assumes an idempotent masquerade (`/root/setup-nat.sh`, table `labnat`,
+saddr 192.168.222.0/24 oif ens3). After each sing-box run the netns is
+rebuilt (its TUN auto_route rewrites the routing table).
