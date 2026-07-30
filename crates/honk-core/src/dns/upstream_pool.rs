@@ -1,5 +1,6 @@
 //! Per-upstream DNS query management with connection reuse.
 
+mod admission;
 mod entries;
 mod query;
 mod routing;
@@ -20,7 +21,8 @@ use honk_outbound::group::{GroupManager, SharedGroupManager};
 use tokio::sync::Notify;
 use tokio::sync::RwLock as AsyncRwLock;
 
-use self::entries::{PoolState, UpstreamEntry, build_entries};
+use self::admission::AdmissionGate;
+use self::entries::{UpstreamEntry, build_entries};
 use crate::dns::routing::DnsRouter;
 use crate::proxy::ProxyRegistry;
 use crate::routing::Router;
@@ -44,7 +46,7 @@ pub struct UpstreamPool {
     dns_query_timeout: Duration,
     dns_dial_timeout: Duration,
     active_transport_tasks: Arc<AtomicUsize>,
-    shutdown: tokio::sync::RwLock<PoolState>,
+    admission: AdmissionGate,
     #[cfg(test)]
     admission_pause: parking_lot::Mutex<Option<AdmissionPause>>,
 }
@@ -98,7 +100,7 @@ impl UpstreamPool {
             dns_query_timeout: Duration::from_secs(3),
             dns_dial_timeout: Duration::from_secs(10),
             active_transport_tasks: Arc::new(AtomicUsize::new(0)),
-            shutdown: tokio::sync::RwLock::new(PoolState::Open),
+            admission: AdmissionGate::new(),
             #[cfg(test)]
             admission_pause: parking_lot::Mutex::new(None),
         })

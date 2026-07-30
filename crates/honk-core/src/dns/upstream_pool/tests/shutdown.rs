@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -42,14 +41,12 @@ async fn close_waits_for_query_admitted_before_transport_publication() {
     let query =
         tokio::spawn(async move { query_pool.query("default", &mock_dns_query(0x1234)).await });
     pause.entered.notified().await;
-    let close_pool = Arc::clone(&pool);
-    let mut close = tokio::spawn(async move { close_pool.close().await });
+    let close = pool.close();
+    tokio::pin!(close);
 
     // When
     assert!(
-        tokio::time::timeout(Duration::from_millis(20), &mut close)
-            .await
-            .is_err(),
+        matches!(futures::poll!(close.as_mut()), std::task::Poll::Pending),
         "close returned while an admitted query could still publish a transport"
     );
     pause.release.notify_one();
@@ -57,7 +54,7 @@ async fn close_waits_for_query_admitted_before_transport_publication() {
         .await
         .expect("query task")
         .expect("query response after release");
-    close.await.expect("close task");
+    close.await;
     server.await.expect("server task");
 
     // Then
@@ -75,4 +72,58 @@ async fn close_waits_for_query_admitted_before_transport_publication() {
             tasks: 0,
         }
     );
+}
+
+#[tokio::test]
+async fn cancelled_admission_releases_concurrent_close_waiters() {
+    // Given
+    let pool = Arc::new(
+        UpstreamPool::new(
+            &[make_upstream("default", "127.0.0.1:9", DnsProtocol::Udp)],
+            make_router(),
+        )
+        .expect("pool"),
+    );
+    let pause = pool.arm_admission_pause_for_test();
+    let query_pool = Arc::clone(&pool);
+    let query =
+        tokio::spawn(async move { query_pool.query("default", &mock_dns_query(0x1234)).await });
+    pause.entered.notified().await;
+    let mut first_close = Box::pin(pool.close());
+    let mut second_close = Box::pin(pool.close());
+    assert!(matches!(
+        futures::poll!(first_close.as_mut()),
+        std::task::Poll::Pending
+    ));
+    assert!(matches!(
+        futures::poll!(second_close.as_mut()),
+        std::task::Poll::Pending
+    ));
+
+    // When
+    drop(first_close);
+    assert!(matches!(
+        futures::poll!(second_close.as_mut()),
+        std::task::Poll::Pending
+    ));
+    query.abort();
+    let cancelled = query.await.expect_err("query cancellation");
+
+    // Then
+    assert!(cancelled.is_cancelled());
+    assert!(matches!(
+        futures::poll!(second_close.as_mut()),
+        std::task::Poll::Ready(())
+    ));
+    let mut idempotent_close = Box::pin(pool.close());
+    assert!(matches!(
+        futures::poll!(idempotent_close.as_mut()),
+        std::task::Poll::Ready(())
+    ));
+    let error = pool
+        .query("default", &mock_dns_query(0x4321))
+        .await
+        .expect_err("closed pool rejects new admission");
+    assert!(error.to_string().contains("closed"));
+    assert_eq!(pool.lifecycle_stats(), TransportLifecycleStats::default());
 }

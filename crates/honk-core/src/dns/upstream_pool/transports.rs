@@ -5,7 +5,7 @@ use honk_config::node::Node;
 use honk_config::types::DnsProtocol;
 
 use super::UpstreamPool;
-use super::entries::{PoolState, UpstreamEntry};
+use super::entries::UpstreamEntry;
 use crate::dns::transport::{
     DialContext, Doh3Client, DohClient, DoqClient, DotPool, LifecycleSlot, ProxyDial, TcpPool,
 };
@@ -140,13 +140,10 @@ impl UpstreamPool {
     }
 
     pub async fn close(&self) {
-        {
-            let mut shutdown = self.shutdown.write().await;
-            match *shutdown {
-                PoolState::Open | PoolState::Closing => *shutdown = PoolState::Closing,
-                PoolState::Closed => return,
-            }
-        }
+        let Some(close) = self.admission.acquire_close().await else {
+            return;
+        };
+        self.admission.wait_for_idle().await;
         let slots = self
             .entries
             .values()
@@ -165,6 +162,6 @@ impl UpstreamPool {
             })
             .await;
         }
-        *self.shutdown.write().await = PoolState::Closed;
+        close.complete();
     }
 }

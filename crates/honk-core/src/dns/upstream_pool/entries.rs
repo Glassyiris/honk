@@ -16,12 +16,6 @@ pub(super) struct UpstreamEntry {
         parking_lot::Mutex<HashMap<TransportKey, Arc<LifecycleSlot<PooledTransport>>>>,
 }
 
-pub(super) enum PoolState {
-    Open,
-    Closing,
-    Closed,
-}
-
 pub(super) fn build_entries(
     upstreams: &[DnsUpstream],
     bootstrap_resolver: Option<honk_outbound::bootstrap::BootstrapResolver>,
