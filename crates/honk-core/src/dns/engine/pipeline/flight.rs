@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use super::cache;
-use crate::dns::cache::CacheKey;
+use crate::dns::cache::{CacheKey, PublicationEpoch};
 use crate::dns::engine::{DnsEngine, PreparedQuery};
 use crate::dns::forwarder::{DnsForwardError, DnsForwarder, ResolveMode};
 use crate::dns::outcome::{DnsOutcome, EffectiveExpiry, OutcomeStatus, Provenance};
@@ -28,6 +28,7 @@ pub(super) async fn waiter_outcome(
     bypass_cache_read: bool,
     mode: ResolveMode,
     template: Arc<ResponseTemplate>,
+    publication_epoch: PublicationEpoch,
 ) -> Result<DnsOutcome, DnsForwardError> {
     if !bypass_cache_read
         && let Some(outcome) = cache::lookup(
@@ -41,6 +42,7 @@ pub(super) async fn waiter_outcome(
             false,
             false,
             mode,
+            publication_epoch,
         )
         .await?
     {

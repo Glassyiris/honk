@@ -117,6 +117,14 @@ pub struct DnsCachePersister {
     epoch: Arc<AtomicU64>,
     counters: Arc<CounterSet>,
     worker: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+    #[cfg(test)]
+    flush_gate: Arc<Mutex<Option<FlushGate>>>,
+}
+
+#[cfg(test)]
+struct FlushGate {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Semaphore>,
 }
 
 impl std::fmt::Debug for DnsCachePersister {
@@ -143,6 +151,8 @@ impl DnsCachePersister {
             epoch: Arc::new(AtomicU64::new(0)),
             counters,
             worker: Arc::new(Mutex::new(handle)),
+            #[cfg(test)]
+            flush_gate: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -191,7 +201,41 @@ impl DnsCachePersister {
         let epoch = self.epoch.fetch_add(1, Ordering::SeqCst).saturating_add(1);
         let (ack, receive) = oneshot::channel();
         self.send_control(Command::Flush { epoch, ack }).await?;
+        #[cfg(test)]
+        let flush_gate = self
+            .flush_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        #[cfg(test)]
+        if let Some(gate) = flush_gate {
+            gate.entered.notify_one();
+            gate.release
+                .acquire()
+                .await
+                .unwrap_or_else(|_| unreachable!("test flush gate remains open"))
+                .forget();
+        }
         receive.await.map_err(|_| PersistControlError::AckDropped)?
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gate_next_flush(
+        &self,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Semaphore>) {
+        let gate = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Semaphore::new(0)),
+        );
+        let stored = FlushGate {
+            entered: Arc::clone(&gate.0),
+            release: Arc::clone(&gate.1),
+        };
+        *self
+            .flush_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(stored);
+        gate
     }
 
     pub async fn shutdown(&self) -> Result<(), PersistControlError> {

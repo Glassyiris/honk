@@ -7,7 +7,7 @@ use super::planner::{
     ResponseTraversal, UpstreamTag,
 };
 use super::policy::PolicyId;
-use super::query::{DnsName, QueryContext, QueryError};
+use super::query::{DnsName, IngressProfile, QueryContext, QueryError};
 use super::response::{ResponseError, ResponseTemplate};
 use super::routing::DnsRouter;
 
@@ -68,25 +68,28 @@ impl DnsEngine {
         &self,
         raw_query: &[u8],
         original_dst: Option<SocketAddr>,
+        ingress: IngressProfile,
     ) -> Result<PreparedQuery, EngineError> {
-        self.prepare_with_mode(raw_query, original_dst, false)
+        self.prepare_with_mode(raw_query, original_dst, ingress, false)
     }
 
     pub(crate) fn prepare_compatibility(
         &self,
         raw_query: &[u8],
         original_dst: Option<SocketAddr>,
+        ingress: IngressProfile,
     ) -> Result<PreparedQuery, EngineError> {
-        self.prepare_with_mode(raw_query, original_dst, true)
+        self.prepare_with_mode(raw_query, original_dst, ingress, true)
     }
 
     fn prepare_with_mode(
         &self,
         raw_query: &[u8],
         original_dst: Option<SocketAddr>,
+        ingress: IngressProfile,
         compatibility: bool,
     ) -> Result<PreparedQuery, EngineError> {
-        let query = QueryContext::parse(raw_query)?;
+        let query = QueryContext::parse_with_profile(raw_query, ingress)?;
         let domain = decode_name(query.qname().ok_or(EngineError::MissingQuestion)?)?;
         let qtype = query.qtype().ok_or(EngineError::MissingQuestion)?.get();
         let context = RequestContext {

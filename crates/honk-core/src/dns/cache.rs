@@ -26,6 +26,9 @@ pub(crate) enum OperationKind {
     Refresh,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PublicationEpoch(u64);
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CacheCounters {
     pub hits: u64,
@@ -203,6 +206,8 @@ pub struct DnsCacheService {
 struct RefreshTasks {
     tasks: tokio::task::JoinSet<()>,
     closed: bool,
+    publication_epoch: u64,
+    accepting_publications: bool,
 }
 
 enum CacheValue {
@@ -249,6 +254,8 @@ impl DnsCache {
                 refresh_tasks: StdMutex::new(RefreshTasks {
                     tasks: tokio::task::JoinSet::new(),
                     closed: false,
+                    publication_epoch: 0,
+                    accepting_publications: true,
                 }),
                 active_refresh_tasks: Arc::new(AtomicUsize::new(0)),
             }),

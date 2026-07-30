@@ -1,9 +1,47 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::{CacheCounters, DnsCacheService, lock};
+use super::{CacheCounters, DnsCacheService, PublicationEpoch, lock};
+
+pub(crate) struct PublicationFlushGuard {
+    service: Arc<DnsCacheService>,
+    persistence: Option<crate::dns::persist::DnsCachePersister>,
+}
+
+impl PublicationFlushGuard {
+    pub(crate) const fn persistence(&self) -> Option<&crate::dns::persist::DnsCachePersister> {
+        self.persistence.as_ref()
+    }
+}
+
+impl Drop for PublicationFlushGuard {
+    fn drop(&mut self) {
+        self.service.finish_flush();
+    }
+}
 
 impl DnsCacheService {
+    pub(crate) fn publication_epoch(&self) -> PublicationEpoch {
+        PublicationEpoch(lock(&self.refresh_tasks).publication_epoch)
+    }
+
+    pub(crate) fn begin_flush(self: &Arc<Self>) -> PublicationFlushGuard {
+        let mut registry = lock(&self.refresh_tasks);
+        registry.publication_epoch = registry.publication_epoch.saturating_add(1);
+        registry.accepting_publications = false;
+        self.clear();
+        PublicationFlushGuard {
+            service: Arc::clone(self),
+            persistence: lock(&self.persister).clone(),
+        }
+    }
+
+    fn finish_flush(&self) {
+        let mut registry = lock(&self.refresh_tasks);
+        registry.publication_epoch = registry.publication_epoch.saturating_add(1);
+        registry.accepting_publications = true;
+    }
+
     pub(crate) fn singleflight(&self) -> super::Singleflight {
         self.flights.clone()
     }

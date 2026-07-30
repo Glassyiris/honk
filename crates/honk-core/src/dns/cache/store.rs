@@ -2,7 +2,9 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use super::{CacheKey, CacheValue, CachedEntry, DnsCacheService, NegativeCacheHit, lock};
+use super::{
+    CacheKey, CacheValue, CachedEntry, DnsCacheService, NegativeCacheHit, PublicationEpoch, lock,
+};
 
 impl DnsCacheService {
     pub fn get(&self, key: &str) -> Option<CachedEntry> {
@@ -61,6 +63,20 @@ impl DnsCacheService {
         self.put_restored(key.storage_key(), response, ttl);
     }
 
+    pub(crate) fn put_exact_if_current(
+        &self,
+        epoch: PublicationEpoch,
+        key: CacheKey,
+        response: Vec<u8>,
+        min_ttl: u32,
+    ) {
+        let registry = lock(&self.refresh_tasks);
+        if !registry.accepting_publications || registry.publication_epoch != epoch.0 {
+            return;
+        }
+        self.put_exact(key, response, min_ttl);
+    }
+
     pub(crate) fn put_restored(&self, key: String, response: Vec<u8>, min_ttl: u32) {
         let ttl = min_ttl.max(1);
         let entry = CachedEntry {
@@ -113,6 +129,20 @@ impl DnsCacheService {
                 rcode,
             },
         );
+    }
+
+    pub(crate) fn put_negative_if_current(
+        &self,
+        epoch: PublicationEpoch,
+        key: String,
+        ttl: u32,
+        rcode: u8,
+    ) {
+        let registry = lock(&self.refresh_tasks);
+        if !registry.accepting_publications || registry.publication_epoch != epoch.0 {
+            return;
+        }
+        self.put_negative(key, ttl, rcode);
     }
 
     pub fn negative_rcode(&self, key: &str) -> Option<u8> {

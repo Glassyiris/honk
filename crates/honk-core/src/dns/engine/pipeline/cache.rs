@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use tracing::debug;
 
 use super::super::{DnsEngine, PreparedQuery, effective_expiry};
-use crate::dns::cache::CacheKey;
+use crate::dns::cache::{CacheKey, PublicationEpoch};
 use crate::dns::forwarder::{
     DnsForwardError, DnsForwarder, ResolveMode, extract_min_ttl, extract_soa_negative_ttl,
     rewrite_answer_ttls,
@@ -22,6 +22,7 @@ pub(super) async fn lookup(
     bypass_cache_read: bool,
     allow_refresh: bool,
     mode: ResolveMode,
+    publication_epoch: PublicationEpoch,
 ) -> Result<Option<DnsOutcome>, DnsForwardError> {
     if !forwarder.cache_enabled || bypass_cache_read {
         return Ok(None);
@@ -59,7 +60,13 @@ pub(super) async fn lookup(
     );
     let refresh_after = (entry.min_ttl as u64 / 10).max(1);
     if allow_refresh && remaining <= refresh_after {
-        forwarder.maybe_spawn_refresh(cache.clone(), raw_query, original_dst, refresh_key.clone());
+        forwarder.maybe_spawn_refresh(
+            cache.clone(),
+            raw_query,
+            original_dst,
+            refresh_key.clone(),
+            publication_epoch,
+        );
     }
     let response = entry.response.clone();
     let response = forwarder
@@ -69,6 +76,7 @@ pub(super) async fn lookup(
             prepared.qtype(),
             response,
             original_dst,
+            prepared.query().ingress(),
         )
         .await?;
     forwarder
@@ -94,6 +102,7 @@ pub(super) async fn store(
     response: &mut [u8],
     class: ResponseClass,
     reuse_eligible: bool,
+    publication_epoch: PublicationEpoch,
 ) -> EffectiveExpiry {
     if !reuse_eligible {
         return EffectiveExpiry::do_not_cache();
@@ -102,7 +111,8 @@ pub(super) async fn store(
         let negative_ttl = extract_soa_negative_ttl(response, 60).clamp(1, 300);
         if forwarder.cache_enabled {
             let rcode = response.get(3).copied().unwrap_or_default() & 0x0f;
-            forwarder.cache_service().await.put_negative(
+            forwarder.cache_service().await.put_negative_if_current(
+                publication_epoch,
                 cache_key.storage_key(),
                 negative_ttl,
                 rcode,
@@ -120,7 +130,8 @@ pub(super) async fn store(
     if forwarder.cache_enabled && expiry.is_cacheable() {
         let cache_ttl = expiry.ttl().as_secs().min(u64::from(u32::MAX)) as u32;
         rewrite_answer_ttls(response, cache_ttl);
-        forwarder.cache_service().await.put_exact(
+        forwarder.cache_service().await.put_exact_if_current(
+            publication_epoch,
             cache_key.clone(),
             response.to_owned(),
             cache_ttl,

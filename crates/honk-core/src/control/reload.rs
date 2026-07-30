@@ -138,7 +138,6 @@ impl ControlPlane {
         {
             let mut router_guard = self.router.write().await;
             let mut config_guard = self.config.write().await;
-            let mut forwarder_guard = self.dns_controller.prepare_forwarder_update().await;
             let mut ebpf = self.ebpf.write().await;
             let mut group_guard = self.group_manager.write();
             let mut outbound_guard = self.outbound_id_map.write();
@@ -174,7 +173,6 @@ impl ControlPlane {
             publication.commit();
             *router_guard = new_router;
             *config_guard = new_config;
-            *forwarder_guard = (*new_dns_forwarder).clone();
             *group_guard = Arc::clone(&new_group_manager);
             *outbound_guard = new_outbound_id_map;
             *plan_guard = Arc::clone(&new_plan);

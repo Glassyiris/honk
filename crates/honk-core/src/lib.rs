@@ -629,15 +629,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     );
     info!("DNS forwarder ready");
 
-    let dns_resolver = dns::DnsResolver::with_forwarder(&config.dns, dns_forwarder.clone())?;
-    info!("DNS resolver ready");
-
     let mut control_plane = control::ControlPlane::new_with_upstream_pool(
         config,
         ebpf_backend,
         router,
         proxy_registry,
-        dns_resolver,
         dns_forwarder,
         dns_upstream_pool.clone(),
     )?;
@@ -712,8 +708,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                         secret: clash_cfg.secret.clone(),
                         external_ui: clash_cfg.external_ui.clone(),
                         log_tx: clash_log_tx.clone(),
-                        dns_cache: control_plane.dns_cache().await,
-                        dns_forwarder: control_plane.dns_forwarder_cell(),
+                        dns_service: control_plane.dns_service(),
                     });
                     tokio::spawn(clash_api::serve(state, listen));
                 }

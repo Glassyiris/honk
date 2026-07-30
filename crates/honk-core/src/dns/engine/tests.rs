@@ -16,6 +16,7 @@ use crate::dns::forwarder::{
 };
 use crate::dns::outcome::{OutcomeStatus, Provenance, ResponseClass};
 use crate::dns::planner::{PlanError, RequestPlan};
+use crate::dns::query::IngressProfile;
 use crate::dns::routing::DnsRouter;
 
 #[test]
@@ -330,7 +331,9 @@ async fn stale_outcome_covers_upstream_error_and_servfail_without_sleeping() {
     let cache = Arc::new(Mutex::new(DnsCache::new(8)));
     let routing = router("first", Vec::new(), None);
     let engine = super::DnsEngine::from_router(&routing, None).expect("engine");
-    let prepared = engine.prepare(&query, None).expect("prepared");
+    let prepared = engine
+        .prepare(&query, None, IngressProfile::Internal)
+        .expect("prepared");
     let RequestPlan::Exchange(scope) = prepared.plan() else {
         panic!("exchange plan");
     };

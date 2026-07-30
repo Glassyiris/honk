@@ -3,10 +3,11 @@ use std::net::SocketAddr;
 use tracing::debug;
 
 use super::DnsEngine;
-use crate::dns::cache::{CacheKey, OperationKind};
+use crate::dns::cache::{CacheKey, OperationKind, PublicationEpoch};
 use crate::dns::forwarder::{DnsForwardError, DnsForwarder, ResolveMode, is_filtered_qtype};
 use crate::dns::outcome::{DnsOutcome, OutcomeStatus};
 use crate::dns::planner::RequestPlan;
+use crate::dns::query::IngressProfile;
 use crate::dns::singleflight::{FlightLeader, FlightRole};
 
 mod cache;
@@ -16,20 +17,44 @@ mod plan;
 
 use plan::{rejected_outcome, request_exchange};
 
+pub(crate) struct ResolveExecution {
+    refresh_owner: Option<FlightLeader>,
+    publication_epoch: PublicationEpoch,
+}
+
+impl ResolveExecution {
+    pub(crate) const fn foreground(publication_epoch: PublicationEpoch) -> Self {
+        Self {
+            refresh_owner: None,
+            publication_epoch,
+        }
+    }
+
+    pub(crate) const fn refresh(owner: FlightLeader, publication_epoch: PublicationEpoch) -> Self {
+        Self {
+            refresh_owner: Some(owner),
+            publication_epoch,
+        }
+    }
+}
+
 pub(crate) async fn resolve(
     forwarder: &DnsForwarder,
     raw_query: &[u8],
     original_dst: Option<SocketAddr>,
+    ingress: IngressProfile,
     bypass_cache_read: bool,
     mode: ResolveMode,
+    publication_epoch: PublicationEpoch,
 ) -> Result<DnsOutcome, DnsForwardError> {
     resolve_with_owner(
         forwarder,
         raw_query,
         original_dst,
+        ingress,
         bypass_cache_read,
         mode,
-        None,
+        ResolveExecution::foreground(publication_epoch),
     )
     .await
 }
@@ -38,15 +63,22 @@ pub(crate) async fn resolve_with_owner(
     forwarder: &DnsForwarder,
     raw_query: &[u8],
     original_dst: Option<SocketAddr>,
+    ingress: IngressProfile,
     bypass_cache_read: bool,
     mode: ResolveMode,
-    refresh_owner: Option<FlightLeader>,
+    execution: ResolveExecution,
 ) -> Result<DnsOutcome, DnsForwardError> {
+    let ResolveExecution {
+        refresh_owner,
+        publication_epoch,
+    } = execution;
     debug!("DNS forwarder: resolving {} bytes", raw_query.len());
     let engine = DnsEngine::from_router(&forwarder.routing, forwarder.policy_id.clone())?;
     let prepared = match mode {
-        ResolveMode::Strict => engine.prepare(raw_query, original_dst)?,
-        ResolveMode::Compatibility => engine.prepare_compatibility(raw_query, original_dst)?,
+        ResolveMode::Strict => engine.prepare(raw_query, original_dst, ingress)?,
+        ResolveMode::Compatibility => {
+            engine.prepare_compatibility(raw_query, original_dst, ingress)?
+        }
     };
     let qtype = prepared.qtype();
     let reuse_eligible = prepared.is_cacheable() && prepared.is_coalescable();
@@ -98,6 +130,7 @@ pub(crate) async fn resolve_with_owner(
             bypass_cache_read,
             true,
             mode,
+            publication_epoch,
         )
         .await?
     {
@@ -105,7 +138,7 @@ pub(crate) async fn resolve_with_owner(
     }
 
     if let Some(owner) = refresh_owner {
-        return run_as_leader(
+        return operation::run_as_leader(
             owner,
             forwarder,
             &engine,
@@ -117,6 +150,7 @@ pub(crate) async fn resolve_with_owner(
             request_scope.clone(),
             reuse_eligible,
             mode,
+            publication_epoch,
         )
         .await;
     }
@@ -147,6 +181,7 @@ pub(crate) async fn resolve_with_owner(
                     request_scope.clone(),
                     reuse_eligible,
                     mode,
+                    publication_epoch,
                 )
                 .await;
             }
@@ -162,6 +197,7 @@ pub(crate) async fn resolve_with_owner(
                     bypass_cache_read,
                     mode,
                     template,
+                    publication_epoch,
                 )
                 .await;
             }
@@ -178,6 +214,7 @@ pub(crate) async fn resolve_with_owner(
                         bypass_cache_read,
                         mode,
                         template,
+                        publication_epoch,
                     )
                     .await;
                 }
@@ -196,12 +233,13 @@ pub(crate) async fn resolve_with_owner(
                         false,
                         true,
                         mode,
+                        publication_epoch,
                     )
                     .await?
                 {
                     return Ok(flight::publish_outcome(leader, outcome));
                 }
-                return run_as_leader(
+                return operation::run_as_leader(
                     leader,
                     forwarder,
                     &engine,
@@ -213,39 +251,10 @@ pub(crate) async fn resolve_with_owner(
                     request_scope.clone(),
                     reuse_eligible,
                     mode,
+                    publication_epoch,
                 )
                 .await;
             }
         }
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn run_as_leader(
-    leader: FlightLeader,
-    forwarder: &DnsForwarder,
-    engine: &DnsEngine,
-    prepared: &super::PreparedQuery,
-    raw_query: &[u8],
-    original_dst: Option<SocketAddr>,
-    cache_key: &str,
-    logical_upstream: crate::dns::planner::UpstreamTag,
-    request_scope: crate::dns::planner::RequestScope,
-    reuse_eligible: bool,
-    mode: ResolveMode,
-) -> Result<DnsOutcome, DnsForwardError> {
-    let outcome = operation::run(
-        forwarder,
-        engine,
-        prepared,
-        raw_query,
-        original_dst,
-        cache_key,
-        logical_upstream,
-        request_scope,
-        reuse_eligible,
-        mode,
-    )
-    .await?;
-    Ok(flight::publish_outcome(leader, outcome))
 }

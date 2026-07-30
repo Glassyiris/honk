@@ -134,6 +134,7 @@ impl ControlPlane {
         dns_resolver: DnsResolver,
         dns_forwarder: std::sync::Arc<crate::dns::forwarder::DnsForwarder>,
     ) -> anyhow::Result<Self> {
+        drop(dns_resolver);
         let dns_router = Arc::new(crate::dns::routing::DnsRouter::new_from_dns_config(
             &config.dns,
         )?);
@@ -149,7 +150,6 @@ impl ControlPlane {
             ebpf,
             router,
             proxy_registry,
-            dns_resolver,
             dns_forwarder,
             dns_upstream_pool,
         )
@@ -160,7 +160,6 @@ impl ControlPlane {
         ebpf: Box<dyn EbpfBackend>,
         router: Router,
         proxy_registry: std::sync::Arc<ProxyRegistry>,
-        dns_resolver: DnsResolver,
         dns_forwarder: std::sync::Arc<crate::dns::forwarder::DnsForwarder>,
         dns_upstream_pool: Arc<crate::dns::upstream_pool::UpstreamPool>,
     ) -> anyhow::Result<Self> {
@@ -181,7 +180,6 @@ impl ControlPlane {
         let direct_target_socket = direct_target.parse()?;
         alive_set.set_direct_check_addr(direct_target.clone());
         honk_outbound::urltest::set_urltest_direct_target(direct_target_socket);
-        let dns_resolver = Arc::new(dns_resolver);
         // Register health checks per the config's group membership; reload
         // re-runs the same sync via `reload_group_manager`.
         let (added, _) = sync_health_check_nodes(&alive_set, &config);
@@ -260,13 +258,13 @@ impl ControlPlane {
         let runtime_provider = Arc::new(crate::dns::runtime::DnsServiceProvider::new(
             initial_runtime,
         ));
+        let dns_service = crate::dns::DnsService::with_provider(Arc::clone(&runtime_provider));
+        let dns_resolver = Arc::new(DnsResolver::with_service(dns_service.clone()));
 
         let dns_controller = Arc::new(
-            crate::control::dns_control::DnsController::new_with_runtime(
-                dns_forwarder.clone(),
-                runtime_provider,
+            crate::control::dns_control::DnsController::new_with_service(
+                dns_service,
                 ebpf_arc.clone(),
-                router_arc.clone(),
             ),
         );
         // Health-check name resolution shares honk's own DNS forwarder
@@ -484,18 +482,8 @@ impl ControlPlane {
         self.proxy_registry.clone()
     }
 
-    /// Shared handle to the DNS response cache (used by the clash API
-    /// `/cache/dns/flush` endpoint).
-    pub async fn dns_cache(&self) -> Arc<tokio::sync::Mutex<crate::dns::cache::DnsCache>> {
-        self.dns_controller.cache().await
-    }
-
-    /// Shared cell of the current DNS forwarder (used by the clash API
-    /// `/dns/query` endpoint so it follows config reloads).
-    pub fn dns_forwarder_cell(
-        &self,
-    ) -> Arc<tokio::sync::RwLock<crate::dns::forwarder::DnsForwarder>> {
-        self.dns_controller.forwarder_cell()
+    pub fn dns_service(&self) -> crate::dns::DnsService {
+        self.dns_controller.dns_service()
     }
 
     pub fn command_sender(&self) -> mpsc::Sender<ControlCommand> {
@@ -575,7 +563,6 @@ impl ControlPlane {
                 }
             }
         }
-
         {
             let mut tasks = self.background_tasks.lock().await;
 

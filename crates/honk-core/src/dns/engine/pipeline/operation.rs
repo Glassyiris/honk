@@ -4,7 +4,7 @@ use std::time::Duration;
 use tracing::debug;
 
 use super::cache;
-use crate::dns::cache::{CacheKey, OperationKind};
+use crate::dns::cache::{CacheKey, OperationKind, PublicationEpoch};
 use crate::dns::engine::{DnsEngine, PreparedQuery, ResponseDirective};
 use crate::dns::forwarder::{
     DnsForwardError, DnsForwarder, ResolveMode, SERVE_STALE_TTL_SECS, make_empty_response,
@@ -12,6 +12,39 @@ use crate::dns::forwarder::{
 };
 use crate::dns::outcome::{DnsOutcome, EffectiveExpiry, OutcomeStatus, Provenance, ResponseClass};
 use crate::dns::planner::{RequestScope, ResponseTraversal, UpstreamTag};
+use crate::dns::singleflight::FlightLeader;
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run_as_leader(
+    leader: FlightLeader,
+    forwarder: &DnsForwarder,
+    engine: &DnsEngine,
+    prepared: &PreparedQuery,
+    raw_query: &[u8],
+    original_dst: Option<SocketAddr>,
+    cache_key: &str,
+    logical_upstream: UpstreamTag,
+    request_scope: RequestScope,
+    reuse_eligible: bool,
+    mode: ResolveMode,
+    publication_epoch: PublicationEpoch,
+) -> Result<DnsOutcome, DnsForwardError> {
+    let outcome = run(
+        forwarder,
+        engine,
+        prepared,
+        raw_query,
+        original_dst,
+        cache_key,
+        logical_upstream,
+        request_scope,
+        reuse_eligible,
+        mode,
+        publication_epoch,
+    )
+    .await?;
+    Ok(super::flight::publish_outcome(leader, outcome))
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run(
@@ -25,6 +58,7 @@ pub(super) async fn run(
     request_scope: RequestScope,
     reuse_eligible: bool,
     mode: ResolveMode,
+    publication_epoch: PublicationEpoch,
 ) -> Result<DnsOutcome, DnsForwardError> {
     let upstream_result = forwarder.exchange(&request_scope, raw_query).await;
     let (mut response, mut upstream_name) = match upstream_result {
@@ -127,6 +161,7 @@ pub(super) async fn run(
         &mut response,
         class,
         reuse_eligible,
+        publication_epoch,
     )
     .await;
     if let Some(notifier) = &forwarder.notifier {
@@ -146,6 +181,7 @@ pub(super) async fn run(
             prepared.qtype(),
             response,
             original_dst,
+            prepared.query().ingress(),
         )
         .await?;
     forwarder.outcome_from_wire(
@@ -188,6 +224,7 @@ async fn stale_outcome(
             prepared.qtype(),
             stale,
             original_dst,
+            prepared.query().ingress(),
         )
         .await?;
     forwarder

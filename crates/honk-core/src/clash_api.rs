@@ -57,14 +57,7 @@ pub struct ClashState {
     pub external_ui: String,
     /// Broadcast channel fed by the clash log tracing layer.
     pub log_tx: tokio::sync::broadcast::Sender<logs::LogEvent>,
-    /// DNS response cache cleared by `/cache/dns/flush`.
-    pub dns_cache: Arc<tokio::sync::Mutex<crate::dns::cache::DnsCache>>,
-    /// Shared cell of the control plane's DNS forwarder (same
-    /// cache/routing/upstream pipeline as intercepted DNS traffic).
-    /// A cell, not a snapshot: a config reload swaps the forwarder and
-    /// `/dns/query` must follow — a startup-time clone silently served
-    /// the stale upstream/routing set forever.
-    pub dns_forwarder: Arc<tokio::sync::RwLock<crate::dns::forwarder::DnsForwarder>>,
+    pub dns_service: crate::dns::DnsService,
 }
 
 pub fn router(state: Arc<ClashState>) -> Router {
@@ -1178,8 +1171,10 @@ async fn get_dns_query(
     };
 
     let query = crate::dns::forwarder::build_dns_query(&name, qtype);
-    let forwarder = { s.dns_forwarder.read().await.clone() };
-    let result = forwarder.resolve(&query).await;
+    let result = s
+        .dns_service
+        .resolve(&query, crate::dns::query::IngressProfile::Api)
+        .await;
     match result {
         Ok(resp) => Json(doh::response_json(&name, qtype, &resp)).into_response(),
         // Upstream error or negative-cache hit: report SERVFAIL-style.
@@ -1203,17 +1198,16 @@ async fn flush_fakeip(State(s): State<Arc<ClashState>>) -> StatusCode {
 }
 
 async fn flush_dns(State(s): State<Arc<ClashState>>) -> StatusCode {
-    let persistence = {
-        let mut cache = s.dns_cache.lock().await;
-        cache.clear();
-        cache.persistence()
-    };
-    if let Some(persistence) = persistence {
-        if let Err(error) = persistence.flush().await {
+    match s.dns_service.flush_cache().await {
+        Ok(true) => {}
+        Ok(false) => {
+            if let Some(ref db) = s.cache_db {
+                db.flush_dns();
+            }
+        }
+        Err(error) => {
             tracing::warn!(%error, "DNS persistence flush command failed");
         }
-    } else if let Some(ref db) = s.cache_db {
-        db.flush_dns();
     }
     StatusCode::NO_CONTENT
 }

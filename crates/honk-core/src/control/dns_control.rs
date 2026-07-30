@@ -11,15 +11,15 @@
 //!
 //! Go ref: `dns_control.go` (2943L)
 
+#[cfg(test)]
 use crate::dns::forwarder::DnsForwarder;
 use crate::ebpf::EbpfBackend;
 #[cfg(test)]
 use crate::group::GroupManager;
+#[cfg(test)]
 use crate::routing::Router;
 use std::net::SocketAddr;
 use std::sync::Arc;
-#[cfg(test)]
-use std::time::Duration;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{RwLock, Semaphore};
 use tracing::debug;
@@ -43,8 +43,7 @@ const DEFAULT_MAX_CONCURRENT_QUERIES: usize = 2048;
 /// DNS Controller — intercepts TPROXY DNS traffic and forwards it through
 /// the DNS forwarding engine with proactive eBPF route updates.
 pub struct DnsController {
-    forwarder: Arc<RwLock<DnsForwarder>>,
-    runtime_provider: Arc<crate::dns::runtime::DnsServiceProvider>,
+    dns_service: crate::dns::DnsService,
     routing_projection: Arc<crate::dns::projection::RoutingProjection>,
     concurrency_limit: Semaphore,
 }
@@ -54,7 +53,7 @@ impl DnsController {
     pub fn new(
         forwarder: Arc<DnsForwarder>,
         ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
-        router: Arc<RwLock<Router>>,
+        _router: Arc<RwLock<Router>>,
     ) -> Self {
         let config = honk_config::Config::default();
         let runtime_router = Arc::new(
@@ -84,28 +83,37 @@ impl DnsController {
             transport: Arc::new(NoopRuntimeTransport),
         });
         Self::new_with_runtime(
-            forwarder,
             Arc::new(crate::dns::runtime::DnsServiceProvider::new(runtime)),
             ebpf,
-            router,
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_runtime(
-        forwarder: Arc<DnsForwarder>,
         runtime_provider: Arc<crate::dns::runtime::DnsServiceProvider>,
         ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
-        _router: Arc<RwLock<Router>>,
+    ) -> Self {
+        Self::new_with_service(
+            crate::dns::DnsService::with_provider(runtime_provider),
+            ebpf,
+        )
+    }
+
+    pub(crate) fn new_with_service(
+        dns_service: crate::dns::DnsService,
+        ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
     ) -> Self {
         let snapshot = {
-            let runtime = runtime_provider.acquire();
+            let runtime = dns_service
+                .provider()
+                .unwrap_or_else(|| unreachable!("controller requires runtime DNS service"))
+                .acquire();
             Arc::clone(runtime.runtime().routing_projection())
         };
         let routing_projection =
             crate::dns::projection::RoutingProjection::spawn(Arc::clone(&ebpf), snapshot);
         Self {
-            forwarder: Arc::new(RwLock::new((*forwarder).clone())),
-            runtime_provider,
+            dns_service,
             routing_projection,
             concurrency_limit: Semaphore::new(DEFAULT_MAX_CONCURRENT_QUERIES),
         }
@@ -115,32 +123,29 @@ impl DnsController {
     /// forwarder — reload-safe, unlike holding a resolver from startup.
     /// Used by the health-check resolver hook.
     pub async fn resolve_domain(&self, domain: &str) -> Vec<std::net::IpAddr> {
-        let runtime = self.runtime_provider.acquire();
         let mut out = Vec::new();
-        for qtype in [1u16, 28] {
-            let query = crate::dns::forwarder::build_dns_query(domain, qtype);
-            if let Ok(resp) = runtime.runtime().resolve(&query).await {
-                out.extend(crate::dns::forwarder::extract_answer_ips(&resp));
-            }
+        let queries =
+            [1_u16, 28].map(|qtype| crate::dns::forwarder::build_dns_query(domain, qtype));
+        for resp in self
+            .dns_service
+            .resolve_internal_queries(&queries)
+            .await
+            .into_iter()
+            .flatten()
+        {
+            out.extend(crate::dns::forwarder::extract_answer_ips(&resp));
         }
         out
     }
 
-    /// Replace the DNS forwarder used by this controller (e.g. after config
-    /// reload changed the upstream list or outbound routing).
-    pub async fn set_forwarder(&self, forwarder: Arc<DnsForwarder>) {
-        let mut guard = self.forwarder.write().await;
-        *guard = (*forwarder).clone();
-    }
-
-    pub(crate) async fn prepare_forwarder_update(
-        &self,
-    ) -> tokio::sync::RwLockWriteGuard<'_, DnsForwarder> {
-        self.forwarder.write().await
-    }
-
     pub(crate) fn runtime_provider(&self) -> Arc<crate::dns::runtime::DnsServiceProvider> {
-        Arc::clone(&self.runtime_provider)
+        self.dns_service
+            .provider()
+            .unwrap_or_else(|| unreachable!("controller always uses runtime DNS service"))
+    }
+
+    pub(crate) fn dns_service(&self) -> crate::dns::DnsService {
+        self.dns_service.clone()
     }
 
     pub(crate) fn update_projection_snapshot(
@@ -150,24 +155,8 @@ impl DnsController {
         self.routing_projection.update_snapshot(snapshot);
     }
 
-    /// Return a clone of the DNS cache so it can be reused across reloads.
     pub async fn cache(&self) -> Arc<tokio::sync::Mutex<crate::dns::cache::DnsCache>> {
-        let runtime = self.runtime_provider.acquire();
-        Arc::clone(runtime.runtime().cache())
-    }
-
-    /// Return a clone of the currently installed DNS forwarder (cheap: all
-    /// fields are `Arc`s). Used by the clash API `/dns/query` endpoint so
-    /// queries go through the same cache/routing/upstream pipeline as
-    /// intercepted DNS traffic.
-    pub async fn forwarder(&self) -> DnsForwarder {
-        self.forwarder.read().await.clone()
-    }
-
-    /// Shared cell of the currently installed forwarder: callers holding
-    /// this see reloads immediately (unlike a one-shot `forwarder()` clone).
-    pub fn forwarder_cell(&self) -> Arc<RwLock<DnsForwarder>> {
-        self.forwarder.clone()
+        self.dns_service.cache()
     }
 
     /// Handle a UDP DNS query from TPROXY.
@@ -204,7 +193,7 @@ impl DnsController {
         );
 
         let response = self
-            .resolve_with_singleflight(data, Some(original_dst))
+            .resolve_with_singleflight(data, Some(original_dst), udp_ingress_profile(data))
             .await;
         let _ = super::send_udp_reply_from_orig_dst(&response, client_addr, original_dst).await;
         Ok(true)
@@ -249,7 +238,11 @@ impl DnsController {
         match self.concurrency_limit.try_acquire() {
             Ok(_permit) => {
                 let response = self
-                    .resolve_with_singleflight(&dns_data, Some(original_dst))
+                    .resolve_with_singleflight(
+                        &dns_data,
+                        Some(original_dst),
+                        crate::dns::query::IngressProfile::Tcp,
+                    )
                     .await;
                 write_tcp_dns_response(stream, &response).await?;
             }
@@ -282,7 +275,11 @@ impl DnsController {
             match self.concurrency_limit.try_acquire() {
                 Ok(_permit) => {
                     let response = self
-                        .resolve_with_singleflight(&dns_data, Some(original_dst))
+                        .resolve_with_singleflight(
+                            &dns_data,
+                            Some(original_dst),
+                            crate::dns::query::IngressProfile::Tcp,
+                        )
                         .await;
                     write_tcp_dns_response(stream, &response).await?;
                 }
@@ -299,8 +296,9 @@ impl DnsController {
         &self,
         data: &[u8],
         original_dst: Option<SocketAddr>,
+        ingress: crate::dns::query::IngressProfile,
     ) -> Vec<u8> {
-        self.resolve_and_notify(data, original_dst).await.0
+        self.resolve_and_notify(data, original_dst, ingress).await.0
     }
 
     /// Resolve a raw DNS query and notify BPF on success.
@@ -308,17 +306,17 @@ impl DnsController {
         &self,
         data: &[u8],
         original_dst: Option<SocketAddr>,
+        ingress: crate::dns::query::IngressProfile,
     ) -> (Vec<u8>, bool) {
-        let runtime = self.runtime_provider.acquire();
-        match runtime
-            .runtime()
-            .forwarder()
-            .resolve_outcome_with_context(data, original_dst)
+        match self
+            .dns_service
+            .resolve_outcome_with_runtime(data, original_dst, ingress)
             .await
         {
-            Ok(outcome) => {
+            Ok((outcome, runtime)) => {
                 self.submit_projection(runtime.runtime(), data, &outcome);
-                (outcome.rendered().to_vec(), true)
+                let resp = outcome.rendered().to_vec();
+                (resp, true)
             }
             Err(e) => {
                 debug!("DNS controller forward failed: {}; sending SERVFAIL", e);
@@ -375,6 +373,14 @@ fn is_dns_query(data: &[u8]) -> bool {
     crate::dns::forwarder::parse_dns_question(data).is_some()
 }
 
+fn udp_ingress_profile(data: &[u8]) -> crate::dns::query::IngressProfile {
+    let advertised_size = crate::dns::query::QueryContext::parse(data)
+        .ok()
+        .and_then(|query| query.edns().map(|edns| edns.advertised_size()))
+        .unwrap_or(512);
+    crate::dns::query::IngressProfile::Udp { advertised_size }
+}
+
 fn build_dns_servfail(query: &[u8]) -> Vec<u8> {
     build_dns_error_response(query, 2)
 }
@@ -411,6 +417,7 @@ mod singleflight_tests {
     use crate::dns::forwarder::{DnsForwarder, DnsUpstreamPool};
     use crate::routing::Router;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
     use tokio::sync::Notify;
 
     struct SlowUpstream {
@@ -508,6 +515,26 @@ mod singleflight_tests {
         query
     }
 
+    #[test]
+    fn udp_profile_uses_exact_edns_advertised_size() {
+        let mut query = query_with_txid("example.com", 1);
+        query[10..12].copy_from_slice(&1_u16.to_be_bytes());
+        query.extend_from_slice(&[0, 0, 41, 0x04, 0xd0, 0, 0, 0, 0, 0, 0]);
+
+        assert_eq!(
+            udp_ingress_profile(&query),
+            crate::dns::query::IngressProfile::Udp {
+                advertised_size: 1232,
+            }
+        );
+        assert_eq!(
+            udp_ingress_profile(&query_with_txid("example.com", 2)),
+            crate::dns::query::IngressProfile::Udp {
+                advertised_size: 512,
+            }
+        );
+    }
+
     /// Concurrent duplicate queries share one upstream flight, and each
     /// waiter gets the response with its OWN transaction id restored.
     #[tokio::test]
@@ -519,8 +546,16 @@ mod singleflight_tests {
         let q1 = query_with_txid("example.com", 0xaaaa);
         let q2 = query_with_txid("example.com", 0xbbbb);
         let (r1, r2) = tokio::join!(
-            controller.resolve_with_singleflight(&q1, None),
-            controller.resolve_with_singleflight(&q2, None),
+            controller.resolve_with_singleflight(
+                &q1,
+                None,
+                crate::dns::query::IngressProfile::Internal,
+            ),
+            controller.resolve_with_singleflight(
+                &q2,
+                None,
+                crate::dns::query::IngressProfile::Internal,
+            ),
         );
         assert_eq!(&r1[0..2], &q1[0..2], "waiter 1 keeps its own txid");
         assert_eq!(&r2[0..2], &q2[0..2], "waiter 2 keeps its own txid");
@@ -541,8 +576,16 @@ mod singleflight_tests {
         let second = multi_question_query(0xbbbb);
 
         let _ = tokio::join!(
-            controller.resolve_with_singleflight(&first, None),
-            controller.resolve_with_singleflight(&second, None),
+            controller.resolve_with_singleflight(
+                &first,
+                None,
+                crate::dns::query::IngressProfile::Internal,
+            ),
+            controller.resolve_with_singleflight(
+                &second,
+                None,
+                crate::dns::query::IngressProfile::Internal,
+            ),
         );
 
         assert_eq!(
@@ -613,8 +656,8 @@ mod singleflight_tests {
     }
 
     async fn publish_snapshot_forwarder(controller: &DnsController, forwarder: Arc<DnsForwarder>) {
-        controller.set_forwarder(Arc::clone(&forwarder)).await;
-        let current = controller.runtime_provider.acquire();
+        let provider = controller.runtime_provider();
+        let current = provider.acquire();
         let runtime = crate::dns::runtime::DnsRuntime::new(crate::dns::runtime::DnsRuntimeParts {
             generation: crate::dns::runtime::RuntimeGeneration::new(
                 current.runtime().generation().get().saturating_add(1),
@@ -629,7 +672,7 @@ mod singleflight_tests {
             transport: Arc::new(NoopRuntimeTransport),
         });
         drop(current);
-        controller.runtime_provider.publish(runtime);
+        provider.publish(runtime);
     }
 
     #[tokio::test]
@@ -647,7 +690,11 @@ mod singleflight_tests {
         let running = {
             let controller = controller.clone();
             let query = query.clone();
-            tokio::spawn(async move { controller.resolve_and_notify(&query, None).await })
+            tokio::spawn(async move {
+                controller
+                    .resolve_and_notify(&query, None, crate::dns::query::IngressProfile::Internal)
+                    .await
+            })
         };
         entered.notified().await;
         let new = snapshot_forwarder(Arc::new(SnapshotUpstream {
@@ -670,7 +717,9 @@ mod singleflight_tests {
         assert!(!running.is_finished(), "old query must remain paused");
         release.notify_waiters();
         let (old_response, _) = running.await.expect("old query task");
-        let (new_response, _) = controller.resolve_and_notify(&query, None).await;
+        let (new_response, _) = controller
+            .resolve_and_notify(&query, None, crate::dns::query::IngressProfile::Internal)
+            .await;
 
         assert_eq!(
             crate::dns::forwarder::extract_answer_ips(&old_response),

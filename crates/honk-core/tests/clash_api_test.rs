@@ -140,8 +140,8 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
 
     let (log_tx, _) = tokio::sync::broadcast::channel(16);
     let dns_cache = Arc::new(tokio::sync::Mutex::new(DnsCache::new(16)));
-    let dns_forwarder = Arc::new(tokio::sync::RwLock::new(test_dns_forwarder(
-        dns_cache.clone(),
+    let dns_service = honk_core::dns::DnsService::with_forwarder(Arc::new(test_dns_forwarder(
+        dns_cache,
         a_record_response([93, 184, 216, 34], 300),
     )));
     let state = Arc::new(ClashState {
@@ -156,8 +156,7 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
         secret: secret.to_string(),
         external_ui: external_ui.to_string(),
         log_tx,
-        dns_cache,
-        dns_forwarder,
+        dns_service,
     });
 
     let app = clash_api::router(state.clone());
@@ -777,13 +776,15 @@ async fn test_cache_flush_endpoints() {
     let now = honk_core::dns::persist::unix_now();
     db.save_dns_answer("example.com", 1, r#"{"r":"QUJD"}"#, now + 300);
     app.state
-        .dns_cache
+        .dns_service
+        .cache()
         .lock()
         .await
         .put("example.com:1".into(), vec![1, 2, 3], 300);
     assert!(
         app.state
-            .dns_cache
+            .dns_service
+            .cache()
             .lock()
             .await
             .get("example.com:1")
@@ -799,7 +800,8 @@ async fn test_cache_flush_endpoints() {
     assert_eq!(resp.status(), 204);
     assert!(
         app.state
-            .dns_cache
+            .dns_service
+            .cache()
             .lock()
             .await
             .get("example.com:1")
@@ -1015,7 +1017,7 @@ async fn test_dns_query_from_cache() {
     let client = http_client();
 
     // Pre-seed the shared DNS cache so the forwarder answers from cache.
-    app.state.dns_cache.lock().await.put(
+    app.state.dns_service.cache().lock().await.put(
         "example.com:1".into(),
         a_record_response([93, 184, 216, 34], 300),
         300,
@@ -1056,12 +1058,12 @@ async fn test_dns_query_upstream_and_nxdomain() {
     assert_eq!(body["Answer"][0]["data"], "93.184.216.34");
 
     // NXDOMAIN: swap in a forwarder whose upstream returns RCODE 3.
-    let nx_forwarder = Arc::new(tokio::sync::RwLock::new(test_dns_forwarder(
-        app.state.dns_cache.clone(),
+    let nx_service = honk_core::dns::DnsService::with_forwarder(Arc::new(test_dns_forwarder(
+        app.state.dns_service.cache(),
         nxdomain_response(),
     )));
     let state = Arc::new(ClashState {
-        dns_forwarder: nx_forwarder,
+        dns_service: nx_service,
         config: app.state.config.clone(),
         stats: app.state.stats.clone(),
         alive_set: app.state.alive_set.clone(),
@@ -1073,7 +1075,6 @@ async fn test_dns_query_upstream_and_nxdomain() {
         secret: String::new(),
         external_ui: String::new(),
         log_tx: app.state.log_tx.clone(),
-        dns_cache: app.state.dns_cache.clone(),
     });
     let nx_app = clash_api::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

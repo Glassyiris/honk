@@ -169,10 +169,6 @@ impl DnsRuntime {
         &self.parts.persistence
     }
 
-    pub(crate) async fn resolve(&self, query: &[u8]) -> anyhow::Result<Vec<u8>> {
-        self.parts.forwarder.resolve(query).await
-    }
-
     fn acquire(runtime: &Arc<Self>) -> RuntimeLease {
         runtime.leases.fetch_add(1, Ordering::AcqRel);
         RuntimeLease {

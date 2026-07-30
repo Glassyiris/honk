@@ -16,11 +16,12 @@ use thiserror::Error;
 use tokio::sync::{Mutex, OnceCell};
 use tracing::{debug, trace};
 
-use super::cache::{DnsCache, DnsCacheService};
+use super::cache::{DnsCache, DnsCacheService, PublicationEpoch};
 use super::engine::{DnsEngine, EngineError, PreparedQuery};
 use super::outcome::{DnsOutcome, EffectiveExpiry, OutcomeParts, OutcomeStatus, Provenance};
 use super::planner::{RequestScope, ResponseTraversal};
 use super::policy::PolicyId;
+use super::query::IngressProfile;
 use super::response::{ResponseError, ResponseTemplate};
 use super::routing::DnsRouter;
 use super::wire::skip_dns_name;
@@ -205,8 +206,18 @@ impl DnsForwarder {
 
     /// Resolve a raw DNS query (no original destination for `asis`).
     pub async fn resolve(&self, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.resolve_with_profile(raw_query, IngressProfile::Internal)
+            .await
+    }
+
+    /// Resolve a raw DNS query using an explicit caller ingress profile.
+    pub async fn resolve_with_profile(
+        &self,
+        raw_query: &[u8],
+        ingress: IngressProfile,
+    ) -> anyhow::Result<Vec<u8>> {
         Ok(self
-            .resolve_inner(raw_query, None, false, ResolveMode::Compatibility)
+            .resolve_inner(raw_query, None, ingress, false, ResolveMode::Compatibility)
             .await?
             .rendered()
             .to_vec())
@@ -222,8 +233,25 @@ impl DnsForwarder {
         raw_query: &[u8],
         original_dst: Option<SocketAddr>,
     ) -> anyhow::Result<Vec<u8>> {
+        self.resolve_with_context_and_profile(raw_query, original_dst, IngressProfile::Internal)
+            .await
+    }
+
+    /// Resolve with an original destination and explicit caller ingress profile.
+    pub async fn resolve_with_context_and_profile(
+        &self,
+        raw_query: &[u8],
+        original_dst: Option<SocketAddr>,
+        ingress: IngressProfile,
+    ) -> anyhow::Result<Vec<u8>> {
         Ok(self
-            .resolve_inner(raw_query, original_dst, false, ResolveMode::Compatibility)
+            .resolve_inner(
+                raw_query,
+                original_dst,
+                ingress,
+                false,
+                ResolveMode::Compatibility,
+            )
             .await?
             .rendered()
             .to_vec())
@@ -238,7 +266,21 @@ impl DnsForwarder {
         raw_query: &[u8],
         original_dst: Option<SocketAddr>,
     ) -> Result<DnsOutcome, DnsForwardError> {
-        self.resolve_inner(raw_query, original_dst, false, ResolveMode::Strict)
+        self.resolve_outcome_with_context_and_profile(
+            raw_query,
+            original_dst,
+            IngressProfile::Internal,
+        )
+        .await
+    }
+
+    pub async fn resolve_outcome_with_context_and_profile(
+        &self,
+        raw_query: &[u8],
+        original_dst: Option<SocketAddr>,
+        ingress: IngressProfile,
+    ) -> Result<DnsOutcome, DnsForwardError> {
+        self.resolve_inner(raw_query, original_dst, ingress, false, ResolveMode::Strict)
             .await
     }
 
@@ -249,11 +291,21 @@ impl DnsForwarder {
         &self,
         raw_query: &[u8],
         original_dst: Option<SocketAddr>,
+        ingress: IngressProfile,
         bypass_cache_read: bool,
         mode: ResolveMode,
     ) -> Result<DnsOutcome, DnsForwardError> {
-        super::engine::pipeline::resolve(self, raw_query, original_dst, bypass_cache_read, mode)
-            .await
+        let publication_epoch = self.cache_service().await.publication_epoch();
+        super::engine::pipeline::resolve(
+            self,
+            raw_query,
+            original_dst,
+            ingress,
+            bypass_cache_read,
+            mode,
+            publication_epoch,
+        )
+        .await
     }
 
     pub(crate) async fn exchange(
@@ -344,7 +396,9 @@ impl DnsForwarder {
         raw_query: &[u8],
         original_dst: Option<SocketAddr>,
         flight_key: crate::dns::cache::CacheKey,
+        publication_epoch: PublicationEpoch,
     ) {
+        let ingress = flight_key.ingress();
         let crate::dns::singleflight::FlightRole::Leader(owner) =
             cache.singleflight().acquire(flight_key)
         else {
@@ -357,9 +411,10 @@ impl DnsForwarder {
                 &this,
                 &query,
                 original_dst,
+                ingress,
                 true,
                 ResolveMode::Compatibility,
-                Some(owner),
+                super::engine::pipeline::ResolveExecution::refresh(owner, publication_epoch),
             )
             .await;
             if let Err(error) = result {
@@ -382,6 +437,7 @@ impl DnsForwarder {
         qtype: u16,
         response: Vec<u8>,
         original_dst: Option<SocketAddr>,
+        ingress: IngressProfile,
     ) -> anyhow::Result<Vec<u8>> {
         let preferred = match (&self.strategy, qtype) {
             (DnsStrategy::PreferIpv4, 28) => 1u16,
@@ -389,7 +445,7 @@ impl DnsForwarder {
             _ => return Ok(response),
         };
         if self
-            .preferred_family_has_answers(domain, preferred, original_dst)
+            .preferred_family_has_answers(domain, preferred, original_dst, ingress)
             .await
         {
             debug!(
@@ -412,6 +468,7 @@ impl DnsForwarder {
         domain: &str,
         preferred_qtype: u16,
         original_dst: Option<SocketAddr>,
+        ingress: IngressProfile,
     ) -> bool {
         let sibling_key = dns_cache_key(domain, preferred_qtype);
         if self.cache_enabled {
@@ -426,7 +483,8 @@ impl DnsForwarder {
         let query = build_dns_query(domain, preferred_qtype);
         // Boxed: breaks the async recursion cycle through resolve_with_context
         // (the sibling uses the preferred qtype, so it never re-enters here).
-        let sibling = Box::pin(self.resolve_with_context(&query, original_dst)).await;
+        let sibling =
+            Box::pin(self.resolve_with_context_and_profile(&query, original_dst, ingress)).await;
         match sibling {
             Ok(resp) => response_has_family_ips(&resp, preferred_qtype),
             Err(e) => {
@@ -503,7 +561,10 @@ impl DnsForwarder {
             let query = build_dns_query(&domain, 1);
             let forwarder = self.clone();
             tokio::spawn(async move {
-                match forwarder.resolve(&query).await {
+                match forwarder
+                    .resolve_with_profile(&query, IngressProfile::Internal)
+                    .await
+                {
                     Err(e) => {
                         debug!("DNS prefetch: {} failed: {:#}", domain, e);
                     }
@@ -1002,6 +1063,222 @@ mod tests {
             self.release.notified().await;
             Ok(self.response.clone())
         }
+    }
+
+    struct RefreshFenceUpstream {
+        initial: Vec<u8>,
+        refreshed: Vec<u8>,
+        call_count: AtomicUsize,
+        refresh_entered: tokio::sync::Notify,
+        refresh_release: tokio::sync::Semaphore,
+    }
+
+    #[async_trait]
+    impl DnsUpstreamPool for RefreshFenceUpstream {
+        async fn query(&self, _: &str, _: &[u8]) -> anyhow::Result<Vec<u8>> {
+            let call = self.call_count.fetch_add(1, Ordering::SeqCst);
+            if call == 1 {
+                self.refresh_entered.notify_one();
+                self.refresh_release
+                    .acquire()
+                    .await
+                    .expect("refresh release")
+                    .forget();
+            }
+            Ok(if call == 0 {
+                self.initial.clone()
+            } else {
+                self.refreshed.clone()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_ingress_profiles_do_not_share_cache_entries() {
+        let upstream = Arc::new(MockUpstream::new(make_a_response([192, 0, 2, 1], 300)));
+        let forwarder = DnsForwarder::new(upstream.clone(), test_cache(), test_router());
+        let query = make_a_query();
+
+        forwarder
+            .resolve_with_profile(&query, IngressProfile::Internal)
+            .await
+            .expect("internal response");
+        forwarder
+            .resolve_with_profile(&query, IngressProfile::Api)
+            .await
+            .expect("API response");
+
+        assert_eq!(upstream.call_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn service_flush_cancels_stalled_query_without_cache_resurrection() {
+        let upstream = Arc::new(GatedUpstream {
+            response: make_a_response([192, 0, 2, 1], 300),
+            call_count: AtomicUsize::new(0),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let cache = test_cache();
+        let service = crate::dns::DnsService::with_forwarder(Arc::new(DnsForwarder::new(
+            upstream.clone(),
+            cache.clone(),
+            test_router(),
+        )));
+        let query = make_a_query();
+        let resolving = {
+            let service = service.clone();
+            tokio::spawn(async move { service.resolve(&query, IngressProfile::Internal).await })
+        };
+        upstream.entered.notified().await;
+        let persisted =
+            tokio::time::timeout(std::time::Duration::from_secs(1), service.flush_cache())
+                .await
+                .expect("flush must complete while the query remains stalled")
+                .expect("flush");
+        assert!(!persisted);
+
+        upstream.release.notify_waiters();
+        let result = resolving.await.expect("resolve task");
+        assert!(result.is_err(), "pre-flush query must be cancelled");
+        assert!(cache.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn service_flush_fences_detached_refresh_memory_and_persistence() {
+        use honk_config::experimental::CacheFileConfig;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = Arc::new(
+            crate::cachedb::CacheDb::open(
+                &CacheFileConfig {
+                    enabled: true,
+                    path: directory
+                        .path()
+                        .join("cache.db")
+                        .to_string_lossy()
+                        .into_owned(),
+                    cache_id: String::new(),
+                    store_fakeip: false,
+                    store_dns: true,
+                },
+                None,
+            )
+            .expect("cache.db"),
+        );
+        let persister = crate::dns::persist::DnsCachePersister::spawn(Arc::clone(&database));
+        let upstream = Arc::new(RefreshFenceUpstream {
+            initial: make_a_response([192, 0, 2, 1], 1),
+            refreshed: make_a_response([192, 0, 2, 2], 300),
+            call_count: AtomicUsize::new(0),
+            refresh_entered: tokio::sync::Notify::new(),
+            refresh_release: tokio::sync::Semaphore::new(0),
+        });
+        let cache = test_cache();
+        cache.lock().await.set_persister(Some(persister.clone()));
+        let service = crate::dns::DnsService::with_forwarder(Arc::new(DnsForwarder::new(
+            upstream.clone(),
+            cache.clone(),
+            test_router(),
+        )));
+        let query = make_a_query();
+
+        let primed = service
+            .resolve(&query, IngressProfile::Internal)
+            .await
+            .expect("prime");
+        assert!(primed.windows(4).any(|bytes| bytes == [192, 0, 2, 1]));
+        let cached = service
+            .resolve(&query, IngressProfile::Internal)
+            .await
+            .expect("near-expiry cache hit");
+        assert!(cached.windows(4).any(|bytes| bytes == [192, 0, 2, 1]));
+        tokio::time::timeout(Duration::from_secs(1), upstream.refresh_entered.notified())
+            .await
+            .expect("detached refresh entered");
+
+        let persisted = tokio::time::timeout(Duration::from_secs(1), service.flush_cache())
+            .await
+            .expect("flush must acknowledge while refresh remains stalled")
+            .expect("flush");
+        assert!(persisted);
+        upstream.refresh_release.add_permits(1);
+        let cache_service = cache.lock().await.service();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while cache_service.refresh_task_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("old refresh completes");
+
+        assert!(cache.lock().await.is_empty());
+        persister.shutdown().await.expect("persistence shutdown");
+        assert!(database.load_dns_v2().expect("persisted rows").is_empty());
+
+        let refreshed = service
+            .resolve(&query, IngressProfile::Internal)
+            .await
+            .expect("new-epoch query");
+        assert!(refreshed.windows(4).any(|bytes| bytes == [192, 0, 2, 2]));
+        assert_eq!(cache.lock().await.len(), 1);
+        assert_eq!(upstream.call_count.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn cancelled_persistent_flush_reopens_cache_publication() {
+        use honk_config::experimental::CacheFileConfig;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = Arc::new(
+            crate::cachedb::CacheDb::open(
+                &CacheFileConfig {
+                    enabled: true,
+                    path: directory
+                        .path()
+                        .join("cache.db")
+                        .to_string_lossy()
+                        .into_owned(),
+                    cache_id: String::new(),
+                    store_fakeip: false,
+                    store_dns: true,
+                },
+                None,
+            )
+            .expect("cache.db"),
+        );
+        let persister = crate::dns::persist::DnsCachePersister::spawn(Arc::clone(&database));
+        let cache = test_cache();
+        cache.lock().await.set_persister(Some(persister.clone()));
+        let service = crate::dns::DnsService::with_forwarder(Arc::new(DnsForwarder::new(
+            Arc::new(MockUpstream::new(make_a_response([192, 0, 2, 9], 300))),
+            cache.clone(),
+            test_router(),
+        )));
+        let (flush_entered, _flush_release) = persister.gate_next_flush();
+        let flushing = {
+            let service = service.clone();
+            tokio::spawn(async move { service.flush_cache().await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), flush_entered.notified())
+            .await
+            .expect("flush reached persistence acknowledgement wait");
+        flushing.abort();
+        assert!(
+            flushing
+                .await
+                .expect_err("flush task cancelled")
+                .is_cancelled(),
+            "flush must be cancelled while persistence acknowledgement is gated"
+        );
+
+        service
+            .resolve(&make_a_query(), IngressProfile::Internal)
+            .await
+            .expect("post-cancellation resolve");
+        assert_eq!(cache.lock().await.len(), 1);
+        persister.shutdown().await.expect("persistence shutdown");
+        assert_eq!(database.load_dns_v2().expect("persisted rows").len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
