@@ -5,48 +5,6 @@
 //! lightweight h2 stream on it instead of a new TCP connection, mirroring
 //! sing-mux's `h2mux` protocol (`mux = true` means h2mux; smux/yamux are
 //! not implemented).
-//!
-//! # Wire format (sing-mux alignment)
-//!
-//! - **Session header**: before the HTTP/2 client preface the client writes
-//!   the sing-mux session request `version(1) | protocol(1)` = `0x00 0x02`
-//!   (Version0 + ProtocolH2Mux, no padding) — sing-mux `protocol.go`
-//!   (`EncodeRequest`) and `protocol_conn.go` (prepended on first write).
-//! - **Streams**: each proxied connection is one h2 stream opened with a
-//!   plain CONNECT request — `:method: CONNECT`, `:authority: localhost`,
-//!   no `:path`/`:scheme` (Go's `x/net/http2` omits them for non-extended
-//!   CONNECT, and so does the `h2` crate) — sing-mux `h2mux.go` `Open`
-//!   builds `&http.Request{Method: CONNECT, URL: https://localhost}`.
-//!   The server must answer `200 OK`; the request/response bodies are the
-//!   upload/download byte pipes (DATA frames both ways).
-//! - **Half-close**: `shutdown()` on the write side sends an empty DATA
-//!   frame with END_STREAM (Go: closing the request body pipe); a peer
-//!   END_STREAM surfaces as read EOF. Dropping a stream that was not shut
-//!   down resets it (Go: request-context cancel → RST_STREAM).
-//! - **Limits**: the least-loaded session is reused while it carries fewer
-//!   than 8 active streams (sing-mux `client.go` `offer` with the default
-//!   `min_streams = 8`), otherwise a new session is dialed; a stale session
-//!   (GOAWAY, I/O error) is invalidated and redialed once, like sing-mux
-//!   `openStream`'s two attempts. A session with no active streams for 60s
-//!   is gracefully closed.
-//!
-//! # Divergence from sing-box
-//!
-//! sing-box runs the proxy protocol handshake (e.g. trojan) on the *outer*
-//! connection with the dummy destination `sp.mux.sing-box.arpa:444` and
-//! prepends a per-stream `StreamRequest` header (`flags(2) | addr`) with the
-//! real destination, so stream payloads are raw bytes. honk instead
-//! hands each h2 stream to the proxy handler, which writes its normal
-//! per-connection handshake (carrying the real target) onto the stream —
-//! the transport layer never sees the target address, so the sing-mux
-//! `StreamRequest` layer cannot be emitted here. Interop with official
-//! sing-box multiplex inbounds is therefore **not** established; the h2
-//! framing layer itself (session header, pseudo-headers, DATA flow,
-//! END_STREAM semantics) follows sing-mux exactly.
-//!
-//! Sessions are cached per `(host, port, tls, sni)` — the TLS identity of
-//! the server. Nodes that differ only in credentials share a session, the
-//! same way sing-mux sessions are destination-agnostic.
 
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

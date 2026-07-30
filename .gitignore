@@ -52,3 +52,5 @@ cache.db
 cache.db-shm
 cache.db-wal
 yacd/
+.omo
+AGENTS.md
