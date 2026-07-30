@@ -10,6 +10,8 @@ use super::outcome::DnsOutcome;
 use super::query::IngressProfile;
 use super::runtime::{DnsServiceProvider, RuntimeLease};
 
+mod name_resolution;
+
 #[derive(Clone)]
 pub struct DnsService {
     backend: Arc<DnsServiceBackend>,
@@ -107,44 +109,6 @@ impl DnsService {
                     .await?
             }
         }
-    }
-
-    pub(crate) async fn resolve_internal_queries(
-        &self,
-        queries: &[Vec<u8>],
-    ) -> Vec<anyhow::Result<Vec<u8>>> {
-        let mut operation = self.operation();
-        match self.backend.as_ref() {
-            DnsServiceBackend::Runtime(provider) => {
-                let lease = provider.acquire();
-                Self::resolve_internal_with_forwarder(
-                    &mut operation,
-                    lease.runtime().forwarder(),
-                    queries,
-                )
-                .await
-            }
-            DnsServiceBackend::Standalone(forwarder) => {
-                Self::resolve_internal_with_forwarder(&mut operation, forwarder, queries).await
-            }
-        }
-    }
-
-    async fn resolve_internal_with_forwarder(
-        operation: &mut OperationToken,
-        forwarder: &DnsForwarder,
-        queries: &[Vec<u8>],
-    ) -> Vec<anyhow::Result<Vec<u8>>> {
-        let mut responses = Vec::with_capacity(queries.len());
-        for query in queries {
-            let response = operation
-                .run(forwarder.resolve_with_profile(query, IngressProfile::Internal))
-                .await
-                .map_err(anyhow::Error::from)
-                .and_then(|result| result);
-            responses.push(response);
-        }
-        responses
     }
 
     pub(crate) async fn resolve_outcome_with_runtime(

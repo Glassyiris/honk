@@ -123,19 +123,13 @@ impl DnsController {
     /// forwarder — reload-safe, unlike holding a resolver from startup.
     /// Used by the health-check resolver hook.
     pub async fn resolve_domain(&self, domain: &str) -> Vec<std::net::IpAddr> {
-        let mut out = Vec::new();
-        let queries =
-            [1_u16, 28].map(|qtype| crate::dns::forwarder::build_dns_query(domain, qtype));
-        for resp in self
-            .dns_service
-            .resolve_internal_queries(&queries)
-            .await
-            .into_iter()
-            .flatten()
-        {
-            out.extend(crate::dns::forwarder::extract_answer_ips(&resp));
+        match self.dns_service.resolve_name(domain).await {
+            Ok(resolved) => resolved.ipv4.into_iter().chain(resolved.ipv6).collect(),
+            Err(error) => {
+                debug!(%error, %domain, "DNS controller name resolution failed");
+                Vec::new()
+            }
         }
-        out
     }
 
     pub(crate) fn runtime_provider(&self) -> Arc<crate::dns::runtime::DnsServiceProvider> {
