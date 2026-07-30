@@ -5,6 +5,7 @@ use super::*;
 
 #[tokio::test]
 async fn acquisition_initializes_once_when_128_callers_race() {
+    let before = crate::stats::dns_snapshot();
     // Given
     let slot = Arc::new(LifecycleSlot::new());
     let initializations = Arc::new(AtomicUsize::new(0));
@@ -34,6 +35,7 @@ async fn acquisition_initializes_once_when_128_callers_race() {
     assert_eq!(initializations.load(Ordering::SeqCst), 1);
     assert_eq!(slot.init_count(), 1);
     assert_eq!(slot.state(), LifecycleState::Ready);
+    assert!(crate::stats::dns_snapshot().delta(before).transport_init >= 1);
 }
 
 #[tokio::test]

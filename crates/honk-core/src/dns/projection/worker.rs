@@ -103,18 +103,31 @@ async fn flush_after_snapshot(
     };
     if generation_changed {
         counters.generation_rebuilds.fetch_add(1, Ordering::Relaxed);
+        crate::stats::record_dns_event(crate::stats::DnsStatEvent::ProjectionStaleGeneration);
+        tracing::debug!(
+            reason = "generation_changed_during_write",
+            "DNS routing projection write became stale"
+        );
     }
     if !writes_current {
+        crate::stats::record_dns_event(crate::stats::DnsStatEvent::ProjectionRetry);
         let _ = projection.wake.try_send(());
     }
     for (_, error) in failures {
         counters.write_failures.fetch_add(1, Ordering::Relaxed);
+        crate::stats::record_dns_event(crate::stats::DnsStatEvent::ProjectionWriteFailure);
+        crate::stats::record_dns_event(crate::stats::DnsStatEvent::ProjectionRetry);
         if error.is_map_full() {
             counters.map_full.fetch_add(1, Ordering::Relaxed);
         }
         let should_warn = last_warning.is_none_or(|last| now.duration_since(last) >= WARN_INTERVAL);
         if should_warn {
-            tracing::warn!(error = %error, "DNS routing projection write failed; retrying");
+            let error_kind = if error.is_map_full() {
+                "map_full"
+            } else {
+                "backend_write"
+            };
+            tracing::warn!(error_kind, "DNS routing projection write failed");
             *last_warning = Some(now);
         }
     }

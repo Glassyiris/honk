@@ -106,6 +106,8 @@ impl<T> LifecycleSlot<T> {
                         let generation = inner.generation;
                         inner.state = SlotState::Building { generation };
                         self.init_count.fetch_add(1, Ordering::SeqCst);
+                        crate::stats::record_dns_event(crate::stats::DnsStatEvent::TransportInit);
+                        tracing::debug!(phase = "start", "DNS transport initialization");
                         Some(generation)
                     }
                 }

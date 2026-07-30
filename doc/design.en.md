@@ -222,6 +222,36 @@ Client :53 → eBPF DNS fast path (redirect, no full route loop)
 - Upstream protocols: UDP/TCP/DoT/DoH/DoQ/DoH3 are all implemented (`honk-core/src/dns/transport/`, pooled sessions with one retry after invalidation).
 - Optional `outbound` on an upstream routes queries through a proxy node/group (anti-pollution intent; UDP+proxy tunnels as TCP-DNS because the SOCKS5-UDP path is still incomplete, and DoQ/DoH3 are direct-only).
 
+Resolution defaults to `both`: an omitted strategy forwards eligible A and AAAA
+queries concurrently. `preferipv4`/`preferipv6` still query both families and
+only suppress the non-preferred answer when the preferred family has usable
+records; `ipv4only`/`ipv6only` do not forward the ineligible family. Bootstrap
+fallback runs once, only when every eligible family is unusable, and its result
+is filtered by the same eligibility set.
+
+Cache and singleflight keys include the ingress profile, routing policy, scope,
+and operation. Requests that are not cacheable or coalescable bypass both
+layers; cancellation releases their flight state. DNS persistence uses an
+`HDNS` v2 record under the `dns:v2:` namespace. Writes are bounded and epoch
+fenced: a flush discards older queued epochs before writing the newest state,
+while stale, corrupt, version-mismatched, or policy-mismatched rows are
+skipped on restore. A rollback to a pre-v2 binary therefore ignores v2 rows;
+they may remain in `cache.db` and do not change the old runtime's behavior.
+
+Runtime reloads publish a new coherent generation. Existing leases finish on
+the old generation while new requests use the replacement; retirement closes
+stalled generations at the deadline and caps retained generations. Pooled
+transports single-flight initialization and close idle sessions exactly once.
+Cache, flight, persistence, runtime, transport, projection, and outcome
+diagnostics use an internal coherent counter snapshot: writers and readers
+acquire the same `AtomicBool` gate, and its Acquire lock plus Release RAII
+unlock makes relaxed counter updates visible as one critical section.
+Structured failure logs expose only bounded `error_kind` classes
+(forwarder, persistence, projection, and transport) plus bounded fields such
+as the transport label; they omit query names, upstream addresses, and
+free-form error payloads. This adds no public DNS metrics endpoint,
+configuration key, or API.
+
 ## 10. Clash API
 
 Enabled when `experimental.clash_api.external_controller` is non-empty.
@@ -252,5 +282,5 @@ Auth: `Authorization: Bearer` or `?token=` (percent-decoded).
 
 - [Configuration](./configuration.en.md)
 - [Component reference](./components.en.md)
+- [DNS canary and rollback runbook](./dns-rollout.en.md)
 - [AGENTS.md](../AGENTS.md) — agent-oriented layout notes
-- [plan.md](../plan.md) — historical unfinished plans (may lag the code)

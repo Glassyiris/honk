@@ -195,10 +195,20 @@ impl DnsRuntime {
         let cancellation = self.cancellation.notified();
         tokio::pin!(cancellation);
         if self.lease_count() != 0 && !self.cancellation_requested.load(Ordering::Acquire) {
-            tokio::select! {
-                () = Self::wait_for_zero_leases(&self) => {}
-                () = tokio::time::sleep(deadline) => {}
-                () = &mut cancellation => {}
+            let timed_out = tokio::select! {
+                () = Self::wait_for_zero_leases(&self) => false,
+                () = tokio::time::sleep(deadline) => true,
+                () = &mut cancellation => false,
+            };
+            if timed_out {
+                crate::stats::record_dns_event(
+                    crate::stats::DnsStatEvent::RuntimeRetirementTimeout,
+                );
+                tracing::warn!(
+                    generation = self.generation().get(),
+                    active_leases = self.lease_count(),
+                    "DNS runtime retirement timed out"
+                );
             }
         }
         if self

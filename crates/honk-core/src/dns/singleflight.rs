@@ -79,6 +79,14 @@ impl Singleflight {
                 self.counters
                     .waiter_saturation_bypass
                     .fetch_add(1, Ordering::Relaxed);
+                crate::stats::record_dns_event(
+                    crate::stats::DnsStatEvent::SingleflightWaiterSaturation,
+                );
+                tracing::warn!(
+                    saturation = "waiters",
+                    action = "bypass",
+                    "DNS singleflight saturated"
+                );
                 return FlightRole::Bypass;
             }
             self.counters.waiters.fetch_add(1, Ordering::Relaxed);
@@ -91,6 +99,12 @@ impl Singleflight {
             self.counters
                 .key_saturation_bypass
                 .fetch_add(1, Ordering::Relaxed);
+            crate::stats::record_dns_event(crate::stats::DnsStatEvent::SingleflightKeySaturation);
+            tracing::warn!(
+                saturation = "keys",
+                action = "bypass",
+                "DNS singleflight saturated"
+            );
             return FlightRole::Bypass;
         }
         let (sender, _) = broadcast::channel(1);
@@ -138,6 +152,8 @@ impl FlightWaiter {
             Ok(template) => Some(template),
             Err(_) => {
                 self.counters.retries.fetch_add(1, Ordering::Relaxed);
+                crate::stats::record_dns_event(crate::stats::DnsStatEvent::SingleflightRetry);
+                tracing::debug!(reason = "leader_unavailable", "DNS singleflight retry");
                 None
             }
         }
@@ -166,6 +182,8 @@ impl Drop for FlightLeader {
             .is_some_and(|entry| matches!(entry.state, FlightState::Running));
         if aborted {
             self.counters.aborts.fetch_add(1, Ordering::Relaxed);
+            crate::stats::record_dns_event(crate::stats::DnsStatEvent::SingleflightCancel);
+            tracing::debug!(role = "leader", "DNS singleflight cancelled");
         }
     }
 }

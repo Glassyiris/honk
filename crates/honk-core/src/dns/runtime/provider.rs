@@ -40,6 +40,12 @@ impl PreparedPublication<'_> {
         if self.state.retired.len() > MAX_RETIRED_RUNTIMES
             && let Some(oldest) = self.state.retired.pop_front()
         {
+            crate::stats::record_dns_event(crate::stats::DnsStatEvent::RuntimeForcedClose);
+            tracing::warn!(
+                generation = oldest.generation().get(),
+                reason = "retired_runtime_limit",
+                "DNS runtime forced close"
+            );
             oldest.request_cancellation();
         }
         let deadline = self.deadline;

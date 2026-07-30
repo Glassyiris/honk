@@ -98,11 +98,11 @@ outbound-ci:
 outbound-ci-e2e:
     ci/outbound-ci.sh --with-e2e-env
 
-# DNS subsystem gate (fmt + clippy + config/dns/control/outbound suites)
+# DNS subsystem gate (fmt + clippy + runtime/projection/resolver/control/outbound suites)
 dns-ci:
     ci/dns-ci.sh
 
-# clash API gate (clash_api_test + integration_test)
+# Clash API gate (including Clash-only DNS query/flush scenarios)
 clash-ci:
     ci/clash-ci.sh
 

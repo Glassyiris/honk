@@ -169,6 +169,83 @@ ss 快路径实测无效(staging 拷贝不是瓶颈,ss2022 仍在 ~1.3 Gbps
 | 洪泛峰值 | 365 MB（有界） | 8 258（有界） |
 | 停流 60s 后 | 31 MB（回到基线） | 70 |
 
+### DNS 架构 Criterion 对比
+
+权威 `dns-final-gate` DNS 微基准将当前 HEAD
+`5d4f2ee0695595b16811b5693201609f9d69d078` 与 baseline commit
+`6bbf1dc929541d64178d44ab389dcfe3b3e55c1e` 对比。两边使用相同的
+非默认 `dns-bench` harness：
+
+```bash
+CARGO_TARGET_DIR=/root/code/honk-anaylyze-dns/target \
+  cargo bench -p honk-core --features dns-bench --bench dns -- \
+  --save-baseline dns-final-gate
+cargo bench -p honk-core --features dns-bench --bench dns -- \
+  --baseline dns-final-gate
+```
+
+本次在 `nixos` 主机（Linux `7.1.4-cachyos`、Intel i9-13900H、20 个逻辑
+CPU）上完成全部 32 个 Criterion group；工具链为 Rust
+`1.99.0-nightly (87e5904f5 2026-07-20)`、Cargo
+`1.99.0-nightly (3efb1f477 2026-07-17)`、LLVM `22.1.8`。baseline 的
+detached worktree 只覆盖编译相同 case 所需且逐字节一致的 benchmark feature、
+support、harness 与 stats 定义；其余 DNS 生产代码均来自精确 baseline SHA。
+不同主机的 timing 不可比较。
+
+| Case | 当前中心估计 | Baseline ratio | Criterion 结果 / 建议判定 |
+| --- | ---: | ---: | --- |
+| 真实 typed `CacheKey::new` 构建 | 78.300 ns | 0.9809x | 在 noise 内；≤1.10x 通过 |
+| Policy 求值，1 条规则 | 72.225 ns | 0.9853x | 在 noise 内；≤1.10x 通过 |
+| Policy 求值，32 条规则 | 197.81 ns | 0.9437x | 改善；≤1.10x 通过 |
+| Policy 求值，128 条规则 | 656.37 ns | 0.9369x | 改善；≤1.10x 通过 |
+| 独立 cache hit，1 task | 247.53 ns | 0.9863x | 未检测到变化；≤1.10x 通过 |
+| 独立 cache miss，1 task | 181.01 ns | 1.0742x | 检测到回归；≤1.10x 通过 |
+| 独立 cache hit，16 tasks | 3.3735 µs | 1.0389x | 检测到回归；≤1.10x 通过 |
+| 独立 cache miss，16 tasks | 1.8296 µs | 1.1264x | 检测到回归；≤1.10x **未达到** |
+| 独立 cache hit，64 tasks | 23.523 µs | 0.9831x | 未检测到变化；≤1.10x 通过 |
+| 独立 cache miss，64 tasks | 16.798 µs | 1.0219x | 在 noise 内；≤1.10x 通过 |
+| Singleflight，128 waiters | 552.43 µs | 1.0061x | 未检测到变化；≤1.10x 通过 |
+| Forwarder cache hit | 2.6462 µs | 0.9940x | 未检测到变化；≤1.15x 通过 |
+| 真实 runtime lease acquire/drop | 48.083 ns | 1.0060x | 未检测到变化；≤1.10x 通过 |
+| 真实 runtime publication/swap | 1.5375 µs | 0.9930x | 未检测到变化；≤1.10x 通过 |
+| shared-gate observability record | 12.025 ns | 1.1335x | 检测到回归；建议项 |
+| shared-gate 一致 snapshot | 9.3540 ns | 0.9992x | 未检测到变化；建议项 |
+| 1 万条 cache 构建/插入 | 2.7278 ms | 1.0055x | 未检测到变化 |
+| 1 万条 allocated bytes | 1,629,256 bytes | 1.0000x | ≤1.50x 通过 |
+
+typed-key 构建只解析一次真实 query，随后每个测量迭代都用真实 query context、
+`PolicyId`、upstream scope 和 resolve operation 调用生产 `CacheKey::new`。
+runtime 测量调用生产 provider 的 `acquire`/lease drop，并构造替换
+`DnsRuntime` 后执行 `prepare_publication(...).commit()`。observability case
+调用真实的 shared-gate writer 与一致 snapshot reader。writer 和 reader 获取
+同一个 `AtomicBool` gate；Acquire lock 与 Release RAII unlock 让 relaxed
+counter 更新作为一个一致临界区可见。baseline 有意覆盖相同 stats 实现，因此
+两次运行间的 delta 是噪声对照，不是新旧生产实现对比。
+
+timing 上限是建议目标，未达到的项目不会隐藏或放宽。16-task cache miss 是唯一
+未达到 ≤1.10x 建议目标的项目，为 1.1264x；在这个亚微秒 case 中，每次操作记录
+一致 counter 的固定成本很突出。功能发布、取消、顺序与资源边界仍由硬性测试断言。
+
+64-task 独立 hot-key 吞吐为 2.7207 Melem/s，串行参考为
+6.4729 Melem/s，即 0.420x，未达到建议的 ≥2x 目标。其单线程 Tokio
+`join_all` harness 测到的是调度成本，而非多核扩展。并行 A+AAAA 为
+1.2844 ms，较慢 AAAA 分支为 1.2159 ms，即 1.056x，通过 ≤1.25x 目标；
+相对 baseline 的 +2.69% 变化在 Criterion noise 内。
+
+原始 provenance receipts：
+
+| Artifact | 路径 | SHA-256 |
+| --- | --- | --- |
+| Baseline timing | `.omo/evidence/todo12-benchmark-final-gate-baseline.log` | `a6d9c0d8baf5354ff5f1fc0bc97b6f323e49bccf1361a09a49696bce9160cfda` |
+| 当前 timing/comparison | `.omo/evidence/todo12-benchmark-final-gate-current.log` | `999ed16100943aa2bef5149f072ffb784ebb4ed0bd4c65b963a87fe38893f806` |
+| Baseline provenance | `.omo/evidence/todo12-benchmark-baseline-provenance-gate.log` | `6428b2eacdb0c512bf96cef48db8bcd705962c6ea953adc6bcb3b1d4a7fc4882` |
+| 当前 provenance | `.omo/evidence/todo12-benchmark-current-provenance-gate.log` | `addc8287e9da4f3856a509a4e3961779b2b2fd8a81a860479dabaf2a7532c7f0` |
+
+机器可读 checksum receipt 位于
+`.omo/evidence/todo12-benchmark-final-gate-checksums.txt`；完整提取与方法说明位于
+`.omo/evidence/todo12-benchmark.md`（SHA-256
+`0121f37508664dd09a94060ee036ff20770ea3017cf521219a0bdfda3690d52a`）。
+
 ## 生产环境说明（10.10.10.1 网关，nexi AnyTLS 订阅）
 
 - 每次部署后 TCP(google/baidu/cloudflare）与 HTTP/3(cloudflare）均通过，
@@ -186,3 +263,5 @@ ss 快路径实测无效(staging 拷贝不是瓶颈,ss2022 仍在 ~1.3 Gbps
 - `just dns-ci` — DNS 子系统门禁。
 - Release CI(`.github/workflows/release.yml`)— workspace 测试门禁 +
   四目标构建（x86_64/aarch64 × gnu/musl)+ BTF 校验 + tarball 发布。
+- [DNS 灰度与回滚操作手册](./dns-rollout.zh.md) — 仅用于隔离授权主机；
+  本地 benchmark lane 未执行特权步骤。

@@ -52,6 +52,7 @@ async fn waiter_receives_leader_template_when_completed() {
 #[tokio::test]
 async fn waiter_retries_when_leader_is_cancelled() {
     // Given
+    let before = crate::stats::dns_snapshot();
     let flights = Singleflight::default();
     let FlightRole::Leader(leader) = flights.acquire(key(2)) else {
         panic!("leader");
@@ -70,11 +71,15 @@ async fn waiter_retries_when_leader_is_cancelled() {
     assert_eq!(flights.counters().aborts, 1);
     assert_eq!(flights.counters().retries, 1);
     assert!(matches!(flights.acquire(key(2)), FlightRole::Leader(_)));
+    let delta = crate::stats::dns_snapshot().delta(before);
+    assert!(delta.singleflight_cancel >= 1);
+    assert!(delta.singleflight_retry >= 1);
 }
 
 #[test]
 fn distinct_key_saturation_bypasses_without_registering_more_entries() {
     // Given
+    let before = crate::stats::dns_snapshot();
     let flights = Singleflight::default();
     let leaders: Vec<_> = (0..MAX_ACTIVE_FLIGHTS)
         .map(
@@ -94,12 +99,19 @@ fn distinct_key_saturation_bypasses_without_registering_more_entries() {
     assert!(matches!(saturated, FlightRole::Bypass));
     assert_eq!(flights.active_len(), MAX_ACTIVE_FLIGHTS);
     assert_eq!(flights.counters().key_saturation_bypass, 1);
+    assert!(
+        crate::stats::dns_snapshot()
+            .delta(before)
+            .singleflight_key_saturation
+            >= 1
+    );
     drop(leaders);
 }
 
 #[test]
 fn waiter_saturation_bypasses_the_257th_waiter() {
     // Given
+    let before = crate::stats::dns_snapshot();
     let flights = Singleflight::default();
     let FlightRole::Leader(_leader) = flights.acquire(key(3)) else {
         panic!("leader");
@@ -117,5 +129,11 @@ fn waiter_saturation_bypasses_the_257th_waiter() {
     // Then
     assert!(matches!(saturated, FlightRole::Bypass));
     assert_eq!(flights.counters().waiter_saturation_bypass, 1);
+    assert!(
+        crate::stats::dns_snapshot()
+            .delta(before)
+            .singleflight_waiter_saturation
+            >= 1
+    );
     drop(waiters);
 }

@@ -19,6 +19,8 @@
 //! shared with intercepted client queries. There is no separate stub
 //! resolver dependency.
 
+#[cfg(feature = "dns-bench")]
+pub mod bench_support;
 pub mod cache;
 pub mod endpoint;
 pub mod engine;

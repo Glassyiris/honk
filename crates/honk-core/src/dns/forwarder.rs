@@ -296,7 +296,7 @@ impl DnsForwarder {
         mode: ResolveMode,
     ) -> Result<DnsOutcome, DnsForwardError> {
         let publication_epoch = self.cache_service().await.publication_epoch();
-        super::engine::pipeline::resolve(
+        let result = super::engine::pipeline::resolve(
             self,
             raw_query,
             original_dst,
@@ -305,7 +305,51 @@ impl DnsForwarder {
             mode,
             publication_epoch,
         )
-        .await
+        .await;
+        match &result {
+            Ok(outcome) => {
+                let event = match (outcome.status(), outcome.response_class()) {
+                    (super::outcome::OutcomeStatus::Rejected, _) => {
+                        crate::stats::DnsStatEvent::OutcomeRejected
+                    }
+                    (
+                        super::outcome::OutcomeStatus::Accepted,
+                        super::outcome::ResponseClass::Positive,
+                    ) => crate::stats::DnsStatEvent::OutcomePositive,
+                    (
+                        super::outcome::OutcomeStatus::Accepted,
+                        super::outcome::ResponseClass::Nodata,
+                    ) => crate::stats::DnsStatEvent::OutcomeNodata,
+                    (
+                        super::outcome::OutcomeStatus::Accepted,
+                        super::outcome::ResponseClass::Nxdomain,
+                    ) => crate::stats::DnsStatEvent::OutcomeNxdomain,
+                    (
+                        super::outcome::OutcomeStatus::Accepted,
+                        super::outcome::ResponseClass::Servfail,
+                    ) => crate::stats::DnsStatEvent::OutcomeServfail,
+                };
+                crate::stats::record_dns_event(event);
+                tracing::debug!(
+                    status = ?outcome.status(),
+                    class = ?outcome.response_class(),
+                    provenance = ?outcome.provenance(),
+                    "DNS resolution outcome"
+                );
+            }
+            Err(error) => {
+                crate::stats::record_dns_event(crate::stats::DnsStatEvent::OutcomeError);
+                let error_kind = match error {
+                    DnsForwardError::Engine(_) => "engine",
+                    DnsForwardError::Exchange { .. } => "exchange",
+                    DnsForwardError::Response(_) => "response",
+                    DnsForwardError::Internal(_) => "internal",
+                    DnsForwardError::RejectedPlanEscaped => "rejected_plan",
+                };
+                tracing::debug!(error_kind, "DNS resolution failed");
+            }
+        }
+        result
     }
 
     pub(crate) async fn exchange(

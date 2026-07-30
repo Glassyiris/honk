@@ -344,7 +344,7 @@ dns {
 | ------ | ------ | -------- | ------ |
 | `upstream` | list | 一个 `default` @ 223.5.5.5 UDP | 服务器；dae：`upstream { name: 'uri' }` |
 | `routing` | object | fallback 默认 | 请求路由；dae：`routing { request { ... } }` |
-| `strategy` | enum | `preferipv4` | 地址族策略；dae：`ipversion_prefer: 4\|6` |
+| `strategy` | enum | 未指定时为 `both`；设置 `ipversion_prefer: 4\|6` 时分别为 `preferipv4`/`preferipv6` | 地址族策略 |
 | `cache` | object | 启用 | 缓存；dae：`optimistic_cache` / `optimistic_cache_ttl` / `max_cache_size` |
 
 ### 上游
@@ -375,7 +375,7 @@ dns {
 
 - `ipv4only` / `ipv6only`：另一地址族的查询在请求期直接回 NODATA，不转发上游。
 - `preferipv4` / `preferipv6`：两个地址族都会转发；当偏好族对同名有应答时，另一族的应答被压制（NODATA）；偏好族无应答时返回另一族的真实应答（允许回退）。缓存未命中时偏好族检查需额外一次上游查询。
-- `both`：不过滤。
+- `both`：`DnsConfig` 的实际默认值；并发转发符合资格的 A 与 AAAA，两个地址族都不压制。honk 配置省略 `ipversion_prefer` 时保持此默认值。
 
 dae：`ipversion_prefer: 4` 映射 `preferipv4`，`6` 映射 `preferipv6`（其他值 = `preferipv4`）；only 模式无法通过 dae 语法表达。
 
@@ -385,9 +385,34 @@ dae：`ipversion_prefer: 4` 映射 `preferipv4`，`6` 映射 `preferipv6`（其�
 | ------ | -------- | ------ |
 | `enabled` | `true` | 开关。**dae：** `optimistic_cache` |
 | `ttl` | `600` | 正缓存固定 TTL（覆盖应答 min TTL；`0` 表示沿用上游）。**dae：** `optimistic_cache_ttl` |
-| `max_size` | `10000` | 最大条目（必须 > 0）。**dae：** `max_cache_size` |
+| `max_size` | `10000` | 最大条目；`0` 仍接受，但会告警并钳制为 `1`。**dae：** `max_cache_size` |
 
-可选持久化：`experimental { cache_file { ... } }` 的 `store_dns`。
+可选持久化：`experimental { cache_file { ... } }` 的 `store_dns`。条目使用可回滚的
+`dns:v2:` 命名空间，只有 expiry、wire identity、入口 profile、scope、operation 与
+策略均匹配时才恢复。v2 命名空间冷启动且不改动旧行；旧版本忽略 v2 行，因此回滚时
+可将其留在 `cache.db` 中而不改变行为。
+
+缓存与 singleflight 共用资格判定。只有标准单问题 QUERY、answer/authority 计数为零、
+最多一个无 option 的 EDNS-v0 OPT 才符合资格。RD/AD/CD、DO、精确 question wire、
+UDP size、入口 profile、策略、scope 与 operation 均在 key 中保持隔离。不受支持的
+flags、EDNS option（包括 ECS/COOKIE）、EDNS-v1 与多问题消息绕过这两项优化；取消会
+释放 flight。
+
+### Runtime 与可观测性
+
+重载一次切换包含 DNS 策略、Router、GroupManager 快照、transport manager 与路由投影的
+完整 generation。lease 让旧请求排空；退役 deadline 与保留 generation 上限约束关闭，
+transport 初始化/关闭使用 singleflight 且幂等。
+
+内部一致快照覆盖 hit/miss/stale、flight 饱和/取消/重试、持久化丢弃/flush 失败、
+runtime 退役、transport 初始化/重置、投影失败/重试和结果分类。writer 与 snapshot
+reader 获取同一个 `AtomicBool` gate；Acquire lock 与 Release RAII unlock 让 relaxed
+counter 更新作为一个一致临界区可见。失败日志使用有界 `error_kind`：
+forwarder 为 `engine`/`exchange`/`response`/`internal`/`rejected_plan`，持久化为
+`worker_closed`/`ack_dropped`/`worker_failed`/`database`，投影为
+`map_full`/`backend_write`，transport 为 `exchange_failed` 并带有界 transport label。
+日志不记录 query name、upstream 地址或自由格式 error。`/stats` 仍是出站统计面；
+没有新增公开 DNS metric、endpoint、API 或调优项。
 
 ---
 
@@ -526,4 +551,5 @@ UDP 选择排除：两个 UDP 域都明确死亡 → 即使 TCP 存活也不选�
 
 - [设计文档](./design.zh.md)
 - [配置说明](./configuration.zh.md)
+- [DNS 灰度与回滚操作手册](./dns-rollout.zh.md)
 - 示例：`config.dae`、`config.min.dae`

@@ -1,0 +1,166 @@
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use honk_config::Config;
+use tokio::sync::Mutex;
+
+use super::cache::{CacheKey, DnsCache, OperationKind};
+use super::forwarder::{DnsForwarder, DnsUpstreamPool};
+use super::planner::{RequestScope, UpstreamTag};
+use super::policy::PolicyId;
+use super::projection::RoutingProjectionSnapshot;
+use super::query::{IngressProfile, QueryContext};
+use super::routing::DnsRouter;
+use super::runtime::{
+    DnsRuntime, DnsRuntimeParts, DnsServiceProvider, ProcessPersistenceHandle, RuntimeGeneration,
+    RuntimeTransport,
+};
+use crate::group::GroupManager;
+use crate::routing::Router;
+
+pub struct CacheKeyBenchmarkInput {
+    query: QueryContext,
+    policy_id: PolicyId,
+    scope: RequestScope,
+}
+
+impl CacheKeyBenchmarkInput {
+    pub fn parse(raw_query: &[u8]) -> Self {
+        let config = Config::default();
+        Self {
+            query: QueryContext::parse_with_profile(
+                raw_query,
+                IngressProfile::Udp {
+                    advertised_size: 1232,
+                },
+            )
+            .expect("benchmark query"),
+            policy_id: PolicyId::from_config(&config.dns).expect("benchmark policy"),
+            scope: RequestScope::Upstream(
+                UpstreamTag::new("default").expect("benchmark upstream tag"),
+            ),
+        }
+    }
+
+    pub fn build(&self) -> usize {
+        CacheKey::new(
+            &self.query,
+            Some(self.policy_id.clone()),
+            self.scope.clone(),
+            OperationKind::Resolve,
+        )
+        .wire_identity()
+        .len()
+    }
+}
+
+pub struct RuntimeBenchmark {
+    provider: Arc<DnsServiceProvider>,
+    shared: RuntimeShared,
+    next_generation: u64,
+}
+
+struct RuntimeShared {
+    forwarder: Arc<DnsForwarder>,
+    router: Arc<Router>,
+    group_manager: Arc<GroupManager>,
+    policy_id: PolicyId,
+    cache: Arc<Mutex<DnsCache>>,
+    persistence: Arc<ProcessPersistenceHandle>,
+}
+
+impl RuntimeBenchmark {
+    pub fn new() -> Self {
+        let config = Config::default();
+        let cache = Arc::new(Mutex::new(DnsCache::new(32)));
+        let dns_router =
+            Arc::new(DnsRouter::new_from_dns_config(&config.dns).expect("benchmark DNS router"));
+        let shared = RuntimeShared {
+            forwarder: Arc::new(DnsForwarder::new(
+                Arc::new(UnusedPool),
+                Arc::clone(&cache),
+                dns_router,
+            )),
+            router: Arc::new(
+                Router::new(&config.routing.rules, &config.routing.default_outbound)
+                    .expect("benchmark router"),
+            ),
+            group_manager: Arc::new(GroupManager::new(&config.groups, &config.nodes)),
+            policy_id: PolicyId::from_config(&config.dns).expect("benchmark policy"),
+            persistence: ProcessPersistenceHandle::new(Arc::clone(&cache)),
+            cache,
+        };
+        let initial = runtime(&shared, 1);
+        Self {
+            provider: Arc::new(DnsServiceProvider::new(initial)),
+            shared,
+            next_generation: 2,
+        }
+    }
+
+    pub fn acquire_generation(&self) -> u64 {
+        self.provider.acquire().runtime().generation().get()
+    }
+
+    pub fn publish_next(&mut self) {
+        let replacement = runtime(&self.shared, self.next_generation);
+        self.next_generation = self.next_generation.saturating_add(1);
+        self.provider.prepare_publication(replacement).commit();
+    }
+
+    pub async fn shutdown(&self) {
+        self.provider.shutdown().await;
+    }
+}
+
+impl Default for RuntimeBenchmark {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub fn record_observability_event() {
+    crate::stats::record_dns_event(crate::stats::DnsStatEvent::CacheHit);
+}
+
+pub fn observability_snapshot_checksum() -> u64 {
+    let snapshot = crate::stats::dns::dns_snapshot();
+    snapshot
+        .cache_hit
+        .wrapping_add(snapshot.cache_miss)
+        .wrapping_add(snapshot.outcome_error)
+}
+
+fn runtime(shared: &RuntimeShared, generation: u64) -> Arc<DnsRuntime> {
+    DnsRuntime::new(DnsRuntimeParts {
+        generation: RuntimeGeneration::new(generation),
+        forwarder: Arc::clone(&shared.forwarder),
+        router: Arc::clone(&shared.router),
+        group_manager: Arc::clone(&shared.group_manager),
+        policy_id: shared.policy_id.clone(),
+        routing_projection: Arc::new(RoutingProjectionSnapshot::new(
+            generation,
+            Arc::clone(&shared.router),
+            Default::default(),
+        )),
+        cache: Arc::clone(&shared.cache),
+        persistence: Arc::clone(&shared.persistence),
+        transport: Arc::new(NoopTransport),
+    })
+}
+
+struct UnusedPool;
+
+#[async_trait]
+impl DnsUpstreamPool for UnusedPool {
+    async fn query(&self, _: &str, _: &[u8]) -> anyhow::Result<Vec<u8>> {
+        unreachable!("benchmark runtime does not exchange DNS")
+    }
+}
+
+struct NoopTransport;
+
+#[async_trait]
+impl RuntimeTransport for NoopTransport {
+    async fn close(&self) {}
+}

@@ -24,6 +24,10 @@ cargo clippy -p honk-core --all-targets -- -D warnings
 step "cargo test -p honk-core --test clash_api_test"
 cargo test -p honk-core --test clash_api_test
 
+step "cargo test -p honk-core --test clash_api_test (DNS API contract probes)"
+cargo test -p honk-core --test clash_api_test test_dns_query
+cargo test -p honk-core --test clash_api_test test_cache_flush_endpoints
+
 step "cargo test -p honk-core --test integration_test"
 cargo test -p honk-core --test integration_test
 

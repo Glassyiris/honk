@@ -1211,8 +1211,10 @@ async fn test_store_dns_persister_end_to_end() {
     persister.shutdown().await.expect("persistence shutdown");
     assert_eq!(persister.counters().written, 1);
 
+    let now = honk_core::dns::persist::unix_now();
+    db.save_dns_answer("legacy.example", 1, r#"{"r":"TEVHQUNZ"}"#, now + 300);
     let fresh_cache = Arc::new(tokio::sync::Mutex::new(DnsCache::new(16)));
-    let restart = honk_core::dns::persist::DnsCachePersister::spawn(db);
+    let restart = honk_core::dns::persist::DnsCachePersister::spawn(db.clone());
     assert_eq!(
         restart
             .restore_cache(&fresh_cache, Some(policy))
@@ -1230,4 +1232,9 @@ async fn test_store_dns_persister_end_to_end() {
         .unwrap();
     assert_eq!(resp, a_record_response([1, 2, 3, 4], 300));
     restart.shutdown().await.expect("restart shutdown");
+    assert_eq!(
+        db.load_dns_answers(now).len(),
+        1,
+        "v2 restart must leave rollback-compatible legacy rows untouched"
+    );
 }

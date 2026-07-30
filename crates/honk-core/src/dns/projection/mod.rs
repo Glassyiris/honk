@@ -149,6 +149,13 @@ impl RoutingProjection {
             if state.update_snapshot(snapshot) {
                 state.observe(observation, tokio::time::Instant::now())
             } else {
+                crate::stats::record_dns_event(
+                    crate::stats::DnsStatEvent::ProjectionStaleGeneration,
+                );
+                tracing::debug!(
+                    reason = "older_snapshot",
+                    "DNS routing projection update ignored"
+                );
                 0
             }
         });

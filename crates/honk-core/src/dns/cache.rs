@@ -378,6 +378,24 @@ mod tests {
     }
 
     #[test]
+    fn dns_stats_snapshot_tracks_cache_outcomes() {
+        let before = crate::stats::dns::dns_snapshot();
+        let mut cache = DnsCache::new(10);
+        let response = make_test_response([93, 184, 216, 34], 300);
+        cache.put("hit".into(), response.clone(), 300);
+        cache.insert_expired_for_test("stale".into(), response, 300);
+
+        assert!(cache.get("hit").is_some());
+        assert!(cache.get("miss").is_none());
+        assert!(cache.get_stale("stale").is_some());
+
+        let delta = crate::stats::dns::dns_snapshot().delta(before);
+        assert!(delta.cache_hit >= 1);
+        assert!(delta.cache_miss >= 1);
+        assert!(delta.cache_stale >= 1);
+    }
+
+    #[test]
     fn test_expiry() {
         let mut cache = DnsCache::new(10);
         let resp = make_test_response([93, 184, 216, 34], 0);

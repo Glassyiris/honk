@@ -109,6 +109,8 @@ fn receive_put(
         counters
             .dropped_pending_full
             .fetch_add(1, Ordering::Relaxed);
+        crate::stats::record_dns_event(crate::stats::DnsStatEvent::PersistenceDrop);
+        tracing::debug!(reason = "pending_set_full", "DNS persistence write dropped");
         return;
     }
     pending.insert(
@@ -150,7 +152,6 @@ fn write_active(
         }
         Err(error) => {
             counters.db_errors.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(%error, "DNS persistence batch write failed");
             Err(PersistControlError::Database(error.to_string()))
         }
     }
@@ -177,7 +178,6 @@ fn flush(
     discard_before(pending, epoch, counters);
     db.flush_dns_namespaces().map_err(|error| {
         counters.db_errors.fetch_add(1, Ordering::Relaxed);
-        tracing::warn!(%error, epoch, "DNS persistence flush failed");
         PersistControlError::Database(error.to_string())
     })?;
     *cleared_epoch = epoch;

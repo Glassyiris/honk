@@ -131,6 +131,7 @@ async fn publication_does_not_wait_for_old_lease_and_drop_awaits_close() {
 #[tokio::test(start_paused = true)]
 async fn retirement_deadline_closes_a_stalled_generation() {
     // Given: a retired generation still has a lease.
+    let before = crate::stats::dns_snapshot();
     let (old, transport) = runtime(1, 1);
     let provider = DnsServiceProvider::new(old);
     let _lease = provider.acquire();
@@ -144,11 +145,18 @@ async fn retirement_deadline_closes_a_stalled_generation() {
 
     // Then: the old generation is forcibly closed without wall-clock sleep.
     assert_eq!(transport.closes.load(Ordering::SeqCst), 1);
+    assert!(
+        crate::stats::dns_snapshot()
+            .delta(before)
+            .runtime_retirement_timeout
+            >= 1
+    );
 }
 
 #[tokio::test]
 async fn fifth_retirement_cancels_oldest_and_retains_four() {
     // Given: the oldest runtime is kept alive by a lease.
+    let before = crate::stats::dns_snapshot();
     let (oldest, oldest_transport) = runtime(0, 0);
     let provider = DnsServiceProvider::new(oldest);
     let oldest_lease = provider.acquire();
@@ -165,6 +173,12 @@ async fn fifth_retirement_cancels_oldest_and_retains_four() {
         .await
         .expect("oldest generation closed at retirement cap");
     assert_eq!(oldest_lease.runtime().state(), RuntimeState::Closed);
+    assert!(
+        crate::stats::dns_snapshot()
+            .delta(before)
+            .runtime_forced_close
+            >= 1
+    );
 }
 
 #[tokio::test]

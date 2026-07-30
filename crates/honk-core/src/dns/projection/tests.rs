@@ -164,6 +164,25 @@ async fn stale_runtime_observation_cannot_downgrade_generation() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn stale_runtime_submission_records_generation_fence_event() {
+    let before = crate::stats::dns_snapshot();
+    let (projection, _receiver, _ebpf) = projection_for_test(snapshot(2, 4, 8));
+    let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 44));
+
+    projection.submit(
+        snapshot(1, 1, 2),
+        positive("a.test", &[ip], Duration::from_secs(30)),
+    );
+
+    assert!(
+        crate::stats::dns_snapshot()
+            .delta(before)
+            .projection_stale_generation
+            >= 1
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn deterministic_capacity_evicts_oldest_domain() {
     let now = tokio::time::Instant::now();
     let mut state = DesiredState::new(snapshot(1, 1, 2), 2);

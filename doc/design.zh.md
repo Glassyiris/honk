@@ -222,6 +222,26 @@ flowchart TB
 - 上游协议：UDP/TCP/DoT/DoH/DoQ/DoH3 均已实现（`honk-core/src/dns/transport/`，会话池化，失效后重试一次）。
 - 上游可选 `outbound`，经代理节点/组发出查询（防污染）；因 SOCKS5-UDP 路径不完整，UDP+代理隧道化为 TCP-DNS，DoQ/DoH3 仅支持直连。
 
+解析策略默认是 `both`：未指定策略时并发转发可用的 A 与 AAAA 查询。
+`preferipv4`/`preferipv6` 仍会查询两个地址族，仅在偏好族有可用记录时压制另一族；
+`ipv4only`/`ipv6only` 不会转发不符合资格的地址族。仅当所有符合资格的地址族都不可用时才
+执行一次 bootstrap 回退，且回退结果同样按资格过滤。
+
+缓存与 singleflight key 包含入口 profile、路由策略、scope 和操作类型。不可缓存或不可合并的
+请求绕过两层；取消请求会释放 flight 状态。DNS 持久化使用 `dns:v2:` 命名空间下的 `HDNS`
+v2 记录。写入由有界 actor 和 epoch 栅栏管理：flush 会先丢弃旧 epoch 的排队项，再写入最新状态；
+恢复时跳过过期、损坏、版本或策略不匹配的行。因此回滚到不认识 v2 的旧二进制时，v2 行可以留在
+`cache.db` 中，但不会改变旧运行时行为。
+
+重载发布新的完整 runtime generation。已有 lease 在旧 generation 上完成，新请求使用替换版本；
+停滞 generation 到期后强制关闭，保留的旧 generation 数量也有上限。上游池对 transport 初始化
+singleflight，并保证空闲会话只关闭一次。缓存、flight、持久化、runtime、transport、投影与结果
+诊断使用内部一致 counter 快照：writer 与 reader 获取同一个 `AtomicBool` gate，
+Acquire lock 与 Release RAII unlock 让 relaxed counter 更新作为一个临界区可见。
+结构化失败日志仅暴露有界 `error_kind` 分类（forwarder、持久化、
+投影和 transport）以及 transport label 等有界字段，不记录 query name、upstream 地址或
+自由格式 error payload。本次没有新增公开 DNS metrics 接口、配置项或 API。
+
 ## 10. Clash API
 
 当 `experimental.clash_api.external_controller` 非空时启用。
@@ -252,5 +272,5 @@ flowchart TB
 
 - [配置说明](./configuration.zh.md)
 - [组件详细配置](./components.zh.md)
+- [DNS 灰度与回滚操作手册](./dns-rollout.zh.md)
 - [AGENTS.md](../AGENTS.md) — 面向 Agent 的仓库说明
-- [plan.md](../plan.md) — 历史未完成计划（可能落后于代码）

@@ -34,6 +34,40 @@ fn classifies_positive_nodata_nxdomain_and_servfail_responses() {
     assert_eq!(classify_response(&servfail), ResponseClass::Servfail);
 }
 
+#[tokio::test]
+async fn real_forwarding_paths_record_each_response_class() {
+    let query = build_dns_query("example.com", 1);
+    let positive = response(&query, [192, 0, 2, 1], 30);
+    let nodata = nodata_response(&query);
+    let mut nxdomain = nodata.clone();
+    nxdomain[3] = 0x83;
+    let mut servfail = nodata.clone();
+    servfail[3] = 0x82;
+
+    for (wire, class) in [
+        (positive, ResponseClass::Positive),
+        (nodata, ResponseClass::Nodata),
+        (nxdomain, ResponseClass::Nxdomain),
+        (servfail, ResponseClass::Servfail),
+    ] {
+        let before = crate::stats::dns_snapshot();
+        let forwarder = DnsForwarder::new(
+            exchange([("first", Ok(wire))], None),
+            Arc::new(Mutex::new(DnsCache::new(8))),
+            router("first", Vec::new(), None),
+        );
+        let outcome = forwarder.resolve_outcome(&query).await.expect("outcome");
+        assert_eq!(outcome.response_class(), class);
+        let delta = crate::stats::dns_snapshot().delta(before);
+        match class {
+            ResponseClass::Positive => assert!(delta.outcome_positive >= 1),
+            ResponseClass::Nodata => assert!(delta.outcome_nodata >= 1),
+            ResponseClass::Nxdomain => assert!(delta.outcome_nxdomain >= 1),
+            ResponseClass::Servfail => assert!(delta.outcome_servfail >= 1),
+        }
+    }
+}
+
 #[test]
 fn fixed_zero_disables_cache_instead_of_clamping_to_one() {
     // Given / When
@@ -212,6 +246,7 @@ async fn typed_outcome_tracks_positive_requery_and_caller_rendering() {
 #[tokio::test]
 async fn typed_outcome_rejects_response_and_skips_exchange_for_request_reject() {
     // Given
+    let before = crate::stats::dns_snapshot();
     let routing = DnsRouting {
         request: DnsRequestRouting {
             rules: Vec::new(),
@@ -235,11 +270,13 @@ async fn typed_outcome_rejects_response_and_skips_exchange_for_request_reject() 
     assert_eq!(outcome.status(), OutcomeStatus::Rejected);
     assert_eq!(outcome.response_class(), ResponseClass::Nodata);
     assert_eq!(outcome.provenance(), Provenance::Fresh);
+    assert!(crate::stats::dns_snapshot().delta(before).outcome_rejected >= 1);
 }
 
 #[tokio::test]
 async fn typed_outcome_reports_malformed_response_and_requery_cycle() {
     // Given
+    let before = crate::stats::dns_snapshot();
     let query = build_dns_query("example.com", 1);
     let cycle_rules = vec![DnsResponseRule {
         conditions: vec![DnsCond::Upstream {
@@ -275,6 +312,7 @@ async fn typed_outcome_reports_malformed_response_and_requery_cycle() {
         cycle_error,
         DnsForwardError::Engine(super::EngineError::Plan(PlanError::UpstreamCycle { .. }))
     ));
+    assert!(crate::stats::dns_snapshot().delta(before).outcome_error >= 2);
 }
 
 #[tokio::test]

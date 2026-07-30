@@ -15,6 +15,8 @@ impl DnsCacheService {
         }) {
             shard.pop(key);
             self.counters.misses.fetch_add(1, Ordering::Relaxed);
+            crate::stats::record_dns_event(crate::stats::DnsStatEvent::CacheMiss);
+            tracing::debug!(result = "miss", "DNS cache lookup");
             return None;
         }
         let result = match shard.get(key) {
@@ -23,8 +25,12 @@ impl DnsCacheService {
         };
         if result.is_some() {
             self.counters.hits.fetch_add(1, Ordering::Relaxed);
+            crate::stats::record_dns_event(crate::stats::DnsStatEvent::CacheHit);
+            tracing::debug!(result = "hit", "DNS cache lookup");
         } else {
             self.counters.misses.fetch_add(1, Ordering::Relaxed);
+            crate::stats::record_dns_event(crate::stats::DnsStatEvent::CacheMiss);
+            tracing::debug!(result = "miss", "DNS cache lookup");
         }
         result
     }
@@ -42,6 +48,8 @@ impl DnsCacheService {
         };
         if result.is_some() {
             self.counters.stale.fetch_add(1, Ordering::Relaxed);
+            crate::stats::record_dns_event(crate::stats::DnsStatEvent::CacheStale);
+            tracing::debug!(result = "stale", "DNS cache lookup");
         }
         result
     }
@@ -169,6 +177,8 @@ impl DnsCacheService {
         });
         if result.is_some() {
             self.counters.hits.fetch_add(1, Ordering::Relaxed);
+            crate::stats::record_dns_event(crate::stats::DnsStatEvent::CacheHit);
+            tracing::debug!(result = "negative_hit", "DNS cache lookup");
         }
         result
     }

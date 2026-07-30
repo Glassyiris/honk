@@ -77,6 +77,7 @@ async fn wake_overflow_is_harmless_and_latest_state_converges() {
 
 #[tokio::test(start_paused = true)]
 async fn set_and_map_full_failures_keep_dirty_until_retry() {
+    let before = crate::stats::dns_snapshot();
     for map_full in [false, true] {
         let (projection, _receiver, ebpf) = projection_for_test(snapshot(1, 1, 2));
         let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2));
@@ -96,6 +97,9 @@ async fn set_and_map_full_failures_keep_dirty_until_retry() {
         assert_eq!(projection.counters().write_failures, 1);
         assert_eq!(projection.counters().map_full, u64::from(map_full));
     }
+    let delta = crate::stats::dns_snapshot().delta(before);
+    assert!(delta.projection_write_failure >= 2);
+    assert!(delta.projection_retry >= 2);
     println!("TYPED_MAP_FULL_COUNTER generic=0 map_full=1");
 }
 

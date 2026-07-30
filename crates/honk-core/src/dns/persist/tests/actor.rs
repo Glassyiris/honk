@@ -9,6 +9,7 @@ use super::*;
 
 #[tokio::test]
 async fn bounded_queue_drops_only_persistence_work_when_saturated() {
+    let before = crate::stats::dns_snapshot();
     let dir = tempfile::tempdir().expect("tempdir");
     let db = test_db(&dir, "");
     let persister = DnsCachePersister::spawn(Arc::clone(&db));
@@ -26,6 +27,7 @@ async fn bounded_queue_drops_only_persistence_work_when_saturated() {
     }
     service.put_exact(key.clone(), response, 300);
     assert_eq!(persister.counters().dropped_full, 1025);
+    assert!(crate::stats::dns_snapshot().delta(before).persistence_drop >= 1);
     assert!(service.get(&key.storage_key()).is_some());
     drop(guard);
     persister.shutdown().await.expect("shutdown");
@@ -119,6 +121,7 @@ async fn database_write_error_is_nonfatal_and_counted() {
 
 #[tokio::test]
 async fn flush_reports_database_clear_failure() {
+    let before = crate::stats::dns_snapshot();
     let dir = tempfile::tempdir().expect("tempdir");
     let db = test_db(&dir, "");
     db.save_dns_answer("legacy.example", 1, "answer", unix_now() + 300);
@@ -132,6 +135,12 @@ async fn flush_reports_database_clear_failure() {
 
     assert!(matches!(error, PersistControlError::Database(_)));
     assert_eq!(persister.counters().db_errors, 1);
+    assert!(
+        crate::stats::dns_snapshot()
+            .delta(before)
+            .persistence_flush_failure
+            >= 1
+    );
     db.set_query_only_for_test(false);
     persister.shutdown().await.expect("shutdown");
 }
