@@ -1,0 +1,170 @@
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
+use honk_config::node::Node;
+use honk_config::types::DnsProtocol;
+
+use super::UpstreamPool;
+use super::entries::{PoolState, UpstreamEntry};
+use crate::dns::transport::{
+    DialContext, Doh3Client, DohClient, DoqClient, DotPool, LifecycleSlot, ProxyDial, TcpPool,
+};
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(super) struct TransportKey {
+    resolved_leaf: Option<String>,
+}
+
+pub(super) enum PooledTransport {
+    Tcp(Arc<TcpPool>),
+    Dot(Arc<DotPool>),
+    Doh(Arc<DohClient>),
+    Doq(Arc<DoqClient>),
+    Doh3(Arc<Doh3Client>),
+}
+
+impl PooledTransport {
+    async fn close(&self) {
+        match self {
+            Self::Tcp(transport) => transport.close().await,
+            Self::Dot(transport) => transport.close().await,
+            Self::Doh(transport) => transport.close().await,
+            Self::Doq(transport) => transport.close().await,
+            Self::Doh3(transport) => transport.close().await,
+        }
+    }
+
+    pub(super) async fn exchange(&self, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+        match self {
+            Self::Tcp(transport) => transport.exchange(raw_query).await,
+            Self::Dot(transport) => transport.exchange(raw_query).await,
+            Self::Doh(transport) => transport.exchange(raw_query).await,
+            Self::Doq(transport) => transport.exchange(raw_query).await,
+            Self::Doh3(transport) => transport.exchange(raw_query).await,
+        }
+    }
+}
+
+impl UpstreamPool {
+    pub(super) fn dial_context(
+        &self,
+        entry: &UpstreamEntry,
+        proxy_node: Option<&Node>,
+    ) -> DialContext {
+        let proxy = match (proxy_node, self.proxy_registry.as_ref()) {
+            (Some(node), Some(registry)) => Some(ProxyDial {
+                registry: Arc::clone(registry),
+                node: node.clone(),
+            }),
+            _ => None,
+        };
+        DialContext {
+            endpoint: entry.endpoint.clone(),
+            query_timeout: self.dns_query_timeout,
+            dial_timeout: self.dns_dial_timeout,
+            proxy,
+        }
+    }
+
+    async fn build_transport(
+        &self,
+        entry: &UpstreamEntry,
+        proxy_node: Option<&Node>,
+    ) -> anyhow::Result<PooledTransport> {
+        let dial = self.dial_context(entry, proxy_node);
+        Ok(match entry.protocol {
+            DnsProtocol::Tcp => PooledTransport::Tcp(TcpPool::new(dial)),
+            DnsProtocol::Tls => PooledTransport::Dot(DotPool::new(dial)?),
+            DnsProtocol::Https => PooledTransport::Doh(DohClient::new_tracked(
+                dial,
+                Arc::clone(&self.active_transport_tasks),
+            )?),
+            DnsProtocol::Quic => PooledTransport::Doq(
+                DoqClient::new(entry.endpoint.clone(), self.dns_query_timeout).await?,
+            ),
+            DnsProtocol::H3 => PooledTransport::Doh3(
+                Doh3Client::new_tracked(
+                    entry.endpoint.clone(),
+                    self.dns_query_timeout,
+                    Arc::clone(&self.active_transport_tasks),
+                )
+                .await?,
+            ),
+            DnsProtocol::Udp => anyhow::bail!("internal: UDP has no pooled transport"),
+        })
+    }
+
+    pub(super) async fn get_transport(
+        &self,
+        entry: &UpstreamEntry,
+        proxy_node: Option<&Node>,
+    ) -> anyhow::Result<Arc<PooledTransport>> {
+        let key = TransportKey {
+            resolved_leaf: proxy_node.map(|node| node.name.clone()),
+        };
+        let slot = {
+            let mut transports = entry.transports.lock();
+            Arc::clone(
+                transports
+                    .entry(key)
+                    .or_insert_with(|| Arc::new(LifecycleSlot::new())),
+            )
+        };
+        slot.acquire(|| self.build_transport(entry, proxy_node))
+            .await
+    }
+
+    pub fn lifecycle_stats(&self) -> super::TransportLifecycleStats {
+        let (init_count, close_count) = self
+            .entries
+            .values()
+            .flat_map(|entry| {
+                entry
+                    .transports
+                    .lock()
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .fold((0, 0), |(initializations, closes), slot| {
+                (
+                    initializations + slot.init_count(),
+                    closes + slot.close_count(),
+                )
+            });
+        super::TransportLifecycleStats {
+            init_count,
+            close_count,
+            tasks: self.active_transport_tasks.load(Ordering::SeqCst),
+        }
+    }
+
+    pub async fn close(&self) {
+        {
+            let mut shutdown = self.shutdown.write().await;
+            match *shutdown {
+                PoolState::Open | PoolState::Closing => *shutdown = PoolState::Closing,
+                PoolState::Closed => return,
+            }
+        }
+        let slots = self
+            .entries
+            .values()
+            .flat_map(|entry| {
+                entry
+                    .transports
+                    .lock()
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        for slot in slots {
+            slot.close(|transport| async move {
+                transport.close().await;
+            })
+            .await;
+        }
+        *self.shutdown.write().await = PoolState::Closed;
+    }
+}
