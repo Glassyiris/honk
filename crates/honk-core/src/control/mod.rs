@@ -921,18 +921,22 @@ impl ControlPlane {
                 recv_result = recv_from_with_orig_dst(&udp4_socket, &mut udp4_buf) => {
                     match recv_result {
                         Ok((n, src_addr, original_dst)) => {
-                            if drain.should_reject() { continue; }
+                            if drain.should_reject() {
+                                self.stats.record_udp_slow_permit_closed();
+                                continue;
+                            }
                             // Fast path: the datagram belongs to an established
                             // endpoint — forward it inline from the receive
                             // buffer (no spawn, no heap copy, no sniffer).
-                            if udp_fast_path(&self.udp_pool, &udp4_buf[..n], src_addr, original_dst).await {
+                            if udp_fast_path(&self.udp_pool, &self.stats, &udp4_buf[..n], src_addr, original_dst).await {
                                 continue;
                             }
                             let data = bytes::Bytes::copy_from_slice(&udp4_buf[..n]);
                             // At capacity, drop the datagram instead of
                             // queueing a task that waits on the semaphore —
                             // UDP tolerates loss; unbounded pending tasks do not.
-                            let Ok(permit) = self.concurrency_limit.clone().try_acquire_owned()
+                            let Some(permit) =
+                                try_admit_udp_slow_path(&self.stats, &self.concurrency_limit)
                             else {
                                 continue;
                             };
@@ -960,17 +964,21 @@ impl ControlPlane {
                 } => {
                     match recv6_result {
                         Ok((n, src_addr, original_dst)) => {
-                            if drain.should_reject() { continue; }
+                            if drain.should_reject() {
+                                self.stats.record_udp_slow_permit_closed();
+                                continue;
+                            }
                             // Fast path: the datagram belongs to an established
                             // endpoint — forward it inline from the receive
                             // buffer (no spawn, no heap copy, no sniffer).
-                            if udp_fast_path(&self.udp_pool, &udp6_buf[..n], src_addr, original_dst).await {
+                            if udp_fast_path(&self.udp_pool, &self.stats, &udp6_buf[..n], src_addr, original_dst).await {
                                 continue;
                             }
                             let data = bytes::Bytes::copy_from_slice(&udp6_buf[..n]);
                             // Same as the v4 path: drop instead of queueing
                             // a pending task when at capacity.
-                            let Ok(permit) = self.concurrency_limit.clone().try_acquire_owned()
+                            let Some(permit) =
+                                try_admit_udp_slow_path(&self.stats, &self.concurrency_limit)
                             else {
                                 continue;
                             };
@@ -1064,7 +1072,29 @@ impl ControlPlane {
             mode_state: self.mode_state.clone(),
         }
     }
+}
 
+/// Admit one datagram onto the current UDP slow path after a fast-path miss.
+///
+/// This is the sole production owner of `udp.slowPermit` accepted/rejected
+/// counters. Endpoint-driver `udp.queue.*` remains unwired until Task 3.
+pub(super) fn try_admit_udp_slow_path(
+    stats: &StatsManager,
+    concurrency_limit: &Arc<tokio::sync::Semaphore>,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    match concurrency_limit.clone().try_acquire_owned() {
+        Ok(permit) => {
+            stats.record_udp_slow_permit_accepted();
+            Some(permit)
+        }
+        Err(_) => {
+            stats.record_udp_slow_permit_rejected();
+            None
+        }
+    }
+}
+
+impl ControlPlane {
     /// Push compiled routing rules to eBPF MatchSet arrays.
     fn push_routing_to_ebpf(
         config: &Config,

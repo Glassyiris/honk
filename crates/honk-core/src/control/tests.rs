@@ -123,9 +123,13 @@ fn might_be_dns_query_matches_controller_condition() {
 #[tokio::test]
 async fn udp_fast_path_miss_goes_slow() {
     let pool = UdpEndpointPool::new();
+    let stats = StatsManager::new();
     let client = addr("10.0.0.1:12345");
     let dst = addr("203.0.113.1:443");
-    assert!(!udp_fast_path(&pool, b"hello", client, dst).await);
+    assert!(!udp_fast_path(&pool, &stats, b"hello", client, dst).await);
+    let udp = stats.udp_snapshot();
+    assert_eq!(udp.endpoint_misses, 1);
+    assert_eq!(udp.endpoint_hits, 0);
 }
 
 #[tokio::test]
@@ -135,6 +139,7 @@ async fn udp_fast_path_hit_forwards_inline() {
     let proxy = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let proxy_addr = proxy.local_addr().unwrap();
     let pool = UdpEndpointPool::new();
+    let stats = StatsManager::new();
     let client = addr("10.0.0.1:12345");
     let dst = addr("203.0.113.1:443");
     let (_ep, is_new) = pool
@@ -150,7 +155,10 @@ async fn udp_fast_path_hit_forwards_inline() {
         .unwrap();
     assert!(is_new);
 
-    assert!(udp_fast_path(&pool, b"hello", client, dst).await);
+    assert!(udp_fast_path(&pool, &stats, b"hello", client, dst).await);
+    let udp = stats.udp_snapshot();
+    assert_eq!(udp.endpoint_hits, 1);
+    assert_eq!(udp.endpoint_misses, 0);
 
     let mut buf = [0u8; 64];
     let (n, from) = tokio::time::timeout(Duration::from_secs(2), echo.recv_from(&mut buf))
@@ -166,6 +174,7 @@ async fn udp_fast_path_dns_goes_slow_even_with_endpoint() {
     // A real DNS query must reach the DNS controller even when an
     // endpoint exists for (client, dst) — today's order is DNS first.
     let pool = UdpEndpointPool::new();
+    let stats = StatsManager::new();
     let client = addr("10.0.0.1:12345");
     let dst = addr("203.0.113.1:53");
     let proxy = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -183,7 +192,10 @@ async fn udp_fast_path_dns_goes_slow_even_with_endpoint() {
         .unwrap();
     assert!(is_new);
 
-    assert!(!udp_fast_path(&pool, &dns_query_payload(), client, dst).await);
+    assert!(!udp_fast_path(&pool, &stats, &dns_query_payload(), client, dst).await);
+    let udp = stats.udp_snapshot();
+    assert_eq!(udp.endpoint_hits, 0);
+    assert_eq!(udp.endpoint_misses, 0);
 }
 
 #[tokio::test]
@@ -194,6 +206,7 @@ async fn udp_fast_path_non_dns_port53_forwards() {
     let echo_addr = echo.local_addr().unwrap();
     let proxy = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let pool = UdpEndpointPool::new();
+    let stats = StatsManager::new();
     let client = addr("10.0.0.1:12345");
     let dst = addr("203.0.113.1:53");
     let (_ep, is_new) = pool
@@ -210,7 +223,8 @@ async fn udp_fast_path_non_dns_port53_forwards() {
     assert!(is_new);
 
     let garbage = [0u8; 20]; // QR=0 but qdcount=0 — not a DNS query
-    assert!(udp_fast_path(&pool, &garbage, client, dst).await);
+    assert!(udp_fast_path(&pool, &stats, &garbage, client, dst).await);
+    assert_eq!(stats.udp_snapshot().endpoint_hits, 1);
 
     let mut buf = [0u8; 64];
     let (n, _) = tokio::time::timeout(Duration::from_secs(2), echo.recv_from(&mut buf))
@@ -223,21 +237,52 @@ async fn udp_fast_path_non_dns_port53_forwards() {
 #[tokio::test]
 async fn udp_fast_path_drops_internal_and_broadcast() {
     let pool = UdpEndpointPool::new();
+    let stats = StatsManager::new();
     let client = addr("10.0.0.1:12345");
     let dst = addr("203.0.113.1:443");
     // honk-internal subnets (v4 + v6), either direction.  The v6 check
     // must match the real dae0 addresses (fd00:686f:6e6b::1/2, see the
     // DAENS_* constants in the crate root).
-    assert!(udp_fast_path(&pool, b"hello", client, addr("169.254.0.11:8080")).await);
-    assert!(udp_fast_path(&pool, b"hello", addr("169.254.0.1:1234"), dst).await);
-    assert!(udp_fast_path(&pool, b"hello", client, addr("[fd00:686f:6e6b::1]:8080")).await);
-    assert!(udp_fast_path(&pool, b"hello", addr("[fd00:686f:6e6b::2]:1234"), dst).await);
+    assert!(udp_fast_path(&pool, &stats, b"hello", client, addr("169.254.0.11:8080")).await);
+    assert!(udp_fast_path(&pool, &stats, b"hello", addr("169.254.0.1:1234"), dst).await);
+    assert!(
+        udp_fast_path(
+            &pool,
+            &stats,
+            b"hello",
+            client,
+            addr("[fd00:686f:6e6b::1]:8080")
+        )
+        .await
+    );
+    assert!(
+        udp_fast_path(
+            &pool,
+            &stats,
+            b"hello",
+            addr("[fd00:686f:6e6b::2]:1234"),
+            dst
+        )
+        .await
+    );
     // Broadcast / multicast destinations.
-    assert!(udp_fast_path(&pool, b"hello", client, addr("255.255.255.255:67")).await);
-    assert!(udp_fast_path(&pool, b"hello", client, addr("192.168.1.255:67")).await);
-    assert!(udp_fast_path(&pool, b"hello", client, addr("239.255.255.250:1900")).await);
-    // Nothing was proxied or pooled.
+    assert!(udp_fast_path(&pool, &stats, b"hello", client, addr("255.255.255.255:67")).await);
+    assert!(udp_fast_path(&pool, &stats, b"hello", client, addr("192.168.1.255:67")).await);
+    assert!(
+        udp_fast_path(
+            &pool,
+            &stats,
+            b"hello",
+            client,
+            addr("239.255.255.250:1900")
+        )
+        .await
+    );
+    // Drops do not count as endpoint misses and nothing is pooled.
     assert!(pool.is_empty());
+    let udp = stats.udp_snapshot();
+    assert_eq!(udp.endpoint_hits, 0);
+    assert_eq!(udp.endpoint_misses, 0);
 }
 
 #[test]
@@ -373,4 +418,288 @@ fn domain_reality_same_family_wrong_ip_is_mismatch() {
         domain_reality_outcome(conn, &[], &[]),
         RealityOutcome::Mismatch
     );
+}
+
+#[derive(Debug, Clone)]
+enum UdpTestMode {
+    DialError,
+    SendError,
+    Success,
+    Hold {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    },
+}
+
+#[derive(Debug)]
+struct UdpTestTransport {
+    mode: UdpTestMode,
+    relay: SocketAddr,
+}
+
+#[async_trait::async_trait]
+impl honk_outbound::proxy::PacketTransport for UdpTestTransport {
+    fn relay_addr(&self) -> SocketAddr {
+        self.relay
+    }
+
+    async fn send_packet(&self, _data: &[u8]) -> std::io::Result<()> {
+        match self.mode {
+            UdpTestMode::SendError => Err(std::io::Error::other("first UDP send failed")),
+            _ => Ok(()),
+        }
+    }
+
+    async fn recv_packet(&self, _buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
+    }
+}
+
+#[derive(Debug)]
+struct UdpTestHandler {
+    mode: UdpTestMode,
+}
+
+#[async_trait::async_trait]
+impl honk_outbound::proxy::ProxyHandler for UdpTestHandler {
+    fn protocol(&self) -> honk_config::types::NodeProtocol {
+        honk_config::types::NodeProtocol::HTTP
+    }
+
+    async fn dial(
+        &self,
+        _node: &Node,
+        _target: SocketAddr,
+        _target_domain: Option<&str>,
+        _connect_timeout: Duration,
+    ) -> anyhow::Result<honk_outbound::proxy::ProxyStream> {
+        Err(anyhow::anyhow!(
+            "TCP dial is not used by the UDP lifecycle tests"
+        ))
+    }
+
+    async fn dial_udp_transport(
+        &self,
+        _node: &Node,
+        target: SocketAddr,
+        _target_domain: Option<&str>,
+        _connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn honk_outbound::proxy::PacketTransport>> {
+        if let UdpTestMode::Hold { entered, release } = &self.mode {
+            entered.notify_one();
+            release.notified().await;
+        }
+        match self.mode {
+            UdpTestMode::DialError => Err(anyhow::anyhow!("UDP dial failed")),
+            _ => Ok(Arc::new(UdpTestTransport {
+                mode: self.mode.clone(),
+                relay: target,
+            })),
+        }
+    }
+}
+
+fn udp_test_forwarder() -> Arc<crate::dns::forwarder::DnsForwarder> {
+    let router = Arc::new(
+        crate::dns::routing::DnsRouter::new(&honk_config::dns::DnsRouting {
+            rules: vec![],
+            fallback: "default".into(),
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    Arc::new(
+        crate::dns::forwarder::DnsForwarder::new(
+            Arc::new(crate::dns::upstream_pool::UpstreamPool::new(&[], router.clone()).unwrap()),
+            Arc::new(tokio::sync::Mutex::new(crate::dns::cache::DnsCache::new(1))),
+            router,
+        )
+        .with_cache_enabled(false),
+    )
+}
+
+fn udp_test_config(default_outbound: &str, nodes: Vec<Node>, groups: Vec<Group>) -> Config {
+    let mut config = Config::default();
+    config.nodes = nodes;
+    config.groups = groups;
+    config.routing.default_outbound = default_outbound.into();
+    config
+}
+
+fn udp_test_node() -> Node {
+    Node {
+        id: uuid::Uuid::new_v4(),
+        name: "udp-test".into(),
+        protocol: honk_config::types::NodeProtocol::HTTP,
+        address: "127.0.0.1".into(),
+        port: 9,
+        ..Default::default()
+    }
+}
+
+fn udp_test_handle(config: Config, mode: UdpTestMode, capacity: usize) -> ControlPlaneHandle {
+    let router = Router::new(&config.routing.rules, &config.routing.default_outbound).unwrap();
+    let mut registry = honk_outbound::proxy::ProxyRegistry::new();
+    registry.register(Box::new(UdpTestHandler { mode }));
+    let mut control_plane = ControlPlane::new(
+        config,
+        Box::new(crate::ebpf::mock::MockEbpfBackend::new()),
+        router,
+        Arc::new(registry),
+        DnsResolver::new(&honk_config::dns::DnsConfig::default()).unwrap(),
+        udp_test_forwarder(),
+    )
+    .unwrap();
+    control_plane.udp_pool = Arc::new(UdpEndpointPool::with_capacity_limit(capacity));
+    control_plane.spawn_handle()
+}
+
+async fn serve_test_udp(handle: &ControlPlaneHandle) -> anyhow::Result<()> {
+    handle
+        .serve_udp_connection(
+            Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            bytes::Bytes::from_static(b"UDP test packet"),
+            addr("10.0.0.2:53000"),
+            addr("203.0.113.2:443"),
+        )
+        .await
+}
+
+fn assert_udp_outbound(
+    stats: &Arc<StatsManager>,
+    outbound: &str,
+    total_connections: u32,
+    active_connections: u32,
+    errors: u32,
+) {
+    let snapshot = stats.snapshot();
+    let actual = snapshot
+        .get(outbound)
+        .unwrap_or_else(|| panic!("missing outbound stats for {outbound}"));
+    assert_eq!(actual.total_conns, total_connections);
+    assert_eq!(actual.active_conns, active_connections);
+    assert_eq!(actual.errors, errors);
+}
+
+#[tokio::test]
+async fn udp_stats_lifecycle_no_candidate_closes_guard_and_records_error() {
+    let config = udp_test_config(
+        "empty",
+        vec![],
+        vec![Group {
+            name: "empty".into(),
+            policy: honk_config::group::GroupPolicy::Selector,
+            ..Default::default()
+        }],
+    );
+    let handle = udp_test_handle(config, UdpTestMode::Success, 1);
+    let stats = handle.stats.clone();
+
+    serve_test_udp(&handle).await.unwrap();
+
+    assert_udp_outbound(&stats, "empty", 1, 0, 1);
+    let udp = stats.udp_snapshot();
+    assert_eq!(udp.route_latency.count, 1);
+    assert_eq!(udp.dial_latency.count, 0);
+}
+
+#[tokio::test]
+async fn udp_stats_lifecycle_dial_error_closes_guard_and_samples_dial() {
+    let config = udp_test_config("udp-test", vec![udp_test_node()], vec![]);
+    let handle = udp_test_handle(config, UdpTestMode::DialError, 1);
+    let stats = handle.stats.clone();
+
+    serve_test_udp(&handle).await.unwrap();
+
+    assert_udp_outbound(&stats, "udp-test", 1, 0, 1);
+    let udp = stats.udp_snapshot();
+    assert_eq!(udp.route_latency.count, 1);
+    assert_eq!(udp.dial_latency.count, 1);
+}
+
+#[tokio::test]
+async fn udp_stats_lifecycle_capacity_after_send_closes_guard() {
+    let config = udp_test_config("udp-test", vec![udp_test_node()], vec![]);
+    let handle = udp_test_handle(config, UdpTestMode::Success, 0);
+    let stats = handle.stats.clone();
+
+    serve_test_udp(&handle).await.unwrap();
+
+    assert_udp_outbound(&stats, "udp-test", 1, 0, 0);
+}
+
+#[tokio::test]
+async fn udp_stats_lifecycle_first_send_error_closes_guard_and_records_error() {
+    let config = udp_test_config("udp-test", vec![udp_test_node()], vec![]);
+    let handle = udp_test_handle(config, UdpTestMode::SendError, 1);
+    let stats = handle.stats.clone();
+
+    assert!(serve_test_udp(&handle).await.is_err());
+
+    assert_udp_outbound(&stats, "udp-test", 1, 0, 1);
+}
+
+#[tokio::test]
+async fn udp_stats_lifecycle_slow_future_cancellation_drops_guard_without_error() {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let config = udp_test_config("udp-test", vec![udp_test_node()], vec![]);
+    let handle = udp_test_handle(
+        config,
+        UdpTestMode::Hold {
+            entered: entered.clone(),
+            release,
+        },
+        1,
+    );
+    let stats = handle.stats.clone();
+    let task = tokio::spawn(async move { serve_test_udp(&handle).await });
+
+    tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .expect("production slow path did not reach the injected dialer");
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+
+    assert_udp_outbound(&stats, "udp-test", 1, 0, 0);
+}
+
+#[tokio::test]
+async fn udp_stats_lifecycle_success_and_reply_eof_close_guard() {
+    let config = udp_test_config("udp-test", vec![udp_test_node()], vec![]);
+    let handle = udp_test_handle(config, UdpTestMode::Success, 1);
+    let stats = handle.stats.clone();
+
+    serve_test_udp(&handle).await.unwrap();
+    tokio::task::yield_now().await;
+
+    assert_udp_outbound(&stats, "udp-test", 1, 0, 0);
+}
+
+#[tokio::test]
+async fn udp_stats_lifecycle_slow_permit_full_rejects_without_outbound_total() {
+    // Exercise the production admission helper used by the accept-loop slow
+    // path. A full semaphore must bump only udp.slowPermit.rejected and must
+    // never open an outbound connection counter.
+    let stats = Arc::new(StatsManager::new());
+    let full = Arc::new(tokio::sync::Semaphore::new(0));
+
+    assert!(super::try_admit_udp_slow_path(&stats, &full).is_none());
+
+    assert!(stats.snapshot().is_empty());
+    let udp = stats.udp_snapshot();
+    assert_eq!(udp.slow_permit_rejected, 1);
+    assert_eq!(udp.slow_permit_accepted, 0);
+    assert_eq!(udp.slow_permit_closed, 0);
+    assert_eq!(udp.queue_accepted, 0);
+    assert_eq!(udp.queue_full, 0);
+    assert_eq!(udp.queue_closed, 0);
+
+    let open = Arc::new(tokio::sync::Semaphore::new(1));
+    let permit = super::try_admit_udp_slow_path(&stats, &open).expect("slow path should admit");
+    drop(permit);
+    let udp = stats.udp_snapshot();
+    assert_eq!(udp.slow_permit_accepted, 1);
+    assert_eq!(udp.slow_permit_rejected, 1);
+    assert!(stats.snapshot().is_empty());
 }

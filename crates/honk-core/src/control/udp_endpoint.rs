@@ -355,6 +355,9 @@ type EndpointRemoval = (SocketAddr, SocketAddr, Option<String>);
 /// Pool of UDP endpoints with LRU-like eviction.
 pub struct UdpEndpointPool {
     endpoints: DashMap<EndpointKey, Arc<UdpEndpoint>>,
+    /// Immutable per-pool cap. Production keeps [`MAX_ENDPOINTS`]; tests can
+    /// inject a smaller cap to exercise the real slow-path capacity branch.
+    capacity_limit: usize,
     /// Sink notified whenever an endpoint is removed; the control plane uses
     /// it to retire the flow's conntrack entries promptly instead of waiting
     /// for the datapath/janitor timeouts, and to drop the flow from the
@@ -364,8 +367,16 @@ pub struct UdpEndpointPool {
 
 impl UdpEndpointPool {
     pub fn new() -> Self {
+        Self::with_capacity_limit(MAX_ENDPOINTS)
+    }
+
+    /// Construct a pool with a deterministic capacity limit. This is an
+    /// injection seam for lifecycle tests; normal control-plane construction
+    /// always calls [`Self::new`] and retains the 8192-endpoint production cap.
+    pub fn with_capacity_limit(capacity_limit: usize) -> Self {
         Self {
             endpoints: DashMap::new(),
+            capacity_limit,
             remove_sink: std::sync::Mutex::new(None),
         }
     }
@@ -411,11 +422,11 @@ impl UdpEndpointPool {
         // entry's write lock. At the cap, existing mappings still refresh;
         // only brand-new ones are refused (a few over-shoot under races is
         // fine for a flood ceiling).
-        if self.endpoints.len() >= MAX_ENDPOINTS {
+        if self.endpoints.len() >= self.capacity_limit {
             return self.get(client, dst).map(|ep| (ep, false)).or_else(|| {
                 debug!(
                     "UDP endpoint pool at capacity ({}); dropping new mapping {} -> {}",
-                    MAX_ENDPOINTS, client, dst
+                    self.capacity_limit, client, dst
                 );
                 None
             });

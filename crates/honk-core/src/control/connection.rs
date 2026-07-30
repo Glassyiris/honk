@@ -1250,6 +1250,9 @@ impl ControlPlaneHandle {
             return Ok(());
         }
 
+        // Only cold setup is timed: the accept-loop fast path returned above
+        // before any clock read or dynamic per-flow metric work.
+        let route_started_at = std::time::Instant::now();
         let tuples = build_tuples_key(
             original_dst.ip(),
             original_dst.port(),
@@ -1302,7 +1305,9 @@ impl ControlPlaneHandle {
                 .map(|m| (m.rule_type.to_string(), m.rule_payload.to_string()))
         };
 
-        self.stats.record_connection(&outbound_name);
+        self.stats
+            .record_udp_route_latency(route_started_at.elapsed());
+        let _connection_guard = self.stats.track_connection(&outbound_name);
 
         let config = self.config.read().await;
         let ipver = if original_dst.is_ipv6() {
@@ -1329,7 +1334,6 @@ impl ControlPlaneHandle {
                 self.alive_set.notify_check_tcp(&node_name);
             }
             self.stats.record_error(&outbound_name);
-            self.stats.record_close(&outbound_name);
             return Ok(());
         }
 
@@ -1340,14 +1344,20 @@ impl ControlPlaneHandle {
         // candidate's UDP ASSOCIATE is rejected.
         let mut last_err: Option<anyhow::Error> = None;
         for node in &candidates {
-            match self
+            let dial_started_at = std::time::Instant::now();
+            let dial_result = self
                 .proxy_registry
                 .dial_udp_transport(node, original_dst, None, connect_timeout)
-                .await
-            {
+                .await;
+            self.stats
+                .record_udp_dial_latency(dial_started_at.elapsed());
+            match dial_result {
                 Ok(transport) => {
                     let relay_addr = transport.relay_addr();
-                    transport.send_packet(&data).await?;
+                    if let Err(error) = transport.send_packet(&data).await {
+                        self.stats.record_error(&outbound_name);
+                        return Err(error.into());
+                    }
                     let client_to_proxy: u64 = data.len() as u64;
 
                     let Some((endpoint, is_new)) = self.udp_pool.get_or_create(
@@ -1430,7 +1440,6 @@ impl ControlPlaneHandle {
                     }
 
                     self.stats.record_bytes(&outbound_name, client_to_proxy, 0);
-                    self.stats.record_close(&outbound_name);
                     return Ok(());
                 }
                 Err(e) => {
@@ -1458,7 +1467,6 @@ impl ControlPlaneHandle {
             debug!("All {} UDP candidate(s) failed: {}", candidates.len(), e);
         }
         self.stats.record_error(&outbound_name);
-        self.stats.record_close(&outbound_name);
         Ok(())
     }
 

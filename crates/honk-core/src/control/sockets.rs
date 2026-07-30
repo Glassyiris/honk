@@ -850,12 +850,14 @@ pub(super) fn might_be_dns_query(data: &[u8]) -> bool {
 /// (`serve_udp_connection`): new-flow setup or a possible DNS query.
 ///
 /// Semantics match the endpoint-reuse branch of `serve_udp_connection`
-/// (same drop pre-checks, `mark_sent`/`refresh`, no stats accounting);
-/// skipping the QUIC sniffer on hits is safe because an established
+/// (same drop pre-checks and `mark_sent`/`refresh`), while this function is
+/// the sole production owner of endpoint hit/miss accounting. Skipping the
+/// QUIC sniffer on hits is safe because an established
 /// endpoint means routing for this flow was already decided when its first
 /// packet took the slow path.
 pub(super) async fn udp_fast_path(
     udp_pool: &UdpEndpointPool,
+    stats: &StatsManager,
     data: &[u8],
     client_addr: SocketAddr,
     original_dst: SocketAddr,
@@ -886,8 +888,10 @@ pub(super) async fn udp_fast_path(
     // Only established flows are forwarded inline; a miss means a new flow
     // whose first packet needs the slow path (sniff, handoff, route, dial).
     let Some(ep) = udp_pool.get(client_addr, original_dst) else {
+        stats.record_udp_endpoint_miss();
         return false;
     };
+    stats.record_udp_endpoint_hit();
 
     debug!("UDP endpoint reuse for {} -> {}", client_addr, original_dst);
     // Routing-cache probe: preserves the lazy TTL invalidation side effect

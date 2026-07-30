@@ -1230,3 +1230,47 @@ async fn test_store_dns_persister_end_to_end() {
         .unwrap();
     assert_eq!(resp, a_record_response([1, 2, 3, 4], 300));
 }
+
+#[tokio::test]
+async fn stats_exposes_udp_metrics() {
+    let app = spawn_app("", "").await;
+    app.state.stats.record_udp_endpoint_hit();
+    app.state.stats.record_udp_slow_permit_accepted();
+
+    let body: serde_json::Value = http_client()
+        .get(app.url("/stats"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // UDP is additive: existing dashboard keys retain their shapes.
+    assert!(body["outbounds"].is_array());
+    assert!(body["pool"].is_object());
+
+    let udp = &body["udp"];
+    assert_eq!(udp["endpoint"]["hits"], 1);
+    assert_eq!(udp["endpoint"]["misses"], 0);
+    assert_eq!(udp["slowPermit"]["accepted"], 1);
+    assert_eq!(udp["slowPermit"]["rejected"], 0);
+    assert_eq!(udp["slowPermit"]["closed"], 0);
+    // Endpoint-driver queue metrics are defined now but are Task 3-owned.
+    assert_eq!(udp["queue"]["accepted"], 0);
+    assert_eq!(udp["queue"]["full"], 0);
+    assert_eq!(udp["queue"]["closed"], 0);
+    assert_eq!(udp["capacity"]["rejected"], 0);
+    assert_eq!(udp["firstSend"]["failures"], 0);
+    assert_eq!(udp["latency"]["route"]["count"], 0);
+    assert_eq!(udp["latency"]["dial"]["count"], 0);
+    assert_eq!(udp["latency"]["replyReady"]["count"], 0);
+    assert_eq!(udp["latency"]["firstSend"]["count"], 0);
+    assert_eq!(udp["latency"]["firstReply"]["count"], 0);
+    assert_eq!(udp["stagger"]["attempts"], 0);
+    assert_eq!(udp["stagger"]["winners"], 0);
+    assert_eq!(udp["stagger"]["cancellations"], 0);
+    assert_eq!(udp["warm"]["attempts"], 0);
+    assert_eq!(udp["warm"]["successes"], 0);
+    assert_eq!(udp["warm"]["failures"], 0);
+}
