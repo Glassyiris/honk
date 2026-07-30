@@ -57,6 +57,30 @@ pub enum DnsForwardError {
     RejectedPlanEscaped,
 }
 
+#[derive(Debug, Error)]
+enum AsIsExchangeError {
+    #[error("create asis UDP socket: {source}")]
+    Socket {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("configure asis UDP socket as nonblocking: {source}")]
+    Nonblocking {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("apply asis UDP bypass mark: {source}")]
+    BypassMark {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("bind asis UDP socket: {source}")]
+    Bind {
+        #[source]
+        source: std::io::Error,
+    },
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum ResolveMode {
     Strict,
@@ -553,31 +577,17 @@ impl DnsForwarder {
         };
 
         debug!("DNS forwarder: asis dial {}", dst);
-        let domain = if dst.is_ipv4() {
-            socket2::Domain::IPV4
-        } else {
-            socket2::Domain::IPV6
-        };
-        let sock2 =
-            socket2::Socket::new(domain, socket2::Type::DGRAM, None).context("asis socket")?;
-        sock2.set_nonblocking(true).context("asis nonblocking")?;
-        #[cfg(target_os = "linux")]
-        {
-            let _ = sock2.set_mark(DAE_BYPASS_MARK);
-        }
-        sock2
-            .bind(
-                &SocketAddr::new(
-                    if dst.is_ipv4() {
-                        IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
-                    } else {
-                        IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
-                    },
-                    0,
-                )
-                .into(),
-            )
-            .context("asis bind")?;
+        let sock2 = new_asis_socket_with_mark(dst, |socket| {
+            #[cfg(target_os = "linux")]
+            {
+                honk_outbound::util::set_mark_best_effort(socket, DAE_BYPASS_MARK)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = socket;
+                Ok(())
+            }
+        })?;
         let socket = tokio::net::UdpSocket::from_std(sock2.into()).context("asis from_std")?;
         socket.connect(dst).await.context("asis connect")?;
 
@@ -619,6 +629,35 @@ impl DnsForwarder {
             });
         }
     }
+}
+
+fn new_asis_socket_with_mark(
+    destination: SocketAddr,
+    mark: impl FnOnce(&socket2::Socket) -> std::io::Result<()>,
+) -> Result<socket2::Socket, AsIsExchangeError> {
+    let domain = if destination.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, None)
+        .map_err(|source| AsIsExchangeError::Socket { source })?;
+    socket
+        .set_nonblocking(true)
+        .map_err(|source| AsIsExchangeError::Nonblocking { source })?;
+    mark(&socket).map_err(|source| AsIsExchangeError::BypassMark { source })?;
+    let bind_address = SocketAddr::new(
+        if destination.is_ipv4() {
+            IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+        } else {
+            IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+        },
+        0,
+    );
+    socket
+        .bind(&bind_address.into())
+        .map_err(|source| AsIsExchangeError::Bind { source })?;
+    Ok(socket)
 }
 
 /// Build a minimal DNS query for the given domain and query type.
@@ -1009,6 +1048,43 @@ mod tests {
             })
             .expect("test router"),
         )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn asis_socket_tolerates_only_permission_denied_mark_failure() {
+        // Given
+        let destination = SocketAddr::from(([127, 0, 0, 1], 53));
+
+        // When
+        let socket = new_asis_socket_with_mark(destination, |_| {
+            honk_outbound::util::set_mark_result_best_effort(Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected EPERM",
+            )))
+        });
+
+        // Then
+        assert!(socket.is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn asis_socket_propagates_non_permission_mark_failure_as_typed_error() {
+        // Given
+        let destination = SocketAddr::from(([127, 0, 0, 1], 53));
+
+        // When
+        let error = new_asis_socket_with_mark(destination, |_| {
+            honk_outbound::util::set_mark_result_best_effort(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "injected EINVAL",
+            )))
+        })
+        .expect_err("non-EPERM mark failure");
+
+        // Then
+        assert!(matches!(error, AsIsExchangeError::BypassMark { .. }));
     }
 
     /// Build an A-record response for example.com with a given IP and TTL.

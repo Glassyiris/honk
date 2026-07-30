@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use honk_config::Config;
+use honk_outbound::bootstrap::BootstrapResolver;
 
 use super::{
     DnsRuntime, DnsRuntimeParts, DnsServiceProvider, MAX_RETIRED_RUNTIMES,
@@ -24,6 +25,45 @@ impl DnsUpstreamPool for UnusedPool {
     async fn query(&self, _upstream_name: &str, _raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
         anyhow::bail!("test upstream is unused")
     }
+}
+
+struct LazyBootstrapPool {
+    resolver: BootstrapResolver,
+    entered: Option<Arc<Notify>>,
+    release: Option<Arc<Notify>>,
+}
+
+#[async_trait]
+impl DnsUpstreamPool for LazyBootstrapPool {
+    async fn query(&self, _upstream_name: &str, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+        if let Some(entered) = &self.entered {
+            entered.notify_one();
+        }
+        if let Some(release) = &self.release {
+            release.notified().await;
+        }
+        let ip = honk_outbound::bootstrap::resolve_with(Some(self.resolver), "runtime.test")
+            .await?
+            .into_iter()
+            .find_map(|ip| match ip {
+                std::net::IpAddr::V4(ip) => Some(ip),
+                std::net::IpAddr::V6(_) => None,
+            })
+            .ok_or_else(|| anyhow::anyhow!("test resolver returned no IPv4 address"))?;
+        let mut response = raw_query.to_vec();
+        response[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
+        response[6..8].copy_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&[
+            0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04,
+        ]);
+        response.extend_from_slice(&ip.octets());
+        Ok(response)
+    }
+}
+
+#[async_trait]
+impl RuntimeTransport for LazyBootstrapPool {
+    async fn close(&self) {}
 }
 
 #[derive(Default)]
@@ -73,6 +113,41 @@ fn runtime(generation: u64, _route_count: usize) -> (Arc<DnsRuntime>, Arc<Observ
     (runtime, transport)
 }
 
+fn runtime_with_bootstrap_pool(generation: u64, pool: Arc<LazyBootstrapPool>) -> Arc<DnsRuntime> {
+    let mut config = Config::default();
+    config.dns.routing.fallback = "generation".to_owned();
+    let dns_router =
+        Arc::new(DnsRouter::new_from_dns_config(&config.dns).expect("valid test DNS config"));
+    let cache = Arc::new(Mutex::new(DnsCache::new(32)));
+    let forwarder = Arc::new(
+        DnsForwarder::new(
+            Arc::clone(&pool) as Arc<dyn DnsUpstreamPool>,
+            Arc::clone(&cache),
+            dns_router,
+        )
+        .with_cache_enabled(false),
+    );
+    let router = Arc::new(
+        Router::new(&config.routing.rules, &config.routing.default_outbound)
+            .expect("valid default router"),
+    );
+    DnsRuntime::new(DnsRuntimeParts {
+        generation: RuntimeGeneration::new(generation),
+        forwarder,
+        router: Arc::clone(&router),
+        group_manager: Arc::new(GroupManager::new(&config.groups, &config.nodes)),
+        policy_id: PolicyId::from_config(&config.dns).expect("valid policy"),
+        routing_projection: Arc::new(RoutingProjectionSnapshot::new(
+            generation,
+            router,
+            Default::default(),
+        )),
+        cache: Arc::clone(&cache),
+        persistence: super::ProcessPersistenceHandle::new(cache),
+        transport: pool,
+    })
+}
+
 #[tokio::test]
 async fn old_dns_request_keeps_generation_snapshots_after_publication() {
     // Given: a request has leased the old runtime generation.
@@ -105,6 +180,76 @@ async fn old_dns_request_keeps_generation_snapshots_after_publication() {
         &old_groups
     ));
     assert_eq!(old_transport.closes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn lazy_bootstrap_resolution_stays_pinned_to_the_runtime_lease() {
+    // Given
+    let old_server = spawn_bootstrap_server([192, 0, 2, 10]).await;
+    let new_server = spawn_bootstrap_server([198, 51, 100, 20]).await;
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let old_pool = Arc::new(LazyBootstrapPool {
+        resolver: BootstrapResolver::parse(&format!("udp://{old_server}")).unwrap(),
+        entered: Some(Arc::clone(&entered)),
+        release: Some(Arc::clone(&release)),
+    });
+    let new_pool = Arc::new(LazyBootstrapPool {
+        resolver: BootstrapResolver::parse(&format!("udp://{new_server}")).unwrap(),
+        entered: None,
+        release: None,
+    });
+    let provider = Arc::new(DnsServiceProvider::new(runtime_with_bootstrap_pool(
+        1, old_pool,
+    )));
+    let old_lease = provider.acquire();
+    let query = crate::dns::forwarder::build_dns_query("example.com", 1);
+    let old_query = {
+        let query = query.clone();
+        tokio::spawn(async move { old_lease.runtime().forwarder().resolve(&query).await })
+    };
+    entered.notified().await;
+
+    // When
+    provider.publish(runtime_with_bootstrap_pool(2, new_pool));
+    let new_lease = provider.acquire();
+    let new_response = new_lease
+        .runtime()
+        .forwarder()
+        .resolve(&query)
+        .await
+        .unwrap();
+    release.notify_one();
+    let old_response = old_query.await.unwrap().unwrap();
+
+    // Then
+    assert_eq!(&old_response[old_response.len() - 4..], &[192, 0, 2, 10]);
+    assert_eq!(&new_response[new_response.len() - 4..], &[198, 51, 100, 20]);
+    provider.shutdown().await;
+}
+
+async fn spawn_bootstrap_server(ip: [u8; 4]) -> std::net::SocketAddr {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let address = socket.local_addr().unwrap();
+    tokio::spawn(async move {
+        for _ in 0..2 {
+            let mut query = [0u8; 512];
+            let (length, peer) = socket.recv_from(&mut query).await.unwrap();
+            let query = &query[..length];
+            let qtype = u16::from_be_bytes([query[length - 4], query[length - 3]]);
+            let mut response = query.to_vec();
+            response[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
+            response[6..8].copy_from_slice(&u16::from(qtype == 1).to_be_bytes());
+            if qtype == 1 {
+                response.extend_from_slice(&[
+                    0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04,
+                ]);
+                response.extend_from_slice(&ip);
+            }
+            socket.send_to(&response, peer).await.unwrap();
+        }
+    });
+    address
 }
 
 #[tokio::test]

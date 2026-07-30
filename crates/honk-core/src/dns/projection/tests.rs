@@ -235,8 +235,14 @@ fn projection_for_test(snapshot: Arc<RoutingProjectionSnapshot>) -> TestProjecti
     (
         RoutingProjection {
             state: parking_lot::Mutex::new(DesiredState::new(snapshot, 10_000)),
-            wake,
+            wake: parking_lot::Mutex::new(Some(wake)),
             counters,
+            worker: parking_lot::Mutex::new(None),
+            lifecycle: {
+                let lifecycle = super::ProjectionLifecycle::running();
+                lifecycle.finish();
+                lifecycle
+            },
         },
         receiver,
         Arc::new(tokio::sync::RwLock::new(Box::new(MockEbpfBackend::new()))),

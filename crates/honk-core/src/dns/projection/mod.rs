@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use honk_ebpf_common::DomainRouting;
@@ -108,8 +108,47 @@ pub(crate) struct ProjectionCounterSnapshot {
 
 pub(crate) struct RoutingProjection {
     state: parking_lot::Mutex<DesiredState>,
-    wake: tokio::sync::mpsc::Sender<()>,
+    wake: parking_lot::Mutex<Option<tokio::sync::mpsc::Sender<()>>>,
     counters: Arc<ProjectionCounters>,
+    worker: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    lifecycle: Arc<ProjectionLifecycle>,
+}
+
+struct ProjectionLifecycle {
+    terminated: AtomicBool,
+    termination: tokio::sync::Notify,
+}
+
+impl ProjectionLifecycle {
+    fn running() -> Arc<Self> {
+        Arc::new(Self {
+            terminated: AtomicBool::new(false),
+            termination: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn finish(&self) {
+        self.terminated.store(true, Ordering::Release);
+        self.termination.notify_waiters();
+    }
+
+    async fn wait(&self) {
+        loop {
+            let terminated = self.termination.notified();
+            if self.terminated.load(Ordering::Acquire) {
+                return;
+            }
+            terminated.await;
+        }
+    }
+}
+
+struct TerminationGuard(Arc<ProjectionLifecycle>);
+
+impl Drop for TerminationGuard {
+    fn drop(&mut self) {
+        self.0.finish();
+    }
 }
 
 impl RoutingProjection {
@@ -119,17 +158,21 @@ impl RoutingProjection {
     ) -> Arc<Self> {
         let (wake, receiver) = tokio::sync::mpsc::channel(1);
         let counters = Arc::new(ProjectionCounters::default());
+        let lifecycle = ProjectionLifecycle::running();
         let projection = Arc::new(Self {
             state: parking_lot::Mutex::new(DesiredState::new(snapshot, DEFAULT_DOMAIN_CAPACITY)),
-            wake,
+            wake: parking_lot::Mutex::new(Some(wake)),
             counters: Arc::clone(&counters),
+            worker: parking_lot::Mutex::new(None),
+            lifecycle: Arc::clone(&lifecycle),
         });
-        tokio::spawn(worker::run(
-            Arc::downgrade(&projection),
-            receiver,
-            ebpf,
-            counters,
-        ));
+        let guard = TerminationGuard(lifecycle);
+        let projection_worker = Arc::downgrade(&projection);
+        let handle = tokio::spawn(async move {
+            let _guard = guard;
+            worker::run(projection_worker, receiver, ebpf, counters).await;
+        });
+        projection.worker.lock().replace(handle);
         projection
     }
 
@@ -166,14 +209,59 @@ impl RoutingProjection {
         self.counters.snapshot()
     }
 
+    pub(crate) async fn shutdown(&self) {
+        self.wake.lock().take();
+        let handle = self.worker.lock().take();
+        if let Some(handle) = handle {
+            let _ = handle.await;
+        } else {
+            self.lifecycle.wait().await;
+        }
+    }
+
     fn mutate(&self, operation: impl FnOnce(&mut DesiredState) -> u64) {
         let counter_delta = operation(&mut self.state.lock());
         self.counters
             .evictions
             .fetch_add(counter_delta, Ordering::Relaxed);
-        if self.wake.try_send(()).is_err() {
+        self.notify_worker();
+    }
+
+    fn notify_worker(&self) {
+        let Some(wake) = self.wake.lock().as_ref().cloned() else {
+            return;
+        };
+        if wake.try_send(()).is_err() {
             self.counters.wake_coalesced.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    #[cfg(test)]
+    fn termination_probe_for_test(&self) -> ProjectionTerminationProbe {
+        ProjectionTerminationProbe(Arc::clone(&self.lifecycle))
+    }
+}
+
+impl Drop for RoutingProjection {
+    fn drop(&mut self) {
+        self.wake.get_mut().take();
+        if let Some(handle) = self.worker.get_mut().take() {
+            handle.abort();
+        }
+    }
+}
+
+#[cfg(test)]
+struct ProjectionTerminationProbe(Arc<ProjectionLifecycle>);
+
+#[cfg(test)]
+impl ProjectionTerminationProbe {
+    fn is_terminated(&self) -> bool {
+        self.0.terminated.load(Ordering::Acquire)
+    }
+
+    async fn wait(&self) {
+        self.0.wait().await;
     }
 }
 

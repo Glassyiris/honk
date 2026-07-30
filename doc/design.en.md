@@ -243,9 +243,9 @@ the old generation while new requests use the replacement; retirement closes
 stalled generations at the deadline and caps retained generations. Pooled
 transports single-flight initialization and close idle sessions exactly once.
 Cache, flight, persistence, runtime, transport, projection, and outcome
-diagnostics use an internal coherent counter snapshot: writers and readers
-acquire the same `AtomicBool` gate, and its Acquire lock plus Release RAII
-unlock makes relaxed counter updates visible as one critical section.
+diagnostics use independent monotonic atomic counters. An internal scrape
+loads each counter without blocking request writers; it is best-effort rather
+than one coherent instant, so cross-counter invariants must not be inferred.
 Structured failure logs expose only bounded `error_kind` classes
 (forwarder, persistence, projection, and transport) plus bounded fields such
 as the transport label; they omit query names, upstream addresses, and

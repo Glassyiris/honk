@@ -1,5 +1,5 @@
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 mod snapshot;
 pub(crate) use snapshot::DnsStatsSnapshot;
@@ -32,7 +32,6 @@ pub(crate) enum DnsStatEvent {
 
 #[derive(Default)]
 struct DnsStats {
-    writer: AtomicBool,
     cache_hit: AtomicU64,
     cache_miss: AtomicU64,
     cache_stale: AtomicU64,
@@ -61,42 +60,7 @@ static DNS_STATS: LazyLock<DnsStats> = LazyLock::new(DnsStats::default);
 
 impl DnsStats {
     fn record(&self, event: DnsStatEvent) {
-        self.write(|| {
-            self.counter(event).fetch_add(1, Ordering::Relaxed);
-        });
-    }
-
-    #[cfg(test)]
-    fn record_pair_for_test(&self, first: DnsStatEvent, second: DnsStatEvent) {
-        self.write(|| {
-            self.counter(first).fetch_add(1, Ordering::Relaxed);
-            self.counter(second).fetch_add(1, Ordering::Relaxed);
-        });
-    }
-
-    fn write(&self, update: impl FnOnce()) {
-        let _guard = self.lock();
-        update();
-    }
-
-    fn lock(&self) -> DnsStatsGuard<'_> {
-        let mut spins = 0;
-        while self
-            .writer
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            if spins < 16 {
-                std::hint::spin_loop();
-                spins += 1;
-            } else {
-                std::thread::yield_now();
-                spins = 0;
-            }
-        }
-        DnsStatsGuard {
-            writer: &self.writer,
-        }
+        self.counter(event).fetch_add(1, Ordering::Relaxed);
     }
 
     fn counter(&self, event: DnsStatEvent) -> &AtomicU64 {
@@ -127,15 +91,9 @@ impl DnsStats {
     }
 
     fn snapshot(&self) -> DnsStatsSnapshot {
-        // The gate's acquire synchronizes with the preceding release. Holding
-        // it while loading every relaxed counter makes the returned values one
-        // coherent snapshot and prevents a writer from publishing half an
-        // update.
-        let _guard = self.lock();
-        self.load_snapshot()
-    }
-
-    fn load_snapshot(&self) -> DnsStatsSnapshot {
+        // Each field is an independent monotonic event counter. This scrape is
+        // best-effort: concurrent records may become visible between loads, so
+        // callers must not infer cross-counter invariants from one snapshot.
         DnsStatsSnapshot {
             cache_hit: self.cache_hit.load(Ordering::Relaxed),
             cache_miss: self.cache_miss.load(Ordering::Relaxed),
@@ -165,16 +123,6 @@ impl DnsStats {
     }
 }
 
-struct DnsStatsGuard<'a> {
-    writer: &'a AtomicBool,
-}
-
-impl Drop for DnsStatsGuard<'_> {
-    fn drop(&mut self) {
-        self.writer.store(false, Ordering::Release);
-    }
-}
-
 pub(crate) fn record_dns_event(event: DnsStatEvent) {
     DNS_STATS.record(event);
 }
@@ -193,75 +141,50 @@ pub(crate) fn dns_snapshot() -> DnsStatsSnapshot {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     use super::{DnsStatEvent, DnsStats};
 
     #[test]
-    fn concurrent_snapshot_never_observes_half_of_a_serialized_update() {
-        let stats = Arc::new(DnsStats::default());
-        let done = Arc::new(AtomicBool::new(false));
-        let writer_stats = Arc::clone(&stats);
-        let writer_done = Arc::clone(&done);
-        let writer = std::thread::spawn(move || {
-            for _ in 0..100_000 {
-                writer_stats.record_pair_for_test(DnsStatEvent::CacheHit, DnsStatEvent::CacheMiss);
-            }
-            writer_done.store(true, Ordering::Release);
-        });
+    fn record_increments_only_the_selected_counter() {
+        let stats = DnsStats::default();
+        let before = stats.snapshot();
 
-        while !done.load(Ordering::Acquire) {
-            let snapshot = stats.snapshot();
-            assert_eq!(snapshot.cache_hit, snapshot.cache_miss);
-        }
-        writer.join().expect("writer");
-        let snapshot = stats.snapshot();
-        assert_eq!(snapshot.cache_hit, 100_000);
-        assert_eq!(snapshot.cache_miss, 100_000);
+        stats.record(DnsStatEvent::CacheHit);
+
+        let delta = stats.snapshot().delta(before);
+        assert_eq!(delta.cache_hit, 1);
+        assert_eq!(delta.cache_miss, 0);
     }
 
     #[test]
-    fn cancelled_reader_releases_gate_and_multiple_writers_make_progress() {
+    fn concurrent_records_are_monotonic_without_cross_counter_coherence() {
         const WRITERS: u64 = 4;
         const WRITES_PER_THREAD: u64 = 25_000;
 
         let stats = Arc::new(DnsStats::default());
-        let cancel_reader = Arc::new(AtomicBool::new(false));
-        let reader_iterations = Arc::new(AtomicU64::new(0));
-        let reader_stats = Arc::clone(&stats);
-        let reader_cancel = Arc::clone(&cancel_reader);
-        let iterations = Arc::clone(&reader_iterations);
-        let reader = std::thread::spawn(move || {
-            while !reader_cancel.load(Ordering::Acquire) {
-                let snapshot = reader_stats.snapshot();
-                assert_eq!(snapshot.cache_hit, snapshot.cache_miss);
-                iterations.fetch_add(1, Ordering::Relaxed);
-            }
-        });
-
         let writers: Vec<_> = (0..WRITERS)
             .map(|_| {
                 let stats = Arc::clone(&stats);
                 std::thread::spawn(move || {
                     for _ in 0..WRITES_PER_THREAD {
-                        stats.record_pair_for_test(DnsStatEvent::CacheHit, DnsStatEvent::CacheMiss);
+                        stats.record(DnsStatEvent::CacheHit);
                     }
                 })
             })
             .collect();
 
-        while reader_iterations.load(Ordering::Relaxed) < 100 {
-            std::thread::yield_now();
+        let mut earlier = stats.snapshot().cache_hit;
+        for _ in 0..100 {
+            let current = stats.snapshot().cache_hit;
+            assert!(current >= earlier);
+            earlier = current;
         }
-        cancel_reader.store(true, Ordering::Release);
-        reader.join().expect("reader");
         for writer in writers {
             writer.join().expect("writer");
         }
 
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.cache_hit, WRITERS * WRITES_PER_THREAD);
-        assert_eq!(snapshot.cache_miss, WRITERS * WRITES_PER_THREAD);
-        assert!(reader_iterations.load(Ordering::Relaxed) >= 100);
+        assert_eq!(snapshot.cache_miss, 0);
     }
 }

@@ -404,10 +404,10 @@ flags、EDNS option（包括 ECS/COOKIE）、EDNS-v1 与多问题消息绕过这
 完整 generation。lease 让旧请求排空；退役 deadline 与保留 generation 上限约束关闭，
 transport 初始化/关闭使用 singleflight 且幂等。
 
-内部一致快照覆盖 hit/miss/stale、flight 饱和/取消/重试、持久化丢弃/flush 失败、
-runtime 退役、transport 初始化/重置、投影失败/重试和结果分类。writer 与 snapshot
-reader 获取同一个 `AtomicBool` gate；Acquire lock 与 Release RAII unlock 让 relaxed
-counter 更新作为一个一致临界区可见。失败日志使用有界 `error_kind`：
+相互独立、单调递增的 counter 覆盖 hit/miss/stale、flight 饱和/取消/重试、
+持久化丢弃/flush 失败、runtime 退役、transport 初始化/重置、投影失败/重试和
+结果分类。记录不会等待 shared gate；内部 best-effort scrape 逐项读取，不提供
+counter 之间的一致性。失败日志使用有界 `error_kind`：
 forwarder 为 `engine`/`exchange`/`response`/`internal`/`rejected_plan`，持久化为
 `worker_closed`/`ack_dropped`/`worker_failed`/`database`，投影为
 `map_full`/`backend_write`，transport 为 `exchange_failed` 并带有界 transport label。

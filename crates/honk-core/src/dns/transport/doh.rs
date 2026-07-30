@@ -17,7 +17,10 @@ use tracing::debug;
 use super::framing::force_dns_id_zero;
 use super::lifecycle::LifecycleSlot;
 use super::owned_task::OwnedTask;
-use super::{DialContext, build_doh_request, exchange_with_retry, finish_doh_response};
+use super::{
+    DialContext, DnsMessageBody, build_doh_request, doh_content_length, exchange_with_retry,
+    finish_doh_response,
+};
 use honk_outbound::tls::TlsConnector;
 
 type H2Sender = SendRequest<Bytes>;
@@ -86,8 +89,9 @@ impl DohClient {
             .map_err(|e| anyhow::anyhow!("DoH response error: {e}"))?;
 
         let status = response.status();
+        let content_length = doh_content_length("DoH", response.headers())?;
         let mut body = response.into_body();
-        let mut buf = Vec::with_capacity(512);
+        let mut buf = DnsMessageBody::new("DoH", content_length)?;
         loop {
             let next = tokio::time::timeout(self.dial.query_timeout, body.data())
                 .await
@@ -96,14 +100,14 @@ impl DohClient {
                 Some(chunk) => {
                     let chunk = chunk.map_err(|e| anyhow::anyhow!("DoH body read: {e}"))?;
                     let n = chunk.len();
-                    buf.extend_from_slice(&chunk);
+                    buf.push(&chunk)?;
                     let _ = body.flow_control().release_capacity(n);
                 }
                 None => break,
             }
         }
 
-        finish_doh_response("DoH", status, buf, orig_id)
+        finish_doh_response("DoH", status, buf.into_bytes(), orig_id)
     }
 
     async fn get_sender(&self) -> anyhow::Result<H2Sender> {
@@ -174,4 +178,57 @@ where
         sender: Mutex::new(Some(sender)),
         driver,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{
+        DnsMessageBody, DnsMessageTooLarge, MAX_DNS_MESSAGE_SIZE, doh_content_length,
+    };
+
+    #[test]
+    fn h2_body_rejects_hostile_multichunk_response_before_append() {
+        // Given
+        let mut body = DnsMessageBody::new("DoH", None).expect("body");
+        body.push(&vec![0; 32_768]).expect("first chunk");
+
+        // When
+        let error = body
+            .push(&vec![0; 32_768])
+            .expect_err("oversized second chunk");
+
+        // Then
+        assert_eq!(body.len(), 32_768);
+        assert!(error.downcast_ref::<DnsMessageTooLarge>().is_some());
+    }
+
+    #[test]
+    fn h2_body_accepts_exact_protocol_boundary() {
+        // Given
+        let mut body =
+            DnsMessageBody::new("DoH", Some(MAX_DNS_MESSAGE_SIZE)).expect("bounded body");
+
+        // When
+        body.push(&vec![0; MAX_DNS_MESSAGE_SIZE])
+            .expect("exact boundary");
+
+        // Then
+        assert_eq!(body.len(), MAX_DNS_MESSAGE_SIZE);
+    }
+
+    #[test]
+    fn h2_body_rejects_oversized_content_length_before_allocation() {
+        // Given
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_LENGTH,
+            http::HeaderValue::from_static("65536"),
+        );
+
+        // When
+        let error = doh_content_length("DoH", &headers).expect_err("oversized content length");
+
+        // Then
+        assert!(error.downcast_ref::<DnsMessageTooLarge>().is_some());
+    }
 }

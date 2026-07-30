@@ -138,13 +138,18 @@ impl ControlPlane {
         let dns_router = Arc::new(crate::dns::routing::DnsRouter::new_from_dns_config(
             &config.dns,
         )?);
-        let dns_upstream_pool = Arc::new(crate::dns::upstream_pool::UpstreamPool::new_with_proxy(
-            &config.dns.upstream,
-            dns_router,
-            Some(Arc::clone(&proxy_registry)),
-            config.nodes.clone(),
-            config.groups.clone(),
-        )?);
+        let dns_upstream_pool = Arc::new(
+            crate::dns::upstream_pool::UpstreamPool::new_with_proxy_and_bootstrap(
+                &config.dns.upstream,
+                dns_router,
+                Some(Arc::clone(&proxy_registry)),
+                config.nodes.clone(),
+                config.groups.clone(),
+                honk_outbound::bootstrap::BootstrapResolver::parse(
+                    &config.global.bootstrap_resolver,
+                ),
+            )?,
+        );
         Self::new_with_upstream_pool(
             config,
             ebpf,
@@ -1073,7 +1078,7 @@ impl ControlPlane {
             }
         }
 
-        self.dns_controller.runtime_provider().shutdown().await;
+        self.dns_controller.shutdown().await;
         let dns_cache = self.dns_controller.cache().await;
         let persistence = dns_cache.lock().await.persistence();
         if let Some(persistence) = persistence

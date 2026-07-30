@@ -598,12 +598,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // Keep a concrete Arc so we can attach SharedGroupManager after the
     // control plane builds it (same cell traffic dials use).
     let dns_upstream_pool = std::sync::Arc::new(
-        dns::upstream_pool::UpstreamPool::new_with_proxy(
+        dns::upstream_pool::UpstreamPool::new_with_proxy_and_bootstrap(
             &config.dns.upstream,
             dns_router.clone(),
             Some(proxy_registry.clone()),
             config.nodes.clone(),
             config.groups.clone(),
+            honk_outbound::bootstrap::BootstrapResolver::parse(&config.global.bootstrap_resolver),
         )?
         .with_timeouts(
             std::time::Duration::from_millis(config.global.dns_resolve_timeout_ms),

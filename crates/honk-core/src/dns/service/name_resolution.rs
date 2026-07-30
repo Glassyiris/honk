@@ -58,7 +58,7 @@ impl DnsService {
             return Ok(literal(ip));
         }
 
-        debug!(%domain, "DNS lookup");
+        debug!(lookup_kind = "name", "DNS lookup");
         let mut operation = self.operation();
         let responses = match self.backend.as_ref() {
             DnsServiceBackend::Runtime(provider) => {
@@ -71,7 +71,7 @@ impl DnsService {
         };
         let ipv4_eligible = responses.ipv4_eligible;
         let ipv6_eligible = responses.ipv6_eligible;
-        let mut resolved = resolved_from_responses(responses, &domain);
+        let mut resolved = resolved_from_responses(responses);
         if resolved.ipv4.is_empty() && resolved.ipv6.is_empty() {
             let addresses = fallback(domain.clone()).await.map_err(|source| {
                 NameResolutionError::Bootstrap {
@@ -92,8 +92,8 @@ impl DnsService {
             resolved.min_ttl = 60;
         }
         debug!(
-            domain,
-            first_ipv4 = ?resolved.ipv4.first(),
+            ipv4_present = !resolved.ipv4.is_empty(),
+            ipv6_present = !resolved.ipv6.is_empty(),
             ttl = resolved.min_ttl,
             "DNS resolved"
         );
@@ -165,9 +165,9 @@ fn literal(ip: IpAddr) -> ResolvedAddr {
     }
 }
 
-fn resolved_from_responses(responses: FamilyResponses, domain: &str) -> ResolvedAddr {
-    let (ipv4, ipv4_ttl) = parsed_family(responses.ipv4, true, "A", domain);
-    let (ipv6, ipv6_ttl) = parsed_family(responses.ipv6, false, "AAAA", domain);
+fn resolved_from_responses(responses: FamilyResponses) -> ResolvedAddr {
+    let (ipv4, ipv4_ttl) = parsed_family(responses.ipv4, true, "A");
+    let (ipv6, ipv6_ttl) = parsed_family(responses.ipv6, false, "AAAA");
     ResolvedAddr {
         ipv4,
         ipv6,
@@ -179,15 +179,18 @@ fn parsed_family(
     response: Option<anyhow::Result<Vec<u8>>>,
     ipv4: bool,
     label: &str,
-    domain: &str,
 ) -> (Vec<IpAddr>, Option<u32>) {
     let Some(response) = response else {
         return (Vec::new(), None);
     };
     let response = match response {
         Ok(response) => response,
-        Err(error) => {
-            debug!("{label} lookup for {domain} failed: {error}");
+        Err(_) => {
+            debug!(
+                record_type = label,
+                error_kind = "lookup_failed",
+                "DNS name-family lookup failed"
+            );
             return (Vec::new(), None);
         }
     };

@@ -2,11 +2,11 @@ use std::net::SocketAddr;
 
 use tracing::debug;
 
-use super::DnsEngine;
+use super::{DnsEngine, PreparedQuery};
 use crate::dns::cache::{CacheKey, OperationKind, PublicationEpoch};
 use crate::dns::forwarder::{DnsForwardError, DnsForwarder, ResolveMode, is_filtered_qtype};
 use crate::dns::outcome::{DnsOutcome, OutcomeStatus};
-use crate::dns::planner::RequestPlan;
+use crate::dns::planner::{RequestPlan, RequestScope, UpstreamTag};
 use crate::dns::query::IngressProfile;
 use crate::dns::singleflight::{FlightLeader, FlightRole};
 
@@ -20,6 +20,22 @@ use plan::{rejected_outcome, request_exchange};
 pub(crate) struct ResolveExecution {
     refresh_owner: Option<FlightLeader>,
     publication_epoch: PublicationEpoch,
+}
+
+pub(super) struct ExecutionContext<'a> {
+    pub(super) forwarder: &'a DnsForwarder,
+    pub(super) engine: &'a DnsEngine,
+    pub(super) prepared: &'a PreparedQuery,
+    pub(super) raw_query: &'a [u8],
+    pub(super) original_dst: Option<SocketAddr>,
+    pub(super) cache_key: String,
+    pub(super) refresh_key: CacheKey,
+    pub(super) logical_upstream: UpstreamTag,
+    pub(super) request_scope: RequestScope,
+    pub(super) reuse_eligible: bool,
+    pub(super) bypass_cache_read: bool,
+    pub(super) mode: ResolveMode,
+    pub(super) publication_epoch: PublicationEpoch,
 }
 
 impl ResolveExecution {
@@ -118,41 +134,31 @@ pub(crate) async fn resolve_with_owner(
         request_scope.clone(),
         OperationKind::Refresh,
     );
-    if reuse_eligible
-        && let Some(outcome) = cache::lookup(
-            forwarder,
-            &engine,
-            &prepared,
-            raw_query,
-            original_dst,
-            &cache_key,
-            &refresh_key,
-            bypass_cache_read,
-            true,
-            mode,
-            publication_epoch,
-        )
-        .await?
-    {
+    let context = ExecutionContext {
+        forwarder,
+        engine: &engine,
+        prepared: &prepared,
+        raw_query,
+        original_dst,
+        cache_key,
+        refresh_key,
+        logical_upstream,
+        request_scope: request_scope.clone(),
+        reuse_eligible,
+        bypass_cache_read,
+        mode,
+        publication_epoch,
+    };
+    if reuse_eligible && let Some(outcome) = cache::lookup(&context, true).await? {
         return Ok(outcome);
     }
 
+    if !reuse_eligible {
+        return operation::run(&context).await;
+    }
+
     if let Some(owner) = refresh_owner {
-        return operation::run_as_leader(
-            owner,
-            forwarder,
-            &engine,
-            &prepared,
-            raw_query,
-            original_dst,
-            &cache_key,
-            logical_upstream,
-            request_scope.clone(),
-            reuse_eligible,
-            mode,
-            publication_epoch,
-        )
-        .await;
+        return operation::run_as_leader(owner, &context).await;
     }
 
     let operation = if bypass_cache_read {
@@ -170,90 +176,22 @@ pub(crate) async fn resolve_with_owner(
     loop {
         match flights.acquire(flight_key.clone()) {
             FlightRole::Bypass => {
-                return operation::run(
-                    forwarder,
-                    &engine,
-                    &prepared,
-                    raw_query,
-                    original_dst,
-                    &cache_key,
-                    logical_upstream,
-                    request_scope.clone(),
-                    reuse_eligible,
-                    mode,
-                    publication_epoch,
-                )
-                .await;
+                return operation::run(&context).await;
             }
             FlightRole::Ready(template) => {
-                return flight::waiter_outcome(
-                    forwarder,
-                    &engine,
-                    &prepared,
-                    raw_query,
-                    original_dst,
-                    &cache_key,
-                    &refresh_key,
-                    bypass_cache_read,
-                    mode,
-                    template,
-                    publication_epoch,
-                )
-                .await;
+                return flight::waiter_outcome(&context, template).await;
             }
             FlightRole::Waiter(waiter) => match waiter.receive().await {
                 Some(template) => {
-                    return flight::waiter_outcome(
-                        forwarder,
-                        &engine,
-                        &prepared,
-                        raw_query,
-                        original_dst,
-                        &cache_key,
-                        &refresh_key,
-                        bypass_cache_read,
-                        mode,
-                        template,
-                        publication_epoch,
-                    )
-                    .await;
+                    return flight::waiter_outcome(&context, template).await;
                 }
                 None => continue,
             },
             FlightRole::Leader(leader) => {
-                if !bypass_cache_read
-                    && let Some(outcome) = cache::lookup(
-                        forwarder,
-                        &engine,
-                        &prepared,
-                        raw_query,
-                        original_dst,
-                        &cache_key,
-                        &refresh_key,
-                        false,
-                        true,
-                        mode,
-                        publication_epoch,
-                    )
-                    .await?
-                {
+                if !bypass_cache_read && let Some(outcome) = cache::lookup(&context, true).await? {
                     return Ok(flight::publish_outcome(leader, outcome));
                 }
-                return operation::run_as_leader(
-                    leader,
-                    forwarder,
-                    &engine,
-                    &prepared,
-                    raw_query,
-                    original_dst,
-                    &cache_key,
-                    logical_upstream,
-                    request_scope.clone(),
-                    reuse_eligible,
-                    mode,
-                    publication_epoch,
-                )
-                .await;
+                return operation::run_as_leader(leader, &context).await;
             }
         }
     }

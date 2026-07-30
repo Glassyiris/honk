@@ -444,12 +444,12 @@ GroupManager snapshot, transport manager, and routing projection. Leases let
 old requests drain; the retirement deadline and retained-generation cap bound
 shutdown, and transport initialization/close is single-flight and idempotent.
 
-Internal coherent snapshots cover hit/miss/stale, flight
+Independent monotonic counters cover hit/miss/stale, flight
 saturation/cancel/retry, persistence drop/flush failure, runtime retirement,
-transport init/reset, projection failure/retry, and outcome classes. Writers
-and snapshot readers acquire the same `AtomicBool` gate; its Acquire lock and
-Release RAII unlock make relaxed counter updates visible as one coherent
-critical section. Failure logs use bounded `error_kind` values: forwarder
+transport init/reset, projection failure/retry, and outcome classes. Recording
+does not block on a shared gate. The internal best-effort scrape loads fields
+separately and does not provide cross-counter coherence. Failure logs use
+bounded `error_kind` values: forwarder
 `engine`/`exchange`/`response`/`internal`/`rejected_plan`, persistence
 `worker_closed`/`ack_dropped`/`worker_failed`/`database`, projection
 `map_full`/`backend_write`, and transport `exchange_failed` with a bounded

@@ -1,10 +1,7 @@
-use std::net::SocketAddr;
 use std::sync::Arc;
 
-use super::cache;
-use crate::dns::cache::{CacheKey, PublicationEpoch};
-use crate::dns::engine::{DnsEngine, PreparedQuery};
-use crate::dns::forwarder::{DnsForwardError, DnsForwarder, ResolveMode};
+use super::{ExecutionContext, cache};
+use crate::dns::forwarder::DnsForwardError;
 use crate::dns::outcome::{DnsOutcome, EffectiveExpiry, OutcomeStatus, Provenance};
 use crate::dns::response::ResponseTemplate;
 use crate::dns::singleflight::FlightLeader;
@@ -16,42 +13,19 @@ pub(super) fn publish_outcome(mut leader: FlightLeader, outcome: DnsOutcome) -> 
     outcome
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn waiter_outcome(
-    forwarder: &DnsForwarder,
-    engine: &DnsEngine,
-    prepared: &PreparedQuery,
-    raw_query: &[u8],
-    original_dst: Option<SocketAddr>,
-    cache_key: &str,
-    refresh_key: &CacheKey,
-    bypass_cache_read: bool,
-    mode: ResolveMode,
+    context: &ExecutionContext<'_>,
     template: Arc<ResponseTemplate>,
-    publication_epoch: PublicationEpoch,
 ) -> Result<DnsOutcome, DnsForwardError> {
-    if !bypass_cache_read
-        && let Some(outcome) = cache::lookup(
-            forwarder,
-            engine,
-            prepared,
-            raw_query,
-            original_dst,
-            cache_key,
-            refresh_key,
-            false,
-            false,
-            mode,
-            publication_epoch,
-        )
-        .await?
+    if !context.bypass_cache_read
+        && let Some(outcome) = cache::lookup(context, false).await?
     {
         return Ok(outcome);
     }
-    let response = template.render(prepared.query())?;
-    forwarder.outcome_from_wire(
-        engine,
-        prepared,
+    let response = template.render(context.prepared.query())?;
+    context.forwarder.outcome_from_wire(
+        context.engine,
+        context.prepared,
         response,
         OutcomeStatus::Accepted,
         Provenance::Upstream,
@@ -59,6 +33,6 @@ pub(super) async fn waiter_outcome(
         None,
         None,
         Vec::new(),
-        mode,
+        context.mode,
     )
 }

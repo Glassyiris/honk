@@ -236,8 +236,9 @@ v2 记录。写入由有界 actor 和 epoch 栅栏管理：flush 会先丢弃旧
 重载发布新的完整 runtime generation。已有 lease 在旧 generation 上完成，新请求使用替换版本；
 停滞 generation 到期后强制关闭，保留的旧 generation 数量也有上限。上游池对 transport 初始化
 singleflight，并保证空闲会话只关闭一次。缓存、flight、持久化、runtime、transport、投影与结果
-诊断使用内部一致 counter 快照：writer 与 reader 获取同一个 `AtomicBool` gate，
-Acquire lock 与 Release RAII unlock 让 relaxed counter 更新作为一个临界区可见。
+诊断使用相互独立、单调递增的 atomic counter。内部 scrape 不阻塞请求 writer，
+逐项读取 counter；它是 best-effort 结果而非同一时刻的一致快照，因此不能据此推导
+counter 之间的不变量。
 结构化失败日志仅暴露有界 `error_kind` 分类（forwarder、持久化、
 投影和 transport）以及 transport label 等有界字段，不记录 query name、upstream 地址或
 自由格式 error payload。本次没有新增公开 DNS metrics 接口、配置项或 API。

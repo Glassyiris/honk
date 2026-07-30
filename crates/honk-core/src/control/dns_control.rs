@@ -126,7 +126,7 @@ impl DnsController {
         match self.dns_service.resolve_name(domain).await {
             Ok(resolved) => resolved.ipv4.into_iter().chain(resolved.ipv6).collect(),
             Err(error) => {
-                debug!(%error, %domain, "DNS controller name resolution failed");
+                debug!(%error, "DNS controller name resolution failed");
                 Vec::new()
             }
         }
@@ -140,6 +140,11 @@ impl DnsController {
 
     pub(crate) fn dns_service(&self) -> crate::dns::DnsService {
         self.dns_service.clone()
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        self.routing_projection.shutdown().await;
+        self.runtime_provider().shutdown().await;
     }
 
     pub(crate) fn update_projection_snapshot(

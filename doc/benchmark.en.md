@@ -182,17 +182,17 @@ sing-box, not honk.
 
 ### DNS architecture Criterion comparison
 
-The authoritative `dns-final-gate` DNS microbenchmark run compares current HEAD
-`5d4f2ee0695595b16811b5693201609f9d69d078` with baseline commit
+The authoritative `dns-final-stats` DNS microbenchmark run compares the current
+working tree at HEAD `37858d36b18e5e809d49a13ae9c7d46a123b1d16` with baseline commit
 `6bbf1dc929541d64178d44ab389dcfe3b3e55c1e`. Both sides use the same
 non-default `dns-bench` harness:
 
 ```bash
 CARGO_TARGET_DIR=/root/code/honk-anaylyze-dns/target \
   cargo bench -p honk-core --features dns-bench --bench dns -- \
-  --save-baseline dns-final-gate
+  --save-baseline dns-final-stats
 cargo bench -p honk-core --features dns-bench --bench dns -- \
-  --baseline dns-final-gate
+  --baseline dns-final-stats
 ```
 
 The run completed all 32 Criterion groups on host `nixos` (Linux
@@ -206,58 +206,69 @@ Cross-host timings are not comparable.
 
 | Case | Current central estimate | Baseline ratio | Criterion result / advisory |
 | --- | ---: | ---: | --- |
-| Real typed `CacheKey::new` build | 78.300 ns | 0.9809x | within noise; ≤1.10x pass |
-| Policy evaluation, 1 rule | 72.225 ns | 0.9853x | within noise; ≤1.10x pass |
-| Policy evaluation, 32 rules | 197.81 ns | 0.9437x | improvement; ≤1.10x pass |
-| Policy evaluation, 128 rules | 656.37 ns | 0.9369x | improvement; ≤1.10x pass |
-| Independent cache hit, 1 task | 247.53 ns | 0.9863x | no detected change; ≤1.10x pass |
-| Independent cache miss, 1 task | 181.01 ns | 1.0742x | regression detected; ≤1.10x pass |
-| Independent cache hit, 16 tasks | 3.3735 µs | 1.0389x | regression detected; ≤1.10x pass |
-| Independent cache miss, 16 tasks | 1.8296 µs | 1.1264x | regression detected; ≤1.10x **miss** |
-| Independent cache hit, 64 tasks | 23.523 µs | 0.9831x | no detected change; ≤1.10x pass |
-| Independent cache miss, 64 tasks | 16.798 µs | 1.0219x | within noise; ≤1.10x pass |
-| Singleflight, 128 waiters | 552.43 µs | 1.0061x | no detected change; ≤1.10x pass |
-| Forwarder cache hit | 2.6462 µs | 0.9940x | no detected change; ≤1.15x pass |
-| Real runtime lease acquire/drop | 48.083 ns | 1.0060x | no detected change; ≤1.10x pass |
-| Real runtime publication/swap | 1.5375 µs | 0.9930x | no detected change; ≤1.10x pass |
-| Shared-gate observability record | 12.025 ns | 1.1335x | regression detected; advisory |
-| Shared-gate coherent snapshot | 9.3540 ns | 0.9992x | no detected change; advisory |
-| 10k cache construction/insertion | 2.7278 ms | 1.0055x | no detected change |
-| 10k allocated bytes | 1,629,256 bytes | 1.0000x | ≤1.50x pass |
+| Real typed `CacheKey::new` build | 77.971 ns | 0.9502x | improvement; ≤1.10x pass |
+| Policy evaluation, 1 rule | 74.814 ns | 1.0000x | no detected change; ≤1.10x pass |
+| Policy evaluation, 32 rules | 202.63 ns | 1.0103x | no detected change; ≤1.10x pass |
+| Policy evaluation, 128 rules | 695.33 ns | 1.0391x | regression detected; ≤1.10x pass |
+| Independent cache hit, 1 task | 329.72 ns | 1.3392x | regression detected; ≤1.10x **miss** |
+| Independent cache miss, 1 task | 248.50 ns | 1.4163x | regression detected; ≤1.10x **miss** |
+| Independent cache hit, 16 tasks | 4.6439 µs | 1.3665x | regression detected; ≤1.10x **miss** |
+| Independent cache miss, 16 tasks | 2.9261 µs | 1.6597x | regression detected; ≤1.10x **miss** |
+| Independent cache hit, 64 tasks | 30.214 µs | 1.2959x | regression detected; ≤1.10x **miss** |
+| Independent cache miss, 64 tasks | 21.358 µs | 1.2509x | regression detected; ≤1.10x **miss** |
+| Singleflight, 128 waiters | 773.57 µs | 1.3670x | regression detected; advisory |
+| Forwarder cache hit | 4.2746 µs | 1.5155x | regression detected; ≤1.15x **miss** |
+| Real runtime lease acquire/drop | 50.845 ns | 1.0372x | regression detected; ≤1.10x pass |
+| Real runtime publication/swap | 1.4524 µs | 0.9578x | improvement; ≤1.10x pass |
+| Ungated atomic event record | 6.8079 ns | 1.3697x | regression detected; advisory |
+| Best-effort atomic counter scrape | 2.2260 ns | 1.0074x | no detected change; advisory |
+| 10k cache construction/insertion | 3.4616 ms | 1.2640x | regression detected |
+| 10k allocated bytes | 1,628,640 bytes | 0.9996x | ≤1.50x pass |
 
 Typed-key construction parses a real query once, then calls the production
 `CacheKey::new` for every measured iteration with real query context,
 `PolicyId`, upstream scope, and resolve operation. Runtime measurements call
 the production provider's `acquire`/lease drop and build a replacement
 `DnsRuntime` before `prepare_publication(...).commit()`. The observability
-cases call the real shared-gate writer and coherent snapshot reader. Writers
-and readers acquire the same `AtomicBool` gate; its Acquire lock and Release
-RAII unlock make relaxed counter updates visible as one coherent critical
-section. The same stats implementation is intentionally overlaid on the
+cases call the real ungated `AtomicU64` recorder and best-effort scrape. Each
+counter is monotonic, but a scrape does not claim cross-counter coherence.
+The same stats implementation is intentionally overlaid on the
 baseline, so their between-run deltas are noise controls rather than
 old-versus-new production comparisons.
 
+The approved budget has no baseline-ratio or absolute threshold for the
+observability cases; they are advisory mechanism measurements. The current
+record cost is 6.8079 ns for one relaxed atomic increment with no shared gate,
+spin, or yield. Although that is 1.3697x the identical overlay in the different
+baseline production tree, it is 43.4% below the prior authoritative gated
+current measurement of 12.025 ns. The absolute hot-path work is therefore
+smaller and cannot serialize independent DNS requests.
+
 Timing limits are advisory and misses are not hidden or relaxed. The 16-task
-cache miss is the only ≤1.10x advisory miss, at 1.1264x; fixed per-operation
-coherent-counter recording is prominent in this sub-microsecond case.
+cache cases now perform stable canonical cache-key identity work; all six
+1/16/64-task cache cases miss ≤1.10x, and the forwarder cache hit misses
+≤1.15x. The benchmark does not isolate that identity work from the cache
+operation, so these results are reported without attributing them to the
+removed stats gate.
 Functional publication, cancellation, ordering, and resource bounds remain
 hard test assertions.
 
-Independent 64-task hot-key throughput is 2.7207 Melem/s versus
-6.4729 Melem/s for the sequential reference, or 0.420x, missing the advisory
+Independent 64-task hot-key throughput is 2.1183 Melem/s versus
+4.1669 Melem/s for the sequential reference, or 0.508x, missing the advisory
 ≥2x target. Its single-thread Tokio `join_all` harness measures scheduling
 overhead rather than multi-core scaling. Parallel A+AAAA completes in
-1.2844 ms versus 1.2159 ms for the slower AAAA branch, or 1.056x, passing the
-≤1.25x target; its +2.69% baseline shift is within Criterion noise.
+1.2650 ms versus 1.2794 ms for the slower AAAA branch, or 0.989x, passing the
+≤1.25x target; overlap plus measurement noise can make the combined central
+estimate slightly lower than the isolated branch.
 
 Raw provenance receipts:
 
 | Artifact | Path | SHA-256 |
 | --- | --- | --- |
-| Baseline timing | `.omo/evidence/todo12-benchmark-final-gate-baseline.log` | `a6d9c0d8baf5354ff5f1fc0bc97b6f323e49bccf1361a09a49696bce9160cfda` |
-| Current timing/comparison | `.omo/evidence/todo12-benchmark-final-gate-current.log` | `999ed16100943aa2bef5149f072ffb784ebb4ed0bd4c65b963a87fe38893f806` |
-| Baseline provenance | `.omo/evidence/todo12-benchmark-baseline-provenance-gate.log` | `6428b2eacdb0c512bf96cef48db8bcd705962c6ea953adc6bcb3b1d4a7fc4882` |
-| Current provenance | `.omo/evidence/todo12-benchmark-current-provenance-gate.log` | `addc8287e9da4f3856a509a4e3961779b2b2fd8a81a860479dabaf2a7532c7f0` |
+| Baseline timing | `.omo/evidence/final-stats-remediation/benchmark-baseline.log` | `07035f23a3ff5da118a5d33f0577d556720adbc7ee6129ee6785e9cf44d272e0` |
+| Current timing/comparison | `.omo/evidence/final-stats-remediation/benchmark-current.log` | `49f4e0111de89cadc67a0cd55b056e89f97f263c3c394d8f6a0d894d80119ef3` |
+| Baseline provenance | `.omo/evidence/final-stats-remediation/baseline-provenance.log` | `870f22ea31b04b3452fd13ee5cdd3df46f9db767992c23aeae3b11799293a33a` |
+| Current provenance | `.omo/evidence/final-stats-remediation/current-provenance.log` | `ad8bcd05336bd95183f6d9db006f66816c4db83219384dc4efbcd15a44b3cdb1` |
 
 The machine-readable checksum receipt is
 `.omo/evidence/todo12-benchmark-final-gate-checksums.txt`; the full extraction and

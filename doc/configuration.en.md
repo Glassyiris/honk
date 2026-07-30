@@ -373,9 +373,9 @@ Upstream URIs take a scheme prefix: `udp://`, `tcp://`, `tcp+udp://`, `tls://`, 
   routing, groups, transports, and projection. Existing requests keep their
   lease on the old generation while new requests use the replacement. Runtime
   retirement and pooled transport shutdown are bounded and awaited.
-- DNS observability is internal. Writers and snapshot readers acquire the same
-  `AtomicBool` gate; its Acquire lock and Release RAII unlock make relaxed
-  counter updates visible as one coherent critical section. Failure logs use
+- DNS observability is internal. Independent monotonic atomic counters keep
+  request recording non-blocking. An internal best-effort scrape loads fields
+  separately and does not promise cross-counter coherence. Failure logs use
   bounded `error_kind` classes and bounded fields such as the transport label,
   without query names, upstream addresses, or free-form error payloads. No
   DNS endpoint, config key, or API was added.

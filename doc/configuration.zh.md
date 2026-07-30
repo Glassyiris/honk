@@ -334,8 +334,8 @@ dns {
 - 重载一次发布包含策略、路由、组、transport 与投影的完整 DNS runtime generation。
   已有请求在旧 generation 上持有 lease，新请求使用替换版本。runtime 退役与池化
   transport 关闭都有界且会被等待。
-- DNS 可观测性仅供内部使用。writer 与 snapshot reader 获取同一个 `AtomicBool` gate；
-  Acquire lock 与 Release RAII unlock 让 relaxed counter 更新作为一个一致临界区可见。
+- DNS 可观测性仅供内部使用。相互独立、单调递增的 atomic counter 使请求记录保持
+  non-blocking。内部 best-effort scrape 逐项读取，不承诺 counter 之间的一致性。
   失败日志仅使用有界 `error_kind` 分类和 transport label 等有界字段，不记录 query name、
   upstream 地址或自由格式 error payload。没有新增 DNS endpoint、配置项或 API。
 

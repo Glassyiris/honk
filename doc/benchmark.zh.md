@@ -171,17 +171,17 @@ ss 快路径实测无效(staging 拷贝不是瓶颈,ss2022 仍在 ~1.3 Gbps
 
 ### DNS 架构 Criterion 对比
 
-权威 `dns-final-gate` DNS 微基准将当前 HEAD
-`5d4f2ee0695595b16811b5693201609f9d69d078` 与 baseline commit
+权威 `dns-final-stats` DNS 微基准将当前工作树（HEAD
+`37858d36b18e5e809d49a13ae9c7d46a123b1d16`）与 baseline commit
 `6bbf1dc929541d64178d44ab389dcfe3b3e55c1e` 对比。两边使用相同的
 非默认 `dns-bench` harness：
 
 ```bash
 CARGO_TARGET_DIR=/root/code/honk-anaylyze-dns/target \
   cargo bench -p honk-core --features dns-bench --bench dns -- \
-  --save-baseline dns-final-gate
+  --save-baseline dns-final-stats
 cargo bench -p honk-core --features dns-bench --bench dns -- \
-  --baseline dns-final-gate
+  --baseline dns-final-stats
 ```
 
 本次在 `nixos` 主机（Linux `7.1.4-cachyos`、Intel i9-13900H、20 个逻辑
@@ -194,52 +194,59 @@ support、harness 与 stats 定义；其余 DNS 生产代码均来自精确 base
 
 | Case | 当前中心估计 | Baseline ratio | Criterion 结果 / 建议判定 |
 | --- | ---: | ---: | --- |
-| 真实 typed `CacheKey::new` 构建 | 78.300 ns | 0.9809x | 在 noise 内；≤1.10x 通过 |
-| Policy 求值，1 条规则 | 72.225 ns | 0.9853x | 在 noise 内；≤1.10x 通过 |
-| Policy 求值，32 条规则 | 197.81 ns | 0.9437x | 改善；≤1.10x 通过 |
-| Policy 求值，128 条规则 | 656.37 ns | 0.9369x | 改善；≤1.10x 通过 |
-| 独立 cache hit，1 task | 247.53 ns | 0.9863x | 未检测到变化；≤1.10x 通过 |
-| 独立 cache miss，1 task | 181.01 ns | 1.0742x | 检测到回归；≤1.10x 通过 |
-| 独立 cache hit，16 tasks | 3.3735 µs | 1.0389x | 检测到回归；≤1.10x 通过 |
-| 独立 cache miss，16 tasks | 1.8296 µs | 1.1264x | 检测到回归；≤1.10x **未达到** |
-| 独立 cache hit，64 tasks | 23.523 µs | 0.9831x | 未检测到变化；≤1.10x 通过 |
-| 独立 cache miss，64 tasks | 16.798 µs | 1.0219x | 在 noise 内；≤1.10x 通过 |
-| Singleflight，128 waiters | 552.43 µs | 1.0061x | 未检测到变化；≤1.10x 通过 |
-| Forwarder cache hit | 2.6462 µs | 0.9940x | 未检测到变化；≤1.15x 通过 |
-| 真实 runtime lease acquire/drop | 48.083 ns | 1.0060x | 未检测到变化；≤1.10x 通过 |
-| 真实 runtime publication/swap | 1.5375 µs | 0.9930x | 未检测到变化；≤1.10x 通过 |
-| shared-gate observability record | 12.025 ns | 1.1335x | 检测到回归；建议项 |
-| shared-gate 一致 snapshot | 9.3540 ns | 0.9992x | 未检测到变化；建议项 |
-| 1 万条 cache 构建/插入 | 2.7278 ms | 1.0055x | 未检测到变化 |
-| 1 万条 allocated bytes | 1,629,256 bytes | 1.0000x | ≤1.50x 通过 |
+| 真实 typed `CacheKey::new` 构建 | 77.971 ns | 0.9502x | 改善；≤1.10x 通过 |
+| Policy 求值，1 条规则 | 74.814 ns | 1.0000x | 未检测到变化；≤1.10x 通过 |
+| Policy 求值，32 条规则 | 202.63 ns | 1.0103x | 未检测到变化；≤1.10x 通过 |
+| Policy 求值，128 条规则 | 695.33 ns | 1.0391x | 检测到回归；≤1.10x 通过 |
+| 独立 cache hit，1 task | 329.72 ns | 1.3392x | 检测到回归；≤1.10x **未达到** |
+| 独立 cache miss，1 task | 248.50 ns | 1.4163x | 检测到回归；≤1.10x **未达到** |
+| 独立 cache hit，16 tasks | 4.6439 µs | 1.3665x | 检测到回归；≤1.10x **未达到** |
+| 独立 cache miss，16 tasks | 2.9261 µs | 1.6597x | 检测到回归；≤1.10x **未达到** |
+| 独立 cache hit，64 tasks | 30.214 µs | 1.2959x | 检测到回归；≤1.10x **未达到** |
+| 独立 cache miss，64 tasks | 21.358 µs | 1.2509x | 检测到回归；≤1.10x **未达到** |
+| Singleflight，128 waiters | 773.57 µs | 1.3670x | 检测到回归；建议项 |
+| Forwarder cache hit | 4.2746 µs | 1.5155x | 检测到回归；≤1.15x **未达到** |
+| 真实 runtime lease acquire/drop | 50.845 ns | 1.0372x | 检测到回归；≤1.10x 通过 |
+| 真实 runtime publication/swap | 1.4524 µs | 0.9578x | 改善；≤1.10x 通过 |
+| 无 gate atomic event record | 6.8079 ns | 1.3697x | 检测到回归；建议项 |
+| Best-effort atomic counter scrape | 2.2260 ns | 1.0074x | 未检测到变化；建议项 |
+| 1 万条 cache 构建/插入 | 3.4616 ms | 1.2640x | 检测到回归 |
+| 1 万条 allocated bytes | 1,628,640 bytes | 0.9996x | ≤1.50x 通过 |
 
 typed-key 构建只解析一次真实 query，随后每个测量迭代都用真实 query context、
 `PolicyId`、upstream scope 和 resolve operation 调用生产 `CacheKey::new`。
 runtime 测量调用生产 provider 的 `acquire`/lease drop，并构造替换
 `DnsRuntime` 后执行 `prepare_publication(...).commit()`。observability case
-调用真实的 shared-gate writer 与一致 snapshot reader。writer 和 reader 获取
-同一个 `AtomicBool` gate；Acquire lock 与 Release RAII unlock 让 relaxed
-counter 更新作为一个一致临界区可见。baseline 有意覆盖相同 stats 实现，因此
+调用真实的无 gate `AtomicU64` recorder 与 best-effort scrape。每个 counter
+单调递增，但 scrape 不承诺 counter 之间的一致性。baseline 有意覆盖相同 stats 实现，因此
 两次运行间的 delta 是噪声对照，不是新旧生产实现对比。
 
-timing 上限是建议目标，未达到的项目不会隐藏或放宽。16-task cache miss 是唯一
-未达到 ≤1.10x 建议目标的项目，为 1.1264x；在这个亚微秒 case 中，每次操作记录
-一致 counter 的固定成本很突出。功能发布、取消、顺序与资源边界仍由硬性测试断言。
+已批准预算没有为 observability case 规定 baseline ratio 或绝对阈值；它们是
+建议性的 mechanism 测量。当前 record 为 6.8079 ns，只执行一次 relaxed atomic
+increment，不再有 shared gate、spin 或 yield。虽然它相对不同 baseline 生产树中
+逐字节相同的 overlay 为 1.3697x，但比上一份权威报告中 gated current 的
+12.025 ns 低 43.4%。因此绝对 hot-path 工作量更小，也无法串行化相互独立的 DNS 请求。
 
-64-task 独立 hot-key 吞吐为 2.7207 Melem/s，串行参考为
-6.4729 Melem/s，即 0.420x，未达到建议的 ≥2x 目标。其单线程 Tokio
+timing 上限是建议目标，未达到的项目不会隐藏或放宽。cache case 现在执行稳定的
+canonical cache-key identity 工作；1/16/64-task 的六个 cache case 均未达到
+≤1.10x，forwarder cache hit 也未达到 ≤1.15x。benchmark 没有把 identity 工作
+从 cache 操作中单独分离，因此这些结果不归因于已移除的 stats gate。功能发布、
+取消、顺序与资源边界仍由硬性测试断言。
+
+64-task 独立 hot-key 吞吐为 2.1183 Melem/s，串行参考为
+4.1669 Melem/s，即 0.508x，未达到建议的 ≥2x 目标。其单线程 Tokio
 `join_all` harness 测到的是调度成本，而非多核扩展。并行 A+AAAA 为
-1.2844 ms，较慢 AAAA 分支为 1.2159 ms，即 1.056x，通过 ≤1.25x 目标；
-相对 baseline 的 +2.69% 变化在 Criterion noise 内。
+1.2650 ms，较慢 AAAA 分支为 1.2794 ms，即 0.989x，通过 ≤1.25x 目标；
+重叠执行与测量 noise 可使组合 case 的中心估计略低于独立分支。
 
 原始 provenance receipts：
 
 | Artifact | 路径 | SHA-256 |
 | --- | --- | --- |
-| Baseline timing | `.omo/evidence/todo12-benchmark-final-gate-baseline.log` | `a6d9c0d8baf5354ff5f1fc0bc97b6f323e49bccf1361a09a49696bce9160cfda` |
-| 当前 timing/comparison | `.omo/evidence/todo12-benchmark-final-gate-current.log` | `999ed16100943aa2bef5149f072ffb784ebb4ed0bd4c65b963a87fe38893f806` |
-| Baseline provenance | `.omo/evidence/todo12-benchmark-baseline-provenance-gate.log` | `6428b2eacdb0c512bf96cef48db8bcd705962c6ea953adc6bcb3b1d4a7fc4882` |
-| 当前 provenance | `.omo/evidence/todo12-benchmark-current-provenance-gate.log` | `addc8287e9da4f3856a509a4e3961779b2b2fd8a81a860479dabaf2a7532c7f0` |
+| Baseline timing | `.omo/evidence/final-stats-remediation/benchmark-baseline.log` | `07035f23a3ff5da118a5d33f0577d556720adbc7ee6129ee6785e9cf44d272e0` |
+| 当前 timing/comparison | `.omo/evidence/final-stats-remediation/benchmark-current.log` | `49f4e0111de89cadc67a0cd55b056e89f97f263c3c394d8f6a0d894d80119ef3` |
+| Baseline provenance | `.omo/evidence/final-stats-remediation/baseline-provenance.log` | `870f22ea31b04b3452fd13ee5cdd3df46f9db767992c23aeae3b11799293a33a` |
+| 当前 provenance | `.omo/evidence/final-stats-remediation/current-provenance.log` | `ad8bcd05336bd95183f6d9db006f66816c4db83219384dc4efbcd15a44b3cdb1` |
 
 机器可读 checksum receipt 位于
 `.omo/evidence/todo12-benchmark-final-gate-checksums.txt`；完整提取与方法说明位于

@@ -182,7 +182,7 @@ pub(super) fn bench_observability(c: &mut Criterion) {
             record_observability_event();
         });
     });
-    group.bench_function("coherent_snapshot", |b| {
+    group.bench_function("best_effort_snapshot", |b| {
         b.iter(|| black_box(observability_snapshot_checksum()));
     });
     group.finish();

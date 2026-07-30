@@ -163,4 +163,40 @@ async fn spawned_worker_converges_mock_map_after_transient_failure() {
         map[0].1.bitmap,
         projection.counters().write_failures
     );
+    projection.shutdown().await;
+}
+
+#[tokio::test]
+async fn shutdown_is_idempotent_and_awaits_worker_termination() {
+    for _ in 0..10 {
+        // Given
+        let ebpf: Arc<tokio::sync::RwLock<Box<dyn EbpfBackend>>> =
+            Arc::new(tokio::sync::RwLock::new(Box::new(MockEbpfBackend::new())));
+        let projection = RoutingProjection::spawn(ebpf, snapshot(1, 1, 2));
+        let termination = projection.termination_probe_for_test();
+
+        // When
+        tokio::join!(projection.shutdown(), projection.shutdown());
+
+        // Then
+        assert!(termination.is_terminated());
+    }
+}
+
+#[tokio::test]
+async fn drop_cancels_projection_worker() {
+    for _ in 0..10 {
+        // Given
+        let ebpf: Arc<tokio::sync::RwLock<Box<dyn EbpfBackend>>> =
+            Arc::new(tokio::sync::RwLock::new(Box::new(MockEbpfBackend::new())));
+        let projection = RoutingProjection::spawn(ebpf, snapshot(1, 1, 2));
+        let termination = projection.termination_probe_for_test();
+
+        // When
+        drop(projection);
+        termination.wait().await;
+
+        // Then
+        assert!(termination.is_terminated());
+    }
 }

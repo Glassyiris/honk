@@ -250,12 +250,15 @@ impl ControlPlane {
             &config.dns,
         )?);
         let dns_upstream_pool = Arc::new(
-            crate::dns::upstream_pool::UpstreamPool::new_with_proxy(
+            crate::dns::upstream_pool::UpstreamPool::new_with_proxy_and_bootstrap(
                 &config.dns.upstream,
                 dns_router.clone(),
                 Some(self.proxy_registry.clone()),
                 config.nodes.clone(),
                 config.groups.clone(),
+                honk_outbound::bootstrap::BootstrapResolver::parse(
+                    &config.global.bootstrap_resolver,
+                ),
             )?
             .with_timeouts(
                 std::time::Duration::from_millis(config.global.dns_resolve_timeout_ms),

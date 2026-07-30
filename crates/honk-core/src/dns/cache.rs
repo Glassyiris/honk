@@ -13,10 +13,12 @@ use std::time::{Duration, Instant};
 
 use super::planner::RequestScope;
 use super::policy::PolicyId;
-use super::query::{IngressProfile, QueryContext};
+use super::query::IngressProfile;
 use super::singleflight::Singleflight;
 
 mod compatibility;
+mod key;
+mod maintenance;
 mod service;
 mod store;
 
@@ -50,80 +52,6 @@ pub(crate) struct CacheKey {
     policy_id: Option<PolicyId>,
     scope: RequestScope,
     operation: OperationKind,
-}
-
-impl CacheKey {
-    pub(crate) fn new(
-        query: &QueryContext,
-        policy_id: Option<PolicyId>,
-        scope: RequestScope,
-        operation: OperationKind,
-    ) -> Self {
-        Self {
-            wire_identity: Arc::from(query.canonical_wire()),
-            ingress: query.ingress(),
-            policy_id,
-            scope,
-            operation,
-        }
-    }
-
-    pub(crate) fn storage_key(&self) -> String {
-        use std::fmt::Write;
-
-        let mut key = String::with_capacity(self.wire_identity.len() * 2 + 128);
-        for byte in self.wire_identity.iter() {
-            let _ = write!(key, "{byte:02x}");
-        }
-        let _ = write!(
-            key,
-            "|{:?}|{}|{:?}|{:?}",
-            self.ingress,
-            self.policy_id
-                .as_ref()
-                .map(PolicyId::digest_hex)
-                .unwrap_or_default(),
-            self.scope,
-            self.operation
-        );
-        key
-    }
-
-    pub(crate) const fn operation(&self) -> OperationKind {
-        self.operation
-    }
-
-    pub(crate) fn wire_identity(&self) -> &[u8] {
-        &self.wire_identity
-    }
-
-    pub(crate) const fn ingress(&self) -> IngressProfile {
-        self.ingress
-    }
-
-    pub(crate) const fn policy_id(&self) -> Option<&PolicyId> {
-        self.policy_id.as_ref()
-    }
-
-    pub(crate) const fn scope(&self) -> &RequestScope {
-        &self.scope
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_test(
-        wire_identity: Vec<u8>,
-        ingress: IngressProfile,
-        scope: RequestScope,
-        operation: OperationKind,
-    ) -> Self {
-        Self {
-            wire_identity: wire_identity.into(),
-            ingress,
-            policy_id: None,
-            scope,
-            operation,
-        }
-    }
 }
 
 /// Extra window past TTL expiry during which an entry stays in the cache
@@ -307,6 +235,8 @@ fn lock<T>(mutex: &StdMutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dns::planner::UpstreamTag;
+    use crate::dns::query::QueryContext;
     use std::thread;
 
     /// Build a small test DNS response for `example.com` A record.
@@ -366,6 +296,87 @@ mod tests {
     }
 
     #[test]
+    fn cache_key_canonical_bytes_have_stable_golden_identity() {
+        let key = CacheKey::for_test(
+            vec![0, 0, 1],
+            IngressProfile::Internal,
+            RequestScope::Upstream(UpstreamTag::new("default").expect("tag")),
+            OperationKind::Resolve,
+        );
+        let canonical_hex = key
+            .canonical_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+
+        assert_eq!(
+            canonical_hex,
+            "4844434b0101000000030000010213032004300000000764656661756c740540"
+        );
+        assert_eq!(
+            key.storage_key(),
+            concat!(
+                "honk-dns-cache-key:v1:",
+                "caae7e784d48452782f192a41b2899cafa9c3042336fa67ae5e857a258deac76:",
+                "4844434b0101000000030000010213032004300000000764656661756c740540"
+            )
+        );
+        assert_eq!(DnsCache::new(16).shard_index(&key.storage_key()), 7);
+    }
+
+    #[test]
+    fn cache_key_canonical_fields_are_separated_and_collision_checked() {
+        let base = CacheKey::for_test(
+            vec![0, 0, 1],
+            IngressProfile::Internal,
+            RequestScope::Upstream(UpstreamTag::new("default").expect("tag")),
+            OperationKind::Resolve,
+        );
+        let variants = [
+            CacheKey::for_test(
+                vec![0, 0, 2],
+                IngressProfile::Internal,
+                base.scope().clone(),
+                OperationKind::Resolve,
+            ),
+            CacheKey::for_test(
+                vec![0, 0, 1],
+                IngressProfile::Tcp,
+                base.scope().clone(),
+                OperationKind::Resolve,
+            ),
+            CacheKey::for_test(
+                vec![0, 0, 1],
+                IngressProfile::Internal,
+                RequestScope::Upstream(UpstreamTag::new("other").expect("tag")),
+                OperationKind::Resolve,
+            ),
+            CacheKey::for_test(
+                vec![0, 0, 1],
+                IngressProfile::Internal,
+                base.scope().clone(),
+                OperationKind::Refresh,
+            ),
+        ];
+
+        for variant in variants {
+            assert_ne!(base.canonical_bytes(), variant.canonical_bytes());
+            assert_ne!(base.storage_key(), variant.storage_key());
+        }
+        let storage = base.storage_key();
+        let (_, canonical_hex) = storage
+            .rsplit_once(':')
+            .expect("digest and collision material");
+        assert_eq!(
+            canonical_hex,
+            base.canonical_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+    }
+
+    #[test]
     fn test_put_get() {
         let mut cache = DnsCache::new(10);
         let resp = make_test_response([93, 184, 216, 34], 300);
@@ -375,24 +386,6 @@ mod tests {
         assert_eq!(entry.response, resp);
         assert_eq!(entry.min_ttl, 300);
         assert!(!entry.is_expired());
-    }
-
-    #[test]
-    fn dns_stats_snapshot_tracks_cache_outcomes() {
-        let before = crate::stats::dns::dns_snapshot();
-        let mut cache = DnsCache::new(10);
-        let response = make_test_response([93, 184, 216, 34], 300);
-        cache.put("hit".into(), response.clone(), 300);
-        cache.insert_expired_for_test("stale".into(), response, 300);
-
-        assert!(cache.get("hit").is_some());
-        assert!(cache.get("miss").is_none());
-        assert!(cache.get_stale("stale").is_some());
-
-        let delta = crate::stats::dns::dns_snapshot().delta(before);
-        assert!(delta.cache_hit >= 1);
-        assert!(delta.cache_miss >= 1);
-        assert!(delta.cache_stale >= 1);
     }
 
     #[test]

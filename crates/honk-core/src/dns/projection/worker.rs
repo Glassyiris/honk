@@ -111,7 +111,7 @@ async fn flush_after_snapshot(
     }
     if !writes_current {
         crate::stats::record_dns_event(crate::stats::DnsStatEvent::ProjectionRetry);
-        let _ = projection.wake.try_send(());
+        projection.notify_worker();
     }
     for (_, error) in failures {
         counters.write_failures.fetch_add(1, Ordering::Relaxed);

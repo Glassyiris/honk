@@ -21,8 +21,8 @@ use super::framing::force_dns_id_zero;
 use super::lifecycle::LifecycleSlot;
 use super::owned_task::OwnedTask;
 use super::{
-    SharedQuicEndpoint, build_doh_request, dns_quic_config, exchange_with_retry,
-    finish_doh_response, quic_connect,
+    DnsMessageBody, SharedQuicEndpoint, build_doh_request, dns_quic_config, doh_content_length,
+    exchange_with_retry, finish_doh_response, quic_connect,
 };
 
 type H3Sender = SendRequest<h3_quinn::OpenStreams, Bytes>;
@@ -103,7 +103,8 @@ impl Doh3Client {
             .map_err(|e| anyhow::anyhow!("DoH3 recv_response: {e}"))?;
 
         let status = response.status();
-        let mut buf = Vec::with_capacity(512);
+        let content_length = doh_content_length("DoH3", response.headers())?;
+        let mut buf = DnsMessageBody::new("DoH3", content_length)?;
         loop {
             let chunk = tokio::time::timeout(self.query_timeout, stream.recv_data())
                 .await
@@ -113,8 +114,8 @@ impl Doh3Client {
                 Some(mut b) => {
                     while b.has_remaining() {
                         let chunk = b.chunk();
-                        buf.extend_from_slice(chunk);
                         let len = chunk.len();
+                        buf.push(chunk)?;
                         b.advance(len);
                     }
                 }
@@ -122,7 +123,7 @@ impl Doh3Client {
             }
         }
 
-        finish_doh_response("DoH3", status, buf, orig_id)
+        finish_doh_response("DoH3", status, buf.into_bytes(), orig_id)
     }
 
     async fn get_sender(&self) -> anyhow::Result<H3Sender> {
@@ -184,5 +185,40 @@ impl Doh3Client {
     pub(crate) async fn close(&self) {
         self.close_session().await;
         self.quic_ep.close().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{DnsMessageBody, DnsMessageTooLarge, MAX_DNS_MESSAGE_SIZE};
+
+    #[test]
+    fn h3_body_rejects_hostile_multichunk_response_before_append() {
+        // Given
+        let mut body = DnsMessageBody::new("DoH3", None).expect("body");
+        body.push(&vec![0; 40_000]).expect("first chunk");
+
+        // When
+        let error = body
+            .push(&vec![0; 30_000])
+            .expect_err("oversized second chunk");
+
+        // Then
+        assert_eq!(body.len(), 40_000);
+        assert!(error.downcast_ref::<DnsMessageTooLarge>().is_some());
+    }
+
+    #[test]
+    fn h3_body_accepts_exact_protocol_boundary() {
+        // Given
+        let mut body =
+            DnsMessageBody::new("DoH3", Some(MAX_DNS_MESSAGE_SIZE)).expect("bounded body");
+
+        // When
+        body.push(&vec![0; MAX_DNS_MESSAGE_SIZE])
+            .expect("exact boundary");
+
+        // Then
+        assert_eq!(body.len(), MAX_DNS_MESSAGE_SIZE);
     }
 }

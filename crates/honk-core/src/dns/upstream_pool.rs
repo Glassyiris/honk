@@ -132,17 +132,36 @@ impl UpstreamPool {
     // needs upstream entries).
     pub fn new_with_proxy(
         upstreams: &[DnsUpstream],
-        _router: Arc<DnsRouter>,
+        router: Arc<DnsRouter>,
         proxy_registry: Option<Arc<ProxyRegistry>>,
         nodes: Vec<Node>,
         groups: Vec<Group>,
     ) -> anyhow::Result<Self> {
+        Self::new_with_proxy_and_bootstrap(
+            upstreams,
+            router,
+            proxy_registry,
+            nodes,
+            groups,
+            honk_outbound::bootstrap::global(),
+        )
+    }
+
+    pub(crate) fn new_with_proxy_and_bootstrap(
+        upstreams: &[DnsUpstream],
+        _router: Arc<DnsRouter>,
+        proxy_registry: Option<Arc<ProxyRegistry>>,
+        nodes: Vec<Node>,
+        groups: Vec<Group>,
+        bootstrap_resolver: Option<honk_outbound::bootstrap::BootstrapResolver>,
+    ) -> anyhow::Result<Self> {
         let mut entries = HashMap::new();
         for upstream in upstreams {
-            let endpoint = DnsEndpoint::parse(
+            let endpoint = DnsEndpoint::parse_with_resolver(
                 &upstream.address,
                 upstream.protocol,
                 upstream.tls_server_name.as_deref(),
+                bootstrap_resolver,
             )
             .map_err(|e| {
                 anyhow::anyhow!(
