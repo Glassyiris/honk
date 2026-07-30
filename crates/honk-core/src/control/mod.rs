@@ -245,11 +245,12 @@ impl ControlPlane {
             crate::dns::runtime::DnsRuntime::new(crate::dns::runtime::DnsRuntimeParts {
                 generation: crate::dns::runtime::RuntimeGeneration::new(0),
                 forwarder: dns_forwarder.clone(),
-                router: pinned_router,
+                router: Arc::clone(&pinned_router),
                 group_manager: pinned_groups,
                 policy_id,
                 routing_projection: Arc::new(crate::dns::runtime::RoutingProjectionSnapshot::new(
-                    initial_push_result.match_set_count,
+                    0,
+                    pinned_router,
                     initial_push_result.domain_bitmaps,
                 )),
                 cache: dns_forwarder.cache(),
@@ -562,24 +563,17 @@ impl ControlPlane {
         let tcp6_listener = tcp6_listener;
         let udp6_socket = udp6_socket.map(Arc::new);
 
-        let routing_pushed = {
+        {
             let plan = self.active_routing_plan.read().clone();
             let mut ebpf = self.ebpf.write().await;
             match routing_matcher::RoutingMatcherBuilder::push_plan(ebpf.as_mut(), &plan) {
                 Ok(_) => {
                     routing_matcher::RoutingMatcherBuilder::activate_projection(&plan);
-                    true
                 }
                 Err(e) => {
                     warn!("Failed to push routing to eBPF (non-fatal): {}", e);
-                    false
                 }
             }
-        };
-        if routing_pushed {
-            // Rebuild learned domain→IP routes with the new rule bitmaps.
-            // No-op on first start (nothing learned yet).
-            self.dns_controller.rebuild_domain_routes().await;
         }
 
         {
@@ -631,10 +625,6 @@ impl ControlPlane {
 
             tasks.push(crate::control::tcp_sniff::spawn_sniff_neg_cache_janitor(
                 self.tcp_sniff_neg_cache.clone(),
-            ));
-
-            tasks.push(crate::control::dns_control::spawn_dns_workers(
-                &self.dns_controller,
             ));
         }
 

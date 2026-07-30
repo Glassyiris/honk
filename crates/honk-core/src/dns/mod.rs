@@ -27,6 +27,7 @@ pub mod outcome;
 pub mod persist;
 pub mod planner;
 pub mod policy;
+pub(crate) mod projection;
 pub mod query;
 pub mod response;
 pub mod routing;

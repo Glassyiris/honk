@@ -40,7 +40,7 @@ impl RuntimeTransport for ObservedTransport {
     }
 }
 
-fn runtime(generation: u64, route_count: usize) -> (Arc<DnsRuntime>, Arc<ObservedTransport>) {
+fn runtime(generation: u64, _route_count: usize) -> (Arc<DnsRuntime>, Arc<ObservedTransport>) {
     let config = Config::default();
     let dns_router =
         Arc::new(DnsRouter::new_from_dns_config(&config.dns).expect("valid default DNS config"));
@@ -51,17 +51,19 @@ fn runtime(generation: u64, route_count: usize) -> (Arc<DnsRuntime>, Arc<Observe
         dns_router,
     ));
     let transport = Arc::new(ObservedTransport::default());
+    let router = Arc::new(
+        Router::new(&config.routing.rules, &config.routing.default_outbound)
+            .expect("valid default router"),
+    );
     let runtime = DnsRuntime::new(DnsRuntimeParts {
         generation: RuntimeGeneration::new(generation),
         forwarder,
-        router: Arc::new(
-            Router::new(&config.routing.rules, &config.routing.default_outbound)
-                .expect("valid default router"),
-        ),
+        router: Arc::clone(&router),
         group_manager: Arc::new(GroupManager::new(&config.groups, &config.nodes)),
         policy_id: PolicyId::from_config(&config.dns).expect("valid policy"),
         routing_projection: Arc::new(RoutingProjectionSnapshot::new(
-            route_count,
+            generation,
+            router,
             Default::default(),
         )),
         cache: Arc::clone(&cache),
@@ -88,7 +90,7 @@ async fn old_dns_request_keeps_generation_snapshots_after_publication() {
 
     // Then: each lease sees only its own generation's snapshot.
     assert_eq!(old_lease.runtime().generation(), RuntimeGeneration::new(1));
-    assert_eq!(old_lease.runtime().routing_projection().route_count(), 11);
+    assert_eq!(old_lease.runtime().routing_projection().generation(), 1);
     assert!(Arc::ptr_eq(old_lease.runtime().router(), &old_router));
     assert!(Arc::ptr_eq(
         old_lease.runtime().group_manager(),
@@ -96,7 +98,7 @@ async fn old_dns_request_keeps_generation_snapshots_after_publication() {
     ));
     assert_eq!(old_lease.runtime().policy_id(), &old_policy);
     assert_eq!(new_lease.runtime().generation(), RuntimeGeneration::new(2));
-    assert_eq!(new_lease.runtime().routing_projection().route_count(), 22);
+    assert_eq!(new_lease.runtime().routing_projection().generation(), 2);
     assert!(!Arc::ptr_eq(new_lease.runtime().router(), &old_router));
     assert!(!Arc::ptr_eq(
         new_lease.runtime().group_manager(),

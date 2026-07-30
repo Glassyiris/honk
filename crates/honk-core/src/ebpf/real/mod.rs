@@ -426,18 +426,28 @@ impl EbpfBackend for RealEbpfBackend {
         &mut self,
         ip_key: &LpmKey,
         bitmap: &DomainRouting,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), super::DomainRouteWriteError> {
         // Overwrite (not OR) so bitmaps from previous rule generations are
         // fully replaced.  Key is the 16-byte IP data, as in add_domain_ip_bitmap.
         let key_bytes = unsafe { as_bytes(&ip_key.data) };
-        bpf_hash_insert(self.bpf_mut()?, "DOMAIN_ROUTING_MAP", key_bytes, unsafe {
+        let bpf = self
+            .bpf_mut()
+            .map_err(super::DomainRouteWriteError::Other)?;
+        bpf_hash_insert_domain(bpf, "DOMAIN_ROUTING_MAP", key_bytes, unsafe {
             as_bytes(bitmap)
         })
     }
 
-    fn remove_domain_ip_bitmap(&mut self, ip_key: &LpmKey) -> anyhow::Result<()> {
+    fn remove_domain_ip_bitmap(
+        &mut self,
+        ip_key: &LpmKey,
+    ) -> Result<(), super::DomainRouteWriteError> {
         let key_bytes = unsafe { as_bytes(&ip_key.data) };
-        bpf_hash_delete(self.bpf_mut()?, "DOMAIN_ROUTING_MAP", key_bytes)
+        let bpf = self
+            .bpf_mut()
+            .map_err(super::DomainRouteWriteError::Other)?;
+        bpf_hash_delete(bpf, "DOMAIN_ROUTING_MAP", key_bytes)
+            .map_err(super::DomainRouteWriteError::Other)
     }
 
     fn add_ip_route(&mut self, prefix: &str, outbound: OutboundIndex) -> anyhow::Result<()> {

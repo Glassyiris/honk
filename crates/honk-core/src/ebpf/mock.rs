@@ -4,15 +4,12 @@
 //! data structures instead of real kernel eBPF. All operations use
 //! HashMap storage.
 
+#[cfg(test)]
+use super::ProjectionMapOperation;
+use super::{EbpfBackend, LpmKeepSet, RoutingPushPhase};
 use async_trait::async_trait;
 use honk_ebpf_common::*;
 use std::collections::HashMap;
-#[cfg(test)]
-use std::sync::Arc;
-#[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-use super::{EbpfBackend, LpmKeepSet, RoutingPushPhase};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MockRoutingSnapshot {
@@ -165,9 +162,11 @@ pub struct MockEbpfBackend {
     /// BPF statistics overflow counters
     pub bpf_stats: HashMap<u32, u64>,
     pub routing_meta_write_order: Vec<u32>,
-    #[cfg(test)]
-    domain_ip_write_count: Option<Arc<AtomicUsize>>,
     routing_fault: Option<(RoutingPushPhase, usize)>,
+    #[cfg(test)]
+    projection_fault: Option<(ProjectionMapOperation, usize, bool)>,
+    #[cfg(test)]
+    projection_writes: Vec<ProjectionMapOperation>,
 }
 
 impl MockEbpfBackend {
@@ -178,12 +177,6 @@ impl MockEbpfBackend {
 
     pub fn fail_next_routing_phase(&mut self, phase: RoutingPushPhase) {
         self.routing_fault = Some((phase, 1));
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_domain_ip_write_count(mut self, count: Arc<AtomicUsize>) -> Self {
-        self.domain_ip_write_count = Some(count);
-        self
     }
 
     pub fn routing_snapshot(&self) -> MockRoutingSnapshot {
@@ -226,6 +219,30 @@ impl MockEbpfBackend {
                 None
             };
             anyhow::bail!("injected routing push failure at {phase:?}");
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn take_projection_fault(
+        &mut self,
+        operation: ProjectionMapOperation,
+    ) -> Result<(), super::DomainRouteWriteError> {
+        self.projection_writes.push(operation);
+        if let Some((configured, remaining, map_full)) = self.projection_fault
+            && configured == operation
+        {
+            self.projection_fault = if remaining > 1 {
+                Some((configured, remaining - 1, map_full))
+            } else {
+                None
+            };
+            if map_full {
+                return Err(super::DomainRouteWriteError::MapFull);
+            }
+            return Err(super::DomainRouteWriteError::Other(anyhow::anyhow!(
+                "injected projection {operation:?} failure"
+            )));
         }
         Ok(())
     }
@@ -317,6 +334,38 @@ impl EbpfBackend for MockEbpfBackend {
         self.routing_fault = (times != 0).then_some((phase, times));
         Ok(())
     }
+
+    #[cfg(test)]
+    fn inject_projection_fault(
+        &mut self,
+        operation: ProjectionMapOperation,
+        times: usize,
+        map_full: bool,
+    ) -> anyhow::Result<()> {
+        self.projection_fault = (times != 0).then_some((operation, times, map_full));
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn projection_map_snapshot(&self) -> Vec<([u8; 20], DomainRouting)> {
+        let mut snapshot = self
+            .domain_routing_bitmap
+            .iter()
+            .map(|(key, bitmap)| (*key, *bitmap))
+            .collect::<Vec<_>>();
+        snapshot.sort_by_key(|(key, _)| *key);
+        snapshot
+    }
+
+    #[cfg(test)]
+    fn projection_write_log(&self) -> Vec<ProjectionMapOperation> {
+        self.projection_writes.clone()
+    }
+
+    #[cfg(test)]
+    fn clear_projection_write_log(&mut self) {
+        self.projection_writes.clear();
+    }
     fn set_param(&mut self, key: ParamKey, value: u32) -> anyhow::Result<()> {
         self.params.insert(key as u32, value);
         Ok(())
@@ -403,10 +452,6 @@ impl EbpfBackend for MockEbpfBackend {
         ip_key: &LpmKey,
         bitmap: &DomainRouting,
     ) -> anyhow::Result<()> {
-        #[cfg(test)]
-        if let Some(count) = &self.domain_ip_write_count {
-            count.fetch_add(1, Ordering::SeqCst);
-        }
         Self::or_bitmap(&mut self.domain_routing_bitmap, ip_key, bitmap);
         Ok(())
     }
@@ -415,13 +460,20 @@ impl EbpfBackend for MockEbpfBackend {
         &mut self,
         ip_key: &LpmKey,
         bitmap: &DomainRouting,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), super::DomainRouteWriteError> {
+        #[cfg(test)]
+        self.take_projection_fault(ProjectionMapOperation::Set)?;
         self.domain_routing_bitmap
             .insert(Self::lpm_key_bytes(ip_key), *bitmap);
         Ok(())
     }
 
-    fn remove_domain_ip_bitmap(&mut self, ip_key: &LpmKey) -> anyhow::Result<()> {
+    fn remove_domain_ip_bitmap(
+        &mut self,
+        ip_key: &LpmKey,
+    ) -> Result<(), super::DomainRouteWriteError> {
+        #[cfg(test)]
+        self.take_projection_fault(ProjectionMapOperation::Remove)?;
         self.domain_routing_bitmap
             .remove(&Self::lpm_key_bytes(ip_key));
         Ok(())
@@ -808,6 +860,7 @@ mod tests {
         }];
         backend.set_routing_rules(&fewer).unwrap();
         backend.set_routing_meta(1, &all_groups).unwrap();
+        backend.clear_routing_map_tail(1).unwrap();
         assert_eq!(backend.routing_map.len(), 1);
         assert_eq!(backend.routing_map.get(&0).unwrap().outbound, 99);
         assert!(!backend.routing_map.contains_key(&1));

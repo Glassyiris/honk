@@ -116,17 +116,19 @@ impl ControlPlane {
             let current = self.dns_controller.runtime_provider().acquire();
             Arc::clone(current.runtime().persistence())
         };
+        let projection_snapshot = Arc::new(crate::dns::runtime::RoutingProjectionSnapshot::new(
+            generation.get(),
+            Arc::clone(&pinned_router),
+            push_result.domain_bitmaps,
+        ));
         let new_runtime =
             crate::dns::runtime::DnsRuntime::new(crate::dns::runtime::DnsRuntimeParts {
                 generation,
                 forwarder: Arc::clone(&new_dns_forwarder),
-                router: pinned_router,
+                router: Arc::clone(&pinned_router),
                 group_manager: Arc::clone(&new_group_manager),
                 policy_id,
-                routing_projection: Arc::new(crate::dns::runtime::RoutingProjectionSnapshot::new(
-                    push_result.match_set_count,
-                    push_result.domain_bitmaps,
-                )),
+                routing_projection: Arc::clone(&projection_snapshot),
                 cache: self.dns_controller.cache().await,
                 persistence,
                 transport: new_upstream_pool,
@@ -178,6 +180,8 @@ impl ControlPlane {
             *plan_guard = Arc::clone(&new_plan);
         }
 
+        self.dns_controller
+            .update_projection_snapshot(projection_snapshot);
         routing_matcher::RoutingMatcherBuilder::activate_projection(&new_plan);
         honk_outbound::bootstrap::set_global(bootstrap_resolver);
         self.alive_set.set_direct_check_addr(direct_target);
@@ -201,8 +205,6 @@ impl ControlPlane {
             self.alive_set
                 .sync_group_check_urls(&group_check_url_registrations(&config));
         }
-        // Rebuild learned domain→IP routes with the new rule-index bitmaps.
-        self.dns_controller.rebuild_domain_routes().await;
         info!("Configuration applied — {} routes active", route_count);
 
         self.stop_reload_rejection_if_healthy(drain);
@@ -712,7 +714,10 @@ mod atomic_reload_tests {
         let cp = test_cp();
         let before_runtime = cp.dns_controller.runtime_provider().acquire();
         let persistence_id = before_runtime.runtime().persistence().identity();
-        assert!(before_runtime.runtime().routing_projection().route_count() > 0);
+        assert_eq!(
+            before_runtime.runtime().routing_projection().generation(),
+            0
+        );
         drop(before_runtime);
         let mut good = Config::default();
         good.global.log_level = "trace".into();
@@ -728,7 +733,7 @@ mod atomic_reload_tests {
             after_runtime.runtime().persistence().identity(),
             persistence_id
         );
-        assert!(after_runtime.runtime().routing_projection().route_count() > 0);
+        assert_eq!(after_runtime.runtime().routing_projection().generation(), 1);
     }
 
     #[tokio::test]

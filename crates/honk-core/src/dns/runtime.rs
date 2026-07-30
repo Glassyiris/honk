@@ -1,10 +1,8 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use honk_ebpf_common::DomainRouting;
 use tokio::sync::Notify;
 
 use super::cache::DnsCache;
@@ -56,33 +54,7 @@ impl RuntimeState {
     }
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct RoutingProjectionSnapshot {
-    #[allow(dead_code)]
-    route_count: usize,
-    domain_bitmaps: Arc<HashMap<String, Vec<DomainRouting>>>,
-}
-
-impl RoutingProjectionSnapshot {
-    pub(crate) fn new(
-        route_count: usize,
-        domain_bitmaps: HashMap<String, Vec<DomainRouting>>,
-    ) -> Self {
-        Self {
-            route_count,
-            domain_bitmaps: Arc::new(domain_bitmaps),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn route_count(&self) -> usize {
-        self.route_count
-    }
-
-    pub(crate) fn domain_bitmaps(&self) -> &HashMap<String, Vec<DomainRouting>> {
-        &self.domain_bitmaps
-    }
-}
+pub(crate) use super::projection::RoutingProjectionSnapshot;
 
 #[async_trait]
 pub(crate) trait RuntimeTransport: Send + Sync {
@@ -119,6 +91,7 @@ impl ProcessPersistenceHandle {
 pub(crate) struct DnsRuntimeParts {
     pub(crate) generation: RuntimeGeneration,
     pub(crate) forwarder: Arc<DnsForwarder>,
+    #[allow(dead_code)]
     pub(crate) router: Arc<Router>,
     #[allow(dead_code)]
     pub(crate) group_manager: Arc<GroupManager>,
@@ -165,6 +138,7 @@ impl DnsRuntime {
         self.leases.load(Ordering::Acquire)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn router(&self) -> &Arc<Router> {
         &self.parts.router
     }
