@@ -30,6 +30,7 @@ pub mod policy;
 pub mod query;
 pub mod response;
 pub mod routing;
+pub(crate) mod runtime;
 mod singleflight;
 pub mod transport;
 pub mod upstream_pool;

@@ -63,8 +63,26 @@ pub struct LpmKeepSet {
 /// Callback for [`EbpfBackend::conn_state_for_each_chunk`].
 pub type ConnStateChunkVisitor<'a> = dyn FnMut(&[(TuplesKey, ConnState)]) + 'a;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutingPushPhase {
+    Rules,
+    DestinationLpm,
+    SourceLpm,
+    MacLpm,
+    Meta,
+    ClearTail,
+    PruneLpm,
+}
+
 #[async_trait]
 pub trait EbpfBackend: Send + Sync {
+    fn inject_routing_fault(
+        &mut self,
+        _phase: RoutingPushPhase,
+        _times: usize,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("routing fault injection is unsupported")
+    }
     fn detach_hooks(&mut self) -> anyhow::Result<()> {
         Ok(())
     }

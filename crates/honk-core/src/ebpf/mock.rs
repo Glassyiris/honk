@@ -7,8 +7,118 @@
 use async_trait::async_trait;
 use honk_ebpf_common::*;
 use std::collections::HashMap;
+#[cfg(test)]
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::{EbpfBackend, LpmKeepSet};
+use super::{EbpfBackend, LpmKeepSet, RoutingPushPhase};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MockRoutingSnapshot {
+    pub routing_map: Vec<(u32, MockMatchSetSnapshot)>,
+    pub routing_meta: Vec<(u32, u32)>,
+    pub dest_lpm: Vec<([u8; 20], [u32; 4])>,
+    pub source_lpm: Vec<([u8; 20], [u32; 4])>,
+    pub mac_lpm: Vec<([u8; 20], [u32; 4])>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MockMatchSetSnapshot {
+    pub value: MockMatchValue,
+    pub not: u8,
+    pub match_type: u8,
+    pub outbound: u8,
+    pub must: u8,
+    pub mark: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MockMatchValue {
+    Zero([u8; 16]),
+    PortRange { start: u16, end: u16 },
+    L4Protocol(u8),
+    IpVersion(u8),
+    ProcessName([u32; TASK_COMM_LEN / 4]),
+    Dscp(u8),
+    Index(u32),
+    Unknown,
+}
+
+impl MockMatchSetSnapshot {
+    fn from_match_set(value: &MatchSet) -> Self {
+        let normalized = match MatchType::from_u8(value.match_type) {
+            Some(
+                MatchType::DomainSet
+                | MatchType::IpSet
+                | MatchType::SourceIpSet
+                | MatchType::Mac
+                | MatchType::Fallback
+                | MatchType::MustRules,
+            ) => {
+                // SAFETY: [Category 4 — Uninitialized Memory] the routing compiler
+                // initializes `MatchSetValue::raw` for these tags. `MatchSetValue`
+                // is `repr(C)`, so the active field starts at the union's address,
+                // and `[u8; 16]` accepts every initialized bit pattern.
+                MockMatchValue::Zero(unsafe { value.value.raw })
+            }
+            Some(MatchType::Port | MatchType::SourcePort) => {
+                // SAFETY: [Category 4 — Uninitialized Memory] the routing compiler
+                // initializes `MatchSetValue::port_range` before assigning either
+                // port tag. `repr(C)` places that active field at the union's
+                // address, and both `u16` members accept every bit pattern.
+                let range = unsafe { value.value.port_range };
+                MockMatchValue::PortRange {
+                    start: range.port_start,
+                    end: range.port_end,
+                }
+            }
+            Some(MatchType::L4Proto) => {
+                // SAFETY: [Category 5 — Invalid Values] the routing compiler writes
+                // a validated `L4ProtoType` to the active `l4proto_type` field
+                // before assigning this tag. `repr(C)` places the active field at
+                // the union's address, preserving the enum discriminant.
+                MockMatchValue::L4Protocol(unsafe { value.value.l4proto_type } as u8)
+            }
+            Some(MatchType::IpVersion) => {
+                // SAFETY: [Category 5 — Invalid Values] the routing compiler writes
+                // a validated `IpVersionType` to the active `ip_version` field
+                // before assigning this tag. `repr(C)` places the active field at
+                // the union's address, preserving the enum discriminant.
+                MockMatchValue::IpVersion(unsafe { value.value.ip_version } as u8)
+            }
+            Some(MatchType::ProcessName) => {
+                // SAFETY: [Category 4 — Uninitialized Memory] the routing compiler
+                // initializes the complete `pname` array before assigning this tag.
+                // `repr(C)` places the active array at the union's address, and
+                // every `u32` element accepts every bit pattern.
+                MockMatchValue::ProcessName(unsafe { value.value.pname })
+            }
+            Some(MatchType::Dscp) => {
+                // SAFETY: [Category 4 — Uninitialized Memory] the routing compiler
+                // initializes `dscp` before assigning this tag. `repr(C)` places
+                // the active `u8` at the union's address, and every byte is valid.
+                MockMatchValue::Dscp(unsafe { value.value.dscp })
+            }
+            Some(MatchType::Upstream | MatchType::QType) => {
+                // SAFETY: [Category 4 — Uninitialized Memory] producers initialize
+                // `index` before assigning either index-bearing tag. `repr(C)`
+                // places the active `u32` at the union's address, and every `u32`
+                // bit pattern is valid.
+                MockMatchValue::Index(unsafe { value.value.index })
+            }
+            None => MockMatchValue::Unknown,
+        };
+        Self {
+            value: normalized,
+            not: value.not,
+            match_type: value.match_type,
+            outbound: value.outbound,
+            must: value.must,
+            mark: value.mark,
+        }
+    }
+}
 
 /// Mock eBPF backend using in-memory maps.
 #[derive(Debug, Default)]
@@ -54,12 +164,70 @@ pub struct MockEbpfBackend {
     pub outbound_alive: HashMap<u32, u32>,
     /// BPF statistics overflow counters
     pub bpf_stats: HashMap<u32, u64>,
+    pub routing_meta_write_order: Vec<u32>,
+    #[cfg(test)]
+    domain_ip_write_count: Option<Arc<AtomicUsize>>,
+    routing_fault: Option<(RoutingPushPhase, usize)>,
 }
 
 impl MockEbpfBackend {
     /// Create a new mock backend.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn fail_next_routing_phase(&mut self, phase: RoutingPushPhase) {
+        self.routing_fault = Some((phase, 1));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_domain_ip_write_count(mut self, count: Arc<AtomicUsize>) -> Self {
+        self.domain_ip_write_count = Some(count);
+        self
+    }
+
+    pub fn routing_snapshot(&self) -> MockRoutingSnapshot {
+        fn sorted_bitmap_map(map: &HashMap<[u8; 20], DomainRouting>) -> Vec<([u8; 20], [u32; 4])> {
+            let mut entries = map
+                .iter()
+                .map(|(key, value)| (*key, value.bitmap))
+                .collect::<Vec<_>>();
+            entries.sort_by_key(|(key, _)| *key);
+            entries
+        }
+        let mut routing_map = self
+            .routing_map
+            .iter()
+            .map(|(key, value)| (*key, MockMatchSetSnapshot::from_match_set(value)))
+            .collect::<Vec<_>>();
+        routing_map.sort_by_key(|(key, _)| *key);
+        let mut routing_meta = self
+            .routing_meta
+            .iter()
+            .map(|(key, value)| (*key, *value))
+            .collect::<Vec<_>>();
+        routing_meta.sort_by_key(|(key, _)| *key);
+        MockRoutingSnapshot {
+            routing_map,
+            routing_meta,
+            dest_lpm: sorted_bitmap_map(&self.dest_lpm_bitmap),
+            source_lpm: sorted_bitmap_map(&self.source_lpm_bitmap),
+            mac_lpm: sorted_bitmap_map(&self.mac_lpm_bitmap),
+        }
+    }
+
+    fn take_routing_fault(&mut self, phase: RoutingPushPhase) -> anyhow::Result<()> {
+        if let Some((configured, remaining)) = self.routing_fault
+            && configured == phase
+        {
+            self.routing_fault = if remaining > 1 {
+                Some((configured, remaining - 1))
+            } else {
+                None
+            };
+            anyhow::bail!("injected routing push failure at {phase:?}");
+        }
+        Ok(())
     }
 
     // These convert repr(C) types to fixed-size byte arrays so they
@@ -141,6 +309,14 @@ impl MockEbpfBackend {
 
 #[async_trait]
 impl EbpfBackend for MockEbpfBackend {
+    fn inject_routing_fault(
+        &mut self,
+        phase: RoutingPushPhase,
+        times: usize,
+    ) -> anyhow::Result<()> {
+        self.routing_fault = (times != 0).then_some((phase, times));
+        Ok(())
+    }
     fn set_param(&mut self, key: ParamKey, value: u32) -> anyhow::Result<()> {
         self.params.insert(key as u32, value);
         Ok(())
@@ -151,10 +327,10 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     fn set_routing_rules(&mut self, rules: &[MatchSet]) -> anyhow::Result<()> {
+        self.take_routing_fault(RoutingPushPhase::Rules)?;
         for (i, rule) in rules.iter().enumerate() {
             self.routing_map.insert(i as u32, *rule);
         }
-        self.routing_map.retain(|&k, _| (k as usize) < rules.len());
         Ok(())
     }
 
@@ -163,13 +339,17 @@ impl EbpfBackend for MockEbpfBackend {
         count: u32,
         group_bitmaps: &RoutingGroupBitmaps,
     ) -> anyhow::Result<()> {
-        self.routing_meta.insert(0, count);
+        self.take_routing_fault(RoutingPushPhase::Meta)?;
         for (g, words) in group_bitmaps.iter().enumerate() {
             for (w, word) in words.iter().enumerate() {
                 self.routing_meta
                     .insert(1 + (g * ROUTING_GROUP_BITMAP_WORDS + w) as u32, *word);
+                self.routing_meta_write_order
+                    .push(1 + (g * ROUTING_GROUP_BITMAP_WORDS + w) as u32);
             }
         }
+        self.routing_meta.insert(0, count);
+        self.routing_meta_write_order.push(0);
         Ok(())
     }
 
@@ -189,6 +369,7 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     fn add_dest_lpm_bitmap(&mut self, key: &LpmKey, bitmap: &DomainRouting) -> anyhow::Result<()> {
+        self.take_routing_fault(RoutingPushPhase::DestinationLpm)?;
         // Overwrite semantics, matching the real backend: an LPM trie lookup
         // returns the longest-prefix *match*, not the exact entry, so the
         // real backend cannot read-modify-write and overwrites instead.
@@ -204,12 +385,14 @@ impl EbpfBackend for MockEbpfBackend {
         key: &LpmKey,
         bitmap: &DomainRouting,
     ) -> anyhow::Result<()> {
+        self.take_routing_fault(RoutingPushPhase::SourceLpm)?;
         self.source_lpm_bitmap
             .insert(Self::lpm_key_bytes(key), *bitmap);
         Ok(())
     }
 
     fn add_mac_lpm_bitmap(&mut self, key: &LpmKey, bitmap: &DomainRouting) -> anyhow::Result<()> {
+        self.take_routing_fault(RoutingPushPhase::MacLpm)?;
         self.mac_lpm_bitmap
             .insert(Self::lpm_key_bytes(key), *bitmap);
         Ok(())
@@ -220,6 +403,10 @@ impl EbpfBackend for MockEbpfBackend {
         ip_key: &LpmKey,
         bitmap: &DomainRouting,
     ) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if let Some(count) = &self.domain_ip_write_count {
+            count.fetch_add(1, Ordering::SeqCst);
+        }
         Self::or_bitmap(&mut self.domain_routing_bitmap, ip_key, bitmap);
         Ok(())
     }
@@ -260,6 +447,7 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     fn clear_routing_map_tail(&mut self, start: u32) -> anyhow::Result<()> {
+        self.take_routing_fault(RoutingPushPhase::ClearTail)?;
         // The real backend zeroes the slots; dropping them is equivalent
         // here because ROUTING_META_MAP[0] (the active count) already
         // excludes them.
@@ -268,6 +456,7 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     fn prune_lpm_entries(&mut self, keep: &LpmKeepSet) -> anyhow::Result<()> {
+        self.take_routing_fault(RoutingPushPhase::PruneLpm)?;
         self.dest_lpm_bitmap.retain(|k, _| keep.dest.contains(k));
         self.source_lpm_bitmap
             .retain(|k, _| keep.source.contains(k));
@@ -722,6 +911,27 @@ mod tests {
             .unwrap();
         backend.clear_routing_map_tail(2).unwrap();
         assert_eq!(backend.routing_map.len(), 2);
+    }
+
+    #[test]
+    fn routing_snapshot_detects_union_payload_changes() {
+        let mut backend = MockEbpfBackend::new();
+        let rule = |port| MatchSet {
+            value: MatchSetValue {
+                port_range: PortRange {
+                    port_start: port,
+                    port_end: port,
+                },
+            },
+            match_type: MatchType::Port as u8,
+            ..MatchSet::default()
+        };
+        backend.routing_map.insert(0, rule(80));
+        let before = backend.routing_snapshot();
+
+        backend.routing_map.insert(0, rule(81));
+
+        assert_ne!(backend.routing_snapshot(), before);
     }
 
     #[test]

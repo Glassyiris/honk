@@ -117,6 +117,12 @@ pub struct ControlPlane {
     /// Shared clash mode state (Rule/Global/Direct + GLOBAL selection),
     /// installed by `set_mode_state` when the clash API is enabled.
     mode_state: Option<crate::mode::SharedModeState>,
+    datapath_healthy: Arc<std::sync::atomic::AtomicBool>,
+    active_routing_plan: Arc<parking_lot::RwLock<Arc<routing_matcher::RoutingPushPlan>>>,
+}
+
+fn accepts_transparent_connection(drain: &DrainTracker) -> bool {
+    !drain.should_reject()
 }
 
 impl ControlPlane {
@@ -127,6 +133,36 @@ impl ControlPlane {
         proxy_registry: std::sync::Arc<ProxyRegistry>,
         dns_resolver: DnsResolver,
         dns_forwarder: std::sync::Arc<crate::dns::forwarder::DnsForwarder>,
+    ) -> anyhow::Result<Self> {
+        let dns_router = Arc::new(crate::dns::routing::DnsRouter::new_from_dns_config(
+            &config.dns,
+        )?);
+        let dns_upstream_pool = Arc::new(crate::dns::upstream_pool::UpstreamPool::new_with_proxy(
+            &config.dns.upstream,
+            dns_router,
+            Some(Arc::clone(&proxy_registry)),
+            config.nodes.clone(),
+            config.groups.clone(),
+        )?);
+        Self::new_with_upstream_pool(
+            config,
+            ebpf,
+            router,
+            proxy_registry,
+            dns_resolver,
+            dns_forwarder,
+            dns_upstream_pool,
+        )
+    }
+
+    pub fn new_with_upstream_pool(
+        config: Config,
+        ebpf: Box<dyn EbpfBackend>,
+        router: Router,
+        proxy_registry: std::sync::Arc<ProxyRegistry>,
+        dns_resolver: DnsResolver,
+        dns_forwarder: std::sync::Arc<crate::dns::forwarder::DnsForwarder>,
+        dns_upstream_pool: Arc<crate::dns::upstream_pool::UpstreamPool>,
     ) -> anyhow::Result<Self> {
         let (tx, rx) = mpsc::channel(256);
 
@@ -142,12 +178,9 @@ impl ControlPlane {
         // clash API gets a real direct latency too. The urltest (on-demand
         // delay) path shares the same target.
         let direct_target = direct_check_addr(&config.global.bootstrap_resolver);
+        let direct_target_socket = direct_target.parse()?;
         alive_set.set_direct_check_addr(direct_target.clone());
-        honk_outbound::urltest::set_urltest_direct_target(
-            direct_target
-                .parse()
-                .expect("direct check addr is a SocketAddr"),
-        );
+        honk_outbound::urltest::set_urltest_direct_target(direct_target_socket);
         let dns_resolver = Arc::new(dns_resolver);
         // Register health checks per the config's group membership; reload
         // re-runs the same sync via `reload_group_manager`.
@@ -194,15 +227,47 @@ impl ControlPlane {
             })));
         }
 
+        let pinned_router = Arc::new(Router::new(
+            &config.routing.rules,
+            &config.routing.default_outbound,
+        )?);
+        let pinned_groups = group_manager.read().clone();
+        dns_upstream_pool.set_group_manager_snapshot(Arc::clone(&pinned_groups));
+        dns_upstream_pool.set_traffic_router_snapshot(Arc::clone(&pinned_router));
+        let policy_id = crate::dns::policy::PolicyId::from_config(&config.dns)?;
+        let initial_routing_plan = Arc::new(Self::compile_routing_plan(&config, &router)?);
+        let initial_push_result = initial_routing_plan.result();
+        let persistence = crate::dns::runtime::ProcessPersistenceHandle::new(dns_forwarder.cache());
         let ebpf_arc = Arc::new(RwLock::new(ebpf));
         let router_arc = Arc::new(RwLock::new(router));
         let config_arc = Arc::new(RwLock::new(config));
-
-        let dns_controller = Arc::new(crate::control::dns_control::DnsController::new(
-            dns_forwarder.clone(),
-            ebpf_arc.clone(),
-            router_arc.clone(),
+        let initial_runtime =
+            crate::dns::runtime::DnsRuntime::new(crate::dns::runtime::DnsRuntimeParts {
+                generation: crate::dns::runtime::RuntimeGeneration::new(0),
+                forwarder: dns_forwarder.clone(),
+                router: pinned_router,
+                group_manager: pinned_groups,
+                policy_id,
+                routing_projection: Arc::new(crate::dns::runtime::RoutingProjectionSnapshot::new(
+                    initial_push_result.match_set_count,
+                    initial_push_result.domain_bitmaps,
+                )),
+                cache: dns_forwarder.cache(),
+                persistence,
+                transport: dns_upstream_pool,
+            });
+        let runtime_provider = Arc::new(crate::dns::runtime::DnsServiceProvider::new(
+            initial_runtime,
         ));
+
+        let dns_controller = Arc::new(
+            crate::control::dns_control::DnsController::new_with_runtime(
+                dns_forwarder.clone(),
+                runtime_provider,
+                ebpf_arc.clone(),
+                router_arc.clone(),
+            ),
+        );
         // Health-check name resolution shares honk's own DNS forwarder
         // (routing / cache / serve-stale, and always the *current* forwarder
         // across reloads) instead of the raw system resolver; bootstrap DNS
@@ -259,6 +324,8 @@ impl ControlPlane {
             concurrency_limit: Arc::new(tokio::sync::Semaphore::new(1024)),
             background_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             mode_state: None,
+            datapath_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            active_routing_plan: Arc::new(parking_lot::RwLock::new(initial_routing_plan)),
         };
 
         // interrupt_connections: when a group's selected node changes, close
@@ -434,6 +501,11 @@ impl ControlPlane {
         self.command_tx.clone()
     }
 
+    pub fn is_datapath_healthy(&self) -> bool {
+        self.datapath_healthy
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let config = self.config.read().await;
         let tproxy_port = config.global.tproxy_port;
@@ -491,11 +563,13 @@ impl ControlPlane {
         let udp6_socket = udp6_socket.map(Arc::new);
 
         let routing_pushed = {
-            let config = self.config.read().await;
-            let router = self.router.read().await;
+            let plan = self.active_routing_plan.read().clone();
             let mut ebpf = self.ebpf.write().await;
-            match Self::push_routing_to_ebpf(&config, &router, &mut ebpf) {
-                Ok(_) => true,
+            match routing_matcher::RoutingMatcherBuilder::push_plan(ebpf.as_mut(), &plan) {
+                Ok(_) => {
+                    routing_matcher::RoutingMatcherBuilder::activate_projection(&plan);
+                    true
+                }
                 Err(e) => {
                     warn!("Failed to push routing to eBPF (non-fatal): {}", e);
                     false
@@ -819,7 +893,7 @@ impl ControlPlane {
                             if let Err(e) = set_so_mark_zero(stream.as_raw_fd()) {
                                 warn!("Failed to clear SO_MARK on accepted socket from {}: {}", addr, e);
                             }
-                            if drain.should_reject() {
+                            if !accepts_transparent_connection(&drain) {
                                 debug!("Rejecting new connection from {} (draining)", addr);
                                 continue;
                             }
@@ -870,7 +944,7 @@ impl ControlPlane {
                             if let Err(e) = set_so_mark_zero(stream.as_raw_fd()) {
                                 warn!("Failed to clear SO_MARK on accepted socket from {}: {}", addr, e);
                             }
-                            if drain.should_reject() {
+                            if !accepts_transparent_connection(&drain) {
                                 debug!("Rejecting new connection from {} (draining)", addr);
                                 continue;
                             }
@@ -903,7 +977,7 @@ impl ControlPlane {
                 recv_result = recv_from_with_orig_dst(&udp4_socket, &mut udp4_buf) => {
                     match recv_result {
                         Ok((n, src_addr, original_dst)) => {
-                            if drain.should_reject() { continue; }
+                            if !accepts_transparent_connection(&drain) { continue; }
                             // Fast path: the datagram belongs to an established
                             // endpoint — forward it inline from the receive
                             // buffer (no spawn, no heap copy, no sniffer).
@@ -942,7 +1016,7 @@ impl ControlPlane {
                 } => {
                     match recv6_result {
                         Ok((n, src_addr, original_dst)) => {
-                            if drain.should_reject() { continue; }
+                            if !accepts_transparent_connection(&drain) { continue; }
                             // Fast path: the datagram belongs to an established
                             // endpoint — forward it inline from the receive
                             // buffer (no spawn, no heap copy, no sniffer).
@@ -1022,6 +1096,7 @@ impl ControlPlane {
             }
         }
 
+        self.dns_controller.runtime_provider().shutdown().await;
         let dns_cache = self.dns_controller.cache().await;
         let persistence = dns_cache.lock().await.persistence();
         if let Some(persistence) = persistence
@@ -1054,12 +1129,10 @@ impl ControlPlane {
         }
     }
 
-    /// Push compiled routing rules to eBPF MatchSet arrays.
-    fn push_routing_to_ebpf(
+    fn compile_routing_plan(
         config: &Config,
         router: &Router,
-        ebpf: &mut Box<dyn EbpfBackend>,
-    ) -> anyhow::Result<routing_matcher::RoutingPushResult> {
+    ) -> anyhow::Result<routing_matcher::RoutingPushPlan> {
         let mut outbound_name_to_id = std::collections::HashMap::new();
         outbound_name_to_id.insert("direct".into(), OutboundIndex::Direct as u8);
         outbound_name_to_id.insert("block".into(), OutboundIndex::Block as u8);
@@ -1076,20 +1149,12 @@ impl ControlPlane {
             .parse::<DialMode>()
             .ok()
             .unwrap_or(DialMode::DomainPlusPlus);
-        let push_result = routing_matcher::RoutingMatcherBuilder::build_and_push(
-            ebpf.as_mut(),
+        routing_matcher::RoutingMatcherBuilder::compile(
             router.compiled_routes(),
             &outbound_name_to_id,
             fallback_outbound,
             dial_mode,
-        )?;
-
-        info!(
-            "eBPF routing rules pushed ({} rules, {} domain bitmaps)",
-            router.route_count(),
-            push_result.domain_bitmaps.len()
-        );
-        Ok(push_result)
+        )
     }
 }
 

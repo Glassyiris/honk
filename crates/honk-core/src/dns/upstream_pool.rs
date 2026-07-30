@@ -16,7 +16,7 @@ use honk_config::node::{Group, Node};
 use honk_config::types::DnsProtocol;
 use honk_ebpf_common::DAE_BYPASS_MARK;
 use honk_outbound::alive::{IpVersion, ProbeDomain};
-use honk_outbound::group::SharedGroupManager;
+use honk_outbound::group::{GroupManager, SharedGroupManager};
 use tokio::sync::RwLock as AsyncRwLock;
 use tracing::{debug, warn};
 
@@ -96,14 +96,30 @@ pub struct UpstreamPool {
     /// Interior mutability so the control plane can attach the shared cell
     /// after construction without wrapping the whole pool.
     group_manager: parking_lot::RwLock<Option<SharedGroupManager>>,
+    group_manager_snapshot: parking_lot::RwLock<Option<Arc<GroupManager>>>,
     /// Traffic router cell (same as control plane). Used when an upstream has
     /// **no** explicit `-> outbound` — dae semantics: dial the DNS server IP
     /// through normal `routing { }` + group selection.
     traffic_router: parking_lot::RwLock<Option<Arc<AsyncRwLock<Router>>>>,
+    traffic_router_snapshot: parking_lot::RwLock<Option<Arc<Router>>>,
     dns_query_timeout: Duration,
     dns_dial_timeout: Duration,
     active_transport_tasks: Arc<AtomicUsize>,
     shutdown: tokio::sync::RwLock<PoolState>,
+}
+
+fn select_group_leaf(group_manager: &GroupManager, outbound: &str) -> Option<Node> {
+    group_manager.get_group_policy(outbound)?;
+    let mut picked =
+        group_manager.select_nodes_in_order_for_domain(outbound, ProbeDomain::Tcp, IpVersion::V4);
+    if picked.is_empty() {
+        picked = group_manager.select_nodes_in_order_for_domain(
+            outbound,
+            ProbeDomain::Tcp,
+            IpVersion::V6,
+        );
+    }
+    picked.into_iter().next().cloned()
 }
 
 impl UpstreamPool {
@@ -152,7 +168,9 @@ impl UpstreamPool {
             nodes,
             groups,
             group_manager: parking_lot::RwLock::new(None),
+            group_manager_snapshot: parking_lot::RwLock::new(None),
             traffic_router: parking_lot::RwLock::new(None),
+            traffic_router_snapshot: parking_lot::RwLock::new(None),
             dns_query_timeout: Duration::from_secs(3),
             dns_dial_timeout: Duration::from_secs(10),
             active_transport_tasks: Arc::new(AtomicUsize::new(0)),
@@ -184,6 +202,15 @@ impl UpstreamPool {
         self
     }
 
+    pub fn set_group_manager_snapshot(&self, gm: Arc<GroupManager>) {
+        *self.group_manager_snapshot.write() = Some(gm);
+    }
+
+    pub fn with_group_manager_snapshot(self, gm: Arc<GroupManager>) -> Self {
+        self.set_group_manager_snapshot(gm);
+        self
+    }
+
     /// Install the traffic router used for **implicit** DNS-upstream dial
     /// selection (dae: Route the DNS server IP through `routing { }`).
     pub fn set_traffic_router(&self, router: Option<Arc<AsyncRwLock<Router>>>) {
@@ -193,6 +220,15 @@ impl UpstreamPool {
     /// Builder-style install of the traffic router.
     pub fn with_traffic_router(self, router: Arc<AsyncRwLock<Router>>) -> Self {
         *self.traffic_router.write() = Some(router);
+        self
+    }
+
+    pub fn set_traffic_router_snapshot(&self, router: Arc<Router>) {
+        *self.traffic_router_snapshot.write() = Some(router);
+    }
+
+    pub fn with_traffic_router_snapshot(self, router: Arc<Router>) -> Self {
+        self.set_traffic_router_snapshot(router);
         self
     }
 
@@ -208,7 +244,14 @@ impl UpstreamPool {
             return None;
         }
 
-        {
+        if let Some(gm) = self.group_manager_snapshot.read().as_ref() {
+            if let Some(node) = select_group_leaf(gm, outbound) {
+                return Some(node);
+            }
+            if gm.get_group_policy(outbound).is_some() {
+                return None;
+            }
+        } else {
             let cell = self.group_manager.read();
             if let Some(cell) = cell.as_ref() {
                 let gm = cell.read();
@@ -287,12 +330,6 @@ impl UpstreamPool {
         }
 
         // 2) Implicit: traffic-route the DNS server endpoint.
-        let router_cell = self.traffic_router.read().clone();
-        let Some(router_arc) = router_cell else {
-            debug!("DNS dial leaf (no traffic router): direct");
-            return Ok(None);
-        };
-
         let target = match Self::resolve_udp_addr(entry).await {
             Ok(a) => a,
             Err(e) => {
@@ -325,9 +362,15 @@ impl UpstreamPool {
             dscp: None,
         };
 
-        let outbound_name = {
-            let router = router_arc.read().await;
+        let outbound_name = if let Some(router) = self.traffic_router_snapshot.read().as_ref() {
             router.route(&conn).to_string()
+        } else {
+            let router_cell = self.traffic_router.read().clone();
+            let Some(router_arc) = router_cell else {
+                debug!("DNS dial leaf (no traffic router): direct");
+                return Ok(None);
+            };
+            router_arc.read().await.route(&conn).to_string()
         };
 
         debug!(

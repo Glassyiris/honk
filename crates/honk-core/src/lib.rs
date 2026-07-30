@@ -632,13 +632,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let dns_resolver = dns::DnsResolver::with_forwarder(&config.dns, dns_forwarder.clone())?;
     info!("DNS resolver ready");
 
-    let mut control_plane = control::ControlPlane::new(
+    let mut control_plane = control::ControlPlane::new_with_upstream_pool(
         config,
         ebpf_backend,
         router,
         proxy_registry,
         dns_resolver,
         dns_forwarder,
+        dns_upstream_pool.clone(),
     )?;
 
     // Wire GroupManager into DNS outbound selection (Selector/URLTest/…).
