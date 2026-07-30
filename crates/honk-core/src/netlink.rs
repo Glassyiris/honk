@@ -40,6 +40,7 @@ const RTM_NEWNEIGH: u16 = 28;
 const ARPHRD_ETHER: u16 = 1;
 const IFF_UP: u32 = 0x1;
 
+const IFLA_ADDRESS: u16 = 1;
 const IFLA_IFNAME: u16 = 3;
 const IFLA_LINKINFO: u16 = 18;
 const IFLA_NET_NS_FD: u16 = 28;
@@ -60,6 +61,7 @@ const NDA_LLADDR: u16 = 2;
 
 const FRA_FWMARK: u16 = 10;
 const FRA_TABLE: u16 = 15;
+const FRA_FWMASK: u16 = 16;
 
 const NUD_PERMANENT: u16 = 0x80;
 const RTN_UNICAST: u8 = 1;
@@ -195,6 +197,24 @@ impl NlSock {
             return Err(io::Error::last_os_error());
         }
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        // A netlink reply that never comes must not hang engine startup.
+        let timeout = libc::timeval {
+            tv_sec: 2,
+            tv_usec: 0,
+        };
+        // SAFETY: standard setsockopt on the fresh socket.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                &timeout as *const libc::timeval as *const libc::c_void,
+                std::mem::size_of::<libc::timeval>() as u32,
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
         let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
         addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
         // SAFETY: addr is a valid sockaddr_nl.
@@ -209,6 +229,42 @@ impl NlSock {
             return Err(io::Error::last_os_error());
         }
         Ok(Self { fd, seq: 0 })
+    }
+
+    /// Receive one datagram: EINTR is retried, a truncated read grows the
+    /// buffer (up to 1 MiB) and retries, a timeout is a hard error.
+    fn recv_one(&self, buf: &mut Vec<u8>) -> io::Result<usize> {
+        const MAX_BUF: usize = 1 << 20;
+        loop {
+            // SAFETY: buf is a valid writable region of buf.len() bytes.
+            let mut iov = libc::iovec {
+                iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+                iov_len: buf.len(),
+            };
+            let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
+            hdr.msg_iov = &mut iov;
+            hdr.msg_iovlen = 1;
+            let n = unsafe { libc::recvmsg(self.fd.as_raw_fd(), &mut hdr, 0) };
+            if n < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(e);
+            }
+            if hdr.msg_flags & libc::MSG_TRUNC != 0 {
+                let next = (buf.len() * 2).min(MAX_BUF);
+                if next == buf.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "netlink message exceeds 1 MiB",
+                    ));
+                }
+                buf.resize(next, 0);
+                continue;
+            }
+            return Ok(n as usize);
+        }
     }
 
     /// Send one request and wait for the kernel ack (NLMSG_ERROR with
@@ -248,21 +304,9 @@ impl NlSock {
             return Err(io::Error::last_os_error());
         }
 
-        let mut resp = [0u8; 4096];
+        let mut resp = vec![0u8; 4096];
         loop {
-            // SAFETY: resp is a valid writable buffer.
-            let n = unsafe {
-                libc::recv(
-                    self.fd.as_raw_fd(),
-                    resp.as_mut_ptr() as *mut libc::c_void,
-                    resp.len(),
-                    0,
-                )
-            };
-            if n < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let n = n as usize;
+            let n = self.recv_one(&mut resp)?;
             let mut off = 0usize;
             while off + 16 <= n {
                 // nlmsghdr: len(4) type(2) flags(2) seq(4) pid(4)
@@ -444,7 +488,10 @@ impl NlSock {
             0,
             0,
         ];
-        let mut attrs: Vec<(u16, Attr)> = vec![(FRA_FWMARK, Attr::U32(fwmark))];
+        let mut attrs: Vec<(u16, Attr)> = vec![
+            (FRA_FWMARK, Attr::U32(fwmark)),
+            (FRA_FWMASK, Attr::U32(u32::MAX)),
+        ];
         if table > 255 {
             attrs.push((FRA_TABLE, Attr::U32(table)));
         }
@@ -575,22 +622,10 @@ impl NlSock {
             return Err(io::Error::last_os_error());
         }
 
-        let mut resp = [0u8; 32768];
+        let mut resp = vec![0u8; 8192];
         let mut found: Option<(u32, [u8; 6])> = None;
         loop {
-            // SAFETY: resp is a valid writable buffer.
-            let n = unsafe {
-                libc::recv(
-                    self.fd.as_raw_fd(),
-                    resp.as_mut_ptr() as *mut libc::c_void,
-                    resp.len(),
-                    0,
-                )
-            };
-            if n < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let n = n as usize;
+            let n = self.recv_one(&mut resp)?;
             let mut done = false;
             let mut off = 0usize;
             while off + 16 <= n {
@@ -709,5 +744,156 @@ mod tests {
         let mut nl = NlSock::new().unwrap();
         let (idx, _mac) = nl.get_link("lo").expect("lo must exist");
         assert_eq!(idx, 1);
+    }
+
+    /// Whether daens is unavailable or the switch succeeds, the calling
+    /// thread must come back in its original namespace (P1a regression).
+    #[test]
+    fn netns_with_daens_restores_namespace() {
+        let before = std::fs::read_link("/proc/thread-self/ns/net").unwrap();
+        let _ = crate::with_daens_netns("test", || Ok(()));
+        let after = std::fs::read_link("/proc/thread-self/ns/net").unwrap();
+        assert_eq!(before, after);
+    }
+
+    const RTM_GETRULE: u16 = 34;
+    const NLM_F_DUMP: u16 = 0x300;
+    const NLMSG_DONE: u16 = 3;
+
+    /// Dump (fwmark, fwmask, table) of every rule in the current namespace.
+    fn rule_dump(nl: &mut NlSock) -> io::Result<Vec<(u32, u32, u32)>> {
+        nl.seq += 1;
+        let seq = nl.seq;
+        let mut buf = Vec::with_capacity(32);
+        buf.extend_from_slice(&[0u8; 4]);
+        buf.extend_from_slice(&RTM_GETRULE.to_ne_bytes());
+        buf.extend_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP).to_ne_bytes());
+        buf.extend_from_slice(&seq.to_ne_bytes());
+        buf.extend_from_slice(&0u32.to_ne_bytes());
+        buf.extend_from_slice(&[0u8; 12]); // fib_rule_hdr
+        let len = buf.len() as u32;
+        buf[0..4].copy_from_slice(&len.to_ne_bytes());
+        // SAFETY: buf holds a well-formed nlmsghdr blob.
+        let sent = unsafe {
+            libc::send(
+                nl.fd.as_raw_fd(),
+                buf.as_ptr() as *const libc::c_void,
+                buf.len(),
+                0,
+            )
+        };
+        if sent < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut out = Vec::new();
+        let mut resp = vec![0u8; 8192];
+        'outer: loop {
+            let n = nl.recv_one(&mut resp)?;
+            let mut off = 0usize;
+            while off + 16 <= n {
+                let hlen = u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap()) as usize;
+                let htype = u16::from_ne_bytes(resp[off + 4..off + 6].try_into().unwrap());
+                let hseq = u32::from_ne_bytes(resp[off + 8..off + 12].try_into().unwrap());
+                if hseq == seq {
+                    match htype {
+                        NLMSG_DONE => break 'outer,
+                        NLMSG_ERROR => {
+                            let err =
+                                i32::from_ne_bytes(resp[off + 16..off + 20].try_into().unwrap());
+                            if err != 0 {
+                                return Err(io::Error::from_raw_os_error(-err));
+                            }
+                            break 'outer;
+                        }
+                        RTM_NEWRULE if hlen >= 16 + 12 => {
+                            let hdr = &resp[off + 16..off + hlen];
+                            let mut table = u32::from(hdr[4]);
+                            let mut mark = 0u32;
+                            let mut mask = 0u32;
+                            let mut aoff = 12;
+                            while aoff + 4 <= hdr.len() {
+                                let alen =
+                                    u16::from_ne_bytes(hdr[aoff..aoff + 2].try_into().unwrap())
+                                        as usize;
+                                let atype =
+                                    u16::from_ne_bytes(hdr[aoff + 2..aoff + 4].try_into().unwrap());
+                                if alen < 4 || aoff + alen > hdr.len() {
+                                    break;
+                                }
+                                let payload = &hdr[aoff + 4..aoff + alen];
+                                if payload.len() == 4 {
+                                    let v = u32::from_ne_bytes(payload.try_into().unwrap());
+                                    match atype {
+                                        FRA_FWMARK => mark = v,
+                                        FRA_FWMASK => mask = v,
+                                        FRA_TABLE => table = v,
+                                        _ => {}
+                                    }
+                                }
+                                aoff += align(alen);
+                            }
+                            out.push((mark, mask, table));
+                        }
+                        _ => {}
+                    }
+                }
+                let next = align(hlen);
+                if next == 0 {
+                    break;
+                }
+                off += next;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Root-only roundtrip over every NlSock op the engine uses. Run with:
+    /// `just test-netns`.
+    #[test]
+    #[ignore = "requires root; run via just test-netns"]
+    fn netns_link_addr_route_rule_neigh_roundtrip() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping: requires root");
+            return;
+        }
+        const MARK: u32 = 0x0800_0099;
+        const TABLE: u32 = 100;
+        let mut nl = NlSock::new().unwrap();
+        // Idempotent start: drop leftovers from an interrupted earlier run.
+        let _ = nl.del_rule_fwmark(FAM_V4, MARK, TABLE);
+        if let Ok((idx, _)) = nl.get_link("honkt0") {
+            let _ = nl.del_link(idx);
+        }
+
+        let result = (|| -> io::Result<()> {
+            nl.add_veth_pair("honkt0", "honkt1")?;
+            let (idx, _mac) = nl.get_link("honkt0")?;
+            nl.set_link_up(idx, true)?;
+            nl.addr_op(true, idx, FAM_V4, &[10, 254, 99, 1], 32)?;
+            nl.add_route(
+                FAM_V4,
+                TABLE,
+                ROUTE_UNICAST,
+                SCOPE_LINK,
+                PROTO_STATIC,
+                Some((&[198, 51, 100, 0], 24)),
+                None,
+                Some(idx),
+            )?;
+            nl.add_rule_fwmark(FAM_V4, MARK, TABLE)?;
+            let rules = rule_dump(&mut nl)?;
+            assert!(
+                rules.contains(&(MARK, u32::MAX, TABLE)),
+                "fwmark rule with full mask missing from dump: {rules:?}"
+            );
+            nl.neigh_replace(idx, FAM_V4, &[198, 51, 100, 1], &[0x02, 0, 0, 0, 0, 1])?;
+            Ok(())
+        })();
+
+        let _ = nl.del_rule_fwmark(FAM_V4, MARK, TABLE);
+        if let Ok((idx, _)) = nl.get_link("honkt0") {
+            let _ = nl.del_link(idx);
+        }
+        result.unwrap();
     }
 }
