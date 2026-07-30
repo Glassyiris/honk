@@ -1,6 +1,8 @@
 # Benchmark 实验室与结果
 
-本文档描述 honk 的可复现 benchmark 环境，以及与 dae 的同时间 A/B 结果。
+本文档描述 honk 的可复现 benchmark 环境，以及与自定义
+[kdae 构建（commit `2a007b39`）](https://github.com/olicesx/dae/commit/2a007b399210ceb25e0538d381bbbe9d86a302e4)
+的同时间 A/B 结果。
 文档随代码维护，环境与数据保持同步。
 
 ## 实验室拓扑
@@ -14,7 +16,7 @@
 │  │ 192.168.222.2 ├──────────┤         │   tuic       :2444/udp      │
 │  └───────┬───────┘          │         │   anytls-sb  :2445/tcp      │
 │          │ NAT + TPROXY     │         │   anytls-go  :2443/tcp      │
-│  honk / dae（轮流运行）       │         │   ss-2022    :2447/tcp      │
+│  honk / kdae（轮流运行）      │         │   ss-2022    :2447/tcp      │
 │  lan_ifname: veth-lab       │         │   trojan     :2446/tcp      │
 │  wan_ifname: ens3           │         │  测试目标：                  │
 └─────────────────────────────┘         │   http       :8001-8006     │
@@ -23,7 +25,7 @@
                                         └─────────────────────────────┘
 ```
 
-- **引擎机（10.10.10.50）**：同一时刻只运行 honk 或 dae 之一。客户端位于
+- **引擎机（10.10.10.50）**：同一时刻只运行 honk 或 kdae 之一。客户端位于
   netns `lab`(veth 对 `veth-lab` ↔ `veth-client`,192.168.222.0/24,
   nftables masquerade NAT)。客户端流量完整经过引擎的真实 eBPF 数据面，
   不是 loopback 捷径。
@@ -56,8 +58,27 @@
 
 引擎配置按目的端口路由，无需 API 切换：`5201/8001 → hy2`、`5202/8002 →
 tuic`、`5203/8003 → ss2022`、`5204/8004 → trojan`、`5205/8005 → anytls-sb`、
-`5206/8006 → anytls-go`（仅 honk,dae 不支持 AnyTLS)。节点服务器端口走
+`5206/8006 → anytls-go`（仅 honk；此 kdae 构建不支持 AnyTLS）。节点服务器端口走
 `direct(must)`。
+
+### 对比程序溯源
+
+下文所有 `kdae` 数值都来自自定义 dae fork 的精确 commit
+[`2a007b399210ceb25e0538d381bbbe9d86a302e4`](https://github.com/olicesx/dae/commit/2a007b399210ceb25e0538d381bbbe9d86a302e4)，
+并非上游 dae 的发行版或当前 main。该 fork 已与上游分叉，因此结果只适用于
+此留存 artifact：
+
+| 项目 | 溯源 |
+| --- | --- |
+| 对比程序二进制 | SHA-256 `bc2f70bfa79ed6adc14fb899b76555defc5ac2f12758944ae58b8e1a6b702de1` |
+| 内嵌 VCS 元数据 | revision `2a007b399210ceb25e0538d381bbbe9d86a302e4`；`vcs.modified=false` |
+| Go/构建设置 | `go1.26.0-X:heapminimum512kib`；`-tags=trace`；`-trimpath=true`；`CGO_ENABLED=0`；`GOARCH=amd64`；`GOEXPERIMENT=heapminimum512kib,randomizedheapbase64` |
+| 构建输入 | `go.mod` SHA-256 `beb10605de028399258973a04de8c5e6917998b915ade7399e843098159f382f`；`go.sum` `7424003bbe18470129018883bdf4ac38eea5a9c106dd19f6d0ee2ba89ed70a0a`；`Makefile` `e3c54593db5c9ac3b10a7fc7a4428527ffe99f4546da67174e0ca2b22baed702` |
+| 运行配置 | `/etc/dae/config.dae`；SHA-256 `6bac2fbb00796dafd435653378d4b1185a47c4e39a29757094250c6c903527a2` |
+
+二进制、干净构建树和运行配置均已留存并恢复；历史 `/root/bench.sh`
+harness 已不再留存，因此协议表是绑定了溯源的历史结果，而非当前可重新执行的
+benchmark recipe。配置内容可能包含凭据，故不在此公开。
 
 ## 运行方式
 
@@ -70,6 +91,7 @@ bash /root/test-protocols.sh
 # 完整 benchmark：每协议的冷/热首请求延迟、iperf3 下载带宽、
 # 引擎 CPU% 与 RSS
 bash /root/bench.sh honk 'hy2 tuic ss2022 trojan anytls-sb anytls-go'
+# 历史 selector 名为 `dae`；它启动的是上文标识的 kdae artifact。
 bash /root/bench.sh dae  'hy2 tuic ss2022 trojan'
 
 # 冷建连延迟（健康检查基本关闭，3600s 间隔）
@@ -83,7 +105,7 @@ bash /root/flood-test.sh 100000 20000
 
 ### 带宽（iperf3 `-R` 单流，8s;direct 基线 9.41 Gbps)
 
-| 协议 | dae | honk | honk/dae |
+| 协议 | kdae | honk | honk/kdae |
 | --- | --- | --- | --- |
 | hy2 | 2.06 Gbps | 1.86 Gbps | 90% |
 | tuic | 2.63 Gbps | 2.01 Gbps | 76% |
@@ -97,7 +119,7 @@ bash /root/flood-test.sh 100000 20000
 
 同时间 A/B/C。括号内 CPU = 测试期间核数;cold = 引擎启动后首个请求。
 
-| 协议 | dae | sing-box | honk |
+| 协议 | kdae | sing-box | honk |
 | --- | --- | --- | --- |
 | hy2 | 2.10 Gbps (1.28c) | 2.10 Gbps (1.58c) | 1.93 Gbps (0.97c) |
 | tuic | 1.80 Gbps (1.07c) | 2.09 Gbps (1.56c) | 2.10 Gbps (1.07c) |
@@ -109,12 +131,12 @@ bash /root/flood-test.sh 100000 20000
 | RSS | 61–65 MB | 51–52 MB | 14–16 MB |
 
 结论:honk 在所有协议上 CPU/Gbps 最低、内存约为 1/4、冷建连最快。
-剩余差距:hy2 比两者低 8%,ss2022 比 dae 低 12%,trojan 比 sing-box
+剩余差距:hy2 比两者低 8%,ss2022 比 kdae 低 12%,trojan 比 sing-box
 低 12%,anytls 对 Go server 比 sing-box 低 21%(ss2022 的 codec 重写
 已收复大部分差距,见历史提交)。
 
 sing-box 引擎以 TUN 入口跑在客户端 netns 内(`sb-client.json`,各
-outbound 绑定 `veth-client` 使自身拨号绕出 tun);honk/dae 照旧跑在
+outbound 绑定 `veth-client` 使自身拨号绕出 tun);honk/kdae 照旧跑在
 根命名空间。
 
 ### 内联优化后变更(2026-07-29,honk dev @ 1715d86)
@@ -127,7 +149,7 @@ record,包装器读到缓冲满或 Pending),以及 mux 会话泄漏修复
 
 完整诚实复测(每次运行引擎 CPU 均验证非零):
 
-| 协议 | dae | sing-box | honk 优化前 | honk 优化后 |
+| 协议 | kdae | sing-box | honk 优化前 | honk 优化后 |
 | --- | --- | --- | --- | --- |
 | hy2 | 2.10 (1.28c) | 2.10 (1.58c) | 1.93 (0.97c) | 1.94 (0.97c) |
 | tuic | 1.80 (1.07c) | 2.09 (1.56c) | 2.10 (1.07c) | **2.18 (1.07c)** |
@@ -146,7 +168,7 @@ ss 快路径实测无效(staging 拷贝不是瓶颈,ss2022 仍在 ~1.3 Gbps
 
 ### 冷建连延迟（ms，健康检查关闭，3 次）
 
-| 协议 | dae | honk | 备注 |
+| 协议 | kdae | honk | 备注 |
 | --- | --- | --- | --- |
 | hy2 | 10–11 | ~5 | |
 | tuic | 84–86 | ~4 | 去掉 auth grace 前约 160 |
@@ -156,7 +178,7 @@ ss 快路径实测无效(staging 拷贝不是瓶颈,ss2022 仍在 ~1.3 Gbps
 
 ### 资源占用（稳态）
 
-| 指标 | dae | honk |
+| 指标 | kdae | honk |
 | --- | --- | --- |
 | RSS | 61–65 MB | 14–16 MB |
 | iperf 期间 CPU（单核） | 1.0–1.4 核 | 1.0–1.2 核 |
@@ -171,17 +193,18 @@ ss 快路径实测无效(staging 拷贝不是瓶颈,ss2022 仍在 ~1.3 Gbps
 
 ### DNS 架构 Criterion 对比
 
-权威 `dns-final-stats` DNS 微基准将当前工作树（HEAD
-`37858d36b18e5e809d49a13ae9c7d46a123b1d16`）与 baseline commit
-`6bbf1dc929541d64178d44ab389dcfe3b3e55c1e` 对比。两边使用相同的
-非默认 `dns-bench` harness：
+权威 `dns-final-production-9b5843a` DNS 微基准将干净的 production commit
+`9b5843abc9957c3122fa6bbc3bc62ecdf8c0ca64` 与 baseline commit
+`6bbf1dc929541d64178d44ab389dcfe3b3e55c1e` 对比。两边使用相同的非默认
+`dns-bench` harness：
 
 ```bash
-CARGO_TARGET_DIR=/root/code/honk-anaylyze-dns/target \
+CARGO_TARGET_DIR=<baseline-target> \
   cargo bench -p honk-core --features dns-bench --bench dns -- \
-  --save-baseline dns-final-stats
+  --save-baseline dns-final-production-9b5843a
+CARGO_TARGET_DIR=<current-target> \
 cargo bench -p honk-core --features dns-bench --bench dns -- \
-  --baseline dns-final-stats
+  --baseline dns-final-production-9b5843a
 ```
 
 本次在 `nixos` 主机（Linux `7.1.4-cachyos`、Intel i9-13900H、20 个逻辑
@@ -190,27 +213,30 @@ CPU）上完成全部 32 个 Criterion group；工具链为 Rust
 `1.99.0-nightly (3efb1f477 2026-07-17)`、LLVM `22.1.8`。baseline 的
 detached worktree 只覆盖编译相同 case 所需且逐字节一致的 benchmark feature、
 support、harness 与 stats 定义；其余 DNS 生产代码均来自精确 baseline SHA。
+保存的 Criterion 测量数据库逐字节复制到全新的 current target，避免编译 artifact
+跨 worktree 复用。完整 manifest 覆盖全部被测 DNS 生产源、benchmark 可执行文件、
+构建/工具链输入与运行配置。
 不同主机的 timing 不可比较。
 
 | Case | 当前中心估计 | Baseline ratio | Criterion 结果 / 建议判定 |
 | --- | ---: | ---: | --- |
-| 真实 typed `CacheKey::new` 构建 | 77.971 ns | 0.9502x | 改善；≤1.10x 通过 |
-| Policy 求值，1 条规则 | 74.814 ns | 1.0000x | 未检测到变化；≤1.10x 通过 |
-| Policy 求值，32 条规则 | 202.63 ns | 1.0103x | 未检测到变化；≤1.10x 通过 |
-| Policy 求值，128 条规则 | 695.33 ns | 1.0391x | 检测到回归；≤1.10x 通过 |
-| 独立 cache hit，1 task | 329.72 ns | 1.3392x | 检测到回归；≤1.10x **未达到** |
-| 独立 cache miss，1 task | 248.50 ns | 1.4163x | 检测到回归；≤1.10x **未达到** |
-| 独立 cache hit，16 tasks | 4.6439 µs | 1.3665x | 检测到回归；≤1.10x **未达到** |
-| 独立 cache miss，16 tasks | 2.9261 µs | 1.6597x | 检测到回归；≤1.10x **未达到** |
-| 独立 cache hit，64 tasks | 30.214 µs | 1.2959x | 检测到回归；≤1.10x **未达到** |
-| 独立 cache miss，64 tasks | 21.358 µs | 1.2509x | 检测到回归；≤1.10x **未达到** |
-| Singleflight，128 waiters | 773.57 µs | 1.3670x | 检测到回归；建议项 |
-| Forwarder cache hit | 4.2746 µs | 1.5155x | 检测到回归；≤1.15x **未达到** |
-| 真实 runtime lease acquire/drop | 50.845 ns | 1.0372x | 检测到回归；≤1.10x 通过 |
-| 真实 runtime publication/swap | 1.4524 µs | 0.9578x | 改善；≤1.10x 通过 |
-| 无 gate atomic event record | 6.8079 ns | 1.3697x | 检测到回归；建议项 |
-| Best-effort atomic counter scrape | 2.2260 ns | 1.0074x | 未检测到变化；建议项 |
-| 1 万条 cache 构建/插入 | 3.4616 ms | 1.2640x | 检测到回归 |
+| 真实 typed `CacheKey::new` 构建 | 78.722 ns | 0.9552x | 改善；≤1.10x 通过 |
+| Policy 求值，1 条规则 | 73.399 ns | 0.9094x | 改善；≤1.10x 通过 |
+| Policy 求值，32 条规则 | 216.68 ns | 1.0595x | 检测到回归；≤1.10x 通过 |
+| Policy 求值，128 条规则 | 739.37 ns | 1.0790x | 检测到回归；≤1.10x 通过 |
+| 独立 cache hit，1 task | 327.19 ns | 1.3639x | 检测到回归；≤1.10x **未达到** |
+| 独立 cache miss，1 task | 240.69 ns | 1.3744x | 检测到回归；≤1.10x **未达到** |
+| 独立 cache hit，16 tasks | 4.5382 µs | 1.3204x | 检测到回归；≤1.10x **未达到** |
+| 独立 cache miss，16 tasks | 2.9460 µs | 1.7753x | 检测到回归；≤1.10x **未达到** |
+| 独立 cache hit，64 tasks | 29.018 µs | 1.2537x | 检测到回归；≤1.10x **未达到** |
+| 独立 cache miss，64 tasks | 21.377 µs | 1.2556x | 检测到回归；≤1.10x **未达到** |
+| Singleflight，128 waiters | 772.66 µs | 1.3184x | 检测到回归；建议项 |
+| Forwarder cache hit | 4.1809 µs | 1.5842x | 检测到回归；≤1.15x **未达到** |
+| 真实 runtime lease acquire/drop | 47.856 ns | 1.0009x | 未检测到变化；≤1.10x 通过 |
+| 真实 runtime publication/swap | 1.5398 µs | 1.0368x | 检测到回归；≤1.10x 通过 |
+| 无 gate atomic event record | 6.7166 ns | 1.3431x | 检测到回归；建议项 |
+| Best-effort atomic counter scrape | 2.1640 ns | 0.9439x | 改善；建议项 |
+| 1 万条 cache 构建/插入 | 3.3343 ms | 1.2578x | 检测到回归 |
 | 1 万条 allocated bytes | 1,628,640 bytes | 0.9996x | ≤1.50x 通过 |
 
 typed-key 构建只解析一次真实 query，随后每个测量迭代都用真实 query context、
@@ -222,9 +248,9 @@ runtime 测量调用生产 provider 的 `acquire`/lease drop，并构造替换
 两次运行间的 delta 是噪声对照，不是新旧生产实现对比。
 
 已批准预算没有为 observability case 规定 baseline ratio 或绝对阈值；它们是
-建议性的 mechanism 测量。当前 record 为 6.8079 ns，只执行一次 relaxed atomic
+建议性的 mechanism 测量。当前 record 为 6.7166 ns，只执行一次 relaxed atomic
 increment，不再有 shared gate、spin 或 yield。虽然它相对不同 baseline 生产树中
-逐字节相同的 overlay 为 1.3697x，但比上一份权威报告中 gated current 的
+逐字节相同的 overlay 为 1.3431x，但比上一份权威报告中 gated current 的
 12.025 ns 低 43.4%。因此绝对 hot-path 工作量更小，也无法串行化相互独立的 DNS 请求。
 
 timing 上限是建议目标，未达到的项目不会隐藏或放宽。cache case 现在执行稳定的
@@ -233,25 +259,25 @@ canonical cache-key identity 工作；1/16/64-task 的六个 cache case 均未�
 从 cache 操作中单独分离，因此这些结果不归因于已移除的 stats gate。功能发布、
 取消、顺序与资源边界仍由硬性测试断言。
 
-64-task 独立 hot-key 吞吐为 2.1183 Melem/s，串行参考为
-4.1669 Melem/s，即 0.508x，未达到建议的 ≥2x 目标。其单线程 Tokio
+64-task 独立 hot-key 吞吐为 2.2055 Melem/s，串行参考为
+4.1643 Melem/s，即 0.530x，未达到建议的 ≥2x 目标。其单线程 Tokio
 `join_all` harness 测到的是调度成本，而非多核扩展。并行 A+AAAA 为
-1.2650 ms，较慢 AAAA 分支为 1.2794 ms，即 0.989x，通过 ≤1.25x 目标；
-重叠执行与测量 noise 可使组合 case 的中心估计略低于独立分支。
+1.2944 ms，较慢 AAAA 分支为 1.2532 ms，即 1.033x，通过 ≤1.25x 目标。
 
 原始 provenance receipts：
 
 | Artifact | 路径 | SHA-256 |
 | --- | --- | --- |
-| Baseline timing | `.omo/evidence/final-stats-remediation/benchmark-baseline.log` | `07035f23a3ff5da118a5d33f0577d556720adbc7ee6129ee6785e9cf44d272e0` |
-| 当前 timing/comparison | `.omo/evidence/final-stats-remediation/benchmark-current.log` | `49f4e0111de89cadc67a0cd55b056e89f97f263c3c394d8f6a0d894d80119ef3` |
-| Baseline provenance | `.omo/evidence/final-stats-remediation/baseline-provenance.log` | `870f22ea31b04b3452fd13ee5cdd3df46f9db767992c23aeae3b11799293a33a` |
-| 当前 provenance | `.omo/evidence/final-stats-remediation/current-provenance.log` | `ad8bcd05336bd95183f6d9db006f66816c4db83219384dc4efbcd15a44b3cdb1` |
+| Baseline timing | `.omo/evidence/final-benchmark-provenance-remediation/benchmark-baseline.log` | `95094d26d62265943aaff9911cfda722e67dc4c09bd6d2b3eeb0b8d4dfc2e1e3` |
+| 当前 timing/comparison | `.omo/evidence/final-benchmark-provenance-remediation/benchmark-current.log` | `49cdaf170ca166a3112add76043535124b10f5e3ebfd121c7b4332b7dcc5600a` |
+| Baseline 源 manifest | `.omo/evidence/final-benchmark-provenance-remediation/baseline-source-manifest.sha256` | `864f1816928d122ccd9b2570f1f60219bd840f7ab65f77a47efb48322c09a60c` |
+| 当前源 manifest | `.omo/evidence/final-benchmark-provenance-remediation/current-source-manifest.sha256` | `8520fd45bd871d461c7bfd1e083aab24a35559873d5f08fca30c0221a1b62fe1` |
+| 构建/运行溯源 | `.omo/evidence/final-benchmark-provenance-remediation/build-runtime-provenance.log` | `be26e41b92d607fd19f618c3550d360568338d66b38ea6ddf0a586e7a890b12b` |
+| kdae artifact manifest | `.omo/evidence/final-benchmark-provenance-remediation/kdae-artifacts.sha256` | `58c26390866e9848633baa11bc4048f8e90eec5fcf3a9755faa62d4aa79467c8` |
 
-机器可读 checksum receipt 位于
-`.omo/evidence/todo12-benchmark-final-gate-checksums.txt`；完整提取与方法说明位于
-`.omo/evidence/todo12-benchmark.md`（SHA-256
-`0121f37508664dd09a94060ee036ff20770ea3017cf521219a0bdfda3690d52a`）。
+baseline/current gate receipt 还绑定了精确干净 SHA、32/32 计数、allocation
+数值与 benchmark 可执行文件 checksum。完整方法与清理 receipt 位于
+`.omo/evidence/final-benchmark-provenance-remediation.md`。
 
 ## 生产环境说明（10.10.10.1 网关，nexi AnyTLS 订阅）
 
