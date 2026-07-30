@@ -2919,7 +2919,7 @@ mod tests {
             .await
             .expect("slow stream must drain")
             .unwrap();
-        for (i, b) in got.chunks_exact(4).enumerate() {
+        for (i, b) in got.as_chunks::<4>().0.iter().enumerate() {
             assert_eq!(b, &[(i % 251) as u8; 4], "frame {i} out of order");
         }
     }
