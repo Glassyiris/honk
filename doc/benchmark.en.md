@@ -119,7 +119,7 @@ cores, RSS after the run. honk runs the musl release binary (mimalloc).
 | honk | direct | 0.0052 | – | – | 9413 | 0.16 | 53 |
 | honk | hy2 | 0.0058 | 0.0018 | 0.0032 | 5239 | 1.06 | 64 |
 | honk | tuic | 0.0024 | 0.0038 | 0.0049 | 5351 | 1.06 | 66 |
-| honk | ss2022 | 0.0038 | 0.0018 | 0.0025 | 5339 | 1.01 | 57 |
+| honk | ss2022 | 0.0038 | 0.0018 | 0.0025 | 9388 | 0.37 | 57 |
 | honk | trojan | 0.0053 | 0.0014 | 0.0055 | 9366 | 0.42 | 49 |
 | honk | anytls-sb | 0.0052 | 0.0020 | 0.0031 | 5098¹ | – | 58 |
 | honk | anytls-go | 0.0126 | 0.0035 | 0.0046 | 6967¹ | – | 55 |
@@ -145,11 +145,13 @@ valid; there is no dae direct baseline.
 
 ### Reading the table
 
-- **Bandwidth**: honk leads on both QUIC protocols by a wide margin
-  (hy2 5239 vs 2996, +75%; tuic 5351 vs 3920, +36%) and ties trojan at
-  line rate (9366 vs 9370). dae's only win is ss2022 (9396 vs 5339) —
-  honk's SS data path is single-core-bound at 1.0 cores while dae's Go
-  AES-GCM assembly idles at 0.49; that is the current optimization target.
+- **Bandwidth**: honk leads or ties on every protocol. hy2 5239 vs 2996
+  (+75%), tuic 5351 vs 3920 (+36%), trojan at line rate 9366 vs 9370,
+  ss2022 at line rate 9388 vs 9396 (−0.1%, a tie). ss2022 got there via
+  the BoringSSL AEAD swap: RustCrypto's aes-gcm measured 0.4–0.5 GB/s
+  (AES-NI path not engaged) vs BoringSSL's 3.3–6.7 GB/s
+  (`benches/ss_aead.rs`), and the swap took the row from 5339 Mbps /
+  1.01 cores to 9388 / 0.37 — now also ahead of dae on CPU (0.37 vs 0.49).
 - **CPU per Gbps**: honk trojan is the standout — line rate at 0.42 cores
   (dae needs 0.66). QUIC protocols cost honk ~1.06 cores at 5.2+ Gbps vs
   dae's 0.75–0.84 at 3–3.9 Gbps (honk moves 75% more bytes per core).
@@ -196,6 +198,11 @@ exchanges are loopback-RTT-bound as expected. The bench suite lives in
 `crates/honk-core/benches/dns.rs`; mock servers run nodelay — without it
 Nagle + delayed-ACK adds ~40 ms per TCP exchange and the numbers measure
 the OS, not the code.
+
+`cargo bench -p honk-outbound --bench ss_aead` compares AEAD backends on
+Shadowsocks-sized chunks (RustCrypto aes-gcm 0.4–0.5 GB/s vs BoringSSL
+AeadCtx 3.3–6.7 GB/s on AES-NI hardware — the reason the SS data path
+uses BoringSSL).
 
 ## Production notes (10.10.10.1 gateway)
 

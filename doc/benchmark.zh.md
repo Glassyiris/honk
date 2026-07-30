@@ -106,7 +106,7 @@ iperf3 接收端中位数,CPU 为核数,RSS 为跑完后值。honk 为 musl 发�
 | honk | direct | 0.0052 | – | – | 9413 | 0.16 | 53 |
 | honk | hy2 | 0.0058 | 0.0018 | 0.0032 | 5239 | 1.06 | 64 |
 | honk | tuic | 0.0024 | 0.0038 | 0.0049 | 5351 | 1.06 | 66 |
-| honk | ss2022 | 0.0038 | 0.0018 | 0.0025 | 5339 | 1.01 | 57 |
+| honk | ss2022 | 0.0038 | 0.0018 | 0.0025 | 9388 | 0.37 | 57 |
 | honk | trojan | 0.0053 | 0.0014 | 0.0055 | 9366 | 0.42 | 49 |
 | honk | anytls-sb | 0.0052 | 0.0020 | 0.0031 | 5098¹ | – | 58 |
 | honk | anytls-go | 0.0126 | 0.0035 | 0.0046 | 6967¹ | – | 55 |
@@ -129,10 +129,13 @@ anytls-server 的环回投递(iperf3 进入 app-limited),用 sing-box 客户端
 
 ### 结果解读
 
-- **带宽**:honk 在两个 QUIC 协议上大幅领先(hy2 5239 vs 2996,+75%;
-  tuic 5351 vs 3920,+36%),trojan 打平线速(9366 vs 9370)。dae 唯一
-  领先的是 ss2022(9396 vs 5339)——honk 的 SS 数据面在 1.0 核打满,
-  而 dae 的 Go AES-GCM 汇编只用 0.49 核;这是当前的优化目标。
+- **带宽**:honk 在所有协议上领先或打平。hy2 5239 vs 2996(+75%)、
+  tuic 5351 vs 3920(+36%)、trojan 线速 9366 vs 9370、ss2022 线速
+  9388 vs 9396(−0.1%,平)。ss2022 靠 BoringSSL AEAD 替换达成:
+  RustCrypto aes-gcm 实测 0.4–0.5 GB/s(AES-NI 路径未启用)vs
+  BoringSSL 3.3–6.7 GB/s(`benches/ss_aead.rs`),替换把该行从
+  5339 Mbps / 1.01 核提到 9388 / 0.37 核——CPU 也反超 dae
+  (0.37 vs 0.49)。
 - **每核带宽**:trojan 是亮点——线速只需 0.42 核(dae 要 0.66)。QUIC
   协议 honk 用 ~1.06 核跑 5.2+ Gbps,dae 用 0.75–0.84 核跑 3–3.9 Gbps
   (honk 每核多搬 75% 的字节)。
@@ -175,6 +178,10 @@ QUIC socket 缓冲修复(8 MiB SO_RCVBUF/SO_SNDBUF + rmem_max/wmem_max
 量级。基准代码在 `crates/honk-core/benches/dns.rs`;mock server 必须开
 nodelay——否则 Nagle + delayed-ACK 会给每次 TCP exchange 加约 40 ms,
 测出来的是操作系统而不是代码。
+
+`cargo bench -p honk-outbound --bench ss_aead` 对比 AEAD 后端在 SS 分块
+尺寸下的吞吐(RustCrypto aes-gcm 0.4–0.5 GB/s vs BoringSSL AeadCtx
+3.3–6.7 GB/s,AES-NI 硬件——SS 数据面用 BoringSSL 的原因)。
 
 ## 生产备注(10.10.10.1 网关)
 
