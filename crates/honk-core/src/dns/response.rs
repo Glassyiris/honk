@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use thiserror::Error;
 
-use super::query::{IngressProfile, QueryContext, TxId, parse_name};
+use super::query::{IngressProfile, NameParseState, QueryContext, TxId, parse_name};
 
 const HEADER_LEN: usize = 12;
 const QR: u16 = 0x8000;
@@ -69,10 +69,11 @@ impl ResponseTemplate {
         if usize::from(qdcount) != request.questions().len() {
             return Err(ResponseError::QuestionMismatch);
         }
+        let mut name_state = NameParseState::new(response.len());
         let mut cursor = HEADER_LEN;
         for (expected_name, expected_type, expected_class) in request.questions() {
-            let (name, name_end) =
-                parse_name(response, cursor).map_err(|_| ResponseError::QuestionMismatch)?;
+            let (name, name_end) = parse_name(response, cursor, &mut name_state)
+                .map_err(|_| ResponseError::QuestionMismatch)?;
             let qtype = read_u16(response, name_end)?;
             let qclass = read_u16(response, name_end + 2)?;
             if &name != expected_name
@@ -93,7 +94,7 @@ impl ResponseTemplate {
         for (section, count) in sections {
             for _ in 0..count {
                 let start = cursor;
-                cursor = record_end(response, cursor)?;
+                cursor = record_end(response, cursor, &mut name_state)?;
                 records.push(RecordBoundary {
                     section,
                     wire: start..cursor,
@@ -166,8 +167,13 @@ impl ResponseTemplate {
     }
 }
 
-fn record_end(response: &[u8], start: usize) -> Result<usize, ResponseError> {
-    let (_, name_end) = parse_name(response, start).map_err(|_| ResponseError::MalformedRecord)?;
+fn record_end(
+    response: &[u8],
+    start: usize,
+    name_state: &mut NameParseState,
+) -> Result<usize, ResponseError> {
+    let (_, name_end) =
+        parse_name(response, start, name_state).map_err(|_| ResponseError::MalformedRecord)?;
     let rdlength = usize::from(read_u16(response, name_end + 8)?);
     (name_end + 10)
         .checked_add(rdlength)

@@ -2,6 +2,52 @@ use std::ops::Range;
 
 use super::{DnsName, EdnsMetadata, QueryError};
 
+const MAX_POINTER_HOPS: usize = 128;
+
+pub(crate) struct NameParseState {
+    visited: Vec<u32>,
+    epoch: u32,
+    pointer_hops: usize,
+}
+
+impl NameParseState {
+    pub(crate) fn new(message_len: usize) -> Self {
+        Self {
+            visited: vec![0; message_len],
+            epoch: 0,
+            pointer_hops: 0,
+        }
+    }
+
+    fn begin_name(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.visited.fill(0);
+            self.epoch = 1;
+        }
+        self.pointer_hops = 0;
+    }
+
+    fn visit_pointer(&mut self, target: usize, cursor: usize) -> Result<(), QueryError> {
+        if target >= cursor {
+            return Err(QueryError::MalformedName);
+        }
+        self.pointer_hops += 1;
+        if self.pointer_hops > MAX_POINTER_HOPS {
+            return Err(QueryError::MalformedName);
+        }
+        let mark = self
+            .visited
+            .get_mut(target)
+            .ok_or(QueryError::MalformedName)?;
+        if *mark == self.epoch {
+            return Err(QueryError::MalformedName);
+        }
+        *mark = self.epoch;
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct ResourceRecord {
     pub(super) name: DnsName,
@@ -12,8 +58,12 @@ pub(super) struct ResourceRecord {
     pub(super) end: usize,
 }
 
-pub(super) fn parse_rr(raw: &[u8], start: usize) -> Result<ResourceRecord, QueryError> {
-    let (name, name_end) = parse_name(raw, start)?;
+pub(super) fn parse_rr(
+    raw: &[u8],
+    start: usize,
+    state: &mut NameParseState,
+) -> Result<ResourceRecord, QueryError> {
+    let (name, name_end) = parse_name(raw, start, state)?;
     let rtype = read_u16(raw, name_end)?;
     let class = read_u16(raw, name_end + 2)?;
     let ttl = read_u32(raw, name_end + 4)?;
@@ -46,7 +96,7 @@ pub(super) fn parse_edns(raw: &[u8], rr: &ResourceRecord) -> Result<EdnsMetadata
             .ok_or(QueryError::MalformedEdnsOption)?;
         option_codes.push(code);
     }
-    if rr.name.0 != [0] {
+    if rr.name.0.as_ref() != [0] {
         return Err(QueryError::MalformedName);
     }
     let flags = u16::try_from(rr.ttl & 0xffff).map_err(|_| QueryError::TruncatedField)?;
@@ -60,24 +110,23 @@ pub(super) fn parse_edns(raw: &[u8], rr: &ResourceRecord) -> Result<EdnsMetadata
     })
 }
 
-pub(crate) fn parse_name(raw: &[u8], start: usize) -> Result<(DnsName, usize), QueryError> {
+pub(crate) fn parse_name(
+    raw: &[u8],
+    start: usize,
+    state: &mut NameParseState,
+) -> Result<(DnsName, usize), QueryError> {
+    state.begin_name();
     let mut cursor = start;
     let mut end = None;
-    let mut visited = vec![false; raw.len()];
     let mut wire = Vec::new();
     loop {
         let octet = *raw.get(cursor).ok_or(QueryError::MalformedName)?;
         if octet & 0xc0 == 0xc0 {
             let second = *raw.get(cursor + 1).ok_or(QueryError::MalformedName)?;
             let target = usize::from((u16::from(octet & 0x3f) << 8) | u16::from(second));
-            if target >= cursor || visited.get(target).copied() != Some(false) {
-                return Err(QueryError::MalformedName);
-            }
+            state.visit_pointer(target, cursor)?;
             if end.is_none() {
                 end = Some(cursor + 2);
-            }
-            if let Some(mark) = visited.get_mut(target) {
-                *mark = true;
             }
             cursor = target;
             continue;
@@ -86,9 +135,12 @@ pub(crate) fn parse_name(raw: &[u8], start: usize) -> Result<(DnsName, usize), Q
             return Err(QueryError::MalformedName);
         }
         wire.push(octet);
+        if wire.len() > 255 {
+            return Err(QueryError::MalformedName);
+        }
         cursor += 1;
         if octet == 0 {
-            return Ok((DnsName(wire), end.unwrap_or(cursor)));
+            return Ok((DnsName(wire.into_boxed_slice()), end.unwrap_or(cursor)));
         }
         let label_end = cursor
             .checked_add(usize::from(octet))
@@ -105,7 +157,7 @@ pub(crate) fn parse_name(raw: &[u8], start: usize) -> Result<(DnsName, usize), Q
     }
 }
 
-fn read_u16(raw: &[u8], offset: usize) -> Result<u16, QueryError> {
+pub(super) fn read_u16(raw: &[u8], offset: usize) -> Result<u16, QueryError> {
     let bytes = raw
         .get(offset..offset + 2)
         .ok_or(QueryError::TruncatedField)?;

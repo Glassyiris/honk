@@ -5,8 +5,10 @@ use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
 
 use super::{IngressProfile, QueryContext};
 
+mod allocation;
+
 #[global_allocator]
-static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
+pub(super) static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
 
 const QDCOUNT_ALLOCATION_CHILD: &str = "HONK_QDCOUNT_ALLOCATION_CHILD";
 

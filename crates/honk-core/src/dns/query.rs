@@ -2,8 +2,8 @@ use thiserror::Error;
 
 mod parser;
 
-pub(crate) use parser::parse_name;
-use parser::{parse_edns, parse_rr};
+pub(crate) use parser::{NameParseState, parse_name};
+use parser::{parse_edns, parse_rr, read_u16};
 
 const HEADER_LEN: usize = 12;
 const MIN_QUESTION_WIRE_LEN: usize = 5;
@@ -38,7 +38,7 @@ impl QClass {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct DnsName(Vec<u8>);
+pub struct DnsName(Box<[u8]>);
 
 impl DnsName {
     pub fn as_wire(&self) -> &[u8] {
@@ -59,17 +59,17 @@ pub enum IngressProfile {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QuestionOffsets {
-    start: usize,
-    end: usize,
+    start: u32,
+    end: u32,
 }
 
 impl QuestionOffsets {
     pub const fn start(self) -> usize {
-        self.start
+        self.start as usize
     }
 
     pub const fn end(self) -> usize {
-        self.end
+        self.end as usize
     }
 }
 
@@ -157,10 +157,11 @@ impl QueryContext {
         if usize::from(qdcount) > (raw.len() - HEADER_LEN) / MIN_QUESTION_WIRE_LEN {
             return Err(QueryError::TruncatedField);
         }
+        let mut name_state = NameParseState::new(raw.len());
         let mut questions = Vec::new();
         for _ in 0..qdcount {
             let start = cursor;
-            let (name, end) = parse_name(raw, cursor)?;
+            let (name, end) = parse_name(raw, cursor, &mut name_state)?;
             cursor = end;
             let qtype = QType(read_u16(raw, cursor)?);
             let qclass = QClass(read_u16(raw, cursor + 2)?);
@@ -169,19 +170,22 @@ impl QueryContext {
                 name,
                 qtype,
                 qclass,
-                offsets: QuestionOffsets { start, end: cursor },
+                offsets: QuestionOffsets {
+                    start: u32::try_from(start).map_err(|_| QueryError::TruncatedField)?,
+                    end: u32::try_from(cursor).map_err(|_| QueryError::TruncatedField)?,
+                },
             });
         }
         for _ in 0..ancount {
-            cursor = parse_rr(raw, cursor)?.end;
+            cursor = parse_rr(raw, cursor, &mut name_state)?.end;
         }
         for _ in 0..nscount {
-            cursor = parse_rr(raw, cursor)?.end;
+            cursor = parse_rr(raw, cursor, &mut name_state)?.end;
         }
         let mut edns = None;
         let mut opt_count = 0u16;
         for _ in 0..arcount {
-            let rr = parse_rr(raw, cursor)?;
+            let rr = parse_rr(raw, cursor, &mut name_state)?;
             cursor = rr.end;
             if rr.rtype == OPT_TYPE {
                 opt_count = opt_count.saturating_add(1);
@@ -247,7 +251,7 @@ impl QueryContext {
 
     pub fn question_wire(&self) -> Option<&[u8]> {
         let offsets = self.question_offsets()?;
-        self.canonical_wire.get(offsets.start..offsets.end)
+        self.canonical_wire.get(offsets.start()..offsets.end())
     }
 
     pub const fn edns(&self) -> Option<&EdnsMetadata> {
@@ -279,13 +283,6 @@ impl QueryContext {
             .iter()
             .map(|question| (&question.name, question.qtype, question.qclass))
     }
-}
-
-fn read_u16(raw: &[u8], offset: usize) -> Result<u16, QueryError> {
-    let bytes = raw
-        .get(offset..offset + 2)
-        .ok_or(QueryError::TruncatedField)?;
-    Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
 }
 
 #[cfg(test)]
