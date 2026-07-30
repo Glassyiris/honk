@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use honk_ebpf_common::DomainRouting;
@@ -9,10 +9,14 @@ use honk_ebpf_common::DomainRouting;
 use crate::ebpf::EbpfBackend;
 use crate::routing::Router;
 
+mod lifecycle;
 mod reconcile;
 mod state;
 mod worker;
 
+#[cfg(test)]
+use lifecycle::ProjectionTerminationProbe;
+use lifecycle::{ProjectionLifecycle, TerminationGuard};
 use state::DesiredState;
 
 const DEFAULT_DOMAIN_CAPACITY: usize = 10_000;
@@ -114,43 +118,6 @@ pub(crate) struct RoutingProjection {
     lifecycle: Arc<ProjectionLifecycle>,
 }
 
-struct ProjectionLifecycle {
-    terminated: AtomicBool,
-    termination: tokio::sync::Notify,
-}
-
-impl ProjectionLifecycle {
-    fn running() -> Arc<Self> {
-        Arc::new(Self {
-            terminated: AtomicBool::new(false),
-            termination: tokio::sync::Notify::new(),
-        })
-    }
-
-    fn finish(&self) {
-        self.terminated.store(true, Ordering::Release);
-        self.termination.notify_waiters();
-    }
-
-    async fn wait(&self) {
-        loop {
-            let terminated = self.termination.notified();
-            if self.terminated.load(Ordering::Acquire) {
-                return;
-            }
-            terminated.await;
-        }
-    }
-}
-
-struct TerminationGuard(Arc<ProjectionLifecycle>);
-
-impl Drop for TerminationGuard {
-    fn drop(&mut self) {
-        self.0.finish();
-    }
-}
-
 impl RoutingProjection {
     pub(crate) fn spawn(
         ebpf: Arc<tokio::sync::RwLock<Box<dyn EbpfBackend>>>,
@@ -166,7 +133,7 @@ impl RoutingProjection {
             worker: parking_lot::Mutex::new(None),
             lifecycle: Arc::clone(&lifecycle),
         });
-        let guard = TerminationGuard(lifecycle);
+        let guard = TerminationGuard::new(lifecycle);
         let projection_worker = Arc::downgrade(&projection);
         let handle = tokio::spawn(async move {
             let _guard = guard;
@@ -238,7 +205,7 @@ impl RoutingProjection {
 
     #[cfg(test)]
     fn termination_probe_for_test(&self) -> ProjectionTerminationProbe {
-        ProjectionTerminationProbe(Arc::clone(&self.lifecycle))
+        ProjectionTerminationProbe::new(Arc::clone(&self.lifecycle))
     }
 }
 
@@ -248,20 +215,6 @@ impl Drop for RoutingProjection {
         if let Some(handle) = self.worker.get_mut().take() {
             handle.abort();
         }
-    }
-}
-
-#[cfg(test)]
-struct ProjectionTerminationProbe(Arc<ProjectionLifecycle>);
-
-#[cfg(test)]
-impl ProjectionTerminationProbe {
-    fn is_terminated(&self) -> bool {
-        self.0.terminated.load(Ordering::Acquire)
-    }
-
-    async fn wait(&self) {
-        self.0.wait().await;
     }
 }
 
