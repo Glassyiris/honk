@@ -183,6 +183,50 @@ row() { # engine proto cold p50 p95 mbps cores rss
     printf '| %s | %s | %s | %s | %s | %s | %s | %s |\n' "$@"
 }
 
+# Median UDP echo RTT (seconds) through the protocol — 53530+idx echoes
+# on the server, routed per-protocol in all three engine configs.
+udp_echo_rtt() { # idx → p50 seconds
+    ip netns exec $N python3 - "$1" <<'PY' 2>/dev/null
+import socket, sys, time
+port = 53530 + int(sys.argv[1])
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(3)
+rtts = []
+for _ in range(15):
+    t = time.time()
+    try:
+        s.sendto(b"lab-udp-ping", ("10.10.10.70", port))
+        s.recvfrom(64)
+        rtts.append(time.time() - t)
+    except Exception:
+        pass
+rtts.sort()
+print(f"{rtts[len(rtts)//2]:.6f}" if rtts else "")
+PY
+}
+
+# UDP bandwidth: iperf3 -u at a fixed offered rate, receiver bps + loss%.
+# Datagram length is pinned to 1200: QUIC tunnels cap datagrams near that
+# (honk hy2/tuic drop oversized ones), and iperf3's path-MTU default
+# (~1448) would measure the cap, not the tunnel.
+udp_bandwidth() { # pid iperf_port → "mbps(loss%) cores"
+    local pid=$1 port=$2
+    local ticks0 ticks1 ms0 ms1 res
+    ticks0=$(cpu_ticks "$pid")
+    ms0=$(date +%s%N)
+    res=$(ip netns exec $N iperf3 -c $T -p "$port" -u -b 10G -l 1200 -t $BW_TIME -R -J 2>/dev/null |
+        python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin); e=d["end"]
+    mbps = int(e["sum_received"]["bits_per_second"]/1e6)
+    loss = e["sum"]["lost_percent"]
+    print("%d(%.1f%%)" % (mbps, loss))
+except Exception: print("0(-)")')
+    ms1=$(date +%s%N)
+    ticks1=$(cpu_ticks "$pid")
+    echo "$res $(python3 -c "print(f'{($ticks1-$ticks0)/100/(($ms1-$ms0)/1e9):.2f}')")"
+}
+
 echo "# lab-bench $(date -u +%Y-%m-%dT%H:%M:%SZ) engines=($ENGINES) protos=($PROTOS)" >&2
 row engine protocol 'cold(s)' 'hot p50(s)' 'hot p95(s)' 'bw(Mbps)' 'cpu(cores)' 'rss(MB)'
 row '---' '---' '---' '---' '---' '---' '---' '---'
@@ -206,6 +250,11 @@ for engine in $ENGINES; do
         rss=$(rss_mb "$pid")
         row "$engine" "$proto" "$cold" "$p50" "$p95" "$bw" "$cores" "$rss"
         echo "$engine|$proto|$cold|$p50|$p95|$bw|$cores|$rss" >>$TSV
+        # UDP: echo RTT (routed 5353x) + iperf3 -u at 10G offered.
+        urtt=$(udp_echo_rtt "$idx")
+        read -r ubw ucores <<<"$(udp_bandwidth "$pid" 520"$idx")"
+        row "$engine" "$proto/udp" "$urtt" '-' '-' "$ubw" "$ucores" '-'
+        echo "$engine|$proto/udp|$urtt|-|-|$ubw|$ucores|-" >>$TSV
     done
 done
 stop_engines

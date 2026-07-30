@@ -91,6 +91,10 @@ Per engine × protocol:
   pooled session.
 - **bw** — iperf3 `-R` download, single stream, 3 runs, median receiver
   bitrate.
+- **udp** — per protocol: echo RTT (15 pings to the routed echo port
+  5353x, median) and iperf3 `-u -b 10G -l 1200 -R` (receiver bitrate +
+  loss at a saturating offered rate; datagrams pinned to 1200 B because
+  QUIC datagrams cap near that).
 - **cpu** — engine CPU cores during the median bandwidth run
   (`/proc/<pid>/stat` utime+stime delta over wall time). The honk pid is
   anchored on the clash-API listener so a second instance parked on the
@@ -158,6 +162,48 @@ better — future work).
 ² dae's direct path is broken on this lab kernel (kdae build): direct
 flows time out while proxied flows work. All dae protocol rows above are
 valid; there is no dae direct baseline.
+
+### UDP results (iperf3 `-u -b 10G -l 1200 -R`, echo RTT)
+
+Same A/B run. Offered rate is a fixed 10 Gbps — far above what any tunnel
+carries, so the loss column reflects saturation, not quality; the
+receiver bandwidth is the capacity number. Datagram length is pinned to
+1200 B: QUIC datagrams cap near that (honk hy2/tuic drop oversized
+datagrams — iperf3's path-MTU default ~1448 B would measure the cap, not
+the tunnel). Echo RTT is the median of 15 pings through the per-protocol
+routed echo port (53531–53536).
+
+| engine | protocol | echo RTT p50 | bw Mbps (loss) | cpu |
+| --- | --- | --- | --- | --- |
+| honk | hy2 | 0.37 ms | 1738 (73.1%) | 1.30 |
+| honk | tuic | 0.38 ms | 293 (54.3%) | 0.22 |
+| honk | ss2022 | 0.11 ms | 1158 (52.4%) | 0.81 |
+| honk | trojan | 0.21 ms | 1506 (77.3%) | 1.26 |
+| honk | anytls-sb | 0.12 ms | 1148 (82.2%) | 0.80 |
+| honk | anytls-go | 0.10 ms | 1519 (76.6%) | 1.11 |
+| dae | hy2 | 0.14 ms | 932 (85.9%) | 0.96 |
+| dae | tuic | 0.13 ms | 9 (75.8%) | 0.03 |
+| dae | ss2022 | 0.10 ms | 2668 (53.1%) | 1.76 |
+| dae | trojan | 0.13 ms | 2957 (49.2%) | 1.67 |
+| dae | anytls-sb | 0.10 ms | 1208 (80.7%) | 0.78 |
+| dae | anytls-go | 0.19 ms | 1561 (75.2%) | 0.99 |
+| sing-box | hy2 | 0.20 ms | 1372 (75.2%) | 1.18 |
+| sing-box | tuic | 0.15 ms | 16 (63.4%) | 0.04 |
+| sing-box | ss2022 | 0.07 ms | 2730 (53.0%) | 1.35 |
+| sing-box | trojan | 0.07 ms | 3380 (45.5%) | 1.56 |
+| sing-box | anytls-sb | 0.09 ms | 1244 (79.3%) | 1.12 |
+| sing-box | anytls-go | 0.13 ms | 1447 (76.9%) | 1.21 |
+
+- **hy2 UDP**: honk leads (1738 vs 932 / 1372) at ~1 core per engine.
+- **TUIC UDP** is weak across all three engines (293 / 9 / 16 Mbps) —
+  QUIC-datagram TUIC is a protocol-level weak spot in this lab, honk is
+  least-bad.
+- **UDP-over-TCP tunnels** (ss2022, trojan): dae/sing-box lead
+  (2.7–3.4 Gbps vs honk 1.1–1.5). honk's UDP endpoint/framing path is
+  the current bottleneck — the next optimization target after anytls-sb.
+- **anytls UoT**: three-way tie at ~1.1–1.5 Gbps.
+- Echo RTTs are sub-millisecond for every engine/protocol; nothing here
+  is latency-bound.
 
 ### Reading the table
 

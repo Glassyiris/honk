@@ -80,6 +80,9 @@
 - **hot p50/p95**——对每协议 HTTP 目标连发 15 个请求的开流延迟(代理会话已
   热)。QUIC 协议这项主要由连接/会话恢复决定,mux 协议由池化会话决定。
 - **bw**——iperf3 `-R` 下载,单流,3 次取接收端中位数。
+- **udp**——每协议:echo RTT(对路由 echo 端口 5353x 发 15 个 ping 取
+  中位数)和 iperf3 `-u -b 10G -l 1200 -R`(饱和供给下的接收带宽 +
+  丢包率;数据报固定 1200B,因为 QUIC datagram 上限就在那附近)。
 - **cpu**——中位数带宽那一轮期间的引擎 CPU 核数
   (`/proc/<pid>/stat` utime+stime 差值除以墙钟时间)。honk 的 pid 锚定
   clash API 监听者,停在单实例锁上的第二实例(零 CPU)不会污染指标。
@@ -140,6 +143,44 @@ honk 自身——单流 demux 队列满(64 帧)会**立即**杀流,单流测试�
 
 ² dae 的 direct 路径在本实验室内核上故障(kdae 构建):direct 流超时,
 代理流正常。上表 dae 各协议行有效;无 dae direct 基线。
+
+### UDP 结果(iperf3 `-u -b 10G -l 1200 -R` + echo RTT)
+
+同一轮 A/B。供给速率固定 10 Gbps——远超任何隧道的承载,所以丢包列
+反映的是饱和而不是质量;接收端带宽才是容量数字。数据报长度固定
+1200B:QUIC datagram 上限就在那附近(honk hy2/tuic 会丢超限数据报
+——iperf3 按路径 MTU 的默认 ~1448B 测到的是上限而不是隧道)。
+echo RTT 为每协议路由 echo 端口(53531–53536)15 次 ping 的中位数。
+
+| 引擎 | 协议 | echo RTT p50 | 带宽 Mbps(丢包) | cpu |
+| --- | --- | --- | --- | --- |
+| honk | hy2 | 0.37 ms | 1738 (73.1%) | 1.30 |
+| honk | tuic | 0.38 ms | 293 (54.3%) | 0.22 |
+| honk | ss2022 | 0.11 ms | 1158 (52.4%) | 0.81 |
+| honk | trojan | 0.21 ms | 1506 (77.3%) | 1.26 |
+| honk | anytls-sb | 0.12 ms | 1148 (82.2%) | 0.80 |
+| honk | anytls-go | 0.10 ms | 1519 (76.6%) | 1.11 |
+| dae | hy2 | 0.14 ms | 932 (85.9%) | 0.96 |
+| dae | tuic | 0.13 ms | 9 (75.8%) | 0.03 |
+| dae | ss2022 | 0.10 ms | 2668 (53.1%) | 1.76 |
+| dae | trojan | 0.13 ms | 2957 (49.2%) | 1.67 |
+| dae | anytls-sb | 0.10 ms | 1208 (80.7%) | 0.78 |
+| dae | anytls-go | 0.19 ms | 1561 (75.2%) | 0.99 |
+| sing-box | hy2 | 0.20 ms | 1372 (75.2%) | 1.18 |
+| sing-box | tuic | 0.15 ms | 16 (63.4%) | 0.04 |
+| sing-box | ss2022 | 0.07 ms | 2730 (53.0%) | 1.35 |
+| sing-box | trojan | 0.07 ms | 3380 (45.5%) | 1.56 |
+| sing-box | anytls-sb | 0.09 ms | 1244 (79.3%) | 1.12 |
+| sing-box | anytls-go | 0.13 ms | 1447 (76.9%) | 1.21 |
+
+- **hy2 UDP**:honk 领先(1738 vs 932 / 1372),三家都约 1 核。
+- **TUIC UDP** 三家都弱(293 / 9 / 16 Mbps)——QUIC-datagram TUIC 在
+  本实验室是协议级短板,honk 是其中最好的。
+- **UDP-over-TCP 隧道**(ss2022、trojan):dae/sing-box 领先
+  (2.7–3.4 Gbps vs honk 1.1–1.5)。honk 的 UDP endpoint/分帧路径是
+  当前瓶颈——anytls-sb 之后的下一个优化目标。
+- **anytls UoT**:三方持平,约 1.1–1.5 Gbps。
+- echo RTT 全部亚毫秒,没有协议是延迟受限的。
 
 ### 结果解读
 

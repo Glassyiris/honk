@@ -66,3 +66,13 @@ engine is running, the host must plain-forward lab traffic — the harness
 assumes an idempotent masquerade (`/root/setup-nat.sh`, table `labnat`,
 saddr 192.168.222.0/24 oif ens3). After each sing-box run the netns is
 rebuilt (its TUN auto_route rewrites the routing table).
+
+## UDP measurements
+
+Each protocol row gets a `<proto>/udp` companion row: echo RTT (15 pings
+to `53530+idx`, median — servers on .70 run `udpecho-multi.py` on
+53530–53536, routes live in all three engine configs) and iperf3
+`-u -b 10G -l 1200 -R` (receiver bps + loss at a saturating offered
+rate). Datagrams are pinned to 1200 B: QUIC datagrams cap near that —
+honk's hy2/tuic drop oversized datagrams (protocol-normal; iperf3's
+~1448 B default would measure the cap, not the tunnel).
