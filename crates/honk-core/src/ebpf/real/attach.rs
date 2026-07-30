@@ -601,8 +601,14 @@ impl RealEbpfBackend {
             .program_mut(prog)
             .ok_or_else(|| anyhow::anyhow!("prog '{}' not found", prog))?
             .try_into()?;
-        p.load()
-            .map_err(|e| anyhow::anyhow!("load '{}': {}", prog, e))?;
+        // Re-attaching an interface (extra LAN/WAN, dynamic watcher) reuses
+        // the program loaded for the primary interface; only the first
+        // attach actually loads.
+        match p.load() {
+            Ok(()) => {}
+            Err(aya::programs::ProgramError::AlreadyLoaded) => {}
+            Err(e) => return Err(anyhow::anyhow!("load '{}': {}", prog, e)),
+        }
         let id = p
             .attach(iface, dir)
             .map_err(|e| anyhow::anyhow!("attach '{}': {} (raw={:?})", prog, e, e))?;
@@ -731,16 +737,14 @@ impl RealEbpfBackend {
             ingress_prog,
             &ifname,
             aya::programs::TcAttachType::Ingress,
-        )
-        .ok();
+        )?;
         if !single_homed {
             Self::attach_tc_at(
                 bpf,
                 egress_prog,
                 &ifname,
                 aya::programs::TcAttachType::Egress,
-            )
-            .ok();
+            )?;
         }
         Ok(())
     }
@@ -755,7 +759,7 @@ impl RealEbpfBackend {
         } else {
             "wan_egress_l3"
         };
-        Self::attach_tc_at(bpf, prog, ifname, aya::programs::TcAttachType::Egress).ok();
+        Self::attach_tc_at(bpf, prog, ifname, aya::programs::TcAttachType::Egress)?;
         Ok(())
     }
 
@@ -771,7 +775,7 @@ impl RealEbpfBackend {
         } else {
             "wan_ingress_l3"
         };
-        Self::attach_tc(bpf, prog, ifname).ok();
+        Self::attach_tc(bpf, prog, ifname)?;
         Ok(())
     }
 }
