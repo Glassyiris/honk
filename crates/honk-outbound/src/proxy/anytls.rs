@@ -547,7 +547,19 @@ impl AnyTlsSession {
                 "AnyTLS session is closed",
             ));
         }
-        let permit = Arc::clone(&self.writer_q.data_permits)
+        let permit = self.acquire_data_permit().await?;
+        self.enqueue_data_with_permit(sid, payload, permit)
+    }
+
+    /// Acquire one writer-queue data permit (async).
+    async fn acquire_data_permit(&self) -> std::io::Result<tokio::sync::OwnedSemaphorePermit> {
+        if self.is_closed() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "AnyTLS session is closed",
+            ));
+        }
+        Arc::clone(&self.writer_q.data_permits)
             .acquire_owned()
             .await
             .map_err(|_| {
@@ -555,7 +567,39 @@ impl AnyTlsSession {
                     std::io::ErrorKind::ConnectionAborted,
                     "AnyTLS writer queue is closed",
                 )
-            })?;
+            })
+    }
+
+    /// Try to enqueue a data frame without waiting; returns the payload
+    /// back when the writer queue is full (caller keeps it in its slot).
+    fn try_enqueue_data(&self, sid: u32, payload: bytes::Bytes) -> Result<(), bytes::Bytes> {
+        if self.is_closed() {
+            return Err(payload);
+        }
+        let Ok(permit) = Arc::clone(&self.writer_q.data_permits).try_acquire_owned() else {
+            return Err(payload);
+        };
+        self.writer_q.push_batch([FrameCommand::Data {
+            sid,
+            payload,
+            _permit: permit,
+        }]);
+        Ok(())
+    }
+
+    /// Enqueue a data frame with an already-acquired permit.
+    fn enqueue_data_with_permit(
+        &self,
+        sid: u32,
+        payload: bytes::Bytes,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> std::io::Result<()> {
+        if self.is_closed() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "AnyTLS session is closed",
+            ));
+        }
         self.writer_q.push_batch([FrameCommand::Data {
             sid,
             payload,
@@ -1205,10 +1249,21 @@ pub(crate) struct AnyTlsStream {
     /// in the same poll: the error is owed to the next poll (data
     /// first, then the error — never silently merge them).
     read_err: Option<std::io::Error>,
-    /// In-flight PSH/FIN write (owns the payload — cancelling the caller's
-    /// write future can never lose data).
-    write_fut:
-        Option<std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>>,
+    /// Outbound frame slot: the payload is owned by the stream until it
+    /// is enqueued — cancelling the caller's write future can neither
+    /// lose it nor enqueue it twice. `poll_write` only returns `Ok(n)`
+    /// after exactly these `n` bytes were queued (never a number derived
+    /// from a different call's buffer).
+    out_slot: Option<(bytes::Bytes, usize)>,
+    /// Waiter for a writer-queue data permit while `out_slot` is occupied.
+    permit_fut: Option<
+        std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = std::io::Result<tokio::sync::OwnedSemaphorePermit>>
+                    + Send,
+            >,
+        >,
+    >,
     fin_sent: bool,
     /// Stream-slot capacity, held for the stream's whole life (released
     /// on Drop).
@@ -1230,23 +1285,11 @@ impl AnyTlsStream {
             read_pos: 0,
             read_eof: false,
             read_err: None,
-            write_fut: None,
+            out_slot: None,
+            permit_fut: None,
             fin_sent: false,
             _permit: permit,
         }
-    }
-
-    /// Queue a PSH frame for up to `u16::MAX` payload bytes; the future
-    /// owns the payload until flushed.
-    fn queue_write(&mut self, data: Vec<u8>) {
-        let session = Arc::clone(&self.session);
-        let sid = self.sid;
-        self.write_fut = Some(Box::pin(async move {
-            session
-                .enqueue_data(sid, bytes::Bytes::from(data))
-                .await
-                .map_err(|e| std::io::Error::other(e.to_string()))
-        }));
     }
 }
 
@@ -1398,18 +1441,36 @@ impl tokio::io::AsyncWrite for AnyTlsStream {
         if chunk == 0 {
             return std::task::Poll::Ready(Ok(0));
         }
-        if self.write_fut.is_none() {
-            self.queue_write(buf[..chunk].to_vec());
-        }
         let this = self.as_mut().get_mut();
-        let fut = this.write_fut.as_mut().expect("just queued");
+        // Occupy the slot exactly once: a retry after Pending reuses the
+        // stored payload, never re-queues it.
+        if this.out_slot.is_none() {
+            this.out_slot = Some((bytes::Bytes::copy_from_slice(&buf[..chunk]), chunk));
+        }
+        // Fast path: a writer-queue permit is available right now.
+        if let Some((payload, n)) = this.out_slot.take() {
+            match this.session.try_enqueue_data(this.sid, payload) {
+                Ok(()) => return std::task::Poll::Ready(Ok(n)),
+                Err(payload) => this.out_slot = Some((payload, n)),
+            }
+        }
+        // Wait for a permit; the payload stays in the slot meanwhile.
+        if this.permit_fut.is_none() {
+            let session = Arc::clone(&this.session);
+            this.permit_fut = Some(Box::pin(async move { session.acquire_data_permit().await }));
+        }
+        let fut = this.permit_fut.as_mut().expect("permit wait just queued");
         match fut.as_mut().poll(cx) {
-            std::task::Poll::Ready(Ok(())) => {
-                this.write_fut = None;
-                std::task::Poll::Ready(Ok(chunk))
+            std::task::Poll::Ready(Ok(permit)) => {
+                this.permit_fut = None;
+                let (payload, n) = this.out_slot.take().expect("slot held while waiting");
+                let r = this
+                    .session
+                    .enqueue_data_with_permit(this.sid, payload, permit);
+                std::task::Poll::Ready(r.map(|()| n))
             }
             std::task::Poll::Ready(Err(e)) => {
-                this.write_fut = None;
+                this.permit_fut = None;
                 std::task::Poll::Ready(Err(e))
             }
             std::task::Poll::Pending => std::task::Poll::Pending,
@@ -1420,11 +1481,18 @@ impl tokio::io::AsyncWrite for AnyTlsStream {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        if let Some(fut) = self.write_fut.as_mut() {
+        let this = self.as_mut().get_mut();
+        if let Some(fut) = this.permit_fut.as_mut() {
             match fut.as_mut().poll(cx) {
-                std::task::Poll::Ready(Ok(())) => self.write_fut = None,
+                std::task::Poll::Ready(Ok(permit)) => {
+                    this.permit_fut = None;
+                    if let Some((payload, _)) = this.out_slot.take() {
+                        this.session
+                            .enqueue_data_with_permit(this.sid, payload, permit)?;
+                    }
+                }
                 std::task::Poll::Ready(Err(e)) => {
-                    self.write_fut = None;
+                    this.permit_fut = None;
                     return std::task::Poll::Ready(Err(e));
                 }
                 std::task::Poll::Pending => return std::task::Poll::Pending,
@@ -1443,18 +1511,11 @@ impl tokio::io::AsyncWrite for AnyTlsStream {
         }
         if !self.fin_sent {
             self.fin_sent = true;
-            let session = Arc::clone(&self.session);
-            let sid = self.sid;
-            let fut: std::pin::Pin<
-                Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>,
-            > = Box::pin(async move {
-                session
-                    .enqueue_control(CMD_FIN, sid, bytes::Bytes::new())
-                    .map_err(|e| std::io::Error::other(e.to_string()))
-            });
-            self.write_fut = Some(fut);
+            self.session
+                .enqueue_control(CMD_FIN, self.sid, bytes::Bytes::new())
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
         }
-        self.poll_flush(cx)
+        std::task::Poll::Ready(Ok(()))
     }
 }
 
@@ -2395,6 +2456,65 @@ mod tests {
             }
         });
         addr_rx
+    }
+
+    /// poll_write cancel safety: a cancelled write neither loses the
+    /// payload nor enqueues it twice; a retry reuses the stored slot.
+    #[tokio::test]
+    async fn test_poll_write_cancel_safety() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (session, mut server) = establish_test_session("127.0.0.1:443").await;
+        expect_handshake(&mut server).await;
+        let mut addr_rx = spawn_echo_server(server);
+        let target = vec![0x01, 127, 0, 0, 1, 0x01, 0xbb];
+        let permit = session.try_reserve().unwrap();
+        let mut stream = session.open_stream_direct(target, permit).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), addr_rx.recv())
+            .await
+            .unwrap();
+
+        // Exhaust the writer-queue data permits so the first write waits.
+        let sem = Arc::clone(&session.writer_q.data_permits);
+        let mut hog = Vec::new();
+        while let Ok(p) = Arc::clone(&sem).try_acquire_owned() {
+            hog.push(p);
+        }
+        assert!(!hog.is_empty());
+
+        // The first write is cancelled mid-poll (timeout): no data out,
+        // no leak.
+        let one = b"payload-one".to_vec();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), stream.write(&one))
+                .await
+                .is_err()
+        );
+
+        // Free one permit: the stored slot goes out exactly once.
+        drop(hog.pop());
+        tokio::time::timeout(Duration::from_secs(2), stream.write(&one))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // A second buffer after the slot freed writes normally.
+        let two = b"payload-two".to_vec();
+        drop(hog);
+        tokio::time::timeout(Duration::from_secs(2), stream.write(&two))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // The echo contains each payload exactly once, in order.
+        let mut echoed = vec![0u8; one.len() + two.len()];
+        tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut echoed))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut want = one.clone();
+        want.extend_from_slice(&two);
+        assert_eq!(echoed, want);
     }
 
     #[tokio::test]
