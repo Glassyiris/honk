@@ -94,14 +94,12 @@ async fn resolve_domain_keeps_old_snapshot_without_blocking_publication() {
     let old_ips = running.await.expect("old lookup task");
     let new_ips = controller.resolve_domain("example.com").await;
 
-    assert!(
-        old_ips
-            .iter()
-            .all(|ip| { *ip == "192.0.2.3".parse::<std::net::IpAddr>().expect("old IP") })
+    assert_eq!(
+        old_ips,
+        ["192.0.2.3".parse::<std::net::IpAddr>().expect("old IP")]
     );
-    assert!(
-        new_ips
-            .iter()
-            .all(|ip| { *ip == "198.51.100.4".parse::<std::net::IpAddr>().expect("new IP") })
+    assert_eq!(
+        new_ips,
+        ["198.51.100.4".parse::<std::net::IpAddr>().expect("new IP")]
     );
 }

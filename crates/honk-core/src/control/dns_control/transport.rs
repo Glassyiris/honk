@@ -99,7 +99,7 @@ async fn read_tcp_dns_query(stream: &mut TcpStream, query: &mut Vec<u8>) -> bool
         return false;
     }
     let length = usize::from(u16::from_be_bytes(length));
-    if !(12..=u16::MAX.into()).contains(&length) {
+    if length < 12 {
         return false;
     }
     query.resize(length, 0);
