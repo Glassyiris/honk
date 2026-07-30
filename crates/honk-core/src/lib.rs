@@ -1111,8 +1111,12 @@ fn create_dae0_veth(lan_ifname: &str) -> anyhow::Result<Dae0Guard> {
     let peer_idx = netlink::ifindex_of("dae0peer")?;
 
     // Bring up dae0. dae0peer stays down until after BPF attach.
-    let _ = nl.set_link_up(dae0_idx, true);
-    let _ = nl.set_link_up(peer_idx, true);
+    // These are datapath-critical: a "successful" startup without them is
+    // worse than a loud failure.
+    nl.set_link_up(dae0_idx, true)
+        .map_err(|e| anyhow::anyhow!("bring dae0 up: {e}"))?;
+    nl.set_link_up(peer_idx, true)
+        .map_err(|e| anyhow::anyhow!("bring dae0peer up: {e}"))?;
 
     for (key, val) in [
         ("net.ipv4.conf.dae0.rp_filter", "0"),
@@ -1136,9 +1140,8 @@ fn create_dae0_veth(lan_ifname: &str) -> anyhow::Result<Dae0Guard> {
     let host_v4: std::net::Ipv4Addr = DAENS_HOST_IP.parse().unwrap();
     // Idempotent: delete any stale address left by a previous run first.
     let _ = nl.addr_op(false, dae0_idx, netlink::FAM_V4, &host_v4.octets(), 32);
-    if let Err(e) = nl.addr_op(true, dae0_idx, netlink::FAM_V4, &host_v4.octets(), 32) {
-        warn!("dae0 addr failed (non-fatal): {e}");
-    }
+    nl.addr_op(true, dae0_idx, netlink::FAM_V4, &host_v4.octets(), 32)
+        .map_err(|e| anyhow::anyhow!("dae0 IPv4 address {}: {e}", host_v4))?;
 
     // Assign an IPv6 ULA address to the host-side dae0 so the daens
     // namespace can route IPv6 replies back through this veth.
@@ -1277,16 +1280,17 @@ fn setup_daens_namespace(tproxy_mark: u32, tproxy_port: u16) -> anyhow::Result<(
 
     // Install static neighbour entries on the host so replies to
     // daens-bound connections are forwarded to the correct dae0peer MAC.
-    if let Err(e) = nl.neigh_replace(dae0_idx, FAM_V4, &peer_v4.octets(), &peer_mac) {
-        warn!("host neigh replace for daens peer failed (non-fatal): {e}");
-    }
+    nl.neigh_replace(dae0_idx, FAM_V4, &peer_v4.octets(), &peer_mac)
+        .map_err(|e| anyhow::anyhow!("host neighbour for daens peer: {e}"))?;
     let _ = nl.neigh_replace(dae0_idx, FAM_V6, &peer_v6.octets(), &peer_mac);
 
     // Make sure the host forwards traffic between dae0 and the LAN/WAN
     // interfaces; this is required for the SYN-ACK path back to the client.
-    let _ = set_sysctl("net.ipv4.ip_forward", "1");
+    set_sysctl("net.ipv4.ip_forward", "1")
+        .map_err(|e| anyhow::anyhow!("enable net.ipv4.ip_forward: {e}"))?;
 
     info!("Configured daens namespace (mark={:#x})", tproxy_mark);
+    DAENS_READY.store(true, std::sync::atomic::Ordering::Release);
     Ok(())
 }
 
@@ -1295,6 +1299,21 @@ fn setup_daens_namespace(tproxy_mark: u32, tproxy_port: u16) -> anyhow::Result<(
 /// itself never depends on it — the namespace is FD-owned (below).
 #[cfg(target_os = "linux")]
 pub(crate) const DAENS_NS_PATH: &str = "/var/run/netns/daens";
+
+/// Runtime truth for "daens is set up", set by [`setup_daens_namespace`]
+/// on success. Socket creation must key on this, never on
+/// `DAENS_NS_PATH` existing — a leftover or failed compat mount says
+/// nothing about the datapath (a first clean deploy once bound every
+/// TPROXY listener into the host namespace because of that confusion).
+#[cfg(target_os = "linux")]
+pub(crate) static DAENS_READY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether THIS instance created the compat bind-mount at
+/// [`DAENS_NS_PATH`]. Cleanup only ever unmounts what it mounted —
+/// never a same-named mount belonging to another tool.
+#[cfg(feature = "ebpf")]
+static COMPAT_MOUNTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The engine-owned daens namespace FD, created by
 /// [`create_daens_namespace`] at startup. An open namespace FD pins the
@@ -1340,13 +1359,14 @@ fn create_daens_namespace() -> anyhow::Result<&'static std::os::unix::io::OwnedF
         let target = std::ffi::CString::new(DAENS_NS_PATH).unwrap();
         let src = std::ffi::CString::new(task_ns.clone()).unwrap();
         let tmpfs = std::ffi::CString::new("tmpfs").unwrap();
-        let _ = std::fs::create_dir_all("/var/run/netns");
-        let _ = std::fs::File::create(DAENS_NS_PATH);
         unsafe {
             // /proc/mounts lists the real path (/var/run is a symlink to
             // /run) — check the canonical path or every engine start
             // mounts a fresh tmpfs over the registry, hiding iproute2's
-            // namespace files (the lab netns "disappears").
+            // namespace files (the lab netns "disappears"). Order matters:
+            // the tmpfs must exist BEFORE the target file is created, or
+            // the mount hides it and the bind below silently fails on a
+            // first clean deploy.
             if !is_mountpoint("/run/netns") {
                 libc::mount(
                     tmpfs.as_ptr(),
@@ -1356,13 +1376,27 @@ fn create_daens_namespace() -> anyhow::Result<&'static std::os::unix::io::OwnedF
                     std::ptr::null(),
                 );
             }
+        }
+        let _ = std::fs::create_dir_all("/var/run/netns");
+        let _ = std::fs::File::create(DAENS_NS_PATH);
+        // The bind result is reported, never silently ignored — a failed
+        // compat mount leaves debug tooling unable to find daens.
+        let rc = unsafe {
             libc::mount(
                 src.as_ptr(),
                 target.as_ptr(),
                 std::ptr::null(),
                 libc::MS_BIND,
                 std::ptr::null(),
+            )
+        };
+        if rc != 0 {
+            warn!(
+                "compat bind-mount of daens failed (debug tooling degraded): {}",
+                std::io::Error::last_os_error()
             );
+        } else {
+            COMPAT_MOUNTED.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         let result = std::fs::File::open(&task_ns).map(OwnedFd::from);
         if result.is_ok() {
@@ -1416,7 +1450,9 @@ pub(crate) fn with_daens_netns<R>(
     static DAENS_SWITCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Restores the saved network namespace on drop, so the original
-    /// namespace is regained even when `f` panics.
+    /// namespace is regained even when `f` panics. A failed restore
+    /// aborts the process — a worker left in the wrong namespace would
+    /// silently originate dials from daens forever after.
     struct RestoreNs<'a> {
         fd: std::fs::File,
         op: &'a str,
@@ -1425,32 +1461,39 @@ pub(crate) fn with_daens_netns<R>(
         fn drop(&mut self) {
             let ret = unsafe { libc::setns(self.fd.as_raw_fd(), libc::CLONE_NEWNET) };
             if ret != 0 {
-                warn!(
-                    "failed to restore original netns after '{}': {}",
+                tracing::error!(
+                    "failed to restore original netns after '{}': {} — aborting",
                     self.op,
                     std::io::Error::last_os_error()
                 );
+                std::process::abort();
             }
         }
     }
 
-    let orig_ns = std::fs::File::open("/proc/self/ns/net")
-        .map_err(|e| anyhow::anyhow!("{}: open /proc/self/ns/net: {}", op, e))?;
+    // Lock FIRST: the save-and-switch is serialized before any namespace
+    // reads, so no other scoped switch can interleave.
+    let _switch_guard = DAENS_SWITCH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    // /proc/thread-self/ns/net is this thread's real namespace;
+    // /proc/self/ns/net always resolves to the main thread.
+    let orig_ns = std::fs::File::open("/proc/thread-self/ns/net")
+        .map_err(|e| anyhow::anyhow!("{}: open /proc/thread-self/ns/net: {}", op, e))?;
 
     // The FD-owned namespace is the primary handle; the compat bind-mount
-    // path is the fallback (tests, mock mode, non-ebpf builds).
+    // path is the fallback (tests, mock mode, non-ebpf builds). The File
+    // must outlive the setns call — a temporary's raw fd dangles.
     #[cfg(feature = "ebpf")]
     let daens_raw = daens_fd()
         .map(|fd| fd.as_raw_fd())
         .map_err(|e| anyhow::anyhow!("{}: daens namespace unavailable: {:#}", op, e))?;
     #[cfg(not(feature = "ebpf"))]
-    let daens_raw = std::fs::File::open(DAENS_NS_PATH)
-        .map_err(|e| anyhow::anyhow!("{}: open {}: {}", op, DAENS_NS_PATH, e))?
-        .as_raw_fd();
-
-    let _switch_guard = DAENS_SWITCH
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let daens_file = std::fs::File::open(DAENS_NS_PATH)
+        .map_err(|e| anyhow::anyhow!("{}: open {}: {}", op, DAENS_NS_PATH, e))?;
+    #[cfg(not(feature = "ebpf"))]
+    let daens_raw = daens_file.as_raw_fd();
 
     if unsafe { libc::setns(daens_raw, libc::CLONE_NEWNET) } != 0 {
         anyhow::bail!("{}: setns(daens): {}", op, std::io::Error::last_os_error());
@@ -1461,11 +1504,14 @@ pub(crate) fn with_daens_netns<R>(
 
 #[cfg(feature = "ebpf")]
 fn cleanup_dae0_interface() {
-    // Drop the compat bind-mount; the FD-owned namespace dies with the
-    // process (dae0peer goes away with it).
-    let target = std::ffi::CString::new(DAENS_NS_PATH).unwrap();
-    // SAFETY: plain umount2; errors (not mounted) are expected and ignored.
-    unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
+    // Unmount the compat bind-mount only when THIS instance mounted it —
+    // a same-named mount from another tool is never ours to tear down.
+    if COMPAT_MOUNTED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        let target = std::ffi::CString::new(DAENS_NS_PATH).unwrap();
+        // SAFETY: plain umount2; errors (already unmounted) are ignored.
+        unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
+    }
+    // The FD-owned namespace dies with the process (dae0peer goes with it).
 
     let Ok(mut nl) = netlink::NlSock::new() else {
         return;

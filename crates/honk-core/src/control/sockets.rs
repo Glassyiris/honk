@@ -29,12 +29,13 @@ pub(super) fn bind_tproxy_tcp(addr: SocketAddr, _mark: u32) -> anyhow::Result<Tc
     build_tproxy_tcp(addr)
 }
 
-/// Whether the daens namespace has been set up.  Only real eBPF mode creates
-/// it (mock mode and tests stay entirely in the host netns), so its presence
-/// is the switch between "bind inside daens" and "bind here".
+/// Whether the daens namespace is fully set up (FD-owned namespace +
+/// policy routing live). Only real eBPF mode creates it (mock mode and
+/// tests stay entirely in the host netns), so this flag is the switch
+/// between "bind inside daens" and "bind here".
 #[cfg(target_os = "linux")]
 fn daens_netns_exists() -> bool {
-    std::path::Path::new(crate::DAENS_NS_PATH).exists()
+    crate::DAENS_READY.load(std::sync::atomic::Ordering::Acquire)
 }
 
 fn build_tproxy_tcp(addr: SocketAddr) -> anyhow::Result<TcpListener> {
