@@ -6,6 +6,7 @@ pub(crate) use parser::parse_name;
 use parser::{parse_edns, parse_rr};
 
 const HEADER_LEN: usize = 12;
+const MIN_QUESTION_WIRE_LEN: usize = 5;
 const OPT_TYPE: u16 = 41;
 const ALLOWED_QUERY_FLAGS: u16 = 0x0130;
 
@@ -153,7 +154,10 @@ impl QueryContext {
         let nscount = read_u16(raw, 8)?;
         let arcount = read_u16(raw, 10)?;
         let mut cursor = HEADER_LEN;
-        let mut questions = Vec::with_capacity(usize::from(qdcount));
+        if usize::from(qdcount) > (raw.len() - HEADER_LEN) / MIN_QUESTION_WIRE_LEN {
+            return Err(QueryError::TruncatedField);
+        }
+        let mut questions = Vec::new();
         for _ in 0..qdcount {
             let start = cursor;
             let (name, end) = parse_name(raw, cursor)?;

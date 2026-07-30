@@ -1,4 +1,14 @@
+use std::alloc::System;
+use std::process::Command;
+
+use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
+
 use super::{IngressProfile, QueryContext};
+
+#[global_allocator]
+static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
+
+const QDCOUNT_ALLOCATION_CHILD: &str = "HONK_QDCOUNT_ALLOCATION_CHILD";
 
 fn query(flags: u16, questions: &[(&[u8], u16, u16)], opt: Option<&[u8]>) -> Vec<u8> {
     let mut wire = vec![0x12, 0x34];
@@ -34,6 +44,61 @@ fn opt(size: u16, version: u8, flags: u16, options: &[u8]) -> Vec<u8> {
     wire.extend_from_slice(&(options.len() as u16).to_be_bytes());
     wire.extend_from_slice(options);
     wire
+}
+
+#[test]
+fn rejects_impossible_qdcount_before_large_allocation() {
+    if std::env::var_os(QDCOUNT_ALLOCATION_CHILD).is_some() {
+        // Given
+        let raw = [0, 1, 1, 0, 0xff, 0xff, 0, 0, 0, 0, 0, 0];
+        let region = Region::new(GLOBAL);
+
+        // When
+        let result = QueryContext::parse(&raw);
+        let allocated = region.change().bytes_allocated;
+
+        // Then
+        assert!(result.is_err());
+        assert!(
+            allocated <= 1_024,
+            "impossible QDCOUNT allocated {allocated} bytes before rejection"
+        );
+        return;
+    }
+
+    // Given
+    let current_test = std::env::current_exe().expect("current test executable");
+
+    // When
+    let output = Command::new(current_test)
+        .args([
+            "--exact",
+            "dns::query::tests::rejects_impossible_qdcount_before_large_allocation",
+            "--nocapture",
+        ])
+        .env(QDCOUNT_ALLOCATION_CHILD, "1")
+        .output()
+        .expect("isolated allocation test");
+
+    // Then
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn accepts_questions_at_the_minimum_wire_size_boundary() {
+    // Given
+    let raw = query(0x0100, &[(&[0], 1, 1), (&[0], 28, 1)], None);
+
+    // When
+    let context = QueryContext::parse(&raw).expect("two minimum-size questions");
+
+    // Then
+    assert_eq!(context.all_question_offsets().len(), 2);
+    assert!(!context.is_cacheable());
 }
 
 #[test]
