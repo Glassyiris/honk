@@ -93,7 +93,8 @@ fn test_trojan_go_grpc_query() {
         "trojan-go://pw@example.com:443?type=grpc&serviceName=myService&allowInsecure=1#trojan-grpc",
     )
     .unwrap();
-    assert_eq!(node.protocol, NodeProtocol::Trojan);
+    // trojan-go is its own protocol (smux-style mux), not plain trojan.
+    assert_eq!(node.protocol, NodeProtocol::TrojanGo);
     assert_eq!(node.transport, "grpc");
     assert_eq!(node.grpc_service.as_deref(), Some("myService"));
     assert!(node.skip_cert_verify);

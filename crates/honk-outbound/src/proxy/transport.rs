@@ -65,9 +65,16 @@ pub(crate) async fn wrap_transport(
         return super::mux::open_stream_on(node, stream).await;
     }
     match node.transport.as_str() {
+        "" | "tcp" => Ok(stream), // raw TCP/TLS
         "ws" => wrap_ws(node, stream).await,
         "grpc" => wrap_grpc(node, stream).await,
-        _ => Ok(stream), // "tcp" or unknown: raw TCP/TLS
+        // Unknown transport must not silently degrade to raw TCP — a
+        // mistyped transport means a different protocol than intended.
+        other => anyhow::bail!(
+            "node '{}': unsupported transport '{}' (expected tcp/ws/grpc)",
+            node.name,
+            other
+        ),
     }
 }
 

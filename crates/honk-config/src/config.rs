@@ -412,6 +412,14 @@ impl Config {
                     node.name
                 )));
             }
+            // Reject unknown transports at load time instead of silently
+            // degrading to raw TCP at dial time.
+            if !matches!(node.transport.as_str(), "" | "tcp" | "ws" | "grpc") {
+                return Err(crate::ConfigError::Validation(format!(
+                    "Node '{}' has unsupported transport '{}' (expected tcp/ws/grpc)",
+                    node.name, node.transport
+                )));
+            }
         }
         for group in &self.groups {
             if group.name.is_empty() {
@@ -437,6 +445,26 @@ fn parse_yaml(content: &str) -> Result<Config, crate::ConfigError> {
 #[cfg(test)]
 mod builtin_nodes_tests {
     use super::*;
+
+    #[test]
+    fn test_validate_rejects_unknown_transport() {
+        let mut config = Config::default();
+        config.nodes.push(crate::node::Node {
+            name: "bad".into(),
+            address: "1.2.3.4:443".into(),
+            transport: "kcp".into(),
+            ..Default::default()
+        });
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported transport"),
+            "unknown transport must be rejected at load: {err}"
+        );
+        for ok in ["", "tcp", "ws", "grpc"] {
+            config.nodes[0].transport = ok.into();
+            assert!(config.validate().is_ok(), "transport '{ok}' must pass");
+        }
+    }
 
     #[test]
     fn test_ensure_builtin_nodes_injects_direct_once() {

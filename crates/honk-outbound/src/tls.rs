@@ -163,7 +163,7 @@ impl CertificateCompressor for BrotliCertCompression {
 
 /// BoringSSL connector carrying per-node ECH settings and the global
 /// fingerprint mode. Clone-cheap (Arc inside); build once per node.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TlsConnector {
     connector: SslConnector,
     chrome: bool,
@@ -473,7 +473,17 @@ pub fn build_connector(node: &Node) -> anyhow::Result<TlsConnector> {
     let chrome = chrome_mode();
     let ech_config_list = load_ech_config_list(node)?;
 
-    let pin = node.tls_pin_sha256.as_deref().and_then(parse_pin_sha256);
+    let pin = match node.tls_pin_sha256.as_deref() {
+        Some(s) => Some(parse_pin_sha256(s).ok_or_else(|| {
+            // pinSHA256 is a security assertion: an unparseable pin
+            // must fail closed, never degrade to plain PKI.
+            anyhow::anyhow!(
+                "node '{}': invalid tls_pin_sha256 (expected 64 hex chars)",
+                node.name
+            )
+        })?),
+        None => None,
+    };
     let mut builder = base_builder(node.skip_cert_verify || pin.is_some())?;
     if let Some(pin) = pin {
         builder.set_custom_verify_callback(SslVerifyMode::PEER, pin_sha256_custom_verify(pin));
@@ -919,6 +929,25 @@ mod pin_tests {
         assert!(parse_pin_sha256("abcd").is_none());
         // Uppercase hex is valid.
         assert!(parse_pin_sha256(&"AB".repeat(32)).is_some());
+    }
+
+    /// P0: an unparseable pinSHA256 must fail closed — never silently
+    /// degrade to plain PKI.
+    #[test]
+    fn invalid_pin_fails_closed() {
+        let node = Node {
+            name: "pinned".into(),
+            host: "example.com".into(),
+            address: "example.com:443".into(),
+            port: 443,
+            tls_pin_sha256: Some("not-a-pin".into()),
+            ..Default::default()
+        };
+        let err = build_connector(&node).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid tls_pin_sha256"),
+            "bad pin must be a hard error: {err}"
+        );
     }
 }
 

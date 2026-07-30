@@ -71,7 +71,10 @@ impl Node {
             "socks5" | "socks4" | "socks4a" => NodeProtocol::Socks5,
             "ss" => NodeProtocol::SS,
             "ssr" => NodeProtocol::SSR,
-            "trojan" | "trojan-go" => NodeProtocol::Trojan,
+            "trojan" => NodeProtocol::Trojan,
+            // trojan-go links are their own protocol (smux-style mux);
+            // parsing them as plain trojan silently produced broken nodes.
+            "trojan-go" => NodeProtocol::TrojanGo,
             "anytls" => NodeProtocol::AnyTLS,
             "vmess" => NodeProtocol::VMess,
             "vless" => NodeProtocol::VLess,
