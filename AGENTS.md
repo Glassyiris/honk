@@ -47,6 +47,7 @@ Notable absences (referenced by older docs but **not in this tree**): `Makefile`
 
 - **Language:** Rust, edition 2024 (workspace-wide, including the eBPF crate).
 - **Async runtime:** Tokio (`full`).
+- **Allocator:** the shipped binary (`honk-core` bin) uses **mimalloc** as the global allocator (musl's stock malloc is slow under contention). mimalloc reserves aligned 1 GiB arenas and decommits purged pages, but fragment-pinned pages linger — so the binary runs a 60s `mi_collect(true)` task in `main.rs`, and RSS reads as the traffic high-water mark, not the live set. The clash `/logs` tracing layer (`clash_api/logs.rs`) skips formatting entirely when it has no subscribers — it is unfiltered, so without the check every sub-level event in the data path would cost a `String`.
 - **eBPF:** userspace [aya](https://github.com/aya-rs/aya) 0.14 (optional `ebpf` feature in `honk-core`); kernel side `aya-ebpf` 0.2 targeting `bpfel-unknown-none` (nightly + `-Zbuild-std=core` + `bpf-linker`).
 - **HTTP API:** axum 0.8 (with `ws`) + tower-http 0.7 (optional `clash-api` feature of `honk-core`, on by default).
 - **QUIC:** quinn 0.11 (TUIC/Juicity/Hysteria2 outbounds, DoQ/DoH3 DNS); `h3`/`h3-quinn` for DoH3 only — Hysteria2 ships its own minimal HTTP/3+QPACK layer.
