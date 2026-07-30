@@ -904,8 +904,10 @@ impl EbpfBackend for RealEbpfBackend {
         // startup), so proxy-bound packets are assigned to them in their own
         // namespace.  The link handle persists after switching back.
         crate::with_daens_netns("attach tproxy_sk_lookup", move || {
-            let netns = std::fs::File::open("/var/run/netns/daens")
-                .map_err(|e| anyhow::anyhow!("open daens netns: {}", e))?;
+            // FD-owned namespace handle (dup so the OnceLock FD stays put).
+            let netns = crate::daens_fd()?
+                .try_clone()
+                .map_err(|e| anyhow::anyhow!("dup daens fd: {e}"))?;
             let p: &mut aya::programs::SkLookup = self
                 .bpf_mut()?
                 .program_mut("tproxy_sk_lookup")

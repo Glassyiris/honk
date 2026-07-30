@@ -1179,11 +1179,15 @@ fn setup_daens_namespace(tproxy_mark: u32, tproxy_port: u16) -> anyhow::Result<(
     // operates on the daens namespace, and /proc/sys writes hit the
     // namespace's sysctls.
     let peer_mac = with_daens_netns("configure daens", || {
-        let mut n = NlSock::new()?;
-        let lo = netlink::ifindex_of("lo")?;
-        let peer = netlink::ifindex_of("dae0peer")?;
-        n.set_link_up(lo, true)?;
-        n.set_link_up(peer, true)?;
+        use anyhow::Context as _;
+        let mut n = NlSock::new().context("daens netlink socket")?;
+        // /sys inside a scoped setns still shows the HOST's devices (the
+        // view is per-mount, not per-reader) — look links up over netlink,
+        // whose socket is bound to the namespace it was created in.
+        let (lo, _) = n.get_link("lo").context("lo in daens")?;
+        let (peer, peer_mac) = n.get_link("dae0peer").context("dae0peer in daens")?;
+        n.set_link_up(lo, true).context("lo up")?;
+        n.set_link_up(peer, true).context("dae0peer up")?;
 
         // fwmark → table 100 with a local default route (v4 + v6 mirror):
         // marked packets are delivered to daens-local sockets.
@@ -1270,7 +1274,7 @@ fn setup_daens_namespace(tproxy_mark: u32, tproxy_port: u16) -> anyhow::Result<(
         ] {
             let _ = set_sysctl(key, val);
         }
-        Ok(netlink::mac_of("dae0peer")?)
+        Ok(peer_mac)
     })?;
 
     // Install static neighbour entries on the host so replies to
@@ -1320,28 +1324,40 @@ fn create_daens_namespace() -> anyhow::Result<&'static std::os::unix::io::OwnedF
             let _ = tx.send(Err(std::io::Error::last_os_error()));
             return;
         }
+        // /proc/self/ns/net always shows the MAIN thread's namespace — the
+        // new namespace lives at the per-TASK path after unshare. (Opening
+        // /proc/self/ns/net here once returned the host ns and attached the
+        // sk_lookup hijack program host-wide — do not regress this.)
+        // SAFETY: plain syscall to learn this thread's kernel tid.
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+        let task_ns = format!("/proc/self/task/{tid}/ns/net");
         // Best-effort compat mount: /var/run/netns/daens (iproute2 shape).
-        // The private propagation step keeps the bind from leaking into
-        // peer mount namespaces; failures only affect external tooling.
+        // The target must be a FILE — namespace handles are files, and a
+        // file bind-mount onto a directory fails with ENOTDIR. The parent
+        // is made a mountpoint (tmpfs) only if it isn't one already —
+        // crucially NOT via a self-MS_BIND, which would stack-duplicate
+        // every nsfs mount beneath it (lab ns pins included) on every
+        // engine restart.
         let dir = std::ffi::CString::new("/var/run/netns").unwrap();
         let target = std::ffi::CString::new(DAENS_NS_PATH).unwrap();
-        let src = std::ffi::CString::new("/proc/self/ns/net").unwrap();
-        let _ = std::fs::create_dir_all(DAENS_NS_PATH);
+        let src = std::ffi::CString::new(task_ns.clone()).unwrap();
+        let tmpfs = std::ffi::CString::new("tmpfs").unwrap();
+        let _ = std::fs::create_dir_all("/var/run/netns");
+        let _ = std::fs::File::create(DAENS_NS_PATH);
         unsafe {
-            libc::mount(
-                dir.as_ptr(),
-                dir.as_ptr(),
-                std::ptr::null(),
-                libc::MS_BIND,
-                std::ptr::null(),
-            );
-            libc::mount(
-                std::ptr::null(),
-                dir.as_ptr(),
-                std::ptr::null(),
-                libc::MS_PRIVATE | libc::MS_REC,
-                std::ptr::null(),
-            );
+            // /proc/mounts lists the real path (/var/run is a symlink to
+            // /run) — check the canonical path or every engine start
+            // mounts a fresh tmpfs over the registry, hiding iproute2's
+            // namespace files (the lab netns "disappears").
+            if !is_mountpoint("/run/netns") {
+                libc::mount(
+                    tmpfs.as_ptr(),
+                    dir.as_ptr(),
+                    tmpfs.as_ptr(),
+                    0,
+                    std::ptr::null(),
+                );
+            }
             libc::mount(
                 src.as_ptr(),
                 target.as_ptr(),
@@ -1350,7 +1366,13 @@ fn create_daens_namespace() -> anyhow::Result<&'static std::os::unix::io::OwnedF
                 std::ptr::null(),
             );
         }
-        let result = std::fs::File::open("/proc/self/ns/net").map(OwnedFd::from);
+        let result = std::fs::File::open(&task_ns).map(OwnedFd::from);
+        if result.is_ok() {
+            let link = std::fs::read_link(&task_ns)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|e| format!("<readlink failed: {e}>"));
+            info!("daens FD source: {} -> {}", task_ns, link);
+        }
         let _ = tx.send(result);
     });
     let fd = rx
@@ -1509,4 +1531,12 @@ fn set_sysctl(key: &str, value: &str) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether `path` is a mountpoint (appears in /proc/mounts).
+#[cfg(feature = "ebpf")]
+fn is_mountpoint(path: &str) -> bool {
+    std::fs::read_to_string("/proc/mounts")
+        .map(|m| m.lines().any(|l| l.split_whitespace().nth(1) == Some(path)))
+        .unwrap_or(false)
 }

@@ -51,9 +51,9 @@ const IFA_ADDRESS: u16 = 1;
 const IFA_LOCAL: u16 = 2;
 
 const RTA_DST: u16 = 1;
-const RTA_GATEWAY: u16 = 2;
+const RTA_GATEWAY: u16 = 5;
 const RTA_OIF: u16 = 4;
-const RTA_TABLE: u16 = 9;
+const RTA_TABLE: u16 = 15;
 
 const NDA_DST: u16 = 1;
 const NDA_LLADDR: u16 = 2;
@@ -63,7 +63,7 @@ const FRA_TABLE: u16 = 15;
 
 const NUD_PERMANENT: u16 = 0x80;
 const RTN_UNICAST: u8 = 1;
-const RTN_LOCAL: u8 = 1;
+const RTN_LOCAL: u8 = 2;
 const RTPROT_STATIC: u8 = 4;
 const RT_SCOPE_LINK: u8 = 253;
 const RT_SCOPE_UNIVERSE: u8 = 0;
@@ -327,13 +327,16 @@ impl NlSock {
     /// Move a link into the namespace held by `ns_fd`.
     pub(crate) fn set_link_netns_fd(&mut self, ifindex: u32, ns_fd: &OwnedFd) -> io::Result<()> {
         let header = ifinfo(ifindex as i32, 0, 0);
-        let attrs = [(IFLA_NET_NS_FD, Attr::U32(ns_fd.as_raw_fd() as u32))];
-        self.request(
+        let fd_no = ns_fd.as_raw_fd() as u32;
+        let attrs = [(IFLA_NET_NS_FD, Attr::U32(fd_no))];
+        let r = self.request(
             RTM_NEWLINK,
             NLM_F_REQUEST | NLM_F_ACK,
             pod_bytes(&header),
             &attrs,
-        )
+        );
+        tracing::debug!(ifindex, fd_no, ok = r.is_ok(), "set_link_netns_fd");
+        r
     }
 
     /// Delete a link by index.
@@ -534,6 +537,133 @@ pub(crate) fn mac_of(name: &str) -> io::Result<[u8; 6]> {
     Ok(mac)
 }
 
+impl NlSock {
+    /// Look up a link by name (RTM_GETLINK dump, filtered client-side).
+    /// Works in any namespace — unlike /sys, which is view-per-mount and
+    /// shows the host's devices even inside a scoped setns.
+    ///
+    /// The whole dump is always drained before returning: an early return
+    /// would leave the dump's tail in the socket buffer and poison the
+    /// next request's reads (observed: the second call saw a stale
+    /// NLMSG_DONE and reported an empty link list).
+    pub(crate) fn get_link(&mut self, name: &str) -> io::Result<(u32, [u8; 6])> {
+        const RTM_GETLINK: u16 = 18;
+        const NLM_F_DUMP: u16 = 0x300;
+        const NLMSG_DONE: u16 = 3;
+        self.seq += 1;
+        let seq = self.seq;
+        let header = ifinfo(0, 0, 0);
+        let mut buf = Vec::with_capacity(64);
+        buf.extend_from_slice(&[0u8; 4]);
+        buf.extend_from_slice(&RTM_GETLINK.to_ne_bytes());
+        buf.extend_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP).to_ne_bytes());
+        buf.extend_from_slice(&seq.to_ne_bytes());
+        buf.extend_from_slice(&0u32.to_ne_bytes());
+        buf.extend_from_slice(pod_bytes(&header));
+        let len = buf.len() as u32;
+        buf[0..4].copy_from_slice(&len.to_ne_bytes());
+        // SAFETY: buf holds a well-formed nlmsghdr blob.
+        let sent = unsafe {
+            libc::send(
+                self.fd.as_raw_fd(),
+                buf.as_ptr() as *const libc::c_void,
+                buf.len(),
+                0,
+            )
+        };
+        if sent < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut resp = [0u8; 32768];
+        let mut found: Option<(u32, [u8; 6])> = None;
+        loop {
+            // SAFETY: resp is a valid writable buffer.
+            let n = unsafe {
+                libc::recv(
+                    self.fd.as_raw_fd(),
+                    resp.as_mut_ptr() as *mut libc::c_void,
+                    resp.len(),
+                    0,
+                )
+            };
+            if n < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let n = n as usize;
+            let mut done = false;
+            let mut off = 0usize;
+            while off + 16 <= n {
+                let hlen = u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap()) as usize;
+                if hlen < 16 {
+                    break;
+                }
+                let htype = u16::from_ne_bytes(resp[off + 4..off + 6].try_into().unwrap());
+                let hseq = u32::from_ne_bytes(resp[off + 8..off + 12].try_into().unwrap());
+                if hseq != seq {
+                    break;
+                }
+                if htype == NLMSG_DONE {
+                    done = true;
+                    break;
+                }
+                if htype == NLMSG_ERROR {
+                    let err = i32::from_ne_bytes(resp[off + 16..off + 20].try_into().unwrap());
+                    return Err(io::Error::from_raw_os_error(-err));
+                }
+                if htype == RTM_NEWLINK && hlen >= 16 + 16 {
+                    // ifinfomsg follows the nlmsghdr; attributes after that.
+                    let ifi = &resp[off + 16..off + hlen];
+                    let ifindex = i32::from_ne_bytes(ifi[4..8].try_into().unwrap());
+                    let mut ifname: Option<String> = None;
+                    let mut mac: Option<[u8; 6]> = None;
+                    let mut aoff = 16;
+                    while aoff + 4 <= ifi.len() {
+                        let alen =
+                            u16::from_ne_bytes(ifi[aoff..aoff + 2].try_into().unwrap()) as usize;
+                        let atype = u16::from_ne_bytes(ifi[aoff + 2..aoff + 4].try_into().unwrap());
+                        if alen < 4 || aoff + alen > ifi.len() {
+                            break;
+                        }
+                        let payload = &ifi[aoff + 4..aoff + alen];
+                        match atype {
+                            IFLA_IFNAME => {
+                                // attr payload is NUL-terminated
+                                let end = payload
+                                    .iter()
+                                    .position(|&b| b == 0)
+                                    .unwrap_or(payload.len());
+                                ifname =
+                                    Some(String::from_utf8_lossy(&payload[..end]).into_owned());
+                            }
+                            IFLA_ADDRESS if payload.len() == 6 => {
+                                mac = Some(payload.try_into().unwrap());
+                            }
+                            _ => {}
+                        }
+                        aoff += align(alen);
+                    }
+                    if ifname.as_deref() == Some(name) {
+                        if let Some(mac) = mac {
+                            found = Some((ifindex as u32, mac));
+                        }
+                    }
+                }
+                let next = align(hlen);
+                if next == 0 {
+                    break;
+                }
+                off += next;
+            }
+            if done {
+                return found.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, format!("link '{name}' not found"))
+                });
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -571,7 +701,13 @@ mod tests {
 
     #[test]
     fn sock_open_close() {
-        // Opening a netlink socket needs no privileges.
         let _ = NlSock::new().expect("netlink socket");
+    }
+
+    #[test]
+    fn get_link_lo() {
+        let mut nl = NlSock::new().unwrap();
+        let (idx, _mac) = nl.get_link("lo").expect("lo must exist");
+        assert_eq!(idx, 1);
     }
 }
