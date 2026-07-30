@@ -106,27 +106,38 @@ impl CipherConf {
 }
 
 /// Owned AEAD cipher enum so we can avoid trait-object gymnastics.
+///
+/// AES-GCM and ChaCha20-Poly1305 go through **BoringSSL** (`AeadCtx`):
+/// RustCrypto's `aes-gcm` measured 0.4–0.5 GB/s on AES-NI hardware vs
+/// BoringSSL's 3.3–6.7 GB/s (benches/ss_aead.rs) — a 7–18× gap that made
+/// SS2022 single-core-bound. Only XChaCha20-Poly1305 (no BoringSSL
+/// equivalent) stays on RustCrypto.
 pub(crate) enum AeadCipher {
-    Aes128Gcm(Box<aes_gcm::Aes128Gcm>),
-    Aes256Gcm(Box<aes_gcm::Aes256Gcm>),
-    ChaCha20Poly1305(Box<chacha20poly1305::ChaCha20Poly1305>),
+    Aes128Gcm(boring::aead::AeadCtx),
+    Aes256Gcm(boring::aead::AeadCtx),
+    ChaCha20Poly1305(boring::aead::AeadCtx),
     XChaCha20Poly1305(Box<chacha20poly1305::XChaCha20Poly1305>),
+}
+
+/// Map a BoringSSL failure into the RustCrypto-shaped error callers use.
+fn aead_err(_: boring::error::ErrorStack) -> aes_gcm::aead::Error {
+    aes_gcm::aead::Error
 }
 
 impl AeadCipher {
     pub(crate) fn new(method: &str, key: &[u8]) -> anyhow::Result<Self> {
-        use aes_gcm::aead::KeyInit;
+        use boring::aead::Algorithm;
         match method.to_lowercase().as_str() {
-            "aes-128-gcm" | "2022-blake3-aes-128-gcm" => Ok(AeadCipher::Aes128Gcm(Box::new(
-                aes_gcm::Aes128Gcm::new_from_slice(key)?,
-            ))),
-            "aes-256-gcm" | "2022-blake3-aes-256-gcm" => Ok(AeadCipher::Aes256Gcm(Box::new(
-                aes_gcm::Aes256Gcm::new_from_slice(key)?,
-            ))),
+            "aes-128-gcm" | "2022-blake3-aes-128-gcm" => Ok(AeadCipher::Aes128Gcm(
+                boring::aead::AeadCtx::new_default_tag(&Algorithm::aes_128_gcm(), key)?,
+            )),
+            "aes-256-gcm" | "2022-blake3-aes-256-gcm" => Ok(AeadCipher::Aes256Gcm(
+                boring::aead::AeadCtx::new_default_tag(&Algorithm::aes_256_gcm(), key)?,
+            )),
             "chacha20-ietf-poly1305" | "chacha20-poly1305" | "2022-blake3-chacha20-poly1305" => {
-                Ok(AeadCipher::ChaCha20Poly1305(Box::new(
-                    chacha20poly1305::ChaCha20Poly1305::new_from_slice(key)?,
-                )))
+                Ok(AeadCipher::ChaCha20Poly1305(
+                    boring::aead::AeadCtx::new_default_tag(&Algorithm::chacha20_poly1305(), key)?,
+                ))
             }
             _ => anyhow::bail!("unsupported Shadowsocks cipher: {}", method),
         }
@@ -148,20 +159,12 @@ impl AeadCipher {
     ) -> Result<Vec<u8>, aes_gcm::aead::Error> {
         use aes_gcm::aead::Aead;
         match self {
-            AeadCipher::Aes128Gcm(c) => {
-                let nonce: &aes_gcm::aead::Nonce<aes_gcm::Aes128Gcm> =
-                    nonce.try_into().map_err(|_| aes_gcm::aead::Error)?;
-                c.encrypt(nonce, plaintext)
-            }
-            AeadCipher::Aes256Gcm(c) => {
-                let nonce: &aes_gcm::aead::Nonce<aes_gcm::Aes256Gcm> =
-                    nonce.try_into().map_err(|_| aes_gcm::aead::Error)?;
-                c.encrypt(nonce, plaintext)
-            }
-            AeadCipher::ChaCha20Poly1305(c) => {
-                let nonce: &chacha20poly1305::aead::Nonce<chacha20poly1305::ChaCha20Poly1305> =
-                    nonce.try_into().map_err(|_| aes_gcm::aead::Error)?;
-                c.encrypt(nonce, plaintext)
+            AeadCipher::Aes128Gcm(_)
+            | AeadCipher::Aes256Gcm(_)
+            | AeadCipher::ChaCha20Poly1305(_) => {
+                let mut out = Vec::with_capacity(plaintext.len() + 16);
+                self.seal_into(nonce, plaintext, &mut out)?;
+                Ok(out)
             }
             AeadCipher::XChaCha20Poly1305(c) => {
                 let nonce: &chacha20poly1305::XNonce =
@@ -178,20 +181,13 @@ impl AeadCipher {
     ) -> Result<Vec<u8>, aes_gcm::aead::Error> {
         use aes_gcm::aead::Aead;
         match self {
-            AeadCipher::Aes128Gcm(c) => {
-                let nonce: &aes_gcm::aead::Nonce<aes_gcm::Aes128Gcm> =
-                    nonce.try_into().map_err(|_| aes_gcm::aead::Error)?;
-                c.decrypt(nonce, ciphertext)
-            }
-            AeadCipher::Aes256Gcm(c) => {
-                let nonce: &aes_gcm::aead::Nonce<aes_gcm::Aes256Gcm> =
-                    nonce.try_into().map_err(|_| aes_gcm::aead::Error)?;
-                c.decrypt(nonce, ciphertext)
-            }
-            AeadCipher::ChaCha20Poly1305(c) => {
-                let nonce: &chacha20poly1305::aead::Nonce<chacha20poly1305::ChaCha20Poly1305> =
-                    nonce.try_into().map_err(|_| aes_gcm::aead::Error)?;
-                c.decrypt(nonce, ciphertext)
+            AeadCipher::Aes128Gcm(_)
+            | AeadCipher::Aes256Gcm(_)
+            | AeadCipher::ChaCha20Poly1305(_) => {
+                let mut buf = ciphertext.to_vec();
+                let n = self.open_in_place(nonce, &mut buf)?;
+                buf.truncate(n);
+                Ok(buf)
             }
             AeadCipher::XChaCha20Poly1305(c) => {
                 let nonce: &chacha20poly1305::XNonce =
@@ -209,31 +205,25 @@ impl AeadCipher {
         plaintext: &[u8],
         out: &mut Vec<u8>,
     ) -> Result<(), aes_gcm::aead::Error> {
-        use aes_gcm::aead::AeadInOut;
-        out.extend_from_slice(plaintext);
-        let start = out.len() - plaintext.len();
-        macro_rules! seal {
-            ($c:expr, $nonce_ty:ty) => {{
-                let nonce: &$nonce_ty = nonce.try_into().map_err(|_| aes_gcm::aead::Error)?;
-                let tag = $c.encrypt_inout_detached(
+        match self {
+            AeadCipher::Aes128Gcm(c) | AeadCipher::Aes256Gcm(c) => {
+                boring_seal_into(c, nonce, plaintext, out)
+            }
+            AeadCipher::ChaCha20Poly1305(c) => boring_seal_into(c, nonce, plaintext, out),
+            AeadCipher::XChaCha20Poly1305(c) => {
+                use aes_gcm::aead::AeadInOut;
+                out.extend_from_slice(plaintext);
+                let start = out.len() - plaintext.len();
+                let nonce: &chacha20poly1305::XNonce =
+                    nonce.try_into().map_err(|_| aes_gcm::aead::Error)?;
+                let tag = c.encrypt_inout_detached(
                     nonce,
                     b"",
                     aes_gcm::aead::inout::InOutBuf::from(&mut out[start..]),
                 )?;
                 out.extend_from_slice(&tag);
                 Ok(())
-            }};
-        }
-        match self {
-            AeadCipher::Aes128Gcm(c) => seal!(c, aes_gcm::aead::Nonce<aes_gcm::Aes128Gcm>),
-            AeadCipher::Aes256Gcm(c) => seal!(c, aes_gcm::aead::Nonce<aes_gcm::Aes256Gcm>),
-            AeadCipher::ChaCha20Poly1305(c) => {
-                seal!(
-                    c,
-                    chacha20poly1305::aead::Nonce<chacha20poly1305::ChaCha20Poly1305>
-                )
             }
-            AeadCipher::XChaCha20Poly1305(c) => seal!(c, chacha20poly1305::XNonce),
         }
     }
 
@@ -244,54 +234,54 @@ impl AeadCipher {
         nonce: &[u8],
         buf: &mut [u8],
     ) -> Result<usize, aes_gcm::aead::Error> {
-        use aes_gcm::aead::AeadInOut;
         let tag_len = self.tag_len();
         if buf.len() < tag_len {
             return Err(aes_gcm::aead::Error);
         }
         let (ct, tag) = buf.split_at_mut(buf.len() - tag_len);
-        macro_rules! open {
-            ($c:expr, $nonce_ty:ty, $tag_ty:ty) => {{
-                let nonce: &$nonce_ty = nonce.try_into().map_err(|_| aes_gcm::aead::Error)?;
-                let tag: &$tag_ty = (&*tag).try_into().map_err(|_| aes_gcm::aead::Error)?;
-                $c.decrypt_inout_detached(
+        match self {
+            AeadCipher::Aes128Gcm(c) | AeadCipher::Aes256Gcm(c) => {
+                c.open_in_place(nonce, ct, tag, b"").map_err(aead_err)?;
+            }
+            AeadCipher::ChaCha20Poly1305(c) => {
+                c.open_in_place(nonce, ct, tag, b"").map_err(aead_err)?;
+            }
+            AeadCipher::XChaCha20Poly1305(c) => {
+                use aes_gcm::aead::AeadInOut;
+                let nonce: &chacha20poly1305::XNonce =
+                    nonce.try_into().map_err(|_| aes_gcm::aead::Error)?;
+                let tag: &chacha20poly1305::aead::Tag<chacha20poly1305::XChaCha20Poly1305> =
+                    (&*tag).try_into().map_err(|_| aes_gcm::aead::Error)?;
+                c.decrypt_inout_detached(
                     nonce,
                     b"",
                     aes_gcm::aead::inout::InOutBuf::from(&mut *ct),
                     tag,
                 )?;
-                Ok(buf.len() - tag_len)
-            }};
-        }
-        match self {
-            AeadCipher::Aes128Gcm(c) => open!(
-                c,
-                aes_gcm::aead::Nonce<aes_gcm::Aes128Gcm>,
-                aes_gcm::aead::Tag<aes_gcm::Aes128Gcm>
-            ),
-            AeadCipher::Aes256Gcm(c) => open!(
-                c,
-                aes_gcm::aead::Nonce<aes_gcm::Aes256Gcm>,
-                aes_gcm::aead::Tag<aes_gcm::Aes256Gcm>
-            ),
-            AeadCipher::ChaCha20Poly1305(c) => {
-                open!(
-                    c,
-                    chacha20poly1305::aead::Nonce<chacha20poly1305::ChaCha20Poly1305>,
-                    chacha20poly1305::aead::Tag<chacha20poly1305::ChaCha20Poly1305>
-                )
             }
-            AeadCipher::XChaCha20Poly1305(c) => open!(
-                c,
-                chacha20poly1305::XNonce,
-                chacha20poly1305::aead::Tag<chacha20poly1305::XChaCha20Poly1305>
-            ),
         }
+        Ok(buf.len() - tag_len)
     }
 
     fn tag_len(&self) -> usize {
         16
     }
+}
+
+/// BoringSSL in-place seal appending to `out` (shared by the three
+/// BoringSSL-backed variants).
+fn boring_seal_into(
+    ctx: &boring::aead::AeadCtx,
+    nonce: &[u8],
+    plaintext: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<(), aes_gcm::aead::Error> {
+    out.extend_from_slice(plaintext);
+    out.resize(out.len() + 16, 0);
+    let start = out.len() - plaintext.len() - 16;
+    let (body, tag) = out[start..].split_at_mut(plaintext.len());
+    ctx.seal_in_place(nonce, body, tag, b"").map_err(aead_err)?;
+    Ok(())
 }
 
 impl fmt::Debug for AeadCipher {
