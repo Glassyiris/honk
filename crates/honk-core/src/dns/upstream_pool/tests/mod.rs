@@ -1,6 +1,7 @@
 mod query;
 mod routing_dial;
 mod routing_leaf;
+mod shutdown;
 
 use std::sync::Arc;
 

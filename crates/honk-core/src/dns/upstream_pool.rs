@@ -16,6 +16,8 @@ use std::time::Duration;
 use honk_config::dns::DnsUpstream;
 use honk_config::node::{Group, Node};
 use honk_outbound::group::{GroupManager, SharedGroupManager};
+#[cfg(test)]
+use tokio::sync::Notify;
 use tokio::sync::RwLock as AsyncRwLock;
 
 use self::entries::{PoolState, UpstreamEntry, build_entries};
@@ -43,6 +45,15 @@ pub struct UpstreamPool {
     dns_dial_timeout: Duration,
     active_transport_tasks: Arc<AtomicUsize>,
     shutdown: tokio::sync::RwLock<PoolState>,
+    #[cfg(test)]
+    admission_pause: parking_lot::Mutex<Option<AdmissionPause>>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct AdmissionPause {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
 }
 
 impl UpstreamPool {
@@ -88,6 +99,8 @@ impl UpstreamPool {
             dns_dial_timeout: Duration::from_secs(10),
             active_transport_tasks: Arc::new(AtomicUsize::new(0)),
             shutdown: tokio::sync::RwLock::new(PoolState::Open),
+            #[cfg(test)]
+            admission_pause: parking_lot::Mutex::new(None),
         })
     }
 
@@ -139,5 +152,24 @@ impl UpstreamPool {
 
     pub fn upstream_count(&self) -> usize {
         self.entries.len()
+    }
+
+    #[cfg(test)]
+    fn arm_admission_pause_for_test(&self) -> AdmissionPause {
+        let pause = AdmissionPause {
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        };
+        self.admission_pause.lock().replace(pause.clone());
+        pause
+    }
+
+    #[cfg(test)]
+    async fn pause_after_admission_for_test(&self) {
+        let pause = self.admission_pause.lock().take();
+        if let Some(pause) = pause {
+            pause.entered.notify_one();
+            pause.release.notified().await;
+        }
     }
 }

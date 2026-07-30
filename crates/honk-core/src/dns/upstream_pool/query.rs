@@ -129,12 +129,15 @@ impl DnsUpstreamPool for UpstreamPool {
             .resolve_dial_leaf(entry)
             .await
             .map_err(|error| anyhow::anyhow!("DNS upstream '{upstream_name}': {error}"))?;
-        match *self.shutdown.read().await {
+        let admission = self.shutdown.read().await;
+        match *admission {
             PoolState::Open => {}
             PoolState::Closing | PoolState::Closed => {
                 anyhow::bail!("DNS upstream pool is closed")
             }
         }
+        #[cfg(test)]
+        self.pause_after_admission_for_test().await;
         debug!(
             "DNS upstream '{}' dial leaf={:?} (forced={})",
             upstream_name,
@@ -142,34 +145,40 @@ impl DnsUpstreamPool for UpstreamPool {
             entry.outbound.is_some()
         );
 
-        if entry.protocol == DnsProtocol::Udp {
-            return self
-                .query_datagram(upstream_name, entry, proxy_node.as_ref(), raw_query)
-                .await;
-        }
-        if matches!(entry.protocol, DnsProtocol::Quic | DnsProtocol::H3) && proxy_node.is_some() {
-            anyhow::bail!(
-                "DNS upstream '{}' protocol {:?} does not support outbound proxy yet",
+        let result = async {
+            if entry.protocol == DnsProtocol::Udp {
+                return self
+                    .query_datagram(upstream_name, entry, proxy_node.as_ref(), raw_query)
+                    .await;
+            }
+            if matches!(entry.protocol, DnsProtocol::Quic | DnsProtocol::H3) && proxy_node.is_some()
+            {
+                anyhow::bail!(
+                    "DNS upstream '{}' protocol {:?} does not support outbound proxy yet",
+                    upstream_name,
+                    entry.protocol
+                );
+            }
+            let response = self
+                .get_transport(entry, proxy_node.as_ref())
+                .await?
+                .exchange(raw_query)
+                .await?;
+            debug!(
+                "DNS upstream '{}' ({:?} {} via {:?}) returned {} bytes",
                 upstream_name,
-                entry.protocol
+                entry.protocol,
+                entry.endpoint.host,
+                proxy_node
+                    .as_ref()
+                    .map(|node| node.name.as_str())
+                    .unwrap_or("direct"),
+                response.len()
             );
+            Ok(response)
         }
-        let response = self
-            .get_transport(entry, proxy_node.as_ref())
-            .await?
-            .exchange(raw_query)
-            .await?;
-        debug!(
-            "DNS upstream '{}' ({:?} {} via {:?}) returned {} bytes",
-            upstream_name,
-            entry.protocol,
-            entry.endpoint.host,
-            proxy_node
-                .as_ref()
-                .map(|node| node.name.as_str())
-                .unwrap_or("direct"),
-            response.len()
-        );
-        Ok(response)
+        .await;
+        drop(admission);
+        result
     }
 }
