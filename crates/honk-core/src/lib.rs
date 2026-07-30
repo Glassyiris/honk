@@ -245,6 +245,55 @@ pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// to 90s for the previous instance to exit, then fails loudly.
+/// Take the process-wide instance lock: the datapath uses fixed names
+/// (dae0, daens, TC hooks) and a stopping instance's cleanup destroys
+/// them, so a second instance must never start while the first is still
+/// draining (its late cleanup would rip the fresh datapath out from
+/// under it — the restart race that hung the lab for a day). Waits up
+/// to 240s for the previous instance to exit (busy gateways can take
+/// well over 90s to drain), then fails loudly.
+fn acquire_instance_lock(
+    _bpf_pin_root: &std::path::Path,
+) -> anyhow::Result<nix::fcntl::Flock<std::fs::File>> {
+    use nix::fcntl::{Flock, FlockArg};
+    // /run (not the bpffs pin root, which rejects regular files).
+    let path = std::path::PathBuf::from("/run/honk-core.lock");
+    let mut file = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|e| anyhow::anyhow!("open instance lock {}: {}", path.display(), e))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
+    let mut logged = false;
+    loop {
+        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(flock) => return Ok(flock),
+            Err((f, _)) if std::time::Instant::now() < deadline => {
+                file = f; // the failed lock hands the file back for the retry
+                if !logged {
+                    info!(
+                        "another honk-core instance is shutting down; \
+                         waiting for the datapath lock at {}",
+                        path.display()
+                    );
+                    logged = true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            Err((_, e)) => {
+                anyhow::bail!(
+                    "another honk-core instance holds {} ({}); refusing to start",
+                    path.display(),
+                    e
+                )
+            }
+        }
+    }
+}
+
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // Load the configuration before initializing logging so `log_level` in
     // the config file is honored (previously only --debug/RUST_LOG had any
@@ -395,6 +444,15 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     );
 
     let mock_mode = cli.mock_ebpf || cfg!(not(feature = "ebpf"));
+
+    // Singleton guard: the datapath uses fixed names (dae0, daens, TC
+    // hooks), and a stopping instance's cleanup destroys them. A second
+    // instance that starts while the first is still draining would have
+    // its fresh datapath ripped out from under it by that cleanup —
+    // silently, minutes later (the restart race that hung the lab for a
+    // day). Take an exclusive flock for the process lifetime; a second
+    // instance waits for the first to fully exit instead of overlapping.
+    let _instance_lock = acquire_instance_lock(&cli.bpf_pin_root)?;
 
     // Create dae0 veth BEFORE eBPF load so PARAM.dae0_ifindex is correct.
     // dae0peer stays in the host namespace during the dae0 attach, then moves
