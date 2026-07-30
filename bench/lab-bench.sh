@@ -13,7 +13,8 @@
 #   rss    — engine RSS after the bandwidth runs
 # Plus a direct-path baseline per engine (no proxy involved).
 #
-# dae has no AnyTLS support: anytls-* rows are skipped for it.
+# dae has no AnyTLS support on mainline; the lab's kdae build does (the
+# harness no longer skips anytls-* for dae).
 #
 # Usage: lab-bench.sh [engines] [protocols]
 #   engines:   space list within one arg, default "honk dae"
@@ -173,9 +174,6 @@ for engine in $ENGINES; do
     echo "$engine|direct|$direct_cold|-|-|$direct_bw|$direct_cpu|$(rss_mb "$pid")" >>$TSV
 
     for proto in $PROTOS; do
-        if [ "$engine" = dae ]; then
-            case $proto in anytls-*) continue ;; esac
-        fi
         idx=$(proto_idx "$proto")
         [ "$idx" = 0 ] && continue
         cold=$(cold_latency "$engine" 800"$idx")

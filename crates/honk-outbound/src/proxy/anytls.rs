@@ -76,6 +76,12 @@ const STREAM_DUPLEX_BUFFER: usize = 65536;
 /// of growing without bound.
 const STREAM_QUEUE_CAP: usize = 64;
 
+/// How long the demux tolerates a full TCP stream queue before killing
+/// the stream. Sized for healthy bursts — relay scheduling jitter and a
+/// fast server's initial flight drain in milliseconds; a consumer still
+/// full after this window is genuinely stuck.
+const HOL_STALL_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Transport halves behind trait objects so tests can drive a session over
 /// an in-memory duplex instead of a real TLS connection.
 type BoxedReader = Box<dyn AsyncRead + Send + Unpin>;
@@ -753,32 +759,45 @@ impl AnyTlsSession {
     /// Deliver a server payload frame to its stream. TCP sinks apply
     /// backpressure (their data must not be dropped); UoT sinks drop on a
     /// full queue (UDP semantics — the demux never blocks on them).
-    /// Deliver a server payload frame to its stream. TCP sinks use
-    /// try_send: a slow consumer must never stall the whole session's
-    /// demux — the stream is killed (server told with a non-blocking
-    /// FIN; the already-queued data still drains to the reader before
-    /// the close) instead of blocking every other stream. UoT sinks
-    /// drop on full (UDP semantics).
+    /// Deliver a server payload frame to its stream. TCP sinks get
+    /// **bounded backpressure**: a full queue parks the demux for up to
+    /// [`HOL_STALL_TIMEOUT`] — healthy bursts (relay scheduling jitter,
+    /// a fast server's initial flight) drain in milliseconds, and only a
+    /// consumer still full after the window is killed (server told with
+    /// a non-blocking FIN; the already-queued data still drains to the
+    /// reader before the close). The stall window is the head-of-line
+    /// tradeoff: one stuck stream can pause the session's demux, but
+    /// never longer than the timeout. UoT sinks drop on full (UDP
+    /// semantics).
     async fn dispatch_data(&self, sid: u32, data: Vec<u8>) {
         let sink = self.streams.lock().unwrap().get(&sid).cloned();
         match sink {
             Some(StreamSink::Tcp(tx)) => match tx.try_send(StreamEvent::Data(data)) {
                 Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    warn!(
-                        "AnyTLS session {} sid={} killed: slow consumer (HOL)",
-                        self.seq, sid
-                    );
-                    // The reader sees a reset (not a clean EOF) after the
-                    // already-queued data drains.
-                    self.killed_streams.lock().unwrap().insert(sid);
-                    self.streams.lock().unwrap().remove(&sid);
-                    if self
-                        .enqueue_control(CMD_FIN, sid, bytes::Bytes::new())
-                        .is_err()
-                    {
-                        // The writer queue is gone too — the session is dead.
-                        self.fail(anyhow::anyhow!("writer queue unavailable on HOL kill"));
+                Err(mpsc::error::TrySendError::Full(ev)) => {
+                    match tokio::time::timeout(HOL_STALL_TIMEOUT, tx.send(ev)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => {
+                            // Reader gone: drop the registration.
+                            self.streams.lock().unwrap().remove(&sid);
+                        }
+                        Err(_) => {
+                            warn!(
+                                "AnyTLS session {} sid={} killed: consumer stalled past {:?} (HOL)",
+                                self.seq, sid, HOL_STALL_TIMEOUT
+                            );
+                            // The reader sees a reset (not a clean EOF) after the
+                            // already-queued data drains.
+                            self.killed_streams.lock().unwrap().insert(sid);
+                            self.streams.lock().unwrap().remove(&sid);
+                            if self
+                                .enqueue_control(CMD_FIN, sid, bytes::Bytes::new())
+                                .is_err()
+                            {
+                                // The writer queue is gone too — the session is dead.
+                                self.fail(anyhow::anyhow!("writer queue unavailable on HOL kill"));
+                            }
+                        }
                     }
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
