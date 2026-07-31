@@ -47,7 +47,7 @@ Notable absences (referenced by older docs but **not in this tree**): `Makefile`
 
 - **Language:** Rust, edition 2024 (workspace-wide, including the eBPF crate).
 - **Async runtime:** Tokio (`full`).
-- **Allocator:** the shipped binary (`honk-core` bin) uses **mimalloc** as the global allocator (musl's stock malloc is slow under contention). mimalloc reserves aligned 1 GiB arenas and decommits purged pages, but fragment-pinned pages linger — so the binary runs a 60s `mi_collect(true)` task in `main.rs`, and RSS reads as the traffic high-water mark, not the live set. The clash `/logs` tracing layer (`clash_api/logs.rs`) skips formatting entirely when it has no subscribers — it is unfiltered, so without the check every sub-level event in the data path would cost a `String`.
+- **Allocator:** the shipped binary (`honk-core` bin) uses **mimalloc** as the global allocator behind the default-on `mimalloc` cargo feature (musl's stock malloc is slow under contention). mimalloc reserves aligned 1 GiB arenas and decommits purged pages, but fragment-pinned pages linger — so the binary runs a 60s `mi_collect(true)` task in `main.rs`, and RSS reads as the traffic high-water mark, not the live set. The clash `/logs` tracing layer (`clash_api/logs.rs`) skips formatting entirely when it has no subscribers — it is unfiltered, so without the check every sub-level event in the data path would cost a `String`.
 - **eBPF:** userspace [aya](https://github.com/aya-rs/aya) 0.14 (optional `ebpf` feature in `honk-core`); kernel side `aya-ebpf` 0.2 targeting `bpfel-unknown-none` (nightly + `-Zbuild-std=core` + `bpf-linker`).
 - **HTTP API:** axum 0.8 (with `ws`) + tower-http 0.7 (optional `clash-api` feature of `honk-core`, on by default).
 - **QUIC:** quinn 0.11 (TUIC/Juicity/Hysteria2 outbounds, DoQ/DoH3 DNS); `h3`/`h3-quinn` for DoH3 only — Hysteria2 ships its own minimal HTTP/3+QPACK layer.
@@ -146,9 +146,10 @@ Outbound dialing, groups, and health checking. Re-exported by `honk-core` as `ho
 
 The proxy engine (library `honk_core` + `honk-core` binary). Cargo features:
 
-- `default = ["clash-api"]`
+- `default = ["clash-api", "mimalloc"]`
 - `ebpf` — real eBPF backend via aya (requires Linux kernel 5.8+); without it the engine runs on `MockEbpfBackend`.
 - `clash-api` — Clash-compatible REST/WS API (pulls in optional axum/tower-http).
+- `mimalloc` — shipped binary allocates through mimalloc (see Technology stack); build with `--no-default-features --features "clash-api,ebpf"` for a stock-malloc binary.
 
 `build.rs` (only with `ebpf`) locates the eBPF object (`crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf` or `target/honk-core.o`), **verifies it contains `.BTF`** (rebuilds with `cargo +nightly` when missing or BTF-less — the rebuild strips `RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS` from the child env because an environment RUSTFLAGS overrides `crates/honk-ebpf/.cargo/config.toml`'s `--btf` flags and silently produces BTF-less objects), copies it to `OUT_DIR/honk-ebpf.o`, and sets `HONK_EBPF_OBJECT`; `lib.rs` embeds it with `include_bytes!`. Runtime override: `--bpf-object`.
 
@@ -271,7 +272,7 @@ The old `run` / `deploy` / `docker*` recipes were removed: they called `scripts/
 
 ### CI / releases
 
-`.github/workflows/release.yml` runs on `v*` tags: a test gate (`cargo test --workspace --no-fail-fast` with the 3 known-failing pre-existing tests `--skip`ped — boring-sys needs `cmake` + `libclang-dev` installed), then builds `honk-core --features ebpf` for `x86_64`/`aarch64` × `gnu`/`musl` (native gnu via `cargo build`; the other three via **zig cc/c++ wrapper scripts `ci/zigcc` / `ci/zigcxx`** — under cross, CMake injects clang-style `--target` flags into boring-sys' ASM rules that real GCC rejects and zig rejects in Rust-triple spelling, so the wrappers strip them and re-anchor on `$ZIGCC_TARGET`; musl targets also set `link-self-contained=no` so zig supplies the CRT). The eBPF object is built once on the host with nightly + `bpf-linker` (the workflow substitutes the hardcoded linker path) and **verified to contain `.BTF`** before packaging. Tarballs go to a GitHub Release (prerelease when the tag contains `alpha`/`beta`/`rc`).
+`.github/workflows/release.yml` runs on `v*` tags: a test gate (`cargo test --workspace --no-fail-fast` with the 3 known-failing pre-existing tests `--skip`ped — boring-sys needs `cmake` + `libclang-dev` installed), then builds `honk-core` with the `ebpf` feature for `x86_64`/`aarch64` × `gnu`/`musl` (native gnu via `cargo build`; the other three via **zig cc/c++ wrapper scripts `ci/zigcc` / `ci/zigcxx`** — under cross, CMake injects clang-style `--target` flags into boring-sys' ASM rules that real GCC rejects and zig rejects in Rust-triple spelling, so the wrappers strip them and re-anchor on `$ZIGCC_TARGET`; musl targets also set `link-self-contained=no` so zig supplies the CRT). Both x86_64 targets additionally build a `-stock` variant without the `mimalloc` feature (lower RSS high-water on small gateways). The eBPF object is built once on the host with nightly + `bpf-linker` (the workflow substitutes the hardcoded linker path) and **verified to contain `.BTF`** before packaging. Tarballs go to a GitHub Release (prerelease when the tag contains `alpha`/`beta`/`rc`).
 
 ## Current test status (verified 2026-07-22, after the boring-tls migration)
 
