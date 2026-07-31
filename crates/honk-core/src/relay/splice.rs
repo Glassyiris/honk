@@ -216,6 +216,11 @@ async fn pump(
 /// without a bound, a silent peer (dead node, blackholed tunnel) pins the
 /// relay task and both sockets forever — observed in production as a
 /// growing pile of CLOSE-WAIT accepted sockets.
+/// Idle budget for the surviving direction after the first EOF: it is cut
+/// only when this much time passes without any byte of progress, so a
+/// silent peer cannot pin the relay task and both sockets forever —
+/// observed in production as a growing pile of CLOSE-WAIT accepted
+/// sockets. Active transfers may outlive it freely.
 pub(crate) const DRAIN_DEADLINE: std::time::Duration = if cfg!(test) {
     std::time::Duration::from_millis(500)
 } else {
@@ -276,8 +281,9 @@ async fn run(
     tokio::pin!(p2c);
 
     // The first direction to finish half-closes the other (inside pump);
-    // the survivor then gets DRAIN_DEADLINE to reach its own EOF. An error
-    // in either direction still cancels the whole relay, mirroring
+    // the survivor then drains until its own EOF or a full DRAIN_DEADLINE
+    // without progress (a slow active download is never cut). An error in
+    // either direction still cancels the whole relay, mirroring
     // `copy_bidirectional`.
     let c2p_first = match tokio::select! {
         r = &mut c2p => r.map(|_| true),
@@ -286,11 +292,14 @@ async fn run(
         Ok(b) => b,
         Err(e) => return Err(SpliceError::Io(e)),
     };
-    let survivor = if c2p_first { &mut p2c } else { &mut c2p };
-    match tokio::time::timeout(DRAIN_DEADLINE, survivor).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => return Err(SpliceError::Io(e)),
-        Err(_) => debug!("relay drain deadline hit; closing both directions"),
+    let (survivor, survivor_cnt) = if c2p_first {
+        (&mut p2c, &cnt_p2c)
+    } else {
+        (&mut c2p, &cnt_c2p)
+    };
+    match super::drain_wait(survivor, survivor_cnt).await {
+        Ok(_) => {}
+        Err(e) => return Err(SpliceError::Io(e)),
     }
     Ok((
         cnt_c2p.load(Ordering::Relaxed),
