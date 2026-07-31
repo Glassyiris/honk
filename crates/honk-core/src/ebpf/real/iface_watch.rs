@@ -11,7 +11,7 @@ use std::time::Duration;
 use tokio::sync::{RwLock, watch};
 use tracing::{debug, info, warn};
 
-use crate::ebpf::{EbpfBackend, IfaceRole};
+use crate::ebpf::{DynamicHooks, EbpfBackend, IfaceRole};
 
 // RTMGRP_LINK as an nl_groups bitmask.
 const RTMGRP_LINK_MASK: u32 = 1;
@@ -21,18 +21,23 @@ const IFF_UP: u32 = 0x1;
 // so a slow ticker backstops the subscription.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Attach state per interface name: the ifindex the hooks live on (a
+/// delete+recreate gets a new one and needs fresh hooks) and which
+/// directions are already attached (retries only fill the gap).
+pub type AttachedMap = HashMap<String, (u32, DynamicHooks)>;
+
 pub struct IfaceWatcher {
     handle: tokio::task::JoinHandle<()>,
     stop: watch::Sender<bool>,
 }
 
 impl IfaceWatcher {
-    /// `attached` seeds the names (with ifindex) already hooked during
-    /// startup so the first reconcile does not attach them twice.
+    /// `attached` seeds the names (with ifindex and directions) already
+    /// hooked during startup so the first reconcile does not attach twice.
     pub fn spawn(
         ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
         config: Arc<RwLock<honk_config::Config>>,
-        attached: HashMap<String, u32>,
+        attached: AttachedMap,
     ) -> Option<Self> {
         let fd = match subscribe_links() {
             Ok(fd) => fd,
@@ -89,7 +94,7 @@ async fn run(
     fd: OwnedFd,
     ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
     config: Arc<RwLock<honk_config::Config>>,
-    mut attached: HashMap<String, u32>,
+    mut attached: AttachedMap,
     mut stop: watch::Receiver<bool>,
 ) {
     let async_fd = match tokio::io::unix::AsyncFd::with_interest(fd, tokio::io::Interest::READABLE)
@@ -112,11 +117,14 @@ async fn run(
                 reconcile(&ebpf, &config, &mut attached).await;
             }
             guard = async_fd.readable() => {
+                // A transient read failure (ENOBUFS after a burst) must not
+                // kill the watcher: the ticker keeps reconciling regardless.
                 let mut guard = match guard {
                     Ok(g) => g,
                     Err(e) => {
                         warn!("interface watcher: netlink wait failed: {}", e);
-                        break;
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
                     }
                 };
                 // Drain pending link events; their contents are irrelevant
@@ -152,7 +160,7 @@ async fn run(
                     }
                     Ok(Err(e)) => {
                         warn!("interface watcher: netlink recv failed: {}", e);
-                        break;
+                        tokio::time::sleep(Duration::from_secs(1)).await;
                     }
                     // Spurious readiness; nothing was drained.
                     Err(_) => {}
@@ -166,26 +174,51 @@ async fn run(
 async fn reconcile(
     ebpf: &Arc<RwLock<Box<dyn EbpfBackend>>>,
     config: &Arc<RwLock<honk_config::Config>>,
-    attached: &mut HashMap<String, u32>,
+    attached: &mut AttachedMap,
 ) {
     let (desired, single_homed) = {
         let cfg = config.read().await;
         desired_interfaces(&cfg)
     };
-    // An ifindex mismatch means the interface was deleted and recreated:
-    // the kernel tore its hooks down with the old device, so it needs a
-    // fresh attach.  A vanished interface is just forgotten.
-    attached.retain(|name, ifindex| iface_ifindex(name) == Some(*ifindex));
+    let wanted = |role: IfaceRole| match role {
+        IfaceRole::Lan => DynamicHooks {
+            ingress: true,
+            egress: !single_homed,
+        },
+        IfaceRole::Wan => DynamicHooks {
+            ingress: true,
+            egress: true,
+        },
+    };
     let mut backend = ebpf.write().await;
+    // An ifindex mismatch means the device was deleted and recreated: its
+    // hooks died with the old device, so drop the stale attach state (and
+    // the backend's dead links) and let it be re-attached below.
+    let tracked: Vec<(String, u32)> = attached
+        .iter()
+        .map(|(name, (ifindex, _))| (name.clone(), *ifindex))
+        .collect();
+    for (name, ifindex) in tracked {
+        if iface_ifindex(&name) != Some(ifindex) {
+            backend.forget_dynamic_interface(ifindex);
+            attached.remove(&name);
+        }
+    }
     for (name, role) in desired {
-        if attached.contains_key(&name) || !iface_is_up(&name) {
+        let want = wanted(role);
+        let have = attached
+            .get(&name)
+            .map(|(_, hooks)| *hooks)
+            .unwrap_or_default();
+        if have == want {
+            continue;
+        }
+        if iface_ifindex(&name).is_none() || !iface_is_up(&name) {
             continue;
         }
         match backend.attach_dynamic_interface(&name, role, single_homed) {
-            Ok(()) => {
-                if let Some(ifindex) = iface_ifindex(&name) {
-                    attached.insert(name.clone(), ifindex);
-                }
+            Ok(hooks) => {
+                attached.insert(name.clone(), (iface_ifindex(&name).unwrap_or(0), hooks));
                 info!(interface = %name, role = ?role, "attached eBPF programs to new interface");
             }
             Err(e) => {

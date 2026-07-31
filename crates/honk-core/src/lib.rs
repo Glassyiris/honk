@@ -503,8 +503,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     }
 
     #[cfg(feature = "ebpf")]
-    let mut attached_ifaces: std::collections::HashMap<String, u32> =
-        std::collections::HashMap::new();
+    let mut attached_ifaces: std::collections::HashMap<String, (u32, ebpf::DynamicHooks)> =
+        Default::default();
     let mut ebpf_backend: Box<dyn ebpf::EbpfBackend> = if cli.mock_ebpf {
         info!("Using mock eBPF backend");
         Box::new(ebpf::mock::MockEbpfBackend::new())
@@ -566,35 +566,59 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     .and_then(|s| s.trim().parse().ok())
             };
             if let Some(i) = ifindex_of(&primary_lan) {
-                attached_ifaces.insert(primary_lan.clone(), i);
+                attached_ifaces.insert(
+                    primary_lan.clone(),
+                    (
+                        i,
+                        ebpf::DynamicHooks {
+                            ingress: true,
+                            egress: !single_homed,
+                        },
+                    ),
+                );
             }
             if !single_homed
                 && !primary_wan.is_empty()
                 && let Some(i) = ifindex_of(&primary_wan)
             {
-                attached_ifaces.insert(primary_wan.clone(), i);
+                attached_ifaces.insert(
+                    primary_wan.clone(),
+                    (
+                        i,
+                        ebpf::DynamicHooks {
+                            ingress: true,
+                            egress: true,
+                        },
+                    ),
+                );
             }
             for extra_lan in lan_ifnames.iter().skip(1) {
                 match backend.attach_lan(extra_lan, single_homed) {
-                    Ok(()) => {
+                    Ok(hooks) => {
                         if let Some(i) = ifindex_of(extra_lan) {
-                            attached_ifaces.insert(extra_lan.clone(), i);
+                            attached_ifaces.insert(extra_lan.clone(), (i, hooks));
                         }
                     }
                     Err(e) => warn!("Failed to attach LAN programs to {}: {}", extra_lan, e),
                 }
             }
             for extra_wan in wan_ifnames.iter().skip(1) {
-                match backend.attach_wan_egress(extra_wan) {
-                    Ok(()) => {
-                        if let Some(i) = ifindex_of(extra_wan) {
-                            attached_ifaces.insert(extra_wan.clone(), i);
-                        }
-                    }
-                    Err(e) => warn!("Failed to attach WAN egress to {}: {}", extra_wan, e),
+                let egress = backend.attach_wan_egress(extra_wan);
+                if let Err(e) = &egress {
+                    warn!("Failed to attach WAN egress to {}: {}", extra_wan, e);
                 }
-                if let Err(e) = backend.attach_wan_ingress(extra_wan) {
+                let ingress = backend.attach_wan_ingress(extra_wan);
+                if let Err(e) = &ingress {
                     warn!("Failed to attach WAN ingress to {}: {}", extra_wan, e);
+                }
+                let hooks = ebpf::DynamicHooks {
+                    ingress: ingress.is_ok(),
+                    egress: egress.is_ok(),
+                };
+                if (hooks.ingress || hooks.egress)
+                    && let Some(i) = ifindex_of(extra_wan)
+                {
+                    attached_ifaces.insert(extra_wan.clone(), (i, hooks));
                 }
             }
 
@@ -749,6 +773,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     } else {
         None
     };
+    #[cfg(feature = "ebpf")]
+    control_plane.set_iface_watcher(iface_watcher);
 
     // Wire GroupManager into DNS outbound selection (Selector/URLTest/…).
     dns_upstream_pool.set_group_manager(Some(control_plane.group_manager()));
@@ -1066,11 +1092,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     info!("honk-core is running. Press Ctrl+C to stop.");
     control_plane.run().await?;
-
-    #[cfg(feature = "ebpf")]
-    if let Some(watcher) = iface_watcher {
-        watcher.shutdown().await;
-    }
 
     // Signal systemd that we're stopping (Type=notify)
     #[cfg(target_os = "linux")]

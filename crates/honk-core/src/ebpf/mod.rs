@@ -103,6 +103,14 @@ pub enum IfaceRole {
     Wan,
 }
 
+/// Per-direction outcome of a dynamic attach: which hooks are live on the
+/// interface after the call (including ones attached earlier).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DynamicHooks {
+    pub ingress: bool,
+    pub egress: bool,
+}
+
 #[async_trait]
 pub trait EbpfBackend: Send + Sync {
     fn inject_routing_fault(
@@ -183,17 +191,21 @@ pub trait EbpfBackend: Send + Sync {
     async fn cleanup(&mut self) -> anyhow::Result<()>;
 
     /// Attach TC programs to a configured interface that appeared after
-    /// startup.  Best-effort: per-program failures are logged inside the
-    /// backend, and attaching an interface whose kernel hook was torn down
-    /// (delete + recreate) is the intended use.
+    /// startup.  Backends dedupe per (ifindex, direction): a direction that
+    /// is already hooked is reported, never re-attached, so retrying after
+    /// a partial failure cannot stack duplicate hooks.
     fn attach_dynamic_interface(
         &mut self,
         _ifname: &str,
         _role: IfaceRole,
         _single_homed: bool,
-    ) -> anyhow::Result<()> {
-        Ok(())
+    ) -> anyhow::Result<DynamicHooks> {
+        Ok(DynamicHooks::default())
     }
+
+    /// Drop any dynamic-attach state for `ifindex` (the device is gone or
+    /// was recreated, so its hooks died with it).
+    fn forget_dynamic_interface(&mut self, _ifindex: u32) {}
 
     fn set_param(&mut self, key: ParamKey, value: u32) -> anyhow::Result<()>;
     fn get_param(&self, key: ParamKey) -> anyhow::Result<Option<u32>>;
