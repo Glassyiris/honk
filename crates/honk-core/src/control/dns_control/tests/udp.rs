@@ -19,6 +19,14 @@ async fn udp_overload_is_refused_while_permit_owner_is_in_flight() {
         .await
         .expect("bind second client");
     let original_dst: SocketAddr = "127.0.0.1:53".parse().expect("original destination");
+    // The reply path builds an IP_TRANSPARENT anyfrom socket bound to the
+    // original destination — unprivileged runners (CI) cannot create it,
+    // and the handler swallows the failure, so the REFUSED would never
+    // arrive. Exercise the full path only where it can actually work.
+    if crate::control::sockets::new_udp_reply_socket(original_dst).is_err() {
+        eprintln!("skipping: transparent UDP reply socket needs privileges");
+        return;
+    }
 
     let first_query = query_with_txid("first.example", 0x1111);
     let first_task = {
