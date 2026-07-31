@@ -184,6 +184,17 @@ struct PerProtocolState {
 }
 
 impl PerProtocolState {
+    /// Mark the domain alive and clear every failure/backoff counter
+    /// (shared by all probe/traffic success paths).
+    fn reset_on_success(&mut self) {
+        self.alive = true;
+        self.consecutive_failures = 0;
+        self.consecutive_successes = 0;
+        self.traffic_failures = 0;
+        self.stopped = false;
+        self.cooldown_until = Instant::now();
+    }
+
     fn new() -> Self {
         Self {
             alive: true,
@@ -249,6 +260,20 @@ pub struct ProbeRecord {
 /// Maximum probe history entries per node per domain/IP version.
 const MAX_PROBE_HISTORY: usize = 100;
 
+/// Domain resolver for health-check targets: `(host, port) → addrs`.
+/// honk-core installs the DNS-forwarder-backed resolver so all health-check
+/// name resolution shares honk's own DNS stack (routing, cache, serve-stale)
+/// instead of the raw system resolver; bootstrap DNS stays for node
+/// hostnames and startup.
+pub type ResolveHook = Arc<
+    dyn Fn(
+            String,
+            u16,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<SocketAddr>> + Send>>
+        + Send
+        + Sync,
+>;
+
 pub struct AliveDialerSet {
     /// Uses parking_lot RwLock/Mutex for synchronous, uncontended access on the
     /// async runtime (parking_lot blocks OS threads without runtime awareness).
@@ -277,6 +302,11 @@ pub struct AliveDialerSet {
     http_prober: RwLock<Option<HttpProberRef>>,
     check_url: RwLock<String>,
     check_method: RwLock<String>,
+    /// Probe target for the `direct` node (`host:port`): the proxy check URL
+    /// is meaningless for direct egress, so direct is measured with a raw
+    /// TCP connect against the bootstrap resolver instead. Defaults to
+    /// [`DEFAULT_DIRECT_CHECK_ADDR`].
+    direct_check_addr: RwLock<String>,
     /// Cached resolved IPs from the check URL hostname (Go: TcpCheckOption.Ip46).
     /// Resolved once at startup; refreshed on `refresh_check_ips()`.
     check_url_ips: RwLock<Vec<SocketAddr>>,
@@ -290,6 +320,8 @@ pub struct AliveDialerSet {
     probe_history: RwLock<HashMap<(String, usize), Vec<ProbeRecord>>>,
     /// Node name → eBPF outbound index resolver for connectivity pushes.
     outbound_resolver: RwLock<Option<OutboundIdResolver>>,
+    /// DNS resolver for check targets (system lookup when unset).
+    resolver: RwLock<Option<ResolveHook>>,
     /// Last activity timestamp per URLTest group (lazy start: absent = idle).
     group_last_active: RwLock<HashMap<String, Instant>>,
     /// node name → URLTest groups it belongs to (for idle suspension).
@@ -315,6 +347,16 @@ pub struct AliveDialerSet {
     url_check_ips: RwLock<HashMap<String, Vec<SocketAddr>>>,
 }
 
+/// Default probe target for the `direct` node when no `bootstrap_resolver`
+/// is configured: a directly-reachable, anycasted resolver.
+pub const DEFAULT_DIRECT_CHECK_ADDR: &str = "223.5.5.5:53";
+
+/// Exponential probe backoff: `base * 2^min(failures, 8)`, capped at `max`.
+fn probe_backoff(base: Duration, max: Duration, consecutive_failures: u32) -> Duration {
+    base.saturating_mul(2u32.pow(consecutive_failures.min(8)))
+        .min(max)
+}
+
 impl AliveDialerSet {
     pub fn new() -> Self {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -324,6 +366,7 @@ impl AliveDialerSet {
             registered: RwLock::new(HashMap::new()),
             ebpf_callback: RwLock::new(None),
             death_callback: RwLock::new(None),
+            resolver: RwLock::new(None),
             failure_threshold: 3,
             base_cooldown: Duration::from_secs(5),
             max_cooldown: Duration::from_secs(300),
@@ -335,6 +378,7 @@ impl AliveDialerSet {
             http_prober: RwLock::new(None),
             check_url: RwLock::new(String::new()),
             check_method: RwLock::new(String::new()),
+            direct_check_addr: RwLock::new(DEFAULT_DIRECT_CHECK_ADDR.to_string()),
             check_url_ips: RwLock::new(Vec::new()),
             udp_prober: RwLock::new(None),
             node_registered_at: RwLock::new(HashMap::new()),
@@ -358,6 +402,12 @@ impl AliveDialerSet {
         self
     }
 
+    /// Override the `direct` node's probe target (`host:port`). honk-core
+    /// installs the configured `bootstrap_resolver` here.
+    pub fn set_direct_check_addr(&self, addr: String) {
+        *self.direct_check_addr.write() = addr;
+    }
+
     /// Configure HTTP-based health checks from config (Go: TcpCheckOption).
     ///
     /// Resolves the check URL's hostname once at startup and caches the IPs.
@@ -377,24 +427,17 @@ impl AliveDialerSet {
         // fallback IPs (comma-separated) are merged in so probes still have
         // targets even when DNS resolution fails.
         if let Some(hostname) = Self::parse_url_host(&check_url) {
-            match tokio::net::lookup_host(format!("{}:80", hostname)).await {
-                Ok(addrs) => {
-                    let ips = Self::merge_check_addrs(addrs.collect(), &check_url);
-                    tracing::info!(
-                        "Health check DNS resolved '{}' → {} IPs",
-                        hostname,
-                        ips.len()
-                    );
-                    *self.check_url_ips.write() = ips;
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to resolve health check URL '{}': {}", hostname, e);
-                    let ips = Self::merge_check_addrs(Vec::new(), &check_url);
-                    if !ips.is_empty() {
-                        *self.check_url_ips.write() = ips;
-                    }
-                }
+            let addrs = self.resolve_host(&hostname, 80).await;
+            if addrs.is_empty() {
+                tracing::warn!("Failed to resolve health check URL '{}'", hostname);
             }
+            let ips = Self::merge_check_addrs(addrs, &check_url);
+            tracing::info!(
+                "Health check DNS resolved '{}' → {} IPs",
+                hostname,
+                ips.len()
+            );
+            *self.check_url_ips.write() = ips;
         } else {
             // No URL hostname at all — literal-only form.
             let ips = Self::merge_check_addrs(Vec::new(), &check_url);
@@ -412,16 +455,39 @@ impl AliveDialerSet {
         *self.udp_prober.write() = Some(prober);
     }
 
+    /// Install the DNS resolver for health-check targets (see [`ResolveHook`]).
+    pub fn set_resolver(&self, hook: ResolveHook) {
+        *self.resolver.write() = Some(hook);
+    }
+
+    /// Resolve `host` via the installed hook, falling back to the system
+    /// resolver when no hook is set or the hook finds nothing.
+    pub async fn resolve_host(&self, host: &str, port: u16) -> Vec<SocketAddr> {
+        let hook = self.resolver.read().clone();
+        if let Some(hook) = hook {
+            let out = hook(host.to_string(), port).await;
+            if !out.is_empty() {
+                return out;
+            }
+            tracing::debug!("health-check resolver found nothing for {host}; system fallback");
+        }
+        tokio::net::lookup_host(format!("{host}:{port}"))
+            .await
+            .map(|it| it.collect())
+            .unwrap_or_default()
+    }
+
     /// Refresh the cached check URL IPs.  Called at the start of each full
     /// health check cycle so DNS record changes are eventually picked up.
     /// Matches Go's `TcpCheckOptionRaw.Reset()`.
     pub async fn refresh_check_ips(&self) {
         let check_url = self.check_url.read().clone();
-        if let Some(hostname) = Self::parse_url_host(&check_url)
-            && let Ok(addrs) = tokio::net::lookup_host(format!("{}:80", hostname)).await
-        {
-            let ips = Self::merge_check_addrs(addrs.collect(), &check_url);
-            *self.check_url_ips.write() = ips;
+        if let Some(hostname) = Self::parse_url_host(&check_url) {
+            let addrs = self.resolve_host(&hostname, 80).await;
+            if !addrs.is_empty() {
+                let ips = Self::merge_check_addrs(addrs, &check_url);
+                *self.check_url_ips.write() = ips;
+            }
         }
     }
 
@@ -545,12 +611,7 @@ impl AliveDialerSet {
         let idx = alive_index(domain, ipver);
         let was_alive = self.with_state(node_id, idx, |e| {
             let was = e.alive;
-            e.alive = true;
-            e.consecutive_failures = 0;
-            e.consecutive_successes = 0;
-            e.traffic_failures = 0;
-            e.stopped = false;
-            e.cooldown_until = Instant::now();
+            e.reset_on_success();
             was
         });
         if !was_alive {
@@ -642,10 +703,7 @@ impl AliveDialerSet {
             } else {
                 e.consecutive_failures += 1;
                 let f = e.consecutive_failures;
-                let backoff = self
-                    .base_cooldown
-                    .saturating_mul(2u32.pow(f.min(8)))
-                    .min(self.max_cooldown);
+                let backoff = probe_backoff(self.base_cooldown, self.max_cooldown, f);
                 e.cooldown_until = Instant::now() + backoff;
                 if f >= MAX_PROBE_BACKOFF_FAILURES {
                     e.stopped = true;
@@ -710,11 +768,7 @@ impl AliveDialerSet {
         let idx = alive_index(domain, ipver);
         let was_alive = self.with_state(node_id, idx, |e| {
             let was = e.alive;
-            e.alive = true;
-            e.consecutive_failures = 0;
-            e.consecutive_successes = 0;
-            e.traffic_failures = 0;
-            e.stopped = false;
+            e.reset_on_success();
             was
         });
         if !was_alive {
@@ -808,12 +862,7 @@ impl AliveDialerSet {
             let was = e.alive;
             if was {
                 // Already alive: straightforward reset.
-                e.alive = true;
-                e.consecutive_failures = 0;
-                e.consecutive_successes = 0;
-                e.traffic_failures = 0;
-                e.stopped = false;
-                e.cooldown_until = Instant::now();
+                e.reset_on_success();
                 false
             } else {
                 // Was dead: apply recovery hysteresis.
@@ -1136,10 +1185,11 @@ impl AliveDialerSet {
         let e = states.entry(key).or_insert_with(UrlProbeState::new);
         e.consecutive_successes = 0;
         e.consecutive_failures += 1;
-        let backoff = self
-            .base_cooldown
-            .saturating_mul(2u32.pow(e.consecutive_failures.min(8)))
-            .min(self.max_cooldown);
+        let backoff = probe_backoff(
+            self.base_cooldown,
+            self.max_cooldown,
+            e.consecutive_failures,
+        );
         e.cooldown_until = Instant::now() + backoff;
         if e.consecutive_failures >= probe_failure_threshold(ProbeDomain::Tcp) {
             e.alive = false;
@@ -1163,13 +1213,10 @@ impl AliveDialerSet {
             return ips.clone();
         }
         let ips = match Self::parse_url_host(url) {
-            Some(hostname) => match tokio::net::lookup_host(format!("{}:80", hostname)).await {
-                Ok(addrs) => Self::merge_check_addrs(addrs.collect(), url),
-                Err(e) => {
-                    tracing::warn!("Health check URL '{}' DNS resolution failed: {}", url, e);
-                    Self::merge_check_addrs(Vec::new(), url)
-                }
-            },
+            Some(hostname) => {
+                let addrs = self.resolve_host(&hostname, 80).await;
+                Self::merge_check_addrs(addrs, url)
+            }
             None => Self::merge_check_addrs(Vec::new(), url),
         };
         self.url_check_ips
@@ -1344,10 +1391,16 @@ impl AliveDialerSet {
 
     /// Merge resolved and literal check-target addresses, deduplicated.
     fn merge_check_addrs(resolved: Vec<SocketAddr>, check_url: &str) -> Vec<SocketAddr> {
-        let mut ips = resolved;
-        ips.extend(Self::parse_check_literals(check_url));
-        ips.sort();
-        ips.dedup();
+        // Operator-declared literal fallbacks are the trusted anchors and
+        // are tried first: resolved answers can be DNS-poisoned, and the
+        // per-family probe window (first 3) would otherwise fill with
+        // poisoned entries and starve the good literals out entirely.
+        let mut ips = Self::parse_check_literals(check_url);
+        for a in resolved {
+            if !ips.contains(&a) {
+                ips.push(a);
+            }
+        }
         ips
     }
 }
@@ -1355,6 +1408,24 @@ impl AliveDialerSet {
 impl Default for AliveDialerSet {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod merge_check_addrs_tests {
+    use super::*;
+
+    #[test]
+    fn literals_come_before_resolved_even_when_they_sort_later() {
+        let literal: SocketAddr = "142.250.197.238:80".parse().unwrap();
+        let poisoned: SocketAddr = "58.63.233.33:80".parse().unwrap();
+        let merged = AliveDialerSet::merge_check_addrs(
+            vec![poisoned],
+            "http://www.google-analytics.com/generate_204,142.250.197.238",
+        );
+        assert_eq!(merged.first(), Some(&literal));
+        assert!(merged.contains(&poisoned));
+        assert_eq!(merged.len(), 2);
     }
 }
 
@@ -1396,111 +1467,5 @@ impl StickyCache {
         let n = c.len();
         c.retain(|_, (_, e)| Instant::now() < *e);
         n - c.len()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NodeState {
-    Healthy,
-    Degraded,
-    Failed,
-    Recovering,
-}
-
-impl RecoveryEntry {
-    fn new() -> Self {
-        Self {
-            state: NodeState::Healthy,
-            consecutive_failures: 0,
-            cooldown_until: Instant::now(),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct RecoveryEntry {
-    state: NodeState,
-    consecutive_failures: u32,
-    cooldown_until: Instant,
-}
-
-pub struct RecoveryState {
-    entries: Mutex<HashMap<String, [RecoveryEntry; ProbeDomain::count()]>>,
-    failure_threshold: u32,
-    base_cooldown: Duration,
-    max_cooldown: Duration,
-}
-
-impl RecoveryState {
-    pub fn new(failure_threshold: u32, base_cooldown: Duration, max_cooldown: Duration) -> Self {
-        Self {
-            entries: Mutex::new(HashMap::new()),
-            failure_threshold,
-            base_cooldown,
-            max_cooldown,
-        }
-    }
-
-    fn with_entry<F, R>(&self, node: &str, domain: ProbeDomain, f: F) -> R
-    where
-        F: FnOnce(&mut RecoveryEntry) -> R,
-    {
-        let mut entries = self.entries.lock();
-        let arr = entries.entry(node.into()).or_insert_with(|| {
-            [
-                RecoveryEntry::new(),
-                RecoveryEntry::new(),
-                RecoveryEntry::new(),
-            ]
-        });
-        f(&mut arr[domain as usize])
-    }
-
-    fn read_entry(&self, node: &str, domain: ProbeDomain) -> RecoveryEntry {
-        self.entries
-            .lock()
-            .get(node)
-            .map(|e| e[domain as usize].clone())
-            .unwrap_or_else(RecoveryEntry::new)
-    }
-
-    pub fn should_probe(&self, node: &str, domain: ProbeDomain) -> bool {
-        Instant::now() >= self.read_entry(node, domain).cooldown_until
-    }
-
-    pub fn report_success(&self, node: &str, domain: ProbeDomain) {
-        self.with_entry(node, domain, |e| {
-            e.consecutive_failures = 0;
-            e.state = NodeState::Healthy;
-            e.cooldown_until = Instant::now();
-        });
-    }
-
-    pub fn report_failure(&self, node: &str, domain: ProbeDomain) -> NodeState {
-        self.with_entry(node, domain, |e| {
-            e.consecutive_failures += 1;
-            let backoff = self
-                .base_cooldown
-                .saturating_mul(2u32.pow(e.consecutive_failures.min(8)))
-                .min(self.max_cooldown);
-            e.cooldown_until = Instant::now() + backoff;
-            e.state = if e.consecutive_failures >= self.failure_threshold {
-                NodeState::Failed
-            } else {
-                NodeState::Degraded
-            };
-            e.state
-        })
-    }
-
-    pub fn get_state(&self, node: &str, domain: ProbeDomain) -> NodeState {
-        self.read_entry(node, domain).state
-    }
-
-    pub fn is_usable(&self, node: &str, domain: ProbeDomain) -> bool {
-        matches!(
-            self.get_state(node, domain),
-            NodeState::Healthy | NodeState::Degraded
-        )
     }
 }

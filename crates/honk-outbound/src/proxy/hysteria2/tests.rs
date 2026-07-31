@@ -1,5 +1,9 @@
 use super::*;
 use crate::quic::testutil;
+use quinn::EndpointConfig;
+use std::time::Instant;
+
+use parking_lot::Mutex;
 use std::sync::atomic::AtomicBool;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -13,6 +17,11 @@ fn test_node(port: u16, password: &str) -> Node {
         address: format!("127.0.0.1:{port}"),
         port,
         hy2_auth: Some(password.to_string()),
+        // Loopback has no loss, so PMTU discovery would climb to 1452 and
+        // the client would fragment UDP payloads above what the peer (capped
+        // by our advertised 1252 max_udp_payload_size) can send back. Real
+        // lossy links keep PMTUD near the advertised value anyway.
+        hy2_disable_mtu_discovery: Some(true),
         skip_cert_verify: true,
         ..Default::default()
     }
@@ -499,12 +508,14 @@ fn test_fragmentation_and_defrag() {
     assert_eq!(frags.len(), 3);
     assert!(frags.iter().all(|f| f.len() <= 1200));
     // Every fragment repeats the full header (sing parity).
-    let mut map: HashMap<u16, DefragBuffer> = HashMap::new();
+    let mut defrag = Defragmenter::new();
     let mut out = None;
     for pkt in frags.iter().rev() {
         let msg = decode_udp_message(pkt).unwrap();
         assert_eq!(msg.addr, "8.8.8.8:53");
-        out = feed_defrag(&mut map, msg).or(out);
+        out = defrag
+            .feed(msg.packet_id, msg.frag_id, msg.frag_total, msg.data)
+            .or(out);
     }
     assert_eq!(out.expect("reassembled payload"), data);
 }
@@ -620,6 +631,52 @@ async fn test_udp_datagram_echo() {
         .unwrap();
     assert_eq!(src, udp.relay_addr);
     assert_eq!(&buf[..n], b"dns-query");
+}
+
+#[tokio::test]
+async fn test_udp_transport_datagram_echo() {
+    let server_addr = start_server(TEST_PASSWORD).await;
+    let node = test_node(server_addr.port(), TEST_PASSWORD);
+    let handler = Hysteria2Handler::new();
+    let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
+
+    let transport = handler
+        .dial_udp_transport(&node, target, None, Duration::from_secs(5))
+        .await
+        .expect("dial_udp_transport should succeed");
+    assert_eq!(transport.relay_addr(), target);
+    transport.send_packet(b"dns-query").await.unwrap();
+    let mut buf = [0u8; 256];
+    let (n, src) = tokio::time::timeout(Duration::from_secs(5), transport.recv_packet(&mut buf))
+        .await
+        .expect("reply timed out")
+        .unwrap();
+    assert_eq!(src, target);
+    assert_eq!(&buf[..n], b"dns-query");
+}
+
+#[tokio::test]
+async fn test_udp_transport_fragmented_echo() {
+    let server_addr = start_server(TEST_PASSWORD).await;
+    let node = test_node(server_addr.port(), TEST_PASSWORD);
+    let handler = Hysteria2Handler::new();
+    let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
+
+    let transport = handler
+        .dial_udp_transport(&node, target, None, Duration::from_secs(5))
+        .await
+        .expect("dial_udp_transport should succeed");
+    // 3000 bytes exceeds the QUIC datagram MTU: fragmented on send and
+    // reassembled on receive.
+    let payload = vec![0x5au8; 3000];
+    transport.send_packet(&payload).await.unwrap();
+    let mut buf = vec![0u8; 4096];
+    let (n, src) = tokio::time::timeout(Duration::from_secs(5), transport.recv_packet(&mut buf))
+        .await
+        .expect("reply timed out")
+        .unwrap();
+    assert_eq!(src, target);
+    assert_eq!(&buf[..n], payload.as_slice());
 }
 
 #[tokio::test]

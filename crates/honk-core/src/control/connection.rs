@@ -766,15 +766,27 @@ impl ControlPlaneHandle {
                     let registry = ctx.proxy_registry.clone();
                     let target_domain = target_domain.clone();
                     tokio::spawn(async move {
-                        let ready_capable = registry
+                        let caps = honk_outbound::runtime::OutboundCapabilities::for_node(&node);
+                        let (ready_capable, bare_capable) = registry
                             .find(node.protocol)
-                            .is_some_and(|h| h.pool_ready_streams(&node));
+                            .map(|h| {
+                                (
+                                    h.pool_ready_streams(&node) && caps.tcp && !caps.multiplexed,
+                                    h.pool_bare_tcp(&node),
+                                )
+                            })
+                            .unwrap_or((false, false));
                         if ready_capable {
                             let key = ConnectionPool::ready_key(
                                 &node_addr,
                                 target,
                                 target_domain.as_deref(),
                             );
+                            // Only hot targets earn a speculative ready
+                            // dial; a one-off flow gets none.
+                            if !pool.note_target(&key) {
+                                return;
+                            }
                             match registry
                                 .dial(&node, target, target_domain.as_deref(), connect_timeout)
                                 .await
@@ -789,6 +801,11 @@ impl ControlPlaneHandle {
                                     );
                                 }
                             }
+                            return;
+                        }
+                        if !bare_capable {
+                            // Multiplexed protocols pool whole sessions
+                            // instead; a bare TCP is useless to them.
                             return;
                         }
                         match honk_outbound::util::connect_outbound(&node_addr, connect_timeout)
@@ -962,15 +979,27 @@ impl ControlPlaneHandle {
                     let registry = self.proxy_registry.clone();
                     let target_domain = target_domain.clone();
                     tokio::spawn(async move {
-                        let ready_capable = registry
+                        let caps = honk_outbound::runtime::OutboundCapabilities::for_node(&node);
+                        let (ready_capable, bare_capable) = registry
                             .find(node.protocol)
-                            .is_some_and(|h| h.pool_ready_streams(&node));
+                            .map(|h| {
+                                (
+                                    h.pool_ready_streams(&node) && caps.tcp && !caps.multiplexed,
+                                    h.pool_bare_tcp(&node),
+                                )
+                            })
+                            .unwrap_or((false, false));
                         if ready_capable {
                             let key = ConnectionPool::ready_key(
                                 &node_addr,
                                 resolved_target,
                                 target_domain.as_deref(),
                             );
+                            // Only hot targets earn a speculative ready
+                            // dial; a one-off flow gets none.
+                            if !pool.note_target(&key) {
+                                return;
+                            }
                             match registry
                                 .dial(
                                     &node,
@@ -990,6 +1019,11 @@ impl ControlPlaneHandle {
                                     );
                                 }
                             }
+                            return;
+                        }
+                        if !bare_capable {
+                            // Multiplexed protocols pool whole sessions
+                            // instead; a bare TCP is useless to them.
                             return;
                         }
                         match honk_outbound::util::connect_outbound(&node_addr, connect_timeout)
@@ -1212,7 +1246,7 @@ impl ControlPlaneHandle {
             ep.mark_sent();
             ep.refresh();
             ep.tracker_upload(data.len() as u64);
-            ep.proxy_socket.send_to(&data, ep.relay_addr).await?;
+            ep.proxy_socket.send_packet(&data).await?;
             return Ok(());
         }
 
@@ -1308,20 +1342,30 @@ impl ControlPlaneHandle {
         for node in &candidates {
             match self
                 .proxy_registry
-                .dial_udp(node, original_dst, None, connect_timeout)
+                .dial_udp_transport(node, original_dst, None, connect_timeout)
                 .await
             {
-                Ok(proxy) => {
-                    proxy.socket.send_to(&data, proxy.relay_addr).await?;
+                Ok(transport) => {
+                    let relay_addr = transport.relay_addr();
+                    transport.send_packet(&data).await?;
                     let client_to_proxy: u64 = data.len() as u64;
 
-                    let (endpoint, is_new) = self.udp_pool.get_or_create(
+                    let Some((endpoint, is_new)) = self.udp_pool.get_or_create(
                         client_addr,
                         original_dst,
-                        proxy.socket,
-                        proxy.relay_addr,
+                        transport,
+                        relay_addr,
                         node.name.clone(),
-                    );
+                    ) else {
+                        // Pool at capacity: the datagram was already sent;
+                        // without an endpoint there is no reply path, so stop
+                        // here instead of queueing unbounded state.
+                        debug!(
+                            "UDP endpoint pool full; dropping mapping {} -> {}",
+                            client_addr, original_dst
+                        );
+                        return Ok(());
+                    };
                     if is_new {
                         debug!(
                             "Proxying UDP {} -> {} via {} (new endpoint)",
@@ -1334,7 +1378,7 @@ impl ControlPlaneHandle {
                         );
                     }
                     endpoint.mark_sent();
-                    endpoint.record_pending_reply_peer(proxy.relay_addr);
+                    endpoint.record_pending_reply_peer(relay_addr);
                     endpoint.cache_routing_result(original_dst, outbound_index);
 
                     // Register the flow in the clash-API tracker once per
@@ -1474,8 +1518,13 @@ impl ControlPlaneHandle {
                 }
             }
 
-            // Bare pool: raw TCP to the proxy server.
-            if let Some(tcp) = pool.acquire_tcp(&addr).await {
+            // Bare pool: raw TCP to the proxy server. Multiplexed
+            // protocols opt out (pool_bare_tcp): their session pool
+            // already holds warm connections and a bare hit would force
+            // a new mux session per flow.
+            if handler.pool_bare_tcp(node)
+                && let Some(tcp) = pool.acquire_tcp(&addr).await
+            {
                 tracing::debug!("Pooled TCP to {} acquired for {}", addr, target);
                 return handler
                     .dial_with_tcp(node, target, target_domain, tcp, connect_timeout)

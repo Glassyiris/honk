@@ -274,49 +274,58 @@ impl BpfJanitor {
             }
         };
 
-        let mut entries = Vec::new();
+        // Stream the map in bounded chunks instead of one 524K-entry
+        // snapshot: memory stays flat regardless of map occupancy. Expired
+        // keys are collected and removed in bounded batches too.
+        let mut expired: Vec<TuplesKey> = Vec::with_capacity(1024);
+        let mut total = 0usize;
+        let mut scan_ok = true;
         {
             let ebpf = self.ebpf.read().await;
-            if ebpf.conn_state_snapshot(&mut entries).is_err() {
-                return (0, 0);
+            if ebpf
+                .conn_state_for_each_chunk(1024, &mut |chunk| {
+                    total += chunk.len();
+                    for (key, state) in chunk {
+                        let age = now_ns.saturating_sub(state.last_seen_ns);
+                        let stale = if key.l4proto == IPPROTO_TCP {
+                            if state.state == TcpState::TcpStateClosing as u8 {
+                                age > TCP_CONN_STATE_CLOSING_TIMEOUT_NS
+                            } else {
+                                age > TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS
+                            }
+                        } else {
+                            age > UDP_CONN_STATE_TIMEOUT_NS
+                        };
+                        if stale {
+                            expired.push(*key);
+                        }
+                    }
+                })
+                .is_err()
+            {
+                scan_ok = false;
             }
         }
+        if !scan_ok {
+            return (0, 0);
+        }
         let ((inserts, ebpf_deletes), userspace_deletes) = occ_counters;
-        gauge.calibrate(
-            entries.len() as u64,
-            inserts,
-            ebpf_deletes,
-            userspace_deletes,
-        );
-
-        let expired: Vec<TuplesKey> = entries
-            .iter()
-            .filter(|(key, state)| {
-                let age = now_ns.saturating_sub(state.last_seen_ns);
-                if key.l4proto == IPPROTO_TCP {
-                    if state.state == TcpState::TcpStateClosing as u8 {
-                        age > TCP_CONN_STATE_CLOSING_TIMEOUT_NS
-                    } else {
-                        age > TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS
-                    }
-                } else {
-                    age > UDP_CONN_STATE_TIMEOUT_NS
-                }
-            })
-            .map(|(key, _)| *key)
-            .collect();
+        gauge.calibrate(total as u64, inserts, ebpf_deletes, userspace_deletes);
 
         let deleted = expired.len() as u64;
         if !expired.is_empty() {
             let mut ebpf = self.ebpf.write().await;
-            if let Err(e) = ebpf.conn_state_remove_batch(&expired) {
-                debug!("BPF janitor: failed to batch-remove conn states: {}", e);
-            } else {
-                gauge.note_janitor_deletes(deleted);
+            for batch in expired.chunks(1024) {
+                if let Err(e) = ebpf.conn_state_remove_batch(batch) {
+                    debug!("BPF janitor: failed to batch-remove conn states: {}", e);
+                    break;
+                } else {
+                    gauge.note_janitor_deletes(batch.len() as u64);
+                }
             }
         }
 
-        (deleted, entries.len())
+        (deleted, total)
     }
 
     /// Clean up stale redirect track entries.

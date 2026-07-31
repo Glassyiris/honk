@@ -1,4 +1,5 @@
-//! h2mux stream multiplexing for the stream-transport layer.
+//! h2mux stream multiplexing for the stream-transport layer —
+//! **honk h2 carrier**, not sing-mux compatible.
 //!
 //! When `node.mux` is set, the trojan/VMess/VLESS dial path upgrades its
 //! TCP (+TLS) connection to a shared HTTP/2 session and each dial opens a
@@ -6,7 +7,17 @@
 //! sing-mux's `h2mux` protocol (`mux = true` means h2mux; smux/yamux are
 //! not implemented).
 //!
-//! # Wire format (sing-mux alignment)
+//! # Compatibility (4B decision gate)
+//!
+//! honk writes the proxy handshake onto each h2 stream, while sing-mux
+//! wraps streams in its own outer handshake + per-stream `StreamRequest`.
+//! An interop gate test against an official sing-box multiplex inbound
+//! (`trojan_mux_against_sing_box`, run with `--ignored`) fails with
+//! "stream closed because of a broken pipe" — **official sing-mux
+//! inbounds reject this implementation**. Use it only with servers that
+//! follow the same honk h2-carrier convention.
+//!
+//! # Wire format
 //!
 //! - **Session header**: before the HTTP/2 client preface the client writes
 //!   the sing-mux session request `version(1) | protocol(1)` = `0x00 0x02`
@@ -48,10 +59,9 @@
 //! the server. Nodes that differ only in credentials share a session, the
 //! same way sing-mux sessions are destination-agnostic.
 
-use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::sync::{Arc, LazyLock, Weak};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -79,24 +89,21 @@ const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// `TCPTimeout` parity); session dials use the caller's connect timeout.
 const SESSION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Cache key for h2mux sessions: one session pool per server TLS identity.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct SessionKey {
-    host: String,
-    port: u16,
-    tls: bool,
-    sni: Option<String>,
-}
-
-impl SessionKey {
-    fn from_node(node: &Node) -> Self {
-        Self {
-            host: node.host().to_string(),
-            port: node.port,
-            tls: node.tls,
-            sni: node.sni.clone(),
-        }
-    }
+/// Pool key for a node: `host:port` plus the auth/TLS fingerprint, so two
+/// nodes sharing an endpoint but differing in password/SNI/verify never
+/// share a session (anytls `pool_key` parity).
+fn pool_key(node: &Node) -> String {
+    let password = node.password.as_deref().unwrap_or("");
+    let pw_hash = &blake3::hash(password.as_bytes()).to_hex().as_str()[..8].to_string();
+    format!(
+        "{}:{}|{}|{}|{}|{}",
+        node.host(),
+        node.port,
+        node.tls,
+        node.sni.as_deref().unwrap_or(""),
+        pw_hash,
+        node.skip_cert_verify,
+    )
 }
 
 /// Shared per-session state, referenced by every open stream.
@@ -121,15 +128,27 @@ struct MuxSession {
     shared: Arc<SessionShared>,
 }
 
-/// Process-wide h2mux session cache. Static because `connect_transport`
-/// has no manager instance to thread through (mirrors the AnyTLS pool's
-/// static janitors).
-pub(crate) struct MuxManager {
-    sessions: Mutex<HashMap<SessionKey, Vec<Arc<MuxSession>>>>,
+impl crate::session::ManagedSession for MuxSession {
+    fn active_streams(&self) -> usize {
+        self.shared.active_streams.load(Ordering::Acquire)
+    }
+    fn is_closed(&self) -> bool {
+        self.shared.closed.load(Ordering::Acquire)
+    }
+    fn close(&self) {
+        self.shared.closed.store(true, Ordering::Release);
+        self.shared.close_notify.notify_one();
+    }
 }
 
-static MUX_MANAGER: LazyLock<MuxManager> = LazyLock::new(|| MuxManager {
-    sessions: Mutex::new(HashMap::new()),
+/// Process-wide h2mux session pool ([`SessionPool`] — hard session cap,
+/// least-loaded scheduling, dial single-flight + backoff; the idle watcher
+/// below keeps the precise 60s zero-stream close).
+static POOL: LazyLock<crate::session::SessionPool<MuxSession>> = LazyLock::new(|| {
+    crate::session::SessionPool::new(crate::session::SessionPoolConfig {
+        max_streams_per_session: SOFT_MAX_STREAMS_PER_SESSION,
+        ..Default::default()
+    })
 });
 
 /// Open a multiplexed stream for `node` on a shared h2mux session, dialing
@@ -138,7 +157,32 @@ pub(crate) async fn open_stream(
     node: &Node,
     connect_timeout: Duration,
 ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
-    MUX_MANAGER.open_stream(node, connect_timeout).await
+    let key = pool_key(node);
+    let mut last_err: Option<anyhow::Error> = None;
+    for _attempt in 0..2 {
+        let dial_node = node.clone();
+        let dial_key = key.clone();
+        let session = match POOL
+            .offer(&key, move || async move {
+                dial_session(&dial_node, &dial_key, connect_timeout).await
+            })
+            .await
+        {
+            Ok(session) => session,
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        };
+        match session.open_stream().await {
+            Ok(stream) => return Ok(Box::new(stream)),
+            Err(e) => {
+                POOL.invalidate(&key, &session);
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.expect("open_stream attempts always record an error"))
 }
 
 /// Build a shared h2mux session on an already-connected (TLS-wrapped)
@@ -147,130 +191,63 @@ pub(crate) async fn open_stream_on(
     node: &Node,
     stream: Box<dyn AsyncReadWrite>,
 ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
-    let key = SessionKey::from_node(node);
-    let session = MUX_MANAGER
-        .insert_session(&key, stream, SESSION_HANDSHAKE_TIMEOUT)
-        .await?;
+    let key = pool_key(node);
+    let session = build_session(stream, SESSION_HANDSHAKE_TIMEOUT, &key).await?;
+    POOL.insert(&key, &session);
     match session.open_stream().await {
         Ok(stream) => Ok(Box::new(stream)),
         Err(e) => {
             // The session is brand new; a failed first stream means it is
             // broken — do not leave it in the cache.
-            MUX_MANAGER.invalidate(&key, &session);
+            POOL.invalidate(&key, &session);
             Err(e)
         }
     }
 }
 
-impl MuxManager {
-    /// Open a new h2 stream on a shared session for `node`, dialing a new
-    /// session when all cached ones are closed or at the soft stream cap.
-    /// One retry on a stale session (sing-mux `openStream`'s two attempts).
-    async fn open_stream(
-        &'static self,
-        node: &Node,
-        connect_timeout: Duration,
-    ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
-        let key = SessionKey::from_node(node);
-        let mut last_err: Option<anyhow::Error> = None;
-        for _attempt in 0..2 {
-            let session = match self.offer(node, &key, connect_timeout).await {
-                Ok(session) => session,
-                Err(e) => {
-                    last_err = Some(e);
-                    continue;
-                }
-            };
-            match session.open_stream().await {
-                Ok(stream) => return Ok(Box::new(stream)),
-                Err(e) => {
-                    self.invalidate(&key, &session);
-                    last_err = Some(e);
-                }
-            }
-        }
-        Err(last_err.expect("open_stream attempts always record an error"))
-    }
+/// Dial a fresh session: TCP (+TLS) to the node server, then the h2
+/// handshake.
+async fn dial_session(
+    node: &Node,
+    key: &str,
+    connect_timeout: Duration,
+) -> anyhow::Result<Arc<MuxSession>> {
+    let addr = format!("{}:{}", node.host(), node.port);
+    let tcp = crate::util::connect_outbound(&addr, connect_timeout).await?;
+    let stream = super::transport::maybe_tls_wrap(node, tcp).await?;
+    build_session(stream, connect_timeout, key).await
+}
 
-    /// Pick the least-loaded live session under the soft stream cap, or
-    /// dial a new one (sing-mux `offer` / `offerNew` with default options).
-    async fn offer(
-        &'static self,
-        node: &Node,
-        key: &SessionKey,
-        connect_timeout: Duration,
-    ) -> anyhow::Result<Arc<MuxSession>> {
-        {
-            let mut sessions = self.sessions.lock().unwrap();
-            let list = sessions.entry(key.clone()).or_default();
-            // Prune closed sessions first (sing-mux `offer`).
-            list.retain(|s| !s.shared.closed.load(Ordering::Acquire));
-            if let Some(session) = list
-                .iter()
-                .min_by_key(|s| s.shared.active_streams.load(Ordering::Acquire))
-                && session.shared.active_streams.load(Ordering::Acquire)
-                    < SOFT_MAX_STREAMS_PER_SESSION
-            {
-                return Ok(Arc::clone(session));
-            }
-        }
-        // No lock held across the dial: concurrent first dials may create
-        // extra sessions, which is harmless (they get shared or idle-close).
-        let addr = format!("{}:{}", node.host(), node.port);
-        let tcp = crate::util::connect_outbound(&addr, connect_timeout).await?;
-        let stream = super::transport::maybe_tls_wrap(node, tcp).await?;
-        self.insert_session(key, stream, connect_timeout).await
-    }
-
-    /// Write the sing-mux session header, run the h2 client handshake,
-    /// spawn the connection driver + idle watcher and cache the session.
-    async fn insert_session(
-        &'static self,
-        key: &SessionKey,
-        mut stream: Box<dyn AsyncReadWrite>,
-        handshake_timeout: Duration,
-    ) -> anyhow::Result<Arc<MuxSession>> {
-        // sing-mux session request header, prepended to the first write
-        // (the h2 client preface follows) — `protocol_conn.go` Write.
-        stream
-            .write_all(&[SESSION_REQUEST_VERSION, SESSION_REQUEST_PROTOCOL_H2MUX])
-            .await?;
-        stream.flush().await?;
-        let (send_request, connection) =
-            tokio::time::timeout(handshake_timeout, h2::client::handshake(stream))
-                .await
-                .map_err(|_| anyhow::anyhow!("h2mux: HTTP/2 handshake timed out"))??;
-        let shared = Arc::new(SessionShared {
-            active_streams: AtomicUsize::new(0),
-            active_watch: watch::channel(0).0,
-            closed: AtomicBool::new(false),
-            close_notify: Notify::new(),
-        });
-        let session = Arc::new(MuxSession {
-            send_request,
-            shared,
-        });
-        spawn_connection_driver(connection, Arc::clone(&session.shared));
-        self.sessions
-            .lock()
-            .unwrap()
-            .entry(key.clone())
-            .or_default()
-            .push(Arc::clone(&session));
-        spawn_idle_watcher(self, key.clone(), Arc::downgrade(&session));
-        Ok(session)
-    }
-
-    /// Drop a session from the cache and mark it closed so future offers
-    /// skip it (GOAWAY / I/O error / open failure / idle expiry).
-    fn invalidate(&self, key: &SessionKey, session: &Arc<MuxSession>) {
-        session.shared.closed.store(true, Ordering::Release);
-        session.shared.close_notify.notify_one();
-        let mut sessions = self.sessions.lock().unwrap();
-        if let Some(list) = sessions.get_mut(key) {
-            list.retain(|s| !Arc::ptr_eq(s, session));
-        }
-    }
+/// Write the sing-mux session header, run the h2 client handshake, and
+/// spawn the connection driver + idle watcher.
+async fn build_session(
+    mut stream: Box<dyn AsyncReadWrite>,
+    handshake_timeout: Duration,
+    key: &str,
+) -> anyhow::Result<Arc<MuxSession>> {
+    // sing-mux session request header, prepended to the first write
+    // (the h2 client preface follows) — `protocol_conn.go` Write.
+    stream
+        .write_all(&[SESSION_REQUEST_VERSION, SESSION_REQUEST_PROTOCOL_H2MUX])
+        .await?;
+    stream.flush().await?;
+    let (send_request, connection) =
+        tokio::time::timeout(handshake_timeout, h2::client::handshake(stream))
+            .await
+            .map_err(|_| anyhow::anyhow!("h2mux: HTTP/2 handshake timed out"))??;
+    let shared = Arc::new(SessionShared {
+        active_streams: AtomicUsize::new(0),
+        active_watch: watch::channel(0).0,
+        closed: AtomicBool::new(false),
+        close_notify: Notify::new(),
+    });
+    let session = Arc::new(MuxSession {
+        send_request,
+        shared,
+    });
+    spawn_connection_driver(connection, Arc::clone(&session.shared));
+    spawn_idle_watcher(key, Arc::downgrade(&session));
+    Ok(session)
 }
 
 impl MuxSession {
@@ -350,7 +327,8 @@ fn spawn_connection_driver(
 
 /// Gracefully close the session once its stream count has stayed at zero
 /// for [`SESSION_IDLE_TIMEOUT`]; exits when the session is gone.
-fn spawn_idle_watcher(manager: &'static MuxManager, key: SessionKey, session: Weak<MuxSession>) {
+fn spawn_idle_watcher(key: &str, session: Weak<MuxSession>) {
+    let key = key.to_string();
     tokio::spawn(async move {
         let Some(strong) = session.upgrade() else {
             return;
@@ -372,7 +350,7 @@ fn spawn_idle_watcher(manager: &'static MuxManager, key: SessionKey, session: We
                 .is_err()
             {
                 if let Some(strong) = session.upgrade() {
-                    manager.invalidate(&key, &strong);
+                    POOL.invalidate(&key, &strong);
                 }
                 return;
             }
@@ -508,6 +486,7 @@ impl AsyncWrite for MuxStream {
 mod tests {
     use super::*;
     use honk_config::types::NodeProtocol;
+    use std::net::SocketAddr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -806,5 +785,47 @@ mod tests {
         assert_eq!(&buf, b"pong");
 
         server.await.unwrap();
+    }
+
+    /// 4B decision gate: honk's h2mux against an **official sing-box
+    /// multiplex inbound**. honk writes the proxy handshake onto each h2
+    /// stream instead of sing-mux's outer handshake + per-stream
+    /// StreamRequest, so this tells us whether the two are compatible.
+    /// Run with:
+    ///   sing-box run -c /tmp/lab-bin/sb-mux-h2.json   # trojan+multiplex on :2448
+    ///   cargo test -p honk-outbound --lib trojan_mux_against_sing_box -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs a sing-box multiplex server on 127.0.0.1:2448"]
+    async fn trojan_mux_against_sing_box() {
+        let node = Node {
+            name: "trojan-mux".into(),
+            protocol: NodeProtocol::Trojan,
+            address: "127.0.0.1:2448".into(),
+            host: "127.0.0.1".into(),
+            port: 2448,
+            password: Some("testpass123".into()),
+            tls: true,
+            skip_cert_verify: true,
+            mux: true,
+            ..Default::default()
+        };
+        let handler = crate::proxy::trojan::TrojanHandler::new();
+        let target: SocketAddr = "127.0.0.1:8000".parse().unwrap();
+        let stream = crate::proxy::ProxyHandler::dial(&handler, &node, target, None, TEST_TIMEOUT)
+            .await
+            .expect("mux dial failed");
+        let mut stream = stream.stream;
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 512];
+        let n = stream.read(&mut buf).await.unwrap();
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            resp.contains(" 200") || resp.contains(" 301") || resp.contains(" 404"),
+            "mux request did not get an HTTP status: {}",
+            &resp[..resp.len().min(160)]
+        );
     }
 }

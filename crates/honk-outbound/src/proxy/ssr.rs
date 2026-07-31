@@ -54,19 +54,24 @@ enum SsrProtocol {
 }
 
 impl SsrProtocol {
-    /// Detect the protocol from the `node.plugin` field (or `node.protocol`
-    /// via plugin_opts). Falls back to `Origin` for unknown / empty values.
-    fn from_node(node: &Node) -> Self {
+    /// Detect the protocol from the `node.plugin` field. Empty/`origin`
+    /// means no protocol header; anything else unsupported is a hard
+    /// error — silently falling back to `Origin` would claim support the
+    /// node doesn't have.
+    fn from_node(node: &Node) -> anyhow::Result<Self> {
         let plugin = node.plugin.as_deref().unwrap_or("").to_lowercase();
+        if plugin.is_empty() || plugin.contains("origin") {
+            return Ok(SsrProtocol::Origin);
+        }
         // SSR subscription URLs often carry protocol info in the plugin field.
         if plugin.contains("auth_sha1_v4") || plugin.contains("auth_sha1") {
-            return SsrProtocol::AuthSha1V4;
+            return Ok(SsrProtocol::AuthSha1V4);
         }
-        if plugin.contains("auth_aes128") {
-            // auth_aes128_* is not yet implemented; fall back to origin.
-            return SsrProtocol::Origin;
-        }
-        SsrProtocol::Origin
+        anyhow::bail!(
+            "node '{}': unsupported SSR protocol in plugin '{}' (only origin/auth_sha1_v4 supported)",
+            node.name,
+            plugin
+        )
     }
 }
 
@@ -80,17 +85,22 @@ enum SsrObfs {
 }
 
 impl SsrObfs {
-    /// Detect the obfuscation from the `node.plugin` field.
-    fn from_node(node: &Node) -> Self {
+    /// Detect the obfuscation from the `node.plugin` field. Empty/`plain`
+    /// means no obfuscation; anything else unsupported is a hard error
+    /// (see [`SsrProtocol::from_node`]).
+    fn from_node(node: &Node) -> anyhow::Result<Self> {
         let plugin = node.plugin.as_deref().unwrap_or("").to_lowercase();
+        if plugin.is_empty() || plugin.contains("plain") {
+            return Ok(SsrObfs::Plain);
+        }
         if plugin.contains("http_simple") {
-            return SsrObfs::HttpSimple;
+            return Ok(SsrObfs::HttpSimple);
         }
-        if plugin.contains("tls1.2_ticket_auth") || plugin.contains("tls1.2") {
-            // Not yet implemented; fall back to plain.
-            return SsrObfs::Plain;
-        }
-        SsrObfs::Plain
+        anyhow::bail!(
+            "node '{}': unsupported SSR obfs in plugin '{}' (only plain/http_simple supported)",
+            node.name,
+            plugin
+        )
     }
 
     /// Parse `node.plugin_opts` for obfs parameters.
@@ -196,8 +206,8 @@ impl ShadowsocksRHandler {
         let conf = ssr_cipher_conf(method)?;
         let password = node.password.as_deref().unwrap_or("");
         let master_key = ShadowsocksHandler::master_key(password, conf.key_len);
-        let proto = SsrProtocol::from_node(node);
-        let obfs = SsrObfs::from_node(node);
+        let proto = SsrProtocol::from_node(node)?;
+        let obfs = SsrObfs::from_node(node)?;
 
         let addr = format!("{}:{}", node.host(), node.port);
         debug!(
@@ -261,17 +271,6 @@ impl ProxyHandler for ShadowsocksRHandler {
         _connect_timeout: std::time::Duration,
     ) -> anyhow::Result<ProxyStream> {
         self.start_relay(node, server, target, target_domain).await
-    }
-
-    async fn test_connectivity(&self, node: &Node) -> bool {
-        let addr = format!("{}:{}", node.host(), node.port);
-        match crate::util::connect_outbound(&addr, std::time::Duration::from_secs(3)).await {
-            Ok(_) => true,
-            Err(e) => {
-                debug!("SSR connectivity test failed for {}: {}", node.name, e);
-                false
-            }
-        }
     }
 }
 
@@ -463,7 +462,10 @@ mod tests {
     #[test]
     fn test_proto_origin_default() {
         let node = Node::default();
-        assert_eq!(SsrProtocol::from_node(&node), SsrProtocol::Origin);
+        assert!(matches!(
+            SsrProtocol::from_node(&node).unwrap(),
+            SsrProtocol::Origin
+        ));
     }
 
     #[test]
@@ -472,7 +474,24 @@ mod tests {
             plugin: Some("auth_sha1_v4".to_string()),
             ..Default::default()
         };
-        assert_eq!(SsrProtocol::from_node(&node), SsrProtocol::AuthSha1V4);
+        assert!(matches!(
+            SsrProtocol::from_node(&node).unwrap(),
+            SsrProtocol::AuthSha1V4
+        ));
+    }
+
+    #[test]
+    fn test_proto_unsupported_errors() {
+        let node = Node {
+            plugin: Some("auth_aes128_md5".to_string()),
+            ..Default::default()
+        };
+        assert!(SsrProtocol::from_node(&node).is_err());
+        let node = Node {
+            plugin: Some("tls1.2_ticket_auth".to_string()),
+            ..Default::default()
+        };
+        assert!(SsrObfs::from_node(&node).is_err());
     }
 
     #[test]
@@ -481,14 +500,15 @@ mod tests {
             plugin: Some("auth_aes128_md5".to_string()),
             ..Default::default()
         };
-        // Not yet implemented — falls back to Origin.
-        assert_eq!(SsrProtocol::from_node(&node), SsrProtocol::Origin);
+        // auth_aes128_* is not implemented — a hard error, not a silent
+        // fallback to Origin.
+        assert!(SsrProtocol::from_node(&node).is_err());
     }
 
     #[test]
     fn test_obfs_plain_default() {
         let node = Node::default();
-        assert_eq!(SsrObfs::from_node(&node), SsrObfs::Plain);
+        assert!(matches!(SsrObfs::from_node(&node).unwrap(), SsrObfs::Plain));
     }
 
     #[test]
@@ -497,7 +517,10 @@ mod tests {
             plugin: Some("http_simple".to_string()),
             ..Default::default()
         };
-        assert_eq!(SsrObfs::from_node(&node), SsrObfs::HttpSimple);
+        assert!(matches!(
+            SsrObfs::from_node(&node).unwrap(),
+            SsrObfs::HttpSimple
+        ));
     }
 
     #[test]
@@ -506,8 +529,9 @@ mod tests {
             plugin: Some("tls1.2_ticket_auth".to_string()),
             ..Default::default()
         };
-        // Not yet implemented — falls back to Plain.
-        assert_eq!(SsrObfs::from_node(&node), SsrObfs::Plain);
+        // tls1.2_ticket_auth is not implemented — a hard error, not a
+        // silent fallback to Plain.
+        assert!(SsrObfs::from_node(&node).is_err());
     }
 
     #[test]

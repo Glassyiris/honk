@@ -30,7 +30,7 @@ where
 use crate::types::NodeProtocol;
 
 /// A proxy node definition.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
     #[serde(default = "uuid::Uuid::new_v4")]
     pub id: uuid::Uuid,
@@ -118,6 +118,14 @@ pub struct Node {
     /// Hysteria2: disable QUIC path MTU discovery (`disablePathMTUDiscovery`)
     #[serde(default)]
     pub hy2_disable_mtu_discovery: Option<bool>,
+    /// QUIC protocols (hy2/tuic/juicity): UDP **payload** size in bytes
+    /// (share-link `mtu=`, valid range 1200..=65527, clamped). Applied to
+    /// the send-side initial MTU, the PMTUD upper bound, and the endpoint's
+    /// receive advertisement — it is NOT the link/IP MTU (IPv4 payload on
+    /// a 1500 link is 1472; on PMTU-unsafe last miles keep the 1252
+    /// default).
+    #[serde(default)]
+    pub quic_mtu: Option<u16>,
     /// TUIC UUID
     #[serde(default)]
     pub tuic_uuid: Option<String>,
@@ -127,6 +135,19 @@ pub struct Node {
     /// TUIC congestion control
     #[serde(default)]
     pub tuic_congestion: Option<String>,
+    /// TUIC ALPN (share-link `alpn=`; comma-separated for multiple).
+    /// Defaults to `tuic` when unset — servers configured with e.g. `h3`
+    /// (HTTP/3 camouflage) reject the handshake otherwise.
+    #[serde(default)]
+    pub tuic_alpn: Option<String>,
+    /// TUIC: initial per-stream receive window (`initStreamReceiveWindow`).
+    /// quinn's default (1.25MB) caps a stream at ~12.5MB/s per 100ms RTT —
+    /// far too small for long-fat links; unset uses honk's larger default.
+    #[serde(default)]
+    pub tuic_init_stream_recv_window: Option<u64>,
+    /// TUIC: initial connection-level receive window (`initConnReceiveWindow`).
+    #[serde(default)]
+    pub tuic_init_conn_recv_window: Option<u64>,
     /// Juicity UUID
     #[serde(default)]
     pub juicity_uuid: Option<String>,
@@ -166,6 +187,69 @@ pub struct Node {
 
 fn default_transport() -> String {
     "tcp".to_string()
+}
+
+impl Default for Node {
+    /// serde's `id` field default (new_v4) must hold for every
+    /// construction path — the runtime registry keys on `Node.id`, and
+    /// the derive-Default nil UUID would break it (e.g. the built-in
+    /// `direct` node).
+    fn default() -> Self {
+        Self {
+            id: uuid::Uuid::new_v4(),
+            name: String::new(),
+            protocol: NodeProtocol::default(),
+            address: String::new(),
+            host: String::new(),
+            port: 0,
+            username: None,
+            password: None,
+            encryption: None,
+            plugin: None,
+            plugin_opts: None,
+            transport: default_transport(),
+            tls: false,
+            sni: None,
+            skip_cert_verify: false,
+            ech_enabled: false,
+            ech_config: None,
+            ech_config_path: None,
+            network: None,
+            ws_path: None,
+            ws_host: None,
+            grpc_service: None,
+            hy2_auth: None,
+            hy2_obfs: None,
+            hy2_up_mbps: None,
+            hy2_down_mbps: None,
+            hy2_port_hopping: None,
+            hy2_hop_interval: None,
+            tls_pin_sha256: None,
+            hy2_init_stream_recv_window: None,
+            hy2_init_conn_recv_window: None,
+            hy2_disable_mtu_discovery: None,
+            quic_mtu: None,
+            tuic_uuid: None,
+            tuic_password: None,
+            tuic_congestion: None,
+            tuic_alpn: None,
+            tuic_init_stream_recv_window: None,
+            tuic_init_conn_recv_window: None,
+            juicity_uuid: None,
+            juicity_password: None,
+            anytls_password: None,
+            anytls_min_idle_session: None,
+            anytls_idle_session_check_interval: None,
+            anytls_idle_session_timeout: None,
+            mux: false,
+            mark: None,
+            tags: Vec::new(),
+            subscription_id: None,
+            group_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
 }
 
 impl Node {

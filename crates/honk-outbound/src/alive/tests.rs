@@ -150,29 +150,6 @@ fn test_sticky_cache_ttl() {
     assert!(c.get_sticky("x").is_none());
 }
 
-#[test]
-fn test_recovery_state_transitions() {
-    let rs = RecoveryState::new(3, Duration::from_secs(1), Duration::from_secs(300));
-    let d = ProbeDomain::Tcp;
-    assert_eq!(rs.get_state("n", d), NodeState::Healthy);
-    rs.report_failure("n", d);
-    assert_eq!(rs.get_state("n", d), NodeState::Degraded);
-    rs.report_failure("n", d);
-    rs.report_failure("n", d);
-    assert_eq!(rs.get_state("n", d), NodeState::Failed);
-    rs.report_success("n", d);
-    assert_eq!(rs.get_state("n", d), NodeState::Healthy);
-}
-
-#[test]
-fn test_should_probe_backoff() {
-    let rs = RecoveryState::new(3, Duration::from_millis(1), Duration::from_secs(5));
-    rs.report_failure("n", ProbeDomain::Tcp);
-    assert_eq!(rs.get_state("n", ProbeDomain::Tcp), NodeState::Degraded);
-    rs.report_success("n", ProbeDomain::Tcp);
-    assert!(rs.is_usable("n", ProbeDomain::Tcp));
-}
-
 #[tokio::test]
 async fn test_urltest_idle_suspension() {
     let set = AliveDialerSet::new();
@@ -633,4 +610,50 @@ fn test_sync_group_check_urls_prunes_unused_urls() {
     set.sync_group_check_urls(&[]);
     assert!(set.group_check_urls().is_empty());
     assert!(!set.has_url_state("n1", url_a), "unused URL state pruned");
+}
+
+/// block is exempt from probes — there is no liveness to measure. The
+/// exemption must not touch any alive state (unknown defaults to alive).
+#[tokio::test]
+async fn test_block_probe_exempt() {
+    let set = AliveDialerSet::new();
+    set.register_node("block".into(), String::new());
+    assert!(set.probe_node("block", Duration::from_millis(1)).await);
+    assert!(set.probe_node_udp("block", Duration::from_millis(1)).await);
+    assert!(
+        set.probe_node_with_url(
+            "block",
+            "block",
+            "http://x.example",
+            Duration::from_millis(1)
+        )
+        .await
+    );
+    assert!(set.is_alive_for("block", ProbeDomain::Tcp, IpVersion::V4));
+}
+
+/// direct is probed against the dedicated direct check target (bootstrap
+/// resolver; default 223.5.5.5:53) instead of the proxy check URL, so the
+/// clash API gets a real direct latency. Uses a loopback listener as the
+/// target; per-group custom-URL and UDP probes stay exempt.
+#[tokio::test]
+async fn test_direct_probe_uses_direct_check_addr() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let set = AliveDialerSet::new();
+    set.register_node("direct".into(), String::new());
+    set.set_direct_check_addr(format!("127.0.0.1:{port}"));
+    assert!(set.probe_node("direct", Duration::from_secs(2)).await);
+    assert!(set.is_alive_for("direct", ProbeDomain::Tcp, IpVersion::V4));
+    // UDP and per-group custom-URL probes remain exempt.
+    assert!(set.probe_node_udp("direct", Duration::from_millis(1)).await);
+    assert!(
+        set.probe_node_with_url(
+            "direct",
+            "direct",
+            "http://x.example",
+            Duration::from_millis(1)
+        )
+        .await
+    );
 }

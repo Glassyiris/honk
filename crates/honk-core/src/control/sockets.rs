@@ -29,12 +29,13 @@ pub(super) fn bind_tproxy_tcp(addr: SocketAddr, _mark: u32) -> anyhow::Result<Tc
     build_tproxy_tcp(addr)
 }
 
-/// Whether the daens namespace has been set up.  Only real eBPF mode creates
-/// it (mock mode and tests stay entirely in the host netns), so its presence
-/// is the switch between "bind inside daens" and "bind here".
+/// Whether the daens namespace is fully set up (FD-owned namespace +
+/// policy routing live). Only real eBPF mode creates it (mock mode and
+/// tests stay entirely in the host netns), so this flag is the switch
+/// between "bind inside daens" and "bind here".
 #[cfg(target_os = "linux")]
 fn daens_netns_exists() -> bool {
-    std::path::Path::new(crate::DAENS_NS_PATH).exists()
+    crate::DAENS_READY.load(std::sync::atomic::Ordering::Acquire)
 }
 
 fn build_tproxy_tcp(addr: SocketAddr) -> anyhow::Result<TcpListener> {
@@ -901,11 +902,15 @@ pub(super) async fn udp_fast_path(
     ep.mark_sent();
     ep.refresh();
     ep.tracker_upload(data.len() as u64);
-    if let Err(e) = ep.proxy_socket.send_to(data, ep.relay_addr).await {
+    if let Err(e) = ep.proxy_socket.send_packet(data).await {
         warn!(
             "UDP fast path send to {} for {} -> {} failed: {}",
             ep.relay_addr, client_addr, original_dst, e
         );
+        // A dead transport (session/stream closed) can never deliver for
+        // this endpoint again; mark it dead so the next datagram creates a
+        // fresh endpoint instead of black-holing until the timeouts reap it.
+        ep.kill();
     }
     true
 }

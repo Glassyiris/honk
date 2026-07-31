@@ -47,14 +47,41 @@ pub fn set_global(resolver: Option<BootstrapResolver>) {
     *GLOBAL.write().unwrap() = resolver;
 }
 
+/// Snapshot the process-wide resolver for compatibility callers that do not
+/// already own a configuration generation.
+pub fn global() -> Option<BootstrapResolver> {
+    match GLOBAL.read() {
+        Ok(resolver) => *resolver,
+        Err(poisoned) => *poisoned.into_inner(),
+    }
+}
+
+/// The configured bootstrap resolver's server address, if any. Also used
+/// as the `direct` node's probe/urltest target: a plain directly-reachable
+/// DNS server is exactly what direct-egress latency should be measured
+/// against.
+pub fn global_server() -> Option<SocketAddr> {
+    GLOBAL.read().unwrap().map(|r| r.server)
+}
+
 /// Resolve `host` to IP addresses, preferring the configured bootstrap
 /// resolver (direct, bypass-marked) and falling back to the system resolver.
 pub async fn resolve(host: &str) -> io::Result<Vec<IpAddr>> {
+    resolve_with(global(), host).await
+}
+
+/// Resolve with an explicit resolver snapshot.
+///
+/// Generation-owned callers use this path so a later [`set_global`] cannot
+/// change the resolver selected by an in-flight or lazily initialized dial.
+pub async fn resolve_with(
+    resolver: Option<BootstrapResolver>,
+    host: &str,
+) -> io::Result<Vec<IpAddr>> {
     let host = host.trim_start_matches('[').trim_end_matches(']');
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(vec![ip]);
     }
-    let resolver = *GLOBAL.read().unwrap();
     if let Some(resolver) = resolver {
         match tokio::time::timeout(Duration::from_secs(3), resolver.query(host)).await {
             Ok(Ok(ips)) if !ips.is_empty() => return Ok(ips),

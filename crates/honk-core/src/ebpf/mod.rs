@@ -60,8 +60,93 @@ pub struct LpmKeepSet {
     pub mac: std::collections::HashSet<[u8; 20]>,
 }
 
+/// Callback for [`EbpfBackend::conn_state_for_each_chunk`].
+pub type ConnStateChunkVisitor<'a> = dyn FnMut(&[(TuplesKey, ConnState)]) + 'a;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutingPushPhase {
+    Rules,
+    DestinationLpm,
+    SourceLpm,
+    MacLpm,
+    Meta,
+    ClearTail,
+    PruneLpm,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectionMapOperation {
+    Set,
+    Remove,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum DomainRouteWriteError {
+    #[error("domain routing map capacity exhausted")]
+    MapFull,
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+impl DomainRouteWriteError {
+    pub const fn is_map_full(&self) -> bool {
+        matches!(self, Self::MapFull)
+    }
+}
+
+/// Which config list an interface came from; selects the TC programs a
+/// dynamic attach installs on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IfaceRole {
+    Lan,
+    Wan,
+    /// Slave port of a configured LAN bridge master: forwarded L2 traffic
+    /// never crosses the master's TC hooks, so the LAN programs go on each
+    /// slave (mirrors the startup expansion).
+    LanBridgeSlave,
+    /// Slave of a configured LAN bond master: packets may arrive/leave on
+    /// the slave without touching the master's qdiscs, so it gets
+    /// lan_ingress + wan_egress (mirrors the startup expansion).
+    LanBondSlave,
+}
+
+/// Per-direction outcome of a dynamic attach: which hooks are live on the
+/// interface after the call (including ones attached earlier).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DynamicHooks {
+    pub ingress: bool,
+    pub egress: bool,
+}
+
 #[async_trait]
 pub trait EbpfBackend: Send + Sync {
+    fn inject_routing_fault(
+        &mut self,
+        _phase: RoutingPushPhase,
+        _times: usize,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("routing fault injection is unsupported")
+    }
+    #[cfg(test)]
+    fn inject_projection_fault(
+        &mut self,
+        _operation: ProjectionMapOperation,
+        _times: usize,
+        _map_full: bool,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("projection fault injection is unsupported")
+    }
+    #[cfg(test)]
+    fn projection_map_snapshot(&self) -> Vec<([u8; 20], DomainRouting)> {
+        Vec::new()
+    }
+    #[cfg(test)]
+    fn projection_write_log(&self) -> Vec<ProjectionMapOperation> {
+        Vec::new()
+    }
+    #[cfg(test)]
+    fn clear_projection_write_log(&mut self) {}
     fn detach_hooks(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
@@ -112,6 +197,23 @@ pub trait EbpfBackend: Send + Sync {
     }
 
     async fn cleanup(&mut self) -> anyhow::Result<()>;
+
+    /// Attach TC programs to a configured interface that appeared after
+    /// startup.  Backends dedupe per (ifindex, direction): a direction that
+    /// is already hooked is reported, never re-attached, so retrying after
+    /// a partial failure cannot stack duplicate hooks.
+    fn attach_dynamic_interface(
+        &mut self,
+        _ifname: &str,
+        _role: IfaceRole,
+        _single_homed: bool,
+    ) -> anyhow::Result<DynamicHooks> {
+        Ok(DynamicHooks::default())
+    }
+
+    /// Drop any dynamic-attach state for `ifindex` (the device is gone or
+    /// was recreated, so its hooks died with it).
+    fn forget_dynamic_interface(&mut self, _ifindex: u32) {}
 
     fn set_param(&mut self, key: ParamKey, value: u32) -> anyhow::Result<()>;
     fn get_param(&self, key: ParamKey) -> anyhow::Result<Option<u32>>;
@@ -185,13 +287,13 @@ pub trait EbpfBackend: Send + Sync {
         &mut self,
         _ip_key: &LpmKey,
         _bitmap: &DomainRouting,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), DomainRouteWriteError> {
         Ok(())
     }
     /// Remove the DOMAIN_ROUTING_MAP entry for `ip_key` (16-byte IP key).
     /// Used by the domain-route rebuild for learned IPs whose domain no
     /// longer matches any domain rule under the current ruleset.
-    fn remove_domain_ip_bitmap(&mut self, _ip_key: &LpmKey) -> anyhow::Result<()> {
+    fn remove_domain_ip_bitmap(&mut self, _ip_key: &LpmKey) -> Result<(), DomainRouteWriteError> {
         Ok(())
     }
     fn add_ip_route(&mut self, prefix: &str, outbound: OutboundIndex) -> anyhow::Result<()>;
@@ -279,6 +381,24 @@ pub trait EbpfBackend: Send + Sync {
 
     /// Remove multiple CONN_STATE_MAP entries (batched when supported).
     fn conn_state_remove_batch(&mut self, keys: &[TuplesKey]) -> anyhow::Result<()>;
+
+    /// Visit CONN_STATE_MAP entries in bounded chunks without accumulating
+    /// the whole map (524K entries would otherwise spike memory on every
+    /// sweep). Backends with `BPF_MAP_LOOKUP_BATCH` stream chunks straight
+    /// from the kernel; others fall back to a snapshot chunked into visits
+    /// (fine for small/mock maps).
+    fn conn_state_for_each_chunk(
+        &self,
+        chunk_size: usize,
+        visit: &mut ConnStateChunkVisitor<'_>,
+    ) -> anyhow::Result<()> {
+        let mut entries = Vec::new();
+        self.conn_state_snapshot(&mut entries)?;
+        for chunk in entries.chunks(chunk_size.max(1)) {
+            visit(chunk);
+        }
+        Ok(())
+    }
 
     /// Read the datapath's CONN_STATE_MAP occupancy counters:
     /// `(cumulative_inserts, cumulative_ebpf_deletes)`.  Userspace combines

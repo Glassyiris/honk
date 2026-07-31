@@ -93,9 +93,10 @@ dae 语法中节点**只能以分享链接书写**：`tag: 'scheme://...'` 或�
 | `hy2_disable_mtu_discovery` | bool? | null | Hysteria2 `disablePathMTUDiscovery` |
 | `tls_pin_sha256` | string? | null | 叶证书 SHA-256 固定（`pinSHA256=`） |
 | `tuic_uuid` / `tuic_password` / `tuic_congestion` | string? | null | TUIC |
+| `tuic_init_stream_recv_window` / `tuic_init_conn_recv_window` | u64? | 8 MiB / quinn 默认 | TUIC QUIC 接收窗口；8 MiB 流窗口默认值提升高 RTT 链路单流吞吐（quinn 默认 1.25 MiB 每 100ms RTT 封顶约 12.5MB/s） |
 | `juicity_uuid` / `juicity_password` | string? | null | Juicity |
 | `anytls_password` | string? | null | AnyTLS 密钥（等于链接密码） |
-| `anytls_min_idle_session` | usize? | null | 池最小空闲会话；链接 `min_idle_session` |
+| `anytls_min_idle_session` | usize? | 1 | 池最小空闲会话；链接 `min_idle_session`。默认 1 保持拨号热度（0 = 回收全部空闲会话） |
 | `anytls_idle_session_check_interval` | u64? | null | 空闲检查周期（秒）；链接 `idle_session_check_interval` |
 | `anytls_idle_session_timeout` | u64? | null | 空闲驱逐（秒）；链接 `idle_session_timeout` |
 | `mux` | bool | `false` | h2mux 多路复用（结构化模型字段，分享链接 / dae 语法无对应参数） |
@@ -343,7 +344,7 @@ dns {
 | ------ | ------ | -------- | ------ |
 | `upstream` | list | 一个 `default` @ 223.5.5.5 UDP | 服务器；dae：`upstream { name: 'uri' }` |
 | `routing` | object | fallback 默认 | 请求路由；dae：`routing { request { ... } }` |
-| `strategy` | enum | `preferipv4` | 地址族策略；dae：`ipversion_prefer: 4\|6` |
+| `strategy` | enum | 未指定时为 `both`；设置 `ipversion_prefer: 4\|6` 时分别为 `preferipv4`/`preferipv6` | 地址族策略 |
 | `cache` | object | 启用 | 缓存；dae：`optimistic_cache` / `optimistic_cache_ttl` / `max_cache_size` |
 
 ### 上游
@@ -353,7 +354,7 @@ dns {
 | `name` | string | 必填 | Id；dae 中冒号前的名字 |
 | `address` | string | 必填 | `ip:port` 或主机；dae 中取 URI 的主机部分 |
 | `protocol` | enum | `udp` | `udp`/`tcp`/`tls`/`https`/`quic`；dae 中由 URI scheme 决定（`udp://`、`tcp://`、`tcp+udp://`/`udp+tcp://`、`tls://`、`https://`、`h3://`、`quic://`，无 scheme 默认为 UDP） |
-| `tls_server_name` | string? | null | DoT/DoH SNI；dae 语法中当主机名不是 IP 时自动派生 |
+| `tls_server_name` | string? | null | DoT/DoH/DoQ/DoH3 SNI。dae 语法自动从主机名派生；IP 字面量上游需用 URI query 参数显式指定，如 `tls://1.1.1.1:853?tls_server_name=cloudflare-dns.com` |
 | `outbound` | string? | null | 经节点/组发出；dae 中行内后缀 `'uri' -> <name>`（旧：`outbound: name`） |
 
 **运行时说明：** UDP/TCP/DoT/DoH/DoQ/DoH3 均可用（连接复用）。DoT/DoH/TCP 支持 `-> proxy`（经节点/组的 TCP 隧道）；DoQ/DoH3 暂仅直连。经代理的 DNS SOCKS5 UDP 路径不完整（UDP+代理隧道化为 TCP DNS）。
@@ -374,7 +375,7 @@ dns {
 
 - `ipv4only` / `ipv6only`：另一地址族的查询在请求期直接回 NODATA，不转发上游。
 - `preferipv4` / `preferipv6`：两个地址族都会转发；当偏好族对同名有应答时，另一族的应答被压制（NODATA）；偏好族无应答时返回另一族的真实应答（允许回退）。缓存未命中时偏好族检查需额外一次上游查询。
-- `both`：不过滤。
+- `both`：`DnsConfig` 的实际默认值；并发转发符合资格的 A 与 AAAA，两个地址族都不压制。honk 配置省略 `ipversion_prefer` 时保持此默认值。
 
 dae：`ipversion_prefer: 4` 映射 `preferipv4`，`6` 映射 `preferipv6`（其他值 = `preferipv4`）；only 模式无法通过 dae 语法表达。
 
@@ -384,9 +385,34 @@ dae：`ipversion_prefer: 4` 映射 `preferipv4`，`6` 映射 `preferipv6`（其�
 | ------ | -------- | ------ |
 | `enabled` | `true` | 开关。**dae：** `optimistic_cache` |
 | `ttl` | `600` | 正缓存固定 TTL（覆盖应答 min TTL；`0` 表示沿用上游）。**dae：** `optimistic_cache_ttl` |
-| `max_size` | `10000` | 最大条目（必须 > 0）。**dae：** `max_cache_size` |
+| `max_size` | `10000` | 最大条目；`0` 仍接受，但会告警并钳制为 `1`。**dae：** `max_cache_size` |
 
-可选持久化：`experimental { cache_file { ... } }` 的 `store_dns`。
+可选持久化：`experimental { cache_file { ... } }` 的 `store_dns`。条目使用可回滚的
+`dns:v2:` 命名空间，只有 expiry、wire identity、入口 profile、scope、operation 与
+策略均匹配时才恢复。v2 命名空间冷启动且不改动旧行；旧版本忽略 v2 行，因此回滚时
+可将其留在 `cache.db` 中而不改变行为。
+
+缓存与 singleflight 共用资格判定。只有标准单问题 QUERY、answer/authority 计数为零、
+最多一个无 option 的 EDNS-v0 OPT 才符合资格。RD/AD/CD、DO、精确 question wire、
+UDP size、入口 profile、策略、scope 与 operation 均在 key 中保持隔离。不受支持的
+flags、EDNS option（包括 ECS/COOKIE）、EDNS-v1 与多问题消息绕过这两项优化；取消会
+释放 flight。
+
+### Runtime 与可观测性
+
+重载一次切换包含 DNS 策略、Router、GroupManager 快照、transport manager 与路由投影的
+完整 generation。lease 让旧请求排空；退役 deadline 与保留 generation 上限约束关闭，
+transport 初始化/关闭使用 singleflight 且幂等。
+
+相互独立、单调递增的 counter 覆盖 hit/miss/stale、flight 饱和/取消/重试、
+持久化丢弃/flush 失败、runtime 退役、transport 初始化/重置、投影失败/重试和
+结果分类。记录不会等待 shared gate；内部 best-effort scrape 逐项读取，不提供
+counter 之间的一致性。失败日志使用有界 `error_kind`：
+forwarder 为 `engine`/`exchange`/`response`/`internal`/`rejected_plan`，持久化为
+`worker_closed`/`ack_dropped`/`worker_failed`/`database`，投影为
+`map_full`/`backend_write`，transport 为 `exchange_failed` 并带有界 transport label。
+日志不记录 query name、upstream 地址或自由格式 error。`/stats` 仍是出站统计面；
+没有新增公开 DNS metric、endpoint、API 或调优项。
 
 ---
 
@@ -525,4 +551,5 @@ UDP 选择排除：两个 UDP 域都明确死亡 → 即使 TCP 存活也不选�
 
 - [设计文档](./design.zh.md)
 - [配置说明](./configuration.zh.md)
+- [DNS 灰度与回滚操作手册](./dns-rollout.zh.md)
 - 示例：`config.dae`、`config.min.dae`

@@ -1,0 +1,219 @@
+mod normalize;
+mod wire;
+
+use std::collections::BTreeMap;
+
+use honk_config::dns::{
+    DnsCond, DnsConfig, DnsDomainMatcher, DnsRequestAction, DnsRequestRouting, DnsResponseAction,
+};
+use honk_config::types::DnsProtocol;
+
+use self::normalize::{exact, host, lowercase};
+use self::wire::Writer;
+use super::PolicyError;
+use crate::dns::endpoint::DnsEndpoint;
+
+const FORMAT_VERSION: u8 = 2;
+// Stale controls are not configurable yet, so identity pins the cache/forwarder defaults.
+const STALE_RETENTION_SECS: u64 = 3600;
+const SERVE_STALE_TTL_SECS: u32 = 30;
+
+pub(super) fn encode(config: &DnsConfig) -> Result<Vec<u8>, PolicyError> {
+    let mut writer = Writer::new();
+    writer.byte(FORMAT_VERSION);
+    writer.len(config.upstream.len())?;
+    for upstream in &config.upstream {
+        writer.string(&exact(&upstream.name, "upstream name")?)?;
+        writer.byte(protocol(upstream.protocol));
+        let endpoint = DnsEndpoint::parse(
+            &upstream.address,
+            upstream.protocol,
+            upstream.tls_server_name.as_deref(),
+        )
+        .map_err(|source| PolicyError::InvalidEndpoint {
+            upstream: upstream.name.clone(),
+            source,
+        })?;
+        writer.string(&host(&endpoint.host)?)?;
+        writer.u16(endpoint.port);
+        writer.string(&endpoint.path)?;
+        writer.string(&host(&endpoint.sni)?)?;
+        writer.optional(
+            upstream
+                .outbound
+                .as_deref()
+                .map(|value| exact(value, "outbound tag"))
+                .transpose()?
+                .as_deref(),
+        )?;
+    }
+
+    let request = effective_request(config);
+    writer.len(request.rules.len())?;
+    for rule in &request.rules {
+        conditions(&mut writer, &rule.conditions)?;
+        request_action(&mut writer, &rule.action)?;
+    }
+    request_action(&mut writer, &request.fallback)?;
+
+    writer.len(config.routing.response.rules.len())?;
+    for rule in &config.routing.response.rules {
+        conditions(&mut writer, &rule.conditions)?;
+        response_action(&mut writer, &rule.action)?;
+    }
+    response_action(&mut writer, &config.routing.response.fallback)?;
+    writer.byte(strategy(config));
+
+    let mut fixed = BTreeMap::new();
+    for (domain, ttl) in &config.fixed_domain_ttl {
+        fixed.insert(exact(domain, "fixed-TTL domain")?, *ttl);
+    }
+    writer.len(fixed.len())?;
+    for (domain, ttl) in fixed {
+        writer.string(&domain)?;
+        writer.u32(ttl);
+    }
+
+    writer.byte(u8::from(config.cache.enabled));
+    writer.u64(config.cache.ttl);
+    writer.u64(u64::try_from(config.cache.max_size).map_err(|_| PolicyError::FieldTooLarge)?);
+    writer.u64(STALE_RETENTION_SECS);
+    writer.u32(SERVE_STALE_TTL_SECS);
+    Ok(writer.finish())
+}
+
+fn effective_request(config: &DnsConfig) -> DnsRequestRouting {
+    if !config.routing.request.rules.is_empty() {
+        return config.routing.request.clone();
+    }
+    if !config.routing.rules.is_empty() {
+        return config.routing.convert_legacy_rules();
+    }
+    let mut request = config.routing.request.clone();
+    if matches!(&request.fallback, DnsRequestAction::Upstream(name) if name == "default")
+        && !matches!(
+            config.routing.fallback.as_str(),
+            "" | "upstream" | "default"
+        )
+    {
+        request.fallback = DnsRequestAction::Upstream(config.routing.fallback.clone());
+    }
+    request
+}
+
+fn conditions(writer: &mut Writer, values: &[DnsCond]) -> Result<(), PolicyError> {
+    writer.len(values.len())?;
+    for condition in values {
+        match condition {
+            DnsCond::Qname { not, matchers } => {
+                writer.byte(0);
+                writer.byte(u8::from(*not));
+                writer.len(matchers.len())?;
+                for matcher in matchers {
+                    domain_matcher(writer, matcher)?;
+                }
+            }
+            DnsCond::Qtype { not, types } => {
+                writer.byte(1);
+                writer.byte(u8::from(*not));
+                writer.len(types.len())?;
+                for value in types {
+                    writer.u16(*value);
+                }
+            }
+            DnsCond::Upstream { not, names } => {
+                writer.byte(2);
+                writer.byte(u8::from(*not));
+                writer.len(names.len())?;
+                for name in names {
+                    writer.string(&exact(name, "condition upstream")?)?;
+                }
+            }
+            DnsCond::Ip { not, cidrs, geoip } => {
+                writer.byte(3);
+                writer.byte(u8::from(*not));
+                writer.len(cidrs.len())?;
+                for value in cidrs {
+                    let network =
+                        value
+                            .parse::<ipnet::IpNet>()
+                            .map_err(|_| PolicyError::InvalidCidr {
+                                value: value.clone(),
+                            })?;
+                    writer.string(&network.to_string())?;
+                }
+                writer.len(geoip.len())?;
+                for value in geoip {
+                    writer.string(&exact(value, "GeoIP code")?)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn domain_matcher(writer: &mut Writer, matcher: &DnsDomainMatcher) -> Result<(), PolicyError> {
+    let (kind, value) = match matcher {
+        DnsDomainMatcher::Full(value) => (0, lowercase(value, "full domain matcher")?),
+        DnsDomainMatcher::Suffix(value) => (
+            1,
+            lowercase(value.trim_start_matches('.'), "suffix domain matcher")?,
+        ),
+        DnsDomainMatcher::Keyword(value) => (2, value.clone()),
+        DnsDomainMatcher::Regex(value) => {
+            regex::Regex::new(value).map_err(|source| PolicyError::InvalidRegex {
+                value: value.clone(),
+                source,
+            })?;
+            (3, value.clone())
+        }
+        DnsDomainMatcher::Geosite(value) => (4, exact(value, "geosite code")?),
+    };
+    writer.byte(kind);
+    writer.string(&value)
+}
+
+fn request_action(writer: &mut Writer, action: &DnsRequestAction) -> Result<(), PolicyError> {
+    match action {
+        DnsRequestAction::Reject => writer.byte(0),
+        DnsRequestAction::AsIs => writer.byte(1),
+        DnsRequestAction::Upstream(name) => {
+            writer.byte(2);
+            writer.string(&exact(name, "request upstream")?)?;
+        }
+    }
+    Ok(())
+}
+
+fn response_action(writer: &mut Writer, action: &DnsResponseAction) -> Result<(), PolicyError> {
+    match action {
+        DnsResponseAction::Accept => writer.byte(0),
+        DnsResponseAction::Reject => writer.byte(1),
+        DnsResponseAction::Upstream(name) => {
+            writer.byte(2);
+            writer.string(&exact(name, "response upstream")?)?;
+        }
+    }
+    Ok(())
+}
+
+fn strategy(config: &DnsConfig) -> u8 {
+    match config.strategy {
+        honk_config::dns::DnsStrategy::PreferIpv4 => 0,
+        honk_config::dns::DnsStrategy::PreferIpv6 => 1,
+        honk_config::dns::DnsStrategy::Ipv4Only => 2,
+        honk_config::dns::DnsStrategy::Ipv6Only => 3,
+        honk_config::dns::DnsStrategy::Both => 4,
+    }
+}
+
+fn protocol(value: DnsProtocol) -> u8 {
+    match value {
+        DnsProtocol::Udp => 0,
+        DnsProtocol::Tcp => 1,
+        DnsProtocol::Tls => 2,
+        DnsProtocol::Https => 3,
+        DnsProtocol::H3 => 4,
+        DnsProtocol::Quic => 5,
+    }
+}

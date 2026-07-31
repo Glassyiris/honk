@@ -17,6 +17,15 @@
 //! host:port pair). The key binds BOTH the proxy node and the target
 //! because the completed handshake already committed the stream to that
 //! exact pair — lookup by the same pair is the only correct reuse.
+//!
+//! Budgets beyond the per-key cap: a global FD budget
+//! ([`MAX_TOTAL_ENTRIES`]), a per-node ready-target cardinality cap
+//! ([`MAX_READY_TARGETS_PER_NODE`]), and hot-target gating
+//! ([`ConnectionPool::note_target`]) so only repeat destinations earn a
+//! speculative ready deposit. Deposits are also capability-checked at the
+//! call site (multiplexed handlers never deposit ready entries — their
+//! session pool already owns reuse). Hit/miss/entry counters feed the
+//! clash API `/stats`.
 
 use dashmap::DashMap;
 use std::net::SocketAddr;
@@ -29,6 +38,18 @@ use tracing::{debug, trace};
 use honk_outbound::proxy::ProxyStream;
 
 const MAX_PER_HOST: usize = 8;
+/// Global cap across all keys (bare + ready) — an FD budget, not just a
+/// per-key one: deposits past it are refused.
+const MAX_TOTAL_ENTRIES: usize = 2048;
+/// Distinct ready targets per node — bounds target-cardinality-driven
+/// ready pools (a scanner hitting thousands of hosts must not turn the
+/// pool into thousands of dialed tunnels).
+const MAX_READY_TARGETS_PER_NODE: usize = 64;
+/// Ready deposits are made only for "hot" targets: at least this many
+/// flows to the same (node, target) within [`HOT_WINDOW`]. A one-off
+/// flow never triggers a speculative ready dial.
+const HOT_THRESHOLD: u32 = 2;
+const HOT_WINDOW: Duration = Duration::from_secs(60);
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Idle TTL for Ready (handshake-completed) entries — shorter than Bare
 /// because a target-bound tunnel holds more server-side state and servers
@@ -51,12 +72,25 @@ struct TimedStream {
     last_used: Instant,
 }
 
-pub(crate) struct ConnectionPool {
+pub struct ConnectionPool {
     entries: DashMap<String, Arc<Mutex<Vec<TimedStream>>>>,
     total_entries: AtomicU64,
     idle_timeout: Duration,
     ready_idle_timeout: Duration,
     max_age: Duration,
+    /// Target hotness for ready-deposit gating (`ready|node|target` →
+    /// (flow count, window start)).
+    hot: DashMap<String, (u32, Instant)>,
+    ready_hits: AtomicU64,
+    ready_misses: AtomicU64,
+}
+
+/// Ready-pool metrics snapshot (clash API `/stats`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReadyPoolMetrics {
+    pub hits: u64,
+    pub misses: u64,
+    pub entries: u64,
 }
 
 impl ConnectionPool {
@@ -67,6 +101,37 @@ impl ConnectionPool {
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             ready_idle_timeout: READY_IDLE_TIMEOUT,
             max_age: DEFAULT_MAX_AGE,
+            hot: DashMap::new(),
+            ready_hits: AtomicU64::new(0),
+            ready_misses: AtomicU64::new(0),
+        }
+    }
+
+    /// Record one flow to `key` (a `ready|…` key) and report whether the
+    /// target is hot enough to justify a speculative ready deposit
+    /// ([`HOT_THRESHOLD`] flows within [`HOT_WINDOW`]).
+    pub(crate) fn note_target(&self, key: &str) -> bool {
+        // Reap ancient windows lazily so the map cannot grow without bound.
+        if self.hot.len() > 4096 {
+            self.hot
+                .retain(|_, (_, start)| start.elapsed() <= HOT_WINDOW);
+        }
+        let mut e = self
+            .hot
+            .entry(key.to_string())
+            .or_insert((0, Instant::now()));
+        if e.1.elapsed() > HOT_WINDOW {
+            *e = (0, Instant::now());
+        }
+        e.0 += 1;
+        e.0 >= HOT_THRESHOLD
+    }
+
+    pub(crate) fn ready_metrics(&self) -> ReadyPoolMetrics {
+        ReadyPoolMetrics {
+            hits: self.ready_hits.load(Ordering::Relaxed),
+            misses: self.ready_misses.load(Ordering::Relaxed),
+            entries: self.total_entries.load(Ordering::Relaxed),
         }
     }
 
@@ -102,8 +167,14 @@ impl ConnectionPool {
     /// exactly one connection and is never returned after use.
     pub(crate) async fn acquire_ready(&self, key: &str) -> Option<ProxyStream> {
         match self.acquire_entry(key, true).await {
-            Some(PooledStream::Ready(stream)) => Some(stream),
-            _ => None,
+            Some(PooledStream::Ready(stream)) => {
+                self.ready_hits.fetch_add(1, Ordering::Relaxed);
+                Some(stream)
+            }
+            _ => {
+                self.ready_misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
         }
     }
 
@@ -174,6 +245,34 @@ impl ConnectionPool {
     }
 
     async fn deposit_entry(&self, addr: &str, stream: PooledStream) {
+        // Global FD budget before any per-key work.
+        if self.total_entries.load(Ordering::Relaxed) >= MAX_TOTAL_ENTRIES as u64 {
+            debug!(
+                "Pool global cap reached ({}); dropping deposit for {}",
+                MAX_TOTAL_ENTRIES, addr
+            );
+            return;
+        }
+        // Ready entries: bound the target cardinality per node.
+        if matches!(stream, PooledStream::Ready(_)) {
+            let node_prefix_end = addr
+                .strip_prefix("ready|")
+                .and_then(|rest| rest.find('|').map(|i| i + "ready|".len()))
+                .unwrap_or(addr.len());
+            let node_prefix = &addr[..node_prefix_end];
+            let targets = self
+                .entries
+                .iter()
+                .filter(|kv| kv.key().starts_with(node_prefix))
+                .count();
+            if targets >= MAX_READY_TARGETS_PER_NODE {
+                debug!(
+                    "Ready target cardinality cap reached for {} (max={}); dropping deposit",
+                    node_prefix, MAX_READY_TARGETS_PER_NODE
+                );
+                return;
+            }
+        }
         let arc = {
             let entry = self
                 .entries
@@ -415,6 +514,58 @@ mod tests {
 
         let acquired = pool.acquire_tcp(&addr).await;
         assert!(acquired.is_some());
+    }
+
+    /// Phase 5: deposits past the global FD budget are refused.
+    #[tokio::test]
+    async fn test_pool_global_cap_refused() {
+        let pool = ConnectionPool::new();
+        let addr = spawn_hold_open_listener().await.to_string();
+        pool.total_entries
+            .store(MAX_TOTAL_ENTRIES as u64, Ordering::Relaxed);
+        pool.deposit_tcp(&addr, TcpStream::connect(&addr).await.unwrap())
+            .await;
+        assert!(pool.acquire_tcp(&addr).await.is_none());
+        assert_eq!(
+            pool.total_entries.load(Ordering::Relaxed),
+            MAX_TOTAL_ENTRIES as u64,
+            "a refused deposit must not bump the counter"
+        );
+    }
+
+    /// Phase 5: hot-target gating — the first flow is cold, the second
+    /// within the window is hot, and a different target stays cold.
+    #[tokio::test]
+    async fn test_note_target_hot_gating() {
+        let pool = ConnectionPool::new();
+        let key = "ready|node:443|1.2.3.4:443";
+        assert!(!pool.note_target(key), "first flow is cold");
+        assert!(pool.note_target(key), "second flow within window is hot");
+        assert!(pool.note_target(key), "stays hot");
+        assert!(!pool.note_target("ready|node:443|5.6.7.8:443"));
+    }
+
+    /// Phase 5: ready deposits stop at the per-node target cardinality.
+    #[tokio::test]
+    async fn test_ready_target_cardinality_cap() {
+        let pool = ConnectionPool::new();
+        let addr = spawn_hold_open_listener().await;
+        let target = addr;
+        for i in 0..MAX_READY_TARGETS_PER_NODE {
+            let key = format!("ready|node:443|10.0.0.{}:443", i + 1);
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            pool.deposit_ready(&key, make_ready_stream(tcp, target))
+                .await;
+        }
+        // One more distinct target for the same node: refused.
+        let key = "ready|node:443|10.9.9.9:443";
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        pool.deposit_ready(key, make_ready_stream(tcp, target))
+            .await;
+        assert!(pool.acquire_ready(key).await.is_none());
+        // The ready metrics reflect one hit attempt (the refused acquire).
+        let m = pool.ready_metrics();
+        assert_eq!(m.misses, 1);
     }
 
     #[tokio::test]

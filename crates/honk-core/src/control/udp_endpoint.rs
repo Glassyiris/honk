@@ -21,11 +21,16 @@ const JANITOR_INTERVAL: Duration = Duration::from_secs(5);
 const REPLY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// TTL for the per-endpoint UDP routing result cache.
 const ROUTING_CACHE_TTL: Duration = Duration::from_secs(30);
+/// Hard cap on pooled endpoints. A unique-tuple UDP flood must not be able
+/// to grow the pool (and with it sockets, reply tasks and memory) without
+/// bound — at the cap new mappings are refused and the datagram is dropped,
+/// which UDP tolerates by design.
+const MAX_ENDPOINTS: usize = 8192;
 
 /// A pooled UDP endpoint representing one NAT mapping.
 pub struct UdpEndpoint {
-    /// The proxy-side UDP socket (connected to upstream).
-    pub proxy_socket: Arc<UdpSocket>,
+    /// The proxy-side framed UDP transport (upstream).
+    pub proxy_socket: Arc<dyn honk_outbound::proxy::PacketTransport>,
     /// The relay target address (upstream proxy).
     pub relay_addr: SocketAddr,
     /// Name of the proxy node this endpoint dials through — used to report
@@ -72,7 +77,11 @@ pub struct UdpEndpoint {
 }
 
 impl UdpEndpoint {
-    pub fn new(proxy_socket: Arc<UdpSocket>, relay_addr: SocketAddr, node_name: String) -> Self {
+    pub fn new(
+        proxy_socket: Arc<dyn honk_outbound::proxy::PacketTransport>,
+        relay_addr: SocketAddr,
+        node_name: String,
+    ) -> Self {
         let now = monotonic_nanos();
         Self {
             proxy_socket,
@@ -386,16 +395,31 @@ impl UdpEndpointPool {
     }
 
     /// Get or create an endpoint for the given client→dst mapping.
-    /// Returns (endpoint, is_new) where is_new indicates whether this was just created.
+    /// Returns `(endpoint, is_new)`, or `None` when the pool is at its hard
+    /// capacity cap (caller should drop the datagram).
     pub fn get_or_create(
         &self,
         client: SocketAddr,
         dst: SocketAddr,
-        proxy_socket: Arc<UdpSocket>,
+        proxy_socket: Arc<dyn honk_outbound::proxy::PacketTransport>,
         relay_addr: SocketAddr,
         node_name: String,
-    ) -> (Arc<UdpEndpoint>, bool) {
+    ) -> Option<(Arc<UdpEndpoint>, bool)> {
         let key = EndpointKey::new(client, dst);
+        // Capacity check BEFORE taking the entry lock — `DashMap::len()`
+        // takes every shard's read lock and would deadlock against the
+        // entry's write lock. At the cap, existing mappings still refresh;
+        // only brand-new ones are refused (a few over-shoot under races is
+        // fine for a flood ceiling).
+        if self.endpoints.len() >= MAX_ENDPOINTS {
+            return self.get(client, dst).map(|ep| (ep, false)).or_else(|| {
+                debug!(
+                    "UDP endpoint pool at capacity ({}); dropping new mapping {} -> {}",
+                    MAX_ENDPOINTS, client, dst
+                );
+                None
+            });
+        }
         // entry() holds the shard lock across the whole check-and-insert,
         // preserving the old global-mutex semantics (no duplicate endpoint
         // can be created for the same key by a racing task).
@@ -409,18 +433,18 @@ impl UdpEndpointPool {
                     // without a matching release pinned every reused
                     // endpoint in the pool forever (the UDP socket leak).
                     existing.refresh();
-                    return (Arc::clone(existing), false);
+                    return Some((Arc::clone(existing), false));
                 }
                 // Dead endpoint: replace it atomically (equivalent to the
                 // old remove-then-insert under the global lock).
                 let ep = Arc::new(UdpEndpoint::new(proxy_socket, relay_addr, node_name));
                 occ.insert(Arc::clone(&ep));
-                (ep, true)
+                Some((ep, true))
             }
             dashmap::mapref::entry::Entry::Vacant(vac) => {
                 let ep = Arc::new(UdpEndpoint::new(proxy_socket, relay_addr, node_name));
                 vac.insert(Arc::clone(&ep));
-                (ep, true)
+                Some((ep, true))
             }
         }
     }
@@ -434,14 +458,16 @@ impl UdpEndpointPool {
         }
     }
 
-    /// Remove every endpoint dialing through `node_name` — called when the
-    /// node flips alive→dead so its UDP flows stop immediately instead of
-    /// lingering until the NAT/reply idle timeouts reap them.
+    /// Remove every *unproven* endpoint dialing through `node_name` — called
+    /// when the node flips alive→dead. Mirrors dae's `checkUdpEndpointHealth`:
+    /// only endpoints that have never forwarded a packet are reaped
+    /// immediately; established flows (has_sent) are left to the NAT/reply
+    /// timeouts so a transient probe failure can't kill an active session.
     pub fn remove_by_node(&self, node_name: &str) {
         let keys: Vec<(SocketAddr, SocketAddr)> = self
             .endpoints
             .iter()
-            .filter(|ep| ep.node_name == node_name)
+            .filter(|ep| ep.node_name == node_name && !ep.has_sent.load(Ordering::Relaxed))
             .map(|ep| {
                 let key = ep.key();
                 (
@@ -545,7 +571,7 @@ impl UdpEndpointPool {
                 }
                 match tokio::time::timeout(
                     REPLY_IDLE_TIMEOUT,
-                    endpoint.proxy_socket.recv_from(&mut buf),
+                    endpoint.proxy_socket.recv_packet(&mut buf),
                 )
                 .await
                 {
@@ -578,7 +604,13 @@ impl UdpEndpointPool {
                         );
                     }
                     Ok(Err(e)) => {
-                        warn!("UDP reply handler recv error: {}", e);
+                        // A closed association (server FIN/EOF) is normal
+                        // teardown, not a malfunction — keep it out of WARN.
+                        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                            debug!("UDP reply handler closed: {}", e);
+                        } else {
+                            warn!("UDP reply handler recv error: {}", e);
+                        }
                         break;
                     }
                     Err(_) => {
@@ -591,6 +623,11 @@ impl UdpEndpointPool {
                 }
             }
             endpoint.release();
+            // Lifecycle consistency: when the reply task exits, the endpoint
+            // must die with it — otherwise the fast path keeps forwarding
+            // client packets into a mapping nobody reads replies for, and
+            // the client sees a black hole until the janitor reaps it.
+            endpoint.kill();
         })
     }
 
@@ -651,6 +688,13 @@ fn pack_socket_addr(addr: SocketAddr) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    fn transport(
+        sock: Arc<UdpSocket>,
+        relay: SocketAddr,
+    ) -> Arc<dyn honk_outbound::proxy::PacketTransport> {
+        Arc::new(honk_outbound::proxy::UdpSocketTransport::new(sock, relay))
+    }
+
     use super::*;
 
     fn make_addr(ip: &str, port: u16) -> SocketAddr {
@@ -708,12 +752,29 @@ mod tests {
         );
         let relay = make_addr("192.168.1.1", 1080);
 
-        let (_ep, is_new) =
-            pool.get_or_create(client, dst, proxy.clone(), relay, "test-node".to_string());
+        let (_ep, is_new) = pool
+            .get_or_create(
+                client,
+                dst,
+                std::sync::Arc::new(honk_outbound::proxy::UdpSocketTransport::new(
+                    proxy.clone(),
+                    relay,
+                )),
+                relay,
+                "test-node".to_string(),
+            )
+            .unwrap();
         assert!(is_new, "first call should be new");
 
-        let (_ep2, is_new2) =
-            pool.get_or_create(client, dst, proxy, relay, "test-node".to_string());
+        let (_ep2, is_new2) = pool
+            .get_or_create(
+                client,
+                dst,
+                std::sync::Arc::new(honk_outbound::proxy::UdpSocketTransport::new(proxy, relay)),
+                relay,
+                "test-node".to_string(),
+            )
+            .unwrap();
         assert!(!is_new2, "second call should return existing");
     }
 
@@ -725,7 +786,7 @@ mod tests {
                 .unwrap(),
         );
         let relay = make_addr("192.168.1.1", 1080);
-        let ep = UdpEndpoint::new(proxy, relay, "test-node".to_string());
+        let ep = UdpEndpoint::new(transport(proxy, relay), relay, "test-node".to_string());
         let dst = make_addr("8.8.8.8", 53);
 
         assert!(ep.get_cached_routing(dst).is_none());
@@ -742,7 +803,7 @@ mod tests {
                 .unwrap(),
         );
         let ep = UdpEndpoint::new(
-            proxy,
+            transport(proxy, make_addr("192.168.1.1", 1080)),
             make_addr("192.168.1.1", 1080),
             "test-node".to_string(),
         );
@@ -759,7 +820,7 @@ mod tests {
                 .unwrap(),
         );
         let ep = UdpEndpoint::new(
-            proxy,
+            transport(proxy, make_addr("192.168.1.1", 1080)),
             make_addr("192.168.1.1", 1080),
             "test-node".to_string(),
         );
@@ -791,17 +852,22 @@ mod tests {
         pool.get_or_create(
             make_addr("10.0.0.1", 12345),
             dst,
-            proxy.clone(),
+            std::sync::Arc::new(honk_outbound::proxy::UdpSocketTransport::new(
+                proxy.clone(),
+                relay,
+            )),
             relay,
             "dead-node".to_string(),
-        );
+        )
+        .unwrap();
         pool.get_or_create(
             make_addr("10.0.0.2", 12345),
             dst,
-            proxy.clone(),
+            transport(proxy.clone(), relay),
             relay,
             "other-node".to_string(),
-        );
+        )
+        .unwrap();
         assert_eq!(pool.len(), 2);
 
         pool.remove_by_node("dead-node");

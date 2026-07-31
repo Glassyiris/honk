@@ -12,6 +12,7 @@ honk-ebpf-common.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
+thiserror.workspace = true
 rand.workspace = true
 uuid.workspace = true
 chrono.workspace = true
@@ -50,8 +51,14 @@ http.workspace = true
 [dev-dependencies]
 rcgen.workspace = true
 tracing-subscriber.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 # rustls: test-only — loopback TLS/QUIC servers prove wire interop with the
 # BoringSSL client stack (and cross-check the QUIC crypto backend)
 tokio-rustls.workspace = true
 rustls-pemfile.workspace = true
 webpki-roots.workspace = true
+
+[[bench]]
+name = "ss_aead"
+harness = false

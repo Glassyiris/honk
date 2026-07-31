@@ -71,7 +71,10 @@ impl Node {
             "socks5" | "socks4" | "socks4a" => NodeProtocol::Socks5,
             "ss" => NodeProtocol::SS,
             "ssr" => NodeProtocol::SSR,
-            "trojan" | "trojan-go" => NodeProtocol::Trojan,
+            "trojan" => NodeProtocol::Trojan,
+            // trojan-go links are their own protocol (smux-style mux);
+            // parsing them as plain trojan silently produced broken nodes.
+            "trojan-go" => NodeProtocol::TrojanGo,
             "anytls" => NodeProtocol::AnyTLS,
             "vmess" => NodeProtocol::VMess,
             "vless" => NodeProtocol::VLess,
@@ -285,6 +288,47 @@ impl Node {
             }
             if let Some(v) = query.get("disablePathMTUDiscovery") {
                 node.hy2_disable_mtu_discovery = Some(v == "1" || v.eq_ignore_ascii_case("true"));
+            }
+        }
+
+        // QUIC payload-size cap (`mtu=`, hy2/tuic/juicity): 1200..=65527,
+        // out-of-range values dropped at parse time (clamped downstream).
+        if matches!(
+            protocol,
+            NodeProtocol::Hysteria2 | NodeProtocol::Tuic | NodeProtocol::Juicity
+        ) && let Some(v) = query.get("mtu")
+        {
+            // Out-of-range values are dropped at parse time (clamped
+            // downstream as well).
+            if let Ok(mtu) = v.parse::<u16>()
+                && (1200..=65527).contains(&mtu)
+            {
+                node.quic_mtu = Some(mtu);
+            }
+        }
+
+        if protocol == NodeProtocol::Tuic {
+            // QUIC flow-control knobs (same spelling as the hy2 fields).
+            if let Some(v) = query.get("initStreamReceiveWindow") {
+                node.tuic_init_stream_recv_window = v.parse().ok();
+            }
+            if let Some(v) = query.get("initConnReceiveWindow") {
+                node.tuic_init_conn_recv_window = v.parse().ok();
+            }
+            if let Some(v) = query.get("congestion_control") {
+                let v = v.trim();
+                if !v.is_empty() {
+                    node.tuic_congestion = Some(v.to_string());
+                }
+            }
+            // ALPN override (e.g. `alpn=h3` for HTTP/3-camouflaged servers);
+            // comma-separated for multiple. Without this the handler would
+            // always offer `tuic` and the handshake is rejected.
+            if let Some(v) = query.get("alpn") {
+                let v = v.trim();
+                if !v.is_empty() {
+                    node.tuic_alpn = Some(v.to_string());
+                }
             }
         }
 

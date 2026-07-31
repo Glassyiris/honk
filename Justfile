@@ -90,6 +90,26 @@ test-config:
 test-ebpf:
     cargo test -p honk-ebpf-common
 
+# Root-gated netlink/netns integration tests (veth/route/rule roundtrip)
+test-netns:
+    cargo test -p honk-core --features ebpf --lib netns -- --ignored --test-threads=1
+
+# Full honk-outbound gate after outbound changes (fmt + clippy + config & outbound suites)
+outbound-ci:
+    ci/outbound-ci.sh
+
+# outbound-ci plus live hysteria2 e2e (needs HONK_HY2_SERVER=...)
+outbound-ci-e2e:
+    ci/outbound-ci.sh --with-e2e-env
+
+# DNS subsystem gate (fmt + clippy + runtime/projection/resolver/control/outbound suites)
+dns-ci:
+    ci/dns-ci.sh
+
+# Clash API gate (including Clash-only DNS query/flush scenarios)
+clash-ci:
+    ci/clash-ci.sh
+
 # ── Run ──────────────────────────────────────────────────
 
 # Run honk-core with eBPF (clash API comes from config.dae experimental section)

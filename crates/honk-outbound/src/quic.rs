@@ -16,13 +16,19 @@
 //! - [`QuicBiStream`] — `AsyncRead + AsyncWrite` wrapper pairing a quinn
 //!   [`SendStream`]/[`RecvStream`] so it can be boxed into a
 //!   [`crate::proxy::ProxyStream`].
+//! - Small pieces shared verbatim by the three protocol handlers:
+//!   [`now_secs`], [`recv_read_exact`], the UDP fragment [`defrag`] module,
+//!   [`cached_client`], [`exporter_auth`], [`spawn_conn_reaper`] and the
+//!   [`dial_quic_stream`] retry skeleton.
 
+use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, anyhow};
 use quinn::congestion;
@@ -32,7 +38,7 @@ use quinn::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::Mutex;
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Map a congestion-control name (`cubic` / `new_reno` / `bbr`, as used by
 /// sing-box and dae node configs) to a quinn controller factory.
@@ -172,6 +178,11 @@ pub struct QuicClientOptions {
     pub conn_receive_window: Option<u64>,
     /// Disable QUIC path MTU discovery.
     pub disable_mtu_discovery: bool,
+    /// UDP payload size (NOT link MTU): applied as the send-side
+    /// `initial_mtu` and the PMTUD upper bound; the endpoint's
+    /// `max_udp_payload_size` (receive advertisement) is set separately by
+    /// the protocol handler from the same node field.
+    pub max_udp_payload_size: Option<u16>,
 }
 
 impl QuicClientOptions {
@@ -221,6 +232,20 @@ pub async fn client_config(
                 .tls_pin_sha256
                 .as_deref()
                 .and_then(crate::tls::parse_pin_sha256),
+            // Tickets belong to a specific service, not a hostname:
+            // address|port|SNI|ALPN — different protocols, different
+            // servers behind one certificate, and reloaded configs never
+            // cross-resume into each other.
+            ticket_key: Some(format!(
+                "{}|{}|{}|{}",
+                node.host(),
+                node.port,
+                node.sni.clone().unwrap_or_else(|| node.host().to_string()),
+                alpn.iter()
+                    .map(|p| String::from_utf8_lossy(p).into_owned())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )),
         })?;
     let mut cfg = ClientConfig::new(Arc::new(crypto));
 
@@ -241,6 +266,18 @@ pub async fn client_config(
     if let Some(w) = options.conn_receive_window {
         transport.receive_window(VarInt::from_u64(w)?);
     }
+    if let Some(mtu) = options.max_udp_payload_size {
+        // UDP payload size, not link MTU. Valid range per RFC 9000 (initial
+        // packets must carry 1200) and quinn's cap; invalid values are
+        // clamped rather than failing the first dial later.
+        let mtu = mtu.clamp(1200, 65527);
+        transport.initial_mtu(mtu);
+        if !options.disable_mtu_discovery {
+            let mut mtud = quinn::MtuDiscoveryConfig::default();
+            mtud.upper_bound(mtu);
+            transport.mtu_discovery_config(Some(mtud));
+        }
+    }
     if options.disable_mtu_discovery {
         transport.mtu_discovery_config(None);
     }
@@ -251,6 +288,108 @@ pub async fn client_config(
     Ok(cfg)
 }
 
+/// Current unix time in seconds (0 on clock skew); used for the idle
+/// accounting of shared connections.
+pub(crate) fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// `RecvStream::read_exact` with quinn's error mapped to
+/// `io::ErrorKind::UnexpectedEof` (protocol framing helpers return
+/// `io::Result`).
+pub(crate) async fn recv_read_exact(recv: &mut RecvStream, buf: &mut [u8]) -> io::Result<()> {
+    recv.read_exact(buf)
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::UnexpectedEof, e))
+}
+
+/// UDP fragment reassembly shared by the TUIC and Hysteria2 session bridges
+/// (sing `udpDefragger` parity).
+pub(crate) mod defrag {
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    /// Maximum pending fragmented packets kept for reassembly per session.
+    const DEFRAG_MAX_PENDING: usize = 64;
+    /// Maximum age of a pending fragmented packet before it is dropped.
+    const DEFRAG_MAX_AGE: Duration = Duration::from_secs(10);
+
+    /// Reassembly state for one fragmented packet.
+    struct DefragBuffer {
+        frags: Vec<Option<Vec<u8>>>,
+        count: usize,
+        updated: Instant,
+    }
+
+    /// Reassembles fragmented UDP packets, bounding memory by capping the
+    /// number of pending packets and expiring stale ones.
+    #[derive(Default)]
+    pub(crate) struct Defragmenter {
+        map: HashMap<u16, DefragBuffer>,
+    }
+
+    impl Defragmenter {
+        pub(crate) fn new() -> Self {
+            Self::default()
+        }
+
+        /// Feed one fragment; returns the reassembled payload when the last
+        /// missing fragment arrives. Unfragmented packets (`frag_total <= 1`)
+        /// pass through immediately; invalid or duplicate fragments are
+        /// dropped (`None`).
+        pub(crate) fn feed(
+            &mut self,
+            packet_id: u16,
+            frag_id: u8,
+            frag_total: u8,
+            data: Vec<u8>,
+        ) -> Option<Vec<u8>> {
+            if frag_total <= 1 {
+                return Some(data);
+            }
+            if frag_id >= frag_total {
+                return None;
+            }
+            let map = &mut self.map;
+            if map.len() >= DEFRAG_MAX_PENDING && !map.contains_key(&packet_id) {
+                map.retain(|_, b| b.updated.elapsed() < DEFRAG_MAX_AGE);
+                if map.len() >= DEFRAG_MAX_PENDING {
+                    return None;
+                }
+            }
+            let frag_total = frag_total as usize;
+            let entry = map.entry(packet_id).or_insert_with(|| DefragBuffer {
+                frags: (0..frag_total).map(|_| None).collect(),
+                count: 0,
+                updated: Instant::now(),
+            });
+            if entry.frags.len() != frag_total {
+                entry.frags = (0..frag_total).map(|_| None).collect();
+                entry.count = 0;
+            }
+            let frag_id = frag_id as usize;
+            if entry.frags[frag_id].is_some() {
+                return None;
+            }
+            entry.frags[frag_id] = Some(data);
+            entry.count += 1;
+            entry.updated = Instant::now();
+            if entry.count != entry.frags.len() {
+                return None;
+            }
+            let entry = map.remove(&packet_id).expect("entry just inserted");
+            let mut data = Vec::new();
+            for frag in entry.frags.into_iter().flatten() {
+                data.extend_from_slice(&frag);
+            }
+            Some(data)
+        }
+    }
+}
+
 /// Bind a non-blocking UDP socket with `SO_MARK` set so the local eBPF
 /// datapath treats QUIC packets to the proxy server as control-plane traffic
 /// and does not re-route them (same bypass as `util::udp_marked_bind`; QUIC
@@ -259,31 +398,137 @@ pub async fn client_config(
 /// Public so protocol handlers that wrap the socket themselves (Hysteria2's
 /// salamander obfuscation) can reuse the same marking logic.
 pub fn marked_udp_socket(ipv6: bool) -> io::Result<std::net::UdpSocket> {
-    let domain = if ipv6 {
-        socket2::Domain::IPV6
-    } else {
-        socket2::Domain::IPV4
-    };
-    let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, None)?;
-    socket.set_nonblocking(true)?;
-    #[cfg(target_os = "linux")]
-    crate::util::set_mark_best_effort(&socket, honk_ebpf_common::DAE_BYPASS_MARK)?;
     let bind_addr: SocketAddr = if ipv6 {
         "[::]:0".parse().expect("hardcoded IPv6 bind address")
     } else {
         "0.0.0.0:0".parse().expect("hardcoded IPv4 bind address")
     };
-    socket.bind(&bind_addr.into())?;
-    Ok(socket.into())
+    crate::util::marked_udp_socket(bind_addr)
 }
 
 /// Create a client-only quinn [`Endpoint`] on a marked UDP socket for the
 /// given address family.
+///
+/// The endpoint advertises `max_udp_payload_size = 1252` instead of quinn's
+/// 1472: on PPPoE/tunneled last miles, larger downlink UDP datagrams are
+/// silently black-holed (measured on a CN PPPoE line: ≤1260B echoes pass,
+/// 1280B all lost), which kills every QUIC handshake whose ServerHello
+/// flight exceeds the threshold. 1252 matches quic-go's default; going
+/// lower (e.g. the RFC minimum 1200) shrinks the server's flight allowance
+/// below its anti-amplification budget (3× the client Initial) and can
+/// deadlock handshakes against large certificate chains.
 pub fn client_endpoint(ipv6: bool) -> io::Result<Endpoint> {
+    client_endpoint_with_mtu(ipv6, 1252)
+}
+
+/// [`client_endpoint`] with an explicit advertised `max_udp_payload_size`.
+pub fn client_endpoint_with_mtu(ipv6: bool, max_udp_payload_size: u16) -> io::Result<Endpoint> {
     let socket = marked_udp_socket(ipv6)?;
     let runtime = quinn::default_runtime()
         .ok_or_else(|| io::Error::other("no async runtime available for QUIC"))?;
-    Endpoint::new(EndpointConfig::default(), None, socket, runtime)
+    let io = Arc::new(tokio::net::UdpSocket::from_std(socket)?);
+    let inner = quinn::udp::UdpSocketState::new((&*io).into())?;
+    static GSO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let gso = *GSO.get_or_init(|| {
+        std::env::var("HONK_QUIC_GSO")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    });
+    let socket = Arc::new(NoGsoUdpSocket { io, inner, gso });
+    Endpoint::new_with_abstract_socket(
+        endpoint_config_with_mtu(max_udp_payload_size)?,
+        None,
+        socket,
+        runtime,
+    )
+}
+
+/// EndpointConfig advertising `max_udp_payload_size` (see `client_endpoint`
+/// for why 1252 is the safe default on PMTU-black-holed last miles).
+pub(crate) fn endpoint_config_with_mtu(mtu: u16) -> io::Result<EndpointConfig> {
+    let mut config = EndpointConfig::default();
+    config.max_udp_payload_size(mtu).map_err(io::Error::other)?;
+    Ok(config)
+}
+
+/// quinn's stock tokio socket behavior (ECN, GRO, cmsgs) with **GSO
+/// disabled** (`max_transmit_segments = 1`): every datagram goes out on its
+/// own, dodging PPPoE uplinks that drop later segments of a GSO
+/// super-packet. This is quinn's own `runtime/tokio.rs` socket with a
+/// one-line change, so nothing else (ECN signaling, GRO receives, pktinfo)
+/// diverges from the stock path.
+///
+/// `HONK_QUIC_GSO=1` opts back into kernel UDP GSO (a 10-20% single-flow
+/// throughput win on non-PPPoE paths; keep it off where the uplink drops
+/// GSO segments).
+#[derive(Debug)]
+struct NoGsoUdpSocket {
+    io: Arc<tokio::net::UdpSocket>,
+    inner: quinn::udp::UdpSocketState,
+    gso: bool,
+}
+
+impl quinn::AsyncUdpSocket for NoGsoUdpSocket {
+    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn quinn::UdpPoller>> {
+        Box::pin(NoGsoUdpPoller {
+            socket: Arc::clone(&self.io),
+        })
+    }
+
+    fn try_send(&self, transmit: &quinn::udp::Transmit) -> io::Result<()> {
+        self.io.try_io(tokio::io::Interest::WRITABLE, || {
+            self.inner.send((&self.io).into(), transmit)
+        })
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut Context<'_>,
+        bufs: &mut [std::io::IoSliceMut<'_>],
+        meta: &mut [quinn::udp::RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        loop {
+            std::task::ready!(self.io.poll_recv_ready(cx))?;
+            match self.io.try_io(tokio::io::Interest::READABLE, || {
+                self.inner.recv((&self.io).into(), bufs, meta)
+            }) {
+                Ok(res) => return Poll::Ready(Ok(res)),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.io.local_addr()
+    }
+
+    fn may_fragment(&self) -> bool {
+        self.inner.may_fragment()
+    }
+
+    fn max_transmit_segments(&self) -> usize {
+        if self.gso {
+            self.inner.max_gso_segments()
+        } else {
+            1
+        }
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        self.inner.gro_segments()
+    }
+}
+
+#[derive(Debug)]
+struct NoGsoUdpPoller {
+    socket: Arc<tokio::net::UdpSocket>,
+}
+
+impl quinn::UdpPoller for NoGsoUdpPoller {
+    fn poll_writable(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.socket.poll_send_ready(cx)
+    }
 }
 
 struct State<C> {
@@ -297,10 +542,14 @@ struct State<C> {
 ///
 /// Keeps at most one active QUIC connection to the server and re-dials on
 /// demand (first use, connection loss, or explicit [`QuicClient::invalidate`]).
-/// The generic `C` is the protocol-specific per-connection state (demux maps,
-/// background task handles, ...), built by the `setup` closure inside the
-/// single-flight critical section so concurrent dialers share exactly one
-/// handshake.
+/// **Rotation overlaps by construction**: a flow owns its `(Connection,
+/// Arc<C>)` pair, so when the holder detects the connection's close reason
+/// and dials a fresh one, in-flight streams/datagram flows finish on the
+/// old connection while new flows land on the new one — one Active plus
+/// one draining, without a hard cut. The generic `C` is the
+/// protocol-specific per-connection state (demux maps, background task
+/// handles, ...), built by the `setup` closure inside the single-flight
+/// critical section so concurrent dialers share exactly one handshake.
 pub struct QuicClient<C> {
     server_host: String,
     server_port: u16,
@@ -311,6 +560,9 @@ pub struct QuicClient<C> {
     /// run QUIC over a salamander-obfuscated socket; when unset the plain
     /// marked socket from [`client_endpoint`] is used.
     endpoint_factory: Option<Arc<dyn Fn(bool) -> io::Result<Endpoint> + Send + Sync>>,
+    /// Advertised `max_udp_payload_size` cap for the default endpoint (see
+    /// [`client_endpoint`] for the safe 1252 default).
+    mtu: u16,
     state: Mutex<State<C>>,
 }
 
@@ -327,11 +579,21 @@ impl<C> QuicClient<C> {
             server_name: server_name.into(),
             config,
             endpoint_factory: None,
+            mtu: 1252,
             state: Mutex::new(State {
                 endpoint: None,
                 conn: None,
             }),
         }
+    }
+
+    /// Advertise a larger `max_udp_payload_size` on paths known to carry it
+    /// (anything but PMTU-black-holed last miles — see [`client_endpoint`]).
+    /// Larger datagrams directly lower the per-packet processing cost that
+    /// caps single-connection QUIC throughput (~180k pps at 1252B).
+    pub fn with_max_udp_payload_size(mut self, mtu: u16) -> Self {
+        self.mtu = mtu;
+        self
     }
 
     /// Use a custom endpoint constructor instead of [`client_endpoint`] (see
@@ -387,7 +649,7 @@ impl<C> QuicClient<C> {
                 _ => {
                     let ep = match &self.endpoint_factory {
                         Some(factory) => factory(ipv6),
-                        None => client_endpoint(ipv6),
+                        None => client_endpoint_with_mtu(ipv6, self.mtu),
                     }
                     .with_context(|| format!("create QUIC endpoint (ipv6={ipv6})"))?;
                     state.endpoint = Some((ipv6, ep.clone()));
@@ -458,13 +720,27 @@ impl<C> QuicClient<C> {
 /// A QUIC bidirectional stream as a single `AsyncRead + AsyncWrite` object.
 ///
 /// Dropping the send half finishes the stream (sends FIN), which is what the
-/// relay's half-close semantics rely on. `on_drop` lets the owning protocol
-/// track open-stream counts (for idle connection reaping) without wrapping
-/// the stream again.
+/// relay's half-close semantics rely on. The [`StreamDropGuard`] lets the
+/// owning protocol track open-stream counts (for idle connection reaping)
+/// without wrapping the stream again.
 pub struct QuicBiStream {
     send: SendStream,
     recv: RecvStream,
-    on_drop: Option<Box<dyn Fn() + Send + Sync>>,
+    guard: StreamDropGuard,
+}
+
+/// Fires the registered callback when dropped. Lives inside
+/// [`QuicBiStream`]; users that split the stream into its raw quinn halves
+/// ([`QuicBiStream::into_parts`]) keep the guard for the same lifetime
+/// accounting.
+pub(crate) struct StreamDropGuard(Option<Box<dyn Fn() + Send + Sync>>);
+
+impl Drop for StreamDropGuard {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
+    }
 }
 
 impl std::fmt::Debug for QuicBiStream {
@@ -481,22 +757,21 @@ impl QuicBiStream {
         Self {
             send,
             recv,
-            on_drop: None,
+            guard: StreamDropGuard(None),
         }
     }
 
     /// Register a callback fired when this stream object is dropped.
     pub fn with_on_drop(mut self, f: impl Fn() + Send + Sync + 'static) -> Self {
-        self.on_drop = Some(Box::new(f));
+        self.guard.0 = Some(Box::new(f));
         self
     }
-}
 
-impl Drop for QuicBiStream {
-    fn drop(&mut self) {
-        if let Some(f) = &self.on_drop {
-            f();
-        }
+    /// Split into the raw quinn halves plus the drop guard (open-stream
+    /// accounting) — for users that drive the halves separately, e.g. UDP
+    /// session bridges.
+    pub(crate) fn into_parts(self) -> (SendStream, RecvStream, StreamDropGuard) {
+        (self.send, self.recv, self.guard)
     }
 }
 
@@ -528,6 +803,226 @@ impl AsyncWrite for QuicBiStream {
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         AsyncWrite::poll_shutdown(Pin::new(&mut self.send), cx)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Shared skeletons for the TUIC / Juicity / Hysteria2 protocol handlers
+// ---------------------------------------------------------------------------
+
+/// Per-connection state shared by the QUIC proxy handlers: the activity
+/// bookkeeping used by the dial retry skeleton and the idle reaper.
+pub(crate) trait QuicConnState: Send + Sync + 'static {
+    /// Record activity on the connection (resets the idle reaper).
+    fn touch(&self);
+    /// Counter of open streams/bridges on this connection.
+    fn open_counter(&self) -> &Arc<AtomicUsize>;
+}
+
+/// Per-server protocol-client cache (TUIC/Juicity/Hysteria2 pool
+/// parity): an owned map keyed by server + credential **fingerprint** —
+/// one per handler instance, never process-global, and never holding a
+/// cleartext password in the key.
+pub(crate) struct ClientCache<C> {
+    map: Arc<parking_lot::Mutex<HashMap<String, Arc<C>>>>,
+}
+
+impl<C> ClientCache<C> {
+    pub(crate) fn new() -> Self {
+        Self {
+            map: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl<C> Default for ClientCache<C> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<C> Clone for ClientCache<C> {
+    fn clone(&self) -> Self {
+        Self {
+            map: Arc::clone(&self.map),
+        }
+    }
+}
+
+impl<C> std::fmt::Debug for ClientCache<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientCache")
+            .field("entries", &self.map.lock().len())
+            .finish()
+    }
+}
+
+/// blake3 fingerprint (16 hex chars) for cache keys: credentials never
+/// sit in keys in the clear.
+pub(crate) fn key_fingerprint(parts: &[&str]) -> String {
+    let mut h = blake3::Hasher::new();
+    for p in parts {
+        h.update(p.as_bytes());
+        h.update(b"|");
+    }
+    h.finalize().to_hex()[..16].to_string()
+}
+
+/// Look up a cached per-server protocol client, building and inserting it
+/// when missing. The build runs outside the lock (it is async — ECH
+/// discovery), so a concurrent task may have won the race; in that case the
+/// existing entry is reused and the freshly built one dropped.
+pub(crate) async fn cached_client<C, F, Fut>(
+    cache: &ClientCache<C>,
+    key: String,
+    build: F,
+) -> anyhow::Result<Arc<C>>
+where
+    C: Send + Sync + 'static,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Arc<C>>>,
+{
+    if let Some(client) = cache.map.lock().get(&key) {
+        return Ok(Arc::clone(client));
+    }
+    let client = build().await?;
+    // Another task may have won the race — reuse theirs.
+    Ok(cache.map.lock().entry(key).or_insert(client).clone())
+}
+
+/// TUIC-style exporter authentication (sing `clientHandshake`,
+/// `client.go:197-214`): one uni stream carrying
+/// `[version, 0x00, uuid(16), token(32)]` where
+/// `token = TLS ExportKeyingMaterial(label = uuid, context = password, 32)`.
+/// Juicity reuses the same frame with version 0x00 and keeps the stream
+/// open (`finish = false`); TUIC finishes it right after the write.
+///
+/// There is no positive auth acknowledgement: a server that rejects the
+/// credentials closes the connection, so the call waits a brief `grace`
+/// period for that to surface as a dial error here instead of a stream
+/// failure on the first proxied connection. Returns the auth stream.
+pub(crate) async fn exporter_auth(
+    conn: &Connection,
+    uuid: &[u8; 16],
+    password: &str,
+    version: u8,
+    finish: bool,
+    grace: Duration,
+) -> anyhow::Result<SendStream> {
+    let mut token = [0u8; 32];
+    conn.export_keying_material(&mut token, uuid, password.as_bytes())
+        .map_err(|e| anyhow!("QUIC exporter auth: TLS keying material export failed: {e:?}"))?;
+    let mut auth = Vec::with_capacity(2 + 16 + 32);
+    auth.push(version);
+    auth.push(0x00); // CMD_AUTHENTICATE
+    auth.extend_from_slice(uuid);
+    auth.extend_from_slice(&token);
+    let mut stream = conn
+        .open_uni()
+        .await
+        .context("QUIC exporter auth: open authenticate stream")?;
+    stream
+        .write_all(&auth)
+        .await
+        .context("QUIC exporter auth: send authenticate")?;
+    if finish {
+        stream
+            .finish()
+            .context("QUIC exporter auth: finish authenticate stream")?;
+    }
+    tokio::select! {
+        e = conn.closed() => Err(anyhow!("QUIC exporter auth: connection closed during authentication: {e}")),
+        _ = tokio::time::sleep(grace) => Ok(stream),
+    }
+}
+
+/// Per-tick callback for [`spawn_conn_reaper`] (TUIC's heartbeat datagram);
+/// returning false ends the reaper loop.
+type ReaperTick = Box<dyn Fn(&Connection) -> bool + Send + 'static>;
+
+/// Spawn the idle-connection reaper shared by the QUIC protocol handlers:
+/// every `interval`, close the connection when the owning protocol state was
+/// dropped ("state dropped") or when it has had no open streams/bridges for
+/// `idle_timeout` ("idle"). `on_tick` runs after the liveness checks (TUIC's
+/// heartbeat datagram); returning false ends the loop.
+pub(crate) fn spawn_conn_reaper(
+    conn: Connection,
+    open: Weak<AtomicUsize>,
+    last_activity: Weak<AtomicU64>,
+    interval: Duration,
+    idle_timeout: Duration,
+    on_tick: Option<ReaperTick>,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            if conn.close_reason().is_some() {
+                break;
+            }
+            let (Some(open), Some(last)) = (open.upgrade(), last_activity.upgrade()) else {
+                // Protocol state dropped: nothing can use this connection.
+                conn.close(VarInt::from_u32(0), b"state dropped");
+                break;
+            };
+            let idle = now_secs().saturating_sub(last.load(Ordering::Relaxed));
+            if open.load(Ordering::Relaxed) == 0 && idle > idle_timeout.as_secs() {
+                conn.close(VarInt::from_u32(0), b"idle");
+                break;
+            }
+            if let Some(on_tick) = &on_tick
+                && !on_tick(&conn)
+            {
+                break;
+            }
+        }
+    });
+}
+
+/// Shared TCP-over-QUIC dial skeleton (TUIC/Juicity/Hysteria2): get the
+/// shared connection via `connect` (re-dialing when needed), run the
+/// protocol's stream handshake (`make`), and retry once with a fresh
+/// connection when the handshake fails on a half-dead cached connection and
+/// `retryable` allows it (Hysteria2's server-side refusals are not
+/// retryable). The returned stream decrements the connection's open counter
+/// on drop.
+pub(crate) async fn dial_quic_stream<S, Connect, Fut, Make, MakeFut>(
+    client: &QuicClient<S>,
+    connect: Connect,
+    connect_timeout: Duration,
+    make: Make,
+    retryable: impl Fn(&anyhow::Error) -> bool,
+    proto: &'static str,
+) -> anyhow::Result<QuicBiStream>
+where
+    S: QuicConnState,
+    Connect: Fn(Duration) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<(Connection, Arc<S>)>>,
+    Make: Fn(Connection) -> MakeFut,
+    MakeFut: std::future::Future<Output = anyhow::Result<(SendStream, RecvStream)>>,
+{
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0..2 {
+        let (conn, state) = connect(connect_timeout).await?;
+        state.touch();
+        match make(conn.clone()).await {
+            Ok((send, recv)) => {
+                let open = Arc::clone(state.open_counter());
+                open.fetch_add(1, Ordering::Relaxed);
+                let stream = QuicBiStream::new(send, recv).with_on_drop(move || {
+                    open.fetch_sub(1, Ordering::Relaxed);
+                });
+                return Ok(stream);
+            }
+            Err(e) if retryable(&e) => {
+                debug!("{proto}: stream open failed (attempt {attempt}): {e}");
+                client.invalidate(&conn).await;
+                last_err = Some(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.expect("loop runs at least once"))
 }
 
 #[cfg(test)]
@@ -781,7 +1276,7 @@ pub async fn quic_handshake_probe(
     let runtime = quinn::default_runtime()
         .ok_or_else(|| io::Error::other("no async runtime available for QUIC"))?;
     let endpoint =
-        Endpoint::new_with_abstract_socket(EndpointConfig::default(), None, socket, runtime)?;
+        Endpoint::new_with_abstract_socket(endpoint_config_with_mtu(1252)?, None, socket, runtime)?;
 
     let start = Instant::now();
     let connecting = endpoint

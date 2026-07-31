@@ -1,3 +1,6 @@
+use std::time::Instant;
+
+use parking_lot::Mutex;
 use rand::Rng;
 
 use super::*;
@@ -365,11 +368,17 @@ impl AsyncUdpSocket for Hy2UdpSocket {
 pub(super) fn hy2_endpoint_factory(
     obfs: Option<Arc<[u8]>>,
     hop: Option<(Vec<u16>, Duration)>,
+    mtu: u16,
 ) -> impl Fn(bool) -> io::Result<Endpoint> + Send + Sync {
     move |ipv6| {
         let socket = Arc::new(Hy2UdpSocket::new(ipv6, obfs.clone(), hop.clone())?);
         let runtime = quinn::default_runtime()
             .ok_or_else(|| io::Error::other("no async runtime available for QUIC"))?;
-        Endpoint::new_with_abstract_socket(EndpointConfig::default(), None, socket, runtime)
+        Endpoint::new_with_abstract_socket(
+            crate::quic::endpoint_config_with_mtu(mtu)?,
+            None,
+            socket,
+            runtime,
+        )
     }
 }

@@ -52,7 +52,6 @@ use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tracing::debug;
 
 use super::addr::{self, SocksAddr};
 use super::{AsyncReadWrite, ProxyHandler, ProxyStream};
@@ -289,6 +288,12 @@ impl ProxyHandler for VmessHandler {
         NodeProtocol::VMess
     }
 
+    /// With `mux` the dial goes through the h2mux SessionPool: bare-TCP
+    /// pooling would force a new h2 session per flow (see AnyTlsHandler).
+    fn pool_bare_tcp(&self, node: &Node) -> bool {
+        !node.mux
+    }
+
     async fn dial(
         &self,
         node: &Node,
@@ -320,17 +325,6 @@ impl ProxyHandler for VmessHandler {
 
         let stream = Self::wrap_transport(node, tcp).await?;
         Self::perform_handshake(uuid_bytes, stream, target, target_domain)
-    }
-
-    async fn test_connectivity(&self, node: &Node) -> bool {
-        let addr = format!("{}:{}", node.host(), node.port);
-        match crate::util::connect_outbound(&addr, std::time::Duration::from_secs(3)).await {
-            Ok(_stream) => true,
-            Err(e) => {
-                debug!("VMess connectivity test failed for {}: {}", node.name, e);
-                false
-            }
-        }
     }
 }
 

@@ -1,3 +1,5 @@
+use std::sync::LazyLock;
+
 use super::*;
 
 // QPACK prefixed integers (RFC 7541 §5.1 / RFC 9204 §4.1.1) — only inside

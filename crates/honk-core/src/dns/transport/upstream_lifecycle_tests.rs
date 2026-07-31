@@ -1,0 +1,295 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use honk_config::dns::{DnsRouting, DnsUpstream};
+use honk_config::node::Node;
+use honk_config::types::DnsProtocol;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+
+use crate::dns::forwarder::DnsUpstreamPool;
+use crate::dns::routing::DnsRouter;
+use crate::dns::upstream_pool::UpstreamPool;
+use crate::routing::Router;
+
+#[tokio::test]
+async fn tcp_transport_lifecycle_is_single_flight_and_closes_once() {
+    // Given
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("listener address");
+    let server = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        for _ in 0..128 {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            connections.spawn(async move {
+                let mut length = [0_u8; 2];
+                stream.read_exact(&mut length).await.expect("query length");
+                let query_length = usize::from(u16::from_be_bytes(length));
+                let mut query = vec![0_u8; query_length];
+                stream.read_exact(&mut query).await.expect("query");
+                let mut response = vec![0_u8; 12];
+                response[..2].copy_from_slice(&query[..2]);
+                response[2] = 0x81;
+                response[3] = 0x80;
+                stream
+                    .write_all(&(response.len() as u16).to_be_bytes())
+                    .await
+                    .expect("response length");
+                stream.write_all(&response).await.expect("response");
+            });
+        }
+        while let Some(connection) = connections.join_next().await {
+            connection.expect("connection task");
+        }
+    });
+    let router = Arc::new(
+        DnsRouter::new(&DnsRouting {
+            fallback: "tcp".to_string(),
+            ..Default::default()
+        })
+        .expect("router"),
+    );
+    let pool = Arc::new(
+        UpstreamPool::new(
+            &[DnsUpstream {
+                name: "tcp".to_string(),
+                address: address.to_string(),
+                protocol: DnsProtocol::Tcp,
+                tls_server_name: None,
+                outbound: None,
+            }],
+            router,
+        )
+        .expect("pool"),
+    );
+    let query = Arc::new(vec![
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ]);
+    let gate = Arc::new(tokio::sync::Barrier::new(128));
+    let mut callers = tokio::task::JoinSet::new();
+    for _ in 0..128 {
+        let pool = Arc::clone(&pool);
+        let query = Arc::clone(&query);
+        let gate = Arc::clone(&gate);
+        callers.spawn(async move {
+            gate.wait().await;
+            pool.query("tcp", &query).await
+        });
+    }
+
+    // When
+    while let Some(response) = callers.join_next().await {
+        assert_eq!(
+            response.expect("query task").expect("query response").len(),
+            12
+        );
+    }
+    pool.close().await;
+    pool.close().await;
+    server.await.expect("server task");
+
+    // Then
+    let stats = pool.lifecycle_stats();
+    assert_eq!(stats.init_count, 1);
+    assert_eq!(stats.close_count, 1);
+    assert_eq!(stats.tasks, 0);
+    assert!(pool.query("tcp", &query).await.is_err());
+}
+
+#[tokio::test]
+async fn proxied_quic_transports_fail_before_direct_dial() {
+    // Given
+    let router = Arc::new(
+        DnsRouter::new(&DnsRouting {
+            fallback: "doq".to_string(),
+            ..Default::default()
+        })
+        .expect("router"),
+    );
+    let proxy = Node {
+        name: "proxy".to_string(),
+        ..Default::default()
+    };
+    let upstreams = [
+        DnsUpstream {
+            name: "doq".to_string(),
+            address: "127.0.0.1:853".to_string(),
+            protocol: DnsProtocol::Quic,
+            tls_server_name: Some("dns.test".to_string()),
+            outbound: Some("proxy".to_string()),
+        },
+        DnsUpstream {
+            name: "doh3".to_string(),
+            address: "127.0.0.1:443/dns-query".to_string(),
+            protocol: DnsProtocol::H3,
+            tls_server_name: Some("dns.test".to_string()),
+            outbound: Some("proxy".to_string()),
+        },
+    ];
+    let pool = UpstreamPool::new_with_proxy(&upstreams, router, None, vec![proxy], Vec::new())
+        .expect("pool");
+    let query = [0_u8; 12];
+
+    // When
+    let doq = pool.query("doq", &query).await;
+    let doh3 = pool.query("doh3", &query).await;
+
+    // Then
+    assert!(
+        doq.expect_err("DoQ proxy rejected")
+            .to_string()
+            .contains("does not support outbound")
+    );
+    assert!(
+        doh3.expect_err("DoH3 proxy rejected")
+            .to_string()
+            .contains("does not support outbound")
+    );
+    assert_eq!(pool.lifecycle_stats().init_count, 0);
+}
+
+#[tokio::test]
+async fn overlapping_close_waits_for_inflight_query_drain() {
+    // Given
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("listener address");
+    let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let mut length = [0_u8; 2];
+        stream.read_exact(&mut length).await.expect("query length");
+        let mut query = vec![0_u8; usize::from(u16::from_be_bytes(length))];
+        stream.read_exact(&mut query).await.expect("query");
+        let _ = request_tx.send(());
+        let _ = response_rx.await;
+        let mut response = vec![0_u8; 12];
+        response[..2].copy_from_slice(&query[..2]);
+        stream
+            .write_all(&(response.len() as u16).to_be_bytes())
+            .await
+            .expect("response length");
+        stream.write_all(&response).await.expect("response");
+    });
+    let pool = Arc::new(
+        UpstreamPool::new(
+            &[DnsUpstream {
+                name: "tcp".to_string(),
+                address: address.to_string(),
+                protocol: DnsProtocol::Tcp,
+                tls_server_name: None,
+                outbound: None,
+            }],
+            Arc::new(
+                DnsRouter::new(&DnsRouting {
+                    fallback: "tcp".to_string(),
+                    ..Default::default()
+                })
+                .expect("router"),
+            ),
+        )
+        .expect("pool"),
+    );
+    let query_pool = Arc::clone(&pool);
+    let query = tokio::spawn(async move { query_pool.query("tcp", &[0_u8; 12]).await });
+    request_rx.await.expect("query reached server");
+    let first_pool = Arc::clone(&pool);
+    let first_close = tokio::spawn(async move { first_pool.close().await });
+    tokio::task::yield_now().await;
+    let second_pool = Arc::clone(&pool);
+    let mut second_close = tokio::spawn(async move { second_pool.close().await });
+
+    // When
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut second_close)
+            .await
+            .is_err(),
+        "second close returned before the inflight transport drained"
+    );
+    response_tx.send(()).expect("release response");
+    query
+        .await
+        .expect("query task")
+        .expect("query response after release");
+    first_close.await.expect("first close task");
+    second_close.await.expect("second close task");
+    server.await.expect("server task");
+
+    // Then
+    let stats = pool.lifecycle_stats();
+    assert_eq!(stats.close_count, 1);
+    assert_eq!(stats.tasks, 0);
+}
+
+#[tokio::test]
+async fn query_paused_in_leaf_routing_cannot_publish_after_close() {
+    // Given
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("listener address");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let mut length = [0_u8; 2];
+        stream.read_exact(&mut length).await.expect("query length");
+        let mut query = vec![0_u8; usize::from(u16::from_be_bytes(length))];
+        stream.read_exact(&mut query).await.expect("query");
+        let response = vec![0_u8; 12];
+        stream
+            .write_all(&(response.len() as u16).to_be_bytes())
+            .await
+            .expect("response length");
+        stream.write_all(&response).await.expect("response");
+    });
+    let pool = Arc::new(
+        UpstreamPool::new(
+            &[DnsUpstream {
+                name: "tcp".to_string(),
+                address: address.to_string(),
+                protocol: DnsProtocol::Tcp,
+                tls_server_name: None,
+                outbound: None,
+            }],
+            Arc::new(
+                DnsRouter::new(&DnsRouting {
+                    fallback: "tcp".to_string(),
+                    ..Default::default()
+                })
+                .expect("dns router"),
+            ),
+        )
+        .expect("pool"),
+    );
+    let traffic = Arc::new(tokio::sync::RwLock::new(
+        Router::new(&[], "direct").expect("traffic router"),
+    ));
+    pool.set_traffic_router(Some(Arc::clone(&traffic)));
+    let baseline_refs = Arc::strong_count(&traffic);
+    let write_guard = traffic.write().await;
+    let query_pool = Arc::clone(&pool);
+    let query = tokio::spawn(async move { query_pool.query("tcp", &[0_u8; 12]).await });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while Arc::strong_count(&traffic) == baseline_refs {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("query paused in leaf routing");
+
+    // When
+    pool.close().await;
+    drop(write_guard);
+    let result = query.await.expect("query task");
+    server.abort();
+    let _ = server.await;
+
+    // Then
+    assert!(
+        result
+            .expect_err("closed pool rejects publication")
+            .to_string()
+            .contains("closed")
+    );
+    let stats = pool.lifecycle_stats();
+    assert_eq!(stats.init_count, 0);
+    assert_eq!(stats.close_count, 0);
+    assert_eq!(stats.tasks, 0);
+}

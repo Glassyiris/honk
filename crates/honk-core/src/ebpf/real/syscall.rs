@@ -10,7 +10,15 @@ use std::ffi::c_long;
 
 pub const ENOENT: c_long = libc::ENOENT as c_long;
 
+/// Callback invoked once per batch chunk by [`bpf_lookup_batch_scan_cb`].
+pub type BatchVisitor<'a, K, V> = dyn FnMut(&[(K, V)]) + 'a;
+
 /// Call the `bpf()` syscall.  Returns `Ok(())` on success, `Err(errno)`.
+///
+/// # Safety
+///
+/// `attr` must point to a live `bpf_attr` appropriate for `cmd` for the
+/// duration of the call.
 pub unsafe fn bpf_syscall(cmd: c_long, attr: &mut bpf_attr) -> Result<(), c_long> {
     let ret = unsafe {
         libc::syscall(
@@ -27,10 +35,21 @@ pub unsafe fn bpf_syscall(cmd: c_long, attr: &mut bpf_attr) -> Result<(), c_long
     }
 }
 
+/// Reinterpret a POD value as its raw bytes.
+///
+/// # Safety
+///
+/// `T` must be valid to view as bytes (no padding-sensitive invariants);
+/// used only with the `#[repr(C)]` wire types.
 pub unsafe fn as_bytes<T: Sized>(t: &T) -> &[u8] {
     unsafe { core::slice::from_raw_parts(t as *const T as *const u8, core::mem::size_of::<T>()) }
 }
 
+/// Read a `T` out of a raw byte slice, possibly unaligned.
+///
+/// # Safety
+///
+/// `bytes` must be at least `size_of::<T>()` long and hold a valid `T`.
 pub unsafe fn from_bytes<T: Sized + Copy>(bytes: &[u8]) -> T {
     unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const T) }
 }
@@ -101,6 +120,31 @@ pub fn bpf_hash_insert(bpf: &mut Ebpf, map: &str, key: &[u8], value: &[u8]) -> a
             .map_err(|e| anyhow::anyhow!("bpf update({}) errno={}", map, e))?;
     }
     Ok(())
+}
+
+pub fn bpf_hash_insert_domain(
+    bpf: &mut Ebpf,
+    map: &str,
+    key: &[u8],
+    value: &[u8],
+) -> Result<(), super::super::DomainRouteWriteError> {
+    let fd = map_fd_mut(bpf, map).map_err(super::super::DomainRouteWriteError::Other)?;
+    let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
+    attr.__bindgen_anon_2.map_fd = fd as u32;
+    attr.__bindgen_anon_2.key = key.as_ptr() as u64;
+    attr.__bindgen_anon_2.__bindgen_anon_1.value = value.as_ptr() as u64;
+    attr.__bindgen_anon_2.flags = BPF_ANY;
+    match unsafe { bpf_syscall(BPF_MAP_UPDATE_ELEM as c_long, &mut attr) } {
+        Ok(()) => Ok(()),
+        Err(errno) if errno == libc::ENOSPC as c_long => {
+            Err(super::super::DomainRouteWriteError::MapFull)
+        }
+        Err(errno) => Err(super::super::DomainRouteWriteError::Other(anyhow::anyhow!(
+            "bpf update({}) errno={}",
+            map,
+            errno
+        ))),
+    }
 }
 
 pub fn bpf_hash_lookup(
@@ -281,6 +325,73 @@ pub fn bpf_lookup_batch_scan<K: Copy, V: Copy>(
             Err(ENOENT) => return Ok(true),
             Err(e) => {
                 out.truncate(initial_len);
+                return Err(anyhow::anyhow!("bpf lookup_batch({}) errno={}", map, e));
+            }
+        }
+    }
+}
+
+/// Streaming variant of [`bpf_lookup_batch_scan`]: invokes `visit` once per
+/// chunk instead of accumulating the whole map, so memory stays bounded by
+/// `BPF_BATCH_CHUNK` regardless of map size. Same fallback contract —
+/// `Ok(false)` when the kernel lacks `BPF_MAP_LOOKUP_BATCH`.
+pub fn bpf_lookup_batch_scan_cb<K: Copy, V: Copy>(
+    bpf: &Ebpf,
+    cap: &BatchCapability,
+    map: &str,
+    visit: &mut BatchVisitor<'_, K, V>,
+) -> anyhow::Result<bool> {
+    if cap.is_unsupported() {
+        return Ok(false);
+    }
+    let fd = map_fd(bpf, map)?;
+    let ksz = core::mem::size_of::<K>();
+    let vsz = core::mem::size_of::<V>();
+    let mut keys_buf = vec![0u8; BPF_BATCH_CHUNK * ksz];
+    let mut vals_buf = vec![0u8; BPF_BATCH_CHUNK * vsz];
+    let mut next_key = vec![0u8; ksz];
+    let mut in_batch: Option<Vec<u8>> = None;
+    let mut chunk: Vec<(K, V)> = Vec::with_capacity(BPF_BATCH_CHUNK);
+    loop {
+        let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
+        attr.batch.map_fd = fd as u32;
+        attr.batch.in_batch = in_batch.as_ref().map_or(0, |b| b.as_ptr() as u64);
+        attr.batch.out_batch = next_key.as_mut_ptr() as u64;
+        attr.batch.keys = keys_buf.as_mut_ptr() as u64;
+        attr.batch.values = vals_buf.as_mut_ptr() as u64;
+        attr.batch.count = BPF_BATCH_CHUNK as u32;
+        let res = unsafe { bpf_syscall(BPF_MAP_LOOKUP_BATCH as c_long, &mut attr) };
+        if !cap.observe(res) {
+            debug!(
+                "bpf lookup_batch({}) unsupported, using GET_NEXT_KEY walk",
+                map
+            );
+            return Ok(false);
+        }
+        match res {
+            Ok(()) => {
+                let n = unsafe { attr.batch.count } as usize;
+                chunk.clear();
+                for i in 0..n {
+                    let k = unsafe {
+                        core::ptr::read_unaligned(keys_buf[i * ksz..].as_ptr() as *const K)
+                    };
+                    let v = unsafe {
+                        core::ptr::read_unaligned(vals_buf[i * vsz..].as_ptr() as *const V)
+                    };
+                    chunk.push((k, v));
+                }
+                if !chunk.is_empty() {
+                    visit(&chunk);
+                }
+                if n == BPF_BATCH_CHUNK {
+                    in_batch = Some(next_key.clone());
+                } else {
+                    return Ok(true);
+                }
+            }
+            Err(ENOENT) => return Ok(true),
+            Err(e) => {
                 return Err(anyhow::anyhow!("bpf lookup_batch({}) errno={}", map, e));
             }
         }

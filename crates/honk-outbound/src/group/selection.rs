@@ -164,7 +164,6 @@ impl GroupManager {
         };
         self.last_used
             .read()
-            .unwrap()
             .get(group_name)
             .map(|t| t.elapsed() >= idle_timeout)
             .unwrap_or(true)
@@ -248,7 +247,6 @@ impl GroupManager {
                 GroupPolicy::Selector => self
                     .selector_choice
                     .read()
-                    .unwrap()
                     .get(&group.name)
                     .cloned()
                     .or_else(|| group.default.clone())
@@ -362,13 +360,13 @@ impl GroupManager {
     /// callback are invoked.
     pub fn set_selector_choice(&self, group_name: &str, node_name: &str) {
         {
-            let mut choices = self.selector_choice.write().unwrap();
+            let mut choices = self.selector_choice.write();
             if choices.get(group_name).map(String::as_str) == Some(node_name) {
                 return; // unchanged
             }
             choices.insert(group_name.to_string(), node_name.to_string());
         }
-        if let Some(ref cb) = *self.persist_callback.read().unwrap() {
+        if let Some(ref cb) = *self.persist_callback.read() {
             cb(group_name, node_name);
         }
         self.maybe_interrupt(group_name);
@@ -377,14 +375,14 @@ impl GroupManager {
     /// Install the callback invoked when a Selector group's choice changes
     /// (group_name, node_name). Re-callable; pass `None` to remove.
     pub fn set_persist_callback(&self, cb: Option<PersistCallback>) {
-        *self.persist_callback.write().unwrap() = cb;
+        *self.persist_callback.write() = cb;
     }
 
     /// Install the callback invoked when a group's selected node changes
     /// and the group has `interrupt_connections = true`. Re-callable;
     /// pass `None` to remove.
     pub fn set_interrupt_callback(&self, cb: Option<InterruptCallback>) {
-        *self.interrupt_callback.write().unwrap() = cb;
+        *self.interrupt_callback.write() = cb;
     }
 
     /// Record group activity: updates the idle-timeout timestamp and wakes
@@ -392,7 +390,6 @@ impl GroupManager {
     fn mark_used(&self, group_name: &str) {
         self.last_used
             .write()
-            .unwrap()
             .insert(group_name.to_string(), Instant::now());
         if let Some(ref alive) = self.alive_set {
             alive.mark_group_active(group_name);
@@ -410,18 +407,14 @@ impl GroupManager {
         if !interrupt {
             return;
         }
-        if let Some(ref cb) = *self.interrupt_callback.read().unwrap() {
+        if let Some(ref cb) = *self.interrupt_callback.read() {
             cb(group_name);
         }
     }
 
     /// Get the current selected node name for a Selector group.
     pub fn get_selector_choice(&self, group_name: &str) -> Option<String> {
-        self.selector_choice
-            .read()
-            .unwrap()
-            .get(group_name)
-            .cloned()
+        self.selector_choice.read().get(group_name).cloned()
     }
 
     /// Wrap this manager into a [`SharedGroupManager`] cell (see the type's
@@ -436,12 +429,12 @@ impl GroupManager {
     /// member of that group, are dropped. Persist/interrupt callbacks are
     /// not fired — they are wired after migration by the caller.
     pub fn migrate_selector_choices_from(&self, old: &GroupManager) {
-        let old_choices = old.selector_choice.read().unwrap().clone();
+        let old_choices = old.selector_choice.read().clone();
         if old_choices.is_empty() {
             return;
         }
         let mut migrated = 0usize;
-        let mut choices = self.selector_choice.write().unwrap();
+        let mut choices = self.selector_choice.write();
         for (group_name, member_tag) in old_choices {
             let still_valid = self
                 .groups
@@ -478,7 +471,7 @@ impl GroupManager {
         group_name: &str,
         network: SelectionNetwork,
     ) -> Option<String> {
-        let cache = self.urltest_cache.read().unwrap();
+        let cache = self.urltest_cache.read();
         cache
             .get(group_name)
             .and_then(|sel| sel.get(network))
@@ -487,7 +480,7 @@ impl GroupManager {
 
     /// Get the current Fallback pinned member tag (for API/display).
     pub fn get_fallback_selection(&self, group_name: &str) -> Option<String> {
-        self.fallback_cache.read().unwrap().get(group_name).cloned()
+        self.fallback_cache.read().get(group_name).cloned()
     }
 
     /// Resolve a group to the single leaf node its policy selects.
@@ -630,7 +623,7 @@ impl GroupManager {
     /// behavior: picking a sub-group defers to that group's own pick,
     /// which flattening already resolved to its leaf).
     fn pick_selector<'a>(&self, candidates: &[Candidate<'a>], group: &Group) -> &'a Node {
-        if let Some(choice) = self.selector_choice.read().unwrap().get(&group.name)
+        if let Some(choice) = self.selector_choice.read().get(&group.name)
             && let Some(c) = candidates.iter().find(|c| c.tag == choice.as_str())
         {
             return c.node;
@@ -668,7 +661,7 @@ impl GroupManager {
                 .any(|c| self.udp_specific_latency(c.node, ipver).is_some())
         {
             let tcp_entry = {
-                let cache = self.urltest_cache.read().unwrap();
+                let cache = self.urltest_cache.read();
                 cache.get(&group.name).and_then(|sel| sel.tcp.clone())
             };
             if let Some(entry) = tcp_entry
@@ -686,7 +679,7 @@ impl GroupManager {
         let best = self.pick_best_by_latency(candidates, group, network, ipver);
 
         {
-            let cache = self.urltest_cache.read().unwrap();
+            let cache = self.urltest_cache.read();
             if let Some(current) = cache.get(&group.name).and_then(|sel| sel.get(network))
                 && let Some(pos) = candidates.iter().position(|c| c.tag == current.tag)
             {
@@ -744,7 +737,7 @@ impl GroupManager {
         candidate: &Candidate,
         latency: Duration,
     ) -> bool {
-        let mut cache = self.urltest_cache.write().unwrap();
+        let mut cache = self.urltest_cache.write();
         let selections = cache.entry(group.name.clone()).or_default();
         let changed = selections
             .get(network)
@@ -790,7 +783,7 @@ impl GroupManager {
     /// working lower-preference member until it actually fails.
     fn pick_fallback<'a>(&self, candidates: &[Candidate<'a>], group: &Group) -> &'a Node {
         {
-            let cache = self.fallback_cache.read().unwrap();
+            let cache = self.fallback_cache.read();
             if let Some(pinned) = cache.get(&group.name)
                 && let Some(&c) = candidates.iter().find(|c| c.tag == pinned.as_str())
             {
@@ -809,7 +802,7 @@ impl GroupManager {
     /// The pin is by member tag — a sub-group stays pinned while it has
     /// any alive leaf to offer.
     fn cache_fallback_selection(&self, group: &Group, candidate: &Candidate) -> bool {
-        let mut cache = self.fallback_cache.write().unwrap();
+        let mut cache = self.fallback_cache.write();
         let changed = cache
             .get(&group.name)
             .map(|old| old != candidate.tag)

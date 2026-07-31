@@ -15,6 +15,8 @@ pub mod control;
 pub mod dns;
 pub mod ebpf;
 pub mod mode;
+#[cfg(feature = "ebpf")]
+pub(crate) mod netlink;
 pub mod pool;
 pub mod relay;
 pub mod routing;
@@ -74,7 +76,7 @@ fn raise_nofile_rlimit() -> anyhow::Result<()> {
 
 /// Resolve an interface name, expanding `"auto"` or empty to the default route interface.
 #[cfg(feature = "ebpf")]
-fn resolve_interface(name: &str) -> String {
+pub(crate) fn resolve_interface(name: &str) -> String {
     if name == "auto" || name.is_empty() {
         detect_default_interface().unwrap_or_else(|| {
             warn!("could not detect default route interface; falling back to 'lo'");
@@ -245,6 +247,55 @@ pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// to 90s for the previous instance to exit, then fails loudly.
+/// Take the process-wide instance lock: the datapath uses fixed names
+/// (dae0, daens, TC hooks) and a stopping instance's cleanup destroys
+/// them, so a second instance must never start while the first is still
+/// draining (its late cleanup would rip the fresh datapath out from
+/// under it — the restart race that hung the lab for a day). Waits up
+/// to 240s for the previous instance to exit (busy gateways can take
+/// well over 90s to drain), then fails loudly.
+fn acquire_instance_lock(
+    _bpf_pin_root: &std::path::Path,
+) -> anyhow::Result<nix::fcntl::Flock<std::fs::File>> {
+    use nix::fcntl::{Flock, FlockArg};
+    // /run (not the bpffs pin root, which rejects regular files).
+    let path = std::path::PathBuf::from("/run/honk-core.lock");
+    let mut file = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|e| anyhow::anyhow!("open instance lock {}: {}", path.display(), e))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
+    let mut logged = false;
+    loop {
+        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(flock) => return Ok(flock),
+            Err((f, _)) if std::time::Instant::now() < deadline => {
+                file = f; // the failed lock hands the file back for the retry
+                if !logged {
+                    info!(
+                        "another honk-core instance is shutting down; \
+                         waiting for the datapath lock at {}",
+                        path.display()
+                    );
+                    logged = true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            Err((_, e)) => {
+                anyhow::bail!(
+                    "another honk-core instance holds {} ({}); refusing to start",
+                    path.display(),
+                    e
+                )
+            }
+        }
+    }
+}
+
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // Load the configuration before initializing logging so `log_level` in
     // the config file is honored (previously only --debug/RUST_LOG had any
@@ -396,6 +447,15 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     let mock_mode = cli.mock_ebpf || cfg!(not(feature = "ebpf"));
 
+    // Singleton guard: the datapath uses fixed names (dae0, daens, TC
+    // hooks), and a stopping instance's cleanup destroys them. A second
+    // instance that starts while the first is still draining would have
+    // its fresh datapath ripped out from under it by that cleanup —
+    // silently, minutes later (the restart race that hung the lab for a
+    // day). Take an exclusive flock for the process lifetime; a second
+    // instance waits for the first to fully exit instead of overlapping.
+    let _instance_lock = acquire_instance_lock(&cli.bpf_pin_root)?;
+
     // Create dae0 veth BEFORE eBPF load so PARAM.dae0_ifindex is correct.
     // dae0peer stays in the host namespace during the dae0 attach, then moves
     // to the daens netns in setup_daens_namespace() below.
@@ -404,6 +464,19 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     #[cfg(not(feature = "ebpf"))]
     let _dae0_guard: Option<()>;
     if !mock_mode {
+        // QUIC socket headroom: the default 208 KiB rmem/wmem caps a
+        // ~1ms-RTT QUIC path at ~2 Gbps (setsockopt is clamped to 2×max).
+        // Raise the ceiling so the 8 MiB SO_RCVBUF/SO_SNDBUF requests in
+        // honk-outbound's marked_udp_socket actually land. Best-effort —
+        // caps, not allocations.
+        for (key, val) in [
+            ("net.core.rmem_max", "16777216"),
+            ("net.core.wmem_max", "16777216"),
+        ] {
+            if let Err(e) = set_sysctl(key, val) {
+                warn!("failed to set {}={}: {}", key, val, e);
+            }
+        }
         #[cfg(feature = "ebpf")]
         {
             let lan_ifname = resolve_interface(
@@ -429,6 +502,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         _dae0_guard = None;
     }
 
+    #[cfg(feature = "ebpf")]
+    let mut attached_ifaces: std::collections::HashMap<String, (u32, ebpf::DynamicHooks)> =
+        Default::default();
     let mut ebpf_backend: Box<dyn ebpf::EbpfBackend> = if cli.mock_ebpf {
         info!("Using mock eBPF backend");
         Box::new(ebpf::mock::MockEbpfBackend::new())
@@ -484,17 +560,65 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             )
             .await?;
 
+            let ifindex_of = |name: &str| -> Option<u32> {
+                std::fs::read_to_string(format!("/sys/class/net/{name}/ifindex"))
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok())
+            };
+            if let Some(i) = ifindex_of(&primary_lan) {
+                attached_ifaces.insert(
+                    primary_lan.clone(),
+                    (
+                        i,
+                        ebpf::DynamicHooks {
+                            ingress: true,
+                            egress: !single_homed,
+                        },
+                    ),
+                );
+            }
+            if !single_homed
+                && !primary_wan.is_empty()
+                && let Some(i) = ifindex_of(&primary_wan)
+            {
+                attached_ifaces.insert(
+                    primary_wan.clone(),
+                    (
+                        i,
+                        ebpf::DynamicHooks {
+                            ingress: true,
+                            egress: true,
+                        },
+                    ),
+                );
+            }
             for extra_lan in lan_ifnames.iter().skip(1) {
-                if let Err(e) = backend.attach_lan(extra_lan, single_homed) {
-                    warn!("Failed to attach LAN programs to {}: {}", extra_lan, e);
+                match backend.attach_lan(extra_lan, single_homed) {
+                    Ok(hooks) => {
+                        if let Some(i) = ifindex_of(extra_lan) {
+                            attached_ifaces.insert(extra_lan.clone(), (i, hooks));
+                        }
+                    }
+                    Err(e) => warn!("Failed to attach LAN programs to {}: {}", extra_lan, e),
                 }
             }
             for extra_wan in wan_ifnames.iter().skip(1) {
-                if let Err(e) = backend.attach_wan_egress(extra_wan) {
+                let egress = backend.attach_wan_egress(extra_wan);
+                if let Err(e) = &egress {
                     warn!("Failed to attach WAN egress to {}: {}", extra_wan, e);
                 }
-                if let Err(e) = backend.attach_wan_ingress(extra_wan) {
+                let ingress = backend.attach_wan_ingress(extra_wan);
+                if let Err(e) = &ingress {
                     warn!("Failed to attach WAN ingress to {}: {}", extra_wan, e);
+                }
+                let hooks = ebpf::DynamicHooks {
+                    ingress: ingress.is_ok(),
+                    egress: egress.is_ok(),
+                };
+                if (hooks.ingress || hooks.egress)
+                    && let Some(i) = ifindex_of(extra_wan)
+                {
+                    attached_ifaces.insert(extra_wan.clone(), (i, hooks));
                 }
             }
 
@@ -598,12 +722,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // Keep a concrete Arc so we can attach SharedGroupManager after the
     // control plane builds it (same cell traffic dials use).
     let dns_upstream_pool = std::sync::Arc::new(
-        dns::upstream_pool::UpstreamPool::new_with_proxy(
+        dns::upstream_pool::UpstreamPool::new_with_proxy_and_bootstrap(
             &config.dns.upstream,
             dns_router.clone(),
             Some(proxy_registry.clone()),
             config.nodes.clone(),
             config.groups.clone(),
+            honk_outbound::bootstrap::BootstrapResolver::parse(&config.global.bootstrap_resolver),
         )?
         .with_timeouts(
             std::time::Duration::from_millis(config.global.dns_resolve_timeout_ms),
@@ -624,21 +749,32 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         )
         .with_strategy(config.dns.strategy.clone())
         .with_cache_enabled(config.dns.cache.enabled)
-        .with_cache_ttl(config.dns.cache.ttl.min(u64::from(u32::MAX)) as u32),
+        .with_cache_ttl(config.dns.cache.ttl.min(u64::from(u32::MAX)) as u32)
+        .with_policy_from_config(&config.dns)?,
     );
     info!("DNS forwarder ready");
 
-    let dns_resolver = dns::DnsResolver::with_forwarder(&config.dns, dns_forwarder.clone())?;
-    info!("DNS resolver ready");
-
-    let mut control_plane = control::ControlPlane::new(
+    let mut control_plane = control::ControlPlane::new_with_upstream_pool(
         config,
         ebpf_backend,
         router,
         proxy_registry,
-        dns_resolver,
         dns_forwarder,
+        dns_upstream_pool.clone(),
     )?;
+
+    #[cfg(feature = "ebpf")]
+    let iface_watcher = if !cli.mock_ebpf {
+        ebpf::real::IfaceWatcher::spawn(
+            control_plane.ebpf_handle(),
+            control_plane.config_handle(),
+            attached_ifaces,
+        )
+    } else {
+        None
+    };
+    #[cfg(feature = "ebpf")]
+    control_plane.set_iface_watcher(iface_watcher);
 
     // Wire GroupManager into DNS outbound selection (Selector/URLTest/…).
     dns_upstream_pool.set_group_manager(Some(control_plane.group_manager()));
@@ -708,10 +844,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                         proxy_registry: control_plane.proxy_registry(),
                         mode_state,
                         secret: clash_cfg.secret.clone(),
+                        connection_pool: control_plane.connection_pool(),
                         external_ui: clash_cfg.external_ui.clone(),
                         log_tx: clash_log_tx.clone(),
-                        dns_cache: control_plane.dns_cache().await,
-                        dns_forwarder: control_plane.dns_forwarder().await,
+                        dns_service: control_plane.dns_service(),
                     });
                     tokio::spawn(clash_api::serve(state, listen));
                 }
@@ -1002,62 +1138,50 @@ impl Dae0Guard {
 impl Drop for Dae0Guard {
     fn drop(&mut self) {
         info!("Cleaning up dae0 side effects");
-        // The process never leaves the host netns (daens is only entered via
-        // scoped `with_daens_netns` switches that always switch back), so the
-        // `ip` cleanup commands below run in the right namespace directly;
-        // daens itself is removed from the host side via `ip netns delete`.
-        cleanup_dae0_interface();
+        // The recorded ifindex keeps cleanup pointed at the device THIS
+        // instance created, never at a same-named replacement.
+        cleanup_dae0_interface((self.ifindex != 0).then_some(self.ifindex));
     }
 }
 
 #[cfg(feature = "ebpf")]
 fn create_dae0_veth(lan_ifname: &str) -> anyhow::Result<Dae0Guard> {
     let _ = lan_ifname; // kept for symmetry with call site; dae0 sysctls don't need it
-    let ip = find_iproute2()?;
 
     let mut guard = Dae0Guard::new();
 
-    let _ = std::process::Command::new(&ip)
-        .args(["netns", "delete", "daens"])
-        .stderr(std::process::Stdio::null())
-        .status();
-    let _ = std::process::Command::new(&ip)
-        .args(["link", "del", "dae0"])
-        .stderr(std::process::Stdio::null())
-        .status();
-
-    let output = std::process::Command::new(&ip)
-        .args(["netns", "add", "daens"])
-        .output()?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "netns add daens: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+    // Stale-state cleanup (previous run): drop the compat bind-mount (the
+    // FD-held namespace dies with its owner process) and any leftover dae0.
+    // The singleton lock guarantees no live sibling owns these names.
+    if is_mountpoint("/run/netns/daens") {
+        let target = std::ffi::CString::new(DAENS_NS_PATH).unwrap();
+        // SAFETY: plain umount2 of a stale bind-mount.
+        unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
     }
-    info!("Created daens network namespace");
-
-    let output = std::process::Command::new(&ip)
-        .args([
-            "link", "add", "dae0", "type", "veth", "peer", "name", "dae0peer",
-        ])
-        .output()?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "failed to add dae0 veth: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+    if let Ok(idx) = netlink::ifindex_of("dae0")
+        && let Ok(mut nl) = netlink::NlSock::new()
+    {
+        let _ = nl.del_link(idx);
     }
+
+    // FD-owned namespace (unshare + held FD, compat bind-mount inside).
+    create_daens_namespace()?;
+
+    let mut nl = netlink::NlSock::new().map_err(|e| anyhow::anyhow!("netlink: {e}"))?;
+    nl.add_veth_pair("dae0", "dae0peer")
+        .map_err(|e| anyhow::anyhow!("failed to add dae0 veth pair: {e}"))?;
     info!("Created dae0/dae0peer veth pair");
-    ensure_veth_peer_name(&ip, "dae0", "dae0peer")?;
+
+    let dae0_idx = netlink::ifindex_of("dae0")?;
+    let peer_idx = netlink::ifindex_of("dae0peer")?;
 
     // Bring up dae0. dae0peer stays down until after BPF attach.
-    let _ = std::process::Command::new(&ip)
-        .args(["link", "set", "dae0", "up"])
-        .status();
-    let _ = std::process::Command::new(&ip)
-        .args(["link", "set", "dae0peer", "up"])
-        .status();
+    // These are datapath-critical: a "successful" startup without them is
+    // worse than a loud failure.
+    nl.set_link_up(dae0_idx, true)
+        .map_err(|e| anyhow::anyhow!("bring dae0 up: {e}"))?;
+    nl.set_link_up(peer_idx, true)
+        .map_err(|e| anyhow::anyhow!("bring dae0peer up: {e}"))?;
 
     for (key, val) in [
         ("net.ipv4.conf.dae0.rp_filter", "0"),
@@ -1073,363 +1197,309 @@ fn create_dae0_veth(lan_ifname: &str) -> anyhow::Result<Dae0Guard> {
     let _ = set_sysctl("net.ipv6.conf.dae0.disable_ipv6", "0");
     let _ = set_sysctl("net.ipv6.conf.dae0.forwarding", "1");
 
-    // Read dae0 ifindex before eBPF load.
-    let ifindex = std::fs::read_to_string("/sys/class/net/dae0/ifindex")
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .ok_or_else(|| anyhow::anyhow!("failed to read dae0 ifindex"))?;
-
-    guard.ifindex = ifindex;
+    guard.ifindex = dae0_idx;
 
     // Assign a link-local /32 address to the host-side dae0.  Link-local
     // addressing eliminates the need for iptables MASQUERADE and TCP MSS
     // clamping — the kernel already treats 169.254.0.0/16 traffic as local.
-    let host_addr = format!("{}/32", DAENS_HOST_IP);
-
-    // Make the dae0 address assignment idempotent: delete any stale address
-    // left behind by a previous run before adding it back.
-    let _ = std::process::Command::new(&ip)
-        .args(["addr", "del", &host_addr, "dev", "dae0"])
-        .stderr(std::process::Stdio::null())
-        .status();
-
-    let output = std::process::Command::new(&ip)
-        .args(["addr", "add", &host_addr, "dev", "dae0"])
-        .output()?;
-    if !output.status.success() {
-        warn!(
-            "dae0 addr failed (non-fatal): {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    let host_v4: std::net::Ipv4Addr = DAENS_HOST_IP.parse().unwrap();
+    // Idempotent: delete any stale address left by a previous run first.
+    let _ = nl.addr_op(false, dae0_idx, netlink::FAM_V4, &host_v4.octets(), 32);
+    nl.addr_op(true, dae0_idx, netlink::FAM_V4, &host_v4.octets(), 32)
+        .map_err(|e| anyhow::anyhow!("dae0 IPv4 address {}: {e}", host_v4))?;
 
     // Assign an IPv6 ULA address to the host-side dae0 so the daens
     // namespace can route IPv6 replies back through this veth.
-    let host_addr6 = format!("{}/64", DAENS_HOST_IPV6);
-    let _ = std::process::Command::new(&ip)
-        .args(["-6", "addr", "del", &host_addr6, "dev", "dae0"])
-        .stderr(std::process::Stdio::null())
-        .status();
-    let _ = std::process::Command::new(&ip)
-        .args(["-6", "addr", "add", &host_addr6, "dev", "dae0"])
-        .stderr(std::process::Stdio::null())
-        .status();
+    let host_v6: std::net::Ipv6Addr = DAENS_HOST_IPV6.parse().unwrap();
+    let _ = nl.addr_op(false, dae0_idx, netlink::FAM_V6, &host_v6.octets(), 64);
+    let _ = nl.addr_op(true, dae0_idx, netlink::FAM_V6, &host_v6.octets(), 64);
 
     // Enable IPv6 forwarding so daens-originated IPv6 packets reach the LAN.
-    let _ = std::process::Command::new("sysctl")
-        .args(["-w", "net.ipv6.conf.all.forwarding=1"])
-        .status();
+    let _ = set_sysctl("net.ipv6.conf.all.forwarding", "1");
 
     Ok(guard)
 }
 
 #[cfg(feature = "ebpf")]
 fn setup_daens_namespace(tproxy_mark: u32, tproxy_port: u16) -> anyhow::Result<()> {
-    let ip = find_iproute2()?;
+    let _ = tproxy_port;
+    use netlink::{FAM_V4, FAM_V6, NlSock};
 
-    // Read the host-side dae0 MAC before moving dae0peer; it is used as the
-    // L2 next-hop for the daens default route.
-    let dae0_mac = std::fs::read_to_string("/sys/class/net/dae0/address")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
+    // Host-side dae0 MAC: the L2 next-hop for the daens default route.
+    let dae0_mac = netlink::mac_of("dae0").map_err(|e| anyhow::anyhow!("read dae0 MAC: {e}"))?;
+    let dae0_idx = netlink::ifindex_of("dae0")?;
+    let peer_idx = netlink::ifindex_of("dae0peer")?;
 
     // Move dae0peer into daens (BPF programs are already attached).
-    let output = std::process::Command::new(&ip)
-        .args(["link", "set", "dae0peer", "netns", "daens"])
-        .output()?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "move dae0peer to daens: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    let mut nl = NlSock::new().map_err(|e| anyhow::anyhow!("netlink: {e}"))?;
+    nl.set_link_netns_fd(peer_idx, daens_fd()?)
+        .map_err(|e| anyhow::anyhow!("move dae0peer to daens: {e}"))?;
     info!("Moved dae0peer to daens");
 
-    // Configure daens: bring up lo and dae0peer.
-    // (lo is auto-configured by the kernel in new netns, but needs to be up)
-    for cmd in [
-        vec!["link", "set", "lo", "up"],
-        vec!["link", "set", "dae0peer", "up"],
-    ] {
-        let output = std::process::Command::new("nsenter")
-            .args(["--net=/var/run/netns/daens", "--", &ip])
-            .args(&cmd)
-            .output()?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "daens '{}' failed: {}",
-                cmd.join(" "),
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-    }
+    let host_v4: std::net::Ipv4Addr = DAENS_HOST_IP.parse().unwrap();
+    let peer_v4: std::net::Ipv4Addr = DAENS_PEER_IP.parse().unwrap();
+    let host_v6: std::net::Ipv6Addr = DAENS_HOST_IPV6.parse().unwrap();
+    let peer_v6: std::net::Ipv6Addr = DAENS_PEER_IPV6.parse().unwrap();
 
-    // In daens: add fwmark rule + route to deliver marked packets locally.
-    let mark = format!("0x{:x}/0x{:x}", tproxy_mark, tproxy_mark);
-    let nsenter_base = || {
-        let mut c = std::process::Command::new("nsenter");
-        c.args(["--net=/var/run/netns/daens", "--", &ip]);
-        c
-    };
-    for (desc, args) in [
-        (
-            "rule4",
-            vec!["rule", "add", "fwmark", mark.as_str(), "table", "100"],
-        ),
-        (
-            "route4",
-            vec![
-                "route", "add", "local", "default", "dev", "lo", "table", "100",
-            ],
-        ),
-        // IPv6 policy routing mirror: deliver fwmark-matched IPv6 packets locally.
-        (
-            "rule6",
-            vec!["-6", "rule", "add", "fwmark", mark.as_str(), "table", "100"],
-        ),
-        (
-            "route6",
-            vec![
-                "-6", "route", "add", "local", "default", "dev", "lo", "table", "100",
-            ],
-        ),
-    ] {
-        let output = nsenter_base().args(&args).output()?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "daens {} failed: {}",
-                desc,
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-    }
+    // Configure daens in one scoped switch: a netlink socket opened inside
+    // operates on the daens namespace, and /proc/sys writes hit the
+    // namespace's sysctls.
+    let peer_mac = with_daens_netns("configure daens", || {
+        use anyhow::Context as _;
+        let mut n = NlSock::new().context("daens netlink socket")?;
+        // /sys inside a scoped setns still shows the HOST's devices (the
+        // view is per-mount, not per-reader) — look links up over netlink,
+        // whose socket is bound to the namespace it was created in.
+        let (lo, _) = n.get_link("lo").context("lo in daens")?;
+        let (peer, peer_mac) = n.get_link("dae0peer").context("dae0peer in daens")?;
+        n.set_link_up(lo, true).context("lo up")?;
+        n.set_link_up(peer, true).context("dae0peer up")?;
 
-    // Read dae0peer MAC now that it lives inside daens; we need it to install
-    // a static neighbour entry on the host so return traffic can reach daens.
-    let dae0peer_mac = {
-        let output = nsenter_base().args(["link", "show", "dae0peer"]).output()?;
-        if !output.status.success() {
-            String::new()
-        } else {
-            parse_mac_from_ip_link(&String::from_utf8_lossy(&output.stdout)).unwrap_or_default()
-        }
-    };
+        // fwmark → table 100 with a local default route (v4 + v6 mirror):
+        // marked packets are delivered to daens-local sockets.
+        n.add_rule_fwmark(FAM_V4, tproxy_mark, 100)?;
+        n.add_route(
+            FAM_V4,
+            100,
+            netlink::ROUTE_LOCAL,
+            netlink::SCOPE_HOST,
+            netlink::PROTO_STATIC,
+            None,
+            None,
+            Some(lo),
+        )?;
+        n.add_rule_fwmark(FAM_V6, tproxy_mark, 100)?;
+        n.add_route(
+            FAM_V6,
+            100,
+            netlink::ROUTE_LOCAL,
+            netlink::SCOPE_HOST,
+            netlink::PROTO_STATIC,
+            None,
+            None,
+            Some(lo),
+        )?;
 
-    // Assign a link-local /32 address to dae0peer and set up routes.
-    // The link-scope route tells the kernel that 169.254.0.1 (dae0) is
-    // directly reachable at L2 via dae0peer; without it, /32 prevents the
-    // kernel from treating 169.254.0.1 as a valid nexthop.
-    let peer_addr = format!("{}/32", DAENS_PEER_IP);
-    for (desc, args) in [
-        ("addr4", vec!["addr", "add", &peer_addr, "dev", "dae0peer"]),
-        (
-            "route4-link",
-            vec![
-                "route",
-                "add",
-                DAENS_HOST_IP,
-                "dev",
-                "dae0peer",
-                "scope",
-                "link",
-            ],
-        ),
-        (
-            "route4-default",
-            vec![
-                "route",
-                "add",
-                "default",
-                "via",
-                DAENS_HOST_IP,
-                "dev",
-                "dae0peer",
-            ],
-        ),
-    ] {
-        let output = nsenter_base().args(&args).output()?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "daens {} failed: {}",
-                desc,
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-    }
+        // Link-local /32 on dae0peer. The link-scope route tells the kernel
+        // that 169.254.0.1 (dae0) is directly reachable at L2; without it,
+        // /32 prevents treating 169.254.0.1 as a valid nexthop.
+        n.addr_op(true, peer, FAM_V4, &peer_v4.octets(), 32)?;
+        n.add_route(
+            FAM_V4,
+            254,
+            netlink::ROUTE_UNICAST,
+            netlink::SCOPE_LINK,
+            netlink::PROTO_STATIC,
+            Some((&host_v4.octets(), 32)),
+            None,
+            Some(peer),
+        )?;
+        n.add_route(
+            FAM_V4,
+            254,
+            netlink::ROUTE_UNICAST,
+            netlink::SCOPE_UNIVERSE,
+            netlink::PROTO_STATIC,
+            None,
+            Some(&host_v4.octets()),
+            Some(peer),
+        )?;
 
-    // Assign an IPv6 ULA address to dae0peer and add an IPv6 default route.
-    let peer_addr6 = format!("{}/64", DAENS_PEER_IPV6);
-    for (desc, args) in [
-        (
-            "addr6",
-            vec!["-6", "addr", "add", &peer_addr6, "dev", "dae0peer"],
-        ),
-        (
-            "route6-default",
-            vec![
-                "-6",
-                "route",
-                "add",
-                "default",
-                "via",
-                DAENS_HOST_IPV6,
-                "dev",
-                "dae0peer",
-            ],
-        ),
-    ] {
-        let output = nsenter_base().args(&args).output()?;
-        if !output.status.success() {
-            warn!(
-                "daens IPv6 {} failed (non-fatal): {}",
-                desc,
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-    }
+        // IPv6 ULA on dae0peer + IPv6 default (non-fatal: v6 path degrades
+        // to v4-only rather than aborting startup).
+        let _ = n.addr_op(true, peer, FAM_V6, &peer_v6.octets(), 64);
+        let _ = n.add_route(
+            FAM_V6,
+            254,
+            netlink::ROUTE_UNICAST,
+            netlink::SCOPE_UNIVERSE,
+            netlink::PROTO_STATIC,
+            None,
+            Some(&host_v6.octets()),
+            Some(peer),
+        );
 
-    if !dae0_mac.is_empty() {
-        // IPv4 neighbour entry for dae0 (host-side gateway).
-        let output = nsenter_base()
-            .args([
-                "neigh",
-                "replace",
-                DAENS_HOST_IP,
-                "dev",
-                "dae0peer",
-                "lladdr",
-                &dae0_mac,
-                "nud",
-                "permanent",
-            ])
-            .output()?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "daens neigh replace failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        // IPv6 neighbour entry for dae0.
-        let _ = nsenter_base()
-            .args([
-                "-6",
-                "neigh",
-                "replace",
-                DAENS_HOST_IPV6,
-                "dev",
-                "dae0peer",
-                "lladdr",
-                &dae0_mac,
-                "nud",
-                "permanent",
-            ])
-            .status();
-    }
+        // Static neighbours for the host side of the veth (v4 + v6).
+        n.neigh_replace(peer, FAM_V4, &host_v4.octets(), &dae0_mac)?;
+        let _ = n.neigh_replace(peer, FAM_V6, &host_v6.octets(), &dae0_mac);
 
-    // Install a static neighbour entry on the host so replies to daens-bound
-    // connections are forwarded to the correct dae0peer MAC.
-    if !dae0peer_mac.is_empty() {
-        // IPv4 host neighbour entry.
-        let output = std::process::Command::new(&ip)
-            .args([
-                "neigh",
-                "replace",
-                DAENS_PEER_IP,
-                "dev",
-                "dae0",
-                "lladdr",
-                &dae0peer_mac,
-                "nud",
-                "permanent",
-            ])
-            .output()?;
-        if !output.status.success() {
-            warn!(
-                "host neigh replace for daens peer failed (non-fatal): {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+        // Disable rp_filter, enable accept_local/route_localnet in daens so
+        // packets with foreign source/dest addresses can be delivered locally.
+        for (key, val) in [
+            ("net.ipv4.conf.all.rp_filter", "0"),
+            ("net.ipv4.conf.all.accept_local", "1"),
+            ("net.ipv4.conf.all.route_localnet", "1"),
+            ("net.ipv4.conf.dae0peer.rp_filter", "0"),
+            ("net.ipv4.conf.dae0peer.accept_local", "1"),
+            ("net.ipv4.conf.dae0peer.route_localnet", "1"),
+            ("net.ipv4.conf.lo.accept_local", "1"),
+            ("net.ipv4.conf.lo.route_localnet", "1"),
+            ("net.ipv6.conf.all.forwarding", "1"),
+            ("net.ipv6.conf.dae0peer.forwarding", "1"),
+            ("net.ipv6.conf.dae0peer.accept_ra", "0"),
+        ] {
+            let _ = set_sysctl(key, val);
         }
-        // IPv6 host neighbour entry.
-        let _ = std::process::Command::new(&ip)
-            .args([
-                "-6",
-                "neigh",
-                "replace",
-                DAENS_PEER_IPV6,
-                "dev",
-                "dae0",
-                "lladdr",
-                &dae0peer_mac,
-                "nud",
-                "permanent",
-            ])
-            .status();
-    }
+        Ok(peer_mac)
+    })?;
+
+    // Install static neighbour entries on the host so replies to
+    // daens-bound connections are forwarded to the correct dae0peer MAC.
+    nl.neigh_replace(dae0_idx, FAM_V4, &peer_v4.octets(), &peer_mac)
+        .map_err(|e| anyhow::anyhow!("host neighbour for daens peer: {e}"))?;
+    let _ = nl.neigh_replace(dae0_idx, FAM_V6, &peer_v6.octets(), &peer_mac);
 
     // Make sure the host forwards traffic between dae0 and the LAN/WAN
     // interfaces; this is required for the SYN-ACK path back to the client.
-    let _ = std::process::Command::new("sysctl")
-        .args(["-w", "net.ipv4.ip_forward=1"])
-        .status();
+    set_sysctl("net.ipv4.ip_forward", "1")
+        .map_err(|e| anyhow::anyhow!("enable net.ipv4.ip_forward: {e}"))?;
 
-    // Disable rp_filter, enable accept_local/route_localnet in daens so
-    // packets with foreign source/dest addresses can be delivered locally.
-    for (key, val) in [
-        ("net.ipv4.conf.all.rp_filter", "0"),
-        ("net.ipv4.conf.all.accept_local", "1"),
-        ("net.ipv4.conf.all.route_localnet", "1"),
-        ("net.ipv4.conf.dae0peer.rp_filter", "0"),
-        ("net.ipv4.conf.dae0peer.accept_local", "1"),
-        ("net.ipv4.conf.dae0peer.route_localnet", "1"),
-        ("net.ipv4.conf.lo.accept_local", "1"),
-        ("net.ipv4.conf.lo.route_localnet", "1"),
-        // IPv6: enable forwarding and disable rp_filter in daens.
-        ("net.ipv6.conf.all.forwarding", "1"),
-        ("net.ipv6.conf.dae0peer.forwarding", "1"),
-        ("net.ipv6.conf.dae0peer.accept_ra", "0"),
-    ] {
-        let _ = std::process::Command::new("nsenter")
-            .args(["--net=/var/run/netns/daens", "--"])
-            .arg("sysctl")
-            .arg("-w")
-            .arg(format!("{}={}", key, val))
-            .status();
-    }
-
-    info!("Configured daens namespace (mark={})", mark);
-    let _ = tproxy_mark;
-    let _ = tproxy_port;
+    info!("Configured daens namespace (mark={:#x})", tproxy_mark);
+    DAENS_READY.store(true, std::sync::atomic::Ordering::Release);
     Ok(())
 }
 
-/// Find the iproute2 binary (Nix store, then system PATH).
-#[cfg(feature = "ebpf")]
-fn find_iproute2() -> anyhow::Result<String> {
-    // Nix store paths (prefer full iproute2 over BusyBox ip)
-    for path in [
-        "/nix/store/qbsvh4fw7lrmkqk870w4sc21kqylph42-iproute2-7.0.0/bin/ip",
-        "/nix/store/f8y3cn08mlw2cwjq05anf6sgkfyb0k8a-iproute2-7.0.0/bin/ip",
-        "/nix/store/df79h6la9hpbvd739qzam20j2p2lqnyp-iproute2-6.19.0/bin/ip",
-    ] {
-        if std::path::Path::new(path).exists() {
-            return Ok(path.to_string());
-        }
-    }
-    // System paths (Debian/VyOS/Alpine/etc.)
-    for path in ["/sbin/ip", "/usr/sbin/ip", "/usr/bin/ip", "/bin/ip"] {
-        if std::path::Path::new(path).exists() {
-            return Ok(path.to_string());
-        }
-    }
-    anyhow::bail!("iproute2 not found; install iproute2 (apt install iproute2)")
-}
-
-/// Path of the daens network-namespace handle created by `ip netns add`.
-/// Shared by `with_daens_netns` and the control plane's "is daens set up"
-/// check (mock mode never creates it).
+/// Path of the daens network-namespace bind-mount, kept for external
+/// tooling compatibility (`ip netns exec`, debug shells). The engine
+/// itself never depends on it — the namespace is FD-owned (below).
 #[cfg(target_os = "linux")]
 pub(crate) const DAENS_NS_PATH: &str = "/var/run/netns/daens";
+
+/// Runtime truth for "daens is set up", set by [`setup_daens_namespace`]
+/// on success. Socket creation must key on this, never on
+/// `DAENS_NS_PATH` existing — a leftover or failed compat mount says
+/// nothing about the datapath (a first clean deploy once bound every
+/// TPROXY listener into the host namespace because of that confusion).
+#[cfg(target_os = "linux")]
+pub(crate) static DAENS_READY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether THIS instance created the compat bind-mount at
+/// [`DAENS_NS_PATH`]. Cleanup only ever unmounts what it mounted —
+/// never a same-named mount belonging to another tool.
+#[cfg(feature = "ebpf")]
+static COMPAT_MOUNTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The engine-owned daens namespace FD, created by
+/// [`create_daens_namespace`] at startup. An open namespace FD pins the
+/// namespace for the process lifetime — no `ip netns` registry involved.
+#[cfg(feature = "ebpf")]
+static DAENS_FD: std::sync::OnceLock<std::os::unix::io::OwnedFd> = std::sync::OnceLock::new();
+
+/// Whether THIS instance mounted the tmpfs at /run/netns (the compat
+/// bind-mount's parent). Tracked separately from [`COMPAT_MOUNTED`]:
+/// cleanup unmounts the parent only when it is ours.
+#[cfg(feature = "ebpf")]
+static PARENT_TMPFS_MOUNTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Create the daens network namespace without iproute2: a throwaway
+/// thread `unshare(CLONE_NEWNET)`s, hands its `/proc/self/ns/net` FD back
+/// (the FD pins the namespace after the thread exits), and the FD is
+/// stored process-wide. For external tooling compatibility the namespace
+/// is also bind-mounted to [`DAENS_NS_PATH`] (best-effort — the engine
+/// works fine without the mount).
+#[cfg(feature = "ebpf")]
+fn create_daens_namespace() -> anyhow::Result<&'static std::os::unix::io::OwnedFd> {
+    use std::os::unix::io::OwnedFd;
+
+    if let Some(fd) = DAENS_FD.get() {
+        return Ok(fd);
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // SAFETY: unshare the network namespace of this throwaway thread.
+        if unsafe { libc::unshare(libc::CLONE_NEWNET) } != 0 {
+            let _ = tx.send(Err(std::io::Error::last_os_error()));
+            return;
+        }
+        // /proc/self/ns/net always shows the MAIN thread's namespace — the
+        // new namespace lives at the per-TASK path after unshare. (Opening
+        // /proc/self/ns/net here once returned the host ns and attached the
+        // sk_lookup hijack program host-wide — do not regress this.)
+        // SAFETY: plain syscall to learn this thread's kernel tid.
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+        let task_ns = format!("/proc/self/task/{tid}/ns/net");
+        // Best-effort compat mount: /var/run/netns/daens (iproute2 shape).
+        // The target must be a FILE — namespace handles are files, and a
+        // file bind-mount onto a directory fails with ENOTDIR. The parent
+        // is made a mountpoint (tmpfs) only if it isn't one already —
+        // crucially NOT via a self-MS_BIND, which would stack-duplicate
+        // every nsfs mount beneath it (lab ns pins included) on every
+        // engine restart.
+        let dir = std::ffi::CString::new("/var/run/netns").unwrap();
+        let target = std::ffi::CString::new(DAENS_NS_PATH).unwrap();
+        let src = std::ffi::CString::new(task_ns.clone()).unwrap();
+        let tmpfs = std::ffi::CString::new("tmpfs").unwrap();
+        let _ = std::fs::create_dir_all("/var/run/netns");
+        // /proc/mounts lists the real path (/var/run is a symlink to
+        // /run) — check the canonical path or every engine start
+        // mounts a fresh tmpfs over the registry, hiding iproute2's
+        // namespace files (the lab netns "disappears"). The tmpfs must
+        // be mounted BEFORE the target file is created, or the mount
+        // hides it and the bind below fails on a first clean deploy.
+        if !is_mountpoint("/run/netns") {
+            // SAFETY: plain mount; the target dir was just ensured.
+            let rc = unsafe {
+                libc::mount(
+                    tmpfs.as_ptr(),
+                    dir.as_ptr(),
+                    tmpfs.as_ptr(),
+                    0,
+                    std::ptr::null(),
+                )
+            };
+            if rc == 0 {
+                PARENT_TMPFS_MOUNTED.store(true, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                warn!(
+                    "tmpfs mount on /run/netns failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+        let _ = std::fs::File::create(DAENS_NS_PATH);
+        // The bind result is reported, never silently ignored — a failed
+        // compat mount leaves debug tooling unable to find daens.
+        let rc = unsafe {
+            libc::mount(
+                src.as_ptr(),
+                target.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            )
+        };
+        if rc != 0 {
+            warn!(
+                "compat bind-mount of daens failed (debug tooling degraded): {}",
+                std::io::Error::last_os_error()
+            );
+        } else {
+            COMPAT_MOUNTED.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let result = std::fs::File::open(&task_ns).map(OwnedFd::from);
+        if result.is_ok() {
+            let link = std::fs::read_link(&task_ns)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|e| format!("<readlink failed: {e}>"));
+            info!("daens FD source: {} -> {}", task_ns, link);
+        }
+        let _ = tx.send(result);
+    });
+    let fd = rx
+        .recv()
+        .map_err(|_| anyhow::anyhow!("daens creator thread died"))?
+        .map_err(|e| anyhow::anyhow!("create daens namespace: {e}"))?;
+    info!("Created daens network namespace (FD-owned)");
+    Ok(DAENS_FD.get_or_init(|| fd))
+}
+
+/// The process-wide daens FD (created on demand).
+#[cfg(feature = "ebpf")]
+pub(crate) fn daens_fd() -> anyhow::Result<&'static std::os::unix::io::OwnedFd> {
+    create_daens_namespace()
+}
 
 /// Run `f` with the calling thread temporarily switched into the `daens`
 /// network namespace, restoring the original namespace on every exit path —
@@ -1460,7 +1530,9 @@ pub(crate) fn with_daens_netns<R>(
     static DAENS_SWITCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Restores the saved network namespace on drop, so the original
-    /// namespace is regained even when `f` panics.
+    /// namespace is regained even when `f` panics. A failed restore
+    /// aborts the process — a worker left in the wrong namespace would
+    /// silently originate dials from daens forever after.
     struct RestoreNs<'a> {
         fd: std::fs::File,
         op: &'a str,
@@ -1469,25 +1541,41 @@ pub(crate) fn with_daens_netns<R>(
         fn drop(&mut self) {
             let ret = unsafe { libc::setns(self.fd.as_raw_fd(), libc::CLONE_NEWNET) };
             if ret != 0 {
-                warn!(
-                    "failed to restore original netns after '{}': {}",
+                tracing::error!(
+                    "failed to restore original netns after '{}': {} — aborting",
                     self.op,
                     std::io::Error::last_os_error()
                 );
+                std::process::abort();
             }
         }
     }
 
-    let orig_ns = std::fs::File::open("/proc/self/ns/net")
-        .map_err(|e| anyhow::anyhow!("{}: open /proc/self/ns/net: {}", op, e))?;
-    let daens_ns = std::fs::File::open(DAENS_NS_PATH)
-        .map_err(|e| anyhow::anyhow!("{}: open {}: {}", op, DAENS_NS_PATH, e))?;
-
+    // Lock FIRST: the save-and-switch is serialized before any namespace
+    // reads, so no other scoped switch can interleave.
     let _switch_guard = DAENS_SWITCH
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    if unsafe { libc::setns(daens_ns.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
+    // /proc/thread-self/ns/net is this thread's real namespace;
+    // /proc/self/ns/net always resolves to the main thread.
+    let orig_ns = std::fs::File::open("/proc/thread-self/ns/net")
+        .map_err(|e| anyhow::anyhow!("{}: open /proc/thread-self/ns/net: {}", op, e))?;
+
+    // The FD-owned namespace is the primary handle; the compat bind-mount
+    // path is the fallback (tests, mock mode, non-ebpf builds). The File
+    // must outlive the setns call — a temporary's raw fd dangles.
+    #[cfg(feature = "ebpf")]
+    let daens_raw = daens_fd()
+        .map(|fd| fd.as_raw_fd())
+        .map_err(|e| anyhow::anyhow!("{}: daens namespace unavailable: {:#}", op, e))?;
+    #[cfg(not(feature = "ebpf"))]
+    let daens_file = std::fs::File::open(DAENS_NS_PATH)
+        .map_err(|e| anyhow::anyhow!("{}: open {}: {}", op, DAENS_NS_PATH, e))?;
+    #[cfg(not(feature = "ebpf"))]
+    let daens_raw = daens_file.as_raw_fd();
+
+    if unsafe { libc::setns(daens_raw, libc::CLONE_NEWNET) } != 0 {
         anyhow::bail!("{}: setns(daens): {}", op, std::io::Error::last_os_error());
     }
     let _restore_guard = RestoreNs { fd: orig_ns, op };
@@ -1495,40 +1583,42 @@ pub(crate) fn with_daens_netns<R>(
 }
 
 #[cfg(feature = "ebpf")]
-fn cleanup_dae0_interface() {
-    let ip = find_iproute2().unwrap_or_else(|_| "ip".to_string());
+fn cleanup_dae0_interface(recorded_ifindex: Option<u32>) {
+    // Unmount the compat bind-mount only when THIS instance mounted it —
+    // a same-named mount from another tool is never ours to tear down.
+    if COMPAT_MOUNTED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        let target = std::ffi::CString::new(DAENS_NS_PATH).unwrap();
+        // SAFETY: plain umount2; errors (already unmounted) are ignored.
+        unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
+    }
+    // Same ownership rule for the parent tmpfs (child must go first).
+    if PARENT_TMPFS_MOUNTED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        let parent = std::ffi::CString::new("/run/netns").unwrap();
+        // SAFETY: plain umount2; errors (busy) are ignored.
+        unsafe { libc::umount2(parent.as_ptr(), libc::MNT_DETACH) };
+    }
+    DAENS_READY.store(false, std::sync::atomic::Ordering::Release);
+    // The FD-owned namespace dies with the process (dae0peer goes with it).
 
-    // Delete daens netns (this also removes dae0peer inside it).
-    let _ = std::process::Command::new(&ip)
-        .args(["netns", "delete", "daens"])
-        .stderr(std::process::Stdio::null())
-        .status();
-
-    // Remove dae0 and policy routing from current namespace.
-    let _ = std::process::Command::new(&ip)
-        .args(["link", "del", "dae0"])
-        .stderr(std::process::Stdio::null())
-        .status();
-    // Policy-routing rules for daens live inside the daens namespace, so they
-    // disappear with the namespace deletion above.  The commands below are only
-    // here as a safety net for stale host-namespace rules; ignore errors.
-    let _ = std::process::Command::new(&ip)
-        .args([
-            "rule",
-            "del",
-            "fwmark",
-            "0x8000000/0x8000000",
-            "table",
-            "100",
-        ])
-        .stderr(std::process::Stdio::null())
-        .status();
-    let _ = std::process::Command::new(&ip)
-        .args([
-            "route", "del", "local", "default", "dev", "lo", "table", "100",
-        ])
-        .stderr(std::process::Stdio::null())
-        .status();
+    let Ok(mut nl) = netlink::NlSock::new() else {
+        return;
+    };
+    // Delete dae0 only when it is still the device this instance created:
+    // the recorded ifindex must still match the name — an outsider's
+    // same-named recreation is left alone.
+    let victim = match recorded_ifindex {
+        Some(idx) if netlink::ifindex_of("dae0").ok() == Some(idx) => Some(idx),
+        Some(_) => None,
+        None => netlink::ifindex_of("dae0").ok(),
+    };
+    if let Some(idx) = victim {
+        let _ = nl.del_link(idx);
+    }
+    // Policy-routing rules for daens live inside the daens namespace and
+    // disappear with it; these are only a safety net for stale
+    // host-namespace rules.
+    let _ = nl.del_rule_fwmark(netlink::FAM_V4, honk_ebpf_common::TPROXY_MARK, 100);
+    let _ = nl.del_rule_fwmark(netlink::FAM_V6, honk_ebpf_common::TPROXY_MARK, 100);
 }
 
 /// Addressing for the dae0/dae0peer veth pair between the host namespace and
@@ -1560,20 +1650,6 @@ pub(crate) const DAE0_IPV6_PREFIX_HI: u64 = 0xfd00_686f_6e6b_0000;
 /// (169.254.0.0/16), as a big-endian u32.
 pub(crate) const DAE0_IPV4_NET: u32 = 0xA9FE_0000;
 
-#[cfg(feature = "ebpf")]
-fn parse_mac_from_ip_link(text: &str) -> Option<String> {
-    for line in text.lines() {
-        if let Some(idx) = line.find("link/ether") {
-            let mac_str = line[idx + 10..].split_whitespace().next().unwrap_or("");
-            if mac_str.split(':').count() == 6 {
-                return Some(mac_str.to_string());
-            }
-        }
-    }
-    None
-}
-
-#[cfg(feature = "ebpf")]
 fn set_sysctl(key: &str, value: &str) -> anyhow::Result<()> {
     // Prefer /proc/sys because the standalone `sysctl` binary may not be on
     // PATH in minimal environments (e.g. NixOS containers).
@@ -1596,46 +1672,10 @@ fn set_sysctl(key: &str, value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Rename the dae0 veth peer to `desired_peer` when it does not already
-/// exist under that name (e.g. after a stale `dae0` was recreated).
+/// Whether `path` is a mountpoint (appears in /proc/mounts).
 #[cfg(feature = "ebpf")]
-fn ensure_veth_peer_name(ip: &str, host_if: &str, desired_peer: &str) -> anyhow::Result<()> {
-    if std::fs::metadata(format!("/sys/class/net/{}", desired_peer)).is_ok() {
-        return Ok(());
-    }
-    let output = std::process::Command::new(ip)
-        .args(["link", "show", host_if])
-        .output()?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "ip link show {} failed: {}",
-            host_if,
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let peer = text
-        .lines()
-        .next()
-        .and_then(|line| {
-            let after_at = line.split('@').nth(1)?;
-            after_at.split(':').next().map(str::trim)
-        })
-        .ok_or_else(|| anyhow::anyhow!("could not parse peer name for {}", host_if))?;
-    if peer == desired_peer {
-        return Ok(());
-    }
-    let output = std::process::Command::new(ip)
-        .args(["link", "set", peer, "name", desired_peer])
-        .output()?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "failed to rename {} to {}: {}",
-            peer,
-            desired_peer,
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    info!("Renamed veth peer {} -> {}", peer, desired_peer);
-    Ok(())
+fn is_mountpoint(path: &str) -> bool {
+    std::fs::read_to_string("/proc/mounts")
+        .map(|m| m.lines().any(|l| l.split_whitespace().nth(1) == Some(path)))
+        .unwrap_or(false)
 }

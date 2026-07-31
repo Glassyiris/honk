@@ -65,9 +65,16 @@ pub(crate) async fn wrap_transport(
         return super::mux::open_stream_on(node, stream).await;
     }
     match node.transport.as_str() {
+        "" | "tcp" => Ok(stream), // raw TCP/TLS
         "ws" => wrap_ws(node, stream).await,
         "grpc" => wrap_grpc(node, stream).await,
-        _ => Ok(stream), // "tcp" or unknown: raw TCP/TLS
+        // Unknown transport must not silently degrade to raw TCP — a
+        // mistyped transport means a different protocol than intended.
+        other => anyhow::bail!(
+            "node '{}': unsupported transport '{}' (expected tcp/ws/grpc)",
+            node.name,
+            other
+        ),
     }
 }
 
@@ -95,7 +102,7 @@ pub(crate) async fn maybe_tls_wrap(
         let connector = crate::tls::build_connector(node)?;
         let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
         let tls_stream = connector.connect(&server_name, stream).await?;
-        Ok(Box::new(tls_stream))
+        Ok(Box::new(crate::tls::BatchRead::new(tls_stream)))
     } else {
         Ok(Box::new(stream))
     }
@@ -219,8 +226,12 @@ async fn wrap_grpc(
     let service = node.grpc_service.as_deref().unwrap_or("GunService");
     let path = format!("/{}/Tun", service);
     let authority = node.host().to_string();
+    // gRPC servers (sing-box) reject :scheme http over a TLS connection.
+    let scheme = if node.tls { "https" } else { "http" };
 
-    Ok(Box::new(GrpcStream::new(stream, &path, &authority).await?))
+    Ok(Box::new(
+        GrpcStream::new(stream, &path, &authority, scheme).await?,
+    ))
 }
 
 /// Minimal gRPC client that wraps a TCP/TLS stream with HTTP/2
@@ -233,11 +244,14 @@ async fn wrap_grpc(
 struct GrpcStream {
     inner: Box<dyn AsyncReadWrite>,
     stream_id: u32,
+    /// Decoded payload not yet consumed by the reader.
     read_buf: Vec<u8>,
-    #[allow(dead_code)]
-    wrote_preface: bool,
-    #[allow(dead_code)]
-    wrote_headers: bool,
+    /// Raw undecoded bytes from `inner` awaiting frame parsing; short
+    /// reads land here instead of corrupting frame alignment.
+    undecoded: Vec<u8>,
+    /// Outbound bytes not yet fully written; short writes keep the rest
+    /// queued instead of losing half a frame.
+    write_queue: std::collections::VecDeque<u8>,
 }
 
 impl std::fmt::Debug for GrpcStream {
@@ -253,24 +267,24 @@ const H2_HEADERS: u8 = 0x1;
 const H2_SETTINGS: u8 = 0x4;
 
 const H2_FLAG_END_HEADERS: u8 = 0x04;
-const H2_FLAG_END_STREAM: u8 = 0x01;
 
 impl GrpcStream {
     async fn new(
         inner: Box<dyn AsyncReadWrite>,
         path: &str,
         authority: &str,
+        scheme: &str,
     ) -> anyhow::Result<Self> {
         let mut s = Self {
             inner,
             stream_id: 1,
             read_buf: Vec::new(),
-            wrote_preface: false,
-            wrote_headers: false,
+            undecoded: Vec::new(),
+            write_queue: std::collections::VecDeque::new(),
         };
         s.send_preface().await?;
         s.send_settings().await?;
-        s.send_headers_frame(path, authority).await?;
+        s.send_headers_frame(path, authority, scheme).await?;
         Ok(s)
     }
 
@@ -278,7 +292,6 @@ impl GrpcStream {
     async fn send_preface(&mut self) -> anyhow::Result<()> {
         const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
         self.inner.write_all(PREFACE).await?;
-        self.wrote_preface = true;
         Ok(())
     }
 
@@ -300,7 +313,12 @@ impl GrpcStream {
     }
 
     /// Send a HEADERS frame to open stream 1 with gRPC pseudo-headers.
-    async fn send_headers_frame(&mut self, path: &str, authority: &str) -> anyhow::Result<()> {
+    async fn send_headers_frame(
+        &mut self,
+        path: &str,
+        authority: &str,
+        scheme: &str,
+    ) -> anyhow::Result<()> {
         let mut hpack = Vec::with_capacity(128);
 
         // :method: POST — literal header field with incremental indexing
@@ -310,10 +328,10 @@ impl GrpcStream {
         hpack.push(0x04);
         hpack.extend_from_slice(b"POST");
 
-        // :scheme: http — same pattern, static idx 6 = ":scheme"
+        // :scheme — same pattern, static idx 6 = ":scheme"
         hpack.push(0x46);
-        hpack.push(0x04);
-        hpack.extend_from_slice(b"http");
+        hpack.push(scheme.len() as u8);
+        hpack.extend_from_slice(scheme.as_bytes());
 
         // :path: <path> — static idx 4 = ":path"
         hpack.push(0x44);
@@ -346,7 +364,10 @@ impl GrpcStream {
             (payload_len >> 8) as u8,
             payload_len as u8,
             H2_HEADERS,
-            H2_FLAG_END_HEADERS | H2_FLAG_END_STREAM,
+            // gRPC is bidirectional streaming: DATA frames follow, so the
+            // HEADERS frame must NOT carry END_STREAM (servers reject
+            // writes on a client-closed stream with 400).
+            H2_FLAG_END_HEADERS,
             ((self.stream_id >> 24) & 0x7F) as u8,
             (self.stream_id >> 16) as u8,
             (self.stream_id >> 8) as u8,
@@ -356,7 +377,6 @@ impl GrpcStream {
         self.inner.write_all(&frame_header).await?;
         self.inner.write_all(&hpack).await?;
         self.inner.flush().await?;
-        self.wrote_headers = true;
         Ok(())
     }
 }
@@ -374,59 +394,109 @@ impl AsyncRead for GrpcStream {
             return Poll::Ready(Ok(()));
         }
 
-        // Read a gRPC-LP frame from inner stream, unwrapping HTTP/2
-        // DATA frames. Each gRPC frame: [1B compressed] [4B BE len] [payload].
-        let mut frame_header = [0u8; 9];
-        match Pin::new(&mut self.inner).poll_read(cx, &mut ReadBuf::new(&mut frame_header)) {
-            Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Pending => return Poll::Pending,
-        }
+        loop {
+            // Parse one complete item from the undecoded buffer. gRPC
+            // messages are assumed to fit in a single HTTP/2 DATA frame
+            // (true for the proxy handshakes this transport carries).
+            if let Some(frame) = self.try_parse_frame() {
+                match frame {
+                    ParsedFrame::Data(payload) => {
+                        let drain = payload.len().min(buf.remaining());
+                        buf.put_slice(&payload[..drain]);
+                        if drain < payload.len() {
+                            self.read_buf.extend_from_slice(&payload[drain..]);
+                        }
+                        return Poll::Ready(Ok(()));
+                    }
+                    ParsedFrame::Skipped => continue,
+                }
+            }
 
-        let _payload_len = ((frame_header[0] as u32) << 16)
-            | ((frame_header[1] as u32) << 8)
-            | (frame_header[2] as u32);
-        let frame_type = frame_header[3];
-
-        if frame_type == H2_DATA {
-            let mut grpc_hdr = [0u8; 5];
-            match Pin::new(&mut self.inner).poll_read(cx, &mut ReadBuf::new(&mut grpc_hdr)) {
-                Poll::Ready(Ok(())) => {}
+            // Need more bytes from the inner stream.
+            let mut chunk = [0u8; 4096];
+            let mut rb = ReadBuf::new(&mut chunk);
+            match Pin::new(&mut self.inner).poll_read(cx, &mut rb) {
+                Poll::Ready(Ok(())) => {
+                    if rb.filled().is_empty() {
+                        // EOF: an empty read is the AsyncRead EOF signal.
+                        return Poll::Ready(Ok(()));
+                    }
+                    self.undecoded.extend_from_slice(rb.filled());
+                }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
-            let compressed = grpc_hdr[0];
-            if compressed != 0 {
-                return Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "gRPC: compressed frames not supported",
-                )));
-            }
-            let grpc_len = u32::from_be_bytes([grpc_hdr[1], grpc_hdr[2], grpc_hdr[3], grpc_hdr[4]]);
+        }
+    }
+}
 
-            if grpc_len > 0 {
-                let mut payload = vec![0u8; grpc_len as usize];
-                match Pin::new(&mut self.inner).poll_read(cx, &mut ReadBuf::new(&mut payload)) {
-                    Poll::Ready(Ok(())) => {}
+enum ParsedFrame {
+    Data(Vec<u8>),
+    Skipped,
+}
+
+impl GrpcStream {
+    /// Parse one complete item out of `self.undecoded` if fully present.
+    /// DATA frames yield their gRPC-LP payload; every other frame type
+    /// (SETTINGS, WINDOW_UPDATE, PING, ...) is consumed and skipped.
+    fn try_parse_frame(&mut self) -> Option<ParsedFrame> {
+        if self.undecoded.len() < 9 {
+            return None;
+        }
+        let payload_len = ((self.undecoded[0] as usize) << 16)
+            | ((self.undecoded[1] as usize) << 8)
+            | self.undecoded[2] as usize;
+        let frame_type = self.undecoded[3];
+        let total = 9 + payload_len;
+        if self.undecoded.len() < total {
+            return None;
+        }
+        if frame_type != H2_DATA {
+            self.undecoded.drain(..total);
+            return Some(ParsedFrame::Skipped);
+        }
+        // DATA: [1B compressed] [4B BE len] [payload]
+        if payload_len < 5 {
+            self.undecoded.drain(..total);
+            return Some(ParsedFrame::Skipped);
+        }
+        let compressed = self.undecoded[9];
+        if compressed != 0 {
+            self.undecoded.drain(..total);
+            return Some(ParsedFrame::Skipped);
+        }
+        let grpc_len = u32::from_be_bytes([
+            self.undecoded[10],
+            self.undecoded[11],
+            self.undecoded[12],
+            self.undecoded[13],
+        ]) as usize;
+        if payload_len < 5 + grpc_len {
+            // gRPC message spans multiple DATA frames: not supported by
+            // this minimal client (see poll_read); skip the frame.
+            self.undecoded.drain(..total);
+            return Some(ParsedFrame::Skipped);
+        }
+        let payload = self.undecoded[14..9 + 5 + grpc_len].to_vec();
+        self.undecoded.drain(..total);
+        Some(ParsedFrame::Data(payload))
+    }
+
+    /// Write as much of the queued frame as possible; Pending keeps the
+    /// remainder queued for the next call.
+    fn drain_write_queue(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        while !self.write_queue.is_empty() {
+            let n = {
+                let contiguous = self.write_queue.make_contiguous();
+                match Pin::new(&mut self.inner).poll_write(cx, contiguous) {
+                    Poll::Ready(Ok(n)) => n,
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                     Poll::Pending => return Poll::Pending,
                 }
-                let drain = payload.len().min(buf.remaining());
-                buf.put_slice(&payload[..drain]);
-                if drain < payload.len() {
-                    self.read_buf.extend_from_slice(&payload[drain..]);
-                }
-                Poll::Ready(Ok(()))
-            } else {
-                Poll::Ready(Ok(()))
-            }
-        } else if frame_type == H2_SETTINGS {
-            Poll::Ready(Ok(()))
-        } else {
-            // Skip other frame types — just try again
-            cx.waker().wake_by_ref();
-            Poll::Pending
+            };
+            self.write_queue.drain(..n);
         }
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -436,40 +506,42 @@ impl AsyncWrite for GrpcStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        // Build a gRPC-LP frame: [1B uncompressed] [4B BE length] [payload]
-        let payload_len = buf.len() as u32;
-        let mut frame = Vec::with_capacity(5 + buf.len());
-        frame.push(0x00); // uncompressed
-        frame.extend_from_slice(&payload_len.to_be_bytes());
-        frame.extend_from_slice(buf);
-
-        let h2_payload_len = frame.len() as u32;
-        let h2_header: [u8; 9] = [
-            (h2_payload_len >> 16) as u8,
-            (h2_payload_len >> 8) as u8,
-            h2_payload_len as u8,
-            H2_DATA,
-            0x00, // flags
-            ((self.stream_id >> 24) & 0x7F) as u8,
-            (self.stream_id >> 16) as u8,
-            (self.stream_id >> 8) as u8,
-            self.stream_id as u8,
-        ];
-
-        match Pin::new(&mut self.inner).poll_write(cx, &h2_header) {
-            Poll::Ready(Ok(_)) => {}
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Pending => return Poll::Pending,
+        // Only one gRPC frame is queued at a time: if a previous frame is
+        // still draining, wait for it (callers write sequentially anyway).
+        if self.write_queue.is_empty() {
+            // Build a gRPC-LP frame: [1B uncompressed] [4B BE length] [payload]
+            let payload_len = buf.len() as u32;
+            let h2_len = 5 + payload_len;
+            let mut frame = Vec::with_capacity(9 + 5 + buf.len());
+            frame.extend_from_slice(&[
+                (h2_len >> 16) as u8,
+                (h2_len >> 8) as u8,
+                h2_len as u8,
+                H2_DATA,
+                0x00, // flags
+                ((self.stream_id >> 24) & 0x7F) as u8,
+                ((self.stream_id >> 16) & 0x7F) as u8,
+                ((self.stream_id >> 8) & 0x7F) as u8,
+                self.stream_id as u8,
+            ]);
+            frame.push(0x00); // uncompressed
+            frame.extend_from_slice(&payload_len.to_be_bytes());
+            frame.extend_from_slice(buf);
+            self.write_queue.extend(frame);
         }
-        match Pin::new(&mut self.inner).poll_write(cx, &frame) {
-            Poll::Ready(Ok(_)) => Poll::Ready(Ok(buf.len())),
+        match self.drain_write_queue(cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(buf.len())),
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => Poll::Pending,
         }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+        match self.drain_write_queue(cx) {
+            Poll::Ready(Ok(())) => Pin::new(&mut self.inner).poll_flush(cx),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -494,6 +566,88 @@ mod tests {
             port,
             ..Default::default()
         }
+    }
+
+    /// An inner stream that yields at most one byte per poll_read and
+    /// accepts at most one byte per poll_write — the short-IO regression
+    /// case for gRPC framing.
+    #[derive(Debug)]
+    struct DribbleStream {
+        reader: std::collections::VecDeque<u8>,
+        written: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl tokio::io::AsyncRead for DribbleStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if let Some(b) = self.reader.pop_front() {
+                buf.put_slice(&[b]);
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl tokio::io::AsyncWrite for DribbleStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if buf.is_empty() {
+                return Poll::Ready(Ok(0));
+            }
+            self.written.lock().unwrap().push(buf[0]);
+            Poll::Ready(Ok(1))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_grpc_stream_tolerates_short_reads_and_writes() {
+        // One gRPC-LP DATA frame on stream 1: [9B h2 hdr][5B grpc hdr][4B "pong"]
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&[0, 0, 9, H2_DATA, 0, 0, 0, 0, 1]);
+        wire.extend_from_slice(&[0, 0, 0, 0, 4]);
+        wire.extend_from_slice(b"pong");
+        let written = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let inner = DribbleStream {
+            reader: wire.into(),
+            written: written.clone(),
+        };
+        let mut stream = GrpcStream {
+            inner: Box::new(inner),
+            stream_id: 1,
+            read_buf: Vec::new(),
+            undecoded: Vec::new(),
+            write_queue: std::collections::VecDeque::new(),
+        };
+
+        // Read: the frame arrives one byte at a time but must decode whole.
+        let mut out = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut out)
+            .await
+            .unwrap();
+        assert_eq!(&out, b"pong");
+
+        // Write: the frame leaves one byte at a time but must be complete.
+        tokio::io::AsyncWriteExt::write_all(&mut stream, b"ping")
+            .await
+            .unwrap();
+        tokio::io::AsyncWriteExt::flush(&mut stream).await.unwrap();
+        let got = written.lock().unwrap().clone();
+        let mut want = Vec::new();
+        want.extend_from_slice(&[0, 0, 9, H2_DATA, 0, 0, 0, 0, 1]);
+        want.extend_from_slice(&[0, 0, 0, 0, 4]);
+        want.extend_from_slice(b"ping");
+        assert_eq!(got, want);
     }
 
     /// WebSocket transport: the mock server verifies the upgrade request

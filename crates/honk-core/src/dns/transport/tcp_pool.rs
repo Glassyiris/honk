@@ -2,9 +2,8 @@
 
 use std::sync::Arc;
 
+use super::{DialContext, IdlePoolState, close_idle_pool, exchange_with_retry, idle_pool_exchange};
 use parking_lot::Mutex;
-
-use super::{DialContext, exchange_with_retry, idle_pool_exchange};
 
 /// Direct or proxied pooled TCP stream.
 type PooledStream = Box<dyn crate::proxy::AsyncReadWrite>;
@@ -12,6 +11,7 @@ type PooledStream = Box<dyn crate::proxy::AsyncReadWrite>;
 /// Idle-pool plain-TCP DNS client for one upstream.
 pub struct TcpPool {
     dial: DialContext,
+    lifecycle: tokio::sync::RwLock<IdlePoolState>,
     idle: Mutex<Vec<PooledStream>>,
 }
 
@@ -19,6 +19,7 @@ impl TcpPool {
     pub fn new(dial: DialContext) -> Arc<Self> {
         Arc::new(Self {
             dial,
+            lifecycle: tokio::sync::RwLock::new(IdlePoolState::Open),
             idle: Mutex::new(Vec::new()),
         })
     }
@@ -29,6 +30,7 @@ impl TcpPool {
 
     async fn exchange_once(&self, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
         idle_pool_exchange(
+            &self.lifecycle,
             &self.idle,
             || self.dial_new(),
             raw_query,
@@ -43,5 +45,9 @@ impl TcpPool {
         } else {
             Ok(Box::new(self.dial.dial_tcp().await?))
         }
+    }
+
+    pub(crate) async fn close(&self) {
+        close_idle_pool(&self.lifecycle, &self.idle, self.dial.query_timeout).await;
     }
 }

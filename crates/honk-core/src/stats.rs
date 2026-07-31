@@ -5,6 +5,11 @@ use honk_ebpf_common::OutboundStats;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub(crate) mod dns;
+#[cfg(test)]
+pub(crate) use dns::dns_snapshot;
+pub(crate) use dns::{DnsStatEvent, record_dns_event};
+
 /// Per-outbound statistics tracked in user-space.
 #[derive(Debug, Clone, Default)]
 pub struct OutboundTracker {

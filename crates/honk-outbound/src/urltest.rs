@@ -26,6 +26,47 @@ pub const DEFAULT_URLTEST_URL: &str = "https://www.gstatic.com/generate_204";
 /// Default per-node measurement timeout.
 pub const DEFAULT_URLTEST_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Optional resolver for check-URL hosts: `(host, port) → addr`.
+/// honk-core installs the DNS-forwarder-backed resolver so delay
+/// measurements share the internal DNS stack; unset means the raw system
+/// resolver (tests, tools).
+pub type UrltestResolver = std::sync::Arc<
+    dyn Fn(
+            String,
+            u16,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<SocketAddr>> + Send>>
+        + Send
+        + Sync,
+>;
+
+static URLTEST_RESOLVER: std::sync::LazyLock<parking_lot::RwLock<Option<UrltestResolver>>> =
+    std::sync::LazyLock::new(|| parking_lot::RwLock::new(None));
+
+/// Install the resolver used for subsequent [`urltest_node`] measurements.
+pub fn set_urltest_resolver(hook: UrltestResolver) {
+    *URLTEST_RESOLVER.write() = Some(hook);
+}
+
+/// direct urltest target override, installed by honk-core alongside
+/// `AliveDialerSet::set_direct_check_addr`. Falls back to the bootstrap
+/// resolver address, then to [`crate::alive::DEFAULT_DIRECT_CHECK_ADDR`].
+/// Kept separate from the bootstrap global so measurements never race
+/// bootstrap resolver users (ECH discovery, node dials).
+static URLTEST_DIRECT_TARGET: std::sync::LazyLock<parking_lot::RwLock<Option<SocketAddr>>> =
+    std::sync::LazyLock::new(|| parking_lot::RwLock::new(None));
+
+/// Install the direct urltest target (`host:port` of the direct probe).
+pub fn set_urltest_direct_target(target: SocketAddr) {
+    *URLTEST_DIRECT_TARGET.write() = Some(target);
+}
+
+fn direct_target() -> SocketAddr {
+    URLTEST_DIRECT_TARGET
+        .read()
+        .or_else(crate::bootstrap::global_server)
+        .unwrap_or_else(|| crate::alive::DEFAULT_DIRECT_CHECK_ADDR.parse().unwrap())
+}
+
 /// Maximum concurrent node measurements inside [`urltest_group`]
 /// (matches sing-box's health check concurrency).
 pub const URLTEST_MAX_CONCURRENT: usize = 10;
@@ -55,13 +96,45 @@ pub async fn urltest_node(
     } else {
         timeout
     };
+    // direct: the check URL is chosen for proxied egress and is commonly
+    // unreachable over a direct connection (e.g. google-analytics from CN),
+    // so measure a raw connect against the bootstrap resolver instead —
+    // the same target the periodic direct probe uses. A failed exchange
+    // here previously also cleared direct's latency history (sing-box
+    // delete-on-failure), leaving dashboards with no direct delay at all.
+    if node.name == honk_config::Config::BUILTIN_DIRECT_NODE {
+        let target = direct_target();
+        let start = Instant::now();
+        tokio::time::timeout(
+            timeout,
+            crate::util::connect_marked_addr(
+                target,
+                Some(honk_ebpf_common::DAE_BYPASS_MARK),
+                timeout,
+            ),
+        )
+        .await
+        .context("direct urltest timed out")?
+        .context("direct urltest connect failed")?;
+        return Ok(start.elapsed());
+    }
     let (host, port, is_https) = parse_url_host_port(url)?;
 
-    let addr = tokio::net::lookup_host(format!("{host}:{port}"))
-        .await
-        .with_context(|| format!("failed to resolve '{host}:{port}'"))?
-        .next()
-        .ok_or_else(|| anyhow!("no address resolved for '{host}:{port}'"))?;
+    let addr = {
+        let hook = URLTEST_RESOLVER.read().clone();
+        match hook {
+            Some(hook) => hook(host.clone(), port)
+                .await
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow!("no address resolved for '{host}:{port}'"))?,
+            None => tokio::net::lookup_host(format!("{host}:{port}"))
+                .await
+                .with_context(|| format!("failed to resolve '{host}:{port}'"))?
+                .next()
+                .ok_or_else(|| anyhow!("no address resolved for '{host}:{port}'"))?,
+        }
+    };
 
     measure_head_exchange(node, handler, &host, is_https, addr, timeout).await
 }
@@ -93,6 +166,7 @@ async fn measure_head_exchange(
     let fut = async {
         let start = Instant::now();
         let proxy = handler.dial(node, addr, Some(host), timeout).await?;
+        tracing::debug!(node = %node.name, %addr, "urltest: dial established");
         let stream = proxy.stream;
 
         if is_https {
@@ -101,6 +175,11 @@ async fn measure_head_exchange(
                 .connect(host, stream)
                 .await
                 .context("TLS handshake failed")?;
+            tracing::debug!(
+                node = %node.name,
+                alpn = ?tls.ssl().selected_alpn_protocol().map(|p| String::from_utf8_lossy(p).into_owned()),
+                "urltest: TLS established"
+            );
             // The probe offers `h2,http/1.1`; speak whatever was negotiated.
             match tls.ssl().selected_alpn_protocol() {
                 Some(b"h2") => exchange_head_h2(tls, host).await?,
@@ -113,6 +192,7 @@ async fn measure_head_exchange(
             let mut stream = stream;
             exchange_head(&mut stream, host).await?;
         }
+        tracing::debug!(node = %node.name, elapsed_ms = start.elapsed().as_millis(), "urltest: exchange complete");
         Ok(start.elapsed())
     };
 
@@ -311,6 +391,40 @@ fn validate_status(buf: &[u8]) -> anyhow::Result<()> {
         return Err(anyhow!("bad status code: {}", code));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod resolver_hook_tests {
+    use super::*;
+
+    /// The installed hook is consulted before the system resolver.
+    #[tokio::test]
+    async fn hook_supplies_urltest_addresses() {
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called2 = called.clone();
+        set_urltest_resolver(std::sync::Arc::new(move |host, port| {
+            let called2 = called2.clone();
+            Box::pin(async move {
+                called2.store(true, std::sync::atomic::Ordering::Relaxed);
+                assert_eq!(host, "example.invalid");
+                assert_eq!(port, 443);
+                vec!["127.0.0.1:443".parse().unwrap()]
+            })
+        }));
+        let node = Node::default();
+        // The dial itself fails (nothing on 127.0.0.1:443) but the hook
+        // must have been consulted first.
+        let handler = crate::proxy::direct::DirectHandler::new();
+        let _ = urltest_node(
+            &node,
+            &handler,
+            "https://example.invalid/",
+            Duration::from_millis(50),
+        )
+        .await;
+        assert!(called.load(std::sync::atomic::Ordering::Relaxed));
+        *URLTEST_RESOLVER.write() = None;
+    }
 }
 
 #[cfg(test)]
@@ -550,5 +664,36 @@ mod tests {
                 None
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod direct_urltest_tests {
+    use super::*;
+
+    /// direct is measured against the direct target (a raw connect to the
+    /// bootstrap resolver address), never against the proxy check URL
+    /// through the node. Uses the dedicated injection point so the test
+    /// never races bootstrap resolver users (ECH discovery tests).
+    #[tokio::test]
+    async fn direct_urltest_uses_direct_target() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        set_urltest_direct_target(addr);
+        let node = Node {
+            name: honk_config::Config::BUILTIN_DIRECT_NODE.to_string(),
+            ..Default::default()
+        };
+        let handler = crate::proxy::direct::DirectHandler::new();
+        let latency = urltest_node(
+            &node,
+            &handler,
+            "http://unreachable.invalid",
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("direct urltest measures the direct-target connect");
+        assert!(latency < Duration::from_secs(2));
+        *URLTEST_DIRECT_TARGET.write() = None;
     }
 }

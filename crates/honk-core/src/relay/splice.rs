@@ -12,8 +12,8 @@
 //! (`TcpStream::async_io`, which re-arms readiness on `WouldBlock`, so the
 //! raw syscalls never busy-loop). When one direction sees EOF it shuts down
 //! the opposite socket's write side (half-close propagation) and the other
-//! direction drains until its own EOF, mirroring
-//! `tokio::io::copy_bidirectional` semantics.
+//! direction drains until its own EOF — bounded by [`DRAIN_DEADLINE`] so a
+//! silent peer cannot pin the relay forever.
 //!
 //! The first splice of each direction doubles as a capability probe: a
 //! failed `splice(2)` moves no bytes, so if it returns EINVAL/ENOSYS/EXDEV
@@ -211,6 +211,22 @@ async fn pump(
     }
 }
 
+/// Grace window for the surviving direction after the first EOF. A peer
+/// that received our half-close should finish draining within seconds;
+/// without a bound, a silent peer (dead node, blackholed tunnel) pins the
+/// relay task and both sockets forever — observed in production as a
+/// growing pile of CLOSE-WAIT accepted sockets.
+/// Idle budget for the surviving direction after the first EOF: it is cut
+/// only when this much time passes without any byte of progress, so a
+/// silent peer cannot pin the relay task and both sockets forever —
+/// observed in production as a growing pile of CLOSE-WAIT accepted
+/// sockets. Active transfers may outlive it freely.
+pub(crate) const DRAIN_DEADLINE: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(500)
+} else {
+    std::time::Duration::from_secs(30)
+};
+
 /// Shared engine behind [`splice_bidirectional`] and [`relay_splice`].
 async fn run(
     client: &TcpStream,
@@ -238,17 +254,57 @@ async fn run(
         Err(e) => return Err(e),
     };
 
-    let (progress_c2p, progress_p2c) = match progress {
-        Some((up, down)) => (Some(up), Some(down)),
-        None => (None, None),
+    // Byte counters double as final stats when the drain deadline cancels
+    // the surviving pump before it can return its own total.
+    let (cnt_c2p, cnt_p2c) = match &progress {
+        Some((up, down)) => (up.clone(), down.clone()),
+        None => (
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ),
     };
-    let c2p = pump(client, upstream, &pipe_c2p, staged_c2p, progress_c2p);
-    let p2c = pump(upstream, client, &pipe_p2c, staged_p2c, progress_p2c);
-    // `try_join!` cancels the surviving direction on the first error,
-    // mirroring `copy_bidirectional`. A clean EOF in one direction only
-    // half-closes the opposite socket; the join completes when both
-    // directions reach EOF.
-    tokio::try_join!(c2p, p2c).map_err(SpliceError::Io)
+    let c2p = pump(
+        client,
+        upstream,
+        &pipe_c2p,
+        staged_c2p,
+        Some(cnt_c2p.clone()),
+    );
+    let p2c = pump(
+        upstream,
+        client,
+        &pipe_p2c,
+        staged_p2c,
+        Some(cnt_p2c.clone()),
+    );
+    tokio::pin!(c2p);
+    tokio::pin!(p2c);
+
+    // The first direction to finish half-closes the other (inside pump);
+    // the survivor then drains until its own EOF or a full DRAIN_DEADLINE
+    // without progress (a slow active download is never cut). An error in
+    // either direction still cancels the whole relay, mirroring
+    // `copy_bidirectional`.
+    let c2p_first = match tokio::select! {
+        r = &mut c2p => r.map(|_| true),
+        r = &mut p2c => r.map(|_| false),
+    } {
+        Ok(b) => b,
+        Err(e) => return Err(SpliceError::Io(e)),
+    };
+    let (survivor, survivor_cnt) = if c2p_first {
+        (&mut p2c, &cnt_p2c)
+    } else {
+        (&mut c2p, &cnt_c2p)
+    };
+    match super::drain_wait(survivor, survivor_cnt).await {
+        Ok(_) => {}
+        Err(e) => return Err(SpliceError::Io(e)),
+    }
+    Ok((
+        cnt_c2p.load(Ordering::Relaxed),
+        cnt_p2c.load(Ordering::Relaxed),
+    ))
 }
 
 /// Relay two plain TCP sockets with zero-copy `splice(2)`.
@@ -258,7 +314,8 @@ async fn run(
 ///
 /// Half-close propagation: when one direction reaches EOF, the opposite
 /// socket's write side is shut down and the reverse direction drains until
-/// its own EOF before returning. Both sockets are shut down on exit.
+/// its own EOF (bounded by [`DRAIN_DEADLINE`]) before returning. Both
+/// sockets are shut down on exit.
 ///
 /// Returns `ErrorKind::Unsupported` when the kernel rejects `splice(2)` on
 /// the capability probe (before any byte is moved). Callers that still own
@@ -628,6 +685,36 @@ mod tests {
             .unwrap();
         assert_eq!(c2p, upload.len() as u64);
         assert_eq!(p2c, trailer.len() as u64);
+    }
+
+    /// A silent peer must not pin the relay forever: after the client
+    /// EOFs, the surviving direction is cut at the drain deadline.
+    #[tokio::test]
+    async fn test_splice_drain_deadline_reaps_silent_peer() {
+        let _lock = TEST_LOCK.lock().await;
+        let _state = StateGuard::new();
+
+        // Blackhole: accept and hold the socket, never read or write.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                std::mem::forget(stream);
+            }
+        });
+        let (front, relay) = spawn_splice_front(backend).await;
+
+        let mut client = TcpStream::connect(front).await.unwrap();
+        let payload = pattern(64 * 1024);
+        client.write_all(&payload).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let (c2p, _p2c) = tokio::time::timeout(std::time::Duration::from_secs(5), relay)
+            .await
+            .expect("relay pinned by silent peer")
+            .unwrap()
+            .unwrap();
+        assert_eq!(c2p, payload.len() as u64);
     }
 
     /// `relay_splice` produces the same `RelayStats` shape as the copy path.

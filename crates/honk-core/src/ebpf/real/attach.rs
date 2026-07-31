@@ -579,6 +579,7 @@ impl RealEbpfBackend {
             lan_slave_links,
             wan_slave_links,
             bridge_slave_links,
+            dynamic_links: Vec::new(),
             dae0_ingress_link: None,
             dae0peer_ingress_link: None,
             sk_lookup_link: None,
@@ -601,8 +602,14 @@ impl RealEbpfBackend {
             .program_mut(prog)
             .ok_or_else(|| anyhow::anyhow!("prog '{}' not found", prog))?
             .try_into()?;
-        p.load()
-            .map_err(|e| anyhow::anyhow!("load '{}': {}", prog, e))?;
+        // Re-attaching an interface (extra LAN/WAN, dynamic watcher) reuses
+        // the program loaded for the primary interface; only the first
+        // attach actually loads.
+        match p.load() {
+            Ok(()) => {}
+            Err(aya::programs::ProgramError::AlreadyLoaded) => {}
+            Err(e) => return Err(anyhow::anyhow!("load '{}': {}", prog, e)),
+        }
         let id = p
             .attach(iface, dir)
             .map_err(|e| anyhow::anyhow!("attach '{}': {} (raw={:?})", prog, e, e))?;
@@ -644,28 +651,35 @@ impl RealEbpfBackend {
         }
     }
 
-    /// Read the IPv4 address of an interface in big-endian u32, or 0.
+    /// Read the IPv4 address of an interface in big-endian u32, or 0
+    /// (getifaddrs — no `ip` subprocess needed).
     fn iface_ipv4(iface: &str) -> u32 {
-        let output = match std::process::Command::new("ip")
-            .args(["-4", "-o", "addr", "show", iface])
-            .output()
-        {
-            Ok(o) => o,
-            Err(_) => return 0,
-        };
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            if let Some(inet_pos) = line.find("inet ") {
-                let rest = &line[inet_pos + 5..];
-                if let Some(slash_pos) = rest.find('/') {
-                    let ip_str = &rest[..slash_pos];
-                    if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
-                        return u32::from_be_bytes(ip.octets());
-                    }
-                }
+        // SAFETY: getifaddrs allocates a linked list freed by freeifaddrs;
+        // all pointers are checked before dereference.
+        unsafe {
+            let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+            if libc::getifaddrs(&mut head) != 0 {
+                return 0;
             }
+            let mut result = 0u32;
+            let mut cur = head;
+            while !cur.is_null() {
+                let ifa = &*cur;
+                let name = std::ffi::CStr::from_ptr(ifa.ifa_name).to_string_lossy();
+                if name == iface
+                    && !ifa.ifa_addr.is_null()
+                    && (*ifa.ifa_addr).sa_family as i32 == libc::AF_INET
+                {
+                    result = (*(ifa.ifa_addr as *const libc::sockaddr_in))
+                        .sin_addr
+                        .s_addr;
+                    break;
+                }
+                cur = ifa.ifa_next;
+            }
+            libc::freeifaddrs(head);
+            result
         }
-        0
     }
 
     /// Read the kernel ifindex for an interface, or 0 if it cannot be read.
@@ -685,7 +699,7 @@ impl RealEbpfBackend {
     }
 
     /// Return the list of bond slaves for `iface` if it is a bond master.
-    fn bond_slaves(iface: &str) -> Vec<String> {
+    pub(crate) fn bond_slaves(iface: &str) -> Vec<String> {
         let path = format!("/sys/class/net/{}/bonding/slaves", iface);
         std::fs::read_to_string(&path)
             .ok()
@@ -698,7 +712,7 @@ impl RealEbpfBackend {
     }
 
     /// Return the list of bridge slaves for `iface` if it is a bridge master.
-    fn bridge_slaves(iface: &str) -> Vec<String> {
+    pub(crate) fn bridge_slaves(iface: &str) -> Vec<String> {
         let path = format!("/sys/class/net/{}/brif", iface);
         std::fs::read_dir(&path)
             .ok()
@@ -712,59 +726,129 @@ impl RealEbpfBackend {
 }
 
 impl RealEbpfBackend {
+    /// Attach one TC program and record the link under (ifindex, direction)
+    /// so it joins the detach lifecycle and dedupes later retries.
+    fn attach_tc_tracked(
+        &mut self,
+        prog: &str,
+        iface: &str,
+        dir: aya::programs::TcAttachType,
+    ) -> anyhow::Result<()> {
+        let ifindex = Self::iface_ifindex(iface);
+        let id = Self::attach_tc_at(self.bpf_mut()?, prog, iface, dir)?;
+        let p: &mut aya::programs::SchedClassifier = self
+            .bpf_mut()?
+            .program_mut(prog)
+            .ok_or_else(|| anyhow::anyhow!("{} program disappeared", prog))?
+            .try_into()?;
+        let link = p.take_link(id)?;
+        let is_egress = matches!(dir, aya::programs::TcAttachType::Egress);
+        self.dynamic_links.push((ifindex, is_egress, link));
+        Ok(())
+    }
+
+    fn dynamic_hooked(&self, ifindex: u32, is_egress: bool) -> bool {
+        self.dynamic_links
+            .iter()
+            .any(|(i, e, _)| *i == ifindex && *e == is_egress)
+    }
+
     /// Attach LAN programs to an additional interface (beyond the primary).
-    pub fn attach_lan(&mut self, ifname: &str, single_homed: bool) -> anyhow::Result<()> {
-        let bpf = self.bpf_mut()?;
+    /// Directions already hooked on this ifindex are skipped, so a retry
+    /// after a partial failure only fills the gap.
+    pub fn attach_lan(
+        &mut self,
+        ifname: &str,
+        single_homed: bool,
+    ) -> anyhow::Result<crate::ebpf::DynamicHooks> {
         let ifname = Self::bridge_interface(ifname).unwrap_or_else(|| ifname.to_string());
         info!("Attaching LAN programs to additional interface: {}", ifname);
         let _ = aya::programs::tc::qdisc_add_clsact(&ifname);
+        let ifindex = Self::iface_ifindex(&ifname);
         let (ingress_prog, egress_prog) = Self::lan_program_pair(&ifname);
-        Self::attach_tc_at(
-            bpf,
-            ingress_prog,
-            &ifname,
-            aya::programs::TcAttachType::Ingress,
-        )
-        .ok();
-        if !single_homed {
-            Self::attach_tc_at(
-                bpf,
-                egress_prog,
-                &ifname,
-                aya::programs::TcAttachType::Egress,
-            )
-            .ok();
+        let mut hooks = crate::ebpf::DynamicHooks {
+            ingress: self.dynamic_hooked(ifindex, false),
+            egress: self.dynamic_hooked(ifindex, true),
+        };
+        if !hooks.ingress {
+            self.attach_tc_tracked(ingress_prog, &ifname, aya::programs::TcAttachType::Ingress)?;
+            hooks.ingress = true;
         }
-        Ok(())
+        if !single_homed && !hooks.egress {
+            self.attach_tc_tracked(egress_prog, &ifname, aya::programs::TcAttachType::Egress)?;
+            hooks.egress = true;
+        }
+        Ok(hooks)
     }
 
     /// Attach WAN egress to an additional interface.
     pub fn attach_wan_egress(&mut self, ifname: &str) -> anyhow::Result<()> {
-        let bpf = self.bpf_mut()?;
         info!("Attaching WAN egress to additional interface: {}", ifname);
         let _ = aya::programs::tc::qdisc_add_clsact(ifname);
+        if self.dynamic_hooked(Self::iface_ifindex(ifname), true) {
+            return Ok(());
+        }
         let prog = if Self::iface_is_ethernet(ifname) {
             "wan_egress_l2"
         } else {
             "wan_egress_l3"
         };
-        Self::attach_tc_at(bpf, prog, ifname, aya::programs::TcAttachType::Egress).ok();
-        Ok(())
+        self.attach_tc_tracked(prog, ifname, aya::programs::TcAttachType::Egress)
     }
 
     /// Attach WAN ingress to an additional interface (reverse-direction
     /// conntrack updates for replies arriving from the WAN).  L2/L3 is
     /// chosen by interface type, same as `attach_wan_egress`.
     pub fn attach_wan_ingress(&mut self, ifname: &str) -> anyhow::Result<()> {
-        let bpf = self.bpf_mut()?;
         info!("Attaching WAN ingress to additional interface: {}", ifname);
         let _ = aya::programs::tc::qdisc_add_clsact(ifname);
+        if self.dynamic_hooked(Self::iface_ifindex(ifname), false) {
+            return Ok(());
+        }
         let prog = if Self::iface_is_ethernet(ifname) {
             "wan_ingress_l2"
         } else {
             "wan_ingress_l3"
         };
-        Self::attach_tc(bpf, prog, ifname).ok();
-        Ok(())
+        self.attach_tc_tracked(prog, ifname, aya::programs::TcAttachType::Ingress)
+    }
+
+    /// Attach a bridge/bond slave of a configured LAN master, mirroring the
+    /// program choices `load()` makes at startup: bridge slaves get the LAN
+    /// pair, bond slaves lan_ingress + wan_egress (both L2 on the egress —
+    /// bond/bridge slaves are ARPHRD_ETHER and see fully-framed skbs).
+    pub fn attach_slave(
+        &mut self,
+        ifname: &str,
+        role: crate::ebpf::IfaceRole,
+    ) -> anyhow::Result<crate::ebpf::DynamicHooks> {
+        info!(
+            "Attaching slave programs to additional interface: {}",
+            ifname
+        );
+        let _ = aya::programs::tc::qdisc_add_clsact(ifname);
+        let ifindex = Self::iface_ifindex(ifname);
+        let mut hooks = crate::ebpf::DynamicHooks {
+            ingress: self.dynamic_hooked(ifindex, false),
+            egress: self.dynamic_hooked(ifindex, true),
+        };
+        let ingress_prog = if Self::iface_is_ethernet(ifname) {
+            "lan_ingress_l2"
+        } else {
+            "lan_ingress_l3"
+        };
+        if !hooks.ingress {
+            self.attach_tc_tracked(ingress_prog, ifname, aya::programs::TcAttachType::Ingress)?;
+            hooks.ingress = true;
+        }
+        let egress_prog = match role {
+            crate::ebpf::IfaceRole::LanBridgeSlave => "lan_egress_l2",
+            _ => "wan_egress_l2",
+        };
+        if !hooks.egress {
+            self.attach_tc_tracked(egress_prog, ifname, aya::programs::TcAttachType::Egress)?;
+            hooks.egress = true;
+        }
+        Ok(hooks)
     }
 }

@@ -8,6 +8,20 @@ impl AliveDialerSet {
     /// proxy node, validating the status code.
     /// Falls back to raw TCP connect when no prober is set.
     pub async fn probe_node(&self, node_id: &str, timeout: Duration) -> bool {
+        // block has no liveness to measure.
+        if node_id == "block" {
+            return true;
+        }
+        // direct is measured against the bootstrap resolver (default
+        // 223.5.5.5:53) with a raw connect: the proxy check URL is chosen
+        // for proxied egress and is commonly unreachable over a direct
+        // connection (e.g. google-analytics from CN), so probing it flapped
+        // direct dead every cycle only for real traffic to revive it
+        // seconds later.
+        if node_id == "direct" {
+            let target = self.direct_check_addr.read().clone();
+            return self.probe_node_tcp(node_id, &target, timeout).await;
+        }
         let addr = self.registered.read().get(node_id).cloned();
         let Some(addr) = addr else { return false };
 
@@ -52,23 +66,12 @@ impl AliveDialerSet {
         // alone never leaves the probe without targets.
         let cached = self.check_url_ips.read().clone();
         let addrs: Vec<SocketAddr> = if cached.is_empty() {
-            // Cache miss — try one-time resolution as fallback.
-            match tokio::net::lookup_host(format!("{}:80", hostname)).await {
-                Ok(it) => {
-                    let ips = Self::merge_check_addrs(it.collect(), &check_url);
-                    *self.check_url_ips.write() = ips.clone();
-                    ips
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Health check DNS resolution failed for '{}' (node '{}'): {}",
-                        hostname,
-                        node_id,
-                        e
-                    );
-                    Self::merge_check_addrs(Vec::new(), &check_url)
-                }
-            }
+            // Cache miss — one-time resolution via the installed resolver
+            // (system lookup is the fallback inside resolve_host).
+            let resolved = self.resolve_host(&hostname, 80).await;
+            let ips = Self::merge_check_addrs(resolved, &check_url);
+            *self.check_url_ips.write() = ips.clone();
+            ips
         } else {
             cached
         };
@@ -174,6 +177,10 @@ impl AliveDialerSet {
         url: &str,
         timeout: Duration,
     ) -> bool {
+        // direct/block exemption, same rationale as probe_node.
+        if matches!(leaf, "direct" | "block") {
+            return true;
+        }
         let prober_opt = self.http_prober.read().clone();
         let Some(ref prober) = prober_opt else {
             return false;
@@ -251,14 +258,22 @@ impl AliveDialerSet {
     /// Raw TCP connect health check (fallback when no HTTP prober configured).
     async fn probe_node_tcp(&self, node_id: &str, node_addr: &str, timeout: Duration) -> bool {
         let addr = node_addr.to_string();
-        let addrs: Vec<_> = match tokio::net::lookup_host(&addr).await {
-            Ok(it) => it.collect(),
-            Err(e) => {
+        let (host, port) = match addr.rsplit_once(':') {
+            Some((h, p)) => match p.parse::<u16>() {
+                Ok(port) => (h.to_string(), port),
+                Err(_) => (addr.clone(), 80),
+            },
+            None => (addr.clone(), 80),
+        };
+        let addrs: Vec<_> = {
+            let out = self.resolve_host(&host, port).await;
+            if !out.is_empty() {
+                out
+            } else {
                 tracing::warn!(
-                    "Health check DNS resolution failed for node '{}' ({}): {}",
+                    "Health check DNS resolution failed for node '{}' ({}): system lookup failed",
                     node_id,
-                    addr,
-                    e
+                    addr
                 );
                 self.mark_dead_for(node_id, ProbeDomain::Tcp, IpVersion::V4);
                 self.mark_dead_for(node_id, ProbeDomain::Tcp, IpVersion::V6);
@@ -377,6 +392,12 @@ impl AliveDialerSet {
     /// TCP-fallback selection semantics (see
     /// [`AliveDialerSet::has_udp_state`]).
     pub async fn probe_node_udp(&self, node_id: &str, timeout: Duration) -> bool {
+        // Same exemption as probe_node: direct/block UDP liveness is
+        // traffic-driven, and the UDP check target (e.g. 8.8.8.8) is not a
+        // reliable direct-egress signal either.
+        if matches!(node_id, "direct" | "block") {
+            return true;
+        }
         // Clone the Arc out of the lock before awaiting (parking_lot guard
         // is !Send).
         let prober_opt = self.udp_prober.read().clone();

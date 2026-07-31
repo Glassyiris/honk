@@ -92,6 +92,9 @@ pub struct ControlPlane {
     dns_resolver: Arc<DnsResolver>,
     dns_controller: Arc<crate::control::dns_control::DnsController>,
     group_manager: SharedGroupManager,
+    /// Per-node runtime ownership (v3.1 phase 2A): the single owner of
+    /// every outbound's session-layer resources, keyed by Node.id.
+    runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
     stats: Arc<StatsManager>,
     drain_tracker: Arc<DrainTracker>,
     udp_pool: Arc<UdpEndpointPool>,
@@ -117,6 +120,16 @@ pub struct ControlPlane {
     /// Shared clash mode state (Rule/Global/Direct + GLOBAL selection),
     /// installed by `set_mode_state` when the clash API is enabled.
     mode_state: Option<crate::mode::SharedModeState>,
+    datapath_healthy: Arc<std::sync::atomic::AtomicBool>,
+    active_routing_plan: Arc<parking_lot::RwLock<Arc<routing_matcher::RoutingPushPlan>>>,
+    /// Interface watcher, stopped and joined before `detach_hooks` during
+    /// shutdown so it cannot re-attach hooks mid-drain.
+    #[cfg(feature = "ebpf")]
+    iface_watcher: Option<crate::ebpf::real::IfaceWatcher>,
+}
+
+fn accepts_transparent_connection(drain: &DrainTracker) -> bool {
+    !drain.should_reject()
 }
 
 impl ControlPlane {
@@ -128,6 +141,40 @@ impl ControlPlane {
         dns_resolver: DnsResolver,
         dns_forwarder: std::sync::Arc<crate::dns::forwarder::DnsForwarder>,
     ) -> anyhow::Result<Self> {
+        drop(dns_resolver);
+        let dns_router = Arc::new(crate::dns::routing::DnsRouter::new_from_dns_config(
+            &config.dns,
+        )?);
+        let dns_upstream_pool = Arc::new(
+            crate::dns::upstream_pool::UpstreamPool::new_with_proxy_and_bootstrap(
+                &config.dns.upstream,
+                dns_router,
+                Some(Arc::clone(&proxy_registry)),
+                config.nodes.clone(),
+                config.groups.clone(),
+                honk_outbound::bootstrap::BootstrapResolver::parse(
+                    &config.global.bootstrap_resolver,
+                ),
+            )?,
+        );
+        Self::new_with_upstream_pool(
+            config,
+            ebpf,
+            router,
+            proxy_registry,
+            dns_forwarder,
+            dns_upstream_pool,
+        )
+    }
+
+    pub fn new_with_upstream_pool(
+        config: Config,
+        ebpf: Box<dyn EbpfBackend>,
+        router: Router,
+        proxy_registry: std::sync::Arc<ProxyRegistry>,
+        dns_forwarder: std::sync::Arc<crate::dns::forwarder::DnsForwarder>,
+        dns_upstream_pool: Arc<crate::dns::upstream_pool::UpstreamPool>,
+    ) -> anyhow::Result<Self> {
         let (tx, rx) = mpsc::channel(256);
 
         // Create alive set for node health checking and pass it into the group
@@ -137,6 +184,14 @@ impl ControlPlane {
         let alive_set = Arc::new(
             crate::outbound::AliveDialerSet::new().with_so_mark(honk_ebpf_common::DAE_BYPASS_MARK),
         );
+        // direct is probed against the bootstrap resolver rather than the
+        // proxy check URL (which is unreachable over direct egress), so the
+        // clash API gets a real direct latency too. The urltest (on-demand
+        // delay) path shares the same target.
+        let direct_target = direct_check_addr(&config.global.bootstrap_resolver);
+        let direct_target_socket = direct_target.parse()?;
+        alive_set.set_direct_check_addr(direct_target.clone());
+        honk_outbound::urltest::set_urltest_direct_target(direct_target_socket);
         // Register health checks per the config's group membership; reload
         // re-runs the same sync via `reload_group_manager`.
         let (added, _) = sync_health_check_nodes(&alive_set, &config);
@@ -170,6 +225,16 @@ impl ControlPlane {
         // they currently select, and the tag keeps the result. The cell
         // keeps working across reloads (the manager inside is swapped).
         let group_manager = group_manager.into_shared();
+        // Per-node runtime registry (single owner of session-layer
+        // resources, keyed by Node.id). Invalid node sets (nil/duplicate
+        // UUIDs) are a fatal config error at startup.
+        let runtime_registry =
+            honk_outbound::runtime::OutboundRuntimeRegistry::build(&config.nodes)
+                .map_err(|e| anyhow::anyhow!("invalid node set: {}", e))?
+                .into_shared();
+        // Hand the registry to handlers with pooled sessions (AnyTLS);
+        // the shared cell swaps contents on reload, installed once.
+        proxy_registry.install_runtime_registry(runtime_registry.clone());
         {
             let gm_cell = group_manager.clone();
             alive_set.set_url_member_resolver(Some(Arc::new(move |group: &str| {
@@ -182,24 +247,90 @@ impl ControlPlane {
             })));
         }
 
+        let pinned_router = Arc::new(Router::new(
+            &config.routing.rules,
+            &config.routing.default_outbound,
+        )?);
+        let pinned_groups = group_manager.read().clone();
+        dns_upstream_pool.set_group_manager_snapshot(Arc::clone(&pinned_groups));
+        dns_upstream_pool.set_traffic_router_snapshot(Arc::clone(&pinned_router));
+        let policy_id = crate::dns::policy::PolicyId::from_config(&config.dns)?;
+        let initial_routing_plan = Arc::new(Self::compile_routing_plan(&config, &router)?);
+        let initial_push_result = initial_routing_plan.result();
+        let persistence = crate::dns::runtime::ProcessPersistenceHandle::new(dns_forwarder.cache());
         let ebpf_arc = Arc::new(RwLock::new(ebpf));
         let router_arc = Arc::new(RwLock::new(router));
         let config_arc = Arc::new(RwLock::new(config));
-
-        let dns_controller = Arc::new(crate::control::dns_control::DnsController::new(
-            dns_forwarder.clone(),
-            ebpf_arc.clone(),
-            router_arc.clone(),
+        let initial_runtime =
+            crate::dns::runtime::DnsRuntime::new(crate::dns::runtime::DnsRuntimeParts {
+                generation: crate::dns::runtime::RuntimeGeneration::new(0),
+                forwarder: dns_forwarder.clone(),
+                router: Arc::clone(&pinned_router),
+                group_manager: pinned_groups,
+                policy_id,
+                routing_projection: Arc::new(crate::dns::runtime::RoutingProjectionSnapshot::new(
+                    0,
+                    pinned_router,
+                    initial_push_result.domain_bitmaps,
+                )),
+                cache: dns_forwarder.cache(),
+                persistence,
+                transport: dns_upstream_pool,
+            });
+        let runtime_provider = Arc::new(crate::dns::runtime::DnsServiceProvider::new(
+            initial_runtime,
         ));
+        let dns_service = crate::dns::DnsService::with_provider(Arc::clone(&runtime_provider));
+        let dns_resolver = Arc::new(DnsResolver::with_service(dns_service.clone()));
+
+        let dns_controller = Arc::new(
+            crate::control::dns_control::DnsController::new_with_service(
+                dns_service,
+                ebpf_arc.clone(),
+            ),
+        );
+        // Health-check name resolution shares honk's own DNS forwarder
+        // (routing / cache / serve-stale, and always the *current* forwarder
+        // across reloads) instead of the raw system resolver; bootstrap DNS
+        // stays for node hostnames and startup. The same hook backs the
+        // urltest (clash delay) measurements.
+        {
+            let controller = dns_controller.clone();
+            type HookFn = dyn Fn(
+                    String,
+                    u16,
+                ) -> std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Vec<std::net::SocketAddr>> + Send>,
+                > + Send
+                + Sync;
+            let make_hook =
+                move |controller: std::sync::Arc<crate::control::dns_control::DnsController>| {
+                    let hook: Arc<HookFn> = Arc::new(move |host: String, port: u16| {
+                        let controller = controller.clone();
+                        Box::pin(async move {
+                            controller
+                                .resolve_domain(&host)
+                                .await
+                                .into_iter()
+                                .map(|ip| std::net::SocketAddr::new(ip, port))
+                                .collect()
+                        })
+                    });
+                    hook
+                };
+            alive_set.set_resolver(make_hook(controller.clone()));
+            honk_outbound::urltest::set_urltest_resolver(make_hook(controller));
+        }
 
         let control_plane = Self {
             config: config_arc,
             ebpf: ebpf_arc,
             router: router_arc,
             proxy_registry,
-            dns_resolver: Arc::new(dns_resolver),
+            dns_resolver,
             dns_controller,
             group_manager,
+            runtime_registry,
             stats: Arc::new(StatsManager::new()),
             drain_tracker: Arc::new(DrainTracker::new()),
             udp_pool: Arc::new(UdpEndpointPool::new()),
@@ -215,6 +346,10 @@ impl ControlPlane {
             concurrency_limit: Arc::new(tokio::sync::Semaphore::new(1024)),
             background_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             mode_state: None,
+            datapath_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            active_routing_plan: Arc::new(parking_lot::RwLock::new(initial_routing_plan)),
+            #[cfg(feature = "ebpf")]
+            iface_watcher: None,
         };
 
         // interrupt_connections: when a group's selected node changes, close
@@ -312,11 +447,18 @@ impl ControlPlane {
         // not immediately re-persisted.
         if cache_cfg.store_dns {
             let dns_cache = self.dns_controller.cache().await;
-            let restored = crate::dns::persist::restore_dns_cache(&db, &dns_cache).await;
-            if restored > 0 {
-                info!("cache.db: restored {} persisted DNS answer(s)", restored);
-            }
             let persister = crate::dns::persist::DnsCachePersister::spawn(db.clone());
+            let policy = {
+                let config = self.config.read().await;
+                crate::dns::policy::PolicyId::from_config(&config.dns).ok()
+            };
+            match persister.restore_cache(&dns_cache, policy).await {
+                Ok(restored) if restored > 0 => {
+                    info!("cache.db: restored {} persisted DNS answer(s)", restored);
+                }
+                Ok(_) => {}
+                Err(error) => warn!(%error, "cache.db DNS restore failed"),
+            }
             dns_cache.lock().await.set_persister(Some(persister));
         }
 
@@ -339,8 +481,26 @@ impl ControlPlane {
         self.config.clone()
     }
 
+    /// Shared backend cell, used by the interface watcher for dynamic attach.
+    pub fn ebpf_handle(&self) -> Arc<RwLock<Box<dyn EbpfBackend>>> {
+        self.ebpf.clone()
+    }
+
+    /// Hand the interface watcher to the control plane so shutdown can stop
+    /// it before detaching hooks.
+    #[cfg(feature = "ebpf")]
+    pub fn set_iface_watcher(&mut self, watcher: Option<crate::ebpf::real::IfaceWatcher>) {
+        self.iface_watcher = watcher;
+    }
+
     pub fn stats_handle(&self) -> Arc<StatsManager> {
         self.stats.clone()
+    }
+
+    /// Shared connection pool (bare TCP + ready streams) for the clash
+    /// API's pool metrics.
+    pub fn connection_pool(&self) -> Arc<ConnectionPool> {
+        self.connection_pool.clone()
     }
 
     pub fn alive_set(&self) -> Arc<crate::outbound::AliveDialerSet> {
@@ -365,20 +525,22 @@ impl ControlPlane {
         self.proxy_registry.clone()
     }
 
-    /// Shared handle to the DNS response cache (used by the clash API
-    /// `/cache/dns/flush` endpoint).
-    pub async fn dns_cache(&self) -> Arc<tokio::sync::Mutex<crate::dns::cache::DnsCache>> {
-        self.dns_controller.cache().await
+    /// Shared per-node runtime registry (session-layer ownership).
+    pub fn runtime_registry(&self) -> honk_outbound::runtime::SharedRuntimeRegistry {
+        self.runtime_registry.clone()
     }
 
-    /// Shared handle to the DNS forwarder (used by the clash API
-    /// `/dns/query` endpoint).
-    pub async fn dns_forwarder(&self) -> crate::dns::forwarder::DnsForwarder {
-        self.dns_controller.forwarder().await
+    pub fn dns_service(&self) -> crate::dns::DnsService {
+        self.dns_controller.dns_service()
     }
 
     pub fn command_sender(&self) -> mpsc::Sender<ControlCommand> {
         self.command_tx.clone()
+    }
+
+    pub fn is_datapath_healthy(&self) -> bool {
+        self.datapath_healthy
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub async fn run(&mut self) -> anyhow::Result<()> {
@@ -437,24 +599,18 @@ impl ControlPlane {
         let tcp6_listener = tcp6_listener;
         let udp6_socket = udp6_socket.map(Arc::new);
 
-        let routing_pushed = {
-            let config = self.config.read().await;
-            let router = self.router.read().await;
+        {
+            let plan = self.active_routing_plan.read().clone();
             let mut ebpf = self.ebpf.write().await;
-            match Self::push_routing_to_ebpf(&config, &router, &mut ebpf) {
-                Ok(_) => true,
+            match routing_matcher::RoutingMatcherBuilder::push_plan(ebpf.as_mut(), &plan) {
+                Ok(_) => {
+                    routing_matcher::RoutingMatcherBuilder::activate_projection(&plan);
+                }
                 Err(e) => {
                     warn!("Failed to push routing to eBPF (non-fatal): {}", e);
-                    false
                 }
             }
-        };
-        if routing_pushed {
-            // Rebuild learned domain→IP routes with the new rule bitmaps.
-            // No-op on first start (nothing learned yet).
-            self.dns_controller.rebuild_domain_routes().await;
         }
-
         {
             let mut tasks = self.background_tasks.lock().await;
 
@@ -504,10 +660,6 @@ impl ControlPlane {
 
             tasks.push(crate::control::tcp_sniff::spawn_sniff_neg_cache_janitor(
                 self.tcp_sniff_neg_cache.clone(),
-            ));
-
-            tasks.push(crate::control::dns_control::spawn_dns_workers(
-                &self.dns_controller,
             ));
         }
 
@@ -563,9 +715,26 @@ impl ControlPlane {
             {
                 let dns_raw = {
                     let c = self.config.read().await;
-                    c.global.udp_check_dns.first().cloned()
+                    c.global.udp_check_dns.clone()
                 };
-                let dns_target = resolve_udp_check_target(dns_raw).await;
+                let dns_target = resolve_udp_check_target(
+                    &dns_raw,
+                    Some({
+                        let controller = self.dns_controller.clone();
+                        Arc::new(move |host: String, port: u16| {
+                            let controller = controller.clone();
+                            Box::pin(async move {
+                                controller
+                                    .resolve_domain(&host)
+                                    .await
+                                    .into_iter()
+                                    .map(|ip| std::net::SocketAddr::new(ip, port))
+                                    .collect()
+                            })
+                        })
+                    }),
+                )
+                .await;
                 alive_set.set_udp_probe(Arc::new(ProxyUdpProber::new(
                     self.config.clone(),
                     self.proxy_registry.clone(),
@@ -749,7 +918,7 @@ impl ControlPlane {
                             if let Err(e) = set_so_mark_zero(stream.as_raw_fd()) {
                                 warn!("Failed to clear SO_MARK on accepted socket from {}: {}", addr, e);
                             }
-                            if drain.should_reject() {
+                            if !accepts_transparent_connection(&drain) {
                                 debug!("Rejecting new connection from {} (draining)", addr);
                                 continue;
                             }
@@ -800,7 +969,7 @@ impl ControlPlane {
                             if let Err(e) = set_so_mark_zero(stream.as_raw_fd()) {
                                 warn!("Failed to clear SO_MARK on accepted socket from {}: {}", addr, e);
                             }
-                            if drain.should_reject() {
+                            if !accepts_transparent_connection(&drain) {
                                 debug!("Rejecting new connection from {} (draining)", addr);
                                 continue;
                             }
@@ -833,7 +1002,7 @@ impl ControlPlane {
                 recv_result = recv_from_with_orig_dst(&udp4_socket, &mut udp4_buf) => {
                     match recv_result {
                         Ok((n, src_addr, original_dst)) => {
-                            if drain.should_reject() { continue; }
+                            if !accepts_transparent_connection(&drain) { continue; }
                             // Fast path: the datagram belongs to an established
                             // endpoint — forward it inline from the receive
                             // buffer (no spawn, no heap copy, no sniffer).
@@ -841,16 +1010,18 @@ impl ControlPlane {
                                 continue;
                             }
                             let data = bytes::Bytes::copy_from_slice(&udp4_buf[..n]);
-                            let permit = self.concurrency_limit.clone().try_acquire_owned();
+                            // At capacity, drop the datagram instead of
+                            // queueing a task that waits on the semaphore —
+                            // UDP tolerates loss; unbounded pending tasks do not.
+                            let Ok(permit) = self.concurrency_limit.clone().try_acquire_owned()
+                            else {
+                                continue;
+                            };
                             let handle = self.spawn_handle();
                             let sock = udp4_socket.clone();
                             let drain = drain.clone();
-                            let limit = self.concurrency_limit.clone();
                             tokio::spawn(async move {
-                                let _permit = match permit {
-                                    Ok(p) => Some(p),
-                                    Err(_) => limit.acquire_owned().await.ok(),
-                                };
+                                let _permit = permit;
                                 let _guard = ConnectionGuard::new(drain);
                                 if let Err(e) = handle.serve_udp_connection(sock, data, src_addr, original_dst).await {
                                     warn!("Error handling UDP from {} (orig {}): {}", src_addr, original_dst, e);
@@ -870,7 +1041,7 @@ impl ControlPlane {
                 } => {
                     match recv6_result {
                         Ok((n, src_addr, original_dst)) => {
-                            if drain.should_reject() { continue; }
+                            if !accepts_transparent_connection(&drain) { continue; }
                             // Fast path: the datagram belongs to an established
                             // endpoint — forward it inline from the receive
                             // buffer (no spawn, no heap copy, no sniffer).
@@ -878,16 +1049,17 @@ impl ControlPlane {
                                 continue;
                             }
                             let data = bytes::Bytes::copy_from_slice(&udp6_buf[..n]);
-                            let permit = self.concurrency_limit.clone().try_acquire_owned();
+                            // Same as the v4 path: drop instead of queueing
+                            // a pending task when at capacity.
+                            let Ok(permit) = self.concurrency_limit.clone().try_acquire_owned()
+                            else {
+                                continue;
+                            };
                             let handle = self.spawn_handle();
                             let sock = udp6_socket.clone().expect("udp6_socket present");
                             let drain = drain.clone();
-                            let limit = self.concurrency_limit.clone();
                             tokio::spawn(async move {
-                                let _permit = match permit {
-                                    Ok(p) => Some(p),
-                                    Err(_) => limit.acquire_owned().await.ok(),
-                                };
+                                let _permit = permit;
                                 let _guard = ConnectionGuard::new(drain);
                                 if let Err(e) = handle.serve_udp_connection(sock, data, src_addr, original_dst).await {
                                     warn!("Error handling UDPv6 from {} (orig {}): {}", src_addr, original_dst, e);
@@ -934,6 +1106,12 @@ impl ControlPlane {
                                     handle.abort();
                                 }
                             }
+                            // Stop the interface watcher first: it shares the
+                            // backend and could re-attach hooks mid-drain.
+                            #[cfg(feature = "ebpf")]
+                            if let Some(watcher) = self.iface_watcher.take() {
+                                watcher.shutdown().await;
+                            }
                             // Detach BPF hooks immediately to restore network connectivity
                             // before draining connections (matches Go dae behaviour).
                             let mut ebpf = ebpf.write().await;
@@ -949,6 +1127,14 @@ impl ControlPlane {
             }
         }
 
+        self.dns_controller.shutdown().await;
+        let dns_cache = self.dns_controller.cache().await;
+        let persistence = dns_cache.lock().await.persistence();
+        if let Some(persistence) = persistence
+            && let Err(error) = persistence.shutdown().await
+        {
+            warn!(%error, "DNS persistence shutdown failed");
+        }
         ebpf.write().await.cleanup().await?;
         info!("Control plane stopped");
         Ok(())
@@ -974,12 +1160,10 @@ impl ControlPlane {
         }
     }
 
-    /// Push compiled routing rules to eBPF MatchSet arrays.
-    fn push_routing_to_ebpf(
+    fn compile_routing_plan(
         config: &Config,
         router: &Router,
-        ebpf: &mut Box<dyn EbpfBackend>,
-    ) -> anyhow::Result<routing_matcher::RoutingPushResult> {
+    ) -> anyhow::Result<routing_matcher::RoutingPushPlan> {
         let mut outbound_name_to_id = std::collections::HashMap::new();
         outbound_name_to_id.insert("direct".into(), OutboundIndex::Direct as u8);
         outbound_name_to_id.insert("block".into(), OutboundIndex::Block as u8);
@@ -996,19 +1180,25 @@ impl ControlPlane {
             .parse::<DialMode>()
             .ok()
             .unwrap_or(DialMode::DomainPlusPlus);
-        let push_result = routing_matcher::RoutingMatcherBuilder::build_and_push(
-            ebpf.as_mut(),
+        routing_matcher::RoutingMatcherBuilder::compile(
             router.compiled_routes(),
             &outbound_name_to_id,
             fallback_outbound,
             dial_mode,
-        )?;
+        )
+    }
+}
 
-        info!(
-            "eBPF routing rules pushed ({} rules, {} domain bitmaps)",
-            router.route_count(),
-            push_result.domain_bitmaps.len()
-        );
-        Ok(push_result)
+/// direct probe target: the configured `bootstrap_resolver` (scheme
+/// stripped), falling back to the built-in default when unset/invalid.
+/// The bootstrap resolver is a plain directly-reachable DNS server, which
+/// is exactly what a direct-egress health probe should measure.
+pub(crate) fn direct_check_addr(bootstrap_resolver: &str) -> String {
+    let s = bootstrap_resolver.trim();
+    let s = s.split_once("://").map(|(_, rest)| rest).unwrap_or(s);
+    if s.parse::<std::net::SocketAddr>().is_ok() {
+        s.to_string()
+    } else {
+        crate::outbound::DEFAULT_DIRECT_CHECK_ADDR.to_string()
     }
 }

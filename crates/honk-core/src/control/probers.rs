@@ -65,8 +65,18 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                     .map_err(|_| "config lock busy".to_string())?;
                 std::time::Duration::from_millis(config.global.connect_timeout_ms)
             };
+            // Proxy nodes dial the check URL by domain: the node's egress
+            // resolver answers it, which both proves the real user path and
+            // sidesteps local DNS poisoning (a poisoned system answer turns
+            // every check into an "empty HTTP response" from a black hole).
+            // `direct` keeps the pre-resolved IP — its reality IS local DNS.
+            let domain = if node.name == "direct" {
+                None
+            } else {
+                url_host(&check_url)
+            };
             let proxy = handler
-                .dial(&node, addr, None, connect_timeout)
+                .dial(&node, addr, domain.as_deref(), connect_timeout)
                 .await
                 .map_err(|e| format!("dial failed: {}", e))?;
 
@@ -78,6 +88,21 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
             Ok(elapsed)
         })
     }
+}
+
+/// Bare host part of a check URL (`http://host[:port]/path` → `host`).
+fn url_host(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let host_port = rest.split('/').next()?;
+    let host = host_port.split(':').next()?;
+    if host.is_empty() {
+        return None;
+    }
+    // An IP literal is not a domain to dial by name.
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    Some(host.to_string())
 }
 
 impl ProxyHttpProber {
@@ -211,24 +236,23 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
             };
 
             let start = std::time::Instant::now();
-            let proxy = handler
-                .dial_udp(&node, dns_target, None, connect_timeout)
+            let transport = handler
+                .dial_udp_transport(&node, dns_target, None, connect_timeout)
                 .await
                 .map_err(|e| format!("UDP dial failed: {}", e))?;
 
             // One minimal DNS query; any well-formed answer proves the
             // node's UDP path round-trips end to end.
             let query = build_dns_probe_query();
-            proxy
-                .socket
-                .send_to(&query, proxy.relay_addr)
+            transport
+                .send_packet(&query)
                 .await
                 .map_err(|e| format!("UDP probe send failed: {}", e))?;
 
             let mut buf = [0u8; 512];
-            let n = tokio::time::timeout(
+            let (n, _src) = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                proxy.socket.recv(&mut buf),
+                transport.recv_packet(&mut buf),
             )
             .await
             .map_err(|_| "UDP probe recv timeout".to_string())?
@@ -256,41 +280,60 @@ pub(super) fn build_dns_probe_query() -> Vec<u8> {
 }
 
 /// Resolve the UDP health check target from `global.udp_check_dns`
-/// (first entry, dae semantics: `host[:port]`, default port 53).
-/// Falls back to [`DEFAULT_UDP_CHECK_DNS`] when unset or unresolvable.
-pub(super) async fn resolve_udp_check_target(raw: Option<String>) -> SocketAddr {
+/// (dae semantics: `host[:port]` list, default port 53).
+///
+/// IP literals in the list are preferred over domain entries: the system
+/// resolver can return DNS-poisoned answers for popular check domains
+/// (e.g. dns.google), which would send every probe to a black hole.
+/// Falls back to [`DEFAULT_UDP_CHECK_DNS`] when the list is empty or no
+/// entry resolves.
+pub(super) async fn resolve_udp_check_target(
+    raws: &[String],
+    resolver: Option<crate::outbound::ResolveHook>,
+) -> SocketAddr {
     let fallback: SocketAddr = DEFAULT_UDP_CHECK_DNS
         .parse()
         .expect("hardcoded default UDP check DNS address");
-    let Some(raw) = raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
-        return fallback;
-    };
-    // Full socket address (v4, or bracketed v6 with port).
-    if let Ok(addr) = raw.parse::<SocketAddr>() {
-        return addr;
-    }
-    // Bare IP literal → default DNS port.
-    if let Ok(ip) = raw.parse::<std::net::IpAddr>() {
-        return SocketAddr::new(ip, 53);
-    }
-    // host[:port] → resolve via system DNS.
-    let (host, port) = match raw.rsplit_once(':') {
-        Some((h, p)) => match p.parse::<u16>() {
-            Ok(port) => (h, port),
-            Err(_) => (raw.as_str(), 53),
-        },
-        None => (raw.as_str(), 53),
-    };
-    match tokio::net::lookup_host((host, port)).await {
-        Ok(mut addrs) => addrs.next().unwrap_or(fallback),
-        Err(e) => {
-            warn!(
-                "Failed to resolve udp_check_dns '{}': {}; using {}",
-                raw, e, fallback
-            );
-            fallback
+    let entries: Vec<&str> = raws
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    // First pass: literal IPs (full socket addr or bare IP with default port).
+    for raw in &entries {
+        if let Ok(addr) = raw.parse::<SocketAddr>() {
+            return addr;
+        }
+        if let Ok(ip) = raw.parse::<std::net::IpAddr>() {
+            return SocketAddr::new(ip, 53);
         }
     }
+    // Second pass: first domain entry, resolved through the internal DNS
+    // resolver when installed (system lookup otherwise).
+    if let Some(raw) = entries.first() {
+        let (host, port) = match raw.rsplit_once(':') {
+            Some((h, p)) => match p.parse::<u16>() {
+                Ok(port) => (h, port),
+                Err(_) => (*raw, 53),
+            },
+            None => (*raw, 53),
+        };
+        let addrs = match resolver {
+            Some(resolve) => resolve(host.to_string(), port).await,
+            None => tokio::net::lookup_host((host, port))
+                .await
+                .map(|it| it.collect())
+                .unwrap_or_default(),
+        };
+        if let Some(addr) = addrs.into_iter().next() {
+            return addr;
+        }
+        warn!(
+            "Failed to resolve udp_check_dns '{}'; using {}",
+            raw, fallback
+        );
+    }
+    fallback
 }
 
 /// Returns true if `ip` belongs to honk's own dae0 veth subnets.

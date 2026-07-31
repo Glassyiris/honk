@@ -84,11 +84,33 @@ pub struct RoutingPushResult {
 /// LPM trie (a lookup returns the longest-prefix *match*, not the exact
 /// entry) and therefore overwrites values; without this merge the last rule
 /// pushed for a shared prefix would clobber the earlier ones.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct LpmPushPlan {
     dest: HashMap<[u8; 20], (LpmKey, DomainRouting)>,
     source: HashMap<[u8; 20], (LpmKey, DomainRouting)>,
     mac: HashMap<[u8; 20], (LpmKey, DomainRouting)>,
+}
+
+/// Immutable, fully compiled inputs for one routing generation.
+///
+/// Keeping this value alive with the active generation lets a failed reload
+/// replay the exact bytes that were previously accepted, without rebuilding
+/// from mutable configuration or geo databases.
+#[derive(Debug, Clone)]
+pub struct RoutingPushPlan {
+    match_sets: Vec<MatchSet>,
+    domain_bitmaps: HashMap<String, Vec<DomainRouting>>,
+    lpm: LpmPushPlan,
+    group_bitmaps: RoutingGroupBitmaps,
+}
+
+impl RoutingPushPlan {
+    pub fn result(&self) -> RoutingPushResult {
+        RoutingPushResult {
+            match_set_count: self.match_sets.len(),
+            domain_bitmaps: self.domain_bitmaps.clone(),
+        }
+    }
 }
 
 impl LpmPushPlan {
@@ -123,22 +145,17 @@ impl LpmPushPlan {
     /// replaced in place.  Failures are logged and skipped: a missing LPM
     /// entry degrades the affected rule to a non-match (traffic falls
     /// through to later rules), it cannot drop packets.
-    fn apply(&self, ebpf: &mut dyn EbpfBackend) {
+    fn apply(&self, ebpf: &mut dyn EbpfBackend) -> anyhow::Result<()> {
         for (key, bitmap) in self.dest.values() {
-            if let Err(e) = ebpf.add_dest_lpm_bitmap(key, bitmap) {
-                warn!("dest LPM push failed (non-fatal): {}", e);
-            }
+            ebpf.add_dest_lpm_bitmap(key, bitmap)?;
         }
         for (key, bitmap) in self.source.values() {
-            if let Err(e) = ebpf.add_source_lpm_bitmap(key, bitmap) {
-                warn!("source LPM push failed (non-fatal): {}", e);
-            }
+            ebpf.add_source_lpm_bitmap(key, bitmap)?;
         }
         for (key, bitmap) in self.mac.values() {
-            if let Err(e) = ebpf.add_mac_lpm_bitmap(key, bitmap) {
-                warn!("mac LPM push failed (non-fatal): {}", e);
-            }
+            ebpf.add_mac_lpm_bitmap(key, bitmap)?;
         }
+        Ok(())
     }
 
     /// Raw key sets of this plan, used to prune entries of previous
@@ -194,13 +211,12 @@ impl RoutingMatcherBuilder {
     /// evaluates a mix of old and new rules and a flow may briefly be
     /// misrouted.  It is never SHOT-dropped, though: the count always
     /// covers a complete, valid ruleset.
-    pub fn build_and_push(
-        ebpf: &mut dyn EbpfBackend,
+    pub fn compile(
         routes: &[CompiledRoute],
         outbound_name_to_id: &HashMap<String, u8>,
         fallback_outbound: &str,
         dial_mode: DialMode,
-    ) -> anyhow::Result<RoutingPushResult> {
+    ) -> anyhow::Result<RoutingPushPlan> {
         // Phase 1: compile the ruleset without touching any BPF map.
         let mut routes: Vec<&CompiledRoute> = routes.iter().collect();
         routes.sort_by_key(|r| r.priority);
@@ -315,37 +331,48 @@ impl RoutingMatcherBuilder {
             Self::ALL_GROUPS,
         );
 
-        // Phase 2: publish.  MatchSets first, then the LPM entries they
-        // reference, then the routing meta block (group bitmaps + rule
-        // count) as the atomic switch.
-        ebpf.set_routing_rules(&match_sets)?;
-        lpm_plan.apply(ebpf);
-        ebpf.set_routing_meta(match_sets.len() as u32, &group_bitmaps)?;
+        Ok(RoutingPushPlan {
+            match_sets,
+            domain_bitmaps,
+            lpm: lpm_plan,
+            group_bitmaps,
+        })
+    }
+
+    pub fn push_plan(
+        ebpf: &mut dyn EbpfBackend,
+        plan: &RoutingPushPlan,
+    ) -> anyhow::Result<RoutingPushResult> {
+        ebpf.set_routing_rules(&plan.match_sets)?;
+        plan.lpm.apply(ebpf)?;
+        ebpf.set_routing_meta(plan.match_sets.len() as u32, &plan.group_bitmaps)?;
+        ebpf.clear_routing_map_tail(plan.match_sets.len() as u32)?;
+        ebpf.prune_lpm_entries(&plan.lpm.keep_set())?;
 
         info!(
             "Pushed {} MatchSet entries to eBPF ROUTING_MAP",
-            match_sets.len()
+            plan.match_sets.len()
         );
+        Ok(plan.result())
+    }
 
-        // Phase 3: post-switch cleanup (best effort).  Failures here only
-        // leave inert entries that the next push will overwrite or prune.
-        if let Err(e) = ebpf.clear_routing_map_tail(match_sets.len() as u32) {
-            warn!("clear_routing_map_tail failed (non-fatal): {}", e);
-        }
-        if let Err(e) = ebpf.prune_lpm_entries(&lpm_plan.keep_set()) {
-            warn!("prune_lpm_entries failed (non-fatal): {}", e);
-        }
+    pub fn build_and_push(
+        ebpf: &mut dyn EbpfBackend,
+        routes: &[CompiledRoute],
+        outbound_name_to_id: &HashMap<String, u8>,
+        fallback_outbound: &str,
+        dial_mode: DialMode,
+    ) -> anyhow::Result<RoutingPushResult> {
+        let plan = Self::compile(routes, outbound_name_to_id, fallback_outbound, dial_mode)?;
+        let result = Self::push_plan(ebpf, &plan)?;
+        Self::activate_projection(&plan);
+        Ok(result)
+    }
 
-        {
-            let mut db = DOMAIN_BITMAPS.write();
-            *db = domain_bitmaps.clone();
-            DOMAIN_BITMAPS_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
-        }
-
-        Ok(RoutingPushResult {
-            match_set_count: match_sets.len(),
-            domain_bitmaps,
-        })
+    pub fn activate_projection(plan: &RoutingPushPlan) {
+        let mut domain_bitmaps = DOMAIN_BITMAPS.write();
+        *domain_bitmaps = plan.domain_bitmaps.clone();
+        DOMAIN_BITMAPS_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     /// Split one `CompiledRoute` into type-specific MatchSets and record the
@@ -929,6 +956,7 @@ fn parse_mac_to_bytes(s: &str) -> Option<[u8; 6]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ebpf::RoutingPushPhase;
     use crate::ebpf::mock::MockEbpfBackend;
 
     #[test]
@@ -940,6 +968,112 @@ mod tests {
             RoutingMatcherBuilder::protocol_mask(&["tcp".into(), "udp".into()]),
             3
         );
+    }
+
+    #[test]
+    fn every_routing_push_phase_surfaces_an_injected_failure() {
+        let dest_nets: Vec<ipnet::IpNet> = vec!["10.0.0.0/8".parse().unwrap()];
+        let source_nets: Vec<ipnet::IpNet> = vec!["192.168.0.0/16".parse().unwrap()];
+        let cases = [
+            (RoutingPushPhase::Rules, make_route("rules", "direct")),
+            (
+                RoutingPushPhase::DestinationLpm,
+                CompiledRoute {
+                    ip_nets: dest_nets.clone(),
+                    ip_trie: crate::routing::BinaryLpmTrie::from_nets(&dest_nets),
+                    ..make_route("dest", "direct")
+                },
+            ),
+            (
+                RoutingPushPhase::SourceLpm,
+                CompiledRoute {
+                    source_ip_nets: source_nets.clone(),
+                    source_ip_trie: crate::routing::BinaryLpmTrie::from_nets(&source_nets),
+                    ..make_route("source", "direct")
+                },
+            ),
+            (
+                RoutingPushPhase::MacLpm,
+                CompiledRoute {
+                    mac_addresses: vec!["aa:bb:cc:dd:ee:ff".into()],
+                    ..make_route("mac", "direct")
+                },
+            ),
+            (RoutingPushPhase::Meta, make_route("meta", "direct")),
+            (
+                RoutingPushPhase::ClearTail,
+                make_route("clear-tail", "direct"),
+            ),
+            (RoutingPushPhase::PruneLpm, make_route("prune", "direct")),
+        ];
+        let outbound_map = HashMap::from([("direct".to_string(), OutboundIndex::Direct as u8)]);
+
+        for (phase, route) in cases {
+            let mut backend = MockEbpfBackend::new();
+            backend.fail_next_routing_phase(phase);
+            let result = RoutingMatcherBuilder::build_and_push(
+                &mut backend,
+                &[route],
+                &outbound_map,
+                "direct",
+                DialMode::Ip,
+            );
+            assert!(result.is_err(), "{phase:?} fault was not surfaced");
+        }
+    }
+
+    #[test]
+    fn every_failed_phase_replays_the_exact_active_plan_count_last() {
+        let old_dest: Vec<ipnet::IpNet> = vec!["10.0.0.0/8".parse().unwrap()];
+        let old_source: Vec<ipnet::IpNet> = vec!["192.168.0.0/16".parse().unwrap()];
+        let old_route = CompiledRoute {
+            ip_nets: old_dest.clone(),
+            ip_trie: crate::routing::BinaryLpmTrie::from_nets(&old_dest),
+            source_ip_nets: old_source.clone(),
+            source_ip_trie: crate::routing::BinaryLpmTrie::from_nets(&old_source),
+            mac_addresses: vec!["aa:bb:cc:dd:ee:ff".into()],
+            ..make_route("old", "direct")
+        };
+        let outbound_map = HashMap::from([("direct".to_string(), OutboundIndex::Direct as u8)]);
+        let old_plan =
+            RoutingMatcherBuilder::compile(&[old_route], &outbound_map, "direct", DialMode::Ip)
+                .unwrap();
+        let new_dest: Vec<ipnet::IpNet> = vec!["172.16.0.0/12".parse().unwrap()];
+        let new_source: Vec<ipnet::IpNet> = vec!["100.64.0.0/10".parse().unwrap()];
+        let new_route = CompiledRoute {
+            ip_nets: new_dest.clone(),
+            ip_trie: crate::routing::BinaryLpmTrie::from_nets(&new_dest),
+            source_ip_nets: new_source.clone(),
+            source_ip_trie: crate::routing::BinaryLpmTrie::from_nets(&new_source),
+            mac_addresses: vec!["11:22:33:44:55:66".into()],
+            ..make_route("new", "direct")
+        };
+        let new_plan =
+            RoutingMatcherBuilder::compile(&[new_route], &outbound_map, "direct", DialMode::Ip)
+                .unwrap();
+
+        for phase in [
+            RoutingPushPhase::Rules,
+            RoutingPushPhase::DestinationLpm,
+            RoutingPushPhase::SourceLpm,
+            RoutingPushPhase::MacLpm,
+            RoutingPushPhase::Meta,
+            RoutingPushPhase::ClearTail,
+            RoutingPushPhase::PruneLpm,
+        ] {
+            let mut backend = MockEbpfBackend::new();
+            RoutingMatcherBuilder::push_plan(&mut backend, &old_plan).unwrap();
+            let accepted = backend.routing_snapshot();
+            backend.fail_next_routing_phase(phase);
+            assert!(RoutingMatcherBuilder::push_plan(&mut backend, &new_plan).is_err());
+            RoutingMatcherBuilder::push_plan(&mut backend, &old_plan).unwrap();
+            assert_eq!(backend.routing_snapshot(), accepted, "{phase:?}");
+            assert_eq!(
+                backend.routing_meta_write_order.last(),
+                Some(&0),
+                "{phase:?}"
+            );
+        }
     }
 
     #[test]

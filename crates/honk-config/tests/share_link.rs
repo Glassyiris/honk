@@ -93,7 +93,8 @@ fn test_trojan_go_grpc_query() {
         "trojan-go://pw@example.com:443?type=grpc&serviceName=myService&allowInsecure=1#trojan-grpc",
     )
     .unwrap();
-    assert_eq!(node.protocol, NodeProtocol::Trojan);
+    // trojan-go is its own protocol (smux-style mux), not plain trojan.
+    assert_eq!(node.protocol, NodeProtocol::TrojanGo);
     assert_eq!(node.transport, "grpc");
     assert_eq!(node.grpc_service.as_deref(), Some("myService"));
     assert!(node.skip_cert_verify);
@@ -493,9 +494,41 @@ fn test_ech_query_params() {
     let node = Node::from_share_link("tuic://u:p@example.com:443/?ech=1").unwrap();
     assert!(node.ech_enabled);
     assert!(node.ech_config.is_none());
+}
+
+#[test]
+fn test_tuic_window_params() {
+    let node = Node::from_share_link(
+        "tuic://u:p@example.com:443/?initStreamReceiveWindow=4194304&initConnReceiveWindow=16777216",
+    )
+    .unwrap();
+    assert_eq!(node.tuic_init_stream_recv_window, Some(4194304));
+    assert_eq!(node.tuic_init_conn_recv_window, Some(16777216));
+    // Unset by default.
+    let node = Node::from_share_link("tuic://u:p@example.com:443").unwrap();
+    assert_eq!(node.tuic_init_stream_recv_window, None);
 
     // No ECH params: disabled.
     let node = Node::from_share_link("trojan://pass@example.com:443").unwrap();
     assert!(!node.ech_enabled);
     assert!(node.ech_config.is_none());
+}
+
+#[test]
+fn test_tuic_alpn_and_congestion_params() {
+    let node = Node::from_share_link(
+        "tuic://d4d633d1-e9db-44dc-a458-fc6fe81beba4:d4d633d1-e9db-44dc-a458-fc6fe81beba4@[2a03:4000:37:a0f:48d0:aff:fe96:e75b]:37618/?congestion_control=bbr&alpn=h3&insecure=1",
+    )
+    .unwrap();
+    assert_eq!(node.tuic_alpn.as_deref(), Some("h3"));
+    assert_eq!(node.tuic_congestion.as_deref(), Some("bbr"));
+
+    // Comma-separated ALPN list is preserved verbatim.
+    let node = Node::from_share_link("tuic://u:p@example.com:443/?alpn=h3,h3-29").unwrap();
+    assert_eq!(node.tuic_alpn.as_deref(), Some("h3,h3-29"));
+
+    // Unset by default.
+    let node = Node::from_share_link("tuic://u:p@example.com:443").unwrap();
+    assert_eq!(node.tuic_alpn, None);
+    assert_eq!(node.tuic_congestion, None);
 }

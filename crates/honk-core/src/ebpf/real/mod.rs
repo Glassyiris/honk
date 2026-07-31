@@ -64,6 +64,12 @@ pub struct RealEbpfBackend {
     /// do not see forwarded L2 traffic on their TC hooks, so we attach the LAN
     /// programs to each slave veth instead.
     bridge_slave_links: Vec<aya::programs::tc::SchedClassifierLink>,
+    /// Links installed by dynamic attach (extra startup interfaces and the
+    /// interface watcher), keyed by (ifindex, is_egress).  Keeping them here
+    /// serves three purposes: the fd stays alive until `detach_hooks`, the
+    /// watcher can drop dead links when a device vanishes, and the (ifindex,
+    /// direction) pair dedupes retries after a partial failure.
+    dynamic_links: Vec<(u32, bool, aya::programs::tc::SchedClassifierLink)>,
     dae0_ingress_link: Option<aya::programs::tc::SchedClassifierLink>,
     dae0peer_ingress_link: Option<aya::programs::tc::SchedClassifierLink>,
     sk_lookup_link: Option<aya::programs::sk_lookup::SkLookupLink>,
@@ -112,9 +118,11 @@ impl RealEbpfBackend {
 
 mod attach;
 mod events;
+mod iface_watch;
 mod syscall;
 
 pub use events::*;
+pub use iface_watch::IfaceWatcher;
 pub use syscall::*;
 
 fn conn_key(outbound: u8, domain: u32, ipver: u32) -> u32 {
@@ -306,6 +314,34 @@ impl RealEbpfBackend {
 
 #[async_trait]
 impl EbpfBackend for RealEbpfBackend {
+    fn attach_dynamic_interface(
+        &mut self,
+        ifname: &str,
+        role: super::IfaceRole,
+        single_homed: bool,
+    ) -> anyhow::Result<super::DynamicHooks> {
+        match role {
+            super::IfaceRole::Lan => self.attach_lan(ifname, single_homed),
+            super::IfaceRole::Wan => {
+                self.attach_wan_egress(ifname)?;
+                self.attach_wan_ingress(ifname)?;
+                Ok(super::DynamicHooks {
+                    ingress: true,
+                    egress: true,
+                })
+            }
+            super::IfaceRole::LanBridgeSlave | super::IfaceRole::LanBondSlave => {
+                self.attach_slave(ifname, role)
+            }
+        }
+    }
+
+    fn forget_dynamic_interface(&mut self, ifindex: u32) {
+        // Dropping the links detaches nothing (the device is already gone);
+        // it only releases the fds and the dedup state.
+        self.dynamic_links.retain(|(i, _, _)| *i != ifindex);
+    }
+
     fn set_param(&mut self, _key: ParamKey, _value: u32) -> anyhow::Result<()> {
         // The Rust eBPF code uses Global<DaeParam> instead of PARAM_MAP.
         // All parameters are set via inject() which writes to the global.
@@ -426,18 +462,28 @@ impl EbpfBackend for RealEbpfBackend {
         &mut self,
         ip_key: &LpmKey,
         bitmap: &DomainRouting,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), super::DomainRouteWriteError> {
         // Overwrite (not OR) so bitmaps from previous rule generations are
         // fully replaced.  Key is the 16-byte IP data, as in add_domain_ip_bitmap.
         let key_bytes = unsafe { as_bytes(&ip_key.data) };
-        bpf_hash_insert(self.bpf_mut()?, "DOMAIN_ROUTING_MAP", key_bytes, unsafe {
+        let bpf = self
+            .bpf_mut()
+            .map_err(super::DomainRouteWriteError::Other)?;
+        bpf_hash_insert_domain(bpf, "DOMAIN_ROUTING_MAP", key_bytes, unsafe {
             as_bytes(bitmap)
         })
     }
 
-    fn remove_domain_ip_bitmap(&mut self, ip_key: &LpmKey) -> anyhow::Result<()> {
+    fn remove_domain_ip_bitmap(
+        &mut self,
+        ip_key: &LpmKey,
+    ) -> Result<(), super::DomainRouteWriteError> {
         let key_bytes = unsafe { as_bytes(&ip_key.data) };
-        bpf_hash_delete(self.bpf_mut()?, "DOMAIN_ROUTING_MAP", key_bytes)
+        let bpf = self
+            .bpf_mut()
+            .map_err(super::DomainRouteWriteError::Other)?;
+        bpf_hash_delete(bpf, "DOMAIN_ROUTING_MAP", key_bytes)
+            .map_err(super::DomainRouteWriteError::Other)
     }
 
     fn add_ip_route(&mut self, prefix: &str, outbound: OutboundIndex) -> anyhow::Result<()> {
@@ -490,9 +536,6 @@ impl EbpfBackend for RealEbpfBackend {
     }
 
     fn clear_routing_map_tail(&mut self, start: u32) -> anyhow::Result<()> {
-        // Best-effort post-commit cleanup: the slots above `start` are already
-        // inactive (the rule count switched first), so individual failures only
-        // leave inert entries that the next push will overwrite or zero again.
         let count = MAX_MATCH_SET_LEN.saturating_sub(start);
         if count == 0 {
             return Ok(());
@@ -509,11 +552,11 @@ impl EbpfBackend for RealEbpfBackend {
         ) {
             Ok(true) => return Ok(()),
             Ok(false) => {}
-            Err(e) => debug!("update_batch(ROUTING_MAP) tail clear failed: {}", e),
+            Err(e) => return Err(e),
         }
         let d = MatchSet::default();
         for i in start..MAX_MATCH_SET_LEN {
-            let _ = self.array_set("ROUTING_MAP", i, &d);
+            self.array_set("ROUTING_MAP", i, &d)?;
         }
         Ok(())
     }
@@ -533,7 +576,7 @@ impl EbpfBackend for RealEbpfBackend {
                     raw.copy_from_slice(&kb[..20]);
                 }
                 if !keys.contains(&raw) {
-                    let _ = bpf_hash_delete(self.bpf_mut()?, map_name, &kb);
+                    bpf_hash_delete(self.bpf_mut()?, map_name, &kb)?;
                 }
             }
         }
@@ -622,6 +665,26 @@ impl EbpfBackend for RealEbpfBackend {
 
     fn conn_state_snapshot(&self, out: &mut Vec<(TuplesKey, ConnState)>) -> anyhow::Result<()> {
         self.map_snapshot("CONN_STATE_MAP", out)
+    }
+
+    fn conn_state_for_each_chunk(
+        &self,
+        chunk_size: usize,
+        visit: &mut crate::ebpf::ConnStateChunkVisitor<'_>,
+    ) -> anyhow::Result<()> {
+        let bpf = self.bpf()?;
+        // Stream chunks straight from the kernel when LOOKUP_BATCH is
+        // available; otherwise fall back to the snapshot-based default.
+        if syscall::bpf_lookup_batch_scan_cb(bpf, &self.cap_lookup_batch, "CONN_STATE_MAP", visit)?
+        {
+            return Ok(());
+        }
+        let mut entries = Vec::new();
+        self.map_snapshot("CONN_STATE_MAP", &mut entries)?;
+        for chunk in entries.chunks(chunk_size.max(1)) {
+            visit(chunk);
+        }
+        Ok(())
     }
 
     fn conn_state_remove_batch(&mut self, keys: &[TuplesKey]) -> anyhow::Result<()> {
@@ -781,6 +844,7 @@ impl EbpfBackend for RealEbpfBackend {
         self.lan_slave_links.clear();
         self.wan_slave_links.clear();
         self.bridge_slave_links.clear();
+        self.dynamic_links.clear();
         self.dae0_ingress_link = None;
         self.dae0peer_ingress_link = None;
         self.sk_lookup_link = None;
@@ -884,8 +948,10 @@ impl EbpfBackend for RealEbpfBackend {
         // startup), so proxy-bound packets are assigned to them in their own
         // namespace.  The link handle persists after switching back.
         crate::with_daens_netns("attach tproxy_sk_lookup", move || {
-            let netns = std::fs::File::open("/var/run/netns/daens")
-                .map_err(|e| anyhow::anyhow!("open daens netns: {}", e))?;
+            // FD-owned namespace handle (dup so the OnceLock FD stays put).
+            let netns = crate::daens_fd()?
+                .try_clone()
+                .map_err(|e| anyhow::anyhow!("dup daens fd: {e}"))?;
             let p: &mut aya::programs::SkLookup = self
                 .bpf_mut()?
                 .program_mut("tproxy_sk_lookup")

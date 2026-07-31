@@ -21,27 +21,26 @@
 //! - Keep-alive: QUIC keep-alive every 5s (`dialer.go:58`); there is no
 //!   application-level heartbeat command.
 
-use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context as _, anyhow};
 use async_trait::async_trait;
 use honk_config::node::Node;
 use honk_config::types::NodeProtocol;
-use parking_lot::Mutex;
 use tracing::debug;
 
-use crate::quic::{QuicBiStream, QuicClient};
+use crate::quic::{
+    ClientCache, QuicClient, QuicConnState, now_secs, recv_read_exact as read_exact,
+};
 
 use super::addr::SocksAddr as JuiceAddr;
-use super::{ProxyHandler, ProxyStream, UdpProxySocket};
+use super::{PacketTransport, ProxyHandler, ProxyStream, UdpProxySocket};
 
 const JUICITY_VERSION: u8 = 0x00;
-const CMD_AUTHENTICATE: u8 = 0x00;
 
 const NETWORK_TCP: u8 = 0x01;
 const NETWORK_UDP: u8 = 0x03;
@@ -51,23 +50,11 @@ const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 /// Close the shared QUIC connection after this long without any open stream.
 const CONN_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Grace period after sending AUTHENTICATE for the server to reject bad
-/// credentials by closing the connection.
-const AUTH_GRACE: Duration = Duration::from_millis(150);
+/// credentials by closing the connection. Zero (tuic parity): bad
+/// credentials fail the first stream open an RTT later instead.
+const AUTH_GRACE: Duration = Duration::ZERO;
 /// Tear down a UDP session bridge after this long without traffic.
 const UDP_BRIDGE_IDLE: Duration = Duration::from_secs(90);
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-async fn read_exact(recv: &mut quinn::RecvStream, buf: &mut [u8]) -> io::Result<()> {
-    recv.read_exact(buf)
-        .await
-        .map_err(|e| io::Error::new(io::ErrorKind::UnexpectedEof, e))
-}
 
 /// Read one inbound UDP frame (`[metadata][len u16][payload]`); the address
 /// is returned alongside the payload for completeness but relayed sessions
@@ -94,6 +81,16 @@ struct JuicityConnState {
     last_activity: Arc<AtomicU64>,
 }
 
+impl QuicConnState for JuicityConnState {
+    fn touch(&self) {
+        self.last_activity.store(now_secs(), Ordering::Relaxed);
+    }
+
+    fn open_counter(&self) -> &Arc<AtomicUsize> {
+        &self.open
+    }
+}
+
 impl JuicityConnState {
     fn new(conn: quinn::Connection, auth_stream: quinn::SendStream) -> Self {
         let state = Self {
@@ -102,32 +99,15 @@ impl JuicityConnState {
             open: Arc::new(AtomicUsize::new(0)),
             last_activity: Arc::new(AtomicU64::new(now_secs())),
         };
-        let open = Arc::downgrade(&state.open);
-        let last_activity = Arc::downgrade(&state.last_activity);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(KEEP_ALIVE_INTERVAL);
-            interval.tick().await;
-            loop {
-                interval.tick().await;
-                if conn.close_reason().is_some() {
-                    break;
-                }
-                let (Some(open), Some(last)) = (open.upgrade(), last_activity.upgrade()) else {
-                    conn.close(quinn::VarInt::from_u32(0), b"state dropped");
-                    break;
-                };
-                let idle = now_secs().saturating_sub(last.load(Ordering::Relaxed));
-                if open.load(Ordering::Relaxed) == 0 && idle > CONN_IDLE_TIMEOUT.as_secs() {
-                    conn.close(quinn::VarInt::from_u32(0), b"idle");
-                    break;
-                }
-            }
-        });
+        crate::quic::spawn_conn_reaper(
+            conn,
+            Arc::downgrade(&state.open),
+            Arc::downgrade(&state.last_activity),
+            KEEP_ALIVE_INTERVAL,
+            CONN_IDLE_TIMEOUT,
+            None,
+        );
         state
-    }
-
-    fn touch(&self) {
-        self.last_activity.store(now_secs(), Ordering::Relaxed);
     }
 }
 
@@ -146,58 +126,34 @@ impl JuicityClient {
         let password = self.password.clone();
         self.quic
             .connection_with(connect_timeout, move |conn| async move {
-                let auth_stream = authenticate(&conn, &uuid, &password).await?;
+                let auth_stream = crate::quic::exporter_auth(
+                    &conn,
+                    &uuid,
+                    &password,
+                    JUICITY_VERSION,
+                    false,
+                    AUTH_GRACE,
+                )
+                .await?;
                 Ok(JuicityConnState::new(conn, auth_stream))
             })
             .await
     }
 }
 
-/// Juicity authenticate: same TUIC exporter token, version byte 0x00
-/// (`client.go:122-141`). Returns the still-open auth stream.
-async fn authenticate(
-    conn: &quinn::Connection,
-    uuid: &[u8; 16],
-    password: &str,
-) -> anyhow::Result<quinn::SendStream> {
-    let mut token = [0u8; 32];
-    conn.export_keying_material(&mut token, uuid, password.as_bytes())
-        .map_err(|e| anyhow!("Juicity: TLS keying material export failed: {e:?}"))?;
-    let mut auth = Vec::with_capacity(2 + 16 + 32);
-    auth.push(JUICITY_VERSION);
-    auth.push(CMD_AUTHENTICATE);
-    auth.extend_from_slice(uuid);
-    auth.extend_from_slice(&token);
-    let mut stream = conn
-        .open_uni()
-        .await
-        .context("Juicity: open authenticate stream")?;
-    stream
-        .write_all(&auth)
-        .await
-        .context("Juicity: send authenticate")?;
-    // Bad credentials are signalled by the server closing the connection;
-    // give it a brief grace period to do so (no protocol-level auth ack).
-    tokio::select! {
-        e = conn.closed() => Err(anyhow!("Juicity: connection closed during authentication: {e}")),
-        _ = tokio::time::sleep(AUTH_GRACE) => Ok(stream),
-    }
+/// Juicity proxy handler. Stateless except its per-server client cache
+/// (owned per handler instance — never process-global).
+#[derive(Debug, Default, Clone)]
+pub struct JuicityHandler {
+    clients: ClientCache<JuicityClient>,
 }
-
-/// Juicity proxy handler.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct JuicityHandler;
-
-/// Shared Juicity clients keyed by server + credentials (anytls pool parity).
-static CLIENTS: LazyLock<Mutex<HashMap<String, Arc<JuicityClient>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 impl JuicityHandler {
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 
-    async fn client_for(node: &Node) -> anyhow::Result<Arc<JuicityClient>> {
+    async fn client_for(&self, node: &Node) -> anyhow::Result<Arc<JuicityClient>> {
         let uuid_str = node
             .juicity_uuid
             .as_deref()
@@ -212,41 +168,40 @@ impl JuicityHandler {
             .unwrap_or("")
             .to_string();
         let key = format!(
-            "{}|{}|{}|{}|{}|{}",
+            "{}:{}|{}|{}|{}",
             node.host(),
             node.port,
-            uuid_str,
-            password,
+            crate::quic::key_fingerprint(&[uuid_str, &password]),
             node.sni.as_deref().unwrap_or(""),
             node.skip_cert_verify
         );
-        if let Some(client) = CLIENTS.lock().get(&key) {
-            return Ok(Arc::clone(client));
-        }
-        // Build outside the lock: client_config is async (ECH discovery).
         let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
-        // Upstream juicity (Go and juicity-rs) defaults to BBR on the client
-        // when no congestion_control is configured.
-        let config = crate::quic::client_config(
-            node,
-            &[b"h3"],
-            crate::quic::QuicClientOptions {
-                keep_alive: Some(KEEP_ALIVE_INTERVAL),
-                ..crate::quic::QuicClientOptions::with_congestion(Some("bbr"))
-            },
-        )
-        .await?;
-        let client = Arc::new(JuicityClient {
-            quic: QuicClient::new(node.host().to_string(), node.port, server_name, config),
-            uuid: *uuid.as_bytes(),
-            password,
-        });
-        // Another task may have won the race — reuse theirs.
-        let mut clients = CLIENTS.lock();
-        Ok(clients
-            .entry(key)
-            .or_insert_with(|| Arc::clone(&client))
-            .clone())
+        crate::quic::cached_client(&self.clients, key, || async move {
+            // Upstream juicity (Go and juicity-rs) defaults to BBR on the client
+            // when no congestion_control is configured.
+            let config = crate::quic::client_config(
+                node,
+                &[b"h3"],
+                crate::quic::QuicClientOptions {
+                    keep_alive: Some(KEEP_ALIVE_INTERVAL),
+                    max_udp_payload_size: node.quic_mtu,
+                    // Same receive-window rationale as hy2/tuic: quinn's
+                    // 1.25 MiB stream default caps downloads around 2 Gbps
+                    // on a LAN.
+                    stream_receive_window: Some(8 << 20),
+                    conn_receive_window: Some(32 << 20),
+                    ..crate::quic::QuicClientOptions::with_congestion(Some("bbr"))
+                },
+            )
+            .await?;
+            Ok(Arc::new(JuicityClient {
+                quic: QuicClient::new(node.host().to_string(), node.port, server_name, config)
+                    .with_max_udp_payload_size(node.quic_mtu.unwrap_or(1252)),
+                uuid: *uuid.as_bytes(),
+                password,
+            }))
+        })
+        .await
     }
 
     /// Open a bi stream and write the juicity request header
@@ -280,35 +235,28 @@ impl ProxyHandler for JuicityHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let client = Self::client_for(node).await?;
+        let client = self.client_for(node).await?;
         let addr = JuiceAddr::new(target, target_domain);
-        let mut last_err: Option<anyhow::Error> = None;
-        // Retry once with a fresh connection when the stream open fails on a
-        // half-dead cached connection.
-        for attempt in 0..2 {
-            let (conn, state) = client.connection(connect_timeout).await?;
-            state.touch();
-            match Self::open_stream(&conn, NETWORK_TCP, &addr).await {
-                Ok((send, recv)) => {
-                    state.open.fetch_add(1, Ordering::Relaxed);
-                    let open = Arc::clone(&state.open);
-                    let stream = QuicBiStream::new(send, recv).with_on_drop(move || {
-                        open.fetch_sub(1, Ordering::Relaxed);
-                    });
-                    return Ok(ProxyStream {
-                        stream: Box::new(stream),
-                        target_addr: target,
-                        target_domain: target_domain.map(str::to_string),
-                    });
-                }
-                Err(e) => {
-                    debug!("Juicity: stream open failed (attempt {attempt}): {e}");
-                    client.quic.invalidate(&conn).await;
-                    last_err = Some(e);
-                }
-            }
-        }
-        Err(last_err.expect("loop runs at least once"))
+        let stream = crate::quic::dial_quic_stream(
+            &client.quic,
+            |timeout| {
+                let client = Arc::clone(&client);
+                async move { client.connection(timeout).await }
+            },
+            connect_timeout,
+            move |conn| {
+                let addr = addr.clone();
+                async move { Self::open_stream(&conn, NETWORK_TCP, &addr).await }
+            },
+            |_| true,
+            "Juicity",
+        )
+        .await?;
+        Ok(ProxyStream {
+            stream: Box::new(stream),
+            target_addr: target,
+            target_domain: target_domain.map(str::to_string),
+        })
     }
 
     async fn dial_udp(
@@ -318,24 +266,40 @@ impl ProxyHandler for JuicityHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<UdpProxySocket> {
-        let client = Self::client_for(node).await?;
-        let (conn, state) = client.connection(connect_timeout).await?;
-        state.touch();
+        let client = self.client_for(node).await?;
         let target_addr = JuiceAddr::new(target, target_domain);
-        let (mut send, mut recv) = Self::open_stream(&conn, NETWORK_UDP, &target_addr).await?;
+        // Same retry skeleton as TCP dials: a dead cached connection must not
+        // fail the UDP session outright (it would otherwise surface as a
+        // one-shot stream-open error on the half-dead connection).
+        let stream_addr = target_addr.clone();
+        let stream = crate::quic::dial_quic_stream(
+            &client.quic,
+            |timeout| {
+                let client = Arc::clone(&client);
+                async move { client.connection(timeout).await }
+            },
+            connect_timeout,
+            move |conn| {
+                let addr = stream_addr.clone();
+                async move { Self::open_stream(&conn, NETWORK_UDP, &addr).await }
+            },
+            |_| true,
+            "Juicity",
+        )
+        .await?;
+        // The guard carries the connection's open-stream accounting; it must
+        // live as long as the bridge.
+        let (mut send, mut recv, guard) = stream.into_parts();
 
         // Bridge the QUIC stream to a local UDP socket pair: the relay sends
         // raw payloads to `relay_addr` on the returned socket and receives
         // replies from the same address (see UdpProxySocket users).
-        let external = crate::util::udp_loopback_bind().await?;
-        let internal = crate::util::udp_loopback_bind().await?;
-        let external_addr = external.local_addr()?;
-        let relay_addr = internal.local_addr()?;
+        let (external, internal, external_addr, relay_addr) =
+            crate::util::udp_loopback_pair().await?;
         let internal = Arc::new(internal);
 
-        state.open.fetch_add(1, Ordering::Relaxed);
-        let bridge_state = Arc::clone(&state);
         tokio::spawn(async move {
+            let _guard = guard;
             let writer = {
                 let internal = Arc::clone(&internal);
                 let target_addr = target_addr.clone();
@@ -375,7 +339,6 @@ impl ProxyHandler for JuicityHandler {
                 _ = reader => {},
                 _ = tokio::time::sleep(UDP_BRIDGE_IDLE) => {},
             }
-            bridge_state.open.fetch_sub(1, Ordering::Relaxed);
         });
 
         Ok(UdpProxySocket {
@@ -385,6 +348,41 @@ impl ProxyHandler for JuicityHandler {
             target_domain: target_domain.map(str::to_string),
             _control: None,
         })
+    }
+
+    async fn dial_udp_transport(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        let client = self.client_for(node).await?;
+        let stream_addr = JuiceAddr::new(target, target_domain);
+        let addr = stream_addr.clone();
+        let stream = crate::quic::dial_quic_stream(
+            &client.quic,
+            |timeout| {
+                let client = Arc::clone(&client);
+                async move { client.connection(timeout).await }
+            },
+            connect_timeout,
+            move |conn| {
+                let addr = addr.clone();
+                async move { Self::open_stream(&conn, NETWORK_UDP, &addr).await }
+            },
+            |_| true,
+            "Juicity",
+        )
+        .await?;
+        let (send, recv, guard) = stream.into_parts();
+        Ok(Arc::new(JuicityUdpTransport {
+            send: tokio::sync::Mutex::new(send),
+            recv: tokio::sync::Mutex::new(recv),
+            _guard: guard,
+            target_addr: stream_addr,
+            target,
+        }))
     }
 
     async fn dial_with_tcp(
@@ -399,13 +397,89 @@ impl ProxyHandler for JuicityHandler {
     }
 
     async fn test_connectivity(&self, node: &Node) -> bool {
-        match Self::client_for(node).await {
-            Ok(client) => client.connection(Duration::from_secs(5)).await.is_ok(),
+        match self.client_for(node).await {
+            // Zero auth grace on the dial path (tuic parity): wait ~1 RTT
+            // for the server to close on bad credentials.
+            Ok(client) => match client.connection(Duration::from_secs(5)).await {
+                Ok((conn, _)) => {
+                    let wait = (2 * conn.rtt()).max(Duration::from_millis(2));
+                    tokio::select! {
+                        _ = conn.closed() => false,
+                        _ = tokio::time::sleep(wait) => {
+                            // Re-check after the wait (tuic parity): a close
+                            // racing the sleep may not have won the select.
+                            conn.close_reason().is_none()
+                        }
+                    }
+                }
+                Err(_) => false,
+            },
             Err(e) => {
                 debug!("Juicity connectivity test failed for {}: {}", node.name, e);
                 false
             }
         }
+    }
+}
+
+/// Framed UDP transport over a Juicity UDP bi stream — the P1.5 replacement
+/// for the loopback bridge: datagrams are framed as
+/// `[metadata][len u16][payload]` directly on the QUIC stream.
+struct JuicityUdpTransport {
+    send: tokio::sync::Mutex<quinn::SendStream>,
+    recv: tokio::sync::Mutex<quinn::RecvStream>,
+    /// Keeps the connection's open-stream accounting alive for the
+    /// transport's lifetime (see `QuicBiStream::into_parts`).
+    _guard: crate::quic::StreamDropGuard,
+    target_addr: JuiceAddr,
+    target: SocketAddr,
+}
+
+impl std::fmt::Debug for JuicityUdpTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JuicityUdpTransport")
+            .field("target", &self.target)
+            .finish()
+    }
+}
+
+#[async_trait]
+impl PacketTransport for JuicityUdpTransport {
+    fn relay_addr(&self) -> SocketAddr {
+        self.target
+    }
+
+    async fn send_packet(&self, data: &[u8]) -> io::Result<()> {
+        if data.len() > u16::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "juicity datagram too large",
+            ));
+        }
+        // SealUDP: `[metadata][len u16][payload]`
+        // (`stream_packet_conn.go:83-90`).
+        let mut frame = Vec::with_capacity(self.target_addr.encoded_len() + 2 + data.len());
+        self.target_addr.encode(&mut frame);
+        frame.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        frame.extend_from_slice(data);
+        self.send
+            .lock()
+            .await
+            .write_all(&frame)
+            .await
+            .map_err(io::Error::other)
+    }
+
+    async fn recv_packet(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        let (_addr, payload) = read_udp_frame(&mut *self.recv.lock().await).await?;
+        if payload.len() > buf.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "juicity datagram exceeds buffer",
+            ));
+        }
+        buf[..payload.len()].copy_from_slice(&payload);
+        Ok((payload.len(), self.target))
     }
 }
 
@@ -416,6 +490,10 @@ mod tests {
     use quinn::VarInt;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// AUTHENTICATE command byte (the shared `exporter_auth` writes it
+    /// inline; only the test server decodes it).
+    const CMD_AUTHENTICATE: u8 = 0x00;
 
     const TEST_UUID: &str = "123e4567-e89b-12d3-a456-426614174000";
     const TEST_PASSWORD: &str = "juicity-test-password";
@@ -561,10 +639,12 @@ mod tests {
         let handler = JuicityHandler::new();
         let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
 
-        let result = handler
+        // Optimistic auth (zero grace, tuic parity): the rejection surfaces
+        // ~1 RTT later when the server closes the connection; the
+        // connectivity probe (which waits for it) must say no.
+        let _ = handler
             .dial(&node, target, None, Duration::from_secs(5))
             .await;
-        assert!(result.is_err(), "bad password must fail the dial");
         assert!(!handler.test_connectivity(&node).await);
     }
 
@@ -594,6 +674,37 @@ mod tests {
         // A second datagram on the same session must work too.
         udp.socket.send_to(b"second", udp.relay_addr).await.unwrap();
         let (n, _) = tokio::time::timeout(Duration::from_secs(5), udp.socket.recv_from(&mut buf))
+            .await
+            .expect("reply timed out")
+            .unwrap();
+        assert_eq!(&buf[..n], b"second");
+    }
+
+    #[tokio::test]
+    async fn test_udp_transport_echo() {
+        let server_addr = start_server(TEST_PASSWORD).await;
+        let node = test_node(server_addr.port(), TEST_PASSWORD);
+        let handler = JuicityHandler::new();
+        let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
+
+        let transport = handler
+            .dial_udp_transport(&node, target, None, Duration::from_secs(5))
+            .await
+            .expect("dial_udp_transport should succeed");
+        assert_eq!(transport.relay_addr(), target);
+        transport.send_packet(b"dns-query").await.unwrap();
+        let mut buf = [0u8; 256];
+        let (n, src) =
+            tokio::time::timeout(Duration::from_secs(5), transport.recv_packet(&mut buf))
+                .await
+                .expect("reply timed out")
+                .unwrap();
+        assert_eq!(src, target);
+        assert_eq!(&buf[..n], b"dns-query");
+
+        // A second datagram on the same session must work too.
+        transport.send_packet(b"second").await.unwrap();
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), transport.recv_packet(&mut buf))
             .await
             .expect("reply timed out")
             .unwrap();

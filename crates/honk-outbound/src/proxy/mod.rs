@@ -4,12 +4,14 @@ pub(crate) mod addr;
 pub mod anytls;
 pub mod block;
 pub mod direct;
+pub mod http;
 pub mod hysteria2;
 pub mod juicity;
 pub(crate) mod mux;
 pub mod shadowsocks;
 pub(crate) mod shadowsocks_2022;
 pub mod socks5;
+pub(crate) mod ss_stream;
 pub mod ssr;
 pub(crate) mod transport;
 pub mod trojan;
@@ -24,6 +26,7 @@ use block::BlockHandler;
 use direct::DirectHandler;
 use honk_config::node::Node;
 use honk_config::types::NodeProtocol;
+use http::HttpConnectHandler;
 use hysteria2::Hysteria2Handler;
 use juicity::JuicityHandler;
 use shadowsocks::ShadowsocksHandler;
@@ -131,6 +134,49 @@ pub struct UdpProxySocket {
     pub _control: Option<tokio::net::TcpStream>,
 }
 
+/// Framed UDP packet transport — the long-term replacement for per-flow
+/// loopback bridges. Native UDP protocols wrap a real `UdpSocket`; tunnel
+/// protocols implement their framing directly on the tunnel instead of
+/// bouncing datagrams through a loopback socket pair (extra FD + bridge
+/// task + 1–2 copies per packet).
+#[async_trait]
+pub trait PacketTransport: Send + Sync + Debug {
+    /// The relay target a flow reports as its destination.
+    fn relay_addr(&self) -> SocketAddr;
+    async fn send_packet(&self, data: &[u8]) -> std::io::Result<()>;
+    async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)>;
+}
+
+/// Adapter presenting any `UdpSocket` — a direct target, a socks5
+/// server-assigned relay, or a legacy loopback bridge — as a
+/// [`PacketTransport`]. Lets tunnel protocols migrate to framed transports
+/// incrementally instead of one flag-day rewrite.
+#[derive(Debug)]
+pub struct UdpSocketTransport {
+    socket: Arc<tokio::net::UdpSocket>,
+    relay_addr: SocketAddr,
+}
+
+impl UdpSocketTransport {
+    pub fn new(socket: Arc<tokio::net::UdpSocket>, relay_addr: SocketAddr) -> Self {
+        Self { socket, relay_addr }
+    }
+}
+
+#[async_trait]
+impl PacketTransport for UdpSocketTransport {
+    fn relay_addr(&self) -> SocketAddr {
+        self.relay_addr
+    }
+    async fn send_packet(&self, data: &[u8]) -> std::io::Result<()> {
+        self.socket.send_to(data, self.relay_addr).await?;
+        Ok(())
+    }
+    async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        self.socket.recv_from(buf).await
+    }
+}
+
 #[async_trait]
 pub trait ProxyHandler: Send + Sync {
     fn protocol(&self) -> NodeProtocol;
@@ -154,7 +200,43 @@ pub trait ProxyHandler: Send + Sync {
         Err(anyhow::anyhow!("UDP not supported for this protocol"))
     }
 
-    async fn test_connectivity(&self, node: &Node) -> bool;
+    /// Framed UDP transport for a flow. The default wraps `dial_udp`'s socket
+    /// (direct target, socks5 relay, or a legacy loopback bridge) in
+    /// [`UdpSocketTransport`]; tunnel protocols override it with a real
+    /// framed transport (no loopback).
+    async fn dial_udp_transport(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        let proxy = self
+            .dial_udp(node, target, target_domain, connect_timeout)
+            .await?;
+        Ok(Arc::new(UdpSocketTransport::new(
+            proxy.socket,
+            proxy.relay_addr,
+        )))
+    }
+
+    /// Raw TCP reachability check against the node server. Handlers share
+    /// this default; `direct`/`block` keep their own overrides.
+    async fn test_connectivity(&self, node: &Node) -> bool {
+        let addr = format!("{}:{}", node.host(), node.port);
+        match crate::util::connect_outbound(&addr, std::time::Duration::from_secs(3)).await {
+            Ok(_stream) => true,
+            Err(e) => {
+                tracing::debug!(
+                    "{} connectivity test failed for {}: {}",
+                    self.protocol().as_str(),
+                    node.name,
+                    e
+                );
+                false
+            }
+        }
+    }
 
     /// The provided `tcp` stream is already connected to the proxy
     /// server.  Handlers that support connection pooling should
@@ -185,6 +267,27 @@ pub trait ProxyHandler: Send + Sync {
         let _ = node;
         false
     }
+
+    /// Whether bare-TCP pool hits are useful for this node. Multiplexed
+    /// protocols (AnyTLS, Trojan-Go, h2mux) keep their own warm session
+    /// pools; a pooled bare TCP forces a brand-new mux session per flow —
+    /// worse than reusing the session pool, and sessions created over the
+    /// pool cap leak. Return `false` for those; the dial then always goes
+    /// through the session pool. The default is `true` (single-connection
+    /// protocols where skipping the TCP handshake helps).
+    fn pool_bare_tcp(&self, node: &Node) -> bool {
+        let _ = node;
+        true
+    }
+
+    /// Install the per-node runtime registry (session-layer ownership).
+    /// Handlers with pooled sessions (AnyTLS, Trojan-Go, h2mux) resolve
+    /// their node's pool through it; the default is a no-op for stateless
+    /// handlers. The shared cell swaps its contents on reload, so this is
+    /// installed once at startup.
+    fn set_runtime_registry(&self, cell: crate::runtime::SharedRuntimeRegistry) {
+        let _ = cell;
+    }
 }
 
 pub struct ProxyRegistry {
@@ -195,6 +298,14 @@ impl ProxyRegistry {
     pub fn new() -> Self {
         Self {
             handlers: Vec::new(),
+        }
+    }
+
+    /// Hand the per-node runtime registry to every handler (see
+    /// [`ProxyHandler::set_runtime_registry`]).
+    pub fn install_runtime_registry(&self, cell: crate::runtime::SharedRuntimeRegistry) {
+        for handler in &self.handlers {
+            handler.set_runtime_registry(cell.clone());
         }
     }
 
@@ -239,6 +350,13 @@ impl ProxyRegistry {
         // block by name so routed block traffic is actually rejected.
         if node.name == "block" {
             return BlockHandler::new()
+                .dial(node, target, target_domain, connect_timeout)
+                .await;
+        }
+        // Real http-proxy nodes (anything but the built-ins) were silently
+        // direct through the same marker: use the CONNECT handler instead.
+        if node.protocol == NodeProtocol::HTTP && node.name != "direct" {
+            return HttpConnectHandler::new()
                 .dial(node, target, target_domain, connect_timeout)
                 .await;
         }
@@ -287,6 +405,28 @@ impl ProxyRegistry {
 
         handler
             .dial_udp(node, target, target_domain, connect_timeout)
+            .await
+    }
+
+    /// Framed UDP transport for a flow, dispatching to the node's handler
+    /// (see [`ProxyHandler::dial_udp_transport`]).
+    pub async fn dial_udp_transport(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        if node.name == "block" {
+            return BlockHandler::new()
+                .dial_udp_transport(node, target, target_domain, connect_timeout)
+                .await;
+        }
+        let handler = self
+            .find(node.protocol)
+            .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", node.protocol))?;
+        handler
+            .dial_udp_transport(node, target, target_domain, connect_timeout)
             .await
     }
 

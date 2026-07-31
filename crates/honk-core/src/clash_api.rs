@@ -53,15 +53,13 @@ pub struct ClashState {
     pub mode_state: SharedModeState,
     /// Bearer secret from `experimental.clash_api.secret`; empty = no auth.
     pub secret: String,
+    /// Shared connection pool (ready-pool hit/miss metrics in `/stats`).
+    pub connection_pool: Arc<crate::pool::ConnectionPool>,
     /// External UI directory (`experimental.clash_api.external_ui`).
     pub external_ui: String,
     /// Broadcast channel fed by the clash log tracing layer.
     pub log_tx: tokio::sync::broadcast::Sender<logs::LogEvent>,
-    /// DNS response cache cleared by `/cache/dns/flush`.
-    pub dns_cache: Arc<tokio::sync::Mutex<crate::dns::cache::DnsCache>>,
-    /// DNS forwarder used by `/dns/query` (same cache/routing/upstream
-    /// pipeline as intercepted DNS traffic).
-    pub dns_forwarder: crate::dns::forwarder::DnsForwarder,
+    pub dns_service: crate::dns::DnsService,
 }
 
 pub fn router(state: Arc<ClashState>) -> Router {
@@ -876,7 +874,15 @@ async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json
             })
         })
         .collect();
-    Json(serde_json::json!({"outbounds": per_outbound}))
+    let pool = s.connection_pool.ready_metrics();
+    Json(serde_json::json!({
+        "outbounds": per_outbound,
+        "pool": {
+            "readyHits": pool.hits,
+            "readyMisses": pool.misses,
+            "entries": pool.entries,
+        },
+    }))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1175,7 +1181,11 @@ async fn get_dns_query(
     };
 
     let query = crate::dns::forwarder::build_dns_query(&name, qtype);
-    match s.dns_forwarder.resolve(&query).await {
+    let result = s
+        .dns_service
+        .resolve(&query, crate::dns::query::IngressProfile::Api)
+        .await;
+    match result {
         Ok(resp) => Json(doh::response_json(&name, qtype, &resp)).into_response(),
         // Upstream error or negative-cache hit: report SERVFAIL-style.
         Err(e) => {
@@ -1198,10 +1208,16 @@ async fn flush_fakeip(State(s): State<Arc<ClashState>>) -> StatusCode {
 }
 
 async fn flush_dns(State(s): State<Arc<ClashState>>) -> StatusCode {
-    s.dns_cache.lock().await.clear();
-    // Also drop the persisted (store_dns) answers, if any.
-    if let Some(ref db) = s.cache_db {
-        db.flush_dns();
+    match s.dns_service.flush_cache().await {
+        Ok(true) => {}
+        Ok(false) => {
+            if let Some(ref db) = s.cache_db {
+                db.flush_dns();
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "DNS persistence flush command failed");
+        }
     }
     StatusCode::NO_CONTENT
 }

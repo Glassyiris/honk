@@ -34,6 +34,98 @@ use honk_config::node::Node;
 /// TLS client stream produced by [`TlsConnector::connect`].
 pub type TlsStream<S> = tokio_boring::SslStream<S>;
 
+/// Greedy-read wrapper for TLS streams.
+///
+/// BoringSSL `SSL_read` returns at most one record (~16 KiB) per call, so
+/// a relay loop with a larger buffer would otherwise run a full
+/// read→write iteration per record. Drain the inner stream until the
+/// caller's buffer is full or the inner stream pends, delivering one
+/// batch per wakeup. Writes pass through unchanged.
+#[derive(Debug)]
+pub struct BatchRead<S> {
+    inner: S,
+}
+
+impl<S> BatchRead<S> {
+    pub fn new(inner: S) -> Self {
+        Self { inner }
+    }
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for BatchRead<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        use std::task::Poll;
+        let start = buf.filled().len();
+        loop {
+            if buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            let before = buf.filled().len();
+            match std::pin::Pin::new(&mut self.inner).poll_read(cx, buf) {
+                Poll::Ready(Ok(())) => {
+                    if buf.filled().len() == before {
+                        return Poll::Ready(Ok(())); // EOF: deliver what we have
+                    }
+                }
+                Poll::Ready(Err(e)) => {
+                    return if buf.filled().len() > start {
+                        Poll::Ready(Ok(()))
+                    } else {
+                        Poll::Ready(Err(e))
+                    };
+                }
+                Poll::Pending => {
+                    return if buf.filled().len() > start {
+                        Poll::Ready(Ok(()))
+                    } else {
+                        Poll::Pending
+                    };
+                }
+            }
+        }
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for BatchRead<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> std::task::Poll<io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+}
+
 // Chrome's TLS 1.3 signature-algorithm list (order matters).
 pub(crate) const CHROME_SIGALGS: &str = "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:\
      ecdsa_secp384r1_sha384:rsa_pss_rsae_sha384:rsa_pkcs1_sha384:\
@@ -71,7 +163,7 @@ impl CertificateCompressor for BrotliCertCompression {
 
 /// BoringSSL connector carrying per-node ECH settings and the global
 /// fingerprint mode. Clone-cheap (Arc inside); build once per node.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TlsConnector {
     connector: SslConnector,
     chrome: bool,
@@ -381,7 +473,17 @@ pub fn build_connector(node: &Node) -> anyhow::Result<TlsConnector> {
     let chrome = chrome_mode();
     let ech_config_list = load_ech_config_list(node)?;
 
-    let pin = node.tls_pin_sha256.as_deref().and_then(parse_pin_sha256);
+    let pin = match node.tls_pin_sha256.as_deref() {
+        Some(s) => Some(parse_pin_sha256(s).ok_or_else(|| {
+            // pinSHA256 is a security assertion: an unparseable pin
+            // must fail closed, never degrade to plain PKI.
+            anyhow::anyhow!(
+                "node '{}': invalid tls_pin_sha256 (expected 64 hex chars)",
+                node.name
+            )
+        })?),
+        None => None,
+    };
     let mut builder = base_builder(node.skip_cert_verify || pin.is_some())?;
     if let Some(pin) = pin {
         builder.set_custom_verify_callback(SslVerifyMode::PEER, pin_sha256_custom_verify(pin));
@@ -827,5 +929,100 @@ mod pin_tests {
         assert!(parse_pin_sha256("abcd").is_none());
         // Uppercase hex is valid.
         assert!(parse_pin_sha256(&"AB".repeat(32)).is_some());
+    }
+
+    /// P0: an unparseable pinSHA256 must fail closed — never silently
+    /// degrade to plain PKI.
+    #[test]
+    fn invalid_pin_fails_closed() {
+        let node = Node {
+            name: "pinned".into(),
+            host: "example.com".into(),
+            address: "example.com:443".into(),
+            port: 443,
+            tls_pin_sha256: Some("not-a-pin".into()),
+            ..Default::default()
+        };
+        let err = build_connector(&node).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid tls_pin_sha256"),
+            "bad pin must be a hard error: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod batch_read_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn drains_all_available_in_one_read() {
+        let (mut w, r) = tokio::io::duplex(64);
+        let mut s = BatchRead::new(r);
+        w.write_all(&[1u8; 10]).await.unwrap();
+        w.write_all(&[2u8; 20]).await.unwrap();
+        // One read must coalesce both writes (a plain duplex read would
+        // also return 30 here; the point is the wrapper never truncates
+        // a wakeup's worth of data to the first inner read).
+        let mut buf = [0u8; 64];
+        let n = s.read(&mut buf).await.unwrap();
+        assert_eq!(n, 30);
+        assert_eq!(&buf[..10], &[1u8; 10]);
+        assert_eq!(&buf[10..30], &[2u8; 20]);
+    }
+
+    #[tokio::test]
+    async fn eof_delivers_partial_then_zero() {
+        let (mut w, r) = tokio::io::duplex(64);
+        let mut s = BatchRead::new(r);
+        w.write_all(&[7u8; 10]).await.unwrap();
+        drop(w); // EOF
+        let mut buf = [0u8; 64];
+        let n = s.read(&mut buf).await.unwrap();
+        assert_eq!(n, 10, "buffered data must be delivered before EOF");
+        let n = s.read(&mut buf).await.unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn read_larger_than_inner_chunks() {
+        // Simulate one-record-per-poll inner reads (TLS): cap each inner
+        // poll at 8 bytes; the wrapper must still fill the big buffer.
+        struct Chunked<R> {
+            inner: R,
+        }
+        impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Chunked<R> {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                let cap = buf.remaining().min(8);
+                let (r, n) = {
+                    let mut small = buf.take(cap);
+                    let r = std::pin::Pin::new(&mut self.inner).poll_read(cx, &mut small);
+                    (r, small.filled().len())
+                };
+                if r.is_ready() {
+                    // SAFETY: `take` views the front of `buf`'s unfilled
+                    // region; bytes it initialized are the front of ours.
+                    unsafe { buf.assume_init(n) };
+                    buf.advance(n);
+                }
+                r
+            }
+        }
+        let (mut w, r) = tokio::io::duplex(64);
+        let mut s = BatchRead::new(Chunked { inner: r });
+        for i in 0..4u8 {
+            w.write_all(&[i; 8]).await.unwrap();
+        }
+        let mut buf = [0u8; 32];
+        let n = s.read(&mut buf).await.unwrap();
+        assert_eq!(n, 32, "four 8-byte records must batch into one read");
+        for i in 0..4usize {
+            assert!(buf[i * 8..(i + 1) * 8].iter().all(|&b| b == i as u8));
+        }
     }
 }
