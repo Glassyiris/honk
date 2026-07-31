@@ -699,7 +699,7 @@ impl RealEbpfBackend {
     }
 
     /// Return the list of bond slaves for `iface` if it is a bond master.
-    fn bond_slaves(iface: &str) -> Vec<String> {
+    pub(crate) fn bond_slaves(iface: &str) -> Vec<String> {
         let path = format!("/sys/class/net/{}/bonding/slaves", iface);
         std::fs::read_to_string(&path)
             .ok()
@@ -712,7 +712,7 @@ impl RealEbpfBackend {
     }
 
     /// Return the list of bridge slaves for `iface` if it is a bridge master.
-    fn bridge_slaves(iface: &str) -> Vec<String> {
+    pub(crate) fn bridge_slaves(iface: &str) -> Vec<String> {
         let path = format!("/sys/class/net/{}/brif", iface);
         std::fs::read_dir(&path)
             .ok()
@@ -811,5 +811,44 @@ impl RealEbpfBackend {
             "wan_ingress_l3"
         };
         self.attach_tc_tracked(prog, ifname, aya::programs::TcAttachType::Ingress)
+    }
+
+    /// Attach a bridge/bond slave of a configured LAN master, mirroring the
+    /// program choices `load()` makes at startup: bridge slaves get the LAN
+    /// pair, bond slaves lan_ingress + wan_egress (both L2 on the egress —
+    /// bond/bridge slaves are ARPHRD_ETHER and see fully-framed skbs).
+    pub fn attach_slave(
+        &mut self,
+        ifname: &str,
+        role: crate::ebpf::IfaceRole,
+    ) -> anyhow::Result<crate::ebpf::DynamicHooks> {
+        info!(
+            "Attaching slave programs to additional interface: {}",
+            ifname
+        );
+        let _ = aya::programs::tc::qdisc_add_clsact(ifname);
+        let ifindex = Self::iface_ifindex(ifname);
+        let mut hooks = crate::ebpf::DynamicHooks {
+            ingress: self.dynamic_hooked(ifindex, false),
+            egress: self.dynamic_hooked(ifindex, true),
+        };
+        let ingress_prog = if Self::iface_is_ethernet(ifname) {
+            "lan_ingress_l2"
+        } else {
+            "lan_ingress_l3"
+        };
+        if !hooks.ingress {
+            self.attach_tc_tracked(ingress_prog, ifname, aya::programs::TcAttachType::Ingress)?;
+            hooks.ingress = true;
+        }
+        let egress_prog = match role {
+            crate::ebpf::IfaceRole::LanBridgeSlave => "lan_egress_l2",
+            _ => "wan_egress_l2",
+        };
+        if !hooks.egress {
+            self.attach_tc_tracked(egress_prog, ifname, aya::programs::TcAttachType::Egress)?;
+            hooks.egress = true;
+        }
+        Ok(hooks)
     }
 }

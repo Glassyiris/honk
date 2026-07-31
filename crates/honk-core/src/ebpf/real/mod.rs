@@ -330,6 +330,9 @@ impl EbpfBackend for RealEbpfBackend {
                     egress: true,
                 })
             }
+            super::IfaceRole::LanBridgeSlave | super::IfaceRole::LanBondSlave => {
+                self.attach_slave(ifname, role)
+            }
         }
     }
 

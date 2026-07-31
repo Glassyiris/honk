@@ -1,7 +1,7 @@
 //! RTMGRP_LINK watcher: attaches TC programs to configured interfaces that
-//! appear after startup (USB NICs, container veths, late-renamed links).
-//! Bridge/bond slave expansion stays startup-only; the watcher tracks the
-//! configured (master) interfaces only.
+//! appear after startup (USB NICs, container veths, late-renamed links),
+//! and re-expands bridge/bond slaves of configured LAN masters on every
+//! reconcile so containers added later are covered too.
 
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -185,21 +185,21 @@ async fn reconcile(
             ingress: true,
             egress: !single_homed,
         },
-        IfaceRole::Wan => DynamicHooks {
+        _ => DynamicHooks {
             ingress: true,
             egress: true,
         },
     };
     let mut backend = ebpf.write().await;
-    // An ifindex mismatch means the device was deleted and recreated: its
-    // hooks died with the old device, so drop the stale attach state (and
-    // the backend's dead links) and let it be re-attached below.
+    // Forget tracked entries that vanished, were recreated (their hooks
+    // died with the old ifindex), or are no longer wanted (un-enslaved,
+    // removed from config).
     let tracked: Vec<(String, u32)> = attached
         .iter()
         .map(|(name, (ifindex, _))| (name.clone(), *ifindex))
         .collect();
     for (name, ifindex) in tracked {
-        if iface_ifindex(&name) != Some(ifindex) {
+        if !desired.contains_key(&name) || iface_ifindex(&name) != Some(ifindex) {
             backend.forget_dynamic_interface(ifindex);
             attached.remove(&name);
         }
@@ -257,6 +257,17 @@ fn desired_interfaces(config: &honk_config::Config) -> (HashMap<String, IfaceRol
     }
     for l in &lan {
         desired.insert(l.clone(), IfaceRole::Lan);
+    }
+    // Bridge/bond slaves of configured LAN masters need their own hooks
+    // (forwarded traffic bypasses the master's qdiscs); membership is
+    // re-read on every reconcile so late-added containers are covered.
+    for master in &lan {
+        for slave in super::RealEbpfBackend::bridge_slaves(master) {
+            desired.entry(slave).or_insert(IfaceRole::LanBridgeSlave);
+        }
+        for slave in super::RealEbpfBackend::bond_slaves(master) {
+            desired.entry(slave).or_insert(IfaceRole::LanBondSlave);
+        }
     }
     (desired, single_homed)
 }
