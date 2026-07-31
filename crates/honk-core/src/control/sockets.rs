@@ -186,6 +186,21 @@ fn build_tproxy_udp(addr: SocketAddr) -> anyhow::Result<UdpSocket> {
                     std::io::Error::last_os_error()
                 );
             }
+            // Preserve the address in the packet header when ORIGDST is not
+            // available, so only an exact DNS query can reconstruct :53.
+            let ret = libc::setsockopt(
+                fd,
+                libc::IPPROTO_IP,
+                libc::IP_PKTINFO,
+                &one as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&one) as libc::socklen_t,
+            );
+            if ret != 0 {
+                anyhow::bail!(
+                    "setsockopt(IP_PKTINFO): {}",
+                    std::io::Error::last_os_error()
+                );
+            }
         } else {
             let ret = libc::setsockopt(
                 fd,
@@ -210,6 +225,20 @@ fn build_tproxy_udp(addr: SocketAddr) -> anyhow::Result<UdpSocket> {
             if ret != 0 {
                 anyhow::bail!(
                     "setsockopt(IPV6_RECVORIGDSTADDR): {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            // IPv6 mirrors IPv4's IP_PKTINFO provenance fallback.
+            let ret = libc::setsockopt(
+                fd,
+                libc::IPPROTO_IPV6,
+                libc::IPV6_RECVPKTINFO,
+                &one as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&one) as libc::socklen_t,
+            );
+            if ret != 0 {
+                anyhow::bail!(
+                    "setsockopt(IPV6_RECVPKTINFO): {}",
                     std::io::Error::last_os_error()
                 );
             }
@@ -618,39 +647,111 @@ fn sendmsg_with_src(
     }
 }
 
-/// Receive a UDP datagram from a TPROXY socket together with its original
-/// destination address.  Requires `IP_RECVORIGDSTADDR` to be set on the socket.
+// Accommodate two IPv6-sized ancillary records (ORIGDST + PKTINFO). The
+// capacity is checked through CMSG_SPACE before every recvmsg rather than
+// relying on the literal remaining correct for all libc ABIs.
+const CMSG_CONTROL_CAPACITY: usize = 256;
+
+/// Raw recvmsg control storage whose first byte is naturally aligned for a
+/// `cmsghdr`. The zero-length field carries `cmsghdr`'s ABI alignment without
+/// consuming cmsg capacity.
+#[repr(C)]
+struct CmsgStorage {
+    _alignment: [libc::cmsghdr; 0],
+    bytes: [u8; CMSG_CONTROL_CAPACITY],
+}
+
+impl CmsgStorage {
+    fn new() -> Self {
+        // SAFETY: raw cmsg storage is initialized to zero before recvmsg.
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+fn cmsg_len(data_len: usize) -> usize {
+    // SAFETY: libc exposes CMSG_LEN as the platform ABI macro wrapper.
+    unsafe { libc::CMSG_LEN(data_len as _) as usize }
+}
+
+fn cmsg_space(data_len: usize) -> usize {
+    // SAFETY: libc exposes CMSG_SPACE as the platform ABI macro wrapper.
+    unsafe { libc::CMSG_SPACE(data_len as _) as usize }
+}
+
+pub(super) fn cmsg_control_capacity_is_sufficient() -> bool {
+    let Some(required) = cmsg_space(std::mem::size_of::<libc::sockaddr_in6>())
+        .checked_add(cmsg_space(std::mem::size_of::<libc::in6_pktinfo>()))
+    else {
+        return false;
+    };
+    CMSG_CONTROL_CAPACITY >= required
+}
+
+/// Provenance captured for one UDP datagram before any destination is
+/// selected.  The listener's address is deliberately retained separately: a
+/// wildcard bind is not an original destination and must not become one.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct UdpRecvMeta {
+    pub(super) original_dst_cmsg: Option<SocketAddr>,
+    pub(super) packet_dst_ip: Option<std::net::IpAddr>,
+    pub(super) local_addr: SocketAddr,
+}
+
+/// Receive a UDP datagram and preserve every destination provenance source.
+/// `IP_RECVORIGDSTADDR` / `IPV6_RECVORIGDSTADDR` provide the authoritative
+/// address; packet-info and the listener address are retained only as guarded
+/// fallbacks by [`udp_original_dst`].
 pub(super) async fn recv_from_with_orig_dst(
     socket: &UdpSocket,
     buf: &mut [u8],
-) -> io::Result<(usize, SocketAddr, SocketAddr)> {
+) -> io::Result<(usize, SocketAddr, UdpRecvMeta)> {
+    let local_addr = socket.local_addr()?;
     socket
         .async_io(Interest::READABLE, || {
-            recvmsg_origdst(socket.as_raw_fd(), buf)
+            recvmsg_origdst(socket.as_raw_fd(), buf, local_addr)
         })
         .await
 }
 
-fn recvmsg_origdst(fd: RawFd, buf: &mut [u8]) -> io::Result<(usize, SocketAddr, SocketAddr)> {
+fn recvmsg_origdst(
+    fd: RawFd,
+    buf: &mut [u8],
+    local_addr: SocketAddr,
+) -> io::Result<(usize, SocketAddr, UdpRecvMeta)> {
     let mut iov = libc::iovec {
         iov_base: buf.as_mut_ptr() as *mut libc::c_void,
         iov_len: buf.len(),
     };
     let mut src_addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    let mut cmsg_buf = [0u8; 128];
+    if !cmsg_control_capacity_is_sufficient() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "recvmsg control buffer cannot hold IPv6 ORIGDST and PKTINFO",
+        ));
+    }
+    // CmsgStorage makes this pointer naturally aligned for libc's cmsghdr
+    // access; CMSG_SPACE capacity above ensures neither IPv6 record crowds
+    // the other out.
+    let mut cmsg_buf = CmsgStorage::new();
+    if !(cmsg_buf.bytes.as_ptr() as usize).is_multiple_of(std::mem::align_of::<libc::cmsghdr>()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "recvmsg control storage is not cmsghdr-aligned",
+        ));
+    }
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_name = &mut src_addr as *mut _ as *mut libc::c_void;
     msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
-    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_control = cmsg_buf.bytes.as_mut_ptr() as *mut libc::c_void;
     #[cfg(target_env = "musl")]
     {
-        msg.msg_controllen = cmsg_buf.len() as u32;
+        msg.msg_controllen = cmsg_buf.bytes.len() as u32;
     }
     #[cfg(not(target_env = "musl"))]
     {
-        msg.msg_controllen = cmsg_buf.len();
+        msg.msg_controllen = cmsg_buf.bytes.len();
     }
 
     let n = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_DONTWAIT) };
@@ -659,53 +760,214 @@ fn recvmsg_origdst(fd: RawFd, buf: &mut [u8]) -> io::Result<(usize, SocketAddr, 
     }
 
     let src = sockaddr_to_std(&src_addr, msg.msg_namelen)?;
+    let returned_control_len = usize::try_from(msg.msg_controllen).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "recvmsg returned an unrepresentable msg_controllen",
+        )
+    })?;
+    // Only kernel-returned bytes are trusted. A larger value can never make
+    // the parser read past our actual allocation.
+    let control_len = returned_control_len.min(cmsg_buf.bytes.len());
+    let (original_dst_cmsg, packet_dst_ip) =
+        parse_cmsg_control(&cmsg_buf.bytes[..control_len], msg.msg_flags)?;
 
-    let mut orig_dst = None;
-    unsafe {
-        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
-        while !cmsg.is_null() {
-            if (*cmsg).cmsg_level == libc::IPPROTO_IP && (*cmsg).cmsg_type == libc::IP_ORIGDSTADDR {
-                let sin = libc::CMSG_DATA(cmsg) as *const libc::sockaddr_in;
-                let ip = std::net::Ipv4Addr::from(u32::from_be((*sin).sin_addr.s_addr));
-                let port = u16::from_be((*sin).sin_port);
-                orig_dst = Some(SocketAddr::new(std::net::IpAddr::V4(ip), port));
-                break;
-            }
-            if (*cmsg).cmsg_level == libc::SOL_IPV6 && (*cmsg).cmsg_type == IPV6_ORIGDSTADDR_OPT {
-                let sin6 = libc::CMSG_DATA(cmsg) as *const libc::sockaddr_in6;
-                let ip = std::net::Ipv6Addr::from((*sin6).sin6_addr.s6_addr);
-                let port = u16::from_be((*sin6).sin6_port);
-                orig_dst = Some(SocketAddr::new(std::net::IpAddr::V6(ip), port));
-                break;
-            }
-            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
-        }
+    Ok((
+        n as usize,
+        src,
+        UdpRecvMeta {
+            original_dst_cmsg,
+            packet_dst_ip,
+            local_addr,
+        },
+    ))
+}
+
+/// Parse the returned ancillary byte range without looking past
+/// `msg_controllen`. Every recognized record must be complete and decodable;
+/// malformed provenance is an InvalidData error, never a missing-metadata
+/// fallback. The production buffer is cmsghdr-aligned, while unaligned reads
+/// here keep this validator safe for any slice used by focused tests.
+pub(super) fn parse_cmsg_control(
+    control: &[u8],
+    msg_flags: libc::c_int,
+) -> io::Result<(Option<SocketAddr>, Option<std::net::IpAddr>)> {
+    if msg_flags & libc::MSG_CTRUNC != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "recvmsg control data truncated",
+        ));
     }
 
-    let orig_dst = match orig_dst {
-        Some(d) => d,
-        None => {
-            // When eBPF delivers the packet directly to the TPROXY listener,
-            // the kernel may not supply IP_ORIGDSTADDR.  The transparent socket
-            // was bound to the original destination, so its local address is a
-            // usable fallback (same fallback used for TCP in serve_connection).
-            let mut local: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-            let mut local_len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-            if unsafe {
-                libc::getsockname(
-                    fd,
-                    &mut local as *mut _ as *mut libc::sockaddr,
-                    &mut local_len,
-                )
-            } < 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-            sockaddr_to_std(&local, local_len)?
+    let header_len = cmsg_len(0);
+    let mut offset = 0;
+    let mut original_dst_cmsg = None;
+    let mut packet_dst_ip = None;
+    while offset < control.len() {
+        if control.len() - offset < header_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated cmsghdr",
+            ));
         }
-    };
+        // SAFETY: the header-sized range was checked above. read_unaligned
+        // avoids assuming alignment for callers other than recvmsg storage.
+        let cmsg = unsafe {
+            std::ptr::read_unaligned(control.as_ptr().add(offset).cast::<libc::cmsghdr>())
+        };
+        let record_len = usize::try_from(cmsg.cmsg_len)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "unrepresentable cmsg_len"))?;
+        let data_len = record_len.checked_sub(header_len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "cmsg_len shorter than cmsghdr")
+        })?;
+        let data_start = offset + header_len;
+        let data_end = data_start
+            .checked_add(data_len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "cmsg length overflow"))?;
+        let data = control
+            .get(data_start..data_end)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated cmsg payload"))?;
 
-    Ok((n as usize, src, orig_dst))
+        if cmsg.cmsg_level == libc::IPPROTO_IP && cmsg.cmsg_type == libc::IP_ORIGDSTADDR {
+            if original_dst_cmsg.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "duplicate ORIGDST cmsg",
+                ));
+            }
+            let original_dst = original_dst_from_cmsg(cmsg.cmsg_level, cmsg.cmsg_type, data)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "malformed IPv4 ORIGDST cmsg")
+                })?;
+            original_dst_cmsg = Some(original_dst);
+        } else if cmsg.cmsg_level == libc::SOL_IPV6 && cmsg.cmsg_type == IPV6_ORIGDSTADDR_OPT {
+            if original_dst_cmsg.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "duplicate ORIGDST cmsg",
+                ));
+            }
+            let original_dst = original_dst_from_cmsg(cmsg.cmsg_level, cmsg.cmsg_type, data)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "malformed IPv6 ORIGDST cmsg")
+                })?;
+            original_dst_cmsg = Some(original_dst);
+        } else if (cmsg.cmsg_level == libc::IPPROTO_IP && cmsg.cmsg_type == libc::IP_PKTINFO)
+            || (cmsg.cmsg_level == libc::IPPROTO_IPV6 && cmsg.cmsg_type == libc::IPV6_PKTINFO)
+        {
+            if packet_dst_ip.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "duplicate PKTINFO cmsg",
+                ));
+            }
+            let packet_dst = packet_dst_ip_from_cmsg(cmsg.cmsg_level, cmsg.cmsg_type, data)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "malformed PKTINFO cmsg")
+                })?;
+            packet_dst_ip = Some(packet_dst);
+        }
+
+        let next = offset
+            .checked_add(cmsg_space(data_len))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "cmsg alignment overflow"))?;
+        if next > control.len() {
+            // The final record may omit tail alignment padding, but an
+            // unfinished record before more returned bytes is malformed.
+            if data_end == control.len() {
+                break;
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated cmsg alignment padding",
+            ));
+        }
+        offset = next;
+    }
+
+    Ok((original_dst_cmsg, packet_dst_ip))
+}
+
+fn original_dst_from_cmsg(
+    cmsg_level: libc::c_int,
+    cmsg_type: libc::c_int,
+    data: &[u8],
+) -> Option<SocketAddr> {
+    if cmsg_level == libc::IPPROTO_IP && cmsg_type == libc::IP_ORIGDSTADDR {
+        if data.len() != std::mem::size_of::<libc::sockaddr_in>() {
+            return None;
+        }
+        let sin = unsafe { std::ptr::read_unaligned(data.as_ptr().cast::<libc::sockaddr_in>()) };
+        if sin.sin_family as libc::c_int != libc::AF_INET {
+            return None;
+        }
+        let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+        return Some(SocketAddr::new(
+            std::net::IpAddr::V4(ip),
+            u16::from_be(sin.sin_port),
+        ));
+    }
+    if cmsg_level == libc::SOL_IPV6 && cmsg_type == IPV6_ORIGDSTADDR_OPT {
+        if data.len() != std::mem::size_of::<libc::sockaddr_in6>() {
+            return None;
+        }
+        let sin6 = unsafe { std::ptr::read_unaligned(data.as_ptr().cast::<libc::sockaddr_in6>()) };
+        if sin6.sin6_family as libc::c_int != libc::AF_INET6 {
+            return None;
+        }
+        let ip = std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr);
+        return Some(SocketAddr::new(
+            std::net::IpAddr::V6(ip),
+            u16::from_be(sin6.sin6_port),
+        ));
+    }
+    None
+}
+
+pub(super) fn packet_dst_ip_from_cmsg(
+    cmsg_level: libc::c_int,
+    cmsg_type: libc::c_int,
+    data: &[u8],
+) -> Option<std::net::IpAddr> {
+    if cmsg_level == libc::IPPROTO_IP && cmsg_type == libc::IP_PKTINFO {
+        if data.len() != std::mem::size_of::<libc::in_pktinfo>() {
+            return None;
+        }
+        let pktinfo = unsafe { std::ptr::read_unaligned(data.as_ptr().cast::<libc::in_pktinfo>()) };
+        return Some(std::net::IpAddr::V4(std::net::Ipv4Addr::from(
+            u32::from_be(pktinfo.ipi_addr.s_addr),
+        )));
+    }
+    if cmsg_level == libc::IPPROTO_IPV6 && cmsg_type == libc::IPV6_PKTINFO {
+        if data.len() != std::mem::size_of::<libc::in6_pktinfo>() {
+            return None;
+        }
+        let pktinfo =
+            unsafe { std::ptr::read_unaligned(data.as_ptr().cast::<libc::in6_pktinfo>()) };
+        return Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(
+            pktinfo.ipi6_addr.s6_addr,
+        )));
+    }
+    None
+}
+
+/// Select a real original destination without inventing one from UDP payload
+/// shape. An ORIGDST cmsg is authoritative; PKTINFO can only supply an IP for
+/// a validated DNS query on port 53; a specifically bound listener is the
+/// final fallback. Wildcard listeners with no valid metadata fail closed.
+pub(super) fn udp_original_dst(meta: &UdpRecvMeta, data: &[u8]) -> Option<SocketAddr> {
+    // A present ORIGDST cmsg is authoritative. An unspecified ORIGDST is
+    // invalid provenance, so do not downgrade it to pktinfo/local fallback.
+    if let Some(original_dst) = meta.original_dst_cmsg {
+        return (!original_dst.ip().is_unspecified()).then_some(original_dst);
+    }
+    if is_exact_dns_query(data)
+        && let Some(packet_dst_ip) = meta.packet_dst_ip
+        && !packet_dst_ip.is_unspecified()
+    {
+        return Some(SocketAddr::new(packet_dst_ip, 53));
+    }
+    (!meta.local_addr.ip().is_unspecified()).then_some(meta.local_addr)
 }
 
 fn sockaddr_to_std(addr: &libc::sockaddr_storage, len: libc::socklen_t) -> io::Result<SocketAddr> {
@@ -808,36 +1070,132 @@ pub(super) fn get_original_dst(stream: &TcpStream) -> anyhow::Result<SocketAddr>
     }
 }
 
-/// Heuristic check for a DNS query payload.
-/// Used as a fallback when the eBPF bpf_sk_assign path does not preserve
-/// IP_ORIGDSTADDR for UDP datagrams: any DNS-shaped payload received on the
-/// TPROXY listener is treated as a DNS query destined for port 53.
-pub(super) fn is_dns_payload(data: &[u8]) -> bool {
-    if data.len() < 12 {
+/// Strict DNS query validation shared by provenance, the controller, and
+/// both UDP dispatch paths. It accepts exactly one fully encoded question,
+/// walks every RR declared by the header, consumes the entire datagram, and
+/// requires the controller's `parse_dns_question` consumer to accept it.
+pub(super) fn is_exact_dns_query(data: &[u8]) -> bool {
+    if data.len() < 12 || data[2] & 0x80 != 0 {
         return false;
     }
-    // QR bit must be 0 (query).
-    data[2] & 0x80 == 0
+
+    let qdcount = u16::from_be_bytes([data[4], data[5]]) as usize;
+    if qdcount != 1 {
+        return false;
+    }
+    let counts = [
+        u16::from_be_bytes([data[6], data[7]]) as usize,
+        u16::from_be_bytes([data[8], data[9]]) as usize,
+        u16::from_be_bytes([data[10], data[11]]) as usize,
+    ];
+    let mut pos = 12;
+    // Label starts observed while walking question/owner names. Compression
+    // pointers may only land on these boundaries (not header/RDATA/interior
+    // label bytes). Unparsed RDATA is intentionally not scanned.
+    let mut label_boundaries = vec![false; data.len()];
+
+    if !skip_strict_dns_name(data, &mut pos, &mut label_boundaries)
+        || pos.checked_add(4).is_none_or(|end| end > data.len())
+    {
+        return false;
+    }
+    pos += 4; // QTYPE + QCLASS
+
+    for count in counts {
+        for _ in 0..count {
+            if !skip_strict_dns_name(data, &mut pos, &mut label_boundaries)
+                || pos.checked_add(10).is_none_or(|end| end > data.len())
+            {
+                return false;
+            }
+            let rdlength = u16::from_be_bytes([data[pos + 8], data[pos + 9]]) as usize;
+            pos += 10; // TYPE + CLASS + TTL + RDLENGTH
+            let Some(rdata_end) = pos.checked_add(rdlength) else {
+                return false;
+            };
+            if rdata_end > data.len() {
+                return false;
+            }
+            pos = rdata_end;
+        }
+    }
+
+    if pos != data.len() {
+        return false;
+    }
+
+    // Keep the shared predicate inside the controller's actual parseable set
+    // so root/binary names fall back to ordinary UDP instead of SERVFAIL.
+    crate::dns::forwarder::parse_dns_question(data).is_some()
 }
 
-/// Exact mirror of the DNS controller's UDP acceptance condition
-/// (`dns_control::is_dns_query` is private to that module).
-///
-/// `handle_udp_dns` consumes a datagram iff this returns true: the port-53 /
-/// DNS-payload check in `serve_udp_connection` only decides whether the
-/// original destination is rewritten to port 53 before the same payload test
-/// runs (and `is_dns_query` already implies a DNS-shaped payload). Datagrams
-/// failing this check are guaranteed to fall through the DNS fast path, so
-/// the UDP fast path may safely skip the DNS controller for them.
-pub(super) fn might_be_dns_query(data: &[u8]) -> bool {
-    if data.len() < 12 {
-        return false;
+/// Bounds-safe name walk that enforces the RFC expanded-name limit and
+/// restricts compression pointers to previously observed label boundaries.
+fn skip_strict_dns_name(data: &[u8], pos: &mut usize, label_boundaries: &mut [bool]) -> bool {
+    let mut cursor = *pos;
+    let mut expanded = 0usize;
+    let mut jumped = false;
+    let mut depth = 0usize;
+
+    loop {
+        if depth > 128 || cursor >= data.len() || cursor >= label_boundaries.len() {
+            return false;
+        }
+
+        if jumped {
+            if !label_boundaries[cursor] {
+                return false;
+            }
+        } else {
+            label_boundaries[cursor] = true;
+        }
+
+        let label_len = data[cursor];
+        if label_len == 0 {
+            if expanded.checked_add(1).is_none_or(|v| v > 255) {
+                return false;
+            }
+            if !jumped {
+                *pos = cursor + 1;
+            }
+            return true;
+        }
+
+        if label_len & 0xc0 == 0xc0 {
+            let Some(&next) = data.get(cursor + 1) else {
+                return false;
+            };
+            let target = (((label_len & 0x3f) as usize) << 8) | next as usize;
+            // Pointers name an earlier observed label start only.
+            if target >= cursor || target >= label_boundaries.len() || !label_boundaries[target] {
+                return false;
+            }
+            if !jumped {
+                *pos = cursor + 2;
+            }
+            jumped = true;
+            cursor = target;
+            depth += 1;
+            continue;
+        }
+
+        if label_len > 63 {
+            return false;
+        }
+
+        let label_octets = 1 + label_len as usize;
+        expanded = match expanded.checked_add(label_octets) {
+            Some(v) if v <= 255 => v,
+            _ => return false,
+        };
+        let Some(next_pos) = cursor.checked_add(label_octets) else {
+            return false;
+        };
+        if next_pos > data.len() {
+            return false;
+        }
+        cursor = next_pos;
     }
-    // QR bit must be 0 (query).
-    if data[2] & 0x80 != 0 {
-        return false;
-    }
-    crate::dns::forwarder::parse_dns_question(data).is_some()
 }
 
 /// UDP datapath fast path: classify/drop and, for a live Ready endpoint,
@@ -878,9 +1236,10 @@ pub(super) async fn udp_fast_path(
         return true;
     }
 
-    // Anything the DNS controller would consume takes the slow path (exact
-    // acceptance condition, not an approximation — see might_be_dns_query).
-    if might_be_dns_query(data) {
+    // Only traffic the controller can consume takes the DNS slow path. The
+    // shared strict predicate guards any PKTINFO-derived port 53; DNS-shaped
+    // traffic to every other authoritative port remains ordinary UDP.
+    if original_dst.port() == 53 && is_exact_dns_query(data) {
         return false;
     }
 

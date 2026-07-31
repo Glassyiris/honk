@@ -926,7 +926,14 @@ impl ControlPlane {
 
                 recv_result = recv_from_with_orig_dst(&udp4_socket, &mut udp4_buf) => {
                     match recv_result {
-                        Ok((n, src_addr, original_dst)) => {
+                        Ok((n, src_addr, recv_meta)) => {
+                            let Some(original_dst) = udp_original_dst(&recv_meta, &udp4_buf[..n]) else {
+                                debug!(
+                                    "Dropping UDP from {} without original-destination provenance",
+                                    src_addr
+                                );
+                                continue;
+                            };
                             if drain.should_reject() {
                                 self.stats.record_udp_slow_permit_closed();
                                 continue;
@@ -953,11 +960,18 @@ impl ControlPlane {
                     if let Some(ref s) = udp6_socket {
                         recv_from_with_orig_dst(s, &mut udp6_buf).await
                     } else {
-                        std::future::pending::<io::Result<(usize, SocketAddr, SocketAddr)>>().await
+                        std::future::pending::<io::Result<(usize, SocketAddr, UdpRecvMeta)>>().await
                     }
                 } => {
                     match recv6_result {
-                        Ok((n, src_addr, original_dst)) => {
+                        Ok((n, src_addr, recv_meta)) => {
+                            let Some(original_dst) = udp_original_dst(&recv_meta, &udp6_buf[..n]) else {
+                                debug!(
+                                    "Dropping UDPv6 from {} without original-destination provenance",
+                                    src_addr
+                                );
+                                continue;
+                            };
                             if drain.should_reject() {
                                 self.stats.record_udp_slow_permit_closed();
                                 continue;
@@ -1078,23 +1092,12 @@ enum UdpSlowPathWork {
     Done,
 }
 
-/// Rewrite destination the same way `initialize_udp_connection` does before
-/// handing a datagram to `DnsController::handle_udp_dns`.
-fn dns_controller_dst(original_dst: SocketAddr, data: &[u8]) -> SocketAddr {
-    if original_dst.port() == 53 {
-        original_dst
-    } else if is_dns_payload(data) {
-        SocketAddr::new(original_dst.ip(), 53)
-    } else {
-        original_dst
-    }
-}
-
 /// Shared production admission helper used by both listener families and by
 /// focused tests. Order is always:
 /// `slow permit → (optional heap copy for DNS task) → reserve_or_enqueue`.
-/// DNS-shaped packets do not reserve/enqueue here; they return
-/// [`UdpSlowPathWork::DnsThenMaybeInitialize`] so the controller runs first.
+/// Only strict DNS queries whose authoritative destination is port 53 return
+/// [`UdpSlowPathWork::DnsThenMaybeInitialize`]; DNS-shaped non-53 UDP stays
+/// on ordinary forwarding.
 fn begin_udp_slow_path(
     pool: &Arc<UdpEndpointPool>,
     stats: &StatsManager,
@@ -1106,7 +1109,7 @@ fn begin_udp_slow_path(
     let Some(permit) = try_admit_udp_slow_path(stats, concurrency_limit) else {
         return UdpSlowPathWork::Done;
     };
-    if might_be_dns_query(data) {
+    if original_dst.port() == 53 && is_exact_dns_query(data) {
         // Permit is acquired before the heap copy required to leave the
         // receive buffer for a permit-bounded DNS task.
         return UdpSlowPathWork::DnsThenMaybeInitialize {
@@ -1137,9 +1140,8 @@ async fn complete_udp_dns_slow_path(
     permit: tokio::sync::OwnedSemaphorePermit,
     data: &[u8],
 ) -> Option<UdpInitLease> {
-    let dns_dst = dns_controller_dst(original_dst, data);
     match dns_controller
-        .handle_udp_dns(udp_socket, data, src_addr, dns_dst)
+        .handle_udp_dns(udp_socket, data, src_addr, original_dst)
         .await
     {
         Ok(true) => return None,
@@ -1150,7 +1152,7 @@ async fn complete_udp_dns_slow_path(
             // endpoint admission has had a chance to forward it.
             warn!(
                 "DNS controller error for UDP {} -> {}; continuing UDP: {}",
-                src_addr, dns_dst, error
+                src_addr, original_dst, error
             );
         }
     }

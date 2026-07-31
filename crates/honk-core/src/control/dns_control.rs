@@ -594,14 +594,10 @@ impl DnsController {
     }
 }
 
+/// Delegate controller admission to the shared strict predicate used by UDP
+/// provenance and both dispatch paths; forwarding behavior remains unchanged.
 fn is_dns_query(data: &[u8]) -> bool {
-    if data.len() < 12 {
-        return false;
-    }
-    if data[2] & 0x80 != 0 {
-        return false;
-    }
-    crate::dns::forwarder::parse_dns_question(data).is_some()
+    super::is_exact_dns_query(data)
 }
 
 fn build_dns_servfail(query: &[u8]) -> Vec<u8> {
@@ -715,6 +711,25 @@ mod singleflight_tests {
         resp[2] = 0x81;
         resp[3] = 0x80;
         resp
+    }
+
+    #[test]
+    fn dns_control_strict_query_predicate_rejects_unconsumed_or_forged_wire() {
+        let query = crate::dns::forwarder::build_dns_query("example.com", 1);
+        assert!(is_dns_query(&query));
+
+        let mut forged_question_count = query.clone();
+        forged_question_count[4..6].copy_from_slice(&2u16.to_be_bytes());
+        assert!(!is_dns_query(&forged_question_count));
+
+        let mut trailing_junk = query.clone();
+        trailing_junk.push(0xde);
+        assert!(!is_dns_query(&trailing_junk));
+
+        let mut truncated_rr = query;
+        truncated_rr[6..8].copy_from_slice(&1u16.to_be_bytes());
+        truncated_rr.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01]);
+        assert!(!is_dns_query(&truncated_rr));
     }
 
     /// Concurrent duplicate queries share one upstream flight, and each

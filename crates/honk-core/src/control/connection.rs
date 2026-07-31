@@ -1216,17 +1216,10 @@ impl ControlPlaneHandle {
             return Ok(());
         }
 
-        let dns_original_dst = if original_dst.port() == 53 {
-            original_dst
-        } else if is_dns_payload(&data) {
-            SocketAddr::new(original_dst.ip(), 53)
-        } else {
-            original_dst
-        };
         if !lease.dns_checked() {
             match self
                 .dns_controller
-                .handle_udp_dns(&udp_socket, &data, client_addr, dns_original_dst)
+                .handle_udp_dns(&udp_socket, &data, client_addr, original_dst)
                 .await
             {
                 Ok(true) => return Ok(()),
@@ -1236,7 +1229,7 @@ impl ControlPlaneHandle {
                     // declines with an error, matching the pre-Task3 path.
                     warn!(
                         "DNS controller error for UDP {} -> {}; continuing UDP: {}",
-                        client_addr, dns_original_dst, error
+                        client_addr, original_dst, error
                     );
                 }
             }
