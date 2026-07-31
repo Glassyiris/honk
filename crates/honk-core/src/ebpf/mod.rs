@@ -180,18 +180,16 @@ pub trait EbpfBackend: Send + Sync {
     /// eBPF listen_socket_map so TC programs can bpf_sk_assign() inbound proxy
     /// traffic directly to the userspace listeners.
     ///
-    /// Key mapping matches Go dae-core with the addition of a dedicated IPv6
-    /// UDP listener:
-    ///   0 -> IPv4 TCP listener
-    ///   1 -> IPv4 UDP listener
-    ///   2 -> IPv6 TCP listener
-    ///   3 -> IPv6 UDP listener
+    /// Key mapping: 0 = IPv4 TCP, 1 = IPv6 TCP, 2.. = IPv4 UDP group,
+    /// 2 + UDP_LISTENER_COUNT.. = IPv6 UDP group. The eBPF programs hash the
+    /// flow tuple into the UDP group, so `udp4_fds`/`udp6_fds` must be in
+    /// hash-slot order.
     fn publish_listener_sockets(
         &mut self,
         _tcp4_fd: std::os::unix::io::RawFd,
         _tcp6_fd: std::os::unix::io::RawFd,
-        _udp4_fd: std::os::unix::io::RawFd,
-        _udp6_fd: std::os::unix::io::RawFd,
+        _udp4_fds: &[std::os::unix::io::RawFd],
+        _udp6_fds: &[std::os::unix::io::RawFd],
     ) -> anyhow::Result<()> {
         Ok(())
     }
