@@ -188,8 +188,13 @@ fn default_route_iface() -> Option<String> {
 }
 
 fn default_tproxy_mark() -> u32 {
-    0x08000000
+    DEFAULT_TPROXY_MARK
 }
+
+/// The only valid `global.tproxy_mark`: the eBPF datapath has the mark
+/// compiled in, so userspace cannot honor any other value. honk-core pins
+/// this against `honk_ebpf_common::TPROXY_MARK` with a unit test.
+pub const DEFAULT_TPROXY_MARK: u32 = 0x0800_0000;
 fn default_log_level() -> String {
     "info".into()
 }

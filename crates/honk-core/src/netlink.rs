@@ -806,6 +806,14 @@ mod tests {
     }
 
     #[test]
+    fn tproxy_mark_default_matches_datapath() {
+        assert_eq!(
+            honk_config::config::DEFAULT_TPROXY_MARK,
+            honk_ebpf_common::TPROXY_MARK
+        );
+    }
+
+    #[test]
     fn get_link_lo() {
         let mut nl = NlSock::new().unwrap();
         let (idx, _mac) = nl.get_link("lo").expect("lo must exist");
