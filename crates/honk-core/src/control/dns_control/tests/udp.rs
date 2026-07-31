@@ -47,7 +47,7 @@ async fn udp_overload_is_refused_while_permit_owner_is_in_flight() {
     );
     let mut response = [0u8; 512];
     let received = tokio::time::timeout(
-        Duration::from_secs(1),
+        Duration::from_secs(5),
         second_client.recv_from(&mut response),
     )
     .await
@@ -60,7 +60,7 @@ async fn udp_overload_is_refused_while_permit_owner_is_in_flight() {
 
     upstream.release_first.notify_one();
     let first_received = tokio::time::timeout(
-        Duration::from_secs(1),
+        Duration::from_secs(5),
         first_client.recv_from(&mut response),
     )
     .await

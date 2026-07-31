@@ -47,8 +47,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # x86_64 ships two binaries: mimalloc (default, faster QUIC) and
-          # stock malloc (lower RSS high-water on small gateways).
+          # Both arches ship two binaries: mimalloc (default, faster QUIC)
+          # and stock malloc (lower RSS high-water on small gateways).
           - target: x86_64-unknown-linux-gnu
             suffix: ""
           - target: x86_64-unknown-linux-gnu
@@ -59,8 +59,12 @@ jobs:
             suffix: "-stock"
           - target: aarch64-unknown-linux-gnu
             suffix: ""
+          - target: aarch64-unknown-linux-gnu
+            suffix: "-stock"
           - target: aarch64-unknown-linux-musl
             suffix: ""
+          - target: aarch64-unknown-linux-musl
+            suffix: "-stock"
     steps:
       - uses: actions/checkout@v5
 
