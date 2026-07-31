@@ -111,6 +111,71 @@ ssh root@10.10.10.57 "bash /root/lab-bench.sh 'honk dae' 'hy2 tuic ss2022 trojan
 ssh root@10.10.10.57 bash /root/test-protocols.sh
 ```
 
+## Results (2026-07-31, honk dev `ac64fe1` vs dae kdae `eee7c88b`)
+
+Same-time A/B on the lab. honk is the musl release binary (mimalloc,
+periodic `mi_collect` on a blocking thread, idle drain deadline); dae is
+the kdae branch at `eee7c88b` (adds a DNS group-override fix and bumps the
+outbound fork to `perf/complete-optimizations@670df833`). Latencies in
+seconds, bandwidth is the iperf3 receiver median, CPU in cores, RSS after
+the run. New in this run: **the kdae direct baseline works** (it was
+broken in the 07-30 run).
+
+| engine | protocol | cold | hot p50 | hot p95 | bw (Mbps) | cpu | RSS (MB) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| honk | direct | 0.0052 | – | – | 9406 | 0.24 | 52 |
+| honk | hy2 | 0.0101 | 0.0032 | 0.0046 | 2921 | 0.48 | 59 |
+| honk | tuic | 0.0093 | 0.0034 | 0.0043 | 3961 | 0.55 | 59 |
+| honk | ss2022 | 0.0044 | 0.0027 | 0.0040 | 9392 | 0.36 | 52 |
+| honk | trojan | 0.0072 | 0.0019 | 0.0120 | 9341 | 0.45 | 53 |
+| honk | anytls-sb | 0.0050 | 0.0031 | 0.0039 | 4790 | 0.30 | 57 |
+| honk | anytls-go | 0.0122 | 0.0032 | 0.0040 | 9226 | 0.49 | 56 |
+| dae | direct | 0.0051 | – | – | 9397 | 0.00 | 52 |
+| dae | hy2 | 0.0090 | 0.0032 | 0.0037 | 3005 | 0.82 | 63 |
+| dae | tuic | 0.0827 | 0.0792 | 0.0800 | 4280 | 0.93 | 64 |
+| dae | ss2022 | 0.0040 | 0.0036 | 0.0062 | 9404 | 0.42 | 57 |
+| dae | trojan | 0.0105 | 0.0078 | 0.0100 | 9340 | 0.65 | 57 |
+| dae | anytls-sb | 0.0112 | 0.0029 | 0.0038 | 4742 | 0.37 | 58 |
+| dae | anytls-go | 0.0069 | 0.0034 | 0.0046 | 9301 | 0.63 | 60 |
+
+UDP (iperf3 `-u -b 10G -l 1200 -R`, receiver Mbps + loss):
+
+| engine | protocol | echo RTT p50 | bw Mbps (loss) | cpu |
+| --- | --- | --- | --- | --- |
+| honk | hy2 | 0.43 ms | 1708 (72.9%) | 1.07 |
+| honk | tuic | 0.31 ms | 142 (64.5%) | 0.13 |
+| honk | ss2022 | 0.22 ms | 1879 (66.6%) | 1.28 |
+| honk | trojan | 0.18 ms | 1609 (71.9%) | 1.27 |
+| honk | anytls-sb | 0.49 ms | 1308 (78.2%) | 0.86 |
+| honk | anytls-go | 0.18 ms | 1607 (74.2%) | 1.04 |
+| dae | hy2 | 0.27 ms | 929 (85.9%) | 0.95 |
+| dae | tuic | 0.28 ms | 60 (52.4%) | 0.06 |
+| dae | ss2022 | 0.16 ms | 2705 (52.4%) | 1.74 |
+| dae | trojan | 0.11 ms | 2972 (48.7%) | 1.69 |
+| dae | anytls-sb | 0.13 ms | 1305 (78.8%) | 0.85 |
+| dae | anytls-go | 0.10 ms | 1413 (76.0%) | 0.92 |
+
+### Reading the 07-31 table
+
+- **TCP bandwidth** is parity within noise: line-rate rows (direct,
+  ss2022, trojan, anytls-go) all ~9.3–9.4 Gbps both engines; anytls-sb is
+  now a tie too (4790 vs 4742 — the new kdae no longer dominates that
+  row). hy2/tuic slightly favor dae (3005/4280 vs 2921/3961).
+- **CPU per Gbps** still belongs to honk on every QUIC row: hy2 0.48 vs
+  0.82 cores, tuic 0.55 vs 0.93, and trojan 0.45 vs 0.65 at identical
+  bandwidth.
+- **Latency**: dae's tuic still pays a full QUIC handshake per connection
+  (cold 82.7 ms, hot p50 79.2 ms vs honk's 9.3/3.4 ms, ticket-cache
+  resumed). Everything else is single-digit ms both ways.
+- **UDP**: honk leads hy2 (1708 vs 929) and anytls-go; the ss2022/trojan
+  UDP-over-TCP gap persists (dae 2705/2972 vs honk 1879/1609) and remains
+  the top UDP optimization target. TUIC UDP is broken-ish on both engines
+  (142/60 Mbps).
+- honk's hy2/tuic TCP bandwidth dropped vs the 07-30 run (5239→2921,
+  5351→3961) while dae's stayed flat; the .70 lab host was under heavy
+  parallel load during this run, so treat these two rows as suspect until
+  re-measured on an idle lab.
+
 ## Results (2026-07-30, honk dev post-session-phases vs dae kdae, AES-NI)
 
 Same-time A/B on the lab (engine VM with host-passthrough CPU; see "Known

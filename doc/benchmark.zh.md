@@ -97,6 +97,66 @@ ssh root@10.10.10.57 "bash /root/lab-bench.sh 'honk dae' 'hy2 tuic ss2022 trojan
 ssh root@10.10.10.57 bash /root/test-protocols.sh
 ```
 
+## 结果(2026-07-31,honk dev `ac64fe1` vs dae kdae `eee7c88b`)
+
+实验室同时刻 A/B。honk 为 musl release 构建(mimalloc,周期性
+`mi_collect` 已移至 blocking 线程并延迟首个周期,drain 改为空闲超时);
+dae 为 kdae 分支 `eee7c88b`(新增 DNS group override 修复,outbound
+fork 升至 `perf/complete-optimizations@670df833`)。延迟单位秒,带宽为
+iperf3 接收端中位数,CPU 单位核,RSS 为跑后值。本轮新情况:**kdae 的
+direct 基线已修复**(07-30 轮是坏的)。
+
+| 引擎 | 协议 | cold | hot p50 | hot p95 | bw (Mbps) | cpu | RSS (MB) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| honk | direct | 0.0052 | – | – | 9406 | 0.24 | 52 |
+| honk | hy2 | 0.0101 | 0.0032 | 0.0046 | 2921 | 0.48 | 59 |
+| honk | tuic | 0.0093 | 0.0034 | 0.0043 | 3961 | 0.55 | 59 |
+| honk | ss2022 | 0.0044 | 0.0027 | 0.0040 | 9392 | 0.36 | 52 |
+| honk | trojan | 0.0072 | 0.0019 | 0.0120 | 9341 | 0.45 | 53 |
+| honk | anytls-sb | 0.0050 | 0.0031 | 0.0039 | 4790 | 0.30 | 57 |
+| honk | anytls-go | 0.0122 | 0.0032 | 0.0040 | 9226 | 0.49 | 56 |
+| dae | direct | 0.0051 | – | – | 9397 | 0.00 | 52 |
+| dae | hy2 | 0.0090 | 0.0032 | 0.0037 | 3005 | 0.82 | 63 |
+| dae | tuic | 0.0827 | 0.0792 | 0.0800 | 4280 | 0.93 | 64 |
+| dae | ss2022 | 0.0040 | 0.0036 | 0.0062 | 9404 | 0.42 | 57 |
+| dae | trojan | 0.0105 | 0.0078 | 0.0100 | 9340 | 0.65 | 57 |
+| dae | anytls-sb | 0.0112 | 0.0029 | 0.0038 | 4742 | 0.37 | 58 |
+| dae | anytls-go | 0.0069 | 0.0034 | 0.0046 | 9301 | 0.63 | 60 |
+
+UDP(iperf3 `-u -b 10G -l 1200 -R`,接收端 Mbps + 丢包):
+
+| 引擎 | 协议 | echo RTT p50 | bw Mbps (丢包) | cpu |
+| --- | --- | --- | --- | --- |
+| honk | hy2 | 0.43 ms | 1708 (72.9%) | 1.07 |
+| honk | tuic | 0.31 ms | 142 (64.5%) | 0.13 |
+| honk | ss2022 | 0.22 ms | 1879 (66.6%) | 1.28 |
+| honk | trojan | 0.18 ms | 1609 (71.9%) | 1.27 |
+| honk | anytls-sb | 0.49 ms | 1308 (78.2%) | 0.86 |
+| honk | anytls-go | 0.18 ms | 1607 (74.2%) | 1.04 |
+| dae | hy2 | 0.27 ms | 929 (85.9%) | 0.95 |
+| dae | tuic | 0.28 ms | 60 (52.4%) | 0.06 |
+| dae | ss2022 | 0.16 ms | 2705 (52.4%) | 1.74 |
+| dae | trojan | 0.11 ms | 2972 (48.7%) | 1.69 |
+| dae | anytls-sb | 0.13 ms | 1305 (78.8%) | 0.85 |
+| dae | anytls-go | 0.10 ms | 1413 (76.0%) | 0.92 |
+
+### 07-31 结果解读
+
+- **TCP 带宽**基本持平:线速行(direct、ss2022、trojan、anytls-go)
+  两边都在 ~9.3–9.4 Gbps;anytls-sb 也首次打平(4790 vs 4742——新
+  kdae 在这一行不再领先)。hy2/tuic 略偏 dae(3005/4280 vs 2921/3961)。
+- **每 Gbps CPU** 依然是 honk 的强项,全部 QUIC 行:hy2 0.48 vs
+  0.82 核,tuic 0.55 vs 0.93,trojan 同带宽下 0.45 vs 0.65。
+- **延迟**:dae 的 tuic 仍为每条连接付完整 QUIC 握手(cold 82.7ms、
+  hot p50 79.2ms;honk 靠票据缓存恢复,9.3/3.4ms)。其余行都在个位
+  数毫秒。
+- **UDP**:honk 领先 hy2(1708 vs 929)与 anytls-go;ss2022/trojan 的
+  UDP-over-TCP 差距仍在(dae 2705/2972 vs honk 1879/1609),仍是 UDP
+  方向的头号优化目标。tuic UDP 两边都差(142/60 Mbps)。
+- honk 的 hy2/tuic TCP 带宽较 07-30 轮下降明显(5239→2921、
+  5351→3961)而 dae 基本持平;本轮跑测时 .70 实验宿主机有高并发负
+  载,这两行标记为存疑,待实验室空闲时复测确认。
+
 ## 结果(2026-07-30,honk dev session 各阶段完成后 vs dae kdae,AES-NI)
 
 实验室同时刻 A/B(引擎 VM 已换 host 透传 CPU;更早的软件加密时代见
