@@ -501,12 +501,17 @@ impl PacketTransport for TrojanUdpTransport {
                 "trojan udp frame too large",
             ));
         }
+        // Drop instead of contending on the writer: parking the flow task
+        // behind another packet's TLS write costs more than the loss.
+        let Ok(mut writer) = self.writer.try_lock() else {
+            return Ok(());
+        };
         let mut frame = Vec::with_capacity(self.addr_header.len() + 4 + data.len());
         frame.extend_from_slice(&self.addr_header);
         frame.extend_from_slice(&(data.len() as u16).to_be_bytes());
         frame.extend_from_slice(CRLF);
         frame.extend_from_slice(data);
-        self.writer.lock().await.write_all(&frame).await
+        writer.write_all(&frame).await
     }
 
     async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
