@@ -1,6 +1,56 @@
 use super::*;
 
 impl ControlPlane {
+    /// Stop and join the prior generation's warm coordinator. Aborting the
+    /// parent drops its JoinSet, so in-flight child dispatches are cancelled
+    /// without becoming health or per-outbound error events.
+    pub(super) async fn stop_udp_warm_coordinator(&self) {
+        let handle = self.udp_warm_task.lock().await.take();
+        if let Some(handle) = handle {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+
+    /// Start a warm coordinator bound to one immutable runtime generation.
+    /// A zero count is a strict no-op: no task is created and no warm metrics
+    /// are touched.
+    pub(super) async fn start_udp_warm_coordinator(
+        &self,
+        generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
+    ) {
+        if generation.is_shutdown() {
+            return;
+        }
+        let config = self.config.read().await.clone();
+        let count = config.global.udp_warm_node_count;
+        if count == 0 {
+            return;
+        }
+        let group_manager = self.group_manager.read().clone();
+        let candidates = udp_warm_candidates(&config, &group_manager, &generation, count);
+        if candidates.is_empty() {
+            return;
+        }
+        let connect_timeout = Duration::from_millis(config.global.connect_timeout_ms);
+        let proxy_registry = self.proxy_registry.clone();
+        let dispatch = Arc::new(move |generation, node_id| {
+            let proxy_registry = proxy_registry.clone();
+            async move {
+                proxy_registry
+                    .warm_udp(generation, node_id, connect_timeout)
+                    .await
+            }
+        });
+        let handle = tokio::spawn(run_udp_warm_dispatches(
+            candidates,
+            generation,
+            self.stats.clone(),
+            dispatch,
+        ));
+        *self.udp_warm_task.lock().await = Some(handle);
+    }
+
     /// Apply a rebuilt config to the running control plane: swap the
     /// userspace router and the shared config, refresh the node→outbound id
     /// map, rebuild the GroupManager (migrating runtime selector choices),
@@ -60,7 +110,7 @@ impl ControlPlane {
         let new_outbound_id_map = build_outbound_id_map(&new_config);
         // Per-node runtime registry for the next generation; invalid node
         // sets (nil/duplicate UUIDs) abort the reload untouched.
-        let new_runtime_registry =
+        let new_runtime_registry = Arc::new(
             match honk_outbound::runtime::OutboundRuntimeRegistry::build(&new_config.nodes) {
                 Ok(r) => r,
                 Err(e) => {
@@ -68,7 +118,8 @@ impl ControlPlane {
                     drain.stop_rejecting();
                     return;
                 }
-            };
+            },
+        );
         let bootstrap = new_config.global.bootstrap_resolver.clone();
         let direct_target = super::direct_check_addr(&bootstrap);
 
@@ -108,9 +159,13 @@ impl ControlPlane {
         // Swap the runtime registry and shut the old generation's down.
         let old_registry = std::mem::replace(
             &mut *self.runtime_registry.write(),
-            Arc::new(new_runtime_registry),
+            Arc::clone(&new_runtime_registry),
         );
+        // Terminally close the old generation before aborting/draining its
+        // coordinator; any completion racing that boundary is neutral.
         old_registry.shutdown();
+        self.stop_udp_warm_coordinator().await;
+        self.start_udp_warm_coordinator(new_runtime_registry).await;
         // Rebuild learned domain→IP routes with the new rule-index bitmaps.
         self.dns_controller.rebuild_domain_routes().await;
         info!("Configuration applied — {} routes active", route_count);
@@ -218,6 +273,111 @@ impl ControlPlane {
             added,
             removed,
         );
+    }
+}
+
+/// Select the real current DataUdp leaves of configured groups for one warm
+/// generation. This deliberately reuses the data-plane resolver, preserving
+/// nested/final choices and UDP liveness; cold URLTest plans, synthetic
+/// direct/block leaves, standalone nodes, and missing runtime entries stay
+/// out. UUID order is first occurrence in configured group, V4, then V6
+/// order and the supplied budget counts dispatches, not successes.
+pub(super) fn udp_warm_candidates(
+    config: &Config,
+    group_manager: &GroupManager,
+    generation: &honk_outbound::runtime::OutboundRuntimeRegistry,
+    budget: usize,
+) -> Vec<uuid::Uuid> {
+    if budget == 0 || generation.is_shutdown() {
+        return Vec::new();
+    }
+    let configured_ids: std::collections::HashSet<uuid::Uuid> =
+        config.nodes.iter().map(|node| node.id).collect();
+    let mut selected = Vec::with_capacity(budget.min(config.nodes.len()));
+    let mut seen = std::collections::HashSet::new();
+    for group in &config.groups {
+        for ipver in [IpVersion::V4, IpVersion::V6] {
+            let plan = resolve_udp_outbound_plan_peek(config, group_manager, &group.name, ipver);
+            if plan.mode == honk_outbound::group::SelectionPlanMode::ColdUrlTest {
+                continue;
+            }
+            for node in plan.nodes {
+                if node.name == "direct" || node.name == "block" {
+                    continue;
+                }
+                if !configured_ids.contains(&node.id) || generation.get(&node.id).is_none() {
+                    continue;
+                }
+                if seen.insert(node.id) {
+                    selected.push(node.id);
+                    if selected.len() == budget {
+                        return selected;
+                    }
+                }
+            }
+        }
+    }
+    selected
+}
+
+/// Execute generation-owned warm dispatches with exactly the fixed aggregate
+/// metrics contract. Neither cancellation nor a terminal generation mutates
+/// outbound health or per-node error state.
+async fn run_udp_warm_dispatches<F, Fut>(
+    candidates: Vec<uuid::Uuid>,
+    generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
+    stats: Arc<StatsManager>,
+    dispatch: Arc<F>,
+) where
+    F: Fn(Arc<honk_outbound::runtime::OutboundRuntimeRegistry>, uuid::Uuid) -> Fut
+        + Send
+        + Sync
+        + 'static,
+    Fut: std::future::Future<Output = anyhow::Result<honk_outbound::proxy::UdpWarmStatus>>
+        + Send
+        + 'static,
+{
+    if candidates.is_empty() {
+        return;
+    }
+    let mut pending = candidates.into_iter();
+    let mut tasks = tokio::task::JoinSet::new();
+    loop {
+        while tasks.len() < 4 {
+            let Some(node_id) = pending.next() else {
+                break;
+            };
+            let generation = Arc::clone(&generation);
+            let stats = Arc::clone(&stats);
+            let dispatch = Arc::clone(&dispatch);
+            tasks.spawn(async move {
+                stats.record_udp_warm_attempt();
+                match dispatch(generation.clone(), node_id).await {
+                    Ok(
+                        honk_outbound::proxy::UdpWarmStatus::Ready
+                        | honk_outbound::proxy::UdpWarmStatus::AlreadyReady,
+                    ) => stats.record_udp_warm_success(),
+                    Ok(honk_outbound::proxy::UdpWarmStatus::NotApplicable) => {}
+                    Err(err) if generation.is_shutdown() => {
+                        debug!("UDP warm ended with terminal generation: {err}");
+                    }
+                    Err(err) => {
+                        debug!("UDP warm failed: {err}");
+                        stats.record_udp_warm_failure();
+                    }
+                }
+            });
+        }
+        if tasks.is_empty() {
+            break;
+        }
+        if let Some(Err(err)) = tasks.join_next().await
+            && err.is_panic()
+            && !generation.is_shutdown()
+        {
+            debug!("UDP warm dispatch panicked: {err}");
+            stats.record_udp_warm_failure();
+        }
     }
 }
 
@@ -536,6 +696,15 @@ pub(super) struct ResolvedUdpPlan {
     pub(super) ipver: IpVersion,
 }
 
+/// Select whether recursive UDP plan resolution is serving traffic or only
+/// observing it for warm-up. The complete final/nesting/family fallback walk
+/// is shared; only the GroupManager selection effects differ.
+#[derive(Clone, Copy)]
+enum UdpResolutionEffects {
+    Apply,
+    Peek,
+}
+
 fn direct_udp_plan(name: &str, ipver: IpVersion) -> ResolvedUdpPlan {
     ResolvedUdpPlan {
         mode: honk_outbound::group::SelectionPlanMode::Authoritative,
@@ -568,6 +737,28 @@ pub(super) fn resolve_udp_outbound_plan(
         ipver,
         0,
         &mut Vec::new(),
+        UdpResolutionEffects::Apply,
+    )
+}
+
+/// Resolve the same UDP plan as the data path without causing any group
+/// selection side effects. Warm-up may read liveness and current choices, but
+/// must not consume a round-robin cursor, wake URLTest, write a cache, or
+/// interrupt active connections.
+fn resolve_udp_outbound_plan_peek(
+    config: &Config,
+    group_manager: &GroupManager,
+    outbound_name: &str,
+    ipver: IpVersion,
+) -> ResolvedUdpPlan {
+    resolve_udp_outbound_plan_inner(
+        config,
+        group_manager,
+        outbound_name,
+        ipver,
+        0,
+        &mut Vec::new(),
+        UdpResolutionEffects::Peek,
     )
 }
 
@@ -578,6 +769,7 @@ fn resolve_udp_outbound_plan_inner(
     ipver: IpVersion,
     depth: usize,
     visited: &mut Vec<String>,
+    effects: UdpResolutionEffects,
 ) -> ResolvedUdpPlan {
     if outbound_name == "direct" || outbound_name == "block" {
         return direct_udp_plan(outbound_name, ipver);
@@ -635,17 +827,34 @@ fn resolve_udp_outbound_plan_inner(
 
     visited.push(outbound_name.to_owned());
     let mut selected_ipver = ipver;
-    let mut plan =
-        group_manager.selection_plan_for_domain(&group.name, ProbeDomain::DataUdp, selected_ipver);
+    let mut plan = match effects {
+        UdpResolutionEffects::Apply => group_manager.selection_plan_for_domain(
+            &group.name,
+            ProbeDomain::DataUdp,
+            selected_ipver,
+        ),
+        UdpResolutionEffects::Peek => group_manager.peek_selection_plan_for_domain(
+            &group.name,
+            ProbeDomain::DataUdp,
+            selected_ipver,
+        ),
+    };
     // Proxy servers frequently have only an A record. Preserve that concrete
     // fallback family for traffic health feedback rather than reporting the
     // original IPv6 destination family.
     if plan.nodes.is_empty() && ipver == IpVersion::V6 {
-        plan = group_manager.selection_plan_for_domain(
-            &group.name,
-            ProbeDomain::DataUdp,
-            IpVersion::V4,
-        );
+        plan = match effects {
+            UdpResolutionEffects::Apply => group_manager.selection_plan_for_domain(
+                &group.name,
+                ProbeDomain::DataUdp,
+                IpVersion::V4,
+            ),
+            UdpResolutionEffects::Peek => group_manager.peek_selection_plan_for_domain(
+                &group.name,
+                ProbeDomain::DataUdp,
+                IpVersion::V4,
+            ),
+        };
         if !plan.nodes.is_empty() {
             selected_ipver = IpVersion::V4;
             warn!(
@@ -675,6 +884,7 @@ fn resolve_udp_outbound_plan_inner(
             ipver,
             depth + 1,
             visited,
+            effects,
         );
         visited.pop();
         return terminal;
@@ -1004,5 +1214,523 @@ mod atomic_reload_tests {
             "trace",
             "valid reload should swap the live config"
         );
+    }
+
+    #[tokio::test]
+    async fn default_udp_warm_is_disabled_without_a_task_or_metrics() {
+        let cp = test_cp();
+        let generation = cp.runtime_registry.read().clone();
+
+        cp.start_udp_warm_coordinator(generation).await;
+
+        assert!(
+            cp.udp_warm_task.lock().await.is_none(),
+            "the default zero count must not spawn udp_warm_task"
+        );
+        let snapshot = cp.stats.udp_snapshot();
+        assert_eq!(
+            (
+                snapshot.warm_attempts,
+                snapshot.warm_successes,
+                snapshot.warm_failures
+            ),
+            (0, 0, 0),
+            "the strict no-op must not touch warm metrics"
+        );
+    }
+
+    #[test]
+    fn udp_warm_candidates_only_use_authoritative_group_leaves() {
+        let node = |name: &str, protocol| Node {
+            id: uuid::Uuid::new_v4(),
+            name: name.into(),
+            protocol,
+            address: "127.0.0.1:9".into(),
+            ..Default::default()
+        };
+        let anytls = node("anytls", honk_config::types::NodeProtocol::AnyTLS);
+        let socks = node("socks", honk_config::types::NodeProtocol::Socks5);
+        let cold = node("cold", honk_config::types::NodeProtocol::HTTP);
+        let standalone = node("standalone", honk_config::types::NodeProtocol::HTTP);
+        let groups = vec![
+            Group {
+                name: "first".into(),
+                policy: GroupPolicy::Selector,
+                nodes: vec![anytls.id],
+                ..Default::default()
+            },
+            Group {
+                name: "nested".into(),
+                policy: GroupPolicy::Selector,
+                nodes: vec![socks.id],
+                ..Default::default()
+            },
+            Group {
+                name: "parent".into(),
+                policy: GroupPolicy::Selector,
+                groups: vec!["nested".into()],
+                ..Default::default()
+            },
+            Group {
+                name: "via-final".into(),
+                policy: GroupPolicy::Selector,
+                final_outbound: Some("parent".into()),
+                ..Default::default()
+            },
+            Group {
+                name: "cold-urltest".into(),
+                policy: GroupPolicy::URLTest,
+                nodes: vec![cold.id],
+                ..Default::default()
+            },
+            Group {
+                name: "direct-final".into(),
+                policy: GroupPolicy::Selector,
+                final_outbound: Some("direct".into()),
+                ..Default::default()
+            },
+        ];
+        let mut config = Config::default();
+        config.routing.default_outbound = "direct".into();
+        config.nodes = vec![anytls.clone(), socks.clone(), cold, standalone];
+        config.groups = groups;
+        let manager = GroupManager::new(&config.groups, &config.nodes);
+        let runtime =
+            honk_outbound::runtime::OutboundRuntimeRegistry::build(&config.nodes).unwrap();
+
+        assert_eq!(
+            udp_warm_candidates(&config, &manager, &runtime, 8),
+            vec![anytls.id, socks.id],
+            "V4/V6 and final/nested paths deduplicate UUIDs; cold/direct/standalone stay out"
+        );
+        assert_eq!(
+            udp_warm_candidates(&config, &manager, &runtime, 1),
+            vec![anytls.id]
+        );
+        assert!(udp_warm_candidates(&config, &manager, &runtime, 0).is_empty());
+    }
+
+    #[test]
+    fn udp_warm_candidates_bound_capacity_and_exclude_explicitly_dead_udp_leaves() {
+        let node = |name: &str| Node {
+            id: uuid::Uuid::new_v4(),
+            name: name.into(),
+            protocol: honk_config::types::NodeProtocol::HTTP,
+            address: "127.0.0.1:9".into(),
+            ..Default::default()
+        };
+        let dead = node("dead-udp");
+        let selected = node("selected");
+        let second = node("second");
+        let mut config = Config::default();
+        config.nodes = vec![dead.clone(), selected.clone(), second.clone()];
+        config.groups = vec![
+            Group {
+                name: "first".into(),
+                policy: GroupPolicy::Selector,
+                nodes: vec![dead.id, selected.id],
+                ..Default::default()
+            },
+            Group {
+                name: "second".into(),
+                policy: GroupPolicy::Selector,
+                nodes: vec![second.id],
+                ..Default::default()
+            },
+        ];
+        let alive = Arc::new(crate::outbound::AliveDialerSet::new());
+        for ipver in [IpVersion::V4, IpVersion::V6] {
+            alive.report_unavailable_forced(&dead.name, ProbeDomain::DataUdp, ipver);
+            alive.report_unavailable_forced(&dead.name, ProbeDomain::DnsUdp, ipver);
+        }
+        let manager =
+            GroupManager::with_alive_set(&config.groups, &config.nodes, Some(Arc::clone(&alive)));
+        let runtime =
+            honk_outbound::runtime::OutboundRuntimeRegistry::build(&config.nodes).unwrap();
+
+        assert_eq!(
+            udp_warm_candidates(&config, &manager, &runtime, usize::MAX),
+            vec![selected.id, second.id],
+            "an unbounded configured budget only returns selectable leaves once across V4/V6"
+        );
+        assert_eq!(
+            udp_warm_candidates(&config, &manager, &runtime, 1),
+            vec![selected.id],
+            "the first live leaf is retained while the budget still bounds dispatches"
+        );
+    }
+
+    #[test]
+    fn udp_warm_candidates_do_not_mutate_group_selection_state() {
+        let node = |name: &str| Node {
+            id: uuid::Uuid::new_v4(),
+            name: name.into(),
+            protocol: honk_config::types::NodeProtocol::HTTP,
+            address: "127.0.0.1:9".into(),
+            ..Default::default()
+        };
+        let (lb_a, lb_b, lb_c) = (node("lb-a"), node("lb-b"), node("lb-c"));
+        let (fallback_a, fallback_b, cold) = (node("fallback-a"), node("fallback-b"), node("cold"));
+        let mut config = Config::default();
+        config.nodes = vec![
+            lb_a.clone(),
+            lb_b.clone(),
+            lb_c.clone(),
+            fallback_a.clone(),
+            fallback_b.clone(),
+            cold.clone(),
+        ];
+        let fallback = Group {
+            name: "fallback".into(),
+            policy: GroupPolicy::Fallback,
+            nodes: vec![fallback_a.id, fallback_b.id],
+            interrupt_connections: true,
+            ..Default::default()
+        };
+        config.groups = vec![
+            Group {
+                name: "load-balance".into(),
+                policy: GroupPolicy::LoadBalance,
+                nodes: vec![lb_a.id, lb_b.id, lb_c.id],
+                ..Default::default()
+            },
+            Group {
+                name: "cold-urltest".into(),
+                policy: GroupPolicy::URLTest,
+                nodes: vec![cold.id],
+                ..Default::default()
+            },
+            fallback,
+        ];
+        let alive = Arc::new(crate::outbound::AliveDialerSet::new());
+        alive.register_urltest_group(
+            "cold-urltest",
+            &[cold.name.clone()],
+            Some(Duration::from_secs(60)),
+        );
+        let manager =
+            GroupManager::with_alive_set(&config.groups, &config.nodes, Some(Arc::clone(&alive)));
+        // Advance LB once and set the fallback pin before observing warm-up.
+        assert_eq!(
+            manager
+                .selection_plan_for_domain("load-balance", ProbeDomain::DataUdp, IpVersion::V4)
+                .nodes[0]
+                .id,
+            lb_a.id
+        );
+        assert_eq!(
+            manager
+                .selection_plan_for_domain("fallback", ProbeDomain::DataUdp, IpVersion::V4)
+                .nodes[0]
+                .id,
+            fallback_a.id
+        );
+        let interrupts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_interrupts = Arc::clone(&interrupts);
+        manager.set_interrupt_callback(Some(Arc::new(move |_| {
+            callback_interrupts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })));
+        for ipver in [IpVersion::V4, IpVersion::V6] {
+            for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
+                alive.report_unavailable_forced(&fallback_a.name, domain, ipver);
+            }
+        }
+        assert!(alive.is_urltest_group_idle("cold-urltest"));
+        let runtime =
+            honk_outbound::runtime::OutboundRuntimeRegistry::build(&config.nodes).unwrap();
+
+        assert_eq!(
+            udp_warm_candidates(&config, &manager, &runtime, 4),
+            vec![lb_b.id, fallback_b.id],
+            "V4/V6 observe the same next LB pick and UUID-deduplicate it"
+        );
+        assert!(alive.is_urltest_group_idle("cold-urltest"));
+        assert_eq!(
+            manager.get_fallback_selection("fallback"),
+            Some("fallback-a".into())
+        );
+        assert_eq!(interrupts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            manager
+                .selection_plan_for_domain("load-balance", ProbeDomain::DataUdp, IpVersion::V4)
+                .nodes[0]
+                .id,
+            lb_b.id,
+            "warm discovery must not consume the next real round-robin pick"
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_warm_coordinator_limits_concurrency_and_keeps_shutdown_errors_neutral() {
+        let nodes: Vec<Node> = (0..5)
+            .map(|n| Node {
+                id: uuid::Uuid::new_v4(),
+                name: format!("node-{n}"),
+                protocol: honk_config::types::NodeProtocol::HTTP,
+                address: "127.0.0.1:9".into(),
+                ..Default::default()
+            })
+            .collect();
+        let ids = nodes.iter().map(|node| node.id).collect::<Vec<_>>();
+        let generation =
+            Arc::new(honk_outbound::runtime::OutboundRuntimeRegistry::build(&nodes).unwrap());
+        let stats = Arc::new(StatsManager::new());
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dispatch = {
+            let active = active.clone();
+            let peak = peak.clone();
+            Arc::new(move |_generation, _id| {
+                let active = active.clone();
+                let peak = peak.clone();
+                async move {
+                    let now = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(honk_outbound::proxy::UdpWarmStatus::Ready)
+                }
+            })
+        };
+        run_udp_warm_dispatches(ids, Arc::clone(&generation), stats.clone(), dispatch).await;
+        assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 4);
+        let snapshot = stats.udp_snapshot();
+        assert_eq!(
+            (
+                snapshot.warm_attempts,
+                snapshot.warm_successes,
+                snapshot.warm_failures
+            ),
+            (5, 5, 0)
+        );
+
+        generation.shutdown();
+        let neutral_stats = Arc::new(StatsManager::new());
+        let neutral_dispatch = Arc::new(|_generation, _id| async {
+            Err(anyhow::anyhow!("old generation was shut down"))
+        });
+        run_udp_warm_dispatches(
+            vec![nodes[0].id],
+            generation,
+            neutral_stats.clone(),
+            neutral_dispatch,
+        )
+        .await;
+        let neutral = neutral_stats.udp_snapshot();
+        assert_eq!(
+            (
+                neutral.warm_attempts,
+                neutral.warm_successes,
+                neutral.warm_failures
+            ),
+            (1, 0, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_warm_dispatch_metrics_distinguish_live_and_terminal_errors_and_panics() {
+        #[derive(Clone, Copy)]
+        enum Outcome {
+            Ready,
+            AlreadyReady,
+            NotApplicable,
+            LiveError,
+            TerminalError,
+            LivePanic,
+            TerminalPanic,
+        }
+
+        let cases = [
+            ("ready", Outcome::Ready, 1, 0),
+            ("already-ready", Outcome::AlreadyReady, 1, 0),
+            ("not-applicable", Outcome::NotApplicable, 0, 0),
+            ("live-error", Outcome::LiveError, 0, 1),
+            ("terminal-error", Outcome::TerminalError, 0, 0),
+            ("live-panic", Outcome::LivePanic, 0, 1),
+            ("terminal-panic", Outcome::TerminalPanic, 0, 0),
+        ];
+        let node = Node {
+            id: uuid::Uuid::new_v4(),
+            name: "warm-node".into(),
+            protocol: honk_config::types::NodeProtocol::HTTP,
+            address: "127.0.0.1:9".into(),
+            ..Default::default()
+        };
+
+        for (name, outcome, expected_successes, expected_failures) in cases {
+            let generation = Arc::new(
+                honk_outbound::runtime::OutboundRuntimeRegistry::build(&[node.clone()]).unwrap(),
+            );
+            let stats = Arc::new(StatsManager::new());
+            let dispatch = Arc::new(
+                move |generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
+                      _node_id: uuid::Uuid| async move {
+                    match outcome {
+                        Outcome::Ready => Ok(honk_outbound::proxy::UdpWarmStatus::Ready),
+                        Outcome::AlreadyReady => {
+                            Ok(honk_outbound::proxy::UdpWarmStatus::AlreadyReady)
+                        }
+                        Outcome::NotApplicable => {
+                            Ok(honk_outbound::proxy::UdpWarmStatus::NotApplicable)
+                        }
+                        Outcome::LiveError => Err(anyhow::anyhow!("live warm error")),
+                        Outcome::TerminalError => {
+                            generation.shutdown();
+                            Err(anyhow::anyhow!("terminal warm error"))
+                        }
+                        Outcome::LivePanic => panic!("live warm panic"),
+                        Outcome::TerminalPanic => {
+                            generation.shutdown();
+                            panic!("terminal warm panic")
+                        }
+                    }
+                },
+            );
+
+            run_udp_warm_dispatches(vec![node.id], generation, Arc::clone(&stats), dispatch).await;
+            let snapshot = stats.udp_snapshot();
+            assert_eq!(
+                (
+                    snapshot.warm_attempts,
+                    snapshot.warm_successes,
+                    snapshot.warm_failures,
+                ),
+                (1, expected_successes, expected_failures),
+                "{name} outcome must update only its fixed aggregate metric"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_retires_only_the_old_warm_generation_and_starts_the_new_one() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct WarmCancellation(Arc<AtomicUsize>);
+
+        impl Drop for WarmCancellation {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        #[derive(Debug)]
+        struct BlockingWarmHandler {
+            started: tokio::sync::mpsc::UnboundedSender<Arc<honk_outbound::runtime::NodeRuntime>>,
+            cancelled: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl honk_outbound::proxy::ProxyHandler for BlockingWarmHandler {
+            fn protocol(&self) -> honk_config::types::NodeProtocol {
+                honk_config::types::NodeProtocol::HTTP
+            }
+
+            async fn warm_udp(
+                &self,
+                runtime: Arc<honk_outbound::runtime::NodeRuntime>,
+                _connect_timeout: Duration,
+            ) -> anyhow::Result<honk_outbound::proxy::UdpWarmStatus> {
+                self.started
+                    .send(runtime)
+                    .expect("warm coordinator receiver must stay open");
+                let _cancel = WarmCancellation(self.cancelled.clone());
+                std::future::pending::<()>().await;
+                unreachable!("pending warm dispatch was unexpectedly completed")
+            }
+
+            async fn dial(
+                &self,
+                _node: &Node,
+                _target: std::net::SocketAddr,
+                _target_domain: Option<&str>,
+                _connect_timeout: Duration,
+            ) -> anyhow::Result<honk_outbound::proxy::ProxyStream> {
+                anyhow::bail!("not used by the warm coordinator")
+            }
+        }
+
+        let node = Node {
+            id: uuid::Uuid::new_v4(),
+            name: "warm-node".into(),
+            protocol: honk_config::types::NodeProtocol::HTTP,
+            address: "127.0.0.1:9".into(),
+            ..Default::default()
+        };
+        let mut config = Config::default();
+        config.global.udp_warm_node_count = 1;
+        config.routing.default_outbound = "warm-group".into();
+        config.nodes = vec![node.clone()];
+        config.groups = vec![Group {
+            name: "warm-group".into(),
+            policy: GroupPolicy::Selector,
+            nodes: vec![node.id],
+            ..Default::default()
+        }];
+        let router = Router::new(&config.routing.rules, &config.routing.default_outbound).unwrap();
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancelled = Arc::new(AtomicUsize::new(0));
+        let mut proxy_registry = ProxyRegistry::new();
+        proxy_registry.register(Box::new(BlockingWarmHandler {
+            started: started_tx,
+            cancelled: cancelled.clone(),
+        }));
+        let cp = ControlPlane::new(
+            config.clone(),
+            Box::new(MockEbpfBackend::new()),
+            router,
+            Arc::new(proxy_registry),
+            DnsResolver::new(&honk_config::dns::DnsConfig::default()).unwrap(),
+            test_dns_forwarder(),
+        )
+        .unwrap();
+
+        let old_generation = cp.runtime_registry.read().clone();
+        cp.start_udp_warm_coordinator(Arc::clone(&old_generation))
+            .await;
+        let old_runtime = tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+            .await
+            .expect("old warm must start")
+            .expect("old runtime");
+        assert!(Arc::ptr_eq(
+            &old_runtime,
+            &old_generation.get(&node.id).unwrap()
+        ));
+
+        // A failed build must not retire the old task or its generation.
+        let mut bad = config.clone();
+        bad.dns.upstream = vec![honk_config::dns::DnsUpstream {
+            name: "invalid".into(),
+            address: String::new(),
+            protocol: honk_config::types::DnsProtocol::Udp,
+            tls_server_name: None,
+            outbound: None,
+        }];
+        cp.apply_runtime_config(bad, &DrainTracker::new()).await;
+        assert!(!old_generation.is_shutdown());
+        assert_eq!(cancelled.load(Ordering::SeqCst), 0);
+
+        cp.apply_runtime_config(config, &DrainTracker::new()).await;
+        let new_runtime = tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+            .await
+            .expect("new warm must start after reload")
+            .expect("new runtime");
+        let new_generation = cp.runtime_registry.read().clone();
+        assert!(old_generation.is_shutdown());
+        assert!(
+            cancelled.load(Ordering::SeqCst) >= 1,
+            "old warm must exit after its generation becomes terminal"
+        );
+        assert!(
+            !Arc::ptr_eq(&old_runtime, &new_runtime),
+            "the reload must not reuse an old NodeRuntime"
+        );
+        assert!(Arc::ptr_eq(
+            &new_runtime,
+            &new_generation.get(&node.id).unwrap()
+        ));
+
+        cp.stop_udp_warm_coordinator().await;
+        new_generation.shutdown();
     }
 }

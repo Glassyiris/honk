@@ -36,7 +36,7 @@ use tokio::time::Instant;
 use tracing::{debug, warn};
 
 use super::addr;
-use super::{PacketTransport, ProxyHandler, ProxyStream, UdpProxySocket};
+use super::{PacketTransport, ProxyHandler, ProxyStream, UdpProxySocket, UdpWarmStatus};
 use crate::session::ManagedSession as _;
 
 /// sing uot v2 magic address (`protocol/anytls/outbound.go`,
@@ -1138,6 +1138,38 @@ impl AnyTlsHandler {
         });
     }
 
+    /// Warm the explicit generation-owned AnyTLS pool. The generic dial seam
+    /// keeps the production path small while letting unit tests use the
+    /// in-memory AnyTLS session fixture instead of a network connection.
+    async fn warm_pool_with<F, Fut>(
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        _connect_timeout: Duration,
+        dial: F,
+    ) -> anyhow::Result<UdpWarmStatus>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = anyhow::Result<Arc<AnyTlsSession>>> + Send + 'static,
+    {
+        if runtime.node.protocol != NodeProtocol::AnyTLS {
+            return Ok(UdpWarmStatus::NotApplicable);
+        }
+        let pool = match &runtime.runtime {
+            crate::runtime::ProtocolRuntime::AnyTls(runtime) => Arc::clone(&runtime.pool),
+            crate::runtime::ProtocolRuntime::None => return Ok(UdpWarmStatus::NotApplicable),
+        };
+        let already_ready = pool.has_usable_session(POOL_KEY);
+        Self::ensure_janitor(&runtime.node, &pool);
+        let _session = pool.offer(POOL_KEY, dial).await?;
+        if !pool.has_usable_session(POOL_KEY) {
+            anyhow::bail!("AnyTLS warm dial completed without a usable session");
+        }
+        Ok(if already_ready {
+            UdpWarmStatus::AlreadyReady
+        } else {
+            UdpWarmStatus::Ready
+        })
+    }
+
     /// Open a stream to `target_addr` on a pooled session, dialing one on
     /// demand (single-flight). One retry on a session that fails mid-open.
     async fn open_pooled_stream(
@@ -1729,6 +1761,22 @@ impl ProxyHandler for AnyTlsHandler {
 
     fn set_runtime_registry(&self, cell: crate::runtime::SharedRuntimeRegistry) {
         *self.runtime_registry.write() = Some(cell);
+    }
+
+    async fn warm_udp(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<UdpWarmStatus> {
+        // Do not call node_pool here: it follows the mutable shared cell and
+        // fallback pool used by normal standalone dialing. Warm-up must stay
+        // tied to the immutable generation supplied by ProxyRegistry.
+        let node = Arc::clone(&runtime.node);
+        let addr = format!("{}:{}", node.host(), node.port);
+        Self::warm_pool_with(runtime, connect_timeout, move || async move {
+            dial_session(&node, &addr, connect_timeout).await
+        })
+        .await
     }
 
     async fn dial(
@@ -2892,6 +2940,109 @@ mod tests {
 
         assert!(!session.is_closed());
         assert_eq!(session.active_streams(), 1);
+    }
+
+    #[tokio::test]
+    async fn warm_udp_uses_only_its_generation_owned_runtime_pool() {
+        let node = Node {
+            name: "warm-anytls".into(),
+            protocol: NodeProtocol::AnyTLS,
+            anytls_min_idle_session: Some(0),
+            ..Default::default()
+        };
+        let generation = Arc::new(
+            crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
+        );
+        let runtime = generation.get(&node.id).unwrap();
+        let pool = match &runtime.runtime {
+            crate::runtime::ProtocolRuntime::AnyTls(runtime) => Arc::clone(&runtime.pool),
+            crate::runtime::ProtocolRuntime::None => panic!("AnyTLS node needs its own runtime"),
+        };
+        let (session, mut server) = establish_test_session("warm-anytls").await;
+        expect_handshake(&mut server).await;
+
+        let status = AnyTlsHandler::warm_pool_with(
+            Arc::clone(&runtime),
+            Duration::from_secs(1),
+            move || async move { Ok(session) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, UdpWarmStatus::Ready);
+        assert!(pool.has_usable_session(POOL_KEY));
+
+        let handler = AnyTlsHandler::new();
+        assert_eq!(
+            handler
+                .warm_udp(Arc::clone(&runtime), Duration::from_secs(1))
+                .await
+                .unwrap(),
+            UdpWarmStatus::AlreadyReady
+        );
+        assert!(
+            handler.fallback_pool.get().is_none(),
+            "warm must never consult the handler fallback or shared current registry"
+        );
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn warm_udp_shutdown_cancels_a_notify_blocked_dial_and_keeps_pool_terminal() {
+        let node = Node {
+            name: "shutdown-warm-anytls".into(),
+            protocol: NodeProtocol::AnyTLS,
+            anytls_min_idle_session: Some(0),
+            ..Default::default()
+        };
+        let generation = Arc::new(
+            crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
+        );
+        let runtime = generation.get(&node.id).unwrap();
+        let pool = match &runtime.runtime {
+            crate::runtime::ProtocolRuntime::AnyTls(runtime) => Arc::clone(&runtime.pool),
+            crate::runtime::ProtocolRuntime::None => panic!("AnyTLS node needs its own runtime"),
+        };
+        let dial_started = Arc::new(tokio::sync::Notify::new());
+        let dial_blocked = Arc::new(tokio::sync::Notify::new());
+        let warm = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            let dial_started = Arc::clone(&dial_started);
+            let dial_blocked = Arc::clone(&dial_blocked);
+            async move {
+                AnyTlsHandler::warm_pool_with(runtime, Duration::from_secs(1), move || {
+                    let dial_started = Arc::clone(&dial_started);
+                    let dial_blocked = Arc::clone(&dial_blocked);
+                    async move {
+                        dial_started.notify_one();
+                        dial_blocked.notified().await;
+                        unreachable!("the blocked warm dial must be cancelled by shutdown")
+                    }
+                })
+                .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), dial_started.notified())
+            .await
+            .expect("warm dial must start before its generation is shut down");
+        generation.shutdown();
+        let result = tokio::time::timeout(Duration::from_secs(1), warm)
+            .await
+            .expect("shutdown must unblock the warm future")
+            .expect("warm task must not panic");
+        assert!(result.is_err(), "terminal pool shutdown rejects the warm");
+        assert!(
+            !pool.has_usable_session(POOL_KEY),
+            "a cancelled dial must not leave a usable session in the pool"
+        );
+        assert!(
+            AnyTlsHandler::warm_pool_with(Arc::clone(&runtime), Duration::from_secs(1), || async {
+                unreachable!("a terminal pool must reject before invoking a new dial")
+            })
+            .await
+            .is_err(),
+            "subsequent warm attempts must be rejected after generation shutdown"
+        );
     }
 }
 

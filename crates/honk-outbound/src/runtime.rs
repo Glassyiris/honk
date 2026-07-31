@@ -1,5 +1,5 @@
-//! Per-node runtime ownership (v3.1 phase 2A): the single owner of every
-//! outbound's session-layer resources.
+//! Per-node runtime ownership: the ControlPlane owns every outbound's
+//! session-layer resources through immutable runtime generations.
 //!
 //! `OutboundRuntimeRegistry` maps `Node.id` (UUID) to a `NodeRuntime` —
 //! the minimal PreparedOutbound: the immutable node config, its
@@ -8,11 +8,12 @@
 //! node may belong to many groups, and group rebuilds must not destroy
 //! live sessions). ProxyRegistry stays stateless handlers.
 //!
-//! Phase 2A only establishes ownership and validation; protocol runtimes
-//! are populated by later phases (2B AnyTLS, 4A Trojan-Go, 4B H2, 4C QUIC).
+//! AnyTLS currently owns its node-local session pool here. Trojan-Go, H2,
+//! and QUIC runtime ownership remain deferred to their dedicated migrations.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use honk_config::node::Node;
 use honk_config::types::NodeProtocol;
@@ -55,11 +56,11 @@ impl OutboundCapabilities {
     }
 }
 
-/// The session-layer runtime for one node. Later phases attach the
-/// remaining owners:
-/// - 4A: `TrojanGo(Arc<SessionPool<MuxConnection>>)`
-/// - 4B: `H2(Arc<SessionPool<MuxSession>>)`
-/// - 4C: `Quic` runtimes (hy2/tuic/juicity, not a shared SessionPool)
+/// The session-layer runtime for one node. AnyTLS is active now; deferred
+/// owners are:
+/// - `TrojanGo(Arc<SessionPool<MuxConnection>>)`
+/// - `H2(Arc<SessionPool<MuxSession>>)`
+/// - `Quic` runtimes (hy2/tuic/juicity, not a shared SessionPool)
 #[derive(Debug)]
 pub enum ProtocolRuntime {
     None,
@@ -105,11 +106,13 @@ pub enum RuntimeRegistryError {
 }
 
 /// The single owner of per-node session runtimes for one config
-/// generation. Rebuilt with the config; the old generation's registry is
-/// shut down after the swap (phase 2B+ closes real sessions there).
+/// generation. Rebuilt with the config; shutdown makes a generation
+/// terminal before closing its owned pools so late work can never fall
+/// through to a newer generation.
 #[derive(Debug)]
 pub struct OutboundRuntimeRegistry {
     nodes: HashMap<uuid::Uuid, Arc<NodeRuntime>>,
+    terminal: AtomicBool,
 }
 
 /// Shared cell swapped atomically on reload (same pattern as
@@ -141,7 +144,10 @@ impl OutboundRuntimeRegistry {
                 ));
             }
         }
-        Ok(Self { nodes: map })
+        Ok(Self {
+            nodes: map,
+            terminal: AtomicBool::new(false),
+        })
     }
 
     /// Wrap into the shared cell used by the control plane.
@@ -161,10 +167,23 @@ impl OutboundRuntimeRegistry {
         self.nodes.is_empty()
     }
 
-    /// Shut down every owned runtime: AnyTLS pools are shut down
-    /// (offers/inserts/prewarms rejected, waiters woken, sessions closed,
-    /// janitor exits). Idempotent.
+    /// Whether this generation has become terminal. Warm-up work must reject
+    /// rather than consulting a replacement generation once this is true.
+    pub fn is_shutdown(&self) -> bool {
+        self.terminal.load(Ordering::Acquire)
+    }
+
+    /// Shut down every owned runtime: mark the generation terminal before
+    /// AnyTLS pools are closed so offers/inserts/prewarms reject consistently.
+    /// Idempotent.
     pub fn shutdown(&self) {
+        if self
+            .terminal
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
         for runtime in self.nodes.values() {
             if let ProtocolRuntime::AnyTls(anytls) = &runtime.runtime {
                 anytls.pool.shutdown();
@@ -198,7 +217,7 @@ mod tests {
         assert_eq!(rt.node.name, "a");
         assert!(rt.capabilities.multiplexed);
         assert!(rt.capabilities.udp);
-        registry.shutdown(); // idempotent no-op in phase 2A
+        registry.shutdown(); // terminal cleanup is idempotent
     }
 
     #[test]
@@ -234,5 +253,19 @@ mod tests {
         let mut mux_vmess = node("x", NodeProtocol::VMess);
         mux_vmess.mux = true;
         assert!(OutboundCapabilities::for_node(&mux_vmess).multiplexed);
+    }
+
+    #[test]
+    fn shutdown_is_terminal_for_the_registry_generation() {
+        let anytls = node("anytls", NodeProtocol::AnyTLS);
+        let registry = OutboundRuntimeRegistry::build(&[anytls]).unwrap();
+        assert!(!registry.is_shutdown());
+        registry.shutdown();
+        assert!(registry.is_shutdown());
+        registry.shutdown();
+        assert!(
+            registry.is_shutdown(),
+            "shutdown remains terminal and idempotent"
+        );
     }
 }

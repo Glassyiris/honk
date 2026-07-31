@@ -174,6 +174,8 @@ impl From<usize> for PoolState {
 enum DialSignal {
     /// Dial still in flight.
     Pending,
+    /// The pool became terminal before the owned dial could publish.
+    Closed,
     /// Dial completed — re-check the pool (session inserted or backoff
     /// recorded).
     Done,
@@ -327,6 +329,26 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         anyhow!("session pool is closed")
     }
 
+    /// Whether this key has a currently usable session. This uses the same
+    /// active/capacity predicate as `offer`, without registering a dial.
+    pub fn has_usable_session(&self, key: &str) -> bool {
+        if self.state() != PoolState::Running {
+            return false;
+        }
+        let mut keys = self.keys.lock();
+        if self.state() != PoolState::Running {
+            return false;
+        }
+        let Some(pool) = keys.get_mut(key) else {
+            return false;
+        };
+        pool.sessions.retain(|session| !session.is_closed());
+        pool.sessions.iter().any(|session| {
+            session.state() == SessionState::Active
+                && session.active_streams() < self.config.max_streams_per_session
+        })
+    }
+
     /// Offer the least-loaded live session, dialing one when none is
     /// usable. Concurrent dials for the same key share one establishment:
     /// the FIRST caller to find no inflight registers the dial and the
@@ -347,6 +369,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
             // Phase 1: pick a live session, register the dial, or park on
             // the in-flight one.
             enum Step<S> {
+                Closed,
                 Have(Arc<S>),
                 Register(u64, tokio::sync::watch::Sender<DialSignal>),
                 Wait(tokio::sync::watch::Receiver<DialSignal>),
@@ -354,42 +377,47 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
             }
             let step = {
                 let mut keys = self.keys.lock();
-                let pool = keys.entry(key.to_string()).or_default();
-                pool.sessions.retain(|s| !s.is_closed());
-                if let Some(s) = pool
-                    .sessions
-                    .iter()
-                    // Draining sessions take no new channels.
-                    .filter(|s| {
-                        s.state() == SessionState::Active
-                            && s.active_streams() < self.config.max_streams_per_session
-                    })
-                    .min_by_key(|s| s.active_streams())
-                {
-                    Step::Have(Arc::clone(s))
-                } else if let Some((_, done)) = &pool.dial_done {
-                    Step::Wait(done.subscribe())
-                } else if let Some(wait) = pool
-                    .next_dial_at
-                    .and_then(|t| t.checked_duration_since(Instant::now()))
-                    .filter(|w| *w > Duration::ZERO)
-                {
-                    Step::Backoff(wait)
-                } else if pool.sessions.len() >= self.config.max_sessions {
-                    // At the hard cap with every session saturated: wait
-                    // for capacity to free up (a stream closes, a session
-                    // is reaped) instead of stampeding past the cap.
-                    Step::Backoff(self.config.janitor_interval.min(Duration::from_secs(5)))
+                if self.state() != PoolState::Running {
+                    Step::Closed
                 } else {
-                    let id = pool.next_inflight_id;
-                    pool.next_inflight_id += 1;
-                    let (tx, _) = tokio::sync::watch::channel(DialSignal::Pending);
-                    pool.dial_done = Some((id, tx.clone()));
-                    Step::Register(id, tx)
+                    let pool = keys.entry(key.to_string()).or_default();
+                    pool.sessions.retain(|s| !s.is_closed());
+                    if let Some(s) = pool
+                        .sessions
+                        .iter()
+                        // Draining sessions take no new channels.
+                        .filter(|s| {
+                            s.state() == SessionState::Active
+                                && s.active_streams() < self.config.max_streams_per_session
+                        })
+                        .min_by_key(|s| s.active_streams())
+                    {
+                        Step::Have(Arc::clone(s))
+                    } else if let Some((_, done)) = &pool.dial_done {
+                        Step::Wait(done.subscribe())
+                    } else if let Some(wait) = pool
+                        .next_dial_at
+                        .and_then(|t| t.checked_duration_since(Instant::now()))
+                        .filter(|w| *w > Duration::ZERO)
+                    {
+                        Step::Backoff(wait)
+                    } else if pool.sessions.len() >= self.config.max_sessions {
+                        // At the hard cap with every session saturated: wait
+                        // for capacity to free up (a stream closes, a session
+                        // is reaped) instead of stampeding past the cap.
+                        Step::Backoff(self.config.janitor_interval.min(Duration::from_secs(5)))
+                    } else {
+                        let id = pool.next_inflight_id;
+                        pool.next_inflight_id += 1;
+                        let (tx, _) = tokio::sync::watch::channel(DialSignal::Pending);
+                        pool.dial_done = Some((id, tx.clone()));
+                        Step::Register(id, tx)
+                    }
                 }
             };
 
             match step {
+                Step::Closed => return Err(Self::pool_closed_err()),
                 Step::Have(s) => return Ok(s),
                 Step::Backoff(wait) => {
                     tokio::select! {
@@ -415,8 +443,12 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                             return Err(Self::pool_closed_err());
                         }
                     };
-                    if let DialSignal::Failed(e) = signal {
-                        return Err(anyhow::anyhow!(e).context("session dial failed"));
+                    match signal {
+                        DialSignal::Closed => return Err(Self::pool_closed_err()),
+                        DialSignal::Failed(e) => {
+                            return Err(anyhow::anyhow!(e).context("session dial failed"));
+                        }
+                        DialSignal::Pending | DialSignal::Done => {}
                     }
                 }
                 Step::Register(id, done) => {
@@ -432,6 +464,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                     let task_keys = Arc::clone(&self.keys);
                     let task_key = key.to_string();
                     let failures_total = Arc::clone(&self.dial_failures_total);
+                    let task_state = Arc::clone(&self.state);
                     let config = self.config.clone();
                     let handle = tokio::spawn(async move {
                         let mut guard = DialGuard {
@@ -443,48 +476,73 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                         let result = std::panic::AssertUnwindSafe(dial_fut).catch_unwind().await;
                         let signal = {
                             let mut keys = task_keys.lock();
-                            let pool = keys.entry(task_key.clone()).or_default();
-                            if pool.dial_done.as_ref().map(|(i, _)| *i) == Some(id) {
-                                pool.dial_done = None;
-                            }
-                            guard.armed = false;
-                            match result {
-                                Ok(Ok(session)) => {
-                                    pool.dial_failures = 0;
-                                    pool.next_dial_at = None;
-                                    pool.sessions.push(session);
-                                    DialSignal::Done
+                            if PoolState::from(task_state.load(Ordering::Acquire))
+                                != PoolState::Running
+                            {
+                                if let Ok(Ok(session)) = &result {
+                                    // A completion that lost the terminal
+                                    // race is never registered; close it
+                                    // explicitly because protocol demux tasks
+                                    // may keep their own Arc alive.
+                                    session.close();
                                 }
-                                Ok(Err(e)) => {
-                                    failures_total.fetch_add(1, Ordering::Relaxed);
-                                    pool.dial_failures += 1;
-                                    let shift = pool.dial_failures.min(8) - 1;
-                                    let backoff =
-                                        (config.dial_backoff.saturating_mul(1u32 << shift))
-                                            .min(config.max_dial_backoff);
-                                    pool.next_dial_at = Some(Instant::now() + backoff);
-                                    DialSignal::Failed(Arc::new(e.context(anyhow!(
-                                        "session dial failed ({} consecutive, backoff {:?})",
-                                        pool.dial_failures,
-                                        backoff
-                                    ))))
+                                if let Some(pool) = keys.get_mut(&task_key)
+                                    && pool.dial_done.as_ref().map(|(i, _)| *i) == Some(id)
+                                {
+                                    pool.dial_done = None;
                                 }
-                                Err(_panic) => {
-                                    // A panicking dial is an internal
-                                    // failure: short backoff.
-                                    failures_total.fetch_add(1, Ordering::Relaxed);
-                                    pool.dial_failures += 1;
-                                    pool.next_dial_at = Some(Instant::now() + config.dial_backoff);
-                                    DialSignal::Failed(Arc::new(anyhow!(
-                                        "session dial panicked (backoff {:?})",
-                                        config.dial_backoff
-                                    )))
+                                guard.armed = false;
+                                DialSignal::Closed
+                            } else {
+                                let pool = keys.entry(task_key.clone()).or_default();
+                                if pool.dial_done.as_ref().map(|(i, _)| *i) == Some(id) {
+                                    pool.dial_done = None;
+                                }
+                                guard.armed = false;
+                                match result {
+                                    Ok(Ok(session)) => {
+                                        pool.dial_failures = 0;
+                                        pool.next_dial_at = None;
+                                        pool.sessions.push(session);
+                                        DialSignal::Done
+                                    }
+                                    Ok(Err(e)) => {
+                                        failures_total.fetch_add(1, Ordering::Relaxed);
+                                        pool.dial_failures += 1;
+                                        let shift = pool.dial_failures.min(8) - 1;
+                                        let backoff =
+                                            (config.dial_backoff.saturating_mul(1u32 << shift))
+                                                .min(config.max_dial_backoff);
+                                        pool.next_dial_at = Some(Instant::now() + backoff);
+                                        DialSignal::Failed(Arc::new(e.context(anyhow!(
+                                            "session dial failed ({} consecutive, backoff {:?})",
+                                            pool.dial_failures,
+                                            backoff
+                                        ))))
+                                    }
+                                    Err(_panic) => {
+                                        // A panicking dial is an internal
+                                        // failure: short backoff.
+                                        failures_total.fetch_add(1, Ordering::Relaxed);
+                                        pool.dial_failures += 1;
+                                        pool.next_dial_at =
+                                            Some(Instant::now() + config.dial_backoff);
+                                        DialSignal::Failed(Arc::new(anyhow!(
+                                            "session dial panicked (backoff {:?})",
+                                            config.dial_backoff
+                                        )))
+                                    }
                                 }
                             }
                         };
                         let _ = done.send(signal);
                     });
-                    self.tasks.lock().push(handle);
+                    let mut tasks = self.tasks.lock();
+                    if self.state() == PoolState::Running {
+                        tasks.push(handle);
+                    } else {
+                        handle.abort();
+                    }
                     // Fall through: wait on the dial like everyone else.
                 }
             }
@@ -552,6 +610,13 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
             return;
         }
         let mut keys = self.keys.lock();
+        // Re-check under the registration lock: shutdown marks terminal
+        // before draining this map, so a late dial cannot repopulate it.
+        if self.state() != PoolState::Running {
+            drop(keys);
+            session.close();
+            return;
+        }
         let pool = keys.entry(key.to_string()).or_default();
         pool.sessions.retain(|s| !s.is_closed());
         pool.sessions.push(Arc::clone(session));
@@ -574,12 +639,111 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         }
     }
 
+    async fn run_janitor<F, Fut>(
+        self: Arc<Self>,
+        key: String,
+        min_idle: usize,
+        idle_timeout: Duration,
+        prewarm: F,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) where
+        F: Fn() -> Fut + Send + Sync + Clone + 'static,
+        Fut: std::future::Future<Output = anyhow::Result<Arc<S>>> + Send + 'static,
+    {
+        if *shutdown_rx.borrow() || self.state() != PoolState::Running {
+            return;
+        }
+        let mut interval = tokio::time::interval(self.config.janitor_interval);
+        interval.tick().await;
+        // Per-session zero-stream streak start, keyed by Arc identity
+        // (positions in the vec shift as sessions come and go).
+        let mut idle_since: HashMap<usize, Instant> = HashMap::new();
+        // Per-session max-age deadline (jittered ±10% by pointer so a
+        // fleet of same-age sessions never reconnects in lockstep).
+        let mut drain_at: HashMap<usize, Instant> = HashMap::new();
+        loop {
+            tokio::select! {
+                biased;
+                // Pool shutdown: exit, no further prewarm/reap.
+                _ = shutdown_rx.changed() => return,
+                _ = interval.tick() => {}
+            }
+            let now = Instant::now();
+            let idle_to_close = {
+                let mut keys = self.keys.lock();
+                if self.state() != PoolState::Running {
+                    return;
+                }
+                let Some(kp) = keys.get_mut(&key) else {
+                    return;
+                };
+                kp.sessions.retain(|s| !s.is_closed());
+                let live: Vec<Arc<S>> = kp.sessions.clone();
+                let mut to_close = Vec::new();
+                idle_since.retain(|ptr, _| live.iter().any(|s| Arc::as_ptr(s) as usize == *ptr));
+                drain_at.retain(|ptr, _| live.iter().any(|s| Arc::as_ptr(s) as usize == *ptr));
+                for s in &live {
+                    let ptr = Arc::as_ptr(s) as usize;
+                    // Max-age drain: stop taking new streams past the
+                    // jittered deadline; close once fully drained.
+                    if let Some(max_age) = self.config.max_session_age {
+                        let deadline = drain_at.entry(ptr).or_insert_with(|| {
+                            let jitter = 0.9 + ((ptr % 200) as f64) / 1000.0;
+                            s.created_at() + max_age.mul_f64(jitter)
+                        });
+                        if now >= *deadline {
+                            s.begin_drain();
+                        }
+                    }
+                    if s.state() == SessionState::Draining && s.active_streams() == 0 {
+                        to_close.push(Arc::clone(s));
+                        continue;
+                    }
+                    if s.active_streams() > 0 {
+                        idle_since.remove(&ptr);
+                        continue;
+                    }
+                    let since = idle_since.entry(ptr).or_insert(now);
+                    if now.duration_since(*since) >= idle_timeout
+                        && live.len() - to_close.len() > min_idle
+                    {
+                        to_close.push(Arc::clone(s));
+                    }
+                }
+                to_close
+            };
+            for s in &idle_to_close {
+                self.invalidate(&key, s);
+            }
+            // Prewarm to min_idle only while the registered key is live.
+            let current = {
+                let keys = self.keys.lock();
+                if self.state() != PoolState::Running {
+                    return;
+                }
+                let Some(pool) = keys.get(&key) else {
+                    return;
+                };
+                pool.sessions.len()
+            };
+            if current < min_idle
+                && let Ok(s) = self
+                    .offer(&key, {
+                        let prewarm = prewarm.clone();
+                        move || prewarm()
+                    })
+                    .await
+            {
+                drop(s);
+            }
+        }
+    }
+
     /// Start the per-key janitor (prune closed/expired, prewarm to
     /// `min_idle`) once; subsequent calls are no-ops. `prewarm` dials a
     /// fresh session and is only called when below `min_idle`.
     /// `min_idle`/`idle_timeout` are per-key (node-level policies, e.g.
     /// AnyTLS's node fields).
-    // First consumer: the AnyTLS pool migration (P1.6).
     #[allow(dead_code)]
     pub fn ensure_janitor<F, Fut>(
         self: &Arc<Self>,
@@ -596,6 +760,9 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         }
         {
             let mut keys = self.keys.lock();
+            if self.state() != PoolState::Running {
+                return;
+            }
             let pool = keys.entry(key.to_string()).or_default();
             if pool.janitor_running {
                 return;
@@ -604,79 +771,8 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         }
         let pool = Arc::clone(self);
         let key = key.to_string();
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(pool.config.janitor_interval);
-            interval.tick().await;
-            // Per-session zero-stream streak start, keyed by Arc identity
-            // (positions in the vec shift as sessions come and go).
-            let mut idle_since: HashMap<usize, Instant> = HashMap::new();
-            // Per-session max-age deadline (jittered ±10% by pointer so a
-            // fleet of same-age sessions never reconnects in lockstep).
-            let mut drain_at: HashMap<usize, Instant> = HashMap::new();
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {}
-                    // Pool shutdown: exit, no further prewarm/reap.
-                    _ = shutdown_rx.changed() => break,
-                }
-                let now = Instant::now();
-                let idle_to_close = {
-                    let mut keys = pool.keys.lock();
-                    let kp = keys.entry(key.clone()).or_default();
-                    kp.sessions.retain(|s| !s.is_closed());
-                    let live: Vec<Arc<S>> = kp.sessions.clone();
-                    let mut to_close = Vec::new();
-                    idle_since
-                        .retain(|ptr, _| live.iter().any(|s| Arc::as_ptr(s) as usize == *ptr));
-                    drain_at.retain(|ptr, _| live.iter().any(|s| Arc::as_ptr(s) as usize == *ptr));
-                    for s in &live {
-                        let ptr = Arc::as_ptr(s) as usize;
-                        // Max-age drain: stop taking new streams past the
-                        // jittered deadline; close once fully drained.
-                        if let Some(max_age) = pool.config.max_session_age {
-                            let deadline = drain_at.entry(ptr).or_insert_with(|| {
-                                let jitter = 0.9 + ((ptr % 200) as f64) / 1000.0;
-                                s.created_at() + max_age.mul_f64(jitter)
-                            });
-                            if now >= *deadline {
-                                s.begin_drain();
-                            }
-                        }
-                        if s.state() == SessionState::Draining && s.active_streams() == 0 {
-                            to_close.push(Arc::clone(s));
-                            continue;
-                        }
-                        if s.active_streams() > 0 {
-                            idle_since.remove(&ptr);
-                            continue;
-                        }
-                        let since = idle_since.entry(ptr).or_insert(now);
-                        if now.duration_since(*since) >= idle_timeout
-                            && live.len() - to_close.len() > min_idle
-                        {
-                            to_close.push(Arc::clone(s));
-                        }
-                    }
-                    to_close
-                };
-                for s in &idle_to_close {
-                    pool.invalidate(&key, s);
-                }
-                // Prewarm to min_idle (rejected once the pool is shut).
-                let current = pool.keys.lock().get(&key).map_or(0, |p| p.sessions.len());
-                if current < min_idle
-                    && let Ok(s) = pool
-                        .offer(&key, {
-                            let prewarm = prewarm.clone();
-                            move || prewarm()
-                        })
-                        .await
-                {
-                    drop(s);
-                }
-            }
-        });
+        let shutdown_rx = self.shutdown_tx.subscribe();
+        tokio::spawn(pool.run_janitor(key, min_idle, idle_timeout, prewarm, shutdown_rx));
     }
 
     /// Shut the pool down: reject offers/inserts/prewarms, abort the
@@ -950,6 +1046,81 @@ mod tests {
             s.closed.load(Ordering::Relaxed),
             "insert after shutdown closes the session"
         );
+        assert!(
+            !pool.has_usable_session("k"),
+            "a shutdown pool cannot retain a late session insertion"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_before_ensure_does_not_register_janitor_or_prewarm() {
+        let pool = Arc::new(pool(SessionPoolConfig {
+            janitor_interval: Duration::from_secs(1),
+            ..Default::default()
+        }));
+        let prewarm_calls = Arc::new(AtomicUsize::new(0));
+        pool.shutdown();
+        pool.ensure_janitor("k", 1, Duration::from_secs(60), {
+            let prewarm_calls = Arc::clone(&prewarm_calls);
+            move || {
+                let prewarm_calls = Arc::clone(&prewarm_calls);
+                async move {
+                    prewarm_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(TestSession::new())
+                }
+            }
+        });
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(pool.keys.lock().is_empty());
+        assert_eq!(prewarm_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_before_first_janitor_poll_exits_without_recreating_key() {
+        let pool = Arc::new(pool(SessionPoolConfig {
+            janitor_interval: Duration::from_secs(1),
+            ..Default::default()
+        }));
+        {
+            let mut keys = pool.keys.lock();
+            keys.entry("k".to_string()).or_default().janitor_running = true;
+        }
+        let _shutdown_listener = pool.shutdown_tx.subscribe();
+        pool.shutdown();
+        let shutdown_rx = pool.shutdown_tx.subscribe();
+        assert!(
+            *shutdown_rx.borrow(),
+            "first poll observes terminal watch state"
+        );
+        let prewarm_calls = Arc::new(AtomicUsize::new(0));
+        let janitor = tokio::spawn(Arc::clone(&pool).run_janitor(
+            "k".to_string(),
+            1,
+            Duration::from_secs(60),
+            {
+                let prewarm_calls = Arc::clone(&prewarm_calls);
+                move || {
+                    let prewarm_calls = Arc::clone(&prewarm_calls);
+                    async move {
+                        prewarm_calls.fetch_add(1, Ordering::Relaxed);
+                        Ok(TestSession::new())
+                    }
+                }
+            },
+            shutdown_rx,
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            janitor.is_finished(),
+            "terminal janitor must exit on first poll"
+        );
+        assert!(
+            pool.keys.lock().is_empty(),
+            "terminal janitor must not recreate its key"
+        );
+        assert_eq!(prewarm_calls.load(Ordering::Relaxed), 0);
     }
 
     /// v2 max-age: past the jittered deadline the session drains (no new

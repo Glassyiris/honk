@@ -133,9 +133,9 @@ impl UdpLatencyHistogramSnapshot {
     }
 }
 
-/// Fixed, allocation-free UDP pipeline metrics. Fields owned by later state
-/// machine tasks are deliberately present from the start and remain zero
-/// until those tasks wire their real production events.
+/// Fixed, allocation-free UDP pipeline metrics for the current control-plane
+/// path. The schema is intentionally stable while each recorder is wired to
+/// its corresponding production event.
 #[derive(Debug, Default)]
 struct UdpStats {
     endpoint_hits: AtomicU64,
@@ -290,6 +290,23 @@ impl StatsManager {
         self.udp.stagger_attempts.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record one started generation-owned UDP warm dispatch. These counters
+    /// remain fixed, aggregate-only recorder fields: no per-node labels or
+    /// outbound health/error state is created for warm-up work.
+    pub fn record_udp_warm_attempt(&self) {
+        self.udp.warm_attempts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a warm dispatch that found or established a usable session.
+    pub fn record_udp_warm_success(&self) {
+        self.udp.warm_successes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a true warm failure while its generation remains live.
+    pub fn record_udp_warm_failure(&self) {
+        self.udp.warm_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record the first eligible successful staggered preparation.
     pub fn record_udp_stagger_winner(&self) {
         self.udp.stagger_winners.fetch_add(1, Ordering::Relaxed);
@@ -302,8 +319,7 @@ impl StatsManager {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record admission into the existing UDP slow path. The endpoint-driver
-    /// queue fields remain untouched until Task 3 owns that state machine.
+    /// Record admission into the active UDP slow path.
     pub fn record_udp_slow_permit_accepted(&self) {
         self.udp
             .slow_permit_accepted

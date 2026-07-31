@@ -119,6 +119,10 @@ pub struct ControlPlane {
     concurrency_limit: Arc<tokio::sync::Semaphore>,
     /// Background task handles (health check, janitor) for clean shutdown.
     background_tasks: Arc<tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// The generation-owned UDP warm coordinator. It is deliberately kept
+    /// separate from generic background tasks so reload/shutdown can abort
+    /// and drain it in the required ownership order.
+    udp_warm_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Shared clash mode state (Rule/Global/Direct + GLOBAL selection),
     /// installed by `set_mode_state` when the clash API is enabled.
     mode_state: Option<crate::mode::SharedModeState>,
@@ -274,6 +278,7 @@ impl ControlPlane {
             outbound_id_map,
             concurrency_limit: Arc::new(tokio::sync::Semaphore::new(1024)),
             background_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            udp_warm_task: tokio::sync::Mutex::new(None),
             mode_state: None,
         };
 
@@ -816,6 +821,11 @@ impl ControlPlane {
             }
         }
 
+        // The warm coordinator starts only after group/runtime setup and
+        // retains this exact registry Arc for its complete lifetime.
+        let warm_generation = self.runtime_registry.read().clone();
+        self.start_udp_warm_coordinator(warm_generation).await;
+
         let mut rx = self.command_rx.take().expect("command_rx already taken");
         let drain = self.drain_tracker.clone();
         let ebpf = self.ebpf.clone();
@@ -1024,6 +1034,7 @@ impl ControlPlane {
                             info!("Control plane shutting down, draining {} active connections",
                                 drain.active_count());
                             drain.start_rejecting();
+                            self.stop_udp_warm_coordinator().await;
                             if !self.udp_pool.cancel_initializers_and_wait().await {
                                 error!("UDP initializer cancellation timed out during shutdown");
                             }
@@ -1043,6 +1054,10 @@ impl ControlPlane {
                             }
                             drop(ebpf);
                             drain.drain().await?;
+                            // Active flows own the current runtime until the
+                            // drain completes; only then terminally close its
+                            // AnyTLS pools and reject any late warm work.
+                            self.runtime_registry.read().clone().shutdown();
                             break;
                         }
                     }

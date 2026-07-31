@@ -805,3 +805,27 @@ dns {
         _ => panic!("expected Qname"),
     }
 }
+
+#[test]
+fn udp_warm_node_count_defaults_to_strictly_disabled() {
+    assert_eq!(crate::Config::default().global.udp_warm_node_count, 0);
+    assert_eq!(
+        parse_dae_config("global {}")
+            .unwrap()
+            .global
+            .udp_warm_node_count,
+        0
+    );
+}
+
+#[test]
+fn udp_warm_node_count_parses_zero_and_rejects_invalid_values() {
+    let enabled = parse_dae_config("global {\n udp_warm_node_count: 3\n}").unwrap();
+    assert_eq!(enabled.global.udp_warm_node_count, 3);
+
+    for invalid in ["nope", "-1", "99999999999999999999999999999999999999"] {
+        let err = parse_dae_config(&format!("global {{\n udp_warm_node_count: {invalid}\n}}"))
+            .expect_err("invalid udp warm count must reject the dae config");
+        assert!(matches!(err, crate::ConfigError::Parse(_)), "{invalid}");
+    }
+}

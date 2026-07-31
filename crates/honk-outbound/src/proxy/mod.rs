@@ -177,9 +177,30 @@ impl PacketTransport for UdpSocketTransport {
     }
 }
 
+/// Outcome of an additive UDP session warm-up request. A status is not a
+/// protocol capability claim: only handlers that own a reusable UDP-capable
+/// session return `Ready` or `AlreadyReady`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UdpWarmStatus {
+    Ready,
+    AlreadyReady,
+    NotApplicable,
+}
+
 #[async_trait]
 pub trait ProxyHandler: Send + Sync {
     fn protocol(&self) -> NodeProtocol;
+
+    /// Warm this generation's node-owned UDP session resources. The default
+    /// is intentionally honest: transport support does not imply that a
+    /// protocol has a reusable warm session.
+    async fn warm_udp(
+        &self,
+        _runtime: Arc<crate::runtime::NodeRuntime>,
+        _connect_timeout: Duration,
+    ) -> anyhow::Result<UdpWarmStatus> {
+        Ok(UdpWarmStatus::NotApplicable)
+    }
 
     async fn dial(
         &self,
@@ -408,6 +429,31 @@ impl ProxyRegistry {
             .await
     }
 
+    /// Warm a node using the explicitly supplied runtime generation. This
+    /// deliberately never reads the mutable shared runtime-registry cell:
+    /// reload-owned work must stay attached to its original generation.
+    pub async fn warm_udp(
+        &self,
+        generation: Arc<crate::runtime::OutboundRuntimeRegistry>,
+        node_id: uuid::Uuid,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<UdpWarmStatus> {
+        if generation.is_shutdown() {
+            anyhow::bail!("outbound runtime generation is shut down");
+        }
+        let runtime = generation
+            .get(&node_id)
+            .ok_or_else(|| anyhow::anyhow!("node {node_id} is not in runtime generation"))?;
+        let handler = self.find(runtime.node.protocol).ok_or_else(|| {
+            anyhow::anyhow!("No handler for protocol {:?}", runtime.node.protocol)
+        })?;
+        let status = handler.warm_udp(runtime, connect_timeout).await?;
+        if generation.is_shutdown() {
+            anyhow::bail!("outbound runtime generation shut down during warm-up");
+        }
+        Ok(status)
+    }
+
     /// Framed UDP transport for a flow, dispatching to the node's handler
     /// (see [`ProxyHandler::dial_udp_transport`]).
     pub async fn dial_udp_transport(
@@ -537,5 +583,60 @@ mod tests {
             target_domain: None,
         };
         assert_eq!(ps.raw_fd(), None);
+    }
+
+    #[tokio::test]
+    async fn warm_udp_is_honestly_not_applicable_for_non_anytls_handlers() {
+        let mut nodes = Vec::new();
+        for (name, protocol) in [
+            ("direct", NodeProtocol::HTTP),
+            ("socks", NodeProtocol::Socks5),
+            ("ss", NodeProtocol::SS),
+            ("trojan", NodeProtocol::Trojan),
+            ("hy2", NodeProtocol::Hysteria2),
+            ("tuic", NodeProtocol::Tuic),
+            ("juicity", NodeProtocol::Juicity),
+        ] {
+            nodes.push(Node {
+                name: name.into(),
+                protocol,
+                ..Default::default()
+            });
+        }
+        let generation = Arc::new(crate::runtime::OutboundRuntimeRegistry::build(&nodes).unwrap());
+        let registry = ProxyRegistry::default_resolver().unwrap();
+
+        for node in &nodes {
+            assert_eq!(
+                registry
+                    .warm_udp(Arc::clone(&generation), node.id, Duration::from_secs(1))
+                    .await
+                    .unwrap(),
+                UdpWarmStatus::NotApplicable,
+                "{} must not masquerade as a warmable UDP session",
+                node.name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_udp_rejects_a_shutdown_generation_before_dispatch() {
+        let node = Node {
+            name: "old-anytls".into(),
+            protocol: NodeProtocol::AnyTLS,
+            ..Default::default()
+        };
+        let generation = Arc::new(
+            crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
+        );
+        generation.shutdown();
+
+        assert!(
+            ProxyRegistry::default_resolver()
+                .unwrap()
+                .warm_udp(generation, node.id, Duration::from_secs(1))
+                .await
+                .is_err()
+        );
     }
 }
