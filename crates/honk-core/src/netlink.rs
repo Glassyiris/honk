@@ -25,6 +25,7 @@ const NLM_F_ACK: u16 = 0x04;
 const NLM_F_EXCL: u16 = 0x200;
 const NLM_F_CREATE: u16 = 0x400;
 const NLM_F_REPLACE: u16 = 0x100;
+const NLM_F_DUMP_INTR: u16 = 0x10;
 
 const NLMSG_ERROR: u16 = 2;
 
@@ -231,17 +232,51 @@ impl NlSock {
         Ok(Self { fd, seq: 0 })
     }
 
-    /// Receive one datagram: EINTR is retried, a truncated read grows the
-    /// buffer (up to 1 MiB) and retries, a timeout is a hard error.
+    /// Receive one datagram. The length is probed with MSG_PEEK|MSG_TRUNC
+    /// before consuming: reading an oversize datagram straight away would
+    /// silently drop its truncated remainder and make the next datagram
+    /// look like the retry. EINTR is retried, oversize is a hard error.
     fn recv_one(&self, buf: &mut Vec<u8>) -> io::Result<usize> {
         const MAX_BUF: usize = 1 << 20;
         loop {
-            // SAFETY: buf is a valid writable region of buf.len() bytes.
+            // SAFETY: valid socket; MSG_PEEK|MSG_TRUNC with no iovec reports
+            // the pending datagram's full length without consuming it.
+            let mut probe: libc::msghdr = unsafe { std::mem::zeroed() };
+            let needed = unsafe {
+                libc::recvmsg(
+                    self.fd.as_raw_fd(),
+                    &mut probe,
+                    libc::MSG_PEEK | libc::MSG_TRUNC,
+                )
+            };
+            if needed < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(e);
+            }
+            let needed = needed as usize;
+            if needed > MAX_BUF {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "netlink message exceeds 1 MiB",
+                ));
+            }
+            if needed > buf.len() {
+                buf.resize(needed, 0);
+            }
+            // SAFETY: buf is a valid writable region of buf.len() bytes;
+            // src captures the sender — only kernel (pid 0) datagrams are
+            // accepted, anything else is dropped and re-probed.
             let mut iov = libc::iovec {
                 iov_base: buf.as_mut_ptr() as *mut libc::c_void,
                 iov_len: buf.len(),
             };
+            let mut src: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
             let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
+            hdr.msg_name = (&mut src as *mut libc::sockaddr_nl).cast();
+            hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_nl>() as u32;
             hdr.msg_iov = &mut iov;
             hdr.msg_iovlen = 1;
             let n = unsafe { libc::recvmsg(self.fd.as_raw_fd(), &mut hdr, 0) };
@@ -252,15 +287,20 @@ impl NlSock {
                 }
                 return Err(e);
             }
+            if src.nl_pid != 0 {
+                continue;
+            }
             if hdr.msg_flags & libc::MSG_TRUNC != 0 {
-                let next = (buf.len() * 2).min(MAX_BUF);
-                if next == buf.len() {
+                // A larger datagram cannot replace the probed one, but stay
+                // defensive: grow and re-probe rather than accept a
+                // truncated read.
+                if buf.len() >= MAX_BUF {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "netlink message exceeds 1 MiB",
                     ));
                 }
-                buf.resize(next, 0);
+                buf.resize((buf.len() * 2).min(MAX_BUF), 0);
                 continue;
             }
             return Ok(n as usize);
@@ -313,18 +353,26 @@ impl NlSock {
                 let hlen = u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap()) as usize;
                 let htype = u16::from_ne_bytes(resp[off + 4..off + 6].try_into().unwrap());
                 let hseq = u32::from_ne_bytes(resp[off + 8..off + 12].try_into().unwrap());
+                if hlen < 16 || off + hlen > n {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "malformed netlink message header",
+                    ));
+                }
                 if hseq == seq && htype == NLMSG_ERROR {
+                    if hlen < 20 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "short NLMSG_ERROR",
+                        ));
+                    }
                     let err = i32::from_ne_bytes(resp[off + 16..off + 20].try_into().unwrap());
                     if err == 0 {
                         return Ok(());
                     }
                     return Err(io::Error::from_raw_os_error(-err));
                 }
-                let next = align(hlen);
-                if next == 0 {
-                    break;
-                }
-                off += next;
+                off += align(hlen);
             }
         }
     }
@@ -630,19 +678,37 @@ impl NlSock {
             let mut off = 0usize;
             while off + 16 <= n {
                 let hlen = u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap()) as usize;
-                if hlen < 16 {
-                    break;
+                if hlen < 16 || off + hlen > n {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "malformed netlink message header",
+                    ));
                 }
                 let htype = u16::from_ne_bytes(resp[off + 4..off + 6].try_into().unwrap());
+                let hflags = u16::from_ne_bytes(resp[off + 6..off + 8].try_into().unwrap());
                 let hseq = u32::from_ne_bytes(resp[off + 8..off + 12].try_into().unwrap());
                 if hseq != seq {
                     break;
+                }
+                // The dump raced an interface-table change; its contents are
+                // not a consistent snapshot.
+                if hflags & NLM_F_DUMP_INTR != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "link dump interrupted by table change",
+                    ));
                 }
                 if htype == NLMSG_DONE {
                     done = true;
                     break;
                 }
                 if htype == NLMSG_ERROR {
+                    if hlen < 20 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "short NLMSG_ERROR",
+                        ));
+                    }
                     let err = i32::from_ne_bytes(resp[off + 16..off + 20].try_into().unwrap());
                     return Err(io::Error::from_raw_os_error(-err));
                 }
@@ -740,6 +806,14 @@ mod tests {
     }
 
     #[test]
+    fn tproxy_mark_default_matches_datapath() {
+        assert_eq!(
+            honk_config::config::DEFAULT_TPROXY_MARK,
+            honk_ebpf_common::TPROXY_MARK
+        );
+    }
+
+    #[test]
     fn get_link_lo() {
         let mut nl = NlSock::new().unwrap();
         let (idx, _mac) = nl.get_link("lo").expect("lo must exist");
@@ -793,11 +867,30 @@ mod tests {
             while off + 16 <= n {
                 let hlen = u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap()) as usize;
                 let htype = u16::from_ne_bytes(resp[off + 4..off + 6].try_into().unwrap());
+                let hflags = u16::from_ne_bytes(resp[off + 6..off + 8].try_into().unwrap());
                 let hseq = u32::from_ne_bytes(resp[off + 8..off + 12].try_into().unwrap());
+                if hlen < 16 || off + hlen > n {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "malformed netlink message header",
+                    ));
+                }
                 if hseq == seq {
+                    if hflags & NLM_F_DUMP_INTR != 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "rule dump interrupted by table change",
+                        ));
+                    }
                     match htype {
                         NLMSG_DONE => break 'outer,
                         NLMSG_ERROR => {
+                            if hlen < 20 {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "short NLMSG_ERROR",
+                                ));
+                            }
                             let err =
                                 i32::from_ne_bytes(resp[off + 16..off + 20].try_into().unwrap());
                             if err != 0 {

@@ -122,6 +122,10 @@ pub struct ControlPlane {
     mode_state: Option<crate::mode::SharedModeState>,
     datapath_healthy: Arc<std::sync::atomic::AtomicBool>,
     active_routing_plan: Arc<parking_lot::RwLock<Arc<routing_matcher::RoutingPushPlan>>>,
+    /// Interface watcher, stopped and joined before `detach_hooks` during
+    /// shutdown so it cannot re-attach hooks mid-drain.
+    #[cfg(feature = "ebpf")]
+    iface_watcher: Option<crate::ebpf::real::IfaceWatcher>,
 }
 
 fn accepts_transparent_connection(drain: &DrainTracker) -> bool {
@@ -344,6 +348,8 @@ impl ControlPlane {
             mode_state: None,
             datapath_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             active_routing_plan: Arc::new(parking_lot::RwLock::new(initial_routing_plan)),
+            #[cfg(feature = "ebpf")]
+            iface_watcher: None,
         };
 
         // interrupt_connections: when a group's selected node changes, close
@@ -478,6 +484,13 @@ impl ControlPlane {
     /// Shared backend cell, used by the interface watcher for dynamic attach.
     pub fn ebpf_handle(&self) -> Arc<RwLock<Box<dyn EbpfBackend>>> {
         self.ebpf.clone()
+    }
+
+    /// Hand the interface watcher to the control plane so shutdown can stop
+    /// it before detaching hooks.
+    #[cfg(feature = "ebpf")]
+    pub fn set_iface_watcher(&mut self, watcher: Option<crate::ebpf::real::IfaceWatcher>) {
+        self.iface_watcher = watcher;
     }
 
     pub fn stats_handle(&self) -> Arc<StatsManager> {
@@ -1092,6 +1105,12 @@ impl ControlPlane {
                                 for handle in tasks.drain(..) {
                                     handle.abort();
                                 }
+                            }
+                            // Stop the interface watcher first: it shares the
+                            // backend and could re-attach hooks mid-drain.
+                            #[cfg(feature = "ebpf")]
+                            if let Some(watcher) = self.iface_watcher.take() {
+                                watcher.shutdown().await;
                             }
                             // Detach BPF hooks immediately to restore network connectivity
                             // before draining connections (matches Go dae behaviour).

@@ -64,6 +64,12 @@ pub struct RealEbpfBackend {
     /// do not see forwarded L2 traffic on their TC hooks, so we attach the LAN
     /// programs to each slave veth instead.
     bridge_slave_links: Vec<aya::programs::tc::SchedClassifierLink>,
+    /// Links installed by dynamic attach (extra startup interfaces and the
+    /// interface watcher), keyed by (ifindex, is_egress).  Keeping them here
+    /// serves three purposes: the fd stays alive until `detach_hooks`, the
+    /// watcher can drop dead links when a device vanishes, and the (ifindex,
+    /// direction) pair dedupes retries after a partial failure.
+    dynamic_links: Vec<(u32, bool, aya::programs::tc::SchedClassifierLink)>,
     dae0_ingress_link: Option<aya::programs::tc::SchedClassifierLink>,
     dae0peer_ingress_link: Option<aya::programs::tc::SchedClassifierLink>,
     sk_lookup_link: Option<aya::programs::sk_lookup::SkLookupLink>,
@@ -313,14 +319,27 @@ impl EbpfBackend for RealEbpfBackend {
         ifname: &str,
         role: super::IfaceRole,
         single_homed: bool,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<super::DynamicHooks> {
         match role {
             super::IfaceRole::Lan => self.attach_lan(ifname, single_homed),
             super::IfaceRole::Wan => {
                 self.attach_wan_egress(ifname)?;
-                self.attach_wan_ingress(ifname)
+                self.attach_wan_ingress(ifname)?;
+                Ok(super::DynamicHooks {
+                    ingress: true,
+                    egress: true,
+                })
+            }
+            super::IfaceRole::LanBridgeSlave | super::IfaceRole::LanBondSlave => {
+                self.attach_slave(ifname, role)
             }
         }
+    }
+
+    fn forget_dynamic_interface(&mut self, ifindex: u32) {
+        // Dropping the links detaches nothing (the device is already gone);
+        // it only releases the fds and the dedup state.
+        self.dynamic_links.retain(|(i, _, _)| *i != ifindex);
     }
 
     fn set_param(&mut self, _key: ParamKey, _value: u32) -> anyhow::Result<()> {
@@ -825,6 +844,7 @@ impl EbpfBackend for RealEbpfBackend {
         self.lan_slave_links.clear();
         self.wan_slave_links.clear();
         self.bridge_slave_links.clear();
+        self.dynamic_links.clear();
         self.dae0_ingress_link = None;
         self.dae0peer_ingress_link = None;
         self.sk_lookup_link = None;
