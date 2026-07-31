@@ -975,21 +975,18 @@ impl EbpfBackend for RealEbpfBackend {
         &mut self,
         tcp4_fd: RawFd,
         tcp6_fd: RawFd,
-        udp4_fds: &[RawFd],
-        udp6_fds: &[RawFd],
+        udp4_fd: RawFd,
+        udp6_fd: RawFd,
     ) -> anyhow::Result<()> {
-        // Publish the listener FDs so the sk_lookup/dae0peer programs can
-        // `bpf_sk_assign` proxy-bound flows. Key mapping: 0=tcp4, 1=tcp6,
-        // 2..=UDP4 group, 2+4..=UDP6 group (see sk_lookup.rs). The programs
-        // hash the flow tuple into the group, so each socket must sit at its
-        // exact slot.
-        let mut entries = vec![(0u32, tcp4_fd), (1u32, tcp6_fd)];
-        for (i, fd) in udp4_fds.iter().enumerate() {
-            entries.push((2 + i as u32, *fd));
-        }
-        for (i, fd) in udp6_fds.iter().enumerate() {
-            entries.push((6 + i as u32, *fd));
-        }
+        // Publish all four listener FDs so the sk_lookup program can
+        // `bpf_sk_assign` proxy-bound flows to the correct TPROXY socket.
+        // Key mapping: 0=tcp4, 1=udp4, 2=tcp6, 3=udp6.
+        let entries = [
+            (0u32, tcp4_fd),
+            (1u32, udp4_fd),
+            (2u32, tcp6_fd),
+            (3u32, udp6_fd),
+        ];
         for (key, fd) in entries {
             // SockMap expects a 4-byte socket FD as the value, not an 8-byte pointer.
             let fd_u32 = fd as u32;

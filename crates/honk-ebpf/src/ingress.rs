@@ -37,7 +37,6 @@ use honk_ebpf_common::{
 use network_types::{
     eth::EthHdr,
     ip::{Ipv4Hdr, Ipv6Hdr},
-    udp::UdpHdr,
 };
 
 use crate::{
@@ -938,12 +937,13 @@ fn do_tproxy_dae0peer_ingress(ctx: &TcContext) -> Verdict {
     Ok(TC_ACT_OK)
 }
 
-/// SockMap keys for `LISTEN_SOCKET_MAP`, shared with `sk_lookup.rs` and the
-/// userspace publish path: 0 = TCP4, 1 = TCP6, 2.. = UDP4 group,
-/// 2 + UDP_LISTENER_COUNT.. = UDP6 group.
-use crate::sk_lookup::{
-    KEY_TCP4, KEY_TCP6, KEY_UDP4_BASE, KEY_UDP6_BASE, listener_hash,
-};
+/// SockMap keys for `LISTEN_SOCKET_MAP`, matching the userspace
+/// `publish_listener_sockets` mapping: 0 = TCP IPv4, 1 = UDP IPv4,
+/// 2 = TCP IPv6, 3 = UDP IPv6.
+const KEY_TCP4: u32 = 0;
+const KEY_UDP4: u32 = 1;
+const KEY_TCP6: u32 = 2;
+const KEY_UDP6: u32 = 3;
 
 /// Assign the TPROXY listener socket to the current skb so the kernel delivers
 /// the packet to the transparent proxy listener instead of performing a normal
@@ -952,8 +952,7 @@ use crate::sk_lookup::{
 /// Ported from Go dae's `assign_listener` in `control/kern/tproxy.c`.  Uses
 /// `bpf_sk_assign` via a SOCKMAP lookup — the same proven pattern employed by
 /// the `tproxy_sk_lookup` program in `sk_lookup.rs`, shared via
-/// [`sk::sk_assign_by_index`].  UDP flows are hashed across the parallel
-/// listener group so each userspace receive loop drains a subset of flows.
+/// [`sk::sk_assign_by_index`].
 #[inline(always)]
 fn assign_listener(ctx: &TcContext, listener_l4proto: u8) -> Result<(), c_long> {
     // SockMap keys differentiate IPv4 vs IPv6 to match the per-family
@@ -962,61 +961,11 @@ fn assign_listener(ctx: &TcContext, listener_l4proto: u8) -> Result<(), c_long> 
     let key = if listener_l4proto == IPPROTO_TCP as u8 {
         if is_v6 { KEY_TCP6 } else { KEY_TCP4 }
     } else {
-        let h = udp_listener_hash(ctx, is_v6);
-        if is_v6 { KEY_UDP6_BASE + h } else { KEY_UDP4_BASE + h }
+        if is_v6 { KEY_UDP6 } else { KEY_UDP4 }
     };
 
     let map_ptr = ptr::from_ref(&LISTEN_SOCKET_MAP).cast::<c_void>();
     sk::sk_assign_by_index(ctx, map_ptr, &key, 0)
-}
-
-/// Flow-consistent listener index for a UDP packet: the same 4-tuple always
-/// lands on the same socket while different flows spread over the group.
-/// Header-missing packets (short reads) hash with zeroed ports, which is
-/// still deterministic per flow.
-#[inline(always)]
-fn udp_listener_hash(ctx: &TcContext, is_v6: bool) -> u32 {
-    // Guarantee the headers are in the linear data area; bounds checks
-    // below still guard the actual reads.
-    let _ = ctx.pull_data((ETH_HLEN + 40 + 8) as u32);
-    let data = ctx.data() as *const u8;
-    let data_end = ctx.data_end() as *const u8;
-    if unsafe { data.add(mem::size_of::<EthHdr>()) } > data_end {
-        return 0;
-    }
-    let (src, dst, l4off) = if is_v6 {
-        if unsafe { data.add(ETH_HLEN as usize + mem::size_of::<Ipv6Hdr>()) } > data_end {
-            return 0;
-        }
-        let v6h = unsafe { &*(data.add(ETH_HLEN as usize) as *const Ipv6Hdr) };
-        let src = u32::from_be_bytes(v6h.src_addr[12..16].try_into().unwrap_or([0; 4]));
-        let dst = u32::from_be_bytes(v6h.dst_addr[12..16].try_into().unwrap_or([0; 4]));
-        (src, dst, ETH_HLEN as usize + mem::size_of::<Ipv6Hdr>())
-    } else {
-        if unsafe { data.add(ETH_HLEN as usize + mem::size_of::<Ipv4Hdr>()) } > data_end {
-            return 0;
-        }
-        let v4h = unsafe { &*(data.add(ETH_HLEN as usize) as *const Ipv4Hdr) };
-        let ihl = (v4h.vihl & 0x0f) as usize * 4;
-        if ihl < 20 {
-            return 0;
-        }
-        (
-            u32::from_be_bytes(v4h.src_addr),
-            u32::from_be_bytes(v4h.dst_addr),
-            ETH_HLEN as usize + ihl,
-        )
-    };
-    let (sport, dport) = if unsafe { data.add(l4off + 4) } > data_end {
-        (0u16, 0u16)
-    } else {
-        let udph = unsafe { &*(data.add(l4off) as *const UdpHdr) };
-        (
-            u16::from_be_bytes(udph.src),
-            u16::from_be_bytes(udph.dst),
-        )
-    };
-    listener_hash(src, dst, ((sport as u32) << 16) | dport as u32, 0)
 }
 
 // #[inline(never)]: standalone program, no deep call chain.

@@ -54,7 +54,7 @@ pub static DAE0PEER_IFINDEX: Global<u32> = Global::new(0);
 pub static OUTBOUND_CONNECTIVITY_MAP: Array<u64, 1536, 0> = Array::new();
 
 #[btf_map]
-pub static LISTEN_SOCKET_MAP: SockMap<16> = SockMap::new();
+pub static LISTEN_SOCKET_MAP: SockMap<4> = SockMap::new();
 
 #[btf_map]
 /// Plain hash with BPF_F_NO_PREALLOC: kernel memory scales with live
