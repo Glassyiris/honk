@@ -43,6 +43,7 @@ proto_idx() {
     trojan) echo 4 ;;
     anytls-sb) echo 5 ;;
     anytls-go) echo 6 ;;
+    juicity) echo 7 ;;
     *) echo 0 ;;
     esac
 }

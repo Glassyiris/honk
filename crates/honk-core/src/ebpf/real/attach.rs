@@ -92,6 +92,12 @@ impl RealEbpfBackend {
             .override_global("DAE0PEER_IFINDEX", &dae0peer_ifindex, true)
             .load(obj)?;
         std::fs::create_dir_all(pin_root)?;
+        // LISTEN_SOCKET_MAP's contents are per-process socket fds and its
+        // slot layout changes between versions (parallel UDP listeners). A
+        // stale pin from a SIGKILLed instance must never shadow the fresh
+        // map (or diagnostics would read a dead generation), so drop it
+        // unconditionally before re-pinning.
+        let _ = std::fs::remove_file(pin_root.join("LISTEN_SOCKET_MAP"));
         for (name, map) in bpf.maps() {
             // aya exposes ELF internal sections (.rodata, .bss, etc.) as maps.
             // These cannot be pinned to bpffs; skip them to avoid noisy warnings.
