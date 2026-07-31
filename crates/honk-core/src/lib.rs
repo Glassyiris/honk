@@ -1138,11 +1138,9 @@ impl Dae0Guard {
 impl Drop for Dae0Guard {
     fn drop(&mut self) {
         info!("Cleaning up dae0 side effects");
-        // The process never leaves the host netns (daens is only entered via
-        // scoped `with_daens_netns` switches that always switch back), so the
-        // `ip` cleanup commands below run in the right namespace directly;
-        // daens itself is removed from the host side via `ip netns delete`.
-        cleanup_dae0_interface();
+        // The recorded ifindex keeps cleanup pointed at the device THIS
+        // instance created, never at a same-named replacement.
+        cleanup_dae0_interface((self.ifindex != 0).then_some(self.ifindex));
     }
 }
 
@@ -1154,13 +1152,16 @@ fn create_dae0_veth(lan_ifname: &str) -> anyhow::Result<Dae0Guard> {
 
     // Stale-state cleanup (previous run): drop the compat bind-mount (the
     // FD-held namespace dies with its owner process) and any leftover dae0.
-    let target = std::ffi::CString::new(DAENS_NS_PATH).unwrap();
-    // SAFETY: plain umount2; errors (not mounted) are expected and ignored.
-    unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
-    if let Ok(idx) = netlink::ifindex_of("dae0") {
-        if let Ok(mut nl) = netlink::NlSock::new() {
-            let _ = nl.del_link(idx);
-        }
+    // The singleton lock guarantees no live sibling owns these names.
+    if is_mountpoint("/run/netns/daens") {
+        let target = std::ffi::CString::new(DAENS_NS_PATH).unwrap();
+        // SAFETY: plain umount2 of a stale bind-mount.
+        unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
+    }
+    if let Ok(idx) = netlink::ifindex_of("dae0")
+        && let Ok(mut nl) = netlink::NlSock::new()
+    {
+        let _ = nl.del_link(idx);
     }
 
     // FD-owned namespace (unshare + held FD, compat bind-mount inside).
@@ -1225,7 +1226,7 @@ fn setup_daens_namespace(tproxy_mark: u32, tproxy_port: u16) -> anyhow::Result<(
     use netlink::{FAM_V4, FAM_V6, NlSock};
 
     // Host-side dae0 MAC: the L2 next-hop for the daens default route.
-    let dae0_mac = netlink::mac_of("dae0").unwrap_or([0; 6]);
+    let dae0_mac = netlink::mac_of("dae0").map_err(|e| anyhow::anyhow!("read dae0 MAC: {e}"))?;
     let dae0_idx = netlink::ifindex_of("dae0")?;
     let peer_idx = netlink::ifindex_of("dae0peer")?;
 
@@ -1385,6 +1386,13 @@ static COMPAT_MOUNTED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 #[cfg(feature = "ebpf")]
 static DAENS_FD: std::sync::OnceLock<std::os::unix::io::OwnedFd> = std::sync::OnceLock::new();
 
+/// Whether THIS instance mounted the tmpfs at /run/netns (the compat
+/// bind-mount's parent). Tracked separately from [`COMPAT_MOUNTED`]:
+/// cleanup unmounts the parent only when it is ours.
+#[cfg(feature = "ebpf")]
+static PARENT_TMPFS_MOUNTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Create the daens network namespace without iproute2: a throwaway
 /// thread `unshare(CLONE_NEWNET)`s, hands its `/proc/self/ns/net` FD back
 /// (the FD pins the namespace after the thread exits), and the FD is
@@ -1423,25 +1431,33 @@ fn create_daens_namespace() -> anyhow::Result<&'static std::os::unix::io::OwnedF
         let target = std::ffi::CString::new(DAENS_NS_PATH).unwrap();
         let src = std::ffi::CString::new(task_ns.clone()).unwrap();
         let tmpfs = std::ffi::CString::new("tmpfs").unwrap();
-        unsafe {
-            // /proc/mounts lists the real path (/var/run is a symlink to
-            // /run) — check the canonical path or every engine start
-            // mounts a fresh tmpfs over the registry, hiding iproute2's
-            // namespace files (the lab netns "disappears"). Order matters:
-            // the tmpfs must exist BEFORE the target file is created, or
-            // the mount hides it and the bind below silently fails on a
-            // first clean deploy.
-            if !is_mountpoint("/run/netns") {
+        let _ = std::fs::create_dir_all("/var/run/netns");
+        // /proc/mounts lists the real path (/var/run is a symlink to
+        // /run) — check the canonical path or every engine start
+        // mounts a fresh tmpfs over the registry, hiding iproute2's
+        // namespace files (the lab netns "disappears"). The tmpfs must
+        // be mounted BEFORE the target file is created, or the mount
+        // hides it and the bind below fails on a first clean deploy.
+        if !is_mountpoint("/run/netns") {
+            // SAFETY: plain mount; the target dir was just ensured.
+            let rc = unsafe {
                 libc::mount(
                     tmpfs.as_ptr(),
                     dir.as_ptr(),
                     tmpfs.as_ptr(),
                     0,
                     std::ptr::null(),
+                )
+            };
+            if rc == 0 {
+                PARENT_TMPFS_MOUNTED.store(true, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                warn!(
+                    "tmpfs mount on /run/netns failed: {}",
+                    std::io::Error::last_os_error()
                 );
             }
         }
-        let _ = std::fs::create_dir_all("/var/run/netns");
         let _ = std::fs::File::create(DAENS_NS_PATH);
         // The bind result is reported, never silently ignored — a failed
         // compat mount leaves debug tooling unable to find daens.
@@ -1567,7 +1583,7 @@ pub(crate) fn with_daens_netns<R>(
 }
 
 #[cfg(feature = "ebpf")]
-fn cleanup_dae0_interface() {
+fn cleanup_dae0_interface(recorded_ifindex: Option<u32>) {
     // Unmount the compat bind-mount only when THIS instance mounted it —
     // a same-named mount from another tool is never ours to tear down.
     if COMPAT_MOUNTED.swap(false, std::sync::atomic::Ordering::Relaxed) {
@@ -1575,12 +1591,27 @@ fn cleanup_dae0_interface() {
         // SAFETY: plain umount2; errors (already unmounted) are ignored.
         unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
     }
+    // Same ownership rule for the parent tmpfs (child must go first).
+    if PARENT_TMPFS_MOUNTED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        let parent = std::ffi::CString::new("/run/netns").unwrap();
+        // SAFETY: plain umount2; errors (busy) are ignored.
+        unsafe { libc::umount2(parent.as_ptr(), libc::MNT_DETACH) };
+    }
+    DAENS_READY.store(false, std::sync::atomic::Ordering::Release);
     // The FD-owned namespace dies with the process (dae0peer goes with it).
 
     let Ok(mut nl) = netlink::NlSock::new() else {
         return;
     };
-    if let Ok(idx) = netlink::ifindex_of("dae0") {
+    // Delete dae0 only when it is still the device this instance created:
+    // the recorded ifindex must still match the name — an outsider's
+    // same-named recreation is left alone.
+    let victim = match recorded_ifindex {
+        Some(idx) if netlink::ifindex_of("dae0").ok() == Some(idx) => Some(idx),
+        Some(_) => None,
+        None => netlink::ifindex_of("dae0").ok(),
+    };
+    if let Some(idx) = victim {
         let _ = nl.del_link(idx);
     }
     // Policy-routing rules for daens live inside the daens namespace and
