@@ -41,16 +41,26 @@ jobs:
             --skip test_routing_with_config_dae
 
   build:
-    name: build ${{ matrix.target }}
+    name: build ${{ matrix.target }}${{ matrix.suffix }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - x86_64-unknown-linux-gnu
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-gnu
-          - aarch64-unknown-linux-musl
+        include:
+          # x86_64 ships two binaries: mimalloc (default, faster QUIC) and
+          # stock malloc (lower RSS high-water on small gateways).
+          - target: x86_64-unknown-linux-gnu
+            suffix: ""
+          - target: x86_64-unknown-linux-gnu
+            suffix: "-stock"
+          - target: x86_64-unknown-linux-musl
+            suffix: ""
+          - target: x86_64-unknown-linux-musl
+            suffix: "-stock"
+          - target: aarch64-unknown-linux-gnu
+            suffix: ""
+          - target: aarch64-unknown-linux-musl
+            suffix: ""
     steps:
       - uses: actions/checkout@v5
 
@@ -100,13 +110,24 @@ jobs:
         with:
           version: 0.14.1
 
+      # The default feature set carries mimalloc; the "-stock" matrix entries
+      # build the same target against the system malloc instead.
+      - name: Resolve feature set
+        shell: bash
+        run: |
+          if [[ "${{ matrix.suffix }}" == "-stock" ]]; then
+            echo "FEATURES=--no-default-features --features clash-api,ebpf" >> "$GITHUB_ENV"
+          else
+            echo "FEATURES=--features ebpf" >> "$GITHUB_ENV"
+          fi
+
       # NB: the nightly step above makes nightly the DEFAULT toolchain, and
       # rust-toolchain's `target` input installs the std only for stable —
       # build with +stable explicitly or cross targets fail with
       # "can't find crate for `core`".
       - name: Build honk-core (native gnu)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo +stable build --release -p honk-core --features ebpf --target ${{ matrix.target }}
+        run: cargo +stable build --release -p honk-core $FEATURES --target ${{ matrix.target }}
 
       - name: Build honk-core (cross via zig wrappers)
         if: matrix.target != 'x86_64-unknown-linux-gnu'
@@ -130,11 +151,11 @@ jobs:
           # boring-sys generates its bindings with bindgen at build time —
           # point it at zig's target headers, not the host's.
           export BINDGEN_EXTRA_CLANG_ARGS="$(ci/zig-bindgen-env "$ZIGCC_TARGET")"
-          cargo +stable build --release -p honk-core --features ebpf --target "$T"
+          cargo +stable build --release -p honk-core $FEATURES --target "$T"
 
       - name: Package artifact
         run: |
-          name="honk-core-${{ github.ref_name }}-${{ matrix.target }}"
+          name="honk-core-${{ github.ref_name }}-${{ matrix.target }}${{ matrix.suffix }}"
           mkdir -p "dist/$name"
           cp "target/${{ matrix.target }}/release/honk-core" "dist/$name/"
           cp LICENSE README.md "dist/$name/"
@@ -143,8 +164,8 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v5
         with:
-          name: honk-core-${{ matrix.target }}
-          path: honk-core-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          name: honk-core-${{ matrix.target }}${{ matrix.suffix }}
+          path: honk-core-${{ github.ref_name }}-${{ matrix.target }}${{ matrix.suffix }}.tar.gz
           retention-days: 1
 
   release:

@@ -128,6 +128,38 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for ReadCounter<S> 
     }
 }
 
+/// Grace window for the surviving direction after the first EOF; see
+/// [`splice::DRAIN_DEADLINE`] for why the drain must be bounded.
+const DRAIN_DEADLINE: std::time::Duration = splice::DRAIN_DEADLINE;
+
+/// Copy one direction until EOF, then half-close the destination's write
+/// side (same contract as `copy_bidirectional`).
+async fn copy_way<R, W>(rd: &mut R, wr: &mut W) -> std::io::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    const RELAY_BUF_SIZE: usize = 64 * 1024;
+    let mut br = tokio::io::BufReader::with_capacity(RELAY_BUF_SIZE, rd);
+    let n = tokio::io::copy_buf(&mut br, wr).await?;
+    wr.shutdown().await?;
+    Ok(n)
+}
+
+/// Wait out the surviving direction after its peer finished; a drain
+/// timeout reports zero bytes for it.
+async fn drain_wait(
+    f: &mut (impl std::future::Future<Output = std::io::Result<u64>> + Unpin),
+) -> std::io::Result<u64> {
+    match tokio::time::timeout(DRAIN_DEADLINE, f).await {
+        Ok(r) => r,
+        Err(_) => {
+            debug!("relay drain deadline hit; closing both directions");
+            Ok(0)
+        }
+    }
+}
+
 /// Relay a TCP connection between client and proxy.
 ///
 /// This is the core forwarding function. It reads from the client and
@@ -149,15 +181,29 @@ where
 
     debug!("TCP relay started: {} → {}", client_addr, target_addr);
 
-    const RELAY_BUF_SIZE: usize = 64 * 1024;
+    let (mut cr, mut cw) = tokio::io::split(&mut client);
+    let (mut pr, mut pw) = tokio::io::split(&mut proxy);
+    // Boxed so dropping them actually releases the stream borrows before
+    // the final shutdown calls.
+    let mut c2p = Box::pin(copy_way(&mut cr, &mut pw));
+    let mut p2c = Box::pin(copy_way(&mut pr, &mut cw));
 
-    let result = tokio::io::copy_bidirectional_with_sizes(
-        &mut client,
-        &mut proxy,
-        RELAY_BUF_SIZE,
-        RELAY_BUF_SIZE,
-    )
-    .await;
+    // The first direction to finish half-closes the other (inside
+    // copy_way); the survivor then gets DRAIN_DEADLINE to reach its own
+    // EOF. An error in either direction cancels the whole relay, mirroring
+    // `copy_bidirectional`.
+    let result: std::io::Result<(u64, u64)> = tokio::select! {
+        r = &mut c2p => match r {
+            Err(e) => Err(e),
+            Ok(first_n) => drain_wait(&mut p2c).await.map(|second_n| (first_n, second_n)),
+        },
+        r = &mut p2c => match r {
+            Err(e) => Err(e),
+            Ok(first_n) => drain_wait(&mut c2p).await.map(|second_n| (second_n, first_n)),
+        },
+    };
+    drop(c2p);
+    drop(p2c);
 
     let _ = client.shutdown().await;
     let _ = proxy.shutdown().await;
@@ -240,6 +286,40 @@ mod tests {
 
         // This test validates the structure - real relay testing needs
         // actual bidirectional data flow
+    }
+
+    /// A silent peer must not pin the copy relay forever either: after the
+    /// client EOFs, the surviving direction is cut at the drain deadline.
+    #[tokio::test]
+    async fn test_relay_tcp_drain_deadline_reaps_silent_peer() {
+        // Blackhole: accept and hold the socket, never read or write.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                std::mem::forget(stream);
+            }
+        });
+        let front_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front = front_listener.local_addr().unwrap();
+        let relay = tokio::spawn(async move {
+            let (client, client_addr) = front_listener.accept().await.unwrap();
+            let upstream = TcpStream::connect(backend).await.unwrap();
+            relay_tcp(client, upstream, client_addr, backend)
+                .await
+                .unwrap()
+        });
+
+        let mut client = TcpStream::connect(front).await.unwrap();
+        let payload = vec![7u8; 64 * 1024];
+        client.write_all(&payload).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let stats = tokio::time::timeout(std::time::Duration::from_secs(5), relay)
+            .await
+            .expect("relay pinned by silent peer")
+            .unwrap();
+        assert_eq!(stats.client_to_proxy, payload.len() as u64);
     }
 
     #[tokio::test]
