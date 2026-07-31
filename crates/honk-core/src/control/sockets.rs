@@ -131,12 +131,42 @@ pub(super) fn set_so_mark_zero(fd: RawFd) -> io::Result<()> {
 /// Replies to clients are sent through dedicated daens-resident reply
 /// sockets (see `new_udp_reply_socket` / the cached DNS reply sockets
 /// below), not through this listener socket.
-pub(super) fn bind_tproxy_udp(addr: SocketAddr, _mark: u32) -> anyhow::Result<UdpSocket> {
+/// Bind `count` transparent UDP listeners on the same address. The eBPF
+/// programs hash each UDP flow's tuple into one of the sockets; SO_REUSEPORT
+/// keeps the normal lookup path working (and hashing) too. Each gets its own
+/// receive loop, so flows drain in parallel across runtime workers.
+pub(super) fn bind_tproxy_udp_listeners(
+    addr: SocketAddr,
+    count: usize,
+) -> anyhow::Result<Vec<UdpSocket>> {
+    let build = |addr: SocketAddr| -> anyhow::Result<UdpSocket> {
+        let socket = build_tproxy_udp(addr)?;
+        #[cfg(target_os = "linux")]
+        unsafe {
+            let one: libc::c_int = 1;
+            let ret = libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_REUSEPORT,
+                &one as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&one) as libc::socklen_t,
+            );
+            if ret != 0 {
+                anyhow::bail!(
+                    "setsockopt(SO_REUSEPORT): {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+        Ok(socket)
+    };
     #[cfg(target_os = "linux")]
     if daens_netns_exists() {
-        return crate::with_daens_netns("bind TPROXY UDP listener", || build_tproxy_udp(addr));
+        return crate::with_daens_netns("bind TPROXY UDP listener group", || {
+            (0..count).map(|_| build(addr)).collect()
+        });
     }
-    build_tproxy_udp(addr)
+    (0..count).map(|_| build(addr)).collect()
 }
 
 fn build_tproxy_udp(addr: SocketAddr) -> anyhow::Result<UdpSocket> {

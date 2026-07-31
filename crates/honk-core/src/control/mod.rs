@@ -603,37 +603,82 @@ impl ControlPlane {
             }
         };
 
-        let udp4_socket = Arc::new(bind_tproxy_udp(udp4_addr, tproxy_mark)?);
-        info!("Control plane listening for TPROXY UDPv4 on {}", udp4_addr);
+        // Parallel UDP listeners: the eBPF datapath hashes each flow's tuple
+        // into one of UDP_LISTENER_COUNT sockets per family (sk_lookup.rs);
+        // each socket gets its own receive loop task below, so flows drain
+        // in parallel across runtime workers.
+        const UDP_LISTENER_COUNT: usize = 4;
+        let udp4_sockets: Vec<Arc<UdpSocket>> =
+            bind_tproxy_udp_listeners(udp4_addr, UDP_LISTENER_COUNT)?
+                .into_iter()
+                .map(Arc::new)
+                .collect();
+        info!(
+            "Control plane listening for TPROXY UDPv4 x{} on {}",
+            udp4_sockets.len(),
+            udp4_addr
+        );
 
-        let udp6_socket = match bind_tproxy_udp(udp6_addr, tproxy_mark) {
-            Ok(s) => {
-                info!("Control plane listening for TPROXY UDPv6 on {}", udp6_addr);
-                Some(s)
-            }
-            Err(e) => {
-                warn!("TPROXY UDPv6 listener unavailable: {}", e);
-                None
-            }
-        };
+        let udp6_sockets: Vec<Arc<UdpSocket>> =
+            match bind_tproxy_udp_listeners(udp6_addr, UDP_LISTENER_COUNT) {
+                Ok(sockets) => {
+                    let sockets: Vec<Arc<UdpSocket>> = sockets.into_iter().map(Arc::new).collect();
+                    info!(
+                        "Control plane listening for TPROXY UDPv6 x{} on {}",
+                        sockets.len(),
+                        udp6_addr
+                    );
+                    sockets
+                }
+                Err(e) => {
+                    warn!("TPROXY UDPv6 listener unavailable: {}", e);
+                    Vec::new()
+                }
+            };
 
         // Publish listener socket FDs into the eBPF listen_socket_map so TC
         // programs can bpf_sk_assign() proxy-bound packets directly to userspace.
-        // Key mapping: 0=tcp4, 1=udp4, 2=tcp6, 3=udp6.
         {
             use std::os::unix::io::AsRawFd;
             let tcp4_fd = tcp4_listener.as_raw_fd();
             let tcp6_fd = tcp6_listener.as_ref().map_or(tcp4_fd, |l| l.as_raw_fd());
-            let udp4_fd = udp4_socket.as_raw_fd();
-            let udp6_fd = udp6_socket.as_ref().map_or(udp4_fd, |s| s.as_raw_fd());
+            let udp4_fds: Vec<_> = udp4_sockets.iter().map(|s| s.as_raw_fd()).collect();
+            let udp6_fds: Vec<_> = udp6_sockets.iter().map(|s| s.as_raw_fd()).collect();
             let mut ebpf = self.ebpf.write().await;
-            if let Err(e) = ebpf.publish_listener_sockets(tcp4_fd, tcp6_fd, udp4_fd, udp6_fd) {
+            if let Err(e) = ebpf.publish_listener_sockets(tcp4_fd, tcp6_fd, &udp4_fds, &udp6_fds) {
                 warn!("Failed to publish listener sockets to eBPF: {}", e);
             }
         }
 
+        // One receive loop per listener socket. The datapath hashes flows
+        // into the group (see the comment above), so loops are flow-disjoint.
+        {
+            let state = UdpLoopState {
+                udp_pool: Arc::clone(&self.udp_pool),
+                stats: Arc::clone(&self.stats),
+                concurrency_limit: Arc::clone(&self.concurrency_limit),
+                dns_controller: Arc::clone(&self.dns_controller),
+                drain: self.drain_tracker.clone(),
+                handle: self.spawn_handle(),
+            };
+            let mut tasks = self.background_tasks.lock().await;
+            for socket in &udp4_sockets {
+                tasks.push(tokio::spawn(udp_listener_loop(
+                    state.clone(),
+                    Arc::clone(socket),
+                    "v4",
+                )));
+            }
+            for socket in &udp6_sockets {
+                tasks.push(tokio::spawn(udp_listener_loop(
+                    state.clone(),
+                    Arc::clone(socket),
+                    "v6",
+                )));
+            }
+        }
+
         let tcp6_listener = tcp6_listener;
-        let udp6_socket = udp6_socket.map(Arc::new);
 
         {
             let plan = self.active_routing_plan.read().clone();
@@ -918,9 +963,6 @@ impl ControlPlane {
         let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut loop_count = 0u64;
-        // Reuse UDP buffers across loop iterations to avoid 128KB alloc per iteration.
-        let mut udp4_buf = vec![0u8; 65536];
-        let mut udp6_buf = vec![0u8; 65536];
         loop {
             loop_count += 1;
             tokio::select! {
@@ -1017,76 +1059,6 @@ impl ControlPlane {
                                 tokio::time::sleep(Duration::from_millis(100)).await;
                             }
                         }
-                    }
-                }
-
-                recv_result = recv_from_with_orig_dst(&udp4_socket, &mut udp4_buf) => {
-                    match recv_result {
-                        Ok((n, src_addr, recv_meta)) => {
-                            let Some(original_dst) = udp_original_dst(&recv_meta, &udp4_buf[..n]) else {
-                                debug!(
-                                    "Dropping UDP from {} without original-destination provenance",
-                                    src_addr
-                                );
-                                continue;
-                            };
-                            if !accepts_transparent_connection(&drain) {
-                                self.stats.record_udp_slow_permit_closed();
-                                continue;
-                            }
-                            // Ready flows enqueue synchronously here; this
-                            // loop never awaits PacketTransport I/O.
-                            if udp_fast_path(&self.udp_pool, &self.stats, &udp4_buf[..n], src_addr, original_dst).await {
-                                continue;
-                            }
-                            dispatch_udp_slow_path(
-                                self,
-                                &drain,
-                                &udp4_socket,
-                                src_addr,
-                                original_dst,
-                                &udp4_buf[..n],
-                            );
-                        }
-                        Err(e) => error!("UDP recv error: {}", e),
-                    }
-                }
-
-                recv6_result = async {
-                    if let Some(ref s) = udp6_socket {
-                        recv_from_with_orig_dst(s, &mut udp6_buf).await
-                    } else {
-                        std::future::pending::<io::Result<(usize, SocketAddr, UdpRecvMeta)>>().await
-                    }
-                } => {
-                    match recv6_result {
-                        Ok((n, src_addr, recv_meta)) => {
-                            let Some(original_dst) = udp_original_dst(&recv_meta, &udp6_buf[..n]) else {
-                                debug!(
-                                    "Dropping UDPv6 from {} without original-destination provenance",
-                                    src_addr
-                                );
-                                continue;
-                            };
-                            if !accepts_transparent_connection(&drain) {
-                                self.stats.record_udp_slow_permit_closed();
-                                continue;
-                            }
-                            // Same shared slow-path helper as the v4 branch.
-                            if udp_fast_path(&self.udp_pool, &self.stats, &udp6_buf[..n], src_addr, original_dst).await {
-                                continue;
-                            }
-                            let socket = udp6_socket.clone().expect("udp6_socket present");
-                            dispatch_udp_slow_path(
-                                self,
-                                &drain,
-                                &socket,
-                                src_addr,
-                                original_dst,
-                                &udp6_buf[..n],
-                            );
-                        }
-                        Err(e) => error!("UDPv6 recv error: {}", e),
                     }
                 }
 
@@ -1307,28 +1279,78 @@ async fn complete_udp_dns_slow_path(
 /// Shared IPv4/IPv6 receive-loop dispatcher after a fast-path miss. Acquires
 /// the slow permit before any copy/spawn, prefers the DNS controller for
 /// DNS-shaped traffic, and only then reserves or enqueues.
+/// Everything a UDP listener loop needs, cloned from the control plane once
+/// so each socket's loop runs as an independent task (parallel drain).
+#[derive(Clone)]
+struct UdpLoopState {
+    udp_pool: Arc<UdpEndpointPool>,
+    stats: Arc<StatsManager>,
+    concurrency_limit: Arc<tokio::sync::Semaphore>,
+    dns_controller: Arc<crate::control::dns_control::DnsController>,
+    drain: Arc<DrainTracker>,
+    handle: ControlPlaneHandle,
+}
+
+/// Receive loop for one UDP listener socket. The eBPF datapath hashes each
+/// flow to a specific socket of the group, so loops are flow-disjoint and
+/// run in parallel across runtime workers.
+async fn udp_listener_loop(state: UdpLoopState, socket: Arc<UdpSocket>, family: &'static str) {
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        match recv_from_with_orig_dst(&socket, &mut buf).await {
+            Ok((n, src_addr, recv_meta)) => {
+                let Some(original_dst) = udp_original_dst(&recv_meta, &buf[..n]) else {
+                    debug!(
+                        "Dropping {} UDP from {} without original-destination provenance",
+                        family, src_addr
+                    );
+                    continue;
+                };
+                if !accepts_transparent_connection(&state.drain) {
+                    state.stats.record_udp_slow_permit_closed();
+                    continue;
+                }
+                // Ready flows enqueue synchronously here; this loop never
+                // awaits PacketTransport I/O.
+                if udp_fast_path(
+                    &state.udp_pool,
+                    &state.stats,
+                    &buf[..n],
+                    src_addr,
+                    original_dst,
+                )
+                .await
+                {
+                    continue;
+                }
+                dispatch_udp_slow_path(&state, &socket, src_addr, original_dst, &buf[..n]);
+            }
+            Err(e) => error!("{} UDP recv error: {}", family, e),
+        }
+    }
+}
+
 fn dispatch_udp_slow_path(
-    plane: &ControlPlane,
-    drain: &Arc<DrainTracker>,
+    state: &UdpLoopState,
     udp_socket: &Arc<UdpSocket>,
     src_addr: SocketAddr,
     original_dst: SocketAddr,
     data: &[u8],
 ) {
     match begin_udp_slow_path(
-        &plane.udp_pool,
-        &plane.stats,
-        &plane.concurrency_limit,
+        &state.udp_pool,
+        &state.stats,
+        &state.concurrency_limit,
         src_addr,
         original_dst,
         data,
     ) {
         UdpSlowPathWork::Done => {}
         UdpSlowPathWork::Initialize(lease) => {
-            let handle = plane.spawn_handle();
+            let handle = state.handle.clone();
             let socket = Arc::clone(udp_socket);
-            let drain = Arc::clone(drain);
-            plane.udp_pool.spawn_slow_path(async move {
+            let drain = Arc::clone(&state.drain);
+            state.udp_pool.spawn_slow_path(async move {
                 let _guard = ConnectionGuard::new(drain);
                 if let Err(e) = handle.serve_udp_connection(lease, socket).await {
                     warn!(
@@ -1339,13 +1361,13 @@ fn dispatch_udp_slow_path(
             });
         }
         UdpSlowPathWork::DnsThenMaybeInitialize { permit, data } => {
-            let handle = plane.spawn_handle();
+            let handle = state.handle.clone();
             let socket = Arc::clone(udp_socket);
-            let guard = ConnectionGuard::new(Arc::clone(drain));
-            let pool = Arc::clone(&plane.udp_pool);
-            let stats = Arc::clone(&plane.stats);
-            let dns_controller = Arc::clone(&plane.dns_controller);
-            plane.udp_pool.spawn_slow_path(async move {
+            let guard = ConnectionGuard::new(Arc::clone(&state.drain));
+            let pool = Arc::clone(&state.udp_pool);
+            let stats = Arc::clone(&state.stats);
+            let dns_controller = Arc::clone(&state.dns_controller);
+            state.udp_pool.spawn_slow_path(async move {
                 // DNS handling is already accepted work. Register it before
                 // spawning so reload/shutdown drain cannot miss work before
                 // its first poll; keep the guard alive for the task lifetime.

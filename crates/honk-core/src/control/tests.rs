@@ -2174,7 +2174,15 @@ async fn udp_dns_dispatch_registers_connection_guard_before_task_poll() {
     let client = addr("10.0.0.3:53000");
     let dst = addr("203.0.113.3:53");
 
-    super::dispatch_udp_slow_path(&plane, &drain, &listener, client, dst, &dns_query_payload());
+    let state = super::UdpLoopState {
+        udp_pool: Arc::clone(&plane.udp_pool),
+        stats: Arc::clone(&plane.stats),
+        concurrency_limit: Arc::clone(&plane.concurrency_limit),
+        dns_controller: Arc::clone(&plane.dns_controller),
+        drain: Arc::clone(&drain),
+        handle: plane.spawn_handle(),
+    };
+    super::dispatch_udp_slow_path(&state, &listener, client, dst, &dns_query_payload());
     assert_eq!(
         drain.active_count(),
         1,
