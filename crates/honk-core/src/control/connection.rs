@@ -1,3 +1,4 @@
+use super::udp_dial::{UdpPrepare, UdpStaggerCallbacks, prepare_udp_plan};
 use super::*;
 use crate::control::udp_endpoint::{UdpEndpoint, UdpInitLease};
 
@@ -1297,19 +1298,18 @@ impl ControlPlaneHandle {
         // after a real driver has reached its barrier.
         lease.set_connection_guard(self.stats.track_connection(&outbound_name));
 
-        let config = self.config.read().await;
-        let ipver = if original_dst.is_ipv6() {
+        let requested_ipver = if original_dst.is_ipv6() {
             IpVersion::V6
         } else {
             IpVersion::V4
         };
-        let candidates = {
+        let plan = {
+            let config = self.config.read().await;
             let gm = self.group_manager.read();
-            resolve_outbound_nodes(&config, &gm, &outbound_name, ProbeDomain::DataUdp, ipver)
+            resolve_udp_outbound_plan(&config, &gm, &outbound_name, requested_ipver)
         };
-        drop(config);
 
-        if candidates.is_empty() {
+        if plan.nodes.is_empty() {
             warn!(
                 "No available candidate nodes for UDP outbound '{}' ({})",
                 outbound_name, client_addr
@@ -1325,177 +1325,195 @@ impl ControlPlaneHandle {
             return Ok(());
         }
 
-        let mut last_err: Option<anyhow::Error> = None;
-        for node in &candidates {
-            // Bind the candidate to this Initializing generation before the
-            // first dial await so a death callback can retire the entry while
-            // dial/driver-ready are still in flight.
-            if !lease.bind_selected_node(&node.name) {
-                return Err(anyhow::anyhow!(
-                    "UDP initializer generation was cancelled before candidate bind"
-                ));
-            }
-            // Close the death-before-bind race: if remove_by_node already won
-            // or DataUdp eligibility is gone, do not dial or send.
-            if !lease.still_initializing()
-                || !self
-                    .alive_set
-                    .is_alive_for(&node.name, ProbeDomain::DataUdp, ipver)
-            {
-                lease.clear_selected_node();
-                last_err = Some(anyhow::anyhow!(
-                    "UDP candidate '{}' became ineligible before dial",
-                    node.name
-                ));
-                continue;
-            }
-
-            let dial_started_at = std::time::Instant::now();
-            let dial_result = self
-                .proxy_registry
-                .dial_udp_transport(node, original_dst, None, connect_timeout)
-                .await;
-            self.stats
-                .record_udp_dial_latency(dial_started_at.elapsed());
-            match dial_result {
-                Ok(transport) => {
-                    // Death during dial must prevent any application send.
-                    if !lease.still_initializing() {
-                        return Err(anyhow::anyhow!(
-                            "UDP initializer generation was retired during dial"
-                        ));
-                    }
-                    // Both capacity (at reservation time) and anyfrom creation
-                    // happen before the first application send. Any failure is
-                    // fail-closed; there is no listener-socket fallback.
-                    let reply_ready_started = std::time::Instant::now();
-                    let reply_socket = match self.udp_pool.create_reply_socket(original_dst) {
-                        Ok(socket) => Arc::new(socket),
-                        Err(error) => {
-                            self.stats
-                                .record_udp_reply_ready_latency(reply_ready_started.elapsed());
-                            self.stats.record_error(&outbound_name);
-                            return Err(error.into());
-                        }
-                    };
-                    self.stats
-                        .record_udp_reply_ready_latency(reply_ready_started.elapsed());
-
-                    let relay_addr = transport.relay_addr();
-                    let endpoint =
-                        Arc::new(UdpEndpoint::new(transport, relay_addr, node.name.clone()));
-                    endpoint.record_pending_reply_peer(relay_addr);
-                    endpoint.cache_routing_result(original_dst, outbound_index);
-
-                    let conn_id = uuid::Uuid::new_v4().to_string();
-                    let (rule, rule_payload) = matched_rule
-                        .clone()
-                        .unwrap_or_else(|| ("Fallback".to_string(), String::new()));
-                    let chains = {
-                        let gm = self.group_manager.read();
-                        let mut chain = gm.selection_chain(&outbound_name);
-                        if chain.last() != Some(&node.name) {
-                            chain.push(node.name.clone());
-                        }
-                        chain.reverse();
-                        chain
-                    };
-                    let (conn_upload, conn_download) = endpoint.byte_counters();
-                    self.connection_tracker
-                        .register(crate::connection_tracker::ConnectionEntry {
-                            id: conn_id.clone(),
-                            source: client_addr.to_string(),
-                            destination: original_dst.to_string(),
-                            proxy: node.name.clone(),
-                            rule,
-                            rule_payload,
-                            chains,
-                            upload: conn_upload,
-                            download: conn_download,
-                            start_time: std::time::Instant::now(),
-                            domain: quic_domain.clone(),
-                            network: "udp".to_string(),
-                        });
-                    endpoint.set_tracker(conn_id.clone());
-                    if !lease.set_tracker_id(conn_id.clone()) {
-                        // The generation was cancelled between route selection
-                        // and registration. No pool entry owns this tracker,
-                        // so retire it directly rather than leaking it.
-                        self.connection_tracker.remove(&conn_id);
-                        return Err(anyhow::anyhow!(
-                            "UDP initializer generation was cancelled before tracker attachment"
-                        ));
-                    }
-
-                    let queue_rx = lease.take_queue_receiver().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "UDP initializer lost its bounded queue before driver start"
-                        )
-                    })?;
-                    let mut driver = self.udp_pool.spawn_driver(
-                        client_addr,
-                        original_dst,
-                        lease.generation(),
-                        Arc::clone(&endpoint),
-                        queue_rx,
-                        reply_socket,
-                        self.alive_set.clone(),
-                        self.stats.clone(),
-                        outbound_name.clone(),
-                    );
-                    driver.wait_ready().await?;
-                    if !lease.still_initializing() {
-                        return Err(anyhow::anyhow!(
-                            "UDP initializer generation was retired before ready commit"
-                        ));
-                    }
-                    if !lease.commit_ready(Arc::clone(&endpoint)) {
-                        return Err(anyhow::anyhow!(
-                            "UDP initializer generation was cancelled before ready commit"
-                        ));
-                    }
-                    let first = lease.take_first().ok_or_else(|| {
-                        anyhow::anyhow!("UDP initializer lost its first packet before driver start")
-                    })?;
-                    driver.start(first)?;
-                    if let Err(error) = driver.wait_first_ack().await {
-                        // PacketTransport Err and timeout are both ambiguous:
-                        // the selected candidate may have received data, so do
-                        // not replay the packet to a later candidate.
-                        self.stats.record_error(&outbound_name);
-                        return Err(error.into());
-                    }
-                    debug!(
-                        "Proxying UDP {} -> {} via {} (endpoint driver ready)",
-                        client_addr, original_dst, node.name
-                    );
-                    return Ok(());
-                }
-                Err(error) => {
-                    // Pre-send dial failure: clear the binding so a later
-                    // candidate may rebind. Never application-send on a dead
-                    // node.
-                    lease.clear_selected_node();
-                    last_err = Some(error);
-                    self.alive_set.report_unavailable_traffic(
+        // Cold URLTest preparation owns no endpoint state: no lease binding,
+        // reply socket, driver, tracker, or application packet exists until
+        // a single eligible transport winner has been drained and accepted.
+        let scheduler_ipver = plan.ipver;
+        let prepare: UdpPrepare<Arc<dyn honk_outbound::proxy::PacketTransport>> = {
+            let registry = self.proxy_registry.clone();
+            let stats = self.stats.clone();
+            Arc::new(move |node: Node| {
+                let registry = registry.clone();
+                let stats = stats.clone();
+                Box::pin(async move {
+                    let dial_started_at = std::time::Instant::now();
+                    let result = registry
+                        .dial_udp_transport(&node, original_dst, None, connect_timeout)
+                        .await;
+                    stats.record_udp_dial_latency(dial_started_at.elapsed());
+                    result
+                })
+            })
+        };
+        let callbacks = UdpStaggerCallbacks {
+            is_eligible: {
+                let group_manager = self.group_manager.clone();
+                Arc::new(move |node| {
+                    group_manager.read().is_node_selectable_for_domain(
                         &node.name,
                         ProbeDomain::DataUdp,
-                        ipver,
+                        scheduler_ipver,
+                    )
+                })
+            },
+            on_dial_error: {
+                let alive_set = self.alive_set.clone();
+                Arc::new(move |node| {
+                    alive_set.report_unavailable_traffic(
+                        &node.name,
+                        ProbeDomain::DataUdp,
+                        scheduler_ipver,
                     );
-                    self.alive_set.clear_latency(&node.name);
-                    self.alive_set.notify_check_tcp(&node.name);
-                }
-            }
+                    alive_set.clear_latency(&node.name);
+                    alive_set.notify_check_tcp(&node.name);
+                })
+            },
+            on_attempt: {
+                let stats = self.stats.clone();
+                Arc::new(move || stats.record_udp_stagger_attempt())
+            },
+            on_winner: {
+                let stats = self.stats.clone();
+                Arc::new(move || stats.record_udp_stagger_winner())
+            },
+            on_cancellation: {
+                let stats = self.stats.clone();
+                Arc::new(move || stats.record_udp_stagger_cancellation())
+            },
+        };
+        let Some((node, transport)) =
+            prepare_udp_plan(plan.mode, plan.nodes, prepare, callbacks).await
+        else {
+            debug!(
+                "All UDP transport preparations failed for '{}'",
+                outbound_name
+            );
+            self.stats.record_error(&outbound_name);
+            return Ok(());
+        };
+
+        // The prepared winner is bound only after every speculative loser has
+        // been aborted/drained. Close the death-before-bind race again before
+        // creating any endpoint state or allowing the Task 3 driver to send.
+        if !lease.bind_selected_node(&node.name) {
+            return Err(anyhow::anyhow!(
+                "UDP initializer generation was cancelled before winner bind"
+            ));
+        }
+        if !lease.still_initializing()
+            || !self.group_manager.read().is_node_selectable_for_domain(
+                &node.name,
+                ProbeDomain::DataUdp,
+                scheduler_ipver,
+            )
+        {
+            lease.clear_selected_node();
+            return Err(anyhow::anyhow!(
+                "UDP winner '{}' became ineligible before endpoint setup",
+                node.name
+            ));
         }
 
-        if let Some(error) = last_err {
-            debug!(
-                "All {} UDP candidate(s) failed: {}",
-                candidates.len(),
-                error
-            );
+        // Both capacity (at reservation time) and anyfrom creation happen
+        // after the winner is finalized and before the only first send. Any
+        // failure is fail-closed; there is no listener-socket fallback.
+        let reply_ready_started = std::time::Instant::now();
+        let reply_socket = match self.udp_pool.create_reply_socket(original_dst) {
+            Ok(socket) => Arc::new(socket),
+            Err(error) => {
+                self.stats
+                    .record_udp_reply_ready_latency(reply_ready_started.elapsed());
+                self.stats.record_error(&outbound_name);
+                return Err(error.into());
+            }
+        };
+        self.stats
+            .record_udp_reply_ready_latency(reply_ready_started.elapsed());
+
+        let relay_addr = transport.relay_addr();
+        let endpoint = Arc::new(UdpEndpoint::new(transport, relay_addr, node.name.clone()));
+        endpoint.record_pending_reply_peer(relay_addr);
+        endpoint.cache_routing_result(original_dst, outbound_index);
+
+        let conn_id = uuid::Uuid::new_v4().to_string();
+        let (rule, rule_payload) = matched_rule
+            .clone()
+            .unwrap_or_else(|| ("Fallback".to_string(), String::new()));
+        let chains = {
+            let gm = self.group_manager.read();
+            let mut chain = gm.selection_chain(&outbound_name);
+            if chain.last() != Some(&node.name) {
+                chain.push(node.name.clone());
+            }
+            chain.reverse();
+            chain
+        };
+        let (conn_upload, conn_download) = endpoint.byte_counters();
+        self.connection_tracker
+            .register(crate::connection_tracker::ConnectionEntry {
+                id: conn_id.clone(),
+                source: client_addr.to_string(),
+                destination: original_dst.to_string(),
+                proxy: node.name.clone(),
+                rule,
+                rule_payload,
+                chains,
+                upload: conn_upload,
+                download: conn_download,
+                start_time: std::time::Instant::now(),
+                domain: quic_domain.clone(),
+                network: "udp".to_string(),
+            });
+        endpoint.set_tracker(conn_id.clone());
+        if !lease.set_tracker_id(conn_id.clone()) {
+            // The generation was cancelled between route selection and
+            // registration. No pool entry owns this tracker, so retire it
+            // directly rather than leaking it.
+            self.connection_tracker.remove(&conn_id);
+            return Err(anyhow::anyhow!(
+                "UDP initializer generation was cancelled before tracker attachment"
+            ));
         }
-        self.stats.record_error(&outbound_name);
+
+        let queue_rx = lease.take_queue_receiver().ok_or_else(|| {
+            anyhow::anyhow!("UDP initializer lost its bounded queue before driver start")
+        })?;
+        let mut driver = self.udp_pool.spawn_driver(
+            client_addr,
+            original_dst,
+            lease.generation(),
+            Arc::clone(&endpoint),
+            queue_rx,
+            reply_socket,
+            self.alive_set.clone(),
+            self.stats.clone(),
+            outbound_name.clone(),
+        );
+        driver.wait_ready().await?;
+        if !lease.still_initializing() {
+            return Err(anyhow::anyhow!(
+                "UDP initializer generation was retired before ready commit"
+            ));
+        }
+        if !lease.commit_ready(Arc::clone(&endpoint)) {
+            return Err(anyhow::anyhow!(
+                "UDP initializer generation was cancelled before ready commit"
+            ));
+        }
+        let first = lease.take_first().ok_or_else(|| {
+            anyhow::anyhow!("UDP initializer lost its first packet before driver start")
+        })?;
+        driver.start(first)?;
+        if let Err(error) = driver.wait_first_ack().await {
+            // PacketTransport Err and timeout are both ambiguous: the winner
+            // may have received data, so never replay this packet elsewhere.
+            self.stats.record_error(&outbound_name);
+            return Err(error.into());
+        }
+        debug!(
+            "Proxying UDP {} -> {} via {} (endpoint driver ready)",
+            client_addr, original_dst, node.name
+        );
         Ok(())
     }
 

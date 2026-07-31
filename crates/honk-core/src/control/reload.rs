@@ -526,6 +526,167 @@ pub(super) fn resolve_outbound_nodes(
     }]
 }
 
+/// Concrete UDP candidates plus the provenance and IP family selected by
+/// the final outbound resolution. This companion does not change the legacy
+/// TCP/DNS `resolve_outbound_nodes` API.
+#[derive(Debug, Clone)]
+pub(super) struct ResolvedUdpPlan {
+    pub(super) mode: honk_outbound::group::SelectionPlanMode,
+    pub(super) nodes: Vec<Node>,
+    pub(super) ipver: IpVersion,
+}
+
+fn direct_udp_plan(name: &str, ipver: IpVersion) -> ResolvedUdpPlan {
+    ResolvedUdpPlan {
+        mode: honk_outbound::group::SelectionPlanMode::Authoritative,
+        nodes: vec![Node {
+            name: name.into(),
+            protocol: honk_config::types::NodeProtocol::HTTP,
+            ..Default::default()
+        }],
+        ipver,
+    }
+}
+
+/// Resolve UDP candidates without inferring policy from candidate count.
+///
+/// A group plan supplies the authoritative/cold provenance directly. Empty
+/// groups may follow `final_outbound`, in which case the terminal outbound's
+/// mode and resolved IP version replace the outer plan. Recursive final
+/// chains are bounded and cycle-safe; a missing final target retains the
+/// historical direct fallback, while a cycle/depth breach fails closed.
+pub(super) fn resolve_udp_outbound_plan(
+    config: &Config,
+    group_manager: &GroupManager,
+    outbound_name: &str,
+    ipver: IpVersion,
+) -> ResolvedUdpPlan {
+    resolve_udp_outbound_plan_inner(
+        config,
+        group_manager,
+        outbound_name,
+        ipver,
+        0,
+        &mut Vec::new(),
+    )
+}
+
+fn resolve_udp_outbound_plan_inner(
+    config: &Config,
+    group_manager: &GroupManager,
+    outbound_name: &str,
+    ipver: IpVersion,
+    depth: usize,
+    visited: &mut Vec<String>,
+) -> ResolvedUdpPlan {
+    if outbound_name == "direct" || outbound_name == "block" {
+        return direct_udp_plan(outbound_name, ipver);
+    }
+    if let Some(node) = config.nodes.iter().find(|node| node.name == outbound_name) {
+        let mut selected_ipver = ipver;
+        let nodes = if group_manager.is_node_selectable_for_domain(
+            &node.name,
+            ProbeDomain::DataUdp,
+            selected_ipver,
+        ) {
+            vec![node.clone()]
+        } else if ipver == IpVersion::V6
+            && group_manager.is_node_selectable_for_domain(
+                &node.name,
+                ProbeDomain::DataUdp,
+                IpVersion::V4,
+            )
+        {
+            selected_ipver = IpVersion::V4;
+            vec![node.clone()]
+        } else {
+            vec![]
+        };
+        return ResolvedUdpPlan {
+            mode: honk_outbound::group::SelectionPlanMode::Authoritative,
+            nodes,
+            ipver: selected_ipver,
+        };
+    }
+    let Some(group) = config
+        .groups
+        .iter()
+        .find(|group| group.name == outbound_name)
+    else {
+        warn!(
+            "UDP outbound '{}' not found, falling back to direct",
+            outbound_name
+        );
+        return direct_udp_plan("direct", ipver);
+    };
+    if depth >= honk_outbound::group::MAX_GROUP_DEPTH
+        || visited.iter().any(|name| name == outbound_name)
+    {
+        warn!(
+            "UDP final outbound resolution for '{}' stopped at recursive cycle/depth",
+            outbound_name
+        );
+        return ResolvedUdpPlan {
+            mode: honk_outbound::group::SelectionPlanMode::Authoritative,
+            nodes: vec![],
+            ipver,
+        };
+    }
+
+    visited.push(outbound_name.to_owned());
+    let mut selected_ipver = ipver;
+    let mut plan =
+        group_manager.selection_plan_for_domain(&group.name, ProbeDomain::DataUdp, selected_ipver);
+    // Proxy servers frequently have only an A record. Preserve that concrete
+    // fallback family for traffic health feedback rather than reporting the
+    // original IPv6 destination family.
+    if plan.nodes.is_empty() && ipver == IpVersion::V6 {
+        plan = group_manager.selection_plan_for_domain(
+            &group.name,
+            ProbeDomain::DataUdp,
+            IpVersion::V4,
+        );
+        if !plan.nodes.is_empty() {
+            selected_ipver = IpVersion::V4;
+            warn!(
+                "UDP group '{}' has no IPv6 alive node; falling back to IPv4 alive candidates",
+                group.name
+            );
+        }
+    }
+    if !plan.nodes.is_empty() {
+        visited.pop();
+        return ResolvedUdpPlan {
+            mode: plan.mode,
+            nodes: plan.nodes.into_iter().cloned().collect(),
+            ipver: selected_ipver,
+        };
+    }
+
+    if let Some(final_name) = group_manager.get_final_outbound(&group.name) {
+        info!(
+            "UDP group '{}' has no available node; falling back to final outbound '{}'",
+            group.name, final_name
+        );
+        let terminal = resolve_udp_outbound_plan_inner(
+            config,
+            group_manager,
+            &final_name,
+            ipver,
+            depth + 1,
+            visited,
+        );
+        visited.pop();
+        return terminal;
+    }
+    visited.pop();
+    ResolvedUdpPlan {
+        mode: plan.mode,
+        nodes: vec![],
+        ipver: selected_ipver,
+    }
+}
+
 #[cfg(test)]
 mod atomic_reload_tests {
     use super::*;

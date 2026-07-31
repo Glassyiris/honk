@@ -13,6 +13,7 @@ mod sockets;
 pub mod tcp_sniff;
 #[cfg(test)]
 mod tests;
+mod udp_dial;
 pub mod udp_endpoint;
 use crate::connection_tracker::ConnectionTracker;
 use crate::control::packet_sniffer::PacketSnifferPool;

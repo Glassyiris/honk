@@ -367,6 +367,135 @@ fn test_urltest_dial_list_single_when_data_exists_race_when_cold() {
 }
 
 #[test]
+fn selection_plan_preserves_authoritative_and_cold_urltest_provenance() {
+    let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let nodes = vec![make_node(a, "a"), make_node(b, "b")];
+    let groups = vec![
+        make_group("selector", GroupPolicy::Selector, vec![a, b]),
+        make_group("load-balance", GroupPolicy::LoadBalance, vec![a, b]),
+        make_group("fallback", GroupPolicy::Fallback, vec![a, b]),
+    ];
+    let manager = GroupManager::new(&groups, &nodes);
+    for group_name in ["selector", "load-balance", "fallback"] {
+        let plan =
+            manager.selection_plan_for_domain(group_name, ProbeDomain::DataUdp, IpVersion::V4);
+        assert_eq!(plan.mode, SelectionPlanMode::Authoritative, "{group_name}");
+        assert_eq!(plan.nodes.len(), 1, "{group_name}");
+    }
+
+    let alive = Arc::new(AliveDialerSet::new());
+    let warm = GroupManager::with_alive_set(
+        &[make_group("warm", GroupPolicy::URLTest, vec![a, b])],
+        &nodes,
+        Some(alive.clone()),
+    );
+    alive.record_probe_latency(
+        "a",
+        ProbeDomain::DataUdp,
+        IpVersion::V4,
+        Duration::from_millis(10),
+    );
+    let plan = warm.selection_plan_for_domain("warm", ProbeDomain::DataUdp, IpVersion::V4);
+    assert_eq!(plan.mode, SelectionPlanMode::Authoritative);
+    assert_eq!(plan.nodes[0].name, "a");
+
+    // A selected cold child contributes its one current leaf. Its cold state
+    // must never turn an authoritative parent into a transport race.
+    let child = make_group("child", GroupPolicy::URLTest, vec![a, b]);
+    let parent = make_subgroup("parent", GroupPolicy::Selector, &["child"]);
+    let nested = GroupManager::new(&[child, parent], &nodes);
+    let plan = nested.selection_plan_for_domain("parent", ProbeDomain::DataUdp, IpVersion::V4);
+    assert_eq!(plan.mode, SelectionPlanMode::Authoritative);
+    assert_eq!(
+        plan.nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        ["a"]
+    );
+}
+
+#[test]
+fn selection_plan_cold_urltest_keeps_mode_with_one_udp_eligible_leaf() {
+    let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let nodes = vec![make_node(a, "udp-dead"), make_node(b, "udp-live")];
+    let alive = Arc::new(AliveDialerSet::new());
+    let manager = GroupManager::with_alive_set(
+        &[make_group("cold", GroupPolicy::URLTest, vec![a, b])],
+        &nodes,
+        Some(alive.clone()),
+    );
+    alive.report_unavailable_forced("udp-dead", ProbeDomain::DataUdp, IpVersion::V4);
+    alive.report_unavailable_forced("udp-dead", ProbeDomain::DnsUdp, IpVersion::V4);
+
+    let plan = manager.selection_plan_for_domain("cold", ProbeDomain::DataUdp, IpVersion::V4);
+    assert_eq!(plan.mode, SelectionPlanMode::ColdUrlTest);
+    assert_eq!(
+        plan.nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        ["udp-live"]
+    );
+}
+
+#[test]
+fn selection_plan_ignores_udp_measurement_from_dead_candidate() {
+    let (a, b, c) = (
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+    );
+    let nodes = vec![
+        make_node(a, "measured-dead"),
+        make_node(b, "unmeasured-live-b"),
+        make_node(c, "unmeasured-live-c"),
+    ];
+    let alive = Arc::new(AliveDialerSet::new());
+    let manager = GroupManager::with_alive_set(
+        &[make_group(
+            "cold-after-filter",
+            GroupPolicy::URLTest,
+            vec![a, b, c],
+        )],
+        &nodes,
+        Some(alive.clone()),
+    );
+    alive.record_probe_latency(
+        "measured-dead",
+        ProbeDomain::DataUdp,
+        IpVersion::V4,
+        Duration::from_millis(10),
+    );
+    for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
+        alive.report_unavailable_forced("measured-dead", domain, IpVersion::V4);
+    }
+
+    let plan =
+        manager.selection_plan_for_domain("cold-after-filter", ProbeDomain::DataUdp, IpVersion::V4);
+    assert_eq!(plan.mode, SelectionPlanMode::ColdUrlTest);
+    assert_eq!(
+        plan.nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        ["unmeasured-live-b", "unmeasured-live-c"]
+    );
+    assert_eq!(
+        manager
+            .select_nodes_in_order_for_domain(
+                "cold-after-filter",
+                ProbeDomain::DataUdp,
+                IpVersion::V4,
+            )
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        ["unmeasured-live-b", "unmeasured-live-c"]
+    );
+}
+
+#[test]
 fn test_migrate_selector_choices_from() {
     let (n1, n2, n3) = (
         uuid::Uuid::new_v4(),

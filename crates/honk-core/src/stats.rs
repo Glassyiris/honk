@@ -284,6 +284,24 @@ impl StatsManager {
         self.udp.dial_latency.record(elapsed);
     }
 
+    /// Record a transport-preparation attempt from the fixed cold URLTest
+    /// stagger scheduler. The schema is fixed; callers never attach labels.
+    pub fn record_udp_stagger_attempt(&self) {
+        self.udp.stagger_attempts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record the first eligible successful staggered preparation.
+    pub fn record_udp_stagger_winner(&self) {
+        self.udp.stagger_winners.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one started speculative preparation aborted after a winner.
+    pub fn record_udp_stagger_cancellation(&self) {
+        self.udp
+            .stagger_cancellations
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record admission into the existing UDP slow path. The endpoint-driver
     /// queue fields remain untouched until Task 3 owns that state machine.
     pub fn record_udp_slow_permit_accepted(&self) {

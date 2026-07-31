@@ -357,9 +357,9 @@ struct InitializingEndpoint {
     /// A tracker registered after route selection but before the Ready
     /// transition. It must be removed if this initialization is cancelled.
     tracker_id: Mutex<Option<String>>,
-    /// Currently selected candidate node for this generation. Bound before the
-    /// first dial await so a death callback can generation-safely retire the
-    /// entry even before `commit_ready` publishes a Ready endpoint.
+    /// Finalized Task 5 transport winner for this generation. Bound only after
+    /// speculative preparation has drained, so a death callback can
+    /// generation-safely retire the entry before `commit_ready` publishes Ready.
     selected_node: Mutex<Option<String>>,
 }
 
@@ -513,9 +513,9 @@ impl UdpInitLease {
         }
     }
 
-    /// Bind the currently selected candidate to this Initializing generation
-    /// before the first dial await. Returns false when a newer generation or
-    /// a death/cancel path already retired this entry.
+    /// Bind the finalized transport winner to this Initializing generation
+    /// after speculative preparation drains and before endpoint setup. Returns
+    /// false when a newer generation or death/cancel path retired this entry.
     pub(super) fn bind_selected_node(&self, node_name: &str) -> bool {
         let Some(entry) = self.pool.endpoints.get(&self.key) else {
             return false;
@@ -531,8 +531,8 @@ impl UdpInitLease {
         }
     }
 
-    /// Clear the selected-node binding after a pre-send dial/preparation
-    /// failure so a later candidate may rebind the same generation.
+    /// Clear the finalized winner's binding if it becomes ineligible before
+    /// endpoint setup. This generation will retire; no later candidate rebinds.
     pub(super) fn clear_selected_node(&self) {
         let Some(entry) = self.pool.endpoints.get(&self.key) else {
             return;
@@ -994,9 +994,9 @@ impl UdpEndpointPool {
     }
 
     /// Retire Ready and bound-Initializing mappings for a dead node.
-    /// Only Initializing entries that have already bound `node_name` are
-    /// removed; unbound reservations are left alone so a later candidate may
-    /// still be selected. Removal is generation-safe.
+    /// Only Initializing entries whose finalized winner is `node_name` are
+    /// removed; an unbound reservation is still awaiting a winner. Removal is
+    /// generation-safe.
     pub fn remove_by_node(&self, node_name: &str) {
         let stale: Vec<(EndpointKey, u64)> = self
             .endpoints

@@ -1,3 +1,4 @@
+use super::udp_dial::{UdpPrepare, UdpStaggerCallbacks, prepare_udp_plan};
 use super::*;
 use crate::control::udp_endpoint::UdpEndpoint;
 
@@ -1728,18 +1729,45 @@ async fn udp_node_dead_before_production_dial_has_zero_dials_and_sends() {
         1,
     );
 
+    for domain in [
+        crate::outbound::ProbeDomain::DataUdp,
+        crate::outbound::ProbeDomain::DnsUdp,
+    ] {
+        handle.alive_set.report_unavailable_forced(
+            "udp-test",
+            domain,
+            crate::outbound::IpVersion::V4,
+        );
+    }
+    serve_test_udp(&handle).await.unwrap();
+
+    assert_eq!(dials.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(sends.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn udp_dns_udp_liveness_keeps_explicit_node_selectable_in_production() {
+    let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let config = udp_test_config("udp-test", vec![udp_test_node()], vec![]);
+    let handle = udp_test_handle(
+        config,
+        UdpTestMode::CountDialAndSend {
+            dials: dials.clone(),
+            sends: sends.clone(),
+        },
+        1,
+    );
+
     handle.alive_set.report_unavailable_forced(
         "udp-test",
         crate::outbound::ProbeDomain::DataUdp,
         crate::outbound::IpVersion::V4,
     );
-    // Trigger the production death callback as well; this ungrouped test
-    // node has no startup grace registration, so one TCP death linearizes it.
-    handle.alive_set.mark_dead("udp-test");
     serve_test_udp(&handle).await.unwrap();
 
-    assert_eq!(dials.load(std::sync::atomic::Ordering::Relaxed), 0);
-    assert_eq!(sends.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(dials.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(sends.load(std::sync::atomic::Ordering::Relaxed), 1);
 }
 
 #[tokio::test]
@@ -1782,7 +1810,7 @@ async fn udp_authoritative_selection_stops_after_single_candidate_dial_failure()
 }
 
 #[tokio::test]
-async fn udp_production_death_callback_removes_blocked_dial_before_send() {
+async fn udp_production_death_during_unbound_preparation_prevents_send() {
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1821,15 +1849,33 @@ async fn udp_production_death_callback_removes_blocked_dial_before_send() {
     let task = tokio::spawn(async move { serve_test_udp(&task_handle).await });
     tokio::time::timeout(Duration::from_secs(1), entered.notified())
         .await
-        .expect("production ProxyRegistry dial must block after node bind");
+        .expect("production ProxyRegistry transport preparation must block");
 
+    // TCP death triggers the production removal callback; both UDP domains
+    // becoming unavailable ensure the scheduler's completion recheck rejects
+    // the transport before it can become a winner.
+    handle.alive_set.report_unavailable_forced(
+        "udp-test",
+        crate::outbound::ProbeDomain::DataUdp,
+        crate::outbound::IpVersion::V4,
+    );
+    handle.alive_set.report_unavailable_forced(
+        "udp-test",
+        crate::outbound::ProbeDomain::DnsUdp,
+        crate::outbound::IpVersion::V4,
+    );
     handle.alive_set.mark_dead("udp-test");
     assert!(
-        handle.udp_pool.is_empty(),
-        "the actual ControlPlane death callback must retire the bound Initializing entry"
+        !handle.udp_pool.is_empty(),
+        "speculative transport preparation must not bind its lease before a winner exists"
     );
     release.notify_one();
-    assert!(task.await.unwrap().is_err());
+    let result = task.await.unwrap();
+    assert!(result.is_ok(), "unexpected initializer result: {result:?}");
+    assert!(
+        handle.udp_pool.is_empty(),
+        "the stale unbound initializer must retire after eligibility rejects its prepared transport"
+    );
     assert_eq!(dials.load(std::sync::atomic::Ordering::Relaxed), 1);
     assert_eq!(
         sends.load(std::sync::atomic::Ordering::Relaxed),
@@ -2227,4 +2273,677 @@ async fn udp_initializing_follower_requires_slow_permit_via_shared_helper() {
         "with a slow permit the follower enqueues exactly once"
     );
     drop(lease);
+}
+
+#[test]
+fn resolve_udp_outbound_plan_preserves_terminal_provenance() {
+    let first = Node {
+        id: uuid::Uuid::new_v4(),
+        name: "first".into(),
+        ..udp_test_node()
+    };
+    let second = Node {
+        id: uuid::Uuid::new_v4(),
+        name: "second".into(),
+        ..udp_test_node()
+    };
+    let cold_child = Group {
+        name: "cold-child".into(),
+        policy: GroupPolicy::URLTest,
+        nodes: vec![first.id, second.id],
+        ..Default::default()
+    };
+    let nested_parent = Group {
+        name: "nested-parent".into(),
+        policy: GroupPolicy::Selector,
+        groups: vec!["cold-child".into()],
+        ..Default::default()
+    };
+    let empty_final = Group {
+        name: "empty-final".into(),
+        policy: GroupPolicy::Selector,
+        final_outbound: Some("cold-child".into()),
+        ..Default::default()
+    };
+    let config = udp_test_config(
+        "direct",
+        vec![first.clone(), second.clone()],
+        vec![cold_child, nested_parent, empty_final],
+    );
+    let manager = GroupManager::new(&config.groups, &config.nodes);
+
+    let direct = resolve_udp_outbound_plan(&config, &manager, "direct", IpVersion::V4);
+    assert_eq!(direct.mode, crate::group::SelectionPlanMode::Authoritative);
+    assert_eq!(
+        direct
+            .nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        ["direct"]
+    );
+
+    let node = resolve_udp_outbound_plan(&config, &manager, "first", IpVersion::V4);
+    assert_eq!(node.mode, crate::group::SelectionPlanMode::Authoritative);
+    assert_eq!(
+        node.nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        ["first"]
+    );
+
+    let nested = resolve_udp_outbound_plan(&config, &manager, "nested-parent", IpVersion::V4);
+    assert_eq!(nested.mode, crate::group::SelectionPlanMode::Authoritative);
+    assert_eq!(
+        nested
+            .nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        ["first"]
+    );
+
+    let final_plan = resolve_udp_outbound_plan(&config, &manager, "empty-final", IpVersion::V4);
+    assert_eq!(
+        final_plan.mode,
+        crate::group::SelectionPlanMode::ColdUrlTest
+    );
+    assert_eq!(
+        final_plan
+            .nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        ["first", "second"]
+    );
+}
+
+#[test]
+fn resolve_udp_outbound_plan_tracks_v4_fallback_and_final_resolution_guards() {
+    let v4_only = Node {
+        id: uuid::Uuid::new_v4(),
+        name: "v4-only".into(),
+        ..udp_test_node()
+    };
+    let groups = vec![
+        Group {
+            name: "v4-group".into(),
+            policy: GroupPolicy::URLTest,
+            nodes: vec![v4_only.id],
+            ..Default::default()
+        },
+        Group {
+            name: "empty".into(),
+            policy: GroupPolicy::Selector,
+            ..Default::default()
+        },
+        Group {
+            name: "missing-final".into(),
+            policy: GroupPolicy::Selector,
+            final_outbound: Some("not-configured".into()),
+            ..Default::default()
+        },
+        Group {
+            name: "cycle-a".into(),
+            policy: GroupPolicy::Selector,
+            final_outbound: Some("cycle-b".into()),
+            ..Default::default()
+        },
+        Group {
+            name: "cycle-b".into(),
+            policy: GroupPolicy::Selector,
+            final_outbound: Some("cycle-a".into()),
+            ..Default::default()
+        },
+    ];
+    let config = udp_test_config("direct", vec![v4_only], groups);
+    let alive = Arc::new(AliveDialerSet::new());
+    alive.report_unavailable_forced("v4-only", ProbeDomain::DataUdp, IpVersion::V6);
+    alive.report_unavailable_forced("v4-only", ProbeDomain::DnsUdp, IpVersion::V6);
+    let manager = GroupManager::with_alive_set(&config.groups, &config.nodes, Some(alive));
+
+    let v4_fallback = resolve_udp_outbound_plan(&config, &manager, "v4-group", IpVersion::V6);
+    assert_eq!(
+        v4_fallback.mode,
+        crate::group::SelectionPlanMode::ColdUrlTest
+    );
+    assert_eq!(v4_fallback.ipver, IpVersion::V4);
+    assert_eq!(
+        v4_fallback
+            .nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        ["v4-only"]
+    );
+
+    let empty = resolve_udp_outbound_plan(&config, &manager, "empty", IpVersion::V4);
+    assert!(empty.nodes.is_empty());
+    assert_eq!(empty.mode, crate::group::SelectionPlanMode::Authoritative);
+
+    let missing = resolve_udp_outbound_plan(&config, &manager, "missing-final", IpVersion::V4);
+    assert_eq!(
+        missing
+            .nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        ["direct"]
+    );
+
+    let cycle = resolve_udp_outbound_plan(&config, &manager, "cycle-a", IpVersion::V4);
+    assert!(
+        cycle.nodes.is_empty(),
+        "final cycles fail closed instead of bypassing policy"
+    );
+}
+
+#[test]
+fn resolve_udp_outbound_plan_explicit_node_falls_back_to_v4_through_final() {
+    let node = Node {
+        id: uuid::Uuid::new_v4(),
+        name: "v4-explicit".into(),
+        ..udp_test_node()
+    };
+    let final_group = Group {
+        name: "final-to-explicit".into(),
+        policy: GroupPolicy::Selector,
+        final_outbound: Some(node.name.clone()),
+        ..Default::default()
+    };
+    let config = udp_test_config("direct", vec![node], vec![final_group]);
+    let alive = Arc::new(AliveDialerSet::new());
+    for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
+        alive.report_unavailable_forced("v4-explicit", domain, IpVersion::V6);
+    }
+    let manager = GroupManager::with_alive_set(&config.groups, &config.nodes, Some(alive.clone()));
+
+    for outbound in ["v4-explicit", "final-to-explicit"] {
+        let plan = resolve_udp_outbound_plan(&config, &manager, outbound, IpVersion::V6);
+        assert_eq!(plan.mode, crate::group::SelectionPlanMode::Authoritative);
+        assert_eq!(plan.ipver, IpVersion::V4, "{outbound}");
+        assert_eq!(
+            plan.nodes
+                .iter()
+                .map(|node| node.name.as_str())
+                .collect::<Vec<_>>(),
+            ["v4-explicit"],
+            "{outbound}"
+        );
+    }
+
+    for outbound in ["direct", "block"] {
+        let plan = resolve_udp_outbound_plan(&config, &manager, outbound, IpVersion::V6);
+        assert_eq!(plan.ipver, IpVersion::V6, "{outbound}");
+        assert_eq!(
+            plan.nodes
+                .iter()
+                .map(|node| node.name.as_str())
+                .collect::<Vec<_>>(),
+            [outbound]
+        );
+    }
+
+    for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
+        alive.report_unavailable_forced("v4-explicit", domain, IpVersion::V4);
+    }
+    for outbound in ["v4-explicit", "final-to-explicit"] {
+        assert!(
+            resolve_udp_outbound_plan(&config, &manager, outbound, IpVersion::V6)
+                .nodes
+                .is_empty(),
+            "{outbound} must stay empty when neither family is selectable"
+        );
+    }
+}
+
+#[test]
+fn resolve_udp_outbound_plan_excludes_unselectable_explicit_node() {
+    let node = udp_test_node();
+    let config = udp_test_config("udp-test", vec![node], vec![]);
+    let alive = Arc::new(AliveDialerSet::new());
+    for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
+        alive.report_unavailable_forced("udp-test", domain, IpVersion::V4);
+    }
+    let manager = GroupManager::with_alive_set(&config.groups, &config.nodes, Some(alive));
+
+    let plan = resolve_udp_outbound_plan(&config, &manager, "udp-test", IpVersion::V4);
+
+    assert!(plan.nodes.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn udp_stagger_uses_absolute_offsets_bounds_inflight_and_drains_losers() {
+    let start = tokio::time::Instant::now();
+    let starts = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let max_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let release_first = Arc::new(tokio::sync::Notify::new());
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let winners = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cancellations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let prepare: UdpPrepare<String> = {
+        let starts = starts.clone();
+        let active = active.clone();
+        let max_active = max_active.clone();
+        let release_first = release_first.clone();
+        Arc::new(move |node: Node| {
+            let starts = starts.clone();
+            let active = active.clone();
+            let max_active = max_active.clone();
+            let release_first = release_first.clone();
+            Box::pin(async move {
+                let now_active = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                max_active.fetch_max(now_active, std::sync::atomic::Ordering::SeqCst);
+                starts.lock().unwrap().push((
+                    node.name.clone(),
+                    tokio::time::Instant::now().duration_since(start),
+                ));
+                match node.name.as_str() {
+                    "first-error" => {
+                        release_first.notified().await;
+                        active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        Err(anyhow::anyhow!("scripted dial error"))
+                    }
+                    "winner" => {
+                        active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(node.name)
+                    }
+                    _ => std::future::pending::<anyhow::Result<String>>().await,
+                }
+            })
+        })
+    };
+    let callbacks = UdpStaggerCallbacks {
+        is_eligible: Arc::new(|_| true),
+        on_dial_error: {
+            let errors = errors.clone();
+            Arc::new(move |_| {
+                errors.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        },
+        on_attempt: {
+            let attempts = attempts.clone();
+            Arc::new(move || {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        },
+        on_winner: {
+            let winners = winners.clone();
+            Arc::new(move || {
+                winners.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        },
+        on_cancellation: {
+            let cancellations = cancellations.clone();
+            Arc::new(move || {
+                cancellations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        },
+    };
+    let candidates = [
+        "first-error",
+        "loser-1",
+        "loser-2",
+        "winner",
+        "never-started",
+    ]
+    .into_iter()
+    .map(|name| Node {
+        id: uuid::Uuid::new_v4(),
+        name: name.into(),
+        ..udp_test_node()
+    })
+    .collect();
+    let task = tokio::spawn(prepare_udp_plan(
+        crate::group::SelectionPlanMode::ColdUrlTest,
+        candidates,
+        prepare,
+        callbacks,
+    ));
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(30)).await;
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(50)).await;
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(80)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        starts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        ["first-error", "loser-1", "loser-2"],
+        "the fourth offset passed, but max-three in-flight blocks its start"
+    );
+
+    release_first.notify_one();
+    let (winner, _) = task
+        .await
+        .unwrap()
+        .expect("the first successful preparation wins");
+    assert_eq!(winner.name, "winner");
+    let starts = starts.lock().unwrap();
+    assert_eq!(
+        starts
+            .iter()
+            .map(|(name, offset)| (name.as_str(), *offset))
+            .collect::<Vec<_>>(),
+        [
+            ("first-error", Duration::ZERO),
+            ("loser-1", Duration::from_millis(30)),
+            ("loser-2", Duration::from_millis(80)),
+            ("winner", Duration::from_millis(160)),
+        ]
+    );
+    assert_eq!(max_active.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 4);
+    assert_eq!(
+        errors.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "only a real dial Err changes health"
+    );
+    assert_eq!(winners.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        cancellations.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "only started losers are cancelled"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn udp_stagger_drain_reports_completed_error_without_cancelling_ready_losers() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cancellations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let prepare: UdpPrepare<String> = {
+        let release = release.clone();
+        Arc::new(move |node: Node| {
+            let release = release.clone();
+            Box::pin(async move {
+                release.notified().await;
+                match node.name.as_str() {
+                    "winner" => Ok(node.name),
+                    "completed-error" => Err(anyhow::anyhow!("scripted dial error")),
+                    "completed-ok" => Ok(node.name),
+                    _ => unreachable!(),
+                }
+            })
+        })
+    };
+    let callbacks = UdpStaggerCallbacks {
+        is_eligible: Arc::new(|_| true),
+        on_dial_error: {
+            let errors = errors.clone();
+            Arc::new(move |_| {
+                errors.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        },
+        on_attempt: {
+            let attempts = attempts.clone();
+            Arc::new(move || {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        },
+        on_winner: Arc::new(|| {}),
+        on_cancellation: {
+            let cancellations = cancellations.clone();
+            Arc::new(move || {
+                cancellations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        },
+    };
+    let candidates = ["winner", "completed-error", "completed-ok"]
+        .into_iter()
+        .map(|name| Node {
+            id: uuid::Uuid::new_v4(),
+            name: name.into(),
+            ..udp_test_node()
+        })
+        .collect();
+    let task = tokio::spawn(prepare_udp_plan(
+        crate::group::SelectionPlanMode::ColdUrlTest,
+        candidates,
+        prepare,
+        callbacks,
+    ));
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(30)).await;
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(50)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+    release.notify_waiters();
+    let (winner, _) = task
+        .await
+        .unwrap()
+        .expect("the first completed success should win");
+    assert_eq!(winner.name, "winner");
+    assert_eq!(errors.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(cancellations.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn udp_stagger_authoritative_prepares_only_the_current_node_without_delay() {
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let winners = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cancellations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let prepare: UdpPrepare<String> = Arc::new(|node: Node| Box::pin(async move { Ok(node.name) }));
+    let callbacks = UdpStaggerCallbacks {
+        is_eligible: Arc::new(|_| true),
+        on_dial_error: Arc::new(|_| panic!("authoritative success must not report an error")),
+        on_attempt: {
+            let attempts = attempts.clone();
+            Arc::new(move || {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        },
+        on_winner: {
+            let winners = winners.clone();
+            Arc::new(move || {
+                winners.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        },
+        on_cancellation: {
+            let cancellations = cancellations.clone();
+            Arc::new(move || {
+                cancellations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        },
+    };
+    let candidates = ["authoritative", "must-not-start"]
+        .into_iter()
+        .map(|name| Node {
+            id: uuid::Uuid::new_v4(),
+            name: name.into(),
+            ..udp_test_node()
+        })
+        .collect();
+
+    let (winner, _) = prepare_udp_plan(
+        crate::group::SelectionPlanMode::Authoritative,
+        candidates,
+        prepare,
+        callbacks,
+    )
+    .await
+    .expect("authoritative candidate should start at offset zero");
+    assert_eq!(winner.name, "authoritative");
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(winners.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(cancellations.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn udp_stagger_authoritative_failure_preserves_fixed_metric_zeros() {
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let winners = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cancellations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let prepare: UdpPrepare<()> =
+        Arc::new(|_: Node| Box::pin(async { Err(anyhow::anyhow!("dial failed")) }));
+    let callbacks = UdpStaggerCallbacks {
+        is_eligible: Arc::new(|_| true),
+        on_dial_error: {
+            let errors = errors.clone();
+            Arc::new(move |_| {
+                errors.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        },
+        on_attempt: {
+            let attempts = attempts.clone();
+            Arc::new(move || {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        },
+        on_winner: {
+            let winners = winners.clone();
+            Arc::new(move || {
+                winners.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        },
+        on_cancellation: {
+            let cancellations = cancellations.clone();
+            Arc::new(move || {
+                cancellations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        },
+    };
+    let candidates = vec![Node {
+        id: uuid::Uuid::new_v4(),
+        name: "authoritative-failure".into(),
+        ..udp_test_node()
+    }];
+
+    assert!(
+        prepare_udp_plan(
+            crate::group::SelectionPlanMode::Authoritative,
+            candidates,
+            prepare,
+            callbacks,
+        )
+        .await
+        .is_none()
+    );
+    assert_eq!(errors.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(winners.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(cancellations.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn udp_stagger_all_dial_failures_report_health_without_cancellation() {
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cancellations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let prepare: UdpPrepare<()> =
+        Arc::new(|_: Node| Box::pin(async { Err(anyhow::anyhow!("dial failed")) }));
+    let callbacks = UdpStaggerCallbacks {
+        is_eligible: Arc::new(|_| true),
+        on_dial_error: {
+            let errors = errors.clone();
+            Arc::new(move |_| {
+                errors.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        },
+        on_attempt: {
+            let attempts = attempts.clone();
+            Arc::new(move || {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        },
+        on_winner: Arc::new(|| {}),
+        on_cancellation: {
+            let cancellations = cancellations.clone();
+            Arc::new(move || {
+                cancellations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        },
+    };
+    let candidates = ["first", "second"]
+        .into_iter()
+        .map(|name| Node {
+            id: uuid::Uuid::new_v4(),
+            name: name.into(),
+            ..udp_test_node()
+        })
+        .collect();
+    let task = tokio::spawn(prepare_udp_plan(
+        crate::group::SelectionPlanMode::ColdUrlTest,
+        candidates,
+        prepare,
+        callbacks,
+    ));
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(30)).await;
+    assert!(task.await.unwrap().is_none());
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(errors.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(cancellations.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn udp_stagger_rechecks_eligibility_before_accepting_prepared_transport() {
+    let became_ineligible = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let prepare: UdpPrepare<String> = {
+        let became_ineligible = became_ineligible.clone();
+        Arc::new(move |node: Node| {
+            let became_ineligible = became_ineligible.clone();
+            Box::pin(async move {
+                if node.name == "became-ineligible" {
+                    became_ineligible.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                Ok(node.name)
+            })
+        })
+    };
+    let callbacks = UdpStaggerCallbacks {
+        is_eligible: {
+            let became_ineligible = became_ineligible.clone();
+            Arc::new(move |node| {
+                node.name != "became-ineligible"
+                    || !became_ineligible.load(std::sync::atomic::Ordering::SeqCst)
+            })
+        },
+        on_dial_error: Arc::new(|_| panic!("prepared success is not a dial error")),
+        on_attempt: {
+            let attempts = attempts.clone();
+            Arc::new(move || {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        },
+        on_winner: Arc::new(|| {}),
+        on_cancellation: Arc::new(|| {}),
+    };
+    let candidates = ["became-ineligible", "eligible-winner"]
+        .into_iter()
+        .map(|name| Node {
+            id: uuid::Uuid::new_v4(),
+            name: name.into(),
+            ..udp_test_node()
+        })
+        .collect();
+    let task = tokio::spawn(prepare_udp_plan(
+        crate::group::SelectionPlanMode::ColdUrlTest,
+        candidates,
+        prepare,
+        callbacks,
+    ));
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(30)).await;
+    let (winner, _) = task
+        .await
+        .unwrap()
+        .expect("eligible candidate should still win");
+    assert_eq!(winner.name, "eligible-winner");
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
