@@ -627,9 +627,10 @@ impl ControlPlane {
             let udp4_fd = udp4_socket.as_raw_fd();
             let udp6_fd = udp6_socket.as_ref().map_or(udp4_fd, |s| s.as_raw_fd());
             let mut ebpf = self.ebpf.write().await;
-            if let Err(e) = ebpf.publish_listener_sockets(tcp4_fd, tcp6_fd, udp4_fd, udp6_fd) {
-                warn!("Failed to publish listener sockets to eBPF: {}", e);
-            }
+            // A partially published listener set means flows are assigned to
+            // sockets that don't exist — run nothing rather than that.
+            ebpf.publish_listener_sockets(tcp4_fd, tcp6_fd, udp4_fd, udp6_fd)
+                .map_err(|e| anyhow::anyhow!("publish listener sockets to eBPF: {}", e))?;
         }
 
         let tcp6_listener = tcp6_listener;
