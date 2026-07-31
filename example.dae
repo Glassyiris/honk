@@ -22,6 +22,8 @@ global {
     check_interval: 30s
     # 新节点延迟 <= 旧节点延迟 - tolerance 才切换
     check_tolerance: 50ms
+    # UDP 预热：启动/重载时给选中的 UDP 组叶子预建会话（0=关闭，最多 4 并发）
+    # udp_warm_node_count: 8
 }
 
 # 订阅（可选）：节点只合并进内存，不回写本文件
