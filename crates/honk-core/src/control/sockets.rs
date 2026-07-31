@@ -152,6 +152,12 @@ fn build_tproxy_udp(addr: SocketAddr) -> anyhow::Result<UdpSocket> {
     if domain == Domain::IPV6 {
         socket.set_only_v6(true)?;
     }
+    // The listener absorbs every proxied UDP datagram before the receive
+    // loop drains it; the ~208 KiB default overflows instantly at
+    // tunnel-saturating rates and the kernel drops the rest before we ever
+    // see it. Same 8 MiB as the QUIC sockets (rmem_max is raised to 16 MiB
+    // at startup).
+    let _ = socket.set_recv_buffer_size(8 << 20);
 
     #[cfg(target_os = "linux")]
     unsafe {
