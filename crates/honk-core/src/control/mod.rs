@@ -647,7 +647,7 @@ impl ControlPlane {
                 }
             }
         }
-        {
+        let mut udp_removal_task = {
             let mut tasks = self.background_tasks.lock().await;
 
             let janitor = BpfJanitor::new(self.ebpf.clone());
@@ -665,7 +665,7 @@ impl ControlPlane {
             self.udp_pool.set_remove_sink(remove_tx);
             let ebpf = self.ebpf.clone();
             let tracker = self.connection_tracker.clone();
-            tasks.push(tokio::spawn(async move {
+            let removal_task = tokio::spawn(async move {
                 while let Some((client, dst, conn_id)) = remove_rx.recv().await {
                     if let Some(id) = conn_id {
                         tracker.remove(&id);
@@ -688,7 +688,7 @@ impl ControlPlane {
                         }
                     }
                 }
-            }));
+            });
 
             tasks.push(self.udp_pool.spawn_janitor());
 
@@ -697,7 +697,8 @@ impl ControlPlane {
             tasks.push(crate::control::tcp_sniff::spawn_sniff_neg_cache_janitor(
                 self.tcp_sniff_neg_cache.clone(),
             ));
-        }
+            removal_task
+        };
 
         {
             let alive_set = self.alive_set.clone();
@@ -1119,11 +1120,16 @@ impl ControlPlane {
                                 drain.active_count());
                             drain.start_rejecting();
                             self.stop_udp_warm_coordinator().await;
-                            if !self.udp_pool.cancel_initializers_and_wait().await {
-                                error!("UDP initializer cancellation timed out during shutdown");
+                            if !self.udp_pool.shutdown().await {
+                                error!("UDP endpoint shutdown required forced cleanup");
                             }
-                            // Abort background tasks (health check, janitor, preconnect) to prevent
-                            // tokio timer panic during runtime shutdown.
+                            // Keep the removal consumer alive until terminal endpoint cleanup has
+                            // emitted and drained every conn-state/tracker retirement.
+                            if let Err(error) = (&mut udp_removal_task).await {
+                                warn!("UDP removal consumer failed during shutdown: {}", error);
+                            }
+                            // Abort remaining background tasks (health check, janitors, preconnect)
+                            // only after UDP drivers and their removal sink have drained.
                             {
                                 let mut tasks = self.background_tasks.lock().await;
                                 for handle in tasks.drain(..) {
@@ -1322,7 +1328,7 @@ fn dispatch_udp_slow_path(
             let handle = plane.spawn_handle();
             let socket = Arc::clone(udp_socket);
             let drain = Arc::clone(drain);
-            tokio::spawn(async move {
+            plane.udp_pool.spawn_slow_path(async move {
                 let _guard = ConnectionGuard::new(drain);
                 if let Err(e) = handle.serve_udp_connection(lease, socket).await {
                     warn!(
@@ -1339,7 +1345,7 @@ fn dispatch_udp_slow_path(
             let pool = Arc::clone(&plane.udp_pool);
             let stats = Arc::clone(&plane.stats);
             let dns_controller = Arc::clone(&plane.dns_controller);
-            tokio::spawn(async move {
+            plane.udp_pool.spawn_slow_path(async move {
                 // DNS handling is already accepted work. Register it before
                 // spawning so reload/shutdown drain cannot miss work before
                 // its first poll; keep the guard alive for the task lifetime.

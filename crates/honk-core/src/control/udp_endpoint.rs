@@ -39,6 +39,8 @@ const FLOW_QUEUE_CAPACITY: usize = 64;
 /// All retained payload bytes across UDP flows are bounded exactly by permits.
 const GLOBAL_PAYLOAD_CAPACITY: usize = 8 * 1024 * 1024;
 const TRANSPORT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const DRIVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(6);
+const DRIVER_ABORT_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// A pooled UDP endpoint representing one NAT mapping.
 pub struct UdpEndpoint {
@@ -599,7 +601,7 @@ impl UdpInitLease {
             dashmap::mapref::entry::Entry::Vacant(_) => return false,
         };
         let _epoch_gate = self.pool.initialization_epoch.lock().unwrap();
-        if self.epoch != *_epoch_gate {
+        if self.pool.terminal.load(Ordering::Acquire) || self.epoch != *_epoch_gate {
             return false;
         }
         let initializing = match occupied.get() {
@@ -661,6 +663,72 @@ impl Drop for UdpInitializerGuard {
     }
 }
 
+struct TaskRegistry {
+    closed: bool,
+    tasks: tokio::task::JoinSet<()>,
+}
+
+impl Default for TaskRegistry {
+    fn default() -> Self {
+        Self {
+            closed: false,
+            tasks: tokio::task::JoinSet::new(),
+        }
+    }
+}
+
+async fn drain_registered_tasks(tasks: &mut tokio::task::JoinSet<()>, label: &str) -> bool {
+    let mut clean = true;
+    while let Some(result) = tasks.join_next().await {
+        if let Err(error) = result
+            && !error.is_cancelled()
+        {
+            clean = false;
+            debug!("UDP {} task join failed during shutdown: {}", label, error);
+        }
+    }
+    clean
+}
+
+async fn join_registered_tasks(
+    mut tasks: tokio::task::JoinSet<()>,
+    label: &str,
+    graceful_timeout: Duration,
+    abort_first: bool,
+) -> bool {
+    if abort_first {
+        tasks.abort_all();
+    }
+    match tokio::time::timeout(
+        if abort_first {
+            DRIVER_ABORT_TIMEOUT
+        } else {
+            graceful_timeout
+        },
+        drain_registered_tasks(&mut tasks, label),
+    )
+    .await
+    {
+        Ok(clean) => clean,
+        Err(_) => {
+            debug!(
+                "Forcing cancellation of UDP {} tasks during shutdown",
+                label
+            );
+            tasks.abort_all();
+            tokio::time::timeout(
+                DRIVER_ABORT_TIMEOUT,
+                drain_registered_tasks(&mut tasks, label),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                debug!("Timed out joining aborted UDP {} tasks", label);
+                false
+            })
+        }
+    }
+}
+
 /// Pool state is a single map entry per tuple: a reservation is either
 /// Initializing or Ready, never a second independently inserted endpoint.
 pub struct UdpEndpointPool {
@@ -676,6 +744,9 @@ pub struct UdpEndpointPool {
     cancel_epoch: watch::Sender<u64>,
     active_initializers: AtomicUsize,
     initializers_empty: Notify,
+    terminal: AtomicBool,
+    slow_tasks: Mutex<TaskRegistry>,
+    drivers: Mutex<TaskRegistry>,
     reply_socket_factory: Arc<dyn UdpReplySocketFactory>,
     /// Sink notified whenever an endpoint is removed; the control plane uses
     /// it to retire conntrack and tracker state exactly once.
@@ -715,6 +786,9 @@ impl UdpEndpointPool {
             cancel_epoch,
             active_initializers: AtomicUsize::new(0),
             initializers_empty: Notify::new(),
+            terminal: AtomicBool::new(false),
+            slow_tasks: Mutex::new(TaskRegistry::default()),
+            drivers: Mutex::new(TaskRegistry::default()),
             reply_socket_factory,
             remove_sink: Mutex::new(None),
             #[cfg(test)]
@@ -821,6 +895,10 @@ impl UdpEndpointPool {
     ) -> EndpointReservation {
         let key = EndpointKey::new(client, dst);
         loop {
+            if self.terminal.load(Ordering::Acquire) {
+                stats.record_udp_queue_closed();
+                return EndpointReservation::QueueClosed;
+            }
             match self.endpoints.entry(key) {
                 dashmap::mapref::entry::Entry::Occupied(occupied) => {
                     let stale_generation = match occupied.get() {
@@ -873,6 +951,10 @@ impl UdpEndpointPool {
                     // A cancellation can therefore linearize wholly before
                     // or after this reservation, never in its middle.
                     let epoch_gate = self.initialization_epoch.lock().unwrap();
+                    if self.terminal.load(Ordering::Acquire) {
+                        stats.record_udp_queue_closed();
+                        return EndpointReservation::QueueClosed;
+                    }
                     let epoch = *epoch_gate;
                     let cancellation = self.cancel_epoch.subscribe();
                     let initializer_guard = UdpInitializerGuard::new(Arc::clone(self));
@@ -913,7 +995,8 @@ impl UdpEndpointPool {
     /// acquire the bounded slow permit before any payload copy/queue work.
     /// This helper never awaits PacketTransport I/O. Closed/dead Ready
     /// entries are retired by generation and returned as a miss so the same
-    /// datagram can reserve.
+    /// datagram can reserve. Terminal shutdown returns `QueueClosed` directly
+    /// so the listener drops the datagram instead of attempting slow admission.
     pub(super) fn fast_path_enqueue(
         &self,
         client: SocketAddr,
@@ -921,6 +1004,10 @@ impl UdpEndpointPool {
         data: &[u8],
         stats: &StatsManager,
     ) -> Option<EndpointReservation> {
+        if self.terminal.load(Ordering::Acquire) {
+            stats.record_udp_queue_closed();
+            return Some(EndpointReservation::QueueClosed);
+        }
         let key = EndpointKey::new(client, dst);
         let entry = self.endpoints.get(&key)?;
         let result = match entry.value() {
@@ -1066,12 +1153,15 @@ impl UdpEndpointPool {
         })
     }
 
-    pub(super) async fn cancel_initializers_and_wait(&self) -> bool {
+    fn advance_initialization_epoch(&self, terminal: bool) {
         // This synchronous gate is the cancellation linearization point. It
         // is shared with reservation publication and commit_ready, and is
         // released before waiting for leases to drop.
         let next = {
             let mut epoch = self.initialization_epoch.lock().unwrap();
+            if terminal {
+                self.terminal.store(true, Ordering::Release);
+            }
             *epoch = epoch
                 .checked_add(1)
                 .expect("UDP initializer epoch overflow");
@@ -1079,6 +1169,9 @@ impl UdpEndpointPool {
             *epoch
         };
         debug_assert_ne!(next, 0);
+    }
+
+    async fn wait_for_initializers(&self) -> bool {
         let wait = async {
             loop {
                 if self.active_initializers.load(Ordering::Acquire) == 0 {
@@ -1096,6 +1189,82 @@ impl UdpEndpointPool {
             .is_ok()
     }
 
+    pub(super) fn spawn_slow_path<F>(&self, future: F) -> bool
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut tasks = self.slow_tasks.lock().unwrap();
+        while let Some(result) = tasks.tasks.try_join_next() {
+            if let Err(error) = result
+                && !error.is_cancelled()
+            {
+                debug!("UDP slow-path task join failed: {}", error);
+            }
+        }
+        if tasks.closed {
+            return false;
+        }
+        drop(tasks.tasks.spawn(future));
+        true
+    }
+
+    pub(super) async fn cancel_initializers_and_wait(&self) -> bool {
+        self.advance_initialization_epoch(false);
+        self.wait_for_initializers().await
+    }
+
+    /// Terminally close UDP admission, retire every mapping, and wait for all
+    /// generation-owned slow-path tasks and endpoint drivers. The removal sink
+    /// is closed only after task cleanup has completed so its consumer can
+    /// drain before the control plane tears down generic background tasks.
+    pub(super) async fn shutdown(&self) -> bool {
+        self.advance_initialization_epoch(true);
+        let slow_tasks = {
+            let mut tasks = self.slow_tasks.lock().unwrap();
+            tasks.closed = true;
+            std::mem::take(&mut tasks.tasks)
+        };
+        {
+            let mut drivers = self.drivers.lock().unwrap();
+            drivers.closed = true;
+        }
+
+        let initializers_graceful = self.wait_for_initializers().await;
+        let slow_tasks_clean = join_registered_tasks(
+            slow_tasks,
+            "slow-path",
+            DRIVER_ABORT_TIMEOUT,
+            !initializers_graceful,
+        )
+        .await;
+        let initializers_clean =
+            slow_tasks_clean && self.active_initializers.load(Ordering::Acquire) == 0;
+
+        let stale: Vec<(EndpointKey, u64)> = self
+            .endpoints
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().generation()))
+            .collect();
+        for (key, generation) in stale {
+            self.remove_if_same(key, generation);
+        }
+
+        let driver_tasks = {
+            let mut drivers = self.drivers.lock().unwrap();
+            std::mem::take(&mut drivers.tasks)
+        };
+        let drivers_clean = join_registered_tasks(
+            driver_tasks,
+            "endpoint driver",
+            DRIVER_SHUTDOWN_TIMEOUT,
+            false,
+        )
+        .await;
+
+        self.remove_sink.lock().unwrap().take();
+        initializers_clean && drivers_clean
+    }
+
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.endpoints.len()
@@ -1104,6 +1273,21 @@ impl UdpEndpointPool {
     #[cfg(test)]
     pub(super) fn is_empty(&self) -> bool {
         self.endpoints.is_empty()
+    }
+
+    #[cfg(test)]
+    fn is_terminal(&self) -> bool {
+        self.terminal.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn slow_task_count(&self) -> usize {
+        self.slow_tasks.lock().unwrap().tasks.len()
+    }
+
+    #[cfg(test)]
+    fn driver_count(&self) -> usize {
+        self.drivers.lock().unwrap().tasks.len()
     }
 }
 
@@ -1120,10 +1304,10 @@ pub(super) struct UdpDriverHandle {
     ready: Option<oneshot::Receiver<()>>,
     start: Option<oneshot::Sender<QueuedDatagram>>,
     first_ack: Option<oneshot::Receiver<io::Result<()>>>,
-    /// Test-only control of the real spawned driver. Dropping a handle still
-    /// detaches the task in production exactly as before.
+    /// Test-only cancellation handle; production ownership remains in the
+    /// pool's driver registry until terminal shutdown joins every task.
     #[cfg(test)]
-    task: tokio::task::JoinHandle<()>,
+    task: Option<tokio::task::AbortHandle>,
 }
 
 /// Owns every terminal driver action. Its synchronous Drop runs after normal
@@ -1197,7 +1381,9 @@ impl UdpDriverHandle {
 
     #[cfg(test)]
     fn abort(&self) {
-        self.task.abort();
+        if let Some(task) = &self.task {
+            task.abort();
+        }
     }
 }
 
@@ -1220,7 +1406,25 @@ impl UdpEndpointPool {
         let (start, start_rx) = oneshot::channel();
         let (first_ack_tx, first_ack) = oneshot::channel();
         let pool = Arc::clone(self);
-        let task = tokio::spawn(async move {
+        let mut drivers = self.drivers.lock().unwrap();
+        while let Some(result) = drivers.tasks.try_join_next() {
+            if let Err(error) = result {
+                debug!("UDP endpoint driver join failed: {}", error);
+            }
+        }
+        if drivers.closed {
+            drop(ready_tx);
+            drop(start_rx);
+            drop(first_ack_tx);
+            return UdpDriverHandle {
+                ready: Some(ready),
+                start: Some(start),
+                first_ack: Some(first_ack),
+                #[cfg(test)]
+                task: None,
+            };
+        }
+        let task = drivers.tasks.spawn(async move {
             // Construct before every await so abort and panic take the same
             // cleanup path as an ordinary driver return.
             let _cleanup = UdpDriverCleanupGuard::new(
@@ -1256,6 +1460,7 @@ impl UdpEndpointPool {
                 );
             }
         });
+        drop(drivers);
         #[cfg(not(test))]
         drop(task);
         UdpDriverHandle {
@@ -1263,7 +1468,7 @@ impl UdpEndpointPool {
             start: Some(start),
             first_ack: Some(first_ack),
             #[cfg(test)]
-            task,
+            task: Some(task),
         }
     }
 }
@@ -2496,6 +2701,120 @@ mod tests {
             removed_rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
+    }
+
+    #[tokio::test]
+    async fn udp_endpoint_pool_shutdown_joins_blocked_ready_driver() {
+        let pool = Arc::new(UdpEndpointPool::new());
+        let stats = Arc::new(StatsManager::new());
+        let client = make_addr("10.0.0.9", 43000);
+        let dst = make_addr("8.8.4.4", 53);
+        let relay = make_addr("192.168.1.1", 1080);
+        let (removed_tx, mut removed_rx) = tokio::sync::mpsc::unbounded_channel();
+        pool.set_remove_sink(removed_tx);
+        let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        let mut lease = match pool.reserve_or_enqueue(client, dst, b"first", slow_permit, &stats) {
+            EndpointReservation::Initializing(lease) => lease,
+            _ => panic!("shutdown fixture must initialize"),
+        };
+        lease.set_connection_guard(stats.track_connection("shutdown-node"));
+        let transport = Arc::new(ScriptedPacketTransport::with_receive_actions(
+            relay,
+            [DriverSendAction::Ok],
+            [DriverReceiveAction::Pending],
+        ));
+        let endpoint = driver_test_endpoint(transport, relay);
+        endpoint.set_tracker("shutdown-tracker".to_owned());
+        assert!(lease.set_tracker_id("shutdown-tracker".to_owned()));
+        let queue_rx = lease.take_queue_receiver().unwrap();
+        let mut driver = pool.spawn_driver(
+            client,
+            dst,
+            lease.generation(),
+            Arc::clone(&endpoint),
+            queue_rx,
+            test_reply_socket().await,
+            Arc::new(honk_outbound::alive::AliveDialerSet::new()),
+            Arc::clone(&stats),
+            "shutdown-node".to_owned(),
+        );
+        driver.wait_ready().await.unwrap();
+        assert!(lease.commit_ready(Arc::clone(&endpoint)));
+        driver.start(lease.take_first().unwrap()).unwrap();
+        drop(lease);
+        driver.wait_first_ack().await.unwrap();
+        assert_eq!(pool.driver_count(), 1);
+        assert_eq!(stats.snapshot()["shutdown-node"].active_conns, 1);
+
+        assert!(pool.shutdown().await);
+
+        assert!(pool.is_terminal());
+        assert!(pool.is_empty());
+        assert_eq!(pool.driver_count(), 0);
+        assert!(endpoint.dead.load(Ordering::Acquire));
+        assert_eq!(stats.snapshot()["shutdown-node"].active_conns, 0);
+        assert_eq!(
+            removed_rx.recv().await,
+            Some((client, dst, Some("shutdown-tracker".to_owned())))
+        );
+        assert_eq!(removed_rx.recv().await, None);
+        assert_eq!(
+            pool.global_payload_bytes.available_permits(),
+            GLOBAL_PAYLOAD_CAPACITY
+        );
+        assert!(matches!(
+            pool.fast_path_enqueue(client, dst, b"late-fast", &stats),
+            Some(EndpointReservation::QueueClosed)
+        ));
+        let rejected = pool.reserve_or_enqueue(
+            client,
+            dst,
+            b"late",
+            Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+            &stats,
+        );
+        assert!(matches!(rejected, EndpointReservation::QueueClosed));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn udp_endpoint_pool_shutdown_aborts_stuck_initializer_task() {
+        let pool = Arc::new(UdpEndpointPool::new());
+        let stats = Arc::new(StatsManager::new());
+        let client = make_addr("10.0.0.10", 43001);
+        let dst = make_addr("1.1.1.1", 53);
+        let (removed_tx, mut removed_rx) = tokio::sync::mpsc::unbounded_channel();
+        pool.set_remove_sink(removed_tx);
+        let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        let mut lease = match pool.reserve_or_enqueue(client, dst, b"held", slow_permit, &stats) {
+            EndpointReservation::Initializing(lease) => lease,
+            _ => panic!("stuck initializer fixture must initialize"),
+        };
+        lease.set_connection_guard(stats.track_connection("stuck-initializer"));
+        assert!(lease.set_tracker_id("stuck-tracker".to_owned()));
+        assert!(pool.spawn_slow_path(async move {
+            std::future::pending::<()>().await;
+            drop(lease);
+        }));
+        tokio::task::yield_now().await;
+        assert_eq!(pool.slow_task_count(), 1);
+        assert_eq!(stats.snapshot()["stuck-initializer"].active_conns, 1);
+
+        assert!(pool.shutdown().await);
+
+        assert_eq!(pool.slow_task_count(), 0);
+        assert!(!pool.spawn_slow_path(async {}));
+        assert!(pool.is_empty());
+        assert_eq!(stats.snapshot()["stuck-initializer"].active_conns, 0);
+        assert_eq!(
+            removed_rx.recv().await,
+            Some((client, dst, Some("stuck-tracker".to_owned())))
+        );
+        assert_eq!(removed_rx.recv().await, None);
+        assert_eq!(
+            pool.global_payload_bytes.available_permits(),
+            GLOBAL_PAYLOAD_CAPACITY
+        );
+        assert_eq!(pool.endpoint_slots.available_permits(), MAX_ENDPOINTS);
     }
 
     #[tokio::test]

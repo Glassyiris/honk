@@ -1251,6 +1251,9 @@ pub(super) async fn udp_fast_path(
         stats.record_udp_endpoint_miss();
         return false;
     };
+    if matches!(result, EndpointReservation::QueueClosed) {
+        return true;
+    }
     stats.record_udp_endpoint_hit();
 
     debug!(
