@@ -13,8 +13,8 @@
 
 ## 2. 非目标（当前）
 
-- 完整 Clash Meta / mihomo 能力对等（完整 FakeIP 引擎、远程 rule-set、完整 DoH/DoT/DoQ 线协议）。
-- REALITY + uTLS 客户端指纹（延期；rustls 缺少成熟 hook）。
+- 完整 Clash Meta / mihomo 能力对等（完整 FakeIP 引擎与远程 rule-set）。
+- REALITY 协议支持（延期）。Chrome 风格 TLS 指纹已通过 BoringSSL 实现，而非生产 rustls 路径。
 - 与官方 sing-box multiplex inbound 的完整互通（h2mux 帧接近 sing-mux，内层握手不同）。
 - Windows / macOS 透明代理。
 
@@ -162,7 +162,7 @@ flowchart TB
 | 嗅探 | TCP SNI/Host、QUIC SNI |
 | DNS | 缓存、路由、转发、可选 SQLite 持久化 |
 | 组 / 拨号 | 经由 `honk-outbound` |
-| 中继 | 双端裸 TCP 时 `splice(2)`；否则 `copy_bidirectional`；UDP bridge |
+| 中继 | 双端裸 TCP 时 `splice(2)`；否则 `copy_bidirectional`；由 PacketTransport 驱动的 UDP endpoint driver |
 | Clash API | 可选 axum 服务 |
 | Cache DB | Selector 选择、模式、可选 DNS 应答 |
 | 订阅 | 拉取 + 周期合并，不回写配置文件 |
@@ -176,6 +176,57 @@ flowchart TB
 | `domain+` | 类似 `domain`，但跳过嗅探域名的真实性校验 |
 | `domain++` | 强制嗅探，并按嗅探域名重新路由 |
 
+### UDP endpoint 管线
+
+**目的地址来源为 fail-closed。** 共享的 IPv4/IPv6 接收器将有效 `ORIGDST`
+控制消息视为权威来源。没有 `ORIGDST` 时，只有精确 DNS 查询加上已指定的
+`PKTINFO` 目的地址才能组成 `IP:53`；否则仅可使用非 wildcard 的本地绑定。
+格式错误、重复、截断或 unspecified 的 `ORIGDST`/`PKTINFO` 元数据会被拒绝，
+不会降级；无可信来源的报文会在保留 endpoint 或发送前直接丢弃。
+
+**`PacketTransport` 是生产 UDP 契约。** `ProxyHandler::dial_udp_transport`
+为每个 endpoint 返回双向的分帧 transport。旧的 `dial_udp`/`UdpProxySocket`
+接口及其 socket adapter 为兼容与渐进迁移而保留，但不是规范 endpoint 路径；
+legacy 或仅测试使用的 loopback adapter 不是生产 bridge 设计。隧道 Handler
+直接在其隧道上分帧。SOCKS5 transport 在整个 association 生命周期内保留 TCP
+UDP-ASSOCIATE 控制流，按 RFC 1928 处理 UDP 分帧与解析，并将控制流 EOF 视为
+endpoint 失败。它的已连接 UDP socket 使用物理 `BND.ADDR` relay，而暴露给
+endpoint 的 `relay_addr()` 与收到的 peer 是供首个回包过滤使用的逻辑目标 peer。
+
+**Endpoint 创建是事务性的。** `(client, original-destination)` 映射先发布带
+lease 的 `Initializing` generation。路由/选择准备出唯一最终且仍 eligible 的
+transport 及 anyfrom 回包 socket 后，driver 到达 ready barrier，lease 提交为
+`Ready`，再发送并确认已保留的首包，之后才按 FIFO 处理后续包。接收循环只做
+路由/保留/入队，绝不 await transport I/O；专用 driver 拥有首发、后续发送与回包。
+首包和稳态发送的 timeout 都是五秒；timeout 或错误均可能已送达，因此绝不改由
+另一个 candidate 重放该包。
+
+**队列上限也是所有权上限。** 每 flow 最多保留 64 个 datagram（含首包），
+全部 flow 的 payload 合计最多 8 MiB。slow admission 和 flow/global permit
+在分配或复制 payload 之前取得；后续包按 FIFO 且非阻塞，饱和时丢弃最新包。
+reload cancellation 受 epoch 与 generation 栅栏保护：它清理 `Initializing`
+lease 及资源、保留已经 `Ready` 的 endpoint，并且只删除同一 generation，故旧任务
+不能清除 replacement。
+
+**选择竞争被刻意收窄。** 普通 Selector、LoadBalance、Fallback、显式节点与
+warm URLTest plan 都是权威的单叶 plan。只有顶层 cold URLTest plan 可并发准备多个
+eligible leaf：绝对启动时刻为 0/30/80 ms，之后每 80 ms 一次，同时最多三个。
+第一个仍 eligible 的成功者获胜；已启动的 loser 在绑定前会被 abort 并 drain。
+只有观察到的 preparation error 会影响 traffic health；取消或成功 drain 的推测性
+loser 对 health 保持中性。AnyTLS 在该路径使用 caller-owned、计入 session cap 的
+provisional slot，而不是普通 pool-owned dial task。loser 会同步关闭 detached
+session；只有最终 winner 才会在 endpoint publication 与 application send 之前
+提交到捕获的 runtime-generation pool，并启动该 pool 的 janitor。
+
+**UDP warm-up 是 opt-in 且 generation-owned。** `global.udp_warm_node_count`
+默认值为 0，不创建 coordinator work 或 warm metrics。预算为正时，discovery 按
+V4 后 V6 顺序 peek 权威 DataUdp group plan，对 eligible 的已配置 leaf 按 UUID
+去重并应用预算；direct、block 与 cold URLTest plan 被排除。dispatch 最多四个 task。
+AnyTLS 在自己的 runtime generation 中拥有可复用 pool，shutdown 会使该 pool 变为
+terminal；reload 只 retire 旧 generation，再启动 replacement。仅 `Ready` 与
+`AlreadyReady` 记为 warm success。direct、其他非 AnyTLS 以及当前延后的 QUIC
+warm-up 返回 `NotApplicable`，不会伪造成功。
+
 ## 8. 出站栈
 
 ### Handler（`honk-outbound`）
@@ -187,7 +238,7 @@ flowchart TB
 - `transport.rs` — TCP → 可选 TLS → WS / gRPC
 - `mux.rs` — `node.mux = true` 时 h2mux（无 smux/yamux）
 - `quic.rs` — Hy2 / TUIC / Juicity 共用 quinn 客户端
-- `tls.rs` — rustls 辅助
+- `tls.rs` — BoringSSL TLS 与 Chrome 指纹辅助
 
 ### 组
 
@@ -196,7 +247,7 @@ flowchart TB
 | 策略 | 行为 |
 | ------ | ------ |
 | **Selector** | 手动固定；Clash API + cache 持久化 |
-| **URLTest** | 最低延迟 + tolerance（以现任节点的当前实测延迟为基准，与 sing-box 一致）；TCP/UDP 独立选择；空闲休眠；拨号失败立即清除该节点延迟历史，下一条连接即刻重选；可选 per-group `check_url`，与全局目标独立探测与排序 |
+| **URLTest** | 最低延迟 + tolerance（以现任节点的当前实测延迟为基准，与 sing-box 一致）；TCP/UDP 独立选择；空闲休眠；拨号失败立即清除该节点延迟历史，下一条连接即刻重选；可选 per-group `check_url`，与全局目标独立探测与排序。只有未测量的顶层 UDP URLTest plan 才是 staggered 多 candidate 准备；已有选择时为权威单叶。 |
 | **LoadBalance** | 组内存活成员轮询 |
 | **Fallback** | 声明顺序第一个存活；粘性直到死亡 |
 
@@ -220,13 +271,13 @@ flowchart TB
 
 - 当前仅有用户态缓存（尚无内核 DNS 应答 cache map）。
 - 上游协议：UDP/TCP/DoT/DoH/DoQ/DoH3 均已实现（`honk-core/src/dns/transport/`，会话池化，失效后重试一次）。
-- 上游可选 `outbound`，经代理节点/组发出查询（防污染）；因 SOCKS5-UDP 路径不完整，UDP+代理隧道化为 TCP-DNS，DoQ/DoH3 仅支持直连。
+- 上游可选 `outbound`，经代理节点/组发出查询（防污染）；UDP+代理由上游策略刻意承载为 TCP-DNS；SOCKS5 RFC 1928 UDP 仍是独立的完整 transport；DoQ/DoH3 仅支持直连。
 
 ## 10. Clash API
 
 当 `experimental.clash_api.external_controller` 非空时启用。
 
-核心接口：`/version`、`/configs`、`/proxies`、delay、`/rules`、`/connections`、`/traffic`、`/stats`、`/logs`、`/dns/query`、缓存清理、`/providers/proxies`、外部 UI 自动下载（Yacd-meta）。
+核心接口：`/version`、`/configs`、`/proxies`、delay、`/rules`、`/connections`、`/traffic`、`/stats`、`/logs`、`/dns/query`、缓存清理、`/providers/proxies`、外部 UI 自动下载（Yacd-meta）。`GET /stats` 含稳定的嵌套 `udp` 对象；完整 schema 见组件参考。
 
 鉴权：`Authorization: Bearer` 或 `?token=`（已做 percent-decode）。
 

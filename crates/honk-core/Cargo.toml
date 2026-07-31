@@ -128,3 +128,7 @@ futures-util = "0.3"
 [[bench]]
 name = "dns"
 harness = false
+
+[[bench]]
+name = "udp"
+harness = false

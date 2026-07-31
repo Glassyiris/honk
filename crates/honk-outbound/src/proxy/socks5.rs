@@ -40,6 +40,20 @@ impl Socks5Handler {
         Self
     }
 
+    fn username_password_auth_request(username: &str, password: &str) -> anyhow::Result<Vec<u8>> {
+        let username_len = u8::try_from(username.len())
+            .map_err(|_| anyhow::anyhow!("SOCKS5 username exceeds 255 bytes"))?;
+        let password_len = u8::try_from(password.len())
+            .map_err(|_| anyhow::anyhow!("SOCKS5 password exceeds 255 bytes"))?;
+        let mut request = Vec::with_capacity(3 + username.len() + password.len());
+        request.push(0x01);
+        request.push(username_len);
+        request.extend_from_slice(username.as_bytes());
+        request.push(password_len);
+        request.extend_from_slice(password.as_bytes());
+        Ok(request)
+    }
+
     /// Perform full SOCKS5 handshake.
     async fn handshake(
         stream: &mut TcpStream,
@@ -78,12 +92,7 @@ impl Socks5Handler {
                     let pass = password.unwrap_or("");
 
                     // Send: VER(1) | ULEN(1) | UNAME(ULEN) | PLEN(1) | PASSWD(PLEN)
-                    let mut auth_req = Vec::with_capacity(3 + user.len() + pass.len());
-                    auth_req.push(0x01); // auth version
-                    auth_req.push(user.len() as u8);
-                    auth_req.extend_from_slice(user.as_bytes());
-                    auth_req.push(pass.len() as u8);
-                    auth_req.extend_from_slice(pass.as_bytes());
+                    let auth_req = Self::username_password_auth_request(user, pass)?;
                     stream.write_all(&auth_req).await?;
 
                     // Read: VER(1) | STATUS(1)
@@ -273,12 +282,7 @@ impl Socks5Handler {
             METHOD_USERNAME_PASSWORD => {
                 let user = username.unwrap_or("");
                 let pass = password.unwrap_or("");
-                let mut auth_req = Vec::with_capacity(3 + user.len() + pass.len());
-                auth_req.push(0x01);
-                auth_req.push(user.len() as u8);
-                auth_req.extend_from_slice(user.as_bytes());
-                auth_req.push(pass.len() as u8);
-                auth_req.extend_from_slice(pass.as_bytes());
+                let auth_req = Self::username_password_auth_request(user, pass)?;
                 stream.write_all(&auth_req).await?;
 
                 let mut auth_resp = [0u8; 2];
@@ -620,6 +624,21 @@ mod tests {
     use std::sync::Arc;
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
+
+    #[test]
+    fn socks5_rfc1929_auth_request_rejects_oversized_credentials() {
+        let oversized = "x".repeat(u8::MAX as usize + 1);
+        assert!(Socks5Handler::username_password_auth_request(&oversized, "ok").is_err());
+        assert!(Socks5Handler::username_password_auth_request("ok", &oversized).is_err());
+    }
+
+    #[test]
+    fn socks5_rfc1929_auth_request_encodes_checked_lengths() {
+        assert_eq!(
+            Socks5Handler::username_password_auth_request("user", "pass").unwrap(),
+            b"\x01\x04user\x04pass"
+        );
+    }
 
     struct UdpAssociateTestServer {
         proxy_addr: SocketAddr,

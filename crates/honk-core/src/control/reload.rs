@@ -1322,22 +1322,24 @@ mod atomic_reload_tests {
         let dead = node("dead-udp");
         let selected = node("selected");
         let second = node("second");
-        let mut config = Config::default();
-        config.nodes = vec![dead.clone(), selected.clone(), second.clone()];
-        config.groups = vec![
-            Group {
-                name: "first".into(),
-                policy: GroupPolicy::Selector,
-                nodes: vec![dead.id, selected.id],
-                ..Default::default()
-            },
-            Group {
-                name: "second".into(),
-                policy: GroupPolicy::Selector,
-                nodes: vec![second.id],
-                ..Default::default()
-            },
-        ];
+        let config = Config {
+            nodes: vec![dead.clone(), selected.clone(), second.clone()],
+            groups: vec![
+                Group {
+                    name: "first".into(),
+                    policy: GroupPolicy::Selector,
+                    nodes: vec![dead.id, selected.id],
+                    ..Default::default()
+                },
+                Group {
+                    name: "second".into(),
+                    policy: GroupPolicy::Selector,
+                    nodes: vec![second.id],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
         let alive = Arc::new(crate::outbound::AliveDialerSet::new());
         for ipver in [IpVersion::V4, IpVersion::V6] {
             alive.report_unavailable_forced(&dead.name, ProbeDomain::DataUdp, ipver);
@@ -1371,15 +1373,6 @@ mod atomic_reload_tests {
         };
         let (lb_a, lb_b, lb_c) = (node("lb-a"), node("lb-b"), node("lb-c"));
         let (fallback_a, fallback_b, cold) = (node("fallback-a"), node("fallback-b"), node("cold"));
-        let mut config = Config::default();
-        config.nodes = vec![
-            lb_a.clone(),
-            lb_b.clone(),
-            lb_c.clone(),
-            fallback_a.clone(),
-            fallback_b.clone(),
-            cold.clone(),
-        ];
         let fallback = Group {
             name: "fallback".into(),
             policy: GroupPolicy::Fallback,
@@ -1387,25 +1380,36 @@ mod atomic_reload_tests {
             interrupt_connections: true,
             ..Default::default()
         };
-        config.groups = vec![
-            Group {
-                name: "load-balance".into(),
-                policy: GroupPolicy::LoadBalance,
-                nodes: vec![lb_a.id, lb_b.id, lb_c.id],
-                ..Default::default()
-            },
-            Group {
-                name: "cold-urltest".into(),
-                policy: GroupPolicy::URLTest,
-                nodes: vec![cold.id],
-                ..Default::default()
-            },
-            fallback,
-        ];
+        let config = Config {
+            nodes: vec![
+                lb_a.clone(),
+                lb_b.clone(),
+                lb_c.clone(),
+                fallback_a.clone(),
+                fallback_b.clone(),
+                cold.clone(),
+            ],
+            groups: vec![
+                Group {
+                    name: "load-balance".into(),
+                    policy: GroupPolicy::LoadBalance,
+                    nodes: vec![lb_a.id, lb_b.id, lb_c.id],
+                    ..Default::default()
+                },
+                Group {
+                    name: "cold-urltest".into(),
+                    policy: GroupPolicy::URLTest,
+                    nodes: vec![cold.id],
+                    ..Default::default()
+                },
+                fallback,
+            ],
+            ..Default::default()
+        };
         let alive = Arc::new(crate::outbound::AliveDialerSet::new());
         alive.register_urltest_group(
             "cold-urltest",
-            &[cold.name.clone()],
+            std::slice::from_ref(&cold.name),
             Some(Duration::from_secs(60)),
         );
         let manager =
@@ -1559,7 +1563,8 @@ mod atomic_reload_tests {
 
         for (name, outcome, expected_successes, expected_failures) in cases {
             let generation = Arc::new(
-                honk_outbound::runtime::OutboundRuntimeRegistry::build(&[node.clone()]).unwrap(),
+                honk_outbound::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node))
+                    .unwrap(),
             );
             let stats = Arc::new(StatsManager::new());
             let dispatch = Arc::new(

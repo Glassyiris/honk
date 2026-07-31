@@ -1,6 +1,7 @@
 use super::udp_dial::{UdpPrepare, UdpStaggerCallbacks, prepare_udp_plan};
 use super::*;
 use crate::control::udp_endpoint::{UdpEndpoint, UdpInitLease};
+use crate::group::SelectionPlanMode;
 
 /// Result from the eBPF routing handoff map lookup.
 #[derive(Debug, Clone)]
@@ -1329,7 +1330,8 @@ impl ControlPlaneHandle {
         // reply socket, driver, tracker, or application packet exists until
         // a single eligible transport winner has been drained and accepted.
         let scheduler_ipver = plan.ipver;
-        let prepare: UdpPrepare<Arc<dyn honk_outbound::proxy::PacketTransport>> = {
+        let plan_mode = plan.mode;
+        let prepare: UdpPrepare<honk_outbound::proxy::PreparedUdpTransport> = {
             let registry = self.proxy_registry.clone();
             let stats = self.stats.clone();
             Arc::new(move |node: Node| {
@@ -1337,9 +1339,21 @@ impl ControlPlaneHandle {
                 let stats = stats.clone();
                 Box::pin(async move {
                     let dial_started_at = std::time::Instant::now();
-                    let result = registry
-                        .dial_udp_transport(&node, original_dst, None, connect_timeout)
-                        .await;
+                    let result = if plan_mode == SelectionPlanMode::ColdUrlTest {
+                        registry
+                            .dial_udp_transport_speculative(
+                                &node,
+                                original_dst,
+                                None,
+                                connect_timeout,
+                            )
+                            .await
+                    } else {
+                        registry
+                            .dial_udp_transport(&node, original_dst, None, connect_timeout)
+                            .await
+                            .map(honk_outbound::proxy::PreparedUdpTransport::ready)
+                    };
                     stats.record_udp_dial_latency(dial_started_at.elapsed());
                     result
                 })
@@ -1381,8 +1395,8 @@ impl ControlPlaneHandle {
                 Arc::new(move || stats.record_udp_stagger_cancellation())
             },
         };
-        let Some((node, transport)) =
-            prepare_udp_plan(plan.mode, plan.nodes, prepare, callbacks).await
+        let Some((node, prepared_transport)) =
+            prepare_udp_plan(plan_mode, plan.nodes, prepare, callbacks).await
         else {
             debug!(
                 "All UDP transport preparations failed for '{}'",
@@ -1413,6 +1427,9 @@ impl ControlPlaneHandle {
                 node.name
             ));
         }
+        // Promotion is explicit and still pre-publication: detached AnyTLS
+        // sessions become generation-owned only for the finalized winner.
+        let transport = prepared_transport.commit()?;
 
         // Both capacity (at reservation time) and anyfrom creation happen
         // after the winner is finalized and before the only first send. Any

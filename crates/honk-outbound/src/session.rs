@@ -13,6 +13,9 @@
 //!   in-flight dial registers it and the pool spawns the dial task — a
 //!   cancelled caller only ends its own wait, never the shared dial
 //!   (outcomes broadcast to every waiter);
+//! - caller-owned speculative checkout: atomically reserve an existing stream
+//!   permit or a provisional, cap-counted physical-dial slot that cancellation
+//!   drops and only an explicit winner commit may publish;
 //! - dial circuit breaker: consecutive establishment failures back off
 //!   exponentially before the pool dials again (a dead server must not
 //!   eat a TCP connect per proxied flow);
@@ -204,9 +207,53 @@ impl OpenError {
     }
 }
 
+/// A speculative checkout atomically either reserves one stream on an
+/// existing pooled session or owns one bounded, caller-cancellable dial slot.
+pub enum SpeculativeCheckout<S: ManagedSession + 'static> {
+    Shared {
+        session: Arc<S>,
+        permit: SessionPermit<S>,
+    },
+    Detached(DetachedSessionReservation<S>),
+}
+
+impl<S: ManagedSession + 'static> std::fmt::Debug for SpeculativeCheckout<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Shared { .. } => f.debug_tuple("SpeculativeCheckout::Shared").finish(),
+            Self::Detached(_) => f.debug_tuple("SpeculativeCheckout::Detached").finish(),
+        }
+    }
+}
+
+/// Caller-owned capacity reservation for one speculative physical dial.
+/// Dropping it removes only its generation-safe slot and closes an attached
+/// detached session, so cancellation cannot populate the pool.
+pub struct DetachedSessionReservation<S: ManagedSession + 'static> {
+    pool: Arc<SessionPool<S>>,
+    key: String,
+    slot_id: u64,
+    active: bool,
+}
+
+impl<S: ManagedSession + 'static> std::fmt::Debug for DetachedSessionReservation<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DetachedSessionReservation")
+            .field("key", &self.key)
+            .field("slot_id", &self.slot_id)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Per-key pool state.
 struct KeyPool<S> {
     sessions: Vec<Arc<S>>,
+    /// Caller-owned speculative dial slots. The `Option` is filled after a
+    /// detached dial succeeds so shutdown and Drop can synchronously close
+    /// that otherwise-unpooled session.
+    provisional: HashMap<u64, Option<Arc<S>>>,
+    /// Next provisional slot generation.
+    next_provisional_id: u64,
     /// While a dial is in flight this is `Some((inflight_id, sender))`;
     /// waiters `wait_for(!Pending)` on a receiver cloned under the lock
     /// (race-free — `watch::Receiver::wait_for` evaluates the predicate
@@ -226,6 +273,8 @@ impl<S> Default for KeyPool<S> {
     fn default() -> Self {
         Self {
             sessions: Vec::new(),
+            provisional: HashMap::new(),
+            next_provisional_id: 0,
             dial_done: None,
             next_inflight_id: 0,
             dial_failures: 0,
@@ -401,8 +450,11 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                         .filter(|w| *w > Duration::ZERO)
                     {
                         Step::Backoff(wait)
-                    } else if pool.sessions.len() >= self.config.max_sessions {
-                        // At the hard cap with every session saturated: wait
+                    } else if pool.sessions.len() + pool.provisional.len()
+                        >= self.config.max_sessions
+                    {
+                        // At the hard cap with every session saturated (including
+                        // caller-owned speculative slots): wait
                         // for capacity to free up (a stream closes, a session
                         // is reaped) instead of stampeding past the cap.
                         Step::Backoff(self.config.janitor_interval.min(Duration::from_secs(5)))
@@ -544,6 +596,106 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                         handle.abort();
                     }
                     // Fall through: wait on the dial like everyone else.
+                }
+            }
+        }
+    }
+
+    /// Atomically reserve an existing stream slot, or reserve capacity for
+    /// one caller-owned speculative physical dial. Unlike [`Self::offer`], a
+    /// detached dial is never spawned by the pool: aborting its caller drops
+    /// the reservation and therefore the dial/session with it.
+    pub async fn checkout_speculative(
+        self: &Arc<Self>,
+        key: &str,
+    ) -> anyhow::Result<SpeculativeCheckout<S>> {
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        loop {
+            enum Step<S: ManagedSession + 'static> {
+                Closed,
+                Shared(Arc<S>, SessionPermit<S>),
+                Wait(tokio::sync::watch::Receiver<DialSignal>),
+                Backoff(Duration),
+                Detached(u64),
+            }
+            let step = {
+                let mut keys = self.keys.lock();
+                if self.state() != PoolState::Running {
+                    Step::Closed
+                } else {
+                    let pool = keys.entry(key.to_string()).or_default();
+                    pool.sessions.retain(|session| !session.is_closed());
+                    if let Some((session, permit)) = pool.sessions.iter().find_map(|session| {
+                        if session.state() != SessionState::Active {
+                            return None;
+                        }
+                        let session = Arc::clone(session);
+                        session.try_reserve().map(|permit| (session, permit))
+                    }) {
+                        Step::Shared(session, permit)
+                    } else if let Some((_, done)) = &pool.dial_done {
+                        // A normal offer already owns capacity for this dial;
+                        // wait rather than oversubscribe the hard cap.
+                        Step::Wait(done.subscribe())
+                    } else if let Some(wait) = pool
+                        .next_dial_at
+                        .and_then(|at| at.checked_duration_since(Instant::now()))
+                        .filter(|wait| *wait > Duration::ZERO)
+                    {
+                        Step::Backoff(wait)
+                    } else if pool.sessions.len()
+                        + pool.provisional.len()
+                        + usize::from(pool.dial_done.is_some())
+                        >= self.config.max_sessions
+                    {
+                        Step::Backoff(self.config.janitor_interval.min(Duration::from_secs(5)))
+                    } else {
+                        let slot_id = pool.next_provisional_id;
+                        pool.next_provisional_id += 1;
+                        pool.provisional.insert(slot_id, None);
+                        Step::Detached(slot_id)
+                    }
+                }
+            };
+
+            match step {
+                Step::Closed => return Err(Self::pool_closed_err()),
+                Step::Shared(session, permit) => {
+                    return Ok(SpeculativeCheckout::Shared { session, permit });
+                }
+                Step::Detached(slot_id) => {
+                    return Ok(SpeculativeCheckout::Detached(DetachedSessionReservation {
+                        pool: Arc::clone(self),
+                        key: key.to_string(),
+                        slot_id,
+                        active: true,
+                    }));
+                }
+                Step::Backoff(wait) => {
+                    tokio::select! {
+                        _ = tokio::time::sleep(wait) => {}
+                        _ = shutdown_rx.changed() => return Err(Self::pool_closed_err()),
+                    }
+                }
+                Step::Wait(mut rx) => {
+                    let signal = tokio::select! {
+                        result = rx.wait_for(|signal| !matches!(signal, DialSignal::Pending)) => {
+                            match result {
+                                Ok(signal) => signal.clone(),
+                                // A cancelled/panicked normal dial released its
+                                // guard; re-check and reserve our own slot.
+                                Err(_) => DialSignal::Done,
+                            }
+                        }
+                        _ = shutdown_rx.changed() => return Err(Self::pool_closed_err()),
+                    };
+                    match signal {
+                        DialSignal::Closed => return Err(Self::pool_closed_err()),
+                        DialSignal::Failed(error) => {
+                            return Err(anyhow::anyhow!(error).context("session dial failed"));
+                        }
+                        DialSignal::Pending | DialSignal::Done => {}
+                    }
                 }
             }
         }
@@ -798,13 +950,114 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         }
         let sessions: Vec<Arc<S>> = {
             let mut keys = self.keys.lock();
-            keys.drain().flat_map(|(_, p)| p.sessions).collect()
+            keys.drain()
+                .flat_map(|(_, pool)| {
+                    pool.sessions
+                        .into_iter()
+                        .chain(pool.provisional.into_values().flatten())
+                })
+                .collect()
         };
         for s in sessions {
             s.close();
         }
         self.state
             .store(PoolState::Closed as usize, Ordering::Release);
+    }
+}
+
+impl<S: ManagedSession + 'static> DetachedSessionReservation<S> {
+    /// Wait until the captured pool generation begins terminal shutdown.
+    /// Callers race this against their detached physical dial so generation
+    /// retirement cancels work that the pool deliberately does not own.
+    pub async fn cancelled(&self) {
+        let mut shutdown_rx = self.pool.shutdown_tx.subscribe();
+        if self.pool.state() != PoolState::Running {
+            return;
+        }
+        let _ = shutdown_rx.changed().await;
+    }
+
+    /// Attach a completed detached session so pool shutdown and reservation
+    /// cancellation close it before it can escape as a pooled session.
+    pub fn attach(&mut self, session: &Arc<S>) -> anyhow::Result<()> {
+        let attached = {
+            let mut keys = self.pool.keys.lock();
+            if !self.active || self.pool.state() != PoolState::Running {
+                false
+            } else {
+                keys.get_mut(&self.key)
+                    .and_then(|pool| pool.provisional.get_mut(&self.slot_id))
+                    .is_some_and(|slot| {
+                        if slot.is_some() {
+                            false
+                        } else {
+                            *slot = Some(Arc::clone(session));
+                            true
+                        }
+                    })
+            }
+        };
+        if attached {
+            Ok(())
+        } else {
+            session.close();
+            Err(SessionPool::<S>::pool_closed_err())
+        }
+    }
+
+    /// Promote the attached session exactly once into the same captured
+    /// pool/key. A terminal pool removes the slot and closes the session
+    /// instead of allowing a stale generation to repopulate it.
+    pub fn commit(mut self) -> anyhow::Result<Arc<S>> {
+        let outcome = {
+            let mut keys = self.pool.keys.lock();
+            if let Some(pool) = keys.get_mut(&self.key) {
+                let session = pool.provisional.remove(&self.slot_id).flatten();
+                if self.pool.state() == PoolState::Running {
+                    if let Some(session) = session {
+                        pool.sessions.retain(|existing| !existing.is_closed());
+                        pool.sessions.push(Arc::clone(&session));
+                        Ok(session)
+                    } else {
+                        Err(None)
+                    }
+                } else {
+                    Err(session)
+                }
+            } else {
+                Err(None)
+            }
+        };
+        self.active = false;
+        match outcome {
+            Ok(session) => Ok(session),
+            Err(session) => {
+                if let Some(session) = session {
+                    session.close();
+                }
+                Err(SessionPool::<S>::pool_closed_err())
+            }
+        }
+    }
+}
+
+impl<S: ManagedSession + 'static> Drop for DetachedSessionReservation<S> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let session = self
+            .pool
+            .keys
+            .lock()
+            .get_mut(&self.key)
+            .and_then(|pool| pool.provisional.remove(&self.slot_id))
+            .flatten();
+        self.active = false;
+        if let Some(session) = session {
+            session.close();
+        }
     }
 }
 
@@ -854,6 +1107,46 @@ mod tests {
 
     fn pool(config: SessionPoolConfig) -> SessionPool<TestSession> {
         SessionPool::new(config)
+    }
+
+    #[derive(Debug)]
+    struct ReservedTestSession {
+        closed: AtomicBool,
+        stream_permits: Arc<tokio::sync::Semaphore>,
+        capacity: usize,
+    }
+
+    impl ReservedTestSession {
+        fn new(capacity: usize) -> Arc<Self> {
+            Arc::new(Self {
+                closed: AtomicBool::new(false),
+                stream_permits: Arc::new(tokio::sync::Semaphore::new(capacity)),
+                capacity,
+            })
+        }
+    }
+
+    impl ManagedSession for ReservedTestSession {
+        fn active_streams(&self) -> usize {
+            self.capacity - self.stream_permits.available_permits()
+        }
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::Relaxed)
+        }
+        fn close(&self) {
+            self.closed.store(true, Ordering::Relaxed);
+        }
+        fn try_reserve(self: &Arc<Self>) -> Option<SessionPermit<Self>> {
+            if self.is_closed() {
+                return None;
+            }
+            let permit = Arc::clone(&self.stream_permits).try_acquire_owned().ok()?;
+            if self.is_closed() {
+                drop(permit);
+                return None;
+            }
+            Some(SessionPermit::new(Arc::clone(self), permit))
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -1234,5 +1527,170 @@ mod tests {
         pool.shutdown();
         assert!(s.is_closed());
         assert_eq!(pool.metrics().sessions, 0);
+    }
+
+    /// A Cold URLTest loser owns its physical dial. Aborting the caller must
+    /// drop its detached reservation, releasing its provisional cap slot.
+    #[tokio::test]
+    async fn speculative_checkout_cancellation_releases_blocked_dial_slot() {
+        let pool = Arc::new(pool(SessionPoolConfig {
+            max_sessions: 1,
+            ..Default::default()
+        }));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let task = tokio::spawn({
+            let pool = Arc::clone(&pool);
+            let entered = Arc::clone(&entered);
+            async move {
+                let _reservation = match pool.checkout_speculative("k").await.unwrap() {
+                    SpeculativeCheckout::Detached(reservation) => reservation,
+                    SpeculativeCheckout::Shared { .. } => panic!("empty pool cannot be shared"),
+                };
+                entered.notify_one();
+                futures_util::future::pending::<()>().await;
+            }
+        });
+        entered.notified().await;
+        assert_eq!(pool.keys.lock().get("k").unwrap().provisional.len(), 1);
+
+        task.abort();
+        let _ = task.await;
+        assert!(
+            pool.keys
+                .lock()
+                .get("k")
+                .is_none_or(|key| key.provisional.is_empty()),
+            "aborting a caller-owned dial must release its provisional slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn detached_checkout_shutdown_closes_attached_session_and_rejects_commit() {
+        let pool = Arc::new(pool(SessionPoolConfig::default()));
+        let mut reservation = match pool.checkout_speculative("k").await.unwrap() {
+            SpeculativeCheckout::Detached(reservation) => reservation,
+            SpeculativeCheckout::Shared { .. } => panic!("empty pool cannot be shared"),
+        };
+        let session = TestSession::new();
+        reservation.attach(&session).unwrap();
+
+        pool.shutdown();
+
+        assert!(
+            session.is_closed(),
+            "terminal shutdown must close an attached detached session"
+        );
+        assert!(
+            reservation.commit().is_err(),
+            "a detached reservation may not repopulate a terminal pool"
+        );
+        assert_eq!(pool.metrics().sessions, 0);
+    }
+
+    #[tokio::test]
+    async fn provisional_slot_blocks_normal_offer_until_released() {
+        let pool = Arc::new(pool(SessionPoolConfig {
+            max_sessions: 1,
+            janitor_interval: Duration::from_millis(1),
+            ..Default::default()
+        }));
+        let reservation = match pool.checkout_speculative("k").await.unwrap() {
+            SpeculativeCheckout::Detached(reservation) => reservation,
+            SpeculativeCheckout::Shared { .. } => panic!("empty pool cannot be shared"),
+        };
+        let dials = Arc::new(AtomicUsize::new(0));
+        let offer = tokio::spawn({
+            let pool = Arc::clone(&pool);
+            let dials = Arc::clone(&dials);
+            async move {
+                pool.offer("k", move || async move {
+                    dials.fetch_add(1, Ordering::Relaxed);
+                    Ok(TestSession::new())
+                })
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(
+            dials.load(Ordering::Relaxed),
+            0,
+            "a provisional slot counts against normal pool-owned dial admission"
+        );
+
+        drop(reservation);
+        let session = tokio::time::timeout(Duration::from_secs(1), offer)
+            .await
+            .expect("normal offer remained blocked after provisional release")
+            .unwrap()
+            .unwrap();
+        assert!(!session.is_closed());
+        assert_eq!(dials.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn detached_commit_inserts_once_into_the_captured_pool() {
+        let pool = Arc::new(pool(SessionPoolConfig::default()));
+        let mut reservation = match pool.checkout_speculative("k").await.unwrap() {
+            SpeculativeCheckout::Detached(reservation) => reservation,
+            SpeculativeCheckout::Shared { .. } => panic!("empty pool cannot be shared"),
+        };
+        let session = TestSession::new();
+        reservation.attach(&session).unwrap();
+        let committed = reservation.commit().unwrap();
+
+        assert!(Arc::ptr_eq(&session, &committed));
+        assert_eq!(pool.metrics().sessions, 1);
+        assert!(pool.keys.lock().get("k").unwrap().provisional.is_empty());
+        let offered = pool
+            .offer("k", || async {
+                unreachable!("committed session must be reused")
+            })
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&committed, &offered));
+        assert_eq!(
+            pool.metrics().sessions,
+            1,
+            "commit cannot duplicate insertion"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_checkout_reserves_its_stream_permit_atomically() {
+        let pool = Arc::new(SessionPool::new(SessionPoolConfig {
+            max_sessions: 1,
+            janitor_interval: Duration::from_millis(1),
+            ..Default::default()
+        }));
+        let session = ReservedTestSession::new(1);
+        pool.insert("k", &session);
+        let permit = match pool.checkout_speculative("k").await.unwrap() {
+            SpeculativeCheckout::Shared {
+                session: checked,
+                permit,
+            } => {
+                assert!(Arc::ptr_eq(&session, &checked));
+                permit
+            }
+            SpeculativeCheckout::Detached(_) => panic!("live session must be checked out first"),
+        };
+        assert_eq!(session.active_streams(), 1);
+
+        let blocked = tokio::spawn({
+            let pool = Arc::clone(&pool);
+            async move { pool.checkout_speculative("k").await }
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !blocked.is_finished(),
+            "the occupied shared stream slot must not be offered twice"
+        );
+        drop(permit);
+        let next = tokio::time::timeout(Duration::from_secs(1), blocked)
+            .await
+            .expect("second checkout did not observe released stream capacity")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(next, SpeculativeCheckout::Shared { .. }));
     }
 }

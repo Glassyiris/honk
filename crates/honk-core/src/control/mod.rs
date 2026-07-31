@@ -1142,20 +1142,32 @@ fn begin_udp_slow_path(
     }
 }
 
+struct UdpDnsSlowPathContext<'a> {
+    pool: &'a Arc<UdpEndpointPool>,
+    stats: &'a StatsManager,
+    dns_controller: &'a crate::control::dns_control::DnsController,
+    udp_socket: &'a UdpSocket,
+    src_addr: SocketAddr,
+    original_dst: SocketAddr,
+}
+
 /// Finish a DNS-forced slow path after the slow permit was acquired: run the
 /// production DNS controller first. If it handles the packet, do not
 /// reserve/enqueue. If it declines, continue through the same
 /// `reserve_or_enqueue` path used by ordinary slow traffic.
 async fn complete_udp_dns_slow_path(
-    pool: &Arc<UdpEndpointPool>,
-    stats: &StatsManager,
-    dns_controller: &crate::control::dns_control::DnsController,
-    udp_socket: &UdpSocket,
-    src_addr: SocketAddr,
-    original_dst: SocketAddr,
+    context: UdpDnsSlowPathContext<'_>,
     permit: tokio::sync::OwnedSemaphorePermit,
     data: &[u8],
 ) -> Option<UdpInitLease> {
+    let UdpDnsSlowPathContext {
+        pool,
+        stats,
+        dns_controller,
+        udp_socket,
+        src_addr,
+        original_dst,
+    } = context;
     match dns_controller
         .handle_udp_dns(udp_socket, data, src_addr, original_dst)
         .await
@@ -1234,12 +1246,14 @@ fn dispatch_udp_slow_path(
                 // its first poll; keep the guard alive for the task lifetime.
                 let _guard = guard;
                 let Some(lease) = complete_udp_dns_slow_path(
-                    &pool,
-                    &stats,
-                    dns_controller.as_ref(),
-                    socket.as_ref(),
-                    src_addr,
-                    original_dst,
+                    UdpDnsSlowPathContext {
+                        pool: &pool,
+                        stats: &stats,
+                        dns_controller: dns_controller.as_ref(),
+                        udp_socket: socket.as_ref(),
+                        src_addr,
+                        original_dst,
+                    },
                     permit,
                     &data,
                 )

@@ -147,6 +147,61 @@ pub trait PacketTransport: Send + Sync + Debug {
     async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)>;
 }
 
+/// A prepared UDP transport that is usable only after its final side effects
+/// have been committed. Dropping it without [`Self::commit`] abandons the
+/// preparation; protocol-specific resources then clean themselves up via
+/// normal RAII. Commit failure drops the transport and returns no value.
+pub struct PreparedUdpTransport {
+    transport: Option<Arc<dyn PacketTransport>>,
+    commit: Option<Box<dyn FnOnce() -> anyhow::Result<()> + Send>>,
+}
+
+impl std::fmt::Debug for PreparedUdpTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedUdpTransport")
+            .field("prepared", &self.transport.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedUdpTransport {
+    pub fn new<F>(transport: Arc<dyn PacketTransport>, commit: F) -> Self
+    where
+        F: FnOnce() -> anyhow::Result<()> + Send + 'static,
+    {
+        Self {
+            transport: Some(transport),
+            commit: Some(Box::new(commit)),
+        }
+    }
+
+    /// Wrap an already-authoritative ordinary transport. This deliberately
+    /// preserves `dial_udp_transport` semantics for protocols with no
+    /// speculative ownership to promote.
+    pub fn ready(transport: Arc<dyn PacketTransport>) -> Self {
+        Self::new(transport, || Ok(()))
+    }
+
+    /// Consume the preparation, run its one-shot promotion, then expose the
+    /// transport. A failed promotion is fail-closed: the transport is dropped
+    /// and cannot be sent on by a caller.
+    pub fn commit(mut self) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        let transport = self
+            .transport
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("UDP transport preparation already consumed"))?;
+        let commit = self
+            .commit
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("UDP transport commit already consumed"))?;
+        if let Err(error) = commit() {
+            drop(transport);
+            return Err(error);
+        }
+        Ok(transport)
+    }
+}
+
 /// Adapter presenting any `UdpSocket` — a direct target, a socks5
 /// server-assigned relay, or a legacy loopback bridge — as a
 /// [`PacketTransport`]. Lets tunnel protocols migrate to framed transports
@@ -239,6 +294,22 @@ pub trait ProxyHandler: Send + Sync {
             proxy.socket,
             proxy.relay_addr,
         )))
+    }
+
+    /// Prepare a UDP transport for a Cold URLTest candidate. Protocols that
+    /// do not need speculative ownership can use their ordinary transport;
+    /// session protocols override this to defer pool publication until the
+    /// caller has selected and committed a winner.
+    async fn dial_udp_transport_speculative(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<PreparedUdpTransport> {
+        self.dial_udp_transport(node, target, target_domain, connect_timeout)
+            .await
+            .map(PreparedUdpTransport::ready)
     }
 
     /// Raw TCP reachability check against the node server. Handlers share
@@ -476,6 +547,29 @@ impl ProxyRegistry {
             .await
     }
 
+    /// Speculatively prepare a framed UDP transport for a Cold URLTest
+    /// candidate. Ordinary dial behavior remains available through
+    /// [`Self::dial_udp_transport`] for authoritative paths.
+    pub async fn dial_udp_transport_speculative(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<PreparedUdpTransport> {
+        if node.name == "block" {
+            return BlockHandler::new()
+                .dial_udp_transport_speculative(node, target, target_domain, connect_timeout)
+                .await;
+        }
+        let handler = self
+            .find(node.protocol)
+            .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", node.protocol))?;
+        handler
+            .dial_udp_transport_speculative(node, target, target_domain, connect_timeout)
+            .await
+    }
+
     pub async fn test_node(&self, node: &Node) -> bool {
         match self.find(node.protocol) {
             Some(handler) => handler.test_connectivity(node).await,
@@ -638,5 +732,27 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn prepared_udp_transport_defers_transport_exposure_until_commit() {
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let relay_addr = socket.local_addr().unwrap();
+        let transport: Arc<dyn PacketTransport> =
+            Arc::new(UdpSocketTransport::new(Arc::clone(&socket), relay_addr));
+        let commits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let prepared = PreparedUdpTransport::new(Arc::clone(&transport), {
+            let commits = Arc::clone(&commits);
+            move || {
+                commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+        });
+        assert_eq!(commits.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        let committed = prepared.commit().unwrap();
+
+        assert_eq!(commits.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(Arc::ptr_eq(&transport, &committed));
     }
 }

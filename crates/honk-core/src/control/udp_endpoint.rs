@@ -19,6 +19,9 @@ use tokio::net::UdpSocket;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tracing::debug;
 
+#[doc(hidden)]
+pub mod bench_support;
+
 const DEFAULT_NAT_TIMEOUT: Duration = Duration::from_secs(30);
 const JANITOR_INTERVAL: Duration = Duration::from_secs(5);
 /// How long the endpoint driver waits for proxy data before giving up.
@@ -436,6 +439,8 @@ impl EndpointEntry {
 /// Result of the synchronous reservation performed by the UDP receive loop.
 /// `Initializing` owns the first packet and the slow-path permit; all other
 /// variants have released the permit before returning to the receive loop.
+/// The lease stays inline to avoid another allocation on every new UDP flow.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum EndpointReservation {
     Initializing(UdpInitLease),
     Enqueued,
@@ -1147,6 +1152,17 @@ impl UdpDriverCleanupGuard {
     }
 }
 
+struct UdpDriverContext {
+    endpoint: Arc<UdpEndpoint>,
+    queue_rx: mpsc::Receiver<QueuedDatagram>,
+    reply_socket: Arc<UdpSocket>,
+    client_addr: SocketAddr,
+    client_dst: SocketAddr,
+    alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
+    stats: Arc<StatsManager>,
+    outbound_name: String,
+}
+
 impl Drop for UdpDriverCleanupGuard {
     fn drop(&mut self) {
         self.endpoint.release();
@@ -1219,14 +1235,16 @@ impl UdpEndpointPool {
                 Err(_) => return,
             };
             let result = run_endpoint_driver(
-                Arc::clone(&endpoint),
-                queue_rx,
-                reply_socket,
-                client_addr,
-                client_dst,
-                alive_set,
-                stats,
-                outbound_name,
+                UdpDriverContext {
+                    endpoint: Arc::clone(&endpoint),
+                    queue_rx,
+                    reply_socket,
+                    client_addr,
+                    client_dst,
+                    alive_set,
+                    stats,
+                    outbound_name,
+                },
                 first,
                 first_ack_tx,
             )
@@ -1239,7 +1257,7 @@ impl UdpEndpointPool {
             }
         });
         #[cfg(not(test))]
-        let _ = task;
+        drop(task);
         UdpDriverHandle {
             ready: Some(ready),
             start: Some(start),
@@ -1251,17 +1269,20 @@ impl UdpEndpointPool {
 }
 
 async fn run_endpoint_driver(
-    endpoint: Arc<UdpEndpoint>,
-    queue_rx: mpsc::Receiver<QueuedDatagram>,
-    reply_socket: Arc<UdpSocket>,
-    client_addr: SocketAddr,
-    client_dst: SocketAddr,
-    alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
-    stats: Arc<StatsManager>,
-    outbound_name: String,
+    context: UdpDriverContext,
     first: QueuedDatagram,
     first_ack: oneshot::Sender<io::Result<()>>,
 ) -> io::Result<()> {
+    let UdpDriverContext {
+        endpoint,
+        queue_rx,
+        reply_socket,
+        client_addr,
+        client_dst,
+        alive_set,
+        stats,
+        outbound_name,
+    } = context;
     // Establish send ordering before supervising the steady send/receive
     // futures. A recv EOF must not race ahead and cancel the first packet.
     match send_one(&endpoint, &stats, &outbound_name, first, true).await {
@@ -1456,6 +1477,36 @@ mod tests {
     }
 
     use super::*;
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_endpoint_driver(
+        endpoint: Arc<UdpEndpoint>,
+        queue_rx: mpsc::Receiver<QueuedDatagram>,
+        reply_socket: Arc<UdpSocket>,
+        client_addr: SocketAddr,
+        client_dst: SocketAddr,
+        alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
+        stats: Arc<StatsManager>,
+        outbound_name: String,
+        first: QueuedDatagram,
+        first_ack: oneshot::Sender<io::Result<()>>,
+    ) -> io::Result<()> {
+        super::run_endpoint_driver(
+            UdpDriverContext {
+                endpoint,
+                queue_rx,
+                reply_socket,
+                client_addr,
+                client_dst,
+                alive_set,
+                stats,
+                outbound_name,
+            },
+            first,
+            first_ack,
+        )
+        .await
+    }
 
     fn make_addr(ip: &str, port: u16) -> SocketAddr {
         format!("{}:{}", ip, port).parse().unwrap()

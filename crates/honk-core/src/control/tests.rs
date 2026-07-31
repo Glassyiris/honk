@@ -702,22 +702,20 @@ async fn udp_dns_controller_declines_root_and_binary_questions() {
     let dst = addr("203.0.113.53:53");
 
     let root = dns_query_with_qname(&[0x00]);
-    assert_eq!(
-        controller
+    assert!(
+        !controller
             .handle_udp_dns(&sock, &root, client, dst)
             .await
             .unwrap(),
-        false,
         "root qname must fall back to ordinary UDP"
     );
 
     let binary = dns_query_with_qname(&[0x01, 0xff, 0x00]);
-    assert_eq!(
-        controller
+    assert!(
+        !controller
             .handle_udp_dns(&sock, &binary, client, dst)
             .await
             .unwrap(),
-        false,
         "binary qname must fall back to ordinary UDP"
     );
 
@@ -1231,6 +1229,11 @@ enum UdpTestMode {
     CountDialError {
         dials: Arc<std::sync::atomic::AtomicUsize>,
     },
+    PreparedCommitError {
+        dials: Arc<std::sync::atomic::AtomicUsize>,
+        commits: Arc<std::sync::atomic::AtomicUsize>,
+        sends: Arc<std::sync::atomic::AtomicUsize>,
+    },
     Success,
     Hold {
         entered: Arc<tokio::sync::Notify>,
@@ -1273,7 +1276,8 @@ impl honk_outbound::proxy::PacketTransport for UdpTestTransport {
                 Err(std::io::Error::other("ambiguous first UDP send failure"))
             }
             UdpTestMode::CountDialAndSend { sends, .. }
-            | UdpTestMode::HoldAndCountDialAndSend { sends, .. } => {
+            | UdpTestMode::HoldAndCountDialAndSend { sends, .. }
+            | UdpTestMode::PreparedCommitError { sends, .. } => {
                 sends.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
@@ -1352,7 +1356,8 @@ impl honk_outbound::proxy::ProxyHandler for UdpTestHandler {
             }
             UdpTestMode::CountFirstSendError { dials, .. }
             | UdpTestMode::CountDialAndSend { dials, .. }
-            | UdpTestMode::CountDialError { dials } => {
+            | UdpTestMode::CountDialError { dials }
+            | UdpTestMode::PreparedCommitError { dials, .. } => {
                 dials.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             UdpTestMode::HoldAndCountDialAndSend {
@@ -1377,6 +1382,31 @@ impl honk_outbound::proxy::ProxyHandler for UdpTestHandler {
             })),
         }
     }
+
+    async fn dial_udp_transport_speculative(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<honk_outbound::proxy::PreparedUdpTransport> {
+        let transport = self
+            .dial_udp_transport(node, target, target_domain, connect_timeout)
+            .await?;
+        if let UdpTestMode::PreparedCommitError { commits, .. } = &self.mode {
+            let commits = Arc::clone(commits);
+            return Ok(honk_outbound::proxy::PreparedUdpTransport::new(
+                transport,
+                move || {
+                    commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Err(anyhow::anyhow!(
+                        "scripted prepared transport commit failure"
+                    ))
+                },
+            ));
+        }
+        Ok(honk_outbound::proxy::PreparedUdpTransport::ready(transport))
+    }
 }
 
 fn udp_test_forwarder() -> Arc<crate::dns::forwarder::DnsForwarder> {
@@ -1399,9 +1429,11 @@ fn udp_test_forwarder() -> Arc<crate::dns::forwarder::DnsForwarder> {
 }
 
 fn udp_test_config(default_outbound: &str, nodes: Vec<Node>, groups: Vec<Group>) -> Config {
-    let mut config = Config::default();
-    config.nodes = nodes;
-    config.groups = groups;
+    let mut config = Config {
+        nodes,
+        groups,
+        ..Default::default()
+    };
     config.routing.default_outbound = default_outbound.into();
     config
 }
@@ -1651,6 +1683,71 @@ async fn udp_first_send_failure_does_not_replay_to_another_candidate() {
         1,
         "an ambiguous first-send failure must not dial a later candidate"
     );
+}
+
+#[tokio::test]
+async fn udp_cold_urltest_commit_failure_sends_nothing_and_fails_closed() {
+    let node = udp_test_node();
+    let config = udp_test_config(
+        "udp-group",
+        vec![node.clone()],
+        vec![Group {
+            name: "udp-group".into(),
+            policy: honk_config::group::GroupPolicy::URLTest,
+            nodes: vec![node.id],
+            ..Default::default()
+        }],
+    );
+    let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let commits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let handle = udp_test_handle(
+        config,
+        UdpTestMode::PreparedCommitError {
+            dials: Arc::clone(&dials),
+            commits: Arc::clone(&commits),
+            sends: Arc::clone(&sends),
+        },
+        1,
+    );
+
+    assert!(serve_test_udp(&handle).await.is_err());
+    assert_eq!(dials.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(commits.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(sends.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert!(handle.udp_pool.is_empty());
+}
+
+#[tokio::test]
+async fn udp_authoritative_plan_bypasses_speculative_commit_hook() {
+    let node = udp_test_node();
+    let config = udp_test_config(
+        "udp-group",
+        vec![node.clone()],
+        vec![Group {
+            name: "udp-group".into(),
+            policy: honk_config::group::GroupPolicy::Selector,
+            nodes: vec![node.id],
+            ..Default::default()
+        }],
+    );
+    let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let commits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let handle = udp_test_handle(
+        config,
+        UdpTestMode::PreparedCommitError {
+            dials: Arc::clone(&dials),
+            commits: Arc::clone(&commits),
+            sends: Arc::clone(&sends),
+        },
+        1,
+    );
+
+    serve_test_udp(&handle).await.unwrap();
+    assert_eq!(dials.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(commits.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(sends.load(std::sync::atomic::Ordering::Relaxed), 1);
 }
 
 #[tokio::test]
@@ -2139,12 +2236,14 @@ async fn udp_dns_with_ready_endpoint_uses_controller_not_queue() {
         super::UdpSlowPathWork::DnsThenMaybeInitialize { permit, data } => {
             let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let lease = super::complete_udp_dns_slow_path(
-                &pool,
-                &stats,
-                dns.as_ref(),
-                &listener,
-                client,
-                dst,
+                super::UdpDnsSlowPathContext {
+                    pool: &pool,
+                    stats: &stats,
+                    dns_controller: dns.as_ref(),
+                    udp_socket: &listener,
+                    src_addr: client,
+                    original_dst: dst,
+                },
                 permit,
                 &data,
             )
@@ -2200,12 +2299,14 @@ async fn udp_dns_with_initializing_endpoint_uses_controller_not_queue() {
         super::UdpSlowPathWork::DnsThenMaybeInitialize { permit, data } => {
             let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let maybe_lease = super::complete_udp_dns_slow_path(
-                &pool,
-                &stats,
-                dns.as_ref(),
-                &listener,
-                client,
-                dst,
+                super::UdpDnsSlowPathContext {
+                    pool: &pool,
+                    stats: &stats,
+                    dns_controller: dns.as_ref(),
+                    udp_socket: &listener,
+                    src_addr: client,
+                    original_dst: dst,
+                },
                 permit,
                 &data,
             )

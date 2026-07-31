@@ -760,12 +760,10 @@ fn recvmsg_origdst(
     }
 
     let src = sockaddr_to_std(&src_addr, msg.msg_namelen)?;
-    let returned_control_len = usize::try_from(msg.msg_controllen).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "recvmsg returned an unrepresentable msg_controllen",
-        )
-    })?;
+    #[cfg(target_env = "musl")]
+    let returned_control_len = msg.msg_controllen as usize;
+    #[cfg(not(target_env = "musl"))]
+    let returned_control_len = msg.msg_controllen;
     // Only kernel-returned bytes are trusted. A larger value can never make
     // the parser read past our actual allocation.
     let control_len = returned_control_len.min(cmsg_buf.bytes.len());
@@ -815,8 +813,10 @@ pub(super) fn parse_cmsg_control(
         let cmsg = unsafe {
             std::ptr::read_unaligned(control.as_ptr().add(offset).cast::<libc::cmsghdr>())
         };
-        let record_len = usize::try_from(cmsg.cmsg_len)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "unrepresentable cmsg_len"))?;
+        #[cfg(target_env = "musl")]
+        let record_len = cmsg.cmsg_len as usize;
+        #[cfg(not(target_env = "musl"))]
+        let record_len = cmsg.cmsg_len;
         let data_len = record_len.checked_sub(header_len).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "cmsg_len shorter than cmsghdr")
         })?;
