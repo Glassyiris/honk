@@ -147,10 +147,8 @@ where
     W: AsyncWrite + Unpin,
 {
     const RELAY_BUF_SIZE: usize = 64 * 1024;
-    let mut br = tokio::io::BufReader::with_capacity(
-        RELAY_BUF_SIZE,
-        ReadCounter::wrap(rd, progress),
-    );
+    let mut br =
+        tokio::io::BufReader::with_capacity(RELAY_BUF_SIZE, ReadCounter::wrap(rd, progress));
     let n = tokio::io::copy_buf(&mut br, wr).await?;
     wr.shutdown().await?;
     Ok(n)
