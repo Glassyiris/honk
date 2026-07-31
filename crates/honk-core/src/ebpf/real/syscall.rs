@@ -10,7 +10,15 @@ use std::ffi::c_long;
 
 pub const ENOENT: c_long = libc::ENOENT as c_long;
 
+/// Callback invoked once per batch chunk by [`bpf_lookup_batch_scan_cb`].
+pub type BatchVisitor<'a, K, V> = dyn FnMut(&[(K, V)]) + 'a;
+
 /// Call the `bpf()` syscall.  Returns `Ok(())` on success, `Err(errno)`.
+///
+/// # Safety
+///
+/// `attr` must point to a live `bpf_attr` appropriate for `cmd` for the
+/// duration of the call.
 pub unsafe fn bpf_syscall(cmd: c_long, attr: &mut bpf_attr) -> Result<(), c_long> {
     let ret = unsafe {
         libc::syscall(
@@ -27,10 +35,21 @@ pub unsafe fn bpf_syscall(cmd: c_long, attr: &mut bpf_attr) -> Result<(), c_long
     }
 }
 
+/// Reinterpret a POD value as its raw bytes.
+///
+/// # Safety
+///
+/// `T` must be valid to view as bytes (no padding-sensitive invariants);
+/// used only with the `#[repr(C)]` wire types.
 pub unsafe fn as_bytes<T: Sized>(t: &T) -> &[u8] {
     unsafe { core::slice::from_raw_parts(t as *const T as *const u8, core::mem::size_of::<T>()) }
 }
 
+/// Read a `T` out of a raw byte slice, possibly unaligned.
+///
+/// # Safety
+///
+/// `bytes` must be at least `size_of::<T>()` long and hold a valid `T`.
 pub unsafe fn from_bytes<T: Sized + Copy>(bytes: &[u8]) -> T {
     unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const T) }
 }
@@ -320,7 +339,7 @@ pub fn bpf_lookup_batch_scan_cb<K: Copy, V: Copy>(
     bpf: &Ebpf,
     cap: &BatchCapability,
     map: &str,
-    visit: &mut dyn FnMut(&[(K, V)]),
+    visit: &mut BatchVisitor<'_, K, V>,
 ) -> anyhow::Result<bool> {
     if cap.is_unsupported() {
         return Ok(false);

@@ -1136,10 +1136,10 @@ fn create_dae0_veth(lan_ifname: &str) -> anyhow::Result<Dae0Guard> {
     let target = std::ffi::CString::new(DAENS_NS_PATH).unwrap();
     // SAFETY: plain umount2; errors (not mounted) are expected and ignored.
     unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
-    if let Ok(idx) = netlink::ifindex_of("dae0") {
-        if let Ok(mut nl) = netlink::NlSock::new() {
-            let _ = nl.del_link(idx);
-        }
+    if let Ok(idx) = netlink::ifindex_of("dae0")
+        && let Ok(mut nl) = netlink::NlSock::new()
+    {
+        let _ = nl.del_link(idx);
     }
 
     // FD-owned namespace (unshare + held FD, compat bind-mount inside).

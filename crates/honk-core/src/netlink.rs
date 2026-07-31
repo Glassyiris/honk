@@ -156,7 +156,7 @@ fn put_attr(buf: &mut Vec<u8>, rta_type: u16, attr: &Attr) {
     buf.extend_from_slice(&len.to_ne_bytes());
     buf.extend_from_slice(&rta_type.to_ne_bytes());
     buf.extend_from_slice(&payload);
-    while buf.len() % NLMSG_ALIGNTO != 0 {
+    while !buf.len().is_multiple_of(NLMSG_ALIGNTO) {
         buf.push(0);
     }
 }
@@ -678,10 +678,10 @@ impl NlSock {
                         }
                         aoff += align(alen);
                     }
-                    if ifname.as_deref() == Some(name) {
-                        if let Some(mac) = mac {
-                            found = Some((ifindex as u32, mac));
-                        }
+                    if ifname.as_deref() == Some(name)
+                        && let Some(mac) = mac
+                    {
+                        found = Some((ifindex as u32, mac));
                     }
                 }
                 let next = align(hlen);
