@@ -13,8 +13,8 @@
 
 ## 2. Non-goals (current)
 
-- Full Clash Meta / mihomo feature parity (FakeIP engine, remote rule-sets, full DoH/DoT/DoQ wire protocols).
-- REALITY + uTLS client fingerprints (deferred; no mature Rust hooks on rustls).
+- Full Clash Meta / mihomo feature parity (FakeIP engine and remote rule-sets).
+- REALITY protocol support (deferred). Chrome-style TLS fingerprints are implemented through BoringSSL rather than a production rustls path.
 - Official sing-box multiplex inbound interop for h2mux (framing is sing-mux-like; inner stream handshake differs).
 - Windows / macOS transparent proxy.
 
@@ -162,7 +162,7 @@ Aligned with dae-core:
 | Sniffing | TCP SNI/Host, QUIC SNI |
 | DNS | Cache, routing, forwarder, optional SQLite persist |
 | Groups / dial | Via `honk-outbound` |
-| Relay | `splice(2)` zero-copy when both ends are plain TCP; else `copy_bidirectional`; UDP bridges |
+| Relay | `splice(2)` zero-copy when both ends are plain TCP; else `copy_bidirectional`; PacketTransport-backed UDP endpoint drivers |
 | Clash API | Optional axum server |
 | Cache DB | Selector choices, mode, optional DNS answers |
 | Subscriptions | Fetch + periodic merge without rewriting the config file |
@@ -176,6 +176,68 @@ Aligned with dae-core:
 | `domain+` | Like `domain` but skip reality check of sniffed name |
 | `domain++` | Force sniff and re-route on sniffed domain |
 
+### UDP endpoint pipeline
+
+**Destination provenance is fail-closed.** The shared IPv4/IPv6 receiver uses a valid
+`ORIGDST` control message as authoritative. If it has no `ORIGDST`, only an exact
+DNS query plus a specified `PKTINFO` destination may form `IP:53`; otherwise it
+may use only a non-wildcard local bind. Malformed, duplicate, truncated, or
+unspecified `ORIGDST`/`PKTINFO` metadata is rejected rather than downgraded, and
+a packet without provenance is dropped before it can reserve an endpoint or send.
+
+**`PacketTransport` is the production UDP contract.** `ProxyHandler::dial_udp_transport`
+returns a framed, bidirectional transport for each endpoint. The older
+`dial_udp`/`UdpProxySocket` surface and its socket adapter remain for compatibility
+and incremental migration, but are not the canonical endpoint path; a legacy or
+test-only loopback adapter is not a production bridge design. Tunnel handlers frame
+packets directly on their tunnel. A SOCKS5 transport keeps its TCP UDP-ASSOCIATE
+control stream for the association lifetime, frames and parses RFC 1928 UDP
+packets, and treats control EOF as endpoint failure. Its connected UDP socket uses
+the physical `BND.ADDR` relay, while `relay_addr()` and the received peer exposed
+to the endpoint are the logical target peer used by first-reply filtering.
+
+**Endpoint creation is transactional.** A `(client, original-destination)` mapping
+first publishes an `Initializing` generation with a lease. After route/selection
+preparation has one final eligible transport and an anyfrom reply socket, the
+driver reaches its ready barrier, the lease commits `Ready`, the retained first
+packet is sent and acknowledged, and only then do FIFO followers run. The receive
+loop only routes/reserves/enqueues; it never awaits transport I/O. The dedicated
+driver owns the first send, follower sends, and replies. A first or steady send has
+a five-second timeout; a timeout or error is ambiguous, so the packet is never
+replayed through another candidate.
+
+**Queue bounds are ownership bounds.** A flow retains at most 64 datagrams,
+including the first, and all flows together retain at most 8 MiB of payload.
+Slow admission and flow/global permits are acquired before payload allocation or
+copy; followers are FIFO and nonblocking saturation drops the newest packet.
+Reload cancellation is epoch- and generation-fenced: it drains `Initializing`
+leases and their resources, preserves already-`Ready` endpoints, and removes only
+the same generation so an older task cannot erase a replacement.
+
+**Selection races are deliberately narrow.** Normal selector, load-balance,
+fallback, explicit-node, and warm-URLTest plans are authoritative single-leaf
+plans. Only a top-level cold URLTest plan may prepare several eligible leaves:
+absolute starts are 0/30/80 ms and then every 80 ms, with at most three in flight.
+The first still-eligible success wins; started losers are aborted and drained before
+binding. Only an observed preparation error affects traffic health; cancelled or
+successfully drained speculative losers are health-neutral. AnyTLS uses a caller-owned,
+cap-counted provisional session slot on this path rather than its normal pool-owned
+dial task. A loser closes its detached session synchronously; only the finalized winner
+commits into the captured runtime-generation pool and starts that pool's janitor, before
+any endpoint publication or application send.
+
+**UDP warm-up is opt-in and generation-owned.** `global.udp_warm_node_count`
+defaults to 0, which creates no coordinator work or warm metrics. With a positive
+budget, discovery peeks authoritative DataUdp group plans in V4 then V6 order,
+UUID-deduplicates eligible configured leaves, and applies the budget; direct,
+block, and cold URLTest plans are excluded. Dispatch has a maximum of four tasks.
+AnyTLS owns the reusable pool in its runtime generation. Reload makes the old
+generation terminal to new warm/speculative work, but existing TCP streams and Ready
+UDP endpoints keep their sessions; after the old DNS runtime's leases and transports
+retire, its pools reject new opens and close each session only when its last stream
+releases. Only `Ready` and `AlreadyReady` are warm successes. Direct, other non-AnyTLS, and
+currently deferred QUIC warm-up return `NotApplicable`, not a false success.
+
 ## 8. Outbound stack
 
 ### Handlers (`honk-outbound`)
@@ -187,7 +249,7 @@ Shared layers:
 - `transport.rs` — TCP → optional TLS → WS / gRPC
 - `mux.rs` — h2mux when `node.mux = true` (not smux/yamux)
 - `quic.rs` — shared quinn client for Hy2 / TUIC / Juicity
-- `tls.rs` — rustls helpers
+- `tls.rs` — BoringSSL TLS and Chrome-fingerprint helpers
 
 ### Groups
 
@@ -196,7 +258,7 @@ Policies (sing-box shaped):
 | Policy | Behavior |
 | -------- | ---------- |
 | **Selector** | Manual pin; Clash API + cache persistence |
-| **URLTest** | Lowest latency + tolerance vs the incumbent's current measured latency (sing-box parity); separate TCP/UDP selections; idle sleep; dial failure clears the node's latency history so the next connection re-selects; optional per-group `check_url` probed and ranked independently of the global target |
+| **URLTest** | Lowest latency + tolerance vs the incumbent's current measured latency (sing-box parity); separate TCP/UDP selections; idle sleep; dial failure clears the node's latency history so the next connection re-selects; optional per-group `check_url` probed and ranked independently of the global target. Only an unmeasured top-level UDP URLTest plan is a staggered multi-candidate preparation; a warm selection is authoritative. |
 | **LoadBalance** | Per-group round-robin among alive members |
 | **Fallback** | First alive in declaration order; sticky until death |
 
@@ -220,7 +282,7 @@ Client :53 → eBPF DNS fast path (redirect, no full route loop)
 
 - Userspace cache only today (no kernel DNS answer cache map yet).
 - Upstream protocols: UDP/TCP/DoT/DoH/DoQ/DoH3 are all implemented (`honk-core/src/dns/transport/`, pooled sessions with one retry after invalidation).
-- Optional `outbound` on an upstream routes queries through a proxy node/group (anti-pollution intent; UDP+proxy tunnels as TCP-DNS because the SOCKS5-UDP path is still incomplete, and DoQ/DoH3 are direct-only).
+- Optional `outbound` on an upstream routes queries through a proxy node/group (anti-pollution intent; UDP+proxy is intentionally carried as TCP-DNS by the upstream policy; SOCKS5 RFC 1928 UDP remains a complete, independent transport; DoQ/DoH3 are direct-only).
 
 Resolution defaults to `both`: an omitted strategy forwards eligible A and AAAA
 queries concurrently. `preferipv4`/`preferipv6` still query both families and
@@ -238,9 +300,12 @@ while stale, corrupt, version-mismatched, or policy-mismatched rows are
 skipped on restore. A rollback to a pre-v2 binary therefore ignores v2 rows;
 they may remain in `cache.db` and do not change the old runtime's behavior.
 
-Runtime reloads publish a new coherent generation. Existing leases finish on
-the old generation while new requests use the replacement; retirement closes
-stalled generations at the deadline and caps retained generations. Pooled
+Runtime reloads publish a new coherent generation. Each DNS runtime pins the matching
+outbound runtime, so existing leases keep the old node configuration and session pools
+while new requests use the replacement even across the publication boundary. After old
+leases and DNS transports retire, the old outbound pools stop accepting streams and
+drain live TCP/UDP flows; process shutdown remains the force-close boundary. Retirement
+closes stalled DNS generations at the deadline and caps retained generations. Pooled
 transports single-flight initialization and close idle sessions exactly once.
 Cache, flight, persistence, runtime, transport, projection, and outcome
 diagnostics use independent monotonic atomic counters. An internal scrape
@@ -256,7 +321,7 @@ configuration key, or API.
 
 Enabled when `experimental.clash_api.external_controller` is non-empty.
 
-Core surface: `/version`, `/configs`, `/proxies`, delay endpoints, `/rules`, `/connections`, `/traffic`, `/stats`, `/logs`, `/dns/query`, cache flush, `/providers/proxies`, external UI auto-download (Yacd-meta).
+Core surface: `/version`, `/configs`, `/proxies`, delay endpoints, `/rules`, `/connections`, `/traffic`, `/stats`, `/logs`, `/dns/query`, cache flush, `/providers/proxies`, external UI auto-download (Yacd-meta). `GET /stats` includes a stable nested `udp` object; its complete schema is documented in the component reference.
 
 Auth: `Authorization: Bearer` or `?token=` (percent-decoded).
 

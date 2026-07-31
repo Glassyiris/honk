@@ -334,6 +334,87 @@ Shadowsocks-sized chunks (RustCrypto aes-gcm 0.4–0.5 GB/s vs BoringSSL
 AeadCtx 3.3–6.7 GB/s on AES-NI hardware — the reason the SS data path
 uses BoringSSL).
 
+## Candidate UDP micro-benchmarks (absolute, not A/B)
+
+The UDP Criterion suite records absolute candidate behavior only. Its fixed
+invocation is:
+
+```bash
+cd /root/code/honk-feat-udp-to-1
+CARGO_TARGET_DIR=/root/code/honk/target cargo bench -p honk-core --bench udp -- --save-baseline udp-candidate
+```
+
+| Case | Fixed work |
+| --- | --- |
+| steady enqueue | 1,000,000 128-byte `fast_path_enqueue` calls on a Ready flow, immediately drained to hold steady state |
+| reserve / rollback | 10,000 endpoint reservations followed by rollback |
+| histogram | 1,000,000 record/snapshot operations |
+| queue saturation | 64 admitted datagrams followed by one dropped newest datagram |
+
+Record the candidate's Criterion mean, median, MAD, and absolute throughput.
+`udp-candidate` is a repeat-run label, not a comparison to `be587b1`: that
+revision has no source-level equivalent interface for a valid A/B. Criterion
+also does not provide a merge-gate p95 estimate; do not infer one from this
+suite.
+
+## Deployment UDP A/B gate
+
+`bench/udp-latency.sh` is the real deployment driver, not a CI substitute. It
+requires the same TPROXY topology and real upstreams for both binaries. Its
+fixed invocation is:
+
+```bash
+sudo bench/udp-latency.sh \
+  --baseline-bin /opt/honk/be587b1/honk-core \
+  --candidate-bin /opt/honk/udp-to-1/honk-core \
+  --config /etc/honk/bench.dae \
+  --echo-target 10.0.2.2:9000 \
+  --dns-target 10.0.2.2:53 \
+  --samples 10000 --runs 5 --offered-rate 5000
+```
+
+The fixed command deliberately has no timeout or hook flags. Configure root's
+`HONK_UDP_TIMEOUT_SEC` (default `30`) and
+`HONK_UDP_{START,READY,SETUP,PROBE,STATS,TEARDOWN,TOPOLOGY}_HOOK` values; CLI
+flags override those values. With `sudo`, use `--preserve-env` for these
+variables or configure them in root's environment. The driver supplies no
+built-in topology: missing live hooks fail closed.
+
+Every executable hook is run through `env`, not evaluated as a shell snippet.
+It receives `variant`, `case`, `run`, `workdir`, `pid`, `pgid`, `selected_bin`,
+`baseline_bin`, `candidate_bin`, `config`, `echo_target`, `dns_target`,
+`samples`, `offered_rate`, and `timeout`; `pid`/`pgid` are empty for `start`
+and `topology`. `start` must finish synchronous setup and then `exec
+"$selected_bin" ...`; the driver attests the selected file's device/inode
+against `/proc/$pid/exe` and rechecks the same PID/session/start-time/executable
+after ready, setup, probe, and stats. A row is emitted only after teardown and
+bounded verification that the owned process group is absent; residual descendants
+fail the run closed. The legacy positional arguments remain compatible. Targets
+may be IPv4, `[IPv6]`, or legal hostnames with a port.
+`probe` must report `sent == samples`.
+
+It emits one JSONL object per case/run with exactly these top-level fields:
+`schema_version`, `variant`, `commit`, `binary_sha256`, `kernel`, `topology`,
+`case`, `run`, `samples`, `offered_rate`, `sent`, `received`, `latency_unit`,
+`p50`, `p95`, `p99`, `max`, `loss`, `cpu_pct`, `rss_kib`, `fd_count`,
+`queue_drops`, and `warm_hit`. `schema_version` is `1`; latency quantiles are
+in microseconds, `loss` is the sample loss ratio, `cpu_pct` is process CPU
+usage, `rss_kib` is resident memory in KiB, and `fd_count` is the open
+file-descriptor count. The fixed cases are `cold_endpoint`, `steady_hit`,
+`warm_session_cold_endpoint`, `dns_hit`, `dns_miss`, `healthy_candidate`, and
+`blackholed_candidate`. The driver interface and JSONL shape are checked with
+`bash bench/tests/udp-latency-cli.sh`.
+
+The deployment gate compares five 10,000-sample runs at the same topology and
+offered rate: healthy cold p50/p95 regression must be at most 5%; a blackholed
+first candidate must improve p95 by at least 20% and p99 by at least 30%; a
+steady path must keep p99 at most 250 microseconds and zero drops below 70% of
+target throughput; AnyTLS warm hits must reach 80% and reduce first reply by
+one RTT or at least 20%; steady CPU and p50 regression must be at most 5%; and
+IPv4/IPv6 client-observed reply tuples must remain unchanged. **This local
+worktree has not run the deployment gate, so it makes no network-latency gate
+claim.**
+
 ## Production notes (10.10.10.1 gateway)
 
 - TCP (google/baidu/cloudflare) and HTTP/3 (cloudflare) pass after each
@@ -353,5 +434,7 @@ uses BoringSSL).
 - `just clash-ci` — fmt, clippy, clash_api_test + integration_test.
 - `just dns-ci` — DNS subsystem gate.
 - `cargo bench -p honk-core --bench dns` — DNS micro-benchmarks (above).
+- `cargo bench -p honk-core --bench udp -- --save-baseline udp-candidate` — candidate-only absolute UDP measurements; not a historical A/B or p95 merge gate.
+- `bash bench/tests/udp-latency-cli.sh` — deployment-driver CLI/JSONL fixture; the real UDP A/B gate above still requires TPROXY and upstreams.
 - Release CI (`.github/workflows/release.yml`) — workspace test gate +
   four-target build (x86_64/aarch64 × gnu/musl) + BTF check + tarballs.

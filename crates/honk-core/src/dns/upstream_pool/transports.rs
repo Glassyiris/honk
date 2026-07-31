@@ -54,6 +54,7 @@ impl UpstreamPool {
         let proxy = match (proxy_node, self.proxy_registry.as_ref()) {
             (Some(node), Some(registry)) => Some(ProxyDial {
                 registry: Arc::clone(registry),
+                generation: self.runtime_generation.get().cloned(),
                 node: node.clone(),
             }),
             _ => None,

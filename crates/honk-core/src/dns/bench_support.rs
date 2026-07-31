@@ -145,6 +145,7 @@ fn runtime(shared: &RuntimeShared, generation: u64) -> Arc<DnsRuntime> {
         )),
         cache: Arc::clone(&shared.cache),
         persistence: Arc::clone(&shared.persistence),
+        outbound_runtime: None,
         transport: Arc::new(NoopTransport),
     })
 }

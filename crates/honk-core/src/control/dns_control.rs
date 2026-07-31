@@ -87,6 +87,7 @@ impl DnsController {
             )),
             cache: forwarder.cache(),
             persistence: crate::dns::runtime::ProcessPersistenceHandle::new(forwarder.cache()),
+            outbound_runtime: None,
             transport: Arc::new(NoopRuntimeTransport),
         });
         Self::new_with_runtime(

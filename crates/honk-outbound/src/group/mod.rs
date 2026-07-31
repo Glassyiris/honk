@@ -60,6 +60,28 @@ impl SelectionNetwork {
     }
 }
 
+/// Provenance of a group selection plan.
+///
+/// The mode is explicit because one surviving candidate does not make a cold
+/// URLTest selection authoritative: callers must preserve the selection
+/// policy rather than infer it from `nodes.len()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionPlanMode {
+    /// Selector, LoadBalance, Fallback, and warm URLTest have already chosen
+    /// their one authoritative leaf.
+    Authoritative,
+    /// A top-level URLTest group has no usable measurement and may prepare
+    /// its ordered eligible leaves with UDP staggering.
+    ColdUrlTest,
+}
+
+/// Concrete leaf nodes plus the selection provenance that produced them.
+#[derive(Debug, Clone)]
+pub struct SelectionPlan<'a> {
+    pub mode: SelectionPlanMode,
+    pub nodes: Vec<&'a Node>,
+}
+
 /// Per-group URLTest selection entry. `tag` is the member tag the group
 /// selected (a direct member's node name, or a sub-group's tag) — it is
 /// the selection's identity for hysteresis and display; `node_id` records

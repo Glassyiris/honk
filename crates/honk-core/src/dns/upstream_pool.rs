@@ -37,6 +37,7 @@ pub struct TransportLifecycleStats {
 pub struct UpstreamPool {
     entries: HashMap<String, UpstreamEntry>,
     proxy_registry: Option<Arc<ProxyRegistry>>,
+    runtime_generation: std::sync::OnceLock<Arc<honk_outbound::runtime::OutboundRuntimeRegistry>>,
     nodes: Vec<Node>,
     groups: Vec<Group>,
     group_manager: parking_lot::RwLock<Option<SharedGroupManager>>,
@@ -91,6 +92,7 @@ impl UpstreamPool {
         Ok(Self {
             entries: build_entries(upstreams, bootstrap_resolver)?,
             proxy_registry,
+            runtime_generation: std::sync::OnceLock::new(),
             nodes,
             groups,
             group_manager: parking_lot::RwLock::new(None),
@@ -113,6 +115,24 @@ impl UpstreamPool {
     ) -> Self {
         self.dns_query_timeout = dns_query_timeout;
         self.dns_dial_timeout = dns_dial_timeout;
+        self
+    }
+
+    pub fn set_runtime_generation(
+        &self,
+        generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
+    ) -> anyhow::Result<()> {
+        self.runtime_generation
+            .set(generation)
+            .map_err(|_| anyhow::anyhow!("DNS upstream runtime generation is already set"))
+    }
+
+    pub fn with_runtime_generation(
+        self,
+        generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
+    ) -> Self {
+        self.set_runtime_generation(generation)
+            .expect("new DNS upstream pool has no runtime generation");
         self
     }
 

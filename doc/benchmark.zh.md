@@ -300,6 +300,77 @@ nodelay——否则 Nagle + delayed-ACK 会给每次 TCP exchange 加约 40 ms,
 尺寸下的吞吐(RustCrypto aes-gcm 0.4–0.5 GB/s vs BoringSSL AeadCtx
 3.3–6.7 GB/s,AES-NI 硬件——SS 数据面用 BoringSSL 的原因)。
 
+## Candidate UDP 微基准（绝对值，不是 A/B）
+
+UDP Criterion suite 只记录 candidate 的绝对行为。固定调用为：
+
+```bash
+cd /root/code/honk-feat-udp-to-1
+CARGO_TARGET_DIR=/root/code/honk/target cargo bench -p honk-core --bench udp -- --save-baseline udp-candidate
+```
+
+| Case | 固定工作量 |
+| --- | --- |
+| steady enqueue | 一个 Ready flow 上 1,000,000 次 128-byte `fast_path_enqueue`，每次立即 drain 以保持 steady state |
+| reserve / rollback | 10,000 次 endpoint reservation 后 rollback |
+| histogram | 1,000,000 次 record/snapshot operation |
+| queue saturation | 先接纳 64 个 datagram，再丢弃一个最新 datagram |
+
+记录 candidate 的 Criterion mean、median、MAD 与绝对吞吐。`udp-candidate`
+只是重复运行标签，不是与 `be587b1` 的比较：该 revision 没有可用于有效 A/B
+的 source-level 等价接口。Criterion 也不提供 merge gate 的 p95 estimate；不得
+从该 suite 推断 p95。
+
+## Deployment UDP A/B gate
+
+`bench/udp-latency.sh` 是真实部署驱动，而非 CI 替代品。它要求两个 binary 使用
+相同的 TPROXY topology 与真实 upstream。固定调用为：
+
+```bash
+sudo bench/udp-latency.sh \
+  --baseline-bin /opt/honk/be587b1/honk-core \
+  --candidate-bin /opt/honk/udp-to-1/honk-core \
+  --config /etc/honk/bench.dae \
+  --echo-target 10.0.2.2:9000 \
+  --dns-target 10.0.2.2:53 \
+  --samples 10000 --runs 5 --offered-rate 5000
+```
+
+该固定调用刻意不传 timeout 或 hook flag。请在 root 环境配置
+`HONK_UDP_TIMEOUT_SEC`（默认 `30`）以及
+`HONK_UDP_{START,READY,SETUP,PROBE,STATS,TEARDOWN,TOPOLOGY}_HOOK`；CLI flag
+可覆盖这些值。使用 `sudo` 时，须以 `--preserve-env` 保留这些变量，或在 root
+环境中配置它们。driver 不提供 built-in topology；缺少 live hook 会 fail closed。
+
+每个 executable hook 都通过 `env` 运行，不会把 shell snippet `eval`。它会获得
+`variant`、`case`、`run`、`workdir`、`pid`、`pgid`、`selected_bin`、
+`baseline_bin`、`candidate_bin`、`config`、`echo_target`、`dns_target`、
+`samples`、`offered_rate` 与 `timeout`；`start` 和 `topology` 的 `pid`/`pgid`
+为空。`start` 必须先完成同步 setup，再执行 `exec "$selected_bin" ...`；driver
+会把所选文件的 device/inode 与 `/proc/$pid/exe` 核对，并在 ready、setup、probe、
+stats 后重新验证同一 PID/session/start-time/executable。只有 teardown 完成且在
+bounded wait 内确认所属 process group 已消失后才输出 row；残留 descendant 会
+fail closed。旧 positional arguments 仍兼容。target 可为 IPv4、`[IPv6]` 或
+带端口的合法 hostname。`probe` 必须报告 `sent == samples`。
+
+它为每个 case/run 输出一个 JSONL object，顶层字段严格为：`schema_version`、
+`variant`、`commit`、`binary_sha256`、`kernel`、`topology`、`case`、`run`、
+`samples`、`offered_rate`、`sent`、`received`、`latency_unit`、`p50`、`p95`、
+`p99`、`max`、`loss`、`cpu_pct`、`rss_kib`、`fd_count`、`queue_drops` 与
+`warm_hit`。`schema_version` 为 `1`；延迟 quantile 的单位为 microseconds；
+`loss` 为 sample loss ratio，`cpu_pct` 为进程 CPU usage，`rss_kib` 为 KiB 的
+resident memory，`fd_count` 为打开的 file-descriptor count。固定 case 为
+`cold_endpoint`、`steady_hit`、`warm_session_cold_endpoint`、`dns_hit`、
+`dns_miss`、`healthy_candidate` 与 `blackholed_candidate`。driver interface 与
+JSONL shape 由 `bash bench/tests/udp-latency-cli.sh` 检查。
+
+部署 gate 在相同 topology 与 offered rate 下比较五轮各 10,000 sample：healthy
+cold 的 p50/p95 回退最多 5%；首个 candidate 被 blackhole 时 p95 至少改善 20%、
+p99 至少改善 30%；steady path 在目标吞吐 70% 以下须保持 p99 至多 250 microseconds
+且零 drop；AnyTLS warm hit 须达 80%，且 first reply 减少一个 RTT 或至少 20%；
+steady CPU 与 p50 回退最多 5%；IPv4/IPv6 client-observed reply tuple 必须不变。
+**本地 worktree 未运行 deployment gate，因此不声称达到任何网络延迟 gate。**
+
 ## 生产备注(10.10.10.1 网关)
 
 - 每次部署后 TCP(google/baidu/cloudflare)与 HTTP/3(cloudflare)通过;
@@ -318,5 +389,7 @@ nodelay——否则 Nagle + delayed-ACK 会给每次 TCP exchange 加约 40 ms,
 - `just clash-ci`——fmt、clippy、clash_api_test + integration_test。
 - `just dns-ci`——DNS 子系统门禁。
 - `cargo bench -p honk-core --bench dns`——DNS 微基准(见上)。
+- `cargo bench -p honk-core --bench udp -- --save-baseline udp-candidate`——仅 candidate 的绝对 UDP 测量；不是历史 A/B 或 p95 merge gate。
+- `bash bench/tests/udp-latency-cli.sh`——deployment driver 的 CLI/JSONL fixture；上文真实 UDP A/B gate 仍需要 TPROXY 与 upstream。
 - 发布 CI(`.github/workflows/release.yml`)——workspace 测试门禁 +
   四目标构建(x86_64/aarch64 × gnu/musl)+ BTF 检查 + tarballs。

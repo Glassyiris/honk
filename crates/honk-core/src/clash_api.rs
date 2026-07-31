@@ -856,6 +856,17 @@ async fn get_rules(State(s): State<Arc<ClashState>>) -> Json<serde_json::Value> 
     Json(serde_json::json!({"rules": rules}))
 }
 
+fn udp_histogram_json(histogram: &crate::stats::UdpLatencyHistogramSnapshot) -> serde_json::Value {
+    // The source histogram is a fixed 64-element atomic array. Snapshot
+    // serialization allocates only this response array; it does not create
+    // labels or unbounded metric state on the packet path.
+    serde_json::json!({
+        "count": histogram.count,
+        "sumNanos": histogram.sum_nanos,
+        "buckets": histogram.buckets.to_vec(),
+    })
+}
+
 /// Per-outbound counters from the userspace stats manager (the datum the
 /// retired debug API exposed at `/debug/stats`). Not part of the clash API
 /// standard; handy for headless ops.
@@ -875,12 +886,52 @@ async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json
         })
         .collect();
     let pool = s.connection_pool.ready_metrics();
+    let udp = s.stats.udp_snapshot();
     Json(serde_json::json!({
         "outbounds": per_outbound,
         "pool": {
             "readyHits": pool.hits,
             "readyMisses": pool.misses,
             "entries": pool.entries,
+        },
+        "udp": {
+            "endpoint": {
+                "hits": udp.endpoint_hits,
+                "misses": udp.endpoint_misses,
+            },
+            "latency": {
+                "route": udp_histogram_json(&udp.route_latency),
+                "dial": udp_histogram_json(&udp.dial_latency),
+                "replyReady": udp_histogram_json(&udp.reply_ready_latency),
+                "firstSend": udp_histogram_json(&udp.first_send_latency),
+                "firstReply": udp_histogram_json(&udp.first_reply_latency),
+            },
+            "capacity": {
+                "rejected": udp.capacity_rejections,
+            },
+            "slowPermit": {
+                "accepted": udp.slow_permit_accepted,
+                "rejected": udp.slow_permit_rejected,
+                "closed": udp.slow_permit_closed,
+            },
+            "queue": {
+                "accepted": udp.queue_accepted,
+                "full": udp.queue_full,
+                "closed": udp.queue_closed,
+            },
+            "firstSend": {
+                "failures": udp.first_send_failures,
+            },
+            "stagger": {
+                "attempts": udp.stagger_attempts,
+                "winners": udp.stagger_winners,
+                "cancellations": udp.stagger_cancellations,
+            },
+            "warm": {
+                "attempts": udp.warm_attempts,
+                "successes": udp.warm_successes,
+                "failures": udp.warm_failures,
+            },
         },
     }))
 }

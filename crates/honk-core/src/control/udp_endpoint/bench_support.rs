@@ -1,0 +1,280 @@
+//! Synchronous production-path harnesses for the UDP Criterion benchmark.
+//!
+//! These helpers exercise the production reservation and Ready fast-path
+//! state machines without duplicating them. They create no socket, runtime,
+//! or task; all resources are dropped and checked before a batch returns.
+
+use super::{
+    EndpointReservation, FLOW_QUEUE_CAPACITY, GLOBAL_PAYLOAD_CAPACITY, UdpEndpoint, UdpEndpointPool,
+};
+use crate::stats::StatsManager;
+use std::io;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::sync::{Semaphore, mpsc};
+
+const BENCH_CLIENT: &str = "192.0.2.10:40000";
+const BENCH_DESTINATION: &str = "198.51.100.53:5353";
+
+#[derive(Debug)]
+struct BenchPacketTransport {
+    relay: SocketAddr,
+}
+
+#[async_trait::async_trait]
+impl honk_outbound::proxy::PacketTransport for BenchPacketTransport {
+    fn relay_addr(&self) -> SocketAddr {
+        self.relay
+    }
+
+    async fn send_packet(&self, _data: &[u8]) -> io::Result<()> {
+        Err(io::Error::other("benchmark transport must not send"))
+    }
+
+    async fn recv_packet(&self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        Err(io::Error::other("benchmark transport must not receive"))
+    }
+}
+
+fn bench_addresses() -> (SocketAddr, SocketAddr) {
+    (
+        BENCH_CLIENT
+            .parse()
+            .unwrap_or_else(|error| panic!("invalid benchmark client address: {error}")),
+        BENCH_DESTINATION
+            .parse()
+            .unwrap_or_else(|error| panic!("invalid benchmark destination address: {error}")),
+    )
+}
+
+fn acquire_slow_permit(slots: &Arc<Semaphore>) -> tokio::sync::OwnedSemaphorePermit {
+    slots
+        .clone()
+        .try_acquire_owned()
+        .unwrap_or_else(|error| panic!("benchmark slow-path permit must be available: {error}"))
+}
+
+fn assert_released(pool: &UdpEndpointPool, slow_slots: &Semaphore, slow_capacity: usize) {
+    assert!(
+        pool.endpoints.is_empty(),
+        "benchmark left a UDP mapping behind"
+    );
+    assert_eq!(
+        pool.endpoint_slots.available_permits(),
+        1,
+        "benchmark leaked an endpoint slot"
+    );
+    assert_eq!(
+        pool.global_payload_bytes.available_permits(),
+        GLOBAL_PAYLOAD_CAPACITY,
+        "benchmark leaked UDP payload-byte permits"
+    );
+    assert_eq!(
+        slow_slots.available_permits(),
+        slow_capacity,
+        "benchmark leaked a slow-path permit"
+    );
+}
+
+struct QueuedBatch {
+    pool: Arc<UdpEndpointPool>,
+    stats: StatsManager,
+    slow_slots: Arc<Semaphore>,
+    slow_capacity: usize,
+    client: SocketAddr,
+    destination: SocketAddr,
+    receiver: mpsc::Receiver<super::QueuedDatagram>,
+    _lease: super::UdpInitLease,
+}
+
+impl QueuedBatch {
+    fn new(slow_capacity: usize, first: &[u8]) -> Self {
+        let pool = Arc::new(UdpEndpointPool::with_capacity_limit(1));
+        let stats = StatsManager::new();
+        let slow_slots = Arc::new(Semaphore::new(slow_capacity));
+        let (client, destination) = bench_addresses();
+        let lease = match pool.reserve_or_enqueue(
+            client,
+            destination,
+            first,
+            acquire_slow_permit(&slow_slots),
+            &stats,
+        ) {
+            EndpointReservation::Initializing(lease) => lease,
+            _ => panic!("benchmark must reserve its initial UDP mapping"),
+        };
+        let receiver = lease
+            .take_queue_receiver()
+            .unwrap_or_else(|| panic!("benchmark reservation must own a queue receiver"));
+        Self {
+            pool,
+            stats,
+            slow_slots,
+            slow_capacity,
+            client,
+            destination,
+            receiver,
+            _lease: lease,
+        }
+    }
+
+    fn enqueue(&mut self, payload: &[u8]) -> EndpointReservation {
+        self.pool.reserve_or_enqueue(
+            self.client,
+            self.destination,
+            payload,
+            acquire_slow_permit(&self.slow_slots),
+            &self.stats,
+        )
+    }
+
+    fn drain_one(&mut self) {
+        drop(self.receiver.try_recv().unwrap_or_else(|error| {
+            panic!("benchmark enqueue must have produced one datagram: {error}")
+        }));
+    }
+
+    fn release_and_assert(self) {
+        let pool = Arc::clone(&self.pool);
+        let slow_slots = Arc::clone(&self.slow_slots);
+        let slow_capacity = self.slow_capacity;
+        drop(self);
+        assert_released(&pool, &slow_slots, slow_capacity);
+    }
+}
+
+struct ReadyBatch {
+    pool: Arc<UdpEndpointPool>,
+    stats: StatsManager,
+    slow_slots: Arc<Semaphore>,
+    slow_capacity: usize,
+    client: SocketAddr,
+    destination: SocketAddr,
+    receiver: mpsc::Receiver<super::QueuedDatagram>,
+}
+
+impl ReadyBatch {
+    fn new(first: &[u8]) -> Self {
+        let QueuedBatch {
+            pool,
+            stats,
+            slow_slots,
+            slow_capacity,
+            client,
+            destination,
+            receiver,
+            _lease: mut lease,
+        } = QueuedBatch::new(1, first);
+        drop(
+            lease
+                .take_first()
+                .unwrap_or_else(|| panic!("benchmark reservation must retain its first datagram")),
+        );
+        let endpoint = Arc::new(UdpEndpoint::new(
+            Arc::new(BenchPacketTransport { relay: destination }),
+            destination,
+            "benchmark".into(),
+        ));
+        assert!(
+            lease.commit_ready(endpoint),
+            "benchmark reservation must commit a Ready mapping"
+        );
+        drop(lease);
+        Self {
+            pool,
+            stats,
+            slow_slots,
+            slow_capacity,
+            client,
+            destination,
+            receiver,
+        }
+    }
+
+    fn enqueue(&self, payload: &[u8]) -> EndpointReservation {
+        self.pool
+            .fast_path_enqueue(self.client, self.destination, payload, &self.stats)
+            .unwrap_or_else(|| panic!("benchmark Ready mapping must hit the UDP fast path"))
+    }
+
+    fn drain_one(&mut self) {
+        drop(self.receiver.try_recv().unwrap_or_else(|error| {
+            panic!("benchmark Ready enqueue must produce one datagram: {error}")
+        }));
+    }
+
+    fn release_and_assert(self) {
+        self.pool.remove(self.client, self.destination);
+        let pool = Arc::clone(&self.pool);
+        let slow_slots = Arc::clone(&self.slow_slots);
+        let slow_capacity = self.slow_capacity;
+        drop(self);
+        assert_released(&pool, &slow_slots, slow_capacity);
+    }
+}
+
+/// Run one 128-byte steady-enqueue batch through the Ready fast path.
+#[doc(hidden)]
+pub fn steady_enqueue_128_batch(iterations: usize) {
+    assert!(iterations > 0, "benchmark batch must be non-empty");
+    let payload = [0xA5; 128];
+    let mut batch = ReadyBatch::new(&payload);
+    for _ in 0..iterations {
+        assert!(matches!(
+            batch.enqueue(&payload),
+            EndpointReservation::Enqueued
+        ));
+        batch.drain_one();
+    }
+    assert_eq!(batch.stats.udp_snapshot().queue_accepted, iterations as u64);
+    batch.release_and_assert();
+}
+
+/// Repeatedly reserve then roll back a cold mapping through its real Drop path.
+#[doc(hidden)]
+pub fn reserve_rollback_batch(iterations: usize) {
+    assert!(iterations > 0, "benchmark batch must be non-empty");
+    let pool = Arc::new(UdpEndpointPool::with_capacity_limit(1));
+    let stats = StatsManager::new();
+    let slow_slots = Arc::new(Semaphore::new(iterations));
+    let (client, destination) = bench_addresses();
+
+    for _ in 0..iterations {
+        let lease = match pool.reserve_or_enqueue(
+            client,
+            destination,
+            b"rollback",
+            acquire_slow_permit(&slow_slots),
+            &stats,
+        ) {
+            EndpointReservation::Initializing(lease) => lease,
+            _ => panic!("rollback benchmark must reserve a fresh mapping"),
+        };
+        drop(lease);
+        assert_released(&pool, &slow_slots, iterations);
+    }
+}
+
+/// Fill the exact 64-datagram bound (including the first) and drop newest.
+#[doc(hidden)]
+pub fn queue_saturation_batch() {
+    let mut batch = QueuedBatch::new(FLOW_QUEUE_CAPACITY + 1, b"first");
+    for _ in 0..FLOW_QUEUE_CAPACITY - 1 {
+        assert!(matches!(
+            batch.enqueue(b"follower"),
+            EndpointReservation::Enqueued
+        ));
+    }
+    assert!(matches!(
+        batch.enqueue(b"newest"),
+        EndpointReservation::QueueFull
+    ));
+
+    let snapshot = batch.stats.udp_snapshot();
+    assert_eq!(snapshot.queue_accepted, (FLOW_QUEUE_CAPACITY - 1) as u64);
+    assert_eq!(snapshot.queue_full, 1);
+    for _ in 0..FLOW_QUEUE_CAPACITY - 1 {
+        batch.drain_one();
+    }
+    batch.release_and_assert();
+}

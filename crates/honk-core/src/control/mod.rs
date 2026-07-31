@@ -13,11 +13,12 @@ mod sockets;
 pub mod tcp_sniff;
 #[cfg(test)]
 mod tests;
+mod udp_dial;
 pub mod udp_endpoint;
 use crate::connection_tracker::ConnectionTracker;
 use crate::control::packet_sniffer::PacketSnifferPool;
 use crate::control::routing_matcher::DOMAIN_BITMAPS;
-use crate::control::udp_endpoint::UdpEndpointPool;
+use crate::control::udp_endpoint::{EndpointReservation, UdpEndpointPool, UdpInitLease};
 use crate::dns::DnsResolver;
 use crate::ebpf::EbpfBackend;
 use crate::ebpf::maps::cidr_to_lpm_key;
@@ -28,6 +29,7 @@ use crate::relay;
 use crate::routing::{ConnectionInfo, Router};
 use crate::sniffing;
 use crate::stats::StatsManager;
+use bytes::Bytes;
 use drain::DrainTracker;
 use honk_config::node::{Group, GroupPolicy};
 use honk_config::{Config, node::Node, types::DialMode};
@@ -117,6 +119,10 @@ pub struct ControlPlane {
     concurrency_limit: Arc<tokio::sync::Semaphore>,
     /// Background task handles (health check, janitor) for clean shutdown.
     background_tasks: Arc<tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// The generation-owned UDP warm coordinator. It is deliberately kept
+    /// separate from generic background tasks so reload/shutdown can abort
+    /// and drain it in the required ownership order.
+    udp_warm_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Shared clash mode state (Rule/Global/Direct + GLOBAL selection),
     /// installed by `set_mode_state` when the clash API is enabled.
     mode_state: Option<crate::mode::SharedModeState>,
@@ -235,6 +241,8 @@ impl ControlPlane {
         // Hand the registry to handlers with pooled sessions (AnyTLS);
         // the shared cell swaps contents on reload, installed once.
         proxy_registry.install_runtime_registry(runtime_registry.clone());
+        let outbound_runtime = runtime_registry.read().clone();
+        dns_upstream_pool.set_runtime_generation(Arc::clone(&outbound_runtime))?;
         {
             let gm_cell = group_manager.clone();
             alive_set.set_url_member_resolver(Some(Arc::new(move |group: &str| {
@@ -275,6 +283,7 @@ impl ControlPlane {
                 )),
                 cache: dns_forwarder.cache(),
                 persistence,
+                outbound_runtime: Some(outbound_runtime),
                 transport: dns_upstream_pool,
             });
         let runtime_provider = Arc::new(crate::dns::runtime::DnsServiceProvider::new(
@@ -345,6 +354,7 @@ impl ControlPlane {
             outbound_id_map,
             concurrency_limit: Arc::new(tokio::sync::Semaphore::new(1024)),
             background_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            udp_warm_task: tokio::sync::Mutex::new(None),
             mode_state: None,
             datapath_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             active_routing_plan: Arc::new(parking_lot::RwLock::new(initial_routing_plan)),
@@ -359,8 +369,34 @@ impl ControlPlane {
             &control_plane.group_manager,
             &control_plane.connection_tracker,
         );
+        // Node death may race an initializer before the listener/background
+        // loops start, so this production lifecycle callback belongs to
+        // ControlPlane construction rather than `run()` setup.
+        control_plane.install_node_death_callback();
 
         Ok(control_plane)
+    }
+
+    /// Reap node-bound UDP entries as soon as a real AliveDialerSet transition
+    /// reports death. Installing this at construction covers blocked dials and
+    /// driver-ready work before `run()` has created listener tasks.
+    fn install_node_death_callback(&self) {
+        let pool = self.connection_pool.clone();
+        let udp_pool = self.udp_pool.clone();
+        let config_for_purge = self.config.clone();
+        self.alive_set
+            .set_death_callback(Some(Box::new(move |node_name: &str| {
+                udp_pool.remove_by_node(node_name);
+                let node_addr = config_for_purge.try_read().ok().and_then(|c| {
+                    c.nodes
+                        .iter()
+                        .find(|n| n.name == node_name)
+                        .map(|n| format!("{}:{}", n.host(), n.port))
+                });
+                if let Some(addr) = node_addr {
+                    pool.purge_node(&addr);
+                }
+            })));
     }
 
     /// Open the persistent cache database (sing-box `cache_file`), wire
@@ -797,27 +833,6 @@ impl ControlPlane {
                     }
                 });
             }));
-            // Connection-lifecycle hook: when a node flips alive→dead,
-            // purge its pooled connections (bare + ready) and reap the UDP
-            // endpoints bound to it — both would otherwise keep serving a
-            // doomed node until their idle timeouts expire.
-            {
-                let pool = self.connection_pool.clone();
-                let udp_pool = self.udp_pool.clone();
-                let config_for_purge = self.config.clone();
-                alive_set.set_death_callback(Some(Box::new(move |node_name: &str| {
-                    udp_pool.remove_by_node(node_name);
-                    let node_addr = config_for_purge.try_read().ok().and_then(|c| {
-                        c.nodes
-                            .iter()
-                            .find(|n| n.name == node_name)
-                            .map(|n| format!("{}:{}", n.host(), n.port))
-                    });
-                    if let Some(addr) = node_addr {
-                        pool.purge_node(&addr);
-                    }
-                })));
-            }
             let period = std::time::Duration::from_secs(interval_secs);
             let handle = alive_set.spawn_health_check_loop(period, check_timeout);
             self.background_tasks.lock().await.push(handle);
@@ -889,6 +904,11 @@ impl ControlPlane {
                 );
             }
         }
+
+        // The warm coordinator starts only after group/runtime setup and
+        // retains this exact registry Arc for its complete lifetime.
+        let warm_generation = self.runtime_registry.read().clone();
+        self.start_udp_warm_coordinator(warm_generation).await;
 
         let mut rx = self.command_rx.take().expect("command_rx already taken");
         let drain = self.drain_tracker.clone();
@@ -1001,32 +1021,31 @@ impl ControlPlane {
 
                 recv_result = recv_from_with_orig_dst(&udp4_socket, &mut udp4_buf) => {
                     match recv_result {
-                        Ok((n, src_addr, original_dst)) => {
-                            if !accepts_transparent_connection(&drain) { continue; }
-                            // Fast path: the datagram belongs to an established
-                            // endpoint — forward it inline from the receive
-                            // buffer (no spawn, no heap copy, no sniffer).
-                            if udp_fast_path(&self.udp_pool, &udp4_buf[..n], src_addr, original_dst).await {
-                                continue;
-                            }
-                            let data = bytes::Bytes::copy_from_slice(&udp4_buf[..n]);
-                            // At capacity, drop the datagram instead of
-                            // queueing a task that waits on the semaphore —
-                            // UDP tolerates loss; unbounded pending tasks do not.
-                            let Ok(permit) = self.concurrency_limit.clone().try_acquire_owned()
-                            else {
+                        Ok((n, src_addr, recv_meta)) => {
+                            let Some(original_dst) = udp_original_dst(&recv_meta, &udp4_buf[..n]) else {
+                                debug!(
+                                    "Dropping UDP from {} without original-destination provenance",
+                                    src_addr
+                                );
                                 continue;
                             };
-                            let handle = self.spawn_handle();
-                            let sock = udp4_socket.clone();
-                            let drain = drain.clone();
-                            tokio::spawn(async move {
-                                let _permit = permit;
-                                let _guard = ConnectionGuard::new(drain);
-                                if let Err(e) = handle.serve_udp_connection(sock, data, src_addr, original_dst).await {
-                                    warn!("Error handling UDP from {} (orig {}): {}", src_addr, original_dst, e);
-                                }
-                            });
+                            if !accepts_transparent_connection(&drain) {
+                                self.stats.record_udp_slow_permit_closed();
+                                continue;
+                            }
+                            // Ready flows enqueue synchronously here; this
+                            // loop never awaits PacketTransport I/O.
+                            if udp_fast_path(&self.udp_pool, &self.stats, &udp4_buf[..n], src_addr, original_dst).await {
+                                continue;
+                            }
+                            dispatch_udp_slow_path(
+                                self,
+                                &drain,
+                                &udp4_socket,
+                                src_addr,
+                                original_dst,
+                                &udp4_buf[..n],
+                            );
                         }
                         Err(e) => error!("UDP recv error: {}", e),
                     }
@@ -1036,35 +1055,35 @@ impl ControlPlane {
                     if let Some(ref s) = udp6_socket {
                         recv_from_with_orig_dst(s, &mut udp6_buf).await
                     } else {
-                        std::future::pending::<io::Result<(usize, SocketAddr, SocketAddr)>>().await
+                        std::future::pending::<io::Result<(usize, SocketAddr, UdpRecvMeta)>>().await
                     }
                 } => {
                     match recv6_result {
-                        Ok((n, src_addr, original_dst)) => {
-                            if !accepts_transparent_connection(&drain) { continue; }
-                            // Fast path: the datagram belongs to an established
-                            // endpoint — forward it inline from the receive
-                            // buffer (no spawn, no heap copy, no sniffer).
-                            if udp_fast_path(&self.udp_pool, &udp6_buf[..n], src_addr, original_dst).await {
-                                continue;
-                            }
-                            let data = bytes::Bytes::copy_from_slice(&udp6_buf[..n]);
-                            // Same as the v4 path: drop instead of queueing
-                            // a pending task when at capacity.
-                            let Ok(permit) = self.concurrency_limit.clone().try_acquire_owned()
-                            else {
+                        Ok((n, src_addr, recv_meta)) => {
+                            let Some(original_dst) = udp_original_dst(&recv_meta, &udp6_buf[..n]) else {
+                                debug!(
+                                    "Dropping UDPv6 from {} without original-destination provenance",
+                                    src_addr
+                                );
                                 continue;
                             };
-                            let handle = self.spawn_handle();
-                            let sock = udp6_socket.clone().expect("udp6_socket present");
-                            let drain = drain.clone();
-                            tokio::spawn(async move {
-                                let _permit = permit;
-                                let _guard = ConnectionGuard::new(drain);
-                                if let Err(e) = handle.serve_udp_connection(sock, data, src_addr, original_dst).await {
-                                    warn!("Error handling UDPv6 from {} (orig {}): {}", src_addr, original_dst, e);
-                                }
-                            });
+                            if !accepts_transparent_connection(&drain) {
+                                self.stats.record_udp_slow_permit_closed();
+                                continue;
+                            }
+                            // Same shared slow-path helper as the v4 branch.
+                            if udp_fast_path(&self.udp_pool, &self.stats, &udp6_buf[..n], src_addr, original_dst).await {
+                                continue;
+                            }
+                            let socket = udp6_socket.clone().expect("udp6_socket present");
+                            dispatch_udp_slow_path(
+                                self,
+                                &drain,
+                                &socket,
+                                src_addr,
+                                original_dst,
+                                &udp6_buf[..n],
+                            );
                         }
                         Err(e) => error!("UDPv6 recv error: {}", e),
                     }
@@ -1098,6 +1117,11 @@ impl ControlPlane {
                         Some(ControlCommand::Shutdown) | None => {
                             info!("Control plane shutting down, draining {} active connections",
                                 drain.active_count());
+                            drain.start_rejecting();
+                            self.stop_udp_warm_coordinator().await;
+                            if !self.udp_pool.cancel_initializers_and_wait().await {
+                                error!("UDP initializer cancellation timed out during shutdown");
+                            }
                             // Abort background tasks (health check, janitor, preconnect) to prevent
                             // tokio timer panic during runtime shutdown.
                             {
@@ -1120,6 +1144,10 @@ impl ControlPlane {
                             }
                             drop(ebpf);
                             drain.drain().await?;
+                            // Active flows own the current runtime until the
+                            // drain completes; only then terminally close its
+                            // AnyTLS pools and reject any late warm work.
+                            self.runtime_registry.read().clone().shutdown();
                             break;
                         }
                     }
@@ -1145,6 +1173,7 @@ impl ControlPlane {
             config: self.config.clone(),
             router: self.router.clone(),
             proxy_registry: self.proxy_registry.clone(),
+            runtime_registry: self.runtime_registry.clone(),
             dns_resolver: self.dns_resolver.clone(),
             group_manager: self.group_manager.clone(),
             stats: self.stats.clone(),
@@ -1159,7 +1188,233 @@ impl ControlPlane {
             mode_state: self.mode_state.clone(),
         }
     }
+}
 
+/// Work produced by the shared IPv4/IPv6 UDP slow-path dispatcher after a
+/// fast-path miss. The accept loop never awaits PacketTransport I/O; DNS
+/// resolution (when required) runs inside a slow-permit-bounded task.
+enum UdpSlowPathWork {
+    /// Fresh reservation: caller spawns `serve_udp_connection`.
+    Initialize(UdpInitLease),
+    /// DNS-shaped traffic: slow permit is already held and the payload has
+    /// been copied. Run the production DNS controller first; only if it
+    /// declines, continue through the same reserve/initializer path.
+    DnsThenMaybeInitialize {
+        permit: tokio::sync::OwnedSemaphorePermit,
+        data: Bytes,
+    },
+    /// Fully handled in the receive loop (enqueued / rejected / dropped).
+    Done,
+}
+
+/// Shared production admission helper used by both listener families and by
+/// focused tests. Order is always:
+/// `slow permit → (optional heap copy for DNS task) → reserve_or_enqueue`.
+/// Only strict DNS queries whose authoritative destination is port 53 return
+/// [`UdpSlowPathWork::DnsThenMaybeInitialize`]; DNS-shaped non-53 UDP stays
+/// on ordinary forwarding.
+fn begin_udp_slow_path(
+    pool: &Arc<UdpEndpointPool>,
+    stats: &StatsManager,
+    concurrency_limit: &Arc<tokio::sync::Semaphore>,
+    src_addr: SocketAddr,
+    original_dst: SocketAddr,
+    data: &[u8],
+) -> UdpSlowPathWork {
+    let Some(permit) = try_admit_udp_slow_path(stats, concurrency_limit) else {
+        return UdpSlowPathWork::Done;
+    };
+    if original_dst.port() == 53 && is_exact_dns_query(data) {
+        // Permit is acquired before the heap copy required to leave the
+        // receive buffer for a permit-bounded DNS task.
+        return UdpSlowPathWork::DnsThenMaybeInitialize {
+            permit,
+            data: Bytes::copy_from_slice(data),
+        };
+    }
+    match pool.reserve_or_enqueue(src_addr, original_dst, data, permit, stats) {
+        EndpointReservation::Initializing(lease) => UdpSlowPathWork::Initialize(lease),
+        EndpointReservation::Enqueued
+        | EndpointReservation::CapacityRejected
+        | EndpointReservation::QueueFull
+        | EndpointReservation::QueueClosed => UdpSlowPathWork::Done,
+    }
+}
+
+struct UdpDnsSlowPathContext<'a> {
+    pool: &'a Arc<UdpEndpointPool>,
+    stats: &'a StatsManager,
+    dns_controller: &'a crate::control::dns_control::DnsController,
+    udp_socket: &'a UdpSocket,
+    src_addr: SocketAddr,
+    original_dst: SocketAddr,
+}
+
+/// Finish a DNS-forced slow path after the slow permit was acquired: run the
+/// production DNS controller first. If it handles the packet, do not
+/// reserve/enqueue. If it declines, continue through the same
+/// `reserve_or_enqueue` path used by ordinary slow traffic.
+async fn complete_udp_dns_slow_path(
+    context: UdpDnsSlowPathContext<'_>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    data: &[u8],
+) -> Option<UdpInitLease> {
+    let UdpDnsSlowPathContext {
+        pool,
+        stats,
+        dns_controller,
+        udp_socket,
+        src_addr,
+        original_dst,
+    } = context;
+    match dns_controller
+        .handle_udp_dns(udp_socket, data, src_addr, original_dst)
+        .await
+    {
+        Ok(true) => return None,
+        Ok(false) => {}
+        Err(error) => {
+            // Preserve the historical UDP fallback: a controller failure is
+            // not a reason to drop the original datagram before ordinary
+            // endpoint admission has had a chance to forward it.
+            warn!(
+                "DNS controller error for UDP {} -> {}; continuing UDP: {}",
+                src_addr, original_dst, error
+            );
+        }
+    }
+    match pool.reserve_or_enqueue(src_addr, original_dst, data, permit, stats) {
+        EndpointReservation::Initializing(mut lease) => {
+            // The controller was invoked exactly once for this packet. Carry
+            // that fact into initialize_udp_connection so an Ok(false) or
+            // Err continuation cannot call it again.
+            lease.mark_dns_checked();
+            Some(lease)
+        }
+        EndpointReservation::Enqueued
+        | EndpointReservation::CapacityRejected
+        | EndpointReservation::QueueFull
+        | EndpointReservation::QueueClosed => None,
+    }
+}
+
+/// Shared IPv4/IPv6 receive-loop dispatcher after a fast-path miss. Acquires
+/// the slow permit before any copy/spawn, prefers the DNS controller for
+/// DNS-shaped traffic, and only then reserves or enqueues.
+fn dispatch_udp_slow_path(
+    plane: &ControlPlane,
+    drain: &Arc<DrainTracker>,
+    udp_socket: &Arc<UdpSocket>,
+    src_addr: SocketAddr,
+    original_dst: SocketAddr,
+    data: &[u8],
+) {
+    match begin_udp_slow_path(
+        &plane.udp_pool,
+        &plane.stats,
+        &plane.concurrency_limit,
+        src_addr,
+        original_dst,
+        data,
+    ) {
+        UdpSlowPathWork::Done => {}
+        UdpSlowPathWork::Initialize(lease) => {
+            let handle = plane.spawn_handle();
+            let socket = Arc::clone(udp_socket);
+            let drain = Arc::clone(drain);
+            tokio::spawn(async move {
+                let _guard = ConnectionGuard::new(drain);
+                if let Err(e) = handle.serve_udp_connection(lease, socket).await {
+                    warn!(
+                        "Error handling UDP from {} (orig {}): {}",
+                        src_addr, original_dst, e
+                    );
+                }
+            });
+        }
+        UdpSlowPathWork::DnsThenMaybeInitialize { permit, data } => {
+            let handle = plane.spawn_handle();
+            let socket = Arc::clone(udp_socket);
+            let guard = ConnectionGuard::new(Arc::clone(drain));
+            let pool = Arc::clone(&plane.udp_pool);
+            let stats = Arc::clone(&plane.stats);
+            let dns_controller = Arc::clone(&plane.dns_controller);
+            tokio::spawn(async move {
+                // DNS handling is already accepted work. Register it before
+                // spawning so reload/shutdown drain cannot miss work before
+                // its first poll; keep the guard alive for the task lifetime.
+                let _guard = guard;
+                let Some(lease) = complete_udp_dns_slow_path(
+                    UdpDnsSlowPathContext {
+                        pool: &pool,
+                        stats: &stats,
+                        dns_controller: dns_controller.as_ref(),
+                        udp_socket: socket.as_ref(),
+                        src_addr,
+                        original_dst,
+                    },
+                    permit,
+                    &data,
+                )
+                .await
+                else {
+                    return;
+                };
+                if let Err(e) = handle.serve_udp_connection(lease, socket).await {
+                    warn!(
+                        "Error handling UDP from {} (orig {}): {}",
+                        src_addr, original_dst, e
+                    );
+                }
+            });
+        }
+    }
+}
+
+/// Compatibility wrapper used by family-symmetric admission tests: acquire
+/// the slow permit then synchronously reserve/enqueue (non-DNS path).
+#[cfg(test)]
+fn reserve_udp_slow_path(
+    pool: &Arc<UdpEndpointPool>,
+    stats: &StatsManager,
+    concurrency_limit: &Arc<tokio::sync::Semaphore>,
+    src_addr: SocketAddr,
+    original_dst: SocketAddr,
+    data: &[u8],
+) -> Option<UdpInitLease> {
+    match begin_udp_slow_path(pool, stats, concurrency_limit, src_addr, original_dst, data) {
+        UdpSlowPathWork::Initialize(lease) => Some(lease),
+        UdpSlowPathWork::DnsThenMaybeInitialize { permit, data } => {
+            match pool.reserve_or_enqueue(src_addr, original_dst, &data, permit, stats) {
+                EndpointReservation::Initializing(lease) => Some(lease),
+                _ => None,
+            }
+        }
+        UdpSlowPathWork::Done => None,
+    }
+}
+
+/// Admit one datagram onto the current UDP slow path after a fast-path miss.
+///
+/// This is the sole production owner of `udp.slowPermit` accepted/rejected
+/// counters. Queue metrics are recorded by `reserve_or_enqueue` / the driver.
+pub(super) fn try_admit_udp_slow_path(
+    stats: &StatsManager,
+    concurrency_limit: &Arc<tokio::sync::Semaphore>,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    match concurrency_limit.clone().try_acquire_owned() {
+        Ok(permit) => {
+            stats.record_udp_slow_permit_accepted();
+            Some(permit)
+        }
+        Err(_) => {
+            stats.record_udp_slow_permit_rejected();
+            None
+        }
+    }
+}
+
+impl ControlPlane {
     fn compile_routing_plan(
         config: &Config,
         router: &Router,

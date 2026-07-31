@@ -80,7 +80,15 @@ impl RuntimeTransport for ObservedTransport {
     }
 }
 
-fn runtime(generation: u64, _route_count: usize) -> (Arc<DnsRuntime>, Arc<ObservedTransport>) {
+fn runtime(generation: u64, route_count: usize) -> (Arc<DnsRuntime>, Arc<ObservedTransport>) {
+    runtime_with_outbound(generation, route_count, None)
+}
+
+fn runtime_with_outbound(
+    generation: u64,
+    _route_count: usize,
+    outbound_runtime: Option<Arc<honk_outbound::runtime::OutboundRuntimeRegistry>>,
+) -> (Arc<DnsRuntime>, Arc<ObservedTransport>) {
     let config = Config::default();
     let dns_router =
         Arc::new(DnsRouter::new_from_dns_config(&config.dns).expect("valid default DNS config"));
@@ -108,6 +116,7 @@ fn runtime(generation: u64, _route_count: usize) -> (Arc<DnsRuntime>, Arc<Observ
         )),
         cache: Arc::clone(&cache),
         persistence: super::ProcessPersistenceHandle::new(Arc::clone(&cache)),
+        outbound_runtime,
         transport: transport.clone(),
     });
     (runtime, transport)
@@ -144,6 +153,7 @@ fn runtime_with_bootstrap_pool(generation: u64, pool: Arc<LazyBootstrapPool>) ->
         )),
         cache: Arc::clone(&cache),
         persistence: super::ProcessPersistenceHandle::new(cache),
+        outbound_runtime: None,
         transport: pool,
     })
 }
@@ -302,7 +312,10 @@ async fn retirement_deadline_closes_a_stalled_generation() {
 async fn fifth_retirement_cancels_oldest_and_retains_four() {
     // Given: the oldest runtime is kept alive by a lease.
     let before = crate::stats::dns_snapshot();
-    let (oldest, oldest_transport) = runtime(0, 0);
+    let oldest_outbound =
+        Arc::new(honk_outbound::runtime::OutboundRuntimeRegistry::build(&[]).unwrap());
+    let (oldest, oldest_transport) =
+        runtime_with_outbound(0, 0, Some(Arc::clone(&oldest_outbound)));
     let provider = DnsServiceProvider::new(oldest);
     let oldest_lease = provider.acquire();
 
@@ -319,6 +332,10 @@ async fn fifth_retirement_cancels_oldest_and_retains_four() {
         .expect("oldest generation closed at retirement cap");
     assert_eq!(oldest_lease.runtime().state(), RuntimeState::Closed);
     assert!(
+        oldest_outbound.is_shutdown(),
+        "cap eviction must force-shutdown its outbound generation"
+    );
+    assert!(
         crate::stats::dns_snapshot()
             .delta(before)
             .runtime_forced_close
@@ -329,9 +346,14 @@ async fn fifth_retirement_cancels_oldest_and_retains_four() {
 #[tokio::test]
 async fn explicit_shutdown_awaits_each_generation_transport_once() {
     // Given: one retired runtime and one current runtime.
-    let (old, old_transport) = runtime(1, 1);
+    let old_outbound =
+        Arc::new(honk_outbound::runtime::OutboundRuntimeRegistry::build(&[]).unwrap());
+    let current_outbound =
+        Arc::new(honk_outbound::runtime::OutboundRuntimeRegistry::build(&[]).unwrap());
+    let (old, old_transport) = runtime_with_outbound(1, 1, Some(Arc::clone(&old_outbound)));
     let provider = DnsServiceProvider::new(old);
-    let (current, current_transport) = runtime(2, 2);
+    let (current, current_transport) =
+        runtime_with_outbound(2, 2, Some(Arc::clone(&current_outbound)));
     provider.publish(current);
 
     // When: process shutdown explicitly joins the runtime supervisors.
@@ -340,6 +362,8 @@ async fn explicit_shutdown_awaits_each_generation_transport_once() {
     // Then: every generation-owned transport is closed exactly once.
     assert_eq!(old_transport.closes.load(Ordering::SeqCst), 1);
     assert_eq!(current_transport.closes.load(Ordering::SeqCst), 1);
+    assert!(old_outbound.is_shutdown());
+    assert!(current_outbound.is_shutdown());
 }
 
 #[tokio::test]

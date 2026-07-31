@@ -700,6 +700,11 @@ fn parse_global_section(section: &Section) -> Result<GlobalConfig, crate::Config
     if let Some(v) = kv.get("bandwidth_max_rx") {
         cfg.bandwidth_max_rx = v.clone();
     }
+    if let Some(v) = kv.get("udp_warm_node_count") {
+        cfg.udp_warm_node_count = v
+            .parse()
+            .map_err(|_| crate::ConfigError::Parse(format!("invalid udp_warm_node_count: {v}")))?;
+    }
 
     Ok(cfg)
 }

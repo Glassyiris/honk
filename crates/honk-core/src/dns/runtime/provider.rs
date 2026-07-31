@@ -47,6 +47,10 @@ impl PreparedPublication<'_> {
                 "DNS runtime forced close"
             );
             oldest.request_cancellation();
+            // The bounded-generation policy is an explicit force-close: do
+            // not leave this evicted runtime's outbound pools unreachable by
+            // the later process-shutdown sweep.
+            oldest.force_shutdown_outbound();
         }
         let deadline = self.deadline;
         self.supervisors
@@ -116,11 +120,11 @@ impl DnsServiceProvider {
                 .chain(state.retired.iter().cloned())
                 .collect::<Vec<_>>()
         };
-        for runtime in runtimes {
+        for runtime in &runtimes {
             runtime.request_cancellation();
             runtime.start_draining();
             if runtime.state() != RuntimeState::Closed {
-                let runtime_for_close = Arc::clone(&runtime);
+                let runtime_for_close = Arc::clone(runtime);
                 self.supervisors
                     .lock()
                     .spawn(async move { runtime_for_close.retire(Duration::ZERO).await });
@@ -131,5 +135,8 @@ impl DnsServiceProvider {
             std::mem::take(&mut *guard)
         };
         while supervisors.join_next().await.is_some() {}
+        for runtime in runtimes {
+            runtime.force_shutdown_outbound();
+        }
     }
 }

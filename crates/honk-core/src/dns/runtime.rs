@@ -38,6 +38,10 @@ pub(crate) struct DnsRuntimeParts {
     pub(crate) routing_projection: Arc<RoutingProjectionSnapshot>,
     pub(crate) cache: Arc<tokio::sync::Mutex<DnsCache>>,
     pub(crate) persistence: Arc<ProcessPersistenceHandle>,
+    /// Outbound session generation captured with this DNS snapshot. It stays
+    /// available to existing leases after publication and begins graceful
+    /// pool drain only when the runtime itself retires.
+    pub(crate) outbound_runtime: Option<Arc<honk_outbound::runtime::OutboundRuntimeRegistry>>,
     pub(crate) transport: Arc<dyn RuntimeTransport>,
 }
 
@@ -164,6 +168,9 @@ impl DnsRuntime {
         }
         self.parts.forwarder.shutdown_prefetch().await;
         self.parts.transport.close().await;
+        if let Some(runtime) = &self.parts.outbound_runtime {
+            runtime.drain_session_pools();
+        }
         self.state
             .store(RuntimeState::Closed as u8, Ordering::Release);
         self.closed.notify_waiters();
@@ -186,6 +193,12 @@ impl DnsRuntime {
                 return;
             }
             closed.await;
+        }
+    }
+
+    fn force_shutdown_outbound(&self) {
+        if let Some(runtime) = &self.parts.outbound_runtime {
+            runtime.shutdown();
         }
     }
 }
