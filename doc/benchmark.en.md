@@ -111,6 +111,50 @@ ssh root@10.10.10.57 "bash /root/lab-bench.sh 'honk dae' 'hy2 tuic ss2022 trojan
 ssh root@10.10.10.57 bash /root/test-protocols.sh
 ```
 
+## Results (2026-08-01, honk reuseport-2: parallel UDP listeners + UDP driver)
+
+honk build: dev `9aabb72` (fail-fast datapath mounts) + reapplied
+`feat/udp-reuseport` (4 parallel TPROXY UDP listeners per family, per-flow
+hash distribution). Latencies in seconds, TCP bandwidth is the iperf3
+receiver median, CPU in cores, RSS after the run.
+
+| engine | protocol | cold | hot p50 | hot p95 | bw (Mbps) | cpu | RSS (MB) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| honk | direct | 0.0060 | – | – | 9411 | 0.24 | 58 |
+| honk | hy2 | 0.0085 | 0.0042 | 0.0053 | 3050 | 0.50 | 60 |
+| honk | tuic | 0.0051 | 0.0032 | 0.0051 | 4400 | 0.60 | 57 |
+| honk | ss2022 | 0.0046 | 0.0028 | 0.0035 | 9205 | 0.36 | 52 |
+| honk | trojan | 0.0103 | 0.0018 | 0.0084 | 9328 | 0.43 | 52 |
+| honk | anytls-sb | 0.0053 | 0.0034 | 0.0046 | 4792 | 0.28 | 45 |
+| honk | anytls-go | 0.0132 | 0.0031 | 0.0037 | 9249 | 0.48 | 56 |
+| honk | juicity | 0.0046 | 0.0034 | 0.0042 | 9412 | 0.26 | 53 |
+
+### UDP: warm state vs cold start (methodology fix)
+
+Previous UDP rows (including the 07-31 table below) were measured on a
+**fresh engine with 10 Gbps offered instantly** — health checks
+unconverged, sessions cold. That systematically reads 3–4× low with
+inflated loss. Measured again on a settled engine, single flow and
+8-flow aggregate (`iperf3 -u -b 10G -l 1200 -R` / `-P 8`):
+
+| protocol | single flow (loss) | P8 aggregate (loss) | earlier cold row |
+| --- | --- | --- | --- |
+| hy2 | 6.21 Gbps (0.1%) | 9.18 Gbps (3.1%) | 1.7 Gbps (73%) |
+| ss2022 | 6.22 Gbps (0.2%) | 9.03 Gbps (4.7%) | 1.9 Gbps (67%) |
+| trojan | 5.96 Gbps (4.2%) | 8.88 Gbps (6.3%) | 1.6 Gbps (72%) |
+| juicity | 6.19 Gbps (4.8%) | 9.22 Gbps (2.7%) | 2.2 Gbps (66%) |
+
+- UDP is effectively at line rate in steady state; the earlier "honk UDP
+  is 1.5–2× slower than dae" conclusion was a cold-start artifact, not a
+  datapath property.
+- The parallel listeners matter exactly where they should: aggregate
+  scales from ~6 Gbps single-flow to ~9 Gbps across 8 flows.
+- juicity is the strongest protocol overall: line-rate TCP at 0.26 cores,
+  6.2 Gbps UDP single-flow.
+- `global.udp_warm_node_count` (from the UDP branch) pre-builds sessions
+  for selected UDP group leaves at startup/reload, shrinking exactly this
+  cold-start window in production.
+
 ## Results (2026-07-31, honk dev `ac64fe1` vs dae kdae `eee7c88b`)
 
 Same-time A/B on the lab. honk is the musl release binary (mimalloc,

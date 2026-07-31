@@ -97,6 +97,45 @@ ssh root@10.10.10.57 "bash /root/lab-bench.sh 'honk dae' 'hy2 tuic ss2022 trojan
 ssh root@10.10.10.57 bash /root/test-protocols.sh
 ```
 
+## 结果(2026-08-01,honk reuseport-2:并行 UDP listener + UDP driver)
+
+honk 构建:dev `9aabb72`(数据面挂载点 fail-fast)+ 重新合入
+`feat/udp-reuseport`(每协议族 4 个并行 TPROXY UDP listener,按流四元组
+hash 分发)。延迟单位秒,TCP 带宽为 iperf3 接收端中位数,CPU 单位核,
+RSS 为跑后值。
+
+| 引擎 | 协议 | cold | hot p50 | hot p95 | bw (Mbps) | cpu | RSS (MB) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| honk | direct | 0.0060 | – | – | 9411 | 0.24 | 58 |
+| honk | hy2 | 0.0085 | 0.0042 | 0.0053 | 3050 | 0.50 | 60 |
+| honk | tuic | 0.0051 | 0.0032 | 0.0051 | 4400 | 0.60 | 57 |
+| honk | ss2022 | 0.0046 | 0.0028 | 0.0035 | 9205 | 0.36 | 52 |
+| honk | trojan | 0.0103 | 0.0018 | 0.0084 | 9328 | 0.43 | 52 |
+| honk | anytls-sb | 0.0053 | 0.0034 | 0.0046 | 4792 | 0.28 | 45 |
+| honk | anytls-go | 0.0132 | 0.0031 | 0.0037 | 9249 | 0.48 | 56 |
+| honk | juicity | 0.0046 | 0.0034 | 0.0042 | 9412 | 0.26 | 53 |
+
+### UDP:稳态 vs 冷启动(方法论修正)
+
+之前的 UDP 行(含下方 07-31 表)都是在**全新引擎上瞬时灌 10Gbps** 测
+的——健康检查未收敛、会话全冷,结果系统性偏低 3–4 倍且丢包虚高。在收
+敛后的引擎上重测,单流与 8 流聚合(`iperf3 -u -b 10G -l 1200 -R` /
+`-P 8`):
+
+| 协议 | 单流(丢包) | P8 聚合(丢包) | 早前冷启动行 |
+| --- | --- | --- | --- |
+| hy2 | 6.21 Gbps (0.1%) | 9.18 Gbps (3.1%) | 1.7 Gbps (73%) |
+| ss2022 | 6.22 Gbps (0.2%) | 9.03 Gbps (4.7%) | 1.9 Gbps (67%) |
+| trojan | 5.96 Gbps (4.2%) | 8.88 Gbps (6.3%) | 1.6 Gbps (72%) |
+| juicity | 6.19 Gbps (4.8%) | 9.22 Gbps (2.7%) | 2.2 Gbps (66%) |
+
+- 稳态下 UDP 已接近线速;"honk UDP 比 dae 慢 1.5–2 倍"的旧结论是冷启
+  动假象,不是数据面属性。
+- 并行 listener 的收益点精确兑现:单流 ~6Gbps,8 流聚合 ~9Gbps。
+- juicity 综合最强:TCP 线速仅 0.26 核,UDP 单流 6.2G。
+- udp 分支引入的 `global.udp_warm_node_count` 在启动/重载时为选中的
+  UDP 组叶子预建会话,专门压缩生产环境的这段冷启动窗口。
+
 ## 结果(2026-07-31,honk dev `ac64fe1` vs dae kdae `eee7c88b`)
 
 实验室同时刻 A/B。honk 为 musl release 构建(mimalloc,周期性
