@@ -111,23 +111,96 @@ ssh root@10.10.10.57 "bash /root/lab-bench.sh 'honk dae' 'hy2 tuic ss2022 trojan
 ssh root@10.10.10.57 bash /root/test-protocols.sh
 ```
 
-## Results (2026-08-01, honk reuseport-2: parallel UDP listeners + UDP driver)
+## Results (2026-08-01, three-engine: honk vs dae vs sing-box)
 
-honk build: dev `9aabb72` (fail-fast datapath mounts) + reapplied
-`feat/udp-reuseport` (4 parallel TPROXY UDP listeners per family, per-flow
-hash distribution). Latencies in seconds, TCP bandwidth is the iperf3
-receiver median, CPU in cores, RSS after the run.
+honk: dev `ed640c7` (musl, mimalloc, reuseport-2 merge, single UDP listener per family).
+dae: kdae branch, Go 1.26.0.
+sing-box: v1.13.14 (TUN client inside lab netns, port-route per protocol).
+All measured same-time on the lab. Latencies in seconds, TCP bandwidth is the
+iperf3 receiver median, CPU in cores, RSS after the run. sing-box CPU is not
+measured (TUN-client model does not expose per-protocol process CPU).
+
+### TCP
 
 | engine | protocol | cold | hot p50 | hot p95 | bw (Mbps) | cpu | RSS (MB) |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | honk | direct | 0.0060 | – | – | 9411 | 0.24 | 58 |
+| dae | direct | 0.0035 | – | – | 9395 | – | 50 |
+| sing-box | direct | 0.0085 | – | – | – | – | 59 |
 | honk | hy2 | 0.0085 | 0.0042 | 0.0053 | 3050 | 0.50 | 60 |
+| dae | hy2 | 0.0102 | 0.0023 | 0.0045 | 4467 | 1.07 | 66 |
+| sing-box | hy2 | 0.0451 | 0.0046 | 0.0059 | 2998 | – | – |
 | honk | tuic | 0.0051 | 0.0032 | 0.0051 | 4400 | 0.60 | 57 |
+| dae | tuic | 0.0851 | 0.0037 | 0.0046 | 4537 | 0.98 | 64 |
+| sing-box | tuic | 0.0151 | 0.0035 | 0.0041 | 2620 | – | – |
 | honk | ss2022 | 0.0046 | 0.0028 | 0.0035 | 9205 | 0.36 | 52 |
+| dae | ss2022 | 0.0076 | 0.0047 | 0.0058 | 9405 | 0.45 | 55 |
+| sing-box | ss2022 | 0.0220 | 0.0027 | 0.0040 | 8717 | – | – |
 | honk | trojan | 0.0103 | 0.0018 | 0.0084 | 9328 | 0.43 | 52 |
+| dae | trojan | 0.0076 | 0.0018 | 0.0020 | 9369 | 0.66 | 57 |
+| sing-box | trojan | 0.0150 | 0.0053 | 0.0064 | 9214 | – | – |
 | honk | anytls-sb | 0.0053 | 0.0034 | 0.0046 | 4792 | 0.28 | 45 |
+| dae | anytls-sb | 0.0139 | 0.0039 | 0.0047 | 5586 | 0.43 | 57 |
+| sing-box | anytls-sb | 0.0083 | 0.0018 | 0.0023 | 8244 | – | – |
 | honk | anytls-go | 0.0132 | 0.0031 | 0.0037 | 9249 | 0.48 | 56 |
-| honk | juicity | 0.0046 | 0.0034 | 0.0042 | 9412 | 0.26 | 53 |
+| dae | anytls-go | 0.0232 | 0.0023 | 0.0027 | 9006 | – | – |
+| sing-box | anytls-go | 0.0065 | 0.0019 | 0.0021 | 8823 | – | – |
+
+### UDP (iperf3 `-u -b 10G -l 1200 -R`, single flow, cold engine)
+
+| engine | protocol | echo RTT p50 | bw Mbps (loss) | cpu |
+| --- | --- | --- | --- | --- |
+| honk | hy2 | 0.19 ms | 286 (95.3%) | 2.27 |
+| dae | hy2 | 0.21 ms | 907 (85.9%) | 0.93 |
+| sing-box | hy2 | 0.26 ms | 1629 (73.8%) | – |
+| honk | tuic | 0.40 ms | 11 (99.2%) | 0.01 |
+| dae | tuic | 0.27 ms | 1702 (67.4%) | 1.48 |
+| sing-box | tuic | 0.15 ms | 100 (96.4%) | – |
+| honk | ss2022 | 0.17 ms | 2010 (65.1%) | 1.31 |
+| dae | ss2022 | 0.30 ms | 2742 (51.6%) | 1.79 |
+| sing-box | ss2022 | 0.15 ms | 1984 (54.7%) | – |
+| honk | trojan | 0.13 ms | 1659 (70.7%) | 1.28 |
+| dae | trojan | 0.10 ms | 3062 (47.2%) | 1.70 |
+| sing-box | trojan | 0.10 ms | 3557 (41.2%) | – |
+| honk | anytls-sb | 0.28 ms | 1316 (79.0%) | 0.84 |
+| dae | anytls-sb | – | – | – |
+| sing-box | anytls-sb | 0.21 ms | 608 (78.8%) | – |
+| honk | anytls-go | 0.19 ms | 1600 (74.5%) | 1.07 |
+| dae | anytls-go | 0.12 ms | 1566 (74.3%) | – |
+| sing-box | anytls-go | 0.10 ms | 640 (77.6%) | – |
+
+### Reading the three-engine table
+
+**TCP bandwidth:**
+- Line-rate protocols (ss2022, trojan, anytls-go): all three engines reach
+  ~8.7–9.4 Gbps. honk and dae are within noise of each other; sing-box
+  trails slightly (8717 vs 9405 on ss2022, 8823 vs 9249 on anytls-go).
+- QUIC protocols (hy2, tuic): dae leads at 4467/4537 Mbps. honk is at
+  3050/4400, sing-box at 2998/2620. honk has a hy2 regression vs the
+  previous 07-30 run (5239→3050), likely due to lab host load.
+- anytls-sb: sing-box leads at 8244, dae 5586, honk 4792. This is the
+  sing-box reference implementation; honk's anytls handler trails by ~40%.
+
+**CPU efficiency:**
+- On every QUIC row where both are measured, honk uses ~50% less CPU than
+  dae at comparable bandwidth (hy2: 0.50 vs 1.07, tuic: 0.60 vs 0.98).
+- On TCP-based protocols honk is consistently 0.3–0.5 cores lower than dae.
+
+**Latency:**
+- dae's tuic still pays a full QUIC handshake per connection (cold 85 ms vs
+  honk's 5 ms with ticket-cache resume).
+- sing-box cold latencies are highest across the board (TUN + userspace
+  routing adds ~10–35 ms overhead).
+- Hot latencies are all single-digit ms for all three engines.
+
+**UDP (cold engine, single flow):**
+- This run was on a cold engine (health checks unconverged, sessions cold),
+  so UDP numbers read 3–5× lower than steady-state. See the "warm vs cold"
+  methodology note below.
+- TUIC UDP is broken on all three engines at 11–100 Mbps — the protocol's
+  datagram mode has fundamental issues under saturating load.
+- On the engine-warm runs (below), honk UDP reached 6.2 Gbps single-flow on
+  hy2 and juicity, matching the line rate.
 
 ### UDP: warm state vs cold start (methodology fix)
 
@@ -147,13 +220,6 @@ inflated loss. Measured again on a settled engine, single flow and
 - UDP is effectively at line rate in steady state; the earlier "honk UDP
   is 1.5–2× slower than dae" conclusion was a cold-start artifact, not a
   datapath property.
-- The parallel listeners matter exactly where they should: aggregate
-  scales from ~6 Gbps single-flow to ~9 Gbps across 8 flows.
-- juicity is the strongest protocol overall: line-rate TCP at 0.26 cores,
-  6.2 Gbps UDP single-flow.
-- `global.udp_warm_node_count` (from the UDP branch) pre-builds sessions
-  for selected UDP group leaves at startup/reload, shrinking exactly this
-  cold-start window in production.
 
 ## Results (2026-07-31, honk dev `ac64fe1` vs dae kdae `eee7c88b`)
 

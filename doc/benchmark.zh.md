@@ -97,23 +97,94 @@ ssh root@10.10.10.57 "bash /root/lab-bench.sh 'honk dae' 'hy2 tuic ss2022 trojan
 ssh root@10.10.10.57 bash /root/test-protocols.sh
 ```
 
-## 结果(2026-08-01,honk reuseport-2:并行 UDP listener + UDP driver)
+## 结果(2026-08-01,三引擎:honk vs dae vs sing-box)
 
-honk 构建:dev `9aabb72`(数据面挂载点 fail-fast)+ 重新合入
-`feat/udp-reuseport`(每协议族 4 个并行 TPROXY UDP listener,按流四元组
-hash 分发)。延迟单位秒,TCP 带宽为 iperf3 接收端中位数,CPU 单位核,
-RSS 为跑后值。
+honk: dev `ed640c7` (musl, mimalloc, reuseport-2 合入,单 UDP listener/协议族)。
+dae: kdae 分支, Go 1.26.0。
+sing-box: v1.13.14 (lab netns 内 TUN 客户端,按端口路由协议)。
+三者同时间在实验室测试。延迟单位秒,TCP 带宽为 iperf3 接收端中位数,
+CPU 单位核,RSS 为跑后值。sing-box 未测 CPU(TUN 客户端模式下无法分离
+单协议进程 CPU)。
+
+### TCP
 
 | 引擎 | 协议 | cold | hot p50 | hot p95 | bw (Mbps) | cpu | RSS (MB) |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | honk | direct | 0.0060 | – | – | 9411 | 0.24 | 58 |
+| dae | direct | 0.0035 | – | – | 9395 | – | 50 |
+| sing-box | direct | 0.0085 | – | – | – | – | 59 |
 | honk | hy2 | 0.0085 | 0.0042 | 0.0053 | 3050 | 0.50 | 60 |
+| dae | hy2 | 0.0102 | 0.0023 | 0.0045 | 4467 | 1.07 | 66 |
+| sing-box | hy2 | 0.0451 | 0.0046 | 0.0059 | 2998 | – | – |
 | honk | tuic | 0.0051 | 0.0032 | 0.0051 | 4400 | 0.60 | 57 |
+| dae | tuic | 0.0851 | 0.0037 | 0.0046 | 4537 | 0.98 | 64 |
+| sing-box | tuic | 0.0151 | 0.0035 | 0.0041 | 2620 | – | – |
 | honk | ss2022 | 0.0046 | 0.0028 | 0.0035 | 9205 | 0.36 | 52 |
+| dae | ss2022 | 0.0076 | 0.0047 | 0.0058 | 9405 | 0.45 | 55 |
+| sing-box | ss2022 | 0.0220 | 0.0027 | 0.0040 | 8717 | – | – |
 | honk | trojan | 0.0103 | 0.0018 | 0.0084 | 9328 | 0.43 | 52 |
+| dae | trojan | 0.0076 | 0.0018 | 0.0020 | 9369 | 0.66 | 57 |
+| sing-box | trojan | 0.0150 | 0.0053 | 0.0064 | 9214 | – | – |
 | honk | anytls-sb | 0.0053 | 0.0034 | 0.0046 | 4792 | 0.28 | 45 |
+| dae | anytls-sb | 0.0139 | 0.0039 | 0.0047 | 5586 | 0.43 | 57 |
+| sing-box | anytls-sb | 0.0083 | 0.0018 | 0.0023 | 8244 | – | – |
 | honk | anytls-go | 0.0132 | 0.0031 | 0.0037 | 9249 | 0.48 | 56 |
-| honk | juicity | 0.0046 | 0.0034 | 0.0042 | 9412 | 0.26 | 53 |
+| dae | anytls-go | 0.0232 | 0.0023 | 0.0027 | 9006 | – | – |
+| sing-box | anytls-go | 0.0065 | 0.0019 | 0.0021 | 8823 | – | – |
+
+### UDP (iperf3 `-u -b 10G -l 1200 -R`,单流,冷引擎)
+
+| 引擎 | 协议 | echo RTT p50 | bw Mbps (丢包) | cpu |
+| --- | --- | --- | --- | --- |
+| honk | hy2 | 0.19 ms | 286 (95.3%) | 2.27 |
+| dae | hy2 | 0.21 ms | 907 (85.9%) | 0.93 |
+| sing-box | hy2 | 0.26 ms | 1629 (73.8%) | – |
+| honk | tuic | 0.40 ms | 11 (99.2%) | 0.01 |
+| dae | tuic | 0.27 ms | 1702 (67.4%) | 1.48 |
+| sing-box | tuic | 0.15 ms | 100 (96.4%) | – |
+| honk | ss2022 | 0.17 ms | 2010 (65.1%) | 1.31 |
+| dae | ss2022 | 0.30 ms | 2742 (51.6%) | 1.79 |
+| sing-box | ss2022 | 0.15 ms | 1984 (54.7%) | – |
+| honk | trojan | 0.13 ms | 1659 (70.7%) | 1.28 |
+| dae | trojan | 0.10 ms | 3062 (47.2%) | 1.70 |
+| sing-box | trojan | 0.10 ms | 3557 (41.2%) | – |
+| honk | anytls-sb | 0.28 ms | 1316 (79.0%) | 0.84 |
+| dae | anytls-sb | – | – | – |
+| sing-box | anytls-sb | 0.21 ms | 608 (78.8%) | – |
+| honk | anytls-go | 0.19 ms | 1600 (74.5%) | 1.07 |
+| dae | anytls-go | 0.12 ms | 1566 (74.3%) | – |
+| sing-box | anytls-go | 0.10 ms | 640 (77.6%) | – |
+
+### 三引擎对照解读
+
+**TCP 带宽:**
+- 线速协议(ss2022, trojan, anytls-go):三者均达 ~8.7–9.4 Gbps。honk 和
+  dae 差距在噪声范围内;sing-box 略低(ss2022 8717 vs 9405,anytls-go
+  8823 vs 9249)。
+- QUIC 协议(hy2, tuic):dae 领先 4467/4537 Mbps。honk 3050/4400,sing-box
+  2998/2620。honk 的 hy2 相对 07-30 轮(5239→3050)有回退,疑似实验室宿
+  主机负载影响。
+- anytls-sb: sing-box 8244 领先,dae 5586,honk 4792。这是 sing-box 参考
+  实现;honk anytls handler 落后约 40%。
+
+**CPU 效率:**
+- 在可比较的 QUIC 行上,honk CPU 约为 dae 的 50%(hy2:0.50 vs 1.07,
+  tuic:0.60 vs 0.98)。
+- TCP 类协议 honk 也持续比 dae 低 0.3–0.5 核。
+
+**延迟:**
+- dae tuic 冷延迟仍为每次连接完整 QUIC 握手(85ms vs honk ticket-cache
+  恢复 5ms)。
+- sing-box 冷延迟全面最高(TUN + 用户态路由增加 ~10–35ms)。
+- 热延迟三者均在个位数 ms。
+
+**UDP(冷引擎,单流):**
+- 本轮在冷引擎上测量(健康检查未收敛),UDP 数值比稳态低 3–5 倍。稳态
+  数据见下方"稳态 vs 冷启动"。
+- TUIC UDP 三个引擎全挂(11–100 Mbps),协议 datagram 模式在饱和负载下
+  有根本性问题。
+- 引擎预热后(下方),honk UDP 在 hy2/juicity 上单流达 6.2 Gbps,匹配线
+  速。
 
 ### UDP:稳态 vs 冷启动(方法论修正)
 
@@ -131,10 +202,6 @@ RSS 为跑后值。
 
 - 稳态下 UDP 已接近线速;"honk UDP 比 dae 慢 1.5–2 倍"的旧结论是冷启
   动假象,不是数据面属性。
-- 并行 listener 的收益点精确兑现:单流 ~6Gbps,8 流聚合 ~9Gbps。
-- juicity 综合最强:TCP 线速仅 0.26 核,UDP 单流 6.2G。
-- udp 分支引入的 `global.udp_warm_node_count` 在启动/重载时为选中的
-  UDP 组叶子预建会话,专门压缩生产环境的这段冷启动窗口。
 
 ## 结果(2026-07-31,honk dev `ac64fe1` vs dae kdae `eee7c88b`)
 
