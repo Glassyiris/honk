@@ -32,7 +32,11 @@ use crate::stats::StatsManager;
 use bytes::Bytes;
 use drain::DrainTracker;
 use honk_config::node::{Group, GroupPolicy};
-use honk_config::{Config, node::Node, types::DialMode};
+use honk_config::{
+    Config,
+    node::Node,
+    types::{DialMode, NodeProtocol},
+};
 use honk_ebpf_common::*;
 use honk_outbound::alive::{AliveDialerSet, IpVersion, ProbeDomain};
 use janitor::BpfJanitor;
@@ -909,7 +913,20 @@ impl ControlPlane {
                 count.min(config.nodes.len())
             };
             let max_concurrent = if count == 0 { 4usize } else { count.min(8) };
-            let nodes: Vec<_> = config.nodes.iter().take(effective_count).cloned().collect();
+            // QUIC nodes can't reuse a bare TCP dial (pool_bare_tcp = false),
+            // so depositing one only poisons the first flow on it.
+            let nodes: Vec<_> = config
+                .nodes
+                .iter()
+                .filter(|node| {
+                    !matches!(
+                        node.protocol,
+                        NodeProtocol::Tuic | NodeProtocol::Juicity | NodeProtocol::Hysteria2
+                    )
+                })
+                .take(effective_count)
+                .cloned()
+                .collect();
             drop(config);
 
             if !nodes.is_empty() {

@@ -350,7 +350,10 @@ impl RealEbpfBackend {
         // master's TC hooks; it is switched directly between slave ports.
         // Attach the LAN programs to each bridge slave so container traffic
         // is intercepted.
-        let mut bridge_slave_links = Vec::new();
+        // Slave links go into `dynamic_links` (keyed by ifindex/direction):
+        // without that the watcher's `dynamic_hooked` dedup never sees them
+        // and retries the attach every tick, failing with AlreadyExists.
+        let mut dynamic_links = Vec::new();
         let br_slaves = Self::bridge_slaves(&ebpf_lan_ifname);
         if !br_slaves.is_empty() {
             info!(
@@ -382,7 +385,7 @@ impl RealEbpfBackend {
                     let id = p.attach(slave, ingress_dir).map_err(|e| {
                         anyhow::anyhow!("attach {} to {}: {}", slave_prog, slave, e)
                     })?;
-                    bridge_slave_links.push(p.take_link(id)?);
+                    dynamic_links.push((Self::iface_ifindex(slave), false, p.take_link(id)?));
                     Ok(())
                 })();
                 // A slave we cannot attach silently leaves that traffic
@@ -403,7 +406,7 @@ impl RealEbpfBackend {
                     let id = p
                         .attach(slave, egress_dir)
                         .map_err(|e| anyhow::anyhow!("attach lan_egress_l2 to {}: {}", slave, e))?;
-                    bridge_slave_links.push(p.take_link(id)?);
+                    dynamic_links.push((Self::iface_ifindex(slave), true, p.take_link(id)?));
                     Ok(())
                 })();
                 egress_result.map_err(|e| {
@@ -583,8 +586,7 @@ impl RealEbpfBackend {
             wan_ingress_link,
             lan_slave_links,
             wan_slave_links,
-            bridge_slave_links,
-            dynamic_links: Vec::new(),
+            dynamic_links,
             dae0_ingress_link: None,
             dae0peer_ingress_link: None,
             sk_lookup_link: None,

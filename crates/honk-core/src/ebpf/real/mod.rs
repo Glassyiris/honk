@@ -60,12 +60,9 @@ pub struct RealEbpfBackend {
     /// Additional egress links for bond slaves. Outbound packets leaving a bond
     /// slave may bypass the master's egress qdisc, so attach wan_egress there too.
     wan_slave_links: Vec<aya::programs::tc::SchedClassifierLink>,
-    /// Additional ingress/egress links for bridge slaves. Linux bridge masters
-    /// do not see forwarded L2 traffic on their TC hooks, so we attach the LAN
-    /// programs to each slave veth instead.
-    bridge_slave_links: Vec<aya::programs::tc::SchedClassifierLink>,
-    /// Links installed by dynamic attach (extra startup interfaces and the
-    /// interface watcher), keyed by (ifindex, is_egress).  Keeping them here
+    /// Links installed by dynamic attach (startup bridge slaves, extra
+    /// startup interfaces, and the interface watcher), keyed by (ifindex,
+    /// is_egress).  Keeping them here
     /// serves three purposes: the fd stays alive until `detach_hooks`, the
     /// watcher can drop dead links when a device vanishes, and the (ifindex,
     /// direction) pair dedupes retries after a partial failure.
@@ -843,7 +840,6 @@ impl EbpfBackend for RealEbpfBackend {
         self.wan_ingress_link = None;
         self.lan_slave_links.clear();
         self.wan_slave_links.clear();
-        self.bridge_slave_links.clear();
         self.dynamic_links.clear();
         self.dae0_ingress_link = None;
         self.dae0peer_ingress_link = None;

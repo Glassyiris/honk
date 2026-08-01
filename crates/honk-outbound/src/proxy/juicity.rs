@@ -396,6 +396,12 @@ impl ProxyHandler for JuicityHandler {
         anyhow::bail!("Juicity runs over QUIC; a bare TCP connection cannot be reused")
     }
 
+    /// QUIC-based: a pooled bare TCP is unusable, so preconnect warmup must
+    /// not deposit one (it would poison the first flow through `dial_with_tcp`).
+    fn pool_bare_tcp(&self, _node: &Node) -> bool {
+        false
+    }
+
     async fn test_connectivity(&self, node: &Node) -> bool {
         match self.client_for(node).await {
             // Zero auth grace on the dial path (tuic parity): wait ~1 RTT
