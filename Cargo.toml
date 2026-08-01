@@ -131,9 +131,8 @@ lto = true
 codegen-units = 1
 strip = true
 
-
-# Explicit benchmark profiles: compare optimization goal (size vs speed)
-# independently from link-time optimization mode (fat vs thin).
+# Keep the shipping profile size-oriented; opt-in profiles isolate LLVM
+# optimization and LTO effects for controlled benchmarks.
 [profile.release-size]
 inherits = "release"
 opt-level = "s"
@@ -161,6 +160,7 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
+
 # Static musl build for portable deployment (VyOS/Debian/etc.)
 [profile.release-musl]
 inherits = "release"

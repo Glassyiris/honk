@@ -60,12 +60,13 @@ export HOOK_LOG="$tmp/hook.log"
 
 "$script" --help >/dev/null
 "$script" --all-targets --dry-run --output "$tmp/plan" >/dev/null
-python3 - "$tmp/plan/matrix.jsonl" "$tmp/plan/matrix.csv" <<'PY'
+python3 - "$tmp/plan/matrix.jsonl" "$tmp/plan/matrix.csv" "$tmp/plan/machine.json" <<'PY'
 import csv
 import json
 import sys
 
-with open(sys.argv[1], encoding="utf-8") as source:
+matrix_json, matrix_csv, machine_json = sys.argv[1:]
+with open(matrix_json, encoding="utf-8") as source:
     rows = [json.loads(line) for line in source]
 assert len(rows) == 48
 assert {row["target"].split("-")[0] for row in rows} == {"x86_64", "aarch64"}
@@ -74,8 +75,12 @@ assert {row["profile"] for row in rows} == {
 }
 assert {row["allocator"] for row in rows} == {"mimalloc", "stock"}
 assert len({row["target_dir"] for row in rows}) == 48
-with open(sys.argv[2], encoding="utf-8", newline="") as source:
+with open(matrix_csv, encoding="utf-8", newline="") as source:
     assert len(list(csv.DictReader(source))) == 48
+with open(machine_json, encoding="utf-8") as source:
+    machine = json.load(source)
+assert "cpu_governors" in machine
+assert "turbo_enabled" in machine
 PY
 
 "$script" \

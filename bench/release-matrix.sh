@@ -167,6 +167,7 @@ import json
 import os
 import platform
 import subprocess
+from pathlib import Path
 import sys
 
 output, repo = sys.argv[1:]
@@ -190,6 +191,28 @@ def cpu_model():
         pass
     return platform.processor() or None
 
+def read_optional(path):
+    try:
+        return Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+
+def cpu_governors():
+    values = {
+        path.read_text(encoding="utf-8").strip()
+        for path in Path("/sys/devices/system/cpu/cpufreq").glob("policy*/scaling_governor")
+    }
+    return sorted(values)
+
+def turbo_enabled():
+    no_turbo = read_optional("/sys/devices/system/cpu/intel_pstate/no_turbo")
+    if no_turbo is not None:
+        return no_turbo == "0"
+    boost = read_optional("/sys/devices/system/cpu/cpufreq/boost")
+    if boost is not None:
+        return boost == "1"
+    return None
+
 metadata = {
     "schema_version": 1,
     "hostname": platform.node(),
@@ -198,6 +221,8 @@ metadata = {
     "architecture": platform.machine(),
     "cpu_model": cpu_model(),
     "logical_cpus": os.cpu_count(),
+    "cpu_governors": cpu_governors(),
+    "turbo_enabled": turbo_enabled(),
     "rustc": command("rustc", "--version", "--verbose"),
     "cargo": command("cargo", "--version", "--verbose"),
     "commit": command("git", "rev-parse", "HEAD"),

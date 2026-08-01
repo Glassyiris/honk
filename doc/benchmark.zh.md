@@ -523,8 +523,28 @@ bench/release-matrix.sh --all-targets --dry-run --output /tmp/honk-release-matri
 ```
 
 主机实测需要提供可执行的 `--benchmark-hook`；其 RSS/PSS/fault/CPU/latency 字段
-契约可由 `bench/release-matrix.sh --help` 查看。只能在同一机器和 workload 下比较
-cell。该矩阵记录证据；没有部署吞吐与尾延迟结果时，不据此切换发布 profile。
+契约可由 `bench/release-matrix.sh --help` 查看。完整矩阵期间必须把所有 CPU
+policy 固定到同一 governor，并保持 turbo 状态不变；`machine.json` 会记录两项
+设置。只能在同一机器和 workload 下比较 cell。该矩阵记录证据；没有部署吞吐
+与尾延迟结果时，不据此切换发布 profile。
+
+profile 晋级采用显式门禁，不能只看二进制尺寸。以 `release-size` 为基线，同一
+实验室的五轮配对结果中，candidate 的每项吞吐回退不得超过 3%、每项 p99
+延迟回退不得超过 5%、RSS 增幅不得超过 20%。三个门禁全部通过前，发布默认
+保持尺寸版。
+
+2026-08-02 完成了一轮初步配对部署：x86_64 musl、mimalloc、60 秒 collect，
+对比 `release-size` 与 `release-speed`。每个协议执行三轮 8 秒反向吞吐；
+warm-up 后另测 200 次请求的尾延迟。
+
+| profile | 二进制 | direct | hy2 | tuic | 最大 RSS | hy2 p99 | tuic p99 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| release-size | 19.50 MB | 9.407 Gbps | 2.756 Gbps | 4.253 Gbps | 56 MB | 5.426 ms | 4.705 ms |
+| release-speed | 24.79 MB | 9.388 Gbps | 3.314 Gbps | 5.152 Gbps | 59 MB | 3.409 ms | 3.136 ms |
+
+速度版没有吞吐或 p99 回退，最大 RSS 增加 5.4%，因此这一个样本通过数值门禁。
+但单轮配对尚未满足五轮证据要求，且二进制增大 27.2%，所以不执行晋级，
+`release-size` 继续作为默认。
 
 ## 生产备注(10.10.10.1 网关)
 

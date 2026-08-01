@@ -3,6 +3,7 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -176,6 +177,7 @@ jobs:
     name: GitHub Release
     needs: [test, build]
     runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v5

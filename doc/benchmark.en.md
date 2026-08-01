@@ -578,9 +578,32 @@ bench/release-matrix.sh --all-targets --dry-run --output /tmp/honk-release-matri
 
 A measured host run requires an executable `--benchmark-hook`; the hook contract
 and required RSS/PSS/fault/CPU/latency fields are printed by
-`bench/release-matrix.sh --help`. Compare cells only on the same machine and
-workload. The matrix records evidence; it does not select a new shipping profile
-without deployment throughput and tail-latency results.
+`bench/release-matrix.sh --help`. Pin every CPU policy to one governor and keep
+turbo in one state for the full matrix; `machine.json` records both settings.
+Compare cells only on the same machine and workload. The matrix records
+evidence; it does not select a new shipping profile without deployment
+throughput and tail-latency results.
+
+Promotion is gated, not inferred from binary size alone. Against the
+`release-size` baseline, a candidate must keep every measured throughput
+regression within 3%, every p99 latency regression within 5%, and RSS growth
+within 20% over five paired runs on the same lab. The size profile remains the
+shipping default until all three gates pass.
+
+One preliminary paired deployment run on 2026-08-02 compared
+`release-size` and `release-speed` for x86_64 musl with mimalloc and the
+60-second collector. Each protocol used three 8-second reverse-throughput runs;
+the tail check used 200 requests after warm-up.
+
+| profile | binary | direct | hy2 | tuic | max RSS | hy2 p99 | tuic p99 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| release-size | 19.50 MB | 9.407 Gbps | 2.756 Gbps | 4.253 Gbps | 56 MB | 5.426 ms | 4.705 ms |
+| release-speed | 24.79 MB | 9.388 Gbps | 3.314 Gbps | 5.152 Gbps | 59 MB | 3.409 ms | 3.136 ms |
+
+The speed profile had no throughput or p99 regression and increased maximum
+RSS by 5.4%, so this sample passes the numerical gates. It is not a promotion:
+one paired run is below the five-run evidence requirement, and its binary is
+27.2% larger. `release-size` therefore remains the default.
 
 ## Production notes (10.10.10.1 gateway)
 

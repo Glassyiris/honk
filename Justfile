@@ -42,7 +42,7 @@ build-musl:
 # rustflags (--btf, debuginfo) — the object then silently loses its .BTF
 # section and aya refuses to load it ("no BTF parsed for object").
 build-ebpf:
-    @test -z "$RUSTFLAGS" || echo "warning: RUSTFLAGS is set and overrides crates/honk-ebpf/.cargo/config.toml (--btf) — the object may lack .BTF"
+    @test -z "${RUSTFLAGS:-}" || echo "warning: RUSTFLAGS is set and overrides crates/honk-ebpf/.cargo/config.toml (--btf) — the object may lack .BTF"
     cd crates/honk-ebpf && cargo +nightly build --release -Zbuild-std=core --target bpfel-unknown-none
     @readelf -S crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf | grep -q '\.BTF' \
         || (echo "error: eBPF object has no .BTF section (see RUSTFLAGS note above)" && exit 1)
