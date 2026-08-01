@@ -131,6 +131,36 @@ lto = true
 codegen-units = 1
 strip = true
 
+
+# Explicit benchmark profiles: compare optimization goal (size vs speed)
+# independently from link-time optimization mode (fat vs thin).
+[profile.release-size]
+inherits = "release"
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+strip = true
+
+[profile.release-size-thin]
+inherits = "release"
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.release-speed]
+inherits = "release"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+
+[profile.release-speed-thin]
+inherits = "release"
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
 # Static musl build for portable deployment (VyOS/Debian/etc.)
 [profile.release-musl]
 inherits = "release"

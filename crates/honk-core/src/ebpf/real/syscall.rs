@@ -11,7 +11,7 @@ use std::ffi::c_long;
 pub const ENOENT: c_long = libc::ENOENT as c_long;
 
 /// Callback invoked once per batch chunk by [`bpf_lookup_batch_scan_cb`].
-pub type BatchVisitor<'a, K, V> = dyn FnMut(&[(K, V)]) + 'a;
+pub type BatchVisitor<'a, K, V> = dyn FnMut(&[(K, V)]) -> bool + 'a;
 
 /// Call the `bpf()` syscall.  Returns `Ok(())` on success, `Err(errno)`.
 ///
@@ -247,6 +247,33 @@ pub fn bpf_lookup_and_delete(
     }
 }
 
+/// Decode entries returned by one lookup-batch syscall. Linux writes the
+/// processed count even when it returns terminal `ENOENT`.
+fn decode_lookup_batch<K: Copy, V: Copy>(
+    keys_buf: &[u8],
+    vals_buf: &[u8],
+    count: u32,
+    mut emit: impl FnMut(K, V),
+) {
+    let ksz = core::mem::size_of::<K>();
+    let vsz = core::mem::size_of::<V>();
+    for i in 0..(count as usize).min(BPF_BATCH_CHUNK) {
+        let key = unsafe { core::ptr::read_unaligned(keys_buf[i * ksz..].as_ptr() as *const K) };
+        let value = unsafe { core::ptr::read_unaligned(vals_buf[i * vsz..].as_ptr() as *const V) };
+        emit(key, value);
+    }
+}
+
+/// A terminal `ENOENT` still carries entries in `count`; it merely marks the
+/// end of this scan.
+fn lookup_batch_result(result: Result<(), c_long>, count: u32) -> Result<(usize, bool), c_long> {
+    match result {
+        Ok(()) => Ok(((count as usize).min(BPF_BATCH_CHUNK), false)),
+        Err(ENOENT) => Ok(((count as usize).min(BPF_BATCH_CHUNK), true)),
+        Err(error) => Err(error),
+    }
+}
+
 /// Scan the whole map into `out` with `BPF_MAP_LOOKUP_BATCH` (hash/LRU-hash
 /// maps, kernel 5.6+), one syscall per [`BPF_BATCH_CHUNK`] entries.
 ///
@@ -287,8 +314,6 @@ pub fn bpf_lookup_batch_scan<K: Copy, V: Copy>(
         attr.batch.count = BPF_BATCH_CHUNK as u32;
         let res = unsafe { bpf_syscall(BPF_MAP_LOOKUP_BATCH as c_long, &mut attr) };
         if !cap.observe(res) {
-            // Restore `out` so the per-key fallback does not see a partial
-            // batch scan on top of its own results.
             out.truncate(initial_len);
             debug!(
                 "bpf lookup_batch({}) unsupported, using GET_NEXT_KEY walk",
@@ -296,38 +321,20 @@ pub fn bpf_lookup_batch_scan<K: Copy, V: Copy>(
             );
             return Ok(false);
         }
-        match res {
-            Ok(()) => {
-                // Read back how many entries the kernel wrote (union
-                // field → unsafe).  Only valid on success.
-                let n = unsafe { attr.batch.count } as usize;
-                for i in 0..n {
-                    let k = unsafe {
-                        core::ptr::read_unaligned(keys_buf[i * ksz..].as_ptr() as *const K)
-                    };
-                    let v = unsafe {
-                        core::ptr::read_unaligned(vals_buf[i * vsz..].as_ptr() as *const V)
-                    };
-                    out.push((k, v));
-                }
-                // A full chunk means there may be more; continue from
-                // out_batch.  A short chunk marks the end of the map.
-                if n == BPF_BATCH_CHUNK {
-                    in_batch = Some(next_key.clone());
-                } else {
-                    return Ok(true);
-                }
-            }
-            // ENOENT: this call processed no entries (empty map or the
-            // continuation key already passed the last entry) — the scan
-            // is complete.  `attr.batch.count` is not consumed here, so a
-            // kernel that leaves it untouched cannot inject stale data.
-            Err(ENOENT) => return Ok(true),
-            Err(e) => {
+        let (n, terminal) = match lookup_batch_result(res, unsafe { attr.batch.count }) {
+            Ok(result) => result,
+            Err(error) => {
                 out.truncate(initial_len);
-                return Err(anyhow::anyhow!("bpf lookup_batch({}) errno={}", map, e));
+                return Err(anyhow::anyhow!("bpf lookup_batch({}) errno={}", map, error));
             }
+        };
+        decode_lookup_batch(&keys_buf, &vals_buf, n as u32, |key, value| {
+            out.push((key, value))
+        });
+        if terminal || n < BPF_BATCH_CHUNK {
+            return Ok(true);
         }
+        in_batch = Some(next_key.clone());
     }
 }
 
@@ -368,33 +375,21 @@ pub fn bpf_lookup_batch_scan_cb<K: Copy, V: Copy>(
             );
             return Ok(false);
         }
-        match res {
-            Ok(()) => {
-                let n = unsafe { attr.batch.count } as usize;
-                chunk.clear();
-                for i in 0..n {
-                    let k = unsafe {
-                        core::ptr::read_unaligned(keys_buf[i * ksz..].as_ptr() as *const K)
-                    };
-                    let v = unsafe {
-                        core::ptr::read_unaligned(vals_buf[i * vsz..].as_ptr() as *const V)
-                    };
-                    chunk.push((k, v));
-                }
-                if !chunk.is_empty() {
-                    visit(&chunk);
-                }
-                if n == BPF_BATCH_CHUNK {
-                    in_batch = Some(next_key.clone());
-                } else {
-                    return Ok(true);
-                }
-            }
-            Err(ENOENT) => return Ok(true),
-            Err(e) => {
-                return Err(anyhow::anyhow!("bpf lookup_batch({}) errno={}", map, e));
-            }
+        let (n, terminal) = match lookup_batch_result(res, unsafe { attr.batch.count }) {
+            Ok(result) => result,
+            Err(error) => return Err(anyhow::anyhow!("bpf lookup_batch({}) errno={}", map, error)),
+        };
+        chunk.clear();
+        decode_lookup_batch(&keys_buf, &vals_buf, n as u32, |key, value| {
+            chunk.push((key, value))
+        });
+        if !chunk.is_empty() && !visit(&chunk) {
+            return Ok(true);
         }
+        if terminal || n < BPF_BATCH_CHUNK {
+            return Ok(true);
+        }
+        in_batch = Some(next_key.clone());
     }
 }
 
@@ -479,4 +474,38 @@ pub fn bpf_update_batch<K: Copy, V: Copy>(
     }
     res.map_err(|e| anyhow::anyhow!("bpf update_batch({}) errno={}", map, e))?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_enoent_preserves_partial_count() {
+        for count in [0, 1, 127, 128, 129, 255] {
+            let (returned, terminal) = lookup_batch_result(Err(ENOENT), count).unwrap();
+            assert!(terminal);
+            assert_eq!(returned, (count as usize).min(BPF_BATCH_CHUNK));
+        }
+    }
+
+    #[test]
+    fn decodes_only_reported_entries() {
+        let keys = [10u32, 20, 30];
+        let values = [100u32, 200, 300];
+        let keys_buf = unsafe {
+            core::slice::from_raw_parts(keys.as_ptr() as *const u8, core::mem::size_of_val(&keys))
+        };
+        let values_buf = unsafe {
+            core::slice::from_raw_parts(
+                values.as_ptr() as *const u8,
+                core::mem::size_of_val(&values),
+            )
+        };
+        let mut decoded = Vec::new();
+        decode_lookup_batch(keys_buf, values_buf, 2, |key, value| {
+            decoded.push((key, value))
+        });
+        assert_eq!(decoded, vec![(10, 100), (20, 200)]);
+    }
 }

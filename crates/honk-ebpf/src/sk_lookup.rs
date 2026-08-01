@@ -36,7 +36,9 @@ pub(crate) const KEY_UDP6_BASE: u32 = KEY_UDP4_BASE + UDP_LISTENER_COUNT;
 /// Flow-consistent spread over the parallel UDP listeners.
 #[inline(always)]
 pub(crate) fn listener_hash(a: u32, b: u32, c: u32, d: u32) -> u32 {
-    (a.wrapping_add(b.rotate_left(8)).wrapping_add(c.rotate_left(16)) ^ d)
+    (a.wrapping_add(b.rotate_left(8))
+        .wrapping_add(c.rotate_left(16))
+        ^ d)
         % UDP_LISTENER_COUNT
 }
 

@@ -28,7 +28,7 @@ pub(super) struct ExecutionContext<'a> {
     pub(super) prepared: &'a PreparedQuery,
     pub(super) raw_query: &'a [u8],
     pub(super) original_dst: Option<SocketAddr>,
-    pub(super) cache_key: String,
+    pub(super) cache_key: CacheKey,
     pub(super) refresh_key: CacheKey,
     pub(super) logical_upstream: UpstreamTag,
     pub(super) request_scope: RequestScope,
@@ -121,26 +121,15 @@ pub(crate) async fn resolve_with_owner(
     }
 
     let (logical_upstream, request_scope) = request_exchange(&prepared)?;
-    let resolve_key = CacheKey::new(
-        prepared.query(),
-        engine.policy_id().cloned(),
-        request_scope.clone(),
-        OperationKind::Resolve,
-    );
-    let cache_key = resolve_key.storage_key();
-    let refresh_key = CacheKey::new(
-        prepared.query(),
-        engine.policy_id().cloned(),
-        request_scope.clone(),
-        OperationKind::Refresh,
-    );
+    let resolve_key = prepared.cache_key(request_scope.clone(), OperationKind::Resolve);
+    let refresh_key = resolve_key.with_operation(OperationKind::Refresh);
     let context = ExecutionContext {
         forwarder,
         engine: &engine,
         prepared: &prepared,
         raw_query,
         original_dst,
-        cache_key,
+        cache_key: resolve_key,
         refresh_key,
         logical_upstream,
         request_scope: request_scope.clone(),
@@ -166,18 +155,11 @@ pub(crate) async fn resolve_with_owner(
     } else {
         OperationKind::Resolve
     };
-    let flight_key = CacheKey::new(
-        prepared.query(),
-        engine.policy_id().cloned(),
-        request_scope.clone(),
-        operation,
-    );
+    let flight_key = context.cache_key.with_operation(operation);
     let flights = forwarder.cache_service().await.singleflight();
     loop {
         match flights.acquire(flight_key.clone()) {
-            FlightRole::Bypass => {
-                return operation::run(&context).await;
-            }
+            FlightRole::Rejected => return Err(DnsForwardError::Overloaded),
             FlightRole::Ready(template) => {
                 return flight::waiter_outcome(&context, template).await;
             }

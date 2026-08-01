@@ -67,7 +67,13 @@ impl GroupManager {
     ) -> Option<&Node> {
         let group = self.groups.get(group_name)?;
         self.mark_used(group_name);
-        let mut visited = Vec::new();
+        // The overwhelmingly common selector has only direct members. Avoid
+        // constructing its transient candidate/visited vectors; nested
+        // groups still take the guarded recursive path below.
+        if group.policy == GroupPolicy::Selector && group.groups.is_empty() {
+            return self.pick_direct_selector(group, domain, ipver);
+        }
+        let mut visited = Vec::with_capacity(MAX_GROUP_DEPTH);
         self.pick_in_group(
             group,
             domain,
@@ -524,13 +530,20 @@ impl GroupManager {
         *self.interrupt_callback.write() = cb;
     }
 
-    /// Record group activity: updates the idle-timeout timestamp and wakes
-    /// URLTest group health checks in the alive set.
+    /// Record group activity: updates idle tracking only for groups that
+    /// actually configure an idle timeout, then wakes URLTest health checks.
     fn mark_used(&self, group_name: &str) {
-        self.last_used
-            .write()
-            .insert(group_name.to_string(), Instant::now());
-        if let Some(ref alive) = self.alive_set {
+        if self
+            .groups
+            .get(group_name)
+            .and_then(|group| group.idle_timeout)
+            .is_some_and(|timeout| timeout > 0)
+        {
+            self.last_used
+                .write()
+                .insert(group_name.to_string(), Instant::now());
+        }
+        if let Some(alive) = &self.alive_set {
             alive.mark_group_active(group_name);
         }
     }
@@ -745,6 +758,49 @@ impl GroupManager {
             .into_iter()
             .filter(|c| self.is_node_selectable_for_domain(&c.node.name, domain, ipver))
             .collect()
+    }
+
+    /// Allocation-free selector fast path for a group with direct members
+    /// only. It preserves selector precedence and liveness/custom-URL
+    /// eligibility while the recursive path retains nested cycle guards.
+    fn pick_direct_selector<'a>(
+        &'a self,
+        group: &'a Group,
+        domain: ProbeDomain,
+        ipver: IpVersion,
+    ) -> Option<&'a Node> {
+        let selectable = |node: &&Node| {
+            if domain == ProbeDomain::Tcp
+                && let Some(url) = group.check_url.as_deref()
+                && let Some(alive) = &self.alive_set
+            {
+                alive.is_alive_for_url(&node.name, url)
+            } else {
+                self.is_node_selectable_for_domain(&node.name, domain, ipver)
+            }
+        };
+        let find = |tag: &str| {
+            group
+                .nodes
+                .iter()
+                .filter_map(|id| self.nodes.get(id))
+                .find(|node| node.name == tag && selectable(node))
+        };
+        if let Some(choice) = self.selector_choice.read().get(&group.name)
+            && let Some(node) = find(choice)
+        {
+            return Some(node);
+        }
+        if let Some(default) = group.default.as_deref()
+            && let Some(node) = find(default)
+        {
+            return Some(node);
+        }
+        group
+            .nodes
+            .iter()
+            .filter_map(|id| self.nodes.get(id))
+            .find(selectable)
     }
 
     /// Selector policy: runtime choice, then `group.default`, then first

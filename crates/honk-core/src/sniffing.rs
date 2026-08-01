@@ -37,8 +37,8 @@ use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::debug;
 
-/// Maximum bytes to read for TLS ClientHello sniffing.
-/// The ClientHello is typically < 512 bytes but can be larger with many extensions.
+/// Maximum bytes buffered while sniffing TLS ClientHello or HTTP headers.
+/// This is a hard bound: untrusted length fields never grow the buffer.
 const MAX_CLIENT_HELLO_SIZE: usize = 4096;
 
 /// Supported traffic types detected by sniffing.
@@ -100,50 +100,36 @@ impl SniffResult {
 /// A `SniffResult` containing the extracted domain (if any) and
 /// the buffered initial bytes that must be forwarded.
 pub async fn sniff_tcp(stream: &mut (impl AsyncRead + Unpin)) -> SniffResult {
+    const SNIFF_DEADLINE: std::time::Duration = std::time::Duration::from_millis(100);
+    let deadline = tokio::time::Instant::now() + SNIFF_DEADLINE;
     let mut buf = BytesMut::with_capacity(MAX_CLIENT_HELLO_SIZE);
 
-    match tokio::time::timeout(std::time::Duration::from_millis(100), async {
-        loop {
-            buf.reserve(512);
-            let n = stream.read_buf(&mut buf).await?;
+    loop {
+        let required = sniff_required_len(&buf);
+        if required <= buf.len() || buf.len() == MAX_CLIENT_HELLO_SIZE {
+            break;
+        }
 
-            if n == 0 {
-                break; // EOF
+        let mut chunk = [0u8; 512];
+        let want = (required - buf.len()).min(chunk.len());
+        match tokio::time::timeout_at(deadline, stream.read(&mut chunk[..want])).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
+            Err(_) => {
+                debug!(bytes = buf.len(), "TCP sniffing timed out");
+                break;
             }
-
-            if buf.len() >= 5 {
+            Ok(Err(e)) => {
+                debug!(bytes = buf.len(), error = %e, "TCP sniffing read failed");
                 break;
             }
         }
-        Ok::<_, std::io::Error>(())
-    })
-    .await
-    {
-        Err(_) => {
-            debug!("SNI sniffing timed out, treating as unknown traffic");
-            return SniffResult::unknown();
-        }
-        Ok(Err(_)) => {
-            return SniffResult::unknown();
-        }
-        _ => {}
     }
 
     let data = buf.to_vec();
-
-    if data.len() < 5 {
-        debug!("SNI sniffing: insufficient data ({} bytes)", data.len());
-        return SniffResult {
-            traffic_type: TrafficType::Unknown,
-            domain: None,
-            buffered: data,
-        };
-    }
-
     if let Some(sni) = parse_tls_sni(&data) {
         return SniffResult::tls_sni(sni, data);
     }
-
     if let Some(host) = parse_http_host(&data) {
         return SniffResult {
             traffic_type: TrafficType::Http {
@@ -153,13 +139,68 @@ pub async fn sniff_tcp(stream: &mut (impl AsyncRead + Unpin)) -> SniffResult {
             buffered: data,
         };
     }
-
-    debug!("SNI sniffing: unknown protocol");
     SniffResult {
         traffic_type: TrafficType::Unknown,
         domain: None,
         buffered: data,
     }
+}
+
+/// Return the prefix length needed to make a bounded sniffing decision.
+/// TLS waits for its declared first record and ClientHello handshake; HTTP
+/// waits for the complete header terminator.  Unknown protocols get only the
+/// initial five-byte classification prefix, avoiding an unnecessary delay.
+fn sniff_required_len(data: &[u8]) -> usize {
+    if data.is_empty() {
+        return 1;
+    }
+    if data[0] == 0x16 {
+        if data.len() < 5 {
+            return 5;
+        }
+        let record_end = 5 + u16::from_be_bytes([data[3], data[4]]) as usize;
+        if record_end > MAX_CLIENT_HELLO_SIZE {
+            return MAX_CLIENT_HELLO_SIZE;
+        }
+        if data.len() < 9 {
+            return record_end;
+        }
+        if data[5] != 0x01 {
+            return record_end;
+        }
+        let hello_end = 9 + u24_from_be(&data[6..9]) as usize;
+        return record_end.max(hello_end).min(MAX_CLIENT_HELLO_SIZE);
+    }
+    if is_http_request_prefix(data) {
+        return if data.windows(4).any(|window| window == b"\r\n\r\n") {
+            data.len()
+        } else {
+            MAX_CLIENT_HELLO_SIZE
+        };
+    }
+    if data
+        .iter()
+        .all(|byte| byte.is_ascii_graphic() || *byte == b'\r' || *byte == b'\n' || *byte == b'\t')
+    {
+        return MAX_CLIENT_HELLO_SIZE;
+    }
+    5
+}
+
+/// Whether `data` can still be the start of a supported HTTP request method.
+fn is_http_request_prefix(data: &[u8]) -> bool {
+    const METHODS: &[&[u8]] = &[
+        b"GET ",
+        b"POST ",
+        b"CONNECT ",
+        b"HEAD ",
+        b"PUT ",
+        b"DELETE ",
+        b"OPTIONS ",
+    ];
+    METHODS
+        .iter()
+        .any(|method| method.starts_with(data) || data.starts_with(method))
 }
 
 /// Parse TLS ClientHello and extract the SNI hostname.
@@ -422,6 +463,7 @@ fn is_valid_hostname(hostname: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
 
     /// Build a minimal TLS ClientHello with SNI.
     fn build_tls_client_hello(sni: &str) -> Vec<u8> {
@@ -457,6 +499,7 @@ mod tests {
 
         // Fix handshake length
         let handshake_body_len = handshake.len() - 4; // minus type + 3-byte length
+
         handshake[1] = ((handshake_body_len >> 16) & 0xff) as u8;
         handshake[2] = ((handshake_body_len >> 8) & 0xff) as u8;
         handshake[3] = (handshake_body_len & 0xff) as u8;
@@ -468,6 +511,51 @@ mod tests {
         buf.extend_from_slice(&handshake);
 
         buf
+    }
+    #[tokio::test]
+    async fn sniff_tcp_reassembles_fragmented_client_hello() {
+        let hello = build_tls_client_hello("fragmented.example");
+        let (mut writer, mut reader) = tokio::io::duplex(8192);
+        let producer = tokio::spawn(async move {
+            for chunk in hello.chunks(3) {
+                writer.write_all(chunk).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let sniffed = sniff_tcp(&mut reader).await;
+        producer.await.unwrap();
+        assert_eq!(sniffed.domain.as_deref(), Some("fragmented.example"));
+        assert_eq!(
+            sniffed.buffered,
+            build_tls_client_hello("fragmented.example")
+        );
+    }
+
+    #[tokio::test]
+    async fn sniff_tcp_reassembles_fragmented_http_header() {
+        let request = b"GET / HTTP/1.1\r\nHost: fragmented.example\r\n\r\n";
+        let (mut writer, mut reader) = tokio::io::duplex(8192);
+        let producer = tokio::spawn(async move {
+            for chunk in request.chunks(2) {
+                writer.write_all(chunk).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let sniffed = sniff_tcp(&mut reader).await;
+        producer.await.unwrap();
+        assert_eq!(sniffed.domain.as_deref(), Some("fragmented.example"));
+        assert_eq!(sniffed.buffered, request);
+    }
+
+    #[tokio::test]
+    async fn sniff_tcp_timeout_replays_every_consumed_byte() {
+        let (mut writer, mut reader) = tokio::io::duplex(8192);
+        writer.write_all(&[0x16, 0x03, 0x03, 0x00]).await.unwrap();
+        let sniffed = sniff_tcp(&mut reader).await;
+        assert_eq!(sniffed.traffic_type, TrafficType::Unknown);
+        assert_eq!(sniffed.buffered, [0x16, 0x03, 0x03, 0x00]);
     }
 
     #[test]

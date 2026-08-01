@@ -141,6 +141,7 @@ impl DnsForwarder {
                     DnsForwardError::Response(_) => "response",
                     DnsForwardError::Internal(_) => "internal",
                     DnsForwardError::RejectedPlanEscaped => "rejected_plan",
+                    DnsForwardError::Overloaded => "overloaded",
                 };
                 tracing::debug!(error_kind, "DNS resolution failed");
             }

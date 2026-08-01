@@ -1,4 +1,19 @@
 use super::*;
+
+#[test]
+fn direct_selector_fast_path_preserves_first_member_selection() {
+    let a = make_node(uuid::Uuid::new_v4(), "a");
+    let b = make_node(uuid::Uuid::new_v4(), "b");
+    let group = make_group("selector", GroupPolicy::Selector, vec![a.id, b.id]);
+    let manager = GroupManager::new(&[group], &[a, b]);
+    assert_eq!(
+        manager
+            .select_node_for_domain("selector", ProbeDomain::Tcp, IpVersion::V4)
+            .expect("direct selector must choose first member")
+            .name,
+        "a"
+    );
+}
 use chrono::Utc;
 
 fn make_node(id: uuid::Uuid, name: &str) -> Node {

@@ -9,10 +9,10 @@ pub(crate) enum DnsStatEvent {
     CacheHit,
     CacheMiss,
     CacheStale,
-    SingleflightKeySaturation,
-    SingleflightWaiterSaturation,
     SingleflightCancel,
     SingleflightRetry,
+    SingleflightRejected,
+    SingleflightAmplificationAvoided,
     PersistenceDrop,
     PersistenceFlushFailure,
     RuntimeRetirementTimeout,
@@ -39,6 +39,8 @@ struct DnsStats {
     singleflight_waiter_saturation: AtomicU64,
     singleflight_cancel: AtomicU64,
     singleflight_retry: AtomicU64,
+    singleflight_rejected: AtomicU64,
+    singleflight_amplification_avoided: AtomicU64,
     persistence_drop: AtomicU64,
     persistence_flush_failure: AtomicU64,
     runtime_retirement_timeout: AtomicU64,
@@ -68,10 +70,12 @@ impl DnsStats {
             DnsStatEvent::CacheHit => &self.cache_hit,
             DnsStatEvent::CacheMiss => &self.cache_miss,
             DnsStatEvent::CacheStale => &self.cache_stale,
-            DnsStatEvent::SingleflightKeySaturation => &self.singleflight_key_saturation,
-            DnsStatEvent::SingleflightWaiterSaturation => &self.singleflight_waiter_saturation,
             DnsStatEvent::SingleflightCancel => &self.singleflight_cancel,
             DnsStatEvent::SingleflightRetry => &self.singleflight_retry,
+            DnsStatEvent::SingleflightRejected => &self.singleflight_rejected,
+            DnsStatEvent::SingleflightAmplificationAvoided => {
+                &self.singleflight_amplification_avoided
+            }
             DnsStatEvent::PersistenceDrop => &self.persistence_drop,
             DnsStatEvent::PersistenceFlushFailure => &self.persistence_flush_failure,
             DnsStatEvent::RuntimeRetirementTimeout => &self.runtime_retirement_timeout,
@@ -104,6 +108,10 @@ impl DnsStats {
                 .load(Ordering::Relaxed),
             singleflight_cancel: self.singleflight_cancel.load(Ordering::Relaxed),
             singleflight_retry: self.singleflight_retry.load(Ordering::Relaxed),
+            singleflight_rejected: self.singleflight_rejected.load(Ordering::Relaxed),
+            singleflight_amplification_avoided: self
+                .singleflight_amplification_avoided
+                .load(Ordering::Relaxed),
             persistence_drop: self.persistence_drop.load(Ordering::Relaxed),
             persistence_flush_failure: self.persistence_flush_failure.load(Ordering::Relaxed),
             runtime_retirement_timeout: self.runtime_retirement_timeout.load(Ordering::Relaxed),

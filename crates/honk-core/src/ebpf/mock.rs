@@ -148,8 +148,8 @@ pub struct MockEbpfBackend {
     pub tcp_conn_states: HashMap<[u8; 40], ConnState>,
     /// UDP connection states (TuplesKey → ConnState)
     pub udp_conn_states: HashMap<[u8; 40], ConnState>,
-    /// Redirect tracking (RedirectTuple → RedirectEntry)
-    pub redirect_tracks: HashMap<[u8; 32], RedirectEntry>,
+    /// Redirect tracking (full directional `RedirectTuple` → `RedirectEntry`).
+    pub redirect_tracks: HashMap<[u8; 40], RedirectEntry>,
     /// Routing handoff table (TuplesKey → RoutingHandoffEntry).
     ///
     /// Behind a Mutex because `routing_handoff_take` takes `&self` (the
@@ -273,11 +273,14 @@ impl MockEbpfBackend {
         buf
     }
 
-    /// Convert a RedirectTuple into a 32-byte array.
-    fn redirect_tuple_bytes(key: &RedirectTuple) -> [u8; 32] {
-        let mut buf = [0u8; 32];
+    /// Convert a RedirectTuple into its exact 40-byte `repr(C)` map key.
+    fn redirect_tuple_bytes(key: &RedirectTuple) -> [u8; 40] {
+        let mut buf = [0u8; 40];
         buf[0..16].copy_from_slice(unsafe { &key.src_ip.u6_addr8 });
         buf[16..32].copy_from_slice(unsafe { &key.dst_ip.u6_addr8 });
+        buf[32..34].copy_from_slice(&key.src_port.to_ne_bytes());
+        buf[34..36].copy_from_slice(&key.dst_port.to_ne_bytes());
+        buf[36] = key.l4proto;
         buf
     }
 
@@ -312,7 +315,7 @@ impl MockEbpfBackend {
     }
 
     /// Reverse of redirect_tuple_bytes.
-    fn bytes_to_redirect_tuple(buf: &[u8; 32]) -> RedirectTuple {
+    fn bytes_to_redirect_tuple(buf: &[u8; 40]) -> RedirectTuple {
         RedirectTuple {
             src_ip: honk_ebpf_common::dae_ip::In6Addr {
                 u6_addr8: buf[0..16].try_into().unwrap(),
@@ -320,6 +323,10 @@ impl MockEbpfBackend {
             dst_ip: honk_ebpf_common::dae_ip::In6Addr {
                 u6_addr8: buf[16..32].try_into().unwrap(),
             },
+            src_port: u16::from_ne_bytes([buf[32], buf[33]]),
+            dst_port: u16::from_ne_bytes([buf[34], buf[35]]),
+            l4proto: buf[36],
+            padding: [0; 3],
         }
     }
 }
@@ -661,8 +668,50 @@ impl EbpfBackend for MockEbpfBackend {
         Ok(())
     }
 
+    fn redirect_track_for_each_chunk(
+        &self,
+        chunk_size: usize,
+        visit: &mut super::RedirectTrackChunkVisitor<'_>,
+    ) -> anyhow::Result<()> {
+        let mut chunk = Vec::with_capacity(chunk_size.max(1));
+        for (key, entry) in &self.redirect_tracks {
+            chunk.push((Self::bytes_to_redirect_tuple(key), *entry));
+            if chunk.len() == chunk_size.max(1) {
+                if !visit(&chunk) {
+                    return Ok(());
+                }
+                chunk.clear();
+            }
+        }
+        if !chunk.is_empty() {
+            visit(&chunk);
+        }
+        Ok(())
+    }
+
     fn cookie_pid_snapshot(&self, out: &mut Vec<(u64, PidPname)>) -> anyhow::Result<()> {
         out.extend(self.cookie_pids.iter().map(|(&c, &e)| (c, e)));
+        Ok(())
+    }
+
+    fn cookie_pid_for_each_chunk(
+        &self,
+        chunk_size: usize,
+        visit: &mut super::CookiePidChunkVisitor<'_>,
+    ) -> anyhow::Result<()> {
+        let mut chunk = Vec::with_capacity(chunk_size.max(1));
+        for (&cookie, &entry) in &self.cookie_pids {
+            chunk.push((cookie, entry));
+            if chunk.len() == chunk_size.max(1) {
+                if !visit(&chunk) {
+                    return Ok(());
+                }
+                chunk.clear();
+            }
+        }
+        if !chunk.is_empty() {
+            visit(&chunk);
+        }
         Ok(())
     }
 
@@ -672,6 +721,27 @@ impl EbpfBackend for MockEbpfBackend {
     ) -> anyhow::Result<()> {
         for (kb, entry) in self.routing_handoffs.lock().unwrap().iter() {
             out.push((Self::bytes_to_tuples_key(kb), *entry));
+        }
+        Ok(())
+    }
+
+    fn routing_handoff_for_each_chunk(
+        &self,
+        chunk_size: usize,
+        visit: &mut super::RoutingHandoffChunkVisitor<'_>,
+    ) -> anyhow::Result<()> {
+        let mut chunk = Vec::with_capacity(chunk_size.max(1));
+        for (key, entry) in self.routing_handoffs.lock().unwrap().iter() {
+            chunk.push((Self::bytes_to_tuples_key(key), *entry));
+            if chunk.len() == chunk_size.max(1) {
+                if !visit(&chunk) {
+                    return Ok(());
+                }
+                chunk.clear();
+            }
+        }
+        if !chunk.is_empty() {
+            visit(&chunk);
         }
         Ok(())
     }
@@ -719,6 +789,87 @@ impl EbpfBackend for MockEbpfBackend {
         Ok(())
     }
 
+    fn conn_state_remove_if_unchanged(
+        &mut self,
+        entries: &[(TuplesKey, ConnState)],
+        expired_before_ns: u64,
+    ) -> anyhow::Result<u64> {
+        let mut removed = 0;
+        for (key, scanned) in entries {
+            let map = if key.l4proto == 6 {
+                &mut self.tcp_conn_states
+            } else {
+                &mut self.udp_conn_states
+            };
+            let raw = Self::tuples_key_bytes(key);
+            if map.get(&raw).is_some_and(|current| {
+                current.last_seen_ns == scanned.last_seen_ns
+                    && current.last_seen_ns <= expired_before_ns
+            }) {
+                map.remove(&raw);
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    fn redirect_track_remove_if_unchanged(
+        &mut self,
+        entries: &[(RedirectTuple, RedirectEntry)],
+        expired_before_ns: u64,
+    ) -> anyhow::Result<u64> {
+        let mut removed = 0;
+        for (key, scanned) in entries {
+            let raw = Self::redirect_tuple_bytes(key);
+            if self.redirect_tracks.get(&raw).is_some_and(|current| {
+                current.last_seen_ns == scanned.last_seen_ns
+                    && current.last_seen_ns <= expired_before_ns
+            }) {
+                self.redirect_tracks.remove(&raw);
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    fn cookie_pid_remove_if_unchanged(
+        &mut self,
+        entries: &[(u64, PidPname)],
+        expired_before_ns: u64,
+    ) -> anyhow::Result<u64> {
+        let mut removed = 0;
+        for (cookie, scanned) in entries {
+            if self.cookie_pids.get(cookie).is_some_and(|current| {
+                current.last_seen_ns == scanned.last_seen_ns
+                    && current.last_seen_ns <= expired_before_ns
+            }) {
+                self.cookie_pids.remove(cookie);
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    fn routing_handoff_remove_if_unchanged(
+        &mut self,
+        entries: &[(TuplesKey, RoutingHandoffEntry)],
+        expired_before_ns: u64,
+    ) -> anyhow::Result<u64> {
+        let mut removed = 0;
+        let handoffs = self.routing_handoffs.get_mut().unwrap();
+        for (key, scanned) in entries {
+            let raw = Self::tuples_key_bytes(key);
+            if handoffs.get(&raw).is_some_and(|current| {
+                current.last_seen_ns == scanned.last_seen_ns
+                    && current.last_seen_ns <= expired_before_ns
+            }) {
+                handoffs.remove(&raw);
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
     async fn cleanup(&mut self) -> anyhow::Result<()> {
         self.params.clear();
         self.domain_routes.clear();
@@ -736,6 +887,67 @@ impl EbpfBackend for MockEbpfBackend {
         self.outbound_alive.clear();
         self.bpf_stats.clear();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod janitor_conditional_delete_tests {
+    use super::*;
+
+    #[test]
+    fn reused_tuple_survives_stale_conditional_delete() {
+        let mut backend = MockEbpfBackend::default();
+        let key = TuplesKey {
+            l4proto: 6,
+            ..Default::default()
+        };
+        let old = ConnState {
+            last_seen_ns: 1,
+            ..Default::default()
+        };
+        let fresh = ConnState {
+            last_seen_ns: 2,
+            ..Default::default()
+        };
+        backend.tcp_conn_state_store(&key, &old).unwrap();
+        backend.tcp_conn_state_store(&key, &fresh).unwrap();
+
+        assert_eq!(
+            backend
+                .conn_state_remove_if_unchanged(&[(key, old)], 10)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            backend
+                .tcp_conn_state_lookup(&key)
+                .unwrap()
+                .unwrap()
+                .last_seen_ns,
+            fresh.last_seen_ns
+        );
+    }
+
+    #[test]
+    fn unchanged_expired_entry_is_removed() {
+        let mut backend = MockEbpfBackend::default();
+        let key = TuplesKey {
+            l4proto: 6,
+            ..Default::default()
+        };
+        let stale = ConnState {
+            last_seen_ns: 1,
+            ..Default::default()
+        };
+        backend.tcp_conn_state_store(&key, &stale).unwrap();
+
+        assert_eq!(
+            backend
+                .conn_state_remove_if_unchanged(&[(key, stale)], 10)
+                .unwrap(),
+            1
+        );
+        assert!(backend.tcp_conn_state_lookup(&key).unwrap().is_none());
     }
 }
 
@@ -994,6 +1206,7 @@ mod tests {
         let rt_key = RedirectTuple {
             src_ip: In6Addr::default(),
             dst_ip: In6Addr::default(),
+            ..Default::default()
         };
         let rt_entry = RedirectEntry {
             last_seen_ns: 111,
@@ -1153,6 +1366,7 @@ mod tests {
         let key = RedirectTuple {
             src_ip: In6Addr::default(),
             dst_ip: In6Addr::default(),
+            ..Default::default()
         };
         let entry = RedirectEntry {
             last_seen_ns: 1111111111,

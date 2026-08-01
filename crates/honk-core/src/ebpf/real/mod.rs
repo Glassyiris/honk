@@ -262,6 +262,47 @@ impl RealEbpfBackend {
         Ok(())
     }
 
+    /// Visit a hash-family map in chunks. Kernels with LOOKUP_BATCH stream
+    /// directly from the map; the legacy fallback preserves compatibility.
+    fn for_each_map_chunk<K: Copy, V: Copy>(
+        &self,
+        map: &str,
+        chunk_size: usize,
+        visit: &mut dyn FnMut(&[(K, V)]) -> bool,
+    ) -> anyhow::Result<()> {
+        let bpf = self.bpf()?;
+        if bpf_lookup_batch_scan_cb(bpf, &self.cap_lookup_batch, map, visit)? {
+            return Ok(());
+        }
+        // Old kernels lack LOOKUP_BATCH. Avoid the snapshot helper here:
+        // it would allocate one entry per map element and defeat the janitor
+        // memory bound.
+        let mut chunk = Vec::with_capacity(chunk_size.max(1));
+        for kb in bpf_map_keys(bpf, map, core::mem::size_of::<K>())? {
+            let mut value = core::mem::MaybeUninit::<V>::uninit();
+            let buf = unsafe {
+                core::slice::from_raw_parts_mut(
+                    value.as_mut_ptr() as *mut u8,
+                    core::mem::size_of::<V>(),
+                )
+            };
+            if bpf_hash_lookup(bpf, map, &kb, buf)?.is_some() {
+                let key = unsafe { core::ptr::read_unaligned(kb.as_ptr() as *const K) };
+                chunk.push((key, unsafe { value.assume_init() }));
+                if chunk.len() == chunk_size.max(1) {
+                    if !visit(&chunk) {
+                        return Ok(());
+                    }
+                    chunk.clear();
+                }
+            }
+        }
+        if !chunk.is_empty() {
+            visit(&chunk);
+        }
+        Ok(())
+    }
+
     /// Delete multiple keys from a hash-family map, preferring
     /// `BPF_MAP_DELETE_BATCH` and falling back to per-key deletes.
     fn map_delete_batch<K: Copy>(&mut self, map: &str, keys: &[K]) -> anyhow::Result<()> {
@@ -663,6 +704,30 @@ impl EbpfBackend for RealEbpfBackend {
         self.map_snapshot("REDIRECT_TRACK", out)
     }
 
+    fn redirect_track_for_each_chunk(
+        &self,
+        chunk_size: usize,
+        visit: &mut crate::ebpf::RedirectTrackChunkVisitor<'_>,
+    ) -> anyhow::Result<()> {
+        self.for_each_map_chunk("REDIRECT_TRACK", chunk_size, visit)
+    }
+
+    fn cookie_pid_for_each_chunk(
+        &self,
+        chunk_size: usize,
+        visit: &mut crate::ebpf::CookiePidChunkVisitor<'_>,
+    ) -> anyhow::Result<()> {
+        self.for_each_map_chunk("COOKIE_PID_MAP", chunk_size, visit)
+    }
+
+    fn routing_handoff_for_each_chunk(
+        &self,
+        chunk_size: usize,
+        visit: &mut crate::ebpf::RoutingHandoffChunkVisitor<'_>,
+    ) -> anyhow::Result<()> {
+        self.for_each_map_chunk("ROUTING_HANDOFF_MAP", chunk_size, visit)
+    }
+
     fn conn_state_snapshot(&self, out: &mut Vec<(TuplesKey, ConnState)>) -> anyhow::Result<()> {
         self.map_snapshot("CONN_STATE_MAP", out)
     }
@@ -672,19 +737,7 @@ impl EbpfBackend for RealEbpfBackend {
         chunk_size: usize,
         visit: &mut crate::ebpf::ConnStateChunkVisitor<'_>,
     ) -> anyhow::Result<()> {
-        let bpf = self.bpf()?;
-        // Stream chunks straight from the kernel when LOOKUP_BATCH is
-        // available; otherwise fall back to the snapshot-based default.
-        if syscall::bpf_lookup_batch_scan_cb(bpf, &self.cap_lookup_batch, "CONN_STATE_MAP", visit)?
-        {
-            return Ok(());
-        }
-        let mut entries = Vec::new();
-        self.map_snapshot("CONN_STATE_MAP", &mut entries)?;
-        for chunk in entries.chunks(chunk_size.max(1)) {
-            visit(chunk);
-        }
-        Ok(())
+        self.for_each_map_chunk("CONN_STATE_MAP", chunk_size, visit)
     }
 
     fn conn_state_remove_batch(&mut self, keys: &[TuplesKey]) -> anyhow::Result<()> {
@@ -743,6 +796,90 @@ impl EbpfBackend for RealEbpfBackend {
         self.map_delete_batch("ROUTING_HANDOFF_MAP", keys)
     }
 
+    fn conn_state_remove_if_unchanged(
+        &mut self,
+        entries: &[(TuplesKey, ConnState)],
+        expired_before_ns: u64,
+    ) -> anyhow::Result<u64> {
+        let mut removed = 0;
+        for (key, scanned) in entries {
+            if self
+                .hash_lookup::<_, ConnState>("CONN_STATE_MAP", key)?
+                .is_some_and(|current| {
+                    current.last_seen_ns == scanned.last_seen_ns
+                        && current.last_seen_ns <= expired_before_ns
+                })
+            {
+                self.hash_remove("CONN_STATE_MAP", key)?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    fn redirect_track_remove_if_unchanged(
+        &mut self,
+        entries: &[(RedirectTuple, RedirectEntry)],
+        expired_before_ns: u64,
+    ) -> anyhow::Result<u64> {
+        let mut removed = 0;
+        for (key, scanned) in entries {
+            if self
+                .hash_lookup::<_, RedirectEntry>("REDIRECT_TRACK", key)?
+                .is_some_and(|current| {
+                    current.last_seen_ns == scanned.last_seen_ns
+                        && current.last_seen_ns <= expired_before_ns
+                })
+            {
+                self.hash_remove("REDIRECT_TRACK", key)?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    fn cookie_pid_remove_if_unchanged(
+        &mut self,
+        entries: &[(u64, PidPname)],
+        expired_before_ns: u64,
+    ) -> anyhow::Result<u64> {
+        let mut removed = 0;
+        for (cookie, scanned) in entries {
+            if self
+                .hash_lookup::<_, PidPname>("COOKIE_PID_MAP", cookie)?
+                .is_some_and(|current| {
+                    current.last_seen_ns == scanned.last_seen_ns
+                        && current.last_seen_ns <= expired_before_ns
+                })
+            {
+                self.hash_remove("COOKIE_PID_MAP", cookie)?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    fn routing_handoff_remove_if_unchanged(
+        &mut self,
+        entries: &[(TuplesKey, RoutingHandoffEntry)],
+        expired_before_ns: u64,
+    ) -> anyhow::Result<u64> {
+        let mut removed = 0;
+        for (key, scanned) in entries {
+            if self
+                .hash_lookup::<_, RoutingHandoffEntry>("ROUTING_HANDOFF_MAP", key)?
+                .is_some_and(|current| {
+                    current.last_seen_ns == scanned.last_seen_ns
+                        && current.last_seen_ns <= expired_before_ns
+                })
+            {
+                self.hash_remove("ROUTING_HANDOFF_MAP", key)?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
     fn set_outbound_alive(&mut self, o: u8, d: u32, ip: u32, alive: bool) -> anyhow::Result<()> {
         let k = conn_key(o, d, ip);
         let v: u64 = if alive { 1 } else { 0 };
@@ -777,21 +914,20 @@ impl EbpfBackend for RealEbpfBackend {
         }
         let o = o as u8;
         let mut stats = OutboundStats::default();
-        for (counter, slot) in [
-            (OUTBOUND_STATS_TX_PACKETS, &mut stats.tx_packets),
-            (OUTBOUND_STATS_TX_BYTES, &mut stats.tx_bytes),
-            (OUTBOUND_STATS_RX_PACKETS, &mut stats.rx_packets),
-            (OUTBOUND_STATS_RX_BYTES, &mut stats.rx_bytes),
-        ] {
-            // Per-CPU array: BPF_MAP_LOOKUP_ELEM returns one u64 slot per
-            // possible CPU; aggregate them here.
-            let ncpu = possible_cpus();
-            let mut buf = vec![0u8; ncpu * 8];
-            let idx = outbound_stats_index(o, counter);
-            if let Some(()) =
-                bpf_hash_lookup(bpf, "OUTBOUND_STATS", unsafe { as_bytes(&idx) }, &mut buf)?
-            {
-                *slot = sum_percpu_u64(&buf, ncpu);
+        let ncpu = possible_cpus();
+        let mut buf = vec![0u8; ncpu * core::mem::size_of::<OutboundStatsCounters>()];
+        let idx = OutboundStatsCounters::for_outbound(o as u8);
+        if let Some(()) =
+            bpf_hash_lookup(bpf, "OUTBOUND_STATS", unsafe { as_bytes(&idx) }, &mut buf)?
+        {
+            for cpu in buf.chunks_exact(core::mem::size_of::<OutboundStatsCounters>()) {
+                let counters = unsafe {
+                    core::ptr::read_unaligned(cpu.as_ptr().cast::<OutboundStatsCounters>())
+                };
+                stats.tx_packets = stats.tx_packets.wrapping_add(counters.tx_packets);
+                stats.tx_bytes = stats.tx_bytes.wrapping_add(counters.tx_bytes);
+                stats.rx_packets = stats.rx_packets.wrapping_add(counters.rx_packets);
+                stats.rx_bytes = stats.rx_bytes.wrapping_add(counters.rx_bytes);
             }
         }
         Ok(stats)
@@ -800,21 +936,14 @@ impl EbpfBackend for RealEbpfBackend {
         if self.bpf()?.map("OUTBOUND_STATS").is_none() {
             return Ok(());
         }
-        let zeros = vec![0u8; possible_cpus() * 8];
-        for counter in [
-            OUTBOUND_STATS_TX_PACKETS,
-            OUTBOUND_STATS_TX_BYTES,
-            OUTBOUND_STATS_RX_PACKETS,
-            OUTBOUND_STATS_RX_BYTES,
-        ] {
-            let idx = outbound_stats_index(o as u8, counter);
-            bpf_hash_insert(
-                self.bpf_mut()?,
-                "OUTBOUND_STATS",
-                unsafe { as_bytes(&idx) },
-                &zeros,
-            )?;
-        }
+        let zeros = vec![0u8; possible_cpus() * core::mem::size_of::<OutboundStatsCounters>()];
+        let idx = OutboundStatsCounters::for_outbound(o as u8);
+        bpf_hash_insert(
+            self.bpf_mut()?,
+            "OUTBOUND_STATS",
+            unsafe { as_bytes(&idx) },
+            &zeros,
+        )?;
         Ok(())
     }
     fn get_bpf_stats(&self, k: u32) -> anyhow::Result<Option<u64>> {

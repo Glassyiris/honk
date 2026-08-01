@@ -222,37 +222,64 @@ impl Default for RoutingMeta {
     }
 }
 
+/// Directional five-tuple used as the `REDIRECT_TRACK` map key.
+///
+/// The key is deliberately not canonicalized: the redirecting packet is
+/// stored in its original direction and the reply path looks it up using the
+/// exact reverse tuple.  Keeping both ports and L4 protocol prevents flows
+/// sharing an address pair from overwriting one another.
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
 pub struct RedirectTuple {
     pub src_ip: In6Addr,
     pub dst_ip: In6Addr,
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub l4proto: u8,
+    pub padding: [u8; 3],
 }
 
 impl RedirectTuple {
-    /// Construct a `RedirectTuple` from a [`TuplesKey`]'s IPs, respecting the
-    /// IPv4-mapped representation used by the kernel.  When `is_ipv4` is
-    /// `true`, the addresses are stored as `::ffff:<ipv4>` by copying only the
-    /// low 32 bits alongside the fixed ::ffff prefix.
+    /// Construct the directional key from the parsed datapath five-tuple.
     #[inline(always)]
-    pub fn from_tuples_ip(tuples: &crate::redirect_need::TuplesKey, is_ipv4: bool) -> Self {
-        if is_ipv4 {
-            let mut rt: Self = unsafe { core::mem::zeroed() };
-            unsafe {
-                rt.src_ip.u6_addr32[2] = 0x0000ffffu32.to_be();
-                rt.src_ip.u6_addr32[3] = tuples.src_ip.u6_addr32[3];
-                rt.dst_ip.u6_addr32[2] = 0x0000ffffu32.to_be();
-                rt.dst_ip.u6_addr32[3] = tuples.dst_ip.u6_addr32[3];
-            }
-            rt
-        } else {
-            Self {
-                src_ip: tuples.src_ip,
-                dst_ip: tuples.dst_ip,
-            }
+    pub const fn from_tuples(tuples: &crate::redirect_need::TuplesKey) -> Self {
+        Self {
+            src_ip: tuples.src_ip,
+            dst_ip: tuples.dst_ip,
+            src_port: tuples.src_port,
+            dst_port: tuples.dst_port,
+            l4proto: tuples.l4proto,
+            padding: [0; 3],
+        }
+    }
+
+    /// Build the opposite-direction key for a reply packet.
+    #[inline(always)]
+    pub const fn reverse(self) -> Self {
+        Self {
+            src_ip: self.dst_ip,
+            dst_ip: self.src_ip,
+            src_port: self.dst_port,
+            dst_port: self.src_port,
+            l4proto: self.l4proto,
+            padding: [0; 3],
         }
     }
 }
+
+// `REDIRECT_TRACK` is shared verbatim with the kernel.  Pin its complete
+// layout so a userspace/eBPF rebuild cannot silently change the map ABI.
+const _REDIRECT_TUPLE_SIZE: () = assert!(core::mem::size_of::<RedirectTuple>() == 40);
+const _REDIRECT_TUPLE_SRC_IP_OFFSET: () =
+    assert!(core::mem::offset_of!(RedirectTuple, src_ip) == 0);
+const _REDIRECT_TUPLE_DST_IP_OFFSET: () =
+    assert!(core::mem::offset_of!(RedirectTuple, dst_ip) == 16);
+const _REDIRECT_TUPLE_SRC_PORT_OFFSET: () =
+    assert!(core::mem::offset_of!(RedirectTuple, src_port) == 32);
+const _REDIRECT_TUPLE_DST_PORT_OFFSET: () =
+    assert!(core::mem::offset_of!(RedirectTuple, dst_port) == 34);
+const _REDIRECT_TUPLE_L4PROTO_OFFSET: () =
+    assert!(core::mem::offset_of!(RedirectTuple, l4proto) == 36);
 
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
@@ -311,24 +338,61 @@ pub struct LpmKey {
 #[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for LpmKey {}
 
-/// Number of `u64` counters per outbound in the eBPF `OUTBOUND_STATS`
-/// per-CPU array (`tx_packets`, `tx_bytes`, `rx_packets`, `rx_bytes`).
-pub const OUTBOUND_STATS_COUNTERS: u32 = 4;
-/// Counter slot offsets within one outbound's `OUTBOUND_STATS` block.
-pub const OUTBOUND_STATS_TX_PACKETS: u32 = 0;
-pub const OUTBOUND_STATS_TX_BYTES: u32 = 1;
-pub const OUTBOUND_STATS_RX_PACKETS: u32 = 2;
-pub const OUTBOUND_STATS_RX_BYTES: u32 = 3;
-/// Total entries of the eBPF `OUTBOUND_STATS` per-CPU array: one counter
-/// block per possible outbound index (the datapath carries it as a `u8`).
-pub const OUTBOUND_STATS_MAP_LEN: u32 = MAX_OUTBOUNDS * OUTBOUND_STATS_COUNTERS;
-
-/// Index of `counter` for `outbound` in the eBPF `OUTBOUND_STATS` per-CPU
-/// array: `outbound * OUTBOUND_STATS_COUNTERS + counter`.
-#[inline(always)]
-pub const fn outbound_stats_index(outbound: u8, counter: u32) -> u32 {
-    outbound as u32 * OUTBOUND_STATS_COUNTERS + counter
+/// One per-CPU `OUTBOUND_STATS` value for an outbound. Keeping the four
+/// counters together lets the datapath update a packet and its byte count
+/// after one map lookup, while preserving contention-free per-CPU updates.
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct OutboundStatsCounters {
+    pub tx_packets: u64,
+    pub tx_bytes: u64,
+    pub rx_packets: u64,
+    pub rx_bytes: u64,
 }
+
+impl OutboundStatsCounters {
+    #[inline(always)]
+    pub const fn for_outbound(outbound: u8) -> u32 {
+        outbound as u32
+    }
+
+    #[inline(always)]
+    pub fn add_tx(&mut self, bytes: u64) {
+        self.tx_packets = self.tx_packets.wrapping_add(1);
+        self.tx_bytes = self.tx_bytes.wrapping_add(bytes);
+    }
+
+    #[inline(always)]
+    pub fn add_rx(&mut self, bytes: u64) {
+        self.rx_packets = self.rx_packets.wrapping_add(1);
+        self.rx_bytes = self.rx_bytes.wrapping_add(bytes);
+    }
+
+    #[inline(always)]
+    pub fn wrapping_add_assign(&mut self, other: &Self) {
+        self.tx_packets = self.tx_packets.wrapping_add(other.tx_packets);
+        self.tx_bytes = self.tx_bytes.wrapping_add(other.tx_bytes);
+        self.rx_packets = self.rx_packets.wrapping_add(other.rx_packets);
+        self.rx_bytes = self.rx_bytes.wrapping_add(other.rx_bytes);
+    }
+}
+
+/// Total entries of the eBPF `OUTBOUND_STATS` per-CPU array: one packed
+/// counter value for each possible `u8` outbound index.
+pub const OUTBOUND_STATS_MAP_LEN: u32 = MAX_OUTBOUNDS;
+
+const _OUTBOUND_STATS_COUNTERS_SIZE: () =
+    assert!(core::mem::size_of::<OutboundStatsCounters>() == 32);
+const _OUTBOUND_STATS_COUNTERS_ALIGN: () =
+    assert!(core::mem::align_of::<OutboundStatsCounters>() == core::mem::align_of::<u64>());
+const _OUTBOUND_STATS_TX_PACKETS_OFFSET: () =
+    assert!(core::mem::offset_of!(OutboundStatsCounters, tx_packets) == 0);
+const _OUTBOUND_STATS_TX_BYTES_OFFSET: () =
+    assert!(core::mem::offset_of!(OutboundStatsCounters, tx_bytes) == 8);
+const _OUTBOUND_STATS_RX_PACKETS_OFFSET: () =
+    assert!(core::mem::offset_of!(OutboundStatsCounters, rx_packets) == 16);
+const _OUTBOUND_STATS_RX_BYTES_OFFSET: () =
+    assert!(core::mem::offset_of!(OutboundStatsCounters, rx_bytes) == 24);
 
 /// Per-outbound statistics as returned by
 /// `EbpfBackend::get_outbound_stats`.  `tx`/`rx` packets and bytes are
@@ -353,3 +417,32 @@ pub struct OutboundStats {
 unsafe impl aya::Pod for RedirectTuple {}
 #[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for RedirectEntry {}
+
+#[cfg(test)]
+mod outbound_stats_counter_tests {
+    use super::*;
+
+    #[test]
+    fn outbound_stats_counter_layout_and_wrapping_are_stable() {
+        assert_eq!(OUTBOUND_STATS_MAP_LEN, MAX_OUTBOUNDS);
+        assert_eq!(OutboundStatsCounters::for_outbound(0), 0);
+        assert_eq!(
+            OutboundStatsCounters::for_outbound(u8::MAX),
+            MAX_OUTBOUNDS - 1
+        );
+        assert_eq!(core::mem::size_of::<OutboundStatsCounters>(), 32);
+
+        let mut counters = OutboundStatsCounters {
+            tx_packets: u64::MAX,
+            tx_bytes: u64::MAX,
+            rx_packets: u64::MAX,
+            rx_bytes: u64::MAX,
+        };
+        counters.add_tx(1);
+        counters.add_rx(1);
+        assert_eq!(counters.tx_packets, 0);
+        assert_eq!(counters.tx_bytes, 0);
+        assert_eq!(counters.rx_packets, 0);
+        assert_eq!(counters.rx_bytes, 0);
+    }
+}

@@ -31,10 +31,14 @@ use tokio::io::Interest;
 use tokio::net::TcpStream;
 use tracing::{debug, warn};
 
-/// Pipe capacity requested via `F_SETPIPE_SZ` (best-effort).
-const PIPE_SIZE: usize = 256 * 1024;
+/// Upper bound requested for one active splice direction. A live pipe owns
+/// two FDs and at most this many kernel-buffer bytes; a full-duplex relay is
+/// therefore bounded to four FDs and 128 KiB of requested pipe pages. Linux
+/// may refuse the resize, in which case `capacity` records the smaller
+/// kernel-selected value.
+const PIPE_SIZE: usize = 64 * 1024;
 
-/// Assumed pipe capacity when `F_GETPIPE_SZ` fails (Linux default).
+/// Conservative capacity used only when `F_GETPIPE_SZ` itself fails.
 const DEFAULT_PIPE_SIZE: usize = 64 * 1024;
 
 /// Set when the kernel rejects `splice(2)` for TCP sockets (e.g. seccomp).
@@ -392,19 +396,13 @@ pub async fn relay_splice(
         Err(SpliceError::Io(e)) => {
             shutdown_write(&client);
             shutdown_write(&upstream);
-            let duration_ms = start.elapsed().as_millis() as u64;
-            // Same error classification and zeroed stats as `relay_tcp`.
             if !is_ignorable_connection_error(&e) {
                 warn!(
                     "TCP splice relay error for {} → {}: {}",
                     client_addr, target_addr, e
                 );
             }
-            Ok(RelayStats {
-                total_bytes: 0,
-                duration_ms,
-                ..Default::default()
-            })
+            Err(e.into())
         }
     }
 }
@@ -604,6 +602,32 @@ mod tests {
             libc::EAGAIN
         )));
         assert!(!is_unsupported_errno(&io::Error::other("synthetic")));
+    }
+
+    /// Two active directions are bounded to four private FDs and 128 KiB of
+    /// requested pipe pages per full-duplex connection, down from the prior
+    /// 512 KiB request. Pipes are never shared, so closing a connection
+    /// cannot expose staged bytes to another one.
+    #[test]
+    fn test_full_duplex_pipe_resource_bound() {
+        let client_to_upstream = Pipe::new().expect("create client pipe");
+        let upstream_to_client = Pipe::new().expect("create upstream pipe");
+        assert_ne!(
+            client_to_upstream.read.as_raw_fd(),
+            client_to_upstream.write.as_raw_fd()
+        );
+        assert_ne!(
+            upstream_to_client.read.as_raw_fd(),
+            upstream_to_client.write.as_raw_fd()
+        );
+        assert!(
+            client_to_upstream.capacity <= PIPE_SIZE && upstream_to_client.capacity <= PIPE_SIZE,
+            "kernel pipe capacity must remain within the requested per-direction bound"
+        );
+        assert!(
+            client_to_upstream.capacity + upstream_to_client.capacity <= 2 * PIPE_SIZE,
+            "full-duplex splice relay exceeds its 128 KiB pipe-page bound"
+        );
     }
 
     /// Bidirectional transfer larger than any pipe capacity, with data

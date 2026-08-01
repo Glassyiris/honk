@@ -91,7 +91,7 @@ impl UpstreamPool {
                 )
                 .await?,
             ),
-            DnsProtocol::Udp => anyhow::bail!("internal: UDP has no pooled transport"),
+            DnsProtocol::Udp => anyhow::bail!("internal: UDP has a dedicated pool"),
         })
     }
 
@@ -157,6 +157,9 @@ impl UpstreamPool {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
+        for entry in self.entries.values() {
+            entry.udp.lock().take();
+        }
         for slot in slots {
             slot.close(|transport| async move {
                 transport.close().await;

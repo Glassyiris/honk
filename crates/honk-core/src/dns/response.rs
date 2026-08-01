@@ -1,4 +1,5 @@
 use std::ops::Range;
+use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -44,7 +45,7 @@ struct RecordBoundary {
 
 #[derive(Debug, Clone)]
 pub struct ResponseTemplate {
-    request_identity: Vec<u8>,
+    request_identity: Arc<[u8]>,
     wire: Vec<u8>,
     question_end: usize,
     records: Vec<RecordBoundary>,
@@ -105,7 +106,7 @@ impl ResponseTemplate {
             return Err(ResponseError::TrailingBytes);
         }
         Ok(Self {
-            request_identity: request.canonical_wire().to_vec(),
+            request_identity: request.canonical_wire_arc(),
             wire: response.to_vec(),
             question_end,
             records,
@@ -113,7 +114,7 @@ impl ResponseTemplate {
     }
 
     pub fn render(&self, caller: &QueryContext) -> Result<Vec<u8>, ResponseError> {
-        if caller.canonical_wire() != self.request_identity {
+        if caller.canonical_wire() != self.request_identity.as_ref() {
             return Err(ResponseError::RequestIdentityMismatch);
         }
         match caller.ingress() {

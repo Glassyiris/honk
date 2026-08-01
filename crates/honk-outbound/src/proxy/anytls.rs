@@ -74,8 +74,6 @@ const FRAME_HEADER_LEN: usize = 7;
 const DEFAULT_IDLE_CHECK_INTERVAL_SECS: u64 = 30;
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30;
 
-/// Buffer of the user-facing half of a stream (matches the old pool).
-const STREAM_DUPLEX_BUFFER: usize = 65536;
 /// Per-stream demux queue depth (frames). A full queue parks frames in
 /// the session overflow instead of blocking the demux.
 const STREAM_QUEUE_CAP: usize = 64;
@@ -113,7 +111,8 @@ impl AnyTlsHandler {
                 .ok_or_else(|| anyhow::anyhow!("node '{}' not in runtime registry", node.name))?;
             return match &runtime.runtime {
                 crate::runtime::ProtocolRuntime::AnyTls(rt) => Ok(Arc::clone(&rt.pool)),
-                crate::runtime::ProtocolRuntime::None => Err(anyhow::anyhow!(
+                crate::runtime::ProtocolRuntime::None
+                | crate::runtime::ProtocolRuntime::Quic(_) => Err(anyhow::anyhow!(
                     "node '{}' has no AnyTLS runtime",
                     node.name
                 )),
@@ -694,25 +693,6 @@ impl AnyTlsSession {
         Ok((sid, rx, guard))
     }
 
-    /// Open a new stream on this session (sing `Session.OpenStream`):
-    /// allocate a sid, send SYN + the first PSH carrying the target
-    /// address, and return the user-facing half of the stream. Many
-    /// streams may be open concurrently; no exclusive borrow is taken.
-    async fn open_stream(
-        self: &Arc<Self>,
-        target_addr: Vec<u8>,
-        permit: crate::session::SessionPermit<Self>,
-    ) -> anyhow::Result<tokio::io::DuplexStream> {
-        let (sid, rx, guard) = self
-            .register_and_open(target_addr, STREAM_QUEUE_CAP, StreamSink::Tcp, permit)
-            .await?;
-        let permit = guard.commit();
-        let (client_half, stream_half) = tokio::io::duplex(STREAM_DUPLEX_BUFFER);
-        tokio::spawn(stream_task(Arc::clone(self), sid, stream_half, rx, permit));
-        debug!("AnyTLS session {} opened sid={}", self.seq, sid);
-        Ok(client_half)
-    }
-
     /// Open a UoT stream: same SYN+PSH opening as [`Self::open_stream`],
     /// but inbound datagrams go straight from the demux into a drop-on-full
     /// queue (no stream task, no duplex) and outbound frames are written
@@ -745,10 +725,8 @@ impl AnyTlsSession {
             .await
     }
 
-    /// Enqueue one application UoT datagram without backpressuring the shared
-    /// session. Saturation deliberately drops the datagram (UDP semantics).
-    async fn write_uot_datagram(&self, sid: u32, data: &[u8]) -> std::io::Result<()> {
-        self.enqueue_uot(sid, bytes::Bytes::copy_from_slice(data))
+    async fn write_uot_datagram(&self, sid: u32, payload: bytes::Bytes) -> std::io::Result<()> {
+        self.enqueue_uot(sid, payload)
     }
 
     /// Open a TCP stream with the direct data path (no stream task, no
@@ -1054,72 +1032,6 @@ async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedReader) {
     }
 }
 
-/// Per-stream task: pumps client payload into PSH frames and delivers
-/// demuxed inbound events to the client. Client EOF closes the stream with
-/// FIN (the session stays open for other streams); server FIN or session
-/// teardown EOFs the client read side.
-async fn stream_task(
-    session: Arc<AnyTlsSession>,
-    sid: u32,
-    mut stream_half: tokio::io::DuplexStream,
-    mut rx: mpsc::Receiver<StreamEvent>,
-    // The capacity slot for this stream; released when the task exits.
-    _permit: crate::session::SessionPermit<AnyTlsSession>,
-) {
-    let mut buf = vec![0u8; 65536];
-    let mut notify_fin = false;
-    loop {
-        tokio::select! {
-            ev = rx.recv() => {
-                match ev {
-                    Some(StreamEvent::Data(data)) => {
-                        if let Err(e) = stream_half.write_all(&data).await {
-                            debug!("AnyTLS sid={} client write failed: {}", sid, e);
-                            // The client is gone; tell the server to drop
-                            // the stream.
-                            notify_fin = true;
-                            break;
-                        }
-                    }
-                    Some(StreamEvent::Fin) | Some(StreamEvent::Error(_)) | None => {
-                        // Server closed the stream, a stream-level
-                        // failure, or the session died and dropped the
-                        // dispatch channels (the legacy duplex path
-                        // cannot carry the error itself — EOF is the
-                        // best it can signal).
-                        let _ = stream_half.shutdown().await;
-                        break;
-                    }
-                }
-            }
-            n = stream_half.read(&mut buf) => {
-                match n {
-                    Ok(0) => {
-                        // Client finished: close the stream, keep the session.
-                        notify_fin = true;
-                        break;
-                    }
-                    Ok(n) => {
-                        if let Err(e) = session
-                            .enqueue_data(sid, bytes::Bytes::copy_from_slice(&buf[..n]))
-                            .await
-                        {
-                            debug!("AnyTLS sid={} PSH enqueue failed: {}", sid, e);
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        debug!("AnyTLS sid={} client read failed: {}", sid, e);
-                        notify_fin = true;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    session.end_stream(sid, notify_fin).await;
-}
-
 impl crate::session::ManagedSession for AnyTlsSession {
     // The inherent methods of the same names do the real work.
     fn active_streams(&self) -> usize {
@@ -1174,9 +1086,10 @@ async fn dial_session(
     node: &Node,
     addr: &str,
     connect_timeout: Duration,
+    tls_connector: Option<Arc<TlsConnector>>,
 ) -> anyhow::Result<Arc<AnyTlsSession>> {
     let (read, write, auth, settings) =
-        connect_transport(node, addr, connect_timeout, None).await?;
+        connect_transport(node, addr, connect_timeout, None, tls_connector).await?;
     AnyTlsSession::establish(addr, read, write, &auth, &settings).await
 }
 
@@ -1189,6 +1102,7 @@ async fn connect_transport(
     addr: &str,
     connect_timeout: Duration,
     tcp: Option<TcpStream>,
+    tls_connector: Option<Arc<TlsConnector>>,
 ) -> anyhow::Result<(BoxedReader, BoxedWriter, Vec<u8>, Vec<u8>)> {
     let password = AnyTlsHandler::resolve_password(node);
     let auth_key = Sha256::digest(password.as_bytes());
@@ -1207,7 +1121,10 @@ async fn connect_transport(
     };
     debug!("AnyTLS: TCP connected to {}", addr);
 
-    let connector = AnyTlsHandler::build_tls_connector(node)?;
+    let connector = match tls_connector {
+        Some(connector) => connector,
+        None => Arc::new(AnyTlsHandler::build_tls_connector(node)?),
+    };
     let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
     let tls = connector.connect(&server_name, tcp).await?;
     debug!("AnyTLS: TLS handshake completed with {}", addr);
@@ -1261,7 +1178,6 @@ impl AnyTlsHandler {
         // skipping it entirely leaks idle sessions into the pool forever.
         // An explicit `min_idle_session=0` disables standby sessions only,
         // never pruning.
-        let label = format!("{}:{}", node.host(), node.port);
         // Default 1 (not sing-box's 0): a single standby session per node
         // keeps every dial warm after the first — cold dials otherwise pay
         // TCP connect + TLS handshake (2 RTT) per burst.
@@ -1271,10 +1187,11 @@ impl AnyTlsHandler {
                 .unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS),
         );
         let prewarm_node = node.clone();
+        let label = format!("{}:{}", node.host(), node.port);
         pool.ensure_janitor(POOL_KEY, min_idle, idle_timeout, move || {
             let node = prewarm_node.clone();
             let label = label.clone();
-            async move { dial_session(&node, &label, Duration::from_secs(10)).await }
+            async move { dial_session(&node, &label, Duration::from_secs(10), None).await }
         });
     }
 
@@ -1295,7 +1212,9 @@ impl AnyTlsHandler {
         }
         let pool = match &runtime.runtime {
             crate::runtime::ProtocolRuntime::AnyTls(runtime) => Arc::clone(&runtime.pool),
-            crate::runtime::ProtocolRuntime::None => return Ok(UdpWarmStatus::NotApplicable),
+            crate::runtime::ProtocolRuntime::None | crate::runtime::ProtocolRuntime::Quic(_) => {
+                return Ok(UdpWarmStatus::NotApplicable);
+            }
         };
         let already_ready = pool.has_usable_session(POOL_KEY);
         Self::ensure_janitor(&runtime.node, &pool);
@@ -1319,7 +1238,7 @@ impl AnyTlsHandler {
         connect_timeout: Duration,
     ) -> anyhow::Result<AnyTlsStream> {
         let pool = self.node_pool(node)?;
-        self.open_pooled_stream_for_pool(node, pool, addr, target_addr, connect_timeout)
+        self.open_pooled_stream_for_pool(node, pool, addr, target_addr, connect_timeout, None)
             .await
     }
 
@@ -1332,6 +1251,7 @@ impl AnyTlsHandler {
         addr: &str,
         target_addr: &[u8],
         connect_timeout: Duration,
+        tls_connector: Option<Arc<TlsConnector>>,
     ) -> anyhow::Result<AnyTlsStream> {
         Self::ensure_janitor(node, &pool);
         // The dial future must be 'static (pool-owned dial task) and the
@@ -1344,7 +1264,8 @@ impl AnyTlsHandler {
             move || {
                 let node = dial_node.clone();
                 let addr = dial_addr.clone();
-                async move { dial_session(&node, &addr, connect_timeout).await }
+                let tls_connector = tls_connector.clone();
+                async move { dial_session(&node, &addr, connect_timeout, tls_connector).await }
             },
             move |session, permit| {
                 let target = target.clone();
@@ -1522,7 +1443,7 @@ pub(crate) struct AnyTlsStream {
     fin_sent: bool,
     /// Stream-slot capacity, held for the stream's whole life (released
     /// on Drop).
-    _permit: crate::session::SessionPermit<AnyTlsSession>,
+    _permit: Option<crate::session::SessionPermit<AnyTlsSession>>,
 }
 
 impl AnyTlsStream {
@@ -1543,7 +1464,7 @@ impl AnyTlsStream {
             out_slot: None,
             permit_fut: None,
             fin_sent: false,
-            _permit: permit,
+            _permit: Some(permit),
         }
     }
 }
@@ -1645,6 +1566,7 @@ impl tokio::io::AsyncRead for AnyTlsStream {
                     // next poll via `read_eof` (returning it now would
                     // either discard the data or lose the Fin).
                     this.read_eof = true;
+                    this._permit.take();
                     return std::task::Poll::Ready(Ok(()));
                 }
                 std::task::Poll::Ready(None) => {
@@ -1882,10 +1804,7 @@ impl<R: tokio::io::AsyncRead + Unpin> UotFrameReader<R> {
                             // A v1 server echoes the connect destination as the
                             // packet source; a mismatch means the bytes were really
                             // a v2 length prefix (e.g. 0x00..0x02) after all.
-                            if self
-                                .v1_header_matches(header, target, target_domain)
-                                .await?
-                            {
+                            if self.v1_header_matches(header, target, target_domain)? {
                                 self.mode = Some(UotMode::V1Packet);
                             } else {
                                 self.mode = Some(UotMode::V2Connect);
@@ -1946,7 +1865,7 @@ impl<R: tokio::io::AsyncRead + Unpin> UotFrameReader<R> {
 
     /// Whether the v1 header currently in `buf` echoes the connect
     /// destination (source == the requested target).
-    async fn v1_header_matches(
+    fn v1_header_matches(
         &self,
         header: usize,
         target: &SocketAddr,
@@ -1977,16 +1896,18 @@ impl<R: tokio::io::AsyncRead + Unpin> UotFrameReader<R> {
     }
 }
 
-/// Bridge task for UoT: forwards payloads between the loopback UDP socket
-/// and length-prefixed datagrams on the AnyTLS stream. Ends on error, EOF,
-/// or after [`UDP_BRIDGE_IDLE_SECS`] without activity.
-async fn uot_bridge(
-    stream: tokio::io::DuplexStream,
+/// Bridge loopback UDP packets to a framed AnyTLS stream. The stream is the
+/// direct session-backed implementation: no per-flow duplex or pump task is
+/// introduced between the socket and the ordered session writer.
+async fn uot_bridge<S>(
+    stream: S,
     internal: tokio::net::UdpSocket,
     external_addr: SocketAddr,
     target: SocketAddr,
     target_domain: Option<String>,
-) {
+) where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
     let (rd, mut wr) = tokio::io::split(stream);
     // Bounded: UDP semantics — drop on a full queue, never queue unboundedly.
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
@@ -2067,8 +1988,14 @@ impl ProxyHandler for AnyTlsHandler {
         // tied to the immutable generation supplied by ProxyRegistry.
         let node = Arc::clone(&runtime.node);
         let addr = format!("{}:{}", node.host(), node.port);
+        let tls = match &runtime.runtime {
+            crate::runtime::ProtocolRuntime::AnyTls(runtime) => Arc::clone(&runtime.tls),
+            crate::runtime::ProtocolRuntime::None | crate::runtime::ProtocolRuntime::Quic(_) => {
+                anyhow::bail!("AnyTLS node runtime does not own an AnyTLS connector")
+            }
+        };
         Self::warm_pool_with(runtime, connect_timeout, move || async move {
-            dial_session(&node, &addr, connect_timeout).await
+            dial_session(&node, &addr, connect_timeout, Some(tls)).await
         })
         .await
     }
@@ -2104,9 +2031,11 @@ impl ProxyHandler for AnyTlsHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let pool = match &runtime.runtime {
-            crate::runtime::ProtocolRuntime::AnyTls(runtime) => Arc::clone(&runtime.pool),
-            crate::runtime::ProtocolRuntime::None => {
+        let (pool, tls) = match &runtime.runtime {
+            crate::runtime::ProtocolRuntime::AnyTls(runtime) => {
+                (Arc::clone(&runtime.pool), Arc::clone(&runtime.tls))
+            }
+            crate::runtime::ProtocolRuntime::None | crate::runtime::ProtocolRuntime::Quic(_) => {
                 anyhow::bail!("AnyTLS node runtime does not own an AnyTLS pool")
             }
         };
@@ -2114,7 +2043,14 @@ impl ProxyHandler for AnyTlsHandler {
         let addr = format!("{}:{}", node.host(), node.port);
         let target_addr = addr::encode_address(target, target_domain);
         let stream = self
-            .open_pooled_stream_for_pool(node.as_ref(), pool, &addr, &target_addr, connect_timeout)
+            .open_pooled_stream_for_pool(
+                node.as_ref(),
+                pool,
+                &addr,
+                &target_addr,
+                connect_timeout,
+                Some(tls),
+            )
             .await?;
         Ok(ProxyStream {
             stream: Box::new(stream),
@@ -2137,7 +2073,7 @@ impl ProxyHandler for AnyTlsHandler {
         let pool = self.node_pool(node)?;
         Self::ensure_janitor(node, &pool);
         let (read, write, auth, settings) =
-            connect_transport(node, &addr, _connect_timeout, Some(tcp)).await?;
+            connect_transport(node, &addr, _connect_timeout, Some(tcp), None).await?;
         let session = AnyTlsSession::establish(&addr, read, write, &auth, &settings).await?;
         pool.insert(POOL_KEY, &session);
         let permit = session
@@ -2174,8 +2110,8 @@ impl ProxyHandler for AnyTlsHandler {
         let magic = addr::encode_address("0.0.0.0:0".parse().unwrap(), Some(UOT_MAGIC));
         let pool = self.node_pool(node)?;
         Self::ensure_janitor(node, &pool);
-        // Legacy loopback path: needs a duplex stream for `uot_bridge`
-        // (the production UDP path is `dial_udp_transport`).
+        // The loopback compatibility path shares the direct session-backed
+        // stream with the packet transport; it needs no duplex or pump task.
         let mut stream = {
             let dial_node = node.clone();
             let dial_addr = addr.clone();
@@ -2184,12 +2120,12 @@ impl ProxyHandler for AnyTlsHandler {
                 move || {
                     let node = dial_node.clone();
                     let addr = dial_addr.clone();
-                    async move { dial_session(&node, &addr, connect_timeout).await }
+                    async move { dial_session(&node, &addr, connect_timeout, None).await }
                 },
                 move |session, permit| {
                     let magic = magic.clone();
                     async move {
-                        match session.open_stream(magic, permit).await {
+                        match session.open_stream_direct(magic, permit).await {
                             Ok(stream) => Ok(stream),
                             Err(error) => Err(if session.is_closed() {
                                 crate::session::OpenError::Session(error)
@@ -2261,7 +2197,7 @@ impl ProxyHandler for AnyTlsHandler {
                 move || {
                     let node = dial_node.clone();
                     let addr = dial_addr.clone();
-                    async move { dial_session(&node, &addr, connect_timeout).await }
+                    async move { dial_session(&node, &addr, connect_timeout, None).await }
                 },
                 move |session, permit| {
                     let magic = magic.clone();
@@ -2325,7 +2261,7 @@ impl ProxyHandler for AnyTlsHandler {
             target,
             target_domain,
             connect_timeout,
-            move || async move { dial_session(&dial_node, &dial_addr, connect_timeout).await },
+            move || async move { dial_session(&dial_node, &dial_addr, connect_timeout, None).await },
         )
         .await
     }
@@ -2337,9 +2273,11 @@ impl ProxyHandler for AnyTlsHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<PreparedUdpTransport> {
-        let pool = match &runtime.runtime {
-            crate::runtime::ProtocolRuntime::AnyTls(runtime) => Arc::clone(&runtime.pool),
-            crate::runtime::ProtocolRuntime::None => {
+        let (pool, tls) = match &runtime.runtime {
+            crate::runtime::ProtocolRuntime::AnyTls(runtime) => {
+                (Arc::clone(&runtime.pool), Arc::clone(&runtime.tls))
+            }
+            crate::runtime::ProtocolRuntime::None | crate::runtime::ProtocolRuntime::Quic(_) => {
                 anyhow::bail!("AnyTLS node runtime does not own an AnyTLS pool")
             }
         };
@@ -2352,7 +2290,9 @@ impl ProxyHandler for AnyTlsHandler {
             target,
             target_domain,
             connect_timeout,
-            move || async move { dial_session(&dial_node, &dial_addr, connect_timeout).await },
+            move || async move {
+                dial_session(&dial_node, &dial_addr, connect_timeout, Some(tls)).await
+            },
         )
         .await
     }
@@ -2515,10 +2455,13 @@ impl PacketTransport for AnyTlsUotTransport {
                 "uot datagram too large",
             ));
         }
-        let mut frame = Vec::with_capacity(2 + data.len());
-        frame.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        let mut frame = bytes::BytesMut::with_capacity(2 + data.len());
+        use bytes::BufMut as _;
+        frame.put_u16(data.len() as u16);
         frame.extend_from_slice(data);
-        self.session.write_uot_datagram(self.sid, &frame).await
+        self.session
+            .write_uot_datagram(self.sid, frame.freeze())
+            .await
     }
 
     async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
@@ -2527,16 +2470,14 @@ impl PacketTransport for AnyTlsUotTransport {
         })?;
         match event {
             StreamEvent::Data(data) => {
-                let payload = self
-                    .strip_uot_header(&mut *self.mode.lock().await, &data)?
-                    .to_vec();
+                let payload = self.strip_uot_header(&mut *self.mode.lock().await, &data)?;
                 if payload.len() > buf.len() {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "uot datagram exceeds buffer",
                     ));
                 }
-                buf[..payload.len()].copy_from_slice(&payload);
+                buf[..payload.len()].copy_from_slice(payload);
                 Ok((payload.len(), self.target))
             }
             StreamEvent::Fin => Err(std::io::Error::new(
@@ -2722,7 +2663,9 @@ mod tests {
         let pool = handler2.node_pool(&node).unwrap();
         let registry_pool = match &registry.read().get(&node.id).unwrap().runtime {
             crate::runtime::ProtocolRuntime::AnyTls(rt) => Arc::clone(&rt.pool),
-            crate::runtime::ProtocolRuntime::None => panic!("expected AnyTls runtime"),
+            crate::runtime::ProtocolRuntime::None | crate::runtime::ProtocolRuntime::Quic(_) => {
+                panic!("expected AnyTls runtime")
+            }
         };
         assert!(Arc::ptr_eq(&pool, &registry_pool));
         assert!(
@@ -2785,7 +2728,9 @@ mod tests {
         let old_runtime = old_generation.get(&old_node.id).unwrap();
         let old_pool = match &old_runtime.runtime {
             crate::runtime::ProtocolRuntime::AnyTls(runtime) => Arc::clone(&runtime.pool),
-            crate::runtime::ProtocolRuntime::None => panic!("expected AnyTLS runtime"),
+            crate::runtime::ProtocolRuntime::None | crate::runtime::ProtocolRuntime::Quic(_) => {
+                panic!("expected AnyTLS runtime")
+            }
         };
         let (session, mut server) = establish_test_session("captured-generation").await;
         expect_handshake(&mut server).await;
@@ -2799,7 +2744,9 @@ mod tests {
             .into_shared();
         let replacement_pool = match &replacement.read().get(&old_node.id).unwrap().runtime {
             crate::runtime::ProtocolRuntime::AnyTls(runtime) => Arc::clone(&runtime.pool),
-            crate::runtime::ProtocolRuntime::None => panic!("expected AnyTLS runtime"),
+            crate::runtime::ProtocolRuntime::None | crate::runtime::ProtocolRuntime::Quic(_) => {
+                panic!("expected AnyTLS runtime")
+            }
         };
         let handler = AnyTlsHandler::new();
         handler.set_runtime_registry(replacement);
@@ -2834,7 +2781,9 @@ mod tests {
             crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
         let pool = match &generation.get(&node.id).unwrap().runtime {
             crate::runtime::ProtocolRuntime::AnyTls(runtime) => Arc::clone(&runtime.pool),
-            crate::runtime::ProtocolRuntime::None => panic!("expected AnyTLS runtime"),
+            crate::runtime::ProtocolRuntime::None | crate::runtime::ProtocolRuntime::Quic(_) => {
+                panic!("expected AnyTLS runtime")
+            }
         };
         let (session, mut server) = establish_test_session("retiring-anytls").await;
         expect_handshake(&mut server).await;
@@ -3036,14 +2985,17 @@ mod tests {
     }
 
     /// Write `payload` on `stream` and assert it echoes back intact.
-    async fn echo(stream: &mut tokio::io::DuplexStream, payload: &[u8]) {
-        stream.write_all(payload).await.unwrap();
+    async fn echo<S>(stream: &mut S, payload: &[u8]) -> std::io::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        stream.write_all(payload).await?;
         let mut buf = vec![0u8; payload.len()];
         tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut buf))
             .await
-            .expect("echo timed out")
-            .unwrap();
+            .expect("echo timed out")?;
         assert_eq!(buf, payload);
+        Ok(())
     }
 
     /// Regression (113666e): Data+Fin enqueued before the first poll must
@@ -3460,17 +3412,15 @@ mod tests {
         expect_handshake(&mut server).await;
         let mut addr_rx = spawn_echo_server(server);
 
-        // Open three streams concurrently on the same session.
         let target = |b: u8| vec![0x01, 127, 0, 0, b, 0x01, 0xbb];
         let (s1, s2, s3) = tokio::join!(
-            session.open_stream(target(1), session.try_reserve().unwrap()),
-            session.open_stream(target(2), session.try_reserve().unwrap()),
-            session.open_stream(target(3), session.try_reserve().unwrap()),
+            session.open_stream_direct(target(1), session.try_reserve().unwrap()),
+            session.open_stream_direct(target(2), session.try_reserve().unwrap()),
+            session.open_stream_direct(target(3), session.try_reserve().unwrap()),
         );
         let (mut s1, mut s2, mut s3) = (s1.unwrap(), s2.unwrap(), s3.unwrap());
         assert_eq!(session.active_streams(), 3);
 
-        // Each SYN was followed by its own address PSH.
         let mut addrs = Vec::new();
         for _ in 0..3 {
             let (sid, a) = tokio::time::timeout(Duration::from_secs(2), addr_rx.recv())
@@ -3484,15 +3434,12 @@ mod tests {
         assert_eq!(addrs[1].1, target(2));
         assert_eq!(addrs[2].1, target(3));
 
-        // Distinct payloads echoed back on the right stream, in parallel.
-        tokio::join!(
-            echo(&mut s1, b"hello-one"),
-            echo(&mut s2, b"hello-two-two"),
-            echo(&mut s3, b"hello-three-three-three"),
-        );
-
-        // Closing all streams ends them (FIN handshake) and idles the
-        // session without closing it.
+        tokio::try_join!(
+            echo(&mut s1, b"one"),
+            echo(&mut s2, b"two"),
+            echo(&mut s3, b"three")
+        )
+        .unwrap();
         drop(s1);
         drop(s2);
         drop(s3);
@@ -3505,9 +3452,8 @@ mod tests {
         .expect("streams drain");
         assert!(!session.is_closed());
 
-        // The same session serves another stream afterwards.
         let mut s4 = session
-            .open_stream(target(4), session.try_reserve().unwrap())
+            .open_stream_direct(target(4), session.try_reserve().unwrap())
             .await
             .unwrap();
         let (sid, a) = tokio::time::timeout(Duration::from_secs(2), addr_rx.recv())
@@ -3516,7 +3462,7 @@ mod tests {
             .unwrap();
         assert_eq!(sid, 4);
         assert_eq!(a, target(4));
-        echo(&mut s4, b"again").await;
+        echo(&mut s4, b"again").await.unwrap();
     }
 
     /// A server-side FIN closes only that stream; sibling streams and the
@@ -3529,15 +3475,14 @@ mod tests {
 
         let target = vec![0x01, 127, 0, 0, 1, 0x00, 0x50];
         let mut s1 = session
-            .open_stream(target.clone(), session.try_reserve().unwrap())
+            .open_stream_direct(target.clone(), session.try_reserve().unwrap())
             .await
             .unwrap();
         let mut s2 = session
-            .open_stream(target.clone(), session.try_reserve().unwrap())
+            .open_stream_direct(target, session.try_reserve().unwrap())
             .await
             .unwrap();
 
-        // Server: consume both opening sequences, then FIN sid=1 only.
         for expected_sid in 1..=2u32 {
             let (cmd, sid, _) = read_frame(&mut server).await.unwrap();
             assert_eq!((cmd, sid), (CMD_SYN, expected_sid));
@@ -3546,7 +3491,6 @@ mod tests {
         }
         write_frame(&mut server, CMD_FIN, 1, &[]).await.unwrap();
 
-        // s1 sees EOF; s2 still echoes.
         let mut b = [0u8; 1];
         let n = tokio::time::timeout(Duration::from_secs(2), s1.read(&mut b))
             .await
@@ -3555,7 +3499,6 @@ mod tests {
         assert_eq!(n, 0);
 
         s2.write_all(b"still-here").await.unwrap();
-        // Server side: read the PSH and echo it back.
         let (cmd, sid, data) = read_frame(&mut server).await.unwrap();
         assert_eq!((cmd, sid), (CMD_PSH, 2));
         assert_eq!(data, b"still-here");
@@ -3585,7 +3528,9 @@ mod tests {
         let runtime = generation.get(&node.id).unwrap();
         let pool = match &runtime.runtime {
             crate::runtime::ProtocolRuntime::AnyTls(runtime) => Arc::clone(&runtime.pool),
-            crate::runtime::ProtocolRuntime::None => panic!("AnyTLS node needs its own runtime"),
+            crate::runtime::ProtocolRuntime::None | crate::runtime::ProtocolRuntime::Quic(_) => {
+                panic!("AnyTLS node needs its own runtime")
+            }
         };
         let (session, mut server) = establish_test_session("warm-anytls").await;
         expect_handshake(&mut server).await;
@@ -3629,7 +3574,9 @@ mod tests {
         let runtime = generation.get(&node.id).unwrap();
         let pool = match &runtime.runtime {
             crate::runtime::ProtocolRuntime::AnyTls(runtime) => Arc::clone(&runtime.pool),
-            crate::runtime::ProtocolRuntime::None => panic!("AnyTLS node needs its own runtime"),
+            crate::runtime::ProtocolRuntime::None | crate::runtime::ProtocolRuntime::Quic(_) => {
+                panic!("AnyTLS node needs its own runtime")
+            }
         };
         let dial_started = Arc::new(tokio::sync::Notify::new());
         let dial_blocked = Arc::new(tokio::sync::Notify::new());

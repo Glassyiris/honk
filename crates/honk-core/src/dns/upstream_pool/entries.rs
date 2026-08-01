@@ -5,7 +5,7 @@ use honk_config::dns::DnsUpstream;
 
 use super::transports::{PooledTransport, TransportKey};
 use crate::dns::endpoint::DnsEndpoint;
-use crate::dns::transport::LifecycleSlot;
+use crate::dns::transport::{LifecycleSlot, UdpPool};
 
 pub(super) struct UpstreamEntry {
     pub(super) protocol: honk_config::types::DnsProtocol,
@@ -14,6 +14,7 @@ pub(super) struct UpstreamEntry {
     pub(super) outbound: Option<String>,
     pub(super) transports:
         parking_lot::Mutex<HashMap<TransportKey, Arc<LifecycleSlot<PooledTransport>>>>,
+    pub(super) udp: parking_lot::Mutex<Option<Arc<UdpPool>>>,
 }
 
 pub(super) fn build_entries(
@@ -43,6 +44,7 @@ pub(super) fn build_entries(
                 address: upstream.address.clone(),
                 outbound: upstream.outbound.clone(),
                 transports: parking_lot::Mutex::new(HashMap::new()),
+                udp: parking_lot::Mutex::new(None),
             },
         );
     }

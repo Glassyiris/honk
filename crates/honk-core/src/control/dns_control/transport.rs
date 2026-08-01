@@ -122,7 +122,7 @@ pub(super) fn build_dns_servfail(query: &[u8]) -> Vec<u8> {
     build_dns_error_response(query, 2)
 }
 
-fn build_dns_refused(query: &[u8]) -> Vec<u8> {
+pub(super) fn build_dns_refused(query: &[u8]) -> Vec<u8> {
     build_dns_error_response(query, 5)
 }
 

@@ -44,6 +44,17 @@ impl HandoffResult {
     }
 }
 
+const COLD_URLTEST_STAGGER: Duration = Duration::from_millis(200);
+
+/// Wait until this candidate's absolute cold-URLTest release offset. The
+/// first candidate starts immediately; sleeping candidates have not acquired
+/// a dial permit and are cancelled with their enclosing `JoinSet`.
+async fn wait_for_cold_urltest_release(index: usize) {
+    if index != 0 {
+        tokio::time::sleep(COLD_URLTEST_STAGGER.saturating_mul(index as u32)).await;
+    }
+}
+
 pub(super) struct ConnectionGuard {
     drain: Arc<DrainTracker>,
 }
@@ -472,17 +483,39 @@ impl ControlPlaneHandle {
 
         self.stats.record_connection(&outbound_name);
 
-        let config = self.config.read().await;
         let ipver = if original_dst.is_ipv6() {
             IpVersion::V6
         } else {
             IpVersion::V4
         };
-        let candidates = {
+        let (mut candidates, selection_mode) = {
+            let config = self.config.read().await;
             let gm = self.group_manager.read();
-            resolve_outbound_nodes(&config, &gm, &outbound_name, ProbeDomain::Tcp, ipver)
+            if let Some(group) = config
+                .groups
+                .iter()
+                .find(|group| group.name == outbound_name)
+            {
+                let plan = gm.selection_plan_for_domain(&group.name, ProbeDomain::Tcp, ipver);
+                (
+                    plan.nodes.into_iter().cloned().collect::<Vec<_>>(),
+                    plan.mode,
+                )
+            } else {
+                (
+                    resolve_outbound_nodes(&config, &gm, &outbound_name, ProbeDomain::Tcp, ipver),
+                    SelectionPlanMode::Authoritative,
+                )
+            }
         };
-        drop(config);
+        // Only an unmeasured URLTest group is allowed to speculate. Its
+        // candidate set is bounded before spawning so a large group cannot
+        // turn one client flow into an unbounded dial storm.
+        if selection_mode == SelectionPlanMode::ColdUrlTest {
+            candidates.truncate(3);
+        } else {
+            candidates.truncate(1);
+        }
 
         // If eBPF already decided this flow should go direct (not just punted
         // it to userspace), skip userspace proxy dial, DNS, and relay entirely.
@@ -633,14 +666,22 @@ impl ControlPlaneHandle {
             let target_domain = target_domain.clone();
             let outbound = outbound_name.clone();
 
+            let cold_urltest = selection_mode == SelectionPlanMode::ColdUrlTest;
             let mut set = tokio::task::JoinSet::new();
             for (idx, node) in candidates.iter().enumerate() {
                 let ctx = ctx.clone();
                 let node = (*node).clone();
                 let target_domain = target_domain.clone();
-                let start = std::time::Instant::now();
                 set.spawn(async move {
+                    if cold_urltest {
+                        // Absolute releases make only candidate zero immediate;
+                        // unreleased work has no dial permit and abort_all()
+                        // cancels it before it can start.
+                        wait_for_cold_urltest_release(idx).await;
+                    }
+                    let start = std::time::Instant::now();
                     let per_dial_timeout = connect_timeout * 3;
+                    let _dial_permit = ConnectionPool::acquire_dial_permit().await;
                     let result = tokio::time::timeout(
                         per_dial_timeout,
                         Self::dial_pooled(
@@ -788,9 +829,10 @@ impl ControlPlaneHandle {
                             );
                             // Only hot targets earn a speculative ready
                             // dial; a one-off flow gets none.
-                            if !pool.note_target(&key) {
+                            let Some(_warm_guard) = pool.try_begin_warm(&key) else {
                                 return;
-                            }
+                            };
+                            let _dial_permit = ConnectionPool::acquire_dial_permit().await;
                             match registry
                                 .dial(&node, target, target_domain.as_deref(), connect_timeout)
                                 .await
@@ -812,6 +854,7 @@ impl ControlPlaneHandle {
                             // instead; a bare TCP is useless to them.
                             return;
                         }
+                        let _dial_permit = ConnectionPool::acquire_dial_permit().await;
                         match honk_outbound::util::connect_outbound(&node_addr, connect_timeout)
                             .await
                         {
@@ -1049,6 +1092,14 @@ impl ControlPlaneHandle {
             }
             Err(e) => {
                 self.connection_tracker.remove(&conn_id);
+                // The relay updates these atomics as every read/splice completes.
+                // Preserve bytes moved before an I/O failure rather than turning
+                // the whole flow into a synthetic zero-byte success.
+                self.stats.record_bytes(
+                    &outbound_name,
+                    conn_upload.load(std::sync::atomic::Ordering::Relaxed),
+                    conn_download.load(std::sync::atomic::Ordering::Relaxed),
+                );
                 let io_err = e.downcast_ref::<std::io::Error>();
                 if let Some(io_err) = io_err {
                     if relay::is_ignorable_connection_error(io_err) {
@@ -1657,5 +1708,46 @@ pub(super) fn domain_reality_outcome(
                 RealityOutcome::Mismatch
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod cold_urltest_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test(start_paused = true)]
+    async fn cold_urltest_releases_candidates_progressively_and_cancels_waiters() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+        for index in 0..3 {
+            let started = Arc::clone(&started);
+            tasks.spawn(async move {
+                wait_for_cold_urltest_release(index).await;
+                started.fetch_add(1, Ordering::AcqRel);
+            });
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(
+            started.load(Ordering::Acquire),
+            1,
+            "only the first candidate is immediate"
+        );
+        tokio::time::advance(COLD_URLTEST_STAGGER).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            started.load(Ordering::Acquire),
+            2,
+            "the second candidate releases after one delay"
+        );
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        tokio::time::advance(COLD_URLTEST_STAGGER * 2).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            started.load(Ordering::Acquire),
+            2,
+            "cancelled unreleased candidate must not start"
+        );
     }
 }

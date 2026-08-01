@@ -76,10 +76,15 @@ impl<S> Layer<S> for ClashLogLayer
 where
     S: tracing::Subscriber,
 {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>, _ctx: Context<'_, S>) -> bool {
+        // This prevents this otherwise-unfiltered layer from expressing
+        // debug/trace interest while the Clash endpoint has no consumer.
+        self.tx.receiver_count() != 0
+    }
+
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
-        // Formatting costs a String per event and this layer is unfiltered,
-        // so the data path would otherwise pay it for every debug event even
-        // at log_level=info. Nobody watching means nobody to format for.
+        // A receiver may disconnect after `enabled`; retain this guard so
+        // formatting is never paid after the final subscriber leaves.
         if self.tx.receiver_count() == 0 {
             return;
         }
@@ -90,8 +95,6 @@ where
         } else {
             format!("{}{}", fields.message, fields.extra)
         };
-        // No active receivers (or lagging ones) is fine: log streaming is
-        // best-effort and must never block the data path.
         let _ = self.tx.send(LogEvent {
             level: *event.metadata().level(),
             payload,

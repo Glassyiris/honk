@@ -117,6 +117,10 @@ pub struct ControlPlane {
     /// Default: 1024 concurrent connections. Each connection handler acquires a
     /// permit before spawning; the accept loop waits when the limit is reached.
     concurrency_limit: Arc<tokio::sync::Semaphore>,
+    /// Cold non-DNS UDP initialization budget. Ready endpoints bypass it.
+    udp_concurrency_limit: Arc<tokio::sync::Semaphore>,
+    /// Port-53 ingress budget, isolated from both TCP and generic UDP floods.
+    dns_concurrency_limit: Arc<tokio::sync::Semaphore>,
     /// Background task handles (health check, janitor) for clean shutdown.
     background_tasks: Arc<tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     /// The generation-owned UDP warm coordinator. It is deliberately kept
@@ -353,6 +357,8 @@ impl ControlPlane {
             cache_db: None,
             outbound_id_map,
             concurrency_limit: Arc::new(tokio::sync::Semaphore::new(1024)),
+            udp_concurrency_limit: Arc::new(tokio::sync::Semaphore::new(256)),
+            dns_concurrency_limit: Arc::new(tokio::sync::Semaphore::new(256)),
             background_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             udp_warm_task: tokio::sync::Mutex::new(None),
             mode_state: None,
@@ -657,7 +663,8 @@ impl ControlPlane {
             let state = UdpLoopState {
                 udp_pool: Arc::clone(&self.udp_pool),
                 stats: Arc::clone(&self.stats),
-                concurrency_limit: Arc::clone(&self.concurrency_limit),
+                udp_concurrency_limit: Arc::clone(&self.udp_concurrency_limit),
+                dns_concurrency_limit: Arc::clone(&self.dns_concurrency_limit),
                 dns_controller: Arc::clone(&self.dns_controller),
                 drain: self.drain_tracker.clone(),
                 handle: self.spawn_handle(),
@@ -703,36 +710,59 @@ impl ControlPlane {
             // Retire conntrack entries as UDP endpoints die (event-driven
             // lifecycle; the datapath/janitor timeouts remain the backstop),
             // and drop the flow from the clash-API tracker.
-            let (remove_tx, mut remove_rx) = tokio::sync::mpsc::unbounded_channel::<(
+            const UDP_REMOVAL_QUEUE_CAPACITY: usize = 1024;
+            const UDP_REMOVAL_BATCH_SIZE: usize = 128;
+            let (remove_tx, mut remove_rx) = tokio::sync::mpsc::channel::<(
                 std::net::SocketAddr,
                 std::net::SocketAddr,
                 Option<String>,
-            )>();
+            )>(UDP_REMOVAL_QUEUE_CAPACITY);
             self.udp_pool.set_remove_sink(remove_tx);
+            let udp_pool = Arc::clone(&self.udp_pool);
             let ebpf = self.ebpf.clone();
             let tracker = self.connection_tracker.clone();
             let removal_task = tokio::spawn(async move {
-                while let Some((client, dst, conn_id)) = remove_rx.recv().await {
-                    if let Some(id) = conn_id {
-                        tracker.remove(&id);
-                    }
-                    let fwd = crate::control::connection::build_tuples_key(
-                        dst.ip(),
-                        dst.port(),
-                        client.ip(),
-                        client.port(),
-                        17, // UDP
-                    );
-                    let mut rev = fwd;
-                    std::mem::swap(&mut rev.src_ip, &mut rev.dst_ip);
-                    std::mem::swap(&mut rev.src_port, &mut rev.dst_port);
-                    let mut ebpf = ebpf.write().await;
-                    for key in [&fwd, &rev] {
-                        if ebpf.udp_conn_state_remove(key).is_ok() {
-                            crate::ebpf::USERSPACE_CONN_STATE_DELETES
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut removals = Vec::with_capacity(UDP_REMOVAL_BATCH_SIZE);
+                let mut keys = Vec::with_capacity(UDP_REMOVAL_BATCH_SIZE * 2);
+                while let Some(first) = remove_rx.recv().await {
+                    removals.clear();
+                    removals.push(first);
+                    while removals.len() < UDP_REMOVAL_BATCH_SIZE {
+                        match remove_rx.try_recv() {
+                            Ok(removal) => removals.push(removal),
+                            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                            | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
                         }
                     }
+
+                    keys.clear();
+                    for (client, dst, conn_id) in removals.drain(..) {
+                        if let Some(id) = conn_id {
+                            tracker.remove(&id);
+                        }
+                        let fwd = crate::control::connection::build_tuples_key(
+                            dst.ip(),
+                            dst.port(),
+                            client.ip(),
+                            client.port(),
+                            17,
+                        );
+                        let mut rev = fwd;
+                        std::mem::swap(&mut rev.src_ip, &mut rev.dst_ip);
+                        std::mem::swap(&mut rev.src_port, &mut rev.dst_port);
+                        keys.extend([fwd, rev]);
+                    }
+
+                    let mut ebpf = ebpf.write().await;
+                    match ebpf.udp_conn_state_remove_batch(&keys) {
+                        Ok(removed) => {
+                            crate::ebpf::USERSPACE_CONN_STATE_DELETES
+                                .fetch_add(removed as u64, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        Err(error) => warn!(%error, "failed to remove UDP conntrack batch"),
+                    }
+                    drop(ebpf);
+                    udp_pool.flush_removal_dirty();
                 }
             });
 
@@ -1286,7 +1316,8 @@ async fn complete_udp_dns_slow_path(
 struct UdpLoopState {
     udp_pool: Arc<UdpEndpointPool>,
     stats: Arc<StatsManager>,
-    concurrency_limit: Arc<tokio::sync::Semaphore>,
+    udp_concurrency_limit: Arc<tokio::sync::Semaphore>,
+    dns_concurrency_limit: Arc<tokio::sync::Semaphore>,
     dns_controller: Arc<crate::control::dns_control::DnsController>,
     drain: Arc<DrainTracker>,
     handle: ControlPlaneHandle,
@@ -1338,10 +1369,15 @@ fn dispatch_udp_slow_path(
     original_dst: SocketAddr,
     data: &[u8],
 ) {
+    let concurrency_limit = if original_dst.port() == 53 && is_exact_dns_query(data) {
+        &state.dns_concurrency_limit
+    } else {
+        &state.udp_concurrency_limit
+    };
     match begin_udp_slow_path(
         &state.udp_pool,
         &state.stats,
-        &state.concurrency_limit,
+        concurrency_limit,
         src_addr,
         original_dst,
         data,

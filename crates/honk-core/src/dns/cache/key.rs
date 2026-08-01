@@ -1,3 +1,5 @@
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -24,13 +26,48 @@ pub(crate) enum OperationKind {
     Refresh,
 }
 
+/// Immutable query identity shared by all cache and singleflight operations for
+/// one prepared DNS query.  The canonical wire form is deliberately retained
+/// as bytes; its textual representation is a persistence boundary only.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct CacheKey {
+pub(crate) struct KeyIdentity(Arc<KeyIdentityData>);
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct KeyIdentityData {
     wire_identity: Arc<[u8]>,
     ingress: IngressProfile,
     policy_id: Option<PolicyId>,
+}
+
+impl KeyIdentity {
+    pub(crate) fn new(query: &QueryContext, policy_id: Option<PolicyId>) -> Self {
+        Self(Arc::new(KeyIdentityData {
+            wire_identity: query.canonical_wire_arc(),
+            ingress: query.ingress(),
+            policy_id,
+        }))
+    }
+
+    pub(crate) fn key(&self, scope: RequestScope, operation: OperationKind) -> CacheKey {
+        let mut hasher = DefaultHasher::new();
+        self.hash(&mut hasher);
+        scope.hash(&mut hasher);
+        operation.hash(&mut hasher);
+        CacheKey {
+            identity: self.clone(),
+            scope,
+            operation,
+            shard_hash: hasher.finish(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct CacheKey {
+    identity: KeyIdentity,
     scope: RequestScope,
     operation: OperationKind,
+    shard_hash: u64,
 }
 
 impl CacheKey {
@@ -40,23 +77,23 @@ impl CacheKey {
         scope: RequestScope,
         operation: OperationKind,
     ) -> Self {
-        Self {
-            wire_identity: Arc::from(query.canonical_wire()),
-            ingress: query.ingress(),
-            policy_id,
-            scope,
-            operation,
-        }
+        KeyIdentity::new(query, policy_id).key(scope, operation)
+    }
+
+    /// Change only the operation discriminator while preserving the canonical
+    /// query identity and request scope.
+    pub(crate) fn with_operation(&self, operation: OperationKind) -> Self {
+        self.identity.key(self.scope.clone(), operation)
     }
 
     pub(crate) fn canonical_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(self.wire_identity.len() + 96);
+        let mut bytes = Vec::with_capacity(self.identity.0.wire_identity.len() + 96);
         bytes.extend_from_slice(MAGIC);
         bytes.push(VERSION);
         bytes.push(FIELD_WIRE);
-        put_bytes(&mut bytes, &self.wire_identity);
-        encode_ingress(&mut bytes, self.ingress);
-        encode_policy(&mut bytes, self.policy_id.as_ref());
+        put_bytes(&mut bytes, &self.identity.0.wire_identity);
+        encode_ingress(&mut bytes, self.identity.0.ingress);
+        encode_policy(&mut bytes, self.identity.0.policy_id.as_ref());
         encode_scope(&mut bytes, &self.scope);
         bytes.extend_from_slice(&[
             FIELD_OPERATION,
@@ -67,7 +104,12 @@ impl CacheKey {
         ]);
         bytes
     }
+    pub(crate) const fn shard_hash(&self) -> u64 {
+        self.shard_hash
+    }
 
+    /// SQLite and legacy callers use this stable, human-safe encoding. Runtime
+    /// cache paths should use the binary `CacheKey` directly.
     pub(crate) fn storage_key(&self) -> String {
         let canonical = self.canonical_bytes();
         format!(
@@ -82,15 +124,15 @@ impl CacheKey {
     }
 
     pub(crate) fn wire_identity(&self) -> &[u8] {
-        &self.wire_identity
+        &self.identity.0.wire_identity
     }
 
-    pub(crate) const fn ingress(&self) -> IngressProfile {
-        self.ingress
+    pub(crate) fn ingress(&self) -> IngressProfile {
+        self.identity.0.ingress
     }
 
-    pub(crate) const fn policy_id(&self) -> Option<&PolicyId> {
-        self.policy_id.as_ref()
+    pub(crate) fn policy_id(&self) -> Option<&PolicyId> {
+        self.identity.0.policy_id.as_ref()
     }
 
     pub(crate) const fn scope(&self) -> &RequestScope {
@@ -104,13 +146,12 @@ impl CacheKey {
         scope: RequestScope,
         operation: OperationKind,
     ) -> Self {
-        Self {
+        KeyIdentity(Arc::new(KeyIdentityData {
             wire_identity: wire_identity.into(),
             ingress,
             policy_id: None,
-            scope,
-            operation,
-        }
+        }))
+        .key(scope, operation)
     }
 }
 

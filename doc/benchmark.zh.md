@@ -508,6 +508,24 @@ p99 至少改善 30%；steady path 在目标吞吐 70% 以下须保持 p99 至�
 steady CPU 与 p50 回退最多 5%；IPv4/IPv6 client-observed reply tuple 必须不变。
 **本地 worktree 未运行 deployment gate，因此不声称达到任何网络延迟 gate。**
 
+## Release profile 与 allocator 矩阵
+
+`bench/release-matrix.sh` 对比显式的 `release-size`、
+`release-size-thin`、`release-speed` 与 `release-speed-thin` profile，并配对
+三种 allocator arm：关闭 collect 的 mimalloc、60 秒 collect 的 mimalloc，以及
+系统 allocator。每个 cell 使用隔离的 Cargo、workload cache 与 run 目录，并输出
+machine metadata、JSONL/CSV build 和 performance 记录。
+
+不编译即可验证全部四种受支持 target 配置：
+
+```bash
+bench/release-matrix.sh --all-targets --dry-run --output /tmp/honk-release-matrix
+```
+
+主机实测需要提供可执行的 `--benchmark-hook`；其 RSS/PSS/fault/CPU/latency 字段
+契约可由 `bench/release-matrix.sh --help` 查看。只能在同一机器和 workload 下比较
+cell。该矩阵记录证据；没有部署吞吐与尾延迟结果时，不据此切换发布 profile。
+
 ## 生产备注(10.10.10.1 网关)
 
 - 每次部署后 TCP(google/baidu/cloudflare)与 HTTP/3(cloudflare)通过;

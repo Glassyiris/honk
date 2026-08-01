@@ -26,7 +26,7 @@ const COMMAND_CAPACITY: usize = 4096;
 struct Put {
     epoch: u64,
     key: CacheKey,
-    response: Vec<u8>,
+    response: bytes::Bytes,
     expire_at_unix: u64,
 }
 
@@ -103,7 +103,7 @@ impl DnsCachePersister {
         }
     }
 
-    pub(crate) fn save(&self, key: CacheKey, response: Vec<u8>, expire_at_unix: u64) {
+    pub(crate) fn save(&self, key: CacheKey, response: bytes::Bytes, expire_at_unix: u64) {
         let command = Command::Put(Put {
             epoch: self.epoch.load(Ordering::SeqCst),
             key,

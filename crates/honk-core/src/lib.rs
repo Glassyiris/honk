@@ -848,6 +848,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                         external_ui: clash_cfg.external_ui.clone(),
                         log_tx: clash_log_tx.clone(),
                         dns_service: control_plane.dns_service(),
+                        stream_samplers: std::sync::Arc::new(clash_api::StreamSamplers::new()),
                     });
                     tokio::spawn(clash_api::serve(state, listen));
                 }

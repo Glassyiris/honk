@@ -33,7 +33,7 @@ pub(super) fn restore(
                     counters.corrupt.fetch_add(1, Ordering::Relaxed);
                     continue;
                 };
-                cache.put_restored(entry.key.storage_key(), entry.response, ttl);
+                cache.put_restored_exact(entry.key, entry.response, ttl);
                 restored = restored.saturating_add(1);
                 counters.restored.fetch_add(1, Ordering::Relaxed);
             }

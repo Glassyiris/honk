@@ -49,13 +49,13 @@ fn test_serve_stale_window() {
 #[test]
 fn test_stale_retention_exceeded() {
     let entry = CachedEntry {
-        response: vec![],
+        response: bytes::Bytes::new(),
         expires_at: Instant::now() - Duration::from_secs(7200),
         min_ttl: 1,
     };
     assert!(entry.is_stale_retention_exceeded());
     let fresh = CachedEntry {
-        response: vec![],
+        response: bytes::Bytes::new(),
         expires_at: Instant::now() - Duration::from_secs(10),
         min_ttl: 1,
     };
@@ -65,7 +65,7 @@ fn test_stale_retention_exceeded() {
 #[test]
 fn test_remaining_ttl() {
     let entry = CachedEntry {
-        response: vec![],
+        response: bytes::Bytes::new(),
         expires_at: Instant::now() + Duration::from_secs(45),
         min_ttl: 45,
     };

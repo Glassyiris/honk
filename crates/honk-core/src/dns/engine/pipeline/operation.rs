@@ -3,7 +3,6 @@ use std::time::Duration;
 use tracing::debug;
 
 use super::{ExecutionContext, cache};
-use crate::dns::cache::{CacheKey, OperationKind};
 use crate::dns::engine::ResponseDirective;
 use crate::dns::forwarder::{
     DnsForwardError, ResolveMode, SERVE_STALE_TTL_SECS, make_empty_response, traversal_strings,
@@ -100,12 +99,7 @@ pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, Dn
         }
     };
 
-    let exact_cache_key = CacheKey::new(
-        context.prepared.query(),
-        context.engine.policy_id().cloned(),
-        context.request_scope.clone(),
-        OperationKind::Resolve,
-    );
+    let exact_cache_key = context.cache_key.clone();
     let expiry = cache::store(context, &exact_cache_key, &mut response, class).await;
     if let Some(notifier) = &context.forwarder.notifier {
         notifier.on_domain_resolved(context.prepared.domain(), &response);

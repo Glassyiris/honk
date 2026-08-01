@@ -69,9 +69,26 @@ impl DnsCache {
         self.service.is_empty()
     }
 
+    #[cfg(feature = "dns-bench")]
+    pub fn benchmark_get(&self, key: &str) -> Option<CachedEntry> {
+        self.service.get(key)
+    }
+
+    #[cfg(feature = "dns-bench")]
+    pub fn benchmark_put(&self, key: String, response: Vec<u8>, min_ttl: u32) {
+        self.service.put(key, response, min_ttl);
+    }
+
+    #[cfg(feature = "dns-bench")]
+    pub fn benchmark_shard_index(&self, key: &str) -> usize {
+        self.service
+            .shard_index(&super::service::CacheSlot::Legacy(key.to_owned()))
+    }
+
     #[cfg(test)]
     pub(super) fn shard_index(&self, key: &str) -> usize {
-        self.service.shard_index(key)
+        self.service
+            .shard_index(&super::service::CacheSlot::Legacy(key.to_owned()))
     }
 
     #[cfg(test)]

@@ -43,6 +43,9 @@ pub struct ConnState {
 pub enum BpfStatsKey {
     UdpConnOverflow = 0,
     TcpConnOverflow = 1,
+    RedirectTrackInsertFailure = 2,
+    RoutingHandoffInsertFailure = 3,
+    CookiePidInsertFailure = 4,
 }
 
 /// CONN_STATE_MAP capacity, shared by the eBPF map definition and the

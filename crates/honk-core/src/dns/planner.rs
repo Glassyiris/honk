@@ -119,7 +119,10 @@ impl Planner {
     }
 
     pub fn plan_request(&self, context: RequestContext<'_>) -> Result<RequestPlan, PlanError> {
-        match self.router.select_request(context.domain, context.qtype) {
+        match self
+            .router
+            .select_request_normalized(context.domain, context.qtype)
+        {
             DnsRequestDecision::Reject => Ok(RequestPlan::Reject),
             DnsRequestDecision::AsIs => context
                 .original_dst
@@ -138,7 +141,7 @@ impl Planner {
         context: ResponseContext<'_>,
         traversal: ResponseTraversal,
     ) -> Result<ResponsePlan, PlanError> {
-        match self.router.select_response(
+        match self.router.select_response_normalized(
             context.domain,
             context.qtype,
             context.answer_ips,

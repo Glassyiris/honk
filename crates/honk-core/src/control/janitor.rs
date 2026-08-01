@@ -19,13 +19,13 @@
 //!   fail-closed last resort)
 
 use crate::ebpf::EbpfBackend;
+use honk_ebpf_common::TuplesKey;
 use honk_ebpf_common::conn::{
-    MAX_CONN_STATE_NUM, TCP_CONN_STATE_CLOSING_TIMEOUT_NS, TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS,
-    TcpState, UDP_CONN_STATE_TIMEOUT_NS,
+    BpfStatsKey, ConnState, MAX_CONN_STATE_NUM, TCP_CONN_STATE_CLOSING_TIMEOUT_NS,
+    TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS, TcpState, UDP_CONN_STATE_TIMEOUT_NS,
 };
-use honk_ebpf_common::{RedirectTuple, TuplesKey};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
@@ -64,6 +64,14 @@ const PRESSURE_EXIT_ROUNDS: u32 = 3;
 
 /// TCP protocol number in `TuplesKey::l4proto`.
 const IPPROTO_TCP: u8 = 6;
+/// Entries examined or retained by one janitor pass.  A later pass resumes
+/// naturally; bounded work is preferable to delaying the async runtime.
+const JANITOR_SCAN_CHUNK: usize = 256;
+const AUX_MAP_CAPACITY: usize = 65_536;
+const AUX_MAP_PRESSURE_WATERMARK: f64 = 0.80;
+const JANITOR_MAX_CANDIDATES: usize = 1024;
+/// Per-map wall-clock budget for a janitor round. Work resumes next round.
+const JANITOR_SCAN_BUDGET: Duration = Duration::from_millis(100);
 
 /// Live CONN_STATE_MAP occupancy estimate, derived from the datapath's
 /// insert/delete counters plus the janitor's own delete accounting, and
@@ -156,6 +164,9 @@ impl BpfJanitor {
 
             let mut pressure = PressureState::default();
             let mut gauge = OccupancyGauge::default();
+            let mut aux_scan_high_water = [0usize; 3];
+            let mut last_aux_failures = [0u64; 3];
+            let mut aux_pressure_warned = [false; 3];
 
             let mut last_redirect_cleanup = tokio::time::Instant::now();
             let mut last_cookie_pid_cleanup = tokio::time::Instant::now();
@@ -236,25 +247,53 @@ impl BpfJanitor {
                 }
 
                 if last_redirect_cleanup + redirect_interval <= now {
-                    self.cleanup_redirect_track().await;
+                    let (_, scanned) = self.cleanup_redirect_track().await;
+                    aux_scan_high_water[0] = aux_scan_high_water[0].max(scanned);
                     last_redirect_cleanup = now;
                 }
                 if last_cookie_pid_cleanup + redirect_interval <= now {
-                    self.cleanup_cookie_pid().await;
+                    let (_, scanned) = self.cleanup_cookie_pid().await;
+                    aux_scan_high_water[1] = aux_scan_high_water[1].max(scanned);
                     last_cookie_pid_cleanup = now;
                 }
 
                 if last_routing_handoff + routing_interval <= now {
-                    self.cleanup_routing_handoff().await;
+                    let (_, scanned) = self.cleanup_routing_handoff().await;
+                    aux_scan_high_water[2] = aux_scan_high_water[2].max(scanned);
                     last_routing_handoff = now;
                 }
 
                 if last_health_check + Duration::from_secs(HEALTH_CHECK_INTERVAL_SECS) <= now {
-                    self.check_map_health(utilization).await;
+                    self.check_map_health(
+                        utilization,
+                        aux_scan_high_water,
+                        &mut last_aux_failures,
+                        &mut aux_pressure_warned,
+                    )
+                    .await;
                     last_health_check = now;
                 }
             }
         })
+    }
+    async fn run_blocking_scan<T, F>(&self, label: &'static str, work: F) -> Option<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut dyn EbpfBackend) -> T + Send + 'static,
+    {
+        let ebpf = Arc::clone(&self.ebpf);
+        match tokio::task::spawn_blocking(move || {
+            let mut ebpf = ebpf.blocking_write();
+            work(ebpf.as_mut())
+        })
+        .await
+        {
+            Ok(result) => Some(result),
+            Err(error) => {
+                error!(%error, map = label, "BPF janitor blocking scan task failed");
+                None
+            }
+        }
     }
 
     /// Clean up expired conn-state entries with state-based timeouts
@@ -268,22 +307,19 @@ impl BpfJanitor {
     ) -> (u64, usize) {
         let now_ns = match monotonic_now_ns() {
             Ok(ns) => ns,
-            Err(e) => {
-                error!("BPF janitor: failed to get monotonic time: {}", e);
+            Err(error) => {
+                error!(%error, "BPF janitor: failed to get monotonic time");
                 return (0, 0);
             }
         };
-
-        // Stream the map in bounded chunks instead of one 524K-entry
-        // snapshot: memory stays flat regardless of map occupancy. Expired
-        // keys are collected and removed in bounded batches too.
-        let mut expired: Vec<TuplesKey> = Vec::with_capacity(1024);
-        let mut total = 0usize;
-        let mut scan_ok = true;
-        {
-            let ebpf = self.ebpf.read().await;
-            if ebpf
-                .conn_state_for_each_chunk(1024, &mut |chunk| {
+        let result = self
+            .run_blocking_scan("conn-state", move |ebpf| {
+                let deadline = Instant::now() + JANITOR_SCAN_BUDGET;
+                let mut expired =
+                    Vec::<(TuplesKey, ConnState)>::with_capacity(JANITOR_MAX_CANDIDATES);
+                let mut total = 0usize;
+                let mut completed = true;
+                ebpf.conn_state_for_each_chunk(JANITOR_SCAN_CHUNK, &mut |chunk| {
                     total += chunk.len();
                     for (key, state) in chunk {
                         let age = now_ns.saturating_sub(state.last_seen_ns);
@@ -297,184 +333,201 @@ impl BpfJanitor {
                             age > UDP_CONN_STATE_TIMEOUT_NS
                         };
                         if stale {
-                            expired.push(*key);
+                            expired.push((*key, *state));
                         }
                     }
-                })
-                .is_err()
-            {
-                scan_ok = false;
-            }
-        }
-        if !scan_ok {
-            return (0, 0);
-        }
-        let ((inserts, ebpf_deletes), userspace_deletes) = occ_counters;
-        gauge.calibrate(total as u64, inserts, ebpf_deletes, userspace_deletes);
-
-        let deleted = expired.len() as u64;
-        if !expired.is_empty() {
-            let mut ebpf = self.ebpf.write().await;
-            for batch in expired.chunks(1024) {
-                if let Err(e) = ebpf.conn_state_remove_batch(batch) {
-                    debug!("BPF janitor: failed to batch-remove conn states: {}", e);
-                    break;
+                    let keep_scanning =
+                        expired.len() < JANITOR_MAX_CANDIDATES && Instant::now() < deadline;
+                    completed &= keep_scanning;
+                    keep_scanning
+                })?;
+                expired.truncate(JANITOR_MAX_CANDIDATES);
+                let deleted = if expired.is_empty() {
+                    0
                 } else {
-                    gauge.note_janitor_deletes(batch.len() as u64);
-                }
+                    ebpf.conn_state_remove_if_unchanged(&expired, now_ns)?
+                };
+                anyhow::Ok((deleted, total, completed))
+            })
+            .await;
+        let Some(result) = result else {
+            return (0, 0);
+        };
+        let (deleted, total, completed) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                debug!(%error, "BPF janitor: conn-state scan failed");
+                return (0, 0);
             }
+        };
+        if completed {
+            let ((inserts, ebpf_deletes), userspace_deletes) = occ_counters;
+            gauge.calibrate(total as u64, inserts, ebpf_deletes, userspace_deletes);
         }
-
+        gauge.note_janitor_deletes(deleted);
         (deleted, total)
     }
 
     /// Clean up stale redirect track entries.
-    async fn cleanup_redirect_track(&self) -> u64 {
+    async fn cleanup_redirect_track(&self) -> (u64, usize) {
         let now_ns = match monotonic_now_ns() {
             Ok(ns) => ns,
-            Err(e) => {
-                error!("BPF janitor: failed to get monotonic time: {}", e);
-                return 0;
+            Err(error) => {
+                error!(%error, "BPF janitor: failed to get monotonic time");
+                return (0, 0);
             }
         };
-
-        // Batched snapshot under a read lock (one syscall per 128 entries on
-        // capable kernels); the expiry predicate runs in memory afterwards.
-        let mut entries = Vec::new();
-        {
-            let ebpf = self.ebpf.read().await;
-            if ebpf.redirect_track_snapshot(&mut entries).is_err() {
-                return 0;
-            }
-        }
-
-        let expired: Vec<RedirectTuple> = entries
-            .iter()
-            .filter(|(_, entry)| {
-                now_ns.saturating_sub(entry.last_seen_ns) > REDIRECT_TRACK_TIMEOUT_NS
+        let result = self
+            .run_blocking_scan("redirect-track", move |ebpf| {
+                let deadline = Instant::now() + JANITOR_SCAN_BUDGET;
+                let mut expired = Vec::with_capacity(JANITOR_MAX_CANDIDATES);
+                let mut total = 0usize;
+                ebpf.redirect_track_for_each_chunk(JANITOR_SCAN_CHUNK, &mut |chunk| {
+                    total += chunk.len();
+                    for (key, entry) in chunk {
+                        if now_ns.saturating_sub(entry.last_seen_ns) > REDIRECT_TRACK_TIMEOUT_NS {
+                            expired.push((*key, *entry));
+                        }
+                    }
+                    expired.len() < JANITOR_MAX_CANDIDATES && Instant::now() < deadline
+                })?;
+                expired.truncate(JANITOR_MAX_CANDIDATES);
+                let deleted = if expired.is_empty() {
+                    0
+                } else {
+                    ebpf.redirect_track_remove_if_unchanged(&expired, now_ns)?
+                };
+                anyhow::Ok((deleted, total))
             })
-            .map(|(key, _)| *key)
-            .collect();
-
-        if !expired.is_empty() {
-            let mut ebpf = self.ebpf.write().await;
-            if let Err(e) = ebpf.redirect_track_remove_batch(&expired) {
-                debug!("BPF janitor: failed to batch-remove redirect track: {}", e);
+            .await;
+        match result {
+            Some(Ok((deleted, total))) => {
+                if deleted > 0 {
+                    debug!(deleted, "BPF janitor: removed redirect track entries");
+                }
+                (deleted, total)
             }
+            Some(Err(error)) => {
+                debug!(%error, "BPF janitor: redirect-track scan failed");
+                (0, 0)
+            }
+            None => (0, 0),
         }
-
-        let deleted = expired.len();
-        if deleted > 0 {
-            debug!(
-                "BPF janitor: removed {} redirect track entries (total scanned: {})",
-                deleted,
-                entries.len()
-            );
-        }
-        deleted as u64
     }
 
     /// Clean up stale cookie PID metadata entries.
     ///
     /// Entries whose `last_seen_ns` is older than `COOKIE_PID_TIMEOUT_NS`
     /// are evicted, matching Go's `cleanupCookiePidMap` behaviour.
-    async fn cleanup_cookie_pid(&self) -> u64 {
+    async fn cleanup_cookie_pid(&self) -> (u64, usize) {
         let now_ns = match monotonic_now_ns() {
             Ok(ns) => ns,
-            Err(e) => {
-                error!("BPF janitor: failed to get monotonic time: {}", e);
-                return 0;
+            Err(error) => {
+                error!(%error, "BPF janitor: failed to get monotonic time");
+                return (0, 0);
             }
         };
-
-        let mut entries = Vec::new();
-        {
-            let ebpf = self.ebpf.read().await;
-            if ebpf.cookie_pid_snapshot(&mut entries).is_err() {
-                return 0;
+        let result = self
+            .run_blocking_scan("cookie-pid", move |ebpf| {
+                let deadline = Instant::now() + JANITOR_SCAN_BUDGET;
+                let mut expired = Vec::with_capacity(JANITOR_MAX_CANDIDATES);
+                let mut total = 0usize;
+                ebpf.cookie_pid_for_each_chunk(JANITOR_SCAN_CHUNK, &mut |chunk| {
+                    total += chunk.len();
+                    for (cookie, entry) in chunk {
+                        if now_ns.saturating_sub(entry.last_seen_ns) > COOKIE_PID_TIMEOUT_NS {
+                            expired.push((*cookie, *entry));
+                        }
+                    }
+                    expired.len() < JANITOR_MAX_CANDIDATES && Instant::now() < deadline
+                })?;
+                expired.truncate(JANITOR_MAX_CANDIDATES);
+                let deleted = if expired.is_empty() {
+                    0
+                } else {
+                    ebpf.cookie_pid_remove_if_unchanged(&expired, now_ns)?
+                };
+                anyhow::Ok((deleted, total))
+            })
+            .await;
+        match result {
+            Some(Ok((deleted, total))) => {
+                if deleted > 0 {
+                    debug!(deleted, "BPF janitor: removed cookie PID entries");
+                }
+                (deleted, total)
             }
-        }
-
-        let expired: Vec<u64> = entries
-            .iter()
-            .filter(|(_, entry)| now_ns.saturating_sub(entry.last_seen_ns) > COOKIE_PID_TIMEOUT_NS)
-            .map(|(cookie, _)| *cookie)
-            .collect();
-
-        if !expired.is_empty() {
-            let mut ebpf = self.ebpf.write().await;
-            if let Err(e) = ebpf.cookie_pid_remove_batch(&expired) {
-                debug!(
-                    "BPF janitor: failed to batch-remove cookie PID entries: {}",
-                    e
-                );
+            Some(Err(error)) => {
+                debug!(%error, "BPF janitor: cookie-PID scan failed");
+                (0, 0)
             }
+            None => (0, 0),
         }
-
-        let deleted = expired.len();
-        if deleted > 0 {
-            debug!(
-                "BPF janitor: removed {} cookie PID entries (total scanned: {})",
-                deleted,
-                entries.len()
-            );
-        }
-        deleted as u64
     }
 
     /// Clean up expired routing handoff entries.
-    ///
-    /// The handoff map is a short-lived bridge for userspace consumers that
-    /// miss the authoritative conn-state publication window.
-    async fn cleanup_routing_handoff(&self) -> u64 {
+    async fn cleanup_routing_handoff(&self) -> (u64, usize) {
         let now_ns = match monotonic_now_ns() {
             Ok(ns) => ns,
-            Err(e) => {
-                error!("BPF janitor: failed to get monotonic time: {}", e);
-                return 0;
+            Err(error) => {
+                error!(%error, "BPF janitor: failed to get monotonic time");
+                return (0, 0);
             }
         };
-
-        let mut entries = Vec::new();
-        {
-            let ebpf = self.ebpf.read().await;
-            if ebpf.routing_handoff_snapshot(&mut entries).is_err() {
-                return 0;
-            }
-        }
-
-        let expired: Vec<TuplesKey> = entries
-            .iter()
-            .filter(|(_, entry)| {
-                now_ns.saturating_sub(entry.last_seen_ns) > ROUTING_HANDOFF_TIMEOUT_NS
+        let result = self
+            .run_blocking_scan("routing-handoff", move |ebpf| {
+                let deadline = Instant::now() + JANITOR_SCAN_BUDGET;
+                let mut expired = Vec::with_capacity(JANITOR_MAX_CANDIDATES);
+                let mut total = 0usize;
+                ebpf.routing_handoff_for_each_chunk(JANITOR_SCAN_CHUNK, &mut |chunk| {
+                    total += chunk.len();
+                    for (key, entry) in chunk {
+                        if now_ns.saturating_sub(entry.last_seen_ns) > ROUTING_HANDOFF_TIMEOUT_NS {
+                            expired.push((*key, *entry));
+                        }
+                    }
+                    expired.len() < JANITOR_MAX_CANDIDATES && Instant::now() < deadline
+                })?;
+                expired.truncate(JANITOR_MAX_CANDIDATES);
+                let deleted = if expired.is_empty() {
+                    0
+                } else {
+                    ebpf.routing_handoff_remove_if_unchanged(&expired, now_ns)?
+                };
+                anyhow::Ok((deleted, total))
             })
-            .map(|(key, _)| *key)
-            .collect();
-
-        if !expired.is_empty() {
-            let mut ebpf = self.ebpf.write().await;
-            if let Err(e) = ebpf.routing_handoff_remove_batch(&expired) {
-                debug!("BPF janitor: failed to batch-remove routing handoff: {}", e);
+            .await;
+        match result {
+            Some(Ok((deleted, total))) => {
+                if deleted > 0 {
+                    debug!(deleted, "BPF janitor: removed routing handoff entries");
+                }
+                (deleted, total)
             }
+            Some(Err(error)) => {
+                debug!(%error, "BPF janitor: routing-handoff scan failed");
+                (0, 0)
+            }
+            None => (0, 0),
         }
-
-        let deleted = expired.len();
-        if deleted > 0 {
-            debug!(
-                "BPF janitor: removed {} routing handoff entries (total scanned: {})",
-                deleted,
-                entries.len()
-            );
-        }
-        deleted as u64
     }
 
     /// Check BPF map health — overflow counter warnings plus conn-state
     /// occupancy watermark warnings.
-    async fn check_map_health(&self, utilization: f64) {
+    async fn check_map_health(
+        &self,
+        utilization: f64,
+        aux_scan_high_water: [usize; 3],
+        last_aux_failures: &mut [u64; 3],
+        aux_pressure_warned: &mut [bool; 3],
+    ) {
         let ebpf = self.ebpf.read().await;
-        let udp_overflow = ebpf.get_bpf_stats(0).unwrap_or(None).unwrap_or(0);
-        let tcp_overflow = ebpf.get_bpf_stats(1).unwrap_or(None).unwrap_or(0);
+        let stat = |key: BpfStatsKey| ebpf.get_bpf_stats(key as u32).unwrap_or(None).unwrap_or(0);
+        let udp_overflow = stat(BpfStatsKey::UdpConnOverflow);
+        let tcp_overflow = stat(BpfStatsKey::TcpConnOverflow);
+        let redirect_failures = stat(BpfStatsKey::RedirectTrackInsertFailure);
+        let handoff_failures = stat(BpfStatsKey::RoutingHandoffInsertFailure);
+        let cookie_failures = stat(BpfStatsKey::CookiePidInsertFailure);
         drop(ebpf);
 
         if udp_overflow > 0 || tcp_overflow > 0 {
@@ -484,6 +537,41 @@ impl BpfJanitor {
                  Consider increasing map capacity.",
                 udp_overflow, tcp_overflow
             );
+        }
+        let aux_failures = [redirect_failures, handoff_failures, cookie_failures];
+        if aux_failures
+            .iter()
+            .zip(last_aux_failures.iter())
+            .any(|(current, previous)| current > previous)
+        {
+            warn!(
+                redirect_failures,
+                handoff_failures,
+                cookie_failures,
+                "BPF janitor: auxiliary map insert failures increased"
+            );
+        }
+        *last_aux_failures = aux_failures;
+
+        for (index, (map, entries)) in [
+            ("redirect-track", aux_scan_high_water[0]),
+            ("cookie-pid", aux_scan_high_water[1]),
+            ("routing-handoff", aux_scan_high_water[2]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let utilization = entries as f64 / AUX_MAP_CAPACITY as f64;
+            if utilization >= AUX_MAP_PRESSURE_WATERMARK && !aux_pressure_warned[index] {
+                warn!(
+                    map,
+                    entries,
+                    capacity = AUX_MAP_CAPACITY,
+                    utilization_pct = utilization * 100.0,
+                    "BPF janitor: auxiliary map scan high-water indicates pressure"
+                );
+                aux_pressure_warned[index] = true;
+            }
         }
 
         if udp_overflow > 100 {

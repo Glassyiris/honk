@@ -56,32 +56,79 @@ impl OutboundCapabilities {
     }
 }
 
-/// The session-layer runtime for one node. AnyTLS is active now; deferred
-/// owners are:
-/// - `TrojanGo(Arc<SessionPool<MuxConnection>>)`
-/// - `H2(Arc<SessionPool<MuxSession>>)`
-/// - `Quic` runtimes (hy2/tuic/juicity, not a shared SessionPool)
+/// The session-layer runtime for one node. AnyTLS owns a `SessionPool`; QUIC
+/// protocols own their connection/auth state here instead of in handlers so
+/// a reload cannot send an old flow to a newly published generation.
 #[derive(Debug)]
 pub enum ProtocolRuntime {
     None,
     /// AnyTLS: the node's own session pool (2B). One pool per node — no
     /// static/global pool, no shared string keys.
     AnyTls(AnyTlsRuntime),
+    /// TUIC, Juicity, and Hysteria2: type-erased, node-local client slots.
+    /// Each concrete handler occupies one slot and retains its own typed
+    /// `QuicClient`; the runtime retains it for this generation's lifetime.
+    Quic(QuicRuntime),
 }
 
-/// AnyTLS session runtime: owns the node's `SessionPool`.
+/// Generation-owned storage for protocol-specific QUIC clients.
+///
+/// The mutex deliberately covers construction: TLS config construction may
+/// perform ECH discovery, and admitting two first flows must still result in
+/// one client/connection single-flight for this generation.
+pub struct QuicRuntime {
+    clients: tokio::sync::Mutex<HashMap<std::any::TypeId, Arc<dyn std::any::Any + Send + Sync>>>,
+}
+
+impl std::fmt::Debug for QuicRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QuicRuntime").finish_non_exhaustive()
+    }
+}
+
+impl QuicRuntime {
+    fn new() -> Self {
+        Self {
+            clients: tokio::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub async fn client<T, F, Fut>(&self, build: F) -> anyhow::Result<Arc<T>>
+    where
+        T: std::any::Any + Send + Sync + 'static,
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = anyhow::Result<Arc<T>>>,
+    {
+        let mut clients = self.clients.lock().await;
+        let key = std::any::TypeId::of::<T>();
+        if let Some(client) = clients.get(&key) {
+            return Arc::downcast::<T>(Arc::clone(client))
+                .map_err(|_| anyhow::anyhow!("QUIC client slot type mismatch"));
+        }
+        let client = build().await?;
+        let erased: Arc<dyn std::any::Any + Send + Sync> = client.clone();
+        clients.insert(key, erased);
+        Ok(client)
+    }
+}
+
+/// AnyTLS session runtime: owns the node's `SessionPool` and its immutable
+/// TLS setup. Keeping the connector here makes root-store, pin, and static
+/// ECH parsing generation-owned rather than session-owned.
 #[derive(Debug)]
 pub struct AnyTlsRuntime {
     pub(crate) pool: Arc<crate::proxy::anytls::AnyTlsPool>,
+    pub(crate) tls: Arc<crate::tls::TlsConnector>,
 }
 
 impl AnyTlsRuntime {
-    fn new() -> Self {
-        Self {
+    fn new(node: &Node) -> anyhow::Result<Self> {
+        Ok(Self {
             pool: Arc::new(crate::session::SessionPool::new(
                 crate::proxy::anytls::session_pool_config(),
             )),
-        }
+            tls: Arc::new(crate::tls::build_connector(node)?),
+        })
     }
 }
 
@@ -103,6 +150,12 @@ pub enum RuntimeRegistryError {
     NilId(String),
     #[error("duplicate node UUID {0} (nodes '{1}' and '{2}')")]
     DuplicateId(uuid::Uuid, String, String),
+    #[error("node '{node}' has invalid TLS configuration: {source}")]
+    Tls {
+        node: String,
+        #[source]
+        source: anyhow::Error,
+    },
 }
 
 /// The single owner of per-node session runtimes for one config
@@ -128,7 +181,17 @@ impl OutboundRuntimeRegistry {
                 return Err(RuntimeRegistryError::NilId(node.name.clone()));
             }
             let protocol_runtime = match node.protocol {
-                NodeProtocol::AnyTLS => ProtocolRuntime::AnyTls(AnyTlsRuntime::new()),
+                NodeProtocol::AnyTLS => {
+                    ProtocolRuntime::AnyTls(AnyTlsRuntime::new(node).map_err(|source| {
+                        RuntimeRegistryError::Tls {
+                            node: node.name.clone(),
+                            source,
+                        }
+                    })?)
+                }
+                NodeProtocol::Hysteria2 | NodeProtocol::Tuic | NodeProtocol::Juicity => {
+                    ProtocolRuntime::Quic(QuicRuntime::new())
+                }
                 _ => ProtocolRuntime::None,
             };
             let runtime = Arc::new(NodeRuntime {
@@ -215,6 +278,31 @@ mod tests {
             address: "1.2.3.4:443".to_string(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn anytls_connector_is_shared_within_generation_and_rebuilt_on_reload() {
+        let node = node("anytls", NodeProtocol::AnyTLS);
+        let first = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
+        let first_runtime = first.get(&node.id).unwrap();
+        let first_connector = match &first_runtime.runtime {
+            ProtocolRuntime::AnyTls(runtime) => Arc::clone(&runtime.tls),
+            _ => panic!("AnyTLS must own a TLS connector"),
+        };
+        let same_generation = first.get(&node.id).unwrap();
+        let same_connector = match &same_generation.runtime {
+            ProtocolRuntime::AnyTls(runtime) => Arc::clone(&runtime.tls),
+            _ => panic!("AnyTLS must own a TLS connector"),
+        };
+        assert!(Arc::ptr_eq(&first_connector, &same_connector));
+
+        let reloaded = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
+        let reloaded_runtime = reloaded.get(&node.id).unwrap();
+        let reloaded_connector = match &reloaded_runtime.runtime {
+            ProtocolRuntime::AnyTls(runtime) => Arc::clone(&runtime.tls),
+            _ => panic!("AnyTLS must own a TLS connector"),
+        };
+        assert!(!Arc::ptr_eq(&first_connector, &reloaded_connector));
     }
 
     #[test]

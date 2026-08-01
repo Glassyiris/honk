@@ -28,7 +28,8 @@ pub(crate) fn sk_assign_by_index(
     index: &u32,
     flags: u64,
 ) -> Result<(), c_long> {
-    let sk = unsafe { bpf_map_lookup_elem(map as *mut c_void, index as *const u32 as *const c_void) };
+    let sk =
+        unsafe { bpf_map_lookup_elem(map as *mut c_void, index as *const u32 as *const c_void) };
     if sk.is_null() {
         return Err(-(ENOENT as c_long));
     }

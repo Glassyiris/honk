@@ -193,6 +193,15 @@ impl DnsController {
                 let resp = outcome.rendered().to_vec();
                 (resp, true)
             }
+            Err(e)
+                if e.downcast_ref::<crate::dns::forwarder::DnsForwardError>()
+                    .is_some_and(|error| {
+                        matches!(error, crate::dns::forwarder::DnsForwardError::Overloaded)
+                    }) =>
+            {
+                crate::stats::record_dns_event(crate::stats::DnsStatEvent::OutcomeRejected);
+                (transport::build_dns_refused(data), false)
+            }
             Err(e) => {
                 debug!("DNS controller forward failed: {}; sending SERVFAIL", e);
                 (build_dns_servfail(data), true)

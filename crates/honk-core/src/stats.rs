@@ -155,6 +155,11 @@ struct UdpStats {
     slow_permit_rejected: AtomicU64,
     slow_permit_closed: AtomicU64,
     queue_accepted: AtomicU64,
+    /// Drop-newest because this flow's packet-slot bound was exhausted.
+    flow_queue_full: AtomicU64,
+    /// Drop-newest because the global retained-payload-byte bound was exhausted.
+    global_payload_full: AtomicU64,
+    /// Aggregate retained-queue drops retained for the stable API schema.
     queue_full: AtomicU64,
     queue_closed: AtomicU64,
     first_send_failures: AtomicU64,
@@ -181,6 +186,8 @@ pub struct UdpStatsSnapshot {
     pub slow_permit_rejected: u64,
     pub slow_permit_closed: u64,
     pub queue_accepted: u64,
+    pub flow_queue_full: u64,
+    pub global_payload_full: u64,
     pub queue_full: u64,
     pub queue_closed: u64,
     pub first_send_failures: u64,
@@ -207,8 +214,10 @@ impl UdpStats {
             slow_permit_rejected: self.slow_permit_rejected.load(Ordering::Relaxed),
             slow_permit_closed: self.slow_permit_closed.load(Ordering::Relaxed),
             queue_accepted: self.queue_accepted.load(Ordering::Relaxed),
-            queue_full: self.queue_full.load(Ordering::Relaxed),
+            flow_queue_full: self.flow_queue_full.load(Ordering::Relaxed),
+            global_payload_full: self.global_payload_full.load(Ordering::Relaxed),
             queue_closed: self.queue_closed.load(Ordering::Relaxed),
+            queue_full: self.queue_full.load(Ordering::Relaxed),
             first_send_failures: self.first_send_failures.load(Ordering::Relaxed),
             stagger_attempts: self.stagger_attempts.load(Ordering::Relaxed),
             stagger_winners: self.stagger_winners.load(Ordering::Relaxed),
@@ -263,6 +272,22 @@ impl StatsManager {
             .entry(outbound.to_string())
             .or_default()
             .clone();
+        tracker.increment_connections();
+        ActiveConnectionGuard { tracker }
+    }
+
+    /// Resolve an outbound tracker once for a long-lived data path. Callers
+    /// that already retain the returned value avoid allocating an outbound
+    /// name and taking a DashMap shard lock for every packet.
+    pub fn outbound_tracker(&self, outbound: &str) -> OutboundTracker {
+        self.trackers
+            .entry(outbound.to_owned())
+            .or_default()
+            .clone()
+    }
+
+    /// Track one connection using an already-resolved tracker.
+    pub fn track_outbound(&self, tracker: OutboundTracker) -> ActiveConnectionGuard {
         tracker.increment_connections();
         ActiveConnectionGuard { tracker }
     }
@@ -349,8 +374,15 @@ impl StatsManager {
         self.udp.queue_accepted.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record drop-newest because a per-flow or global queue bound was full.
-    pub fn record_udp_queue_full(&self) {
+    /// Record drop-newest because a per-flow queue bound was full.
+    pub fn record_udp_flow_queue_full(&self) {
+        self.udp.flow_queue_full.fetch_add(1, Ordering::Relaxed);
+        self.udp.queue_full.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record drop-newest because the global retained-payload-byte bound was full.
+    pub fn record_udp_global_payload_full(&self) {
+        self.udp.global_payload_full.fetch_add(1, Ordering::Relaxed);
         self.udp.queue_full.fetch_add(1, Ordering::Relaxed);
     }
 
