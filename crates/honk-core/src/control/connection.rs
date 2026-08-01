@@ -448,10 +448,10 @@ impl ControlPlaneHandle {
                         db.get(matched.rule_name).cloned().unwrap_or_default()
                     };
                     if !bitmaps.is_empty() {
-                        let mut merged = DomainRouting { bitmap: [0u32; 4] };
+                        let mut merged = DomainRouting::default();
                         for bm in &bitmaps {
-                            for i in 0..4 {
-                                merged.bitmap[i] |= bm.bitmap[i];
+                            for (word, value) in merged.bitmap.iter_mut().zip(bm.bitmap) {
+                                *word |= value;
                             }
                         }
                         let prefix_len = if original_dst.ip().is_ipv4() { 32 } else { 128 };

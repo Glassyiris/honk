@@ -3,6 +3,10 @@ use aya_ebpf_bindings::bindings::{__be16, __u16};
 use crate::{TASK_COMM_LEN, dae_ip::In6Addr};
 
 pub const MAX_MATCH_SET_LEN: usize = 128;
+pub const ROUTING_BITMAP_WORDS_PER_GENERATION: usize = MAX_MATCH_SET_LEN / 32;
+pub const ROUTING_BITMAP_GENERATIONS: usize = 2;
+pub const ROUTING_BITMAP_WORDS: usize =
+    ROUTING_BITMAP_WORDS_PER_GENERATION * ROUTING_BITMAP_GENERATIONS;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -57,7 +61,19 @@ pub struct PortRange {
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
 pub struct DomainRouting {
-    pub bitmap: [u32; MAX_MATCH_SET_LEN / 32],
+    pub bitmap: [u32; ROUTING_BITMAP_WORDS],
+}
+
+impl DomainRouting {
+    pub fn for_generation(&self, generation: u32) -> Self {
+        let mut shifted = Self::default();
+        let offset = generation as usize * ROUTING_BITMAP_WORDS_PER_GENERATION;
+        if offset + ROUTING_BITMAP_WORDS_PER_GENERATION <= shifted.bitmap.len() {
+            shifted.bitmap[offset..offset + ROUTING_BITMAP_WORDS_PER_GENERATION]
+                .copy_from_slice(&self.bitmap[..ROUTING_BITMAP_WORDS_PER_GENERATION]);
+        }
+        shifted
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]

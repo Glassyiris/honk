@@ -10,7 +10,7 @@ use honk_ebpf_common::redirect_need::{
     DomainRouting, MAX_MATCH_SET_LEN, PIDName, RoutingHandoffEntry, TuplesKey,
 };
 use honk_ebpf_common::route::{MatchSet, ROUTING_META_MAP_LEN};
-use honk_ebpf_common::{DaeParam, RedirectEntry, RedirectTuple};
+use honk_ebpf_common::{DaeParam, ROUTING_MAP_LEN, RedirectEntry, RedirectTuple};
 
 use crate::route::{RouteCtx, WanEgressRouteScratch};
 use crate::transport::ParsedPacket;
@@ -77,18 +77,14 @@ pub static ROUTING_HANDOFF_MAP: HashMap<
 > = HashMap::new();
 
 #[btf_map]
-pub static ROUTING_MAP: Array<MatchSet, MAX_MATCH_SET_LEN, 0> = Array::new();
+/// Two physical rule banks. `ROUTING_META_MAP[0]` selects the active bank;
+/// the inactive bank is populated before that single-slot switch.
+pub static ROUTING_MAP: Array<MatchSet, ROUTING_MAP_LEN, 0> = Array::new();
 
-/// Routing meta block.
-///
-/// Slot 0 holds the active rule count; slots `[1..ROUTING_META_MAP_LEN)`
-/// hold the four (l4proto × ipversion) group bitmaps — see
-/// `honk_ebpf_common::route::ROUTING_META_MAP_LEN` for the exact layout.
-/// Userspace publishes the group bitmaps first and the count last, so the
-/// count remains the atomic switch of the two-phase routing commit.
+/// Routing metadata for the two rule banks. Slot 0 is the active generation;
+/// each following block contains one generation's count and group bitmaps.
 #[btf_map]
 pub static ROUTING_META_MAP: Array<u32, ROUTING_META_MAP_LEN, 0> = Array::new();
-
 #[btf_map]
 pub static DOMAIN_ROUTING_MAP: HashMap<[__be32; 4], DomainRouting, MAX_DOMAIN_ROUTING_NUM, 1> =
     HashMap::new();

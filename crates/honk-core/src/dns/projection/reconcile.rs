@@ -45,6 +45,7 @@ impl DesiredState {
                 }
                 Some(_) | None => {
                     self.dirty_ips.remove(&ip);
+                    self.retries.remove(&ip);
                 }
             }
             if sets.len() + removes.len() >= MAX_BATCH_ENTRIES {

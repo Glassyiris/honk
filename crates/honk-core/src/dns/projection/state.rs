@@ -207,7 +207,7 @@ impl DesiredState {
                     }
                 }
             }
-            if aggregate.bitmap == [0; 4] {
+            if aggregate.bitmap.iter().all(|word| *word == 0) {
                 self.desired.remove(&ip);
             } else {
                 self.desired.insert(ip, aggregate);
@@ -225,6 +225,28 @@ impl DesiredState {
             .collect::<BTreeSet<_>>();
         self.desired.clear();
         self.recompute_ips(ips);
+    }
+
+    pub(super) fn project(
+        &self,
+        snapshot: &RoutingProjectionSnapshot,
+    ) -> BTreeMap<IpAddr, DomainRouting> {
+        self.reverse
+            .iter()
+            .filter_map(|(ip, domains)| {
+                let mut aggregate = DomainRouting::default();
+                for domain in domains {
+                    if let Some(bitmap) = snapshot.bitmap_for(domain) {
+                        or_bitmap(&mut aggregate, &bitmap);
+                    }
+                }
+                aggregate
+                    .bitmap
+                    .iter()
+                    .any(|word| *word != 0)
+                    .then_some((*ip, aggregate))
+            })
+            .collect()
     }
 
     pub(super) fn expire(&mut self, now: Instant) {

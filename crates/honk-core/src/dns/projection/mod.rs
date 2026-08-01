@@ -52,7 +52,11 @@ impl RoutingProjectionSnapshot {
         for bitmap in bitmaps {
             or_bitmap(&mut aggregate, bitmap);
         }
-        (aggregate.bitmap != [0; 4]).then_some(aggregate)
+        aggregate
+            .bitmap
+            .iter()
+            .any(|word| *word != 0)
+            .then_some(aggregate)
     }
 }
 
@@ -148,6 +152,13 @@ impl RoutingProjection {
             state.update_snapshot(snapshot);
             0
         });
+    }
+
+    pub(crate) fn project(
+        &self,
+        snapshot: &RoutingProjectionSnapshot,
+    ) -> Vec<(IpAddr, DomainRouting)> {
+        self.state.lock().project(snapshot).into_iter().collect()
     }
 
     pub(crate) fn submit(

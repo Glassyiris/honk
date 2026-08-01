@@ -24,9 +24,9 @@ type TestProjection = (
 );
 
 fn bitmap(bit: u32) -> DomainRouting {
-    DomainRouting {
-        bitmap: [bit, 0, 0, 0],
-    }
+    let mut bitmap = DomainRouting::default();
+    bitmap.bitmap[0] = bit;
+    bitmap
 }
 
 fn snapshot(generation: u64, a: u32, b: u32) -> Arc<RoutingProjectionSnapshot> {
@@ -81,11 +81,14 @@ async fn shared_ip_clear_and_expiry_recompute_owner_or() {
     state.observe(positive("a.test", &[ip], Duration::from_secs(1)), now);
     state.observe(positive("b.test", &[ip], Duration::from_secs(5)), now);
     let batch = state.batch(now);
-    assert_eq!(batch.sets[0].bitmap.bitmap, [3, 0, 0, 0]);
+    assert_eq!(batch.sets[0].bitmap.bitmap, [3, 0, 0, 0, 0, 0, 0, 0]);
     assert!(state.commit_success(batch.generation, &batch.sets, &batch.removes));
 
     state.observe(ProjectionObservation::Clear { domain: "a.test" }, now);
-    assert_eq!(state.batch(now).sets[0].bitmap.bitmap, [2, 0, 0, 0]);
+    assert_eq!(
+        state.batch(now).sets[0].bitmap.bitmap,
+        [2, 0, 0, 0, 0, 0, 0, 0]
+    );
     tokio::time::advance(Duration::from_secs(5)).await;
     state.expire(tokio::time::Instant::now());
     assert_eq!(state.batch(tokio::time::Instant::now()).removes[0].ip, ip);
@@ -127,7 +130,7 @@ async fn generation_race_forces_full_recompute() {
     assert!(!state.commit_success(stale.generation, &stale.sets, &stale.removes));
     let rebuilt = state.batch(now);
     assert_eq!(rebuilt.generation, 2);
-    assert_eq!(rebuilt.sets[0].bitmap.bitmap, [4, 0, 0, 0]);
+    assert_eq!(rebuilt.sets[0].bitmap.bitmap, [4, 0, 0, 0, 0, 0, 0, 0]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -142,7 +145,7 @@ async fn same_generation_update_after_batch_snapshot_stays_dirty() {
 
     assert!(!state.commit_success(stale.generation, &stale.sets, &stale.removes));
     let repaired = state.batch(now);
-    assert_eq!(repaired.sets[0].bitmap.bitmap, [3, 0, 0, 0]);
+    assert_eq!(repaired.sets[0].bitmap.bitmap, [3, 0, 0, 0, 0, 0, 0, 0]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -160,7 +163,7 @@ async fn stale_runtime_observation_cannot_downgrade_generation() {
     state.observe(positive("a.test", &[ip], Duration::from_secs(30)), now);
     let batch = state.batch(now);
     assert_eq!(batch.generation, 2);
-    assert_eq!(batch.sets[0].bitmap.bitmap, [4, 0, 0, 0]);
+    assert_eq!(batch.sets[0].bitmap.bitmap, [4, 0, 0, 0, 0, 0, 0, 0]);
 }
 
 #[tokio::test(start_paused = true)]

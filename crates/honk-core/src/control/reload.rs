@@ -57,17 +57,15 @@ impl ControlPlane {
     /// replays the exact active plan before admission resumes. SIGHUP and
     /// subscription merges share this command-channel-serialized path.
     pub(super) async fn apply_runtime_config(&self, new_config: Config, drain: &DrainTracker) {
-        drain.start_rejecting();
-        // An old initializer must not publish a Ready endpoint across this
-        // runtime/config generation. Reject first, broadcast cancellation,
-        // and wait for lease Drop before touching live configuration.
-        if !self.udp_pool.cancel_initializers_and_wait().await {
-            error!("UDP initializer cancellation timed out; reload aborted before config swap");
-            self.stop_reload_rejection_if_healthy(drain);
+        let current_config = self.config.read().await.clone();
+        let restart_required = restart_required_changes(&current_config, &new_config);
+        if !restart_required.is_empty() {
+            error!(
+                fields = ?restart_required,
+                "reload rejected: changed fields require process restart"
+            );
             return;
         }
-        // Preserve the settling window for non-UDP connection setup.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let old_plan = self.active_routing_plan.read().clone();
 
         // ── Phase 1: build everything (no live-state mutation) ──
@@ -163,15 +161,30 @@ impl ControlPlane {
                 .get()
                 .saturating_add(1),
         );
-        let persistence = {
+        let (persistence, old_projection_snapshot) = {
             let current = self.dns_controller.runtime_provider().acquire();
-            Arc::clone(current.runtime().persistence())
+            (
+                Arc::clone(current.runtime().persistence()),
+                Arc::clone(current.runtime().routing_projection()),
+            )
         };
         let projection_snapshot = Arc::new(crate::dns::runtime::RoutingProjectionSnapshot::new(
             generation.get(),
             Arc::clone(&pinned_router),
             push_result.domain_bitmaps,
         ));
+        let old_domain_routes = self
+            .dns_controller
+            .project_routes(&old_projection_snapshot)
+            .into_iter()
+            .map(|(ip, bitmap)| (crate::ebpf::maps::ip_addr_to_lpm_key(ip), bitmap))
+            .collect::<Vec<_>>();
+        let new_domain_routes = self
+            .dns_controller
+            .project_routes(&projection_snapshot)
+            .into_iter()
+            .map(|(ip, bitmap)| (crate::ebpf::maps::ip_addr_to_lpm_key(ip), bitmap))
+            .collect::<Vec<_>>();
         let new_runtime =
             crate::dns::runtime::DnsRuntime::new(crate::dns::runtime::DnsRuntimeParts {
                 generation,
@@ -187,6 +200,16 @@ impl ControlPlane {
             });
 
         let route_count = new_router.route_count();
+        // All fallible preparation is complete. Fence only the atomic routing
+        // publication: existing Ready UDP endpoints remain independently
+        // serviceable, while new TCP/UDP slow-path admissions cannot observe a
+        // half-published eBPF/runtime generation.
+        drain.start_rejecting();
+        if !self.udp_pool.cancel_initializers_and_wait().await {
+            warn!("UDP initializers did not drain before reload commit");
+            self.stop_reload_rejection_if_healthy(drain);
+            return;
+        }
         let old_registry = {
             let mut router_guard = self.router.write().await;
             let mut config_guard = self.config.write().await;
@@ -198,11 +221,40 @@ impl ControlPlane {
             let provider = self.dns_controller.runtime_provider();
             let publication = provider.prepare_publication(new_runtime);
 
+            let active_generation = match ebpf.active_routing_generation() {
+                Ok(generation) => generation,
+                Err(error) => {
+                    error!(%error, "Failed to read active routing generation");
+                    self.stop_reload_rejection_if_healthy(drain);
+                    return;
+                }
+            };
+            let next_generation =
+                active_generation ^ (honk_ebpf_common::ROUTING_GENERATION_COUNT as u32 - 1);
             if let Err(error) =
-                routing_matcher::RoutingMatcherBuilder::push_plan(ebpf.as_mut(), &new_plan)
+                ebpf.stage_domain_routing_generation(next_generation, &new_domain_routes)
             {
-                match routing_matcher::RoutingMatcherBuilder::push_plan(ebpf.as_mut(), &old_plan) {
-                    Ok(_) => {
+                error!(%error, "Failed to stage learned domain routes");
+                self.stop_reload_rejection_if_healthy(drain);
+                return;
+            }
+            if let Err(error) = routing_matcher::RoutingMatcherBuilder::push_transition(
+                ebpf.as_mut(),
+                Some(&old_plan),
+                &new_plan,
+            ) {
+                let replay = ebpf
+                    .stage_domain_routing_generation(next_generation, &old_domain_routes)
+                    .and_then(|_| {
+                        routing_matcher::RoutingMatcherBuilder::push_transition(
+                            ebpf.as_mut(),
+                            Some(&old_plan),
+                            &old_plan,
+                        )
+                        .map(|_| ())
+                    });
+                match replay {
+                    Ok(()) => {
                         error!(
                             %error,
                             "Failed to push routing to eBPF; exact active plan replayed"
@@ -270,6 +322,7 @@ impl ControlPlane {
         self.stop_reload_rejection_if_healthy(drain);
     }
 
+    /// End reload admission once the datapath is known healthy.
     fn stop_reload_rejection_if_healthy(&self, drain: &DrainTracker) {
         if self.is_datapath_healthy() {
             drain.stop_rejecting();
@@ -392,6 +445,62 @@ impl ControlPlane {
             removed,
         );
     }
+}
+/// Fields whose current consumers are process-scoped and therefore cannot be
+/// swapped safely by the runtime generation publication. A rejected reload
+/// has not mutated any live state.
+fn restart_required_changes(current: &Config, candidate: &Config) -> Vec<&'static str> {
+    let mut changed = Vec::new();
+    let old_global = &current.global;
+    let new_global = &candidate.global;
+    if old_global.tproxy_port != new_global.tproxy_port {
+        changed.push("global.tproxy_port");
+    }
+    if old_global.tproxy_mark != new_global.tproxy_mark {
+        changed.push("global.tproxy_mark");
+    }
+    if old_global.tproxy_port_protect != new_global.tproxy_port_protect {
+        changed.push("global.tproxy_port_protect");
+    }
+    if old_global.pprof_port != new_global.pprof_port {
+        changed.push("global.pprof_port");
+    }
+    if old_global.so_mark_from_dae != new_global.so_mark_from_dae {
+        changed.push("global.so_mark_from_dae");
+    }
+    if old_global.log_level != new_global.log_level {
+        changed.push("global.log_level");
+    }
+    if old_global.lan_interface != new_global.lan_interface {
+        changed.push("global.lan_interface");
+    }
+    if old_global.wan_interface != new_global.wan_interface {
+        changed.push("global.wan_interface");
+    }
+    if old_global.auto_config_kernel_parameter != new_global.auto_config_kernel_parameter {
+        changed.push("global.auto_config_kernel_parameter");
+    }
+
+    let old_api = &current.experimental.clash_api;
+    let new_api = &candidate.experimental.clash_api;
+    if old_api.external_controller != new_api.external_controller {
+        changed.push("experimental.clash_api.external_controller");
+    }
+    if old_api.external_ui != new_api.external_ui {
+        changed.push("experimental.clash_api.external_ui");
+    }
+    if old_api.secret != new_api.secret {
+        changed.push("experimental.clash_api.secret");
+    }
+    if old_api.default_mode != new_api.default_mode {
+        changed.push("experimental.clash_api.default_mode");
+    }
+    if serde_json::to_value(&current.experimental.cache_file).ok()
+        != serde_json::to_value(&candidate.experimental.cache_file).ok()
+    {
+        changed.push("experimental.cache_file");
+    }
+    changed
 }
 
 /// Select the real current DataUdp leaves of configured groups for one warm
@@ -1070,12 +1179,12 @@ mod atomic_reload_tests {
     #[tokio::test]
     async fn build_failure_leaves_live_config_untouched() {
         let cp = test_cp();
-        let before = cp.config_handle().read().await.global.log_level.clone();
+        let before = cp.config_handle().read().await.global.check_interval_secs;
 
         // An upstream with an empty address fails DnsEndpoint::parse during
         // build_dns_forwarder — the reload must abort before commit.
         let mut bad = Config::default();
-        bad.global.log_level = "trace".into();
+        bad.global.check_interval_secs += 1;
         bad.dns.upstream = vec![honk_config::dns::DnsUpstream {
             name: "broken".into(),
             address: String::new(),
@@ -1087,7 +1196,7 @@ mod atomic_reload_tests {
         let drain = DrainTracker::new();
         cp.apply_runtime_config(bad, &drain).await;
 
-        let after = cp.config_handle().read().await.global.log_level.clone();
+        let after = cp.config_handle().read().await.global.check_interval_secs;
         assert_eq!(before, after, "failed build must not swap the live config");
     }
 
@@ -1187,12 +1296,18 @@ mod atomic_reload_tests {
             Arc::clone(&stats),
             "ready-node".into(),
         );
-        driver.wait_ready().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), driver.wait_ready())
+            .await
+            .expect("driver must become ready")
+            .unwrap();
         assert!(ready_lease.commit_ready(Arc::clone(&ready_endpoint)));
         driver
             .start(ready_lease.take_first().unwrap())
             .expect("driver start");
-        driver.wait_first_ack().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), driver.wait_first_ack())
+            .await
+            .expect("driver must send the first packet")
+            .unwrap();
         // Production drops a committed lease after the first-send ack; only
         // the Ready driver, not an initializer guard, survives into reload.
         drop(ready_lease);
@@ -1220,11 +1335,15 @@ mod atomic_reload_tests {
         });
 
         let mut new_config = Config::default();
-        new_config.global.log_level = "trace".into();
+        new_config.global.check_interval_secs += 1;
         let drain = DrainTracker::new();
-        cp.apply_runtime_config(new_config, &drain).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            cp.apply_runtime_config(new_config, &drain),
+        )
+        .await
+        .expect("reload must complete");
         initializer.await.unwrap();
-
         assert!(pool.get(initializing_client, dst).is_none());
         assert!(
             Arc::ptr_eq(&pool.get(ready_client, dst).unwrap(), &ready_endpoint),
@@ -1240,7 +1359,12 @@ mod atomic_reload_tests {
             pool.reserve_or_enqueue(ready_client, dst, b"after-reload", follower_permit, &stats,),
             EndpointReservation::Enqueued
         ));
-        transport.wait_for_send_count(2).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            transport.wait_for_send_count(2),
+        )
+        .await
+        .expect("Ready endpoint driver must survive reload");
         assert_eq!(
             transport.sent_packets(),
             vec![b"ready-first".to_vec(), b"after-reload".to_vec()]
@@ -1259,7 +1383,10 @@ mod atomic_reload_tests {
             ),
             EndpointReservation::Initializing(_)
         ));
-        assert_eq!(cp.config_handle().read().await.global.log_level, "trace");
+        assert_eq!(
+            cp.config_handle().read().await.global.check_interval_secs,
+            Config::default().global.check_interval_secs + 1
+        );
         pool.remove(ready_client, dst);
         pool.remove(initializing_client, dst);
     }
@@ -1279,9 +1406,9 @@ mod atomic_reload_tests {
             _ => panic!("timeout fixture must hold a real initializer lease"),
         };
         let mut cancellation = lease.cancellation();
-        let before = cp.config_handle().read().await.global.log_level.clone();
+        let before = cp.config_handle().read().await.global.check_interval_secs;
         let mut next = Config::default();
-        next.global.log_level = "trace".into();
+        next.global.check_interval_secs += 1;
         let drain = Arc::new(DrainTracker::new());
         let reloading_cp = Arc::clone(&cp);
         let reloading_drain = Arc::clone(&drain);
@@ -1303,7 +1430,7 @@ mod atomic_reload_tests {
         reloader.await.unwrap();
 
         assert_eq!(
-            cp.config_handle().read().await.global.log_level,
+            cp.config_handle().read().await.global.check_interval_secs,
             before,
             "a timed-out initializer must prevent the runtime/config swap"
         );
@@ -1323,6 +1450,7 @@ mod atomic_reload_tests {
     /// A valid reload commits: config is swapped and eBPF routing is pushed.
     #[tokio::test]
     async fn valid_reload_commits() {
+        let expected_interval = Config::default().global.check_interval_secs + 1;
         let cp = test_cp();
         let before_runtime = cp.dns_controller.runtime_provider().acquire();
         let persistence_id = before_runtime.runtime().persistence().identity();
@@ -1332,12 +1460,12 @@ mod atomic_reload_tests {
         );
         drop(before_runtime);
         let mut good = Config::default();
-        good.global.log_level = "trace".into();
+        good.global.check_interval_secs = expected_interval;
         let drain = DrainTracker::new();
         cp.apply_runtime_config(good, &drain).await;
         assert_eq!(
-            cp.config_handle().read().await.global.log_level,
-            "trace",
+            cp.config_handle().read().await.global.check_interval_secs,
+            expected_interval,
             "valid reload should swap the live config"
         );
         let after_runtime = cp.dns_controller.runtime_provider().acquire();
@@ -1357,14 +1485,40 @@ mod atomic_reload_tests {
             .inject_routing_fault(RoutingPushPhase::Meta, 1)
             .unwrap();
         let mut replacement = Config::default();
-        replacement.global.log_level = "trace".into();
+        replacement.global.check_interval_secs += 1;
 
         cp.apply_runtime_config(replacement, &DrainTracker::new())
             .await;
 
         assert_eq!(
-            cp.config_handle().read().await.global.log_level,
-            Config::default().global.log_level
+            cp.config_handle().read().await.global.check_interval_secs,
+            Config::default().global.check_interval_secs,
+        );
+        assert!(cp.is_datapath_healthy());
+        assert!(!cp.drain_tracker.should_reject());
+    }
+
+    #[tokio::test]
+    async fn domain_route_staging_failure_keeps_the_active_generation() {
+        let cp = test_cp();
+        let before = cp.ebpf.read().await.active_routing_generation().unwrap();
+        cp.ebpf
+            .write()
+            .await
+            .inject_routing_fault(RoutingPushPhase::DomainRouting, 1)
+            .unwrap();
+        let mut replacement = Config::default();
+        replacement.global.check_interval_secs += 1;
+
+        cp.apply_runtime_config(replacement, &DrainTracker::new())
+            .await;
+        assert_eq!(
+            cp.ebpf.read().await.active_routing_generation().unwrap(),
+            before
+        );
+        assert_eq!(
+            cp.config_handle().read().await.global.check_interval_secs,
+            Config::default().global.check_interval_secs,
         );
         assert!(cp.is_datapath_healthy());
         assert!(!cp.drain_tracker.should_reject());

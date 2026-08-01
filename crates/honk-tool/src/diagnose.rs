@@ -107,7 +107,7 @@ fn find_engine() -> Option<(u32, String)> {
         };
         let comm = std::fs::read_to_string(entry.path().join("comm")).ok()?;
         let comm = comm.trim().to_string();
-        if comm == "honk-core" || comm == "dae" {
+        if comm == "honk-core" || comm == "honk" || comm == "dae" {
             return Some((pid, comm));
         }
     }

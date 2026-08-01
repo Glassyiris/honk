@@ -86,12 +86,8 @@ impl RealEbpfBackend {
             "PARAM: port={} dae0_ifindex={} wan_ifindex={} (iface={})",
             tproxy_port, dae0_ifindex, wan_ifindex, ebpf_wan_ifname
         );
-        // Datapath maps with a versioned slot layout (LISTEN_SOCKET_MAP's
-        // key scheme changes between releases) must never be reused from a
-        // stale pin: aya re-pins at load time when the pin file exists, and
-        // a same-named map with the old layout then silently degrades the
-        // datapath (observed as E2BIG/blackholed listeners in production).
-        // Clear it before load, never after.
+        // A stale pin must never hide the map owned by this generation.
+        // The singleton lock guarantees the previous engine has exited.
         let _ = std::fs::remove_file(pin_root.join("LISTEN_SOCKET_MAP"));
         let mut bpf = EbpfLoader::new()
             .override_global("PARAM", &dae_param, true)
@@ -107,6 +103,11 @@ impl RealEbpfBackend {
                 continue;
             }
             let pin_path = pin_root.join(name);
+            if let Err(error) = std::fs::remove_file(&pin_path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!("remove stale pin '{}': {}", name, error);
+            }
             if let Err(e) = map.pin(&pin_path) {
                 warn!("pin '{}': {}", name, e);
             } else {

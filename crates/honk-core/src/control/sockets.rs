@@ -1364,10 +1364,10 @@ impl DomainResolveNotifier for DnsBpfNotifier {
         if bitmaps.is_empty() {
             return;
         }
-        let mut merged = DomainRouting { bitmap: [0u32; 4] };
+        let mut merged = DomainRouting::default();
         for bm in &bitmaps {
-            for i in 0..4 {
-                merged.bitmap[i] |= bm.bitmap[i];
+            for (word, value) in merged.bitmap.iter_mut().zip(bm.bitmap) {
+                *word |= value;
             }
         }
 

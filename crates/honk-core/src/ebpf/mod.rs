@@ -70,6 +70,7 @@ pub type RoutingHandoffChunkVisitor<'a> =
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoutingPushPhase {
+    DomainRouting,
     Rules,
     DestinationLpm,
     SourceLpm,
@@ -221,19 +222,19 @@ pub trait EbpfBackend: Send + Sync {
     fn set_param(&mut self, key: ParamKey, value: u32) -> anyhow::Result<()>;
     fn get_param(&self, key: ParamKey) -> anyhow::Result<Option<u32>>;
 
-    fn set_routing_rules(&mut self, rules: &[MatchSet]) -> anyhow::Result<()>;
-    /// Publish the routing meta block (`ROUTING_META_MAP`): `count` active
-    /// rules plus the per-(l4proto × ipversion)-group bitmaps telling the
-    /// datapath which groups each rule index belongs to (see
-    /// [`ROUTING_META_MAP_LEN`] for the slot layout).
-    ///
-    /// This is the atomic switch of the two-phase routing commit and must
-    /// run LAST, after the MatchSets and LPM entries it activates.
-    /// Backends must write the group bitmap slots (1..) first and the
-    /// rule-count slot 0 last, so the datapath never sees a new count
-    /// with stale group bitmaps.
-    fn set_routing_meta(
+    /// Fill the inactive physical routing-rule bank. The bank is not visible
+    /// to the datapath until `publish_routing_generation` flips its selector.
+    fn set_routing_rules(&mut self, generation: u32, rules: &[MatchSet]) -> anyhow::Result<()>;
+    /// Return the bank currently selected by the datapath.
+    fn active_routing_generation(&self) -> anyhow::Result<u32> {
+        Ok(0)
+    }
+    /// Fill the metadata for `generation`, then atomically make it active by
+    /// writing only the selector slot. Implementations MUST leave the prior
+    /// generation intact until after the switch succeeds.
+    fn publish_routing_generation(
         &mut self,
+        generation: u32,
         count: u32,
         group_bitmaps: &RoutingGroupBitmaps,
     ) -> anyhow::Result<()>;
@@ -271,8 +272,7 @@ pub trait EbpfBackend: Send + Sync {
         let _ = bitmap;
         Ok(())
     }
-    /// Push a resolved IP → DomainRouting bitmap into DOMAIN_ROUTING_MAP.
-    /// Used by DNS snooping to enable eBPF direct routing for known domains.
+    /// Merge a resolved-IP bitmap into the active routing generation.
     fn add_domain_ip_bitmap(
         &mut self,
         ip_key: &LpmKey,
@@ -282,15 +282,27 @@ pub trait EbpfBackend: Send + Sync {
         let _ = bitmap;
         Ok(())
     }
-    /// Overwrite the DOMAIN_ROUTING_MAP entry for `ip_key` (16-byte IP key),
-    /// replacing any bitmap left over from a previous rule generation.
-    /// Used by the post-push domain-route rebuild; `add_domain_ip_bitmap`
-    /// (OR semantics) would accumulate stale rule-index bits across reloads.
+    /// Replace the active generation's bitmap while retaining the inactive
+    /// half for packets that entered before a routing publication.
     fn set_domain_ip_bitmap(
         &mut self,
         _ip_key: &LpmKey,
         _bitmap: &DomainRouting,
     ) -> Result<(), DomainRouteWriteError> {
+        Ok(())
+    }
+
+    /// Overwrite a bounded batch of DOMAIN_ROUTING_MAP entries. The default
+    /// keeps every backend correct; native backends may replace it with one
+    /// batch syscall without changing projection reconciliation semantics.
+    fn set_domain_ip_bitmap_batch(
+        &mut self,
+        entries: &[(LpmKey, DomainRouting)],
+    ) -> Result<(), (usize, DomainRouteWriteError)> {
+        for (index, (key, bitmap)) in entries.iter().enumerate() {
+            self.set_domain_ip_bitmap(key, bitmap)
+                .map_err(|error| (index, error))?;
+        }
         Ok(())
     }
     /// Remove the DOMAIN_ROUTING_MAP entry for `ip_key` (16-byte IP key).
@@ -299,6 +311,27 @@ pub trait EbpfBackend: Send + Sync {
     fn remove_domain_ip_bitmap(&mut self, _ip_key: &LpmKey) -> Result<(), DomainRouteWriteError> {
         Ok(())
     }
+
+    /// Remove a bounded batch of DOMAIN_ROUTING_MAP entries. The returned
+    /// index identifies the first entry not known to have been applied.
+    fn remove_domain_ip_bitmap_batch(
+        &mut self,
+        keys: &[LpmKey],
+    ) -> Result<(), (usize, DomainRouteWriteError)> {
+        for (index, key) in keys.iter().enumerate() {
+            self.remove_domain_ip_bitmap(key)
+                .map_err(|error| (index, error))?;
+        }
+        Ok(())
+    }
+
+    /// Populate the inactive generation for every learned domain route before
+    /// publishing its matching rule bank.
+    fn stage_domain_routing_generation(
+        &mut self,
+        generation: u32,
+        entries: &[(LpmKey, DomainRouting)],
+    ) -> anyhow::Result<()>;
     fn add_ip_route(&mut self, prefix: &str, outbound: OutboundIndex) -> anyhow::Result<()>;
     /// Fully reset all routing-related maps (MatchSets, rule count, domain
     /// routing, LPM tries).  NOT used by the routing push path: clearing
@@ -308,10 +341,8 @@ pub trait EbpfBackend: Send + Sync {
     fn clear_routes(&mut self) -> anyhow::Result<()>;
     /// Zero the ROUTING_MAP slots `[start..MAX_MATCH_SET_LEN)`.
     ///
-    /// Post-commit cleanup for the two-phase routing push: it runs *after*
-    /// `set_routing_meta(start, ...)` has switched the datapath, so the
-    /// cleared slots are already inactive.  This removes stale MatchSets
-    /// left over from a previous, longer ruleset.
+    /// Optional post-commit cleanup for stale physical routing slots. The
+    /// active generation's count already excludes those slots.
     fn clear_routing_map_tail(&mut self, _start: u32) -> anyhow::Result<()> {
         Ok(())
     }

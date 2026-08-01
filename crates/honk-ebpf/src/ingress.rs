@@ -40,7 +40,7 @@ use network_types::{
 use crate::{
     maps::{
         OUTBOUND_CONNECTIVITY_MAP, PARAM, PKT_SCRATCH_KEY, REDIRECT_TRACK, ROUTE_CTX_SCRATCH_MAP,
-        ROUTING_HANDOFF_MAP, ROUTING_META_MAP, increment_bpf_stat,
+        ROUTING_HANDOFF_MAP, increment_bpf_stat,
     },
     route::{OUTBOUND_BLOCK, OUTBOUND_DIRECT, RouteCtx},
     sk,
@@ -605,22 +605,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         );
     }
 
-    let zero_key: u32 = 0;
-    let max_match_set_len: u32 = 32 * 32;
-    let active_rules_len = if let Some(len_ptr) = ROUTING_META_MAP.get(zero_key) {
-        let raw = *len_ptr;
-        if raw <= max_match_set_len {
-            raw
-        } else {
-            max_match_set_len
-        }
-    } else {
-        max_match_set_len
-    };
-
-    // Cache this flow's (l4proto × ipversion) group bitmap so the route
-    // loop can skip MatchSets that cannot match it.
-    route_ctx.load_group_bitmap();
+    let active_rules_len = route_ctx.prepare_generation();
 
     let loop_ret = route_ctx.route_loop(active_rules_len);
     if loop_ret < 0 {

@@ -15,28 +15,45 @@ pub const ROUTING_GROUP_TCP6: u32 = 1;
 pub const ROUTING_GROUP_UDP4: u32 = 2;
 /// Group index of UDP-over-IPv6 flows.
 pub const ROUTING_GROUP_UDP6: u32 = 3;
-/// u32 words per group bitmap: one bit per `ROUTING_MAP` slot.
+/// u32 words per group bitmap: one bit per logical `MatchSet` slot.
 pub const ROUTING_GROUP_BITMAP_WORDS: usize = MAX_MATCH_SET_LEN / 32;
-/// Total width of `ROUTING_META_MAP` in u32 slots.
+/// Number of independently publishable routing generations.
 ///
-/// Layout: slot 0 holds the active rule count (kept for compatibility);
-/// slots `[1..ROUTING_META_MAP_LEN)` hold `ROUTING_GROUP_COUNT` bitmaps of
-/// `ROUTING_GROUP_BITMAP_WORDS` words each.  Bit N of group g's bitmap —
-/// slot `1 + g * ROUTING_GROUP_BITMAP_WORDS + N / 32`, bit `N % 32` — is
-/// set when `ROUTING_MAP[N]` belongs to group g.  MatchSets are never
-/// duplicated across groups; a rule belonging to several groups simply
-/// has its global index set in each of them.
-pub const ROUTING_META_MAP_LEN: usize = 1 + ROUTING_GROUP_COUNT * ROUTING_GROUP_BITMAP_WORDS;
+/// Rules and their group metadata are double-buffered.  Userspace completely
+/// fills the inactive bank, then flips [`ROUTING_META_ACTIVE_GENERATION_SLOT`]
+/// in one map update.  The datapath consequently evaluates either the old
+/// complete generation or the new complete generation, never a mixture.
+pub const ROUTING_GENERATION_COUNT: usize = 2;
+const _: [(); ROUTING_GENERATION_COUNT] = [(); crate::redirect_need::ROUTING_BITMAP_GENERATIONS];
+/// Physical `ROUTING_MAP` slots. Each generation owns one 128-rule bank.
+pub const ROUTING_MAP_LEN: usize = ROUTING_GENERATION_COUNT * MAX_MATCH_SET_LEN;
+/// Meta slot holding the active generation (0 or 1). This is the sole commit
+/// point and must be written only after the selected bank is complete.
+pub const ROUTING_META_ACTIVE_GENERATION_SLOT: u32 = 0;
+/// Slots occupied by one generation's count and group bitmaps.
+pub const ROUTING_META_GENERATION_STRIDE: usize =
+    1 + ROUTING_GROUP_COUNT * ROUTING_GROUP_BITMAP_WORDS;
+/// First metadata slot of generation `generation`.
+#[inline(always)]
+pub const fn routing_meta_generation_base(generation: u32) -> u32 {
+    1 + generation * ROUTING_META_GENERATION_STRIDE as u32
+}
+/// Rule count slot for a generation.
+#[inline(always)]
+pub const fn routing_meta_count_slot(generation: u32) -> u32 {
+    routing_meta_generation_base(generation)
+}
+/// First group-bitmap slot for a generation.
+#[inline(always)]
+pub const fn routing_meta_bitmap_base(generation: u32) -> u32 {
+    routing_meta_generation_base(generation) + 1
+}
+/// Total width of `ROUTING_META_MAP` in u32 slots.
+pub const ROUTING_META_MAP_LEN: usize =
+    1 + ROUTING_GENERATION_COUNT * ROUTING_META_GENERATION_STRIDE;
 
-// The layout is hard-coded for 128 MatchSet slots (4 bitmap words) and a
-// 17-wide meta map; both the eBPF loader and the userspace backend rely on
-// these exact numbers.
-const _: () = assert!(ROUTING_GROUP_BITMAP_WORDS == 4);
-const _: () = assert!(ROUTING_META_MAP_LEN == 17);
-
-/// Per-group rule bitmaps published to `ROUTING_META_MAP[1..]`.
-/// `bitmaps[g][w]` is word w of group g's 128-bit bitmap over
-/// `ROUTING_MAP` indices.
+/// Per-group rule bitmaps for one generation.
+/// `bitmaps[g][w]` is word w of group g's 128-bit bitmap over logical rule indices.
 pub type RoutingGroupBitmaps = [[u32; ROUTING_GROUP_BITMAP_WORDS]; ROUTING_GROUP_COUNT];
 
 /// Map a flow's (L4 protocol, IP version) pair to its routing group index.

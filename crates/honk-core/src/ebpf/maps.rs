@@ -65,6 +65,24 @@ pub fn cidr_to_lpm_key(prefix: &str) -> anyhow::Result<LpmKey> {
     Ok(LpmKey { prefix_len, data })
 }
 
+/// Convert an IP address into the exact host-prefix key used by the domain
+/// routing LPM map without formatting or parsing a temporary CIDR string.
+pub const fn ip_addr_to_lpm_key(ip: std::net::IpAddr) -> LpmKey {
+    let (prefix_len, bytes) = match ip {
+        std::net::IpAddr::V4(ip) => (128, ip.to_ipv6_mapped().octets()),
+        std::net::IpAddr::V6(ip) => (128, ip.octets()),
+    };
+    LpmKey {
+        prefix_len,
+        data: [
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+            u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+            u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
+        ],
+    }
+}
+
 /// Encode an [`LpmKey`] as its raw 20-byte map-key form: the native-order
 /// `prefix_len` followed by the 16-byte address data.  This matches the
 /// `#[repr(C)]` layout the kernel uses for LPM trie keys and lets the

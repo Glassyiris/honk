@@ -11,6 +11,7 @@ use std::ffi::c_long;
 pub const ENOENT: c_long = libc::ENOENT as c_long;
 
 /// Callback invoked once per batch chunk by [`bpf_lookup_batch_scan_cb`].
+/// Returning `false` stops the scan early.
 pub type BatchVisitor<'a, K, V> = dyn FnMut(&[(K, V)]) -> bool + 'a;
 
 /// Call the `bpf()` syscall.  Returns `Ok(())` on success, `Err(errno)`.

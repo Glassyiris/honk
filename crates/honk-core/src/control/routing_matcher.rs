@@ -140,11 +140,45 @@ impl LpmPushPlan {
         Self::insert(&mut self.mac, key, bitmap);
     }
 
-    /// Push the planned entries into the BPF maps.  These are per-key
-    /// overwrites, so entries shared with the previous generation are
-    /// replaced in place.  Failures are logged and skipped: a missing LPM
-    /// entry degrades the affected rule to a non-match (traffic falls
-    /// through to later rules), it cannot drop packets.
+    fn merge_generation(
+        target: &mut HashMap<[u8; 20], (LpmKey, DomainRouting)>,
+        source: &HashMap<[u8; 20], (LpmKey, DomainRouting)>,
+        generation: u32,
+    ) {
+        for (raw, (key, bitmap)) in source {
+            let shifted = bitmap.for_generation(generation);
+            target
+                .entry(*raw)
+                .and_modify(|(_, current)| {
+                    for (word, value) in current.bitmap.iter_mut().zip(shifted.bitmap) {
+                        *word |= value;
+                    }
+                })
+                .or_insert((*key, shifted));
+        }
+    }
+
+    fn transition(
+        active: Option<&Self>,
+        active_generation: u32,
+        next: &Self,
+        next_generation: u32,
+    ) -> Self {
+        let mut combined = Self::default();
+        if let Some(active) = active {
+            Self::merge_generation(&mut combined.dest, &active.dest, active_generation);
+            Self::merge_generation(&mut combined.source, &active.source, active_generation);
+            Self::merge_generation(&mut combined.mac, &active.mac, active_generation);
+        }
+        Self::merge_generation(&mut combined.dest, &next.dest, next_generation);
+        Self::merge_generation(&mut combined.source, &next.source, next_generation);
+        Self::merge_generation(&mut combined.mac, &next.mac, next_generation);
+        combined
+    }
+
+    /// Push complete physical-generation bitmaps. Each value retains the
+    /// active bank while preparing the inactive bank, so packet evaluation
+    /// cannot observe rule/LPM disagreement before the selector flips.
     fn apply(&self, ebpf: &mut dyn EbpfBackend) -> anyhow::Result<()> {
         for (key, bitmap) in self.dest.values() {
             ebpf.add_dest_lpm_bitmap(key, bitmap)?;
@@ -158,8 +192,7 @@ impl LpmPushPlan {
         Ok(())
     }
 
-    /// Raw key sets of this plan, used to prune entries of previous
-    /// generations after the rule-count switch.
+    /// Raw keys needed by either bank during one atomic transition.
     fn keep_set(&self) -> LpmKeepSet {
         LpmKeepSet {
             dest: self.dest.keys().copied().collect(),
@@ -224,9 +257,9 @@ impl RoutingMatcherBuilder {
         let mut match_sets: Vec<MatchSet> = Vec::with_capacity(routes.len() * 2);
         let mut domain_bitmaps: HashMap<String, Vec<DomainRouting>> = HashMap::new();
         let mut lpm_plan = LpmPushPlan::default();
-        // (l4proto × ipversion) group bitmaps over ROUTING_MAP indices:
-        // bit N of group g is set when the MatchSet at index N belongs to
-        // group g.  Filled alongside the MatchSets below.
+        // (l4proto × ipversion) group bitmaps over logical rule indices:
+        // bit N of group g is set when the MatchSet at index N within its
+        // generation belongs to group g.
         let mut group_bitmaps: RoutingGroupBitmaps =
             [[0; ROUTING_GROUP_BITMAP_WORDS]; ROUTING_GROUP_COUNT];
 
@@ -343,11 +376,34 @@ impl RoutingMatcherBuilder {
         ebpf: &mut dyn EbpfBackend,
         plan: &RoutingPushPlan,
     ) -> anyhow::Result<RoutingPushResult> {
-        ebpf.set_routing_rules(&plan.match_sets)?;
-        plan.lpm.apply(ebpf)?;
-        ebpf.set_routing_meta(plan.match_sets.len() as u32, &plan.group_bitmaps)?;
-        ebpf.clear_routing_map_tail(plan.match_sets.len() as u32)?;
-        ebpf.prune_lpm_entries(&plan.lpm.keep_set())?;
+        Self::push_transition(ebpf, None, plan)
+    }
+
+    pub fn push_transition(
+        ebpf: &mut dyn EbpfBackend,
+        active: Option<&RoutingPushPlan>,
+        plan: &RoutingPushPlan,
+    ) -> anyhow::Result<RoutingPushResult> {
+        let active_generation = ebpf.active_routing_generation()?;
+        anyhow::ensure!(
+            active_generation < honk_ebpf_common::ROUTING_GENERATION_COUNT as u32,
+            "invalid active routing generation {active_generation}"
+        );
+        let generation = active_generation ^ 1;
+        let lpm = LpmPushPlan::transition(
+            active.map(|plan| &plan.lpm),
+            active_generation,
+            &plan.lpm,
+            generation,
+        );
+        ebpf.set_routing_rules(generation, &plan.match_sets)?;
+        lpm.apply(ebpf)?;
+        ebpf.prune_lpm_entries(&lpm.keep_set())?;
+        ebpf.publish_routing_generation(
+            generation,
+            plan.match_sets.len() as u32,
+            &plan.group_bitmaps,
+        )?;
 
         info!(
             "Pushed {} MatchSet entries to eBPF ROUTING_MAP",
@@ -797,7 +853,7 @@ impl RoutingMatcherBuilder {
 
     /// Return a DomainRouting bitmap with a single bit set for `rule_index`.
     fn bitmap_for_rule(rule_index: u32) -> DomainRouting {
-        let mut bitmap = [0u32; 4];
+        let mut bitmap = [0u32; ROUTING_BITMAP_WORDS];
         let wi = (rule_index / 32) as usize;
         if wi < bitmap.len() {
             bitmap[wi] = 1u32 << (rule_index % 32);
@@ -867,10 +923,9 @@ impl RoutingMatcherBuilder {
         mask
     }
 
-    /// Set the bitmap bits for MatchSet indices `[start, end)` in every
-    /// group selected by `group_mask` (bit g = group g).  Bit N of a
-    /// group bitmap always refers to the global ROUTING_MAP index N;
-    /// MatchSets are never duplicated across groups.
+    /// Set the bitmap bits for logical MatchSet indices `[start, end)` in
+    /// every group selected by `group_mask` (bit g = group g). MatchSets are
+    /// never duplicated across groups.
     fn set_group_bits(bitmaps: &mut RoutingGroupBitmaps, start: usize, end: usize, group_mask: u8) {
         for (g, words) in bitmaps.iter_mut().enumerate() {
             if (group_mask >> g) & 1 == 0 {
@@ -1000,10 +1055,6 @@ mod tests {
                 },
             ),
             (RoutingPushPhase::Meta, make_route("meta", "direct")),
-            (
-                RoutingPushPhase::ClearTail,
-                make_route("clear-tail", "direct"),
-            ),
             (RoutingPushPhase::PruneLpm, make_route("prune", "direct")),
         ];
         let outbound_map = HashMap::from([("direct".to_string(), OutboundIndex::Direct as u8)]);
@@ -1058,15 +1109,18 @@ mod tests {
             RoutingPushPhase::SourceLpm,
             RoutingPushPhase::MacLpm,
             RoutingPushPhase::Meta,
-            RoutingPushPhase::ClearTail,
             RoutingPushPhase::PruneLpm,
         ] {
             let mut backend = MockEbpfBackend::new();
             RoutingMatcherBuilder::push_plan(&mut backend, &old_plan).unwrap();
             let accepted = backend.routing_snapshot();
             backend.fail_next_routing_phase(phase);
-            assert!(RoutingMatcherBuilder::push_plan(&mut backend, &new_plan).is_err());
-            RoutingMatcherBuilder::push_plan(&mut backend, &old_plan).unwrap();
+            assert!(
+                RoutingMatcherBuilder::push_transition(&mut backend, Some(&old_plan), &new_plan,)
+                    .is_err()
+            );
+            RoutingMatcherBuilder::push_transition(&mut backend, Some(&old_plan), &old_plan)
+                .unwrap();
             assert_eq!(backend.routing_snapshot(), accepted, "{phase:?}");
             assert_eq!(
                 backend.routing_meta_write_order.last(),
@@ -1165,7 +1219,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(backend.routing_map.len(), 2); // IpSet + fallback
+        assert_eq!(backend.active_routing_rule_count(), 2); // IpSet + fallback
         assert_eq!(backend.dest_lpm_bitmap.len(), 1);
         assert!(backend.source_lpm_bitmap.is_empty());
     }
@@ -1192,7 +1246,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(backend.routing_map.len(), 2);
+        assert_eq!(backend.active_routing_rule_count(), 2);
         assert_eq!(backend.source_lpm_bitmap.len(), 1);
         assert!(backend.dest_lpm_bitmap.is_empty());
     }
@@ -1221,11 +1275,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(backend.routing_map.len(), 2);
-        let port_rule = backend.routing_map.get(&0).unwrap();
+        assert_eq!(backend.active_routing_rule_count(), 2);
+        let port_rule = backend.active_routing_rule(0).unwrap();
         assert_eq!(port_rule.match_type, MatchType::Port as u8);
         assert_eq!(port_rule.outbound, OutboundIndex::UserBase as u8);
-        let fallback = backend.routing_map.get(&1).unwrap();
+        let fallback = backend.active_routing_rule(1).unwrap();
         assert_eq!(fallback.match_type, MatchType::Fallback as u8);
     }
 
@@ -1253,7 +1307,7 @@ mod tests {
         )
         .unwrap();
 
-        let port_rule = backend.routing_map.get(&0).unwrap();
+        let port_rule = backend.active_routing_rule(0).unwrap();
         assert_eq!(port_rule.match_type, MatchType::Port as u8);
         assert_eq!(
             port_rule.outbound,
@@ -1282,8 +1336,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(backend.routing_map.len(), 2);
-        let proto_rule = backend.routing_map.get(&0).unwrap();
+        assert_eq!(backend.active_routing_rule_count(), 2);
+        let proto_rule = backend.active_routing_rule(0).unwrap();
         assert_eq!(proto_rule.match_type, MatchType::L4Proto as u8);
         assert_eq!(proto_rule.outbound, OutboundIndex::UserBase as u8);
     }
@@ -1308,7 +1362,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(backend.routing_map.len(), 2);
+        assert_eq!(backend.active_routing_rule_count(), 2);
         assert_eq!(backend.mac_lpm_bitmap.len(), 1);
     }
 
@@ -1335,7 +1389,7 @@ mod tests {
         assert_eq!(result.match_set_count, 2);
         assert!(result.domain_bitmaps.contains_key("google"));
         assert_eq!(
-            backend.routing_map.get(&0).unwrap().match_type,
+            backend.active_routing_rule(0).unwrap().match_type,
             MatchType::DomainSet as u8
         );
     }
@@ -1362,10 +1416,10 @@ mod tests {
         )
         .unwrap();
 
-        let rule = backend.routing_map.get(&0).unwrap();
+        let rule = backend.active_routing_rule(0).unwrap();
         assert_eq!(rule.must, 1);
         assert_eq!(rule.mark, 99);
-        let fallback = backend.routing_map.get(&1).unwrap();
+        let fallback = backend.active_routing_rule(1).unwrap();
         assert_eq!(fallback.match_type, MatchType::Fallback as u8);
         assert_eq!(fallback.outbound, OutboundIndex::Direct as u8);
     }
@@ -1401,13 +1455,13 @@ mod tests {
         .unwrap();
 
         // priority 5 first, then priority 10, then fallback
-        assert_eq!(backend.routing_map.len(), 3);
+        assert_eq!(backend.active_routing_rule_count(), 3);
         assert_eq!(
-            backend.routing_map.get(&0).unwrap().outbound,
+            backend.active_routing_rule(0).unwrap().outbound,
             OutboundIndex::Direct as u8
         );
         assert_eq!(
-            backend.routing_map.get(&1).unwrap().outbound,
+            backend.active_routing_rule(1).unwrap().outbound,
             OutboundIndex::UserBase as u8
         );
     }
@@ -1436,7 +1490,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(backend.dest_lpm_bitmap.len(), 1);
-        assert_eq!(backend.routing_map.len(), 2); // IpSet + fallback
+        assert_eq!(backend.active_routing_rule_count(), 2); // IpSet + fallback
 
         // Reload with a different CIDR and fewer rules.
         let nets2: Vec<ipnet::IpNet> = vec!["192.168.0.0/16".parse().unwrap()];
@@ -1461,8 +1515,7 @@ mod tests {
         let key2 = maps::lpm_key_bytes(&maps::cidr_to_lpm_key("192.168.0.0/16").unwrap());
         let entry = backend.dest_lpm_bitmap.get(&key2).unwrap();
         assert_eq!(entry.bitmap[0], 1);
-        assert_eq!(backend.routing_map.len(), 2);
-        assert_eq!(backend.routing_meta.get(&0).copied(), Some(2));
+        assert_eq!(backend.active_routing_rule_count(), 2);
     }
 
     #[test]
@@ -1496,10 +1549,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(backend.dest_lpm_bitmap.len(), 1);
-        let entry = backend.dest_lpm_bitmap.values().next().unwrap();
+        let snapshot = backend.routing_snapshot();
+        assert_eq!(snapshot.dest_lpm.len(), 1);
         assert_eq!(
-            entry.bitmap[0], 0b11,
+            snapshot.dest_lpm[0].1[0], 0b11,
             "shared CIDR must carry both rule indices (0 and 1)"
         );
     }
@@ -1536,19 +1589,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(backend.routing_meta.get(&0).copied(), Some(2));
-        assert_eq!(backend.routing_map.len(), 2);
+        assert_eq!(backend.active_routing_rule_count(), 2);
         assert!(backend.domain_routes.is_empty());
         assert!(backend.ip_routes.is_empty());
     }
 
-    /// Read word `w` of group `g`'s rule bitmap from the mock meta map.
     fn mock_group_word(backend: &MockEbpfBackend, g: u32, w: u32) -> u32 {
-        backend
-            .routing_meta
-            .get(&(1 + g * ROUTING_GROUP_BITMAP_WORDS as u32 + w))
-            .copied()
-            .unwrap_or(0)
+        backend.active_routing_group_word(g as usize, w as usize)
     }
 
     #[test]
@@ -1650,7 +1697,7 @@ mod tests {
         .unwrap();
 
         // One L4Proto MatchSet at index 0, fallback at index 1.
-        assert_eq!(backend.routing_meta.get(&0).copied(), Some(2));
+        assert_eq!(backend.active_routing_rule_count(), 2);
         for g in [ROUTING_GROUP_TCP4, ROUTING_GROUP_TCP6] {
             assert_eq!(
                 mock_group_word(&backend, g, 0) & 0b11,
@@ -1699,12 +1746,11 @@ mod tests {
 
     #[test]
     fn test_group_bitmap_bits_match_global_indices() {
-        // 17 tcp+port rules produce 17 two-entry chains (indices 0..34)
-        // plus the fallback at index 34, so the bitmaps cross the first
-        // 32-bit word boundary.  Every bit must refer to the global
-        // ROUTING_MAP index of its MatchSet — no per-group renumbering.
+        // 40 tcp+port rules produce 40 two-entry chains (indices 0..79)
+        // plus the fallback at index 80. This crosses both the 32- and
+        // 64-entry boundaries, and every bit must retain its global index.
         let mut backend = MockEbpfBackend::new();
-        let routes: Vec<CompiledRoute> = (0..17u16)
+        let routes: Vec<CompiledRoute> = (0..40u16)
             .map(|i| CompiledRoute {
                 protocols: vec!["tcp".into()],
                 ports: vec![crate::routing::PortRange {
@@ -1727,17 +1773,94 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(backend.routing_meta.get(&0).copied(), Some(35));
-        // tcp groups: rule chains fill word 0 and bits 0-1 of word 1,
-        // the fallback adds bit 2 of word 1 (global index 34).
+        assert_eq!(backend.active_routing_rule_count(), 81);
         for g in [ROUTING_GROUP_TCP4, ROUTING_GROUP_TCP6] {
             assert_eq!(mock_group_word(&backend, g, 0), u32::MAX, "group {g}");
-            assert_eq!(mock_group_word(&backend, g, 1), 0b111, "group {g}");
+            assert_eq!(mock_group_word(&backend, g, 1), u32::MAX, "group {g}");
+            assert_eq!(mock_group_word(&backend, g, 2), 0x1ffff, "group {g}");
         }
-        // udp groups: only the fallback bit (global index 34 → word 1 bit 2).
+        // UDP groups carry only the fallback at global index 80.
         for g in [ROUTING_GROUP_UDP4, ROUTING_GROUP_UDP6] {
             assert_eq!(mock_group_word(&backend, g, 0), 0, "group {g}");
-            assert_eq!(mock_group_word(&backend, g, 1), 0b100, "group {g}");
+            assert_eq!(mock_group_word(&backend, g, 1), 0, "group {g}");
+            assert_eq!(mock_group_word(&backend, g, 2), 1 << 16, "group {g}");
+        }
+    }
+
+    #[test]
+    fn staged_domain_routes_switch_with_the_rule_bank() {
+        let mut backend = MockEbpfBackend::new();
+        let outbound_map = HashMap::from([("proxy".to_string(), OutboundIndex::UserBase as u8)]);
+        let old_plan = RoutingMatcherBuilder::compile(
+            &[CompiledRoute {
+                ports: vec![crate::routing::PortRange {
+                    start: 1000,
+                    end: 1000,
+                }],
+                ..make_route("old", "proxy")
+            }],
+            &outbound_map,
+            "direct",
+            DialMode::Ip,
+        )
+        .unwrap();
+        RoutingMatcherBuilder::push_plan(&mut backend, &old_plan).unwrap();
+
+        let key = crate::ebpf::maps::ip_addr_to_lpm_key("203.0.113.7".parse().unwrap());
+        let old_bitmap = RoutingMatcherBuilder::bitmap_for_rule(0);
+        backend.set_domain_ip_bitmap(&key, &old_bitmap).unwrap();
+        let accepted = backend.routing_snapshot();
+
+        let routes = (0..33u16)
+            .map(|index| CompiledRoute {
+                protocols: vec!["tcp".into()],
+                ports: vec![crate::routing::PortRange {
+                    start: 2000 + index,
+                    end: 2000 + index,
+                }],
+                ..make_route(&format!("new-{index}"), "proxy")
+            })
+            .collect::<Vec<_>>();
+        let next_plan =
+            RoutingMatcherBuilder::compile(&routes, &outbound_map, "direct", DialMode::Ip).unwrap();
+        let next_generation = backend.active_routing_generation().unwrap() ^ 1;
+        let next_bitmap = RoutingMatcherBuilder::bitmap_for_rule(64);
+        backend
+            .stage_domain_routing_generation(next_generation, &[(key, next_bitmap)])
+            .unwrap();
+        assert_eq!(backend.routing_snapshot(), accepted);
+
+        RoutingMatcherBuilder::push_transition(&mut backend, Some(&old_plan), &next_plan).unwrap();
+        let switched = backend.routing_snapshot();
+        assert_eq!(backend.active_routing_rule_count(), 67);
+        assert_eq!(switched.domain.len(), 1);
+        assert_eq!(switched.domain[0].1[2], 1);
+    }
+
+    #[test]
+    fn domain_bitmaps_cover_first_middle_and_last_logical_rules() {
+        for index in [0, 63, 64, 127] {
+            let logical = RoutingMatcherBuilder::bitmap_for_rule(index);
+            let logical_word = index as usize / 32;
+            let bit = 1u32 << (index % 32);
+            assert_eq!(logical.bitmap[logical_word], bit);
+
+            for generation in 0..ROUTING_GENERATION_COUNT as u32 {
+                let physical = logical.for_generation(generation);
+                let physical_word =
+                    generation as usize * ROUTING_BITMAP_WORDS_PER_GENERATION + logical_word;
+                assert_eq!(physical.bitmap[physical_word], bit);
+                assert_eq!(
+                    physical
+                        .bitmap
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, word)| **word != 0)
+                        .map(|(word, _)| word)
+                        .collect::<Vec<_>>(),
+                    vec![physical_word]
+                );
+            }
         }
     }
 

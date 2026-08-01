@@ -162,6 +162,13 @@ impl DnsController {
         self.routing_projection.update_snapshot(snapshot);
     }
 
+    pub(crate) fn project_routes(
+        &self,
+        snapshot: &crate::dns::projection::RoutingProjectionSnapshot,
+    ) -> Vec<(std::net::IpAddr, honk_ebpf_common::DomainRouting)> {
+        self.routing_projection.project(snapshot)
+    }
+
     pub async fn cache(&self) -> Arc<tokio::sync::Mutex<crate::dns::cache::DnsCache>> {
         self.dns_service.cache()
     }
