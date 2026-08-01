@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use thiserror::Error;
 
+use super::cache::KeyIdentity;
 use super::outcome::ResponseClass;
 use super::planner::{
     PlanError, Planner, RequestContext, RequestPlan, RequestScope, ResponseContext, ResponsePlan,
@@ -23,6 +24,7 @@ pub(crate) struct DnsEngine {
 
 pub(crate) struct PreparedQuery {
     query: QueryContext,
+    key_identity: KeyIdentity,
     domain: String,
     qtype: u16,
     plan: RequestPlan,
@@ -104,6 +106,7 @@ impl DnsEngine {
             result => result?,
         };
         Ok(PreparedQuery {
+            key_identity: KeyIdentity::new(&query, self.policy_id.clone()),
             query,
             domain,
             qtype,
@@ -175,6 +178,14 @@ impl DnsEngine {
 impl PreparedQuery {
     pub(crate) const fn query(&self) -> &QueryContext {
         &self.query
+    }
+
+    pub(crate) fn cache_key(
+        &self,
+        scope: RequestScope,
+        operation: crate::dns::cache::OperationKind,
+    ) -> crate::dns::cache::CacheKey {
+        self.key_identity.key(scope, operation)
     }
 
     pub(crate) fn domain(&self) -> &str {

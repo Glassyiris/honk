@@ -834,6 +834,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             };
             match listen_str.parse::<std::net::SocketAddr>() {
                 Ok(listen) => {
+                    let stream_samplers = std::sync::Arc::new(clash_api::StreamSamplers::new());
                     let state = std::sync::Arc::new(clash_api::ClashState {
                         config: control_plane.config_handle(),
                         stats: control_plane.stats_handle(),
@@ -848,6 +849,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                         external_ui: clash_cfg.external_ui.clone(),
                         log_tx: clash_log_tx.clone(),
                         dns_service: control_plane.dns_service(),
+                        stream_samplers,
                     });
                     tokio::spawn(clash_api::serve(state, listen));
                 }

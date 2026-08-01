@@ -1,50 +1,55 @@
-use std::net::IpAddr;
 use std::time::Duration;
 
 use tokio::time::Instant;
 
-use super::state::{Batch, DesiredState, PendingRemove, PendingSet, RetryMetadata};
+use super::state::{Batch, DesiredState, PendingRemove, PendingSet, RetryDeadline, RetryMetadata};
 
 const RETRY_MIN: Duration = Duration::from_millis(100);
 const RETRY_MAX: Duration = Duration::from_secs(5);
+pub(super) const MAX_BATCH_ENTRIES: usize = 256;
 
 impl DesiredState {
     pub(super) fn batch(&mut self, now: Instant) -> Batch {
-        let ready = |ip: &IpAddr| {
-            self.retries
-                .get(ip)
-                .is_none_or(|retry| retry.next_at <= now)
-        };
         let mut sets = Vec::new();
         let mut removes = Vec::new();
-        let dirty = self.dirty_ips.iter().copied().collect::<Vec<_>>();
-        for ip in dirty.iter().filter(|ip| ready(ip)) {
-            match self.desired.get(ip) {
+        let candidates = self
+            .dirty_ips
+            .iter()
+            .copied()
+            .filter(|ip| {
+                self.retries
+                    .get(ip)
+                    .is_none_or(|retry| retry.next_at <= now)
+            })
+            .take(MAX_BATCH_ENTRIES)
+            .collect::<Vec<_>>();
+        for ip in candidates {
+            match self.desired.get(&ip) {
                 Some(desired)
                     if self
                         .applied
-                        .get(ip)
+                        .get(&ip)
                         .is_none_or(|applied| applied.bitmap != desired.bitmap) =>
                 {
                     sets.push(PendingSet {
-                        ip: *ip,
+                        ip,
                         bitmap: *desired,
-                        revision: self.revisions.get(ip).copied().unwrap_or_default(),
+                        revision: self.revisions.get(&ip).copied().unwrap_or_default(),
                     });
                 }
-                None if self.applied.contains_key(ip) => removes.push(PendingRemove {
-                    ip: *ip,
-                    revision: self.revisions.get(ip).copied().unwrap_or_default(),
-                }),
-                Some(_) | None => {}
+                None if self.applied.contains_key(&ip) => {
+                    removes.push(PendingRemove {
+                        ip,
+                        revision: self.revisions.get(&ip).copied().unwrap_or_default(),
+                    });
+                }
+                Some(_) | None => {
+                    self.dirty_ips.remove(&ip);
+                    self.retries.remove(&ip);
+                }
             }
-        }
-        for ip in dirty {
-            if !sets.iter().any(|set| set.ip == ip)
-                && !removes.iter().any(|remove| remove.ip == ip)
-                && !self.retries.contains_key(&ip)
-            {
-                self.dirty_ips.remove(&ip);
+            if sets.len() + removes.len() >= MAX_BATCH_ENTRIES {
+                break;
             }
         }
         Batch {
@@ -106,28 +111,36 @@ impl DesiredState {
         current
     }
 
-    pub(super) fn record_failure(&mut self, ip: IpAddr, now: Instant) {
+    pub(super) fn record_failure(&mut self, ip: std::net::IpAddr, now: Instant) {
         let attempts = self
             .retries
             .get(&ip)
             .map_or(1, |retry| retry.attempts.saturating_add(1));
         let factor = 1u32 << u32::from(attempts.saturating_sub(1).min(6));
-        let delay = RETRY_MIN.saturating_mul(factor).min(RETRY_MAX);
-        self.retries.insert(
+        let next_at = now + RETRY_MIN.saturating_mul(factor).min(RETRY_MAX);
+        self.retries.insert(ip, RetryMetadata { attempts, next_at });
+        self.retry_deadlines.push(std::cmp::Reverse(RetryDeadline {
+            at: next_at,
             ip,
-            RetryMetadata {
-                attempts,
-                next_at: now + delay,
-            },
-        );
+            attempts,
+        }));
         self.dirty_ips.insert(ip);
     }
 
-    pub(super) fn next_deadline(&self) -> Option<Instant> {
-        self.owners
-            .values()
-            .map(|owner| owner.expires_at)
-            .chain(self.retries.values().map(|retry| retry.next_at))
+    pub(super) fn next_deadline(&mut self) -> Option<Instant> {
+        while let Some(std::cmp::Reverse(deadline)) = self.retry_deadlines.peek() {
+            if self.retries.get(&deadline.ip).is_some_and(|retry| {
+                retry.attempts == deadline.attempts && retry.next_at == deadline.at
+            }) {
+                break;
+            }
+            self.retry_deadlines.pop();
+        }
+        self.expiry_deadlines
+            .peek()
+            .map(|entry| entry.0.at)
+            .into_iter()
+            .chain(self.retry_deadlines.peek().map(|entry| entry.0.at))
             .min()
     }
 }

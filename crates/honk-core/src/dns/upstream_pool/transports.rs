@@ -54,6 +54,7 @@ impl UpstreamPool {
         let proxy = match (proxy_node, self.proxy_registry.as_ref()) {
             (Some(node), Some(registry)) => Some(ProxyDial {
                 registry: Arc::clone(registry),
+                generation: self.runtime_generation.get().cloned(),
                 node: node.clone(),
             }),
             _ => None,
@@ -90,7 +91,7 @@ impl UpstreamPool {
                 )
                 .await?,
             ),
-            DnsProtocol::Udp => anyhow::bail!("internal: UDP has no pooled transport"),
+            DnsProtocol::Udp => anyhow::bail!("internal: UDP has a dedicated pool"),
         })
     }
 
@@ -156,6 +157,9 @@ impl UpstreamPool {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
+        for entry in self.entries.values() {
+            entry.udp.lock().take();
+        }
         for slot in slots {
             slot.close(|transport| async move {
                 transport.close().await;

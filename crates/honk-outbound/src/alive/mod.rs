@@ -288,8 +288,11 @@ pub struct AliveDialerSet {
     failure_threshold: u32,
     base_cooldown: Duration,
     max_cooldown: Duration,
-    trigger_tx: tokio::sync::mpsc::UnboundedSender<String>,
-    trigger_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<String>>>,
+    /// Bounded node-deduplicated emergency probe queue. A pending node owns
+    /// at most one entry, so traffic failure storms cannot grow memory.
+    trigger_tx: tokio::sync::mpsc::Sender<String>,
+    trigger_rx: Mutex<Option<tokio::sync::mpsc::Receiver<String>>>,
+    trigger_pending: Mutex<HashSet<String>>,
     /// Optional `SO_MARK` value applied to probe sockets so the eBPF datapath
     /// treats them as control-plane traffic and does not re-route them.
     so_mark: Option<u32>,
@@ -359,7 +362,8 @@ fn probe_backoff(base: Duration, max: Duration, consecutive_failures: u32) -> Du
 
 impl AliveDialerSet {
     pub fn new() -> Self {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        const TRIGGER_QUEUE_CAPACITY: usize = 256;
+        let (tx, rx) = tokio::sync::mpsc::channel(TRIGGER_QUEUE_CAPACITY);
         Self {
             states: RwLock::new(HashMap::new()),
             collections: RwLock::new(HashMap::new()),
@@ -372,6 +376,7 @@ impl AliveDialerSet {
             max_cooldown: Duration::from_secs(300),
             trigger_tx: tx,
             trigger_rx: Mutex::new(Some(rx)),
+            trigger_pending: Mutex::new(HashSet::new()),
             so_mark: None,
             last_emergency_tcp: Mutex::new(HashMap::new()),
             last_emergency_udp: Mutex::new(HashMap::new()),
@@ -524,7 +529,7 @@ impl AliveDialerSet {
         }
     }
 
-    pub fn take_trigger_rx(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<String>> {
+    pub fn take_trigger_rx(&self) -> Option<tokio::sync::mpsc::Receiver<String>> {
         self.trigger_rx.lock().take()
     }
 
@@ -1018,7 +1023,19 @@ impl AliveDialerSet {
     }
 
     pub fn trigger_probe(&self, node_id: &str) {
-        let _ = self.trigger_tx.send(node_id.to_string());
+        let mut pending = self.trigger_pending.lock();
+        if !pending.insert(node_id.to_string()) {
+            return;
+        }
+        if self.trigger_tx.try_send(node_id.to_string()).is_err() {
+            // Queue saturation drops this request (a later traffic failure or
+            // periodic sweep retries it), and releases its dedup reservation.
+            pending.remove(node_id);
+        }
+    }
+
+    pub(crate) fn finish_trigger_probe(&self, node_id: &str) {
+        self.trigger_pending.lock().remove(node_id);
     }
 
     pub fn should_probe(&self, node_id: &str, domain: ProbeDomain, ipver: IpVersion) -> bool {
@@ -1408,6 +1425,38 @@ impl AliveDialerSet {
 impl Default for AliveDialerSet {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod trigger_tests {
+    use super::*;
+
+    #[test]
+    fn trigger_queue_is_deduplicated_and_bounded() {
+        let set = AliveDialerSet::new();
+        for _ in 0..1_000 {
+            set.trigger_probe("same-node");
+        }
+        for index in 0..1_000 {
+            set.trigger_probe(&format!("node-{index}"));
+        }
+
+        let mut receiver = set.take_trigger_rx().expect("first receiver ownership");
+        let mut seen = std::collections::HashSet::new();
+        while let Ok(id) = receiver.try_recv() {
+            seen.insert(id);
+        }
+        assert!(seen.len() <= 256);
+        assert_eq!(
+            seen.iter().filter(|id| id.as_str() == "same-node").count(),
+            1
+        );
+        for id in seen {
+            set.finish_trigger_probe(&id);
+        }
+        set.trigger_probe("same-node");
+        assert_eq!(receiver.try_recv().as_deref(), Ok("same-node"));
     }
 }
 

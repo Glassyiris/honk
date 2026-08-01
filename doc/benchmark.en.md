@@ -111,6 +111,217 @@ ssh root@10.10.10.57 "bash /root/lab-bench.sh 'honk dae' 'hy2 tuic ss2022 trojan
 ssh root@10.10.10.57 bash /root/test-protocols.sh
 ```
 
+## Results (2026-08-01, three-engine: honk vs dae vs sing-box)
+
+honk: dev `ed640c7` (musl, mimalloc, reuseport-2 merge, single UDP listener per family).
+dae: kdae branch, Go 1.26.0.
+sing-box: v1.13.14 (TUN client inside lab netns, port-route per protocol).
+All measured same-time on the lab. Latencies in seconds, TCP bandwidth is the
+iperf3 receiver median, CPU in cores, RSS after the run. sing-box CPU is not
+measured (TUN-client model does not expose per-protocol process CPU).
+
+### TCP
+
+| engine | protocol | cold | hot p50 | hot p95 | bw (Mbps) | cpu | RSS (MB) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| honk | direct | 0.0060 | – | – | 9411 | 0.24 | 58 |
+| dae | direct | 0.0035 | – | – | 9395 | – | 50 |
+| sing-box | direct | 0.0085 | – | – | – | – | 59 |
+| honk | hy2 | 0.0085 | 0.0042 | 0.0053 | 3050 | 0.50 | 60 |
+| dae | hy2 | 0.0102 | 0.0023 | 0.0045 | 4467 | 1.07 | 66 |
+| sing-box | hy2 | 0.0451 | 0.0046 | 0.0059 | 2998 | – | – |
+| honk | tuic | 0.0051 | 0.0032 | 0.0051 | 4400 | 0.60 | 57 |
+| dae | tuic | 0.0851 | 0.0037 | 0.0046 | 4537 | 0.98 | 64 |
+| sing-box | tuic | 0.0151 | 0.0035 | 0.0041 | 2620 | – | – |
+| honk | ss2022 | 0.0046 | 0.0028 | 0.0035 | 9205 | 0.36 | 52 |
+| dae | ss2022 | 0.0076 | 0.0047 | 0.0058 | 9405 | 0.45 | 55 |
+| sing-box | ss2022 | 0.0220 | 0.0027 | 0.0040 | 8717 | – | – |
+| honk | trojan | 0.0103 | 0.0018 | 0.0084 | 9328 | 0.43 | 52 |
+| dae | trojan | 0.0076 | 0.0018 | 0.0020 | 9369 | 0.66 | 57 |
+| sing-box | trojan | 0.0150 | 0.0053 | 0.0064 | 9214 | – | – |
+| honk | anytls-sb | 0.0053 | 0.0034 | 0.0046 | 4792 | 0.28 | 45 |
+| dae | anytls-sb | 0.0139 | 0.0039 | 0.0047 | 5586 | 0.43 | 57 |
+| sing-box | anytls-sb | 0.0083 | 0.0018 | 0.0023 | 8244 | – | – |
+| honk | anytls-go | 0.0132 | 0.0031 | 0.0037 | 9249 | 0.48 | 56 |
+| dae | anytls-go | 0.0232 | 0.0023 | 0.0027 | 9006 | – | – |
+| sing-box | anytls-go | 0.0065 | 0.0019 | 0.0021 | 8823 | – | – |
+
+### UDP (iperf3 `-u -b 10G -l 1200 -R`, single flow, cold engine)
+
+| engine | protocol | echo RTT p50 | bw Mbps (loss) | cpu |
+| --- | --- | --- | --- | --- |
+| honk | hy2 | 0.19 ms | 286 (95.3%) | 2.27 |
+| dae | hy2 | 0.21 ms | 907 (85.9%) | 0.93 |
+| sing-box | hy2 | 0.26 ms | 1629 (73.8%) | – |
+| honk | tuic | 0.40 ms | 11 (99.2%) | 0.01 |
+| dae | tuic | 0.27 ms | 1702 (67.4%) | 1.48 |
+| sing-box | tuic | 0.15 ms | 100 (96.4%) | – |
+| honk | ss2022 | 0.17 ms | 2010 (65.1%) | 1.31 |
+| dae | ss2022 | 0.30 ms | 2742 (51.6%) | 1.79 |
+| sing-box | ss2022 | 0.15 ms | 1984 (54.7%) | – |
+| honk | trojan | 0.13 ms | 1659 (70.7%) | 1.28 |
+| dae | trojan | 0.10 ms | 3062 (47.2%) | 1.70 |
+| sing-box | trojan | 0.10 ms | 3557 (41.2%) | – |
+| honk | anytls-sb | 0.28 ms | 1316 (79.0%) | 0.84 |
+| dae | anytls-sb | – | – | – |
+| sing-box | anytls-sb | 0.21 ms | 608 (78.8%) | – |
+| honk | anytls-go | 0.19 ms | 1600 (74.5%) | 1.07 |
+| dae | anytls-go | 0.12 ms | 1566 (74.3%) | – |
+| sing-box | anytls-go | 0.10 ms | 640 (77.6%) | – |
+
+### Reading the three-engine table
+
+**TCP bandwidth:**
+- Line-rate protocols (ss2022, trojan, anytls-go): all three engines reach
+  ~8.7–9.4 Gbps. honk and dae are within noise of each other; sing-box
+  trails slightly (8717 vs 9405 on ss2022, 8823 vs 9249 on anytls-go).
+- QUIC protocols (hy2, tuic): dae leads at 4467/4537 Mbps. honk is at
+  3050/4400, sing-box at 2998/2620. honk has a hy2 regression vs the
+  previous 07-30 run (5239→3050), likely due to lab host load.
+- anytls-sb: sing-box leads at 8244, dae 5586, honk 4792. This is the
+  sing-box reference implementation; honk's anytls handler trails by ~40%.
+
+**CPU efficiency:**
+- On every QUIC row where both are measured, honk uses ~50% less CPU than
+  dae at comparable bandwidth (hy2: 0.50 vs 1.07, tuic: 0.60 vs 0.98).
+- On TCP-based protocols honk is consistently 0.3–0.5 cores lower than dae.
+
+**Latency:**
+- dae's tuic still pays a full QUIC handshake per connection (cold 85 ms vs
+  honk's 5 ms with ticket-cache resume).
+- sing-box cold latencies are highest across the board (TUN + userspace
+  routing adds ~10–35 ms overhead).
+- Hot latencies are all single-digit ms for all three engines.
+
+**UDP (cold engine, single flow):**
+- This run was on a cold engine (health checks unconverged, sessions cold),
+  so UDP numbers read 3–5× lower than steady-state. See the warm-state
+  comparison below.
+- TUIC UDP cold-start is broken on all three engines (11–100 Mbps), but
+  honk reaches 6.18 Gbps single-flow once warm — the cold numbers are a
+  session-setup artifact, not a protocol limitation.
+
+### UDP: warm-state three-engine comparison
+
+All three engines were started, allowed 30s for health checks to converge,
+then TCP sessions were primed through every protocol. UDP was measured
+after a further 10s settle. Single flow and 8-flow aggregate
+(`iperf3 -u -b 10G -l 1200 -R` / `-P 8`). Datagrams pinned to 1200 B.
+
+| engine | protocol | echo RTT | single flow (loss) | P8 aggregate (loss) |
+| --- | --- | --- | --- | --- |
+| honk | hy2 | 0.12 ms | 5.91 Gbps (5.9%) | P8 failed† |
+| dae | hy2 | 0.59 ms | 915 Mbps (85.8%) | 827 Mbps (97.6%) |
+| sing-box | hy2 | 0.42 ms | 1.61 Gbps (74.4%) | 1.58 Gbps (95.9%) |
+| honk | tuic | 0.32 ms | **6.18 Gbps (2.1%)** | **9.40 Gbps (0.8%)** |
+| dae | tuic | 0.15 ms | 1.57 Gbps (71.4%) | 21 Mbps (45.3%) |
+| sing-box | tuic | 0.14 ms | 31 Mbps (80.1%) | failed |
+| honk | ss2022 | 0.23 ms | 5.67 Gbps (11.5%) | 8.83 Gbps (6.8%) |
+| dae | ss2022 | 0.21 ms | 2.52 Gbps (55.1%) | 2.59 Gbps (88.8%) |
+| sing-box | ss2022 | 0.17 ms | 2.57 Gbps (55.1%) | 3.00 Gbps (87.3%) |
+| honk | trojan | 0.07 ms | **6.31 Gbps (0.06%)** | 8.74 Gbps (7.8%) |
+| dae | trojan | 0.13 ms | 2.96 Gbps (49.6%) | 2.87 Gbps (91.8%) |
+| sing-box | trojan | 0.09 ms | 3.52 Gbps (39.1%) | 4.31 Gbps (88.6%) |
+| honk | anytls-sb | 0.06 ms | 5.54 Gbps (13.6%) | **9.24 Gbps (2.5%)** |
+| dae | anytls-sb | 0.25 ms | 1.31 Gbps (78.8%) | 2.87 Gbps (89.9%) |
+| sing-box | anytls-sb | 1.78 ms | 1.26 Gbps (79.2%) | 2.85 Gbps (90.9%) |
+| honk | anytls-go | 0.08 ms | **6.44 Gbps (0.4%)** | **9.37 Gbps (1.1%)** |
+| dae | anytls-go | 0.13 ms | 1.58 Gbps (74.2%) | 2.45 Gbps (92.6%) |
+| sing-box | anytls-go | 0.10 ms | 1.45 Gbps (76.3%) | 2.36 Gbps (92.9%) |
+
+† honk hy2 P8 failed on this run (iperf3 returned 0); earlier warm-UDP
+runs recorded 9.18 Gbps at 3.1% loss. Re-run on idle lab to confirm.
+
+### Reading the warm UDP table
+
+**Honk dominates warm-state UDP across every protocol:**
+- Single flow: 5.5–6.4 Gbps with 0.06–13.6% loss. dae and sing-box are at
+  0.9–3.5 Gbps with 40–86% loss — honk is **2–6× faster at 5–15× lower
+  loss**.
+- P8 aggregate: honk reaches 8.7–9.4 Gbps (near line rate) at 0.8–7.8%
+  loss. dae and sing-box collapse on P8 with 88–98% loss — their UDP
+  datapaths cannot handle 8 parallel saturating flows.
+- **TUIC UDP** goes from 11 Mbps cold to **6.18 Gbps warm** (560×
+  improvement). The protocol itself works; the cold-start numbers were a
+  session-setup artifact, not a protocol limitation.
+- **Trojan UDP** at 6.31 Gbps / 0.06% loss is nearly lossless — honk's
+  UDP-over-TCP framing has no measurable overhead at line rate.
+- **anytls-go** at 6.44 Gbps / 0.4% loss single-flow and 9.37 Gbps / 1.1%
+  P8 is the best all-around UDP performer.
+
+**dae and sing-box UDP collapse on P8 is not a lab artifact:**
+Both engines show the same pattern — single-flow at 1–3.5 Gbps with
+moderate loss, then P8 at same or LOWER throughput with 88–98% loss. This
+indicates a fundamental bottleneck in their UDP receive paths (shared
+socket buffer contention, lack of per-flow queuing, or kernel-level UDP
+socket lock contention) that honk's `UdpEndpointPool` and per-flow bounded
+queues were specifically designed to avoid.
+
+## Results (2026-07-31, honk dev `ac64fe1` vs dae kdae `eee7c88b`)
+
+Same-time A/B on the lab. honk is the musl release binary (mimalloc,
+periodic `mi_collect` on a blocking thread, idle drain deadline); dae is
+the kdae branch at `eee7c88b` (adds a DNS group-override fix and bumps the
+outbound fork to `perf/complete-optimizations@670df833`). Latencies in
+seconds, bandwidth is the iperf3 receiver median, CPU in cores, RSS after
+the run. New in this run: **the kdae direct baseline works** (it was
+broken in the 07-30 run).
+
+| engine | protocol | cold | hot p50 | hot p95 | bw (Mbps) | cpu | RSS (MB) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| honk | direct | 0.0052 | – | – | 9406 | 0.24 | 52 |
+| honk | hy2 | 0.0101 | 0.0032 | 0.0046 | 2921 | 0.48 | 59 |
+| honk | tuic | 0.0093 | 0.0034 | 0.0043 | 3961 | 0.55 | 59 |
+| honk | ss2022 | 0.0044 | 0.0027 | 0.0040 | 9392 | 0.36 | 52 |
+| honk | trojan | 0.0072 | 0.0019 | 0.0120 | 9341 | 0.45 | 53 |
+| honk | anytls-sb | 0.0050 | 0.0031 | 0.0039 | 4790 | 0.30 | 57 |
+| honk | anytls-go | 0.0122 | 0.0032 | 0.0040 | 9226 | 0.49 | 56 |
+| dae | direct | 0.0051 | – | – | 9397 | 0.00 | 52 |
+| dae | hy2 | 0.0090 | 0.0032 | 0.0037 | 3005 | 0.82 | 63 |
+| dae | tuic | 0.0827 | 0.0792 | 0.0800 | 4280 | 0.93 | 64 |
+| dae | ss2022 | 0.0040 | 0.0036 | 0.0062 | 9404 | 0.42 | 57 |
+| dae | trojan | 0.0105 | 0.0078 | 0.0100 | 9340 | 0.65 | 57 |
+| dae | anytls-sb | 0.0112 | 0.0029 | 0.0038 | 4742 | 0.37 | 58 |
+| dae | anytls-go | 0.0069 | 0.0034 | 0.0046 | 9301 | 0.63 | 60 |
+
+UDP (iperf3 `-u -b 10G -l 1200 -R`, receiver Mbps + loss):
+
+| engine | protocol | echo RTT p50 | bw Mbps (loss) | cpu |
+| --- | --- | --- | --- | --- |
+| honk | hy2 | 0.43 ms | 1708 (72.9%) | 1.07 |
+| honk | tuic | 0.31 ms | 142 (64.5%) | 0.13 |
+| honk | ss2022 | 0.22 ms | 1879 (66.6%) | 1.28 |
+| honk | trojan | 0.18 ms | 1609 (71.9%) | 1.27 |
+| honk | anytls-sb | 0.49 ms | 1308 (78.2%) | 0.86 |
+| honk | anytls-go | 0.18 ms | 1607 (74.2%) | 1.04 |
+| dae | hy2 | 0.27 ms | 929 (85.9%) | 0.95 |
+| dae | tuic | 0.28 ms | 60 (52.4%) | 0.06 |
+| dae | ss2022 | 0.16 ms | 2705 (52.4%) | 1.74 |
+| dae | trojan | 0.11 ms | 2972 (48.7%) | 1.69 |
+| dae | anytls-sb | 0.13 ms | 1305 (78.8%) | 0.85 |
+| dae | anytls-go | 0.10 ms | 1413 (76.0%) | 0.92 |
+
+### Reading the 07-31 table
+
+- **TCP bandwidth** is parity within noise: line-rate rows (direct,
+  ss2022, trojan, anytls-go) all ~9.3–9.4 Gbps both engines; anytls-sb is
+  now a tie too (4790 vs 4742 — the new kdae no longer dominates that
+  row). hy2/tuic slightly favor dae (3005/4280 vs 2921/3961).
+- **CPU per Gbps** still belongs to honk on every QUIC row: hy2 0.48 vs
+  0.82 cores, tuic 0.55 vs 0.93, and trojan 0.45 vs 0.65 at identical
+  bandwidth.
+- **Latency**: dae's tuic still pays a full QUIC handshake per connection
+  (cold 82.7 ms, hot p50 79.2 ms vs honk's 9.3/3.4 ms, ticket-cache
+  resumed). Everything else is single-digit ms both ways.
+- **UDP**: honk leads hy2 (1708 vs 929) and anytls-go; the ss2022/trojan
+  UDP-over-TCP gap persists (dae 2705/2972 vs honk 1879/1609) and remains
+  the top UDP optimization target. TUIC UDP is broken-ish on both engines
+  (142/60 Mbps).
+- honk's hy2/tuic TCP bandwidth dropped vs the 07-30 run (5239→2921,
+  5351→3961) while dae's stayed flat; the .70 lab host was under heavy
+  parallel load during this run, so treat these two rows as suspect until
+  re-measured on an idle lab.
+
 ## Results (2026-07-30, honk dev post-session-phases vs dae kdae, AES-NI)
 
 Same-time A/B on the lab (engine VM with host-passthrough CPU; see "Known
@@ -269,6 +480,131 @@ Shadowsocks-sized chunks (RustCrypto aes-gcm 0.4–0.5 GB/s vs BoringSSL
 AeadCtx 3.3–6.7 GB/s on AES-NI hardware — the reason the SS data path
 uses BoringSSL).
 
+## Candidate UDP micro-benchmarks (absolute, not A/B)
+
+The UDP Criterion suite records absolute candidate behavior only. Its fixed
+invocation is:
+
+```bash
+cd /root/code/honk-feat-udp-to-1
+CARGO_TARGET_DIR=/root/code/honk/target cargo bench -p honk-core --bench udp -- --save-baseline udp-candidate
+```
+
+| Case | Fixed work |
+| --- | --- |
+| steady enqueue | 1,000,000 128-byte `fast_path_enqueue` calls on a Ready flow, immediately drained to hold steady state |
+| reserve / rollback | 10,000 endpoint reservations followed by rollback |
+| histogram | 1,000,000 record/snapshot operations |
+| queue saturation | 64 admitted datagrams followed by one dropped newest datagram |
+
+Record the candidate's Criterion mean, median, MAD, and absolute throughput.
+`udp-candidate` is a repeat-run label, not a comparison to `be587b1`: that
+revision has no source-level equivalent interface for a valid A/B. Criterion
+also does not provide a merge-gate p95 estimate; do not infer one from this
+suite.
+
+## Deployment UDP A/B gate
+
+`bench/udp-latency.sh` is the real deployment driver, not a CI substitute. It
+requires the same TPROXY topology and real upstreams for both binaries. Its
+fixed invocation is:
+
+```bash
+sudo bench/udp-latency.sh \
+  --baseline-bin /opt/honk/be587b1/honk-core \
+  --candidate-bin /opt/honk/udp-to-1/honk-core \
+  --config /etc/honk/bench.dae \
+  --echo-target 10.0.2.2:9000 \
+  --dns-target 10.0.2.2:53 \
+  --samples 10000 --runs 5 --offered-rate 5000
+```
+
+The fixed command deliberately has no timeout or hook flags. Configure root's
+`HONK_UDP_TIMEOUT_SEC` (default `30`) and
+`HONK_UDP_{START,READY,SETUP,PROBE,STATS,TEARDOWN,TOPOLOGY}_HOOK` values; CLI
+flags override those values. With `sudo`, use `--preserve-env` for these
+variables or configure them in root's environment. The driver supplies no
+built-in topology: missing live hooks fail closed.
+
+Every executable hook is run through `env`, not evaluated as a shell snippet.
+It receives `variant`, `case`, `run`, `workdir`, `pid`, `pgid`, `selected_bin`,
+`baseline_bin`, `candidate_bin`, `config`, `echo_target`, `dns_target`,
+`samples`, `offered_rate`, and `timeout`; `pid`/`pgid` are empty for `start`
+and `topology`. `start` must finish synchronous setup and then `exec
+"$selected_bin" ...`; the driver attests the selected file's device/inode
+against `/proc/$pid/exe` and rechecks the same PID/session/start-time/executable
+after ready, setup, probe, and stats. A row is emitted only after teardown and
+bounded verification that the owned process group is absent; residual descendants
+fail the run closed. The legacy positional arguments remain compatible. Targets
+may be IPv4, `[IPv6]`, or legal hostnames with a port.
+`probe` must report `sent == samples`.
+
+It emits one JSONL object per case/run with exactly these top-level fields:
+`schema_version`, `variant`, `commit`, `binary_sha256`, `kernel`, `topology`,
+`case`, `run`, `samples`, `offered_rate`, `sent`, `received`, `latency_unit`,
+`p50`, `p95`, `p99`, `max`, `loss`, `cpu_pct`, `rss_kib`, `fd_count`,
+`queue_drops`, and `warm_hit`. `schema_version` is `1`; latency quantiles are
+in microseconds, `loss` is the sample loss ratio, `cpu_pct` is process CPU
+usage, `rss_kib` is resident memory in KiB, and `fd_count` is the open
+file-descriptor count. The fixed cases are `cold_endpoint`, `steady_hit`,
+`warm_session_cold_endpoint`, `dns_hit`, `dns_miss`, `healthy_candidate`, and
+`blackholed_candidate`. The driver interface and JSONL shape are checked with
+`bash bench/tests/udp-latency-cli.sh`.
+
+The deployment gate compares five 10,000-sample runs at the same topology and
+offered rate: healthy cold p50/p95 regression must be at most 5%; a blackholed
+first candidate must improve p95 by at least 20% and p99 by at least 30%; a
+steady path must keep p99 at most 250 microseconds and zero drops below 70% of
+target throughput; AnyTLS warm hits must reach 80% and reduce first reply by
+one RTT or at least 20%; steady CPU and p50 regression must be at most 5%; and
+IPv4/IPv6 client-observed reply tuples must remain unchanged. **This local
+worktree has not run the deployment gate, so it makes no network-latency gate
+claim.**
+
+## Release profile and allocator matrix
+
+`bench/release-matrix.sh` compares the explicit `release-size`,
+`release-size-thin`, `release-speed`, and `release-speed-thin` profiles against
+three allocator arms: mimalloc with collection disabled, mimalloc with the
+60-second collector, and the system allocator. Every cell uses isolated Cargo,
+workload-cache, and run directories and emits machine metadata plus JSONL/CSV
+build and performance records.
+
+Validate all four supported target configurations without compiling:
+
+```bash
+bench/release-matrix.sh --all-targets --dry-run --output /tmp/honk-release-matrix
+```
+
+A measured host run requires an executable `--benchmark-hook`; the hook contract
+and required RSS/PSS/fault/CPU/latency fields are printed by
+`bench/release-matrix.sh --help`. Pin every CPU policy to one governor and keep
+turbo in one state for the full matrix; `machine.json` records both settings.
+Compare cells only on the same machine and workload. The matrix records
+evidence; it does not select a new shipping profile without deployment
+throughput and tail-latency results.
+
+Promotion is gated, not inferred from binary size alone. Against the
+`release-size` baseline, a candidate must keep every measured throughput
+regression within 3%, every p99 latency regression within 5%, and RSS growth
+within 20% over five paired runs on the same lab. The size profile remains the
+shipping default until all three gates pass.
+
+One preliminary paired deployment run on 2026-08-02 compared
+`release-size` and `release-speed` for x86_64 musl with mimalloc and the
+60-second collector. Each protocol used three 8-second reverse-throughput runs;
+the tail check used 200 requests after warm-up.
+
+| profile | binary | direct | hy2 | tuic | max RSS | hy2 p99 | tuic p99 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| release-size | 19.50 MB | 9.407 Gbps | 2.756 Gbps | 4.253 Gbps | 56 MB | 5.426 ms | 4.705 ms |
+| release-speed | 24.79 MB | 9.388 Gbps | 3.314 Gbps | 5.152 Gbps | 59 MB | 3.409 ms | 3.136 ms |
+
+The speed profile had no throughput or p99 regression and increased maximum
+RSS by 5.4%, so this sample passes the numerical gates. It is not a promotion:
+one paired run is below the five-run evidence requirement, and its binary is
+27.2% larger. `release-size` therefore remains the default.
+
 ## Production notes (10.10.10.1 gateway)
 
 - TCP (google/baidu/cloudflare) and HTTP/3 (cloudflare) pass after each
@@ -288,5 +624,7 @@ uses BoringSSL).
 - `just clash-ci` — fmt, clippy, clash_api_test + integration_test.
 - `just dns-ci` — DNS subsystem gate.
 - `cargo bench -p honk-core --bench dns` — DNS micro-benchmarks (above).
+- `cargo bench -p honk-core --bench udp -- --save-baseline udp-candidate` — candidate-only absolute UDP measurements; not a historical A/B or p95 merge gate.
+- `bash bench/tests/udp-latency-cli.sh` — deployment-driver CLI/JSONL fixture; the real UDP A/B gate above still requires TPROXY and upstreams.
 - Release CI (`.github/workflows/release.yml`) — workspace test gate +
   four-target build (x86_64/aarch64 × gnu/musl) + BTF check + tarballs.

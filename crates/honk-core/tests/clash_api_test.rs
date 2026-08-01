@@ -144,13 +144,15 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
         dns_cache,
         a_record_response([93, 184, 216, 34], 300),
     )));
+    let stats = Arc::new(StatsManager::new());
+    let connection_tracker = Arc::new(ConnectionTracker::new());
     let state = Arc::new(ClashState {
         config: Arc::new(tokio::sync::RwLock::new(config)),
-        stats: Arc::new(StatsManager::new()),
+        stats: stats.clone(),
         alive_set,
         group_manager,
         cache_db: Some(db),
-        connection_tracker: Arc::new(ConnectionTracker::new()),
+        connection_tracker: connection_tracker.clone(),
         proxy_registry: Arc::new(ProxyRegistry::default_resolver().unwrap()),
         mode_state: Arc::new(parking_lot::RwLock::new(ModeState::new("Rule", "proxy"))),
         secret: secret.to_string(),
@@ -158,6 +160,7 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
         log_tx,
         dns_service,
         connection_pool: Arc::new(honk_core::pool::ConnectionPool::new()),
+        stream_samplers: Arc::new(clash_api::StreamSamplers::new()),
     });
 
     let app = clash_api::router(state.clone());
@@ -512,18 +515,27 @@ async fn test_global_selection_and_mode_persisted() {
         .unwrap();
     assert_eq!(resp.status(), 400);
 
-    // "Restart": reopen the same cache.db and verify both values survived.
+    // Point writes are acknowledged from the in-memory pending map and become
+    // crash-durable on the bounded background flush.
     let cache_cfg = CacheFileConfig {
         enabled: true,
         path: app.db_path.to_str().unwrap().to_string(),
         ..Default::default()
     };
     let reopened = CacheDb::open(&cache_cfg, None).unwrap();
-    assert_eq!(reopened.load_clash_mode().as_deref(), Some("Global"));
-    assert_eq!(
-        reopened.load_selector_choice("GLOBAL").as_deref(),
-        Some("proxy")
-    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        if reopened.load_clash_mode().as_deref() == Some("Global")
+            && reopened.load_selector_choice("GLOBAL").as_deref() == Some("proxy")
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "cache.db point-write durability bound exceeded"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test]
@@ -1077,6 +1089,7 @@ async fn test_dns_query_upstream_and_nxdomain() {
         log_tx: app.state.log_tx.clone(),
         dns_service: nx_service,
         connection_pool: app.state.connection_pool.clone(),
+        stream_samplers: app.state.stream_samplers.clone(),
     });
     let nx_app = clash_api::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1239,4 +1252,48 @@ async fn test_store_dns_persister_end_to_end() {
         1,
         "v2 restart must leave rollback-compatible legacy rows untouched"
     );
+}
+
+#[tokio::test]
+async fn stats_exposes_udp_metrics() {
+    let app = spawn_app("", "").await;
+    app.state.stats.record_udp_endpoint_hit();
+    app.state.stats.record_udp_slow_permit_accepted();
+
+    let body: serde_json::Value = http_client()
+        .get(app.url("/stats"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // UDP is additive: existing dashboard keys retain their shapes.
+    assert!(body["outbounds"].is_array());
+    assert!(body["pool"].is_object());
+
+    let udp = &body["udp"];
+    assert_eq!(udp["endpoint"]["hits"], 1);
+    assert_eq!(udp["endpoint"]["misses"], 0);
+    assert_eq!(udp["slowPermit"]["accepted"], 1);
+    assert_eq!(udp["slowPermit"]["rejected"], 0);
+    assert_eq!(udp["slowPermit"]["closed"], 0);
+    // Endpoint-driver queue metrics are defined now but are Task 3-owned.
+    assert_eq!(udp["queue"]["accepted"], 0);
+    assert_eq!(udp["queue"]["full"], 0);
+    assert_eq!(udp["queue"]["closed"], 0);
+    assert_eq!(udp["capacity"]["rejected"], 0);
+    assert_eq!(udp["firstSend"]["failures"], 0);
+    assert_eq!(udp["latency"]["route"]["count"], 0);
+    assert_eq!(udp["latency"]["dial"]["count"], 0);
+    assert_eq!(udp["latency"]["replyReady"]["count"], 0);
+    assert_eq!(udp["latency"]["firstSend"]["count"], 0);
+    assert_eq!(udp["latency"]["firstReply"]["count"], 0);
+    assert_eq!(udp["stagger"]["attempts"], 0);
+    assert_eq!(udp["stagger"]["winners"], 0);
+    assert_eq!(udp["stagger"]["cancellations"], 0);
+    assert_eq!(udp["warm"]["attempts"], 0);
+    assert_eq!(udp["warm"]["successes"], 0);
+    assert_eq!(udp["warm"]["failures"], 0);
 }

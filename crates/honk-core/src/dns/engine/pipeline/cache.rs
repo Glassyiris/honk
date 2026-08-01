@@ -16,8 +16,7 @@ pub(super) async fn lookup(
         return Ok(None);
     }
     let cache = context.forwarder.cache_service().await;
-    if let Some(hit) = cache.negative_hit(&context.cache_key) {
-        debug!(rcode = hit.rcode, "DNS forwarder: negative cache hit");
+    if let Some(hit) = cache.negative_hit(&context.cache_key.storage_key()) {
         let response =
             crate::control::dns_control::build_dns_error_response(context.raw_query, hit.rcode);
         return context
@@ -36,7 +35,7 @@ pub(super) async fn lookup(
             )
             .map(Some);
     }
-    let Some(entry) = cache.get(&context.cache_key) else {
+    let Some(entry) = cache.get_exact(&context.cache_key) else {
         return Ok(None);
     };
     let remaining = entry.remaining_ttl_secs();
@@ -51,7 +50,7 @@ pub(super) async fn lookup(
             context.publication_epoch,
         );
     }
-    let response = entry.response.clone();
+    let response = entry.response.to_vec();
     let response = context
         .forwarder
         .apply_prefer_strategy(

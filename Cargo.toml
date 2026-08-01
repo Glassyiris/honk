@@ -131,6 +131,36 @@ lto = true
 codegen-units = 1
 strip = true
 
+# Keep the shipping profile size-oriented; opt-in profiles isolate LLVM
+# optimization and LTO effects for controlled benchmarks.
+[profile.release-size]
+inherits = "release"
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+strip = true
+
+[profile.release-size-thin]
+inherits = "release"
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.release-speed]
+inherits = "release"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+
+[profile.release-speed-thin]
+inherits = "release"
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
 # Static musl build for portable deployment (VyOS/Debian/etc.)
 [profile.release-musl]
 inherits = "release"

@@ -23,7 +23,7 @@ async fn same_generation_interleaving_converges_exact_mock_value() {
         assert!(projection.state.lock().dirty_ips.is_empty());
         assert_eq!(
             ebpf.read().await.projection_map_snapshot()[0].1.bitmap,
-            [3, 0, 0, 0]
+            [3, 0, 0, 0, 0, 0, 0, 0]
         );
     }
     println!("INTERLEAVING_CONVERGED repetitions=10 bitmap=[3, 0, 0, 0] dirty=0");
@@ -55,7 +55,10 @@ async fn stale_remove_is_repaired_by_new_same_generation_owner() {
         .expect("repair write");
     assert!(state.commit_success(repaired.generation, &repaired.sets, &repaired.removes));
     assert!(state.dirty_ips.is_empty());
-    assert_eq!(backend.projection_map_snapshot()[0].1.bitmap, [2, 0, 0, 0]);
+    assert_eq!(
+        backend.projection_map_snapshot()[0].1.bitmap,
+        [2, 0, 0, 0, 0, 0, 0, 0]
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -72,7 +75,7 @@ async fn wake_overflow_is_harmless_and_latest_state_converges() {
     worker::flush_for_test(&projection, &ebpf).await;
     let map = ebpf.read().await.projection_map_snapshot();
     assert_eq!(map.len(), 1);
-    assert_eq!(map[0].1.bitmap, [1, 0, 0, 0]);
+    assert_eq!(map[0].1.bitmap, [1, 0, 0, 0, 0, 0, 0, 0]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -155,7 +158,7 @@ async fn spawned_worker_converges_mock_map_after_transient_failure() {
     tokio::task::yield_now().await;
     let map = ebpf.read().await.projection_map_snapshot();
     assert_eq!(map.len(), 1);
-    assert_eq!(map[0].1.bitmap, [1, 0, 0, 0]);
+    assert_eq!(map[0].1.bitmap, [1, 0, 0, 0, 0, 0, 0, 0]);
     assert_eq!(projection.counters().write_failures, 1);
     println!(
         "MOCK_CONVERGED entries={} bitmap={:?} write_failures={}",

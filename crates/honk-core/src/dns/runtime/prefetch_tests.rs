@@ -78,6 +78,7 @@ fn runtime(transport: Arc<BlockingTransport>) -> Arc<DnsRuntime> {
         )),
         cache: Arc::clone(&cache),
         persistence: ProcessPersistenceHandle::new(cache),
+        outbound_runtime: None,
         transport: transport.clone(),
     })
 }

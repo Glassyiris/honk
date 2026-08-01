@@ -220,6 +220,17 @@ impl JuicityHandler {
             .context("Juicity: send request header")?;
         Ok((send, recv))
     }
+    async fn client_for_runtime(
+        &self,
+        runtime: &crate::runtime::NodeRuntime,
+    ) -> anyhow::Result<Arc<JuicityClient>> {
+        let crate::runtime::ProtocolRuntime::Quic(quic_runtime) = &runtime.runtime else {
+            anyhow::bail!("Juicity runtime is not QUIC-owned");
+        };
+        quic_runtime
+            .client(|| self.client_for(runtime.node.as_ref()))
+            .await
+    }
 }
 
 #[async_trait]
@@ -228,6 +239,20 @@ impl ProxyHandler for JuicityHandler {
         NodeProtocol::Juicity
     }
 
+    async fn warm_udp(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<super::UdpWarmStatus> {
+        let client = self.client_for_runtime(&runtime).await?;
+        let already_ready = client.quic.has_live_connection().await;
+        client.connection(connect_timeout).await?;
+        Ok(if already_ready {
+            super::UdpWarmStatus::AlreadyReady
+        } else {
+            super::UdpWarmStatus::Ready
+        })
+    }
     async fn dial(
         &self,
         node: &Node,
@@ -394,6 +419,12 @@ impl ProxyHandler for JuicityHandler {
         _connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
         anyhow::bail!("Juicity runs over QUIC; a bare TCP connection cannot be reused")
+    }
+
+    /// QUIC-based: a pooled bare TCP is unusable, so preconnect warmup must
+    /// not deposit one (it would poison the first flow through `dial_with_tcp`).
+    fn pool_bare_tcp(&self, _node: &Node) -> bool {
+        false
     }
 
     async fn test_connectivity(&self, node: &Node) -> bool {

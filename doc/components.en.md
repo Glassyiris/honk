@@ -45,6 +45,7 @@ Source of truth: `crates/honk-config/src/*`, the dae parser in `crates/honk-conf
 | — | `dns_resolve_timeout_ms` | `2000` | Control-plane resolve timeout; not settable in dae syntax |
 | — | `relay_idle_timeout_secs` | `300` | Idle relay kill; `0` = off; not settable in dae syntax |
 | — | `preconnect_node_count` | `0` | Preconnect count; `0` = auto `min(nodes,8)`; not settable in dae syntax |
+| `udp_warm_node_count` | `udp_warm_node_count` | `0` | Opt-in UDP warm-up budget. `0` is strictly disabled: no coordinator task and no warm metrics. A positive value discovers authoritative DataUdp group leaves; dispatch remains capped at four concurrent tasks. |
 
 ```dae
 global {
@@ -403,7 +404,7 @@ Each upstream is a `name: 'uri'` line; an optional trailing `-> tag` (or legacy 
 | `tls_server_name` | string? | null | DoT/DoH/DoQ/DoH3 SNI. dae syntax auto-derives from the hostname; for IP-literal upstreams set it explicitly as a URI query param, e.g. `tls://1.1.1.1:853?tls_server_name=cloudflare-dns.com` |
 | `outbound` | string? | null | Send via node/group (trailing `-> tag`) |
 
-**Runtime note:** UDP/TCP/DoT/DoH/DoQ/DoH3 work with connection reuse. DoT/DoH/TCP support `-> proxy` (TCP tunnel via node/group). DoQ/DoH3 are direct-only for now. DNS-over-proxy SOCKS5 UDP is incomplete (UDP+proxy tunnels as TCP DNS).
+**Runtime note:** UDP/TCP/DoT/DoH/DoQ/DoH3 work with connection reuse. DoT/DoH/TCP support `-> proxy` (TCP tunnel via node/group). DoQ/DoH3 are direct-only for now. UDP+proxy is intentionally carried as TCP-DNS by this upstream policy; SOCKS5 RFC 1928 UDP remains a complete, independent transport.
 
 ### Routing / rules
 
@@ -437,12 +438,21 @@ key. Unsupported flags, EDNS options (including ECS/COOKIE), EDNS-v1, and
 multi-question messages bypass both optimizations; cancellation releases the
 flight.
 
+Runtime cache and singleflight keys share one immutable binary query identity;
+operation variants retain that allocation, and cache sharding uses a precomputed
+runtime hash. The SQLite text encoding remains confined to the persistence
+boundary.
+
+
 ### Runtime and observability
 
 Reload swaps one coherent generation containing DNS policy, Router,
-GroupManager snapshot, transport manager, and routing projection. Leases let
-old requests drain; the retirement deadline and retained-generation cap bound
-shutdown, and transport initialization/close is single-flight and idempotent.
+GroupManager snapshot, transport manager, routing projection, and a pinned
+outbound runtime. Leases let old requests keep their matching node/session
+generation; after they and their DNS transports retire, old outbound pools
+reject new opens and drain live streams. The retirement deadline and retained-
+generation cap bound DNS shutdown, and transport initialization/close is
+single-flight and idempotent.
 
 Independent monotonic counters cover hit/miss/stale, flight
 saturation/cancel/retry, persistence drop/flush failure, runtime retirement,
@@ -530,7 +540,7 @@ experimental {
 | GET/DELETE | `/connections` | List / close all |
 | DELETE | `/connections/{id}` | Close one |
 | GET | `/traffic` | WS or chunked JSON lines |
-| GET | `/stats` | Outbound stats |
+| GET | `/stats` | Outbound and stable UDP stats |
 | GET | `/logs` | WS or chunked |
 | GET | `/dns/query` | DoH-style JSON |
 | POST | `/cache/fakeip/flush` | FakeIP prefix flush |
@@ -538,6 +548,36 @@ experimental {
 | GET | `/providers/proxies` | Groups as providers |
 | GET | `/providers/rules` | Stub empty |
 | GET | `/ui` … | External UI |
+
+### `GET /stats` UDP schema
+
+`udp` is a stable object nested in `GET /stats`. The dotted shorthand
+`/stats.udp` below means that nested object, **not** a separate route. All listed
+keys are always present; counters may be zero when their event has not occurred.
+No dynamic node/tag labels are added on the packet path.
+
+```text
+udp = {
+  endpoint: { hits, misses },
+  latency: {
+    route: H, dial: H, replyReady: H, firstSend: H, firstReply: H
+  },
+  capacity: { rejected },
+  slowPermit: { accepted, rejected, closed },
+  queue: { accepted, full, closed },
+  firstSend: { failures },
+  stagger: { attempts, winners, cancellations },
+  warm: { attempts, successes, failures }
+}
+H = { count, sumNanos, buckets }  // buckets has 64 fixed log2 slots
+```
+
+`queue` is the endpoint-driver queue; it is distinct from `slowPermit`, which
+records slow-path admission. Stagger counters are used only for cold URLTest
+preparation. AnyTLS candidates use caller-owned provisional session slots counted
+against the pool cap; loser cancellation closes detached work, while the winner
+commits into the captured generation before endpoint publication. Warm `successes`
+count only `Ready` or `AlreadyReady`; a `NotApplicable` result is neutral.
 
 Env: `HONK_UI_DOWNLOAD_URL` for UI zip override.
 

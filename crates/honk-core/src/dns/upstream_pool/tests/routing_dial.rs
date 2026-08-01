@@ -22,6 +22,35 @@ fn route(ip: &str, outbound: &str) -> RoutingRule {
     }
 }
 
+#[test]
+fn dial_context_pins_its_outbound_runtime_generation() {
+    let node = test_node("dns-proxy");
+    let generation = Arc::new(
+        honk_outbound::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node))
+            .unwrap(),
+    );
+    let upstream = make_upstream("proxy", "1.1.1.1:53", DnsProtocol::Tcp);
+    let pool = UpstreamPool::new_with_proxy(
+        &[upstream],
+        make_router(),
+        Some(Arc::new(
+            crate::proxy::ProxyRegistry::default_resolver().unwrap(),
+        )),
+        vec![node.clone()],
+        vec![],
+    )
+    .unwrap()
+    .with_runtime_generation(Arc::clone(&generation));
+
+    let entry = pool.entries.get("proxy").unwrap();
+    let context = pool.dial_context(entry, Some(&node));
+    let captured = context
+        .proxy
+        .and_then(|proxy| proxy.generation)
+        .expect("proxy dial must capture the owning DNS generation");
+    assert!(Arc::ptr_eq(&captured, &generation));
+}
+
 #[tokio::test]
 async fn resolve_dial_leaf_forced_arrow_bypasses_traffic_router() {
     let forced = test_node("forced-node");

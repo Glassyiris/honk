@@ -147,6 +147,61 @@ pub trait PacketTransport: Send + Sync + Debug {
     async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)>;
 }
 
+/// A prepared UDP transport that is usable only after its final side effects
+/// have been committed. Dropping it without [`Self::commit`] abandons the
+/// preparation; protocol-specific resources then clean themselves up via
+/// normal RAII. Commit failure drops the transport and returns no value.
+pub struct PreparedUdpTransport {
+    transport: Option<Arc<dyn PacketTransport>>,
+    commit: Option<Box<dyn FnOnce() -> anyhow::Result<()> + Send>>,
+}
+
+impl std::fmt::Debug for PreparedUdpTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedUdpTransport")
+            .field("prepared", &self.transport.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedUdpTransport {
+    pub fn new<F>(transport: Arc<dyn PacketTransport>, commit: F) -> Self
+    where
+        F: FnOnce() -> anyhow::Result<()> + Send + 'static,
+    {
+        Self {
+            transport: Some(transport),
+            commit: Some(Box::new(commit)),
+        }
+    }
+
+    /// Wrap an already-authoritative ordinary transport. This deliberately
+    /// preserves `dial_udp_transport` semantics for protocols with no
+    /// speculative ownership to promote.
+    pub fn ready(transport: Arc<dyn PacketTransport>) -> Self {
+        Self::new(transport, || Ok(()))
+    }
+
+    /// Consume the preparation, run its one-shot promotion, then expose the
+    /// transport. A failed promotion is fail-closed: the transport is dropped
+    /// and cannot be sent on by a caller.
+    pub fn commit(mut self) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        let transport = self
+            .transport
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("UDP transport preparation already consumed"))?;
+        let commit = self
+            .commit
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("UDP transport commit already consumed"))?;
+        if let Err(error) = commit() {
+            drop(transport);
+            return Err(error);
+        }
+        Ok(transport)
+    }
+}
+
 /// Adapter presenting any `UdpSocket` — a direct target, a socks5
 /// server-assigned relay, or a legacy loopback bridge — as a
 /// [`PacketTransport`]. Lets tunnel protocols migrate to framed transports
@@ -177,9 +232,30 @@ impl PacketTransport for UdpSocketTransport {
     }
 }
 
+/// Outcome of an additive UDP session warm-up request. A status is not a
+/// protocol capability claim: only handlers that own a reusable UDP-capable
+/// session return `Ready` or `AlreadyReady`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UdpWarmStatus {
+    Ready,
+    AlreadyReady,
+    NotApplicable,
+}
+
 #[async_trait]
 pub trait ProxyHandler: Send + Sync {
     fn protocol(&self) -> NodeProtocol;
+
+    /// Warm this generation's node-owned UDP session resources. The default
+    /// is intentionally honest: transport support does not imply that a
+    /// protocol has a reusable warm session.
+    async fn warm_udp(
+        &self,
+        _runtime: Arc<crate::runtime::NodeRuntime>,
+        _connect_timeout: Duration,
+    ) -> anyhow::Result<UdpWarmStatus> {
+        Ok(UdpWarmStatus::NotApplicable)
+    }
 
     async fn dial(
         &self,
@@ -188,6 +264,25 @@ pub trait ProxyHandler: Send + Sync {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream>;
+
+    /// Dial through an explicitly captured runtime generation. Stateless
+    /// handlers delegate to [`Self::dial`]; session-owning handlers override
+    /// this to avoid consulting the mutable current-generation registry.
+    async fn dial_runtime(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        self.dial(
+            runtime.node.as_ref(),
+            target,
+            target_domain,
+            connect_timeout,
+        )
+        .await
+    }
 
     /// Default implementation returns an error indicating UDP is not supported.
     async fn dial_udp(
@@ -218,6 +313,59 @@ pub trait ProxyHandler: Send + Sync {
             proxy.socket,
             proxy.relay_addr,
         )))
+    }
+    /// Open a framed UDP transport using an explicitly captured runtime
+    /// generation. Session-owning handlers override this so an authoritative
+    /// flow reuses the same warmed generation-local client.
+    async fn dial_udp_transport_runtime(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        self.dial_udp_transport(
+            runtime.node.as_ref(),
+            target,
+            target_domain,
+            connect_timeout,
+        )
+        .await
+    }
+
+    /// Prepare a UDP transport for a Cold URLTest candidate. Protocols that
+    /// do not need speculative ownership can use their ordinary transport;
+    /// session protocols override this to defer pool publication until the
+    /// caller has selected and committed a winner.
+    async fn dial_udp_transport_speculative(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<PreparedUdpTransport> {
+        self.dial_udp_transport(node, target, target_domain, connect_timeout)
+            .await
+            .map(PreparedUdpTransport::ready)
+    }
+
+    /// Generation-pinned speculative preparation. The default delegates to
+    /// the node-based method; session-owning handlers override this so every
+    /// provisional resource stays attached to the captured runtime generation.
+    async fn dial_udp_transport_speculative_runtime(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<PreparedUdpTransport> {
+        self.dial_udp_transport_speculative(
+            runtime.node.as_ref(),
+            target,
+            target_domain,
+            connect_timeout,
+        )
+        .await
     }
 
     /// Raw TCP reachability check against the node server. Handlers share
@@ -377,6 +525,33 @@ impl ProxyRegistry {
             .await
     }
 
+    /// Dial through a generation-pinned node runtime. DNS runtime leases use
+    /// this path so a reload cannot redirect an old snapshot into a new pool.
+    pub async fn dial_runtime(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        if runtime.node.name == "block" {
+            return BlockHandler::new()
+                .dial_runtime(runtime, target, target_domain, connect_timeout)
+                .await;
+        }
+        if runtime.node.protocol == NodeProtocol::HTTP && runtime.node.name != "direct" {
+            return HttpConnectHandler::new()
+                .dial_runtime(runtime, target, target_domain, connect_timeout)
+                .await;
+        }
+        let handler = self.find(runtime.node.protocol).ok_or_else(|| {
+            anyhow::anyhow!("No handler for protocol {:?}", runtime.node.protocol)
+        })?;
+        handler
+            .dial_runtime(runtime, target, target_domain, connect_timeout)
+            .await
+    }
+
     pub async fn dial_udp(
         &self,
         node: &Node,
@@ -408,6 +583,31 @@ impl ProxyRegistry {
             .await
     }
 
+    /// Warm a node using the explicitly supplied runtime generation. This
+    /// deliberately never reads the mutable shared runtime-registry cell:
+    /// reload-owned work must stay attached to its original generation.
+    pub async fn warm_udp(
+        &self,
+        generation: Arc<crate::runtime::OutboundRuntimeRegistry>,
+        node_id: uuid::Uuid,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<UdpWarmStatus> {
+        if generation.is_shutdown() {
+            anyhow::bail!("outbound runtime generation is shut down");
+        }
+        let runtime = generation
+            .get(&node_id)
+            .ok_or_else(|| anyhow::anyhow!("node {node_id} is not in runtime generation"))?;
+        let handler = self.find(runtime.node.protocol).ok_or_else(|| {
+            anyhow::anyhow!("No handler for protocol {:?}", runtime.node.protocol)
+        })?;
+        let status = handler.warm_udp(runtime, connect_timeout).await?;
+        if generation.is_shutdown() {
+            anyhow::bail!("outbound runtime generation shut down during warm-up");
+        }
+        Ok(status)
+    }
+
     /// Framed UDP transport for a flow, dispatching to the node's handler
     /// (see [`ProxyHandler::dial_udp_transport`]).
     pub async fn dial_udp_transport(
@@ -428,6 +628,92 @@ impl ProxyRegistry {
         handler
             .dial_udp_transport(node, target, target_domain, connect_timeout)
             .await
+    }
+
+    /// Generation-pinned framed UDP transport for an authoritative flow.
+    /// This complements speculative preparation: both paths must retain the
+    /// runtime captured when the flow was admitted, not re-resolve a handler
+    /// cache after reload.
+    pub async fn dial_udp_transport_runtime(
+        &self,
+        generation: Arc<crate::runtime::OutboundRuntimeRegistry>,
+        node_id: uuid::Uuid,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        if generation.is_shutdown() {
+            anyhow::bail!("outbound runtime generation is shut down");
+        }
+        let runtime = generation
+            .get(&node_id)
+            .ok_or_else(|| anyhow::anyhow!("node {node_id} is not in runtime generation"))?;
+        let transport = if runtime.node.name == "block" {
+            BlockHandler::new()
+                .dial_udp_transport_runtime(
+                    Arc::clone(&runtime),
+                    target,
+                    target_domain,
+                    connect_timeout,
+                )
+                .await?
+        } else {
+            let handler = self.find(runtime.node.protocol).ok_or_else(|| {
+                anyhow::anyhow!("No handler for protocol {:?}", runtime.node.protocol)
+            })?;
+            handler
+                .dial_udp_transport_runtime(runtime, target, target_domain, connect_timeout)
+                .await?
+        };
+        if generation.is_shutdown() {
+            anyhow::bail!("outbound runtime generation shut down during UDP dial");
+        }
+        Ok(transport)
+    }
+
+    /// Speculatively prepare a framed UDP transport for a Cold URLTest
+    /// candidate. Ordinary dial behavior remains available through
+    /// [`Self::dial_udp_transport`] for authoritative paths.
+    pub async fn dial_udp_transport_speculative(
+        &self,
+        generation: Arc<crate::runtime::OutboundRuntimeRegistry>,
+        node_id: uuid::Uuid,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<PreparedUdpTransport> {
+        if generation.is_shutdown() {
+            anyhow::bail!("outbound runtime generation is shut down");
+        }
+        let runtime = generation
+            .get(&node_id)
+            .ok_or_else(|| anyhow::anyhow!("node {node_id} is not in runtime generation"))?;
+        let prepared = if runtime.node.name == "block" {
+            BlockHandler::new()
+                .dial_udp_transport_speculative_runtime(
+                    Arc::clone(&runtime),
+                    target,
+                    target_domain,
+                    connect_timeout,
+                )
+                .await?
+        } else {
+            let handler = self.find(runtime.node.protocol).ok_or_else(|| {
+                anyhow::anyhow!("No handler for protocol {:?}", runtime.node.protocol)
+            })?;
+            handler
+                .dial_udp_transport_speculative_runtime(
+                    runtime,
+                    target,
+                    target_domain,
+                    connect_timeout,
+                )
+                .await?
+        };
+        if generation.is_shutdown() {
+            anyhow::bail!("outbound runtime generation shut down during UDP preparation");
+        }
+        Ok(prepared)
     }
 
     pub async fn test_node(&self, node: &Node) -> bool {
@@ -537,5 +823,106 @@ mod tests {
             target_domain: None,
         };
         assert_eq!(ps.raw_fd(), None);
+    }
+
+    #[tokio::test]
+    async fn warm_udp_is_not_applicable_for_handlers_without_reusable_sessions() {
+        let mut nodes = Vec::new();
+        for (name, protocol) in [
+            ("direct", NodeProtocol::HTTP),
+            ("socks", NodeProtocol::Socks5),
+            ("ss", NodeProtocol::SS),
+            ("trojan", NodeProtocol::Trojan),
+        ] {
+            nodes.push(Node {
+                name: name.into(),
+                protocol,
+                ..Default::default()
+            });
+        }
+        let generation = Arc::new(crate::runtime::OutboundRuntimeRegistry::build(&nodes).unwrap());
+        let registry = ProxyRegistry::default_resolver().unwrap();
+
+        for node in &nodes {
+            assert_eq!(
+                registry
+                    .warm_udp(Arc::clone(&generation), node.id, Duration::from_secs(1))
+                    .await
+                    .unwrap(),
+                UdpWarmStatus::NotApplicable,
+                "{} must not masquerade as a warmable UDP session",
+                node.name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_udp_rejects_a_shutdown_generation_before_dispatch() {
+        let node = Node {
+            name: "old-anytls".into(),
+            protocol: NodeProtocol::AnyTLS,
+            ..Default::default()
+        };
+        let generation = Arc::new(
+            crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
+        );
+        generation.shutdown();
+
+        assert!(
+            ProxyRegistry::default_resolver()
+                .unwrap()
+                .warm_udp(generation, node.id, Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn speculative_udp_rejects_a_shutdown_generation_before_dispatch() {
+        let node = Node {
+            name: "direct".into(),
+            protocol: NodeProtocol::HTTP,
+            ..Default::default()
+        };
+        let generation = Arc::new(
+            crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
+        );
+        generation.shutdown();
+
+        assert!(
+            ProxyRegistry::default_resolver()
+                .unwrap()
+                .dial_udp_transport_speculative(
+                    generation,
+                    node.id,
+                    "127.0.0.1:53".parse().unwrap(),
+                    None,
+                    Duration::from_secs(1),
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_udp_transport_defers_transport_exposure_until_commit() {
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let relay_addr = socket.local_addr().unwrap();
+        let transport: Arc<dyn PacketTransport> =
+            Arc::new(UdpSocketTransport::new(Arc::clone(&socket), relay_addr));
+        let commits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let prepared = PreparedUdpTransport::new(Arc::clone(&transport), {
+            let commits = Arc::clone(&commits);
+            move || {
+                commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+        });
+        assert_eq!(commits.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        let committed = prepared.commit().unwrap();
+
+        assert_eq!(commits.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(Arc::ptr_eq(&transport, &committed));
     }
 }

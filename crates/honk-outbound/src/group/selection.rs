@@ -1,5 +1,20 @@
 use super::*;
 
+/// Whether resolving a selection may update group state or must only observe
+/// it. Peek is deliberately threaded through nested policies so warm-up
+/// discovery shares production semantics without advancing selection state.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelectionEffects {
+    Apply,
+    Peek,
+}
+
+impl SelectionEffects {
+    fn applies(self) -> bool {
+        self == Self::Apply
+    }
+}
+
 impl GroupManager {
     pub fn new(groups: &[Group], nodes: &[Node]) -> Self {
         Self::with_alive_set(groups, nodes, None)
@@ -52,8 +67,46 @@ impl GroupManager {
     ) -> Option<&Node> {
         let group = self.groups.get(group_name)?;
         self.mark_used(group_name);
-        let mut visited = Vec::new();
-        self.pick_in_group(group, domain, ipver, &mut visited, 0)
+        // The overwhelmingly common selector has only direct members. Avoid
+        // constructing its transient candidate/visited vectors; nested
+        // groups still take the guarded recursive path below.
+        if group.policy == GroupPolicy::Selector && group.groups.is_empty() {
+            return self.pick_direct_selector(group, domain, ipver);
+        }
+        let mut visited = Vec::with_capacity(MAX_GROUP_DEPTH);
+        self.pick_in_group(
+            group,
+            domain,
+            ipver,
+            &mut visited,
+            0,
+            SelectionEffects::Apply,
+        )
+    }
+
+    /// Whether a node is selectable for this traffic domain and IP version.
+    ///
+    /// Data UDP accepts either UDP probe domain after UDP state exists;
+    /// unprobed nodes inherit TCP liveness. Other domains use their matching
+    /// health state.
+    pub fn is_node_selectable_for_domain(
+        &self,
+        node_name: &str,
+        domain: ProbeDomain,
+        ipver: IpVersion,
+    ) -> bool {
+        let Some(alive) = &self.alive_set else {
+            return true;
+        };
+        if domain == ProbeDomain::DataUdp {
+            return if alive.has_udp_state(node_name) {
+                alive.is_alive_for(node_name, ProbeDomain::DataUdp, ipver)
+                    || alive.is_alive_for(node_name, ProbeDomain::DnsUdp, ipver)
+            } else {
+                alive.is_alive_for(node_name, ProbeDomain::Tcp, ipver)
+            };
+        }
+        alive.is_alive_for(node_name, domain, ipver)
     }
 
     /// Select a single alive node, excluding one by name (for failover retry).
@@ -66,7 +119,14 @@ impl GroupManager {
     ) -> Option<&Node> {
         let group = self.groups.get(name)?;
         let mut visited = Vec::new();
-        let candidates = self.flatten_candidates(group, domain, ipver, &mut visited, 0);
+        let candidates = self.flatten_candidates(
+            group,
+            domain,
+            ipver,
+            &mut visited,
+            0,
+            SelectionEffects::Apply,
+        );
         let candidates: Vec<Candidate> = self
             .filter_alive_candidates(candidates, domain, ipver, group.check_url.as_deref())
             .into_iter()
@@ -86,57 +146,135 @@ impl GroupManager {
         )
     }
 
-    /// Select candidate node(s) for dialing.
+    /// Select candidate node(s) for dialing, retaining the legacy Vec API.
     ///
-    /// Selection is **authoritative** (sing-box semantics): a group's policy
-    /// pick is the node traffic actually goes through — the list has exactly
-    /// one entry for every policy, so the manual Selector choice and the
-    /// URLTest winner are honored instead of being lost to a parallel race.
-    /// The only multi-entry case is a URLTest group with no measurement
-    /// data at all (cold start), where racing all alive candidates is the
-    /// fastest way to find a working node before the first selection forms.
-    ///
-    /// With nested groups, candidates are the flattened leaves (each
-    /// sub-group contributes its own policy's current pick), so dialing is
-    /// always against concrete leaf nodes.
+    /// New callers that must distinguish a cold URLTest plan from a
+    /// single-candidate authoritative pick should use
+    /// [`Self::selection_plan_for_domain`] instead; vector length is not
+    /// provenance (liveness filtering can leave one cold candidate).
     pub fn select_nodes_in_order_for_domain(
         &self,
         group_name: &str,
         domain: ProbeDomain,
         ipver: IpVersion,
     ) -> Vec<&Node> {
+        self.selection_plan_for_domain(group_name, domain, ipver)
+            .nodes
+    }
+
+    /// Resolve the top-level group's concrete leaves and retain whether its
+    /// policy made an authoritative choice or remains a cold URLTest plan.
+    ///
+    /// Nested groups contribute only their own current leaf through
+    /// [`Self::flatten_candidates`]; a nested cold URLTest therefore never
+    /// contaminates the caller's provenance. Only this requested top-level
+    /// URLTest can return [`SelectionPlanMode::ColdUrlTest`].
+    pub fn selection_plan_for_domain(
+        &self,
+        group_name: &str,
+        domain: ProbeDomain,
+        ipver: IpVersion,
+    ) -> SelectionPlan<'_> {
+        self.selection_plan_for_domain_with_effects(
+            group_name,
+            domain,
+            ipver,
+            SelectionEffects::Apply,
+        )
+    }
+
+    /// Resolve a selection plan without changing group activity, caches,
+    /// round-robin cursors, persistence, or connection interruption state.
+    /// This is used by UDP warm-up discovery, which must observe the exact
+    /// next production plan without itself becoming traffic.
+    pub fn peek_selection_plan_for_domain(
+        &self,
+        group_name: &str,
+        domain: ProbeDomain,
+        ipver: IpVersion,
+    ) -> SelectionPlan<'_> {
+        self.selection_plan_for_domain_with_effects(
+            group_name,
+            domain,
+            ipver,
+            SelectionEffects::Peek,
+        )
+    }
+
+    fn selection_plan_for_domain_with_effects(
+        &self,
+        group_name: &str,
+        domain: ProbeDomain,
+        ipver: IpVersion,
+        effects: SelectionEffects,
+    ) -> SelectionPlan<'_> {
         let Some(group) = self.groups.get(group_name) else {
-            return vec![];
+            return SelectionPlan {
+                mode: SelectionPlanMode::Authoritative,
+                nodes: vec![],
+            };
         };
-        self.mark_used(group_name);
+        if effects.applies() {
+            self.mark_used(group_name);
+        }
         let mut visited = Vec::new();
-        let candidates = self.flatten_candidates(group, domain, ipver, &mut visited, 0);
+        let candidates = self.flatten_candidates(group, domain, ipver, &mut visited, 0, effects);
         let candidates =
             self.filter_alive_candidates(candidates, domain, ipver, group.check_url.as_deref());
-        if candidates.is_empty() {
-            return vec![];
-        }
         let network = SelectionNetwork::from_probe_domain(domain);
-        match group.policy {
-            GroupPolicy::Selector => vec![self.pick_selector(&candidates, group)],
-            GroupPolicy::URLTest => {
-                // Cold start: no latency data on any candidate — race all
-                // alive candidates to land the first connection quickly.
-                let any_data = candidates.iter().any(|c| {
-                    self.node_latency(c.node, network, ipver, group.check_url.as_deref(), c.tag)
-                        != Duration::MAX
-                });
-                if any_data {
-                    vec![self.pick_urltest(&candidates, group, network, ipver)]
+        // Measurements on UDP-dead nodes cannot make the surviving plan warm:
+        // determine URLTest provenance only from eligible candidates. A cold
+        // group stays cold with one (or zero) survivor.
+        let urltest_has_data = group.policy == GroupPolicy::URLTest
+            && candidates.iter().any(|c| {
+                self.node_latency(c.node, network, ipver, group.check_url.as_deref(), c.tag)
+                    != Duration::MAX
+            });
+        if candidates.is_empty() {
+            return SelectionPlan {
+                mode: if group.policy == GroupPolicy::URLTest && !urltest_has_data {
+                    SelectionPlanMode::ColdUrlTest
                 } else {
-                    self.order_by_latency(candidates, network, ipver, group.check_url.as_deref())
-                        .into_iter()
-                        .map(|c| c.node)
-                        .collect()
+                    SelectionPlanMode::Authoritative
+                },
+                nodes: vec![],
+            };
+        }
+        match group.policy {
+            GroupPolicy::Selector => SelectionPlan {
+                mode: SelectionPlanMode::Authoritative,
+                nodes: vec![self.pick_selector(&candidates, group)],
+            },
+            GroupPolicy::URLTest => {
+                if urltest_has_data {
+                    SelectionPlan {
+                        mode: SelectionPlanMode::Authoritative,
+                        nodes: vec![self.pick_urltest(&candidates, group, network, ipver, effects)],
+                    }
+                } else {
+                    SelectionPlan {
+                        mode: SelectionPlanMode::ColdUrlTest,
+                        nodes: self
+                            .order_by_latency(
+                                candidates,
+                                network,
+                                ipver,
+                                group.check_url.as_deref(),
+                            )
+                            .into_iter()
+                            .map(|c| c.node)
+                            .collect(),
+                    }
                 }
             }
-            GroupPolicy::LoadBalance => vec![self.pick_load_balance(&candidates, group)],
-            GroupPolicy::Fallback => vec![self.pick_fallback(&candidates, group)],
+            GroupPolicy::LoadBalance => SelectionPlan {
+                mode: SelectionPlanMode::Authoritative,
+                nodes: vec![self.pick_load_balance(&candidates, group, effects)],
+            },
+            GroupPolicy::Fallback => SelectionPlan {
+                mode: SelectionPlanMode::Authoritative,
+                nodes: vec![self.pick_fallback(&candidates, group, effects)],
+            },
         }
     }
 
@@ -292,7 +430,14 @@ impl GroupManager {
             };
             let mut visited = Vec::new();
             let leaf = self
-                .pick_in_group(sub, ProbeDomain::Tcp, IpVersion::V4, &mut visited, 0)
+                .pick_in_group(
+                    sub,
+                    ProbeDomain::Tcp,
+                    IpVersion::V4,
+                    &mut visited,
+                    0,
+                    SelectionEffects::Apply,
+                )
                 .or_else(|| {
                     let mut visited = Vec::new();
                     self.first_leaf(sub, &mut visited, 0)
@@ -385,13 +530,20 @@ impl GroupManager {
         *self.interrupt_callback.write() = cb;
     }
 
-    /// Record group activity: updates the idle-timeout timestamp and wakes
-    /// URLTest group health checks in the alive set.
+    /// Record group activity: updates idle tracking only for groups that
+    /// actually configure an idle timeout, then wakes URLTest health checks.
     fn mark_used(&self, group_name: &str) {
-        self.last_used
-            .write()
-            .insert(group_name.to_string(), Instant::now());
-        if let Some(ref alive) = self.alive_set {
+        if self
+            .groups
+            .get(group_name)
+            .and_then(|group| group.idle_timeout)
+            .is_some_and(|timeout| timeout > 0)
+        {
+            self.last_used
+                .write()
+                .insert(group_name.to_string(), Instant::now());
+        }
+        if let Some(alive) = &self.alive_set {
             alive.mark_group_active(group_name);
         }
     }
@@ -492,8 +644,9 @@ impl GroupManager {
         ipver: IpVersion,
         visited: &mut Vec<&'a str>,
         depth: usize,
+        effects: SelectionEffects,
     ) -> Option<&'a Node> {
-        let candidates = self.flatten_candidates(group, domain, ipver, visited, depth);
+        let candidates = self.flatten_candidates(group, domain, ipver, visited, depth, effects);
         let candidates =
             self.filter_alive_candidates(candidates, domain, ipver, group.check_url.as_deref());
         if candidates.is_empty() {
@@ -502,9 +655,9 @@ impl GroupManager {
         let network = SelectionNetwork::from_probe_domain(domain);
         Some(match group.policy {
             GroupPolicy::Selector => self.pick_selector(&candidates, group),
-            GroupPolicy::URLTest => self.pick_urltest(&candidates, group, network, ipver),
-            GroupPolicy::LoadBalance => self.pick_load_balance(&candidates, group),
-            GroupPolicy::Fallback => self.pick_fallback(&candidates, group),
+            GroupPolicy::URLTest => self.pick_urltest(&candidates, group, network, ipver, effects),
+            GroupPolicy::LoadBalance => self.pick_load_balance(&candidates, group, effects),
+            GroupPolicy::Fallback => self.pick_fallback(&candidates, group, effects),
         })
     }
 
@@ -520,6 +673,7 @@ impl GroupManager {
         ipver: IpVersion,
         visited: &mut Vec<&'a str>,
         depth: usize,
+        effects: SelectionEffects,
     ) -> Vec<Candidate<'a>> {
         if depth >= MAX_GROUP_DEPTH || visited.contains(&group.name.as_str()) {
             return Vec::new();
@@ -539,11 +693,14 @@ impl GroupManager {
             let Some(sub) = self.groups.get(sub_tag.as_str()) else {
                 continue;
             };
-            // Sub-group participation counts as activity so the parent's
-            // traffic keeps the child's health checks awake (URLTest idle
-            // sleep is driven by `mark_used`).
-            self.mark_used(sub_tag);
-            if let Some(leaf) = self.pick_in_group(sub, domain, ipver, visited, depth + 1) {
+            // Sub-group participation counts as activity only for real
+            // traffic. Peek follows the same nested policy without waking
+            // health checks or updating idle timestamps.
+            if effects.applies() {
+                self.mark_used(sub_tag);
+            }
+            if let Some(leaf) = self.pick_in_group(sub, domain, ipver, visited, depth + 1, effects)
+            {
                 out.push(Candidate {
                     tag: sub_tag.as_str(),
                     node: leaf,
@@ -584,20 +741,6 @@ impl GroupManager {
         let Some(ref alive) = self.alive_set else {
             return candidates;
         };
-        if domain == ProbeDomain::DataUdp {
-            return candidates
-                .into_iter()
-                .filter(|c| {
-                    let name = &c.node.name;
-                    if alive.has_udp_state(name) {
-                        alive.is_alive_for(name, ProbeDomain::DataUdp, ipver)
-                            || alive.is_alive_for(name, ProbeDomain::DnsUdp, ipver)
-                    } else {
-                        alive.is_alive_for(name, ProbeDomain::Tcp, ipver)
-                    }
-                })
-                .collect();
-        }
         if domain == ProbeDomain::Tcp
             && let Some(url) = check_url
         {
@@ -613,8 +756,51 @@ impl GroupManager {
         }
         candidates
             .into_iter()
-            .filter(|c| alive.is_alive_for(&c.node.name, domain, ipver))
+            .filter(|c| self.is_node_selectable_for_domain(&c.node.name, domain, ipver))
             .collect()
+    }
+
+    /// Allocation-free selector fast path for a group with direct members
+    /// only. It preserves selector precedence and liveness/custom-URL
+    /// eligibility while the recursive path retains nested cycle guards.
+    fn pick_direct_selector<'a>(
+        &'a self,
+        group: &'a Group,
+        domain: ProbeDomain,
+        ipver: IpVersion,
+    ) -> Option<&'a Node> {
+        let selectable = |node: &&Node| {
+            if domain == ProbeDomain::Tcp
+                && let Some(url) = group.check_url.as_deref()
+                && let Some(alive) = &self.alive_set
+            {
+                alive.is_alive_for_url(&node.name, url)
+            } else {
+                self.is_node_selectable_for_domain(&node.name, domain, ipver)
+            }
+        };
+        let find = |tag: &str| {
+            group
+                .nodes
+                .iter()
+                .filter_map(|id| self.nodes.get(id))
+                .find(|node| node.name == tag && selectable(node))
+        };
+        if let Some(choice) = self.selector_choice.read().get(&group.name)
+            && let Some(node) = find(choice)
+        {
+            return Some(node);
+        }
+        if let Some(default) = group.default.as_deref()
+            && let Some(node) = find(default)
+        {
+            return Some(node);
+        }
+        group
+            .nodes
+            .iter()
+            .filter_map(|id| self.nodes.get(id))
+            .find(selectable)
     }
 
     /// Selector policy: runtime choice, then `group.default`, then first
@@ -649,6 +835,7 @@ impl GroupManager {
         group: &Group,
         network: SelectionNetwork,
         ipver: IpVersion,
+        effects: SelectionEffects,
     ) -> &'a Node {
         let tolerance = Duration::from_millis(group.tolerance.max(1));
 
@@ -667,7 +854,9 @@ impl GroupManager {
             if let Some(entry) = tcp_entry
                 && let Some(&c) = candidates.iter().find(|c| c.tag == entry.tag)
             {
-                if self.cache_urltest_selection(group, network, &c, entry.latency) {
+                if effects.applies()
+                    && self.cache_urltest_selection(group, network, &c, entry.latency)
+                {
                     self.maybe_interrupt(&group.name);
                 }
                 return c.node;
@@ -718,7 +907,7 @@ impl GroupManager {
             group.check_url.as_deref(),
             best.tag,
         );
-        if self.cache_urltest_selection(group, network, &best, latency) {
+        if effects.applies() && self.cache_urltest_selection(group, network, &best, latency) {
             self.maybe_interrupt(&group.name);
         }
 
@@ -764,12 +953,21 @@ impl GroupManager {
     /// tracked connection of the group (that would defeat load balancing).
     /// Connections to a node that actually dies are reaped by the alive
     /// set's traffic-failure reporting instead.
-    fn pick_load_balance<'a>(&self, candidates: &[Candidate<'a>], group: &Group) -> &'a Node {
+    fn pick_load_balance<'a>(
+        &self,
+        candidates: &[Candidate<'a>],
+        group: &Group,
+        effects: SelectionEffects,
+    ) -> &'a Node {
         let Some(counter) = self.lb_counters.get(&group.name) else {
             return candidates[0].node;
         };
-        let idx = counter.fetch_add(1, Ordering::Relaxed) % candidates.len();
-        candidates[idx].node
+        let cursor = if effects.applies() {
+            counter.fetch_add(1, Ordering::Relaxed)
+        } else {
+            counter.load(Ordering::Relaxed)
+        };
+        candidates[cursor % candidates.len()].node
     }
 
     /// Fallback policy: first alive candidate in member order, pinned.
@@ -781,7 +979,12 @@ impl GroupManager {
     /// flapping (a marginally-preferred member oscillating alive/dead
     /// would yank every connection twice) costs more than staying on a
     /// working lower-preference member until it actually fails.
-    fn pick_fallback<'a>(&self, candidates: &[Candidate<'a>], group: &Group) -> &'a Node {
+    fn pick_fallback<'a>(
+        &self,
+        candidates: &[Candidate<'a>],
+        group: &Group,
+        effects: SelectionEffects,
+    ) -> &'a Node {
         {
             let cache = self.fallback_cache.read();
             if let Some(pinned) = cache.get(&group.name)
@@ -791,7 +994,7 @@ impl GroupManager {
             }
         }
         let first = candidates[0];
-        if self.cache_fallback_selection(group, &first) {
+        if effects.applies() && self.cache_fallback_selection(group, &first) {
             self.maybe_interrupt(&group.name);
         }
         first.node

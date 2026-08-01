@@ -1,4 +1,3 @@
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -7,7 +6,7 @@ use tokio::sync::{RwLock, mpsc};
 use tokio::time::Instant;
 
 use super::{ProjectionCounters, RoutingProjection};
-use crate::ebpf::{DomainRouteWriteError, EbpfBackend, maps};
+use crate::ebpf::{EbpfBackend, maps};
 
 const WARN_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -77,13 +76,15 @@ async fn flush_after_snapshot(
     {
         let mut backend = ebpf.write().await;
         for set in &batch.sets {
-            match ip_key(set.ip).and_then(|key| backend.set_domain_ip_bitmap(&key, &set.bitmap)) {
+            let key = maps::ip_addr_to_lpm_key(set.ip);
+            match backend.set_domain_ip_bitmap(&key, &set.bitmap) {
                 Ok(()) => successful_sets.push(*set),
                 Err(error) => failures.push((set.ip, error)),
             }
         }
         for remove in &batch.removes {
-            match ip_key(remove.ip).and_then(|key| backend.remove_domain_ip_bitmap(&key)) {
+            let key = maps::ip_addr_to_lpm_key(remove.ip);
+            match backend.remove_domain_ip_bitmap(&key) {
                 Ok(()) => successful_removes.push(*remove),
                 Err(error) => failures.push((remove.ip, error)),
             }
@@ -131,14 +132,6 @@ async fn flush_after_snapshot(
             *last_warning = Some(now);
         }
     }
-}
-
-fn ip_key(ip: IpAddr) -> Result<honk_ebpf_common::LpmKey, DomainRouteWriteError> {
-    let prefix = match ip {
-        IpAddr::V4(_) => format!("{ip}/32"),
-        IpAddr::V6(_) => format!("{ip}/128"),
-    };
-    maps::cidr_to_lpm_key(&prefix).map_err(DomainRouteWriteError::Other)
 }
 
 #[cfg(test)]

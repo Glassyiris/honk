@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test]
-async fn set_forwarder_does_not_wait_for_resolve_and_notify_exchange() {
+async fn snapshot_publication_does_not_wait_for_resolve_and_notify_exchange() {
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let old = snapshot_forwarder(Arc::new(SnapshotUpstream {
@@ -37,7 +37,7 @@ async fn set_forwarder_does_not_wait_for_resolve_and_notify_exchange() {
     if publication.is_err() {
         release.notify_waiters();
         let _ = running.await;
-        panic!("set_forwarder waited for the old upstream exchange");
+        panic!("snapshot publication waited for the old upstream exchange");
     }
     assert!(!running.is_finished(), "old query must remain paused");
     release.notify_waiters();
@@ -87,7 +87,7 @@ async fn resolve_domain_keeps_old_snapshot_without_blocking_publication() {
     if publication.is_err() {
         release.notify_waiters();
         let _ = running.await;
-        panic!("set_forwarder waited for resolve_domain");
+        panic!("snapshot publication waited for resolve_domain");
     }
     assert!(!running.is_finished(), "old lookup must remain paused");
     release.notify_waiters();

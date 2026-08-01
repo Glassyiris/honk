@@ -261,11 +261,7 @@ where
                     client_addr, target_addr, e
                 );
             }
-            Ok(RelayStats {
-                total_bytes: 0,
-                duration_ms,
-                ..Default::default()
-            })
+            Err(e.into())
         }
     }
 }

@@ -14,7 +14,9 @@ use clap::Args;
 use honk_ebpf_common::conn::ConnState;
 use honk_ebpf_common::dae_ip::In6Addr;
 use honk_ebpf_common::redirect_need::{DomainRouting, RoutingHandoffEntry, TuplesKey};
-use honk_ebpf_common::{RedirectEntry, RedirectTuple};
+use honk_ebpf_common::{
+    OUTBOUND_STATS_MAP_LEN, OutboundStatsCounters, RedirectEntry, RedirectTuple,
+};
 
 // ---------------------------------------------------------------------------
 // Minimal bpf(2) layer (BPF_OBJ_GET / LOOKUP_ELEM / GET_NEXT_KEY).
@@ -150,6 +152,31 @@ fn read_percpu_sum(fd: RawFd, ncpu: usize, index: u32) -> io::Result<u64> {
         total = total.wrapping_add(u64::from_ne_bytes(*chunk));
     }
     Ok(total)
+}
+
+fn read_percpu_outbound(fd: RawFd, ncpu: usize, index: u32) -> io::Result<OutboundStatsCounters> {
+    let value_len = std::mem::size_of::<OutboundStatsCounters>();
+    let mut buf = vec![0u8; ncpu * value_len];
+    let mut attr = BpfAttr {
+        map_fd: fd as u32,
+        key: &index as *const u32 as u64,
+        value_or_next: buf.as_mut_ptr() as u64,
+        ..Default::default()
+    };
+    bpf(BPF_MAP_LOOKUP_ELEM, &mut attr)?;
+    Ok(sum_percpu_outbound(&buf))
+}
+
+fn sum_percpu_outbound(buf: &[u8]) -> OutboundStatsCounters {
+    let value_len = std::mem::size_of::<OutboundStatsCounters>();
+    debug_assert_eq!(buf.len() % value_len, 0);
+    let mut total = OutboundStatsCounters::default();
+    for chunk in buf.chunks_exact(value_len) {
+        let value =
+            unsafe { std::ptr::read_unaligned(chunk.as_ptr() as *const OutboundStatsCounters) };
+        total.wrapping_add_assign(&value);
+    }
+    total
 }
 
 fn possible_cpus() -> usize {
@@ -374,6 +401,13 @@ pub(crate) fn stats(args: StatsArgs) -> anyhow::Result<()> {
     let udp_ovf: u64 = read_value(fd, &0u32.to_ne_bytes())?.unwrap_or(0);
     let tcp_ovf: u64 = read_value(fd, &1u32.to_ne_bytes())?.unwrap_or(0);
     println!("conn-state overflow: udp={udp_ovf} tcp={tcp_ovf}");
+    let redirect_failures: u64 = read_value(fd, &2u32.to_ne_bytes())?.unwrap_or(0);
+    let handoff_failures: u64 = read_value(fd, &3u32.to_ne_bytes())?.unwrap_or(0);
+    let cookie_failures: u64 = read_value(fd, &4u32.to_ne_bytes())?.unwrap_or(0);
+    println!(
+        "auxiliary insert failures: redirect_track={redirect_failures} \
+         routing_handoff={handoff_failures} cookie_pid={cookie_failures}"
+    );
 
     let fd = open(&args.pin_root, "CONN_STATE_OCCUPANCY")?;
     let inserts = read_percpu_sum(fd, ncpu, 0)?;
@@ -385,17 +419,55 @@ pub(crate) fn stats(args: StatsArgs) -> anyhow::Result<()> {
 
     let fd = open(&args.pin_root, "OUTBOUND_STATS")?;
     println!("\noutbound counters (tx_pkts tx_bytes rx_pkts rx_bytes):");
-    for outbound in 0..=255u32 {
-        let base = outbound * 4;
-        let (txp, txb, rxp, rxb) = (
-            read_percpu_sum(fd, ncpu, base)?,
-            read_percpu_sum(fd, ncpu, base + 1)?,
-            read_percpu_sum(fd, ncpu, base + 2)?,
-            read_percpu_sum(fd, ncpu, base + 3)?,
-        );
-        if txp + txb + rxp + rxb > 0 {
-            println!("  outbound {outbound:<4} {txp} {txb} {rxp} {rxb}");
+    for outbound in 0..OUTBOUND_STATS_MAP_LEN {
+        let counters = read_percpu_outbound(fd, ncpu, outbound)?;
+        if counters.tx_packets != 0
+            || counters.tx_bytes != 0
+            || counters.rx_packets != 0
+            || counters.rx_bytes != 0
+        {
+            println!(
+                "  outbound {outbound:<4} {} {} {} {}",
+                counters.tx_packets, counters.tx_bytes, counters.rx_packets, counters.rx_bytes
+            );
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encode(counters: OutboundStatsCounters) -> Vec<u8> {
+        [
+            counters.tx_packets.to_ne_bytes(),
+            counters.tx_bytes.to_ne_bytes(),
+            counters.rx_packets.to_ne_bytes(),
+            counters.rx_bytes.to_ne_bytes(),
+        ]
+        .concat()
+    }
+
+    #[test]
+    fn sums_packed_outbound_counters_across_cpus() {
+        let mut values = encode(OutboundStatsCounters {
+            tx_packets: 1,
+            tx_bytes: 20,
+            rx_packets: 3,
+            rx_bytes: 40,
+        });
+        values.extend(encode(OutboundStatsCounters {
+            tx_packets: 5,
+            tx_bytes: 60,
+            rx_packets: 7,
+            rx_bytes: 80,
+        }));
+
+        let total = sum_percpu_outbound(&values);
+        assert_eq!(total.tx_packets, 6);
+        assert_eq!(total.tx_bytes, 80);
+        assert_eq!(total.rx_packets, 10);
+        assert_eq!(total.rx_bytes, 120);
+    }
 }

@@ -533,6 +533,10 @@ impl ShadowsocksHandler {
         };
         let outbound = crate::util::udp_marked_bind(bind_addr).await?;
         outbound.connect(server_addr).await?;
+        // Establish write-readiness once: try_send on a freshly created
+        // socket reports WouldBlock until the reactor has seen it writable,
+        // which would silently drop the first datagrams.
+        let _ = outbound.writable().await;
         debug!(
             "Shadowsocks UDP: session to {} for target {}",
             server_addr, target
@@ -566,14 +570,22 @@ impl PacketTransport for SsUdpTransport {
     }
 
     async fn send_packet(&self, data: &[u8]) -> std::io::Result<()> {
-        let packet = self
-            .crypto
-            .lock()
-            .await
+        // Overload discipline: drop instead of parking. Awaiting the cipher
+        // lock or a full socket buffer would put the flow task to sleep and
+        // wake it per packet — at tunnel capacity that costs more CPU than
+        // the crypto itself, and UDP tolerates the loss anyway.
+        let Ok(mut crypto) = self.crypto.try_lock() else {
+            return Ok(());
+        };
+        let packet = crypto
             .seal(&self.socks, self.target.port(), data)
             .map_err(std::io::Error::other)?;
-        self.socket.send(&packet).await?;
-        Ok(())
+        drop(crypto);
+        match self.socket.try_send(&packet) {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {

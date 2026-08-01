@@ -18,7 +18,7 @@ honk-config.workspace = true
 honk-ebpf-common.workspace = true
 honk-outbound.workspace = true
 
-# eBPF (optional, enabled by default on Linux)
+# eBPF (optional; enable with the `ebpf` feature)
 aya = { workspace = true, optional = true }
 aya-obj = { workspace = true, optional = true }
 aya-log = { workspace = true, optional = true }
@@ -138,3 +138,7 @@ stats_alloc = "0.1.10"
 name = "dns"
 harness = false
 required-features = ["dns-bench"]
+
+[[bench]]
+name = "udp"
+harness = false

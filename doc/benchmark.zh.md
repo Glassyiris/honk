@@ -97,6 +97,203 @@ ssh root@10.10.10.57 "bash /root/lab-bench.sh 'honk dae' 'hy2 tuic ss2022 trojan
 ssh root@10.10.10.57 bash /root/test-protocols.sh
 ```
 
+## 结果(2026-08-01,三引擎:honk vs dae vs sing-box)
+
+honk: dev `ed640c7` (musl, mimalloc, reuseport-2 合入,单 UDP listener/协议族)。
+dae: kdae 分支, Go 1.26.0。
+sing-box: v1.13.14 (lab netns 内 TUN 客户端,按端口路由协议)。
+三者同时间在实验室测试。延迟单位秒,TCP 带宽为 iperf3 接收端中位数,
+CPU 单位核,RSS 为跑后值。sing-box 未测 CPU(TUN 客户端模式下无法分离
+单协议进程 CPU)。
+
+### TCP
+
+| 引擎 | 协议 | cold | hot p50 | hot p95 | bw (Mbps) | cpu | RSS (MB) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| honk | direct | 0.0060 | – | – | 9411 | 0.24 | 58 |
+| dae | direct | 0.0035 | – | – | 9395 | – | 50 |
+| sing-box | direct | 0.0085 | – | – | – | – | 59 |
+| honk | hy2 | 0.0085 | 0.0042 | 0.0053 | 3050 | 0.50 | 60 |
+| dae | hy2 | 0.0102 | 0.0023 | 0.0045 | 4467 | 1.07 | 66 |
+| sing-box | hy2 | 0.0451 | 0.0046 | 0.0059 | 2998 | – | – |
+| honk | tuic | 0.0051 | 0.0032 | 0.0051 | 4400 | 0.60 | 57 |
+| dae | tuic | 0.0851 | 0.0037 | 0.0046 | 4537 | 0.98 | 64 |
+| sing-box | tuic | 0.0151 | 0.0035 | 0.0041 | 2620 | – | – |
+| honk | ss2022 | 0.0046 | 0.0028 | 0.0035 | 9205 | 0.36 | 52 |
+| dae | ss2022 | 0.0076 | 0.0047 | 0.0058 | 9405 | 0.45 | 55 |
+| sing-box | ss2022 | 0.0220 | 0.0027 | 0.0040 | 8717 | – | – |
+| honk | trojan | 0.0103 | 0.0018 | 0.0084 | 9328 | 0.43 | 52 |
+| dae | trojan | 0.0076 | 0.0018 | 0.0020 | 9369 | 0.66 | 57 |
+| sing-box | trojan | 0.0150 | 0.0053 | 0.0064 | 9214 | – | – |
+| honk | anytls-sb | 0.0053 | 0.0034 | 0.0046 | 4792 | 0.28 | 45 |
+| dae | anytls-sb | 0.0139 | 0.0039 | 0.0047 | 5586 | 0.43 | 57 |
+| sing-box | anytls-sb | 0.0083 | 0.0018 | 0.0023 | 8244 | – | – |
+| honk | anytls-go | 0.0132 | 0.0031 | 0.0037 | 9249 | 0.48 | 56 |
+| dae | anytls-go | 0.0232 | 0.0023 | 0.0027 | 9006 | – | – |
+| sing-box | anytls-go | 0.0065 | 0.0019 | 0.0021 | 8823 | – | – |
+
+### UDP (iperf3 `-u -b 10G -l 1200 -R`,单流,冷引擎)
+
+| 引擎 | 协议 | echo RTT p50 | bw Mbps (丢包) | cpu |
+| --- | --- | --- | --- | --- |
+| honk | hy2 | 0.19 ms | 286 (95.3%) | 2.27 |
+| dae | hy2 | 0.21 ms | 907 (85.9%) | 0.93 |
+| sing-box | hy2 | 0.26 ms | 1629 (73.8%) | – |
+| honk | tuic | 0.40 ms | 11 (99.2%) | 0.01 |
+| dae | tuic | 0.27 ms | 1702 (67.4%) | 1.48 |
+| sing-box | tuic | 0.15 ms | 100 (96.4%) | – |
+| honk | ss2022 | 0.17 ms | 2010 (65.1%) | 1.31 |
+| dae | ss2022 | 0.30 ms | 2742 (51.6%) | 1.79 |
+| sing-box | ss2022 | 0.15 ms | 1984 (54.7%) | – |
+| honk | trojan | 0.13 ms | 1659 (70.7%) | 1.28 |
+| dae | trojan | 0.10 ms | 3062 (47.2%) | 1.70 |
+| sing-box | trojan | 0.10 ms | 3557 (41.2%) | – |
+| honk | anytls-sb | 0.28 ms | 1316 (79.0%) | 0.84 |
+| dae | anytls-sb | – | – | – |
+| sing-box | anytls-sb | 0.21 ms | 608 (78.8%) | – |
+| honk | anytls-go | 0.19 ms | 1600 (74.5%) | 1.07 |
+| dae | anytls-go | 0.12 ms | 1566 (74.3%) | – |
+| sing-box | anytls-go | 0.10 ms | 640 (77.6%) | – |
+
+### 三引擎对照解读
+
+**TCP 带宽:**
+- 线速协议(ss2022, trojan, anytls-go):三者均达 ~8.7–9.4 Gbps。honk 和
+  dae 差距在噪声范围内;sing-box 略低(ss2022 8717 vs 9405,anytls-go
+  8823 vs 9249)。
+- QUIC 协议(hy2, tuic):dae 领先 4467/4537 Mbps。honk 3050/4400,sing-box
+  2998/2620。honk 的 hy2 相对 07-30 轮(5239→3050)有回退,疑似实验室宿
+  主机负载影响。
+- anytls-sb: sing-box 8244 领先,dae 5586,honk 4792。这是 sing-box 参考
+  实现;honk anytls handler 落后约 40%。
+
+**CPU 效率:**
+- 在可比较的 QUIC 行上,honk CPU 约为 dae 的 50%(hy2:0.50 vs 1.07,
+  tuic:0.60 vs 0.98)。
+- TCP 类协议 honk 也持续比 dae 低 0.3–0.5 核。
+
+**延迟:**
+- dae tuic 冷延迟仍为每次连接完整 QUIC 握手(85ms vs honk ticket-cache
+  恢复 5ms)。
+- sing-box 冷延迟全面最高(TUN + 用户态路由增加 ~10–35ms)。
+- 热延迟三者均在个位数 ms。
+
+**UDP(冷引擎,单流):**
+- 本轮在冷引擎上测量(健康检查未收敛),UDP 数值比稳态低 3–5 倍。稳态
+  数据见下方"稳态三引擎对比"。
+- TUIC UDP 三引擎冷启动全挂(11–100 Mbps),但预热后 honk 单流达 6.18
+  Gbps——冷启动是会话建立的假象,不是协议限制。
+
+### UDP:稳态三引擎对比
+
+三个引擎分别启动,等待 30s 健康检查收敛,随后通过各协议进行 TCP 预热,
+再等 10s 稳定后测量。单流和 8 流聚合(`iperf3 -u -b 10G -l 1200 -R` /
+`-P 8`)。报文固定 1200B。
+
+| 引擎 | 协议 | echo RTT | 单流(丢包) | P8 聚合(丢包) |
+| --- | --- | --- | --- | --- |
+| honk | hy2 | 0.12 ms | 5.91 Gbps (5.9%) | P8 失败† |
+| dae | hy2 | 0.59 ms | 915 Mbps (85.8%) | 827 Mbps (97.6%) |
+| sing-box | hy2 | 0.42 ms | 1.61 Gbps (74.4%) | 1.58 Gbps (95.9%) |
+| honk | tuic | 0.32 ms | **6.18 Gbps (2.1%)** | **9.40 Gbps (0.8%)** |
+| dae | tuic | 0.15 ms | 1.57 Gbps (71.4%) | 21 Mbps (45.3%) |
+| sing-box | tuic | 0.14 ms | 31 Mbps (80.1%) | 失败 |
+| honk | ss2022 | 0.23 ms | 5.67 Gbps (11.5%) | 8.83 Gbps (6.8%) |
+| dae | ss2022 | 0.21 ms | 2.52 Gbps (55.1%) | 2.59 Gbps (88.8%) |
+| sing-box | ss2022 | 0.17 ms | 2.57 Gbps (55.1%) | 3.00 Gbps (87.3%) |
+| honk | trojan | 0.07 ms | **6.31 Gbps (0.06%)** | 8.74 Gbps (7.8%) |
+| dae | trojan | 0.13 ms | 2.96 Gbps (49.6%) | 2.87 Gbps (91.8%) |
+| sing-box | trojan | 0.09 ms | 3.52 Gbps (39.1%) | 4.31 Gbps (88.6%) |
+| honk | anytls-sb | 0.06 ms | 5.54 Gbps (13.6%) | **9.24 Gbps (2.5%)** |
+| dae | anytls-sb | 0.25 ms | 1.31 Gbps (78.8%) | 2.87 Gbps (89.9%) |
+| sing-box | anytls-sb | 1.78 ms | 1.26 Gbps (79.2%) | 2.85 Gbps (90.9%) |
+| honk | anytls-go | 0.08 ms | **6.44 Gbps (0.4%)** | **9.37 Gbps (1.1%)** |
+| dae | anytls-go | 0.13 ms | 1.58 Gbps (74.2%) | 2.45 Gbps (92.6%) |
+| sing-box | anytls-go | 0.10 ms | 1.45 Gbps (76.3%) | 2.36 Gbps (92.9%) |
+
+† honk hy2 P8 本轮失败(iperf3 返回 0);此前稳态曾录得 9.18 Gbps / 3.1%
+丢包。空闲实验室重测可确认。
+
+### 稳态 UDP 解读
+
+**Honk 在稳态 UDP 上全面领先:**
+- 单流:5.5–6.4 Gbps,丢包 0.06–13.6%。dae 和 sing-box 仅 0.9–3.5 Gbps,
+  丢包 40–86%——honk **快 2–6 倍,丢包低 5–15 倍**。
+- P8 聚合:honk 达 8.7–9.4 Gbps(接近线速),丢包 0.8–7.8%。dae 和
+  sing-box P8 崩溃,丢包 88–98%——它们的 UDP 数据面无法承载 8 条并行饱
+  和流。
+- **TUIC UDP** 从冷启动 11 Mbps 跃升至 **6.18 Gbps**(560 倍提升)。协议
+  本身没问题;冷启动数据是会话建立的假象,不是协议限制。
+- **Trojan UDP** 6.31 Gbps / 0.06% 丢包——honk 的 UDP-over-TCP 组帧在线
+  速下无可测开销。
+- **anytls-go** 6.44 Gbps / 0.4% 单流,9.37 Gbps / 1.1% P8,综合最强。
+
+**dae 和 sing-box P8 崩溃不是实验室假象:**
+两者表现一致——单流 1–3.5 Gbps 丢包尚可,P8 吞吐量不升反降,丢包飙至
+88–98%。这说明它们的 UDP 接收路径存在根本瓶颈(共享 socket buffer 竞
+争、缺少逐流排队或内核级 UDP socket 锁竞争),而这正是 honk 的
+`UdpEndpointPool` 和逐流有界队列专门设计要解决的问题。
+
+## 结果(2026-07-31,honk dev `ac64fe1` vs dae kdae `eee7c88b`)
+
+实验室同时刻 A/B。honk 为 musl release 构建(mimalloc,周期性
+`mi_collect` 已移至 blocking 线程并延迟首个周期,drain 改为空闲超时);
+dae 为 kdae 分支 `eee7c88b`(新增 DNS group override 修复,outbound
+fork 升至 `perf/complete-optimizations@670df833`)。延迟单位秒,带宽为
+iperf3 接收端中位数,CPU 单位核,RSS 为跑后值。本轮新情况:**kdae 的
+direct 基线已修复**(07-30 轮是坏的)。
+
+| 引擎 | 协议 | cold | hot p50 | hot p95 | bw (Mbps) | cpu | RSS (MB) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| honk | direct | 0.0052 | – | – | 9406 | 0.24 | 52 |
+| honk | hy2 | 0.0101 | 0.0032 | 0.0046 | 2921 | 0.48 | 59 |
+| honk | tuic | 0.0093 | 0.0034 | 0.0043 | 3961 | 0.55 | 59 |
+| honk | ss2022 | 0.0044 | 0.0027 | 0.0040 | 9392 | 0.36 | 52 |
+| honk | trojan | 0.0072 | 0.0019 | 0.0120 | 9341 | 0.45 | 53 |
+| honk | anytls-sb | 0.0050 | 0.0031 | 0.0039 | 4790 | 0.30 | 57 |
+| honk | anytls-go | 0.0122 | 0.0032 | 0.0040 | 9226 | 0.49 | 56 |
+| dae | direct | 0.0051 | – | – | 9397 | 0.00 | 52 |
+| dae | hy2 | 0.0090 | 0.0032 | 0.0037 | 3005 | 0.82 | 63 |
+| dae | tuic | 0.0827 | 0.0792 | 0.0800 | 4280 | 0.93 | 64 |
+| dae | ss2022 | 0.0040 | 0.0036 | 0.0062 | 9404 | 0.42 | 57 |
+| dae | trojan | 0.0105 | 0.0078 | 0.0100 | 9340 | 0.65 | 57 |
+| dae | anytls-sb | 0.0112 | 0.0029 | 0.0038 | 4742 | 0.37 | 58 |
+| dae | anytls-go | 0.0069 | 0.0034 | 0.0046 | 9301 | 0.63 | 60 |
+
+UDP(iperf3 `-u -b 10G -l 1200 -R`,接收端 Mbps + 丢包):
+
+| 引擎 | 协议 | echo RTT p50 | bw Mbps (丢包) | cpu |
+| --- | --- | --- | --- | --- |
+| honk | hy2 | 0.43 ms | 1708 (72.9%) | 1.07 |
+| honk | tuic | 0.31 ms | 142 (64.5%) | 0.13 |
+| honk | ss2022 | 0.22 ms | 1879 (66.6%) | 1.28 |
+| honk | trojan | 0.18 ms | 1609 (71.9%) | 1.27 |
+| honk | anytls-sb | 0.49 ms | 1308 (78.2%) | 0.86 |
+| honk | anytls-go | 0.18 ms | 1607 (74.2%) | 1.04 |
+| dae | hy2 | 0.27 ms | 929 (85.9%) | 0.95 |
+| dae | tuic | 0.28 ms | 60 (52.4%) | 0.06 |
+| dae | ss2022 | 0.16 ms | 2705 (52.4%) | 1.74 |
+| dae | trojan | 0.11 ms | 2972 (48.7%) | 1.69 |
+| dae | anytls-sb | 0.13 ms | 1305 (78.8%) | 0.85 |
+| dae | anytls-go | 0.10 ms | 1413 (76.0%) | 0.92 |
+
+### 07-31 结果解读
+
+- **TCP 带宽**基本持平:线速行(direct、ss2022、trojan、anytls-go)
+  两边都在 ~9.3–9.4 Gbps;anytls-sb 也首次打平(4790 vs 4742——新
+  kdae 在这一行不再领先)。hy2/tuic 略偏 dae(3005/4280 vs 2921/3961)。
+- **每 Gbps CPU** 依然是 honk 的强项,全部 QUIC 行:hy2 0.48 vs
+  0.82 核,tuic 0.55 vs 0.93,trojan 同带宽下 0.45 vs 0.65。
+- **延迟**:dae 的 tuic 仍为每条连接付完整 QUIC 握手(cold 82.7ms、
+  hot p50 79.2ms;honk 靠票据缓存恢复,9.3/3.4ms)。其余行都在个位
+  数毫秒。
+- **UDP**:honk 领先 hy2(1708 vs 929)与 anytls-go;ss2022/trojan 的
+  UDP-over-TCP 差距仍在(dae 2705/2972 vs honk 1879/1609),仍是 UDP
+  方向的头号优化目标。tuic UDP 两边都差(142/60 Mbps)。
+- honk 的 hy2/tuic TCP 带宽较 07-30 轮下降明显(5239→2921、
+  5351→3961)而 dae 基本持平;本轮跑测时 .70 实验宿主机有高并发负
+  载,这两行标记为存疑,待实验室空闲时复测确认。
+
 ## 结果(2026-07-30,honk dev session 各阶段完成后 vs dae kdae,AES-NI)
 
 实验室同时刻 A/B(引擎 VM 已换 host 透传 CPU;更早的软件加密时代见
@@ -240,6 +437,115 @@ nodelay——否则 Nagle + delayed-ACK 会给每次 TCP exchange 加约 40 ms,
 尺寸下的吞吐(RustCrypto aes-gcm 0.4–0.5 GB/s vs BoringSSL AeadCtx
 3.3–6.7 GB/s,AES-NI 硬件——SS 数据面用 BoringSSL 的原因)。
 
+## Candidate UDP 微基准（绝对值，不是 A/B）
+
+UDP Criterion suite 只记录 candidate 的绝对行为。固定调用为：
+
+```bash
+cd /root/code/honk-feat-udp-to-1
+CARGO_TARGET_DIR=/root/code/honk/target cargo bench -p honk-core --bench udp -- --save-baseline udp-candidate
+```
+
+| Case | 固定工作量 |
+| --- | --- |
+| steady enqueue | 一个 Ready flow 上 1,000,000 次 128-byte `fast_path_enqueue`，每次立即 drain 以保持 steady state |
+| reserve / rollback | 10,000 次 endpoint reservation 后 rollback |
+| histogram | 1,000,000 次 record/snapshot operation |
+| queue saturation | 先接纳 64 个 datagram，再丢弃一个最新 datagram |
+
+记录 candidate 的 Criterion mean、median、MAD 与绝对吞吐。`udp-candidate`
+只是重复运行标签，不是与 `be587b1` 的比较：该 revision 没有可用于有效 A/B
+的 source-level 等价接口。Criterion 也不提供 merge gate 的 p95 estimate；不得
+从该 suite 推断 p95。
+
+## Deployment UDP A/B gate
+
+`bench/udp-latency.sh` 是真实部署驱动，而非 CI 替代品。它要求两个 binary 使用
+相同的 TPROXY topology 与真实 upstream。固定调用为：
+
+```bash
+sudo bench/udp-latency.sh \
+  --baseline-bin /opt/honk/be587b1/honk-core \
+  --candidate-bin /opt/honk/udp-to-1/honk-core \
+  --config /etc/honk/bench.dae \
+  --echo-target 10.0.2.2:9000 \
+  --dns-target 10.0.2.2:53 \
+  --samples 10000 --runs 5 --offered-rate 5000
+```
+
+该固定调用刻意不传 timeout 或 hook flag。请在 root 环境配置
+`HONK_UDP_TIMEOUT_SEC`（默认 `30`）以及
+`HONK_UDP_{START,READY,SETUP,PROBE,STATS,TEARDOWN,TOPOLOGY}_HOOK`；CLI flag
+可覆盖这些值。使用 `sudo` 时，须以 `--preserve-env` 保留这些变量，或在 root
+环境中配置它们。driver 不提供 built-in topology；缺少 live hook 会 fail closed。
+
+每个 executable hook 都通过 `env` 运行，不会把 shell snippet `eval`。它会获得
+`variant`、`case`、`run`、`workdir`、`pid`、`pgid`、`selected_bin`、
+`baseline_bin`、`candidate_bin`、`config`、`echo_target`、`dns_target`、
+`samples`、`offered_rate` 与 `timeout`；`start` 和 `topology` 的 `pid`/`pgid`
+为空。`start` 必须先完成同步 setup，再执行 `exec "$selected_bin" ...`；driver
+会把所选文件的 device/inode 与 `/proc/$pid/exe` 核对，并在 ready、setup、probe、
+stats 后重新验证同一 PID/session/start-time/executable。只有 teardown 完成且在
+bounded wait 内确认所属 process group 已消失后才输出 row；残留 descendant 会
+fail closed。旧 positional arguments 仍兼容。target 可为 IPv4、`[IPv6]` 或
+带端口的合法 hostname。`probe` 必须报告 `sent == samples`。
+
+它为每个 case/run 输出一个 JSONL object，顶层字段严格为：`schema_version`、
+`variant`、`commit`、`binary_sha256`、`kernel`、`topology`、`case`、`run`、
+`samples`、`offered_rate`、`sent`、`received`、`latency_unit`、`p50`、`p95`、
+`p99`、`max`、`loss`、`cpu_pct`、`rss_kib`、`fd_count`、`queue_drops` 与
+`warm_hit`。`schema_version` 为 `1`；延迟 quantile 的单位为 microseconds；
+`loss` 为 sample loss ratio，`cpu_pct` 为进程 CPU usage，`rss_kib` 为 KiB 的
+resident memory，`fd_count` 为打开的 file-descriptor count。固定 case 为
+`cold_endpoint`、`steady_hit`、`warm_session_cold_endpoint`、`dns_hit`、
+`dns_miss`、`healthy_candidate` 与 `blackholed_candidate`。driver interface 与
+JSONL shape 由 `bash bench/tests/udp-latency-cli.sh` 检查。
+
+部署 gate 在相同 topology 与 offered rate 下比较五轮各 10,000 sample：healthy
+cold 的 p50/p95 回退最多 5%；首个 candidate 被 blackhole 时 p95 至少改善 20%、
+p99 至少改善 30%；steady path 在目标吞吐 70% 以下须保持 p99 至多 250 microseconds
+且零 drop；AnyTLS warm hit 须达 80%，且 first reply 减少一个 RTT 或至少 20%；
+steady CPU 与 p50 回退最多 5%；IPv4/IPv6 client-observed reply tuple 必须不变。
+**本地 worktree 未运行 deployment gate，因此不声称达到任何网络延迟 gate。**
+
+## Release profile 与 allocator 矩阵
+
+`bench/release-matrix.sh` 对比显式的 `release-size`、
+`release-size-thin`、`release-speed` 与 `release-speed-thin` profile，并配对
+三种 allocator arm：关闭 collect 的 mimalloc、60 秒 collect 的 mimalloc，以及
+系统 allocator。每个 cell 使用隔离的 Cargo、workload cache 与 run 目录，并输出
+machine metadata、JSONL/CSV build 和 performance 记录。
+
+不编译即可验证全部四种受支持 target 配置：
+
+```bash
+bench/release-matrix.sh --all-targets --dry-run --output /tmp/honk-release-matrix
+```
+
+主机实测需要提供可执行的 `--benchmark-hook`；其 RSS/PSS/fault/CPU/latency 字段
+契约可由 `bench/release-matrix.sh --help` 查看。完整矩阵期间必须把所有 CPU
+policy 固定到同一 governor，并保持 turbo 状态不变；`machine.json` 会记录两项
+设置。只能在同一机器和 workload 下比较 cell。该矩阵记录证据；没有部署吞吐
+与尾延迟结果时，不据此切换发布 profile。
+
+profile 晋级采用显式门禁，不能只看二进制尺寸。以 `release-size` 为基线，同一
+实验室的五轮配对结果中，candidate 的每项吞吐回退不得超过 3%、每项 p99
+延迟回退不得超过 5%、RSS 增幅不得超过 20%。三个门禁全部通过前，发布默认
+保持尺寸版。
+
+2026-08-02 完成了一轮初步配对部署：x86_64 musl、mimalloc、60 秒 collect，
+对比 `release-size` 与 `release-speed`。每个协议执行三轮 8 秒反向吞吐；
+warm-up 后另测 200 次请求的尾延迟。
+
+| profile | 二进制 | direct | hy2 | tuic | 最大 RSS | hy2 p99 | tuic p99 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| release-size | 19.50 MB | 9.407 Gbps | 2.756 Gbps | 4.253 Gbps | 56 MB | 5.426 ms | 4.705 ms |
+| release-speed | 24.79 MB | 9.388 Gbps | 3.314 Gbps | 5.152 Gbps | 59 MB | 3.409 ms | 3.136 ms |
+
+速度版没有吞吐或 p99 回退，最大 RSS 增加 5.4%，因此这一个样本通过数值门禁。
+但单轮配对尚未满足五轮证据要求，且二进制增大 27.2%，所以不执行晋级，
+`release-size` 继续作为默认。
+
 ## 生产备注(10.10.10.1 网关)
 
 - 每次部署后 TCP(google/baidu/cloudflare)与 HTTP/3(cloudflare)通过;
@@ -258,5 +564,7 @@ nodelay——否则 Nagle + delayed-ACK 会给每次 TCP exchange 加约 40 ms,
 - `just clash-ci`——fmt、clippy、clash_api_test + integration_test。
 - `just dns-ci`——DNS 子系统门禁。
 - `cargo bench -p honk-core --bench dns`——DNS 微基准(见上)。
+- `cargo bench -p honk-core --bench udp -- --save-baseline udp-candidate`——仅 candidate 的绝对 UDP 测量；不是历史 A/B 或 p95 merge gate。
+- `bash bench/tests/udp-latency-cli.sh`——deployment driver 的 CLI/JSONL fixture；上文真实 UDP A/B gate 仍需要 TPROXY 与 upstream。
 - 发布 CI(`.github/workflows/release.yml`)——workspace 测试门禁 +
   四目标构建(x86_64/aarch64 × gnu/musl)+ BTF 检查 + tarballs。

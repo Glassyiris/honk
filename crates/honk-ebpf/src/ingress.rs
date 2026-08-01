@@ -24,42 +24,29 @@ use aya_ebpf_bindings::{
         __sk_buff, bpf_sock_tuple, bpf_sock_tuple__bindgen_ty_1__bindgen_ty_1,
         bpf_sock_tuple__bindgen_ty_1__bindgen_ty_2,
     },
-    helpers::{
-        bpf_ktime_get_ns, bpf_redirect, bpf_redirect_peer, bpf_skb_load_bytes, bpf_skb_store_bytes,
-    },
+    helpers::{bpf_ktime_get_ns, bpf_redirect, bpf_redirect_peer, bpf_skb_store_bytes},
 };
 use honk_ebpf_common::{
     RedirectEntry, RedirectTuple, RoutingMeta, TPROXY_MARK,
-    conn::ConnState,
-    dae_ip::In6Addr,
+    conn::{BpfStatsKey, ConnState},
     redirect_need::{RoutingHandoffEntry, TuplesKey},
 };
 use network_types::{
     eth::EthHdr,
     ip::{Ipv4Hdr, Ipv6Hdr},
+    udp::UdpHdr,
 };
 
 use crate::{
     maps::{
         OUTBOUND_CONNECTIVITY_MAP, PARAM, PKT_SCRATCH_KEY, REDIRECT_TRACK, ROUTE_CTX_SCRATCH_MAP,
-        ROUTING_HANDOFF_MAP, ROUTING_META_MAP,
+        ROUTING_HANDOFF_MAP, increment_bpf_stat,
     },
     route::{OUTBOUND_BLOCK, OUTBOUND_DIRECT, RouteCtx},
     sk,
     transport::{ETH_HLEN, ETH_P_IP, ETH_P_IPV6, IPPROTO_TCP, IPPROTO_UDP, parse_packet},
 };
-
 const IPV6_BYTE_LENGTH: usize = 16;
-
-// Internal codes for the load_redirect_tuple_* helpers — NOT TC verdicts.
-// `LOAD_REDIRECT_TUPLE_FALLBACK` numerically collides with `TC_ACT_SHOT`;
-// it is consumed only by `load_redirect_tuple`'s fast→slow fallback chain.
-const LOAD_REDIRECT_TUPLE_FALLBACK: c_long = 2;
-/// Packet is neither IPv4 nor IPv6 — nothing to look up.
-const LOAD_REDIRECT_TUPLE_NOT_IP: c_long = 1;
-/// `bpf_skb_load_bytes` failed during the slow parse.
-const LOAD_REDIRECT_TUPLE_ERR: c_long = -1;
-const REDIRECT_PULL_SIZE: u32 = 128;
 
 /// skb->mark bit set on packets that already passed `lan_ingress`
 /// classification and were allowed through (`TC_ACT_OK`).
@@ -149,17 +136,22 @@ fn redirect_lan_packet_to_control_plane(
             handoff.result.outbound = routing_meta.data.outbound;
             handoff.result.dscp = routing_meta.data.dscp;
         }
-        handoff.result.mac.copy_from_slice(&pkt.ethh.src_addr);
-        ROUTING_HANDOFF_MAP.insert(pkt.tuples.five, handoff, 0).ok();
+        if ROUTING_HANDOFF_MAP
+            .insert(pkt.tuples.five, handoff, 0)
+            .is_err()
+        {
+            increment_bpf_stat(BpfStatsKey::RoutingHandoffInsertFailure);
+            // The control plane would otherwise receive an unrouteable flow;
+            // do not redirect it without the required handoff.
+            return Err(TC_ACT_SHOT);
+        }
     }
 
     // Store the original LAN framing so dae0_ingress can rewrite replies
     // back to the original client without involving host IP forwarding.
     // New flows write unconditionally; cached-flow packets only refresh the
     // entry once it is older than REDIRECT_REFRESH_INTERVAL_NS.
-    let protocol = unsafe { (*ctx.skb.skb).protocol as u16 };
-    let redirect_tuple =
-        RedirectTuple::from_tuples_ip(&pkt.tuples.five, protocol == ETH_P_IP.to_be());
+    let redirect_tuple = RedirectTuple::from_tuples(&pkt.tuples.five);
     let write_track = if handoff_mode == HANDOFF_WRITE_ALWAYS {
         true
     } else {
@@ -179,9 +171,14 @@ fn redirect_lan_packet_to_control_plane(
         redirect_entry.last_seen_ns = now;
         // Record the final outbound so dae0_ingress can attribute replies.
         redirect_entry.outbound = unsafe { routing_meta.data.outbound };
-        REDIRECT_TRACK
+        if REDIRECT_TRACK
             .insert(redirect_tuple, redirect_entry, 0)
-            .ok();
+            .is_err()
+        {
+            increment_bpf_stat(BpfStatsKey::RedirectTrackInsertFailure);
+            // Do not redirect when reply restoration cannot be guaranteed.
+            return Err(TC_ACT_SHOT);
+        }
     }
 
     // Redirect the packet to the host-side dae0 veth.  From there it crosses
@@ -208,142 +205,6 @@ fn pass_through_classified(ctx: &TcContext) -> Verdict {
     ctx.skb
         .set_mark(unsafe { (*ctx.skb.skb).mark } | CLASSIFIED_MARK);
     Err(TC_ACT_OK)
-}
-
-#[inline(always)]
-fn load_redirect_tuple_fast(ctx: &TcContext) -> Result<RedirectTuple, c_long> {
-    if ctx.pull_data(REDIRECT_PULL_SIZE).is_err() {
-        return Err(LOAD_REDIRECT_TUPLE_FALLBACK);
-    }
-
-    let data = ctx.data() as *const u8;
-    let data_end = ctx.data_end() as *const u8;
-
-    if unsafe { data.add(mem::size_of::<EthHdr>()) } > data_end {
-        return Err(LOAD_REDIRECT_TUPLE_FALLBACK);
-    }
-
-    let eth = data as *const EthHdr;
-    let ether_type = unsafe { (*eth).ether_type };
-
-    if ether_type == ETH_P_IP.to_be() {
-        let iph_offset = ETH_HLEN as usize;
-        if unsafe { data.add(iph_offset + mem::size_of::<Ipv4Hdr>()) } > data_end {
-            return Err(LOAD_REDIRECT_TUPLE_FALLBACK);
-        }
-        let iph = unsafe { &*(data.add(iph_offset) as *const Ipv4Hdr) };
-
-        let rt: RedirectTuple = RedirectTuple {
-            src_ip: In6Addr::from_ipv4_bytes(iph.dst_addr),
-            dst_ip: In6Addr::from_ipv4_bytes(iph.src_addr),
-        };
-
-        Ok(rt)
-    } else if ether_type == ETH_P_IPV6.to_be() {
-        let ipv6h_offset = ETH_HLEN as usize;
-        if unsafe { data.add(ipv6h_offset + mem::size_of::<Ipv6Hdr>()) } > data_end {
-            return Err(LOAD_REDIRECT_TUPLE_FALLBACK);
-        }
-        let ipv6h = unsafe { &*(data.add(ipv6h_offset) as *const Ipv6Hdr) };
-
-        let mut rt: RedirectTuple = unsafe { mem::zeroed() };
-        rt.src_ip = In6Addr::from_ipv6_addr(ipv6h.dst_addr());
-        rt.dst_ip = In6Addr::from_ipv6_addr(ipv6h.src_addr());
-
-        Ok(rt)
-    } else {
-        Err(LOAD_REDIRECT_TUPLE_NOT_IP)
-    }
-}
-
-#[inline(always)]
-fn load_redirect_tuple_slow(ctx: &TcContext) -> Result<RedirectTuple, c_long> {
-    let protocol = unsafe { (*ctx.skb.skb).protocol as u16 };
-
-    match protocol {
-        val if val == ETH_P_IP.to_be() => {
-            let _rt: RedirectTuple = RedirectTuple {
-                src_ip: In6Addr::zero(),
-                dst_ip: In6Addr::zero(),
-            };
-
-            // daddr — use raw bpf_skb_load_bytes with fixed len=4
-            let dst_offset = (ETH_HLEN as usize + mem::offset_of!(Ipv4Hdr, dst_addr)) as u32;
-            let mut dst_buf: [u8; 4] = [0; 4];
-            let ret = unsafe {
-                bpf_skb_load_bytes(
-                    ctx.skb.skb as *mut _,
-                    dst_offset,
-                    dst_buf.as_mut_ptr() as *mut _,
-                    4,
-                )
-            };
-            if ret != 0 {
-                return Err(LOAD_REDIRECT_TUPLE_ERR);
-            }
-
-            let src_ip = In6Addr::from_ipv4_bytes(dst_buf);
-
-            // saddr
-            let src_offset = (ETH_HLEN as usize + mem::offset_of!(Ipv4Hdr, src_addr)) as u32;
-            let mut src_buf: [u8; 4] = [0; 4];
-            let ret = unsafe {
-                bpf_skb_load_bytes(
-                    ctx.skb.skb as *mut _,
-                    src_offset,
-                    src_buf.as_mut_ptr() as *mut _,
-                    4,
-                )
-            };
-            if ret != 0 {
-                return Err(LOAD_REDIRECT_TUPLE_ERR);
-            }
-
-            let dst_ip = In6Addr::from_ipv4_bytes(src_buf);
-
-            Ok(RedirectTuple { src_ip, dst_ip })
-        }
-        val if val == ETH_P_IPV6.to_be() => {
-            let mut rt: RedirectTuple = unsafe { mem::zeroed() };
-
-            let dst_offset = (ETH_HLEN as usize + mem::offset_of!(Ipv6Hdr, dst_addr)) as u32;
-            let ret = unsafe {
-                bpf_skb_load_bytes(
-                    ctx.skb.skb as *mut _,
-                    dst_offset,
-                    rt.src_ip.u6_addr32.as_mut_ptr() as *mut _,
-                    16,
-                )
-            };
-            if ret != 0 {
-                return Err(LOAD_REDIRECT_TUPLE_ERR);
-            }
-
-            let src_offset = (ETH_HLEN as usize + mem::offset_of!(Ipv6Hdr, src_addr)) as u32;
-            let ret = unsafe {
-                bpf_skb_load_bytes(
-                    ctx.skb.skb as *mut _,
-                    src_offset,
-                    rt.dst_ip.u6_addr32.as_mut_ptr() as *mut _,
-                    16,
-                )
-            };
-            if ret != 0 {
-                return Err(LOAD_REDIRECT_TUPLE_ERR);
-            }
-
-            Ok(rt)
-        }
-        _ => Err(LOAD_REDIRECT_TUPLE_NOT_IP),
-    }
-}
-
-#[inline(always)]
-fn load_redirect_tuple(ctx: &TcContext) -> Result<RedirectTuple, c_long> {
-    match load_redirect_tuple_fast(ctx) {
-        Err(LOAD_REDIRECT_TUPLE_FALLBACK) => load_redirect_tuple_slow(ctx),
-        other => other,
-    }
 }
 
 #[inline(always)]
@@ -744,22 +605,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         );
     }
 
-    let zero_key: u32 = 0;
-    let max_match_set_len: u32 = 32 * 32;
-    let active_rules_len = if let Some(len_ptr) = ROUTING_META_MAP.get(zero_key) {
-        let raw = *len_ptr;
-        if raw <= max_match_set_len {
-            raw
-        } else {
-            max_match_set_len
-        }
-    } else {
-        max_match_set_len
-    };
-
-    // Cache this flow's (l4proto × ipversion) group bitmap so the route
-    // loop can skip MatchSets that cannot match it.
-    route_ctx.load_group_bitmap();
+    let active_rules_len = route_ctx.prepare_generation();
 
     let loop_ret = route_ctx.route_loop(active_rules_len);
     if loop_ret < 0 {
@@ -937,13 +783,10 @@ fn do_tproxy_dae0peer_ingress(ctx: &TcContext) -> Verdict {
     Ok(TC_ACT_OK)
 }
 
-/// SockMap keys for `LISTEN_SOCKET_MAP`, matching the userspace
-/// `publish_listener_sockets` mapping: 0 = TCP IPv4, 1 = UDP IPv4,
-/// 2 = TCP IPv6, 3 = UDP IPv6.
-const KEY_TCP4: u32 = 0;
-const KEY_UDP4: u32 = 1;
-const KEY_TCP6: u32 = 2;
-const KEY_UDP6: u32 = 3;
+/// SockMap keys for `LISTEN_SOCKET_MAP`, shared with `sk_lookup.rs` and the
+/// userspace publish path: 0 = TCP4, 1 = TCP6, 2.. = UDP4 group,
+/// 2 + UDP_LISTENER_COUNT.. = UDP6 group.
+use crate::sk_lookup::{KEY_TCP4, KEY_TCP6, KEY_UDP4_BASE, KEY_UDP6_BASE, listener_hash};
 
 /// Assign the TPROXY listener socket to the current skb so the kernel delivers
 /// the packet to the transparent proxy listener instead of performing a normal
@@ -952,7 +795,8 @@ const KEY_UDP6: u32 = 3;
 /// Ported from Go dae's `assign_listener` in `control/kern/tproxy.c`.  Uses
 /// `bpf_sk_assign` via a SOCKMAP lookup — the same proven pattern employed by
 /// the `tproxy_sk_lookup` program in `sk_lookup.rs`, shared via
-/// [`sk::sk_assign_by_index`].
+/// [`sk::sk_assign_by_index`].  UDP flows are hashed across the parallel
+/// listener group so each userspace receive loop drains a subset of flows.
 #[inline(always)]
 fn assign_listener(ctx: &TcContext, listener_l4proto: u8) -> Result<(), c_long> {
     // SockMap keys differentiate IPv4 vs IPv6 to match the per-family
@@ -961,20 +805,78 @@ fn assign_listener(ctx: &TcContext, listener_l4proto: u8) -> Result<(), c_long> 
     let key = if listener_l4proto == IPPROTO_TCP as u8 {
         if is_v6 { KEY_TCP6 } else { KEY_TCP4 }
     } else {
-        if is_v6 { KEY_UDP6 } else { KEY_UDP4 }
+        let h = udp_listener_hash(ctx, is_v6);
+        if is_v6 {
+            KEY_UDP6_BASE + h
+        } else {
+            KEY_UDP4_BASE + h
+        }
     };
 
     let map_ptr = ptr::from_ref(&LISTEN_SOCKET_MAP).cast::<c_void>();
     sk::sk_assign_by_index(ctx, map_ptr, &key, 0)
 }
 
+/// Flow-consistent listener index for a UDP packet: the same 4-tuple always
+/// lands on the same socket while different flows spread over the group.
+/// Header-missing packets (short reads) hash with zeroed ports, which is
+/// still deterministic per flow.
+#[inline(always)]
+fn udp_listener_hash(ctx: &TcContext, is_v6: bool) -> u32 {
+    // Guarantee the headers are in the linear data area; bounds checks
+    // below still guard the actual reads.
+    let _ = ctx.pull_data((ETH_HLEN + 40 + 8) as u32);
+    let data = ctx.data() as *const u8;
+    let data_end = ctx.data_end() as *const u8;
+    if unsafe { data.add(mem::size_of::<EthHdr>()) } > data_end {
+        return 0;
+    }
+    let (src, dst, l4off) = if is_v6 {
+        if unsafe { data.add(ETH_HLEN as usize + mem::size_of::<Ipv6Hdr>()) } > data_end {
+            return 0;
+        }
+        let v6h = unsafe { &*(data.add(ETH_HLEN as usize) as *const Ipv6Hdr) };
+        let src = u32::from_be_bytes(v6h.src_addr[12..16].try_into().unwrap_or([0; 4]));
+        let dst = u32::from_be_bytes(v6h.dst_addr[12..16].try_into().unwrap_or([0; 4]));
+        (src, dst, ETH_HLEN as usize + mem::size_of::<Ipv6Hdr>())
+    } else {
+        if unsafe { data.add(ETH_HLEN as usize + mem::size_of::<Ipv4Hdr>()) } > data_end {
+            return 0;
+        }
+        let v4h = unsafe { &*(data.add(ETH_HLEN as usize) as *const Ipv4Hdr) };
+        let ihl = (v4h.vihl & 0x0f) as usize * 4;
+        if ihl < 20 {
+            return 0;
+        }
+        (
+            u32::from_be_bytes(v4h.src_addr),
+            u32::from_be_bytes(v4h.dst_addr),
+            ETH_HLEN as usize + ihl,
+        )
+    };
+    let (sport, dport) = if unsafe { data.add(l4off + 4) } > data_end {
+        (0u16, 0u16)
+    } else {
+        let udph = unsafe { &*(data.add(l4off) as *const UdpHdr) };
+        (u16::from_be_bytes(udph.src), u16::from_be_bytes(udph.dst))
+    };
+    listener_hash(src, dst, ((sport as u32) << 16) | dport as u32, 0)
+}
+
 // #[inline(never)]: standalone program, no deep call chain.
 #[inline(never)]
 fn do_tproxy_dae0_ingress(ctx: &TcContext) -> Verdict {
-    let redirect_tuple = match load_redirect_tuple(ctx) {
-        Ok(rt) => rt,
-        Err(_) => return Err(TC_ACT_OK),
+    // Parse the complete reply tuple, then reverse it into the original
+    // redirect direction.  Address-only keys alias concurrent TCP/UDP flows
+    // sharing an IP pair; the map key must retain ports and protocol.
+    let pkt = match PKT_SCRATCH_KEY.get_ptr_mut(0) {
+        Some(ptr) => unsafe { &mut *ptr },
+        None => return Err(TC_ACT_SHOT),
     };
+    if parse_packet(ctx, ETH_HLEN, pkt) != 0 {
+        return Err(TC_ACT_OK);
+    }
+    let redirect_tuple = RedirectTuple::from_tuples(&pkt.tuples.five).reverse();
 
     let entry_ptr = REDIRECT_TRACK.get_ptr_mut(redirect_tuple);
     if entry_ptr.is_none() {
@@ -985,13 +887,9 @@ fn do_tproxy_dae0_ingress(ctx: &TcContext) -> Verdict {
     entry.last_seen_ns = unsafe { bpf_ktime_get_ns() };
 
     // Account this reply (outbound → LAN) against the outbound recorded
-    // when the flow was redirected to the control plane.
-    crate::stats::count_rx(ctx, entry.outbound);
-
-    // load_redirect_tuple reverses the packet tuple, so any successful
-    // lookup here is a reply (proxy -> LAN).  Rewrite the Ethernet header
-    // back to the original LAN framing and redirect to the original
-    // interface so the reply reaches the original client.
+    // when the flow was redirected to the control plane.  The full packet
+    // tuple was reversed above, so a successful lookup is a proxy reply.
+    // Restore the original LAN framing and redirect to its interface.
     //
     // Host-originated flows (from_wan != 0, e.g. gateway's own traffic out a
     // PPPoE WAN) have no LAN framing to restore: inject the reply into the

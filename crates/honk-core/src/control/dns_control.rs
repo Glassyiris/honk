@@ -87,6 +87,7 @@ impl DnsController {
             )),
             cache: forwarder.cache(),
             persistence: crate::dns::runtime::ProcessPersistenceHandle::new(forwarder.cache()),
+            outbound_runtime: None,
             transport: Arc::new(NoopRuntimeTransport),
         });
         Self::new_with_runtime(
@@ -161,6 +162,13 @@ impl DnsController {
         self.routing_projection.update_snapshot(snapshot);
     }
 
+    pub(crate) fn project_routes(
+        &self,
+        snapshot: &crate::dns::projection::RoutingProjectionSnapshot,
+    ) -> Vec<(std::net::IpAddr, honk_ebpf_common::DomainRouting)> {
+        self.routing_projection.project(snapshot)
+    }
+
     pub async fn cache(&self) -> Arc<tokio::sync::Mutex<crate::dns::cache::DnsCache>> {
         self.dns_service.cache()
     }
@@ -191,6 +199,15 @@ impl DnsController {
                 self.submit_projection(runtime.runtime(), data, &outcome);
                 let resp = outcome.rendered().to_vec();
                 (resp, true)
+            }
+            Err(e)
+                if e.downcast_ref::<crate::dns::forwarder::DnsForwardError>()
+                    .is_some_and(|error| {
+                        matches!(error, crate::dns::forwarder::DnsForwardError::Overloaded)
+                    }) =>
+            {
+                crate::stats::record_dns_event(crate::stats::DnsStatEvent::OutcomeRejected);
+                (transport::build_dns_refused(data), false)
             }
             Err(e) => {
                 debug!("DNS controller forward failed: {}; sending SERVFAIL", e);

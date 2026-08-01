@@ -1,5 +1,6 @@
 use honk_ebpf_common::DomainRouting;
-use std::collections::{BTreeMap, BTreeSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::time::Instant;
@@ -40,6 +41,20 @@ pub(super) struct PendingRemove {
     pub(super) revision: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct DeadlineEntry {
+    pub(super) at: Instant,
+    pub(super) domain: String,
+    pub(super) sequence: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct RetryDeadline {
+    pub(super) at: Instant,
+    pub(super) ip: IpAddr,
+    pub(super) attempts: u8,
+}
+
 pub(super) struct DesiredState {
     pub(super) capacity: usize,
     pub(super) sequence: u64,
@@ -52,6 +67,9 @@ pub(super) struct DesiredState {
     pub(super) dirty_ips: BTreeSet<IpAddr>,
     pub(super) dirty_domains: BTreeSet<String>,
     pub(super) retries: BTreeMap<IpAddr, RetryMetadata>,
+    pub(super) expiry_deadlines: BinaryHeap<Reverse<DeadlineEntry>>,
+    pub(super) eviction_order: BinaryHeap<Reverse<(u64, String)>>,
+    pub(super) retry_deadlines: BinaryHeap<Reverse<RetryDeadline>>,
 }
 
 impl DesiredState {
@@ -68,6 +86,9 @@ impl DesiredState {
             dirty_ips: BTreeSet::new(),
             dirty_domains: BTreeSet::new(),
             retries: BTreeMap::new(),
+            expiry_deadlines: BinaryHeap::new(),
+            eviction_order: BinaryHeap::new(),
+            retry_deadlines: BinaryHeap::new(),
         }
     }
 
@@ -126,16 +147,30 @@ impl DesiredState {
                 _freshness: freshness,
             },
         );
+        self.expiry_deadlines.push(Reverse(DeadlineEntry {
+            at: expires_at,
+            domain: domain.to_owned(),
+            sequence: self.sequence,
+        }));
+        self.eviction_order
+            .push(Reverse((self.sequence, domain.to_owned())));
         self.dirty_domains.insert(domain.to_owned());
         self.recompute_ips(ips);
         if self.owners.len() <= self.capacity {
             return 0;
         }
-        let evicted = self
-            .owners
-            .iter()
-            .min_by_key(|(domain, owner)| (owner.sequence, domain.as_str()))
-            .map(|(domain, _)| domain.clone());
+        let evicted = loop {
+            let Some(Reverse((sequence, domain))) = self.eviction_order.pop() else {
+                break None;
+            };
+            if self
+                .owners
+                .get(&domain)
+                .is_some_and(|owner| owner.sequence == sequence)
+            {
+                break Some(domain);
+            }
+        };
         if let Some(evicted) = evicted {
             self.remove_owner(&evicted);
             1
@@ -172,7 +207,7 @@ impl DesiredState {
                     }
                 }
             }
-            if aggregate.bitmap == [0; 4] {
+            if aggregate.bitmap.iter().all(|word| *word == 0) {
                 self.desired.remove(&ip);
             } else {
                 self.desired.insert(ip, aggregate);
@@ -192,15 +227,45 @@ impl DesiredState {
         self.recompute_ips(ips);
     }
 
-    pub(super) fn expire(&mut self, now: Instant) {
-        let expired = self
-            .owners
+    pub(super) fn project(
+        &self,
+        snapshot: &RoutingProjectionSnapshot,
+    ) -> BTreeMap<IpAddr, DomainRouting> {
+        self.reverse
             .iter()
-            .filter(|(_, owner)| owner.expires_at <= now)
-            .map(|(domain, _)| domain.clone())
-            .collect::<Vec<_>>();
-        for domain in expired {
-            self.remove_owner(&domain);
+            .filter_map(|(ip, domains)| {
+                let mut aggregate = DomainRouting::default();
+                for domain in domains {
+                    if let Some(bitmap) = snapshot.bitmap_for(domain) {
+                        or_bitmap(&mut aggregate, &bitmap);
+                    }
+                }
+                aggregate
+                    .bitmap
+                    .iter()
+                    .any(|word| *word != 0)
+                    .then_some((*ip, aggregate))
+            })
+            .collect()
+    }
+
+    pub(super) fn expire(&mut self, now: Instant) {
+        while let Some(Reverse(deadline)) = self.expiry_deadlines.peek() {
+            if deadline.at > now {
+                break;
+            }
+            let deadline = self
+                .expiry_deadlines
+                .pop()
+                .expect("expiry heap entry disappeared")
+                .0;
+            if self
+                .owners
+                .get(&deadline.domain)
+                .is_some_and(|owner| owner.sequence == deadline.sequence && owner.expires_at <= now)
+            {
+                self.remove_owner(&deadline.domain);
+            }
         }
     }
 

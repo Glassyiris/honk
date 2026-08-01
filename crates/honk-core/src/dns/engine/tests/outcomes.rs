@@ -173,12 +173,12 @@ async fn stale_outcome_covers_upstream_error_and_servfail_without_sleeping() {
         None,
         scope.clone(),
         OperationKind::Resolve,
-    )
-    .storage_key();
+    );
     cache
         .lock()
         .await
-        .insert_expired_for_test(cache_key, cached, 30);
+        .service()
+        .insert_expired_exact_for_test(cache_key, cached, 30);
     let error_forwarder = DnsForwarder::new(
         exchange([("first", Err(anyhow::anyhow!("offline")))], None),
         cache.clone(),

@@ -36,6 +36,33 @@ use honk_outbound::urltest::{urltest_group, urltest_node};
 use std::sync::Arc;
 use std::time::Duration;
 
+const STREAM_CHANNEL_CAPACITY: usize = 16;
+
+/// Lazily populated fan-out for high-frequency API streams. A sampler checks
+/// receiver count before it snapshots or serializes any data.
+pub struct StreamSamplers {
+    connections: dashmap::DashMap<Duration, tokio::sync::broadcast::Sender<Arc<Bytes>>>,
+    traffic: tokio::sync::broadcast::Sender<Arc<Bytes>>,
+    traffic_started: std::sync::atomic::AtomicBool,
+}
+
+impl StreamSamplers {
+    pub fn new() -> Self {
+        let (traffic, _) = tokio::sync::broadcast::channel(STREAM_CHANNEL_CAPACITY);
+        Self {
+            connections: dashmap::DashMap::new(),
+            traffic,
+            traffic_started: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+impl Default for StreamSamplers {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 use crate::mode::{ModeState, SharedModeState};
 
 pub struct ClashState {
@@ -60,6 +87,8 @@ pub struct ClashState {
     /// Broadcast channel fed by the clash log tracing layer.
     pub log_tx: tokio::sync::broadcast::Sender<logs::LogEvent>,
     pub dns_service: crate::dns::DnsService,
+    /// Shared lazy samplers for high-fanout websocket/HTTP streams.
+    pub stream_samplers: Arc<StreamSamplers>,
 }
 
 pub fn router(state: Arc<ClashState>) -> Router {
@@ -856,6 +885,17 @@ async fn get_rules(State(s): State<Arc<ClashState>>) -> Json<serde_json::Value> 
     Json(serde_json::json!({"rules": rules}))
 }
 
+fn udp_histogram_json(histogram: &crate::stats::UdpLatencyHistogramSnapshot) -> serde_json::Value {
+    // The source histogram is a fixed 64-element atomic array. Snapshot
+    // serialization allocates only this response array; it does not create
+    // labels or unbounded metric state on the packet path.
+    serde_json::json!({
+        "count": histogram.count,
+        "sumNanos": histogram.sum_nanos,
+        "buckets": histogram.buckets.to_vec(),
+    })
+}
+
 /// Per-outbound counters from the userspace stats manager (the datum the
 /// retired debug API exposed at `/debug/stats`). Not part of the clash API
 /// standard; handy for headless ops.
@@ -875,12 +915,54 @@ async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json
         })
         .collect();
     let pool = s.connection_pool.ready_metrics();
+    let udp = s.stats.udp_snapshot();
     Json(serde_json::json!({
         "outbounds": per_outbound,
         "pool": {
             "readyHits": pool.hits,
             "readyMisses": pool.misses,
             "entries": pool.entries,
+        },
+        "udp": {
+            "endpoint": {
+                "hits": udp.endpoint_hits,
+                "misses": udp.endpoint_misses,
+            },
+            "latency": {
+                "route": udp_histogram_json(&udp.route_latency),
+                "dial": udp_histogram_json(&udp.dial_latency),
+                "replyReady": udp_histogram_json(&udp.reply_ready_latency),
+                "firstSend": udp_histogram_json(&udp.first_send_latency),
+                "firstReply": udp_histogram_json(&udp.first_reply_latency),
+            },
+            "capacity": {
+                "rejected": udp.capacity_rejections,
+            },
+            "slowPermit": {
+                "accepted": udp.slow_permit_accepted,
+                "rejected": udp.slow_permit_rejected,
+                "closed": udp.slow_permit_closed,
+            },
+            "queue": {
+                "accepted": udp.queue_accepted,
+                "full": udp.queue_full,
+                "flowFull": udp.flow_queue_full,
+                "globalPayloadFull": udp.global_payload_full,
+                "closed": udp.queue_closed,
+            },
+            "firstSend": {
+                "failures": udp.first_send_failures,
+            },
+            "stagger": {
+                "attempts": udp.stagger_attempts,
+                "winners": udp.stagger_winners,
+                "cancellations": udp.stagger_cancellations,
+            },
+            "warm": {
+                "attempts": udp.warm_attempts,
+                "successes": udp.warm_successes,
+                "failures": udp.warm_failures,
+            },
         },
     }))
 }
@@ -894,8 +976,13 @@ struct ConnectionsQuery {
 
 /// Build the clash connections document from the tracker snapshot.
 fn connections_json(s: &ClashState) -> serde_json::Value {
-    let snapshots = s.connection_tracker.snapshot();
+    connections_json_tracker(&s.connection_tracker)
+}
 
+fn connections_json_tracker(
+    tracker: &crate::connection_tracker::ConnectionTracker,
+) -> serde_json::Value {
+    let snapshots = tracker.snapshot();
     let connections: Vec<serde_json::Value> = snapshots
         .iter()
         .map(|e| {
@@ -909,10 +996,9 @@ fn connections_json(s: &ClashState) -> serde_json::Value {
                 ""
             };
             let dst_ip = if dest_ip.len() > 1 { dest_ip[1] } else { "" };
-            // start_time is an Instant; recover wall time as RFC3339.
             let start = std::time::SystemTime::now()
                 .checked_sub(e.start_time.elapsed())
-                .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339())
+                .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339())
                 .unwrap_or_default();
 
             serde_json::json!({
@@ -938,13 +1024,12 @@ fn connections_json(s: &ClashState) -> serde_json::Value {
         })
         .collect();
 
-    let (total_up, total_down) = snapshots.iter().fold((0u64, 0u64), |(up, down), e| {
-        (up + e.upload, down + e.download)
-    });
-
+    let (upload, download) = snapshots
+        .iter()
+        .fold((0, 0), |(up, down), e| (up + e.upload, down + e.download));
     serde_json::json!({
-        "downloadTotal": total_down,
-        "uploadTotal": total_up,
+        "downloadTotal": download,
+        "uploadTotal": upload,
         "connections": connections,
         "memory": 0,
     })
@@ -965,15 +1050,57 @@ async fn get_connections(
 /// Push the full connections snapshot every `interval` until the client
 /// disconnects.
 async fn connections_ws(mut socket: WebSocket, s: Arc<ClashState>, interval: Duration) {
-    let mut tick = tokio::time::interval(interval);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut frames = connection_sampler(&s, interval).subscribe();
     loop {
-        tick.tick().await;
-        let msg = connections_json(&s).to_string();
-        if socket.send(Message::Text(msg.into())).await.is_err() {
-            break;
+        match frames.recv().await {
+            Ok(frame) => {
+                if socket
+                    .send(Message::Text(
+                        std::str::from_utf8(frame.as_ref())
+                            .expect("connections JSON is UTF-8")
+                            .into(),
+                    ))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
     }
+}
+
+fn connection_sampler(
+    s: &Arc<ClashState>,
+    interval: Duration,
+) -> tokio::sync::broadcast::Sender<Arc<Bytes>> {
+    if let Some(existing) = s.stream_samplers.connections.get(&interval) {
+        return existing.clone();
+    }
+    let (tx, _) = tokio::sync::broadcast::channel(STREAM_CHANNEL_CAPACITY);
+    s.stream_samplers
+        .connections
+        .entry(interval)
+        .or_insert_with(|| {
+            let sampler_tx = tx.clone();
+            let sampler_state = Arc::clone(s);
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(interval);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tick.tick().await;
+                    if sampler_tx.receiver_count() == 0 {
+                        continue;
+                    }
+                    let frame = Arc::new(Bytes::from(connections_json(&sampler_state).to_string()));
+                    let _ = sampler_tx.send(frame);
+                }
+            });
+            tx.clone()
+        })
+        .clone()
 }
 
 async fn delete_connections(State(s): State<Arc<ClashState>>) -> StatusCode {
@@ -988,45 +1115,76 @@ async fn delete_connection(State(s): State<Arc<ClashState>>, Path(id): Path<Stri
     StatusCode::NO_CONTENT
 }
 
-/// Sum tx/rx bytes across all outbounds.
 async fn traffic_totals(s: &ClashState) -> (u64, u64) {
-    let snap = s.stats.snapshot();
-    snap.values().fold((0u64, 0u64), |(up, down), st| {
-        (up + st.tx_bytes, down + st.rx_bytes)
+    traffic_totals_stats(&s.stats)
+}
+
+fn traffic_totals_stats(stats: &crate::stats::StatsManager) -> (u64, u64) {
+    stats.snapshot().values().fold((0, 0), |(up, down), value| {
+        (up + value.tx_bytes, down + value.rx_bytes)
     })
 }
 
 async fn get_traffic(State(s): State<Arc<ClashState>>, ws: MaybeWs) -> Response {
     let Some(ws) = ws.0 else {
-        // Non-WS clients get a chunked JSON stream (sing-box behavior):
-        // one `{"up","down"}` line per second.
         return chunked_json_response(traffic_chunk_stream(s));
     };
     ws.on_upgrade(move |socket| traffic_ws(socket, s))
 }
 
-/// Push per-second up/down byte deltas (clash `/traffic` shape).
 async fn traffic_ws(mut socket: WebSocket, s: Arc<ClashState>) {
-    let mut tick = tokio::time::interval(Duration::from_secs(1));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let (mut prev_up, mut prev_down) = traffic_totals(&s).await;
+    ensure_traffic_sampler(&s);
+    let mut frames = s.stream_samplers.traffic.subscribe();
     loop {
-        tick.tick().await;
-        let (up, down) = traffic_totals(&s).await;
-        let msg = serde_json::json!({
-            "up": up.saturating_sub(prev_up),
-            "down": down.saturating_sub(prev_down),
-        });
-        if socket
-            .send(Message::Text(msg.to_string().into()))
-            .await
-            .is_err()
-        {
-            break;
+        match frames.recv().await {
+            Ok(frame) => {
+                if socket
+                    .send(Message::Text(
+                        std::str::from_utf8(frame.as_ref())
+                            .expect("traffic JSON is UTF-8")
+                            .into(),
+                    ))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
-        prev_up = up;
-        prev_down = down;
     }
+}
+fn ensure_traffic_sampler(s: &Arc<ClashState>) {
+    if s.stream_samplers
+        .traffic_started
+        .swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        return;
+    }
+    let state = Arc::clone(s);
+    let tx = state.stream_samplers.traffic.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut previous = traffic_totals(&state).await;
+        loop {
+            tick.tick().await;
+            if tx.receiver_count() == 0 {
+                continue;
+            }
+            let current = traffic_totals(&state).await;
+            let frame = Arc::new(Bytes::from(
+                serde_json::json!({
+                    "up": current.0.saturating_sub(previous.0),
+                    "down": current.1.saturating_sub(previous.1),
+                })
+                .to_string(),
+            ));
+            let _ = tx.send(frame);
+            previous = current;
+        }
+    });
 }
 
 /// Chunked-HTTP fallback for `/traffic`: the same per-second delta frames
@@ -1034,22 +1192,22 @@ async fn traffic_ws(mut socket: WebSocket, s: Arc<ClashState>) {
 fn traffic_chunk_stream(
     s: Arc<ClashState>,
 ) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
-    futures::stream::unfold(
-        (s, None),
-        |(s, prev): (Arc<ClashState>, Option<(u64, u64)>)| async move {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            let (up, down) = traffic_totals(&s).await;
-            let (prev_up, prev_down) = prev.unwrap_or((up, down));
-            let line = format!(
-                "{}\n",
-                serde_json::json!({
-                    "up": up.saturating_sub(prev_up),
-                    "down": down.saturating_sub(prev_down),
-                })
-            );
-            Some((Ok(Bytes::from(line)), (s, Some((up, down)))))
-        },
-    )
+    ensure_traffic_sampler(&s);
+    let receiver = s.stream_samplers.traffic.subscribe();
+    futures::stream::unfold(receiver, |mut receiver| async move {
+        loop {
+            match receiver.recv().await {
+                Ok(frame) => {
+                    let mut line = Vec::with_capacity(frame.len() + 1);
+                    line.extend_from_slice(frame.as_ref());
+                    line.push(b'\n');
+                    return Some((Ok(Bytes::from(line)), receiver));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    })
 }
 
 /// Wrap a JSON-lines stream into a chunked `application/json` response.

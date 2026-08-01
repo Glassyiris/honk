@@ -47,6 +47,8 @@ pub enum DnsForwardError {
     Internal(#[from] anyhow::Error),
     #[error("rejected DNS request escaped the request-plan branch")]
     RejectedPlanEscaped,
+    #[error("DNS singleflight admission is saturated")]
+    Overloaded,
 }
 
 #[derive(Debug, Error)]

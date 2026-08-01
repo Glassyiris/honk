@@ -47,6 +47,7 @@
 | `dns_resolve_timeout_ms` | u64 | `2000` | 控制面解析超时（结构化模型字段，dae 语法无对应键） |
 | `relay_idle_timeout_secs` | u64 | `300` | 空闲中继断开；`0` = 关闭（结构化模型字段，dae 语法无对应键） |
 | `preconnect_node_count` | usize | `0` | 预连接数；`0` = 自动 `min(nodes,8)`（结构化模型字段，dae 语法无对应键） |
+| `udp_warm_node_count` | usize | `0` | opt-in UDP warm-up 预算。`0` 为严格关闭：不创建 coordinator task，也不产生 warm metrics。正值会发现权威 DataUdp group leaf；dispatch 仍最多四个并发 task。 |
 
 ### 拨号模式细节
 
@@ -357,7 +358,7 @@ dns {
 | `tls_server_name` | string? | null | DoT/DoH/DoQ/DoH3 SNI。dae 语法自动从主机名派生；IP 字面量上游需用 URI query 参数显式指定，如 `tls://1.1.1.1:853?tls_server_name=cloudflare-dns.com` |
 | `outbound` | string? | null | 经节点/组发出；dae 中行内后缀 `'uri' -> <name>`（旧：`outbound: name`） |
 
-**运行时说明：** UDP/TCP/DoT/DoH/DoQ/DoH3 均可用（连接复用）。DoT/DoH/TCP 支持 `-> proxy`（经节点/组的 TCP 隧道）；DoQ/DoH3 暂仅直连。经代理的 DNS SOCKS5 UDP 路径不完整（UDP+代理隧道化为 TCP DNS）。
+**运行时说明：** UDP/TCP/DoT/DoH/DoQ/DoH3 均可用（连接复用）。DoT/DoH/TCP 支持 `-> proxy`（经节点/组的 TCP 隧道）；DoQ/DoH3 暂仅直连。UDP+代理由该上游策略刻意承载为 TCP-DNS；SOCKS5 RFC 1928 UDP 仍是独立的完整 transport。
 
 ### 路由 / 规则
 
@@ -398,11 +399,18 @@ UDP size、入口 profile、策略、scope 与 operation 均在 key 中保持隔
 flags、EDNS option（包括 ECS/COOKIE）、EDNS-v1 与多问题消息绕过这两项优化；取消会
 释放 flight。
 
+运行时 cache 与 singleflight key 共享同一份不可变二进制 query identity；
+operation 变体复用该分配，cache 分片使用预计算的运行时 hash。SQLite 文本编码
+只存在于持久化边界。
+
+
 ### Runtime 与可观测性
 
-重载一次切换包含 DNS 策略、Router、GroupManager 快照、transport manager 与路由投影的
-完整 generation。lease 让旧请求排空；退役 deadline 与保留 generation 上限约束关闭，
-transport 初始化/关闭使用 singleflight 且幂等。
+重载一次切换包含 DNS 策略、Router、GroupManager 快照、transport manager、路由投影与
+固定 outbound runtime 的完整 generation。lease 让旧请求继续使用匹配的节点/session
+generation；这些 lease 与 DNS transport 退役后，旧 outbound pool 才拒绝新 open 并 drain
+存活 stream。退役 deadline 与保留 generation 上限约束 DNS 关闭，transport 初始化/关闭
+使用 singleflight 且幂等。
 
 相互独立、单调递增的 counter 覆盖 hit/miss/stale、flight 饱和/取消/重试、
 持久化丢弃/flush 失败、runtime 退役、transport 初始化/重置、投影失败/重试和
@@ -463,7 +471,7 @@ dae 语法中每个订阅一行：`tag: 'https://...'` 或裸 `'https://...'`（
 | GET/DELETE | `/connections` | 列表 / 关闭全部 |
 | DELETE | `/connections/{id}` | 关闭单个 |
 | GET | `/traffic` | WS 或分块 JSON 行 |
-| GET | `/stats` | 出站统计 |
+| GET | `/stats` | 出站与稳定 UDP 统计 |
 | GET | `/logs` | WS 或分块 |
 | GET | `/dns/query` | DoH 风格 JSON |
 | POST | `/cache/fakeip/flush` | FakeIP 前缀清理 |
@@ -471,6 +479,35 @@ dae 语法中每个订阅一行：`tag: 'https://...'` 或裸 `'https://...'`（
 | GET | `/providers/proxies` | 组作为 provider |
 | GET | `/providers/rules` | 空桩 |
 | GET | `/ui` … | 外部 UI |
+
+### `GET /stats` UDP schema
+
+`udp` 是 `GET /stats` 中稳定的嵌套对象。下文的点记法 `/stats.udp` 表示该
+嵌套对象，**不是**独立路由。列出的键始终存在；尚未发生对应事件时计数可为零。
+报文路径不会创建动态 node/tag label。
+
+```text
+udp = {
+  endpoint: { hits, misses },
+  latency: {
+    route: H, dial: H, replyReady: H, firstSend: H, firstReply: H
+  },
+  capacity: { rejected },
+  slowPermit: { accepted, rejected, closed },
+  queue: { accepted, full, closed },
+  firstSend: { failures },
+  stagger: { attempts, winners, cancellations },
+  warm: { attempts, successes, failures }
+}
+H = { count, sumNanos, buckets }  // buckets 有固定 64 个 log2 slot
+```
+
+`queue` 是 endpoint driver 队列，与记录 slow-path admission 的
+`slowPermit` 不同。stagger counter 只用于 cold URLTest preparation。AnyTLS
+candidate 使用计入 pool cap 的 caller-owned provisional session slot；loser
+取消会关闭 detached work，winner 则在 endpoint publication 前提交到捕获的
+generation。warm 的 `successes` 只计 `Ready` 或 `AlreadyReady`；
+`NotApplicable` 保持中性。
 
 环境变量：`HONK_UI_DOWNLOAD_URL` 覆盖 UI zip。
 

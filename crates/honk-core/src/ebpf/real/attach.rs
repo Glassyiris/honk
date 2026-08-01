@@ -86,6 +86,9 @@ impl RealEbpfBackend {
             "PARAM: port={} dae0_ifindex={} wan_ifindex={} (iface={})",
             tproxy_port, dae0_ifindex, wan_ifindex, ebpf_wan_ifname
         );
+        // A stale pin must never hide the map owned by this generation.
+        // The singleton lock guarantees the previous engine has exited.
+        let _ = std::fs::remove_file(pin_root.join("LISTEN_SOCKET_MAP"));
         let mut bpf = EbpfLoader::new()
             .override_global("PARAM", &dae_param, true)
             .override_global("WAN_IFINDEX", &wan_ifindex, true)
@@ -100,6 +103,11 @@ impl RealEbpfBackend {
                 continue;
             }
             let pin_path = pin_root.join(name);
+            if let Err(error) = std::fs::remove_file(&pin_path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!("remove stale pin '{}': {}", name, error);
+            }
             if let Err(e) = map.pin(&pin_path) {
                 warn!("pin '{}': {}", name, e);
             } else {
@@ -120,14 +128,16 @@ impl RealEbpfBackend {
                 outbound: OutboundIndex::ControlPlaneRouting as u8,
                 ..Default::default()
             };
-            if let Err(e) = bpf_hash_insert(
+            // Without this table every new flow is dropped between attach and
+            // the first routing push — a silent failure mode, so any error
+            // here aborts startup (the caller drops the half-loaded object).
+            bpf_hash_insert(
                 &mut bpf,
                 "ROUTING_MAP",
                 unsafe { as_bytes(&0u32) },
                 unsafe { as_bytes(&cold_start) },
-            ) {
-                warn!("cold-start ROUTING_MAP init failed (non-fatal): {}", e);
-            }
+            )
+            .map_err(|e| anyhow::anyhow!("cold-start ROUTING_MAP init: {}", e))?;
             // The fallback belongs to every (l4proto × ipversion) group, so
             // bit 0 of each group bitmap is set.  Write all meta slots
             // explicitly — group bitmaps first, the rule count last — so a
@@ -137,24 +147,22 @@ impl RealEbpfBackend {
                 for w in 0..ROUTING_GROUP_BITMAP_WORDS as u32 {
                     let slot = 1 + g * ROUTING_GROUP_BITMAP_WORDS as u32 + w;
                     let word: u32 = if w == 0 { 1 } else { 0 };
-                    if let Err(e) = bpf_hash_insert(
+                    bpf_hash_insert(
                         &mut bpf,
                         "ROUTING_META_MAP",
                         unsafe { as_bytes(&slot) },
                         unsafe { as_bytes(&word) },
-                    ) {
-                        warn!("cold-start ROUTING_META_MAP init failed (non-fatal): {}", e);
-                    }
+                    )
+                    .map_err(|e| anyhow::anyhow!("cold-start ROUTING_META_MAP init: {}", e))?;
                 }
             }
-            if let Err(e) = bpf_hash_insert(
+            bpf_hash_insert(
                 &mut bpf,
                 "ROUTING_META_MAP",
                 unsafe { as_bytes(&0u32) },
                 unsafe { as_bytes(&1u32) },
-            ) {
-                warn!("cold-start ROUTING_META_MAP init failed (non-fatal): {}", e);
-            }
+            )
+            .map_err(|e| anyhow::anyhow!("cold-start ROUTING_META_MAP init: {}", e))?;
         }
         // Attach cgroup programs to root cgroup2 for cookie→PID mapping.
         // This enables pname routing and control-plane traffic bypass (Go dae parity).
@@ -197,14 +205,16 @@ impl RealEbpfBackend {
         }
         // Initialize outbound connectivity map: all entries are alive by default.
         // This map is updated by health checks; until then we must not drop
-        // proxy-bound traffic.
+        // proxy-bound traffic. Skipping entries here marks every outbound
+        // dead, so an insert error aborts startup.
         for i in 0..honk_ebpf_common::MAX_OUTBOUNDS * 6 {
-            let _ = bpf_hash_insert(
+            bpf_hash_insert(
                 &mut bpf,
                 "OUTBOUND_CONNECTIVITY_MAP",
                 unsafe { as_bytes(&i) },
                 unsafe { as_bytes(&1u64) },
-            );
+            )
+            .map_err(|e| anyhow::anyhow!("OUTBOUND_CONNECTIVITY_MAP init: {}", e))?;
         }
 
         // If the configured LAN interface is a bridge slave, attach the eBPF
@@ -341,7 +351,10 @@ impl RealEbpfBackend {
         // master's TC hooks; it is switched directly between slave ports.
         // Attach the LAN programs to each bridge slave so container traffic
         // is intercepted.
-        let mut bridge_slave_links = Vec::new();
+        // Slave links go into `dynamic_links` (keyed by ifindex/direction):
+        // without that the watcher's `dynamic_hooked` dedup never sees them
+        // and retries the attach every tick, failing with AlreadyExists.
+        let mut dynamic_links = Vec::new();
         let br_slaves = Self::bridge_slaves(&ebpf_lan_ifname);
         if !br_slaves.is_empty() {
             info!(
@@ -373,19 +386,18 @@ impl RealEbpfBackend {
                     let id = p.attach(slave, ingress_dir).map_err(|e| {
                         anyhow::anyhow!("attach {} to {}: {}", slave_prog, slave, e)
                     })?;
-                    bridge_slave_links.push(p.take_link(id)?);
+                    dynamic_links.push((Self::iface_ifindex(slave), false, p.take_link(id)?));
                     Ok(())
                 })();
-                match ingress_result {
-                    Ok(()) => info!(
-                        "attached {} to bridge slave {} (Ingress)",
-                        slave_prog, slave
-                    ),
-                    Err(e) => warn!(
-                        "failed to attach {} to bridge slave {}: {}",
-                        slave_prog, slave, e
-                    ),
-                }
+                // A slave we cannot attach silently leaves that traffic
+                // outside the proxy — abort rather than run half-covered.
+                ingress_result.map_err(|e| {
+                    anyhow::anyhow!("attach {} to bridge slave {}: {}", slave_prog, slave, e)
+                })?;
+                info!(
+                    "attached {} to bridge slave {} (Ingress)",
+                    slave_prog, slave
+                );
 
                 let egress_result: anyhow::Result<()> = (|| {
                     let p: &mut aya::programs::SchedClassifier = bpf
@@ -395,16 +407,13 @@ impl RealEbpfBackend {
                     let id = p
                         .attach(slave, egress_dir)
                         .map_err(|e| anyhow::anyhow!("attach lan_egress_l2 to {}: {}", slave, e))?;
-                    bridge_slave_links.push(p.take_link(id)?);
+                    dynamic_links.push((Self::iface_ifindex(slave), true, p.take_link(id)?));
                     Ok(())
                 })();
-                match egress_result {
-                    Ok(()) => info!("attached lan_egress_l2 to bridge slave {} (Egress)", slave),
-                    Err(e) => warn!(
-                        "failed to attach lan_egress_l2 to bridge slave {}: {}",
-                        slave, e
-                    ),
-                }
+                egress_result.map_err(|e| {
+                    anyhow::anyhow!("attach lan_egress_l2 to bridge slave {}: {}", slave, e)
+                })?;
+                info!("attached lan_egress_l2 to bridge slave {} (Egress)", slave);
             }
         }
 
@@ -441,10 +450,10 @@ impl RealEbpfBackend {
                     lan_slave_links.push(p.take_link(id)?);
                     Ok(())
                 })();
-                match attach_result {
-                    Ok(()) => info!("attached lan_ingress to bond slave {}", slave),
-                    Err(e) => warn!("failed to attach lan_ingress to slave {}: {}", slave, e),
-                }
+                attach_result.map_err(|e| {
+                    anyhow::anyhow!("attach lan_ingress to bond slave {}: {}", slave, e)
+                })?;
+                info!("attached lan_ingress to bond slave {}", slave);
             }
         }
 
@@ -478,10 +487,10 @@ impl RealEbpfBackend {
                     wan_slave_links.push(p.take_link(id)?);
                     Ok(())
                 })();
-                match attach_result {
-                    Ok(()) => info!("attached wan_egress to bond slave {}", slave),
-                    Err(e) => warn!("failed to attach wan_egress to slave {}: {}", slave, e),
-                }
+                attach_result.map_err(|e| {
+                    anyhow::anyhow!("attach wan_egress to bond slave {}: {}", slave, e)
+                })?;
+                info!("attached wan_egress to bond slave {}", slave);
             }
         }
 
@@ -578,8 +587,7 @@ impl RealEbpfBackend {
             wan_ingress_link,
             lan_slave_links,
             wan_slave_links,
-            bridge_slave_links,
-            dynamic_links: Vec::new(),
+            dynamic_links,
             dae0_ingress_link: None,
             dae0peer_ingress_link: None,
             sk_lookup_link: None,

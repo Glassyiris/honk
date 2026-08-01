@@ -2,13 +2,15 @@ use aya_ebpf::Global;
 use aya_ebpf::bindings::__be32;
 use aya_ebpf::btf_maps::{Array, HashMap, LpmTrie, PerCpuArray, RingBuf, SockMap};
 use aya_ebpf::macros::btf_map;
-use honk_ebpf_common::conn::{ConnState, ConntrackArgs, MAX_CONN_STATE_NUM, ParseTransportCtx};
+use honk_ebpf_common::conn::{
+    BpfStatsKey, ConnState, ConntrackArgs, MAX_CONN_STATE_NUM, ParseTransportCtx,
+};
 use honk_ebpf_common::event::DaeEvent;
 use honk_ebpf_common::redirect_need::{
     DomainRouting, MAX_MATCH_SET_LEN, PIDName, RoutingHandoffEntry, TuplesKey,
 };
 use honk_ebpf_common::route::{MatchSet, ROUTING_META_MAP_LEN};
-use honk_ebpf_common::{DaeParam, RedirectEntry, RedirectTuple};
+use honk_ebpf_common::{DaeParam, ROUTING_MAP_LEN, RedirectEntry, RedirectTuple};
 
 use crate::route::{RouteCtx, WanEgressRouteScratch};
 use crate::transport::ParsedPacket;
@@ -54,7 +56,7 @@ pub static DAE0PEER_IFINDEX: Global<u32> = Global::new(0);
 pub static OUTBOUND_CONNECTIVITY_MAP: Array<u64, 1536, 0> = Array::new();
 
 #[btf_map]
-pub static LISTEN_SOCKET_MAP: SockMap<4> = SockMap::new();
+pub static LISTEN_SOCKET_MAP: SockMap<16> = SockMap::new();
 
 #[btf_map]
 /// Plain hash with BPF_F_NO_PREALLOC: kernel memory scales with live
@@ -67,22 +69,22 @@ pub static REDIRECT_TRACK: HashMap<RedirectTuple, RedirectEntry, 65536, 1> = Has
 #[btf_map]
 /// Plain hash with BPF_F_NO_PREALLOC: swept by the userspace janitor (30 s
 /// timeout).
-pub static ROUTING_HANDOFF_MAP: HashMap<TuplesKey, RoutingHandoffEntry, MAX_ROUTING_HANDOFF_NUM, 1> =
-    HashMap::new();
+pub static ROUTING_HANDOFF_MAP: HashMap<
+    TuplesKey,
+    RoutingHandoffEntry,
+    MAX_ROUTING_HANDOFF_NUM,
+    1,
+> = HashMap::new();
 
 #[btf_map]
-pub static ROUTING_MAP: Array<MatchSet, MAX_MATCH_SET_LEN, 0> = Array::new();
+/// Two physical rule banks. `ROUTING_META_MAP[0]` selects the active bank;
+/// the inactive bank is populated before that single-slot switch.
+pub static ROUTING_MAP: Array<MatchSet, ROUTING_MAP_LEN, 0> = Array::new();
 
-/// Routing meta block.
-///
-/// Slot 0 holds the active rule count; slots `[1..ROUTING_META_MAP_LEN)`
-/// hold the four (l4proto × ipversion) group bitmaps — see
-/// `honk_ebpf_common::route::ROUTING_META_MAP_LEN` for the exact layout.
-/// Userspace publishes the group bitmaps first and the count last, so the
-/// count remains the atomic switch of the two-phase routing commit.
+/// Routing metadata for the two rule banks. Slot 0 is the active generation;
+/// each following block contains one generation's count and group bitmaps.
 #[btf_map]
 pub static ROUTING_META_MAP: Array<u32, ROUTING_META_MAP_LEN, 0> = Array::new();
-
 #[btf_map]
 pub static DOMAIN_ROUTING_MAP: HashMap<[__be32; 4], DomainRouting, MAX_DOMAIN_ROUTING_NUM, 1> =
     HashMap::new();
@@ -123,20 +125,28 @@ pub static CONN_STATE_MAP: HashMap<TuplesKey, ConnState, { MAX_CONN_STATE_NUM as
 #[btf_map]
 pub static CONN_STATE_OCCUPANCY: PerCpuArray<u64, 2> = PerCpuArray::new();
 
-// key=0: UDP conn overflow count; key=1: TCP conn overflow count.
+/// Insert failures: conn UDP/TCP, redirect-track, routing-handoff, cookie-PID.
 #[btf_map]
-pub static BPF_STATS_MAP: Array<u64, 2> = Array::new();
+pub static BPF_STATS_MAP: Array<u64, 5> = Array::new();
+
+#[inline(always)]
+pub fn increment_bpf_stat(key: BpfStatsKey) {
+    if let Some(counter) = BPF_STATS_MAP.get_ptr_mut(key as u32) {
+        unsafe {
+            *counter += 1;
+        }
+    }
+}
 
 /// Per-outbound traffic counters (per-CPU to avoid cross-CPU contention on
-/// the per-packet update path).  Index:
-/// `honk_ebpf_common::outbound_stats_index(outbound, counter)` — four `u64`
-/// counters per outbound (tx_packets, tx_bytes, rx_packets, rx_bytes) for
-/// each of the 256 possible `u8` outbound indices.  tx is accounted at
-/// `lan_ingress` when the routing decision lands, rx at `dae0_ingress` on
-/// the reply path.  Userspace aggregates the per-CPU slots when reading.
+/// the per-packet update path). Each entry packs tx/rx packets and bytes for
+/// one of the 256 possible `u8` outbound indices; userspace aggregates the
+/// per-CPU values when reading.
 #[btf_map]
-pub static OUTBOUND_STATS: PerCpuArray<u64, { honk_ebpf_common::OUTBOUND_STATS_MAP_LEN as usize }> =
-    PerCpuArray::new();
+pub static OUTBOUND_STATS: PerCpuArray<
+    honk_ebpf_common::OutboundStatsCounters,
+    { honk_ebpf_common::OUTBOUND_STATS_MAP_LEN as usize },
+> = PerCpuArray::new();
 
 #[btf_map]
 pub static EVENT_RINGBUF: RingBuf<DaeEvent, 262144> = RingBuf::new();

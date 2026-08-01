@@ -107,9 +107,7 @@ async fn read_tcp_dns_query(stream: &mut TcpStream, query: &mut Vec<u8>) -> bool
 }
 
 fn is_dns_query(data: &[u8]) -> bool {
-    data.len() >= 12
-        && data[2] & 0x80 == 0
-        && crate::dns::forwarder::parse_dns_question(data).is_some()
+    super::super::is_exact_dns_query(data)
 }
 
 pub(super) fn udp_ingress_profile(data: &[u8]) -> crate::dns::query::IngressProfile {
@@ -124,7 +122,7 @@ pub(super) fn build_dns_servfail(query: &[u8]) -> Vec<u8> {
     build_dns_error_response(query, 2)
 }
 
-fn build_dns_refused(query: &[u8]) -> Vec<u8> {
+pub(super) fn build_dns_refused(query: &[u8]) -> Vec<u8> {
     build_dns_error_response(query, 5)
 }
 

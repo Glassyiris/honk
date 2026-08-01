@@ -1,3 +1,5 @@
+use bytes::Bytes;
+
 use std::time::{Duration, Instant};
 
 pub(super) const STALE_RETENTION: Duration = Duration::from_secs(3600);
@@ -9,7 +11,7 @@ pub(super) const STALE_RETENTION: Duration = Duration::from_secs(3600);
 #[derive(Debug, Clone)]
 pub struct CachedEntry {
     /// Raw DNS response bytes (full wire-format message).
-    pub response: Vec<u8>,
+    pub response: Bytes,
     /// Absolute wall-clock time after which this entry is stale.
     pub expires_at: Instant,
     /// Minimum TTL from the DNS record set, in seconds.

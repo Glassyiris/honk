@@ -1,4 +1,7 @@
+use super::udp_dial::{UdpPrepare, UdpStaggerCallbacks, prepare_udp_plan};
 use super::*;
+use crate::control::udp_endpoint::{UdpEndpoint, UdpInitLease};
+use crate::group::SelectionPlanMode;
 
 /// Result from the eBPF routing handoff map lookup.
 #[derive(Debug, Clone)]
@@ -41,6 +44,17 @@ impl HandoffResult {
     }
 }
 
+const COLD_URLTEST_STAGGER: Duration = Duration::from_millis(200);
+
+/// Wait until this candidate's absolute cold-URLTest release offset. The
+/// first candidate starts immediately; sleeping candidates have not acquired
+/// a dial permit and are cancelled with their enclosing `JoinSet`.
+async fn wait_for_cold_urltest_release(index: usize) {
+    if index != 0 {
+        tokio::time::sleep(COLD_URLTEST_STAGGER.saturating_mul(index as u32)).await;
+    }
+}
+
 pub(super) struct ConnectionGuard {
     drain: Arc<DrainTracker>,
 }
@@ -66,6 +80,7 @@ pub(super) struct ControlPlaneHandle {
     pub(super) config: Arc<RwLock<Config>>,
     pub(super) router: Arc<RwLock<Router>>,
     pub(super) proxy_registry: Arc<ProxyRegistry>,
+    pub(super) runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
     pub(super) dns_resolver: Arc<DnsResolver>,
     pub(super) group_manager: SharedGroupManager,
     pub(super) stats: Arc<StatsManager>,
@@ -433,10 +448,10 @@ impl ControlPlaneHandle {
                         db.get(matched.rule_name).cloned().unwrap_or_default()
                     };
                     if !bitmaps.is_empty() {
-                        let mut merged = DomainRouting { bitmap: [0u32; 4] };
+                        let mut merged = DomainRouting::default();
                         for bm in &bitmaps {
-                            for i in 0..4 {
-                                merged.bitmap[i] |= bm.bitmap[i];
+                            for (word, value) in merged.bitmap.iter_mut().zip(bm.bitmap) {
+                                *word |= value;
                             }
                         }
                         let prefix_len = if original_dst.ip().is_ipv4() { 32 } else { 128 };
@@ -468,17 +483,39 @@ impl ControlPlaneHandle {
 
         self.stats.record_connection(&outbound_name);
 
-        let config = self.config.read().await;
         let ipver = if original_dst.is_ipv6() {
             IpVersion::V6
         } else {
             IpVersion::V4
         };
-        let candidates = {
+        let (mut candidates, selection_mode) = {
+            let config = self.config.read().await;
             let gm = self.group_manager.read();
-            resolve_outbound_nodes(&config, &gm, &outbound_name, ProbeDomain::Tcp, ipver)
+            if let Some(group) = config
+                .groups
+                .iter()
+                .find(|group| group.name == outbound_name)
+            {
+                let plan = gm.selection_plan_for_domain(&group.name, ProbeDomain::Tcp, ipver);
+                (
+                    plan.nodes.into_iter().cloned().collect::<Vec<_>>(),
+                    plan.mode,
+                )
+            } else {
+                (
+                    resolve_outbound_nodes(&config, &gm, &outbound_name, ProbeDomain::Tcp, ipver),
+                    SelectionPlanMode::Authoritative,
+                )
+            }
         };
-        drop(config);
+        // Only an unmeasured URLTest group is allowed to speculate. Its
+        // candidate set is bounded before spawning so a large group cannot
+        // turn one client flow into an unbounded dial storm.
+        if selection_mode == SelectionPlanMode::ColdUrlTest {
+            candidates.truncate(3);
+        } else {
+            candidates.truncate(1);
+        }
 
         // If eBPF already decided this flow should go direct (not just punted
         // it to userspace), skip userspace proxy dial, DNS, and relay entirely.
@@ -629,14 +666,22 @@ impl ControlPlaneHandle {
             let target_domain = target_domain.clone();
             let outbound = outbound_name.clone();
 
+            let cold_urltest = selection_mode == SelectionPlanMode::ColdUrlTest;
             let mut set = tokio::task::JoinSet::new();
             for (idx, node) in candidates.iter().enumerate() {
                 let ctx = ctx.clone();
                 let node = (*node).clone();
                 let target_domain = target_domain.clone();
-                let start = std::time::Instant::now();
                 set.spawn(async move {
+                    if cold_urltest {
+                        // Absolute releases make only candidate zero immediate;
+                        // unreleased work has no dial permit and abort_all()
+                        // cancels it before it can start.
+                        wait_for_cold_urltest_release(idx).await;
+                    }
+                    let start = std::time::Instant::now();
                     let per_dial_timeout = connect_timeout * 3;
+                    let _dial_permit = ConnectionPool::acquire_dial_permit().await;
                     let result = tokio::time::timeout(
                         per_dial_timeout,
                         Self::dial_pooled(
@@ -784,9 +829,10 @@ impl ControlPlaneHandle {
                             );
                             // Only hot targets earn a speculative ready
                             // dial; a one-off flow gets none.
-                            if !pool.note_target(&key) {
+                            let Some(_warm_guard) = pool.try_begin_warm(&key) else {
                                 return;
-                            }
+                            };
+                            let _dial_permit = ConnectionPool::acquire_dial_permit().await;
                             match registry
                                 .dial(&node, target, target_domain.as_deref(), connect_timeout)
                                 .await
@@ -808,6 +854,7 @@ impl ControlPlaneHandle {
                             // instead; a bare TCP is useless to them.
                             return;
                         }
+                        let _dial_permit = ConnectionPool::acquire_dial_permit().await;
                         match honk_outbound::util::connect_outbound(&node_addr, connect_timeout)
                             .await
                         {
@@ -1045,6 +1092,14 @@ impl ControlPlaneHandle {
             }
             Err(e) => {
                 self.connection_tracker.remove(&conn_id);
+                // The relay updates these atomics as every read/splice completes.
+                // Preserve bytes moved before an I/O failure rather than turning
+                // the whole flow into a synthetic zero-byte success.
+                self.stats.record_bytes(
+                    &outbound_name,
+                    conn_upload.load(std::sync::atomic::Ordering::Relaxed),
+                    conn_download.load(std::sync::atomic::Ordering::Relaxed),
+                );
                 let io_err = e.downcast_ref::<std::io::Error>();
                 if let Some(io_err) = io_err {
                     if relay::is_ignorable_connection_error(io_err) {
@@ -1164,11 +1219,27 @@ impl ControlPlaneHandle {
 
     pub(super) async fn serve_udp_connection(
         &self,
+        lease: UdpInitLease,
         udp_socket: Arc<UdpSocket>,
-        data: bytes::Bytes,
-        client_addr: SocketAddr,
-        original_dst: SocketAddr,
     ) -> anyhow::Result<()> {
+        let mut cancellation = lease.cancellation();
+        tokio::select! {
+            _ = cancellation.changed() => {
+                // Dropping the uncommitted lease removes only its generation.
+                Ok(())
+            }
+            result = self.initialize_udp_connection(lease, udp_socket) => result,
+        }
+    }
+
+    async fn initialize_udp_connection(
+        &self,
+        mut lease: UdpInitLease,
+        udp_socket: Arc<UdpSocket>,
+    ) -> anyhow::Result<()> {
+        let client_addr = lease.client_addr();
+        let original_dst = lease.original_dst();
+        let data = lease.first_payload();
         debug!(
             "TPROXY UDP datagram from {} -> {} ({} bytes)",
             client_addr,
@@ -1181,10 +1252,9 @@ impl ControlPlaneHandle {
             std::time::Duration::from_millis(config.global.connect_timeout_ms)
         };
 
-        // The dae0/dae0peer veth pair uses fd00:686f:6e6b::/64 (IPv6)
-        // and 169.254.0.0/16 (IPv4 link-local). Traffic between these addresses
-        // is honk's own internal communication — proxying it would create
-        // a routing loop and exhaust file descriptors.
+        // These checks remain after the reservation only because DNS and
+        // sniffing historically lived in this slow handler. Their early exit
+        // drops the lease and therefore releases every reservation resource.
         if is_honk_internal_addr(&original_dst.ip()) || is_honk_internal_addr(&client_addr.ip()) {
             trace!(
                 "Skipping honk-internal UDP {} -> {}",
@@ -1192,12 +1262,6 @@ impl ControlPlaneHandle {
             );
             return Ok(());
         }
-
-        // TPROXY captures local discovery protocols (mDNS, SSDP, LLMNR)
-        // whose destinations are broadcast or multicast addresses.
-        // Userspace cannot send to broadcast without SO_BROADCAST, and
-        // forwarding multicast through a proxy is semantically wrong.
-        // Silently drop these datagrams — they belong to the LAN, not WAN.
         if is_broadcast_or_multicast(&original_dst.ip()) {
             trace!(
                 "Skipping broadcast/multicast UDP {} -> {}",
@@ -1206,24 +1270,23 @@ impl ControlPlaneHandle {
             return Ok(());
         }
 
-        // When eBPF delivers UDP via bpf_sk_assign the original destination
-        // cmsg may be missing; fall back to treating DNS-shaped payloads as
-        // DNS regardless of the reported destination port.
-        let dns_original_dst = if original_dst.port() == 53 {
-            original_dst
-        } else if is_dns_payload(&data) {
-            // Reconstruct the expected DNS source address so replies are
-            // accepted by the stub resolver.
-            SocketAddr::new(original_dst.ip(), 53)
-        } else {
-            original_dst
-        };
-        if let Ok(true) = self
-            .dns_controller
-            .handle_udp_dns(&udp_socket, &data, client_addr, dns_original_dst)
-            .await
-        {
-            return Ok(());
+        if !lease.dns_checked() {
+            match self
+                .dns_controller
+                .handle_udp_dns(&udp_socket, &data, client_addr, original_dst)
+                .await
+            {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(error) => {
+                    // Keep ordinary UDP forwarding available when DNS control
+                    // declines with an error, matching the pre-Task3 path.
+                    warn!(
+                        "DNS controller error for UDP {} -> {}; continuing UDP: {}",
+                        client_addr, original_dst, error
+                    );
+                }
+            }
         }
 
         let mut quic_domain: Option<String> = None;
@@ -1235,21 +1298,7 @@ impl ControlPlaneHandle {
             }
         }
 
-        if let Some(ep) = self.udp_pool.get(client_addr, original_dst) {
-            debug!("UDP endpoint reuse for {} -> {}", client_addr, original_dst);
-            if let Some(_cached_outbound) = ep.get_cached_routing(original_dst) {
-                debug!(
-                    "UDP routing cache hit for {} -> {}",
-                    client_addr, original_dst
-                );
-            }
-            ep.mark_sent();
-            ep.refresh();
-            ep.tracker_upload(data.len() as u64);
-            ep.proxy_socket.send_packet(&data).await?;
-            return Ok(());
-        }
-
+        let route_started_at = std::time::Instant::now();
         let tuples = build_tuples_key(
             original_dst.ip(),
             original_dst.port(),
@@ -1258,7 +1307,6 @@ impl ControlPlaneHandle {
             17, // UDP
         );
         let handoff = self.lookup_handoff(&tuples).await;
-
         let conn_info = ConnectionInfo {
             domain: quic_domain.clone(),
             dst_ip: original_dst.ip(),
@@ -1289,34 +1337,32 @@ impl ControlPlaneHandle {
             let (name, must) = router.route_with_must(&conn_info);
             (name.to_string(), 0, must)
         };
-
-        // Clash mode override (Direct/Global); must/block results are never
-        // overridden — same semantics as the TCP path.
         let outbound_name = self.apply_mode_override(outbound_name, must).await;
 
-        // Matched-rule identity for the /connections display (same as TCP).
         let matched_rule = {
             let router = self.router.read().await;
             router
                 .route_full(&conn_info)
                 .map(|m| (m.rule_type.to_string(), m.rule_payload.to_string()))
         };
+        self.stats
+            .record_udp_route_latency(route_started_at.elapsed());
+        // This guard is created exactly once and is transferred to Ready only
+        // after a real driver has reached its barrier.
+        lease.set_connection_guard(self.stats.track_connection(&outbound_name));
 
-        self.stats.record_connection(&outbound_name);
-
-        let config = self.config.read().await;
-        let ipver = if original_dst.is_ipv6() {
+        let requested_ipver = if original_dst.is_ipv6() {
             IpVersion::V6
         } else {
             IpVersion::V4
         };
-        let candidates = {
+        let plan = {
+            let config = self.config.read().await;
             let gm = self.group_manager.read();
-            resolve_outbound_nodes(&config, &gm, &outbound_name, ProbeDomain::DataUdp, ipver)
+            resolve_udp_outbound_plan(&config, &gm, &outbound_name, requested_ipver)
         };
-        drop(config);
 
-        if candidates.is_empty() {
+        if plan.nodes.is_empty() {
             warn!(
                 "No available candidate nodes for UDP outbound '{}' ({})",
                 outbound_name, client_addr
@@ -1329,136 +1375,217 @@ impl ControlPlaneHandle {
                 self.alive_set.notify_check_tcp(&node_name);
             }
             self.stats.record_error(&outbound_name);
-            self.stats.record_close(&outbound_name);
             return Ok(());
         }
 
-        // Try each candidate until one succeeds.  The TCP path uses parallel
-        // dial with JoinSet; for UDP we try sequentially because the proxy
-        // handshake is fast (no TLS) and the first candidate is usually alive.
-        // This prevents QUIC connections from failing silently when the first
-        // candidate's UDP ASSOCIATE is rejected.
-        let mut last_err: Option<anyhow::Error> = None;
-        for node in &candidates {
-            match self
-                .proxy_registry
-                .dial_udp_transport(node, original_dst, None, connect_timeout)
-                .await
-            {
-                Ok(transport) => {
-                    let relay_addr = transport.relay_addr();
-                    transport.send_packet(&data).await?;
-                    let client_to_proxy: u64 = data.len() as u64;
-
-                    let Some((endpoint, is_new)) = self.udp_pool.get_or_create(
-                        client_addr,
-                        original_dst,
-                        transport,
-                        relay_addr,
-                        node.name.clone(),
-                    ) else {
-                        // Pool at capacity: the datagram was already sent;
-                        // without an endpoint there is no reply path, so stop
-                        // here instead of queueing unbounded state.
-                        debug!(
-                            "UDP endpoint pool full; dropping mapping {} -> {}",
-                            client_addr, original_dst
-                        );
-                        return Ok(());
-                    };
-                    if is_new {
-                        debug!(
-                            "Proxying UDP {} -> {} via {} (new endpoint)",
-                            client_addr, original_dst, node.name
-                        );
+        // Cold URLTest preparation owns no endpoint state: no lease binding,
+        // reply socket, driver, tracker, or application packet exists until
+        // a single eligible transport winner has been drained and accepted.
+        let scheduler_ipver = plan.ipver;
+        let plan_mode = plan.mode;
+        let runtime_generation = self.runtime_registry.read().clone();
+        let prepare: UdpPrepare<honk_outbound::proxy::PreparedUdpTransport> = {
+            let registry = self.proxy_registry.clone();
+            let stats = self.stats.clone();
+            Arc::new(move |node: Node| {
+                let registry = registry.clone();
+                let stats = stats.clone();
+                let runtime_generation = Arc::clone(&runtime_generation);
+                Box::pin(async move {
+                    let dial_started_at = std::time::Instant::now();
+                    let result = if plan_mode == SelectionPlanMode::ColdUrlTest {
+                        registry
+                            .dial_udp_transport_speculative(
+                                runtime_generation,
+                                node.id,
+                                original_dst,
+                                None,
+                                connect_timeout,
+                            )
+                            .await
                     } else {
-                        debug!(
-                            "Proxying UDP {} -> {} via {} (endpoint reuse)",
-                            client_addr, original_dst, node.name
-                        );
-                    }
-                    endpoint.mark_sent();
-                    endpoint.record_pending_reply_peer(relay_addr);
-                    endpoint.cache_routing_result(original_dst, outbound_index);
-
-                    // Register the flow in the clash-API tracker once per
-                    // endpoint (one endpoint == one UDP "connection"), with
-                    // live byte counters shared by the send/reply paths.
-                    if is_new {
-                        let conn_id = uuid::Uuid::new_v4().to_string();
-                        let (rule, rule_payload) = matched_rule
-                            .clone()
-                            .unwrap_or_else(|| ("Fallback".to_string(), String::new()));
-                        let chains = {
-                            let gm = self.group_manager.read();
-                            let mut chain = gm.selection_chain(&outbound_name);
-                            if chain.last() != Some(&node.name) {
-                                chain.push(node.name.clone());
-                            }
-                            chain.reverse();
-                            chain
-                        };
-                        let (conn_upload, conn_download) = endpoint.byte_counters();
-                        self.connection_tracker.register(
-                            crate::connection_tracker::ConnectionEntry {
-                                id: conn_id.clone(),
-                                source: client_addr.to_string(),
-                                destination: original_dst.to_string(),
-                                proxy: node.name.clone(),
-                                rule,
-                                rule_payload,
-                                chains,
-                                upload: conn_upload,
-                                download: conn_download,
-                                start_time: std::time::Instant::now(),
-                                domain: quic_domain.clone(),
-                                network: "udp".to_string(),
-                            },
-                        );
-                        endpoint.set_tracker(conn_id);
-                    }
-                    endpoint.tracker_upload(client_to_proxy);
-
-                    if is_new {
-                        UdpEndpointPool::spawn_reply_handler(
-                            endpoint,
-                            udp_socket,
-                            client_addr,
-                            original_dst,
-                            self.alive_set.clone(),
-                        );
-                    }
-
-                    self.stats.record_bytes(&outbound_name, client_to_proxy, 0);
-                    self.stats.record_close(&outbound_name);
-                    return Ok(());
-                }
-                Err(e) => {
-                    last_err = Some(e);
-                    let ipver = if original_dst.is_ipv6() {
-                        IpVersion::V6
-                    } else {
-                        IpVersion::V4
+                        registry
+                            .dial_udp_transport(&node, original_dst, None, connect_timeout)
+                            .await
+                            .map(honk_outbound::proxy::PreparedUdpTransport::ready)
                     };
-                    self.alive_set.report_unavailable_traffic(
+                    stats.record_udp_dial_latency(dial_started_at.elapsed());
+                    result
+                })
+            })
+        };
+        let callbacks = UdpStaggerCallbacks {
+            is_eligible: {
+                let group_manager = self.group_manager.clone();
+                Arc::new(move |node| {
+                    group_manager.read().is_node_selectable_for_domain(
                         &node.name,
                         ProbeDomain::DataUdp,
-                        ipver,
+                        scheduler_ipver,
+                    )
+                })
+            },
+            on_dial_error: {
+                let alive_set = self.alive_set.clone();
+                Arc::new(move |node| {
+                    alive_set.report_unavailable_traffic(
+                        &node.name,
+                        ProbeDomain::DataUdp,
+                        scheduler_ipver,
                     );
-                    // sing-box `DeleteURLTestHistory` parity: un-rank the
-                    // node immediately for the next selection (see the TCP
-                    // dial path).
-                    self.alive_set.clear_latency(&node.name);
-                    self.alive_set.notify_check_tcp(&node.name);
-                }
+                    alive_set.clear_latency(&node.name);
+                    alive_set.notify_check_tcp(&node.name);
+                })
+            },
+            on_attempt: {
+                let stats = self.stats.clone();
+                Arc::new(move || stats.record_udp_stagger_attempt())
+            },
+            on_winner: {
+                let stats = self.stats.clone();
+                Arc::new(move || stats.record_udp_stagger_winner())
+            },
+            on_cancellation: {
+                let stats = self.stats.clone();
+                Arc::new(move || stats.record_udp_stagger_cancellation())
+            },
+        };
+        let Some((node, prepared_transport)) =
+            prepare_udp_plan(plan_mode, plan.nodes, prepare, callbacks).await
+        else {
+            debug!(
+                "All UDP transport preparations failed for '{}'",
+                outbound_name
+            );
+            self.stats.record_error(&outbound_name);
+            return Ok(());
+        };
+
+        // The prepared winner is bound only after every speculative loser has
+        // been aborted/drained. Close the death-before-bind race again before
+        // creating any endpoint state or allowing the Task 3 driver to send.
+        if !lease.bind_selected_node(&node.name) {
+            return Err(anyhow::anyhow!(
+                "UDP initializer generation was cancelled before winner bind"
+            ));
+        }
+        if !lease.still_initializing()
+            || !self.group_manager.read().is_node_selectable_for_domain(
+                &node.name,
+                ProbeDomain::DataUdp,
+                scheduler_ipver,
+            )
+        {
+            lease.clear_selected_node();
+            return Err(anyhow::anyhow!(
+                "UDP winner '{}' became ineligible before endpoint setup",
+                node.name
+            ));
+        }
+        // Promotion is explicit and still pre-publication: detached AnyTLS
+        // sessions become generation-owned only for the finalized winner.
+        let transport = prepared_transport.commit()?;
+
+        // Both capacity (at reservation time) and anyfrom creation happen
+        // after the winner is finalized and before the only first send. Any
+        // failure is fail-closed; there is no listener-socket fallback.
+        let reply_ready_started = std::time::Instant::now();
+        let reply_socket = match self.udp_pool.create_reply_socket(original_dst) {
+            Ok(socket) => Arc::new(socket),
+            Err(error) => {
+                self.stats
+                    .record_udp_reply_ready_latency(reply_ready_started.elapsed());
+                self.stats.record_error(&outbound_name);
+                return Err(error.into());
             }
+        };
+        self.stats
+            .record_udp_reply_ready_latency(reply_ready_started.elapsed());
+
+        let relay_addr = transport.relay_addr();
+        let endpoint = Arc::new(UdpEndpoint::new(transport, relay_addr, node.name.clone()));
+        endpoint.record_pending_reply_peer(relay_addr);
+        endpoint.cache_routing_result(original_dst, outbound_index);
+
+        let conn_id = uuid::Uuid::new_v4().to_string();
+        let (rule, rule_payload) = matched_rule
+            .clone()
+            .unwrap_or_else(|| ("Fallback".to_string(), String::new()));
+        let chains = {
+            let gm = self.group_manager.read();
+            let mut chain = gm.selection_chain(&outbound_name);
+            if chain.last() != Some(&node.name) {
+                chain.push(node.name.clone());
+            }
+            chain.reverse();
+            chain
+        };
+        let (conn_upload, conn_download) = endpoint.byte_counters();
+        self.connection_tracker
+            .register(crate::connection_tracker::ConnectionEntry {
+                id: conn_id.clone(),
+                source: client_addr.to_string(),
+                destination: original_dst.to_string(),
+                proxy: node.name.clone(),
+                rule,
+                rule_payload,
+                chains,
+                upload: conn_upload,
+                download: conn_download,
+                start_time: std::time::Instant::now(),
+                domain: quic_domain.clone(),
+                network: "udp".to_string(),
+            });
+        endpoint.set_tracker(conn_id.clone());
+        if !lease.set_tracker_id(conn_id.clone()) {
+            // The generation was cancelled between route selection and
+            // registration. No pool entry owns this tracker, so retire it
+            // directly rather than leaking it.
+            self.connection_tracker.remove(&conn_id);
+            return Err(anyhow::anyhow!(
+                "UDP initializer generation was cancelled before tracker attachment"
+            ));
         }
 
-        if let Some(e) = last_err {
-            debug!("All {} UDP candidate(s) failed: {}", candidates.len(), e);
+        let queue_rx = lease.take_queue_receiver().ok_or_else(|| {
+            anyhow::anyhow!("UDP initializer lost its bounded queue before driver start")
+        })?;
+        let mut driver = self.udp_pool.spawn_driver(
+            client_addr,
+            original_dst,
+            lease.generation(),
+            Arc::clone(&endpoint),
+            queue_rx,
+            reply_socket,
+            self.alive_set.clone(),
+            self.stats.clone(),
+            outbound_name.clone(),
+        );
+        driver.wait_ready().await?;
+        if !lease.still_initializing() {
+            return Err(anyhow::anyhow!(
+                "UDP initializer generation was retired before ready commit"
+            ));
         }
-        self.stats.record_error(&outbound_name);
-        self.stats.record_close(&outbound_name);
+        if !lease.commit_ready(Arc::clone(&endpoint)) {
+            return Err(anyhow::anyhow!(
+                "UDP initializer generation was cancelled before ready commit"
+            ));
+        }
+        let first = lease.take_first().ok_or_else(|| {
+            anyhow::anyhow!("UDP initializer lost its first packet before driver start")
+        })?;
+        driver.start(first)?;
+        if let Err(error) = driver.wait_first_ack().await {
+            // PacketTransport Err and timeout are both ambiguous: the winner
+            // may have received data, so never replay this packet elsewhere.
+            self.stats.record_error(&outbound_name);
+            return Err(error.into());
+        }
+        debug!(
+            "Proxying UDP {} -> {} via {} (endpoint driver ready)",
+            client_addr, original_dst, node.name
+        );
         Ok(())
     }
 
@@ -1581,5 +1708,46 @@ pub(super) fn domain_reality_outcome(
                 RealityOutcome::Mismatch
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod cold_urltest_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test(start_paused = true)]
+    async fn cold_urltest_releases_candidates_progressively_and_cancels_waiters() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+        for index in 0..3 {
+            let started = Arc::clone(&started);
+            tasks.spawn(async move {
+                wait_for_cold_urltest_release(index).await;
+                started.fetch_add(1, Ordering::AcqRel);
+            });
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(
+            started.load(Ordering::Acquire),
+            1,
+            "only the first candidate is immediate"
+        );
+        tokio::time::advance(COLD_URLTEST_STAGGER).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            started.load(Ordering::Acquire),
+            2,
+            "the second candidate releases after one delay"
+        );
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        tokio::time::advance(COLD_URLTEST_STAGGER * 2).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            started.load(Ordering::Acquire),
+            2,
+            "cancelled unreleased candidate must not start"
+        );
     }
 }

@@ -570,11 +570,9 @@ impl AliveDialerSet {
         self.spawn_health_check_loop_concurrent(interval, timeout, 10)
     }
 
-    /// Spawn a health check loop with configurable concurrency.
-    ///
-    /// Uses `run_health_check_cycle_concurrent` with the given `concurrency`
-    /// for the periodic cycle. Emergency probes (triggered via `trigger_probe`)
-    /// are still handled inline without concurrency limiting.
+    /// Spawn periodic and emergency probes through one bounded worker pool.
+    /// Triggered work is node-deduplicated by `AliveDialerSet`, and periodic
+    /// cycles remain independent so a trigger storm cannot serialize them.
     pub fn spawn_health_check_loop_concurrent(
         self: &Arc<Self>,
         interval: Duration,
@@ -584,6 +582,7 @@ impl AliveDialerSet {
         let this = self.clone();
         let mut trigger_rx = self.take_trigger_rx();
         let concurrency = concurrency.max(1);
+        let mut emergency_workers = tokio::task::JoinSet::new();
         tokio::spawn(async move {
             // ── Anti-thundering-herd: stagger the first health check by a
             // random delay within [0, min(5s, interval/4)] to avoid all
@@ -600,15 +599,18 @@ impl AliveDialerSet {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
-                    _ = ticker.tick() => {
-                        this.run_health_check_cycle_concurrent(timeout, concurrency).await;
+                    biased;
+                    Some(result) = emergency_workers.join_next(), if !emergency_workers.is_empty() => {
+                        if let Err(error) = result {
+                            tracing::warn!(?error, "emergency health-check worker panicked");
+                        }
                     }
                     node = async {
                         match trigger_rx.as_mut() {
                             Some(rx) => rx.recv().await,
                             None => std::future::pending().await,
                         }
-                    } => {
+                    }, if emergency_workers.len() < concurrency => {
                         if let Some(id) = node {
                             {
                                 let mut states = this.states.write();
@@ -618,8 +620,15 @@ impl AliveDialerSet {
                                     }
                                 }
                             }
-                            this.probe_node(&id, timeout).await;
+                            let this = Arc::clone(&this);
+                            emergency_workers.spawn(async move {
+                                this.probe_node(&id, timeout).await;
+                                this.finish_trigger_probe(&id);
+                            });
                         }
+                    }
+                    _ = ticker.tick() => {
+                        this.run_health_check_cycle_concurrent(timeout, concurrency).await;
                     }
                 }
             }

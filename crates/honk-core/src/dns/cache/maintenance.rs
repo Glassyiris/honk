@@ -1,13 +1,14 @@
 use std::time::Instant;
 
-use super::{CacheValue, CachedEntry, DnsCacheService, lock};
+use super::{CacheSlot, CacheValue, CachedEntry, DnsCacheService, lock};
 
 impl DnsCacheService {
     pub fn clear_negative(&self, key: &str) {
-        let index = self.shard_index(key);
+        let key = CacheSlot::Legacy(key.to_owned());
+        let index = self.shard_index(&key);
         let mut shard = lock(&self.shards[index]);
-        if matches!(shard.peek(key), Some(CacheValue::Negative { .. })) {
-            shard.pop(key);
+        if matches!(shard.peek(&key), Some(CacheValue::Negative { .. })) {
+            shard.pop(&key);
         }
     }
 
@@ -15,7 +16,7 @@ impl DnsCacheService {
         let now = Instant::now();
         for shard in &self.shards {
             let mut shard = lock(shard);
-            let expired: Vec<String> = shard
+            let expired: Vec<CacheSlot> = shard
                 .iter()
                 .filter_map(|(key, value)| match value {
                     CacheValue::Negative { expires_at, .. } if now >= *expires_at => {
@@ -39,7 +40,7 @@ impl DnsCacheService {
     pub fn purge_expired(&self) {
         for shard in &self.shards {
             let mut shard = lock(shard);
-            let expired: Vec<String> = shard
+            let expired: Vec<CacheSlot> = shard
                 .iter()
                 .filter_map(|(key, value)| match value {
                     CacheValue::Positive(entry) if entry.is_expired() => Some(key.clone()),
@@ -54,8 +55,9 @@ impl DnsCacheService {
     }
 
     pub fn remove(&self, key: &str) -> Option<CachedEntry> {
-        let index = self.shard_index(key);
-        match lock(&self.shards[index]).pop(key) {
+        let key = CacheSlot::Legacy(key.to_owned());
+        let index = self.shard_index(&key);
+        match lock(&self.shards[index]).pop(&key) {
             Some(CacheValue::Positive(entry)) => Some(entry),
             Some(CacheValue::Negative { .. }) | None => None,
         }
@@ -69,11 +71,17 @@ impl DnsCacheService {
         self.shards.iter().all(|shard| lock(shard).is_empty())
     }
 
-    pub(super) fn shard_index(&self, key: &str) -> usize {
-        let digest = super::key::stable_shard_digest(key);
-        let hash = u64::from_be_bytes([
-            digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
-        ]);
+    pub(super) fn shard_index(&self, key: &CacheSlot) -> usize {
+        let hash = match key {
+            CacheSlot::Exact(key) => key.shard_hash(),
+            CacheSlot::Legacy(key) => {
+                let digest = super::key::stable_shard_digest(key);
+                u64::from_be_bytes([
+                    digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6],
+                    digest[7],
+                ])
+            }
+        };
         usize::try_from(hash % u64::try_from(self.shards.len()).unwrap_or(1)).unwrap_or_default()
     }
 

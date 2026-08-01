@@ -161,6 +161,7 @@ pub(super) async fn publish_snapshot_forwarder(
         routing_projection: Arc::clone(current.runtime().routing_projection()),
         cache: forwarder.cache(),
         persistence: Arc::clone(current.runtime().persistence()),
+        outbound_runtime: None,
         transport: Arc::new(NoopRuntimeTransport),
     });
     drop(current);

@@ -60,12 +60,9 @@ pub struct RealEbpfBackend {
     /// Additional egress links for bond slaves. Outbound packets leaving a bond
     /// slave may bypass the master's egress qdisc, so attach wan_egress there too.
     wan_slave_links: Vec<aya::programs::tc::SchedClassifierLink>,
-    /// Additional ingress/egress links for bridge slaves. Linux bridge masters
-    /// do not see forwarded L2 traffic on their TC hooks, so we attach the LAN
-    /// programs to each slave veth instead.
-    bridge_slave_links: Vec<aya::programs::tc::SchedClassifierLink>,
-    /// Links installed by dynamic attach (extra startup interfaces and the
-    /// interface watcher), keyed by (ifindex, is_egress).  Keeping them here
+    /// Links installed by dynamic attach (startup bridge slaves, extra
+    /// startup interfaces, and the interface watcher), keyed by (ifindex,
+    /// is_egress).  Keeping them here
     /// serves three purposes: the fd stays alive until `detach_hooks`, the
     /// watcher can drop dead links when a device vanishes, and the (ifindex,
     /// direction) pair dedupes retries after a partial failure.
@@ -262,6 +259,47 @@ impl RealEbpfBackend {
         Ok(())
     }
 
+    /// Visit a hash-family map in chunks. Kernels with LOOKUP_BATCH stream
+    /// directly from the map; the legacy fallback preserves compatibility.
+    fn for_each_map_chunk<K: Copy, V: Copy>(
+        &self,
+        map: &str,
+        chunk_size: usize,
+        visit: &mut dyn FnMut(&[(K, V)]) -> bool,
+    ) -> anyhow::Result<()> {
+        let bpf = self.bpf()?;
+        if bpf_lookup_batch_scan_cb(bpf, &self.cap_lookup_batch, map, visit)? {
+            return Ok(());
+        }
+        // Old kernels lack LOOKUP_BATCH. Avoid the snapshot helper here:
+        // it would allocate one entry per map element and defeat the janitor
+        // memory bound.
+        let mut chunk = Vec::with_capacity(chunk_size.max(1));
+        for kb in bpf_map_keys(bpf, map, core::mem::size_of::<K>())? {
+            let mut value = core::mem::MaybeUninit::<V>::uninit();
+            let buf = unsafe {
+                core::slice::from_raw_parts_mut(
+                    value.as_mut_ptr() as *mut u8,
+                    core::mem::size_of::<V>(),
+                )
+            };
+            if bpf_hash_lookup(bpf, map, &kb, buf)?.is_some() {
+                let key = unsafe { core::ptr::read_unaligned(kb.as_ptr() as *const K) };
+                chunk.push((key, unsafe { value.assume_init() }));
+                if chunk.len() == chunk_size.max(1) {
+                    if !visit(&chunk) {
+                        return Ok(());
+                    }
+                    chunk.clear();
+                }
+            }
+        }
+        if !chunk.is_empty() {
+            visit(&chunk);
+        }
+        Ok(())
+    }
+
     /// Delete multiple keys from a hash-family map, preferring
     /// `BPF_MAP_DELETE_BATCH` and falling back to per-key deletes.
     fn map_delete_batch<K: Copy>(&mut self, map: &str, keys: &[K]) -> anyhow::Result<()> {
@@ -352,11 +390,9 @@ impl EbpfBackend for RealEbpfBackend {
         Ok(None)
     }
 
-    fn set_routing_rules(&mut self, rules: &[MatchSet]) -> anyhow::Result<()> {
-        // One BPF_MAP_UPDATE_BATCH syscall for the whole rule array when
-        // the kernel supports it (5.6+); the keys are contiguous u32
-        // indices.  Falls back to per-element updates otherwise.
-        let keys: Vec<u32> = (0..rules.len() as u32).collect();
+    fn set_routing_rules(&mut self, generation: u32, rules: &[MatchSet]) -> anyhow::Result<()> {
+        let base = generation * MAX_MATCH_SET_LEN;
+        let keys: Vec<u32> = (base..base + rules.len() as u32).collect();
         if bpf_update_batch(
             self.bpf()?,
             &self.cap_update_batch,
@@ -366,41 +402,37 @@ impl EbpfBackend for RealEbpfBackend {
         )? {
             return Ok(());
         }
-        for (i, r) in rules.iter().enumerate() {
-            self.array_set("ROUTING_MAP", i as u32, r)?;
+        for (i, rule) in rules.iter().enumerate() {
+            self.array_set("ROUTING_MAP", base + i as u32, rule)?;
         }
         Ok(())
     }
-    fn set_routing_meta(
+
+    fn active_routing_generation(&self) -> anyhow::Result<u32> {
+        Ok(self
+            .array_get::<u32>("ROUTING_META_MAP", ROUTING_META_ACTIVE_GENERATION_SLOT)?
+            .unwrap_or(0))
+    }
+    fn publish_routing_generation(
         &mut self,
+        generation: u32,
         count: u32,
         group_bitmaps: &RoutingGroupBitmaps,
     ) -> anyhow::Result<()> {
-        // Flatten the meta block and publish it in one
-        // BPF_MAP_UPDATE_BATCH syscall when the kernel supports it.
-        // Slot 0 (the rule count) is the two-phase commit's atomic
-        // switch: it is ordered LAST so the datapath never sees a new
-        // count with stale group bitmaps.
-        let mut keys: Vec<u32> = (1..ROUTING_META_MAP_LEN as u32).collect();
-        keys.push(0);
-        let mut values: Vec<u32> = Vec::with_capacity(ROUTING_META_MAP_LEN);
-        for words in group_bitmaps.iter() {
+        let base = routing_meta_generation_base(generation);
+        let mut values = Vec::with_capacity(ROUTING_META_GENERATION_STRIDE);
+        values.push(count);
+        for words in group_bitmaps {
             values.extend_from_slice(words);
         }
-        values.push(count);
-        if bpf_update_batch(
-            self.bpf()?,
-            &self.cap_update_batch,
+        for (offset, value) in values.iter().enumerate() {
+            self.array_set("ROUTING_META_MAP", base + offset as u32, value)?;
+        }
+        self.array_set(
             "ROUTING_META_MAP",
-            &keys,
-            &values,
-        )? {
-            return Ok(());
-        }
-        for (k, v) in keys.iter().zip(values.iter()) {
-            self.array_set("ROUTING_META_MAP", *k, v)?;
-        }
-        Ok(())
+            ROUTING_META_ACTIVE_GENERATION_SLOT,
+            &generation,
+        )
     }
 
     fn add_domain_route(&mut self, domain: &str, outbound: OutboundIndex) -> anyhow::Result<()> {
@@ -419,8 +451,9 @@ impl EbpfBackend for RealEbpfBackend {
             };
         let ob = outbound as u32;
         let wi = (ob / 32) as usize;
-        if wi < cur.bitmap.len() {
-            cur.bitmap[wi] |= 1 << (ob % 32);
+        if wi < ROUTING_BITMAP_WORDS_PER_GENERATION {
+            let generation = self.active_routing_generation()? as usize;
+            cur.bitmap[generation * ROUTING_BITMAP_WORDS_PER_GENERATION + wi] |= 1 << (ob % 32);
         }
         bpf_hash_insert(self.bpf_mut()?, "DOMAIN_ROUTING_MAP", key_bytes, unsafe {
             as_bytes(&cur)
@@ -432,19 +465,35 @@ impl EbpfBackend for RealEbpfBackend {
         key: &LpmKey,
         bm: &DomainRouting,
     ) -> anyhow::Result<()> {
-        Self::or_update_bitmap(self.bpf_mut()?, "DOMAIN_ROUTING_MAP", key, bm)
+        let bitmap = bm.for_generation(self.active_routing_generation()?);
+        Self::or_update_bitmap(self.bpf_mut()?, "DOMAIN_ROUTING_MAP", key, &bitmap)
     }
 
     fn add_dest_lpm_bitmap(&mut self, key: &LpmKey, bm: &DomainRouting) -> anyhow::Result<()> {
-        Self::or_update_bitmap(self.bpf_mut()?, "DEST_LPM_ROUTING_MAP", key, bm)
+        bpf_hash_insert(
+            self.bpf_mut()?,
+            "DEST_LPM_ROUTING_MAP",
+            unsafe { as_bytes(key) },
+            unsafe { as_bytes(bm) },
+        )
     }
 
     fn add_source_lpm_bitmap(&mut self, key: &LpmKey, bm: &DomainRouting) -> anyhow::Result<()> {
-        Self::or_update_bitmap(self.bpf_mut()?, "SOURCE_LPM_ROUTING_MAP", key, bm)
+        bpf_hash_insert(
+            self.bpf_mut()?,
+            "SOURCE_LPM_ROUTING_MAP",
+            unsafe { as_bytes(key) },
+            unsafe { as_bytes(bm) },
+        )
     }
 
     fn add_mac_lpm_bitmap(&mut self, key: &LpmKey, bm: &DomainRouting) -> anyhow::Result<()> {
-        Self::or_update_bitmap(self.bpf_mut()?, "MAC_LPM_ROUTING_MAP", key, bm)
+        bpf_hash_insert(
+            self.bpf_mut()?,
+            "MAC_LPM_ROUTING_MAP",
+            unsafe { as_bytes(key) },
+            unsafe { as_bytes(bm) },
+        )
     }
 
     fn add_domain_ip_bitmap(
@@ -452,10 +501,9 @@ impl EbpfBackend for RealEbpfBackend {
         ip_key: &LpmKey,
         bitmap: &DomainRouting,
     ) -> anyhow::Result<()> {
-        // DOMAIN_ROUTING_MAP is a HashMap<[__be32; 4], DomainRouting>; only the
-        // 16-byte IP data is the key, not the full 20-byte LpmKey.
+        let bitmap = bitmap.for_generation(self.active_routing_generation()?);
         let key_bytes = unsafe { as_bytes(&ip_key.data) };
-        Self::or_update_bitmap_raw(self.bpf_mut()?, "DOMAIN_ROUTING_MAP", key_bytes, bitmap)
+        Self::or_update_bitmap_raw(self.bpf_mut()?, "DOMAIN_ROUTING_MAP", key_bytes, &bitmap)
     }
 
     fn set_domain_ip_bitmap(
@@ -463,14 +511,30 @@ impl EbpfBackend for RealEbpfBackend {
         ip_key: &LpmKey,
         bitmap: &DomainRouting,
     ) -> Result<(), super::DomainRouteWriteError> {
-        // Overwrite (not OR) so bitmaps from previous rule generations are
-        // fully replaced.  Key is the 16-byte IP data, as in add_domain_ip_bitmap.
+        let generation = self
+            .active_routing_generation()
+            .map_err(super::DomainRouteWriteError::Other)?;
         let key_bytes = unsafe { as_bytes(&ip_key.data) };
+        let mut buf = vec![0u8; core::mem::size_of::<DomainRouting>()];
+        let mut current = match bpf_hash_lookup(
+            self.bpf().map_err(super::DomainRouteWriteError::Other)?,
+            "DOMAIN_ROUTING_MAP",
+            key_bytes,
+            &mut buf,
+        )
+        .map_err(super::DomainRouteWriteError::Other)?
+        {
+            Some(()) => unsafe { from_bytes::<DomainRouting>(&buf) },
+            None => DomainRouting::default(),
+        };
+        let offset = generation as usize * ROUTING_BITMAP_WORDS_PER_GENERATION;
+        current.bitmap[offset..offset + ROUTING_BITMAP_WORDS_PER_GENERATION]
+            .copy_from_slice(&bitmap.bitmap[..ROUTING_BITMAP_WORDS_PER_GENERATION]);
         let bpf = self
             .bpf_mut()
             .map_err(super::DomainRouteWriteError::Other)?;
         bpf_hash_insert_domain(bpf, "DOMAIN_ROUTING_MAP", key_bytes, unsafe {
-            as_bytes(bitmap)
+            as_bytes(&current)
         })
     }
 
@@ -478,25 +542,87 @@ impl EbpfBackend for RealEbpfBackend {
         &mut self,
         ip_key: &LpmKey,
     ) -> Result<(), super::DomainRouteWriteError> {
+        let generation = self
+            .active_routing_generation()
+            .map_err(super::DomainRouteWriteError::Other)?;
         let key_bytes = unsafe { as_bytes(&ip_key.data) };
+        let mut buf = vec![0u8; core::mem::size_of::<DomainRouting>()];
+        let Some(()) = bpf_hash_lookup(
+            self.bpf().map_err(super::DomainRouteWriteError::Other)?,
+            "DOMAIN_ROUTING_MAP",
+            key_bytes,
+            &mut buf,
+        )
+        .map_err(super::DomainRouteWriteError::Other)?
+        else {
+            return Ok(());
+        };
+        let mut bitmap = unsafe { from_bytes::<DomainRouting>(&buf) };
+        let offset = generation as usize * ROUTING_BITMAP_WORDS_PER_GENERATION;
+        bitmap.bitmap[offset..offset + ROUTING_BITMAP_WORDS_PER_GENERATION].fill(0);
         let bpf = self
             .bpf_mut()
             .map_err(super::DomainRouteWriteError::Other)?;
-        bpf_hash_delete(bpf, "DOMAIN_ROUTING_MAP", key_bytes)
-            .map_err(super::DomainRouteWriteError::Other)
+        if bitmap.bitmap.iter().all(|word| *word == 0) {
+            bpf_hash_delete(bpf, "DOMAIN_ROUTING_MAP", key_bytes)
+                .map_err(super::DomainRouteWriteError::Other)
+        } else {
+            bpf_hash_insert_domain(bpf, "DOMAIN_ROUTING_MAP", key_bytes, unsafe {
+                as_bytes(&bitmap)
+            })
+        }
+    }
+
+    fn stage_domain_routing_generation(
+        &mut self,
+        generation: u32,
+        entries: &[(LpmKey, DomainRouting)],
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            generation < ROUTING_BITMAP_GENERATIONS as u32,
+            "invalid routing generation {generation}"
+        );
+        let offset = generation as usize * ROUTING_BITMAP_WORDS_PER_GENERATION;
+        let keys = self.collect_keys("DOMAIN_ROUTING_MAP", core::mem::size_of::<[u32; 4]>())?;
+        for key in keys {
+            let mut buf = vec![0u8; core::mem::size_of::<DomainRouting>()];
+            let Some(()) = bpf_hash_lookup(self.bpf()?, "DOMAIN_ROUTING_MAP", &key, &mut buf)?
+            else {
+                continue;
+            };
+            let mut bitmap = unsafe { from_bytes::<DomainRouting>(&buf) };
+            bitmap.bitmap[offset..offset + ROUTING_BITMAP_WORDS_PER_GENERATION].fill(0);
+            bpf_hash_insert(self.bpf_mut()?, "DOMAIN_ROUTING_MAP", &key, unsafe {
+                as_bytes(&bitmap)
+            })?;
+        }
+        for (key, logical) in entries {
+            let key_bytes = unsafe { as_bytes(&key.data) };
+            let mut buf = vec![0u8; core::mem::size_of::<DomainRouting>()];
+            let mut bitmap =
+                match bpf_hash_lookup(self.bpf()?, "DOMAIN_ROUTING_MAP", key_bytes, &mut buf)? {
+                    Some(()) => unsafe { from_bytes::<DomainRouting>(&buf) },
+                    None => DomainRouting::default(),
+                };
+            bitmap.bitmap[offset..offset + ROUTING_BITMAP_WORDS_PER_GENERATION]
+                .copy_from_slice(&logical.bitmap[..ROUTING_BITMAP_WORDS_PER_GENERATION]);
+            bpf_hash_insert(self.bpf_mut()?, "DOMAIN_ROUTING_MAP", key_bytes, unsafe {
+                as_bytes(&bitmap)
+            })?;
+        }
+        Ok(())
     }
 
     fn add_ip_route(&mut self, prefix: &str, outbound: OutboundIndex) -> anyhow::Result<()> {
         let lk = maps::cidr_to_lpm_key(prefix)?;
-        let mut b = [0u32; 4];
+        let mut routing = DomainRouting::default();
         let ob = outbound as u32;
         let wi = (ob / 32) as usize;
-        if wi < 4 {
-            b[wi] = 1 << (ob % 32);
+        if wi < ROUTING_BITMAP_WORDS_PER_GENERATION {
+            routing.bitmap[wi] = 1 << (ob % 32);
         }
-        // DOMAIN_ROUTING_MAP key is the 16-byte IP data, not the 20-byte LpmKey.
+        let routing = routing.for_generation(self.active_routing_generation()?);
         let key_bytes = unsafe { as_bytes(&lk.data) };
-        let routing = DomainRouting { bitmap: b };
         bpf_hash_insert(self.bpf_mut()?, "DOMAIN_ROUTING_MAP", key_bytes, unsafe {
             as_bytes(&routing)
         })
@@ -504,7 +630,7 @@ impl EbpfBackend for RealEbpfBackend {
 
     fn clear_routes(&mut self) -> anyhow::Result<()> {
         let d = MatchSet::default();
-        for i in 0..MAX_MATCH_SET_LEN {
+        for i in 0..ROUTING_MAP_LEN as u32 {
             let _ = self.array_set("ROUTING_MAP", i, &d);
         }
         for i in 0..ROUTING_META_MAP_LEN as u32 {
@@ -663,6 +789,30 @@ impl EbpfBackend for RealEbpfBackend {
         self.map_snapshot("REDIRECT_TRACK", out)
     }
 
+    fn redirect_track_for_each_chunk(
+        &self,
+        chunk_size: usize,
+        visit: &mut crate::ebpf::RedirectTrackChunkVisitor<'_>,
+    ) -> anyhow::Result<()> {
+        self.for_each_map_chunk("REDIRECT_TRACK", chunk_size, visit)
+    }
+
+    fn cookie_pid_for_each_chunk(
+        &self,
+        chunk_size: usize,
+        visit: &mut crate::ebpf::CookiePidChunkVisitor<'_>,
+    ) -> anyhow::Result<()> {
+        self.for_each_map_chunk("COOKIE_PID_MAP", chunk_size, visit)
+    }
+
+    fn routing_handoff_for_each_chunk(
+        &self,
+        chunk_size: usize,
+        visit: &mut crate::ebpf::RoutingHandoffChunkVisitor<'_>,
+    ) -> anyhow::Result<()> {
+        self.for_each_map_chunk("ROUTING_HANDOFF_MAP", chunk_size, visit)
+    }
+
     fn conn_state_snapshot(&self, out: &mut Vec<(TuplesKey, ConnState)>) -> anyhow::Result<()> {
         self.map_snapshot("CONN_STATE_MAP", out)
     }
@@ -682,7 +832,9 @@ impl EbpfBackend for RealEbpfBackend {
         let mut entries = Vec::new();
         self.map_snapshot("CONN_STATE_MAP", &mut entries)?;
         for chunk in entries.chunks(chunk_size.max(1)) {
-            visit(chunk);
+            if !visit(chunk) {
+                break;
+            }
         }
         Ok(())
     }
@@ -743,6 +895,90 @@ impl EbpfBackend for RealEbpfBackend {
         self.map_delete_batch("ROUTING_HANDOFF_MAP", keys)
     }
 
+    fn conn_state_remove_if_unchanged(
+        &mut self,
+        entries: &[(TuplesKey, ConnState)],
+        expired_before_ns: u64,
+    ) -> anyhow::Result<u64> {
+        let mut removed = 0;
+        for (key, scanned) in entries {
+            if self
+                .hash_lookup::<_, ConnState>("CONN_STATE_MAP", key)?
+                .is_some_and(|current| {
+                    current.last_seen_ns == scanned.last_seen_ns
+                        && current.last_seen_ns <= expired_before_ns
+                })
+            {
+                self.hash_remove("CONN_STATE_MAP", key)?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    fn redirect_track_remove_if_unchanged(
+        &mut self,
+        entries: &[(RedirectTuple, RedirectEntry)],
+        expired_before_ns: u64,
+    ) -> anyhow::Result<u64> {
+        let mut removed = 0;
+        for (key, scanned) in entries {
+            if self
+                .hash_lookup::<_, RedirectEntry>("REDIRECT_TRACK", key)?
+                .is_some_and(|current| {
+                    current.last_seen_ns == scanned.last_seen_ns
+                        && current.last_seen_ns <= expired_before_ns
+                })
+            {
+                self.hash_remove("REDIRECT_TRACK", key)?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    fn cookie_pid_remove_if_unchanged(
+        &mut self,
+        entries: &[(u64, PidPname)],
+        expired_before_ns: u64,
+    ) -> anyhow::Result<u64> {
+        let mut removed = 0;
+        for (cookie, scanned) in entries {
+            if self
+                .hash_lookup::<_, PidPname>("COOKIE_PID_MAP", cookie)?
+                .is_some_and(|current| {
+                    current.last_seen_ns == scanned.last_seen_ns
+                        && current.last_seen_ns <= expired_before_ns
+                })
+            {
+                self.hash_remove("COOKIE_PID_MAP", cookie)?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    fn routing_handoff_remove_if_unchanged(
+        &mut self,
+        entries: &[(TuplesKey, RoutingHandoffEntry)],
+        expired_before_ns: u64,
+    ) -> anyhow::Result<u64> {
+        let mut removed = 0;
+        for (key, scanned) in entries {
+            if self
+                .hash_lookup::<_, RoutingHandoffEntry>("ROUTING_HANDOFF_MAP", key)?
+                .is_some_and(|current| {
+                    current.last_seen_ns == scanned.last_seen_ns
+                        && current.last_seen_ns <= expired_before_ns
+                })
+            {
+                self.hash_remove("ROUTING_HANDOFF_MAP", key)?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
     fn set_outbound_alive(&mut self, o: u8, d: u32, ip: u32, alive: bool) -> anyhow::Result<()> {
         let k = conn_key(o, d, ip);
         let v: u64 = if alive { 1 } else { 0 };
@@ -777,21 +1013,20 @@ impl EbpfBackend for RealEbpfBackend {
         }
         let o = o as u8;
         let mut stats = OutboundStats::default();
-        for (counter, slot) in [
-            (OUTBOUND_STATS_TX_PACKETS, &mut stats.tx_packets),
-            (OUTBOUND_STATS_TX_BYTES, &mut stats.tx_bytes),
-            (OUTBOUND_STATS_RX_PACKETS, &mut stats.rx_packets),
-            (OUTBOUND_STATS_RX_BYTES, &mut stats.rx_bytes),
-        ] {
-            // Per-CPU array: BPF_MAP_LOOKUP_ELEM returns one u64 slot per
-            // possible CPU; aggregate them here.
-            let ncpu = possible_cpus();
-            let mut buf = vec![0u8; ncpu * 8];
-            let idx = outbound_stats_index(o, counter);
-            if let Some(()) =
-                bpf_hash_lookup(bpf, "OUTBOUND_STATS", unsafe { as_bytes(&idx) }, &mut buf)?
-            {
-                *slot = sum_percpu_u64(&buf, ncpu);
+        let ncpu = possible_cpus();
+        let mut buf = vec![0u8; ncpu * core::mem::size_of::<OutboundStatsCounters>()];
+        let idx = OutboundStatsCounters::for_outbound(o as u8);
+        if let Some(()) =
+            bpf_hash_lookup(bpf, "OUTBOUND_STATS", unsafe { as_bytes(&idx) }, &mut buf)?
+        {
+            for cpu in buf.chunks_exact(core::mem::size_of::<OutboundStatsCounters>()) {
+                let counters = unsafe {
+                    core::ptr::read_unaligned(cpu.as_ptr().cast::<OutboundStatsCounters>())
+                };
+                stats.tx_packets = stats.tx_packets.wrapping_add(counters.tx_packets);
+                stats.tx_bytes = stats.tx_bytes.wrapping_add(counters.tx_bytes);
+                stats.rx_packets = stats.rx_packets.wrapping_add(counters.rx_packets);
+                stats.rx_bytes = stats.rx_bytes.wrapping_add(counters.rx_bytes);
             }
         }
         Ok(stats)
@@ -800,21 +1035,14 @@ impl EbpfBackend for RealEbpfBackend {
         if self.bpf()?.map("OUTBOUND_STATS").is_none() {
             return Ok(());
         }
-        let zeros = vec![0u8; possible_cpus() * 8];
-        for counter in [
-            OUTBOUND_STATS_TX_PACKETS,
-            OUTBOUND_STATS_TX_BYTES,
-            OUTBOUND_STATS_RX_PACKETS,
-            OUTBOUND_STATS_RX_BYTES,
-        ] {
-            let idx = outbound_stats_index(o as u8, counter);
-            bpf_hash_insert(
-                self.bpf_mut()?,
-                "OUTBOUND_STATS",
-                unsafe { as_bytes(&idx) },
-                &zeros,
-            )?;
-        }
+        let zeros = vec![0u8; possible_cpus() * core::mem::size_of::<OutboundStatsCounters>()];
+        let idx = OutboundStatsCounters::for_outbound(o as u8);
+        bpf_hash_insert(
+            self.bpf_mut()?,
+            "OUTBOUND_STATS",
+            unsafe { as_bytes(&idx) },
+            &zeros,
+        )?;
         Ok(())
     }
     fn get_bpf_stats(&self, k: u32) -> anyhow::Result<Option<u64>> {
@@ -843,7 +1071,6 @@ impl EbpfBackend for RealEbpfBackend {
         self.wan_ingress_link = None;
         self.lan_slave_links.clear();
         self.wan_slave_links.clear();
-        self.bridge_slave_links.clear();
         self.dynamic_links.clear();
         self.dae0_ingress_link = None;
         self.dae0peer_ingress_link = None;
@@ -975,18 +1202,21 @@ impl EbpfBackend for RealEbpfBackend {
         &mut self,
         tcp4_fd: RawFd,
         tcp6_fd: RawFd,
-        udp4_fd: RawFd,
-        udp6_fd: RawFd,
+        udp4_fds: &[RawFd],
+        udp6_fds: &[RawFd],
     ) -> anyhow::Result<()> {
-        // Publish all four listener FDs so the sk_lookup program can
-        // `bpf_sk_assign` proxy-bound flows to the correct TPROXY socket.
-        // Key mapping: 0=tcp4, 1=udp4, 2=tcp6, 3=udp6.
-        let entries = [
-            (0u32, tcp4_fd),
-            (1u32, udp4_fd),
-            (2u32, tcp6_fd),
-            (3u32, udp6_fd),
-        ];
+        // Publish the listener FDs so the sk_lookup/dae0peer programs can
+        // `bpf_sk_assign` proxy-bound flows. Key mapping: 0=tcp4, 1=tcp6,
+        // 2..=UDP4 group, 2+4..=UDP6 group (see sk_lookup.rs). The programs
+        // hash the flow tuple into the group, so each socket must sit at its
+        // exact slot.
+        let mut entries = vec![(0u32, tcp4_fd), (1u32, tcp6_fd)];
+        for (i, fd) in udp4_fds.iter().enumerate() {
+            entries.push((2 + i as u32, *fd));
+        }
+        for (i, fd) in udp6_fds.iter().enumerate() {
+            entries.push((6 + i as u32, *fd));
+        }
         for (key, fd) in entries {
             // SockMap expects a 4-byte socket FD as the value, not an 8-byte pointer.
             let fd_u32 = fd as u32;

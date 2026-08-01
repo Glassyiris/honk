@@ -18,6 +18,9 @@ pub struct DialContext {
 #[derive(Clone)]
 pub struct ProxyDial {
     pub registry: Arc<ProxyRegistry>,
+    /// Immutable outbound generation captured by the owning DNS runtime.
+    /// Legacy unit-test pools may omit it and use the node path directly.
+    pub generation: Option<Arc<honk_outbound::runtime::OutboundRuntimeRegistry>>,
     pub node: Node,
 }
 
@@ -68,11 +71,24 @@ impl DialContext {
     pub async fn dial_tcp_boxed(&self) -> anyhow::Result<Box<dyn crate::proxy::AsyncReadWrite>> {
         if let Some(proxy) = &self.proxy {
             let addr = self.endpoint.resolve_addr().await?;
-            let ps = proxy
-                .registry
-                .dial(&proxy.node, addr, None, self.dial_timeout)
-                .await
-                .map_err(|e| anyhow::anyhow!("proxy dial for DNS upstream: {e}"))?;
+            let ps = if let Some(generation) = &proxy.generation {
+                let runtime = generation.get(&proxy.node.id).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "DNS proxy node {} is absent from its runtime generation",
+                        proxy.node.id
+                    )
+                })?;
+                proxy
+                    .registry
+                    .dial_runtime(runtime, addr, None, self.dial_timeout)
+                    .await
+            } else {
+                proxy
+                    .registry
+                    .dial(&proxy.node, addr, None, self.dial_timeout)
+                    .await
+            }
+            .map_err(|e| anyhow::anyhow!("proxy dial for DNS upstream: {e}"))?;
             return Ok(ps.stream);
         }
         let stream = self.dial_tcp().await?;

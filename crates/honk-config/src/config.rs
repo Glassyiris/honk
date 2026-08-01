@@ -106,6 +106,10 @@ pub struct GlobalConfig {
     /// Number of proxy nodes to preconnect on startup (0 = auto: min(nodes, 8)).
     #[serde(default = "default_preconnect_node_count")]
     pub preconnect_node_count: usize,
+    /// Number of selected UDP nodes to warm on startup/reload. Zero strictly
+    /// disables this independent warm-up path.
+    #[serde(default = "default_udp_warm_node_count")]
+    pub udp_warm_node_count: usize,
 }
 
 fn default_tproxy_port() -> u16 {
@@ -254,6 +258,9 @@ fn default_relay_idle_timeout_secs() -> u64 {
 fn default_preconnect_node_count() -> usize {
     0
 }
+fn default_udp_warm_node_count() -> usize {
+    0
+}
 
 impl Default for GlobalConfig {
     fn default() -> Self {
@@ -292,6 +299,7 @@ impl Default for GlobalConfig {
             dns_resolve_timeout_ms: default_dns_resolve_timeout_ms(),
             relay_idle_timeout_secs: default_relay_idle_timeout_secs(),
             preconnect_node_count: default_preconnect_node_count(),
+            udp_warm_node_count: default_udp_warm_node_count(),
         }
     }
 }

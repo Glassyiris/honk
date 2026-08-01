@@ -18,13 +18,14 @@ use honk_core::dns::forwarder::build_dns_query;
 use honk_core::dns::routing::DnsRouter;
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
 use tokio::runtime::Runtime;
-use tokio::sync::Mutex;
+use tokio::sync::Barrier;
 
 #[path = "fixtures.rs"]
 mod fixtures;
 
 #[global_allocator]
 static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
+const CACHE_OPS_PER_TASK: usize = 256;
 
 pub(super) fn bench_typed_key_build(c: &mut Criterion) {
     let query = build_dns_query("www.example.com", 1);
@@ -48,54 +49,69 @@ pub(super) fn bench_policy_evaluation(c: &mut Criterion) {
 pub(super) fn bench_cache_concurrency(c: &mut Criterion) {
     let runtime = Runtime::new().expect("benchmark runtime");
     let response = build_dns_query("hot.example", 1);
-    let mut group = c.benchmark_group("dns_cache_tasks");
+    let mut group = c.benchmark_group("dns_cache_concurrency");
     for tasks in [1_usize, 16, 64] {
-        for hit in [true, false] {
-            let label = if hit { "hit" } else { "miss" };
-            let keys = Arc::new(
-                (0..tasks)
-                    .map(|index| format!("{label}-{index}"))
-                    .collect::<Vec<_>>(),
-            );
-            let caches = Arc::new(
-                (0..tasks)
-                    .map(|_| Arc::new(Mutex::new(DnsCache::new(1))))
-                    .collect::<Vec<_>>(),
-            );
-            if hit {
-                runtime.block_on(async {
-                    for (cache, key) in caches.iter().zip(keys.iter()) {
-                        cache.lock().await.put(key.clone(), response.clone(), 300);
-                    }
-                });
+        for scenario in ["same_key", "same_shard", "different_shards", "read_write"] {
+            let cache = Arc::new(DnsCache::new(4_096));
+            let keys = benchmark_keys(&cache, tasks, scenario);
+            for key in &keys {
+                cache.benchmark_put(key.clone(), response.clone(), 300);
             }
-            group.throughput(Throughput::Elements(tasks as u64));
+            group.throughput(Throughput::Elements((tasks * CACHE_OPS_PER_TASK) as u64));
             group.bench_with_input(
-                BenchmarkId::new(label, tasks),
-                &(tasks, hit),
-                |b, &(tasks, _)| {
-                    b.to_async(&runtime).iter(|| async {
-                        let operations = (0..tasks).map(|index| {
-                            let cache = Arc::clone(&caches[index]);
-                            let keys = Arc::clone(&keys);
-                            async move { cache.lock().await.get(&keys[index]) }
+                BenchmarkId::new(scenario, tasks),
+                &(Arc::clone(&cache), keys, response.clone()),
+                |b, (cache, keys, response)| {
+                    b.to_async(&runtime).iter(|| {
+                        let barrier = Arc::new(Barrier::new(tasks));
+                        let operations = (0..tasks).map(move |index| {
+                            let cache = Arc::clone(cache);
+                            let barrier = Arc::clone(&barrier);
+                            let key = keys[index].clone();
+                            let response = response.clone();
+                            tokio::spawn(async move {
+                                barrier.wait().await;
+                                let mut hits = 0usize;
+                                for _ in 0..CACHE_OPS_PER_TASK {
+                                    if scenario == "read_write" && index % 2 == 1 {
+                                        cache.benchmark_put(key.clone(), response.clone(), 300);
+                                    } else {
+                                        hits += usize::from(cache.benchmark_get(&key).is_some());
+                                    }
+                                }
+                                hits
+                            })
                         });
-                        black_box(join_all(operations).await);
+                        async move { black_box(join_all(operations).await) }
                     });
                 },
             );
-            if hit && tasks == 64 {
-                group.bench_function(BenchmarkId::new("hit_sequential", tasks), |b| {
-                    b.to_async(&runtime).iter(|| async {
-                        for index in 0..tasks {
-                            black_box(caches[index].lock().await.get(&keys[index]));
-                        }
-                    });
-                });
-            }
         }
     }
     group.finish();
+}
+
+fn benchmark_keys(cache: &DnsCache, tasks: usize, scenario: &str) -> Vec<String> {
+    let mut by_shard: [Vec<String>; 16] = std::array::from_fn(|_| Vec::new());
+    for index in 0..20_000 {
+        let key = format!("{scenario}-{index}");
+        let shard = cache.benchmark_shard_index(&key);
+        if by_shard[shard].len() < tasks {
+            by_shard[shard].push(key);
+        }
+        if by_shard.iter().all(|keys| keys.len() >= tasks) {
+            break;
+        }
+    }
+    match scenario {
+        "same_key" => vec![by_shard[0][0].clone(); tasks],
+        "same_shard" => by_shard[0][..tasks].to_vec(),
+        "different_shards" => (0..tasks)
+            .map(|index| by_shard[index % by_shard.len()][index / by_shard.len()].clone())
+            .collect(),
+        "read_write" => by_shard[0][..tasks].to_vec(),
+        _ => unreachable!("known cache benchmark scenario"),
+    }
 }
 
 pub(super) fn bench_singleflight(c: &mut Criterion) {

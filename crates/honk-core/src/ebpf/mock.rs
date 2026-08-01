@@ -15,9 +15,10 @@ use std::collections::HashMap;
 pub struct MockRoutingSnapshot {
     pub routing_map: Vec<(u32, MockMatchSetSnapshot)>,
     pub routing_meta: Vec<(u32, u32)>,
-    pub dest_lpm: Vec<([u8; 20], [u32; 4])>,
-    pub source_lpm: Vec<([u8; 20], [u32; 4])>,
-    pub mac_lpm: Vec<([u8; 20], [u32; 4])>,
+    pub dest_lpm: Vec<([u8; 20], [u32; ROUTING_BITMAP_WORDS])>,
+    pub source_lpm: Vec<([u8; 20], [u32; ROUTING_BITMAP_WORDS])>,
+    pub mac_lpm: Vec<([u8; 20], [u32; ROUTING_BITMAP_WORDS])>,
+    pub domain: Vec<([u8; 20], [u32; ROUTING_BITMAP_WORDS])>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,8 +149,8 @@ pub struct MockEbpfBackend {
     pub tcp_conn_states: HashMap<[u8; 40], ConnState>,
     /// UDP connection states (TuplesKey → ConnState)
     pub udp_conn_states: HashMap<[u8; 40], ConnState>,
-    /// Redirect tracking (RedirectTuple → RedirectEntry)
-    pub redirect_tracks: HashMap<[u8; 32], RedirectEntry>,
+    /// Redirect tracking (full directional `RedirectTuple` → `RedirectEntry`).
+    pub redirect_tracks: HashMap<[u8; 40], RedirectEntry>,
     /// Routing handoff table (TuplesKey → RoutingHandoffEntry).
     ///
     /// Behind a Mutex because `routing_handoff_take` takes `&self` (the
@@ -180,33 +181,98 @@ impl MockEbpfBackend {
     }
 
     pub fn routing_snapshot(&self) -> MockRoutingSnapshot {
-        fn sorted_bitmap_map(map: &HashMap<[u8; 20], DomainRouting>) -> Vec<([u8; 20], [u32; 4])> {
+        fn sorted_bitmap_map(
+            map: &HashMap<[u8; 20], DomainRouting>,
+            generation: u32,
+        ) -> Vec<([u8; 20], [u32; ROUTING_BITMAP_WORDS])> {
+            let offset = generation as usize * ROUTING_BITMAP_WORDS_PER_GENERATION;
             let mut entries = map
                 .iter()
-                .map(|(key, value)| (*key, value.bitmap))
+                .filter_map(|(key, value)| {
+                    let mut logical = [0; ROUTING_BITMAP_WORDS];
+                    logical[..ROUTING_BITMAP_WORDS_PER_GENERATION].copy_from_slice(
+                        &value.bitmap[offset..offset + ROUTING_BITMAP_WORDS_PER_GENERATION],
+                    );
+                    logical
+                        .iter()
+                        .any(|word| *word != 0)
+                        .then_some((*key, logical))
+                })
                 .collect::<Vec<_>>();
             entries.sort_by_key(|(key, _)| *key);
             entries
         }
-        let mut routing_map = self
-            .routing_map
-            .iter()
-            .map(|(key, value)| (*key, MockMatchSetSnapshot::from_match_set(value)))
-            .collect::<Vec<_>>();
-        routing_map.sort_by_key(|(key, _)| *key);
-        let mut routing_meta = self
+        let generation = self
             .routing_meta
-            .iter()
-            .map(|(key, value)| (*key, *value))
-            .collect::<Vec<_>>();
-        routing_meta.sort_by_key(|(key, _)| *key);
+            .get(&ROUTING_META_ACTIVE_GENERATION_SLOT)
+            .copied()
+            .unwrap_or(0);
+        let count = self
+            .routing_meta
+            .get(&routing_meta_count_slot(generation))
+            .copied()
+            .unwrap_or(0);
+        let base = generation * MAX_MATCH_SET_LEN;
+        let routing_map = (0..count)
+            .filter_map(|index| {
+                self.routing_map
+                    .get(&(base + index))
+                    .map(|value| (index, MockMatchSetSnapshot::from_match_set(value)))
+            })
+            .collect();
+        let meta_base = routing_meta_generation_base(generation);
+        let routing_meta = (0..ROUTING_META_GENERATION_STRIDE as u32)
+            .map(|offset| {
+                (
+                    offset,
+                    self.routing_meta
+                        .get(&(meta_base + offset))
+                        .copied()
+                        .unwrap_or(0),
+                )
+            })
+            .collect();
         MockRoutingSnapshot {
             routing_map,
             routing_meta,
-            dest_lpm: sorted_bitmap_map(&self.dest_lpm_bitmap),
-            source_lpm: sorted_bitmap_map(&self.source_lpm_bitmap),
-            mac_lpm: sorted_bitmap_map(&self.mac_lpm_bitmap),
+            dest_lpm: sorted_bitmap_map(&self.dest_lpm_bitmap, generation),
+            source_lpm: sorted_bitmap_map(&self.source_lpm_bitmap, generation),
+            mac_lpm: sorted_bitmap_map(&self.mac_lpm_bitmap, generation),
+            domain: sorted_bitmap_map(&self.domain_routing_bitmap, generation),
         }
+    }
+
+    pub fn active_routing_rule(&self, index: u32) -> Option<&MatchSet> {
+        let generation = self
+            .routing_meta
+            .get(&ROUTING_META_ACTIVE_GENERATION_SLOT)
+            .copied()
+            .unwrap_or(0);
+        self.routing_map
+            .get(&(generation * MAX_MATCH_SET_LEN + index))
+    }
+
+    pub fn active_routing_rule_count(&self) -> u32 {
+        let generation = self
+            .routing_meta
+            .get(&ROUTING_META_ACTIVE_GENERATION_SLOT)
+            .copied()
+            .unwrap_or(0);
+        self.routing_meta
+            .get(&routing_meta_count_slot(generation))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn active_routing_group_word(&self, group: usize, word: usize) -> u32 {
+        let generation = self
+            .routing_meta
+            .get(&ROUTING_META_ACTIVE_GENERATION_SLOT)
+            .copied()
+            .unwrap_or(0);
+        let slot = routing_meta_bitmap_base(generation)
+            + (group * ROUTING_GROUP_BITMAP_WORDS + word) as u32;
+        self.routing_meta.get(&slot).copied().unwrap_or(0)
     }
 
     fn take_routing_fault(&mut self, phase: RoutingPushPhase) -> anyhow::Result<()> {
@@ -273,17 +339,46 @@ impl MockEbpfBackend {
         buf
     }
 
-    /// Convert a RedirectTuple into a 32-byte array.
-    fn redirect_tuple_bytes(key: &RedirectTuple) -> [u8; 32] {
-        let mut buf = [0u8; 32];
+    /// Convert a RedirectTuple into its exact 40-byte `repr(C)` map key.
+    fn redirect_tuple_bytes(key: &RedirectTuple) -> [u8; 40] {
+        let mut buf = [0u8; 40];
         buf[0..16].copy_from_slice(unsafe { &key.src_ip.u6_addr8 });
         buf[16..32].copy_from_slice(unsafe { &key.dst_ip.u6_addr8 });
+        buf[32..34].copy_from_slice(&key.src_port.to_ne_bytes());
+        buf[34..36].copy_from_slice(&key.dst_port.to_ne_bytes());
+        buf[36] = key.l4proto;
         buf
     }
 
     /// Convert an LpmKey into a 20-byte array.
     fn lpm_key_bytes(key: &LpmKey) -> [u8; 20] {
         super::maps::lpm_key_bytes(key)
+    }
+
+    fn bitmap_for_active_generation(&self, bitmap: &DomainRouting) -> DomainRouting {
+        let generation = self
+            .routing_meta
+            .get(&ROUTING_META_ACTIVE_GENERATION_SLOT)
+            .copied()
+            .unwrap_or(0);
+        bitmap.for_generation(generation)
+    }
+
+    fn replace_active_bitmap(
+        &self,
+        current: Option<DomainRouting>,
+        bitmap: &DomainRouting,
+    ) -> DomainRouting {
+        let generation = self
+            .routing_meta
+            .get(&ROUTING_META_ACTIVE_GENERATION_SLOT)
+            .copied()
+            .unwrap_or(0);
+        let mut value = current.unwrap_or_default();
+        let offset = generation as usize * ROUTING_BITMAP_WORDS_PER_GENERATION;
+        value.bitmap[offset..offset + ROUTING_BITMAP_WORDS_PER_GENERATION]
+            .copy_from_slice(&bitmap.bitmap[..ROUTING_BITMAP_WORDS_PER_GENERATION]);
+        value
     }
 
     /// OR a DomainRouting bitmap into the given in-memory map keyed by LpmKey.
@@ -312,7 +407,7 @@ impl MockEbpfBackend {
     }
 
     /// Reverse of redirect_tuple_bytes.
-    fn bytes_to_redirect_tuple(buf: &[u8; 32]) -> RedirectTuple {
+    fn bytes_to_redirect_tuple(buf: &[u8; 40]) -> RedirectTuple {
         RedirectTuple {
             src_ip: honk_ebpf_common::dae_ip::In6Addr {
                 u6_addr8: buf[0..16].try_into().unwrap(),
@@ -320,6 +415,10 @@ impl MockEbpfBackend {
             dst_ip: honk_ebpf_common::dae_ip::In6Addr {
                 u6_addr8: buf[16..32].try_into().unwrap(),
             },
+            src_port: u16::from_ne_bytes([buf[32], buf[33]]),
+            dst_port: u16::from_ne_bytes([buf[34], buf[35]]),
+            l4proto: buf[36],
+            padding: [0; 3],
         }
     }
 }
@@ -375,30 +474,46 @@ impl EbpfBackend for MockEbpfBackend {
         Ok(self.params.get(&(key as u32)).copied())
     }
 
-    fn set_routing_rules(&mut self, rules: &[MatchSet]) -> anyhow::Result<()> {
+    fn set_routing_rules(&mut self, generation: u32, rules: &[MatchSet]) -> anyhow::Result<()> {
         self.take_routing_fault(RoutingPushPhase::Rules)?;
+        let base = generation * MAX_MATCH_SET_LEN;
         for (i, rule) in rules.iter().enumerate() {
-            self.routing_map.insert(i as u32, *rule);
+            self.routing_map.insert(base + i as u32, *rule);
         }
         Ok(())
     }
 
-    fn set_routing_meta(
+    fn active_routing_generation(&self) -> anyhow::Result<u32> {
+        Ok(self
+            .routing_meta
+            .get(&ROUTING_META_ACTIVE_GENERATION_SLOT)
+            .copied()
+            .unwrap_or(0))
+    }
+
+    fn publish_routing_generation(
         &mut self,
+        generation: u32,
         count: u32,
         group_bitmaps: &RoutingGroupBitmaps,
     ) -> anyhow::Result<()> {
         self.take_routing_fault(RoutingPushPhase::Meta)?;
         for (g, words) in group_bitmaps.iter().enumerate() {
             for (w, word) in words.iter().enumerate() {
-                self.routing_meta
-                    .insert(1 + (g * ROUTING_GROUP_BITMAP_WORDS + w) as u32, *word);
-                self.routing_meta_write_order
-                    .push(1 + (g * ROUTING_GROUP_BITMAP_WORDS + w) as u32);
+                let slot = routing_meta_bitmap_base(generation)
+                    + (g * ROUTING_GROUP_BITMAP_WORDS + w) as u32;
+                self.routing_meta.insert(slot, *word);
+                self.routing_meta_write_order.push(slot);
             }
         }
-        self.routing_meta.insert(0, count);
-        self.routing_meta_write_order.push(0);
+        self.routing_meta
+            .insert(routing_meta_count_slot(generation), count);
+        self.routing_meta_write_order
+            .push(routing_meta_count_slot(generation));
+        self.routing_meta
+            .insert(ROUTING_META_ACTIVE_GENERATION_SLOT, generation);
+        self.routing_meta_write_order
+            .push(ROUTING_META_ACTIVE_GENERATION_SLOT);
         Ok(())
     }
 
@@ -413,7 +528,8 @@ impl EbpfBackend for MockEbpfBackend {
         key: &LpmKey,
         bitmap: &DomainRouting,
     ) -> anyhow::Result<()> {
-        Self::or_bitmap(&mut self.domain_routing_bitmap, key, bitmap);
+        let bitmap = self.bitmap_for_active_generation(bitmap);
+        Self::or_bitmap(&mut self.domain_routing_bitmap, key, &bitmap);
         Ok(())
     }
 
@@ -452,7 +568,8 @@ impl EbpfBackend for MockEbpfBackend {
         ip_key: &LpmKey,
         bitmap: &DomainRouting,
     ) -> anyhow::Result<()> {
-        Self::or_bitmap(&mut self.domain_routing_bitmap, ip_key, bitmap);
+        let bitmap = self.bitmap_for_active_generation(bitmap);
+        Self::or_bitmap(&mut self.domain_routing_bitmap, ip_key, &bitmap);
         Ok(())
     }
 
@@ -463,19 +580,55 @@ impl EbpfBackend for MockEbpfBackend {
     ) -> Result<(), super::DomainRouteWriteError> {
         #[cfg(test)]
         self.take_projection_fault(ProjectionMapOperation::Set)?;
-        self.domain_routing_bitmap
-            .insert(Self::lpm_key_bytes(ip_key), *bitmap);
+        let key = Self::lpm_key_bytes(ip_key);
+        let bitmap =
+            self.replace_active_bitmap(self.domain_routing_bitmap.get(&key).copied(), bitmap);
+        self.domain_routing_bitmap.insert(key, bitmap);
         Ok(())
     }
-
     fn remove_domain_ip_bitmap(
         &mut self,
         ip_key: &LpmKey,
     ) -> Result<(), super::DomainRouteWriteError> {
         #[cfg(test)]
         self.take_projection_fault(ProjectionMapOperation::Remove)?;
-        self.domain_routing_bitmap
-            .remove(&Self::lpm_key_bytes(ip_key));
+        let key = Self::lpm_key_bytes(ip_key);
+        let Some(mut bitmap) = self.domain_routing_bitmap.get(&key).copied() else {
+            return Ok(());
+        };
+        let generation = self.active_routing_generation()?;
+        let offset = generation as usize * ROUTING_BITMAP_WORDS_PER_GENERATION;
+        bitmap.bitmap[offset..offset + ROUTING_BITMAP_WORDS_PER_GENERATION].fill(0);
+        if bitmap.bitmap.iter().all(|word| *word == 0) {
+            self.domain_routing_bitmap.remove(&key);
+        } else {
+            self.domain_routing_bitmap.insert(key, bitmap);
+        }
+        Ok(())
+    }
+
+    fn stage_domain_routing_generation(
+        &mut self,
+        generation: u32,
+        entries: &[(LpmKey, DomainRouting)],
+    ) -> anyhow::Result<()> {
+        self.take_routing_fault(RoutingPushPhase::DomainRouting)?;
+        anyhow::ensure!(
+            generation < ROUTING_BITMAP_GENERATIONS as u32,
+            "invalid routing generation {generation}"
+        );
+        let offset = generation as usize * ROUTING_BITMAP_WORDS_PER_GENERATION;
+        for bitmap in self.domain_routing_bitmap.values_mut() {
+            bitmap.bitmap[offset..offset + ROUTING_BITMAP_WORDS_PER_GENERATION].fill(0);
+        }
+        for (key, logical) in entries {
+            let bitmap = self
+                .domain_routing_bitmap
+                .entry(Self::lpm_key_bytes(key))
+                .or_default();
+            bitmap.bitmap[offset..offset + ROUTING_BITMAP_WORDS_PER_GENERATION]
+                .copy_from_slice(&logical.bitmap[..ROUTING_BITMAP_WORDS_PER_GENERATION]);
+        }
         Ok(())
     }
 
@@ -661,8 +814,50 @@ impl EbpfBackend for MockEbpfBackend {
         Ok(())
     }
 
+    fn redirect_track_for_each_chunk(
+        &self,
+        chunk_size: usize,
+        visit: &mut super::RedirectTrackChunkVisitor<'_>,
+    ) -> anyhow::Result<()> {
+        let mut chunk = Vec::with_capacity(chunk_size.max(1));
+        for (key, entry) in &self.redirect_tracks {
+            chunk.push((Self::bytes_to_redirect_tuple(key), *entry));
+            if chunk.len() == chunk_size.max(1) {
+                if !visit(&chunk) {
+                    return Ok(());
+                }
+                chunk.clear();
+            }
+        }
+        if !chunk.is_empty() {
+            visit(&chunk);
+        }
+        Ok(())
+    }
+
     fn cookie_pid_snapshot(&self, out: &mut Vec<(u64, PidPname)>) -> anyhow::Result<()> {
         out.extend(self.cookie_pids.iter().map(|(&c, &e)| (c, e)));
+        Ok(())
+    }
+
+    fn cookie_pid_for_each_chunk(
+        &self,
+        chunk_size: usize,
+        visit: &mut super::CookiePidChunkVisitor<'_>,
+    ) -> anyhow::Result<()> {
+        let mut chunk = Vec::with_capacity(chunk_size.max(1));
+        for (&cookie, &entry) in &self.cookie_pids {
+            chunk.push((cookie, entry));
+            if chunk.len() == chunk_size.max(1) {
+                if !visit(&chunk) {
+                    return Ok(());
+                }
+                chunk.clear();
+            }
+        }
+        if !chunk.is_empty() {
+            visit(&chunk);
+        }
         Ok(())
     }
 
@@ -672,6 +867,27 @@ impl EbpfBackend for MockEbpfBackend {
     ) -> anyhow::Result<()> {
         for (kb, entry) in self.routing_handoffs.lock().unwrap().iter() {
             out.push((Self::bytes_to_tuples_key(kb), *entry));
+        }
+        Ok(())
+    }
+
+    fn routing_handoff_for_each_chunk(
+        &self,
+        chunk_size: usize,
+        visit: &mut super::RoutingHandoffChunkVisitor<'_>,
+    ) -> anyhow::Result<()> {
+        let mut chunk = Vec::with_capacity(chunk_size.max(1));
+        for (key, entry) in self.routing_handoffs.lock().unwrap().iter() {
+            chunk.push((Self::bytes_to_tuples_key(key), *entry));
+            if chunk.len() == chunk_size.max(1) {
+                if !visit(&chunk) {
+                    return Ok(());
+                }
+                chunk.clear();
+            }
+        }
+        if !chunk.is_empty() {
+            visit(&chunk);
         }
         Ok(())
     }
@@ -719,6 +935,87 @@ impl EbpfBackend for MockEbpfBackend {
         Ok(())
     }
 
+    fn conn_state_remove_if_unchanged(
+        &mut self,
+        entries: &[(TuplesKey, ConnState)],
+        expired_before_ns: u64,
+    ) -> anyhow::Result<u64> {
+        let mut removed = 0;
+        for (key, scanned) in entries {
+            let map = if key.l4proto == 6 {
+                &mut self.tcp_conn_states
+            } else {
+                &mut self.udp_conn_states
+            };
+            let raw = Self::tuples_key_bytes(key);
+            if map.get(&raw).is_some_and(|current| {
+                current.last_seen_ns == scanned.last_seen_ns
+                    && current.last_seen_ns <= expired_before_ns
+            }) {
+                map.remove(&raw);
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    fn redirect_track_remove_if_unchanged(
+        &mut self,
+        entries: &[(RedirectTuple, RedirectEntry)],
+        expired_before_ns: u64,
+    ) -> anyhow::Result<u64> {
+        let mut removed = 0;
+        for (key, scanned) in entries {
+            let raw = Self::redirect_tuple_bytes(key);
+            if self.redirect_tracks.get(&raw).is_some_and(|current| {
+                current.last_seen_ns == scanned.last_seen_ns
+                    && current.last_seen_ns <= expired_before_ns
+            }) {
+                self.redirect_tracks.remove(&raw);
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    fn cookie_pid_remove_if_unchanged(
+        &mut self,
+        entries: &[(u64, PidPname)],
+        expired_before_ns: u64,
+    ) -> anyhow::Result<u64> {
+        let mut removed = 0;
+        for (cookie, scanned) in entries {
+            if self.cookie_pids.get(cookie).is_some_and(|current| {
+                current.last_seen_ns == scanned.last_seen_ns
+                    && current.last_seen_ns <= expired_before_ns
+            }) {
+                self.cookie_pids.remove(cookie);
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    fn routing_handoff_remove_if_unchanged(
+        &mut self,
+        entries: &[(TuplesKey, RoutingHandoffEntry)],
+        expired_before_ns: u64,
+    ) -> anyhow::Result<u64> {
+        let mut removed = 0;
+        let handoffs = self.routing_handoffs.get_mut().unwrap();
+        for (key, scanned) in entries {
+            let raw = Self::tuples_key_bytes(key);
+            if handoffs.get(&raw).is_some_and(|current| {
+                current.last_seen_ns == scanned.last_seen_ns
+                    && current.last_seen_ns <= expired_before_ns
+            }) {
+                handoffs.remove(&raw);
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
     async fn cleanup(&mut self) -> anyhow::Result<()> {
         self.params.clear();
         self.domain_routes.clear();
@@ -736,6 +1033,67 @@ impl EbpfBackend for MockEbpfBackend {
         self.outbound_alive.clear();
         self.bpf_stats.clear();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod janitor_conditional_delete_tests {
+    use super::*;
+
+    #[test]
+    fn reused_tuple_survives_stale_conditional_delete() {
+        let mut backend = MockEbpfBackend::default();
+        let key = TuplesKey {
+            l4proto: 6,
+            ..Default::default()
+        };
+        let old = ConnState {
+            last_seen_ns: 1,
+            ..Default::default()
+        };
+        let fresh = ConnState {
+            last_seen_ns: 2,
+            ..Default::default()
+        };
+        backend.tcp_conn_state_store(&key, &old).unwrap();
+        backend.tcp_conn_state_store(&key, &fresh).unwrap();
+
+        assert_eq!(
+            backend
+                .conn_state_remove_if_unchanged(&[(key, old)], 10)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            backend
+                .tcp_conn_state_lookup(&key)
+                .unwrap()
+                .unwrap()
+                .last_seen_ns,
+            fresh.last_seen_ns
+        );
+    }
+
+    #[test]
+    fn unchanged_expired_entry_is_removed() {
+        let mut backend = MockEbpfBackend::default();
+        let key = TuplesKey {
+            l4proto: 6,
+            ..Default::default()
+        };
+        let stale = ConnState {
+            last_seen_ns: 1,
+            ..Default::default()
+        };
+        backend.tcp_conn_state_store(&key, &stale).unwrap();
+
+        assert_eq!(
+            backend
+                .conn_state_remove_if_unchanged(&[(key, stale)], 10)
+                .unwrap(),
+            1
+        );
+        assert!(backend.tcp_conn_state_lookup(&key).unwrap().is_none());
     }
 }
 
@@ -836,20 +1194,35 @@ mod tests {
             },
         ];
 
-        backend.set_routing_rules(&rules).unwrap();
+        backend.set_routing_rules(0, &rules).unwrap();
         let all_groups: RoutingGroupBitmaps =
             [[u32::MAX; ROUTING_GROUP_BITMAP_WORDS]; ROUTING_GROUP_COUNT];
-        backend.set_routing_meta(3, &all_groups).unwrap();
+        backend
+            .publish_routing_generation(0, 3, &all_groups)
+            .unwrap();
 
         assert_eq!(backend.routing_map.len(), 3);
         assert_eq!(backend.routing_map.get(&0).unwrap().outbound, 10);
         assert_eq!(backend.routing_map.get(&1).unwrap().outbound, 20);
         assert_eq!(backend.routing_map.get(&2).unwrap().outbound, 30);
-        assert_eq!(backend.routing_meta.get(&0).copied(), Some(3));
-        // Group bitmaps land at slots 1..ROUTING_META_MAP_LEN, in group order.
+        assert_eq!(
+            backend
+                .routing_meta
+                .get(&ROUTING_META_ACTIVE_GENERATION_SLOT)
+                .copied(),
+            Some(0)
+        );
+        assert_eq!(
+            backend
+                .routing_meta
+                .get(&routing_meta_count_slot(0))
+                .copied(),
+            Some(3)
+        );
         for g in 0..ROUTING_GROUP_COUNT {
             for w in 0..ROUTING_GROUP_BITMAP_WORDS {
-                let slot = 1 + (g * ROUTING_GROUP_BITMAP_WORDS + w) as u32;
+                let slot =
+                    routing_meta_bitmap_base(0) + (g * ROUTING_GROUP_BITMAP_WORDS + w) as u32;
                 assert_eq!(backend.routing_meta.get(&slot).copied(), Some(u32::MAX));
             }
         }
@@ -858,13 +1231,21 @@ mod tests {
             outbound: 99,
             ..Default::default()
         }];
-        backend.set_routing_rules(&fewer).unwrap();
-        backend.set_routing_meta(1, &all_groups).unwrap();
+        backend.set_routing_rules(0, &fewer).unwrap();
+        backend
+            .publish_routing_generation(0, 1, &all_groups)
+            .unwrap();
         backend.clear_routing_map_tail(1).unwrap();
         assert_eq!(backend.routing_map.len(), 1);
         assert_eq!(backend.routing_map.get(&0).unwrap().outbound, 99);
         assert!(!backend.routing_map.contains_key(&1));
-        assert_eq!(backend.routing_meta.get(&0).copied(), Some(1));
+        assert_eq!(
+            backend
+                .routing_meta
+                .get(&routing_meta_count_slot(0))
+                .copied(),
+            Some(1)
+        );
     }
 
     #[test]
@@ -875,9 +1256,9 @@ mod tests {
             prefix_len: 24,
             data: [0x0a000001, 0, 0, 0],
         };
-        let bitmap = DomainRouting {
-            bitmap: [0xDEADBEEF, 0xCAFEBABE, 0, 0],
-        };
+        let mut bitmap = DomainRouting::default();
+        bitmap.bitmap[0] = 0xDEADBEEF;
+        bitmap.bitmap[1] = 0xCAFEBABE;
 
         backend.add_domain_routing_bitmap(&key, &bitmap).unwrap();
 
@@ -906,12 +1287,10 @@ mod tests {
             prefix_len: 128,
             data: [0, 0, 0xffff0000, 0x0a000001],
         };
-        let bm1 = DomainRouting {
-            bitmap: [0b001, 0, 0, 0],
-        };
-        let bm2 = DomainRouting {
-            bitmap: [0b100, 0, 0, 0],
-        };
+        let mut bm1 = DomainRouting::default();
+        bm1.bitmap[0] = 0b001;
+        let mut bm2 = DomainRouting::default();
+        bm2.bitmap[0] = 0b100;
 
         // add_domain_ip_bitmap has OR semantics; set_domain_ip_bitmap must
         // replace the entry wholesale (used by the post-push rebuild so
@@ -939,9 +1318,8 @@ mod tests {
             prefix_len: 120,
             data: [0, 0, 0xffff0000, 0x01a8c0],
         };
-        let bm = DomainRouting {
-            bitmap: [1, 0, 0, 0],
-        };
+        let mut bm = DomainRouting::default();
+        bm.bitmap[0] = 1;
         backend.add_dest_lpm_bitmap(&k1, &bm).unwrap();
         backend.add_dest_lpm_bitmap(&k2, &bm).unwrap();
 
@@ -956,11 +1334,14 @@ mod tests {
         );
 
         backend
-            .set_routing_rules(&[
-                MatchSet::default(),
-                MatchSet::default(),
-                MatchSet::default(),
-            ])
+            .set_routing_rules(
+                0,
+                &[
+                    MatchSet::default(),
+                    MatchSet::default(),
+                    MatchSet::default(),
+                ],
+            )
             .unwrap();
         backend.clear_routing_map_tail(2).unwrap();
         assert_eq!(backend.routing_map.len(), 2);
@@ -980,6 +1361,7 @@ mod tests {
             ..MatchSet::default()
         };
         backend.routing_map.insert(0, rule(80));
+        backend.routing_meta.insert(routing_meta_count_slot(0), 1);
         let before = backend.routing_snapshot();
 
         backend.routing_map.insert(0, rule(81));
@@ -994,6 +1376,7 @@ mod tests {
         let rt_key = RedirectTuple {
             src_ip: In6Addr::default(),
             dst_ip: In6Addr::default(),
+            ..Default::default()
         };
         let rt_entry = RedirectEntry {
             last_seen_ns: 111,
@@ -1153,6 +1536,7 @@ mod tests {
         let key = RedirectTuple {
             src_ip: In6Addr::default(),
             dst_ip: In6Addr::default(),
+            ..Default::default()
         };
         let entry = RedirectEntry {
             last_seen_ns: 1111111111,
@@ -1337,9 +1721,12 @@ mod tests {
         backend
             .add_domain_route("example.com", OutboundIndex::Direct)
             .unwrap();
-        backend.set_routing_rules(&[MatchSet::default()]).unwrap();
         backend
-            .set_routing_meta(
+            .set_routing_rules(0, &[MatchSet::default()])
+            .unwrap();
+        backend
+            .publish_routing_generation(
+                0,
                 1,
                 &[[u32::MAX; ROUTING_GROUP_BITMAP_WORDS]; ROUTING_GROUP_COUNT],
             )

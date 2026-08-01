@@ -17,9 +17,10 @@ use aya_ebpf::bindings::__be32;
 use aya_ebpf::maps::lpm_trie::Key;
 use aya_ebpf_bindings::helpers::bpf_loop;
 use honk_ebpf_common::{
-    L4ProtoType,
+    L4ProtoType, ROUTING_GENERATION_COUNT, ROUTING_MAP_LEN, ROUTING_META_ACTIVE_GENERATION_SLOT,
     redirect_need::MAX_MATCH_SET_LEN,
     route::{MatchSet, MatchType, ROUTING_GROUP_BITMAP_WORDS, routing_group_index},
+    routing_meta_bitmap_base, routing_meta_count_slot,
 };
 
 use crate::{
@@ -105,16 +106,7 @@ pub fn route(
             ctx.route_state |= RouteStateFlags::DnsQuery as u8;
         }
 
-        let mut active_rules_len = MAX_MATCH_SET_LEN as u32;
-        if let Some(len_ptr) = ROUTING_META_MAP.get(0u32) {
-            if *len_ptr <= MAX_MATCH_SET_LEN as u32 {
-                active_rules_len = *len_ptr;
-            }
-        }
-
-        // Cache this flow's (l4proto × ipversion) group bitmap so the
-        // route loop can skip MatchSets that cannot match it.
-        ctx.load_group_bitmap();
+        let active_rules_len = ctx.prepare_generation();
 
         let ret = ctx.route_loop(active_rules_len);
         if ret < 0 {
@@ -146,12 +138,11 @@ pub struct RouteCtx {
     pub route_state: u8,
     pub l4proto_type: u8,
     pub ipversion_type: u8,
-    pub pname_cache: [u32; 4],
     pub dscp_cache: u8,
-    /// Bitmap words of this flow's (l4proto × ipversion) routing group,
-    /// loaded from ROUTING_META_MAP by `load_group_bitmap` before the
-    /// route loop starts.  Bit N mirrors ROUTING_MAP[N]'s membership in
-    /// the group: 0 means the loop skips that MatchSet entirely.
+    pub pname_cache: [u32; 4],
+    /// Active physical rule bank selected once at route entry.
+    pub active_generation: u32,
+    /// Bitmap words for the selected generation and flow group.
     pub group_bitmap: [u32; ROUTING_GROUP_BITMAP_WORDS],
 }
 
@@ -196,12 +187,9 @@ impl RouteCtx {
         };
 
         if let Some(dr) = lpm {
-            // Clamp to the bitmap size. The outer loop guarantees index is
-            // within the rule table, but the bitmap only covers
-            // MAX_MATCH_SET_LEN bits; black_box keeps the clamp from being
-            // folded away so the verifier sees a bounded value.
-            let max_index = MAX_MATCH_SET_LEN as u32 - 1;
-            let safe_index = core::hint::black_box(index).min(max_index);
+            let physical_index = index + self.active_generation * MAX_MATCH_SET_LEN as u32;
+            let max_index = ROUTING_MAP_LEN as u32 - 1;
+            let safe_index = core::hint::black_box(physical_index).min(max_index);
             let word = (safe_index / 32) as usize;
             let bit = safe_index % 32;
             if ((dr.bitmap[word] >> bit) & 1) != 0 {
@@ -218,11 +206,10 @@ impl RouteCtx {
     /// of bounds.
     #[inline(always)]
     pub fn match_domain_set(&mut self, index: u32) -> Result<(), c_long> {
-        // Clamp to valid range for verifier. The bitmap has
-        // MAX_MATCH_SET_LEN/32 entries.
-        let safe_index = index.min(MAX_MATCH_SET_LEN as u32 - 1);
+        let physical_index = index + self.active_generation * MAX_MATCH_SET_LEN as u32;
+        let safe_index = physical_index.min(ROUTING_MAP_LEN as u32 - 1);
         let bitmap_word_idx = safe_index / 32;
-        let max_word_idx = (MAX_MATCH_SET_LEN as u32 / 32).saturating_sub(1);
+        let max_word_idx = (ROUTING_MAP_LEN as u32 / 32).saturating_sub(1);
 
         if !self.domain_word_cached || self.domain_word_idx != bitmap_word_idx {
             let key = self.lpm_key_daddr.data;
@@ -230,8 +217,6 @@ impl RouteCtx {
             self.domain_word_idx = bitmap_word_idx;
             match unsafe { DOMAIN_ROUTING_MAP.get(key) } {
                 Some(domain_routing) => {
-                    // black_box prevents LLVM from proving bitmap_word_idx is in bounds
-                    // and optimizing away the min() clamp.
                     let idx = core::hint::black_box(bitmap_word_idx).min(max_word_idx) as usize;
                     self.domain_word_bits = domain_routing.bitmap[idx];
                 }
@@ -394,27 +379,31 @@ impl RouteCtx {
         LOOP_CONTINUE
     }
 
-    /// Load this flow's group bitmap from ROUTING_META_MAP into
-    /// `group_bitmap`.
-    ///
-    /// Group g's words live at meta slots
-    /// `1 + g * ROUTING_GROUP_BITMAP_WORDS .. + ROUTING_GROUP_BITMAP_WORDS`;
-    /// group order is 0=tcp4, 1=tcp6, 2=udp4, 3=udp6
-    /// (`routing_group_index`).
-    ///
-    /// An all-zero group bitmap means "no group information": a freshly
-    /// created map before the first userspace push, or a userspace that
-    /// predates group bitmaps and only wrote the rule count.  It is
-    /// treated as all-ones so the flow falls back to evaluating every
-    /// rule instead of matching nothing and getting SHOT.
+    /// Select the committed rule bank and cache its flow-group bitmap.
+    #[inline(always)]
+    pub fn prepare_generation(&mut self) -> u32 {
+        let active_generation = match ROUTING_META_MAP.get(ROUTING_META_ACTIVE_GENERATION_SLOT) {
+            Some(generation) if *generation < ROUTING_GENERATION_COUNT as u32 => *generation,
+            _ => 0,
+        };
+        let mut active_rules_len = MAX_MATCH_SET_LEN as u32;
+        if let Some(len_ptr) = ROUTING_META_MAP.get(routing_meta_count_slot(active_generation)) {
+            if *len_ptr <= MAX_MATCH_SET_LEN as u32 {
+                active_rules_len = *len_ptr;
+            }
+        }
+        self.active_generation = active_generation;
+        self.load_group_bitmap();
+        active_rules_len
+    }
+
+    /// Load this flow's selected generation group bitmap from ROUTING_META_MAP.
     #[inline(always)]
     pub fn load_group_bitmap(&mut self) {
         let group = routing_group_index(self.l4proto_type, self.ipversion_type);
-        let base = 1 + group * ROUTING_GROUP_BITMAP_WORDS as u32;
+        let base = routing_meta_bitmap_base(self.active_generation)
+            + group * ROUTING_GROUP_BITMAP_WORDS as u32;
         let mut words = [0u32; ROUTING_GROUP_BITMAP_WORDS];
-        // Unrolled single-slot reads (ROUTING_GROUP_BITMAP_WORDS == 4,
-        // asserted in honk-ebpf-common); a loop would rely on LLVM
-        // unrolling for the verifier.
         if let Some(w) = ROUTING_META_MAP.get(base) {
             words[0] = *w;
         }
@@ -426,9 +415,6 @@ impl RouteCtx {
         }
         if let Some(w) = ROUTING_META_MAP.get(base + 3) {
             words[3] = *w;
-        }
-        if words == [0u32; ROUTING_GROUP_BITMAP_WORDS] {
-            words = [u32::MAX; ROUTING_GROUP_BITMAP_WORDS];
         }
         self.group_bitmap = words;
     }
@@ -462,7 +448,7 @@ impl RouteCtx {
             return LOOP_CONTINUE;
         }
 
-        let k = index;
+        let k = index + self.active_generation * MAX_MATCH_SET_LEN as u32;
 
         let match_set = match ROUTING_MAP.get(k) {
             Some(ms) => ms,
@@ -482,7 +468,7 @@ impl RouteCtx {
             if self
                 .eval_match(
                     match_set,
-                    k,
+                    index,
                     l4proto_type,
                     ipversion_type,
                     &pname,

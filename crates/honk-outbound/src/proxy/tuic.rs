@@ -485,6 +485,18 @@ impl TuicHandler {
         .await
     }
 
+    async fn client_for_runtime(
+        &self,
+        runtime: &crate::runtime::NodeRuntime,
+    ) -> anyhow::Result<Arc<TuicClient>> {
+        let crate::runtime::ProtocolRuntime::Quic(quic_runtime) = &runtime.runtime else {
+            anyhow::bail!("TUIC runtime is not QUIC-owned");
+        };
+        quic_runtime
+            .client(|| self.client_for(runtime.node.as_ref()))
+            .await
+    }
+
     async fn send_udp(
         state: &TuicConnState,
         session_id: u16,
@@ -527,6 +539,21 @@ impl TuicHandler {
 impl ProxyHandler for TuicHandler {
     fn protocol(&self) -> NodeProtocol {
         NodeProtocol::Tuic
+    }
+
+    async fn warm_udp(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<super::UdpWarmStatus> {
+        let client = self.client_for_runtime(&runtime).await?;
+        let already_ready = client.quic.has_live_connection().await;
+        client.connection(connect_timeout).await?;
+        Ok(if already_ready {
+            super::UdpWarmStatus::AlreadyReady
+        } else {
+            super::UdpWarmStatus::Ready
+        })
     }
 
     async fn dial(
@@ -691,6 +718,12 @@ impl ProxyHandler for TuicHandler {
         _connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
         anyhow::bail!("TUIC runs over QUIC; a bare TCP connection cannot be reused")
+    }
+
+    /// QUIC-based: a pooled bare TCP is unusable, so preconnect warmup must
+    /// not deposit one (it would poison the first flow through `dial_with_tcp`).
+    fn pool_bare_tcp(&self, _node: &Node) -> bool {
+        false
     }
 
     async fn test_connectivity(&self, node: &Node) -> bool {
