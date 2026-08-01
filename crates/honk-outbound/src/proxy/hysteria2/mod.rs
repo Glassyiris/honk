@@ -684,11 +684,16 @@ impl ProxyHandler for Hysteria2Handler {
         connect_timeout: Duration,
     ) -> anyhow::Result<super::UdpWarmStatus> {
         let client = self.client_for_runtime(&runtime).await?;
+        let already_ready = client.quic.has_live_connection().await;
         let (_, state) = client.connection(connect_timeout).await?;
         if state.udp_disabled {
             anyhow::bail!("Hysteria2: UDP disabled by server");
         }
-        Ok(super::UdpWarmStatus::Ready)
+        Ok(if already_ready {
+            super::UdpWarmStatus::AlreadyReady
+        } else {
+            super::UdpWarmStatus::Ready
+        })
     }
 
     async fn dial(

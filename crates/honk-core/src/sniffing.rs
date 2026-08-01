@@ -198,6 +198,7 @@ fn is_http_request_prefix(data: &[u8]) -> bool {
         b"DELETE ",
         b"OPTIONS ",
     ];
+
     METHODS
         .iter()
         .any(|method| method.starts_with(data) || data.starts_with(method))
@@ -591,6 +592,30 @@ mod tests {
         let data = b"GET / HTTP/1.1\r\nHost: example.com:8080\r\n\r\n";
         let result = parse_http_host(data);
         assert_eq!(result, Some("example.com".to_string()));
+    }
+    #[tokio::test]
+    async fn test_sniff_tcp_detects_fragmented_http_host() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let request = b"GET / HTTP/1.1\r\nHost: fragmented.example.com\r\n\r\n";
+        let writer = tokio::spawn(async move {
+            client.write_all(&request[..20]).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            client.write_all(&request[20..]).await.unwrap();
+        });
+
+        let result = sniff_tcp(&mut server).await;
+        writer.await.unwrap();
+
+        assert_eq!(result.domain.as_deref(), Some("fragmented.example.com"));
+        assert_eq!(
+            result.traffic_type,
+            TrafficType::Http {
+                host: Some("fragmented.example.com".to_string())
+            }
+        );
+        assert_eq!(result.buffered, request);
     }
 
     #[test]

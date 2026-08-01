@@ -314,6 +314,24 @@ pub trait ProxyHandler: Send + Sync {
             proxy.relay_addr,
         )))
     }
+    /// Open a framed UDP transport using an explicitly captured runtime
+    /// generation. Session-owning handlers override this so an authoritative
+    /// flow reuses the same warmed generation-local client.
+    async fn dial_udp_transport_runtime(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        self.dial_udp_transport(
+            runtime.node.as_ref(),
+            target,
+            target_domain,
+            connect_timeout,
+        )
+        .await
+    }
 
     /// Prepare a UDP transport for a Cold URLTest candidate. Protocols that
     /// do not need speculative ownership can use their ordinary transport;
@@ -610,6 +628,47 @@ impl ProxyRegistry {
         handler
             .dial_udp_transport(node, target, target_domain, connect_timeout)
             .await
+    }
+
+    /// Generation-pinned framed UDP transport for an authoritative flow.
+    /// This complements speculative preparation: both paths must retain the
+    /// runtime captured when the flow was admitted, not re-resolve a handler
+    /// cache after reload.
+    pub async fn dial_udp_transport_runtime(
+        &self,
+        generation: Arc<crate::runtime::OutboundRuntimeRegistry>,
+        node_id: uuid::Uuid,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        if generation.is_shutdown() {
+            anyhow::bail!("outbound runtime generation is shut down");
+        }
+        let runtime = generation
+            .get(&node_id)
+            .ok_or_else(|| anyhow::anyhow!("node {node_id} is not in runtime generation"))?;
+        let transport = if runtime.node.name == "block" {
+            BlockHandler::new()
+                .dial_udp_transport_runtime(
+                    Arc::clone(&runtime),
+                    target,
+                    target_domain,
+                    connect_timeout,
+                )
+                .await?
+        } else {
+            let handler = self.find(runtime.node.protocol).ok_or_else(|| {
+                anyhow::anyhow!("No handler for protocol {:?}", runtime.node.protocol)
+            })?;
+            handler
+                .dial_udp_transport_runtime(runtime, target, target_domain, connect_timeout)
+                .await?
+        };
+        if generation.is_shutdown() {
+            anyhow::bail!("outbound runtime generation shut down during UDP dial");
+        }
+        Ok(transport)
     }
 
     /// Speculatively prepare a framed UDP transport for a Cold URLTest

@@ -144,13 +144,15 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
         dns_cache,
         a_record_response([93, 184, 216, 34], 300),
     )));
+    let stats = Arc::new(StatsManager::new());
+    let connection_tracker = Arc::new(ConnectionTracker::new());
     let state = Arc::new(ClashState {
         config: Arc::new(tokio::sync::RwLock::new(config)),
-        stats: Arc::new(StatsManager::new()),
+        stats: stats.clone(),
         alive_set,
         group_manager,
         cache_db: Some(db),
-        connection_tracker: Arc::new(ConnectionTracker::new()),
+        connection_tracker: connection_tracker.clone(),
         proxy_registry: Arc::new(ProxyRegistry::default_resolver().unwrap()),
         mode_state: Arc::new(parking_lot::RwLock::new(ModeState::new("Rule", "proxy"))),
         secret: secret.to_string(),
@@ -513,18 +515,27 @@ async fn test_global_selection_and_mode_persisted() {
         .unwrap();
     assert_eq!(resp.status(), 400);
 
-    // "Restart": reopen the same cache.db and verify both values survived.
+    // Point writes are acknowledged from the in-memory pending map and become
+    // crash-durable on the bounded background flush.
     let cache_cfg = CacheFileConfig {
         enabled: true,
         path: app.db_path.to_str().unwrap().to_string(),
         ..Default::default()
     };
     let reopened = CacheDb::open(&cache_cfg, None).unwrap();
-    assert_eq!(reopened.load_clash_mode().as_deref(), Some("Global"));
-    assert_eq!(
-        reopened.load_selector_choice("GLOBAL").as_deref(),
-        Some("proxy")
-    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        if reopened.load_clash_mode().as_deref() == Some("Global")
+            && reopened.load_selector_choice("GLOBAL").as_deref() == Some("proxy")
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "cache.db point-write durability bound exceeded"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test]

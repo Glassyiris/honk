@@ -715,6 +715,17 @@ impl<C> QuicClient<C> {
             state.conn = None;
         }
     }
+    /// Whether this client already owns a live reusable QUIC connection.
+    /// Warm-up uses this only to report whether it established a connection;
+    /// the connection itself remains owned by the client cache.
+    pub async fn has_live_connection(&self) -> bool {
+        self.state
+            .lock()
+            .await
+            .conn
+            .as_ref()
+            .is_some_and(|(conn, _)| conn.close_reason().is_none())
+    }
 }
 
 /// A QUIC bidirectional stream as a single `AsyncRead + AsyncWrite` object.

@@ -139,6 +139,9 @@ pub struct NodeRuntime {
     /// Immutable node config for this generation.
     pub node: Arc<Node>,
     pub capabilities: OutboundCapabilities,
+    /// Prebuilt roots, pin verifier, and static ECH for TLS nodes. This is
+    /// clone-cheap and remains valid for flows retained by this generation.
+    pub tls_connector: Option<crate::tls::TlsConnector>,
     pub runtime: ProtocolRuntime,
 }
 
@@ -194,9 +197,18 @@ impl OutboundRuntimeRegistry {
                 }
                 _ => ProtocolRuntime::None,
             };
+            let tls_connector = node
+                .tls
+                .then(|| crate::tls::build_connector(node))
+                .transpose()
+                .map_err(|source| RuntimeRegistryError::Tls {
+                    node: node.name.clone(),
+                    source,
+                })?;
             let runtime = Arc::new(NodeRuntime {
                 node: Arc::new(node.clone()),
                 capabilities: OutboundCapabilities::for_node(node),
+                tls_connector,
                 runtime: protocol_runtime,
             });
             if let Some(prev) = map.insert(node.id, Arc::clone(&runtime)) {

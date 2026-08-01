@@ -22,19 +22,18 @@ impl DnsCacheService {
     fn get_slot(&self, key: &CacheSlot) -> Option<CachedEntry> {
         let index = self.shard_index(key);
         let mut shard = lock(&self.shards[index]);
-        if shard.peek(key).is_some_and(|value| {
-            matches!(value, CacheValue::Positive(entry) if entry.is_stale_retention_exceeded())
-        }) {
-            shard.pop(key);
-            self.counters.misses.fetch_add(1, Ordering::Relaxed);
-            crate::stats::record_dns_event(crate::stats::DnsStatEvent::CacheMiss);
-            tracing::debug!(result = "miss", "DNS cache lookup");
-            return None;
-        }
-        let result = match shard.get(key) {
-            Some(CacheValue::Positive(entry)) if !entry.is_expired() => Some(entry.clone()),
-            Some(CacheValue::Positive(_) | CacheValue::Negative { .. }) | None => None,
+        let (result, remove) = match shard.get(key) {
+            Some(CacheValue::Positive(entry)) if entry.is_stale_retention_exceeded() => {
+                (None, true)
+            }
+            Some(CacheValue::Positive(entry)) if !entry.is_expired() => {
+                (Some(entry.clone()), false)
+            }
+            Some(CacheValue::Positive(_) | CacheValue::Negative { .. }) | None => (None, false),
         };
+        if remove {
+            shard.pop(key);
+        }
         if result.is_some() {
             self.counters.hits.fetch_add(1, Ordering::Relaxed);
             crate::stats::record_dns_event(crate::stats::DnsStatEvent::CacheHit);

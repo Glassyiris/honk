@@ -51,6 +51,17 @@ const CONN_STATE_ELEVATED_WATERMARK: f64 = 0.70;
 /// Occupancy fraction that latches pressure mode (sweep every tick).
 const CONN_STATE_PRESSURE_WATERMARK: f64 = 0.85;
 
+const JANITOR_MIN_SCAN_CHUNK: usize = 128;
+const JANITOR_BASE_SCAN_CHUNK: usize = 256;
+const JANITOR_MAX_SCAN_CHUNK: usize = 1024;
+const JANITOR_BASE_CANDIDATES: usize = 1024;
+const JANITOR_MAX_CANDIDATES: usize = 4096;
+const JANITOR_BASE_SCAN_BUDGET: Duration = Duration::from_millis(100);
+const JANITOR_ELEVATED_SCAN_BUDGET: Duration = Duration::from_millis(150);
+const JANITOR_PRESSURE_SCAN_BUDGET: Duration = Duration::from_millis(200);
+const AUX_MAP_CAPACITY: usize = 65_536;
+const AUX_MAP_PRESSURE_WATERMARK: f64 = 0.80;
+
 /// Redirect track entry timeout: 120 seconds.
 const REDIRECT_TRACK_TIMEOUT_NS: u64 = 120_000_000_000;
 /// Cookie PID entry timeout: 600 seconds.
@@ -64,14 +75,6 @@ const PRESSURE_EXIT_ROUNDS: u32 = 3;
 
 /// TCP protocol number in `TuplesKey::l4proto`.
 const IPPROTO_TCP: u8 = 6;
-/// Entries examined or retained by one janitor pass.  A later pass resumes
-/// naturally; bounded work is preferable to delaying the async runtime.
-const JANITOR_SCAN_CHUNK: usize = 256;
-const AUX_MAP_CAPACITY: usize = 65_536;
-const AUX_MAP_PRESSURE_WATERMARK: f64 = 0.80;
-const JANITOR_MAX_CANDIDATES: usize = 1024;
-/// Per-map wall-clock budget for a janitor round. Work resumes next round.
-const JANITOR_SCAN_BUDGET: Duration = Duration::from_millis(100);
 
 /// Live CONN_STATE_MAP occupancy estimate, derived from the datapath's
 /// insert/delete counters plus the janitor's own delete accounting, and
@@ -105,6 +108,45 @@ impl OccupancyGauge {
 
     fn note_janitor_deletes(&mut self, n: u64) {
         self.janitor_deletes += n;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScanTuning {
+    chunk: usize,
+    candidates: usize,
+    budget: Duration,
+}
+
+fn scan_tuning(utilization: f64, previous_elapsed: Duration) -> ScanTuning {
+    let (mut chunk, candidates, budget) = if utilization >= CONN_STATE_PRESSURE_WATERMARK {
+        (
+            JANITOR_BASE_SCAN_CHUNK * 2,
+            JANITOR_MAX_CANDIDATES,
+            JANITOR_PRESSURE_SCAN_BUDGET,
+        )
+    } else if utilization >= CONN_STATE_ELEVATED_WATERMARK {
+        (
+            JANITOR_BASE_SCAN_CHUNK,
+            JANITOR_BASE_CANDIDATES * 2,
+            JANITOR_ELEVATED_SCAN_BUDGET,
+        )
+    } else {
+        (
+            JANITOR_BASE_SCAN_CHUNK,
+            JANITOR_BASE_CANDIDATES,
+            JANITOR_BASE_SCAN_BUDGET,
+        )
+    };
+    if previous_elapsed > budget {
+        chunk = (chunk / 2).max(JANITOR_MIN_SCAN_CHUNK);
+    } else if utilization >= CONN_STATE_ELEVATED_WATERMARK && previous_elapsed < budget / 2 {
+        chunk = (chunk * 2).min(JANITOR_MAX_SCAN_CHUNK);
+    }
+    ScanTuning {
+        chunk,
+        candidates,
+        budget,
     }
 }
 
@@ -167,6 +209,7 @@ impl BpfJanitor {
             let mut aux_scan_high_water = [0usize; 3];
             let mut last_aux_failures = [0u64; 3];
             let mut aux_pressure_warned = [false; 3];
+            let mut last_scan_elapsed = [Duration::ZERO; 4];
 
             let mut last_redirect_cleanup = tokio::time::Instant::now();
             let mut last_cookie_pid_cleanup = tokio::time::Instant::now();
@@ -234,7 +277,12 @@ impl BpfJanitor {
                 };
 
                 if last_conn_state_cleanup + conn_state_interval <= now {
-                    let (deleted, total) = self.cleanup_conn_state(&mut gauge, occ_counters).await;
+                    let tuning = scan_tuning(utilization, last_scan_elapsed[0]);
+                    let started = Instant::now();
+                    let (deleted, total) = self
+                        .cleanup_conn_state(&mut gauge, occ_counters, tuning)
+                        .await;
+                    last_scan_elapsed[0] = started.elapsed();
                     last_conn_state_cleanup = now;
                     if utilization >= CONN_STATE_ELEVATED_WATERMARK || deleted > 0 {
                         info!(
@@ -245,20 +293,40 @@ impl BpfJanitor {
                         );
                     }
                 }
+                let auxiliary_pressure_floor = if pressure.active {
+                    CONN_STATE_PRESSURE_WATERMARK
+                } else {
+                    0.0
+                };
 
                 if last_redirect_cleanup + redirect_interval <= now {
-                    let (_, scanned) = self.cleanup_redirect_track().await;
+                    let utilization = (aux_scan_high_water[0] as f64 / AUX_MAP_CAPACITY as f64)
+                        .max(auxiliary_pressure_floor);
+                    let tuning = scan_tuning(utilization, last_scan_elapsed[1]);
+                    let started = Instant::now();
+                    let (_, scanned) = self.cleanup_redirect_track(tuning).await;
+                    last_scan_elapsed[1] = started.elapsed();
                     aux_scan_high_water[0] = aux_scan_high_water[0].max(scanned);
                     last_redirect_cleanup = now;
                 }
                 if last_cookie_pid_cleanup + redirect_interval <= now {
-                    let (_, scanned) = self.cleanup_cookie_pid().await;
+                    let utilization = (aux_scan_high_water[1] as f64 / AUX_MAP_CAPACITY as f64)
+                        .max(auxiliary_pressure_floor);
+                    let tuning = scan_tuning(utilization, last_scan_elapsed[2]);
+                    let started = Instant::now();
+                    let (_, scanned) = self.cleanup_cookie_pid(tuning).await;
+                    last_scan_elapsed[2] = started.elapsed();
                     aux_scan_high_water[1] = aux_scan_high_water[1].max(scanned);
                     last_cookie_pid_cleanup = now;
                 }
 
                 if last_routing_handoff + routing_interval <= now {
-                    let (_, scanned) = self.cleanup_routing_handoff().await;
+                    let utilization = (aux_scan_high_water[2] as f64 / AUX_MAP_CAPACITY as f64)
+                        .max(auxiliary_pressure_floor);
+                    let tuning = scan_tuning(utilization, last_scan_elapsed[3]);
+                    let started = Instant::now();
+                    let (_, scanned) = self.cleanup_routing_handoff(tuning).await;
+                    last_scan_elapsed[3] = started.elapsed();
                     aux_scan_high_water[2] = aux_scan_high_water[2].max(scanned);
                     last_routing_handoff = now;
                 }
@@ -304,6 +372,7 @@ impl BpfJanitor {
         &self,
         gauge: &mut OccupancyGauge,
         occ_counters: ((u64, u64), u64),
+        tuning: ScanTuning,
     ) -> (u64, usize) {
         let now_ns = match monotonic_now_ns() {
             Ok(ns) => ns,
@@ -312,14 +381,16 @@ impl BpfJanitor {
                 return (0, 0);
             }
         };
+        // Map iteration uses synchronous BPF syscalls. Run a bounded scan in
+        // the blocking pool while retaining exclusive access for race-safe
+        // conditional deletion.
         let result = self
             .run_blocking_scan("conn-state", move |ebpf| {
-                let deadline = Instant::now() + JANITOR_SCAN_BUDGET;
-                let mut expired =
-                    Vec::<(TuplesKey, ConnState)>::with_capacity(JANITOR_MAX_CANDIDATES);
+                let deadline = Instant::now() + tuning.budget;
+                let mut expired = Vec::<(TuplesKey, ConnState)>::with_capacity(tuning.candidates);
                 let mut total = 0usize;
                 let mut completed = true;
-                ebpf.conn_state_for_each_chunk(JANITOR_SCAN_CHUNK, &mut |chunk| {
+                ebpf.conn_state_for_each_chunk(tuning.chunk, &mut |chunk| {
                     total += chunk.len();
                     for (key, state) in chunk {
                         let age = now_ns.saturating_sub(state.last_seen_ns);
@@ -337,11 +408,11 @@ impl BpfJanitor {
                         }
                     }
                     let keep_scanning =
-                        expired.len() < JANITOR_MAX_CANDIDATES && Instant::now() < deadline;
+                        expired.len() < tuning.candidates && Instant::now() < deadline;
                     completed &= keep_scanning;
                     keep_scanning
                 })?;
-                expired.truncate(JANITOR_MAX_CANDIDATES);
+                expired.truncate(tuning.candidates);
                 let deleted = if expired.is_empty() {
                     0
                 } else {
@@ -369,7 +440,7 @@ impl BpfJanitor {
     }
 
     /// Clean up stale redirect track entries.
-    async fn cleanup_redirect_track(&self) -> (u64, usize) {
+    async fn cleanup_redirect_track(&self, tuning: ScanTuning) -> (u64, usize) {
         let now_ns = match monotonic_now_ns() {
             Ok(ns) => ns,
             Err(error) => {
@@ -379,19 +450,19 @@ impl BpfJanitor {
         };
         let result = self
             .run_blocking_scan("redirect-track", move |ebpf| {
-                let deadline = Instant::now() + JANITOR_SCAN_BUDGET;
-                let mut expired = Vec::with_capacity(JANITOR_MAX_CANDIDATES);
+                let deadline = Instant::now() + tuning.budget;
+                let mut expired = Vec::with_capacity(tuning.candidates);
                 let mut total = 0usize;
-                ebpf.redirect_track_for_each_chunk(JANITOR_SCAN_CHUNK, &mut |chunk| {
+                ebpf.redirect_track_for_each_chunk(tuning.chunk, &mut |chunk| {
                     total += chunk.len();
                     for (key, entry) in chunk {
                         if now_ns.saturating_sub(entry.last_seen_ns) > REDIRECT_TRACK_TIMEOUT_NS {
                             expired.push((*key, *entry));
                         }
                     }
-                    expired.len() < JANITOR_MAX_CANDIDATES && Instant::now() < deadline
+                    expired.len() < tuning.candidates && Instant::now() < deadline
                 })?;
-                expired.truncate(JANITOR_MAX_CANDIDATES);
+                expired.truncate(tuning.candidates);
                 let deleted = if expired.is_empty() {
                     0
                 } else {
@@ -419,7 +490,7 @@ impl BpfJanitor {
     ///
     /// Entries whose `last_seen_ns` is older than `COOKIE_PID_TIMEOUT_NS`
     /// are evicted, matching Go's `cleanupCookiePidMap` behaviour.
-    async fn cleanup_cookie_pid(&self) -> (u64, usize) {
+    async fn cleanup_cookie_pid(&self, tuning: ScanTuning) -> (u64, usize) {
         let now_ns = match monotonic_now_ns() {
             Ok(ns) => ns,
             Err(error) => {
@@ -429,19 +500,19 @@ impl BpfJanitor {
         };
         let result = self
             .run_blocking_scan("cookie-pid", move |ebpf| {
-                let deadline = Instant::now() + JANITOR_SCAN_BUDGET;
-                let mut expired = Vec::with_capacity(JANITOR_MAX_CANDIDATES);
+                let deadline = Instant::now() + tuning.budget;
+                let mut expired = Vec::with_capacity(tuning.candidates);
                 let mut total = 0usize;
-                ebpf.cookie_pid_for_each_chunk(JANITOR_SCAN_CHUNK, &mut |chunk| {
+                ebpf.cookie_pid_for_each_chunk(tuning.chunk, &mut |chunk| {
                     total += chunk.len();
                     for (cookie, entry) in chunk {
                         if now_ns.saturating_sub(entry.last_seen_ns) > COOKIE_PID_TIMEOUT_NS {
                             expired.push((*cookie, *entry));
                         }
                     }
-                    expired.len() < JANITOR_MAX_CANDIDATES && Instant::now() < deadline
+                    expired.len() < tuning.candidates && Instant::now() < deadline
                 })?;
-                expired.truncate(JANITOR_MAX_CANDIDATES);
+                expired.truncate(tuning.candidates);
                 let deleted = if expired.is_empty() {
                     0
                 } else {
@@ -466,7 +537,7 @@ impl BpfJanitor {
     }
 
     /// Clean up expired routing handoff entries.
-    async fn cleanup_routing_handoff(&self) -> (u64, usize) {
+    async fn cleanup_routing_handoff(&self, tuning: ScanTuning) -> (u64, usize) {
         let now_ns = match monotonic_now_ns() {
             Ok(ns) => ns,
             Err(error) => {
@@ -476,19 +547,19 @@ impl BpfJanitor {
         };
         let result = self
             .run_blocking_scan("routing-handoff", move |ebpf| {
-                let deadline = Instant::now() + JANITOR_SCAN_BUDGET;
-                let mut expired = Vec::with_capacity(JANITOR_MAX_CANDIDATES);
+                let deadline = Instant::now() + tuning.budget;
+                let mut expired = Vec::with_capacity(tuning.candidates);
                 let mut total = 0usize;
-                ebpf.routing_handoff_for_each_chunk(JANITOR_SCAN_CHUNK, &mut |chunk| {
+                ebpf.routing_handoff_for_each_chunk(tuning.chunk, &mut |chunk| {
                     total += chunk.len();
                     for (key, entry) in chunk {
                         if now_ns.saturating_sub(entry.last_seen_ns) > ROUTING_HANDOFF_TIMEOUT_NS {
                             expired.push((*key, *entry));
                         }
                     }
-                    expired.len() < JANITOR_MAX_CANDIDATES && Instant::now() < deadline
+                    expired.len() < tuning.candidates && Instant::now() < deadline
                 })?;
-                expired.truncate(JANITOR_MAX_CANDIDATES);
+                expired.truncate(tuning.candidates);
                 let deleted = if expired.is_empty() {
                     0
                 } else {
@@ -649,6 +720,32 @@ fn update_pressure_state(state: &mut PressureState, overflow_delta: bool, utiliz
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn scan_tuning_grows_with_pressure() {
+        let steady = scan_tuning(0.5, Duration::ZERO);
+        let elevated = scan_tuning(CONN_STATE_ELEVATED_WATERMARK, Duration::ZERO);
+        let pressure = scan_tuning(CONN_STATE_PRESSURE_WATERMARK, Duration::ZERO);
+
+        assert!(steady.chunk < elevated.chunk);
+        assert!(elevated.chunk <= pressure.chunk);
+        assert!(steady.candidates < elevated.candidates);
+        assert!(elevated.candidates < pressure.candidates);
+        assert!(steady.budget < elevated.budget);
+        assert!(elevated.budget < pressure.budget);
+    }
+
+    #[test]
+    fn scan_tuning_reduces_chunk_after_budget_overrun() {
+        let fast = scan_tuning(CONN_STATE_PRESSURE_WATERMARK, Duration::ZERO);
+        let slow = scan_tuning(
+            CONN_STATE_PRESSURE_WATERMARK,
+            JANITOR_PRESSURE_SCAN_BUDGET + Duration::from_millis(1),
+        );
+
+        assert!(slow.chunk < fast.chunk);
+        assert_eq!(slow.candidates, fast.candidates);
+        assert_eq!(slow.budget, fast.budget);
+    }
 
     #[test]
     fn test_pressure_state_enter_on_overflow_delta() {

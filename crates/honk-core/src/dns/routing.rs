@@ -79,10 +79,8 @@ impl DnsRouter {
         })
     }
 
-    pub fn select_request(&self, domain: &str, qtype: u16) -> DnsRequestDecision {
-        self.select_request_normalized(&domain.to_lowercase(), qtype)
-    }
-
+    /// Select a request route for a domain that has already been normalized to
+    /// ASCII lowercase by the DNS query parser.
     pub(crate) fn select_request_normalized(&self, domain: &str, qtype: u16) -> DnsRequestDecision {
         let evaluation = Evaluation::request(domain, qtype);
         for rule in &self.request_rules {
@@ -101,16 +99,12 @@ impl DnsRouter {
         map_request_action(&self.request_fallback)
     }
 
-    pub fn select_response(
-        &self,
-        domain: &str,
-        qtype: u16,
-        answer_ips: &[IpAddr],
-        from_upstream: &str,
-    ) -> DnsResponseDecision {
-        self.select_response_normalized(&domain.to_lowercase(), qtype, answer_ips, from_upstream)
+    pub fn select_request(&self, domain: &str, qtype: u16) -> DnsRequestDecision {
+        self.select_request_normalized(&domain.to_ascii_lowercase(), qtype)
     }
 
+    /// Select a response route for a domain that has already been normalized
+    /// to ASCII lowercase by the DNS query parser.
     pub(crate) fn select_response_normalized(
         &self,
         domain: &str,
@@ -142,6 +136,21 @@ impl DnsRouter {
         map_response_action(&self.response_fallback)
     }
 
+    pub fn select_response(
+        &self,
+        domain: &str,
+        qtype: u16,
+        answer_ips: &[IpAddr],
+        from_upstream: &str,
+    ) -> DnsResponseDecision {
+        self.select_response_normalized(
+            &domain.to_ascii_lowercase(),
+            qtype,
+            answer_ips,
+            from_upstream,
+        )
+    }
+
     pub fn fixed_ttl(&self, domain: &str) -> Option<u32> {
         self.fixed_domain_ttl.get(domain).copied()
     }
@@ -168,15 +177,18 @@ impl DnsRouter {
         self.rule_count
     }
 
-    pub fn select_upstream(&self, domain: &str) -> &str {
-        let domain_lower = domain.to_lowercase();
-        let evaluation = Evaluation::request(&domain_lower, 1);
+    pub(crate) fn select_upstream_normalized(&self, domain: &str) -> &str {
+        let evaluation = Evaluation::request(domain, 1);
         for rule in &self.request_rules {
             if eval_conditions(&rule.conditions, &evaluation) {
                 return request_action_name(domain, &rule.action, false);
             }
         }
         request_action_name(domain, &self.request_fallback, true)
+    }
+
+    pub fn select_upstream(&self, domain: &str) -> &str {
+        self.select_upstream_normalized(&domain.to_ascii_lowercase())
     }
 }
 

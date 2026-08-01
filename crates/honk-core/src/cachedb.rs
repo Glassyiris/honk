@@ -13,8 +13,9 @@
 
 use honk_config::experimental::CacheFileConfig;
 use rusqlite::{Connection, params};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, mpsc};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CacheDbError {
@@ -23,13 +24,177 @@ pub enum CacheDbError {
     #[error("cache.db operation failed: {0}")]
     Sqlite(#[from] rusqlite::Error),
 }
+#[derive(Clone)]
+struct PendingWrite {
+    sequence: u64,
+    value: Option<String>,
+}
+
+fn flush_pending_writes(
+    pending: &Mutex<HashMap<String, PendingWrite>>,
+    writer: &mpsc::SyncSender<Write>,
+) -> Result<(), CacheDbError> {
+    let snapshot = pending
+        .lock()
+        .map_err(|_| CacheDbError::LockPoisoned)?
+        .iter()
+        .map(|(key, value)| (key.clone(), value.sequence))
+        .collect::<HashMap<_, _>>();
+    if snapshot.is_empty() {
+        return Ok(());
+    }
+    let (ack, result) = mpsc::channel();
+    writer
+        .send(Write::Barrier(ack))
+        .map_err(|_| CacheDbError::LockPoisoned)?;
+    result.recv().map_err(|_| CacheDbError::LockPoisoned)??;
+    pending
+        .lock()
+        .map_err(|_| CacheDbError::LockPoisoned)?
+        .retain(|key, value| snapshot.get(key) != Some(&value.sequence));
+    Ok(())
+}
+
+fn run_writer(mut conn: Connection, receiver: mpsc::Receiver<Write>) {
+    let mut latest = HashMap::<String, String>::new();
+    fn flush(
+        conn: &mut Connection,
+        latest: &mut HashMap<String, String>,
+    ) -> Result<(), rusqlite::Error> {
+        if latest.is_empty() {
+            return Ok(());
+        }
+        let transaction = conn.transaction()?;
+        let mut statement =
+            transaction.prepare("INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)")?;
+        for (key, value) in latest.iter() {
+            statement.execute(params![key, value])?;
+        }
+        drop(statement);
+        transaction.commit()?;
+        latest.clear();
+        Ok(())
+    }
+    while let Ok(write) = receiver.recv() {
+        match write {
+            Write::Set(key, value) => {
+                latest.insert(key, value);
+                if latest.len() >= 64
+                    && let Err(error) = flush(&mut conn, &mut latest)
+                {
+                    tracing::warn!(%error, "cache.db writer batch failed");
+                }
+            }
+            Write::Remove(key) => {
+                if let Err(error) = flush(&mut conn, &mut latest).and_then(|_| {
+                    conn.execute("DELETE FROM kv WHERE key = ?1", params![key])
+                        .map(|_| ())
+                }) {
+                    tracing::warn!(%error, "cache.db remove failed");
+                }
+            }
+            Write::FlushPrefix(prefix, ack) => {
+                let result = flush(&mut conn, &mut latest)
+                    .and_then(|_| {
+                        conn.execute(
+                            "DELETE FROM kv WHERE key LIKE ?1 ESCAPE '\\'",
+                            params![format!("{prefix}%")],
+                        )
+                        .map(|_| ())
+                    })
+                    .map_err(CacheDbError::from);
+                let _ = ack.send(result);
+            }
+            Write::Barrier(ack) => {
+                let result = flush(&mut conn, &mut latest).map_err(CacheDbError::from);
+                let _ = ack.send(result);
+            }
+            Write::DnsV2(entries, ack) => {
+                let result = (|| -> Result<(), rusqlite::Error> {
+                    flush(&mut conn, &mut latest)?;
+                    let transaction = conn.transaction()?;
+                    let mut statement = transaction
+                        .prepare("INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)")?;
+                    for (key, value) in entries {
+                        statement.execute(params![key, value])?;
+                    }
+                    drop(statement);
+                    transaction.commit()
+                })()
+                .map_err(CacheDbError::from);
+                let _ = ack.send(result);
+            }
+            Write::FlushDns(legacy, v2, ack) => {
+                let result = flush(&mut conn, &mut latest).and_then(|_| conn.execute("DELETE FROM kv WHERE key LIKE ?1 ESCAPE '\\' OR key LIKE ?2 ESCAPE '\\'", params![format!("{legacy}%"), format!("{v2}%")]).map(|_| ())).map_err(CacheDbError::from);
+                let _ = ack.send(result);
+            }
+            #[cfg(test)]
+            Write::SetQueryOnly(enabled, ack) => {
+                let result = conn
+                    .pragma_update(None, "query_only", enabled)
+                    .map_err(CacheDbError::from);
+                let _ = ack.send(result);
+            }
+            #[cfg(test)]
+            Write::Block(entered, release) => {
+                let _ = entered.send(());
+                let _ = release.recv();
+            }
+        }
+    }
+    if let Err(error) = flush(&mut conn, &mut latest) {
+        tracing::warn!(%error, "cache.db writer final flush failed");
+    }
+}
+
+enum Write {
+    Set(String, String),
+    Remove(String),
+    FlushPrefix(String, mpsc::Sender<Result<(), CacheDbError>>),
+    Barrier(mpsc::Sender<Result<(), CacheDbError>>),
+    DnsV2(
+        Vec<(String, Vec<u8>)>,
+        mpsc::Sender<Result<(), CacheDbError>>,
+    ),
+    FlushDns(String, String, mpsc::Sender<Result<(), CacheDbError>>),
+    #[cfg(test)]
+    SetQueryOnly(bool, mpsc::Sender<Result<(), CacheDbError>>),
+    #[cfg(test)]
+    Block(mpsc::Sender<()>, mpsc::Receiver<()>),
+}
+
+#[cfg(test)]
+pub(crate) struct CacheDbWriterGuard {
+    release: mpsc::Sender<()>,
+}
+
+#[cfg(test)]
+impl Drop for CacheDbWriterGuard {
+    fn drop(&mut self) {
+        let _ = self.release.send(());
+    }
+}
 
 pub struct CacheDb {
+    /// Read-only connection. Writes are serialized by `writer`, so readers
+    /// never wait behind an arbitrary write batch while holding this lock.
     conn: Mutex<Connection>,
-    /// Key namespace prefix derived from `cache_id` ("" when empty).
+    /// Latest asynchronous point writes, used by point reads until the writer
+    /// has durably folded them into SQLite.
+    pending: Arc<Mutex<HashMap<String, PendingWrite>>>,
+    writer: mpsc::SyncSender<Write>,
+    next_sequence: std::sync::atomic::AtomicU64,
     prefix: String,
     #[cfg(test)]
     write_attempted: std::sync::atomic::AtomicBool,
+}
+
+impl Drop for CacheDb {
+    fn drop(&mut self) {
+        if let Err(error) = self.flush_pending() {
+            tracing::warn!(%error, "cache.db final point-write flush failed");
+        }
+    }
 }
 
 impl CacheDb {
@@ -81,9 +246,42 @@ impl CacheDb {
             return None;
         }
 
-        tracing::info!("cache.db opened at {}", path.display());
+        let reader = match open_and_check(&path) {
+            Ok(conn) => conn,
+            Err(error) => {
+                tracing::warn!(%error, "cache.db reader connection failed");
+                return None;
+            }
+        };
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (writer, receiver) = mpsc::sync_channel(1024);
+        std::thread::Builder::new()
+            .name("honk-cache-db-writer".into())
+            .spawn(move || run_writer(conn, receiver))
+            .map_err(|error| tracing::warn!(%error, "cache.db writer spawn failed"))
+            .ok()?;
+        let flush_pending = Arc::downgrade(&pending);
+        let flush_writer = writer.clone();
+        std::thread::Builder::new()
+            .name("honk-cache-db-flusher".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    let Some(pending) = flush_pending.upgrade() else {
+                        break;
+                    };
+                    if let Err(error) = flush_pending_writes(&pending, &flush_writer) {
+                        tracing::warn!(%error, "cache.db periodic point-write flush failed");
+                    }
+                }
+            })
+            .map_err(|error| tracing::warn!(%error, "cache.db flusher spawn failed"))
+            .ok()?;
         Some(Self {
-            conn: Mutex::new(conn),
+            conn: Mutex::new(reader),
+            pending,
+            writer,
+            next_sequence: std::sync::atomic::AtomicU64::new(1),
             prefix,
             #[cfg(test)]
             write_attempted: std::sync::atomic::AtomicBool::new(false),
@@ -101,50 +299,95 @@ impl CacheDb {
 
     pub fn get(&self, key: &str) -> Option<String> {
         let key = self.wrap(key);
+        if let Some(value) = self.pending.lock().ok()?.get(&key) {
+            return value.value.clone();
+        }
         let conn = self.conn.lock().ok()?;
         conn.query_row("SELECT value FROM kv WHERE key = ?1", params![key], |r| {
             r.get(0)
         })
         .ok()
     }
-
     pub fn set(&self, key: &str, value: &str) {
         let key = self.wrap(key);
-        if let Ok(conn) = self.conn.lock()
-            && let Err(e) = conn.execute(
-                "INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)",
-                params![key, value],
-            )
-        {
-            tracing::warn!("cache.db set '{}' failed: {}", key, e);
+        let sequence = self
+            .next_sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let value = value.to_owned();
+        let Ok(mut pending) = self.pending.lock() else {
+            tracing::warn!("cache.db pending-write lock poisoned");
+            return;
+        };
+        let previous = pending.insert(
+            key.clone(),
+            PendingWrite {
+                sequence,
+                value: Some(value.clone()),
+            },
+        );
+        if let Err(error) = self.writer.send(Write::Set(key.clone(), value)) {
+            match previous {
+                Some(value) => {
+                    pending.insert(key, value);
+                }
+                None => {
+                    pending.remove(&key);
+                }
+            }
+            tracing::warn!(%error, "cache.db writer closed; point write rejected");
         }
     }
 
     pub fn remove(&self, key: &str) {
         let key = self.wrap(key);
-        if let Ok(conn) = self.conn.lock()
-            && let Err(e) = conn.execute("DELETE FROM kv WHERE key = ?1", params![key])
-        {
-            tracing::warn!("cache.db remove '{}' failed: {}", key, e);
+        let sequence = self
+            .next_sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let Ok(mut pending) = self.pending.lock() else {
+            tracing::warn!("cache.db pending-write lock poisoned");
+            return;
+        };
+        let previous = pending.insert(
+            key.clone(),
+            PendingWrite {
+                sequence,
+                value: None,
+            },
+        );
+        if let Err(error) = self.writer.send(Write::Remove(key.clone())) {
+            match previous {
+                Some(value) => {
+                    pending.insert(key, value);
+                }
+                None => {
+                    pending.remove(&key);
+                }
+            }
+            tracing::warn!(%error, "cache.db writer closed; remove rejected");
         }
     }
 
+    fn flush_pending(&self) -> Result<(), CacheDbError> {
+        flush_pending_writes(&self.pending, &self.writer)
+    }
+
     /// Delete all keys starting with `prefix` (after namespacing).
-    /// Reserved for future use (e.g. flushing persisted FakeIP mappings).
     pub fn flush_prefix(&self, prefix: &str) {
         let prefix = self.wrap(prefix);
-        // Escape LIKE metacharacters so the prefix matches literally.
-        let escaped = prefix
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        if let Ok(conn) = self.conn.lock()
-            && let Err(e) = conn.execute(
-                "DELETE FROM kv WHERE key LIKE ?1 ESCAPE '\\'",
-                params![format!("{}%", escaped)],
-            )
-        {
-            tracing::warn!("cache.db flush_prefix '{}' failed: {}", prefix, e);
+        let Ok(mut pending) = self.pending.lock() else {
+            tracing::warn!("cache.db pending-write lock poisoned");
+            return;
+        };
+        let (ack, result) = mpsc::channel();
+        let flushed = self
+            .writer
+            .send(Write::FlushPrefix(prefix.clone(), ack))
+            .map_err(|_| CacheDbError::LockPoisoned)
+            .and_then(|_| result.recv().map_err(|_| CacheDbError::LockPoisoned))
+            .and_then(|result| result);
+        match flushed {
+            Ok(()) => pending.retain(|key, _| !key.starts_with(&prefix)),
+            Err(error) => tracing::warn!(%error, "cache.db prefix flush failed"),
         }
     }
 
@@ -155,17 +398,17 @@ impl CacheDb {
         #[cfg(test)]
         self.write_attempted
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let mut conn = self.conn.lock().map_err(|_| CacheDbError::LockPoisoned)?;
-        let transaction = conn.transaction()?;
-        {
-            let mut statement =
-                transaction.prepare("INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)")?;
-            for (suffix, value) in entries {
-                statement.execute(params![self.wrap(&format!("dns:v2:{suffix}")), value])?;
-            }
-        }
-        transaction.commit()?;
-        Ok(())
+        let (ack, result) = mpsc::channel();
+        self.writer
+            .send(Write::DnsV2(
+                entries
+                    .iter()
+                    .map(|(suffix, value)| (self.wrap(&format!("dns:v2:{suffix}")), value.clone()))
+                    .collect(),
+                ack,
+            ))
+            .map_err(|_| CacheDbError::LockPoisoned)?;
+        result.recv().map_err(|_| CacheDbError::LockPoisoned)?
     }
 
     pub(crate) fn load_dns_v2(&self) -> Result<Vec<(String, Vec<u8>)>, CacheDbError> {
@@ -190,14 +433,22 @@ impl CacheDb {
     }
 
     pub(crate) fn flush_dns_namespaces(&self) -> Result<(), CacheDbError> {
-        let legacy = escape_like_prefix(&self.wrap("dns:"));
-        let v2 = escape_like_prefix(&self.wrap("dns:v2:"));
-        let conn = self.conn.lock().map_err(|_| CacheDbError::LockPoisoned)?;
-        conn.execute(
-            "DELETE FROM kv
-             WHERE key LIKE ?1 ESCAPE '\\' OR key LIKE ?2 ESCAPE '\\'",
-            params![format!("{legacy}%"), format!("{v2}%")],
-        )?;
+        let legacy = self.wrap("dns:");
+        let v2 = self.wrap("dns:v2:");
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| CacheDbError::LockPoisoned)?;
+        let (ack, result) = mpsc::channel();
+        self.writer
+            .send(Write::FlushDns(
+                escape_like_prefix(&legacy),
+                escape_like_prefix(&v2),
+                ack,
+            ))
+            .map_err(|_| CacheDbError::LockPoisoned)?;
+        result.recv().map_err(|_| CacheDbError::LockPoisoned)??;
+        pending.retain(|key, _| !key.starts_with(&legacy));
         Ok(())
     }
 
@@ -232,6 +483,9 @@ impl CacheDb {
     /// relative to `now_unix`. Stale or malformed entries are skipped and
     /// lazily deleted. Returns `(node, delay_ms, measured_at_unix)`.
     pub fn load_delay_samples(&self, now_unix: u64, max_age_secs: u64) -> Vec<(String, u64, u64)> {
+        if let Err(error) = self.flush_pending() {
+            tracing::warn!(%error, "cache.db delay scan flush failed");
+        }
         let prefix = self.wrap("delay:");
         let escaped = prefix
             .replace('\\', "\\\\")
@@ -305,6 +559,9 @@ impl CacheDb {
     /// Load every persisted DNS answer that is still fresh at `now_unix`.
     /// Expired (or malformed) entries are skipped and lazily deleted.
     pub fn load_dns_answers(&self, now_unix: u64) -> Vec<PersistedDnsAnswer> {
+        if let Err(error) = self.flush_pending() {
+            tracing::warn!(%error, "cache.db DNS scan flush failed");
+        }
         let prefix = self.wrap("dns:");
         let v2_prefix = self.wrap("dns:v2:");
         let escaped = prefix
@@ -405,13 +662,21 @@ impl CacheDb {
         if let Ok(conn) = self.conn.lock() {
             let _ = conn.pragma_update(None, "query_only", enabled);
         }
+        let (ack, result) = mpsc::channel();
+        if self.writer.send(Write::SetQueryOnly(enabled, ack)).is_ok() {
+            let _ = result.recv();
+        }
     }
 
     #[cfg(test)]
-    pub(crate) fn lock_for_test(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.conn
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    pub(crate) fn lock_for_test(&self) -> CacheDbWriterGuard {
+        let (entered, ready) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        self.writer
+            .send(Write::Block(entered, released))
+            .expect("cache.db writer available");
+        ready.recv().expect("cache.db writer blocked");
+        CacheDbWriterGuard { release }
     }
 
     #[cfg(test)]
@@ -523,6 +788,74 @@ mod tests {
         assert_eq!(db.get("k").as_deref(), Some("v2"));
         db.remove("k");
         assert!(db.get("k").is_none());
+    }
+
+    #[test]
+    fn point_writes_are_latest_wins_without_blocking_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.db");
+        let db = std::sync::Arc::new(CacheDb::open(&cfg(&path, ""), None).unwrap());
+        let writer = std::sync::Arc::clone(&db);
+        let worker = std::thread::spawn(move || {
+            for value in 0..10_000 {
+                writer.set("selector:proxy", &value.to_string());
+            }
+        });
+        for _ in 0..10_000 {
+            let _ = db.get("selector:proxy");
+        }
+        worker.join().unwrap();
+        assert_eq!(db.get("selector:proxy").as_deref(), Some("9999"));
+    }
+
+    #[test]
+    fn point_save_does_not_wait_for_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.db");
+        let db = Arc::new(CacheDb::open(&cfg(&path, ""), None).unwrap());
+        let writer_guard = db.lock_for_test();
+        let (completed, completion) = mpsc::channel();
+        let saving = Arc::clone(&db);
+        let worker = std::thread::spawn(move || {
+            saving.save_selector_choice("proxy", "node-a");
+            completed.send(()).unwrap();
+        });
+
+        completion
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .expect("point save must not wait for SQLite");
+        assert_eq!(db.load_selector_choice("proxy").as_deref(), Some("node-a"));
+        drop(writer_guard);
+        worker.join().unwrap();
+        db.flush_pending().unwrap();
+    }
+
+    #[test]
+    fn periodic_flush_bounds_point_write_durability() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.db");
+        let db = CacheDb::open(&cfg(&path, ""), None).unwrap();
+        db.set("k", "v");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            let stored = db
+                .conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT value FROM kv WHERE key = 'k'", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .ok();
+            if stored.as_deref() == Some("v") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "periodic flush exceeded durability bound"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[test]

@@ -976,8 +976,13 @@ struct ConnectionsQuery {
 
 /// Build the clash connections document from the tracker snapshot.
 fn connections_json(s: &ClashState) -> serde_json::Value {
-    let snapshots = s.connection_tracker.snapshot();
+    connections_json_tracker(&s.connection_tracker)
+}
 
+fn connections_json_tracker(
+    tracker: &crate::connection_tracker::ConnectionTracker,
+) -> serde_json::Value {
+    let snapshots = tracker.snapshot();
     let connections: Vec<serde_json::Value> = snapshots
         .iter()
         .map(|e| {
@@ -991,10 +996,9 @@ fn connections_json(s: &ClashState) -> serde_json::Value {
                 ""
             };
             let dst_ip = if dest_ip.len() > 1 { dest_ip[1] } else { "" };
-            // start_time is an Instant; recover wall time as RFC3339.
             let start = std::time::SystemTime::now()
                 .checked_sub(e.start_time.elapsed())
-                .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339())
+                .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339())
                 .unwrap_or_default();
 
             serde_json::json!({
@@ -1020,13 +1024,12 @@ fn connections_json(s: &ClashState) -> serde_json::Value {
         })
         .collect();
 
-    let (total_up, total_down) = snapshots.iter().fold((0u64, 0u64), |(up, down), e| {
-        (up + e.upload, down + e.download)
-    });
-
+    let (upload, download) = snapshots
+        .iter()
+        .fold((0, 0), |(up, down), e| (up + e.upload, down + e.download));
     serde_json::json!({
-        "downloadTotal": total_down,
-        "uploadTotal": total_up,
+        "downloadTotal": download,
+        "uploadTotal": upload,
         "connections": connections,
         "memory": 0,
     })
@@ -1112,24 +1115,23 @@ async fn delete_connection(State(s): State<Arc<ClashState>>, Path(id): Path<Stri
     StatusCode::NO_CONTENT
 }
 
-/// Sum tx/rx bytes across all outbounds.
 async fn traffic_totals(s: &ClashState) -> (u64, u64) {
-    let snap = s.stats.snapshot();
-    snap.values().fold((0u64, 0u64), |(up, down), st| {
-        (up + st.tx_bytes, down + st.rx_bytes)
+    traffic_totals_stats(&s.stats)
+}
+
+fn traffic_totals_stats(stats: &crate::stats::StatsManager) -> (u64, u64) {
+    stats.snapshot().values().fold((0, 0), |(up, down), value| {
+        (up + value.tx_bytes, down + value.rx_bytes)
     })
 }
 
 async fn get_traffic(State(s): State<Arc<ClashState>>, ws: MaybeWs) -> Response {
     let Some(ws) = ws.0 else {
-        // Non-WS clients get a chunked JSON stream (sing-box behavior):
-        // one `{"up","down"}` line per second.
         return chunked_json_response(traffic_chunk_stream(s));
     };
     ws.on_upgrade(move |socket| traffic_ws(socket, s))
 }
 
-/// Push per-second up/down byte deltas (clash `/traffic` shape).
 async fn traffic_ws(mut socket: WebSocket, s: Arc<ClashState>) {
     ensure_traffic_sampler(&s);
     let mut frames = s.stream_samplers.traffic.subscribe();

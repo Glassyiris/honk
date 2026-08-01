@@ -547,8 +547,13 @@ impl ProxyHandler for TuicHandler {
         connect_timeout: Duration,
     ) -> anyhow::Result<super::UdpWarmStatus> {
         let client = self.client_for_runtime(&runtime).await?;
+        let already_ready = client.quic.has_live_connection().await;
         client.connection(connect_timeout).await?;
-        Ok(super::UdpWarmStatus::Ready)
+        Ok(if already_ready {
+            super::UdpWarmStatus::AlreadyReady
+        } else {
+            super::UdpWarmStatus::Ready
+        })
     }
 
     async fn dial(

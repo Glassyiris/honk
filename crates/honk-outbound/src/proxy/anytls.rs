@@ -1441,8 +1441,9 @@ pub(crate) struct AnyTlsStream {
         >,
     >,
     fin_sent: bool,
-    /// Stream-slot capacity, held for the stream's whole life (released
-    /// on Drop).
+    /// Stream-slot capacity, held until either endpoint closes the stream.
+    /// A server FIN releases it immediately even if callers retain the EOF
+    /// stream object.
     _permit: Option<crate::session::SessionPermit<AnyTlsSession>>,
 }
 
@@ -1466,6 +1467,10 @@ impl AnyTlsStream {
             fin_sent: false,
             _permit: Some(permit),
         }
+    }
+
+    fn release_permit(&mut self) {
+        self._permit.take();
     }
 }
 
@@ -1557,6 +1562,7 @@ impl tokio::io::AsyncRead for AnyTlsStream {
                         return std::task::Poll::Ready(Ok(()));
                     }
                     this.read_eof = true;
+                    this.release_permit();
                     return std::task::Poll::Ready(Err(err));
                 }
                 std::task::Poll::Ready(Some(StreamEvent::Fin)) => {
@@ -1566,7 +1572,7 @@ impl tokio::io::AsyncRead for AnyTlsStream {
                     // next poll via `read_eof` (returning it now would
                     // either discard the data or lose the Fin).
                     this.read_eof = true;
-                    this._permit.take();
+                    this.release_permit();
                     return std::task::Poll::Ready(Ok(()));
                 }
                 std::task::Poll::Ready(None) => {
@@ -1599,9 +1605,11 @@ impl tokio::io::AsyncRead for AnyTlsStream {
                             return std::task::Poll::Ready(Ok(()));
                         }
                         this.read_eof = true;
+                        this.release_permit();
                         return std::task::Poll::Ready(Err(err));
                     }
                     this.read_eof = true;
+                    this.release_permit();
                     return std::task::Poll::Ready(Ok(()));
                 }
                 std::task::Poll::Pending => {

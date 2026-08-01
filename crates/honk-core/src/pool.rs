@@ -192,6 +192,7 @@ impl ConnectionPool {
         }
     }
 
+    #[cfg(any(test, feature = "clash-api"))]
     pub(crate) fn ready_metrics(&self) -> ReadyPoolMetrics {
         ReadyPoolMetrics {
             hits: self.ready_hits.load(Ordering::Relaxed),
