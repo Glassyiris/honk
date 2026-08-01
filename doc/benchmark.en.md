@@ -561,6 +561,27 @@ IPv4/IPv6 client-observed reply tuples must remain unchanged. **This local
 worktree has not run the deployment gate, so it makes no network-latency gate
 claim.**
 
+## Release profile and allocator matrix
+
+`bench/release-matrix.sh` compares the explicit `release-size`,
+`release-size-thin`, `release-speed`, and `release-speed-thin` profiles against
+three allocator arms: mimalloc with collection disabled, mimalloc with the
+60-second collector, and the system allocator. Every cell uses isolated Cargo,
+workload-cache, and run directories and emits machine metadata plus JSONL/CSV
+build and performance records.
+
+Validate all four supported target configurations without compiling:
+
+```bash
+bench/release-matrix.sh --all-targets --dry-run --output /tmp/honk-release-matrix
+```
+
+A measured host run requires an executable `--benchmark-hook`; the hook contract
+and required RSS/PSS/fault/CPU/latency fields are printed by
+`bench/release-matrix.sh --help`. Compare cells only on the same machine and
+workload. The matrix records evidence; it does not select a new shipping profile
+without deployment throughput and tail-latency results.
+
 ## Production notes (10.10.10.1 gateway)
 
 - TCP (google/baidu/cloudflare) and HTTP/3 (cloudflare) pass after each

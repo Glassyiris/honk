@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::Context;
 use tracing::{debug, trace};
 
-use crate::dns::cache::{DnsCacheService, PublicationEpoch};
+use crate::dns::cache::{CacheKey, DnsCacheService, PublicationEpoch};
 use crate::dns::engine::{DnsEngine, PreparedQuery};
 use crate::dns::outcome::{DnsOutcome, EffectiveExpiry, OutcomeParts, OutcomeStatus, Provenance};
 use crate::dns::planner::RequestScope;
@@ -75,7 +75,7 @@ impl DnsForwarder {
     /// patched to the caller's query.
     pub(crate) async fn try_serve_stale(
         &self,
-        cache_key: &str,
+        cache_key: &CacheKey,
         raw_query: &[u8],
         domain: &str,
     ) -> Option<Vec<u8>> {
@@ -83,8 +83,8 @@ impl DnsForwarder {
             return None;
         }
         let cache = self.cache_service().await;
-        let entry = cache.get_stale(cache_key)?;
-        let mut response = entry.response.clone();
+        let entry = cache.get_stale_exact(cache_key)?;
+        let mut response = entry.response.to_vec();
         rewrite_answer_ttls(&mut response, SERVE_STALE_TTL_SECS);
         if response.len() >= 2 && raw_query.len() >= 2 {
             response[0..2].copy_from_slice(&raw_query[0..2]);

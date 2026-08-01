@@ -1,8 +1,8 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use honk_config::types::DnsProtocol;
-use honk_ebpf_common::DAE_BYPASS_MARK;
 use tracing::debug;
 
 use super::UpstreamPool;
@@ -12,58 +12,27 @@ use crate::dns::transport::TcpPool;
 
 impl UpstreamPool {
     async fn query_udp(
-        address: SocketAddr,
+        entry: &UpstreamEntry,
         raw_query: &[u8],
         query_timeout: Duration,
     ) -> anyhow::Result<Vec<u8>> {
-        let domain = if address.is_ipv4() {
-            socket2::Domain::IPV4
-        } else {
-            socket2::Domain::IPV6
+        let pool = {
+            if let Some(pool) = entry.udp.lock().as_ref() {
+                Arc::clone(pool)
+            } else {
+                let address = Self::resolve_udp_addr(entry).await?;
+                let pool = crate::dns::transport::UdpPool::new(address, query_timeout).await?;
+                let mut slot = entry.udp.lock();
+                Arc::clone(slot.get_or_insert(pool))
+            }
         };
-        let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, None)?;
-        socket.set_nonblocking(true)?;
-        #[cfg(target_os = "linux")]
-        honk_outbound::util::set_mark_best_effort(&socket, DAE_BYPASS_MARK)?;
-        let unspecified = if address.is_ipv4() {
-            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
-        } else {
-            IpAddr::V6(Ipv6Addr::UNSPECIFIED)
-        };
-        socket.bind(&SocketAddr::new(unspecified, 0).into())?;
-        let socket = tokio::net::UdpSocket::from_std(socket.into())?;
-        socket.connect(address).await?;
-
-        let first_budget = (query_timeout / 3).max(Duration::from_millis(200));
-        match Self::udp_roundtrip(&socket, address, raw_query, first_budget).await {
+        match pool.exchange(raw_query).await {
             Ok(response) => Ok(response),
             Err(error) => {
-                debug!("UDP DNS query to {address} first attempt: {error}; retrying");
-                Self::udp_roundtrip(&socket, address, raw_query, query_timeout).await
+                debug!("UDP DNS query first attempt: {error}; retrying");
+                pool.exchange(raw_query).await
             }
         }
-    }
-
-    async fn udp_roundtrip(
-        socket: &tokio::net::UdpSocket,
-        address: SocketAddr,
-        raw_query: &[u8],
-        budget: Duration,
-    ) -> anyhow::Result<Vec<u8>> {
-        tokio::time::timeout(budget, async {
-            socket.send(raw_query).await?;
-            let mut response = vec![0_u8; 4096];
-            loop {
-                let length = socket.recv(&mut response).await?;
-                if length >= 2 && raw_query.len() >= 2 && response[..2] == raw_query[..2] {
-                    response.truncate(length);
-                    return Ok::<_, std::io::Error>(response);
-                }
-            }
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("UDP DNS query to {address} timed out after {budget:?}"))?
-        .map_err(Into::into)
     }
 
     pub(super) async fn resolve_udp_addr(entry: &UpstreamEntry) -> anyhow::Result<SocketAddr> {
@@ -92,8 +61,7 @@ impl UpstreamPool {
             return Ok(response);
         }
 
-        let address = Self::resolve_udp_addr(entry).await?;
-        let response = Self::query_udp(address, raw_query, self.dns_query_timeout).await?;
+        let response = Self::query_udp(entry, raw_query, self.dns_query_timeout).await?;
         if response.len() >= 4 && response[2] & 0x02 != 0 {
             debug!(
                 "DNS upstream '{}' UDP answer has TC set — retrying over TCP",
@@ -104,9 +72,8 @@ impl UpstreamPool {
                 .await;
         }
         debug!(
-            "DNS upstream '{}' (udp {}) returned {} bytes",
+            "DNS upstream '{}' (udp) returned {} bytes",
             upstream_name,
-            address,
             response.len()
         );
         Ok(response)

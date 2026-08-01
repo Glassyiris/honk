@@ -20,6 +20,7 @@ use core::ffi::c_long;
 use core::mem;
 use honk_ebpf_common::{
     RedirectEntry, RedirectTuple, TASK_COMM_LEN, TPROXY_MARK,
+    conn::BpfStatsKey,
     redirect_need::{PIDName, RoutingHandoffEntry, Tuples, TuplesKey},
 };
 use network_types::eth::EthHdr;
@@ -33,7 +34,7 @@ use crate::{
     },
     maps::{
         COOKIE_PID_MAP, OUTBOUND_CONNECTIVITY_MAP, PARAM, PKT_SCRATCH_KEY, REDIRECT_TRACK,
-        ROUTING_HANDOFF_MAP, WAN_EGRESS_ROUTE_SCRATCH_MAP,
+        ROUTING_HANDOFF_MAP, WAN_EGRESS_ROUTE_SCRATCH_MAP, increment_bpf_stat,
     },
     route::{OUTBOUND_BLOCK, OUTBOUND_DIRECT},
     transport::{
@@ -228,8 +229,7 @@ pub fn prep_redirect_to_control_plane(
         }
     }
 
-    let proto = ctx.skb.protocol() as u16;
-    let redirect_tuple = RedirectTuple::from_tuples_ip(&tuples.five, proto == ETH_P_IP.to_be());
+    let redirect_tuple = RedirectTuple::from_tuples(&tuples.five);
 
     // Cached-flow throttle: skip the update while the existing entry is
     // fresh.  The header rewrite above is per-packet and must stay
@@ -262,8 +262,14 @@ pub fn prep_redirect_to_control_plane(
     }
     // else: L3-only — MACs stay zero.
 
-    unsafe {
-        let _ = REDIRECT_TRACK.insert(redirect_tuple, redirect_entry, 0u64);
+    if REDIRECT_TRACK
+        .insert(redirect_tuple, redirect_entry, 0u64)
+        .is_err()
+    {
+        increment_bpf_stat(BpfStatsKey::RedirectTrackInsertFailure);
+        // A redirect without its reverse-path state blackholes replies.
+        // Preserve the caller's documented direct-pass safety path instead.
+        return -1;
     }
 
     0
@@ -563,8 +569,11 @@ fn do_tproxy_wan_egress_tcp(
         if let Some(pname) = handoff_pname {
             handoff.result.pname.copy_from_slice(pname);
         }
-        unsafe {
-            let _ = ROUTING_HANDOFF_MAP.insert(tuples.five, handoff, 0u64);
+        if ROUTING_HANDOFF_MAP
+            .insert(tuples.five, handoff, 0u64)
+            .is_err()
+        {
+            increment_bpf_stat(BpfStatsKey::RoutingHandoffInsertFailure);
         }
     }
 
@@ -630,8 +639,11 @@ fn fast_path_decision(
         if let Some(pname) = handoff_pname {
             handoff.result.pname.copy_from_slice(pname);
         }
-        unsafe {
-            let _ = ROUTING_HANDOFF_MAP.insert(tuples.five, handoff, 0u64);
+        if ROUTING_HANDOFF_MAP
+            .insert(tuples.five, handoff, 0u64)
+            .is_err()
+        {
+            increment_bpf_stat(BpfStatsKey::RoutingHandoffInsertFailure);
         }
     }
 

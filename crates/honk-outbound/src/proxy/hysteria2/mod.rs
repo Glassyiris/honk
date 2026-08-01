@@ -659,12 +659,36 @@ impl Hysteria2Handler {
         })
         .await
     }
+    async fn client_for_runtime(
+        &self,
+        runtime: &crate::runtime::NodeRuntime,
+    ) -> anyhow::Result<Arc<Hy2Client>> {
+        let crate::runtime::ProtocolRuntime::Quic(quic_runtime) = &runtime.runtime else {
+            anyhow::bail!("Hysteria2 runtime is not QUIC-owned");
+        };
+        quic_runtime
+            .client(|| self.client_for(runtime.node.as_ref()))
+            .await
+    }
 }
 
 #[async_trait]
 impl ProxyHandler for Hysteria2Handler {
     fn protocol(&self) -> NodeProtocol {
         NodeProtocol::Hysteria2
+    }
+
+    async fn warm_udp(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<super::UdpWarmStatus> {
+        let client = self.client_for_runtime(&runtime).await?;
+        let (_, state) = client.connection(connect_timeout).await?;
+        if state.udp_disabled {
+            anyhow::bail!("Hysteria2: UDP disabled by server");
+        }
+        Ok(super::UdpWarmStatus::Ready)
     }
 
     async fn dial(

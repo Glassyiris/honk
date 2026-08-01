@@ -14,7 +14,9 @@ async fn test_udp_query() {
         let mut buffer = [0_u8; 512];
         let (length, source) = server.recv_from(&mut buffer).await.unwrap();
         assert!(length > 0);
-        server.send_to(&response_clone, source).await.unwrap();
+        let mut response = response_clone;
+        response[..2].copy_from_slice(&buffer[..2]);
+        server.send_to(&response, source).await.unwrap();
     });
 
     let upstream = make_upstream("test-udp", &server_address.to_string(), DnsProtocol::Udp);
@@ -73,7 +75,9 @@ async fn test_udp_hedged_retry_on_loss() {
         let mut buffer = [0_u8; 512];
         let _ = server.recv_from(&mut buffer).await.unwrap();
         let (_, source) = server.recv_from(&mut buffer).await.unwrap();
-        server.send_to(&response_clone, source).await.unwrap();
+        let mut response = response_clone;
+        response[..2].copy_from_slice(&buffer[..2]);
+        server.send_to(&response, source).await.unwrap();
     });
 
     let upstream = make_upstream("hedged", &server_address.to_string(), DnsProtocol::Udp);
@@ -96,7 +100,9 @@ async fn test_udp_txid_mismatch_discarded() {
         let mut buffer = [0_u8; 512];
         let (_, source) = server.recv_from(&mut buffer).await.unwrap();
         server.send_to(&wrong, source).await.unwrap();
-        server.send_to(&right_clone, source).await.unwrap();
+        let mut response = right_clone;
+        response[..2].copy_from_slice(&buffer[..2]);
+        server.send_to(&response, source).await.unwrap();
     });
 
     let upstream = make_upstream("txid", &server_address.to_string(), DnsProtocol::Udp);
@@ -141,7 +147,9 @@ async fn test_udp_truncated_answer_upgrades_to_tcp() {
     tokio::spawn(async move {
         let mut buffer = [0_u8; 512];
         let (_, source) = udp_server.recv_from(&mut buffer).await.unwrap();
-        udp_server.send_to(&truncated, source).await.unwrap();
+        let mut response = truncated;
+        response[..2].copy_from_slice(&buffer[..2]);
+        udp_server.send_to(&response, source).await.unwrap();
     });
     let full_clone = full.clone();
     tokio::spawn(async move {

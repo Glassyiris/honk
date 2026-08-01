@@ -438,6 +438,12 @@ key. Unsupported flags, EDNS options (including ECS/COOKIE), EDNS-v1, and
 multi-question messages bypass both optimizations; cancellation releases the
 flight.
 
+Runtime cache and singleflight keys share one immutable binary query identity;
+operation variants retain that allocation, and cache sharding uses a precomputed
+runtime hash. The SQLite text encoding remains confined to the persistence
+boundary.
+
+
 ### Runtime and observability
 
 Reload swaps one coherent generation containing DNS policy, Router,

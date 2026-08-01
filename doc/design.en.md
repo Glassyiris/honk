@@ -128,6 +128,7 @@ flowchart TB
 | `DOMAIN_ROUTING_MAP` | IP → domain-rule bitmaps (DNS-learned) |
 | `ROUTING_HANDOFF_MAP` | Tuple → userspace handoff |
 | `REDIRECT_TRACK` / `CONN_STATE_MAP` | Redirect + conntrack state |
+| `BPF_STATS_MAP` | Conn-state overflow plus redirect/handoff/cookie insert failures |
 | `OUTBOUND_CONNECTIVITY_MAP` | Alive bits pushed from userspace health checks |
 | `OUTBOUND_STATS` | Per-CPU tx/rx packets/bytes per outbound |
 | `LISTEN_SOCKET_MAP` | SockMap of transparent listeners |
@@ -166,6 +167,11 @@ Aligned with dae-core:
 | Clash API | Optional axum server |
 | Cache DB | Selector choices, mode, optional DNS answers |
 | Subscriptions | Fetch + periodic merge without rewriting the config file |
+
+Plain-TCP splice requests at most 64 KiB for each direction's private
+nonblocking pipe (128 KiB and four pipe FDs per full-duplex relay). Unsupported
+splice paths fall back losslessly before moving bytes.
+
 
 ### Dial modes (`global.dial_mode`)
 
@@ -206,13 +212,18 @@ driver owns the first send, follower sends, and replies. A first or steady send 
 a five-second timeout; a timeout or error is ambiguous, so the packet is never
 replayed through another candidate.
 
-**Queue bounds are ownership bounds.** A flow retains at most 64 datagrams,
-including the first, and all flows together retain at most 8 MiB of payload.
-Slow admission and flow/global permits are acquired before payload allocation or
-copy; followers are FIFO and nonblocking saturation drops the newest packet.
-Reload cancellation is epoch- and generation-fenced: it drains `Initializing`
-leases and their resources, preserves already-`Ready` endpoints, and removes only
-the same generation so an older task cannot erase a replacement.
+**Queue and process budgets are ownership bounds.** A flow retains at most 64
+datagrams, including the first, and all flows together retain at most 8 MiB of
+payload. Slow admission and flow/global permits are acquired before payload
+allocation or copy; followers are FIFO and nonblocking saturation drops the
+newest packet. TCP, cold non-DNS UDP, and port-53 work have independent
+admission semaphores, so one class cannot exhaust another. UDP endpoint slots
+also reserve process FDs: production uses at most
+`min(8192, (min(RLIMIT_NOFILE, 16384) - reserves) / 2)` endpoints. Removal
+notifications use a bounded queue with deduplicated compensation. Reload
+cancellation is epoch- and generation-fenced: it drains `Initializing` leases
+and their resources, preserves already-`Ready` endpoints, and removes only the
+same generation so an older task cannot erase a replacement.
 
 **Selection races are deliberately narrow.** Normal selector, load-balance,
 fallback, explicit-node, and warm-URLTest plans are authoritative single-leaf

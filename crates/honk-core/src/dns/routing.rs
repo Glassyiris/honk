@@ -80,8 +80,11 @@ impl DnsRouter {
     }
 
     pub fn select_request(&self, domain: &str, qtype: u16) -> DnsRequestDecision {
-        let domain = domain.to_lowercase();
-        let evaluation = Evaluation::request(&domain, qtype);
+        self.select_request_normalized(&domain.to_lowercase(), qtype)
+    }
+
+    pub(crate) fn select_request_normalized(&self, domain: &str, qtype: u16) -> DnsRequestDecision {
+        let evaluation = Evaluation::request(domain, qtype);
         for rule in &self.request_rules {
             if eval_conditions(&rule.conditions, &evaluation) {
                 debug!(
@@ -105,9 +108,18 @@ impl DnsRouter {
         answer_ips: &[IpAddr],
         from_upstream: &str,
     ) -> DnsResponseDecision {
-        let domain = domain.to_lowercase();
+        self.select_response_normalized(&domain.to_lowercase(), qtype, answer_ips, from_upstream)
+    }
+
+    pub(crate) fn select_response_normalized(
+        &self,
+        domain: &str,
+        qtype: u16,
+        answer_ips: &[IpAddr],
+        from_upstream: &str,
+    ) -> DnsResponseDecision {
         let evaluation = Evaluation::response(
-            &domain,
+            domain,
             qtype,
             ResponseContext {
                 answer_ips,

@@ -272,7 +272,7 @@ pub fn queue_saturation_batch() {
 
     let snapshot = batch.stats.udp_snapshot();
     assert_eq!(snapshot.queue_accepted, (FLOW_QUEUE_CAPACITY - 1) as u64);
-    assert_eq!(snapshot.queue_full, 1);
+    assert_eq!(snapshot.flow_queue_full, 1);
     for _ in 0..FLOW_QUEUE_CAPACITY - 1 {
         batch.drain_one();
     }

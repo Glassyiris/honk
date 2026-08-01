@@ -7,13 +7,15 @@
 //! The pool is a [`DashMap`] so that per-packet lookups on the UDP fast path
 //! only contend on a single shard instead of one global mutex.
 
-use crate::stats::{ActiveConnectionGuard, StatsManager};
+use crate::stats::{ActiveConnectionGuard, OutboundTracker, StatsManager};
 use bytes::Bytes;
 use dashmap::DashMap;
+use parking_lot::Mutex;
+use std::collections::HashSet;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
@@ -38,10 +40,38 @@ const MAX_ENDPOINTS: usize = 8192;
 const FLOW_QUEUE_CAPACITY: usize = 64;
 /// All retained payload bytes across UDP flows are bounded exactly by permits.
 const GLOBAL_PAYLOAD_CAPACITY: usize = 8 * 1024 * 1024;
+/// Process-wide proxy FD ceiling used even when RLIMIT_NOFILE is enormous.
+const PROXY_FD_BUDGET: usize = 16_384;
+/// One independent UDP endpoint may own a transport and an anyfrom reply socket.
+const UDP_FDS_PER_ENDPOINT: usize = 2;
+const NON_PROXY_FD_RESERVE: usize = 256;
 const TRANSPORT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const DRIVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(6);
 const DRIVER_ABORT_TIMEOUT: Duration = Duration::from_secs(1);
 
+fn endpoint_capacity_for_nofile(nofile: usize) -> usize {
+    let budget = nofile.min(PROXY_FD_BUDGET);
+    let non_proxy = NON_PROXY_FD_RESERVE.min(budget / 4);
+    let tcp_pool = crate::pool::MAX_TOTAL_ENTRIES.min(budget / 4);
+    budget
+        .saturating_sub(non_proxy + tcp_pool)
+        .checked_div(UDP_FDS_PER_ENDPOINT)
+        .unwrap_or(0)
+        .clamp(1, MAX_ENDPOINTS)
+}
+
+fn production_endpoint_capacity() -> usize {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let nofile = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
+        usize::try_from(limit.rlim_cur).unwrap_or(PROXY_FD_BUDGET)
+    } else {
+        PROXY_FD_BUDGET
+    };
+    endpoint_capacity_for_nofile(nofile)
+}
 /// A pooled UDP endpoint representing one NAT mapping.
 pub struct UdpEndpoint {
     /// The proxy-side framed UDP transport (upstream).
@@ -126,7 +156,7 @@ impl UdpEndpoint {
     /// Bind the clash-API tracker entry to this endpoint: the entry shares
     /// the endpoint's atomic counters, and `conn_id` is stored for removal.
     pub fn set_tracker(&self, conn_id: String) {
-        *self.tracker_id.lock().unwrap() = Some(conn_id);
+        *self.tracker_id.lock() = Some(conn_id);
     }
 
     /// Counter clones for the tracker entry.
@@ -146,7 +176,7 @@ impl UdpEndpoint {
 
     /// Take the tracker connection id (on endpoint removal).
     pub fn take_tracker_id(&self) -> Option<String> {
-        self.tracker_id.lock().unwrap().take()
+        self.tracker_id.lock().take()
     }
 
     pub fn is_expired(&self) -> bool {
@@ -217,12 +247,12 @@ impl UdpEndpoint {
         // A node-death retirement ordered before `begin_send_attempt` must
         // prevent the transport call. Conversely, once an attempt has passed
         // that point it is ambiguous and may not be replayed.
-        let _send_gate = self.send_gate.lock().unwrap();
+        let _send_gate = self.send_gate.lock();
         self.dead.store(true, Ordering::Release);
     }
 
     fn begin_send_attempt(&self) -> io::Result<()> {
-        let _send_gate = self.send_gate.lock().unwrap();
+        let _send_gate = self.send_gate.lock();
         if self.dead.load(Ordering::Acquire) {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
@@ -242,7 +272,7 @@ impl UdpEndpoint {
     /// (before the first reply is received), only replies from recorded
     /// peers are accepted.
     pub fn record_pending_reply_peer(&self, peer: SocketAddr) {
-        let mut ring = self.pending_reply_peers.lock().unwrap();
+        let mut ring = self.pending_reply_peers.lock();
         let next = self.pending_reply_next.fetch_add(1, Ordering::Relaxed) as usize % 8;
         ring[next] = (peer, true);
     }
@@ -257,7 +287,7 @@ impl UdpEndpoint {
         if self.has_reply.load(Ordering::Relaxed) {
             return true;
         }
-        let ring = self.pending_reply_peers.lock().unwrap();
+        let ring = self.pending_reply_peers.lock();
         for (addr, valid) in ring.iter() {
             if *valid && *addr == peer {
                 return true;
@@ -353,6 +383,11 @@ pub(super) struct QueuedDatagram {
     _global_byte_permit: Option<OwnedSemaphorePermit>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PacketAdmissionError {
+    FlowQueueFull,
+    GlobalPayloadFull,
+}
 struct InitializingEndpoint {
     generation: u64,
     queue_tx: mpsc::Sender<QueuedDatagram>,
@@ -370,15 +405,15 @@ struct InitializingEndpoint {
 
 impl InitializingEndpoint {
     fn take_receiver(&self) -> Option<mpsc::Receiver<QueuedDatagram>> {
-        self.queue_rx.lock().unwrap().take()
+        self.queue_rx.lock().take()
     }
 
     fn take_endpoint_permit(&self) -> Option<OwnedSemaphorePermit> {
-        self.endpoint_permit.lock().unwrap().take()
+        self.endpoint_permit.lock().take()
     }
 
     fn set_tracker_id(&self, tracker_id: String) -> bool {
-        let mut current = self.tracker_id.lock().unwrap();
+        let mut current = self.tracker_id.lock();
         if current.is_some() {
             return false;
         }
@@ -387,19 +422,19 @@ impl InitializingEndpoint {
     }
 
     fn take_tracker_id(&self) -> Option<String> {
-        self.tracker_id.lock().unwrap().take()
+        self.tracker_id.lock().take()
     }
 
     fn bind_selected_node(&self, node_name: &str) {
-        *self.selected_node.lock().unwrap() = Some(node_name.to_owned());
+        *self.selected_node.lock() = Some(node_name.to_owned());
     }
 
     fn clear_selected_node(&self) {
-        *self.selected_node.lock().unwrap() = None;
+        *self.selected_node.lock() = None;
     }
 
     fn selected_node_is(&self, node_name: &str) -> bool {
-        self.selected_node.lock().unwrap().as_deref() == Some(node_name)
+        self.selected_node.lock().as_deref() == Some(node_name)
     }
 }
 
@@ -600,7 +635,7 @@ impl UdpInitLease {
             dashmap::mapref::entry::Entry::Occupied(occupied) => occupied,
             dashmap::mapref::entry::Entry::Vacant(_) => return false,
         };
-        let _epoch_gate = self.pool.initialization_epoch.lock().unwrap();
+        let _epoch_gate = self.pool.initialization_epoch.lock();
         if self.pool.terminal.load(Ordering::Acquire) || self.epoch != *_epoch_gate {
             return false;
         }
@@ -750,7 +785,9 @@ pub struct UdpEndpointPool {
     reply_socket_factory: Arc<dyn UdpReplySocketFactory>,
     /// Sink notified whenever an endpoint is removed; the control plane uses
     /// it to retire conntrack and tracker state exactly once.
-    remove_sink: Mutex<Option<tokio::sync::mpsc::UnboundedSender<EndpointRemoval>>>,
+    remove_sink: Mutex<Option<tokio::sync::mpsc::Sender<EndpointRemoval>>>,
+    /// Bounded compensation for removals observed while the sink is full.
+    removal_dirty: Mutex<HashSet<EndpointRemoval>>,
     /// Test-only synchronous barrier at the historical publication point.
     /// It makes the cancellation linearization regression reproducible
     /// without introducing an await into reservation.
@@ -760,11 +797,10 @@ pub struct UdpEndpointPool {
 
 impl UdpEndpointPool {
     pub fn new() -> Self {
-        Self::with_capacity_limit(MAX_ENDPOINTS)
+        Self::with_capacity_limit(production_endpoint_capacity())
     }
 
-    /// Construct a pool with a deterministic endpoint cap. Production keeps
-    /// 8192; the same real reservation path is used by lifecycle tests.
+    /// Construct a pool with a deterministic endpoint cap for lifecycle tests.
     pub fn with_capacity_limit(capacity_limit: usize) -> Self {
         Self::with_reply_socket_factory(capacity_limit, Arc::new(SystemUdpReplySocketFactory))
     }
@@ -791,6 +827,7 @@ impl UdpEndpointPool {
             drivers: Mutex::new(TaskRegistry::default()),
             reply_socket_factory,
             remove_sink: Mutex::new(None),
+            removal_dirty: Mutex::new(HashSet::new()),
             #[cfg(test)]
             reservation_publication_hook: Mutex::new(None),
         }
@@ -798,12 +835,12 @@ impl UdpEndpointPool {
 
     #[cfg(test)]
     fn set_reservation_publication_hook(&self, hook: Option<Arc<ReservationPublicationHook>>) {
-        *self.reservation_publication_hook.lock().unwrap() = hook;
+        *self.reservation_publication_hook.lock() = hook;
     }
 
     #[cfg(test)]
     fn pause_after_reservation_publication(&self) {
-        let hook = self.reservation_publication_hook.lock().unwrap().clone();
+        let hook = self.reservation_publication_hook.lock().clone();
         if let Some(hook) = hook {
             hook.published.wait();
             hook.resume.wait();
@@ -814,29 +851,70 @@ impl UdpEndpointPool {
         self.reply_socket_factory.create(original_dst)
     }
 
-    pub fn set_remove_sink(&self, tx: tokio::sync::mpsc::UnboundedSender<EndpointRemoval>) {
-        *self.remove_sink.lock().unwrap() = Some(tx);
+    pub fn set_remove_sink(&self, tx: tokio::sync::mpsc::Sender<EndpointRemoval>) {
+        *self.remove_sink.lock() = Some(tx);
+        self.flush_removal_dirty();
     }
 
-    fn notify_removed(&self, client: SocketAddr, dst: SocketAddr, conn_id: Option<String>) {
-        if let Some(tx) = &*self.remove_sink.lock().unwrap() {
-            let _ = tx.send((client, dst, conn_id));
+    pub(super) fn flush_removal_dirty(&self) {
+        let Some(tx) = self.remove_sink.lock().clone() else {
+            return;
+        };
+        let mut dirty = self.removal_dirty.lock();
+        dirty.retain(|removal| match tx.try_send(removal.clone()) {
+            Ok(()) => false,
+            Err(mpsc::error::TrySendError::Full(_)) | Err(mpsc::error::TrySendError::Closed(_)) => {
+                true
+            }
+        });
+    }
+
+    async fn drain_removal_dirty(&self) {
+        let Some(tx) = self.remove_sink.lock().clone() else {
+            return;
+        };
+        let pending = std::mem::take(&mut *self.removal_dirty.lock());
+        for removal in pending {
+            if tx.send(removal).await.is_err() {
+                break;
+            }
         }
     }
 
-    fn make_packet(&self, data: &[u8], flow_slots: &Arc<Semaphore>) -> Result<QueuedDatagram, ()> {
-        let flow_permit = flow_slots.clone().try_acquire_owned().map_err(|_| ())?;
+    fn notify_removed(&self, client: SocketAddr, dst: SocketAddr, conn_id: Option<String>) {
+        let removal = (client, dst, conn_id);
+        let delivered = self
+            .remove_sink
+            .lock()
+            .as_ref()
+            .is_some_and(|tx| tx.try_send(removal.clone()).is_ok());
+        if !delivered {
+            self.removal_dirty.lock().insert(removal);
+        }
+        self.flush_removal_dirty();
+    }
+
+    fn make_packet(
+        &self,
+        data: &[u8],
+        flow_slots: &Arc<Semaphore>,
+    ) -> Result<QueuedDatagram, PacketAdmissionError> {
+        let flow_permit = flow_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| PacketAdmissionError::FlowQueueFull)?;
         let global_byte_permit = if data.is_empty() {
             None
         } else {
-            let byte_count = u32::try_from(data.len()).map_err(|_| ())?;
+            let byte_count =
+                u32::try_from(data.len()).map_err(|_| PacketAdmissionError::GlobalPayloadFull)?;
             match self
                 .global_payload_bytes
                 .clone()
                 .try_acquire_many_owned(byte_count)
             {
                 Ok(permit) => Some(permit),
-                Err(_) => return Err(()),
+                Err(_) => return Err(PacketAdmissionError::GlobalPayloadFull),
             }
         };
         // Allocation/copy is intentionally last: all bounded resources were
@@ -861,8 +939,12 @@ impl UdpEndpointPool {
         }
         let packet = match self.make_packet(data, flow_slots) {
             Ok(packet) => packet,
-            Err(()) => {
-                stats.record_udp_queue_full();
+            Err(PacketAdmissionError::FlowQueueFull) => {
+                stats.record_udp_flow_queue_full();
+                return EndpointReservation::QueueFull;
+            }
+            Err(PacketAdmissionError::GlobalPayloadFull) => {
+                stats.record_udp_global_payload_full();
                 return EndpointReservation::QueueFull;
             }
         };
@@ -872,7 +954,7 @@ impl UdpEndpointPool {
                 EndpointReservation::Enqueued
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
-                stats.record_udp_queue_full();
+                stats.record_udp_flow_queue_full();
                 EndpointReservation::QueueFull
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -938,8 +1020,12 @@ impl UdpEndpointPool {
                     let flow_slots = Arc::new(Semaphore::new(FLOW_QUEUE_CAPACITY));
                     let first = match self.make_packet(data, &flow_slots) {
                         Ok(packet) => packet,
-                        Err(()) => {
-                            stats.record_udp_queue_full();
+                        Err(PacketAdmissionError::FlowQueueFull) => {
+                            stats.record_udp_flow_queue_full();
+                            return EndpointReservation::QueueFull;
+                        }
+                        Err(PacketAdmissionError::GlobalPayloadFull) => {
+                            stats.record_udp_global_payload_full();
                             return EndpointReservation::QueueFull;
                         }
                     };
@@ -950,7 +1036,7 @@ impl UdpEndpointPool {
                     // while the same gate held by cancellation is locked.
                     // A cancellation can therefore linearize wholly before
                     // or after this reservation, never in its middle.
-                    let epoch_gate = self.initialization_epoch.lock().unwrap();
+                    let epoch_gate = self.initialization_epoch.lock();
                     if self.terminal.load(Ordering::Acquire) {
                         stats.record_udp_queue_closed();
                         return EndpointReservation::QueueClosed;
@@ -1158,7 +1244,7 @@ impl UdpEndpointPool {
         // is shared with reservation publication and commit_ready, and is
         // released before waiting for leases to drop.
         let next = {
-            let mut epoch = self.initialization_epoch.lock().unwrap();
+            let mut epoch = self.initialization_epoch.lock();
             if terminal {
                 self.terminal.store(true, Ordering::Release);
             }
@@ -1193,7 +1279,7 @@ impl UdpEndpointPool {
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
-        let mut tasks = self.slow_tasks.lock().unwrap();
+        let mut tasks = self.slow_tasks.lock();
         while let Some(result) = tasks.tasks.try_join_next() {
             if let Err(error) = result
                 && !error.is_cancelled()
@@ -1220,12 +1306,12 @@ impl UdpEndpointPool {
     pub(super) async fn shutdown(&self) -> bool {
         self.advance_initialization_epoch(true);
         let slow_tasks = {
-            let mut tasks = self.slow_tasks.lock().unwrap();
+            let mut tasks = self.slow_tasks.lock();
             tasks.closed = true;
             std::mem::take(&mut tasks.tasks)
         };
         {
-            let mut drivers = self.drivers.lock().unwrap();
+            let mut drivers = self.drivers.lock();
             drivers.closed = true;
         }
 
@@ -1250,7 +1336,7 @@ impl UdpEndpointPool {
         }
 
         let driver_tasks = {
-            let mut drivers = self.drivers.lock().unwrap();
+            let mut drivers = self.drivers.lock();
             std::mem::take(&mut drivers.tasks)
         };
         let drivers_clean = join_registered_tasks(
@@ -1261,7 +1347,8 @@ impl UdpEndpointPool {
         )
         .await;
 
-        self.remove_sink.lock().unwrap().take();
+        self.drain_removal_dirty().await;
+        self.remove_sink.lock().take();
         initializers_clean && drivers_clean
     }
 
@@ -1282,12 +1369,12 @@ impl UdpEndpointPool {
 
     #[cfg(test)]
     fn slow_task_count(&self) -> usize {
-        self.slow_tasks.lock().unwrap().tasks.len()
+        self.slow_tasks.lock().tasks.len()
     }
 
     #[cfg(test)]
     fn driver_count(&self) -> usize {
-        self.drivers.lock().unwrap().tasks.len()
+        self.drivers.lock().tasks.len()
     }
 }
 
@@ -1344,7 +1431,7 @@ struct UdpDriverContext {
     client_dst: SocketAddr,
     alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
     stats: Arc<StatsManager>,
-    outbound_name: String,
+    outbound_tracker: OutboundTracker,
 }
 
 impl Drop for UdpDriverCleanupGuard {
@@ -1402,11 +1489,12 @@ impl UdpEndpointPool {
         outbound_name: String,
     ) -> UdpDriverHandle {
         let key = EndpointKey::new(client_addr, client_dst);
+        let outbound_tracker = stats.outbound_tracker(&outbound_name);
         let (ready_tx, ready) = oneshot::channel();
         let (start, start_rx) = oneshot::channel();
         let (first_ack_tx, first_ack) = oneshot::channel();
         let pool = Arc::clone(self);
-        let mut drivers = self.drivers.lock().unwrap();
+        let mut drivers = self.drivers.lock();
         while let Some(result) = drivers.tasks.try_join_next() {
             if let Err(error) = result {
                 debug!("UDP endpoint driver join failed: {}", error);
@@ -1447,7 +1535,7 @@ impl UdpEndpointPool {
                     client_dst,
                     alive_set,
                     stats,
-                    outbound_name,
+                    outbound_tracker,
                 },
                 first,
                 first_ack_tx,
@@ -1486,11 +1574,11 @@ async fn run_endpoint_driver(
         client_dst,
         alive_set,
         stats,
-        outbound_name,
+        outbound_tracker,
     } = context;
     // Establish send ordering before supervising the steady send/receive
     // futures. A recv EOF must not race ahead and cancel the first packet.
-    match send_one(&endpoint, &stats, &outbound_name, first, true).await {
+    match send_one(&endpoint, &stats, &outbound_tracker, first, true).await {
         Ok(()) => {
             let _ = first_ack.send(Ok(()));
         }
@@ -1504,7 +1592,7 @@ async fn run_endpoint_driver(
         Arc::clone(&endpoint),
         queue_rx,
         Arc::clone(&stats),
-        outbound_name.clone(),
+        outbound_tracker.clone(),
     );
     let receiver = receive_loop(
         endpoint,
@@ -1513,7 +1601,7 @@ async fn run_endpoint_driver(
         client_dst,
         alive_set,
         stats,
-        outbound_name,
+        outbound_tracker,
     );
     tokio::pin!(sender);
     tokio::pin!(receiver);
@@ -1527,10 +1615,10 @@ async fn send_followers(
     endpoint: Arc<UdpEndpoint>,
     mut queue_rx: mpsc::Receiver<QueuedDatagram>,
     stats: Arc<StatsManager>,
-    outbound_name: String,
+    outbound_tracker: OutboundTracker,
 ) -> io::Result<()> {
     while let Some(packet) = queue_rx.recv().await {
-        send_one(&endpoint, &stats, &outbound_name, packet, false).await?;
+        send_one(&endpoint, &stats, &outbound_tracker, packet, false).await?;
     }
     Err(io::Error::new(
         io::ErrorKind::BrokenPipe,
@@ -1541,7 +1629,7 @@ async fn send_followers(
 async fn send_one(
     endpoint: &UdpEndpoint,
     stats: &StatsManager,
-    outbound_name: &str,
+    outbound_tracker: &OutboundTracker,
     packet: QueuedDatagram,
     first: bool,
 ) -> io::Result<()> {
@@ -1569,7 +1657,7 @@ async fn send_one(
         Ok(()) => {
             endpoint.refresh();
             endpoint.tracker_upload(packet.data.len() as u64);
-            stats.record_bytes(outbound_name, packet.data.len() as u64, 0);
+            outbound_tracker.add_bytes(packet.data.len() as u64, 0);
             Ok(())
         }
         Err(error) => {
@@ -1588,7 +1676,7 @@ async fn receive_loop(
     client_dst: SocketAddr,
     alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
     stats: Arc<StatsManager>,
-    outbound_name: String,
+    outbound_tracker: OutboundTracker,
 ) -> io::Result<()> {
     let ipver = if client_dst.is_ipv4() {
         honk_outbound::alive::IpVersion::V4
@@ -1625,7 +1713,7 @@ async fn receive_loop(
             stats.record_udp_first_reply_latency(elapsed);
         }
         endpoint.tracker_download(n as u64);
-        stats.record_bytes(&outbound_name, 0, n as u64);
+        outbound_tracker.add_bytes(0, n as u64);
         alive_set.report_available_traffic(
             &endpoint.node_name,
             honk_outbound::alive::ProbeDomain::DataUdp,
@@ -1682,6 +1770,13 @@ mod tests {
     }
 
     use super::*;
+    #[test]
+    fn endpoint_capacity_reserves_process_fd_budget() {
+        assert_eq!(endpoint_capacity_for_nofile(64), 16);
+        assert_eq!(endpoint_capacity_for_nofile(1_024), 256);
+        assert_eq!(endpoint_capacity_for_nofile(PROXY_FD_BUDGET), 7_040);
+        assert_eq!(endpoint_capacity_for_nofile(usize::MAX), 7_040);
+    }
 
     #[allow(clippy::too_many_arguments)]
     async fn run_endpoint_driver(
@@ -1696,6 +1791,7 @@ mod tests {
         first: QueuedDatagram,
         first_ack: oneshot::Sender<io::Result<()>>,
     ) -> io::Result<()> {
+        let outbound_tracker = stats.outbound_tracker(&outbound_name);
         super::run_endpoint_driver(
             UdpDriverContext {
                 endpoint,
@@ -1705,7 +1801,7 @@ mod tests {
                 client_dst,
                 alive_set,
                 stats,
-                outbound_name,
+                outbound_tracker,
             },
             first,
             first_ack,
@@ -1770,12 +1866,12 @@ mod tests {
         }
 
         fn sent_packets(&self) -> Vec<Vec<u8>> {
-            self.sent.lock().unwrap().clone()
+            self.sent.lock().clone()
         }
 
         async fn wait_for_send_count(&self, count: usize) {
             loop {
-                if self.sent.lock().unwrap().len() >= count {
+                if self.sent.lock().len() >= count {
                     return;
                 }
                 self.send_progress.notified().await;
@@ -1790,12 +1886,11 @@ mod tests {
         }
 
         async fn send_packet(&self, data: &[u8]) -> io::Result<()> {
-            self.sent.lock().unwrap().push(data.to_vec());
+            self.sent.lock().push(data.to_vec());
             self.send_progress.notify_waiters();
             let action = self
                 .actions
                 .lock()
-                .unwrap()
                 .pop_front()
                 .unwrap_or(DriverSendAction::Ok);
             match action {
@@ -1818,7 +1913,6 @@ mod tests {
             let action = self
                 .recv_actions
                 .lock()
-                .unwrap()
                 .pop_front()
                 .unwrap_or(DriverReceiveAction::Pending);
             match action {
@@ -2015,7 +2109,7 @@ mod tests {
         ));
         let snapshot = stats.udp_snapshot();
         assert_eq!(snapshot.queue_accepted, (FLOW_QUEUE_CAPACITY - 1) as u64);
-        assert_eq!(snapshot.queue_full, 1);
+        assert_eq!(snapshot.flow_queue_full, 1);
         drop(lease);
     }
 
@@ -2036,7 +2130,7 @@ mod tests {
             pool.reserve_or_enqueue(client, dst, b"x", follower_permit, &stats),
             EndpointReservation::QueueFull
         ));
-        assert_eq!(stats.udp_snapshot().queue_full, 1);
+        assert_eq!(stats.udp_snapshot().global_payload_full, 1);
         drop(lease);
     }
 
@@ -2239,7 +2333,7 @@ mod tests {
         let stats = StatsManager::new();
         let client = make_addr("10.0.0.1", 12345);
         let dst = make_addr("8.8.8.8", 53);
-        let (removed_tx, mut removed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (removed_tx, mut removed_rx) = tokio::sync::mpsc::channel(16);
         pool.set_remove_sink(removed_tx);
         let first_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
         let lease = match pool.reserve_or_enqueue(client, dst, b"first", first_permit, &stats) {
@@ -2658,7 +2752,7 @@ mod tests {
         let client = make_addr("10.0.0.1", 12345);
         let dst = make_addr("8.8.8.8", 53);
         let relay = make_addr("192.168.1.1", 1080);
-        let (removed_tx, mut removed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (removed_tx, mut removed_rx) = tokio::sync::mpsc::channel(16);
         pool.set_remove_sink(removed_tx);
         let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
         let mut lease = match pool.reserve_or_enqueue(client, dst, b"first", slow_permit, &stats) {
@@ -2710,7 +2804,7 @@ mod tests {
         let client = make_addr("10.0.0.9", 43000);
         let dst = make_addr("8.8.4.4", 53);
         let relay = make_addr("192.168.1.1", 1080);
-        let (removed_tx, mut removed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (removed_tx, mut removed_rx) = tokio::sync::mpsc::channel(16);
         pool.set_remove_sink(removed_tx);
         let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
         let mut lease = match pool.reserve_or_enqueue(client, dst, b"first", slow_permit, &stats) {
@@ -2779,10 +2873,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn udp_endpoint_pool_shutdown_aborts_stuck_initializer_task() {
         let pool = Arc::new(UdpEndpointPool::new());
+        let endpoint_capacity = pool.endpoint_slots.available_permits();
         let stats = Arc::new(StatsManager::new());
         let client = make_addr("10.0.0.10", 43001);
         let dst = make_addr("1.1.1.1", 53);
-        let (removed_tx, mut removed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (removed_tx, mut removed_rx) = tokio::sync::mpsc::channel(16);
         pool.set_remove_sink(removed_tx);
         let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
         let mut lease = match pool.reserve_or_enqueue(client, dst, b"held", slow_permit, &stats) {
@@ -2814,7 +2909,7 @@ mod tests {
             pool.global_payload_bytes.available_permits(),
             GLOBAL_PAYLOAD_CAPACITY
         );
-        assert_eq!(pool.endpoint_slots.available_permits(), MAX_ENDPOINTS);
+        assert_eq!(pool.endpoint_slots.available_permits(), endpoint_capacity);
     }
 
     #[tokio::test]
@@ -2844,7 +2939,7 @@ mod tests {
             let stats = Arc::new(StatsManager::new());
             let dst = make_addr("8.8.8.8", 53);
             let relay = make_addr("192.168.1.1", 1080);
-            let (removed_tx, mut removed_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (removed_tx, mut removed_rx) = tokio::sync::mpsc::channel(16);
             pool.set_remove_sink(removed_tx);
             let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
             let mut lease =
@@ -2892,7 +2987,7 @@ mod tests {
         let client = make_addr("10.0.0.1", 12345);
         let dst = make_addr("8.8.8.8", 53);
         let relay = make_addr("192.168.1.1", 1080);
-        let (removed_tx, mut removed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (removed_tx, mut removed_rx) = tokio::sync::mpsc::channel(16);
         pool.set_remove_sink(removed_tx);
         let receive_failure = Arc::new(tokio::sync::Notify::new());
         let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
@@ -2958,7 +3053,7 @@ mod tests {
         let client = make_addr("10.0.0.1", 12345);
         let dst = make_addr("8.8.8.8", 53);
         let relay = make_addr("192.168.1.1", 1080);
-        let (removed_tx, mut removed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (removed_tx, mut removed_rx) = tokio::sync::mpsc::channel(16);
         pool.set_remove_sink(removed_tx);
         let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
         let mut lease = match pool.reserve_or_enqueue(client, dst, b"first", slow_permit, &stats) {
@@ -3010,7 +3105,7 @@ mod tests {
         let client = make_addr("10.0.0.1", 12345);
         let dst = make_addr("8.8.8.8", 53);
         let relay = make_addr("192.168.1.1", 1080);
-        let (removed_tx, mut removed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (removed_tx, mut removed_rx) = tokio::sync::mpsc::channel(16);
         pool.set_remove_sink(removed_tx);
         let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
         let mut lease = match pool.reserve_or_enqueue(client, dst, b"panic", slow_permit, &stats) {
@@ -3074,7 +3169,7 @@ mod tests {
         let client = make_addr("10.0.0.1", 12345);
         let dst = make_addr("8.8.8.8", 53);
         let relay = make_addr("192.168.1.1", 1080);
-        let (removed_tx, mut removed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (removed_tx, mut removed_rx) = tokio::sync::mpsc::channel(16);
         pool.set_remove_sink(removed_tx);
         let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
         let mut lease = match pool.reserve_or_enqueue(client, dst, b"abort", slow_permit, &stats) {
@@ -3147,7 +3242,7 @@ mod tests {
         let client = make_addr("10.0.0.1", 12345);
         let dst = make_addr("8.8.8.8", 53);
         let relay = make_addr("192.168.1.1", 1080);
-        let (removed_tx, mut removed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (removed_tx, mut removed_rx) = tokio::sync::mpsc::channel(16);
         pool.set_remove_sink(removed_tx);
         let release = Arc::new(tokio::sync::Notify::new());
         let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
@@ -3272,7 +3367,7 @@ mod tests {
         let stats = Arc::new(StatsManager::new());
         let client = make_addr("10.0.0.1", 12345);
         let dst = make_addr("8.8.8.8", 53);
-        let (removed_tx, mut removed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (removed_tx, mut removed_rx) = tokio::sync::mpsc::channel(16);
         pool.set_remove_sink(removed_tx);
         let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
         let mut lease = match pool.reserve_or_enqueue(client, dst, b"first", slow_permit, &stats) {
@@ -3323,7 +3418,7 @@ mod tests {
         let stats = Arc::new(StatsManager::new());
         let client = make_addr("10.0.0.1", 12345);
         let dst = make_addr("8.8.8.8", 53);
-        let (removed_tx, mut removed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (removed_tx, mut removed_rx) = tokio::sync::mpsc::channel(16);
         pool.set_remove_sink(removed_tx);
         let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
         let mut lease = match pool.reserve_or_enqueue(client, dst, b"first", slow_permit, &stats) {
@@ -3366,7 +3461,7 @@ mod tests {
         let client = make_addr("10.0.0.1", 12345);
         let dst = make_addr("8.8.8.8", 53);
         let relay = make_addr("192.168.1.1", 1080);
-        let (removed_tx, mut removed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (removed_tx, mut removed_rx) = tokio::sync::mpsc::channel(16);
         pool.set_remove_sink(removed_tx);
         let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
         let mut lease = match pool.reserve_or_enqueue(client, dst, b"first", slow_permit, &stats) {
@@ -3427,7 +3522,7 @@ mod tests {
         let client = make_addr("10.0.0.1", 12345);
         let dst = make_addr("8.8.8.8", 53);
         let relay = make_addr("192.168.1.1", 1080);
-        let (removed_tx, mut removed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (removed_tx, mut removed_rx) = tokio::sync::mpsc::channel(16);
         pool.set_remove_sink(removed_tx);
         let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
         let mut lease = match pool.reserve_or_enqueue(client, dst, b"first", slow_permit, &stats) {
@@ -3551,7 +3646,7 @@ mod tests {
     #[tokio::test]
     async fn udp_endpoint_node_and_janitor_cleanup_notify_tracker_once() {
         let pool = Arc::new(UdpEndpointPool::new());
-        let (removed_tx, mut removed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (removed_tx, mut removed_rx) = tokio::sync::mpsc::channel(16);
         pool.set_remove_sink(removed_tx);
         let proxy = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let relay = make_addr("192.168.1.1", 1080);

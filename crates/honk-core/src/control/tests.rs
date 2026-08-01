@@ -2031,7 +2031,8 @@ async fn udp_stats_lifecycle_slow_permit_full_rejects_without_outbound_total() {
     assert_eq!(udp.slow_permit_accepted, 0);
     assert_eq!(udp.slow_permit_closed, 0);
     assert_eq!(udp.queue_accepted, 0);
-    assert_eq!(udp.queue_full, 0);
+    assert_eq!(udp.flow_queue_full, 0);
+    assert_eq!(udp.global_payload_full, 0);
     assert_eq!(udp.queue_closed, 0);
 
     let open = Arc::new(tokio::sync::Semaphore::new(1));
@@ -2177,7 +2178,8 @@ async fn udp_dns_dispatch_registers_connection_guard_before_task_poll() {
     let state = super::UdpLoopState {
         udp_pool: Arc::clone(&plane.udp_pool),
         stats: Arc::clone(&plane.stats),
-        concurrency_limit: Arc::clone(&plane.concurrency_limit),
+        udp_concurrency_limit: Arc::clone(&plane.udp_concurrency_limit),
+        dns_concurrency_limit: Arc::clone(&plane.dns_concurrency_limit),
         dns_controller: Arc::clone(&plane.dns_controller),
         drain: Arc::clone(&drain),
         handle: plane.spawn_handle(),

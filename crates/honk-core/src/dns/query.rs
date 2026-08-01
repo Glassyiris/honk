@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use thiserror::Error;
 
 mod parser;
@@ -120,7 +122,7 @@ pub struct QueryContext {
     questions: Vec<Question>,
     edns: Option<EdnsMetadata>,
     ingress: IngressProfile,
-    canonical_wire: Vec<u8>,
+    canonical_wire: Arc<[u8]>,
     cacheable: bool,
 }
 
@@ -220,7 +222,7 @@ impl QueryContext {
             questions,
             edns,
             ingress,
-            canonical_wire,
+            canonical_wire: canonical_wire.into(),
             cacheable,
         })
     }
@@ -264,6 +266,9 @@ impl QueryContext {
 
     pub fn canonical_wire(&self) -> &[u8] {
         &self.canonical_wire
+    }
+    pub(crate) fn canonical_wire_arc(&self) -> Arc<[u8]> {
+        Arc::clone(&self.canonical_wire)
     }
 
     pub const fn is_cacheable(&self) -> bool {

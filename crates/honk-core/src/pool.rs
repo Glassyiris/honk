@@ -28,11 +28,14 @@
 //! clash API `/stats`.
 
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
+use parking_lot::Mutex;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, trace};
 
 use honk_outbound::proxy::ProxyStream;
@@ -40,7 +43,7 @@ use honk_outbound::proxy::ProxyStream;
 const MAX_PER_HOST: usize = 8;
 /// Global cap across all keys (bare + ready) — an FD budget, not just a
 /// per-key one: deposits past it are refused.
-const MAX_TOTAL_ENTRIES: usize = 2048;
+pub(crate) const MAX_TOTAL_ENTRIES: usize = 2048;
 /// Distinct ready targets per node — bounds target-cardinality-driven
 /// ready pools (a scanner hitting thousands of hosts must not turn the
 /// pool into thousands of dialed tunnels).
@@ -56,6 +59,12 @@ const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// typically reap idle tunnels sooner.
 const READY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_AGE: Duration = Duration::from_secs(300);
+
+/// Bound all TCP dials process-wide. Cold URLTest can speculate, but it must
+/// share the same admission budget as ordinary and warming dials.
+const MAX_CONCURRENT_DIALS: usize = 3;
+
+static GLOBAL_DIAL_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 /// A pooled connection. Each key's list holds exactly one kind: the key
 /// namespaces (`"host:port"` vs `ready|...`) make mixing impossible.
@@ -75,14 +84,33 @@ struct TimedStream {
 pub struct ConnectionPool {
     entries: DashMap<String, Arc<Mutex<Vec<TimedStream>>>>,
     total_entries: AtomicU64,
+    /// Ready-key cardinality per node, updated only when a ready key enters
+    /// or leaves `entries`; no deposit scans every shard.
+    ready_targets: DashMap<String, Arc<AtomicU64>>,
+    /// One background warmer per ready key. Followers retain the existing
+    /// ready entry or wait for the next flow rather than duplicate a dial.
+    warm_dials: DashMap<String, ()>,
     idle_timeout: Duration,
     ready_idle_timeout: Duration,
     max_age: Duration,
     /// Target hotness for ready-deposit gating (`ready|node|target` →
-    /// (flow count, window start)).
+    /// (flow count, window start)). This remains strictly bounded: stale
+    /// entries are reset on their next access, never reclaimed by a scan.
     hot: DashMap<String, (u32, Instant)>,
+    hot_entries: AtomicU64,
     ready_hits: AtomicU64,
     ready_misses: AtomicU64,
+}
+
+pub(crate) struct WarmDialGuard<'a> {
+    pool: &'a ConnectionPool,
+    key: String,
+}
+
+impl Drop for WarmDialGuard<'_> {
+    fn drop(&mut self) {
+        self.pool.warm_dials.remove(&self.key);
+    }
 }
 
 /// Ready-pool metrics snapshot (clash API `/stats`).
@@ -100,8 +128,11 @@ impl ConnectionPool {
             total_entries: AtomicU64::new(0),
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             ready_idle_timeout: READY_IDLE_TIMEOUT,
+            ready_targets: DashMap::new(),
+            warm_dials: DashMap::new(),
             max_age: DEFAULT_MAX_AGE,
             hot: DashMap::new(),
+            hot_entries: AtomicU64::new(0),
             ready_hits: AtomicU64::new(0),
             ready_misses: AtomicU64::new(0),
         }
@@ -111,20 +142,54 @@ impl ConnectionPool {
     /// target is hot enough to justify a speculative ready deposit
     /// ([`HOT_THRESHOLD`] flows within [`HOT_WINDOW`]).
     pub(crate) fn note_target(&self, key: &str) -> bool {
-        // Reap ancient windows lazily so the map cannot grow without bound.
-        if self.hot.len() > 4096 {
-            self.hot
-                .retain(|_, (_, start)| start.elapsed() <= HOT_WINDOW);
+        const MAX_HOT_TARGETS: u64 = 4096;
+        match self.hot.entry(key.to_owned()) {
+            Entry::Occupied(mut entry) => {
+                let value = entry.get_mut();
+                if value.1.elapsed() > HOT_WINDOW {
+                    *value = (0, Instant::now());
+                }
+                value.0 += 1;
+                value.0 >= HOT_THRESHOLD
+            }
+            Entry::Vacant(entry) => {
+                if self
+                    .hot_entries
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                        (current < MAX_HOT_TARGETS).then_some(current + 1)
+                    })
+                    .is_err()
+                {
+                    return false;
+                }
+                entry.insert((1, Instant::now()));
+                false
+            }
         }
-        let mut e = self
-            .hot
-            .entry(key.to_string())
-            .or_insert((0, Instant::now()));
-        if e.1.elapsed() > HOT_WINDOW {
-            *e = (0, Instant::now());
+    }
+
+    pub(crate) async fn acquire_dial_permit() -> OwnedSemaphorePermit {
+        Arc::clone(
+            GLOBAL_DIAL_SEMAPHORE.get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_DIALS))),
+        )
+        .acquire_owned()
+        .await
+        .expect("global dial semaphore is never closed")
+    }
+
+    /// Claim one background warming dial for this ready key. The returned
+    /// guard clears the claim on drop, including cancellation and failures.
+    pub(crate) fn try_begin_warm(&self, key: &str) -> Option<WarmDialGuard<'_>> {
+        match self.warm_dials.entry(key.to_owned()) {
+            Entry::Vacant(entry) => {
+                entry.insert(());
+                Some(WarmDialGuard {
+                    pool: self,
+                    key: key.to_owned(),
+                })
+            }
+            Entry::Occupied(_) => None,
         }
-        e.0 += 1;
-        e.0 >= HOT_THRESHOLD
     }
 
     pub(crate) fn ready_metrics(&self) -> ReadyPoolMetrics {
@@ -179,9 +244,8 @@ impl ConnectionPool {
     }
 
     async fn acquire_entry(&self, addr: &str, want_ready: bool) -> Option<PooledStream> {
-        // Clone the Arc from DashMap, releasing the shard lock immediately.
         let arc = Arc::clone(&*self.entries.get(addr)?);
-        let mut list = arc.lock().unwrap();
+        let mut list = arc.lock();
 
         let now = Instant::now();
         let mut found_idx: Option<usize> = None;
@@ -212,6 +276,9 @@ impl ConnectionPool {
                 if list.is_empty() {
                     drop(list);
                     self.entries.remove(addr);
+                    if want_ready {
+                        self.release_ready_target(&Self::ready_node(addr));
+                    }
                 }
                 Some(entry.stream)
             }
@@ -226,6 +293,9 @@ impl ConnectionPool {
                 if list.is_empty() {
                     drop(list);
                     self.entries.remove(addr);
+                    if want_ready {
+                        self.release_ready_target(&Self::ready_node(addr));
+                    }
                 }
                 None
             }
@@ -245,48 +315,45 @@ impl ConnectionPool {
     }
 
     async fn deposit_entry(&self, addr: &str, stream: PooledStream) {
-        // Global FD budget before any per-key work.
-        if self.total_entries.load(Ordering::Relaxed) >= MAX_TOTAL_ENTRIES as u64 {
+        let ready_node = matches!(stream, PooledStream::Ready(_)).then(|| Self::ready_node(addr));
+        if !self.reserve_total() {
             debug!(
                 "Pool global cap reached ({}); dropping deposit for {}",
                 MAX_TOTAL_ENTRIES, addr
             );
             return;
         }
-        // Ready entries: bound the target cardinality per node.
-        if matches!(stream, PooledStream::Ready(_)) {
-            let node_prefix_end = addr
-                .strip_prefix("ready|")
-                .and_then(|rest| rest.find('|').map(|i| i + "ready|".len()))
-                .unwrap_or(addr.len());
-            let node_prefix = &addr[..node_prefix_end];
-            let targets = self
-                .entries
-                .iter()
-                .filter(|kv| kv.key().starts_with(node_prefix))
-                .count();
-            if targets >= MAX_READY_TARGETS_PER_NODE {
-                debug!(
-                    "Ready target cardinality cap reached for {} (max={}); dropping deposit",
-                    node_prefix, MAX_READY_TARGETS_PER_NODE
-                );
-                return;
+
+        let mut target_reserved = false;
+        let arc = match self.entries.entry(addr.to_string()) {
+            Entry::Occupied(entry) => Arc::clone(entry.get()),
+            Entry::Vacant(entry) => {
+                if let Some(node) = ready_node.as_deref() {
+                    target_reserved = self.reserve_ready_target(node);
+                    if !target_reserved {
+                        self.total_entries.fetch_sub(1, Ordering::AcqRel);
+                        debug!(
+                            "Ready target cardinality cap reached for {} (max={}); dropping deposit",
+                            node, MAX_READY_TARGETS_PER_NODE
+                        );
+                        return;
+                    }
+                }
+                let arc = Arc::new(Mutex::new(Vec::new()));
+                entry.insert(Arc::clone(&arc));
+                arc
             }
-        }
-        let arc = {
-            let entry = self
-                .entries
-                .entry(addr.to_string())
-                .or_insert_with(|| Arc::new(Mutex::new(Vec::new())));
-            Arc::clone(&*entry)
         };
-        let mut list = arc.lock().unwrap();
+        let mut list = arc.lock();
         if list.len() >= MAX_PER_HOST {
+            self.total_entries.fetch_sub(1, Ordering::AcqRel);
+            if target_reserved {
+                self.release_ready_target(ready_node.as_deref().expect("ready node"));
+            }
             debug!("Pool cap reached for {} (max={})", addr, MAX_PER_HOST);
             return;
         }
         let now = Instant::now();
-        self.total_entries.fetch_add(1, Ordering::Relaxed);
         let kind = match &stream {
             PooledStream::Bare(_) => "bare",
             PooledStream::Ready(_) => "ready",
@@ -304,6 +371,40 @@ impl ConnectionPool {
         );
     }
 
+    fn reserve_total(&self) -> bool {
+        self.total_entries
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < MAX_TOTAL_ENTRIES as u64).then_some(current + 1)
+            })
+            .is_ok()
+    }
+
+    fn ready_node(key: &str) -> String {
+        key.strip_prefix("ready|")
+            .and_then(|rest| rest.split_once('|').map(|(node, _)| node.to_owned()))
+            .unwrap_or_default()
+    }
+
+    fn reserve_ready_target(&self, node: &str) -> bool {
+        let counter = Arc::clone(
+            &*self
+                .ready_targets
+                .entry(node.to_owned())
+                .or_insert_with(|| Arc::new(AtomicU64::new(0))),
+        );
+        counter
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < MAX_READY_TARGETS_PER_NODE as u64).then_some(current + 1)
+            })
+            .is_ok()
+    }
+
+    fn release_ready_target(&self, node: &str) {
+        if let Some(counter) = self.ready_targets.get(node) {
+            counter.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
     /// Drop every pooled connection tied to a proxy node: the bare
     /// `"host:port"` key plus all `ready|<node_addr>|…` entries. Called
     /// when the node flips alive→dead — a pooled-but-doomed stream must
@@ -314,7 +415,7 @@ impl ConnectionPool {
         let mut removed = 0u64;
         self.entries.retain(|key, arc| {
             if key == node_addr || key.starts_with(&ready_prefix) {
-                removed += arc.lock().unwrap().len() as u64;
+                removed += arc.lock().len() as u64;
                 false
             } else {
                 true
@@ -322,6 +423,7 @@ impl ConnectionPool {
         });
         if removed > 0 {
             self.total_entries.fetch_sub(removed, Ordering::Relaxed);
+            self.ready_targets.remove(node_addr);
             debug!(
                 "Purged {} pooled connections for dead node {}",
                 removed, node_addr
@@ -334,8 +436,8 @@ impl ConnectionPool {
         let mut total_removed = 0usize;
         let total_remaining = AtomicU64::new(0);
 
-        self.entries.retain(|_addr, arc| {
-            let mut list = arc.lock().unwrap();
+        self.entries.retain(|addr, arc| {
+            let mut list = arc.lock();
             list.retain(|e| {
                 if self.entry_expired(e, now) || !Self::is_entry_alive(e) {
                     total_removed += 1;
@@ -344,6 +446,9 @@ impl ConnectionPool {
                     true
                 }
             });
+            if list.is_empty() && addr.starts_with("ready|") {
+                self.release_ready_target(&Self::ready_node(addr));
+            }
             total_remaining.fetch_add(list.len() as u64, Ordering::Relaxed);
             !list.is_empty()
         });
@@ -475,6 +580,7 @@ mod tests {
     use honk_config::types::NodeProtocol;
     use honk_outbound::proxy::ProxyHandler;
     use honk_outbound::proxy::socks5::Socks5Handler;
+    use std::sync::atomic::AtomicUsize;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -810,6 +916,108 @@ mod tests {
             pool.acquire_ready(&ConnectionPool::ready_key(other_addr, target, None))
                 .await
                 .is_some()
+        );
+    }
+    #[tokio::test]
+    async fn test_dial_permits_cap_concurrent_callers() {
+        use std::sync::atomic::AtomicUsize;
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..12 {
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            tasks.spawn(async move {
+                let _permit = ConnectionPool::acquire_dial_permit().await;
+                let now = active.fetch_add(1, Ordering::AcqRel) + 1;
+                peak.fetch_max(now, Ordering::AcqRel);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                active.fetch_sub(1, Ordering::AcqRel);
+            });
+        }
+        while tasks.join_next().await.is_some() {}
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        assert_eq!(peak.load(Ordering::Acquire), MAX_CONCURRENT_DIALS);
+    }
+
+    #[tokio::test]
+    async fn test_ready_target_cap_is_atomic_under_parallel_deposits() {
+        let pool = Arc::new(ConnectionPool::new());
+        let server = spawn_hold_open_listener().await;
+        let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..MAX_READY_TARGETS_PER_NODE + 16 {
+            let pool = Arc::clone(&pool);
+            tasks.spawn(async move {
+                let key = format!("ready|node:443|198.51.100.{i}:443");
+                let tcp = TcpStream::connect(server).await.unwrap();
+                pool.deposit_ready(&key, make_ready_stream(tcp, target))
+                    .await;
+            });
+        }
+        while tasks.join_next().await.is_some() {}
+        assert_eq!(
+            pool.ready_targets
+                .get("node:443")
+                .map(|count| count.load(Ordering::Acquire)),
+            Some(MAX_READY_TARGETS_PER_NODE as u64),
+            "parallel distinct deposits must never exceed the ready-target cap"
+        );
+        assert_eq!(
+            pool.total_entries.load(Ordering::Acquire),
+            MAX_READY_TARGETS_PER_NODE as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn test_total_cap_cas_never_overshoots_under_parallel_reservations() {
+        let pool = Arc::new(ConnectionPool::new());
+        pool.total_entries
+            .store(MAX_TOTAL_ENTRIES as u64 - 4, Ordering::Release);
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..32 {
+            let pool = Arc::clone(&pool);
+            let accepted = Arc::clone(&accepted);
+            tasks.spawn(async move {
+                if pool.reserve_total() {
+                    accepted.fetch_add(1, Ordering::AcqRel);
+                }
+            });
+        }
+        while tasks.join_next().await.is_some() {}
+        assert_eq!(accepted.load(Ordering::Acquire), 4);
+        assert_eq!(
+            pool.total_entries.load(Ordering::Acquire),
+            MAX_TOTAL_ENTRIES as u64
+        );
+    }
+
+    #[test]
+    fn test_warm_key_singleflight_and_drop_releases_claim() {
+        let pool = ConnectionPool::new();
+        let key = "ready|node:443|198.51.100.1:443";
+        let guard = pool.try_begin_warm(key).expect("first warmer owns key");
+        assert!(
+            pool.try_begin_warm(key).is_none(),
+            "follower must not duplicate warm dial"
+        );
+        drop(guard);
+        assert!(
+            pool.try_begin_warm(key).is_some(),
+            "cancelled/failed owner must release key"
+        );
+    }
+
+    #[test]
+    fn test_hot_map_refuses_new_keys_at_bound_without_scan() {
+        let pool = ConnectionPool::new();
+        pool.hot_entries.store(4096, Ordering::Release);
+        assert!(!pool.note_target("ready|node:443|new:443"));
+        assert!(
+            pool.hot.is_empty(),
+            "a full hot map must not insert or scan"
         );
     }
 }

@@ -399,6 +399,11 @@ UDP size、入口 profile、策略、scope 与 operation 均在 key 中保持隔
 flags、EDNS option（包括 ECS/COOKIE）、EDNS-v1 与多问题消息绕过这两项优化；取消会
 释放 flight。
 
+运行时 cache 与 singleflight key 共享同一份不可变二进制 query identity；
+operation 变体复用该分配，cache 分片使用预计算的运行时 hash。SQLite 文本编码
+只存在于持久化边界。
+
+
 ### Runtime 与可观测性
 
 重载一次切换包含 DNS 策略、Router、GroupManager 快照、transport manager、路由投影与

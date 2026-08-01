@@ -10,9 +10,9 @@ use aya_ebpf_bindings::helpers::{
     bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_socket_cookie, bpf_ktime_get_ns,
 };
 use core::mem;
-use honk_ebpf_common::redirect_need::PIDName;
+use honk_ebpf_common::{conn::BpfStatsKey, redirect_need::PIDName};
 
-use crate::maps::COOKIE_PID_MAP;
+use crate::maps::{COOKIE_PID_MAP, increment_bpf_stat};
 
 /// Cgroup program verdict: allow the operation.
 const CGROUP_ALLOW: i32 = 1;
@@ -70,7 +70,9 @@ fn update_map_elem_by_cookie(cookie: u64) -> i32 {
             let mut fallback: PIDName = unsafe { mem::zeroed() };
             fallback.last_seen_ns = unsafe { bpf_ktime_get_ns() };
             fallback.pid = (unsafe { bpf_get_current_pid_tgid() } >> 32) as u32;
-            let _ = COOKIE_PID_MAP.insert(cookie, fallback, 0u64);
+            if COOKIE_PID_MAP.insert(cookie, fallback, 0u64).is_err() {
+                increment_bpf_stat(BpfStatsKey::CookiePidInsertFailure);
+            }
             -1
         }
     }

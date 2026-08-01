@@ -1,3 +1,5 @@
+use super::CacheKey;
+
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -12,12 +14,18 @@ static ZERO_CAPACITY_WARNED: AtomicBool = AtomicBool::new(false);
 pub(crate) struct PublicationEpoch(pub(super) u64);
 
 pub struct DnsCacheService {
-    pub(super) shards: Vec<Mutex<lru::LruCache<String, CacheValue>>>,
+    pub(super) shards: Vec<Mutex<lru::LruCache<CacheSlot, CacheValue>>>,
     pub(super) flights: Singleflight,
     pub(super) counters: CacheCounterSet,
     pub(super) persister: Mutex<Option<crate::dns::persist::DnsCachePersister>>,
     pub(super) refresh_tasks: Mutex<RefreshTasks>,
     pub(super) active_refresh_tasks: Arc<AtomicUsize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum CacheSlot {
+    Exact(CacheKey),
+    Legacy(String),
 }
 
 pub(super) struct RefreshTasks {

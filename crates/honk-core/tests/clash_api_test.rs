@@ -158,6 +158,7 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
         log_tx,
         dns_service,
         connection_pool: Arc::new(honk_core::pool::ConnectionPool::new()),
+        stream_samplers: Arc::new(clash_api::StreamSamplers::new()),
     });
 
     let app = clash_api::router(state.clone());
@@ -1077,6 +1078,7 @@ async fn test_dns_query_upstream_and_nxdomain() {
         log_tx: app.state.log_tx.clone(),
         dns_service: nx_service,
         connection_pool: app.state.connection_pool.clone(),
+        stream_samplers: app.state.stream_samplers.clone(),
     });
     let nx_app = clash_api::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

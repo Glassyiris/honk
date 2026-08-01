@@ -19,9 +19,9 @@ mod storage;
 mod store;
 
 pub use counters::CacheCounters;
-pub(crate) use key::{CacheKey, OperationKind};
-pub use service::DnsCacheService;
+pub(crate) use key::{CacheKey, KeyIdentity, OperationKind};
 pub(crate) use service::PublicationEpoch;
+pub(crate) use service::{CacheSlot, DnsCacheService};
 pub use storage::{CachedEntry, NegativeCacheHit};
 
 use storage::CacheValue;

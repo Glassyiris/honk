@@ -14,6 +14,8 @@ pub(crate) struct DnsStatsSnapshot {
     pub(crate) singleflight_waiter_saturation: u64,
     pub(crate) singleflight_cancel: u64,
     pub(crate) singleflight_retry: u64,
+    pub(crate) singleflight_rejected: u64,
+    pub(crate) singleflight_amplification_avoided: u64,
     pub(crate) persistence_drop: u64,
     pub(crate) persistence_flush_failure: u64,
     pub(crate) runtime_retirement_timeout: u64,
@@ -50,6 +52,12 @@ impl DnsStatsSnapshot {
             singleflight_retry: self
                 .singleflight_retry
                 .saturating_sub(earlier.singleflight_retry),
+            singleflight_rejected: self
+                .singleflight_rejected
+                .saturating_sub(earlier.singleflight_rejected),
+            singleflight_amplification_avoided: self
+                .singleflight_amplification_avoided
+                .saturating_sub(earlier.singleflight_amplification_avoided),
             persistence_drop: self
                 .persistence_drop
                 .saturating_sub(earlier.persistence_drop),

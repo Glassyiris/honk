@@ -12,4 +12,3 @@ pub fn bpf_sock_is_dae_socket(sock: *const bpf_sock) -> bool {
     }
     unsafe { (*fullsock).mark == crate::maps::PARAM.load().dae_socket_mark }
 }
-

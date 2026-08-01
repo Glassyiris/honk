@@ -220,6 +220,17 @@ impl JuicityHandler {
             .context("Juicity: send request header")?;
         Ok((send, recv))
     }
+    async fn client_for_runtime(
+        &self,
+        runtime: &crate::runtime::NodeRuntime,
+    ) -> anyhow::Result<Arc<JuicityClient>> {
+        let crate::runtime::ProtocolRuntime::Quic(quic_runtime) = &runtime.runtime else {
+            anyhow::bail!("Juicity runtime is not QUIC-owned");
+        };
+        quic_runtime
+            .client(|| self.client_for(runtime.node.as_ref()))
+            .await
+    }
 }
 
 #[async_trait]
@@ -228,6 +239,15 @@ impl ProxyHandler for JuicityHandler {
         NodeProtocol::Juicity
     }
 
+    async fn warm_udp(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<super::UdpWarmStatus> {
+        let client = self.client_for_runtime(&runtime).await?;
+        client.connection(connect_timeout).await?;
+        Ok(super::UdpWarmStatus::Ready)
+    }
     async fn dial(
         &self,
         node: &Node,

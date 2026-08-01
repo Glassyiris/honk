@@ -25,6 +25,7 @@ mod owned_task;
 mod quic;
 mod retry;
 mod tcp_pool;
+mod udp_pool;
 
 #[cfg(test)]
 mod idle_pool_tests;
@@ -49,3 +50,4 @@ pub use dot::DotPool;
 pub use framing::{exchange_length_prefixed, force_dns_id_zero, restore_dns_id};
 pub(crate) use lifecycle::LifecycleSlot;
 pub use tcp_pool::TcpPool;
+pub use udp_pool::UdpPool;

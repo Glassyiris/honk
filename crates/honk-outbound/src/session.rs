@@ -335,8 +335,6 @@ pub struct SessionPool<S: ManagedSession + 'static> {
     dial_failures_total: Arc<AtomicUsize>,
     state: Arc<AtomicUsize>,
     shutdown_tx: Arc<tokio::sync::watch::Sender<bool>>,
-    /// Pool-owned dial task handles (aborted on shutdown).
-    tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 impl<S: ManagedSession + 'static> std::fmt::Debug for SessionPool<S> {
@@ -356,7 +354,6 @@ impl<S: ManagedSession + 'static> Clone for SessionPool<S> {
             dial_failures_total: Arc::clone(&self.dial_failures_total),
             state: Arc::clone(&self.state),
             shutdown_tx: Arc::clone(&self.shutdown_tx),
-            tasks: Arc::clone(&self.tasks),
         }
     }
 }
@@ -370,7 +367,6 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
             dial_failures_total: Arc::new(AtomicUsize::new(0)),
             state: Arc::new(AtomicUsize::new(PoolState::Running as usize)),
             shutdown_tx: Arc::new(shutdown_tx),
-            tasks: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -522,24 +518,26 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                     let failures_total = Arc::clone(&self.dial_failures_total);
                     let task_state = Arc::clone(&self.state);
                     let config = self.config.clone();
-                    let handle = tokio::spawn(async move {
+                    let mut task_shutdown_rx = self.shutdown_tx.subscribe();
+                    tokio::spawn(async move {
                         let mut guard = DialGuard {
                             keys: Arc::clone(&task_keys),
                             key: task_key.clone(),
                             inflight_id: id,
                             armed: true,
                         };
-                        let result = std::panic::AssertUnwindSafe(dial_fut).catch_unwind().await;
+                        let result = tokio::select! {
+                            result = std::panic::AssertUnwindSafe(dial_fut).catch_unwind() => Some(result),
+                            _ = task_shutdown_rx.changed() => None,
+                        };
                         let signal = {
                             let mut keys = task_keys.lock();
                             if PoolState::from(task_state.load(Ordering::Acquire))
                                 != PoolState::Running
                             {
-                                if let Ok(Ok(session)) = &result {
-                                    // A completion that lost the terminal
-                                    // race is never registered; close it
-                                    // explicitly because protocol demux tasks
-                                    // may keep their own Arc alive.
+                                if let Some(Ok(Ok(session))) = &result {
+                                    // A completion that lost the terminal race is never
+                                    // published: protocol-owned tasks may retain its Arc.
                                     session.close();
                                 }
                                 if let Some(pool) = keys.get_mut(&task_key)
@@ -555,7 +553,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                                     pool.dial_done = None;
                                 }
                                 guard.armed = false;
-                                match result {
+                                match result.expect("running pool cannot receive shutdown") {
                                     Ok(Ok(session)) => {
                                         pool.dial_failures = 0;
                                         pool.next_dial_at = None;
@@ -577,8 +575,6 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                                         ))))
                                     }
                                     Err(_panic) => {
-                                        // A panicking dial is an internal
-                                        // failure: short backoff.
                                         failures_total.fetch_add(1, Ordering::Relaxed);
                                         pool.dial_failures += 1;
                                         pool.next_dial_at =
@@ -593,12 +589,6 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                         };
                         let _ = done.send(signal);
                     });
-                    let mut tasks = self.tasks.lock();
-                    if self.state() == PoolState::Running {
-                        tasks.push(handle);
-                    } else {
-                        handle.abort();
-                    }
                     // Fall through: wait on the dial like everyone else.
                 }
             }
@@ -956,9 +946,8 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
             return;
         }
         let _ = self.shutdown_tx.send(true);
-        for task in self.tasks.lock().drain(..) {
-            task.abort();
-        }
+        // Dials and janitors observe this signal. A late dial verifies the
+        // terminal state under the registration lock before publication.
         let (sessions, provisional) = {
             let mut keys = self.keys.lock();
             let mut sessions = Vec::new();
@@ -979,7 +968,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
 
         let keys = Arc::clone(&self.keys);
         let state = Arc::clone(&self.state);
-        let drain_task = tokio::spawn(async move {
+        tokio::spawn(async move {
             loop {
                 let (to_close, empty) = {
                     let mut keys = keys.lock();
@@ -1018,7 +1007,6 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         });
-        self.tasks.lock().push(drain_task);
     }
 
     /// Shut the pool down: reject offers/inserts/prewarms, abort the
@@ -1046,10 +1034,8 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
             }
         }
         let _ = self.shutdown_tx.send(true);
-        // Abort pool-owned dial tasks; the janitor exits on the signal.
-        for task in self.tasks.lock().drain(..) {
-            task.abort();
-        }
+        // Dials and janitors observe the terminal signal; terminal
+        // registration checks close late dial results safely.
         let sessions: Vec<Arc<S>> = {
             let mut keys = self.keys.lock();
             keys.drain()

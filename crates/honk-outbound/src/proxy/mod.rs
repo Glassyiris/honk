@@ -767,16 +767,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn warm_udp_is_honestly_not_applicable_for_non_anytls_handlers() {
+    async fn warm_udp_is_not_applicable_for_handlers_without_reusable_sessions() {
         let mut nodes = Vec::new();
         for (name, protocol) in [
             ("direct", NodeProtocol::HTTP),
             ("socks", NodeProtocol::Socks5),
             ("ss", NodeProtocol::SS),
             ("trojan", NodeProtocol::Trojan),
-            ("hy2", NodeProtocol::Hysteria2),
-            ("tuic", NodeProtocol::Tuic),
-            ("juicity", NodeProtocol::Juicity),
         ] {
             nodes.push(Node {
                 name: name.into(),

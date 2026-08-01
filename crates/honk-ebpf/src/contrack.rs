@@ -327,39 +327,32 @@ fn __mark_udp_seen(
     let args = unsafe { &*args };
     let now = unsafe { bpf_ktime_get_ns() };
 
-    // Lazy expiry: delete clearly-expired entries so stale state stops
-    // affecting routing without waiting for the userspace janitor sweep.
-    if let Some(ptr) = CONN_STATE_MAP.get_ptr_mut(key) {
-        let state = unsafe { &*ptr };
-        if udp_conn_state_expired(state, now) {
-            let _ = CONN_STATE_MAP.remove(key);
-            occupancy_add(OCCUPANCY_EBPF_DELETES);
-        }
-    }
-
-    // Re-check after possible deletion: a valid state may exist now.
+    // Reuse the first lookup for an unexpired steady-state entry. An expired
+    // entry is removed before insertion, so no pointer is used after removal.
     if let Some(ptr) = CONN_STATE_MAP.get_ptr_mut(key) {
         let state = unsafe { &mut *ptr };
+        if !udp_conn_state_expired(state, now) {
+            if now.wrapping_sub(state.last_seen_ns) > UDP_CONN_STATE_UPDATE_INTERVAL_NS {
+                state.last_seen_ns = now;
+            }
 
-        if now.wrapping_sub(state.last_seen_ns) > UDP_CONN_STATE_UPDATE_INTERVAL_NS {
-            state.last_seen_ns = now;
+            // Update routing if provided (e.g., routing decision changed).
+            if args.has_routing() {
+                let meta = build_routing_meta(args.outbound, args.mark, args.must, args.dscp);
+                if args.has_mac() {
+                    state.mac.copy_from_slice(&args.mac);
+                }
+                if args.has_pname() {
+                    state.pname.copy_from_slice(&args.pname);
+                }
+                state.pid = args.pid;
+                publish_routing_meta(&mut state.meta, meta);
+            }
+            return state as *mut ConnState;
         }
 
-        // Update routing if provided (e.g., routing decision changed)
-        if args.has_routing() {
-            let meta = build_routing_meta(args.outbound, args.mark, args.must, args.dscp);
-
-            if args.has_mac() {
-                state.mac.copy_from_slice(&args.mac);
-            }
-            if args.has_pname() {
-                state.pname.copy_from_slice(&args.pname);
-            }
-            state.pid = args.pid;
-            publish_routing_meta(&mut state.meta, meta);
-        }
-
-        return state as *mut ConnState;
+        let _ = CONN_STATE_MAP.remove(key);
+        occupancy_add(OCCUPANCY_EBPF_DELETES);
     }
 
     let has_rt = args.has_routing();

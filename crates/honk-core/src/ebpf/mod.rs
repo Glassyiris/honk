@@ -60,8 +60,13 @@ pub struct LpmKeepSet {
     pub mac: std::collections::HashSet<[u8; 20]>,
 }
 
-/// Callback for [`EbpfBackend::conn_state_for_each_chunk`].
-pub type ConnStateChunkVisitor<'a> = dyn FnMut(&[(TuplesKey, ConnState)]) + 'a;
+/// Callback for a bounded janitor scan. Return `false` to stop the scan at a
+/// chunk boundary (used to enforce the janitor time budget).
+pub type ConnStateChunkVisitor<'a> = dyn FnMut(&[(TuplesKey, ConnState)]) -> bool + 'a;
+pub type RedirectTrackChunkVisitor<'a> = dyn FnMut(&[(RedirectTuple, RedirectEntry)]) -> bool + 'a;
+pub type CookiePidChunkVisitor<'a> = dyn FnMut(&[(u64, PidPname)]) -> bool + 'a;
+pub type RoutingHandoffChunkVisitor<'a> =
+    dyn FnMut(&[(TuplesKey, RoutingHandoffEntry)]) -> bool + 'a;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoutingPushPhase {
@@ -326,6 +331,14 @@ pub trait EbpfBackend: Send + Sync {
     fn udp_conn_state_lookup(&self, key: &TuplesKey) -> anyhow::Result<Option<ConnState>>;
     fn udp_conn_state_store(&mut self, key: &TuplesKey, state: &ConnState) -> anyhow::Result<()>;
     fn udp_conn_state_remove(&mut self, key: &TuplesKey) -> anyhow::Result<()>;
+    /// Remove a bounded batch of UDP conntrack entries. Backends may override
+    /// this to amortize map access; the default preserves single-delete errors.
+    fn udp_conn_state_remove_batch(&mut self, keys: &[TuplesKey]) -> anyhow::Result<usize> {
+        for key in keys {
+            self.udp_conn_state_remove(key)?;
+        }
+        Ok(keys.len())
+    }
 
     fn redirect_track_lookup(&self, key: &RedirectTuple) -> anyhow::Result<Option<RedirectEntry>>;
     fn redirect_track_store(
@@ -393,7 +406,9 @@ pub trait EbpfBackend: Send + Sync {
         let mut entries = Vec::new();
         self.conn_state_snapshot(&mut entries)?;
         for chunk in entries.chunks(chunk_size.max(1)) {
-            visit(chunk);
+            if !visit(chunk) {
+                break;
+            }
         }
         Ok(())
     }
@@ -407,39 +422,89 @@ pub trait EbpfBackend: Send + Sync {
         Ok((0, 0))
     }
 
-    /// Snapshot all (key, entry) pairs from REDIRECT_TRACK.
-    ///
-    /// Batched backends use `BPF_MAP_LOOKUP_BATCH` (one syscall per
-    /// 128-entry chunk); others fall back to GET_NEXT_KEY + per-key
-    /// lookups.  The snapshot is not atomic: entries inserted or removed
-    /// concurrently may be skipped or returned twice.  The janitor
-    /// tolerates this — missed entries are retried on the next round and
-    /// duplicates are re-validated against the expiry predicate before
-    /// deletion.
     fn redirect_track_snapshot(
         &self,
         out: &mut Vec<(RedirectTuple, RedirectEntry)>,
     ) -> anyhow::Result<()>;
-
-    /// Snapshot all (cookie, entry) pairs from COOKIE_PID_MAP.
-    /// Same consistency notes as [`Self::redirect_track_snapshot`].
     fn cookie_pid_snapshot(&self, out: &mut Vec<(u64, PidPname)>) -> anyhow::Result<()>;
-
-    /// Snapshot all (key, entry) pairs from ROUTING_HANDOFF_MAP.
-    /// Same consistency notes as [`Self::redirect_track_snapshot`].
     fn routing_handoff_snapshot(
         &self,
         out: &mut Vec<(TuplesKey, RoutingHandoffEntry)>,
     ) -> anyhow::Result<()>;
-
-    /// Remove multiple REDIRECT_TRACK entries (one `BPF_MAP_DELETE_BATCH`
-    /// syscall per 128-key chunk when supported, per-key deletes
-    /// otherwise).  Keys already gone are ignored.
     fn redirect_track_remove_batch(&mut self, keys: &[RedirectTuple]) -> anyhow::Result<()>;
-    /// Remove multiple COOKIE_PID_MAP entries (batched when supported).
     fn cookie_pid_remove_batch(&mut self, cookies: &[u64]) -> anyhow::Result<()>;
-    /// Remove multiple ROUTING_HANDOFF_MAP entries (batched when supported).
     fn routing_handoff_remove_batch(&mut self, keys: &[TuplesKey]) -> anyhow::Result<()>;
+
+    /// Stream REDIRECT_TRACK in bounded chunks. The callback can stop at a
+    /// chunk boundary so callers can retain a wall-clock budget.
+    fn redirect_track_for_each_chunk(
+        &self,
+        chunk_size: usize,
+        visit: &mut RedirectTrackChunkVisitor<'_>,
+    ) -> anyhow::Result<()> {
+        let mut entries = Vec::new();
+        self.redirect_track_snapshot(&mut entries)?;
+        for chunk in entries.chunks(chunk_size.max(1)) {
+            if !visit(chunk) {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn cookie_pid_for_each_chunk(
+        &self,
+        chunk_size: usize,
+        visit: &mut CookiePidChunkVisitor<'_>,
+    ) -> anyhow::Result<()> {
+        let mut entries = Vec::new();
+        self.cookie_pid_snapshot(&mut entries)?;
+        for chunk in entries.chunks(chunk_size.max(1)) {
+            if !visit(chunk) {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn routing_handoff_for_each_chunk(
+        &self,
+        chunk_size: usize,
+        visit: &mut RoutingHandoffChunkVisitor<'_>,
+    ) -> anyhow::Result<()> {
+        let mut entries = Vec::new();
+        self.routing_handoff_snapshot(&mut entries)?;
+        for chunk in entries.chunks(chunk_size.max(1)) {
+            if !visit(chunk) {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-check candidates before deleting them. A key reused after the scan
+    /// is retained unless its current incarnation has the scanned timestamp
+    /// and is still older than `expired_before_ns`.
+    fn conn_state_remove_if_unchanged(
+        &mut self,
+        entries: &[(TuplesKey, ConnState)],
+        expired_before_ns: u64,
+    ) -> anyhow::Result<u64>;
+    fn redirect_track_remove_if_unchanged(
+        &mut self,
+        entries: &[(RedirectTuple, RedirectEntry)],
+        expired_before_ns: u64,
+    ) -> anyhow::Result<u64>;
+    fn cookie_pid_remove_if_unchanged(
+        &mut self,
+        entries: &[(u64, PidPname)],
+        expired_before_ns: u64,
+    ) -> anyhow::Result<u64>;
+    fn routing_handoff_remove_if_unchanged(
+        &mut self,
+        entries: &[(TuplesKey, RoutingHandoffEntry)],
+        expired_before_ns: u64,
+    ) -> anyhow::Result<u64>;
 
     fn conn_track_lookup(&self, tuple: &ConnTuple) -> anyhow::Result<Option<u32>>;
     fn conn_track_store(&mut self, tuple: &ConnTuple, outbound_idx: u32) -> anyhow::Result<()>;

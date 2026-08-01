@@ -485,6 +485,18 @@ impl TuicHandler {
         .await
     }
 
+    async fn client_for_runtime(
+        &self,
+        runtime: &crate::runtime::NodeRuntime,
+    ) -> anyhow::Result<Arc<TuicClient>> {
+        let crate::runtime::ProtocolRuntime::Quic(quic_runtime) = &runtime.runtime else {
+            anyhow::bail!("TUIC runtime is not QUIC-owned");
+        };
+        quic_runtime
+            .client(|| self.client_for(runtime.node.as_ref()))
+            .await
+    }
+
     async fn send_udp(
         state: &TuicConnState,
         session_id: u16,
@@ -527,6 +539,16 @@ impl TuicHandler {
 impl ProxyHandler for TuicHandler {
     fn protocol(&self) -> NodeProtocol {
         NodeProtocol::Tuic
+    }
+
+    async fn warm_udp(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<super::UdpWarmStatus> {
+        let client = self.client_for_runtime(&runtime).await?;
+        client.connection(connect_timeout).await?;
+        Ok(super::UdpWarmStatus::Ready)
     }
 
     async fn dial(

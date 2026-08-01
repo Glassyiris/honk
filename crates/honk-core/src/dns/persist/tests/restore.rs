@@ -16,9 +16,8 @@ async fn exact_entry_round_trips_across_restart_and_renders_caller_txid() {
         Some(active_policy.clone()),
         upstream("default"),
     );
-    let storage_key = key.storage_key();
     let persister = DnsCachePersister::spawn(Arc::clone(&db));
-    persister.save(key, response.clone(), unix_now() + 300);
+    persister.save(key.clone(), response.clone().into(), unix_now() + 300);
     persister.shutdown().await.expect("shutdown");
 
     let restored = DnsCache::new(16);
@@ -31,7 +30,7 @@ async fn exact_entry_round_trips_across_restart_and_renders_caller_txid() {
             .expect("restore"),
         1
     );
-    let entry = restored_service.get(&storage_key).expect("exact hit");
+    let entry = restored_service.get_exact(&key).expect("exact hit");
     let mut caller_wire = build_dns_query("example.com", 1);
     caller_wire[0..2].copy_from_slice(&0x1234_u16.to_be_bytes());
     let caller = QueryContext::parse(&caller_wire).expect("caller");
@@ -142,7 +141,7 @@ async fn exact_restore_does_not_hit_profile_scope_wire_or_policy_variants() {
         OperationKind::Resolve,
     );
     for variant in [profile, scope, no_policy, wire_key] {
-        assert!(service.get(&variant.storage_key()).is_none());
+        assert!(service.get_exact(&variant).is_none());
     }
     persister.shutdown().await.expect("shutdown");
 }

@@ -77,40 +77,33 @@ async fn waiter_retries_when_leader_is_cancelled() {
 }
 
 #[test]
-fn distinct_key_saturation_bypasses_without_registering_more_entries() {
-    // Given
+fn active_flight_limit_rejects_the_2049th_key() {
     let before = crate::stats::dns_snapshot();
     let flights = Singleflight::default();
     let leaders: Vec<_> = (0..MAX_ACTIVE_FLIGHTS)
         .map(
             |index| match flights.acquire(key(u16::try_from(index).expect("index"))) {
                 FlightRole::Leader(leader) => leader,
-                FlightRole::Waiter(_) | FlightRole::Ready(_) | FlightRole::Bypass => {
-                    panic!("leader")
-                }
+                _ => panic!("leader"),
             },
         )
         .collect();
 
-    // When
-    let saturated = flights.acquire(key(u16::try_from(MAX_ACTIVE_FLIGHTS).expect("limit")));
-
-    // Then
-    assert!(matches!(saturated, FlightRole::Bypass));
-    assert_eq!(flights.active_len(), MAX_ACTIVE_FLIGHTS);
-    assert_eq!(flights.counters().key_saturation_bypass, 1);
+    assert_eq!(flights.active_len(), 2048);
+    assert!(matches!(flights.acquire(key(2048)), FlightRole::Rejected));
+    assert_eq!(flights.active_len(), 2048);
+    assert_eq!(flights.counters().rejections, 1);
     assert!(
         crate::stats::dns_snapshot()
             .delta(before)
-            .singleflight_key_saturation
+            .singleflight_rejected
             >= 1
     );
     drop(leaders);
 }
 
 #[test]
-fn waiter_saturation_bypasses_the_257th_waiter() {
-    // Given
+fn waiter_limit_rejects_the_257th_follower_without_opening_an_exchange() {
     let before = crate::stats::dns_snapshot();
     let flights = Singleflight::default();
     let FlightRole::Leader(_leader) = flights.acquire(key(3)) else {
@@ -119,20 +112,19 @@ fn waiter_saturation_bypasses_the_257th_waiter() {
     let waiters: Vec<_> = (0..MAX_WAITERS_PER_FLIGHT)
         .map(|_| match flights.acquire(key(3)) {
             FlightRole::Waiter(waiter) => waiter,
-            FlightRole::Leader(_) | FlightRole::Ready(_) | FlightRole::Bypass => panic!("waiter"),
+            _ => panic!("waiter"),
         })
         .collect();
 
-    // When
-    let saturated = flights.acquire(key(3));
-
-    // Then
-    assert!(matches!(saturated, FlightRole::Bypass));
-    assert_eq!(flights.counters().waiter_saturation_bypass, 1);
+    assert_eq!(flights.counters().waiters, 256);
+    assert!(matches!(flights.acquire(key(3)), FlightRole::Rejected));
+    let counters = flights.counters();
+    assert_eq!(counters.rejections, 1);
+    assert_eq!(counters.amplification_avoided, 256);
     assert!(
         crate::stats::dns_snapshot()
             .delta(before)
-            .singleflight_waiter_saturation
+            .singleflight_rejected
             >= 1
     );
     drop(waiters);

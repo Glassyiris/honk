@@ -128,6 +128,7 @@ flowchart TB
 | `DOMAIN_ROUTING_MAP` | IP → 域名规则位图（DNS 学习） |
 | `ROUTING_HANDOFF_MAP` | 五元组 → 用户态 handoff |
 | `REDIRECT_TRACK` / `CONN_STATE_MAP` | redirect 与 conntrack |
+| `BPF_STATS_MAP` | conn-state 溢出，以及 redirect/handoff/cookie 插入失败 |
 | `OUTBOUND_CONNECTIVITY_MAP` | 用户态健康检查推送的存活位 |
 | `OUTBOUND_STATS` | 每出站 per-CPU tx/rx 包/字节 |
 | `LISTEN_SOCKET_MAP` | 透明监听 SockMap |
@@ -167,6 +168,10 @@ flowchart TB
 | Cache DB | Selector 选择、模式、可选 DNS 应答 |
 | 订阅 | 拉取 + 周期合并，不回写配置文件 |
 
+裸 TCP 的 splice 每个方向最多申请 64 KiB 私有非阻塞 pipe（全双工每条 relay
+共 128 KiB 与四个 pipe FD）。不支持 splice 的路径会在移动任何字节前无损回退。
+
+
 ### 拨号模式（`global.dial_mode`）
 
 | 模式 | 行为 |
@@ -201,12 +206,15 @@ transport 及 anyfrom 回包 socket 后，driver 到达 ready barrier，lease �
 首包和稳态发送的 timeout 都是五秒；timeout 或错误均可能已送达，因此绝不改由
 另一个 candidate 重放该包。
 
-**队列上限也是所有权上限。** 每 flow 最多保留 64 个 datagram（含首包），
+**队列与进程预算也是所有权上限。** 每 flow 最多保留 64 个 datagram（含首包），
 全部 flow 的 payload 合计最多 8 MiB。slow admission 和 flow/global permit
-在分配或复制 payload 之前取得；后续包按 FIFO 且非阻塞，饱和时丢弃最新包。
-reload cancellation 受 epoch 与 generation 栅栏保护：它清理 `Initializing`
-lease 及资源、保留已经 `Ready` 的 endpoint，并且只删除同一 generation，故旧任务
-不能清除 replacement。
+在分配或复制 payload 前取得；后续包按 FIFO 且非阻塞，饱和时丢弃最新包。TCP、
+冷态非 DNS UDP 与 port-53 工作使用相互独立的 admission semaphore，避免一种流量
+耗尽其他类别。UDP endpoint 还预留进程 FD；生产上限为
+`min(8192, (min(RLIMIT_NOFILE, 16384) - reserves) / 2)`。移除通知使用有界队列与
+去重补偿。reload cancellation 受 epoch 与 generation 栅栏保护：它清理
+`Initializing` lease 及资源、保留已经 `Ready` 的 endpoint，并且只删除同一
+generation，故旧任务不能清除 replacement。
 
 **选择竞争被刻意收窄。** 普通 Selector、LoadBalance、Fallback、显式节点与
 warm URLTest plan 都是权威的单叶 plan。只有顶层 cold URLTest plan 可并发准备多个

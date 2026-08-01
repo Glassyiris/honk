@@ -15,8 +15,10 @@ pub(crate) const MAX_WAITERS_PER_FLIGHT: usize = 256;
 pub struct FlightCounters {
     pub leaders: u64,
     pub waiters: u64,
-    pub key_saturation_bypass: u64,
-    pub waiter_saturation_bypass: u64,
+    /// Saturated-key requests rejected rather than opening an unbounded exchange.
+    pub rejections: u64,
+    /// Followers attached to a shared upstream exchange.
+    pub amplification_avoided: u64,
     pub aborts: u64,
     pub retries: u64,
     pub refreshes: u64,
@@ -26,8 +28,8 @@ pub struct FlightCounters {
 struct CounterSet {
     leaders: AtomicU64,
     waiters: AtomicU64,
-    key_saturation_bypass: AtomicU64,
-    waiter_saturation_bypass: AtomicU64,
+    rejections: AtomicU64,
+    amplification_avoided: AtomicU64,
     aborts: AtomicU64,
     retries: AtomicU64,
     refreshes: AtomicU64,
@@ -53,7 +55,7 @@ pub(crate) enum FlightRole {
     Leader(FlightLeader),
     Waiter(FlightWaiter),
     Ready(Arc<ResponseTemplate>),
-    Bypass,
+    Rejected,
 }
 
 pub(crate) struct FlightWaiter {
@@ -76,36 +78,36 @@ impl Singleflight {
                 return FlightRole::Ready(Arc::clone(template));
             }
             if entry.sender.receiver_count() >= MAX_WAITERS_PER_FLIGHT {
-                self.counters
-                    .waiter_saturation_bypass
-                    .fetch_add(1, Ordering::Relaxed);
-                crate::stats::record_dns_event(
-                    crate::stats::DnsStatEvent::SingleflightWaiterSaturation,
-                );
+                self.counters.rejections.fetch_add(1, Ordering::Relaxed);
+                crate::stats::record_dns_event(crate::stats::DnsStatEvent::SingleflightRejected);
                 tracing::warn!(
                     saturation = "waiters",
-                    action = "bypass",
+                    action = "reject",
                     "DNS singleflight saturated"
                 );
-                return FlightRole::Bypass;
+                return FlightRole::Rejected;
             }
             self.counters.waiters.fetch_add(1, Ordering::Relaxed);
+            self.counters
+                .amplification_avoided
+                .fetch_add(1, Ordering::Relaxed);
+            crate::stats::record_dns_event(
+                crate::stats::DnsStatEvent::SingleflightAmplificationAvoided,
+            );
             return FlightRole::Waiter(FlightWaiter {
                 receiver: entry.sender.subscribe(),
                 counters: Arc::clone(&self.counters),
             });
         }
         if entries.len() >= MAX_ACTIVE_FLIGHTS {
-            self.counters
-                .key_saturation_bypass
-                .fetch_add(1, Ordering::Relaxed);
-            crate::stats::record_dns_event(crate::stats::DnsStatEvent::SingleflightKeySaturation);
+            self.counters.rejections.fetch_add(1, Ordering::Relaxed);
+            crate::stats::record_dns_event(crate::stats::DnsStatEvent::SingleflightRejected);
             tracing::warn!(
                 saturation = "keys",
-                action = "bypass",
+                action = "reject",
                 "DNS singleflight saturated"
             );
-            return FlightRole::Bypass;
+            return FlightRole::Rejected;
         }
         let (sender, _) = broadcast::channel(1);
         entries.insert(
@@ -130,11 +132,8 @@ impl Singleflight {
         FlightCounters {
             leaders: self.counters.leaders.load(Ordering::Relaxed),
             waiters: self.counters.waiters.load(Ordering::Relaxed),
-            key_saturation_bypass: self.counters.key_saturation_bypass.load(Ordering::Relaxed),
-            waiter_saturation_bypass: self
-                .counters
-                .waiter_saturation_bypass
-                .load(Ordering::Relaxed),
+            rejections: self.counters.rejections.load(Ordering::Relaxed),
+            amplification_avoided: self.counters.amplification_avoided.load(Ordering::Relaxed),
             aborts: self.counters.aborts.load(Ordering::Relaxed),
             retries: self.counters.retries.load(Ordering::Relaxed),
             refreshes: self.counters.refreshes.load(Ordering::Relaxed),
