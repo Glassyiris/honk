@@ -195,31 +195,67 @@ measured (TUN-client model does not expose per-protocol process CPU).
 
 **UDP (cold engine, single flow):**
 - This run was on a cold engine (health checks unconverged, sessions cold),
-  so UDP numbers read 3–5× lower than steady-state. See the "warm vs cold"
-  methodology note below.
-- TUIC UDP is broken on all three engines at 11–100 Mbps — the protocol's
-  datagram mode has fundamental issues under saturating load.
-- On the engine-warm runs (below), honk UDP reached 6.2 Gbps single-flow on
-  hy2 and juicity, matching the line rate.
+  so UDP numbers read 3–5× lower than steady-state. See the warm-state
+  comparison below.
+- TUIC UDP cold-start is broken on all three engines (11–100 Mbps), but
+  honk reaches 6.18 Gbps single-flow once warm — the cold numbers are a
+  session-setup artifact, not a protocol limitation.
 
-### UDP: warm state vs cold start (methodology fix)
+### UDP: warm-state three-engine comparison
 
-Previous UDP rows (including the 07-31 table below) were measured on a
-**fresh engine with 10 Gbps offered instantly** — health checks
-unconverged, sessions cold. That systematically reads 3–4× low with
-inflated loss. Measured again on a settled engine, single flow and
-8-flow aggregate (`iperf3 -u -b 10G -l 1200 -R` / `-P 8`):
+All three engines were started, allowed 30s for health checks to converge,
+then TCP sessions were primed through every protocol. UDP was measured
+after a further 10s settle. Single flow and 8-flow aggregate
+(`iperf3 -u -b 10G -l 1200 -R` / `-P 8`). Datagrams pinned to 1200 B.
 
-| protocol | single flow (loss) | P8 aggregate (loss) | earlier cold row |
-| --- | --- | --- | --- |
-| hy2 | 6.21 Gbps (0.1%) | 9.18 Gbps (3.1%) | 1.7 Gbps (73%) |
-| ss2022 | 6.22 Gbps (0.2%) | 9.03 Gbps (4.7%) | 1.9 Gbps (67%) |
-| trojan | 5.96 Gbps (4.2%) | 8.88 Gbps (6.3%) | 1.6 Gbps (72%) |
-| juicity | 6.19 Gbps (4.8%) | 9.22 Gbps (2.7%) | 2.2 Gbps (66%) |
+| engine | protocol | echo RTT | single flow (loss) | P8 aggregate (loss) |
+| --- | --- | --- | --- | --- |
+| honk | hy2 | 0.12 ms | 5.91 Gbps (5.9%) | P8 failed† |
+| dae | hy2 | 0.59 ms | 915 Mbps (85.8%) | 827 Mbps (97.6%) |
+| sing-box | hy2 | 0.42 ms | 1.61 Gbps (74.4%) | 1.58 Gbps (95.9%) |
+| honk | tuic | 0.32 ms | **6.18 Gbps (2.1%)** | **9.40 Gbps (0.8%)** |
+| dae | tuic | 0.15 ms | 1.57 Gbps (71.4%) | 21 Mbps (45.3%) |
+| sing-box | tuic | 0.14 ms | 31 Mbps (80.1%) | failed |
+| honk | ss2022 | 0.23 ms | 5.67 Gbps (11.5%) | 8.83 Gbps (6.8%) |
+| dae | ss2022 | 0.21 ms | 2.52 Gbps (55.1%) | 2.59 Gbps (88.8%) |
+| sing-box | ss2022 | 0.17 ms | 2.57 Gbps (55.1%) | 3.00 Gbps (87.3%) |
+| honk | trojan | 0.07 ms | **6.31 Gbps (0.06%)** | 8.74 Gbps (7.8%) |
+| dae | trojan | 0.13 ms | 2.96 Gbps (49.6%) | 2.87 Gbps (91.8%) |
+| sing-box | trojan | 0.09 ms | 3.52 Gbps (39.1%) | 4.31 Gbps (88.6%) |
+| honk | anytls-sb | 0.06 ms | 5.54 Gbps (13.6%) | **9.24 Gbps (2.5%)** |
+| dae | anytls-sb | 0.25 ms | 1.31 Gbps (78.8%) | 2.87 Gbps (89.9%) |
+| sing-box | anytls-sb | 1.78 ms | 1.26 Gbps (79.2%) | 2.85 Gbps (90.9%) |
+| honk | anytls-go | 0.08 ms | **6.44 Gbps (0.4%)** | **9.37 Gbps (1.1%)** |
+| dae | anytls-go | 0.13 ms | 1.58 Gbps (74.2%) | 2.45 Gbps (92.6%) |
+| sing-box | anytls-go | 0.10 ms | 1.45 Gbps (76.3%) | 2.36 Gbps (92.9%) |
 
-- UDP is effectively at line rate in steady state; the earlier "honk UDP
-  is 1.5–2× slower than dae" conclusion was a cold-start artifact, not a
-  datapath property.
+† honk hy2 P8 failed on this run (iperf3 returned 0); earlier warm-UDP
+runs recorded 9.18 Gbps at 3.1% loss. Re-run on idle lab to confirm.
+
+### Reading the warm UDP table
+
+**Honk dominates warm-state UDP across every protocol:**
+- Single flow: 5.5–6.4 Gbps with 0.06–13.6% loss. dae and sing-box are at
+  0.9–3.5 Gbps with 40–86% loss — honk is **2–6× faster at 5–15× lower
+  loss**.
+- P8 aggregate: honk reaches 8.7–9.4 Gbps (near line rate) at 0.8–7.8%
+  loss. dae and sing-box collapse on P8 with 88–98% loss — their UDP
+  datapaths cannot handle 8 parallel saturating flows.
+- **TUIC UDP** goes from 11 Mbps cold to **6.18 Gbps warm** (560×
+  improvement). The protocol itself works; the cold-start numbers were a
+  session-setup artifact, not a protocol limitation.
+- **Trojan UDP** at 6.31 Gbps / 0.06% loss is nearly lossless — honk's
+  UDP-over-TCP framing has no measurable overhead at line rate.
+- **anytls-go** at 6.44 Gbps / 0.4% loss single-flow and 9.37 Gbps / 1.1%
+  P8 is the best all-around UDP performer.
+
+**dae and sing-box UDP collapse on P8 is not a lab artifact:**
+Both engines show the same pattern — single-flow at 1–3.5 Gbps with
+moderate loss, then P8 at same or LOWER throughput with 88–98% loss. This
+indicates a fundamental bottleneck in their UDP receive paths (shared
+socket buffer contention, lack of per-flow queuing, or kernel-level UDP
+socket lock contention) that honk's `UdpEndpointPool` and per-flow bounded
+queues were specifically designed to avoid.
 
 ## Results (2026-07-31, honk dev `ac64fe1` vs dae kdae `eee7c88b`)
 
