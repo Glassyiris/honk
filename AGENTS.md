@@ -270,6 +270,33 @@ The old `run` / `deploy` / `docker*` recipes were removed: they called `scripts/
 
 `.github/workflows/release.yml` runs on `v*` tags: a test gate (`cargo test --workspace --no-fail-fast` with the three named temporary excludes listed below — boring-sys needs `cmake` + `libclang-dev` installed), then builds `honk-core --features ebpf` for `x86_64`/`aarch64` × `gnu`/`musl` (native gnu via `cargo build`; the other three via **zig cc/c++ wrapper scripts `ci/zigcc` / `ci/zigcxx`** — under cross, CMake injects clang-style `--target` flags into boring-sys' ASM rules that real GCC rejects and zig rejects in Rust-triple spelling, so the wrappers strip them and re-anchor on `$ZIGCC_TARGET`; musl targets also set `link-self-contained=no` so zig supplies the CRT). Each of the four target triples ships a default mimalloc build and a `-stock` build without the `mimalloc` feature (lower RSS high-water on small gateways). The eBPF object is built once on the host with nightly + `bpf-linker` (the workflow substitutes the hardcoded linker path) and **verified to contain `.BTF`** before packaging. Tarballs go to a GitHub Release (prerelease when the tag contains `alpha`/`beta`/`rc`).
 
+### Release process (standing convention)
+
+- **Tag naming:** `v0.0.1.beta.N` (strictly incrementing; check `git tag -l | sort -V | tail`). Tag the current `main` tip after it is pushed and its branch CI is green.
+- **Trigger:** pushing the tag runs the full release workflow (test gate → eBPF object + BTF check → 4 targets × mimalloc/stock → tarballs). The workflow creates the GitHub Release with `generate_release_notes: true` as a base.
+- **Release notes (agent-curated, dae `v2.0.0` style):** after the workflow creates the Release, edit the body to the curated format — do not rely on the auto notes alone. Format:
+
+  ```markdown
+  ## Highlights
+  <2-5 bullets: what this release means to a gateway operator>
+
+  ## What's Changed
+  ### New Features
+  * <subject> by @agent in <short-hash>
+  ### Bug Fixes
+  * <subject> by @agent in <short-hash>
+  ### Performance
+  * ...
+  ### Documentation
+  * ...
+
+  **Full Changelog**: https://github.com/Glassyiris/honk/compare/<prev-tag>...<tag>
+  ```
+
+  - Group commits by their `type(scope)` prefix (`feat` → New Features, `fix` → Bug Fixes, `perf` → Performance, `docs`/`bench` → Documentation, `refactor`/`test` → fold into the nearest section or omit).
+  - Apply with `gh release edit <tag> --repo Glassyiris/honk --notes-file <file>`; the Release page exists only after the workflow's `release` job finishes, so curate after the build completes.
+- **Deployment:** after tagging, the musl mimalloc tarball is the canonical gateway binary; manual `scp` deploys (as used during development) should be noted in the PR/issue of record when they diverge from the release artifact.
+
 ## Current validation guidance
 
 Do not treat dated pass counts as repository status; use the current command output
