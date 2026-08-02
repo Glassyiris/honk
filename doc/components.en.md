@@ -273,7 +273,7 @@ group {
 | Canonical | dae spellings | Behavior |
 | ----------- | ------------- | ---------- |
 | `selector` | `select`, `fixed`, `fixed(0)` | Manual pin; API + cache |
-| `urltest` | `min_moving_avg`, `min_avg10`, `min_last_delay` | Lowest latency + tolerance; **TCP/UDP separate** |
+| `urltest` | `min_moving_avg`, `min_avg10`, `min_last_delay` | Lowest latency + tolerance; ranks by a halving moving average `(prev+sample)/2` (dae `min_moving_avg` semantics); **TCP/UDP separate** |
 | `loadbalance` | `roundrobin`, `round_robin`, `balance` | Per-group, per-network RR among alive members |
 | `fallback` | `fallback` | First alive sticky per TCP/UDP network; no instant failback |
 

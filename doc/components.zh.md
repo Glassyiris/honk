@@ -237,7 +237,7 @@ group {
 | 规范名 | 别名 | 行为 |
 | -------- | ------ | ------ |
 | `selector` | `select`、`fixed`、`fixed(0)` | 手动固定；API + cache |
-| `urltest` | `min_moving_avg`、`min_avg10`、`min_last_delay` | 最低延迟 + tolerance；**TCP/UDP 分离** |
+| `urltest` | `min_moving_avg`、`min_avg10`、`min_last_delay` | 最低延迟 + tolerance；按减半递推移动平均 `(prev+sample)/2` 排名（dae `min_moving_avg` 语义）；**TCP/UDP 分离** |
 | `loadbalance` | `roundrobin`、`round_robin`、`balance` | 每组、每网络独立对存活成员轮询 |
 | `fallback` | | TCP/UDP 各自固定第一个存活成员；无立即 failback |
 

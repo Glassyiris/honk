@@ -1059,15 +1059,18 @@ impl GroupManager {
 
     /// Effective selection latency for a node on the given network.
     ///
-    /// Ranking uses the **moving average** of recent probe samples (dae's
-    /// `min_moving_avg` / `min_avg10` semantics): TCP ranks by the TCP-probe
-    /// average — or, when the group has a custom `check_url`, by the
-    /// per-(node, url) probe average (sing-box urltest `url` option).
-    /// UDP ranks by the DataUDP then DNS-UDP averages only — a node
-    /// with no UDP measurement ranks `Duration::MAX` (never its TCP
-    /// latency), so UDP-proven nodes always beat UDP-unproven ones; the
-    /// all-no-UDP-data case is handled separately by the TCP mirror in
-    /// [`GroupManager::pick_urltest`].
+    /// Ranking uses the **halving moving average** (`(prev + sample) / 2`,
+    /// dae `min_moving_avg` semantics): recent samples weigh exponentially
+    /// more, so a degraded node is displaced within a few probe cycles
+    /// while single-sample jitter stays smoothed. Synthetic failure samples
+    /// feed the same average, so a failed probe or dial immediately sinks
+    /// the node's rank. TCP ranks by the TCP-probe average — or, when the
+    /// group has a custom `check_url`, by the per-(node, url) probe average
+    /// (sing-box urltest `url` option). UDP ranks by the DataUDP then
+    /// DNS-UDP averages only — a node with no UDP measurement ranks
+    /// `Duration::MAX` (never its TCP latency), so UDP-proven nodes always
+    /// beat UDP-unproven ones; the all-no-UDP-data case is handled
+    /// separately by the TCP mirror in [`GroupManager::pick_urltest`].
     fn node_latency(
         &self,
         node: &Node,
@@ -1085,16 +1088,16 @@ impl GroupManager {
                 None => self
                     .alive_set
                     .as_ref()
-                    .and_then(|a| a.get_avg_latency(&node.name, ProbeDomain::Tcp, ipver)),
+                    .and_then(|a| a.get_moving_average(&node.name, ProbeDomain::Tcp, ipver)),
             },
             SelectionNetwork::Udp => self
                 .alive_set
                 .as_ref()
-                .and_then(|a| a.get_avg_latency(&node.name, ProbeDomain::DataUdp, ipver))
+                .and_then(|a| a.get_moving_average(&node.name, ProbeDomain::DataUdp, ipver))
                 .or_else(|| {
                     self.alive_set
                         .as_ref()
-                        .and_then(|a| a.get_avg_latency(&node.name, ProbeDomain::DnsUdp, ipver))
+                        .and_then(|a| a.get_moving_average(&node.name, ProbeDomain::DnsUdp, ipver))
                 }),
         };
         latency.unwrap_or(Duration::MAX)
