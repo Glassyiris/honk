@@ -1583,6 +1583,18 @@ async fn run_endpoint_driver(
             let _ = first_ack.send(Ok(()));
         }
         Err(error) => {
+            if !endpoint.dead.load(Ordering::Acquire) {
+                let ipver = if client_dst.is_ipv4() {
+                    honk_outbound::alive::IpVersion::V4
+                } else {
+                    honk_outbound::alive::IpVersion::V6
+                };
+                alive_set.report_unavailable_traffic(
+                    &endpoint.node_name,
+                    honk_outbound::alive::ProbeDomain::DataUdp,
+                    ipver,
+                );
+            }
             let _ = first_ack.send(Err(io::Error::new(error.kind(), error.to_string())));
             return Err(error);
         }
@@ -1595,20 +1607,33 @@ async fn run_endpoint_driver(
         outbound_tracker.clone(),
     );
     let receiver = receive_loop(
-        endpoint,
+        Arc::clone(&endpoint),
         reply_socket,
         client_addr,
         client_dst,
-        alive_set,
+        Arc::clone(&alive_set),
         stats,
         outbound_tracker,
     );
     tokio::pin!(sender);
     tokio::pin!(receiver);
-    tokio::select! {
+    let result = tokio::select! {
         result = &mut sender => result,
         result = &mut receiver => result,
+    };
+    if result.is_err() && !endpoint.dead.load(Ordering::Acquire) {
+        let ipver = if client_dst.is_ipv4() {
+            honk_outbound::alive::IpVersion::V4
+        } else {
+            honk_outbound::alive::IpVersion::V6
+        };
+        alive_set.report_unavailable_traffic(
+            &endpoint.node_name,
+            honk_outbound::alive::ProbeDomain::DataUdp,
+            ipver,
+        );
     }
+    result
 }
 
 async fn send_followers(
@@ -2749,6 +2774,7 @@ mod tests {
     async fn udp_endpoint_driver_reply_idle_timeout_cleans_up_once() {
         let pool = Arc::new(UdpEndpointPool::new());
         let stats = Arc::new(StatsManager::new());
+        let alive = Arc::new(honk_outbound::alive::AliveDialerSet::new());
         let client = make_addr("10.0.0.1", 12345);
         let dst = make_addr("8.8.8.8", 53);
         let relay = make_addr("192.168.1.1", 1080);
@@ -2771,7 +2797,7 @@ mod tests {
             Arc::clone(&endpoint),
             queue_rx,
             test_reply_socket().await,
-            Arc::new(honk_outbound::alive::AliveDialerSet::new()),
+            Arc::clone(&alive),
             Arc::clone(&stats),
             "test-node".to_owned(),
         );
@@ -2787,6 +2813,13 @@ mod tests {
             Some((client, dst, Some("idle-tracker".to_owned())))
         );
         assert!(pool.is_empty());
+        let history = alive.get_probe_history(
+            "test-node",
+            honk_outbound::alive::ProbeDomain::DataUdp,
+            honk_outbound::alive::IpVersion::V4,
+        );
+        assert_eq!(history.len(), 1);
+        assert!(!history[0].success);
         assert_eq!(
             pool.global_payload_bytes.available_permits(),
             GLOBAL_PAYLOAD_CAPACITY
@@ -2801,6 +2834,7 @@ mod tests {
     async fn udp_endpoint_pool_shutdown_joins_blocked_ready_driver() {
         let pool = Arc::new(UdpEndpointPool::new());
         let stats = Arc::new(StatsManager::new());
+        let alive = Arc::new(honk_outbound::alive::AliveDialerSet::new());
         let client = make_addr("10.0.0.9", 43000);
         let dst = make_addr("8.8.4.4", 53);
         let relay = make_addr("192.168.1.1", 1080);
@@ -2828,7 +2862,7 @@ mod tests {
             Arc::clone(&endpoint),
             queue_rx,
             test_reply_socket().await,
-            Arc::new(honk_outbound::alive::AliveDialerSet::new()),
+            Arc::clone(&alive),
             Arc::clone(&stats),
             "shutdown-node".to_owned(),
         );
@@ -2847,6 +2881,15 @@ mod tests {
         assert_eq!(pool.driver_count(), 0);
         assert!(endpoint.dead.load(Ordering::Acquire));
         assert_eq!(stats.snapshot()["shutdown-node"].active_conns, 0);
+        assert!(
+            alive
+                .get_probe_history(
+                    "test-node",
+                    honk_outbound::alive::ProbeDomain::DataUdp,
+                    honk_outbound::alive::IpVersion::V4,
+                )
+                .is_empty()
+        );
         assert_eq!(
             removed_rx.recv().await,
             Some((client, dst, Some("shutdown-tracker".to_owned())))
@@ -2937,6 +2980,7 @@ mod tests {
         ] {
             let pool = Arc::new(UdpEndpointPool::new());
             let stats = Arc::new(StatsManager::new());
+            let alive = Arc::new(honk_outbound::alive::AliveDialerSet::new());
             let dst = make_addr("8.8.8.8", 53);
             let relay = make_addr("192.168.1.1", 1080);
             let (removed_tx, mut removed_rx) = tokio::sync::mpsc::channel(16);
@@ -2959,7 +3003,7 @@ mod tests {
                 Arc::clone(&endpoint),
                 queue_rx,
                 test_reply_socket().await,
-                Arc::new(honk_outbound::alive::AliveDialerSet::new()),
+                Arc::clone(&alive),
                 Arc::clone(&stats),
                 "test-node".to_owned(),
             );
@@ -2973,6 +3017,13 @@ mod tests {
                 Some((client, dst, Some("receive-tracker".to_owned())))
             );
             assert!(pool.is_empty());
+            let history = alive.get_probe_history(
+                "test-node",
+                honk_outbound::alive::ProbeDomain::DataUdp,
+                honk_outbound::alive::IpVersion::V4,
+            );
+            assert_eq!(history.len(), 1);
+            assert!(!history[0].success);
             assert!(matches!(
                 removed_rx.try_recv(),
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty)
