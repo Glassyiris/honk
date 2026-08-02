@@ -328,6 +328,21 @@ pub fn load_ech_config_list(node: &Node) -> anyhow::Result<Option<Vec<u8>>> {
     }
     Ok(None)
 }
+/// Validate fail-closed per-node TLS inputs without allocating an SSL_CTX or
+/// root store. Runtime registries use this before publication; connectors are
+/// built lazily when a node first enters the active working set.
+pub fn validate_connector_config(node: &Node) -> anyhow::Result<()> {
+    load_ech_config_list(node)?;
+    if let Some(pin) = node.tls_pin_sha256.as_deref()
+        && parse_pin_sha256(pin).is_none()
+    {
+        anyhow::bail!(
+            "node '{}': invalid tls_pin_sha256 (expected 64 hex chars)",
+            node.name
+        );
+    }
+    Ok(())
+}
 
 static USE_CHROME_TLS: LazyLock<AtomicBool> = LazyLock::new(|| AtomicBool::new(false));
 

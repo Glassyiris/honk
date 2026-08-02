@@ -1005,6 +1005,23 @@ impl ControlPlane {
         self.start_udp_warm_coordinator(warm_generation).await;
 
         {
+            let runtime_registry = self.runtime_registry.clone();
+            let handle = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(honk_outbound::runtime::TLS_REAP_INTERVAL);
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    let generation = runtime_registry.read().clone();
+                    let evicted = generation.reap_tls_connectors(std::time::Instant::now());
+                    if evicted > 0 {
+                        debug!(evicted, "released idle outbound TLS connectors");
+                    }
+                }
+            });
+            self.background_tasks.lock().await.push(handle);
+        }
+
+        {
             let mut ebpf = self.ebpf.write().await;
             ebpf.set_datapath_ready(true)
                 .map_err(|error| anyhow::anyhow!("open eBPF datapath admission: {error}"))?;

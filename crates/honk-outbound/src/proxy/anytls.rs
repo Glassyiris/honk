@@ -122,6 +122,13 @@ impl AnyTlsHandler {
             Arc::new(crate::session::SessionPool::new(session_pool_config()))
         })))
     }
+
+    fn node_runtime(&self, node: &Node) -> Option<Arc<crate::runtime::NodeRuntime>> {
+        self.runtime_registry
+            .read()
+            .as_ref()
+            .and_then(|cell| cell.read().get(&node.id))
+    }
 }
 
 /// Key inside a node's own session pool. Pools are per-node (runtime
@@ -1238,7 +1245,8 @@ impl AnyTlsHandler {
         connect_timeout: Duration,
     ) -> anyhow::Result<AnyTlsStream> {
         let pool = self.node_pool(node)?;
-        self.open_pooled_stream_for_pool(node, pool, addr, target_addr, connect_timeout, None)
+        let runtime = self.node_runtime(node);
+        self.open_pooled_stream_for_pool(node, pool, addr, target_addr, connect_timeout, runtime)
             .await
     }
 
@@ -1251,7 +1259,7 @@ impl AnyTlsHandler {
         addr: &str,
         target_addr: &[u8],
         connect_timeout: Duration,
-        tls_connector: Option<Arc<TlsConnector>>,
+        runtime: Option<Arc<crate::runtime::NodeRuntime>>,
     ) -> anyhow::Result<AnyTlsStream> {
         Self::ensure_janitor(node, &pool);
         // The dial future must be 'static (pool-owned dial task) and the
@@ -1264,8 +1272,14 @@ impl AnyTlsHandler {
             move || {
                 let node = dial_node.clone();
                 let addr = dial_addr.clone();
-                let tls_connector = tls_connector.clone();
-                async move { dial_session(&node, &addr, connect_timeout, tls_connector).await }
+                let runtime = runtime.clone();
+                async move {
+                    let tls_connector = runtime
+                        .as_ref()
+                        .map(|runtime| runtime.anytls_tls_connector())
+                        .transpose()?;
+                    dial_session(&node, &addr, connect_timeout, tls_connector).await
+                }
             },
             move |session, permit| {
                 let target = target.clone();
@@ -1996,12 +2010,7 @@ impl ProxyHandler for AnyTlsHandler {
         // tied to the immutable generation supplied by ProxyRegistry.
         let node = Arc::clone(&runtime.node);
         let addr = format!("{}:{}", node.host(), node.port);
-        let tls = match &runtime.runtime {
-            crate::runtime::ProtocolRuntime::AnyTls(runtime) => Arc::clone(&runtime.tls),
-            crate::runtime::ProtocolRuntime::None | crate::runtime::ProtocolRuntime::Quic(_) => {
-                anyhow::bail!("AnyTLS node runtime does not own an AnyTLS connector")
-            }
-        };
+        let tls = runtime.anytls_tls_connector()?;
         Self::warm_pool_with(runtime, connect_timeout, move || async move {
             dial_session(&node, &addr, connect_timeout, Some(tls)).await
         })
@@ -2039,10 +2048,8 @@ impl ProxyHandler for AnyTlsHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let (pool, tls) = match &runtime.runtime {
-            crate::runtime::ProtocolRuntime::AnyTls(runtime) => {
-                (Arc::clone(&runtime.pool), Arc::clone(&runtime.tls))
-            }
+        let pool = match &runtime.runtime {
+            crate::runtime::ProtocolRuntime::AnyTls(runtime) => Arc::clone(&runtime.pool),
             crate::runtime::ProtocolRuntime::None | crate::runtime::ProtocolRuntime::Quic(_) => {
                 anyhow::bail!("AnyTLS node runtime does not own an AnyTLS pool")
             }
@@ -2057,7 +2064,7 @@ impl ProxyHandler for AnyTlsHandler {
                 &addr,
                 &target_addr,
                 connect_timeout,
-                Some(tls),
+                Some(runtime),
             )
             .await?;
         Ok(ProxyStream {
@@ -2281,14 +2288,13 @@ impl ProxyHandler for AnyTlsHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<PreparedUdpTransport> {
-        let (pool, tls) = match &runtime.runtime {
-            crate::runtime::ProtocolRuntime::AnyTls(runtime) => {
-                (Arc::clone(&runtime.pool), Arc::clone(&runtime.tls))
-            }
+        let pool = match &runtime.runtime {
+            crate::runtime::ProtocolRuntime::AnyTls(runtime) => Arc::clone(&runtime.pool),
             crate::runtime::ProtocolRuntime::None | crate::runtime::ProtocolRuntime::Quic(_) => {
                 anyhow::bail!("AnyTLS node runtime does not own an AnyTLS pool")
             }
         };
+        let tls = runtime.anytls_tls_connector()?;
         let node = Arc::clone(&runtime.node);
         let dial_node = node.as_ref().clone();
         let dial_addr = format!("{}:{}", node.host(), node.port);

@@ -14,6 +14,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+const TLS_ACTIVE_RATIO_NUMERATOR: usize = 1;
+const TLS_ACTIVE_RATIO_DENOMINATOR: usize = 10;
+const TLS_ACTIVE_MIN: usize = 8;
+pub const TLS_IDLE_RETENTION: Duration = Duration::from_secs(10 * 60);
+pub const TLS_REAP_INTERVAL: Duration = Duration::from_secs(60);
 
 use honk_config::node::Node;
 use honk_config::types::NodeProtocol;
@@ -112,23 +118,55 @@ impl QuicRuntime {
     }
 }
 
-/// AnyTLS session runtime: owns the node's `SessionPool` and its immutable
-/// TLS setup. Keeping the connector here makes root-store, pin, and static
-/// ECH parsing generation-owned rather than session-owned.
+/// Lazily built TLS state. An in-flight handshake owns an `Arc`, so evicting
+/// the cached reference never invalidates active work.
+#[derive(Debug, Default)]
+struct TlsConnectorSlot {
+    state: parking_lot::Mutex<Option<(Arc<crate::tls::TlsConnector>, Instant)>>,
+}
+
+impl TlsConnectorSlot {
+    fn get_or_build(&self, node: &Node) -> anyhow::Result<Arc<crate::tls::TlsConnector>> {
+        let mut state = self.state.lock();
+        if let Some((connector, used_at)) = state.as_mut() {
+            *used_at = Instant::now();
+            return Ok(Arc::clone(connector));
+        }
+        let connector = Arc::new(crate::tls::build_connector(node)?);
+        *state = Some((Arc::clone(&connector), Instant::now()));
+        Ok(connector)
+    }
+
+    fn last_used(&self) -> Option<Instant> {
+        self.state.lock().as_ref().map(|(_, used_at)| *used_at)
+    }
+
+    fn evict(&self) -> bool {
+        self.state.lock().take().is_some()
+    }
+
+    #[cfg(test)]
+    fn is_loaded(&self) -> bool {
+        self.state.lock().is_some()
+    }
+}
+
+/// AnyTLS session runtime: the pool stays generation-owned, while expensive
+/// BoringSSL state is materialized only for nodes entering the active set.
 #[derive(Debug)]
 pub struct AnyTlsRuntime {
     pub(crate) pool: Arc<crate::proxy::anytls::AnyTlsPool>,
-    pub(crate) tls: Arc<crate::tls::TlsConnector>,
+    tls: TlsConnectorSlot,
 }
 
 impl AnyTlsRuntime {
-    fn new(node: &Node) -> anyhow::Result<Self> {
-        Ok(Self {
+    fn new() -> Self {
+        Self {
             pool: Arc::new(crate::session::SessionPool::new(
                 crate::proxy::anytls::session_pool_config(),
             )),
-            tls: Arc::new(crate::tls::build_connector(node)?),
-        })
+            tls: TlsConnectorSlot::default(),
+        }
     }
 }
 
@@ -139,10 +177,38 @@ pub struct NodeRuntime {
     /// Immutable node config for this generation.
     pub node: Arc<Node>,
     pub capabilities: OutboundCapabilities,
-    /// Prebuilt roots, pin verifier, and static ECH for TLS nodes. This is
-    /// clone-cheap and remains valid for flows retained by this generation.
-    pub tls_connector: Option<crate::tls::TlsConnector>,
     pub runtime: ProtocolRuntime,
+}
+
+impl NodeRuntime {
+    pub(crate) fn anytls_tls_connector(&self) -> anyhow::Result<Arc<crate::tls::TlsConnector>> {
+        let ProtocolRuntime::AnyTls(runtime) = &self.runtime else {
+            anyhow::bail!("node '{}' has no AnyTLS runtime", self.node.name);
+        };
+        runtime.tls.get_or_build(&self.node)
+    }
+
+    fn tls_last_used(&self) -> Option<Instant> {
+        match &self.runtime {
+            ProtocolRuntime::AnyTls(runtime) => runtime.tls.last_used(),
+            ProtocolRuntime::None | ProtocolRuntime::Quic(_) => None,
+        }
+    }
+
+    fn evict_tls_connector(&self) -> bool {
+        match &self.runtime {
+            ProtocolRuntime::AnyTls(runtime) => runtime.tls.evict(),
+            ProtocolRuntime::None | ProtocolRuntime::Quic(_) => false,
+        }
+    }
+
+    #[cfg(test)]
+    fn tls_connector_loaded(&self) -> bool {
+        match &self.runtime {
+            ProtocolRuntime::AnyTls(runtime) => runtime.tls.is_loaded(),
+            ProtocolRuntime::None | ProtocolRuntime::Quic(_) => false,
+        }
+    }
 }
 
 /// Registry build/validation errors. A failure here aborts the reload
@@ -183,32 +249,26 @@ impl OutboundRuntimeRegistry {
             if node.id.is_nil() {
                 return Err(RuntimeRegistryError::NilId(node.name.clone()));
             }
+            // Validate cheap, fail-closed TLS inputs before publishing the
+            // generation. The heavyweight SSL_CTX/root store stays lazy.
+            if node.tls {
+                crate::tls::validate_connector_config(node).map_err(|source| {
+                    RuntimeRegistryError::Tls {
+                        node: node.name.clone(),
+                        source,
+                    }
+                })?;
+            }
             let protocol_runtime = match node.protocol {
-                NodeProtocol::AnyTLS => {
-                    ProtocolRuntime::AnyTls(AnyTlsRuntime::new(node).map_err(|source| {
-                        RuntimeRegistryError::Tls {
-                            node: node.name.clone(),
-                            source,
-                        }
-                    })?)
-                }
+                NodeProtocol::AnyTLS => ProtocolRuntime::AnyTls(AnyTlsRuntime::new()),
                 NodeProtocol::Hysteria2 | NodeProtocol::Tuic | NodeProtocol::Juicity => {
                     ProtocolRuntime::Quic(QuicRuntime::new())
                 }
                 _ => ProtocolRuntime::None,
             };
-            let tls_connector = node
-                .tls
-                .then(|| crate::tls::build_connector(node))
-                .transpose()
-                .map_err(|source| RuntimeRegistryError::Tls {
-                    node: node.name.clone(),
-                    source,
-                })?;
             let runtime = Arc::new(NodeRuntime {
                 node: Arc::new(node.clone()),
                 capabilities: OutboundCapabilities::for_node(node),
-                tls_connector,
                 runtime: protocol_runtime,
             });
             if let Some(prev) = map.insert(node.id, Arc::clone(&runtime)) {
@@ -240,6 +300,38 @@ impl OutboundRuntimeRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
+    }
+
+    /// Retain the most recently used AnyTLS connectors as the hot working set.
+    /// Idle entries are always released; under a broad burst, the newest 10%
+    /// (at least eight) remain ready so common nodes avoid connector rebuilds.
+    pub fn reap_tls_connectors(&self, now: Instant) -> usize {
+        let anytls_count = self
+            .nodes
+            .values()
+            .filter(|runtime| matches!(runtime.runtime, ProtocolRuntime::AnyTls(_)))
+            .count();
+        let target = anytls_count
+            .saturating_mul(TLS_ACTIVE_RATIO_NUMERATOR)
+            .div_ceil(TLS_ACTIVE_RATIO_DENOMINATOR)
+            .max(TLS_ACTIVE_MIN)
+            .min(anytls_count);
+        let mut loaded: Vec<_> = self
+            .nodes
+            .values()
+            .filter_map(|runtime| runtime.tls_last_used().map(|used_at| (used_at, runtime)))
+            .collect();
+        loaded.sort_unstable_by_key(|(used_at, _)| std::cmp::Reverse(*used_at));
+
+        let mut evicted = 0;
+        for (index, (used_at, runtime)) in loaded.into_iter().enumerate() {
+            if (index >= target || now.saturating_duration_since(used_at) >= TLS_IDLE_RETENTION)
+                && runtime.evict_tls_connector()
+            {
+                evicted += 1;
+            }
+        }
+        evicted
     }
 
     /// Whether this generation has become terminal. Warm-up work must reject
@@ -293,28 +385,67 @@ mod tests {
     }
 
     #[test]
-    fn anytls_connector_is_shared_within_generation_and_rebuilt_on_reload() {
+    fn anytls_connector_is_lazy_shared_and_generation_local() {
         let node = node("anytls", NodeProtocol::AnyTLS);
         let first = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
         let first_runtime = first.get(&node.id).unwrap();
-        let first_connector = match &first_runtime.runtime {
-            ProtocolRuntime::AnyTls(runtime) => Arc::clone(&runtime.tls),
-            _ => panic!("AnyTLS must own a TLS connector"),
-        };
-        let same_generation = first.get(&node.id).unwrap();
-        let same_connector = match &same_generation.runtime {
-            ProtocolRuntime::AnyTls(runtime) => Arc::clone(&runtime.tls),
-            _ => panic!("AnyTLS must own a TLS connector"),
-        };
+        assert!(!first_runtime.tls_connector_loaded());
+        let first_connector = first_runtime.anytls_tls_connector().unwrap();
+        assert!(first_runtime.tls_connector_loaded());
+        let same_connector = first.get(&node.id).unwrap().anytls_tls_connector().unwrap();
         assert!(Arc::ptr_eq(&first_connector, &same_connector));
 
         let reloaded = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
-        let reloaded_runtime = reloaded.get(&node.id).unwrap();
-        let reloaded_connector = match &reloaded_runtime.runtime {
-            ProtocolRuntime::AnyTls(runtime) => Arc::clone(&runtime.tls),
-            _ => panic!("AnyTLS must own a TLS connector"),
-        };
+        let reloaded_connector = reloaded
+            .get(&node.id)
+            .unwrap()
+            .anytls_tls_connector()
+            .unwrap();
         assert!(!Arc::ptr_eq(&first_connector, &reloaded_connector));
+    }
+
+    #[test]
+    fn reap_keeps_recent_active_ratio_and_rebuilds_evicted_connectors() {
+        let nodes: Vec<_> = (0..20)
+            .map(|index| node(&format!("anytls-{index}"), NodeProtocol::AnyTLS))
+            .collect();
+        let registry = OutboundRuntimeRegistry::build(&nodes).unwrap();
+        let loaded: Vec<_> = nodes
+            .iter()
+            .map(|node| {
+                let runtime = registry.get(&node.id).unwrap();
+                let connector = runtime.anytls_tls_connector().unwrap();
+                (runtime, connector)
+            })
+            .collect();
+
+        assert_eq!(registry.reap_tls_connectors(Instant::now()), 12);
+        assert_eq!(
+            loaded
+                .iter()
+                .filter(|(runtime, _)| runtime.tls_connector_loaded())
+                .count(),
+            8
+        );
+        let evicted = loaded
+            .iter()
+            .find(|(runtime, _)| !runtime.tls_connector_loaded())
+            .unwrap();
+        let rebuilt = evicted.0.anytls_tls_connector().unwrap();
+        assert!(!Arc::ptr_eq(&evicted.1, &rebuilt));
+    }
+
+    #[test]
+    fn reap_drops_idle_connector_even_inside_hot_ratio() {
+        let node = node("anytls", NodeProtocol::AnyTLS);
+        let registry = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
+        let runtime = registry.get(&node.id).unwrap();
+        runtime.anytls_tls_connector().unwrap();
+        assert_eq!(
+            registry.reap_tls_connectors(Instant::now() + TLS_IDLE_RETENTION),
+            1
+        );
+        assert!(!runtime.tls_connector_loaded());
     }
 
     #[test]
