@@ -431,12 +431,13 @@ impl AliveDialerSet {
         // Resolve the check URL hostname once at startup; dae-format literal
         // fallback IPs (comma-separated) are merged in so probes still have
         // targets even when DNS resolution fails.
+        let port = Self::parse_url_port(&check_url);
         if let Some(hostname) = Self::parse_url_host(&check_url) {
-            let addrs = self.resolve_host(&hostname, 80).await;
+            let addrs = self.resolve_host(&hostname, port).await;
             if addrs.is_empty() {
                 tracing::warn!("Failed to resolve health check URL '{}'", hostname);
             }
-            let ips = Self::merge_check_addrs(addrs, &check_url);
+            let ips = Self::merge_check_addrs(addrs, &check_url, port);
             tracing::info!(
                 "Health check DNS resolved '{}' → {} IPs",
                 hostname,
@@ -445,7 +446,7 @@ impl AliveDialerSet {
             *self.check_url_ips.write() = ips;
         } else {
             // No URL hostname at all — literal-only form.
-            let ips = Self::merge_check_addrs(Vec::new(), &check_url);
+            let ips = Self::merge_check_addrs(Vec::new(), &check_url, port);
             if !ips.is_empty() {
                 *self.check_url_ips.write() = ips;
             }
@@ -488,9 +489,10 @@ impl AliveDialerSet {
     pub async fn refresh_check_ips(&self) {
         let check_url = self.check_url.read().clone();
         if let Some(hostname) = Self::parse_url_host(&check_url) {
-            let addrs = self.resolve_host(&hostname, 80).await;
+            let port = Self::parse_url_port(&check_url);
+            let addrs = self.resolve_host(&hostname, port).await;
             if !addrs.is_empty() {
-                let ips = Self::merge_check_addrs(addrs, &check_url);
+                let ips = Self::merge_check_addrs(addrs, &check_url, port);
                 *self.check_url_ips.write() = ips;
             }
         }
@@ -1231,10 +1233,11 @@ impl AliveDialerSet {
         }
         let ips = match Self::parse_url_host(url) {
             Some(hostname) => {
-                let addrs = self.resolve_host(&hostname, 80).await;
-                Self::merge_check_addrs(addrs, url)
+                let port = Self::parse_url_port(url);
+                let addrs = self.resolve_host(&hostname, port).await;
+                Self::merge_check_addrs(addrs, url, port)
             }
-            None => Self::merge_check_addrs(Vec::new(), url),
+            None => Self::merge_check_addrs(Vec::new(), url, Self::parse_url_port(url)),
         };
         self.url_check_ips
             .write()
@@ -1386,10 +1389,42 @@ impl AliveDialerSet {
         }
     }
 
+    /// Port of a check URL: the explicit `:port` of the first (URL) segment
+    /// wins; otherwise the scheme default (https 443, http/bare 80).
+    fn parse_url_port(url: &str) -> u16 {
+        let s = url.trim();
+        let (default_port, rest) = if let Some(rest) = s.strip_prefix("https://") {
+            (443, rest)
+        } else if let Some(rest) = s.strip_prefix("http://") {
+            (80, rest)
+        } else {
+            (80, s)
+        };
+        let authority = rest
+            .split(',')
+            .next()
+            .unwrap_or(rest)
+            .trim()
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or("");
+        let port_str = if let Some(rest) = authority.strip_prefix('[') {
+            // [v6]:port — only a port after the closing bracket counts.
+            rest.split(']')
+                .nth(1)
+                .and_then(|tail| tail.strip_prefix(':'))
+        } else {
+            authority.rsplit_once(':').map(|(_, port)| port)
+        };
+        port_str
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(default_port)
+    }
+
     /// Extract the comma-separated literal fallback IPs from a dae-format
-    /// check URL (`http://host,ip4,ip6`) as port-80 socket addresses.
-    /// Go: the non-URL entries of `TcpCheckOptionRaw.Raw`.
-    fn parse_check_literals(check_url: &str) -> Vec<SocketAddr> {
+    /// check URL (`http://host,ip4,ip6`) as socket addresses on the URL's
+    /// port. Go: the non-URL entries of `TcpCheckOptionRaw.Raw`.
+    fn parse_check_literals(check_url: &str, port: u16) -> Vec<SocketAddr> {
         check_url
             .split(',')
             .skip(1)
@@ -1401,18 +1436,18 @@ impl AliveDialerSet {
                         seg.trim()
                     );
                 }
-                ip.map(|ip| SocketAddr::new(ip, 80))
+                ip.map(|ip| SocketAddr::new(ip, port))
             })
             .collect()
     }
 
     /// Merge resolved and literal check-target addresses, deduplicated.
-    fn merge_check_addrs(resolved: Vec<SocketAddr>, check_url: &str) -> Vec<SocketAddr> {
+    fn merge_check_addrs(resolved: Vec<SocketAddr>, check_url: &str, port: u16) -> Vec<SocketAddr> {
         // Operator-declared literal fallbacks are the trusted anchors and
         // are tried first: resolved answers can be DNS-poisoned, and the
         // per-family probe window (first 3) would otherwise fill with
         // poisoned entries and starve the good literals out entirely.
-        let mut ips = Self::parse_check_literals(check_url);
+        let mut ips = Self::parse_check_literals(check_url, port);
         for a in resolved {
             if !ips.contains(&a) {
                 ips.push(a);
@@ -1471,6 +1506,7 @@ mod merge_check_addrs_tests {
         let merged = AliveDialerSet::merge_check_addrs(
             vec![poisoned],
             "http://www.google-analytics.com/generate_204,142.250.197.238",
+            80,
         );
         assert_eq!(merged.first(), Some(&literal));
         assert!(merged.contains(&poisoned));

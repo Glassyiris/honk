@@ -64,12 +64,13 @@ impl AliveDialerSet {
         // cascade into all nodes being marked dead simultaneously.
         // dae-format literal fallback IPs are merged in so a DNS failure
         // alone never leaves the probe without targets.
+        let port = Self::parse_url_port(&check_url);
         let cached = self.check_url_ips.read().clone();
         let addrs: Vec<SocketAddr> = if cached.is_empty() {
             // Cache miss — one-time resolution via the installed resolver
             // (system lookup is the fallback inside resolve_host).
-            let resolved = self.resolve_host(&hostname, 80).await;
-            let ips = Self::merge_check_addrs(resolved, &check_url);
+            let resolved = self.resolve_host(&hostname, port).await;
+            let ips = Self::merge_check_addrs(resolved, &check_url, port);
             *self.check_url_ips.write() = ips.clone();
             ips
         } else {

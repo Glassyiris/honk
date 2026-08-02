@@ -48,9 +48,33 @@ fn test_parse_url_host_strips_path_and_missing_scheme() {
 }
 
 #[test]
+fn test_parse_url_port() {
+    assert_eq!(AliveDialerSet::parse_url_port("http://a.com"), 80);
+    assert_eq!(AliveDialerSet::parse_url_port("https://a.com"), 443);
+    assert_eq!(AliveDialerSet::parse_url_port("http://a.com:8080/"), 8080);
+    assert_eq!(
+        AliveDialerSet::parse_url_port("https://a.com:8443/check?q=1#f"),
+        8443
+    );
+    assert_eq!(
+        AliveDialerSet::parse_url_port("http://10.10.10.70:9043/,1.1.1.1"),
+        9043
+    );
+    assert_eq!(
+        AliveDialerSet::parse_url_port("http://[2606:4700:4700::1111]:8443/"),
+        8443
+    );
+    assert_eq!(
+        AliveDialerSet::parse_url_port("[2606:4700:4700::1111]/path"),
+        80
+    );
+}
+
+#[test]
 fn test_parse_check_literals() {
     let lits = AliveDialerSet::parse_check_literals(
         "http://cp.cloudflare.com,1.1.1.1,2606:4700:4700::1111",
+        80,
     );
     assert_eq!(
         lits,
@@ -59,10 +83,13 @@ fn test_parse_check_literals() {
             "[2606:4700:4700::1111]:80".parse::<SocketAddr>().unwrap(),
         ]
     );
+    // The URL's explicit port applies to the literal fallbacks as well.
+    let lits = AliveDialerSet::parse_check_literals("http://a.com:8443/,1.1.1.1", 8443);
+    assert_eq!(lits, vec!["1.1.1.1:8443".parse::<SocketAddr>().unwrap()]);
     // No fallback segments → empty; garbage segments skipped.
-    assert!(AliveDialerSet::parse_check_literals("http://cp.cloudflare.com").is_empty());
+    assert!(AliveDialerSet::parse_check_literals("http://cp.cloudflare.com", 80).is_empty());
     assert_eq!(
-        AliveDialerSet::parse_check_literals("http://a.com,bogus,8.8.8.8").len(),
+        AliveDialerSet::parse_check_literals("http://a.com,bogus,8.8.8.8", 80).len(),
         1
     );
 }
@@ -71,7 +98,7 @@ fn test_parse_check_literals() {
 fn test_merge_check_addrs_dedup() {
     let resolved = vec!["1.1.1.1:80".parse::<SocketAddr>().unwrap()];
     let merged =
-        AliveDialerSet::merge_check_addrs(resolved, "http://cp.cloudflare.com,1.1.1.1,8.8.8.8");
+        AliveDialerSet::merge_check_addrs(resolved, "http://cp.cloudflare.com,1.1.1.1,8.8.8.8", 80);
     assert_eq!(merged.len(), 2); // 1.1.1.1 deduped against resolved
 }
 
