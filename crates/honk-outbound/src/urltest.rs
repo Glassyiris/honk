@@ -315,7 +315,7 @@ pub async fn urltest_group(
                     );
                 }
                 Err(_) => {
-                    alive_set.clear_latency(&node.name);
+                    alive_set.record_dial_failure(&node.name, ProbeDomain::Tcp, IpVersion::V4);
                 }
             }
             (node.name.clone(), result)

@@ -574,7 +574,7 @@ honk-core delay <node> [--url HOST:PORT]
 | 并发 | 默认批次 10 |
 | 恢复 | 连续 2 次成功 |
 | 深度退避 | 连续失败 10 次后仍以 max_cooldown（300s）慢速节奏继续探测，不永久停止 |
-| 拨号失败 | 立即清除延迟历史（sing-box `DeleteURLTestHistory`）；节点 alive→dead 翻转时清除其连接池条目并回收 UDP endpoint |
+| 拨号失败 | 清除延迟历史并注入一个 10s 合成罚样本（sing-box `DeleteURLTestHistory` + 防抖动）；节点 alive→dead 翻转时清除其连接池条目并回收 UDP endpoint |
 | UDP driver 失败 | transport 发送、接收或回包空闲超时会上报 DataUdp 流量失败；主动 endpoint 退役和进程关闭不影响健康状态 |
 | 延迟持久化 | 每节点最近真实延迟样本写入 cache.db（60s 周期），启动时恢复，超过 24h 丢弃 |
 | 新节点宽限 | 约 60s |

@@ -657,12 +657,13 @@ async fn test_group_delay_omits_failed_members() {
         "failed members must be omitted, got: {map:?}"
     );
 
-    // Failure cleared the seeded history.
+    // Failure replaced the seeded history with the synthetic penalty sample,
+    // so the node can no longer rank by its stale 123ms.
     assert_eq!(
         app.state
             .alive_set
             .get_last_latency("node-a", ProbeDomain::Tcp, IpVersion::V4),
-        None
+        Some(Duration::from_secs(10))
     );
 
     // Unknown group → 404.
@@ -751,8 +752,8 @@ async fn test_nested_group_delay_endpoints() {
         app.state
             .alive_set
             .get_last_latency("node-b", ProbeDomain::Tcp, IpVersion::V4),
-        None,
-        "sub-group leaf must have been measured (and cleared on failure)"
+        Some(Duration::from_secs(10)),
+        "sub-group leaf must have been measured (penalty sample on failure)"
     );
 
     // The sub-group tag itself is a valid delay target (group branch):

@@ -1462,6 +1462,89 @@ fn test_urltest_keeps_incumbent_within_tolerance_of_current_latency() {
     assert_eq!(m.select_node("g").unwrap().name, "a");
 }
 
+/// Lab scenario S3: a flaky node (fast when it works, but failing probes and
+/// dials) must not be re-adopted after a dial failure wipes its history. The
+/// sequence mirrors the control plane: probe failure kills the node (TCP
+/// threshold 1, synthetic timeout sample), recovery needs 2 successes, and a
+/// dial failure clears latency history + triggers a re-probe that can
+/// succeed. The incumbent must survive all of it.
+#[test]
+fn urltest_flaky_node_stays_demoted_after_history_clear() {
+    let (na, nb, nc) = (
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+    );
+    let nodes = vec![make_node(na, "a"), make_node(nb, "b"), make_node(nc, "c")];
+    let alive = Arc::new(AliveDialerSet::new());
+    let m = GroupManager::with_alive_set(
+        &[make_group("g", GroupPolicy::URLTest, vec![na, nb, nc])],
+        &nodes,
+        Some(alive.clone()),
+    );
+    let probe_ok = |n: &str, ms: u64| {
+        alive.record_probe_latency(
+            n,
+            ProbeDomain::Tcp,
+            IpVersion::V4,
+            Duration::from_millis(ms),
+        );
+    };
+    probe_ok("a", 7);
+    probe_ok("b", 21);
+    probe_ok("c", 42);
+    assert_eq!(m.select_node("g").unwrap().name, "a");
+
+    // Probe failure on 'a' → dead + synthetic 10s sample → group moves to 'b'.
+    alive.mark_dead("a");
+    assert_eq!(m.select_node("g").unwrap().name, "b");
+
+    // 'a' recovers after two good probes; its window still holds the
+    // synthetic sample, so the average stays unattractive.
+    probe_ok("a", 7);
+    probe_ok("a", 7);
+    assert_eq!(m.select_node("g").unwrap().name, "b");
+
+    // Now the flaky loop: a user dial through 'a' fails → history cleared
+    // with a synthetic penalty sample, an emergency re-probe succeeds (the
+    // node works 60% of the time).
+    for round in 0..6 {
+        alive.report_unavailable_traffic("a", ProbeDomain::Tcp, IpVersion::V4);
+        alive.record_dial_failure("a", ProbeDomain::Tcp, IpVersion::V4);
+        probe_ok("a", 7);
+        assert_eq!(
+            m.select_node("g").unwrap().name,
+            "b",
+            "round {round}: flaky node 'a' must not displace the incumbent"
+        );
+    }
+
+    // With no incumbent context at all, one dial failure still demotes the
+    // flaky node below the healthy alternative: the penalty sample keeps its
+    // moving average at seconds, not 7ms.
+    let alive2 = Arc::new(AliveDialerSet::new());
+    let m2 = GroupManager::with_alive_set(
+        &[make_group("g2", GroupPolicy::URLTest, vec![na, nb])],
+        &nodes,
+        Some(alive2.clone()),
+    );
+    probe_ok2(&alive2, "a", 7);
+    probe_ok2(&alive2, "b", 21);
+    assert_eq!(m2.select_node("g2").unwrap().name, "a");
+    alive2.record_dial_failure("a", ProbeDomain::Tcp, IpVersion::V4);
+    probe_ok2(&alive2, "a", 7);
+    assert_eq!(m2.select_node("g2").unwrap().name, "b");
+}
+
+fn probe_ok2(alive: &AliveDialerSet, n: &str, ms: u64) {
+    alive.record_probe_latency(
+        n,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(ms),
+    );
+}
+
 /// After a dial failure clears the node's latency history (sing-box
 /// `DeleteURLTestHistory` parity), the URLTest group's next selection must
 /// move to the next-best measured node instead of waiting for the probe

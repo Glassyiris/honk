@@ -644,7 +644,7 @@ Configured via `global { ... }` keys (`tcp_check_url`, `udp_check_dns`, `check_i
 | Concurrency | Default batch 10 |
 | Recovery | 2 consecutive successes |
 | Deep backoff | After 10 consecutive failures, probing continues at the max-cooldown (300s) cadence — no permanent stop |
-| Dial failure | Latency history cleared immediately (sing-box `DeleteURLTestHistory`); a node's pooled connections and UDP endpoints are purged when it flips alive→dead |
+| Dial failure | Latency history cleared + one synthetic 10s penalty sample (sing-box `DeleteURLTestHistory` + flap guard); a node's pooled connections and UDP endpoints are purged when it flips alive→dead |
 | UDP driver failure | Transport send/receive/reply-idle errors report a DataUdp traffic failure; intentional endpoint retirement and shutdown are health-neutral |
 | Delay persistence | Last real delay sample per node saved to cache.db (60s writer), restored at startup, 24h age-out |
 | New node grace | ~60s |

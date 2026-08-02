@@ -975,6 +975,18 @@ impl AliveDialerSet {
         self.collections.write().remove(node_id);
     }
 
+    /// Dial-failure handling: un-rank the node (sing-box
+    /// `DeleteURLTestHistory` parity) **and** seed one synthetic timeout
+    /// sample. The blank-slate version let a fast-but-flaky node reclaim
+    /// the top rank with a single lucky probe — with the penalty sample its
+    /// moving average stays unattractive until ten real successes age the
+    /// failure out.
+    pub fn record_dial_failure(&self, node_id: &str, domain: ProbeDomain, ipver: IpVersion) {
+        self.clear_latency(node_id);
+        let coll = self.get_or_create_collection(node_id, alive_index(domain, ipver));
+        coll.mark_unavailable();
+    }
+
     /// Seed a persisted delay sample into the node's TCP-v4 latency
     /// history (cache.db warm start). Does NOT touch alive state — probes
     /// decide liveness; this only pre-seeds ranking data so URLTest groups

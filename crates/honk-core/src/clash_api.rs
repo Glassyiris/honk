@@ -636,8 +636,11 @@ async fn get_proxy_delay(
                 Json(serde_json::json!({"delay": delay_ms(latency)})).into_response()
             }
             Err(e) => {
-                // sing-box deletes the node's latency history on failure.
-                s.alive_set.clear_latency(&node.name);
+                // sing-box deletes the node's latency history on failure;
+                // the synthetic penalty sample keeps a flaky node from
+                // instantly re-ranking first.
+                s.alive_set
+                    .record_dial_failure(&node.name, ProbeDomain::Tcp, IpVersion::V4);
                 error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     &format!("An error occurred in the delay test: {e}"),
