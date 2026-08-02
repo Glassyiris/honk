@@ -657,11 +657,12 @@ mod tests {
         assert!(results[0].1.is_err());
         assert!(results[1].1.is_err());
 
-        // Failure → latency history cleared (sing-box delete-history).
+        // Failure → history replaced by the synthetic penalty sample, so the
+        // stale 999ms no longer ranks the node.
         for m in &members {
             assert_eq!(
                 alive_set.get_last_latency(&m.name, ProbeDomain::Tcp, IpVersion::V4),
-                None
+                Some(Duration::from_secs(10))
             );
         }
     }
