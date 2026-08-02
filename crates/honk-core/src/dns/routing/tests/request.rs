@@ -207,3 +207,70 @@ fn request_actions_and_fallback_preserve_semantics() {
         DnsRequestDecision::Upstream("fallback_upstream".into())
     );
 }
+
+#[test]
+fn negated_qname_matches_complement() {
+    let router = router_from_request(request(vec![rule(
+        DnsCond::Qname {
+            not: true,
+            matchers: vec![DnsDomainMatcher::Suffix("cn".into())],
+        },
+        DnsRequestAction::Upstream("googledns".into()),
+    )]));
+    assert_eq!(
+        router.select_request("google.com", 1),
+        DnsRequestDecision::Upstream("googledns".into())
+    );
+    assert_eq!(
+        router.select_request("baidu.cn", 1),
+        DnsRequestDecision::Upstream("default".into())
+    );
+}
+
+#[test]
+fn negated_qtype_matches_complement() {
+    let router = router_from_request(request(vec![rule(
+        DnsCond::Qtype {
+            not: true,
+            types: vec![65],
+        },
+        DnsRequestAction::Upstream("googledns".into()),
+    )]));
+    assert_eq!(
+        router.select_request("example.com", 1),
+        DnsRequestDecision::Upstream("googledns".into())
+    );
+    assert_eq!(
+        router.select_request("example.com", 65),
+        DnsRequestDecision::Upstream("default".into())
+    );
+}
+
+#[test]
+fn negated_and_positive_conditions_are_anded() {
+    let router = router_from_request(request(vec![DnsRequestRule {
+        conditions: vec![
+            DnsCond::Qname {
+                not: false,
+                matchers: vec![DnsDomainMatcher::Suffix("example.com".into())],
+            },
+            DnsCond::Qtype {
+                not: true,
+                types: vec![28],
+            },
+        ],
+        action: DnsRequestAction::Upstream("alidns".into()),
+    }]));
+    assert_eq!(
+        router.select_request("www.example.com", 1),
+        DnsRequestDecision::Upstream("alidns".into())
+    );
+    assert_eq!(
+        router.select_request("www.example.com", 28),
+        DnsRequestDecision::Upstream("default".into())
+    );
+    assert_eq!(
+        router.select_request("other.org", 1),
+        DnsRequestDecision::Upstream("default".into())
+    );
+}

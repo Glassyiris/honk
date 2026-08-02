@@ -308,6 +308,12 @@ routing {
 
 `default:` is accepted as an alias of `fallback:`.
 
+Any matcher may be negated with a leading `!` (binds to the single matcher
+that follows): `sip(10.10.10.24/32) && !dport(53) -> direct(must)`. A rule
+matches iff every positive matcher matches and none of the negated ones do.
+A flow with an unknown (unsniffed) domain is treated as "not x" for negated
+domain/geosite matchers, so it never vetoes them.
+
 ### Rule fields (internal schema)
 
 | Field | Type | Default | Meaning |
@@ -337,6 +343,7 @@ routing {
 | `geosite` | Geosite codes |
 | `ip_version` | IP version |
 | `dscp` | DSCP |
+| `not` | Negated matcher set (`!matcher(...)`), mirroring every field above |
 
 Multiple functions on one rule are AND'd with `&&`.
 

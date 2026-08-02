@@ -982,3 +982,137 @@ fn udp_warm_node_count_parses_zero_and_rejects_invalid_values() {
         assert!(matches!(err, crate::ConfigError::Parse(_)), "{invalid}");
     }
 }
+
+#[test]
+fn test_parse_route_negation_matrix() {
+    let input = r#"
+routing {
+    pname(curl) && !pname(wget) -> direct
+    dip(10.0.0.0/8) && !dip(10.1.0.0/16) -> direct
+    sip(192.168.0.0/16) && !sip(192.168.1.0/24) -> direct
+    domain(suffix: example.com) && !domain(suffix: ads.example.com, keyword: tracker, full: evil.org, regex: ^bad\.) -> direct
+    dport(80) && !dport(53) -> direct
+    sport(1000-2000) && !sport(53) -> direct
+    l4proto(tcp) && !l4proto(udp) -> direct
+    ipversion(4) && !ipversion(6) -> direct
+    mac(aa:bb:cc:dd:ee:ff) && !mac(00:11:22:33:44:55) -> direct
+    dscp(4) && !dscp(46) -> direct
+    dip(geoip:cn) && !dip(geoip:telegram) -> direct
+    domain(geosite:cn) && !domain(geosite:category-ads) -> direct
+    fallback: proxy
+}
+"#;
+    let config = parse_dae_config(input).unwrap();
+    let rules = &config.routing.rules;
+    assert_eq!(rules.len(), 12);
+
+    assert_eq!(rules[0].condition.process_name, vec!["curl"]);
+    assert_eq!(rules[0].condition.not.process_name, vec!["wget"]);
+
+    assert_eq!(rules[1].condition.ip, vec!["10.0.0.0/8"]);
+    assert_eq!(rules[1].condition.not.ip, vec!["10.1.0.0/16"]);
+
+    assert_eq!(rules[2].condition.source_ip, vec!["192.168.0.0/16"]);
+    assert_eq!(rules[2].condition.not.source_ip, vec!["192.168.1.0/24"]);
+
+    assert_eq!(rules[3].condition.domain_suffix, vec!["example.com"]);
+    assert_eq!(
+        rules[3].condition.not.domain_suffix,
+        vec!["ads.example.com"]
+    );
+    assert_eq!(rules[3].condition.not.domain_keyword, vec!["tracker"]);
+    assert_eq!(rules[3].condition.not.domain, vec!["evil.org"]);
+    assert_eq!(rules[3].condition.not.domain_regex, vec![r"^bad\."]);
+
+    assert_eq!(rules[4].condition.port, vec!["80"]);
+    assert_eq!(rules[4].condition.not.port, vec!["53"]);
+
+    assert_eq!(rules[5].condition.source_port, vec!["1000-2000"]);
+    assert_eq!(rules[5].condition.not.source_port, vec!["53"]);
+
+    assert_eq!(rules[6].condition.protocol, vec!["tcp"]);
+    assert_eq!(rules[6].condition.not.protocol, vec!["udp"]);
+
+    assert_eq!(rules[7].condition.ip_version, vec!["4"]);
+    assert_eq!(rules[7].condition.not.ip_version, vec!["6"]);
+
+    assert_eq!(rules[8].condition.mac, vec!["aa:bb:cc:dd:ee:ff"]);
+    assert_eq!(rules[8].condition.not.mac, vec!["00:11:22:33:44:55"]);
+
+    assert_eq!(rules[9].condition.dscp, vec!["4"]);
+    assert_eq!(rules[9].condition.not.dscp, vec!["46"]);
+
+    assert_eq!(rules[10].condition.geo_ip, vec!["cn"]);
+    assert_eq!(rules[10].condition.not.geo_ip, vec!["telegram"]);
+
+    assert_eq!(rules[11].condition.geosite, vec!["cn"]);
+    assert_eq!(rules[11].condition.not.geosite, vec!["category-ads"]);
+
+    for rule in rules {
+        assert!(
+            rule.condition.clash_rule_parts().is_some(),
+            "positive side stays the clash display source"
+        );
+    }
+}
+
+#[test]
+fn test_parse_route_negation_bare_prefix_forms() {
+    let input = r#"
+routing {
+    !geosite:cn -> proxy
+    !geoip:cn -> proxy
+    !domain:example.com -> proxy
+    !suffix:example.org -> proxy
+    !keyword:ads -> proxy
+    !full:evil.net -> proxy
+    !regex:^bad\. -> proxy
+    fallback: direct
+}
+"#;
+    let config = parse_dae_config(input).unwrap();
+    let rules = &config.routing.rules;
+    assert_eq!(rules.len(), 7);
+
+    assert_eq!(rules[0].condition.not.geosite, vec!["cn"]);
+    assert_eq!(rules[1].condition.not.geo_ip, vec!["cn"]);
+    assert_eq!(rules[2].condition.not.domain_suffix, vec!["example.com"]);
+    assert_eq!(rules[3].condition.not.domain_suffix, vec!["example.org"]);
+    assert_eq!(rules[4].condition.not.domain_keyword, vec!["ads"]);
+    assert_eq!(rules[5].condition.not.domain, vec!["evil.net"]);
+    assert_eq!(rules[6].condition.not.domain_regex, vec![r"^bad\."]);
+
+    for rule in rules {
+        let c = &rule.condition;
+        assert!(c.domain.is_empty() && c.domain_suffix.is_empty());
+        assert!(c.ip.is_empty() && c.port.is_empty() && c.geosite.is_empty());
+        assert!(c.geo_ip.is_empty() && c.domain_keyword.is_empty());
+    }
+}
+
+#[test]
+fn test_parse_route_negation_production_rule() {
+    let input = r#"
+routing {
+    sip(10.10.10.24/32) && !dport(53) -> direct(must)
+    fallback: proxy
+}
+"#;
+    let config = parse_dae_config(input).unwrap();
+    let rule = &config.routing.rules[0];
+    assert_eq!(rule.condition.source_ip, vec!["10.10.10.24/32"]);
+    assert_eq!(rule.condition.not.port, vec!["53"]);
+    assert!(rule.must);
+}
+
+#[test]
+fn test_routing_condition_not_serde_defaults() {
+    let cond: crate::routing::RoutingCondition = toml::from_str("port = ['443']").unwrap();
+    assert_eq!(cond.port, vec!["443"]);
+    assert!(cond.not.port.is_empty());
+    assert!(cond.not.domain.is_empty());
+
+    let cond: crate::routing::RoutingCondition =
+        toml::from_str("port = ['443']\n[not]\nport = ['53']").unwrap();
+    assert_eq!(cond.not.port, vec!["53"]);
+}

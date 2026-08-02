@@ -965,3 +965,274 @@ fn test_route_domain_does_not_claim_default_as_match() {
     conn.dst_port = 443;
     assert_eq!(router.route(&conn), "🍥 final");
 }
+
+mod negation {
+    use super::*;
+    use honk_config::routing::RoutingNotCondition;
+
+    fn rule(name: &str, not: RoutingNotCondition, outbound: &str) -> RoutingRule {
+        RoutingRule {
+            name: name.into(),
+            condition: RoutingCondition {
+                not,
+                ..Default::default()
+            },
+            outbound: RoutingOutbound::Simple(outbound.into()),
+            priority: 0,
+            must: false,
+            mark: 0,
+        }
+    }
+
+    fn conn() -> ConnectionInfo {
+        ConnectionInfo {
+            domain: None,
+            dst_ip: "1.1.1.1".parse().unwrap(),
+            dst_port: 443,
+            src_ip: "192.168.1.1".parse().unwrap(),
+            src_port: 12345,
+            protocol: "tcp",
+            process_name: None,
+            mac: None,
+            dscp: None,
+        }
+    }
+
+    fn not(pairs: &[(&str, &str)]) -> RoutingNotCondition {
+        let mut n = RoutingNotCondition::default();
+        for (field, value) in pairs {
+            let values = vec![value.to_string()];
+            match *field {
+                "domain" => n.domain = values,
+                "domain_suffix" => n.domain_suffix = values,
+                "domain_keyword" => n.domain_keyword = values,
+                "domain_regex" => n.domain_regex = values,
+                "ip" => n.ip = values,
+                "source_ip" => n.source_ip = values,
+                "port" => n.port = values,
+                "source_port" => n.source_port = values,
+                "protocol" => n.protocol = values,
+                "process_name" => n.process_name = values,
+                "mac" => n.mac = values,
+                "geo_ip" => n.geo_ip = values,
+                "geosite" => n.geosite = values,
+                "ip_version" => n.ip_version = values,
+                "dscp" => n.dscp = values,
+                other => panic!("unknown field {other}"),
+            }
+        }
+        n
+    }
+
+    fn check(not_cond: RoutingNotCondition, matching: &ConnectionInfo, vetoed: &ConnectionInfo) {
+        let router = Router::new(&[rule("neg", not_cond, "proxy")], "direct").unwrap();
+        assert_eq!(router.route(matching), "proxy");
+        assert_eq!(router.route(vetoed), "direct");
+    }
+
+    #[test]
+    fn test_negated_dport() {
+        let mut hit = conn();
+        hit.dst_port = 80;
+        let mut veto = conn();
+        veto.dst_port = 53;
+        check(not(&[("port", "53")]), &hit, &veto);
+    }
+
+    #[test]
+    fn test_negated_sport() {
+        let mut hit = conn();
+        hit.src_port = 8080;
+        let mut veto = conn();
+        veto.src_port = 53;
+        check(not(&[("source_port", "53")]), &hit, &veto);
+    }
+
+    #[test]
+    fn test_negated_dip() {
+        let mut hit = conn();
+        hit.dst_ip = "8.8.8.8".parse().unwrap();
+        let mut veto = conn();
+        veto.dst_ip = "10.1.2.3".parse().unwrap();
+        check(not(&[("ip", "10.0.0.0/8")]), &hit, &veto);
+    }
+
+    #[test]
+    fn test_negated_sip() {
+        let mut hit = conn();
+        hit.src_ip = "10.0.0.1".parse().unwrap();
+        let mut veto = conn();
+        veto.src_ip = "192.168.1.5".parse().unwrap();
+        check(not(&[("source_ip", "192.168.0.0/16")]), &hit, &veto);
+    }
+
+    #[test]
+    fn test_negated_l4proto() {
+        let mut veto = conn();
+        veto.protocol = "udp";
+        check(not(&[("protocol", "udp")]), &conn(), &veto);
+    }
+
+    #[test]
+    fn test_negated_ipversion() {
+        let mut veto = conn();
+        veto.dst_ip = "2001:db8::1".parse().unwrap();
+        check(not(&[("ip_version", "6")]), &conn(), &veto);
+    }
+
+    #[test]
+    fn test_negated_pname() {
+        let mut hit = conn();
+        hit.process_name = Some("/usr/bin/curl".into());
+        let mut veto = conn();
+        veto.process_name = Some("wget".into());
+        check(not(&[("process_name", "wget")]), &hit, &veto);
+    }
+
+    #[test]
+    fn test_negated_mac() {
+        let mut hit = conn();
+        hit.mac = Some("aa:bb:cc:dd:ee:ff".into());
+        let mut veto = conn();
+        veto.mac = Some("00:11:22:33:44:55".into());
+        check(not(&[("mac", "00:11:22:33:44:55")]), &hit, &veto);
+    }
+
+    #[test]
+    fn test_negated_dscp() {
+        let mut hit = conn();
+        hit.dscp = Some(0);
+        let mut veto = conn();
+        veto.dscp = Some(4);
+        check(not(&[("dscp", "4")]), &hit, &veto);
+    }
+
+    #[test]
+    fn test_negated_domain_suffix() {
+        let mut hit = conn();
+        hit.domain = Some("y.com".into());
+        let mut veto = conn();
+        veto.domain = Some("www.x.com".into());
+        check(not(&[("domain_suffix", "x.com")]), &hit, &veto);
+
+        // Unknown domain cannot prove the negated matcher: treated as "not x".
+        let router = Router::new(
+            &[rule("neg", not(&[("domain_suffix", "x.com")]), "proxy")],
+            "direct",
+        )
+        .unwrap();
+        assert_eq!(router.route(&conn()), "proxy");
+    }
+
+    #[test]
+    fn test_negated_domain_full_keyword_regex() {
+        let mut hit = conn();
+        hit.domain = Some("good.com".into());
+
+        let mut veto = conn();
+        veto.domain = Some("evil.org".into());
+        check(not(&[("domain", "evil.org")]), &hit, &veto);
+
+        let mut veto = conn();
+        veto.domain = Some("www.tracker.com".into());
+        check(not(&[("domain_keyword", "tracker")]), &hit, &veto);
+
+        let mut veto = conn();
+        veto.domain = Some("bad.example.com".into());
+        check(not(&[("domain_regex", r"^bad\.")]), &hit, &veto);
+    }
+
+    #[test]
+    fn test_negated_geoip_private() {
+        let mut hit = conn();
+        hit.dst_ip = "8.8.8.8".parse().unwrap();
+        let mut veto = conn();
+        veto.dst_ip = "192.168.1.1".parse().unwrap();
+        check(not(&[("geo_ip", "private")]), &hit, &veto);
+    }
+
+    #[test]
+    fn test_negated_geosite_matcher() {
+        // Build the base route without geo assets; then swap in a synthetic
+        // negated geosite matcher (the dat-backed positive side is covered
+        // by test_geosite_route above).
+        let router =
+            Router::new(&[rule("neg", not(&[("port", "53")]), "proxy")], "direct").unwrap();
+        let route = &router.compiled_routes()[0];
+        let domains = vec![GeositeDomain::Domain("x.com".into())];
+        let route = CompiledRoute {
+            not_ports: Vec::new(),
+            not_geosite_domains: domains.clone(),
+            not_geosite_matcher: GeositeMatcher::build(&domains),
+            ..route.clone()
+        };
+        let router = Router {
+            routes: vec![route],
+            default_outbound: "direct".into(),
+        };
+        let mut veto = conn();
+        veto.domain = Some("www.x.com".into());
+        assert_eq!(router.route(&veto), "direct");
+        let mut hit = conn();
+        hit.domain = Some("y.com".into());
+        assert_eq!(router.route(&hit), "proxy");
+        // Unknown domain never vetoes a negated geosite matcher.
+        assert_eq!(router.route(&conn()), "proxy");
+    }
+
+    #[test]
+    fn test_production_rule_sip_and_not_dport() {
+        let rules = vec![
+            RoutingRule {
+                name: "host24-not-dns".into(),
+                condition: RoutingCondition {
+                    source_ip: vec!["10.10.10.24/32".into()],
+                    not: not(&[("port", "53")]),
+                    ..Default::default()
+                },
+                outbound: RoutingOutbound::Simple("direct".into()),
+                priority: 0,
+                must: true,
+                mark: 0,
+            },
+            RoutingRule {
+                name: "catch-all".into(),
+                condition: RoutingCondition {
+                    source_ip: vec!["10.0.0.0/8".into()],
+                    ..Default::default()
+                },
+                outbound: RoutingOutbound::Simple("proxy".into()),
+                priority: 1,
+                must: false,
+                mark: 0,
+            },
+        ];
+        let router = Router::new(&rules, "block").unwrap();
+
+        let mut dns_flow = conn();
+        dns_flow.src_ip = "10.10.10.24".parse().unwrap();
+        dns_flow.dst_port = 53;
+        let m = router.route_full(&dns_flow).unwrap();
+        assert_eq!(m.rule_name, "catch-all");
+
+        let mut web_flow = conn();
+        web_flow.src_ip = "10.10.10.24".parse().unwrap();
+        web_flow.dst_port = 80;
+        let m = router.route_full(&web_flow).unwrap();
+        assert_eq!(m.rule_name, "host24-not-dns");
+        assert!(m.must);
+    }
+
+    #[test]
+    fn test_negated_only_rule_counts_as_conditioned() {
+        // A rule whose only matcher is negated must not degrade to an
+        // unconditional match-all bypassing the has_conditions guard.
+        let router =
+            Router::new(&[rule("neg", not(&[("port", "53")]), "proxy")], "direct").unwrap();
+        let mut c = conn();
+        c.dst_port = 53;
+        assert_eq!(router.route(&c), "direct");
+        c.dst_port = 80;
+        assert_eq!(router.route(&c), "proxy");
+    }
+}

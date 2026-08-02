@@ -271,6 +271,11 @@ routing {
 | `rules` | rule[] | `[]` | 有序规则；dae 中按书写顺序 |
 | `default_outbound` | string | `"direct"` | 回退。**dae：** `fallback:` / `default:` |
 
+任意 matcher 可加 `!` 前缀取反（仅作用于紧随其后的一个 matcher）：
+`sip(10.10.10.24/32) && !dport(53) -> direct(must)`。规则匹配 ⟺ 所有正向
+matcher 都匹配且所有取反 matcher 都不匹配。域名未知的流对取反的
+domain/geosite matcher 视为"不是 x"，不会被其否决。
+
 ### 规则字段
 
 | 字段 | 类型 | 默认值 | 含义 |
@@ -300,6 +305,7 @@ routing {
 | `geosite` | Geosite 代码 |
 | `ip_version` | IP 版本 |
 | `dscp` | DSCP |
+| `not` | 取反 matcher 集（`!matcher(...)`），字段与上表完全镜像 |
 
 同一规则上多字段为 AND。dae 用 `&&` 连接函数。
 

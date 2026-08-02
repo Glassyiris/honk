@@ -44,6 +44,25 @@ pub struct CompiledRoute {
     pub(crate) geosite_matcher: GeositeMatcher,
     pub ip_versions: Vec<u8>,
     pub dscp_values: Vec<u8>,
+    /// Negated matchers (dae `!matcher(...)`): any hit vetoes the rule.
+    /// Mirrors the positive fields above; `not_geo_ip` is expanded through
+    /// GeoAssets into `not_ip_nets` exactly like the positive side.
+    pub not_domain_patterns: Vec<Regex>,
+    pub not_domain_suffixes: Vec<String>,
+    pub not_domain_keywords: Vec<String>,
+    pub not_ip_nets: Vec<ipnet::IpNet>,
+    pub(crate) not_ip_trie: BinaryLpmTrie,
+    pub not_source_ip_nets: Vec<ipnet::IpNet>,
+    pub(crate) not_source_ip_trie: BinaryLpmTrie,
+    pub not_ports: Vec<PortRange>,
+    pub not_source_ports: Vec<PortRange>,
+    pub not_protocols: Vec<String>,
+    pub not_process_names: Vec<String>,
+    pub not_mac_addresses: Vec<String>,
+    pub(crate) not_geosite_domains: Vec<GeositeDomain>,
+    pub(crate) not_geosite_matcher: GeositeMatcher,
+    pub not_ip_versions: Vec<u8>,
+    pub not_dscp_values: Vec<u8>,
     pub outbound: String,
     /// When true, matching this rule sets must=true on the result, which
     /// tells the control plane to skip TLS/HTTP sniffing.
@@ -245,6 +264,48 @@ impl Router {
             let ip_trie = BinaryLpmTrie::from_nets(&ip_nets);
             let source_ip_trie = BinaryLpmTrie::from_nets(&source_ip_nets);
 
+            let not = &rule.condition.not;
+            let mut not_domain_patterns = Vec::new();
+            for pattern in &not.domain_regex {
+                not_domain_patterns.push(
+                    Regex::new(pattern)
+                        .map_err(|e| anyhow::anyhow!("Invalid regex '{}': {}", pattern, e))?,
+                );
+            }
+            for wildcard in &not.domain {
+                let regex_str = glob_to_regex(wildcard);
+                not_domain_patterns.push(
+                    Regex::new(&regex_str)
+                        .map_err(|e| anyhow::anyhow!("Invalid pattern '{}': {}", wildcard, e))?,
+                );
+            }
+            let mut not_ip_nets: Vec<ipnet::IpNet> =
+                not.ip.iter().filter_map(|c| c.parse().ok()).collect();
+            not_ip_nets.extend(assets.geoip_nets(&not.geo_ip));
+            let not_source_ip_nets: Vec<ipnet::IpNet> = not
+                .source_ip
+                .iter()
+                .filter_map(|c| c.parse().ok())
+                .collect();
+            let not_ports = parse_port_ranges(&not.port)?;
+            let not_source_ports = parse_port_ranges(&not.source_port)?;
+            let not_mac_addresses: Vec<String> =
+                not.mac.iter().filter_map(|m| normalize_mac(m)).collect();
+            let not_geosite_domains = assets.geosite_domains(&not.geosite);
+            let not_geosite_matcher = GeositeMatcher::build(&not_geosite_domains);
+            let not_ip_versions: Vec<u8> = not
+                .ip_version
+                .iter()
+                .filter_map(|s| parse_ip_version(s))
+                .collect();
+            let not_dscp_values: Vec<u8> = not
+                .dscp
+                .iter()
+                .filter_map(|s| s.trim().parse().ok())
+                .collect();
+            let not_ip_trie = BinaryLpmTrie::from_nets(&not_ip_nets);
+            let not_source_ip_trie = BinaryLpmTrie::from_nets(&not_source_ip_nets);
+
             let (outbound, outbound_must) = match &rule.outbound {
                 RoutingOutbound::Simple(name) => parse_outbound(name),
                 RoutingOutbound::Complex { outbounds, .. } => {
@@ -279,6 +340,22 @@ impl Router {
                 geosite_matcher,
                 ip_versions,
                 dscp_values,
+                not_domain_patterns,
+                not_domain_suffixes: not.domain_suffix.clone(),
+                not_domain_keywords: not.domain_keyword.clone(),
+                not_ip_nets,
+                not_ip_trie,
+                not_source_ip_nets,
+                not_source_ip_trie,
+                not_ports,
+                not_source_ports,
+                not_protocols: not.protocol.clone(),
+                not_process_names: not.process_name.clone(),
+                not_mac_addresses,
+                not_geosite_domains,
+                not_geosite_matcher,
+                not_ip_versions,
+                not_dscp_values,
                 outbound,
                 must: rule.must || outbound_must,
                 mark: rule.mark,
@@ -419,7 +496,8 @@ impl Router {
             || !route.mac_addresses.is_empty()
             || !route.geosite_domains.is_empty()
             || !route.ip_versions.is_empty()
-            || !route.dscp_values.is_empty();
+            || !route.dscp_values.is_empty()
+            || Self::has_negated_conditions(route);
         if !has_conditions {
             return false;
         }
@@ -521,7 +599,89 @@ impl Router {
             }
         }
 
-        true
+        !Self::negated_hit(route, conn)
+    }
+
+    fn has_negated_conditions(route: &CompiledRoute) -> bool {
+        !route.not_domain_patterns.is_empty()
+            || !route.not_domain_suffixes.is_empty()
+            || !route.not_domain_keywords.is_empty()
+            || !route.not_ip_nets.is_empty()
+            || !route.not_source_ip_nets.is_empty()
+            || !route.not_ports.is_empty()
+            || !route.not_source_ports.is_empty()
+            || !route.not_protocols.is_empty()
+            || !route.not_process_names.is_empty()
+            || !route.not_mac_addresses.is_empty()
+            || !route.not_geosite_domains.is_empty()
+            || !route.not_ip_versions.is_empty()
+            || !route.not_dscp_values.is_empty()
+    }
+
+    /// True when any negated matcher hits and therefore vetoes the rule.
+    /// An absent domain cannot prove a negated domain/geosite matcher, so it
+    /// never vetoes — "cannot prove it is x" counts as "is not x" (dae).
+    fn negated_hit(route: &CompiledRoute, conn: &ConnectionInfo) -> bool {
+        if let Some(ref domain) = conn.domain
+            && (route
+                .not_domain_patterns
+                .iter()
+                .any(|re| re.is_match(domain))
+                || route
+                    .not_domain_suffixes
+                    .iter()
+                    .any(|s| domain.ends_with(s))
+                || route.not_domain_keywords.iter().any(|k| domain.contains(k))
+                || route.not_geosite_matcher.matches(domain))
+        {
+            return true;
+        }
+        if !route.not_ip_nets.is_empty() && route.not_ip_trie.matches(&conn.dst_ip) {
+            return true;
+        }
+        if !route.not_source_ip_nets.is_empty() && route.not_source_ip_trie.matches(&conn.src_ip) {
+            return true;
+        }
+        if route.not_ports.iter().any(|r| r.contains(conn.dst_port)) {
+            return true;
+        }
+        if route
+            .not_source_ports
+            .iter()
+            .any(|r| r.contains(conn.src_port))
+        {
+            return true;
+        }
+        if route
+            .not_protocols
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(conn.protocol))
+        {
+            return true;
+        }
+        if let Some(ref proc) = conn.process_name
+            && route.not_process_names.iter().any(|p| proc.contains(p))
+        {
+            return true;
+        }
+        if let Some(ref mac) = conn.mac
+            && let Some(canonical) = normalize_mac(mac)
+            && route.not_mac_addresses.contains(&canonical)
+        {
+            return true;
+        }
+        if !route.not_ip_versions.is_empty() {
+            let version = if conn.dst_ip.is_ipv4() { 4 } else { 6 };
+            if route.not_ip_versions.contains(&version) {
+                return true;
+            }
+        }
+        if let Some(dscp) = conn.dscp
+            && route.not_dscp_values.contains(&dscp)
+        {
+            return true;
+        }
+        false
     }
 
     pub fn route_count(&self) -> usize {

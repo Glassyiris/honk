@@ -26,7 +26,15 @@ pub static DOMAIN_BITMAPS_GENERATION: std::sync::atomic::AtomicU64 =
 
 /// A single condition present in a compiled route.
 #[derive(Debug)]
-enum Condition<'a> {
+struct Condition<'a> {
+    /// dae `!matcher(...)`: the kernel inverts this match_set's result
+    /// (`good_subrule == match_not` fails the rule).
+    not: bool,
+    kind: ConditionKind<'a>,
+}
+
+#[derive(Debug)]
+enum ConditionKind<'a> {
     /// Domain/geosite conditions are represented in eBPF as a `DomainSet`
     /// placeholder. The actual domain→IP mapping is populated by DNS snooping:
     /// when DNS resolves a matching domain, the resolved IPs are inserted into
@@ -452,102 +460,137 @@ impl RoutingMatcherBuilder {
             } else {
                 OutboundIndex::LogicalAnd as u8
             };
+            let not = cond.not as u8;
 
-            match cond {
-                Condition::SourceIp { nets } => {
+            match &cond.kind {
+                ConditionKind::SourceIp { nets } => {
                     let idx = match_sets.len() as u32;
+                    // Negated LPM matchers still install their entries; the
+                    // kernel inverts the lookup result via the not flag.
                     if let Err(e) = Self::plan_source_lpm_routes(lpm_plan, nets, idx) {
                         warn!("SourceIp LPM planning failed (non-fatal): {}", e);
                     }
                     match_sets.push(MatchSet {
                         value: MatchSetValue { raw: [0; 16] },
-                        not: 0,
+                        not,
                         match_type: MatchType::SourceIpSet as u8,
                         outbound: sub_outbound,
                         must: must as u8,
                         mark,
                     });
                 }
-                Condition::Ip { nets } => {
+                ConditionKind::Ip { nets } => {
                     let idx = match_sets.len() as u32;
                     if let Err(e) = Self::plan_dest_lpm_routes(lpm_plan, nets, idx) {
                         warn!("DestIp LPM planning failed (non-fatal): {}", e);
                     }
                     match_sets.push(MatchSet {
                         value: MatchSetValue { raw: [0; 16] },
-                        not: 0,
+                        not,
                         match_type: MatchType::IpSet as u8,
                         outbound: sub_outbound,
                         must: must as u8,
                         mark,
                     });
                 }
-                Condition::Mac { macs } => {
+                ConditionKind::Mac { macs } => {
                     let idx = match_sets.len() as u32;
                     if let Err(e) = Self::plan_mac_lpm_routes(lpm_plan, macs, idx) {
                         warn!("Mac LPM planning failed (non-fatal): {}", e);
                     }
                     match_sets.push(MatchSet {
                         value: MatchSetValue { raw: [0; 16] },
-                        not: 0,
+                        not,
                         match_type: MatchType::Mac as u8,
                         outbound: sub_outbound,
                         must: must as u8,
                         mark,
                     });
                 }
-                Condition::SourcePort { ranges } => {
-                    Self::push_port_match_sets(ranges, true, sub_outbound, must, mark, match_sets);
+                ConditionKind::SourcePort { ranges } => {
+                    Self::push_port_match_sets(
+                        ranges,
+                        true,
+                        not,
+                        sub_outbound,
+                        must,
+                        mark,
+                        match_sets,
+                    );
                 }
-                Condition::Port { ranges } => {
-                    Self::push_port_match_sets(ranges, false, sub_outbound, must, mark, match_sets);
+                ConditionKind::Port { ranges } => {
+                    Self::push_port_match_sets(
+                        ranges,
+                        false,
+                        not,
+                        sub_outbound,
+                        must,
+                        mark,
+                        match_sets,
+                    );
                 }
-                Condition::Protocol { protocols } => {
+                ConditionKind::Protocol { protocols } => {
                     let mask = Self::protocol_mask(protocols);
                     match_sets.push(MatchSet {
                         value: MatchSetValue {
                             l4proto_type: L4ProtoType::from_u8(mask).unwrap_or(L4ProtoType::Tcp),
                         },
-                        not: 0,
+                        not,
                         match_type: MatchType::L4Proto as u8,
                         outbound: sub_outbound,
                         must: must as u8,
                         mark,
                     });
                 }
-                Condition::IpVersion { versions } => {
+                ConditionKind::IpVersion { versions } => {
                     let mask = Self::ip_version_mask(versions);
                     match_sets.push(MatchSet {
                         value: MatchSetValue {
                             ip_version: IpVersionType::from_u8(mask).unwrap_or(IpVersionType::V4),
                         },
-                        not: 0,
+                        not,
                         match_type: MatchType::IpVersion as u8,
                         outbound: sub_outbound,
                         must: must as u8,
                         mark,
                     });
                 }
-                Condition::Dscp { values } => {
-                    Self::push_dscp_match_sets(values, sub_outbound, must, mark, match_sets);
+                ConditionKind::Dscp { values } => {
+                    Self::push_dscp_match_sets(values, not, sub_outbound, must, mark, match_sets);
                 }
-                Condition::ProcessName { names } => {
-                    Self::push_process_name_match_sets(names, sub_outbound, must, mark, match_sets);
+                ConditionKind::ProcessName { names } => {
+                    Self::push_process_name_match_sets(
+                        names,
+                        not,
+                        sub_outbound,
+                        must,
+                        mark,
+                        match_sets,
+                    );
                 }
                 // Domain: push a DomainSet placeholder in ROUTING_MAP.
                 // The actual domain→IP mapping will be populated by DNS snooping:
                 // when DNS resolves a domain to IPs, those IPs are pushed to
                 // DOMAIN_ROUTING_MAP with the bitmap pointing to this match_set.
-                Condition::Domain { .. } => {
+                ConditionKind::Domain { .. } => {
                     let idx = match_sets.len() as u32;
-                    let bitmap = Self::bitmap_for_rule(idx);
-                    domain_bitmaps
-                        .entry(route.name.clone())
-                        .or_default()
-                        .push(bitmap);
+                    // A negated DomainSet must NOT receive DNS-snooped bitmap
+                    // pushes: they record IPs whose domain matched the rule in
+                    // userspace, which is exactly the complement the kernel
+                    // would then veto. Leaving the bit unset makes the kernel
+                    // treat every flow as "not x", mirroring the userspace
+                    // unknown-domain semantics; the domain veto itself stays
+                    // on the userspace routing path.
+                    if not == 0 {
+                        let bitmap = Self::bitmap_for_rule(idx);
+                        domain_bitmaps
+                            .entry(route.name.clone())
+                            .or_default()
+                            .push(bitmap);
+                    }
                     match_sets.push(MatchSet {
                         value: MatchSetValue { raw: [0; 16] },
-                        not: 0,
+                        not,
                         match_type: MatchType::DomainSet as u8,
                         outbound: sub_outbound,
                         must: must as u8,
@@ -564,70 +607,125 @@ impl RoutingMatcherBuilder {
     fn collect_conditions<'a>(route: &'a CompiledRoute) -> Vec<Condition<'a>> {
         let mut conditions = Vec::new();
 
-        let has_domain = !route.domain_suffixes.is_empty()
-            || !route.domain_keywords.is_empty()
-            || !route.geosite_domains.is_empty();
-        if has_domain {
-            conditions.push(Condition::Domain {
-                suffixes: &route.domain_suffixes,
-                keywords: &route.domain_keywords,
-                geosite_domains: &route.geosite_domains,
-            });
+        macro_rules! collect_side {
+            ($not:expr, $domain_suffixes:expr, $domain_keywords:expr, $geosite_domains:expr,
+             $source_ip_nets:expr, $ip_nets:expr, $mac_addresses:expr, $source_ports:expr,
+             $ports:expr, $protocols:expr, $ip_versions:expr, $dscp_values:expr,
+             $process_names:expr) => {
+                let has_domain = !$domain_suffixes.is_empty()
+                    || !$domain_keywords.is_empty()
+                    || !$geosite_domains.is_empty();
+                if has_domain {
+                    conditions.push(Condition {
+                        not: $not,
+                        kind: ConditionKind::Domain {
+                            suffixes: $domain_suffixes,
+                            keywords: $domain_keywords,
+                            geosite_domains: $geosite_domains,
+                        },
+                    });
+                }
+                if !$source_ip_nets.is_empty() {
+                    conditions.push(Condition {
+                        not: $not,
+                        kind: ConditionKind::SourceIp {
+                            nets: $source_ip_nets,
+                        },
+                    });
+                }
+                if !$ip_nets.is_empty() {
+                    conditions.push(Condition {
+                        not: $not,
+                        kind: ConditionKind::Ip { nets: $ip_nets },
+                    });
+                }
+                if !$mac_addresses.is_empty() {
+                    conditions.push(Condition {
+                        not: $not,
+                        kind: ConditionKind::Mac {
+                            macs: $mac_addresses,
+                        },
+                    });
+                }
+                if !$source_ports.is_empty() {
+                    conditions.push(Condition {
+                        not: $not,
+                        kind: ConditionKind::SourcePort {
+                            ranges: $source_ports,
+                        },
+                    });
+                }
+                if !$ports.is_empty() {
+                    conditions.push(Condition {
+                        not: $not,
+                        kind: ConditionKind::Port { ranges: $ports },
+                    });
+                }
+                if !$protocols.is_empty() {
+                    conditions.push(Condition {
+                        not: $not,
+                        kind: ConditionKind::Protocol {
+                            protocols: $protocols,
+                        },
+                    });
+                }
+                if !$ip_versions.is_empty() {
+                    conditions.push(Condition {
+                        not: $not,
+                        kind: ConditionKind::IpVersion {
+                            versions: $ip_versions,
+                        },
+                    });
+                }
+                if !$dscp_values.is_empty() {
+                    conditions.push(Condition {
+                        not: $not,
+                        kind: ConditionKind::Dscp {
+                            values: $dscp_values,
+                        },
+                    });
+                }
+                if !$process_names.is_empty() {
+                    conditions.push(Condition {
+                        not: $not,
+                        kind: ConditionKind::ProcessName {
+                            names: $process_names,
+                        },
+                    });
+                }
+            };
         }
 
-        if !route.source_ip_nets.is_empty() {
-            conditions.push(Condition::SourceIp {
-                nets: &route.source_ip_nets,
-            });
-        }
-
-        if !route.ip_nets.is_empty() {
-            conditions.push(Condition::Ip {
-                nets: &route.ip_nets,
-            });
-        }
-
-        if !route.mac_addresses.is_empty() {
-            conditions.push(Condition::Mac {
-                macs: &route.mac_addresses,
-            });
-        }
-
-        if !route.source_ports.is_empty() {
-            conditions.push(Condition::SourcePort {
-                ranges: &route.source_ports,
-            });
-        }
-
-        if !route.ports.is_empty() {
-            conditions.push(Condition::Port {
-                ranges: &route.ports,
-            });
-        }
-
-        if !route.protocols.is_empty() {
-            conditions.push(Condition::Protocol {
-                protocols: &route.protocols,
-            });
-        }
-
-        if !route.ip_versions.is_empty() {
-            conditions.push(Condition::IpVersion {
-                versions: &route.ip_versions,
-            });
-        }
-
-        if !route.dscp_values.is_empty() {
-            conditions.push(Condition::Dscp {
-                values: &route.dscp_values,
-            });
-        }
-
-        if !route.process_names.is_empty() {
-            conditions.push(Condition::ProcessName {
-                names: &route.process_names,
-            });
-        }
+        collect_side!(
+            false,
+            &route.domain_suffixes,
+            &route.domain_keywords,
+            &route.geosite_domains,
+            &route.source_ip_nets,
+            &route.ip_nets,
+            &route.mac_addresses,
+            &route.source_ports,
+            &route.ports,
+            &route.protocols,
+            &route.ip_versions,
+            &route.dscp_values,
+            &route.process_names
+        );
+        collect_side!(
+            true,
+            &route.not_domain_suffixes,
+            &route.not_domain_keywords,
+            &route.not_geosite_domains,
+            &route.not_source_ip_nets,
+            &route.not_ip_nets,
+            &route.not_mac_addresses,
+            &route.not_source_ports,
+            &route.not_ports,
+            &route.not_protocols,
+            &route.not_ip_versions,
+            &route.not_dscp_values,
+            &route.not_process_names
+        );
 
         conditions
     }
@@ -753,6 +851,7 @@ impl RoutingMatcherBuilder {
     fn push_port_match_sets(
         ranges: &[crate::routing::PortRange],
         is_source: bool,
+        not: u8,
         final_outbound: u8,
         must: bool,
         mark: u32,
@@ -773,7 +872,7 @@ impl RoutingMatcherBuilder {
                         port_end: r.end,
                     },
                 },
-                not: 0,
+                not,
                 match_type: if is_source {
                     MatchType::SourcePort as u8
                 } else {
@@ -789,6 +888,7 @@ impl RoutingMatcherBuilder {
     /// Append one MatchSet per DSCP value, ORing multiple values with LogicalOr.
     fn push_dscp_match_sets(
         values: &[u8],
+        not: u8,
         final_outbound: u8,
         must: bool,
         mark: u32,
@@ -804,7 +904,7 @@ impl RoutingMatcherBuilder {
             };
             match_sets.push(MatchSet {
                 value: MatchSetValue { dscp: v },
-                not: 0,
+                not,
                 match_type: MatchType::Dscp as u8,
                 outbound,
                 must: must as u8,
@@ -817,6 +917,7 @@ impl RoutingMatcherBuilder {
     /// Each name is truncated to TASK_COMM_LEN (16 bytes) and stored as [u32; 4].
     fn push_process_name_match_sets(
         names: &[String],
+        not: u8,
         final_outbound: u8,
         must: bool,
         mark: u32,
@@ -842,7 +943,7 @@ impl RoutingMatcherBuilder {
             }
             match_sets.push(MatchSet {
                 value: MatchSetValue { pname },
-                not: 0,
+                not,
                 match_type: MatchType::ProcessName as u8,
                 outbound,
                 must: must as u8,
@@ -881,6 +982,12 @@ impl RoutingMatcherBuilder {
         let mut l4 = 0b11u8; // bit 0: tcp allowed, bit 1: udp allowed
         let mut ip = 0b11u8; // bit 0: v4 allowed, bit 1: v6 allowed
         for ms in chain {
+            // A negated L4Proto/IpVersion entry matches the complement
+            // protocols/families, so it must not narrow the group mask —
+            // the pre-filter would otherwise skip a rule that can match.
+            if ms.not != 0 {
+                continue;
+            }
             match MatchType::from_u8(ms.match_type) {
                 Some(MatchType::L4Proto) => {
                     let v = unsafe { ms.value.l4proto_type as u8 };
@@ -1191,6 +1298,22 @@ mod tests {
             geosite_matcher: Default::default(),
             ip_versions: Vec::new(),
             dscp_values: Vec::new(),
+            not_domain_patterns: Vec::new(),
+            not_domain_suffixes: Vec::new(),
+            not_domain_keywords: Vec::new(),
+            not_ip_nets: Vec::new(),
+            not_ip_trie: crate::routing::BinaryLpmTrie::from_nets(&[]),
+            not_source_ip_nets: Vec::new(),
+            not_source_ip_trie: crate::routing::BinaryLpmTrie::from_nets(&[]),
+            not_ports: Vec::new(),
+            not_source_ports: Vec::new(),
+            not_protocols: Vec::new(),
+            not_process_names: Vec::new(),
+            not_mac_addresses: Vec::new(),
+            not_geosite_domains: Vec::new(),
+            not_geosite_matcher: Default::default(),
+            not_ip_versions: Vec::new(),
+            not_dscp_values: Vec::new(),
             outbound: outbound.into(),
             must: false,
             mark: 0,
@@ -1875,5 +1998,167 @@ mod tests {
             assert_eq!(words[2], 0);
             assert_eq!(words[3], 0);
         }
+    }
+
+    #[test]
+    fn test_push_negated_port_rule_marks_not() {
+        let mut backend = MockEbpfBackend::new();
+        let route = CompiledRoute {
+            not_ports: vec![crate::routing::PortRange { start: 53, end: 53 }],
+            ..make_route("not-dns", "proxy")
+        };
+        let outbound_map = HashMap::from([("proxy".to_string(), OutboundIndex::UserBase as u8)]);
+
+        RoutingMatcherBuilder::build_and_push(
+            &mut backend,
+            &[route],
+            &outbound_map,
+            "direct",
+            DialMode::Ip,
+        )
+        .unwrap();
+
+        let rule = backend.active_routing_rule(0).unwrap();
+        assert_eq!(rule.match_type, MatchType::Port as u8);
+        assert_eq!(rule.not, 1);
+        assert_eq!(rule.outbound, OutboundIndex::UserBase as u8);
+    }
+
+    #[test]
+    fn test_push_negated_ip_rule_installs_lpm_and_marks_not() {
+        // A negated LPM matcher still needs its entries installed; the
+        // kernel inverts the lookup result via the not flag.
+        let mut backend = MockEbpfBackend::new();
+        let nets: Vec<ipnet::IpNet> = vec!["10.0.0.0/8".parse().unwrap()];
+        let route = CompiledRoute {
+            not_ip_nets: nets.clone(),
+            not_ip_trie: crate::routing::BinaryLpmTrie::from_nets(&nets),
+            ..make_route("not-private", "proxy")
+        };
+        let outbound_map = HashMap::from([("proxy".to_string(), OutboundIndex::UserBase as u8)]);
+
+        RoutingMatcherBuilder::build_and_push(
+            &mut backend,
+            &[route],
+            &outbound_map,
+            "direct",
+            DialMode::Ip,
+        )
+        .unwrap();
+
+        assert_eq!(backend.dest_lpm_bitmap.len(), 1);
+        let rule = backend.active_routing_rule(0).unwrap();
+        assert_eq!(rule.match_type, MatchType::IpSet as u8);
+        assert_eq!(rule.not, 1);
+    }
+
+    #[test]
+    fn test_negated_l4proto_rule_stays_in_all_groups() {
+        // The rule matches the complement protocols, so the group
+        // pre-filter must not skip it for any flow.
+        let mut backend = MockEbpfBackend::new();
+        let route = CompiledRoute {
+            not_protocols: vec!["tcp".into()],
+            ..make_route("not-tcp", "proxy")
+        };
+        let outbound_map = HashMap::from([("proxy".to_string(), OutboundIndex::UserBase as u8)]);
+
+        RoutingMatcherBuilder::build_and_push(
+            &mut backend,
+            &[route],
+            &outbound_map,
+            "direct",
+            DialMode::Ip,
+        )
+        .unwrap();
+
+        assert_eq!(backend.active_routing_rule_count(), 2);
+        let rule = backend.active_routing_rule(0).unwrap();
+        assert_eq!(rule.match_type, MatchType::L4Proto as u8);
+        assert_eq!(rule.not, 1);
+        for g in 0..ROUTING_GROUP_COUNT as u32 {
+            assert_eq!(
+                mock_group_word(&backend, g, 0) & 0b11,
+                0b11,
+                "group {g} must contain the negated-proto rule and the fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn test_negated_ipversion_rule_stays_in_all_groups() {
+        let route = CompiledRoute {
+            not_ip_versions: vec![6],
+            ..make_route("not-v6", "proxy")
+        };
+        let outbound_map = HashMap::from([("proxy".to_string(), OutboundIndex::UserBase as u8)]);
+        let plan = RoutingMatcherBuilder::compile(&[route], &outbound_map, "direct", DialMode::Ip)
+            .unwrap();
+        let rule_index = 0usize;
+        for words in plan.group_bitmaps.iter() {
+            assert_ne!(
+                words[rule_index / 32] & (1 << (rule_index % 32)),
+                0,
+                "negated ipversion rule must be in every group"
+            );
+        }
+    }
+
+    #[test]
+    fn test_negated_domain_pushes_not_domainset_without_bitmap() {
+        let route = CompiledRoute {
+            not_domain_suffixes: vec!["x.com".into()],
+            ..make_route("not-x", "proxy")
+        };
+        let outbound_map = HashMap::from([("proxy".to_string(), OutboundIndex::UserBase as u8)]);
+        let plan = RoutingMatcherBuilder::compile(&[route], &outbound_map, "direct", DialMode::Ip)
+            .unwrap();
+
+        assert_eq!(plan.match_sets[0].match_type, MatchType::DomainSet as u8);
+        assert_eq!(plan.match_sets[0].not, 1);
+        assert!(
+            !plan.domain_bitmaps.contains_key("not-x"),
+            "a negated DomainSet must not receive DNS-snooped bitmap pushes"
+        );
+    }
+
+    #[test]
+    fn test_mixed_domain_rule_registers_only_positive_bitmap() {
+        let route = CompiledRoute {
+            domain_suffixes: vec!["google.com".into()],
+            not_domain_suffixes: vec!["mail.google.com".into()],
+            ..make_route("mixed", "proxy")
+        };
+        let outbound_map = HashMap::from([("proxy".to_string(), OutboundIndex::UserBase as u8)]);
+        let plan = RoutingMatcherBuilder::compile(&[route], &outbound_map, "direct", DialMode::Ip)
+            .unwrap();
+
+        assert_eq!(plan.match_sets[0].match_type, MatchType::DomainSet as u8);
+        assert_eq!(plan.match_sets[0].not, 0);
+        assert_eq!(plan.match_sets[1].match_type, MatchType::DomainSet as u8);
+        assert_eq!(plan.match_sets[1].not, 1);
+        let bitmaps = plan.domain_bitmaps.get("mixed").unwrap();
+        assert_eq!(bitmaps.len(), 1, "only the positive DomainSet registers");
+        assert_eq!(bitmaps[0].bitmap[0], 1, "bitmap points at match_set 0");
+    }
+
+    #[test]
+    fn test_negated_combined_chain_marks_each_set() {
+        let route = CompiledRoute {
+            ip_nets: vec!["10.10.10.24/32".parse().unwrap()],
+            ip_trie: crate::routing::BinaryLpmTrie::from_nets(&["10.10.10.24/32".parse().unwrap()]),
+            not_ports: vec![crate::routing::PortRange { start: 53, end: 53 }],
+            ..make_route("host24", "direct")
+        };
+        let outbound_map = HashMap::from([("direct".to_string(), OutboundIndex::Direct as u8)]);
+        let plan = RoutingMatcherBuilder::compile(&[route], &outbound_map, "direct", DialMode::Ip)
+            .unwrap();
+
+        assert_eq!(plan.match_sets[0].match_type, MatchType::IpSet as u8);
+        assert_eq!(plan.match_sets[0].not, 0);
+        assert_eq!(plan.match_sets[0].outbound, OutboundIndex::LogicalAnd as u8);
+        assert_eq!(plan.match_sets[1].match_type, MatchType::Port as u8);
+        assert_eq!(plan.match_sets[1].not, 1);
+        assert_eq!(plan.match_sets[1].outbound, OutboundIndex::Direct as u8);
     }
 }

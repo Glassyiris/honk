@@ -1161,43 +1161,56 @@ fn parse_route_condition(expr: &str) -> crate::routing::RoutingCondition {
     let parts: Vec<&str> = expr.split("&&").map(|s| s.trim()).collect();
 
     for part in parts {
+        // dae negation: `!` binds to the single matcher that follows it.
+        let (not, part) = match part.strip_prefix('!') {
+            Some(rest) => (true, rest.trim()),
+            None => (false, part),
+        };
+        if part.is_empty() {
+            continue;
+        }
+        let mut target = if not {
+            cond.not.fields_mut()
+        } else {
+            cond.fields_mut()
+        };
         if let Some(args) = extract_fn_args(part, "pname") {
-            cond.process_name = args.iter().map(|s| s.to_string()).collect();
+            target.process_name.extend(args);
         } else if let Some(args) = extract_fn_args(part, "dip") {
-            parse_ip_args(&args, &mut cond);
+            parse_ip_args(&args, &mut target);
         } else if let Some(args) = extract_fn_args(part, "sip") {
-            cond.source_ip = args;
+            target.source_ip.extend(args);
         } else if let Some(args) = extract_fn_args(part, "domain") {
-            parse_domain_args(&args, &mut cond);
+            parse_domain_args(&args, &mut target);
         } else if let Some(args) = extract_fn_args(part, "dport") {
-            cond.port = args.iter().map(|s| s.to_string()).collect();
+            target.port.extend(args);
         } else if let Some(args) = extract_fn_args(part, "sport") {
-            cond.source_port = args.iter().map(|s| s.to_string()).collect();
+            target.source_port.extend(args);
         } else if let Some(args) = extract_fn_args(part, "l4proto") {
-            cond.protocol = args.iter().map(|s| s.to_string()).collect();
+            target.protocol.extend(args);
         } else if let Some(args) = extract_fn_args(part, "ipversion") {
-            cond.ip_version = args.iter().map(|s| s.to_string()).collect();
+            target.ip_version.extend(args);
         } else if let Some(args) = extract_fn_args(part, "mac") {
-            cond.mac = args.iter().map(|s| s.to_string()).collect();
+            target.mac.extend(args);
         } else if let Some(args) = extract_fn_args(part, "dscp") {
-            cond.dscp = args.iter().map(|s| s.to_string()).collect();
+            target.dscp.extend(args);
         } else {
             // Bare prefix-style conditions used outside function wrappers:
             // geosite:cn, geoip:cn, domain:example.com, suffix:example.com, etc.
             if let Some(v) = strip_tag_arg(part, "geosite:") {
-                cond.geosite.push(normalize_geosite_code(&v));
+                target.geosite.push(normalize_geosite_code(&v));
             } else if let Some(v) = strip_tag_arg(part, "geoip:") {
-                cond.geo_ip.push(normalize_geosite_code(&v));
+                target.geo_ip.push(normalize_geosite_code(&v));
             } else if let Some(v) = strip_tag_arg(part, "domain:") {
-                cond.domain_suffix.push(v);
+                target.domain_suffix.push(v);
             } else if let Some(v) = strip_tag_arg(part, "suffix:") {
-                cond.domain_suffix.push(v);
+                target.domain_suffix.push(v);
             } else if let Some(v) = strip_tag_arg(part, "keyword:") {
-                cond.domain_keyword.push(v);
+                target.domain_keyword.push(v);
             } else if let Some(v) = strip_tag_arg(part, "full:") {
-                cond.domain.push(v);
+                target.domain.push(v);
             } else if let Some(v) = strip_tag_arg(part, "regex:") {
-                cond.domain_regex.push(v);
+                target.domain_regex.push(v);
             }
         }
     }
@@ -1240,7 +1253,7 @@ fn normalize_geosite_code(code: &str) -> String {
 
 /// Dispatch `domain(...)` arguments to the correct condition fields.
 /// Supports `suffix:`, `keyword:`, `full:`, `regex:`, and `geosite:`.
-fn parse_domain_args(args: &[String], cond: &mut crate::routing::RoutingCondition) {
+fn parse_domain_args(args: &[String], cond: &mut crate::routing::ConditionFields<'_>) {
     for a in args {
         if let Some(v) = strip_tag_arg(a, "geosite:") {
             cond.geosite.push(normalize_geosite_code(&v));
@@ -1261,7 +1274,7 @@ fn parse_domain_args(args: &[String], cond: &mut crate::routing::RoutingConditio
 
 /// Dispatch `dip(...)` arguments to the correct condition fields.
 /// Supports `geoip:` and plain CIDRs.
-fn parse_ip_args(args: &[String], cond: &mut crate::routing::RoutingCondition) {
+fn parse_ip_args(args: &[String], cond: &mut crate::routing::ConditionFields<'_>) {
     for a in args {
         if let Some(v) = strip_tag_arg(a, "geoip:") {
             cond.geo_ip.push(normalize_geosite_code(&v));

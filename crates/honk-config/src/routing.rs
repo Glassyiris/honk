@@ -56,6 +56,101 @@ pub struct RoutingCondition {
     pub ip_version: Vec<String>,
     #[serde(default)]
     pub dscp: Vec<String>,
+    /// Negated matchers (dae `!matcher(...)`): a rule matches iff every
+    /// positive matcher matches and none of these do.
+    #[serde(default)]
+    pub not: RoutingNotCondition,
+}
+
+/// Negated matcher set of a routing rule, mirroring [`RoutingCondition`]
+/// field for field. Kept as a separate struct so existing serde configs
+/// without a `not` key keep parsing unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RoutingNotCondition {
+    #[serde(default)]
+    pub domain: Vec<String>,
+    #[serde(default)]
+    pub domain_suffix: Vec<String>,
+    #[serde(default)]
+    pub domain_keyword: Vec<String>,
+    #[serde(default)]
+    pub domain_regex: Vec<String>,
+    #[serde(default)]
+    pub ip: Vec<String>,
+    #[serde(default)]
+    pub source_ip: Vec<String>,
+    #[serde(default)]
+    pub port: Vec<String>,
+    #[serde(default)]
+    pub source_port: Vec<String>,
+    #[serde(default)]
+    pub protocol: Vec<String>,
+    #[serde(default)]
+    pub process_name: Vec<String>,
+    #[serde(default)]
+    pub mac: Vec<String>,
+    #[serde(default)]
+    pub geo_ip: Vec<String>,
+    #[serde(default)]
+    pub geosite: Vec<String>,
+    #[serde(default)]
+    pub ip_version: Vec<String>,
+    #[serde(default)]
+    pub dscp: Vec<String>,
+}
+
+/// Mutable view over one matcher field set. The dae parser dispatches each
+/// `&&` part into either the positive or the negated set through this view.
+pub(crate) struct ConditionFields<'a> {
+    pub domain: &'a mut Vec<String>,
+    pub domain_suffix: &'a mut Vec<String>,
+    pub domain_keyword: &'a mut Vec<String>,
+    pub domain_regex: &'a mut Vec<String>,
+    pub ip: &'a mut Vec<String>,
+    pub source_ip: &'a mut Vec<String>,
+    pub port: &'a mut Vec<String>,
+    pub source_port: &'a mut Vec<String>,
+    pub protocol: &'a mut Vec<String>,
+    pub process_name: &'a mut Vec<String>,
+    pub mac: &'a mut Vec<String>,
+    pub geo_ip: &'a mut Vec<String>,
+    pub geosite: &'a mut Vec<String>,
+    pub ip_version: &'a mut Vec<String>,
+    pub dscp: &'a mut Vec<String>,
+}
+
+macro_rules! fields_mut {
+    ($self:ident) => {
+        ConditionFields {
+            domain: &mut $self.domain,
+            domain_suffix: &mut $self.domain_suffix,
+            domain_keyword: &mut $self.domain_keyword,
+            domain_regex: &mut $self.domain_regex,
+            ip: &mut $self.ip,
+            source_ip: &mut $self.source_ip,
+            port: &mut $self.port,
+            source_port: &mut $self.source_port,
+            protocol: &mut $self.protocol,
+            process_name: &mut $self.process_name,
+            mac: &mut $self.mac,
+            geo_ip: &mut $self.geo_ip,
+            geosite: &mut $self.geosite,
+            ip_version: &mut $self.ip_version,
+            dscp: &mut $self.dscp,
+        }
+    };
+}
+
+impl RoutingCondition {
+    pub(crate) fn fields_mut(&mut self) -> ConditionFields<'_> {
+        fields_mut!(self)
+    }
+}
+
+impl RoutingNotCondition {
+    pub(crate) fn fields_mut(&mut self) -> ConditionFields<'_> {
+        fields_mut!(self)
+    }
 }
 
 impl RoutingCondition {
