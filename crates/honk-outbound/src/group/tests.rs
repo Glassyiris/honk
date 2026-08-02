@@ -581,6 +581,45 @@ fn test_loadbalance_round_robin_independent_per_group() {
 }
 
 #[test]
+fn loadbalance_tcp_and_udp_cursors_are_independent() {
+    let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let nodes = vec![make_node(a, "a"), make_node(b, "b")];
+    let manager = GroupManager::new(
+        &[make_group("lb", GroupPolicy::LoadBalance, vec![a, b])],
+        &nodes,
+    );
+
+    assert_eq!(
+        manager
+            .select_node_for_domain("lb", ProbeDomain::Tcp, IpVersion::V4)
+            .unwrap()
+            .name,
+        "a"
+    );
+    assert_eq!(
+        manager
+            .select_node_for_domain("lb", ProbeDomain::DataUdp, IpVersion::V4)
+            .unwrap()
+            .name,
+        "a"
+    );
+    assert_eq!(
+        manager
+            .select_node_for_domain("lb", ProbeDomain::Tcp, IpVersion::V4)
+            .unwrap()
+            .name,
+        "b"
+    );
+    assert_eq!(
+        manager
+            .select_node_for_domain("lb", ProbeDomain::DataUdp, IpVersion::V4)
+            .unwrap()
+            .name,
+        "b"
+    );
+}
+
+#[test]
 fn test_loadbalance_skips_dead_nodes() {
     let (n1, n2, n3) = (
         uuid::Uuid::new_v4(),
@@ -706,6 +745,32 @@ fn test_fallback_first_alive_switch_and_no_flap_back() {
     // Current pin dies again → re-evaluate declaration order → "a".
     alive.report_unavailable_forced("b", ProbeDomain::Tcp, IpVersion::V4);
     assert_eq!(m.select_node("fb").unwrap().name, "a");
+}
+
+#[test]
+fn fallback_tcp_and_udp_pins_are_independent() {
+    let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let nodes = vec![make_node(a, "a"), make_node(b, "b")];
+    let alive = Arc::new(AliveDialerSet::new());
+    let manager = GroupManager::with_alive_set(
+        &[make_group("fb", GroupPolicy::Fallback, vec![a, b])],
+        &nodes,
+        Some(alive.clone()),
+    );
+
+    assert_eq!(manager.select_node("fb").unwrap().name, "a");
+    for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
+        alive.report_unavailable_forced("a", domain, IpVersion::V4);
+    }
+    assert_eq!(
+        manager
+            .select_node_for_domain("fb", ProbeDomain::DataUdp, IpVersion::V4)
+            .unwrap()
+            .name,
+        "b"
+    );
+    assert_eq!(manager.select_node("fb").unwrap().name, "a");
+    assert_eq!(manager.get_fallback_selection("fb"), Some("a".into()));
 }
 
 #[test]
@@ -1640,7 +1705,10 @@ fn peek_selection_plan_does_not_update_urltest_or_fallback_after_death() {
         manager.get_urltest_selection_for_network("url", SelectionNetwork::Udp),
         Some("a".into())
     );
-    assert_eq!(manager.get_fallback_selection("fallback"), Some("a".into()));
+    assert_eq!(
+        manager.get_fallback_selection_for_network("fallback", SelectionNetwork::Udp),
+        Some("a".into())
+    );
     assert_eq!(interrupts.load(std::sync::atomic::Ordering::SeqCst), 0);
 
     for group in ["url", "fallback"] {
@@ -1656,7 +1724,10 @@ fn peek_selection_plan_does_not_update_urltest_or_fallback_after_death() {
         manager.get_urltest_selection_for_network("url", SelectionNetwork::Udp),
         Some("b".into())
     );
-    assert_eq!(manager.get_fallback_selection("fallback"), Some("b".into()));
+    assert_eq!(
+        manager.get_fallback_selection_for_network("fallback", SelectionNetwork::Udp),
+        Some("b".into())
+    );
     assert_eq!(interrupts.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 

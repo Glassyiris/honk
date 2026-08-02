@@ -43,7 +43,10 @@ impl GroupManager {
             urltest_cache: RwLock::new(HashMap::new()),
             lb_counters: groups
                 .iter()
-                .map(|g| (g.name.clone(), AtomicUsize::new(0)))
+                .flat_map(|g| {
+                    [SelectionNetwork::Tcp, SelectionNetwork::Udp]
+                        .map(move |network| ((g.name.clone(), network), AtomicUsize::new(0)))
+                })
                 .collect(),
             fallback_cache: RwLock::new(HashMap::new()),
             last_used: RwLock::new(HashMap::new()),
@@ -269,11 +272,11 @@ impl GroupManager {
             }
             GroupPolicy::LoadBalance => SelectionPlan {
                 mode: SelectionPlanMode::Authoritative,
-                nodes: vec![self.pick_load_balance(&candidates, group, effects)],
+                nodes: vec![self.pick_load_balance(&candidates, group, network, effects)],
             },
             GroupPolicy::Fallback => SelectionPlan {
                 mode: SelectionPlanMode::Authoritative,
-                nodes: vec![self.pick_fallback(&candidates, group, effects)],
+                nodes: vec![self.pick_fallback(&candidates, group, network, effects)],
             },
         }
     }
@@ -630,9 +633,20 @@ impl GroupManager {
             .map(|entry| entry.tag.clone())
     }
 
-    /// Get the current Fallback pinned member tag (for API/display).
+    /// Get the current TCP Fallback pinned member tag (for API/display).
     pub fn get_fallback_selection(&self, group_name: &str) -> Option<String> {
-        self.fallback_cache.read().get(group_name).cloned()
+        self.get_fallback_selection_for_network(group_name, SelectionNetwork::Tcp)
+    }
+
+    pub fn get_fallback_selection_for_network(
+        &self,
+        group_name: &str,
+        network: SelectionNetwork,
+    ) -> Option<String> {
+        self.fallback_cache
+            .read()
+            .get(&(group_name.to_string(), network))
+            .cloned()
     }
 
     /// Resolve a group to the single leaf node its policy selects.
@@ -656,8 +670,10 @@ impl GroupManager {
         Some(match group.policy {
             GroupPolicy::Selector => self.pick_selector(&candidates, group),
             GroupPolicy::URLTest => self.pick_urltest(&candidates, group, network, ipver, effects),
-            GroupPolicy::LoadBalance => self.pick_load_balance(&candidates, group, effects),
-            GroupPolicy::Fallback => self.pick_fallback(&candidates, group, effects),
+            GroupPolicy::LoadBalance => {
+                self.pick_load_balance(&candidates, group, network, effects)
+            }
+            GroupPolicy::Fallback => self.pick_fallback(&candidates, group, network, effects),
         })
     }
 
@@ -946,7 +962,7 @@ impl GroupManager {
 
     /// LoadBalance policy: round-robin over the alive candidates in member
     /// order. Dead members never enter `candidates`, so the rotation skips
-    /// them automatically. Each group's counter is independent
+    /// them automatically. Each group/network counter is independent
     /// (`lb_counters`), and the pick never fires the interrupt callback:
     /// rotation is per-connection by design, so there is no stable
     /// group-level selection whose change would justify closing every
@@ -957,9 +973,11 @@ impl GroupManager {
         &self,
         candidates: &[Candidate<'a>],
         group: &Group,
+        network: SelectionNetwork,
         effects: SelectionEffects,
     ) -> &'a Node {
-        let Some(counter) = self.lb_counters.get(&group.name) else {
+        let key = (group.name.clone(), network);
+        let Some(counter) = self.lb_counters.get(&key) else {
             return candidates[0].node;
         };
         let cursor = if effects.applies() {
@@ -983,18 +1001,20 @@ impl GroupManager {
         &self,
         candidates: &[Candidate<'a>],
         group: &Group,
+        network: SelectionNetwork,
         effects: SelectionEffects,
     ) -> &'a Node {
+        let key = (group.name.clone(), network);
         {
             let cache = self.fallback_cache.read();
-            if let Some(pinned) = cache.get(&group.name)
+            if let Some(pinned) = cache.get(&key)
                 && let Some(&c) = candidates.iter().find(|c| c.tag == pinned.as_str())
             {
                 return c.node;
             }
         }
         let first = candidates[0];
-        if effects.applies() && self.cache_fallback_selection(group, &first) {
+        if effects.applies() && self.cache_fallback_selection(group, network, &first) {
             self.maybe_interrupt(&group.name);
         }
         first.node
@@ -1004,13 +1024,19 @@ impl GroupManager {
     /// when the pin actually changed (the first-ever pin is not a change).
     /// The pin is by member tag — a sub-group stays pinned while it has
     /// any alive leaf to offer.
-    fn cache_fallback_selection(&self, group: &Group, candidate: &Candidate) -> bool {
+    fn cache_fallback_selection(
+        &self,
+        group: &Group,
+        network: SelectionNetwork,
+        candidate: &Candidate,
+    ) -> bool {
         let mut cache = self.fallback_cache.write();
+        let key = (group.name.clone(), network);
         let changed = cache
-            .get(&group.name)
+            .get(&key)
             .map(|old| old != candidate.tag)
             .unwrap_or(false);
-        cache.insert(group.name.clone(), candidate.tag.to_string());
+        cache.insert(key, candidate.tag.to_string());
         changed
     }
 

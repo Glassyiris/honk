@@ -168,15 +168,12 @@ pub struct GroupManager {
     alive_set: Option<Arc<AliveDialerSet>>,
     /// Per-group URLTest selection cache, split by network (TCP/UDP).
     urltest_cache: RwLock<HashMap<String, UrlTestSelections>>,
-    /// Per-group round-robin counters for the LoadBalance policy.
-    /// Built once at construction (the group set is immutable for the
-    /// manager's lifetime) so the hot path is a lock-free `fetch_add`.
-    /// Each group owns its counter — an earlier design shared one
-    /// counter across groups, which made rotation in one group skew
-    /// the pick in another.
-    lb_counters: HashMap<String, AtomicUsize>,
-    /// Per-group Fallback pinned member tag (sticky until it dies).
-    fallback_cache: RwLock<HashMap<String, String>>,
+    /// Per-group, per-network round-robin counters for LoadBalance. TCP and
+    /// UDP must not advance each other's sequence.
+    lb_counters: HashMap<(String, SelectionNetwork), AtomicUsize>,
+    /// Per-group, per-network Fallback pin. A TCP-alive/UDP-dead member must
+    /// not pin both traffic classes to the same leaf.
+    fallback_cache: RwLock<HashMap<(String, SelectionNetwork), String>>,
     /// Per-group last-used timestamp for idle timeout.
     last_used: RwLock<HashMap<String, Instant>>,
     /// Per-group selector choice (set via API, persisted by caller).
