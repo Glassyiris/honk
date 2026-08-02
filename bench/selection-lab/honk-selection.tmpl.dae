@@ -1,0 +1,49 @@
+global {
+    wan_interface: ens3
+    lan_interface: veth-lab
+    log_level: info
+    dial_mode: ip
+    allow_insecure: true
+    auto_config_kernel_parameter: true
+    tcp_check_url: 'http://10.10.10.70/'
+    tcp_check_http_method: HEAD
+    udp_check_dns: '10.10.10.70:15353'
+    check_interval: 3s
+    check_tolerance: 50ms
+}
+
+node {
+    relay-a: 'socks5://10.10.10.70:12001'
+    relay-b: 'socks5://10.10.10.70:12002'
+    relay-c: 'socks5://10.10.10.70:12003'
+}
+
+group {
+    proxy {
+        filter: name(keyword: 'relay')
+        policy: __POLICY__
+    }
+}
+
+routing {
+    dport(12001, 12002, 12003) -> direct(must)
+    dport(9001, 9002, 9003) -> proxy
+    fallback: direct
+}
+
+dns {
+    upstream {
+        alidns: 'udp://223.5.5.5:53'
+    }
+    routing {
+        request {
+            fallback: alidns
+        }
+    }
+}
+
+experimental {
+    clash_api {
+        external_controller: '127.0.0.1:9090'
+    }
+}
