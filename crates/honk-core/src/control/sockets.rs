@@ -88,6 +88,12 @@ fn build_tproxy_tcp(addr: SocketAddr) -> anyhow::Result<TcpListener> {
         }
     }
 
+    // Same identification mark as the UDP listeners: established-flow TCP
+    // probes must not mistake the TPROXY listener for a local service.
+    // Accepted sockets inherit the mark; the accept loop clears it.
+    #[cfg(target_os = "linux")]
+    set_so_mark(socket.as_raw_fd(), honk_ebpf_common::DAE_BYPASS_MARK)?;
+
     socket.bind(&addr.into())?;
     socket.listen(128)?;
 
@@ -97,24 +103,33 @@ fn build_tproxy_tcp(addr: SocketAddr) -> anyhow::Result<TcpListener> {
 /// Clear the packet mark on a socket so that locally generated replies are
 /// routed through the ordinary routing table, not the TPROXY policy route.
 pub(super) fn set_so_mark_zero(fd: RawFd) -> io::Result<()> {
-    #[cfg(target_os = "linux")]
+    set_so_mark(fd, 0)
+}
+
+/// Set SO_MARK on a socket. TPROXY listeners carry `DAE_BYPASS_MARK` so the
+/// eBPF NAT-loopback probe (`bpf_sock_is_dae_socket`, which compares against
+/// `PARAM.dae_socket_mark`) recognizes them as proxy-engine sockets instead
+/// of misreading them as local services to pass through.
+#[cfg(target_os = "linux")]
+pub(super) fn set_so_mark(fd: RawFd, mark: u32) -> io::Result<()> {
     unsafe {
-        let zero: libc::c_uint = 0;
+        let mark: libc::c_uint = mark;
         let ret = libc::setsockopt(
             fd,
             libc::SOL_SOCKET,
             libc::SO_MARK,
-            &zero as *const _ as *const libc::c_void,
-            std::mem::size_of_val(&zero) as libc::socklen_t,
+            &mark as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&mark) as libc::socklen_t,
         );
         if ret != 0 {
             return Err(io::Error::last_os_error());
         }
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = fd;
-    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn set_so_mark(_fd: RawFd, _mark: u32) -> io::Result<()> {
     Ok(())
 }
 
@@ -265,10 +280,11 @@ fn build_tproxy_udp(addr: SocketAddr, reuse_port: bool) -> anyhow::Result<UdpSoc
                 );
             }
         }
-        // SO_MARK is intentionally not set here because the UDP listener does
-        // not need a routing mark.  Clear it explicitly in case the underlying
-        // socket inherited a mark from a previous binding.
-        set_so_mark_zero(socket.as_raw_fd())?;
+        // The listener never originates replies (those go through dedicated
+        // reply sockets), so the mark costs nothing; it is what lets the
+        // eBPF NAT-loopback UDP probe tell this socket apart from a local
+        // service (an unmarked listener would be passed through directly).
+        set_so_mark(socket.as_raw_fd(), honk_ebpf_common::DAE_BYPASS_MARK)?;
     }
 
     socket.bind(&addr.into())?;
