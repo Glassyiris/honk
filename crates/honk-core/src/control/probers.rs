@@ -80,11 +80,14 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                 .await
                 .map_err(|e| format!("dial failed: {}", e))?;
 
-            let elapsed = start.elapsed();
-
             // Send HTTP request over the proxy connection.
             Self::http_check(proxy.stream, &check_url, &check_method).await?;
 
+            // Measure the full request round trip, not just the dial: mux
+            // protocols (AnyTLS, h2mux, QUIC tunnels) open a stream on an
+            // already-warm session, so a dial-only measurement reports ~0ms
+            // for every such node and makes URLTest ranking meaningless.
+            let elapsed = start.elapsed();
             Ok(elapsed)
         })
     }
