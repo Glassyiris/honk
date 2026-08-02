@@ -77,9 +77,12 @@ where
     S: tracing::Subscriber,
 {
     fn enabled(&self, _metadata: &tracing::Metadata<'_>, _ctx: Context<'_, S>) -> bool {
-        // This prevents this otherwise-unfiltered layer from expressing
-        // debug/trace interest while the Clash endpoint has no consumer.
-        self.tx.receiver_count() != 0
+        // Must stay unconditionally true: `Layered::enabled` short-circuits
+        // the whole stack when any layer answers false, so gating on the
+        // subscriber count here would silence every other layer (console
+        // fmt output included) whenever no `/logs` client is attached. The
+        // formatting skip lives in `on_event` below.
+        true
     }
 
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
