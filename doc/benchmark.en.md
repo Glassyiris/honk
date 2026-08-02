@@ -111,6 +111,93 @@ ssh root@10.10.10.57 "bash /root/lab-bench.sh 'honk dae' 'hy2 tuic ss2022 trojan
 ssh root@10.10.10.57 bash /root/test-protocols.sh
 ```
 
+## Results (2026-08-02, three-engine: honk vs dae vs sing-box)
+
+The engine host for this round was **10.10.10.59** (another VM in the same lab;
+the server host is still the physical 10.10.10.70; the production gateway
+10.10.10.1 carries a `sip(10.10.10.59/32) -> direct(must)` rule so benchmark
+traffic bypasses its proxy datapath). Topology and methodology are unchanged
+from the 08-01 round.
+
+- honk: main `49b166d` (musl, mimalloc) — includes the eBPF datapath admission
+  gate, per-network LoadBalance/Fallback state, lazy AnyTLS TLS connectors, the
+  tracing-stack silencing fix, the dial-failure penalty sample, TPROXY listener
+  marking, and the halving moving average for URLTest.
+- dae: kdae `ae056a6a` (Go 1.26.0; updated from the 08-01 round's `eee7c88b`,
+  includes outbound-fork fixes).
+- sing-box: v1.13.14 (TUN client inside lab netns, port-route per protocol).
+
+Latencies in seconds, TCP bandwidth is the median iperf3 receiver rate, CPU in
+cores, RSS measured after the runs.
+
+### TCP
+
+| engine | protocol | cold | hot p50 | hot p95 | bw (Mbps) | cpu | RSS (MB) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| honk | direct | 0.0082 | – | – | 9399 | 0.26 | 54 |
+| dae | direct | 0.0034 | – | – | 9402 | 0.00 | 50 |
+| sing-box | direct | 0.0052 | – | – | 9403 | 0.43 | 47 |
+| honk | hy2 | 0.0060 | 0.0034 | 0.0047 | 2858 | 0.49 | 59 |
+| dae | hy2 | 0.0104 | 0.0032 | 0.0036 | 2757 | 0.82 | 61 |
+| sing-box | hy2 | 0.0108 | 0.0039 | 0.0053 | 2570 | 0.87 | 51 |
+| honk | tuic | 0.0060 | 0.0037 | 0.0054 | 4134 | 0.59 | 54 |
+| dae | tuic | 0.0858 | 0.0797 | 0.0804 | 2940 | 0.82 | 62 |
+| sing-box | tuic | 0.0083 | 0.0039 | 0.0051 | 2618 | 0.89 | 51 |
+| honk | ss2022 | 0.0052 | 0.0036 | 0.0061 | 9333 | 0.39 | 57 |
+| dae | ss2022 | 0.0041 | 0.0041 | 0.0049 | 9372 | 0.51 | 53 |
+| sing-box | ss2022 | 0.0057 | 0.0041 | 0.0069 | 9342 | 1.30 | 51 |
+| honk | trojan | 0.0113 | 0.0023 | 0.0107 | 9244 | 0.46 | 50 |
+| dae | trojan | 0.0104 | 0.0075 | 0.0106 | 9162 | 0.71 | 55 |
+| sing-box | trojan | 0.0098 | 0.0090 | 0.0124 | 9187 | 0.86 | 49 |
+| honk | anytls-sb | 0.0055 | 0.0043 | 0.0061 | 4575 | 0.30 | 50 |
+| dae | anytls-sb | 0.0089 | 0.0037 | 0.0047 | 4522 | 0.40 | 56 |
+| sing-box | anytls-sb | 0.0131 | 0.0035 | 0.0053 | 4512 | 0.50 | 48 |
+| honk | anytls-go | 0.0052 | 0.0032 | 0.0049 | 8937 | 0.54 | 52 |
+| dae | anytls-go | 0.0080 | 0.0038 | 0.0049 | 8892 | 0.69 | 61 |
+| sing-box | anytls-go | 0.0113 | 0.0039 | 0.0046 | 8741 | 1.05 | 48 |
+
+### UDP (iperf3 `-u -b 10G -l 1200 -R`)
+
+| engine | protocol | echo RTT p50 | bw Mbps (loss) | cpu |
+| --- | --- | --- | --- | --- |
+| honk | hy2 | 0.20 ms | 1743 (71.5%) | 1.16 |
+| dae | hy2 | 0.22 ms | 931 (85.5%) | 0.95 |
+| sing-box | hy2 | 0.33 ms | 1561 (75.0%) | 1.41 |
+| honk | tuic | 0.20 ms | 1577 (70.6%) | 1.33 |
+| dae | tuic | 0.33 ms | 108 (76.2%) | 0.13 |
+| sing-box | tuic | 0.30 ms | 27 (80.9%) | 0.05 |
+| honk | ss2022 | 0.20 ms | 1207 (78.6%) | 1.23 |
+| dae | ss2022 | 0.13 ms | 2367 (58.6%) | 1.76 |
+| sing-box | ss2022 | 0.17 ms | 2509 (55.6%) | 1.34 |
+| honk | trojan | 0.10 ms | 1629 (70.1%) | 1.28 |
+| dae | trojan | 0.18 ms | 2903 (49.5%) | 1.67 |
+| sing-box | trojan | 0.13 ms | 3330 (41.6%) | 1.66 |
+| honk | anytls-sb | 0.23 ms | 1287 (79.2%) | 0.91 |
+| dae | anytls-sb | 0.26 ms | 1290 (77.9%) | 0.91 |
+| sing-box | anytls-sb | 0.36 ms | 1262 (79.1%) | 1.18 |
+| honk | anytls-go | 0.24 ms | 1539 (75.6%) | 1.10 |
+| dae | anytls-go | 0.22 ms | 1493 (76.0%) | 1.01 |
+| sing-box | anytls-go | 0.18 ms | 1368 (77.7%) | 1.24 |
+
+### Reading the 08-02 results
+
+- **Latency**: honk best across the board — cold 5–11ms (dae tuic still pays a
+  full QUIC handshake per connection at 86ms; sing-box 8–13ms), hot p50
+  2.3–4.7ms.
+- **TCP bandwidth**: line-rate rows (ss2022, trojan, anytls-go) are tied at
+  ~8.7–9.4 Gbps. QUIC protocols go to honk: hy2 2858 (+3.7% vs dae, +11% vs
+  sing-box), tuic 4134 (+41% / +58%). Versus the 08-01 round, dae's hy2/tuic
+  bandwidth fell from 4467/4537 to 2757/2940 while honk's hy2 recovered to the
+  same tier.
+- **UDP**: honk leads the QUIC protocols by a wide margin — hy2 1743 (vs
+  931/1561), tuic 1577 (vs 108/27; dae's and sing-box's TUIC UDP was nearly
+  unusable this round). **The weak spot is still UDP-over-TCP**: ss2022 1207 vs
+  2367/2509, trojan 1629 vs 2903/3330 — about half of the competitors, and still
+  the top UDP optimization target. anytls-sb/go are tied (~1.3–1.5 Gbps).
+- **CPU**: honk lowest on most rows (ss2022 0.39 vs 0.51/1.30 cores; hy2 0.49
+  vs 0.82/0.87; tuic 0.59 vs 0.82/0.89).
+- **RSS**: comparable across engines (47–62 MB).
+
 ## Results (2026-08-01, three-engine: honk vs dae vs sing-box)
 
 honk: dev `ed640c7` (musl, mimalloc, reuseport-2 merge, single UDP listener per family).

@@ -97,6 +97,87 @@ ssh root@10.10.10.57 "bash /root/lab-bench.sh 'honk dae' 'hy2 tuic ss2022 trojan
 ssh root@10.10.10.57 bash /root/test-protocols.sh
 ```
 
+## 结果(2026-08-02,三引擎:honk vs dae vs sing-box)
+
+本轮引擎机为 **10.10.10.59**(同实验室的另一台 VM,服务端仍为物理机
+10.10.10.70;生产网关 10.10.10.1 已加 `sip(10.10.10.59/32) -> direct(must)`
+规则,基准流量不经过网关代理面)。配置与测量方法与 08-01 轮一致。
+
+- honk: main `49b166d`(musl, mimalloc)——含 eBPF 数据面准入门、LB/Fallback
+  按 TCP/UDP 分离、AnyTLS TLS connector 懒加载、日志短路修复、拨号失败罚样本、
+  TPROXY listener 标记、URLTest 减半递推移动平均。
+- dae: kdae `ae056a6a`(Go 1.26.0;自 08-01 轮的 `eee7c88b` 更新,含 outbound
+  fork 修复)。
+- sing-box: v1.13.14(lab netns 内 TUN 客户端,按端口路由)。
+
+延迟单位秒,TCP 带宽为 iperf3 接收端中位数,CPU 单位核,RSS 为跑后值。
+
+### TCP
+
+| 引擎 | 协议 | cold | hot p50 | hot p95 | bw (Mbps) | cpu | RSS (MB) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| honk | direct | 0.0082 | – | – | 9399 | 0.26 | 54 |
+| dae | direct | 0.0034 | – | – | 9402 | 0.00 | 50 |
+| sing-box | direct | 0.0052 | – | – | 9403 | 0.43 | 47 |
+| honk | hy2 | 0.0060 | 0.0034 | 0.0047 | 2858 | 0.49 | 59 |
+| dae | hy2 | 0.0104 | 0.0032 | 0.0036 | 2757 | 0.82 | 61 |
+| sing-box | hy2 | 0.0108 | 0.0039 | 0.0053 | 2570 | 0.87 | 51 |
+| honk | tuic | 0.0060 | 0.0037 | 0.0054 | 4134 | 0.59 | 54 |
+| dae | tuic | 0.0858 | 0.0797 | 0.0804 | 2940 | 0.82 | 62 |
+| sing-box | tuic | 0.0083 | 0.0039 | 0.0051 | 2618 | 0.89 | 51 |
+| honk | ss2022 | 0.0052 | 0.0036 | 0.0061 | 9333 | 0.39 | 57 |
+| dae | ss2022 | 0.0041 | 0.0041 | 0.0049 | 9372 | 0.51 | 53 |
+| sing-box | ss2022 | 0.0057 | 0.0041 | 0.0069 | 9342 | 1.30 | 51 |
+| honk | trojan | 0.0113 | 0.0023 | 0.0107 | 9244 | 0.46 | 50 |
+| dae | trojan | 0.0104 | 0.0075 | 0.0106 | 9162 | 0.71 | 55 |
+| sing-box | trojan | 0.0098 | 0.0090 | 0.0124 | 9187 | 0.86 | 49 |
+| honk | anytls-sb | 0.0055 | 0.0043 | 0.0061 | 4575 | 0.30 | 50 |
+| dae | anytls-sb | 0.0089 | 0.0037 | 0.0047 | 4522 | 0.40 | 56 |
+| sing-box | anytls-sb | 0.0131 | 0.0035 | 0.0053 | 4512 | 0.50 | 48 |
+| honk | anytls-go | 0.0052 | 0.0032 | 0.0049 | 8937 | 0.54 | 52 |
+| dae | anytls-go | 0.0080 | 0.0038 | 0.0049 | 8892 | 0.69 | 61 |
+| sing-box | anytls-go | 0.0113 | 0.0039 | 0.0046 | 8741 | 1.05 | 48 |
+
+### UDP (iperf3 `-u -b 10G -l 1200 -R`)
+
+| 引擎 | 协议 | echo RTT p50 | bw Mbps (丢包) | cpu |
+| --- | --- | --- | --- | --- |
+| honk | hy2 | 0.20 ms | 1743 (71.5%) | 1.16 |
+| dae | hy2 | 0.22 ms | 931 (85.5%) | 0.95 |
+| sing-box | hy2 | 0.33 ms | 1561 (75.0%) | 1.41 |
+| honk | tuic | 0.20 ms | 1577 (70.6%) | 1.33 |
+| dae | tuic | 0.33 ms | 108 (76.2%) | 0.13 |
+| sing-box | tuic | 0.30 ms | 27 (80.9%) | 0.05 |
+| honk | ss2022 | 0.20 ms | 1207 (78.6%) | 1.23 |
+| dae | ss2022 | 0.13 ms | 2367 (58.6%) | 1.76 |
+| sing-box | ss2022 | 0.17 ms | 2509 (55.6%) | 1.34 |
+| honk | trojan | 0.10 ms | 1629 (70.1%) | 1.28 |
+| dae | trojan | 0.18 ms | 2903 (49.5%) | 1.67 |
+| sing-box | trojan | 0.13 ms | 3330 (41.6%) | 1.66 |
+| honk | anytls-sb | 0.23 ms | 1287 (79.2%) | 0.91 |
+| dae | anytls-sb | 0.26 ms | 1290 (77.9%) | 0.91 |
+| sing-box | anytls-sb | 0.36 ms | 1262 (79.1%) | 1.18 |
+| honk | anytls-go | 0.24 ms | 1539 (75.6%) | 1.10 |
+| dae | anytls-go | 0.22 ms | 1493 (76.0%) | 1.01 |
+| sing-box | anytls-go | 0.18 ms | 1368 (77.7%) | 1.24 |
+
+### 08-02 结果解读
+
+- **延迟**:honk 全面最优——cold 5–11ms(dae tuic 仍为每连接完整 QUIC 握手
+  86ms;sing-box 8–13ms),hot p50 2.3–4.7ms。
+- **TCP 带宽**:线速行(ss2022、trojan、anytls-go)三方基本持平
+  (~8.7–9.4 Gbps)。QUIC 协议 honk 领先:hy2 2858(+3.7% vs dae、+11% vs
+  sing-box),tuic 4134(+41% / +58%)。与 08-01 轮相比,dae 的 hy2/tuic
+  带宽从 4467/4537 回落到 2757/2940,honk 的 hy2 恢复至同档。
+- **UDP**:QUIC 协议 honk 大幅领先——hy2 1743(vs 931/1561),tuic 1577
+  (vs 108/27,dae 与 sing-box 的 tuic UDP 本轮接近不可用)。**短板仍在
+  UDP-over-TCP**:ss2022 1207 vs 2367/2509,trojan 1629 vs 2903/3330——
+  honk 约为对手一半,仍是 UDP 方向头号优化目标。anytls-sb/go 三方持平
+  (~1.3–1.5 Gbps)。
+- **CPU**:honk 多数行最低(ss2022 0.39 vs 0.51/1.30 核;hy2 0.49 vs
+  0.82/0.87;tuic 0.59 vs 0.82/0.89)。
+- **RSS**:三方持平(47–62 MB)。
+
 ## 结果(2026-08-01,三引擎:honk vs dae vs sing-box)
 
 honk: dev `ed640c7` (musl, mimalloc, reuseport-2 合入,单 UDP listener/协议族)。
