@@ -91,12 +91,13 @@ impl ControlPlane {
                 return;
             }
         };
+        let old_group_manager = self.group_manager.read().clone();
         let new_group_manager = Arc::new(GroupManager::with_alive_set(
             &new_config.groups,
             &new_config.nodes,
             Some(Arc::clone(&self.alive_set)),
         ));
-        new_group_manager.migrate_selector_choices_from(&self.group_manager.read());
+        new_group_manager.migrate_selector_choices_from(&old_group_manager);
         // Build the outbound generation before DNS so every new runtime
         // snapshot captures its own immutable node/session ownership.
         let new_runtime_registry = Arc::new(
@@ -134,6 +135,10 @@ impl ControlPlane {
             }
         };
         let new_outbound_id_map = build_outbound_id_map(&new_config);
+        let old_connectivity =
+            group_connectivity_snapshot(&current_config, &old_group_manager, &self.alive_set);
+        let new_connectivity =
+            group_connectivity_snapshot(&new_config, &new_group_manager, &self.alive_set);
         let bootstrap = new_config.global.bootstrap_resolver.clone();
         let direct_target = super::direct_check_addr(&bootstrap);
         let direct_target_socket = match direct_target.parse() {
@@ -221,6 +226,13 @@ impl ControlPlane {
             let provider = self.dns_controller.runtime_provider();
             let publication = provider.prepare_publication(new_runtime);
 
+            let transition_group_count = current_config.groups.len().max(new_config.groups.len());
+            if let Err(error) = open_group_connectivity(ebpf.as_mut(), transition_group_count) {
+                let restore = publish_group_connectivity(ebpf.as_mut(), &old_connectivity);
+                error!(%error, ?restore, "Failed to open group connectivity for reload transition");
+                self.stop_reload_rejection_if_healthy(drain);
+                return;
+            }
             let active_generation = match ebpf.active_routing_generation() {
                 Ok(generation) => generation,
                 Err(error) => {
@@ -234,7 +246,8 @@ impl ControlPlane {
             if let Err(error) =
                 ebpf.stage_domain_routing_generation(next_generation, &new_domain_routes)
             {
-                error!(%error, "Failed to stage learned domain routes");
+                let restore = publish_group_connectivity(ebpf.as_mut(), &old_connectivity);
+                error!(%error, ?restore, "Failed to stage learned domain routes");
                 self.stop_reload_rejection_if_healthy(drain);
                 return;
             }
@@ -252,7 +265,8 @@ impl ControlPlane {
                             &old_plan,
                         )
                         .map(|_| ())
-                    });
+                    })
+                    .and_then(|_| publish_group_connectivity(ebpf.as_mut(), &old_connectivity));
                 match replay {
                     Ok(()) => {
                         error!(
@@ -275,6 +289,12 @@ impl ControlPlane {
                 return;
             }
 
+            if let Err(error) = publish_group_connectivity(ebpf.as_mut(), &new_connectivity) {
+                warn!(
+                    %error,
+                    "Failed to publish exact group connectivity after reload; remaining slots stay fail-open"
+                );
+            }
             let old_registry =
                 std::mem::replace(&mut *runtime_guard, Arc::clone(&new_runtime_registry));
             publication.commit();
@@ -841,6 +861,58 @@ pub(super) fn build_outbound_id_map(config: &Config) -> std::collections::HashMa
     map
 }
 
+type GroupConnectivity = (u8, u32, u32, bool);
+
+fn group_connectivity_snapshot(
+    config: &Config,
+    group_manager: &GroupManager,
+    alive_set: &crate::outbound::AliveDialerSet,
+) -> Vec<GroupConnectivity> {
+    let mut snapshot = Vec::with_capacity(config.groups.len() * 6);
+    for (index, group) in config.groups.iter().enumerate() {
+        let outbound = OutboundIndex::UserBase as u8 + index as u8;
+        let leaves = group_manager.leaf_node_names_in_group(&group.name);
+        for (domain_index, domain) in [ProbeDomain::Tcp, ProbeDomain::DnsUdp, ProbeDomain::DataUdp]
+            .into_iter()
+            .enumerate()
+        {
+            for (ip_index, ipver) in [IpVersion::V4, IpVersion::V6].into_iter().enumerate() {
+                let any_alive = leaves
+                    .iter()
+                    .any(|node| alive_set.is_alive_for(node, domain, ipver));
+                snapshot.push((outbound, domain_index as u32, ip_index as u32, any_alive));
+            }
+        }
+    }
+    snapshot
+}
+
+fn publish_group_connectivity(
+    ebpf: &mut dyn EbpfBackend,
+    snapshot: &[GroupConnectivity],
+) -> anyhow::Result<()> {
+    for &(outbound, domain, ipver, alive) in snapshot {
+        ebpf.set_outbound_alive(outbound, domain, ipver, alive)?;
+    }
+    Ok(())
+}
+
+fn open_group_connectivity(ebpf: &mut dyn EbpfBackend, group_count: usize) -> anyhow::Result<()> {
+    for index in 0..group_count {
+        let offset = u8::try_from(index)
+            .map_err(|_| anyhow::anyhow!("too many outbound groups: {group_count}"))?;
+        let outbound = (OutboundIndex::UserBase as u8)
+            .checked_add(offset)
+            .ok_or_else(|| anyhow::anyhow!("too many outbound groups: {group_count}"))?;
+        for domain in 0..3 {
+            for ipver in 0..2 {
+                ebpf.set_outbound_alive(outbound, domain, ipver, true)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn resolve_outbound_nodes(
     config: &Config,
     group_manager: &GroupManager,
@@ -1159,6 +1231,60 @@ mod atomic_reload_tests {
         dns::forwarder::DnsForwarder::new(upstream_pool, cache, router)
             .with_cache_enabled(false)
             .into()
+    }
+    #[test]
+    fn group_connectivity_follows_reordered_outbound_ids() {
+        let a = Node {
+            id: uuid::Uuid::new_v4(),
+            name: "a".into(),
+            ..Default::default()
+        };
+        let b = Node {
+            id: uuid::Uuid::new_v4(),
+            name: "b".into(),
+            ..Default::default()
+        };
+        let group = |name: &str, node: &Node| Group {
+            name: name.into(),
+            policy: GroupPolicy::Selector,
+            nodes: vec![node.id],
+            ..Default::default()
+        };
+        let mut config = Config {
+            nodes: vec![a.clone(), b.clone()],
+            groups: vec![group("ga", &a), group("gb", &b)],
+            ..Default::default()
+        };
+        let alive = Arc::new(crate::outbound::AliveDialerSet::new());
+        alive.report_unavailable_forced(&a.name, ProbeDomain::DataUdp, IpVersion::V4);
+
+        let original_manager =
+            GroupManager::with_alive_set(&config.groups, &config.nodes, Some(Arc::clone(&alive)));
+        let original = group_connectivity_snapshot(&config, &original_manager, &alive);
+        assert!(original.contains(&(OutboundIndex::UserBase as u8, 2, 0, false)));
+        assert!(original.contains(&(OutboundIndex::UserBase as u8 + 1, 2, 0, true)));
+
+        config.groups.swap(0, 1);
+        let reordered_manager =
+            GroupManager::with_alive_set(&config.groups, &config.nodes, Some(Arc::clone(&alive)));
+        let reordered = group_connectivity_snapshot(&config, &reordered_manager, &alive);
+        assert!(reordered.contains(&(OutboundIndex::UserBase as u8, 2, 0, true)));
+        assert!(reordered.contains(&(OutboundIndex::UserBase as u8 + 1, 2, 0, false)));
+
+        let mut backend = MockEbpfBackend::new();
+        publish_group_connectivity(&mut backend, &original).unwrap();
+        open_group_connectivity(&mut backend, 2).unwrap();
+        assert!(
+            backend
+                .get_outbound_alive(OutboundIndex::UserBase as u8 + 1, 2, 0)
+                .unwrap()
+        );
+        publish_group_connectivity(&mut backend, &reordered).unwrap();
+        assert!(
+            !backend
+                .get_outbound_alive(OutboundIndex::UserBase as u8 + 1, 2, 0)
+                .unwrap()
+        );
     }
 
     fn test_cp() -> ControlPlane {
@@ -1783,7 +1909,10 @@ mod atomic_reload_tests {
         );
         assert!(alive.is_urltest_group_idle("cold-urltest"));
         assert_eq!(
-            manager.get_fallback_selection("fallback"),
+            manager.get_fallback_selection_for_network(
+                "fallback",
+                crate::group::SelectionNetwork::Udp,
+            ),
             Some("fallback-a".into())
         );
         assert_eq!(interrupts.load(std::sync::atomic::Ordering::SeqCst), 0);
