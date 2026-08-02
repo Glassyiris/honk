@@ -163,6 +163,11 @@ pub trait EbpfBackend: Send + Sync {
     fn attach_dae0_programs(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
+    /// Open or close admission at the TC entry points. Implementations must
+    /// publish listener sockets before setting this to `true`.
+    fn set_datapath_ready(&mut self, _ready: bool) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     /// Attach the dae0peer_ingress TC program after dae0peer has been moved
     /// into the isolated daens namespace.  The attach runs inside a scoped

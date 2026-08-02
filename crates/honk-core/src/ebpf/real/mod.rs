@@ -70,6 +70,7 @@ pub struct RealEbpfBackend {
     dae0_ingress_link: Option<aya::programs::tc::SchedClassifierLink>,
     dae0peer_ingress_link: Option<aya::programs::tc::SchedClassifierLink>,
     sk_lookup_link: Option<aya::programs::sk_lookup::SkLookupLink>,
+    listeners_published: bool,
     /// Background task that flushes aya-log ring-buffer records.
     log_flush_handle: Option<tokio::task::JoinHandle<()>>,
     /// Background task that drains EVENT_RINGBUF (DaeEvent) into the log.
@@ -378,6 +379,13 @@ impl EbpfBackend for RealEbpfBackend {
         // Dropping the links detaches nothing (the device is already gone);
         // it only releases the fds and the dedup state.
         self.dynamic_links.retain(|(i, _, _)| *i != ifindex);
+    }
+
+    fn set_datapath_ready(&mut self, ready: bool) -> anyhow::Result<()> {
+        if ready && !self.listeners_published {
+            anyhow::bail!("listener socket generation is not fully published");
+        }
+        self.array_set("DATAPATH_STATE_MAP", 0, &u32::from(ready))
     }
 
     fn set_param(&mut self, _key: ParamKey, _value: u32) -> anyhow::Result<()> {
@@ -1205,6 +1213,7 @@ impl EbpfBackend for RealEbpfBackend {
         udp4_fds: &[RawFd],
         udp6_fds: &[RawFd],
     ) -> anyhow::Result<()> {
+        self.listeners_published = false;
         // Publish the listener FDs so the sk_lookup/dae0peer programs can
         // `bpf_sk_assign` proxy-bound flows. Key mapping: 0=tcp4, 1=tcp6,
         // 2..=UDP4 group, 2+4..=UDP6 group (see sk_lookup.rs). The programs
@@ -1232,6 +1241,7 @@ impl EbpfBackend for RealEbpfBackend {
                 fd, key
             );
         }
+        self.listeners_published = true;
         Ok(())
     }
 

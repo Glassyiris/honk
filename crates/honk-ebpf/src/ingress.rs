@@ -238,6 +238,9 @@ fn wan_outbound_is_alive(ctx: &TcContext, outbound: u8, l4proto: u8, dport: u16)
 // with 256B baseline stays under the 512B BPF stack limit.
 #[inline(never)]
 fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
+    if !crate::maps::datapath_ready() {
+        return Err(TC_ACT_OK);
+    }
     // Userspace attaches lan_ingress to both the bridge master and every
     // bridge slave, so a forwarded packet can traverse this program twice.
     // The first pass tags pass-through packets with CLASSIFIED_MARK; pass

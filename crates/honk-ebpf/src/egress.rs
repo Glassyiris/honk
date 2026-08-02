@@ -832,6 +832,9 @@ fn do_tproxy_wan_egress_udp(
 /// to the TCP or UDP handler.
 #[inline(always)]
 fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
+    if !crate::maps::datapath_ready() {
+        return Err(TC_ACT_OK);
+    }
     let scratch_key: u32 = 0;
     let pkt = match unsafe { PKT_SCRATCH_KEY.get_ptr_mut(scratch_key) } {
         Some(ptr) => unsafe { &mut *ptr },

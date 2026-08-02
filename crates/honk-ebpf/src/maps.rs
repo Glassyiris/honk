@@ -59,6 +59,14 @@ pub static OUTBOUND_CONNECTIVITY_MAP: Array<u64, 1536, 0> = Array::new();
 pub static LISTEN_SOCKET_MAP: SockMap<16> = SockMap::new();
 
 #[btf_map]
+pub static DATAPATH_STATE_MAP: Array<u32, 1, 0> = Array::new();
+
+#[inline(always)]
+pub fn datapath_ready() -> bool {
+    DATAPATH_STATE_MAP.get(0).is_some_and(|ready| *ready != 0)
+}
+
+#[btf_map]
 /// Plain hash with BPF_F_NO_PREALLOC: kernel memory scales with live
 /// entries instead of locking max_entries up front (~8 MB empty instead of
 /// ~8 MB per 64K capacity).  Eviction is owned by the userspace janitor

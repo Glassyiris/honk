@@ -591,6 +591,7 @@ impl RealEbpfBackend {
             dae0_ingress_link: None,
             dae0peer_ingress_link: None,
             sk_lookup_link: None,
+            listeners_published: false,
             log_flush_handle,
             event_flush_handle,
             cap_lookup_and_delete: BatchCapability::new(),

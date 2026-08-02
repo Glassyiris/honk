@@ -1004,6 +1004,13 @@ impl ControlPlane {
         let warm_generation = self.runtime_registry.read().clone();
         self.start_udp_warm_coordinator(warm_generation).await;
 
+        {
+            let mut ebpf = self.ebpf.write().await;
+            ebpf.set_datapath_ready(true)
+                .map_err(|error| anyhow::anyhow!("open eBPF datapath admission: {error}"))?;
+        }
+        info!("eBPF datapath admission opened after listener publication");
+
         let mut rx = self.command_rx.take().expect("command_rx already taken");
         let drain = self.drain_tracker.clone();
         let ebpf = self.ebpf.clone();
@@ -1138,6 +1145,9 @@ impl ControlPlane {
                         Some(ControlCommand::Shutdown) | None => {
                             info!("Control plane shutting down, draining {} active connections",
                                 drain.active_count());
+                            if let Err(error) = ebpf.write().await.set_datapath_ready(false) {
+                                warn!(%error, "failed to close eBPF datapath admission");
+                            }
                             drain.start_rejecting();
                             self.stop_udp_warm_coordinator().await;
                             if !self.udp_pool.shutdown().await {

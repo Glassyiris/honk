@@ -162,6 +162,9 @@ pub struct MockEbpfBackend {
     pub outbound_alive: HashMap<u32, u32>,
     /// BPF statistics overflow counters
     pub bpf_stats: HashMap<u32, u64>,
+    /// Whether TC entry points may redirect traffic into the control plane.
+    pub datapath_ready: bool,
+    pub listener_sockets_published: bool,
     pub routing_meta_write_order: Vec<u32>,
     routing_fault: Option<(RoutingPushPhase, usize)>,
     #[cfg(test)]
@@ -465,6 +468,25 @@ impl EbpfBackend for MockEbpfBackend {
     fn clear_projection_write_log(&mut self) {
         self.projection_writes.clear();
     }
+    fn publish_listener_sockets(
+        &mut self,
+        _tcp4_fd: std::os::fd::RawFd,
+        _tcp6_fd: std::os::fd::RawFd,
+        _udp4_fds: &[std::os::fd::RawFd],
+        _udp6_fds: &[std::os::fd::RawFd],
+    ) -> anyhow::Result<()> {
+        self.listener_sockets_published = true;
+        Ok(())
+    }
+
+    fn set_datapath_ready(&mut self, ready: bool) -> anyhow::Result<()> {
+        if ready && !self.listener_sockets_published {
+            anyhow::bail!("listener socket generation is not fully published");
+        }
+        self.datapath_ready = ready;
+        Ok(())
+    }
+
     fn set_param(&mut self, key: ParamKey, value: u32) -> anyhow::Result<()> {
         self.params.insert(key as u32, value);
         Ok(())
@@ -1018,6 +1040,8 @@ impl EbpfBackend for MockEbpfBackend {
 
     async fn cleanup(&mut self) -> anyhow::Result<()> {
         self.params.clear();
+        self.datapath_ready = false;
+        self.listener_sockets_published = false;
         self.domain_routes.clear();
         self.ip_routes.clear();
         self.stats.clear();
@@ -1132,6 +1156,20 @@ mod tests {
             Some(12345)
         );
         assert_eq!(backend.get_param(ParamKey::ControlPlanePid).unwrap(), None);
+    }
+
+    #[test]
+    fn test_mock_datapath_readiness() {
+        let mut backend = MockEbpfBackend::new();
+        assert!(!backend.datapath_ready);
+        assert!(backend.set_datapath_ready(true).is_err());
+        backend
+            .publish_listener_sockets(10, 11, &[12, 13, 14, 15], &[16, 17, 18, 19])
+            .unwrap();
+        backend.set_datapath_ready(true).unwrap();
+        assert!(backend.datapath_ready);
+        backend.set_datapath_ready(false).unwrap();
+        assert!(!backend.datapath_ready);
     }
 
     #[test]
