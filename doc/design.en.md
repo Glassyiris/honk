@@ -103,6 +103,12 @@ flowchart TB
 6. Dial/probe/DNS-upstream sockets use **`DAE_BYPASS_MARK` (`0x100`)** so eBPF does not re-proxy control-plane traffic.
 7. UDP replies use per-endpoint **anyfrom** transparent sockets (dae parity) so source addresses stay correct on the way back through `dae0_ingress`.
 
+Startup admission is fail-open until the listener generation is complete: TC hooks
+leave traffic untouched while `DATAPATH_STATE_MAP[0]` is zero. Userspace publishes
+every TCP/UDP listener FD, starts the receive loops, then opens that single gate;
+shutdown closes it before listener teardown. A partial SockMap publication can
+therefore never redirect a flow into a missing listener slot.
+
 > **Note:** Older docs mentioned host `iptables TPROXY` on the bridge master as the primary path. The live path is **TC redirect + daens + sk_lookup**. Listeners are still `IP_TRANSPARENT`. Cleanup scripts may still remove leftover legacy iptables rules.
 
 ## 6. eBPF design
@@ -132,6 +138,7 @@ flowchart TB
 | `OUTBOUND_CONNECTIVITY_MAP` | Alive bits pushed from userspace health checks |
 | `OUTBOUND_STATS` | Per-CPU tx/rx packets/bytes per outbound |
 | `LISTEN_SOCKET_MAP` | SockMap of transparent listeners |
+| `DATAPATH_STATE_MAP` | Admission gate opened only after the complete listener generation is published |
 | `EVENT_RINGBUF` | Overflow events drained to tracing |
 
 ### Reserved outbound indices
@@ -148,7 +155,7 @@ Aligned with dae-core:
 - **At SYN time**, pure domain rules often cannot match without a prior DNS learn or userspace sniff.
 - DNS answers update `DOMAIN_ROUTING_MAP` so subsequent TCP can match in eBPF.
 - `direct` without `must` is intentionally sent to userspace so SNI/HTTP Host can refine the route (dae-like).
-- TCP sniff: TLS ClientHello SNI + HTTP Host. QUIC Initial SNI decryption is implemented for UDP domain routing without DNS learning.
+- TCP SNI/HTTP Host and QUIC Initial SNI both re-run the userspace Router for non-`must`, non-`block` handoffs in domain-aware modes.
 
 ## 7. Userspace control plane
 
@@ -224,11 +231,16 @@ notifications use a bounded queue with deduplicated compensation. Reload
 cancellation is epoch- and generation-fenced: it drains `Initializing` leases
 and their resources, preserves already-`Ready` endpoints, and removes only the
 same generation so an older task cannot erase a replacement.
+Group ordinals also share eBPF connectivity slots. Reload first makes all transition
+slots fail-open, switches the routing generation, then publishes the exact per-group,
+per-network alive snapshot so reordered groups cannot inherit stale health.
 
 **Selection races are deliberately narrow.** Normal selector, load-balance,
 fallback, explicit-node, and warm-URLTest plans are authoritative single-leaf
 plans. Only a top-level cold URLTest plan may prepare several eligible leaves:
 absolute starts are 0/30/80 ms and then every 80 ms, with at most three in flight.
+LoadBalance cursors and Fallback pins are independent for TCP and UDP, so traffic on
+one network cannot advance or repin the other network's authoritative choice.
 The first still-eligible success wins; started losers are aborted and drained before
 binding. Only an observed preparation error affects traffic health; cancelled or
 successfully drained speculative losers are health-neutral. AnyTLS uses a caller-owned,

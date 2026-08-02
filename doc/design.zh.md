@@ -103,6 +103,11 @@ flowchart TB
 6. 拨号/探测/DNS 上游套接字打上 **`DAE_BYPASS_MARK`（`0x100`）**，避免被 eBPF 再次代理。
 7. UDP 回包使用每 endpoint 的 **anyfrom** 透明套接字（对齐 dae），经 `dae0_ingress` 回写到客户端。
 
+启动 admission 在监听 generation 完整前保持 fail-open：当
+`DATAPATH_STATE_MAP[0]` 为 0 时，TC hook 原样放行流量。用户态发布全部 TCP/UDP
+监听 FD、启动接收循环后，才打开这一处 gate；关闭时则先关 gate 再拆监听。因此
+SockMap 即使只发布了一部分，也不会把流量 redirect 到缺失的 listener slot。
+
 > **说明：** 旧文档曾写主机桥上 `iptables TPROXY` 为主路径。当前实现是 **TC redirect + daens + sk_lookup**。监听仍为 `IP_TRANSPARENT`。清理脚本可能仍会删除历史遗留的 iptables 规则。
 
 ## 6. eBPF 设计
@@ -132,6 +137,7 @@ flowchart TB
 | `OUTBOUND_CONNECTIVITY_MAP` | 用户态健康检查推送的存活位 |
 | `OUTBOUND_STATS` | 每出站 per-CPU tx/rx 包/字节 |
 | `LISTEN_SOCKET_MAP` | 透明监听 SockMap |
+| `DATAPATH_STATE_MAP` | 仅在完整 listener generation 发布后打开的 admission gate |
 | `EVENT_RINGBUF` | 溢出事件 → 用户态 tracing |
 
 ### 保留出站索引
@@ -148,7 +154,7 @@ flowchart TB
 - **SYN 时刻**，若无 DNS 学习或用户态嗅探，纯域名规则往往无法命中。
 - DNS 应答会更新 `DOMAIN_ROUTING_MAP`，后续 TCP 可在 eBPF 内匹配。
 - 非 `must` 的 `direct` 会刻意进用户态，以便 SNI/HTTP Host 精修路由（dae 风格）。
-- TCP 嗅探：TLS ClientHello SNI + HTTP Host。QUIC Initial SNI 解密已实现，用于无 DNS 学习时的 UDP 域名路由。
+- TCP SNI/HTTP Host 与 QUIC Initial SNI 在域名感知模式下都会对非 `must`、非 `block` handoff 重新执行用户态 Router。
 
 ## 7. 用户态控制面
 
@@ -215,10 +221,14 @@ transport 及 anyfrom 回包 socket 后，driver 到达 ready barrier，lease �
 去重补偿。reload cancellation 受 epoch 与 generation 栅栏保护：它清理
 `Initializing` lease 及资源、保留已经 `Ready` 的 endpoint，并且只删除同一
 generation，故旧任务不能清除 replacement。
+组序号也对应 eBPF connectivity slot。reload 会先把过渡 slot 全部设为 fail-open，
+切换路由 generation，再发布精确的每组、每网络存活快照，避免组重排继承旧健康状态。
 
 **选择竞争被刻意收窄。** 普通 Selector、LoadBalance、Fallback、显式节点与
 warm URLTest plan 都是权威的单叶 plan。只有顶层 cold URLTest plan 可并发准备多个
 eligible leaf：绝对启动时刻为 0/30/80 ms，之后每 80 ms 一次，同时最多三个。
+LoadBalance 游标与 Fallback pin 均按 TCP/UDP 独立维护，一个网络的流量不会推进
+或改绑另一个网络的权威选择。
 第一个仍 eligible 的成功者获胜；已启动的 loser 在绑定前会被 abort 并 drain。
 只有观察到的 preparation error 会影响 traffic health；取消或成功 drain 的推测性
 loser 对 health 保持中性。AnyTLS 在该路径使用 caller-owned、计入 session cap 的

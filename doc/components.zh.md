@@ -238,8 +238,8 @@ group {
 | -------- | ------ | ------ |
 | `selector` | `select`、`fixed`、`fixed(0)` | 手动固定；API + cache |
 | `urltest` | `min_moving_avg`、`min_avg10`、`min_last_delay` | 最低延迟 + tolerance；**TCP/UDP 分离** |
-| `loadbalance` | `roundrobin`、`round_robin`、`balance` | 组内对存活成员轮询 |
-| `fallback` | | 第一个存活粘性；无立即 failback |
+| `loadbalance` | `roundrobin`、`round_robin`、`balance` | 每组、每网络独立对存活成员轮询 |
+| `fallback` | | TCP/UDP 各自固定第一个存活成员；无立即 failback |
 
 ### 过滤解析
 
@@ -575,6 +575,7 @@ honk-core delay <node> [--url HOST:PORT]
 | 恢复 | 连续 2 次成功 |
 | 深度退避 | 连续失败 10 次后仍以 max_cooldown（300s）慢速节奏继续探测，不永久停止 |
 | 拨号失败 | 立即清除延迟历史（sing-box `DeleteURLTestHistory`）；节点 alive→dead 翻转时清除其连接池条目并回收 UDP endpoint |
+| UDP driver 失败 | transport 发送、接收或回包空闲超时会上报 DataUdp 流量失败；主动 endpoint 退役和进程关闭不影响健康状态 |
 | 延迟持久化 | 每节点最近真实延迟样本写入 cache.db（60s 周期），启动时恢复，超过 24h 丢弃 |
 | 新节点宽限 | 约 60s |
 | URLTest 空闲 | `idle_timeout` 停止未使用组的探测 |

@@ -274,8 +274,8 @@ group {
 | ----------- | ------------- | ---------- |
 | `selector` | `select`, `fixed`, `fixed(0)` | Manual pin; API + cache |
 | `urltest` | `min_moving_avg`, `min_avg10`, `min_last_delay` | Lowest latency + tolerance; **TCP/UDP separate** |
-| `loadbalance` | `roundrobin`, `round_robin`, `balance` | Per-group RR among alive |
-| `fallback` | `fallback` | First alive sticky; no instant failback |
+| `loadbalance` | `roundrobin`, `round_robin`, `balance` | Per-group, per-network RR among alive members |
+| `fallback` | `fallback` | First alive sticky per TCP/UDP network; no instant failback |
 
 ### Filter resolution
 
@@ -645,6 +645,7 @@ Configured via `global { ... }` keys (`tcp_check_url`, `udp_check_dns`, `check_i
 | Recovery | 2 consecutive successes |
 | Deep backoff | After 10 consecutive failures, probing continues at the max-cooldown (300s) cadence — no permanent stop |
 | Dial failure | Latency history cleared immediately (sing-box `DeleteURLTestHistory`); a node's pooled connections and UDP endpoints are purged when it flips alive→dead |
+| UDP driver failure | Transport send/receive/reply-idle errors report a DataUdp traffic failure; intentional endpoint retirement and shutdown are health-neutral |
 | Delay persistence | Last real delay sample per node saved to cache.db (60s writer), restored at startup, 24h age-out |
 | New node grace | ~60s |
 | URLTest idle | `idle_timeout` stops probes for unused groups |
