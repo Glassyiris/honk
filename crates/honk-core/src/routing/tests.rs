@@ -1236,3 +1236,40 @@ mod negation {
         assert_eq!(router.route(&c), "proxy");
     }
 }
+
+/// dae configs write bare IPs in dip/sip; they must parse as host routes
+/// rather than silently dropping the matcher.
+#[test]
+fn bare_ip_in_dip_sip_parses_as_host_route() {
+    use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
+    let rules = vec![RoutingRule {
+        name: "bare".into(),
+        condition: RoutingCondition {
+            ip: vec!["10.9.9.9".into()],
+            source_ip: vec!["192.168.222.2".into()],
+            ..Default::default()
+        },
+        outbound: RoutingOutbound::Simple("direct".into()),
+        priority: 0,
+        must: true,
+        mark: 0,
+    }];
+    let router = Router::new(&rules, "proxy").unwrap();
+    let hit = |ip: &str, sip: &str| {
+        let conn = ConnectionInfo {
+            domain: None,
+            dst_ip: ip.parse().unwrap(),
+            dst_port: 80,
+            src_ip: sip.parse().unwrap(),
+            src_port: 1000,
+            protocol: "tcp",
+            process_name: None,
+            mac: None,
+            dscp: None,
+        };
+        router.route(&conn).to_string()
+    };
+    assert_eq!(hit("10.9.9.9", "192.168.222.2"), "direct");
+    assert_eq!(hit("10.9.9.8", "192.168.222.2"), "proxy");
+    assert_eq!(hit("10.9.9.9", "192.168.222.3"), "proxy");
+}

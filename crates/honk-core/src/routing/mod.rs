@@ -223,7 +223,7 @@ impl Router {
                 .condition
                 .ip
                 .iter()
-                .filter_map(|c| c.parse().ok())
+                .filter_map(|c| parse_ip_net_str(c))
                 .collect();
             ip_nets.extend(assets.geoip_nets(&rule.condition.geo_ip));
 
@@ -231,7 +231,7 @@ impl Router {
                 .condition
                 .source_ip
                 .iter()
-                .filter_map(|c| c.parse().ok())
+                .filter_map(|c| parse_ip_net_str(c))
                 .collect();
 
             let ports = parse_port_ranges(&rule.condition.port)?;
@@ -280,12 +280,12 @@ impl Router {
                 );
             }
             let mut not_ip_nets: Vec<ipnet::IpNet> =
-                not.ip.iter().filter_map(|c| c.parse().ok()).collect();
+                not.ip.iter().filter_map(|c| parse_ip_net_str(c)).collect();
             not_ip_nets.extend(assets.geoip_nets(&not.geo_ip));
             let not_source_ip_nets: Vec<ipnet::IpNet> = not
                 .source_ip
                 .iter()
-                .filter_map(|c| c.parse().ok())
+                .filter_map(|c| parse_ip_net_str(c))
                 .collect();
             let not_ports = parse_port_ranges(&not.port)?;
             let not_source_ports = parse_port_ranges(&not.source_port)?;
@@ -751,6 +751,21 @@ fn parse_ip_version(s: &str) -> Option<u8> {
         "6" | "ipv6" => Some(6),
         _ => None,
     }
+}
+
+/// Parse a dae `dip`/`sip` argument into an `IpNet`. `ipnet`'s `FromStr`
+/// rejects bare addresses, but dae configs write them freely — a bare IP is
+/// a host route (/32 or /128). Silently dropping it would silently drop the
+/// whole matcher.
+fn parse_ip_net_str(s: &str) -> Option<ipnet::IpNet> {
+    let trimmed = s.trim();
+    if trimmed.contains('/') {
+        return trimmed.parse().ok();
+    }
+    if trimmed.contains(':') {
+        return format!("{trimmed}/128").parse().ok();
+    }
+    format!("{trimmed}/32").parse().ok()
 }
 
 fn parse_port_ranges(ports: &[String]) -> anyhow::Result<Vec<PortRange>> {
