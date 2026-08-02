@@ -179,6 +179,55 @@ cores, RSS measured after the runs.
 | dae | anytls-go | 0.22 ms | 1493 (76.0%) | 1.01 |
 | sing-box | anytls-go | 0.18 ms | 1368 (77.7%) | 1.24 |
 
+### UDP: warmed steady-state comparison (08-02)
+
+Same methodology as the 08-01 steady round: after each engine starts, wait 30s
+for health-check convergence, run 5 TCP warm-up requests per protocol, settle
+10s, then measure. `iperf3 -u -b 10G -l 1200 -R` single flow and `-P 8`
+aggregate.
+
+| engine | protocol | echo RTT (ms) | single Mbps (loss) | P8 aggregate Mbps (loss) |
+| --- | --- | --- | --- | --- |
+| honk | hy2 | 0.22 | 1663 (73.8%) | 1582 (95.8%) |
+| dae | hy2 | 0.36 | 938 (85.6%) | 864 (97.6%) |
+| sing-box | hy2 | 0.42 | 1607 (74.4%) | 1588 (95.7%) |
+| honk | tuic | 0.11 | 359 (67.1%) | FAIL |
+| dae | tuic | 0.11 | 325 (75.1%) | 1 (27.3%) |
+| sing-box | tuic | 0.14 | 101 (74.2%) | FAIL |
+| honk | ss2022 | 0.19 | 1851 (67.2%) | 2928 (88.0%) |
+| dae | ss2022 | 0.21 | 2448 (55.6%) | 2382 (89.8%) |
+| sing-box | ss2022 | 0.19 | 2475 (56.5%) | 2944 (87.9%) |
+| honk | trojan | 0.06 | 1623 (72.0%) | 3159 (91.8%) |
+| dae | trojan | 0.13 | 2864 (49.6%) | 2631 (92.3%) |
+| sing-box | trojan | 0.09 | 3226 (42.7%) | 4092 (88.9%) |
+| honk | anytls-sb | 0.69 | 1294 (78.5%) | 1266 (96.5%) |
+| dae | anytls-sb | 0.15 | 1278 (78.8%) | 2610 (91.1%) |
+| sing-box | anytls-sb | 0.67 | 1268 (79.1%) | 2760 (90.7%) |
+| honk | anytls-go | 0.12 | 1484 (76.5%) | 1269 (96.5%) |
+| dae | anytls-go | 0.21 | 1435 (76.9%) | 2259 (93.2%) |
+| sing-box | anytls-go | 0.98 | 1375 (77.8%) | 2248 (93.1%) |
+
+**Reading the steady-state UDP results (08-02):**
+
+- **hy2**: honk 1663 ≈ sing-box 1607 > dae 938; P8 does not scale for any
+  engine (0.9–1.6 Gbps at 96%+ loss), far from honk's 5.91 Gbps single-flow in
+  the 08-01 steady round — see the lab-condition note below.
+- **TUIC UDP collapsed across all three engines** (101–359 Mbps): the direct
+  UDP baseline measured in the same round (port 5300, no proxy) reached only
+  1954 Mbps at 61% loss, so the .70→.59 UDP link itself was near its
+  saturation ceiling. Absolute tuic figures are therefore not comparable with
+  the 08-01 steady round (6.18 Gbps); this is a lab-condition artifact and the
+  row should be re-measured on an idle link.
+- **ss2022**: single-flow sing-box 2475 ≈ dae 2448 > honk 1851; P8 honk 2928 ≈
+  sing-box 2944 > dae 2382. honk still trails single-flow but has caught up
+  on P8.
+- **trojan**: single-flow sing-box 3226 > dae 2864 > honk 1623; P8 sing-box
+  4092 > honk 3159 > dae 2631. honk's trojan UDP-over-TCP single-flow remains
+  the lowest of the three and the top UDP optimization target.
+- **anytls UoT**: single-flow is tied (~1.3–1.5 Gbps); **P8 is clearly lowest
+  for honk** (1266/1269 vs dae 2610/2259 vs sing-box 2760/2248) — a newly
+  exposed multi-flow UDP weakness worth a dedicated analysis.
+
 ### Reading the 08-02 results
 
 - **Latency**: honk best across the board — cold 5–11ms (dae tuic still pays a
