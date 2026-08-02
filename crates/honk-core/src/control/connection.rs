@@ -1217,6 +1217,18 @@ impl ControlPlaneHandle {
         }
     }
 
+    fn should_reroute_sniffed_domain(
+        dial_mode: DialMode,
+        domain: Option<&str>,
+        handoff: Option<&HandoffResult>,
+    ) -> bool {
+        !matches!(dial_mode, DialMode::Ip)
+            && domain.is_some()
+            && handoff.is_some_and(|handoff| {
+                handoff.must == 0 && handoff.outbound != OutboundIndex::Block as u8
+            })
+    }
+
     pub(super) async fn serve_udp_connection(
         &self,
         lease: UdpInitLease,
@@ -1250,6 +1262,16 @@ impl ControlPlaneHandle {
         let connect_timeout = {
             let config = self.config.read().await;
             std::time::Duration::from_millis(config.global.connect_timeout_ms)
+        };
+
+        let dial_mode = {
+            let config = self.config.read().await;
+            config
+                .global
+                .dial_mode
+                .parse::<DialMode>()
+                .ok()
+                .unwrap_or(DialMode::DomainPlusPlus)
         };
 
         // These checks remain after the reservation only because DNS and
@@ -1297,6 +1319,17 @@ impl ControlPlaneHandle {
                 quic_domain = self.sniffer_pool.feed_quic_initial(sniffer_key, &data);
             }
         }
+        if matches!(dial_mode, DialMode::Domain)
+            && let Some(domain) = &quic_domain
+            && !self.verify_domain_reality(domain, original_dst.ip()).await
+        {
+            debug!(
+                "QUIC domain {} failed reality check against {}, falling back to IP",
+                domain,
+                original_dst.ip()
+            );
+            quic_domain = None;
+        }
 
         let route_started_at = std::time::Instant::now();
         let tuples = build_tuples_key(
@@ -1319,9 +1352,15 @@ impl ControlPlaneHandle {
             dscp: handoff.as_ref().map(|ho| ho.dscp),
         };
 
-        let (outbound_name, outbound_index, must) = if let Some(ref ho) = handoff {
+        let reroute_by_sniffed_domain = Self::should_reroute_sniffed_domain(
+            dial_mode,
+            quic_domain.as_deref(),
+            handoff.as_ref(),
+        );
+        let (outbound_name, outbound_index, must) = if let Some(ho) = &handoff {
             debug!("eBPF handoff UDP: outbound={}", ho.outbound);
-            if ho.outbound == OutboundIndex::ControlPlaneRouting as u8 {
+            if ho.outbound == OutboundIndex::ControlPlaneRouting as u8 || reroute_by_sniffed_domain
+            {
                 let router = self.router.read().await;
                 let (name, must) = router.route_with_must(&conn_info);
                 (name.to_string(), 0, must)
@@ -1708,6 +1747,63 @@ pub(super) fn domain_reality_outcome(
                 RealityOutcome::Mismatch
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod sniffed_domain_routing_tests {
+    use super::*;
+
+    fn handoff(outbound: u8, must: u8) -> HandoffResult {
+        HandoffResult {
+            outbound,
+            must,
+            mark: 0,
+            dscp: 0,
+            mac: [0; 6],
+            pname: [0; 16],
+        }
+    }
+
+    #[test]
+    fn udp_domain_modes_reroute_preliminary_group_handoffs() {
+        let group = handoff(OutboundIndex::UserBase as u8, 0);
+        for mode in [
+            DialMode::Domain,
+            DialMode::DomainPlus,
+            DialMode::DomainPlusPlus,
+        ] {
+            assert!(ControlPlaneHandle::should_reroute_sniffed_domain(
+                mode,
+                Some("www.youtube.com"),
+                Some(&group)
+            ));
+        }
+    }
+
+    #[test]
+    fn udp_domain_reroute_preserves_final_decisions() {
+        let group = handoff(OutboundIndex::UserBase as u8, 0);
+        assert!(!ControlPlaneHandle::should_reroute_sniffed_domain(
+            DialMode::Ip,
+            Some("www.youtube.com"),
+            Some(&group)
+        ));
+        assert!(!ControlPlaneHandle::should_reroute_sniffed_domain(
+            DialMode::DomainPlusPlus,
+            None,
+            Some(&group)
+        ));
+        assert!(!ControlPlaneHandle::should_reroute_sniffed_domain(
+            DialMode::DomainPlusPlus,
+            Some("www.youtube.com"),
+            Some(&handoff(OutboundIndex::Block as u8, 0))
+        ));
+        assert!(!ControlPlaneHandle::should_reroute_sniffed_domain(
+            DialMode::DomainPlusPlus,
+            Some("www.youtube.com"),
+            Some(&handoff(OutboundIndex::UserBase as u8, 1))
+        ));
     }
 }
 
