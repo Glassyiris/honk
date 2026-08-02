@@ -45,7 +45,7 @@ Source of truth: `crates/honk-config/src/*`, the dae parser in `crates/honk-conf
 | — | `dns_resolve_timeout_ms` | `2000` | Control-plane resolve timeout; not settable in dae syntax |
 | — | `relay_idle_timeout_secs` | `300` | Idle relay kill; `0` = off; not settable in dae syntax |
 | — | `preconnect_node_count` | `0` | Preconnect count; `0` = auto `min(nodes,8)`; not settable in dae syntax |
-| `udp_warm_node_count` | `udp_warm_node_count` | `0` | Opt-in UDP warm-up budget. `0` is strictly disabled: no coordinator task and no warm metrics. A positive value discovers authoritative DataUdp group leaves; dispatch remains capped at four concurrent tasks. |
+| `udp_warm_node_count` | `udp_warm_node_count` | `0` | Per-group UDP warm-up cap. `0` is strictly disabled: no coordinator task and no warm metrics. A positive value N (capped at 3) warms each group's top-N latency-ranked, UDP-capable leaves after startup and after every probe cycle (`check_interval`), so newly fast nodes are pre-dialed before they win a selection. Dispatch stays capped at four concurrent tasks. |
 
 ```dae
 global {

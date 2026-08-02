@@ -1865,3 +1865,53 @@ fn peek_selection_plan_keeps_nested_child_idle_and_only_reads_tcp_mirror() {
         None
     );
 }
+
+/// The warm coordinator's per-group top-N source: latency-ordered, alive
+/// filtered, capped, and never mutating selection state.
+#[test]
+fn ranked_udp_leaves_orders_caps_and_filters() {
+    let (na, nb, nc) = (
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+    );
+    let nodes = vec![make_node(na, "a"), make_node(nb, "b"), make_node(nc, "c")];
+    let alive = Arc::new(AliveDialerSet::new());
+    let manager = GroupManager::with_alive_set(
+        &[make_group("g", GroupPolicy::URLTest, vec![na, nb, nc])],
+        &nodes,
+        Some(alive.clone()),
+    );
+    for (name, ms) in [("b", 10u64), ("a", 30), ("c", 20)] {
+        alive.record_probe_latency(
+            name,
+            ProbeDomain::DataUdp,
+            IpVersion::V4,
+            Duration::from_millis(ms),
+        );
+    }
+    let names = |limit| {
+        manager
+            .ranked_udp_leaves("g", IpVersion::V4, limit)
+            .iter()
+            .map(|n| n.name.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(3), vec!["b", "c", "a"]);
+    assert_eq!(names(2), vec!["b", "c"]);
+    assert_eq!(names(1), vec!["b"]);
+    assert!(names(0).is_empty());
+
+    // Both UDP domains dead on the leader -> it drops out of the ranking.
+    for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
+        alive.report_unavailable_forced("b", domain, IpVersion::V4);
+    }
+    assert_eq!(names(2), vec!["c", "a"]);
+
+    // Peek semantics: no urltest cache write, no cursor advance.
+    assert!(
+        manager
+            .get_urltest_selection_for_network("g", SelectionNetwork::Udp)
+            .is_none()
+    );
+}

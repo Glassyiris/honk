@@ -1124,6 +1124,46 @@ impl GroupManager {
         candidates.sort_by_key(|c| self.node_latency(c.node, network, ipver, check_url, c.tag));
         candidates
     }
+
+    /// Alive UDP leaves of a group ordered by latency (best first), capped at
+    /// `limit`. Used by the periodic UDP warm coordinator to pre-dial the
+    /// top-N leaves per group after each probe cycle. Peek semantics: no
+    /// activity marks, no cache writes.
+    pub fn ranked_udp_leaves(
+        &self,
+        group_name: &str,
+        ipver: IpVersion,
+        limit: usize,
+    ) -> Vec<&Node> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let Some(group) = self.groups.get(group_name) else {
+            return Vec::new();
+        };
+        let mut visited = Vec::new();
+        let candidates = self.flatten_candidates(
+            group,
+            ProbeDomain::DataUdp,
+            ipver,
+            &mut visited,
+            0,
+            SelectionEffects::Peek,
+        );
+        let candidates = self.filter_alive_candidates(
+            candidates,
+            ProbeDomain::DataUdp,
+            ipver,
+            group.check_url.as_deref(),
+        );
+        let ordered = self.order_by_latency(
+            candidates,
+            SelectionNetwork::Udp,
+            ipver,
+            group.check_url.as_deref(),
+        );
+        ordered.into_iter().take(limit).map(|c| c.node).collect()
+    }
 }
 
 /// Break cycles in the sub-group graph before the manager starts

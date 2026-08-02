@@ -47,7 +47,7 @@
 | `dns_resolve_timeout_ms` | u64 | `2000` | 控制面解析超时（结构化模型字段，dae 语法无对应键） |
 | `relay_idle_timeout_secs` | u64 | `300` | 空闲中继断开；`0` = 关闭（结构化模型字段，dae 语法无对应键） |
 | `preconnect_node_count` | usize | `0` | 预连接数；`0` = 自动 `min(nodes,8)`（结构化模型字段，dae 语法无对应键） |
-| `udp_warm_node_count` | usize | `0` | opt-in UDP warm-up 预算。`0` 为严格关闭：不创建 coordinator task，也不产生 warm metrics。正值会发现权威 DataUdp group leaf；dispatch 仍最多四个并发 task。 |
+| `udp_warm_node_count` | usize | `0` | 每组 UDP 预热上限。`0` 为严格关闭：不创建 coordinator task，也不产生 warm metrics。正值 N（封顶 3）会在启动后以及**每个探测周期**（`check_interval`）预热每组按延迟排名前 N 的 UDP 可用节点——测速后新变快的节点在赢得选择前就已拨好 transport。dispatch 仍最多四个并发 task。 |
 
 ### 拨号模式细节
 

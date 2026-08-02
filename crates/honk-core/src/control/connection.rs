@@ -749,12 +749,6 @@ impl ControlPlaneHandle {
                                     ProbeDomain::Tcp,
                                     ipver,
                                 );
-                                // sing-box `DeleteURLTestHistory` parity
-                                // plus a synthetic timeout sample: the node
-                                // is un-ranked immediately so URLTest groups
-                                // re-select on the next connection, and a
-                                // flaky node cannot reclaim the top rank
-                                // with one lucky probe.
                                 ctx.alive_set.record_dial_failure(
                                     &node.name,
                                     ProbeDomain::Tcp,
