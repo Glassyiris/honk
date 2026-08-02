@@ -11,6 +11,33 @@ fn test_build_dns_probe_query() {
     assert_eq!(&q[q.len() - 4..], &[0, 1, 0, 1]); // QTYPE A / QCLASS IN
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn udp_listener_enables_reuse_port_before_bind() {
+    use std::os::fd::AsRawFd;
+
+    let first = sockets::new_udp_listener_socket(socket2::Domain::IPV4, true).unwrap();
+    let mut enabled = 0i32;
+    let mut enabled_len = std::mem::size_of_val(&enabled) as libc::socklen_t;
+    let status = unsafe {
+        libc::getsockopt(
+            first.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_REUSEPORT,
+            (&mut enabled as *mut i32).cast(),
+            &mut enabled_len,
+        )
+    };
+    assert_eq!(status, 0);
+    assert_eq!(enabled, 1);
+
+    first
+        .bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into())
+        .unwrap();
+    let addr = first.local_addr().unwrap();
+    let second = sockets::new_udp_listener_socket(socket2::Domain::IPV4, true).unwrap();
+    second.bind(&addr).unwrap();
+}
 #[tokio::test]
 async fn test_resolve_udp_check_target() {
     let fallback: SocketAddr = "8.8.8.8:53".parse().unwrap();

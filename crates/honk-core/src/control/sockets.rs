@@ -86,11 +86,6 @@ fn build_tproxy_tcp(addr: SocketAddr) -> anyhow::Result<TcpListener> {
                 );
             }
         }
-        // SO_MARK is intentionally not set.  With the eBPF bpf_sk_assign
-        // datapath the listener does not need a policy-route mark; replies
-        // are routed back to the client through the daens main table
-        // (default via dae0peer), which only steers fwmark'd packets into
-        // the tproxy table.
     }
 
     socket.bind(&addr.into())?;
@@ -139,27 +134,7 @@ pub(super) fn bind_tproxy_udp_listeners(
     addr: SocketAddr,
     count: usize,
 ) -> anyhow::Result<Vec<UdpSocket>> {
-    let build = |addr: SocketAddr| -> anyhow::Result<UdpSocket> {
-        let socket = build_tproxy_udp(addr)?;
-        #[cfg(target_os = "linux")]
-        unsafe {
-            let one: libc::c_int = 1;
-            let ret = libc::setsockopt(
-                socket.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_REUSEPORT,
-                &one as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&one) as libc::socklen_t,
-            );
-            if ret != 0 {
-                anyhow::bail!(
-                    "setsockopt(SO_REUSEPORT): {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-        }
-        Ok(socket)
-    };
+    let build = |addr: SocketAddr| -> anyhow::Result<UdpSocket> { build_tproxy_udp(addr, true) };
     #[cfg(target_os = "linux")]
     if daens_netns_exists() {
         return crate::with_daens_netns("bind TPROXY UDP listener group", || {
@@ -169,19 +144,29 @@ pub(super) fn bind_tproxy_udp_listeners(
     (0..count).map(|_| build(addr)).collect()
 }
 
-fn build_tproxy_udp(addr: SocketAddr) -> anyhow::Result<UdpSocket> {
+pub(super) fn new_udp_listener_socket(domain: Domain, reuse_port: bool) -> io::Result<Socket> {
+    let socket = Socket::new(domain, Type::DGRAM, None)?;
+    socket.set_nonblocking(true)?;
+    socket.set_cloexec(true)?;
+    #[cfg(target_os = "linux")]
+    if reuse_port {
+        socket.set_reuse_port(true)?;
+    }
+    socket.set_reuse_address(true)?;
+    if domain == Domain::IPV6 {
+        socket.set_only_v6(true)?;
+    }
+    Ok(socket)
+}
+
+fn build_tproxy_udp(addr: SocketAddr, reuse_port: bool) -> anyhow::Result<UdpSocket> {
     let domain = if addr.is_ipv4() {
         Domain::IPV4
     } else {
         Domain::IPV6
     };
-    let socket = Socket::new(domain, Type::DGRAM, None)?;
-    socket.set_nonblocking(true)?;
-    socket.set_cloexec(true)?;
-    socket.set_reuse_address(true)?;
-    if domain == Domain::IPV6 {
-        socket.set_only_v6(true)?;
-    }
+    let socket = new_udp_listener_socket(domain, reuse_port)?;
+
     // The listener absorbs every proxied UDP datagram before the receive
     // loop drains it; the ~208 KiB default overflows instantly at
     // tunnel-saturating rates and the kernel drops the rest before we ever
