@@ -207,6 +207,25 @@ aggregate.
 | dae | anytls-go | 0.21 | 1435 (76.9%) | 2259 (93.2%) |
 | sing-box | anytls-go | 0.98 | 1375 (77.8%) | 2248 (93.1%) |
 
+Note: the first steady-state run was measured **without** `udp_warm_node_count`
+(honk's UDP warm-up knob; the production config sets it to 8). After enabling
+`udp_warm_node_count: 8`, honk's rows re-measured as follows (dae and sing-box
+have no such knob; their rows are unchanged):
+
+| engine | protocol | single Mbps (loss) | P8 aggregate Mbps (loss) |
+| --- | --- | --- | --- |
+| honk (udp_warm) | hy2 | 1622 (74.1%) | 1650 (95.5%) |
+| honk (udp_warm) | tuic | **1252 (72.3%)** | FAIL |
+| honk (udp_warm) | ss2022 | 1796 (68.7%) | 2916 (88.0%) |
+| honk (udp_warm) | trojan | 1562 (73.2%) | 3283 (91.3%) |
+| honk (udp_warm) | anytls-sb | 1254 (79.9%) | 1297 (96.2%) |
+| honk (udp_warm) | anytls-go | 1400 (77.4%) | 1298 (96.3%) |
+
+tuic single-flow improved from 359 to 1252 Mbps — cold session establishment
+was indeed the dominant cost in the un-warmed measurement; the other rows are
+within noise. The anytls P8 shortfall and the tuic P8 failure are unrelated to
+warm-up and stand as genuine weaknesses.
+
 **Reading the steady-state UDP results (08-02):**
 
 - **hy2**: honk 1663 ≈ sing-box 1607 > dae 938; P8 does not scale for any

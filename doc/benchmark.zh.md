@@ -187,6 +187,22 @@ ssh root@10.10.10.57 bash /root/test-protocols.sh
 | dae | anytls-go | 0.21 | 1435 (76.9%) | 2259 (93.2%) |
 | sing-box | anytls-go | 0.98 | 1375 (77.8%) | 2248 (93.1%) |
 
+注:第一轮稳态测量时实验室配置**未启用** `udp_warm_node_count`(honk 的 UDP
+预热;生产配置为 8)。补上 `udp_warm_node_count: 8` 后重测 honk 各行如下
+(dae/sing-box 无此开关,行不变):
+
+| 引擎 | 协议 | 单流 Mbps(丢包) | P8 聚合 Mbps(丢包) |
+| --- | --- | --- | --- |
+| honk(开 udp_warm) | hy2 | 1622 (74.1%) | 1650 (95.5%) |
+| honk(开 udp_warm) | tuic | **1252 (72.3%)** | FAIL |
+| honk(开 udp_warm) | ss2022 | 1796 (68.7%) | 2916 (88.0%) |
+| honk(开 udp_warm) | trojan | 1562 (73.2%) | 3283 (91.3%) |
+| honk(开 udp_warm) | anytls-sb | 1254 (79.9%) | 1297 (96.2%) |
+| honk(开 udp_warm) | anytls-go | 1400 (77.4%) | 1298 (96.3%) |
+
+tuic 单流从 359 提升到 1252 Mbps——冷会话建立确实占了未预热测量的主要部分;
+其余行在噪声范围内。anytls P8 垫底与 tuic P8 FAIL 与预热无关,为真实短板。
+
 **稳态 UDP 解读(08-02):**
 
 - **hy2**:honk 1663 ≈ sing-box 1607 > dae 938;P8 三家均不扩展(0.9–1.6 Gbps,
