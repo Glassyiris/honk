@@ -690,7 +690,7 @@ impl ControlPlaneHandle {
                         if matches!(node.protocol, NodeProtocol::Direct | NodeProtocol::Block) {
                             None
                         } else {
-                            Some(ConnectionPool::acquire_dial_permit().await)
+                            Some(generation.acquire_dial_permit().await)
                         };
                     let result = tokio::time::timeout(
                         per_dial_timeout,
@@ -843,7 +843,7 @@ impl ControlPlaneHandle {
                             let Some(_warm_guard) = pool.try_begin_warm(&key) else {
                                 return;
                             };
-                            let _dial_permit = ConnectionPool::acquire_dial_permit().await;
+                            let _dial_permit = generation.acquire_dial_permit().await;
                             match registry
                                 .dial_runtime(
                                     generation,
@@ -871,7 +871,7 @@ impl ControlPlaneHandle {
                             // instead; a bare TCP is useless to them.
                             return;
                         }
-                        let _dial_permit = ConnectionPool::acquire_dial_permit().await;
+                        let _dial_permit = generation.acquire_dial_permit().await;
                         match honk_outbound::util::connect_outbound(&node_addr, connect_timeout)
                             .await
                         {

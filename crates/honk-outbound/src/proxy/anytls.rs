@@ -1398,7 +1398,7 @@ async fn connect_transport(
 impl AnyTlsHandler {
     /// Create a new AnyTLS handler.
     pub fn new() -> Self {
-        Self::default()
+        Self
     }
 
     /// Resolve the AnyTLS password: generic password first, then the

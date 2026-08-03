@@ -303,6 +303,10 @@ pub enum RuntimeRegistryError {
 pub struct OutboundRuntimeRegistry {
     nodes: HashMap<uuid::Uuid, Arc<NodeRuntime>>,
     terminal: AtomicBool,
+    /// Admission budget for concurrent proxied dials, scoped to this
+    /// generation: a reload applies a changed limit to new work at once
+    /// while in-flight dials keep their permits until they finish.
+    dial_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 /// Shared cell swapped atomically on reload (same pattern as
@@ -312,16 +316,22 @@ pub type SharedRuntimeRegistry = Arc<parking_lot::RwLock<Arc<OutboundRuntimeRegi
 impl OutboundRuntimeRegistry {
     /// Build and validate a registry from the generation's node set.
     pub fn build(nodes: &[Node]) -> Result<Self, RuntimeRegistryError> {
-        Self::build_reusing(nodes, None)
+        Self::build_reusing(
+            nodes,
+            honk_config::config::GlobalConfig::default().max_concurrent_dials,
+            None,
+        )
     }
 
-    /// [`Self::build`] that adopts the previous generation's runtime for
-    /// every node whose full config survived the reload unchanged (the
-    /// content-derived ID alone is too narrow — it excludes dial fields
-    /// like SNI, transport, and obfs). Adopted runtimes keep their live
-    /// sessions; the previous generation skips them at drain/shutdown.
+    /// [`Self::build`] with an explicit dial-admission budget and optional
+    /// adoption of the previous generation's runtimes for every node whose
+    /// full config survived the reload unchanged (the content-derived ID
+    /// alone is too narrow — it excludes dial fields like SNI, transport,
+    /// and obfs). Adopted runtimes keep their live sessions; the previous
+    /// generation skips them at drain/shutdown.
     pub fn build_reusing(
         nodes: &[Node],
+        max_concurrent_dials: usize,
         previous: Option<&Self>,
     ) -> Result<Self, RuntimeRegistryError> {
         let mut map = HashMap::with_capacity(nodes.len());
@@ -371,6 +381,7 @@ impl OutboundRuntimeRegistry {
         Ok(Self {
             nodes: map,
             terminal: AtomicBool::new(false),
+            dial_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent_dials.max(1))),
         })
     }
 
@@ -431,6 +442,14 @@ impl OutboundRuntimeRegistry {
     /// rather than consulting a replacement generation once this is true.
     pub fn is_shutdown(&self) -> bool {
         self.terminal.load(Ordering::Acquire)
+    }
+
+    /// Acquire one dial-admission permit from this generation's budget.
+    pub async fn acquire_dial_permit(&self) -> tokio::sync::OwnedSemaphorePermit {
+        Arc::clone(&self.dial_semaphore)
+            .acquire_owned()
+            .await
+            .expect("dial semaphore is never closed")
     }
 
     /// Make the generation unavailable to new generation-owned work without
@@ -626,6 +645,7 @@ mod tests {
         changed.sni = Some("new.example.com".to_string());
         let second = OutboundRuntimeRegistry::build_reusing(
             &[unchanged.clone(), changed.clone()],
+            64,
             Some(&first),
         )
         .unwrap();
@@ -662,9 +682,12 @@ mod tests {
         let mut reparsed = parsed.clone();
         reparsed.created_at = chrono::Utc::now();
         reparsed.updated_at = chrono::Utc::now();
-        let second =
-            OutboundRuntimeRegistry::build_reusing(std::slice::from_ref(&reparsed), Some(&first))
-                .unwrap();
+        let second = OutboundRuntimeRegistry::build_reusing(
+            std::slice::from_ref(&reparsed),
+            64,
+            Some(&first),
+        )
+        .unwrap();
         assert!(Arc::ptr_eq(
             &first.get(&parsed.id).unwrap(),
             &second.get(&parsed.id).unwrap()

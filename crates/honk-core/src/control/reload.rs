@@ -71,8 +71,6 @@ impl ControlPlane {
         }
         let old_plan = self.active_routing_plan.read().clone();
 
-        crate::pool::ConnectionPool::configure_dial_limit(new_config.global.max_concurrent_dials);
-
         // ── Phase 1: build everything (no live-state mutation) ──
         let new_router = match Router::new(
             &new_config.routing.rules,
@@ -110,6 +108,7 @@ impl ControlPlane {
         let new_runtime_registry = Arc::new(
             match honk_outbound::runtime::OutboundRuntimeRegistry::build_reusing(
                 &new_config.nodes,
+                new_config.global.max_concurrent_dials,
                 Some(&self.runtime_registry.read()),
             ) {
                 Ok(r) => r,

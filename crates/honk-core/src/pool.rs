@@ -31,11 +31,10 @@ use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use parking_lot::Mutex;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, trace};
 
 use honk_outbound::proxy::ProxyStream;
@@ -59,16 +58,6 @@ const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// typically reap idle tunnels sooner.
 const READY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_AGE: Duration = Duration::from_secs(300);
-
-/// Bound proxied TCP dials process-wide. Cold URLTest can speculate, but it
-/// must share the same admission budget as ordinary and warming dials.
-/// Built-in direct/block dials are exempt (see the dial path): they are
-/// local connects already bounded by the control-plane connection limit,
-/// and letting dead direct peers occupy this budget starves real dials.
-const DEFAULT_MAX_CONCURRENT_DIALS: usize = 64;
-
-static GLOBAL_DIAL_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
-static DIAL_LIMIT: AtomicU64 = AtomicU64::new(DEFAULT_MAX_CONCURRENT_DIALS as u64);
 
 /// A pooled connection. Each key's list holds exactly one kind: the key
 /// namespaces (`"host:port"` vs `ready|...`) make mixing impossible.
@@ -169,30 +158,6 @@ impl ConnectionPool {
                 entry.insert((1, Instant::now()));
                 false
             }
-        }
-    }
-
-    pub(crate) async fn acquire_dial_permit() -> OwnedSemaphorePermit {
-        Arc::clone(
-            GLOBAL_DIAL_SEMAPHORE.get_or_init(|| {
-                Arc::new(Semaphore::new(DIAL_LIMIT.load(Ordering::Acquire) as usize))
-            }),
-        )
-        .acquire_owned()
-        .await
-        .expect("global dial semaphore is never closed")
-    }
-
-    /// Apply `global.max_concurrent_dials`. Raising the limit is immediate;
-    /// lowering it only takes effect before the first dial, since a
-    /// `Semaphore` cannot reclaim outstanding permits.
-    pub(crate) fn configure_dial_limit(limit: usize) {
-        let limit = limit.max(1);
-        let previous = DIAL_LIMIT.swap(limit as u64, Ordering::AcqRel) as usize;
-        if let Some(semaphore) = GLOBAL_DIAL_SEMAPHORE.get()
-            && limit > previous
-        {
-            semaphore.add_permits(limit - previous);
         }
     }
 
@@ -945,15 +910,18 @@ mod tests {
     async fn test_dial_permits_cap_concurrent_callers() {
         use std::sync::atomic::AtomicUsize;
 
-        ConnectionPool::configure_dial_limit(3);
+        let generation = Arc::new(
+            honk_outbound::runtime::OutboundRuntimeRegistry::build_reusing(&[], 3, None).unwrap(),
+        );
         let active = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
         let mut tasks = tokio::task::JoinSet::new();
         for _ in 0..12 {
+            let generation = Arc::clone(&generation);
             let active = Arc::clone(&active);
             let peak = Arc::clone(&peak);
             tasks.spawn(async move {
-                let _permit = ConnectionPool::acquire_dial_permit().await;
+                let _permit = generation.acquire_dial_permit().await;
                 let now = active.fetch_add(1, Ordering::AcqRel) + 1;
                 peak.fetch_max(now, Ordering::AcqRel);
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -963,7 +931,6 @@ mod tests {
         while tasks.join_next().await.is_some() {}
         assert_eq!(active.load(Ordering::Acquire), 0);
         assert_eq!(peak.load(Ordering::Acquire), 3);
-        ConnectionPool::configure_dial_limit(DEFAULT_MAX_CONCURRENT_DIALS);
     }
 
     #[tokio::test]

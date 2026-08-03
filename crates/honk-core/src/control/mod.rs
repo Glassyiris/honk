@@ -194,8 +194,6 @@ impl ControlPlane {
     ) -> anyhow::Result<Self> {
         let (tx, rx) = mpsc::channel(256);
 
-        ConnectionPool::configure_dial_limit(config.global.max_concurrent_dials);
-
         // Create alive set for node health checking and pass it into the group
         // manager so dead nodes are excluded from group selection.
         // Mark probe sockets with DAE_BYPASS_MARK so the eBPF datapath does not
@@ -247,10 +245,13 @@ impl ControlPlane {
         // Per-node runtime registry (single owner of session-layer
         // resources, keyed by Node.id). Invalid node sets (nil/duplicate
         // UUIDs) are a fatal config error at startup.
-        let runtime_registry =
-            honk_outbound::runtime::OutboundRuntimeRegistry::build(&config.nodes)
-                .map_err(|e| anyhow::anyhow!("invalid node set: {}", e))?
-                .into_shared();
+        let runtime_registry = honk_outbound::runtime::OutboundRuntimeRegistry::build_reusing(
+            &config.nodes,
+            config.global.max_concurrent_dials,
+            None,
+        )
+        .map_err(|e| anyhow::anyhow!("invalid node set: {}", e))?
+        .into_shared();
         let outbound_runtime = runtime_registry.read().clone();
         dns_upstream_pool.set_runtime_generation(Arc::clone(&outbound_runtime))?;
         {
