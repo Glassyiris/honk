@@ -1,15 +1,4 @@
-//! External UI auto-download for the clash API (sing-box
-//! `experimental/clashapi/server_resources.go` equivalent).
-//!
-//! When `experimental.clash_api.external_ui` points at a missing or empty
-//! directory, a background task downloads the zashboard dashboard zip from
-//! GitHub and extracts it into that directory, stripping the single
-//! top-level archive directory. The download never blocks startup and
-//! failures only log a warning — `ServeDir` keeps returning 404 until the
-//! files land.
-//!
-//! The download URL defaults to [`DEFAULT_UI_DOWNLOAD_URL`] and can be
-//! overridden with the `HONK_UI_DOWNLOAD_URL` environment variable.
+//! Atomic external-UI download and publication for the Clash API.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -22,82 +11,218 @@ pub const DEFAULT_UI_DOWNLOAD_URL: &str =
 /// Environment variable overriding [`DEFAULT_UI_DOWNLOAD_URL`].
 pub const UI_DOWNLOAD_URL_ENV: &str = "HONK_UI_DOWNLOAD_URL";
 
-/// HTTP timeout for the archive download.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Spawn a background task that downloads the dashboard when `dir` is
-/// missing or empty. Fire-and-forget: outcomes are only logged.
-pub fn spawn_ui_download_if_needed(dir: String) {
+/// Start a non-blocking initial download when the configured directory is empty.
+pub fn spawn_ui_download_if_needed(
+    dir: String,
+    update_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    url: Option<String>,
+) {
     tokio::spawn(async move {
-        match ensure_external_ui(&dir).await {
-            Ok(true) => tracing::info!("external UI downloaded into {}", dir),
+        let _update = update_lock.lock().await;
+        let result = match url {
+            Some(url) => ensure_external_ui_from_url(&dir, &url).await,
+            None => ensure_external_ui(&dir).await,
+        };
+        match result {
+            Ok(true) => tracing::info!(directory = %dir, "external UI published"),
             Ok(false) => {}
-            Err(e) => tracing::warn!("download external ui error: {:#}", e),
+            Err(error) => tracing::warn!(%error, "external UI startup download failed"),
         }
     });
 }
 
-/// Ensure `dir` exists and holds the dashboard, downloading it when the
-/// directory is missing or empty. Returns `Ok(true)` when a download was
-/// performed, `Ok(false)` when the directory was already populated.
+/// Download and publish the UI only when `dir` is missing or empty.
 pub async fn ensure_external_ui(dir: &str) -> anyhow::Result<bool> {
+    let url = download_url();
+    ensure_external_ui_from_url(dir, &url).await
+}
+
+async fn ensure_external_ui_from_url(dir: &str, url: &str) -> anyhow::Result<bool> {
     if dir.is_empty() {
         return Ok(false);
     }
-    let path = Path::new(dir);
-    match std::fs::read_dir(path) {
+    match std::fs::read_dir(dir) {
         Ok(mut entries) => {
             if entries.next().is_some() {
-                // Already populated — nothing to do.
                 return Ok(false);
             }
         }
-        Err(_) => std::fs::create_dir_all(path)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
-    download_external_ui(dir, &download_url()).await?;
+    replace_external_ui_from_url(dir, url).await?;
     Ok(true)
 }
 
-/// The configured download URL (env override, then the default constant).
-fn download_url() -> String {
-    std::env::var(UI_DOWNLOAD_URL_ENV).unwrap_or_else(|_| DEFAULT_UI_DOWNLOAD_URL.to_string())
+/// Replace `dir` from the configured environment/default archive URL.
+pub async fn replace_external_ui(dir: &str) -> anyhow::Result<()> {
+    let url = download_url();
+    replace_external_ui_from_url(dir, &url).await
 }
 
-/// Download the archive at `url` and extract it into `dir`. On extraction
-/// failure the (possibly partial) directory contents are removed again,
-/// matching sing-box's cleanup so the next start retries the download.
-pub async fn download_external_ui(dir: &str, url: &str) -> anyhow::Result<()> {
-    tracing::info!("downloading external ui from {}", url);
-    let client = reqwest::Client::builder()
+/// Download into a sibling staging directory and atomically publish it.
+pub async fn replace_external_ui_from_url(dir: &str, url: &str) -> anyhow::Result<()> {
+    if dir.is_empty() {
+        anyhow::bail!("external UI directory is empty");
+    }
+    tracing::info!(%url, "downloading external UI");
+    let response = reqwest::Client::builder()
         .timeout(DOWNLOAD_TIMEOUT)
-        .build()?;
-    let response = client.get(url).send().await?;
+        .build()?
+        .get(url)
+        .send()
+        .await?;
     if !response.status().is_success() {
-        anyhow::bail!("download external ui failed: {}", response.status());
+        anyhow::bail!("download external UI failed: {}", response.status());
     }
     let bytes = response.bytes().await?;
-    let dir_owned = dir.to_string();
-    let result =
-        tokio::task::spawn_blocking(move || extract_ui_zip(&bytes, Path::new(&dir_owned))).await;
-    match result {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => {
-            remove_all_in_directory(Path::new(dir));
-            Err(e)
+    let target = PathBuf::from(dir);
+    let staging = staging_path(&target)?;
+    let extraction_path = staging.clone();
+    let extraction = tokio::task::spawn_blocking(move || {
+        extract_ui_zip(&bytes, &extraction_path)?;
+        validate_external_ui(&extraction_path)
+    })
+    .await;
+    match extraction {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            let _ = remove_path(&staging);
+            return Err(error);
         }
-        Err(join_err) => {
-            remove_all_in_directory(Path::new(dir));
-            Err(anyhow::anyhow!(
-                "external ui extraction task failed: {}",
-                join_err
-            ))
+        Err(error) => {
+            let _ = remove_path(&staging);
+            return Err(anyhow::anyhow!(
+                "external UI extraction task failed: {error}"
+            ));
         }
+    }
+
+    let publish_target = target.clone();
+    let publish_staging = staging.clone();
+    let exchanged = match tokio::task::spawn_blocking(move || {
+        publish_staging_directory(&publish_target, &publish_staging)
+    })
+    .await
+    {
+        Ok(Ok(exchanged)) => exchanged,
+        Ok(Err(error)) => {
+            let _ = remove_path(&staging);
+            return Err(error.into());
+        }
+        Err(error) => {
+            let _ = remove_path(&staging);
+            return Err(anyhow::anyhow!(
+                "external UI publication task failed: {error}"
+            ));
+        }
+    };
+    if exchanged {
+        let cleanup = staging.clone();
+        match tokio::task::spawn_blocking(move || remove_path(&cleanup)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(path = %staging.display(), %error, "old external UI cleanup failed")
+            }
+            Err(error) => {
+                tracing::warn!(path = %staging.display(), %error, "old external UI cleanup task failed")
+            }
+        }
+    }
+    Ok(())
+}
+
+fn download_url() -> String {
+    std::env::var(UI_DOWNLOAD_URL_ENV).unwrap_or_else(|_| DEFAULT_UI_DOWNLOAD_URL.to_owned())
+}
+
+fn staging_path(target: &Path) -> anyhow::Result<PathBuf> {
+    let name = target
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("external UI path has no directory name"))?;
+    let parent = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    Ok(parent.join(format!(
+        ".{}.honk-stage-{}",
+        name.to_string_lossy(),
+        uuid::Uuid::new_v4()
+    )))
+}
+
+fn validate_external_ui(staging: &Path) -> anyhow::Result<()> {
+    let index = staging.join("index.html");
+    let metadata = std::fs::symlink_metadata(&index)?;
+    if !metadata.file_type().is_file() || metadata.len() == 0 {
+        anyhow::bail!("external UI archive has no regular non-empty index.html");
+    }
+    Ok(())
+}
+
+fn publish_staging_directory(target: &Path, staging: &Path) -> std::io::Result<bool> {
+    if target.try_exists()? {
+        rename_exchange(target, staging)?;
+        Ok(true)
+    } else {
+        std::fs::rename(staging, target)?;
+        Ok(false)
     }
 }
 
-/// Extract a zip archive into `output`, stripping the single top-level
-/// directory when every entry shares one (GitHub archives always do).
-/// Entries with path-traversal components are skipped.
+#[cfg(target_os = "linux")]
+fn rename_exchange(left: &Path, right: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let left = CString::new(left.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let right = CString::new(right.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // libc omits the renameat2 wrapper on musl; use the Linux syscall ABI directly.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            left.as_ptr(),
+            libc::AT_FDCWD,
+            right.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn rename_exchange(_left: &Path, _right: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic external UI exchange requires Linux renameat2",
+    ))
+}
+
+fn remove_path(path: &Path) -> std::io::Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+}
+
+/// Extract a zip archive into `output`, stripping a shared top directory.
 pub fn extract_ui_zip(bytes: &[u8], output: &Path) -> anyhow::Result<()> {
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
     let names: Vec<String> = archive.file_names().map(str::to_string).collect();
@@ -113,11 +238,12 @@ pub fn extract_ui_zip(bytes: &[u8], output: &Path) -> anyhow::Result<()> {
         if trim_top {
             components.remove(0);
         }
-        // Reject traversal and empty components (zip-slip guard).
-        if components
-            .iter()
-            .any(|c| c.is_empty() || *c == "." || *c == ".." || c.contains('\\'))
-        {
+        if components.iter().any(|component| {
+            component.is_empty()
+                || *component == "."
+                || *component == ".."
+                || component.contains('\\')
+        }) {
             continue;
         }
         if components.is_empty() {
@@ -130,14 +256,12 @@ pub fn extract_ui_zip(bytes: &[u8], output: &Path) -> anyhow::Result<()> {
         if let Some(parent) = save_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut out_file = std::fs::File::create(&save_path)?;
-        std::io::copy(&mut file as &mut dyn Read, &mut out_file)?;
+        let mut output_file = std::fs::File::create(&save_path)?;
+        std::io::copy(&mut file as &mut dyn Read, &mut output_file)?;
     }
     Ok(())
 }
 
-/// `true` when every entry in the archive lives under the same top-level
-/// directory (sing-box `zipIsInSingleDirectory`).
 fn single_top_directory(names: &[String]) -> bool {
     let mut top: Option<&str> = None;
     for name in names {
@@ -145,28 +269,16 @@ fn single_top_directory(names: &[String]) -> bool {
         let Some(first) = parts.next() else {
             return false;
         };
-        // An entry without a path separator sits at the archive root.
         if parts.next().is_none() {
             return false;
         }
         match top {
             None => top = Some(first),
-            Some(t) if t != first => return false,
+            Some(current) if current != first => return false,
             _ => {}
         }
     }
     top.is_some()
-}
-
-/// Remove everything inside `directory` (best-effort).
-fn remove_all_in_directory(directory: &Path) {
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let _ = std::fs::remove_dir_all(entry.path());
-        let _ = std::fs::remove_file(entry.path());
-    }
 }
 
 #[cfg(test)]
@@ -267,7 +379,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ui_dir = dir.path().join("ui");
         // Point the download at a *missing* directory to also cover creation.
-        download_external_ui(ui_dir.to_str().unwrap(), &format!("http://{}/ui.zip", addr))
+        replace_external_ui_from_url(ui_dir.to_str().unwrap(), &format!("http://{}/ui.zip", addr))
             .await
             .unwrap();
         assert_eq!(
@@ -298,7 +410,7 @@ mod tests {
         let garbage = zip_bytes[..zip_bytes.len() / 2].to_vec();
         let addr = spawn_zip_server(garbage).await;
         let dir = tempfile::tempdir().unwrap();
-        let result = download_external_ui(
+        let result = replace_external_ui_from_url(
             dir.path().to_str().unwrap(),
             &format!("http://{}/bad.zip", addr),
         )
@@ -306,5 +418,74 @@ mod tests {
         assert!(result.is_err());
         // Partial contents are removed so the next start retries.
         assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+    }
+    #[tokio::test]
+    async fn invalid_index_preserves_existing_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("ui");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("index.html"), "old-index").unwrap();
+        let archive = make_zip(&[("dist/assets/app.js", b"new-asset".as_slice())]);
+        let addr = spawn_zip_server(archive).await;
+
+        assert!(
+            replace_external_ui_from_url(
+                target.to_str().unwrap(),
+                &format!("http://{addr}/invalid.zip"),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("index.html")).unwrap(),
+            "old-index"
+        );
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn replacement_exchanges_complete_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("ui");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("index.html"), "old-index").unwrap();
+        std::fs::write(target.join("old-only.txt"), "old").unwrap();
+        let archive = make_zip(&[
+            ("dist/index.html", b"new-index".as_slice()),
+            ("dist/assets/app.js", b"new-asset".as_slice()),
+        ]);
+        let addr = spawn_zip_server(archive).await;
+
+        replace_external_ui_from_url(
+            target.to_str().unwrap(),
+            &format!("http://{addr}/valid.zip"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(target.join("index.html")).unwrap(),
+            "new-index"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("assets/app.js")).unwrap(),
+            "new-asset"
+        );
+        assert!(!target.join("old-only.txt").exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn exchange_failure_preserves_existing_target() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("ui");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("index.html"), "old-index").unwrap();
+        let missing_staging = root.path().join("missing-staging");
+
+        assert!(publish_staging_directory(&target, &missing_staging).is_err());
+        assert_eq!(
+            std::fs::read_to_string(target.join("index.html")).unwrap(),
+            "old-index"
+        );
     }
 }

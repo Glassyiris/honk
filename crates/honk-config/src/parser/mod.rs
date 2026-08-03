@@ -1434,6 +1434,7 @@ fn parse_subscription_section(section: &Section) -> Result<Vec<Subscription>, cr
             subs.push(Subscription {
                 name: tag,
                 url,
+                enabled: true,
                 ..Default::default()
             });
         } else if trimmed.starts_with('\'') && trimmed.ends_with('\'') {
@@ -1441,6 +1442,7 @@ fn parse_subscription_section(section: &Section) -> Result<Vec<Subscription>, cr
             subs.push(Subscription {
                 name: url.clone(),
                 url,
+                enabled: true,
                 ..Default::default()
             });
         }

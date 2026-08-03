@@ -72,6 +72,58 @@ impl Drop for ConnectionGuard {
     }
 }
 
+enum CancellableTcpRelay {
+    Completed(anyhow::Result<relay::RelayStats>),
+    Closed,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn relay_tcp_until_closed(
+    client: TcpStream,
+    mut proxy: honk_outbound::proxy::ProxyStream,
+    client_addr: SocketAddr,
+    target_addr: SocketAddr,
+    sniffed_bytes: Vec<u8>,
+    upload: Arc<std::sync::atomic::AtomicU64>,
+    download: Arc<std::sync::atomic::AtomicU64>,
+    mut close_rx: tokio::sync::oneshot::Receiver<()>,
+) -> CancellableTcpRelay {
+    let relay = async move {
+        use tokio::io::AsyncWriteExt;
+
+        let mut remaining = sniffed_bytes.as_slice();
+        while !remaining.is_empty() {
+            let written = proxy.stream.write(remaining).await?;
+            if written == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "proxy closed while writing sniffed bytes",
+                )
+                .into());
+            }
+            upload.fetch_add(written as u64, std::sync::atomic::Ordering::Relaxed);
+            remaining = &remaining[written..];
+        }
+
+        let progress = Some((upload, download));
+        match proxy.into_tcp_stream() {
+            Ok(upstream) => {
+                relay::splice::relay_splice(client, upstream, client_addr, target_addr, progress)
+                    .await
+            }
+            Err(proxy) => {
+                relay::splice::relay_auto(client, proxy.stream, client_addr, target_addr, progress)
+                    .await
+            }
+        }
+    };
+    tokio::pin!(relay);
+    tokio::select! {
+        result = &mut relay => CancellableTcpRelay::Completed(result),
+        _ = &mut close_rx => CancellableTcpRelay::Closed,
+    }
+}
+
 /// Shared context bundle passed to every connection handler.
 /// Bundles all shared fields under a single `Arc` to eliminate
 /// per-field atomic reference-count overhead on the hot path.
@@ -660,7 +712,7 @@ impl ControlPlaneHandle {
             let overall_ms = (per_node_ms * 4).max(10000);
             tokio::time::Instant::now() + std::time::Duration::from_millis(overall_ms)
         };
-        let (mut proxy_stream, node): (crate::proxy::ProxyStream, &Node) = {
+        let (proxy_stream, node): (crate::proxy::ProxyStream, &Node) = {
             let ctx = self.clone();
             let target = resolved_target;
             let target_domain = target_domain.clone();
@@ -938,6 +990,7 @@ impl ControlPlaneHandle {
         // single close-time (never-visible) update.
         let conn_upload = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let conn_download = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (close_tx, close_rx) = tokio::sync::oneshot::channel();
         self.connection_tracker
             .register(crate::connection_tracker::ConnectionEntry {
                 id: conn_id.clone(),
@@ -952,6 +1005,8 @@ impl ControlPlaneHandle {
                 start_time: std::time::Instant::now(),
                 domain: target_domain.clone(),
                 network: "tcp".to_string(),
+                dscp: dscp_val,
+                close_handle: crate::connection_tracker::ConnectionCloseHandle::tcp(close_tx),
             });
 
         debug!(
@@ -965,164 +1020,59 @@ impl ControlPlaneHandle {
             "TCP connection: {} <-> {}", client_addr, resolved_target,
         );
 
-        if !sniff_result.buffered.is_empty() {
-            use tokio::io::AsyncWriteExt;
-            if let Err(e) = proxy_stream.stream.write_all(&sniff_result.buffered).await {
-                warn!("Failed to write sniffed bytes to proxy: {}", e);
-                self.stats.record_error(&outbound_name);
-                self.stats.record_close(&outbound_name);
-                self.connection_tracker.remove(&conn_id);
-                return Ok(());
-            }
-        }
+        let relay_result = relay_tcp_until_closed(
+            stream,
+            proxy_stream,
+            client_addr,
+            resolved_target,
+            sniff_result.buffered,
+            conn_upload,
+            conn_download,
+            close_rx,
+        )
+        .await;
 
-        // Zero-copy fast path: a direct dial yields plain `TcpStream`s on
-        // both ends, so relay through `splice(2)` (with automatic lossless
-        // fallback to the copy relay when the kernel rejects it). TLS- or
-        // protocol-wrapped proxy streams keep the userspace copy relay.
-        // Both paths update the connection's live byte counters as data flows.
-        let conn_progress = Some((conn_upload.clone(), conn_download.clone()));
-        let relay_result = match proxy_stream.into_tcp_stream() {
-            Ok(upstream) => {
-                relay::splice::relay_splice(
-                    stream,
-                    upstream,
-                    client_addr,
-                    resolved_target,
-                    conn_progress,
-                )
-                .await
-            }
-            Err(proxy_stream) => {
-                relay::splice::relay_auto(
-                    stream,
-                    proxy_stream.stream,
-                    client_addr,
-                    resolved_target,
-                    conn_progress,
-                )
-                .await
-            }
-        };
-
-        match relay_result {
-            Ok(relay_stats) => {
-                self.connection_tracker.remove(&conn_id);
-                self.stats.record_bytes(
-                    &outbound_name,
-                    relay_stats.client_to_proxy,
-                    relay_stats.proxy_to_client,
-                );
-                self.stats.record_close(&outbound_name);
-
-                // Deposit a fresh connection for future reuse. Ready-capable
-                // handlers get a fully-dialed, target-bound stream (handshake
-                // paid here, off the critical path); others get a bare TCP
-                // to the proxy server.
-                if outbound_name != "direct" && outbound_name != "block" {
-                    let node = node.clone();
-                    let node_addr = format!("{}:{}", node.host(), node.port);
-                    let pool = self.connection_pool.clone();
-                    let registry = self.proxy_registry.clone();
-                    let target_domain = target_domain.clone();
-                    tokio::spawn(async move {
-                        let caps = honk_outbound::runtime::OutboundCapabilities::for_node(&node);
-                        let (ready_capable, bare_capable) = registry
-                            .find(node.protocol)
-                            .map(|h| {
-                                (
-                                    h.pool_ready_streams(&node) && caps.tcp && !caps.multiplexed,
-                                    h.pool_bare_tcp(&node),
-                                )
-                            })
-                            .unwrap_or((false, false));
-                        if ready_capable {
-                            let key = ConnectionPool::ready_key(
-                                &node_addr,
-                                resolved_target,
-                                target_domain.as_deref(),
-                            );
-                            // Only hot targets earn a speculative ready
-                            // dial; a one-off flow gets none.
-                            if !pool.note_target(&key) {
-                                return;
-                            }
-                            match registry
-                                .dial(
-                                    &node,
-                                    resolved_target,
-                                    target_domain.as_deref(),
-                                    connect_timeout,
-                                )
-                                .await
-                            {
-                                Ok(stream) => {
-                                    pool.deposit_ready(&key, stream).await;
-                                }
-                                Err(e) => {
-                                    debug!(
-                                        "Pool deposit: ready dial to {} via {} failed: {}",
-                                        resolved_target, node_addr, e
-                                    );
-                                }
-                            }
-                            return;
-                        }
-                        if !bare_capable {
-                            // Multiplexed protocols pool whole sessions
-                            // instead; a bare TCP is useless to them.
-                            return;
-                        }
-                        match honk_outbound::util::connect_outbound(&node_addr, connect_timeout)
-                            .await
-                        {
-                            Ok(stream) => {
-                                if is_tcp_stream_alive(&stream) {
-                                    pool.deposit_tcp(&node_addr, stream).await;
-                                } else {
-                                    debug!("Pool deposit: stream to {} is dead", node_addr);
-                                }
-                            }
-                            Err(e) => {
-                                debug!("Pool deposit: connect to {} failed: {}", node_addr, e);
-                            }
-                        }
-                    });
-                }
-            }
-            Err(e) => {
-                self.connection_tracker.remove(&conn_id);
-                // The relay updates these atomics as every read/splice completes.
-                // Preserve bytes moved before an I/O failure rather than turning
-                // the whole flow into a synthetic zero-byte success.
-                self.stats.record_bytes(
-                    &outbound_name,
-                    conn_upload.load(std::sync::atomic::Ordering::Relaxed),
-                    conn_download.load(std::sync::atomic::Ordering::Relaxed),
-                );
-                let io_err = e.downcast_ref::<std::io::Error>();
-                if let Some(io_err) = io_err {
-                    if relay::is_ignorable_connection_error(io_err) {
+        let completed_successfully = match relay_result {
+            CancellableTcpRelay::Completed(Ok(_)) => true,
+            CancellableTcpRelay::Completed(Err(error)) => {
+                let io_error = error.downcast_ref::<std::io::Error>();
+                if let Some(io_error) = io_error {
+                    if relay::is_ignorable_connection_error(io_error) {
                         debug!(
                             "TCP relay closed for {} -> {}: {}",
-                            client_addr, resolved_target, io_err
+                            client_addr, resolved_target, io_error
                         );
                     } else {
                         warn!(
                             "Relay error for {} -> {}: {}",
-                            client_addr, resolved_target, e
+                            client_addr, resolved_target, error
                         );
                     }
                 } else {
                     warn!(
                         "Relay error for {} -> {}: {}",
-                        client_addr, resolved_target, e
+                        client_addr, resolved_target, error
                     );
                 }
                 self.stats.record_error(&outbound_name);
-                self.stats.record_close(&outbound_name);
+                false
             }
-        }
+            CancellableTcpRelay::Closed => {
+                debug!(
+                    client = %client_addr,
+                    destination = %resolved_target,
+                    "TCP connection closed administratively"
+                );
+                false
+            }
+        };
+
+        self.connection_tracker.commit_tcp_traffic_and_remove(
+            &conn_id,
+            &self.stats,
+            &outbound_name,
+        );
+        self.stats.record_close(&outbound_name);
 
         // Event-driven lifecycle: the userspace relay has ended, so this
         // flow's conntrack entries are dead state — retire both directions
@@ -1149,7 +1099,7 @@ impl ControlPlaneHandle {
             );
         }
 
-        if let (Some(ref ho), Some(ref domain)) = (handoff, sniff_result.domain)
+        if let (Some(ho), Some(domain)) = (&handoff, &sniff_result.domain)
             && (ho.outbound >= OutboundIndex::UserBase as u8
                 || ho.outbound == OutboundIndex::Direct as u8)
         {
@@ -1164,6 +1114,78 @@ impl ControlPlaneHandle {
             }
         }
 
+        // Deposit a fresh connection for future reuse. Ready-capable
+        // handlers get a fully-dialed, target-bound stream (handshake
+        // paid here, off the critical path); others get a bare TCP
+        // to the proxy server.
+        if completed_successfully && outbound_name != "direct" && outbound_name != "block" {
+            let node = node.clone();
+            let node_addr = format!("{}:{}", node.host(), node.port);
+            let pool = self.connection_pool.clone();
+            let registry = self.proxy_registry.clone();
+            let target_domain = target_domain.clone();
+            tokio::spawn(async move {
+                let caps = honk_outbound::runtime::OutboundCapabilities::for_node(&node);
+                let (ready_capable, bare_capable) = registry
+                    .find(node.protocol)
+                    .map(|h| {
+                        (
+                            h.pool_ready_streams(&node) && caps.tcp && !caps.multiplexed,
+                            h.pool_bare_tcp(&node),
+                        )
+                    })
+                    .unwrap_or((false, false));
+                if ready_capable {
+                    let key = ConnectionPool::ready_key(
+                        &node_addr,
+                        resolved_target,
+                        target_domain.as_deref(),
+                    );
+                    // Only hot targets earn a speculative ready
+                    // dial; a one-off flow gets none.
+                    if !pool.note_target(&key) {
+                        return;
+                    }
+                    match registry
+                        .dial(
+                            &node,
+                            resolved_target,
+                            target_domain.as_deref(),
+                            connect_timeout,
+                        )
+                        .await
+                    {
+                        Ok(stream) => {
+                            pool.deposit_ready(&key, stream).await;
+                        }
+                        Err(e) => {
+                            debug!(
+                                "Pool deposit: ready dial to {} via {} failed: {}",
+                                resolved_target, node_addr, e
+                            );
+                        }
+                    }
+                    return;
+                }
+                if !bare_capable {
+                    // Multiplexed protocols pool whole sessions
+                    // instead; a bare TCP is useless to them.
+                    return;
+                }
+                match honk_outbound::util::connect_outbound(&node_addr, connect_timeout).await {
+                    Ok(stream) => {
+                        if is_tcp_stream_alive(&stream) {
+                            pool.deposit_tcp(&node_addr, stream).await;
+                        } else {
+                            debug!("Pool deposit: stream to {} is dead", node_addr);
+                        }
+                    }
+                    Err(e) => {
+                        debug!("Pool deposit: connect to {} failed: {}", node_addr, e);
+                    }
+                }
+            });
+        }
         Ok(())
     }
 
@@ -1578,6 +1600,12 @@ impl ControlPlaneHandle {
                 start_time: std::time::Instant::now(),
                 domain: quic_domain.clone(),
                 network: "udp".to_string(),
+                dscp: handoff.as_ref().map(|handoff| handoff.dscp).unwrap_or(0),
+                close_handle: crate::connection_tracker::ConnectionCloseHandle::udp(
+                    Arc::downgrade(&self.udp_pool),
+                    client_addr,
+                    original_dst,
+                ),
             });
         endpoint.set_tracker(conn_id.clone());
         if !lease.set_tracker_id(conn_id.clone()) {
@@ -1751,6 +1779,174 @@ pub(super) fn domain_reality_outcome(
                 RealityOutcome::Mismatch
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tcp_close_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (connected, accepted) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        (connected.unwrap(), accepted.unwrap().0)
+    }
+
+    #[tokio::test]
+    async fn close_drops_live_loopback_relay_with_exact_counters() {
+        let (client, mut client_peer) = tcp_pair().await;
+        let (upstream, mut upstream_peer) = tcp_pair().await;
+        let client_addr = client.local_addr().unwrap();
+        let target_addr = upstream.peer_addr().unwrap();
+        let upload = Arc::new(AtomicU64::new(0));
+        let download = Arc::new(AtomicU64::new(0));
+        let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+        let relay = tokio::spawn(relay_tcp_until_closed(
+            client,
+            honk_outbound::proxy::ProxyStream {
+                stream: Box::new(upstream),
+                target_addr,
+                target_domain: None,
+            },
+            client_addr,
+            target_addr,
+            Vec::new(),
+            Arc::clone(&upload),
+            Arc::clone(&download),
+            close_rx,
+        ));
+
+        client_peer.write_all(b"hello").await.unwrap();
+        let mut request = [0u8; 5];
+        upstream_peer.read_exact(&mut request).await.unwrap();
+        upstream_peer.write_all(b"bye").await.unwrap();
+        let mut response = [0u8; 3];
+        client_peer.read_exact(&mut response).await.unwrap();
+        assert_eq!(&request, b"hello");
+        assert_eq!(&response, b"bye");
+        assert_eq!(upload.load(Ordering::Relaxed), 5);
+        assert_eq!(download.load(Ordering::Relaxed), 3);
+
+        close_tx.send(()).unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), relay)
+                .await
+                .unwrap()
+                .unwrap(),
+            CancellableTcpRelay::Closed
+        ));
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), client_peer.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), upstream_peer.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+    }
+
+    #[derive(Debug)]
+    struct PendingWrite {
+        polled: Arc<AtomicBool>,
+    }
+
+    impl tokio::io::AsyncRead for PendingWrite {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl tokio::io::AsyncWrite for PendingWrite {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.polled.store(true, Ordering::Release);
+            std::task::Poll::Pending
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn close_cancels_blocked_sniff_buffer_write() {
+        let (client, mut client_peer) = tcp_pair().await;
+        let client_addr = client.local_addr().unwrap();
+        let target_addr = "127.0.0.1:443".parse().unwrap();
+        let polled = Arc::new(AtomicBool::new(false));
+        let upload = Arc::new(AtomicU64::new(0));
+        let download = Arc::new(AtomicU64::new(0));
+        let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+        let relay = tokio::spawn(relay_tcp_until_closed(
+            client,
+            honk_outbound::proxy::ProxyStream {
+                stream: Box::new(PendingWrite {
+                    polled: Arc::clone(&polled),
+                }),
+                target_addr,
+                target_domain: None,
+            },
+            client_addr,
+            target_addr,
+            b"buffered client hello".to_vec(),
+            Arc::clone(&upload),
+            download,
+            close_rx,
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !polled.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        close_tx.send(()).unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), relay)
+                .await
+                .unwrap()
+                .unwrap(),
+            CancellableTcpRelay::Closed
+        ));
+        assert_eq!(upload.load(Ordering::Relaxed), 0);
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), client_peer.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
     }
 }
 

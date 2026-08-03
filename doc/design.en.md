@@ -29,7 +29,7 @@
 | Config section syntax | **dae** | `global { } node { } group { } routing { }` |
 | Group policies & nested outbounds | **sing-box** | Selector / URLTest / LB / Fallback, RealTag-style chain |
 | TCP/UDP separate URLTest picks | **sing-box** | Tolerance, idle_timeout, interrupt_connections |
-| Clash API + external UI download | **sing-box** clashapi | Minimal REST/WS set |
+| Clash API + external UI | **sing-box** clashapi | Capability-truthful zashboard core surface |
 | Protocol/transport details | **sing-box** + daeuniverse **outbound** | SS2022, AnyTLS pool, UoT v2, Hy2/TUIC/Juicity, h2mux |
 
 ## 4. Crate layout
@@ -344,7 +344,21 @@ configuration key, or API.
 
 Enabled when `experimental.clash_api.external_controller` is non-empty.
 
-Core surface: `/version`, `/configs`, `/proxies`, delay endpoints, `/rules`, `/connections`, `/traffic`, `/stats`, `/logs`, `/dns/query`, cache flush, `/providers/proxies`, external UI auto-download (Yacd-meta). `GET /stats` includes a stable nested `udp` object; its complete schema is documented in the component reference.
+The server advertises the `sing-box honk <package-version>` capability profile
+and registers only behavior honk owns; Mihomo-only restart, binary/Geo upgrade,
+TUN, Smart, and rule-mutation routes remain absent. The implemented surface
+includes configs/proxies/delay/rules, connection snapshots and real termination,
+shared `/traffic` and `/memory` streams, `/stats`, filtered `/logs`, DNS/cache
+operations, enabled subscriptions as refreshable/health-checkable proxy
+providers, zashboard settings storage, and staged atomic external-UI updates.
+
+`PATCH /configs` changes only Clash mode. `PUT /configs?reload=true` sends the
+configured DAE path to the serialized control owner and returns only after base
+runtime publication; config replacement is rejected. Subscription fetches are
+identity-revalidated before their acknowledged merge, so stale work cannot
+resurrect a removed, disabled, or changed provider. Connection deletion signals
+the lifecycle owner of the TCP relay or UDP endpoint rather than deleting only
+the API row.
 
 Auth: `Authorization: Bearer` or `?token=` (percent-decoded).
 

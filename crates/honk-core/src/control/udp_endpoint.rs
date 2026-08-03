@@ -2379,6 +2379,58 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn administrative_close_retires_udp_through_removal_sink() {
+        let pool = Arc::new(UdpEndpointPool::new());
+        let stats = StatsManager::new();
+        let tracker = crate::connection_tracker::ConnectionTracker::new();
+        let client = make_addr("10.0.0.1", 12345);
+        let dst = make_addr("8.8.8.8", 53);
+        let (removed_tx, mut removed_rx) = tokio::sync::mpsc::channel(16);
+        pool.set_remove_sink(removed_tx);
+        let first_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        let lease = match pool.reserve_or_enqueue(client, dst, b"first", first_permit, &stats) {
+            EndpointReservation::Initializing(lease) => lease,
+            _ => panic!("first reservation must initialize"),
+        };
+        assert!(lease.set_tracker_id("udp-close".to_owned()));
+        tracker.register(crate::connection_tracker::ConnectionEntry {
+            id: "udp-close".into(),
+            source: client.to_string(),
+            destination: dst.to_string(),
+            proxy: "proxy".into(),
+            rule: "Match".into(),
+            rule_payload: String::new(),
+            chains: vec!["proxy".into()],
+            upload: Arc::new(AtomicU64::new(0)),
+            download: Arc::new(AtomicU64::new(0)),
+            start_time: Instant::now(),
+            domain: None,
+            network: "udp".into(),
+            dscp: 0,
+            close_handle: crate::connection_tracker::ConnectionCloseHandle::udp(
+                Arc::downgrade(&pool),
+                client,
+                dst,
+            ),
+        });
+
+        assert!(tracker.close_connection("udp-close"));
+        assert!(tracker.close_connection("udp-close"));
+        assert!(pool.is_empty());
+        assert_eq!(
+            removed_rx.try_recv().unwrap(),
+            (client, dst, Some("udp-close".to_owned()))
+        );
+        assert!(matches!(
+            removed_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(tracker.snapshot().len(), 1);
+        tracker.remove("udp-close");
+        drop(lease);
+    }
+
     #[tokio::test]
     async fn udp_init_lease_abort_and_panic_release_generation_for_reuse() {
         let pool = Arc::new(UdpEndpointPool::new());

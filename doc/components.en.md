@@ -535,26 +535,47 @@ experimental {
 
 ### HTTP API map (implemented)
 
+`GET /version` returns only the `sing-box honk <package-version>` capability
+profile. Unsupported Mihomo-only actions are not advertised by that profile.
+
 | Method | Path | Purpose |
 | -------- | ------ | --------- |
-| GET | `/` `/version` | Hello / version |
-| GET/PUT/PATCH | `/configs` | Mode and related |
-| GET | `/proxies` | Nodes + groups |
+| GET | `/` `/version` | Hello / capability profile |
+| GET | `/configs` | Runtime mode and actual TPROXY port |
+| PUT | `/configs?reload=true` | Reload the configured DAE file; wait for runtime publication |
+| PATCH | `/configs` | Set `Rule` / `Global` / `Direct` mode only |
+| GET | `/proxies` | Nodes + groups with truthful UDP capability |
 | GET/PUT | `/proxies/{name}` | Detail / selector set |
 | GET | `/proxies/{name}/delay` | On-demand delay |
 | GET | `/group/{name}/delay` | Group delay |
-| GET | `/rules` | Rules |
-| GET/DELETE | `/connections` | List / close all |
-| DELETE | `/connections/{id}` | Close one |
-| GET | `/traffic` | WS or chunked JSON lines |
+| GET | `/rules` | One row per DAE rule plus final `Match` |
+| GET | `/connections` | REST or WS connection snapshots |
+| DELETE | `/connections` | Close every tracked TCP/UDP connection |
+| DELETE | `/connections/{id}` | Close one tracked TCP/UDP connection |
+| GET | `/traffic` | WS or chunked per-second JSON deltas |
+| GET | `/memory` | WS or chunked process-RSS samples |
 | GET | `/stats` | Outbound and stable UDP stats |
-| GET | `/logs` | WS or chunked |
+| GET | `/logs` | WS or chunked logs; `?level=` includes `silent` |
 | GET | `/dns/query` | DoH-style JSON |
 | POST | `/cache/fakeip/flush` | FakeIP prefix flush |
 | POST | `/cache/dns/flush` | DNS cache flush |
-| GET | `/providers/proxies` | Groups as providers |
-| GET | `/providers/rules` | Stub empty |
+| GET | `/providers/proxies` | Enabled subscriptions as HTTP proxy providers |
+| PUT | `/providers/proxies/{provider}` | Fetch and acknowledged-merge one subscription |
+| GET | `/providers/proxies/{provider}/healthcheck` | Test every node in one subscription |
+| GET | `/providers/proxies/{provider}/{proxy}/healthcheck` | Test one subscription node |
+| GET | `/providers/rules` | Empty compatibility object |
+| GET/PUT/DELETE | `/storage/zashboard` | Read, replace, or clear dashboard settings |
+| POST | `/upgrade/ui` | Stage, validate, and atomically replace the external UI |
 | GET | `/ui` … | External UI |
+
+Config replacement and forced updates remain unsupported: `PUT /configs`
+accepts only `reload=true` with empty `path` and `payload`. Connection deletion
+signals lifecycle-owned TCP relays or UDP endpoint pools and lets those owners
+perform socket, tracker, and conn-state cleanup. Provider rows are isolated by
+subscription ID; refreshes are revalidated and serialized before publication.
+Dashboard settings persist through `cachedb` when it is enabled and otherwise
+remain process-local. Startup UI installation and `POST /upgrade/ui` share the
+same staged, atomic publication path.
 
 ### `GET /stats` UDP schema
 

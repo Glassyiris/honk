@@ -735,6 +735,13 @@ protocol = "udp"
         let old1 = node("sub-old-1", Some(sub_id));
         let old2 = node("sub-old-2", Some(sub_id));
         let other = node("other-sub", Some(other_sub_id));
+        let subscription = honk_config::subscription::Subscription {
+            id: sub_id,
+            name: "fixture".into(),
+            url: "https://example.test/subscription".into(),
+            enabled: true,
+            ..Default::default()
+        };
         let mut config = Config {
             nodes: vec![
                 static_node.clone(),
@@ -747,6 +754,7 @@ protocol = "udp"
                 policy: GroupPolicy::Selector,
                 ..Default::default()
             }],
+            subscriptions: vec![subscription.clone()],
             ..Default::default()
         };
         // Startup resolves filter-based membership (filter-less group → all
@@ -781,8 +789,9 @@ protocol = "udp"
         // fresh UUIDs replace the previous generation.
         let new1 = node("sub-new-1", Some(sub_id));
         let new2 = node("sub-new-2", Some(sub_id));
-        cp.merge_subscription_nodes(sub_id, vec![new1.clone(), new2.clone()])
-            .await;
+        cp.merge_subscription_nodes(subscription.clone(), vec![new1.clone(), new2.clone()])
+            .await
+            .unwrap();
 
         // The merged config replaces only this subscription's nodes.
         {
@@ -833,8 +842,9 @@ protocol = "udp"
         // with fresh UUIDs) replaces instead of duplicating.
         let refresh1 = node("sub-new-1", Some(sub_id));
         let refresh2 = node("sub-new-2", Some(sub_id));
-        cp.merge_subscription_nodes(sub_id, vec![refresh1, refresh2])
-            .await;
+        cp.merge_subscription_nodes(subscription, vec![refresh1, refresh2])
+            .await
+            .unwrap();
         {
             let config = cp.config_handle();
             let config = config.read().await;

@@ -55,7 +55,11 @@ impl ControlPlane {
     /// failures leave the current generation untouched; an eBPF push failure
     /// replays the exact active plan before admission resumes. SIGHUP and
     /// subscription merges share this command-channel-serialized path.
-    pub(super) async fn apply_runtime_config(&self, new_config: Config, drain: &DrainTracker) {
+    pub(super) async fn apply_runtime_config(
+        &self,
+        new_config: Config,
+        drain: &DrainTracker,
+    ) -> Result<(), String> {
         let current_config = self.config.read().await.clone();
         let restart_required = restart_required_changes(&current_config, &new_config);
         if !restart_required.is_empty() {
@@ -63,7 +67,10 @@ impl ControlPlane {
                 fields = ?restart_required,
                 "reload rejected: changed fields require process restart"
             );
-            return;
+            return Err(format!(
+                "reload rejected: changed fields require process restart: {}",
+                restart_required.join(", ")
+            ));
         }
         let old_plan = self.active_routing_plan.read().clone();
 
@@ -76,7 +83,7 @@ impl ControlPlane {
             Err(e) => {
                 error!("Failed to build new router: {}", e);
                 self.stop_reload_rejection_if_healthy(drain);
-                return;
+                return Err(format!("Failed to build new router: {e}"));
             }
         };
         let pinned_router = match Router::new(
@@ -87,7 +94,9 @@ impl ControlPlane {
             Err(error) => {
                 error!(%error, "Failed to build pinned DNS traffic router");
                 self.stop_reload_rejection_if_healthy(drain);
-                return;
+                return Err(format!(
+                    "Failed to build pinned DNS traffic router: {error}"
+                ));
             }
         };
         let old_group_manager = self.group_manager.read().clone();
@@ -105,7 +114,9 @@ impl ControlPlane {
                 Err(e) => {
                     error!("Failed to build runtime registry (reload aborted): {}", e);
                     self.stop_reload_rejection_if_healthy(drain);
-                    return;
+                    return Err(format!(
+                        "Failed to build runtime registry (reload aborted): {e}"
+                    ));
                 }
             },
         );
@@ -122,7 +133,7 @@ impl ControlPlane {
             Err(e) => {
                 error!("Failed to build DNS forwarder: {}", e);
                 self.stop_reload_rejection_if_healthy(drain);
-                return;
+                return Err(format!("Failed to build DNS forwarder: {e}"));
             }
         };
         let policy_id = match crate::dns::policy::PolicyId::from_config(&new_config.dns) {
@@ -130,7 +141,7 @@ impl ControlPlane {
             Err(error) => {
                 error!(%error, "Failed to build DNS policy identity");
                 self.stop_reload_rejection_if_healthy(drain);
-                return;
+                return Err(format!("Failed to build DNS policy identity: {error}"));
             }
         };
         let new_outbound_id_map = build_outbound_id_map(&new_config);
@@ -145,7 +156,9 @@ impl ControlPlane {
             Err(error) => {
                 error!(%error, "Failed to prepare direct health-check target");
                 self.stop_reload_rejection_if_healthy(drain);
-                return;
+                return Err(format!(
+                    "Failed to prepare direct health-check target: {error}"
+                ));
             }
         };
         let bootstrap_resolver = honk_outbound::bootstrap::BootstrapResolver::parse(&bootstrap);
@@ -154,7 +167,7 @@ impl ControlPlane {
             Err(error) => {
                 error!(%error, "Failed to compile routing publication");
                 self.stop_reload_rejection_if_healthy(drain);
-                return;
+                return Err(format!("Failed to compile routing publication: {error}"));
             }
         };
         let push_result = new_plan.result();
@@ -212,7 +225,7 @@ impl ControlPlane {
         if !self.udp_pool.cancel_initializers_and_wait().await {
             warn!("UDP initializers did not drain before reload commit");
             self.stop_reload_rejection_if_healthy(drain);
-            return;
+            return Err("UDP initializers did not drain before reload commit".to_string());
         }
         let old_registry = {
             let mut router_guard = self.router.write().await;
@@ -230,14 +243,16 @@ impl ControlPlane {
                 let restore = publish_group_connectivity(ebpf.as_mut(), &old_connectivity);
                 error!(%error, ?restore, "Failed to open group connectivity for reload transition");
                 self.stop_reload_rejection_if_healthy(drain);
-                return;
+                return Err(format!(
+                    "Failed to open group connectivity for reload transition: {error}"
+                ));
             }
             let active_generation = match ebpf.active_routing_generation() {
                 Ok(generation) => generation,
                 Err(error) => {
                     error!(%error, "Failed to read active routing generation");
                     self.stop_reload_rejection_if_healthy(drain);
-                    return;
+                    return Err(format!("Failed to read active routing generation: {error}"));
                 }
             };
             let next_generation =
@@ -248,7 +263,7 @@ impl ControlPlane {
                 let restore = publish_group_connectivity(ebpf.as_mut(), &old_connectivity);
                 error!(%error, ?restore, "Failed to stage learned domain routes");
                 self.stop_reload_rejection_if_healthy(drain);
-                return;
+                return Err(format!("Failed to stage learned domain routes: {error}"));
             }
             if let Err(error) = routing_matcher::RoutingMatcherBuilder::push_transition(
                 ebpf.as_mut(),
@@ -285,7 +300,7 @@ impl ControlPlane {
                         self.drain_tracker.start_rejecting();
                     }
                 }
-                return;
+                return Err(format!("Failed to push routing to eBPF: {error}"));
             }
 
             if let Err(error) = publish_group_connectivity(ebpf.as_mut(), &new_connectivity) {
@@ -339,6 +354,7 @@ impl ControlPlane {
         info!("Configuration applied — {} routes active", route_count);
 
         self.stop_reload_rejection_if_healthy(drain);
+        Ok(())
     }
 
     /// End reload admission once the datapath is known healthy.
@@ -351,21 +367,21 @@ impl ControlPlane {
         }
     }
 
-    /// Merge freshly fetched subscription nodes into the running config,
-    /// replacing the previous node set of `subscription_id`, and run the
-    /// shared rebuild pipeline.
-    ///
-    /// Production callers go through `ControlCommand::MergeSubscription` on
-    /// the command channel (which keeps merges serialized against SIGHUP
-    /// reloads); this public wrapper exists so integration tests can drive a
-    /// merge without binding the TPROXY accept loop.
-    pub async fn merge_subscription_nodes(&self, subscription_id: uuid::Uuid, nodes: Vec<Node>) {
+    /// Merge freshly fetched subscription nodes through the shared runtime
+    /// publication pipeline. Production callers use the serialized command
+    /// owner; this wrapper lets integration tests exercise the same candidate
+    /// validation without binding transparent listeners.
+    pub async fn merge_subscription_nodes(
+        &self,
+        subscription: Subscription,
+        nodes: Vec<Node>,
+    ) -> Result<(), String> {
         let new_config = {
             let current = self.config.read().await;
-            config_with_subscription_nodes(&current, subscription_id, nodes)
+            config_with_subscription_nodes(&current, &subscription, nodes)?
         };
-        let drain = DrainTracker::new();
-        self.apply_runtime_config(new_config, &drain).await;
+        self.apply_runtime_config(new_config, &DrainTracker::new())
+            .await
     }
 
     /// Build a DNS forwarder from an explicit config (used by the reload
@@ -686,32 +702,136 @@ async fn run_udp_warm_dispatches<F, Fut>(
     }
 }
 
-/// Build the config produced by merging one subscription's freshly fetched
-/// nodes: every node previously delivered by that subscription is replaced
-/// (matched by `subscription_id`), group memberships derived from replaced
-/// nodes are pruned, and filter-based membership is re-resolved against the
-/// merged node set. Nodes from other subscriptions and static config nodes
-/// are untouched. Re-merging the same subscription is idempotent — nodes
-/// are replaced, never duplicated.
-pub(super) fn config_with_subscription_nodes(
+#[derive(Debug)]
+pub(super) struct PreparedRuntimeReload {
+    pub(super) config: Config,
+    pub(super) subscriptions: Vec<Subscription>,
+    pub(super) refresh_subscriptions: Vec<Subscription>,
+}
+
+pub(super) fn prepare_runtime_reload(
+    path: &std::path::Path,
     current: &Config,
-    subscription_id: uuid::Uuid,
-    nodes: Vec<Node>,
-) -> Config {
+) -> anyhow::Result<PreparedRuntimeReload> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("config path is not valid UTF-8"))?;
+    let mut candidate = Config::from_file(path)?;
+    candidate.validate()?;
+    candidate.ensure_builtin_nodes();
+    candidate.ensure_local_direct_rules();
+
+    let mut matched_live = std::collections::HashSet::new();
+    let mut carried_subscription_ids = std::collections::HashSet::new();
+    for subscription in &mut candidate.subscriptions {
+        let Some(live) = current
+            .subscriptions
+            .iter()
+            .find(|live| live.url == subscription.url && !matched_live.contains(&live.id))
+        else {
+            continue;
+        };
+        matched_live.insert(live.id);
+        subscription.id = live.id;
+        subscription.created_at = live.created_at;
+        subscription.last_updated = live.last_updated;
+        subscription.node_count = live.node_count;
+        if subscription.enabled {
+            carried_subscription_ids.insert(live.id);
+        }
+    }
+    candidate
+        .nodes
+        .retain(|node| node.subscription_id.is_none());
+
+    candidate.nodes.extend(
+        current
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.subscription_id
+                    .is_some_and(|id| carried_subscription_ids.contains(&id))
+            })
+            .cloned(),
+    );
+    honk_config::parser::resolve_group_filters(&mut candidate.groups, &candidate.nodes);
+
+    let subscriptions = candidate.subscriptions.clone();
+    let refresh_subscriptions = subscriptions
+        .iter()
+        .filter(|subscription| subscription.enabled)
+        .cloned()
+        .collect();
+    Ok(PreparedRuntimeReload {
+        config: candidate,
+        subscriptions,
+        refresh_subscriptions,
+    })
+}
+
+fn same_subscription_fetch_identity(current: &Subscription, fetched: &Subscription) -> bool {
+    current.url == fetched.url
+        && current.sub_type == fetched.sub_type
+        && current.user_agent == fetched.user_agent
+        && current.headers.len() == fetched.headers.len()
+        && current
+            .headers
+            .iter()
+            .zip(&fetched.headers)
+            .all(|(current, fetched)| current.key == fetched.key && current.value == fetched.value)
+}
+
+/// Build a candidate that replaces one enabled subscription's node set.
+/// The full fetch identity is revalidated before the current config is cloned,
+/// so late results cannot resurrect a removed, disabled, or changed provider.
+pub(crate) fn config_with_subscription_nodes(
+    current: &Config,
+    fetched: &Subscription,
+    mut nodes: Vec<Node>,
+) -> Result<Config, String> {
+    let current_subscription = current
+        .subscriptions
+        .iter()
+        .find(|subscription| subscription.id == fetched.id && subscription.enabled)
+        .ok_or_else(|| {
+            format!(
+                "stale subscription fetch for '{}': provider is removed or disabled",
+                fetched.name
+            )
+        })?;
+    if !same_subscription_fetch_identity(current_subscription, fetched) {
+        return Err(format!(
+            "stale subscription fetch for '{}': fetch identity changed",
+            fetched.name
+        ));
+    }
+
+    let subscription_id = current_subscription.id;
+    let node_count = u32::try_from(nodes.len()).unwrap_or(u32::MAX);
+    for node in &mut nodes {
+        node.subscription_id = Some(subscription_id);
+    }
+
     let mut config = current.clone();
+    let subscription = config
+        .subscriptions
+        .iter_mut()
+        .find(|subscription| subscription.id == subscription_id)
+        .expect("validated subscription must exist in cloned config");
+    subscription.last_updated = Some(chrono::Utc::now());
+    subscription.node_count = node_count;
     config
         .nodes
-        .retain(|n| n.subscription_id != Some(subscription_id));
+        .retain(|node| node.subscription_id != Some(subscription_id));
     config.nodes.extend(nodes);
-    // Group membership is filter-derived state: drop dangling IDs left
-    // behind by replaced subscription nodes (refreshed parses mint fresh
-    // UUIDs), then re-resolve filters against the merged node set.
-    let live: std::collections::HashSet<uuid::Uuid> = config.nodes.iter().map(|n| n.id).collect();
+
+    let live: std::collections::HashSet<uuid::Uuid> =
+        config.nodes.iter().map(|node| node.id).collect();
     for group in &mut config.groups {
         group.nodes.retain(|id| live.contains(id));
     }
     honk_config::parser::resolve_group_filters(&mut config.groups, &config.nodes);
-    config
+    Ok(config)
 }
 
 /// Recursively collect the member node ids of a group, expanding nested
@@ -1328,10 +1448,96 @@ mod atomic_reload_tests {
         }];
 
         let drain = DrainTracker::new();
-        cp.apply_runtime_config(bad, &drain).await;
+        cp.apply_runtime_config(bad, &drain).await.unwrap_err();
 
         let after = cp.config_handle().read().await.global.check_interval_secs;
         assert_eq!(before, after, "failed build must not swap the live config");
+    }
+    #[test]
+    fn prepared_reload_carries_metadata_and_only_enabled_live_nodes() {
+        let subscription_id = uuid::Uuid::new_v4();
+        let created_at = chrono::Utc::now() - chrono::Duration::days(1);
+        let last_updated = chrono::Utc::now() - chrono::Duration::hours(1);
+        let live_subscription = Subscription {
+            id: subscription_id,
+            name: "live".into(),
+            url: "https://example.test/provider".into(),
+            enabled: true,
+            created_at,
+            last_updated: Some(last_updated),
+            node_count: 1,
+            ..Default::default()
+        };
+        let live_node = Node {
+            name: "live-node".into(),
+            subscription_id: Some(subscription_id),
+            ..Default::default()
+        };
+        let current = Config {
+            subscriptions: vec![live_subscription],
+            nodes: vec![live_node.clone()],
+            ..Default::default()
+        };
+
+        let mut disk = Config {
+            subscriptions: vec![Subscription {
+                name: "disk".into(),
+                url: "https://example.test/provider".into(),
+                enabled: true,
+                ..Default::default()
+            }],
+            nodes: vec![Node {
+                name: "serialized-stale".into(),
+                address: "127.0.0.1:8080".into(),
+                host: "127.0.0.1".into(),
+                port: 8080,
+                subscription_id: Some(subscription_id),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let file = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
+        std::fs::write(file.path(), serde_json::to_vec(&disk).unwrap()).unwrap();
+
+        let prepared = prepare_runtime_reload(file.path(), &current).unwrap();
+        let subscription = &prepared.config.subscriptions[0];
+        assert_eq!(subscription.id, subscription_id);
+        assert_eq!(subscription.created_at, created_at);
+        assert_eq!(subscription.last_updated, Some(last_updated));
+        assert_eq!(subscription.node_count, 1);
+        assert_eq!(prepared.refresh_subscriptions.len(), 1);
+        assert!(
+            prepared
+                .config
+                .nodes
+                .iter()
+                .any(|node| node.id == live_node.id)
+        );
+        assert!(
+            prepared
+                .config
+                .nodes
+                .iter()
+                .all(|node| node.name != "serialized-stale")
+        );
+
+        disk.subscriptions[0].enabled = false;
+        std::fs::write(file.path(), serde_json::to_vec(&disk).unwrap()).unwrap();
+        let disabled = prepare_runtime_reload(file.path(), &current).unwrap();
+        assert_eq!(disabled.config.subscriptions[0].id, subscription_id);
+        assert_eq!(disabled.config.subscriptions[0].created_at, created_at);
+        assert_eq!(
+            disabled.config.subscriptions[0].last_updated,
+            Some(last_updated)
+        );
+        assert!(disabled.refresh_subscriptions.is_empty());
+        assert!(
+            disabled
+                .config
+                .nodes
+                .iter()
+                .all(|node| node.subscription_id != Some(subscription_id))
+        );
     }
 
     #[tokio::test]
@@ -1476,7 +1682,8 @@ mod atomic_reload_tests {
             cp.apply_runtime_config(new_config, &drain),
         )
         .await
-        .expect("reload must complete");
+        .expect("reload must complete")
+        .expect("reload must commit");
         initializer.await.unwrap();
         assert!(pool.get(initializing_client, dst).is_none());
         assert!(
@@ -1549,7 +1756,7 @@ mod atomic_reload_tests {
         let reloader = tokio::spawn(async move {
             reloading_cp
                 .apply_runtime_config(next, reloading_drain.as_ref())
-                .await;
+                .await
         });
 
         cancellation
@@ -1561,7 +1768,7 @@ mod atomic_reload_tests {
             "reload must fail closed while it waits"
         );
         tokio::time::advance(Duration::from_secs(5) + Duration::from_millis(1)).await;
-        reloader.await.unwrap();
+        reloader.await.unwrap().unwrap_err();
 
         assert_eq!(
             cp.config_handle().read().await.global.check_interval_secs,
@@ -1596,7 +1803,7 @@ mod atomic_reload_tests {
         let mut good = Config::default();
         good.global.check_interval_secs = expected_interval;
         let drain = DrainTracker::new();
-        cp.apply_runtime_config(good, &drain).await;
+        cp.apply_runtime_config(good, &drain).await.unwrap();
         assert_eq!(
             cp.config_handle().read().await.global.check_interval_secs,
             expected_interval,
@@ -1622,7 +1829,8 @@ mod atomic_reload_tests {
         replacement.global.check_interval_secs += 1;
 
         cp.apply_runtime_config(replacement, &DrainTracker::new())
-            .await;
+            .await
+            .unwrap_err();
 
         assert_eq!(
             cp.config_handle().read().await.global.check_interval_secs,
@@ -1645,7 +1853,8 @@ mod atomic_reload_tests {
         replacement.global.check_interval_secs += 1;
 
         cp.apply_runtime_config(replacement, &DrainTracker::new())
-            .await;
+            .await
+            .unwrap_err();
         assert_eq!(
             cp.ebpf.read().await.active_routing_generation().unwrap(),
             before
@@ -1668,16 +1877,20 @@ mod atomic_reload_tests {
             .unwrap();
 
         cp.apply_runtime_config(Config::default(), &DrainTracker::new())
-            .await;
+            .await
+            .unwrap_err();
 
         assert!(!cp.is_datapath_healthy());
         assert!(cp.drain_tracker.should_reject());
 
         let mut invalid = Config::default();
         invalid.dns.upstream[0].address.clear();
-        cp.apply_runtime_config(invalid, &DrainTracker::new()).await;
+        cp.apply_runtime_config(invalid, &DrainTracker::new())
+            .await
+            .unwrap_err();
         cp.apply_runtime_config(Config::default(), &DrainTracker::new())
-            .await;
+            .await
+            .unwrap();
 
         assert!(!cp.is_datapath_healthy());
         assert!(cp.drain_tracker.should_reject());
@@ -2183,11 +2396,15 @@ mod atomic_reload_tests {
             tls_server_name: None,
             outbound: None,
         }];
-        cp.apply_runtime_config(bad, &DrainTracker::new()).await;
+        cp.apply_runtime_config(bad, &DrainTracker::new())
+            .await
+            .unwrap_err();
         assert!(!old_generation.is_shutdown());
         assert_eq!(cancelled.load(Ordering::SeqCst), 0);
 
-        cp.apply_runtime_config(config, &DrainTracker::new()).await;
+        cp.apply_runtime_config(config, &DrainTracker::new())
+            .await
+            .unwrap();
         let new_runtime = tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
             .await
             .expect("new warm must start after reload")

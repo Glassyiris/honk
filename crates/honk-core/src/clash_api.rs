@@ -28,11 +28,13 @@ use bytes::Bytes;
 use honk_config::Config;
 use honk_config::group::GroupPolicy;
 use honk_config::node::{Group, Node};
-use honk_config::routing::{RoutingCondition, RoutingOutbound};
+use honk_config::routing::RoutingOutbound;
 use honk_config::types::NodeProtocol;
 use honk_outbound::alive::{AliveDialerSet, IpVersion, ProbeDomain};
 use honk_outbound::group::{GroupManager, SharedGroupManager};
 use honk_outbound::urltest::{urltest_group, urltest_node};
+use std::io::{self, Read};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,15 +46,20 @@ pub struct StreamSamplers {
     connections: dashmap::DashMap<Duration, tokio::sync::broadcast::Sender<Arc<Bytes>>>,
     traffic: tokio::sync::broadcast::Sender<Arc<Bytes>>,
     traffic_started: std::sync::atomic::AtomicBool,
+    memory: tokio::sync::broadcast::Sender<Arc<Bytes>>,
+    memory_started: std::sync::atomic::AtomicBool,
 }
 
 impl StreamSamplers {
     pub fn new() -> Self {
         let (traffic, _) = tokio::sync::broadcast::channel(STREAM_CHANNEL_CAPACITY);
+        let (memory, _) = tokio::sync::broadcast::channel(STREAM_CHANNEL_CAPACITY);
         Self {
             connections: dashmap::DashMap::new(),
             traffic,
             traffic_started: std::sync::atomic::AtomicBool::new(false),
+            memory,
+            memory_started: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -64,9 +71,20 @@ impl Default for StreamSamplers {
 }
 
 use crate::mode::{ModeState, SharedModeState};
+pub(crate) fn parse_dashboard_storage(value: Option<&str>) -> serde_json::Value {
+    value
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}))
+}
 
 pub struct ClashState {
     pub config: Arc<tokio::sync::RwLock<Config>>,
+    pub config_path: std::path::PathBuf,
+    pub command_tx: tokio::sync::mpsc::Sender<crate::control::ControlCommand>,
+    pub subscription_refresh: Arc<crate::subscription::SubscriptionRefreshCoordinator>,
+    pub dashboard_storage: parking_lot::RwLock<serde_json::Value>,
+    pub ui_update_lock: Arc<tokio::sync::Mutex<()>>,
     pub stats: Arc<crate::stats::StatsManager>,
     pub alive_set: Arc<AliveDialerSet>,
     /// Hot-swappable group manager cell; a config reload swaps the inner
@@ -84,6 +102,7 @@ pub struct ClashState {
     pub connection_pool: Arc<crate::pool::ConnectionPool>,
     /// External UI directory (`experimental.clash_api.external_ui`).
     pub external_ui: String,
+    pub ui_download_url: Option<String>,
     /// Broadcast channel fed by the clash log tracing layer.
     pub log_tx: tokio::sync::broadcast::Sender<logs::LogEvent>,
     pub dns_service: crate::dns::DnsService,
@@ -110,6 +129,7 @@ pub fn router(state: Arc<ClashState>) -> Router {
         )
         .route("/connections/{id}", delete(delete_connection))
         .route("/traffic", get(get_traffic))
+        .route("/memory", get(get_memory))
         .route("/stats", get(get_outbound_stats))
         .route("/logs", get(get_logs))
         .route("/dns/query", get(get_dns_query))
@@ -117,6 +137,25 @@ pub fn router(state: Arc<ClashState>) -> Router {
         .route("/cache/dns/flush", post(flush_dns))
         .route("/providers/proxies", get(get_proxy_providers))
         .route("/providers/rules", get(get_rule_providers))
+        .route(
+            "/storage/zashboard",
+            get(get_dashboard_storage)
+                .put(put_dashboard_storage)
+                .delete(delete_dashboard_storage),
+        )
+        .route("/upgrade/ui", post(upgrade_ui))
+        .route(
+            "/providers/proxies/{provider}",
+            axum::routing::put(refresh_proxy_provider),
+        )
+        .route(
+            "/providers/proxies/{provider}/healthcheck",
+            get(healthcheck_proxy_provider),
+        )
+        .route(
+            "/providers/proxies/{provider}/{proxy}/healthcheck",
+            get(healthcheck_provider_proxy),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -127,7 +166,11 @@ pub fn router(state: Arc<ClashState>) -> Router {
         // sing-box server_resources.go: download the dashboard in the
         // background when the directory is missing/empty; ServeDir keeps
         // returning 404 until the files land (never blocks startup).
-        ui::spawn_ui_download_if_needed(state.external_ui.clone());
+        ui::spawn_ui_download_if_needed(
+            state.external_ui.clone(),
+            Arc::clone(&state.ui_update_lock),
+            state.ui_download_url.clone(),
+        );
         app = app
             // 301 Moved Permanently, matching sing-box's RedirectHandler.
             .route(
@@ -277,12 +320,10 @@ async fn hello(State(s): State<Arc<ClashState>>, headers: HeaderMap) -> Response
     Json(serde_json::json!({"hello": "clash"})).into_response()
 }
 
-/// GET /version — version info enabling premium/meta features in dashboards.
+/// GET /version — select zashboard's sing-box-compatible capability profile.
 async fn version() -> Json<serde_json::Value> {
     Json(serde_json::json!({
-        "version": concat!("honk ", env!("CARGO_PKG_VERSION")),
-        "premium": true,
-        "meta": true,
+        "version": concat!("sing-box honk ", env!("CARGO_PKG_VERSION")),
     }))
 }
 
@@ -293,8 +334,11 @@ async fn get_configs(State(s): State<Arc<ClashState>>) -> Json<serde_json::Value
     Json(serde_json::json!({
         "mode": mode,
         "mode-list": ["Rule", "Global", "Direct"],
+        "modes": ["Rule", "Global", "Direct"],
+        "tproxy-port": config.global.tproxy_port,
         "port": 0,
         "socks-port": 0,
+        "redir-port": 0,
         "mixed-port": 0,
         "allow-lan": false,
         "ipv6": false,
@@ -304,33 +348,170 @@ async fn get_configs(State(s): State<Arc<ClashState>>) -> Json<serde_json::Value
     }))
 }
 
-/// PUT /configs — accept full config body (no-op for now).
-async fn put_configs() -> StatusCode {
+#[derive(Debug, Default, serde::Deserialize)]
+struct PutConfigsQuery {
+    #[serde(default)]
+    reload: bool,
+    #[serde(default)]
+    force: bool,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PutConfigsBody {
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    payload: String,
+}
+
+async fn put_configs(
+    State(s): State<Arc<ClashState>>,
+    Query(query): Query<PutConfigsQuery>,
+    body: Bytes,
+) -> Response {
+    let body = if body.is_empty() {
+        PutConfigsBody::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(body) => body,
+            Err(error) => {
+                return error_response(StatusCode::BAD_REQUEST, &format!("invalid body: {error}"));
+            }
+        }
+    };
+    if !query.reload || query.force || !body.path.is_empty() || !body.payload.is_empty() {
+        return error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "config replacement is unsupported; edit the dae file and use reload=true",
+        );
+    }
+
+    let (completion, acknowledged) = tokio::sync::oneshot::channel();
+    if s.command_tx
+        .send(crate::control::ControlCommand::ReloadConfig {
+            path: s.config_path.clone(),
+            completion,
+        })
+        .await
+        .is_err()
+    {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "reload owner is unavailable",
+        );
+    }
+    match acknowledged.await {
+        Ok(Ok(publication)) => {
+            s.subscription_refresh
+                .reconcile(&publication.subscriptions)
+                .await;
+            s.subscription_refresh
+                .refresh_now(publication.refresh_subscriptions);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(Err(crate::control::ReloadFailure::Invalid(error))) => {
+            error_response(StatusCode::BAD_REQUEST, &error)
+        }
+        Ok(Err(crate::control::ReloadFailure::Rejected(error))) => {
+            error_response(StatusCode::CONFLICT, &error)
+        }
+        Ok(Err(crate::control::ReloadFailure::Internal(error))) => {
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, &error)
+        }
+        Err(_) => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "reload acknowledgement is unavailable",
+        ),
+    }
+}
+
+/// PATCH /configs accepts only a mode mutation.
+async fn patch_configs(State(s): State<Arc<ClashState>>, body: Bytes) -> Response {
+    let body: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(body) => body,
+        Err(error) => {
+            return error_response(StatusCode::BAD_REQUEST, &format!("invalid body: {error}"));
+        }
+    };
+    let Some(object) = body.as_object() else {
+        return error_response(StatusCode::BAD_REQUEST, "invalid body: expected object");
+    };
+    if let Some(field) = object.keys().find(|field| field.as_str() != "mode") {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            &format!("unsupported config field: {field}"),
+        );
+    }
+    let Some(mode_text) = object.get("mode").and_then(serde_json::Value::as_str) else {
+        return error_response(StatusCode::BAD_REQUEST, "invalid config field: mode");
+    };
+    let Some(mode) = ModeState::normalize(mode_text) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid mode (expected Rule/Global/Direct)",
+        );
+    };
+    s.mode_state.write().mode = mode.clone();
+    if let Some(db) = &s.cache_db {
+        db.save_clash_mode(&mode);
+    }
+    tracing::info!(mode = %mode, "clash mode updated");
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn get_dashboard_storage(State(s): State<Arc<ClashState>>) -> Json<serde_json::Value> {
+    Json(s.dashboard_storage.read().clone())
+}
+
+async fn put_dashboard_storage(State(s): State<Arc<ClashState>>, body: Bytes) -> Response {
+    let value: serde_json::Value = match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(value) if value.is_object() => value,
+        Ok(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid dashboard storage: expected object",
+            );
+        }
+        Err(error) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("invalid dashboard storage: {error}"),
+            );
+        }
+    };
+    let compact = serde_json::to_string(&value).expect("JSON value serialization cannot fail");
+    *s.dashboard_storage.write() = value;
+    if let Some(cache_db) = &s.cache_db {
+        cache_db.set("zashboard:storage", &compact);
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn delete_dashboard_storage(State(s): State<Arc<ClashState>>) -> StatusCode {
+    *s.dashboard_storage.write() = serde_json::json!({});
+    if let Some(cache_db) = &s.cache_db {
+        cache_db.remove("zashboard:storage");
+    }
     StatusCode::NO_CONTENT
 }
 
-/// PATCH /configs — update specific fields; `{mode}` switches the clash
-/// mode (Rule/Global/Direct, case-insensitive) and persists it to cache.db.
-/// The body is parsed regardless of Content-Type (dashboard parity).
-async fn patch_configs(State(s): State<Arc<ClashState>>, body: Bytes) -> Response {
-    let body: serde_json::Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("invalid body: {e}")),
-    };
-    if let Some(mode_str) = body.get("mode").and_then(|v| v.as_str()) {
-        let Some(mode) = ModeState::normalize(mode_str) else {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid mode (expected Rule/Global/Direct)",
-            );
-        };
-        s.mode_state.write().mode = mode.clone();
-        if let Some(ref db) = s.cache_db {
-            db.save_clash_mode(&mode);
-        }
-        tracing::info!("clash mode updated: {}", mode);
+async fn upgrade_ui(State(s): State<Arc<ClashState>>) -> Response {
+    if s.external_ui.is_empty() {
+        return error_response(StatusCode::CONFLICT, "external UI is not configured");
     }
-    StatusCode::NO_CONTENT.into_response()
+    let _update = s.ui_update_lock.lock().await;
+    let result = match s.ui_download_url.as_deref() {
+        Some(url) => ui::replace_external_ui_from_url(&s.external_ui, url).await,
+        None => ui::replace_external_ui(&s.external_ui).await,
+    };
+    match result {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("external UI update failed: {error:#}"),
+        ),
+    }
 }
 
 /// Map a node protocol to a Clash-compatible type name.
@@ -364,6 +545,7 @@ fn clash_group_type(policy: GroupPolicy) -> &'static str {
 /// Build a single proxy info object used by zashboard/Metacubexd for a group.
 fn build_group_proxy_info(
     group: &Group,
+    nodes: &[Node],
     group_manager: &GroupManager,
     alive_set: &AliveDialerSet,
 ) -> serde_json::Value {
@@ -395,13 +577,27 @@ fn build_group_proxy_info(
         }
     }
 
-    serde_json::json!({
+    let udp = group_manager
+        .leaf_node_names_in_group(&group.name)
+        .iter()
+        .any(|name| {
+            nodes.iter().any(|node| {
+                node.name == *name
+                    && honk_outbound::runtime::OutboundCapabilities::for_node(node).udp
+            })
+        });
+    let mut info = serde_json::json!({
         "name": group.name,
         "type": clash_group_type(group.policy),
         "all": node_names,
         "now": now,
+        "udp": udp,
         "history": history,
-    })
+    });
+    if let Some(test_url) = &group.check_url {
+        info["testUrl"] = serde_json::Value::String(test_url.clone());
+    }
+    info
 }
 
 /// Build a proxy info object for an individual node.
@@ -419,7 +615,7 @@ fn build_node_proxy_info(node: &Node, alive_set: &AliveDialerSet) -> serde_json:
     let mut info = serde_json::json!({
         "name": node.name,
         "type": display_type,
-        "udp": true,
+        "udp": honk_outbound::runtime::OutboundCapabilities::for_node(node).udp,
         "history": [],
     });
     if let Some((latency, at)) =
@@ -469,6 +665,9 @@ fn build_global_proxy_info(config: &Config, global_selection: &str) -> serde_jso
         "type": "selector",
         "all": all,
         "now": now,
+        "udp": config.nodes.iter().any(|node| {
+            honk_outbound::runtime::OutboundCapabilities::for_node(node).udp
+        }),
     })
 }
 
@@ -488,7 +687,7 @@ async fn get_proxies(State(s): State<Arc<ClashState>>) -> Json<serde_json::Value
     for group in &config.groups {
         proxies.insert(
             group.name.clone(),
-            build_group_proxy_info(group, &group_manager, &s.alive_set),
+            build_group_proxy_info(group, &config.nodes, &group_manager, &s.alive_set),
         );
     }
 
@@ -510,7 +709,13 @@ async fn get_proxy(State(s): State<Arc<ClashState>>, Path(name): Path<String>) -
     }
 
     if let Some(group) = config.groups.iter().find(|g| g.name == name) {
-        return Json(build_group_proxy_info(group, &group_manager, &s.alive_set)).into_response();
+        return Json(build_group_proxy_info(
+            group,
+            &config.nodes,
+            &group_manager,
+            &s.alive_set,
+        ))
+        .into_response();
     }
 
     if let Some(node) = config.nodes.iter().find(|n| n.name == name) {
@@ -607,6 +812,34 @@ fn delay_ms(d: Duration) -> u64 {
     (d.as_millis() as u64).min(u16::MAX as u64)
 }
 
+async fn measure_node_delay(
+    state: &ClashState,
+    node: &Node,
+    url: &str,
+    timeout: Duration,
+) -> Result<u64, String> {
+    let Some(handler) = state.proxy_registry.find(node.protocol) else {
+        return Err("no handler for the node protocol".to_owned());
+    };
+    match urltest_node(node, handler, url, timeout).await {
+        Ok(latency) => {
+            state.alive_set.record_probe_latency(
+                &node.name,
+                ProbeDomain::Tcp,
+                IpVersion::V4,
+                latency,
+            );
+            Ok(delay_ms(latency))
+        }
+        Err(error) => {
+            state
+                .alive_set
+                .record_dial_failure(&node.name, ProbeDomain::Tcp, IpVersion::V4);
+            Err(format!("An error occurred in the delay test: {error}"))
+        }
+    }
+}
+
 /// GET /proxies/{name}/delay — live latency measurement (HEAD request
 /// through the node / group members). Successes refresh the alive-set
 /// latency history; failures clear it and return 503.
@@ -619,33 +852,9 @@ async fn get_proxy_delay(
 
     if let Some(node) = config.nodes.iter().find(|n| n.name == name).cloned() {
         drop(config);
-        let Some(handler) = s.proxy_registry.find(node.protocol) else {
-            return error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "no handler for the node protocol",
-            );
-        };
-        return match urltest_node(&node, handler, &query.url, query.timeout()).await {
-            Ok(latency) => {
-                s.alive_set.record_probe_latency(
-                    &node.name,
-                    ProbeDomain::Tcp,
-                    IpVersion::V4,
-                    latency,
-                );
-                Json(serde_json::json!({"delay": delay_ms(latency)})).into_response()
-            }
-            Err(e) => {
-                // sing-box deletes the node's latency history on failure;
-                // the synthetic penalty sample keeps a flaky node from
-                // instantly re-ranking first.
-                s.alive_set
-                    .record_dial_failure(&node.name, ProbeDomain::Tcp, IpVersion::V4);
-                error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    &format!("An error occurred in the delay test: {e}"),
-                )
-            }
+        return match measure_node_delay(&s, &node, &query.url, query.timeout()).await {
+            Ok(delay) => Json(serde_json::json!({"delay": delay})).into_response(),
+            Err(error) => error_response(StatusCode::SERVICE_UNAVAILABLE, &error),
         };
     }
 
@@ -748,122 +957,6 @@ async fn get_group_delay(
     Json(serde_json::Value::Object(delays)).into_response()
 }
 
-/// Map a single routing condition entry to a Clash rule object.
-fn condition_to_rule_entry(
-    condition: &RoutingCondition,
-    proxy_tag: &str,
-) -> Vec<serde_json::Value> {
-    let mut entries = Vec::new();
-
-    for domain in &condition.domain {
-        entries.push(serde_json::json!({
-            "type": "domain",
-            "payload": domain,
-            "proxy": proxy_tag,
-        }));
-    }
-    for suffix in &condition.domain_suffix {
-        entries.push(serde_json::json!({
-            "type": "domain-suffix",
-            "payload": suffix,
-            "proxy": proxy_tag,
-        }));
-    }
-    for keyword in &condition.domain_keyword {
-        entries.push(serde_json::json!({
-            "type": "domain-keyword",
-            "payload": keyword,
-            "proxy": proxy_tag,
-        }));
-    }
-    for regex in &condition.domain_regex {
-        entries.push(serde_json::json!({
-            "type": "domain-regex",
-            "payload": regex,
-            "proxy": proxy_tag,
-        }));
-    }
-    for ip in &condition.ip {
-        entries.push(serde_json::json!({
-            "type": "ip-cidr",
-            "payload": ip,
-            "proxy": proxy_tag,
-        }));
-    }
-    for src_ip in &condition.source_ip {
-        entries.push(serde_json::json!({
-            "type": "src-ip-cidr",
-            "payload": src_ip,
-            "proxy": proxy_tag,
-        }));
-    }
-    for port in &condition.port {
-        entries.push(serde_json::json!({
-            "type": "dst-port",
-            "payload": port,
-            "proxy": proxy_tag,
-        }));
-    }
-    for src_port in &condition.source_port {
-        entries.push(serde_json::json!({
-            "type": "src-port",
-            "payload": src_port,
-            "proxy": proxy_tag,
-        }));
-    }
-    for proto in &condition.protocol {
-        entries.push(serde_json::json!({
-            "type": "protocol",
-            "payload": proto,
-            "proxy": proxy_tag,
-        }));
-    }
-    for process in &condition.process_name {
-        entries.push(serde_json::json!({
-            "type": "process-name",
-            "payload": process,
-            "proxy": proxy_tag,
-        }));
-    }
-    for mac in &condition.mac {
-        entries.push(serde_json::json!({
-            "type": "src-mac",
-            "payload": mac,
-            "proxy": proxy_tag,
-        }));
-    }
-    for geo_ip in &condition.geo_ip {
-        entries.push(serde_json::json!({
-            "type": "geoip",
-            "payload": geo_ip,
-            "proxy": proxy_tag,
-        }));
-    }
-    for geosite in &condition.geosite {
-        entries.push(serde_json::json!({
-            "type": "geosite",
-            "payload": geosite,
-            "proxy": proxy_tag,
-        }));
-    }
-    for ip_ver in &condition.ip_version {
-        entries.push(serde_json::json!({
-            "type": "ip-version",
-            "payload": ip_ver,
-            "proxy": proxy_tag,
-        }));
-    }
-    for dscp in &condition.dscp {
-        entries.push(serde_json::json!({
-            "type": "dscp",
-            "payload": dscp,
-            "proxy": proxy_tag,
-        }));
-    }
-
-    entries
-}
-
 /// Extract the proxy tag name from a RoutingOutbound.
 fn outbound_tag(outbound: &RoutingOutbound) -> String {
     match outbound {
@@ -877,13 +970,28 @@ fn outbound_tag(outbound: &RoutingOutbound) -> String {
 
 async fn get_rules(State(s): State<Arc<ClashState>>) -> Json<serde_json::Value> {
     let config = s.config.read().await;
-    let mut rules: Vec<serde_json::Value> = Vec::new();
+    let mut rules = Vec::with_capacity(config.routing.rules.len() + 1);
 
-    for rule in &config.routing.rules {
-        let proxy_tag = outbound_tag(&rule.outbound);
-        let entries = condition_to_rule_entry(&rule.condition, &proxy_tag);
-        rules.extend(entries);
+    for (index, rule) in config.routing.rules.iter().enumerate() {
+        let (rule_type, payload) = rule
+            .condition
+            .clash_rule_parts()
+            .unwrap_or_else(|| ("Match", String::new()));
+        rules.push(serde_json::json!({
+            "type": rule_type,
+            "payload": payload,
+            "proxy": outbound_tag(&rule.outbound),
+            "index": index,
+            "size": -1,
+        }));
     }
+    rules.push(serde_json::json!({
+        "type": "Match",
+        "payload": "",
+        "proxy": config.routing.default_outbound,
+        "index": config.routing.rules.len(),
+        "size": -1,
+    }));
 
     Json(serde_json::json!({"rules": rules}))
 }
@@ -977,28 +1085,37 @@ struct ConnectionsQuery {
     interval: Option<u64>,
 }
 
-/// Build the clash connections document from the tracker snapshot.
-fn connections_json(s: &ClashState) -> serde_json::Value {
-    connections_json_tracker(&s.connection_tracker)
+/// Split a connection endpoint into the IP and port fields expected by
+/// zashboard. Valid SocketAddr values are parsed first so IPv6 addresses keep
+/// their complete host portion; malformed embedder/test values retain the
+/// legacy final-colon split.
+fn connection_endpoint_parts(endpoint: &str) -> (String, String) {
+    if let Ok(address) = endpoint.parse::<SocketAddr>() {
+        return (address.ip().to_string(), address.port().to_string());
+    }
+
+    endpoint
+        .rsplit_once(':')
+        .map(|(host, port)| {
+            (
+                host.trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .to_string(),
+                port.to_string(),
+            )
+        })
+        .unwrap_or_else(|| (endpoint.to_string(), String::new()))
 }
 
-fn connections_json_tracker(
-    tracker: &crate::connection_tracker::ConnectionTracker,
-) -> serde_json::Value {
-    let snapshots = tracker.snapshot();
+/// Build the clash connections document from the tracker snapshot.
+fn connections_json(s: &ClashState) -> serde_json::Value {
+    let snapshots = s.connection_tracker.snapshot();
     let connections: Vec<serde_json::Value> = snapshots
         .iter()
         .map(|e| {
-            let source_ip: Vec<&str> = e.source.rsplitn(2, ':').collect();
-            let dest_ip: Vec<&str> = e.destination.rsplitn(2, ':').collect();
-            let src_port = source_ip.first().copied().unwrap_or("");
-            let dst_port = dest_ip.first().copied().unwrap_or("");
-            let src_ip = if source_ip.len() > 1 {
-                source_ip[1]
-            } else {
-                ""
-            };
-            let dst_ip = if dest_ip.len() > 1 { dest_ip[1] } else { "" };
+            let (src_ip, src_port) = connection_endpoint_parts(&e.source);
+            let (dst_ip, dst_port) = connection_endpoint_parts(&e.destination);
+            let host = e.domain.clone().unwrap_or_default();
             let start = std::time::SystemTime::now()
                 .checked_sub(e.start_time.elapsed())
                 .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339())
@@ -1007,15 +1124,31 @@ fn connections_json_tracker(
             serde_json::json!({
                 "id": e.id,
                 "metadata": {
-                    "network": e.network,
-                    "type": e.network,
-                    "sourceIP": src_ip,
+                    "destinationGeoIP": "",
                     "destinationIP": dst_ip,
-                    "sourcePort": src_port,
+                    "destinationIPASN": "",
                     "destinationPort": dst_port,
-                    "host": e.domain.clone().unwrap_or_default(),
                     "dnsMode": "normal",
+                    "dscp": e.dscp,
+                    "host": host.clone(),
+                    "inboundIP": "",
+                    "inboundName": "",
+                    "inboundPort": "",
+                    "inboundUser": "",
+                    "network": e.network,
+                    "process": "",
                     "processPath": "",
+                    "remoteDestination": "",
+                    "sniffHost": host,
+                    "sourceGeoIP": "",
+                    "sourceIP": src_ip,
+                    "sourceIPASN": "",
+                    "sourcePort": src_port,
+                    "specialProxy": "",
+                    "specialRules": "",
+                    "type": e.network,
+                    "uid": 0,
+                    "smartBlock": "",
                 },
                 "upload": e.upload,
                 "download": e.download,
@@ -1027,14 +1160,11 @@ fn connections_json_tracker(
         })
         .collect();
 
-    let (upload, download) = snapshots
-        .iter()
-        .fold((0, 0), |(up, down), e| (up + e.upload, down + e.download));
+    let (upload, download) = s.connection_tracker.combined_traffic_totals(&s.stats);
     serde_json::json!({
         "downloadTotal": download,
         "uploadTotal": upload,
         "connections": connections,
-        "memory": 0,
     })
 }
 
@@ -1106,26 +1236,28 @@ fn connection_sampler(
         .clone()
 }
 
-async fn delete_connections(State(s): State<Arc<ClashState>>) -> StatusCode {
-    for snap in s.connection_tracker.snapshot() {
-        s.connection_tracker.close_connection(&snap.id);
+fn signal_all_connection_closes(tracker: &crate::connection_tracker::ConnectionTracker) {
+    for snapshot in tracker.snapshot() {
+        tracker.close_connection(&snapshot.id);
     }
+}
+
+fn signal_connection_close(tracker: &crate::connection_tracker::ConnectionTracker, id: &str) {
+    tracker.close_connection(id);
+}
+
+async fn delete_connections(State(s): State<Arc<ClashState>>) -> StatusCode {
+    signal_all_connection_closes(&s.connection_tracker);
     StatusCode::NO_CONTENT
 }
 
 async fn delete_connection(State(s): State<Arc<ClashState>>, Path(id): Path<String>) -> StatusCode {
-    s.connection_tracker.close_connection(&id);
+    signal_connection_close(&s.connection_tracker, &id);
     StatusCode::NO_CONTENT
 }
 
 async fn traffic_totals(s: &ClashState) -> (u64, u64) {
-    traffic_totals_stats(&s.stats)
-}
-
-fn traffic_totals_stats(stats: &crate::stats::StatsManager) -> (u64, u64) {
-    stats.snapshot().values().fold((0, 0), |(up, down), value| {
-        (up + value.tx_bytes, down + value.rx_bytes)
-    })
+    s.connection_tracker.combined_traffic_totals(&s.stats)
 }
 
 async fn get_traffic(State(s): State<Arc<ClashState>>, ws: MaybeWs) -> Response {
@@ -1173,19 +1305,21 @@ fn ensure_traffic_sampler(s: &Arc<ClashState>) {
         let mut previous = traffic_totals(&state).await;
         loop {
             tick.tick().await;
+            let current = traffic_totals(&state).await;
+            let up = current.0.saturating_sub(previous.0);
+            let down = current.1.saturating_sub(previous.1);
+            previous = current;
             if tx.receiver_count() == 0 {
                 continue;
             }
-            let current = traffic_totals(&state).await;
             let frame = Arc::new(Bytes::from(
                 serde_json::json!({
-                    "up": current.0.saturating_sub(previous.0),
-                    "down": current.1.saturating_sub(previous.1),
+                    "up": up,
+                    "down": down,
                 })
                 .to_string(),
             ));
             let _ = tx.send(frame);
-            previous = current;
         }
     });
 }
@@ -1197,6 +1331,130 @@ fn traffic_chunk_stream(
 ) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
     ensure_traffic_sampler(&s);
     let receiver = s.stream_samplers.traffic.subscribe();
+    futures::stream::unfold(receiver, |mut receiver| async move {
+        loop {
+            match receiver.recv().await {
+                Ok(frame) => {
+                    let mut line = Vec::with_capacity(frame.len() + 1);
+                    line.extend_from_slice(frame.as_ref());
+                    line.push(b'\n');
+                    return Some((Ok(Bytes::from(line)), receiver));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    })
+}
+/// Return the process resident set size in bytes from Linux `/proc`.
+///
+/// The proc file is intentionally read into a fixed stack buffer: statm is a
+/// short, fixed-shape record and this avoids an allocation on every sampler
+/// tick. Invalid, zero, or overflowing values are reported to the caller.
+fn process_resident_bytes() -> io::Result<u64> {
+    let mut file = std::fs::File::open("/proc/self/statm")?;
+    let mut buffer = [0_u8; 128];
+    let length = file.read(&mut buffer)?;
+    let text = std::str::from_utf8(&buffer[..length])
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let resident_pages = text
+        .split_ascii_whitespace()
+        .nth(1)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing resident pages"))?
+        .parse::<u64>()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if resident_pages == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "resident pages is zero",
+        ));
+    }
+
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "system page size is nonpositive",
+        ));
+    }
+    resident_pages
+        .checked_mul(page_size as u64)
+        .filter(|bytes| *bytes > 0)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "resident bytes overflow"))
+}
+
+async fn get_memory(State(s): State<Arc<ClashState>>, ws: MaybeWs) -> Response {
+    if let Err(error) = process_resident_bytes() {
+        tracing::warn!("clash memory preflight failed: {error}");
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "memory is unavailable");
+    }
+    let Some(ws) = ws.0 else {
+        return chunked_json_response(memory_chunk_stream(s));
+    };
+    ws.on_upgrade(move |socket| memory_ws(socket, s))
+}
+
+async fn memory_ws(mut socket: WebSocket, s: Arc<ClashState>) {
+    ensure_memory_sampler(&s);
+    let mut frames = s.stream_samplers.memory.subscribe();
+    loop {
+        match frames.recv().await {
+            Ok(frame) => {
+                if socket
+                    .send(Message::Text(
+                        std::str::from_utf8(frame.as_ref())
+                            .expect("memory JSON is UTF-8")
+                            .into(),
+                    ))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+fn ensure_memory_sampler(s: &Arc<ClashState>) {
+    if s.stream_samplers
+        .memory_started
+        .swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        return;
+    }
+    let state = Arc::clone(s);
+    let tx = state.stream_samplers.memory.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            if tx.receiver_count() == 0 {
+                continue;
+            }
+            let resident = match process_resident_bytes() {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    tracing::warn!("clash memory sampler failed: {error}");
+                    continue;
+                }
+            };
+            let frame = Arc::new(Bytes::from(
+                serde_json::json!({"inuse": resident}).to_string(),
+            ));
+            let _ = tx.send(frame);
+        }
+    });
+}
+
+fn memory_chunk_stream(
+    s: Arc<ClashState>,
+) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
+    ensure_memory_sampler(&s);
+    let receiver = s.stream_samplers.memory.subscribe();
     futures::stream::unfold(receiver, |mut receiver| async move {
         loop {
             match receiver.recv().await {
@@ -1236,25 +1494,35 @@ async fn get_logs(
     ws: MaybeWs,
 ) -> Response {
     let level_text = query.level.as_deref().unwrap_or("info");
-    let Some(level) = logs::parse_level(level_text) else {
+    let Some(filter) = logs::parse_level(level_text) else {
         return error_response(StatusCode::BAD_REQUEST, "invalid log level");
     };
     let Some(ws) = ws.0 else {
-        // Non-WS clients get a chunked JSON stream (sing-box behavior):
-        // one `{"type","payload"}` line per log event.
-        return chunked_json_response(logs_chunk_stream(s, level));
+        return match filter {
+            logs::LogFilter::Level(level) => chunked_json_response(logs_chunk_stream(s, level)),
+            logs::LogFilter::Off => chunked_json_response(logs_off_chunk_stream()),
+        };
     };
-    ws.on_upgrade(move |socket| logs_ws(socket, s, level))
+    ws.on_upgrade(move |socket| logs_ws(socket, s, filter))
 }
 
 /// Stream broadcast log events as `{"type": level, "payload": line}`.
-async fn logs_ws(mut socket: WebSocket, s: Arc<ClashState>, level: tracing::Level) {
+async fn logs_ws(mut socket: WebSocket, s: Arc<ClashState>, filter: logs::LogFilter) {
+    let level = match filter {
+        logs::LogFilter::Level(level) => level,
+        logs::LogFilter::Off => {
+            while let Some(message) = socket.recv().await {
+                if matches!(message, Err(_) | Ok(Message::Close(_))) {
+                    break;
+                }
+            }
+            return;
+        }
+    };
     let mut rx = s.log_tx.subscribe();
     loop {
         match rx.recv().await {
             Ok(event) => {
-                // tracing levels order ERROR < WARN < INFO < DEBUG < TRACE;
-                // skip anything more verbose than the requested level.
                 if event.level > level {
                     continue;
                 }
@@ -1270,8 +1538,6 @@ async fn logs_ws(mut socket: WebSocket, s: Arc<ClashState>, level: tracing::Leve
                     break;
                 }
             }
-            // Lagging subscribers skip ahead; a closed channel (shutdown)
-            // ends the stream.
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
@@ -1307,6 +1573,11 @@ fn logs_chunk_stream(
             }
         }
     })
+}
+
+fn logs_off_chunk_stream()
+-> impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
+    futures::stream::pending()
 }
 
 /// Query params for `/dns/query`: `?name=<domain>&type=<A|AAAA|...>`.
@@ -1383,44 +1654,229 @@ async fn flush_dns(State(s): State<Arc<ClashState>>) -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
-/// Each group is exposed as a proxy provider holding its members — the
-/// minimal provider document dashboards (zashboard/Metacubexd) render. Nested
-/// sub-groups appear under their own tag (their representative leaf
-/// supplies the delay history), matching the `all` member list.
+fn provider_test_url(config: &Config) -> String {
+    config
+        .global
+        .tcp_check_url
+        .first()
+        .filter(|url| !url.is_empty())
+        .cloned()
+        .unwrap_or_else(|| honk_outbound::urltest::DEFAULT_URLTEST_URL.to_owned())
+}
+
 async fn get_proxy_providers(State(s): State<Arc<ClashState>>) -> Json<serde_json::Value> {
     let config = s.config.read().await;
-    let gm = s.group_manager.read().clone();
+    let test_url = provider_test_url(&config);
     let mut providers = serde_json::Map::new();
 
-    for group in &config.groups {
-        let members = gm.delay_test_members(&group.name);
-        // Skip empty groups (e.g. subscription-less groups at startup).
-        if members.is_empty() {
+    for subscription in config
+        .subscriptions
+        .iter()
+        .filter(|subscription| subscription.enabled)
+    {
+        if providers.contains_key(&subscription.name) {
+            tracing::warn!(
+                provider = %subscription.name,
+                "duplicate subscription provider name ignored"
+            );
             continue;
         }
-        let proxies: Vec<serde_json::Value> = members
+        let proxies = config
+            .nodes
             .iter()
-            .map(|(tag, leaf)| {
-                let mut info = build_node_proxy_info(leaf, &s.alive_set);
-                info["name"] = serde_json::Value::String(tag.clone());
-                info
-            })
-            .collect();
+            .filter(|node| node.subscription_id == Some(subscription.id))
+            .map(|node| build_node_proxy_info(node, &s.alive_set))
+            .collect::<Vec<_>>();
+        let updated_at = subscription
+            .last_updated
+            .unwrap_or(subscription.created_at)
+            .to_rfc3339();
         providers.insert(
-            group.name.clone(),
+            subscription.name.clone(),
             serde_json::json!({
-                "name": group.name,
+                "name": subscription.name,
                 "type": "Proxy",
-                "vehicleType": "Compatible",
-                "updatedAt": null,
+                "vehicleType": "HTTP",
+                "updatedAt": updated_at,
+                "testUrl": test_url,
                 "proxies": proxies,
             }),
         );
     }
-
     Json(serde_json::json!({"providers": providers}))
 }
 
+async fn healthcheck_provider_proxy(
+    State(s): State<Arc<ClashState>>,
+    Path((provider_name, proxy_name)): Path<(String, String)>,
+    Query(query): Query<DelayQuery>,
+) -> Response {
+    let config = s.config.read().await;
+    let Some(subscription) = config
+        .subscriptions
+        .iter()
+        .find(|subscription| subscription.name == provider_name)
+    else {
+        return error_response(StatusCode::NOT_FOUND, "provider not found");
+    };
+    if !subscription.enabled {
+        return error_response(StatusCode::CONFLICT, "provider is disabled");
+    }
+    let Some(node) = config
+        .nodes
+        .iter()
+        .find(|node| node.name == proxy_name && node.subscription_id == Some(subscription.id))
+        .cloned()
+    else {
+        return error_response(StatusCode::NOT_FOUND, "provider proxy not found");
+    };
+    drop(config);
+
+    match measure_node_delay(&s, &node, &query.url, query.timeout()).await {
+        Ok(delay) => Json(serde_json::json!({"delay": delay})).into_response(),
+        Err(error) => error_response(StatusCode::SERVICE_UNAVAILABLE, &error),
+    }
+}
+
+async fn healthcheck_proxy_provider(
+    State(s): State<Arc<ClashState>>,
+    Path(provider_name): Path<String>,
+    Query(query): Query<DelayQuery>,
+) -> Response {
+    let config = s.config.read().await;
+    let Some(subscription) = config
+        .subscriptions
+        .iter()
+        .find(|subscription| subscription.name == provider_name)
+    else {
+        return error_response(StatusCode::NOT_FOUND, "provider not found");
+    };
+    if !subscription.enabled {
+        return error_response(StatusCode::CONFLICT, "provider is disabled");
+    }
+    let nodes = config
+        .nodes
+        .iter()
+        .filter(|node| node.subscription_id == Some(subscription.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let test_url = provider_test_url(&config);
+    drop(config);
+
+    let results = urltest_group(
+        &nodes,
+        &s.proxy_registry,
+        &s.alive_set,
+        &test_url,
+        query.timeout(),
+    )
+    .await;
+    let mut delays = serde_json::Map::new();
+    for (name, result) in results {
+        if let Ok(latency) = result {
+            delays.insert(name, serde_json::json!(delay_ms(latency)));
+        }
+    }
+    Json(serde_json::Value::Object(delays)).into_response()
+}
+
+async fn refresh_proxy_provider(
+    State(s): State<Arc<ClashState>>,
+    Path(provider_name): Path<String>,
+) -> Response {
+    let config = s.config.read().await;
+    let Some(subscription) = config
+        .subscriptions
+        .iter()
+        .find(|subscription| subscription.name == provider_name)
+        .cloned()
+    else {
+        return error_response(StatusCode::NOT_FOUND, "provider not found");
+    };
+    drop(config);
+    if !subscription.enabled {
+        return error_response(StatusCode::CONFLICT, "provider is disabled");
+    }
+
+    match s.subscription_refresh.refresh(subscription).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(crate::subscription::SubscriptionRefreshError::Fetch(error)) => {
+            error_response(StatusCode::BAD_GATEWAY, &error)
+        }
+        Err(crate::subscription::SubscriptionRefreshError::Unavailable) => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "subscription refresh is unavailable",
+        ),
+        Err(crate::subscription::SubscriptionRefreshError::Rejected(error)) => {
+            error_response(StatusCode::CONFLICT, &error)
+        }
+    }
+}
+
 async fn get_rule_providers() -> Json<serde_json::Value> {
-    Json(serde_json::json!({"providers": []}))
+    Json(serde_json::json!({"providers": {}}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dashboard_storage_restores_only_objects() {
+        assert_eq!(parse_dashboard_storage(None), serde_json::json!({}));
+        assert_eq!(
+            parse_dashboard_storage(Some("not-json")),
+            serde_json::json!({})
+        );
+        assert_eq!(parse_dashboard_storage(Some("[]")), serde_json::json!({}));
+        assert_eq!(
+            parse_dashboard_storage(Some(r#"{"theme":"dark"}"#)),
+            serde_json::json!({"theme": "dark"})
+        );
+    }
+
+    fn tcp_entry(
+        id: &str,
+        close: tokio::sync::oneshot::Sender<()>,
+    ) -> crate::connection_tracker::ConnectionEntry {
+        crate::connection_tracker::ConnectionEntry {
+            id: id.into(),
+            source: "127.0.0.1:1000".into(),
+            destination: "127.0.0.1:2000".into(),
+            proxy: "proxy".into(),
+            rule: "Match".into(),
+            rule_payload: String::new(),
+            chains: vec!["proxy".into()],
+            upload: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            download: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            start_time: std::time::Instant::now(),
+            domain: None,
+            network: "tcp".into(),
+            dscp: 0,
+            close_handle: crate::connection_tracker::ConnectionCloseHandle::tcp(close),
+        }
+    }
+
+    #[test]
+    fn connection_delete_helpers_signal_each_tcp_handle_once() {
+        let tracker = crate::connection_tracker::ConnectionTracker::new();
+        let (first_close, mut first_closed) = tokio::sync::oneshot::channel();
+        let (second_close, mut second_closed) = tokio::sync::oneshot::channel();
+        tracker.register(tcp_entry("first", first_close));
+        tracker.register(tcp_entry("second", second_close));
+
+        signal_connection_close(&tracker, "first");
+        signal_connection_close(&tracker, "first");
+        signal_connection_close(&tracker, "missing");
+        assert_eq!(first_closed.try_recv(), Ok(()));
+        assert!(matches!(
+            second_closed.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        signal_all_connection_closes(&tracker);
+        signal_all_connection_closes(&tracker);
+        assert_eq!(second_closed.try_recv(), Ok(()));
+        assert_eq!(tracker.snapshot().len(), 2);
+    }
 }

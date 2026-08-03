@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use honk_config::Config;
 use honk_config::node::Node;
+use honk_config::subscription::Subscription;
 use honk_core::control::ControlPlane;
 use honk_core::dns;
 use honk_core::dns::DnsResolver;
@@ -59,13 +60,24 @@ fn control_plane(config: Config, forwarder: Arc<DnsForwarder>) -> ControlPlane {
     )
     .expect("control plane")
 }
+fn refresh_fixture() -> Subscription {
+    Subscription {
+        id: uuid::Uuid::new_v4(),
+        name: "runtime-refresh".into(),
+        url: "https://example.test/runtime-refresh".into(),
+        enabled: true,
+        ..Default::default()
+    }
+}
 
 #[tokio::test]
 async fn public_reload_surface_publishes_a_coherent_runtime() {
-    let config = Config::default();
+    let subscription = refresh_fixture();
+    let mut config = Config::default();
+    config.subscriptions.push(subscription.clone());
     let upstream = StaticUpstream::new([192, 0, 2, 1]);
     let control = control_plane(config.clone(), test_dns_forwarder(&config, upstream));
-    let subscription_id = uuid::Uuid::new_v4();
+    let subscription_id = subscription.id;
     let replacement = Node {
         name: "published-runtime-node".into(),
         subscription_id: Some(subscription_id),
@@ -73,8 +85,9 @@ async fn public_reload_surface_publishes_a_coherent_runtime() {
     };
 
     control
-        .merge_subscription_nodes(subscription_id, vec![replacement])
-        .await;
+        .merge_subscription_nodes(subscription, vec![replacement])
+        .await
+        .unwrap();
 
     let active = control.config_handle();
     let active = active.read().await;
@@ -91,7 +104,9 @@ async fn public_reload_surface_publishes_a_coherent_runtime() {
 async fn public_runtime_reload_preserves_policy_cache_then_changes_udp_and_tcp_transport() {
     let udp = spawn_udp_server([192, 0, 2, 20]).await;
     let tcp = spawn_tcp_server([192, 0, 2, 30]).await;
-    let config = config_for_upstream(udp.address, DnsProtocol::Udp);
+    let mut config = config_for_upstream(udp.address, DnsProtocol::Udp);
+    let subscription = refresh_fixture();
+    config.subscriptions.push(subscription.clone());
     let initial = StaticUpstream::new([192, 0, 2, 10]);
     let control = control_plane(config.clone(), test_dns_forwarder(&config, initial.clone()));
     let service = control.dns_service();
@@ -104,8 +119,9 @@ async fn public_runtime_reload_preserves_policy_cache_then_changes_udp_and_tcp_t
     assert_eq!(first, a_response(&query, [192, 0, 2, 10]));
 
     control
-        .merge_subscription_nodes(uuid::Uuid::new_v4(), vec![])
-        .await;
+        .merge_subscription_nodes(subscription.clone(), vec![])
+        .await
+        .unwrap();
     let unchanged = service
         .resolve(&query, IngressProfile::Internal)
         .await
@@ -127,8 +143,9 @@ async fn public_runtime_reload_preserves_policy_cache_then_changes_udp_and_tcp_t
 
     control.config_handle().write().await.dns.cache.ttl = 301;
     control
-        .merge_subscription_nodes(uuid::Uuid::new_v4(), vec![])
-        .await;
+        .merge_subscription_nodes(subscription.clone(), vec![])
+        .await
+        .unwrap();
     let changed = service
         .resolve(&query, IngressProfile::Internal)
         .await
@@ -144,8 +161,9 @@ async fn public_runtime_reload_preserves_policy_cache_then_changes_udp_and_tcp_t
         active.dns.upstream[0].protocol = DnsProtocol::Tcp;
     }
     control
-        .merge_subscription_nodes(uuid::Uuid::new_v4(), vec![])
-        .await;
+        .merge_subscription_nodes(subscription, vec![])
+        .await
+        .unwrap();
     let tcp_query = build_dns_query("tcp.reload.example", 1);
     let tcp_response = service
         .resolve(&tcp_query, IngressProfile::Tcp)

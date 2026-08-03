@@ -7,7 +7,7 @@ pub mod janitor;
 pub mod packet_sniffer;
 mod probers;
 pub mod quic;
-mod reload;
+pub(crate) mod reload;
 pub mod routing_matcher;
 mod sockets;
 pub mod tcp_sniff;
@@ -35,6 +35,7 @@ use honk_config::node::{Group, GroupPolicy};
 use honk_config::{
     Config,
     node::Node,
+    subscription::Subscription,
     types::{DialMode, NodeProtocol},
 };
 use honk_ebpf_common::*;
@@ -55,28 +56,41 @@ use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, trace, warn};
 
 pub mod commands {
-    use honk_config::{Config, node::Node};
-    use tokio::sync::mpsc;
+    use honk_config::{node::Node, subscription::Subscription};
+    use std::path::PathBuf;
+    use tokio::sync::{mpsc, oneshot};
+
+    #[derive(Debug)]
+    pub enum ReloadFailure {
+        Invalid(String),
+        Rejected(String),
+        Internal(String),
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct ReloadPublication {
+        pub subscriptions: Vec<Subscription>,
+        pub refresh_subscriptions: Vec<Subscription>,
+    }
 
     #[derive(Debug)]
     #[allow(clippy::large_enum_variant)]
     pub enum ControlCommand {
-        ReloadConfig(Box<Config>),
-        /// Merge freshly fetched subscription nodes into the running config,
-        /// replacing the previous node set of that subscription. Used by
-        /// late startup fetches and periodic refreshes; subscription nodes
-        /// live in memory only and are never written back to the config file.
+        ReloadConfig {
+            path: PathBuf,
+            completion: oneshot::Sender<Result<ReloadPublication, ReloadFailure>>,
+        },
         MergeSubscription {
-            subscription_id: uuid::Uuid,
-            name: String,
+            subscription: Box<Subscription>,
             nodes: Vec<Node>,
+            completion: oneshot::Sender<Result<(), String>>,
         },
         Shutdown,
         GetStats(mpsc::Sender<super::StatsSnapshot>),
     }
 }
 
-pub use commands::ControlCommand;
+pub use commands::{ControlCommand, ReloadFailure, ReloadPublication};
 use connection::*;
 use probers::*;
 use reload::*;
@@ -1136,23 +1150,64 @@ impl ControlPlane {
 
                 cmd = rx.recv() => {
                     match cmd {
-                        Some(ControlCommand::ReloadConfig(new_config)) => {
-                            info!("Reloading configuration — draining new connections briefly");
-                            self.apply_runtime_config(*new_config, &drain).await;
-                        }
-                        Some(ControlCommand::MergeSubscription { subscription_id, name, nodes }) => {
-                            info!(
-                                "Merging {} node(s) from subscription '{}'",
-                                nodes.len(),
-                                name
-                            );
-                            let new_config = {
-                                let current = self.config.read().await;
-                                config_with_subscription_nodes(&current, subscription_id, nodes)
+                        Some(ControlCommand::ReloadConfig { path, completion }) => {
+                            info!(path = %path.display(), "Reloading configuration");
+                            let current = self.config.read().await.clone();
+                            let prepared = tokio::task::spawn_blocking(move || {
+                                prepare_runtime_reload(&path, &current)
+                            })
+                            .await;
+                            let result = match prepared {
+                                Ok(Ok(prepared)) => {
+                                    let publication = ReloadPublication {
+                                        subscriptions: prepared.subscriptions,
+                                        refresh_subscriptions: prepared.refresh_subscriptions,
+                                    };
+                                    match self
+                                        .apply_runtime_config(prepared.config, &drain)
+                                        .await
+                                    {
+                                        Ok(()) => Ok(publication),
+                                        Err(error) => Err(ReloadFailure::Rejected(error)),
+                                    }
+                                }
+                                Ok(Err(error)) => {
+                                    Err(ReloadFailure::Invalid(error.to_string()))
+                                }
+                                Err(error) => Err(ReloadFailure::Internal(format!(
+                                    "reload preparation task failed: {error}"
+                                ))),
                             };
-                            // Same serialized rebuild path as ReloadConfig —
-                            // both commands queue on this single channel.
-                            self.apply_runtime_config(new_config, &drain).await;
+                            if completion.send(result).is_err() {
+                                warn!("reload completion receiver disappeared");
+                            }
+                        }
+                        Some(ControlCommand::MergeSubscription {
+                            subscription,
+                            nodes,
+                            completion,
+                        }) => {
+                            info!(
+                                subscription = %subscription.name,
+                                node_count = nodes.len(),
+                                "Merging subscription nodes"
+                            );
+                            let candidate = {
+                                let current = self.config.read().await;
+                                config_with_subscription_nodes(&current, &subscription, nodes)
+                            };
+                            let result = match candidate {
+                                Ok(candidate) => {
+                                    self.apply_runtime_config(candidate, &drain).await
+                                }
+                                Err(error) => Err(error),
+                            };
+                            if completion.send(result).is_err() {
+                                warn!(
+                                    subscription = %subscription.name,
+                                    "subscription merge completion receiver disappeared"
+                                );
+                            }
                         }
                         Some(ControlCommand::GetStats(tx)) => {
                             let snap = self.stats.snapshot();

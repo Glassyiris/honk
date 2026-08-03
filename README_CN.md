@@ -99,14 +99,14 @@ honk 沿用 dae 的内核模型，但并非移植。主要不同点：
 - [x] 组：Selector / URLTest / LoadBalance / Fallback + 嵌套组
 - [x] URLTest：tolerance、TCP/UDP 独立选择、idle_timeout、interrupt_connections
 - [x] `AliveDialerSet`：并发探测、恢复滞后、TCP+UDP 探测、推送 eBPF
-- [x] 订阅拉取 + 后台合并（节点仅内存）
+- [x] 订阅启动/手动/周期刷新 + 有确认、串行化的运行时合并（节点仅存内存）
 
 #### 控制面扩展
 
 - [x] TCP `splice` 中继（失败回退 copy）；UDP anyfrom 回包
-- [x] Clash 兼容 REST/WS API（proxies、delay、connections、traffic、logs、DNS query、UI 下载）
-- [x] SQLite 缓存（Selector 选择、模式、可选 DNS 持久化）
-- [x] 热重载重建 `GroupManager` 并迁移 Selector 选择
+- [x] 面向 zashboard、按真实能力提供的 Clash REST/WS API：memory/traffic/log/connection 实时流、proxies、rules、DNS 查询与缓存清理
+- [x] SQLite 缓存（Selector 选择、Clash 模式、可选 DNS 应答、zashboard 设置）
+- [x] DAE 重载确认发布、由生命周期 owner 关闭连接、订阅 provider 刷新/健康检查、面板设置存储与原子外部 UI 更新
 
 #### 测试 / 示例
 

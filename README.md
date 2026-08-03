@@ -70,7 +70,14 @@ Status reflects the current tree and unit/integration tests. Prefer re-running `
 - [x] Groups: Selector / URLTest / LoadBalance / Fallback + nested groups
 - [x] URLTest: tolerance, separate TCP/UDP picks, idle_timeout, interrupt_connections
 - [x] `AliveDialerSet`: concurrent probes, hysteresis, TCP+UDP probes, eBPF push
-- [x] Subscription fetch + background merge (in-memory nodes)
+- [x] Subscription startup/manual/periodic refresh with acknowledged, serialized runtime merge (nodes stay in memory)
+
+#### Control plane extensions
+
+- [x] TCP `splice` relay with copy fallback; UDP anyfrom replies
+- [x] Capability-truthful Clash REST/WS surface for zashboard: live memory/traffic/log/connection streams, proxies, rules, DNS query, and cache flush
+- [x] SQLite `cachedb` persistence for selector choices, Clash mode, optional DNS answers, and zashboard settings
+- [x] Acknowledged DAE reload, lifecycle-owned connection termination, subscription provider refresh/health checks, dashboard settings storage, and atomic external-UI updates
 
 ### Review Status
 

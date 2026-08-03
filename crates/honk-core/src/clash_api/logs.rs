@@ -33,16 +33,32 @@ pub fn layer() -> (ClashLogLayer, broadcast::Sender<LogEvent>) {
     (ClashLogLayer { tx: tx.clone() }, tx)
 }
 
-/// Parse a clash `?level=` query value into a tracing level.
+/// Filter selected by a clash `?level=` query value.
+pub enum LogFilter {
+    Level(tracing::Level),
+    Off,
+}
+
+/// Parse a clash `?level=` query value into a log filter.
 /// Returns `None` for unknown names (the endpoint maps that to a 400).
-pub fn parse_level(level: &str) -> Option<tracing::Level> {
-    match level.to_ascii_lowercase().as_str() {
-        "trace" => Some(tracing::Level::TRACE),
-        "debug" => Some(tracing::Level::DEBUG),
-        "info" => Some(tracing::Level::INFO),
-        "warn" | "warning" => Some(tracing::Level::WARN),
-        "error" => Some(tracing::Level::ERROR),
-        _ => None,
+pub fn parse_level(level: &str) -> Option<LogFilter> {
+    if level.eq_ignore_ascii_case("trace") {
+        Some(LogFilter::Level(tracing::Level::TRACE))
+    } else if level.eq_ignore_ascii_case("debug") {
+        Some(LogFilter::Level(tracing::Level::DEBUG))
+    } else if level.eq_ignore_ascii_case("info") {
+        Some(LogFilter::Level(tracing::Level::INFO))
+    } else if level.eq_ignore_ascii_case("warn") || level.eq_ignore_ascii_case("warning") {
+        Some(LogFilter::Level(tracing::Level::WARN))
+    } else if level.eq_ignore_ascii_case("error")
+        || level.eq_ignore_ascii_case("fatal")
+        || level.eq_ignore_ascii_case("panic")
+    {
+        Some(LogFilter::Level(tracing::Level::ERROR))
+    } else if level.eq_ignore_ascii_case("silent") {
+        Some(LogFilter::Off)
+    } else {
+        None
     }
 }
 
@@ -102,5 +118,51 @@ where
             level: *event.metadata().level(),
             payload,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LogFilter, parse_level};
+
+    fn assert_level(input: &str, expected: tracing::Level) {
+        assert!(
+            matches!(parse_level(input), Some(LogFilter::Level(actual)) if actual == expected),
+            "unexpected filter for {input:?}"
+        );
+    }
+
+    #[test]
+    fn parses_level_names_and_aliases_case_insensitively() {
+        for (name, expected) in [
+            ("trace", tracing::Level::TRACE),
+            ("debug", tracing::Level::DEBUG),
+            ("info", tracing::Level::INFO),
+            ("warn", tracing::Level::WARN),
+            ("warning", tracing::Level::WARN),
+            ("error", tracing::Level::ERROR),
+            ("fatal", tracing::Level::ERROR),
+            ("panic", tracing::Level::ERROR),
+        ] {
+            assert_level(name, expected);
+            assert_level(&name.to_ascii_uppercase(), expected);
+        }
+    }
+
+    #[test]
+    fn parses_silent_as_off_case_insensitively() {
+        for name in ["silent", "SILENT", "SiLeNt"] {
+            assert!(matches!(parse_level(name), Some(LogFilter::Off)));
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_names() {
+        for name in ["", "off", "verbose", " warning"] {
+            assert!(
+                parse_level(name).is_none(),
+                "unexpected filter for {name:?}"
+            );
+        }
     }
 }

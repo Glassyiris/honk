@@ -439,6 +439,20 @@ impl StatsManager {
             .increment_errors();
     }
 
+    /// Return completed TCP and all UDP traffic without allocating a snapshot.
+    pub fn traffic_totals(&self) -> (u64, u64) {
+        self.trackers.iter().fold((0u64, 0u64), |totals, entry| {
+            (
+                totals
+                    .0
+                    .saturating_add(entry.tx_bytes.load(Ordering::Relaxed)),
+                totals
+                    .1
+                    .saturating_add(entry.rx_bytes.load(Ordering::Relaxed)),
+            )
+        })
+    }
+
     /// Get a snapshot of all per-outbound statistics.
     pub fn snapshot(&self) -> std::collections::HashMap<String, OutboundStats> {
         self.trackers
@@ -493,6 +507,7 @@ mod tests {
         mgr.record_connection("proxy2");
         mgr.record_bytes("proxy1", 1000, 2000);
         mgr.record_error("proxy2");
+        assert_eq!(mgr.traffic_totals(), (1000, 2000));
 
         let snap = mgr.snapshot();
         assert_eq!(snap.len(), 2);

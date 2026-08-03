@@ -465,26 +465,45 @@ dae 语法中每个订阅一行：`tag: 'https://...'` 或裸 `'https://...'`（
 
 ### 已实现 HTTP API
 
+`GET /version` 只返回 `sing-box honk <package-version>` 能力 profile；该
+profile 不宣告 honk 未实现的 Mihomo 专属操作。
+
 | 方法 | 路径 | 用途 |
 | ------ | ------ | ------ |
-| GET | `/` `/version` | 问候 / 版本 |
-| GET/PUT/PATCH | `/configs` | 模式等 |
-| GET | `/proxies` | 节点 + 组 |
+| GET | `/` `/version` | 问候 / 能力 profile |
+| GET | `/configs` | 运行模式与真实 TPROXY 端口 |
+| PUT | `/configs?reload=true` | 重载已配置的 DAE 文件，并等待 runtime 发布 |
+| PATCH | `/configs` | 仅设置 `Rule` / `Global` / `Direct` 模式 |
+| GET | `/proxies` | 节点 + 组，并如实报告 UDP 能力 |
 | GET/PUT | `/proxies/{name}` | 详情 / 设置 Selector |
 | GET | `/proxies/{name}/delay` | 按需测速 |
 | GET | `/group/{name}/delay` | 组测速 |
-| GET | `/rules` | 规则 |
-| GET/DELETE | `/connections` | 列表 / 关闭全部 |
-| DELETE | `/connections/{id}` | 关闭单个 |
-| GET | `/traffic` | WS 或分块 JSON 行 |
+| GET | `/rules` | 每条 DAE 规则一行，末尾附 `Match` |
+| GET | `/connections` | REST 或 WS 连接快照 |
+| DELETE | `/connections` | 关闭全部已跟踪 TCP/UDP 连接 |
+| DELETE | `/connections/{id}` | 关闭单个已跟踪 TCP/UDP 连接 |
+| GET | `/traffic` | WS 或分块的每秒 JSON 增量 |
+| GET | `/memory` | WS 或分块的进程 RSS 样本 |
 | GET | `/stats` | 出站与稳定 UDP 统计 |
-| GET | `/logs` | WS 或分块 |
+| GET | `/logs` | WS 或分块日志；`?level=` 包含 `silent` |
 | GET | `/dns/query` | DoH 风格 JSON |
 | POST | `/cache/fakeip/flush` | FakeIP 前缀清理 |
 | POST | `/cache/dns/flush` | DNS 缓存清理 |
-| GET | `/providers/proxies` | 组作为 provider |
-| GET | `/providers/rules` | 空桩 |
+| GET | `/providers/proxies` | 将已启用订阅暴露为 HTTP proxy provider |
+| PUT | `/providers/proxies/{provider}` | 拉取并经确认合并单个订阅 |
+| GET | `/providers/proxies/{provider}/healthcheck` | 测试订阅中的全部节点 |
+| GET | `/providers/proxies/{provider}/{proxy}/healthcheck` | 测试订阅中的单个节点 |
+| GET | `/providers/rules` | 空兼容对象 |
+| GET/PUT/DELETE | `/storage/zashboard` | 读取、替换或清空面板设置 |
+| POST | `/upgrade/ui` | 暂存、校验并原子替换外部 UI |
 | GET | `/ui` … | 外部 UI |
+
+配置替换与强制更新仍不支持：`PUT /configs` 只接受 `reload=true`，且
+`path`、`payload` 必须为空。删除连接会通知生命周期所属的 TCP relay 或
+UDP endpoint pool，由 owner 完成 socket、tracker 与 conn-state 清理。
+Provider 按 subscription ID 隔离；刷新在发布前重新校验并串行化。面板设置在
+`cachedb` 启用时持久化，否则只在进程生命周期内保留。启动时安装 UI 与
+`POST /upgrade/ui` 共用同一条暂存、原子发布路径。
 
 ### `GET /stats` UDP schema
 

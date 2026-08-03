@@ -297,6 +297,12 @@ subscription {
 "#;
         let config = parse_dae_config(input).unwrap();
         assert_eq!(config.subscriptions.len(), 2);
+        assert!(
+            config
+                .subscriptions
+                .iter()
+                .all(|subscription| subscription.enabled)
+        );
     }
 
     #[test]

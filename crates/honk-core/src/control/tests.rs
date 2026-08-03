@@ -1153,6 +1153,13 @@ fn subscription_merge_replaces_only_that_subscription() {
     let old_a1 = node("a-old-1", Some(sub_a));
     let old_a2 = node("a-old-2", Some(sub_a));
     let b_node = node("b-1", Some(sub_b));
+    let subscription = Subscription {
+        id: sub_a,
+        name: "a".into(),
+        url: "https://example.test/a".into(),
+        enabled: true,
+        ..Default::default()
+    };
 
     let mut current = Config {
         nodes: vec![
@@ -1161,6 +1168,7 @@ fn subscription_merge_replaces_only_that_subscription() {
             old_a2.clone(),
             b_node.clone(),
         ],
+        subscriptions: vec![subscription.clone()],
         groups: vec![honk_config::node::Group {
             name: "proxy".into(),
             ..Default::default()
@@ -1171,13 +1179,27 @@ fn subscription_merge_replaces_only_that_subscription() {
     // filter-less group swallows every node.
     honk_config::parser::resolve_group_filters(&mut current.groups, &current.nodes);
     assert_eq!(current.groups[0].nodes.len(), 4);
+    let mut stale = subscription.clone();
+    stale.url = "https://example.test/changed".into();
+    let stale_error = config_with_subscription_nodes(&current, &stale, vec![]).unwrap_err();
+    assert!(stale_error.contains("fetch identity changed"));
+    assert_eq!(current.nodes.len(), 4);
+
+    let mut disabled = current.clone();
+    disabled.subscriptions[0].enabled = false;
+    let disabled_error =
+        config_with_subscription_nodes(&disabled, &subscription, vec![]).unwrap_err();
+    assert!(disabled_error.contains("removed or disabled"));
 
     let new_a1 = node("a-new-1", Some(sub_a));
-    let merged = config_with_subscription_nodes(&current, sub_a, vec![new_a1.clone()]);
+    let merged =
+        config_with_subscription_nodes(&current, &subscription, vec![new_a1.clone()]).unwrap();
 
     // Old sub-A nodes are gone; static and other-subscription nodes stay.
     let names: Vec<&str> = merged.nodes.iter().map(|n| n.name.as_str()).collect();
     assert_eq!(names, vec!["static", "b-1", "a-new-1"]);
+    assert_eq!(merged.subscriptions[0].node_count, 1);
+    assert!(merged.subscriptions[0].last_updated.is_some());
     // Group membership was pruned of dangling IDs and re-resolved:
     // exactly the three live nodes, no stale UUIDs.
     assert_eq!(merged.groups[0].nodes.len(), 3);
@@ -1189,7 +1211,8 @@ fn subscription_merge_replaces_only_that_subscription() {
 
     // Re-merging the same subscription replaces instead of duplicating.
     let new_a1b = node("a-new-1", Some(sub_a));
-    let remerged = config_with_subscription_nodes(&merged, sub_a, vec![new_a1b.clone()]);
+    let remerged =
+        config_with_subscription_nodes(&merged, &subscription, vec![new_a1b.clone()]).unwrap();
     assert_eq!(remerged.nodes.len(), 3);
     assert_eq!(remerged.groups[0].nodes.len(), 3);
     assert_eq!(remerged.nodes[2].id, new_a1b.id);

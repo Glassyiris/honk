@@ -29,7 +29,7 @@
 | 分段配置语法 | **dae** | `global { } node { } group { } routing { }` |
 | 组策略与嵌套出站 | **sing-box** | Selector / URLTest / LB / Fallback、RealTag 风格链 |
 | TCP/UDP 独立 URLTest 选择 | **sing-box** | tolerance、idle_timeout、interrupt_connections |
-| Clash API + 外部 UI 下载 | **sing-box** clashapi | 最小 REST/WS 集合 |
+| Clash API + 外部 UI | **sing-box** clashapi | 按真实能力提供的 zashboard 核心接口 |
 | 协议/传输细节 | **sing-box** + daeuniverse **outbound** | SS2022、AnyTLS 池、UoT v2、Hy2/TUIC/Juicity、h2mux |
 
 ## 4. Crate 划分
@@ -321,7 +321,18 @@ counter 之间的不变量。
 
 当 `experimental.clash_api.external_controller` 非空时启用。
 
-核心接口：`/version`、`/configs`、`/proxies`、delay、`/rules`、`/connections`、`/traffic`、`/stats`、`/logs`、`/dns/query`、缓存清理、`/providers/proxies`、外部 UI 自动下载（Yacd-meta）。`GET /stats` 含稳定的嵌套 `udp` 对象；完整 schema 见组件参考。
+服务端宣告 `sing-box honk <package-version>` 能力 profile，只注册 honk 真正
+拥有的行为；Mihomo 专属的 restart、二进制/Geo 更新、TUN、Smart 与规则修改
+路由保持缺席。已实现接口包括 configs/proxies/delay/rules、连接快照与真实关闭、
+共享 `/traffic` 和 `/memory` 流、`/stats`、分级 `/logs`、DNS/缓存操作、将已启用
+订阅暴露为可刷新/健康检查的 proxy provider、zashboard 设置存储，以及暂存后
+原子发布的外部 UI 更新。
+
+`PATCH /configs` 只修改 Clash 模式。`PUT /configs?reload=true` 把已配置的
+DAE 路径交给串行控制面 owner，并仅在基础 runtime 发布后返回；配置替换会被
+拒绝。订阅拉取在经确认合并前重新校验身份，因此旧任务不能复活已删除、禁用或
+改变的 provider。删除连接会通知 TCP relay 或 UDP endpoint 的生命周期 owner，
+而不是只删除 API 行。
 
 鉴权：`Authorization: Bearer` 或 `?token=`（已做 percent-decode）。
 
