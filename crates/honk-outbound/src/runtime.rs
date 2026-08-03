@@ -22,7 +22,6 @@ pub const TLS_IDLE_RETENTION: Duration = Duration::from_secs(10 * 60);
 pub const TLS_REAP_INTERVAL: Duration = Duration::from_secs(60);
 
 use honk_config::node::Node;
-use honk_config::types::NodeProtocol;
 
 /// What a node can do, derived from its protocol and config — the basis
 /// for capability-based pooling decisions (e.g. the ready-pool allowlist
@@ -40,24 +39,24 @@ pub struct OutboundCapabilities {
 
 impl OutboundCapabilities {
     pub fn for_node(node: &Node) -> Self {
-        // UDP support matrix (verified): direct, socks5, shadowsocks
-        // (+2022), trojan, hysteria2, anytls, tuic, juicity. Not vmess,
-        // vless, block.
-        let udp = matches!(
-            node.protocol,
-            NodeProtocol::Socks5
-                | NodeProtocol::SS
-                | NodeProtocol::Trojan
-                | NodeProtocol::Hysteria2
-                | NodeProtocol::AnyTLS
-                | NodeProtocol::Tuic
-                | NodeProtocol::Juicity
-                | NodeProtocol::Direct
-        );
-        Self {
-            tcp: true,
-            udp,
-            multiplexed: matches!(node.protocol, NodeProtocol::AnyTLS),
+        crate::descriptor::descriptor(node.protocol).capabilities
+    }
+}
+
+/// The generation-scoped session runtime a protocol owns, if any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerationRuntime {
+    None,
+    AnyTls,
+    Quic,
+}
+
+impl GenerationRuntime {
+    pub(crate) fn build(self) -> ProtocolRuntime {
+        match self {
+            GenerationRuntime::None => ProtocolRuntime::None,
+            GenerationRuntime::AnyTls => ProtocolRuntime::AnyTls(AnyTlsRuntime::new()),
+            GenerationRuntime::Quic => ProtocolRuntime::Quic(QuicRuntime::new()),
         }
     }
 }
@@ -281,13 +280,9 @@ impl OutboundRuntimeRegistry {
                     }
                 })?;
             }
-            let protocol_runtime = match node.protocol {
-                NodeProtocol::AnyTLS => ProtocolRuntime::AnyTls(AnyTlsRuntime::new()),
-                NodeProtocol::Hysteria2 | NodeProtocol::Tuic | NodeProtocol::Juicity => {
-                    ProtocolRuntime::Quic(QuicRuntime::new())
-                }
-                _ => ProtocolRuntime::None,
-            };
+            let protocol_runtime = crate::descriptor::descriptor(node.protocol)
+                .generation_runtime
+                .build();
             let runtime = Arc::new(NodeRuntime {
                 node: Arc::new(node.clone()),
                 capabilities: OutboundCapabilities::for_node(node),
@@ -400,6 +395,7 @@ impl OutboundRuntimeRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use honk_config::types::NodeProtocol;
 
     fn node(name: &str, protocol: NodeProtocol) -> Node {
         Node {

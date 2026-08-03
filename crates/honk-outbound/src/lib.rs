@@ -7,6 +7,7 @@
 
 pub mod alive;
 pub mod bootstrap;
+pub mod descriptor;
 pub mod group;
 pub mod proxy;
 pub mod quic;
