@@ -287,7 +287,7 @@ async fn test_version_and_config_shape_are_sing_box_compatible() {
     assert_eq!(
         version,
         serde_json::json!({
-            "version": format!("sing-box honk {}", env!("CARGO_PKG_VERSION"))
+            "version": format!("honk {}", env!("CARGO_PKG_VERSION"))
         })
     );
 

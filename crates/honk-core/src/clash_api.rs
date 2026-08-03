@@ -323,7 +323,7 @@ async fn hello(State(s): State<Arc<ClashState>>, headers: HeaderMap) -> Response
 /// GET /version — select zashboard's sing-box-compatible capability profile.
 async fn version() -> Json<serde_json::Value> {
     Json(serde_json::json!({
-        "version": concat!("sing-box honk ", env!("CARGO_PKG_VERSION")),
+        "version": concat!("honk ", env!("CARGO_PKG_VERSION")),
     }))
 }
 
