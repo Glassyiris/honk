@@ -475,9 +475,11 @@ outbound 绑定 `veth-client`)。
 ¹ honk 的 anytls 两行有一段历史:单流 iperf3 曾只有 2–3 Mbps。根因在
 honk 自身——单流 demux 队列满(64 帧)会**立即**杀流,单流测试中服务器
 的初始飞行快过新建 relay 任务,22ms 就触发杀流;随后服务器继续向池化
-会话灌死 sid 的 PSH 垃圾帧。修复为真正的有界 HOL 背压(队列满时 demux
-最多等 5s 再杀)。anytls-go 现在与 dae 持平;anytls-sb 落后(sing-box
-服务端的帧模式 dae 容忍得更好——后续工作)。
+会话灌死 sid 的 PSH 垃圾帧。上表实测使用第一版有界 HOL 修复,即最多
+等待 5s 再杀。当前路径不等待:按流分桶并设置 512 帧、每流 2 MiB、每会话
+8 MiB 的硬上限;触及上限时,已接纳数据排空后立即只 reset 肇事流。
+历史实测中 anytls-go 与 dae 持平;anytls-sb 落后(sing-box 服务端的帧模式
+dae 容忍得更好——后续工作)。
 
 ² dae 的 direct 路径在本实验室内核上故障(kdae 构建):direct 流超时,
 代理流正常。上表 dae 各协议行有效;无 dae direct 基线。
@@ -663,9 +665,9 @@ machine metadata、JSONL/CSV build 和 performance 记录。
 bench/release-matrix.sh --all-targets --dry-run --output /tmp/honk-release-matrix
 ```
 
-主机实测需要提供可执行的 `--benchmark-hook`；其 RSS/PSS/fault/CPU/latency 字段
-契约可由 `bench/release-matrix.sh --help` 查看。完整矩阵期间必须把所有 CPU
-policy 固定到同一 governor，并保持 turbo 状态不变；`machine.json` 会记录两项
+主机实测需要提供可执行的 `--benchmark-hook`；其 RSS/PSS/fault/CPU/throughput/
+latency 字段契约可由 `bench/release-matrix.sh --help` 查看。完整矩阵期间必须把
+所有 CPU policy 固定到同一 governor，并保持 turbo 状态不变；`machine.json` 会记录两项
 设置。只能在同一机器和 workload 下比较 cell。该矩阵记录证据；没有部署吞吐
 与尾延迟结果时，不据此切换发布 profile。
 
@@ -707,5 +709,6 @@ warm-up 后另测 200 次请求的尾延迟。
 - `cargo bench -p honk-core --bench dns`——DNS 微基准(见上)。
 - `cargo bench -p honk-core --bench udp -- --save-baseline udp-candidate`——仅 candidate 的绝对 UDP 测量；不是历史 A/B 或 p95 merge gate。
 - `bash bench/tests/udp-latency-cli.sh`——deployment driver 的 CLI/JSONL fixture；上文真实 UDP A/B gate 仍需要 TPROXY 与 upstream。
+- `bash bench/tests/runtime-memory-cli.sh`——配对 runtime-memory driver 的 CLI、顺序、identity 与 fail-closed JSONL fixture。
 - 发布 CI(`.github/workflows/release.yml`)——workspace 测试门禁 +
   四目标构建(x86_64/aarch64 × gnu/musl)+ BTF 检查 + tarballs。
