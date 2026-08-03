@@ -27,6 +27,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 /// Per-(node, check_url) probe state for URLTest groups with a custom
 /// `check_url` (sing-box urltest `url` option). Deliberately simpler than
@@ -228,10 +229,11 @@ type EbpfAliveCallback = Box<dyn Fn(u8, u32, u32, bool) + Send + Sync>;
 
 /// Callback fired when a node's (domain, ip-version) state flips
 /// alive→dead on the probe path (same trigger as the eBPF connectivity
-/// push). honk-core purges pooled connections and UDP endpoints bound to
-/// the node from it. Fires once per domain/ip-version flip — handlers
+/// push). Carries the NodeId plus the registered display name for logs.
+/// honk-core purges pooled connections and UDP endpoints bound to the
+/// node from it. Fires once per domain/ip-version flip — handlers
 /// must be idempotent.
-type DeathCallback = Box<dyn Fn(&str) + Send + Sync>;
+type DeathCallback = Box<dyn Fn(Uuid, &str) + Send + Sync>;
 
 /// Resolves a custom-check-URL group's member tags to `(tag, current
 /// leaf node)` pairs for probing (see `url_member_resolver`).
@@ -242,12 +244,20 @@ pub type UrlMemberResolver = Arc<dyn Fn(&str) -> Vec<(String, String)> + Send + 
 /// members pauses while the group is idle and resumes on the next selection.
 pub const DEFAULT_URLTEST_IDLE_TIMEOUT: Duration = Duration::from_secs(1800);
 
-/// Resolves a node name to its eBPF outbound index for
+/// Resolves a NodeId to its eBPF outbound index for
 /// `OUTBOUND_CONNECTIVITY_MAP` writes (direct=0, block=1, group i → 2+i,
 /// matching the control plane's routing push). Returns `None` for nodes
 /// without an eBPF outbound id (not in any group) — those state changes
 /// are not pushed to the kernel map.
-pub type OutboundIdResolver = Arc<dyn Fn(&str) -> Option<u8> + Send + Sync>;
+pub type OutboundIdResolver = Arc<dyn Fn(Uuid) -> Option<u8> + Send + Sync>;
+
+/// A node registered for health checking: the content-derived NodeId is
+/// the map key; the name is kept for logs and the prober's node lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredNode {
+    pub name: String,
+    pub address: String,
+}
 
 /// A single probe record for history/API consumption.
 #[derive(Debug, Clone)]
@@ -277,10 +287,10 @@ pub type ResolveHook = Arc<
 pub struct AliveDialerSet {
     /// Uses parking_lot RwLock/Mutex for synchronous, uncontended access on the
     /// async runtime (parking_lot blocks OS threads without runtime awareness).
-    states: RwLock<HashMap<String, [PerProtocolState; ALIVE_STATES_PER_NODE]>>,
+    states: RwLock<HashMap<Uuid, [PerProtocolState; ALIVE_STATES_PER_NODE]>>,
     /// Per-node-per-domain latency collections (Go `collection` struct).
-    collections: RwLock<HashMap<String, [Arc<DialerCollection>; ALIVE_STATES_PER_NODE]>>,
-    registered: RwLock<HashMap<String, String>>,
+    collections: RwLock<HashMap<Uuid, [Arc<DialerCollection>; ALIVE_STATES_PER_NODE]>>,
+    registered: RwLock<HashMap<Uuid, RegisteredNode>>,
     ebpf_callback: RwLock<Option<EbpfAliveCallback>>,
     death_callback: RwLock<Option<DeathCallback>>,
     /// Deprecated: per-protocol thresholds are now used via probe_failure_threshold/traffic_failure_threshold.
@@ -290,15 +300,15 @@ pub struct AliveDialerSet {
     max_cooldown: Duration,
     /// Bounded node-deduplicated emergency probe queue. A pending node owns
     /// at most one entry, so traffic failure storms cannot grow memory.
-    trigger_tx: tokio::sync::mpsc::Sender<String>,
-    trigger_rx: Mutex<Option<tokio::sync::mpsc::Receiver<String>>>,
-    trigger_pending: Mutex<HashSet<String>>,
+    trigger_tx: tokio::sync::mpsc::Sender<Uuid>,
+    trigger_rx: Mutex<Option<tokio::sync::mpsc::Receiver<Uuid>>>,
+    trigger_pending: Mutex<HashSet<Uuid>>,
     /// Optional `SO_MARK` value applied to probe sockets so the eBPF datapath
     /// treats them as control-plane traffic and does not re-route them.
     so_mark: Option<u32>,
     /// Last emergency probe timestamps per node for cooldown (Go: lastNotifyUdp/lastNotifyTcp).
-    last_emergency_tcp: Mutex<HashMap<String, Instant>>,
-    last_emergency_udp: Mutex<HashMap<String, Instant>>,
+    last_emergency_tcp: Mutex<HashMap<Uuid, Instant>>,
+    last_emergency_udp: Mutex<HashMap<Uuid, Instant>>,
     /// HTTP health check URL and method from config (Go: TcpCheckOption).
     /// When set, the probe uses HTTP(S) requests through the proxy instead of
     /// raw TCP connect, matching Go's `HttpCheck` behaviour.
@@ -318,19 +328,19 @@ pub struct AliveDialerSet {
     /// through the node's UDP data path after the TCP probe.
     udp_prober: RwLock<Option<UdpProberRef>>,
     /// Timestamp when each node was first registered (for grace period).
-    node_registered_at: RwLock<HashMap<String, Instant>>,
+    node_registered_at: RwLock<HashMap<Uuid, Instant>>,
     /// Per-node per-domain/IP-version probe history for API/UI.
-    probe_history: RwLock<HashMap<(String, usize), Vec<ProbeRecord>>>,
-    /// Node name → eBPF outbound index resolver for connectivity pushes.
+    probe_history: RwLock<HashMap<(Uuid, usize), Vec<ProbeRecord>>>,
+    /// NodeId → eBPF outbound index resolver for connectivity pushes.
     outbound_resolver: RwLock<Option<OutboundIdResolver>>,
     /// DNS resolver for check targets (system lookup when unset).
     resolver: RwLock<Option<ResolveHook>>,
     /// Last activity timestamp per URLTest group (lazy start: absent = idle).
     group_last_active: RwLock<HashMap<String, Instant>>,
-    /// node name → URLTest groups it belongs to (for idle suspension).
-    node_urltest_groups: RwLock<HashMap<String, Vec<String>>>,
-    /// URLTest group → member node names (for wake-up probes).
-    urltest_group_members: RwLock<HashMap<String, Vec<String>>>,
+    /// NodeId → URLTest groups it belongs to (for idle suspension).
+    node_urltest_groups: RwLock<HashMap<Uuid, Vec<String>>>,
+    /// URLTest group → member NodeIds (for wake-up probes).
+    urltest_group_members: RwLock<HashMap<String, Vec<Uuid>>>,
     /// URLTest group → idle timeout (probing pauses past it).
     urltest_group_timeout: RwLock<HashMap<String, Duration>>,
     /// Group → custom check URL for per-group health check targets
@@ -342,9 +352,11 @@ pub struct AliveDialerSet {
     /// for custom-URL probing (installed by honk-core via the group
     /// manager; direct members map to themselves).
     url_member_resolver: RwLock<Option<UrlMemberResolver>>,
-    /// (node, check_url) → probe state (TCP-only, see [`UrlProbeState`]).
+    /// (member tag, check_url) → probe state (TCP-only, see [`UrlProbeState`]).
+    /// Keyed by member TAG, not NodeId: a member may be a nested sub-group,
+    /// which has no node identity (sing-box RealTag semantics).
     url_states: RwLock<HashMap<(String, String), UrlProbeState>>,
-    /// (node, check_url) → latency collection for selection ranking.
+    /// (member tag, check_url) → latency collection for selection ranking.
     url_collections: RwLock<HashMap<(String, String), Arc<DialerCollection>>>,
     /// check_url → cached resolved IPs (same caching as `check_url_ips`).
     url_check_ips: RwLock<HashMap<String, Vec<SocketAddr>>>,
@@ -516,7 +528,7 @@ impl AliveDialerSet {
         *self.outbound_resolver.write() = resolver;
     }
 
-    fn push_ebpf(&self, node_id: &str, domain: ProbeDomain, ipver: IpVersion, alive: bool) {
+    fn push_ebpf(&self, node_id: Uuid, domain: ProbeDomain, ipver: IpVersion, alive: bool) {
         let outbound = match *self.outbound_resolver.read() {
             Some(ref resolve) => match resolve(node_id) {
                 Some(id) => id,
@@ -531,37 +543,40 @@ impl AliveDialerSet {
         }
     }
 
-    pub fn take_trigger_rx(&self) -> Option<tokio::sync::mpsc::Receiver<String>> {
+    pub fn take_trigger_rx(&self) -> Option<tokio::sync::mpsc::Receiver<Uuid>> {
         self.trigger_rx.lock().take()
     }
 
-    fn with_state<F, R>(&self, node_id: &str, idx: usize, f: F) -> R
+    fn with_state<F, R>(&self, node_id: Uuid, idx: usize, f: F) -> R
     where
         F: FnOnce(&mut PerProtocolState) -> R,
     {
         let mut states = self.states.write();
-        let entry = states.entry(node_id.into()).or_insert_with(fresh_states);
+        let entry = states.entry(node_id).or_insert_with(fresh_states);
         f(&mut entry[idx])
     }
 
-    fn read_state(&self, node_id: &str, idx: usize) -> PerProtocolState {
+    fn read_state(&self, node_id: Uuid, idx: usize) -> PerProtocolState {
         self.states
             .read()
-            .get(node_id)
+            .get(&node_id)
             .map(|s| s[idx].clone())
             .unwrap_or_default()
     }
 
-    pub fn is_alive_for(&self, node_id: &str, domain: ProbeDomain, ipver: IpVersion) -> bool {
+    pub fn is_alive_for(&self, node_id: Uuid, domain: ProbeDomain, ipver: IpVersion) -> bool {
         let idx = alive_index(domain, ipver);
-        self.states.read().get(node_id).is_none_or(|s| s[idx].alive)
+        self.states
+            .read()
+            .get(&node_id)
+            .is_none_or(|s| s[idx].alive)
     }
 
-    pub fn is_alive(&self, node_id: &str) -> bool {
+    pub fn is_alive(&self, node_id: Uuid) -> bool {
         self.is_alive_for(node_id, ProbeDomain::Tcp, IpVersion::V4)
     }
 
-    pub fn is_alive_udp(&self, node_id: &str) -> bool {
+    pub fn is_alive_udp(&self, node_id: Uuid) -> bool {
         self.is_alive_for(node_id, ProbeDomain::DataUdp, IpVersion::V4)
     }
 
@@ -570,7 +585,7 @@ impl AliveDialerSet {
     /// UDP traffic reported. Group selection uses this to distinguish
     /// "never UDP-probed" (TCP liveness fallback applies) from "UDP-probed
     /// and dead" (excluded from UDP selection even when TCP is alive).
-    pub fn has_udp_state(&self, node_id: &str) -> bool {
+    pub fn has_udp_state(&self, node_id: Uuid) -> bool {
         let history = self.probe_history.read();
         [ProbeDomain::DataUdp, ProbeDomain::DnsUdp]
             .into_iter()
@@ -581,18 +596,18 @@ impl AliveDialerSet {
             })
             .any(|(d, v)| {
                 history
-                    .get(&(node_id.to_string(), alive_index(d, v)))
+                    .get(&(node_id, alive_index(d, v)))
                     .is_some_and(|records| !records.is_empty())
             })
     }
 
-    pub fn alive_nodes(&self) -> HashSet<String> {
+    pub fn alive_nodes(&self) -> HashSet<Uuid> {
         let idx = alive_index(ProbeDomain::Tcp, IpVersion::V4);
         self.states
             .read()
             .iter()
             .filter(|(_, s)| s[idx].alive)
-            .map(|(k, _)| k.clone())
+            .map(|(k, _)| *k)
             .collect()
     }
 
@@ -602,7 +617,7 @@ impl AliveDialerSet {
     }
 
     #[allow(dead_code)]
-    fn mark_alive_for(&self, node_id: &str, domain: ProbeDomain, ipver: IpVersion) {
+    fn mark_alive_for(&self, node_id: Uuid, domain: ProbeDomain, ipver: IpVersion) {
         self.mark_alive_for_latency(node_id, domain, ipver, Duration::ZERO);
     }
 
@@ -610,7 +625,7 @@ impl AliveDialerSet {
     /// probe latency so `Latencies10` and `MovingAverage` are updated.
     fn mark_alive_for_latency(
         &self,
-        node_id: &str,
+        node_id: Uuid,
         domain: ProbeDomain,
         ipver: IpVersion,
         latency: Duration,
@@ -632,10 +647,10 @@ impl AliveDialerSet {
     }
 
     /// Check if a node is within its grace period.
-    fn is_in_grace_period(&self, node_id: &str) -> bool {
+    fn is_in_grace_period(&self, node_id: Uuid) -> bool {
         self.node_registered_at
             .read()
-            .get(node_id)
+            .get(&node_id)
             .map(|t| t.elapsed() < GRACE_PERIOD)
             .unwrap_or(false)
     }
@@ -643,12 +658,12 @@ impl AliveDialerSet {
     /// Append a probe record to history.
     fn record_probe_history(
         &self,
-        node_id: &str,
+        node_id: Uuid,
         idx: usize,
         success: bool,
         latency: Option<Duration>,
     ) {
-        let key = (node_id.to_string(), idx);
+        let key = (node_id, idx);
         let mut history = self.probe_history.write();
         let entry = history.entry(key).or_default();
         entry.push(ProbeRecord {
@@ -668,7 +683,7 @@ impl AliveDialerSet {
     /// - `is_traffic` = true → use traffic_failure_threshold
     fn mark_unavailable_internal(
         &self,
-        node_id: &str,
+        node_id: Uuid,
         domain: ProbeDomain,
         ipver: IpVersion,
         force: bool,
@@ -727,7 +742,7 @@ impl AliveDialerSet {
             if !still_alive {
                 self.push_ebpf(node_id, domain, ipver, false);
                 if let Some(ref cb) = *self.death_callback.read() {
-                    cb(node_id);
+                    cb(node_id, &self.node_name(node_id));
                 }
             }
         }
@@ -742,12 +757,12 @@ impl AliveDialerSet {
         self.record_probe_history(node_id, idx, false, None);
     }
 
-    fn mark_dead_for(&self, node_id: &str, domain: ProbeDomain, ipver: IpVersion) {
+    fn mark_dead_for(&self, node_id: Uuid, domain: ProbeDomain, ipver: IpVersion) {
         self.mark_unavailable_internal(node_id, domain, ipver, false, false);
     }
 
     /// Mark a TCP node as dead (public API for proxy dial failure callers).
-    pub fn mark_dead(&self, node_id: &str) {
+    pub fn mark_dead(&self, node_id: Uuid) {
         self.mark_dead_for(node_id, ProbeDomain::Tcp, IpVersion::V4);
         self.mark_dead_for(node_id, ProbeDomain::Tcp, IpVersion::V6);
     }
@@ -757,13 +772,13 @@ impl AliveDialerSet {
     /// Uses the per-protocol traffic failure thresholds (TCP=10, UDP Data=50)
     /// so transient glitches don't immediately tear down the node's alive state.
     /// Matches Go's `Dialer.ReportUnavailable`.
-    pub fn report_unavailable_traffic(&self, node_id: &str, domain: ProbeDomain, ipver: IpVersion) {
+    pub fn report_unavailable_traffic(&self, node_id: Uuid, domain: ProbeDomain, ipver: IpVersion) {
         self.mark_unavailable_internal(node_id, domain, ipver, false, true);
     }
 
     /// Force-mark a node as dead immediately (used on fatal errors).
     /// Matches Go's `Dialer.ReportUnavailableForced`.
-    pub fn report_unavailable_forced(&self, node_id: &str, domain: ProbeDomain, ipver: IpVersion) {
+    pub fn report_unavailable_forced(&self, node_id: Uuid, domain: ProbeDomain, ipver: IpVersion) {
         self.mark_unavailable_internal(node_id, domain, ipver, true, true);
     }
 
@@ -771,7 +786,7 @@ impl AliveDialerSet {
     ///
     /// For DataUDP: a single successful real UDP flow can instantly revive
     /// the data-UDP health domain (Go: `ReportAvailableTraffic`).
-    pub fn report_available_traffic(&self, node_id: &str, domain: ProbeDomain, ipver: IpVersion) {
+    pub fn report_available_traffic(&self, node_id: Uuid, domain: ProbeDomain, ipver: IpVersion) {
         let idx = alive_index(domain, ipver);
         let was_alive = self.with_state(node_id, idx, |e| {
             let was = e.alive;
@@ -791,30 +806,30 @@ impl AliveDialerSet {
 
     /// Trigger an emergency TCP health check on this node.
     /// Rate-limited to once per EMERGENCY_PROBE_COOLDOWN to protect the worker pool.
-    pub fn notify_check_tcp(&self, node_id: &str) {
+    pub fn notify_check_tcp(&self, node_id: Uuid) {
         let now = Instant::now();
         let mut last = self.last_emergency_tcp.lock();
-        if let Some(prev) = last.get(node_id)
+        if let Some(prev) = last.get(&node_id)
             && now.duration_since(*prev) < EMERGENCY_PROBE_COOLDOWN
         {
             return;
         }
-        last.insert(node_id.to_string(), now);
+        last.insert(node_id, now);
         drop(last);
         self.trigger_probe(node_id);
     }
 
     /// Trigger an emergency DNS UDP health check on this node.
     /// Rate-limited to once per EMERGENCY_PROBE_COOLDOWN.
-    pub fn notify_check_dns_udp(&self, node_id: &str) {
+    pub fn notify_check_dns_udp(&self, node_id: Uuid) {
         let now = Instant::now();
         let mut last = self.last_emergency_udp.lock();
-        if let Some(prev) = last.get(node_id)
+        if let Some(prev) = last.get(&node_id)
             && now.duration_since(*prev) < EMERGENCY_PROBE_COOLDOWN
         {
             return;
         }
-        last.insert(node_id.to_string(), now);
+        last.insert(node_id, now);
         drop(last);
         self.trigger_probe(node_id);
     }
@@ -823,19 +838,19 @@ impl AliveDialerSet {
     /// consecutive failures). Such nodes still probe on the slow
     /// max_cooldown cadence; the flag is informational (API/diagnostics).
     /// Emergency probes can still be triggered via `notify_check_*`.
-    pub fn is_probe_stopped(&self, node_id: &str, domain: ProbeDomain, ipver: IpVersion) -> bool {
+    pub fn is_probe_stopped(&self, node_id: Uuid, domain: ProbeDomain, ipver: IpVersion) -> bool {
         let idx = alive_index(domain, ipver);
         self.states
             .read()
-            .get(node_id)
+            .get(&node_id)
             .map(|s| s[idx].stopped)
             .unwrap_or(false)
     }
 
     /// Get (or create) the `DialerCollection` for a given node and domain index.
-    fn get_or_create_collection(&self, node_id: &str, idx: usize) -> Arc<DialerCollection> {
+    fn get_or_create_collection(&self, node_id: Uuid, idx: usize) -> Arc<DialerCollection> {
         let mut cols = self.collections.write();
-        let arr = cols.entry(node_id.to_string()).or_insert_with(|| {
+        let arr = cols.entry(node_id).or_insert_with(|| {
             [
                 Arc::new(DialerCollection::new()),
                 Arc::new(DialerCollection::new()),
@@ -859,7 +874,7 @@ impl AliveDialerSet {
     /// marked alive again. An already-alive node stays alive immediately.
     pub fn record_probe_latency(
         &self,
-        node_id: &str,
+        node_id: Uuid,
         domain: ProbeDomain,
         ipver: IpVersion,
         latency: Duration,
@@ -911,13 +926,13 @@ impl AliveDialerSet {
     /// Used by `GroupManager`'s `MinLatency` / `MinMovingAverage` policies.
     pub fn get_moving_average(
         &self,
-        node_id: &str,
+        node_id: Uuid,
         domain: ProbeDomain,
         ipver: IpVersion,
     ) -> Option<Duration> {
         let idx = alive_index(domain, ipver);
         let cols = self.collections.read();
-        let coll = cols.get(node_id).map(|arr| &arr[idx])?;
+        let coll = cols.get(&node_id).map(|arr| &arr[idx])?;
         let ma = coll.moving_average_duration();
         if ma > Duration::ZERO { Some(ma) } else { None }
     }
@@ -925,13 +940,13 @@ impl AliveDialerSet {
     /// Read the last probe latency for a node-domain pair.
     pub fn get_last_latency(
         &self,
-        node_id: &str,
+        node_id: Uuid,
         domain: ProbeDomain,
         ipver: IpVersion,
     ) -> Option<Duration> {
         let idx = alive_index(domain, ipver);
         let cols = self.collections.read();
-        let coll = cols.get(node_id).map(|arr| &arr[idx])?;
+        let coll = cols.get(&node_id).map(|arr| &arr[idx])?;
         coll.latencies.last()
     }
 
@@ -941,13 +956,13 @@ impl AliveDialerSet {
     /// show them as a measured delay.
     pub fn get_last_real_sample(
         &self,
-        node_id: &str,
+        node_id: Uuid,
         domain: ProbeDomain,
         ipver: IpVersion,
     ) -> Option<(Duration, std::time::SystemTime)> {
         let idx = alive_index(domain, ipver);
         let cols = self.collections.read();
-        let coll = cols.get(node_id).map(|arr| &arr[idx])?;
+        let coll = cols.get(&node_id).map(|arr| &arr[idx])?;
         coll.latencies.last_real_sample().map(|s| (s.latency, s.at))
     }
 
@@ -957,13 +972,13 @@ impl AliveDialerSet {
     /// sample when there is only one.
     pub fn get_avg_latency(
         &self,
-        node_id: &str,
+        node_id: Uuid,
         domain: ProbeDomain,
         ipver: IpVersion,
     ) -> Option<Duration> {
         let idx = alive_index(domain, ipver);
         let cols = self.collections.read();
-        let coll = cols.get(node_id).map(|arr| &arr[idx])?;
+        let coll = cols.get(&node_id).map(|arr| &arr[idx])?;
         coll.latencies.avg().or_else(|| coll.latencies.last())
     }
 
@@ -971,8 +986,8 @@ impl AliveDialerSet {
     /// history" semantics on measurement failure). After this call
     /// `get_last_latency` / `get_moving_average` return `None` until the
     /// next successful measurement.
-    pub fn clear_latency(&self, node_id: &str) {
-        self.collections.write().remove(node_id);
+    pub fn clear_latency(&self, node_id: Uuid) {
+        self.collections.write().remove(&node_id);
     }
 
     /// Dial-failure handling: un-rank the node (sing-box
@@ -981,7 +996,7 @@ impl AliveDialerSet {
     /// the top rank with a single lucky probe — with the penalty sample its
     /// moving average stays unattractive until ten real successes age the
     /// failure out.
-    pub fn record_dial_failure(&self, node_id: &str, domain: ProbeDomain, ipver: IpVersion) {
+    pub fn record_dial_failure(&self, node_id: Uuid, domain: ProbeDomain, ipver: IpVersion) {
         self.clear_latency(node_id);
         let coll = self.get_or_create_collection(node_id, alive_index(domain, ipver));
         coll.mark_unavailable();
@@ -991,7 +1006,7 @@ impl AliveDialerSet {
     /// history (cache.db warm start). Does NOT touch alive state — probes
     /// decide liveness; this only pre-seeds ranking data so URLTest groups
     /// don't start cold after a restart.
-    pub fn restore_latency(&self, node_id: &str, latency: Duration, at: std::time::SystemTime) {
+    pub fn restore_latency(&self, node_id: Uuid, latency: Duration, at: std::time::SystemTime) {
         let idx = alive_index(ProbeDomain::Tcp, IpVersion::V4);
         let coll = self.get_or_create_collection(node_id, idx);
         coll.restore_sample(latency, at);
@@ -999,7 +1014,7 @@ impl AliveDialerSet {
 
     /// Snapshot every node's last real TCP-v4 latency sample for
     /// persistence. Synthetic (failure) samples are excluded.
-    pub fn latency_snapshot(&self) -> Vec<(String, Duration, std::time::SystemTime)> {
+    pub fn latency_snapshot(&self) -> Vec<(Uuid, Duration, std::time::SystemTime)> {
         let idx = alive_index(ProbeDomain::Tcp, IpVersion::V4);
         let cols = self.collections.read();
         cols.iter()
@@ -1007,52 +1022,64 @@ impl AliveDialerSet {
                 arr[idx]
                     .latencies
                     .last_real_sample()
-                    .map(|s| (node.clone(), s.latency, s.at))
+                    .map(|s| (*node, s.latency, s.at))
             })
             .collect()
     }
 
-    pub fn register_node(&self, node_id: String, address: String) {
-        self.registered.write().insert(node_id.clone(), address);
+    pub fn register_node(&self, node_id: Uuid, name: String, address: String) {
+        self.registered
+            .write()
+            .insert(node_id, RegisteredNode { name, address });
         self.node_registered_at
             .write()
-            .insert(node_id.clone(), Instant::now());
+            .insert(node_id, Instant::now());
         let mut states = self.states.write();
         states.entry(node_id).or_insert_with(fresh_states);
     }
 
-    /// Snapshot of currently registered nodes (name → address), used by
-    /// config reload to diff and re-register only what changed.
-    pub fn registered_nodes(&self) -> HashMap<String, String> {
+    /// Snapshot of currently registered nodes (NodeId → name/address), used
+    /// by config reload to diff and re-register only what changed.
+    pub fn registered_nodes(&self) -> HashMap<Uuid, RegisteredNode> {
         self.registered.read().clone()
     }
 
-    pub fn remove_node(&self, node_id: &str) {
-        self.registered.write().remove(node_id);
-        self.states.write().remove(node_id);
-        self.node_registered_at.write().remove(node_id);
-        self.node_urltest_groups.write().remove(node_id);
-        let mut history = self.probe_history.write();
-        history.retain(|(id, _), _| id != node_id);
+    /// Registered display name for logs and prober lookups; falls back to
+    /// the ID itself for nodes driven without registration (tests).
+    pub fn node_name(&self, node_id: Uuid) -> String {
+        self.registered
+            .read()
+            .get(&node_id)
+            .map(|r| r.name.clone())
+            .unwrap_or_else(|| node_id.to_string())
     }
 
-    pub fn trigger_probe(&self, node_id: &str) {
+    pub fn remove_node(&self, node_id: Uuid) {
+        self.registered.write().remove(&node_id);
+        self.states.write().remove(&node_id);
+        self.node_registered_at.write().remove(&node_id);
+        self.node_urltest_groups.write().remove(&node_id);
+        let mut history = self.probe_history.write();
+        history.retain(|(id, _), _| *id != node_id);
+    }
+
+    pub fn trigger_probe(&self, node_id: Uuid) {
         let mut pending = self.trigger_pending.lock();
-        if !pending.insert(node_id.to_string()) {
+        if !pending.insert(node_id) {
             return;
         }
-        if self.trigger_tx.try_send(node_id.to_string()).is_err() {
+        if self.trigger_tx.try_send(node_id).is_err() {
             // Queue saturation drops this request (a later traffic failure or
             // periodic sweep retries it), and releases its dedup reservation.
-            pending.remove(node_id);
+            pending.remove(&node_id);
         }
     }
 
-    pub(crate) fn finish_trigger_probe(&self, node_id: &str) {
-        self.trigger_pending.lock().remove(node_id);
+    pub(crate) fn finish_trigger_probe(&self, node_id: Uuid) {
+        self.trigger_pending.lock().remove(&node_id);
     }
 
-    pub fn should_probe(&self, node_id: &str, domain: ProbeDomain, ipver: IpVersion) -> bool {
+    pub fn should_probe(&self, node_id: Uuid, domain: ProbeDomain, ipver: IpVersion) -> bool {
         let idx = alive_index(domain, ipver);
         let state = self.read_state(node_id, idx);
         // Stopped nodes (MAX_PROBE_BACKOFF_FAILURES consecutive failures)
@@ -1067,14 +1094,14 @@ impl AliveDialerSet {
 
     /// Register a URLTest group for idle-aware probe suspension.
     ///
-    /// `members` are node names; callers should exclude members that also
+    /// `members` are NodeIds; callers should exclude members that also
     /// belong to Selector groups (those are probed unconditionally).
     /// `idle_timeout` defaults to [`DEFAULT_URLTEST_IDLE_TIMEOUT`] when
     /// `None`. Re-callable on config reload.
     pub fn register_urltest_group(
         &self,
         group: &str,
-        members: &[String],
+        members: &[Uuid],
         idle_timeout: Option<Duration>,
     ) {
         let timeout = idle_timeout.unwrap_or(DEFAULT_URLTEST_IDLE_TIMEOUT);
@@ -1087,7 +1114,7 @@ impl AliveDialerSet {
         let mut node_groups = self.node_urltest_groups.write();
         for member in members {
             node_groups
-                .entry(member.clone())
+                .entry(*member)
                 .or_default()
                 .push(group.to_string());
         }
@@ -1259,14 +1286,14 @@ impl AliveDialerSet {
 
     /// Replace the whole URLTest group table (config reload).
     ///
-    /// `groups` is `(group name, member node names, idle timeout)` per
+    /// `groups` is `(group name, member NodeIds, idle timeout)` per
     /// URLTest group — the same shape [`register_urltest_group`] takes.
     /// Entries for groups absent from `groups` are dropped, and the
     /// node → groups index is rebuilt from scratch (so stale memberships
     /// and duplicate entries from repeated registration disappear).
     /// `group_last_active` timestamps survive for groups that still exist,
     /// keeping the idle-suspension state across the reload.
-    pub fn sync_urltest_groups(&self, groups: &[(String, Vec<String>, Option<Duration>)]) {
+    pub fn sync_urltest_groups(&self, groups: &[(String, Vec<Uuid>, Option<Duration>)]) {
         {
             let mut timeouts = self.urltest_group_timeout.write();
             let mut members_map = self.urltest_group_members.write();
@@ -1281,10 +1308,7 @@ impl AliveDialerSet {
                 );
                 members_map.insert(group.clone(), members.clone());
                 for member in members {
-                    node_groups
-                        .entry(member.clone())
-                        .or_default()
-                        .push(group.clone());
+                    node_groups.entry(*member).or_default().push(group.clone());
                 }
             }
         }
@@ -1318,7 +1342,7 @@ impl AliveDialerSet {
                     group
                 );
                 for member in members {
-                    self.trigger_probe(&member);
+                    self.trigger_probe(member);
                 }
             }
         }
@@ -1343,9 +1367,9 @@ impl AliveDialerSet {
     /// Whether periodic probing of this node is suspended because every
     /// URLTest group it belongs to is idle. Nodes outside URLTest groups
     /// are never suspended.
-    pub fn is_probe_suspended(&self, node_id: &str) -> bool {
+    pub fn is_probe_suspended(&self, node_id: Uuid) -> bool {
         let groups = self.node_urltest_groups.read();
-        match groups.get(node_id) {
+        match groups.get(&node_id) {
             Some(gs) if !gs.is_empty() => gs.iter().all(|g| self.is_urltest_group_idle(g)),
             _ => false,
         }
@@ -1356,14 +1380,14 @@ impl AliveDialerSet {
     /// selection, deprioritising recently-flapping nodes.
     pub fn consecutive_failures(
         &self,
-        node_id: &str,
+        node_id: Uuid,
         domain: ProbeDomain,
         ipver: IpVersion,
     ) -> u32 {
         let idx = alive_index(domain, ipver);
         self.states
             .read()
-            .get(node_id)
+            .get(&node_id)
             .map(|s| s[idx].consecutive_failures)
             .unwrap_or(0)
     }
@@ -1482,11 +1506,12 @@ mod trigger_tests {
     #[test]
     fn trigger_queue_is_deduplicated_and_bounded() {
         let set = AliveDialerSet::new();
+        let same = Uuid::from_u128(1);
         for _ in 0..1_000 {
-            set.trigger_probe("same-node");
+            set.trigger_probe(same);
         }
-        for index in 0..1_000 {
-            set.trigger_probe(&format!("node-{index}"));
+        for index in 0..1_000u128 {
+            set.trigger_probe(Uuid::from_u128(index + 2));
         }
 
         let mut receiver = set.take_trigger_rx().expect("first receiver ownership");
@@ -1495,15 +1520,12 @@ mod trigger_tests {
             seen.insert(id);
         }
         assert!(seen.len() <= 256);
-        assert_eq!(
-            seen.iter().filter(|id| id.as_str() == "same-node").count(),
-            1
-        );
+        assert_eq!(seen.iter().filter(|id| **id == same).count(), 1);
         for id in seen {
-            set.finish_trigger_probe(&id);
+            set.finish_trigger_probe(id);
         }
-        set.trigger_probe("same-node");
-        assert_eq!(receiver.try_recv().as_deref(), Ok("same-node"));
+        set.trigger_probe(same);
+        assert_eq!(receiver.try_recv(), Ok(same));
     }
 }
 

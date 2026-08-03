@@ -554,12 +554,9 @@ impl ControlPlaneHandle {
             );
             // Trigger emergency probes to recover dead nodes (leaf
             // expansion: sub-group tags carry no probe state).
-            let group_nodes = self
-                .group_manager
-                .read()
-                .leaf_node_names_in_group(&outbound_name);
-            for node_name in group_nodes {
-                self.alive_set.notify_check_tcp(&node_name);
+            let group_manager = self.group_manager.read().clone();
+            for node in group_manager.leaf_nodes_in_group(&outbound_name) {
+                self.alive_set.notify_check_tcp(node.id);
             }
             self.stats.record_error(&outbound_name);
             self.stats.record_close(&outbound_name);
@@ -735,7 +732,7 @@ impl ControlPlaneHandle {
                                     IpVersion::V4
                                 };
                                 ctx.alive_set.report_available_traffic(
-                                    &node.name,
+                                    node.id,
                                     ProbeDomain::Tcp,
                                     ipver,
                                 );
@@ -753,16 +750,13 @@ impl ControlPlaneHandle {
                                     IpVersion::V4
                                 };
                                 ctx.alive_set.report_unavailable_traffic(
-                                    &node.name,
+                                    node.id,
                                     ProbeDomain::Tcp,
                                     ipver,
                                 );
-                                ctx.alive_set.record_dial_failure(
-                                    &node.name,
-                                    ProbeDomain::Tcp,
-                                    ipver,
-                                );
-                                ctx.alive_set.notify_check_tcp(&node.name);
+                                ctx.alive_set
+                                    .record_dial_failure(node.id, ProbeDomain::Tcp, ipver);
+                                ctx.alive_set.notify_check_tcp(node.id);
                                 let msg = e.to_string();
                                 if msg.starts_with("dial timed out after") {
                                     timeout_count += 1;
@@ -1414,12 +1408,9 @@ impl ControlPlaneHandle {
                 "No available candidate nodes for UDP outbound '{}' ({})",
                 outbound_name, client_addr
             );
-            let group_nodes = self
-                .group_manager
-                .read()
-                .leaf_node_names_in_group(&outbound_name);
-            for node_name in group_nodes {
-                self.alive_set.notify_check_tcp(&node_name);
+            let group_manager = self.group_manager.read().clone();
+            for node in group_manager.leaf_nodes_in_group(&outbound_name) {
+                self.alive_set.notify_check_tcp(node.id);
             }
             self.stats.record_error(&outbound_name);
             return Ok(());
@@ -1472,7 +1463,7 @@ impl ControlPlaneHandle {
                 let group_manager = self.group_manager.clone();
                 Arc::new(move |node| {
                     group_manager.read().is_node_selectable_for_domain(
-                        &node.name,
+                        node.id,
                         ProbeDomain::DataUdp,
                         scheduler_ipver,
                     )
@@ -1482,16 +1473,12 @@ impl ControlPlaneHandle {
                 let alive_set = self.alive_set.clone();
                 Arc::new(move |node| {
                     alive_set.report_unavailable_traffic(
-                        &node.name,
+                        node.id,
                         ProbeDomain::DataUdp,
                         scheduler_ipver,
                     );
-                    alive_set.record_dial_failure(
-                        &node.name,
-                        ProbeDomain::DataUdp,
-                        scheduler_ipver,
-                    );
-                    alive_set.notify_check_tcp(&node.name);
+                    alive_set.record_dial_failure(node.id, ProbeDomain::DataUdp, scheduler_ipver);
+                    alive_set.notify_check_tcp(node.id);
                 })
             },
             on_attempt: {
@@ -1521,14 +1508,14 @@ impl ControlPlaneHandle {
         // The prepared winner is bound only after every speculative loser has
         // been aborted/drained. Close the death-before-bind race again before
         // creating any endpoint state or allowing the Task 3 driver to send.
-        if !lease.bind_selected_node(&node.name) {
+        if !lease.bind_selected_node(node.id) {
             return Err(anyhow::anyhow!(
                 "UDP initializer generation was cancelled before winner bind"
             ));
         }
         if !lease.still_initializing()
             || !self.group_manager.read().is_node_selectable_for_domain(
-                &node.name,
+                node.id,
                 ProbeDomain::DataUdp,
                 scheduler_ipver,
             )
@@ -1560,7 +1547,7 @@ impl ControlPlaneHandle {
             .record_udp_reply_ready_latency(reply_ready_started.elapsed());
 
         let relay_addr = transport.relay_addr();
-        let endpoint = Arc::new(UdpEndpoint::new(transport, relay_addr, node.name.clone()));
+        let endpoint = Arc::new(UdpEndpoint::new(transport, relay_addr, node.id));
         endpoint.record_pending_reply_peer(relay_addr);
         endpoint.cache_routing_result(original_dst, outbound_index);
 

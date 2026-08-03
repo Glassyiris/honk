@@ -677,9 +677,9 @@ protocol = "udp"
         }
         // Health-check registrations follow the new membership.
         let registered = cp.alive_set().registered_nodes();
-        assert!(registered.contains_key("a"));
-        assert!(registered.contains_key("b"));
-        assert!(registered.contains_key("c"));
+        assert!(registered.contains_key(&a.id));
+        assert!(registered.contains_key(&b.id));
+        assert!(registered.contains_key(&c.id));
         // The new URLTest group is registered for idle suspension (lazy
         // start: never active → idle).
         assert!(cp.alive_set().is_urltest_group_idle("ut"));
@@ -701,9 +701,9 @@ protocol = "udp"
             assert!(gm.select_node("extra").is_none());
         }
         let registered = cp.alive_set().registered_nodes();
-        assert!(registered.contains_key("a"));
-        assert!(!registered.contains_key("b"));
-        assert!(!registered.contains_key("c"));
+        assert!(registered.contains_key(&a.id));
+        assert!(!registered.contains_key(&b.id));
+        assert!(!registered.contains_key(&c.id));
         // Removed URLTest groups are no longer registered (never idle).
         assert!(!cp.alive_set().is_urltest_group_idle("ut"));
     }
@@ -822,12 +822,12 @@ protocol = "udp"
         // Health checks follow the merged membership: new nodes registered,
         // replaced nodes deregistered, others untouched.
         let registered = cp.alive_set().registered_nodes();
-        assert!(registered.contains_key("sub-new-1"));
-        assert!(registered.contains_key("sub-new-2"));
-        assert!(registered.contains_key("static"));
-        assert!(registered.contains_key("other-sub"));
-        assert!(!registered.contains_key("sub-old-1"));
-        assert!(!registered.contains_key("sub-old-2"));
+        assert!(registered.contains_key(&new1.id));
+        assert!(registered.contains_key(&new2.id));
+        assert!(registered.contains_key(&static_node.id));
+        assert!(registered.contains_key(&other.id));
+        assert!(!registered.contains_key(&old1.id));
+        assert!(!registered.contains_key(&old2.id));
 
         // Idempotency: re-merging the same subscription (periodic refresh
         // with fresh UUIDs) replaces instead of duplicating.

@@ -2,8 +2,8 @@ use super::*;
 
 #[test]
 fn direct_selector_fast_path_preserves_first_member_selection() {
-    let a = make_node(uuid::Uuid::new_v4(), "a");
-    let b = make_node(uuid::Uuid::new_v4(), "b");
+    let a = make_node(nid("a"), "a");
+    let b = make_node(nid("b"), "b");
     let group = make_group("selector", GroupPolicy::Selector, vec![a.id, b.id]);
     let manager = GroupManager::new(&[group], &[a, b]);
     assert_eq!(
@@ -15,6 +15,10 @@ fn direct_selector_fast_path_preserves_first_member_selection() {
     );
 }
 use chrono::Utc;
+
+fn nid(name: &str) -> uuid::Uuid {
+    uuid::Uuid::new_v5(&honk_config::node::NODE_ID_NAMESPACE, name.as_bytes())
+}
 
 fn make_node(id: uuid::Uuid, name: &str) -> Node {
     Node {
@@ -51,7 +55,7 @@ fn make_subgroup(name: &str, policy: GroupPolicy, sub_tags: &[&str]) -> Group {
 
 #[test]
 fn test_selector_default_first_alive() {
-    let (n1, n2) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (n1, n2) = (nid("a"), nid("b"));
     let nodes = vec![make_node(n1, "a"), make_node(n2, "b")];
     let m = GroupManager::new(
         &[make_group("g", GroupPolicy::Selector, vec![n1, n2])],
@@ -64,7 +68,7 @@ fn test_selector_default_first_alive() {
 
 #[test]
 fn test_selector_with_default_name() {
-    let (n1, n2) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (n1, n2) = (nid("alpha"), nid("beta"));
     let nodes = vec![make_node(n1, "alpha"), make_node(n2, "beta")];
     let mut group = make_group("g", GroupPolicy::Selector, vec![n1, n2]);
     group.default = Some("beta".into());
@@ -75,11 +79,7 @@ fn test_selector_with_default_name() {
 
 #[test]
 fn test_selector_runtime_choice_overrides_default() {
-    let (n1, n2, n3) = (
-        uuid::Uuid::new_v4(),
-        uuid::Uuid::new_v4(),
-        uuid::Uuid::new_v4(),
-    );
+    let (n1, n2, n3) = (nid("a"), nid("b"), nid("c"));
     let nodes = vec![make_node(n1, "a"), make_node(n2, "b"), make_node(n3, "c")];
     let mut group = make_group("g", GroupPolicy::Selector, vec![n1, n2, n3]);
     group.default = Some("b".into());
@@ -91,7 +91,7 @@ fn test_selector_runtime_choice_overrides_default() {
 
 #[test]
 fn test_not_found() {
-    let n = make_node(uuid::Uuid::new_v4(), "x");
+    let n = make_node(nid("x"), "x");
     let m = GroupManager::new(&[make_group("g", GroupPolicy::Selector, vec![n.id])], &[n]);
     assert!(m.select_node("nope").is_none());
     assert!(m.get_group_policy("nope").is_none());
@@ -107,7 +107,7 @@ fn test_selector_choice_get_set() {
 
 #[test]
 fn test_urltest_selection() {
-    let n = uuid::Uuid::new_v4();
+    let n = nid("a");
     let nodes = vec![make_node(n, "a")];
     let m = GroupManager::new(&[make_group("g", GroupPolicy::URLTest, vec![n])], &nodes);
     let selected = m.select_node("g").unwrap();
@@ -117,7 +117,7 @@ fn test_urltest_selection() {
 
 #[test]
 fn test_group_policy() {
-    let n = uuid::Uuid::new_v4();
+    let n = nid("a");
     let nodes = vec![make_node(n, "a")];
     let m = GroupManager::new(
         &[
@@ -132,7 +132,7 @@ fn test_group_policy() {
 
 #[test]
 fn test_node_names_in_group() {
-    let (n1, n2) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (n1, n2) = (nid("a"), nid("b"));
     let nodes = vec![make_node(n1, "a"), make_node(n2, "b")];
     let m = GroupManager::new(
         &[make_group("g", GroupPolicy::Selector, vec![n1, n2])],
@@ -146,7 +146,7 @@ fn test_node_names_in_group() {
 
 #[test]
 fn test_idle_default() {
-    let n = uuid::Uuid::new_v4();
+    let n = nid("a");
     let nodes = vec![make_node(n, "a")];
     // No idle_timeout → never idle
     let m = GroupManager::new(&[make_group("g", GroupPolicy::Selector, vec![n])], &nodes);
@@ -155,7 +155,7 @@ fn test_idle_default() {
 
 #[test]
 fn test_idle_with_timeout() {
-    let n = uuid::Uuid::new_v4();
+    let n = nid("a");
     let nodes = vec![make_node(n, "a")];
     let mut group = make_group("g", GroupPolicy::Selector, vec![n]);
     group.idle_timeout = Some(1);
@@ -172,7 +172,7 @@ fn test_idle_with_timeout() {
 
 #[test]
 fn test_final_outbound() {
-    let n = uuid::Uuid::new_v4();
+    let n = nid("a");
     let nodes = vec![make_node(n, "a")];
     let mut group = make_group("g", GroupPolicy::Selector, vec![n]);
     group.final_outbound = Some("direct".into());
@@ -183,7 +183,7 @@ fn test_final_outbound() {
 
 #[test]
 fn test_persist_callback_on_selector_change() {
-    let (n1, n2) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (n1, n2) = (nid("a"), nid("b"));
     let nodes = vec![make_node(n1, "a"), make_node(n2, "b")];
     let m = GroupManager::new(
         &[make_group("g", GroupPolicy::Selector, vec![n1, n2])],
@@ -214,7 +214,7 @@ fn test_persist_callback_on_selector_change() {
 
 #[test]
 fn test_interrupt_callback_selector() {
-    let (n1, n2) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (n1, n2) = (nid("a"), nid("b"));
     let nodes = vec![make_node(n1, "a"), make_node(n2, "b")];
     let mut g_on = make_group("on", GroupPolicy::Selector, vec![n1, n2]);
     g_on.interrupt_connections = true;
@@ -243,7 +243,7 @@ fn test_interrupt_callback_selector() {
 
 #[test]
 fn test_interrupt_callback_urltest_switch() {
-    let (n1, n2) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (n1, n2) = (nid("a"), nid("b"));
     let nodes = vec![make_node(n1, "a"), make_node(n2, "b")];
     let mut group = make_group("g", GroupPolicy::URLTest, vec![n1, n2]);
     group.interrupt_connections = true;
@@ -259,13 +259,13 @@ fn test_interrupt_callback_urltest_switch() {
     // 'a' has the lower latency → selected first. First selection is
     // not a change, so no interrupt fires.
     alive.record_probe_latency(
-        "a",
+        nid("a"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(10),
     );
     alive.record_probe_latency(
-        "b",
+        nid("b"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(100),
@@ -275,7 +275,7 @@ fn test_interrupt_callback_urltest_switch() {
     assert!(calls.lock().unwrap().is_empty());
 
     // Kill 'a' → next selection switches to 'b' → interrupt fires once.
-    alive.report_unavailable_forced("a", ProbeDomain::Tcp, IpVersion::V4);
+    alive.report_unavailable_forced(nid("a"), ProbeDomain::Tcp, IpVersion::V4);
     let sel = m.select_node("g").unwrap();
     assert_eq!(sel.name, "b");
     assert_eq!(calls.lock().unwrap().as_slice(), &["g".to_string()]);
@@ -287,10 +287,10 @@ fn test_interrupt_callback_urltest_switch() {
 
 #[test]
 fn test_select_marks_group_active() {
-    let n = uuid::Uuid::new_v4();
+    let n = nid("a");
     let nodes = vec![make_node(n, "a")];
     let alive = Arc::new(AliveDialerSet::new());
-    alive.register_urltest_group("g", &["a".to_string()], Some(Duration::from_secs(3600)));
+    alive.register_urltest_group("g", &[nid("a")], Some(Duration::from_secs(3600)));
     let m = GroupManager::with_alive_set(
         &[make_group("g", GroupPolicy::URLTest, vec![n])],
         &nodes,
@@ -303,7 +303,7 @@ fn test_select_marks_group_active() {
     assert!(!alive.is_urltest_group_idle("g"));
 
     // The parallel-dial path also counts as activity.
-    alive.register_urltest_group("g2", &["a".to_string()], Some(Duration::from_millis(50)));
+    alive.register_urltest_group("g2", &[nid("a")], Some(Duration::from_millis(50)));
     let m2 = GroupManager::with_alive_set(
         &[make_group("g2", GroupPolicy::URLTest, vec![n])],
         &nodes,
@@ -318,7 +318,7 @@ fn test_select_marks_group_active() {
 /// exactly the policy pick, not a latency-sorted race list.
 #[test]
 fn test_selector_dial_list_is_the_chosen_node_only() {
-    let (n1, n2) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (n1, n2) = (nid("a"), nid("b"));
     let nodes = vec![make_node(n1, "a"), make_node(n2, "b")];
     let alive = Arc::new(AliveDialerSet::new());
     let m = GroupManager::with_alive_set(
@@ -328,13 +328,13 @@ fn test_selector_dial_list_is_the_chosen_node_only() {
     );
     // "a" has the better latency, but the manual choice "b" must win.
     alive.record_probe_latency(
-        "a",
+        nid("a"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(10),
     );
     alive.record_probe_latency(
-        "b",
+        nid("b"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(50),
@@ -350,7 +350,7 @@ fn test_selector_dial_list_is_the_chosen_node_only() {
 /// node; without any data (cold start) all alive candidates race.
 #[test]
 fn test_urltest_dial_list_single_when_data_exists_race_when_cold() {
-    let (n1, n2) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (n1, n2) = (nid("a"), nid("b"));
     let nodes = vec![make_node(n1, "a"), make_node(n2, "b")];
     let alive = Arc::new(AliveDialerSet::new());
     let m = GroupManager::with_alive_set(
@@ -365,13 +365,13 @@ fn test_urltest_dial_list_single_when_data_exists_race_when_cold() {
 
     // With measurements, only the best node is dialed.
     alive.record_probe_latency(
-        "a",
+        nid("a"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(10),
     );
     alive.record_probe_latency(
-        "b",
+        nid("b"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(50),
@@ -383,7 +383,7 @@ fn test_urltest_dial_list_single_when_data_exists_race_when_cold() {
 
 #[test]
 fn selection_plan_preserves_authoritative_and_cold_urltest_provenance() {
-    let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (a, b) = (nid("a"), nid("b"));
     let nodes = vec![make_node(a, "a"), make_node(b, "b")];
     let groups = vec![
         make_group("selector", GroupPolicy::Selector, vec![a, b]),
@@ -405,7 +405,7 @@ fn selection_plan_preserves_authoritative_and_cold_urltest_provenance() {
         Some(alive.clone()),
     );
     alive.record_probe_latency(
-        "a",
+        nid("a"),
         ProbeDomain::DataUdp,
         IpVersion::V4,
         Duration::from_millis(10),
@@ -432,7 +432,7 @@ fn selection_plan_preserves_authoritative_and_cold_urltest_provenance() {
 
 #[test]
 fn selection_plan_cold_urltest_keeps_mode_with_one_udp_eligible_leaf() {
-    let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (a, b) = (nid("udp-dead"), nid("udp-live"));
     let nodes = vec![make_node(a, "udp-dead"), make_node(b, "udp-live")];
     let alive = Arc::new(AliveDialerSet::new());
     let manager = GroupManager::with_alive_set(
@@ -440,8 +440,8 @@ fn selection_plan_cold_urltest_keeps_mode_with_one_udp_eligible_leaf() {
         &nodes,
         Some(alive.clone()),
     );
-    alive.report_unavailable_forced("udp-dead", ProbeDomain::DataUdp, IpVersion::V4);
-    alive.report_unavailable_forced("udp-dead", ProbeDomain::DnsUdp, IpVersion::V4);
+    alive.report_unavailable_forced(nid("udp-dead"), ProbeDomain::DataUdp, IpVersion::V4);
+    alive.report_unavailable_forced(nid("udp-dead"), ProbeDomain::DnsUdp, IpVersion::V4);
 
     let plan = manager.selection_plan_for_domain("cold", ProbeDomain::DataUdp, IpVersion::V4);
     assert_eq!(plan.mode, SelectionPlanMode::ColdUrlTest);
@@ -457,9 +457,9 @@ fn selection_plan_cold_urltest_keeps_mode_with_one_udp_eligible_leaf() {
 #[test]
 fn selection_plan_ignores_udp_measurement_from_dead_candidate() {
     let (a, b, c) = (
-        uuid::Uuid::new_v4(),
-        uuid::Uuid::new_v4(),
-        uuid::Uuid::new_v4(),
+        nid("measured-dead"),
+        nid("unmeasured-live-b"),
+        nid("unmeasured-live-c"),
     );
     let nodes = vec![
         make_node(a, "measured-dead"),
@@ -477,13 +477,13 @@ fn selection_plan_ignores_udp_measurement_from_dead_candidate() {
         Some(alive.clone()),
     );
     alive.record_probe_latency(
-        "measured-dead",
+        nid("measured-dead"),
         ProbeDomain::DataUdp,
         IpVersion::V4,
         Duration::from_millis(10),
     );
     for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
-        alive.report_unavailable_forced("measured-dead", domain, IpVersion::V4);
+        alive.report_unavailable_forced(nid("measured-dead"), domain, IpVersion::V4);
     }
 
     let plan =
@@ -512,11 +512,7 @@ fn selection_plan_ignores_udp_measurement_from_dead_candidate() {
 
 #[test]
 fn test_migrate_selector_choices_from() {
-    let (n1, n2, n3) = (
-        uuid::Uuid::new_v4(),
-        uuid::Uuid::new_v4(),
-        uuid::Uuid::new_v4(),
-    );
+    let (n1, n2, n3) = (nid("a"), nid("b"), nid("c"));
     let nodes = vec![make_node(n1, "a"), make_node(n2, "b"), make_node(n3, "c")];
 
     // Old manager: three selector groups with runtime choices.
@@ -553,11 +549,7 @@ fn test_migrate_selector_choices_from() {
 
 #[test]
 fn test_loadbalance_round_robin_independent_per_group() {
-    let (n1, n2, n3) = (
-        uuid::Uuid::new_v4(),
-        uuid::Uuid::new_v4(),
-        uuid::Uuid::new_v4(),
-    );
+    let (n1, n2, n3) = (nid("a"), nid("b"), nid("c"));
     let nodes = vec![make_node(n1, "a"), make_node(n2, "b"), make_node(n3, "c")];
     let m = GroupManager::new(
         &[
@@ -582,7 +574,7 @@ fn test_loadbalance_round_robin_independent_per_group() {
 
 #[test]
 fn loadbalance_tcp_and_udp_cursors_are_independent() {
-    let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (a, b) = (nid("a"), nid("b"));
     let nodes = vec![make_node(a, "a"), make_node(b, "b")];
     let manager = GroupManager::new(
         &[make_group("lb", GroupPolicy::LoadBalance, vec![a, b])],
@@ -621,11 +613,7 @@ fn loadbalance_tcp_and_udp_cursors_are_independent() {
 
 #[test]
 fn test_loadbalance_skips_dead_nodes() {
-    let (n1, n2, n3) = (
-        uuid::Uuid::new_v4(),
-        uuid::Uuid::new_v4(),
-        uuid::Uuid::new_v4(),
-    );
+    let (n1, n2, n3) = (nid("a"), nid("b"), nid("c"));
     let nodes = vec![make_node(n1, "a"), make_node(n2, "b"), make_node(n3, "c")];
     let alive = Arc::new(AliveDialerSet::new());
     let m = GroupManager::with_alive_set(
@@ -633,7 +621,7 @@ fn test_loadbalance_skips_dead_nodes() {
         &nodes,
         Some(alive.clone()),
     );
-    alive.report_unavailable_forced("b", ProbeDomain::Tcp, IpVersion::V4);
+    alive.report_unavailable_forced(nid("b"), ProbeDomain::Tcp, IpVersion::V4);
     let seq: Vec<String> = (0..4)
         .map(|_| m.select_node("lb").unwrap().name.clone())
         .collect();
@@ -643,11 +631,7 @@ fn test_loadbalance_skips_dead_nodes() {
 
 #[test]
 fn test_loadbalance_order_for_parallel_dial() {
-    let (n1, n2, n3) = (
-        uuid::Uuid::new_v4(),
-        uuid::Uuid::new_v4(),
-        uuid::Uuid::new_v4(),
-    );
+    let (n1, n2, n3) = (nid("a"), nid("b"), nid("c"));
     let nodes = vec![make_node(n1, "a"), make_node(n2, "b"), make_node(n3, "c")];
     let alive = Arc::new(AliveDialerSet::new());
     let m = GroupManager::with_alive_set(
@@ -656,19 +640,19 @@ fn test_loadbalance_order_for_parallel_dial() {
         Some(alive.clone()),
     );
     alive.record_probe_latency(
-        "a",
+        nid("a"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(100),
     );
     alive.record_probe_latency(
-        "b",
+        nid("b"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(10),
     );
     alive.record_probe_latency(
-        "c",
+        nid("c"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(50),
@@ -687,7 +671,7 @@ fn test_loadbalance_order_for_parallel_dial() {
 
 #[test]
 fn test_loadbalance_no_interrupt_on_rotation() {
-    let (n1, n2) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (n1, n2) = (nid("a"), nid("b"));
     let nodes = vec![make_node(n1, "a"), make_node(n2, "b")];
     let mut group = make_group("lb", GroupPolicy::LoadBalance, vec![n1, n2]);
     group.interrupt_connections = true;
@@ -709,7 +693,7 @@ fn test_loadbalance_no_interrupt_on_rotation() {
 
 #[test]
 fn test_fallback_first_alive_switch_and_no_flap_back() {
-    let (n1, n2) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (n1, n2) = (nid("a"), nid("b"));
     let nodes = vec![make_node(n1, "a"), make_node(n2, "b")];
     let alive = Arc::new(AliveDialerSet::new());
     let m = GroupManager::with_alive_set(
@@ -719,13 +703,13 @@ fn test_fallback_first_alive_switch_and_no_flap_back() {
     );
     // "b" is faster, but Fallback follows declaration order.
     alive.record_probe_latency(
-        "a",
+        nid("a"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(100),
     );
     alive.record_probe_latency(
-        "b",
+        nid("b"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(10),
@@ -734,22 +718,22 @@ fn test_fallback_first_alive_switch_and_no_flap_back() {
     assert_eq!(m.get_fallback_selection("fb"), Some("a".into()));
 
     // Current pin dies → switch to the next alive node.
-    alive.report_unavailable_forced("a", ProbeDomain::Tcp, IpVersion::V4);
+    alive.report_unavailable_forced(nid("a"), ProbeDomain::Tcp, IpVersion::V4);
     assert_eq!(m.select_node("fb").unwrap().name, "b");
     assert_eq!(m.get_fallback_selection("fb"), Some("b".into()));
 
     // Preferred node recovers → NO immediate failback (hysteresis).
-    alive.report_available_traffic("a", ProbeDomain::Tcp, IpVersion::V4);
+    alive.report_available_traffic(nid("a"), ProbeDomain::Tcp, IpVersion::V4);
     assert_eq!(m.select_node("fb").unwrap().name, "b");
 
     // Current pin dies again → re-evaluate declaration order → "a".
-    alive.report_unavailable_forced("b", ProbeDomain::Tcp, IpVersion::V4);
+    alive.report_unavailable_forced(nid("b"), ProbeDomain::Tcp, IpVersion::V4);
     assert_eq!(m.select_node("fb").unwrap().name, "a");
 }
 
 #[test]
 fn fallback_tcp_and_udp_pins_are_independent() {
-    let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (a, b) = (nid("a"), nid("b"));
     let nodes = vec![make_node(a, "a"), make_node(b, "b")];
     let alive = Arc::new(AliveDialerSet::new());
     let manager = GroupManager::with_alive_set(
@@ -760,7 +744,7 @@ fn fallback_tcp_and_udp_pins_are_independent() {
 
     assert_eq!(manager.select_node("fb").unwrap().name, "a");
     for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
-        alive.report_unavailable_forced("a", domain, IpVersion::V4);
+        alive.report_unavailable_forced(nid("a"), domain, IpVersion::V4);
     }
     assert_eq!(
         manager
@@ -775,7 +759,7 @@ fn fallback_tcp_and_udp_pins_are_independent() {
 
 #[test]
 fn test_fallback_interrupt_on_switch() {
-    let (n1, n2) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (n1, n2) = (nid("a"), nid("b"));
     let nodes = vec![make_node(n1, "a"), make_node(n2, "b")];
     let mut group = make_group("fb", GroupPolicy::Fallback, vec![n1, n2]);
     group.interrupt_connections = true;
@@ -793,7 +777,7 @@ fn test_fallback_interrupt_on_switch() {
     assert!(calls.lock().unwrap().is_empty());
 
     // Pin dies → switch fires the interrupt once.
-    alive.report_unavailable_forced("a", ProbeDomain::Tcp, IpVersion::V4);
+    alive.report_unavailable_forced(nid("a"), ProbeDomain::Tcp, IpVersion::V4);
     assert_eq!(m.select_node("fb").unwrap().name, "b");
     assert_eq!(calls.lock().unwrap().as_slice(), &["fb".to_string()]);
 
@@ -804,7 +788,7 @@ fn test_fallback_interrupt_on_switch() {
 
 #[test]
 fn test_urltest_tcp_udp_separate_selections() {
-    let (n1, n2) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (n1, n2) = (nid("a"), nid("b"));
     let nodes = vec![make_node(n1, "a"), make_node(n2, "b")];
     let alive = Arc::new(AliveDialerSet::new());
     let m = GroupManager::with_alive_set(
@@ -814,25 +798,25 @@ fn test_urltest_tcp_udp_separate_selections() {
     );
     // "a" wins on TCP, "b" wins on UDP (DataUdp).
     alive.record_probe_latency(
-        "a",
+        nid("a"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(10),
     );
     alive.record_probe_latency(
-        "b",
+        nid("b"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(100),
     );
     alive.record_probe_latency(
-        "a",
+        nid("a"),
         ProbeDomain::DataUdp,
         IpVersion::V4,
         Duration::from_millis(100),
     );
     alive.record_probe_latency(
-        "b",
+        nid("b"),
         ProbeDomain::DataUdp,
         IpVersion::V4,
         Duration::from_millis(10),
@@ -857,7 +841,7 @@ fn test_urltest_tcp_udp_separate_selections() {
 
 #[test]
 fn test_urltest_udp_falls_back_to_tcp_selection() {
-    let (n1, n2) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (n1, n2) = (nid("a"), nid("b"));
     let nodes = vec![make_node(n1, "a"), make_node(n2, "b")];
     let alive = Arc::new(AliveDialerSet::new());
     let m = GroupManager::with_alive_set(
@@ -867,13 +851,13 @@ fn test_urltest_udp_falls_back_to_tcp_selection() {
     );
     // Only TCP measurements exist.
     alive.record_probe_latency(
-        "a",
+        nid("a"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(10),
     );
     alive.record_probe_latency(
-        "b",
+        nid("b"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(100),
@@ -891,7 +875,7 @@ fn test_urltest_udp_falls_back_to_tcp_selection() {
 
 #[test]
 fn test_urltest_udp_uses_dns_udp_latency_when_no_data_udp() {
-    let (n1, n2) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (n1, n2) = (nid("a"), nid("b"));
     let nodes = vec![make_node(n1, "a"), make_node(n2, "b")];
     let alive = Arc::new(AliveDialerSet::new());
     let m = GroupManager::with_alive_set(
@@ -901,25 +885,25 @@ fn test_urltest_udp_uses_dns_udp_latency_when_no_data_udp() {
     );
     // TCP says "a"; only DNS-UDP measurements exist and they say "b".
     alive.record_probe_latency(
-        "a",
+        nid("a"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(10),
     );
     alive.record_probe_latency(
-        "b",
+        nid("b"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(100),
     );
     alive.record_probe_latency(
-        "a",
+        nid("a"),
         ProbeDomain::DnsUdp,
         IpVersion::V4,
         Duration::from_millis(100),
     );
     alive.record_probe_latency(
-        "b",
+        nid("b"),
         ProbeDomain::DnsUdp,
         IpVersion::V4,
         Duration::from_millis(10),
@@ -936,7 +920,7 @@ fn test_urltest_udp_uses_dns_udp_latency_when_no_data_udp() {
 /// AnyTLS-without-UoT scenario). TCP selection is unaffected.
 #[test]
 fn test_udp_both_dead_excluded_despite_tcp_alive() {
-    let (n1, n2) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (n1, n2) = (nid("a"), nid("b"));
     let nodes = vec![make_node(n1, "a"), make_node(n2, "b")];
     let alive = Arc::new(AliveDialerSet::new());
     let m = GroupManager::with_alive_set(
@@ -946,15 +930,15 @@ fn test_udp_both_dead_excluded_despite_tcp_alive() {
     );
 
     // "a" UDP-dead on both domains, TCP still alive → "b" wins UDP.
-    alive.report_unavailable_forced("a", ProbeDomain::DataUdp, IpVersion::V4);
-    alive.report_unavailable_forced("a", ProbeDomain::DnsUdp, IpVersion::V4);
+    alive.report_unavailable_forced(nid("a"), ProbeDomain::DataUdp, IpVersion::V4);
+    alive.report_unavailable_forced(nid("a"), ProbeDomain::DnsUdp, IpVersion::V4);
     let udp = m.select_node_for_domain("g", ProbeDomain::DataUdp, IpVersion::V4);
     assert_eq!(udp.unwrap().name, "b");
 
     // With "b" UDP-dead too, NOTHING is selectable for UDP — no TCP
     // fallback for explicitly UDP-dead nodes.
-    alive.report_unavailable_forced("b", ProbeDomain::DataUdp, IpVersion::V4);
-    alive.report_unavailable_forced("b", ProbeDomain::DnsUdp, IpVersion::V4);
+    alive.report_unavailable_forced(nid("b"), ProbeDomain::DataUdp, IpVersion::V4);
+    alive.report_unavailable_forced(nid("b"), ProbeDomain::DnsUdp, IpVersion::V4);
     assert!(
         m.select_node_for_domain("g", ProbeDomain::DataUdp, IpVersion::V4)
             .is_none()
@@ -972,7 +956,7 @@ fn test_udp_both_dead_excluded_despite_tcp_alive() {
 /// stays selectable for UDP.
 #[test]
 fn test_udp_single_domain_alive_selectable() {
-    let n1 = uuid::Uuid::new_v4();
+    let n1 = nid("a");
     let nodes = vec![make_node(n1, "a")];
     let alive = Arc::new(AliveDialerSet::new());
     let m = GroupManager::with_alive_set(
@@ -981,8 +965,8 @@ fn test_udp_single_domain_alive_selectable() {
         Some(alive.clone()),
     );
 
-    alive.report_unavailable_forced("a", ProbeDomain::DataUdp, IpVersion::V4);
-    assert!(alive.has_udp_state("a"));
+    alive.report_unavailable_forced(nid("a"), ProbeDomain::DataUdp, IpVersion::V4);
+    assert!(alive.has_udp_state(nid("a")));
     let udp = m.select_node_for_domain("g", ProbeDomain::DataUdp, IpVersion::V4);
     assert_eq!(udp.unwrap().name, "a");
 }
@@ -991,7 +975,7 @@ fn test_udp_single_domain_alive_selectable() {
 /// fallback): alive TCP → selectable; dead TCP → not.
 #[test]
 fn test_udp_unprobed_node_inherits_tcp_liveness() {
-    let (n1, n2) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (n1, n2) = (nid("a"), nid("b"));
     let nodes = vec![make_node(n1, "a"), make_node(n2, "b")];
     let alive = Arc::new(AliveDialerSet::new());
     let m = GroupManager::with_alive_set(
@@ -1001,7 +985,7 @@ fn test_udp_unprobed_node_inherits_tcp_liveness() {
     );
 
     // No UDP state anywhere: both nodes selectable for UDP.
-    assert!(!alive.has_udp_state("a"));
+    assert!(!alive.has_udp_state(nid("a")));
     assert_eq!(
         m.select_node_for_domain("g", ProbeDomain::DataUdp, IpVersion::V4)
             .unwrap()
@@ -1011,8 +995,8 @@ fn test_udp_unprobed_node_inherits_tcp_liveness() {
 
     // A TCP-dead unprobed node is excluded: its UDP health is unknown
     // and there is no healthy TCP to inherit.
-    alive.report_unavailable_forced("a", ProbeDomain::Tcp, IpVersion::V4);
-    assert!(!alive.has_udp_state("a"));
+    alive.report_unavailable_forced(nid("a"), ProbeDomain::Tcp, IpVersion::V4);
+    assert!(!alive.has_udp_state(nid("a")));
     assert_eq!(
         m.select_node_for_domain("g", ProbeDomain::DataUdp, IpVersion::V4)
             .unwrap()
@@ -1021,7 +1005,7 @@ fn test_udp_unprobed_node_inherits_tcp_liveness() {
     );
 
     // With every unprobed node TCP-dead, UDP selection is empty.
-    alive.report_unavailable_forced("b", ProbeDomain::Tcp, IpVersion::V4);
+    alive.report_unavailable_forced(nid("b"), ProbeDomain::Tcp, IpVersion::V4);
     assert!(
         m.select_node_for_domain("g", ProbeDomain::DataUdp, IpVersion::V4)
             .is_none()
@@ -1033,7 +1017,7 @@ fn test_udp_unprobed_node_inherits_tcp_liveness() {
 /// the UDP selection skip it (TCP selection still honours latency).
 #[test]
 fn test_urltest_udp_selection_skips_udp_dead_node() {
-    let (n1, n2) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (n1, n2) = (nid("a"), nid("b"));
     let nodes = vec![make_node(n1, "a"), make_node(n2, "b")];
     let alive = Arc::new(AliveDialerSet::new());
     let m = GroupManager::with_alive_set(
@@ -1044,21 +1028,21 @@ fn test_urltest_udp_selection_skips_udp_dead_node() {
     // "a" is TCP-fastest but its UDP path is dead; "b" is slower but
     // fully healthy.
     alive.record_probe_latency(
-        "a",
+        nid("a"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(10),
     );
     alive.record_probe_latency(
-        "b",
+        nid("b"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(100),
     );
-    alive.report_unavailable_forced("a", ProbeDomain::DataUdp, IpVersion::V4);
-    alive.report_unavailable_forced("a", ProbeDomain::DnsUdp, IpVersion::V4);
+    alive.report_unavailable_forced(nid("a"), ProbeDomain::DataUdp, IpVersion::V4);
+    alive.report_unavailable_forced(nid("a"), ProbeDomain::DnsUdp, IpVersion::V4);
     alive.record_probe_latency(
-        "b",
+        nid("b"),
         ProbeDomain::DataUdp,
         IpVersion::V4,
         Duration::from_millis(50),
@@ -1073,7 +1057,7 @@ fn test_urltest_udp_selection_skips_udp_dead_node() {
 /// cycle-closing edge (with a warning) and both groups stay usable.
 #[test]
 fn test_cycle_detection_breaks_cycle_edge() {
-    let n = uuid::Uuid::new_v4();
+    let n = nid("a");
     let nodes = vec![make_node(n, "a")];
     let mut ga = make_group("A", GroupPolicy::Selector, vec![n]);
     ga.groups = vec!["B".into()];
@@ -1106,11 +1090,7 @@ fn test_cycle_detection_breaks_cycle_edge() {
 /// rebuild via `migrate_selector_choices_from` (the reload path).
 #[test]
 fn test_nested_selector_three_levels() {
-    let (l1, l2, l3) = (
-        uuid::Uuid::new_v4(),
-        uuid::Uuid::new_v4(),
-        uuid::Uuid::new_v4(),
-    );
+    let (l1, l2, l3) = (nid("l1"), nid("l2"), nid("l3"));
     let nodes = vec![
         make_node(l1, "l1"),
         make_node(l2, "l2"),
@@ -1167,11 +1147,7 @@ fn test_nested_selector_three_levels() {
 /// parent's `now`/chain report the sub-group's tag.
 #[test]
 fn test_urltest_parent_with_urltest_subgroup() {
-    let (l1, l2, d) = (
-        uuid::Uuid::new_v4(),
-        uuid::Uuid::new_v4(),
-        uuid::Uuid::new_v4(),
-    );
+    let (l1, l2, d) = (nid("l1"), nid("l2"), nid("d"));
     let nodes = vec![make_node(l1, "l1"), make_node(l2, "l2"), make_node(d, "d")];
     let sub = make_group("sub", GroupPolicy::URLTest, vec![l1, l2]);
     let mut parent = make_subgroup("parent", GroupPolicy::URLTest, &["sub"]);
@@ -1180,19 +1156,19 @@ fn test_urltest_parent_with_urltest_subgroup() {
     let m = GroupManager::with_alive_set(&[sub, parent], &nodes, Some(alive.clone()));
 
     alive.record_probe_latency(
-        "l1",
+        nid("l1"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(10),
     );
     alive.record_probe_latency(
-        "l2",
+        nid("l2"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(20),
     );
     alive.record_probe_latency(
-        "d",
+        nid("d"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(5),
@@ -1206,7 +1182,7 @@ fn test_urltest_parent_with_urltest_subgroup() {
     assert_eq!(m.selection_chain("parent"), vec!["parent", "d"]);
 
     // Kill the direct member → the sub-group's representative leaf wins.
-    alive.report_unavailable_forced("d", ProbeDomain::Tcp, IpVersion::V4);
+    alive.report_unavailable_forced(nid("d"), ProbeDomain::Tcp, IpVersion::V4);
     assert_eq!(m.select_node("parent").unwrap().name, "l1");
     // `now` displays the sub-group tag, the chain resolves to the leaf.
     assert_eq!(m.get_urltest_selection("parent"), Some("sub".into()));
@@ -1390,7 +1366,7 @@ fn test_user_style_nested_layout() {
 /// beats its current latency by ≥ tolerance.
 #[test]
 fn test_urltest_switches_when_incumbent_degrades() {
-    let (n1, n2) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (n1, n2) = (nid("a"), nid("b"));
     let nodes = vec![make_node(n1, "a"), make_node(n2, "b")];
     let alive = Arc::new(AliveDialerSet::new());
     let m = GroupManager::with_alive_set(
@@ -1400,13 +1376,13 @@ fn test_urltest_switches_when_incumbent_degrades() {
     );
     // 'a' wins the first selection at 10ms (moving average starts at 10).
     alive.record_probe_latency(
-        "a",
+        nid("a"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(10),
     );
     alive.record_probe_latency(
-        "b",
+        nid("b"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(100),
@@ -1417,7 +1393,7 @@ fn test_urltest_switches_when_incumbent_degrades() {
     // 'b' (100ms) now beats a's *current* latency by > tolerance (50ms) and
     // must take over — the stale 10ms baseline would have kept 'a' forever.
     alive.record_probe_latency(
-        "a",
+        nid("a"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(400),
@@ -1429,7 +1405,7 @@ fn test_urltest_switches_when_incumbent_degrades() {
 /// stable (no flapping).
 #[test]
 fn test_urltest_keeps_incumbent_within_tolerance_of_current_latency() {
-    let (n1, n2) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (n1, n2) = (nid("a"), nid("b"));
     let nodes = vec![make_node(n1, "a"), make_node(n2, "b")];
     let alive = Arc::new(AliveDialerSet::new());
     let m = GroupManager::with_alive_set(
@@ -1438,13 +1414,13 @@ fn test_urltest_keeps_incumbent_within_tolerance_of_current_latency() {
         Some(alive.clone()),
     );
     alive.record_probe_latency(
-        "a",
+        nid("a"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(10),
     );
     alive.record_probe_latency(
-        "b",
+        nid("b"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(80),
@@ -1454,7 +1430,7 @@ fn test_urltest_keeps_incumbent_within_tolerance_of_current_latency() {
     // 'a' drifts to (10+190)/2 = 100ms; 'b' at 80ms is faster but within
     // the 50ms tolerance of a's current latency → keep 'a'.
     alive.record_probe_latency(
-        "a",
+        nid("a"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(190),
@@ -1470,11 +1446,7 @@ fn test_urltest_keeps_incumbent_within_tolerance_of_current_latency() {
 /// succeed. The incumbent must survive all of it.
 #[test]
 fn urltest_flaky_node_stays_demoted_after_history_clear() {
-    let (na, nb, nc) = (
-        uuid::Uuid::new_v4(),
-        uuid::Uuid::new_v4(),
-        uuid::Uuid::new_v4(),
-    );
+    let (na, nb, nc) = (nid("a"), nid("b"), nid("c"));
     let nodes = vec![make_node(na, "a"), make_node(nb, "b"), make_node(nc, "c")];
     let alive = Arc::new(AliveDialerSet::new());
     let m = GroupManager::with_alive_set(
@@ -1482,7 +1454,7 @@ fn urltest_flaky_node_stays_demoted_after_history_clear() {
         &nodes,
         Some(alive.clone()),
     );
-    let probe_ok = |n: &str, ms: u64| {
+    let probe_ok = |n: uuid::Uuid, ms: u64| {
         alive.record_probe_latency(
             n,
             ProbeDomain::Tcp,
@@ -1490,28 +1462,28 @@ fn urltest_flaky_node_stays_demoted_after_history_clear() {
             Duration::from_millis(ms),
         );
     };
-    probe_ok("a", 7);
-    probe_ok("b", 21);
-    probe_ok("c", 42);
+    probe_ok(nid("a"), 7);
+    probe_ok(nid("b"), 21);
+    probe_ok(nid("c"), 42);
     assert_eq!(m.select_node("g").unwrap().name, "a");
 
     // Probe failure on 'a' → dead + synthetic 10s sample → group moves to 'b'.
-    alive.mark_dead("a");
+    alive.mark_dead(nid("a"));
     assert_eq!(m.select_node("g").unwrap().name, "b");
 
     // 'a' recovers after two good probes; its window still holds the
     // synthetic sample, so the average stays unattractive.
-    probe_ok("a", 7);
-    probe_ok("a", 7);
+    probe_ok(nid("a"), 7);
+    probe_ok(nid("a"), 7);
     assert_eq!(m.select_node("g").unwrap().name, "b");
 
     // Now the flaky loop: a user dial through 'a' fails → history cleared
     // with a synthetic penalty sample, an emergency re-probe succeeds (the
     // node works 60% of the time).
     for round in 0..6 {
-        alive.report_unavailable_traffic("a", ProbeDomain::Tcp, IpVersion::V4);
-        alive.record_dial_failure("a", ProbeDomain::Tcp, IpVersion::V4);
-        probe_ok("a", 7);
+        alive.report_unavailable_traffic(nid("a"), ProbeDomain::Tcp, IpVersion::V4);
+        alive.record_dial_failure(nid("a"), ProbeDomain::Tcp, IpVersion::V4);
+        probe_ok(nid("a"), 7);
         assert_eq!(
             m.select_node("g").unwrap().name,
             "b",
@@ -1528,15 +1500,15 @@ fn urltest_flaky_node_stays_demoted_after_history_clear() {
         &nodes,
         Some(alive2.clone()),
     );
-    probe_ok2(&alive2, "a", 7);
-    probe_ok2(&alive2, "b", 21);
+    probe_ok2(&alive2, nid("a"), 7);
+    probe_ok2(&alive2, nid("b"), 21);
     assert_eq!(m2.select_node("g2").unwrap().name, "a");
-    alive2.record_dial_failure("a", ProbeDomain::Tcp, IpVersion::V4);
-    probe_ok2(&alive2, "a", 7);
+    alive2.record_dial_failure(nid("a"), ProbeDomain::Tcp, IpVersion::V4);
+    probe_ok2(&alive2, nid("a"), 7);
     assert_eq!(m2.select_node("g2").unwrap().name, "b");
 }
 
-fn probe_ok2(alive: &AliveDialerSet, n: &str, ms: u64) {
+fn probe_ok2(alive: &AliveDialerSet, n: uuid::Uuid, ms: u64) {
     alive.record_probe_latency(
         n,
         ProbeDomain::Tcp,
@@ -1551,7 +1523,7 @@ fn probe_ok2(alive: &AliveDialerSet, n: &str, ms: u64) {
 /// cycle.
 #[test]
 fn test_urltest_reselects_after_latency_cleared() {
-    let (n1, n2) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (n1, n2) = (nid("a"), nid("b"));
     let nodes = vec![make_node(n1, "a"), make_node(n2, "b")];
     let alive = Arc::new(AliveDialerSet::new());
     let m = GroupManager::with_alive_set(
@@ -1560,13 +1532,13 @@ fn test_urltest_reselects_after_latency_cleared() {
         Some(alive.clone()),
     );
     alive.record_probe_latency(
-        "a",
+        nid("a"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(10),
     );
     alive.record_probe_latency(
-        "b",
+        nid("b"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(100),
@@ -1574,7 +1546,7 @@ fn test_urltest_reselects_after_latency_cleared() {
     assert_eq!(m.select_node("g").unwrap().name, "a");
 
     // Dial to 'a' fails → history cleared → next selection is 'b'.
-    alive.clear_latency("a");
+    alive.clear_latency(nid("a"));
     assert_eq!(m.select_node("g").unwrap().name, "b");
 }
 
@@ -1584,7 +1556,7 @@ fn test_urltest_reselects_after_latency_cleared() {
 /// is excluded; ranking uses per-URL latency.
 #[test]
 fn test_urltest_group_custom_check_url_selection() {
-    let (n1, n2) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (n1, n2) = (nid("a"), nid("b"));
     let nodes = vec![make_node(n1, "a"), make_node(n2, "b")];
     let url = "http://chatgpt.example/trace";
     let mut group = make_group("g", GroupPolicy::URLTest, vec![n1, n2]);
@@ -1595,13 +1567,13 @@ fn test_urltest_group_custom_check_url_selection() {
 
     // Global: a is faster. Per-URL: b is faster → b wins.
     alive.record_probe_latency(
-        "a",
+        nid("a"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(10),
     );
     alive.record_probe_latency(
-        "b",
+        nid("b"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(500),
@@ -1612,14 +1584,14 @@ fn test_urltest_group_custom_check_url_selection() {
 
     // b dies for the group's URL (but stays globally alive) → a wins.
     alive.record_url_probe_failure("b", url);
-    assert!(alive.is_alive_for("b", ProbeDomain::Tcp, IpVersion::V4));
+    assert!(alive.is_alive_for(nid("b"), ProbeDomain::Tcp, IpVersion::V4));
     assert_eq!(m.select_node("g").unwrap().name, "a");
 }
 
 /// Groups without check_url keep the global behaviour (regression).
 #[test]
 fn test_urltest_group_without_check_url_uses_global_state() {
-    let (n1, n2) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (n1, n2) = (nid("a"), nid("b"));
     let nodes = vec![make_node(n1, "a"), make_node(n2, "b")];
     let alive = Arc::new(AliveDialerSet::new());
     let m = GroupManager::with_alive_set(
@@ -1628,13 +1600,13 @@ fn test_urltest_group_without_check_url_uses_global_state() {
         Some(alive.clone()),
     );
     alive.record_probe_latency(
-        "a",
+        nid("a"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(10),
     );
     alive.record_probe_latency(
-        "b",
+        nid("b"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(100),
@@ -1651,7 +1623,7 @@ fn test_urltest_group_without_check_url_uses_global_state() {
 /// currently picks.
 #[test]
 fn test_nested_group_check_url_ranks_subgroups_by_tag() {
-    let (n1, n2) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (n1, n2) = (nid("hk-1"), nid("us-1"));
     let nodes = vec![make_node(n1, "hk-1"), make_node(n2, "us-1")];
     let url = "http://chatgpt.example/trace";
     let hk = make_subgroup("hk", GroupPolicy::URLTest, &[]);
@@ -1677,18 +1649,18 @@ fn test_nested_group_check_url_ranks_subgroups_by_tag() {
     // hk dies FOR THE PARENT'S URL (its own/global state untouched) →
     // the parent switches to us even though hk-1 is globally healthy.
     alive.record_url_probe_failure("hk", url);
-    assert!(alive.is_alive_for("hk-1", ProbeDomain::Tcp, IpVersion::V4));
+    assert!(alive.is_alive_for(nid("hk-1"), ProbeDomain::Tcp, IpVersion::V4));
     let sel = m.select_node("ai").unwrap();
     assert_eq!(sel.name, "us-1");
 }
 
 #[test]
 fn peek_selection_plan_keeps_cold_urltest_idle_and_cache_empty() {
-    let node_id = uuid::Uuid::new_v4();
+    let node_id = nid("cold");
     let nodes = vec![make_node(node_id, "cold")];
     let group = make_group("cold", GroupPolicy::URLTest, vec![node_id]);
     let alive = Arc::new(AliveDialerSet::new());
-    alive.register_urltest_group("cold", &["cold".to_owned()], Some(Duration::from_secs(60)));
+    alive.register_urltest_group("cold", &[nid("cold")], Some(Duration::from_secs(60)));
     let manager = GroupManager::with_alive_set(&[group], &nodes, Some(Arc::clone(&alive)));
 
     assert!(alive.is_urltest_group_idle("cold"));
@@ -1702,7 +1674,7 @@ fn peek_selection_plan_keeps_cold_urltest_idle_and_cache_empty() {
 
 #[test]
 fn peek_selection_plan_load_balance_does_not_advance_cursor() {
-    let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (a, b) = (nid("a"), nid("b"));
     let nodes = vec![make_node(a, "a"), make_node(b, "b")];
     let manager = GroupManager::new(
         &[make_group("lb", GroupPolicy::LoadBalance, vec![a, b])],
@@ -1732,7 +1704,7 @@ fn peek_selection_plan_load_balance_does_not_advance_cursor() {
 
 #[test]
 fn peek_selection_plan_does_not_update_urltest_or_fallback_after_death() {
-    let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (a, b) = (nid("a"), nid("b"));
     let nodes = vec![make_node(a, "a"), make_node(b, "b")];
     let mut urltest = make_group("url", GroupPolicy::URLTest, vec![a, b]);
     let mut fallback = make_group("fallback", GroupPolicy::Fallback, vec![a, b]);
@@ -1742,13 +1714,13 @@ fn peek_selection_plan_does_not_update_urltest_or_fallback_after_death() {
     let manager =
         GroupManager::with_alive_set(&[urltest, fallback], &nodes, Some(Arc::clone(&alive)));
     alive.record_probe_latency(
-        "a",
+        nid("a"),
         ProbeDomain::DataUdp,
         IpVersion::V4,
         Duration::from_millis(10),
     );
     alive.record_probe_latency(
-        "b",
+        nid("b"),
         ProbeDomain::DataUdp,
         IpVersion::V4,
         Duration::from_millis(100),
@@ -1773,7 +1745,7 @@ fn peek_selection_plan_does_not_update_urltest_or_fallback_after_death() {
         callback_interrupts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     })));
     for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
-        alive.report_unavailable_forced("a", domain, IpVersion::V4);
+        alive.report_unavailable_forced(nid("a"), domain, IpVersion::V4);
     }
 
     for group in ["url", "fallback"] {
@@ -1816,27 +1788,23 @@ fn peek_selection_plan_does_not_update_urltest_or_fallback_after_death() {
 
 #[test]
 fn peek_selection_plan_keeps_nested_child_idle_and_only_reads_tcp_mirror() {
-    let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (a, b) = (nid("a"), nid("b"));
     let nodes = vec![make_node(a, "a"), make_node(b, "b")];
     let child = make_group("child", GroupPolicy::URLTest, vec![a, b]);
     let parent = make_subgroup("parent", GroupPolicy::Selector, &["child"]);
     let alive = Arc::new(AliveDialerSet::new());
     for group in ["child", "parent"] {
-        alive.register_urltest_group(
-            group,
-            &["a".to_owned(), "b".to_owned()],
-            Some(Duration::from_secs(60)),
-        );
+        alive.register_urltest_group(group, &[nid("a"), nid("b")], Some(Duration::from_secs(60)));
     }
     let manager = GroupManager::with_alive_set(&[child, parent], &nodes, Some(Arc::clone(&alive)));
     alive.record_probe_latency(
-        "a",
+        nid("a"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(10),
     );
     alive.record_probe_latency(
-        "b",
+        nid("b"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(100),
@@ -1870,11 +1838,7 @@ fn peek_selection_plan_keeps_nested_child_idle_and_only_reads_tcp_mirror() {
 /// filtered, capped, and never mutating selection state.
 #[test]
 fn ranked_udp_leaves_orders_caps_and_filters() {
-    let (na, nb, nc) = (
-        uuid::Uuid::new_v4(),
-        uuid::Uuid::new_v4(),
-        uuid::Uuid::new_v4(),
-    );
+    let (na, nb, nc) = (nid("a"), nid("b"), nid("c"));
     let nodes = vec![make_node(na, "a"), make_node(nb, "b"), make_node(nc, "c")];
     let alive = Arc::new(AliveDialerSet::new());
     let manager = GroupManager::with_alive_set(
@@ -1882,9 +1846,9 @@ fn ranked_udp_leaves_orders_caps_and_filters() {
         &nodes,
         Some(alive.clone()),
     );
-    for (name, ms) in [("b", 10u64), ("a", 30), ("c", 20)] {
+    for (node, ms) in [(nb, 10u64), (na, 30), (nc, 20)] {
         alive.record_probe_latency(
-            name,
+            node,
             ProbeDomain::DataUdp,
             IpVersion::V4,
             Duration::from_millis(ms),
@@ -1904,7 +1868,7 @@ fn ranked_udp_leaves_orders_caps_and_filters() {
 
     // Both UDP domains dead on the leader -> it drops out of the ranking.
     for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
-        alive.report_unavailable_forced("b", domain, IpVersion::V4);
+        alive.report_unavailable_forced(nid("b"), domain, IpVersion::V4);
     }
     assert_eq!(names(2), vec!["c", "a"]);
 

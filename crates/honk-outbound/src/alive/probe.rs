@@ -7,9 +7,9 @@ impl AliveDialerSet {
     /// the check URL's hostname to IPs and sends an HTTP request through the
     /// proxy node, validating the status code.
     /// Falls back to raw TCP connect when no prober is set.
-    pub async fn probe_node(&self, node_id: &str, timeout: Duration) -> bool {
+    pub async fn probe_node(&self, node_id: Uuid, timeout: Duration) -> bool {
         // block has no liveness to measure.
-        if node_id == "block" {
+        if node_id == honk_config::config::BLOCK_NODE_ID {
             return true;
         }
         // direct is measured against the bootstrap resolver (default
@@ -18,34 +18,44 @@ impl AliveDialerSet {
         // connection (e.g. google-analytics from CN), so probing it flapped
         // direct dead every cycle only for real traffic to revive it
         // seconds later.
-        if node_id == "direct" {
+        if node_id == honk_config::config::DIRECT_NODE_ID {
             let target = self.direct_check_addr.read().clone();
-            return self.probe_node_tcp(node_id, &target, timeout).await;
+            return self
+                .probe_node_tcp(node_id, "direct", &target, timeout)
+                .await;
         }
-        let addr = self.registered.read().get(node_id).cloned();
-        let Some(addr) = addr else { return false };
+        let registered = self.registered.read().get(&node_id).cloned();
+        let Some(registered) = registered else {
+            return false;
+        };
 
         // Clone the Arc out of the lock before awaiting (parking_lot guard is !Send).
         let prober_opt = self.http_prober.read().clone();
         if let Some(ref prober) = prober_opt {
-            return self.probe_node_http(node_id, &addr, timeout, prober).await;
+            return self
+                .probe_node_http(node_id, &registered, timeout, prober)
+                .await;
         }
 
-        self.probe_node_tcp(node_id, &addr, timeout).await
+        self.probe_node_tcp(node_id, &registered.name, &registered.address, timeout)
+            .await
     }
 
     /// HTTP-based health check: resolves the check URL hostname, dials through
     /// the proxy node, and validates the HTTP response status code.
     async fn probe_node_http(
         &self,
-        node_id: &str,
-        node_addr: &str,
+        node_id: Uuid,
+        registered: &RegisteredNode,
         timeout: Duration,
         prober: &HttpProberRef,
     ) -> bool {
+        let node_name = registered.name.as_str();
         let check_url = self.check_url.read().clone();
         if check_url.is_empty() {
-            return self.probe_node_tcp(node_id, node_addr, timeout).await;
+            return self
+                .probe_node_tcp(node_id, node_name, &registered.address, timeout)
+                .await;
         }
 
         let hostname = match Self::parse_url_host(&check_url) {
@@ -55,7 +65,9 @@ impl AliveDialerSet {
                     "Invalid check URL '{}', falling back to TCP probe",
                     check_url
                 );
-                return self.probe_node_tcp(node_id, node_addr, timeout).await;
+                return self
+                    .probe_node_tcp(node_id, node_name, &registered.address, timeout)
+                    .await;
             }
         };
 
@@ -81,7 +93,7 @@ impl AliveDialerSet {
             tracing::warn!(
                 "Health check found no addresses for '{}' (node '{}')",
                 hostname,
-                node_id
+                node_name
             );
             return false;
         }
@@ -112,13 +124,13 @@ impl AliveDialerSet {
 
             let mut family_ok = false;
             for a in family_addrs {
-                match tokio::time::timeout(timeout, prober.probe_http(node_id, *a, &check_url))
+                match tokio::time::timeout(timeout, prober.probe_http(node_name, *a, &check_url))
                     .await
                 {
                     Ok(Ok(elapsed)) => {
                         tracing::debug!(
                             "HTTP health check succeeded for node '{}' via {} ({}ms)",
-                            node_id,
+                            node_name,
                             a,
                             elapsed.as_millis()
                         );
@@ -130,7 +142,7 @@ impl AliveDialerSet {
                     Ok(Err(err_msg)) => {
                         tracing::debug!(
                             "HTTP health check failed for node '{}' via {}: {}",
-                            node_id,
+                            node_name,
                             a,
                             err_msg
                         );
@@ -138,7 +150,7 @@ impl AliveDialerSet {
                     Err(_) => {
                         tracing::debug!(
                             "HTTP health check timed out for node '{}' via {} after {:?}",
-                            node_id,
+                            node_name,
                             a,
                             timeout
                         );
@@ -151,12 +163,12 @@ impl AliveDialerSet {
         }
 
         if any_ok {
-            tracing::info!("Node '{}' is alive after HTTP health check", node_id);
+            tracing::info!("Node '{}' is alive after HTTP health check", node_name);
         } else {
             tracing::warn!(
                 "Node '{}' failed HTTP health check against all addresses ({})",
-                node_id,
-                node_addr
+                node_name,
+                registered.address
             );
         }
 
@@ -257,7 +269,13 @@ impl AliveDialerSet {
     }
 
     /// Raw TCP connect health check (fallback when no HTTP prober configured).
-    async fn probe_node_tcp(&self, node_id: &str, node_addr: &str, timeout: Duration) -> bool {
+    async fn probe_node_tcp(
+        &self,
+        node_id: Uuid,
+        node_name: &str,
+        node_addr: &str,
+        timeout: Duration,
+    ) -> bool {
         let addr = node_addr.to_string();
         let (host, port) = match addr.rsplit_once(':') {
             Some((h, p)) => match p.parse::<u16>() {
@@ -273,7 +291,7 @@ impl AliveDialerSet {
             } else {
                 tracing::warn!(
                     "Health check DNS resolution failed for node '{}' ({}): system lookup failed",
-                    node_id,
+                    node_name,
                     addr
                 );
                 self.mark_dead_for(node_id, ProbeDomain::Tcp, IpVersion::V4);
@@ -285,7 +303,7 @@ impl AliveDialerSet {
         if addrs.is_empty() {
             tracing::warn!(
                 "Health check found no addresses for node '{}' ({})",
-                node_id,
+                node_name,
                 addr
             );
             self.mark_dead_for(node_id, ProbeDomain::Tcp, IpVersion::V4);
@@ -332,7 +350,7 @@ impl AliveDialerSet {
                 Ok(Ok(_stream)) => {
                     tracing::debug!(
                         "Health check probe succeeded for node '{}' via {} ({}ms)",
-                        node_id,
+                        node_name,
                         a,
                         elapsed.as_millis()
                     );
@@ -342,7 +360,7 @@ impl AliveDialerSet {
                 Ok(Err(e)) => {
                     tracing::debug!(
                         "Health check probe failed for node '{}' via {}: {}",
-                        node_id,
+                        node_name,
                         a,
                         e
                     );
@@ -351,7 +369,7 @@ impl AliveDialerSet {
                 Err(_) => {
                     tracing::debug!(
                         "Health check probe timed out for node '{}' via {} after {:?}",
-                        node_id,
+                        node_name,
                         a,
                         timeout
                     );
@@ -368,11 +386,11 @@ impl AliveDialerSet {
         }
 
         if any_ok {
-            tracing::info!("Node '{}' is alive after TCP health check", node_id);
+            tracing::info!("Node '{}' is alive after TCP health check", node_name);
         } else {
             tracing::warn!(
                 "Node '{}' failed TCP health check against all addresses ({})",
-                node_id,
+                node_name,
                 addr
             );
         }
@@ -392,11 +410,14 @@ impl AliveDialerSet {
     /// `false`, and no state is recorded — nodes keep the legacy
     /// TCP-fallback selection semantics (see
     /// [`AliveDialerSet::has_udp_state`]).
-    pub async fn probe_node_udp(&self, node_id: &str, timeout: Duration) -> bool {
+    pub async fn probe_node_udp(&self, node_id: Uuid, timeout: Duration) -> bool {
         // Same exemption as probe_node: direct/block UDP liveness is
         // traffic-driven, and the UDP check target (e.g. 8.8.8.8) is not a
         // reliable direct-egress signal either.
-        if matches!(node_id, "direct" | "block") {
+        if matches!(
+            node_id,
+            honk_config::config::DIRECT_NODE_ID | honk_config::config::BLOCK_NODE_ID
+        ) {
             return true;
         }
         // Clone the Arc out of the lock before awaiting (parking_lot guard
@@ -406,13 +427,14 @@ impl AliveDialerSet {
             return false;
         };
 
+        let node_name = self.node_name(node_id);
         const UDP_DOMAINS: [ProbeDomain; 2] = [ProbeDomain::DataUdp, ProbeDomain::DnsUdp];
         const IPVERS: [IpVersion; 2] = [IpVersion::V4, IpVersion::V6];
-        match tokio::time::timeout(timeout, prober.probe_udp(node_id)).await {
+        match tokio::time::timeout(timeout, prober.probe_udp(&node_name)).await {
             Ok(Ok(elapsed)) => {
                 tracing::debug!(
                     "UDP health check succeeded for node '{}' ({}ms)",
-                    node_id,
+                    node_name,
                     elapsed.as_millis()
                 );
                 for domain in UDP_DOMAINS {
@@ -425,7 +447,7 @@ impl AliveDialerSet {
             Ok(Err(err_msg)) => {
                 tracing::debug!(
                     "UDP health check failed for node '{}': {}",
-                    node_id,
+                    node_name,
                     err_msg
                 );
                 for domain in UDP_DOMAINS {
@@ -438,7 +460,7 @@ impl AliveDialerSet {
             Err(_) => {
                 tracing::debug!(
                     "UDP health check timed out for node '{}' after {:?}",
-                    node_id,
+                    node_name,
                     timeout
                 );
                 for domain in UDP_DOMAINS {
@@ -470,7 +492,7 @@ impl AliveDialerSet {
         // Matches Go's TcpCheckOptionRaw.Reset().
         self.refresh_check_ips().await;
 
-        let nodes: Vec<String> = self.registered.read().keys().cloned().collect();
+        let nodes: Vec<Uuid> = self.registered.read().keys().copied().collect();
         if nodes.is_empty() {
             return;
         }
@@ -482,30 +504,29 @@ impl AliveDialerSet {
         for id in nodes {
             // URLTest idle suspension: skip nodes whose groups are all idle
             // (lazy start: never-active groups start suspended).
-            if self.is_probe_suspended(&id) {
+            if self.is_probe_suspended(id) {
                 tracing::trace!("Skipping health check for '{}' (URLTest groups idle)", id);
                 continue;
             }
             let idx = alive_index(ProbeDomain::Tcp, IpVersion::V4);
-            let state = self.read_state(&id, idx);
+            let state = self.read_state(id, idx);
             // Stopped nodes are probed too — on their slow max_cooldown
             // cadence — so recovery stays reachable (see `should_probe`).
             if Instant::now() < state.cooldown_until {
                 continue;
             }
             let this = self.clone();
-            let id = id.clone();
             let permit = semaphore.clone();
             join_set.spawn(async move {
                 let _p = permit.acquire().await;
-                this.probe_node(&id, timeout).await;
+                this.probe_node(id, timeout).await;
                 // UDP data-path probe (Go: UdpCheck) after the TCP probe,
                 // gated on the UDP domain's own backoff so a chronically
                 // broken UDP path backs off exponentially (and eventually
                 // stops) instead of re-probing every cycle. No-op without
                 // an installed UdpProber.
-                if this.should_probe(&id, ProbeDomain::DataUdp, IpVersion::V4) {
-                    this.probe_node_udp(&id, timeout).await;
+                if this.should_probe(id, ProbeDomain::DataUdp, IpVersion::V4) {
+                    this.probe_node_udp(id, timeout).await;
                 }
             });
         }
@@ -550,12 +571,12 @@ impl AliveDialerSet {
     /// exists.
     pub fn get_probe_history(
         &self,
-        node_id: &str,
+        node_id: Uuid,
         domain: ProbeDomain,
         ipver: IpVersion,
     ) -> Vec<ProbeRecord> {
         let idx = alive_index(domain, ipver);
-        let key = (node_id.to_string(), idx);
+        let key = (node_id, idx);
         self.probe_history
             .read()
             .get(&key)
@@ -623,8 +644,8 @@ impl AliveDialerSet {
                             }
                             let this = Arc::clone(&this);
                             emergency_workers.spawn(async move {
-                                this.probe_node(&id, timeout).await;
-                                this.finish_trigger_probe(&id);
+                                this.probe_node(id, timeout).await;
+                                this.finish_trigger_probe(id);
                             });
                         }
                     }

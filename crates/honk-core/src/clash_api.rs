@@ -387,9 +387,11 @@ fn build_group_proxy_info(
 
     let mut history: Vec<serde_json::Value> = Vec::new();
     for name in &node_names {
-        if let Some((latency, at)) =
-            alive_set.get_last_real_sample(name, ProbeDomain::Tcp, IpVersion::V4)
-        {
+        // Member tags may name sub-groups; only real nodes carry samples.
+        let sample = group_manager
+            .node_by_name(name)
+            .and_then(|n| alive_set.get_last_real_sample(n.id, ProbeDomain::Tcp, IpVersion::V4));
+        if let Some((latency, at)) = sample {
             history.push(delay_history_entry(latency.as_millis() as u64, at));
         }
     }
@@ -415,7 +417,7 @@ fn build_node_proxy_info(node: &Node, alive_set: &AliveDialerSet) -> serde_json:
         "history": [],
     });
     if let Some((latency, at)) =
-        alive_set.get_last_real_sample(&node.name, ProbeDomain::Tcp, IpVersion::V4)
+        alive_set.get_last_real_sample(node.id, ProbeDomain::Tcp, IpVersion::V4)
     {
         let ms = latency.as_millis() as u64;
         info["history"] = serde_json::json!([delay_history_entry(ms, at)]);
@@ -619,12 +621,8 @@ async fn get_proxy_delay(
         };
         return match urltest_node(&node, handler, &query.url, query.timeout()).await {
             Ok(latency) => {
-                s.alive_set.record_probe_latency(
-                    &node.name,
-                    ProbeDomain::Tcp,
-                    IpVersion::V4,
-                    latency,
-                );
+                s.alive_set
+                    .record_probe_latency(node.id, ProbeDomain::Tcp, IpVersion::V4, latency);
                 Json(serde_json::json!({"delay": delay_ms(latency)})).into_response()
             }
             Err(e) => {
@@ -632,7 +630,7 @@ async fn get_proxy_delay(
                 // the synthetic penalty sample keeps a flaky node from
                 // instantly re-ranking first.
                 s.alive_set
-                    .record_dial_failure(&node.name, ProbeDomain::Tcp, IpVersion::V4);
+                    .record_dial_failure(node.id, ProbeDomain::Tcp, IpVersion::V4);
                 error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     &format!("An error occurred in the delay test: {e}"),

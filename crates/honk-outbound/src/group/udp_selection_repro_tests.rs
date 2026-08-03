@@ -1,6 +1,10 @@
 use super::*;
 use std::time::Duration;
 
+fn nid(name: &str) -> uuid::Uuid {
+    uuid::Uuid::new_v5(&honk_config::node::NODE_ID_NAMESPACE, name.as_bytes())
+}
+
 fn make_node(id: uuid::Uuid, name: &str) -> Node {
     Node {
         id,
@@ -22,7 +26,7 @@ fn make_group(name: &str, policy: GroupPolicy, ids: Vec<uuid::Uuid>) -> Group {
 /// none. The UDP pick must choose the trojan node, not mirror TCP.
 #[test]
 fn udp_pick_prefers_node_with_udp_latency_over_mirror() {
-    let (t, a) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (t, a) = (nid("trojan"), nid("anytls"));
     let nodes = vec![make_node(t, "trojan"), make_node(a, "anytls")];
     let alive = std::sync::Arc::new(AliveDialerSet::new());
     let m = GroupManager::with_alive_set(
@@ -32,20 +36,20 @@ fn udp_pick_prefers_node_with_udp_latency_over_mirror() {
     );
     // anytls: great TCP latency (best TCP), no UDP latency.
     alive.record_probe_latency(
-        "anytls",
+        nid("anytls"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(50),
     );
     // trojan: worse TCP, but has real UDP latency.
     alive.record_probe_latency(
-        "trojan",
+        nid("trojan"),
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(200),
     );
     alive.record_probe_latency(
-        "trojan",
+        nid("trojan"),
         ProbeDomain::DataUdp,
         IpVersion::V4,
         Duration::from_millis(283),

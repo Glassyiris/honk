@@ -759,8 +759,8 @@ fn groups_by_name(config: &Config) -> std::collections::HashMap<&str, &Group> {
 /// nested sub-groups expanded to their leaf nodes (Selector members are
 /// probed too — alive display + failure discovery — not just URLTest
 /// members). Ungrouped nodes are skipped unless no groups exist at all.
-/// Returns `(node name, address)` pairs.
-fn health_check_targets(config: &Config) -> Vec<(String, String)> {
+/// Returns `(NodeId, node name, address)` triples.
+fn health_check_targets(config: &Config) -> Vec<(uuid::Uuid, String, String)> {
     let by_name = groups_by_name(config);
     let group_node_ids: std::collections::BTreeSet<uuid::Uuid> = config
         .groups
@@ -775,32 +775,39 @@ fn health_check_targets(config: &Config) -> Vec<(String, String)> {
         .nodes
         .iter()
         .filter(|n| group_node_ids.is_empty() || group_node_ids.contains(&n.id))
-        .map(|n| (n.name.clone(), n.address.clone()))
+        .map(|n| (n.id, n.name.clone(), n.address.clone()))
         .collect()
 }
 
 /// Synchronize alive-set health-check registrations with the config's
-/// group membership: register nodes that are new or whose address changed,
-/// remove nodes that left the checked set. Unchanged registrations keep
-/// their probe state and grace period. Returns `(added, removed)` counts.
+/// group membership: register nodes that are new or whose name/address
+/// changed, remove nodes that left the checked set. Unchanged
+/// registrations keep their probe state and grace period. Returns
+/// `(added, removed)` counts.
 pub(super) fn sync_health_check_nodes(
     alive_set: &AliveDialerSet,
     config: &Config,
 ) -> (usize, usize) {
-    let desired: std::collections::HashMap<String, String> =
-        health_check_targets(config).into_iter().collect();
+    let desired: std::collections::HashMap<uuid::Uuid, (String, String)> =
+        health_check_targets(config)
+            .into_iter()
+            .map(|(id, name, addr)| (id, (name, addr)))
+            .collect();
     let current = alive_set.registered_nodes();
     let mut added = 0usize;
-    for (name, addr) in &desired {
-        if current.get(name) != Some(addr) {
-            alive_set.register_node(name.clone(), addr.clone());
+    for (id, (name, addr)) in &desired {
+        let unchanged = current
+            .get(id)
+            .is_some_and(|r| &r.name == name && &r.address == addr);
+        if !unchanged {
+            alive_set.register_node(*id, name.clone(), addr.clone());
             added += 1;
         }
     }
     let mut removed = 0usize;
-    for name in current.keys() {
-        if !desired.contains_key(name) {
-            alive_set.remove_node(name);
+    for id in current.keys() {
+        if !desired.contains_key(id) {
+            alive_set.remove_node(*id);
             removed += 1;
         }
     }
@@ -808,7 +815,7 @@ pub(super) fn sync_health_check_nodes(
 }
 
 /// URLTest group registrations for the alive set's idle-suspension table:
-/// `(group name, member node names, idle timeout)` per URLTest group.
+/// `(group name, member NodeIds, idle timeout)` per URLTest group.
 /// Members shared with any non-URLTest group (Selector, LoadBalance,
 /// Fallback) are excluded — those are probed unconditionally, same as
 /// Selector members. Nested sub-groups are expanded to their leaf nodes
@@ -816,7 +823,7 @@ pub(super) fn sync_health_check_nodes(
 /// config reload.
 pub(super) fn urltest_group_registrations(
     config: &Config,
-) -> Vec<(String, Vec<String>, Option<Duration>)> {
+) -> Vec<(String, Vec<uuid::Uuid>, Option<Duration>)> {
     let by_name = groups_by_name(config);
     let leaf_ids = |g: &Group| {
         let mut ids = std::collections::BTreeSet::new();
@@ -834,11 +841,9 @@ pub(super) fn urltest_group_registrations(
         .iter()
         .filter(|g| g.policy == GroupPolicy::URLTest)
         .map(|group| {
-            let members: Vec<String> = leaf_ids(group)
+            let members: Vec<uuid::Uuid> = leaf_ids(group)
                 .into_iter()
                 .filter(|id| !always_probed_node_ids.contains(id))
-                .filter_map(|id| config.nodes.iter().find(|n| n.id == id))
-                .map(|n| n.name.clone())
                 .collect();
             (
                 group.name.clone(),
@@ -906,7 +911,7 @@ pub(super) fn install_interrupt_callback(
     })));
 }
 
-/// Build the node name → eBPF outbound id map used for
+/// Build the NodeId → eBPF outbound id map used for
 /// `OUTBOUND_CONNECTIVITY_MAP` pushes. Numbering matches
 /// `push_routing_to_ebpf`: direct=0, block=1, group i → `UserBase + i`;
 /// group member nodes inherit their group's id (first group wins when a
@@ -914,7 +919,7 @@ pub(super) fn install_interrupt_callback(
 /// leaves so a leaf dialed via a sub-group still maps to the top group's
 /// slot. Nodes outside any group have no eBPF outbound id and are absent
 /// from the map.
-pub(super) fn build_outbound_id_map(config: &Config) -> std::collections::HashMap<String, u8> {
+pub(super) fn build_outbound_id_map(config: &Config) -> std::collections::HashMap<uuid::Uuid, u8> {
     let by_name = groups_by_name(config);
     let mut map = std::collections::HashMap::new();
     for (i, group) in config.groups.iter().enumerate() {
@@ -922,9 +927,7 @@ pub(super) fn build_outbound_id_map(config: &Config) -> std::collections::HashMa
         let mut leaf_ids = std::collections::BTreeSet::new();
         collect_group_leaf_ids(group, &by_name, 0, &mut Vec::new(), &mut leaf_ids);
         for node_id in leaf_ids {
-            if let Some(node) = config.nodes.iter().find(|n| n.id == node_id) {
-                map.entry(node.name.clone()).or_insert(id);
-            }
+            map.entry(node_id).or_insert(id);
         }
     }
     map
@@ -940,7 +943,7 @@ fn group_connectivity_snapshot(
     let mut snapshot = Vec::with_capacity(config.groups.len() * 6);
     for (index, group) in config.groups.iter().enumerate() {
         let outbound = OutboundIndex::UserBase as u8 + index as u8;
-        let leaves = group_manager.leaf_node_names_in_group(&group.name);
+        let leaves = group_manager.leaf_nodes_in_group(&group.name);
         for (domain_index, domain) in [ProbeDomain::Tcp, ProbeDomain::DnsUdp, ProbeDomain::DataUdp]
             .into_iter()
             .enumerate()
@@ -948,7 +951,7 @@ fn group_connectivity_snapshot(
             for (ip_index, ipver) in [IpVersion::V4, IpVersion::V6].into_iter().enumerate() {
                 let any_alive = leaves
                     .iter()
-                    .any(|node| alive_set.is_alive_for(node, domain, ipver));
+                    .any(|node| alive_set.is_alive_for(node.id, domain, ipver));
                 snapshot.push((outbound, domain_index as u32, ip_index as u32, any_alive));
             }
         }
@@ -1097,14 +1100,14 @@ fn resolve_udp_outbound_plan_inner(
     if let Some(node) = config.nodes.iter().find(|node| node.name == outbound_name) {
         let mut selected_ipver = ipver;
         let nodes = if group_manager.is_node_selectable_for_domain(
-            &node.name,
+            node.id,
             ProbeDomain::DataUdp,
             selected_ipver,
         ) {
             vec![node.clone()]
         } else if ipver == IpVersion::V6
             && group_manager.is_node_selectable_for_domain(
-                &node.name,
+                node.id,
                 ProbeDomain::DataUdp,
                 IpVersion::V4,
             )
@@ -1263,7 +1266,7 @@ mod atomic_reload_tests {
             ..Default::default()
         };
         let alive = Arc::new(crate::outbound::AliveDialerSet::new());
-        alive.report_unavailable_forced(&a.name, ProbeDomain::DataUdp, IpVersion::V4);
+        alive.report_unavailable_forced(a.id, ProbeDomain::DataUdp, IpVersion::V4);
 
         let original_manager =
             GroupManager::with_alive_set(&config.groups, &config.nodes, Some(Arc::clone(&alive)));
@@ -1414,7 +1417,7 @@ mod atomic_reload_tests {
         let ready_endpoint = Arc::new(UdpEndpoint::new(
             transport.clone() as Arc<dyn PacketTransport>,
             relay,
-            "ready-node".into(),
+            uuid::Uuid::from_u128(0x1ead9),
         ));
         let queue_rx = ready_lease.take_queue_receiver().unwrap();
         let reply_socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -1810,8 +1813,8 @@ mod atomic_reload_tests {
         };
         let alive = Arc::new(crate::outbound::AliveDialerSet::new());
         for ipver in [IpVersion::V4, IpVersion::V6] {
-            alive.report_unavailable_forced(&dead.name, ProbeDomain::DataUdp, ipver);
-            alive.report_unavailable_forced(&dead.name, ProbeDomain::DnsUdp, ipver);
+            alive.report_unavailable_forced(dead.id, ProbeDomain::DataUdp, ipver);
+            alive.report_unavailable_forced(dead.id, ProbeDomain::DnsUdp, ipver);
         }
         let manager =
             GroupManager::with_alive_set(&config.groups, &config.nodes, Some(Arc::clone(&alive)));
@@ -1877,7 +1880,7 @@ mod atomic_reload_tests {
         let alive = Arc::new(crate::outbound::AliveDialerSet::new());
         alive.register_urltest_group(
             "cold-urltest",
-            std::slice::from_ref(&cold.name),
+            std::slice::from_ref(&cold.id),
             Some(Duration::from_secs(60)),
         );
         let manager =
@@ -1904,7 +1907,7 @@ mod atomic_reload_tests {
         })));
         for ipver in [IpVersion::V4, IpVersion::V6] {
             for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
-                alive.report_unavailable_forced(&fallback_a.name, domain, ipver);
+                alive.report_unavailable_forced(fallback_a.id, domain, ipver);
             }
         }
         assert!(alive.is_urltest_group_idle("cold-urltest"));

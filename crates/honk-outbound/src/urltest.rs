@@ -308,14 +308,14 @@ pub async fn urltest_group(
             match &result {
                 Ok(latency) => {
                     alive_set.record_probe_latency(
-                        &node.name,
+                        node.id,
                         ProbeDomain::Tcp,
                         IpVersion::V4,
                         *latency,
                     );
                 }
                 Err(_) => {
-                    alive_set.record_dial_failure(&node.name, ProbeDomain::Tcp, IpVersion::V4);
+                    alive_set.record_dial_failure(node.id, ProbeDomain::Tcp, IpVersion::V4);
                 }
             }
             (node.name.clone(), result)
@@ -635,7 +635,7 @@ mod tests {
         let members = vec![make_node("good"), make_node("bad")];
         for m in &members {
             alive_set.record_probe_latency(
-                &m.name,
+                m.id,
                 ProbeDomain::Tcp,
                 IpVersion::V4,
                 Duration::from_millis(999),
@@ -661,7 +661,7 @@ mod tests {
         // stale 999ms no longer ranks the node.
         for m in &members {
             assert_eq!(
-                alive_set.get_last_latency(&m.name, ProbeDomain::Tcp, IpVersion::V4),
+                alive_set.get_last_latency(m.id, ProbeDomain::Tcp, IpVersion::V4),
                 Some(Duration::from_secs(10))
             );
         }

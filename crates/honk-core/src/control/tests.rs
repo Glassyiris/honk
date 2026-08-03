@@ -557,7 +557,7 @@ async fn ready_udp_endpoint(
         crate::control::udp_endpoint::EndpointReservation::Initializing(lease) => lease,
         _ => panic!("test endpoint must reserve a fresh lease"),
     };
-    let endpoint = Arc::new(UdpEndpoint::new(transport, relay, "test-node".into()));
+    let endpoint = Arc::new(UdpEndpoint::new(transport, relay, udp_test_node().id));
     let queue_rx = lease.take_queue_receiver().unwrap();
     let reply_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let mut driver = pool.spawn_driver(
@@ -1466,14 +1466,15 @@ fn udp_test_config(default_outbound: &str, nodes: Vec<Node>, groups: Vec<Group>)
 }
 
 fn udp_test_node() -> Node {
-    Node {
-        id: uuid::Uuid::new_v4(),
+    let mut node = Node {
         name: "udp-test".into(),
         protocol: honk_config::types::NodeProtocol::Socks5,
         address: "127.0.0.1".into(),
         port: 9,
         ..Default::default()
-    }
+    };
+    node.id = node.derive_id();
+    node
 }
 
 fn udp_test_handle(config: Config, mode: UdpTestMode, capacity: usize) -> ControlPlaneHandle {
@@ -1858,7 +1859,7 @@ async fn udp_node_dead_before_production_dial_has_zero_dials_and_sends() {
         crate::outbound::ProbeDomain::DnsUdp,
     ] {
         handle.alive_set.report_unavailable_forced(
-            "udp-test",
+            udp_test_node().id,
             domain,
             crate::outbound::IpVersion::V4,
         );
@@ -1884,7 +1885,7 @@ async fn udp_dns_udp_liveness_keeps_explicit_node_selectable_in_production() {
     );
 
     handle.alive_set.report_unavailable_forced(
-        "udp-test",
+        udp_test_node().id,
         crate::outbound::ProbeDomain::DataUdp,
         crate::outbound::IpVersion::V4,
     );
@@ -1979,16 +1980,16 @@ async fn udp_production_death_during_unbound_preparation_prevents_send() {
     // becoming unavailable ensure the scheduler's completion recheck rejects
     // the transport before it can become a winner.
     handle.alive_set.report_unavailable_forced(
-        "udp-test",
+        udp_test_node().id,
         crate::outbound::ProbeDomain::DataUdp,
         crate::outbound::IpVersion::V4,
     );
     handle.alive_set.report_unavailable_forced(
-        "udp-test",
+        udp_test_node().id,
         crate::outbound::ProbeDomain::DnsUdp,
         crate::outbound::IpVersion::V4,
     );
-    handle.alive_set.mark_dead("udp-test");
+    handle.alive_set.mark_dead(udp_test_node().id);
     assert!(
         !handle.udp_pool.is_empty(),
         "speculative transport preparation must not bind its lease before a winner exists"
@@ -2535,10 +2536,11 @@ fn resolve_udp_outbound_plan_tracks_v4_fallback_and_final_resolution_guards() {
             ..Default::default()
         },
     ];
+    let v4_only_id = v4_only.id;
     let config = udp_test_config("direct", vec![v4_only], groups);
     let alive = Arc::new(AliveDialerSet::new());
-    alive.report_unavailable_forced("v4-only", ProbeDomain::DataUdp, IpVersion::V6);
-    alive.report_unavailable_forced("v4-only", ProbeDomain::DnsUdp, IpVersion::V6);
+    alive.report_unavailable_forced(v4_only_id, ProbeDomain::DataUdp, IpVersion::V6);
+    alive.report_unavailable_forced(v4_only_id, ProbeDomain::DnsUdp, IpVersion::V6);
     let manager = GroupManager::with_alive_set(&config.groups, &config.nodes, Some(alive));
 
     let v4_fallback = resolve_udp_outbound_plan(&config, &manager, "v4-group", IpVersion::V6);
@@ -2590,10 +2592,11 @@ fn resolve_udp_outbound_plan_explicit_node_falls_back_to_v4_through_final() {
         final_outbound: Some(node.name.clone()),
         ..Default::default()
     };
+    let node_id = node.id;
     let config = udp_test_config("direct", vec![node], vec![final_group]);
     let alive = Arc::new(AliveDialerSet::new());
     for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
-        alive.report_unavailable_forced("v4-explicit", domain, IpVersion::V6);
+        alive.report_unavailable_forced(node_id, domain, IpVersion::V6);
     }
     let manager = GroupManager::with_alive_set(&config.groups, &config.nodes, Some(alive.clone()));
 
@@ -2624,7 +2627,7 @@ fn resolve_udp_outbound_plan_explicit_node_falls_back_to_v4_through_final() {
     }
 
     for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
-        alive.report_unavailable_forced("v4-explicit", domain, IpVersion::V4);
+        alive.report_unavailable_forced(node_id, domain, IpVersion::V4);
     }
     for outbound in ["v4-explicit", "final-to-explicit"] {
         assert!(
@@ -2642,7 +2645,7 @@ fn resolve_udp_outbound_plan_excludes_unselectable_explicit_node() {
     let config = udp_test_config("udp-test", vec![node], vec![]);
     let alive = Arc::new(AliveDialerSet::new());
     for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
-        alive.report_unavailable_forced("udp-test", domain, IpVersion::V4);
+        alive.report_unavailable_forced(udp_test_node().id, domain, IpVersion::V4);
     }
     let manager = GroupManager::with_alive_set(&config.groups, &config.nodes, Some(alive));
 

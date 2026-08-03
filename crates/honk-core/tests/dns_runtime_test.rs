@@ -66,11 +66,12 @@ async fn public_reload_surface_publishes_a_coherent_runtime() {
     let upstream = StaticUpstream::new([192, 0, 2, 1]);
     let control = control_plane(config.clone(), test_dns_forwarder(&config, upstream));
     let subscription_id = uuid::Uuid::new_v4();
-    let replacement = Node {
+    let mut replacement = Node {
         name: "published-runtime-node".into(),
         subscription_id: Some(subscription_id),
         ..Node::default()
     };
+    replacement.id = replacement.derive_id();
 
     control
         .merge_subscription_nodes(subscription_id, vec![replacement])

@@ -119,7 +119,7 @@ pub struct ControlPlane {
     cache_db: Option<Arc<crate::cachedb::CacheDb>>,
     /// Node name → eBPF outbound id (push_routing_to_ebpf numbering),
     /// shared with the alive set's outbound resolver; rebuilt on reload.
-    outbound_id_map: Arc<parking_lot::RwLock<std::collections::HashMap<String, u8>>>,
+    outbound_id_map: Arc<parking_lot::RwLock<std::collections::HashMap<uuid::Uuid, u8>>>,
     /// Concurrency limiter to prevent tokio thread starvation under high load.
     /// Default: 1024 concurrent connections. Each connection handler acquires a
     /// permit before spawning; the accept loop waits when the limit is reached.
@@ -226,14 +226,14 @@ impl ControlPlane {
         // groups are excluded — those are probed unconditionally.
         alive_set.sync_urltest_groups(&urltest_group_registrations(&config));
         alive_set.sync_group_check_urls(&group_check_url_registrations(&config));
-        // Node name → eBPF outbound id for OUTBOUND_CONNECTIVITY_MAP pushes,
+        // NodeId → eBPF outbound id for OUTBOUND_CONNECTIVITY_MAP pushes,
         // numbered exactly like push_routing_to_ebpf (group i → UserBase+i).
         // Rebuilt on config reload.
         let outbound_id_map = Arc::new(parking_lot::RwLock::new(build_outbound_id_map(&config)));
         {
             let map = outbound_id_map.clone();
-            alive_set.set_outbound_resolver(Some(Arc::new(move |node_name: &str| {
-                map.read().get(node_name).copied()
+            alive_set.set_outbound_resolver(Some(Arc::new(move |node_id: uuid::Uuid| {
+                map.read().get(&node_id).copied()
             })));
         }
         let group_manager =
@@ -399,19 +399,20 @@ impl ControlPlane {
         let pool = self.connection_pool.clone();
         let udp_pool = self.udp_pool.clone();
         let config_for_purge = self.config.clone();
-        self.alive_set
-            .set_death_callback(Some(Box::new(move |node_name: &str| {
-                udp_pool.remove_by_node(node_name);
+        self.alive_set.set_death_callback(Some(Box::new(
+            move |node_id: uuid::Uuid, _name: &str| {
+                udp_pool.remove_by_node(node_id);
                 let node_addr = config_for_purge.try_read().ok().and_then(|c| {
                     c.nodes
                         .iter()
-                        .find(|n| n.name == node_name)
+                        .find(|n| n.id == node_id)
                         .map(|n| format!("{}:{}", n.host(), n.port))
                 });
                 if let Some(addr) = node_addr {
                     pool.purge_node(&addr);
                 }
-            })));
+            },
+        )));
     }
 
     /// Open the persistent cache database (sing-box `cache_file`), wire
@@ -460,10 +461,24 @@ impl ControlPlane {
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             let samples = db.load_delay_samples(now_unix, DELAY_SAMPLE_MAX_AGE_SECS);
+            // cache.db keys delay samples by node name (format unchanged);
+            // resolve them onto this generation's NodeIds — samples for
+            // nodes no longer configured are dropped.
+            let id_by_name: std::collections::HashMap<String, uuid::Uuid> = {
+                let config = self.config.read().await;
+                config
+                    .nodes
+                    .iter()
+                    .map(|n| (n.name.clone(), n.id))
+                    .collect()
+            };
             let mut restored = 0usize;
             for (node, delay_ms, measured_at) in samples {
+                let Some(node_id) = id_by_name.get(node.as_str()).copied() else {
+                    continue;
+                };
                 self.alive_set.restore_latency(
-                    &node,
+                    node_id,
                     std::time::Duration::from_millis(delay_ms),
                     std::time::UNIX_EPOCH + std::time::Duration::from_secs(measured_at),
                 );
@@ -474,16 +489,27 @@ impl ControlPlane {
             }
             let db_delay = db.clone();
             let alive_for_delay = self.alive_set.clone();
+            let config_for_delay = self.config.clone();
             let delay_task = tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
                 interval.tick().await; // first snapshot after one period
                 loop {
-                    for (node, latency, at) in alive_for_delay.latency_snapshot() {
+                    let names: std::collections::HashMap<uuid::Uuid, String> = config_for_delay
+                        .read()
+                        .await
+                        .nodes
+                        .iter()
+                        .map(|n| (n.id, n.name.clone()))
+                        .collect();
+                    for (node_id, latency, at) in alive_for_delay.latency_snapshot() {
+                        let Some(name) = names.get(&node_id) else {
+                            continue;
+                        };
                         let measured_at = at
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs())
                             .unwrap_or(0);
-                        db_delay.save_delay_sample(&node, latency.as_millis() as u64, measured_at);
+                        db_delay.save_delay_sample(name, latency.as_millis() as u64, measured_at);
                     }
                     interval.tick().await;
                 }
@@ -902,11 +928,10 @@ impl ControlPlane {
                         let gm = group_manager_for_push.read().clone();
                         // Leaf expansion matters here: member tags may name
                         // nested sub-groups, which have no alive state of
-                        // their own (`is_alive_for` defaults unknown names
-                        // to alive) — only real leaf nodes carry health.
-                        gm.leaf_node_names_in_group(&name)
+                        // their own — only real leaf nodes carry health.
+                        gm.leaf_nodes_in_group(&name)
                             .iter()
-                            .any(|n| alive_for_push.is_alive_for(n, probe_domain, ip_version))
+                            .any(|n| alive_for_push.is_alive_for(n.id, probe_domain, ip_version))
                     }
                     // Unknown outbound: keep the datapath open (userspace
                     // makes the final decision anyway).

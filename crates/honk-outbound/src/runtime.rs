@@ -403,6 +403,7 @@ mod tests {
 
     fn node(name: &str, protocol: NodeProtocol) -> Node {
         Node {
+            id: uuid::Uuid::new_v4(),
             name: name.to_string(),
             protocol,
             address: "1.2.3.4:443".to_string(),

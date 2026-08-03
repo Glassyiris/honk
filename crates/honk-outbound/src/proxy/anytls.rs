@@ -3209,6 +3209,7 @@ mod tests {
     #[test]
     fn test_node_pool_prefers_registry() {
         let node = Node {
+            id: uuid::Uuid::new_v4(),
             name: "test".into(),
             protocol: NodeProtocol::AnyTLS,
             ..Default::default()
@@ -3239,6 +3240,7 @@ mod tests {
 
         // A node absent from the registry is an explicit error.
         let other = Node {
+            id: uuid::Uuid::new_v4(),
             name: "other".into(),
             protocol: NodeProtocol::AnyTLS,
             ..Default::default()
@@ -3305,6 +3307,7 @@ mod tests {
     #[tokio::test]
     async fn runtime_udp_pool_hit_does_not_build_connector() {
         let node = Node {
+            id: uuid::Uuid::new_v4(),
             name: "runtime-udp-hit".into(),
             protocol: NodeProtocol::AnyTLS,
             address: "127.0.0.1:9".into(),
@@ -3344,6 +3347,7 @@ mod tests {
     #[tokio::test]
     async fn runtime_dial_stays_on_captured_pool_after_registry_swap() {
         let old_node = Node {
+            id: uuid::Uuid::new_v4(),
             name: "generation-node".into(),
             protocol: NodeProtocol::AnyTLS,
             address: "127.0.0.1:9".into(),
@@ -3401,6 +3405,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn runtime_retirement_drains_live_session_without_cutting_it() {
         let node = Node {
+            id: uuid::Uuid::new_v4(),
             name: "retiring-anytls".into(),
             protocol: NodeProtocol::AnyTLS,
             ..Default::default()
@@ -4427,6 +4432,7 @@ mod tests {
     #[tokio::test]
     async fn warm_udp_uses_only_its_generation_owned_runtime_pool() {
         let node = Node {
+            id: uuid::Uuid::new_v4(),
             name: "warm-anytls".into(),
             protocol: NodeProtocol::AnyTLS,
             anytls_min_idle_session: Some(0),
@@ -4473,6 +4479,7 @@ mod tests {
     #[tokio::test]
     async fn warm_udp_shutdown_cancels_a_notify_blocked_dial_and_keeps_pool_terminal() {
         let node = Node {
+            id: uuid::Uuid::new_v4(),
             name: "shutdown-warm-anytls".into(),
             protocol: NodeProtocol::AnyTLS,
             anytls_min_idle_session: Some(0),
@@ -4535,6 +4542,7 @@ mod tests {
     async fn speculative_shared_loser_unregisters_uot_sid_synchronously() {
         let handler = AnyTlsHandler::new();
         let node = Node {
+            id: uuid::Uuid::new_v4(),
             name: "speculative-shared".into(),
             protocol: NodeProtocol::AnyTLS,
             anytls_min_idle_session: Some(0),
@@ -4571,6 +4579,7 @@ mod tests {
     async fn speculative_detached_winner_commits_into_captured_pool_once() {
         let handler = AnyTlsHandler::new();
         let node = Node {
+            id: uuid::Uuid::new_v4(),
             name: "speculative-detached-commit".into(),
             protocol: NodeProtocol::AnyTLS,
             anytls_min_idle_session: Some(0),
@@ -4606,6 +4615,7 @@ mod tests {
     async fn speculative_detached_commit_fails_closed_after_generation_shutdown() {
         let handler = AnyTlsHandler::new();
         let node = Node {
+            id: uuid::Uuid::new_v4(),
             name: "speculative-detached-shutdown".into(),
             protocol: NodeProtocol::AnyTLS,
             anytls_min_idle_session: Some(0),
@@ -4646,6 +4656,7 @@ mod tests {
     async fn speculative_udp_abort_cancels_injected_dial_without_pooling() {
         let handler = Arc::new(AnyTlsHandler::new());
         let node = Node {
+            id: uuid::Uuid::new_v4(),
             name: "speculative-abort".into(),
             protocol: NodeProtocol::AnyTLS,
             anytls_min_idle_session: Some(0),
@@ -4709,6 +4720,7 @@ mod tests {
     async fn speculative_udp_generation_shutdown_cancels_injected_dial() {
         let handler = Arc::new(AnyTlsHandler::new());
         let node = Node {
+            id: uuid::Uuid::new_v4(),
             name: "speculative-shutdown".into(),
             protocol: NodeProtocol::AnyTLS,
             anytls_min_idle_session: Some(0),

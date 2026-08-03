@@ -688,6 +688,7 @@ mod tests {
     async fn test_block_node_dispatches_to_block_handler() {
         let registry = ProxyRegistry::default_resolver().unwrap();
         let node = Node {
+            id: uuid::Uuid::new_v4(),
             name: "block".into(),
             protocol: NodeProtocol::Block,
             ..Default::default()
@@ -762,6 +763,7 @@ mod tests {
             ("trojan", NodeProtocol::Trojan),
         ] {
             nodes.push(Node {
+                id: uuid::Uuid::new_v4(),
                 name: name.into(),
                 protocol,
                 ..Default::default()
@@ -786,6 +788,7 @@ mod tests {
     #[tokio::test]
     async fn warm_udp_rejects_a_shutdown_generation_before_dispatch() {
         let node = Node {
+            id: uuid::Uuid::new_v4(),
             name: "old-anytls".into(),
             protocol: NodeProtocol::AnyTLS,
             ..Default::default()
@@ -807,6 +810,7 @@ mod tests {
     #[tokio::test]
     async fn speculative_udp_rejects_a_shutdown_generation_before_dispatch() {
         let node = Node {
+            id: uuid::Uuid::new_v4(),
             name: "direct".into(),
             protocol: NodeProtocol::Direct,
             ..Default::default()

@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 fn make_node(name: &str) -> Node {
     Node {
-        id: uuid::Uuid::new_v4(),
+        id: uuid::Uuid::new_v5(&honk_config::node::NODE_ID_NAMESPACE, name.as_bytes()),
         name: name.into(),
         protocol: NodeProtocol::Socks5,
         address: "127.0.0.1".into(),
@@ -635,7 +635,7 @@ async fn test_group_delay_omits_failed_members() {
 
     // Pre-seed latency history; a failed measurement must clear it.
     app.state.alive_set.record_probe_latency(
-        "node-a",
+        make_node("node-a").id,
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(123),
@@ -660,9 +660,11 @@ async fn test_group_delay_omits_failed_members() {
     // Failure replaced the seeded history with the synthetic penalty sample,
     // so the node can no longer rank by its stale 123ms.
     assert_eq!(
-        app.state
-            .alive_set
-            .get_last_latency("node-a", ProbeDomain::Tcp, IpVersion::V4),
+        app.state.alive_set.get_last_latency(
+            make_node("node-a").id,
+            ProbeDomain::Tcp,
+            IpVersion::V4
+        ),
         Some(Duration::from_secs(10))
     );
 
@@ -730,7 +732,7 @@ async fn test_nested_group_delay_endpoints() {
     // Seed latency on the sub-group's leaf: a failed measurement of the
     // parent must clear it (proof the leaf was actually measured).
     app.state.alive_set.record_probe_latency(
-        "node-b",
+        make_node("node-b").id,
         ProbeDomain::Tcp,
         IpVersion::V4,
         Duration::from_millis(55),
@@ -749,9 +751,11 @@ async fn test_nested_group_delay_endpoints() {
         "failed members must be omitted, got: {map:?}"
     );
     assert_eq!(
-        app.state
-            .alive_set
-            .get_last_latency("node-b", ProbeDomain::Tcp, IpVersion::V4),
+        app.state.alive_set.get_last_latency(
+            make_node("node-b").id,
+            ProbeDomain::Tcp,
+            IpVersion::V4
+        ),
         Some(Duration::from_secs(10)),
         "sub-group leaf must have been measured (penalty sample on failure)"
     );

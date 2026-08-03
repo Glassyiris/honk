@@ -173,7 +173,7 @@ impl ReadyBatch {
         let endpoint = Arc::new(UdpEndpoint::new(
             Arc::new(BenchPacketTransport { relay: destination }),
             destination,
-            "benchmark".into(),
+            uuid::Uuid::from_u128(0xbe9c4),
         ));
         assert!(
             lease.commit_ready(endpoint),

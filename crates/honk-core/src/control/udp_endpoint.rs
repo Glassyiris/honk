@@ -78,9 +78,10 @@ pub struct UdpEndpoint {
     pub proxy_socket: Arc<dyn honk_outbound::proxy::PacketTransport>,
     /// The relay target address (upstream proxy).
     pub relay_addr: SocketAddr,
-    /// Name of the proxy node this endpoint dials through — used to report
-    /// UDP liveness when a reply actually arrives (see `receive_loop`).
-    node_name: String,
+    /// NodeId of the proxy node this endpoint dials through — used to
+    /// report UDP liveness when a reply actually arrives (see
+    /// `receive_loop`) and to retire the endpoint on node death.
+    node_id: uuid::Uuid,
     /// When this endpoint expires (monotonic nanos).
     expires_at: AtomicI64,
     /// Whether the endpoint has received at least one reply.
@@ -122,13 +123,13 @@ impl UdpEndpoint {
     pub fn new(
         proxy_socket: Arc<dyn honk_outbound::proxy::PacketTransport>,
         relay_addr: SocketAddr,
-        node_name: String,
+        node_id: uuid::Uuid,
     ) -> Self {
         let now = monotonic_nanos();
         Self {
             proxy_socket,
             relay_addr,
-            node_name,
+            node_id,
             expires_at: AtomicI64::new(now + nanos_from_dur(DEFAULT_NAT_TIMEOUT)),
             has_reply: AtomicBool::new(false),
             first_reply_recorded: AtomicBool::new(false),
@@ -400,7 +401,7 @@ struct InitializingEndpoint {
     /// Finalized Task 5 transport winner for this generation. Bound only after
     /// speculative preparation has drained, so a death callback can
     /// generation-safely retire the entry before `commit_ready` publishes Ready.
-    selected_node: Mutex<Option<String>>,
+    selected_node: Mutex<Option<uuid::Uuid>>,
 }
 
 impl InitializingEndpoint {
@@ -425,16 +426,16 @@ impl InitializingEndpoint {
         self.tracker_id.lock().take()
     }
 
-    fn bind_selected_node(&self, node_name: &str) {
-        *self.selected_node.lock() = Some(node_name.to_owned());
+    fn bind_selected_node(&self, node_id: uuid::Uuid) {
+        *self.selected_node.lock() = Some(node_id);
     }
 
     fn clear_selected_node(&self) {
         *self.selected_node.lock() = None;
     }
 
-    fn selected_node_is(&self, node_name: &str) -> bool {
-        self.selected_node.lock().as_deref() == Some(node_name)
+    fn selected_node_is(&self, node_id: uuid::Uuid) -> bool {
+        *self.selected_node.lock() == Some(node_id)
     }
 }
 
@@ -555,10 +556,11 @@ impl UdpInitLease {
         }
     }
 
-    /// Bind the finalized transport winner to this Initializing generation
-    /// after speculative preparation drains and before endpoint setup. Returns
-    /// false when a newer generation or death/cancel path retired this entry.
-    pub(super) fn bind_selected_node(&self, node_name: &str) -> bool {
+    /// Bind the finalized transport winner (NodeId) to this Initializing
+    /// generation after speculative preparation drains and before endpoint
+    /// setup. Returns false when a newer generation or death/cancel path
+    /// retired this entry.
+    pub(super) fn bind_selected_node(&self, node_id: uuid::Uuid) -> bool {
         let Some(entry) = self.pool.endpoints.get(&self.key) else {
             return false;
         };
@@ -566,7 +568,7 @@ impl UdpInitLease {
             EndpointEntry::Initializing(initializing)
                 if initializing.generation == self.generation =>
             {
-                initializing.bind_selected_node(node_name);
+                initializing.bind_selected_node(node_id);
                 true
             }
             _ => false,
@@ -1172,19 +1174,19 @@ impl UdpEndpointPool {
     }
 
     /// Retire Ready and bound-Initializing mappings for a dead node.
-    /// Only Initializing entries whose finalized winner is `node_name` are
+    /// Only Initializing entries whose finalized winner is `node_id` are
     /// removed; an unbound reservation is still awaiting a winner. Removal is
     /// generation-safe.
-    pub fn remove_by_node(&self, node_name: &str) {
+    pub fn remove_by_node(&self, node_id: uuid::Uuid) {
         let stale: Vec<(EndpointKey, u64)> = self
             .endpoints
             .iter()
             .filter_map(|entry| match entry.value() {
-                EndpointEntry::Ready(ready) if ready.endpoint.node_name == node_name => {
+                EndpointEntry::Ready(ready) if ready.endpoint.node_id == node_id => {
                     Some((*entry.key(), ready.generation))
                 }
                 EndpointEntry::Initializing(initializing)
-                    if initializing.selected_node_is(node_name) =>
+                    if initializing.selected_node_is(node_id) =>
                 {
                     Some((*entry.key(), initializing.generation))
                 }
@@ -1197,8 +1199,8 @@ impl UdpEndpointPool {
             .count();
         if removed != 0 {
             debug!(
-                "Removed {} UDP endpoints bound to dead node '{}'",
-                removed, node_name
+                "Removed {} UDP endpoints bound to dead node {}",
+                removed, node_id
             );
         }
     }
@@ -1590,7 +1592,7 @@ async fn run_endpoint_driver(
                     honk_outbound::alive::IpVersion::V6
                 };
                 alive_set.report_unavailable_traffic(
-                    &endpoint.node_name,
+                    endpoint.node_id,
                     honk_outbound::alive::ProbeDomain::DataUdp,
                     ipver,
                 );
@@ -1628,7 +1630,7 @@ async fn run_endpoint_driver(
             honk_outbound::alive::IpVersion::V6
         };
         alive_set.report_unavailable_traffic(
-            &endpoint.node_name,
+            endpoint.node_id,
             honk_outbound::alive::ProbeDomain::DataUdp,
             ipver,
         );
@@ -1740,7 +1742,7 @@ async fn receive_loop(
         endpoint.tracker_download(n as u64);
         outbound_tracker.add_bytes(0, n as u64);
         alive_set.report_available_traffic(
-            &endpoint.node_name,
+            endpoint.node_id,
             honk_outbound::alive::ProbeDomain::DataUdp,
             ipver,
         );
@@ -1987,12 +1989,17 @@ mod tests {
         (first, queue_rx)
     }
 
+    const TEST_NODE_ID: uuid::Uuid = uuid::Uuid::from_u128(0x7e57);
+    const DEAD_NODE_ID: uuid::Uuid = uuid::Uuid::from_u128(0xdead);
+    const OTHER_NODE_ID: uuid::Uuid = uuid::Uuid::from_u128(0x07e4);
+    const JANITOR_NODE_ID: uuid::Uuid = uuid::Uuid::from_u128(0x9a17);
+
     fn driver_test_endpoint(
         transport: Arc<ScriptedPacketTransport>,
         relay: SocketAddr,
     ) -> Arc<UdpEndpoint> {
         let transport: Arc<dyn honk_outbound::proxy::PacketTransport> = transport;
-        Arc::new(UdpEndpoint::new(transport, relay, "test-node".to_owned()))
+        Arc::new(UdpEndpoint::new(transport, relay, TEST_NODE_ID))
     }
 
     async fn test_reply_socket() -> Arc<UdpSocket> {
@@ -2005,7 +2012,7 @@ mod tests {
         dst: SocketAddr,
         proxy_socket: Arc<dyn honk_outbound::proxy::PacketTransport>,
         relay: SocketAddr,
-        node_name: &str,
+        node_id: uuid::Uuid,
     ) -> Arc<UdpEndpoint> {
         let stats = StatsManager::new();
         let slow_permit = Arc::new(Semaphore::new(1))
@@ -2015,7 +2022,7 @@ mod tests {
             EndpointReservation::Initializing(lease) => lease,
             _ => panic!("expected a new initializer lease"),
         };
-        let endpoint = Arc::new(UdpEndpoint::new(proxy_socket, relay, node_name.to_string()));
+        let endpoint = Arc::new(UdpEndpoint::new(proxy_socket, relay, node_id));
         assert!(lease.commit_ready(Arc::clone(&endpoint)));
         endpoint
     }
@@ -2312,7 +2319,7 @@ mod tests {
             Arc::new(ScriptedPacketTransport::new(relay, []))
                 as Arc<dyn honk_outbound::proxy::PacketTransport>,
             relay,
-            "fence-node".to_owned(),
+            TEST_NODE_ID,
         ));
         assert!(
             !lease.commit_ready(endpoint),
@@ -2339,7 +2346,7 @@ mod tests {
             Arc::new(ScriptedPacketTransport::new(relay, []))
                 as Arc<dyn honk_outbound::proxy::PacketTransport>,
             relay,
-            "ready-node".to_owned(),
+            TEST_NODE_ID,
         ));
         assert!(lease.commit_ready(Arc::clone(&endpoint)));
         drop(lease);
@@ -2457,7 +2464,7 @@ mod tests {
         let endpoint = Arc::new(UdpEndpoint::new(
             transport.clone() as Arc<dyn honk_outbound::proxy::PacketTransport>,
             relay,
-            "ready-node".to_owned(),
+            TEST_NODE_ID,
         ));
         let queue_rx = lease.take_queue_receiver().unwrap();
         let mut driver = pool.spawn_driver(
@@ -2469,7 +2476,7 @@ mod tests {
             test_reply_socket().await,
             Arc::new(honk_outbound::alive::AliveDialerSet::new()),
             Arc::clone(&stats),
-            "ready-node".to_owned(),
+            "test-node".to_owned(),
         );
         driver.wait_ready().await.unwrap();
         assert!(lease.commit_ready(Arc::clone(&endpoint)));
@@ -2814,7 +2821,7 @@ mod tests {
         );
         assert!(pool.is_empty());
         let history = alive.get_probe_history(
-            "test-node",
+            TEST_NODE_ID,
             honk_outbound::alive::ProbeDomain::DataUdp,
             honk_outbound::alive::IpVersion::V4,
         );
@@ -2884,7 +2891,7 @@ mod tests {
         assert!(
             alive
                 .get_probe_history(
-                    "test-node",
+                    TEST_NODE_ID,
                     honk_outbound::alive::ProbeDomain::DataUdp,
                     honk_outbound::alive::IpVersion::V4,
                 )
@@ -3018,7 +3025,7 @@ mod tests {
             );
             assert!(pool.is_empty());
             let history = alive.get_probe_history(
-                "test-node",
+                TEST_NODE_ID,
                 honk_outbound::alive::ProbeDomain::DataUdp,
                 honk_outbound::alive::IpVersion::V4,
             );
@@ -3359,7 +3366,7 @@ mod tests {
                 .unwrap(),
         );
         let relay = make_addr("192.168.1.1", 1080);
-        let ep = UdpEndpoint::new(transport(proxy, relay), relay, "test-node".to_string());
+        let ep = UdpEndpoint::new(transport(proxy, relay), relay, TEST_NODE_ID);
         let dst = make_addr("8.8.8.8", 53);
 
         assert!(ep.get_cached_routing(dst).is_none());
@@ -3378,7 +3385,7 @@ mod tests {
         let ep = UdpEndpoint::new(
             transport(proxy, make_addr("192.168.1.1", 1080)),
             make_addr("192.168.1.1", 1080),
-            "test-node".to_string(),
+            TEST_NODE_ID,
         );
 
         ep.cache_routing_result(make_addr("8.8.8.8", 53), 3);
@@ -3395,7 +3402,7 @@ mod tests {
         let ep = UdpEndpoint::new(
             transport(proxy, make_addr("192.168.1.1", 1080)),
             make_addr("192.168.1.1", 1080),
-            "test-node".to_string(),
+            TEST_NODE_ID,
         );
         let dst = make_addr("8.8.8.8", 53);
 
@@ -3426,9 +3433,9 @@ mod tests {
             _ => panic!("death-before-dial fixture must initialize"),
         };
         let generation = lease.generation();
-        assert!(lease.bind_selected_node("dead-node"));
+        assert!(lease.bind_selected_node(DEAD_NODE_ID));
         // Simulate death winning immediately after bind, before dial await.
-        pool.remove_by_node("dead-node");
+        pool.remove_by_node(DEAD_NODE_ID);
         assert!(
             !lease.still_initializing(),
             "bound Initializing entry must be generation-safely removed"
@@ -3442,7 +3449,7 @@ mod tests {
         let endpoint = Arc::new(UdpEndpoint::new(
             transport.clone() as Arc<dyn honk_outbound::proxy::PacketTransport>,
             relay,
-            "dead-node".to_owned(),
+            DEAD_NODE_ID,
         ));
         assert!(
             !lease.commit_ready(endpoint),
@@ -3476,10 +3483,10 @@ mod tests {
             EndpointReservation::Initializing(lease) => lease,
             _ => panic!("death-during-dial fixture must initialize"),
         };
-        assert!(lease.bind_selected_node("dead-node"));
+        assert!(lease.bind_selected_node(DEAD_NODE_ID));
         assert!(lease.set_tracker_id("during-dial".to_owned()));
         // Death arrives while dial would be in flight.
-        pool.remove_by_node("dead-node");
+        pool.remove_by_node(DEAD_NODE_ID);
         assert!(!lease.still_initializing());
         assert_eq!(
             removed_rx.try_recv().unwrap(),
@@ -3491,7 +3498,7 @@ mod tests {
         let endpoint = Arc::new(UdpEndpoint::new(
             transport.clone() as Arc<dyn honk_outbound::proxy::PacketTransport>,
             relay,
-            "dead-node".to_owned(),
+            DEAD_NODE_ID,
         ));
         // Even if dial "succeeded", commit and start must not send.
         assert!(lease.take_queue_receiver().is_none());
@@ -3519,12 +3526,12 @@ mod tests {
             EndpointReservation::Initializing(lease) => lease,
             _ => panic!("death-before-commit fixture must initialize"),
         };
-        assert!(lease.bind_selected_node("dead-node"));
+        assert!(lease.bind_selected_node(DEAD_NODE_ID));
         let transport = Arc::new(ScriptedPacketTransport::new(relay, [DriverSendAction::Ok]));
         let endpoint = Arc::new(UdpEndpoint::new(
             transport.clone() as Arc<dyn honk_outbound::proxy::PacketTransport>,
             relay,
-            "dead-node".to_owned(),
+            DEAD_NODE_ID,
         ));
         endpoint.set_tracker("before-commit".to_owned());
         assert!(lease.set_tracker_id("before-commit".to_owned()));
@@ -3543,7 +3550,7 @@ mod tests {
         driver.wait_ready().await.unwrap();
 
         // Death wins after driver-ready, before commit_ready.
-        pool.remove_by_node("dead-node");
+        pool.remove_by_node(DEAD_NODE_ID);
         assert!(!lease.still_initializing());
         assert!(pool.is_empty());
         assert_eq!(
@@ -3582,11 +3589,7 @@ mod tests {
         };
         let transport = Arc::new(ScriptedPacketTransport::new(relay, [DriverSendAction::Ok]));
         let proxy_socket: Arc<dyn honk_outbound::proxy::PacketTransport> = transport.clone();
-        let endpoint = Arc::new(UdpEndpoint::new(
-            proxy_socket,
-            relay,
-            "dead-node".to_owned(),
-        ));
+        let endpoint = Arc::new(UdpEndpoint::new(proxy_socket, relay, DEAD_NODE_ID));
         endpoint.set_tracker("dead-before-start".to_owned());
         assert!(lease.set_tracker_id("dead-before-start".to_owned()));
         let queue_rx = lease.take_queue_receiver().unwrap();
@@ -3604,7 +3607,7 @@ mod tests {
         driver.wait_ready().await.unwrap();
         assert!(lease.commit_ready(endpoint));
 
-        pool.remove_by_node("dead-node");
+        pool.remove_by_node(DEAD_NODE_ID);
         assert!(
             pool.is_empty(),
             "node death must retire every Ready mapping"
@@ -3655,7 +3658,7 @@ mod tests {
             dst,
             transport(proxy.clone(), relay),
             relay,
-            "dead-node",
+            DEAD_NODE_ID,
         );
         commit_ready(
             &pool,
@@ -3663,7 +3666,7 @@ mod tests {
             dst,
             transport(proxy.clone(), relay),
             relay,
-            "other-node",
+            OTHER_NODE_ID,
         );
         let init_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
         let initializing = match pool.reserve_or_enqueue(
@@ -3678,14 +3681,14 @@ mod tests {
         };
         // Unbound Initializing must not be attributed to the dead node yet.
         assert_eq!(pool.len(), 3);
-        pool.remove_by_node("dead-node");
+        pool.remove_by_node(DEAD_NODE_ID);
         assert_eq!(pool.len(), 2);
         assert!(pool.get(make_addr("10.0.0.1", 12345), dst).is_none());
         assert!(pool.get(make_addr("10.0.0.2", 12345), dst).is_some());
         assert!(initializing.still_initializing());
 
-        assert!(initializing.bind_selected_node("dead-node"));
-        pool.remove_by_node("dead-node");
+        assert!(initializing.bind_selected_node(DEAD_NODE_ID));
+        pool.remove_by_node(DEAD_NODE_ID);
         assert!(
             !initializing.still_initializing(),
             "bound Initializing must be removed generation-safely"
@@ -3709,11 +3712,11 @@ mod tests {
             dst,
             transport(proxy.clone(), relay),
             relay,
-            "dead-node",
+            DEAD_NODE_ID,
         );
         node_endpoint.set_tracker("node-tracker".to_owned());
 
-        pool.remove_by_node("dead-node");
+        pool.remove_by_node(DEAD_NODE_ID);
         assert_eq!(
             removed_rx.try_recv().unwrap(),
             (node_client, dst, Some("node-tracker".to_owned()))
@@ -3726,7 +3729,7 @@ mod tests {
             dst,
             transport(proxy, relay),
             relay,
-            "janitor-node",
+            JANITOR_NODE_ID,
         );
         janitor_endpoint.set_tracker("janitor-tracker".to_owned());
         janitor_endpoint.release();

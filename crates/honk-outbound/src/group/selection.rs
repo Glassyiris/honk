@@ -94,7 +94,7 @@ impl GroupManager {
     /// health state.
     pub fn is_node_selectable_for_domain(
         &self,
-        node_name: &str,
+        node_id: uuid::Uuid,
         domain: ProbeDomain,
         ipver: IpVersion,
     ) -> bool {
@@ -102,14 +102,14 @@ impl GroupManager {
             return true;
         };
         if domain == ProbeDomain::DataUdp {
-            return if alive.has_udp_state(node_name) {
-                alive.is_alive_for(node_name, ProbeDomain::DataUdp, ipver)
-                    || alive.is_alive_for(node_name, ProbeDomain::DnsUdp, ipver)
+            return if alive.has_udp_state(node_id) {
+                alive.is_alive_for(node_id, ProbeDomain::DataUdp, ipver)
+                    || alive.is_alive_for(node_id, ProbeDomain::DnsUdp, ipver)
             } else {
-                alive.is_alive_for(node_name, ProbeDomain::Tcp, ipver)
+                alive.is_alive_for(node_id, ProbeDomain::Tcp, ipver)
             };
         }
-        alive.is_alive_for(node_name, domain, ipver)
+        alive.is_alive_for(node_id, domain, ipver)
     }
 
     /// Select a single alive node, excluding one by name (for failover retry).
@@ -334,37 +334,56 @@ impl GroupManager {
     /// this resolves to the real nodes whose health state drives probing
     /// and eBPF connectivity pushes.
     pub fn leaf_node_names_in_group(&self, group_name: &str) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
+        self.leaf_nodes_in_group(group_name)
+            .into_iter()
+            .map(|n| n.name.clone())
+            .collect()
+    }
+
+    /// All leaf nodes reachable from a group (deduplicated by NodeId,
+    /// cycle-guarded) — the health-state carriers behind
+    /// [`GroupManager::leaf_node_names_in_group`].
+    pub fn leaf_nodes_in_group(&self, group_name: &str) -> Vec<&Node> {
+        let mut out: Vec<&Node> = Vec::new();
         let mut visited: Vec<&str> = Vec::new();
-        self.collect_leaf_names(group_name, 0, &mut visited, &mut out);
+        self.collect_leaf_nodes(group_name, 0, &mut visited, &mut out);
         out
     }
 
-    fn collect_leaf_names<'a>(
+    fn collect_leaf_nodes<'a>(
         &'a self,
-        group_name: &'a str,
+        group_name: &str,
         depth: usize,
         visited: &mut Vec<&'a str>,
-        out: &mut Vec<String>,
+        out: &mut Vec<&'a Node>,
     ) {
-        if depth >= MAX_GROUP_DEPTH || visited.contains(&group_name) {
+        if depth >= MAX_GROUP_DEPTH {
             return;
         }
         let Some(group) = self.groups.get(group_name) else {
             return;
         };
-        visited.push(group_name);
+        if visited.contains(&group.name.as_str()) {
+            return;
+        }
+        visited.push(group.name.as_str());
         for id in &group.nodes {
             if let Some(n) = self.nodes.get(id)
-                && !out.contains(&n.name)
+                && !out.iter().any(|o| o.id == n.id)
             {
-                out.push(n.name.clone());
+                out.push(n);
             }
         }
         for tag in &group.groups {
-            self.collect_leaf_names(tag, depth + 1, visited, out);
+            self.collect_leaf_nodes(tag, depth + 1, visited, out);
         }
         visited.pop();
+    }
+
+    /// Look up a node by display name (dashboard/API boundary — the hot
+    /// paths key on NodeId). Sub-group tags and unknown names yield `None`.
+    pub fn node_by_name(&self, name: &str) -> Option<&Node> {
+        self.nodes.values().find(|n| n.name == name)
     }
 
     /// The selection chain from a group down to the leaf its current
@@ -772,7 +791,7 @@ impl GroupManager {
         }
         candidates
             .into_iter()
-            .filter(|c| self.is_node_selectable_for_domain(&c.node.name, domain, ipver))
+            .filter(|c| self.is_node_selectable_for_domain(c.node.id, domain, ipver))
             .collect()
     }
 
@@ -792,7 +811,7 @@ impl GroupManager {
             {
                 alive.is_alive_for_url(&node.name, url)
             } else {
-                self.is_node_selectable_for_domain(&node.name, domain, ipver)
+                self.is_node_selectable_for_domain(node.id, domain, ipver)
             }
         };
         let find = |tag: &str| {
@@ -1088,16 +1107,16 @@ impl GroupManager {
                 None => self
                     .alive_set
                     .as_ref()
-                    .and_then(|a| a.get_moving_average(&node.name, ProbeDomain::Tcp, ipver)),
+                    .and_then(|a| a.get_moving_average(node.id, ProbeDomain::Tcp, ipver)),
             },
             SelectionNetwork::Udp => self
                 .alive_set
                 .as_ref()
-                .and_then(|a| a.get_moving_average(&node.name, ProbeDomain::DataUdp, ipver))
+                .and_then(|a| a.get_moving_average(node.id, ProbeDomain::DataUdp, ipver))
                 .or_else(|| {
                     self.alive_set
                         .as_ref()
-                        .and_then(|a| a.get_moving_average(&node.name, ProbeDomain::DnsUdp, ipver))
+                        .and_then(|a| a.get_moving_average(node.id, ProbeDomain::DnsUdp, ipver))
                 }),
         };
         latency.unwrap_or(Duration::MAX)
@@ -1109,8 +1128,8 @@ impl GroupManager {
     fn udp_specific_latency(&self, node: &Node, ipver: IpVersion) -> Option<Duration> {
         let alive = self.alive_set.as_ref()?;
         alive
-            .get_last_latency(&node.name, ProbeDomain::DataUdp, ipver)
-            .or_else(|| alive.get_last_latency(&node.name, ProbeDomain::DnsUdp, ipver))
+            .get_last_latency(node.id, ProbeDomain::DataUdp, ipver)
+            .or_else(|| alive.get_last_latency(node.id, ProbeDomain::DnsUdp, ipver))
     }
 
     /// Order candidates by (network-aware) latency, lowest first.
