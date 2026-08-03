@@ -15,7 +15,6 @@
 
 - 完整 Clash Meta / mihomo 能力对等（完整 FakeIP 引擎与远程 rule-set）。
 - REALITY 协议支持（延期）。Chrome 风格 TLS 指纹已通过 BoringSSL 实现，而非生产 rustls 路径。
-- 与官方 sing-box multiplex inbound 的完整互通（h2mux 帧接近 sing-mux，内层握手不同）。
 - Windows / macOS 透明代理。
 
 ## 3. 灵感来源对照
@@ -30,7 +29,7 @@
 | 组策略与嵌套出站 | **sing-box** | Selector / URLTest / LB / Fallback、RealTag 风格链 |
 | TCP/UDP 独立 URLTest 选择 | **sing-box** | tolerance、idle_timeout、interrupt_connections |
 | Clash API + 外部 UI 下载 | **sing-box** clashapi | 最小 REST/WS 集合 |
-| 协议/传输细节 | **sing-box** + daeuniverse **outbound** | SS2022、AnyTLS 池、UoT v2、Hy2/TUIC/Juicity、h2mux |
+| 协议/传输细节 | **sing-box** + daeuniverse **outbound** | SS2022、AnyTLS 池、UoT v2、Hy2/TUIC/Juicity |
 
 ## 4. Crate 划分
 
@@ -251,12 +250,11 @@ warm-up 返回 `NotApplicable`，不会伪造成功。
 
 ### Handler（`honk-outbound`）
 
-已注册：Direct、Block、SOCKS5、Shadowsocks（含 2022）、SSR、Trojan、Trojan-Go、VMess、VLESS、Hysteria2、TUIC、Juicity、AnyTLS。
+已注册：Direct、Block、SOCKS5、Shadowsocks（含 2022）、Trojan、VMess、VLESS、Hysteria2、TUIC、Juicity、AnyTLS。
 
 共享层：
 
 - `transport.rs` — TCP → 可选 TLS → WS / gRPC
-- `mux.rs` — `node.mux = true` 时 h2mux（无 smux/yamux）
 - `quic.rs` — Hy2 / TUIC / Juicity 共用 quinn 客户端
 - `tls.rs` — BoringSSL TLS 与 Chrome 指纹辅助
 

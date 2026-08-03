@@ -171,9 +171,9 @@ experimental {
 
 节点在 `node { }` 中以**分享链接**声明，格式为 `tag: 'scheme://...'`（tag 即节点名），也接受不带 tag 的裸链接。单引号、双引号均可；解析失败的条目会在 stderr 打警告并跳过。
 
-解析支持的 scheme：`ss://`、`ssr://`、`socks5://`、`trojan://`、`trojan-go://`、`vmess://`、`vless://`、`hysteria2://`、`tuic://`、`juicity://`、`anytls://`、`http://`、`https://`。
+解析支持的 scheme：`ss://`、`socks5://`、`trojan://`、`vmess://`、`vless://`、`hysteria2://`、`tuic://`、`juicity://`、`anytls://`。
 
-分享链接中的参数会映射到 `Node` 字段：`name`、`protocol`、`address`/`host`、`port`、`password`/`username`、`encryption`、`tls`、`sni`、`transport`、`ws_path`、`ws_host`、`grpc_service`、`mux`，以及 Hy2/TUIC/Juicity/AnyTLS 专用字段。
+分享链接中的参数会映射到 `Node` 字段：`name`、`protocol`、`address`/`host`、`port`、`password`/`username`、`encryption`、`tls`、`sni`、`transport`、`ws_path`、`ws_host`、`grpc_service`，以及 Hy2/TUIC/Juicity/AnyTLS 专用字段。
 
 完整字段表与协议注意点（含 UDP 支持矩阵）见 [components.zh.md](./components.zh.md)。
 

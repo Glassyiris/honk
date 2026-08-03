@@ -106,7 +106,7 @@ The fields below are what a parsed node carries. In dae syntax they are **derive
 | `host` | string | `""` | Explicit host; else from `address` |
 | `port` | u16 | `0` | Server port |
 | `username` / `password` | string? | null | Auth / UUID / secret |
-| `encryption` | string? | null | SS/SSR/VMess cipher |
+| `encryption` | string? | null | SS/VMess cipher |
 | `plugin` / `plugin_opts` | string? | null | Plugin name/opts |
 | `transport` | string | `"tcp"` | `tcp` / `ws` / `grpc` / … (share-link `type=`/`net`) |
 | `tls` | bool | `false` | Enable TLS |
@@ -131,7 +131,6 @@ The fields below are what a parsed node carries. In dae syntax they are **derive
 | `anytls_min_idle_session` | usize? | 1 | Pool min idle sessions (`min_idle_session=`); default 1 keeps dials warm (0 = reap all idle sessions) |
 | `anytls_idle_session_check_interval` | u64? | null | Idle check period, s (`idle_session_check_interval=`) |
 | `anytls_idle_session_timeout` | u64? | null | Idle eviction, s (`idle_session_timeout=`) |
-| `mux` | bool | `false` | h2mux multiplexing; **not settable from a share link / dae syntax** |
 | `mark` | u32? | null | Outbound SO_MARK |
 | `tags` | string[] | `[]` | Labels |
 | `subscription_id` / `group_id` | UUID? | null | Ownership metadata |
@@ -144,13 +143,11 @@ The fields below are what a parsed node carries. In dae syntax they are **derive
 | Value | Aliases | TCP | UDP | Notes |
 | ------- | --------- | ----- | ----- | ------- |
 | `ss` | `shadowsocks` | Yes | Yes | AEAD + `2022-blake3-*` |
-| `ssr` | `shadowsocksr` | Yes | No | `origin` + limited obfs; advanced proto partial |
-| `trojan` | | Yes | Yes | TLS; WS/gRPC/h2mux via transport |
-| `trojan-go` | | Yes | No | Own mux path |
-| `vmess` | | Yes | No | AEAD; WS/gRPC/h2mux |
+| `trojan` | | Yes | Yes | TLS; WS/gRPC via transport |
+| `vmess` | | Yes | No | AEAD; WS/gRPC |
 | `vless` | | Yes | No | Header UDP exists in tests only |
 | `socks5` | | Yes | Yes | UDP ASSOCIATE |
-| `http` | | Yes* | — | Mapped through direct-style dial |
+| `http` | | Yes* | — | Reserved for the built-in `direct`/`block` markers; explicit http proxies are rejected at validation |
 | `hysteria2` | | Yes | Yes | Real QUIC/H3; salamander; brutal (with bandwidth) or BBR; port hopping |
 | `tuic` | | Yes | Yes | TUIC v5 / quinn |
 | `juicity` | | Yes | Yes | quinn bi-stream UDP |
@@ -175,8 +172,6 @@ node {
     trojan_grpc: 'trojan://secret@example.com:443?type=grpc&serviceName=GunService#trojan_grpc'
 }
 ```
-
-`mux = true` (h2mux) exists in the node schema but cannot be expressed in dae syntax today.
 
 ### TLS fingerprint and ECH
 
@@ -222,12 +217,11 @@ node {
 | Scheme | Notes |
 | -------- | ------- |
 | `ss://` | SIP002 |
-| `ssr://` | base64 parameter blob |
 | `vmess://` | base64 JSON (v2rayN) |
-| `vless://` / `trojan://` / `trojan-go://` | query params for transport/TLS |
+| `vless://` / `trojan://` | query params for transport/TLS |
 | `anytls://` | pool params in query |
 | `hysteria2://` / `tuic://` / `juicity://` | QUIC family |
-| `socks5://` / `http://` / `https://` | simple |
+| `socks5://` | simple |
 
 Chain `a -> b` parses **first hop only**. Name from `#fragment` or `{scheme}-{host}`.
 

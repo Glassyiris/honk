@@ -15,7 +15,6 @@
 
 - Full Clash Meta / mihomo feature parity (FakeIP engine and remote rule-sets).
 - REALITY protocol support (deferred). Chrome-style TLS fingerprints are implemented through BoringSSL rather than a production rustls path.
-- Official sing-box multiplex inbound interop for h2mux (framing is sing-mux-like; inner stream handshake differs).
 - Windows / macOS transparent proxy.
 
 ## 3. Inspiration map
@@ -30,7 +29,7 @@
 | Group policies & nested outbounds | **sing-box** | Selector / URLTest / LB / Fallback, RealTag-style chain |
 | TCP/UDP separate URLTest picks | **sing-box** | Tolerance, idle_timeout, interrupt_connections |
 | Clash API + external UI download | **sing-box** clashapi | Minimal REST/WS set |
-| Protocol/transport details | **sing-box** + daeuniverse **outbound** | SS2022, AnyTLS pool, UoT v2, Hy2/TUIC/Juicity, h2mux |
+| Protocol/transport details | **sing-box** + daeuniverse **outbound** | SS2022, AnyTLS pool, UoT v2, Hy2/TUIC/Juicity |
 
 ## 4. Crate layout
 
@@ -265,12 +264,11 @@ currently deferred QUIC warm-up return `NotApplicable`, not a false success.
 
 ### Handlers (`honk-outbound`)
 
-Registered protocols: Direct, Block, SOCKS5, Shadowsocks (+ 2022), SSR, Trojan, Trojan-Go, VMess, VLESS, Hysteria2, TUIC, Juicity, AnyTLS.
+Registered protocols: Direct, Block, SOCKS5, Shadowsocks (+ 2022), Trojan, VMess, VLESS, Hysteria2, TUIC, Juicity, AnyTLS.
 
 Shared layers:
 
 - `transport.rs` — TCP → optional TLS → WS / gRPC
-- `mux.rs` — h2mux when `node.mux = true` (not smux/yamux)
 - `quic.rs` — shared quinn client for Hy2 / TUIC / Juicity
 - `tls.rs` — BoringSSL TLS and Chrome-fingerprint helpers
 

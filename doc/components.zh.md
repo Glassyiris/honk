@@ -76,7 +76,7 @@ dae 语法中节点**只能以分享链接书写**：`tag: 'scheme://...'` 或�
 | `host` | string | `""` | 显式主机；否则从 `address` 取 |
 | `port` | u16 | `0` | 服务端口 |
 | `username` / `password` | string? | null | 认证 / UUID / 密钥；链接 userinfo |
-| `encryption` | string? | null | SS/SSR/VMess 加密 |
+| `encryption` | string? | null | SS/VMess 加密 |
 | `plugin` / `plugin_opts` | string? | null | 插件名/参数；链接 `plugin` / `plugin-opts` |
 | `transport` | string | `"tcp"` | `tcp` / `ws` / `grpc` / …；链接 `type`（或 `network`）参数 |
 | `tls` | bool | `false` | 启用 TLS；trojan/vless/anytls 等链接自动开启 |
@@ -101,7 +101,6 @@ dae 语法中节点**只能以分享链接书写**：`tag: 'scheme://...'` 或�
 | `anytls_min_idle_session` | usize? | 1 | 池最小空闲会话；链接 `min_idle_session`。默认 1 保持拨号热度（0 = 回收全部空闲会话） |
 | `anytls_idle_session_check_interval` | u64? | null | 空闲检查周期（秒）；链接 `idle_session_check_interval` |
 | `anytls_idle_session_timeout` | u64? | null | 空闲驱逐（秒）；链接 `idle_session_timeout` |
-| `mux` | bool | `false` | h2mux 多路复用（结构化模型字段，分享链接 / dae 语法无对应参数） |
 | `mark` | u32? | null | 出站 SO_MARK（结构化模型字段，dae 语法无对应键） |
 | `tags` | string[] | `[]` | 标签（结构化模型字段，dae 语法无对应键） |
 | `subscription_id` / `group_id` | UUID? | null | 归属元数据（运行时填充） |
@@ -114,13 +113,11 @@ dae 语法中节点**只能以分享链接书写**：`tag: 'scheme://...'` 或�
 | 取值 | 别名 | TCP | UDP | 说明 |
 | ------ | ------ | ----- | ----- | ------ |
 | `ss` | `shadowsocks` | 是 | 是 | AEAD + `2022-blake3-*` |
-| `ssr` | `shadowsocksr` | 是 | 否 | `origin` + 有限 obfs；高级 proto 部分实现 |
-| `trojan` | | 是 | 是 | TLS；经 transport 支持 WS/gRPC/h2mux |
-| `trojan-go` | | 是 | 否 | 自有 mux 路径 |
-| `vmess` | | 是 | 否 | AEAD；WS/gRPC/h2mux |
+| `trojan` | | 是 | 是 | TLS；经 transport 支持 WS/gRPC |
+| `vmess` | | 是 | 否 | AEAD；WS/gRPC |
 | `vless` | | 是 | 否 | 头里的 UDP 仅测试存在 |
 | `socks5` | | 是 | 是 | UDP ASSOCIATE |
-| `http` | | 是* | — | 走类似 direct 的拨号 |
+| `http` | | 是* | — | 仅保留为内置 `direct`/`block` 的标记；显式 http 代理在校验时拒绝 |
 | `hysteria2` | | 是 | 是 | 真实 QUIC/H3；salamander；brutal（配带宽时）或 BBR；端口跳跃 |
 | `tuic` | | 是 | 是 | TUIC v5 / quinn |
 | `juicity` | | 是 | 是 | quinn 双向流 UDP |
@@ -145,8 +142,6 @@ node {
     my_grpc: 'trojan://password@example.com:443?type=grpc&serviceName=GunService&sni=example.com#my_grpc'
 }
 ```
-
-注意：`mux`（h2mux）没有对应的分享链接参数，dae 语法下无法开启。
 
 ### TLS 指纹与 ECH
 
@@ -190,12 +185,11 @@ node {
 | Scheme | 说明 |
 | -------- | ------ |
 | `ss://` | SIP002 |
-| `ssr://` | base64 参数 blob |
 | `vmess://` | base64 JSON（v2rayN） |
-| `vless://` / `trojan://` / `trojan-go://` | query 传 transport/TLS |
+| `vless://` / `trojan://` | query 传 transport/TLS |
 | `anytls://` | query 中的池参数 |
 | `hysteria2://` / `tuic://` / `juicity://` | QUIC 族 |
-| `socks5://` / `http://` / `https://` | 简单代理 |
+| `socks5://` | 简单代理 |
 
 链式 `a -> b` **只解析第一跳**。名称来自 `#fragment` 或 `{scheme}-{host}`。
 

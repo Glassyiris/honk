@@ -86,7 +86,7 @@ honk 沿用 dae 的内核模型，但并非移植。主要不同点：
 #### 配置与路由（用户态）
 
 - [x] dae 语法加载、include/glob 组合与校验
-- [x] 分享链接解析（ss/ssr/vmess/vless/trojan/anytls/hy2/tuic/juicity/…）
+- [x] 分享链接解析（ss/vmess/vless/trojan/anytls/hy2/tuic/juicity/…）
 - [x] 用户态 `Router`（域名/IP/端口/协议/进程/MAC/geosite/geoip）
 - [x] TCP 嗅探（TLS SNI、HTTP Host）；QUIC Initial SNI 解密
 - [x] 拨号模式 `ip` / `domain` / `domain+` / `domain++`
@@ -94,8 +94,8 @@ honk 沿用 dae 的内核模型，但并非移植。主要不同点：
 
 #### 出站与组
 
-- [x] Handler：Direct、Block、SOCKS5、SS（含 2022）、SSR、Trojan、Trojan-Go、VMess、VLESS、Hysteria2、TUIC、Juicity、AnyTLS
-- [x] 共享传输层（TLS/WS/gRPC）+ h2mux（`node.mux`）
+- [x] Handler：Direct、Block、SOCKS5、SS（含 2022）、Trojan、VMess、VLESS、Hysteria2、TUIC、Juicity、AnyTLS
+- [x] 共享传输层（TLS/WS/gRPC）
 - [x] 组：Selector / URLTest / LoadBalance / Fallback + 嵌套组
 - [x] URLTest：tolerance、TCP/UDP 独立选择、idle_timeout、interrupt_connections
 - [x] `AliveDialerSet`：并发探测、恢复滞后、TCP+UDP 探测、推送 eBPF
@@ -116,9 +116,8 @@ honk 沿用 dae 的内核模型，但并非移植。主要不同点：
 
 ### TODO
 
-- [ ] VMess / VLESS / SSR / Trojan-Go 的 UDP 中继
+- [ ] VMess / VLESS 的 UDP 中继
 - [ ] REALITY + uTLS（**已延期** — rustls 缺成熟 hook）
-- [ ] smux/yamux；h2mux 与官方 sing-box multiplex inbound 的验证互通
 - [x] 真正的 DoT/DoH/DoQ/DoH3 上游（TLS/H2/QUIC 会话复用）
 - [x] Hysteria2 brutal（上下行 Mbps）、端口跳跃（`mport`/`mhop`）、`pinSHA256`、QUIC 接收窗口/PMTUD 参数；已对官方服务器实测验证
 - [ ] Hysteria2 残留：`maxStreamReceiveWindow`/`maxConnReceiveWindow`（quinn 无自动调窗对应）、`fastOpen`、UDP 会话/连接空闲超时可配（当前硬编码 90s/120s）

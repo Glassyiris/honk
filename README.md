@@ -57,7 +57,7 @@ Status reflects the current tree and unit/integration tests. Prefer re-running `
 #### Config & routing (userspace)
 
 - [x] dae syntax load, include/glob composition & validate
-- [x] Share-link parse (ss/ssr/vmess/vless/trojan/anytls/hy2/tuic/juicity/…)
+- [x] Share-link parse (ss/vmess/vless/trojan/anytls/hy2/tuic/juicity/…)
 - [x] Userspace `Router` (domain/IP/port/proto/process/MAC/geosite/geoip)
 - [x] TCP sniff (TLS SNI, HTTP Host); QUIC Initial SNI decrypt
 - [x] Dial modes `ip` / `domain` / `domain+` / `domain++`
@@ -65,8 +65,8 @@ Status reflects the current tree and unit/integration tests. Prefer re-running `
 
 #### Outbound & groups
 
-- [x] Handlers: Direct, Block, SOCKS5, SS(+2022), SSR, Trojan, Trojan-Go, VMess, VLESS, Hysteria2, TUIC, Juicity, AnyTLS
-- [x] Shared transport (TLS/WS/gRPC) + h2mux (`node.mux`)
+- [x] Handlers: Direct, Block, SOCKS5, SS(+2022), Trojan, VMess, VLESS, Hysteria2, TUIC, Juicity, AnyTLS
+- [x] Shared transport (TLS/WS/gRPC)
 - [x] Groups: Selector / URLTest / LoadBalance / Fallback + nested groups
 - [x] URLTest: tolerance, separate TCP/UDP picks, idle_timeout, interrupt_connections
 - [x] `AliveDialerSet`: concurrent probes, hysteresis, TCP+UDP probes, eBPF push
@@ -77,16 +77,15 @@ Status reflects the current tree and unit/integration tests. Prefer re-running `
 - [x] ebpf pat
 - [x] control plan
 - [x] anytls / trojan / juicity /socks5
-- [ ] ss/ ssr/ vless/ vmess/ tuic
+- [ ] ss/ vless/ vmess/ tuic
 - [ ] dns logic
 - [x] ech
 - [ ] quic
 
 ### TODO
 
-- [ ] UDP relay for VMess / VLESS / SSR / Trojan-Go
+- [ ] UDP relay for VMess / VLESS
 - [ ] REALITY + uTLS (**deferred** — no mature rustls hooks)
-- [ ] smux/yamux; verified h2mux interop with official sing-box multiplex inbounds
 - [x] Real DoT/DoH/DoQ/DoH3 upstreams (pooled TLS/H2/QUIC sessions)
 - [x] Hysteria2 brutal (up/down Mbps), port hopping (`mport`/`mhop`), `pinSHA256`, QUIC receive-window/PMTUD knobs; live-verified against the official server
 - [ ] Hysteria2 residue: `maxStreamReceiveWindow`/`maxConnReceiveWindow` (no quinn autotuning equivalent), `fastOpen`, configurable UDP-session/connection idle timeouts (hardcoded 90s/120s)

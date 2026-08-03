@@ -194,9 +194,9 @@ node {
 }
 ```
 
-Supported schemes (parser): `ss://`, `ssr://`, `socks5://`, `trojan://`, `trojan-go://`, `vmess://`, `vless://`, `hysteria2://`, `tuic://`, `juicity://`, `anytls://`, `http://`, `https://`.
+Supported schemes (parser): `ss://`, `socks5://`, `trojan://`, `vmess://`, `vless://`, `hysteria2://`, `tuic://`, `juicity://`, `anytls://`.
 
-Node parameters (credentials, `sni`, transport/ws/grpc options, `mux`, protocol-specific Hy2/TUIC/Juicity/AnyTLS options) are carried by the share link's userinfo/host/query components — the same fields the `Node` model exposes (`name`, `protocol`, `address`/`host`, `port`, `password`/`username`, `encryption`, `tls`, `sni`, `transport`, `ws_path`, `ws_host`, `grpc_service`, `mux`, ...). An explicit `tag:` prefix overrides the name embedded in the link.
+Node parameters (credentials, `sni`, transport/ws/grpc options, protocol-specific Hy2/TUIC/Juicity/AnyTLS options) are carried by the share link's userinfo/host/query components — the same fields the `Node` model exposes (`name`, `protocol`, `address`/`host`, `port`, `password`/`username`, `encryption`, `tls`, `sni`, `transport`, `ws_path`, `ws_host`, `grpc_service`, ...). An explicit `tag:` prefix overrides the name embedded in the link.
 
 See [components.en.md](./components.en.md) for the full field table and protocol notes (including UDP support matrix).
 
