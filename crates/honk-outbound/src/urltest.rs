@@ -102,7 +102,7 @@ pub async fn urltest_node(
     // the same target the periodic direct probe uses. A failed exchange
     // here previously also cleared direct's latency history (sing-box
     // delete-on-failure), leaving dashboards with no direct delay at all.
-    if node.name == honk_config::Config::BUILTIN_DIRECT_NODE {
+    if node.protocol == honk_config::types::NodeProtocol::Direct {
         let target = direct_target();
         let start = Instant::now();
         tokio::time::timeout(
@@ -441,7 +441,7 @@ mod tests {
     #[async_trait::async_trait]
     impl ProxyHandler for MockHandler {
         fn protocol(&self) -> NodeProtocol {
-            NodeProtocol::HTTP
+            NodeProtocol::Socks5
         }
 
         async fn dial(
@@ -471,7 +471,7 @@ mod tests {
         Node {
             id: uuid::Uuid::new_v4(),
             name: name.into(),
-            protocol: NodeProtocol::HTTP,
+            protocol: NodeProtocol::Socks5,
             ..Default::default()
         }
     }
@@ -683,6 +683,7 @@ mod direct_urltest_tests {
         set_urltest_direct_target(addr);
         let node = Node {
             name: honk_config::Config::BUILTIN_DIRECT_NODE.to_string(),
+            protocol: honk_config::types::NodeProtocol::Direct,
             ..Default::default()
         };
         let handler = crate::proxy::direct::DirectHandler::new();

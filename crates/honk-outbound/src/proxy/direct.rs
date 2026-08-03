@@ -28,9 +28,7 @@ impl DirectHandler {
 #[async_trait]
 impl ProxyHandler for DirectHandler {
     fn protocol(&self) -> NodeProtocol {
-        // Direct isn't really a protocol, but we use it as one for the routing system
-        // We map it to HTTP since that's the closest "raw" protocol
-        NodeProtocol::HTTP
+        NodeProtocol::Direct
     }
 
     async fn dial(

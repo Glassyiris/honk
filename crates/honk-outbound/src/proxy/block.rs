@@ -30,7 +30,7 @@ impl BlockHandler {
 #[async_trait]
 impl ProxyHandler for BlockHandler {
     fn protocol(&self) -> NodeProtocol {
-        NodeProtocol::HTTP // reused as a "block" protocol marker
+        NodeProtocol::Block
     }
 
     async fn dial(

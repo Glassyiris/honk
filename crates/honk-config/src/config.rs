@@ -7,6 +7,12 @@ use crate::node::Node;
 use crate::routing::RoutingConfig;
 use crate::subscription::Subscription;
 
+/// Stable identity of the built-in `direct` node across reloads and restarts.
+pub const DIRECT_NODE_ID: uuid::Uuid =
+    uuid::Uuid::from_u128(0x00000000_0000_4000_8000_00000000d1ec);
+/// Stable identity of the built-in `block` node across reloads and restarts.
+pub const BLOCK_NODE_ID: uuid::Uuid = uuid::Uuid::from_u128(0x00000000_0000_4000_8000_00000000b10c);
+
 /// Main honk configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
@@ -317,27 +323,59 @@ impl Config {
     /// The built-in `direct` node name (usable as a group member without
     /// being declared in the config).
     pub const BUILTIN_DIRECT_NODE: &'static str = "direct";
+    /// The built-in `block` node name.
+    pub const BUILTIN_BLOCK_NODE: &'static str = "block";
 
-    /// Inject the built-in `direct` node unless the config already defines a
-    /// node with that name. Idempotent.
+    /// Inject the built-in `direct`/`block` nodes unless the config already
+    /// defines nodes with those names. Idempotent.
     ///
-    /// This makes `direct` a first-class group member (Selector/urltest
-    /// candidate, delay-test target) without a placeholder `http://` node in
-    /// the config file. The node maps to `DirectHandler` via the HTTP
-    /// protocol; its address fields are unused.
+    /// This makes both built-ins first-class group members (Selector/urltest
+    /// candidates, delay-test targets) without declaring them in the config
+    /// file; their address fields are unused.
     pub fn ensure_builtin_nodes(&mut self) {
-        if self
-            .nodes
-            .iter()
-            .any(|n| n.name == Self::BUILTIN_DIRECT_NODE)
-        {
-            return;
+        for builtin in [Self::builtin_direct_node(), Self::builtin_block_node()] {
+            if !self.nodes.iter().any(|n| n.name == builtin.name) {
+                self.nodes.push(builtin);
+            }
         }
-        self.nodes.push(crate::node::Node {
+    }
+
+    /// The built-in node registered under `name`, falling back to a fresh
+    /// built-in definition when [`Self::ensure_builtin_nodes`] has not run.
+    /// `None` for any non-built-in name.
+    pub fn builtin_node(&self, name: &str) -> Option<crate::node::Node> {
+        let fresh = match name {
+            Self::BUILTIN_DIRECT_NODE => Self::builtin_direct_node(),
+            Self::BUILTIN_BLOCK_NODE => Self::builtin_block_node(),
+            _ => return None,
+        };
+        Some(
+            self.nodes
+                .iter()
+                .find(|n| n.name == name)
+                .cloned()
+                .unwrap_or(fresh),
+        )
+    }
+
+    /// A fresh built-in `direct` node definition.
+    pub fn builtin_direct_node() -> crate::node::Node {
+        crate::node::Node {
+            id: DIRECT_NODE_ID,
             name: Self::BUILTIN_DIRECT_NODE.to_string(),
-            protocol: crate::types::NodeProtocol::HTTP,
+            protocol: crate::types::NodeProtocol::Direct,
             ..Default::default()
-        });
+        }
+    }
+
+    /// A fresh built-in `block` node definition.
+    pub fn builtin_block_node() -> crate::node::Node {
+        crate::node::Node {
+            id: BLOCK_NODE_ID,
+            name: Self::BUILTIN_BLOCK_NODE.to_string(),
+            protocol: crate::types::NodeProtocol::Block,
+            ..Default::default()
+        }
     }
 
     /// Inject must-direct routing rules for every address assigned to the
@@ -450,6 +488,10 @@ impl Config {
             )));
         }
         for node in &self.nodes {
+            // The injected built-ins carry no dialable address by design.
+            if node.id == DIRECT_NODE_ID || node.id == BLOCK_NODE_ID {
+                continue;
+            }
             if node.name.is_empty() {
                 return Err(crate::ConfigError::Validation(
                     "Node name cannot be empty".into(),
@@ -469,14 +511,17 @@ impl Config {
                     node.name, node.transport
                 )));
             }
-            // The HTTP protocol variant survives only as the internal marker
-            // of the built-in direct/block nodes; explicit http proxies are
-            // no longer supported.
-            if node.protocol == crate::types::NodeProtocol::HTTP
-                && !matches!(node.name.as_str(), "direct" | "block")
-            {
+            // direct/block are the injected built-ins; a user node may
+            // neither take their names nor their protocols.
+            if matches!(
+                node.name.as_str(),
+                Self::BUILTIN_DIRECT_NODE | Self::BUILTIN_BLOCK_NODE
+            ) || matches!(
+                node.protocol,
+                crate::types::NodeProtocol::Direct | crate::types::NodeProtocol::Block
+            ) {
                 return Err(crate::ConfigError::Validation(format!(
-                    "Node '{}': the http proxy protocol is no longer supported",
+                    "Node '{}' uses a name or protocol reserved for the built-in direct/block nodes",
                     node.name
                 )));
             }
@@ -527,51 +572,59 @@ mod builtin_nodes_tests {
     }
 
     #[test]
-    fn test_validate_rejects_explicit_http_node() {
-        let mut config = Config::default();
-        config.nodes.push(crate::node::Node {
-            name: "web-proxy".into(),
-            address: "1.2.3.4:8080".into(),
-            protocol: crate::types::NodeProtocol::HTTP,
-            ..Default::default()
-        });
-        let err = config.validate().unwrap_err();
-        assert!(
-            err.to_string().contains("http proxy protocol"),
-            "explicit http nodes must be rejected: {err}"
-        );
-        for builtin in ["direct", "block"] {
-            config.nodes[0].name = builtin.into();
+    fn test_validate_rejects_reserved_builtin_names_and_protocols() {
+        for (name, protocol) in [
+            ("direct", crate::types::NodeProtocol::Socks5),
+            ("block", crate::types::NodeProtocol::Socks5),
+            ("web-proxy", crate::types::NodeProtocol::Direct),
+            ("web-proxy", crate::types::NodeProtocol::Block),
+        ] {
+            let mut config = Config::default();
+            config.nodes.push(crate::node::Node {
+                name: name.into(),
+                address: "1.2.3.4:8080".into(),
+                protocol,
+                ..Default::default()
+            });
+            let err = config.validate().unwrap_err();
             assert!(
-                config.validate().is_ok(),
-                "built-in '{builtin}' keeps the HTTP marker"
+                err.to_string().contains("reserved for the built-in"),
+                "{name}/{protocol:?} must be rejected: {err}"
             );
         }
     }
 
     #[test]
-    fn test_ensure_builtin_nodes_injects_direct_once() {
+    fn test_ensure_builtin_nodes_injects_direct_and_block_once() {
         let mut config = Config::default();
         assert!(!config.nodes.iter().any(|n| n.name == "direct"));
         config.ensure_builtin_nodes();
-        assert_eq!(config.nodes.len(), 1);
+        assert_eq!(config.nodes.len(), 2);
         assert_eq!(config.nodes[0].name, "direct");
-        assert_eq!(config.nodes[0].protocol, crate::types::NodeProtocol::HTTP);
+        assert_eq!(config.nodes[0].id, DIRECT_NODE_ID);
+        assert_eq!(config.nodes[0].protocol, crate::types::NodeProtocol::Direct);
+        assert_eq!(config.nodes[1].name, "block");
+        assert_eq!(config.nodes[1].id, BLOCK_NODE_ID);
+        assert_eq!(config.nodes[1].protocol, crate::types::NodeProtocol::Block);
         config.ensure_builtin_nodes();
-        assert_eq!(config.nodes.len(), 1);
+        assert_eq!(config.nodes.len(), 2);
+        assert!(config.validate().is_ok(), "built-ins stay valid");
     }
 
     #[test]
-    fn test_ensure_builtin_nodes_respects_user_defined() {
+    fn test_builtin_node_resolves_registered_or_fresh() {
         let mut config = Config::default();
-        config.nodes.push(crate::node::Node {
-            name: "direct".into(),
-            host: "custom.example.com".into(),
-            ..Default::default()
-        });
-        config.ensure_builtin_nodes();
-        assert_eq!(config.nodes.len(), 1);
-        assert_eq!(config.nodes[0].host, "custom.example.com");
+        let fresh = config.builtin_node("direct").unwrap();
+        assert_eq!(fresh.id, DIRECT_NODE_ID);
+        assert!(config.builtin_node("proxy").is_none());
+        let mut registered = Config::builtin_block_node();
+        registered.subscription_id = Some(uuid::Uuid::new_v4());
+        config.nodes.push(registered.clone());
+        assert_eq!(
+            config.builtin_node("block").unwrap().subscription_id,
+            registered.subscription_id,
+            "a registered built-in wins over the fresh definition"
+        );
     }
 
     #[test]

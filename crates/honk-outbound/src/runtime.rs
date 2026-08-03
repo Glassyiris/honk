@@ -42,7 +42,7 @@ impl OutboundCapabilities {
     pub fn for_node(node: &Node) -> Self {
         // UDP support matrix (verified): direct, socks5, shadowsocks
         // (+2022), trojan, hysteria2, anytls, tuic, juicity. Not vmess,
-        // vless.
+        // vless, block.
         let udp = matches!(
             node.protocol,
             NodeProtocol::Socks5
@@ -52,7 +52,8 @@ impl OutboundCapabilities {
                 | NodeProtocol::AnyTLS
                 | NodeProtocol::Tuic
                 | NodeProtocol::Juicity
-        ) || (node.protocol == NodeProtocol::HTTP && node.name == "direct");
+                | NodeProtocol::Direct
+        );
         Self {
             tcp: true,
             udp,

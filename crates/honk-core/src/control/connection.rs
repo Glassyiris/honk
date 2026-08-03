@@ -2,6 +2,7 @@ use super::udp_dial::{UdpPrepare, UdpStaggerCallbacks, prepare_udp_plan};
 use super::*;
 use crate::control::udp_endpoint::{UdpEndpoint, UdpInitLease};
 use crate::group::SelectionPlanMode;
+use honk_config::types::NodeProtocol;
 
 /// Result from the eBPF routing handoff map lookup.
 #[derive(Debug, Clone)]
@@ -569,18 +570,17 @@ impl ControlPlaneHandle {
         // (ATYP_DOMAIN). They resolve the domain on the proxy server side, so
         // client-side DNS is unnecessary. Direct/block use the original_dst IP
         // directly — no DNS needed.
-        let all_domain_capable = outbound_name == "direct"
-            || outbound_name == "block"
-            || candidates.iter().all(|node| {
-                use honk_config::types::NodeProtocol;
-                matches!(
-                    node.protocol,
-                    NodeProtocol::Socks5
-                        | NodeProtocol::Trojan
-                        | NodeProtocol::SS
-                        | NodeProtocol::AnyTLS
-                )
-            });
+        let all_domain_capable = candidates.iter().all(|node| {
+            matches!(
+                node.protocol,
+                NodeProtocol::Direct
+                    | NodeProtocol::Block
+                    | NodeProtocol::Socks5
+                    | NodeProtocol::Trojan
+                    | NodeProtocol::SS
+                    | NodeProtocol::AnyTLS
+            )
+        });
 
         // Resolve the target IP for dialing. Pass the sniffed domain to the
         // proxy when available (used for domain-based routing in SOCKS5 etc.).
@@ -684,11 +684,12 @@ impl ControlPlaneHandle {
                     // Built-in direct/block dials are local connects bounded
                     // by the connection admission limit; dead direct peers
                     // must not starve the proxied-dial budget.
-                    let _dial_permit = if node.name == "direct" || node.name == "block" {
-                        None
-                    } else {
-                        Some(ConnectionPool::acquire_dial_permit().await)
-                    };
+                    let _dial_permit =
+                        if matches!(node.protocol, NodeProtocol::Direct | NodeProtocol::Block) {
+                            None
+                        } else {
+                            Some(ConnectionPool::acquire_dial_permit().await)
+                        };
                     let result = tokio::time::timeout(
                         per_dial_timeout,
                         Self::dial_pooled(
@@ -1665,15 +1666,6 @@ impl ControlPlaneHandle {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<crate::proxy::ProxyStream> {
-        // The built-in block node shares NodeProtocol::HTTP with direct;
-        // reject here before find() resolves it to DirectHandler (and before
-        // any pool lookup under its meaningless ":0" address).
-        if node.name == "block" {
-            use crate::proxy::ProxyHandler as _;
-            return crate::proxy::block::BlockHandler::new()
-                .dial(node, target, target_domain, connect_timeout)
-                .await;
-        }
         static POOL_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let pool_disabled = *POOL_DISABLED.get_or_init(|| {
             std::env::var("HONK_POOL_DISABLE")

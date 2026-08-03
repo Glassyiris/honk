@@ -70,7 +70,7 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
             // sidesteps local DNS poisoning (a poisoned system answer turns
             // every check into an "empty HTTP response" from a black hole).
             // `direct` keeps the pre-resolved IP — its reality IS local DNS.
-            let domain = if node.name == "direct" {
+            let domain = if node.protocol == honk_config::types::NodeProtocol::Direct {
                 None
             } else {
                 url_host(&check_url)

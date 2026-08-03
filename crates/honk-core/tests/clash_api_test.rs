@@ -31,7 +31,7 @@ fn make_node(name: &str) -> Node {
     Node {
         id: uuid::Uuid::new_v4(),
         name: name.into(),
-        protocol: NodeProtocol::HTTP, // direct-class handler in the registry
+        protocol: NodeProtocol::Socks5,
         address: "127.0.0.1".into(),
         port: 1,
         ..Default::default()
@@ -1173,7 +1173,7 @@ async fn test_proxy_providers_structure() {
     let proxies = provider["proxies"].as_array().unwrap();
     assert_eq!(proxies.len(), 2);
     assert_eq!(proxies[0]["name"], "node-a");
-    assert_eq!(proxies[0]["type"], "Http");
+    assert_eq!(proxies[0]["type"], "Socks5");
     assert_eq!(proxies[0]["udp"], true);
     assert_eq!(proxies[1]["name"], "node-b");
 

@@ -484,14 +484,6 @@ impl ProxyRegistry {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
-        // The built-in direct/block nodes share NodeProtocol::HTTP, and
-        // find() returns the first protocol match (DirectHandler) — dispatch
-        // block by name so routed block traffic is actually rejected.
-        if node.name == "block" {
-            return BlockHandler::new()
-                .dial(node, target, target_domain, connect_timeout)
-                .await;
-        }
         let handler = self
             .find(node.protocol)
             .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", node.protocol))?;
@@ -518,11 +510,6 @@ impl ProxyRegistry {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
-        if runtime.node.name == "block" {
-            return BlockHandler::new()
-                .dial_runtime(runtime, target, target_domain, connect_timeout)
-                .await;
-        }
         let handler = self.find(runtime.node.protocol).ok_or_else(|| {
             anyhow::anyhow!("No handler for protocol {:?}", runtime.node.protocol)
         })?;
@@ -538,13 +525,6 @@ impl ProxyRegistry {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<UdpProxySocket> {
-        // See dial(): the block built-in must not fall through to
-        // DirectHandler via the shared NodeProtocol::HTTP marker.
-        if node.name == "block" {
-            return BlockHandler::new()
-                .dial_udp(node, target, target_domain, connect_timeout)
-                .await;
-        }
         let handler = self
             .find(node.protocol)
             .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", node.protocol))?;
@@ -596,11 +576,6 @@ impl ProxyRegistry {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        if node.name == "block" {
-            return BlockHandler::new()
-                .dial_udp_transport(node, target, target_domain, connect_timeout)
-                .await;
-        }
         let handler = self
             .find(node.protocol)
             .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", node.protocol))?;
@@ -627,23 +602,12 @@ impl ProxyRegistry {
         let runtime = generation
             .get(&node_id)
             .ok_or_else(|| anyhow::anyhow!("node {node_id} is not in runtime generation"))?;
-        let transport = if runtime.node.name == "block" {
-            BlockHandler::new()
-                .dial_udp_transport_runtime(
-                    Arc::clone(&runtime),
-                    target,
-                    target_domain,
-                    connect_timeout,
-                )
-                .await?
-        } else {
-            let handler = self.find(runtime.node.protocol).ok_or_else(|| {
-                anyhow::anyhow!("No handler for protocol {:?}", runtime.node.protocol)
-            })?;
-            handler
-                .dial_udp_transport_runtime(runtime, target, target_domain, connect_timeout)
-                .await?
-        };
+        let handler = self.find(runtime.node.protocol).ok_or_else(|| {
+            anyhow::anyhow!("No handler for protocol {:?}", runtime.node.protocol)
+        })?;
+        let transport = handler
+            .dial_udp_transport_runtime(runtime, target, target_domain, connect_timeout)
+            .await?;
         if generation.is_shutdown() {
             anyhow::bail!("outbound runtime generation shut down during UDP dial");
         }
@@ -667,28 +631,12 @@ impl ProxyRegistry {
         let runtime = generation
             .get(&node_id)
             .ok_or_else(|| anyhow::anyhow!("node {node_id} is not in runtime generation"))?;
-        let prepared = if runtime.node.name == "block" {
-            BlockHandler::new()
-                .dial_udp_transport_speculative_runtime(
-                    Arc::clone(&runtime),
-                    target,
-                    target_domain,
-                    connect_timeout,
-                )
-                .await?
-        } else {
-            let handler = self.find(runtime.node.protocol).ok_or_else(|| {
-                anyhow::anyhow!("No handler for protocol {:?}", runtime.node.protocol)
-            })?;
-            handler
-                .dial_udp_transport_speculative_runtime(
-                    runtime,
-                    target,
-                    target_domain,
-                    connect_timeout,
-                )
-                .await?
-        };
+        let handler = self.find(runtime.node.protocol).ok_or_else(|| {
+            anyhow::anyhow!("No handler for protocol {:?}", runtime.node.protocol)
+        })?;
+        let prepared = handler
+            .dial_udp_transport_speculative_runtime(runtime, target, target_domain, connect_timeout)
+            .await?;
         if generation.is_shutdown() {
             anyhow::bail!("outbound runtime generation shut down during UDP preparation");
         }
@@ -722,7 +670,8 @@ mod tests {
         let registry = ProxyRegistry::default_resolver().unwrap();
         assert!(registry.handler_count() >= 4);
         assert!(registry.find(NodeProtocol::Socks5).is_some());
-        assert!(registry.find(NodeProtocol::HTTP).is_some()); // HTTP uses DirectHandler
+        assert!(registry.find(NodeProtocol::Direct).is_some());
+        assert!(registry.find(NodeProtocol::Block).is_some());
         assert!(registry.find(NodeProtocol::Trojan).is_some());
         assert!(registry.find(NodeProtocol::SS).is_some());
         assert!(registry.find(NodeProtocol::AnyTLS).is_some());
@@ -732,16 +681,15 @@ mod tests {
         assert!(registry.find(NodeProtocol::Juicity).is_some());
     }
 
-    /// The built-in direct/block nodes both carry NodeProtocol::HTTP; the
-    /// registry must dispatch "block" by name to BlockHandler instead of
-    /// falling through to DirectHandler (regression: block rules silently
-    /// dialed direct).
+    /// The built-in block node carries NodeProtocol::Block; the registry must
+    /// dispatch it to BlockHandler (regression: block rules silently dialed
+    /// direct when block shared direct's protocol marker).
     #[tokio::test]
     async fn test_block_node_dispatches_to_block_handler() {
         let registry = ProxyRegistry::default_resolver().unwrap();
         let node = Node {
             name: "block".into(),
-            protocol: NodeProtocol::HTTP,
+            protocol: NodeProtocol::Block,
             ..Default::default()
         };
         let target: SocketAddr = "10.0.0.1:80".parse().unwrap();
@@ -808,7 +756,7 @@ mod tests {
     async fn warm_udp_is_not_applicable_for_handlers_without_reusable_sessions() {
         let mut nodes = Vec::new();
         for (name, protocol) in [
-            ("direct", NodeProtocol::HTTP),
+            ("direct", NodeProtocol::Direct),
             ("socks", NodeProtocol::Socks5),
             ("ss", NodeProtocol::SS),
             ("trojan", NodeProtocol::Trojan),
@@ -860,7 +808,7 @@ mod tests {
     async fn speculative_udp_rejects_a_shutdown_generation_before_dispatch() {
         let node = Node {
             name: "direct".into(),
-            protocol: NodeProtocol::HTTP,
+            protocol: NodeProtocol::Direct,
             ..Default::default()
         };
         let generation = Arc::new(

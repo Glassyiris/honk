@@ -563,7 +563,11 @@ pub(super) fn udp_warm_candidates(
                 leaves = group_manager.ranked_udp_leaves(&final_name, ipver, per_group);
             }
             for node in leaves {
-                if node.name == "direct" || node.name == "block" {
+                if matches!(
+                    node.protocol,
+                    honk_config::types::NodeProtocol::Direct
+                        | honk_config::types::NodeProtocol::Block
+                ) {
                     continue;
                 }
                 if !configured_ids.contains(&node.id) {
@@ -985,12 +989,8 @@ pub(super) fn resolve_outbound_nodes(
     domain: ProbeDomain,
     ipver: IpVersion,
 ) -> Vec<Node> {
-    if outbound_name == "direct" || outbound_name == "block" {
-        return vec![Node {
-            name: outbound_name.into(),
-            protocol: honk_config::types::NodeProtocol::HTTP,
-            ..Default::default()
-        }];
+    if let Some(node) = config.builtin_node(outbound_name) {
+        return vec![node];
     }
     if let Some(node) = config.nodes.iter().find(|n| n.name == outbound_name) {
         return vec![node.clone()];
@@ -1043,11 +1043,7 @@ pub(super) fn resolve_outbound_nodes(
         "Outbound '{}' not found, falling back to direct",
         outbound_name
     );
-    vec![Node {
-        name: "direct".into(),
-        protocol: honk_config::types::NodeProtocol::HTTP,
-        ..Default::default()
-    }]
+    vec![Config::builtin_direct_node()]
 }
 
 /// Concrete UDP candidates plus the provenance and IP family selected by
@@ -1058,18 +1054,6 @@ pub(super) struct ResolvedUdpPlan {
     pub(super) mode: honk_outbound::group::SelectionPlanMode,
     pub(super) nodes: Vec<Node>,
     pub(super) ipver: IpVersion,
-}
-
-fn direct_udp_plan(name: &str, ipver: IpVersion) -> ResolvedUdpPlan {
-    ResolvedUdpPlan {
-        mode: honk_outbound::group::SelectionPlanMode::Authoritative,
-        nodes: vec![Node {
-            name: name.into(),
-            protocol: honk_config::types::NodeProtocol::HTTP,
-            ..Default::default()
-        }],
-        ipver,
-    }
 }
 
 /// Resolve UDP candidates without inferring policy from candidate count.
@@ -1103,8 +1087,12 @@ fn resolve_udp_outbound_plan_inner(
     depth: usize,
     visited: &mut Vec<String>,
 ) -> ResolvedUdpPlan {
-    if outbound_name == "direct" || outbound_name == "block" {
-        return direct_udp_plan(outbound_name, ipver);
+    if let Some(node) = config.builtin_node(outbound_name) {
+        return ResolvedUdpPlan {
+            mode: honk_outbound::group::SelectionPlanMode::Authoritative,
+            nodes: vec![node],
+            ipver,
+        };
     }
     if let Some(node) = config.nodes.iter().find(|node| node.name == outbound_name) {
         let mut selected_ipver = ipver;
@@ -1141,7 +1129,11 @@ fn resolve_udp_outbound_plan_inner(
             "UDP outbound '{}' not found, falling back to direct",
             outbound_name
         );
-        return direct_udp_plan("direct", ipver);
+        return ResolvedUdpPlan {
+            mode: honk_outbound::group::SelectionPlanMode::Authoritative,
+            nodes: vec![Config::builtin_direct_node()],
+            ipver,
+        };
     };
     if depth >= honk_outbound::group::MAX_GROUP_DEPTH
         || visited.iter().any(|name| name == outbound_name)
@@ -1724,8 +1716,8 @@ mod atomic_reload_tests {
         };
         let anytls = node("anytls", honk_config::types::NodeProtocol::AnyTLS);
         let socks = node("socks", honk_config::types::NodeProtocol::Socks5);
-        let cold = node("cold", honk_config::types::NodeProtocol::HTTP);
-        let standalone = node("standalone", honk_config::types::NodeProtocol::HTTP);
+        let cold = node("cold", honk_config::types::NodeProtocol::VMess);
+        let standalone = node("standalone", honk_config::types::NodeProtocol::VMess);
         let groups = vec![
             Group {
                 name: "first".into(),
@@ -1949,7 +1941,7 @@ mod atomic_reload_tests {
             .map(|n| Node {
                 id: uuid::Uuid::new_v4(),
                 name: format!("node-{n}"),
-                protocol: honk_config::types::NodeProtocol::HTTP,
+                protocol: honk_config::types::NodeProtocol::Socks5,
                 address: "127.0.0.1:9".into(),
                 ..Default::default()
             })

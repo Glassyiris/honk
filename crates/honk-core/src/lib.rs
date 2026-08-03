@@ -302,8 +302,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // effect and config log_level was silently ignored).
     let mut config = Config::from_file(cli.config.to_str().unwrap())?;
     config.validate()?;
-    // Make `direct` usable as a group member without declaring it in the
-    // config (maps to DirectHandler via the HTTP protocol).
+    // Make `direct`/`block` usable as group members without declaring them
+    // in the config (Direct/Block protocols → DirectHandler/BlockHandler).
     config.ensure_builtin_nodes();
     // Traffic to the gateway's own addresses always goes direct (must),
     // keeping admin/API access alive even when every node is down.

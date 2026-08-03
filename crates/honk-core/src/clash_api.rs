@@ -341,11 +341,12 @@ fn clash_protocol_type(protocol: NodeProtocol) -> &'static str {
         NodeProtocol::VMess => "Vmess",
         NodeProtocol::VLess => "Vless",
         NodeProtocol::Socks5 => "Socks5",
-        NodeProtocol::HTTP => "Http",
         NodeProtocol::Hysteria2 => "Hysteria2",
         NodeProtocol::Tuic => "Tuic",
         NodeProtocol::Juicity => "Juicity",
         NodeProtocol::AnyTLS => "AnyTLS",
+        NodeProtocol::Direct => "Direct",
+        NodeProtocol::Block => "Reject",
     }
 }
 
@@ -407,16 +408,9 @@ fn build_group_proxy_info(
 /// Includes the per-node delay history (clash `{time, delay}` shape) so
 /// dashboards can render per-node latencies — group members included.
 fn build_node_proxy_info(node: &Node, alive_set: &AliveDialerSet) -> serde_json::Value {
-    // The built-in `direct` node displays as Direct (clash convention)
-    // rather than by its marker protocol (HTTP).
-    let display_type = if node.name == Config::BUILTIN_DIRECT_NODE {
-        "Direct"
-    } else {
-        clash_protocol_type(node.protocol)
-    };
     let mut info = serde_json::json!({
         "name": node.name,
-        "type": display_type,
+        "type": clash_protocol_type(node.protocol),
         "udp": true,
         "history": [],
     });

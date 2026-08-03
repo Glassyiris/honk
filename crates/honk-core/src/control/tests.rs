@@ -1345,7 +1345,7 @@ struct UdpTestHandler {
 #[async_trait::async_trait]
 impl honk_outbound::proxy::ProxyHandler for UdpTestHandler {
     fn protocol(&self) -> honk_config::types::NodeProtocol {
-        honk_config::types::NodeProtocol::HTTP
+        honk_config::types::NodeProtocol::Socks5
     }
 
     async fn dial(
@@ -1469,7 +1469,7 @@ fn udp_test_node() -> Node {
     Node {
         id: uuid::Uuid::new_v4(),
         name: "udp-test".into(),
-        protocol: honk_config::types::NodeProtocol::HTTP,
+        protocol: honk_config::types::NodeProtocol::Socks5,
         address: "127.0.0.1".into(),
         port: 9,
         ..Default::default()
@@ -1672,7 +1672,7 @@ async fn udp_first_send_failure_does_not_replay_to_another_candidate() {
     let second = Node {
         id: uuid::Uuid::new_v4(),
         name: "udp-test-second".into(),
-        protocol: honk_config::types::NodeProtocol::HTTP,
+        protocol: honk_config::types::NodeProtocol::Socks5,
         address: "127.0.0.1".into(),
         port: 10,
         ..Default::default()
@@ -1900,7 +1900,7 @@ async fn udp_authoritative_selection_stops_after_single_candidate_dial_failure()
     let second = Node {
         id: uuid::Uuid::new_v4(),
         name: "udp-test-second".into(),
-        protocol: honk_config::types::NodeProtocol::HTTP,
+        protocol: honk_config::types::NodeProtocol::Socks5,
         address: "127.0.0.1".into(),
         port: 10,
         ..Default::default()
@@ -1943,7 +1943,7 @@ async fn udp_production_death_during_unbound_preparation_prevents_send() {
     let unrelated = Node {
         id: uuid::Uuid::new_v4(),
         name: "health-registered-other".into(),
-        protocol: honk_config::types::NodeProtocol::HTTP,
+        protocol: honk_config::types::NodeProtocol::Socks5,
         address: "127.0.0.1".into(),
         port: 10,
         ..Default::default()

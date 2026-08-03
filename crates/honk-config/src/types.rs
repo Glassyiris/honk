@@ -10,11 +10,14 @@ pub enum NodeProtocol {
     VMess,
     VLess,
     Socks5,
-    HTTP,
     Hysteria2,
     Tuic,
     Juicity,
     AnyTLS,
+    /// Built-in bypass outbound; reserved, not a configurable protocol.
+    Direct,
+    /// Built-in reject outbound; reserved, not a configurable protocol.
+    Block,
 }
 
 impl NodeProtocol {
@@ -25,11 +28,12 @@ impl NodeProtocol {
             NodeProtocol::VMess => "vmess",
             NodeProtocol::VLess => "vless",
             NodeProtocol::Socks5 => "socks5",
-            NodeProtocol::HTTP => "http",
             NodeProtocol::Hysteria2 => "hysteria2",
             NodeProtocol::Tuic => "tuic",
             NodeProtocol::Juicity => "juicity",
             NodeProtocol::AnyTLS => "anytls",
+            NodeProtocol::Direct => "direct",
+            NodeProtocol::Block => "block",
         }
     }
 }
@@ -44,11 +48,12 @@ impl std::str::FromStr for NodeProtocol {
             "vmess" => Ok(NodeProtocol::VMess),
             "vless" => Ok(NodeProtocol::VLess),
             "socks5" => Ok(NodeProtocol::Socks5),
-            "http" => Ok(NodeProtocol::HTTP),
             "hysteria2" => Ok(NodeProtocol::Hysteria2),
             "tuic" => Ok(NodeProtocol::Tuic),
             "juicity" => Ok(NodeProtocol::Juicity),
             "anytls" => Ok(NodeProtocol::AnyTLS),
+            "direct" => Ok(NodeProtocol::Direct),
+            "block" => Ok(NodeProtocol::Block),
             _ => Err(crate::ConfigError::UnknownProtocol(s.to_string())),
         }
     }
