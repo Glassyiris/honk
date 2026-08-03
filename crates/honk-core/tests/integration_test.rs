@@ -391,13 +391,12 @@ protocol = "udp"
     #[tokio::test]
     async fn test_socks5_full_handshake() {
         use honk_config::node::Node;
-        use honk_core::proxy::ProxyHandler;
+        use honk_core::proxy::ProbeableOutbound;
         use honk_core::proxy::socks5::Socks5Handler;
 
         // We need a real SOCKS5 server for testing.
         // For this test, we verify the handler can be created and tested.
         let handler = Socks5Handler::new();
-        assert_eq!(handler.protocol(), types::NodeProtocol::Socks5);
 
         let bad_node = Node {
             name: "bad".into(),
@@ -415,7 +414,7 @@ protocol = "udp"
     #[tokio::test]
     async fn test_direct_handler_to_echo_server() {
         use honk_config::node::Node;
-        use honk_core::proxy::ProxyHandler;
+        use honk_core::proxy::TcpOutbound;
         use honk_core::proxy::direct::DirectHandler;
 
         let echo_addr = spawn_echo_server().await;
@@ -437,7 +436,7 @@ protocol = "udp"
     #[tokio::test]
     async fn test_block_handler_rejects_all() {
         use honk_config::node::Node;
-        use honk_core::proxy::ProxyHandler;
+        use honk_core::proxy::TcpOutbound;
         use honk_core::proxy::block::BlockHandler;
 
         let handler = BlockHandler::new();

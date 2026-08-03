@@ -56,7 +56,6 @@ use std::time::Duration;
 use anyhow::{Context as _, anyhow};
 use async_trait::async_trait;
 use honk_config::node::Node;
-use honk_config::types::NodeProtocol;
 use quinn::{AsyncUdpSocket, Endpoint, UdpPoller};
 use rand::RngExt;
 use tokio::io::ReadBuf;
@@ -68,7 +67,9 @@ use crate::quic::{
     ClientCache, QuicClient, QuicConnState, now_secs, recv_read_exact as read_exact,
 };
 
-use super::{PacketTransport, ProxyHandler, ProxyStream};
+use super::{
+    PacketOutbound, PacketTransport, ProbeableOutbound, ProxyStream, TcpOutbound, WarmableOutbound,
+};
 
 /// Auth request target: `POST https://hysteria/auth` (`protocol/http.go:8-10`).
 const URL_HOST: &str = "hysteria";
@@ -671,11 +672,7 @@ impl Hysteria2Handler {
 }
 
 #[async_trait]
-impl ProxyHandler for Hysteria2Handler {
-    fn protocol(&self) -> NodeProtocol {
-        NodeProtocol::Hysteria2
-    }
-
+impl WarmableOutbound for Hysteria2Handler {
     async fn warm_udp(
         &self,
         runtime: Arc<crate::runtime::NodeRuntime>,
@@ -693,7 +690,10 @@ impl ProxyHandler for Hysteria2Handler {
             super::UdpWarmStatus::Ready
         })
     }
+}
 
+#[async_trait]
+impl TcpOutbound for Hysteria2Handler {
     async fn dial(
         &self,
         node: &Node,
@@ -751,6 +751,20 @@ impl ProxyHandler for Hysteria2Handler {
         })
     }
 
+    async fn dial_with_tcp(
+        &self,
+        _node: &Node,
+        _target: SocketAddr,
+        _target_domain: Option<&str>,
+        _tcp: tokio::net::TcpStream,
+        _connect_timeout: Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        anyhow::bail!("Hysteria2 runs over QUIC; a bare TCP connection cannot be reused")
+    }
+}
+
+#[async_trait]
+impl PacketOutbound for Hysteria2Handler {
     async fn dial_udp_transport(
         &self,
         node: &Node,
@@ -786,24 +800,10 @@ impl ProxyHandler for Hysteria2Handler {
             target,
         }))
     }
+}
 
-    async fn dial_with_tcp(
-        &self,
-        _node: &Node,
-        _target: SocketAddr,
-        _target_domain: Option<&str>,
-        _tcp: tokio::net::TcpStream,
-        _connect_timeout: Duration,
-    ) -> anyhow::Result<ProxyStream> {
-        anyhow::bail!("Hysteria2 runs over QUIC; a bare TCP connection cannot be reused")
-    }
-
-    /// QUIC-based: a pooled bare TCP is unusable, so preconnect warmup must
-    /// not deposit one (it would poison the first flow through `dial_with_tcp`).
-    fn pool_bare_tcp(&self, _node: &Node) -> bool {
-        false
-    }
-
+#[async_trait]
+impl ProbeableOutbound for Hysteria2Handler {
     async fn test_connectivity(&self, node: &Node) -> bool {
         match self.client_for(node).await {
             Ok(client) => client.connection(Duration::from_secs(5)).await.is_ok(),
@@ -818,10 +818,9 @@ impl ProxyHandler for Hysteria2Handler {
     }
 }
 
-/// Framed UDP transport over the shared Hysteria2 QUIC connection — the
-/// P1.5 replacement for the loopback bridge: UDP message datagrams go
-/// straight onto the connection and inbound datagrams arrive through the
-/// session demux queue.
+/// Framed UDP transport over the shared Hysteria2 QUIC connection: UDP
+/// message datagrams go straight onto the connection and inbound datagrams
+/// arrive through the session demux queue.
 struct Hy2UdpTransport {
     state: Arc<Hy2ConnState>,
     session_id: u32,

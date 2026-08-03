@@ -37,7 +37,10 @@ use tokio::time::Instant;
 use tracing::{debug, warn};
 
 use super::addr;
-use super::{PacketTransport, PreparedUdpTransport, ProxyHandler, ProxyStream, UdpWarmStatus};
+use super::{
+    PacketOutbound, PacketTransport, PreparedUdpTransport, ProbeableOutbound, ProxyStream,
+    RuntimeRegistryConsumer, TcpOutbound, UdpWarmStatus, WarmableOutbound,
+};
 use crate::session::{ManagedSession as _, SpeculativeCheckout};
 
 /// sing uot v2 magic address (`protocol/anytls/outbound.go`,
@@ -2135,24 +2138,14 @@ enum UotMode {
     V1Packet,
 }
 
-#[async_trait]
-impl ProxyHandler for AnyTlsHandler {
-    fn protocol(&self) -> NodeProtocol {
-        NodeProtocol::AnyTLS
-    }
-
-    /// Multiplexed: the session pool already keeps warm connections; a
-    /// pooled bare TCP would force a new session (TLS + auth) per flow,
-    /// and sessions created over the pool cap leak (orphaned from the
-    /// janitor, held forever by their demux task).
-    fn pool_bare_tcp(&self, _node: &Node) -> bool {
-        false
-    }
-
+impl RuntimeRegistryConsumer for AnyTlsHandler {
     fn set_runtime_registry(&self, cell: crate::runtime::SharedRuntimeRegistry) {
         *self.runtime_registry.write() = Some(cell);
     }
+}
 
+#[async_trait]
+impl WarmableOutbound for AnyTlsHandler {
     async fn warm_udp(
         &self,
         runtime: Arc<crate::runtime::NodeRuntime>,
@@ -2170,7 +2163,10 @@ impl ProxyHandler for AnyTlsHandler {
         })
         .await
     }
+}
 
+#[async_trait]
+impl TcpOutbound for AnyTlsHandler {
     async fn dial(
         &self,
         node: &Node,
@@ -2256,7 +2252,10 @@ impl ProxyHandler for AnyTlsHandler {
             target_domain: target_domain.map(|s| s.to_string()),
         })
     }
+}
 
+#[async_trait]
+impl PacketOutbound for AnyTlsHandler {
     async fn dial_udp_transport(
         &self,
         node: &Node,
@@ -2409,6 +2408,9 @@ impl ProxyHandler for AnyTlsHandler {
         .await
     }
 }
+
+#[async_trait]
+impl ProbeableOutbound for AnyTlsHandler {}
 
 /// Framed UoT transport over a multiplexed AnyTLS stream. Inbound
 /// datagrams come straight from the session demux (drop-on-full queue);

@@ -12,7 +12,7 @@
 //! `alive` is unaffected by these ad-hoc measurements.
 
 use crate::alive::{AliveDialerSet, IpVersion, ProbeDomain};
-use crate::proxy::{ProxyHandler, ProxyRegistry};
+use crate::proxy::{ProxyRegistry, TcpOutbound};
 use anyhow::{Context, anyhow};
 use honk_config::node::Node;
 use std::net::SocketAddr;
@@ -86,7 +86,7 @@ pub const URLTEST_MAX_CONCURRENT: usize = 10;
 /// [`DEFAULT_URLTEST_TIMEOUT`].
 pub async fn urltest_node(
     node: &Node,
-    handler: &dyn ProxyHandler,
+    handler: &dyn TcpOutbound,
     url: &str,
     timeout: Duration,
 ) -> anyhow::Result<Duration> {
@@ -143,7 +143,7 @@ pub async fn urltest_node(
 /// explicit v4/v6 target) — TLS SNI/Host still come from `url`.
 pub async fn urltest_node_addr(
     node: &Node,
-    handler: &dyn ProxyHandler,
+    handler: &dyn TcpOutbound,
     url: &str,
     addr: SocketAddr,
     timeout: Duration,
@@ -157,7 +157,7 @@ pub async fn urltest_node_addr(
 /// response bytes (TLS handshake + HEAD for https, plain HEAD for http).
 async fn measure_head_exchange(
     node: &Node,
-    handler: &dyn ProxyHandler,
+    handler: &dyn TcpOutbound,
     host: &str,
     is_https: bool,
     addr: SocketAddr,
@@ -302,7 +302,7 @@ pub async fn urltest_group(
         join_set.spawn(async move {
             let _permit = permit.acquire_owned().await;
             let result = match registry.find(node.protocol) {
-                Some(handler) => urltest_node(&node, handler, &url, timeout).await,
+                Some(entry) => urltest_node(&node, entry.tcp.as_ref(), &url, timeout).await,
                 None => Err(anyhow!("no handler for protocol {:?}", node.protocol)),
             };
             match &result {
@@ -439,11 +439,7 @@ mod tests {
     struct MockHandler;
 
     #[async_trait::async_trait]
-    impl ProxyHandler for MockHandler {
-        fn protocol(&self) -> NodeProtocol {
-            NodeProtocol::Socks5
-        }
-
+    impl TcpOutbound for MockHandler {
         async fn dial(
             &self,
             node: &Node,
@@ -460,10 +456,6 @@ mod tests {
                 target_addr: target,
                 target_domain: target_domain.map(|s| s.to_string()),
             })
-        }
-
-        async fn test_connectivity(&self, _node: &Node) -> bool {
-            true
         }
     }
 
@@ -628,7 +620,10 @@ mod tests {
         let url = format!("https://{}:{}/", addr.ip(), addr.port());
 
         let mut registry = ProxyRegistry::new();
-        registry.register(Box::new(MockHandler));
+        registry.register(crate::proxy::ProtocolEntry::new(
+            NodeProtocol::Socks5,
+            Arc::new(MockHandler),
+        ));
         let registry = Arc::new(registry);
         let alive_set = Arc::new(AliveDialerSet::new());
 

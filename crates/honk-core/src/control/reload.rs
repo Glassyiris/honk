@@ -576,7 +576,10 @@ pub(super) fn udp_warm_candidates(
                 let Some(runtime) = generation.get(&node.id) else {
                     continue;
                 };
-                if !runtime.capabilities.udp {
+                if !honk_outbound::descriptor::descriptor(runtime.node.protocol)
+                    .capabilities
+                    .udp
+                {
                     continue;
                 }
                 if seen.insert(node.id) {
@@ -2100,11 +2103,20 @@ mod atomic_reload_tests {
         }
 
         #[async_trait::async_trait]
-        impl honk_outbound::proxy::ProxyHandler for BlockingWarmHandler {
-            fn protocol(&self) -> honk_config::types::NodeProtocol {
-                honk_config::types::NodeProtocol::Socks5
+        impl honk_outbound::proxy::TcpOutbound for BlockingWarmHandler {
+            async fn dial(
+                &self,
+                _node: &Node,
+                _target: std::net::SocketAddr,
+                _target_domain: Option<&str>,
+                _connect_timeout: Duration,
+            ) -> anyhow::Result<honk_outbound::proxy::ProxyStream> {
+                anyhow::bail!("not used by the warm coordinator")
             }
+        }
 
+        #[async_trait::async_trait]
+        impl honk_outbound::proxy::WarmableOutbound for BlockingWarmHandler {
             async fn warm_udp(
                 &self,
                 runtime: Arc<honk_outbound::runtime::NodeRuntime>,
@@ -2116,16 +2128,6 @@ mod atomic_reload_tests {
                 let _cancel = WarmCancellation(self.cancelled.clone());
                 std::future::pending::<()>().await;
                 unreachable!("pending warm dispatch was unexpectedly completed")
-            }
-
-            async fn dial(
-                &self,
-                _node: &Node,
-                _target: std::net::SocketAddr,
-                _target_domain: Option<&str>,
-                _connect_timeout: Duration,
-            ) -> anyhow::Result<honk_outbound::proxy::ProxyStream> {
-                anyhow::bail!("not used by the warm coordinator")
             }
         }
 
@@ -2150,10 +2152,17 @@ mod atomic_reload_tests {
         let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
         let cancelled = Arc::new(AtomicUsize::new(0));
         let mut proxy_registry = ProxyRegistry::new();
-        proxy_registry.register(Box::new(BlockingWarmHandler {
+        let warm_handler = Arc::new(BlockingWarmHandler {
             started: started_tx,
             cancelled: cancelled.clone(),
-        }));
+        });
+        proxy_registry.register(
+            honk_outbound::proxy::ProtocolEntry::new(
+                honk_config::types::NodeProtocol::Socks5,
+                warm_handler.clone(),
+            )
+            .with_warmable(warm_handler),
+        );
         let cp = ControlPlane::new(
             config.clone(),
             Box::new(MockEbpfBackend::new()),

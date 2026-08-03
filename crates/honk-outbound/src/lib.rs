@@ -18,5 +18,9 @@ pub mod tls;
 pub mod urltest;
 pub mod util;
 
-pub use proxy::{AsyncReadWrite, ProxyHandler, ProxyRegistry, ProxyStream};
+pub use proxy::{
+    AsyncReadWrite, PacketOutbound, PacketTransport, PreparedUdpTransport, ProbeableOutbound,
+    ProtocolEntry, ProxyRegistry, ProxyStream, RuntimeRegistryConsumer, TcpOutbound,
+    UdpWarmStatus, WarmableOutbound,
+};
 pub use util::{connect_marked, connect_marked_addr, connect_outbound, udp_marked_bind};

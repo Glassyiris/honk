@@ -2,7 +2,6 @@
 
 use async_trait::async_trait;
 use honk_config::node::Node;
-use honk_config::types::NodeProtocol;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -10,7 +9,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tracing::debug;
 
-use super::{PacketTransport, ProxyHandler, ProxyStream};
+use super::{PacketOutbound, PacketTransport, ProbeableOutbound, ProxyStream, TcpOutbound};
 
 const SOCKS5_VERSION: u8 = 0x05;
 const CMD_CONNECT: u8 = 0x01;
@@ -527,11 +526,7 @@ impl Default for Socks5Handler {
 }
 
 #[async_trait]
-impl ProxyHandler for Socks5Handler {
-    fn protocol(&self) -> NodeProtocol {
-        NodeProtocol::Socks5
-    }
-
+impl TcpOutbound for Socks5Handler {
     async fn dial(
         &self,
         node: &Node,
@@ -568,15 +563,10 @@ impl ProxyHandler for Socks5Handler {
             target_domain: target_domain.map(|s| s.to_string()),
         })
     }
+}
 
-    /// After the greeting (+ optional RFC 1929 auth) and a successful
-    /// CONNECT reply, the connection is a pure data channel bound to the
-    /// requested target — the server sends nothing of its own before
-    /// target data. Safe to pool as a ready stream.
-    fn pool_ready_streams(&self, _node: &Node) -> bool {
-        true
-    }
-
+#[async_trait]
+impl PacketOutbound for Socks5Handler {
     async fn dial_udp_transport(
         &self,
         node: &Node,
@@ -599,9 +589,13 @@ impl ProxyHandler for Socks5Handler {
     }
 }
 
+#[async_trait]
+impl ProbeableOutbound for Socks5Handler {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use honk_config::types::NodeProtocol;
     use std::sync::Arc;
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
@@ -1341,7 +1335,8 @@ mod tests {
     fn test_pool_ready_streams_declared() {
         // SOCKS5 completed-CONNECT streams are pure data channels and may
         // be pooled for direct reuse.
-        let handler = Socks5Handler::new();
-        assert!(handler.pool_ready_streams(&Node::default()));
+        let pool_ready_streams =
+            crate::descriptor::descriptor(NodeProtocol::Socks5).pool_ready_streams;
+        assert!(pool_ready_streams(&Node::default()));
     }
 }

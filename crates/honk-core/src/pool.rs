@@ -4,7 +4,7 @@
 //!
 //! - **Bare** — a pre-handshake `TcpStream` to the proxy server (60s idle
 //!   TTL), keyed by the server's `"host:port"` and reused via
-//!   `ProxyHandler::dial_with_tcp`. Saves the TCP connect RTT only.
+//!   `TcpOutbound::dial_with_tcp`. Saves the TCP connect RTT only.
 //! - **Ready** — a fully-dialed `ProxyStream` whose protocol handshake is
 //!   complete (SOCKS5 CONNECT done, Trojan TLS + request header written),
 //!   reused *directly* as the data channel with no handshake at all.
@@ -327,7 +327,7 @@ impl ConnectionPool {
     }
 
     /// Deposit a fully-dialed stream under `key` (see [`ready_key`]).
-    /// The stream must come straight out of `ProxyHandler::dial()` with no
+    /// The stream must come straight out of `TcpOutbound::dial()` with no
     /// application reads performed, so its userspace TLS buffer (if any)
     /// is empty and the fd-level liveness probe stays accurate.
     pub(crate) async fn deposit_ready(&self, key: &str, stream: ProxyStream) {
@@ -598,7 +598,7 @@ mod tests {
     use super::*;
     use honk_config::node::Node;
     use honk_config::types::NodeProtocol;
-    use honk_outbound::proxy::ProxyHandler;
+    use honk_outbound::proxy::TcpOutbound;
     use honk_outbound::proxy::socks5::Socks5Handler;
     use std::sync::atomic::AtomicUsize;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -879,7 +879,9 @@ mod tests {
             ..Default::default()
         };
         let handler = Socks5Handler::new();
-        assert!(handler.pool_ready_streams(&node));
+        assert!((honk_outbound::descriptor::descriptor(NodeProtocol::Socks5).pool_ready_streams)(
+            &node
+        ));
         let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
 
         // Full dial (TCP + greeting + CONNECT), then pool the result.

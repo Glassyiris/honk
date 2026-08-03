@@ -43,9 +43,12 @@ fn always(_: &Node) -> bool {
     true
 }
 
-/// WebSocket/gRPC transports add a bridge task / HTTP/2 framing state whose
-/// idle liveness cannot be probed at the fd level, so only the plain TCP
-/// transport yields a poolable ready stream.
+/// Poolable only on the plain TCP transport: `dial()` completes the TLS
+/// handshake (if enabled) and writes the one-shot request header; Trojan
+/// defines no server handshake reply, so the stream is then a target-bound
+/// data channel. WebSocket/gRPC transports add a bridge task / HTTP/2
+/// framing state whose idle liveness cannot be probed at the fd level, so
+/// they stay on bare-TCP pooling.
 fn trojan_pool_ready_streams(node: &Node) -> bool {
     matches!(node.transport.as_str(), "" | "tcp")
 }
@@ -83,6 +86,10 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         generation_runtime: GenerationRuntime::None,
         share_link_schemes: &["vless"],
     },
+    // After the greeting (+ optional RFC 1929 auth) and a successful CONNECT
+    // reply, the connection is a pure data channel bound to the requested
+    // target — the server sends nothing of its own first, so a fully-dialed
+    // stream is safe to pool and reuse directly.
     ProtocolDescriptor {
         protocol: NodeProtocol::Socks5,
         capabilities: capabilities(true, false),
@@ -91,6 +98,9 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         generation_runtime: GenerationRuntime::None,
         share_link_schemes: &["socks5", "socks4", "socks4a"],
     },
+    // QUIC-based (hy2/tuic/juicity): a pooled bare TCP is unusable — their
+    // `dial_with_tcp` fails — so preconnect warmup must not deposit one (it
+    // would poison the first flow).
     ProtocolDescriptor {
         protocol: NodeProtocol::Hysteria2,
         capabilities: capabilities(true, false),
@@ -115,6 +125,10 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         generation_runtime: GenerationRuntime::Quic,
         share_link_schemes: &["juicity"],
     },
+    // Multiplexed: the session pool already keeps warm connections; a pooled
+    // bare TCP would force a new session (TLS + auth) per flow, and sessions
+    // created over the pool cap leak (orphaned from the janitor, held forever
+    // by their demux task).
     ProtocolDescriptor {
         protocol: NodeProtocol::AnyTLS,
         capabilities: capabilities(true, true),

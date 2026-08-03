@@ -30,7 +30,6 @@ use std::time::Duration;
 use anyhow::{Context as _, anyhow};
 use async_trait::async_trait;
 use honk_config::node::Node;
-use honk_config::types::NodeProtocol;
 use tracing::debug;
 
 use crate::quic::{
@@ -38,7 +37,9 @@ use crate::quic::{
 };
 
 use super::addr::SocksAddr as JuiceAddr;
-use super::{PacketTransport, ProxyHandler, ProxyStream};
+use super::{
+    PacketOutbound, PacketTransport, ProbeableOutbound, ProxyStream, TcpOutbound, WarmableOutbound,
+};
 
 const JUICITY_VERSION: u8 = 0x00;
 
@@ -232,11 +233,7 @@ impl JuicityHandler {
 }
 
 #[async_trait]
-impl ProxyHandler for JuicityHandler {
-    fn protocol(&self) -> NodeProtocol {
-        NodeProtocol::Juicity
-    }
-
+impl WarmableOutbound for JuicityHandler {
     async fn warm_udp(
         &self,
         runtime: Arc<crate::runtime::NodeRuntime>,
@@ -251,6 +248,10 @@ impl ProxyHandler for JuicityHandler {
             super::UdpWarmStatus::Ready
         })
     }
+}
+
+#[async_trait]
+impl TcpOutbound for JuicityHandler {
     async fn dial(
         &self,
         node: &Node,
@@ -282,6 +283,20 @@ impl ProxyHandler for JuicityHandler {
         })
     }
 
+    async fn dial_with_tcp(
+        &self,
+        _node: &Node,
+        _target: SocketAddr,
+        _target_domain: Option<&str>,
+        _tcp: tokio::net::TcpStream,
+        _connect_timeout: Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        anyhow::bail!("Juicity runs over QUIC; a bare TCP connection cannot be reused")
+    }
+}
+
+#[async_trait]
+impl PacketOutbound for JuicityHandler {
     async fn dial_udp_transport(
         &self,
         node: &Node,
@@ -316,24 +331,10 @@ impl ProxyHandler for JuicityHandler {
             target,
         }))
     }
+}
 
-    async fn dial_with_tcp(
-        &self,
-        _node: &Node,
-        _target: SocketAddr,
-        _target_domain: Option<&str>,
-        _tcp: tokio::net::TcpStream,
-        _connect_timeout: Duration,
-    ) -> anyhow::Result<ProxyStream> {
-        anyhow::bail!("Juicity runs over QUIC; a bare TCP connection cannot be reused")
-    }
-
-    /// QUIC-based: a pooled bare TCP is unusable, so preconnect warmup must
-    /// not deposit one (it would poison the first flow through `dial_with_tcp`).
-    fn pool_bare_tcp(&self, _node: &Node) -> bool {
-        false
-    }
-
+#[async_trait]
+impl ProbeableOutbound for JuicityHandler {
     async fn test_connectivity(&self, node: &Node) -> bool {
         match self.client_for(node).await {
             // Zero auth grace on the dial path (tuic parity): wait ~1 RTT
@@ -425,6 +426,7 @@ impl PacketTransport for JuicityUdpTransport {
 mod tests {
     use super::*;
     use crate::quic::testutil;
+    use honk_config::types::NodeProtocol;
     use quinn::VarInt;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

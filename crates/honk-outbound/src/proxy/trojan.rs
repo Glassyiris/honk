@@ -24,10 +24,8 @@
 //!
 //! Reference: <https://trojan-gfw.github.io/trojan/protocol>
 
-use super::{AsyncReadWrite, PacketTransport};
 use async_trait::async_trait;
 use honk_config::node::Node;
-use honk_config::types::NodeProtocol;
 use sha2::{Digest, Sha224};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -35,7 +33,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 
 use super::addr;
-use super::{ProxyHandler, ProxyStream};
+use super::{
+    AsyncReadWrite, PacketOutbound, PacketTransport, ProbeableOutbound, ProxyStream, TcpOutbound,
+};
 
 const CRLF: &[u8] = b"\r\n";
 const CMD_TCP: u8 = 0x01;
@@ -84,11 +84,7 @@ impl TrojanHandler {
 }
 
 #[async_trait]
-impl ProxyHandler for TrojanHandler {
-    fn protocol(&self) -> NodeProtocol {
-        NodeProtocol::Trojan
-    }
-
+impl TcpOutbound for TrojanHandler {
     async fn dial(
         &self,
         node: &Node,
@@ -125,7 +121,10 @@ impl ProxyHandler for TrojanHandler {
             target_domain: target_domain.map(|s| s.to_string()),
         })
     }
+}
 
+#[async_trait]
+impl PacketOutbound for TrojanHandler {
     async fn dial_udp_transport(
         &self,
         node: &Node,
@@ -162,17 +161,10 @@ impl ProxyHandler for TrojanHandler {
             relay_addr: target,
         }))
     }
-
-    /// Poolable only on the plain TCP transport: `dial()` completes the
-    /// TLS handshake (if enabled) and writes the one-shot request header;
-    /// Trojan defines no server handshake reply, so the stream is then a
-    /// target-bound data channel. WebSocket/gRPC transports add a bridge
-    /// task / HTTP/2 framing state whose idle liveness cannot be probed at
-    /// the fd level, so they stay on bare-TCP pooling.
-    fn pool_ready_streams(&self, node: &Node) -> bool {
-        matches!(node.transport.as_str(), "" | "tcp")
-    }
 }
+
+#[async_trait]
+impl ProbeableOutbound for TrojanHandler {}
 
 /// Compute the lowercase hex encoding of SHA224(password).
 fn hex_sha224(password: &str) -> String {
@@ -196,6 +188,7 @@ fn hex_digit(n: u8) -> char {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use honk_config::types::NodeProtocol;
 
     #[test]
     fn test_trojan_request_header_encoding() {
@@ -246,7 +239,8 @@ mod tests {
 
     #[test]
     fn test_pool_ready_streams_transport_gating() {
-        let handler = TrojanHandler::new();
+        let pool_ready_streams = crate::descriptor::descriptor(NodeProtocol::Trojan)
+            .pool_ready_streams;
         let mut node = Node {
             name: "t".into(),
             protocol: NodeProtocol::Trojan,
@@ -255,13 +249,13 @@ mod tests {
             ..Default::default()
         };
         node.transport = String::new();
-        assert!(handler.pool_ready_streams(&node));
+        assert!(pool_ready_streams(&node));
         node.transport = "tcp".into();
-        assert!(handler.pool_ready_streams(&node));
+        assert!(pool_ready_streams(&node));
         node.transport = "ws".into();
-        assert!(!handler.pool_ready_streams(&node));
+        assert!(!pool_ready_streams(&node));
         node.transport = "grpc".into();
-        assert!(!handler.pool_ready_streams(&node));
+        assert!(!pool_ready_streams(&node));
     }
 }
 

@@ -613,13 +613,14 @@ async fn get_proxy_delay(
 
     if let Some(node) = config.nodes.iter().find(|n| n.name == name).cloned() {
         drop(config);
-        let Some(handler) = s.proxy_registry.find(node.protocol) else {
+        let Some(entry) = s.proxy_registry.find(node.protocol) else {
             return error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "no handler for the node protocol",
             );
         };
-        return match urltest_node(&node, handler, &query.url, query.timeout()).await {
+        let tcp = entry.tcp.clone();
+        return match urltest_node(&node, tcp.as_ref(), &query.url, query.timeout()).await {
             Ok(latency) => {
                 s.alive_set
                     .record_probe_latency(node.id, ProbeDomain::Tcp, IpVersion::V4, latency);

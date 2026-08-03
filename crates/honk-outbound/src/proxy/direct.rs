@@ -2,14 +2,16 @@
 
 use async_trait::async_trait;
 use honk_config::node::Node;
-use honk_config::types::NodeProtocol;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tracing::debug;
 
-use super::{PacketTransport, ProxyHandler, ProxyStream, UdpSocketTransport};
+use super::{
+    PacketOutbound, PacketTransport, ProbeableOutbound, ProxyStream, TcpOutbound,
+    UdpSocketTransport,
+};
 
 pub struct DirectHandler;
 
@@ -26,11 +28,7 @@ impl DirectHandler {
 }
 
 #[async_trait]
-impl ProxyHandler for DirectHandler {
-    fn protocol(&self) -> NodeProtocol {
-        NodeProtocol::Direct
-    }
-
+impl TcpOutbound for DirectHandler {
     async fn dial(
         &self,
         _node: &Node,
@@ -67,12 +65,10 @@ impl ProxyHandler for DirectHandler {
             target_domain: None,
         })
     }
+}
 
-    async fn test_connectivity(&self, _node: &Node) -> bool {
-        // Direct always "works" - connectivity depends on the actual target
-        true
-    }
-
+#[async_trait]
+impl PacketOutbound for DirectHandler {
     async fn dial_udp_transport(
         &self,
         _node: &Node,
@@ -89,6 +85,14 @@ impl ProxyHandler for DirectHandler {
         };
         let socket = crate::util::udp_marked_bind(bind_addr).await?;
         Ok(Arc::new(UdpSocketTransport::new(Arc::new(socket), target)))
+    }
+}
+
+#[async_trait]
+impl ProbeableOutbound for DirectHandler {
+    async fn test_connectivity(&self, _node: &Node) -> bool {
+        // Direct always "works" - connectivity depends on the actual target
+        true
     }
 }
 

@@ -1,4 +1,6 @@
-//! Registry-based proxy handler dispatch.
+//! Registry-based outbound dispatch: a static protocol descriptor plus
+//! per-capability trait objects (`TcpOutbound`, `PacketOutbound`,
+//! `WarmableOutbound`, `ProbeableOutbound`).
 
 pub(crate) mod addr;
 pub mod anytls;
@@ -222,21 +224,9 @@ pub enum UdpWarmStatus {
     NotApplicable,
 }
 
+/// TCP flow dialing. Every protocol implements this.
 #[async_trait]
-pub trait ProxyHandler: Send + Sync {
-    fn protocol(&self) -> NodeProtocol;
-
-    /// Warm this generation's node-owned UDP session resources. The default
-    /// is intentionally honest: transport support does not imply that a
-    /// protocol has a reusable warm session.
-    async fn warm_udp(
-        &self,
-        _runtime: Arc<crate::runtime::NodeRuntime>,
-        _connect_timeout: Duration,
-    ) -> anyhow::Result<UdpWarmStatus> {
-        Ok(UdpWarmStatus::NotApplicable)
-    }
-
+pub trait TcpOutbound: Send + Sync {
     async fn dial(
         &self,
         node: &Node,
@@ -244,6 +234,23 @@ pub trait ProxyHandler: Send + Sync {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream>;
+
+    /// The provided `tcp` stream is already connected to the proxy
+    /// server. Handlers that support connection pooling override this to
+    /// skip `TcpStream::connect()`; the default ignores `tcp` and delegates
+    /// to [`Self::dial`].
+    async fn dial_with_tcp(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        tcp: tokio::net::TcpStream,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        let _ = tcp;
+        self.dial(node, target, target_domain, connect_timeout)
+            .await
+    }
 
     /// Dial through an explicitly captured runtime generation. Stateless
     /// handlers delegate to [`Self::dial`]; session-owning handlers override
@@ -263,19 +270,19 @@ pub trait ProxyHandler: Send + Sync {
         )
         .await
     }
+}
 
-    /// Framed UDP transport for a flow. Protocols without UDP capability
-    /// keep the default refusal.
+/// Framed UDP transports — only protocols with UDP capability (see
+/// [`crate::descriptor::ProtocolDescriptor::capabilities`]).
+#[async_trait]
+pub trait PacketOutbound: Send + Sync {
     async fn dial_udp_transport(
         &self,
         node: &Node,
         target: SocketAddr,
         target_domain: Option<&str>,
         connect_timeout: Duration,
-    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        let _ = (node, target, target_domain, connect_timeout);
-        Err(anyhow::anyhow!("UDP not supported for this protocol"))
-    }
+    ) -> anyhow::Result<Arc<dyn PacketTransport>>;
 
     /// Open a framed UDP transport using an explicitly captured runtime
     /// generation. Session-owning handlers override this so an authoritative
@@ -330,9 +337,23 @@ pub trait ProxyHandler: Send + Sync {
         )
         .await
     }
+}
 
-    /// Raw TCP reachability check against the node server. Handlers share
-    /// this default; `direct`/`block` keep their own overrides.
+/// Warming of generation-owned reusable UDP session resources. Transport
+/// support alone does not imply a warmable session; only session-owning
+/// protocols (AnyTLS, the QUIC tunnels) implement this.
+#[async_trait]
+pub trait WarmableOutbound: Send + Sync {
+    async fn warm_udp(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<UdpWarmStatus>;
+}
+
+/// Raw server reachability checks.
+#[async_trait]
+pub trait ProbeableOutbound: Send + Sync {
     async fn test_connectivity(&self, node: &Node) -> bool {
         let addr = format!("{}:{}", node.host(), node.port);
         match crate::util::connect_outbound(&addr, std::time::Duration::from_secs(3)).await {
@@ -340,7 +361,7 @@ pub trait ProxyHandler: Send + Sync {
             Err(e) => {
                 tracing::debug!(
                     "{} connectivity test failed for {}: {}",
-                    self.protocol().as_str(),
+                    node.protocol.as_str(),
                     node.name,
                     e
                 );
@@ -348,103 +369,166 @@ pub trait ProxyHandler: Send + Sync {
             }
         }
     }
+}
 
-    /// The provided `tcp` stream is already connected to the proxy
-    /// server.  Handlers that support connection pooling should
-    /// override this to skip `TcpStream::connect()`.  The default
-    /// implementation ignores `tcp` and delegates to [`dial`].
-    async fn dial_with_tcp(
-        &self,
-        node: &Node,
-        target: SocketAddr,
-        target_domain: Option<&str>,
-        tcp: tokio::net::TcpStream,
-        connect_timeout: Duration,
-    ) -> anyhow::Result<ProxyStream> {
-        let _ = tcp; // default: ignore pooled connection
-        self.dial(node, target, target_domain, connect_timeout)
-            .await
+/// Consumer of the per-node runtime registry (session-layer ownership).
+/// Handlers with pooled sessions (AnyTLS) resolve their node's pool through
+/// it. The shared cell swaps its contents on reload, so this is installed
+/// once at startup.
+pub trait RuntimeRegistryConsumer: Send + Sync {
+    fn set_runtime_registry(&self, cell: crate::runtime::SharedRuntimeRegistry);
+}
+
+/// One registered protocol: its static descriptor plus the capability
+/// objects it implements. A `None` slot means the protocol lacks that
+/// capability; dispatches into it are refused.
+pub struct ProtocolEntry {
+    pub descriptor: &'static crate::descriptor::ProtocolDescriptor,
+    pub tcp: Arc<dyn TcpOutbound>,
+    pub packet: Option<Arc<dyn PacketOutbound>>,
+    pub warmable: Option<Arc<dyn WarmableOutbound>>,
+    pub probeable: Option<Arc<dyn ProbeableOutbound>>,
+    runtime_consumer: Option<Arc<dyn RuntimeRegistryConsumer>>,
+}
+
+impl ProtocolEntry {
+    pub fn new<T: TcpOutbound + 'static>(protocol: NodeProtocol, handler: Arc<T>) -> Self {
+        Self {
+            descriptor: crate::descriptor::descriptor(protocol),
+            tcp: handler,
+            packet: None,
+            warmable: None,
+            probeable: None,
+            runtime_consumer: None,
+        }
     }
 
-    /// Whether a fully-completed `dial()` for `node` yields a stream that
-    /// may be pooled and later reused *directly* as the data channel,
-    /// skipping both the TCP connect and the protocol handshake.
-    ///
-    /// Only handlers whose post-handshake stream is an unframed,
-    /// target-bound byte channel (SOCKS5 after CONNECT, Trojan after the
-    /// request header) should return `true`. The default is `false`:
-    /// those handlers keep bare-TCP pooling via [`dial_with_tcp`].
-    fn pool_ready_streams(&self, node: &Node) -> bool {
-        let _ = node;
-        false
+    pub fn with_packet<T: PacketOutbound + 'static>(mut self, handler: Arc<T>) -> Self {
+        self.packet = Some(handler);
+        self
     }
 
-    /// Whether bare-TCP pool hits are useful for this node. Multiplexed
-    /// protocols (AnyTLS) keep their own warm session pools; a pooled bare
-    /// TCP forces a brand-new mux session per flow — worse than reusing the
-    /// session pool, and sessions created over the pool cap leak. Return
-    /// `false` for those; the dial then always goes through the session
-    /// pool. The default is `true` (single-connection protocols where
-    /// skipping the TCP handshake helps).
-    fn pool_bare_tcp(&self, node: &Node) -> bool {
-        let _ = node;
-        true
+    pub fn with_warmable<T: WarmableOutbound + 'static>(mut self, handler: Arc<T>) -> Self {
+        self.warmable = Some(handler);
+        self
     }
 
-    /// Install the per-node runtime registry (session-layer ownership).
-    /// Handlers with pooled sessions (AnyTLS) resolve their node's pool
-    /// through it; the default is a no-op for stateless
-    /// handlers. The shared cell swaps its contents on reload, so this is
-    /// installed once at startup.
-    fn set_runtime_registry(&self, cell: crate::runtime::SharedRuntimeRegistry) {
-        let _ = cell;
+    pub fn with_probeable<T: ProbeableOutbound + 'static>(mut self, handler: Arc<T>) -> Self {
+        self.probeable = Some(handler);
+        self
+    }
+
+    pub fn with_runtime_consumer<T: RuntimeRegistryConsumer + 'static>(
+        mut self,
+        handler: Arc<T>,
+    ) -> Self {
+        self.runtime_consumer = Some(handler);
+        self
     }
 }
 
 pub struct ProxyRegistry {
-    handlers: Vec<Box<dyn ProxyHandler>>,
+    entries: Vec<ProtocolEntry>,
 }
 
 impl ProxyRegistry {
     pub fn new() -> Self {
         Self {
-            handlers: Vec::new(),
+            entries: Vec::new(),
         }
     }
 
-    /// Hand the per-node runtime registry to every handler (see
-    /// [`ProxyHandler::set_runtime_registry`]).
+    /// Hand the per-node runtime registry to every registered consumer (see
+    /// [`RuntimeRegistryConsumer`]).
     pub fn install_runtime_registry(&self, cell: crate::runtime::SharedRuntimeRegistry) {
-        for handler in &self.handlers {
-            handler.set_runtime_registry(cell.clone());
+        for entry in &self.entries {
+            if let Some(consumer) = &entry.runtime_consumer {
+                consumer.set_runtime_registry(cell.clone());
+            }
         }
     }
 
     pub fn default_resolver() -> anyhow::Result<Self> {
         let mut registry = Self::new();
-        registry.register(Box::new(Socks5Handler::new()));
-        registry.register(Box::new(DirectHandler::new()));
-        registry.register(Box::new(BlockHandler::new()));
-        registry.register(Box::new(TrojanHandler::new()));
-        registry.register(Box::new(Hysteria2Handler::new()));
-        registry.register(Box::new(ShadowsocksHandler::new()));
-        registry.register(Box::new(VLessHandler::new()));
-        registry.register(Box::new(VmessHandler::new()));
-        registry.register(Box::new(AnyTlsHandler::new()));
-        registry.register(Box::new(TuicHandler::new()));
-        registry.register(Box::new(JuicityHandler::new()));
+
+        let socks5 = Arc::new(Socks5Handler::new());
+        registry.register(
+            ProtocolEntry::new(NodeProtocol::Socks5, socks5.clone())
+                .with_packet(socks5.clone())
+                .with_probeable(socks5),
+        );
+        let direct = Arc::new(DirectHandler::new());
+        registry.register(
+            ProtocolEntry::new(NodeProtocol::Direct, direct.clone())
+                .with_packet(direct.clone())
+                .with_probeable(direct),
+        );
+        let block = Arc::new(BlockHandler::new());
+        registry.register(
+            ProtocolEntry::new(NodeProtocol::Block, block.clone())
+                .with_packet(block.clone())
+                .with_probeable(block),
+        );
+        let trojan = Arc::new(TrojanHandler::new());
+        registry.register(
+            ProtocolEntry::new(NodeProtocol::Trojan, trojan.clone())
+                .with_packet(trojan.clone())
+                .with_probeable(trojan),
+        );
+        let hysteria2 = Arc::new(Hysteria2Handler::new());
+        registry.register(
+            ProtocolEntry::new(NodeProtocol::Hysteria2, hysteria2.clone())
+                .with_packet(hysteria2.clone())
+                .with_warmable(hysteria2.clone())
+                .with_probeable(hysteria2),
+        );
+        let shadowsocks = Arc::new(ShadowsocksHandler::new());
+        registry.register(
+            ProtocolEntry::new(NodeProtocol::SS, shadowsocks.clone())
+                .with_packet(shadowsocks.clone())
+                .with_probeable(shadowsocks),
+        );
+        let vless = Arc::new(VLessHandler::new());
+        registry.register(
+            ProtocolEntry::new(NodeProtocol::VLess, vless.clone()).with_probeable(vless),
+        );
+        let vmess = Arc::new(VmessHandler::new());
+        registry.register(
+            ProtocolEntry::new(NodeProtocol::VMess, vmess.clone()).with_probeable(vmess),
+        );
+        let anytls = Arc::new(AnyTlsHandler::new());
+        registry.register(
+            ProtocolEntry::new(NodeProtocol::AnyTLS, anytls.clone())
+                .with_packet(anytls.clone())
+                .with_warmable(anytls.clone())
+                .with_probeable(anytls.clone())
+                .with_runtime_consumer(anytls),
+        );
+        let tuic = Arc::new(TuicHandler::new());
+        registry.register(
+            ProtocolEntry::new(NodeProtocol::Tuic, tuic.clone())
+                .with_packet(tuic.clone())
+                .with_warmable(tuic.clone())
+                .with_probeable(tuic),
+        );
+        let juicity = Arc::new(JuicityHandler::new());
+        registry.register(
+            ProtocolEntry::new(NodeProtocol::Juicity, juicity.clone())
+                .with_packet(juicity.clone())
+                .with_warmable(juicity.clone())
+                .with_probeable(juicity),
+        );
         Ok(registry)
     }
 
-    pub fn register(&mut self, handler: Box<dyn ProxyHandler>) {
-        self.handlers.push(handler);
+    pub fn register(&mut self, entry: ProtocolEntry) {
+        self.entries.push(entry);
     }
 
-    pub fn find(&self, protocol: NodeProtocol) -> Option<&dyn ProxyHandler> {
-        self.handlers
+    pub fn find(&self, protocol: NodeProtocol) -> Option<&ProtocolEntry> {
+        self.entries
             .iter()
-            .find(|h| h.protocol() == protocol)
-            .map(|h| h.as_ref())
+            .find(|entry| entry.descriptor.protocol == protocol)
     }
 
     pub async fn dial(
@@ -454,7 +538,7 @@ impl ProxyRegistry {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let handler = self
+        let entry = self
             .find(node.protocol)
             .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", node.protocol))?;
 
@@ -466,7 +550,8 @@ impl ProxyRegistry {
             node.host()
         );
 
-        handler
+        entry
+            .tcp
             .dial(node, target, target_domain, connect_timeout)
             .await
     }
@@ -480,10 +565,11 @@ impl ProxyRegistry {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let handler = self.find(runtime.node.protocol).ok_or_else(|| {
+        let entry = self.find(runtime.node.protocol).ok_or_else(|| {
             anyhow::anyhow!("No handler for protocol {:?}", runtime.node.protocol)
         })?;
-        handler
+        entry
+            .tcp
             .dial_runtime(runtime, target, target_domain, connect_timeout)
             .await
     }
@@ -503,18 +589,21 @@ impl ProxyRegistry {
         let runtime = generation
             .get(&node_id)
             .ok_or_else(|| anyhow::anyhow!("node {node_id} is not in runtime generation"))?;
-        let handler = self.find(runtime.node.protocol).ok_or_else(|| {
+        let entry = self.find(runtime.node.protocol).ok_or_else(|| {
             anyhow::anyhow!("No handler for protocol {:?}", runtime.node.protocol)
         })?;
-        let status = handler.warm_udp(runtime, connect_timeout).await?;
+        let Some(warmable) = entry.warmable.as_ref() else {
+            return Ok(UdpWarmStatus::NotApplicable);
+        };
+        let status = warmable.warm_udp(runtime, connect_timeout).await?;
         if generation.is_shutdown() {
             anyhow::bail!("outbound runtime generation shut down during warm-up");
         }
         Ok(status)
     }
 
-    /// Framed UDP transport for a flow, dispatching to the node's handler
-    /// (see [`ProxyHandler::dial_udp_transport`]).
+    /// Framed UDP transport for a flow, dispatching to the node's packet
+    /// capability (see [`PacketOutbound::dial_udp_transport`]).
     pub async fn dial_udp_transport(
         &self,
         node: &Node,
@@ -522,10 +611,13 @@ impl ProxyRegistry {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        let handler = self
+        let entry = self
             .find(node.protocol)
             .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", node.protocol))?;
-        handler
+        let packet = entry.packet.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("UDP not supported for protocol {}", node.protocol.as_str())
+        })?;
+        packet
             .dial_udp_transport(node, target, target_domain, connect_timeout)
             .await
     }
@@ -542,16 +634,8 @@ impl ProxyRegistry {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        if generation.is_shutdown() {
-            anyhow::bail!("outbound runtime generation is shut down");
-        }
-        let runtime = generation
-            .get(&node_id)
-            .ok_or_else(|| anyhow::anyhow!("node {node_id} is not in runtime generation"))?;
-        let handler = self.find(runtime.node.protocol).ok_or_else(|| {
-            anyhow::anyhow!("No handler for protocol {:?}", runtime.node.protocol)
-        })?;
-        let transport = handler
+        let (runtime, packet) = self.packet_runtime(&generation, node_id)?;
+        let transport = packet
             .dial_udp_transport_runtime(runtime, target, target_domain, connect_timeout)
             .await?;
         if generation.is_shutdown() {
@@ -571,16 +655,8 @@ impl ProxyRegistry {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<PreparedUdpTransport> {
-        if generation.is_shutdown() {
-            anyhow::bail!("outbound runtime generation is shut down");
-        }
-        let runtime = generation
-            .get(&node_id)
-            .ok_or_else(|| anyhow::anyhow!("node {node_id} is not in runtime generation"))?;
-        let handler = self.find(runtime.node.protocol).ok_or_else(|| {
-            anyhow::anyhow!("No handler for protocol {:?}", runtime.node.protocol)
-        })?;
-        let prepared = handler
+        let (runtime, packet) = self.packet_runtime(&generation, node_id)?;
+        let prepared = packet
             .dial_udp_transport_speculative_runtime(runtime, target, target_domain, connect_timeout)
             .await?;
         if generation.is_shutdown() {
@@ -589,8 +665,34 @@ impl ProxyRegistry {
         Ok(prepared)
     }
 
+    fn packet_runtime(
+        &self,
+        generation: &Arc<crate::runtime::OutboundRuntimeRegistry>,
+        node_id: uuid::Uuid,
+    ) -> anyhow::Result<(
+        Arc<crate::runtime::NodeRuntime>,
+        &Arc<dyn PacketOutbound>,
+    )> {
+        if generation.is_shutdown() {
+            anyhow::bail!("outbound runtime generation is shut down");
+        }
+        let runtime = generation
+            .get(&node_id)
+            .ok_or_else(|| anyhow::anyhow!("node {node_id} is not in runtime generation"))?;
+        let entry = self.find(runtime.node.protocol).ok_or_else(|| {
+            anyhow::anyhow!("No handler for protocol {:?}", runtime.node.protocol)
+        })?;
+        let packet = entry.packet.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "UDP not supported for protocol {}",
+                runtime.node.protocol.as_str()
+            )
+        })?;
+        Ok((runtime, packet))
+    }
+
     pub fn handler_count(&self) -> usize {
-        self.handlers.len()
+        self.entries.len()
     }
 }
 

@@ -813,13 +813,15 @@ impl ControlPlaneHandle {
                     let registry = ctx.proxy_registry.clone();
                     let target_domain = target_domain.clone();
                     tokio::spawn(async move {
-                        let caps = honk_outbound::runtime::OutboundCapabilities::for_node(&node);
                         let (ready_capable, bare_capable) = registry
                             .find(node.protocol)
-                            .map(|h| {
+                            .map(|entry| {
+                                let caps = &entry.descriptor.capabilities;
                                 (
-                                    h.pool_ready_streams(&node) && caps.tcp && !caps.multiplexed,
-                                    h.pool_bare_tcp(&node),
+                                    (entry.descriptor.pool_ready_streams)(&node)
+                                        && caps.tcp
+                                        && !caps.multiplexed,
+                                    (entry.descriptor.pool_bare_tcp)(&node),
                                 )
                             })
                             .unwrap_or((false, false));
@@ -1028,13 +1030,15 @@ impl ControlPlaneHandle {
                     let registry = self.proxy_registry.clone();
                     let target_domain = target_domain.clone();
                     tokio::spawn(async move {
-                        let caps = honk_outbound::runtime::OutboundCapabilities::for_node(&node);
                         let (ready_capable, bare_capable) = registry
                             .find(node.protocol)
-                            .map(|h| {
+                            .map(|entry| {
+                                let caps = &entry.descriptor.capabilities;
                                 (
-                                    h.pool_ready_streams(&node) && caps.tcp && !caps.multiplexed,
-                                    h.pool_bare_tcp(&node),
+                                    (entry.descriptor.pool_ready_streams)(&node)
+                                        && caps.tcp
+                                        && !caps.multiplexed,
+                                    (entry.descriptor.pool_bare_tcp)(&node),
                                 )
                             })
                             .unwrap_or((false, false));
@@ -1661,14 +1665,14 @@ impl ControlPlaneHandle {
         });
 
         let addr = format!("{}:{}", node.host(), node.port);
-        let handler = registry
+        let entry = registry
             .find(node.protocol)
             .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", node.protocol))?;
 
         if !pool_disabled {
             // Ready pool: a fully-dialed stream bound to this exact
             // node+target. Reused directly as the data channel.
-            if handler.pool_ready_streams(node) {
+            if (entry.descriptor.pool_ready_streams)(node) {
                 let key = ConnectionPool::ready_key(&addr, target, target_domain);
                 if let Some(stream) = pool.acquire_ready(&key).await {
                     tracing::debug!(
@@ -1684,11 +1688,12 @@ impl ControlPlaneHandle {
             // protocols opt out (pool_bare_tcp): their session pool
             // already holds warm connections and a bare hit would force
             // a new mux session per flow.
-            if handler.pool_bare_tcp(node)
+            if (entry.descriptor.pool_bare_tcp)(node)
                 && let Some(tcp) = pool.acquire_tcp(&addr).await
             {
                 tracing::debug!("Pooled TCP to {} acquired for {}", addr, target);
-                return handler
+                return entry
+                    .tcp
                     .dial_with_tcp(node, target, target_domain, tcp, connect_timeout)
                     .await;
             }
@@ -1696,7 +1701,8 @@ impl ControlPlaneHandle {
 
         // Pool miss (or pools disabled) — fresh connect
         tracing::debug!("Fresh TCP connect to {} for {}", addr, target);
-        handler
+        entry
+            .tcp
             .dial(node, target, target_domain, connect_timeout)
             .await
     }

@@ -20,9 +20,8 @@ async fn main() -> anyhow::Result<()> {
 
     let node = Node::from_share_link(&link)?;
     let registry = ProxyRegistry::default_resolver()?;
-    let handler = registry.find(node.protocol).expect("handler");
 
-    let transport = handler
+    let transport = registry
         .dial_udp_transport(&node, dns_server, None, Duration::from_secs(10))
         .await?;
 

@@ -44,7 +44,6 @@
 use aes_gcm::aead::{Aead, KeyInit};
 use async_trait::async_trait;
 use honk_config::node::Node;
-use honk_config::types::NodeProtocol;
 use md5::{Digest, Md5};
 use rand::Rng;
 use rand::RngExt;
@@ -54,7 +53,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use super::addr::{self, SocksAddr};
-use super::{AsyncReadWrite, ProxyHandler, ProxyStream};
+use super::{AsyncReadWrite, ProbeableOutbound, ProxyStream, TcpOutbound};
 
 /// VMess AEAD version byte.
 const VMESS_VERSION: u8 = 0x01;
@@ -283,11 +282,7 @@ impl VmessHandler {
 }
 
 #[async_trait]
-impl ProxyHandler for VmessHandler {
-    fn protocol(&self) -> NodeProtocol {
-        NodeProtocol::VMess
-    }
-
+impl TcpOutbound for VmessHandler {
     async fn dial(
         &self,
         node: &Node,
@@ -321,6 +316,9 @@ impl ProxyHandler for VmessHandler {
         Self::perform_handshake(uuid_bytes, stream, target, target_domain)
     }
 }
+
+#[async_trait]
+impl ProbeableOutbound for VmessHandler {}
 
 /// Background task that encrypts client→server data and decrypts
 /// server→client data using the VMess AEAD chunking format.
@@ -454,6 +452,7 @@ fn increment_nonce(nonce: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use honk_config::types::NodeProtocol;
 
     #[test]
     fn test_derive_cmd_key() {
@@ -608,8 +607,10 @@ mod tests {
 
     #[test]
     fn test_protocol_returns_vmess() {
-        let handler = VmessHandler;
-        assert_eq!(handler.protocol(), NodeProtocol::VMess);
+        assert_eq!(
+            crate::descriptor::descriptor(NodeProtocol::VMess).protocol,
+            NodeProtocol::VMess
+        );
     }
 
     #[test]

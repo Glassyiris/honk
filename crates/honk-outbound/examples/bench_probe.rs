@@ -34,15 +34,17 @@ async fn main() -> anyhow::Result<()> {
 
     let node = Node::from_share_link(&link)?;
     let registry = ProxyRegistry::default_resolver()?;
-    let handler = registry.find(node.protocol).expect("handler for protocol");
+    let tcp = registry
+        .find(node.protocol)
+        .expect("handler for protocol")
+        .tcp
+        .clone();
 
     // --- 1. Sequential dial latency ---
     let mut lat = Vec::with_capacity(n_dials);
     for _ in 0..n_dials {
         let t0 = Instant::now();
-        let s = handler
-            .dial(&node, target, None, Duration::from_secs(10))
-            .await?;
+        let s = tcp.dial(&node, target, None, Duration::from_secs(10)).await?;
         lat.push(t0.elapsed());
         drop(s);
     }
@@ -61,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
     let t0 = Instant::now();
     let mut tasks = Vec::new();
     for _ in 0..n_par {
-        tasks.push(handler.dial(&node, target, None, Duration::from_secs(10)));
+        tasks.push(tcp.dial(&node, target, None, Duration::from_secs(10)));
     }
     let results = futures_util::future::join_all(tasks).await;
     let ok = results.iter().filter(|r| r.is_ok()).count();
@@ -71,9 +73,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // --- 3. Download throughput ---
-    let mut s = handler
-        .dial(&node, target, None, Duration::from_secs(10))
-        .await?;
+    let mut s = tcp.dial(&node, target, None, Duration::from_secs(10)).await?;
     s.stream
         .write_all(b"GET / HTTP/1.1\r\nHost: bench\r\nConnection: close\r\n\r\n")
         .await?;
@@ -112,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
         .nth(3)
         .and_then(|a| a.parse().ok())
         .unwrap_or(target);
-    match handler
+    match registry
         .dial_udp_transport(&node, udp_target, None, Duration::from_secs(10))
         .await
     {

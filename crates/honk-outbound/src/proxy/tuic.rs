@@ -32,7 +32,6 @@ use std::time::Duration;
 use anyhow::{Context as _, anyhow};
 use async_trait::async_trait;
 use honk_config::node::Node;
-use honk_config::types::NodeProtocol;
 use tokio::sync::mpsc;
 use tracing::debug;
 
@@ -42,7 +41,9 @@ use crate::quic::{
 };
 
 use super::addr::{self, SocksAddr};
-use super::{PacketTransport, ProxyHandler, ProxyStream};
+use super::{
+    PacketOutbound, PacketTransport, ProbeableOutbound, ProxyStream, TcpOutbound, WarmableOutbound,
+};
 
 const TUIC_VERSION: u8 = 0x05;
 
@@ -534,11 +535,7 @@ impl TuicHandler {
 }
 
 #[async_trait]
-impl ProxyHandler for TuicHandler {
-    fn protocol(&self) -> NodeProtocol {
-        NodeProtocol::Tuic
-    }
-
+impl WarmableOutbound for TuicHandler {
     async fn warm_udp(
         &self,
         runtime: Arc<crate::runtime::NodeRuntime>,
@@ -553,7 +550,10 @@ impl ProxyHandler for TuicHandler {
             super::UdpWarmStatus::Ready
         })
     }
+}
 
+#[async_trait]
+impl TcpOutbound for TuicHandler {
     async fn dial(
         &self,
         node: &Node,
@@ -595,6 +595,20 @@ impl ProxyHandler for TuicHandler {
         })
     }
 
+    async fn dial_with_tcp(
+        &self,
+        _node: &Node,
+        _target: SocketAddr,
+        _target_domain: Option<&str>,
+        _tcp: tokio::net::TcpStream,
+        _connect_timeout: Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        anyhow::bail!("TUIC runs over QUIC; a bare TCP connection cannot be reused")
+    }
+}
+
+#[async_trait]
+impl PacketOutbound for TuicHandler {
     async fn dial_udp_transport(
         &self,
         node: &Node,
@@ -619,24 +633,10 @@ impl ProxyHandler for TuicHandler {
             target,
         }))
     }
+}
 
-    async fn dial_with_tcp(
-        &self,
-        _node: &Node,
-        _target: SocketAddr,
-        _target_domain: Option<&str>,
-        _tcp: tokio::net::TcpStream,
-        _connect_timeout: Duration,
-    ) -> anyhow::Result<ProxyStream> {
-        anyhow::bail!("TUIC runs over QUIC; a bare TCP connection cannot be reused")
-    }
-
-    /// QUIC-based: a pooled bare TCP is unusable, so preconnect warmup must
-    /// not deposit one (it would poison the first flow through `dial_with_tcp`).
-    fn pool_bare_tcp(&self, _node: &Node) -> bool {
-        false
-    }
-
+#[async_trait]
+impl ProbeableOutbound for TuicHandler {
     async fn test_connectivity(&self, node: &Node) -> bool {
         match self.client_for(node).await {
             // With the zero auth grace on the dial path, a wrong password is
@@ -664,10 +664,10 @@ impl ProxyHandler for TuicHandler {
     }
 }
 
-/// Framed UDP transport over a TUIC session — the P1.5 replacement for the
-/// loopback bridge: PACKET frames go straight onto the shared QUIC
-/// connection (datagrams, or uni streams when datagrams were not negotiated)
-/// and inbound frames arrive through the connection's session demux queue.
+/// Framed UDP transport over a TUIC session: PACKET frames go straight onto
+/// the shared QUIC connection (datagrams, or uni streams when datagrams were
+/// not negotiated) and inbound frames arrive through the connection's
+/// session demux queue.
 struct TuicUdpTransport {
     state: Arc<TuicConnState>,
     session_id: u16,
@@ -749,6 +749,7 @@ impl PacketTransport for TuicUdpTransport {
 mod tests {
     use super::*;
     use crate::quic::testutil;
+    use honk_config::types::NodeProtocol;
     use quinn::VarInt;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

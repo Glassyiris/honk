@@ -5,12 +5,11 @@
 
 use async_trait::async_trait;
 use honk_config::node::Node;
-use honk_config::types::NodeProtocol;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tracing::warn;
 
-use super::{PacketTransport, ProxyHandler, ProxyStream};
+use super::{PacketOutbound, PacketTransport, ProbeableOutbound, ProxyStream, TcpOutbound};
 use std::sync::Arc;
 
 /// Handler for blocking connections.
@@ -29,11 +28,7 @@ impl BlockHandler {
 }
 
 #[async_trait]
-impl ProxyHandler for BlockHandler {
-    fn protocol(&self) -> NodeProtocol {
-        NodeProtocol::Block
-    }
-
+impl TcpOutbound for BlockHandler {
     async fn dial(
         &self,
         _node: &Node,
@@ -44,7 +39,10 @@ impl ProxyHandler for BlockHandler {
         warn!("Blocked connection to {}", target);
         anyhow::bail!("Connection blocked by routing rule");
     }
+}
 
+#[async_trait]
+impl PacketOutbound for BlockHandler {
     async fn dial_udp_transport(
         &self,
         _node: &Node,
@@ -55,7 +53,10 @@ impl ProxyHandler for BlockHandler {
         warn!("Blocked UDP connection to {}", target);
         anyhow::bail!("UDP connection blocked by routing rule");
     }
+}
 
+#[async_trait]
+impl ProbeableOutbound for BlockHandler {
     async fn test_connectivity(&self, _node: &Node) -> bool {
         false // Block handler is never "reachable"
     }

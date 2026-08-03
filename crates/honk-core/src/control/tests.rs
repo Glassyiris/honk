@@ -1343,11 +1343,7 @@ struct UdpTestHandler {
 }
 
 #[async_trait::async_trait]
-impl honk_outbound::proxy::ProxyHandler for UdpTestHandler {
-    fn protocol(&self) -> honk_config::types::NodeProtocol {
-        honk_config::types::NodeProtocol::Socks5
-    }
-
+impl honk_outbound::proxy::TcpOutbound for UdpTestHandler {
     async fn dial(
         &self,
         _node: &Node,
@@ -1359,7 +1355,10 @@ impl honk_outbound::proxy::ProxyHandler for UdpTestHandler {
             "TCP dial is not used by the UDP lifecycle tests"
         ))
     }
+}
 
+#[async_trait::async_trait]
+impl honk_outbound::proxy::PacketOutbound for UdpTestHandler {
     async fn dial_udp_transport(
         &self,
         _node: &Node,
@@ -1487,7 +1486,14 @@ fn udp_test_handle(config: Config, mode: UdpTestMode, capacity: usize) -> Contro
 fn udp_test_handle_with_default_pool(config: Config, mode: UdpTestMode) -> ControlPlaneHandle {
     let router = Router::new(&config.routing.rules, &config.routing.default_outbound).unwrap();
     let mut registry = honk_outbound::proxy::ProxyRegistry::new();
-    registry.register(Box::new(UdpTestHandler { mode }));
+    let handler = Arc::new(UdpTestHandler { mode });
+    registry.register(
+        honk_outbound::proxy::ProtocolEntry::new(
+            honk_config::types::NodeProtocol::Socks5,
+            handler.clone(),
+        )
+        .with_packet(handler),
+    );
     ControlPlane::new(
         config,
         Box::new(crate::ebpf::mock::MockEbpfBackend::new()),
@@ -1508,7 +1514,14 @@ fn udp_test_handle_with_reply_factory(
 ) -> ControlPlaneHandle {
     let router = Router::new(&config.routing.rules, &config.routing.default_outbound).unwrap();
     let mut registry = honk_outbound::proxy::ProxyRegistry::new();
-    registry.register(Box::new(UdpTestHandler { mode }));
+    let handler = Arc::new(UdpTestHandler { mode });
+    registry.register(
+        honk_outbound::proxy::ProtocolEntry::new(
+            honk_config::types::NodeProtocol::Socks5,
+            handler.clone(),
+        )
+        .with_packet(handler),
+    );
     let mut control_plane = ControlPlane::new(
         config,
         Box::new(crate::ebpf::mock::MockEbpfBackend::new()),
@@ -2182,9 +2195,16 @@ async fn udp_dns_dispatch_registers_connection_guard_before_task_poll() {
     let config = udp_test_config("udp-test", vec![udp_test_node()], vec![]);
     let router = Router::new(&config.routing.rules, &config.routing.default_outbound).unwrap();
     let mut registry = honk_outbound::proxy::ProxyRegistry::new();
-    registry.register(Box::new(UdpTestHandler {
+    let handler = Arc::new(UdpTestHandler {
         mode: UdpTestMode::Success,
-    }));
+    });
+    registry.register(
+        honk_outbound::proxy::ProtocolEntry::new(
+            honk_config::types::NodeProtocol::Socks5,
+            handler.clone(),
+        )
+        .with_packet(handler),
+    );
     let mut plane = ControlPlane::new(
         config,
         Box::new(crate::ebpf::mock::MockEbpfBackend::new()),

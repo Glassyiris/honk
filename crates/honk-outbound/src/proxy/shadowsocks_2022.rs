@@ -594,8 +594,8 @@ impl Ss2022UdpSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proxy::ProxyHandler;
     use crate::proxy::shadowsocks::ShadowsocksHandler;
+    use crate::proxy::{PacketOutbound, TcpOutbound};
     use honk_config::node::Node;
     use honk_config::types::NodeProtocol;
     use std::net::SocketAddr;

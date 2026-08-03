@@ -27,12 +27,11 @@
 
 use async_trait::async_trait;
 use honk_config::node::Node;
-use honk_config::types::NodeProtocol;
 use std::net::SocketAddr;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
-use super::{AsyncReadWrite, ProxyHandler, ProxyStream};
+use super::{AsyncReadWrite, ProbeableOutbound, ProxyStream, TcpOutbound};
 
 const VLESS_VERSION: u8 = 0x00;
 const CMD_TCP: u8 = 0x01;
@@ -145,11 +144,7 @@ impl VLessHandler {
 }
 
 #[async_trait]
-impl ProxyHandler for VLessHandler {
-    fn protocol(&self) -> NodeProtocol {
-        NodeProtocol::VLess
-    }
-
+impl TcpOutbound for VLessHandler {
     async fn dial(
         &self,
         node: &Node,
@@ -198,9 +193,13 @@ impl ProxyHandler for VLessHandler {
     }
 }
 
+#[async_trait]
+impl ProbeableOutbound for VLessHandler {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use honk_config::types::NodeProtocol;
 
     #[test]
     fn test_vless_header_ipv4() {

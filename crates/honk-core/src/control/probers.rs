@@ -54,9 +54,10 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
 
         Box::pin(async move {
             let node = node.ok_or_else(|| format!("node '{}' not found", node_name_owned))?;
-            let handler = registry
+            let entry = registry
                 .find(node.protocol)
                 .ok_or_else(|| format!("no handler for protocol {:?}", node.protocol))?;
+            let tcp = entry.tcp.clone();
 
             let start = std::time::Instant::now();
             let connect_timeout = {
@@ -75,7 +76,7 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
             } else {
                 url_host(&check_url)
             };
-            let proxy = handler
+            let proxy = tcp
                 .dial(&node, addr, domain.as_deref(), connect_timeout)
                 .await
                 .map_err(|e| format!("dial failed: {}", e))?;
@@ -229,9 +230,13 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
 
         Box::pin(async move {
             let node = node.ok_or_else(|| format!("node '{}' not found", node_name_owned))?;
-            let handler = registry
+            let entry = registry
                 .find(node.protocol)
                 .ok_or_else(|| format!("no handler for protocol {:?}", node.protocol))?;
+            let packet = entry
+                .packet
+                .clone()
+                .ok_or_else(|| format!("protocol {:?} has no UDP capability", node.protocol))?;
             let connect_timeout = {
                 let config = config
                     .try_read()
@@ -240,7 +245,7 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
             };
 
             let start = std::time::Instant::now();
-            let transport = handler
+            let transport = packet
                 .dial_udp_transport(&node, dns_target, None, connect_timeout)
                 .await
                 .map_err(|e| format!("UDP dial failed: {}", e))?;

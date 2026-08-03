@@ -27,7 +27,6 @@
 use async_trait::async_trait;
 use hkdf::Hkdf;
 use honk_config::node::Node;
-use honk_config::types::NodeProtocol;
 use rand::Rng;
 use sha1::Sha1;
 use std::fmt;
@@ -39,7 +38,7 @@ use tracing::debug;
 
 use super::addr;
 use super::shadowsocks_2022::{self, Ss2022Method, Ss2022UdpSession};
-use super::{PacketTransport, ProxyHandler, ProxyStream};
+use super::{PacketOutbound, PacketTransport, ProbeableOutbound, ProxyStream, TcpOutbound};
 
 pub(crate) const SS_SUBKEY_INFO: &[u8] = b"ss-subkey";
 pub(crate) const CHUNK_MAX_LEN: usize = 0x3FFF; // 2^14 - 1
@@ -374,11 +373,7 @@ impl ShadowsocksHandler {
 }
 
 #[async_trait]
-impl ProxyHandler for ShadowsocksHandler {
-    fn protocol(&self) -> NodeProtocol {
-        NodeProtocol::SS
-    }
-
+impl TcpOutbound for ShadowsocksHandler {
     async fn dial(
         &self,
         node: &Node,
@@ -418,7 +413,10 @@ impl ProxyHandler for ShadowsocksHandler {
         self.start_relay(method, password, server, header, target, target_domain)
             .await
     }
+}
 
+#[async_trait]
+impl PacketOutbound for ShadowsocksHandler {
     async fn dial_udp_transport(
         &self,
         node: &Node,
@@ -436,6 +434,9 @@ impl ProxyHandler for ShadowsocksHandler {
         }))
     }
 }
+
+#[async_trait]
+impl ProbeableOutbound for ShadowsocksHandler {}
 
 impl ShadowsocksHandler {
     /// Set up a UDP relay session towards the server: cipher state plus a

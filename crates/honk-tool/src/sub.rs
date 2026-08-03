@@ -234,9 +234,9 @@ async fn probe_node(registry: &ProxyRegistry, node: Node, targets: &ProbeTargets
     let udp_quic = probe_udp_quic(registry, &node, url_host, 443, timeout).await;
 
     let urltest = match handler {
-        Some(handler) => {
+        Some(entry) => {
             let url = targets.url.clone().unwrap_or_default();
-            urltest_node(&node, handler, &url, timeout)
+            urltest_node(&node, entry.tcp.as_ref(), &url, timeout)
                 .await
                 .map_err(|e| e.to_string())
         }
@@ -298,12 +298,14 @@ async fn probe_family(
             Err(e) => return Some(Err(format!("resolve {url_host}: {e}"))),
         },
     };
-    let handler = registry.find(node.protocol)?;
+    let entry = registry.find(node.protocol)?;
     // NB: urltest's normalize_url swaps any http:// URL for the default
     // https one — always probe with an https URL (the default targets all
     // serve TLS on 443 anyway).
     let url = format!("https://{url_host}/");
-    match honk_outbound::urltest::urltest_node_addr(node, handler, &url, addr, timeout).await {
+    match honk_outbound::urltest::urltest_node_addr(node, entry.tcp.as_ref(), &url, addr, timeout)
+        .await
+    {
         Ok(d) => Some(Ok(d)),
         Err(e) => Some(Err(e.to_string())),
     }

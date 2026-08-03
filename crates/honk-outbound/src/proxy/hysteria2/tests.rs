@@ -1,5 +1,6 @@
 use super::*;
 use crate::quic::testutil;
+use honk_config::types::NodeProtocol;
 use quinn::EndpointConfig;
 use std::time::Instant;
 
