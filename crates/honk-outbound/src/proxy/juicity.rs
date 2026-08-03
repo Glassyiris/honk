@@ -32,9 +32,7 @@ use async_trait::async_trait;
 use honk_config::node::Node;
 use tracing::debug;
 
-use crate::quic::{
-    ClientCache, QuicClient, QuicConnState, now_secs, recv_read_exact as read_exact,
-};
+use crate::quic::{QuicClient, QuicConnState, now_secs, recv_read_exact as read_exact};
 
 use super::addr::SocksAddr as JuiceAddr;
 use super::{
@@ -116,6 +114,16 @@ struct JuicityClient {
     password: String,
 }
 
+impl crate::runtime::QuicRuntimeClient for JuicityClient {
+    fn into_erased(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
+        self
+    }
+
+    fn force_close(&self) {
+        self.quic.force_close();
+    }
+}
+
 impl JuicityClient {
     async fn connection(
         &self,
@@ -140,19 +148,17 @@ impl JuicityClient {
     }
 }
 
-/// Juicity proxy handler. Stateless except its per-server client cache
-/// (owned per handler instance — never process-global).
+/// Juicity proxy handler. Stateless: the per-server client (and its shared
+/// QUIC connection) lives in the node's generation runtime.
 #[derive(Debug, Default, Clone)]
-pub struct JuicityHandler {
-    clients: ClientCache<JuicityClient>,
-}
+pub struct JuicityHandler;
 
 impl JuicityHandler {
     pub fn new() -> Self {
-        Self::default()
+        Self
     }
 
-    async fn client_for(&self, node: &Node) -> anyhow::Result<Arc<JuicityClient>> {
+    async fn build_client(&self, node: &Node) -> anyhow::Result<Arc<JuicityClient>> {
         let uuid_str = node
             .juicity_uuid
             .as_deref()
@@ -166,41 +172,30 @@ impl JuicityHandler {
             .or(node.password.as_deref())
             .unwrap_or("")
             .to_string();
-        let key = format!(
-            "{}:{}|{}|{}|{}",
-            node.host(),
-            node.port,
-            crate::quic::key_fingerprint(&[uuid_str, &password]),
-            node.sni.as_deref().unwrap_or(""),
-            node.skip_cert_verify
-        );
         let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
-        crate::quic::cached_client(&self.clients, key, || async move {
-            // Upstream juicity (Go and juicity-rs) defaults to BBR on the client
-            // when no congestion_control is configured.
-            let config = crate::quic::client_config(
-                node,
-                &[b"h3"],
-                crate::quic::QuicClientOptions {
-                    keep_alive: Some(KEEP_ALIVE_INTERVAL),
-                    max_udp_payload_size: node.quic_mtu,
-                    // Same receive-window rationale as hy2/tuic: quinn's
-                    // 1.25 MiB stream default caps downloads around 2 Gbps
-                    // on a LAN.
-                    stream_receive_window: Some(8 << 20),
-                    conn_receive_window: Some(32 << 20),
-                    ..crate::quic::QuicClientOptions::with_congestion(Some("bbr"))
-                },
-            )
-            .await?;
-            Ok(Arc::new(JuicityClient {
-                quic: QuicClient::new(node.host().to_string(), node.port, server_name, config)
-                    .with_max_udp_payload_size(node.quic_mtu.unwrap_or(1252)),
-                uuid: *uuid.as_bytes(),
-                password,
-            }))
-        })
-        .await
+        // Upstream juicity (Go and juicity-rs) defaults to BBR on the client
+        // when no congestion_control is configured.
+        let config = crate::quic::client_config(
+            node,
+            &[b"h3"],
+            crate::quic::QuicClientOptions {
+                keep_alive: Some(KEEP_ALIVE_INTERVAL),
+                max_udp_payload_size: node.quic_mtu,
+                // Same receive-window rationale as hy2/tuic: quinn's
+                // 1.25 MiB stream default caps downloads around 2 Gbps
+                // on a LAN.
+                stream_receive_window: Some(8 << 20),
+                conn_receive_window: Some(32 << 20),
+                ..crate::quic::QuicClientOptions::with_congestion(Some("bbr"))
+            },
+        )
+        .await?;
+        Ok(Arc::new(JuicityClient {
+            quic: QuicClient::new(node.host().to_string(), node.port, server_name, config)
+                .with_max_udp_payload_size(node.quic_mtu.unwrap_or(1252)),
+            uuid: *uuid.as_bytes(),
+            password,
+        }))
     }
 
     /// Open a bi stream and write the juicity request header
@@ -227,8 +222,72 @@ impl JuicityHandler {
             anyhow::bail!("Juicity runtime is not QUIC-owned");
         };
         quic_runtime
-            .client(|| self.client_for(runtime.node.as_ref()))
+            .client(|| self.build_client(runtime.node.as_ref()))
             .await
+    }
+
+    async fn dial_via_client(
+        &self,
+        client: Arc<JuicityClient>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        let addr = JuiceAddr::new(target, target_domain);
+        let stream = crate::quic::dial_quic_stream(
+            &client.quic,
+            |timeout| {
+                let client = Arc::clone(&client);
+                async move { client.connection(timeout).await }
+            },
+            connect_timeout,
+            move |conn| {
+                let addr = addr.clone();
+                async move { Self::open_stream(&conn, NETWORK_TCP, &addr).await }
+            },
+            |_| true,
+            "Juicity",
+        )
+        .await?;
+        Ok(ProxyStream {
+            stream: Box::new(stream),
+            target_addr: target,
+            target_domain: target_domain.map(str::to_string),
+        })
+    }
+
+    async fn udp_transport_via_client(
+        &self,
+        client: Arc<JuicityClient>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        let stream_addr = JuiceAddr::new(target, target_domain);
+        let addr = stream_addr.clone();
+        let stream = crate::quic::dial_quic_stream(
+            &client.quic,
+            |timeout| {
+                let client = Arc::clone(&client);
+                async move { client.connection(timeout).await }
+            },
+            connect_timeout,
+            move |conn| {
+                let addr = addr.clone();
+                async move { Self::open_stream(&conn, NETWORK_UDP, &addr).await }
+            },
+            |_| true,
+            "Juicity",
+        )
+        .await?;
+        let (send, recv, guard) = stream.into_parts();
+        Ok(Arc::new(JuicityUdpTransport {
+            send: tokio::sync::Mutex::new(send),
+            recv: tokio::sync::Mutex::new(recv),
+            _guard: guard,
+            target_addr: stream_addr,
+            target,
+        }))
     }
 }
 
@@ -259,28 +318,21 @@ impl TcpOutbound for JuicityHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let client = self.client_for(node).await?;
-        let addr = JuiceAddr::new(target, target_domain);
-        let stream = crate::quic::dial_quic_stream(
-            &client.quic,
-            |timeout| {
-                let client = Arc::clone(&client);
-                async move { client.connection(timeout).await }
-            },
-            connect_timeout,
-            move |conn| {
-                let addr = addr.clone();
-                async move { Self::open_stream(&conn, NETWORK_TCP, &addr).await }
-            },
-            |_| true,
-            "Juicity",
-        )
-        .await?;
-        Ok(ProxyStream {
-            stream: Box::new(stream),
-            target_addr: target,
-            target_domain: target_domain.map(str::to_string),
-        })
+        let client = self.build_client(node).await?;
+        self.dial_via_client(client, target, target_domain, connect_timeout)
+            .await
+    }
+
+    async fn dial_runtime(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        let client = self.client_for_runtime(&runtime).await?;
+        self.dial_via_client(client, target, target_domain, connect_timeout)
+            .await
     }
 
     async fn dial_with_tcp(
@@ -304,39 +356,40 @@ impl PacketOutbound for JuicityHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        let client = self.client_for(node).await?;
-        let stream_addr = JuiceAddr::new(target, target_domain);
-        let addr = stream_addr.clone();
-        let stream = crate::quic::dial_quic_stream(
-            &client.quic,
-            |timeout| {
-                let client = Arc::clone(&client);
-                async move { client.connection(timeout).await }
-            },
-            connect_timeout,
-            move |conn| {
-                let addr = addr.clone();
-                async move { Self::open_stream(&conn, NETWORK_UDP, &addr).await }
-            },
-            |_| true,
-            "Juicity",
-        )
-        .await?;
-        let (send, recv, guard) = stream.into_parts();
-        Ok(Arc::new(JuicityUdpTransport {
-            send: tokio::sync::Mutex::new(send),
-            recv: tokio::sync::Mutex::new(recv),
-            _guard: guard,
-            target_addr: stream_addr,
-            target,
-        }))
+        let client = self.build_client(node).await?;
+        self.udp_transport_via_client(client, target, target_domain, connect_timeout)
+            .await
+    }
+
+    async fn dial_udp_transport_runtime(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        let client = self.client_for_runtime(&runtime).await?;
+        self.udp_transport_via_client(client, target, target_domain, connect_timeout)
+            .await
+    }
+
+    async fn dial_udp_transport_speculative_runtime(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<super::PreparedUdpTransport> {
+        self.dial_udp_transport_runtime(runtime, target, target_domain, connect_timeout)
+            .await
+            .map(super::PreparedUdpTransport::ready)
     }
 }
 
 #[async_trait]
 impl ProbeableOutbound for JuicityHandler {
     async fn test_connectivity(&self, node: &Node) -> bool {
-        match self.client_for(node).await {
+        match self.build_client(node).await {
             // Zero auth grace on the dial path (tuic parity): wait ~1 RTT
             // for the server to close on bad credentials.
             Ok(client) => match client.connection(Duration::from_secs(5)).await {

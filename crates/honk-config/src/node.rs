@@ -36,7 +36,7 @@ pub const NODE_ID_NAMESPACE: uuid::Uuid =
     uuid::Uuid::from_u128(0x3d8f2e1a_9b4c_4d57_8f3a_2c6e1d0b9a7f);
 
 /// A proxy node definition.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Node {
     /// Stable identity derived from the node's content by [`Node::derive_id`]
     /// at every construction entry (nil until then — the runtime registry

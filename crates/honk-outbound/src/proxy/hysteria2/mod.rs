@@ -63,9 +63,7 @@ use tokio::sync::mpsc;
 use tracing::debug;
 
 use crate::quic::defrag::Defragmenter;
-use crate::quic::{
-    ClientCache, QuicClient, QuicConnState, now_secs, recv_read_exact as read_exact,
-};
+use crate::quic::{QuicClient, QuicConnState, now_secs, recv_read_exact as read_exact};
 
 use super::{
     PacketOutbound, PacketTransport, ProbeableOutbound, ProxyStream, TcpOutbound, WarmableOutbound,
@@ -462,6 +460,16 @@ struct Hy2Client {
     rx_bps: u64,
 }
 
+impl crate::runtime::QuicRuntimeClient for Hy2Client {
+    fn into_erased(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
+        self
+    }
+
+    fn force_close(&self) {
+        self.quic.force_close();
+    }
+}
+
 impl Hy2Client {
     async fn connection(
         &self,
@@ -559,16 +567,14 @@ fn target_string(target: SocketAddr, target_domain: Option<&str>) -> String {
     }
 }
 
-/// Hysteria2 proxy handler (QUIC). Stateless except its per-server
-/// client cache (owned per handler instance — never process-global).
+/// Hysteria2 proxy handler (QUIC). Stateless: the per-server client (and
+/// its shared QUIC connection) lives in the node's generation runtime.
 #[derive(Debug, Default, Clone)]
-pub struct Hysteria2Handler {
-    clients: ClientCache<Hy2Client>,
-}
+pub struct Hysteria2Handler;
 
 impl Hysteria2Handler {
     pub fn new() -> Self {
-        Self::default()
+        Self
     }
 
     /// Resolve the effective authentication password (`hy2_auth`, falling
@@ -579,7 +585,7 @@ impl Hysteria2Handler {
             .unwrap_or_else(|| node.password.as_deref().unwrap_or(""))
     }
 
-    async fn client_for(&self, node: &Node) -> anyhow::Result<Arc<Hy2Client>> {
+    async fn build_client(&self, node: &Node) -> anyhow::Result<Arc<Hy2Client>> {
         let password = Self::resolve_password(node);
         let obfs = node.hy2_obfs.as_deref().filter(|s| !s.is_empty());
         // Receive bandwidth for the auth header, bits/s (0 = unset).
@@ -596,68 +602,53 @@ impl Hysteria2Handler {
                     Duration::from_secs(node.hy2_hop_interval.unwrap_or(30).max(1)),
                 )
             });
-        let key = format!(
-            "{}:{}|{}|{}|{}|{}|{}|{}|{}|{}",
-            node.host(),
-            node.port,
-            crate::quic::key_fingerprint(&[password]),
-            node.sni.as_deref().unwrap_or(""),
-            node.skip_cert_verify,
-            obfs.unwrap_or(""),
-            node.hy2_up_mbps.unwrap_or(0),
-            rx_bps,
-            node.hy2_port_hopping.as_deref().unwrap_or(""),
-            node.hy2_hop_interval.unwrap_or(0),
-        );
         let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
-        crate::quic::cached_client(&self.clients, key, || async move {
-            // ALPN "h3" (hysteria2 runs its auth over HTTP/3, `client.go:100-102`).
-            // With `hy2_up_mbps` the send side runs a fixed-rate brutal sender;
-            // otherwise BBR — sing-quic's default when no bandwidth is
-            // configured (`client.go:580-588`).
-            let factory: Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> =
-                match node.hy2_up_mbps {
-                    Some(mbps) if mbps > 0 => Arc::new(crate::quic::BrutalConfig::from_bps(
-                        u64::from(mbps) * 1_000_000,
-                    )),
-                    _ => crate::quic::congestion_factory(Some("bbr")),
-                };
-            let config = crate::quic::client_config(
-                node,
-                &[b"h3"],
-                crate::quic::QuicClientOptions {
-                    congestion: Some(factory),
-                    keep_alive: Some(KEEP_ALIVE_INTERVAL),
-                    // Download throughput is capped by our advertised receive
-                    // windows (window/RTT): quinn's 1.25 MiB stream default
-                    // tops out around 2 Gbps on a LAN. Match the TUIC
-                    // defaults (8 MiB stream / 32 MiB conn).
-                    stream_receive_window: node.hy2_init_stream_recv_window.or(Some(8 << 20)),
-                    conn_receive_window: node.hy2_init_conn_recv_window.or(Some(32 << 20)),
-                    disable_mtu_discovery: node.hy2_disable_mtu_discovery == Some(true),
-                    max_udp_payload_size: node.quic_mtu,
-                },
-            )
-            .await?;
-            let quic = QuicClient::new(node.host().to_string(), node.port, server_name, config);
-            let mtu = node.quic_mtu.unwrap_or(1252);
-            let quic = quic.with_max_udp_payload_size(mtu);
-            let quic = match (obfs, hop) {
-                (None, None) => quic,
-                (obfs, hop) => quic.with_endpoint_factory(hy2_endpoint_factory(
-                    obfs.map(|p| Arc::from(p.as_bytes())),
-                    hop,
-                    mtu,
+        // ALPN "h3" (hysteria2 runs its auth over HTTP/3, `client.go:100-102`).
+        // With `hy2_up_mbps` the send side runs a fixed-rate brutal sender;
+        // otherwise BBR — sing-quic's default when no bandwidth is
+        // configured (`client.go:580-588`).
+        let factory: Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> =
+            match node.hy2_up_mbps {
+                Some(mbps) if mbps > 0 => Arc::new(crate::quic::BrutalConfig::from_bps(
+                    u64::from(mbps) * 1_000_000,
                 )),
+                _ => crate::quic::congestion_factory(Some("bbr")),
             };
-            Ok(Arc::new(Hy2Client {
-                quic,
-                password: password.to_string(),
-                rx_bps,
-            }))
-        })
-        .await
+        let config = crate::quic::client_config(
+            node,
+            &[b"h3"],
+            crate::quic::QuicClientOptions {
+                congestion: Some(factory),
+                keep_alive: Some(KEEP_ALIVE_INTERVAL),
+                // Download throughput is capped by our advertised receive
+                // windows (window/RTT): quinn's 1.25 MiB stream default
+                // tops out around 2 Gbps on a LAN. Match the TUIC
+                // defaults (8 MiB stream / 32 MiB conn).
+                stream_receive_window: node.hy2_init_stream_recv_window.or(Some(8 << 20)),
+                conn_receive_window: node.hy2_init_conn_recv_window.or(Some(32 << 20)),
+                disable_mtu_discovery: node.hy2_disable_mtu_discovery == Some(true),
+                max_udp_payload_size: node.quic_mtu,
+            },
+        )
+        .await?;
+        let quic = QuicClient::new(node.host().to_string(), node.port, server_name, config);
+        let mtu = node.quic_mtu.unwrap_or(1252);
+        let quic = quic.with_max_udp_payload_size(mtu);
+        let quic = match (obfs, hop) {
+            (None, None) => quic,
+            (obfs, hop) => quic.with_endpoint_factory(hy2_endpoint_factory(
+                obfs.map(|p| Arc::from(p.as_bytes())),
+                hop,
+                mtu,
+            )),
+        };
+        Ok(Arc::new(Hy2Client {
+            quic,
+            password: password.to_string(),
+            rx_bps,
+        }))
     }
+
     async fn client_for_runtime(
         &self,
         runtime: &crate::runtime::NodeRuntime,
@@ -666,7 +657,7 @@ impl Hysteria2Handler {
             anyhow::bail!("Hysteria2 runtime is not QUIC-owned");
         };
         quic_runtime
-            .client(|| self.client_for(runtime.node.as_ref()))
+            .client(|| self.build_client(runtime.node.as_ref()))
             .await
     }
 }
@@ -692,16 +683,14 @@ impl WarmableOutbound for Hysteria2Handler {
     }
 }
 
-#[async_trait]
-impl TcpOutbound for Hysteria2Handler {
-    async fn dial(
+impl Hysteria2Handler {
+    async fn dial_via_client(
         &self,
-        node: &Node,
+        client: Arc<Hy2Client>,
         target: SocketAddr,
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let client = self.client_for(node).await?;
         let addr = target_string(target, target_domain);
         if addr.len() as u64 > MAX_ADDRESS_LENGTH {
             anyhow::bail!("Hysteria2: target address too long");
@@ -751,28 +740,13 @@ impl TcpOutbound for Hysteria2Handler {
         })
     }
 
-    async fn dial_with_tcp(
+    async fn udp_transport_via_client(
         &self,
-        _node: &Node,
-        _target: SocketAddr,
-        _target_domain: Option<&str>,
-        _tcp: tokio::net::TcpStream,
-        _connect_timeout: Duration,
-    ) -> anyhow::Result<ProxyStream> {
-        anyhow::bail!("Hysteria2 runs over QUIC; a bare TCP connection cannot be reused")
-    }
-}
-
-#[async_trait]
-impl PacketOutbound for Hysteria2Handler {
-    async fn dial_udp_transport(
-        &self,
-        node: &Node,
+        client: Arc<Hy2Client>,
         target: SocketAddr,
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        let client = self.client_for(node).await?;
         let (conn, state) = client.connection(connect_timeout).await?;
         if state.udp_disabled {
             anyhow::bail!("Hysteria2: UDP disabled by server");
@@ -803,9 +777,86 @@ impl PacketOutbound for Hysteria2Handler {
 }
 
 #[async_trait]
+impl TcpOutbound for Hysteria2Handler {
+    async fn dial(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        let client = self.build_client(node).await?;
+        self.dial_via_client(client, target, target_domain, connect_timeout)
+            .await
+    }
+
+    async fn dial_runtime(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        let client = self.client_for_runtime(&runtime).await?;
+        self.dial_via_client(client, target, target_domain, connect_timeout)
+            .await
+    }
+
+    async fn dial_with_tcp(
+        &self,
+        _node: &Node,
+        _target: SocketAddr,
+        _target_domain: Option<&str>,
+        _tcp: tokio::net::TcpStream,
+        _connect_timeout: Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        anyhow::bail!("Hysteria2 runs over QUIC; a bare TCP connection cannot be reused")
+    }
+}
+
+#[async_trait]
+impl PacketOutbound for Hysteria2Handler {
+    async fn dial_udp_transport(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        let client = self.build_client(node).await?;
+        self.udp_transport_via_client(client, target, target_domain, connect_timeout)
+            .await
+    }
+
+    async fn dial_udp_transport_runtime(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        let client = self.client_for_runtime(&runtime).await?;
+        self.udp_transport_via_client(client, target, target_domain, connect_timeout)
+            .await
+    }
+
+    async fn dial_udp_transport_speculative_runtime(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<super::PreparedUdpTransport> {
+        self.dial_udp_transport_runtime(runtime, target, target_domain, connect_timeout)
+            .await
+            .map(super::PreparedUdpTransport::ready)
+    }
+}
+
+#[async_trait]
 impl ProbeableOutbound for Hysteria2Handler {
     async fn test_connectivity(&self, node: &Node) -> bool {
-        match self.client_for(node).await {
+        match self.build_client(node).await {
             Ok(client) => client.connection(Duration::from_secs(5)).await.is_ok(),
             Err(e) => {
                 debug!(

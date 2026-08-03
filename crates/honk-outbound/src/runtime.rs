@@ -8,8 +8,8 @@
 //! node may belong to many groups, and group rebuilds must not destroy
 //! live sessions). ProxyRegistry stays stateless handlers.
 //!
-//! AnyTLS currently owns its node-local session pool here. QUIC runtime
-//! ownership remain deferred to their dedicated migrations.
+//! AnyTLS owns its node-local session pool here; the QUIC protocols own
+//! their per-node client (and thereby the shared QUIC connection) here.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -76,13 +76,22 @@ pub enum ProtocolRuntime {
     Quic(QuicRuntime),
 }
 
+/// A protocol client stored in [`QuicRuntime`]. Implemented by the
+/// TUIC/Juicity/Hysteria2 per-server clients so a terminating generation
+/// can force-close the shared connection without knowing the concrete type.
+pub trait QuicRuntimeClient: Send + Sync + 'static {
+    fn into_erased(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync>;
+    /// Best-effort synchronous close of the cached connection and endpoint.
+    fn force_close(&self);
+}
+
 /// Generation-owned storage for protocol-specific QUIC clients.
 ///
 /// The mutex deliberately covers construction: TLS config construction may
 /// perform ECH discovery, and admitting two first flows must still result in
 /// one client/connection single-flight for this generation.
 pub struct QuicRuntime {
-    clients: tokio::sync::Mutex<HashMap<std::any::TypeId, Arc<dyn std::any::Any + Send + Sync>>>,
+    clients: tokio::sync::Mutex<HashMap<std::any::TypeId, Arc<dyn QuicRuntimeClient>>>,
 }
 
 impl std::fmt::Debug for QuicRuntime {
@@ -92,7 +101,7 @@ impl std::fmt::Debug for QuicRuntime {
 }
 
 impl QuicRuntime {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             clients: tokio::sync::Mutex::new(HashMap::new()),
         }
@@ -100,20 +109,32 @@ impl QuicRuntime {
 
     pub async fn client<T, F, Fut>(&self, build: F) -> anyhow::Result<Arc<T>>
     where
-        T: std::any::Any + Send + Sync + 'static,
+        T: QuicRuntimeClient,
         F: FnOnce() -> Fut,
         Fut: Future<Output = anyhow::Result<Arc<T>>>,
     {
         let mut clients = self.clients.lock().await;
         let key = std::any::TypeId::of::<T>();
         if let Some(client) = clients.get(&key) {
-            return Arc::downcast::<T>(Arc::clone(client))
+            return Arc::clone(client)
+                .into_erased()
+                .downcast::<T>()
                 .map_err(|_| anyhow::anyhow!("QUIC client slot type mismatch"));
         }
         let client = build().await?;
-        let erased: Arc<dyn std::any::Any + Send + Sync> = client.clone();
-        clients.insert(key, erased);
+        clients.insert(key, Arc::clone(&client) as Arc<dyn QuicRuntimeClient>);
         Ok(client)
+    }
+
+    /// Force-close every cached client. Best-effort: a client locked by an
+    /// in-flight dial is skipped, and that dial's caller observes the
+    /// terminal generation through the registry checks instead.
+    pub(crate) fn force_close_all(&self) {
+        if let Ok(clients) = self.clients.try_lock() {
+            for client in clients.values() {
+                client.force_close();
+            }
+        }
     }
 }
 
@@ -199,6 +220,10 @@ pub struct NodeRuntime {
     pub node: Arc<Node>,
     pub capabilities: OutboundCapabilities,
     pub runtime: ProtocolRuntime,
+    /// Set when a successor generation adopts this runtime verbatim; the
+    /// retiring generation must not drain or shut down sessions the
+    /// successor still serves.
+    adopted: AtomicBool,
 }
 
 impl NodeRuntime {
@@ -230,6 +255,15 @@ impl NodeRuntime {
             ProtocolRuntime::None | ProtocolRuntime::Quic(_) => false,
         }
     }
+}
+
+/// Full node-config equality for runtime adoption, ignoring the parse-time
+/// `created_at`/`updated_at` stamps (metadata, not dial configuration).
+fn same_node_config(a: &Node, b: &Node) -> bool {
+    let (mut a, b) = (a.clone(), b.clone());
+    a.created_at = b.created_at;
+    a.updated_at = b.updated_at;
+    a == b
 }
 
 /// Registry build/validation errors. A failure here aborts the reload
@@ -265,6 +299,18 @@ pub type SharedRuntimeRegistry = Arc<parking_lot::RwLock<Arc<OutboundRuntimeRegi
 impl OutboundRuntimeRegistry {
     /// Build and validate a registry from the generation's node set.
     pub fn build(nodes: &[Node]) -> Result<Self, RuntimeRegistryError> {
+        Self::build_reusing(nodes, None)
+    }
+
+    /// [`Self::build`] that adopts the previous generation's runtime for
+    /// every node whose full config survived the reload unchanged (the
+    /// content-derived ID alone is too narrow — it excludes dial fields
+    /// like SNI, transport, and obfs). Adopted runtimes keep their live
+    /// sessions; the previous generation skips them at drain/shutdown.
+    pub fn build_reusing(
+        nodes: &[Node],
+        previous: Option<&Self>,
+    ) -> Result<Self, RuntimeRegistryError> {
         let mut map = HashMap::with_capacity(nodes.len());
         for node in nodes {
             if node.id.is_nil() {
@@ -280,20 +326,33 @@ impl OutboundRuntimeRegistry {
                     }
                 })?;
             }
-            let protocol_runtime = crate::descriptor::descriptor(node.protocol)
-                .generation_runtime
-                .build();
-            let runtime = Arc::new(NodeRuntime {
-                node: Arc::new(node.clone()),
-                capabilities: OutboundCapabilities::for_node(node),
-                runtime: protocol_runtime,
+            let adopted = previous.and_then(|previous| {
+                let runtime = previous.get(&node.id)?;
+                same_node_config(&runtime.node, node).then_some(runtime)
             });
+            let reused = adopted.is_some();
+            let runtime = match adopted {
+                Some(runtime) => runtime,
+                None => Arc::new(NodeRuntime {
+                    node: Arc::new(node.clone()),
+                    capabilities: OutboundCapabilities::for_node(node),
+                    runtime: crate::descriptor::descriptor(node.protocol)
+                        .generation_runtime
+                        .build(),
+                    adopted: AtomicBool::new(false),
+                }),
+            };
             if let Some(prev) = map.insert(node.id, Arc::clone(&runtime)) {
                 return Err(RuntimeRegistryError::DuplicateId(
                     node.id,
                     prev.node.name.clone(),
                     node.name.clone(),
                 ));
+            }
+            // Marked only after a successful build step: an aborted reload
+            // leaves the previous generation's drain semantics untouched.
+            if reused {
+                runtime.adopted.store(true, Ordering::Release);
             }
         }
         Ok(Self {
@@ -370,9 +429,16 @@ impl OutboundRuntimeRegistry {
 
     /// Reject new pool work and let published sessions close after their last
     /// stream releases. Existing streams remain usable while draining.
+    /// Runtimes adopted by a successor generation are left alone. QUIC
+    /// connections need no drain step: new work is rejected by the terminal
+    /// flag at the registry checks, and in-flight flows keep their
+    /// connections until they finish.
     pub fn drain_session_pools(&self) {
         self.begin_retirement();
         for runtime in self.nodes.values() {
+            if runtime.adopted.load(Ordering::Acquire) {
+                continue;
+            }
             if let ProtocolRuntime::AnyTls(anytls) = &runtime.runtime {
                 anytls.pool.retire();
             }
@@ -385,8 +451,13 @@ impl OutboundRuntimeRegistry {
     pub fn shutdown(&self) {
         self.terminal.store(true, Ordering::Release);
         for runtime in self.nodes.values() {
-            if let ProtocolRuntime::AnyTls(anytls) = &runtime.runtime {
-                anytls.pool.shutdown();
+            if runtime.adopted.load(Ordering::Acquire) {
+                continue;
+            }
+            match &runtime.runtime {
+                ProtocolRuntime::AnyTls(anytls) => anytls.pool.shutdown(),
+                ProtocolRuntime::Quic(quic) => quic.force_close_all(),
+                ProtocolRuntime::None => {}
             }
         }
     }
@@ -529,6 +600,62 @@ mod tests {
         let hy2 = node("x", NodeProtocol::Hysteria2);
         let caps = OutboundCapabilities::for_node(&hy2);
         assert!(!caps.multiplexed && caps.udp);
+    }
+
+    #[test]
+    fn build_reusing_adopts_unchanged_nodes_and_skips_them_at_shutdown() {
+        let unchanged = node("anytls", NodeProtocol::AnyTLS);
+        let mut changed = node("tuic", NodeProtocol::Tuic);
+        let first = OutboundRuntimeRegistry::build(&[unchanged.clone(), changed.clone()]).unwrap();
+        let first_unchanged = first.get(&unchanged.id).unwrap();
+        let first_changed = first.get(&changed.id).unwrap();
+
+        changed.sni = Some("new.example.com".to_string());
+        let second = OutboundRuntimeRegistry::build_reusing(
+            &[unchanged.clone(), changed.clone()],
+            Some(&first),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(
+            &first_unchanged,
+            &second.get(&unchanged.id).unwrap()
+        ));
+        assert!(!Arc::ptr_eq(
+            &first_changed,
+            &second.get(&changed.id).unwrap()
+        ));
+
+        // Draining and shutting down the old generation leaves the adopted
+        // pool serving the successor.
+        first.drain_session_pools();
+        first.shutdown();
+        let ProtocolRuntime::AnyTls(anytls) = &second.get(&unchanged.id).unwrap().runtime else {
+            panic!("anytls runtime expected");
+        };
+        assert!(!anytls.pool.is_retired());
+
+        // A rebuilt runtime for the changed node is fully retired with the
+        // old generation.
+        let ProtocolRuntime::Quic(_) = &first_changed.runtime else {
+            panic!("quic runtime expected");
+        };
+    }
+
+    #[test]
+    fn build_reusing_ignores_parse_timestamps() {
+        let mut parsed = node("trojan", NodeProtocol::Trojan);
+        parsed.sni = Some("example.com".to_string());
+        let first = OutboundRuntimeRegistry::build(std::slice::from_ref(&parsed)).unwrap();
+        let mut reparsed = parsed.clone();
+        reparsed.created_at = chrono::Utc::now();
+        reparsed.updated_at = chrono::Utc::now();
+        let second =
+            OutboundRuntimeRegistry::build_reusing(std::slice::from_ref(&reparsed), Some(&first))
+                .unwrap();
+        assert!(Arc::ptr_eq(
+            &first.get(&parsed.id).unwrap(),
+            &second.get(&parsed.id).unwrap()
+        ));
     }
 
     #[test]

@@ -18,10 +18,9 @@
 //!   [`crate::proxy::ProxyStream`].
 //! - Small pieces shared verbatim by the three protocol handlers:
 //!   [`now_secs`], [`recv_read_exact`], the UDP fragment [`defrag`] module,
-//!   [`cached_client`], [`exporter_auth`], [`spawn_conn_reaper`] and the
-//!   [`dial_quic_stream`] retry skeleton.
+//!   [`exporter_auth`], [`spawn_conn_reaper`] and the [`dial_quic_stream`]
+//!   retry skeleton.
 
-use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -717,7 +716,7 @@ impl<C> QuicClient<C> {
     }
     /// Whether this client already owns a live reusable QUIC connection.
     /// Warm-up uses this only to report whether it established a connection;
-    /// the connection itself remains owned by the client cache.
+    /// the connection itself remains owned by the generation runtime.
     pub async fn has_live_connection(&self) -> bool {
         self.state
             .lock()
@@ -725,6 +724,22 @@ impl<C> QuicClient<C> {
             .conn
             .as_ref()
             .is_some_and(|(conn, _)| conn.close_reason().is_none())
+    }
+
+    /// Close the cached connection and endpoint without waiting for the
+    /// state lock: a generation shutdown must not queue behind an in-flight
+    /// dial (that dial's caller fails through the terminal-generation
+    /// checks instead). Flows already owning a `(Connection, Arc<C>)` pair
+    /// keep it — this only stops future reuse.
+    pub fn force_close(&self) {
+        if let Ok(mut state) = self.state.try_lock() {
+            if let Some((conn, _)) = state.conn.take() {
+                conn.close(VarInt::from_u32(0), b"generation shutdown");
+            }
+            if let Some((_, endpoint)) = state.endpoint.take() {
+                endpoint.close(VarInt::from_u32(0), b"generation shutdown");
+            }
+        }
     }
 }
 
@@ -827,77 +842,6 @@ pub(crate) trait QuicConnState: Send + Sync + 'static {
     fn touch(&self);
     /// Counter of open streams/bridges on this connection.
     fn open_counter(&self) -> &Arc<AtomicUsize>;
-}
-
-/// Per-server protocol-client cache (TUIC/Juicity/Hysteria2 pool
-/// parity): an owned map keyed by server + credential **fingerprint** —
-/// one per handler instance, never process-global, and never holding a
-/// cleartext password in the key.
-pub(crate) struct ClientCache<C> {
-    map: Arc<parking_lot::Mutex<HashMap<String, Arc<C>>>>,
-}
-
-impl<C> ClientCache<C> {
-    pub(crate) fn new() -> Self {
-        Self {
-            map: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-        }
-    }
-}
-
-impl<C> Default for ClientCache<C> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<C> Clone for ClientCache<C> {
-    fn clone(&self) -> Self {
-        Self {
-            map: Arc::clone(&self.map),
-        }
-    }
-}
-
-impl<C> std::fmt::Debug for ClientCache<C> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ClientCache")
-            .field("entries", &self.map.lock().len())
-            .finish()
-    }
-}
-
-/// blake3 fingerprint (16 hex chars) for cache keys: credentials never
-/// sit in keys in the clear.
-pub(crate) fn key_fingerprint(parts: &[&str]) -> String {
-    let mut h = blake3::Hasher::new();
-    for p in parts {
-        h.update(p.as_bytes());
-        h.update(b"|");
-    }
-    h.finalize().to_hex()[..16].to_string()
-}
-
-/// Look up a cached per-server protocol client, building and inserting it
-/// when missing. The build runs outside the lock (it is async — ECH
-/// discovery), so a concurrent task may have won the race; in that case the
-/// existing entry is reused and the freshly built one dropped.
-pub(crate) async fn cached_client<C, F, Fut>(
-    cache: &ClientCache<C>,
-    key: String,
-    build: F,
-) -> anyhow::Result<Arc<C>>
-where
-    C: Send + Sync + 'static,
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = anyhow::Result<Arc<C>>>,
-{
-    if let Some(client) = cache.map.lock().get(&key) {
-        return Ok(Arc::clone(client));
-    }
-    let client = build().await?;
-    // Another task may have won the race — reuse theirs.
-    Ok(cache.map.lock().entry(key).or_insert(client).clone())
 }
 
 /// TUIC-style exporter authentication (sing `clientHandshake`,

@@ -36,9 +36,7 @@ use tokio::sync::mpsc;
 use tracing::debug;
 
 use crate::quic::defrag::Defragmenter;
-use crate::quic::{
-    ClientCache, QuicClient, QuicConnState, now_secs, recv_read_exact as read_exact,
-};
+use crate::quic::{QuicClient, QuicConnState, now_secs, recv_read_exact as read_exact};
 
 use super::addr::{self, SocksAddr};
 use super::{
@@ -390,6 +388,16 @@ struct TuicClient {
     password: String,
 }
 
+impl crate::runtime::QuicRuntimeClient for TuicClient {
+    fn into_erased(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
+        self
+    }
+
+    fn force_close(&self) {
+        self.quic.force_close();
+    }
+}
+
 impl TuicClient {
     async fn connection(
         &self,
@@ -407,19 +415,17 @@ impl TuicClient {
     }
 }
 
-/// TUIC proxy handler. Stateless except its per-server client cache
-/// (owned per handler instance — never process-global).
+/// TUIC proxy handler. Stateless: the per-server client (and its shared
+/// QUIC connection) lives in the node's generation runtime.
 #[derive(Debug, Default, Clone)]
-pub struct TuicHandler {
-    clients: ClientCache<TuicClient>,
-}
+pub struct TuicHandler;
 
 impl TuicHandler {
     pub fn new() -> Self {
-        Self::default()
+        Self
     }
 
-    async fn client_for(&self, node: &Node) -> anyhow::Result<Arc<TuicClient>> {
+    async fn build_client(&self, node: &Node) -> anyhow::Result<Arc<TuicClient>> {
         let uuid_str = node
             .tuic_uuid
             .as_deref()
@@ -449,16 +455,6 @@ impl TuicHandler {
             })
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| vec![b"tuic".to_vec()]);
-        let alpn_key = node.tuic_alpn.as_deref().unwrap_or("").to_string();
-        let key = format!(
-            "{}:{}|{}|{}|{}|{}",
-            node.host(),
-            node.port,
-            crate::quic::key_fingerprint(&[uuid_str, &password]),
-            node.sni.as_deref().unwrap_or(""),
-            node.skip_cert_verify,
-            alpn_key,
-        );
         // quinn's default stream window (1.25MB) caps a single stream at
         // ~12.5MB/s per 100ms of RTT — unusable on long-fat links. Default
         // to 8MB stream / 32MB conn; explicit node fields override.
@@ -471,17 +467,14 @@ impl TuicHandler {
             max_udp_payload_size: node.quic_mtu,
             ..Default::default()
         };
-        crate::quic::cached_client(&self.clients, key, || async move {
-            let alpn_refs: Vec<&[u8]> = alpn.iter().map(Vec::as_slice).collect();
-            let config = crate::quic::client_config(node, &alpn_refs, options).await?;
-            Ok(Arc::new(TuicClient {
-                quic: QuicClient::new(node.host().to_string(), node.port, server_name, config)
-                    .with_max_udp_payload_size(node.quic_mtu.unwrap_or(1252)),
-                uuid: *uuid.as_bytes(),
-                password,
-            }))
-        })
-        .await
+        let alpn_refs: Vec<&[u8]> = alpn.iter().map(Vec::as_slice).collect();
+        let config = crate::quic::client_config(node, &alpn_refs, options).await?;
+        Ok(Arc::new(TuicClient {
+            quic: QuicClient::new(node.host().to_string(), node.port, server_name, config)
+                .with_max_udp_payload_size(node.quic_mtu.unwrap_or(1252)),
+            uuid: *uuid.as_bytes(),
+            password,
+        }))
     }
 
     async fn client_for_runtime(
@@ -492,8 +485,72 @@ impl TuicHandler {
             anyhow::bail!("TUIC runtime is not QUIC-owned");
         };
         quic_runtime
-            .client(|| self.client_for(runtime.node.as_ref()))
+            .client(|| self.build_client(runtime.node.as_ref()))
             .await
+    }
+
+    async fn dial_via_client(
+        &self,
+        client: Arc<TuicClient>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        let addr = TuicAddr::new(target, target_domain);
+        let stream = crate::quic::dial_quic_stream(
+            &client.quic,
+            |timeout| {
+                let client = Arc::clone(&client);
+                async move { client.connection(timeout).await }
+            },
+            connect_timeout,
+            move |conn| {
+                let addr = addr.clone();
+                async move {
+                    let (mut send, recv) = conn.open_bi().await.context("TUIC: open stream")?;
+                    let mut header = Vec::with_capacity(2 + addr.encoded_len());
+                    header.push(TUIC_VERSION);
+                    header.push(CMD_CONNECT);
+                    addr.encode(&mut header);
+                    send.write_all(&header)
+                        .await
+                        .context("TUIC: send CONNECT")?;
+                    Ok((send, recv))
+                }
+            },
+            |_| true,
+            "TUIC",
+        )
+        .await?;
+        Ok(ProxyStream {
+            stream: Box::new(stream),
+            target_addr: target,
+            target_domain: target_domain.map(str::to_string),
+        })
+    }
+
+    async fn udp_transport_via_client(
+        &self,
+        client: Arc<TuicClient>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        let (_conn, state) = client.connection(connect_timeout).await?;
+        state.touch();
+        let session_id = state.alloc_session();
+        let (tx, rx) = mpsc::channel::<UdpInbound>(UDP_SESSION_QUEUE_CAP);
+        state.sessions.lock().insert(session_id, tx);
+        state.open.fetch_add(1, Ordering::Relaxed);
+        Ok(Arc::new(TuicUdpTransport {
+            state,
+            session_id,
+            packet_id: AtomicU16::new(0),
+            rx: tokio::sync::Mutex::new(rx),
+            defrag: tokio::sync::Mutex::new(Defragmenter::new()),
+            target_addr: TuicAddr::new(target, target_domain),
+            target,
+        }))
     }
 
     async fn send_udp(
@@ -561,38 +618,21 @@ impl TcpOutbound for TuicHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let client = self.client_for(node).await?;
-        let addr = TuicAddr::new(target, target_domain);
-        let stream = crate::quic::dial_quic_stream(
-            &client.quic,
-            |timeout| {
-                let client = Arc::clone(&client);
-                async move { client.connection(timeout).await }
-            },
-            connect_timeout,
-            move |conn| {
-                let addr = addr.clone();
-                async move {
-                    let (mut send, recv) = conn.open_bi().await.context("TUIC: open stream")?;
-                    let mut header = Vec::with_capacity(2 + addr.encoded_len());
-                    header.push(TUIC_VERSION);
-                    header.push(CMD_CONNECT);
-                    addr.encode(&mut header);
-                    send.write_all(&header)
-                        .await
-                        .context("TUIC: send CONNECT")?;
-                    Ok((send, recv))
-                }
-            },
-            |_| true,
-            "TUIC",
-        )
-        .await?;
-        Ok(ProxyStream {
-            stream: Box::new(stream),
-            target_addr: target,
-            target_domain: target_domain.map(str::to_string),
-        })
+        let client = self.build_client(node).await?;
+        self.dial_via_client(client, target, target_domain, connect_timeout)
+            .await
+    }
+
+    async fn dial_runtime(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        let client = self.client_for_runtime(&runtime).await?;
+        self.dial_via_client(client, target, target_domain, connect_timeout)
+            .await
     }
 
     async fn dial_with_tcp(
@@ -616,29 +656,40 @@ impl PacketOutbound for TuicHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        let client = self.client_for(node).await?;
-        let (_conn, state) = client.connection(connect_timeout).await?;
-        state.touch();
-        let session_id = state.alloc_session();
-        let (tx, rx) = mpsc::channel::<UdpInbound>(UDP_SESSION_QUEUE_CAP);
-        state.sessions.lock().insert(session_id, tx);
-        state.open.fetch_add(1, Ordering::Relaxed);
-        Ok(Arc::new(TuicUdpTransport {
-            state,
-            session_id,
-            packet_id: AtomicU16::new(0),
-            rx: tokio::sync::Mutex::new(rx),
-            defrag: tokio::sync::Mutex::new(Defragmenter::new()),
-            target_addr: TuicAddr::new(target, target_domain),
-            target,
-        }))
+        let client = self.build_client(node).await?;
+        self.udp_transport_via_client(client, target, target_domain, connect_timeout)
+            .await
+    }
+
+    async fn dial_udp_transport_runtime(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        let client = self.client_for_runtime(&runtime).await?;
+        self.udp_transport_via_client(client, target, target_domain, connect_timeout)
+            .await
+    }
+
+    async fn dial_udp_transport_speculative_runtime(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<super::PreparedUdpTransport> {
+        self.dial_udp_transport_runtime(runtime, target, target_domain, connect_timeout)
+            .await
+            .map(super::PreparedUdpTransport::ready)
     }
 }
 
 #[async_trait]
 impl ProbeableOutbound for TuicHandler {
     async fn test_connectivity(&self, node: &Node) -> bool {
-        match self.client_for(node).await {
+        match self.build_client(node).await {
             // With the zero auth grace on the dial path, a wrong password is
             // only visible when the server closes the connection (~1 RTT) —
             // wait for that here, scaled to the measured RTT.

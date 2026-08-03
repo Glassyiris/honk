@@ -374,6 +374,11 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         PoolState::from(self.state.load(Ordering::Acquire))
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_retired(&self) -> bool {
+        self.state() != PoolState::Running
+    }
+
     fn pool_closed_err() -> anyhow::Error {
         anyhow!("session pool is closed")
     }

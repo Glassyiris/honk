@@ -105,8 +105,13 @@ impl ControlPlane {
         new_group_manager.migrate_selector_choices_from(&old_group_manager);
         // Build the outbound generation before DNS so every new runtime
         // snapshot captures its own immutable node/session ownership.
+        // Nodes whose config survived the reload unchanged adopt the
+        // current generation's runtime (live sessions stay up).
         let new_runtime_registry = Arc::new(
-            match honk_outbound::runtime::OutboundRuntimeRegistry::build(&new_config.nodes) {
+            match honk_outbound::runtime::OutboundRuntimeRegistry::build_reusing(
+                &new_config.nodes,
+                Some(&self.runtime_registry.read()),
+            ) {
                 Ok(r) => r,
                 Err(e) => {
                     error!("Failed to build runtime registry (reload aborted): {}", e);
@@ -2210,8 +2215,8 @@ mod atomic_reload_tests {
             "old warm must exit after its generation becomes terminal"
         );
         assert!(
-            !Arc::ptr_eq(&old_runtime, &new_runtime),
-            "the reload must not reuse an old NodeRuntime"
+            Arc::ptr_eq(&old_runtime, &new_runtime),
+            "an unchanged node adopts the old generation's NodeRuntime"
         );
         assert!(Arc::ptr_eq(
             &new_runtime,
