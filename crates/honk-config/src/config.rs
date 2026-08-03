@@ -428,7 +428,7 @@ impl Config {
         // A recognized extension picks its format first and falls back to the
         // other structured formats.  Unknown or missing extensions keep the
         // historical dae -> TOML -> YAML -> JSON fallback chain.
-        match ext.as_deref() {
+        let mut config = match ext.as_deref() {
             Some("json") => Self::from_json_str(&content)
                 .or_else(|_| parse_toml(&content))
                 .or_else(|_| parse_yaml(&content)),
@@ -447,7 +447,9 @@ impl Config {
                     .or_else(|_| parse_yaml(&content))
                     .or_else(|_| Self::from_json_str(&content)),
             },
-        }
+        }?;
+        config.derive_node_ids();
+        Ok(config)
     }
 
     pub fn to_file(&self, path: &str) -> Result<(), crate::ConfigError> {
@@ -475,7 +477,23 @@ impl Config {
 
     /// Parse a configuration from a JSON string.
     pub fn from_json_str(s: &str) -> Result<Self, crate::ConfigError> {
-        serde_json::from_str(s).map_err(|e| crate::ConfigError::Parse(e.to_string()))
+        let mut config: Self =
+            serde_json::from_str(s).map_err(|e| crate::ConfigError::Parse(e.to_string()))?;
+        config.derive_node_ids();
+        Ok(config)
+    }
+
+    /// Re-derive every node's content-based ID ([`Node::derive_id`]) after
+    /// load. Stored/serde-default IDs are discarded so identity always
+    /// reflects the current content; the built-in direct/block nodes keep
+    /// their fixed IDs.
+    fn derive_node_ids(&mut self) {
+        for node in &mut self.nodes {
+            if node.id == DIRECT_NODE_ID || node.id == BLOCK_NODE_ID {
+                continue;
+            }
+            node.id = node.derive_id();
+        }
     }
 
     pub fn validate(&self) -> Result<(), crate::ConfigError> {
@@ -486,6 +504,23 @@ impl Config {
                 "global.tproxy_mark must be {:#x} (compiled into the eBPF datapath)",
                 default_tproxy_mark()
             )));
+        }
+        // Content-derived IDs collide when two nodes share protocol, server,
+        // and credentials — they are the same endpoint and cannot coexist
+        // in the runtime registry.
+        let mut ids: std::collections::HashMap<uuid::Uuid, &str> = std::collections::HashMap::new();
+        for node in &self.nodes {
+            if node.id.is_nil() {
+                continue;
+            }
+            if let Some(prev) = ids.insert(node.id, &node.name)
+                && prev != node.name
+            {
+                return Err(crate::ConfigError::Validation(format!(
+                    "Nodes '{}' and '{}' derive the same ID (identical protocol, server and credentials)",
+                    prev, node.name
+                )));
+            }
         }
         for node in &self.nodes {
             // The injected built-ins carry no dialable address by design.
@@ -592,6 +627,28 @@ mod builtin_nodes_tests {
                 "{name}/{protocol:?} must be rejected: {err}"
             );
         }
+    }
+
+    #[test]
+    fn test_validate_rejects_derived_id_conflicts() {
+        let node = |name: &str| {
+            let mut n =
+                crate::node::Node::from_share_link("trojan://secret@example.com:443").unwrap();
+            n.name = name.into();
+            n
+        };
+        let mut config = Config::default();
+        config.nodes.push(node("alpha"));
+        config.nodes.push(node("beta"));
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("'alpha' and 'beta'"),
+            "conflict error must name both nodes: {err}"
+        );
+        // A credential change breaks the tie.
+        config.nodes[1].password = Some("other".into());
+        config.nodes[1].id = config.nodes[1].derive_id();
+        assert!(config.validate().is_ok());
     }
 
     #[test]

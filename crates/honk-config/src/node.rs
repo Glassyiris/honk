@@ -29,10 +29,19 @@ where
 
 use crate::types::NodeProtocol;
 
+/// UUID v5 namespace for content-derived node IDs ([`Node::derive_id`]).
+/// Fixed arbitrary value; never change it or every persisted node identity
+/// breaks.
+pub const NODE_ID_NAMESPACE: uuid::Uuid =
+    uuid::Uuid::from_u128(0x3d8f2e1a_9b4c_4d57_8f3a_2c6e1d0b9a7f);
+
 /// A proxy node definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
-    #[serde(default = "uuid::Uuid::new_v4")]
+    /// Stable identity derived from the node's content by [`Node::derive_id`]
+    /// at every construction entry (nil until then — the runtime registry
+    /// rejects nil IDs, so a missed entry fails loudly).
+    #[serde(default)]
     pub id: uuid::Uuid,
     pub name: String,
     pub protocol: NodeProtocol,
@@ -187,13 +196,9 @@ fn default_transport() -> String {
 }
 
 impl Default for Node {
-    /// serde's `id` field default (new_v4) must hold for every
-    /// construction path — the runtime registry keys on `Node.id`, and
-    /// the derive-Default nil UUID would break it (e.g. the built-in
-    /// `direct` node).
     fn default() -> Self {
         Self {
-            id: uuid::Uuid::new_v4(),
+            id: uuid::Uuid::nil(),
             name: String::new(),
             protocol: NodeProtocol::default(),
             address: String::new(),
@@ -255,6 +260,57 @@ impl Node {
             self.address.split(':').next().unwrap_or(&self.address)
         } else {
             &self.host
+        }
+    }
+
+    /// Content-derived stable identity: UUID v5 over
+    /// `protocol|host|port|credential-fingerprint`. The same node config
+    /// keeps its ID across reloads and subscription refreshes (health
+    /// state, latency history, and session pools survive); renaming a node
+    /// does NOT change the ID — identity is the dialable endpoint, not the
+    /// label. Display/transport knobs are excluded from the fingerprint.
+    pub fn derive_id(&self) -> uuid::Uuid {
+        let material = format!(
+            "{}|{}|{}|{}",
+            self.protocol.as_str(),
+            self.host(),
+            self.port,
+            self.credential_fingerprint()
+        );
+        uuid::Uuid::new_v5(&NODE_ID_NAMESPACE, material.as_bytes())
+    }
+
+    /// The protocol's credential identity, resolved the same way the
+    /// protocol handlers resolve their auth fields (specific field first,
+    /// generic `username`/`password` fallback). Empty for protocols
+    /// without credentials (direct/block, unauthenticated socks5).
+    fn credential_fingerprint(&self) -> String {
+        let user = self.username.as_deref().unwrap_or("");
+        let pass = self.password.as_deref().unwrap_or("");
+        match self.protocol {
+            NodeProtocol::SS => {
+                format!("{}|{}", self.encryption.as_deref().unwrap_or(""), pass)
+            }
+            NodeProtocol::Trojan | NodeProtocol::VMess | NodeProtocol::VLess => pass.to_string(),
+            NodeProtocol::Socks5 => format!("{user}|{pass}"),
+            NodeProtocol::Hysteria2 => self.hy2_auth.as_deref().unwrap_or(pass).to_string(),
+            NodeProtocol::Tuic => format!(
+                "{}|{}",
+                self.tuic_uuid.as_deref().unwrap_or(user),
+                self.tuic_password.as_deref().unwrap_or(pass)
+            ),
+            NodeProtocol::Juicity => format!(
+                "{}|{}",
+                self.juicity_uuid.as_deref().unwrap_or(user),
+                self.juicity_password.as_deref().unwrap_or(pass)
+            ),
+            NodeProtocol::AnyTLS => self
+                .password
+                .as_deref()
+                .or(self.anytls_password.as_deref())
+                .unwrap_or("")
+                .to_string(),
+            NodeProtocol::Direct | NodeProtocol::Block => String::new(),
         }
     }
 }
@@ -374,5 +430,27 @@ mod tests {
             serde_json::to_string(&GroupPolicy::URLTest).unwrap(),
             "\"urltest\""
         );
+    }
+
+    #[test]
+    fn test_derive_id_is_content_derived() {
+        let node = Node::from_share_link("trojan://secret@example.com:443#one").unwrap();
+        // Same content, different name → same ID.
+        let mut renamed = node.clone();
+        renamed.name = "two".into();
+        assert_eq!(node.derive_id(), renamed.derive_id());
+        assert_eq!(node.id, node.derive_id());
+
+        // Credential or endpoint change → different ID.
+        let mut other_pw = node.clone();
+        other_pw.password = Some("other".into());
+        assert_ne!(node.derive_id(), other_pw.derive_id());
+        let mut other_port = node.clone();
+        other_port.port = 8443;
+        assert_ne!(node.derive_id(), other_port.derive_id());
+        // Display/transport knobs do not participate.
+        let mut other_sni = node.clone();
+        other_sni.sni = Some("cdn.example".into());
+        assert_eq!(node.derive_id(), other_sni.derive_id());
     }
 }

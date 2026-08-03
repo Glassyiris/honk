@@ -78,7 +78,6 @@ impl Node {
         let port = url.port().unwrap_or(443);
 
         let mut node = Node {
-            id: uuid::Uuid::new_v4(),
             protocol,
             host: host.clone(),
             address: format!("{}:{}", host, port),
@@ -321,6 +320,7 @@ impl Node {
             }
         }
 
+        node.id = node.derive_id();
         Ok(node)
     }
 }
@@ -403,7 +403,6 @@ impl VmessLinkJson {
         let transport = self.net.unwrap_or_default();
 
         let mut node = Node {
-            id: uuid::Uuid::new_v4(),
             protocol: NodeProtocol::VMess,
             host: host.clone(),
             address: format!("{}:{}", host, port),
@@ -439,6 +438,7 @@ impl VmessLinkJson {
             }
         }
 
+        node.id = node.derive_id();
         Ok(node)
     }
 }

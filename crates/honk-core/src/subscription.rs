@@ -207,7 +207,6 @@ fn parse_clash_subscription(
         let address = format!("{}:{}", server, port);
 
         let mut node = Node {
-            id: uuid::Uuid::new_v4(),
             name,
             protocol,
             address,
@@ -261,6 +260,7 @@ fn parse_clash_subscription(
         }
 
         node.subscription_id = subscription_id;
+        node.id = node.derive_id();
         nodes.push(node);
     }
 
