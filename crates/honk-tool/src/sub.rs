@@ -383,7 +383,7 @@ fn rand_seed() -> u64 {
         .unwrap_or(0x9e3779b97f4a7c15)
 }
 
-/// UDP probe: one minimal DNS A query through the node's `dial_udp`.
+/// UDP probe: one minimal DNS A query through the node's UDP transport.
 /// Proves the node's UDP relay path end to end (mirrors the engine's
 /// `probe_node_udp` health check).
 async fn probe_udp_dns(
@@ -392,8 +392,11 @@ async fn probe_udp_dns(
     timeout: Duration,
 ) -> Option<Result<Duration, String>> {
     let dns_server: SocketAddr = "8.8.8.8:53".parse().unwrap();
-    let proxy = match registry.dial_udp(node, dns_server, None, timeout).await {
-        Ok(p) => p,
+    let transport = match registry
+        .dial_udp_transport(node, dns_server, None, timeout)
+        .await
+    {
+        Ok(t) => t,
         Err(e) => return Some(Err(e.to_string())),
     };
 
@@ -419,11 +422,11 @@ async fn probe_udp_dns(
     query.extend_from_slice(&[0x00, 0x00, 0x01, 0x00, 0x01]); // root, A, IN
 
     let start = Instant::now();
-    if let Err(e) = proxy.socket.send_to(&query, proxy.relay_addr).await {
+    if let Err(e) = transport.send_packet(&query).await {
         return Some(Err(format!("dns send: {e}")));
     }
     let mut buf = [0u8; 512];
-    match tokio::time::timeout(timeout, proxy.socket.recv_from(&mut buf)).await {
+    match tokio::time::timeout(timeout, transport.recv_packet(&mut buf)).await {
         Ok(Ok((n, _))) => {
             if n >= 2 && buf[0] == query[0] && buf[1] == query[1] {
                 Some(Ok(start.elapsed()))
@@ -437,8 +440,8 @@ async fn probe_udp_dns(
     }
 }
 
-/// UDP probe for QUIC: run a real QUIC handshake through the node's
-/// `dial_udp` and time it.  Unlike a bare Version-Negotiation trigger (which
+/// UDP probe for QUIC: run a real QUIC handshake through the node's UDP
+/// transport and time it.  Unlike a bare Version-Negotiation trigger (which
 /// most frontends silently drop), this proves TLS-in-QUIC reachability
 /// through the node's UDP path.
 async fn probe_udp_quic(
@@ -452,8 +455,8 @@ async fn probe_udp_quic(
         Ok(mut addrs) => addrs.find(|a| a.is_ipv4())?,
         Err(e) => return Some(Err(format!("resolve {url_host}: {e}"))),
     };
-    let proxy = match registry.dial_udp(node, addr, None, timeout).await {
-        Ok(p) => p,
+    let transport = match registry.dial_udp_transport(node, addr, None, timeout).await {
+        Ok(t) => t,
         Err(e) => return Some(Err(e.to_string())),
     };
 
@@ -474,7 +477,9 @@ async fn probe_udp_quic(
         Err(e) => return Some(Err(format!("quic config: {e}"))),
     };
 
-    match honk_outbound::quic::quic_handshake_probe(proxy, addr, url_host, &config, timeout).await {
+    match honk_outbound::quic::quic_handshake_probe(transport, addr, url_host, &config, timeout)
+        .await
+    {
         Ok(elapsed) => Some(Ok(elapsed)),
         Err(e) => Some(Err(e.to_string())),
     }

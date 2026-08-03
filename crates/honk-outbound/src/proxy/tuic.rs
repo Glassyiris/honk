@@ -42,7 +42,7 @@ use crate::quic::{
 };
 
 use super::addr::{self, SocksAddr};
-use super::{PacketTransport, ProxyHandler, ProxyStream, UdpProxySocket};
+use super::{PacketTransport, ProxyHandler, ProxyStream};
 
 const TUIC_VERSION: u8 = 0x05;
 
@@ -63,8 +63,6 @@ const CONN_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// otherwise pays a fixed 150ms (measured: 160ms cold TUIC connect vs
 /// dae's 85ms).
 const AUTH_GRACE: Duration = Duration::ZERO;
-/// Tear down a UDP session bridge after this long without traffic.
-const UDP_BRIDGE_IDLE: Duration = Duration::from_secs(90);
 
 /// TUIC address: the shared SOCKS5-style address encoded under sing's
 /// socksaddr ATYP numbering ([`addr::ATYP_SING`]), plus TUIC's own
@@ -597,93 +595,6 @@ impl ProxyHandler for TuicHandler {
         })
     }
 
-    async fn dial_udp(
-        &self,
-        node: &Node,
-        target: SocketAddr,
-        target_domain: Option<&str>,
-        connect_timeout: Duration,
-    ) -> anyhow::Result<UdpProxySocket> {
-        let client = self.client_for(node).await?;
-        let (conn, state) = client.connection(connect_timeout).await?;
-        state.touch();
-        let session_id = state.alloc_session();
-        let target_addr = TuicAddr::new(target, target_domain);
-
-        // Bridge the QUIC tunnel to a local UDP socket pair: the relay sends
-        // raw payloads to `relay_addr` on the returned socket and receives
-        // replies from the same address (see UdpProxySocket users).
-        let (external, internal, external_addr, relay_addr) =
-            crate::util::udp_loopback_pair().await?;
-
-        let (tx, mut rx) = mpsc::channel::<UdpInbound>(UDP_SESSION_QUEUE_CAP);
-        state.sessions.lock().insert(session_id, tx);
-
-        let bridge_state = Arc::clone(&state);
-        bridge_state.open.fetch_add(1, Ordering::Relaxed);
-        tokio::spawn(async move {
-            let mut defrag = Defragmenter::new();
-            let mut packet_id: u16 = 0;
-            let mut buf = vec![0u8; 65536];
-            loop {
-                tokio::select! {
-                    result = internal.recv_from(&mut buf) => {
-                        match result {
-                            Ok((n, src)) => {
-                                if src != external_addr {
-                                    continue;
-                                }
-                                packet_id = packet_id.wrapping_add(1);
-                                if let Err(e) = Self::send_udp(
-                                    &bridge_state,
-                                    session_id,
-                                    packet_id,
-                                    &target_addr,
-                                    &buf[..n],
-                                )
-                                .await
-                                {
-                                    debug!("TUIC UDP: send failed: {e}");
-                                    break;
-                                }
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    msg = rx.recv() => {
-                        match msg {
-                            Some(msg) => {
-                                if let Some(data) = defrag.feed(
-                                    msg.packet_id,
-                                    msg.frag_id,
-                                    msg.frag_total,
-                                    msg.data,
-                                ) && internal.send_to(&data, external_addr).await.is_err()
-                                {
-                                    break;
-                                }
-                            }
-                            // Demux gone (connection died).
-                            None => break,
-                        }
-                    }
-                    _ = tokio::time::sleep(UDP_BRIDGE_IDLE) => break,
-                }
-            }
-            bridge_state.sessions.lock().remove(&session_id);
-            bridge_state.open.fetch_sub(1, Ordering::Relaxed);
-            Self::send_dissociate(&conn, session_id).await;
-        });
-
-        Ok(UdpProxySocket {
-            socket: Arc::new(external),
-            relay_addr,
-            target_addr: target,
-            target_domain: target_domain.map(str::to_string),
-            _control: None,
-        })
-    }
-
     async fn dial_udp_transport(
         &self,
         node: &Node,
@@ -1063,55 +974,6 @@ mod tests {
             .dial(&node, target, None, Duration::from_secs(5))
             .await;
         assert!(result.is_err(), "mismatched ALPN must fail the handshake");
-    }
-
-    #[tokio::test]
-    async fn test_udp_native_datagram_echo() {
-        let server_addr = start_server(true, TEST_PASSWORD).await;
-        let node = test_node(server_addr.port(), TEST_PASSWORD);
-        let handler = TuicHandler::new();
-        let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
-
-        let udp = handler
-            .dial_udp(&node, target, None, Duration::from_secs(5))
-            .await
-            .expect("dial_udp should succeed");
-        udp.socket
-            .send_to(b"dns-query", udp.relay_addr)
-            .await
-            .unwrap();
-        let mut buf = [0u8; 256];
-        let (n, src) = tokio::time::timeout(Duration::from_secs(5), udp.socket.recv_from(&mut buf))
-            .await
-            .expect("reply timed out")
-            .unwrap();
-        assert_eq!(src, udp.relay_addr);
-        assert_eq!(&buf[..n], b"dns-query");
-    }
-
-    #[tokio::test]
-    async fn test_udp_over_stream_echo() {
-        // Server without QUIC datagram support → UDP-over-stream fallback.
-        let server_addr = start_server(false, TEST_PASSWORD).await;
-        let node = test_node(server_addr.port(), TEST_PASSWORD);
-        let handler = TuicHandler::new();
-        let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
-
-        let udp = handler
-            .dial_udp(&node, target, None, Duration::from_secs(5))
-            .await
-            .expect("dial_udp should succeed");
-        udp.socket
-            .send_to(b"stream-query", udp.relay_addr)
-            .await
-            .unwrap();
-        let mut buf = [0u8; 256];
-        let (n, src) = tokio::time::timeout(Duration::from_secs(5), udp.socket.recv_from(&mut buf))
-            .await
-            .expect("reply timed out")
-            .unwrap();
-        assert_eq!(src, udp.relay_addr);
-        assert_eq!(&buf[..n], b"stream-query");
     }
 
     #[tokio::test]

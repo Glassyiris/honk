@@ -127,8 +127,8 @@ pub type HttpProberRef = Arc<dyn HttpProber>;
 ///
 /// Implemented by `honk-core` to route a minimal DNS query through the
 /// proxy handler's UDP data path (real UDP, UoT, QUIC datagrams — whatever
-/// `dial_udp` provides), matching Go's `Dialer.UdpCheck`. Returns the
-/// measured round-trip latency on success, or an error string on failure.
+/// `dial_udp_transport` provides), matching Go's `Dialer.UdpCheck`. Returns
+/// the measured round-trip latency on success, or an error string on failure.
 ///
 /// This catches nodes whose TCP path works but whose UDP path is broken
 /// (e.g. an AnyTLS server without UoT support) — a plain TCP probe can

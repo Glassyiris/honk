@@ -16,11 +16,10 @@
 //! A background task encrypts traffic to the server and decrypts traffic
 //! back using Shadowsocks' record chunking (`[len][tag][payload][tag]`).
 //!
-//! UDP is supported for both cipher families through `dial_udp`: the core
-//! exchanges *raw* payload datagrams with the returned socket, while a
-//! background bridge task on the other end of a loopback pair performs the
-//! Shadowsocks UDP encapsulation (legacy: per-packet salt + AEAD; 2022:
-//! session-based separate-header construction) towards the server.
+//! UDP is supported for both cipher families through `dial_udp_transport`:
+//! datagrams are sealed/opened in place and exchanged over a connected
+//! server-facing socket (legacy: per-packet salt + AEAD; 2022: session-based
+//! separate-header construction).
 //!
 //! References: <https://shadowsocks.org/doc/aead.html>,
 //! <https://shadowsocks.org/doc/sip022.html>
@@ -40,15 +39,10 @@ use tracing::debug;
 
 use super::addr;
 use super::shadowsocks_2022::{self, Ss2022Method, Ss2022UdpSession};
-use super::{PacketTransport, ProxyHandler, ProxyStream, UdpProxySocket};
+use super::{PacketTransport, ProxyHandler, ProxyStream};
 
 pub(crate) const SS_SUBKEY_INFO: &[u8] = b"ss-subkey";
 pub(crate) const CHUNK_MAX_LEN: usize = 0x3FFF; // 2^14 - 1
-
-/// How long the UDP bridge may stay idle before it shuts down. Slightly
-/// longer than the core's endpoint reply idle timeout (120s) so the bridge
-/// never dies before the core has given up on the endpoint.
-const UDP_BRIDGE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// Whether `method` names a Shadowsocks 2022 (SIP022) cipher.
 pub(crate) fn is_2022_method(method: &str) -> bool {
@@ -425,52 +419,6 @@ impl ProxyHandler for ShadowsocksHandler {
             .await
     }
 
-    /// UDP relay for both cipher families.
-    ///
-    /// The core sends/receives raw payload datagrams through the returned
-    /// socket (`relay_addr` is a loopback bridge endpoint); the bridge task
-    /// performs the Shadowsocks UDP encapsulation towards the server:
-    ///
-    /// - legacy AEAD: each datagram is `salt | AEAD(subkey)(addr | payload)`
-    ///   with a fresh salt and an all-zero nonce;
-    /// - 2022: one session per `dial_udp` call (random session id, monotonic
-    ///   packet id); AES methods use the separate-header construction, the
-    ///   chacha method uses XChaCha20-Poly1305 with a random 24-byte nonce.
-    async fn dial_udp(
-        &self,
-        node: &Node,
-        target: SocketAddr,
-        target_domain: Option<&str>,
-        connect_timeout: std::time::Duration,
-    ) -> anyhow::Result<UdpProxySocket> {
-        let (crypto, outbound, socks) =
-            Self::udp_server_session(node, target, target_domain, connect_timeout).await?;
-
-        // Loopback pair: the core talks raw payloads to `front` via
-        // `relay_addr` (the address of `back`).
-        let front = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
-        let back = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
-        let front_addr = front.local_addr()?;
-        let relay_addr = back.local_addr()?;
-
-        tokio::spawn(shadowsocks_udp_bridge(
-            back,
-            outbound,
-            front_addr,
-            socks,
-            target.port(),
-            crypto,
-        ));
-
-        Ok(UdpProxySocket {
-            socket: Arc::new(front),
-            relay_addr,
-            target_addr: target,
-            target_domain: target_domain.map(|s| s.to_string()),
-            _control: None,
-        })
-    }
-
     async fn dial_udp_transport(
         &self,
         node: &Node,
@@ -545,9 +493,8 @@ impl ShadowsocksHandler {
     }
 }
 
-/// Framed Shadowsocks UDP transport — the P1.5 replacement for the loopback
-/// bridge: datagrams are sealed/opened in place and go straight over the
-/// connected server-facing socket.
+/// Framed Shadowsocks UDP transport: datagrams are sealed/opened in place
+/// and go straight over the connected server-facing socket.
 struct SsUdpTransport {
     socket: Arc<tokio::net::UdpSocket>,
     crypto: tokio::sync::Mutex<SsUdpCrypto>,
@@ -794,47 +741,6 @@ impl SsUdpCrypto {
     }
 }
 
-/// Bridge between the core-facing loopback socket (raw payloads) and the
-/// server-facing socket (Shadowsocks UDP encapsulation).
-///
-/// `back` receives raw payloads from the core and sends decrypted replies
-/// back to `front_addr`; `outbound` is connected to the proxy server.
-async fn shadowsocks_udp_bridge(
-    back: tokio::net::UdpSocket,
-    outbound: tokio::net::UdpSocket,
-    front_addr: SocketAddr,
-    socks: Vec<u8>,
-    target_port: u16,
-    mut crypto: SsUdpCrypto,
-) -> anyhow::Result<()> {
-    let mut core_buf = vec![0u8; 65536];
-    let mut server_buf = vec![0u8; 65536];
-    loop {
-        tokio::select! {
-            r = back.recv_from(&mut core_buf) => {
-                let (n, _src) = r?;
-                let packet = crypto.seal(&socks, target_port, &core_buf[..n])?;
-                outbound.send(&packet).await?;
-            }
-            r = outbound.recv(&mut server_buf) => {
-                let n = r?;
-                match crypto.open(&server_buf[..n]) {
-                    Ok(payload) => {
-                        back.send_to(&payload, front_addr).await?;
-                    }
-                    Err(e) => {
-                        debug!("Shadowsocks UDP: dropping undecryptable packet: {}", e);
-                    }
-                }
-            }
-            _ = tokio::time::sleep(UDP_BRIDGE_IDLE_TIMEOUT) => {
-                debug!("Shadowsocks UDP bridge idle timeout, closing");
-                return Ok(());
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1001,8 +907,8 @@ mod tests {
         assert_eq!(received, payload);
     }
 
-    /// End-to-end UDP test: mock legacy-AEAD server, real `dial_udp`,
-    /// core-style raw payload exchange through the returned socket.
+    /// End-to-end UDP test: mock legacy-AEAD server, real
+    /// `dial_udp_transport`, payload exchange through the framed transport.
     #[tokio::test]
     async fn test_dial_udp_legacy_end_to_end() {
         use honk_config::types::NodeProtocol;
@@ -1034,19 +940,15 @@ mod tests {
         };
         let handler = ShadowsocksHandler::new();
         let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
-        let proxy = handler
-            .dial_udp(&node, target, None, std::time::Duration::from_secs(3))
+        let transport = handler
+            .dial_udp_transport(&node, target, None, std::time::Duration::from_secs(3))
             .await
             .unwrap();
 
-        proxy
-            .socket
-            .send_to(b"hello dns", proxy.relay_addr)
-            .await
-            .unwrap();
+        transport.send_packet(b"hello dns").await.unwrap();
         let mut buf = [0u8; 65536];
-        let (n, src) = proxy.socket.recv_from(&mut buf).await.unwrap();
-        assert_eq!(src, proxy.relay_addr);
+        let (n, src) = transport.recv_packet(&mut buf).await.unwrap();
+        assert_eq!(src, target);
         assert_eq!(&buf[..n], b"HELLO DNS");
     }
 

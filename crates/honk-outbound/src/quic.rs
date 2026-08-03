@@ -1175,39 +1175,92 @@ mod brutal_tests {
 // QUIC liveness probing through a proxy's UDP tunnel
 // ---------------------------------------------------------------------------
 
-use crate::proxy::UdpProxySocket;
+use crate::proxy::PacketTransport;
 
-/// quinn [`AsyncUdpSocket`] that drives a proxied UDP tunnel
-/// ([`UdpProxySocket`]): outbound datagrams go to the tunnel's relay address,
-/// and inbound datagrams have their source normalized to the QUIC peer so
-/// quinn's remote-address checks see a stable path (same trick as
-/// hysteria2's port-hop normalization).
+/// quinn [`AsyncUdpSocket`] over a framed [`PacketTransport`]: outbound
+/// datagrams ride a bounded channel drained by a forwarder task (the
+/// transport's async send cannot run in a poll context), and inbound
+/// datagrams have their source normalized to the QUIC peer so quinn's
+/// remote-address checks see a stable path (same trick as hysteria2's
+/// port-hop normalization).
 #[derive(Debug)]
-struct UdpProxyQuinnSocket {
-    proxy: Arc<UdpProxySocket>,
+struct TransportQuinnSocket {
     remote: SocketAddr,
+    outbound: tokio::sync::mpsc::Sender<Vec<u8>>,
+    inbound: std::sync::Mutex<tokio::sync::mpsc::Receiver<Vec<u8>>>,
+    tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
-impl quinn::AsyncUdpSocket for UdpProxyQuinnSocket {
+impl TransportQuinnSocket {
+    fn new(transport: Arc<dyn PacketTransport>, remote: SocketAddr) -> Arc<Self> {
+        const QUEUE_CAP: usize = 64;
+        let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(QUEUE_CAP);
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(QUEUE_CAP);
+        let sender = tokio::spawn({
+            let transport = Arc::clone(&transport);
+            async move {
+                while let Some(data) = outbound_rx.recv().await {
+                    if transport.send_packet(&data).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        let receiver = tokio::spawn(async move {
+            let mut buf = vec![0u8; 65536];
+            loop {
+                let Ok((n, _)) = transport.recv_packet(&mut buf).await else {
+                    break;
+                };
+                // A full queue drops the datagram (UDP semantics); the
+                // transport read must never backpressure.
+                let _ = inbound_tx.try_send(buf[..n].to_vec());
+            }
+        });
+        Arc::new(Self {
+            remote,
+            outbound: outbound_tx,
+            inbound: std::sync::Mutex::new(inbound_rx),
+            tasks: std::sync::Mutex::new(vec![sender, receiver]),
+        })
+    }
+}
+
+impl Drop for TransportQuinnSocket {
+    fn drop(&mut self) {
+        for task in self.tasks.get_mut().unwrap() {
+            task.abort();
+        }
+    }
+}
+
+impl quinn::AsyncUdpSocket for TransportQuinnSocket {
     fn create_io_poller(self: Arc<Self>) -> std::pin::Pin<Box<dyn quinn::UdpPoller>> {
         #[derive(Debug)]
-        struct Poller(Arc<UdpProxySocket>);
+        struct Poller;
         impl quinn::UdpPoller for Poller {
             fn poll_writable(
                 self: std::pin::Pin<&mut Self>,
-                cx: &mut std::task::Context<'_>,
+                _cx: &mut std::task::Context<'_>,
             ) -> std::task::Poll<io::Result<()>> {
-                self.0.socket.poll_send_ready(cx)
+                // The forwarder task drains continuously; a full channel
+                // surfaces as WouldBlock in try_send instead.
+                std::task::Poll::Ready(Ok(()))
             }
         }
-        Box::pin(Poller(self.proxy.clone()))
+        Box::pin(Poller)
     }
 
     fn try_send(&self, transmit: &quinn::udp::Transmit) -> io::Result<()> {
-        self.proxy
-            .socket
-            .try_send_to(transmit.contents, self.proxy.relay_addr)
-            .map(|_| ())
+        match self.outbound.try_send(transmit.contents.to_vec()) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            }
+        }
     }
 
     fn poll_recv(
@@ -1216,12 +1269,13 @@ impl quinn::AsyncUdpSocket for UdpProxyQuinnSocket {
         bufs: &mut [std::io::IoSliceMut<'_>],
         meta: &mut [quinn::udp::RecvMeta],
     ) -> std::task::Poll<io::Result<usize>> {
+        let mut inbound = self.inbound.lock().unwrap();
         let mut count = 0;
         for (buf, meta_slot) in bufs.iter_mut().zip(meta.iter_mut()) {
-            let mut read_buf = tokio::io::ReadBuf::new(&mut buf[..]);
-            match self.proxy.socket.poll_recv_from(cx, &mut read_buf) {
-                std::task::Poll::Ready(Ok(_addr)) => {
-                    let len = read_buf.filled().len();
+            match inbound.poll_recv(cx) {
+                std::task::Poll::Ready(Some(data)) => {
+                    let len = data.len().min(buf.len());
+                    buf[..len].copy_from_slice(&data[..len]);
                     *meta_slot = quinn::udp::RecvMeta {
                         addr: self.remote,
                         len,
@@ -1231,9 +1285,9 @@ impl quinn::AsyncUdpSocket for UdpProxyQuinnSocket {
                     };
                     count += 1;
                 }
-                std::task::Poll::Ready(Err(e)) => {
+                std::task::Poll::Ready(None) => {
                     return if count == 0 {
-                        std::task::Poll::Ready(Err(e))
+                        std::task::Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)))
                     } else {
                         std::task::Poll::Ready(Ok(count))
                     };
@@ -1251,7 +1305,12 @@ impl quinn::AsyncUdpSocket for UdpProxyQuinnSocket {
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.proxy.socket.local_addr()
+        // The transport owns the real socket; quinn only needs a stable
+        // placeholder for path bookkeeping (TEST-NET-1, RFC 5737).
+        Ok(SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1)),
+            12345,
+        ))
     }
 
     fn max_transmit_segments(&self) -> usize {
@@ -1274,16 +1333,13 @@ impl quinn::AsyncUdpSocket for UdpProxyQuinnSocket {
 /// [`client_config`] — pass a node with `skip_cert_verify` for pure liveness
 /// probing.
 pub async fn quic_handshake_probe(
-    proxy: UdpProxySocket,
+    transport: Arc<dyn PacketTransport>,
     target: SocketAddr,
     server_name: &str,
     config: &ClientConfig,
     timeout: Duration,
 ) -> anyhow::Result<Duration> {
-    let socket = Arc::new(UdpProxyQuinnSocket {
-        proxy: Arc::new(proxy),
-        remote: target,
-    });
+    let socket = TransportQuinnSocket::new(transport, target);
     let runtime = quinn::default_runtime()
         .ok_or_else(|| io::Error::other("no async runtime available for QUIC"))?;
     let endpoint =

@@ -30,7 +30,7 @@ use honk_config::node::Node;
 pub struct OutboundCapabilities {
     /// Carries TCP flows (all current protocols).
     pub tcp: bool,
-    /// Carries UDP flows (dial_udp works end to end).
+    /// Carries UDP flows (`dial_udp_transport` works end to end).
     pub udp: bool,
     /// Multiplexes many logical streams over one physical session —
     /// these protocols pool sessions, never bare TCP or ready streams.

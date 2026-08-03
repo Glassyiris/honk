@@ -38,7 +38,7 @@ use crate::quic::{
 };
 
 use super::addr::SocksAddr as JuiceAddr;
-use super::{PacketTransport, ProxyHandler, ProxyStream, UdpProxySocket};
+use super::{PacketTransport, ProxyHandler, ProxyStream};
 
 const JUICITY_VERSION: u8 = 0x00;
 
@@ -53,8 +53,6 @@ const CONN_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// credentials by closing the connection. Zero (tuic parity): bad
 /// credentials fail the first stream open an RTT later instead.
 const AUTH_GRACE: Duration = Duration::ZERO;
-/// Tear down a UDP session bridge after this long without traffic.
-const UDP_BRIDGE_IDLE: Duration = Duration::from_secs(90);
 
 /// Read one inbound UDP frame (`[metadata][len u16][payload]`); the address
 /// is returned alongside the payload for completeness but relayed sessions
@@ -281,97 +279,6 @@ impl ProxyHandler for JuicityHandler {
             stream: Box::new(stream),
             target_addr: target,
             target_domain: target_domain.map(str::to_string),
-        })
-    }
-
-    async fn dial_udp(
-        &self,
-        node: &Node,
-        target: SocketAddr,
-        target_domain: Option<&str>,
-        connect_timeout: Duration,
-    ) -> anyhow::Result<UdpProxySocket> {
-        let client = self.client_for(node).await?;
-        let target_addr = JuiceAddr::new(target, target_domain);
-        // Same retry skeleton as TCP dials: a dead cached connection must not
-        // fail the UDP session outright (it would otherwise surface as a
-        // one-shot stream-open error on the half-dead connection).
-        let stream_addr = target_addr.clone();
-        let stream = crate::quic::dial_quic_stream(
-            &client.quic,
-            |timeout| {
-                let client = Arc::clone(&client);
-                async move { client.connection(timeout).await }
-            },
-            connect_timeout,
-            move |conn| {
-                let addr = stream_addr.clone();
-                async move { Self::open_stream(&conn, NETWORK_UDP, &addr).await }
-            },
-            |_| true,
-            "Juicity",
-        )
-        .await?;
-        // The guard carries the connection's open-stream accounting; it must
-        // live as long as the bridge.
-        let (mut send, mut recv, guard) = stream.into_parts();
-
-        // Bridge the QUIC stream to a local UDP socket pair: the relay sends
-        // raw payloads to `relay_addr` on the returned socket and receives
-        // replies from the same address (see UdpProxySocket users).
-        let (external, internal, external_addr, relay_addr) =
-            crate::util::udp_loopback_pair().await?;
-        let internal = Arc::new(internal);
-
-        tokio::spawn(async move {
-            let _guard = guard;
-            let writer = {
-                let internal = Arc::clone(&internal);
-                let target_addr = target_addr.clone();
-                async move {
-                    let mut buf = vec![0u8; 65536];
-                    loop {
-                        let Ok((n, src)) = internal.recv_from(&mut buf).await else {
-                            break;
-                        };
-                        if src != external_addr {
-                            continue;
-                        }
-                        // SealUDP: `[metadata][len u16][payload]`
-                        // (`stream_packet_conn.go:83-90`).
-                        let mut frame = Vec::with_capacity(target_addr.encoded_len() + 2 + n);
-                        target_addr.encode(&mut frame);
-                        frame.extend_from_slice(&(n as u16).to_be_bytes());
-                        frame.extend_from_slice(&buf[..n]);
-                        if send.write_all(&frame).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-            };
-            let reader = async move {
-                loop {
-                    let Ok((_addr, payload)) = read_udp_frame(&mut recv).await else {
-                        break;
-                    };
-                    if internal.send_to(&payload, external_addr).await.is_err() {
-                        break;
-                    }
-                }
-            };
-            tokio::select! {
-                _ = writer => {},
-                _ = reader => {},
-                _ = tokio::time::sleep(UDP_BRIDGE_IDLE) => {},
-            }
-        });
-
-        Ok(UdpProxySocket {
-            socket: Arc::new(external),
-            relay_addr,
-            target_addr: target,
-            target_domain: target_domain.map(str::to_string),
-            _control: None,
         })
     }
 
@@ -677,38 +584,6 @@ mod tests {
             .dial(&node, target, None, Duration::from_secs(5))
             .await;
         assert!(!handler.test_connectivity(&node).await);
-    }
-
-    #[tokio::test]
-    async fn test_udp_echo() {
-        let server_addr = start_server(TEST_PASSWORD).await;
-        let node = test_node(server_addr.port(), TEST_PASSWORD);
-        let handler = JuicityHandler::new();
-        let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
-
-        let udp = handler
-            .dial_udp(&node, target, None, Duration::from_secs(5))
-            .await
-            .expect("dial_udp should succeed");
-        udp.socket
-            .send_to(b"dns-query", udp.relay_addr)
-            .await
-            .unwrap();
-        let mut buf = [0u8; 256];
-        let (n, src) = tokio::time::timeout(Duration::from_secs(5), udp.socket.recv_from(&mut buf))
-            .await
-            .expect("reply timed out")
-            .unwrap();
-        assert_eq!(src, udp.relay_addr);
-        assert_eq!(&buf[..n], b"dns-query");
-
-        // A second datagram on the same session must work too.
-        udp.socket.send_to(b"second", udp.relay_addr).await.unwrap();
-        let (n, _) = tokio::time::timeout(Duration::from_secs(5), udp.socket.recv_from(&mut buf))
-            .await
-            .expect("reply timed out")
-            .unwrap();
-        assert_eq!(&buf[..n], b"second");
     }
 
     #[tokio::test]

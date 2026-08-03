@@ -400,7 +400,7 @@ impl AliveDialerSet {
 
     /// Probe a single node's UDP data path (Go: UdpCheck) through the
     /// installed [`UdpProber`]: honk-core routes a minimal DNS query through
-    /// the proxy handler's `dial_udp` and awaits the answer.
+    /// the proxy handler's `dial_udp_transport` and awaits the answer.
     ///
     /// Success marks BOTH UDP domains (DataUdp + DnsUdp, v4+v6) alive and
     /// records the round-trip latency for URLTest ranking; failure records

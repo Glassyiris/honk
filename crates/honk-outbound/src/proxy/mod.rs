@@ -117,21 +117,10 @@ impl ProxyStream {
     }
 }
 
-#[derive(Debug)]
-pub struct UdpProxySocket {
-    pub socket: Arc<tokio::net::UdpSocket>,
-    pub relay_addr: SocketAddr,
-    pub target_addr: SocketAddr,
-    pub target_domain: Option<String>,
-    /// TCP control connection (must be kept alive for SOCKS5 UDP ASSOCIATE).
-    pub _control: Option<tokio::net::TcpStream>,
-}
-
-/// Framed UDP packet transport — the long-term replacement for per-flow
-/// loopback bridges. Native UDP protocols wrap a real `UdpSocket`; tunnel
-/// protocols implement their framing directly on the tunnel instead of
-/// bouncing datagrams through a loopback socket pair (extra FD + bridge
-/// task + 1–2 copies per packet).
+/// Framed UDP packet transport — the production UDP contract. Native UDP
+/// protocols wrap a real `UdpSocket`; tunnel protocols implement their
+/// framing directly on the tunnel instead of bouncing datagrams through a
+/// loopback socket pair (extra FD + bridge task + 1–2 copies per packet).
 #[async_trait]
 pub trait PacketTransport: Send + Sync + Debug {
     /// The relay target a flow reports as its destination.
@@ -195,10 +184,8 @@ impl PreparedUdpTransport {
     }
 }
 
-/// Adapter presenting any `UdpSocket` — a direct target, a socks5
-/// server-assigned relay, or a legacy loopback bridge — as a
-/// [`PacketTransport`]. Lets tunnel protocols migrate to framed transports
-/// incrementally instead of one flag-day rewrite.
+/// Adapter presenting a raw `UdpSocket` (e.g. the direct handler's
+/// bypass-marked socket) as a [`PacketTransport`].
 #[derive(Debug)]
 pub struct UdpSocketTransport {
     socket: Arc<tokio::net::UdpSocket>,
@@ -277,21 +264,8 @@ pub trait ProxyHandler: Send + Sync {
         .await
     }
 
-    /// Default implementation returns an error indicating UDP is not supported.
-    async fn dial_udp(
-        &self,
-        _node: &Node,
-        _target: SocketAddr,
-        _target_domain: Option<&str>,
-        _connect_timeout: Duration,
-    ) -> anyhow::Result<UdpProxySocket> {
-        Err(anyhow::anyhow!("UDP not supported for this protocol"))
-    }
-
-    /// Framed UDP transport for a flow. The default wraps `dial_udp`'s socket
-    /// (direct target, socks5 relay, or a legacy loopback bridge) in
-    /// [`UdpSocketTransport`]; tunnel protocols override it with a real
-    /// framed transport (no loopback).
+    /// Framed UDP transport for a flow. Protocols without UDP capability
+    /// keep the default refusal.
     async fn dial_udp_transport(
         &self,
         node: &Node,
@@ -299,14 +273,10 @@ pub trait ProxyHandler: Send + Sync {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        let proxy = self
-            .dial_udp(node, target, target_domain, connect_timeout)
-            .await?;
-        Ok(Arc::new(UdpSocketTransport::new(
-            proxy.socket,
-            proxy.relay_addr,
-        )))
+        let _ = (node, target, target_domain, connect_timeout);
+        Err(anyhow::anyhow!("UDP not supported for this protocol"))
     }
+
     /// Open a framed UDP transport using an explicitly captured runtime
     /// generation. Session-owning handlers override this so an authoritative
     /// flow reuses the same warmed generation-local client.
@@ -518,30 +488,6 @@ impl ProxyRegistry {
             .await
     }
 
-    pub async fn dial_udp(
-        &self,
-        node: &Node,
-        target: SocketAddr,
-        target_domain: Option<&str>,
-        connect_timeout: Duration,
-    ) -> anyhow::Result<UdpProxySocket> {
-        let handler = self
-            .find(node.protocol)
-            .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", node.protocol))?;
-
-        tracing::debug!(
-            "Dialing UDP {}:{} via {} ({})",
-            target,
-            node.protocol.as_str(),
-            node.name,
-            node.host()
-        );
-
-        handler
-            .dial_udp(node, target, target_domain, connect_timeout)
-            .await
-    }
-
     /// Warm a node using the explicitly supplied runtime generation. This
     /// deliberately never reads the mutable shared runtime-registry cell:
     /// reload-owned work must stay attached to its original generation.
@@ -643,13 +589,6 @@ impl ProxyRegistry {
         Ok(prepared)
     }
 
-    pub async fn test_node(&self, node: &Node) -> bool {
-        match self.find(node.protocol) {
-            Some(handler) => handler.test_connectivity(node).await,
-            None => false,
-        }
-    }
-
     pub fn handler_count(&self) -> usize {
         self.handlers.len()
     }
@@ -700,7 +639,7 @@ mod tests {
             .expect_err("block node must not dial");
         assert!(err.to_string().contains("blocked"));
         let err = registry
-            .dial_udp(&node, target, None, Duration::from_secs(1))
+            .dial_udp_transport(&node, target, None, Duration::from_secs(1))
             .await
             .expect_err("block node must not dial UDP");
         assert!(err.to_string().contains("blocked"));

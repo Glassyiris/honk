@@ -68,7 +68,7 @@ use crate::quic::{
     ClientCache, QuicClient, QuicConnState, now_secs, recv_read_exact as read_exact,
 };
 
-use super::{PacketTransport, ProxyHandler, ProxyStream, UdpProxySocket};
+use super::{PacketTransport, ProxyHandler, ProxyStream};
 
 /// Auth request target: `POST https://hysteria/auth` (`protocol/http.go:8-10`).
 const URL_HOST: &str = "hysteria";
@@ -101,8 +101,6 @@ const TCP_PADDING_MAX: usize = 512;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// Close the shared QUIC connection after this long without open streams.
 const CONN_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
-/// Tear down a UDP session bridge after this long without traffic.
-const UDP_BRIDGE_IDLE: Duration = Duration::from_secs(90);
 
 /// Generous cap for one HEADERS frame payload (the auth response is ~3 KB).
 const MAX_FIELD_SECTION: u64 = 64 * 1024;
@@ -750,118 +748,6 @@ impl ProxyHandler for Hysteria2Handler {
             stream: Box::new(stream),
             target_addr: target,
             target_domain: target_domain.map(str::to_string),
-        })
-    }
-
-    async fn dial_udp(
-        &self,
-        node: &Node,
-        target: SocketAddr,
-        target_domain: Option<&str>,
-        connect_timeout: Duration,
-    ) -> anyhow::Result<UdpProxySocket> {
-        let client = self.client_for(node).await?;
-        let (conn, state) = client.connection(connect_timeout).await?;
-        if state.udp_disabled {
-            anyhow::bail!("Hysteria2: UDP disabled by server");
-        }
-        let max_datagram = conn
-            .max_datagram_size()
-            .ok_or_else(|| anyhow!("Hysteria2: peer does not support QUIC datagrams"))?;
-        state.touch();
-        let session_id = state.alloc_session();
-        let addr = target_string(target, target_domain);
-        if addr.len() as u64 > MAX_ADDRESS_LENGTH {
-            anyhow::bail!("Hysteria2: target address too long");
-        }
-
-        // Bridge the QUIC tunnel to a local UDP socket pair: the relay sends
-        // raw payloads to `relay_addr` on the returned socket and receives
-        // replies from the same address (same shape as the TUIC handler).
-        let (external, internal, external_addr, relay_addr) =
-            crate::util::udp_loopback_pair().await?;
-
-        let (tx, mut rx) = mpsc::channel::<UdpInbound>(UDP_SESSION_QUEUE_CAP);
-        state.sessions.lock().insert(session_id, tx);
-
-        let bridge_state = Arc::clone(&state);
-        bridge_state.open.fetch_add(1, Ordering::Relaxed);
-        tokio::spawn(async move {
-            let mut defrag = Defragmenter::new();
-            let mut packet_id: u16 = 0;
-            let mut buf = vec![0u8; 65536];
-            loop {
-                tokio::select! {
-                    result = internal.recv_from(&mut buf) => {
-                        match result {
-                            Ok((n, src)) => {
-                                if src != external_addr {
-                                    continue;
-                                }
-                                packet_id = packet_id.wrapping_add(1);
-                                bridge_state.touch();
-                                let data = &buf[..n];
-                                if data.len() > MAX_UDP_SIZE {
-                                    debug!(
-                                        "Hysteria2 UDP: dropping oversized payload ({} bytes)",
-                                        data.len()
-                                    );
-                                    continue;
-                                }
-                                let sent = fragment_udp_message(
-                                    session_id,
-                                    packet_id,
-                                    &addr,
-                                    data,
-                                    max_datagram,
-                                )
-                                .and_then(|packets| {
-                                    for packet in packets {
-                                        bridge_state
-                                            .conn
-                                            .send_datagram(bytes::Bytes::from(packet))
-                                            .map_err(|e| anyhow!("send datagram: {e}"))?;
-                                    }
-                                    Ok(())
-                                });
-                                if let Err(e) = sent {
-                                    debug!("Hysteria2 UDP: send failed: {e}");
-                                    break;
-                                }
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    msg = rx.recv() => {
-                        match msg {
-                            Some(msg) => {
-                                if let Some(data) = defrag.feed(
-                                    msg.packet_id,
-                                    msg.frag_id,
-                                    msg.frag_total,
-                                    msg.data,
-                                ) && internal.send_to(&data, external_addr).await.is_err()
-                                {
-                                    break;
-                                }
-                            }
-                            // Demux gone (connection died).
-                            None => break,
-                        }
-                    }
-                    _ = tokio::time::sleep(UDP_BRIDGE_IDLE) => break,
-                }
-            }
-            bridge_state.sessions.lock().remove(&session_id);
-            bridge_state.open.fetch_sub(1, Ordering::Relaxed);
-        });
-
-        Ok(UdpProxySocket {
-            socket: Arc::new(external),
-            relay_addr,
-            target_addr: target,
-            target_domain: target_domain.map(str::to_string),
-            _control: None,
         })
     }
 

@@ -358,7 +358,7 @@ pub(crate) async fn dial_stream(
 
 /// Client-side Shadowsocks 2022 UDP session.
 ///
-/// One session per `dial_udp` call: random session id, monotonically
+/// One session per `dial_udp_transport` call: random session id, monotonically
 /// increasing packet id for outgoing packets, and a sliding-window replay
 /// filter per server session on the receive path.
 pub(crate) struct Ss2022UdpSession {
@@ -1139,8 +1139,8 @@ mod tests {
         .await;
     }
 
-    /// End-to-end UDP test: mock Shadowsocks 2022 server, real `dial_udp`,
-    /// core-style raw payload exchange through the returned socket.
+    /// End-to-end UDP test: mock Shadowsocks 2022 server, real
+    /// `dial_udp_transport`, payload exchange through the framed transport.
     #[tokio::test]
     async fn test_dial_udp_2022_end_to_end() {
         let psk_b64 = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
@@ -1181,28 +1181,20 @@ mod tests {
             ..Default::default()
         };
         let handler = ShadowsocksHandler::new();
-        let proxy = handler
-            .dial_udp(&node, target, None, std::time::Duration::from_secs(3))
+        let transport = handler
+            .dial_udp_transport(&node, target, None, std::time::Duration::from_secs(3))
             .await
             .unwrap();
 
-        proxy
-            .socket
-            .send_to(b"quic data", proxy.relay_addr)
-            .await
-            .unwrap();
+        transport.send_packet(b"quic data").await.unwrap();
         let mut buf = [0u8; 65536];
-        let (n, src) = proxy.socket.recv_from(&mut buf).await.unwrap();
-        assert_eq!(src, proxy.relay_addr);
+        let (n, src) = transport.recv_packet(&mut buf).await.unwrap();
+        assert_eq!(src, target);
         assert_eq!(&buf[..n], b"QUIC DATA");
 
         // Second datagram on the same session (packet id continuity).
-        proxy
-            .socket
-            .send_to(b"more data", proxy.relay_addr)
-            .await
-            .unwrap();
-        let (n, _src) = proxy.socket.recv_from(&mut buf).await.unwrap();
+        transport.send_packet(b"more data").await.unwrap();
+        let (n, _src) = transport.recv_packet(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"MORE DATA");
     }
 }

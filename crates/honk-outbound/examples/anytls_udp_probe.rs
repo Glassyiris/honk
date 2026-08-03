@@ -22,8 +22,8 @@ async fn main() -> anyhow::Result<()> {
     let registry = ProxyRegistry::default_resolver()?;
     let handler = registry.find(node.protocol).expect("handler");
 
-    let udp = handler
-        .dial_udp(&node, dns_server, None, Duration::from_secs(10))
+    let transport = handler
+        .dial_udp_transport(&node, dns_server, None, Duration::from_secs(10))
         .await?;
 
     // Minimal DNS query: id 0x1234, RD, google.com A IN.
@@ -36,12 +36,12 @@ async fn main() -> anyhow::Result<()> {
     }
     query.extend_from_slice(&[0x00, 0x00, 0x01, 0x00, 0x01]);
 
-    udp.socket.send_to(&query, udp.relay_addr).await?;
-    println!("sent {} bytes to {}", query.len(), udp.relay_addr);
+    transport.send_packet(&query).await?;
+    println!("sent {} bytes via {}", query.len(), transport.relay_addr());
 
     let mut buf = [0u8; 2048];
     for i in 0..3 {
-        match tokio::time::timeout(Duration::from_secs(5), udp.socket.recv_from(&mut buf)).await {
+        match tokio::time::timeout(Duration::from_secs(5), transport.recv_packet(&mut buf)).await {
             Ok(Ok((n, src))) => {
                 let hex: String = buf[..n.min(64)]
                     .iter()

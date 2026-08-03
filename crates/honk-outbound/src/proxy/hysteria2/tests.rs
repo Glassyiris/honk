@@ -610,30 +610,6 @@ async fn test_wrong_password_rejected() {
 }
 
 #[tokio::test]
-async fn test_udp_datagram_echo() {
-    let server_addr = start_server(TEST_PASSWORD).await;
-    let node = test_node(server_addr.port(), TEST_PASSWORD);
-    let handler = Hysteria2Handler::new();
-    let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
-
-    let udp = handler
-        .dial_udp(&node, target, None, Duration::from_secs(5))
-        .await
-        .expect("dial_udp should succeed");
-    udp.socket
-        .send_to(b"dns-query", udp.relay_addr)
-        .await
-        .unwrap();
-    let mut buf = [0u8; 256];
-    let (n, src) = tokio::time::timeout(Duration::from_secs(5), udp.socket.recv_from(&mut buf))
-        .await
-        .expect("reply timed out")
-        .unwrap();
-    assert_eq!(src, udp.relay_addr);
-    assert_eq!(&buf[..n], b"dns-query");
-}
-
-#[tokio::test]
 async fn test_udp_transport_datagram_echo() {
     let server_addr = start_server(TEST_PASSWORD).await;
     let node = test_node(server_addr.port(), TEST_PASSWORD);
@@ -680,30 +656,6 @@ async fn test_udp_transport_fragmented_echo() {
 }
 
 #[tokio::test]
-async fn test_udp_fragmented_echo() {
-    let server_addr = start_server(TEST_PASSWORD).await;
-    let node = test_node(server_addr.port(), TEST_PASSWORD);
-    let handler = Hysteria2Handler::new();
-    let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
-
-    let udp = handler
-        .dial_udp(&node, target, None, Duration::from_secs(5))
-        .await
-        .expect("dial_udp should succeed");
-    // 3000 bytes exceeds the QUIC datagram MTU: fragmented on send and
-    // reassembled on receive.
-    let payload = vec![0x5au8; 3000];
-    udp.socket.send_to(&payload, udp.relay_addr).await.unwrap();
-    let mut buf = vec![0u8; 4096];
-    let (n, src) = tokio::time::timeout(Duration::from_secs(5), udp.socket.recv_from(&mut buf))
-        .await
-        .expect("reply timed out")
-        .unwrap();
-    assert_eq!(src, udp.relay_addr);
-    assert_eq!(&buf[..n], payload.as_slice());
-}
-
-#[tokio::test]
 async fn test_connection_reuse_across_dials() {
     let server_addr = start_server(TEST_PASSWORD).await;
     let node = test_node(server_addr.port(), TEST_PASSWORD);
@@ -741,20 +693,17 @@ async fn test_salamander_obfs_tcp_udp_echo() {
     assert_eq!(&buf[..n], b"obfs hello");
 
     let udp_target: SocketAddr = "8.8.8.8:53".parse().unwrap();
-    let udp = handler
-        .dial_udp(&node, udp_target, None, Duration::from_secs(5))
+    let transport = handler
+        .dial_udp_transport(&node, udp_target, None, Duration::from_secs(5))
         .await
-        .expect("dial_udp through salamander obfs should succeed");
-    udp.socket
-        .send_to(b"obfs-dns", udp.relay_addr)
-        .await
-        .unwrap();
+        .expect("dial_udp_transport through salamander obfs should succeed");
+    transport.send_packet(b"obfs-dns").await.unwrap();
     let mut buf = [0u8; 256];
-    let (n, src) = tokio::time::timeout(Duration::from_secs(5), udp.socket.recv_from(&mut buf))
+    let (n, src) = tokio::time::timeout(Duration::from_secs(5), transport.recv_packet(&mut buf))
         .await
         .expect("reply timed out")
         .unwrap();
-    assert_eq!(src, udp.relay_addr);
+    assert_eq!(src, udp_target);
     assert_eq!(&buf[..n], b"obfs-dns");
 }
 
@@ -879,10 +828,10 @@ async fn test_e2e_real_server_udp_dns() {
         .unwrap_or_else(|_| "8.8.8.8:53".to_string())
         .parse()
         .expect("invalid HONK_HY2_UDP_TARGET");
-    let udp = handler
-        .dial_udp(&node, target, None, Duration::from_secs(10))
+    let transport = handler
+        .dial_udp_transport(&node, target, None, Duration::from_secs(10))
         .await
-        .expect("dial_udp through real server should succeed");
+        .expect("dial_udp_transport through real server should succeed");
     if std::env::var("HONK_HY2_DELAY_MS").is_ok() {
         let ms: u64 = std::env::var("HONK_HY2_DELAY_MS").unwrap().parse().unwrap();
         tokio::time::sleep(Duration::from_millis(ms)).await;
@@ -906,8 +855,8 @@ async fn test_e2e_real_server_udp_dns() {
     let mut buf = vec![0u8; 2048];
     let mut received = None;
     for attempt in 0..5 {
-        udp.socket.send_to(&query, udp.relay_addr).await.unwrap();
-        match tokio::time::timeout(Duration::from_secs(4), udp.socket.recv_from(&mut buf)).await {
+        transport.send_packet(&query).await.unwrap();
+        match tokio::time::timeout(Duration::from_secs(4), transport.recv_packet(&mut buf)).await {
             Ok(Ok((n, _))) => {
                 received = Some(n);
                 break;
@@ -1007,8 +956,8 @@ async fn test_e2e_real_server_hop_soak_udp() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(120);
     let handler = Hysteria2Handler::new();
-    let udp = handler
-        .dial_udp(&node, target, None, Duration::from_secs(10))
+    let transport = handler
+        .dial_udp_transport(&node, target, None, Duration::from_secs(10))
         .await
         .expect("udp dial should succeed");
     let started = std::time::Instant::now();
@@ -1018,8 +967,8 @@ async fn test_e2e_real_server_hop_soak_udp() {
     while started.elapsed() < Duration::from_secs(secs) {
         sent += 1;
         let pkt = sent.to_be_bytes();
-        udp.socket.send_to(&pkt, udp.relay_addr).await.unwrap();
-        match tokio::time::timeout(Duration::from_secs(3), udp.socket.recv_from(&mut buf)).await {
+        transport.send_packet(&pkt).await.unwrap();
+        match tokio::time::timeout(Duration::from_secs(3), transport.recv_packet(&mut buf)).await {
             Ok(Ok((n, _))) => assert_eq!(&buf[..n], &pkt, "echo payload mismatch"),
             _ => {
                 lost += 1;

@@ -10,7 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tracing::debug;
 
-use super::{PacketTransport, ProxyHandler, ProxyStream, UdpProxySocket};
+use super::{PacketTransport, ProxyHandler, ProxyStream};
 
 const SOCKS5_VERSION: u8 = 0x05;
 const CMD_CONNECT: u8 = 0x01;
@@ -575,25 +575,6 @@ impl ProxyHandler for Socks5Handler {
     /// target data. Safe to pool as a ready stream.
     fn pool_ready_streams(&self, _node: &Node) -> bool {
         true
-    }
-
-    async fn dial_udp(
-        &self,
-        node: &Node,
-        target: SocketAddr,
-        target_domain: Option<&str>,
-        connect_timeout: std::time::Duration,
-    ) -> anyhow::Result<UdpProxySocket> {
-        let (udp_socket, relay_addr, control) =
-            Self::udp_association(node, connect_timeout).await?;
-
-        Ok(UdpProxySocket {
-            socket: Arc::new(udp_socket),
-            relay_addr,
-            target_addr: target,
-            target_domain: target_domain.map(|s| s.to_string()),
-            _control: Some(control),
-        })
     }
 
     async fn dial_udp_transport(

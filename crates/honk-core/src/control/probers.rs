@@ -176,12 +176,13 @@ const DEFAULT_UDP_CHECK_DNS: &str = "8.8.8.8:53";
 /// proxy node's UDP data path.
 ///
 /// Implements `UdpProber` for `AliveDialerSet` (Go: `Dialer.UdpCheck`):
-/// resolves the node, opens its UDP channel via the handler's `dial_udp`
-/// (real UDP, UoT, QUIC datagrams — whatever the protocol provides),
-/// sends one DNS query to the configured check DNS server, and awaits the
-/// answer. Nodes whose server or protocol cannot carry UDP (e.g. an
-/// AnyTLS server without UoT support) fail here even while their TCP
-/// probe succeeds — exactly the signal the UDP alive domains need.
+/// resolves the node, opens its UDP channel via the handler's
+/// `dial_udp_transport` (real UDP, UoT, QUIC datagrams — whatever the
+/// protocol provides), sends one DNS query to the configured check DNS
+/// server, and awaits the answer. Nodes whose server or protocol cannot
+/// carry UDP (e.g. an AnyTLS server without UoT support) fail here even
+/// while their TCP probe succeeds — exactly the signal the UDP alive
+/// domains need.
 pub(super) struct ProxyUdpProber {
     config: Arc<RwLock<Config>>,
     proxy_registry: Arc<ProxyRegistry>,

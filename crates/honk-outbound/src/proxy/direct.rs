@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tracing::debug;
 
-use super::{ProxyHandler, ProxyStream, UdpProxySocket};
+use super::{PacketTransport, ProxyHandler, ProxyStream, UdpSocketTransport};
 
 pub struct DirectHandler;
 
@@ -73,13 +73,13 @@ impl ProxyHandler for DirectHandler {
         true
     }
 
-    async fn dial_udp(
+    async fn dial_udp_transport(
         &self,
         _node: &Node,
         target: SocketAddr,
         _target_domain: Option<&str>,
         _connect_timeout: Duration,
-    ) -> anyhow::Result<UdpProxySocket> {
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         debug!("Direct UDP to {}", target);
         // Bind to the correct address family so the source address matches.
         let bind_addr: SocketAddr = if target.is_ipv4() {
@@ -88,13 +88,7 @@ impl ProxyHandler for DirectHandler {
             "[::]:0".parse().expect("hardcoded IPv6 bind address")
         };
         let socket = crate::util::udp_marked_bind(bind_addr).await?;
-        Ok(UdpProxySocket {
-            socket: Arc::new(socket),
-            relay_addr: target,
-            target_addr: target,
-            target_domain: None,
-            _control: None,
-        })
+        Ok(Arc::new(UdpSocketTransport::new(Arc::new(socket), target)))
     }
 }
 

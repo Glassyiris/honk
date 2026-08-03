@@ -10,7 +10,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tracing::warn;
 
-use super::{ProxyHandler, ProxyStream, UdpProxySocket};
+use super::{PacketTransport, ProxyHandler, ProxyStream};
+use std::sync::Arc;
 
 /// Handler for blocking connections.
 pub struct BlockHandler;
@@ -44,13 +45,13 @@ impl ProxyHandler for BlockHandler {
         anyhow::bail!("Connection blocked by routing rule");
     }
 
-    async fn dial_udp(
+    async fn dial_udp_transport(
         &self,
         _node: &Node,
         target: SocketAddr,
         _target_domain: Option<&str>,
         _connect_timeout: Duration,
-    ) -> anyhow::Result<UdpProxySocket> {
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         warn!("Blocked UDP connection to {}", target);
         anyhow::bail!("UDP connection blocked by routing rule");
     }

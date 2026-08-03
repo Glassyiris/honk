@@ -31,14 +31,11 @@ use honk_config::types::NodeProtocol;
 use sha2::{Digest, Sha224};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
-use tokio::time;
 
 use super::addr;
-use super::{ProxyHandler, ProxyStream, UdpProxySocket};
+use super::{ProxyHandler, ProxyStream};
 
 const CRLF: &[u8] = b"\r\n";
 const CMD_TCP: u8 = 0x01;
@@ -129,72 +126,6 @@ impl ProxyHandler for TrojanHandler {
         })
     }
 
-    async fn dial_udp(
-        &self,
-        node: &Node,
-        target: SocketAddr,
-        target_domain: Option<&str>,
-        connect_timeout: std::time::Duration,
-    ) -> anyhow::Result<UdpProxySocket> {
-        // UDP relay is only available when the node's network list explicitly
-        // includes "udp" (or is unset); fail loudly otherwise instead of
-        // silently dropping datagrams.
-        if let Some(network) = node.network.as_deref() {
-            let supports_udp = network
-                .split(',')
-                .any(|n| n.trim().eq_ignore_ascii_case("udp"));
-            if !supports_udp {
-                anyhow::bail!(
-                    "Trojan UDP: node network '{}' does not include \"udp\"",
-                    network
-                );
-            }
-        }
-
-        let password = node.password.as_deref().unwrap_or("");
-        let addr = format!("{}:{}", node.host(), node.port);
-        tracing::debug!("Trojan UDP: opening associate channel to {}", addr);
-
-        // The associate channel needs the same TLS / transport wrapping as
-        // TCP dials — writing the header onto bare TCP gets dropped by any
-        // TLS-terminated Trojan server before the request is even read.
-        let mut control = Self::connect_server(node, connect_timeout).await?;
-
-        let mut header = Vec::with_capacity(56 + 2 + 1 + 19 + 2);
-        header.extend_from_slice(hex_sha224(password).as_bytes());
-        header.extend_from_slice(CRLF);
-        header.push(CMD_UDP);
-        header.extend_from_slice(&addr::encode_address(target, target_domain));
-        header.extend_from_slice(CRLF);
-
-        control.write_all(&header).await?;
-
-        // Bridge a loopback UDP socket pair to Trojan-framed packets on the
-        // associate stream: the relay talks raw payloads to `relay_addr`,
-        // the bridge frames them onto the tunnel and unframes replies back.
-        // (Sending datagrams directly to `target` here used to bypass the
-        // proxy entirely — and made UDP health probes measure the gateway's
-        // own egress instead of the tunnel.)
-        let external = crate::util::udp_loopback_bind().await?;
-        let internal = crate::util::udp_loopback_bind().await?;
-        let external_addr = external.local_addr()?;
-        let relay_addr = internal.local_addr()?;
-        tokio::spawn(trojan_udp_bridge(
-            control,
-            internal,
-            external_addr,
-            addr::encode_address(target, target_domain),
-        ));
-
-        Ok(UdpProxySocket {
-            socket: Arc::new(external),
-            relay_addr,
-            target_addr: target,
-            target_domain: target_domain.map(|s| s.to_string()),
-            _control: None,
-        })
-    }
-
     async fn dial_udp_transport(
         &self,
         node: &Node,
@@ -241,89 +172,6 @@ impl ProxyHandler for TrojanHandler {
     fn pool_ready_streams(&self, node: &Node) -> bool {
         matches!(node.transport.as_str(), "" | "tcp")
     }
-}
-
-/// Idle timeout for the UDP associate bridge (mirrors the AnyTLS UoT bridge).
-const UDP_BRIDGE_IDLE_SECS: u64 = 90;
-
-/// Bridge task for UDP associate: frames loopback datagrams as Trojan UDP
-/// packets (`addr | u16 len | CRLF | payload`) on the associate stream and
-/// delivers inbound packets back to the loopback peer. Ends on error, EOF,
-/// or after [`UDP_BRIDGE_IDLE_SECS`] without activity.
-async fn trojan_udp_bridge(
-    stream: Box<dyn super::AsyncReadWrite>,
-    internal: tokio::net::UdpSocket,
-    external_addr: SocketAddr,
-    addr_header: Vec<u8>,
-) {
-    let (mut rd, mut wr) = tokio::io::split(stream);
-    // Bounded: a slow loopback writer must not let tunnel reads queue
-    // without bound; UDP drops instead.
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
-    let reader = tokio::spawn(async move {
-        loop {
-            // The address is parsed (and bounds-checked) but discarded: the
-            // bridge replies to the fixed loopback peer regardless.
-            if addr::SocksAddr::read_from_stream(&mut rd).await.is_err() {
-                break;
-            }
-            let mut len_buf = [0u8; 2];
-            if rd.read_exact(&mut len_buf).await.is_err() {
-                break;
-            }
-            let len = u16::from_be_bytes(len_buf) as usize;
-            let mut crlf = [0u8; 2];
-            if rd.read_exact(&mut crlf).await.is_err() {
-                break;
-            }
-            let mut data = vec![0u8; len];
-            if rd.read_exact(&mut data).await.is_err() {
-                break;
-            }
-            match tx.try_send(data) {
-                Ok(()) => {}
-                // Full queue: drop this datagram (UDP semantics), keep reading.
-                Err(mpsc::error::TrySendError::Full(_)) => continue,
-                Err(mpsc::error::TrySendError::Closed(_)) => break,
-            }
-        }
-    });
-
-    let mut buf = vec![0u8; 65536];
-    loop {
-        tokio::select! {
-            result = internal.recv_from(&mut buf) => {
-                match result {
-                    Ok((n, src)) => {
-                        if src != external_addr {
-                            continue;
-                        }
-                        let mut pkt = Vec::with_capacity(addr_header.len() + 4 + n);
-                        pkt.extend_from_slice(&addr_header);
-                        pkt.extend_from_slice(&(n as u16).to_be_bytes());
-                        pkt.extend_from_slice(CRLF);
-                        pkt.extend_from_slice(&buf[..n]);
-                        if wr.write_all(&pkt).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-            msg = rx.recv() => {
-                match msg {
-                    Some(data) => {
-                        if internal.send_to(&data, external_addr).await.is_err() {
-                            break;
-                        }
-                    }
-                    None => break,
-                }
-            }
-            _ = time::sleep(Duration::from_secs(UDP_BRIDGE_IDLE_SECS)) => break,
-        }
-    }
-    reader.abort();
 }
 
 /// Compute the lowercase hex encoding of SHA224(password).
@@ -415,58 +263,11 @@ mod tests {
         node.transport = "grpc".into();
         assert!(!handler.pool_ready_streams(&node));
     }
-
-    /// The bridge frames loopback payloads as Trojan UDP packets
-    /// (`addr | u16 len | CRLF | payload`) and delivers inbound packets
-    /// back to the loopback peer.
-    #[tokio::test]
-    async fn test_trojan_udp_bridge_roundtrip() {
-        let (client_half, mut server_half) = tokio::io::duplex(65536);
-        let boxed: Box<dyn crate::proxy::AsyncReadWrite> = Box::new(client_half);
-        let external = crate::util::udp_loopback_bind().await.unwrap();
-        let internal = crate::util::udp_loopback_bind().await.unwrap();
-        let external_addr = external.local_addr().unwrap();
-        let relay_addr = internal.local_addr().unwrap();
-        let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
-        let addr_header = addr::encode_address(target, None);
-        tokio::spawn(trojan_udp_bridge(
-            boxed,
-            internal,
-            external_addr,
-            addr_header,
-        ));
-
-        // Outbound: payload from the loopback peer becomes a framed packet.
-        external.send_to(b"ping", relay_addr).await.unwrap();
-        let mut head = [0u8; 7]; // 0x01 + 4 octets + 2 port
-        server_half.read_exact(&mut head).await.unwrap();
-        assert_eq!(head, [0x01, 8, 8, 8, 8, 0, 53]);
-        let mut len_buf = [0u8; 2];
-        server_half.read_exact(&mut len_buf).await.unwrap();
-        assert_eq!(u16::from_be_bytes(len_buf), 4);
-        let mut crlf = [0u8; 2];
-        server_half.read_exact(&mut crlf).await.unwrap();
-        assert_eq!(&crlf, b"\r\n");
-        let mut payload = vec![0u8; 4];
-        server_half.read_exact(&mut payload).await.unwrap();
-        assert_eq!(&payload, b"ping");
-
-        // Inbound: a framed packet from the stream is delivered to the peer.
-        let mut inbound = vec![0x01, 8, 8, 8, 8, 0, 53, 0, 4];
-        inbound.extend_from_slice(b"\r\n");
-        inbound.extend_from_slice(b"pong");
-        server_half.write_all(&inbound).await.unwrap();
-        let mut buf = [0u8; 16];
-        let (n, from) = external.recv_from(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"pong");
-        assert_eq!(from, relay_addr);
-    }
 }
 
-/// Framed UDP-associate transport over the Trojan control stream — the P1.5
-/// replacement for the loopback bridge: packets are framed directly onto the
-/// associate stream (`addr | u16 len | CRLF | payload`), no loopback socket
-/// pair, no bridge task, one fewer copy per datagram.
+/// Framed UDP-associate transport over the Trojan control stream: packets
+/// are framed directly onto the associate stream
+/// (`addr | u16 len | CRLF | payload`).
 struct TrojanUdpTransport {
     writer: tokio::sync::Mutex<WriteHalf<Box<dyn AsyncReadWrite>>>,
     reader: tokio::sync::Mutex<ReadHalf<Box<dyn AsyncReadWrite>>>,

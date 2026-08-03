@@ -113,18 +113,20 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|a| a.parse().ok())
         .unwrap_or(target);
     match handler
-        .dial_udp(&node, udp_target, None, Duration::from_secs(10))
+        .dial_udp_transport(&node, udp_target, None, Duration::from_secs(10))
         .await
     {
-        Ok(udp) => {
+        Ok(transport) => {
             let mut rtts = Vec::new();
             let mut buf = [0u8; 256];
             for i in 0..10u32 {
                 let t0 = Instant::now();
-                udp.socket.send_to(&i.to_be_bytes(), udp.relay_addr).await?;
-                if let Ok(Ok(_)) =
-                    tokio::time::timeout(Duration::from_secs(3), udp.socket.recv_from(&mut buf))
-                        .await
+                transport.send_packet(&i.to_be_bytes()).await?;
+                if let Ok(Ok(_)) = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    transport.recv_packet(&mut buf),
+                )
+                .await
                 {
                     rtts.push(t0.elapsed());
                 }

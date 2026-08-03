@@ -172,38 +172,3 @@ pub fn marked_udp_socket(bind_addr: SocketAddr) -> io::Result<std::net::UdpSocke
 pub async fn udp_marked_bind(bind_addr: SocketAddr) -> io::Result<tokio::net::UdpSocket> {
     tokio::net::UdpSocket::from_std(marked_udp_socket(bind_addr)?)
 }
-
-/// Bind a loopback UDP socket for a local protocol bridge (QUIC UDP sessions
-/// are re-exported to the relay as loopback datagrams). Loopback traffic does
-/// not traverse the interfaces the eBPF datapath attaches to, so the mark is
-/// best-effort: fall back to a plain bind when `SO_MARK` is not permitted
-/// (e.g. tests running unprivileged).
-pub async fn udp_loopback_bind() -> io::Result<tokio::net::UdpSocket> {
-    let loopback: SocketAddr = "127.0.0.1:0".parse().expect("hardcoded loopback address");
-    match udp_marked_bind(loopback).await {
-        Ok(socket) => Ok(socket),
-        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-            tokio::net::UdpSocket::bind(loopback).await
-        }
-        Err(e) => Err(e),
-    }
-}
-
-/// Bind the loopback UDP socket pair for a local protocol bridge (QUIC UDP
-/// sessions and stream tunnels are re-exported to the relay as loopback
-/// datagrams). Returns `(external, internal, external_addr, relay_addr)`:
-/// the relay sends raw payloads to `relay_addr` on `external` and receives
-/// replies from the same address; the bridge task talks to `external_addr`
-/// on `internal`.
-pub async fn udp_loopback_pair() -> io::Result<(
-    tokio::net::UdpSocket,
-    tokio::net::UdpSocket,
-    SocketAddr,
-    SocketAddr,
-)> {
-    let external = udp_loopback_bind().await?;
-    let internal = udp_loopback_bind().await?;
-    let external_addr = external.local_addr()?;
-    let relay_addr = internal.local_addr()?;
-    Ok((external, internal, external_addr, relay_addr))
-}
