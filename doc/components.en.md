@@ -642,7 +642,7 @@ Configured via `global { ... }` keys (`tcp_check_url`, `udp_check_dns`, `check_i
 | ---------- | -------- |
 | Domains | Tcp, DnsUdp, DataUdp × v4/v6 |
 | TCP probe | HTTP method to `tcp_check_url` or raw connect |
-| UDP probe | DNS to first usable `udp_check_dns` via node `dial_udp` |
+| UDP probe | DNS to first usable `udp_check_dns` via node `dial_udp_transport` |
 | Per-group check URL | Groups with `check_url` probe members against it (sub-group members via their current pick, keyed by tag — sing-box RealTag); (tag, url) state independent of the global one — dead-for-this-URL excludes the member from that group only |
 | Concurrency | Default batch 10 |
 | Recovery | 2 consecutive successes |

@@ -50,7 +50,7 @@ AAAA（如 `ipversion_prefer: 4`）族探测也能工作。可用
   拨号（TLS 协议族含 TLS 握手）;
 - 经 `urltest_node` 的代理延迟（默认目标
   `https://www.gstatic.com/generate_204`);
-- UDP 探活：经节点 `dial_udp` 发送最小 DNS A 查询，以及一次**真实 QUIC
+- UDP 探活：经节点 `dial_udp_transport` 发送最小 DNS A 查询，以及一次**真实 QUIC
   握手**(h3，跳过证书验证）——复用 honk-outbound 的
   `quic::quic_handshake_probe`（在隧道上叠自定义 `AsyncUdpSocket` 驱动
   quinn)。

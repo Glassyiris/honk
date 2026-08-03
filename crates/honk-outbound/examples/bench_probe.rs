@@ -44,7 +44,9 @@ async fn main() -> anyhow::Result<()> {
     let mut lat = Vec::with_capacity(n_dials);
     for _ in 0..n_dials {
         let t0 = Instant::now();
-        let s = tcp.dial(&node, target, None, Duration::from_secs(10)).await?;
+        let s = tcp
+            .dial(&node, target, None, Duration::from_secs(10))
+            .await?;
         lat.push(t0.elapsed());
         drop(s);
     }
@@ -73,7 +75,9 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // --- 3. Download throughput ---
-    let mut s = tcp.dial(&node, target, None, Duration::from_secs(10)).await?;
+    let mut s = tcp
+        .dial(&node, target, None, Duration::from_secs(10))
+        .await?;
     s.stream
         .write_all(b"GET / HTTP/1.1\r\nHost: bench\r\nConnection: close\r\n\r\n")
         .await?;
@@ -122,11 +126,9 @@ async fn main() -> anyhow::Result<()> {
             for i in 0..10u32 {
                 let t0 = Instant::now();
                 transport.send_packet(&i.to_be_bytes()).await?;
-                if let Ok(Ok(_)) = tokio::time::timeout(
-                    Duration::from_secs(3),
-                    transport.recv_packet(&mut buf),
-                )
-                .await
+                if let Ok(Ok(_)) =
+                    tokio::time::timeout(Duration::from_secs(3), transport.recv_packet(&mut buf))
+                        .await
                 {
                     rtts.push(t0.elapsed());
                 }

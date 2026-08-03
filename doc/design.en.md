@@ -79,7 +79,7 @@ flowchart TB
     SNIFF[SNI / HTTP Host / QUIC SNI]
     R[Router fallback]
     G[GroupManager → leaf node]
-    D[ProxyHandler dial]
+    D[TcpOutbound dial]
     REL[relay splice / copy / UDP]
   end
 
@@ -197,11 +197,8 @@ may use only a non-wildcard local bind. Malformed, duplicate, truncated, or
 unspecified `ORIGDST`/`PKTINFO` metadata is rejected rather than downgraded, and
 a packet without provenance is dropped before it can reserve an endpoint or send.
 
-**`PacketTransport` is the production UDP contract.** `ProxyHandler::dial_udp_transport`
-returns a framed, bidirectional transport for each endpoint. The older
-`dial_udp`/`UdpProxySocket` surface and its socket adapter remain for compatibility
-and incremental migration, but are not the canonical endpoint path; a legacy or
-test-only loopback adapter is not a production bridge design. Tunnel handlers frame
+**`PacketTransport` is the only UDP contract.** `PacketOutbound::dial_udp_transport`
+returns a framed, bidirectional transport for each endpoint. Tunnel handlers frame
 packets directly on their tunnel. A SOCKS5 transport keeps its TCP UDP-ASSOCIATE
 control stream for the association lifetime, frames and parses RFC 1928 UDP
 packets, and treats control EOF as endpoint failure. Its connected UDP socket uses
@@ -289,7 +286,7 @@ Nested groups (`groups` field) flatten recursively (depth ≤ 8) to a single lea
 
 - Per-node states: TCP / DnsUDP / DataUDP × v4/v6
 - Concurrent probes (default batch 10), recovery hysteresis, grace period, exponential backoff (deep-backoff nodes keep probing on the slow max-cooldown cadence — never a full stop)
-- TCP: HTTP HEAD or raw connect; UDP: DNS query through the node’s own `dial_udp`
+- TCP: HTTP HEAD or raw connect; UDP: DNS query through the node’s own `dial_udp_transport`
 - Pushes connectivity into eBPF so dead outbounds are not redirected
 
 ## 9. DNS design

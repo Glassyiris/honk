@@ -54,9 +54,9 @@ the family probes work even when the resolver returns no AAAA (e.g.
 - proxied latency via `urltest_node` (default target:
   `https://www.gstatic.com/generate_204`),
 - UDP liveness: a minimal DNS A query **and** a real QUIC handshake (h3,
-  certificates skipped) through the node's `dial_udp` — via the reusable
-  `quic::quic_handshake_probe` in honk-outbound, which drives quinn over a
-  custom `AsyncUdpSocket` on top of the tunnel.
+  certificates skipped) through the node's `dial_udp_transport` — via the
+  reusable `quic::quic_handshake_probe` in honk-outbound, which drives quinn
+  over a custom `AsyncUdpSocket` on top of the tunnel.
 
 Ends with alive-per-family counts and the median latency.
 

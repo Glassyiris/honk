@@ -239,8 +239,8 @@ mod tests {
 
     #[test]
     fn test_pool_ready_streams_transport_gating() {
-        let pool_ready_streams = crate::descriptor::descriptor(NodeProtocol::Trojan)
-            .pool_ready_streams;
+        let pool_ready_streams =
+            crate::descriptor::descriptor(NodeProtocol::Trojan).pool_ready_streams;
         let mut node = Node {
             name: "t".into(),
             protocol: NodeProtocol::Trojan,

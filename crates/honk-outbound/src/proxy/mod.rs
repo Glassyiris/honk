@@ -489,13 +489,11 @@ impl ProxyRegistry {
                 .with_probeable(shadowsocks),
         );
         let vless = Arc::new(VLessHandler::new());
-        registry.register(
-            ProtocolEntry::new(NodeProtocol::VLess, vless.clone()).with_probeable(vless),
-        );
+        registry
+            .register(ProtocolEntry::new(NodeProtocol::VLess, vless.clone()).with_probeable(vless));
         let vmess = Arc::new(VmessHandler::new());
-        registry.register(
-            ProtocolEntry::new(NodeProtocol::VMess, vmess.clone()).with_probeable(vmess),
-        );
+        registry
+            .register(ProtocolEntry::new(NodeProtocol::VMess, vmess.clone()).with_probeable(vmess));
         let anytls = Arc::new(AnyTlsHandler::new());
         registry.register(
             ProtocolEntry::new(NodeProtocol::AnyTLS, anytls.clone())
@@ -669,10 +667,7 @@ impl ProxyRegistry {
         &self,
         generation: &Arc<crate::runtime::OutboundRuntimeRegistry>,
         node_id: uuid::Uuid,
-    ) -> anyhow::Result<(
-        Arc<crate::runtime::NodeRuntime>,
-        &Arc<dyn PacketOutbound>,
-    )> {
+    ) -> anyhow::Result<(Arc<crate::runtime::NodeRuntime>, &Arc<dyn PacketOutbound>)> {
         if generation.is_shutdown() {
             anyhow::bail!("outbound runtime generation is shut down");
         }

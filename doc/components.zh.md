@@ -571,7 +571,7 @@ honk-core delay <node> [--url HOST:PORT]
 | ------ | ------ |
 | 域 | Tcp、DnsUdp、DataUdp × v4/v6 |
 | TCP 探测 | 对 `tcp_check_url` 发 HTTP，或裸连接 |
-| UDP 探测 | 经节点 `dial_udp` 向 `udp_check_dns` 发 DNS |
+| UDP 探测 | 经节点 `dial_udp_transport` 向 `udp_check_dns` 发 DNS |
 | 按组 check URL | 配了 `check_url` 的组按其目标探测成员（子组成员经其当前选中节点探测，结果记到子组 tag,与 sing-box RealTag 一致）；(tag, url) 状态与全局独立——对该 URL 死亡只把该成员排除出该组 |
 | 并发 | 默认批次 10 |
 | 恢复 | 连续 2 次成功 |

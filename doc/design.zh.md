@@ -79,7 +79,7 @@ flowchart TB
     SNIFF[SNI / HTTP Host / QUIC SNI]
     R[Router 回退]
     G[GroupManager → 叶子节点]
-    D[ProxyHandler dial]
+    D[TcpOutbound dial]
     REL[relay splice / copy / UDP]
   end
 
@@ -194,11 +194,9 @@ SockMap 即使只发布了一部分，也不会把流量 redirect 到缺失的 l
 格式错误、重复、截断或 unspecified 的 `ORIGDST`/`PKTINFO` 元数据会被拒绝，
 不会降级；无可信来源的报文会在保留 endpoint 或发送前直接丢弃。
 
-**`PacketTransport` 是生产 UDP 契约。** `ProxyHandler::dial_udp_transport`
-为每个 endpoint 返回双向的分帧 transport。旧的 `dial_udp`/`UdpProxySocket`
-接口及其 socket adapter 为兼容与渐进迁移而保留，但不是规范 endpoint 路径；
-legacy 或仅测试使用的 loopback adapter 不是生产 bridge 设计。隧道 Handler
-直接在其隧道上分帧。SOCKS5 transport 在整个 association 生命周期内保留 TCP
+**`PacketTransport` 是唯一的 UDP 契约。** `PacketOutbound::dial_udp_transport`
+为每个 endpoint 返回双向的分帧 transport。隧道 Handler 直接在其隧道上分帧。
+SOCKS5 transport 在整个 association 生命周期内保留 TCP
 UDP-ASSOCIATE 控制流，按 RFC 1928 处理 UDP 分帧与解析，并将控制流 EOF 视为
 endpoint 失败。它的已连接 UDP socket 使用物理 `BND.ADDR` relay，而暴露给
 endpoint 的 `relay_addr()` 与收到的 peer 是供首个回包过滤使用的逻辑目标 peer。
@@ -275,7 +273,7 @@ warm-up 返回 `NotApplicable`，不会伪造成功。
 
 - 每节点状态：TCP / DnsUDP / DataUDP × v4/v6
 - 并发探测（默认批次 10）、恢复滞后、宽限期、指数退避（深度退避节点仍以 max_cooldown 慢速节奏继续探测，永不完全停止）
-- TCP：HTTP HEAD 或裸连接；UDP：经节点自身 `dial_udp` 发 DNS 查询
+- TCP：HTTP HEAD 或裸连接；UDP：经节点自身 `dial_udp_transport` 发 DNS 查询
 - 将连通性推入 eBPF，避免把流量 redirect 到已死出站
 
 ## 9. DNS 设计

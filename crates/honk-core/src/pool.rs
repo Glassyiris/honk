@@ -879,9 +879,10 @@ mod tests {
             ..Default::default()
         };
         let handler = Socks5Handler::new();
-        assert!((honk_outbound::descriptor::descriptor(NodeProtocol::Socks5).pool_ready_streams)(
-            &node
-        ));
+        assert!((honk_outbound::descriptor::descriptor(
+            NodeProtocol::Socks5
+        )
+        .pool_ready_streams)(&node));
         let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
 
         // Full dial (TCP + greeting + CONNECT), then pool the result.
