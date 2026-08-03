@@ -4,18 +4,14 @@ pub(crate) mod addr;
 pub mod anytls;
 pub mod block;
 pub mod direct;
-pub mod http;
 pub mod hysteria2;
 pub mod juicity;
-pub(crate) mod mux;
 pub mod shadowsocks;
 pub(crate) mod shadowsocks_2022;
 pub mod socks5;
 pub(crate) mod ss_stream;
-pub mod ssr;
 pub(crate) mod transport;
 pub mod trojan;
-pub mod trojan_go;
 pub mod tuic;
 pub mod vless;
 pub mod vmess;
@@ -26,19 +22,16 @@ use block::BlockHandler;
 use direct::DirectHandler;
 use honk_config::node::Node;
 use honk_config::types::NodeProtocol;
-use http::HttpConnectHandler;
 use hysteria2::Hysteria2Handler;
 use juicity::JuicityHandler;
 use shadowsocks::ShadowsocksHandler;
 use socks5::Socks5Handler;
-use ssr::ShadowsocksRHandler;
 use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use trojan::TrojanHandler;
-use trojan_go::TrojanGoHandler;
 use tuic::TuicHandler;
 use vless::VLessHandler;
 use vmess::VmessHandler;
@@ -417,20 +410,20 @@ pub trait ProxyHandler: Send + Sync {
     }
 
     /// Whether bare-TCP pool hits are useful for this node. Multiplexed
-    /// protocols (AnyTLS, Trojan-Go, h2mux) keep their own warm session
-    /// pools; a pooled bare TCP forces a brand-new mux session per flow —
-    /// worse than reusing the session pool, and sessions created over the
-    /// pool cap leak. Return `false` for those; the dial then always goes
-    /// through the session pool. The default is `true` (single-connection
-    /// protocols where skipping the TCP handshake helps).
+    /// protocols (AnyTLS) keep their own warm session pools; a pooled bare
+    /// TCP forces a brand-new mux session per flow — worse than reusing the
+    /// session pool, and sessions created over the pool cap leak. Return
+    /// `false` for those; the dial then always goes through the session
+    /// pool. The default is `true` (single-connection protocols where
+    /// skipping the TCP handshake helps).
     fn pool_bare_tcp(&self, node: &Node) -> bool {
         let _ = node;
         true
     }
 
     /// Install the per-node runtime registry (session-layer ownership).
-    /// Handlers with pooled sessions (AnyTLS, Trojan-Go, h2mux) resolve
-    /// their node's pool through it; the default is a no-op for stateless
+    /// Handlers with pooled sessions (AnyTLS) resolve their node's pool
+    /// through it; the default is a no-op for stateless
     /// handlers. The shared cell swaps its contents on reload, so this is
     /// installed once at startup.
     fn set_runtime_registry(&self, cell: crate::runtime::SharedRuntimeRegistry) {
@@ -463,10 +456,8 @@ impl ProxyRegistry {
         registry.register(Box::new(DirectHandler::new()));
         registry.register(Box::new(BlockHandler::new()));
         registry.register(Box::new(TrojanHandler::new()));
-        registry.register(Box::new(TrojanGoHandler::new()));
         registry.register(Box::new(Hysteria2Handler::new()));
         registry.register(Box::new(ShadowsocksHandler::new()));
-        registry.register(Box::new(ShadowsocksRHandler::new()));
         registry.register(Box::new(VLessHandler::new()));
         registry.register(Box::new(VmessHandler::new()));
         registry.register(Box::new(AnyTlsHandler::new()));
@@ -501,13 +492,6 @@ impl ProxyRegistry {
                 .dial(node, target, target_domain, connect_timeout)
                 .await;
         }
-        // Real http-proxy nodes (anything but the built-ins) were silently
-        // direct through the same marker: use the CONNECT handler instead.
-        if node.protocol == NodeProtocol::HTTP && node.name != "direct" {
-            return HttpConnectHandler::new()
-                .dial(node, target, target_domain, connect_timeout)
-                .await;
-        }
         let handler = self
             .find(node.protocol)
             .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", node.protocol))?;
@@ -536,11 +520,6 @@ impl ProxyRegistry {
     ) -> anyhow::Result<ProxyStream> {
         if runtime.node.name == "block" {
             return BlockHandler::new()
-                .dial_runtime(runtime, target, target_domain, connect_timeout)
-                .await;
-        }
-        if runtime.node.protocol == NodeProtocol::HTTP && runtime.node.name != "direct" {
-            return HttpConnectHandler::new()
                 .dial_runtime(runtime, target, target_domain, connect_timeout)
                 .await;
         }

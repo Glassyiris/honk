@@ -6,7 +6,7 @@ use honk_config::Config;
 use honk_config::node::Node;
 use honk_config::types::NodeProtocol;
 
-/// URL-safe base64 without padding (the encoding used by vmess/ssr links).
+/// URL-safe base64 without padding (the encoding used by vmess links).
 fn b64(s: &str) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s)
 }
@@ -85,19 +85,6 @@ fn test_trojan_ws_query() {
     assert_eq!(node.ws_path.as_deref(), Some("/ws"));
     assert_eq!(node.ws_host.as_deref(), Some("cdn.example.com"));
     assert_eq!(node.sni.as_deref(), Some("sni.example.com"));
-}
-
-#[test]
-fn test_trojan_go_grpc_query() {
-    let node = Node::from_share_link(
-        "trojan-go://pw@example.com:443?type=grpc&serviceName=myService&allowInsecure=1#trojan-grpc",
-    )
-    .unwrap();
-    // trojan-go is its own protocol (smux-style mux), not plain trojan.
-    assert_eq!(node.protocol, NodeProtocol::TrojanGo);
-    assert_eq!(node.transport, "grpc");
-    assert_eq!(node.grpc_service.as_deref(), Some("myService"));
-    assert!(node.skip_cert_verify);
 }
 
 #[test]
@@ -199,55 +186,23 @@ fn test_vmess_invalid_links_rejected() {
 }
 
 #[test]
-fn test_ssr_full_link() {
-    let inner = format!(
-        "1.2.3.4:8388:auth_sha1_v4:aes-256-cfb:http_simple:{}/?obfsparam={}&protoparam={}&remarks={}&group={}",
-        b64("password123"),
-        b64("obfs.example.com"),
-        b64("proto-param"),
-        b64("my-ssr-node"),
-        b64("some-group"),
-    );
-    let node = Node::from_share_link(&format!("ssr://{}", b64(&inner))).unwrap();
-    assert_eq!(node.protocol, NodeProtocol::SSR);
-    assert_eq!(node.name, "my-ssr-node");
-    assert_eq!(node.host, "1.2.3.4");
-    assert_eq!(node.address, "1.2.3.4:8388");
-    assert_eq!(node.port, 8388);
-    assert_eq!(node.encryption.as_deref(), Some("aes-256-cfb"));
-    assert_eq!(node.password.as_deref(), Some("password123"));
-    // The SSR handler substring-matches `plugin` for protocol and obfs.
-    assert_eq!(node.plugin.as_deref(), Some("auth_sha1_v4;http_simple"));
-    assert_eq!(
-        node.plugin_opts.as_deref(),
-        Some("obfsparam=obfs.example.com;protoparam=proto-param")
-    );
-}
-
-#[test]
-fn test_ssr_minimal_link_without_params() {
-    let inner = format!("example.com:443:origin:none:plain:{}", b64("pw"));
-    let node = Node::from_share_link(&format!("ssr://{}", b64(&inner))).unwrap();
-    assert_eq!(node.protocol, NodeProtocol::SSR);
-    assert_eq!(node.host, "example.com");
-    assert_eq!(node.port, 443);
-    assert_eq!(node.encryption.as_deref(), Some("none"));
-    assert_eq!(node.password.as_deref(), Some("pw"));
-    assert_eq!(node.plugin.as_deref(), Some("origin;plain"));
-    assert!(node.plugin_opts.is_none());
-    // No remark: the name falls back to `ssr-<host>` (never the raw link,
-    // which would leak the password).
-    assert_eq!(node.name, "ssr-example.com");
-}
-
-#[test]
-fn test_ssr_invalid_links_rejected() {
-    assert!(Node::from_share_link("ssr://!!!not-base64!!!").is_err());
-    // Too few fields after decoding.
-    assert!(Node::from_share_link(&format!("ssr://{}", b64("host:1234"))).is_err());
-    // Bad port.
-    let bad_port = format!("host:notaport:origin:none:plain:{}", b64("pw"));
-    assert!(Node::from_share_link(&format!("ssr://{}", b64(&bad_port))).is_err());
+fn test_removed_protocol_links_rejected() {
+    // ssr/trojan-go/http(s) support was removed; the links now fail as
+    // unknown protocols (hard error in config files, skipped with a
+    // warning in subscriptions).
+    let ssr_link = format!("ssr://{}", b64("example.com:443:origin:none:plain:cHc"));
+    for link in [
+        ssr_link.as_str(),
+        "trojan-go://pw@example.com:443",
+        "http://proxy.example.com:8080",
+        "https://user:pass@proxy.example.com:8443",
+    ] {
+        let err = Node::from_share_link(link).unwrap_err();
+        assert!(
+            err.to_string().contains("Unknown node protocol"),
+            "'{link}' must be rejected: {err}"
+        );
+    }
 }
 
 #[test]

@@ -46,7 +46,7 @@ pub struct Node {
     /// Password / UUID for auth
     #[serde(default)]
     pub password: Option<String>,
-    /// Encryption method (for SS/SSR)
+    /// Encryption method (for SS)
     #[serde(default)]
     pub encryption: Option<String>,
     #[serde(default)]
@@ -166,9 +166,6 @@ pub struct Node {
     /// Seconds before an idle AnyTLS session is evicted.
     #[serde(default)]
     pub anytls_idle_session_timeout: Option<u64>,
-    /// Multiplexing enabled
-    #[serde(default)]
-    pub mux: bool,
     /// Outbound mark for routing
     #[serde(default)]
     pub mark: Option<u32>,
@@ -241,7 +238,6 @@ impl Default for Node {
             anytls_min_idle_session: None,
             anytls_idle_session_check_interval: None,
             anytls_idle_session_timeout: None,
-            mux: false,
             mark: None,
             tags: Vec::new(),
             subscription_id: None,

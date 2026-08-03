@@ -469,6 +469,17 @@ impl Config {
                     node.name, node.transport
                 )));
             }
+            // The HTTP protocol variant survives only as the internal marker
+            // of the built-in direct/block nodes; explicit http proxies are
+            // no longer supported.
+            if node.protocol == crate::types::NodeProtocol::HTTP
+                && !matches!(node.name.as_str(), "direct" | "block")
+            {
+                return Err(crate::ConfigError::Validation(format!(
+                    "Node '{}': the http proxy protocol is no longer supported",
+                    node.name
+                )));
+            }
         }
         for group in &self.groups {
             if group.name.is_empty() {
@@ -512,6 +523,29 @@ mod builtin_nodes_tests {
         for ok in ["", "tcp", "ws", "grpc"] {
             config.nodes[0].transport = ok.into();
             assert!(config.validate().is_ok(), "transport '{ok}' must pass");
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_explicit_http_node() {
+        let mut config = Config::default();
+        config.nodes.push(crate::node::Node {
+            name: "web-proxy".into(),
+            address: "1.2.3.4:8080".into(),
+            protocol: crate::types::NodeProtocol::HTTP,
+            ..Default::default()
+        });
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("http proxy protocol"),
+            "explicit http nodes must be rejected: {err}"
+        );
+        for builtin in ["direct", "block"] {
+            config.nodes[0].name = builtin.into();
+            assert!(
+                config.validate().is_ok(),
+                "built-in '{builtin}' keeps the HTTP marker"
+            );
         }
     }
 

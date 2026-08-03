@@ -1,23 +1,17 @@
 //! Share-link parsing: build a [`Node`] from a proxy share URI.
 //!
-//! Supports the common `scheme://` share-link formats (socks5, ss/ssr,
-//! trojan/trojan-go, anytls, vmess, vless, hysteria2, tuic, juicity, http).
+//! Supports the common `scheme://` share-link formats (socks5, ss,
+//! trojan, anytls, vmess, vless, hysteria2, tuic, juicity).
 //! Shadowsocks links follow SIP002: the userinfo is either
 //! `base64(method:password)` or plain `method:password` (the method itself
 //! may still be base64-encoded), the whole `method:password@host:port`
 //! authority may also be base64-encoded, and an optional `/?plugin=...`
 //! query suffix carries the plugin name and options.
 //!
-//! Two schemes do not follow the URL-shaped layout and are decoded before
-//! the generic URL path:
-//!
-//! - `vmess://<base64>` — the payload is base64 (URL-safe or standard
-//!   alphabet) of a JSON object with the v2rayN field set (`add`, `port`,
-//!   `id`, `scy`, `net`, `host`, `path`, `tls`, `sni`, ...).
-//! - `ssr://<base64>` — the payload is base64 of
-//!   `host:port:protocol:method:obfs:base64(password)/?params`, where the
-//!   `obfsparam`/`protoparam`/`remarks`/`group` params are themselves
-//!   URL-safe base64 without padding.
+//! `vmess://<base64>` does not follow the URL-shaped layout and is decoded
+//! before the generic URL path: the payload is base64 (URL-safe or standard
+//! alphabet) of a JSON object with the v2rayN field set (`add`, `port`,
+//! `id`, `scy`, `net`, `host`, `path`, `tls`, `sni`, ...).
 //!
 //! This is the single share-link parser for the whole workspace: the dae
 //! config parser and the core subscription fetcher both delegate to
@@ -38,13 +32,10 @@ impl Node {
     pub fn from_share_link(link: &str) -> Result<Node, ConfigError> {
         let first = link.split("->").next().unwrap_or("").trim();
 
-        // vmess:// and ssr:// carry a base64-encoded payload in place of a
-        // URL-shaped authority, so they are decoded before the generic path.
+        // vmess:// carries a base64-encoded payload in place of a
+        // URL-shaped authority, so it is decoded before the generic path.
         if let Some(payload) = first.strip_prefix("vmess://") {
             return parse_vmess_link(first, payload);
-        }
-        if let Some(payload) = first.strip_prefix("ssr://") {
-            return parse_ssr_link(first, payload);
         }
 
         // SIP002 also allows the whole authority to be base64-encoded
@@ -70,18 +61,13 @@ impl Node {
         let protocol = match scheme {
             "socks5" | "socks4" | "socks4a" => NodeProtocol::Socks5,
             "ss" => NodeProtocol::SS,
-            "ssr" => NodeProtocol::SSR,
             "trojan" => NodeProtocol::Trojan,
-            // trojan-go links are their own protocol (smux-style mux);
-            // parsing them as plain trojan silently produced broken nodes.
-            "trojan-go" => NodeProtocol::TrojanGo,
             "anytls" => NodeProtocol::AnyTLS,
             "vmess" => NodeProtocol::VMess,
             "vless" => NodeProtocol::VLess,
             "hysteria2" | "hysteria" => NodeProtocol::Hysteria2,
             "tuic" => NodeProtocol::Tuic,
             "juicity" => NodeProtocol::Juicity,
-            "http" | "https" => NodeProtocol::HTTP,
             _ => return Err(ConfigError::UnknownProtocol(scheme.to_string())),
         };
 
@@ -89,10 +75,7 @@ impl Node {
             .host_str()
             .ok_or_else(|| ConfigError::Parse(format!("missing host in share link '{}'", first)))?
             .to_string();
-        let port = url.port().unwrap_or(match protocol {
-            NodeProtocol::HTTP => 80,
-            _ => 443,
-        });
+        let port = url.port().unwrap_or(443);
 
         let mut node = Node {
             id: uuid::Uuid::new_v4(),
@@ -117,14 +100,12 @@ impl Node {
                 node.password = Some(percent_decode_str(pw));
             }
 
-            // Trojan, Trojan-Go and AnyTLS put the authentication secret in the
+            // Trojan and AnyTLS put the authentication secret in the
             // URI userinfo field, not the password field.  Copy it to
             // `password` so the protocol handler can build the correct request
             // header.
-            if matches!(
-                protocol,
-                NodeProtocol::Trojan | NodeProtocol::TrojanGo | NodeProtocol::AnyTLS
-            ) && node.password.is_none()
+            if matches!(protocol, NodeProtocol::Trojan | NodeProtocol::AnyTLS)
+                && node.password.is_none()
                 && !url.username().is_empty()
             {
                 node.password = Some(percent_decode_str(url.username()));
@@ -141,14 +122,8 @@ impl Node {
             .unwrap_or_else(|| format!("{}-{}", scheme, host));
 
         match protocol {
-            NodeProtocol::Trojan
-            | NodeProtocol::TrojanGo
-            | NodeProtocol::VLess
-            | NodeProtocol::AnyTLS => {
+            NodeProtocol::Trojan | NodeProtocol::VLess | NodeProtocol::AnyTLS => {
                 node.tls = true;
-            }
-            NodeProtocol::HTTP => {
-                node.tls = scheme == "https";
             }
             _ => {}
         }
@@ -167,10 +142,10 @@ impl Node {
             node.sni = Some(v.clone());
         }
 
-        // Trojan/Trojan-Go transport options.  `alpn` is accepted for
+        // Trojan transport options.  `alpn` is accepted for
         // compatibility but intentionally not stored.
         let mut host_consumed = false;
-        if matches!(protocol, NodeProtocol::Trojan | NodeProtocol::TrojanGo) {
+        if protocol == NodeProtocol::Trojan {
             match node.transport.as_str() {
                 "ws" => {
                     if let Some(v) = query.get("host") {
@@ -475,102 +450,6 @@ fn json_port(value: Option<serde_json::Value>) -> Option<u16> {
         serde_json::Value::String(s) => s.trim().parse().ok(),
         _ => None,
     }
-}
-
-/// Parse an `ssr://` share link.
-///
-/// The payload is base64 of
-/// `host:port:protocol:method:obfs:base64(password)/?key=base64(value)&...`;
-/// the `/?params` section is optional.
-fn parse_ssr_link(link: &str, payload: &str) -> Result<Node, ConfigError> {
-    let raw = base64_decode_flexible(payload).ok_or_else(|| {
-        ConfigError::Parse(format!("invalid ssr link '{}': base64 decode failed", link))
-    })?;
-    let text = String::from_utf8(raw).map_err(|_| {
-        ConfigError::Parse(format!("invalid ssr link '{}': payload is not UTF-8", link))
-    })?;
-
-    let (main, query) = match text.split_once("/?") {
-        Some((m, q)) => (m, Some(q)),
-        None => (text.trim_end_matches('/'), None),
-    };
-
-    // Peel the five right-most fields; the remainder is the host (which may
-    // itself contain ':' for bracketed IPv6 literals).
-    let mut fields = main.rsplitn(6, ':');
-    let password_b64 = fields.next().unwrap_or("");
-    let obfs = fields.next().unwrap_or("");
-    let method = fields.next().unwrap_or("");
-    let ssr_protocol = fields.next().unwrap_or("");
-    let port_str = fields.next().unwrap_or("");
-    let host = fields.next().unwrap_or("");
-
-    if host.is_empty() || obfs.is_empty() || method.is_empty() || ssr_protocol.is_empty() {
-        return Err(ConfigError::Parse(format!(
-            "invalid ssr link '{}': expected host:port:protocol:method:obfs:password",
-            link
-        )));
-    }
-    let port: u16 = port_str.parse().map_err(|_| {
-        ConfigError::Parse(format!(
-            "invalid ssr link '{}': bad port '{}'",
-            link, port_str
-        ))
-    })?;
-    let password = base64_decode_flexible(password_b64)
-        .and_then(|b| String::from_utf8(b).ok())
-        .ok_or_else(|| {
-            ConfigError::Parse(format!("invalid ssr link '{}': bad password field", link))
-        })?;
-
-    // Query parameters are URL-safe base64 without padding.
-    let mut remarks = None;
-    let mut obfs_param = None;
-    let mut proto_param = None;
-    if let Some(query) = query {
-        for pair in query.split('&') {
-            let Some((key, value)) = pair.split_once('=') else {
-                continue;
-            };
-            let decoded = base64_decode_flexible(value).and_then(|b| String::from_utf8(b).ok());
-            match key {
-                "remarks" => remarks = decoded,
-                "obfsparam" => obfs_param = decoded,
-                "protoparam" => proto_param = decoded,
-                _ => {} // `group` and friends are accepted but not stored
-            }
-        }
-    }
-
-    let mut node = Node {
-        id: uuid::Uuid::new_v4(),
-        protocol: NodeProtocol::SSR,
-        host: host.to_string(),
-        address: format!("{}:{}", host, port),
-        port,
-        encryption: Some(method.to_string()),
-        password: Some(password),
-        // The SSR handler detects both the protocol and the obfs plugin by
-        // substring-matching `node.plugin`; carry both names there.
-        plugin: Some(format!("{};{}", ssr_protocol, obfs)),
-        name: remarks.unwrap_or_else(|| format!("ssr-{}", host)),
-        ..Default::default()
-    };
-
-    // Surface the decoded plugin parameters as `k=v;...` pairs, the format
-    // `SsrObfs::parse_opts` understands.
-    let mut opts = Vec::new();
-    if let Some(v) = obfs_param.filter(|s| !s.is_empty()) {
-        opts.push(format!("obfsparam={}", v));
-    }
-    if let Some(v) = proto_param.filter(|s| !s.is_empty()) {
-        opts.push(format!("protoparam={}", v));
-    }
-    if !opts.is_empty() {
-        node.plugin_opts = Some(opts.join(";"));
-    }
-
-    Ok(node)
 }
 
 /// Apply SIP002 userinfo decoding for Shadowsocks links.

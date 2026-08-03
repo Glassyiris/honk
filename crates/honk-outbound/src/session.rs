@@ -1,5 +1,5 @@
-//! Unified session pool for multiplexed outbounds (h2mux, AnyTLS,
-//! Trojan-Go; QUIC protocols keep their own single-connection holder —
+//! Unified session pool for multiplexed outbounds (AnyTLS;
+//! QUIC protocols keep their own single-connection holder —
 //! see `quic::QuicClient`).
 //!
 //! What this centralizes (previously re-implemented, slightly

@@ -84,7 +84,7 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
             Self::http_check(proxy.stream, &check_url, &check_method).await?;
 
             // Measure the full request round trip, not just the dial: mux
-            // protocols (AnyTLS, h2mux, QUIC tunnels) open a stream on an
+            // protocols (AnyTLS, QUIC tunnels) open a stream on an
             // already-warm session, so a dial-only measurement reports ~0ms
             // for every such node and makes URLTest ranking meaningless.
             let elapsed = start.elapsed();

@@ -150,12 +150,6 @@ impl ProxyHandler for VLessHandler {
         NodeProtocol::VLess
     }
 
-    /// With `mux` the dial goes through the h2mux SessionPool: bare-TCP
-    /// pooling would force a new h2 session per flow (see AnyTlsHandler).
-    fn pool_bare_tcp(&self, node: &Node) -> bool {
-        !node.mux
-    }
-
     async fn dial(
         &self,
         node: &Node,

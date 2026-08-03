@@ -8,7 +8,7 @@
 //! IPv6:   ATYP(0x04) | 16 octets | port(2)
 //! ```
 //!
-//! The trojan, trojan-go, shadowsocks (+2022/ssr), anytls and juicity
+//! The trojan, shadowsocks (+2022), anytls and juicity
 //! handlers all use this exact layout; VMess and TUIC use the same layout
 //! with a different ATYP numbering ([`AtypScheme`]). VLESS keeps its own
 //! encoding (port before ATYP) and is deliberately not unified here.

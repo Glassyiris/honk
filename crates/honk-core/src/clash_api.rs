@@ -337,11 +337,9 @@ async fn patch_configs(State(s): State<Arc<ClashState>>, body: Bytes) -> Respons
 fn clash_protocol_type(protocol: NodeProtocol) -> &'static str {
     match protocol {
         NodeProtocol::SS => "Shadowsocks",
-        NodeProtocol::SSR => "ShadowsocksR",
         NodeProtocol::Trojan => "Trojan",
         NodeProtocol::VMess => "Vmess",
         NodeProtocol::VLess => "Vless",
-        NodeProtocol::TrojanGo => "Trojan",
         NodeProtocol::Socks5 => "Socks5",
         NodeProtocol::HTTP => "Http",
         NodeProtocol::Hysteria2 => "Hysteria2",

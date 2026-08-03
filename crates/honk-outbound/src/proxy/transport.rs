@@ -3,26 +3,19 @@
 //! Trojan, VMess and VLESS all wrap their connections in the same order:
 //!
 //! ```text
-//! TCP -> (TLS) -> (h2mux | WebSocket | gRPC) -> protocol header
+//! TCP -> (TLS) -> (WebSocket | gRPC) -> protocol header
 //! ```
 //!
 //! This module provides the reusable pieces so each handler only implements
 //! its own protocol handshake:
 //!
-//! - [`connect_transport`]: TCP connect + optional TLS + optional h2mux or
-//!   WS/gRPC wrapping, driven by `node.mux` / `node.transport` / `node.tls`.
-//! - [`wrap_transport`]: the same TLS + h2mux/WS/gRPC wrapping for an
+//! - [`connect_transport`]: TCP connect + optional TLS + optional WS/gRPC
+//!   wrapping, driven by `node.transport` / `node.tls`.
+//! - [`wrap_transport`]: the same TLS + WS/gRPC wrapping for an
 //!   already-connected `TcpStream` (the `dial_with_tcp` pooling path).
 //! - [`maybe_tls_wrap`]: just the TLS step (used by handlers that keep the
 //!   pooled-TCP path on the raw transport).
 //! - [`GrpcStream`]: minimal gRPC-over-HTTP/2 framing client.
-//!
-//! When `node.mux` is set the dial goes through [`super::mux`] instead of
-//! the WS/gRPC transports: the TCP (+TLS) connection is upgraded to a
-//! shared HTTP/2 session and the returned stream is one multiplexed h2
-//! stream (sing-box semantics — multiplex and transport are mutually
-//! exclusive, so a configured `node.transport` is ignored with a debug
-//! log). The protocol header the handler writes afterwards is unchanged.
 
 use futures_util::{SinkExt, StreamExt};
 use honk_config::node::Node;
@@ -35,35 +28,22 @@ use super::AsyncReadWrite;
 
 /// Connect to the node server and optionally wrap with TLS and then a
 /// WebSocket or gRPC transport based on `node.transport`.
-///
-/// When `node.mux` is set this returns a multiplexed h2 stream from the
-/// shared h2mux session instead (see [`super::mux`]); the WS/gRPC
-/// transports are mutually exclusive with mux and are skipped.
 pub(crate) async fn connect_transport(
     node: &Node,
     connect_timeout: std::time::Duration,
 ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
-    if node.mux {
-        debug_mux_transport_conflict(node);
-        return super::mux::open_stream(node, connect_timeout).await;
-    }
     let addr = format!("{}:{}", node.host(), node.port);
     let tcp = crate::util::connect_outbound(&addr, connect_timeout).await?;
     wrap_transport(node, tcp).await
 }
 
 /// Apply TLS (when `node.tls`) and then the `node.transport` wrapping to an
-/// already-connected TCP stream. With `node.mux` the TLS stream is upgraded
-/// to an h2mux session instead and one multiplexed stream is returned.
+/// already-connected TCP stream.
 pub(crate) async fn wrap_transport(
     node: &Node,
     tcp: TcpStream,
 ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
     let stream = maybe_tls_wrap(node, tcp).await?;
-    if node.mux {
-        debug_mux_transport_conflict(node);
-        return super::mux::open_stream_on(node, stream).await;
-    }
     match node.transport.as_str() {
         "" | "tcp" => Ok(stream), // raw TCP/TLS
         "ws" => wrap_ws(node, stream).await,
@@ -75,20 +55,6 @@ pub(crate) async fn wrap_transport(
             node.name,
             other
         ),
-    }
-}
-
-/// sing-box semantics: multiplex and the WS/gRPC transports are mutually
-/// exclusive — mux wins, so warn (at debug level) when a transport is
-/// configured but will be ignored.
-fn debug_mux_transport_conflict(node: &Node) {
-    if !matches!(node.transport.as_str(), "" | "tcp") {
-        tracing::debug!(
-            node = %node.name,
-            transport = %node.transport,
-            "node.mux is enabled: multiplex and transport are mutually exclusive; \
-             ignoring the configured WS/gRPC transport"
-        );
     }
 }
 

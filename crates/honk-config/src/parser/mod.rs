@@ -1296,6 +1296,13 @@ fn parse_node_section(section: &Section) -> Result<Vec<Node>, crate::ConfigError
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
+        if let Some(rest) = trimmed.strip_prefix("mux")
+            && rest.trim_start().starts_with(['=', ':'])
+        {
+            return Err(crate::ConfigError::Parse(
+                "node section: 'mux' (h2mux) is no longer supported; remove the mux setting".into(),
+            ));
+        }
         let unquote = |s: &str| s.trim().trim_matches(|c| c == '\'' || c == '"').to_string();
         // Shapes: `tag: 'uri'` | `'tag': 'uri'` | `'uri'` | bare `scheme://uri`.
         // The first colon only splits tag/uri when it sits outside any quotes
@@ -1330,6 +1337,9 @@ fn parse_node_section(section: &Section) -> Result<Vec<Node>, crate::ConfigError
                 }
                 nodes.push(node);
             }
+            // A recognized-but-removed protocol in the config file is a hard
+            // error (subscriptions skip such entries with a warning instead).
+            Err(e @ crate::ConfigError::UnknownProtocol(_)) => return Err(e),
             Err(e) => {
                 eprintln!("node section: skipping unparseable entry '{trimmed}': {e}");
             }

@@ -8,8 +8,8 @@
 //! node may belong to many groups, and group rebuilds must not destroy
 //! live sessions). ProxyRegistry stays stateless handlers.
 //!
-//! AnyTLS currently owns its node-local session pool here. Trojan-Go, H2,
-//! and QUIC runtime ownership remain deferred to their dedicated migrations.
+//! AnyTLS currently owns its node-local session pool here. QUIC runtime
+//! ownership remain deferred to their dedicated migrations.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -42,7 +42,7 @@ impl OutboundCapabilities {
     pub fn for_node(node: &Node) -> Self {
         // UDP support matrix (verified): direct, socks5, shadowsocks
         // (+2022), trojan, hysteria2, anytls, tuic, juicity. Not vmess,
-        // vless, ssr, trojan-go.
+        // vless.
         let udp = matches!(
             node.protocol,
             NodeProtocol::Socks5
@@ -56,8 +56,7 @@ impl OutboundCapabilities {
         Self {
             tcp: true,
             udp,
-            multiplexed: node.mux
-                || matches!(node.protocol, NodeProtocol::AnyTLS | NodeProtocol::TrojanGo),
+            multiplexed: matches!(node.protocol, NodeProtocol::AnyTLS),
         }
     }
 }
@@ -526,18 +525,12 @@ mod tests {
     fn capabilities_matrix() {
         let anytls = node("x", NodeProtocol::AnyTLS);
         assert!(OutboundCapabilities::for_node(&anytls).multiplexed);
-        let trojan_go = node("x", NodeProtocol::TrojanGo);
-        let caps = OutboundCapabilities::for_node(&trojan_go);
-        assert!(caps.multiplexed && !caps.udp);
         let vmess = node("x", NodeProtocol::VMess);
         let caps = OutboundCapabilities::for_node(&vmess);
         assert!(!caps.multiplexed && !caps.udp);
         let hy2 = node("x", NodeProtocol::Hysteria2);
         let caps = OutboundCapabilities::for_node(&hy2);
         assert!(!caps.multiplexed && caps.udp);
-        let mut mux_vmess = node("x", NodeProtocol::VMess);
-        mux_vmess.mux = true;
-        assert!(OutboundCapabilities::for_node(&mux_vmess).multiplexed);
     }
 
     #[test]

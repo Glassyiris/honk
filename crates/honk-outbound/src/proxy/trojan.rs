@@ -241,12 +241,6 @@ impl ProxyHandler for TrojanHandler {
     fn pool_ready_streams(&self, node: &Node) -> bool {
         matches!(node.transport.as_str(), "" | "tcp")
     }
-
-    /// With `mux` the dial goes through the h2mux SessionPool: bare-TCP
-    /// pooling would force a new h2 session per flow (see AnyTlsHandler).
-    fn pool_bare_tcp(&self, node: &Node) -> bool {
-        !node.mux
-    }
 }
 
 /// Idle timeout for the UDP associate bridge (mirrors the AnyTLS UoT bridge).

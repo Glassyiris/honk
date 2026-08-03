@@ -161,6 +161,26 @@ node {
     }
 
     #[test]
+    fn test_node_section_rejects_removed_protocols_and_mux() {
+        for input in [
+            "node {\n    'ssr://a'\n}",
+            "node {\n    'trojan-go://pw@example.com:443'\n}",
+            "node {\n    'http://proxy.example.com:8080'\n}",
+        ] {
+            let err = parse_dae_config(input).unwrap_err();
+            assert!(
+                err.to_string().contains("Unknown node protocol"),
+                "removed protocols must be a hard error in the config file: {err}"
+            );
+        }
+        let err = parse_dae_config("node {\n    mux = true\n}").unwrap_err();
+        assert!(
+            err.to_string().contains("mux"),
+            "mux must be a hard error: {err}"
+        );
+    }
+
+    #[test]
     fn test_parse_groups() {
         let input = r#"
 group {

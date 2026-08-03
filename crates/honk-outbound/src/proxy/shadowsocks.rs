@@ -607,42 +607,6 @@ impl PacketTransport for SsUdpTransport {
     }
 }
 
-/// Encrypt `payload` as Shadowsocks chunks and write them to the server.
-pub(crate) async fn write_chunks<W>(
-    writer: &mut W,
-    cipher: &AeadCipher,
-    nonce: &mut [u8],
-    payload: &[u8],
-) -> anyhow::Result<()>
-where
-    W: AsyncWriteExt + Unpin,
-{
-    let mut offset = 0;
-    while offset < payload.len() {
-        let end = (offset + CHUNK_MAX_LEN).min(payload.len());
-        let chunk = &payload[offset..end];
-
-        let len = chunk.len() as u16;
-        let mut len_plain = vec![0u8; 2];
-        len_plain.copy_from_slice(&len.to_be_bytes());
-        let len_cipher = cipher
-            .seal(nonce, &len_plain)
-            .map_err(|e| anyhow::anyhow!("encrypt length failed: {:?}", e))?;
-        increment_nonce(nonce);
-
-        let payload_cipher = cipher
-            .seal(nonce, chunk)
-            .map_err(|e| anyhow::anyhow!("encrypt payload failed: {:?}", e))?;
-        increment_nonce(nonce);
-
-        writer.write_all(&len_cipher).await?;
-        writer.write_all(&payload_cipher).await?;
-
-        offset = end;
-    }
-    Ok(())
-}
-
 /// Steady-state relay read batch (64KB = 4 chunks): batched seal/decrypt
 /// without the per-connection memory cost of the old 256KB draft — see
 /// ss_stream.rs for why it is not larger.

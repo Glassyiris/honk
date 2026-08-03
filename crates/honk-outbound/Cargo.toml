@@ -44,7 +44,7 @@ futures-util.workspace = true
 # QUIC transport (TUIC / Hysteria2 / Juicity outbounds)
 quinn.workspace = true
 quinn-proto.workspace = true
-# HTTP/2 framing for h2mux multiplexing
+# HTTP/2 client for the urltest latency probe (urltest.rs)
 h2.workspace = true
 http.workspace = true
 

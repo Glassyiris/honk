@@ -6,11 +6,9 @@ use serde::{Deserialize, Serialize};
 pub enum NodeProtocol {
     #[default]
     SS,
-    SSR,
     Trojan,
     VMess,
     VLess,
-    TrojanGo,
     Socks5,
     HTTP,
     Hysteria2,
@@ -23,11 +21,9 @@ impl NodeProtocol {
     pub fn as_str(&self) -> &'static str {
         match self {
             NodeProtocol::SS => "ss",
-            NodeProtocol::SSR => "ssr",
             NodeProtocol::Trojan => "trojan",
             NodeProtocol::VMess => "vmess",
             NodeProtocol::VLess => "vless",
-            NodeProtocol::TrojanGo => "trojan-go",
             NodeProtocol::Socks5 => "socks5",
             NodeProtocol::HTTP => "http",
             NodeProtocol::Hysteria2 => "hysteria2",
@@ -44,11 +40,9 @@ impl std::str::FromStr for NodeProtocol {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "ss" | "shadowsocks" => Ok(NodeProtocol::SS),
-            "ssr" | "shadowsocksr" => Ok(NodeProtocol::SSR),
             "trojan" => Ok(NodeProtocol::Trojan),
             "vmess" => Ok(NodeProtocol::VMess),
             "vless" => Ok(NodeProtocol::VLess),
-            "trojan-go" => Ok(NodeProtocol::TrojanGo),
             "socks5" => Ok(NodeProtocol::Socks5),
             "http" => Ok(NodeProtocol::HTTP),
             "hysteria2" => Ok(NodeProtocol::Hysteria2),

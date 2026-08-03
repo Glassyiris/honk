@@ -179,11 +179,9 @@ fn parse_clash_subscription(
         let protocol = match proxy_type.to_lowercase().as_str() {
             "socks5" => NodeProtocol::Socks5,
             "ss" | "shadowsocks" => NodeProtocol::SS,
-            "ssr" | "shadowsocksr" => NodeProtocol::SSR,
             "trojan" => NodeProtocol::Trojan,
             "vmess" => NodeProtocol::VMess,
             "vless" => NodeProtocol::VLess,
-            "http" => NodeProtocol::HTTP,
             "hysteria2" | "hysteria" => NodeProtocol::Hysteria2,
             "tuic" => NodeProtocol::Tuic,
             "juicity" => NodeProtocol::Juicity,
@@ -388,6 +386,34 @@ proxies:
         assert_eq!(nodes[1].name, "My SS");
         assert_eq!(nodes[1].protocol, NodeProtocol::SS);
         assert_eq!(nodes[1].encryption, Some("aes-256-gcm".to_string()));
+    }
+
+    #[test]
+    fn test_parse_clash_skips_removed_protocols() {
+        // ssr/http/trojan-go support was removed: subscription entries are
+        // skipped with a warning instead of failing the whole fetch.
+        let yaml = r#"
+proxies:
+  - name: "SSR node"
+    type: ssr
+    server: 10.0.0.2
+    port: 8388
+  - name: "HTTP node"
+    type: http
+    server: 10.0.0.3
+    port: 8080
+  - name: "Trojan-Go node"
+    type: trojan-go
+    server: 10.0.0.4
+    port: 443
+  - name: "OK"
+    type: socks5
+    server: 10.0.0.1
+    port: 1080
+"#;
+        let nodes = parse_clash_subscription(yaml, None).unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].name, "OK");
     }
 
     #[test]
