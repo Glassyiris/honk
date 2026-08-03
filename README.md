@@ -57,11 +57,11 @@ Status reflects the current tree and unit/integration tests. Prefer re-running `
 #### Config & routing (userspace)
 
 - [x] dae syntax load, include/glob composition & validate
-- [x] Share-link parse (ss/vmess/vless/trojan/anytls/hy2/tuic/juicity/…)
+- [x] Share-link parse (ss/socks5/vmess/vless/trojan/anytls/hy2/tuic/juicity/…)
 - [x] Userspace `Router` (domain/IP/port/proto/process/MAC/geosite/geoip)
 - [x] TCP sniff (TLS SNI, HTTP Host); QUIC Initial SNI decrypt
 - [x] Dial modes `ip` / `domain` / `domain+` / `domain++`
-- [x] Built-in `direct` node injection; `block` outbound
+- [x] Built-in `direct`/`block` node injection (reserved protocols, stable content-derived node IDs)
 
 #### Outbound & groups
 

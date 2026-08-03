@@ -51,8 +51,8 @@ experimental { ... }   # clash_api, cache_file
 
 Built-ins:
 
-- Outbound **`direct`** is auto-injected if missing (usable in groups/filters/routing).
-- Outbound **`block`** drops traffic.
+- Outbounds **`direct`** and **`block`** are auto-injected at load as reserved protocol nodes (usable in groups/filters/routing); user nodes may not take their names or protocols.
+- **`block`** drops traffic.
 
 ## 3. Minimal configuration
 
