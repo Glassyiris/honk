@@ -59,8 +59,8 @@ pin-project-lite.workspace = true
 # binary's allocator. Build without default features for a stock-malloc
 # binary.
 mimalloc = { version = "0.1", optional = true }
-# Same sys crate instance as mimalloc's (cargo feature unification), used
-# for mi_collect from the binary's maintenance task.
+# Same sys crate instance as mimalloc's (cargo feature unification), used by
+# the Tokio worker idle hook to collect each owning heap.
 libmimalloc-sys = { version = "0.1.49", features = ["extended"], optional = true }
 
 # Encoding
