@@ -681,7 +681,14 @@ impl ControlPlaneHandle {
                     }
                     let start = std::time::Instant::now();
                     let per_dial_timeout = connect_timeout * 3;
-                    let _dial_permit = ConnectionPool::acquire_dial_permit().await;
+                    // Built-in direct/block dials are local connects bounded
+                    // by the connection admission limit; dead direct peers
+                    // must not starve the proxied-dial budget.
+                    let _dial_permit = if node.name == "direct" || node.name == "block" {
+                        None
+                    } else {
+                        Some(ConnectionPool::acquire_dial_permit().await)
+                    };
                     let result = tokio::time::timeout(
                         per_dial_timeout,
                         Self::dial_pooled(

@@ -48,6 +48,7 @@
 | `relay_idle_timeout_secs` | u64 | `300` | 空闲中继断开；`0` = 关闭（结构化模型字段，dae 语法无对应键） |
 | `preconnect_node_count` | usize | `0` | 预连接数；`0` = 自动 `min(nodes,8)`（结构化模型字段，dae 语法无对应键） |
 | `udp_warm_node_count` | usize | `0` | 每组 UDP 预热上限。`0` 为严格关闭：不创建 coordinator task，也不产生 warm metrics。正值 N（封顶 3）会在启动后以及**每个探测周期**（`check_interval`）预热每组按延迟排名前 N 的 UDP 可用节点——测速后新变快的节点在赢得选择前就已拨好 transport。dispatch 仍最多四个并发 task。 |
+| `max_concurrent_dials` | usize | `64` | 全进程并发代理拨号上限（connect + 协议握手）。内置 `direct`/`block` 拨号豁免——它们是本地 connect，已由连接准入上限约束。reload 时调大立即生效；调小仅在首次拨号前生效。 |
 
 ### 拨号模式细节
 

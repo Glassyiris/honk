@@ -194,6 +194,8 @@ impl ControlPlane {
     ) -> anyhow::Result<Self> {
         let (tx, rx) = mpsc::channel(256);
 
+        ConnectionPool::configure_dial_limit(config.global.max_concurrent_dials);
+
         // Create alive set for node health checking and pass it into the group
         // manager so dead nodes are excluded from group selection.
         // Mark probe sockets with DAE_BYPASS_MARK so the eBPF datapath does not

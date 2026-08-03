@@ -110,6 +110,11 @@ pub struct GlobalConfig {
     /// disables this independent warm-up path.
     #[serde(default = "default_udp_warm_node_count")]
     pub udp_warm_node_count: usize,
+    /// Process-wide cap on concurrent proxied dials (connect + protocol
+    /// handshake). Built-in direct/block dials are exempt — they are local
+    /// connects already bounded by the connection admission limit.
+    #[serde(default = "default_max_concurrent_dials")]
+    pub max_concurrent_dials: usize,
 }
 
 fn default_tproxy_port() -> u16 {
@@ -261,6 +266,9 @@ fn default_preconnect_node_count() -> usize {
 fn default_udp_warm_node_count() -> usize {
     0
 }
+fn default_max_concurrent_dials() -> usize {
+    64
+}
 
 impl Default for GlobalConfig {
     fn default() -> Self {
@@ -300,6 +308,7 @@ impl Default for GlobalConfig {
             relay_idle_timeout_secs: default_relay_idle_timeout_secs(),
             preconnect_node_count: default_preconnect_node_count(),
             udp_warm_node_count: default_udp_warm_node_count(),
+            max_concurrent_dials: default_max_concurrent_dials(),
         }
     }
 }

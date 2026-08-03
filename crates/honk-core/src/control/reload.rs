@@ -71,6 +71,8 @@ impl ControlPlane {
         }
         let old_plan = self.active_routing_plan.read().clone();
 
+        crate::pool::ConnectionPool::configure_dial_limit(new_config.global.max_concurrent_dials);
+
         // ── Phase 1: build everything (no live-state mutation) ──
         let new_router = match Router::new(
             &new_config.routing.rules,

@@ -705,6 +705,11 @@ fn parse_global_section(section: &Section) -> Result<GlobalConfig, crate::Config
             .parse()
             .map_err(|_| crate::ConfigError::Parse(format!("invalid udp_warm_node_count: {v}")))?;
     }
+    if let Some(v) = kv.get("max_concurrent_dials") {
+        cfg.max_concurrent_dials = v
+            .parse()
+            .map_err(|_| crate::ConfigError::Parse(format!("invalid max_concurrent_dials: {v}")))?;
+    }
 
     Ok(cfg)
 }

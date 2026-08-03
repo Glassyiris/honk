@@ -984,6 +984,16 @@ fn udp_warm_node_count_parses_zero_and_rejects_invalid_values() {
 }
 
 #[test]
+fn max_concurrent_dials_defaults_and_parses() {
+    assert_eq!(crate::Config::default().global.max_concurrent_dials, 64);
+    let cfg = parse_dae_config("global {\n max_concurrent_dials: 128\n}").unwrap();
+    assert_eq!(cfg.global.max_concurrent_dials, 128);
+    let err = parse_dae_config("global {\n max_concurrent_dials: nope\n}")
+        .expect_err("invalid max_concurrent_dials must reject the dae config");
+    assert!(matches!(err, crate::ConfigError::Parse(_)));
+}
+
+#[test]
 fn test_parse_route_negation_matrix() {
     let input = r#"
 routing {
