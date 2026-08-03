@@ -264,20 +264,35 @@ impl Node {
     }
 
     /// Content-derived stable identity: UUID v5 over
-    /// `protocol|host|port|credential-fingerprint`. The same node config
-    /// keeps its ID across reloads and subscription refreshes (health
-    /// state, latency history, and session pools survive); renaming a node
-    /// does NOT change the ID — identity is the dialable endpoint, not the
-    /// label. Display/transport knobs are excluded from the fingerprint.
+    /// `protocol|host|port|credential-fingerprint|dial-shape`. The same
+    /// node config keeps its ID across reloads and subscription refreshes
+    /// (health state, latency history, and session pools survive); renaming
+    /// a node does NOT change the ID — identity is the dialable endpoint,
+    /// not the label. Dial shape covers SNI (CDN fronting makes the same
+    /// server a different endpoint per SNI), transport, and obfs;
+    /// validation and tuning knobs are excluded.
     pub fn derive_id(&self) -> uuid::Uuid {
         let material = format!(
-            "{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}",
             self.protocol.as_str(),
             self.host(),
             self.port,
-            self.credential_fingerprint()
+            self.credential_fingerprint(),
+            self.dial_shape_fingerprint()
         );
         uuid::Uuid::new_v5(&NODE_ID_NAMESPACE, material.as_bytes())
+    }
+
+    fn dial_shape_fingerprint(&self) -> String {
+        [
+            self.sni.as_deref().unwrap_or(""),
+            self.transport.as_str(),
+            self.ws_path.as_deref().unwrap_or(""),
+            self.ws_host.as_deref().unwrap_or(""),
+            self.grpc_service.as_deref().unwrap_or(""),
+            self.hy2_obfs.as_deref().unwrap_or(""),
+        ]
+        .join("|")
     }
 
     /// The protocol's credential identity, resolved the same way the
@@ -448,9 +463,17 @@ mod tests {
         let mut other_port = node.clone();
         other_port.port = 8443;
         assert_ne!(node.derive_id(), other_port.derive_id());
-        // Display/transport knobs do not participate.
+        // Dial shape participates: same server behind a different SNI or
+        // transport is a different endpoint (CDN fronting).
         let mut other_sni = node.clone();
         other_sni.sni = Some("cdn.example".into());
-        assert_eq!(node.derive_id(), other_sni.derive_id());
+        assert_ne!(node.derive_id(), other_sni.derive_id());
+        let mut other_transport = node.clone();
+        other_transport.transport = "ws".into();
+        assert_ne!(node.derive_id(), other_transport.derive_id());
+        // Validation and tuning knobs do not participate.
+        let mut other_insecure = node.clone();
+        other_insecure.skip_cert_verify = true;
+        assert_eq!(node.derive_id(), other_insecure.derive_id());
     }
 }

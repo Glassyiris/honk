@@ -69,7 +69,7 @@ dae 语法中节点**只能以分享链接书写**：`tag: 'scheme://...'` 或�
 
 | 字段 | 类型 | 默认值 | 含义 |
 | ------ | ------ | -------- | ------ |
-| `id` | UUID | 内容派生 | 稳定身份：对 `protocol\|host\|port\|credential-fingerprint` 取 UUID v5；改名不变，两个节点派生出相同 id 会被拒绝 |
+| `id` | UUID | 内容派生 | 稳定身份：对 `protocol\|host\|port\|credential\|dial-shape`（dial shape = sni/transport/ws/grpc/obfs）取 UUID v5；改名不变，两个节点派生出相同 id 会被拒绝（订阅内重复端点跳过并告警） |
 | `name` | string | **必填** | 路由 / API 名称；dae 中为链接前的 tag |
 | `protocol` | enum | `ss` | 见协议表；dae 中由链接 scheme 决定 |
 | `address` | string | 必填* | 主机或 `host:port` |

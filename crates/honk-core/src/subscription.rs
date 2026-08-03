@@ -57,14 +57,31 @@ impl SubscriptionManager {
         let response = request.send().await?;
         let content = response.text().await?;
 
-        match sub.sub_type {
+        let nodes = match sub.sub_type {
             SubscriptionType::Simple | SubscriptionType::Sip008 => {
                 parse_base64_subscription(&content, Some(sub.id))
             }
             SubscriptionType::Clash => parse_clash_subscription(&content, Some(sub.id)),
             SubscriptionType::Custom => parse_base64_subscription(&content, Some(sub.id))
                 .or_else(|_| parse_clash_subscription(&content, Some(sub.id))),
-        }
+        }?;
+
+        // Providers legitimately list the same dialable endpoint under
+        // several names; identical content-derived IDs would abort the
+        // runtime registry build, so the first one wins.
+        let mut seen = std::collections::HashSet::new();
+        Ok(nodes
+            .into_iter()
+            .filter(|node| {
+                seen.insert(node.id) || {
+                    tracing::warn!(
+                        node = %node.name,
+                        "skipping subscription node with a duplicate endpoint identity"
+                    );
+                    false
+                }
+            })
+            .collect())
     }
 }
 

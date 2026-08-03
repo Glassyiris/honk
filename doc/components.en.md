@@ -99,7 +99,7 @@ The fields below are what a parsed node carries. In dae syntax they are **derive
 
 | Field | Type | Default | Meaning |
 | ------- | ------ | --------- | --------- |
-| `id` | UUID | content-derived | Stable identity: UUID v5 over `protocol\|host\|port\|credential-fingerprint`; renames keep it, two nodes deriving the same ID are rejected |
+| `id` | UUID | content-derived | Stable identity: UUID v5 over `protocol\|host\|port\|credential\|dial-shape` (dial shape = sni/transport/ws/grpc/obfs); renames keep it, two nodes deriving the same ID are rejected (subscription duplicates are skipped with a warning) |
 | `name` | string | **required** | Routing / API name |
 | `protocol` | enum | `ss` | See protocol table |
 | `address` | string | required* | Host or `host:port` |
