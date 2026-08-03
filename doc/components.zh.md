@@ -117,13 +117,14 @@ dae 语法中节点**只能以分享链接书写**：`tag: 'scheme://...'` 或�
 | `vmess` | | 是 | 否 | AEAD；WS/gRPC |
 | `vless` | | 是 | 否 | 头里的 UDP 仅测试存在 |
 | `socks5` | | 是 | 是 | UDP ASSOCIATE |
-| `http` | | 是* | — | 仅保留为内置 `direct`/`block` 的标记；显式 http 代理在校验时拒绝 |
 | `hysteria2` | | 是 | 是 | 真实 QUIC/H3；salamander；brutal（配带宽时）或 BBR；端口跳跃 |
 | `tuic` | | 是 | 是 | TUIC v5 / quinn |
 | `juicity` | | 是 | 是 | quinn 双向流 UDP |
 | `anytls` | | 是 | 是 | 会话池 + UoT v2 |
+| `direct` | | 是 | 是 | 内置直连出口；保留协议，加载时注入（不可配置） |
+| `block` | | — | — | 内置拒绝出口；保留协议，加载时注入（不可配置） |
 
-内置 **`direct`** 节点在加载时注入（配置中可不写）。
+内置 **`direct`** 与 **`block`** 节点在加载时注入（配置中可不写）；用户节点不得占用其名称或协议。
 
 ### 协议提示
 

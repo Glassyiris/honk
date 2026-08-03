@@ -147,13 +147,14 @@ The fields below are what a parsed node carries. In dae syntax they are **derive
 | `vmess` | | Yes | No | AEAD; WS/gRPC |
 | `vless` | | Yes | No | Header UDP exists in tests only |
 | `socks5` | | Yes | Yes | UDP ASSOCIATE |
-| `http` | | Yes* | — | Reserved for the built-in `direct`/`block` markers; explicit http proxies are rejected at validation |
 | `hysteria2` | | Yes | Yes | Real QUIC/H3; salamander; brutal (with bandwidth) or BBR; port hopping |
 | `tuic` | | Yes | Yes | TUIC v5 / quinn |
 | `juicity` | | Yes | Yes | quinn bi-stream UDP |
 | `anytls` | | Yes | Yes | Session pool + UoT v2 |
+| `direct` | | Yes | Yes | Built-in bypass outbound; reserved, injected at load (not configurable) |
+| `block` | | — | — | Built-in reject outbound; reserved, injected at load (not configurable) |
 
-Built-in **`direct`** node is injected at load (not required in config).
+Built-in **`direct`** and **`block`** nodes are injected at load (not required in config); user nodes may not take their names or protocols.
 
 ### Protocol-specific tips
 
