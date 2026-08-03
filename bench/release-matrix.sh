@@ -49,7 +49,7 @@ The hook runs with SELECTED_BIN, PROFILE, FEATURES, ALLOCATOR, COLLECT_SECS,
 TARGET, RUN, WARMUP, MACHINE_JSON, OUTPUT_DIR, RUN_DIR, and CACHE_DIR. It must
 print exactly one JSON object containing these non-negative numeric fields:
   rss_kib, pss_kib, private_dirty_kib, minor_faults, major_faults,
-  cpu_user_seconds, cpu_system_seconds, cpu_percent,
+  cpu_user_seconds, cpu_system_seconds, cpu_percent, throughput_mbps,
   p50_us, p95_us, p99_us, collection_duration_seconds
 
 Diagnostics belong on stderr. machine.json, matrix.jsonl/csv, builds.jsonl/csv,
@@ -300,7 +300,7 @@ import sys
 path = sys.argv[1]
 required = (
     "rss_kib", "pss_kib", "private_dirty_kib", "minor_faults", "major_faults",
-    "cpu_user_seconds", "cpu_system_seconds", "cpu_percent",
+    "cpu_user_seconds", "cpu_system_seconds", "cpu_percent", "throughput_mbps",
     "p50_us", "p95_us", "p99_us", "collection_duration_seconds",
 )
 try:
@@ -507,7 +507,7 @@ with open(build_csv, "w", encoding="utf-8", newline="") as sink:
 
 metric_fields = [
     "rss_kib", "pss_kib", "private_dirty_kib", "minor_faults", "major_faults",
-    "cpu_user_seconds", "cpu_system_seconds", "cpu_percent",
+    "cpu_user_seconds", "cpu_system_seconds", "cpu_percent", "throughput_mbps",
     "p50_us", "p95_us", "p99_us", "collection_duration_seconds",
 ]
 performance_fields = build_fields + ["run"] + metric_fields

@@ -1466,7 +1466,13 @@ impl ControlPlaneHandle {
                             .await
                     } else {
                         registry
-                            .dial_udp_transport(&node, original_dst, None, connect_timeout)
+                            .dial_udp_transport_runtime(
+                                runtime_generation,
+                                node.id,
+                                original_dst,
+                                None,
+                                connect_timeout,
+                            )
                             .await
                             .map(honk_outbound::proxy::PreparedUdpTransport::ready)
                     };

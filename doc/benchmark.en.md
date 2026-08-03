@@ -520,10 +520,12 @@ configs, outbounds bound to `veth-client`).
 (64 frames) triggered an *instant* stream kill, which fired 22 ms into a
 single-stream run when the server's initial flight outran the fresh
 relay task; the server then flooded the pooled session with PSH frames
-for the dead sid. Fixed by real bounded HOL backpressure (the demux
-parks up to 5 s on a full queue before killing). anytls-go now matches
-dae; anytls-sb trails (the sing-box server emits patterns dae tolerates
-better — future work).
+for the dead sid. The measured rows above used the first bounded-HOL fix,
+which parked for up to 5 s before killing. The current path is nonblocking:
+per-stream buckets have 512-frame / 2 MiB-stream / 8 MiB-session hard caps,
+and cap pressure immediately resets only the offender after admitted bytes
+drain. anytls-go matches dae in the historical run; anytls-sb trails (the
+sing-box server emits patterns dae tolerates better — future work).
 
 ² dae's direct path is broken on this lab kernel (kdae build): direct
 flows time out while proxied flows work. All dae protocol rows above are
@@ -732,7 +734,7 @@ bench/release-matrix.sh --all-targets --dry-run --output /tmp/honk-release-matri
 ```
 
 A measured host run requires an executable `--benchmark-hook`; the hook contract
-and required RSS/PSS/fault/CPU/latency fields are printed by
+and required RSS/PSS/fault/CPU/throughput/latency fields are printed by
 `bench/release-matrix.sh --help`. Pin every CPU policy to one governor and keep
 turbo in one state for the full matrix; `machine.json` records both settings.
 Compare cells only on the same machine and workload. The matrix records
@@ -781,5 +783,6 @@ one paired run is below the five-run evidence requirement, and its binary is
 - `cargo bench -p honk-core --bench dns` — DNS micro-benchmarks (above).
 - `cargo bench -p honk-core --bench udp -- --save-baseline udp-candidate` — candidate-only absolute UDP measurements; not a historical A/B or p95 merge gate.
 - `bash bench/tests/udp-latency-cli.sh` — deployment-driver CLI/JSONL fixture; the real UDP A/B gate above still requires TPROXY and upstreams.
+- `bash bench/tests/runtime-memory-cli.sh` — paired runtime-memory driver CLI, ordering, identity, and fail-closed JSONL fixture.
 - Release CI (`.github/workflows/release.yml`) — workspace test gate +
   four-target build (x86_64/aarch64 × gnu/musl) + BTF check + tarballs.
