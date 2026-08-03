@@ -414,9 +414,8 @@ impl ProbeableOutbound for JuicityHandler {
     }
 }
 
-/// Framed UDP transport over a Juicity UDP bi stream — the P1.5 replacement
-/// for the loopback bridge: datagrams are framed as
-/// `[metadata][len u16][payload]` directly on the QUIC stream.
+/// Framed UDP transport over a Juicity UDP bi stream: datagrams are framed
+/// as `[metadata][len u16][payload]` directly on the QUIC stream.
 struct JuicityUdpTransport {
     send: tokio::sync::Mutex<quinn::SendStream>,
     recv: tokio::sync::Mutex<quinn::RecvStream>,

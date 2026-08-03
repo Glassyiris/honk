@@ -2397,10 +2397,9 @@ fn v1_header_matches(
 }
 
 /// Per-stream UoT demux queue depth. UDP semantics: drop on a full queue,
-/// never queue unboundedly. Sized for QUIC bursts: the pre-P1.5 loopback
-/// bridge had ~256KB of kernel socket buffer per leg; at ~1.2KB per
-/// datagram, 1024 entries absorbs a ~10ms burst at 100k pps while the
-/// reply handler drains.
+/// never queue unboundedly. Sized for bursts: at ~1.2KB per datagram,
+/// 4096 entries absorbs a ~40ms burst at 100k pps while the reply handler
+/// drains.
 const UOT_DRAIN_QUEUE_CAP: usize = 4096;
 
 impl Drop for AnyTlsUotTransport {
