@@ -371,14 +371,6 @@ pub trait ProbeableOutbound: Send + Sync {
     }
 }
 
-/// Consumer of the per-node runtime registry (session-layer ownership).
-/// Handlers with pooled sessions (AnyTLS) resolve their node's pool through
-/// it. The shared cell swaps its contents on reload, so this is installed
-/// once at startup.
-pub trait RuntimeRegistryConsumer: Send + Sync {
-    fn set_runtime_registry(&self, cell: crate::runtime::SharedRuntimeRegistry);
-}
-
 /// One registered protocol: its static descriptor plus the capability
 /// objects it implements. A `None` slot means the protocol lacks that
 /// capability; dispatches into it are refused.
@@ -388,7 +380,6 @@ pub struct ProtocolEntry {
     pub packet: Option<Arc<dyn PacketOutbound>>,
     pub warmable: Option<Arc<dyn WarmableOutbound>>,
     pub probeable: Option<Arc<dyn ProbeableOutbound>>,
-    runtime_consumer: Option<Arc<dyn RuntimeRegistryConsumer>>,
 }
 
 impl ProtocolEntry {
@@ -399,7 +390,6 @@ impl ProtocolEntry {
             packet: None,
             warmable: None,
             probeable: None,
-            runtime_consumer: None,
         }
     }
 
@@ -417,14 +407,6 @@ impl ProtocolEntry {
         self.probeable = Some(handler);
         self
     }
-
-    pub fn with_runtime_consumer<T: RuntimeRegistryConsumer + 'static>(
-        mut self,
-        handler: Arc<T>,
-    ) -> Self {
-        self.runtime_consumer = Some(handler);
-        self
-    }
 }
 
 pub struct ProxyRegistry {
@@ -435,16 +417,6 @@ impl ProxyRegistry {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
-        }
-    }
-
-    /// Hand the per-node runtime registry to every registered consumer (see
-    /// [`RuntimeRegistryConsumer`]).
-    pub fn install_runtime_registry(&self, cell: crate::runtime::SharedRuntimeRegistry) {
-        for entry in &self.entries {
-            if let Some(consumer) = &entry.runtime_consumer {
-                consumer.set_runtime_registry(cell.clone());
-            }
         }
     }
 
@@ -499,8 +471,7 @@ impl ProxyRegistry {
             ProtocolEntry::new(NodeProtocol::AnyTLS, anytls.clone())
                 .with_packet(anytls.clone())
                 .with_warmable(anytls.clone())
-                .with_probeable(anytls.clone())
-                .with_runtime_consumer(anytls),
+                .with_probeable(anytls),
         );
         let tuic = Arc::new(TuicHandler::new());
         registry.register(

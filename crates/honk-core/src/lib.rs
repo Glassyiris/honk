@@ -843,6 +843,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                         cache_db: control_plane.cache_db(),
                         connection_tracker: control_plane.connection_tracker(),
                         proxy_registry: control_plane.proxy_registry(),
+                        runtime_registry: control_plane.runtime_registry(),
                         mode_state,
                         secret: clash_cfg.secret.clone(),
                         connection_pool: control_plane.connection_pool(),

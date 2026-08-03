@@ -762,6 +762,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
     /// its demux task holds it (and its TCP connection) open forever.
     /// Over-cap entries are transient; the janitor reaps them when idle.
     /// After shutdown the session is closed instead of inserted.
+    #[allow(dead_code)] // test pools insert externally-established sessions
     pub fn insert(&self, key: &str, session: &Arc<S>) {
         if self.state() != PoolState::Running {
             session.close();

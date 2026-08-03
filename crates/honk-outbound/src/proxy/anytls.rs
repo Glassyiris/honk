@@ -39,7 +39,7 @@ use tracing::{debug, warn};
 use super::addr;
 use super::{
     PacketOutbound, PacketTransport, PreparedUdpTransport, ProbeableOutbound, ProxyStream,
-    RuntimeRegistryConsumer, TcpOutbound, UdpWarmStatus, WarmableOutbound,
+    TcpOutbound, UdpWarmStatus, WarmableOutbound,
 };
 use crate::session::{ManagedSession as _, SpeculativeCheckout};
 
@@ -87,49 +87,11 @@ const MAX_STREAM_ERROR_SOURCE_BYTES: usize = 1024;
 type BoxedReader = Box<dyn AsyncRead + Send + Unpin>;
 type BoxedWriter = Box<dyn AsyncWrite + Send + Unpin>;
 
-/// AnyTLS proxy handler. Stateless except for the runtime-registry
-/// handle (installed by the control plane) and a fallback pool used when
-/// no registry is installed (unit tests, standalone use).
+/// AnyTLS proxy handler. Stateless: the node's session pool lives in its
+/// generation-owned runtime; node-based calls (tests, standalone probing)
+/// get a throwaway pool per call.
 #[derive(Debug, Default, Clone)]
-pub struct AnyTlsHandler {
-    runtime_registry: Arc<parking_lot::RwLock<Option<crate::runtime::SharedRuntimeRegistry>>>,
-    fallback_pool: std::sync::OnceLock<Arc<AnyTlsPool>>,
-}
-
-struct CapturedAnyTlsRuntime {
-    runtime: Arc<crate::runtime::NodeRuntime>,
-    pool: Arc<AnyTlsPool>,
-}
-
-impl AnyTlsHandler {
-    fn captured_runtime(&self, node: &Node) -> anyhow::Result<Option<CapturedAnyTlsRuntime>> {
-        let Some(cell) = self.runtime_registry.read().as_ref().cloned() else {
-            return Ok(None);
-        };
-        let runtime = cell
-            .read()
-            .get(&node.id)
-            .ok_or_else(|| anyhow::anyhow!("node '{}' not in runtime registry", node.name))?;
-        let pool = match &runtime.runtime {
-            crate::runtime::ProtocolRuntime::AnyTls(runtime) => Arc::clone(&runtime.pool),
-            crate::runtime::ProtocolRuntime::None | crate::runtime::ProtocolRuntime::Quic(_) => {
-                anyhow::bail!("node '{}' has no AnyTLS runtime", runtime.node.name)
-            }
-        };
-        Ok(Some(CapturedAnyTlsRuntime { runtime, pool }))
-    }
-
-    /// The session pool for `node`: its runtime-registry pool when the
-    /// control plane installed one, otherwise this handler's own.
-    fn node_pool(&self, node: &Node) -> anyhow::Result<Arc<AnyTlsPool>> {
-        if let Some(captured) = self.captured_runtime(node)? {
-            return Ok(captured.pool);
-        }
-        Ok(Arc::clone(self.fallback_pool.get_or_init(|| {
-            Arc::new(crate::session::SessionPool::new(session_pool_config()))
-        })))
-    }
-}
+pub struct AnyTlsHandler;
 
 /// Key inside a node's own session pool. Pools are per-node (runtime
 /// registry), so the key is a constant — the old `host:port|tls|sni|
@@ -139,7 +101,7 @@ pub(crate) const POOL_KEY: &str = "self";
 
 /// Pool configuration for one AnyTLS node (least-loaded scheduling
 /// without a stream cap (sing-anytls parity); the hard session cap still
-/// applies). Shared by the runtime-registry pools and handler fallbacks.
+/// applies). Shared by the generation-owned pools and throwaway pools.
 pub(crate) fn session_pool_config() -> crate::session::SessionPoolConfig {
     crate::session::SessionPoolConfig {
         // v3.1 sizing: two sessions per node, 128 streams each (initial
@@ -1535,37 +1497,6 @@ impl AnyTlsHandler {
         })
     }
 
-    /// Open a stream through the handler's currently installed runtime.
-    async fn open_pooled_stream(
-        &self,
-        node: &Node,
-        addr: &str,
-        target_addr: &[u8],
-        connect_timeout: Duration,
-    ) -> anyhow::Result<AnyTlsStream> {
-        if let Some(captured) = self.captured_runtime(node)? {
-            let runtime = captured.runtime;
-            let runtime_node = Arc::clone(&runtime.node);
-            let runtime_addr = format!("{}:{}", runtime_node.host(), runtime_node.port);
-            return self
-                .open_pooled_stream_for_pool(
-                    runtime_node.as_ref(),
-                    captured.pool,
-                    &runtime_addr,
-                    target_addr,
-                    connect_timeout,
-                    Some(runtime),
-                )
-                .await;
-        }
-        let pool = Arc::clone(
-            self.fallback_pool
-                .get_or_init(|| Arc::new(crate::session::SessionPool::new(session_pool_config()))),
-        );
-        self.open_pooled_stream_for_pool(node, pool, addr, target_addr, connect_timeout, None)
-            .await
-    }
-
     /// Open a stream on an explicitly captured generation-owned pool. One
     /// retry is allowed only when the selected session fails mid-open.
     async fn open_pooled_stream_for_pool(
@@ -1577,7 +1508,11 @@ impl AnyTlsHandler {
         connect_timeout: Duration,
         runtime: Option<Arc<crate::runtime::NodeRuntime>>,
     ) -> anyhow::Result<AnyTlsStream> {
-        Self::ensure_janitor(node, &pool, runtime.clone());
+        // A throwaway pool (no generation runtime) gets no janitor: the
+        // janitor task pins its pool alive.
+        if runtime.is_some() {
+            Self::ensure_janitor(node, &pool, runtime.clone());
+        }
         // The dial future must be 'static (pool-owned dial task) and the
         // closure Clone (open_with retries once): own clones.
         let dial_node = node.clone();
@@ -1626,6 +1561,7 @@ impl AnyTlsHandler {
     async fn dial_udp_transport_speculative_with<F, Fut>(
         &self,
         node: &Node,
+        pool: Arc<AnyTlsPool>,
         target: SocketAddr,
         target_domain: Option<&str>,
         connect_timeout: Duration,
@@ -1635,7 +1571,6 @@ impl AnyTlsHandler {
         F: FnOnce() -> Fut + Send,
         Fut: std::future::Future<Output = anyhow::Result<Arc<AnyTlsSession>>> + Send,
     {
-        let pool = self.node_pool(node)?;
         Self::dial_udp_transport_speculative_for_pool_with(
             node,
             pool,
@@ -1725,14 +1660,18 @@ impl AnyTlsHandler {
             let commit_runtime = runtime.clone();
             return Ok(PreparedUdpTransport::new(transport, move || {
                 reservation.commit()?;
-                Self::ensure_janitor(&commit_node, &commit_pool, commit_runtime);
+                if commit_runtime.is_some() {
+                    Self::ensure_janitor(&commit_node, &commit_pool, commit_runtime);
+                }
                 Ok(())
             }));
         }
 
         let commit_node = node.clone();
         Ok(PreparedUdpTransport::new(transport, move || {
-            Self::ensure_janitor(&commit_node, &pool, runtime);
+            if runtime.is_some() {
+                Self::ensure_janitor(&commit_node, &pool, runtime);
+            }
             Ok(())
         }))
     }
@@ -1756,7 +1695,9 @@ impl AnyTlsHandler {
 
         let addr = format!("{}:{}", node.host(), node.port);
         let magic = addr::encode_address("0.0.0.0:0".parse().unwrap(), Some(UOT_MAGIC));
-        Self::ensure_janitor(node.as_ref(), &pool, runtime.clone());
+        if runtime.is_some() {
+            Self::ensure_janitor(node.as_ref(), &pool, runtime.clone());
+        }
         let dial_node = Arc::clone(&node);
         let dial_addr = addr.clone();
         let (session, sid, rx, mut guard) = pool
@@ -2138,12 +2079,6 @@ enum UotMode {
     V1Packet,
 }
 
-impl RuntimeRegistryConsumer for AnyTlsHandler {
-    fn set_runtime_registry(&self, cell: crate::runtime::SharedRuntimeRegistry) {
-        *self.runtime_registry.write() = Some(cell);
-    }
-}
-
 #[async_trait]
 impl WarmableOutbound for AnyTlsHandler {
     async fn warm_udp(
@@ -2151,9 +2086,6 @@ impl WarmableOutbound for AnyTlsHandler {
         runtime: Arc<crate::runtime::NodeRuntime>,
         connect_timeout: Duration,
     ) -> anyhow::Result<UdpWarmStatus> {
-        // Do not call node_pool here: it follows the mutable shared cell and
-        // fallback pool used by normal standalone dialing. Warm-up must stay
-        // tied to the immutable generation supplied by ProxyRegistry.
         let node = Arc::clone(&runtime.node);
         let addr = format!("{}:{}", node.host(), node.port);
         let dial_runtime = Arc::clone(&runtime);
@@ -2181,7 +2113,14 @@ impl TcpOutbound for AnyTlsHandler {
             addr, target, node.tls, node.sni, node.skip_cert_verify
         );
         let stream = self
-            .open_pooled_stream(node, &addr, &target_addr, connect_timeout)
+            .open_pooled_stream_for_pool(
+                node,
+                Arc::new(crate::session::SessionPool::new(session_pool_config())),
+                &addr,
+                &target_addr,
+                connect_timeout,
+                None,
+            )
             .await?;
 
         Ok(ProxyStream {
@@ -2223,35 +2162,6 @@ impl TcpOutbound for AnyTlsHandler {
             target_domain: target_domain.map(str::to_string),
         })
     }
-
-    async fn dial_with_tcp(
-        &self,
-        node: &Node,
-        target: SocketAddr,
-        target_domain: Option<&str>,
-        tcp: TcpStream,
-        _connect_timeout: Duration,
-    ) -> anyhow::Result<ProxyStream> {
-        let addr = format!("{}:{}", node.host(), node.port);
-        let target_addr = addr::encode_address(target, target_domain);
-
-        let pool = self.node_pool(node)?;
-        Self::ensure_janitor(node, &pool, None);
-        let (read, write, auth, settings) =
-            connect_transport(node, &addr, _connect_timeout, Some(tcp), None).await?;
-        let session = AnyTlsSession::establish(&addr, read, write, &auth, &settings).await?;
-        pool.insert(POOL_KEY, &session);
-        let permit = session
-            .try_reserve()
-            .ok_or_else(|| anyhow::anyhow!("fresh AnyTLS session has no stream capacity"))?;
-        let stream = session.open_stream_direct(target_addr, permit).await?;
-
-        Ok(ProxyStream {
-            stream: Box::new(stream),
-            target_addr: target,
-            target_domain: target_domain.map(|s| s.to_string()),
-        })
-    }
 }
 
 #[async_trait]
@@ -2263,27 +2173,9 @@ impl PacketOutbound for AnyTlsHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        if let Some(captured) = self.captured_runtime(node)? {
-            let runtime = captured.runtime;
-            let runtime_node = Arc::clone(&runtime.node);
-            return self
-                .dial_udp_transport_for_pool(
-                    runtime_node,
-                    captured.pool,
-                    target,
-                    target_domain,
-                    connect_timeout,
-                    Some(runtime),
-                )
-                .await;
-        }
-        let pool = Arc::clone(
-            self.fallback_pool
-                .get_or_init(|| Arc::new(crate::session::SessionPool::new(session_pool_config()))),
-        );
         self.dial_udp_transport_for_pool(
             Arc::new(node.clone()),
-            pool,
+            Arc::new(crate::session::SessionPool::new(session_pool_config())),
             target,
             target_domain,
             connect_timeout,
@@ -2324,41 +2216,11 @@ impl PacketOutbound for AnyTlsHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<PreparedUdpTransport> {
-        if let Some(captured) = self.captured_runtime(node)? {
-            let runtime = captured.runtime;
-            let runtime_node = Arc::clone(&runtime.node);
-            let dial_runtime = Arc::clone(&runtime);
-            let dial_node = Arc::clone(&runtime_node);
-            let dial_addr = format!("{}:{}", runtime_node.host(), runtime_node.port);
-            return Self::dial_udp_transport_speculative_for_pool_with(
-                runtime_node.as_ref(),
-                captured.pool,
-                target,
-                target_domain,
-                connect_timeout,
-                Some(runtime),
-                move || async move {
-                    let tls_connector = dial_runtime.anytls_tls_connector()?;
-                    dial_session(
-                        dial_node.as_ref(),
-                        &dial_addr,
-                        connect_timeout,
-                        Some(tls_connector),
-                    )
-                    .await
-                },
-            )
-            .await;
-        }
-        let pool = Arc::clone(
-            self.fallback_pool
-                .get_or_init(|| Arc::new(crate::session::SessionPool::new(session_pool_config()))),
-        );
         let dial_node = node.clone();
         let dial_addr = format!("{}:{}", node.host(), node.port);
         Self::dial_udp_transport_speculative_for_pool_with(
             node,
-            pool,
+            Arc::new(crate::session::SessionPool::new(session_pool_config())),
             target,
             target_domain,
             connect_timeout,
@@ -2891,75 +2753,6 @@ mod tests {
         assert!(q.queue.lock().unwrap().is_empty());
     }
 
-    /// 2B: with a runtime registry installed, the handler dials through
-    /// the node's registry-owned pool; without one, its own fallback.
-    #[test]
-    fn test_node_pool_prefers_registry() {
-        let node = Node {
-            id: uuid::Uuid::new_v4(),
-            name: "test".into(),
-            protocol: NodeProtocol::AnyTLS,
-            ..Default::default()
-        };
-        let handler = AnyTlsHandler::new();
-        // No registry: fallback pool, shared across calls.
-        let p1 = handler.node_pool(&node).unwrap();
-        let p2 = handler.node_pool(&node).unwrap();
-        assert!(Arc::ptr_eq(&p1, &p2));
-
-        let registry = crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node))
-            .unwrap()
-            .into_shared();
-        let handler2 = AnyTlsHandler::new();
-        handler2.set_runtime_registry(registry.clone());
-        let pool = handler2.node_pool(&node).unwrap();
-        let registry_pool = match &registry.read().get(&node.id).unwrap().runtime {
-            crate::runtime::ProtocolRuntime::AnyTls(rt) => Arc::clone(&rt.pool),
-            crate::runtime::ProtocolRuntime::None | crate::runtime::ProtocolRuntime::Quic(_) => {
-                panic!("expected AnyTls runtime")
-            }
-        };
-        assert!(Arc::ptr_eq(&pool, &registry_pool));
-        assert!(
-            handler2.fallback_pool.get().is_none(),
-            "registry path must not touch the fallback"
-        );
-
-        // A node absent from the registry is an explicit error.
-        let other = Node {
-            id: uuid::Uuid::new_v4(),
-            name: "other".into(),
-            protocol: NodeProtocol::AnyTLS,
-            ..Default::default()
-        };
-        assert!(handler2.node_pool(&other).is_err());
-
-        let replacement_node = Node {
-            id: node.id,
-            name: node.name.clone(),
-            protocol: NodeProtocol::AnyTLS,
-            address: "replacement.example:9443".into(),
-            sni: Some("replacement.example".into()),
-            skip_cert_verify: true,
-            ..Default::default()
-        };
-        *registry.write() = Arc::new(
-            crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&replacement_node))
-                .unwrap(),
-        );
-        let captured = handler2.captured_runtime(&node).unwrap().unwrap();
-        assert_eq!(captured.runtime.node.address, replacement_node.address);
-        assert_eq!(captured.runtime.node.sni, replacement_node.sni);
-        assert!(captured.runtime.node.skip_cert_verify);
-        let replacement_pool = match &registry.read().get(&node.id).unwrap().runtime {
-            crate::runtime::ProtocolRuntime::AnyTls(runtime) => Arc::clone(&runtime.pool),
-            crate::runtime::ProtocolRuntime::None | crate::runtime::ProtocolRuntime::Quic(_) => {
-                panic!("expected AnyTLS runtime")
-            }
-        };
-        assert!(Arc::ptr_eq(&captured.pool, &replacement_pool));
-    }
-
     const TEST_AUTH: &[u8] = b"test-auth";
     const TEST_SETTINGS: &[u8] = b"test-settings";
 
@@ -3058,17 +2851,15 @@ mod tests {
 
         let mut replacement_node = old_node.clone();
         replacement_node.address = "127.0.0.1:10".into();
-        let replacement = crate::runtime::OutboundRuntimeRegistry::build(&[replacement_node])
-            .unwrap()
-            .into_shared();
-        let replacement_pool = match &replacement.read().get(&old_node.id).unwrap().runtime {
+        let replacement =
+            crate::runtime::OutboundRuntimeRegistry::build(&[replacement_node]).unwrap();
+        let replacement_pool = match &replacement.get(&old_node.id).unwrap().runtime {
             crate::runtime::ProtocolRuntime::AnyTls(runtime) => Arc::clone(&runtime.pool),
             crate::runtime::ProtocolRuntime::None | crate::runtime::ProtocolRuntime::Quic(_) => {
                 panic!("expected AnyTLS runtime")
             }
         };
         let handler = AnyTlsHandler::new();
-        handler.set_runtime_registry(replacement);
 
         let mut stream = handler
             .dial_runtime(
@@ -4156,10 +3947,6 @@ mod tests {
                 .unwrap(),
             UdpWarmStatus::AlreadyReady
         );
-        assert!(
-            handler.fallback_pool.get().is_none(),
-            "warm must never consult the handler fallback or shared current registry"
-        );
         drop(server);
     }
 
@@ -4235,12 +4022,14 @@ mod tests {
             anytls_min_idle_session: Some(0),
             ..Default::default()
         };
-        let pool = handler.node_pool(&node).unwrap();
+        let pool: Arc<AnyTlsPool> =
+            Arc::new(crate::session::SessionPool::new(session_pool_config()));
         let (session, _server) = establish_test_session("speculative-shared").await;
         pool.insert(POOL_KEY, &session);
         let prepared = handler
             .dial_udp_transport_speculative_with(
                 &node,
+                Arc::clone(&pool),
                 "8.8.8.8:53".parse().unwrap(),
                 None,
                 Duration::from_secs(1),
@@ -4272,11 +4061,13 @@ mod tests {
             anytls_min_idle_session: Some(0),
             ..Default::default()
         };
-        let pool = handler.node_pool(&node).unwrap();
+        let pool: Arc<AnyTlsPool> =
+            Arc::new(crate::session::SessionPool::new(session_pool_config()));
         let (session, _server) = establish_test_session("speculative-detached-commit").await;
         let prepared = handler
             .dial_udp_transport_speculative_with(
                 &node,
+                Arc::clone(&pool),
                 "8.8.8.8:53".parse().unwrap(),
                 None,
                 Duration::from_secs(1),
@@ -4308,11 +4099,13 @@ mod tests {
             anytls_min_idle_session: Some(0),
             ..Default::default()
         };
-        let pool = handler.node_pool(&node).unwrap();
+        let pool: Arc<AnyTlsPool> =
+            Arc::new(crate::session::SessionPool::new(session_pool_config()));
         let (session, _server) = establish_test_session("speculative-detached-shutdown").await;
         let prepared = handler
             .dial_udp_transport_speculative_with(
                 &node,
+                Arc::clone(&pool),
                 "8.8.8.8:53".parse().unwrap(),
                 None,
                 Duration::from_secs(1),
@@ -4349,18 +4142,21 @@ mod tests {
             anytls_min_idle_session: Some(0),
             ..Default::default()
         };
-        let pool = handler.node_pool(&node).unwrap();
+        let pool: Arc<AnyTlsPool> =
+            Arc::new(crate::session::SessionPool::new(session_pool_config()));
         let started = Arc::new(tokio::sync::Notify::new());
         let cancelled = Arc::new(AtomicBool::new(false));
         let task = tokio::spawn({
             let handler = Arc::clone(&handler);
             let node = node.clone();
+            let pool = Arc::clone(&pool);
             let started = Arc::clone(&started);
             let cancelled = Arc::clone(&cancelled);
             async move {
                 let _ = handler
                     .dial_udp_transport_speculative_with(
                         &node,
+                        pool,
                         "8.8.8.8:53".parse().unwrap(),
                         None,
                         Duration::from_secs(1),
@@ -4413,18 +4209,21 @@ mod tests {
             anytls_min_idle_session: Some(0),
             ..Default::default()
         };
-        let pool = handler.node_pool(&node).unwrap();
+        let pool: Arc<AnyTlsPool> =
+            Arc::new(crate::session::SessionPool::new(session_pool_config()));
         let started = Arc::new(tokio::sync::Notify::new());
         let cancelled = Arc::new(AtomicBool::new(false));
         let task = tokio::spawn({
             let handler = Arc::clone(&handler);
             let node = node.clone();
+            let pool = Arc::clone(&pool);
             let started = Arc::clone(&started);
             let cancelled = Arc::clone(&cancelled);
             async move {
                 handler
                     .dial_udp_transport_speculative_with(
                         &node,
+                        pool,
                         "8.8.8.8:53".parse().unwrap(),
                         None,
                         Duration::from_secs(1),

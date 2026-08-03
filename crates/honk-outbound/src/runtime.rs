@@ -227,6 +227,19 @@ pub struct NodeRuntime {
 }
 
 impl NodeRuntime {
+    /// A generation-free runtime for one-shot callers (standalone probing,
+    /// tests): session protocols get a throwaway pool per runtime.
+    pub fn ephemeral(node: &Node) -> Arc<Self> {
+        Arc::new(Self {
+            node: Arc::new(node.clone()),
+            capabilities: OutboundCapabilities::for_node(node),
+            runtime: crate::descriptor::descriptor(node.protocol)
+                .generation_runtime
+                .build(),
+            adopted: AtomicBool::new(false),
+        })
+    }
+
     pub(crate) fn anytls_tls_connector(&self) -> anyhow::Result<Arc<crate::tls::TlsConnector>> {
         let ProtocolRuntime::AnyTls(runtime) = &self.runtime else {
             anyhow::bail!("node '{}' has no AnyTLS runtime", self.node.name);

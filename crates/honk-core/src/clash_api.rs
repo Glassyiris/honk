@@ -75,6 +75,10 @@ pub struct ClashState {
     pub cache_db: Option<Arc<crate::cachedb::CacheDb>>,
     pub connection_tracker: Arc<crate::connection_tracker::ConnectionTracker>,
     pub proxy_registry: Arc<honk_outbound::proxy::ProxyRegistry>,
+    /// Hot-swappable runtime generation cell; delay measurements resolve
+    /// their node's runtime through it so session protocols probe over the
+    /// same generation-warm session the data path uses.
+    pub runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
     /// Shared clash mode + GLOBAL selection (also held by the control
     /// plane, which applies the mode override on the outbound path).
     pub mode_state: SharedModeState,
@@ -620,7 +624,12 @@ async fn get_proxy_delay(
             );
         };
         let tcp = entry.tcp.clone();
-        return match urltest_node(&node, tcp.as_ref(), &query.url, query.timeout()).await {
+        let runtime = s
+            .runtime_registry
+            .read()
+            .get(&node.id)
+            .unwrap_or_else(|| honk_outbound::runtime::NodeRuntime::ephemeral(&node));
+        return match urltest_node(&runtime, tcp.as_ref(), &query.url, query.timeout()).await {
             Ok(latency) => {
                 s.alive_set
                     .record_probe_latency(node.id, ProbeDomain::Tcp, IpVersion::V4, latency);
@@ -652,8 +661,10 @@ async fn get_proxy_delay(
             return error_response(StatusCode::SERVICE_UNAVAILABLE, "group has no members");
         }
         let leaves: Vec<Node> = members.iter().map(|(_, leaf)| leaf.clone()).collect();
+        let generation = s.runtime_registry.read().clone();
         let results = urltest_group(
             &leaves,
+            &generation,
             &s.proxy_registry,
             &s.alive_set,
             &query.url,
@@ -714,8 +725,10 @@ async fn get_group_delay(
     drop(config);
 
     let leaves: Vec<Node> = members.iter().map(|(_, leaf)| leaf.clone()).collect();
+    let generation = s.runtime_registry.read().clone();
     let results = urltest_group(
         &leaves,
+        &generation,
         &s.proxy_registry,
         &s.alive_set,
         &query.url,

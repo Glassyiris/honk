@@ -251,9 +251,6 @@ impl ControlPlane {
             honk_outbound::runtime::OutboundRuntimeRegistry::build(&config.nodes)
                 .map_err(|e| anyhow::anyhow!("invalid node set: {}", e))?
                 .into_shared();
-        // Hand the registry to handlers with pooled sessions (AnyTLS);
-        // the shared cell swaps contents on reload, installed once.
-        proxy_registry.install_runtime_registry(runtime_registry.clone());
         let outbound_runtime = runtime_registry.read().clone();
         dns_upstream_pool.set_runtime_generation(Arc::clone(&outbound_runtime))?;
         {
@@ -838,6 +835,7 @@ impl ControlPlane {
                     let prober = Arc::new(ProxyHttpProber::new(
                         self.config.clone(),
                         self.proxy_registry.clone(),
+                        self.runtime_registry.clone(),
                         check_method.clone(),
                     ));
                     alive_set
@@ -886,6 +884,7 @@ impl ControlPlane {
                 alive_set.set_udp_probe(Arc::new(ProxyUdpProber::new(
                     self.config.clone(),
                     self.proxy_registry.clone(),
+                    self.runtime_registry.clone(),
                     dns_target,
                 )));
                 info!("UDP health check enabled (dns={})", dns_target);

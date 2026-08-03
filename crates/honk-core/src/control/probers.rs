@@ -8,6 +8,7 @@ use super::*;
 pub(super) struct ProxyHttpProber {
     config: Arc<RwLock<Config>>,
     proxy_registry: Arc<ProxyRegistry>,
+    runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
     check_method: String,
 }
 
@@ -15,11 +16,13 @@ impl ProxyHttpProber {
     pub(super) fn new(
         config: Arc<RwLock<Config>>,
         proxy_registry: Arc<ProxyRegistry>,
+        runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
         check_method: String,
     ) -> Self {
         Self {
             config,
             proxy_registry,
+            runtime_registry,
             check_method,
         }
     }
@@ -48,6 +51,7 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
         let node = self.find_node(node_name);
         let node_name_owned = node_name.to_string();
         let registry = self.proxy_registry.clone();
+        let generation = self.runtime_registry.read().clone();
         let check_url = url.to_string();
         let check_method = self.check_method.clone();
         let config = self.config.clone();
@@ -58,6 +62,9 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                 .find(node.protocol)
                 .ok_or_else(|| format!("no handler for protocol {:?}", node.protocol))?;
             let tcp = entry.tcp.clone();
+            let runtime = generation
+                .get(&node.id)
+                .unwrap_or_else(|| honk_outbound::runtime::NodeRuntime::ephemeral(&node));
 
             let start = std::time::Instant::now();
             let connect_timeout = {
@@ -77,7 +84,7 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                 url_host(&check_url)
             };
             let proxy = tcp
-                .dial(&node, addr, domain.as_deref(), connect_timeout)
+                .dial_runtime(runtime, addr, domain.as_deref(), connect_timeout)
                 .await
                 .map_err(|e| format!("dial failed: {}", e))?;
 
@@ -187,6 +194,7 @@ const DEFAULT_UDP_CHECK_DNS: &str = "8.8.8.8:53";
 pub(super) struct ProxyUdpProber {
     config: Arc<RwLock<Config>>,
     proxy_registry: Arc<ProxyRegistry>,
+    runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
     dns_target: SocketAddr,
 }
 
@@ -194,11 +202,13 @@ impl ProxyUdpProber {
     pub(super) fn new(
         config: Arc<RwLock<Config>>,
         proxy_registry: Arc<ProxyRegistry>,
+        runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
         dns_target: SocketAddr,
     ) -> Self {
         Self {
             config,
             proxy_registry,
+            runtime_registry,
             dns_target,
         }
     }
@@ -225,6 +235,7 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
         let node = self.find_node(node_name);
         let node_name_owned = node_name.to_string();
         let registry = self.proxy_registry.clone();
+        let generation = self.runtime_registry.read().clone();
         let config = self.config.clone();
         let dns_target = self.dns_target;
 
@@ -245,10 +256,19 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
             };
 
             let start = std::time::Instant::now();
-            let transport = packet
-                .dial_udp_transport(&node, dns_target, None, connect_timeout)
-                .await
-                .map_err(|e| format!("UDP dial failed: {}", e))?;
+            let transport = match generation.get(&node.id) {
+                Some(runtime) => {
+                    packet
+                        .dial_udp_transport_runtime(runtime, dns_target, None, connect_timeout)
+                        .await
+                }
+                None => {
+                    packet
+                        .dial_udp_transport(&node, dns_target, None, connect_timeout)
+                        .await
+                }
+            }
+            .map_err(|e| format!("UDP dial failed: {}", e))?;
 
             // One minimal DNS query; any well-formed answer proves the
             // node's UDP path round-trips end to end.

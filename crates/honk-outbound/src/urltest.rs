@@ -71,7 +71,9 @@ fn direct_target() -> SocketAddr {
 /// (matches sing-box's health check concurrency).
 pub const URLTEST_MAX_CONCURRENT: usize = 10;
 
-/// Measure the round-trip latency to `url` through `node` via `handler`.
+/// Measure the round-trip latency to `url` through the node's runtime via
+/// `handler`. Session-owning protocols multiplex the probe onto their
+/// generation-warm session, so the measurement matches the real data path.
 ///
 /// Dials the URL's host on port 443 (https) or 80 (http) through the proxy
 /// handler. For https URLs the stream is then wrapped in a real TLS
@@ -85,11 +87,12 @@ pub const URLTEST_MAX_CONCURRENT: usize = 10;
 /// [`DEFAULT_URLTEST_URL`]. A zero `timeout` falls back to
 /// [`DEFAULT_URLTEST_TIMEOUT`].
 pub async fn urltest_node(
-    node: &Node,
+    runtime: &Arc<crate::runtime::NodeRuntime>,
     handler: &dyn TcpOutbound,
     url: &str,
     timeout: Duration,
 ) -> anyhow::Result<Duration> {
+    let node = runtime.node.as_ref();
     let url = normalize_url(url);
     let timeout = if timeout.is_zero() {
         DEFAULT_URLTEST_TIMEOUT
@@ -136,13 +139,13 @@ pub async fn urltest_node(
         }
     };
 
-    measure_head_exchange(node, handler, &host, is_https, addr, timeout).await
+    measure_head_exchange(runtime, handler, &host, is_https, addr, timeout).await
 }
 
 /// [`urltest_node`] with a caller-chosen destination address (e.g. an
 /// explicit v4/v6 target) — TLS SNI/Host still come from `url`.
 pub async fn urltest_node_addr(
-    node: &Node,
+    runtime: &Arc<crate::runtime::NodeRuntime>,
     handler: &dyn TcpOutbound,
     url: &str,
     addr: SocketAddr,
@@ -150,22 +153,25 @@ pub async fn urltest_node_addr(
 ) -> anyhow::Result<Duration> {
     let url = normalize_url(url);
     let (host, _, is_https) = parse_url_host_port(url)?;
-    measure_head_exchange(node, handler, &host, is_https, addr, timeout).await
+    measure_head_exchange(runtime, handler, &host, is_https, addr, timeout).await
 }
 
 /// Dial `addr` through the node and time the full exchange up to the first
 /// response bytes (TLS handshake + HEAD for https, plain HEAD for http).
 async fn measure_head_exchange(
-    node: &Node,
+    runtime: &Arc<crate::runtime::NodeRuntime>,
     handler: &dyn TcpOutbound,
     host: &str,
     is_https: bool,
     addr: SocketAddr,
     timeout: Duration,
 ) -> anyhow::Result<Duration> {
+    let node = runtime.node.as_ref();
     let fut = async {
         let start = Instant::now();
-        let proxy = handler.dial(node, addr, Some(host), timeout).await?;
+        let proxy = handler
+            .dial_runtime(Arc::clone(runtime), addr, Some(host), timeout)
+            .await?;
         tracing::debug!(node = %node.name, %addr, "urltest: dial established");
         let stream = proxy.stream;
 
@@ -284,6 +290,7 @@ where
 /// Returns one `(node_name, result)` entry per member, in member order.
 pub async fn urltest_group(
     members: &[Node],
+    generation: &Arc<crate::runtime::OutboundRuntimeRegistry>,
     registry: &Arc<ProxyRegistry>,
     alive_set: &Arc<AliveDialerSet>,
     url: &str,
@@ -295,6 +302,9 @@ pub async fn urltest_group(
 
     for node in members {
         let node = node.clone();
+        let runtime = generation
+            .get(&node.id)
+            .unwrap_or_else(|| crate::runtime::NodeRuntime::ephemeral(&node));
         let registry = registry.clone();
         let alive_set = alive_set.clone();
         let url = url.clone();
@@ -302,7 +312,7 @@ pub async fn urltest_group(
         join_set.spawn(async move {
             let _permit = permit.acquire_owned().await;
             let result = match registry.find(node.protocol) {
-                Some(entry) => urltest_node(&node, entry.tcp.as_ref(), &url, timeout).await,
+                Some(entry) => urltest_node(&runtime, entry.tcp.as_ref(), &url, timeout).await,
                 None => Err(anyhow!("no handler for protocol {:?}", node.protocol)),
             };
             match &result {
@@ -416,7 +426,7 @@ mod resolver_hook_tests {
         // must have been consulted first.
         let handler = crate::proxy::direct::DirectHandler::new();
         let _ = urltest_node(
-            &node,
+            &crate::runtime::NodeRuntime::ephemeral(&node),
             &handler,
             "https://example.invalid/",
             Duration::from_millis(50),
@@ -578,7 +588,13 @@ mod tests {
         let handler = MockHandler;
         let url = format!("https://{}:{}/", addr.ip(), addr.port());
 
-        let result = urltest_node(&node, &handler, &url, Duration::from_secs(5)).await;
+        let result = urltest_node(
+            &crate::runtime::NodeRuntime::ephemeral(&node),
+            &handler,
+            &url,
+            Duration::from_secs(5),
+        )
+        .await;
         assert!(
             result.is_err(),
             "https measurement against a plaintext server must fail"
@@ -591,7 +607,7 @@ mod tests {
         let node = make_node("good");
         let handler = MockHandler;
         let result = urltest_node(
-            &node,
+            &crate::runtime::NodeRuntime::ephemeral(&node),
             &handler,
             "https://127.0.0.1:1/",
             Duration::from_secs(2),
@@ -602,7 +618,7 @@ mod tests {
         // A node named "bad" fails inside the handler.
         let bad = make_node("bad");
         let result = urltest_node(
-            &bad,
+            &crate::runtime::NodeRuntime::ephemeral(&bad),
             &handler,
             "https://127.0.0.1:1/",
             Duration::from_secs(2),
@@ -639,6 +655,7 @@ mod tests {
 
         let results = urltest_group(
             &members,
+            &Arc::new(crate::runtime::OutboundRuntimeRegistry::build(&members).unwrap()),
             &registry,
             &alive_set,
             &url,
@@ -683,7 +700,7 @@ mod direct_urltest_tests {
         };
         let handler = crate::proxy::direct::DirectHandler::new();
         let latency = urltest_node(
-            &node,
+            &crate::runtime::NodeRuntime::ephemeral(&node),
             &handler,
             "http://unreachable.invalid",
             Duration::from_secs(2),
