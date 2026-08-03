@@ -150,6 +150,52 @@ fn scan_tuning(utilization: f64, previous_elapsed: Duration) -> ScanTuning {
     }
 }
 
+struct PostScanCleanup<C: FnOnce()> {
+    cleanup: Option<C>,
+}
+
+impl<C: FnOnce()> Drop for PostScanCleanup<C> {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup();
+        }
+    }
+}
+
+fn with_post_scan_cleanup<T, W, C>(work: W, cleanup: C) -> T
+where
+    W: FnOnce() -> T,
+    C: FnOnce(),
+{
+    let _cleanup = PostScanCleanup {
+        cleanup: Some(cleanup),
+    };
+    work()
+}
+
+#[cfg(feature = "mimalloc")]
+fn janitor_mimalloc_collection_enabled(value: Option<&str>) -> bool {
+    value
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(60)
+        > 0
+}
+
+#[cfg(feature = "mimalloc")]
+fn collect_janitor_scan_heap() {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let value = std::env::var("HONK_MI_COLLECT_SECS").ok();
+        janitor_mimalloc_collection_enabled(value.as_deref())
+    });
+    if *ENABLED {
+        // SAFETY: the blocking thread invoking this function owns the scan allocations.
+        unsafe { libmimalloc_sys::mi_collect(true) };
+    }
+}
+
+#[cfg(not(feature = "mimalloc"))]
+fn collect_janitor_scan_heap() {}
+
 /// Tracks the pressure state of the BPF maps for adaptive cleanup intervals.
 #[derive(Debug, Clone, Default)]
 struct PressureState {
@@ -349,10 +395,30 @@ impl BpfJanitor {
         T: Send + 'static,
         F: FnOnce(&mut dyn EbpfBackend) -> T + Send + 'static,
     {
+        self.run_blocking_scan_with_cleanup(label, work, collect_janitor_scan_heap)
+            .await
+    }
+
+    async fn run_blocking_scan_with_cleanup<T, F, C>(
+        &self,
+        label: &'static str,
+        work: F,
+        cleanup: C,
+    ) -> Option<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut dyn EbpfBackend) -> T + Send + 'static,
+        C: FnOnce() + Send + 'static,
+    {
         let ebpf = Arc::clone(&self.ebpf);
         match tokio::task::spawn_blocking(move || {
-            let mut ebpf = ebpf.blocking_write();
-            work(ebpf.as_mut())
+            with_post_scan_cleanup(
+                || {
+                    let mut ebpf = ebpf.blocking_write();
+                    work(ebpf.as_mut())
+                },
+                cleanup,
+            )
         })
         .await
         {
@@ -720,6 +786,74 @@ fn update_pressure_state(state: &mut PressureState, overflow_delta: bool, utiliz
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_scan_collects_on_allocating_thread_after_unlock() {
+        let ebpf: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(
+            crate::ebpf::mock::MockEbpfBackend::new(),
+        )));
+        let janitor = BpfJanitor::new(Arc::clone(&ebpf));
+        let allocating_thread = Arc::new(std::sync::Mutex::new(None));
+        let allocating_thread_for_work = Arc::clone(&allocating_thread);
+        let cleanup_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cleanup_observed_for_callback = Arc::clone(&cleanup_observed);
+        let ebpf_for_callback = Arc::clone(&ebpf);
+
+        let result = janitor
+            .run_blocking_scan_with_cleanup(
+                "test",
+                move |_| {
+                    *allocating_thread_for_work.lock().unwrap() = Some(std::thread::current().id());
+                    vec![0_u8; 1024 * 1024].len()
+                },
+                move || {
+                    let same_thread =
+                        *allocating_thread.lock().unwrap() == Some(std::thread::current().id());
+                    let backend_unlocked = ebpf_for_callback.try_write().is_ok();
+                    cleanup_observed_for_callback.store(
+                        same_thread && backend_unlocked,
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                },
+            )
+            .await;
+
+        assert_eq!(result, Some(1024 * 1024));
+        assert!(cleanup_observed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_scan_collects_during_panic_unwind() {
+        let ebpf: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(
+            crate::ebpf::mock::MockEbpfBackend::new(),
+        )));
+        let janitor = BpfJanitor::new(Arc::clone(&ebpf));
+        let cleanup_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cleanup_ran_for_callback = Arc::clone(&cleanup_ran);
+
+        let result: Option<()> = janitor
+            .run_blocking_scan_with_cleanup(
+                "test-panic",
+                |_| panic!("scan panic"),
+                move || {
+                    cleanup_ran_for_callback.store(true, std::sync::atomic::Ordering::SeqCst);
+                },
+            )
+            .await;
+
+        assert!(result.is_none());
+        assert!(cleanup_ran.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(ebpf.try_write().is_ok());
+    }
+    #[cfg(feature = "mimalloc")]
+    #[test]
+    fn janitor_collection_uses_the_process_collector_setting() {
+        assert!(!janitor_mimalloc_collection_enabled(Some("0")));
+        assert!(janitor_mimalloc_collection_enabled(None));
+        assert!(janitor_mimalloc_collection_enabled(Some("invalid")));
+        assert!(janitor_mimalloc_collection_enabled(Some("60")));
+    }
+
     #[test]
     fn scan_tuning_grows_with_pressure() {
         let steady = scan_tuning(0.5, Duration::ZERO);
