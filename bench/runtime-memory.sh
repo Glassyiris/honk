@@ -284,7 +284,7 @@ port = parsed.port or 80
 
 def normalized(address):
     value = ipaddress.ip_address(address.split("%", 1)[0])
-    return value.ipv4_mapped or value
+    return getattr(value, "ipv4_mapped", None) or value
 
 wanted = {
     normalized(sockaddr[0])
