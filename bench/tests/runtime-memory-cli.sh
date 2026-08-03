@@ -44,7 +44,7 @@ def metrics(pss):
 
 def row(name, digest, pss):
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "record": "runtime_memory",
         "scenario": "settled",
         "arm": name,
@@ -78,6 +78,14 @@ def row(name, digest, pss):
         "thp_enabled": "[always] madvise never",
         "cpu_governor": "performance",
         "turbo_disabled": 0,
+        "direct_control_port": 5300,
+        "direct_control_min_mbps": 8930,
+        "churn_ports": [8001, 8002, 8003, 8004, 8005, 8006],
+        "churn_count": 20000,
+        "churn_concurrency": 64,
+        "churn_batch_size": 2000,
+        "churn_batch_pause": 1,
+        "churn_retries": 3,
         "elapsed_seconds": 130,
         "rss_kib": pss + 10,
         "peak_rss_kib": pss + 20,
@@ -135,6 +143,9 @@ required = {
     "throughput_mbps", "ops_per_s", "p50_ms", "p95_ms", "p99_ms", "samples",
     "failures", "loss", "connections_before", "connections_after",
     "udp_stats_before", "udp_stats_after", "process_before", "process_after", "curve",
+    "direct_control_port", "direct_control_min_mbps", "churn_ports",
+    "churn_count", "churn_concurrency", "churn_batch_size", "churn_batch_pause",
+    "churn_retries",
 }
 assert all(required <= row.keys() for row in rows)
 assert {row["binary_sha256"] for row in rows} == {"a" * 64, "b" * 64}
@@ -154,6 +165,41 @@ import threading
 spec = importlib.util.spec_from_file_location("runtime_memory_workload", sys.argv[1])
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
+with (Path(sys.argv[2]) / "fixture.json").open(encoding="utf-8") as source:
+    template = json.load(source)["rows"]["baseline"][0]
+direct = dict(template)
+direct.pop("curve")
+direct.update(
+    scenario="direct_control",
+    throughput_runs_mbps=[9000.0, 9010.0, 8990.0],
+    active_process_metrics=template["process_after"],
+    active_connections=1,
+    active_samples=3,
+    attempts=3,
+    retries=0,
+)
+module.validate_row(direct)
+protocol = dict(template)
+protocol.pop("curve")
+protocol.update(
+    scenario="protocol_smoke",
+    samples=36,
+    throughput_mbps=0.0,
+    ops_per_s=0.0,
+    p50_ms=0.0,
+    p95_ms=0.0,
+    p99_ms=0.0,
+    protocol_results=[
+        {
+            "network": "tcp" if index < 6 else "udp",
+            "port": (8001 + index) if index < 6 else (53531 + index - 6),
+            "samples": 3,
+            "failures": 0,
+        }
+        for index in range(12)
+    ],
+)
+module.validate_row(protocol)
 try:
     module.parse_target("example.com")
 except argparse.ArgumentTypeError:
@@ -220,6 +266,21 @@ assert retry_result["failures"] == 0
 assert retry_result["attempts"] == 3
 assert retry_result["retries"] == 1
 
+observed_ports = []
+async def record_port(_, port):
+    observed_ports.append(port)
+    return 0.001, 7
+
+module.http_request = record_port
+distributed = asyncio.run(
+    module.churn_client("192.0.2.1", (8001, 8002, 8003), 6, 1, 0, 2, 0)
+)
+assert distributed["failures"] == 0
+assert observed_ports == [8001, 8002, 8003, 8001, 8002, 8003]
+assert distributed["batches"] == 3
+assert module.retryable_http_error(asyncio.IncompleteReadError(b"", 1))
+assert module.parse_ports("8001,8002,8003") == (8001, 8002, 8003)
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         payload = json.dumps({"connections": []}).encode()
@@ -275,7 +336,7 @@ import sys
 with open(sys.argv[1], encoding="utf-8") as source:
     fixture = json.load(source)
 for path, field, value in (
-    (sys.argv[2], "schema_version", 2),
+    (sys.argv[2], "schema_version", 1),
     (sys.argv[3], "record", "other"),
     (sys.argv[4], "pid_start_time_ticks", None),
 ):

@@ -76,6 +76,9 @@ COMMON_STRING_FIELDS = (
     "thp_enabled",
     "cpu_governor",
 )
+PROTOCOL_TCP_PORTS = (8001, 8002, 8003, 8004, 8005, 8006)
+PROTOCOL_UDP_PORTS = (53531, 53532, 53533, 53534, 53535, 53536)
+CHURN_PORTS = PROTOCOL_TCP_PORTS
 
 
 def require_nonnegative_number(value: object, label: str) -> None:
@@ -121,6 +124,15 @@ def parse_target(raw: str) -> str:
         return str(ipaddress.ip_address(raw))
     except ValueError as error:
         raise argparse.ArgumentTypeError("target must be an IP address") from error
+
+def parse_ports(raw: str) -> tuple[int, ...]:
+    try:
+        ports = tuple(int(value) for value in raw.split(","))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("ports must be comma-separated integers") from error
+    if not ports or any(not 1 <= port <= 65535 for port in ports):
+        raise argparse.ArgumentTypeError("ports must be in 1..65535")
+    return ports
 
 
 def read_proc_stat(pid: int) -> tuple[list[str], str]:
@@ -261,43 +273,77 @@ async def http_request(host: str, port: int, path: str = "/") -> tuple[float, in
     return time.monotonic() - started, response_size
 
 
+def retryable_http_error(error: Exception) -> bool:
+    return isinstance(error, (ConnectionError, asyncio.IncompleteReadError)) or (
+        isinstance(error, RuntimeError)
+        and str(error) in {"connect timeout", "response header timeout", "response body timeout"}
+    )
+
+
 async def churn_client(
-    host: str, port: int, count: int, concurrency: int, connect_retries: int
+    host: str,
+    ports: int | tuple[int, ...],
+    count: int,
+    concurrency: int,
+    connect_retries: int,
+    batch_size: int | None = None,
+    batch_pause: float = 0.0,
 ) -> dict:
-    queue: asyncio.Queue[int] = asyncio.Queue()
-    for index in range(count):
-        queue.put_nowait(index)
+    if isinstance(ports, int):
+        ports = (ports,)
+    if not ports:
+        raise ValueError("churn requires at least one port")
+    if count <= 0 or concurrency <= 0:
+        raise ValueError("churn count and concurrency must be positive")
+    if connect_retries < 0:
+        raise ValueError("connect retries must be nonnegative")
+    if batch_size is None:
+        batch_size = count
+    if batch_size <= 0 or batch_pause < 0:
+        raise ValueError("batch size must be positive and pause nonnegative")
+
     latencies: list[float] = []
     failures: list[str] = []
     transferred = 0
     retries = 0
 
-    async def worker() -> None:
-        nonlocal transferred, retries
-        while True:
-            try:
-                queue.get_nowait()
-            except asyncio.QueueEmpty:
-                return
-            operation_started = time.monotonic()
-            try:
-                for attempt in range(connect_retries + 1):
-                    try:
-                        _, size = await http_request(host, port)
-                        break
-                    except RuntimeError as error:
-                        if str(error) != "connect timeout" or attempt == connect_retries:
-                            raise
-                        retries += 1
-                latencies.append(time.monotonic() - operation_started)
-                transferred += size
-            except Exception as error:
-                failures.append(f"{type(error).__name__}:{error}")
-            finally:
-                queue.task_done()
+    async def run_batch(start: int, stop: int) -> None:
+        queue: asyncio.Queue[int] = asyncio.Queue()
+        for index in range(start, stop):
+            queue.put_nowait(index)
+
+        async def worker() -> None:
+            nonlocal transferred, retries
+            while True:
+                try:
+                    operation = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                operation_started = time.monotonic()
+                try:
+                    for attempt in range(connect_retries + 1):
+                        try:
+                            _, size = await http_request(host, ports[operation % len(ports)])
+                            break
+                        except Exception as error:
+                            if not retryable_http_error(error) or attempt == connect_retries:
+                                raise
+                            retries += 1
+                    latencies.append(time.monotonic() - operation_started)
+                    transferred += size
+                except Exception as error:
+                    failures.append(f"{type(error).__name__}:{error}")
+                finally:
+                    queue.task_done()
+
+        await asyncio.gather(*(worker() for _ in range(concurrency)))
 
     started = time.monotonic()
-    await asyncio.gather(*(worker() for _ in range(concurrency)))
+    batches = math.ceil(count / batch_size)
+    for batch_index, batch_start in enumerate(range(0, count, batch_size)):
+        await run_batch(batch_start, min(count, batch_start + batch_size))
+        if batch_index + 1 < batches and batch_pause:
+            await asyncio.sleep(batch_pause)
     elapsed = time.monotonic() - started
     latency_ms = [value * 1000 for value in latencies]
     return {
@@ -314,6 +360,9 @@ async def churn_client(
         "p99_ms": percentile(latency_ms, 0.99),
         "bytes": transferred,
         "throughput_mbps": transferred * 8 / elapsed / 1_000_000 if elapsed else 0.0,
+        "batches": batches,
+        "batch_size": batch_size,
+        "batch_pause": batch_pause,
     }
 
 
@@ -458,9 +507,22 @@ async def download_client(
 def client_main(args: argparse.Namespace) -> int:
     if args.connect_retries < 0:
         raise ValueError("connect retries must be nonnegative")
+    if args.mode != "churn" and args.port is None:
+        raise ValueError(f"{args.mode} requires --port")
+    if args.mode == "churn" and args.ports is not None and args.port is not None:
+        raise ValueError("churn accepts either --port or --ports, not both")
     if args.mode == "churn":
+        ports = args.ports or ((args.port,) if args.port is not None else ())
         value = asyncio.run(
-            churn_client(args.target, args.port, args.count, args.concurrency, args.connect_retries)
+            churn_client(
+                args.target,
+                ports,
+                args.count,
+                args.concurrency,
+                args.connect_retries,
+                args.batch_size,
+                args.batch_pause,
+            )
         )
     elif args.mode == "backpressure":
         value = asyncio.run(
@@ -621,7 +683,7 @@ def wait_connections_zero(controller: str, timeout: float = 150.0) -> None:
     raise RuntimeError(f"connections did not drain: {connection_count(controller)}")
 
 
-def iperf_action(args: argparse.Namespace) -> tuple[list[float], float, dict]:
+def iperf_action(args: argparse.Namespace, port: int) -> tuple[list[float], float, dict]:
     rates: list[float] = []
     active_runs = []
     for _ in range(args.iperf_runs):
@@ -635,7 +697,7 @@ def iperf_action(args: argparse.Namespace) -> tuple[list[float], float, dict]:
                 "-c",
                 args.target,
                 "-p",
-                str(args.iperf_port),
+                str(port),
                 "-t",
                 str(args.iperf_seconds),
                 "-R",
@@ -682,16 +744,18 @@ def base_result() -> dict:
 
 
 def validate_row(row: dict) -> None:
-    if row.get("schema_version") != 1:
-        raise ValueError("schema_version must be 1")
+    if row.get("schema_version") != 2:
+        raise ValueError("schema_version must be 2")
     if row.get("record") != "runtime_memory":
         raise ValueError("record must be runtime_memory")
     if row.get("arm") not in {"baseline", "candidate"}:
         raise ValueError("arm must be baseline or candidate")
     if row.get("scenario") not in {
         "cold",
+        "direct_control",
         "reload",
         "throughput",
+        "protocol_smoke",
         "churn",
         "backpressure",
         "settled",
@@ -714,6 +778,10 @@ def validate_row(row: dict) -> None:
         "pid_start_time_ticks",
         "config_inode",
         "worker_threads",
+        "direct_control_port",
+        "churn_count",
+        "churn_concurrency",
+        "churn_batch_size",
     ):
         if isinstance(row.get(key), bool) or not isinstance(row.get(key), int) or row[key] <= 0:
             raise ValueError(f"{key} must be a positive integer")
@@ -722,6 +790,7 @@ def validate_row(row: dict) -> None:
         "process_exe_device",
         "config_device",
         "mi_collect_secs",
+        "churn_retries",
     ):
         if isinstance(row.get(key), bool) or not isinstance(row.get(key), int) or row[key] < 0:
             raise ValueError(f"{key} must be a non-negative integer")
@@ -731,8 +800,23 @@ def validate_row(row: dict) -> None:
         "elapsed_seconds",
         "minor_faults_delta",
         "major_faults_delta",
+        "direct_control_min_mbps",
+        "churn_batch_pause",
     ):
         require_nonnegative_number(row.get(key), key)
+    if row["direct_control_min_mbps"] <= 0:
+        raise ValueError("direct_control_min_mbps must be positive")
+    churn_ports = row.get("churn_ports")
+    if (
+        not isinstance(churn_ports, list)
+        or not churn_ports
+        or len(set(churn_ports)) != len(churn_ports)
+        or any(
+            isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535
+            for port in churn_ports
+        )
+    ):
+        raise ValueError("churn_ports must be unique ports in 1..65535")
     for key in ("samples", "failures", "connections_before", "connections_after"):
         if isinstance(row[key], bool) or not isinstance(row[key], int):
             raise ValueError(f"{key} must be an integer")
@@ -763,12 +847,25 @@ def validate_row(row: dict) -> None:
             raise ValueError("reload long_stream_bytes must be positive")
         if not isinstance(row.get("udp_results"), list) or not row["udp_results"]:
             raise ValueError("reload udp_results must be a non-empty list")
+    elif scenario == "protocol_smoke":
+        results = row.get("protocol_results")
+        if not isinstance(results, list) or len(results) != 12:
+            raise ValueError("protocol_smoke must contain 12 TCP/UDP results")
+        for index, result in enumerate(results):
+            if not isinstance(result, dict) or result.get("network") not in {"tcp", "udp"}:
+                raise ValueError(f"protocol_results[{index}] has invalid network")
+            if not isinstance(result.get("port"), int) or result["port"] <= 0:
+                raise ValueError(f"protocol_results[{index}] has invalid port")
+            if not isinstance(result.get("samples"), int) or result["samples"] <= 0:
+                raise ValueError(f"protocol_results[{index}] has invalid samples")
+            if result.get("failures") != 0:
+                raise ValueError(f"protocol_results[{index}] has failures")
     else:
         validate_process_metrics(row.get("active_process_metrics"), "active_process_metrics")
         for key in ("active_connections", "active_samples", "attempts", "retries"):
             if isinstance(row.get(key), bool) or not isinstance(row.get(key), int) or row[key] < 0:
                 raise ValueError(f"{key} must be a non-negative integer")
-        if scenario == "throughput":
+        if scenario in {"throughput", "direct_control"}:
             rates = row.get("throughput_runs_mbps")
             if not isinstance(rates, list) or not rates:
                 raise ValueError("throughput_runs_mbps must be a non-empty list")
@@ -789,6 +886,10 @@ def run_main(args: argparse.Namespace) -> int:
     )
     if args.expected_binary_size <= 0:
         raise ValueError("expected binary size must be positive")
+    if not 1 <= args.direct_control_port <= 65535:
+        raise ValueError("direct control port must be in 1..65535")
+    if not math.isfinite(args.direct_control_min_mbps) or args.direct_control_min_mbps <= 0:
+        raise ValueError("direct control minimum must be positive")
     if not re.fullmatch(r"[0-9a-f]{64}", args.expected_binary_sha256):
         raise ValueError("expected binary SHA-256 is invalid")
     binary_hash = args.expected_binary_sha256
@@ -813,7 +914,7 @@ def run_main(args: argparse.Namespace) -> int:
     workload_path = Path(__file__).resolve(strict=True)
     driver_path = workload_path.with_name("runtime-memory.sh").resolve(strict=True)
     common = {
-        "schema_version": 1,
+        "schema_version": 2,
         "record": "runtime_memory",
         "arm": args.arm,
         "run": args.run,
@@ -841,6 +942,14 @@ def run_main(args: argparse.Namespace) -> int:
         "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
         "worker_threads": args.worker_threads,
         "mi_collect_secs": args.collect_secs,
+        "direct_control_port": args.direct_control_port,
+        "direct_control_min_mbps": args.direct_control_min_mbps,
+        "churn_ports": list(args.churn_ports),
+        "churn_count": args.churn_count,
+        "churn_concurrency": args.churn_concurrency,
+        "churn_batch_size": args.churn_batch_size,
+        "churn_batch_pause": args.churn_batch_pause,
+        "churn_retries": args.churn_retries,
         "target": args.target,
         "netns": args.netns,
         "thp_enabled": read_optional_text("/sys/kernel/mm/transparent_hugepage/enabled"),
@@ -911,6 +1020,28 @@ def run_main(args: argparse.Namespace) -> int:
             curve.append({"second": second + 1, **process_metrics(args.pid)})
         return {"samples": len(curve), "curve": curve}
 
+    def direct_control() -> dict:
+        wait_connections_zero(args.controller)
+        rates, median_rate, active = iperf_action(args, args.direct_control_port)
+        if median_rate < args.direct_control_min_mbps:
+            raise RuntimeError(
+                f"direct control throughput {median_rate:.1f} Mbps is below "
+                f"{args.direct_control_min_mbps:.1f} Mbps"
+            )
+        wait_connections_zero(args.controller)
+        return {
+            "throughput_mbps": median_rate,
+            "samples": len(rates),
+            "failures": 0,
+            "loss": 0.0,
+            "attempts": len(rates),
+            "retries": 0,
+            "throughput_runs_mbps": rates,
+            "active_process_metrics": active["metrics"],
+            "active_connections": active["connections"],
+            "active_samples": active["samples"],
+        }
+
     def throughput() -> dict:
         wait_connections_zero(args.controller)
         openings = run_client(
@@ -933,7 +1064,7 @@ def run_main(args: argparse.Namespace) -> int:
         )
         if openings["failures"]:
             raise RuntimeError(f"open latency failures: {openings['failure_examples']}")
-        rates, median_rate, active = iperf_action(args)
+        rates, median_rate, active = iperf_action(args, args.iperf_port)
         wait_connections_zero(args.controller)
         return {
             "throughput_mbps": median_rate,
@@ -961,14 +1092,18 @@ def run_main(args: argparse.Namespace) -> int:
                 "churn",
                 "--target",
                 args.target,
-                "--port",
-                str(args.churn_port),
+                "--ports",
+                ",".join(str(port) for port in args.churn_ports),
                 "--count",
                 str(args.churn_count),
                 "--concurrency",
                 str(args.churn_concurrency),
                 "--connect-retries",
-                "1",
+                str(args.churn_retries),
+                "--batch-size",
+                str(args.churn_batch_size),
+                "--batch-pause",
+                str(args.churn_batch_pause),
             ],
             args.workload_timeout,
         )
@@ -987,6 +1122,7 @@ def run_main(args: argparse.Namespace) -> int:
             "failure_examples": result["failure_examples"],
             "attempts": result["attempts"],
             "retries": result["retries"],
+            "batches": result["batches"],
             "active_process_metrics": active["metrics"],
             "active_connections": active["connections"],
             "active_samples": active["samples"],
@@ -1041,6 +1177,95 @@ def run_main(args: argparse.Namespace) -> int:
             "active_process_metrics": active["metrics"],
             "active_connections": active["connections"],
             "active_samples": active["samples"],
+        }
+
+    def protocol_smoke() -> dict:
+        wait_connections_zero(args.controller)
+        results = []
+        samples = 0
+        for port in PROTOCOL_TCP_PORTS:
+            tcp = run_client(
+                args,
+                [
+                    "--mode",
+                    "churn",
+                    "--target",
+                    args.target,
+                    "--port",
+                    str(port),
+                    "--count",
+                    "3",
+                    "--concurrency",
+                    "1",
+                    "--connect-retries",
+                    "1",
+                ],
+                60,
+            )
+            if tcp["failures"]:
+                raise RuntimeError(
+                    f"TCP protocol smoke failed on port {port}: {tcp['failure_examples']}"
+                )
+            samples += tcp["successes"]
+            results.append(
+                {
+                    "network": "tcp",
+                    "port": port,
+                    "samples": tcp["successes"],
+                    "failures": 0,
+                    "p50_ms": tcp["p50_ms"],
+                    "p95_ms": tcp["p95_ms"],
+                    "p99_ms": tcp["p99_ms"],
+                    "attempts": tcp["attempts"],
+                    "retries": tcp["retries"],
+                }
+            )
+
+        for port in PROTOCOL_UDP_PORTS:
+            udp = run_client(
+                args,
+                [
+                    "--mode",
+                    "udp",
+                    "--target",
+                    args.target,
+                    "--port",
+                    str(port),
+                    "--samples",
+                    "3",
+                ],
+                60,
+            )
+            peer = udp.get("peer")
+            valid_peer = (
+                isinstance(peer, list)
+                and len(peer) == 2
+                and ipaddress.ip_address(peer[0]) == ipaddress.ip_address(args.target)
+                and peer[1] == port
+            )
+            if udp["failures"] or not valid_peer:
+                raise RuntimeError(f"UDP protocol smoke failed on port {port}: {udp}")
+            samples += udp["samples"]
+            results.append(
+                {
+                    "network": "udp",
+                    "port": port,
+                    "samples": udp["samples"],
+                    "failures": 0,
+                    "loss": udp["loss"],
+                    "p50_ms": udp["p50_ms"],
+                    "p95_ms": udp["p95_ms"],
+                    "p99_ms": udp["p99_ms"],
+                    "peer": peer,
+                }
+            )
+
+        wait_connections_zero(args.controller)
+        return {
+            "samples": samples,
+            "failures": 0,
+            "loss": 0.0,
+            "protocol_results": results,
         }
 
     def reload_continuity() -> dict:
@@ -1201,10 +1426,12 @@ def run_main(args: argparse.Namespace) -> int:
         return {"samples": len(curve), "curve": curve}
 
     emit_scenario("cold", cold)
-    emit_scenario("reload", reload_continuity)
+    emit_scenario("direct_control", direct_control)
     emit_scenario("throughput", throughput)
     emit_scenario("churn", churn)
     emit_scenario("backpressure", backpressure)
+    emit_scenario("reload", reload_continuity)
+    emit_scenario("protocol_smoke", protocol_smoke)
     emit_scenario("settled", settled)
     return 0
 
@@ -1229,11 +1456,14 @@ def parser() -> argparse.ArgumentParser:
     client = sub.add_parser("client")
     client.add_argument("--mode", choices=("churn", "backpressure", "udp", "download"), required=True)
     client.add_argument("--target", required=True)
-    client.add_argument("--port", type=int, required=True)
+    client.add_argument("--port", type=int)
+    client.add_argument("--ports", type=parse_ports)
     client.add_argument("--count", type=int, default=0)
     client.add_argument("--concurrency", type=int, default=1)
     client.add_argument("--slow", type=int, default=0)
     client.add_argument("--connect-retries", type=int, default=0)
+    client.add_argument("--batch-size", type=int)
+    client.add_argument("--batch-pause", type=float, default=0)
     client.add_argument("--samples", type=int, default=1)
     client.add_argument("--path", default="/")
     client.add_argument("--delay-ms", type=float, default=0)
@@ -1262,6 +1492,8 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--controller", default="http://127.0.0.1:9090")
     run.add_argument("--ip-binary", default="ip")
     run.add_argument("--iperf-binary", default="iperf3")
+    run.add_argument("--direct-control-port", type=int, default=5300)
+    run.add_argument("--direct-control-min-mbps", type=float, default=8930)
     run.add_argument("--worker-threads", type=int, default=16)
     run.add_argument("--collect-secs", type=int, default=60)
     run.add_argument("--cold-seconds", type=int, default=130)
@@ -1271,9 +1503,12 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--iperf-port", type=int, default=5205)
     run.add_argument("--iperf-runs", type=int, default=3)
     run.add_argument("--iperf-seconds", type=int, default=8)
-    run.add_argument("--churn-port", type=int, default=18006)
+    run.add_argument("--churn-ports", type=parse_ports, default=CHURN_PORTS)
     run.add_argument("--churn-count", type=int, default=20000)
     run.add_argument("--churn-concurrency", type=int, default=64)
+    run.add_argument("--churn-batch-size", type=int, default=2000)
+    run.add_argument("--churn-batch-pause", type=float, default=1)
+    run.add_argument("--churn-retries", type=int, default=3)
     run.add_argument("--backpressure-port", type=int, default=18007)
     run.add_argument("--slow-count", type=int, default=8)
     run.add_argument("--fast-count", type=int, default=1000)

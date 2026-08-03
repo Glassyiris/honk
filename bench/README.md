@@ -44,8 +44,9 @@ Stdout is a markdown table; raw TSV appends to `/root/bench-results.tsv`.
   harness uses the API listener to identify the *active* engine process
   (a second honk instance parked on the singleton flock reports zero CPU
   and would poison the metrics).
-- Targets on 10.10.10.70: http servers `8001-8006` + `8080`, iperf3
-  servers `5201-5206` + `5300` (direct baseline), UDP echo `:53530`.
+- Targets on 10.10.10.70: HTTP servers `8001-8006` plus churn/reload
+  servers `18006-18007` (`18007/big.bin` is the throttled long stream), iperf3
+  servers `5201-5206` + `5300` (direct control), and UDP echo `53531-53536`.
 
 ## Paired runtime-memory measurements
 
@@ -68,16 +69,24 @@ sudo bench/runtime-memory.sh \
   --output /var/tmp/honk-runtime-memory.jsonl
 ```
 
-Each fresh arm records a 130-second cold curve; 20 SIGHUP reloads (the first
-while hashing a throttled long stream and checking new TCP plus UDP, the other
-19 with a new TCP flow each); AnyTLS open latency and reverse throughput;
-20,000 requests at 64-way concurrency; eight stalled readers beside 1,000 fast
-requests at 16-way concurrency; and a 130-second post-drain curve. Every JSONL
+Each fresh arm records a 130-second cold curve; rejects a direct-path control
+below 8.93 Gbps; measures AnyTLS open latency and reverse throughput; runs
+20,000 requests at 64-way concurrency across all six protocol routes in ten
+2,000-request batches separated by one second (up to three recorded retries
+for transient connection/response timeouts); runs eight stalled readers beside
+1,000 fast requests at 16-way concurrency; verifies 20 SIGHUP reloads (the
+first while hashing a throttled long stream and checking new TCP plus UDP, the
+other 19 with a new TCP flow each); smokes TCP and UDP through all six protocol
+routes; and records a 130-second post-drain curve. Every JSONL
 row carries source, binary, immutable config-snapshot, and benchmark-code identity;
 host policy; RSS/PSS/private-dirty/fault/CPU telemetry; throughput and latency
 quantiles; failures/loss, connection counts, and UDP stats. Engine logs remain in
-`<output>.runs/`; any candidate TCP workload failure emits no partial arm and leaves
+`<output>.runs/`; any TCP workload failure emits no partial arm and leaves
 the output suitable only as failure evidence.
+
+Runtime-memory rows use `schema_version: 2`; `direct_control` and
+`protocol_smoke` are explicit scenario discriminators, not fields folded into
+the proxied throughput row.
 
 For the collector ablation, rerun the same five pairs with both
 `--baseline-collect-secs 0` and `--candidate-collect-secs 0`; do not change THP,
