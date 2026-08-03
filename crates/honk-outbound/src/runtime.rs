@@ -122,32 +122,54 @@ impl QuicRuntime {
 /// the cached reference never invalidates active work.
 #[derive(Debug, Default)]
 struct TlsConnectorSlot {
-    state: parking_lot::Mutex<Option<(Arc<crate::tls::TlsConnector>, Instant)>>,
+    state: parking_lot::Mutex<TlsConnectorSlotState>,
+}
+
+#[derive(Debug, Default)]
+struct TlsConnectorSlotState {
+    cached: Option<(Arc<crate::tls::TlsConnector>, Instant)>,
+    revision: u64,
 }
 
 impl TlsConnectorSlot {
     fn get_or_build(&self, node: &Node) -> anyhow::Result<Arc<crate::tls::TlsConnector>> {
         let mut state = self.state.lock();
-        if let Some((connector, used_at)) = state.as_mut() {
+        state.revision = state.revision.wrapping_add(1);
+        if let Some((connector, used_at)) = state.cached.as_mut() {
             *used_at = Instant::now();
             return Ok(Arc::clone(connector));
         }
         let connector = Arc::new(crate::tls::build_connector(node)?);
-        *state = Some((Arc::clone(&connector), Instant::now()));
+        state.cached = Some((Arc::clone(&connector), Instant::now()));
         Ok(connector)
     }
 
-    fn last_used(&self) -> Option<Instant> {
-        self.state.lock().as_ref().map(|(_, used_at)| *used_at)
+    fn sample(&self) -> Option<(Instant, u64)> {
+        let state = self.state.lock();
+        state
+            .cached
+            .as_ref()
+            .map(|(_, used_at)| (*used_at, state.revision))
     }
 
-    fn evict(&self) -> bool {
-        self.state.lock().take().is_some()
+    fn evict_if_sample(&self, sample: (Instant, u64)) -> bool {
+        let mut state = self.state.lock();
+        let unchanged = state.revision == sample.1
+            && state
+                .cached
+                .as_ref()
+                .is_some_and(|(_, used_at)| *used_at == sample.0);
+        if !unchanged {
+            return false;
+        }
+        state.cached.take();
+        state.revision = state.revision.wrapping_add(1);
+        true
     }
 
     #[cfg(test)]
     fn is_loaded(&self) -> bool {
-        self.state.lock().is_some()
+        self.state.lock().cached.is_some()
     }
 }
 
@@ -188,22 +210,22 @@ impl NodeRuntime {
         runtime.tls.get_or_build(&self.node)
     }
 
-    fn tls_last_used(&self) -> Option<Instant> {
+    fn tls_connector_sample(&self) -> Option<(Instant, u64)> {
         match &self.runtime {
-            ProtocolRuntime::AnyTls(runtime) => runtime.tls.last_used(),
+            ProtocolRuntime::AnyTls(runtime) => runtime.tls.sample(),
             ProtocolRuntime::None | ProtocolRuntime::Quic(_) => None,
         }
     }
 
-    fn evict_tls_connector(&self) -> bool {
+    fn evict_tls_connector_if_sample(&self, sample: (Instant, u64)) -> bool {
         match &self.runtime {
-            ProtocolRuntime::AnyTls(runtime) => runtime.tls.evict(),
+            ProtocolRuntime::AnyTls(runtime) => runtime.tls.evict_if_sample(sample),
             ProtocolRuntime::None | ProtocolRuntime::Quic(_) => false,
         }
     }
 
     #[cfg(test)]
-    fn tls_connector_loaded(&self) -> bool {
+    pub(crate) fn tls_connector_loaded(&self) -> bool {
         match &self.runtime {
             ProtocolRuntime::AnyTls(runtime) => runtime.tls.is_loaded(),
             ProtocolRuntime::None | ProtocolRuntime::Quic(_) => false,
@@ -319,14 +341,18 @@ impl OutboundRuntimeRegistry {
         let mut loaded: Vec<_> = self
             .nodes
             .values()
-            .filter_map(|runtime| runtime.tls_last_used().map(|used_at| (used_at, runtime)))
+            .filter_map(|runtime| {
+                runtime
+                    .tls_connector_sample()
+                    .map(|sample| (sample, runtime))
+            })
             .collect();
-        loaded.sort_unstable_by_key(|(used_at, _)| std::cmp::Reverse(*used_at));
+        loaded.sort_unstable_by_key(|((used_at, _), _)| std::cmp::Reverse(*used_at));
 
         let mut evicted = 0;
-        for (index, (used_at, runtime)) in loaded.into_iter().enumerate() {
-            if (index >= target || now.saturating_duration_since(used_at) >= TLS_IDLE_RETENTION)
-                && runtime.evict_tls_connector()
+        for (index, (sample, runtime)) in loaded.into_iter().enumerate() {
+            if (index >= target || now.saturating_duration_since(sample.0) >= TLS_IDLE_RETENTION)
+                && runtime.evict_tls_connector_if_sample(sample)
             {
                 evicted += 1;
             }
@@ -402,6 +428,22 @@ mod tests {
             .anytls_tls_connector()
             .unwrap();
         assert!(!Arc::ptr_eq(&first_connector, &reloaded_connector));
+    }
+
+    #[test]
+    fn refreshed_connector_rejects_stale_reaper_sample() {
+        let node = node("anytls", NodeProtocol::AnyTLS);
+        let slot = TlsConnectorSlot::default();
+        let first = slot.get_or_build(&node).unwrap();
+        let stale_sample = slot.sample().unwrap();
+
+        let refreshed = slot.get_or_build(&node).unwrap();
+        assert!(Arc::ptr_eq(&first, &refreshed));
+        assert!(!slot.evict_if_sample(stale_sample));
+        assert!(slot.is_loaded());
+
+        assert!(slot.evict_if_sample(slot.sample().unwrap()));
+        assert!(!slot.is_loaded());
     }
 
     #[test]

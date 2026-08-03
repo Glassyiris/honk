@@ -25,8 +25,7 @@ use async_trait::async_trait;
 use honk_config::node::Node;
 use honk_config::types::NodeProtocol;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -77,14 +76,13 @@ const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30;
 /// Per-stream demux queue depth (frames). A full queue parks frames in
 /// the session overflow instead of blocking the demux.
 const STREAM_QUEUE_CAP: usize = 64;
-/// Total overflow frames parked across a session. A stream that keeps
-/// overflowing past this is killed (a genuinely stuck consumer); the cap
-/// bounds the memory a slow stream can pin.
+/// Total overflow events parked across a session.
 const SESSION_OVERFLOW_CAP: usize = 512;
-/// How long the demux waits at the overflow cap before killing the
-/// stream — sized so a healthy initial flight (drains in milliseconds)
-/// never trips it; only a consumer stuck for this long is killed.
-const OVERFLOW_STALL_TIMEOUT: Duration = Duration::from_secs(3);
+/// Payload retained for one stalled stream after its normal queue fills.
+const STREAM_OVERFLOW_BYTES_CAP: usize = 2 * 1024 * 1024;
+/// Payload retained across all stalled streams on one session.
+const SESSION_OVERFLOW_BYTES_CAP: usize = 8 * 1024 * 1024;
+const MAX_STREAM_ERROR_SOURCE_BYTES: usize = 1024;
 
 /// Transport halves behind trait objects so tests can drive a session over
 /// an in-memory duplex instead of a real TLS connection.
@@ -100,34 +98,38 @@ pub struct AnyTlsHandler {
     fallback_pool: std::sync::OnceLock<Arc<AnyTlsPool>>,
 }
 
+struct CapturedAnyTlsRuntime {
+    runtime: Arc<crate::runtime::NodeRuntime>,
+    pool: Arc<AnyTlsPool>,
+}
+
 impl AnyTlsHandler {
+    fn captured_runtime(&self, node: &Node) -> anyhow::Result<Option<CapturedAnyTlsRuntime>> {
+        let Some(cell) = self.runtime_registry.read().as_ref().cloned() else {
+            return Ok(None);
+        };
+        let runtime = cell
+            .read()
+            .get(&node.id)
+            .ok_or_else(|| anyhow::anyhow!("node '{}' not in runtime registry", node.name))?;
+        let pool = match &runtime.runtime {
+            crate::runtime::ProtocolRuntime::AnyTls(runtime) => Arc::clone(&runtime.pool),
+            crate::runtime::ProtocolRuntime::None | crate::runtime::ProtocolRuntime::Quic(_) => {
+                anyhow::bail!("node '{}' has no AnyTLS runtime", runtime.node.name)
+            }
+        };
+        Ok(Some(CapturedAnyTlsRuntime { runtime, pool }))
+    }
+
     /// The session pool for `node`: its runtime-registry pool when the
     /// control plane installed one, otherwise this handler's own.
     fn node_pool(&self, node: &Node) -> anyhow::Result<Arc<AnyTlsPool>> {
-        if let Some(cell) = self.runtime_registry.read().as_ref() {
-            let runtime = cell
-                .read()
-                .get(&node.id)
-                .ok_or_else(|| anyhow::anyhow!("node '{}' not in runtime registry", node.name))?;
-            return match &runtime.runtime {
-                crate::runtime::ProtocolRuntime::AnyTls(rt) => Ok(Arc::clone(&rt.pool)),
-                crate::runtime::ProtocolRuntime::None
-                | crate::runtime::ProtocolRuntime::Quic(_) => Err(anyhow::anyhow!(
-                    "node '{}' has no AnyTLS runtime",
-                    node.name
-                )),
-            };
+        if let Some(captured) = self.captured_runtime(node)? {
+            return Ok(captured.pool);
         }
         Ok(Arc::clone(self.fallback_pool.get_or_init(|| {
             Arc::new(crate::session::SessionPool::new(session_pool_config()))
         })))
-    }
-
-    fn node_runtime(&self, node: &Node) -> Option<Arc<crate::runtime::NodeRuntime>> {
-        self.runtime_registry
-            .read()
-            .as_ref()
-            .and_then(|cell| cell.read().get(&node.id))
     }
 }
 
@@ -161,22 +163,228 @@ static SESSION_SEQ: AtomicU64 = AtomicU64::new(1);
 /// Inbound events delivered from the session demux to a stream task.
 #[derive(Debug)]
 enum StreamEvent {
-    /// Server payload for this stream.
     Data(Vec<u8>),
-    /// Server closed the stream (clean FIN).
     Fin,
-    /// Stream-level failure: server-reported open error (SYNACK with
-    /// data) or a local HOL kill. Surfaces as a read error, not a clean
-    /// EOF (a truncated TCP stream must never look like a clean close).
-    Error(Arc<anyhow::Error>),
+    Error(Arc<str>),
+}
+
+impl StreamEvent {
+    fn payload_len(&self) -> usize {
+        match self {
+            Self::Data(data) => data.len(),
+            Self::Fin | Self::Error(_) => 0,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct OverflowUsage {
+    frames: usize,
+    bytes: usize,
+}
+
+#[derive(Default)]
+struct StreamOverflow {
+    events: VecDeque<StreamEvent>,
+    frames: usize,
+    bytes: usize,
+    first_parked_at: Option<tokio::time::Instant>,
+}
+
+#[derive(Default)]
+struct OverflowState {
+    streams: HashMap<u32, StreamOverflow>,
+    frames: usize,
+    bytes: usize,
+    flushing: HashSet<u32>,
+    flush_requested: HashSet<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OverflowLimit {
+    SessionFrames,
+    StreamBytes,
+    SessionBytes,
+}
+
+impl OverflowLimit {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SessionFrames => "session_frames",
+            Self::StreamBytes => "stream_bytes",
+            Self::SessionBytes => "session_bytes",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OverflowVictim {
+    sid: u32,
+    limit: OverflowLimit,
+    session: OverflowUsage,
+    stream: OverflowUsage,
+    stalled_for: Duration,
+}
+
+impl OverflowState {
+    fn has(&self, sid: u32) -> bool {
+        self.streams.contains_key(&sid)
+    }
+
+    fn usage(&self) -> OverflowUsage {
+        OverflowUsage {
+            frames: self.frames,
+            bytes: self.bytes,
+        }
+    }
+
+    fn stream_usage(&self, sid: u32) -> OverflowUsage {
+        self.streams
+            .get(&sid)
+            .map(|stream| OverflowUsage {
+                frames: stream.frames,
+                bytes: stream.bytes,
+            })
+            .unwrap_or_default()
+    }
+
+    fn limit_for(&self, sid: u32, event: &StreamEvent) -> Option<OverflowLimit> {
+        let bytes = event.payload_len();
+        if bytes != 0
+            && self.stream_usage(sid).bytes.saturating_add(bytes) > STREAM_OVERFLOW_BYTES_CAP
+        {
+            return Some(OverflowLimit::StreamBytes);
+        }
+        if bytes != 0 && self.bytes.saturating_add(bytes) > SESSION_OVERFLOW_BYTES_CAP {
+            return Some(OverflowLimit::SessionBytes);
+        }
+        (self.frames >= SESSION_OVERFLOW_CAP).then_some(OverflowLimit::SessionFrames)
+    }
+
+    fn stalled_for(&self, sid: u32) -> Duration {
+        self.streams
+            .get(&sid)
+            .and_then(|stream| stream.first_parked_at)
+            .map(|started| started.elapsed())
+            .unwrap_or_default()
+    }
+
+    fn first_parked_at(&self, sid: u32) -> Option<tokio::time::Instant> {
+        self.streams
+            .get(&sid)
+            .and_then(|stream| stream.first_parked_at)
+    }
+
+    fn restore_first_parked_at(&mut self, sid: u32, started: Option<tokio::time::Instant>) {
+        if let (Some(stream), Some(started)) = (self.streams.get_mut(&sid), started) {
+            stream.first_parked_at = Some(started);
+        }
+    }
+
+    fn push_back(&mut self, sid: u32, event: StreamEvent) {
+        let bytes = event.payload_len();
+        let stream = self.streams.entry(sid).or_default();
+        stream
+            .first_parked_at
+            .get_or_insert_with(tokio::time::Instant::now);
+        stream.events.push_back(event);
+        stream.frames += 1;
+        stream.bytes += bytes;
+        self.frames += 1;
+        self.bytes += bytes;
+    }
+
+    fn push_front(&mut self, sid: u32, event: StreamEvent) {
+        let bytes = event.payload_len();
+        let stream = self.streams.entry(sid).or_default();
+        stream
+            .first_parked_at
+            .get_or_insert_with(tokio::time::Instant::now);
+        stream.events.push_front(event);
+        stream.frames += 1;
+        stream.bytes += bytes;
+        self.frames += 1;
+        self.bytes += bytes;
+    }
+
+    fn pop_front(&mut self, sid: u32) -> Option<StreamEvent> {
+        let (event, empty) = {
+            let stream = self.streams.get_mut(&sid)?;
+            let event = stream.events.pop_front()?;
+            let bytes = event.payload_len();
+            stream.frames -= 1;
+            stream.bytes -= bytes;
+            self.frames -= 1;
+            self.bytes -= bytes;
+            (event, stream.frames == 0)
+        };
+        if empty {
+            self.streams.remove(&sid);
+        }
+        Some(event)
+    }
+
+    fn remove_stream(&mut self, sid: u32) -> OverflowUsage {
+        let Some(stream) = self.streams.remove(&sid) else {
+            return OverflowUsage::default();
+        };
+        self.frames -= stream.frames;
+        self.bytes -= stream.bytes;
+        OverflowUsage {
+            frames: stream.frames,
+            bytes: stream.bytes,
+        }
+    }
+
+    fn clear(&mut self) -> OverflowUsage {
+        let usage = self.usage();
+        self.streams.clear();
+        self.frames = 0;
+        self.bytes = 0;
+        usage
+    }
+
+    fn largest_stream(&self, limit: OverflowLimit) -> Option<u32> {
+        self.streams
+            .iter()
+            .max_by_key(|(sid, stream)| match limit {
+                OverflowLimit::SessionFrames => (stream.frames, stream.bytes, **sid),
+                OverflowLimit::StreamBytes | OverflowLimit::SessionBytes => {
+                    (stream.bytes, stream.frames, **sid)
+                }
+            })
+            .map(|(sid, _)| *sid)
+    }
+
+    fn request_flush(&mut self, sid: u32) -> bool {
+        if self.flushing.insert(sid) {
+            true
+        } else {
+            self.flush_requested.insert(sid);
+            false
+        }
+    }
+
+    fn finish_flush(&mut self, sid: u32) -> bool {
+        if self.flush_requested.remove(&sid) {
+            true
+        } else {
+            self.flushing.remove(&sid);
+            false
+        }
+    }
+
+    fn cancel_flush(&mut self, sid: u32) {
+        self.flushing.remove(&sid);
+        self.flush_requested.remove(&sid);
+    }
 }
 
 /// Per-stream demux delivery channel.
 #[derive(Clone)]
 enum StreamSink {
     /// TCP streams: bounded queue plus the session overflow. Payload is
-    /// retained in order; a consumer that pins the shared overflow at its
-    /// cap past `OVERFLOW_STALL_TIMEOUT` gets only its own stream killed.
+    /// retained in order until a hard overflow cap selects and resets only
+    /// the offending stream.
     Tcp(mpsc::Sender<StreamEvent>),
     /// UoT streams: drop-on-full (UDP semantics) — a slow consumer must
     /// never backpressure the session demux, or one hot UDP flow wedges
@@ -212,8 +420,8 @@ impl StreamSink {
 
     /// Deliver a stream-level failure (open error). Same delivery
     /// semantics as FIN: never dropped for TCP.
-    async fn send_error(&self, err: anyhow::Error) {
-        let event = StreamEvent::Error(Arc::new(err));
+    async fn send_error(&self, message: Arc<str>) {
+        let event = StreamEvent::Error(message);
         match self {
             StreamSink::Tcp(tx) => {
                 let _ = tx.send(event).await;
@@ -258,6 +466,7 @@ impl Drop for StreamRegistration {
             return;
         }
         self.session.streams.lock().unwrap().remove(&self.sid);
+        self.session.discard_overflow(self.sid);
         if self.frame_started {
             // The opening frames are already queued (the writer queue
             // makes partial frames impossible): clean up the server's
@@ -470,14 +679,9 @@ pub(crate) struct AnyTlsSession {
     /// Streams killed locally (HOL slow-consumer): their readers see a
     /// reset after the queued data drains, not a clean EOF.
     killed_streams: Mutex<HashSet<u32>>,
-    /// Session overflow for stalled TCP sinks: frames a full per-stream
-    /// queue can't take are parked here (ordered per sid). The demux remains
-    /// non-blocking below [`SESSION_OVERFLOW_CAP`]; at the cap it waits up to
-    /// [`OVERFLOW_STALL_TIMEOUT`] before killing only the stalled stream.
-    overflow: Mutex<std::collections::VecDeque<(u32, StreamEvent)>>,
-    /// Wakes the demux when the reader frees overflow space (used only at
-    /// the shared overflow cap — see `park_overflow`).
-    overflow_notify: tokio::sync::Notify,
+    /// Per-stream ordered overflow for full TCP queues, with exact session
+    /// and stream frame/byte accounting.
+    overflow: parking_lot::Mutex<OverflowState>,
     /// Stream-slot capacity: the single capacity truth (replaces the old
     /// active_streams counter — a permit outlives the counter's races).
     stream_permits: Arc<tokio::sync::Semaphore>,
@@ -513,8 +717,7 @@ impl AnyTlsSession {
             session_state: AtomicUsize::new(crate::session::SessionState::Active as usize),
             terminal_error: std::sync::OnceLock::new(),
             killed_streams: Mutex::new(HashSet::new()),
-            overflow: Mutex::new(std::collections::VecDeque::new()),
-            overflow_notify: tokio::sync::Notify::new(),
+            overflow: parking_lot::Mutex::new(OverflowState::default()),
             stream_permits: Arc::new(tokio::sync::Semaphore::new(MAX_STREAMS_PER_SESSION)),
             demux: Mutex::new(None),
         });
@@ -771,7 +974,7 @@ impl AnyTlsSession {
     async fn end_stream(&self, sid: u32, notify_fin: bool) {
         let was_registered = self.streams.lock().unwrap().remove(&sid).is_some();
         // A dead stream's parked frames go with it.
-        self.overflow.lock().unwrap().retain(|(s, _)| *s != sid);
+        self.discard_overflow(sid);
         // No FIN back when the server already closed its side (dispatch_fin
         // leaves the entry registered; `notify_fin` distinguishes the
         // client-initiated close) or when the whole session is gone.
@@ -802,6 +1005,7 @@ impl AnyTlsSession {
             Ordering::Release,
         );
         self.streams.lock().unwrap().clear();
+        self.clear_overflow();
         if let Some(handle) = self.demux.lock().unwrap().take() {
             handle.abort();
         }
@@ -816,15 +1020,14 @@ impl AnyTlsSession {
     /// **non-blocking**: a full per-stream queue parks the frame in the
     /// session overflow (flushed later by the reader's progress — see
     /// [`Self::flush_overflow`]), so one stalled stream never pauses the
-    /// demux for the others. A stream that keeps overflowing past
-    /// [`SESSION_OVERFLOW_CAP`] is killed (FIN to the server, reset to
-    /// the reader after its queued data drains). UoT sinks drop on full
-    /// (UDP semantics).
+    /// demux for the others. Hard frame or byte pressure immediately evicts
+    /// the applicable stalled stream; waiting at a hard cap would stall every
+    /// stream on the multiplexed connection. UoT sinks drop on full.
     async fn dispatch_data(&self, sid: u32, data: Vec<u8>) {
         // Ordering: if this sid already has parked frames, the new frame
         // goes behind them, never past them.
         if self.overflow_has(sid) {
-            self.park_overflow(sid, StreamEvent::Data(data)).await;
+            self.park_overflow(sid, StreamEvent::Data(data));
             return;
         }
         let sink = self.streams.lock().unwrap().get(&sid).cloned();
@@ -832,16 +1035,18 @@ impl AnyTlsSession {
             Some(StreamSink::Tcp(tx)) => match tx.try_send(StreamEvent::Data(data)) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(ev)) => {
-                    self.park_overflow(sid, ev).await;
+                    self.park_overflow(sid, ev);
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     self.streams.lock().unwrap().remove(&sid);
+                    self.discard_overflow(sid);
                 }
             },
             Some(sink) => {
                 if !sink.send_data(data).await {
                     // Stream task died without unregistering; clean up.
                     self.streams.lock().unwrap().remove(&sid);
+                    self.discard_overflow(sid);
                 }
             }
             None => {
@@ -855,112 +1060,198 @@ impl AnyTlsSession {
         }
     }
 
-    /// Whether the sid has frames parked in the session overflow.
-    fn overflow_has(&self, sid: u32) -> bool {
-        self.overflow.lock().unwrap().iter().any(|(s, _)| *s == sid)
+    fn overflow_sink_is_live(&self, sid: u32) -> bool {
+        let live = matches!(
+            self.streams.lock().unwrap().get(&sid),
+            Some(StreamSink::Tcp(tx)) if !tx.is_closed()
+        );
+        if !live {
+            self.streams.lock().unwrap().remove(&sid);
+        }
+        live
     }
 
-    /// Park a frame in the session overflow. At the shared cap the demux
-    /// waits (only there — never below it) for the reader to free space;
-    /// a consumer still stuck after [`OVERFLOW_STALL_TIMEOUT`] is killed
-    /// (FIN to the server, queued data drains before the reset).
-    async fn park_overflow(&self, sid: u32, ev: StreamEvent) {
-        loop {
-            let len = {
-                let mut overflow = self.overflow.lock().unwrap();
-                if overflow.len() < SESSION_OVERFLOW_CAP {
-                    overflow.push_back((sid, ev));
-                    return;
-                }
-                overflow.len()
-            };
-            let _ = len;
-            // At the cap: wait for the reader to drain (any flush wakes
-            // us) — a fast flow's initial flight drains in milliseconds,
-            // so this wait only ever fires for genuinely stuck readers.
-            if tokio::time::timeout(OVERFLOW_STALL_TIMEOUT, self.overflow_notify.notified())
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
+    fn overflow_has(&self, sid: u32) -> bool {
+        self.overflow.lock().has(sid)
+    }
+
+    fn discard_overflow(&self, sid: u32) -> OverflowUsage {
+        self.overflow.lock().remove_stream(sid)
+    }
+
+    fn clear_overflow(&self) -> OverflowUsage {
+        self.overflow.lock().clear()
+    }
+
+    fn kill_overflow_victim(&self, victim: OverflowVictim) {
+        let stall_ms = u64::try_from(victim.stalled_for.as_millis()).unwrap_or(u64::MAX);
+        let queue_capacity = match self.streams.lock().unwrap().get(&victim.sid) {
+            Some(StreamSink::Tcp(tx)) => tx.capacity(),
+            Some(StreamSink::Uot(_)) | None => 0,
+        };
         warn!(
-            "AnyTLS session {} sid={} killed: overflow at {} frames past {:?} (stuck consumer)",
-            self.seq, sid, SESSION_OVERFLOW_CAP, OVERFLOW_STALL_TIMEOUT
+            session = self.seq,
+            victim_sid = victim.sid,
+            cap_reason = victim.limit.as_str(),
+            session_frames = victim.session.frames,
+            session_bytes = victim.session.bytes,
+            stream_frames = victim.stream.frames,
+            stream_bytes = victim.stream.bytes,
+            stall_ms,
+            queue_capacity,
+            "AnyTLS slow consumer overflow killed stream at hard cap"
         );
-        self.overflow.lock().unwrap().retain(|(s, _)| *s != sid);
-        self.killed_streams.lock().unwrap().insert(sid);
-        self.streams.lock().unwrap().remove(&sid);
+        self.killed_streams.lock().unwrap().insert(victim.sid);
+        self.streams.lock().unwrap().remove(&victim.sid);
         if self
-            .enqueue_control(CMD_FIN, sid, bytes::Bytes::new())
+            .enqueue_control(CMD_FIN, victim.sid, bytes::Bytes::new())
             .is_err()
         {
             self.fail(anyhow::anyhow!("writer queue unavailable on overflow kill"));
         }
     }
 
-    /// Move parked frames for `sid` from the session overflow into the
-    /// stream's queue while it has space. Called by the stream's reader
-    /// after it consumes events (its progress is the drain signal, and
-    /// wakes any demux waiting at the overflow cap).
+    /// Park an event without ever waiting in the single session demux.
+    fn park_overflow(&self, sid: u32, event: StreamEvent) {
+        loop {
+            if !self.overflow_sink_is_live(sid) {
+                self.discard_overflow(sid);
+                return;
+            }
+
+            let victim = {
+                let mut overflow = self.overflow.lock();
+                let Some(limit) = overflow.limit_for(sid, &event) else {
+                    overflow.push_back(sid, event);
+                    drop(overflow);
+                    self.flush_overflow(sid);
+                    if !self.overflow_sink_is_live(sid) {
+                        self.discard_overflow(sid);
+                    }
+                    return;
+                };
+                let victim_sid = match limit {
+                    OverflowLimit::StreamBytes => sid,
+                    OverflowLimit::SessionFrames | OverflowLimit::SessionBytes => {
+                        overflow.largest_stream(limit).unwrap_or(sid)
+                    }
+                };
+                let victim = OverflowVictim {
+                    sid: victim_sid,
+                    limit,
+                    session: overflow.usage(),
+                    stream: overflow.stream_usage(victim_sid),
+                    stalled_for: overflow.stalled_for(victim_sid),
+                };
+                overflow.remove_stream(victim_sid);
+                victim
+            };
+
+            self.kill_overflow_victim(victim);
+            if victim.sid == sid {
+                return;
+            }
+        }
+    }
+
+    /// Move one sid's parked events into its queue without scanning siblings.
     fn flush_overflow(&self, sid: u32) {
-        let mut moved = false;
+        {
+            let mut overflow = self.overflow.lock();
+            if !overflow.has(sid) || !overflow.request_flush(sid) {
+                return;
+            }
+        }
+
         loop {
             let tx = match self.streams.lock().unwrap().get(&sid).cloned() {
                 Some(StreamSink::Tcp(tx)) => tx,
-                _ => break,
-            };
-            let ev = {
-                let mut overflow = self.overflow.lock().unwrap();
-                let Some(pos) = overflow.iter().position(|(s, _)| *s == sid) else {
-                    break;
-                };
-                overflow.remove(pos).expect("position checked").1
-            };
-            match tx.try_send(ev) {
-                Ok(()) => {
-                    moved = true;
+                _ => {
+                    let mut overflow = self.overflow.lock();
+                    overflow.remove_stream(sid);
+                    overflow.cancel_flush(sid);
+                    drop(overflow);
+                    return;
                 }
-                Err(mpsc::error::TrySendError::Full(ev)) => {
-                    // Put it back at the front and stop — try again on the
-                    // reader's next progress.
-                    self.overflow.lock().unwrap().push_front((sid, ev));
+            };
+
+            let mut overflow = self.overflow.lock();
+            let first_parked_at = overflow.first_parked_at(sid);
+            let Some(event) = overflow.pop_front(sid) else {
+                if overflow.finish_flush(sid) {
+                    drop(overflow);
+                    continue;
+                }
+                drop(overflow);
+                break;
+            };
+            match tx.try_send(event) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(event)) => {
+                    overflow.push_front(sid, event);
+                    overflow.restore_first_parked_at(sid, first_parked_at);
+                    if overflow.finish_flush(sid) {
+                        drop(overflow);
+                        continue;
+                    }
+                    drop(overflow);
                     break;
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
+                    overflow.remove_stream(sid);
+                    overflow.cancel_flush(sid);
+                    drop(overflow);
                     self.streams.lock().unwrap().remove(&sid);
-                    break;
+                    return;
                 }
             }
         }
-        if moved {
-            self.overflow_notify.notify_waiters();
-        }
     }
 
-    /// Deliver a server FIN to its consumer. A FIN for a stream with parked
-    /// overflow frames rides the overflow so data stays ahead of it.
     async fn dispatch_fin(&self, sid: u32) {
         if self.overflow_has(sid) {
-            self.overflow
-                .lock()
-                .unwrap()
-                .push_back((sid, StreamEvent::Fin));
+            self.park_overflow(sid, StreamEvent::Fin);
             return;
         }
         let sink = self.streams.lock().unwrap().get(&sid).cloned();
-        if let Some(sink) = sink {
-            sink.send_fin().await;
+        match sink {
+            Some(StreamSink::Tcp(tx)) => match tx.try_send(StreamEvent::Fin) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(event)) => {
+                    self.park_overflow(sid, event);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.streams.lock().unwrap().remove(&sid);
+                    self.discard_overflow(sid);
+                }
+            },
+            Some(sink) => sink.send_fin().await,
+            None => {}
         }
     }
 
-    /// Deliver a stream-level failure (server-reported open error): the
-    /// reader sees an error, not a clean EOF.
-    async fn dispatch_error(&self, sid: u32, err: anyhow::Error) {
+    async fn dispatch_error(&self, sid: u32, message: Arc<str>) {
+        if self.overflow_has(sid) {
+            self.park_overflow(sid, StreamEvent::Error(message));
+            return;
+        }
         let sink = self.streams.lock().unwrap().get(&sid).cloned();
-        if let Some(sink) = sink {
-            sink.send_error(err).await;
+        match sink {
+            Some(StreamSink::Tcp(tx)) => {
+                let event = StreamEvent::Error(message);
+                match tx.try_send(event) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(event)) => {
+                        self.park_overflow(sid, event);
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        self.streams.lock().unwrap().remove(&sid);
+                        self.discard_overflow(sid);
+                    }
+                }
+            }
+            Some(sink) => sink.send_error(message).await,
+            None => {}
         }
     }
 }
@@ -982,23 +1273,22 @@ async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedReader) {
             CMD_PSH => session.dispatch_data(sid, data).await,
             CMD_FIN => session.dispatch_fin(sid).await,
             CMD_SYNACK => {
-                // sing: a SYNACK carrying data reports a dial error for the
-                // stream (an empty SYNACK is a pure handshake ack — ignore).
-                // The target refused — a typed stream error, not a clean
-                // EOF (the session stays healthy).
                 if !data.is_empty() {
+                    let shown = &data[..data.len().min(MAX_STREAM_ERROR_SOURCE_BYTES)];
+                    let suffix = if shown.len() == data.len() {
+                        ""
+                    } else {
+                        " [truncated]"
+                    };
+                    let message: Arc<str> = Arc::from(format!(
+                        "target refused: {}{suffix}",
+                        String::from_utf8_lossy(shown)
+                    ));
                     debug!(
                         "AnyTLS session {} sid={} remote dial error: {}",
-                        session.seq,
-                        sid,
-                        String::from_utf8_lossy(&data)
+                        session.seq, sid, message
                     );
-                    session
-                        .dispatch_error(
-                            sid,
-                            anyhow::anyhow!("target refused: {}", String::from_utf8_lossy(&data)),
-                        )
-                        .await;
+                    session.dispatch_error(sid, message).await;
                 }
             }
             CMD_HEART_REQUEST => {
@@ -1179,7 +1469,11 @@ impl AnyTlsHandler {
         format!("v=2\nclient=dae\npadding-md5={}\n", md5).into_bytes()
     }
     /// Lazily start the pool janitor for this node (once per pool).
-    fn ensure_janitor(node: &Node, pool: &Arc<AnyTlsPool>) {
+    fn ensure_janitor(
+        node: &Node,
+        pool: &Arc<AnyTlsPool>,
+        runtime: Option<Arc<crate::runtime::NodeRuntime>>,
+    ) {
         // Always run the janitor: it pre-establishes min_idle sessions
         // (default 1) and, just as importantly, reaps idle-expired ones —
         // skipping it entirely leaks idle sessions into the pool forever.
@@ -1198,7 +1492,14 @@ impl AnyTlsHandler {
         pool.ensure_janitor(POOL_KEY, min_idle, idle_timeout, move || {
             let node = prewarm_node.clone();
             let label = label.clone();
-            async move { dial_session(&node, &label, Duration::from_secs(10), None).await }
+            let runtime = runtime.clone();
+            async move {
+                let tls_connector = runtime
+                    .as_ref()
+                    .map(|runtime| runtime.anytls_tls_connector())
+                    .transpose()?;
+                dial_session(&node, &label, Duration::from_secs(10), tls_connector).await
+            }
         });
     }
 
@@ -1224,7 +1525,7 @@ impl AnyTlsHandler {
             }
         };
         let already_ready = pool.has_usable_session(POOL_KEY);
-        Self::ensure_janitor(&runtime.node, &pool);
+        Self::ensure_janitor(&runtime.node, &pool, Some(Arc::clone(&runtime)));
         let _session = pool.offer(POOL_KEY, dial).await?;
         if !pool.has_usable_session(POOL_KEY) {
             anyhow::bail!("AnyTLS warm dial completed without a usable session");
@@ -1244,9 +1545,26 @@ impl AnyTlsHandler {
         target_addr: &[u8],
         connect_timeout: Duration,
     ) -> anyhow::Result<AnyTlsStream> {
-        let pool = self.node_pool(node)?;
-        let runtime = self.node_runtime(node);
-        self.open_pooled_stream_for_pool(node, pool, addr, target_addr, connect_timeout, runtime)
+        if let Some(captured) = self.captured_runtime(node)? {
+            let runtime = captured.runtime;
+            let runtime_node = Arc::clone(&runtime.node);
+            let runtime_addr = format!("{}:{}", runtime_node.host(), runtime_node.port);
+            return self
+                .open_pooled_stream_for_pool(
+                    runtime_node.as_ref(),
+                    captured.pool,
+                    &runtime_addr,
+                    target_addr,
+                    connect_timeout,
+                    Some(runtime),
+                )
+                .await;
+        }
+        let pool = Arc::clone(
+            self.fallback_pool
+                .get_or_init(|| Arc::new(crate::session::SessionPool::new(session_pool_config()))),
+        );
+        self.open_pooled_stream_for_pool(node, pool, addr, target_addr, connect_timeout, None)
             .await
     }
 
@@ -1261,7 +1579,7 @@ impl AnyTlsHandler {
         connect_timeout: Duration,
         runtime: Option<Arc<crate::runtime::NodeRuntime>>,
     ) -> anyhow::Result<AnyTlsStream> {
-        Self::ensure_janitor(node, &pool);
+        Self::ensure_janitor(node, &pool, runtime.clone());
         // The dial future must be 'static (pool-owned dial task) and the
         // closure Clone (open_with retries once): own clones.
         let dial_node = node.clone();
@@ -1305,8 +1623,8 @@ impl AnyTlsHandler {
         .await
     }
 
-    /// Compatibility seam for focused tests and callers that intentionally
-    /// use the handler's currently installed runtime registry.
+    /// Keeps cancellation observable without opening a physical session.
+    #[cfg(test)]
     async fn dial_udp_transport_speculative_with<F, Fut>(
         &self,
         node: &Node,
@@ -1320,12 +1638,13 @@ impl AnyTlsHandler {
         Fut: std::future::Future<Output = anyhow::Result<Arc<AnyTlsSession>>> + Send,
     {
         let pool = self.node_pool(node)?;
-        self.dial_udp_transport_speculative_for_pool_with(
+        Self::dial_udp_transport_speculative_for_pool_with(
             node,
             pool,
             target,
             target_domain,
             connect_timeout,
+            None,
             dial,
         )
         .await
@@ -1335,12 +1654,12 @@ impl AnyTlsHandler {
     /// publishing a detached session or starting the janitor. The injected
     /// dial seam keeps cancellation observable in tests.
     async fn dial_udp_transport_speculative_for_pool_with<F, Fut>(
-        &self,
         node: &Node,
         pool: Arc<AnyTlsPool>,
         target: SocketAddr,
         target_domain: Option<&str>,
         connect_timeout: Duration,
+        runtime: Option<Arc<crate::runtime::NodeRuntime>>,
         dial: F,
     ) -> anyhow::Result<PreparedUdpTransport>
     where
@@ -1405,17 +1724,98 @@ impl AnyTlsHandler {
         if let Some(reservation) = detached {
             let commit_node = node.clone();
             let commit_pool = Arc::clone(&pool);
+            let commit_runtime = runtime.clone();
             return Ok(PreparedUdpTransport::new(transport, move || {
                 reservation.commit()?;
-                Self::ensure_janitor(&commit_node, &commit_pool);
+                Self::ensure_janitor(&commit_node, &commit_pool, commit_runtime);
                 Ok(())
             }));
         }
 
         let commit_node = node.clone();
         Ok(PreparedUdpTransport::new(transport, move || {
-            Self::ensure_janitor(&commit_node, &pool);
+            Self::ensure_janitor(&commit_node, &pool, runtime);
             Ok(())
+        }))
+    }
+
+    async fn dial_udp_transport_for_pool(
+        &self,
+        node: Arc<Node>,
+        pool: Arc<AnyTlsPool>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        runtime: Option<Arc<crate::runtime::NodeRuntime>>,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        if let Some(network) = &node.network
+            && !network
+                .split(',')
+                .any(|entry| entry.trim().eq_ignore_ascii_case("udp"))
+        {
+            anyhow::bail!("node '{}' does not allow UDP", node.name);
+        }
+
+        let addr = format!("{}:{}", node.host(), node.port);
+        let magic = addr::encode_address("0.0.0.0:0".parse().unwrap(), Some(UOT_MAGIC));
+        Self::ensure_janitor(node.as_ref(), &pool, runtime.clone());
+        let dial_node = Arc::clone(&node);
+        let dial_addr = addr.clone();
+        let (session, sid, rx, mut guard) = pool
+            .open_with(
+                POOL_KEY,
+                move || {
+                    let node = Arc::clone(&dial_node);
+                    let addr = dial_addr.clone();
+                    let runtime = runtime.clone();
+                    async move {
+                        let tls_connector = runtime
+                            .as_ref()
+                            .map(|runtime| runtime.anytls_tls_connector())
+                            .transpose()?;
+                        dial_session(node.as_ref(), &addr, connect_timeout, tls_connector).await
+                    }
+                },
+                move |session, permit| {
+                    let magic = magic.clone();
+                    async move {
+                        match session.open_uot_stream(magic, permit).await {
+                            Ok((sid, rx, guard)) => Ok((session, sid, rx, guard)),
+                            Err(error) => Err(if session.is_closed() {
+                                crate::session::OpenError::Session(error)
+                            } else {
+                                crate::session::OpenError::Refused(error)
+                            }),
+                        }
+                    }
+                },
+            )
+            .await?;
+
+        let mut request = vec![1u8];
+        request.extend(addr::encode_address(target, target_domain));
+        guard.frame_started = true;
+        let request_written = tokio::time::timeout(
+            connect_timeout,
+            session.write_uot_setup_frame(sid, &request),
+        )
+        .await;
+        match request_written {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(error.into()),
+            Err(elapsed) => return Err(elapsed.into()),
+        }
+        guard.frame_started = false;
+        let permit = guard.commit();
+
+        Ok(Arc::new(AnyTlsUotTransport {
+            session,
+            sid,
+            rx: tokio::sync::Mutex::new(rx),
+            mode: tokio::sync::Mutex::new(None),
+            target,
+            target_domain: target_domain.map(str::to_string),
+            _permit: permit,
         }))
     }
 }
@@ -2010,9 +2410,10 @@ impl ProxyHandler for AnyTlsHandler {
         // tied to the immutable generation supplied by ProxyRegistry.
         let node = Arc::clone(&runtime.node);
         let addr = format!("{}:{}", node.host(), node.port);
-        let tls = runtime.anytls_tls_connector()?;
+        let dial_runtime = Arc::clone(&runtime);
         Self::warm_pool_with(runtime, connect_timeout, move || async move {
-            dial_session(&node, &addr, connect_timeout, Some(tls)).await
+            let tls_connector = dial_runtime.anytls_tls_connector()?;
+            dial_session(&node, &addr, connect_timeout, Some(tls_connector)).await
         })
         .await
     }
@@ -2086,7 +2487,7 @@ impl ProxyHandler for AnyTlsHandler {
         let target_addr = addr::encode_address(target, target_domain);
 
         let pool = self.node_pool(node)?;
-        Self::ensure_janitor(node, &pool);
+        Self::ensure_janitor(node, &pool, None);
         let (read, write, auth, settings) =
             connect_transport(node, &addr, _connect_timeout, Some(tcp), None).await?;
         let session = AnyTlsSession::establish(&addr, read, write, &auth, &settings).await?;
@@ -2110,50 +2511,36 @@ impl ProxyHandler for AnyTlsHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<UdpProxySocket> {
-        // sing-box enforces the network list: no UDP when the node is
-        // tcp-only.
-        if let Some(ref network) = node.network
+        let (dial_node, pool, runtime) = if let Some(captured) = self.captured_runtime(node)? {
+            let runtime = captured.runtime;
+            (Arc::clone(&runtime.node), captured.pool, Some(runtime))
+        } else {
+            let pool =
+                Arc::clone(self.fallback_pool.get_or_init(|| {
+                    Arc::new(crate::session::SessionPool::new(session_pool_config()))
+                }));
+            (Arc::new(node.clone()), pool, None)
+        };
+        if let Some(network) = &dial_node.network
             && !network
                 .split(',')
-                .any(|n| n.trim().eq_ignore_ascii_case("udp"))
+                .any(|entry| entry.trim().eq_ignore_ascii_case("udp"))
         {
-            anyhow::bail!("node '{}' does not allow UDP", node.name);
+            anyhow::bail!("node '{}' does not allow UDP", dial_node.name);
         }
 
-        let addr = format!("{}:{}", node.host(), node.port);
-        // The stream target is the UoT magic address (SOCKS5 address form).
+        let addr = format!("{}:{}", dial_node.host(), dial_node.port);
         let magic = addr::encode_address("0.0.0.0:0".parse().unwrap(), Some(UOT_MAGIC));
-        let pool = self.node_pool(node)?;
-        Self::ensure_janitor(node, &pool);
-        // The loopback compatibility path shares the direct session-backed
-        // stream with the packet transport; it needs no duplex or pump task.
-        let mut stream = {
-            let dial_node = node.clone();
-            let dial_addr = addr.clone();
-            pool.open_with(
-                POOL_KEY,
-                move || {
-                    let node = dial_node.clone();
-                    let addr = dial_addr.clone();
-                    async move { dial_session(&node, &addr, connect_timeout, None).await }
-                },
-                move |session, permit| {
-                    let magic = magic.clone();
-                    async move {
-                        match session.open_stream_direct(magic, permit).await {
-                            Ok(stream) => Ok(stream),
-                            Err(error) => Err(if session.is_closed() {
-                                crate::session::OpenError::Session(error)
-                            } else {
-                                crate::session::OpenError::Refused(error)
-                            }),
-                        }
-                    }
-                },
+        let mut stream = self
+            .open_pooled_stream_for_pool(
+                dial_node.as_ref(),
+                pool,
+                &addr,
+                &magic,
+                connect_timeout,
+                runtime,
             )
-            .await?
-        };
-
+            .await?;
         // UoT request: isConnect=true + destination in SOCKS5 address form.
         // sing's uot.ReadRequest parses the destination with
         // M.SocksaddrSerializer (0x01/0x03/0x04), not the per-packet
@@ -2192,74 +2579,58 @@ impl ProxyHandler for AnyTlsHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        if let Some(ref network) = node.network
-            && !network
-                .split(',')
-                .any(|n| n.trim().eq_ignore_ascii_case("udp"))
-        {
-            anyhow::bail!("node '{}' does not allow UDP", node.name);
+        if let Some(captured) = self.captured_runtime(node)? {
+            let runtime = captured.runtime;
+            let runtime_node = Arc::clone(&runtime.node);
+            return self
+                .dial_udp_transport_for_pool(
+                    runtime_node,
+                    captured.pool,
+                    target,
+                    target_domain,
+                    connect_timeout,
+                    Some(runtime),
+                )
+                .await;
         }
-
-        let addr = format!("{}:{}", node.host(), node.port);
-        let magic = addr::encode_address("0.0.0.0:0".parse().unwrap(), Some(UOT_MAGIC));
-        let pool = self.node_pool(node)?;
-        Self::ensure_janitor(node, &pool);
-        let dial_node = node.clone();
-        let dial_addr = addr.clone();
-        let (session, sid, rx, mut guard) = pool
-            .open_with(
-                POOL_KEY,
-                move || {
-                    let node = dial_node.clone();
-                    let addr = dial_addr.clone();
-                    async move { dial_session(&node, &addr, connect_timeout, None).await }
-                },
-                move |session, permit| {
-                    let magic = magic.clone();
-                    async move {
-                        match session.open_uot_stream(magic, permit).await {
-                            Ok((sid, rx, guard)) => Ok((session, sid, rx, guard)),
-                            Err(error) => Err(if session.is_closed() {
-                                crate::session::OpenError::Session(error)
-                            } else {
-                                crate::session::OpenError::Refused(error)
-                            }),
-                        }
-                    }
-                },
-            )
-            .await?;
-
-        // UoT request: isConnect=true + destination in SOCKS5 address form.
-        // The registration commits only after the request is fully written
-        // and the transport exists; a timeout/cancel/error in between
-        // drops the guard (sid + count cleaned, session closed on a
-        // possibly-partial frame).
-        let mut request = vec![1u8];
-        request.extend(addr::encode_address(target, target_domain));
-        guard.frame_started = true;
-        let request_written = tokio::time::timeout(
-            connect_timeout,
-            session.write_uot_setup_frame(sid, &request),
-        )
-        .await;
-        match request_written {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e.into()),
-            Err(elapsed) => return Err(elapsed.into()),
-        }
-        guard.frame_started = false;
-        let permit = guard.commit();
-
-        Ok(Arc::new(AnyTlsUotTransport {
-            session,
-            sid,
-            rx: tokio::sync::Mutex::new(rx),
-            mode: tokio::sync::Mutex::new(None),
+        let pool = Arc::clone(
+            self.fallback_pool
+                .get_or_init(|| Arc::new(crate::session::SessionPool::new(session_pool_config()))),
+        );
+        self.dial_udp_transport_for_pool(
+            Arc::new(node.clone()),
+            pool,
             target,
-            target_domain: target_domain.map(str::to_string),
-            _permit: permit,
-        }))
+            target_domain,
+            connect_timeout,
+            None,
+        )
+        .await
+    }
+
+    async fn dial_udp_transport_runtime(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        let pool = match &runtime.runtime {
+            crate::runtime::ProtocolRuntime::AnyTls(runtime) => Arc::clone(&runtime.pool),
+            crate::runtime::ProtocolRuntime::None | crate::runtime::ProtocolRuntime::Quic(_) => {
+                anyhow::bail!("AnyTLS node runtime does not own an AnyTLS pool")
+            }
+        };
+        let node = Arc::clone(&runtime.node);
+        self.dial_udp_transport_for_pool(
+            node,
+            pool,
+            target,
+            target_domain,
+            connect_timeout,
+            Some(runtime),
+        )
+        .await
     }
 
     async fn dial_udp_transport_speculative(
@@ -2269,14 +2640,48 @@ impl ProxyHandler for AnyTlsHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<PreparedUdpTransport> {
+        if let Some(captured) = self.captured_runtime(node)? {
+            let runtime = captured.runtime;
+            let runtime_node = Arc::clone(&runtime.node);
+            let dial_runtime = Arc::clone(&runtime);
+            let dial_node = Arc::clone(&runtime_node);
+            let dial_addr = format!("{}:{}", runtime_node.host(), runtime_node.port);
+            return Self::dial_udp_transport_speculative_for_pool_with(
+                runtime_node.as_ref(),
+                captured.pool,
+                target,
+                target_domain,
+                connect_timeout,
+                Some(runtime),
+                move || async move {
+                    let tls_connector = dial_runtime.anytls_tls_connector()?;
+                    dial_session(
+                        dial_node.as_ref(),
+                        &dial_addr,
+                        connect_timeout,
+                        Some(tls_connector),
+                    )
+                    .await
+                },
+            )
+            .await;
+        }
+        let pool = Arc::clone(
+            self.fallback_pool
+                .get_or_init(|| Arc::new(crate::session::SessionPool::new(session_pool_config()))),
+        );
         let dial_node = node.clone();
         let dial_addr = format!("{}:{}", node.host(), node.port);
-        self.dial_udp_transport_speculative_with(
+        Self::dial_udp_transport_speculative_for_pool_with(
             node,
+            pool,
             target,
             target_domain,
             connect_timeout,
-            move || async move { dial_session(&dial_node, &dial_addr, connect_timeout, None).await },
+            None,
+            move || async move {
+                dial_session(&dial_node, &dial_addr, connect_timeout, None).await
+            },
         )
         .await
     }
@@ -2294,18 +2699,26 @@ impl ProxyHandler for AnyTlsHandler {
                 anyhow::bail!("AnyTLS node runtime does not own an AnyTLS pool")
             }
         };
-        let tls = runtime.anytls_tls_connector()?;
         let node = Arc::clone(&runtime.node);
-        let dial_node = node.as_ref().clone();
+        let dial_node = Arc::clone(&node);
+        let dial_runtime = Arc::clone(&runtime);
         let dial_addr = format!("{}:{}", node.host(), node.port);
-        self.dial_udp_transport_speculative_for_pool_with(
+        Self::dial_udp_transport_speculative_for_pool_with(
             node.as_ref(),
             pool,
             target,
             target_domain,
             connect_timeout,
+            Some(runtime),
             move || async move {
-                dial_session(&dial_node, &dial_addr, connect_timeout, Some(tls)).await
+                let tls_connector = dial_runtime.anytls_tls_connector()?;
+                dial_session(
+                    dial_node.as_ref(),
+                    &dial_addr,
+                    connect_timeout,
+                    Some(tls_connector),
+                )
+                .await
             },
         )
         .await
@@ -2553,6 +2966,143 @@ mod tests {
     }
 
     #[test]
+    fn overflow_state_enforces_frame_and_byte_caps_independently() {
+        let mut frames = OverflowState::default();
+        for _ in 0..SESSION_OVERFLOW_CAP {
+            frames.push_back(1, StreamEvent::Fin);
+        }
+        assert_eq!(frames.usage().bytes, 0);
+        assert_eq!(
+            frames.limit_for(2, &StreamEvent::Data(vec![1])),
+            Some(OverflowLimit::SessionFrames)
+        );
+
+        let mut stream_bytes = OverflowState::default();
+        stream_bytes.push_back(1, StreamEvent::Data(vec![0; STREAM_OVERFLOW_BYTES_CAP]));
+        assert_eq!(
+            stream_bytes.limit_for(1, &StreamEvent::Data(vec![1])),
+            Some(OverflowLimit::StreamBytes)
+        );
+
+        let mut session_bytes = OverflowState::default();
+        for sid in 1..=4 {
+            session_bytes.push_back(sid, StreamEvent::Data(vec![0; STREAM_OVERFLOW_BYTES_CAP]));
+        }
+        assert_eq!(session_bytes.usage().bytes, SESSION_OVERFLOW_BYTES_CAP);
+        assert_eq!(
+            session_bytes.limit_for(5, &StreamEvent::Data(vec![1])),
+            Some(OverflowLimit::SessionBytes)
+        );
+        assert_eq!(session_bytes.limit_for(5, &StreamEvent::Fin), None);
+
+        let mut competing_limits = OverflowState::default();
+        competing_limits.push_back(9, StreamEvent::Data(vec![0; STREAM_OVERFLOW_BYTES_CAP]));
+        for _ in 1..SESSION_OVERFLOW_CAP {
+            competing_limits.push_back(10, StreamEvent::Fin);
+        }
+        assert_eq!(
+            competing_limits.limit_for(9, &StreamEvent::Data(vec![1])),
+            Some(OverflowLimit::StreamBytes)
+        );
+
+        let mut competing_session_limits = OverflowState::default();
+        for sid in 1..=4 {
+            competing_session_limits
+                .push_back(sid, StreamEvent::Data(vec![0; STREAM_OVERFLOW_BYTES_CAP]));
+        }
+        for _ in 4..SESSION_OVERFLOW_CAP {
+            competing_session_limits.push_back(10, StreamEvent::Fin);
+        }
+        assert_eq!(
+            competing_session_limits.limit_for(11, &StreamEvent::Data(vec![1])),
+            Some(OverflowLimit::SessionBytes)
+        );
+
+        let mut errors = OverflowState::default();
+        errors.push_back(1, StreamEvent::Error(Arc::from("remote error")));
+        assert_eq!(
+            errors.usage(),
+            OverflowUsage {
+                frames: 1,
+                bytes: 0
+            }
+        );
+    }
+
+    #[test]
+    fn overflow_state_accounting_tracks_every_queue_operation() {
+        let mut overflow = OverflowState::default();
+        overflow.push_back(1, StreamEvent::Data(vec![1, 2, 3]));
+        overflow.push_back(1, StreamEvent::Fin);
+        overflow.push_back(2, StreamEvent::Data(vec![0; 5]));
+        assert_eq!(
+            overflow.usage(),
+            OverflowUsage {
+                frames: 3,
+                bytes: 8
+            }
+        );
+        assert_eq!(
+            overflow.largest_stream(OverflowLimit::SessionBytes),
+            Some(2)
+        );
+
+        let event = overflow.pop_front(1).unwrap();
+        assert_eq!(
+            overflow.usage(),
+            OverflowUsage {
+                frames: 2,
+                bytes: 5
+            }
+        );
+        overflow.push_front(1, event);
+        assert_eq!(
+            overflow.usage(),
+            OverflowUsage {
+                frames: 3,
+                bytes: 8
+            }
+        );
+
+        assert_eq!(
+            overflow.remove_stream(1),
+            OverflowUsage {
+                frames: 2,
+                bytes: 3
+            }
+        );
+        assert_eq!(
+            overflow.usage(),
+            OverflowUsage {
+                frames: 1,
+                bytes: 5
+            }
+        );
+        assert_eq!(
+            overflow.clear(),
+            OverflowUsage {
+                frames: 1,
+                bytes: 5
+            }
+        );
+        assert_eq!(overflow.usage(), OverflowUsage::default());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overflow_full_requeue_preserves_first_stall_age() {
+        let mut overflow = OverflowState::default();
+        overflow.push_back(1, StreamEvent::Data(vec![1]));
+        tokio::time::advance(Duration::from_secs(2)).await;
+
+        let started = overflow.first_parked_at(1);
+        let event = overflow.pop_front(1).unwrap();
+        overflow.push_front(1, event);
+        overflow.restore_first_parked_at(1, started);
+
+        assert_eq!(overflow.stalled_for(1), Duration::from_secs(2));
+    }
+
+    #[test]
     fn test_resolve_password_fallback() {
         let mut node = Node {
             name: "test".into(),
@@ -2694,6 +3244,31 @@ mod tests {
             ..Default::default()
         };
         assert!(handler2.node_pool(&other).is_err());
+
+        let replacement_node = Node {
+            id: node.id,
+            name: node.name.clone(),
+            protocol: NodeProtocol::AnyTLS,
+            address: "replacement.example:9443".into(),
+            sni: Some("replacement.example".into()),
+            skip_cert_verify: true,
+            ..Default::default()
+        };
+        *registry.write() = Arc::new(
+            crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&replacement_node))
+                .unwrap(),
+        );
+        let captured = handler2.captured_runtime(&node).unwrap().unwrap();
+        assert_eq!(captured.runtime.node.address, replacement_node.address);
+        assert_eq!(captured.runtime.node.sni, replacement_node.sni);
+        assert!(captured.runtime.node.skip_cert_verify);
+        let replacement_pool = match &registry.read().get(&node.id).unwrap().runtime {
+            crate::runtime::ProtocolRuntime::AnyTls(runtime) => Arc::clone(&runtime.pool),
+            crate::runtime::ProtocolRuntime::None | crate::runtime::ProtocolRuntime::Quic(_) => {
+                panic!("expected AnyTLS runtime")
+            }
+        };
+        assert!(Arc::ptr_eq(&captured.pool, &replacement_pool));
     }
 
     const TEST_AUTH: &[u8] = b"test-auth";
@@ -2725,6 +3300,45 @@ mod tests {
         assert_eq!(cmd, CMD_SETTINGS);
         assert_eq!(sid, 0);
         assert_eq!(data, TEST_SETTINGS);
+    }
+
+    #[tokio::test]
+    async fn runtime_udp_pool_hit_does_not_build_connector() {
+        let node = Node {
+            name: "runtime-udp-hit".into(),
+            protocol: NodeProtocol::AnyTLS,
+            address: "127.0.0.1:9".into(),
+            ..Default::default()
+        };
+        let generation = Arc::new(
+            crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
+        );
+        let runtime = generation.get(&node.id).unwrap();
+        let pool = match &runtime.runtime {
+            crate::runtime::ProtocolRuntime::AnyTls(runtime) => Arc::clone(&runtime.pool),
+            crate::runtime::ProtocolRuntime::None | crate::runtime::ProtocolRuntime::Quic(_) => {
+                panic!("expected AnyTLS runtime")
+            }
+        };
+        let (session, mut server) = establish_test_session("runtime-udp-hit").await;
+        expect_handshake(&mut server).await;
+        pool.insert(POOL_KEY, &session);
+        assert!(!runtime.tls_connector_loaded());
+
+        let handler = AnyTlsHandler::new();
+        let transport = handler
+            .dial_udp_transport_runtime(
+                Arc::clone(&runtime),
+                "127.0.0.1:53".parse().unwrap(),
+                None,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+
+        assert!(!runtime.tls_connector_loaded());
+        drop(transport);
+        generation.shutdown();
     }
 
     #[tokio::test]
@@ -3217,6 +3831,288 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
         assert!(err.to_string().contains("refused"));
         assert!(!session.is_closed(), "target refusal keeps the session");
+    }
+
+    #[tokio::test]
+    async fn overflow_accounting_clears_on_lifecycle_exits() {
+        let (session, _server) = establish_test_session("127.0.0.1:443").await;
+
+        let (end_tx, _end_rx) = mpsc::channel(STREAM_QUEUE_CAP);
+        session
+            .streams
+            .lock()
+            .unwrap()
+            .insert(31, StreamSink::Tcp(end_tx));
+        session
+            .overflow
+            .lock()
+            .push_back(31, StreamEvent::Data(vec![1; 17]));
+        session.end_stream(31, false).await;
+        assert_eq!(session.overflow.lock().usage(), OverflowUsage::default());
+
+        let (drop_tx, _drop_rx) = mpsc::channel(STREAM_QUEUE_CAP);
+        session
+            .streams
+            .lock()
+            .unwrap()
+            .insert(32, StreamSink::Tcp(drop_tx));
+        let registration = StreamRegistration {
+            session: Arc::clone(&session),
+            sid: 32,
+            frame_started: false,
+            committed: false,
+            permit: Some(session.try_reserve().unwrap()),
+        };
+        session
+            .overflow
+            .lock()
+            .push_back(32, StreamEvent::Data(vec![2; 19]));
+        drop(registration);
+        assert_eq!(session.overflow.lock().usage(), OverflowUsage::default());
+
+        let (closed_tx, closed_rx) = mpsc::channel(STREAM_QUEUE_CAP);
+        session
+            .streams
+            .lock()
+            .unwrap()
+            .insert(33, StreamSink::Tcp(closed_tx));
+        session
+            .overflow
+            .lock()
+            .push_back(33, StreamEvent::Data(vec![3; 23]));
+        drop(closed_rx);
+        session.dispatch_data(33, vec![4]).await;
+        assert!(!session.streams.lock().unwrap().contains_key(&33));
+        assert_eq!(session.overflow.lock().usage(), OverflowUsage::default());
+
+        let (close_tx, _close_rx) = mpsc::channel(STREAM_QUEUE_CAP);
+        session
+            .streams
+            .lock()
+            .unwrap()
+            .insert(34, StreamSink::Tcp(close_tx));
+        session
+            .overflow
+            .lock()
+            .push_back(34, StreamEvent::Data(vec![5; 29]));
+        session.close();
+        assert_eq!(session.overflow.lock().usage(), OverflowUsage::default());
+    }
+
+    #[tokio::test]
+    async fn stream_byte_cap_kills_only_that_stream_and_clears_accounting() {
+        let (session, _server) = establish_test_session("127.0.0.1:443").await;
+        let sid = 41;
+        let (tx, _rx) = mpsc::channel(STREAM_QUEUE_CAP);
+        session
+            .streams
+            .lock()
+            .unwrap()
+            .insert(sid, StreamSink::Tcp(tx));
+        session
+            .overflow
+            .lock()
+            .push_back(sid, StreamEvent::Data(vec![0; STREAM_OVERFLOW_BYTES_CAP]));
+
+        session.park_overflow(sid, StreamEvent::Data(vec![1]));
+
+        assert!(!session.streams.lock().unwrap().contains_key(&sid));
+        assert!(session.killed_streams.lock().unwrap().contains(&sid));
+        assert_eq!(session.overflow.lock().usage(), OverflowUsage::default());
+        assert!(!session.is_closed());
+        session.close();
+    }
+
+    #[tokio::test]
+    async fn session_cap_kills_largest_offender_then_delivers_waiting_stream() {
+        let (session, _server) = establish_test_session("127.0.0.1:443").await;
+        let (slow_tx, _slow_rx) = mpsc::channel(STREAM_QUEUE_CAP);
+        let (other_tx, _other_rx) = mpsc::channel(STREAM_QUEUE_CAP);
+        let (waiting_tx, mut waiting_rx) = mpsc::channel(STREAM_QUEUE_CAP);
+        {
+            let mut streams = session.streams.lock().unwrap();
+            streams.insert(51, StreamSink::Tcp(slow_tx));
+            streams.insert(52, StreamSink::Tcp(other_tx));
+            streams.insert(53, StreamSink::Tcp(waiting_tx));
+        }
+        {
+            let mut overflow = session.overflow.lock();
+            for _ in 0..300 {
+                overflow.push_back(51, StreamEvent::Data(vec![1; 4096]));
+            }
+            for _ in 0..212 {
+                overflow.push_back(52, StreamEvent::Data(vec![2; 1024]));
+            }
+            assert_eq!(overflow.usage().frames, SESSION_OVERFLOW_CAP);
+        }
+
+        session.park_overflow(53, StreamEvent::Data(vec![9, 8, 7]));
+
+        assert!(session.killed_streams.lock().unwrap().contains(&51));
+        assert!(!session.streams.lock().unwrap().contains_key(&51));
+        assert!(session.streams.lock().unwrap().contains_key(&52));
+        assert!(session.streams.lock().unwrap().contains_key(&53));
+        assert!(!session.overflow.lock().has(51));
+        session.flush_overflow(53);
+        match waiting_rx.recv().await.unwrap() {
+            StreamEvent::Data(data) => assert_eq!(data, vec![9, 8, 7]),
+            _ => panic!("waiting stream received a terminal event"),
+        }
+        assert_eq!(
+            session.overflow.lock().usage(),
+            OverflowUsage {
+                frames: 212,
+                bytes: 212 * 1024,
+            }
+        );
+        assert!(!session.is_closed());
+        session.close();
+    }
+
+    #[tokio::test]
+    async fn hard_cap_eviction_does_not_pause_sibling_demux() {
+        let (session, _server) = establish_test_session("127.0.0.1:443").await;
+        let slow_sid = 61;
+        let fast_sid = 62;
+        let (slow_tx, _slow_rx) = mpsc::channel(STREAM_QUEUE_CAP);
+        let (fast_tx, mut fast_rx) = mpsc::channel(STREAM_QUEUE_CAP);
+        {
+            let mut streams = session.streams.lock().unwrap();
+            streams.insert(slow_sid, StreamSink::Tcp(slow_tx));
+            streams.insert(fast_sid, StreamSink::Tcp(fast_tx));
+        }
+        for _ in 0..SESSION_OVERFLOW_CAP {
+            session
+                .overflow
+                .lock()
+                .push_back(slow_sid, StreamEvent::Fin);
+        }
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            session.dispatch_data(slow_sid, vec![1]),
+        )
+        .await
+        .expect("hard-cap eviction blocked the demux");
+        session.dispatch_data(fast_sid, vec![7]).await;
+        match fast_rx.recv().await.unwrap() {
+            StreamEvent::Data(data) => assert_eq!(data, vec![7]),
+            StreamEvent::Fin | StreamEvent::Error(_) => panic!("fast sibling was terminated"),
+        }
+
+        assert!(session.killed_streams.lock().unwrap().contains(&slow_sid));
+        assert!(session.streams.lock().unwrap().contains_key(&fast_sid));
+        assert!(!session.is_closed());
+        session.close();
+    }
+
+    #[tokio::test]
+    async fn overflow_transition_self_kicks_an_emptied_queue() {
+        let (session, _server) = establish_test_session("127.0.0.1:443").await;
+        let sid = 70;
+        let (tx, mut rx) = mpsc::channel(1);
+        session
+            .streams
+            .lock()
+            .unwrap()
+            .insert(sid, StreamSink::Tcp(tx));
+
+        session.park_overflow(sid, StreamEvent::Data(vec![7, 8, 9]));
+
+        assert_eq!(session.overflow.lock().usage(), OverflowUsage::default());
+        match rx.recv().await.unwrap() {
+            StreamEvent::Data(data) => assert_eq!(data, vec![7, 8, 9]),
+            _ => panic!("overflow transition delivered a terminal event"),
+        }
+        session.close();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_overflow_flush_preserves_stream_order() {
+        const EVENTS: usize = 256;
+        let (session, _server) = establish_test_session("127.0.0.1:443").await;
+        let sid = 70;
+        let (tx, mut rx) = mpsc::channel(1);
+        session
+            .streams
+            .lock()
+            .unwrap()
+            .insert(sid, StreamSink::Tcp(tx));
+        for index in 0..EVENTS {
+            session.overflow.lock().push_back(
+                sid,
+                StreamEvent::Data(u16::try_from(index).unwrap().to_be_bytes().to_vec()),
+            );
+        }
+
+        let done = Arc::new(AtomicBool::new(false));
+        let kickers: Vec<_> = (0..8)
+            .map(|_| {
+                let session = Arc::clone(&session);
+                let done = Arc::clone(&done);
+                tokio::spawn(async move {
+                    while !done.load(Ordering::Acquire) {
+                        session.flush_overflow(sid);
+                        tokio::task::yield_now().await;
+                    }
+                })
+            })
+            .collect();
+
+        let mut observed = Vec::with_capacity(EVENTS);
+        while observed.len() != EVENTS {
+            session.flush_overflow(sid);
+            let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("ordered overflow event timed out")
+                .expect("ordered overflow channel closed");
+            match event {
+                StreamEvent::Data(data) => {
+                    observed.push(u16::from_be_bytes(data.try_into().unwrap()) as usize);
+                }
+                StreamEvent::Fin | StreamEvent::Error(_) => {
+                    panic!("unexpected terminal event")
+                }
+            }
+        }
+        done.store(true, Ordering::Release);
+        for kicker in kickers {
+            kicker.await.unwrap();
+        }
+
+        assert_eq!(observed, (0..EVENTS).collect::<Vec<_>>());
+        let overflow = session.overflow.lock();
+        assert_eq!(overflow.usage(), OverflowUsage::default());
+        assert!(!overflow.flushing.contains(&sid));
+        assert!(!overflow.flush_requested.contains(&sid));
+        drop(overflow);
+        session.close();
+    }
+
+    #[tokio::test]
+    async fn overflow_preserves_data_before_fin() {
+        let (session, _server) = establish_test_session("127.0.0.1:443").await;
+        let sid = 81;
+        let (tx, rx) = mpsc::channel(STREAM_QUEUE_CAP);
+        session
+            .streams
+            .lock()
+            .unwrap()
+            .insert(sid, StreamSink::Tcp(tx));
+        let permit = session.try_reserve().unwrap();
+        let mut stream = AnyTlsStream::new(Arc::clone(&session), sid, rx, permit);
+        for _ in 0..STREAM_QUEUE_CAP {
+            session.dispatch_data(sid, vec![1]).await;
+        }
+        session.dispatch_data(sid, vec![9]).await;
+        session.dispatch_fin(sid).await;
+
+        let mut payload = vec![0; STREAM_QUEUE_CAP + 1];
+        stream.read_exact(&mut payload).await.unwrap();
+        assert!(payload[..STREAM_QUEUE_CAP].iter().all(|byte| *byte == 1));
+        assert_eq!(payload[STREAM_QUEUE_CAP], 9);
+        assert_eq!(stream.read(&mut [0; 1]).await.unwrap(), 0);
+        assert_eq!(session.overflow.lock().usage(), OverflowUsage::default());
     }
 
     /// 3B-2: a stalled stream is first parked in the session overflow
