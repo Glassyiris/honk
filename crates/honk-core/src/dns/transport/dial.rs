@@ -72,15 +72,15 @@ impl DialContext {
         if let Some(proxy) = &self.proxy {
             let addr = self.endpoint.resolve_addr().await?;
             let ps = if let Some(generation) = &proxy.generation {
-                let runtime = generation.get(&proxy.node.id).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "DNS proxy node {} is absent from its runtime generation",
-                        proxy.node.id
-                    )
-                })?;
                 proxy
                     .registry
-                    .dial_runtime(runtime, addr, None, self.dial_timeout)
+                    .dial_runtime(
+                        Arc::clone(generation),
+                        proxy.node.id,
+                        addr,
+                        None,
+                        self.dial_timeout,
+                    )
                     .await
             } else {
                 proxy

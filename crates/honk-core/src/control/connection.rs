@@ -517,6 +517,10 @@ impl ControlPlaneHandle {
         } else {
             candidates.truncate(1);
         }
+        // Pin this flow to the runtime generation admitted with its
+        // candidate selection: every dial, pool backfill, and permit below
+        // uses this snapshot, never a post-reload replacement.
+        let runtime_generation = self.runtime_registry.read().clone();
 
         // If eBPF already decided this flow should go direct (not just punted
         // it to userspace), skip userspace proxy dial, DNS, and relay entirely.
@@ -669,6 +673,7 @@ impl ControlPlaneHandle {
                 let ctx = ctx.clone();
                 let node = (*node).clone();
                 let target_domain = target_domain.clone();
+                let generation = Arc::clone(&runtime_generation);
                 set.spawn(async move {
                     if cold_urltest {
                         // Absolute releases make only candidate zero immediate;
@@ -692,6 +697,7 @@ impl ControlPlaneHandle {
                         Self::dial_pooled(
                             &ctx.proxy_registry,
                             &ctx.connection_pool,
+                            &generation,
                             &node,
                             target,
                             target_domain.as_deref(),
@@ -812,6 +818,7 @@ impl ControlPlaneHandle {
                     let pool = ctx.connection_pool.clone();
                     let registry = ctx.proxy_registry.clone();
                     let target_domain = target_domain.clone();
+                    let generation = Arc::clone(&runtime_generation);
                     tokio::spawn(async move {
                         let (ready_capable, bare_capable) = registry
                             .find(node.protocol)
@@ -838,7 +845,13 @@ impl ControlPlaneHandle {
                             };
                             let _dial_permit = ConnectionPool::acquire_dial_permit().await;
                             match registry
-                                .dial(&node, target, target_domain.as_deref(), connect_timeout)
+                                .dial_runtime(
+                                    generation,
+                                    node.id,
+                                    target,
+                                    target_domain.as_deref(),
+                                    connect_timeout,
+                                )
                                 .await
                             {
                                 Ok(stream) => {
@@ -1029,6 +1042,7 @@ impl ControlPlaneHandle {
                     let pool = self.connection_pool.clone();
                     let registry = self.proxy_registry.clone();
                     let target_domain = target_domain.clone();
+                    let generation = Arc::clone(&runtime_generation);
                     tokio::spawn(async move {
                         let (ready_capable, bare_capable) = registry
                             .find(node.protocol)
@@ -1054,8 +1068,9 @@ impl ControlPlaneHandle {
                                 return;
                             }
                             match registry
-                                .dial(
-                                    &node,
+                                .dial_runtime(
+                                    generation,
+                                    node.id,
                                     resolved_target,
                                     target_domain.as_deref(),
                                     connect_timeout,
@@ -1652,6 +1667,7 @@ impl ControlPlaneHandle {
     async fn dial_pooled(
         registry: &ProxyRegistry,
         pool: &ConnectionPool,
+        generation: &Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
         node: &Node,
         target: SocketAddr,
         target_domain: Option<&str>,
@@ -1699,12 +1715,27 @@ impl ControlPlaneHandle {
             }
         }
 
-        // Pool miss (or pools disabled) — fresh connect
+        // Pool miss (or pools disabled) — fresh connect through the
+        // flow's pinned generation. A candidate absent from the generation
+        // (e.g. a hand-built test config without the built-in nodes
+        // injected) falls back to the stateless node-based dial.
         tracing::debug!("Fresh TCP connect to {} for {}", addr, target);
-        entry
-            .tcp
-            .dial(node, target, target_domain, connect_timeout)
-            .await
+        if generation.get(&node.id).is_some() {
+            registry
+                .dial_runtime(
+                    Arc::clone(generation),
+                    node.id,
+                    target,
+                    target_domain,
+                    connect_timeout,
+                )
+                .await
+        } else {
+            entry
+                .tcp
+                .dial(node, target, target_domain, connect_timeout)
+                .await
+        }
     }
 }
 

@@ -554,22 +554,35 @@ impl ProxyRegistry {
             .await
     }
 
-    /// Dial through a generation-pinned node runtime. DNS runtime leases use
-    /// this path so a reload cannot redirect an old snapshot into a new pool.
+    /// Dial through a generation-pinned node runtime. The generation's
+    /// terminal flag is checked before and after the dial so a reload or
+    /// shutdown racing the handshake fails closed instead of publishing a
+    /// stream into a retired generation.
     pub async fn dial_runtime(
         &self,
-        runtime: Arc<crate::runtime::NodeRuntime>,
+        generation: Arc<crate::runtime::OutboundRuntimeRegistry>,
+        node_id: uuid::Uuid,
         target: SocketAddr,
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
+        if generation.is_shutdown() {
+            anyhow::bail!("outbound runtime generation is shut down");
+        }
+        let runtime = generation
+            .get(&node_id)
+            .ok_or_else(|| anyhow::anyhow!("node {node_id} is not in runtime generation"))?;
         let entry = self.find(runtime.node.protocol).ok_or_else(|| {
             anyhow::anyhow!("No handler for protocol {:?}", runtime.node.protocol)
         })?;
-        entry
+        let stream = entry
             .tcp
             .dial_runtime(runtime, target, target_domain, connect_timeout)
-            .await
+            .await?;
+        if generation.is_shutdown() {
+            anyhow::bail!("outbound runtime generation shut down during dial");
+        }
+        Ok(stream)
     }
 
     /// Warm a node using the explicitly supplied runtime generation. This
