@@ -967,13 +967,15 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 return;
             }
         };
+        let mut request_id = 0u64;
         loop {
             sighup.recv().await;
-            info!("Received SIGHUP, reloading configuration");
+            request_id = request_id.wrapping_add(1).max(1);
+            info!("SIGHUP reload request {request_id} received");
             match Config::from_file(config_path.to_str().unwrap_or("/etc/honk/config.dae")) {
                 Ok(mut new_config) => {
                     if let Err(e) = new_config.validate() {
-                        warn!("Reloaded config is invalid: {}", e);
+                        warn!("SIGHUP reload request {request_id} rejected: invalid config: {e}");
                         continue;
                     }
                     new_config.ensure_builtin_nodes();
@@ -1023,10 +1025,15 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                         &new_config.nodes,
                     );
                     if let Err(e) = reload_tx
-                        .send(control::ControlCommand::ReloadConfig(Box::new(new_config)))
+                        .send(control::ControlCommand::ReloadConfig {
+                            request_id,
+                            config: Box::new(new_config),
+                        })
                         .await
                     {
-                        warn!("Failed to send reload command: {}", e);
+                        warn!(
+                            "SIGHUP reload request {request_id} rejected: command send failed: {e}"
+                        );
                         break;
                     }
                     // Immediately re-fetch enabled subscriptions in the
@@ -1062,7 +1069,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                         });
                     }
                 }
-                Err(e) => warn!("Failed to reload config: {}", e),
+                Err(e) => {
+                    warn!("SIGHUP reload request {request_id} rejected: config load failed: {e}")
+                }
             }
         }
     });

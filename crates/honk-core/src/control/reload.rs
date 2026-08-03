@@ -55,7 +55,11 @@ impl ControlPlane {
     /// failures leave the current generation untouched; an eBPF push failure
     /// replays the exact active plan before admission resumes. SIGHUP and
     /// subscription merges share this command-channel-serialized path.
-    pub(super) async fn apply_runtime_config(&self, new_config: Config, drain: &DrainTracker) {
+    pub(super) async fn apply_runtime_config(
+        &self,
+        new_config: Config,
+        drain: &DrainTracker,
+    ) -> bool {
         let current_config = self.config.read().await.clone();
         let restart_required = restart_required_changes(&current_config, &new_config);
         if !restart_required.is_empty() {
@@ -63,7 +67,7 @@ impl ControlPlane {
                 fields = ?restart_required,
                 "reload rejected: changed fields require process restart"
             );
-            return;
+            return false;
         }
         let old_plan = self.active_routing_plan.read().clone();
 
@@ -76,7 +80,7 @@ impl ControlPlane {
             Err(e) => {
                 error!("Failed to build new router: {}", e);
                 self.stop_reload_rejection_if_healthy(drain);
-                return;
+                return false;
             }
         };
         let pinned_router = match Router::new(
@@ -87,7 +91,7 @@ impl ControlPlane {
             Err(error) => {
                 error!(%error, "Failed to build pinned DNS traffic router");
                 self.stop_reload_rejection_if_healthy(drain);
-                return;
+                return false;
             }
         };
         let old_group_manager = self.group_manager.read().clone();
@@ -105,7 +109,7 @@ impl ControlPlane {
                 Err(e) => {
                     error!("Failed to build runtime registry (reload aborted): {}", e);
                     self.stop_reload_rejection_if_healthy(drain);
-                    return;
+                    return false;
                 }
             },
         );
@@ -122,7 +126,7 @@ impl ControlPlane {
             Err(e) => {
                 error!("Failed to build DNS forwarder: {}", e);
                 self.stop_reload_rejection_if_healthy(drain);
-                return;
+                return false;
             }
         };
         let policy_id = match crate::dns::policy::PolicyId::from_config(&new_config.dns) {
@@ -130,7 +134,7 @@ impl ControlPlane {
             Err(error) => {
                 error!(%error, "Failed to build DNS policy identity");
                 self.stop_reload_rejection_if_healthy(drain);
-                return;
+                return false;
             }
         };
         let new_outbound_id_map = build_outbound_id_map(&new_config);
@@ -145,7 +149,7 @@ impl ControlPlane {
             Err(error) => {
                 error!(%error, "Failed to prepare direct health-check target");
                 self.stop_reload_rejection_if_healthy(drain);
-                return;
+                return false;
             }
         };
         let bootstrap_resolver = honk_outbound::bootstrap::BootstrapResolver::parse(&bootstrap);
@@ -154,7 +158,7 @@ impl ControlPlane {
             Err(error) => {
                 error!(%error, "Failed to compile routing publication");
                 self.stop_reload_rejection_if_healthy(drain);
-                return;
+                return false;
             }
         };
         let push_result = new_plan.result();
@@ -212,7 +216,7 @@ impl ControlPlane {
         if !self.udp_pool.cancel_initializers_and_wait().await {
             warn!("UDP initializers did not drain before reload commit");
             self.stop_reload_rejection_if_healthy(drain);
-            return;
+            return false;
         }
         let old_registry = {
             let mut router_guard = self.router.write().await;
@@ -230,14 +234,14 @@ impl ControlPlane {
                 let restore = publish_group_connectivity(ebpf.as_mut(), &old_connectivity);
                 error!(%error, ?restore, "Failed to open group connectivity for reload transition");
                 self.stop_reload_rejection_if_healthy(drain);
-                return;
+                return false;
             }
             let active_generation = match ebpf.active_routing_generation() {
                 Ok(generation) => generation,
                 Err(error) => {
                     error!(%error, "Failed to read active routing generation");
                     self.stop_reload_rejection_if_healthy(drain);
-                    return;
+                    return false;
                 }
             };
             let next_generation =
@@ -248,7 +252,7 @@ impl ControlPlane {
                 let restore = publish_group_connectivity(ebpf.as_mut(), &old_connectivity);
                 error!(%error, ?restore, "Failed to stage learned domain routes");
                 self.stop_reload_rejection_if_healthy(drain);
-                return;
+                return false;
             }
             if let Err(error) = routing_matcher::RoutingMatcherBuilder::push_transition(
                 ebpf.as_mut(),
@@ -285,7 +289,7 @@ impl ControlPlane {
                         self.drain_tracker.start_rejecting();
                     }
                 }
-                return;
+                return false;
             }
 
             if let Err(error) = publish_group_connectivity(ebpf.as_mut(), &new_connectivity) {
@@ -339,6 +343,7 @@ impl ControlPlane {
         info!("Configuration applied — {} routes active", route_count);
 
         self.stop_reload_rejection_if_healthy(drain);
+        true
     }
 
     /// End reload admission once the datapath is known healthy.

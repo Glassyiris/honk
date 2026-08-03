@@ -61,7 +61,10 @@ pub mod commands {
     #[derive(Debug)]
     #[allow(clippy::large_enum_variant)]
     pub enum ControlCommand {
-        ReloadConfig(Box<Config>),
+        ReloadConfig {
+            request_id: u64,
+            config: Box<Config>,
+        },
         /// Merge freshly fetched subscription nodes into the running config,
         /// replacing the previous node set of that subscription. Used by
         /// late startup fetches and periodic refreshes; subscription nodes
@@ -1136,9 +1139,13 @@ impl ControlPlane {
 
                 cmd = rx.recv() => {
                     match cmd {
-                        Some(ControlCommand::ReloadConfig(new_config)) => {
-                            info!("Reloading configuration — draining new connections briefly");
-                            self.apply_runtime_config(*new_config, &drain).await;
+                        Some(ControlCommand::ReloadConfig { request_id, config }) => {
+                            info!("SIGHUP reload request {request_id} started");
+                            if self.apply_runtime_config(*config, &drain).await {
+                                info!("SIGHUP reload request {request_id} applied");
+                            } else {
+                                warn!("SIGHUP reload request {request_id} rejected");
+                            }
                         }
                         Some(ControlCommand::MergeSubscription { subscription_id, name, nodes }) => {
                             info!(
@@ -1152,7 +1159,7 @@ impl ControlPlane {
                             };
                             // Same serialized rebuild path as ReloadConfig —
                             // both commands queue on this single channel.
-                            self.apply_runtime_config(new_config, &drain).await;
+                            let _ = self.apply_runtime_config(new_config, &drain).await;
                         }
                         Some(ControlCommand::GetStats(tx)) => {
                             let snap = self.stats.snapshot();

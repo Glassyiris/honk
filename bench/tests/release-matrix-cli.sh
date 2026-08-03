@@ -50,7 +50,7 @@ stock) [[ -z $COLLECT_SECS && ! -v HONK_MI_COLLECT_SECS ]] ;;
 *) exit 66 ;;
 esac
 printf '%s|%s|%s|%s|%s\n' "$TARGET" "$PROFILE" "$ALLOCATOR" "$WARMUP" "$RUN" >>"$HOOK_LOG"
-printf '%s\n' '{"rss_kib":100,"pss_kib":90,"private_dirty_kib":80,"minor_faults":7,"major_faults":1,"cpu_user_seconds":1.25,"cpu_system_seconds":0.5,"cpu_percent":75,"p50_us":10,"p95_us":20,"p99_us":30,"collection_duration_seconds":2.5}'
+printf '%s\n' '{"rss_kib":100,"pss_kib":90,"private_dirty_kib":80,"minor_faults":7,"major_faults":1,"cpu_user_seconds":1.25,"cpu_system_seconds":0.5,"cpu_percent":75,"throughput_mbps":9000,"p50_us":10,"p95_us":20,"p99_us":30,"collection_duration_seconds":2.5}'
 SH
 chmod +x "$tmp/bin/rustc" "$tmp/bin/cargo" "$tmp/hook"
 
@@ -113,7 +113,7 @@ with open(perf_json, encoding="utf-8") as source:
 assert len(performance) == 4
 required = {
     "rss_kib", "pss_kib", "private_dirty_kib", "minor_faults", "major_faults",
-    "cpu_user_seconds", "cpu_system_seconds", "cpu_percent",
+    "cpu_user_seconds", "cpu_system_seconds", "cpu_percent", "throughput_mbps",
     "p50_us", "p95_us", "p99_us", "collection_duration_seconds",
 }
 assert all(required <= row["metrics"].keys() for row in performance)
