@@ -121,10 +121,8 @@ type BoxedWriter = Box<dyn AsyncWrite + Send + Unpin>;
 #[derive(Debug, Default, Clone)]
 pub struct AnyTlsHandler;
 
-/// Key inside a node's own session pool. Pools are per-node (runtime
-/// registry), so the key is a constant — the old `host:port|tls|sni|
-/// pwhash|verify` fingerprint existed only to disambiguate the shared
-/// static pool, and it also kept a password hash around for no reason.
+/// Key inside a node's own session pool: pools are per-node (runtime
+/// registry), so the key is a constant.
 pub(crate) const POOL_KEY: &str = "self";
 
 /// Pool configuration for one AnyTLS node (least-loaded scheduling
@@ -1605,8 +1603,8 @@ async fn connect_transport(
 
     let tcp = match tcp {
         Some(tcp) => tcp,
-        // `addr` is the pool key (host:port plus an auth/TLS fingerprint),
-        // not a dial target — always dial the node's own address.
+        // `addr` is a log label, not a dial target — always dial the node's
+        // own address.
         None => {
             crate::util::connect_outbound(
                 &format!("{}:{}", node.host(), node.port),
@@ -1838,11 +1836,7 @@ impl AnyTlsHandler {
         F: FnOnce() -> Fut + Send,
         Fut: std::future::Future<Output = anyhow::Result<Arc<AnyTlsSession>>> + Send,
     {
-        if let Some(network) = &node.network
-            && !network
-                .split(',')
-                .any(|entry| entry.trim().eq_ignore_ascii_case("udp"))
-        {
+        if !crate::descriptor::network_allows_udp(node) {
             anyhow::bail!("node '{}' does not allow UDP", node.name);
         }
 
@@ -1924,11 +1918,7 @@ impl AnyTlsHandler {
         connect_timeout: Duration,
         runtime: Option<Arc<crate::runtime::NodeRuntime>>,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        if let Some(network) = &node.network
-            && !network
-                .split(',')
-                .any(|entry| entry.trim().eq_ignore_ascii_case("udp"))
-        {
+        if !crate::descriptor::network_allows_udp(&node) {
             anyhow::bail!("node '{}' does not allow UDP", node.name);
         }
 

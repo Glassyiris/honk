@@ -585,10 +585,7 @@ pub(super) fn udp_warm_candidates(
                 let Some(runtime) = generation.get(&node.id) else {
                     continue;
                 };
-                if !honk_outbound::descriptor::descriptor(runtime.node.protocol)
-                    .capabilities
-                    .udp
-                {
+                if !runtime.capabilities.udp {
                     continue;
                 }
                 if seen.insert(node.id) {

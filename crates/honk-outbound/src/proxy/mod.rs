@@ -371,15 +371,20 @@ pub trait ProbeableOutbound: Send + Sync {
     }
 }
 
-/// One registered protocol: its static descriptor plus the capability
-/// objects it implements. A `None` slot means the protocol lacks that
-/// capability; dispatches into it are refused.
+/// One registered protocol: its descriptor plus the capability objects it
+/// implements. A `None` slot means the protocol lacks that capability;
+/// dispatches into it are refused.
 pub struct ProtocolEntry {
     pub descriptor: &'static crate::descriptor::ProtocolDescriptor,
     pub tcp: Arc<dyn TcpOutbound>,
     pub packet: Option<Arc<dyn PacketOutbound>>,
     pub warmable: Option<Arc<dyn WarmableOutbound>>,
     pub probeable: Option<Arc<dyn ProbeableOutbound>>,
+    /// Declared reason a packet slot may exist despite the descriptor
+    /// reporting `udp: false` for a default node (Block: the slot answers
+    /// blocked UDP flows with the routing refusal). `None` enforces
+    /// slot/table parity in [`Self::validate_consistency`].
+    packet_udp_exemption: Option<&'static str>,
 }
 
 impl ProtocolEntry {
@@ -390,11 +395,17 @@ impl ProtocolEntry {
             packet: None,
             warmable: None,
             probeable: None,
+            packet_udp_exemption: None,
         }
     }
 
     pub fn with_packet<T: PacketOutbound + 'static>(mut self, handler: Arc<T>) -> Self {
         self.packet = Some(handler);
+        self
+    }
+
+    pub fn with_packet_udp_exemption(mut self, reason: &'static str) -> Self {
+        self.packet_udp_exemption = Some(reason);
         self
     }
 
@@ -406,6 +417,36 @@ impl ProtocolEntry {
     pub fn with_probeable<T: ProbeableOutbound + 'static>(mut self, handler: Arc<T>) -> Self {
         self.probeable = Some(handler);
         self
+    }
+
+    /// Cross-check the capability slots against the descriptor table. The
+    /// table drives selection and warm-candidate decisions; a slot that
+    /// disagrees with it silently misroutes work, so registry assembly
+    /// panics on inconsistency rather than starting up half-truthful.
+    fn validate_consistency(&self) {
+        let protocol = self.descriptor.protocol;
+        let default_node = Node {
+            protocol,
+            ..Default::default()
+        };
+        let udp_capable = (self.descriptor.capabilities)(&default_node).udp;
+        if self.packet.is_some() != udp_capable && self.packet_udp_exemption.is_none() {
+            panic!(
+                "protocol {}: packet slot (present={}) disagrees with descriptor udp={}; \
+                 declare with_packet_udp_exemption if intentional",
+                protocol.as_str(),
+                self.packet.is_some(),
+                udp_capable
+            );
+        }
+        if self.warmable.is_some() != self.descriptor.has_generation_runtime() {
+            panic!(
+                "protocol {}: warmable slot (present={}) disagrees with generation runtime {:?}",
+                protocol.as_str(),
+                self.warmable.is_some(),
+                self.descriptor.generation_runtime
+            );
+        }
     }
 }
 
@@ -439,6 +480,9 @@ impl ProxyRegistry {
         registry.register(
             ProtocolEntry::new(NodeProtocol::Block, block.clone())
                 .with_packet(block.clone())
+                // Blocked UDP flows get the routing refusal from the handler;
+                // the node itself is never UDP-selectable.
+                .with_packet_udp_exemption("block answers with the routing refusal")
                 .with_probeable(block),
         );
         let trojan = Arc::new(TrojanHandler::new());
@@ -487,6 +531,9 @@ impl ProxyRegistry {
                 .with_warmable(juicity.clone())
                 .with_probeable(juicity),
         );
+        for entry in &registry.entries {
+            entry.validate_consistency();
+        }
         Ok(registry)
     }
 
@@ -699,6 +746,26 @@ mod tests {
         assert!(registry.find(NodeProtocol::VMess).is_some());
         assert!(registry.find(NodeProtocol::Tuic).is_some());
         assert!(registry.find(NodeProtocol::Juicity).is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "packet slot")]
+    fn consistency_rejects_undeclared_packet_without_udp_capability() {
+        let block = Arc::new(BlockHandler::new());
+        ProtocolEntry::new(NodeProtocol::VMess, block.clone())
+            .with_packet(block)
+            .validate_consistency();
+    }
+
+    #[test]
+    #[should_panic(expected = "warmable slot")]
+    fn consistency_rejects_warmable_without_generation_runtime() {
+        let socks5 = Arc::new(Socks5Handler::new());
+        let anytls = Arc::new(AnyTlsHandler::new());
+        ProtocolEntry::new(NodeProtocol::Socks5, socks5.clone())
+            .with_packet(socks5)
+            .with_warmable(anytls)
+            .validate_consistency();
     }
 
     /// The built-in block node carries NodeProtocol::Block; the registry must

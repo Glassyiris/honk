@@ -132,16 +132,11 @@ impl PacketOutbound for TrojanHandler {
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        if let Some(network) = node.network.as_deref() {
-            let supports_udp = network
-                .split(',')
-                .any(|n| n.trim().eq_ignore_ascii_case("udp"));
-            if !supports_udp {
-                anyhow::bail!(
-                    "Trojan UDP: node network '{}' does not include \"udp\"",
-                    network
-                );
-            }
+        if !crate::descriptor::network_allows_udp(node) {
+            anyhow::bail!(
+                "Trojan UDP: node network {:?} does not include \"udp\"",
+                node.network
+            );
         }
         let password = node.password.as_deref().unwrap_or("");
         let mut control = Self::connect_server(node, connect_timeout).await?;

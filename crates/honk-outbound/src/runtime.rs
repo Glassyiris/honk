@@ -39,7 +39,7 @@ pub struct OutboundCapabilities {
 
 impl OutboundCapabilities {
     pub fn for_node(node: &Node) -> Self {
-        crate::descriptor::descriptor(node.protocol).capabilities
+        (crate::descriptor::descriptor(node.protocol).capabilities)(node)
     }
 }
 

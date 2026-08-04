@@ -823,7 +823,7 @@ impl ControlPlaneHandle {
                         let (ready_capable, bare_capable) = registry
                             .find(node.protocol)
                             .map(|entry| {
-                                let caps = &entry.descriptor.capabilities;
+                                let caps = (entry.descriptor.capabilities)(&node);
                                 (
                                     (entry.descriptor.pool_ready_streams)(&node)
                                         && caps.tcp
@@ -1047,7 +1047,7 @@ impl ControlPlaneHandle {
                         let (ready_capable, bare_capable) = registry
                             .find(node.protocol)
                             .map(|entry| {
-                                let caps = &entry.descriptor.capabilities;
+                                let caps = (entry.descriptor.capabilities)(&node);
                                 (
                                     (entry.descriptor.pool_ready_streams)(&node)
                                         && caps.tcp
