@@ -157,6 +157,13 @@ impl QuicRuntime {
             .map(|c| !c.is_empty())
             .unwrap_or(true)
     }
+
+    /// Number of occupied client slots — the warm-resource gauge behind
+    /// `/stats`. A contended lock reports zero rather than blocking a
+    /// metrics path on an in-flight build.
+    pub(crate) fn client_count(&self) -> usize {
+        self.clients.try_lock().map(|c| c.len()).unwrap_or(0)
+    }
 }
 
 /// Lazily built TLS state. An in-flight handshake owns an `Arc`, so evicting
@@ -233,6 +240,14 @@ impl AnyTlsRuntime {
     }
 }
 
+/// Live warm-session gauge of one runtime: retained AnyTLS pool sessions
+/// and occupied QUIC client slots.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct WarmCounts {
+    pub sessions: usize,
+    pub clients: usize,
+}
+
 /// The minimal per-node runtime entry (the honest, minimal
 /// PreparedOutbound — not the full scaffold).
 #[derive(Debug)]
@@ -277,6 +292,24 @@ impl NodeRuntime {
                 .pool
                 .has_usable_session(crate::proxy::anytls::POOL_KEY),
             ProtocolRuntime::Quic(runtime) => runtime.has_client(),
+        }
+    }
+
+    /// Retained warm state of this runtime: live AnyTLS pool sessions and
+    /// occupied QUIC client slots.
+    pub fn warm_counts(&self) -> WarmCounts {
+        match &self.runtime {
+            ProtocolRuntime::None => WarmCounts::default(),
+            ProtocolRuntime::AnyTls(runtime) => WarmCounts {
+                sessions: runtime
+                    .pool
+                    .live_session_count(crate::proxy::anytls::POOL_KEY),
+                clients: 0,
+            },
+            ProtocolRuntime::Quic(runtime) => WarmCounts {
+                sessions: 0,
+                clients: runtime.client_count(),
+            },
         }
     }
 
@@ -436,6 +469,11 @@ impl OutboundRuntimeRegistry {
 
     pub fn get(&self, id: &uuid::Uuid) -> Option<Arc<NodeRuntime>> {
         self.nodes.get(id).map(Arc::clone)
+    }
+
+    /// Iterate every runtime of this generation (observability/gauges).
+    pub fn values(&self) -> impl Iterator<Item = &Arc<NodeRuntime>> {
+        self.nodes.values()
     }
 
     pub fn len(&self) -> usize {

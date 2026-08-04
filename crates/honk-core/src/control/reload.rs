@@ -546,6 +546,11 @@ fn restart_required_changes(current: &Config, candidate: &Config) -> Vec<&'stati
 /// list (they are exactly the groups that benefit from pre-dialed
 /// transports). UUID-deduplicated across groups, direct/block leaves and
 /// nodes without a UDP-capable runtime stay out.
+///
+/// On top of the per-group top-N, a process-wide cap of `4 × count` keeps
+/// the retained transports bounded when the group count grows: the merged
+/// set is re-ranked by the global UDP latency and truncated, so the cap
+/// sacrifices only the slowest leaves.
 pub(super) fn udp_warm_candidates(
     config: &Config,
     group_manager: &GroupManager,
@@ -556,10 +561,10 @@ pub(super) fn udp_warm_candidates(
         return Vec::new();
     }
     let per_group = count.min(3);
+    let total_cap = count.saturating_mul(4);
     let configured_ids: std::collections::HashSet<uuid::Uuid> =
         config.nodes.iter().map(|node| node.id).collect();
-    let mut selected = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+    let mut selected: Vec<(uuid::Uuid, Duration)> = Vec::new();
     for group in &config.groups {
         for ipver in [IpVersion::V4, IpVersion::V6] {
             let mut leaves = group_manager.ranked_udp_leaves(&group.name, ipver, per_group);
@@ -588,13 +593,19 @@ pub(super) fn udp_warm_candidates(
                 if !runtime.capabilities.udp {
                     continue;
                 }
-                if seen.insert(node.id) {
-                    selected.push(node.id);
+                let latency = group_manager.udp_latency(node, ipver);
+                match selected.iter_mut().find(|(id, _)| *id == node.id) {
+                    Some(entry) => entry.1 = entry.1.min(latency),
+                    None => selected.push((node.id, latency)),
                 }
             }
         }
     }
-    selected
+    // Stable sort: unmeasured leaves (Duration::MAX) keep their per-group
+    // order below every measured one.
+    selected.sort_by_key(|(_, latency)| *latency);
+    selected.truncate(total_cap);
+    selected.into_iter().map(|(id, _)| id).collect()
 }
 
 /// Periodic warm coordinator: one pass immediately, then one pass per probe
@@ -681,7 +692,10 @@ async fn run_udp_warm_dispatches<F, Fut>(
                     Ok(
                         honk_outbound::proxy::UdpWarmStatus::Ready
                         | honk_outbound::proxy::UdpWarmStatus::AlreadyReady,
-                    ) => stats.record_udp_warm_success(),
+                    ) => {
+                        stats.record_udp_warm_success();
+                        stats.mark_warm(node_id, crate::stats::WarmReason::Udp);
+                    }
                     Ok(honk_outbound::proxy::UdpWarmStatus::NotApplicable) => {}
                     Err(err) if generation.is_shutdown() => {
                         debug!("UDP warm ended with terminal generation: {err}");
@@ -1785,7 +1799,7 @@ mod atomic_reload_tests {
         assert_eq!(
             udp_warm_candidates(&config, &manager, &runtime, 1),
             vec![anytls.id, socks.id],
-            "the count is a per-group cap, not a global budget"
+            "the count is a per-group cap; the process-wide cap (4x) does not bind here"
         );
         assert!(udp_warm_candidates(&config, &manager, &runtime, 0).is_empty());
     }
@@ -1840,6 +1854,58 @@ mod atomic_reload_tests {
             vec![selected.id, second.id],
             "a per-group cap of one keeps the best live leaf of every group"
         );
+    }
+
+    #[test]
+    fn udp_warm_candidates_enforce_a_process_wide_latency_ordered_cap() {
+        // Six groups of two leaves: the per-group top-2 alone would retain
+        // twelve transports; the process-wide cap (4 x count = 8) keeps only
+        // the globally fastest.
+        let mut nodes = Vec::new();
+        let mut groups = Vec::new();
+        for g in 0..6 {
+            let mut ids = Vec::new();
+            for i in 0..2 {
+                let node = Node {
+                    id: uuid::Uuid::new_v4(),
+                    name: format!("n{g}-{i}"),
+                    protocol: honk_config::types::NodeProtocol::Socks5,
+                    address: "127.0.0.1:9".into(),
+                    ..Default::default()
+                };
+                ids.push(node.id);
+                nodes.push(node);
+            }
+            groups.push(Group {
+                name: format!("g{g}"),
+                policy: GroupPolicy::Selector,
+                nodes: ids,
+                ..Default::default()
+            });
+        }
+        // Global latency order: n0-0 fastest (1ms) ... n5-1 slowest (12ms).
+        let alive = Arc::new(crate::outbound::AliveDialerSet::new());
+        for (index, node) in nodes.iter().enumerate() {
+            alive.record_probe_latency(
+                node.id,
+                ProbeDomain::DataUdp,
+                IpVersion::V4,
+                Duration::from_millis(index as u64 + 1),
+            );
+        }
+        let config = Config {
+            nodes,
+            groups,
+            ..Default::default()
+        };
+        let manager =
+            GroupManager::with_alive_set(&config.groups, &config.nodes, Some(Arc::clone(&alive)));
+        let runtime =
+            honk_outbound::runtime::OutboundRuntimeRegistry::build(&config.nodes).unwrap();
+
+        let candidates = udp_warm_candidates(&config, &manager, &runtime, 2);
+        let expected: Vec<_> = config.nodes.iter().take(8).map(|n| n.id).collect();
+        assert_eq!(candidates, expected);
     }
 
     #[test]

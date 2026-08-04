@@ -1327,4 +1327,16 @@ async fn stats_exposes_udp_metrics() {
     assert_eq!(udp["warm"]["attempts"], 0);
     assert_eq!(udp["warm"]["successes"], 0);
     assert_eq!(udp["warm"]["failures"], 0);
+
+    // Top-level warm gauges: nodes by reason and per-protocol retained
+    // sessions/clients, all zero before any warm-up runs.
+    let warm = &body["warm"];
+    assert_eq!(warm["nodes"]["preconnect"], 0);
+    assert_eq!(warm["nodes"]["health"], 0);
+    assert_eq!(warm["nodes"]["udp"], 0);
+    assert_eq!(warm["nodes"]["traffic"], 0);
+    assert_eq!(warm["sessions"]["anytls"], 0);
+    assert_eq!(warm["sessions"]["tuic"], 0);
+    assert_eq!(warm["sessions"]["juicity"], 0);
+    assert_eq!(warm["sessions"]["hysteria2"], 0);
 }

@@ -837,6 +837,7 @@ impl ControlPlane {
                         self.config.clone(),
                         self.proxy_registry.clone(),
                         self.runtime_registry.clone(),
+                        self.stats.clone(),
                         check_method.clone(),
                     ));
                     alive_set
@@ -886,6 +887,7 @@ impl ControlPlane {
                     self.config.clone(),
                     self.proxy_registry.clone(),
                     self.runtime_registry.clone(),
+                    self.stats.clone(),
                     dns_target,
                 )));
                 info!("UDP health check enabled (dns={})", dns_target);
@@ -981,12 +983,14 @@ impl ControlPlane {
             if !nodes.is_empty() {
                 let node_count = nodes.len();
                 let pool = self.connection_pool.clone();
+                let stats = self.stats.clone();
                 let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
                 let handle = tokio::spawn(async move {
                     let mut set = tokio::task::JoinSet::new();
                     for node in nodes {
                         let addr = format!("{}:{}", node.host(), node.port);
                         let pool = pool.clone();
+                        let stats = stats.clone();
                         let sem = semaphore.clone();
                         set.spawn(async move {
                             let _permit = sem.acquire_owned().await;
@@ -996,6 +1000,10 @@ impl ControlPlane {
                                 Ok(stream) => {
                                     if is_tcp_stream_alive(&stream) {
                                         pool.deposit_tcp(&addr, stream).await;
+                                        stats.mark_warm(
+                                            node.id,
+                                            crate::stats::WarmReason::Preconnect,
+                                        );
                                         debug!(
                                             "Preconnect warmup: deposited connection to {}",
                                             addr

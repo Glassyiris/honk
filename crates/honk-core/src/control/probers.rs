@@ -9,6 +9,7 @@ pub(super) struct ProxyHttpProber {
     config: Arc<RwLock<Config>>,
     proxy_registry: Arc<ProxyRegistry>,
     runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
+    stats: Arc<StatsManager>,
     check_method: String,
 }
 
@@ -17,12 +18,14 @@ impl ProxyHttpProber {
         config: Arc<RwLock<Config>>,
         proxy_registry: Arc<ProxyRegistry>,
         runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
+        stats: Arc<StatsManager>,
         check_method: String,
     ) -> Self {
         Self {
             config,
             proxy_registry,
             runtime_registry,
+            stats,
             check_method,
         }
     }
@@ -55,6 +58,7 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
         let check_url = url.to_string();
         let check_method = self.check_method.clone();
         let config = self.config.clone();
+        let stats = self.stats.clone();
 
         Box::pin(async move {
             let node = node.ok_or_else(|| format!("node '{}' not found", node_name_owned))?;
@@ -88,6 +92,7 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
             // real cold-start latency, while warm nodes report the hot path.
             let proxy = match warm_runtime(&generation, &node) {
                 Some(runtime) => {
+                    stats.mark_warm(node.id, crate::stats::WarmReason::Health);
                     tcp.dial_runtime(runtime, addr, domain.as_deref(), connect_timeout)
                         .await
                 }
@@ -217,6 +222,7 @@ pub(super) struct ProxyUdpProber {
     config: Arc<RwLock<Config>>,
     proxy_registry: Arc<ProxyRegistry>,
     runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
+    stats: Arc<StatsManager>,
     dns_target: SocketAddr,
 }
 
@@ -225,12 +231,14 @@ impl ProxyUdpProber {
         config: Arc<RwLock<Config>>,
         proxy_registry: Arc<ProxyRegistry>,
         runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
+        stats: Arc<StatsManager>,
         dns_target: SocketAddr,
     ) -> Self {
         Self {
             config,
             proxy_registry,
             runtime_registry,
+            stats,
             dns_target,
         }
     }
@@ -259,6 +267,7 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
         let registry = self.proxy_registry.clone();
         let generation = self.runtime_registry.read().clone();
         let config = self.config.clone();
+        let stats = self.stats.clone();
         let dns_target = self.dns_target;
 
         Box::pin(async move {
@@ -280,6 +289,7 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
             let start = std::time::Instant::now();
             let transport = match warm_runtime(&generation, &node) {
                 Some(runtime) => {
+                    stats.mark_warm(node.id, crate::stats::WarmReason::Health);
                     packet
                         .dial_udp_transport_runtime(runtime, dns_target, None, connect_timeout)
                         .await

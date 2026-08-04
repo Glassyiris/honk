@@ -291,6 +291,19 @@ impl ConnectionPool {
         self.deposit_entry(addr, PooledStream::Bare(stream)).await;
     }
 
+    /// Whether a live, unexpired bare-TCP entry exists for `addr`
+    /// (`host:port`) — the preconnect warm gauge behind `/stats`.
+    pub(crate) fn has_live_bare_entry(&self, addr: &str) -> bool {
+        let now = Instant::now();
+        self.entries.get(addr).is_some_and(|list| {
+            list.lock().iter().any(|entry| {
+                matches!(entry.stream, PooledStream::Bare(_))
+                    && !self.entry_expired(entry, now)
+                    && Self::is_entry_alive(entry)
+            })
+        })
+    }
+
     /// Deposit a fully-dialed stream under `key` (see [`ready_key`]).
     /// The stream must come straight out of `TcpOutbound::dial()` with no
     /// application reads performed, so its userspace TLS buffer (if any)

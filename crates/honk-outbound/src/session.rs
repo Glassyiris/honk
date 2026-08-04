@@ -403,6 +403,17 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         })
     }
 
+    /// Live (not closed) session count for `key` — the warm-resource gauge
+    /// behind `/stats`.
+    pub fn live_session_count(&self, key: &str) -> usize {
+        let mut keys = self.keys.lock();
+        let Some(pool) = keys.get_mut(key) else {
+            return 0;
+        };
+        pool.sessions.retain(|session| !session.is_closed());
+        pool.sessions.len()
+    }
+
     /// Offer the least-loaded live session, dialing one when none is
     /// usable. Concurrent dials for the same key share one establishment:
     /// the FIRST caller to find no inflight registers the dial and the

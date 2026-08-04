@@ -3,7 +3,7 @@
 use dashmap::DashMap;
 use honk_ebpf_common::OutboundStats;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 pub(crate) mod dns;
 #[cfg(test)]
@@ -247,6 +247,46 @@ impl Drop for ActiveConnectionGuard {
 pub struct StatsManager {
     trackers: DashMap<String, OutboundTracker>,
     udp: UdpStats,
+    /// Warm-reason attribution bits per node id, pruned at snapshot time to
+    /// nodes that still hold warm resources.
+    warm_marks: DashMap<uuid::Uuid, AtomicU8>,
+}
+
+/// Why a node's warm resources were established. Several reasons can mark
+/// the same node; a warm node with no marks is reported as traffic-warmed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WarmReason {
+    /// Startup bare-TCP preconnect deposit.
+    Preconnect,
+    /// A health probe observed the node warm (probes never warm cold
+    /// nodes — they only reuse existing warm state).
+    Health,
+    /// The UDP warm coordinator established the session/client.
+    Udp,
+}
+
+impl WarmReason {
+    fn bit(self) -> u8 {
+        match self {
+            WarmReason::Preconnect => 1,
+            WarmReason::Health => 1 << 1,
+            WarmReason::Udp => 1 << 2,
+        }
+    }
+}
+
+/// Point-in-time warm-resource gauges behind `/stats`: warm nodes by reason
+/// and retained sessions/clients per session protocol.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct WarmSnapshot {
+    pub preconnect_nodes: u64,
+    pub health_nodes: u64,
+    pub udp_nodes: u64,
+    pub traffic_nodes: u64,
+    pub anytls_sessions: u64,
+    pub tuic_clients: u64,
+    pub juicity_clients: u64,
+    pub hysteria2_clients: u64,
 }
 
 impl StatsManager {
@@ -254,7 +294,66 @@ impl StatsManager {
         Self {
             trackers: DashMap::new(),
             udp: UdpStats::default(),
+            warm_marks: DashMap::new(),
         }
+    }
+
+    /// Attribute a node's current warm resources to a reason.
+    pub fn mark_warm(&self, node: uuid::Uuid, reason: WarmReason) {
+        self.warm_marks
+            .entry(node)
+            .or_default()
+            .fetch_or(reason.bit(), Ordering::Relaxed);
+    }
+
+    /// Current warm-resource gauges: warm nodes counted per reason (an
+    /// unmarked warm node counts as traffic-warmed) plus retained
+    /// sessions/clients per session protocol. Marks of nodes that went
+    /// cold are dropped here, so attribution never outlives the resource.
+    pub fn warm_snapshot(
+        &self,
+        generation: &honk_outbound::runtime::OutboundRuntimeRegistry,
+        pool: &crate::pool::ConnectionPool,
+    ) -> WarmSnapshot {
+        use honk_config::types::NodeProtocol;
+        let mut snap = WarmSnapshot::default();
+        let mut warm_ids = std::collections::HashSet::new();
+        for runtime in generation.values() {
+            let counts = runtime.warm_counts();
+            match runtime.node.protocol {
+                NodeProtocol::AnyTLS => snap.anytls_sessions += counts.sessions as u64,
+                NodeProtocol::Tuic => snap.tuic_clients += counts.clients as u64,
+                NodeProtocol::Juicity => snap.juicity_clients += counts.clients as u64,
+                NodeProtocol::Hysteria2 => snap.hysteria2_clients += counts.clients as u64,
+                _ => {}
+            }
+            let bare =
+                pool.has_live_bare_entry(&format!("{}:{}", runtime.node.host(), runtime.node.port));
+            if counts.sessions == 0 && counts.clients == 0 && !bare {
+                continue;
+            }
+            warm_ids.insert(runtime.node.id);
+            let marks = self
+                .warm_marks
+                .get(&runtime.node.id)
+                .map(|m| m.load(Ordering::Relaxed))
+                .unwrap_or(0);
+            if marks == 0 {
+                snap.traffic_nodes += 1;
+                continue;
+            }
+            if marks & WarmReason::Preconnect.bit() != 0 {
+                snap.preconnect_nodes += 1;
+            }
+            if marks & WarmReason::Health.bit() != 0 {
+                snap.health_nodes += 1;
+            }
+            if marks & WarmReason::Udp.bit() != 0 {
+                snap.udp_nodes += 1;
+            }
+        }
+        self.warm_marks.retain(|id, _| warm_ids.contains(id));
+        snap
     }
 
     /// Record a new connection on an outbound.
@@ -536,5 +635,53 @@ mod tests {
         assert_eq!(UdpLatencyHistogramSnapshot::bucket_upper_bound_ns(0), 1);
         assert_eq!(UdpLatencyHistogramSnapshot::bucket_upper_bound_ns(1), 3);
         assert_eq!(route.quantile_upper_bound_ns(0.5), Some(3));
+    }
+
+    #[tokio::test]
+    async fn warm_snapshot_attributes_reasons_and_prunes_cold_nodes() {
+        let stats = StatsManager::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let node = honk_config::node::Node {
+            id: uuid::Uuid::new_v4(),
+            name: "ss".into(),
+            protocol: honk_config::types::NodeProtocol::SS,
+            address: addr.to_string(),
+            port: addr.port(),
+            ..Default::default()
+        };
+        let generation =
+            honk_outbound::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node))
+                .unwrap();
+        let pool = crate::pool::ConnectionPool::new();
+
+        let cold = stats.warm_snapshot(&generation, &pool);
+        assert_eq!(cold, WarmSnapshot::default());
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let _accepted = listener.accept().await.unwrap();
+        pool.deposit_tcp(&addr.to_string(), stream).await;
+
+        let unmarked = stats.warm_snapshot(&generation, &pool);
+        assert_eq!(unmarked.traffic_nodes, 1);
+        assert_eq!(unmarked.preconnect_nodes, 0);
+
+        stats.mark_warm(node.id, WarmReason::Preconnect);
+        let marked = stats.warm_snapshot(&generation, &pool);
+        assert_eq!(marked.preconnect_nodes, 1);
+        assert_eq!(marked.traffic_nodes, 0);
+
+        // Once the resource is gone, its marks go with it: re-warming
+        // without a mark counts as traffic again.
+        let pool = crate::pool::ConnectionPool::new();
+        assert_eq!(
+            stats.warm_snapshot(&generation, &pool),
+            WarmSnapshot::default()
+        );
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        pool.deposit_tcp(&addr.to_string(), stream).await;
+        let rewarmed = stats.warm_snapshot(&generation, &pool);
+        assert_eq!(rewarmed.traffic_nodes, 1);
+        assert_eq!(rewarmed.preconnect_nodes, 0);
     }
 }

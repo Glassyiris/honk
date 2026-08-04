@@ -463,6 +463,14 @@ impl GroupManager {
         );
         ordered.into_iter().take(limit).map(|c| c.node).collect()
     }
+
+    /// The node's UDP ranking latency (DataUDP, then DNS-UDP;
+    /// `Duration::MAX` when unmeasured). The warm coordinator re-ranks its
+    /// merged per-group candidate lists by this to enforce its process-wide
+    /// cap on the globally fastest leaves.
+    pub fn udp_latency(&self, node: &Node, ipver: IpVersion) -> Duration {
+        self.node_latency(node, SelectionNetwork::Udp, ipver, None, &node.name)
+    }
 }
 
 mod filter;

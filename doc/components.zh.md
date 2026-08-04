@@ -47,7 +47,7 @@
 | `dns_resolve_timeout_ms` | u64 | `2000` | 控制面解析超时（结构化模型字段，dae 语法无对应键） |
 | `relay_idle_timeout_secs` | u64 | `300` | 空闲中继断开；`0` = 关闭（结构化模型字段，dae 语法无对应键） |
 | `preconnect_node_count` | usize | `'auto'` | 启动裸 TCP 预连接数。`'auto'` = `min(nodes,8)`；`0` 严格关闭预热。候选顺序为各组当前选择优先、再按配置顺序补足；仅可池化裸 TCP 的协议入选（AnyTLS/QUIC 永远不会消费池化裸 TCP），且排除内置 `direct`/`block`。 |
-| `udp_warm_node_count` | usize | `0` | 每组 UDP 预热上限。`0` 为严格关闭：不创建 coordinator task，也不产生 warm metrics。正值 N（封顶 3）会在启动后以及**每个探测周期**（`check_interval`）预热每组按延迟排名前 N 的 UDP 可用节点——测速后新变快的节点在赢得选择前就已拨好 transport。dispatch 仍最多四个并发 task。 |
+| `udp_warm_node_count` | usize | `0` | 每组 UDP 预热上限。`0` 为严格关闭：不创建 coordinator task，也不产生 warm metrics。正值 N（封顶 3）会在启动后以及**每个探测周期**（`check_interval`）预热每组按延迟排名前 N 的 UDP 可用节点——测速后新变快的节点在赢得选择前就已拨好 transport。dispatch 仍最多四个并发 task。另有进程级总量上限 `4 × N`：合并后的候选按全局 UDP 延迟重排并截断，组再多也不会膨胀驻留 transport。 |
 | `max_concurrent_dials` | usize | `64` | 并发代理拨号上限（connect + 协议握手），按 runtime generation 作用域生效。内置 `direct`/`block` 拨号豁免——它们是本地 connect，已由连接准入上限约束。reload 后新拨号立即使用新上限；进行中的拨号保留原有许可。 |
 
 ### 拨号模式细节
@@ -510,6 +510,20 @@ candidate 使用计入 pool cap 的 caller-owned provisional session slot；lose
 取消会关闭 detached work，winner 则在 endpoint publication 前提交到捕获的
 generation。warm 的 `successes` 只计 `Ready` 或 `AlreadyReady`；
 `NotApplicable` 保持中性。
+
+`/stats` 另有顶层 `warm` 对象，为即时 gauge：
+
+```text
+warm = {
+  nodes: { preconnect, health, udp, traffic },
+  sessions: { anytls, tuic, juicity, hysteria2 }
+}
+```
+
+`nodes` 按热资源建立的原因统计当前热节点（一个节点可同时计入多个原因；
+无记录原因的热节点计为 `traffic`）。`sessions` 按协议统计驻留的 AnyTLS
+池 session 与已占用的 QUIC client 槽。gauge 跟随当前 generation：资源
+排干后节点在下一个快照中消失。
 
 环境变量：`HONK_UI_DOWNLOAD_URL` 覆盖 UI zip。
 

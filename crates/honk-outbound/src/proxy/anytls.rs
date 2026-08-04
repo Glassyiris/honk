@@ -3208,12 +3208,14 @@ mod tests {
         expect_handshake(&mut server).await;
         anytls.pool.insert(POOL_KEY, &session);
         assert!(runtime.has_warm_resources());
+        assert_eq!(runtime.warm_counts().sessions, 1);
 
         session.close();
         assert!(
             !runtime.has_warm_resources(),
             "a closed session no longer counts as warm"
         );
+        assert_eq!(runtime.warm_counts().sessions, 0);
     }
 
     #[tokio::test]

@@ -45,7 +45,7 @@ Source of truth: `crates/honk-config/src/*`, the dae parser in `crates/honk-conf
 | — | `dns_resolve_timeout_ms` | `2000` | Control-plane resolve timeout; not settable in dae syntax |
 | — | `relay_idle_timeout_secs` | `300` | Idle relay kill; `0` = off; not settable in dae syntax |
 | `preconnect_node_count` | `preconnect_node_count` | `'auto'` | Startup bare-TCP preconnect count. `'auto'` = `min(nodes,8)`; `0` strictly disables the warm-up. Candidates are each group's current pick first, then config order; only bare-TCP-poolable protocols qualify (AnyTLS/QUIC never consume a pooled bare TCP) and the built-in `direct`/`block` are excluded. |
-| `udp_warm_node_count` | `udp_warm_node_count` | `0` | Per-group UDP warm-up cap. `0` is strictly disabled: no coordinator task and no warm metrics. A positive value N (capped at 3) warms each group's top-N latency-ranked, UDP-capable leaves after startup and after every probe cycle (`check_interval`), so newly fast nodes are pre-dialed before they win a selection. Dispatch stays capped at four concurrent tasks. |
+| `udp_warm_node_count` | `udp_warm_node_count` | `0` | Per-group UDP warm-up cap. `0` is strictly disabled: no coordinator task and no warm metrics. A positive value N (capped at 3) warms each group's top-N latency-ranked, UDP-capable leaves after startup and after every probe cycle (`check_interval`), so newly fast nodes are pre-dialed before they win a selection. Dispatch stays capped at four concurrent tasks. A process-wide cap of `4 × N` bounds the total: the merged candidate set is re-ranked by global UDP latency and truncated, so many groups cannot inflate retained transports. |
 | `max_concurrent_dials` | `max_concurrent_dials` | `64` | Cap on concurrent proxied dials (connect + protocol handshake), scoped to the runtime generation. Built-in `direct`/`block` dials are exempt — they are local connects already bounded by the connection admission limit. A changed limit applies to new dials immediately on reload; in-flight dials keep their permits. |
 
 ```dae
@@ -581,6 +581,21 @@ preparation. AnyTLS candidates use caller-owned provisional session slots counte
 against the pool cap; loser cancellation closes detached work, while the winner
 commits into the captured generation before endpoint publication. Warm `successes`
 count only `Ready` or `AlreadyReady`; a `NotApplicable` result is neutral.
+
+`/stats` also carries a top-level `warm` object of point-in-time gauges:
+
+```text
+warm = {
+  nodes: { preconnect, health, udp, traffic },
+  sessions: { anytls, tuic, juicity, hysteria2 }
+}
+```
+
+`nodes` counts currently warm nodes by the reason their resources were
+established (a node may count under several reasons; a warm node with no
+recorded reason counts as `traffic`). `sessions` counts retained AnyTLS pool
+sessions and occupied QUIC client slots per protocol. Gauges track the live
+generation: a node whose resources drain drops out of the next snapshot.
 
 Env: `HONK_UI_DOWNLOAD_URL` for UI zip override.
 

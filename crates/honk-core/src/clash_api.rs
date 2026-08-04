@@ -929,12 +929,29 @@ async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json
         .collect();
     let pool = s.connection_pool.ready_metrics();
     let udp = s.stats.udp_snapshot();
+    let warm = s
+        .stats
+        .warm_snapshot(&s.runtime_registry.read().clone(), &s.connection_pool);
     Json(serde_json::json!({
         "outbounds": per_outbound,
         "pool": {
             "readyHits": pool.hits,
             "readyMisses": pool.misses,
             "entries": pool.entries,
+        },
+        "warm": {
+            "nodes": {
+                "preconnect": warm.preconnect_nodes,
+                "health": warm.health_nodes,
+                "udp": warm.udp_nodes,
+                "traffic": warm.traffic_nodes,
+            },
+            "sessions": {
+                "anytls": warm.anytls_sessions,
+                "tuic": warm.tuic_clients,
+                "juicity": warm.juicity_clients,
+                "hysteria2": warm.hysteria2_clients,
+            },
         },
         "udp": {
             "endpoint": {
