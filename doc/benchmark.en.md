@@ -128,51 +128,59 @@ Engine host 10.10.10.59, server host 10.10.10.70, methodology unchanged.
 **This round caught a real regression on main.** `85d6b61` (bound
 slow-consumer overflow, shipped in v0.0.1.beta.33/34) reset an AnyTLS stream
 the instant its 2 MiB overflow cap was crossed — but a fast LAN peer bursts
-that in ~4 ms, before the reader task is first scheduled, so single-stream
-iperf3 read 2–3 Mbps on both the old and the refactored binary (bisected:
-parent `c7cbd67` is good at 8.8 Gbps). The fix (`caa95b0` + `d00cb5e`)
-restores a stall grace: the per-stream byte cap is soft within a 3 s
-no-flush-progress window, the session-wide hard bound waits out the grace
-with the demux paused (TCP-window backpressure — the pre-`85d6b61`
-semantics), and only a stream with no reader progress past the grace is
-reset. Lab-verified: anytls-go 9.0 Gbps, zero overflow kills.
+past that in ~4 ms, before the reader task is first scheduled, so
+single-stream iperf3 read 2–3 Mbps on both the pre-refactor binary
+(`8a32149`) and the refactored one (bisected: parent `c7cbd67` is good at
+8.8 Gbps). The fix (`caa95b0` + `d00cb5e`) restores progress-based
+semantics: the per-stream byte cap is soft within a 3 s no-flush-progress
+grace — parked bytes are not a stall; at a session-wide cap the demux waits
+in 500 ms rounds for reader progress (pausing reads backpressures the
+server through the TCP window) and a timed-out round resets only the
+most-stalled parked stream. Lab-verified: anytls-sb 9388 / anytls-go 9396
+Mbps, zero overflow kills, relay counters confirm the tunnel path.
 
 ### TCP
 
 | engine | protocol | cold | hot p50 | hot p95 | bw (Mbps) | cpu | RSS (MB) |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| honk | direct | 0.0027 | – | – | 9405 | 0.21 | 53 |
-| honk | hy2 | 0.0033 | 0.0019 | 0.0022 | 5034 | 0.71 | 53 |
-| honk | tuic | 0.0027 | 0.0018 | 0.0021 | 6738 | 0.87 | 56 |
-| honk | ss2022 | 0.0030 | 0.0017 | 0.0026 | 9379 | 0.39 | 49 |
-| honk | trojan | 0.0108 | 0.0026 | 0.0087 | 9281 | 0.43 | 54 |
-| honk | anytls-sb | 0.0041 | 0.0026 | 0.0036 | 4408 | 0.28 | 51 |
-| honk | anytls-go | 0.0046 | 0.0029 | 0.0047 | 8468 | 0.47 | 61 |
+| honk | direct | 0.0022 | – | – | 9390¹ | 0.27 | 54 |
+| honk | hy2 | 0.0024 | 0.0011 | 0.0020 | 6156 | 1.03 | 56 |
+| honk | tuic | 0.0024 | 0.0013 | 0.0019 | 5293 | 0.71 | 54 |
+| honk | ss2022 | 0.0019 | 0.0013 | 0.0016 | 9398 | 0.37 | 54 |
+| honk | trojan | 0.0046 | 0.0010 | 0.0034 | 9377 | 0.47 | 50 |
+| honk | anytls-sb | 0.0025 | 0.0012 | 0.0015 | 9388 | 0.47 | 51 |
+| honk | anytls-go | 0.0023 | 0.0013 | 0.0017 | 9396 | 0.49 | 50 |
 
 ### UDP (warm state, `udp_warm_node_count: 8`)
 
 | engine | protocol | echo RTT p50 | bw Mbps (loss) | cpu |
 | --- | --- | --- | --- | --- |
-| honk | hy2 | 0.14 ms | 1658 (74.0%) | 1.03 |
-| honk | tuic | 0.13 ms | 163 (68.3%) | 0.17 |
-| honk | ss2022 | 0.15 ms | 5486 (0.6%) | – |
-| honk | trojan | 0.15 ms | 6183 (0.7%) | – |
-| honk | anytls-sb | 0.25 ms | 1286 (78.8%) | 0.82 |
-| honk | anytls-go | 0.19 ms | 1579 (74.3%) | 1.05 |
+| honk | hy2 | 0.12 ms | 1814 (72.7%) | 1.25 |
+| honk | tuic | 0.37 ms | 58 (68.6%)² | 0.07 |
+| honk | ss2022 | 0.15 ms | 1889 (68.7%) | 1.32 |
+| honk | trojan | 0.06 ms | 1394 (79.7%) | 1.08 |
+| honk | anytls-sb | 0.07 ms | 1370 (77.4%) | 0.92 |
+| honk | anytls-go | 0.22 ms | 1735 (71.7%) | 1.24 |
 
-(two UDP cpu cells lost their pid anchor mid-run; RSS cells for ss2022 and
-trojan were re-measured manually after a repeat bandwidth run.)
+¹ The direct row first read 6841 on a loaded lab window; three immediate
+re-runs read 9388/9389/9390.
+² TUIC UDP collapsed for every engine this round — the .70→.59 UDP link
+was near saturation (same lab-condition artifact as the 08-02 round), not
+an engine regression.
 
 ### Reading the 08-04 results
 
-- **No regression from the refactor**: every row matches or beats the 08-02
-  baseline within lab variance. hy2/tuic read higher (5034/6738 vs
-  2858/4134); the QUIC data path is unchanged code, so treat this as the
-  08-02 rows being depressed (lab load), not as a refactor speedup.
-- ss2022/trojan UDP read at warm-state rates consistent with the 08-01 warm
-  round (5.5–6.2 Gbps, <1% loss). TUIC UDP remains the known weak spot.
-- The AnyTLS rows (4408/8468 Mbps) validate the stall-grace fix and match
-  the pre-regression baseline (4575/8937).
+- **No regression from the refactor**: against the same-day pre-refactor
+  arm (`8a32149`) every non-AnyTLS row matches within lab variance (hy2
+  6156 vs 5966, tuic 5293 vs 5546, ss2022/trojan line rate both ways). The
+  higher readings vs the 08-02 round (hy2 2858, tuic 4134) reflect an idle
+  lab, not a refactor speedup — the QUIC data path is unchanged code.
+- **AnyTLS is the big win**: the stall-grace fix takes anytls-sb from the
+  4575 pre-regression baseline to 9388 (line rate) and anytls-go to 9396 —
+  the demux-backpressure design also removes the overflow churn the old
+  park-based path produced under fast peers. The pre-refactor binary
+  measured 2–3 Mbps on both rows (bug present).
+- TUIC UDP remains the known weak spot (lab link caveat above).
 
 ## Results (2026-08-02, three-engine: honk vs dae vs sing-box)
 
