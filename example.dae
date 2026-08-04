@@ -22,8 +22,19 @@ global {
     check_interval: 30s
     # 新节点延迟 <= 旧节点延迟 - tolerance 才切换
     check_tolerance: 50ms
-    # UDP 预热：启动/重载时给选中的 UDP 组叶子预建会话（0=关闭，最多 4 并发）
+    # 预热三件套(详细语义见 doc/configuration.zh.md 的「预热与拨号预算」):
+    # - 健康探测只测不暖:探测不会给冷节点留下常驻会话,无需担心节点多。
+    # - UDP 预热:每组每 IP 族 top-N 个 UDP 叶子预建会话(0=关闭;
+    #   进程级总量自动封顶为 4×N,组多也不会失控)。
     # udp_warm_node_count: 8
+    # - TCP/TLS 预热:每组每 IP 族保活最快的 K 个 AnyTLS/TCP 叶子(默认 1;
+    #   节点少(<50)建议 3-5,大订阅保持 1-2)。
+    # tcp_warm_node_count: 3
+    # - 启动裸 TCP 预连接:'auto'(默认,最多 8 个,各组当前选中优先)
+    #   / 0(关闭) / N;AnyTLS/QUIC 与内置 direct/block 自动排除。
+    # preconnect_node_count: 'auto'
+    # 并发代理拨号上限(默认 64,direct/block 本地拨号不占额度)
+    # max_concurrent_dials: 64
 }
 
 # 订阅（可选）：节点只合并进内存，不回写本文件

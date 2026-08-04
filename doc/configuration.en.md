@@ -183,6 +183,23 @@ All of these live in the `global { ... }` section:
 | `domain+` | DNS does not go through honk |
 | `domain++` | Force sniff and re-route on SNI/Host |
 
+### Warm-up and dial budget
+
+honk warms up in three distinct ways, all budgeted — none of them scales
+with raw node count, so large subscriptions are safe:
+
+| Mechanism | Key | Default | Notes |
+| ----------- | ----- | --------- | ------- |
+| Bare TCP preconnect at startup | `preconnect_node_count` | `'auto'` | `'auto'` = up to 8 nodes (each group's current pick first, then config order); `0` disables; `N` pins the count. Only bare-TCP-poolable protocols qualify — AnyTLS/QUIC and the built-in `direct`/`block` are always skipped. |
+| TCP/TLS warm set | `tcp_warm_node_count` | `1` | Keeps the K fastest AnyTLS/TCP leaves per group per IP family warm. With few nodes (<50) `3`-`5` noticeably cuts first-hit latency on off-winner chains; with large subscriptions keep `1`-`2`. |
+| UDP warm set | `udp_warm_node_count` | `0` | Top-N UDP leaves per group per IP family; the process-wide total is capped at `4×N`, so many groups cannot blow the budget. |
+| Concurrent dial cap | `max_concurrent_dials` | `64` | Bounds concurrent proxied dials (connect + handshake). Built-in `direct`/`block` dials are exempt (local connects). Applies per generation — reload changes take effect for new dials only. |
+
+Health checks probe but never warm: a probe on a cold node leaves no
+session behind, so `check_interval` on a 400-node subscription does not
+create 400 idle tunnels. `/stats` exposes the live warm inventory under
+`warm` (reason × hot-node count, sessions per protocol).
+
 ## 6. Nodes and share links
 
 Nodes are declared as **share links** inside the `node { ... }` section, either with an explicit tag or bare. Single- and double-quoted forms are both accepted; an entry that fails to parse is skipped with a warning on stderr:

@@ -13,6 +13,16 @@ global {
 
     # Group will switch node only when new_latency <= old_latency - tolerance.
     check_tolerance: 30ms
+
+    # 预热与拨号预算(小中规模节点的推荐值;大订阅见 doc/configuration.zh.md)
+    # 每组每 IP 族保活的最快 AnyTLS/TCP 叶子数(默认 1;节点少时可调到 3-5)
+    tcp_warm_node_count: 3
+    # 每组 UDP 预热候选(0=关闭;进程级总量自动封顶为 4 倍该值)
+    udp_warm_node_count: 8
+    # 启动裸 TCP 预连接:'auto'(默认,最多 8 个) / 0(关闭) / N;AnyTLS/QUIC 自动跳过
+    # preconnect_node_count: 'auto'
+    # 并发代理拨号上限(默认 64;direct/block 不占额度)
+    # max_concurrent_dials: 64
 }
 
 # 代理节点链
