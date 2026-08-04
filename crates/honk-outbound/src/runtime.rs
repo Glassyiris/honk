@@ -79,10 +79,12 @@ pub enum ProtocolRuntime {
 /// A protocol client stored in [`QuicRuntime`]. Implemented by the
 /// TUIC/Juicity/Hysteria2 per-server clients so a terminating generation
 /// can force-close the shared connection without knowing the concrete type.
+#[async_trait::async_trait]
 pub trait QuicRuntimeClient: Send + Sync + 'static {
     fn into_erased(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync>;
-    /// Best-effort synchronous close of the cached connection and endpoint.
-    fn force_close(&self);
+    /// Close the cached connection and endpoint, awaiting any in-flight
+    /// dial so its late-arriving connection is closed too.
+    async fn force_close(&self);
 }
 
 /// Generation-owned storage for protocol-specific QUIC clients.
@@ -92,6 +94,9 @@ pub trait QuicRuntimeClient: Send + Sync + 'static {
 /// one client/connection single-flight for this generation.
 pub struct QuicRuntime {
     clients: tokio::sync::Mutex<HashMap<std::any::TypeId, Arc<dyn QuicRuntimeClient>>>,
+    /// Set by [`Self::force_close_all`] under the clients lock, so a client
+    /// build can never slip past a completed close.
+    closed: AtomicBool,
 }
 
 impl std::fmt::Debug for QuicRuntime {
@@ -104,6 +109,7 @@ impl QuicRuntime {
     pub(crate) fn new() -> Self {
         Self {
             clients: tokio::sync::Mutex::new(HashMap::new()),
+            closed: AtomicBool::new(false),
         }
     }
 
@@ -114,6 +120,9 @@ impl QuicRuntime {
         Fut: Future<Output = anyhow::Result<Arc<T>>>,
     {
         let mut clients = self.clients.lock().await;
+        if self.closed.load(Ordering::Acquire) {
+            anyhow::bail!("QUIC runtime is closed");
+        }
         let key = std::any::TypeId::of::<T>();
         if let Some(client) = clients.get(&key) {
             return Arc::clone(client)
@@ -126,14 +135,15 @@ impl QuicRuntime {
         Ok(client)
     }
 
-    /// Force-close every cached client. Best-effort: a client locked by an
-    /// in-flight dial is skipped, and that dial's caller observes the
-    /// terminal generation through the registry checks instead.
-    pub(crate) fn force_close_all(&self) {
-        if let Ok(clients) = self.clients.try_lock() {
-            for client in clients.values() {
-                client.force_close();
-            }
+    /// Force-close every cached client and reject future client builds.
+    /// Awaits the construction/dial critical sections: a client or
+    /// connection completed just before the close is closed here rather
+    /// than leaked into a terminating generation.
+    pub(crate) async fn force_close_all(&self) {
+        let clients = self.clients.lock().await;
+        self.closed.store(true, Ordering::Release);
+        for client in clients.values() {
+            client.force_close().await;
         }
     }
 }
@@ -385,9 +395,7 @@ impl OutboundRuntimeRegistry {
                 nodes: map,
                 terminal: AtomicBool::new(false),
                 moved_out: parking_lot::Mutex::new(HashSet::new()),
-                dial_semaphore: Arc::new(tokio::sync::Semaphore::new(
-                    max_concurrent_dials.max(1),
-                )),
+                dial_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent_dials.max(1))),
             },
             reused,
         ))
@@ -497,16 +505,16 @@ impl OutboundRuntimeRegistry {
     /// Force-close every owned runtime. Used only after process-level flow
     /// drain; unlike retirement this deliberately terminates all sessions.
     /// Idempotent, including after [`Self::begin_retirement`].
-    pub fn shutdown(&self) {
+    pub async fn shutdown(&self) {
         self.terminal.store(true, Ordering::Release);
-        let moved_out = self.moved_out.lock();
+        let moved_out: HashSet<uuid::Uuid> = self.moved_out.lock().clone();
         for (id, runtime) in &self.nodes {
             if moved_out.contains(id) {
                 continue;
             }
             match &runtime.runtime {
                 ProtocolRuntime::AnyTls(anytls) => anytls.pool.shutdown(),
-                ProtocolRuntime::Quic(quic) => quic.force_close_all(),
+                ProtocolRuntime::Quic(quic) => quic.force_close_all().await,
                 ProtocolRuntime::None => {}
             }
         }
@@ -608,8 +616,8 @@ mod tests {
         assert!(!runtime.tls_connector_loaded());
     }
 
-    #[test]
-    fn build_and_get_roundtrip() {
+    #[tokio::test]
+    async fn build_and_get_roundtrip() {
         let nodes = vec![
             node("a", NodeProtocol::AnyTLS),
             node("b", NodeProtocol::Trojan),
@@ -620,7 +628,7 @@ mod tests {
         assert_eq!(rt.node.name, "a");
         assert!(rt.capabilities.multiplexed);
         assert!(rt.capabilities.udp);
-        registry.shutdown(); // terminal cleanup is idempotent
+        registry.shutdown().await; // terminal cleanup is idempotent
     }
 
     #[test]
@@ -678,8 +686,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn reused_runtime_is_closed_by_the_new_owner_only_after_commit() {
+    #[tokio::test]
+    async fn reused_runtime_is_closed_by_the_new_owner_only_after_commit() {
         let unchanged = node("anytls", NodeProtocol::AnyTLS);
         let first = OutboundRuntimeRegistry::build(std::slice::from_ref(&unchanged)).unwrap();
         let (second, _) = OutboundRuntimeRegistry::build_reusing(
@@ -691,7 +699,7 @@ mod tests {
 
         // A build alone transfers nothing: the old generation still closes
         // the runtime if the reload aborts before the commit point.
-        first.shutdown();
+        first.shutdown().await;
         let ProtocolRuntime::AnyTls(anytls) = &second.get(&unchanged.id).unwrap().runtime else {
             panic!("anytls runtime expected");
         };
@@ -711,7 +719,7 @@ mod tests {
         .unwrap();
         first.mark_moved_out(reused);
         first.drain_session_pools();
-        first.shutdown();
+        first.shutdown().await;
         let ProtocolRuntime::AnyTls(anytls) = &second.get(&unchanged.id).unwrap().runtime else {
             panic!("anytls runtime expected");
         };
@@ -719,7 +727,7 @@ mod tests {
             !anytls.pool.is_retired(),
             "committed reload: old generation leaves the moved runtime alone"
         );
-        second.shutdown();
+        second.shutdown().await;
         assert!(
             anytls.pool.is_retired(),
             "the new generation owns the reused runtime's shutdown"
@@ -746,15 +754,46 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn retirement_is_terminal_and_shutdown_remains_idempotent() {
+    #[tokio::test]
+    async fn quic_runtime_close_covers_clients_and_rejects_new_builds() {
+        struct FakeClient(AtomicBool);
+        #[async_trait::async_trait]
+        impl QuicRuntimeClient for FakeClient {
+            fn into_erased(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
+                self
+            }
+            async fn force_close(&self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let runtime = QuicRuntime::new();
+        let client: Arc<FakeClient> = runtime
+            .client(|| async { Ok(Arc::new(FakeClient(AtomicBool::new(false)))) })
+            .await
+            .unwrap();
+        runtime.force_close_all().await;
+        assert!(client.0.load(Ordering::Acquire));
+        assert!(
+            runtime
+                .client::<FakeClient, _, _>(|| async {
+                    Ok(Arc::new(FakeClient(AtomicBool::new(false))))
+                })
+                .await
+                .is_err(),
+            "a closed QUIC runtime rejects new client builds"
+        );
+    }
+
+    #[tokio::test]
+    async fn retirement_is_terminal_and_shutdown_remains_idempotent() {
         let anytls = node("anytls", NodeProtocol::AnyTLS);
         let registry = OutboundRuntimeRegistry::build(&[anytls]).unwrap();
         assert!(!registry.is_shutdown());
         registry.begin_retirement();
         assert!(registry.is_shutdown());
-        registry.shutdown();
-        registry.shutdown();
+        registry.shutdown().await;
+        registry.shutdown().await;
         assert!(
             registry.is_shutdown(),
             "retirement and force shutdown remain terminal and idempotent"

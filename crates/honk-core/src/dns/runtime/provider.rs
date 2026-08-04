@@ -49,8 +49,10 @@ impl PreparedPublication<'_> {
             oldest.request_cancellation();
             // The bounded-generation policy is an explicit force-close: do
             // not leave this evicted runtime's outbound pools unreachable by
-            // the later process-shutdown sweep.
-            oldest.force_shutdown_outbound();
+            // the later process-shutdown sweep. Commit is synchronous (it
+            // runs under the publication guards), so the close is fired off
+            // detached; the registry shutdown is idempotent.
+            tokio::spawn(async move { oldest.force_shutdown_outbound().await });
         }
         let deadline = self.deadline;
         self.supervisors
@@ -136,7 +138,7 @@ impl DnsServiceProvider {
         };
         while supervisors.join_next().await.is_some() {}
         for runtime in runtimes {
-            runtime.force_shutdown_outbound();
+            runtime.force_shutdown_outbound().await;
         }
     }
 }

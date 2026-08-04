@@ -3194,7 +3194,7 @@ mod tests {
 
         assert!(!runtime.tls_connector_loaded());
         drop(transport);
-        generation.shutdown();
+        generation.shutdown().await;
     }
 
     #[tokio::test]
@@ -4747,7 +4747,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), dial_started.notified())
             .await
             .expect("warm dial must start before its generation is shut down");
-        generation.shutdown();
+        generation.shutdown().await;
         let result = tokio::time::timeout(Duration::from_secs(1), warm)
             .await
             .expect("shutdown must unblock the warm future")

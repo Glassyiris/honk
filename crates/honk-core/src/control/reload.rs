@@ -107,8 +107,8 @@ impl ControlPlane {
         // current generation's runtime (live sessions stay up); the
         // transfer is recorded on the old generation only at the commit
         // point below, so an aborted build leaves its ownership untouched.
-        let (new_runtime_registry, reused_runtime_ids) = match
-            honk_outbound::runtime::OutboundRuntimeRegistry::build_reusing(
+        let (new_runtime_registry, reused_runtime_ids) =
+            match honk_outbound::runtime::OutboundRuntimeRegistry::build_reusing(
                 &new_config.nodes,
                 new_config.global.max_concurrent_dials,
                 Some(&self.runtime_registry.read()),
@@ -1994,7 +1994,7 @@ mod atomic_reload_tests {
             (5, 5, 0)
         );
 
-        generation.shutdown();
+        generation.shutdown().await;
         let neutral_stats = Arc::new(StatsManager::new());
         let neutral_dispatch = Arc::new(|_generation, _id| async {
             Err(anyhow::anyhow!("old generation was shut down"))
@@ -2066,12 +2066,12 @@ mod atomic_reload_tests {
                         }
                         Outcome::LiveError => Err(anyhow::anyhow!("live warm error")),
                         Outcome::TerminalError => {
-                            generation.shutdown();
+                            generation.shutdown().await;
                             Err(anyhow::anyhow!("terminal warm error"))
                         }
                         Outcome::LivePanic => panic!("live warm panic"),
                         Outcome::TerminalPanic => {
-                            generation.shutdown();
+                            generation.shutdown().await;
                             panic!("terminal warm panic")
                         }
                     }
@@ -2228,6 +2228,6 @@ mod atomic_reload_tests {
         ));
 
         cp.stop_udp_warm_coordinator().await;
-        new_generation.shutdown();
+        new_generation.shutdown().await;
     }
 }

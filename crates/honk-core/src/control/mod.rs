@@ -1234,7 +1234,8 @@ impl ControlPlane {
                             // Active flows own the current runtime until the
                             // drain completes; only then terminally close its
                             // AnyTLS pools and reject any late warm work.
-                            self.runtime_registry.read().clone().shutdown();
+                            let generation = self.runtime_registry.read().clone();
+                            generation.shutdown().await;
                             break;
                         }
                     }

@@ -535,6 +535,9 @@ struct State<C> {
     /// the family of the resolved server address changes.
     endpoint: Option<(bool, Endpoint)>,
     conn: Option<(Connection, Arc<C>)>,
+    /// Set by [`QuicClient::force_close`]: future dials fail instead of
+    /// re-dialing into a closed client.
+    closed: bool,
 }
 
 /// Per-server QUIC connection holder.
@@ -582,6 +585,7 @@ impl<C> QuicClient<C> {
             state: Mutex::new(State {
                 endpoint: None,
                 conn: None,
+                closed: false,
             }),
         }
     }
@@ -621,6 +625,9 @@ impl<C> QuicClient<C> {
         Fut: std::future::Future<Output = anyhow::Result<C>>,
     {
         let mut state = self.state.lock().await;
+        if state.closed {
+            anyhow::bail!("QUIC client is closed");
+        }
         if let Some((conn, ctx)) = &state.conn
             && conn.close_reason().is_none()
         {
@@ -699,6 +706,13 @@ impl<C> QuicClient<C> {
             conn.close(VarInt::from_u32(0), b"setup failed");
         })?;
         let ctx = Arc::new(ctx);
+        // The single-flight mutex makes this unreachable today; the guard
+        // keeps a freshly dialed connection out of a closed client if the
+        // critical section is ever narrowed.
+        if state.closed {
+            conn.close(VarInt::from_u32(0), b"generation shutdown");
+            anyhow::bail!("QUIC client closed during dial");
+        }
         state.conn = Some((conn.clone(), Arc::clone(&ctx)));
         Ok((conn, ctx))
     }
@@ -726,19 +740,20 @@ impl<C> QuicClient<C> {
             .is_some_and(|(conn, _)| conn.close_reason().is_none())
     }
 
-    /// Close the cached connection and endpoint without waiting for the
-    /// state lock: a generation shutdown must not queue behind an in-flight
-    /// dial (that dial's caller fails through the terminal-generation
-    /// checks instead). Flows already owning a `(Connection, Arc<C>)` pair
+    /// Close the cached connection and endpoint, and reject future dials.
+    /// Awaits an in-flight dial's single-flight section instead of skipping:
+    /// that dial caches its fresh connection first, and this close then
+    /// covers it — a try-lock skip would leak the late connection and its
+    /// endpoint driver. Flows already owning a `(Connection, Arc<C>)` pair
     /// keep it — this only stops future reuse.
-    pub fn force_close(&self) {
-        if let Ok(mut state) = self.state.try_lock() {
-            if let Some((conn, _)) = state.conn.take() {
-                conn.close(VarInt::from_u32(0), b"generation shutdown");
-            }
-            if let Some((_, endpoint)) = state.endpoint.take() {
-                endpoint.close(VarInt::from_u32(0), b"generation shutdown");
-            }
+    pub async fn force_close(&self) {
+        let mut state = self.state.lock().await;
+        state.closed = true;
+        if let Some((conn, _)) = state.conn.take() {
+            conn.close(VarInt::from_u32(0), b"generation shutdown");
+        }
+        if let Some((_, endpoint)) = state.endpoint.take() {
+            endpoint.close(VarInt::from_u32(0), b"generation shutdown");
         }
     }
 }
@@ -1112,6 +1127,88 @@ mod brutal_tests {
         cc.on_congestion_event(Instant::now(), Instant::now(), true, 12000);
         cc.on_congestion_event(Instant::now(), Instant::now(), false, 0);
         assert_eq!(cc.window(), before);
+    }
+}
+
+#[cfg(test)]
+mod client_tests {
+    use super::*;
+
+    async fn test_client(port: u16) -> QuicClient<()> {
+        let node = honk_config::node::Node {
+            name: "quic-test".to_string(),
+            host: "127.0.0.1".to_string(),
+            address: format!("127.0.0.1:{port}"),
+            port,
+            skip_cert_verify: true,
+            ..Default::default()
+        };
+        let config = client_config(&node, &[b"h3"], QuicClientOptions::default())
+            .await
+            .unwrap();
+        QuicClient::new("127.0.0.1", port, "localhost", config)
+    }
+
+    fn spawn_accept_loop(endpoint: Endpoint) {
+        tokio::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                tokio::spawn(async move {
+                    let _ = incoming.await;
+                });
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn force_close_covers_connection_cached_by_in_flight_dial() {
+        let (endpoint, addr) = testutil::server_endpoint(&[b"h3"], true).unwrap();
+        spawn_accept_loop(endpoint);
+        let client = Arc::new(test_client(addr.port()).await);
+
+        // Park the dial inside its setup closure: it holds the single-flight
+        // state lock with the handshake already completed.
+        let (setup_entered, entered) = tokio::sync::oneshot::channel::<()>();
+        let (release_setup, release) = tokio::sync::oneshot::channel::<()>();
+        let dial = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move {
+                client
+                    .connection_with(Duration::from_secs(5), move |_conn| async move {
+                        let _ = setup_entered.send(());
+                        let _ = release.await;
+                        Ok::<(), anyhow::Error>(())
+                    })
+                    .await
+            }
+        });
+        entered.await.unwrap();
+
+        let closer = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { client.force_close().await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !closer.is_finished(),
+            "force_close must wait out the in-flight dial"
+        );
+
+        let _ = release_setup.send(());
+        let (conn, _) = dial.await.unwrap().unwrap();
+        closer.await.unwrap();
+        assert!(
+            conn.close_reason().is_some(),
+            "a connection cached just before the close must still be closed"
+        );
+        assert!(
+            client
+                .connection_with(Duration::from_secs(1), |_conn| async {
+                    Ok::<(), anyhow::Error>(())
+                })
+                .await
+                .is_err(),
+            "a closed client rejects new dials"
+        );
     }
 }
 

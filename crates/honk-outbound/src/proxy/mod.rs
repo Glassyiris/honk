@@ -816,7 +816,7 @@ mod tests {
         let generation = Arc::new(
             crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
         );
-        generation.shutdown();
+        generation.shutdown().await;
 
         assert!(
             ProxyRegistry::default_resolver()
@@ -838,7 +838,7 @@ mod tests {
         let generation = Arc::new(
             crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
         );
-        generation.shutdown();
+        generation.shutdown().await;
 
         assert!(
             ProxyRegistry::default_resolver()

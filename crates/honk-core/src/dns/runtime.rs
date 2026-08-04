@@ -196,9 +196,9 @@ impl DnsRuntime {
         }
     }
 
-    fn force_shutdown_outbound(&self) {
+    async fn force_shutdown_outbound(&self) {
         if let Some(runtime) = &self.parts.outbound_runtime {
-            runtime.shutdown();
+            runtime.shutdown().await;
         }
     }
 }

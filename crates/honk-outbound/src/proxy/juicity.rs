@@ -114,13 +114,14 @@ struct JuicityClient {
     password: String,
 }
 
+#[async_trait]
 impl crate::runtime::QuicRuntimeClient for JuicityClient {
     fn into_erased(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
         self
     }
 
-    fn force_close(&self) {
-        self.quic.force_close();
+    async fn force_close(&self) {
+        self.quic.force_close().await;
     }
 }
 

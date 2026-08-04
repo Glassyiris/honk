@@ -460,13 +460,14 @@ struct Hy2Client {
     rx_bps: u64,
 }
 
+#[async_trait]
 impl crate::runtime::QuicRuntimeClient for Hy2Client {
     fn into_erased(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
         self
     }
 
-    fn force_close(&self) {
-        self.quic.force_close();
+    async fn force_close(&self) {
+        self.quic.force_close().await;
     }
 }
 
