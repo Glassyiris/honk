@@ -3218,3 +3218,44 @@ fn preconnect_candidates_auto_caps_at_eight() {
         "an explicit count smaller than the eligible set is honored"
     );
 }
+
+#[test]
+fn probe_warm_runtime_reuses_only_warm_or_stateless_nodes() {
+    let anytls = Node {
+        id: uuid::Uuid::new_v4(),
+        name: "anytls".into(),
+        protocol: NodeProtocol::AnyTLS,
+        address: "anytls.example.com:443".into(),
+        ..Default::default()
+    };
+    let trojan = Node {
+        id: uuid::Uuid::new_v4(),
+        name: "trojan".into(),
+        protocol: NodeProtocol::Trojan,
+        address: "trojan.example.com:443".into(),
+        ..Default::default()
+    };
+    let absent = Node {
+        id: uuid::Uuid::new_v4(),
+        name: "absent".into(),
+        protocol: NodeProtocol::SS,
+        address: "absent.example.com:443".into(),
+        ..Default::default()
+    };
+    let generation =
+        honk_outbound::runtime::OutboundRuntimeRegistry::build(&[anytls.clone(), trojan.clone()])
+            .unwrap();
+
+    assert!(
+        probers::warm_runtime(&generation, &anytls).is_none(),
+        "a cold AnyTLS node probes through an ephemeral runtime"
+    );
+    assert!(
+        probers::warm_runtime(&generation, &absent).is_none(),
+        "a node outside the generation probes ephemerally"
+    );
+    assert!(
+        probers::warm_runtime(&generation, &trojan).is_some(),
+        "a session-less protocol has nothing to retain; reuse the generation runtime"
+    );
+}

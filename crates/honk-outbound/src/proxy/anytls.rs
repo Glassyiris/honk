@@ -3188,6 +3188,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn warm_resources_flip_with_pool_session() {
+        let node = Node {
+            id: uuid::Uuid::new_v4(),
+            name: "warm-resources".into(),
+            protocol: NodeProtocol::AnyTLS,
+            address: "127.0.0.1:9".into(),
+            ..Default::default()
+        };
+        let generation =
+            crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
+        let runtime = generation.get(&node.id).unwrap();
+        assert!(!runtime.has_warm_resources());
+
+        let crate::runtime::ProtocolRuntime::AnyTls(anytls) = &runtime.runtime else {
+            panic!("expected AnyTLS runtime")
+        };
+        let (session, mut server) = establish_test_session("warm-resources").await;
+        expect_handshake(&mut server).await;
+        anytls.pool.insert(POOL_KEY, &session);
+        assert!(runtime.has_warm_resources());
+
+        session.close();
+        assert!(
+            !runtime.has_warm_resources(),
+            "a closed session no longer counts as warm"
+        );
+    }
+
+    #[tokio::test]
     async fn runtime_dial_stays_on_captured_pool_after_registry_swap() {
         let old_node = Node {
             id: uuid::Uuid::new_v4(),

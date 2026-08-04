@@ -146,6 +146,17 @@ impl QuicRuntime {
             client.force_close().await;
         }
     }
+
+    /// Whether any protocol client already occupies a slot. A contended lock
+    /// means a client build is in flight, which counts as warm: callers use
+    /// this to decide between reusing the runtime and dialing ephemerally,
+    /// and the ephemeral dial would only duplicate that build.
+    pub(crate) fn has_client(&self) -> bool {
+        self.clients
+            .try_lock()
+            .map(|c| !c.is_empty())
+            .unwrap_or(true)
+    }
 }
 
 /// Lazily built TLS state. An in-flight handshake owns an `Arc`, so evicting
@@ -250,6 +261,23 @@ impl NodeRuntime {
             anyhow::bail!("node '{}' has no AnyTLS runtime", self.node.name);
         };
         runtime.tls.get_or_build(&self.node)
+    }
+
+    /// Whether dialing through this runtime reuses already-warm session
+    /// state instead of establishing — and then retaining — new state.
+    /// Health probes key on this: a warm runtime is reused (the probe then
+    /// measures the hot path), a cold one is bypassed for an ephemeral
+    /// one-shot dial so a probe cycle never fills every node's pool with
+    /// standby sessions. Runtimes without session state report warm: the
+    /// generation and ephemeral forms of their dial are identical.
+    pub fn has_warm_resources(&self) -> bool {
+        match &self.runtime {
+            ProtocolRuntime::None => true,
+            ProtocolRuntime::AnyTls(runtime) => runtime
+                .pool
+                .has_usable_session(crate::proxy::anytls::POOL_KEY),
+            ProtocolRuntime::Quic(runtime) => runtime.has_client(),
+        }
     }
 
     fn tls_connector_sample(&self) -> Option<(Instant, u64)> {
@@ -614,6 +642,41 @@ mod tests {
             1
         );
         assert!(!runtime.tls_connector_loaded());
+    }
+
+    #[tokio::test]
+    async fn warm_resources_report_session_state_only() {
+        let anytls = node("anytls", NodeProtocol::AnyTLS);
+        let trojan = node("trojan", NodeProtocol::Trojan);
+        let tuic = node("tuic", NodeProtocol::Tuic);
+        let registry =
+            OutboundRuntimeRegistry::build(&[anytls.clone(), trojan.clone(), tuic.clone()])
+                .unwrap();
+
+        let anytls_runtime = registry.get(&anytls.id).unwrap();
+        let tuic_runtime = registry.get(&tuic.id).unwrap();
+        assert!(!anytls_runtime.has_warm_resources());
+        assert!(!tuic_runtime.has_warm_resources());
+        assert!(
+            registry.get(&trojan.id).unwrap().has_warm_resources(),
+            "session-less protocols have nothing to retain either way"
+        );
+
+        struct FakeClient;
+        #[async_trait::async_trait]
+        impl QuicRuntimeClient for FakeClient {
+            fn into_erased(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
+                self
+            }
+            async fn force_close(&self) {}
+        }
+        let ProtocolRuntime::Quic(quic) = &tuic_runtime.runtime else {
+            panic!("tuic runtime expected");
+        };
+        quic.client(|| async { Ok(Arc::new(FakeClient)) })
+            .await
+            .unwrap();
+        assert!(tuic_runtime.has_warm_resources());
     }
 
     #[tokio::test]

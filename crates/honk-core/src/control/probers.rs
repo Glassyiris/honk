@@ -62,9 +62,6 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                 .find(node.protocol)
                 .ok_or_else(|| format!("no handler for protocol {:?}", node.protocol))?;
             let tcp = entry.tcp.clone();
-            let runtime = generation
-                .get(&node.id)
-                .unwrap_or_else(|| honk_outbound::runtime::NodeRuntime::ephemeral(&node));
 
             let start = std::time::Instant::now();
             let connect_timeout = {
@@ -83,10 +80,23 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
             } else {
                 url_host(&check_url)
             };
-            let proxy = tcp
-                .dial_runtime(runtime, addr, domain.as_deref(), connect_timeout)
-                .await
-                .map_err(|e| format!("dial failed: {}", e))?;
+            // Dial through the generation runtime only when the node already
+            // holds warm session state: a cold-node probe through the pool
+            // would leave a janitor-kept standby session behind on every
+            // node after every cycle. Cold nodes get an ephemeral one-shot
+            // dial that retains nothing — their measured latency is then the
+            // real cold-start latency, while warm nodes report the hot path.
+            let proxy = match warm_runtime(&generation, &node) {
+                Some(runtime) => {
+                    tcp.dial_runtime(runtime, addr, domain.as_deref(), connect_timeout)
+                        .await
+                }
+                None => {
+                    tcp.dial(&node, addr, domain.as_deref(), connect_timeout)
+                        .await
+                }
+            }
+            .map_err(|e| format!("dial failed: {}", e))?;
 
             // Send HTTP request over the proxy connection.
             Self::http_check(proxy.stream, &check_url, &check_method).await?;
@@ -99,6 +109,18 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
             Ok(elapsed)
         })
     }
+}
+
+/// The node's generation runtime when it already holds warm session state,
+/// else `None` — probers then take the ephemeral one-shot path so a probe
+/// cycle never leaves retained sessions/clients on cold nodes.
+pub(super) fn warm_runtime(
+    generation: &honk_outbound::runtime::OutboundRuntimeRegistry,
+    node: &Node,
+) -> Option<Arc<honk_outbound::runtime::NodeRuntime>> {
+    generation
+        .get(&node.id)
+        .filter(|runtime| runtime.has_warm_resources())
 }
 
 /// Bare host part of a check URL (`http://host[:port]/path` → `host`).
@@ -256,7 +278,7 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
             };
 
             let start = std::time::Instant::now();
-            let transport = match generation.get(&node.id) {
+            let transport = match warm_runtime(&generation, &node) {
                 Some(runtime) => {
                     packet
                         .dial_udp_transport_runtime(runtime, dns_target, None, connect_timeout)
