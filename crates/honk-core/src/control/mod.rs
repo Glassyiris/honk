@@ -245,13 +245,13 @@ impl ControlPlane {
         // Per-node runtime registry (single owner of session-layer
         // resources, keyed by Node.id). Invalid node sets (nil/duplicate
         // UUIDs) are a fatal config error at startup.
-        let runtime_registry = honk_outbound::runtime::OutboundRuntimeRegistry::build_reusing(
+        let (runtime_registry, _) = honk_outbound::runtime::OutboundRuntimeRegistry::build_reusing(
             &config.nodes,
             config.global.max_concurrent_dials,
             None,
         )
-        .map_err(|e| anyhow::anyhow!("invalid node set: {}", e))?
-        .into_shared();
+        .map_err(|e| anyhow::anyhow!("invalid node set: {}", e))?;
+        let runtime_registry = runtime_registry.into_shared();
         let outbound_runtime = runtime_registry.read().clone();
         dns_upstream_pool.set_runtime_generation(Arc::clone(&outbound_runtime))?;
         {

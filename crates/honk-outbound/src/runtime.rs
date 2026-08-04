@@ -11,7 +11,7 @@
 //! AnyTLS owns its node-local session pool here; the QUIC protocols own
 //! their per-node client (and thereby the shared QUIC connection) here.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -220,10 +220,6 @@ pub struct NodeRuntime {
     pub node: Arc<Node>,
     pub capabilities: OutboundCapabilities,
     pub runtime: ProtocolRuntime,
-    /// Set when a successor generation adopts this runtime verbatim; the
-    /// retiring generation must not drain or shut down sessions the
-    /// successor still serves.
-    adopted: AtomicBool,
 }
 
 impl NodeRuntime {
@@ -236,7 +232,6 @@ impl NodeRuntime {
             runtime: crate::descriptor::descriptor(node.protocol)
                 .generation_runtime
                 .build(),
-            adopted: AtomicBool::new(false),
         })
     }
 
@@ -270,8 +265,9 @@ impl NodeRuntime {
     }
 }
 
-/// Full node-config equality for runtime adoption, ignoring the parse-time
-/// `created_at`/`updated_at` stamps (metadata, not dial configuration).
+/// Full node-config equality for runtime reuse across generations, ignoring
+/// the parse-time `created_at`/`updated_at` stamps (metadata, not dial
+/// configuration).
 fn same_node_config(a: &Node, b: &Node) -> bool {
     let (mut a, b) = (a.clone(), b.clone());
     a.created_at = b.created_at;
@@ -303,6 +299,11 @@ pub enum RuntimeRegistryError {
 pub struct OutboundRuntimeRegistry {
     nodes: HashMap<uuid::Uuid, Arc<NodeRuntime>>,
     terminal: AtomicBool,
+    /// Runtimes a successor generation took over at the reload commit point.
+    /// Recorded only after the successor is published, so an aborted reload
+    /// leaves this generation's ownership untouched; drain/shutdown skip
+    /// exactly these entries (the successor closes them as their full owner).
+    moved_out: parking_lot::Mutex<HashSet<uuid::Uuid>>,
     /// Admission budget for concurrent proxied dials, scoped to this
     /// generation: a reload applies a changed limit to new work at once
     /// while in-flight dials keep their permits until they finish.
@@ -321,20 +322,25 @@ impl OutboundRuntimeRegistry {
             honk_config::config::GlobalConfig::default().max_concurrent_dials,
             None,
         )
+        .map(|(registry, _)| registry)
     }
 
     /// [`Self::build`] with an explicit dial-admission budget and optional
-    /// adoption of the previous generation's runtimes for every node whose
+    /// reuse of the previous generation's runtimes for every node whose
     /// full config survived the reload unchanged (the content-derived ID
     /// alone is too narrow — it excludes dial fields like SNI, transport,
-    /// and obfs). Adopted runtimes keep their live sessions; the previous
-    /// generation skips them at drain/shutdown.
+    /// and obfs). Returns the registry plus the ids of the runtimes taken
+    /// from `previous`. Nothing is marked at build time: only a committed
+    /// reload records the transfer on the old generation via
+    /// [`Self::mark_moved_out`], so an aborted reload leaves the old
+    /// generation's drain/shutdown semantics untouched.
     pub fn build_reusing(
         nodes: &[Node],
         max_concurrent_dials: usize,
         previous: Option<&Self>,
-    ) -> Result<Self, RuntimeRegistryError> {
+    ) -> Result<(Self, HashSet<uuid::Uuid>), RuntimeRegistryError> {
         let mut map = HashMap::with_capacity(nodes.len());
+        let mut reused = HashSet::new();
         for node in nodes {
             if node.id.is_nil() {
                 return Err(RuntimeRegistryError::NilId(node.name.clone()));
@@ -349,40 +355,42 @@ impl OutboundRuntimeRegistry {
                     }
                 })?;
             }
-            let adopted = previous.and_then(|previous| {
+            let reused_runtime = previous.and_then(|previous| {
                 let runtime = previous.get(&node.id)?;
                 same_node_config(&runtime.node, node).then_some(runtime)
             });
-            let reused = adopted.is_some();
-            let runtime = match adopted {
-                Some(runtime) => runtime,
+            let runtime = match reused_runtime {
+                Some(runtime) => {
+                    reused.insert(node.id);
+                    runtime
+                }
                 None => Arc::new(NodeRuntime {
                     node: Arc::new(node.clone()),
                     capabilities: OutboundCapabilities::for_node(node),
                     runtime: crate::descriptor::descriptor(node.protocol)
                         .generation_runtime
                         .build(),
-                    adopted: AtomicBool::new(false),
                 }),
             };
-            if let Some(prev) = map.insert(node.id, Arc::clone(&runtime)) {
+            if let Some(prev) = map.insert(node.id, runtime) {
                 return Err(RuntimeRegistryError::DuplicateId(
                     node.id,
                     prev.node.name.clone(),
                     node.name.clone(),
                 ));
             }
-            // Marked only after a successful build step: an aborted reload
-            // leaves the previous generation's drain semantics untouched.
-            if reused {
-                runtime.adopted.store(true, Ordering::Release);
-            }
         }
-        Ok(Self {
-            nodes: map,
-            terminal: AtomicBool::new(false),
-            dial_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent_dials.max(1))),
-        })
+        Ok((
+            Self {
+                nodes: map,
+                terminal: AtomicBool::new(false),
+                moved_out: parking_lot::Mutex::new(HashSet::new()),
+                dial_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                    max_concurrent_dials.max(1),
+                )),
+            },
+            reused,
+        ))
     }
 
     /// Wrap into the shared cell used by the control plane.
@@ -459,16 +467,25 @@ impl OutboundRuntimeRegistry {
         self.terminal.store(true, Ordering::Release);
     }
 
+    /// Record runtimes a published successor generation has taken over.
+    /// Called only at the reload commit point (after the successor registry
+    /// replaces this one); this generation then leaves those runtimes alone
+    /// at drain/shutdown — the successor owns and closes them.
+    pub fn mark_moved_out(&self, ids: impl IntoIterator<Item = uuid::Uuid>) {
+        self.moved_out.lock().extend(ids);
+    }
+
     /// Reject new pool work and let published sessions close after their last
     /// stream releases. Existing streams remain usable while draining.
-    /// Runtimes adopted by a successor generation are left alone. QUIC
+    /// Runtimes transferred to a successor generation are left alone. QUIC
     /// connections need no drain step: new work is rejected by the terminal
     /// flag at the registry checks, and in-flight flows keep their
     /// connections until they finish.
     pub fn drain_session_pools(&self) {
         self.begin_retirement();
-        for runtime in self.nodes.values() {
-            if runtime.adopted.load(Ordering::Acquire) {
+        let moved_out = self.moved_out.lock();
+        for (id, runtime) in &self.nodes {
+            if moved_out.contains(id) {
                 continue;
             }
             if let ProtocolRuntime::AnyTls(anytls) = &runtime.runtime {
@@ -482,8 +499,9 @@ impl OutboundRuntimeRegistry {
     /// Idempotent, including after [`Self::begin_retirement`].
     pub fn shutdown(&self) {
         self.terminal.store(true, Ordering::Release);
-        for runtime in self.nodes.values() {
-            if runtime.adopted.load(Ordering::Acquire) {
+        let moved_out = self.moved_out.lock();
+        for (id, runtime) in &self.nodes {
+            if moved_out.contains(id) {
                 continue;
             }
             match &runtime.runtime {
@@ -635,7 +653,7 @@ mod tests {
     }
 
     #[test]
-    fn build_reusing_adopts_unchanged_nodes_and_skips_them_at_shutdown() {
+    fn build_reusing_reuses_unchanged_nodes_and_reports_them() {
         let unchanged = node("anytls", NodeProtocol::AnyTLS);
         let mut changed = node("tuic", NodeProtocol::Tuic);
         let first = OutboundRuntimeRegistry::build(&[unchanged.clone(), changed.clone()]).unwrap();
@@ -643,12 +661,13 @@ mod tests {
         let first_changed = first.get(&changed.id).unwrap();
 
         changed.sni = Some("new.example.com".to_string());
-        let second = OutboundRuntimeRegistry::build_reusing(
+        let (second, reused) = OutboundRuntimeRegistry::build_reusing(
             &[unchanged.clone(), changed.clone()],
             64,
             Some(&first),
         )
         .unwrap();
+        assert_eq!(reused, HashSet::from([unchanged.id]));
         assert!(Arc::ptr_eq(
             &first_unchanged,
             &second.get(&unchanged.id).unwrap()
@@ -657,21 +676,54 @@ mod tests {
             &first_changed,
             &second.get(&changed.id).unwrap()
         ));
+    }
 
-        // Draining and shutting down the old generation leaves the adopted
-        // pool serving the successor.
+    #[test]
+    fn reused_runtime_is_closed_by_the_new_owner_only_after_commit() {
+        let unchanged = node("anytls", NodeProtocol::AnyTLS);
+        let first = OutboundRuntimeRegistry::build(std::slice::from_ref(&unchanged)).unwrap();
+        let (second, _) = OutboundRuntimeRegistry::build_reusing(
+            std::slice::from_ref(&unchanged),
+            64,
+            Some(&first),
+        )
+        .unwrap();
+
+        // A build alone transfers nothing: the old generation still closes
+        // the runtime if the reload aborts before the commit point.
+        first.shutdown();
+        let ProtocolRuntime::AnyTls(anytls) = &second.get(&unchanged.id).unwrap().runtime else {
+            panic!("anytls runtime expected");
+        };
+        assert!(
+            anytls.pool.is_retired(),
+            "aborted reload: old generation remains the owner"
+        );
+
+        // Committed transfer: the old generation skips the moved runtime;
+        // the new generation closes it as its full owner.
+        let first = OutboundRuntimeRegistry::build(std::slice::from_ref(&unchanged)).unwrap();
+        let (second, reused) = OutboundRuntimeRegistry::build_reusing(
+            std::slice::from_ref(&unchanged),
+            64,
+            Some(&first),
+        )
+        .unwrap();
+        first.mark_moved_out(reused);
         first.drain_session_pools();
         first.shutdown();
         let ProtocolRuntime::AnyTls(anytls) = &second.get(&unchanged.id).unwrap().runtime else {
             panic!("anytls runtime expected");
         };
-        assert!(!anytls.pool.is_retired());
-
-        // A rebuilt runtime for the changed node is fully retired with the
-        // old generation.
-        let ProtocolRuntime::Quic(_) = &first_changed.runtime else {
-            panic!("quic runtime expected");
-        };
+        assert!(
+            !anytls.pool.is_retired(),
+            "committed reload: old generation leaves the moved runtime alone"
+        );
+        second.shutdown();
+        assert!(
+            anytls.pool.is_retired(),
+            "the new generation owns the reused runtime's shutdown"
+        );
     }
 
     #[test]
@@ -682,7 +734,7 @@ mod tests {
         let mut reparsed = parsed.clone();
         reparsed.created_at = chrono::Utc::now();
         reparsed.updated_at = chrono::Utc::now();
-        let second = OutboundRuntimeRegistry::build_reusing(
+        let (second, _) = OutboundRuntimeRegistry::build_reusing(
             std::slice::from_ref(&reparsed),
             64,
             Some(&first),

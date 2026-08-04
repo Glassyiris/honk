@@ -911,7 +911,9 @@ mod tests {
         use std::sync::atomic::AtomicUsize;
 
         let generation = Arc::new(
-            honk_outbound::runtime::OutboundRuntimeRegistry::build_reusing(&[], 3, None).unwrap(),
+            honk_outbound::runtime::OutboundRuntimeRegistry::build_reusing(&[], 3, None)
+                .unwrap()
+                .0,
         );
         let active = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));

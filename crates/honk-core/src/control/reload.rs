@@ -103,22 +103,23 @@ impl ControlPlane {
         new_group_manager.migrate_selector_choices_from(&old_group_manager);
         // Build the outbound generation before DNS so every new runtime
         // snapshot captures its own immutable node/session ownership.
-        // Nodes whose config survived the reload unchanged adopt the
-        // current generation's runtime (live sessions stay up).
-        let new_runtime_registry = Arc::new(
-            match honk_outbound::runtime::OutboundRuntimeRegistry::build_reusing(
+        // Nodes whose config survived the reload unchanged reuse the
+        // current generation's runtime (live sessions stay up); the
+        // transfer is recorded on the old generation only at the commit
+        // point below, so an aborted build leaves its ownership untouched.
+        let (new_runtime_registry, reused_runtime_ids) = match
+            honk_outbound::runtime::OutboundRuntimeRegistry::build_reusing(
                 &new_config.nodes,
                 new_config.global.max_concurrent_dials,
                 Some(&self.runtime_registry.read()),
             ) {
-                Ok(r) => r,
+                Ok((registry, reused)) => (Arc::new(registry), reused),
                 Err(e) => {
                     error!("Failed to build runtime registry (reload aborted): {}", e);
                     self.stop_reload_rejection_if_healthy(drain);
                     return false;
                 }
-            },
-        );
+            };
         let (new_dns_forwarder, new_upstream_pool) = match self
             .build_dns_forwarder(
                 &new_config,
@@ -306,6 +307,10 @@ impl ControlPlane {
             }
             let old_registry =
                 std::mem::replace(&mut *runtime_guard, Arc::clone(&new_runtime_registry));
+            // Commit point for runtime reuse: only now, with the successor
+            // published, does the old generation record the transfer and
+            // skip those runtimes at drain/shutdown.
+            old_registry.mark_moved_out(reused_runtime_ids);
             publication.commit();
             *router_guard = new_router;
             *config_guard = new_config;
@@ -2215,7 +2220,7 @@ mod atomic_reload_tests {
         );
         assert!(
             Arc::ptr_eq(&old_runtime, &new_runtime),
-            "an unchanged node adopts the old generation's NodeRuntime"
+            "an unchanged node reuses the old generation's NodeRuntime"
         );
         assert!(Arc::ptr_eq(
             &new_runtime,
