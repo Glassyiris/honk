@@ -44,15 +44,20 @@ pub struct StreamSamplers {
     connections: dashmap::DashMap<Duration, tokio::sync::broadcast::Sender<Arc<Bytes>>>,
     traffic: tokio::sync::broadcast::Sender<Arc<Bytes>>,
     traffic_started: std::sync::atomic::AtomicBool,
+    memory: tokio::sync::broadcast::Sender<Arc<Bytes>>,
+    memory_started: std::sync::atomic::AtomicBool,
 }
 
 impl StreamSamplers {
     pub fn new() -> Self {
         let (traffic, _) = tokio::sync::broadcast::channel(STREAM_CHANNEL_CAPACITY);
+        let (memory, _) = tokio::sync::broadcast::channel(STREAM_CHANNEL_CAPACITY);
         Self {
             connections: dashmap::DashMap::new(),
             traffic,
             traffic_started: std::sync::atomic::AtomicBool::new(false),
+            memory,
+            memory_started: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -114,6 +119,7 @@ pub fn router(state: Arc<ClashState>) -> Router {
         )
         .route("/connections/{id}", delete(delete_connection))
         .route("/traffic", get(get_traffic))
+        .route("/memory", get(get_memory))
         .route("/stats", get(get_outbound_stats))
         .route("/logs", get(get_logs))
         .route("/dns/query", get(get_dns_query))
@@ -1038,7 +1044,7 @@ fn connections_json_tracker(
         "downloadTotal": download,
         "uploadTotal": upload,
         "connections": connections,
-        "memory": 0,
+        "memory": rss_bytes(),
     })
 }
 
@@ -1139,16 +1145,17 @@ async fn get_traffic(State(s): State<Arc<ClashState>>, ws: MaybeWs) -> Response 
     ws.on_upgrade(move |socket| traffic_ws(socket, s))
 }
 
-async fn traffic_ws(mut socket: WebSocket, s: Arc<ClashState>) {
-    ensure_traffic_sampler(&s);
-    let mut frames = s.stream_samplers.traffic.subscribe();
+async fn stream_ws_frames(
+    mut socket: WebSocket,
+    mut frames: tokio::sync::broadcast::Receiver<Arc<Bytes>>,
+) {
     loop {
         match frames.recv().await {
             Ok(frame) => {
                 if socket
                     .send(Message::Text(
                         std::str::from_utf8(frame.as_ref())
-                            .expect("traffic JSON is UTF-8")
+                            .expect("sampler JSON is UTF-8")
                             .into(),
                     ))
                     .await
@@ -1162,6 +1169,12 @@ async fn traffic_ws(mut socket: WebSocket, s: Arc<ClashState>) {
         }
     }
 }
+
+async fn traffic_ws(socket: WebSocket, s: Arc<ClashState>) {
+    ensure_traffic_sampler(&s);
+    stream_ws_frames(socket, s.stream_samplers.traffic.subscribe()).await
+}
+
 fn ensure_traffic_sampler(s: &Arc<ClashState>) {
     if s.stream_samplers
         .traffic_started
@@ -1194,13 +1207,70 @@ fn ensure_traffic_sampler(s: &Arc<ClashState>) {
     });
 }
 
+fn rss_bytes() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status.lines().find_map(|line| {
+                line.strip_prefix("VmRSS:")?
+                    .trim()
+                    .strip_suffix(" kB")?
+                    .parse::<u64>()
+                    .ok()
+            })
+        })
+        .unwrap_or(0)
+        * 1024
+}
+
+async fn get_memory(State(s): State<Arc<ClashState>>, ws: MaybeWs) -> Response {
+    ensure_memory_sampler(&s);
+    let Some(ws) = ws.0 else {
+        return chunked_json_response(sampler_chunk_stream(s.stream_samplers.memory.subscribe()));
+    };
+    ws.on_upgrade(move |socket| stream_ws_frames(socket, s.stream_samplers.memory.subscribe()))
+}
+
+fn ensure_memory_sampler(s: &Arc<ClashState>) {
+    if s.stream_samplers
+        .memory_started
+        .swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        return;
+    }
+    let tx = s.stream_samplers.memory.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            if tx.receiver_count() == 0 {
+                continue;
+            }
+            let frame = Arc::new(Bytes::from(
+                serde_json::json!({
+                    "inuse": rss_bytes(),
+                    "oslimit": 0,
+                })
+                .to_string(),
+            ));
+            let _ = tx.send(frame);
+        }
+    });
+}
+
 /// Chunked-HTTP fallback for `/traffic`: the same per-second delta frames
 /// as the WS stream, one JSON document per line.
 fn traffic_chunk_stream(
     s: Arc<ClashState>,
 ) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
     ensure_traffic_sampler(&s);
-    let receiver = s.stream_samplers.traffic.subscribe();
+    sampler_chunk_stream(s.stream_samplers.traffic.subscribe())
+}
+
+fn sampler_chunk_stream(
+    receiver: tokio::sync::broadcast::Receiver<Arc<Bytes>>,
+) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
     futures::stream::unfold(receiver, |mut receiver| async move {
         loop {
             match receiver.recv().await {

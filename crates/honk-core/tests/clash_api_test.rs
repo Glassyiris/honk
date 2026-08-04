@@ -908,6 +908,27 @@ async fn test_traffic_ws_with_token_auth() {
     assert!(err.is_err());
 }
 
+/// /memory streams per-second inuse/oslimit frames (chunked HTTP here).
+#[tokio::test]
+async fn test_memory_chunked_reports_rss() {
+    let app = spawn_app("", "").await;
+    let client = http_client();
+
+    let mut resp = client.get(app.url("/memory")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["transfer-encoding"], "chunked");
+
+    let chunk = tokio::time::timeout(Duration::from_secs(5), resp.chunk())
+        .await
+        .expect("memory frame within 5s")
+        .unwrap()
+        .expect("non-empty first chunk");
+    let text = String::from_utf8(chunk.to_vec()).unwrap();
+    let v: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    assert!(v["inuse"].as_u64().unwrap() > 0);
+    assert_eq!(v["oslimit"], 0);
+}
+
 /// WS auth percent-decodes `?token=` before comparing to the secret, so
 /// secrets containing reserved characters (`+`, `=`) authenticate both in
 /// their percent-encoded form (what WS clients should send) and raw form.
