@@ -236,14 +236,10 @@ async fn probe_node(registry: &ProxyRegistry, node: Node, targets: &ProbeTargets
     let urltest = match handler {
         Some(entry) => {
             let url = targets.url.clone().unwrap_or_default();
-            urltest_node(
-                &honk_outbound::runtime::NodeRuntime::ephemeral(&node),
-                entry.tcp.as_ref(),
-                &url,
-                timeout,
-            )
-            .await
-            .map_err(|e| e.to_string())
+            let guard = honk_outbound::runtime::NodeRuntime::ephemeral_guarded(&node);
+            let measured = urltest_node(&guard.runtime(), entry.tcp.as_ref(), &url, timeout).await;
+            guard.close().await;
+            measured.map_err(|e| e.to_string())
         }
         None => Err(format!("no handler for {:?}", node.protocol)),
     };
@@ -308,15 +304,17 @@ async fn probe_family(
     // https one — always probe with an https URL (the default targets all
     // serve TLS on 443 anyway).
     let url = format!("https://{url_host}/");
-    match honk_outbound::urltest::urltest_node_addr(
-        &honk_outbound::runtime::NodeRuntime::ephemeral(node),
+    let guard = honk_outbound::runtime::NodeRuntime::ephemeral_guarded(node);
+    let measured = honk_outbound::urltest::urltest_node_addr(
+        &guard.runtime(),
         entry.tcp.as_ref(),
         &url,
         addr,
         timeout,
     )
-    .await
-    {
+    .await;
+    guard.close().await;
+    match measured {
         Ok(d) => Some(Ok(d)),
         Err(e) => Some(Err(e.to_string())),
     }

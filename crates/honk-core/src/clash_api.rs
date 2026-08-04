@@ -630,12 +630,19 @@ async fn get_proxy_delay(
             );
         };
         let tcp = entry.tcp.clone();
-        let runtime = s
-            .runtime_registry
-            .read()
-            .get(&node.id)
-            .unwrap_or_else(|| honk_outbound::runtime::NodeRuntime::ephemeral(&node));
-        return match urltest_node(&runtime, tcp.as_ref(), &query.url, query.timeout()).await {
+        let generation = s.runtime_registry.read().clone();
+        let (runtime, guard) = match generation.get(&node.id) {
+            Some(runtime) => (runtime, None),
+            None => {
+                let guard = honk_outbound::runtime::NodeRuntime::ephemeral_guarded(&node);
+                (guard.runtime(), Some(guard))
+            }
+        };
+        let measured = urltest_node(&runtime, tcp.as_ref(), &query.url, query.timeout()).await;
+        if let Some(guard) = guard {
+            guard.close().await;
+        }
+        return match measured {
             Ok(latency) => {
                 s.alive_set
                     .record_probe_latency(node.id, ProbeDomain::Tcp, IpVersion::V4, latency);

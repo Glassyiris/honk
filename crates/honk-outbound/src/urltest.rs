@@ -302,9 +302,13 @@ pub async fn urltest_group(
 
     for node in members {
         let node = node.clone();
-        let runtime = generation
-            .get(&node.id)
-            .unwrap_or_else(|| crate::runtime::NodeRuntime::ephemeral(&node));
+        let (runtime, guard) = match generation.get(&node.id) {
+            Some(runtime) => (runtime, None),
+            None => {
+                let guard = crate::runtime::NodeRuntime::ephemeral_guarded(&node);
+                (guard.runtime(), Some(guard))
+            }
+        };
         let registry = registry.clone();
         let alive_set = alive_set.clone();
         let url = url.clone();
@@ -315,6 +319,9 @@ pub async fn urltest_group(
                 Some(entry) => urltest_node(&runtime, entry.tcp.as_ref(), &url, timeout).await,
                 None => Err(anyhow!("no handler for protocol {:?}", node.protocol)),
             };
+            if let Some(guard) = guard {
+                guard.close().await;
+            }
             match &result {
                 Ok(latency) => {
                     alive_set.record_probe_latency(

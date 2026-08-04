@@ -134,18 +134,17 @@ pub(super) fn warm_runtime(
 }
 
 /// Dial `node` through its warm generation runtime when it has one, else
-/// through an ephemeral one-shot runtime. The returned runtime handle (Some
-/// only on the ephemeral path) MUST be passed to [`close_ephemeral`] once
-/// the dialed resource is finished, on every exit path: an abandoned
-/// ephemeral pool keeps its demux-held sessions — and their connections —
-/// open forever, accumulating one per probe cycle.
+/// through an ephemeral one-shot runtime. The returned guard (Some only on
+/// the ephemeral path) closes the runtime on drop — covering timeout/abort
+/// paths that drop the probe future — and SHOULD be passed to
+/// [`close_ephemeral`] on normal exits to await the teardown.
 async fn probe_dial<T, F, Fut>(
     generation: &honk_outbound::runtime::OutboundRuntimeRegistry,
     node: &Node,
     dial: F,
 ) -> (
     anyhow::Result<T>,
-    Option<Arc<honk_outbound::runtime::NodeRuntime>>,
+    Option<honk_outbound::runtime::EphemeralRuntimeGuard>,
 )
 where
     F: FnOnce(Arc<honk_outbound::runtime::NodeRuntime>) -> Fut,
@@ -154,16 +153,16 @@ where
     match warm_runtime(generation, node) {
         Some(runtime) => (dial(runtime).await, None),
         None => {
-            let ephemeral = honk_outbound::runtime::NodeRuntime::ephemeral(node);
-            let result = dial(Arc::clone(&ephemeral)).await;
-            (result, Some(ephemeral))
+            let guard = honk_outbound::runtime::NodeRuntime::ephemeral_guarded(node);
+            let result = dial(guard.runtime()).await;
+            (result, Some(guard))
         }
     }
 }
 
-async fn close_ephemeral(ephemeral: Option<Arc<honk_outbound::runtime::NodeRuntime>>) {
-    if let Some(runtime) = ephemeral {
-        runtime.close().await;
+async fn close_ephemeral(guard: Option<honk_outbound::runtime::EphemeralRuntimeGuard>) {
+    if let Some(guard) = guard {
+        guard.close().await;
     }
 }
 

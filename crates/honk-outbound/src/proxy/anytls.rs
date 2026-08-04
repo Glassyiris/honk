@@ -3193,6 +3193,45 @@ mod tests {
     /// it must deterministically release the session, its demux task, and
     /// the underlying connection (the 797 ESTABLISHED leak: throwaway pools
     /// had no owner running any close/idle reaping).
+    /// A probe future dropped mid-flight (outer timeout / task abort) never
+    /// runs the explicit close; the guard's Drop must still release the
+    /// session and its connection.
+    #[tokio::test]
+    async fn ephemeral_guard_releases_session_when_probe_is_aborted() {
+        let node = Node {
+            id: uuid::Uuid::new_v4(),
+            name: "guard-abort".into(),
+            protocol: NodeProtocol::AnyTLS,
+            address: "127.0.0.1:9".into(),
+            ..Default::default()
+        };
+        let (session, mut server) = establish_test_session("guard-abort").await;
+        expect_handshake(&mut server).await;
+        let probe_session = Arc::clone(&session);
+        let probe = tokio::spawn(async move {
+            let guard = crate::runtime::NodeRuntime::ephemeral_guarded(&node);
+            let runtime = guard.runtime();
+            let crate::runtime::ProtocolRuntime::AnyTls(anytls) = &runtime.runtime else {
+                panic!("expected AnyTLS runtime")
+            };
+            anytls.pool.insert(POOL_KEY, &probe_session);
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        probe.abort();
+        let _ = probe.await;
+
+        assert!(
+            session.is_closed(),
+            "dropping the guard on abort must close the session"
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while read_frame(&mut server).await.is_ok() {}
+        })
+        .await
+        .expect("the connection must close on abort");
+    }
+
     #[tokio::test]
     async fn ephemeral_runtime_close_releases_session_and_connection() {
         let node = Node {

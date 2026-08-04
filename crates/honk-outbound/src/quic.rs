@@ -1214,33 +1214,33 @@ mod client_tests {
     /// A cold-node health probe dials QUIC through an ephemeral runtime;
     /// closing it must deterministically close the cached connection and
     /// endpoint driver (drop-alone is not relied upon).
-    #[tokio::test]
-    async fn ephemeral_runtime_close_shuts_quic_client() {
-        use crate::runtime::{NodeRuntime, ProtocolRuntime, QuicRuntimeClient};
-
-        struct ProbeClient(QuicClient<()>);
-        #[async_trait::async_trait]
-        impl QuicRuntimeClient for ProbeClient {
-            fn into_erased(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
-                self
-            }
-            async fn force_close(&self) {
-                self.0.force_close().await;
-            }
+    struct ProbeClient(QuicClient<()>);
+    #[async_trait::async_trait]
+    impl crate::runtime::QuicRuntimeClient for ProbeClient {
+        fn into_erased(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
+            self
         }
+        async fn force_close(&self) {
+            self.0.force_close().await;
+        }
+    }
 
-        let (endpoint, addr) = testutil::server_endpoint(&[b"h3"], true).unwrap();
-        spawn_accept_loop(endpoint);
-        let node = honk_config::node::Node {
+    fn tuic_ephemeral() -> Arc<crate::runtime::NodeRuntime> {
+        crate::runtime::NodeRuntime::ephemeral(&honk_config::node::Node {
             protocol: honk_config::types::NodeProtocol::Tuic,
             ..Default::default()
-        };
-        let runtime = NodeRuntime::ephemeral(&node);
-        let ProtocolRuntime::Quic(quic) = &runtime.runtime else {
+        })
+    }
+
+    async fn probe_client(
+        runtime: &crate::runtime::NodeRuntime,
+        port: u16,
+    ) -> (Arc<ProbeClient>, quinn::Connection) {
+        let crate::runtime::ProtocolRuntime::Quic(quic) = &runtime.runtime else {
             panic!("tuic runtime expected");
         };
         let client: Arc<ProbeClient> = quic
-            .client(|| async { Ok(Arc::new(ProbeClient(test_client(addr.port()).await))) })
+            .client(|| async { Ok(Arc::new(ProbeClient(test_client(port).await))) })
             .await
             .unwrap();
         let (conn, _) = client
@@ -1250,6 +1250,15 @@ mod client_tests {
             })
             .await
             .unwrap();
+        (client, conn)
+    }
+
+    #[tokio::test]
+    async fn ephemeral_runtime_close_shuts_quic_client() {
+        let (endpoint, addr) = testutil::server_endpoint(&[b"h3"], true).unwrap();
+        spawn_accept_loop(endpoint);
+        let runtime = tuic_ephemeral();
+        let (_client, conn) = probe_client(&runtime, addr.port()).await;
         assert!(conn.close_reason().is_none());
         assert!(runtime.has_warm_resources());
 
@@ -1262,6 +1271,39 @@ mod client_tests {
             !runtime.has_warm_resources(),
             "a closed runtime no longer reports warm clients"
         );
+    }
+
+    /// A probe future dropped mid-flight (outer timeout / task abort) never
+    /// runs the explicit close; the guard's Drop must still close the cached
+    /// connection and endpoint driver.
+    #[tokio::test]
+    async fn ephemeral_guard_releases_quic_client_when_probe_is_aborted() {
+        use crate::runtime::NodeRuntime;
+
+        let (endpoint, addr) = testutil::server_endpoint(&[b"h3"], true).unwrap();
+        spawn_accept_loop(endpoint);
+        let (conn_tx, conn_rx) = tokio::sync::oneshot::channel();
+        let probe = tokio::spawn(async move {
+            let guard = NodeRuntime::ephemeral_guarded(&honk_config::node::Node {
+                protocol: honk_config::types::NodeProtocol::Tuic,
+                ..Default::default()
+            });
+            let runtime = guard.runtime();
+            let (_client, conn) = probe_client(&runtime, addr.port()).await;
+            let _ = conn_tx.send(conn);
+            std::future::pending::<()>().await;
+        });
+        let conn = conn_rx.await.unwrap();
+        probe.abort();
+        let _ = probe.await;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while conn.close_reason().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the guard Drop must drive the QUIC close after abort");
     }
 }
 

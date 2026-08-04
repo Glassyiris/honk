@@ -272,7 +272,7 @@ impl NodeRuntime {
     /// tests): session protocols get a throwaway pool per runtime. The
     /// caller MUST [`Self::close`] it when done — an unclosed ephemeral
     /// pool keeps its demux-held sessions (and their connections) open
-    /// forever.
+    /// forever. Prefer [`Self::ephemeral_guarded`], which closes on drop.
     pub fn ephemeral(node: &Node) -> Arc<Self> {
         Arc::new(Self {
             node: Arc::new(node.clone()),
@@ -282,6 +282,15 @@ impl NodeRuntime {
                 .build(),
             ephemeral: true,
         })
+    }
+
+    /// [`Self::ephemeral`] wrapped in an ownership guard whose Drop starts
+    /// the close, so timeout/abort paths that simply drop the probe future
+    /// cannot leak the session-layer resources.
+    pub fn ephemeral_guarded(node: &Node) -> EphemeralRuntimeGuard {
+        EphemeralRuntimeGuard {
+            runtime: Some(Self::ephemeral(node)),
+        }
     }
 
     pub(crate) fn is_ephemeral(&self) -> bool {
@@ -361,6 +370,58 @@ impl NodeRuntime {
             ProtocolRuntime::AnyTls(runtime) => runtime.tls.is_loaded(),
             ProtocolRuntime::None | ProtocolRuntime::Quic(_) => false,
         }
+    }
+}
+
+/// Ownership guard for an ephemeral [`NodeRuntime`]: Drop initiates the
+/// close, so a probe future dropped mid-flight (timeout, task abort) still
+/// releases the session-layer resources. Use [`Self::close`] on the normal
+/// path to also await the teardown.
+#[derive(Debug)]
+pub struct EphemeralRuntimeGuard {
+    runtime: Option<Arc<NodeRuntime>>,
+}
+
+impl EphemeralRuntimeGuard {
+    /// The guarded runtime for dialing. Valid until [`Self::close`].
+    pub fn runtime(&self) -> Arc<NodeRuntime> {
+        Arc::clone(
+            self.runtime
+                .as_ref()
+                .expect("EphemeralRuntimeGuard outlives its uses"),
+        )
+    }
+
+    /// Initiate the close without awaiting it: idempotent and Drop-safe.
+    /// AnyTLS pool teardown is fully synchronous and completes here; QUIC
+    /// client teardown awaits locks, so it is handed to a runtime-driven
+    /// task when one is available.
+    pub fn request_close(&mut self) {
+        let Some(runtime) = self.runtime.take() else {
+            return;
+        };
+        match &runtime.runtime {
+            ProtocolRuntime::AnyTls(anytls) => anytls.pool.shutdown(),
+            ProtocolRuntime::Quic(_) => {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move { runtime.close().await });
+                }
+            }
+            ProtocolRuntime::None => {}
+        }
+    }
+
+    /// Close the runtime and await full teardown.
+    pub async fn close(mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.close().await;
+        }
+    }
+}
+
+impl Drop for EphemeralRuntimeGuard {
+    fn drop(&mut self) {
+        self.request_close();
     }
 }
 
