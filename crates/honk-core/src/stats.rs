@@ -322,14 +322,20 @@ impl StatsManager {
             let counts = runtime.warm_counts();
             match runtime.node.protocol {
                 NodeProtocol::AnyTLS => snap.anytls_sessions += counts.sessions as u64,
-                NodeProtocol::Tuic => snap.tuic_clients += counts.clients as u64,
-                NodeProtocol::Juicity => snap.juicity_clients += counts.clients as u64,
-                NodeProtocol::Hysteria2 => snap.hysteria2_clients += counts.clients as u64,
+                NodeProtocol::Tuic => snap.tuic_clients += counts.clients.unwrap_or(0) as u64,
+                NodeProtocol::Juicity => snap.juicity_clients += counts.clients.unwrap_or(0) as u64,
+                NodeProtocol::Hysteria2 => {
+                    snap.hysteria2_clients += counts.clients.unwrap_or(0) as u64
+                }
                 _ => {}
             }
             let bare =
                 pool.has_live_bare_entry(&format!("{}:{}", runtime.node.host(), runtime.node.port));
-            if counts.sessions == 0 && counts.clients == 0 && !bare {
+            // An unknown QUIC client count (map locked by an in-flight
+            // build) is warm, not cold: pruning here would drop the node's
+            // attribution and re-report it as traffic next sample.
+            let session_warm = counts.sessions > 0 || counts.clients.unwrap_or(1) > 0;
+            if !session_warm && !bare {
                 continue;
             }
             warm_ids.insert(runtime.node.id);
@@ -683,5 +689,77 @@ mod tests {
         let rewarmed = stats.warm_snapshot(&generation, &pool);
         assert_eq!(rewarmed.traffic_nodes, 1);
         assert_eq!(rewarmed.preconnect_nodes, 0);
+    }
+
+    #[tokio::test]
+    async fn warm_snapshot_keeps_marks_while_quic_client_count_is_unknown() {
+        use honk_outbound::runtime::{ProtocolRuntime, QuicRuntimeClient};
+
+        struct ParkedClient;
+        #[async_trait::async_trait]
+        impl QuicRuntimeClient for ParkedClient {
+            fn into_erased(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
+                self
+            }
+            async fn force_close(&self) {}
+        }
+
+        let stats = StatsManager::new();
+        let node = honk_config::node::Node {
+            id: uuid::Uuid::new_v4(),
+            name: "tuic".into(),
+            protocol: honk_config::types::NodeProtocol::Tuic,
+            address: "127.0.0.1:443".into(),
+            port: 443,
+            ..Default::default()
+        };
+        let generation =
+            honk_outbound::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node))
+                .unwrap();
+        let runtime = generation.get(&node.id).unwrap();
+        let pool = crate::pool::ConnectionPool::new();
+
+        // Cold node: the mark is pruned with the missing resource.
+        stats.mark_warm(node.id, WarmReason::Udp);
+        assert_eq!(
+            stats.warm_snapshot(&generation, &pool),
+            WarmSnapshot::default()
+        );
+
+        // Hold the client map with an in-flight build: the count is
+        // unknown, which must read as warm — the mark and its attribution
+        // survive the contended snapshot.
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let build = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            async move {
+                let ProtocolRuntime::Quic(quic) = &runtime.runtime else {
+                    panic!("tuic runtime expected")
+                };
+                quic.client::<ParkedClient, _, _>(|| async move {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.await;
+                    Ok(Arc::new(ParkedClient))
+                })
+                .await
+            }
+        });
+        entered_rx.await.unwrap();
+        stats.mark_warm(node.id, WarmReason::Udp);
+        let contended = stats.warm_snapshot(&generation, &pool);
+        assert_eq!(contended.udp_nodes, 1);
+        assert_eq!(contended.traffic_nodes, 0);
+        assert_eq!(
+            contended.tuic_clients, 0,
+            "an unknown count adds nothing to the gauge"
+        );
+
+        drop(release_tx);
+        build.await.unwrap().unwrap();
+        let settled = stats.warm_snapshot(&generation, &pool);
+        assert_eq!(settled.udp_nodes, 1);
+        assert_eq!(settled.tuic_clients, 1);
+        generation.shutdown().await;
     }
 }

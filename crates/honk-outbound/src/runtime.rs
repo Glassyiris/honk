@@ -162,11 +162,12 @@ impl QuicRuntime {
             .unwrap_or(true)
     }
 
-    /// Number of occupied client slots — the warm-resource gauge behind
-    /// `/stats`. A contended lock reports zero rather than blocking a
-    /// metrics path on an in-flight build.
-    pub(crate) fn client_count(&self) -> usize {
-        self.clients.try_lock().map(|c| c.len()).unwrap_or(0)
+    /// Number of occupied client slots, or `None` when the map is locked by
+    /// an in-flight client build — "unknown", deliberately distinct from
+    /// zero: gauges must not treat a contended read as a cold node and
+    /// prune its attribution.
+    pub(crate) fn client_count(&self) -> Option<usize> {
+        self.clients.try_lock().map(|c| c.len()).ok()
     }
 }
 
@@ -245,11 +246,21 @@ impl AnyTlsRuntime {
 }
 
 /// Live warm-session gauge of one runtime: retained AnyTLS pool sessions
-/// and occupied QUIC client slots.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+/// and occupied QUIC client slots (`None` = count unknown under lock
+/// contention, to be treated as warm rather than cold).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WarmCounts {
     pub sessions: usize,
-    pub clients: usize,
+    pub clients: Option<usize>,
+}
+
+impl Default for WarmCounts {
+    fn default() -> Self {
+        Self {
+            sessions: 0,
+            clients: Some(0),
+        }
+    }
 }
 
 /// The minimal per-node runtime entry (the honest, minimal
@@ -333,7 +344,9 @@ impl NodeRuntime {
     }
 
     /// Retained warm state of this runtime: live AnyTLS pool sessions and
-    /// occupied QUIC client slots.
+    /// occupied QUIC client slots. `clients` is `None` when the count is
+    /// unknown (client map locked by an in-flight build) — callers must
+    /// treat unknown as warm, never as cold.
     pub fn warm_counts(&self) -> WarmCounts {
         match &self.runtime {
             ProtocolRuntime::None => WarmCounts::default(),
@@ -341,7 +354,7 @@ impl NodeRuntime {
                 sessions: runtime
                     .pool
                     .live_session_count(crate::proxy::anytls::POOL_KEY),
-                clients: 0,
+                clients: Some(0),
             },
             ProtocolRuntime::Quic(runtime) => WarmCounts {
                 sessions: 0,
