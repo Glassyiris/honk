@@ -1210,6 +1210,59 @@ mod client_tests {
             "a closed client rejects new dials"
         );
     }
+
+    /// A cold-node health probe dials QUIC through an ephemeral runtime;
+    /// closing it must deterministically close the cached connection and
+    /// endpoint driver (drop-alone is not relied upon).
+    #[tokio::test]
+    async fn ephemeral_runtime_close_shuts_quic_client() {
+        use crate::runtime::{NodeRuntime, ProtocolRuntime, QuicRuntimeClient};
+
+        struct ProbeClient(QuicClient<()>);
+        #[async_trait::async_trait]
+        impl QuicRuntimeClient for ProbeClient {
+            fn into_erased(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
+                self
+            }
+            async fn force_close(&self) {
+                self.0.force_close().await;
+            }
+        }
+
+        let (endpoint, addr) = testutil::server_endpoint(&[b"h3"], true).unwrap();
+        spawn_accept_loop(endpoint);
+        let node = honk_config::node::Node {
+            protocol: honk_config::types::NodeProtocol::Tuic,
+            ..Default::default()
+        };
+        let runtime = NodeRuntime::ephemeral(&node);
+        let ProtocolRuntime::Quic(quic) = &runtime.runtime else {
+            panic!("tuic runtime expected");
+        };
+        let client: Arc<ProbeClient> = quic
+            .client(|| async { Ok(Arc::new(ProbeClient(test_client(addr.port()).await))) })
+            .await
+            .unwrap();
+        let (conn, _) = client
+            .0
+            .connection_with(Duration::from_secs(5), |_conn| async {
+                Ok::<(), anyhow::Error>(())
+            })
+            .await
+            .unwrap();
+        assert!(conn.close_reason().is_none());
+        assert!(runtime.has_warm_resources());
+
+        runtime.close().await;
+        assert!(
+            conn.close_reason().is_some(),
+            "closing the ephemeral runtime must close the probe connection"
+        );
+        assert!(
+            !runtime.has_warm_resources(),
+            "a closed runtime no longer reports warm clients"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -1745,9 +1745,11 @@ impl AnyTlsHandler {
         connect_timeout: Duration,
         runtime: Option<Arc<crate::runtime::NodeRuntime>>,
     ) -> anyhow::Result<AnyTlsStream> {
-        // A throwaway pool (no generation runtime) gets no janitor: the
-        // janitor task pins its pool alive.
-        if runtime.is_some() {
+        // A throwaway pool (no generation runtime) or a one-shot ephemeral
+        // runtime gets no janitor: the janitor task pins its pool alive and
+        // would prewarm standby sessions nobody owns. Ephemeral runtimes are
+        // closed explicitly by their caller instead.
+        if runtime.as_ref().is_some_and(|r| !r.is_ephemeral()) {
             Self::ensure_janitor(node, &pool, runtime.clone());
         }
         // The dial future must be 'static (pool-owned dial task) and the
@@ -1924,7 +1926,7 @@ impl AnyTlsHandler {
 
         let addr = format!("{}:{}", node.host(), node.port);
         let magic = addr::encode_address("0.0.0.0:0".parse().unwrap(), Some(UOT_MAGIC));
-        if runtime.is_some() {
+        if runtime.as_ref().is_some_and(|r| !r.is_ephemeral()) {
             Self::ensure_janitor(node.as_ref(), &pool, runtime.clone());
         }
         let dial_node = Arc::clone(&node);
@@ -3185,6 +3187,61 @@ mod tests {
         assert!(!runtime.tls_connector_loaded());
         drop(transport);
         generation.shutdown().await;
+    }
+
+    /// A cold-node health probe dials through an ephemeral runtime; closing
+    /// it must deterministically release the session, its demux task, and
+    /// the underlying connection (the 797 ESTABLISHED leak: throwaway pools
+    /// had no owner running any close/idle reaping).
+    #[tokio::test]
+    async fn ephemeral_runtime_close_releases_session_and_connection() {
+        let node = Node {
+            id: uuid::Uuid::new_v4(),
+            name: "ephemeral-probe".into(),
+            protocol: NodeProtocol::AnyTLS,
+            address: "127.0.0.1:9".into(),
+            ..Default::default()
+        };
+        let runtime = crate::runtime::NodeRuntime::ephemeral(&node);
+        assert!(runtime.is_ephemeral());
+        let pool = match &runtime.runtime {
+            crate::runtime::ProtocolRuntime::AnyTls(runtime) => Arc::clone(&runtime.pool),
+            crate::runtime::ProtocolRuntime::None | crate::runtime::ProtocolRuntime::Quic(_) => {
+                panic!("expected AnyTLS runtime")
+            }
+        };
+        let (session, mut server) = establish_test_session("ephemeral-probe").await;
+        expect_handshake(&mut server).await;
+        pool.insert(POOL_KEY, &session);
+
+        // The probe dial reuses the pooled session and opens its stream.
+        let handler = AnyTlsHandler::new();
+        let stream = handler
+            .dial_runtime(
+                Arc::clone(&runtime),
+                "8.8.8.8:53".parse().unwrap(),
+                None,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap()
+            .stream;
+        let (cmd, _sid, _) = read_frame(&mut server).await.unwrap();
+        assert_eq!(cmd, CMD_SYN);
+        let (cmd, _, _) = read_frame(&mut server).await.unwrap();
+        assert_eq!(cmd, CMD_PSH);
+        drop(stream);
+
+        runtime.close().await;
+        assert!(session.is_closed());
+        assert_eq!(pool.live_session_count(POOL_KEY), 0);
+        // The underlying transport is closed: the server reader hits EOF
+        // once the remaining frames (e.g. the stream FIN) are consumed.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while read_frame(&mut server).await.is_ok() {}
+        })
+        .await
+        .expect("closing the ephemeral runtime must close the connection");
     }
 
     #[tokio::test]

@@ -88,23 +88,28 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
             // holds warm session state: a cold-node probe through the pool
             // would leave a janitor-kept standby session behind on every
             // node after every cycle. Cold nodes get an ephemeral one-shot
-            // dial that retains nothing — their measured latency is then the
-            // real cold-start latency, while warm nodes report the hot path.
-            let proxy = match warm_runtime(&generation, &node) {
-                Some(runtime) => {
-                    stats.mark_warm(node.id, crate::stats::WarmReason::Health);
-                    tcp.dial_runtime(runtime, addr, domain.as_deref(), connect_timeout)
-                        .await
-                }
-                None => {
-                    tcp.dial(&node, addr, domain.as_deref(), connect_timeout)
-                        .await
-                }
+            // dial that is closed deterministically after the probe — their
+            // measured latency is then the real cold-start latency, while
+            // warm nodes report the hot path.
+            let (dialed, ephemeral) = probe_dial(&generation, &node, |runtime| {
+                tcp.dial_runtime(runtime, addr, domain.as_deref(), connect_timeout)
+            })
+            .await;
+            if ephemeral.is_none() {
+                stats.mark_warm(node.id, crate::stats::WarmReason::Health);
             }
-            .map_err(|e| format!("dial failed: {}", e))?;
+            let proxy = match dialed {
+                Ok(proxy) => proxy,
+                Err(e) => {
+                    close_ephemeral(ephemeral).await;
+                    return Err(format!("dial failed: {}", e));
+                }
+            };
 
             // Send HTTP request over the proxy connection.
-            Self::http_check(proxy.stream, &check_url, &check_method).await?;
+            let check = Self::http_check(proxy.stream, &check_url, &check_method).await;
+            close_ephemeral(ephemeral).await;
+            check?;
 
             // Measure the full request round trip, not just the dial: mux
             // protocols (AnyTLS, QUIC tunnels) open a stream on an
@@ -126,6 +131,40 @@ pub(super) fn warm_runtime(
     generation
         .get(&node.id)
         .filter(|runtime| runtime.has_warm_resources())
+}
+
+/// Dial `node` through its warm generation runtime when it has one, else
+/// through an ephemeral one-shot runtime. The returned runtime handle (Some
+/// only on the ephemeral path) MUST be passed to [`close_ephemeral`] once
+/// the dialed resource is finished, on every exit path: an abandoned
+/// ephemeral pool keeps its demux-held sessions — and their connections —
+/// open forever, accumulating one per probe cycle.
+async fn probe_dial<T, F, Fut>(
+    generation: &honk_outbound::runtime::OutboundRuntimeRegistry,
+    node: &Node,
+    dial: F,
+) -> (
+    anyhow::Result<T>,
+    Option<Arc<honk_outbound::runtime::NodeRuntime>>,
+)
+where
+    F: FnOnce(Arc<honk_outbound::runtime::NodeRuntime>) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    match warm_runtime(generation, node) {
+        Some(runtime) => (dial(runtime).await, None),
+        None => {
+            let ephemeral = honk_outbound::runtime::NodeRuntime::ephemeral(node);
+            let result = dial(Arc::clone(&ephemeral)).await;
+            (result, Some(ephemeral))
+        }
+    }
+}
+
+async fn close_ephemeral(ephemeral: Option<Arc<honk_outbound::runtime::NodeRuntime>>) {
+    if let Some(runtime) = ephemeral {
+        runtime.close().await;
+    }
 }
 
 /// Bare host part of a check URL (`http://host[:port]/path` → `host`).
@@ -287,46 +326,57 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
             };
 
             let start = std::time::Instant::now();
-            let transport = match warm_runtime(&generation, &node) {
-                Some(runtime) => {
-                    stats.mark_warm(node.id, crate::stats::WarmReason::Health);
-                    packet
-                        .dial_udp_transport_runtime(runtime, dns_target, None, connect_timeout)
-                        .await
-                }
-                None => {
-                    packet
-                        .dial_udp_transport(&node, dns_target, None, connect_timeout)
-                        .await
-                }
+            let (dialed, ephemeral) = probe_dial(&generation, &node, |runtime| {
+                packet.dial_udp_transport_runtime(runtime, dns_target, None, connect_timeout)
+            })
+            .await;
+            if ephemeral.is_none() {
+                stats.mark_warm(node.id, crate::stats::WarmReason::Health);
             }
-            .map_err(|e| format!("UDP dial failed: {}", e))?;
+            let transport = match dialed {
+                Ok(transport) => transport,
+                Err(e) => {
+                    close_ephemeral(ephemeral).await;
+                    return Err(format!("UDP dial failed: {}", e));
+                }
+            };
 
             // One minimal DNS query; any well-formed answer proves the
             // node's UDP path round-trips end to end.
-            let query = build_dns_probe_query();
-            transport
-                .send_packet(&query)
-                .await
-                .map_err(|e| format!("UDP probe send failed: {}", e))?;
-
-            let mut buf = [0u8; 512];
-            let (n, _src) = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                transport.recv_packet(&mut buf),
-            )
-            .await
-            .map_err(|_| "UDP probe recv timeout".to_string())?
-            .map_err(|e| format!("UDP probe recv failed: {}", e))?;
-
-            // Validate the DNS header: matching id + QR (response) bit.
-            if n < 12 || buf[0] != query[0] || buf[1] != query[1] || buf[2] & 0x80 == 0 {
-                return Err("malformed DNS probe response".to_string());
-            }
+            let exchange = udp_probe_exchange(&transport).await;
+            drop(transport);
+            close_ephemeral(ephemeral).await;
+            exchange?;
 
             Ok(start.elapsed())
         })
     }
+}
+
+/// Send the minimal DNS probe query and await a well-formed answer.
+async fn udp_probe_exchange(
+    transport: &Arc<dyn honk_outbound::proxy::PacketTransport>,
+) -> Result<(), String> {
+    let query = build_dns_probe_query();
+    transport
+        .send_packet(&query)
+        .await
+        .map_err(|e| format!("UDP probe send failed: {}", e))?;
+
+    let mut buf = [0u8; 512];
+    let (n, _src) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        transport.recv_packet(&mut buf),
+    )
+    .await
+    .map_err(|_| "UDP probe recv timeout".to_string())?
+    .map_err(|e| format!("UDP probe recv failed: {}", e))?;
+
+    // Validate the DNS header: matching id + QR (response) bit.
+    if n < 12 || buf[0] != query[0] || buf[1] != query[1] || buf[2] & 0x80 == 0 {
+        return Err("malformed DNS probe response".to_string());
+    }
+    Ok(())
 }
 
 /// Build the minimal DNS query used by the UDP health probe: a single

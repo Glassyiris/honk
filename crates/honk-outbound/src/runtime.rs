@@ -138,11 +138,15 @@ impl QuicRuntime {
     /// Force-close every cached client and reject future client builds.
     /// Awaits the construction/dial critical sections: a client or
     /// connection completed just before the close is closed here rather
-    /// than leaked into a terminating generation.
+    /// than leaked into a terminating generation. The map is drained so a
+    /// closed runtime neither pins dead clients nor reports them as warm.
     pub(crate) async fn force_close_all(&self) {
-        let clients = self.clients.lock().await;
-        self.closed.store(true, Ordering::Release);
-        for client in clients.values() {
+        let clients: Vec<Arc<dyn QuicRuntimeClient>> = {
+            let mut clients = self.clients.lock().await;
+            self.closed.store(true, Ordering::Release);
+            clients.drain().map(|(_, client)| client).collect()
+        };
+        for client in clients {
             client.force_close().await;
         }
     }
@@ -256,11 +260,19 @@ pub struct NodeRuntime {
     pub node: Arc<Node>,
     pub capabilities: OutboundCapabilities,
     pub runtime: ProtocolRuntime,
+    /// One-shot runtime outside any generation (see [`Self::ephemeral`]).
+    /// Session protocols skip their standby janitor for these: there is no
+    /// long-lived owner to keep warm state for, only [`Self::close`] to
+    /// release it deterministically.
+    ephemeral: bool,
 }
 
 impl NodeRuntime {
     /// A generation-free runtime for one-shot callers (standalone probing,
-    /// tests): session protocols get a throwaway pool per runtime.
+    /// tests): session protocols get a throwaway pool per runtime. The
+    /// caller MUST [`Self::close`] it when done — an unclosed ephemeral
+    /// pool keeps its demux-held sessions (and their connections) open
+    /// forever.
     pub fn ephemeral(node: &Node) -> Arc<Self> {
         Arc::new(Self {
             node: Arc::new(node.clone()),
@@ -268,7 +280,23 @@ impl NodeRuntime {
             runtime: crate::descriptor::descriptor(node.protocol)
                 .generation_runtime
                 .build(),
+            ephemeral: true,
         })
+    }
+
+    pub(crate) fn is_ephemeral(&self) -> bool {
+        self.ephemeral
+    }
+
+    /// Close every session-layer resource this runtime owns: AnyTLS pool
+    /// sessions (connections + demux tasks) and cached QUIC clients
+    /// (connection + endpoint driver). Terminal for the runtime; idempotent.
+    pub async fn close(&self) {
+        match &self.runtime {
+            ProtocolRuntime::AnyTls(runtime) => runtime.pool.shutdown(),
+            ProtocolRuntime::Quic(runtime) => runtime.force_close_all().await,
+            ProtocolRuntime::None => {}
+        }
     }
 
     pub(crate) fn anytls_tls_connector(&self) -> anyhow::Result<Arc<crate::tls::TlsConnector>> {
@@ -441,6 +469,7 @@ impl OutboundRuntimeRegistry {
                     runtime: crate::descriptor::descriptor(node.protocol)
                         .generation_runtime
                         .build(),
+                    ephemeral: false,
                 }),
             };
             if let Some(prev) = map.insert(node.id, runtime) {
