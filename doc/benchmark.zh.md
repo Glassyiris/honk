@@ -97,6 +97,63 @@ ssh root@10.10.10.57 "bash /root/lab-bench.sh 'honk dae' 'hy2 tuic ss2022 trojan
 ssh root@10.10.10.57 bash /root/test-protocols.sh
 ```
 
+## 结果(2026-08-04,honk outbound-v2 重构回归验证)
+
+本轮是 outbound-v2 重构合并的单引擎回归验证,不含 dae/sing-box 对照臂;
+对照基线为 08-02 轮(`49b166d`)。引擎机 10.10.10.59,服务端 10.10.10.70,
+测量方法不变。
+
+- honk: main `d00cb5e`(musl, mimalloc)——outbound-v2 重构(协议面收缩为
+  Direct/Block/SOCKS5/SS2022/Trojan/VMess/VLess/AnyTLS/Hysteria2/TUIC/Juicity;
+  `ProtocolDescriptor` 能力表;能力 trait 取代大接口 `ProxyHandler`;内容派生
+  稳定 NodeId;QUIC client 归 generation 所有且未变节点跨 reload 复用;TCP 拨号
+  路径固定准入 generation;拨号预算 per-generation),外加下述 AnyTLS 溢出修复。
+
+**本轮抓到一个 main 上的真实回归。** `85d6b61`(限制慢消费者溢出,已随
+v0.0.1.beta.33/34 发布)在流溢出达到 2 MiB 上限的瞬间即 reset——但快 LAN
+对端约 4ms 就能 burst 到这个量,此时 reader 任务尚未被首次调度,于是单流
+iperf3 在新旧两个二进制上都只有 2–3 Mbps(bisect 确认:父提交 `c7cbd67`
+正常,8.8 Gbps)。修复(`caa95b0` + `d00cb5e`)恢复停滞宽限:流字节上限在
+3 秒无 flush 进展窗口内为软上限;session 级硬上限在宽限内让 demux 暂停等待
+(借 TCP 窗口施加背压——即 `85d6b61` 之前的语义);只有超过宽限仍无 reader
+进展的流才被 reset。实验室验证:anytls-go 9.0 Gbps,零溢出误杀。
+
+### TCP
+
+| 引擎 | 协议 | cold | hot p50 | hot p95 | bw (Mbps) | cpu | RSS (MB) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| honk | direct | 0.0027 | – | – | 9405 | 0.21 | 53 |
+| honk | hy2 | 0.0033 | 0.0019 | 0.0022 | 5034 | 0.71 | 53 |
+| honk | tuic | 0.0027 | 0.0018 | 0.0021 | 6738 | 0.87 | 56 |
+| honk | ss2022 | 0.0030 | 0.0017 | 0.0026 | 9379 | 0.39 | 49 |
+| honk | trojan | 0.0108 | 0.0026 | 0.0087 | 9281 | 0.43 | 54 |
+| honk | anytls-sb | 0.0041 | 0.0026 | 0.0036 | 4408 | 0.28 | 51 |
+| honk | anytls-go | 0.0046 | 0.0029 | 0.0047 | 8468 | 0.47 | 61 |
+
+### UDP(热态,`udp_warm_node_count: 8`)
+
+| 引擎 | 协议 | echo RTT p50 | bw Mbps (loss) | cpu |
+| --- | --- | --- | --- | --- |
+| honk | hy2 | 0.14 ms | 1658 (74.0%) | 1.03 |
+| honk | tuic | 0.13 ms | 163 (68.3%) | 0.17 |
+| honk | ss2022 | 0.15 ms | 5486 (0.6%) | – |
+| honk | trojan | 0.15 ms | 6183 (0.7%) | – |
+| honk | anytls-sb | 0.25 ms | 1286 (78.8%) | 0.82 |
+| honk | anytls-go | 0.19 ms | 1579 (74.3%) | 1.05 |
+
+(两个 UDP cpu 格子在测量中丢失 pid 锚点;ss2022/trojan 的 RSS 格子为带宽
+复跑后手工补测。)
+
+### 08-04 结果解读
+
+- **重构无回归**:所有行在实验室波动范围内持平或优于 08-02 基线。hy2/tuic
+  读数更高(5034/6738 vs 2858/4134);QUIC 数据面代码未变,应视为 08-02 行
+  受实验室负载压低,而非重构带来的提速。
+- ss2022/trojan UDP 读数与 08-01 热态轮一致(5.5–6.2 Gbps,<1% 丢包)。
+  TUIC UDP 仍是已知弱点。
+- AnyTLS 行(4408/8468 Mbps)验证了停滞宽限修复,与回归前基线(4575/8937)
+  一致。
+
 ## 结果(2026-08-02,三引擎:honk vs dae vs sing-box)
 
 本轮引擎机为 **10.10.10.59**(同实验室的另一台 VM,服务端仍为物理机
