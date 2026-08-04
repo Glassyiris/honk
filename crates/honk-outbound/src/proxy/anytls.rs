@@ -74,21 +74,25 @@ const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30;
 /// Per-stream demux queue depth (frames). A full queue parks frames in
 /// the session overflow instead of blocking the demux.
 const STREAM_QUEUE_CAP: usize = 64;
-/// Total overflow events parked across a session. Hard bound: the stream
-/// whose data frame trips it is killed immediately (dropping the frame
-/// and keeping the stream would silently corrupt its TCP payload).
+/// Total overflow events parked across a session. At the cap the demux
+/// waits in [`OVERFLOW_SESSION_WAIT`] rounds for reader progress —
+/// pausing reads backpressures the server through the TCP window.
 const SESSION_OVERFLOW_CAP: usize = 512;
 /// Payload retained for one stalled stream after its normal queue fills.
 /// Soft within [`OVERFLOW_STALL_GRACE`]: a fast peer can burst past this
 /// in the milliseconds before the reader task is first scheduled.
 const STREAM_OVERFLOW_BYTES_CAP: usize = 2 * 1024 * 1024;
-/// Payload retained across all stalled streams on one session. Hard
-/// bound, same immediate-kill semantics as [`SESSION_OVERFLOW_CAP`].
+/// Payload retained across all stalled streams on one session. Same
+/// wait-then-kill semantics as [`SESSION_OVERFLOW_CAP`].
 const SESSION_OVERFLOW_BYTES_CAP: usize = 8 * 1024 * 1024;
 /// How long a stream at an overflow cap may go without flush progress
 /// before it is judged a stuck consumer and killed. Parked bytes are not
 /// a stall — only the absence of reader progress is.
 const OVERFLOW_STALL_GRACE: Duration = Duration::from_secs(3);
+/// One wait round when a session-wide cap is tripped. Sized far above the
+/// milliseconds a healthy reader needs to start draining (16ms observed
+/// on a 9Gbps LAN burst) so siblings never wait long behind a stuck one.
+const OVERFLOW_SESSION_WAIT: Duration = Duration::from_millis(500);
 const MAX_STREAM_ERROR_SOURCE_BYTES: usize = 1024;
 
 /// Transport halves behind trait objects so tests can drive a session over
@@ -196,6 +200,9 @@ struct OverflowVictim {
 
 enum OverflowAction {
     Parked,
+    /// Session-wide cap inside the stall grace: the caller waits for
+    /// flush progress, then retries with the returned event.
+    Wait(StreamEvent, OverflowLimit),
     Kill(OverflowVictim),
 }
 
@@ -355,26 +362,40 @@ impl OverflowState {
         self.flush_requested.remove(&sid);
     }
 
+    /// The parked stream with the oldest flush progress (ties to the
+    /// lowest sid): the prime stuck-consumer suspect at a session cap.
+    fn most_stalled_stream(&self) -> Option<u32> {
+        self.streams
+            .iter()
+            .filter_map(|(&sid, stream)| stream.last_progress_at.map(|at| (at, sid)))
+            .min()
+            .map(|(_, sid)| sid)
+    }
+
     /// Admit an overflow-bound event, parking it inline or returning the
-    /// kill verdict for the caller to execute outside the lock. The
-    /// stream byte cap is soft inside [`OVERFLOW_STALL_GRACE`] — parked
-    /// bytes are not a stall, only missing flush progress is. Session-wide
-    /// caps are a hard memory bound: the stream whose data frame trips
-    /// one is killed immediately, grace or not — dropping the frame and
-    /// keeping the stream would silently corrupt its TCP payload.
-    /// Fin/Error always park: they are tiny, and dropping them would
-    /// break stream termination.
+    /// verdict for the caller to execute outside the lock. The stream
+    /// byte cap is soft inside [`OVERFLOW_STALL_GRACE`] — parked bytes are
+    /// not a stall, only missing flush progress is. A data frame tripping
+    /// a session-wide cap inside the grace makes the demux wait in
+    /// [`OVERFLOW_SESSION_WAIT`] rounds for reader progress — pausing
+    /// reads backpressures the server through the TCP window, which is
+    /// what actually bounds parked memory; a wait that times out kills
+    /// the most-stalled parked stream. Fin/Error always park: they are
+    /// tiny, and dropping them would break stream termination.
     fn admit(&mut self, sid: u32, event: StreamEvent) -> OverflowAction {
         let Some(limit) = self.limit_for(sid, &event) else {
             self.push_back(sid, event);
             return OverflowAction::Parked;
         };
         let stalled_for = self.stalled_for(sid);
-        let soft_stream_cap =
-            limit == OverflowLimit::StreamBytes && stalled_for < OVERFLOW_STALL_GRACE;
-        if soft_stream_cap || !matches!(event, StreamEvent::Data(_)) {
+        if !matches!(event, StreamEvent::Data(_))
+            || (limit == OverflowLimit::StreamBytes && stalled_for < OVERFLOW_STALL_GRACE)
+        {
             self.push_back(sid, event);
             return OverflowAction::Parked;
+        }
+        if stalled_for < OVERFLOW_STALL_GRACE {
+            return OverflowAction::Wait(event, limit);
         }
         let victim = OverflowVictim {
             sid,
@@ -392,9 +413,9 @@ impl OverflowState {
 #[derive(Clone)]
 enum StreamSink {
     /// TCP streams: bounded queue plus the session overflow. Payload is
-    /// retained in order; a stream parked past its byte cap with no flush
-    /// progress for [`OVERFLOW_STALL_GRACE`], or one whose data frame
-    /// trips a session-wide hard bound, gets only its own stream reset.
+    /// retained in order; a stream parked at an overflow cap with no
+    /// flush progress past [`OVERFLOW_STALL_GRACE`] gets only its own
+    /// stream reset.
     Tcp(mpsc::Sender<StreamEvent>),
     /// UoT streams: drop-on-full (UDP semantics) — a slow consumer must
     /// never backpressure the session demux, or one hot UDP flow wedges
@@ -692,6 +713,9 @@ pub(crate) struct AnyTlsSession {
     /// Per-stream ordered overflow for full TCP queues, with exact session
     /// and stream frame/byte accounting.
     overflow: parking_lot::Mutex<OverflowState>,
+    /// Wakes the demux waiting at a session overflow cap when a flush
+    /// actually frees overflow space (reader progress).
+    overflow_notify: tokio::sync::Notify,
     /// Stream-slot capacity: the single capacity truth (replaces the old
     /// active_streams counter — a permit outlives the counter's races).
     stream_permits: Arc<tokio::sync::Semaphore>,
@@ -728,6 +752,7 @@ impl AnyTlsSession {
             terminal_error: std::sync::OnceLock::new(),
             killed_streams: Mutex::new(HashSet::new()),
             overflow: parking_lot::Mutex::new(OverflowState::default()),
+            overflow_notify: tokio::sync::Notify::new(),
             stream_permits: Arc::new(tokio::sync::Semaphore::new(MAX_STREAMS_PER_SESSION)),
             demux: Mutex::new(None),
         });
@@ -1026,21 +1051,21 @@ impl AnyTlsSession {
         debug!("AnyTLS session {} for {} closed", self.seq, self.addr);
     }
 
-    /// Deliver a server payload frame to its stream. TCP sinks are
-    /// **non-blocking**: a full per-stream queue parks the frame in the
-    /// session overflow (flushed later by the reader's progress — see
-    /// [`Self::flush_overflow`]), so one stalled stream never pauses the
-    /// demux for the others. The per-stream byte cap is soft inside
-    /// [`OVERFLOW_STALL_GRACE`] — parked bytes are not a stall (a fast
-    /// peer bursts megabytes before the reader task is first scheduled),
-    /// only missing flush progress past the grace kills. Session-wide
-    /// caps are a hard memory bound: the stream whose data frame trips
-    /// one is killed immediately. UoT sinks drop on full.
+    /// Deliver a server payload frame to its stream. TCP sinks park a
+    /// full per-stream queue into the session overflow (flushed later by
+    /// the reader's progress — see [`Self::flush_overflow`]). The
+    /// per-stream byte cap is soft inside [`OVERFLOW_STALL_GRACE`] —
+    /// parked bytes are not a stall (a fast peer bursts megabytes before
+    /// the reader task is first scheduled), only missing flush progress
+    /// past the grace kills. At a session-wide cap the demux waits out
+    /// the grace for reader progress; pausing reads backpressures the
+    /// server through the TCP window, which is what actually bounds
+    /// parked memory. UoT sinks drop on full.
     async fn dispatch_data(&self, sid: u32, data: Vec<u8>) {
         // Ordering: if this sid already has parked frames, the new frame
         // goes behind them, never past them.
         if self.overflow_has(sid) {
-            self.park_overflow(sid, StreamEvent::Data(data));
+            self.park_overflow(sid, StreamEvent::Data(data)).await;
             return;
         }
         let sink = self.streams.lock().unwrap().get(&sid).cloned();
@@ -1048,7 +1073,7 @@ impl AnyTlsSession {
             Some(StreamSink::Tcp(tx)) => match tx.try_send(StreamEvent::Data(data)) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(ev)) => {
-                    self.park_overflow(sid, ev);
+                    self.park_overflow(sid, ev).await;
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     self.streams.lock().unwrap().remove(&sid);
@@ -1125,34 +1150,89 @@ impl AnyTlsSession {
         }
     }
 
-    /// Park an event without ever waiting in the single session demux.
-    fn park_overflow(&self, sid: u32, event: StreamEvent) {
-        if !self.overflow_sink_is_live(sid) {
-            self.discard_overflow(sid);
-            return;
-        }
+    /// Park an event without ever waiting below the session caps. At a
+    /// session-wide cap inside the stall grace the demux waits in
+    /// [`OVERFLOW_SESSION_WAIT`] rounds for reader progress,
+    /// backpressuring the server through the TCP window; any successful
+    /// flush session-wide wakes it to retry. A wait that times out kills
+    /// the most-stalled parked stream and retries.
+    async fn park_overflow(&self, sid: u32, mut event: StreamEvent) {
+        loop {
+            if !self.overflow_sink_is_live(sid) {
+                self.discard_overflow(sid);
+                return;
+            }
+            // Register before admitting so a flush landing between the
+            // decision and the wait cannot be missed.
+            let wait = self.overflow_notify.notified();
+            tokio::pin!(wait);
+            wait.as_mut().enable();
 
-        let action = self.overflow.lock().admit(sid, event);
-        match action {
-            OverflowAction::Parked => {
-                self.flush_overflow(sid);
-                if !self.overflow_sink_is_live(sid) {
-                    self.discard_overflow(sid);
+            let action = self.overflow.lock().admit(sid, event);
+            match action {
+                OverflowAction::Parked => {
+                    self.flush_overflow(sid);
+                    if !self.overflow_sink_is_live(sid) {
+                        self.discard_overflow(sid);
+                    }
+                    return;
+                }
+                OverflowAction::Kill(victim) => {
+                    self.kill_overflow_victim(victim);
+                    return;
+                }
+                OverflowAction::Wait(returned, limit) => {
+                    event = returned;
+                    if tokio::time::timeout(OVERFLOW_SESSION_WAIT, wait)
+                        .await
+                        .is_ok()
+                    {
+                        continue;
+                    }
+                    let victim = {
+                        let mut overflow = self.overflow.lock();
+                        let Some(victim_sid) = overflow.most_stalled_stream() else {
+                            continue;
+                        };
+                        let victim = OverflowVictim {
+                            sid: victim_sid,
+                            limit,
+                            session: overflow.usage(),
+                            stream: overflow.stream_usage(victim_sid),
+                            stalled_for: overflow.stalled_for(victim_sid),
+                        };
+                        overflow.remove_stream(victim_sid);
+                        victim
+                    };
+                    let own = victim.sid == sid;
+                    self.kill_overflow_victim(victim);
+                    if own {
+                        return;
+                    }
                 }
             }
-            OverflowAction::Kill(victim) => self.kill_overflow_victim(victim),
         }
     }
 
-    /// Move one sid's parked events into its queue without scanning siblings.
+    /// Move one sid's parked events into its queue without scanning
+    /// siblings; wakes a demux waiting at a session cap when space was
+    /// actually freed.
     fn flush_overflow(&self, sid: u32) {
+        if self.drain_overflow(sid) {
+            self.overflow_notify.notify_waiters();
+        }
+    }
+
+    /// Returns whether any parked event reached the stream queue.
+    fn drain_overflow(&self, sid: u32) -> bool {
         {
             let mut overflow = self.overflow.lock();
             if !overflow.has(sid) || !overflow.request_flush(sid) {
-                return;
+                return false;
             }
         }
 
+        let mut moved = false;
         loop {
             let tx = match self.streams.lock().unwrap().get(&sid).cloned() {
                 Some(StreamSink::Tcp(tx)) => tx,
@@ -1161,7 +1241,7 @@ impl AnyTlsSession {
                     overflow.remove_stream(sid);
                     overflow.cancel_flush(sid);
                     drop(overflow);
-                    return;
+                    return moved;
                 }
             };
 
@@ -1173,10 +1253,13 @@ impl AnyTlsSession {
                     continue;
                 }
                 drop(overflow);
-                break;
+                return moved;
             };
             match tx.try_send(event) {
-                Ok(()) => overflow.note_progress(sid),
+                Ok(()) => {
+                    overflow.note_progress(sid);
+                    moved = true;
+                }
                 Err(mpsc::error::TrySendError::Full(event)) => {
                     overflow.push_front(sid, event);
                     overflow.restore_last_progress_at(sid, last_progress_at);
@@ -1185,14 +1268,14 @@ impl AnyTlsSession {
                         continue;
                     }
                     drop(overflow);
-                    break;
+                    return moved;
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     overflow.remove_stream(sid);
                     overflow.cancel_flush(sid);
                     drop(overflow);
                     self.streams.lock().unwrap().remove(&sid);
-                    return;
+                    return moved;
                 }
             }
         }
@@ -1200,7 +1283,7 @@ impl AnyTlsSession {
 
     async fn dispatch_fin(&self, sid: u32) {
         if self.overflow_has(sid) {
-            self.park_overflow(sid, StreamEvent::Fin);
+            self.park_overflow(sid, StreamEvent::Fin).await;
             return;
         }
         let sink = self.streams.lock().unwrap().get(&sid).cloned();
@@ -1208,7 +1291,7 @@ impl AnyTlsSession {
             Some(StreamSink::Tcp(tx)) => match tx.try_send(StreamEvent::Fin) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(event)) => {
-                    self.park_overflow(sid, event);
+                    self.park_overflow(sid, event).await;
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     self.streams.lock().unwrap().remove(&sid);
@@ -1222,7 +1305,7 @@ impl AnyTlsSession {
 
     async fn dispatch_error(&self, sid: u32, message: Arc<str>) {
         if self.overflow_has(sid) {
-            self.park_overflow(sid, StreamEvent::Error(message));
+            self.park_overflow(sid, StreamEvent::Error(message)).await;
             return;
         }
         let sink = self.streams.lock().unwrap().get(&sid).cloned();
@@ -1232,7 +1315,7 @@ impl AnyTlsSession {
                 match tx.try_send(event) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(event)) => {
-                        self.park_overflow(sid, event);
+                        self.park_overflow(sid, event).await;
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         self.streams.lock().unwrap().remove(&sid);
@@ -3437,7 +3520,7 @@ mod tests {
             .push_back(sid, StreamEvent::Data(vec![0; STREAM_OVERFLOW_BYTES_CAP]));
 
         // At the cap but inside the grace window the frame still parks.
-        session.park_overflow(sid, StreamEvent::Data(vec![1]));
+        session.park_overflow(sid, StreamEvent::Data(vec![1])).await;
         assert!(session.streams.lock().unwrap().contains_key(&sid));
         assert!(!session.killed_streams.lock().unwrap().contains(&sid));
         assert_eq!(
@@ -3447,7 +3530,7 @@ mod tests {
 
         // A reader that never consumes is killed once the grace expires.
         tokio::time::advance(OVERFLOW_STALL_GRACE).await;
-        session.park_overflow(sid, StreamEvent::Data(vec![1]));
+        session.park_overflow(sid, StreamEvent::Data(vec![1])).await;
         assert!(!session.streams.lock().unwrap().contains_key(&sid));
         assert!(session.killed_streams.lock().unwrap().contains(&sid));
         assert_eq!(session.overflow.lock().usage(), OverflowUsage::default());
@@ -3455,9 +3538,10 @@ mod tests {
         session.close();
     }
 
-    /// Fast-peer burst regression: megabytes parked before the reader is
-    /// first scheduled must not kill the stream — the reader drains within
-    /// the stall grace and every byte arrives in order.
+    /// Fast-peer burst regression: a peer can park past the session byte
+    /// cap in the milliseconds before the reader is first scheduled — the
+    /// demux waits it out (bounded by the stall grace), the late reader
+    /// drains, and every byte arrives in order.
     #[tokio::test]
     async fn overflow_burst_within_grace_survives_and_delivers() {
         let (session, _server) = establish_test_session("127.0.0.1:443").await;
@@ -3472,13 +3556,21 @@ mod tests {
         let mut stream = AnyTlsStream::new(Arc::clone(&session), sid, rx, permit);
 
         const FRAME: usize = 32 * 1024;
-        let frames = STREAM_QUEUE_CAP + STREAM_OVERFLOW_BYTES_CAP / FRAME + 8;
-        for i in 0..frames {
-            session
-                .dispatch_data(sid, vec![(i % 251) as u8; FRAME])
-                .await;
-        }
-        assert!(session.overflow.lock().stream_usage(sid).bytes > STREAM_OVERFLOW_BYTES_CAP);
+        // Queue + stream soft cap + past the session byte hard cap.
+        let frames = STREAM_QUEUE_CAP + SESSION_OVERFLOW_BYTES_CAP / FRAME + 8;
+        let dispatcher = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move {
+                for i in 0..frames {
+                    session
+                        .dispatch_data(sid, vec![(i % 251) as u8; FRAME])
+                        .await;
+                }
+            }
+        });
+        // The reader starts late: the burst has parked past the session
+        // cap and the dispatcher is waiting it out, not killing.
+        tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(session.streams.lock().unwrap().contains_key(&sid));
         assert!(!session.killed_streams.lock().unwrap().contains(&sid));
 
@@ -3487,6 +3579,7 @@ mod tests {
             .await
             .expect("burst drains")
             .unwrap();
+        dispatcher.await.unwrap();
         for (i, frame) in got.as_chunks::<FRAME>().0.iter().enumerate() {
             assert!(
                 frame.iter().all(|&b| b == (i % 251) as u8),
@@ -3498,8 +3591,8 @@ mod tests {
         session.close();
     }
 
-    #[tokio::test]
-    async fn session_cap_immediately_kills_the_stream_whose_frame_trips_it() {
+    #[tokio::test(start_paused = true)]
+    async fn session_cap_kills_stream_that_outwaits_the_stall_grace() {
         let (session, _server) = establish_test_session("127.0.0.1:443").await;
         let (slow_tx, _slow_rx) = mpsc::channel(STREAM_QUEUE_CAP);
         let (other_tx, _other_rx) = mpsc::channel(STREAM_QUEUE_CAP);
@@ -3521,71 +3614,118 @@ mod tests {
             assert_eq!(overflow.usage().frames, SESSION_OVERFLOW_CAP);
         }
 
-        // A data frame tripping the session-wide hard bound kills its own
-        // stream at once — parking it would exceed the memory bound, and
-        // dropping it while keeping the stream would silently corrupt the
-        // TCP payload. Siblings are untouched.
-        session.park_overflow(53, StreamEvent::Data(vec![9, 8, 7]));
+        // No reader progress anywhere: the demux waits at the cap (paused
+        // time auto-advances past the wait round), then kills the
+        // most-stalled parked stream — 51, oldest progress (ties to the
+        // lowest sid) — and the waiter's frame parks on the freed space,
+        // then flushes into its empty channel.
+        session
+            .park_overflow(53, StreamEvent::Data(vec![9, 8, 7]))
+            .await;
 
-        assert!(session.killed_streams.lock().unwrap().contains(&53));
-        assert!(!session.streams.lock().unwrap().contains_key(&53));
-        assert!(session.streams.lock().unwrap().contains_key(&51));
+        assert!(session.killed_streams.lock().unwrap().contains(&51));
+        assert!(!session.streams.lock().unwrap().contains_key(&51));
         assert!(session.streams.lock().unwrap().contains_key(&52));
+        assert!(session.streams.lock().unwrap().contains_key(&53));
+        assert!(!session.overflow.lock().has(51));
         assert!(!session.overflow.lock().has(53));
         assert_eq!(
             session.overflow.lock().usage(),
             OverflowUsage {
-                frames: SESSION_OVERFLOW_CAP,
-                bytes: 300 * 4096 + 212 * 1024,
+                frames: 212,
+                bytes: 212 * 1024,
             }
         );
 
-        // Non-data events are tiny and still park past the frame cap; the
-        // post-park flush then moves a free channel's worth of events into
-        // the stream queue (512 parked + 1 Fin − 64 delivered).
-        session.park_overflow(52, StreamEvent::Fin);
+        // Non-data events still park below the cap; the post-park flush
+        // moves a free channel's worth of events into the stream queue
+        // (212 parked + 1 Fin − 64 delivered).
+        session.park_overflow(52, StreamEvent::Fin).await;
         assert!(session.streams.lock().unwrap().contains_key(&52));
         assert_eq!(
             session.overflow.lock().usage().frames,
-            SESSION_OVERFLOW_CAP + 1 - STREAM_QUEUE_CAP
+            212 + 1 - STREAM_QUEUE_CAP
         );
         assert!(!session.is_closed());
         session.close();
     }
 
+    /// At a session cap inside the stall grace the demux waits (bounded)
+    /// instead of killing: a sibling with no parked frames still
+    /// dispatches, and reader progress wakes the waiter to park.
     #[tokio::test]
-    async fn hard_cap_eviction_does_not_pause_sibling_demux() {
+    async fn session_cap_wait_parks_after_flush_and_spares_siblings() {
         let (session, _server) = establish_test_session("127.0.0.1:443").await;
         let slow_sid = 61;
         let fast_sid = 62;
+        let waiting_sid = 63;
         let (slow_tx, _slow_rx) = mpsc::channel(STREAM_QUEUE_CAP);
         let (fast_tx, mut fast_rx) = mpsc::channel(STREAM_QUEUE_CAP);
+        let (waiting_tx, mut waiting_rx) = mpsc::channel(STREAM_QUEUE_CAP);
         {
             let mut streams = session.streams.lock().unwrap();
             streams.insert(slow_sid, StreamSink::Tcp(slow_tx));
             streams.insert(fast_sid, StreamSink::Tcp(fast_tx));
+            streams.insert(waiting_sid, StreamSink::Tcp(waiting_tx));
         }
-        for _ in 0..SESSION_OVERFLOW_CAP {
-            session
-                .overflow
-                .lock()
-                .push_back(slow_sid, StreamEvent::Fin);
+        {
+            let mut overflow = session.overflow.lock();
+            for _ in 0..SESSION_OVERFLOW_CAP {
+                overflow.push_back(slow_sid, StreamEvent::Data(vec![1; 8]));
+            }
         }
 
-        tokio::time::timeout(
-            Duration::from_millis(100),
-            session.dispatch_data(slow_sid, vec![1]),
-        )
-        .await
-        .expect("hard-cap eviction blocked the demux");
+        let parker = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move {
+                session
+                    .park_overflow(waiting_sid, StreamEvent::Data(vec![9, 8, 7]))
+                    .await;
+            }
+        });
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(
+            waiting_rx.try_recv().is_err(),
+            "the frame waits at the cap inside the grace"
+        );
+        assert!(
+            !session
+                .killed_streams
+                .lock()
+                .unwrap()
+                .contains(&waiting_sid)
+        );
+
+        // A sibling with no parked frames is not affected by the wait.
         session.dispatch_data(fast_sid, vec![7]).await;
         match fast_rx.recv().await.unwrap() {
             StreamEvent::Data(data) => assert_eq!(data, vec![7]),
             StreamEvent::Fin | StreamEvent::Error(_) => panic!("fast sibling was terminated"),
         }
 
-        assert!(session.killed_streams.lock().unwrap().contains(&slow_sid));
-        assert!(session.streams.lock().unwrap().contains_key(&fast_sid));
+        // Reader progress on the stalled stream frees overflow space and
+        // wakes the parker, which parks and flushes its frame.
+        session.flush_overflow(slow_sid);
+        tokio::time::timeout(Duration::from_secs(2), parker)
+            .await
+            .expect("parker wakes after the flush")
+            .unwrap();
+        match waiting_rx.recv().await.unwrap() {
+            StreamEvent::Data(data) => assert_eq!(data, vec![9, 8, 7]),
+            StreamEvent::Fin | StreamEvent::Error(_) => panic!("waiting stream was terminated"),
+        }
+        assert!(
+            !session
+                .killed_streams
+                .lock()
+                .unwrap()
+                .contains(&waiting_sid)
+        );
+        assert_eq!(
+            session.overflow.lock().usage().frames,
+            SESSION_OVERFLOW_CAP - STREAM_QUEUE_CAP
+        );
         assert!(!session.is_closed());
         session.close();
     }
@@ -3601,7 +3741,9 @@ mod tests {
             .unwrap()
             .insert(sid, StreamSink::Tcp(tx));
 
-        session.park_overflow(sid, StreamEvent::Data(vec![7, 8, 9]));
+        session
+            .park_overflow(sid, StreamEvent::Data(vec![7, 8, 9]))
+            .await;
 
         assert_eq!(session.overflow.lock().usage(), OverflowUsage::default());
         match rx.recv().await.unwrap() {
@@ -3700,10 +3842,11 @@ mod tests {
     }
 
     /// 3B-2: a stalled stream is first parked in the session overflow
-    /// (non-blocking); a data frame tripping the shared frame cap kills
-    /// just that stream — queued data still drains, then the reader sees
-    /// a reset (never a clean EOF), and the session survives.
-    #[tokio::test]
+    /// (non-blocking); at the shared frame cap the demux waits out the
+    /// stall grace and, with no reader progress, kills just that stream —
+    /// queued data still drains, then the reader sees a reset (never a
+    /// clean EOF), and the session survives.
+    #[tokio::test(start_paused = true)]
     async fn test_hol_slow_consumer_reset_after_queue_drains() {
         let (session, _server) = establish_test_session("127.0.0.1:443").await;
         let sid = 21u32;
@@ -3726,7 +3869,9 @@ mod tests {
             session.streams.lock().unwrap().get(&sid).is_some(),
             "overflow parking must not kill the stream"
         );
-        // Tripping the session-wide frame cap kills it immediately.
+        // Tripping the session-wide frame cap makes the demux wait out
+        // the stall grace (paused time auto-advances it); with no reader
+        // progress the stream is then killed.
         for _ in 0..SESSION_OVERFLOW_CAP {
             session.dispatch_data(sid, vec![2u8; 8]).await;
         }
