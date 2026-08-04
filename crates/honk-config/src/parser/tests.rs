@@ -1004,6 +1004,26 @@ fn udp_warm_node_count_parses_zero_and_rejects_invalid_values() {
 }
 
 #[test]
+fn preconnect_node_count_defaults_to_auto_and_zero_disables() {
+    assert_eq!(
+        crate::Config::default().global.preconnect_node_count,
+        crate::config::PRECONNECT_NODE_COUNT_AUTO
+    );
+    let auto = parse_dae_config("global {\n preconnect_node_count: 'auto'\n}").unwrap();
+    assert_eq!(
+        auto.global.preconnect_node_count,
+        crate::config::PRECONNECT_NODE_COUNT_AUTO
+    );
+    let disabled = parse_dae_config("global {\n preconnect_node_count: 0\n}").unwrap();
+    assert_eq!(disabled.global.preconnect_node_count, 0);
+    let explicit = parse_dae_config("global {\n preconnect_node_count: 5\n}").unwrap();
+    assert_eq!(explicit.global.preconnect_node_count, 5);
+    let err = parse_dae_config("global {\n preconnect_node_count: someday\n}")
+        .expect_err("invalid preconnect_node_count must reject the dae config");
+    assert!(matches!(err, crate::ConfigError::Parse(_)));
+}
+
+#[test]
 fn max_concurrent_dials_defaults_and_parses() {
     assert_eq!(crate::Config::default().global.max_concurrent_dials, 64);
     let cfg = parse_dae_config("global {\n max_concurrent_dials: 128\n}").unwrap();

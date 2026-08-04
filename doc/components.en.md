@@ -44,7 +44,7 @@ Source of truth: `crates/honk-config/src/*`, the dae parser in `crates/honk-conf
 | — | `connect_timeout_ms` | `3000` | TCP connect timeout; not settable in dae syntax |
 | — | `dns_resolve_timeout_ms` | `2000` | Control-plane resolve timeout; not settable in dae syntax |
 | — | `relay_idle_timeout_secs` | `300` | Idle relay kill; `0` = off; not settable in dae syntax |
-| — | `preconnect_node_count` | `0` | Preconnect count; `0` = auto `min(nodes,8)`; not settable in dae syntax |
+| `preconnect_node_count` | `preconnect_node_count` | `'auto'` | Startup bare-TCP preconnect count. `'auto'` = `min(nodes,8)`; `0` strictly disables the warm-up. Candidates are each group's current pick first, then config order; only bare-TCP-poolable protocols qualify (AnyTLS/QUIC never consume a pooled bare TCP) and the built-in `direct`/`block` are excluded. |
 | `udp_warm_node_count` | `udp_warm_node_count` | `0` | Per-group UDP warm-up cap. `0` is strictly disabled: no coordinator task and no warm metrics. A positive value N (capped at 3) warms each group's top-N latency-ranked, UDP-capable leaves after startup and after every probe cycle (`check_interval`), so newly fast nodes are pre-dialed before they win a selection. Dispatch stays capped at four concurrent tasks. |
 | `max_concurrent_dials` | `max_concurrent_dials` | `64` | Cap on concurrent proxied dials (connect + protocol handshake), scoped to the runtime generation. Built-in `direct`/`block` dials are exempt — they are local connects already bounded by the connection admission limit. A changed limit applies to new dials immediately on reload; in-flight dials keep their permits. |
 

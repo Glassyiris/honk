@@ -3108,3 +3108,113 @@ async fn udp_stagger_rechecks_eligibility_before_accepting_prepared_transport() 
     assert_eq!(winner.name, "eligible-winner");
     assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
+
+fn preconnect_test_node(name: &str, protocol: NodeProtocol) -> Node {
+    Node {
+        id: uuid::Uuid::new_v4(),
+        name: name.into(),
+        protocol,
+        address: format!("{name}.example.com:443"),
+        ..Default::default()
+    }
+}
+
+fn preconnect_test_group(name: &str, policy: GroupPolicy, ids: Vec<uuid::Uuid>) -> Group {
+    Group {
+        id: uuid::Uuid::new_v4(),
+        name: name.into(),
+        policy,
+        nodes: ids,
+        filters: vec![],
+        groups: vec![],
+        default: None,
+        final_outbound: None,
+        check_url: None,
+        check_interval: None,
+        tolerance: 50,
+        idle_timeout: None,
+        interrupt_connections: false,
+        created_at: chrono::Utc::now(),
+    }
+}
+
+#[test]
+fn preconnect_candidates_zero_disables_and_eligibility_is_descriptor_driven() {
+    let anytls = preconnect_test_node("anytls", NodeProtocol::AnyTLS);
+    let ss = preconnect_test_node("ss", NodeProtocol::SS);
+    let tuic = preconnect_test_node("tuic", NodeProtocol::Tuic);
+    let trojan = preconnect_test_node("trojan", NodeProtocol::Trojan);
+    let hy2 = preconnect_test_node("hy2", NodeProtocol::Hysteria2);
+    let direct = preconnect_test_node("direct", NodeProtocol::Direct);
+    let block = preconnect_test_node("block", NodeProtocol::Block);
+    let nodes = vec![anytls, ss.clone(), tuic, trojan.clone(), hy2, direct, block];
+    let config = Config {
+        nodes,
+        ..Default::default()
+    };
+    let manager = GroupManager::new(&config.groups, &config.nodes);
+
+    assert!(preconnect_candidates(&config, &manager, 0).is_empty());
+
+    let picked = preconnect_candidates(
+        &config,
+        &manager,
+        honk_config::config::PRECONNECT_NODE_COUNT_AUTO,
+    );
+    assert_eq!(
+        picked.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(),
+        vec!["ss", "trojan"],
+        "AnyTLS/QUIC can never consume a pooled bare TCP; built-ins have no server"
+    );
+}
+
+#[test]
+fn preconnect_candidates_prefer_group_selections_then_config_order() {
+    let ss = preconnect_test_node("ss", NodeProtocol::SS);
+    let trojan = preconnect_test_node("trojan", NodeProtocol::Trojan);
+    let vmess = preconnect_test_node("vmess", NodeProtocol::VMess);
+    let config = Config {
+        nodes: vec![ss, trojan.clone(), vmess],
+        groups: vec![preconnect_test_group(
+            "g",
+            GroupPolicy::Selector,
+            vec![trojan.id],
+        )],
+        ..Default::default()
+    };
+    let manager = GroupManager::new(&config.groups, &config.nodes);
+
+    let picked = preconnect_candidates(&config, &manager, 8);
+    assert_eq!(
+        picked.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(),
+        vec!["trojan", "ss", "vmess"],
+        "the group's current pick leads; config order fills the rest"
+    );
+}
+
+#[test]
+fn preconnect_candidates_auto_caps_at_eight() {
+    let nodes: Vec<_> = (0..12)
+        .map(|i| preconnect_test_node(&format!("ss-{i}"), NodeProtocol::SS))
+        .collect();
+    let config = Config {
+        nodes,
+        ..Default::default()
+    };
+    let manager = GroupManager::new(&config.groups, &config.nodes);
+
+    assert_eq!(
+        preconnect_candidates(
+            &config,
+            &manager,
+            honk_config::config::PRECONNECT_NODE_COUNT_AUTO
+        )
+        .len(),
+        8
+    );
+    assert_eq!(
+        preconnect_candidates(&config, &manager, 3).len(),
+        3,
+        "an explicit count smaller than the eligible set is honored"
+    );
+}

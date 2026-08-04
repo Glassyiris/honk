@@ -13,6 +13,11 @@ pub const DIRECT_NODE_ID: uuid::Uuid =
 /// Stable identity of the built-in `block` node across reloads and restarts.
 pub const BLOCK_NODE_ID: uuid::Uuid = uuid::Uuid::from_u128(0x00000000_0000_4000_8000_00000000b10c);
 
+/// `preconnect_node_count` sentinel for the dae `'auto'` value: preconnect
+/// `min(nodes, 8)` nodes. Kept as a `usize` sentinel so the serde formats
+/// stay plain integers; `0` means disabled.
+pub const PRECONNECT_NODE_COUNT_AUTO: usize = usize::MAX;
+
 /// Main honk configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
@@ -109,7 +114,9 @@ pub struct GlobalConfig {
     /// many seconds, the relay is terminated. 0 disables the timeout.
     #[serde(default = "default_relay_idle_timeout_secs")]
     pub relay_idle_timeout_secs: u64,
-    /// Number of proxy nodes to preconnect on startup (0 = auto: min(nodes, 8)).
+    /// Number of proxy nodes to preconnect on startup. `0` disables the
+    /// warm-up entirely; [`PRECONNECT_NODE_COUNT_AUTO`] (dae `'auto'`) picks
+    /// `min(nodes, 8)`.
     #[serde(default = "default_preconnect_node_count")]
     pub preconnect_node_count: usize,
     /// Number of selected UDP nodes to warm on startup/reload. Zero strictly
@@ -267,7 +274,7 @@ fn default_relay_idle_timeout_secs() -> u64 {
     300
 }
 fn default_preconnect_node_count() -> usize {
-    0
+    PRECONNECT_NODE_COUNT_AUTO
 }
 fn default_udp_warm_node_count() -> usize {
     0

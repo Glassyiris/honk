@@ -46,7 +46,7 @@
 | `connect_timeout_ms` | u64 | `3000` | TCP 连接超时（结构化模型字段，dae 语法无对应键） |
 | `dns_resolve_timeout_ms` | u64 | `2000` | 控制面解析超时（结构化模型字段，dae 语法无对应键） |
 | `relay_idle_timeout_secs` | u64 | `300` | 空闲中继断开；`0` = 关闭（结构化模型字段，dae 语法无对应键） |
-| `preconnect_node_count` | usize | `0` | 预连接数；`0` = 自动 `min(nodes,8)`（结构化模型字段，dae 语法无对应键） |
+| `preconnect_node_count` | usize | `'auto'` | 启动裸 TCP 预连接数。`'auto'` = `min(nodes,8)`；`0` 严格关闭预热。候选顺序为各组当前选择优先、再按配置顺序补足；仅可池化裸 TCP 的协议入选（AnyTLS/QUIC 永远不会消费池化裸 TCP），且排除内置 `direct`/`block`。 |
 | `udp_warm_node_count` | usize | `0` | 每组 UDP 预热上限。`0` 为严格关闭：不创建 coordinator task，也不产生 warm metrics。正值 N（封顶 3）会在启动后以及**每个探测周期**（`check_interval`）预热每组按延迟排名前 N 的 UDP 可用节点——测速后新变快的节点在赢得选择前就已拨好 transport。dispatch 仍最多四个并发 task。 |
 | `max_concurrent_dials` | usize | `64` | 并发代理拨号上限（connect + 协议握手），按 runtime generation 作用域生效。内置 `direct`/`block` 拨号豁免——它们是本地 connect，已由连接准入上限约束。reload 后新拨号立即使用新上限；进行中的拨号保留原有许可。 |
 

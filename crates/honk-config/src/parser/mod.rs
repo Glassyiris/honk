@@ -705,6 +705,16 @@ fn parse_global_section(section: &Section) -> Result<GlobalConfig, crate::Config
             .parse()
             .map_err(|_| crate::ConfigError::Parse(format!("invalid udp_warm_node_count: {v}")))?;
     }
+    if let Some(v) = kv.get("preconnect_node_count") {
+        let trimmed = v.trim().trim_matches('\'');
+        cfg.preconnect_node_count = if trimmed.eq_ignore_ascii_case("auto") {
+            crate::config::PRECONNECT_NODE_COUNT_AUTO
+        } else {
+            trimmed.parse().map_err(|_| {
+                crate::ConfigError::Parse(format!("invalid preconnect_node_count: {v}"))
+            })?
+        };
+    }
     if let Some(v) = kv.get("max_concurrent_dials") {
         cfg.max_concurrent_dials = v
             .parse()
