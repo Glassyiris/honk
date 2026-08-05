@@ -136,6 +136,7 @@ fn redirect_lan_packet_to_control_plane(
             handoff.result.outbound = routing_meta.data.outbound;
             handoff.result.dscp = routing_meta.data.dscp;
         }
+        handoff.result.mac.copy_from_slice(&pkt.ethh.src_addr);
         if ROUTING_HANDOFF_MAP
             .insert(pkt.tuples.five, handoff, 0)
             .is_err()
