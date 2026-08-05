@@ -187,13 +187,19 @@ impl RoutingProjection {
         self.counters.snapshot()
     }
 
-    pub(crate) async fn shutdown(&self) {
+    pub(crate) async fn shutdown(&self, timeout: Duration) {
         self.wake.lock().take();
         let handle = self.worker.lock().take();
-        if let Some(handle) = handle {
-            let _ = handle.await;
+        if let Some(mut handle) = handle {
+            // A wedged worker must be aborted, never detached: shutdown
+            // continues into backend cleanup, and a live worker would keep
+            // pushing map writes into the backend being torn down.
+            if tokio::time::timeout(timeout, &mut handle).await.is_err() {
+                handle.abort();
+                let _ = (&mut handle).await;
+            }
         } else {
-            self.lifecycle.wait().await;
+            let _ = tokio::time::timeout(timeout, self.lifecycle.wait()).await;
         }
     }
 

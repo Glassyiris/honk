@@ -174,6 +174,11 @@ pub struct MockEbpfBackend {
     /// Whether TC entry points may redirect traffic into the control plane.
     pub datapath_ready: bool,
     pub listener_sockets_published: bool,
+    /// Lifecycle counters (shared so tests can read them after the backend is
+    /// boxed): detach_hooks must only ever run during shutdown.
+    pub detach_calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub dynamic_attach_calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub dynamic_forget_calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub routing_meta_write_order: Vec<u32>,
     pub routing_publication_order: Vec<MockRoutingPublicationWrite>,
     routing_fault: Option<(RoutingPushPhase, usize)>,
@@ -1072,6 +1077,31 @@ impl EbpfBackend for MockEbpfBackend {
             }
         }
         Ok(removed)
+    }
+
+    fn detach_hooks(&mut self) -> anyhow::Result<()> {
+        self.detach_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn attach_dynamic_interface(
+        &mut self,
+        _ifname: &str,
+        _role: super::IfaceRole,
+        _single_homed: bool,
+    ) -> anyhow::Result<super::DynamicHooks> {
+        self.dynamic_attach_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(super::DynamicHooks {
+            ingress: true,
+            egress: true,
+        })
+    }
+
+    fn forget_dynamic_interface(&mut self, _ifindex: u32) {
+        self.dynamic_forget_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     async fn cleanup(&mut self) -> anyhow::Result<()> {

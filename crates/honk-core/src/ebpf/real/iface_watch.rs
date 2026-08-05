@@ -54,9 +54,16 @@ impl IfaceWatcher {
         Some(Self { handle, stop })
     }
 
-    pub async fn shutdown(self) {
+    pub async fn shutdown(self, timeout: Duration) {
         let _ = self.stop.send(true);
-        let _ = self.handle.await;
+        let mut handle = self.handle;
+        // A watcher wedged mid-reconcile holds the backend write lock and
+        // could re-attach hooks after detach_hooks — abort it rather than
+        // drop the handle and leave the task running into teardown.
+        if tokio::time::timeout(timeout, &mut handle).await.is_err() {
+            handle.abort();
+            let _ = (&mut handle).await;
+        }
     }
 }
 
@@ -285,4 +292,40 @@ fn iface_is_up(name: &str) -> bool {
         .ok()
         .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
         .is_some_and(|flags| flags & IFF_UP != 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// Reconcile attaches an interface's hooks exactly once and never
+    /// detaches: hook removal belongs to shutdown alone, a periodic
+    /// reconcile must not tear down the datapath.
+    #[tokio::test]
+    async fn reconcile_attaches_once_and_never_detaches() {
+        let backend = crate::ebpf::mock::MockEbpfBackend::new();
+        let attach = backend.dynamic_attach_calls.clone();
+        let detach = backend.detach_calls.clone();
+        let ebpf: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(backend)));
+        let config = Arc::new(RwLock::new(honk_config::Config::default()));
+        let mut attached = AttachedMap::new();
+
+        reconcile(&ebpf, &config, &mut attached).await;
+        let first = attach.load(Ordering::Relaxed);
+        assert!(first >= 1, "first reconcile attaches the configured lo");
+        assert_eq!(detach.load(Ordering::Relaxed), 0);
+
+        reconcile(&ebpf, &config, &mut attached).await;
+        assert_eq!(
+            attach.load(Ordering::Relaxed),
+            first,
+            "second reconcile must not re-attach"
+        );
+        assert_eq!(
+            detach.load(Ordering::Relaxed),
+            0,
+            "reconcile must never detach"
+        );
+    }
 }

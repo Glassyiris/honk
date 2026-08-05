@@ -55,6 +55,12 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, trace, warn};
 
+/// Bound for shutdown stages that have no natural deadline (watcher join,
+/// runtime-generation retirement, DNS controller/persistence close). The
+/// datapath hooks are already detached by then, so a hung stage must time
+/// out and log rather than leave the process half-torn-down forever.
+const SHUTDOWN_STAGE_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub mod commands {
     use honk_config::{Config, node::Node};
     use tokio::sync::mpsc;
@@ -1105,7 +1111,6 @@ impl ControlPlane {
 
         let mut rx = self.command_rx.take().expect("command_rx already taken");
         let drain = self.drain_tracker.clone();
-        let ebpf = self.ebpf.clone();
 
         let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1239,48 +1244,7 @@ impl ControlPlane {
                             let _ = tx.send(StatsSnapshot { per_outbound: snap, total_connections: total }).await;
                         }
                         Some(ControlCommand::Shutdown) | None => {
-                            info!("Control plane shutting down, draining {} active connections",
-                                drain.active_count());
-                            if let Err(error) = ebpf.write().await.set_datapath_ready(false) {
-                                warn!(%error, "failed to close eBPF datapath admission");
-                            }
-                            drain.start_rejecting();
-                            self.stop_udp_warm_coordinator().await;
-                            if !self.udp_pool.shutdown().await {
-                                error!("UDP endpoint shutdown required forced cleanup");
-                            }
-                            // Keep the removal consumer alive until terminal endpoint cleanup has
-                            // emitted and drained every conn-state/tracker retirement.
-                            if let Err(error) = (&mut udp_removal_task).await {
-                                warn!("UDP removal consumer failed during shutdown: {}", error);
-                            }
-                            // Abort remaining background tasks (health check, janitors, preconnect)
-                            // only after UDP drivers and their removal sink have drained.
-                            {
-                                let mut tasks = self.background_tasks.lock().await;
-                                for handle in tasks.drain(..) {
-                                    handle.abort();
-                                }
-                            }
-                            // Stop the interface watcher first: it shares the
-                            // backend and could re-attach hooks mid-drain.
-                            #[cfg(feature = "ebpf")]
-                            if let Some(watcher) = self.iface_watcher.take() {
-                                watcher.shutdown().await;
-                            }
-                            // Detach BPF hooks immediately to restore network connectivity
-                            // before draining connections (matches Go dae behaviour).
-                            let mut ebpf = ebpf.write().await;
-                            if let Err(e) = ebpf.detach_hooks() {
-                                warn!("Failed to detach BPF hooks: {}", e);
-                            }
-                            drop(ebpf);
-                            drain.drain().await?;
-                            // Active flows own the current runtime until the
-                            // drain completes; only then terminally close its
-                            // AnyTLS pools and reject any late warm work.
-                            let generation = self.runtime_registry.read().clone();
-                            generation.shutdown().await;
+                            self.shutdown_datapath(&drain, &mut udp_removal_task).await?;
                             break;
                         }
                     }
@@ -1288,15 +1252,107 @@ impl ControlPlane {
             }
         }
 
-        self.dns_controller.shutdown().await;
+        self.finalize_shutdown().await
+    }
+
+    /// Datapath half of shutdown: close admission, stop background work,
+    /// detach the eBPF hooks (network restored before the connection drain,
+    /// Go dae behaviour), then drain flows and retire the outbound runtime
+    /// generation.  Every await without a natural deadline is bounded —
+    /// with the hooks already detached, a hung stage would otherwise leave
+    /// the engine half-torn-down forever: links gone, process alive.
+    async fn shutdown_datapath(
+        &mut self,
+        drain: &Arc<DrainTracker>,
+        udp_removal_task: &mut tokio::task::JoinHandle<()>,
+    ) -> anyhow::Result<()> {
+        info!(
+            "Control plane shutting down, draining {} active connections",
+            drain.active_count()
+        );
+        if let Err(error) = self.ebpf.write().await.set_datapath_ready(false) {
+            warn!(%error, "failed to close eBPF datapath admission");
+        }
+        drain.start_rejecting();
+        self.stop_udp_warm_coordinator().await;
+        if !self.udp_pool.shutdown().await {
+            error!("UDP endpoint shutdown required forced cleanup");
+        }
+        // Keep the removal consumer alive until terminal endpoint cleanup has
+        // emitted and drained every conn-state/tracker retirement.
+        if let Err(error) = (&mut *udp_removal_task).await {
+            warn!("UDP removal consumer failed during shutdown: {}", error);
+        }
+        // Abort remaining background tasks (health check, janitors, preconnect)
+        // only after UDP drivers and their removal sink have drained.
+        {
+            let mut tasks = self.background_tasks.lock().await;
+            for handle in tasks.drain(..) {
+                handle.abort();
+            }
+        }
+        // Stop the interface watcher first: it shares the backend and could
+        // re-attach hooks mid-drain. The timeout aborts the worker instead
+        // of detaching it (a detached watcher could re-attach hooks after
+        // detach_hooks).
+        #[cfg(feature = "ebpf")]
+        if let Some(watcher) = self.iface_watcher.take() {
+            watcher.shutdown(SHUTDOWN_STAGE_TIMEOUT).await;
+        }
+        // Detach BPF hooks immediately to restore network connectivity
+        // before draining connections (matches Go dae behaviour).
+        info!("shutdown: detaching eBPF hooks");
+        {
+            let mut ebpf = self.ebpf.write().await;
+            if let Err(e) = ebpf.detach_hooks() {
+                warn!("Failed to detach BPF hooks: {}", e);
+            }
+        }
+        info!("shutdown: draining connections");
+        drain.drain().await?;
+        // Active flows own the current runtime until the drain completes; only
+        // then terminally close its AnyTLS pools and reject any late warm work.
+        // Dropping this future on timeout detaches nothing: the force-closes
+        // are synchronous once entered and none of the runtimes touch the
+        // eBPF backend.
+        let generation = self.runtime_registry.read().clone();
+        info!("shutdown: retiring outbound runtime generation");
+        if tokio::time::timeout(SHUTDOWN_STAGE_TIMEOUT, generation.shutdown())
+            .await
+            .is_err()
+        {
+            warn!(
+                "outbound runtime generation shutdown exceeded {:?}; continuing",
+                SHUTDOWN_STAGE_TIMEOUT
+            );
+        }
+        Ok(())
+    }
+
+    /// Userspace half of shutdown: DNS controller, DNS persistence, and the
+    /// eBPF backend cleanup.  Bounded like `shutdown_datapath` so a stuck
+    /// DNS transport cannot pin the process after the datapath is down.
+    async fn finalize_shutdown(&mut self) -> anyhow::Result<()> {
+        info!("shutdown: stopping DNS controller");
+        self.dns_controller.shutdown(SHUTDOWN_STAGE_TIMEOUT).await;
         let dns_cache = self.dns_controller.cache().await;
         let persistence = dns_cache.lock().await.persistence();
-        if let Some(persistence) = persistence
-            && let Err(error) = persistence.shutdown().await
-        {
-            warn!(%error, "DNS persistence shutdown failed");
+        if let Some(persistence) = persistence {
+            // The worker is a std thread that cannot be aborted, but the
+            // Shutdown command is queued before the join starts, and the
+            // spawn_blocking join keeps owning the thread handle even if
+            // this future is dropped on timeout — no detached writer.
+            match tokio::time::timeout(SHUTDOWN_STAGE_TIMEOUT, persistence.shutdown()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => warn!(%error, "DNS persistence shutdown failed"),
+                Err(_) => warn!(
+                    "DNS persistence shutdown exceeded {:?}; continuing",
+                    SHUTDOWN_STAGE_TIMEOUT
+                ),
+            }
         }
-        ebpf.write().await.cleanup().await?;
+        info!("shutdown: cleaning up eBPF backend");
+        self.ebpf.write().await.cleanup().await?;
         info!("Control plane stopped");
         Ok(())
     }
