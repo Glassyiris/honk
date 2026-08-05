@@ -99,12 +99,14 @@ impl Node {
                 node.password = Some(percent_decode_str(pw));
             }
 
-            // Trojan and AnyTLS put the authentication secret in the
-            // URI userinfo field, not the password field.  Copy it to
-            // `password` so the protocol handler can build the correct request
-            // header.
-            if matches!(protocol, NodeProtocol::Trojan | NodeProtocol::AnyTLS)
-                && node.password.is_none()
+            // Trojan, AnyTLS and VLess put the authentication secret (UUID
+            // for VLess) in the URI userinfo field, not the password field.
+            // Copy it to `password` so the protocol handler can build the
+            // correct request header.
+            if matches!(
+                protocol,
+                NodeProtocol::Trojan | NodeProtocol::AnyTLS | NodeProtocol::VLess
+            ) && node.password.is_none()
                 && !url.username().is_empty()
             {
                 node.password = Some(percent_decode_str(url.username()));

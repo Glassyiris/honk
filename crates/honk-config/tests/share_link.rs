@@ -487,3 +487,18 @@ fn test_tuic_alpn_and_congestion_params() {
     assert_eq!(node.tuic_alpn, None);
     assert_eq!(node.tuic_congestion, None);
 }
+
+#[test]
+fn test_vless_reality_full() {
+    let node = Node::from_share_link(
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@reality.example.com:443?security=reality&pbk=jHkr1EmJCyQxjU0HXJlNblVdXB4Z7yODHJhgJ5lqmzc&sid=a1b2c3d4e5f60718&spx=%2F&fp=chrome&flow=xtls-rprx-vision#reality-node",
+    )
+    .unwrap();
+    assert_eq!(node.protocol, NodeProtocol::VLess);
+    assert_eq!(node.name, "reality-node");
+    // The userinfo UUID is the protocol credential.
+    assert_eq!(
+        node.password.as_deref(),
+        Some("b831381d-6324-4d53-ad4f-8cda48b30811")
+    );
+}
