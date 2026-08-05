@@ -64,14 +64,31 @@ pub(crate) async fn maybe_tls_wrap(
     node: &Node,
     stream: TcpStream,
 ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
+    match maybe_tls_wrap_concrete(node, stream).await? {
+        MaybeTls::Tls(stream) => Ok(Box::new(crate::tls::BatchRead::new(*stream))),
+        MaybeTls::Plain(stream) => Ok(Box::new(stream)),
+    }
+}
+
+/// [`maybe_tls_wrap`] without erasing the concrete stream type: the XTLS
+/// Vision direct-copy switch must reach the raw TCP socket under the TLS
+/// stream once the server abandons the outer TLS session.
+pub(crate) enum MaybeTls {
+    Tls(Box<crate::tls::TlsStream<TcpStream>>),
+    Plain(TcpStream),
+}
+
+pub(crate) async fn maybe_tls_wrap_concrete(
+    node: &Node,
+    tcp: TcpStream,
+) -> anyhow::Result<MaybeTls> {
     if node.tls {
         let connector = crate::tls::build_connector(node)?;
         let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
-        let tls_stream = connector.connect(&server_name, stream).await?;
-        Ok(Box::new(crate::tls::BatchRead::new(tls_stream)))
-    } else {
-        Ok(Box::new(stream))
+        let tls_stream = connector.connect(&server_name, tcp).await?;
+        return Ok(MaybeTls::Tls(Box::new(tls_stream)));
     }
+    Ok(MaybeTls::Plain(tcp))
 }
 
 /// Upgrade an already-connected (optionally TLS-wrapped) stream to
