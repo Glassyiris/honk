@@ -397,12 +397,7 @@ impl EbpfBackend for RealEbpfBackend {
         self.array_set("DATAPATH_STATE_MAP", 0, &u32::from(ready))
     }
 
-    fn set_direct_offload(&mut self, enabled: bool) -> anyhow::Result<()> {
-        let flags = if enabled {
-            DATAPATH_FLAG_OFFLOAD_DIRECT
-        } else {
-            0
-        };
+    fn set_datapath_flags(&mut self, flags: u32) -> anyhow::Result<()> {
         self.array_set("DATAPATH_FLAGS_MAP", 0, &flags)
     }
 

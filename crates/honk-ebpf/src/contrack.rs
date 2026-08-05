@@ -57,16 +57,37 @@ fn occupancy_add(slot: u32) {
 /// |  40–47  | `must`      |
 /// |  48–55  | `dscp`      |
 /// |  56     | `has_routing` |
+/// |  57     | `offload` (mode-based direct offload; see
+///           [`honk_ebpf_common::ROUTING_META_FLAG_OFFLOAD`]) |
 ///
 /// **Note**: this differs from the C dae layout (where mark occupies bits 0–31
 /// and outbound bits 32–39). Do **not** copy bit offsets from C code.
 #[inline(always)]
 pub fn build_routing_meta(outbound: u8, mark: u32, must: u8, dscp: u8) -> RoutingMeta {
+    build_routing_meta_with_offload(outbound, mark, must, dscp, false)
+}
+
+/// [`build_routing_meta`] plus the per-flow offload bit, set only by
+/// `lan_ingress` when the mode-based policy selected this flow for kernel
+/// direct offload at route-decision time.
+#[inline(always)]
+pub fn build_routing_meta_with_offload(
+    outbound: u8,
+    mark: u32,
+    must: u8,
+    dscp: u8,
+    offload: bool,
+) -> RoutingMeta {
     let raw: u64 = (outbound as u64)
         | ((mark as u64) << 8)
         | ((must as u64) << 40)
         | ((dscp as u64) << 48)
-        | (1u64 << 56);
+        | (1u64 << 56)
+        | if offload {
+            honk_ebpf_common::ROUTING_META_FLAG_OFFLOAD
+        } else {
+            0
+        };
     RoutingMeta { raw }
 }
 

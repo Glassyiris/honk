@@ -171,13 +171,14 @@ pub trait EbpfBackend: Send + Sync {
         Ok(())
     }
 
-    /// Enable or disable kernel offload of non-`must` `direct` flows in
-    /// `lan_ingress` (the `DATAPATH_FLAG_OFFLOAD_DIRECT` bit).  The control
-    /// plane enables this exactly when the effective clash mode is `Rule` —
-    /// or when no clash API/mode override exists at all; Global/Direct modes
-    /// must keep every non-must flow on the control-plane path so the mode
-    /// override can re-decide it.
-    fn set_direct_offload(&mut self, _enabled: bool) -> anyhow::Result<()> {
+    /// Write the mode-based direct-offload policy (the
+    /// `DATAPATH_FLAG_OFFLOAD_*` bits) into `DATAPATH_FLAGS_MAP`.  The
+    /// control plane recomputes and pushes the full word on startup, at the
+    /// reload commit point, and on every clash mode switch; `lan_ingress`
+    /// reads it once per new flow and caches the decision per flow, so the
+    /// write takes effect for new flows only — established flows keep the
+    /// decision they were created with.
+    fn set_datapath_flags(&mut self, _flags: u32) -> anyhow::Result<()> {
         Ok(())
     }
 

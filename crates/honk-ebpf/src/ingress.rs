@@ -42,7 +42,7 @@ use crate::{
         OUTBOUND_CONNECTIVITY_MAP, PARAM, PKT_SCRATCH_KEY, REDIRECT_TRACK, ROUTE_CTX_SCRATCH_MAP,
         ROUTING_HANDOFF_MAP, increment_bpf_stat,
     },
-    route::{OUTBOUND_BLOCK, OUTBOUND_DIRECT, RouteCtx},
+    route::{OUTBOUND_BLOCK, OUTBOUND_DIRECT, RouteCtx, RouteStateFlags},
     sk,
     transport::{ETH_HLEN, ETH_P_IP, ETH_P_IPV6, IPPROTO_TCP, IPPROTO_UDP, parse_packet},
 };
@@ -293,14 +293,14 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         let mark = unsafe { tcp_state.meta.data.mark };
 
         let must = unsafe { tcp_state.meta.data.must };
+        let offload =
+            unsafe { tcp_state.meta.raw } & honk_ebpf_common::ROUTING_META_FLAG_OFFLOAD != 0;
 
-        // Port 53 is exempt: the DNS fast path publishes a direct/non-must
-        // meta for TCP DNS and redirects the SYN to the control plane, so
-        // offloading the follow-up packets here would split the connection.
-        if outbound == OUTBOUND_DIRECT
-            && (must != 0 || crate::maps::direct_offload_enabled())
-            && pkt.tuples.five.dst_port != 53
-        {
+        // The offload decision was cached per flow at route-decision time
+        // (must-direct, or the mode-based policy).  Flows the DNS fast path
+        // publishes carry neither bit and keep redirecting to the control
+        // plane, so TCP DNS is never split by this pass-through.
+        if outbound == OUTBOUND_DIRECT && (must != 0 || offload) {
             crate::stats::count_tx(ctx, outbound);
             ctx.skb.set_mark(mark | CLASSIFIED_MARK);
             return Err(TC_ACT_OK);
@@ -381,10 +381,11 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
                     let mark = unsafe { udp_s.meta.data.mark };
 
                     let must = unsafe { udp_s.meta.data.must };
+                    let offload = unsafe { udp_s.meta.raw }
+                        & honk_ebpf_common::ROUTING_META_FLAG_OFFLOAD
+                        != 0;
 
-                    if outbound == OUTBOUND_DIRECT
-                        && (must != 0 || crate::maps::direct_offload_enabled())
-                    {
+                    if outbound == OUTBOUND_DIRECT && (must != 0 || offload) {
                         crate::stats::count_tx(ctx, outbound);
                         ctx.skb.set_mark(mark | CLASSIFIED_MARK);
                         return Err(TC_ACT_OK);
@@ -635,6 +636,31 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     let mark = (s64_ret >> 8) as u32;
     let must = ((s64_ret >> 40) & 1) as u8;
 
+    // Mode-based direct offload, decided once per new flow and cached in the
+    // flow's routing meta (ROUTING_META_FLAG_OFFLOAD) — the only read of
+    // DATAPATH_FLAGS_MAP on this path.  must/block finals are never
+    // offloaded beyond the must-direct case, in any mode.  In Rule mode a
+    // non-must direct decision is offloaded only when no SNI re-evaluation
+    // can change it: the config provably has no domain-class rules (static
+    // flag), or this flow's domain was DNS-learned and the route loop just
+    // evaluated the complete bitmap.  In Direct mode every non-final flow
+    // is offloaded regardless — the userspace override would force direct
+    // anyway — and its cached outbound is normalized to direct so the
+    // established fast path and tx stats treat it as what it physically is.
+    let flags = crate::maps::datapath_flags();
+    let offload_direct = must == 0
+        && outbound != OUTBOUND_BLOCK
+        && ((flags & honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_ALL != 0)
+            || (flags & honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_RULE_DIRECT != 0
+                && outbound == OUTBOUND_DIRECT
+                && (flags & honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_NO_DOMAIN_RULES != 0
+                    || route_ctx.route_state & (RouteStateFlags::DomainKnown as u8) != 0)));
+    let meta_outbound = if offload_direct {
+        OUTBOUND_DIRECT
+    } else {
+        outbound
+    };
+
     let short_lived_udp =
         pkt.l4proto == IPPROTO_UDP && crate::contrack::is_short_lived_udp_traffic(&pkt.tuples.five);
     if short_lived_udp {
@@ -642,27 +668,36 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     } else if pkt.l4proto == IPPROTO_TCP {
         if let Some(ref mut state) = tcp_state {
             state.mac.copy_from_slice(&pkt.ethh.src_addr);
-            let meta = crate::contrack::build_routing_meta(outbound, mark, must, pkt.tuples.dscp);
+            let meta = crate::contrack::build_routing_meta_with_offload(
+                meta_outbound,
+                mark,
+                must,
+                pkt.tuples.dscp,
+                offload_direct,
+            );
             crate::contrack::publish_routing_meta(&mut state.meta, meta);
         }
     } else if pkt.l4proto == IPPROTO_UDP {
         if let Some(ref mut state) = udp_state {
             state.mac.copy_from_slice(&pkt.ethh.src_addr);
-            let meta = crate::contrack::build_routing_meta(outbound, mark, must, pkt.tuples.dscp);
+            let meta = crate::contrack::build_routing_meta_with_offload(
+                meta_outbound,
+                mark,
+                must,
+                pkt.tuples.dscp,
+                offload_direct,
+            );
             crate::contrack::publish_routing_meta(&mut state.meta, meta);
         }
     }
 
-    // Fail-closed for TCP when the conn state map is full.
+    // Fail-closed for TCP when the conn state map is full.  Reuses the
+    // offload decision computed above — no second flags read.
     if pkt.l4proto == IPPROTO_TCP && tcp_state.is_none() {
-        if outbound == OUTBOUND_DIRECT
-            && (must != 0 || crate::maps::direct_offload_enabled())
-            && mark == 0
-        {
+        if (outbound == OUTBOUND_DIRECT && must != 0 || offload_direct) && mark == 0 {
             ctx.skb.set_mark(mark | CLASSIFIED_MARK);
             return Err(TC_ACT_OK);
         }
-        if outbound == OUTBOUND_DIRECT && must != 0 {}
         return Err(TC_ACT_SHOT);
     }
 
@@ -672,20 +707,21 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         return Err(TC_ACT_SHOT);
     }
 
-    if outbound == OUTBOUND_DIRECT && (must != 0 || crate::maps::direct_offload_enabled()) {
+    if (outbound == OUTBOUND_DIRECT && must != 0) || offload_direct {
         if PARAM.load().padding2 & 1 != 0 {
             info!(ctx, target: "honk", "direct offload path");
         }
-        crate::stats::count_tx(ctx, outbound);
+        crate::stats::count_tx(ctx, meta_outbound);
         ctx.skb.set_mark(mark | CLASSIFIED_MARK);
         return Err(TC_ACT_OK);
     }
     if outbound == OUTBOUND_DIRECT {
-        // Non-must direct with offload disabled (clash Global/Direct mode):
-        // redirect to the control plane so the mode override — and the
-        // SNI-sniffed re-route — can re-decide the flow in userspace.
+        // Non-must direct the mode policy may not offload (Global mode, or
+        // Rule mode with a possible SNI re-route pending): redirect to the
+        // control plane so the mode override — and the SNI-sniffed
+        // re-route — can re-decide the flow in userspace.
         if PARAM.load().padding2 & 1 != 0 {
-            info!(ctx, target: "honk", "direct(no must, offload off) → control plane");
+            info!(ctx, target: "honk", "direct(no must, no offload) → control plane");
         }
         return redirect_lan_packet_to_control_plane(
             ctx,

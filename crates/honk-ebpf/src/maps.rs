@@ -68,18 +68,17 @@ pub fn datapath_ready() -> bool {
     DATAPATH_STATE_MAP.get(0).is_some_and(|ready| *ready != 0)
 }
 
-/// Runtime datapath flags written by userspace; see
-/// `DATAPATH_FLAG_OFFLOAD_DIRECT` in honk-ebpf-common.
+/// Runtime datapath flags written by userspace; see the
+/// `DATAPATH_FLAG_OFFLOAD_*` bits in honk-ebpf-common.
 #[btf_map]
 pub static DATAPATH_FLAGS_MAP: Array<u32, 1, 0> = Array::new();
 
-/// Whether non-`must` `direct` flows may be passed through in the kernel
-/// (clash Rule mode / no mode override) instead of redirected to userspace.
+/// Read the mode-based offload policy.  `lan_ingress` calls this once per
+/// new flow (at route-decision time) and caches the outcome per flow in
+/// `ROUTING_META_FLAG_OFFLOAD`; established packets must not re-read it.
 #[inline(always)]
-pub fn direct_offload_enabled() -> bool {
-    DATAPATH_FLAGS_MAP
-        .get(0)
-        .is_some_and(|flags| *flags & honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_DIRECT != 0)
+pub fn datapath_flags() -> u32 {
+    DATAPATH_FLAGS_MAP.get(0).copied().unwrap_or(0)
 }
 
 #[btf_map]
