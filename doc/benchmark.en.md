@@ -111,6 +111,39 @@ ssh root@10.10.10.57 "bash /root/lab-bench.sh 'honk dae' 'hy2 tuic ss2022 trojan
 ssh root@10.10.10.57 bash /root/test-protocols.sh
 ```
 
+## Results (2026-08-05, rprx family: VLESS+REALITY(±vision)/VMess join the matrix)
+
+Covers the protocol rows added by feat/rprx (PR #12); engine is a feat/rprx
+musl+mimalloc build (vless rows measured on `67b5a56`, the vmess row on a
+rebuild with the `5dc47cf` AEAD fix). Methodology identical to the rounds
+above. New server matrix on 10.10.10.70 (sing-box 1.13.14):
+vless+reality+vision `:2448`, vless+reality `:2449`, vmess bare tcp `:2450`;
+targets http `8007-8009`, iperf3 `5207-5209`, udp echo `53537-53539`; engine
+routes by port (`5207/8007/53537→vision`, `…8→reality`, `…9→vmess`). The
+REALITY dest is a local TLS service (note: the dest's TLS Certificate message
+must fit the server's 8 KiB capture buffer or auth fails).
+
+Calibration anchors (this round vs 08-04): direct 9411/9390, ss2022
+9399/9398, anytls-sb 9406/9388 Mbps — environment consistent, so the table
+below compares directly against the 08-04 rows.
+
+| Engine | Protocol | cold | hot p50 | hot p95 | bw (Mbps) | cpu | RSS (MB) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| honk | vless-reality-vision | 0.0037 | 0.0033 | 0.0050 | 9372 | 0.60 | 45 |
+| honk | vless-reality | 0.0043 | 0.0034 | 0.0042 | 9383 | 0.49 | 54 |
+| honk | vmess (tcp) | 0.0022 | 0.0010 | 0.0014 | 9313 | 0.78 | 50 |
+
+- All three rows sit at line rate (~9.4G). The vmess row is post-`5dc47cf`
+  (body AEAD moved from RustCrypto to BoringSSL); before the fix the same
+  path measured ~420 MB/s handler-level (single core at 105%). vmess cpu
+  (0.78) is still the highest of the TCP protocols (per-chunk SHAKE size
+  masking + framing) — a follow-up optimization candidate.
+- vision vs non-vision shows no bandwidth difference (BoringSSL AES-NI is
+  already line-rate below 10G); the vision row pays slightly more cpu
+  (0.60 vs 0.49) for framing, and its cold includes the REALITY handshake.
+- vless/vmess have no UDP datapath in honk (README TODO); the UDP rows are
+  empty by design, not a measurement failure.
+
 ## Results (2026-08-04, honk outbound-v2 refactor regression check)
 
 Single-engine regression round for the outbound-v2 refactor merge — no

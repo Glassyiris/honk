@@ -97,6 +97,36 @@ ssh root@10.10.10.57 "bash /root/lab-bench.sh 'honk dae' 'hy2 tuic ss2022 trojan
 ssh root@10.10.10.57 bash /root/test-protocols.sh
 ```
 
+## 结果(2026-08-05,rprx 协议族: VLESS+REALITY(±vision)/VMess 入列)
+
+本轮覆盖 feat/rprx(PR #12)新增的协议行,引擎为 feat/rprx musl+mimalloc 构建
+(vless 行于 `67b5a56` 测量,vmess 行在 `5dc47cf` AEAD 修复后重建测量;修复
+内容见该分支)。方法学与上文完全一致。新增服务端矩阵(10.10.10.70,sing-box
+1.13.14):vless+reality+vision `:2448`、vless+reality `:2449`、vmess 裸 tcp
+`:2450`;目标服务 http `8007-8009`、iperf3 `5207-5209`、udp echo
+`53537-53539`;引擎按端口路由(`5207/8007/53537→vision`、`…8→reality`、
+`…9→vmess`)。reality 伪装目标为本地 TLS 服务(注意:dest 的 TLS Certificate
+消息必须 <8KiB,否则 reality 服务端的 CH 缓存放不下会判定失败)。
+
+校准锚点(本轮 vs 08-04 轮):direct 9411/9390、ss2022 9399/9398、
+anytls-sb 9406/9388 Mbps——环境判定一致,下表可直接与 08-04 轮横向比较。
+
+| 引擎 | 协议 | cold | hot p50 | hot p95 | bw (Mbps) | cpu | RSS (MB) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| honk | vless-reality-vision | 0.0037 | 0.0033 | 0.0050 | 9372 | 0.60 | 45 |
+| honk | vless-reality | 0.0043 | 0.0034 | 0.0042 | 9383 | 0.49 | 54 |
+| honk | vmess (tcp) | 0.0022 | 0.0010 | 0.0014 | 9313 | 0.78 | 50 |
+
+- 三行全部贴线速(~9.4G)。vmess 行是 `5dc47cf`(body AEAD 从 RustCrypto
+  切到 BoringSSL)之后的结果;修复前同路径 handler 级测量仅 ~420 MB/s
+  (单核 105%)。vmess cpu 0.78 核仍是 TCP 类协议中最高(每 chunk 的
+  SHAKE 长度掩码 + 帧处理),可作后续优化点。
+- vision vs 无 vision 无带宽差异(10G 内非 vision 的 BoringSSL AES-NI 已
+  贴线速);vision 行 cpu 略高(0.60 vs 0.49)为组帧开销,cold 含 reality
+  握手。
+- vless/vmess 在 honk 无 UDP 数据面(README TODO),UDP 行无数据,非测量
+  失败。
+
 ## 结果(2026-08-04,honk outbound-v2 重构回归验证)
 
 本轮是 outbound-v2 重构合并的单引擎回归验证,不含 dae/sing-box 对照臂;
