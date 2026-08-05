@@ -398,7 +398,7 @@ experimental {
 
 常用接口：`/proxies`、`/proxies/{name}`（PUT 切换 Selector）、delay、`/connections`、`/traffic`、`/logs`、`/dns/query`、`/stats`。
 
-环境变量：`HONK_UI_DOWNLOAD_URL` 可覆盖默认 zashboard zip（当 `external_ui` 目录为空/不存在时后台下载）。
+环境变量：`HONK_UI_DOWNLOAD_URL` 可覆盖默认 zashboard zip（当 `external_ui` 目录为空/不存在时后台下载）。下载走与用户流量相同的路由判定（Router + 组选择）：`direct` 直连下载，`block` 放弃下载，其余 outbound 经所选节点隧道下载。
 
 ### 缓存文件
 

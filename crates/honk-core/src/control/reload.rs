@@ -1012,7 +1012,7 @@ fn open_group_connectivity(ebpf: &mut dyn EbpfBackend, group_count: usize) -> an
     Ok(())
 }
 
-pub(super) fn resolve_outbound_nodes(
+pub(crate) fn resolve_outbound_nodes(
     config: &Config,
     group_manager: &GroupManager,
     outbound_name: &str,

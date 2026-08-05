@@ -7,7 +7,7 @@ pub mod janitor;
 pub mod packet_sniffer;
 mod probers;
 pub mod quic;
-mod reload;
+pub(crate) mod reload;
 mod resource_budget;
 pub mod routing_matcher;
 mod sockets;

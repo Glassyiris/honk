@@ -440,7 +440,7 @@ experimental {
 
 Useful endpoints: `/proxies`, `/proxies/{name}` (PUT selector), `/proxies/{name}/delay`, `/group/{name}/delay`, `/connections`, `/traffic`, `/logs`, `/dns/query`, `/stats`.
 
-Env: `HONK_UI_DOWNLOAD_URL` overrides the default zashboard zip URL when `external_ui` is empty/missing.
+Env: `HONK_UI_DOWNLOAD_URL` overrides the default zashboard zip URL when `external_ui` is empty/missing. The download follows the traffic routing decision (Router + group selection): `direct` fetches directly, `block` aborts it, any other outbound is dialed through the selected node.
 
 ### Cache file
 

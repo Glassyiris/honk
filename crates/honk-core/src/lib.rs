@@ -865,6 +865,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                         secret: clash_cfg.secret.clone(),
                         connection_pool: control_plane.connection_pool(),
                         external_ui: clash_cfg.external_ui.clone(),
+                        router: control_plane.traffic_router(),
                         log_handle: clash_log_handle.clone(),
                         dns_service: control_plane.dns_service(),
                         stream_samplers,

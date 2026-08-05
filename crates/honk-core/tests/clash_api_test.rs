@@ -152,6 +152,9 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
     let runtime_registry = honk_outbound::runtime::OutboundRuntimeRegistry::build(&config.nodes)
         .unwrap()
         .into_shared();
+    let traffic_router =
+        honk_core::routing::Router::new(&config.routing.rules, &config.routing.default_outbound)
+            .unwrap();
     let state = Arc::new(ClashState {
         config: Arc::new(tokio::sync::RwLock::new(config)),
         stats: stats.clone(),
@@ -164,6 +167,7 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
         mode_state: Arc::new(parking_lot::RwLock::new(ModeState::new("Rule", "proxy"))),
         secret: secret.to_string(),
         external_ui: external_ui.to_string(),
+        router: Arc::new(tokio::sync::RwLock::new(traffic_router)),
         log_handle,
         dns_service,
         connection_pool: Arc::new(honk_core::pool::ConnectionPool::new()),
@@ -1145,6 +1149,7 @@ async fn test_dns_query_upstream_and_nxdomain() {
         mode_state: app.state.mode_state.clone(),
         secret: String::new(),
         external_ui: String::new(),
+        router: app.state.router.clone(),
         log_handle: app.state.log_handle.clone(),
         dns_service: nx_service,
         connection_pool: app.state.connection_pool.clone(),
