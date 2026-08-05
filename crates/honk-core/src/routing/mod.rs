@@ -84,6 +84,24 @@ pub struct CompiledRoute {
     pub mark: u32,
 }
 
+impl CompiledRoute {
+    /// Whether the rule references any domain-class matcher (suffix, keyword,
+    /// geosite, regex; negated or not).  While any such rule exists, a
+    /// kernel routing decision made without the destination domain is not
+    /// final — userspace SNI sniffing could re-route the flow — so the
+    /// datapath's Rule-mode direct offload stays constrained.
+    pub fn has_domain_conditions(&self) -> bool {
+        !self.domain_suffixes.is_empty()
+            || !self.domain_keywords.is_empty()
+            || !self.geosite_domains.is_empty()
+            || !self.domain_patterns.is_empty()
+            || !self.not_domain_suffixes.is_empty()
+            || !self.not_domain_keywords.is_empty()
+            || !self.not_geosite_domains.is_empty()
+            || !self.not_domain_patterns.is_empty()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum GeositeDomain {
     Full(String),

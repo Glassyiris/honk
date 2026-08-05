@@ -211,8 +211,19 @@ pub struct RoutingMetaData {
     pub mark: u32,    // offset 1 → u64 bits 8-39
     pub must: u8,     // offset 5 → u64 bit 40
     pub dscp: u8,     // offset 6 → u64 bits 48-55
-    pub _pad: u8,     // offset 7 → u64 bits 56-63
+    pub _pad: u8,     // offset 7 → u64 bits 56-63 (bit 56 published, bit 57 offload)
 }
+
+/// Bit 57 of `RoutingMeta::raw`: the per-flow cached kernel-offload
+/// decision, set once at route-decision time when the flow was selected for
+/// direct offload by the mode-based offload policy (see the
+/// `DATAPATH_FLAG_OFFLOAD_*` bits).  `must`-direct flows do not need it —
+/// the `must` bit already encodes their offload — so the flag marks only
+/// non-`must` mode-offloaded flows.  Flows carrying it are normalized to
+/// `outbound == OUTBOUND_DIRECT` at publish time, so the established-packet
+/// fast path only ever checks `outbound == direct && (must || offload)`
+/// and never re-reads the datapath flags per packet.
+pub const ROUTING_META_FLAG_OFFLOAD: u64 = 1 << 57;
 
 // Layout assertions — must hold for the union to work correctly.
 // RoutingMeta is a union of u64 and RoutingMetaData, so both must be 8 bytes
@@ -306,6 +317,45 @@ pub struct PidPname {
     pub pid: u32,
     pub pname: [u8; 16],
 }
+
+/// Bits of the single-slot `DATAPATH_FLAGS_MAP` array, written by userspace
+/// at runtime (unlike `DaeParam`, which is fixed at load time).  They encode
+/// the mode-based direct-offload policy and are read **once per new flow**
+/// in `lan_ingress`, at route-decision time; the resulting offload decision
+/// is cached per flow in `ROUTING_META_FLAG_OFFLOAD`, so established packets
+/// never touch this map.
+///
+/// `DATAPATH_FLAG_OFFLOAD_RULE_DIRECT`: the effective clash mode is `Rule`
+/// (including "clash API disabled", where no mode override ever applies), so
+/// `lan_ingress` may pass flows routed to `direct` straight through the
+/// kernel like Go dae — subject to the sniff constraint below — instead of
+/// redirecting them into userspace.
+pub const DATAPATH_FLAG_OFFLOAD_RULE_DIRECT: u32 = 1 << 0;
+
+/// `DATAPATH_FLAG_OFFLOAD_ALL`: the effective clash mode is `Direct`.  The
+/// userspace mode override would re-decide every non-`must`/non-`block`
+/// flow to `direct` anyway, so the kernel offloads all of them (including
+/// flows routed to a proxy), normalizing their cached outbound to
+/// `OUTBOUND_DIRECT`.  The SNI constraint does not apply here: no sniffed
+/// domain can change an always-direct outcome.
+pub const DATAPATH_FLAG_OFFLOAD_ALL: u32 = 1 << 1;
+
+/// `DATAPATH_FLAG_OFFLOAD_NO_DOMAIN_RULES`: static routing property pushed
+/// together with the mode — `dial_mode: ip`, or the routing config contains
+/// no domain-class rule (domain/geosite, negated or not).  Only then is a
+/// non-`must` `direct` routing decision provably free of SNI re-evaluation;
+/// otherwise offload additionally requires the flow itself to have been
+/// domain-judged via `DOMAIN_ROUTING_MAP` (DNS-learned bitmap).  Meaningful
+/// only together with `DATAPATH_FLAG_OFFLOAD_RULE_DIRECT`.
+///
+/// `Global` mode pushes none of the offload bits: only `must`-direct flows
+/// pass through in the kernel (status quo), and every other flow still
+/// reaches the control plane so the mode override can re-decide it.
+/// `must`/`block` finals are never offloaded beyond the `must`-direct case
+/// in any mode.  Offloaded flows skip userspace relay entirely: no
+/// connection-tracker entry and no SNI-based re-route (Go dae parity), with
+/// tx stats still counted at `lan_ingress`.
+pub const DATAPATH_FLAG_OFFLOAD_NO_DOMAIN_RULES: u32 = 1 << 2;
 
 /// Parameter keys for the `params` BPF array map.
 /// Used by honk-core to configure eBPF program behaviour at runtime.

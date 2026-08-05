@@ -145,6 +145,10 @@ pub struct ControlPlane {
     /// Shared clash mode state (Rule/Global/Direct + GLOBAL selection),
     /// installed by `set_mode_state` when the clash API is enabled.
     mode_state: Option<crate::mode::SharedModeState>,
+    /// Cached static half of the datapath offload policy
+    /// (`DATAPATH_FLAG_OFFLOAD_NO_DOMAIN_RULES` or 0), recomputed by
+    /// `sync_direct_offload_flags` and shared with the clash API.
+    direct_offload_static: Arc<std::sync::atomic::AtomicU32>,
     datapath_healthy: Arc<std::sync::atomic::AtomicBool>,
     active_routing_plan: Arc<parking_lot::RwLock<Arc<routing_matcher::RoutingPushPlan>>>,
     /// Interface watcher, stopped and joined before `detach_hooks` during
@@ -319,6 +323,9 @@ impl ControlPlane {
         let policy_id = crate::dns::policy::PolicyId::from_config(&config.dns)?;
         let initial_routing_plan = Arc::new(Self::compile_routing_plan(&config, &router)?);
         let initial_push_result = initial_routing_plan.result();
+        let direct_offload_static = Arc::new(std::sync::atomic::AtomicU32::new(
+            direct_offload_static_bit(&config, &initial_routing_plan),
+        ));
         let persistence = crate::dns::runtime::ProcessPersistenceHandle::new(dns_forwarder.cache());
         let ebpf_arc = Arc::new(RwLock::new(ebpf));
         let router_arc = Arc::new(RwLock::new(router));
@@ -423,6 +430,7 @@ impl ControlPlane {
             background_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             udp_warm_task: tokio::sync::Mutex::new(None),
             mode_state: None,
+            direct_offload_static,
             datapath_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             active_routing_plan: Arc::new(parking_lot::RwLock::new(initial_routing_plan)),
             #[cfg(feature = "ebpf")]
@@ -604,6 +612,45 @@ impl ControlPlane {
     /// mode override through this handle.
     pub fn set_mode_state(&mut self, mode_state: crate::mode::SharedModeState) {
         self.mode_state = Some(mode_state);
+    }
+
+    /// Recompute and push the datapath offload policy (the
+    /// `DATAPATH_FLAG_OFFLOAD_*` word): the mode bits come from the current
+    /// clash mode (no mode state at all — clash API disabled — means no
+    /// override ever applies and behaves as `Rule`); the static
+    /// `NO_DOMAIN_RULES` bit comes from `dial_mode` plus the active routing
+    /// plan and is also stored in `direct_offload_static` so the clash
+    /// API's mode-switch path can reuse it without touching the config.
+    ///
+    /// Called before datapath admission opens in `run()` and re-asserted at
+    /// the reload commit point; runtime mode switches go through the clash
+    /// API's own write (PATCH /configs).  The datapath reads the word once
+    /// per new flow, so a changed policy applies to new flows only —
+    /// established flows keep the offload decision they were created with.
+    pub async fn sync_direct_offload_flags(&self) {
+        let static_bit = {
+            let config = self.config.read().await;
+            let plan = self.active_routing_plan.read();
+            direct_offload_static_bit(&config, &plan)
+        };
+        self.direct_offload_static
+            .store(static_bit, std::sync::atomic::Ordering::Relaxed);
+        let mode_bits = self
+            .mode_state
+            .as_ref()
+            .map(|state| state.read().direct_offload_mode_bits())
+            .unwrap_or(honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_RULE_DIRECT);
+        let flags = mode_bits | static_bit;
+        if let Err(error) = self.ebpf.write().await.set_datapath_flags(flags) {
+            warn!(%error, flags, "failed to update eBPF datapath offload flags");
+        }
+    }
+
+    /// The cached static offload bit (`NO_DOMAIN_RULES` or 0), shared with
+    /// the clash API so PATCH /configs mode switches can compose the full
+    /// flags word without reading the config or routing plan.
+    pub fn direct_offload_static_handle(&self) -> Arc<std::sync::atomic::AtomicU32> {
+        self.direct_offload_static.clone()
     }
 
     pub fn config_handle(&self) -> Arc<RwLock<Config>> {
@@ -1102,6 +1149,7 @@ impl ControlPlane {
             self.background_tasks.lock().await.push(handle);
         }
 
+        self.sync_direct_offload_flags().await;
         {
             let mut ebpf = self.ebpf.write().await;
             ebpf.set_datapath_ready(true)
@@ -1656,6 +1704,23 @@ pub(super) fn try_admit_udp_slow_path(
             stats.record_udp_slow_permit_rejected();
             None
         }
+    }
+}
+
+/// The static half of the datapath offload policy: non-`must` direct
+/// offload needs no SNI re-evaluation when `dial_mode: ip` or the routing
+/// config contains no domain-class rule at all.
+fn direct_offload_static_bit(config: &Config, plan: &routing_matcher::RoutingPushPlan) -> u32 {
+    let dial_mode = config
+        .global
+        .dial_mode
+        .parse::<DialMode>()
+        .ok()
+        .unwrap_or(DialMode::DomainPlusPlus);
+    if dial_mode == DialMode::Ip || !plan.has_domain_rules {
+        honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_NO_DOMAIN_RULES
+    } else {
+        0
     }
 }
 

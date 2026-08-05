@@ -95,8 +95,9 @@ flowchart TB
 1. **TC ingress** on each `lan_interface` classifies forwarded client traffic; independently, **TC egress** on each `wan_interface` classifies host-originated TCP/UDP. Omitting `lan_interface` installs only the WAN path.
 2. DNS to port 53 takes a **fast path** (skip expensive match loop) and is redirected to the control plane.
 3. Outcomes:
-   - `direct + must` → leave on host stack (no redirect).
-   - `direct` without must / user outbound / block / control-plane routing → redirect into `dae0` when the outbound is considered alive.
+   - `direct + must` → leave on host stack (no redirect), in every mode.
+   - `direct` without must → also left on the host stack when the per-flow offload decision allows it (cached in `RoutingMeta` bit 57 at route time): in clash `Rule` mode (or with the clash API disabled) when no SNI re-evaluation can change the decision — `dial_mode: ip`, no domain-class rule in the config, or the flow's domain was DNS-learned and evaluated through `DOMAIN_ROUTING_MAP`; in clash `Direct` mode unconditionally (the userspace override would force `direct` anyway). In `Global` mode — and in `Rule` mode when a domain re-route may still apply — it redirects into `dae0`.
+   - user outbound / block / control-plane routing → redirect into `dae0` when the outbound is considered alive. (In clash `Direct` mode a non-`must` user-outbound flow is instead passed through as direct — same offload as above.)
 4. In **daens**, `sk_lookup` assigns the flow to transparent TCP/UDP listeners.
 5. **Userspace** takes the routing handoff, optionally sniffs domain, falls back to the full `Router`, applies Clash mode override, selects a group leaf, dials, and relays.
 6. Dial/probe/DNS-upstream sockets use **`DAE_BYPASS_MARK` (`0x100`)** so eBPF does not re-proxy control-plane traffic.
@@ -138,6 +139,7 @@ therefore never redirect a flow into a missing listener slot.
 | `OUTBOUND_STATS` | Per-CPU tx/rx packets/bytes per outbound |
 | `LISTEN_SOCKET_MAP` | SockMap of transparent listeners |
 | `DATAPATH_STATE_MAP` | Admission gate opened only after the complete listener generation is published |
+| `DATAPATH_FLAGS_MAP` | Runtime flags written by userspace: the mode-based direct-offload policy (`DATAPATH_FLAG_OFFLOAD_RULE_DIRECT` / `_ALL` / `_NO_DOMAIN_RULES`), read once per new flow at route time; the decision is cached per flow in `RoutingMeta` bit 57 |
 | `EVENT_RINGBUF` | Overflow events drained to tracing |
 
 ### Reserved outbound indices
@@ -153,7 +155,7 @@ Aligned with dae-core:
 
 - **At SYN time**, pure domain rules often cannot match without a prior DNS learn or userspace sniff.
 - DNS answers update `DOMAIN_ROUTING_MAP` so subsequent TCP can match in eBPF.
-- `direct` without `must` is intentionally sent to userspace so SNI/HTTP Host can refine the route (dae-like).
+- `direct` without `must` reaches userspace only when the mode policy says so — always in `Global` mode, and in `Rule` mode when an SNI re-route may still apply (domain-class rules exist, `dial_mode` sniffs, and the flow's domain was not DNS-learned). Otherwise it is offloaded in the kernel exactly like `must` direct (Go dae parity): no userspace relay, no `/connections` entry, and no SNI-based re-route; tx stats are still counted at `lan_ingress`. In `Direct` mode every non-`must`/non-`block` flow is offloaded (the override would force `direct` regardless). The decision is made once per flow at route time and cached in the flow's `RoutingMeta` (bit 57) — the policy word itself (`DATAPATH_FLAGS_MAP`) is written on startup (cachedb-restored mode), on every PATCH `/configs` mode switch, and re-asserted after each reload, and binds at flow creation only.
 - TCP SNI/HTTP Host and QUIC Initial SNI both re-run the userspace Router for non-`must`, non-`block` handoffs in domain-aware modes.
 
 ## 7. Userspace control plane

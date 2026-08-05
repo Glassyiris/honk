@@ -68,6 +68,19 @@ pub fn datapath_ready() -> bool {
     DATAPATH_STATE_MAP.get(0).is_some_and(|ready| *ready != 0)
 }
 
+/// Runtime datapath flags written by userspace; see the
+/// `DATAPATH_FLAG_OFFLOAD_*` bits in honk-ebpf-common.
+#[btf_map]
+pub static DATAPATH_FLAGS_MAP: Array<u32, 1, 0> = Array::new();
+
+/// Read the mode-based offload policy.  `lan_ingress` calls this once per
+/// new flow (at route-decision time) and caches the outcome per flow in
+/// `ROUTING_META_FLAG_OFFLOAD`; established packets must not re-read it.
+#[inline(always)]
+pub fn datapath_flags() -> u32 {
+    DATAPATH_FLAGS_MAP.get(0).copied().unwrap_or(0)
+}
+
 #[btf_map]
 /// Plain hash with BPF_F_NO_PREALLOC: kernel memory scales with live
 /// entries instead of locking max_entries up front (~8 MB empty instead of

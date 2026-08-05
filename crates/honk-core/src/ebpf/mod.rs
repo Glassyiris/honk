@@ -171,6 +171,17 @@ pub trait EbpfBackend: Send + Sync {
         Ok(())
     }
 
+    /// Write the mode-based direct-offload policy (the
+    /// `DATAPATH_FLAG_OFFLOAD_*` bits) into `DATAPATH_FLAGS_MAP`.  The
+    /// control plane recomputes and pushes the full word on startup, at the
+    /// reload commit point, and on every clash mode switch; `lan_ingress`
+    /// reads it once per new flow and caches the decision per flow, so the
+    /// write takes effect for new flows only — established flows keep the
+    /// decision they were created with.
+    fn set_datapath_flags(&mut self, _flags: u32) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Attach the dae0peer_ingress TC program after dae0peer has been moved
     /// into the isolated daens namespace.  The attach runs inside a scoped
     /// `with_daens_netns` switch — the process threads always stay in the
