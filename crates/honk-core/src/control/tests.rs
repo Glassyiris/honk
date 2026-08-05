@@ -3290,3 +3290,68 @@ fn probe_warm_runtime_reuses_only_warm_or_stateless_nodes() {
         "a session-less protocol has nothing to retain; reuse the generation runtime"
     );
 }
+
+fn link_lifecycle_cp(backend: crate::ebpf::mock::MockEbpfBackend) -> ControlPlane {
+    ControlPlane::new(
+        Config::default(),
+        Box::new(backend),
+        Router::new(&[], "direct").unwrap(),
+        Arc::new(ProxyRegistry::default_resolver().unwrap()),
+        DnsResolver::new(&honk_config::dns::DnsConfig::default()).unwrap(),
+        udp_test_forwarder(),
+    )
+    .unwrap()
+}
+
+/// Reload and subscription merge share `apply_runtime_config`, which only
+/// rewrites maps through the live backend — datapath hooks must never be
+/// detached or re-attached outside shutdown.
+#[tokio::test]
+async fn reload_and_merge_never_touch_ebpf_hooks() {
+    use std::sync::atomic::Ordering;
+    let backend = crate::ebpf::mock::MockEbpfBackend::new();
+    let detach = backend.detach_calls.clone();
+    let dyn_attach = backend.dynamic_attach_calls.clone();
+    let dyn_forget = backend.dynamic_forget_calls.clone();
+    let cp = link_lifecycle_cp(backend);
+
+    let drain = DrainTracker::new();
+    assert!(cp.apply_runtime_config(Config::default(), &drain).await);
+    assert!(cp.apply_runtime_config(Config::default(), &drain).await);
+
+    assert_eq!(
+        detach.load(Ordering::Relaxed),
+        0,
+        "reload/merge must never detach datapath hooks"
+    );
+    assert_eq!(dyn_attach.load(Ordering::Relaxed), 0);
+    assert_eq!(dyn_forget.load(Ordering::Relaxed), 0);
+}
+
+/// Shutdown with a flow that never finishes must still detach the hooks and
+/// return in bounded time (the drain tracker caps the wait).
+#[tokio::test]
+async fn shutdown_detaches_hooks_and_stays_bounded_with_stuck_flow() {
+    use std::sync::atomic::Ordering;
+    let backend = crate::ebpf::mock::MockEbpfBackend::new();
+    let detach = backend.detach_calls.clone();
+    let mut cp = link_lifecycle_cp(backend);
+
+    // A flow that never finishes: the drain tracker must cap the wait.
+    cp.drain_tracker.increment();
+    let drain = cp.drain_tracker.clone();
+    let mut removal_task = tokio::spawn(async {});
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        cp.shutdown_datapath(&drain, &mut removal_task)
+            .await
+            .unwrap();
+        cp.finalize_shutdown().await.unwrap();
+    })
+    .await
+    .expect("shutdown must stay bounded with a stuck flow");
+    assert!(
+        detach.load(Ordering::Relaxed) >= 1,
+        "shutdown must detach the datapath hooks"
+    );
+}

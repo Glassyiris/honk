@@ -194,7 +194,34 @@ async fn spawned_worker_converges_mock_map_after_transient_failure() {
         map[0].1.bitmap,
         projection.counters().write_failures
     );
-    projection.shutdown().await;
+    projection.shutdown(Duration::from_secs(30)).await;
+}
+
+#[tokio::test]
+async fn shutdown_timeout_aborts_wedged_worker() {
+    // Given a worker wedged on the backend write lock mid-flush.
+    let ebpf: Arc<tokio::sync::RwLock<Box<dyn EbpfBackend>>> =
+        Arc::new(tokio::sync::RwLock::new(Box::new(MockEbpfBackend::new())));
+    let projection = RoutingProjection::spawn(ebpf.clone(), snapshot(1, 1, 2));
+    let termination = projection.termination_probe_for_test();
+    let guard = ebpf.write().await;
+    projection.submit(
+        snapshot(1, 1, 2),
+        positive(
+            "a.test",
+            &[IpAddr::V4(Ipv4Addr::new(203, 0, 113, 40))],
+            Duration::from_secs(30),
+        ),
+    );
+
+    // When shutdown's budget expires, the worker must be aborted (never
+    // detached into backend teardown) and shutdown must still return.
+    projection.shutdown(Duration::from_millis(50)).await;
+    drop(guard);
+
+    // Then
+    termination.wait().await;
+    assert!(termination.is_terminated());
 }
 
 #[tokio::test]
@@ -207,7 +234,10 @@ async fn shutdown_is_idempotent_and_awaits_worker_termination() {
         let termination = projection.termination_probe_for_test();
 
         // When
-        tokio::join!(projection.shutdown(), projection.shutdown());
+        tokio::join!(
+            projection.shutdown(Duration::from_secs(30)),
+            projection.shutdown(Duration::from_secs(30))
+        );
 
         // Then
         assert!(termination.is_terminated());

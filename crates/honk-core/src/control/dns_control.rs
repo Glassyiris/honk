@@ -20,8 +20,9 @@ use crate::group::GroupManager;
 use crate::routing::Router;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{RwLock, Semaphore};
-use tracing::debug;
+use tracing::{debug, warn};
 
 mod transport;
 
@@ -150,9 +151,21 @@ impl DnsController {
         self.dns_service.clone()
     }
 
-    pub(crate) async fn shutdown(&self) {
-        self.routing_projection.shutdown().await;
-        self.runtime_provider().shutdown().await;
+    pub(crate) async fn shutdown(&self, timeout: Duration) {
+        self.routing_projection.shutdown(timeout).await;
+        // The provider retires runtimes through a JoinSet of supervisors,
+        // and a dropped JoinSet aborts its tasks — a timeout here cannot
+        // leave a detached worker behind.
+        let provider = self.runtime_provider();
+        if tokio::time::timeout(timeout, provider.shutdown())
+            .await
+            .is_err()
+        {
+            warn!(
+                "DNS runtime provider shutdown exceeded {:?}; continuing",
+                timeout
+            );
+        }
     }
 
     pub(crate) fn update_projection_snapshot(
