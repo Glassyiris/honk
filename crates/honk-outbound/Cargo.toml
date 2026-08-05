@@ -19,6 +19,7 @@ chrono.workspace = true
 serde.workspace = true
 sha1.workspace = true
 sha2.workspace = true
+sha3.workspace = true
 hmac.workspace = true
 hkdf.workspace = true
 boring.workspace = true
@@ -68,3 +69,7 @@ rprx = []
 [[bench]]
 name = "ss_aead"
 harness = false
+
+[[example]]
+name = "vmess_lab59"
+required-features = ["rprx"]

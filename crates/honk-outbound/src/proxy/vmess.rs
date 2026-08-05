@@ -1,52 +1,54 @@
-//! VMess AEAD outbound handler.
+//! VMess AEAD outbound handler (alterId = 0).
 //!
-//! Implements VMess AEAD protocol (V2Ray v4.28.1+) with `alterId=0`.
+//! Implements the VMess AEAD wire format as specified by Xray-core
+//! (`proxy/vmess/aead`, `proxy/vmess/encoding`) and sing-vmess — the format
+//! sing-box/v2ray servers actually speak:
 //!
-//! The connection is established through the shared transport layer
-//! (`super::transport`): TCP, optionally TLS-wrapped, optionally carried
-//! over WebSocket (`node.transport = "ws"`) or gRPC (`"grpc"`). The VMess
-//! handshake then runs on the resulting stream.
-//!
-//! Protocol overview:
-//!
-//! 1. **Key derivation**:
-//!    - `cmd_key = MD5(uuid || "c48619fe-8f02-49e0-b9e9-edf763e17e21")`
-//!    - `auth_key = MD5(uuid)`
-//!
-//! 2. **Auth header** (sent to server):
+//! 1. **Request header** (`aead/encrypt.go` `SealVMessAEADHeader`):
 //!    ```text
-//!    auth_id(16) | cmd_nonce(12) | encrypted_instruction
+//!    auth_id(16) | enc_len(2+16) | conn_nonce(8) | enc_header(N+16)
 //!    ```
-//!    - `auth_id`: AES-128-GCM(key=auth_key, nonce=timestamp||0x00000000,
-//!      plaintext=[])[0..16]
-//!    - `encrypted_instruction`: AES-128-GCM(key=cmd_key, nonce=cmd_nonce,
-//!      plaintext=instruction)
+//!    - `auth_id`: AES-128 single-block encrypt of
+//!      `ts(8 BE) | rand(4) | crc32(ts|rand)(4 BE)` under
+//!      `KDF16(cmd_key, "AES Auth ID Encryption")` (`aead/authid.go`).
+//!    - `enc_len`/`enc_header`: AES-128-GCM with keys/nonces from
+//!      `KDF(cmd_key, salt, auth_id, conn_nonce)`, AAD = auth_id.
+//!    - `cmd_key = MD5(uuid || "c48619fe-8f02-49e0-b9e9-edf763e17e21")`.
+//!    - `KDF` is the chained HMAC-SHA256 of `aead/kdf.go` with salt seed
+//!      `"VMess AEAD KDF"`.
 //!
-//! 3. **Instruction** (plaintext, 55–71+ bytes):
+//! 2. **Header plaintext** (`encoding/client.go` `EncodeRequestHeader`):
 //!    ```text
-//!    version(1) | body_key(16) | body_iv(16) | resp_header(1) |
-//!    options(1) | padding_len(2) | padding(P) | resp_key(16) | resp_iv(16)
+//!    version(1) | req_iv(16) | req_key(16) | resp_header(1) | option(1) |
+//!    padding_len<<4|security(1) | 0(1) | cmd(1) | port(2 BE) | atyp+addr |
+//!    padding | fnv1a32(4 BE)
 //!    ```
+//!    ATYP numbering is V2Ray's (IPv4=1, Domain=2, IPv6=3) and the port
+//!    comes FIRST (`addrParser.WriteAddressPort`).
 //!
-//! 4. **Address** (encrypted with body_key, nonce = body_iv[..12]):
-//!    - V2Ray ATYP format: `ATYP(1) | addr | port(2)`
-//!    - IPv4: ATYP=0x01 + 4 bytes
-//!    - Domain: ATYP=0x02 + 1-byte len + domain
-//!    - IPv6: ATYP=0x03 + 16 bytes
+//! 3. **Body chunks** (`common/crypto` `AuthenticationWriter` +
+//!    `encoding/auth.go` `ShakeSizeParser`):
+//!    ```text
+//!    masked_len(2) | encrypted_payload(len+16)
+//!    ```
+//!    - `masked_len = BE16(payload_len+16) XOR SHAKE128(iv)` (2 bytes per
+//!      chunk from one continuous SHAKE stream, option `ChunkMasking`).
+//!    - AES-128-GCM key = body key, nonce = `count(2 BE) | iv[2..12]`,
+//!      count starts at 0 (`GenerateChunkNonce`).
+//!    - An empty-payload chunk (len field = 16) terminates the request body.
 //!
-//! 5. **Data relay** (authenticated-length chunks):
-//!    - Each chunk: `[2+16 bytes: encrypted_len] [N+16 bytes: encrypted_payload]`
-//!    - Nonce starts at body_iv[..12] + 1 (counter 1) for send
-//!    - Nonce starts at resp_iv[..12] (counter 0) for receive
-//!
-//! Reference: <https://www.v2fly.org/developer/protocols/vmess.html>
+//! 4. **Response**: body key/iv are `SHA256(req_key/req_iv)[..16]`; the
+//!    response header is AES-128-GCM with `KDF` salts
+//!    `"AEAD Resp Header {Len,}{Key,IV}"` and no AAD
+//!    (`encoding/client.go` `DecodeResponseHeader`).
 
-use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::aead::{Aead, KeyInit, Payload};
 use async_trait::async_trait;
 use honk_config::node::Node;
 use md5::{Digest, Md5};
 use rand::Rng;
 use rand::RngExt;
+use sha2::Sha256;
 use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -55,40 +57,165 @@ use tokio::net::TcpStream;
 use super::addr::{self, SocksAddr};
 use super::{AsyncReadWrite, ProbeableOutbound, ProxyStream, TcpOutbound};
 
-/// VMess AEAD version byte.
+/// VMess protocol version byte.
 const VMESS_VERSION: u8 = 0x01;
-/// Options: Standard format (target address directly follows instruction cipher).
-const OPT_S: u8 = 0x01;
-/// Options: Authenticated length (each data chunk prefixed with a 2-byte
-/// length encrypted in its own AEAD block, a.k.a. ChunkStream).
-const OPT_A: u8 = 0x04;
-/// Response header obfuscation length (0 = disabled).
-const RESP_HEADER_LEN: u8 = 0x00;
-/// Suffix for cmd_key derivation.
+/// Request options: ChunkStream | ChunkMasking — what Xray's outbound sets
+/// for AES-128-GCM security (`proxy/vmess/outbound/outbound.go`).
+const REQUEST_OPTION: u8 = 0x01 | 0x04;
+/// Security nibble: AES-128-GCM (`SecurityType_AES128_GCM`, what "auto"
+/// resolves to on any AES-capable host).
+const SECURITY_AES128_GCM: u8 = 0x03;
+/// Request command: TCP.
+const CMD_TCP: u8 = 0x01;
+/// Suffix for cmd_key derivation (`vmess.Account.ID.CmdKey`).
 const CMD_KEY_SUFFIX: &[u8] = b"c48619fe-8f02-49e0-b9e9-edf763e17e21";
+/// Seed of the chained KDF (`aead/kdf.go` KDFSaltConstVMessAEADKDF).
+const KDF_SALT_SEED: &[u8] = b"VMess AEAD KDF";
+const KDF_SALT_AUTH_ID: &[u8] = b"AES Auth ID Encryption";
+const KDF_SALT_HEADER_LEN_KEY: &[u8] = b"VMess Header AEAD Key_Length";
+const KDF_SALT_HEADER_LEN_IV: &[u8] = b"VMess Header AEAD Nonce_Length";
+const KDF_SALT_HEADER_KEY: &[u8] = b"VMess Header AEAD Key";
+const KDF_SALT_HEADER_IV: &[u8] = b"VMess Header AEAD Nonce";
+const KDF_SALT_RESP_LEN_KEY: &[u8] = b"AEAD Resp Header Len Key";
+const KDF_SALT_RESP_LEN_IV: &[u8] = b"AEAD Resp Header Len IV";
+const KDF_SALT_RESP_KEY: &[u8] = b"AEAD Resp Header Key";
+const KDF_SALT_RESP_IV: &[u8] = b"AEAD Resp Header IV";
 /// AES-GCM tag length in bytes.
 const GCM_TAG_LEN: usize = 16;
-/// AES-128-GCM nonce length.
-const NONCE_LEN: usize = 12;
-/// Maximum plaintext payload per AEAD chunk (same as Shadowsocks).
-const CHUNK_MAX_LEN: usize = 0x3FFF; // 16383;
+/// Maximum plaintext per body chunk (Xray `buf.Size` - tag - size field,
+/// no global padding).
+const CHUNK_MAX_LEN: usize = 16384 - GCM_TAG_LEN - 2;
+
+fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    use hmac::Mac;
+    let mut mac = <hmac::Hmac<Sha256>>::new_from_slice(key).expect("HMAC key length is free");
+    mac.update(msg);
+    mac.finalize().into_bytes().into()
+}
+
+/// HMAC block pads for a key that fits the 64-byte block (every KDF path
+/// element does, so the >64-byte pre-hash branch never applies).
+fn hmac_pads(key: &[u8]) -> ([u8; 64], [u8; 64]) {
+    debug_assert!(key.len() <= 64);
+    let mut ipad = [0x36u8; 64];
+    let mut opad = [0x5cu8; 64];
+    for (i, &b) in key.iter().enumerate() {
+        ipad[i] ^= b;
+        opad[i] ^= b;
+    }
+    (ipad, opad)
+}
+
+/// The chained hash of `aead/kdf.go`: `chain[0]` is the innermost HMAC key
+/// (the salt seed); each further element wraps the previous hash as an HMAC
+/// whose "hash function" is the previous level — `H_k(m) = H_{k-1}(opad_k
+/// || H_{k-1}(ipad_k || m))`. Verified byte-identical to both Xray-core's
+/// `KDF` and sing-vmess's `KDF` against their Go sources.
+fn chain_hash(chain: &[&[u8]], msg: &[u8]) -> [u8; 32] {
+    if let &[seed] = chain {
+        return hmac_sha256(seed, msg);
+    }
+    let (rest, last) = chain.split_at(chain.len() - 1);
+    let (ipad, opad) = hmac_pads(last[0]);
+    let mut inner = Vec::with_capacity(64 + msg.len());
+    inner.extend_from_slice(&ipad);
+    inner.extend_from_slice(msg);
+    let inner = chain_hash(rest, &inner);
+    let mut outer = Vec::with_capacity(64 + 32);
+    outer.extend_from_slice(&opad);
+    outer.extend_from_slice(&inner);
+    chain_hash(rest, &outer)
+}
+
+fn kdf(key: &[u8], salt: &[u8], extra: &[&[u8]]) -> [u8; 32] {
+    let mut chain: Vec<&[u8]> = Vec::with_capacity(2 + extra.len());
+    chain.push(KDF_SALT_SEED);
+    chain.push(salt);
+    chain.extend_from_slice(extra);
+    chain_hash(&chain, key)
+}
+
+fn kdf16(key: &[u8], salt: &[u8], extra: &[&[u8]]) -> [u8; 16] {
+    kdf(key, salt, extra)[..16]
+        .try_into()
+        .expect("slice length")
+}
+
+fn kdf12(key: &[u8], salt: &[u8], extra: &[&[u8]]) -> [u8; 12] {
+    kdf(key, salt, extra)[..12]
+        .try_into()
+        .expect("slice length")
+}
+
+/// CRC-32 IEEE (gzip polynomial), used by the auth ID
+/// (`crc32.ChecksumIEEE` in `aead/authid.go`).
+fn crc32_ieee(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+/// FNV-1a 32 (`hash/fnv` in `EncodeRequestHeader`; Go's `Sum` appends
+/// big-endian).
+fn fnv1a32(data: &[u8]) -> u32 {
+    let mut h = 0x811C_9DC5u32;
+    for &b in data {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
 
 /// VMess AEAD proxy handler.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct VmessHandler;
 
+/// Per-connection session material (`encoding.NewClientSession`).
+struct Session {
+    req_key: [u8; 16],
+    req_iv: [u8; 16],
+    resp_key: [u8; 16],
+    resp_iv: [u8; 16],
+    resp_header: u8,
+}
+
+impl Session {
+    fn new() -> Self {
+        let mut rng = rand::rng();
+        let mut req_key = [0u8; 16];
+        let mut req_iv = [0u8; 16];
+        rng.fill_bytes(&mut req_key);
+        rng.fill_bytes(&mut req_iv);
+        // Response body keys derive from the request keys
+        // (encoding/client.go NewClientSession).
+        let resp_key: [u8; 16] = Sha256::digest(req_key)[..16]
+            .try_into()
+            .expect("sha256 > 16");
+        let resp_iv: [u8; 16] = Sha256::digest(req_iv)[..16]
+            .try_into()
+            .expect("sha256 > 16");
+        Self {
+            req_key,
+            req_iv,
+            resp_key,
+            resp_iv,
+            resp_header: rng.random(),
+        }
+    }
+}
+
 impl VmessHandler {
     pub fn new() -> Self {
         Self
-    }
-
-    /// Encode target address in the V2Ray ATYP format (domain = 0x02,
-    /// IPv6 = 0x03 — not the SOCKS5 numbering).
-    fn encode_address(target: SocketAddr, target_domain: Option<&str>) -> Vec<u8> {
-        let socks = SocksAddr::new(target, target_domain);
-        let mut buf = Vec::with_capacity(socks.encoded_len());
-        socks.encode_with(&mut buf, addr::ATYP_VMESS);
-        buf
     }
 
     /// Derive the command key: `MD5(uuid || CMD_KEY_SUFFIX)`.
@@ -99,87 +226,91 @@ impl VmessHandler {
         h.finalize().into()
     }
 
-    /// Derive the auth key: `MD5(uuid)`.
-    fn derive_auth_key(uuid: &[u8]) -> [u8; 16] {
-        let mut h = Md5::new();
-        h.update(uuid);
-        h.finalize().into()
+    /// `CreateAuthID`: AES-128 single-block encryption of
+    /// `ts(8 BE) | rand(4) | crc32(ts|rand)(4 BE)` under the auth-ID key.
+    fn create_auth_id(cmd_key: &[u8; 16], ts: u64, rand4: [u8; 4]) -> [u8; 16] {
+        use aes_gcm::aes::cipher::BlockCipherEncrypt;
+        let mut block = [0u8; 16];
+        block[..8].copy_from_slice(&ts.to_be_bytes());
+        block[8..12].copy_from_slice(&rand4);
+        let crc = crc32_ieee(&block[..12]);
+        block[12..].copy_from_slice(&crc.to_be_bytes());
+        let key = kdf16(cmd_key, KDF_SALT_AUTH_ID, &[]);
+        let cipher = aes_gcm::aes::Aes128::new_from_slice(&key).expect("key length");
+        cipher.encrypt_block((&mut block).into());
+        block
     }
 
-    /// Build the `auth_id` field: first 16 bytes of AES-128-GCM with an
-    /// empty plaintext, keyed with `auth_key` and nonced with the current
-    /// unix timestamp.
-    fn build_auth_id(uuid: &[u8]) -> ([u8; 16], u64) {
-        let auth_key = Self::derive_auth_key(uuid);
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let ts_bytes = ts.to_be_bytes();
-
-        let mut nonce = [0u8; NONCE_LEN];
-        nonce[..8].copy_from_slice(&ts_bytes);
-
-        let cipher = aes_gcm::Aes128Gcm::new_from_slice(&auth_key).expect("valid key length");
-        let ct = cipher
-            .encrypt(
-                <&aes_gcm::aead::Nonce<aes_gcm::Aes128Gcm>>::try_from(nonce.as_slice())
-                    .expect("nonce size"),
-                [].as_ref(),
-            )
-            .expect("encrypt empty plaintext");
-
-        let mut auth_id = [0u8; 16];
-        auth_id.copy_from_slice(&ct[..16]);
-        (auth_id, ts)
-    }
-
-    /// Build the plaintext instruction block and its random nonce.
-    fn build_instruction(
-        body_key: &[u8; 16],
-        body_iv: &[u8; 16],
-        resp_key: &[u8; 16],
-        resp_iv: &[u8; 16],
-    ) -> ([u8; NONCE_LEN], Vec<u8>) {
-        let mut rng = rand::rng();
-        let mut nonce = [0u8; NONCE_LEN];
-        rng.fill_bytes(&mut nonce);
-
-        let padding_len: u16 = rng.random_range(0..=16);
-        let capacity = 1 + 16 + 16 + 1 + 1 + 2 + padding_len as usize + 16 + 16;
-        let mut plain = Vec::with_capacity(capacity);
-
-        plain.push(VMESS_VERSION); // 1
-        plain.extend_from_slice(body_key); // 16
-        plain.extend_from_slice(body_iv); // 16
-        plain.push(RESP_HEADER_LEN); // 1
-        plain.push(OPT_S | OPT_A); // 1
-        plain.extend_from_slice(&padding_len.to_be_bytes()); // 2
-        if padding_len > 0 {
-            let mut padding = vec![0u8; padding_len as usize];
-            rng.fill_bytes(&mut padding);
-            plain.extend_from_slice(&padding); // P
+    /// Header plaintext per `EncodeRequestHeader` (fnv checksum included).
+    fn build_header_plain(
+        session: &Session,
+        padding_len: u8,
+        padding: &[u8],
+        target: SocketAddr,
+        target_domain: Option<&str>,
+    ) -> Vec<u8> {
+        debug_assert_eq!(padding_len as usize, padding.len());
+        let addr = SocksAddr::new(target, target_domain);
+        let mut plain = Vec::with_capacity(41 + addr.encoded_len() + padding.len() + 4);
+        plain.push(VMESS_VERSION);
+        plain.extend_from_slice(&session.req_iv);
+        plain.extend_from_slice(&session.req_key);
+        plain.push(session.resp_header);
+        plain.push(REQUEST_OPTION);
+        plain.push((padding_len << 4) | SECURITY_AES128_GCM);
+        plain.push(0);
+        plain.push(CMD_TCP);
+        plain.extend_from_slice(&target.port().to_be_bytes());
+        // V2Ray writes port first, then ATYP + address
+        // (protocol.AddressSerializer with PortThenAddress).
+        match &addr {
+            SocksAddr::V4(v4) => {
+                plain.push(addr::ATYP_VMESS.ipv4);
+                plain.extend_from_slice(&v4.ip().octets());
+            }
+            SocksAddr::V6(v6) => {
+                plain.push(addr::ATYP_VMESS.ipv6);
+                plain.extend_from_slice(&v6.ip().octets());
+            }
+            SocksAddr::Domain(domain, _) => {
+                plain.push(addr::ATYP_VMESS.domain);
+                plain.push(domain.len().min(u8::MAX as usize) as u8);
+                plain.extend_from_slice(domain.as_bytes());
+            }
         }
-        plain.extend_from_slice(resp_key); // 16
-        plain.extend_from_slice(resp_iv); // 16
-
-        (nonce, plain)
+        plain.extend_from_slice(padding);
+        plain.extend_from_slice(&fnv1a32(&plain).to_be_bytes());
+        plain
     }
 
-    /// Encrypt the instruction with the command key.
-    fn encrypt_instruction(cmd_key: &[u8; 16], nonce: &[u8; NONCE_LEN], plain: &[u8]) -> Vec<u8> {
-        let cipher = aes_gcm::Aes128Gcm::new_from_slice(cmd_key).expect("valid key length");
-        cipher
-            .encrypt(
-                <&aes_gcm::aead::Nonce<aes_gcm::Aes128Gcm>>::try_from(nonce.as_slice())
-                    .expect("nonce size"),
-                plain,
-            )
-            .expect("encrypt instruction")
+    /// `SealVMessAEADHeader`: auth_id | enc_len | conn_nonce | enc_header,
+    /// both AEAD blocks authenticated with auth_id as AAD.
+    fn seal_request_header(
+        cmd_key: &[u8; 16],
+        auth_id: &[u8; 16],
+        conn_nonce: &[u8; 8],
+        plain: &[u8],
+    ) -> Vec<u8> {
+        let extra: [&[u8]; 2] = [auth_id, conn_nonce];
+        let len_key = kdf16(cmd_key, KDF_SALT_HEADER_LEN_KEY, &extra);
+        let len_nonce = kdf12(cmd_key, KDF_SALT_HEADER_LEN_IV, &extra);
+        let hdr_key = kdf16(cmd_key, KDF_SALT_HEADER_KEY, &extra);
+        let hdr_nonce = kdf12(cmd_key, KDF_SALT_HEADER_IV, &extra);
+
+        let mut out = Vec::with_capacity(16 + 18 + 8 + plain.len() + GCM_TAG_LEN);
+        out.extend_from_slice(auth_id);
+        out.extend_from_slice(&Self::seal_aad(
+            &len_key,
+            &len_nonce,
+            &(plain.len() as u16).to_be_bytes(),
+            auth_id,
+        ));
+        out.extend_from_slice(conn_nonce);
+        out.extend_from_slice(&Self::seal_aad(&hdr_key, &hdr_nonce, plain, auth_id));
+        out
     }
 
-    /// Encrypt plaintext with AES-128-GCM.
-    fn seal(key: &[u8; 16], nonce: &[u8; NONCE_LEN], plaintext: &[u8]) -> Vec<u8> {
+    fn seal(key: &[u8; 16], nonce: &[u8; 12], plaintext: &[u8]) -> Vec<u8> {
         let cipher = aes_gcm::Aes128Gcm::new_from_slice(key).expect("valid key length");
         cipher
             .encrypt(
@@ -190,10 +321,23 @@ impl VmessHandler {
             .expect("seal")
     }
 
-    /// Decrypt ciphertext with AES-128-GCM.
+    fn seal_aad(key: &[u8; 16], nonce: &[u8; 12], plaintext: &[u8], aad: &[u8]) -> Vec<u8> {
+        let cipher = aes_gcm::Aes128Gcm::new_from_slice(key).expect("valid key length");
+        cipher
+            .encrypt(
+                <&aes_gcm::aead::Nonce<aes_gcm::Aes128Gcm>>::try_from(nonce.as_slice())
+                    .expect("nonce size"),
+                Payload {
+                    msg: plaintext,
+                    aad,
+                },
+            )
+            .expect("seal")
+    }
+
     fn open(
         key: &[u8; 16],
-        nonce: &[u8; NONCE_LEN],
+        nonce: &[u8; 12],
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, aes_gcm::aead::Error> {
         let cipher = aes_gcm::Aes128Gcm::new_from_slice(key).expect("valid key length");
@@ -201,6 +345,24 @@ impl VmessHandler {
             <&aes_gcm::aead::Nonce<aes_gcm::Aes128Gcm>>::try_from(nonce.as_slice())
                 .expect("nonce size"),
             ciphertext,
+        )
+    }
+
+    #[cfg(test)]
+    fn open_aad(
+        key: &[u8; 16],
+        nonce: &[u8; 12],
+        ciphertext: &[u8],
+        aad: &[u8],
+    ) -> Result<Vec<u8>, aes_gcm::aead::Error> {
+        let cipher = aes_gcm::Aes128Gcm::new_from_slice(key).expect("valid key length");
+        cipher.decrypt(
+            <&aes_gcm::aead::Nonce<aes_gcm::Aes128Gcm>>::try_from(nonce.as_slice())
+                .expect("nonce size"),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
         )
     }
 
@@ -220,8 +382,8 @@ impl VmessHandler {
         super::transport::wrap_transport(node, tcp).await
     }
 
-    /// Perform the VMess AEAD handshake and return a proxy stream backed by
-    /// a duplex pipe + background relay task.
+    /// Build the request header and return a proxy stream backed by a
+    /// duplex pipe + background relay task.
     fn perform_handshake(
         uuid_bytes: &[u8],
         stream: Box<dyn AsyncReadWrite>,
@@ -229,49 +391,26 @@ impl VmessHandler {
         target_domain: Option<&str>,
     ) -> anyhow::Result<ProxyStream> {
         let cmd_key = Self::derive_cmd_key(uuid_bytes);
-        let (auth_id, _ts) = Self::build_auth_id(uuid_bytes);
+        let session = Session::new();
 
         let mut rng = rand::rng();
-        let mut body_key = [0u8; 16];
-        let mut body_iv = [0u8; 16];
-        let mut resp_key = [0u8; 16];
-        let mut resp_iv = [0u8; 16];
-        rng.fill_bytes(&mut body_key);
-        rng.fill_bytes(&mut body_iv);
-        rng.fill_bytes(&mut resp_key);
-        rng.fill_bytes(&mut resp_iv);
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let auth_id = Self::create_auth_id(&cmd_key, ts, rng.random());
+        let conn_nonce: [u8; 8] = rng.random();
+        // dice.Roll(16): 0..=15 — the length lives in the high nibble.
+        let padding_len: u8 = rng.random_range(0..16);
+        let mut padding = vec![0u8; padding_len as usize];
+        rng.fill_bytes(&mut padding);
 
-        let (cmd_nonce, instruction) =
-            Self::build_instruction(&body_key, &body_iv, &resp_key, &resp_iv);
-        let encrypted_instruction = Self::encrypt_instruction(&cmd_key, &cmd_nonce, &instruction);
-
-        let addr = Self::encode_address(target, target_domain);
-        // Nonce for address: first 12 bytes of body_iv (counter 0).
-        let addr_nonce: [u8; NONCE_LEN] = body_iv[..NONCE_LEN]
-            .try_into()
-            .expect("body_iv has >12 bytes");
-        let encrypted_addr = Self::seal(&body_key, &addr_nonce, &addr);
+        let plain =
+            Self::build_header_plain(&session, padding_len, &padding, target, target_domain);
+        let header_wire = Self::seal_request_header(&cmd_key, &auth_id, &conn_nonce, &plain);
 
         let (client_half, server_half) = tokio::io::duplex(65536);
-
-        // Relay starts at counter 1 for send, counter 0 for receive.
-        let send_start_nonce: [u8; NONCE_LEN] = addr_nonce;
-        let recv_start_nonce: [u8; NONCE_LEN] = resp_iv[..NONCE_LEN]
-            .try_into()
-            .expect("resp_iv has >12 bytes");
-
-        tokio::spawn(vmess_relay(
-            stream,
-            server_half,
-            auth_id,
-            cmd_nonce,
-            encrypted_instruction,
-            body_key,
-            send_start_nonce,
-            resp_key,
-            recv_start_nonce,
-            encrypted_addr,
-        ));
+        tokio::spawn(vmess_relay(stream, server_half, header_wire, session));
 
         Ok(ProxyStream {
             stream: Box::new(client_half),
@@ -320,133 +459,193 @@ impl TcpOutbound for VmessHandler {
 #[async_trait]
 impl ProbeableOutbound for VmessHandler {}
 
+/// `ShakeSizeParser` (encoding/auth.go): a SHAKE128 stream over the body IV
+/// yielding the 2-byte XOR mask for each chunk's length field, in order.
+struct ShakeSizeParser(sha3::Shake128Reader);
+
+impl ShakeSizeParser {
+    fn new(iv: &[u8; 16]) -> Self {
+        use sha3::digest::{ExtendableOutput, Update};
+        let mut h = sha3::Shake128::default();
+        h.update(iv);
+        Self(h.finalize_xof())
+    }
+
+    fn next_mask(&mut self) -> [u8; 2] {
+        use sha3::digest::XofReader;
+        let mut mask = [0u8; 2];
+        self.0.read(&mut mask);
+        mask
+    }
+
+    fn encode_len(&mut self, size: u16) -> [u8; 2] {
+        let mask = self.next_mask();
+        let [a, b] = size.to_be_bytes();
+        [a ^ mask[0], b ^ mask[1]]
+    }
+
+    fn decode_len(&mut self, encoded: [u8; 2]) -> u16 {
+        let mask = self.next_mask();
+        u16::from_be_bytes([encoded[0] ^ mask[0], encoded[1] ^ mask[1]])
+    }
+}
+
+/// `GenerateChunkNonce`: the 12-byte nonce is the body IV's first 12 bytes
+/// with the first two replaced by the big-endian chunk counter.
+fn chunk_nonce(iv: &[u8; 16], count: u16) -> [u8; 12] {
+    let mut nonce = [0u8; 12];
+    nonce[..2].copy_from_slice(&count.to_be_bytes());
+    nonce[2..].copy_from_slice(&iv[2..12]);
+    nonce
+}
+
+/// Seal one body chunk: masked length field + AEAD(payload). An empty
+/// payload is the request-body termination chunk (Xray's outbound writes an
+/// empty MultiBuffer on upload EOF; without it the server keeps waiting for
+/// more request data).
+fn seal_chunk(
+    key: &[u8; 16],
+    iv: &[u8; 16],
+    size: &mut ShakeSizeParser,
+    count: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    debug_assert!(payload.len() <= CHUNK_MAX_LEN);
+    let mut out = Vec::with_capacity(2 + payload.len() + GCM_TAG_LEN);
+    out.extend_from_slice(&size.encode_len((payload.len() + GCM_TAG_LEN) as u16));
+    out.extend_from_slice(&VmessHandler::seal(key, &chunk_nonce(iv, count), payload));
+    out
+}
+
 /// Background task that encrypts client→server data and decrypts
 /// server→client data using the VMess AEAD chunking format.
-///
-/// On the send side, counter 0 was already consumed for the target address,
-/// so the relay starts at counter 1.  On the receive side the counter
-/// starts at 0.
-#[allow(clippy::too_many_arguments)]
 async fn vmess_relay(
     server: Box<dyn AsyncReadWrite>,
     client: tokio::io::DuplexStream,
-    auth_id: [u8; 16],
-    cmd_nonce: [u8; NONCE_LEN],
-    encrypted_instruction: Vec<u8>,
-    body_key: [u8; 16],
-    mut send_nonce: [u8; NONCE_LEN],
-    resp_key: [u8; 16],
-    mut recv_nonce: [u8; NONCE_LEN],
-    encrypted_addr: Vec<u8>,
+    header_wire: Vec<u8>,
+    session: Session,
 ) -> anyhow::Result<()> {
     let (mut server_read, mut server_write) = tokio::io::split(server);
     let (mut client_read, mut client_write) = tokio::io::split(client);
 
-    // Bump send_nonce once — counter 0 was the address.
-    increment_nonce(&mut send_nonce);
+    let upload = async {
+        server_write.write_all(&header_wire).await?;
 
-    let c2s = async {
-        // Write the VMess header: auth_id(16) + cmd_nonce(12) + encrypted_instruction
-        server_write.write_all(&auth_id).await?;
-        server_write.write_all(&cmd_nonce).await?;
-        server_write.write_all(&encrypted_instruction).await?;
-
-        // Write the encrypted address (counter 0, already sealed).
-        server_write.write_all(&encrypted_addr).await?;
-
-        let mut buf = vec![0u8; 65536];
+        let mut size = ShakeSizeParser::new(&session.req_iv);
+        let mut count = 0u16;
+        let mut buf = vec![0u8; CHUNK_MAX_LEN];
         loop {
             let n = client_read.read(&mut buf).await?;
             if n == 0 {
                 break;
             }
-            write_vmess_chunks(&mut server_write, &body_key, &mut send_nonce, &buf[..n]).await?;
+            let mut offset = 0;
+            while offset < n {
+                let end = (offset + CHUNK_MAX_LEN).min(n);
+                let chunk = seal_chunk(
+                    &session.req_key,
+                    &session.req_iv,
+                    &mut size,
+                    count,
+                    &buf[offset..end],
+                );
+                count = count.wrapping_add(1);
+                server_write.write_all(&chunk).await?;
+                offset = end;
+            }
         }
+        let term = seal_chunk(&session.req_key, &session.req_iv, &mut size, count, &[]);
+        server_write.write_all(&term).await?;
+        server_write.flush().await?;
         Ok::<(), anyhow::Error>(())
     };
 
-    let s2c = async {
-        // Each chunk: [encrypted_len (2 + GCM_TAG_LEN)] [encrypted_payload]
-        let mut len_buf = vec![0u8; 2 + GCM_TAG_LEN];
+    let download = async {
+        read_response_header(&mut server_read, &session).await?;
+
+        let mut size = ShakeSizeParser::new(&session.resp_iv);
+        let mut count = 0u16;
         loop {
+            let mut len_buf = [0u8; 2];
             if server_read.read_exact(&mut len_buf).await.is_err() {
                 break;
             }
-            let len_plain = open_resp(&resp_key, &recv_nonce, &len_buf)?;
-            increment_nonce(&mut recv_nonce);
-
-            let payload_len = u16::from_be_bytes([len_plain[0], len_plain[1]]) as usize;
-
-            let mut payload = vec![0u8; payload_len + GCM_TAG_LEN];
-            server_read.read_exact(&mut payload).await?;
-
-            let plain = open_resp(&resp_key, &recv_nonce, &payload)?;
-            increment_nonce(&mut recv_nonce);
-
+            let chunk_len = size.decode_len(len_buf) as usize;
+            // size == AEAD overhead is the server's termination chunk
+            // (AuthenticationReader.readInternal).
+            if chunk_len == GCM_TAG_LEN {
+                break;
+            }
+            anyhow::ensure!(
+                chunk_len > GCM_TAG_LEN && chunk_len <= CHUNK_MAX_LEN + GCM_TAG_LEN,
+                "invalid VMess chunk size {chunk_len}"
+            );
+            let mut ct = vec![0u8; chunk_len];
+            server_read.read_exact(&mut ct).await?;
+            let plain = VmessHandler::open(
+                &session.resp_key,
+                &chunk_nonce(&session.resp_iv, count),
+                &ct,
+            )
+            .map_err(|e| anyhow::anyhow!("VMess response chunk decrypt failed: {:?}", e))?;
+            count = count.wrapping_add(1);
             client_write.write_all(&plain).await?;
         }
         Ok::<(), anyhow::Error>(())
     };
 
+    // Upload EOF only half-closes the request body — the response must
+    // still be drained (HTTP: the reply arrives after the request ends).
+    tokio::pin!(upload);
+    tokio::pin!(download);
     tokio::select! {
-        r = c2s => r,
-        r = s2c => r,
-    }
-}
-
-/// Decrypt response data (thin wrapper that maps the error).
-fn open_resp(
-    key: &[u8; 16],
-    nonce: &[u8; NONCE_LEN],
-    ciphertext: &[u8],
-) -> anyhow::Result<Vec<u8>> {
-    VmessHandler::open(key, nonce, ciphertext)
-        .map_err(|e| anyhow::anyhow!("VMess decrypt response failed: {:?}", e))
-}
-
-/// Write a payload as one or more authenticated-length VMess chunks.
-async fn write_vmess_chunks<W>(
-    writer: &mut W,
-    body_key: &[u8; 16],
-    nonce: &mut [u8; NONCE_LEN],
-    payload: &[u8],
-) -> anyhow::Result<()>
-where
-    W: AsyncWriteExt + Unpin,
-{
-    let mut offset = 0;
-    while offset < payload.len() {
-        let end = (offset + CHUNK_MAX_LEN).min(payload.len());
-        let chunk = &payload[offset..end];
-
-        // Encrypt the 2-byte length in its own AEAD block.
-        let len = chunk.len() as u16;
-        let len_plain = len.to_be_bytes();
-        let len_cipher = VmessHandler::seal(body_key, nonce, &len_plain);
-        increment_nonce(nonce);
-
-        // Encrypt the payload in the next AEAD block.
-        let payload_cipher = VmessHandler::seal(body_key, nonce, chunk);
-        increment_nonce(nonce);
-
-        writer.write_all(&len_cipher).await?;
-        writer.write_all(&payload_cipher).await?;
-
-        offset = end;
-    }
-    Ok(())
-}
-
-/// Increment a nonce treating it as a little-endian counter.
-fn increment_nonce(nonce: &mut [u8]) {
-    for byte in nonce.iter_mut() {
-        if *byte == 0xFF {
-            *byte = 0;
-        } else {
-            *byte += 1;
-            break;
+        r = &mut download => r,
+        r = &mut upload => {
+            r?;
+            download.await
         }
     }
+}
+
+/// `DecodeResponseHeader`: AEAD-sealed length then AEAD-sealed payload,
+/// keyed from the response body key/IV with no AAD.
+async fn read_response_header<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+    session: &Session,
+) -> anyhow::Result<()> {
+    let mut len_ct = [0u8; 2 + GCM_TAG_LEN];
+    reader.read_exact(&mut len_ct).await?;
+    let len_plain = VmessHandler::open(
+        &kdf16(&session.resp_key, KDF_SALT_RESP_LEN_KEY, &[]),
+        &kdf12(&session.resp_iv, KDF_SALT_RESP_LEN_IV, &[]),
+        &len_ct,
+    )
+    .map_err(|e| anyhow::anyhow!("VMess response header length decrypt failed: {:?}", e))?;
+    let hdr_len = u16::from_be_bytes([len_plain[0], len_plain[1]]) as usize;
+    anyhow::ensure!(
+        (4..=256).contains(&hdr_len),
+        "invalid VMess response header length {hdr_len}"
+    );
+
+    let mut hdr_ct = vec![0u8; hdr_len + GCM_TAG_LEN];
+    reader.read_exact(&mut hdr_ct).await?;
+    let hdr = VmessHandler::open(
+        &kdf16(&session.resp_key, KDF_SALT_RESP_KEY, &[]),
+        &kdf12(&session.resp_iv, KDF_SALT_RESP_IV, &[]),
+        &hdr_ct,
+    )
+    .map_err(|e| anyhow::anyhow!("VMess response header decrypt failed: {:?}", e))?;
+
+    anyhow::ensure!(
+        hdr[0] == session.resp_header,
+        "unexpected VMess response header byte {:#x}, expected {:#x}",
+        hdr[0],
+        session.resp_header
+    );
+    // hdr[1] option, hdr[2] command id, hdr[3] command data length; the
+    // command data rides inside the same header block and carries nothing
+    // a plain TCP outbound needs.
+    Ok(())
 }
 
 #[cfg(test)]
@@ -454,111 +653,197 @@ mod tests {
     use super::*;
     use honk_config::types::NodeProtocol;
 
-    #[test]
-    fn test_derive_cmd_key() {
-        let uuid = [0u8; 16];
-        let cmd_key = VmessHandler::derive_cmd_key(&uuid);
-        assert_eq!(cmd_key.len(), 16);
-        assert_ne!(cmd_key, [0u8; 16]);
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    // Byte-level regression vectors produced by running the actual
+    // Xray-core/sing-vmess Go code (aead/kdf.go, aead/authid.go,
+    // aead/encrypt.go, encoding/auth.go semantics) with these fixed inputs.
+    const UUID: &str = "b831381d-6324-4d53-ad4f-8cda48b30811";
+    const CMD_KEY: &str = "b50d916ac0cec067981af8e5f38a758f";
+    const AUTH_ID_KEY: &str = "1415ba74ca8b3d041a8f583fb4116315";
+    const AUTH_ID: &str = "7997d3314952dc37e0b284331b6bb2e7"; // ts=1700000000, rand=deadbeef
+    const HEADER_PLAIN: &str = "0122222222222222222222222222222222111111111111111111111111111111115a053300010050015db8d822aabbcc15eba2f4";
+    const HEADER_WIRE: &str = "7997d3314952dc37e0b284331b6bb2e71a963074b6c9f5cd7c0825ace93c69df311f0102030405060708301fcaedd9021cf0eaab9deb25afab08b13d78f0b0ff69acfc123dd0ba0d9b6c24d5edbfbcd20d23d7fd0a9f3d59a64835ccd0253af09feb22cc2affb2942c159c5acdc2";
+    const CHUNK0: &str = "cce0f4cf6e664ef12db2501e5fc2333f0d54118144ce186c4913a9a33a";
+    const CHUNK1: &str = "821e7f5df60be7f0159bdf89de3bda5c55c920d471fda4d17d24ddb5fd";
+    const CHUNK_TERM: &str = "f25f875b48011300760c657294fca053c869";
+    const RESP_KEY: &str = "b8f12ea8c9a95d4b4641b03d9fa5a71a";
+    const RESP_IV: &str = "3dc30fbac8417f76943e9c10e15eeacb";
+    const RESP_HEADER_WIRE: &str =
+        "1ed5e218e618e8c5350363b980c93de5efa06015b5dc7a63f67ab72353ff9aa4f47a9ee044da";
+    const RCHUNK0: &str = "a519478d162a2f176b9d3e71216983fc910451176407bbc97aa4daccb61c4740c0";
+    const RCHUNK1: &str = "7baab45ea2ec0a90ad19bc5cacb263341906c9224a32ff3ce1dd65f2c0f7817120";
+
+    fn fixed_session() -> Session {
+        Session {
+            req_key: [0x11; 16],
+            req_iv: [0x22; 16],
+            resp_key: hex(RESP_KEY).try_into().unwrap(),
+            resp_iv: hex(RESP_IV).try_into().unwrap(),
+            resp_header: 0x5a,
+        }
+    }
+
+    fn fixed_cmd_key() -> [u8; 16] {
+        hex(CMD_KEY).try_into().unwrap()
     }
 
     #[test]
-    fn test_derive_auth_key() {
-        let uuid = [0u8; 16];
-        let auth_key = VmessHandler::derive_auth_key(&uuid);
-        assert_eq!(auth_key.len(), 16);
-        assert_ne!(auth_key, [0u8; 16]);
+    fn test_derive_cmd_key_vector() {
+        let uuid = uuid::Uuid::parse_str(UUID).unwrap();
+        assert_eq!(
+            VmessHandler::derive_cmd_key(uuid.as_bytes()),
+            fixed_cmd_key()
+        );
     }
 
     #[test]
-    fn test_cmd_key_deterministic() {
-        let uuid = [1u8; 16];
-        let k1 = VmessHandler::derive_cmd_key(&uuid);
-        let k2 = VmessHandler::derive_cmd_key(&uuid);
-        assert_eq!(k1, k2);
+    fn test_kdf_auth_id_key_vector() {
+        assert_eq!(
+            kdf16(&fixed_cmd_key(), KDF_SALT_AUTH_ID, &[]).to_vec(),
+            hex(AUTH_ID_KEY)
+        );
     }
 
     #[test]
-    fn test_different_keys_for_different_uuids() {
-        let k1 = VmessHandler::derive_cmd_key(&[0u8; 16]);
-        let k2 = VmessHandler::derive_cmd_key(&[1u8; 16]);
-        assert_ne!(k1, k2);
+    fn test_auth_id_vector() {
+        let auth_id =
+            VmessHandler::create_auth_id(&fixed_cmd_key(), 1_700_000_000, [0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(auth_id.to_vec(), hex(AUTH_ID));
     }
 
     #[test]
-    fn test_build_auth_id_returns_16_bytes() {
-        let uuid = [0u8; 16];
-        let (auth_id, ts) = VmessHandler::build_auth_id(&uuid);
-        assert_eq!(auth_id.len(), 16);
-        assert!(ts > 1_700_000_000); // after 2023
+    fn test_request_header_plain_vector() {
+        let session = fixed_session();
+        let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
+        let plain =
+            VmessHandler::build_header_plain(&session, 3, &[0xaa, 0xbb, 0xcc], target, None);
+        assert_eq!(plain, hex(HEADER_PLAIN));
     }
 
     #[test]
-    fn test_auth_id_is_not_all_zeros() {
-        let uuid = [0u8; 16];
-        let (auth_id, _) = VmessHandler::build_auth_id(&uuid);
-        assert_ne!(auth_id, [0u8; 16]);
+    fn test_request_header_wire_vector() {
+        let session = fixed_session();
+        let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
+        let plain =
+            VmessHandler::build_header_plain(&session, 3, &[0xaa, 0xbb, 0xcc], target, None);
+        let wire = VmessHandler::seal_request_header(
+            &fixed_cmd_key(),
+            &hex(AUTH_ID).try_into().unwrap(),
+            &[1, 2, 3, 4, 5, 6, 7, 8],
+            &plain,
+        );
+        assert_eq!(wire, hex(HEADER_WIRE));
     }
 
     #[test]
-    fn test_build_instruction_structure() {
-        let bk = [0u8; 16];
-        let bi = [0u8; 16];
-        let rk = [0u8; 16];
-        let ri = [0u8; 16];
-
-        let (nonce, inst) = VmessHandler::build_instruction(&bk, &bi, &rk, &ri);
-        assert_eq!(nonce.len(), 12);
-
-        assert_eq!(inst[0], VMESS_VERSION);
-        assert_eq!(&inst[1..17], &bk);
-        assert_eq!(&inst[17..33], &bi);
-        assert_eq!(inst[33], RESP_HEADER_LEN);
-        assert_eq!(inst[34], OPT_S | OPT_A);
-
-        let padding_len = u16::from_be_bytes([inst[35], inst[36]]) as usize;
-        let padding_end = 37 + padding_len;
-        assert_eq!(&inst[padding_end..padding_end + 16], &rk);
-        assert_eq!(&inst[padding_end + 16..padding_end + 32], &ri);
+    fn test_body_chunk_vectors() {
+        let session = fixed_session();
+        let mut size = ShakeSizeParser::new(&session.req_iv);
+        let c0 = seal_chunk(
+            &session.req_key,
+            &session.req_iv,
+            &mut size,
+            0,
+            b"hello vmess",
+        );
+        let c1 = seal_chunk(
+            &session.req_key,
+            &session.req_iv,
+            &mut size,
+            1,
+            b"hello vmess",
+        );
+        let term = seal_chunk(&session.req_key, &session.req_iv, &mut size, 2, b"");
+        assert_eq!(c0, hex(CHUNK0));
+        assert_eq!(c1, hex(CHUNK1));
+        assert_eq!(term, hex(CHUNK_TERM));
     }
 
     #[test]
-    fn test_encrypt_instruction_roundtrip() {
-        let bk = [1u8; 16];
-        let bi = [2u8; 16];
-        let rk = [3u8; 16];
-        let ri = [4u8; 16];
+    fn test_response_key_derivation_vectors() {
+        let session = Session {
+            req_key: [0x11; 16],
+            req_iv: [0x22; 16],
+            ..fixed_session()
+        };
+        let derived = Session {
+            resp_key: Sha256::digest(session.req_key)[..16].try_into().unwrap(),
+            resp_iv: Sha256::digest(session.req_iv)[..16].try_into().unwrap(),
+            ..session
+        };
+        assert_eq!(derived.resp_key.to_vec(), hex(RESP_KEY));
+        assert_eq!(derived.resp_iv.to_vec(), hex(RESP_IV));
+    }
 
-        let uuid = [5u8; 16];
-        let cmd_key = VmessHandler::derive_cmd_key(&uuid);
-        let (nonce, inst) = VmessHandler::build_instruction(&bk, &bi, &rk, &ri);
+    /// Feed the exact bytes a Go (Xray-semantics) server would send and
+    /// check the response header + body chunk decode end to end.
+    #[tokio::test]
+    async fn test_response_decode_vectors() {
+        let session = fixed_session();
+        let mut wire = hex(RESP_HEADER_WIRE);
+        wire.extend_from_slice(&hex(RCHUNK0));
+        wire.extend_from_slice(&hex(RCHUNK1));
 
-        let encrypted = VmessHandler::encrypt_instruction(&cmd_key, &nonce, &inst);
+        let mut cursor: &[u8] = &wire;
+        read_response_header(&mut cursor, &session).await.unwrap();
 
-        let decrypted =
-            VmessHandler::open(&cmd_key, &nonce, &encrypted).expect("decrypt instruction");
-        assert_eq!(decrypted, inst);
+        let mut size = ShakeSizeParser::new(&session.resp_iv);
+        let mut out = Vec::new();
+        for count in 0..2u16 {
+            let mut len_buf = [0u8; 2];
+            cursor.read_exact(&mut len_buf).await.unwrap();
+            let chunk_len = size.decode_len(len_buf) as usize;
+            let mut ct = vec![0u8; chunk_len];
+            cursor.read_exact(&mut ct).await.unwrap();
+            let plain = VmessHandler::open(
+                &session.resp_key,
+                &chunk_nonce(&session.resp_iv, count),
+                &ct,
+            )
+            .unwrap();
+            out.extend_from_slice(&plain);
+        }
+        assert_eq!(out, b"HTTP/1.1 200 OKHTTP/1.1 200 OK");
+        assert!(cursor.is_empty());
+    }
+
+    /// The same wire bytes with a tampered response-header byte must fail
+    /// the response-header equality check, not silently relay.
+    #[tokio::test]
+    async fn test_response_header_mismatch_fails() {
+        let session = Session {
+            resp_header: 0x5b,
+            ..fixed_session()
+        };
+        let wire = hex(RESP_HEADER_WIRE);
+        let mut cursor: &[u8] = &wire;
+        assert!(read_response_header(&mut cursor, &session).await.is_err());
     }
 
     #[test]
-    fn test_increment_nonce_basic() {
-        let mut n = [0u8; 12];
-        increment_nonce(&mut n);
-        assert_eq!(n, [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    fn test_crc32_ieee() {
+        // crc32.ChecksumIEEE("123456789") = 0xCBF43926 (classic vector).
+        assert_eq!(crc32_ieee(b"123456789"), 0xCBF4_3926);
     }
 
     #[test]
-    fn test_increment_nonce_carry() {
-        let mut n = [0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        increment_nonce(&mut n);
-        assert_eq!(n, [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    fn test_fnv1a32() {
+        // fnv.New32a("hello") = 0x4f9f2cab.
+        assert_eq!(fnv1a32(b"hello"), 0x4F9F_2CAB);
     }
 
     #[test]
-    fn test_increment_nonce_overflow() {
-        let mut n = [0xFF; 12];
-        increment_nonce(&mut n);
-        assert_eq!(n, [0; 12]);
+    fn test_chunk_nonce_layout() {
+        let iv = [0x22; 16];
+        let nonce = chunk_nonce(&iv, 0x0102);
+        assert_eq!(nonce[..2], [0x01, 0x02]);
+        assert_eq!(nonce[2..], [0x22; 10]);
     }
 
     #[test]
@@ -575,37 +860,6 @@ mod tests {
     }
 
     #[test]
-    fn test_seal_open_empty() {
-        let key = [0xCC; 16];
-        let nonce = [0xDD; 12];
-        let plain: &[u8] = &[];
-
-        let ct = VmessHandler::seal(&key, &nonce, plain);
-        assert_eq!(ct.len(), GCM_TAG_LEN);
-
-        let decrypted = VmessHandler::open(&key, &nonce, &ct).expect("decrypt empty");
-        assert!(decrypted.is_empty());
-    }
-
-    #[test]
-    fn test_open_with_wrong_key_fails() {
-        let key1 = [0x11; 16];
-        let key2 = [0x22; 16];
-        let nonce = [0x33; 12];
-        let ct = VmessHandler::seal(&key1, &nonce, b"data");
-        assert!(VmessHandler::open(&key2, &nonce, &ct).is_err());
-    }
-
-    #[test]
-    fn test_open_with_wrong_nonce_fails() {
-        let key = [0x44; 16];
-        let nonce1 = [0x55; 12];
-        let nonce2 = [0x66; 12];
-        let ct = VmessHandler::seal(&key, &nonce1, b"data");
-        assert!(VmessHandler::open(&key, &nonce2, &ct).is_err());
-    }
-
-    #[test]
     fn test_protocol_returns_vmess() {
         assert_eq!(
             crate::descriptor::descriptor(NodeProtocol::VMess).protocol,
@@ -613,14 +867,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_handler_new() {
-        let _handler = VmessHandler::new();
-    }
-
-    /// End-to-end over the WebSocket transport: a mock WS server receives
-    /// the VMess auth block + encrypted address as binary message(s) and
-    /// fully decrypts the instruction and target address.
+    /// End-to-end over the WebSocket transport: a mock server parses the
+    /// real AEAD wire format — auth ID, sealed header length, sealed header
+    /// (version/option/security/address) — exactly like a sing-box/Xray
+    /// inbound would.
     #[tokio::test]
     async fn test_vmess_dial_over_ws_handshake() {
         use futures_util::StreamExt;
@@ -635,15 +885,11 @@ mod tests {
 
             let uuid = uuid::Uuid::parse_str(uuid_str).unwrap();
             let cmd_key = VmessHandler::derive_cmd_key(uuid.as_bytes());
-            let cmd_cipher = aes_gcm::Aes128Gcm::new_from_slice(&cmd_key).unwrap();
 
-            // The bridge may coalesce or split the header writes; collect
-            // binary messages until the instruction + address decrypt.
-            // auth_id(16) | cmd_nonce(12) | enc_instruction | enc_addr;
-            // instruction plaintext is 69..=85 bytes (+16 tag), the IPv4
-            // address ciphertext is exactly 23 bytes.
+            // auth_id(16) | enc_len(18) | conn_nonce(8) | enc_header(N+16);
+            // the bridge may coalesce or split writes across messages.
             let mut data = Vec::new();
-            let (instruction, addr_ct) = loop {
+            let header_plain = loop {
                 let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
                     .await
                     .expect("message within timeout")
@@ -651,40 +897,47 @@ mod tests {
                     .expect("message ok");
                 data.extend_from_slice(&msg.into_data());
 
-                if data.len() >= 28 + 85 + 23 {
-                    let mut found = None;
-                    for instr_ct_len in 85..=101 {
-                        if 28 + instr_ct_len + 23 != data.len() {
-                            continue;
-                        }
-                        let nonce: &[u8; NONCE_LEN] = data[16..28].try_into().unwrap();
-                        if let Ok(pt) =
-                            cmd_cipher.decrypt(nonce.into(), &data[28..28 + instr_ct_len])
-                        {
-                            found = Some((pt, data[28 + instr_ct_len..].to_vec()));
-                            break;
-                        }
-                    }
-                    if let Some(found) = found {
-                        break found;
-                    }
-                    panic!("VMess header did not decrypt ({} bytes)", data.len());
+                if data.len() < 16 + 18 + 8 + 4 + GCM_TAG_LEN {
+                    continue;
                 }
+                let auth_id: [u8; 16] = data[..16].try_into().unwrap();
+                let conn_nonce: [u8; 8] = data[34..42].try_into().unwrap();
+                let extra: [&[u8]; 2] = [&auth_id, &conn_nonce];
+                let len_key = kdf16(&cmd_key, KDF_SALT_HEADER_LEN_KEY, &extra);
+                let len_nonce = kdf12(&cmd_key, KDF_SALT_HEADER_LEN_IV, &extra);
+                let Ok(len_plain) =
+                    VmessHandler::open_aad(&len_key, &len_nonce, &data[16..34], &auth_id)
+                else {
+                    continue;
+                };
+                let hdr_len = u16::from_be_bytes([len_plain[0], len_plain[1]]) as usize;
+                if data.len() < 42 + hdr_len + GCM_TAG_LEN {
+                    continue;
+                }
+                let hdr_key = kdf16(&cmd_key, KDF_SALT_HEADER_KEY, &extra);
+                let hdr_nonce = kdf12(&cmd_key, KDF_SALT_HEADER_IV, &extra);
+                let plain = VmessHandler::open_aad(
+                    &hdr_key,
+                    &hdr_nonce,
+                    &data[42..42 + hdr_len + GCM_TAG_LEN],
+                    &auth_id,
+                )
+                .expect("header decrypts");
+                break plain;
             };
 
-            assert_eq!(instruction[0], VMESS_VERSION);
-            assert_eq!(instruction[34], OPT_S | OPT_A);
-
-            let body_key: [u8; 16] = instruction[1..17].try_into().unwrap();
-            let body_iv: [u8; 16] = instruction[17..33].try_into().unwrap();
-            let body_cipher = aes_gcm::Aes128Gcm::new_from_slice(&body_key).unwrap();
-            let addr_nonce: &[u8; NONCE_LEN] = body_iv[..NONCE_LEN].try_into().unwrap();
-            let addr = body_cipher
-                .decrypt(addr_nonce.into(), addr_ct.as_slice())
-                .expect("address decrypts");
-            assert_eq!(addr[0], addr::ATYP_VMESS.ipv4);
-            assert_eq!(&addr[1..5], &[93, 184, 216, 34]);
-            assert_eq!(&addr[5..7], &[0x00, 0x50]); // port 80
+            assert_eq!(header_plain[0], VMESS_VERSION);
+            assert_eq!(header_plain[34], REQUEST_OPTION);
+            assert_eq!(header_plain[35] & 0x0f, SECURITY_AES128_GCM);
+            assert_eq!(header_plain[37], CMD_TCP);
+            // port first, then ATYP + address (V2Ray WriteAddressPort).
+            assert_eq!(&header_plain[38..40], &[0x00, 0x50]);
+            assert_eq!(header_plain[40], addr::ATYP_VMESS.ipv4);
+            assert_eq!(&header_plain[41..45], &[93, 184, 216, 34]);
+            // fnv1a checksum over everything before it.
+            let payload_end = header_plain.len() - 4;
+            let sum = u32::from_be_bytes(header_plain[payload_end..].try_into().unwrap());
+            assert_eq!(sum, fnv1a32(&header_plain[..payload_end]));
         });
 
         let node = Node {
