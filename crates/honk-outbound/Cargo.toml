@@ -73,3 +73,7 @@ harness = false
 [[example]]
 name = "vmess_lab59"
 required-features = ["rprx"]
+
+[[example]]
+name = "vless_bench"
+required-features = ["rprx"]
