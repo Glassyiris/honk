@@ -265,10 +265,13 @@ fn set_chrome_key_shares_ssl_ref(ssl: &boring::ssl::SslRef) -> anyhow::Result<()
 }
 
 /// Chrome sends ALPS for h2 with an empty settings payload whenever ALPN
-/// offers h2. boring exposes this only via FFI.
-fn add_chrome_alps(cfg: &mut ConnectConfiguration) -> anyhow::Result<()> {
+/// offers h2. boring exposes this only via FFI. Chrome uses the old ALPS
+/// codepoint (0x4469) on TCP+h2; BoringSSL defaults to the new one (0x44cd),
+/// which is JA4-distinguishable from real Chrome.
+pub(crate) fn add_chrome_alps(cfg: &mut ConnectConfiguration) -> anyhow::Result<()> {
     let ssl: &boring::ssl::SslRef = cfg;
     let ok = unsafe {
+        boring_sys::SSL_set_alps_use_new_codepoint(ssl.as_ptr(), 0);
         boring_sys::SSL_add_application_settings(
             ssl.as_ptr(),
             b"h2".as_ptr(),
