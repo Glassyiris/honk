@@ -32,19 +32,69 @@ fn embed_ebpf_object() {
             .unwrap_or(false)
     }
 
+    /// Newest mtime under `dir` (recursive). The eBPF object is built by a
+    /// separate cargo invocation, so cargo's own change tracking never
+    /// rebuilds it — without this check a stale object from hours ago gets
+    /// embedded while the sources have moved on (observed twice: missing maps
+    /// at runtime while the build looks green).
+    fn newest_mtime(dir: &Path) -> Option<std::time::SystemTime> {
+        let mut newest = None;
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d).ok()?.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if let Ok(meta) = path.metadata() {
+                    if let Ok(mtime) = meta.modified() {
+                        if newest.is_none_or(|n| mtime > n) {
+                            newest = Some(mtime);
+                        }
+                    }
+                }
+            }
+        }
+        newest
+    }
+
+    fn object_stale(obj: &Path, src_dirs: &[&Path]) -> bool {
+        let Ok(obj_mtime) = obj.metadata().and_then(|m| m.modified()) else {
+            return true;
+        };
+        src_dirs
+            .iter()
+            .filter_map(|d| newest_mtime(d))
+            .any(|src_mtime| src_mtime > obj_mtime)
+    }
+
     let candidates = [
         ebpf_target.clone(),
         manifest_dir.join("../../target/honk-core.o"),
     ];
 
     let obj = candidates.iter().find(|p| p.exists()).cloned();
+    let src_dirs = [ebpf_crate.join("src"), ebpf_common_crate.join("src")];
 
     let obj = match obj {
-        Some(p) if object_has_btf(&p) => {
+        Some(p)
+            if object_has_btf(&p)
+                && !object_stale(
+                    &p,
+                    &src_dirs.iter().map(|d| d.as_path()).collect::<Vec<_>>(),
+                ) =>
+        {
             println!("cargo:rerun-if-changed={}", p.display());
             p
         }
-        _ => {
+        stale => {
+            if let Some(p) = &stale {
+                if p.exists() && object_has_btf(p) {
+                    println!(
+                        "cargo:warning=eBPF object at {} is older than the eBPF sources — rebuilding",
+                        p.display()
+                    );
+                }
+            }
             // Missing, or stale without .BTF (e.g. built while an environment
             // RUSTFLAGS overrode crates/honk-ebpf/.cargo/config.toml): (re)build.
             println!("cargo:warning=Building eBPF object (one-time, ~30s)...");
