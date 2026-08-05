@@ -101,8 +101,11 @@ fn resolve_dat(
     find: fn() -> Option<PathBuf>,
 ) -> anyhow::Result<PathBuf> {
     if let Some(p) = explicit {
-        if !p.is_file() {
+        if !p.exists() {
             anyhow::bail!("{}: no such file", p.display());
+        }
+        if !p.is_file() {
+            anyhow::bail!("{}: not a file", p.display());
         }
         return Ok(p);
     }
