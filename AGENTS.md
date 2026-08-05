@@ -282,9 +282,9 @@ The old `run` / `deploy` / `docker*` recipes were removed: they called `scripts/
 
   ## What's Changed
   ### New Features
-  * <subject> by @agent in <short-hash>
+  * <subject> by @colores-slave in <short-hash>
   ### Bug Fixes
-  * <subject> by @agent in <short-hash>
+  * <subject> by @colores-slave in <short-hash>
   ### Performance
   * ...
   ### Documentation
