@@ -95,9 +95,9 @@ flowchart TB
 1. 每个 `lan_interface` 上的 **TC ingress** 负责分类转发的客户端流量；每个 `wan_interface` 上的 **TC egress** 独立分类本机发起的 TCP/UDP。省略 `lan_interface` 时只安装 WAN 路径。
 2. 目的端口 53 的 DNS 走**快路径**（跳过昂贵 match 环），重定向到控制面。
 3. 结果：
-   - `direct + must` → 留在主机协议栈（不 redirect）。
-   - 非 must 的 `direct` → 当 direct 卸载标志置位时（`DATAPATH_FLAGS_MAP` 位 0——恰好对应 clash `Rule` 模式或未启用 clash API）同样留在主机协议栈；`Global`/`Direct` 模式下仍 redirect 进 `dae0`，让用户态模式覆盖改判。
-   - 用户出站 / block / 控制面路由 → 在出站存活时 redirect 进 `dae0`。
+   - `direct + must` → 留在主机协议栈（不 redirect），任何模式皆如此。
+   - 非 must 的 `direct` → 当按流卸载决定允许时同样留在主机协议栈（路由时决定一次，缓存在该流 `RoutingMeta` 位 57）：clash `Rule` 模式（或未启用 clash API）下，要求可证明无需 SNI 再评估——`dial_mode: ip`、路由配置无域名类规则、或该流域名已经 DNS 学习并在本次路由中经 `DOMAIN_ROUTING_MAP` 位图判定；clash `Direct` 模式下无条件卸载（用户态覆盖反正会改判 direct）。`Global` 模式——以及 `Rule` 模式下仍可能被域名改判的流——仍 redirect 进 `dae0`。
+   - 用户出站 / block / 控制面路由 → 在出站存活时 redirect 进 `dae0`。（clash `Direct` 模式下非 must 的用户出站流改为按 direct 直通——同上述卸载。）
 4. 在 **daens** 中，`sk_lookup` 将流指派到透明 TCP/UDP 监听套接字。
 5. **用户态**取 handoff，可选嗅探域名，必要时走完整 `Router`，应用 Clash 模式覆盖，选组叶子，拨号并中继。
 6. 拨号/探测/DNS 上游套接字打上 **`DAE_BYPASS_MARK`（`0x100`）**，避免被 eBPF 再次代理。
@@ -138,7 +138,7 @@ SockMap 即使只发布了一部分，也不会把流量 redirect 到缺失的 l
 | `OUTBOUND_STATS` | 每出站 per-CPU tx/rx 包/字节 |
 | `LISTEN_SOCKET_MAP` | 透明监听 SockMap |
 | `DATAPATH_STATE_MAP` | 仅在完整 listener generation 发布后打开的 admission gate |
-| `DATAPATH_FLAGS_MAP` | 用户态运行时写入的标志位；位 0 在内核卸载非 `must` 的 `direct` 流（clash `Rule` 模式 / 未启用 clash API） |
+| `DATAPATH_FLAGS_MAP` | 用户态运行时写入的标志位：按模式的 direct 卸载策略（`DATAPATH_FLAG_OFFLOAD_RULE_DIRECT` / `_ALL` / `_NO_DOMAIN_RULES`），仅在新流路由决策时读取一次；决定按流缓存在 `RoutingMeta` 位 57 |
 | `EVENT_RINGBUF` | 溢出事件 → 用户态 tracing |
 
 ### 保留出站索引
@@ -154,7 +154,7 @@ SockMap 即使只发布了一部分，也不会把流量 redirect 到缺失的 l
 
 - **SYN 时刻**，若无 DNS 学习或用户态嗅探，纯域名规则往往无法命中。
 - DNS 应答会更新 `DOMAIN_ROUTING_MAP`，后续 TCP 可在 eBPF 内匹配。
-- 非 `must` 的 `direct` 仅在 clash 模式为 `Global`/`Direct` 时进用户态（模式覆盖必须能改判它）。`Rule` 模式——或未启用 clash API——时它与 `must` direct 一样在内核卸载（对齐 Go dae）：不经用户态中继、不出现在 `/connections`、也不再走 SNI 改判；tx 统计仍在 `lan_ingress` 计数。用户态在启动时（按 cachedb 恢复的模式）、每次 PATCH `/configs` 切换模式时写入该标志，并在每次 reload 后重新断言。
+- 非 `must` 的 `direct` 仅在模式策略要求时进用户态——`Global` 模式全部如此，`Rule` 模式下仅当仍可能被 SNI 改判时（存在域名类规则、`dial_mode` 启用嗅探、且该流域名未经 DNS 学习）。其余情形它与 `must` direct 一样在内核卸载（对齐 Go dae）：不经用户态中继、不出现在 `/connections`、也不再走 SNI 改判；tx 统计仍在 `lan_ingress` 计数。`Direct` 模式下所有非 `must`/非 `block` 流均被卸载（覆盖反正会强制 direct）。卸载决定在路由时按流做一次并缓存在该流的 `RoutingMeta`（位 57）；策略字（`DATAPATH_FLAGS_MAP`）由用户态在启动时（按 cachedb 恢复的模式）、每次 PATCH `/configs` 切换模式时写入，并在每次 reload 后重新断言，只在流创建时生效。
 - TCP SNI/HTTP Host 与 QUIC Initial SNI 在域名感知模式下都会对非 `must`、非 `block` handoff 重新执行用户态 Router。
 
 ## 7. 用户态控制面
