@@ -87,11 +87,7 @@ async fn bench_down(
     }
     if let Some(h) = hasher {
         use sha2::Digest;
-        let digest: String = h
-            .finalize()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let digest: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
         println!("down sha256({total}B): {digest}");
     }
     let secs = t0.elapsed().as_secs_f64();

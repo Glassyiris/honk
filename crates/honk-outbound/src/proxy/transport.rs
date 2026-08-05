@@ -477,7 +477,13 @@ impl AsyncRead for GrpcStream {
 }
 
 /// Append the 9-byte HTTP/2 frame header to `out`.
-fn push_frame_header(out: &mut Vec<u8>, payload_len: u32, frame_type: u8, flags: u8, stream_id: u32) {
+fn push_frame_header(
+    out: &mut Vec<u8>,
+    payload_len: u32,
+    frame_type: u8,
+    flags: u8,
+    stream_id: u32,
+) {
     out.extend_from_slice(&[
         (payload_len >> 16) as u8,
         (payload_len >> 8) as u8,
@@ -569,8 +575,7 @@ impl GrpcStream {
                     self.peer_initial_window = new;
                 }
                 0x5 => {
-                    self.peer_max_frame =
-                        (value as usize).clamp(H2_DEFAULT_MAX_FRAME, 0xFF_FFFF);
+                    self.peer_max_frame = (value as usize).clamp(H2_DEFAULT_MAX_FRAME, 0xFF_FFFF);
                 }
                 _ => {}
             }
@@ -1119,10 +1124,13 @@ mod tests {
         push_frame_header(&mut grant, 4, H2_WINDOW_UPDATE, 0, 0);
         grant.extend_from_slice(&2048u32.to_be_bytes());
         server_side.write_all(&grant).await.unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(2), stream.write_all(b"hello"))
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stream.write_all(b"hello"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
 
         // Wire order: the SETTINGS ACK the client queued while stalled,
         // then the DATA frame.
