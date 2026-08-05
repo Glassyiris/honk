@@ -49,6 +49,13 @@ impl ModeState {
         self.mode.eq_ignore_ascii_case("direct")
     }
 
+    /// Whether the current mode is `Rule` — the only mode in which the eBPF
+    /// datapath may offload non-`must` `direct` flows, because the mode
+    /// override is the identity there.
+    pub fn is_rule(&self) -> bool {
+        self.mode.eq_ignore_ascii_case("rule")
+    }
+
     /// Whether the current mode is `Global`.
     pub fn is_global(&self) -> bool {
         self.mode.eq_ignore_ascii_case("global")

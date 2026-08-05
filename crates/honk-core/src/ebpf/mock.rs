@@ -174,6 +174,9 @@ pub struct MockEbpfBackend {
     /// Whether TC entry points may redirect traffic into the control plane.
     pub datapath_ready: bool,
     pub listener_sockets_published: bool,
+    /// Every `set_direct_offload` value written (shared so tests can read it
+    /// after the backend is boxed).
+    pub direct_offload_writes: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
     /// Lifecycle counters (shared so tests can read them after the backend is
     /// boxed): detach_hooks must only ever run during shutdown.
     pub detach_calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -510,6 +513,11 @@ impl EbpfBackend for MockEbpfBackend {
             anyhow::bail!("listener socket generation is not fully published");
         }
         self.datapath_ready = ready;
+        Ok(())
+    }
+
+    fn set_direct_offload(&mut self, enabled: bool) -> anyhow::Result<()> {
+        self.direct_offload_writes.lock().unwrap().push(enabled);
         Ok(())
     }
 

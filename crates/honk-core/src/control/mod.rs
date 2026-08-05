@@ -606,6 +606,27 @@ impl ControlPlane {
         self.mode_state = Some(mode_state);
     }
 
+    /// Push the direct-offload flag derived from the current clash mode into
+    /// the eBPF datapath: enabled exactly in `Rule` mode, or when no mode
+    /// state exists at all (clash API disabled → no override ever applies).
+    /// Without the flag, `lan_ingress` redirects every non-`must` `direct`
+    /// flow into userspace so the Global/Direct mode override can re-decide
+    /// it; with it, direct flows pass through the kernel like Go dae.
+    ///
+    /// Called before datapath admission opens in `run()` and re-asserted at
+    /// the reload commit point; runtime mode switches go through the clash
+    /// API's own write (PATCH /configs).
+    pub async fn sync_direct_offload_flag(&self) {
+        let offload = self
+            .mode_state
+            .as_ref()
+            .map(|state| state.read().is_rule())
+            .unwrap_or(true);
+        if let Err(error) = self.ebpf.write().await.set_direct_offload(offload) {
+            warn!(%error, direct_offload = offload, "failed to update eBPF direct-offload flag");
+        }
+    }
+
     pub fn config_handle(&self) -> Arc<RwLock<Config>> {
         self.config.clone()
     }
@@ -1102,6 +1123,7 @@ impl ControlPlane {
             self.background_tasks.lock().await.push(handle);
         }
 
+        self.sync_direct_offload_flag().await;
         {
             let mut ebpf = self.ebpf.write().await;
             ebpf.set_datapath_ready(true)

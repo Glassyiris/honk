@@ -394,6 +394,15 @@ impl EbpfBackend for RealEbpfBackend {
         self.array_set("DATAPATH_STATE_MAP", 0, &u32::from(ready))
     }
 
+    fn set_direct_offload(&mut self, enabled: bool) -> anyhow::Result<()> {
+        let flags = if enabled {
+            DATAPATH_FLAG_OFFLOAD_DIRECT
+        } else {
+            0
+        };
+        self.array_set("DATAPATH_FLAGS_MAP", 0, &flags)
+    }
+
     fn set_param(&mut self, _key: ParamKey, _value: u32) -> anyhow::Result<()> {
         // The Rust eBPF code uses Global<DaeParam> instead of PARAM_MAP.
         // All parameters are set via inject() which writes to the global.

@@ -60,6 +60,8 @@ struct TestApp {
     state: Arc<ClashState>,
     log_dispatch: tracing::Dispatch,
     db_path: std::path::PathBuf,
+    /// Every `set_direct_offload` value the mock backend received.
+    ebpf_direct_offload_writes: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
     _tmp: tempfile::TempDir,
 }
 
@@ -155,6 +157,9 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
     let traffic_router =
         honk_core::routing::Router::new(&config.routing.rules, &config.routing.default_outbound)
             .unwrap();
+    let ebpf_direct_offload_writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut mock_ebpf = honk_core::ebpf::mock::MockEbpfBackend::new();
+    mock_ebpf.direct_offload_writes = ebpf_direct_offload_writes.clone();
     let state = Arc::new(ClashState {
         config: Arc::new(tokio::sync::RwLock::new(config)),
         stats: stats.clone(),
@@ -165,6 +170,9 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
         proxy_registry: Arc::new(ProxyRegistry::default_resolver().unwrap()),
         runtime_registry,
         mode_state: Arc::new(parking_lot::RwLock::new(ModeState::new("Rule", "proxy"))),
+        ebpf: Arc::new(tokio::sync::RwLock::new(
+            Box::new(mock_ebpf) as Box<dyn honk_core::ebpf::EbpfBackend>
+        )),
         secret: secret.to_string(),
         external_ui: external_ui.to_string(),
         router: Arc::new(tokio::sync::RwLock::new(traffic_router)),
@@ -190,6 +198,7 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
         state,
         log_dispatch,
         db_path,
+        ebpf_direct_offload_writes,
         _tmp: tmp,
     }
 }
@@ -548,6 +557,40 @@ async fn test_global_selection_and_mode_persisted() {
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+/// A mode switch over PATCH /configs flips the eBPF direct-offload flag:
+/// Rule offloads non-must direct flows in the kernel, Global/Direct keep
+/// them on the control-plane path so the mode override can re-decide them.
+#[tokio::test]
+async fn test_mode_switch_updates_direct_offload_flag() {
+    let app = spawn_app("", "").await;
+    let client = http_client();
+
+    let writes = || app.ebpf_direct_offload_writes.lock().unwrap().clone();
+    assert_eq!(writes(), Vec::<bool>::new());
+
+    for (mode, expect_offload) in [("global", false), ("direct", false), ("rule", true)] {
+        let resp = client
+            .patch(app.url("/configs"))
+            .json(&serde_json::json!({"mode": mode}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204);
+        assert_eq!(writes().last().copied(), Some(expect_offload));
+    }
+    assert_eq!(writes(), vec![false, false, true]);
+
+    // An invalid mode must not touch the datapath flag.
+    let resp = client
+        .patch(app.url("/configs"))
+        .json(&serde_json::json!({"mode": "bogus"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    assert_eq!(writes(), vec![false, false, true]);
 }
 
 #[tokio::test]
@@ -1147,6 +1190,7 @@ async fn test_dns_query_upstream_and_nxdomain() {
         proxy_registry: app.state.proxy_registry.clone(),
         runtime_registry: app.state.runtime_registry.clone(),
         mode_state: app.state.mode_state.clone(),
+        ebpf: app.state.ebpf.clone(),
         secret: String::new(),
         external_ui: String::new(),
         router: app.state.router.clone(),

@@ -294,7 +294,13 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
 
         let must = unsafe { tcp_state.meta.data.must };
 
-        if outbound == OUTBOUND_DIRECT && must != 0 {
+        // Port 53 is exempt: the DNS fast path publishes a direct/non-must
+        // meta for TCP DNS and redirects the SYN to the control plane, so
+        // offloading the follow-up packets here would split the connection.
+        if outbound == OUTBOUND_DIRECT
+            && (must != 0 || crate::maps::direct_offload_enabled())
+            && pkt.tuples.five.dst_port != 53
+        {
             crate::stats::count_tx(ctx, outbound);
             ctx.skb.set_mark(mark | CLASSIFIED_MARK);
             return Err(TC_ACT_OK);
@@ -376,7 +382,9 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
 
                     let must = unsafe { udp_s.meta.data.must };
 
-                    if outbound == OUTBOUND_DIRECT && must != 0 {
+                    if outbound == OUTBOUND_DIRECT
+                        && (must != 0 || crate::maps::direct_offload_enabled())
+                    {
                         crate::stats::count_tx(ctx, outbound);
                         ctx.skb.set_mark(mark | CLASSIFIED_MARK);
                         return Err(TC_ACT_OK);
@@ -647,7 +655,10 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
 
     // Fail-closed for TCP when the conn state map is full.
     if pkt.l4proto == IPPROTO_TCP && tcp_state.is_none() {
-        if outbound == OUTBOUND_DIRECT && must != 0 && mark == 0 {
+        if outbound == OUTBOUND_DIRECT
+            && (must != 0 || crate::maps::direct_offload_enabled())
+            && mark == 0
+        {
             ctx.skb.set_mark(mark | CLASSIFIED_MARK);
             return Err(TC_ACT_OK);
         }
@@ -661,19 +672,20 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         return Err(TC_ACT_SHOT);
     }
 
-    if outbound == OUTBOUND_DIRECT && must != 0 {
+    if outbound == OUTBOUND_DIRECT && (must != 0 || crate::maps::direct_offload_enabled()) {
         if PARAM.load().padding2 & 1 != 0 {
-            info!(ctx, target: "honk", "direct(must) path");
+            info!(ctx, target: "honk", "direct offload path");
         }
         crate::stats::count_tx(ctx, outbound);
         ctx.skb.set_mark(mark | CLASSIFIED_MARK);
         return Err(TC_ACT_OK);
     }
     if outbound == OUTBOUND_DIRECT {
-        // No must → domain-based or uncertain routing.
-        // Redirect to control plane for SNI sniffing and final routing.
+        // Non-must direct with offload disabled (clash Global/Direct mode):
+        // redirect to the control plane so the mode override — and the
+        // SNI-sniffed re-route — can re-decide the flow in userspace.
         if PARAM.load().padding2 & 1 != 0 {
-            info!(ctx, target: "honk", "direct(no must) → control plane");
+            info!(ctx, target: "honk", "direct(no must, offload off) → control plane");
         }
         return redirect_lan_packet_to_control_plane(
             ctx,

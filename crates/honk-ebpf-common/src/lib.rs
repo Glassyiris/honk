@@ -307,6 +307,20 @@ pub struct PidPname {
     pub pname: [u8; 16],
 }
 
+/// Bit 0 of the single-slot `DATAPATH_FLAGS_MAP` array, written by userspace
+/// at runtime (unlike `DaeParam`, which is fixed at load time).
+///
+/// Set exactly when the control plane's effective clash mode is `Rule` —
+/// including "clash API disabled", where no mode override ever applies — so
+/// `lan_ingress` may pass non-`must` `direct` flows straight through the
+/// kernel like Go dae instead of redirecting them into userspace.  Global/
+/// Direct modes clear the bit so every non-must flow still reaches the
+/// control plane, where the mode override can re-decide it.  Offloaded flows
+/// skip userspace relay entirely: no connection-tracker entry and no
+/// SNI-based re-route (Go dae parity), with tx stats still counted at
+/// `lan_ingress`.
+pub const DATAPATH_FLAG_OFFLOAD_DIRECT: u32 = 1 << 0;
+
 /// Parameter keys for the `params` BPF array map.
 /// Used by honk-core to configure eBPF program behaviour at runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

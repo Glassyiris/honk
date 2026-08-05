@@ -171,6 +171,16 @@ pub trait EbpfBackend: Send + Sync {
         Ok(())
     }
 
+    /// Enable or disable kernel offload of non-`must` `direct` flows in
+    /// `lan_ingress` (the `DATAPATH_FLAG_OFFLOAD_DIRECT` bit).  The control
+    /// plane enables this exactly when the effective clash mode is `Rule` —
+    /// or when no clash API/mode override exists at all; Global/Direct modes
+    /// must keep every non-must flow on the control-plane path so the mode
+    /// override can re-decide it.
+    fn set_direct_offload(&mut self, _enabled: bool) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Attach the dae0peer_ingress TC program after dae0peer has been moved
     /// into the isolated daens namespace.  The attach runs inside a scoped
     /// `with_daens_netns` switch — the process threads always stay in the

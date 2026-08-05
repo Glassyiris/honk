@@ -89,6 +89,10 @@ pub struct ClashState {
     /// Shared clash mode + GLOBAL selection (also held by the control
     /// plane, which applies the mode override on the outbound path).
     pub mode_state: SharedModeState,
+    /// Shared eBPF backend; a mode switch flips the datapath's
+    /// direct-offload flag (Rule offloads non-must direct flows in the
+    /// kernel, Global/Direct keep them on the control-plane path).
+    pub ebpf: Arc<tokio::sync::RwLock<Box<dyn crate::ebpf::EbpfBackend>>>,
     /// Bearer secret from `experimental.clash_api.secret`; empty = no auth.
     pub secret: String,
     /// Shared connection pool (ready-pool hit/miss metrics in `/stats`).
@@ -350,6 +354,13 @@ async fn patch_configs(State(s): State<Arc<ClashState>>, body: Bytes) -> Respons
         s.mode_state.write().mode = mode.clone();
         if let Some(ref db) = s.cache_db {
             db.save_clash_mode(&mode);
+        }
+        // A failed write leaves the datapath out of sync with the mode: in
+        // Global/Direct the kernel would keep offloading direct flows past
+        // the mode override, so log at error level (the userspace mode still
+        // applies to every flow that does reach the control plane).
+        if let Err(error) = s.ebpf.write().await.set_direct_offload(mode == "Rule") {
+            tracing::error!(%error, mode = %mode, "failed to update eBPF direct-offload flag");
         }
         tracing::info!("clash mode updated: {}", mode);
     }

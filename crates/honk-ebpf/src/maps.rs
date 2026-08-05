@@ -68,6 +68,20 @@ pub fn datapath_ready() -> bool {
     DATAPATH_STATE_MAP.get(0).is_some_and(|ready| *ready != 0)
 }
 
+/// Runtime datapath flags written by userspace; see
+/// `DATAPATH_FLAG_OFFLOAD_DIRECT` in honk-ebpf-common.
+#[btf_map]
+pub static DATAPATH_FLAGS_MAP: Array<u32, 1, 0> = Array::new();
+
+/// Whether non-`must` `direct` flows may be passed through in the kernel
+/// (clash Rule mode / no mode override) instead of redirected to userspace.
+#[inline(always)]
+pub fn direct_offload_enabled() -> bool {
+    DATAPATH_FLAGS_MAP
+        .get(0)
+        .is_some_and(|flags| *flags & honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_DIRECT != 0)
+}
+
 #[btf_map]
 /// Plain hash with BPF_F_NO_PREALLOC: kernel memory scales with live
 /// entries instead of locking max_entries up front (~8 MB empty instead of

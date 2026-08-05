@@ -96,7 +96,8 @@ flowchart TB
 2. DNS to port 53 takes a **fast path** (skip expensive match loop) and is redirected to the control plane.
 3. Outcomes:
    - `direct + must` → leave on host stack (no redirect).
-   - `direct` without must / user outbound / block / control-plane routing → redirect into `dae0` when the outbound is considered alive.
+   - `direct` without must → also left on the host stack when the direct-offload flag is set (`DATAPATH_FLAGS_MAP` bit 0 — exactly in clash `Rule` mode or with the clash API disabled); in `Global`/`Direct` mode it redirects into `dae0` so the userspace mode override can re-decide it.
+   - user outbound / block / control-plane routing → redirect into `dae0` when the outbound is considered alive.
 4. In **daens**, `sk_lookup` assigns the flow to transparent TCP/UDP listeners.
 5. **Userspace** takes the routing handoff, optionally sniffs domain, falls back to the full `Router`, applies Clash mode override, selects a group leaf, dials, and relays.
 6. Dial/probe/DNS-upstream sockets use **`DAE_BYPASS_MARK` (`0x100`)** so eBPF does not re-proxy control-plane traffic.
@@ -138,6 +139,7 @@ therefore never redirect a flow into a missing listener slot.
 | `OUTBOUND_STATS` | Per-CPU tx/rx packets/bytes per outbound |
 | `LISTEN_SOCKET_MAP` | SockMap of transparent listeners |
 | `DATAPATH_STATE_MAP` | Admission gate opened only after the complete listener generation is published |
+| `DATAPATH_FLAGS_MAP` | Runtime flags written by userspace; bit 0 offloads non-`must` `direct` flows in the kernel (clash `Rule` mode / clash API disabled) |
 | `EVENT_RINGBUF` | Overflow events drained to tracing |
 
 ### Reserved outbound indices
@@ -153,7 +155,7 @@ Aligned with dae-core:
 
 - **At SYN time**, pure domain rules often cannot match without a prior DNS learn or userspace sniff.
 - DNS answers update `DOMAIN_ROUTING_MAP` so subsequent TCP can match in eBPF.
-- `direct` without `must` is intentionally sent to userspace so SNI/HTTP Host can refine the route (dae-like).
+- `direct` without `must` reaches userspace only while the clash mode is `Global`/`Direct` (the mode override must be able to re-decide it). In `Rule` mode — or with the clash API disabled — it is offloaded in the kernel exactly like `must` direct (Go dae parity): no userspace relay, no `/connections` entry, and no SNI-based re-route; tx stats are still counted at `lan_ingress`. Userspace writes the flag on startup (cachedb-restored mode), on every PATCH `/configs` mode switch, and re-asserts it after each reload.
 - TCP SNI/HTTP Host and QUIC Initial SNI both re-run the userspace Router for non-`must`, non-`block` handoffs in domain-aware modes.
 
 ## 7. Userspace control plane
