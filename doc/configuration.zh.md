@@ -150,13 +150,25 @@ experimental {
 
 | 主题 | 关键字段 | 建议 |
 | ------ | ---------- | ------ |
-| 拦截网卡 | `lan_interface`、`wan_interface` | LAN 为空则不拦截 LAN。`auto` 解析默认路由网卡 |
+| 拦截网卡 | `lan_interface`、`wan_interface` | 省略 LAN 时不安装任何 LAN hook；已配置的 WAN hook 仍代理本机发起的 TCP/UDP。`auto` 解析默认路由网卡 |
 | 监听 | `tproxy_port` | 默认 `12345`；`tproxy_mark`（默认 `0x08000000`）在 dae 语法中不可设置 |
 | 内核 | `auto_config_kernel_parameter` | 需 root；自动设置有用的 sysctl |
 | 健康检查 | `tcp_check_url`、`udp_check_dns`、`check_interval`、`check_tolerance` | 驱动 AliveDialerSet / URLTest；时长写作 `30s` / `50ms` |
 | 拨号 | `dial_mode` | `ip` / `domain` / `domain+` / `domain++` |
 | 解析 | `bootstrap_resolver`、`fallback_resolver` | 解析节点域名时避免自拦截死锁 |
 | 超时 | `connect_timeout_ms`、`dns_resolve_timeout_ms`、`relay_idle_timeout_secs` | dae 语法暂不解析这些字段，使用内置默认值 |
+
+**仅代理本机流量：** 主机没有需要拦截的下游 LAN 流量时，省略 `lan_interface`：
+
+```dae
+global {
+    wan_interface: ens3
+    dial_mode: ip
+}
+```
+
+此模式只安装 WAN ingress/egress hook。本机创建并经 `ens3` 发出的 TCP/UDP 会进入 honk；转发的 LAN 流量和 loopback 流量不受影响。不要把 `lo` 当作虚拟 LAN 接口加入配置。
+
 
 **拨号模式：**
 

@@ -35,6 +35,21 @@ global {
     }
 
     #[test]
+    fn test_parse_wan_only_global() {
+        let input = r#"
+global {
+    wan_interface: ens3
+    dial_mode: ip
+}
+"#;
+        let config = parse_dae_config(input).unwrap();
+        assert!(config.global.lan_interface.is_empty());
+        let explicitly_empty = parse_dae_config("global {\n    lan_interface:\n}").unwrap();
+        assert!(explicitly_empty.global.lan_interface.is_empty());
+        assert_eq!(config.global.wan_interface, vec!["ens3"]);
+    }
+
+    #[test]
     fn test_parse_dns_upstream() {
         let input = r#"
 dns {

@@ -629,10 +629,20 @@ fn parse_global_section(section: &Section) -> Result<GlobalConfig, crate::Config
         cfg.disable_waiting_network = parse_bool(v);
     }
     if let Some(v) = kv.get("lan_interface") {
-        cfg.lan_interface = v.split(',').map(|s| s.trim().to_string()).collect();
+        cfg.lan_interface = v
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect();
     }
     if let Some(v) = kv.get("wan_interface") {
-        cfg.wan_interface = v.split(',').map(|s| s.trim().to_string()).collect();
+        cfg.wan_interface = v
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect();
     }
     if let Some(v) = kv.get("auto_config_kernel_parameter") {
         cfg.auto_config_kernel_parameter = parse_bool(v);

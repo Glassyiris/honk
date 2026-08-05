@@ -92,7 +92,7 @@ flowchart TB
 
 ### Packet walk (simplified)
 
-1. **TC ingress** on `lan_interface` (L2 or L3 by interface type) parses the packet and runs the eBPF route loop.
+1. **TC ingress** on each `lan_interface` classifies forwarded client traffic; independently, **TC egress** on each `wan_interface` classifies host-originated TCP/UDP. Omitting `lan_interface` installs only the WAN path.
 2. DNS to port 53 takes a **fast path** (skip expensive match loop) and is redirected to the control plane.
 3. Outcomes:
    - `direct + must` → leave on host stack (no redirect).

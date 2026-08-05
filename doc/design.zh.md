@@ -92,7 +92,7 @@ flowchart TB
 
 ### 报文路径（简）
 
-1. 在 `lan_interface` 上的 **TC ingress**（按接口类型选 L2/L3）解析报文并跑 eBPF 路由环。
+1. 每个 `lan_interface` 上的 **TC ingress** 负责分类转发的客户端流量；每个 `wan_interface` 上的 **TC egress** 独立分类本机发起的 TCP/UDP。省略 `lan_interface` 时只安装 WAN 路径。
 2. 目的端口 53 的 DNS 走**快路径**（跳过昂贵 match 环），重定向到控制面。
 3. 结果：
    - `direct + must` → 留在主机协议栈（不 redirect）。

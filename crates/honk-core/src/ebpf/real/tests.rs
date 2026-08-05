@@ -56,7 +56,7 @@ async fn link_lifecycle_held_until_detach_hooks() {
         &pin_root,
         12345,
         0x0800_0000,
-        "lo",
+        Some("lo"),
         "",
         true,
     )

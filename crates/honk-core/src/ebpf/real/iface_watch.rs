@@ -1,7 +1,7 @@
 //! RTMGRP_LINK watcher: attaches TC programs to configured interfaces that
 //! appear after startup (USB NICs, container veths, late-renamed links),
-//! and re-expands bridge/bond slaves of configured LAN masters on every
-//! reconcile so containers added later are covered too.
+//! re-expands LAN bridge/bond slaves, and follows WAN bond slaves so newly
+//! added physical egress paths receive the matching hooks.
 
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -192,6 +192,10 @@ async fn reconcile(
             ingress: true,
             egress: !single_homed,
         },
+        IfaceRole::WanBondSlave => DynamicHooks {
+            ingress: false,
+            egress: true,
+        },
         _ => DynamicHooks {
             ingress: true,
             egress: true,
@@ -236,26 +240,14 @@ async fn reconcile(
 }
 
 /// The configured interface set with roles, mirroring the startup logic in
-/// `run()`: LAN entries win over WAN for the same name (single-homed), and
-/// `auto`/empty resolve to the default-route interface.
+/// `run()`: LAN entries win over WAN for the same name (single-homed), while
+/// an empty LAN list installs no LAN hooks.
 fn desired_interfaces(config: &honk_config::Config) -> (HashMap<String, IfaceRole>, bool) {
-    let lan: Vec<String> = if config.global.lan_interface.is_empty() {
-        vec!["lo".to_string()]
-    } else {
-        config
-            .global
-            .lan_interface
-            .iter()
-            .map(|s| crate::resolve_interface(s))
-            .collect()
-    };
-    let wan: Vec<String> = config
-        .global
-        .wan_interface
-        .iter()
-        .map(|s| crate::resolve_interface(s))
-        .collect();
-    let single_homed = !wan.is_empty() && lan.iter().any(|l| wan.contains(l));
+    let crate::ConfiguredInterfaces {
+        lan,
+        wan,
+        single_homed,
+    } = crate::configured_interfaces(config);
     let mut desired = HashMap::new();
     for w in &wan {
         if !lan.contains(w) {
@@ -274,6 +266,13 @@ fn desired_interfaces(config: &honk_config::Config) -> (HashMap<String, IfaceRol
         }
         for slave in super::RealEbpfBackend::bond_slaves(master) {
             desired.entry(slave).or_insert(IfaceRole::LanBondSlave);
+        }
+    }
+    // A bond may emit host traffic directly on a slave. Re-expand membership
+    // so WAN-only mode keeps intercepting slaves added after startup.
+    for master in &wan {
+        for slave in super::RealEbpfBackend::bond_slaves(master) {
+            desired.entry(slave).or_insert(IfaceRole::WanBondSlave);
         }
     }
     (desired, single_homed)
@@ -299,6 +298,19 @@ mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
 
+    #[test]
+    fn wan_only_configuration_does_not_synthesize_loopback_lan() {
+        let mut config = honk_config::Config::default();
+        config.global.wan_interface = vec!["wan0".to_string()];
+
+        let (desired, single_homed) = desired_interfaces(&config);
+
+        assert!(!single_homed);
+        assert_eq!(desired.len(), 1);
+        assert_eq!(desired.get("wan0"), Some(&IfaceRole::Wan));
+        assert!(!desired.contains_key("lo"));
+    }
+
     /// Reconcile attaches an interface's hooks exactly once and never
     /// detaches: hook removal belongs to shutdown alone, a periodic
     /// reconcile must not tear down the datapath.
@@ -308,12 +320,14 @@ mod tests {
         let attach = backend.dynamic_attach_calls.clone();
         let detach = backend.detach_calls.clone();
         let ebpf: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(backend)));
-        let config = Arc::new(RwLock::new(honk_config::Config::default()));
+        let mut config = honk_config::Config::default();
+        config.global.lan_interface = vec!["lo".to_string()];
+        let config = Arc::new(RwLock::new(config));
         let mut attached = AttachedMap::new();
 
         reconcile(&ebpf, &config, &mut attached).await;
         let first = attach.load(Ordering::Relaxed);
-        assert!(first >= 1, "first reconcile attaches the configured lo");
+        assert!(first >= 1, "first reconcile attaches the configured LAN");
         assert_eq!(detach.load(Ordering::Relaxed), 0);
 
         reconcile(&ebpf, &config, &mut attached).await;

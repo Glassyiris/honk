@@ -368,6 +368,13 @@ impl EbpfBackend for RealEbpfBackend {
                     egress: true,
                 })
             }
+            super::IfaceRole::WanBondSlave => {
+                self.attach_wan_egress(ifname)?;
+                Ok(super::DynamicHooks {
+                    ingress: false,
+                    egress: true,
+                })
+            }
             super::IfaceRole::LanBridgeSlave | super::IfaceRole::LanBondSlave => {
                 self.attach_slave(ifname, role)
             }

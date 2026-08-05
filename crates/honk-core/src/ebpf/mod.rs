@@ -114,6 +114,9 @@ pub enum IfaceRole {
     /// the slave without touching the master's qdiscs, so it gets
     /// lan_ingress + wan_egress (mirrors the startup expansion).
     LanBondSlave,
+    /// Slave of a WAN bond master: locally-originated traffic can bypass the
+    /// master's egress qdisc, so only wan_egress belongs on this interface.
+    WanBondSlave,
 }
 
 /// Per-direction outcome of a dynamic attach: which hooks are live on the

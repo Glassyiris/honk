@@ -167,12 +167,24 @@ All of these live in the `global { ... }` section:
 
 | Topic | Key fields | Guidance |
 | ------- | ------------ | ---------- |
-| Intercept | `lan_interface`, `wan_interface` | Empty LAN list = no LAN intercept. `auto` resolves default-route iface (dae). |
+| Intercept | `lan_interface`, `wan_interface` | Omit LAN to install no LAN hooks; configured WAN hooks still proxy host-originated TCP/UDP. `auto` resolves the default-route iface. |
 | Listen | `tproxy_port` | Default `12345`; the TPROXY traffic mark defaults to `0x08000000`. |
 | Kernel | `auto_config_kernel_parameter` | Needs root; enables helpful sysctls |
 | Health | `tcp_check_url`, `udp_check_dns`, `check_interval`, `check_tolerance` | Drives AliveDialerSet / URLTest. Durations: `check_interval: 30s`, `check_tolerance: 50ms`. |
 | Dial | `dial_mode` | `ip` / `domain` / `domain+` / `domain++` |
 | Resolve | `bootstrap_resolver`, `fallback_resolver` | Avoid self-intercept when resolving node hostnames |
+
+
+**WAN-only host proxy:** omit `lan_interface` when the machine has no downstream LAN traffic to intercept:
+
+```dae
+global {
+    wan_interface: ens3
+    dial_mode: ip
+}
+```
+
+This installs only the WAN ingress/egress hooks. TCP and UDP created by the host and leaving `ens3` are routed through honk; forwarded LAN and loopback traffic are untouched. Do not add `lo` as a synthetic LAN interface.
 
 **Dial modes:**
 
