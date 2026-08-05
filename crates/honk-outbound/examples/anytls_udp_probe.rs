@@ -2,7 +2,10 @@
 //! UDP relay after sending a probe DNS query — for debugging UoT framing
 //! against third-party servers.
 //!
-//! Usage: anytls_udp_probe <share-link> [dns-server-addr]
+//! Usage: anytls_udp_probe <share-link> [dns-server-addr] [payload-bytes]
+//! With `payload-bytes` the probe sends a zero-filled datagram of that
+//! size instead (point it at a UDP echo server) to exercise datagram
+//! fragmentation/reassembly beyond a single QUIC datagram.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -17,6 +20,7 @@ async fn main() -> anyhow::Result<()> {
         .nth(2)
         .unwrap_or_else(|| "8.8.8.8:53".to_string())
         .parse()?;
+    let payload_bytes: Option<usize> = std::env::args().nth(3).and_then(|v| v.parse().ok());
 
     let node = Node::from_share_link(&link)?;
     let registry = ProxyRegistry::default_resolver()?;
@@ -34,11 +38,14 @@ async fn main() -> anyhow::Result<()> {
         query.extend_from_slice(label.as_bytes());
     }
     query.extend_from_slice(&[0x00, 0x00, 0x01, 0x00, 0x01]);
+    if let Some(n) = payload_bytes {
+        query = vec![0xAB; n];
+    }
 
     transport.send_packet(&query).await?;
     println!("sent {} bytes via {}", query.len(), transport.relay_addr());
 
-    let mut buf = [0u8; 2048];
+    let mut buf = vec![0u8; 65536];
     for i in 0..3 {
         match tokio::time::timeout(Duration::from_secs(5), transport.recv_packet(&mut buf)).await {
             Ok(Ok((n, src))) => {
