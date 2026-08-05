@@ -13,6 +13,7 @@ struct HandoffResult {
     dscp: u8,
     mac: [u8; 6],
     pname: [u8; 16],
+    pid: u32,
 }
 
 impl HandoffResult {
@@ -28,6 +29,24 @@ impl HandoffResult {
         } else {
             Some(trimmed.to_string())
         }
+    }
+
+    /// Resolve the process executable path from /proc. The process may have
+    /// exited between the cgroup hook and now — any failure just omits the
+    /// field. Off the runtime workers: even a /proc readlink is blocking I/O.
+    async fn process_path(&self) -> Option<String> {
+        if self.pid == 0 {
+            return None;
+        }
+        let pid = self.pid;
+        tokio::task::spawn_blocking(move || {
+            std::fs::read_link(format!("/proc/{pid}/exe"))
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// Convert the eBPF MAC address to canonical lower-case colon form.
@@ -175,6 +194,7 @@ impl ControlPlaneHandle {
             dscp: entry.result.dscp,
             mac: entry.result.mac,
             pname: entry.result.pname,
+            pid: entry.result.pid,
         })
     }
 
@@ -955,6 +975,10 @@ impl ControlPlaneHandle {
         // single close-time (never-visible) update.
         let conn_upload = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let conn_download = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let process_path = match &handoff {
+            Some(ho) => ho.process_path().await,
+            None => None,
+        };
         self.connection_tracker
             .register(crate::connection_tracker::ConnectionEntry {
                 id: conn_id.clone(),
@@ -969,6 +993,8 @@ impl ControlPlaneHandle {
                 start_time: std::time::Instant::now(),
                 domain: target_domain.clone(),
                 network: "tcp".to_string(),
+                process: handoff.as_ref().and_then(|ho| ho.process_name()),
+                process_path,
             });
 
         debug!(
@@ -1579,6 +1605,10 @@ impl ControlPlaneHandle {
             chain
         };
         let (conn_upload, conn_download) = endpoint.byte_counters();
+        let process_path = match &handoff {
+            Some(ho) => ho.process_path().await,
+            None => None,
+        };
         self.connection_tracker
             .register(crate::connection_tracker::ConnectionEntry {
                 id: conn_id.clone(),
@@ -1593,6 +1623,8 @@ impl ControlPlaneHandle {
                 start_time: std::time::Instant::now(),
                 domain: quic_domain.clone(),
                 network: "udp".to_string(),
+                process: handoff.as_ref().and_then(|ho| ho.process_name()),
+                process_path,
             });
         endpoint.set_tracker(conn_id.clone());
         if !lease.set_tracker_id(conn_id.clone()) {
@@ -1790,6 +1822,7 @@ mod sniffed_domain_routing_tests {
             dscp: 0,
             mac: [0; 6],
             pname: [0; 16],
+            pid: 0,
         }
     }
 
@@ -1832,6 +1865,22 @@ mod sniffed_domain_routing_tests {
             Some("www.youtube.com"),
             Some(&handoff(OutboundIndex::UserBase as u8, 1))
         ));
+    }
+
+    #[tokio::test]
+    async fn handoff_process_fields_decode_and_fail_closed() {
+        let mut ho = handoff(OutboundIndex::UserBase as u8, 0);
+        assert_eq!(ho.process_name(), None, "zeroed pname means no process");
+        assert_eq!(ho.process_path().await, None, "pid 0 means no process");
+
+        ho.pname[..4].copy_from_slice(b"curl");
+        assert_eq!(ho.process_name().as_deref(), Some("curl"));
+
+        ho.pid = std::process::id();
+        assert!(ho.process_path().await.is_some());
+        // A dead/invalid pid just omits the path instead of erroring.
+        ho.pid = u32::MAX;
+        assert_eq!(ho.process_path().await, None);
     }
 }
 

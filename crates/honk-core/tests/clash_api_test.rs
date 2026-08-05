@@ -551,7 +551,8 @@ async fn test_connections_snapshot_and_delete() {
     let app = spawn_app("", "").await;
     let client = http_client();
 
-    // Inject one tracked connection.
+    // Inject one tracked connection with process attribution (as the eBPF
+    // handoff provides for locally-originated flows).
     let id = app.state.connection_tracker.register(ConnectionEntry {
         id: "conn-1".into(),
         source: "10.0.0.2:12345".into(),
@@ -565,6 +566,25 @@ async fn test_connections_snapshot_and_delete() {
         start_time: Instant::now(),
         domain: Some("example.com".into()),
         network: "tcp".into(),
+        process: Some("curl".into()),
+        process_path: Some("/usr/bin/curl".into()),
+    });
+    // A LAN-forwarded flow carries no process attribution.
+    app.state.connection_tracker.register(ConnectionEntry {
+        id: "conn-2".into(),
+        source: "192.168.1.10:4321".into(),
+        destination: "1.1.1.1:443".into(),
+        proxy: "proxy".into(),
+        rule: "Match".into(),
+        rule_payload: String::new(),
+        chains: vec!["node-a".into(), "proxy".into()],
+        upload: std::sync::Arc::new(AtomicU64::new(0)),
+        download: std::sync::Arc::new(AtomicU64::new(0)),
+        start_time: Instant::now(),
+        domain: None,
+        network: "udp".into(),
+        process: None,
+        process_path: None,
     });
 
     let body: serde_json::Value = client
@@ -576,13 +596,14 @@ async fn test_connections_snapshot_and_delete() {
         .await
         .unwrap();
     let conns = body["connections"].as_array().unwrap();
-    assert_eq!(conns.len(), 1);
-    let c = &conns[0];
-    assert_eq!(c["id"], id);
+    assert_eq!(conns.len(), 2);
+    let c = conns.iter().find(|c| c["id"] == id).unwrap();
     assert_eq!(c["metadata"]["sourceIP"], "10.0.0.2");
     assert_eq!(c["metadata"]["destinationIP"], "142.250.72.14");
     assert_eq!(c["metadata"]["sourcePort"], "12345");
     assert_eq!(c["metadata"]["host"], "example.com");
+    assert_eq!(c["metadata"]["process"], "curl");
+    assert_eq!(c["metadata"]["processPath"], "/usr/bin/curl");
     assert_eq!(c["upload"], 100);
     assert_eq!(c["download"], 200);
     assert_eq!(c["rule"], "suffix");
@@ -595,6 +616,10 @@ async fn test_connections_snapshot_and_delete() {
     // RFC3339 start timestamp.
     let start = c["start"].as_str().unwrap();
     assert!(chrono::DateTime::parse_from_rfc3339(start).is_ok());
+    // A flow without process attribution omits both process keys entirely.
+    let c2 = conns.iter().find(|c| c["id"] == "conn-2").unwrap();
+    assert!(c2["metadata"].get("process").is_none());
+    assert!(c2["metadata"].get("processPath").is_none());
     assert_eq!(body["uploadTotal"], 100);
     assert_eq!(body["downloadTotal"], 200);
 
@@ -613,7 +638,9 @@ async fn test_connections_snapshot_and_delete() {
         .json()
         .await
         .unwrap();
-    assert_eq!(body["connections"].as_array().unwrap().len(), 0);
+    let remaining = body["connections"].as_array().unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0]["id"], "conn-2");
 }
 
 /// Plaintext HTTP server answering 204 to everything.
@@ -987,6 +1014,8 @@ async fn test_connections_ws_stream() {
         start_time: Instant::now(),
         domain: None,
         network: "tcp".into(),
+        process: None,
+        process_path: None,
     });
 
     let ws_url = format!("ws://{}/connections?interval=200", app.addr);
