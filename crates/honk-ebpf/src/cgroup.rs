@@ -12,7 +12,10 @@ use aya_ebpf_bindings::helpers::{
 use core::mem;
 use honk_ebpf_common::{conn::BpfStatsKey, redirect_need::PIDName};
 
-use crate::maps::{COOKIE_PID_MAP, increment_bpf_stat};
+use crate::{
+    contrack::AUXILIARY_MAP_REFRESH_INTERVAL_NS,
+    maps::{COOKIE_PID_MAP, increment_bpf_stat},
+};
 
 /// Cgroup program verdict: allow the operation.
 const CGROUP_ALLOW: i32 = 1;
@@ -44,11 +47,11 @@ fn update_map_elem_by_cookie(cookie: u64) -> i32 {
         return 0;
     }
 
-    if COOKIE_PID_MAP.get_ptr_mut(cookie).is_some() {
-        if let Some(ptr) = COOKIE_PID_MAP.get_ptr_mut(cookie) {
-            unsafe {
-                (*ptr).last_seen_ns = bpf_ktime_get_ns();
-            }
+    if let Some(ptr) = COOKIE_PID_MAP.get_ptr_mut(cookie) {
+        let now = unsafe { bpf_ktime_get_ns() };
+        let entry = unsafe { &mut *ptr };
+        if now.wrapping_sub(entry.last_seen_ns) >= AUXILIARY_MAP_REFRESH_INTERVAL_NS {
+            entry.last_seen_ns = now;
         }
         return 0;
     }

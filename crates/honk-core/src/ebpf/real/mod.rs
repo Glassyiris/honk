@@ -427,14 +427,28 @@ impl EbpfBackend for RealEbpfBackend {
         count: u32,
         group_bitmaps: &RoutingGroupBitmaps,
     ) -> anyhow::Result<()> {
-        let base = routing_meta_generation_base(generation);
-        let mut values = Vec::with_capacity(ROUTING_META_GENERATION_STRIDE);
-        values.push(count);
-        for words in group_bitmaps {
-            values.extend_from_slice(words);
+        for (group, words) in group_bitmaps.iter().enumerate() {
+            for (word, value) in words.iter().enumerate() {
+                let slot = routing_meta_bitmap_base(generation)
+                    + (group * ROUTING_GROUP_BITMAP_WORDS + word) as u32;
+                self.array_set("ROUTING_META_MAP", slot, value)?;
+            }
         }
-        for (offset, value) in values.iter().enumerate() {
-            self.array_set("ROUTING_META_MAP", base + offset as u32, value)?;
+        self.array_set(
+            "ROUTING_META_MAP",
+            routing_meta_count_slot(generation),
+            &count,
+        )?;
+        for (group, bitmap) in group_bitmaps.iter().enumerate() {
+            let meta = RoutingGroupMeta {
+                rule_count: count,
+                bitmap: *bitmap,
+            };
+            self.array_set(
+                "ROUTING_GROUP_META_MAP",
+                routing_group_meta_index(generation, group as u32),
+                &meta,
+            )?;
         }
         self.array_set(
             "ROUTING_META_MAP",
@@ -644,6 +658,9 @@ impl EbpfBackend for RealEbpfBackend {
         for i in 0..ROUTING_META_MAP_LEN as u32 {
             let _ = self.array_set("ROUTING_META_MAP", i, &0u32);
         }
+        for i in 0..ROUTING_GROUP_META_MAP_LEN as u32 {
+            let _ = self.array_set("ROUTING_GROUP_META_MAP", i, &RoutingGroupMeta::default());
+        }
         // DOMAIN_ROUTING_MAP is HashMap<[__be32; 4], DomainRouting>: the key
         // is the 16-byte IP data alone, NOT the 20-byte LpmKey.
         for kb in self
@@ -669,36 +686,11 @@ impl EbpfBackend for RealEbpfBackend {
         Ok(())
     }
 
-    fn clear_routing_map_tail(&mut self, start: u32) -> anyhow::Result<()> {
-        let count = MAX_MATCH_SET_LEN.saturating_sub(start);
-        if count == 0 {
-            return Ok(());
-        }
-        // Single BPF_MAP_UPDATE_BATCH zeroing the tail when supported.
-        let keys: Vec<u32> = (start..MAX_MATCH_SET_LEN).collect();
-        let zeros = vec![MatchSet::default(); count as usize];
-        match bpf_update_batch(
-            self.bpf()?,
-            &self.cap_update_batch,
-            "ROUTING_MAP",
-            &keys,
-            &zeros,
-        ) {
-            Ok(true) => return Ok(()),
-            Ok(false) => {}
-            Err(e) => return Err(e),
-        }
-        let d = MatchSet::default();
-        for i in start..MAX_MATCH_SET_LEN {
-            self.array_set("ROUTING_MAP", i, &d)?;
-        }
-        Ok(())
-    }
-
     fn prune_lpm_entries(&mut self, keep: &LpmKeepSet) -> anyhow::Result<()> {
-        // Delete the LPM keys the new ruleset no longer references.  This is
-        // the post-commit counterpart of the per-key overwrite during the
-        // push: together they leave exactly the new generation's entries.
+        // Keep every key referenced by the active or staged generation.
+        // A key retired by the latest switch remains for one transition so a
+        // packet that already read the old selector cannot observe its LPM
+        // value disappear mid-evaluation.
         for (map_name, keys) in [
             ("DEST_LPM_ROUTING_MAP", &keep.dest),
             ("SOURCE_LPM_ROUTING_MAP", &keep.source),

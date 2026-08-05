@@ -181,8 +181,11 @@ impl GroupManager {
         network: SelectionNetwork,
         effects: SelectionEffects,
     ) -> &'a Node {
-        let key = (group.name.clone(), network);
-        let Some(counter) = self.lb_counters.get(&key) else {
+        let Some(counter) = self
+            .lb_counters
+            .get(&group.name)
+            .map(|counters| &counters[network.slot()])
+        else {
             return candidates[0].node;
         };
         let cursor = if effects.applies() {
@@ -209,11 +212,12 @@ impl GroupManager {
         network: SelectionNetwork,
         effects: SelectionEffects,
     ) -> &'a Node {
-        let key = (group.name.clone(), network);
         {
             let cache = self.fallback_cache.read();
-            if let Some(pinned) = cache.get(&key)
-                && let Some(&c) = candidates.iter().find(|c| c.tag == pinned.as_str())
+            if let Some(pinned) = cache
+                .get(&group.name)
+                .and_then(|pins| pins[network.slot()].as_deref())
+                && let Some(&c) = candidates.iter().find(|c| c.tag == pinned)
             {
                 return c.node;
             }

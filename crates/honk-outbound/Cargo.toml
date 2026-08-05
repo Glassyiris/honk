@@ -62,3 +62,7 @@ webpki-roots.workspace = true
 [[bench]]
 name = "ss_aead"
 harness = false
+
+[[bench]]
+name = "group_selection"
+harness = false

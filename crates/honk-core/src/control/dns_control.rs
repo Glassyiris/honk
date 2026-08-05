@@ -7,7 +7,7 @@
 //! - Singleflight deduplication for concurrent identical queries
 //! - Async BPF cache update channel (non-blocking)
 //! - Periodic route refresh worker
-//! - Concurrency limit with graceful SERVFAIL degradation
+//! - Concurrency limit with graceful REFUSED degradation
 //!
 //! Go ref: `dns_control.go` (2943L)
 
@@ -196,7 +196,7 @@ impl DnsController {
             .await
         {
             Ok((outcome, runtime)) => {
-                self.submit_projection(runtime.runtime(), data, &outcome);
+                self.submit_projection(runtime.runtime(), &outcome);
                 let resp = outcome.rendered().to_vec();
                 (resp, true)
             }
@@ -219,22 +219,16 @@ impl DnsController {
     fn submit_projection(
         &self,
         runtime: &crate::dns::runtime::DnsRuntime,
-        query: &[u8],
         outcome: &crate::dns::outcome::DnsOutcome,
     ) {
         use crate::dns::outcome::{OutcomeStatus, Provenance, ResponseClass};
         use crate::dns::projection::{ProjectionFreshness, ProjectionObservation};
 
-        let Some((domain, _)) = crate::dns::forwarder::parse_dns_question(query) else {
-            return;
-        };
-        let positive_ips = (outcome.status() == OutcomeStatus::Accepted
-            && outcome.response_class() == ResponseClass::Positive)
-            .then(|| crate::dns::forwarder::extract_answer_ips(outcome.rendered()));
+        let domain = outcome.domain();
         let observation = match (outcome.status(), outcome.response_class()) {
             (OutcomeStatus::Accepted, ResponseClass::Positive) => ProjectionObservation::Positive {
-                domain: &domain,
-                ips: positive_ips.as_deref().unwrap_or_default(),
+                domain,
+                ips: outcome.answer_ips(),
                 advertised_ttl: outcome.expiry().ttl(),
                 freshness: if outcome.provenance() == Provenance::Stale {
                     ProjectionFreshness::Stale
@@ -243,10 +237,10 @@ impl DnsController {
                 },
             },
             (OutcomeStatus::Accepted, ResponseClass::Nodata | ResponseClass::Nxdomain) => {
-                ProjectionObservation::Clear { domain: &domain }
+                ProjectionObservation::Clear { domain }
             }
             (OutcomeStatus::Accepted, ResponseClass::Servfail) | (OutcomeStatus::Rejected, _) => {
-                ProjectionObservation::Retain { domain: &domain }
+                ProjectionObservation::Retain
             }
         };
         self.routing_projection

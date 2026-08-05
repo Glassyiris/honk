@@ -76,7 +76,6 @@ pub enum RoutingPushPhase {
     SourceLpm,
     MacLpm,
     Meta,
-    ClearTail,
     PruneLpm,
 }
 
@@ -234,9 +233,10 @@ pub trait EbpfBackend: Send + Sync {
     fn active_routing_generation(&self) -> anyhow::Result<u32> {
         Ok(0)
     }
-    /// Fill the metadata for `generation`, then atomically make it active by
+    /// Fill the inactive generation's exploded introspection metadata and all
+    /// four packed `RoutingGroupMeta` entries, then atomically activate it by
     /// writing only the selector slot. Implementations MUST leave the prior
-    /// generation intact until after the switch succeeds.
+    /// generation selected until every packed entry is complete.
     fn publish_routing_generation(
         &mut self,
         generation: u32,
@@ -338,19 +338,12 @@ pub trait EbpfBackend: Send + Sync {
         entries: &[(LpmKey, DomainRouting)],
     ) -> anyhow::Result<()>;
     fn add_ip_route(&mut self, prefix: &str, outbound: OutboundIndex) -> anyhow::Result<()>;
-    /// Fully reset all routing-related maps (MatchSets, rule count, domain
-    /// routing, LPM tries).  NOT used by the routing push path: clearing
-    /// first would zero ROUTING_META_MAP[0] and make the eBPF datapath drop
-    /// every new flow until the push completes.  Kept for tests and
+    /// Fully reset all routing-related maps (MatchSets, routing metadata,
+    /// domain routing, and LPM tries). NOT used by the routing push path:
+    /// clearing the active bank and metadata makes the eBPF datapath fail
+    /// closed until a complete generation is published. Kept for tests and
     /// full-reset scenarios only.
     fn clear_routes(&mut self) -> anyhow::Result<()>;
-    /// Zero the ROUTING_MAP slots `[start..MAX_MATCH_SET_LEN)`.
-    ///
-    /// Optional post-commit cleanup for stale physical routing slots. The
-    /// active generation's count already excludes those slots.
-    fn clear_routing_map_tail(&mut self, _start: u32) -> anyhow::Result<()> {
-        Ok(())
-    }
     /// Delete dest/source/MAC LPM entries whose raw key is not in `keep`.
     ///
     /// Post-commit cleanup for the two-phase routing push.  This replaces

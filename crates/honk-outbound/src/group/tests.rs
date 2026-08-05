@@ -14,6 +14,40 @@ fn direct_selector_fast_path_preserves_first_member_selection() {
         "a"
     );
 }
+
+#[test]
+fn direct_selector_plan_fast_path_preserves_choice_default_and_health() {
+    let a = make_node(nid("plan-a"), "plan-a");
+    let b = make_node(nid("plan-b"), "plan-b");
+    let mut group = make_group("plan-selector", GroupPolicy::Selector, vec![a.id, b.id]);
+    group.default = Some(b.name.clone());
+    let alive = Arc::new(AliveDialerSet::new());
+    let manager = GroupManager::with_alive_set(&[group], &[a, b], Some(Arc::clone(&alive)));
+
+    assert_eq!(
+        manager
+            .selection_plan_for_domain("plan-selector", ProbeDomain::Tcp, IpVersion::V4)
+            .nodes[0]
+            .name,
+        "plan-b"
+    );
+    manager.set_selector_choice("plan-selector", "plan-a");
+    assert_eq!(
+        manager
+            .selection_plan_for_domain("plan-selector", ProbeDomain::Tcp, IpVersion::V4)
+            .nodes[0]
+            .name,
+        "plan-a"
+    );
+    alive.report_unavailable_forced(nid("plan-a"), ProbeDomain::Tcp, IpVersion::V4);
+    assert_eq!(
+        manager
+            .selection_plan_for_domain("plan-selector", ProbeDomain::Tcp, IpVersion::V4)
+            .nodes[0]
+            .name,
+        "plan-b"
+    );
+}
 use chrono::Utc;
 
 fn nid(name: &str) -> uuid::Uuid {

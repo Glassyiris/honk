@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use std::net::SocketAddr;
 
 use tracing::debug;
@@ -19,10 +20,10 @@ impl DnsForwarder {
         raw_query: &[u8],
         domain: &str,
         qtype: u16,
-        response: Vec<u8>,
+        response: Bytes,
         original_dst: Option<SocketAddr>,
         ingress: IngressProfile,
-    ) -> anyhow::Result<Vec<u8>> {
+    ) -> anyhow::Result<Bytes> {
         let preferred = match (&self.strategy, qtype) {
             (DnsStrategy::PreferIpv4, 28) => 1u16,
             (DnsStrategy::PreferIpv6, 1) => 28u16,
@@ -38,7 +39,7 @@ impl DnsForwarder {
                 domain,
                 qtype_name(preferred)
             );
-            return Ok(make_empty_response(raw_query, domain, qtype));
+            return Ok(make_empty_response(raw_query, domain, qtype).into());
         }
         Ok(response)
     }

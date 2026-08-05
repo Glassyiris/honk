@@ -1378,24 +1378,20 @@ impl ControlPlaneHandle {
             quic_domain.as_deref(),
             handoff.as_ref(),
         );
-        let (outbound_name, outbound_index, must) = if let Some(ho) = &handoff {
+        let (outbound_name, must) = if let Some(ho) = &handoff {
             debug!("eBPF handoff UDP: outbound={}", ho.outbound);
             if ho.outbound == OutboundIndex::ControlPlaneRouting as u8 || reroute_by_sniffed_domain
             {
                 let router = self.router.read().await;
                 let (name, must) = router.route_with_must(&conn_info);
-                (name.to_string(), 0, must)
+                (name.to_string(), must)
             } else {
-                (
-                    self.outbound_index_to_name(ho.outbound).await,
-                    ho.outbound,
-                    ho.must != 0,
-                )
+                (self.outbound_index_to_name(ho.outbound).await, ho.must != 0)
             }
         } else {
             let router = self.router.read().await;
             let (name, must) = router.route_with_must(&conn_info);
-            (name.to_string(), 0, must)
+            (name.to_string(), must)
         };
         let outbound_name = self.apply_mode_override(outbound_name, must).await;
 
@@ -1568,7 +1564,6 @@ impl ControlPlaneHandle {
         let relay_addr = transport.relay_addr();
         let endpoint = Arc::new(UdpEndpoint::new(transport, relay_addr, node.id));
         endpoint.record_pending_reply_peer(relay_addr);
-        endpoint.cache_routing_result(original_dst, outbound_index);
 
         let conn_id = uuid::Uuid::new_v4().to_string();
         let (rule, rule_payload) = matched_rule

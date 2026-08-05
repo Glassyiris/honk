@@ -16,6 +16,7 @@ fn typed_outcome_exposes_projection_metadata_when_upstream_is_accepted() {
         "primary",
         "secondary",
         &["primary", "secondary"],
+        vec!["192.0.2.1".parse().expect("IP")],
         vec![0x12, 0x34],
     );
 
@@ -27,6 +28,11 @@ fn typed_outcome_exposes_projection_metadata_when_upstream_is_accepted() {
     assert_eq!(outcome.logical_upstream(), Some("primary"));
     assert_eq!(outcome.final_upstream(), Some("secondary"));
     assert_eq!(outcome.requery_history(), &["primary", "secondary"]);
+    assert_eq!(outcome.domain(), "example.com");
+    assert_eq!(
+        outcome.answer_ips(),
+        &["192.0.2.1".parse::<std::net::IpAddr>().expect("IP")]
+    );
     assert_eq!(outcome.rendered(), &[0x12, 0x34]);
 }
 

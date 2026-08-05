@@ -26,6 +26,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
+use tracing_subscriber::prelude::*;
 
 fn make_node(name: &str) -> Node {
     Node {
@@ -57,6 +58,7 @@ fn test_config() -> Config {
 struct TestApp {
     addr: SocketAddr,
     state: Arc<ClashState>,
+    log_dispatch: tracing::Dispatch,
     db_path: std::path::PathBuf,
     _tmp: tempfile::TempDir,
 }
@@ -138,7 +140,8 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
     }
     let group_manager = group_manager.into_shared();
 
-    let (log_tx, _) = tokio::sync::broadcast::channel(16);
+    let (log_layer, log_handle) = clash_api::logs::layer();
+    let log_dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(log_layer));
     let dns_cache = Arc::new(tokio::sync::Mutex::new(DnsCache::new(16)));
     let dns_service = honk_core::dns::DnsService::with_forwarder(Arc::new(test_dns_forwarder(
         dns_cache,
@@ -161,7 +164,7 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
         mode_state: Arc::new(parking_lot::RwLock::new(ModeState::new("Rule", "proxy"))),
         secret: secret.to_string(),
         external_ui: external_ui.to_string(),
-        log_tx,
+        log_handle,
         dns_service,
         connection_pool: Arc::new(honk_core::pool::ConnectionPool::new()),
         stream_samplers: Arc::new(clash_api::StreamSamplers::new()),
@@ -181,6 +184,7 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
     TestApp {
         addr,
         state,
+        log_dispatch,
         db_path,
         _tmp: tmp,
     }
@@ -1034,14 +1038,9 @@ async fn test_logs_chunked_fallback() {
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.headers()["content-type"], "application/json");
 
-    // Publish an event after the stream is set up.
-    app.state
-        .log_tx
-        .send(honk_core::clash_api::logs::LogEvent {
-            level: tracing::Level::INFO,
-            payload: "chunked-log-line".into(),
-        })
-        .unwrap();
+    tracing::dispatcher::with_default(&app.log_dispatch, || {
+        tracing::info!("chunked-log-line");
+    });
 
     let chunk = tokio::time::timeout(Duration::from_secs(5), resp.chunk())
         .await
@@ -1117,7 +1116,7 @@ async fn test_dns_query_upstream_and_nxdomain() {
         mode_state: app.state.mode_state.clone(),
         secret: String::new(),
         external_ui: String::new(),
-        log_tx: app.state.log_tx.clone(),
+        log_handle: app.state.log_handle.clone(),
         dns_service: nx_service,
         connection_pool: app.state.connection_pool.clone(),
         stream_samplers: app.state.stream_samplers.clone(),

@@ -16,6 +16,19 @@ fn test_put_get() {
 }
 
 #[test]
+fn legacy_negative_replaces_the_positive_for_the_same_key() {
+    let mut cache = DnsCache::new(10);
+    let key = "negative.example:1";
+    cache.put(key.into(), make_test_response([192, 0, 2, 1], 300), 300);
+
+    cache.put_negative(key.into(), 60, 3);
+
+    assert!(cache.get(key).is_none());
+    assert_eq!(cache.negative_rcode(key), Some(3));
+    assert_eq!(cache.len(), 1);
+}
+
+#[test]
 fn test_expiry() {
     let mut cache = DnsCache::new(10);
     let response = make_test_response([93, 184, 216, 34], 0);

@@ -10,7 +10,7 @@ use honk_config::dns::{
 };
 use honk_core::dns::DnsResolver;
 use honk_core::dns::bench_support::{
-    CacheKeyBenchmarkInput, RuntimeBenchmark, observability_snapshot_checksum,
+    CacheKeyBenchmarkInput, ProjectionBenchmark, RuntimeBenchmark, observability_snapshot_checksum,
     record_observability_event,
 };
 use honk_core::dns::cache::DnsCache;
@@ -32,6 +32,77 @@ pub(super) fn bench_typed_key_build(c: &mut Criterion) {
     let input = CacheKeyBenchmarkInput::parse(&query);
     c.bench_function("dns_typed_key/build", |b| {
         b.iter(|| black_box(input.build()));
+    });
+}
+
+pub(super) fn bench_warmed_forwarder_hits(c: &mut Criterion) {
+    let runtime = Runtime::new().expect("benchmark runtime");
+    let positive = fixtures::forwarder(Arc::new(fixtures::LoopbackPool::immediate()), true);
+    let negative = fixtures::forwarder(Arc::new(fixtures::LoopbackPool::nxdomain()), true);
+    let positive_query = build_dns_query("positive.example", 1);
+    let negative_query = build_dns_query("negative.example", 1);
+    runtime.block_on(async {
+        positive
+            .resolve_outcome(&positive_query)
+            .await
+            .expect("warm positive");
+        negative
+            .resolve_outcome(&negative_query)
+            .await
+            .expect("warm negative");
+    });
+
+    for (label, forwarder, query) in [
+        ("POSITIVE", Arc::clone(&positive), positive_query.as_slice()),
+        ("NXDOMAIN", Arc::clone(&negative), negative_query.as_slice()),
+    ] {
+        let region = Region::new(GLOBAL);
+        runtime.block_on(async {
+            for _ in 0..1_000 {
+                black_box(
+                    forwarder
+                        .resolve_outcome(black_box(query))
+                        .await
+                        .expect("warmed hit"),
+                );
+            }
+        });
+        let allocation = region.change();
+        eprintln!(
+            "DNS_WARMED_{label}_ALLOCATIONS={} DNS_WARMED_{label}_BYTES={}",
+            allocation.allocations, allocation.bytes_allocated
+        );
+    }
+
+    let mut group = c.benchmark_group("dns_forwarder_warmed");
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("positive_hit", |b| {
+        b.to_async(&runtime).iter(|| async {
+            black_box(
+                positive
+                    .resolve_outcome(black_box(&positive_query))
+                    .await
+                    .expect("positive hit"),
+            );
+        });
+    });
+    group.bench_function("nxdomain_hit", |b| {
+        b.to_async(&runtime).iter(|| async {
+            black_box(
+                negative
+                    .resolve_outcome(black_box(&negative_query))
+                    .await
+                    .expect("negative hit"),
+            );
+        });
+    });
+    group.finish();
+}
+
+pub(super) fn bench_projection_replacement(c: &mut Criterion) {
+    let mut replacement = ProjectionBenchmark::new();
+    c.bench_function("dns_projection/hot_replacement", |b| {
+        b.iter(|| black_box(replacement.replace()));
     });
 }
 

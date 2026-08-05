@@ -1,19 +1,23 @@
 //! Log streaming support for the clash API `/logs` endpoint.
 //!
-//! A custom tracing [`Layer`] formats every event into a single-line
-//! payload and broadcasts it on a `tokio::sync::broadcast` channel. The
-//! channel has a bounded capacity; slow subscribers hit `Lagged` and
-//! simply skip ahead (log streaming is best-effort). With no subscribers
-//! the layer skips formatting entirely, so subscribers see events from
-//! their subscription time onward, not a replayed history.
+//! The API layer is disabled at the callsite while no client is attached.
+//! Each client raises the layer's dynamic ceiling for its subscription lifetime;
+//! console filtering remains independent because the layer uses a per-layer filter.
 
 use std::fmt::Write as _;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+use parking_lot::Mutex;
 use tokio::sync::broadcast;
 use tracing::field::{Field, Visit};
-use tracing_subscriber::layer::{Context, Layer};
+use tracing::subscriber::Interest;
+use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::layer::{Context, Filter, Layer};
 
 /// Bounded broadcast capacity; overflow drops the oldest entries.
 pub const LOG_CHANNEL_CAPACITY: usize = 256;
+const LEVEL_COUNT: usize = 5;
 
 /// One formatted log event distributed to `/logs` subscribers.
 #[derive(Debug, Clone)]
@@ -22,15 +26,153 @@ pub struct LogEvent {
     pub payload: String,
 }
 
-/// Tracing layer that broadcasts formatted events. Construct via [`layer`].
+struct LogInterest {
+    active_level: AtomicU8,
+    subscriptions: Mutex<[usize; LEVEL_COUNT]>,
+}
+
+impl LogInterest {
+    fn new() -> Self {
+        Self {
+            active_level: AtomicU8::new(0),
+            subscriptions: Mutex::new([0; LEVEL_COUNT]),
+        }
+    }
+
+    fn add(&self, level: tracing::Level) {
+        let mut subscriptions = self.subscriptions.lock();
+        subscriptions[level_rank(level) as usize - 1] += 1;
+        self.publish_level(&subscriptions);
+    }
+
+    fn remove(&self, level: tracing::Level) {
+        let mut subscriptions = self.subscriptions.lock();
+        let count = &mut subscriptions[level_rank(level) as usize - 1];
+        debug_assert!(*count > 0, "log subscription count underflow");
+        *count = count.saturating_sub(1);
+        self.publish_level(&subscriptions);
+    }
+
+    fn publish_level(&self, subscriptions: &[usize; LEVEL_COUNT]) {
+        let active_level = subscriptions
+            .iter()
+            .rposition(|count| *count != 0)
+            .map_or(0, |index| index as u8 + 1);
+        if self.active_level.swap(active_level, Ordering::Release) != active_level {
+            tracing::callsite::rebuild_interest_cache();
+        }
+    }
+
+    fn includes(&self, level: tracing::Level) -> bool {
+        level_rank(level) <= self.active_level.load(Ordering::Acquire)
+    }
+
+    fn level_filter(&self) -> LevelFilter {
+        match self.active_level.load(Ordering::Acquire) {
+            1 => LevelFilter::ERROR,
+            2 => LevelFilter::WARN,
+            3 => LevelFilter::INFO,
+            4 => LevelFilter::DEBUG,
+            5 => LevelFilter::TRACE,
+            _ => LevelFilter::OFF,
+        }
+    }
+}
+
+fn level_rank(level: tracing::Level) -> u8 {
+    match level {
+        tracing::Level::ERROR => 1,
+        tracing::Level::WARN => 2,
+        tracing::Level::INFO => 3,
+        tracing::Level::DEBUG => 4,
+        tracing::Level::TRACE => 5,
+    }
+}
+
+/// Active-level-aware handle shared by the Clash API state.
+#[derive(Clone)]
+pub struct ClashLogHandle {
+    tx: broadcast::Sender<LogEvent>,
+    interest: Arc<LogInterest>,
+}
+
+impl ClashLogHandle {
+    /// Subscribe through `level` until the returned guard is dropped.
+    pub fn subscribe(&self, level: tracing::Level) -> LogSubscription {
+        let receiver = self.tx.subscribe();
+        self.interest.add(level);
+        LogSubscription {
+            receiver,
+            interest: Arc::clone(&self.interest),
+            level,
+        }
+    }
+}
+
+/// Receiver whose lifetime controls the API tracing interest ceiling.
+pub struct LogSubscription {
+    receiver: broadcast::Receiver<LogEvent>,
+    interest: Arc<LogInterest>,
+    level: tracing::Level,
+}
+
+impl LogSubscription {
+    pub async fn recv(&mut self) -> Result<LogEvent, broadcast::error::RecvError> {
+        self.receiver.recv().await
+    }
+    pub fn includes(&self, level: tracing::Level) -> bool {
+        level <= self.level
+    }
+}
+
+impl Drop for LogSubscription {
+    fn drop(&mut self) {
+        self.interest.remove(self.level);
+    }
+}
+
+struct ClashLogFilter {
+    interest: Arc<LogInterest>,
+}
+
+impl<S> Filter<S> for ClashLogFilter {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>, _cx: &Context<'_, S>) -> bool {
+        self.interest.includes(*metadata.level())
+    }
+
+    fn callsite_enabled(&self, metadata: &'static tracing::Metadata<'static>) -> Interest {
+        if self.interest.includes(*metadata.level()) {
+            Interest::always()
+        } else {
+            Interest::never()
+        }
+    }
+
+    fn max_level_hint(&self) -> Option<LevelFilter> {
+        Some(self.interest.level_filter())
+    }
+}
+
+/// Tracing layer that broadcasts formatted events.
 pub struct ClashLogLayer {
     tx: broadcast::Sender<LogEvent>,
 }
 
-/// Create the layer and the sender half handed to the clash API state.
-pub fn layer() -> (ClashLogLayer, broadcast::Sender<LogEvent>) {
+/// Create a dynamically filtered layer and handle for the Clash API state.
+pub fn layer<S>() -> (impl Layer<S>, ClashLogHandle)
+where
+    S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
+{
     let (tx, _) = broadcast::channel(LOG_CHANNEL_CAPACITY);
-    (ClashLogLayer { tx: tx.clone() }, tx)
+    let interest = Arc::new(LogInterest::new());
+    let handle = ClashLogHandle {
+        tx: tx.clone(),
+        interest: Arc::clone(&interest),
+    };
+    (
+        ClashLogLayer { tx }.with_filter(ClashLogFilter { interest }),
+        handle,
+    )
 }
 
 /// Parse a clash `?level=` query value into a tracing level.
@@ -46,8 +188,6 @@ pub fn parse_level(level: &str) -> Option<tracing::Level> {
     }
 }
 
-/// Field collector: `message` becomes the payload head, remaining fields
-/// are appended as ` key=value` pairs on the same line.
 #[derive(Default)]
 struct EventFields {
     message: String,
@@ -76,18 +216,7 @@ impl<S> Layer<S> for ClashLogLayer
 where
     S: tracing::Subscriber,
 {
-    fn enabled(&self, _metadata: &tracing::Metadata<'_>, _ctx: Context<'_, S>) -> bool {
-        // Must stay unconditionally true: `Layered::enabled` short-circuits
-        // the whole stack when any layer answers false, so gating on the
-        // subscriber count here would silence every other layer (console
-        // fmt output included) whenever no `/logs` client is attached. The
-        // formatting skip lives in `on_event` below.
-        true
-    }
-
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
-        // A receiver may disconnect after `enabled`; retain this guard so
-        // formatting is never paid after the final subscriber leaves.
         if self.tx.receiver_count() == 0 {
             return;
         }
@@ -102,5 +231,67 @@ where
             level: *event.metadata().level(),
             payload,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tracing_subscriber::prelude::*;
+
+    #[test]
+    fn api_interest_changes_do_not_change_console_filtering() {
+        let (api_layer, handle) = layer();
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::sink)
+                    .with_filter(LevelFilter::INFO),
+            )
+            .with(api_layer);
+        let dispatch = tracing::Dispatch::new(subscriber);
+
+        assert_eq!(handle.interest.level_filter(), LevelFilter::OFF);
+
+        let mut subscription = handle.subscribe(tracing::Level::DEBUG);
+        assert_eq!(handle.interest.level_filter(), LevelFilter::DEBUG);
+        tracing::dispatcher::with_default(&dispatch, || {
+            tracing::debug!("api-only-debug");
+        });
+        assert_eq!(
+            subscription.receiver.try_recv().unwrap().payload,
+            "api-only-debug"
+        );
+
+        drop(subscription);
+        assert_eq!(handle.interest.level_filter(), LevelFilter::OFF);
+    }
+
+    #[test]
+    fn verbose_console_events_stay_out_of_less_verbose_api_subscription() {
+        let (api_layer, handle) = layer();
+        let mut subscription = handle.subscribe(tracing::Level::INFO);
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::sink)
+                    .with_filter(LevelFilter::TRACE),
+            )
+            .with(api_layer);
+        let dispatch = tracing::Dispatch::new(subscriber);
+
+        tracing::dispatcher::with_default(&dispatch, || {
+            assert!(tracing::enabled!(tracing::Level::TRACE));
+            tracing::trace!("console-only-trace");
+            tracing::info!("shared-info");
+        });
+
+        let event = subscription.receiver.try_recv().unwrap();
+        assert_eq!(event.level, tracing::Level::INFO);
+        assert_eq!(event.payload, "shared-info");
+        assert!(matches!(
+            subscription.receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
     }
 }

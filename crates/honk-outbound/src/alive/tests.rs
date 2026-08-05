@@ -140,6 +140,48 @@ fn test_alive_set_per_protocol() {
     assert!(set.is_alive_for(id(1), ProbeDomain::DnsUdp, IpVersion::V4));
 }
 
+#[test]
+fn available_traffic_fast_path_preserves_clean_state_and_resets_dirty_state() {
+    let set = AliveDialerSet::new();
+    let node = id(9);
+    let idx = alive_index(ProbeDomain::DataUdp, IpVersion::V4);
+    set.report_available_traffic(node, ProbeDomain::DataUdp, IpVersion::V4);
+    let clean = set.states.read()[&node][idx].clone();
+
+    set.report_available_traffic(node, ProbeDomain::DataUdp, IpVersion::V4);
+    let unchanged = set.states.read()[&node][idx].clone();
+    assert_eq!(unchanged.cooldown_until, clean.cooldown_until);
+
+    {
+        let mut states = set.states.write();
+        let state = &mut states.get_mut(&node).expect("state")[idx];
+        state.traffic_failures = 1;
+        state.stopped = true;
+    }
+    set.report_available_traffic(node, ProbeDomain::DataUdp, IpVersion::V4);
+    let reset = set.states.read()[&node][idx].clone();
+    assert!(reset.is_clean_alive());
+}
+
+#[test]
+fn group_activity_ignores_untracked_groups_and_reuses_registered_key() {
+    let set = AliveDialerSet::new();
+    set.mark_group_active("untracked");
+    assert!(set.group_last_active.read().is_empty());
+
+    set.sync_urltest_groups(&[(
+        "tracked".to_owned(),
+        Vec::new(),
+        Some(Duration::from_secs(60)),
+    )]);
+    set.mark_group_active("tracked");
+    let first = set.group_last_active.read()["tracked"];
+    set.mark_group_active("tracked");
+    let active = set.group_last_active.read();
+    assert_eq!(active.len(), 1);
+    assert!(active["tracked"] >= first);
+}
+
 /// Traffic failures during the grace period must not mark a fresh node
 /// dead (restart warm-up regression: mass traffic failures used to kill
 /// every node seconds after startup).

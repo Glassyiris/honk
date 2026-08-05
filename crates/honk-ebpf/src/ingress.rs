@@ -79,7 +79,7 @@ const CLASSIFIED_MARK: u32 = 0x4000_0000;
 ///   `REDIRECT_TRACK` is refreshed only when stale.
 /// `HANDOFF_WRITE_REFRESH`: UDP, first packet and cached path alike.
 ///   Write when no entry exists or the existing one is older than
-///   [`crate::contrack::REDIRECT_REFRESH_INTERVAL_NS`].  A new flow's first
+///   [`crate::contrack::AUXILIARY_MAP_REFRESH_INTERVAL_NS`]. A new flow's first
 ///   packet always finds the entry absent (or long consumed) and therefore
 ///   rewrites it, so userspace still sees a handoff on endpoint-pool miss.
 const HANDOFF_WRITE_ALWAYS: u8 = 0;
@@ -115,13 +115,13 @@ fn redirect_lan_packet_to_control_plane(
 
     // Handoff entry for userspace lookup, throttled by mode (see the
     // HANDOFF_WRITE_* constants): established TCP flows never write, UDP
-    // flows write at most once per REDIRECT_REFRESH_INTERVAL_NS.
+    // flows write at most once per AUXILIARY_MAP_REFRESH_INTERVAL_NS.
     let write_handoff = match handoff_mode {
         HANDOFF_WRITE_ALWAYS => true,
         HANDOFF_WRITE_REFRESH => match ROUTING_HANDOFF_MAP.get_ptr_mut(pkt.tuples.five) {
             Some(old) => {
                 now.wrapping_sub(unsafe { (*old).last_seen_ns })
-                    >= crate::contrack::REDIRECT_REFRESH_INTERVAL_NS
+                    >= crate::contrack::AUXILIARY_MAP_REFRESH_INTERVAL_NS
             }
             None => true,
         },
@@ -150,7 +150,7 @@ fn redirect_lan_packet_to_control_plane(
     // Store the original LAN framing so dae0_ingress can rewrite replies
     // back to the original client without involving host IP forwarding.
     // New flows write unconditionally; cached-flow packets only refresh the
-    // entry once it is older than REDIRECT_REFRESH_INTERVAL_NS.
+    // entry once it is older than AUXILIARY_MAP_REFRESH_INTERVAL_NS.
     let redirect_tuple = RedirectTuple::from_tuples(&pkt.tuples.five);
     let write_track = if handoff_mode == HANDOFF_WRITE_ALWAYS {
         true
@@ -158,7 +158,7 @@ fn redirect_lan_packet_to_control_plane(
         match REDIRECT_TRACK.get_ptr_mut(redirect_tuple) {
             Some(old) => {
                 now.wrapping_sub(unsafe { (*old).last_seen_ns })
-                    >= crate::contrack::REDIRECT_REFRESH_INTERVAL_NS
+                    >= crate::contrack::AUXILIARY_MAP_REFRESH_INTERVAL_NS
             }
             None => true,
         }
@@ -626,7 +626,9 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     let mark = (s64_ret >> 8) as u32;
     let must = ((s64_ret >> 40) & 1) as u8;
 
-    if pkt.l4proto == IPPROTO_UDP && crate::contrack::is_short_lived_udp_traffic(&pkt.tuples.five) {
+    let short_lived_udp =
+        pkt.l4proto == IPPROTO_UDP && crate::contrack::is_short_lived_udp_traffic(&pkt.tuples.five);
+    if short_lived_udp {
         // Skip cache for short-lived DNS
     } else if pkt.l4proto == IPPROTO_TCP {
         if let Some(ref mut state) = tcp_state {
@@ -649,6 +651,12 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             return Err(TC_ACT_OK);
         }
         if outbound == OUTBOUND_DIRECT && must != 0 {}
+        return Err(TC_ACT_SHOT);
+    }
+
+    // DNS bypasses conntrack deliberately; every other UDP flow needs a
+    // published route before it can enter the proxied datapath.
+    if pkt.l4proto == IPPROTO_UDP && !short_lived_udp && udp_state.is_none() {
         return Err(TC_ACT_SHOT);
     }
 
@@ -887,7 +895,10 @@ fn do_tproxy_dae0_ingress(ctx: &TcContext) -> Verdict {
     }
     let entry = unsafe { &mut *entry_ptr.unwrap() };
 
-    entry.last_seen_ns = unsafe { bpf_ktime_get_ns() };
+    let now = unsafe { bpf_ktime_get_ns() };
+    if now.wrapping_sub(entry.last_seen_ns) >= crate::contrack::AUXILIARY_MAP_REFRESH_INTERVAL_NS {
+        entry.last_seen_ns = now;
+    }
 
     // Account this reply (outbound → LAN) against the outbound recorded
     // when the flow was redirected to the control plane.  The full packet

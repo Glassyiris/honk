@@ -477,10 +477,18 @@ pub struct OutboundRuntimeRegistry {
     /// leaves this generation's ownership untouched; drain/shutdown skip
     /// exactly these entries (the successor closes them as their full owner).
     moved_out: parking_lot::Mutex<HashSet<uuid::Uuid>>,
-    /// Admission budget for concurrent proxied dials, scoped to this
-    /// generation: a reload applies a changed limit to new work at once
-    /// while in-flight dials keep their permits until they finish.
+    /// Generation-local configured admission budget. The process-wide
+    /// descriptor gate below is shared by every overlapping generation.
     dial_semaphore: Arc<tokio::sync::Semaphore>,
+    dial_limit: usize,
+    dial_ceiling_semaphore: Arc<tokio::sync::Semaphore>,
+    dial_ceiling_limit: usize,
+}
+/// One proxied dial admitted by both its generation and the process-wide
+/// descriptor partition. Dropping it releases both capacities.
+pub struct DialPermit {
+    _generation: tokio::sync::OwnedSemaphorePermit,
+    _process: tokio::sync::OwnedSemaphorePermit,
 }
 
 /// Shared cell swapped atomically on reload (same pattern as
@@ -498,18 +506,56 @@ impl OutboundRuntimeRegistry {
         .map(|(registry, _)| registry)
     }
 
-    /// [`Self::build`] with an explicit dial-admission budget and optional
-    /// reuse of the previous generation's runtimes for every node whose
-    /// full config survived the reload unchanged (the content-derived ID
-    /// alone is too narrow — it excludes dial fields like SNI, transport,
-    /// and obfs). Returns the registry plus the ids of the runtimes taken
-    /// from `previous`. Nothing is marked at build time: only a committed
-    /// reload records the transfer on the old generation via
-    /// [`Self::mark_moved_out`], so an aborted reload leaves the old
-    /// generation's drain/shutdown semantics untouched.
+    /// Build with a generation-local dial limit. Descriptor-aware owners that
+    /// overlap generations should use [`Self::build_reusing_with_dial_ceiling`].
     pub fn build_reusing(
         nodes: &[Node],
         max_concurrent_dials: usize,
+        previous: Option<&Self>,
+    ) -> Result<(Self, HashSet<uuid::Uuid>), RuntimeRegistryError> {
+        let dial_ceiling_limit = max_concurrent_dials.max(1);
+        Self::build_reusing_with_admission(
+            nodes,
+            max_concurrent_dials,
+            Arc::new(tokio::sync::Semaphore::new(dial_ceiling_limit)),
+            dial_ceiling_limit,
+            previous,
+        )
+    }
+
+    /// Build while sharing one immutable process-wide dial descriptor ceiling
+    /// with `previous`. A successor may change its generation-local configured
+    /// limit, but old and new permits together never exceed the startup gate.
+    pub fn build_reusing_with_dial_ceiling(
+        nodes: &[Node],
+        max_concurrent_dials: usize,
+        startup_dial_ceiling: usize,
+        previous: Option<&Self>,
+    ) -> Result<(Self, HashSet<uuid::Uuid>), RuntimeRegistryError> {
+        let (dial_ceiling_semaphore, dial_ceiling_limit) = match previous {
+            Some(previous) => (
+                Arc::clone(&previous.dial_ceiling_semaphore),
+                previous.dial_ceiling_limit,
+            ),
+            None => {
+                let limit = startup_dial_ceiling.max(1);
+                (Arc::new(tokio::sync::Semaphore::new(limit)), limit)
+            }
+        };
+        Self::build_reusing_with_admission(
+            nodes,
+            max_concurrent_dials,
+            dial_ceiling_semaphore,
+            dial_ceiling_limit,
+            previous,
+        )
+    }
+
+    fn build_reusing_with_admission(
+        nodes: &[Node],
+        max_concurrent_dials: usize,
+        dial_ceiling_semaphore: Arc<tokio::sync::Semaphore>,
+        dial_ceiling_limit: usize,
         previous: Option<&Self>,
     ) -> Result<(Self, HashSet<uuid::Uuid>), RuntimeRegistryError> {
         let mut map = HashMap::with_capacity(nodes.len());
@@ -559,7 +605,12 @@ impl OutboundRuntimeRegistry {
                 nodes: map,
                 terminal: AtomicBool::new(false),
                 moved_out: parking_lot::Mutex::new(HashSet::new()),
-                dial_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent_dials.max(1))),
+                dial_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                    max_concurrent_dials.max(1).min(dial_ceiling_limit),
+                )),
+                dial_limit: max_concurrent_dials.max(1).min(dial_ceiling_limit),
+                dial_ceiling_semaphore,
+                dial_ceiling_limit,
             },
             reused,
         ))
@@ -629,12 +680,26 @@ impl OutboundRuntimeRegistry {
         self.terminal.load(Ordering::Acquire)
     }
 
-    /// Acquire one dial-admission permit from this generation's budget.
-    pub async fn acquire_dial_permit(&self) -> tokio::sync::OwnedSemaphorePermit {
-        Arc::clone(&self.dial_semaphore)
+    /// Configured admission ceiling for this immutable generation.
+    pub fn dial_limit(&self) -> usize {
+        self.dial_limit
+    }
+
+    /// Acquire generation-local admission before the shared process gate so
+    /// low configured limits cannot hoard process capacity while waiting.
+    pub async fn acquire_dial_permit(&self) -> DialPermit {
+        let generation = Arc::clone(&self.dial_semaphore)
             .acquire_owned()
             .await
-            .expect("dial semaphore is never closed")
+            .expect("dial semaphore is never closed");
+        let process = Arc::clone(&self.dial_ceiling_semaphore)
+            .acquire_owned()
+            .await
+            .expect("dial ceiling semaphore is never closed");
+        DialPermit {
+            _generation: generation,
+            _process: process,
+        }
     }
 
     /// Make the generation unavailable to new generation-owned work without
@@ -850,6 +915,40 @@ mod tests {
         b.id = a.id;
         let err = OutboundRuntimeRegistry::build(&[a, b]).unwrap_err();
         assert!(matches!(err, RuntimeRegistryError::DuplicateId(..)));
+    }
+
+    #[test]
+    fn explicit_dial_limit_is_generation_owned() {
+        let (registry, _) = OutboundRuntimeRegistry::build_reusing(&[], 7, None).unwrap();
+        assert_eq!(registry.dial_limit(), 7);
+        let (minimum, _) = OutboundRuntimeRegistry::build_reusing(&[], 0, None).unwrap();
+        assert_eq!(minimum.dial_limit(), 1);
+    }
+
+    #[tokio::test]
+    async fn overlapping_generations_share_the_startup_dial_ceiling() {
+        let (first, _) =
+            OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 3, 4, None).unwrap();
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            held.push(first.acquire_dial_permit().await);
+        }
+
+        let (second, _) =
+            OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 4, 99, Some(&first))
+                .unwrap();
+        assert_eq!(second.dial_limit(), 4);
+        held.push(second.acquire_dial_permit().await);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), second.acquire_dial_permit())
+                .await
+                .is_err()
+        );
+
+        drop(held.pop());
+        tokio::time::timeout(Duration::from_millis(100), second.acquire_dial_permit())
+            .await
+            .expect("released process capacity must admit the successor");
     }
 
     #[test]

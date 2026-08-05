@@ -16,7 +16,7 @@ pub(super) async fn lookup(
         return Ok(None);
     }
     let cache = context.forwarder.cache_service().await;
-    if let Some(hit) = cache.negative_hit(&context.cache_key.storage_key()) {
+    if let Some(hit) = cache.negative_hit_exact(&context.cache_key) {
         let response =
             crate::control::dns_control::build_dns_error_response(context.raw_query, hit.rcode);
         return context
@@ -25,6 +25,7 @@ pub(super) async fn lookup(
                 context.engine,
                 context.prepared,
                 response,
+                None,
                 OutcomeStatus::Accepted,
                 Provenance::Cache,
                 EffectiveExpiry::cacheable(hit.remaining_ttl),
@@ -50,7 +51,7 @@ pub(super) async fn lookup(
             context.publication_epoch,
         );
     }
-    let response = entry.response.to_vec();
+    let response = entry.response;
     let response = context
         .forwarder
         .apply_prefer_strategy(
@@ -68,6 +69,7 @@ pub(super) async fn lookup(
             context.engine,
             context.prepared,
             response,
+            None,
             OutcomeStatus::Accepted,
             Provenance::Cache,
             EffectiveExpiry::cacheable(std::time::Duration::from_secs(remaining)),
@@ -98,7 +100,7 @@ pub(super) async fn store(
                 .await
                 .put_negative_if_current(
                     context.publication_epoch,
-                    cache_key.storage_key(),
+                    cache_key.clone(),
                     negative_ttl,
                     rcode,
                 );

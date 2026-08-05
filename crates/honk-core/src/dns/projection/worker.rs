@@ -23,22 +23,31 @@ pub(super) async fn run(
         };
         let deadline = active.state.lock().next_deadline();
         drop(active);
-        match deadline {
+        let received_wake = match deadline {
             Some(deadline) => {
                 tokio::select! {
-                    wake = receiver.recv() => if wake.is_none() { return; },
-                    () = tokio::time::sleep_until(deadline) => {}
+                    wake = receiver.recv() => {
+                        if wake.is_none() {
+                            return;
+                        }
+                        true
+                    },
+                    () = tokio::time::sleep_until(deadline) => false,
                 }
             }
             None => {
                 if receiver.recv().await.is_none() {
                     return;
                 }
+                true
             }
-        }
+        };
         let Some(active) = projection.upgrade() else {
             return;
         };
+        if received_wake {
+            active.clear_worker_wake();
+        }
         flush(&active, &ebpf, &counters, &mut last_warning).await;
     }
 }

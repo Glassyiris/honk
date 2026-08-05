@@ -229,29 +229,25 @@ impl RoutingMatcherBuilder {
     ///
     /// ## Two-phase commit
     ///
-    /// The eBPF route loop evaluates `ROUTING_MAP[0..n)` where `n` is
-    /// `ROUTING_META_MAP[0]`.  Clearing the maps first (the old behaviour)
-    /// sets `n = 0`, and the datapath drops every new flow until the push
-    /// completes (`route()` returns a negative errno → `TC_ACT_SHOT`); with
-    /// many rules/CIDRs that window reaches tens to hundreds of milliseconds
-    /// on every reload.  Instead we:
+    /// Each physical rule bank has four packed metadata entries, one per
+    /// `(l4proto × ipversion)` group. Clearing first would expose an empty
+    /// generation and fail closed every new flow while a reload is publishing.
+    /// Instead we:
     ///
     /// 1. compile the whole ruleset (MatchSets + LPM plan + group bitmaps)
     ///    without touching any map;
-    /// 2. overwrite `ROUTING_MAP[0..n)` with the new MatchSets;
-    /// 3. publish the new LPM entries (per-key overwrite);
-    /// 4. atomically switch by writing the routing meta block LAST:
-    ///    the (l4proto × ipversion) group bitmaps at
-    ///    `ROUTING_META_MAP[1..]`, then the rule count at
-    ///    `ROUTING_META_MAP[0]`;
-    /// 5. only then clean up: zero the stale MatchSet slots `[n..128)` and
-    ///    prune the LPM keys the new ruleset no longer references.
+    /// 2. fill the inactive `ROUTING_MAP` bank;
+    /// 3. publish LPM values containing both the active and staged generation,
+    ///    pruning only keys referenced by neither;
+    /// 4. write the staged generation's exploded introspection metadata and
+    ///    all four packed `RoutingGroupMeta` entries;
+    /// 5. flip the one-slot generation selector only after that bank is
+    ///    complete. Physical tail slots are harmless because the packed count
+    ///    bounds evaluation; retired LPM keys leave on the next transition.
     ///
-    /// Trade-off: between steps 2 and 4 the datapath keeps the *old* rule
-    /// count while already seeing *new* MatchSet/LPM contents, so it
-    /// evaluates a mix of old and new rules and a flow may briefly be
-    /// misrouted.  It is never SHOT-dropped, though: the count always
-    /// covers a complete, valid ruleset.
+    /// The datapath reads the selector once, then one packed group entry. It
+    /// therefore evaluates either the complete old generation or the complete
+    /// replacement and never observes a mixed count/bitmap pair.
     pub fn compile(
         routes: &[CompiledRoute],
         outbound_name_to_id: &HashMap<String, u8>,
@@ -1119,7 +1115,7 @@ fn parse_mac_to_bytes(s: &str) -> Option<[u8; 6]> {
 mod tests {
     use super::*;
     use crate::ebpf::RoutingPushPhase;
-    use crate::ebpf::mock::MockEbpfBackend;
+    use crate::ebpf::mock::{MockEbpfBackend, MockRoutingPublicationWrite};
 
     #[test]
     fn test_protocol_mask() {
@@ -1181,7 +1177,7 @@ mod tests {
     }
 
     #[test]
-    fn every_failed_phase_replays_the_exact_active_plan_count_last() {
+    fn every_failed_phase_replays_the_exact_active_plan_selector_last() {
         let old_dest: Vec<ipnet::IpNet> = vec!["10.0.0.0/8".parse().unwrap()];
         let old_source: Vec<ipnet::IpNet> = vec!["192.168.0.0/16".parse().unwrap()];
         let old_route = CompiledRoute {
@@ -1235,6 +1231,41 @@ mod tests {
                 "{phase:?}"
             );
         }
+    }
+
+    #[test]
+    fn packed_group_metadata_is_complete_before_selector_flip() {
+        let mut backend = MockEbpfBackend::new();
+        let mut bitmaps = [[0u32; ROUTING_GROUP_BITMAP_WORDS]; ROUTING_GROUP_COUNT];
+        for (group, words) in bitmaps.iter_mut().enumerate() {
+            for (word, value) in words.iter_mut().enumerate() {
+                *value = ((group + 1) * 100 + word) as u32;
+            }
+        }
+
+        backend.publish_routing_generation(1, 42, &bitmaps).unwrap();
+
+        for (group, bitmap) in bitmaps.iter().enumerate() {
+            assert_eq!(
+                backend.active_routing_group_meta(group as u32),
+                Some(RoutingGroupMeta {
+                    rule_count: 42,
+                    bitmap: *bitmap,
+                })
+            );
+        }
+        let expected_tail = [
+            MockRoutingPublicationWrite::Packed(routing_group_meta_index(1, 0)),
+            MockRoutingPublicationWrite::Packed(routing_group_meta_index(1, 1)),
+            MockRoutingPublicationWrite::Packed(routing_group_meta_index(1, 2)),
+            MockRoutingPublicationWrite::Packed(routing_group_meta_index(1, 3)),
+            MockRoutingPublicationWrite::Selector(1),
+        ];
+        assert_eq!(
+            &backend.routing_publication_order
+                [backend.routing_publication_order.len() - expected_tail.len()..],
+            &expected_tail
+        );
     }
 
     #[test]
@@ -1590,55 +1621,52 @@ mod tests {
     }
 
     #[test]
-    fn test_reload_prunes_stale_lpm_and_rules() {
-        // Second push (reload) must not call clear_routes: stale LPM keys are
-        // pruned by set difference and the MatchSet tail is cleared, while the
-        // rule count always covers a complete ruleset.
+    fn reload_retains_previous_lpm_keys_for_one_transition() {
         let mut backend = MockEbpfBackend::new();
-        let mut outbound_map = HashMap::new();
-        outbound_map.insert("direct".to_string(), OutboundIndex::Direct as u8);
+        let outbound_map = HashMap::from([("direct".to_string(), OutboundIndex::Direct as u8)]);
 
-        let nets1: Vec<ipnet::IpNet> = vec!["10.0.0.0/8".parse().unwrap()];
-        let route1 = CompiledRoute {
-            ip_nets: nets1.clone(),
-            ip_trie: crate::routing::BinaryLpmTrie::from_nets(&nets1),
-            ..make_route("r1", "direct")
-        };
-        RoutingMatcherBuilder::build_and_push(
-            &mut backend,
-            &[route1],
+        let old_nets: Vec<ipnet::IpNet> = vec!["10.0.0.0/8".parse().unwrap()];
+        let old_plan = RoutingMatcherBuilder::compile(
+            &[CompiledRoute {
+                ip_nets: old_nets.clone(),
+                ip_trie: crate::routing::BinaryLpmTrie::from_nets(&old_nets),
+                ..make_route("old", "direct")
+            }],
             &outbound_map,
             "direct",
             DialMode::Ip,
         )
         .unwrap();
-        assert_eq!(backend.dest_lpm_bitmap.len(), 1);
-        assert_eq!(backend.active_routing_rule_count(), 2); // IpSet + fallback
+        RoutingMatcherBuilder::push_plan(&mut backend, &old_plan).unwrap();
 
-        // Reload with a different CIDR and fewer rules.
-        let nets2: Vec<ipnet::IpNet> = vec!["192.168.0.0/16".parse().unwrap()];
-        let route2 = CompiledRoute {
-            ip_nets: nets2.clone(),
-            ip_trie: crate::routing::BinaryLpmTrie::from_nets(&nets2),
-            ..make_route("r2", "direct")
-        };
-        RoutingMatcherBuilder::build_and_push(
-            &mut backend,
-            &[route2],
+        let new_nets: Vec<ipnet::IpNet> = vec!["192.168.0.0/16".parse().unwrap()];
+        let new_plan = RoutingMatcherBuilder::compile(
+            &[CompiledRoute {
+                ip_nets: new_nets.clone(),
+                ip_trie: crate::routing::BinaryLpmTrie::from_nets(&new_nets),
+                ..make_route("new", "direct")
+            }],
             &outbound_map,
             "direct",
             DialMode::Ip,
         )
         .unwrap();
+        RoutingMatcherBuilder::push_transition(&mut backend, Some(&old_plan), &new_plan).unwrap();
 
-        // The old CIDR is gone, the new one is present, and the bitmap
-        // references rule index 0 of the new generation (no OR-accumulation
-        // from the previous generation).
-        assert_eq!(backend.dest_lpm_bitmap.len(), 1);
-        let key2 = maps::lpm_key_bytes(&maps::cidr_to_lpm_key("192.168.0.0/16").unwrap());
-        let entry = backend.dest_lpm_bitmap.get(&key2).unwrap();
-        assert_eq!(entry.bitmap[0], 1);
+        let old_key = maps::lpm_key_bytes(&maps::cidr_to_lpm_key("10.0.0.0/8").unwrap());
+        let new_key = maps::lpm_key_bytes(&maps::cidr_to_lpm_key("192.168.0.0/16").unwrap());
+        assert_eq!(backend.dest_lpm_bitmap.len(), 2);
+        assert_eq!(
+            backend.dest_lpm_bitmap[&old_key].bitmap[ROUTING_BITMAP_WORDS_PER_GENERATION],
+            1
+        );
+        assert_eq!(backend.dest_lpm_bitmap[&new_key].bitmap[0], 1);
         assert_eq!(backend.active_routing_rule_count(), 2);
+
+        RoutingMatcherBuilder::push_transition(&mut backend, Some(&new_plan), &new_plan).unwrap();
+        assert_eq!(backend.dest_lpm_bitmap.len(), 1);
+        assert!(!backend.dest_lpm_bitmap.contains_key(&old_key));
+        assert!(backend.dest_lpm_bitmap.contains_key(&new_key));
     }
 
     #[test]

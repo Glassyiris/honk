@@ -1,0 +1,97 @@
+use std::hint::black_box;
+use std::sync::Arc;
+
+use chrono::Utc;
+use criterion::{Criterion, criterion_group, criterion_main};
+use honk_config::node::{Group, GroupPolicy, NODE_ID_NAMESPACE, Node};
+use honk_outbound::alive::{AliveDialerSet, IpVersion, ProbeDomain};
+use honk_outbound::group::GroupManager;
+use uuid::Uuid;
+
+fn node(name: &str) -> Node {
+    Node {
+        id: Uuid::new_v5(&NODE_ID_NAMESPACE, name.as_bytes()),
+        name: name.to_owned(),
+        ..Default::default()
+    }
+}
+
+fn group(name: &str, policy: GroupPolicy, nodes: &[Node]) -> Group {
+    Group {
+        id: Uuid::new_v5(&NODE_ID_NAMESPACE, name.as_bytes()),
+        name: name.to_owned(),
+        policy,
+        nodes: nodes.iter().map(|node| node.id).collect(),
+        filters: Vec::new(),
+        groups: Vec::new(),
+        default: None,
+        final_outbound: None,
+        check_url: None,
+        check_interval: None,
+        tolerance: 50,
+        idle_timeout: None,
+        interrupt_connections: false,
+        created_at: Utc::now(),
+    }
+}
+
+fn bench_group_selection(c: &mut Criterion) {
+    let nodes = vec![node("a"), node("b"), node("c")];
+    let groups = vec![
+        group("selector", GroupPolicy::Selector, &nodes),
+        group("load-balance", GroupPolicy::LoadBalance, &nodes),
+        group("fallback", GroupPolicy::Fallback, &nodes),
+    ];
+    let alive = Arc::new(AliveDialerSet::new());
+    let manager = GroupManager::with_alive_set(&groups, &nodes, Some(Arc::clone(&alive)));
+    alive.report_available_traffic(nodes[0].id, ProbeDomain::DataUdp, IpVersion::V4);
+
+    let mut group = c.benchmark_group("group_selection");
+    group.bench_function("direct_selector_plan", |b| {
+        b.iter(|| {
+            let plan = manager.selection_plan_for_domain(
+                black_box("selector"),
+                ProbeDomain::DataUdp,
+                IpVersion::V4,
+            );
+            black_box(plan.nodes[0].id)
+        });
+    });
+    group.bench_function("load_balance_tcp", |b| {
+        b.iter(|| {
+            black_box(
+                manager
+                    .select_node_for_domain(
+                        black_box("load-balance"),
+                        ProbeDomain::Tcp,
+                        IpVersion::V4,
+                    )
+                    .expect("load-balance node")
+                    .id,
+            )
+        });
+    });
+    group.bench_function("fallback_tcp", |b| {
+        b.iter(|| {
+            black_box(
+                manager
+                    .select_node_for_domain(black_box("fallback"), ProbeDomain::Tcp, IpVersion::V4)
+                    .expect("fallback node")
+                    .id,
+            )
+        });
+    });
+    group.bench_function("clean_health_success", |b| {
+        b.iter(|| {
+            alive.report_available_traffic(
+                black_box(nodes[0].id),
+                ProbeDomain::DataUdp,
+                IpVersion::V4,
+            );
+        });
+    });
+    group.finish();
+}
+
+criterion_group!(benches, bench_group_selection);
+criterion_main!(benches);

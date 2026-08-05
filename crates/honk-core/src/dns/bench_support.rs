@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -8,7 +10,7 @@ use super::cache::{CacheKey, DnsCache, OperationKind};
 use super::forwarder::{DnsForwarder, DnsUpstreamPool};
 use super::planner::{RequestScope, UpstreamTag};
 use super::policy::PolicyId;
-use super::projection::RoutingProjectionSnapshot;
+use super::projection::{ProjectionReplacementBenchmark, RoutingProjectionSnapshot};
 use super::query::{IngressProfile, QueryContext};
 use super::routing::DnsRouter;
 use super::runtime::{
@@ -51,6 +53,51 @@ impl CacheKeyBenchmarkInput {
         )
         .wire_identity()
         .len()
+    }
+}
+
+pub struct ProjectionBenchmark {
+    replacement: ProjectionReplacementBenchmark,
+}
+
+impl ProjectionBenchmark {
+    pub fn new() -> Self {
+        let rule = honk_config::routing::RoutingRule {
+            name: "projection-bench".to_owned(),
+            condition: honk_config::routing::RoutingCondition {
+                domain: vec!["projection.example".to_owned()],
+                ..Default::default()
+            },
+            outbound: honk_config::routing::RoutingOutbound::Simple("direct".to_owned()),
+            priority: 1,
+            must: false,
+            mark: 0,
+        };
+        let matcher = Arc::new(Router::new(&[rule], "direct").expect("benchmark router"));
+        let mut bitmap = honk_ebpf_common::DomainRouting::default();
+        bitmap.bitmap[0] = 1;
+        let snapshot = Arc::new(RoutingProjectionSnapshot::new(
+            1,
+            matcher,
+            HashMap::from([("projection-bench".to_owned(), vec![bitmap])]),
+        ));
+        Self {
+            replacement: ProjectionReplacementBenchmark::new(
+                snapshot,
+                Arc::<str>::from("projection.example"),
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            ),
+        }
+    }
+
+    pub fn replace(&mut self) -> u64 {
+        self.replacement.replace()
+    }
+}
+
+impl Default for ProjectionBenchmark {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

@@ -2,35 +2,20 @@ use crate::dns::planner::{RequestScope, UpstreamTag};
 use crate::dns::policy::PolicyId;
 use crate::dns::query::{IngressProfile, QueryContext};
 
-use super::{CacheKey, DnsCache, OperationKind};
+use super::{CacheKey, DnsCache, OperationKind, make_test_response};
 
 #[test]
-fn cache_key_canonical_bytes_have_stable_golden_identity() {
+fn exact_key_has_stable_typed_identity() {
     let key = CacheKey::for_test(
         vec![0, 0, 1],
         IngressProfile::Internal,
         RequestScope::Upstream(UpstreamTag::new("default").expect("tag")),
         OperationKind::Resolve,
     );
-    let canonical_hex = key
-        .canonical_bytes()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let identical = key.clone();
 
-    assert_eq!(
-        canonical_hex,
-        "4844434b0101000000030000010213032004300000000764656661756c740540"
-    );
-    assert_eq!(
-        key.storage_key(),
-        concat!(
-            "honk-dns-cache-key:v1:",
-            "caae7e784d48452782f192a41b2899cafa9c3042336fa67ae5e857a258deac76:",
-            "4844434b0101000000030000010213032004300000000764656661756c740540"
-        )
-    );
-    assert_eq!(DnsCache::new(16).shard_index(&key.storage_key()), 7);
+    assert_eq!(key, identical);
+    assert_eq!(key.shard_hash(), identical.shard_hash());
 }
 
 #[test]
@@ -69,20 +54,8 @@ fn cache_key_canonical_fields_are_separated_and_collision_checked() {
     ];
 
     for variant in variants {
-        assert_ne!(base.canonical_bytes(), variant.canonical_bytes());
-        assert_ne!(base.storage_key(), variant.storage_key());
+        assert_ne!(base, variant);
     }
-    let storage = base.storage_key();
-    let (_, canonical_hex) = storage
-        .rsplit_once(':')
-        .expect("digest and collision material");
-    assert_eq!(
-        canonical_hex,
-        base.canonical_bytes()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
-    );
 }
 
 #[test]
@@ -144,9 +117,94 @@ fn exact_key_separates_wire_profile_policy_scope_and_operation() {
     ));
 
     assert!(variants.iter().all(|variant| variant != &base));
-    assert!(
-        variants
-            .iter()
-            .all(|variant| variant.storage_key() != base.storage_key())
+}
+
+#[test]
+fn exact_negative_identity_isolated_and_flush_fenced() {
+    let wire = crate::dns::forwarder::build_dns_query("negative.example", 1);
+    let query = QueryContext::parse(&wire).expect("query");
+    let scope = RequestScope::Upstream(UpstreamTag::new("default").expect("scope"));
+    let key = CacheKey::new(&query, None, scope.clone(), OperationKind::Resolve);
+    let other_scope = CacheKey::new(
+        &query,
+        None,
+        RequestScope::Upstream(UpstreamTag::new("other").expect("other scope")),
+        OperationKind::Resolve,
     );
+    let refresh = CacheKey::new(&query, None, scope, OperationKind::Refresh);
+    let cache = DnsCache::new(16);
+    let service = cache.service();
+    let old_epoch = service.publication_epoch();
+
+    service.put_negative_if_current(old_epoch, key.clone(), 60, 3);
+    assert_eq!(
+        service.negative_hit_exact(&key).map(|hit| hit.rcode),
+        Some(3)
+    );
+    assert!(service.negative_hit_exact(&other_scope).is_none());
+    assert!(service.negative_hit_exact(&refresh).is_none());
+
+    let flush = service.begin_flush();
+    assert!(service.negative_hit_exact(&key).is_none());
+    service.put_negative_if_current(old_epoch, key.clone(), 60, 2);
+    assert!(service.negative_hit_exact(&key).is_none());
+    drop(flush);
+
+    service.put_negative_if_current(service.publication_epoch(), key.clone(), 60, 2);
+    assert_eq!(
+        service.negative_hit_exact(&key).map(|hit| hit.rcode),
+        Some(2)
+    );
+}
+
+#[test]
+fn expired_exact_negative_preserves_the_stale_positive() {
+    let wire = crate::dns::forwarder::build_dns_query("stale-after-error.example", 1);
+    let query = QueryContext::parse(&wire).expect("query");
+    let key = CacheKey::new(
+        &query,
+        None,
+        RequestScope::Upstream(UpstreamTag::new("default").expect("scope")),
+        OperationKind::Resolve,
+    );
+    let response = make_test_response([192, 0, 2, 1], 300);
+    let cache = DnsCache::new(1);
+    let service = cache.service();
+
+    service.put_exact(key.clone(), response.clone(), 300);
+    service.put_negative_exact(key.clone(), 60, 2);
+    assert_eq!(service.len(), 1);
+    assert_eq!(service.get_exact(&key).unwrap().response.as_ref(), response);
+    assert_eq!(
+        service.negative_hit_exact(&key).map(|hit| hit.rcode),
+        Some(2)
+    );
+
+    service.expire_positive_exact_for_test(&key);
+    assert!(service.get_stale_exact(&key).is_some());
+    service.insert_expired_negative_exact_for_test(key.clone(), 2);
+    assert!(service.negative_hit_exact(&key).is_none());
+    assert_eq!(
+        service.get_stale_exact(&key).unwrap().response.as_ref(),
+        response
+    );
+}
+
+#[test]
+fn expired_exact_negative_only_slot_is_removed() {
+    let wire = crate::dns::forwarder::build_dns_query("expired-negative.example", 1);
+    let query = QueryContext::parse(&wire).expect("query");
+    let key = CacheKey::new(
+        &query,
+        None,
+        RequestScope::Upstream(UpstreamTag::new("default").expect("scope")),
+        OperationKind::Resolve,
+    );
+    let cache = DnsCache::new(1);
+    let service = cache.service();
+    service.insert_expired_negative_exact_for_test(key.clone(), 2);
+
+    assert_eq!(service.len(), 1);
+    assert!(service.negative_hit_exact(&key).is_none());
+    assert_eq!(service.len(), 0);
 }
