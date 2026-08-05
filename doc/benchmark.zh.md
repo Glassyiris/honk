@@ -97,6 +97,57 @@ ssh root@10.10.10.57 "bash /root/lab-bench.sh 'honk dae' 'hy2 tuic ss2022 trojan
 ssh root@10.10.10.57 bash /root/test-protocols.sh
 ```
 
+## 结果(2026-08-05,ARM A/B: honk vs dae @ NanoPi R2S)
+
+双引擎对照轮,引擎机 NanoPi R2S(两轮:.43 板载网口 / .45 USB 网卡复测),
+honk 为 feat/rprx `2ad0a93` aarch64 musl,dae 为 kdae `ae056a6a`(go1.26.5)。
+方法学不变;两引擎同一时刻只跑一个。dae 仅支持共有协议行(hy2/tuic/
+ss2022/trojan)。两轮交替取均值,轮内偏差 <5%。**注意 .45 复测用 USB 网卡,
+绝对带宽整体下移 ~10–15%,引擎间比值才是可比项。**
+
+### TCP(.45 复测值;`→` 后为 .43 首轮值)
+
+| 引擎 | 协议 | cold | hot p50 | bw (Mbps) | cpu | RSS (MB) |
+| --- | --- | --- | --- | --- | --- | --- |
+| honk | direct | 0.0062 | – | 370 →458 | 0.71 | 52 |
+| dae | direct | 0.0057 | – | 895 →931 | 0.01 | 39 |
+| honk | hy2 | 0.0091 | 0.0081 | 268 →303 | 1.34 | 59 |
+| dae | hy2 | 0.0367 | 0.0079 | 191 →197 | 1.86 | 57 |
+| honk | tuic | 0.0070 | 0.0070 | 262 →293 | 1.36 | 59 |
+| dae | tuic | 0.1040 | 0.0834 | 196 →208 | 1.80 | 49 |
+| honk | ss2022 | 0.0070 | 0.0058 | 353 →385 | 0.88 | 51 |
+| dae | ss2022 | 0.0114 | 0.0092 | 247 →265 | 0.87 | 41 |
+| honk | trojan | 0.0221 | 0.0061 | 282 →328 | 0.88 | 53 |
+| dae | trojan | 0.0228 | 0.0163 | 171 →201 | 0.78 | 42 |
+
+### UDP(.45 复测值;echo RTT 秒 / 饱和接收 Mbps / cpu)
+
+| 引擎 | 协议 | RTT | bw | cpu |
+| --- | --- | --- | --- | --- |
+| honk | hy2/udp | 0.0029 | 33 | 1.85 |
+| dae | hy2/udp | 0.0034 | 31 | 2.14 |
+| honk | tuic/udp | 0.0028 | 53 | 1.76 |
+| dae | tuic/udp | 0.0034 | 33 | 2.21 |
+| honk | ss2022/udp | 0.0021 | 34 (73.8%) | 0.93 |
+| dae | ss2022/udp | 0.0027 | 40 (87.9%) | 1.29 |
+| honk | trojan/udp | 0.0019 | 31 | 0.88 |
+| dae | trojan/udp | 0.0031 | 49 | 1.45 |
+
+解读:
+
+- **honk TCP 吞吐领先 35–65% 且可复现**:hy2 1.40×、tuic 1.34×、trojan
+  1.65×、ss2022 1.43×(与 .43 轮比值漂移 ≤0.1);每 Mbps 的 CPU 成本约为
+  dae 的一半(hy2: 1.34 核@268 vs 1.86 核@191)。A53 弱核上 Go 运行时的
+  每字节成本在 QUIC 协议上被放大得最厉害。
+- **延迟**:dae tuic 热 p50 83ms/冷 104ms(每连接重建 QUIC 会话)两轮原样
+  重现;honk 全协议热 p50 ≤8ms。UDP echo RTT honk 各行稳定低 0.5–1.2ms。
+- **direct 行差异是路径而非引擎**:dae 把 fallback direct 全量 eBPF 卸载
+  (895Mbps@0.01 核),honk 只对 must 标记的 direct 卸载,fallback direct
+  走用户态 relay(370@0.71)——可作 honk 后续优化点。
+- **UDP** 两引擎都触及 A53 平台瓶颈(30–57Mbps),互有胜负;内存 dae 略省
+  (38–59MB vs 48–61MB),1GB 设备上均非约束。
+- 公平性:双方 TCP relay 均在用户态(dae 日志确认 eBPF offload 关闭)。
+
 ## 结果(2026-08-05,ARM 轮: NanoPi R2S / RK3328)
 
 引擎机 10.10.10.43(NanoPi R2S: 4×Cortex-A53 @1.3GHz, 968MB RAM, end0

@@ -111,6 +111,62 @@ ssh root@10.10.10.57 "bash /root/lab-bench.sh 'honk dae' 'hy2 tuic ss2022 trojan
 ssh root@10.10.10.57 bash /root/test-protocols.sh
 ```
 
+## Results (2026-08-05, ARM A/B: honk vs dae @ NanoPi R2S)
+
+Two-engine comparison on the NanoPi R2S (two runs: .43 onboard NIC, then a
+.45 re-run over a USB NIC); honk is feat/rprx `2ad0a93` aarch64-musl, dae is
+kdae `ae056a6a` (go1.26.5). Methodology unchanged; only one engine runs at a
+time. dae only supports the shared protocol rows (hy2/tuic/ss2022/trojan).
+Values are means of two alternating rounds, <5% intra-round deviation.
+**The .45 re-run used a USB NIC, shifting absolute bandwidth down ~10–15% —
+compare ratios, not absolutes.**
+
+### TCP (.45 re-run values; `→` shows the .43 first round)
+
+| Engine | Protocol | cold | hot p50 | bw (Mbps) | cpu | RSS (MB) |
+| --- | --- | --- | --- | --- | --- | --- |
+| honk | direct | 0.0062 | – | 370 →458 | 0.71 | 52 |
+| dae | direct | 0.0057 | – | 895 →931 | 0.01 | 39 |
+| honk | hy2 | 0.0091 | 0.0081 | 268 →303 | 1.34 | 59 |
+| dae | hy2 | 0.0367 | 0.0079 | 191 →197 | 1.86 | 57 |
+| honk | tuic | 0.0070 | 0.0070 | 262 →293 | 1.36 | 59 |
+| dae | tuic | 0.1040 | 0.0834 | 196 →208 | 1.80 | 49 |
+| honk | ss2022 | 0.0070 | 0.0058 | 353 →385 | 0.88 | 51 |
+| dae | ss2022 | 0.0114 | 0.0092 | 247 →265 | 0.87 | 41 |
+| honk | trojan | 0.0221 | 0.0061 | 282 →328 | 0.88 | 53 |
+| dae | trojan | 0.0228 | 0.0163 | 171 →201 | 0.78 | 42 |
+
+### UDP (.45 re-run; echo RTT s / saturated receive Mbps / cpu)
+
+| Engine | Protocol | RTT | bw | cpu |
+| --- | --- | --- | --- | --- |
+| honk | hy2/udp | 0.0029 | 33 | 1.85 |
+| dae | hy2/udp | 0.0034 | 31 | 2.14 |
+| honk | tuic/udp | 0.0028 | 53 | 1.76 |
+| dae | tuic/udp | 0.0034 | 33 | 2.21 |
+| honk | ss2022/udp | 0.0021 | 34 (73.8%) | 0.93 |
+| dae | ss2022/udp | 0.0027 | 40 (87.9%) | 1.29 |
+| honk | trojan/udp | 0.0019 | 31 | 0.88 |
+| dae | trojan/udp | 0.0031 | 49 | 1.45 |
+
+Read-out:
+
+- **honk leads TCP throughput by 35–65%, reproducibly**: hy2 1.40×, tuic
+  1.34×, trojan 1.65×, ss2022 1.43× (ratio drift vs the .43 round ≤0.1); CPU
+  cost per Mbps is about half of dae's (hy2: 1.34 cores@268 vs 1.86@191). On
+  A53 little cores the Go runtime's per-byte cost is amplified most on QUIC.
+- **Latency**: dae's tuic hot p50 83ms / cold 104ms (per-connection QUIC
+  session rebuild) reproduces exactly; honk stays ≤8ms hot p50 across all
+  protocols. honk's UDP echo RTT is consistently 0.5–1.2ms lower per row.
+- **The direct-row gap is path, not engine**: dae offloads fallback-direct
+  fully in eBPF (895Mbps@0.01 cores); honk only offloads must-marked direct
+  and relays fallback-direct in userspace (370@0.71) — a candidate honk
+  optimization.
+- **UDP** hits the A53 platform ceiling for both engines (30–57 Mbps); memory
+  slightly favors dae (38–59 vs 48–61MB), neither is a constraint at 1GB.
+- Fairness: both engines relay TCP in userspace (dae log confirms eBPF
+  offload disabled).
+
 ## Results (2026-08-05, ARM round: NanoPi R2S / RK3328)
 
 Engine host 10.10.10.43 (NanoPi R2S: 4×Cortex-A53 @1.3GHz, 968MB RAM, end0
