@@ -177,7 +177,7 @@ honk 有三套互相独立的预热机制，全部有预算约束——都不随
 | 启动裸 TCP 预连接 | `preconnect_node_count` | `'auto'` | `'auto'` = 最多 8 个节点（各组当前选中优先，其次配置顺序）;`0` 关闭；`N` 指定数量。仅可裸 TCP 池化的协议参与——AnyTLS/QUIC 与内置 `direct`/`block` 一律跳过。 |
 | TCP/TLS 保活集合 | `tcp_warm_node_count` | `1` | 每组每 IP 族保活最快的 K 个 AnyTLS/TCP 叶子。节点少（<50）时设 `3`-`5` 可明显降低非 winner 链路的首连延迟；大订阅保持 `1`-`2`。 |
 | UDP 预热集合 | `udp_warm_node_count` | `0` | 每组每 IP 族 top-N 个 UDP 叶子；进程级总量自动封顶为 `4×N`，组再多也不会失控。 |
-| 并发拨号上限 | `max_concurrent_dials` | `64` | 限制并发代理拨号（connect + 协议握手）；内置 `direct`/`block` 本地拨号不占额度。按 generation 生效——reload 后只影响新拨号。 |
+| 并发拨号上限 | `max_concurrent_dials` | `64` | 按 generation 限制并发代理拨号（connect + 协议握手）；内置 `direct`/`block` 本地拨号不占额度。reload 会更新 replacement 的局部上限，但新旧 generation 始终共享启动时确定的同一个描述符 gate。 |
 
 健康探测只测不暖：冷节点被探测后不会留下任何常驻会话，400 节点的
 订阅也不会因健康检查常驻 400 条隧道。`/stats` 的 `warm` 字段可观测

@@ -29,6 +29,7 @@ pub(super) fn rejected_outcome(
         engine,
         prepared,
         make_empty_response(raw_query, prepared.domain(), prepared.qtype()),
+        None,
         status,
         Provenance::Fresh,
         EffectiveExpiry::do_not_cache(),

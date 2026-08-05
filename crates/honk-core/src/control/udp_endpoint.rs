@@ -15,7 +15,7 @@ use std::collections::HashSet;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
@@ -28,50 +28,19 @@ const DEFAULT_NAT_TIMEOUT: Duration = Duration::from_secs(30);
 const JANITOR_INTERVAL: Duration = Duration::from_secs(5);
 /// How long the endpoint driver waits for proxy data before giving up.
 const REPLY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
-/// TTL for the per-endpoint UDP routing result cache.
-const ROUTING_CACHE_TTL: Duration = Duration::from_secs(30);
 /// Hard cap on pooled endpoints. A unique-tuple UDP flood must not be able
 /// to grow the pool (and with it sockets, reply tasks and memory) without
 /// bound — at the cap new mappings are refused and the datagram is dropped,
 /// which UDP tolerates by design.
-const MAX_ENDPOINTS: usize = 8192;
+pub(crate) const MAX_ENDPOINTS: usize = 8192;
 /// At most 64 datagrams, including the initializer's first packet, may be
 /// retained for one flow.
 const FLOW_QUEUE_CAPACITY: usize = 64;
 /// All retained payload bytes across UDP flows are bounded exactly by permits.
 const GLOBAL_PAYLOAD_CAPACITY: usize = 8 * 1024 * 1024;
-/// Process-wide proxy FD ceiling used even when RLIMIT_NOFILE is enormous.
-const PROXY_FD_BUDGET: usize = 16_384;
-/// One independent UDP endpoint may own a transport and an anyfrom reply socket.
-const UDP_FDS_PER_ENDPOINT: usize = 2;
-const NON_PROXY_FD_RESERVE: usize = 256;
 const TRANSPORT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const DRIVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(6);
 const DRIVER_ABORT_TIMEOUT: Duration = Duration::from_secs(1);
-
-fn endpoint_capacity_for_nofile(nofile: usize) -> usize {
-    let budget = nofile.min(PROXY_FD_BUDGET);
-    let non_proxy = NON_PROXY_FD_RESERVE.min(budget / 4);
-    let tcp_pool = crate::pool::MAX_TOTAL_ENTRIES.min(budget / 4);
-    budget
-        .saturating_sub(non_proxy + tcp_pool)
-        .checked_div(UDP_FDS_PER_ENDPOINT)
-        .unwrap_or(0)
-        .clamp(1, MAX_ENDPOINTS)
-}
-
-fn production_endpoint_capacity() -> usize {
-    let mut limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    let nofile = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
-        usize::try_from(limit.rlim_cur).unwrap_or(PROXY_FD_BUDGET)
-    } else {
-        PROXY_FD_BUDGET
-    };
-    endpoint_capacity_for_nofile(nofile)
-}
 /// A pooled UDP endpoint representing one NAT mapping.
 pub struct UdpEndpoint {
     /// The proxy-side framed UDP transport (upstream).
@@ -98,14 +67,6 @@ pub struct UdpEndpoint {
     /// application send attempt. This lock is held only synchronously; no
     /// transport I/O occurs while it is held.
     send_gate: Mutex<()>,
-    /// Packed destination address for routing cache validation.
-    routing_cache_dst: AtomicU64,
-    /// Cached outbound index.
-    routing_cache_outbound: AtomicU8,
-    /// Monotonic nanos when the cache entry was stored.
-    routing_cache_at: AtomicI64,
-    /// Whether a valid routing cache entry exists.
-    has_routing_cache: AtomicBool,
     /// Ring buffer of peers we've sent packets to (for reply validation).
     pending_reply_peers: Mutex<[(SocketAddr, bool); 8]>,
     /// Next ring position to write.
@@ -137,10 +98,6 @@ impl UdpEndpoint {
             ref_count: AtomicI64::new(1),
             dead: AtomicBool::new(false),
             send_gate: Mutex::new(()),
-            routing_cache_dst: AtomicU64::new(0),
-            routing_cache_outbound: AtomicU8::new(0),
-            routing_cache_at: AtomicI64::new(0),
-            has_routing_cache: AtomicBool::new(false),
             pending_reply_peers: Mutex::new(
                 [(
                     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
@@ -198,42 +155,6 @@ impl UdpEndpoint {
 
     fn take_first_reply_metric(&self) -> Option<Duration> {
         (!self.first_reply_recorded.swap(true, Ordering::AcqRel)).then(|| self.created_at.elapsed())
-    }
-
-    /// Cache the routing result for this endpoint.
-    ///
-    /// Stores the destination and outbound index with a TTL so that
-    /// subsequent UDP packets on the same endpoint can skip eBPF
-    /// handoff lookup and Router evaluation.
-    pub fn cache_routing_result(&self, dst: SocketAddr, outbound: u8) {
-        let packed = pack_socket_addr(dst);
-        self.routing_cache_dst.store(packed, Ordering::Relaxed);
-        self.routing_cache_outbound
-            .store(outbound, Ordering::Relaxed);
-        self.routing_cache_at
-            .store(monotonic_nanos(), Ordering::Relaxed);
-        self.has_routing_cache.store(true, Ordering::Relaxed);
-    }
-
-    /// Retrieve a cached routing result for this endpoint.
-    ///
-    /// Returns `Some(outbound)` if the cache is valid for the given
-    /// destination and the TTL has not expired. Returns `None` otherwise.
-    pub fn get_cached_routing(&self, dst: SocketAddr) -> Option<u8> {
-        if !self.has_routing_cache.load(Ordering::Relaxed) {
-            return None;
-        }
-        let packed = pack_socket_addr(dst);
-        if self.routing_cache_dst.load(Ordering::Relaxed) != packed {
-            return None;
-        }
-        let now = monotonic_nanos();
-        let cached_at = self.routing_cache_at.load(Ordering::Relaxed);
-        if now - cached_at > nanos_from_dur(ROUTING_CACHE_TTL) {
-            self.has_routing_cache.store(false, Ordering::Relaxed);
-            return None;
-        }
-        Some(self.routing_cache_outbound.load(Ordering::Relaxed))
     }
 
     pub fn has_reply(&self) -> bool {
@@ -798,13 +719,17 @@ pub struct UdpEndpointPool {
 }
 
 impl UdpEndpointPool {
+    /// Construct a max-capacity pool for tests and standalone callers.
     pub fn new() -> Self {
-        Self::with_capacity_limit(production_endpoint_capacity())
+        Self::with_capacity_limit(MAX_ENDPOINTS)
     }
 
-    /// Construct a pool with a deterministic endpoint cap for lifecycle tests.
+    /// Construct a pool with an explicit endpoint cap.
     pub fn with_capacity_limit(capacity_limit: usize) -> Self {
-        Self::with_reply_socket_factory(capacity_limit, Arc::new(SystemUdpReplySocketFactory))
+        Self::with_reply_socket_factory(
+            capacity_limit.min(MAX_ENDPOINTS),
+            Arc::new(SystemUdpReplySocketFactory),
+        )
     }
 
     /// Production dependency injection seam for synchronous anyfrom creation.
@@ -1120,10 +1045,8 @@ impl UdpEndpointPool {
         }
     }
 
-    /// Existing Ready endpoint lookup for routing-cache compatibility. The
-    /// fast path itself uses `fast_path_enqueue` so it never obtains a
-    /// transport and cannot await a send.
-    pub fn get(&self, client: SocketAddr, dst: SocketAddr) -> Option<Arc<UdpEndpoint>> {
+    #[cfg(test)]
+    pub(super) fn get(&self, client: SocketAddr, dst: SocketAddr) -> Option<Arc<UdpEndpoint>> {
         let entry = self.endpoints.get(&EndpointKey::new(client, dst))?;
         match entry.value() {
             EndpointEntry::Ready(ready)
@@ -1664,7 +1587,7 @@ async fn send_one(
     // before it prevents any transport call; death after it is ambiguous, so
     // this driver never retries the packet or starts later followers.
     endpoint.begin_send_attempt()?;
-    let started = Instant::now();
+    let started = first.then(Instant::now);
     let sent = tokio::time::timeout(
         TRANSPORT_SEND_TIMEOUT,
         endpoint.proxy_socket.send_packet(&packet.data),
@@ -1677,7 +1600,7 @@ async fn send_one(
             "UDP PacketTransport send timed out",
         )),
     };
-    if first {
+    if let Some(started) = started {
         stats.record_udp_first_send_latency(started.elapsed());
     }
     match result {
@@ -1761,32 +1684,6 @@ fn nanos_from_dur(d: Duration) -> i64 {
     d.as_nanos() as i64
 }
 
-/// Pack a SocketAddr into a u64 for fast atomic comparisons.
-///
-/// IPv4: `(octets as u32) as u64) << 16 | port`
-/// IPv6: XOR of address bytes with port for collision resistance.
-fn pack_socket_addr(addr: SocketAddr) -> u64 {
-    match addr.ip() {
-        std::net::IpAddr::V4(ip) => {
-            let octets = ip.octets();
-            ((octets[0] as u64) << 24
-                | (octets[1] as u64) << 16
-                | (octets[2] as u64) << 8
-                | octets[3] as u64)
-                << 16
-                | (addr.port() as u64)
-        }
-        std::net::IpAddr::V6(ip) => {
-            let octets = ip.octets();
-            let lo = u64::from_be_bytes([
-                octets[8], octets[9], octets[10], octets[11], octets[12], octets[13], octets[14],
-                octets[15],
-            ]);
-            lo ^ ((addr.port() as u64) << 48)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     fn transport(
@@ -1798,11 +1695,23 @@ mod tests {
 
     use super::*;
     #[test]
-    fn endpoint_capacity_reserves_process_fd_budget() {
-        assert_eq!(endpoint_capacity_for_nofile(64), 16);
-        assert_eq!(endpoint_capacity_for_nofile(1_024), 256);
-        assert_eq!(endpoint_capacity_for_nofile(PROXY_FD_BUDGET), 7_040);
-        assert_eq!(endpoint_capacity_for_nofile(usize::MAX), 7_040);
+    fn pool_constructors_use_max_or_explicit_capacity() {
+        assert_eq!(
+            UdpEndpointPool::new().endpoint_slots.available_permits(),
+            MAX_ENDPOINTS
+        );
+        assert_eq!(
+            UdpEndpointPool::with_capacity_limit(3)
+                .endpoint_slots
+                .available_permits(),
+            3
+        );
+        assert_eq!(
+            UdpEndpointPool::with_capacity_limit(usize::MAX)
+                .endpoint_slots
+                .available_permits(),
+            MAX_ENDPOINTS
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2533,7 +2442,7 @@ mod tests {
             client,
             dst,
             Arc::new(honk_outbound::alive::AliveDialerSet::new()),
-            stats,
+            Arc::clone(&stats),
             "test-node".to_owned(),
             first,
             first_ack_tx,
@@ -2545,6 +2454,7 @@ mod tests {
             transport.sent_packets(),
             vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()]
         );
+        assert_eq!(stats.udp_snapshot().first_send_latency.count, 1);
         worker.abort();
     }
 
@@ -3356,67 +3266,6 @@ mod tests {
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
         drop(replacement);
-    }
-
-    #[test]
-    fn test_routing_cache_hit() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let proxy = Arc::new(
-            rt.block_on(tokio::net::UdpSocket::bind("127.0.0.1:0"))
-                .unwrap(),
-        );
-        let relay = make_addr("192.168.1.1", 1080);
-        let ep = UdpEndpoint::new(transport(proxy, relay), relay, TEST_NODE_ID);
-        let dst = make_addr("8.8.8.8", 53);
-
-        assert!(ep.get_cached_routing(dst).is_none());
-
-        ep.cache_routing_result(dst, 5);
-        assert_eq!(ep.get_cached_routing(dst), Some(5));
-    }
-
-    #[test]
-    fn test_routing_cache_different_dst_miss() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let proxy = Arc::new(
-            rt.block_on(tokio::net::UdpSocket::bind("127.0.0.1:0"))
-                .unwrap(),
-        );
-        let ep = UdpEndpoint::new(
-            transport(proxy, make_addr("192.168.1.1", 1080)),
-            make_addr("192.168.1.1", 1080),
-            TEST_NODE_ID,
-        );
-
-        ep.cache_routing_result(make_addr("8.8.8.8", 53), 3);
-        assert!(ep.get_cached_routing(make_addr("1.1.1.1", 53)).is_none());
-    }
-
-    #[test]
-    fn test_routing_cache_expiry() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let proxy = Arc::new(
-            rt.block_on(tokio::net::UdpSocket::bind("127.0.0.1:0"))
-                .unwrap(),
-        );
-        let ep = UdpEndpoint::new(
-            transport(proxy, make_addr("192.168.1.1", 1080)),
-            make_addr("192.168.1.1", 1080),
-            TEST_NODE_ID,
-        );
-        let dst = make_addr("8.8.8.8", 53);
-
-        ep.cache_routing_result(dst, 7);
-        assert_eq!(ep.get_cached_routing(dst), Some(7));
-
-        // Force expiry by backdating the timestamp past the TTL.
-        ep.routing_cache_at.store(
-            monotonic_nanos()
-                - nanos_from_dur(ROUTING_CACHE_TTL)
-                - nanos_from_dur(Duration::from_secs(1)),
-            Ordering::Relaxed,
-        );
-        assert!(ep.get_cached_routing(dst).is_none());
     }
 
     #[tokio::test]

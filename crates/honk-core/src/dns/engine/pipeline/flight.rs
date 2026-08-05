@@ -27,6 +27,7 @@ pub(super) async fn waiter_outcome(
         context.engine,
         context.prepared,
         response,
+        None,
         OutcomeStatus::Accepted,
         Provenance::Upstream,
         EffectiveExpiry::do_not_cache(),

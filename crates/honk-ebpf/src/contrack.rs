@@ -27,12 +27,11 @@ pub type ConnStateAlias = ConnState;
 /// Lazy-timestamp update interval: only bump `last_seen_ns` when > 1 s elapsed.
 pub const UDP_CONN_STATE_UPDATE_INTERVAL_NS: u64 = 1_000_000_000;
 
-/// Refresh interval for `REDIRECT_TRACK` / `ROUTING_HANDOFF_MAP` writes on
-/// cached-flow packets: skip the map update while the existing entry is
-/// fresher than this (1 s), using the same lazy-timestamp pattern as the
-/// conn-state updates above.  Time comparisons must use `wrapping_sub` so
-/// the verifier sees monotonic unsigned arithmetic.
-pub const REDIRECT_REFRESH_INTERVAL_NS: u64 = 1_000_000_000;
+/// Refresh interval for `COOKIE_PID_MAP`, `REDIRECT_TRACK`, and
+/// `ROUTING_HANDOFF_MAP`: cached packets skip timestamp writes while an entry
+/// is fresher than one second. Time comparisons use `wrapping_sub` for
+/// verifier-friendly monotonic arithmetic.
+pub const AUXILIARY_MAP_REFRESH_INTERVAL_NS: u64 = 1_000_000_000;
 
 pub const TCP_CONN_STATE_UPDATE_INTERVAL_NS: u64 = 1_000_000_000; // 1 second
 
@@ -314,6 +313,28 @@ pub fn mark_tcp_seen(
     }
 }
 
+#[inline(always)]
+fn lookup_udp_seen_at(key: &TuplesKey, now: u64) -> Option<&'static mut ConnState> {
+    let ptr = CONN_STATE_MAP.get_ptr_mut(key)?;
+    if udp_conn_state_expired(unsafe { &*ptr }, now) {
+        let _ = CONN_STATE_MAP.remove(key);
+        occupancy_add(OCCUPANCY_EBPF_DELETES);
+        return None;
+    }
+    let state = unsafe { &mut *ptr };
+    if now.wrapping_sub(state.last_seen_ns) > UDP_CONN_STATE_UPDATE_INTERVAL_NS {
+        state.last_seen_ns = now;
+    }
+    Some(state)
+}
+
+/// Look up an existing live UDP entry and lazily refresh its timestamp.
+/// Missing or expired entries are never allocated on this path.
+#[inline(always)]
+pub fn lookup_udp_seen(key: &TuplesKey) -> Option<&'static mut ConnState> {
+    lookup_udp_seen_at(key, unsafe { bpf_ktime_get_ns() })
+}
+
 /// Noinline core for UDP connection tracking.
 ///
 /// Returns a mutable reference to the [`ConnState`] entry on success,
@@ -327,32 +348,20 @@ fn __mark_udp_seen(
     let args = unsafe { &*args };
     let now = unsafe { bpf_ktime_get_ns() };
 
-    // Reuse the first lookup for an unexpired steady-state entry. An expired
-    // entry is removed before insertion, so no pointer is used after removal.
-    if let Some(ptr) = CONN_STATE_MAP.get_ptr_mut(key) {
-        let state = unsafe { &mut *ptr };
-        if !udp_conn_state_expired(state, now) {
-            if now.wrapping_sub(state.last_seen_ns) > UDP_CONN_STATE_UPDATE_INTERVAL_NS {
-                state.last_seen_ns = now;
+    if let Some(state) = lookup_udp_seen_at(key, now) {
+        // Update routing only when the caller publishes a complete decision.
+        if args.has_routing() {
+            let meta = build_routing_meta(args.outbound, args.mark, args.must, args.dscp);
+            if args.has_mac() {
+                state.mac.copy_from_slice(&args.mac);
             }
-
-            // Update routing if provided (e.g., routing decision changed).
-            if args.has_routing() {
-                let meta = build_routing_meta(args.outbound, args.mark, args.must, args.dscp);
-                if args.has_mac() {
-                    state.mac.copy_from_slice(&args.mac);
-                }
-                if args.has_pname() {
-                    state.pname.copy_from_slice(&args.pname);
-                }
-                state.pid = args.pid;
-                publish_routing_meta(&mut state.meta, meta);
+            if args.has_pname() {
+                state.pname.copy_from_slice(&args.pname);
             }
-            return state as *mut ConnState;
+            state.pid = args.pid;
+            publish_routing_meta(&mut state.meta, meta);
         }
-
-        let _ = CONN_STATE_MAP.remove(key);
-        occupancy_add(OCCUPANCY_EBPF_DELETES);
+        return state as *mut ConnState;
     }
 
     let has_rt = args.has_routing();

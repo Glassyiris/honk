@@ -45,7 +45,7 @@ pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, Dn
     };
 
     let mut traversal = ResponseTraversal::start(context.logical_upstream.clone());
-    let (status, class) = loop {
+    let (status, class, analyzed_answer_ips) = loop {
         match context.engine.analyze(
             context.prepared,
             traversal,
@@ -56,17 +56,22 @@ pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, Dn
                 response: analyzed,
                 traversal: accepted,
             } => {
-                response = analyzed.wire;
-                traversal = accepted;
+                let class = analyzed.class;
                 if context.reuse_eligible
-                    && analyzed.class == ResponseClass::Servfail
+                    && class == ResponseClass::Servfail
                     && let Some(stale) =
-                        stale_outcome(context, &upstream_name, traversal_strings(&traversal))
-                            .await?
+                        stale_outcome(context, &upstream_name, traversal_strings(&accepted)).await?
                 {
                     return Ok(stale);
                 }
-                break (OutcomeStatus::Accepted, analyzed.class);
+                let wire_len = analyzed.wire.len();
+                response = analyzed.wire;
+                traversal = accepted;
+                break (
+                    OutcomeStatus::Accepted,
+                    class,
+                    Some((wire_len, analyzed.answer_ips)),
+                );
             }
             ResponseDirective::Reject {
                 response: analyzed,
@@ -78,7 +83,7 @@ pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, Dn
                     context.prepared.qtype(),
                 );
                 traversal = rejected;
-                break (OutcomeStatus::Rejected, analyzed.class);
+                break (OutcomeStatus::Rejected, analyzed.class, None);
             }
             ResponseDirective::Requery {
                 upstream,
@@ -115,7 +120,7 @@ pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, Dn
             context.raw_query,
             context.prepared.domain(),
             context.prepared.qtype(),
-            response,
+            response.into(),
             context.original_dst,
             context.prepared.query().ingress(),
         )
@@ -124,6 +129,7 @@ pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, Dn
         context.engine,
         context.prepared,
         response,
+        analyzed_answer_ips,
         status,
         Provenance::Upstream,
         expiry,
@@ -156,7 +162,7 @@ async fn stale_outcome(
             context.raw_query,
             context.prepared.domain(),
             context.prepared.qtype(),
-            stale,
+            stale.into(),
             context.original_dst,
             context.prepared.query().ingress(),
         )
@@ -167,6 +173,7 @@ async fn stale_outcome(
             context.engine,
             context.prepared,
             stale,
+            None,
             OutcomeStatus::Accepted,
             Provenance::Stale,
             EffectiveExpiry::cacheable(Duration::from_secs(u64::from(SERVE_STALE_TTL_SECS))),

@@ -100,10 +100,7 @@ async fn stale_uses_only_advertised_ttl_and_retain_keeps_owner() {
     let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
     let mut state = DesiredState::new(snapshot(1, 1, 2), 10_000);
     state.observe(positive("a.test", &[ip], Duration::from_secs(30)), now);
-    state.observe(
-        ProjectionObservation::Retain { domain: "a.test" },
-        now + Duration::from_secs(1),
-    );
+    state.observe(ProjectionObservation::Retain, now + Duration::from_secs(1));
     state.observe(
         ProjectionObservation::Positive {
             domain: "a.test",
@@ -232,6 +229,73 @@ async fn ten_thousand_and_first_domain_evicts_exact_oldest_owner() {
     assert!(domains.iter().any(|domain| domain == "d10000.test"));
 }
 
+#[tokio::test(start_paused = true)]
+async fn million_hot_owner_refreshes_keep_heaps_and_revision_bounded() {
+    let now = tokio::time::Instant::now();
+    let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 55));
+    let mut state = DesiredState::new(snapshot(1, 1, 2), 10_000);
+    state.observe(
+        positive("a.test", &[ip], Duration::from_secs(2_000_000)),
+        now,
+    );
+    let revision = state.revisions[&ip];
+
+    for update in 1..1_000_000_u64 {
+        state.observe(
+            positive("a.test", &[ip], Duration::from_secs(2_000_000 - update)),
+            now,
+        );
+    }
+
+    assert_eq!(state.owners.len(), 1);
+    assert_eq!(state.revisions[&ip], revision);
+    assert!(state.expiry_deadlines.len() <= 65);
+    assert!(state.eviction_order.len() <= 65);
+}
+
+#[tokio::test(start_paused = true)]
+async fn refresh_and_ip_replacement_preserve_ttl_and_exact_revisions() {
+    let now = tokio::time::Instant::now();
+    let old_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 56));
+    let new_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 57));
+    let mut state = DesiredState::new(snapshot(1, 1, 2), 10_000);
+    state.observe(positive("a.test", &[old_ip], Duration::from_secs(10)), now);
+    let initial = state.batch(now);
+    assert!(state.commit_success(initial.generation, &initial.sets, &initial.removes));
+    let old_revision = state.revisions[&old_ip];
+
+    state.observe(positive("a.test", &[old_ip], Duration::from_secs(20)), now);
+    assert_eq!(state.revisions[&old_ip], old_revision);
+    assert!(state.batch(now).sets.is_empty());
+    state.expire(now + Duration::from_secs(11));
+    assert_eq!(state.owner_domains(), vec!["a.test".to_owned()]);
+
+    state.observe(positive("a.test", &[new_ip], Duration::from_secs(30)), now);
+    let replacement = state.batch(now);
+    assert_eq!(
+        replacement
+            .sets
+            .iter()
+            .map(|set| set.ip)
+            .collect::<Vec<_>>(),
+        vec![new_ip]
+    );
+    assert_eq!(
+        replacement
+            .removes
+            .iter()
+            .map(|remove| remove.ip)
+            .collect::<Vec<_>>(),
+        vec![old_ip]
+    );
+    assert!(!state.reverse.contains_key(&old_ip));
+    assert!(state.reverse[&new_ip].contains("a.test"));
+    state.expire(now + Duration::from_secs(29));
+    assert_eq!(state.owner_domains(), vec!["a.test".to_owned()]);
+    state.expire(now + Duration::from_secs(31));
+    assert!(state.owner_domains().is_empty());
+}
+
 fn projection_for_test(snapshot: Arc<RoutingProjectionSnapshot>) -> TestProjection {
     let (wake, receiver) = tokio::sync::mpsc::channel(1);
     let counters = Arc::new(super::ProjectionCounters::default());
@@ -239,6 +303,7 @@ fn projection_for_test(snapshot: Arc<RoutingProjectionSnapshot>) -> TestProjecti
         RoutingProjection {
             state: parking_lot::Mutex::new(DesiredState::new(snapshot, 10_000)),
             wake: parking_lot::Mutex::new(Some(wake)),
+            wake_pending: std::sync::atomic::AtomicBool::new(false),
             counters,
             worker: parking_lot::Mutex::new(None),
             lifecycle: {

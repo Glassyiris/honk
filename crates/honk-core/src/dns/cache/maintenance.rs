@@ -1,13 +1,17 @@
 use std::time::Instant;
 
-use super::{CacheSlot, CacheValue, CachedEntry, DnsCacheService, lock};
+use super::{CacheSlot, CachedEntry, DnsCacheService, lock};
 
 impl DnsCacheService {
     pub fn clear_negative(&self, key: &str) {
         let key = CacheSlot::Legacy(key.to_owned());
         let index = self.shard_index(&key);
         let mut shard = lock(&self.shards[index]);
-        if matches!(shard.peek(&key), Some(CacheValue::Negative { .. })) {
+        let remove_slot = shard.get_mut(&key).is_some_and(|value| {
+            value.negative = None;
+            value.positive.is_none()
+        });
+        if remove_slot {
             shard.pop(&key);
         }
     }
@@ -18,15 +22,17 @@ impl DnsCacheService {
             let mut shard = lock(shard);
             let expired: Vec<CacheSlot> = shard
                 .iter()
-                .filter_map(|(key, value)| match value {
-                    CacheValue::Negative { expires_at, .. } if now >= *expires_at => {
-                        Some(key.clone())
-                    }
-                    CacheValue::Positive(_) | CacheValue::Negative { .. } => None,
-                })
+                .filter(|(_, value)| value.negative.is_some_and(|entry| now >= entry.expires_at))
+                .map(|(key, _)| key.clone())
                 .collect();
             for key in expired {
-                shard.pop(&key);
+                let remove_slot = shard.get_mut(&key).is_some_and(|value| {
+                    value.negative = None;
+                    value.positive.is_none()
+                });
+                if remove_slot {
+                    shard.pop(&key);
+                }
             }
         }
     }
@@ -42,13 +48,17 @@ impl DnsCacheService {
             let mut shard = lock(shard);
             let expired: Vec<CacheSlot> = shard
                 .iter()
-                .filter_map(|(key, value)| match value {
-                    CacheValue::Positive(entry) if entry.is_expired() => Some(key.clone()),
-                    CacheValue::Positive(_) | CacheValue::Negative { .. } => None,
-                })
+                .filter(|(_, value)| value.positive.as_ref().is_some_and(CachedEntry::is_expired))
+                .map(|(key, _)| key.clone())
                 .collect();
             for key in expired {
-                shard.pop(&key);
+                let remove_slot = shard.get_mut(&key).is_some_and(|value| {
+                    value.positive = None;
+                    value.negative.is_none()
+                });
+                if remove_slot {
+                    shard.pop(&key);
+                }
             }
         }
         self.purge_expired_negatives();
@@ -57,10 +67,9 @@ impl DnsCacheService {
     pub fn remove(&self, key: &str) -> Option<CachedEntry> {
         let key = CacheSlot::Legacy(key.to_owned());
         let index = self.shard_index(&key);
-        match lock(&self.shards[index]).pop(&key) {
-            Some(CacheValue::Positive(entry)) => Some(entry),
-            Some(CacheValue::Negative { .. }) | None => None,
-        }
+        lock(&self.shards[index])
+            .pop(&key)
+            .and_then(|value| value.positive)
     }
 
     pub fn len(&self) -> usize {
@@ -100,10 +109,7 @@ impl DnsCacheService {
             .flat_map(|shard| {
                 lock(shard)
                     .iter()
-                    .filter_map(|(_, value)| match value {
-                        CacheValue::Positive(entry) => Some(entry.clone()),
-                        CacheValue::Negative { .. } => None,
-                    })
+                    .filter_map(|(_, value)| value.positive.clone())
                     .collect::<Vec<_>>()
             })
             .collect()

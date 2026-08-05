@@ -19,15 +19,17 @@ use aya_ebpf_bindings::helpers::bpf_loop;
 use honk_ebpf_common::{
     L4ProtoType, ROUTING_GENERATION_COUNT, ROUTING_MAP_LEN, ROUTING_META_ACTIVE_GENERATION_SLOT,
     redirect_need::MAX_MATCH_SET_LEN,
-    route::{MatchSet, MatchType, ROUTING_GROUP_BITMAP_WORDS, routing_group_index},
-    routing_meta_bitmap_base, routing_meta_count_slot,
+    route::{
+        MatchSet, MatchType, ROUTING_GROUP_BITMAP_WORDS, routing_group_index,
+        routing_group_meta_index,
+    },
 };
 
 use crate::{
     errno::{EFAULT, EINVAL, ENOEXEC},
     maps::{
         DEST_LPM_ROUTING_MAP, DOMAIN_ROUTING_MAP, MAC_LPM_ROUTING_MAP, ROUTE_CTX_SCRATCH_MAP,
-        ROUTING_MAP, ROUTING_META_MAP, SOURCE_LPM_ROUTING_MAP,
+        ROUTING_GROUP_META_MAP, ROUTING_MAP, ROUTING_META_MAP, SOURCE_LPM_ROUTING_MAP,
     },
 };
 
@@ -379,44 +381,28 @@ impl RouteCtx {
         LOOP_CONTINUE
     }
 
-    /// Select the committed rule bank and cache its flow-group bitmap.
+    /// Select the committed rule bank and load this flow group's packed
+    /// count/bitmap metadata with one map lookup.
     #[inline(always)]
     pub fn prepare_generation(&mut self) -> u32 {
         let active_generation = match ROUTING_META_MAP.get(ROUTING_META_ACTIVE_GENERATION_SLOT) {
             Some(generation) if *generation < ROUTING_GENERATION_COUNT as u32 => *generation,
             _ => 0,
         };
-        let mut active_rules_len = MAX_MATCH_SET_LEN as u32;
-        if let Some(len_ptr) = ROUTING_META_MAP.get(routing_meta_count_slot(active_generation)) {
-            if *len_ptr <= MAX_MATCH_SET_LEN as u32 {
-                active_rules_len = *len_ptr;
-            }
-        }
         self.active_generation = active_generation;
-        self.load_group_bitmap();
-        active_rules_len
-    }
 
-    /// Load this flow's selected generation group bitmap from ROUTING_META_MAP.
-    #[inline(always)]
-    pub fn load_group_bitmap(&mut self) {
         let group = routing_group_index(self.l4proto_type, self.ipversion_type);
-        let base = routing_meta_bitmap_base(self.active_generation)
-            + group * ROUTING_GROUP_BITMAP_WORDS as u32;
-        let mut words = [0u32; ROUTING_GROUP_BITMAP_WORDS];
-        if let Some(w) = ROUTING_META_MAP.get(base) {
-            words[0] = *w;
+        let index = routing_group_meta_index(active_generation, group);
+        let Some(meta) = ROUTING_GROUP_META_MAP.get(index) else {
+            self.group_bitmap = [0; ROUTING_GROUP_BITMAP_WORDS];
+            return 0;
+        };
+        if meta.rule_count > MAX_MATCH_SET_LEN as u32 {
+            self.group_bitmap = [0; ROUTING_GROUP_BITMAP_WORDS];
+            return 0;
         }
-        if let Some(w) = ROUTING_META_MAP.get(base + 1) {
-            words[1] = *w;
-        }
-        if let Some(w) = ROUTING_META_MAP.get(base + 2) {
-            words[2] = *w;
-        }
-        if let Some(w) = ROUTING_META_MAP.get(base + 3) {
-            words[3] = *w;
-        }
-        self.group_bitmap = words;
+        self.group_bitmap = meta.bitmap;
+        meta.rule_count
     }
 
     #[inline(always)]

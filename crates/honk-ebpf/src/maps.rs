@@ -9,7 +9,9 @@ use honk_ebpf_common::event::DaeEvent;
 use honk_ebpf_common::redirect_need::{
     DomainRouting, MAX_MATCH_SET_LEN, PIDName, RoutingHandoffEntry, TuplesKey,
 };
-use honk_ebpf_common::route::{MatchSet, ROUTING_META_MAP_LEN};
+use honk_ebpf_common::route::{
+    MatchSet, ROUTING_GROUP_META_MAP_LEN, ROUTING_META_MAP_LEN, RoutingGroupMeta,
+};
 use honk_ebpf_common::{DaeParam, ROUTING_MAP_LEN, RedirectEntry, RedirectTuple};
 
 use crate::route::{RouteCtx, WanEgressRouteScratch};
@@ -93,6 +95,10 @@ pub static ROUTING_MAP: Array<MatchSet, ROUTING_MAP_LEN, 0> = Array::new();
 /// each following block contains one generation's count and group bitmaps.
 #[btf_map]
 pub static ROUTING_META_MAP: Array<u32, ROUTING_META_MAP_LEN, 0> = Array::new();
+/// Packed count and bitmap for each (generation, flow-group) pair.
+#[btf_map]
+pub static ROUTING_GROUP_META_MAP: Array<RoutingGroupMeta, { ROUTING_GROUP_META_MAP_LEN }, 0> =
+    Array::new();
 #[btf_map]
 pub static DOMAIN_ROUTING_MAP: HashMap<[__be32; 4], DomainRouting, MAX_DOMAIN_ROUTING_NUM, 1> =
     HashMap::new();

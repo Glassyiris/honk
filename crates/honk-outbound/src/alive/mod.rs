@@ -196,6 +196,14 @@ impl PerProtocolState {
         self.cooldown_until = Instant::now();
     }
 
+    fn is_clean_alive(&self) -> bool {
+        self.alive
+            && self.consecutive_failures == 0
+            && self.consecutive_successes == 0
+            && self.traffic_failures == 0
+            && !self.stopped
+    }
+
     fn new() -> Self {
         Self {
             alive: true,
@@ -788,6 +796,14 @@ impl AliveDialerSet {
     /// the data-UDP health domain (Go: `ReportAvailableTraffic`).
     pub fn report_available_traffic(&self, node_id: Uuid, domain: ProbeDomain, ipver: IpVersion) {
         let idx = alive_index(domain, ipver);
+        if self
+            .states
+            .read()
+            .get(&node_id)
+            .is_some_and(|states| states[idx].is_clean_alive())
+        {
+            return;
+        }
         let was_alive = self.with_state(node_id, idx, |e| {
             let was = e.alive;
             e.reset_on_success();
@@ -1325,10 +1341,22 @@ impl AliveDialerSet {
     /// resume and member probes are kicked off immediately so latency data
     /// is fresh for the next selection.
     pub fn mark_group_active(&self, group: &str) {
-        let was_idle = self.is_urltest_group_idle(group);
-        self.group_last_active
-            .write()
-            .insert(group.to_string(), Instant::now());
+        let Some(timeout) = self.urltest_group_timeout.read().get(group).copied() else {
+            return;
+        };
+        let was_idle = {
+            let mut active = self.group_last_active.write();
+            let now = Instant::now();
+            let was_idle = active
+                .get(group)
+                .is_none_or(|last| now.duration_since(*last) >= timeout);
+            if let Some(last) = active.get_mut(group) {
+                *last = now;
+            } else {
+                active.insert(group.to_owned(), now);
+            }
+            was_idle
+        };
         if was_idle {
             let members = self
                 .urltest_group_members

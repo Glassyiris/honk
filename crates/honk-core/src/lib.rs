@@ -34,44 +34,53 @@ use honk_ebpf_common::ParamKey;
 use std::path::PathBuf;
 use tracing::{info, warn};
 
-/// Raise the file-descriptor rlimit to the hard maximum (or 1_048_576 if
-/// the hard limit is unlimited).  A busy transparent proxy must handle
-/// thousands of concurrent connections; the default 1024-fd soft limit is
-/// far too low.
-fn raise_nofile_rlimit() -> anyhow::Result<()> {
+/// Raise the soft descriptor limit toward the hard maximum, then return the
+/// one startup snapshot used to size every control-plane descriptor owner.
+fn raise_nofile_rlimit() -> anyhow::Result<usize> {
     use std::io::Error;
-    let mut rlim = libc::rlimit {
+
+    let mut limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
     };
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) } != 0 {
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
         anyhow::bail!("getrlimit(RLIMIT_NOFILE): {}", Error::last_os_error());
     }
-    let soft_max = if rlim.rlim_max == libc::RLIM_INFINITY {
+
+    let original_soft = limit.rlim_cur;
+    let desired_soft = if limit.rlim_max == libc::RLIM_INFINITY {
         1_048_576
     } else {
-        rlim.rlim_max
+        limit.rlim_max
     };
-    if rlim.rlim_cur >= soft_max {
+    let active_soft = if original_soft < desired_soft {
+        limit.rlim_cur = desired_soft;
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } == 0 {
+            info!(
+                "Raised NOFILE rlimit to {} (hard={})",
+                desired_soft, limit.rlim_max
+            );
+            desired_soft
+        } else {
+            warn!(
+                "Failed to raise NOFILE rlimit to {}: {}; using soft limit {}",
+                desired_soft,
+                Error::last_os_error(),
+                original_soft
+            );
+            original_soft
+        }
+    } else {
         info!(
             "NOFILE rlimit already {} (soft) / {} (hard)",
-            rlim.rlim_cur, rlim.rlim_max
+            original_soft, limit.rlim_max
         );
-        return Ok(());
-    }
-    rlim.rlim_cur = soft_max;
-    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) } != 0 {
-        anyhow::bail!(
-            "setrlimit(RLIMIT_NOFILE, {}): {}",
-            soft_max,
-            Error::last_os_error()
-        );
-    }
-    info!(
-        "Raised NOFILE rlimit to {} (hard={})",
-        soft_max, rlim.rlim_max
-    );
-    Ok(())
+        original_soft
+    };
+
+    Ok(usize::try_from(active_soft)
+        .unwrap_or(control::MAX_EFFECTIVE_NOFILE)
+        .min(control::MAX_EFFECTIVE_NOFILE))
 }
 
 /// Resolve an interface name, expanding `"auto"` or empty to the default route interface.
@@ -319,12 +328,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level));
 
-    // Clash API log broadcast layer: installed unconditionally (when the
-    // feature is compiled in) so `/logs` WS subscribers can see startup
-    // messages. It is unfiltered on purpose — per-subscriber level
-    // filtering happens in the WS handler.
+    // The console and Clash API have independent per-layer filters. With no
+    // `/logs` subscription, the API layer contributes no callsite interest.
     #[cfg(feature = "clash-api")]
-    let (clash_log_layer, clash_log_tx) = clash_api::logs::layer();
+    let (clash_log_layer, clash_log_handle) = clash_api::logs::layer();
 
     use tracing_subscriber::prelude::*;
     let registry = tracing_subscriber::registry()
@@ -336,12 +343,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     info!("honk-core v{} starting", env!("CARGO_PKG_VERSION"));
     info!("Config: {}", cli.config.display());
 
-    // Raise the file-descriptor limit.  A busy transparent proxy can easily
-    // exhaust the default 1024-fd ulimit because each accepted connection
-    // holds a fd while waiting for a concurrency permit.
-    if let Err(e) = raise_nofile_rlimit() {
-        warn!("Failed to raise NOFILE rlimit: {}", e);
-    }
+    let effective_nofile = match raise_nofile_rlimit() {
+        Ok(limit) => limit,
+        Err(error) => {
+            warn!(%error, "Failed to read NOFILE rlimit; using conservative budget");
+            1_024
+        }
+    };
+    let resource_budget = control::ResourceBudget::for_nofile(effective_nofile);
 
     // Install the bootstrap resolver for proxy-server hostname lookups so
     // node dials never depend on the (potentially self-intercepted) regular
@@ -754,13 +763,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     );
     info!("DNS forwarder ready");
 
-    let mut control_plane = control::ControlPlane::new_with_upstream_pool(
+    let mut control_plane = control::ControlPlane::new_with_upstream_pool_and_budget(
         config,
         ebpf_backend,
         router,
         proxy_registry,
         dns_forwarder,
         dns_upstream_pool.clone(),
+        resource_budget,
     )?;
 
     #[cfg(feature = "ebpf")]
@@ -848,7 +858,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                         secret: clash_cfg.secret.clone(),
                         connection_pool: control_plane.connection_pool(),
                         external_ui: clash_cfg.external_ui.clone(),
-                        log_tx: clash_log_tx.clone(),
+                        log_handle: clash_log_handle.clone(),
                         dns_service: control_plane.dns_service(),
                         stream_samplers,
                     });

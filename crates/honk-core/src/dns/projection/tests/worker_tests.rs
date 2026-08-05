@@ -10,6 +10,7 @@ async fn same_generation_interleaving_converges_exact_mock_value() {
             positive("a.test", &[ip], Duration::from_secs(30)),
         );
         receiver.try_recv().expect("initial wake");
+        projection.clear_worker_wake();
         worker::flush_for_test_after_snapshot(&projection, &ebpf, || {
             projection.submit(
                 snapshot(1, 1, 2),
@@ -18,6 +19,7 @@ async fn same_generation_interleaving_converges_exact_mock_value() {
         })
         .await;
         receiver.try_recv().expect("new desired state wake");
+        projection.clear_worker_wake();
         worker::flush_for_test(&projection, &ebpf).await;
 
         assert!(projection.state.lock().dirty_ips.is_empty());
@@ -76,6 +78,32 @@ async fn wake_overflow_is_harmless_and_latest_state_converges() {
     let map = ebpf.read().await.projection_map_snapshot();
     assert_eq!(map.len(), 1);
     assert_eq!(map[0].1.bitmap, [1, 0, 0, 0, 0, 0, 0, 0]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn wake_gate_reopens_before_snapshot_and_coalesces_duplicates() {
+    let (projection, mut receiver, _ebpf) = projection_for_test(snapshot(1, 1, 2));
+    let first = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 40));
+    let second = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 41));
+
+    projection.submit(
+        snapshot(1, 1, 2),
+        positive("a.test", &[first], Duration::from_secs(30)),
+    );
+    projection.submit(
+        snapshot(1, 1, 2),
+        positive("a.test", &[first], Duration::from_secs(30)),
+    );
+    assert_eq!(projection.counters().wake_coalesced, 1);
+    receiver.try_recv().expect("initial wake");
+    projection.clear_worker_wake();
+
+    projection.submit(
+        snapshot(1, 1, 2),
+        positive("a.test", &[second], Duration::from_secs(30)),
+    );
+    receiver.try_recv().expect("post-snapshot wake");
+    assert!(receiver.try_recv().is_err());
 }
 
 #[tokio::test(start_paused = true)]

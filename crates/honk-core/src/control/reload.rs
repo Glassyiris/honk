@@ -107,10 +107,14 @@ impl ControlPlane {
         // current generation's runtime (live sessions stay up); the
         // transfer is recorded on the old generation only at the commit
         // point below, so an aborted build leaves its ownership untouched.
+        let dial_limit = self
+            .resource_budget
+            .clamp_dials(new_config.global.max_concurrent_dials);
         let (new_runtime_registry, reused_runtime_ids) =
-            match honk_outbound::runtime::OutboundRuntimeRegistry::build_reusing(
+            match honk_outbound::runtime::OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
                 &new_config.nodes,
-                new_config.global.max_concurrent_dials,
+                dial_limit,
+                self.resource_budget.transient_dials,
                 Some(&self.runtime_registry.read()),
             ) {
                 Ok((registry, reused)) => (Arc::new(registry), reused),
@@ -1330,6 +1334,17 @@ mod atomic_reload_tests {
             test_dns_forwarder(),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn reload_clamps_dials_to_startup_descriptor_reservation() {
+        let cp = test_cp();
+        let ceiling = cp.resource_budget.transient_dials;
+        let mut config = cp.config_handle().read().await.clone();
+        config.global.max_concurrent_dials = usize::MAX;
+
+        assert!(cp.apply_runtime_config(config, &DrainTracker::new()).await);
+        assert_eq!(cp.runtime_registry.read().dial_limit(), ceiling);
     }
 
     /// A reload whose build phase fails (invalid upstream address) must abort

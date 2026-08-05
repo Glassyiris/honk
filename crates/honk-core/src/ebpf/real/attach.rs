@@ -114,23 +114,16 @@ impl RealEbpfBackend {
                 debug!("pinned '{}'", name);
             }
         }
-        // Cold-start routing table: a single Fallback MatchSet pointing at the
-        // control plane (outbound 0xFD), with the active rule count set to 1.
-        // ROUTING_META_MAP[0] defaults to 0, and the eBPF route loop treats a
-        // zero rule count as an error (route() returns negative → TC_ACT_SHOT),
-        // so without this every new flow would be dropped between program
-        // attach and the first routing push.  With it, such flows are punted
-        // to userspace routing instead.  This runs before any TC attach below,
-        // so there is no window where the datapath sees an empty table.
+        // Install a complete generation-0 fallback before any TC hook is
+        // attached. New flows therefore punt to userspace until the first
+        // compiled routing generation is published.
         {
+            let generation = 0u32;
             let cold_start = MatchSet {
                 match_type: MatchType::Fallback as u8,
                 outbound: OutboundIndex::ControlPlaneRouting as u8,
                 ..Default::default()
             };
-            // Without this table every new flow is dropped between attach and
-            // the first routing push — a silent failure mode, so any error
-            // here aborts startup (the caller drops the half-loaded object).
             bpf_hash_insert(
                 &mut bpf,
                 "ROUTING_MAP",
@@ -138,31 +131,52 @@ impl RealEbpfBackend {
                 unsafe { as_bytes(&cold_start) },
             )
             .map_err(|e| anyhow::anyhow!("cold-start ROUTING_MAP init: {}", e))?;
-            // The fallback belongs to every (l4proto × ipversion) group, so
-            // bit 0 of each group bitmap is set.  Write all meta slots
-            // explicitly — group bitmaps first, the rule count last — so a
-            // reused pinned map cannot leak stale group bits and the count
-            // stays the atomic switch.
-            for g in 0..ROUTING_GROUP_COUNT as u32 {
-                for w in 0..ROUTING_GROUP_BITMAP_WORDS as u32 {
-                    let slot = 1 + g * ROUTING_GROUP_BITMAP_WORDS as u32 + w;
-                    let word: u32 = if w == 0 { 1 } else { 0 };
+
+            let bitmap = [1u32, 0, 0, 0];
+            for group in 0..ROUTING_GROUP_COUNT as u32 {
+                for (word, value) in bitmap.iter().enumerate() {
+                    let slot = routing_meta_bitmap_base(generation)
+                        + group * ROUTING_GROUP_BITMAP_WORDS as u32
+                        + word as u32;
                     bpf_hash_insert(
                         &mut bpf,
                         "ROUTING_META_MAP",
                         unsafe { as_bytes(&slot) },
-                        unsafe { as_bytes(&word) },
+                        unsafe { as_bytes(value) },
                     )
                     .map_err(|e| anyhow::anyhow!("cold-start ROUTING_META_MAP init: {}", e))?;
                 }
             }
+            let count = 1u32;
+            let count_slot = routing_meta_count_slot(generation);
             bpf_hash_insert(
                 &mut bpf,
                 "ROUTING_META_MAP",
-                unsafe { as_bytes(&0u32) },
-                unsafe { as_bytes(&1u32) },
+                unsafe { as_bytes(&count_slot) },
+                unsafe { as_bytes(&count) },
             )
             .map_err(|e| anyhow::anyhow!("cold-start ROUTING_META_MAP init: {}", e))?;
+            for group in 0..ROUTING_GROUP_COUNT as u32 {
+                let index = routing_group_meta_index(generation, group);
+                let meta = RoutingGroupMeta {
+                    rule_count: count,
+                    bitmap,
+                };
+                bpf_hash_insert(
+                    &mut bpf,
+                    "ROUTING_GROUP_META_MAP",
+                    unsafe { as_bytes(&index) },
+                    unsafe { as_bytes(&meta) },
+                )
+                .map_err(|e| anyhow::anyhow!("cold-start ROUTING_GROUP_META_MAP init: {}", e))?;
+            }
+            bpf_hash_insert(
+                &mut bpf,
+                "ROUTING_META_MAP",
+                unsafe { as_bytes(&ROUTING_META_ACTIVE_GENERATION_SLOT) },
+                unsafe { as_bytes(&generation) },
+            )
+            .map_err(|e| anyhow::anyhow!("cold-start routing selector init: {}", e))?;
         }
         // Attach cgroup programs to root cgroup2 for cookie→PID mapping.
         // This enables pname routing and control-plane traffic bypass (Go dae parity).

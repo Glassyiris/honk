@@ -1,6 +1,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use thiserror::Error;
 
 use super::query::{IngressProfile, NameParseState, QueryContext, TxId, parse_name};
@@ -46,68 +47,30 @@ struct RecordBoundary {
 #[derive(Debug, Clone)]
 pub struct ResponseTemplate {
     request_identity: Arc<[u8]>,
-    wire: Vec<u8>,
+    wire: Bytes,
     question_end: usize,
     records: Vec<RecordBoundary>,
 }
 
 impl ResponseTemplate {
     pub fn validate(request: &QueryContext, response: &[u8]) -> Result<Self, ResponseError> {
-        if response.len() < HEADER_LEN {
-            return Err(ResponseError::HeaderTruncated);
-        }
-        let flags = read_u16(response, 2)?;
-        if flags & QR == 0 {
-            return Err(ResponseError::QueryMessage);
-        }
-        if flags & OPCODE_MASK != request.flags() & OPCODE_MASK {
-            return Err(ResponseError::OpcodeMismatch);
-        }
-        if flags & TC != 0 && !matches!(request.ingress(), IngressProfile::Udp { .. }) {
-            return Err(ResponseError::IncompatibleProfile);
-        }
-        let qdcount = read_u16(response, 4)?;
-        if usize::from(qdcount) != request.questions().len() {
-            return Err(ResponseError::QuestionMismatch);
-        }
-        let mut name_state = NameParseState::new(response.len());
-        let mut cursor = HEADER_LEN;
-        for (expected_name, expected_type, expected_class) in request.questions() {
-            let (name, name_end) = parse_name(response, cursor, &mut name_state)
-                .map_err(|_| ResponseError::QuestionMismatch)?;
-            let qtype = read_u16(response, name_end)?;
-            let qclass = read_u16(response, name_end + 2)?;
-            if &name != expected_name
-                || qtype != expected_type.get()
-                || qclass != expected_class.get()
-            {
-                return Err(ResponseError::QuestionMismatch);
-            }
-            cursor = name_end + 4;
-        }
-        let question_end = cursor;
-        let sections = [
-            (Section::Answer, read_u16(response, 6)?),
-            (Section::Authority, read_u16(response, 8)?),
-            (Section::Additional, read_u16(response, 10)?),
-        ];
-        let mut records = Vec::new();
-        for (section, count) in sections {
-            for _ in 0..count {
-                let start = cursor;
-                cursor = record_end(response, cursor, &mut name_state)?;
-                records.push(RecordBoundary {
-                    section,
-                    wire: start..cursor,
-                });
-            }
-        }
-        if cursor != response.len() {
-            return Err(ResponseError::TrailingBytes);
-        }
+        let (question_end, records) = validate_layout(request, response)?;
         Ok(Self {
             request_identity: request.canonical_wire_arc(),
-            wire: response.to_vec(),
+            wire: Bytes::copy_from_slice(response),
+            question_end,
+            records,
+        })
+    }
+
+    pub(crate) fn validate_owned(
+        request: &QueryContext,
+        response: Bytes,
+    ) -> Result<Self, ResponseError> {
+        let (question_end, records) = validate_layout(request, &response)?;
+        Ok(Self {
+            request_identity: request.canonical_wire_arc(),
+            wire: response,
             question_end,
             records,
         })
@@ -122,7 +85,7 @@ impl ResponseTemplate {
                 self.render_udp(caller.txid(), usize::from(advertised_size))
             }
             IngressProfile::Tcp | IngressProfile::Api | IngressProfile::Internal => {
-                let mut response = self.wire.clone();
+                let mut response = self.wire.to_vec();
                 set_txid(&mut response, caller.txid())?;
                 Ok(response)
             }
@@ -131,7 +94,7 @@ impl ResponseTemplate {
 
     fn render_udp(&self, txid: TxId, limit: usize) -> Result<Vec<u8>, ResponseError> {
         if self.wire.len() <= limit {
-            let mut response = self.wire.clone();
+            let mut response = self.wire.to_vec();
             set_txid(&mut response, txid)?;
             return Ok(response);
         }
@@ -166,6 +129,63 @@ impl ResponseTemplate {
         write_u16(&mut response, 10, counts[2])?;
         Ok(response)
     }
+}
+
+fn validate_layout(
+    request: &QueryContext,
+    response: &[u8],
+) -> Result<(usize, Vec<RecordBoundary>), ResponseError> {
+    if response.len() < HEADER_LEN {
+        return Err(ResponseError::HeaderTruncated);
+    }
+    let flags = read_u16(response, 2)?;
+    if flags & QR == 0 {
+        return Err(ResponseError::QueryMessage);
+    }
+    if flags & OPCODE_MASK != request.flags() & OPCODE_MASK {
+        return Err(ResponseError::OpcodeMismatch);
+    }
+    if flags & TC != 0 && !matches!(request.ingress(), IngressProfile::Udp { .. }) {
+        return Err(ResponseError::IncompatibleProfile);
+    }
+    let qdcount = read_u16(response, 4)?;
+    if usize::from(qdcount) != request.questions().len() {
+        return Err(ResponseError::QuestionMismatch);
+    }
+    let mut name_state = NameParseState::new(response.len());
+    let mut cursor = HEADER_LEN;
+    for (expected_name, expected_type, expected_class) in request.questions() {
+        let (name, name_end) = parse_name(response, cursor, &mut name_state)
+            .map_err(|_| ResponseError::QuestionMismatch)?;
+        let qtype = read_u16(response, name_end)?;
+        let qclass = read_u16(response, name_end + 2)?;
+        if &name != expected_name || qtype != expected_type.get() || qclass != expected_class.get()
+        {
+            return Err(ResponseError::QuestionMismatch);
+        }
+        cursor = name_end + 4;
+    }
+    let question_end = cursor;
+    let sections = [
+        (Section::Answer, read_u16(response, 6)?),
+        (Section::Authority, read_u16(response, 8)?),
+        (Section::Additional, read_u16(response, 10)?),
+    ];
+    let mut records = Vec::new();
+    for (section, count) in sections {
+        for _ in 0..count {
+            let start = cursor;
+            cursor = record_end(response, cursor, &mut name_state)?;
+            records.push(RecordBoundary {
+                section,
+                wire: start..cursor,
+            });
+        }
+    }
+    if cursor != response.len() {
+        return Err(ResponseError::TrailingBytes);
+    }
+    Ok((question_end, records))
 }
 
 fn record_end(

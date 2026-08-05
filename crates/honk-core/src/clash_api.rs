@@ -33,10 +33,12 @@ use honk_config::types::NodeProtocol;
 use honk_outbound::alive::{AliveDialerSet, IpVersion, ProbeDomain};
 use honk_outbound::group::{GroupManager, SharedGroupManager};
 use honk_outbound::urltest::{urltest_group, urltest_node};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 const STREAM_CHANNEL_CAPACITY: usize = 16;
+const CONNECTION_INTERVAL_BUCKETS_MS: [u64; 9] =
+    [100, 200, 500, 1_000, 2_000, 5_000, 10_000, 30_000, 60_000];
 
 /// Lazily populated fan-out for high-frequency API streams. A sampler checks
 /// receiver count before it snapshots or serializes any data.
@@ -93,8 +95,8 @@ pub struct ClashState {
     pub connection_pool: Arc<crate::pool::ConnectionPool>,
     /// External UI directory (`experimental.clash_api.external_ui`).
     pub external_ui: String,
-    /// Broadcast channel fed by the clash log tracing layer.
-    pub log_tx: tokio::sync::broadcast::Sender<logs::LogEvent>,
+    /// Active-level handle for the Clash API tracing layer.
+    pub log_handle: logs::ClashLogHandle,
     pub dns_service: crate::dns::DnsService,
     /// Shared lazy samplers for high-fanout websocket/HTTP streams.
     pub stream_samplers: Arc<StreamSamplers>,
@@ -1078,7 +1080,7 @@ async fn get_connections(
     ws: MaybeWs,
 ) -> Response {
     if let Some(ws) = ws.0 {
-        let interval = Duration::from_millis(query.interval.unwrap_or(1000).max(100));
+        let interval = normalize_connection_interval(query.interval);
         return ws.on_upgrade(move |socket| connections_ws(socket, s, interval));
     }
     Json(connections_json(&s)).into_response()
@@ -1087,7 +1089,7 @@ async fn get_connections(
 /// Push the full connections snapshot every `interval` until the client
 /// disconnects.
 async fn connections_ws(mut socket: WebSocket, s: Arc<ClashState>, interval: Duration) {
-    let mut frames = connection_sampler(&s, interval).subscribe();
+    let mut frames = connection_sampler(&s, interval);
     loop {
         match frames.recv().await {
             Ok(frame) => {
@@ -1109,35 +1111,94 @@ async fn connections_ws(mut socket: WebSocket, s: Arc<ClashState>, interval: Dur
     }
 }
 
+fn normalize_connection_interval(requested_ms: Option<u64>) -> Duration {
+    let requested_ms = requested_ms.unwrap_or(1_000);
+    let bucket_ms = CONNECTION_INTERVAL_BUCKETS_MS
+        .iter()
+        .copied()
+        .find(|bucket| requested_ms <= *bucket)
+        .unwrap_or(CONNECTION_INTERVAL_BUCKETS_MS[CONNECTION_INTERVAL_BUCKETS_MS.len() - 1]);
+    Duration::from_millis(bucket_ms)
+}
+
 fn connection_sampler(
     s: &Arc<ClashState>,
     interval: Duration,
-) -> tokio::sync::broadcast::Sender<Arc<Bytes>> {
-    if let Some(existing) = s.stream_samplers.connections.get(&interval) {
-        return existing.clone();
+) -> tokio::sync::broadcast::Receiver<Arc<Bytes>> {
+    subscribe_connection_sampler(
+        &s.stream_samplers,
+        Arc::clone(&s.connection_tracker),
+        interval,
+    )
+}
+
+fn subscribe_connection_sampler(
+    samplers: &Arc<StreamSamplers>,
+    tracker: Arc<crate::connection_tracker::ConnectionTracker>,
+    interval: Duration,
+) -> tokio::sync::broadcast::Receiver<Arc<Bytes>> {
+    match samplers.connections.entry(interval) {
+        dashmap::mapref::entry::Entry::Occupied(entry) => entry.get().subscribe(),
+        dashmap::mapref::entry::Entry::Vacant(entry) => {
+            let (tx, receiver) =
+                tokio::sync::broadcast::channel::<Arc<Bytes>>(STREAM_CHANNEL_CAPACITY);
+            entry.insert(tx.clone());
+            spawn_connection_sampler(Arc::downgrade(samplers), tracker, interval, tx);
+            receiver
+        }
     }
-    let (tx, _) = tokio::sync::broadcast::channel(STREAM_CHANNEL_CAPACITY);
-    s.stream_samplers
-        .connections
-        .entry(interval)
-        .or_insert_with(|| {
-            let sampler_tx = tx.clone();
-            let sampler_state = Arc::clone(s);
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(interval);
-                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    tick.tick().await;
-                    if sampler_tx.receiver_count() == 0 {
-                        continue;
-                    }
-                    let frame = Arc::new(Bytes::from(connections_json(&sampler_state).to_string()));
-                    let _ = sampler_tx.send(frame);
+}
+
+struct ConnectionSamplerTaskGuard {
+    samplers: Weak<StreamSamplers>,
+    interval: Duration,
+    tx: tokio::sync::broadcast::Sender<Arc<Bytes>>,
+}
+
+impl Drop for ConnectionSamplerTaskGuard {
+    fn drop(&mut self) {
+        if let Some(samplers) = self.samplers.upgrade() {
+            samplers
+                .connections
+                .remove_if(&self.interval, |_, current| current.same_channel(&self.tx));
+        }
+    }
+}
+
+fn spawn_connection_sampler(
+    samplers: Weak<StreamSamplers>,
+    tracker: Arc<crate::connection_tracker::ConnectionTracker>,
+    interval: Duration,
+    tx: tokio::sync::broadcast::Sender<Arc<Bytes>>,
+) {
+    tokio::spawn(async move {
+        let _task_guard = ConnectionSamplerTaskGuard {
+            samplers: samplers.clone(),
+            interval,
+            tx: tx.clone(),
+        };
+        let mut tick = tokio::time::interval(interval);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            if tx.receiver_count() == 0 {
+                let Some(samplers) = samplers.upgrade() else {
+                    break;
+                };
+                if samplers
+                    .connections
+                    .remove_if(&interval, |_, current| {
+                        current.same_channel(&tx) && current.receiver_count() == 0
+                    })
+                    .is_some()
+                {
+                    break;
                 }
-            });
-            tx.clone()
-        })
-        .clone()
+            }
+            let frame = Arc::new(Bytes::from(connections_json_tracker(&tracker).to_string()));
+            let _ = tx.send(frame);
+        }
+    });
 }
 
 async fn delete_connections(State(s): State<Arc<ClashState>>) -> StatusCode {
@@ -1337,23 +1398,19 @@ async fn get_logs(
     let Some(level) = logs::parse_level(level_text) else {
         return error_response(StatusCode::BAD_REQUEST, "invalid log level");
     };
+    let subscription = s.log_handle.subscribe(level);
     let Some(ws) = ws.0 else {
-        // Non-WS clients get a chunked JSON stream (sing-box behavior):
-        // one `{"type","payload"}` line per log event.
-        return chunked_json_response(logs_chunk_stream(s, level));
+        return chunked_json_response(logs_chunk_stream(subscription));
     };
-    ws.on_upgrade(move |socket| logs_ws(socket, s, level))
+    ws.on_upgrade(move |socket| logs_ws(socket, subscription))
 }
 
 /// Stream broadcast log events as `{"type": level, "payload": line}`.
-async fn logs_ws(mut socket: WebSocket, s: Arc<ClashState>, level: tracing::Level) {
-    let mut rx = s.log_tx.subscribe();
+async fn logs_ws(mut socket: WebSocket, mut subscription: logs::LogSubscription) {
     loop {
-        match rx.recv().await {
+        match subscription.recv().await {
             Ok(event) => {
-                // tracing levels order ERROR < WARN < INFO < DEBUG < TRACE;
-                // skip anything more verbose than the requested level.
-                if event.level > level {
+                if !subscription.includes(event.level) {
                     continue;
                 }
                 let msg = serde_json::json!({
@@ -1379,15 +1436,13 @@ async fn logs_ws(mut socket: WebSocket, s: Arc<ClashState>, level: tracing::Leve
 /// Chunked-HTTP fallback for `/logs`: the same event documents as the WS
 /// stream, one JSON object per line.
 fn logs_chunk_stream(
-    s: Arc<ClashState>,
-    level: tracing::Level,
+    subscription: logs::LogSubscription,
 ) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
-    let rx = s.log_tx.subscribe();
-    futures::stream::unfold(rx, move |mut rx| async move {
+    futures::stream::unfold(subscription, |mut subscription| async move {
         loop {
-            match rx.recv().await {
+            match subscription.recv().await {
                 Ok(event) => {
-                    if event.level > level {
+                    if !subscription.includes(event.level) {
                         continue;
                     }
                     let line = format!(
@@ -1397,7 +1452,7 @@ fn logs_chunk_stream(
                             "payload": event.payload,
                         })
                     );
-                    return Some((Ok(Bytes::from(line)), rx));
+                    return Some((Ok(Bytes::from(line)), subscription));
                 }
                 // Lagging subscribers skip ahead; a closed channel ends it.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -1521,4 +1576,102 @@ async fn get_proxy_providers(State(s): State<Arc<ClashState>>) -> Json<serde_jso
 
 async fn get_rule_providers() -> Json<serde_json::Value> {
     Json(serde_json::json!({"providers": []}))
+}
+
+#[cfg(test)]
+mod sampler_tests {
+    use super::*;
+
+    #[test]
+    fn connection_intervals_use_bounded_ceiling_buckets() {
+        let cases = [
+            (None, 1_000),
+            (Some(0), 100),
+            (Some(100), 100),
+            (Some(101), 200),
+            (Some(201), 500),
+            (Some(999), 1_000),
+            (Some(1_001), 2_000),
+            (Some(2_001), 5_000),
+            (Some(5_001), 10_000),
+            (Some(10_001), 30_000),
+            (Some(30_001), 60_000),
+            (Some(u64::MAX), 60_000),
+        ];
+        for (requested, expected_ms) in cases {
+            assert_eq!(
+                normalize_connection_interval(requested),
+                Duration::from_millis(expected_ms)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_subscribers_share_one_sampler_and_idle_task_is_reclaimed() {
+        const SUBSCRIBERS: usize = 16;
+        let samplers = Arc::new(StreamSamplers::new());
+        let tracker = Arc::new(crate::connection_tracker::ConnectionTracker::new());
+        let barrier = Arc::new(tokio::sync::Barrier::new(SUBSCRIBERS));
+        let interval = Duration::from_millis(10);
+        let mut tasks = Vec::with_capacity(SUBSCRIBERS);
+
+        for _ in 0..SUBSCRIBERS {
+            let samplers = Arc::clone(&samplers);
+            let tracker = Arc::clone(&tracker);
+            let barrier = Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                subscribe_connection_sampler(&samplers, tracker, interval)
+            }));
+        }
+
+        let mut receivers = Vec::with_capacity(SUBSCRIBERS);
+        for task in tasks {
+            receivers.push(task.await.unwrap());
+        }
+        assert_eq!(samplers.connections.len(), 1);
+        assert_eq!(
+            samplers
+                .connections
+                .get(&interval)
+                .unwrap()
+                .receiver_count(),
+            SUBSCRIBERS
+        );
+        for receiver in &mut receivers {
+            tokio::time::timeout(Duration::from_millis(100), receiver.recv())
+                .await
+                .expect("shared sampler frame")
+                .unwrap();
+        }
+
+        drop(receivers);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(samplers.connections.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconnect_after_reclamation_uses_a_new_live_channel() {
+        let samplers = Arc::new(StreamSamplers::new());
+        let tracker = Arc::new(crate::connection_tracker::ConnectionTracker::new());
+        let interval = Duration::from_millis(10);
+        let mut first = subscribe_connection_sampler(&samplers, Arc::clone(&tracker), interval);
+        let old_tx = samplers.connections.get(&interval).unwrap().clone();
+        tokio::time::timeout(Duration::from_millis(100), first.recv())
+            .await
+            .expect("first sampler frame")
+            .unwrap();
+        drop(first);
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(samplers.connections.is_empty());
+
+        let mut second = subscribe_connection_sampler(&samplers, tracker, interval);
+        let new_tx = samplers.connections.get(&interval).unwrap().clone();
+        assert!(!old_tx.same_channel(&new_tx));
+        tokio::time::timeout(Duration::from_millis(100), second.recv())
+            .await
+            .expect("replacement sampler frame")
+            .unwrap();
+    }
 }

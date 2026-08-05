@@ -89,7 +89,7 @@ pub(crate) async fn resolve_with_owner(
         publication_epoch,
     } = execution;
     debug!("DNS forwarder: resolving {} bytes", raw_query.len());
-    let engine = DnsEngine::from_router(&forwarder.routing, forwarder.policy_id.clone())?;
+    let engine = forwarder.engine().await?;
     let prepared = match mode {
         ResolveMode::Strict => engine.prepare(raw_query, original_dst, ingress)?,
         ResolveMode::Compatibility => {
@@ -102,7 +102,7 @@ pub(crate) async fn resolve_with_owner(
     if is_filtered_qtype(qtype, &forwarder.strategy) {
         return rejected_outcome(
             forwarder,
-            &engine,
+            engine,
             &prepared,
             raw_query,
             mode,
@@ -112,7 +112,7 @@ pub(crate) async fn resolve_with_owner(
     if matches!(prepared.plan(), RequestPlan::Reject) {
         return rejected_outcome(
             forwarder,
-            &engine,
+            engine,
             &prepared,
             raw_query,
             mode,
@@ -125,7 +125,7 @@ pub(crate) async fn resolve_with_owner(
     let refresh_key = resolve_key.with_operation(OperationKind::Refresh);
     let context = ExecutionContext {
         forwarder,
-        engine: &engine,
+        engine,
         prepared: &prepared,
         raw_query,
         original_dst,

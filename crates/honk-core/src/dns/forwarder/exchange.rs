@@ -1,8 +1,9 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use bytes::Bytes;
 use tracing::{debug, trace};
 
 use crate::dns::cache::{CacheKey, DnsCacheService, PublicationEpoch};
@@ -36,7 +37,8 @@ impl DnsForwarder {
         &self,
         engine: &DnsEngine,
         prepared: &PreparedQuery,
-        reusable: Vec<u8>,
+        reusable: impl Into<Bytes>,
+        analyzed_answer_ips: Option<(usize, Vec<IpAddr>)>,
         status: OutcomeStatus,
         provenance: Provenance,
         expiry: EffectiveExpiry,
@@ -45,19 +47,33 @@ impl DnsForwarder {
         requery_history: Vec<String>,
         mode: ResolveMode,
     ) -> Result<DnsOutcome, DnsForwardError> {
-        let template = match ResponseTemplate::validate(prepared.query(), &reusable) {
+        let reusable = reusable.into();
+        let template = match ResponseTemplate::validate_owned(prepared.query(), reusable.clone()) {
             Ok(template) => Some(template),
             Err(_) if matches!(mode, ResolveMode::Compatibility) => None,
             Err(error) => return Err(error.into()),
         };
         let rendered = match &template {
             Some(template) => template.render(prepared.query())?,
-            None => patch_txid(reusable.clone(), prepared.query().txid().get()),
+            None => patch_txid(reusable.to_vec(), prepared.query().txid().get()),
+        };
+        let response_class = crate::dns::engine::classify_response(&reusable);
+        let answer_ips = if status == OutcomeStatus::Accepted
+            && response_class == crate::dns::outcome::ResponseClass::Positive
+        {
+            match analyzed_answer_ips {
+                Some((source_wire_len, ips)) if source_wire_len == rendered.len() => ips,
+                _ => super::message::extract_answer_ips(&rendered),
+            }
+        } else {
+            Vec::new()
         };
         Ok(DnsOutcome::new(OutcomeParts {
             status,
-            response_class: crate::dns::engine::classify_response(&reusable),
+            response_class,
             provenance,
+            domain: prepared.domain_arc(),
+            answer_ips,
             expiry,
             logical_upstream,
             final_upstream,

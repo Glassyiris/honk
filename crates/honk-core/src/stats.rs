@@ -40,8 +40,12 @@ impl OutboundTracker {
     }
 
     pub fn add_bytes(&self, tx: u64, rx: u64) {
-        self.tx_bytes.fetch_add(tx, Ordering::Relaxed);
-        self.rx_bytes.fetch_add(rx, Ordering::Relaxed);
+        if tx != 0 {
+            self.tx_bytes.fetch_add(tx, Ordering::Relaxed);
+        }
+        if rx != 0 {
+            self.rx_bytes.fetch_add(rx, Ordering::Relaxed);
+        }
     }
 
     pub fn increment_errors(&self) {
@@ -583,6 +587,10 @@ mod tests {
         tracker.add_bytes(100, 200);
         assert_eq!(tracker.tx_bytes.load(Ordering::Relaxed), 100);
         assert_eq!(tracker.rx_bytes.load(Ordering::Relaxed), 200);
+        tracker.add_bytes(0, 50);
+        tracker.add_bytes(25, 0);
+        assert_eq!(tracker.tx_bytes.load(Ordering::Relaxed), 125);
+        assert_eq!(tracker.rx_bytes.load(Ordering::Relaxed), 250);
 
         let snap = tracker.snapshot();
         assert_eq!(snap.total_conns, 2);

@@ -24,7 +24,7 @@ pub(crate) use service::PublicationEpoch;
 pub(crate) use service::{CacheSlot, DnsCacheService};
 pub use storage::{CachedEntry, NegativeCacheHit};
 
-use storage::CacheValue;
+use storage::{CacheValue, NegativeEntry};
 
 /// DNS response cache with LRU eviction and TTL-based expiry.
 ///

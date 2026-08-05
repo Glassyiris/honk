@@ -21,6 +21,13 @@ pub struct MockRoutingSnapshot {
     pub domain: Vec<([u8; 20], [u32; ROUTING_BITMAP_WORDS])>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MockRoutingPublicationWrite {
+    Exploded(u32),
+    Packed(u32),
+    Selector(u32),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MockMatchSetSnapshot {
     pub value: MockMatchValue,
@@ -134,9 +141,11 @@ pub struct MockEbpfBackend {
 
     /// Routing rules: index → MatchSet (array-style BPF map)
     pub routing_map: HashMap<u32, MatchSet>,
-    /// Routing metadata: key=0 holds the routing rule count, keys
-    /// `[1..ROUTING_META_MAP_LEN)` hold the per-group rule bitmaps.
+    /// Exploded routing metadata: key 0 selects the active generation; each
+    /// following generation block holds its rule count and group bitmaps.
     pub routing_meta: HashMap<u32, u32>,
+    /// Packed count/bitmap entries consumed by the datapath.
+    pub routing_group_meta: HashMap<u32, RoutingGroupMeta>,
     /// Domain routing bitmap: LpmKey → DomainRouting
     pub domain_routing_bitmap: HashMap<[u8; 20], DomainRouting>,
     /// Destination IP LPM routing bitmap: LpmKey → DomainRouting
@@ -166,6 +175,7 @@ pub struct MockEbpfBackend {
     pub datapath_ready: bool,
     pub listener_sockets_published: bool,
     pub routing_meta_write_order: Vec<u32>,
+    pub routing_publication_order: Vec<MockRoutingPublicationWrite>,
     routing_fault: Option<(RoutingPushPhase, usize)>,
     #[cfg(test)]
     projection_fault: Option<(ProjectionMapOperation, usize, bool)>,
@@ -276,6 +286,17 @@ impl MockEbpfBackend {
         let slot = routing_meta_bitmap_base(generation)
             + (group * ROUTING_GROUP_BITMAP_WORDS + word) as u32;
         self.routing_meta.get(&slot).copied().unwrap_or(0)
+    }
+
+    pub fn active_routing_group_meta(&self, group: u32) -> Option<RoutingGroupMeta> {
+        let generation = self
+            .routing_meta
+            .get(&ROUTING_META_ACTIVE_GENERATION_SLOT)
+            .copied()
+            .unwrap_or(0);
+        self.routing_group_meta
+            .get(&routing_group_meta_index(generation, group))
+            .copied()
     }
 
     fn take_routing_fault(&mut self, phase: RoutingPushPhase) -> anyhow::Result<()> {
@@ -526,16 +547,36 @@ impl EbpfBackend for MockEbpfBackend {
                     + (g * ROUTING_GROUP_BITMAP_WORDS + w) as u32;
                 self.routing_meta.insert(slot, *word);
                 self.routing_meta_write_order.push(slot);
+                self.routing_publication_order
+                    .push(MockRoutingPublicationWrite::Exploded(slot));
             }
         }
         self.routing_meta
             .insert(routing_meta_count_slot(generation), count);
         self.routing_meta_write_order
             .push(routing_meta_count_slot(generation));
+        self.routing_publication_order
+            .push(MockRoutingPublicationWrite::Exploded(
+                routing_meta_count_slot(generation),
+            ));
+        for (group, bitmap) in group_bitmaps.iter().enumerate() {
+            let index = routing_group_meta_index(generation, group as u32);
+            self.routing_group_meta.insert(
+                index,
+                RoutingGroupMeta {
+                    rule_count: count,
+                    bitmap: *bitmap,
+                },
+            );
+            self.routing_publication_order
+                .push(MockRoutingPublicationWrite::Packed(index));
+        }
         self.routing_meta
             .insert(ROUTING_META_ACTIVE_GENERATION_SLOT, generation);
         self.routing_meta_write_order
             .push(ROUTING_META_ACTIVE_GENERATION_SLOT);
+        self.routing_publication_order
+            .push(MockRoutingPublicationWrite::Selector(generation));
         Ok(())
     }
 
@@ -666,19 +707,14 @@ impl EbpfBackend for MockEbpfBackend {
         self.domain_routes.clear();
         self.ip_routes.clear();
         self.routing_map.clear();
+        self.routing_meta.clear();
+        self.routing_group_meta.clear();
+        self.routing_meta_write_order.clear();
+        self.routing_publication_order.clear();
         self.domain_routing_bitmap.clear();
         self.dest_lpm_bitmap.clear();
         self.source_lpm_bitmap.clear();
         self.mac_lpm_bitmap.clear();
-        Ok(())
-    }
-
-    fn clear_routing_map_tail(&mut self, start: u32) -> anyhow::Result<()> {
-        self.take_routing_fault(RoutingPushPhase::ClearTail)?;
-        // The real backend zeroes the slots; dropping them is equivalent
-        // here because ROUTING_META_MAP[0] (the active count) already
-        // excludes them.
-        self.routing_map.retain(|&k, _| k < start);
         Ok(())
     }
 
@@ -1273,10 +1309,9 @@ mod tests {
         backend
             .publish_routing_generation(0, 1, &all_groups)
             .unwrap();
-        backend.clear_routing_map_tail(1).unwrap();
-        assert_eq!(backend.routing_map.len(), 1);
+        assert_eq!(backend.routing_map.len(), 3);
         assert_eq!(backend.routing_map.get(&0).unwrap().outbound, 99);
-        assert!(!backend.routing_map.contains_key(&1));
+        assert!(backend.routing_map.contains_key(&1));
         assert_eq!(
             backend
                 .routing_meta
@@ -1346,7 +1381,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prune_lpm_entries_and_clear_routing_map_tail() {
+    fn test_prune_lpm_entries() {
         let mut backend = MockEbpfBackend::new();
         let k1 = LpmKey {
             prefix_len: 104,
@@ -1370,19 +1405,6 @@ mod tests {
                 .dest_lpm_bitmap
                 .contains_key(&MockEbpfBackend::lpm_key_bytes(&k2))
         );
-
-        backend
-            .set_routing_rules(
-                0,
-                &[
-                    MatchSet::default(),
-                    MatchSet::default(),
-                    MatchSet::default(),
-                ],
-            )
-            .unwrap();
-        backend.clear_routing_map_tail(2).unwrap();
-        assert_eq!(backend.routing_map.len(), 2);
     }
 
     #[test]

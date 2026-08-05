@@ -127,7 +127,7 @@ SockMap 即使只发布了一部分，也不会把流量 redirect 到缺失的 l
 
 | Map | 作用 |
 | ----- | ------ |
-| `ROUTING_MAP` + `ROUTING_META_MAP` | MatchSet 数组 + L4/IP 版本位图；两阶段发布 |
+| `ROUTING_MAP` + `ROUTING_META_MAP` + `ROUTING_GROUP_META_MAP` | 双缓冲 MatchSet bank + 可观测位图 + 每个流量组一条打包的 count/bitmap；最后切换 selector |
 | `DEST/SOURCE/MAC_LPM_ROUTING_MAP` | CIDR/MAC 的 LPM |
 | `DOMAIN_ROUTING_MAP` | IP → 域名规则位图（DNS 学习） |
 | `ROUTING_HANDOFF_MAP` | 五元组 → 用户态 handoff |
@@ -211,11 +211,16 @@ transport 及 anyfrom 回包 socket 后，driver 到达 ready barrier，lease �
 
 **队列与进程预算也是所有权上限。** 每 flow 最多保留 64 个 datagram（含首包），
 全部 flow 的 payload 合计最多 8 MiB。slow admission 和 flow/global permit
-在分配或复制 payload 前取得；后续包按 FIFO 且非阻塞，饱和时丢弃最新包。TCP、
-冷态非 DNS UDP 与 port-53 工作使用相互独立的 admission semaphore，避免一种流量
-耗尽其他类别。UDP endpoint 还预留进程 FD；生产上限为
-`min(8192, (min(RLIMIT_NOFILE, 16384) - reserves) / 2)`。移除通知使用有界队列与
-去重补偿。reload cancellation 受 epoch 与 generation 栅栏保护：它清理
+在分配或复制 payload 前取得；后续包按 FIFO 且非阻塞，饱和时丢弃最新包。启动时只
+读取一次 `RLIMIT_NOFILE`（封顶 16,384），再用饱和算术划分给固定/runtime 预留、
+活动 TCP flow（每个六个描述符：accepted socket、outbound socket 与两对 splice
+pipe）、TCP 池保留项、临时代理拨号以及 UDP endpoint（每个三个描述符，覆盖
+SOCKS5 的 UDP relay、TCP control stream 与 anyfrom 回包 socket）。TCP、冷态
+非 DNS UDP 与 port-53 准入、TCP 池、runtime 拨号 semaphore 和 UDP endpoint
+slot 全部来自这一份不可变划分。上限 16,384 时分别为：预留 256、TCP flow 672、
+池化 TCP 2,016、临时拨号 1,008、UDP endpoint 3,024；UDP 与 DNS slow path
+各自再封顶 256。移除通知使用有界队列与去重补偿。reload
+cancellation 受 epoch 与 generation 栅栏保护：它清理
 `Initializing` lease 及资源、保留已经 `Ready` 的 endpoint，并且只删除同一
 generation，故旧任务不能清除 replacement。
 组序号也对应 eBPF connectivity slot。reload 会先把过渡 slot 全部设为 fail-open，

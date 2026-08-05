@@ -128,7 +128,7 @@ therefore never redirect a flow into a missing listener slot.
 
 | Map | Role |
 | ----- | ------ |
-| `ROUTING_MAP` + `ROUTING_META_MAP` | MatchSet array + L4/IP-version bitmaps; two-phase publish |
+| `ROUTING_MAP` + `ROUTING_META_MAP` + `ROUTING_GROUP_META_MAP` | Double-buffered MatchSet banks + introspection bitmaps + one packed count/bitmap entry per flow group; selector-last publish |
 | `DEST/SOURCE/MAC_LPM_ROUTING_MAP` | LPM tries for CIDR/MAC |
 | `DOMAIN_ROUTING_MAP` | IP → domain-rule bitmaps (DNS-learned) |
 | `ROUTING_HANDOFF_MAP` | Tuple → userspace handoff |
@@ -219,10 +219,16 @@ replayed through another candidate.
 datagrams, including the first, and all flows together retain at most 8 MiB of
 payload. Slow admission and flow/global permits are acquired before payload
 allocation or copy; followers are FIFO and nonblocking saturation drops the
-newest packet. TCP, cold non-DNS UDP, and port-53 work have independent
-admission semaphores, so one class cannot exhaust another. UDP endpoint slots
-also reserve process FDs: production uses at most
-`min(8192, (min(RLIMIT_NOFILE, 16384) - reserves) / 2)` endpoints. Removal
+newest packet. One startup `RLIMIT_NOFILE` snapshot, capped at 16,384, is split
+with saturating arithmetic among a fixed/runtime reserve, active TCP flows (six
+descriptors each: accepted socket, outbound socket, and two splice pipe pairs),
+retained TCP pool entries, transient proxied dials, and UDP endpoints (three
+descriptors each, covering SOCKS5's UDP relay, TCP control stream, and anyfrom
+reply socket). TCP, cold non-DNS UDP, and port-53 admission, the TCP pool,
+runtime dial semaphore, and UDP endpoint slots all derive from that immutable
+partition. At the 16,384 cap the respective capacities are 256 reserved
+descriptors, 672 TCP flows, 2,016 pooled TCP entries, 1,008 transient dials,
+and 3,024 UDP endpoints; UDP and DNS slow paths are each capped at 256. Removal
 notifications use a bounded queue with deduplicated compensation. Reload
 cancellation is epoch- and generation-fenced: it drains `Initializing` leases
 and their resources, preserves already-`Ready` endpoints, and removes only the
