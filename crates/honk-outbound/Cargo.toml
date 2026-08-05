@@ -59,6 +59,12 @@ tokio-rustls.workspace = true
 rustls-pemfile.workspace = true
 webpki-roots.workspace = true
 
+[features]
+# VLESS (xtls-rprx-vision flow) / VMess proxy handlers. Off by default:
+# the descriptor facts stay unconditional, the registry simply has no
+# handler to dispatch for those protocols without the feature.
+rprx = []
+
 [[bench]]
 name = "ss_aead"
 harness = false
