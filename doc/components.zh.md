@@ -69,7 +69,7 @@ dae 语法中节点**只能以分享链接书写**：`tag: 'scheme://...'` 或�
 
 | 字段 | 类型 | 默认值 | 含义 |
 | ------ | ------ | -------- | ------ |
-| `id` | UUID | 内容派生 | 稳定身份：对 `protocol\|host\|port\|credential\|dial-shape`（dial shape = sni/transport/ws/grpc/obfs）取 UUID v5；改名不变，两个节点派生出相同 id 会被拒绝（订阅内重复端点跳过并告警） |
+| `id` | UUID | 内容派生 | 稳定身份：对 `protocol\|host\|port\|credential\|dial-shape`（dial shape = sni/transport/ws/grpc/obfs 外加 REALITY/flow 握手形态）取 UUID v5；改名不变，两个节点派生出相同 id 会被拒绝（订阅内重复端点跳过并告警） |
 | `name` | string | **必填** | 路由 / API 名称；dae 中为链接前的 tag |
 | `protocol` | enum | `ss` | 见协议表；dae 中由链接 scheme 决定 |
 | `address` | string | 必填* | 主机或 `host:port` |
@@ -85,6 +85,10 @@ dae 语法中节点**只能以分享链接书写**：`tag: 'scheme://...'` 或�
 | `ech_enabled` | bool | `false` | 提供 ECH；链接 `ech=1`（或 `ech_config` 隐式开启） |
 | `ech_config` | string? | null | Base64 编码的 ECHConfigList；链接 `ech_config` 参数 |
 | `ech_config_path` | string? | null | 存放 base64 ECHConfigList 的文件路径 |
+| `reality_public_key` | string? | null | REALITY 服务端 X25519 公钥（分享链接 `pbk`）；设置后该节点走 REALITY 握手而非普通 TLS（`security=reality` 隐含 `tls=true`） |
+| `reality_short_id` | string? | null | REALITY short id（链接 `sid`，偶数长度 hex，至多 8 字节） |
+| `reality_spider_x` | string? | null | REALITY spider 路径（链接 `spx`，链接约定默认 `/`） |
+| `flow` | string? | null | VLESS flow 控制（链接 `flow=`）；仅支持 `xtls-rprx-vision`，且要求 TLS 或 REALITY 承载——由 `Config::validate` 强制校验 |
 | `network` | string? | null | V2Ray 风格 network 提示 |
 | `ws_path` / `ws_host` | string? | null | WebSocket；链接 `path` / `host` 参数 |
 | `grpc_service` | string? | null | gRPC service 名；链接 `serviceName` 参数 |
@@ -114,8 +118,8 @@ dae 语法中节点**只能以分享链接书写**：`tag: 'scheme://...'` 或�
 | ------ | ------ | ----- | ----- | ------ |
 | `ss` | `shadowsocks` | 是 | 是 | AEAD + `2022-blake3-*` |
 | `trojan` | | 是 | 是 | TLS；经 transport 支持 WS/gRPC |
-| `vmess` | | 是 | 否 | AEAD；WS/gRPC |
-| `vless` | | 是 | 否 | 头里的 UDP 仅测试存在 |
+| `vmess` | | 是 | 否 | AEAD；WS/gRPC；`security=reality` 可启用 REALITY；仅在 `rprx` feature 下注册（honk-core 默认构建开启） |
+| `vless` | | 是 | 否 | REALITY + `xtls-rprx-vision` flow；头里的 UDP 仅测试存在；仅在 `rprx` feature 下注册 |
 | `socks5` | | 是 | 是 | UDP ASSOCIATE |
 | `hysteria2` | | 是 | 是 | 真实 QUIC/H3；salamander；brutal（配带宽时）或 BBR；端口跳跃 |
 | `tuic` | | 是 | 是 | TUIC v5 / quinn |
@@ -143,6 +147,21 @@ node {
     my_grpc: 'trojan://password@example.com:443?type=grpc&serviceName=GunService&sni=example.com#my_grpc'
 }
 ```
+
+**VLESS + REALITY（xtls-rprx-vision）**
+
+`security=reality` 把 vless（或 vmess）节点从普通 TLS 切换为 REALITY 握手；`pbk`/`sid`/`spx` 携带 REALITY 参数，`flow=xtls-rprx-vision` 启用 XTLS Vision 拼接：
+
+```dae
+node {
+    vless_r: 'vless://uuid@example.com:443?security=reality&sni=dl.google.com&pbk=<base64url-公钥>&sid=ab12&flow=xtls-rprx-vision#vless_r'
+}
+```
+
+- 显式 `security=` 覆盖 vless 历史默认的 TLS 开启行为：`security=none` 关闭 TLS，其余取值开启；不带 `security=` 的链接解析行为与之前完全一致（vless 默认开 TLS，vmess 默认关）。`fp=` 被接受但忽略——ClientHello 指纹跟随全局 `tls_implementation` 模式。
+- REALITY 不需要 CA，也不需要 `skip_cert_verify`：服务端在握手后基于 REALITY auth key 认证（见 `doc/design.zh.md`），认证失败一律拒绝，不会降级。
+- REALITY 的 `dest`/SNI 要选 TLS Certificate 消息小于 8 KiB 的目标（sing-box reality 缓冲为 8192 字节）——`dl.google.com` 可用，`www.microsoft.com` 不可用。
+- VMess 与 VLESS 的 handler 由 honk-outbound 的 `rprx` cargo feature 编译（honk-core 默认开启）。不带该 feature 的构建可以解析这类节点，但拨号会以 "No handler for protocol" 拒绝。
 
 ### TLS 指纹与 ECH
 
@@ -187,7 +206,7 @@ node {
 | -------- | ------ |
 | `ss://` | SIP002 |
 | `vmess://` | base64 JSON（v2rayN） |
-| `vless://` / `trojan://` | query 传 transport/TLS |
+| `vless://` / `trojan://` | query 传 transport/TLS；vless/vmess 另支持 `security=reality|tls|none`、`pbk`、`sid`、`spx`、`flow`（REALITY + xtls-rprx-vision） |
 | `anytls://` | query 中的池参数 |
 | `hysteria2://` / `tuic://` / `juicity://` | QUIC 族 |
 | `socks5://` | 简单代理 |

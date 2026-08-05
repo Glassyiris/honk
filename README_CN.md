@@ -95,6 +95,7 @@ honk 沿用 dae 的内核模型，但并非移植。主要不同点：
 #### 出站与组
 
 - [x] Handler：Direct、Block、SOCKS5、SS（含 2022）、Trojan、VMess、VLESS、Hysteria2、TUIC、Juicity、AnyTLS
+- [x] VLESS + REALITY 客户端（含 `xtls-rprx-vision` flow），基于 boring-sys 补丁钩子改写 ClientHello；JA4 与真实 Chrome 对齐（ja4_a/ja4_b 完全一致）
 - [x] 共享传输层（TLS/WS/gRPC）
 - [x] 组：Selector / URLTest / LoadBalance / Fallback + 嵌套组
 - [x] URLTest：tolerance、TCP/UDP 独立选择、idle_timeout、interrupt_connections
@@ -117,7 +118,7 @@ honk 沿用 dae 的内核模型，但并非移植。主要不同点：
 ### TODO
 
 - [ ] VMess / VLESS 的 UDP 中继
-- [ ] REALITY + uTLS（**已延期** — rustls 缺成熟 hook）
+- [x] REALITY 客户端 + Chrome（uTLS 风格）指纹——BoringSSL 加两个 boring-sys 补丁钩子实现；支持 VLESS `xtls-rprx-vision`
 - [x] 真正的 DoT/DoH/DoQ/DoH3 上游（TLS/H2/QUIC 会话复用）
 - [x] Hysteria2 brutal（上下行 Mbps）、端口跳跃（`mport`/`mhop`）、`pinSHA256`、QUIC 接收窗口/PMTUD 参数；已对官方服务器实测验证
 - [ ] Hysteria2 残留：`maxStreamReceiveWindow`/`maxConnReceiveWindow`（quinn 无自动调窗对应）、`fastOpen`、UDP 会话/连接空闲超时可配（当前硬编码 90s/120s）

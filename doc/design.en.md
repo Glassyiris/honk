@@ -14,7 +14,6 @@
 ## 2. Non-goals (current)
 
 - Full Clash Meta / mihomo feature parity (FakeIP engine and remote rule-sets).
-- REALITY protocol support (deferred). Chrome-style TLS fingerprints are implemented through BoringSSL rather than a production rustls path.
 - Windows / macOS transparent proxy.
 
 ## 3. Inspiration map
@@ -265,9 +264,23 @@ Registered protocols: Direct, Block, SOCKS5, Shadowsocks (+ 2022), Trojan, VMess
 
 Shared layers:
 
-- `transport.rs` — TCP → optional TLS → WS / gRPC
+- `transport.rs` — TCP → optional TLS → WS / gRPC; a node with REALITY parameters takes the REALITY handshake here instead of plain TLS
 - `quic.rs` — shared quinn client for Hy2 / TUIC / Juicity
 - `tls.rs` — BoringSSL TLS and Chrome-fingerprint helpers
+- `reality.rs` — REALITY client handshake (see below)
+
+VMess and VLESS are compiled behind honk-outbound's `rprx` cargo feature (on in honk-core's default build); without it those nodes parse but dials are refused with "No handler for protocol".
+
+### REALITY client
+
+`honk-outbound/src/reality.rs` implements the REALITY handshake for VLESS/VMess outbounds, byte-compatible with Xray-core `transport/internet/reality/reality.go`, over two client hooks carried by a small boring-sys fork patch (`SSL_set1_client_x25519_private_key` presets the ephemeral X25519 key into the ClientHello key_share; `SSL_set_client_hello_fixup_cb` allows rewriting the serialized ClientHello in place before it enters the transcript):
+
+- The legacy session_id is rewritten to `AES-256-GCM(authKey).Seal([ver:3][0][timestamp:4][short_id:8])`, where `authKey = HKDF-SHA256(X25519(client ephemeral, server public key), salt = client_random[:20], "REALITY")`, the nonce is `client_random[20:32]`, and the AAD is the whole ClientHello with the session_id slot zeroed.
+- Server authentication replaces PKI (the mask target's real certificate would always fail it): a genuine REALITY server presents an ephemeral ed25519 certificate whose signature equals `HMAC-SHA512(authKey, raw ed25519 public key)`. Anything else — a real certificate relayed from the mask target when the session_id did not decrypt, a wrong key, a MITM — is fail-closed.
+- Chrome mode is aligned against a real Chrome ClientHello: the reality-mode JA4 is `t13d1516h2_8daaf6152771_01adaf6b9c20` with ja4_a/ja4_b identical to real Chrome; the one known difference is ja4_c, because the signature-algorithm list must be widened with ed25519 (BoringSSL otherwise rejects the REALITY ephemeral leaf with WRONG_SIGNATURE_TYPE before authentication can run). ALPS is pinned to the old `0x4469` codepoint, closer to real Chrome than uTLS. Session resumption is never offered.
+- The REALITY `dest`/SNI target must serve a TLS Certificate message under 8 KiB (sing-box reality buffers 8192 bytes): `dl.google.com` works, `www.microsoft.com` (8273 B) does not.
+
+With `flow: xtls-rprx-vision`, the VLESS request carries the flow in the Xray `encoding.Addons` protobuf; the response header is stripped lazily on the first read (servers piggyback it on the first downstream bytes), and Vision response frames (`[command][contentLen u16][paddingLen u16]`) are unpadded on the read side — `command=2` (XTLS direct copy) switches the read side to the raw TCP socket when the server abandons the outer TLS session, while the write side stays on the outer stream.
 
 ### Groups
 

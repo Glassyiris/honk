@@ -14,7 +14,6 @@
 ## 2. 非目标（当前）
 
 - 完整 Clash Meta / mihomo 能力对等（完整 FakeIP 引擎与远程 rule-set）。
-- REALITY 协议支持（延期）。Chrome 风格 TLS 指纹已通过 BoringSSL 实现，而非生产 rustls 路径。
 - Windows / macOS 透明代理。
 
 ## 3. 灵感来源对照
@@ -252,9 +251,23 @@ warm-up 返回 `NotApplicable`，不会伪造成功。
 
 共享层：
 
-- `transport.rs` — TCP → 可选 TLS → WS / gRPC
+- `transport.rs` — TCP → 可选 TLS → WS / gRPC；带 REALITY 参数的节点在此走 REALITY 握手而非普通 TLS
 - `quic.rs` — Hy2 / TUIC / Juicity 共用 quinn 客户端
 - `tls.rs` — BoringSSL TLS 与 Chrome 指纹辅助
+- `reality.rs` — REALITY 客户端握手（见下文）
+
+VMess 与 VLESS 由 honk-outbound 的 `rprx` cargo feature 编译（honk-core 默认构建开启）；不带该 feature 时节点可解析，但拨号以 "No handler for protocol" 拒绝。
+
+### REALITY 客户端
+
+`honk-outbound/src/reality.rs` 为 VLESS/VMess 出站实现 REALITY 握手，字节级兼容 Xray-core 的 `transport/internet/reality/reality.go`，依赖 boring-sys fork 补丁提供的两个客户端钩子（`SSL_set1_client_x25519_private_key` 把临时 X25519 私钥预置进 ClientHello 的 key_share；`SSL_set_client_hello_fixup_cb` 允许在 ClientHello 进入 transcript 前原地改写序列化后的报文）：
+
+- legacy session_id 被改写为 `AES-256-GCM(authKey).Seal([ver:3][0][timestamp:4][short_id:8])`，其中 `authKey = HKDF-SHA256(X25519(客户端临时私钥, 服务端公钥), salt = client_random[:20], "REALITY")`，nonce 为 `client_random[20:32]`，AAD 为 session_id 槽位清零后的整个 ClientHello。
+- 服务端认证取代 PKI（伪装目标的真实证书必然过不了校验）：真正的 REALITY 服务端出示临时 ed25519 证书，其签名等于 `HMAC-SHA512(authKey, ed25519 裸公钥)`。其余一切——session_id 解密失败时从伪装目标转发来的真实证书、错误的密钥、MITM——一律失败关闭，不降级。
+- Chrome 模式对齐真实 Chrome 的 ClientHello：reality 模式下 JA4 为 `t13d1516h2_8daaf6152771_01adaf6b9c20`，ja4_a/ja4_b 与真实 Chrome 完全一致；唯一已知差异在 ja4_c——签名算法列表必须加入 ed25519（否则 BoringSSL 在认证执行前就以 WRONG_SIGNATURE_TYPE 拒绝 REALITY 的临时叶证书）。ALPS 固定使用旧码点 `0x4469`，比 uTLS 更接近真实 Chrome。从不提供会话恢复。
+- REALITY 的 `dest`/SNI 目标必须返回小于 8 KiB 的 TLS Certificate 消息（sing-box reality 缓冲 8192 字节）：`dl.google.com` 可用，`www.microsoft.com`（8273 B）不可用。
+
+当 `flow: xtls-rprx-vision` 时，VLESS 请求在 Xray `encoding.Addons` protobuf 中携带 flow；响应头在首次读取时惰性剥离（服务端把它搭在首批下行数据上），读侧对 Vision 帧（`[command][contentLen u16][paddingLen u16]`）做 unpad——`command=2`（XTLS direct copy）时服务端放弃外层 TLS 会话，读侧切换到裸 TCP socket，写侧仍留在外层流上。
 
 ### 组
 

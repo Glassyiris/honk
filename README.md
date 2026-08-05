@@ -66,6 +66,7 @@ Status reflects the current tree and unit/integration tests. Prefer re-running `
 #### Outbound & groups
 
 - [x] Handlers: Direct, Block, SOCKS5, SS(+2022), Trojan, VMess, VLESS, Hysteria2, TUIC, Juicity, AnyTLS
+- [x] VLESS + REALITY client (incl. `xtls-rprx-vision` flow) over a patched-boring-sys ClientHello; Chrome-fingerprint JA4-aligned (ja4_a/ja4_b identical to real Chrome)
 - [x] Shared transport (TLS/WS/gRPC)
 - [x] Groups: Selector / URLTest / LoadBalance / Fallback + nested groups
 - [x] URLTest: tolerance, separate TCP/UDP picks, idle_timeout, interrupt_connections
@@ -85,7 +86,7 @@ Status reflects the current tree and unit/integration tests. Prefer re-running `
 ### TODO
 
 - [ ] UDP relay for VMess / VLESS
-- [ ] REALITY + uTLS (**deferred** — no mature rustls hooks)
+- [x] REALITY client + Chrome (uTLS-style) fingerprint — BoringSSL with a two-hook boring-sys patch; VLESS `xtls-rprx-vision` supported
 - [x] Real DoT/DoH/DoQ/DoH3 upstreams (pooled TLS/H2/QUIC sessions)
 - [x] Hysteria2 brutal (up/down Mbps), port hopping (`mport`/`mhop`), `pinSHA256`, QUIC receive-window/PMTUD knobs; live-verified against the official server
 - [ ] Hysteria2 residue: `maxStreamReceiveWindow`/`maxConnReceiveWindow` (no quinn autotuning equivalent), `fastOpen`, configurable UDP-session/connection idle timeouts (hardcoded 90s/120s)
