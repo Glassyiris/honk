@@ -95,6 +95,9 @@ pub struct ClashState {
     pub connection_pool: Arc<crate::pool::ConnectionPool>,
     /// External UI directory (`experimental.clash_api.external_ui`).
     pub external_ui: String,
+    /// Traffic router; the external-UI download routes its fetch through it
+    /// like user traffic.
+    pub router: Arc<tokio::sync::RwLock<crate::routing::Router>>,
     /// Active-level handle for the Clash API tracing layer.
     pub log_handle: logs::ClashLogHandle,
     pub dns_service: crate::dns::DnsService,
@@ -138,8 +141,16 @@ pub fn router(state: Arc<ClashState>) -> Router {
     if !state.external_ui.is_empty() {
         // sing-box server_resources.go: download the dashboard in the
         // background when the directory is missing/empty; ServeDir keeps
-        // returning 404 until the files land (never blocks startup).
-        ui::spawn_ui_download_if_needed(state.external_ui.clone());
+        // returning 404 until the files land (never blocks startup). The
+        // fetch follows the traffic routing decision (direct/block/proxy).
+        ui::spawn_ui_download_if_needed(ui::UiDownloadContext {
+            external_ui: state.external_ui.clone(),
+            router: state.router.clone(),
+            config: state.config.clone(),
+            group_manager: state.group_manager.clone(),
+            proxy_registry: state.proxy_registry.clone(),
+            runtime_registry: state.runtime_registry.clone(),
+        });
         app = app
             // 301 Moved Permanently, matching sing-box's RedirectHandler.
             .route(
