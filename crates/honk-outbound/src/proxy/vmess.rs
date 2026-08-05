@@ -310,17 +310,6 @@ impl VmessHandler {
         out
     }
 
-    fn seal(key: &[u8; 16], nonce: &[u8; 12], plaintext: &[u8]) -> Vec<u8> {
-        let cipher = aes_gcm::Aes128Gcm::new_from_slice(key).expect("valid key length");
-        cipher
-            .encrypt(
-                <&aes_gcm::aead::Nonce<aes_gcm::Aes128Gcm>>::try_from(nonce.as_slice())
-                    .expect("nonce size"),
-                plaintext,
-            )
-            .expect("seal")
-    }
-
     fn seal_aad(key: &[u8; 16], nonce: &[u8; 12], plaintext: &[u8], aad: &[u8]) -> Vec<u8> {
         let cipher = aes_gcm::Aes128Gcm::new_from_slice(key).expect("valid key length");
         cipher
@@ -499,22 +488,66 @@ fn chunk_nonce(iv: &[u8; 16], count: u16) -> [u8; 12] {
     nonce
 }
 
-/// Seal one body chunk: masked length field + AEAD(payload). An empty
-/// payload is the request-body termination chunk (Xray's outbound writes an
-/// empty MultiBuffer on upload EOF; without it the server keeps waiting for
-/// more request data).
-fn seal_chunk(
-    key: &[u8; 16],
-    iv: &[u8; 16],
-    size: &mut ShakeSizeParser,
+/// Per-direction body chunk coder: SHAKE128 length masking + AES-128-GCM.
+/// The AEAD runs on BoringSSL (`AeadCtx`): RustCrypto's aes-gcm measured
+/// ~0.4 GB/s single-core vs BoringSSL's multi-GB/s on AES-NI
+/// (benches/ss_aead.rs, same finding as the Shadowsocks `AeadCipher`),
+/// which made the VMess relay single-core-bound. The header AEAD and the
+/// auth-ID block stay on RustCrypto — two AEAD ops and one AES block per
+/// connection are not hot.
+struct BodyChunks {
+    ctx: boring::aead::AeadCtx,
+    iv: [u8; 16],
+    size: ShakeSizeParser,
     count: u16,
-    payload: &[u8],
-) -> Vec<u8> {
-    debug_assert!(payload.len() <= CHUNK_MAX_LEN);
-    let mut out = Vec::with_capacity(2 + payload.len() + GCM_TAG_LEN);
-    out.extend_from_slice(&size.encode_len((payload.len() + GCM_TAG_LEN) as u16));
-    out.extend_from_slice(&VmessHandler::seal(key, &chunk_nonce(iv, count), payload));
-    out
+}
+
+impl BodyChunks {
+    fn new(key: &[u8; 16], iv: &[u8; 16]) -> anyhow::Result<Self> {
+        Ok(Self {
+            ctx: boring::aead::AeadCtx::new_default_tag(
+                &boring::aead::Algorithm::aes_128_gcm(),
+                key,
+            )?,
+            iv: *iv,
+            size: ShakeSizeParser::new(iv),
+            count: 0,
+        })
+    }
+
+    /// Seal one chunk: masked length field + AEAD(payload). An empty
+    /// payload is the request-body termination chunk (Xray's outbound
+    /// writes an empty MultiBuffer on upload EOF; without it the server
+    /// keeps waiting for more request data).
+    fn seal_chunk(&mut self, payload: &[u8]) -> Vec<u8> {
+        debug_assert!(payload.len() <= CHUNK_MAX_LEN);
+        let mut out = Vec::with_capacity(2 + payload.len() + GCM_TAG_LEN);
+        out.extend_from_slice(&self.size.encode_len((payload.len() + GCM_TAG_LEN) as u16));
+        out.extend_from_slice(payload);
+        out.resize(out.len() + GCM_TAG_LEN, 0);
+        let (body, tag) = out[2..].split_at_mut(payload.len());
+        self.ctx
+            .seal_in_place(&chunk_nonce(&self.iv, self.count), body, tag, b"")
+            .expect("AES-128-GCM seal");
+        self.count = self.count.wrapping_add(1);
+        out
+    }
+
+    fn decode_len(&mut self, encoded: [u8; 2]) -> u16 {
+        self.size.decode_len(encoded)
+    }
+
+    /// Decrypt a chunk in place (ciphertext+tag → plaintext prefix) and
+    /// return the plaintext length.
+    fn open_chunk(&mut self, ct: &mut [u8]) -> anyhow::Result<usize> {
+        anyhow::ensure!(ct.len() >= GCM_TAG_LEN, "short VMess chunk");
+        let (body, tag) = ct.split_at_mut(ct.len() - GCM_TAG_LEN);
+        self.ctx
+            .open_in_place(&chunk_nonce(&self.iv, self.count), body, tag, b"")
+            .map_err(|e| anyhow::anyhow!("VMess response chunk decrypt failed: {e}"))?;
+        self.count = self.count.wrapping_add(1);
+        Ok(body.len())
+    }
 }
 
 /// Background task that encrypts client→server data and decrypts
@@ -531,8 +564,7 @@ async fn vmess_relay(
     let upload = async {
         server_write.write_all(&header_wire).await?;
 
-        let mut size = ShakeSizeParser::new(&session.req_iv);
-        let mut count = 0u16;
+        let mut body = BodyChunks::new(&session.req_key, &session.req_iv)?;
         let mut buf = vec![0u8; CHUNK_MAX_LEN];
         loop {
             let n = client_read.read(&mut buf).await?;
@@ -542,19 +574,12 @@ async fn vmess_relay(
             let mut offset = 0;
             while offset < n {
                 let end = (offset + CHUNK_MAX_LEN).min(n);
-                let chunk = seal_chunk(
-                    &session.req_key,
-                    &session.req_iv,
-                    &mut size,
-                    count,
-                    &buf[offset..end],
-                );
-                count = count.wrapping_add(1);
+                let chunk = body.seal_chunk(&buf[offset..end]);
                 server_write.write_all(&chunk).await?;
                 offset = end;
             }
         }
-        let term = seal_chunk(&session.req_key, &session.req_iv, &mut size, count, &[]);
+        let term = body.seal_chunk(&[]);
         server_write.write_all(&term).await?;
         server_write.flush().await?;
         Ok::<(), anyhow::Error>(())
@@ -563,14 +588,13 @@ async fn vmess_relay(
     let download = async {
         read_response_header(&mut server_read, &session).await?;
 
-        let mut size = ShakeSizeParser::new(&session.resp_iv);
-        let mut count = 0u16;
+        let mut body = BodyChunks::new(&session.resp_key, &session.resp_iv)?;
         loop {
             let mut len_buf = [0u8; 2];
             if server_read.read_exact(&mut len_buf).await.is_err() {
                 break;
             }
-            let chunk_len = size.decode_len(len_buf) as usize;
+            let chunk_len = body.decode_len(len_buf) as usize;
             // size == AEAD overhead is the server's termination chunk
             // (AuthenticationReader.readInternal).
             if chunk_len == GCM_TAG_LEN {
@@ -582,14 +606,8 @@ async fn vmess_relay(
             );
             let mut ct = vec![0u8; chunk_len];
             server_read.read_exact(&mut ct).await?;
-            let plain = VmessHandler::open(
-                &session.resp_key,
-                &chunk_nonce(&session.resp_iv, count),
-                &ct,
-            )
-            .map_err(|e| anyhow::anyhow!("VMess response chunk decrypt failed: {:?}", e))?;
-            count = count.wrapping_add(1);
-            client_write.write_all(&plain).await?;
+            let n = body.open_chunk(&mut ct)?;
+            client_write.write_all(&ct[..n]).await?;
         }
         Ok::<(), anyhow::Error>(())
     };
@@ -744,22 +762,10 @@ mod tests {
     #[test]
     fn test_body_chunk_vectors() {
         let session = fixed_session();
-        let mut size = ShakeSizeParser::new(&session.req_iv);
-        let c0 = seal_chunk(
-            &session.req_key,
-            &session.req_iv,
-            &mut size,
-            0,
-            b"hello vmess",
-        );
-        let c1 = seal_chunk(
-            &session.req_key,
-            &session.req_iv,
-            &mut size,
-            1,
-            b"hello vmess",
-        );
-        let term = seal_chunk(&session.req_key, &session.req_iv, &mut size, 2, b"");
+        let mut body = BodyChunks::new(&session.req_key, &session.req_iv).unwrap();
+        let c0 = body.seal_chunk(b"hello vmess");
+        let c1 = body.seal_chunk(b"hello vmess");
+        let term = body.seal_chunk(b"");
         assert_eq!(c0, hex(CHUNK0));
         assert_eq!(c1, hex(CHUNK1));
         assert_eq!(term, hex(CHUNK_TERM));
@@ -793,21 +799,16 @@ mod tests {
         let mut cursor: &[u8] = &wire;
         read_response_header(&mut cursor, &session).await.unwrap();
 
-        let mut size = ShakeSizeParser::new(&session.resp_iv);
+        let mut body = BodyChunks::new(&session.resp_key, &session.resp_iv).unwrap();
         let mut out = Vec::new();
-        for count in 0..2u16 {
+        for _ in 0..2 {
             let mut len_buf = [0u8; 2];
             cursor.read_exact(&mut len_buf).await.unwrap();
-            let chunk_len = size.decode_len(len_buf) as usize;
+            let chunk_len = body.decode_len(len_buf) as usize;
             let mut ct = vec![0u8; chunk_len];
             cursor.read_exact(&mut ct).await.unwrap();
-            let plain = VmessHandler::open(
-                &session.resp_key,
-                &chunk_nonce(&session.resp_iv, count),
-                &ct,
-            )
-            .unwrap();
-            out.extend_from_slice(&plain);
+            let n = body.open_chunk(&mut ct).unwrap();
+            out.extend_from_slice(&ct[..n]);
         }
         assert_eq!(out, b"HTTP/1.1 200 OKHTTP/1.1 200 OK");
         assert!(cursor.is_empty());
@@ -847,16 +848,18 @@ mod tests {
     }
 
     #[test]
-    fn test_seal_open_roundtrip() {
-        let key = [0xAA; 16];
-        let nonce = [0xBB; 12];
-        let plain = b"hello vmess aead";
-
-        let ct = VmessHandler::seal(&key, &nonce, plain);
-        assert_eq!(ct.len(), plain.len() + GCM_TAG_LEN);
-
-        let decrypted = VmessHandler::open(&key, &nonce, &ct).expect("decrypt");
-        assert_eq!(decrypted, plain);
+    fn test_body_chunk_roundtrip() {
+        let session = fixed_session();
+        let mut tx = BodyChunks::new(&session.req_key, &session.req_iv).unwrap();
+        let mut rx = BodyChunks::new(&session.req_key, &session.req_iv).unwrap();
+        for payload in [&b"hello vmess aead"[..], &vec![0xAB; CHUNK_MAX_LEN][..]] {
+            let wire = tx.seal_chunk(payload);
+            let len = rx.decode_len([wire[0], wire[1]]) as usize;
+            assert_eq!(len, payload.len() + GCM_TAG_LEN);
+            let mut ct = wire[2..].to_vec();
+            let n = rx.open_chunk(&mut ct).unwrap();
+            assert_eq!(&ct[..n], payload);
+        }
     }
 
     #[test]
