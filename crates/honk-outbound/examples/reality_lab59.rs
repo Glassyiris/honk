@@ -1,8 +1,9 @@
 //! REALITY interop probe against the lab server at 10.10.10.59:8443
 //! (vless+reality+xtls-rprx-vision). Positive case: TLS handshake +
 //! REALITY ed25519 server authentication + a minimal VLESS request
-//! tunneling an HTTP/1.1 HEAD to www.gstatic.com. Negative case: a wrong
-//! public key must fail closed at the server-authentication step.
+//! tunneling an HTTP/1.1 HEAD to the LAN bench server (the lab has no
+//! direct internet egress). Negative case: a wrong public key must fail
+//! closed at the server-authentication step.
 //!
 //! Run: cargo run -p honk-outbound --example reality_lab59
 
@@ -17,10 +18,10 @@ const UUID: &str = "4a3d42a2-a62d-4454-b2a2-7cbe5ddf4c7a";
 const PUBLIC_KEY: &str = "ubLKoDOT4sSoWuztLwduKc9szHmp4lvmKbMk4-1O518";
 const SHORT_ID: &str = "a1b2c3d4e5f60718";
 const SNI: &str = "dl.google.com";
-const TARGET_HOST: &str = "www.gstatic.com";
-// Plain HTTP on 443 gets no answer from Google's frontends (they wait for a
-// ClientHello); port 80 proves the tunnel both ways with a real HTTP reply.
-const TARGET_PORT: u16 = 80;
+// LAN bench server: the lab has no direct internet egress, so the probe
+// target lives on the probe machine itself.
+const TARGET_HOST: &str = "10.10.10.70";
+const TARGET_PORT: u16 = 18080;
 
 fn lab_config(addr_host: &str, public_key: &str) -> RealityConfig {
     let node = Node {
@@ -68,7 +69,7 @@ async fn positive(
     tls.write_all(&vless_request(uuid, TARGET_HOST, TARGET_PORT))
         .await?;
     tls.write_all(
-        format!("HEAD /generate_204 HTTP/1.1\r\nHost: {TARGET_HOST}\r\nConnection: close\r\n\r\n")
+        format!("GET /generate_204 HTTP/1.1\r\nHost: {TARGET_HOST}\r\nConnection: close\r\n\r\n")
             .as_bytes(),
     )
     .await?;

@@ -82,6 +82,10 @@ required-features = ["rprx"]
 name = "proto_bench"
 required-features = ["rprx"]
 
+[[example]]
+name = "vless_transports"
+required-features = ["rprx"]
+
 [[bench]]
 name = "group_selection"
 harness = false
