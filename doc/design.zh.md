@@ -155,6 +155,7 @@ SockMap 即使只发布了一部分，也不会把流量 redirect 到缺失的 l
 - **SYN 时刻**，若无 DNS 学习或用户态嗅探，纯域名规则往往无法命中。
 - DNS 应答会更新 `DOMAIN_ROUTING_MAP`，后续 TCP 可在 eBPF 内匹配。
 - 非 `must` 的 `direct` 仅在模式策略要求时进用户态——`Global` 模式全部如此，`Rule` 模式下仅当仍可能被 SNI 改判时（存在域名类规则、`dial_mode` 启用嗅探、且该流域名未经 DNS 学习）。其余情形它与 `must` direct 一样在内核卸载（对齐 Go dae）：不经用户态中继、不出现在 `/connections`、也不再走 SNI 改判；tx 统计仍在 `lan_ingress` 计数。`Direct` 模式下所有非 `must`/非 `block` 流均被卸载（覆盖反正会强制 direct）。卸载决定在路由时按流做一次并缓存在该流的 `RoutingMeta`（位 57）；策略字（`DATAPATH_FLAGS_MAP`）由用户态在启动时（按 cachedb 恢复的模式）、每次 PATCH `/configs` 切换模式时写入，并在每次 reload 后重新断言，只在流创建时生效。
+- UDP 流还可以在**用户态决策完全收敛之后**再卸载。与 TCP 不同，UDP 没有内核必须从首字节起跟踪的序号状态，因此当某条流的控制面决策最终落在 `direct`（路由 + 模式覆盖 + 组选择 + 首个包发送成功）时，控制面原地改写该流已发布的 conn_state meta（`RoutingMeta::set_offloaded_direct`：outbound 归一为 `Direct`、清除 tproxy mark、置位 57），`lan_ingress` 的 established-UDP 分支随后让后续包内核直通。模式语义与路由时策略一致：`Rule`（或未启用 clash API）卸载收敛为 direct 的决策，`Direct` 把所有非 `must`/非 `block` 决策归一为 direct，`Global` 仅放行 `must`-direct、其余留在用户态。53 端口永不卸载——DNS 劫持依赖 DnsController 看到每个包（结构上 53 端口 UDP 本就没有 conn_state 可置位）。写位只发生在 direct endpoint 的 Ready 提交点：Initializing 或冷 URLTest stagger 期间绝不写，代理决策绝不写。endpoint 会刻意保留到空闲回收器退役为止，以便投递在途的首个应答（单发单收的 UDP 不受影响）；卸载流不再出现在 `/connections`，rx 字节也不计数（rx 在 `dae0_ingress` 记账），与 `must`-direct 完全一致。静默 120s 后 conn_state 被清扫，下一个数据报会原样重复一次"决策再卸载"循环。卸载位按流在决策时绑定，reload 或模式切换前建立的流保持其缓存决策。
 - TCP SNI/HTTP Host 与 QUIC Initial SNI 在域名感知模式下都会对非 `must`、非 `block` handoff 重新执行用户态 Router。
 
 ## 7. 用户态控制面
