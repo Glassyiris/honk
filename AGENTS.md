@@ -249,7 +249,7 @@ cargo +nightly build --release -Zbuild-std=core --target bpfel-unknown-none
 | -------- | --------- |
 | `build` / `check` / `lint` / `fmt` | `cargo build --release` / `check` / `clippy --all -D warnings` / `fmt --all` |
 | `test` / `test-ci` / `test-core` / `test-config` / `test-ebpf` | Test suites (`test` = full incl. known failures; `test-ci` = CI gate with the 3 known failures skipped; `test-ebpf` = honk-ebpf-common only) |
-| `test-netns` | Root-gated netlink/netns roundtrip tests (`--features ebpf --ignored`: veth/addr/route/fwmark-rule/neigh against the real kernel) |
+| `test-netns` | Root-gated real-kernel tests (`--features ebpf --ignored`): netlink/netns roundtrips (veth/addr/route/fwmark-rule/neigh) plus the `link_lifecycle` regression test asserting every TC+cgroup link stays held until `detach_hooks` |
 | `outbound-ci` / `outbound-ci-e2e` | honk-outbound gate (`ci/outbound-ci.sh`: fmt + clippy + honk-config & honk-outbound suites; `...-e2e` adds live hy2 e2e via `HONK_HY2_SERVER=`) — run after every outbound change |
 | `dns-ci` | DNS subsystem gate (`ci/dns-ci.sh`: fmt + clippy + honk-config + honk-core dns/control + honk-outbound suites) — run after every DNS-path change |
 | `build-core` / `build-core-ebpf` | honk-core with `ebpf` feature |

@@ -93,6 +93,7 @@ test-ebpf:
 # Root-gated netlink/netns integration tests (veth/route/rule roundtrip)
 test-netns:
     cargo test -p honk-core --features ebpf --lib netns -- --ignored --test-threads=1
+    cargo test -p honk-core --features ebpf --lib link_lifecycle -- --ignored --test-threads=1
 
 # Full honk-outbound gate after outbound changes (fmt + clippy + config & outbound suites)
 outbound-ci:

@@ -67,6 +67,12 @@ pub struct RealEbpfBackend {
     /// watcher can drop dead links when a device vanishes, and the (ifindex,
     /// direction) pair dedupes retries after a partial failure.
     dynamic_links: Vec<(u32, bool, aya::programs::tc::SchedClassifierLink)>,
+    /// cgroup sock_create/sock_release links (cookie→PID mapping, control-plane
+    /// bypass). Held for the backend lifetime — dropping one detaches the
+    /// program in the kernel.
+    cgroup_sock_links: Vec<aya::programs::cgroup_sock::CgroupSockLink>,
+    /// cgroup connect4/6 + sendmsg4/6 links; same lifetime rule as above.
+    cgroup_sock_addr_links: Vec<aya::programs::cgroup_sock_addr::CgroupSockAddrLink>,
     dae0_ingress_link: Option<aya::programs::tc::SchedClassifierLink>,
     dae0peer_ingress_link: Option<aya::programs::tc::SchedClassifierLink>,
     sk_lookup_link: Option<aya::programs::sk_lookup::SkLookupLink>,
@@ -1063,7 +1069,7 @@ impl EbpfBackend for RealEbpfBackend {
         // Drop all TC links, which detaches the eBPF programs from the
         // network interfaces and restores normal packet processing.
         info!(
-            "Detaching BPF hooks (lan_ingress, lan_egress, wan_egress, wan_ingress, bond slaves, bridge slaves, dae0, sk_lookup)"
+            "Detaching BPF hooks (lan_ingress, lan_egress, wan_egress, wan_ingress, bond slaves, bridge slaves, cgroup, dae0, sk_lookup)"
         );
         self.lan_ingress_link = None;
         self.lan_egress_link = None;
@@ -1072,6 +1078,8 @@ impl EbpfBackend for RealEbpfBackend {
         self.lan_slave_links.clear();
         self.wan_slave_links.clear();
         self.dynamic_links.clear();
+        self.cgroup_sock_links.clear();
+        self.cgroup_sock_addr_links.clear();
         self.dae0_ingress_link = None;
         self.dae0peer_ingress_link = None;
         self.sk_lookup_link = None;

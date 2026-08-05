@@ -180,6 +180,11 @@ impl RealEbpfBackend {
         }
         // Attach cgroup programs to root cgroup2 for cookie→PID mapping.
         // This enables pname routing and control-plane traffic bypass (Go dae parity).
+        // The links must stay owned by the backend: a dropped link fd detaches
+        // the program, which once silently disabled COOKIE_PID_MAP (pname
+        // routing) from the first microseconds of every run.
+        let mut cgroup_sock_links = Vec::new();
+        let mut cgroup_sock_addr_links = Vec::new();
         match detect_cgroup_path() {
             Ok(cgroup_path) => {
                 let cgroup_file = std::fs::File::open(&cgroup_path)
@@ -193,7 +198,7 @@ impl RealEbpfBackend {
                     p.load()?;
                     let link_id =
                         p.attach(&cgroup_file, aya::programs::CgroupAttachMode::Single)?;
-                    let _link = p.take_link(link_id)?;
+                    cgroup_sock_links.push(p.take_link(link_id)?);
                 }
                 let cg_addr_names = [
                     "tproxy_wan_cg_connect4",
@@ -209,7 +214,7 @@ impl RealEbpfBackend {
                     p.load()?;
                     let link_id =
                         p.attach(&cgroup_file, aya::programs::CgroupAttachMode::Single)?;
-                    let _link = p.take_link(link_id)?;
+                    cgroup_sock_addr_links.push(p.take_link(link_id)?);
                 }
                 info!("Attached 6 cgroup programs to {}", cgroup_path);
             }
@@ -602,6 +607,8 @@ impl RealEbpfBackend {
             lan_slave_links,
             wan_slave_links,
             dynamic_links,
+            cgroup_sock_links,
+            cgroup_sock_addr_links,
             dae0_ingress_link: None,
             dae0peer_ingress_link: None,
             sk_lookup_link: None,
