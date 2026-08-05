@@ -111,6 +111,24 @@ ssh root@10.10.10.57 "bash /root/lab-bench.sh 'honk dae' 'hy2 tuic ss2022 trojan
 ssh root@10.10.10.57 bash /root/test-protocols.sh
 ```
 
+## Results (2026-08-06, direct kernel-offload verification @ NanoPi R2S)
+
+Verifies PR #17 (kernel offload of direct-routed flows in Rule mode, per-flow
+cached decision, zero per-packet cost). Engine is feat/rprx (incl. main
+`ac5ffbb`) aarch64-musl; the lab's 8080/5300 targets route via
+`fallback: direct` (non-must) — exactly the path this feature targets. Two
+alternating rounds; dae re-measured in the same window.
+
+| Engine | Protocol | cold | bw (Mbps) | cpu | RSS |
+| --- | --- | --- | --- | --- | --- |
+| honk | direct (with offload) | 0.0043 | **880** (prev 370) | **0.01** (prev 0.71) | 61 |
+| dae | direct | 0.0041 | 896 | 0.01 | 39 |
+
+All protocol rows within noise of the previous round (hy2 267/268, tuic
+260/262, ss2022 353/353, trojan 279/282) — no regression. honk direct now
+matches dae (the 1.8% gap is link noise); cold improved too (6.2→4.3ms, on
+par with dae's 4.1ms).
+
 ## Results (2026-08-05, ARM A/B: honk vs dae @ NanoPi R2S)
 
 Two-engine comparison on the NanoPi R2S (two runs: .43 onboard NIC, then a

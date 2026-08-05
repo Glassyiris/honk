@@ -97,6 +97,22 @@ ssh root@10.10.10.57 "bash /root/lab-bench.sh 'honk dae' 'hy2 tuic ss2022 trojan
 ssh root@10.10.10.57 bash /root/test-protocols.sh
 ```
 
+## 结果(2026-08-06,direct 内核卸载验证轮 @ NanoPi R2S)
+
+验证 PR #17(Rule 模式 direct 流全量内核卸载,按流缓存决策,零每包开销)。
+引擎为 feat/rprx(含 main `ac5ffbb`)aarch64 musl,lab 的 8080/5300 目标走
+`fallback: direct`(非 must)——正是本功能的目标路径。两轮交替,dae 同窗口
+重测。
+
+| 引擎 | 协议 | cold | bw (Mbps) | cpu | RSS |
+| --- | --- | --- | --- | --- | --- |
+| honk | direct(卸载后) | 0.0043 | **880**(上轮 370) | **0.01**(上轮 0.71) | 61 |
+| dae | direct | 0.0041 | 896 | 0.01 | 39 |
+
+协议行两轮全部在上轮噪声内(hy2 267/268、tuic 260/262、ss2022 353/353、
+trojan 279/282),无回归。honk direct 与 dae 同量级(差距 1.8% 属链路噪声),
+cold 同步改善(6.2→4.3ms,与 dae 4.1ms 持平)。
+
 ## 结果(2026-08-05,ARM A/B: honk vs dae @ NanoPi R2S)
 
 双引擎对照轮,引擎机 NanoPi R2S(两轮:.43 板载网口 / .45 USB 网卡复测),
