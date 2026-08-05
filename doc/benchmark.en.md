@@ -111,6 +111,61 @@ ssh root@10.10.10.57 "bash /root/lab-bench.sh 'honk dae' 'hy2 tuic ss2022 trojan
 ssh root@10.10.10.57 bash /root/test-protocols.sh
 ```
 
+## Results (2026-08-05, ARM round: NanoPi R2S / RK3328)
+
+Engine host 10.10.10.43 (NanoPi R2S: 4×Cortex-A53 @1.3GHz, 968MB RAM, end0
+1Gbps, kernel 6.18, cpuinfo shows `aes pmull sha1 sha2`), running a feat/rprx
+`2ad0a93` aarch64-musl build. Methodology unchanged (netns lab → real eBPF
+datapath → .70). **Line-rate anchor: with the engine off, the same netns+NAT
+path saturates 941 Mbps**, so every number below is bounded by the userspace
+engine. The cpu column counts only honk's utime/stime (no softirq).
+
+### TCP
+
+| Engine | Protocol | cold | hot p50 | hot p95 | bw (Mbps) | cpu | RSS (MB) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| honk | direct | 0.0064 | – | – | 437 | 0.74 | 50 |
+| honk | hy2 | 0.0100 | 0.0084 | 0.0090 | 301 | 1.34 | 61 |
+| honk | tuic | 0.0097 | 0.0073 | 0.0082 | 304 | 1.33 | 56 |
+| honk | ss2022 | 0.0105 | 0.0057 | 0.0065 | 388 | 0.83 | 55 |
+| honk | trojan | 0.0213 | 0.0060 | 0.0205 | 329 | 0.91 | 50 |
+| honk | anytls-sb | 0.0066 | 0.0061 | 0.0065 | 336 | 0.98 | 51 |
+| honk | anytls-go | 0.0116 | 0.0065 | 0.0076 | 337 | 0.96 | 51 |
+| honk | vless-reality-vision | 0.0225 | 0.0181 | 0.0196 | 183 | 0.74 | 51 |
+| honk | vless-reality | 0.0208 | 0.0174 | 0.0287 | 332 | 0.88 | 52 |
+| honk | vmess (tcp) | 0.0076 | 0.0067 | 0.0087 | 416 | 1.50 | 47 |
+
+### UDP (hot, `udp_warm_node_count: 8`)
+
+| Protocol | echo RTT p50 | bw Mbps (loss) | cpu |
+| --- | --- | --- | --- |
+| hy2 | 2.77 ms | 34 (97.8%) | 1.91 |
+| tuic | 2.88 ms | 46 (98.1%) | 1.86 |
+| ss2022 | 2.09 ms | 42 (91.0%) | 0.92 |
+| trojan | 2.12 ms | 38 (98.1%) | 0.90 |
+| anytls-sb | 2.23 ms | 50 (89.3%) | 1.79 |
+| anytls-go | 2.54 ms | 57 (87.7%) | 1.80 |
+
+Read-out (A53 little cores vs x86 E-13600K, same methodology as 08-04):
+
+- **Everything is CPU-bound**: direct 437 (vs 9390 on x86); TCP protocols
+  flatten at 330–390 Mbps (flat across rows = the shared relay+crypto path is
+  the bottleneck, not any single handler); QUIC per-core efficiency is ~20×
+  lower. vmess at 416 is closest to the direct baseline, confirming `5dc47cf`'s
+  BoringSSL AEAD pays off equally under ARM crypto extensions; its 1.50 cores
+  remain the highest among TCP rows (a cross-platform optimization target).
+  vless-vision at 183 is the lowest TCP row; the vision/reality hot p50 of
+  ~18ms (vs 3.3ms on x86) is the REALITY handshake cost on slow crypto.
+- **UDP suffers most**: 34–57 Mbps with 88–98% loss — the per-packet path
+  (TPROXY recvmsg provenance + anyfrom replies + tunnel framing) saturates the
+  little cores; echo RTT is an order of magnitude slower than x86.
+- **RSS 47–61MB matches x86 exactly**; a 1GB device shows zero memory
+  pressure — the constraint is purely CPU.
+- The .70 rprx target services (8007-8009/5207-5209/53537-53539) were
+  half-broken this round; those three rows used an equivalent variant (working
+  targets 8001/5201 re-routed to the respective groups) with unchanged
+  methodology.
+
 ## Results (2026-08-05, rprx family: VLESS+REALITY(±vision)/VMess join the matrix)
 
 Covers the protocol rows added by feat/rprx (PR #12); engine is a feat/rprx

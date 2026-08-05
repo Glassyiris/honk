@@ -97,6 +97,56 @@ ssh root@10.10.10.57 "bash /root/lab-bench.sh 'honk dae' 'hy2 tuic ss2022 trojan
 ssh root@10.10.10.57 bash /root/test-protocols.sh
 ```
 
+## 结果(2026-08-05,ARM 轮: NanoPi R2S / RK3328)
+
+引擎机 10.10.10.43(NanoPi R2S: 4×Cortex-A53 @1.3GHz, 968MB RAM, end0
+1Gbps, kernel 6.18, cpuinfo 含 `aes pmull sha1 sha2`),引擎为 feat/rprx
+`2ad0a93` aarch64 musl 构建。方法学不变(netns lab → 真实 eBPF 数据面 →
+.70)。**线速锚点: 关闭引擎后 netns+NAT 路径打满 941 Mbps**,以下数字的
+瓶颈全在引擎用户态。CPU 列仅含 honk 进程 utime/stime,不含 softirq。
+
+### TCP
+
+| 引擎 | 协议 | cold | hot p50 | hot p95 | bw (Mbps) | cpu | RSS (MB) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| honk | direct | 0.0064 | – | – | 437 | 0.74 | 50 |
+| honk | hy2 | 0.0100 | 0.0084 | 0.0090 | 301 | 1.34 | 61 |
+| honk | tuic | 0.0097 | 0.0073 | 0.0082 | 304 | 1.33 | 56 |
+| honk | ss2022 | 0.0105 | 0.0057 | 0.0065 | 388 | 0.83 | 55 |
+| honk | trojan | 0.0213 | 0.0060 | 0.0205 | 329 | 0.91 | 50 |
+| honk | anytls-sb | 0.0066 | 0.0061 | 0.0065 | 336 | 0.98 | 51 |
+| honk | anytls-go | 0.0116 | 0.0065 | 0.0076 | 337 | 0.96 | 51 |
+| honk | vless-reality-vision | 0.0225 | 0.0181 | 0.0196 | 183 | 0.74 | 51 |
+| honk | vless-reality | 0.0208 | 0.0174 | 0.0287 | 332 | 0.88 | 52 |
+| honk | vmess (tcp) | 0.0076 | 0.0067 | 0.0087 | 416 | 1.50 | 47 |
+
+### UDP(热态,`udp_warm_node_count: 8`)
+
+| 协议 | echo RTT p50 | bw Mbps (loss) | cpu |
+| --- | --- | --- | --- |
+| hy2 | 2.77 ms | 34 (97.8%) | 1.91 |
+| tuic | 2.88 ms | 46 (98.1%) | 1.86 |
+| ss2022 | 2.09 ms | 42 (91.0%) | 0.92 |
+| trojan | 2.12 ms | 38 (98.1%) | 0.90 |
+| anytls-sb | 2.23 ms | 50 (89.3%) | 1.79 |
+| anytls-go | 2.54 ms | 57 (87.7%) | 1.80 |
+
+解读(A53 小核 vs x86 E-13600K,同方法学对照 08-04 轮):
+
+- **全部 CPU-bound**:direct 437(x86 9390);TCP 类被压平在 330–390
+  Mbps(行间扁平 = 瓶颈在公共 relay+crypto 路径);QUIC 每核效率差 ~20 倍。
+  vmess 416 最接近 direct 基线,印证 `5dc47cf` 的 BoringSSL AEAD 在 ARM
+  crypto extensions 下同样有效;其 cpu 1.50 仍是 TCP 类最高(跨平台共同
+  优化点)。vless-vision 183 为 TCP 最低行;vision/reality 行 hot p50
+  ~18ms(x86 3.3ms)是 REALITY 握手在慢 crypto 上的每连接成本。
+- **UDP 是重灾区**:34–57 Mbps、丢包 88–98%——A53 上逐包路径(TPROXY
+  recvmsg provenance + anyfrom 回复 + 隧道组帧)完全饱和,echo RTT 比
+  x86 慢一个量级。
+- **RSS 47–61MB 与 x86 相同**,1GB 设备全程无内存压力——瓶颈纯 CPU。
+- rprx 行的 .70 目标服务(8007-8009/5207-5209/53537-53539)本轮处于半坏
+  状态,三行用等价变体(工作目标 8001/5201 重路由到对应 group)测量,
+  方法学不变。
+
 ## 结果(2026-08-05,rprx 协议族: VLESS+REALITY(±vision)/VMess 入列)
 
 本轮覆盖 feat/rprx(PR #12)新增的协议行,引擎为 feat/rprx musl+mimalloc 构建
