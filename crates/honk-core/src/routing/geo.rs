@@ -78,6 +78,14 @@ impl GeoAssets {
                 for code in codes {
                     if let Some(domains) = index.get(&code.trim().to_lowercase()) {
                         out.extend(domains.iter().cloned());
+                    } else {
+                        // A code that expands to nothing silently disables its
+                        // rule (e.g. an `@attr` filter this geosite.dat does
+                        // not materialize) — never stay silent about that.
+                        tracing::warn!(
+                            code,
+                            "geosite code expanded to zero matchers; rule will never match"
+                        );
                     }
                 }
                 tracing::debug!("expanded geosite codes into {} domain matchers", out.len());

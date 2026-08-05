@@ -392,7 +392,7 @@ routing {
         assert_eq!(r0.condition.domain, vec!["bar.org"]);
 
         let r1 = &config.routing.rules[1];
-        assert_eq!(r1.condition.geosite, vec!["cn", "category-ai-cn"]);
+        assert_eq!(r1.condition.geosite, vec!["cn", "category-ai@cn"]);
 
         let r2 = &config.routing.rules[2];
         assert_eq!(r2.condition.geosite, vec!["private"]);

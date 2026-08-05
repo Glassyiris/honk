@@ -1268,12 +1268,11 @@ fn strip_tag_arg(arg: &str, prefix: &str) -> Option<String> {
 /// Normalize a geosite list name.  Dae uses `list@cn` to request the
 /// China-specific variant; the dat files flatten those as `list-cn`.
 fn normalize_geosite_code(code: &str) -> String {
-    let code = code.trim();
-    if code.contains('@') {
-        code.replace('@', "-")
-    } else {
-        code.to_string()
-    }
+    // Keep the code verbatim: `@attr` is an attribute filter, not part of the
+    // category name — remapping it to `-` silently mismatched into a
+    // nonexistent category. Codes that resolve to nothing are warned about at
+    // expansion time (honk-core routing/geo.rs).
+    code.trim().to_string()
 }
 
 /// Dispatch `domain(...)` arguments to the correct condition fields.

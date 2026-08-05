@@ -317,7 +317,7 @@ domain/geosite matcher 视为"不是 x"，不会被其否决。
 | `pname` | `process_name` |
 | `mac` / `dscp` / `ipversion` | 同名字段 |
 
-`domain` 参数标签：裸值/`suffix:` → 后缀；`keyword:`；`full:`；`regex:`；`geosite:`（`@` → `-`）。
+`domain` 参数标签：裸值/`suffix:` → 后缀；`keyword:`；`full:`；`regex:`；`geosite:`（原样匹配；`@attr` 属性不过滤——类目不存在时告警且永不匹配）。
 
 ### 复杂出站（仅结构化模型）
 
