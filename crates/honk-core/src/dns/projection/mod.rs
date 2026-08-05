@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use honk_ebpf_common::DomainRouting;
@@ -77,9 +77,7 @@ pub(crate) enum ProjectionObservation<'a> {
     Clear {
         domain: &'a str,
     },
-    Retain {
-        domain: &'a str,
-    },
+    Retain,
 }
 
 #[derive(Debug, Default)]
@@ -117,6 +115,7 @@ pub(crate) struct ProjectionCounterSnapshot {
 pub(crate) struct RoutingProjection {
     state: parking_lot::Mutex<DesiredState>,
     wake: parking_lot::Mutex<Option<tokio::sync::mpsc::Sender<()>>>,
+    wake_pending: AtomicBool,
     counters: Arc<ProjectionCounters>,
     worker: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
     lifecycle: Arc<ProjectionLifecycle>,
@@ -133,6 +132,7 @@ impl RoutingProjection {
         let projection = Arc::new(Self {
             state: parking_lot::Mutex::new(DesiredState::new(snapshot, DEFAULT_DOMAIN_CAPACITY)),
             wake: parking_lot::Mutex::new(Some(wake)),
+            wake_pending: AtomicBool::new(false),
             counters: Arc::clone(&counters),
             worker: parking_lot::Mutex::new(None),
             lifecycle: Arc::clone(&lifecycle),
@@ -206,17 +206,81 @@ impl RoutingProjection {
     }
 
     fn notify_worker(&self) {
+        if self.wake_pending.swap(true, Ordering::AcqRel) {
+            self.counters.wake_coalesced.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let Some(wake) = self.wake.lock().as_ref().cloned() else {
+            self.wake_pending.store(false, Ordering::Release);
             return;
         };
-        if wake.try_send(()).is_err() {
-            self.counters.wake_coalesced.fetch_add(1, Ordering::Relaxed);
+        match wake.try_send(()) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {
+                self.counters.wake_coalesced.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {
+                self.wake_pending.store(false, Ordering::Release);
+            }
         }
+    }
+
+    fn clear_worker_wake(&self) {
+        self.wake_pending.store(false, Ordering::Release);
     }
 
     #[cfg(test)]
     fn termination_probe_for_test(&self) -> ProjectionTerminationProbe {
         ProjectionTerminationProbe::new(Arc::clone(&self.lifecycle))
+    }
+}
+
+#[cfg(feature = "dns-bench")]
+pub(crate) struct ProjectionReplacementBenchmark {
+    state: DesiredState,
+    domain: Arc<str>,
+    ip: IpAddr,
+    now: tokio::time::Instant,
+}
+
+#[cfg(feature = "dns-bench")]
+impl ProjectionReplacementBenchmark {
+    pub(crate) fn new(
+        snapshot: Arc<RoutingProjectionSnapshot>,
+        domain: Arc<str>,
+        ip: IpAddr,
+    ) -> Self {
+        let now = tokio::time::Instant::now();
+        let mut state = DesiredState::new(snapshot, DEFAULT_DOMAIN_CAPACITY);
+        state.observe(
+            ProjectionObservation::Positive {
+                domain: &domain,
+                ips: std::slice::from_ref(&ip),
+                advertised_ttl: Duration::from_secs(300),
+                freshness: ProjectionFreshness::Fresh,
+            },
+            now,
+        );
+        Self {
+            state,
+            domain,
+            ip,
+            now,
+        }
+    }
+
+    pub(crate) fn replace(&mut self) -> u64 {
+        self.now += Duration::from_millis(1);
+        self.state.observe(
+            ProjectionObservation::Positive {
+                domain: &self.domain,
+                ips: std::slice::from_ref(&self.ip),
+                advertised_ttl: Duration::from_secs(300),
+                freshness: ProjectionFreshness::Fresh,
+            },
+            self.now,
+        );
+        self.state.sequence
     }
 }
 

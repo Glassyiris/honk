@@ -1,10 +1,9 @@
-//! Candidate-only synchronous UDP micro-benchmarks.
+//! Synchronous production-path UDP microbenchmarks.
 //!
-//! These report Criterion's mean/median/MAD and absolute throughput for the
-//! current candidate. They are not a source-level A/B comparison and do not
-//! claim a p95 estimate.
+//! Named Criterion baselines allow source-level comparisons while the fixed
+//! batch sizes expose absolute throughput and bounded saturation behavior.
 
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use honk_core::control::udp_endpoint::bench_support;
 use honk_core::stats::StatsManager;
 use std::hint::black_box;
@@ -13,7 +12,7 @@ use std::time::Duration;
 const STEADY_ENQUEUE_ITERATIONS: usize = 1_000_000;
 const RESERVE_ROLLBACK_ITERATIONS: usize = 10_000;
 const HISTOGRAM_ITERATIONS: usize = 1_000_000;
-const QUEUE_SATURATION_OPERATIONS: u64 = 65;
+const QUEUE_SATURATION_OPERATIONS: u64 = 64;
 
 fn bench_steady_enqueue(c: &mut Criterion) {
     let mut group = c.benchmark_group("udp_steady_enqueue_128b");
@@ -36,18 +35,22 @@ fn bench_reserve_rollback(c: &mut Criterion) {
 }
 
 fn bench_histogram_record_snapshot(c: &mut Criterion) {
+    let stats = StatsManager::new();
     let mut group = c.benchmark_group("udp_histogram_record_snapshot");
     group.sample_size(10);
     group.throughput(Throughput::Elements(HISTOGRAM_ITERATIONS as u64));
     group.bench_function("one_million", |b| {
         b.iter(|| {
-            let stats = StatsManager::new();
+            let before = stats.udp_snapshot().route_latency.count;
             let latency = Duration::from_nanos(128);
             for _ in 0..HISTOGRAM_ITERATIONS {
                 stats.record_udp_route_latency(latency);
             }
             let snapshot = stats.udp_snapshot();
-            assert_eq!(snapshot.route_latency.count, HISTOGRAM_ITERATIONS as u64);
+            assert_eq!(
+                snapshot.route_latency.count - before,
+                HISTOGRAM_ITERATIONS as u64
+            );
             black_box(snapshot);
         });
     });
@@ -59,7 +62,11 @@ fn bench_queue_saturation(c: &mut Criterion) {
     group.sample_size(10);
     group.throughput(Throughput::Elements(QUEUE_SATURATION_OPERATIONS));
     group.bench_function("64_admitted_then_drop_newest", |b| {
-        b.iter(bench_support::queue_saturation_batch);
+        b.iter_batched(
+            bench_support::QueueSaturationBenchmark::new,
+            bench_support::QueueSaturationBenchmark::run,
+            BatchSize::SmallInput,
+        );
     });
     group.finish();
 }

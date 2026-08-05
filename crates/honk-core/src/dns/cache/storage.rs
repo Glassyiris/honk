@@ -24,9 +24,31 @@ pub struct NegativeCacheHit {
     pub remaining_ttl: Duration,
 }
 
-pub(super) enum CacheValue {
-    Positive(CachedEntry),
-    Negative { expires_at: Instant, rcode: u8 },
+#[derive(Debug, Clone, Copy)]
+pub(super) struct NegativeEntry {
+    pub expires_at: Instant,
+    pub rcode: u8,
+}
+
+pub(super) struct CacheValue {
+    pub positive: Option<CachedEntry>,
+    pub negative: Option<NegativeEntry>,
+}
+
+impl CacheValue {
+    pub(super) fn positive(entry: CachedEntry) -> Self {
+        Self {
+            positive: Some(entry),
+            negative: None,
+        }
+    }
+
+    pub(super) fn negative(entry: NegativeEntry) -> Self {
+        Self {
+            positive: None,
+            negative: Some(entry),
+        }
+    }
 }
 
 impl CachedEntry {

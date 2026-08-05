@@ -14,7 +14,7 @@ use thiserror::Error;
 use tokio::sync::{Mutex, OnceCell};
 
 use super::cache::{DnsCache, DnsCacheService};
-use super::engine::EngineError;
+use super::engine::{DnsEngine, EngineError};
 use super::policy::PolicyId;
 use super::response::ResponseError;
 use super::routing::DnsRouter;
@@ -121,6 +121,7 @@ pub struct DnsForwarder {
     pub(crate) upstream_pool: Arc<dyn DnsUpstreamPool>,
     pub(crate) cache: Arc<Mutex<DnsCache>>,
     cache_service: Arc<OnceCell<Arc<DnsCacheService>>>,
+    engine: Arc<OnceCell<DnsEngine>>,
     pub(crate) routing: Arc<DnsRouter>,
     pub(crate) strategy: DnsStrategy,
     /// When false, skip positive/negative cache lookups and inserts
@@ -147,6 +148,7 @@ impl DnsForwarder {
             upstream_pool,
             cache,
             cache_service: Arc::new(OnceCell::new()),
+            engine: Arc::new(OnceCell::new()),
             routing,
             strategy: DnsStrategy::default(),
             cache_enabled: true,
@@ -169,6 +171,7 @@ impl DnsForwarder {
             upstream_pool,
             cache,
             cache_service: Arc::new(OnceCell::new()),
+            engine: Arc::new(OnceCell::new()),
             routing,
             strategy: DnsStrategy::default(),
             cache_enabled: true,
@@ -202,6 +205,9 @@ impl DnsForwarder {
     }
 
     pub fn with_policy_id(mut self, policy_id: PolicyId) -> Self {
+        if self.policy_id.as_ref() != Some(&policy_id) {
+            self.engine = Arc::new(OnceCell::new());
+        }
         self.policy_id = Some(policy_id);
         self
     }
@@ -225,11 +231,20 @@ impl DnsForwarder {
         )
     }
 
+    pub(crate) async fn engine(&self) -> Result<&DnsEngine, EngineError> {
+        self.engine
+            .get_or_try_init(|| async {
+                DnsEngine::from_router(&self.routing, self.policy_id.clone())
+            })
+            .await
+    }
+
     fn background_clone(&self) -> Self {
         Self {
             upstream_pool: Arc::clone(&self.upstream_pool),
             cache: Arc::clone(&self.cache),
             cache_service: Arc::clone(&self.cache_service),
+            engine: Arc::clone(&self.engine),
             routing: Arc::clone(&self.routing),
             strategy: self.strategy.clone(),
             cache_enabled: self.cache_enabled,

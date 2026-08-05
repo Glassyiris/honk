@@ -81,3 +81,7 @@ required-features = ["rprx"]
 [[example]]
 name = "proto_bench"
 required-features = ["rprx"]
+
+[[bench]]
+name = "group_selection"
+harness = false

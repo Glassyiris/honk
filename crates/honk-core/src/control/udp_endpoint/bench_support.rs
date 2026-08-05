@@ -127,20 +127,6 @@ impl QueuedBatch {
             &self.stats,
         )
     }
-
-    fn drain_one(&mut self) {
-        drop(self.receiver.try_recv().unwrap_or_else(|error| {
-            panic!("benchmark enqueue must have produced one datagram: {error}")
-        }));
-    }
-
-    fn release_and_assert(self) {
-        let pool = Arc::clone(&self.pool);
-        let slow_slots = Arc::clone(&self.slow_slots);
-        let slow_capacity = self.slow_capacity;
-        drop(self);
-        assert_released(&pool, &slow_slots, slow_capacity);
-    }
 }
 
 struct ReadyBatch {
@@ -255,26 +241,36 @@ pub fn reserve_rollback_batch(iterations: usize) {
     }
 }
 
-/// Fill the exact 64-datagram bound (including the first) and drop newest.
+/// Prepared fixture for filling the exact 64-datagram bound and dropping newest.
 #[doc(hidden)]
-pub fn queue_saturation_batch() {
-    let mut batch = QueuedBatch::new(FLOW_QUEUE_CAPACITY + 1, b"first");
-    for _ in 0..FLOW_QUEUE_CAPACITY - 1 {
-        assert!(matches!(
-            batch.enqueue(b"follower"),
-            EndpointReservation::Enqueued
-        ));
-    }
-    assert!(matches!(
-        batch.enqueue(b"newest"),
-        EndpointReservation::QueueFull
-    ));
+pub struct QueueSaturationBenchmark(QueuedBatch);
 
-    let snapshot = batch.stats.udp_snapshot();
-    assert_eq!(snapshot.queue_accepted, (FLOW_QUEUE_CAPACITY - 1) as u64);
-    assert_eq!(snapshot.flow_queue_full, 1);
-    for _ in 0..FLOW_QUEUE_CAPACITY - 1 {
-        batch.drain_one();
+impl QueueSaturationBenchmark {
+    pub fn new() -> Self {
+        Self(QueuedBatch::new(FLOW_QUEUE_CAPACITY + 1, b"first"))
     }
-    batch.release_and_assert();
+
+    pub fn run(mut self) -> Self {
+        for _ in 0..FLOW_QUEUE_CAPACITY - 1 {
+            assert!(matches!(
+                self.0.enqueue(b"follower"),
+                EndpointReservation::Enqueued
+            ));
+        }
+        assert!(matches!(
+            self.0.enqueue(b"newest"),
+            EndpointReservation::QueueFull
+        ));
+
+        let snapshot = self.0.stats.udp_snapshot();
+        assert_eq!(snapshot.queue_accepted, (FLOW_QUEUE_CAPACITY - 1) as u64);
+        assert_eq!(snapshot.flow_queue_full, 1);
+        self
+    }
+}
+
+impl Default for QueueSaturationBenchmark {
+    fn default() -> Self {
+        Self::new()
+    }
 }

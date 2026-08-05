@@ -1,3 +1,6 @@
+use bytes::Bytes;
+use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::policy::PolicyId;
@@ -60,11 +63,13 @@ pub struct DnsOutcome {
     status: OutcomeStatus,
     response_class: ResponseClass,
     provenance: Provenance,
+    domain: Arc<str>,
+    answer_ips: Vec<IpAddr>,
     expiry: EffectiveExpiry,
     logical_upstream: Option<String>,
     final_upstream: Option<String>,
     requery_history: Vec<String>,
-    reusable: Vec<u8>,
+    reusable: Bytes,
     rendered: Vec<u8>,
     template: Option<ResponseTemplate>,
     policy_id: Option<PolicyId>,
@@ -74,11 +79,13 @@ pub(crate) struct OutcomeParts {
     pub status: OutcomeStatus,
     pub response_class: ResponseClass,
     pub provenance: Provenance,
+    pub domain: Arc<str>,
+    pub answer_ips: Vec<IpAddr>,
     pub expiry: EffectiveExpiry,
     pub logical_upstream: Option<String>,
     pub final_upstream: Option<String>,
     pub requery_history: Vec<String>,
-    pub reusable: Vec<u8>,
+    pub reusable: Bytes,
     pub rendered: Vec<u8>,
     pub template: Option<ResponseTemplate>,
     pub policy_id: Option<PolicyId>,
@@ -92,6 +99,8 @@ impl DnsOutcome {
             provenance: parts.provenance,
             expiry: parts.expiry,
             logical_upstream: parts.logical_upstream,
+            domain: parts.domain,
+            answer_ips: parts.answer_ips,
             final_upstream: parts.final_upstream,
             requery_history: parts.requery_history,
             reusable: parts.reusable,
@@ -115,6 +124,14 @@ impl DnsOutcome {
 
     pub const fn expiry(&self) -> EffectiveExpiry {
         self.expiry
+    }
+
+    pub fn domain(&self) -> &str {
+        &self.domain
+    }
+
+    pub fn answer_ips(&self) -> &[IpAddr] {
+        &self.answer_ips
     }
 
     pub fn logical_upstream(&self) -> Option<&str> {
@@ -155,6 +172,7 @@ impl DnsOutcome {
         logical_upstream: &str,
         final_upstream: &str,
         history: &[&str],
+        answer_ips: Vec<IpAddr>,
         rendered: Vec<u8>,
     ) -> Self {
         let query = crate::dns::forwarder::build_dns_query("example.com", 1);
@@ -168,10 +186,12 @@ impl DnsOutcome {
             response_class,
             provenance,
             expiry,
+            domain: "example.com".into(),
+            answer_ips,
             logical_upstream: Some(logical_upstream.to_owned()),
             final_upstream: Some(final_upstream.to_owned()),
             requery_history: history.iter().map(ToString::to_string).collect(),
-            reusable: response,
+            reusable: response.into(),
             rendered,
             template: Some(template),
             policy_id: None,

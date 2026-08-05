@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 pub(super) struct LoopbackPool {
     calls: AtomicU64,
     delayed: bool,
+    nxdomain: bool,
 }
 
 impl LoopbackPool {
@@ -19,6 +20,7 @@ impl LoopbackPool {
         Self {
             calls: AtomicU64::new(0),
             delayed: false,
+            nxdomain: false,
         }
     }
 
@@ -26,6 +28,15 @@ impl LoopbackPool {
         Self {
             calls: AtomicU64::new(0),
             delayed: true,
+            nxdomain: false,
+        }
+    }
+
+    pub(super) const fn nxdomain() -> Self {
+        Self {
+            calls: AtomicU64::new(0),
+            delayed: false,
+            nxdomain: true,
         }
     }
 
@@ -52,7 +63,7 @@ impl DnsUpstreamPool for LoopbackPool {
         } else {
             tokio::task::yield_now().await;
         }
-        Ok(response(raw_query, qtype))
+        Ok(response(raw_query, qtype, self.nxdomain))
     }
 }
 
@@ -69,13 +80,19 @@ pub(super) fn forwarder(pool: Arc<LoopbackPool>, cache_enabled: bool) -> Arc<Dns
     );
     Arc::new(
         DnsForwarder::new(pool, Arc::new(Mutex::new(DnsCache::new(10_000))), router)
-            .with_cache_enabled(cache_enabled),
+            .with_cache_enabled(cache_enabled)
+            .with_policy_from_config(&honk_config::dns::DnsConfig::default())
+            .expect("benchmark policy"),
     )
 }
 
-fn response(query: &[u8], qtype: u16) -> Vec<u8> {
+fn response(query: &[u8], qtype: u16, nxdomain: bool) -> Vec<u8> {
     let mut response = query.to_vec();
     response[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+    if nxdomain {
+        response[3] = 0x83;
+        return response;
+    }
     response[6..8].copy_from_slice(&1_u16.to_be_bytes());
     response.extend_from_slice(&[0xc0, 0x0c]);
     response.extend_from_slice(&qtype.to_be_bytes());

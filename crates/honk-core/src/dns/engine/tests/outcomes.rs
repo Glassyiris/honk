@@ -1,7 +1,7 @@
 #[tokio::test]
 async fn typed_outcome_tracks_positive_requery_and_caller_rendering() {
     // Given
-    let mut query = build_dns_query("example.com", 1);
+    let mut query = build_dns_query("ExAmPlE.COM", 1);
     query[0..2].copy_from_slice(&0x1234_u16.to_be_bytes());
     let first = response(&query, [10, 0, 0, 1], 30);
     let second = response(&query, [8, 8, 8, 8], 30);
@@ -25,6 +25,7 @@ async fn typed_outcome_tracks_positive_requery_and_caller_rendering() {
 
     // When
     let outcome = forwarder.resolve_outcome(&query).await.expect("outcome");
+    let cached = forwarder.resolve_outcome(&query).await.expect("cached outcome");
 
     // Then
     assert_eq!(outcome.status(), OutcomeStatus::Accepted);
@@ -33,10 +34,51 @@ async fn typed_outcome_tracks_positive_requery_and_caller_rendering() {
     assert_eq!(outcome.logical_upstream(), Some("first"));
     assert_eq!(outcome.final_upstream(), Some("second"));
     assert_eq!(outcome.requery_history(), &["first", "second"]);
+    assert_eq!(outcome.domain(), "example.com");
+    assert_eq!(
+        outcome.answer_ips(),
+        &["8.8.8.8".parse::<std::net::IpAddr>().expect("IP")]
+    );
+    assert_eq!(cached.provenance(), Provenance::Cache);
+    assert_eq!(cached.domain(), "example.com");
+    assert_eq!(cached.answer_ips(), outcome.answer_ips());
     assert_eq!(&outcome.rendered()[0..2], &0x1234_u16.to_be_bytes());
     assert_eq!(
         &outcome.rendered()[outcome.rendered().len() - 4..],
         &[8, 8, 8, 8]
+    );
+}
+
+#[tokio::test]
+async fn typed_outcome_metadata_excludes_udp_truncated_answers() {
+    let query = build_dns_query("example.com", 1);
+    let mut full_response = response(&query, [192, 0, 2, 1], 30);
+    let second = response(&query, [198, 51, 100, 2], 30);
+    full_response[6..8].copy_from_slice(&2_u16.to_be_bytes());
+    full_response.extend_from_slice(&second[second.len() - 16..]);
+    let forwarder = DnsForwarder::new(
+        exchange([("first", Ok(full_response))], None),
+        Arc::new(Mutex::new(DnsCache::new(8))),
+        router("first", Vec::new(), None),
+    );
+
+    let outcome = forwarder
+        .resolve_outcome_with_context_and_profile(
+            &query,
+            None,
+            IngressProfile::Udp {
+                advertised_size: 45,
+            },
+        )
+        .await
+        .expect("truncated outcome");
+
+    assert_eq!(outcome.domain(), "example.com");
+    assert_eq!(outcome.rendered().len(), 45);
+    assert_ne!(u16::from_be_bytes([outcome.rendered()[2], outcome.rendered()[3]]) & 0x0200, 0);
+    assert_eq!(
+        outcome.answer_ips(),
+        &["192.0.2.1".parse::<std::net::IpAddr>().expect("IP")]
     );
 }
 

@@ -180,8 +180,8 @@ impl GroupManager {
     ) -> Option<String> {
         self.fallback_cache
             .read()
-            .get(&(group_name.to_string(), network))
-            .cloned()
+            .get(group_name)
+            .and_then(|pins| pins[network.slot()].clone())
     }
 
     /// Record `candidate` as the group's URLTest selection for `network`.
@@ -225,12 +225,13 @@ impl GroupManager {
         candidate: &Candidate,
     ) -> bool {
         let mut cache = self.fallback_cache.write();
-        let key = (group.name.clone(), network);
-        let changed = cache
-            .get(&key)
+        let pins = cache.entry(group.name.clone()).or_default();
+        let pin = &mut pins[network.slot()];
+        let changed = pin
+            .as_deref()
             .map(|old| old != candidate.tag)
             .unwrap_or(false);
-        cache.insert(key, candidate.tag.to_string());
+        *pin = Some(candidate.tag.to_owned());
         changed
     }
 }

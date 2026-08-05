@@ -105,9 +105,6 @@ impl DesiredState {
                 current = false;
             }
         }
-        if self.dirty_ips.is_empty() {
-            self.dirty_domains.clear();
-        }
         current
     }
 
@@ -128,6 +125,7 @@ impl DesiredState {
     }
 
     pub(super) fn next_deadline(&mut self) -> Option<Instant> {
+        self.compact_owner_heaps_if_needed();
         while let Some(std::cmp::Reverse(deadline)) = self.retry_deadlines.peek() {
             if self.retries.get(&deadline.ip).is_some_and(|retry| {
                 retry.attempts == deadline.attempts && retry.next_at == deadline.at

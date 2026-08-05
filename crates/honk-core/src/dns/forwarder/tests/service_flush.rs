@@ -1,4 +1,25 @@
 #[tokio::test]
+async fn clones_share_lazy_engine_and_policy_change_resets_it() {
+    let forwarder = DnsForwarder::new(
+        Arc::new(MockUpstream::new(make_a_response([192, 0, 2, 1], 300))),
+        test_cache(),
+        test_router(),
+    );
+    let clone = forwarder.clone();
+
+    assert!(forwarder.engine.get().is_none());
+    let original = forwarder.engine().await.expect("engine") as *const DnsEngine;
+    let shared = clone.engine().await.expect("shared engine") as *const DnsEngine;
+    assert_eq!(original, shared);
+
+    let policy = PolicyId::from_config(&DnsConfig::default()).expect("policy");
+    let rebound = clone.with_policy_id(policy);
+    assert!(rebound.engine.get().is_none());
+    let rebound_engine = rebound.engine().await.expect("rebound engine") as *const DnsEngine;
+    assert_ne!(original, rebound_engine);
+}
+
+#[tokio::test]
 async fn explicit_ingress_profiles_do_not_share_cache_entries() {
     let upstream = Arc::new(MockUpstream::new(make_a_response([192, 0, 2, 1], 300)));
     let forwarder = DnsForwarder::new(upstream.clone(), test_cache(), test_router());

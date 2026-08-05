@@ -8,6 +8,7 @@ pub mod packet_sniffer;
 mod probers;
 pub mod quic;
 mod reload;
+mod resource_budget;
 pub mod routing_matcher;
 mod sockets;
 pub mod tcp_sniff;
@@ -83,6 +84,7 @@ pub use commands::ControlCommand;
 use connection::*;
 use probers::*;
 use reload::*;
+pub(crate) use resource_budget::{MAX_EFFECTIVE_NOFILE, ResourceBudget};
 pub use sockets::DnsBpfNotifier;
 use sockets::*;
 
@@ -120,9 +122,9 @@ pub struct ControlPlane {
     /// Node name → eBPF outbound id (push_routing_to_ebpf numbering),
     /// shared with the alive set's outbound resolver; rebuilt on reload.
     outbound_id_map: Arc<parking_lot::RwLock<std::collections::HashMap<uuid::Uuid, u8>>>,
-    /// Concurrency limiter to prevent tokio thread starvation under high load.
-    /// Default: 1024 concurrent connections. Each connection handler acquires a
-    /// permit before spawning; the accept loop waits when the limit is reached.
+    resource_budget: ResourceBudget,
+    /// Active TCP flow admission. Each permit accounts for the accepted
+    /// client socket and one outbound socket in the descriptor budget.
     concurrency_limit: Arc<tokio::sync::Semaphore>,
     /// Cold non-DNS UDP initialization budget. Ready endpoints bypass it.
     udp_concurrency_limit: Arc<tokio::sync::Semaphore>,
@@ -192,6 +194,26 @@ impl ControlPlane {
         dns_forwarder: std::sync::Arc<crate::dns::forwarder::DnsForwarder>,
         dns_upstream_pool: Arc<crate::dns::upstream_pool::UpstreamPool>,
     ) -> anyhow::Result<Self> {
+        Self::new_with_upstream_pool_and_budget(
+            config,
+            ebpf,
+            router,
+            proxy_registry,
+            dns_forwarder,
+            dns_upstream_pool,
+            ResourceBudget::for_nofile(MAX_EFFECTIVE_NOFILE),
+        )
+    }
+
+    pub(crate) fn new_with_upstream_pool_and_budget(
+        config: Config,
+        ebpf: Box<dyn EbpfBackend>,
+        router: Router,
+        proxy_registry: std::sync::Arc<ProxyRegistry>,
+        dns_forwarder: std::sync::Arc<crate::dns::forwarder::DnsForwarder>,
+        dns_upstream_pool: Arc<crate::dns::upstream_pool::UpstreamPool>,
+        resource_budget: ResourceBudget,
+    ) -> anyhow::Result<Self> {
         let (tx, rx) = mpsc::channel(256);
 
         // Create alive set for node health checking and pass it into the group
@@ -245,13 +267,28 @@ impl ControlPlane {
         // Per-node runtime registry (single owner of session-layer
         // resources, keyed by Node.id). Invalid node sets (nil/duplicate
         // UUIDs) are a fatal config error at startup.
-        let (runtime_registry, _) = honk_outbound::runtime::OutboundRuntimeRegistry::build_reusing(
-            &config.nodes,
-            config.global.max_concurrent_dials,
-            None,
-        )
-        .map_err(|e| anyhow::anyhow!("invalid node set: {}", e))?;
+        let dial_limit = resource_budget.clamp_dials(config.global.max_concurrent_dials);
+        let (runtime_registry, _) =
+            honk_outbound::runtime::OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
+                &config.nodes,
+                dial_limit,
+                resource_budget.transient_dials,
+                None,
+            )
+            .map_err(|e| anyhow::anyhow!("invalid node set: {}", e))?;
         let runtime_registry = runtime_registry.into_shared();
+        info!(
+            nofile = resource_budget.effective_nofile,
+            fixed = resource_budget.fixed_reserve,
+            tcp_flows = resource_budget.active_tcp_flows,
+            tcp_pool = resource_budget.tcp_pool_entries,
+            dials = dial_limit,
+            dial_ceiling = resource_budget.transient_dials,
+            udp_endpoints = resource_budget.udp_endpoints,
+            udp_slow = resource_budget.udp_slow_path,
+            dns_slow = resource_budget.dns_slow_path,
+            "Control-plane descriptor budget"
+        );
         let outbound_runtime = runtime_registry.read().clone();
         dns_upstream_pool.set_runtime_generation(Arc::clone(&outbound_runtime))?;
         {
@@ -353,19 +390,30 @@ impl ControlPlane {
             runtime_registry,
             stats: Arc::new(StatsManager::new()),
             drain_tracker: Arc::new(DrainTracker::new()),
-            udp_pool: Arc::new(UdpEndpointPool::new()),
+            udp_pool: Arc::new(UdpEndpointPool::with_capacity_limit(
+                resource_budget.udp_endpoints,
+            )),
             sniffer_pool: Arc::new(PacketSnifferPool::new()),
             tcp_sniff_neg_cache: Arc::new(crate::control::tcp_sniff::TcpSniffNegCache::new()),
             command_tx: tx,
             command_rx: Some(rx),
             alive_set,
-            connection_pool: Arc::new(ConnectionPool::new()),
+            connection_pool: Arc::new(ConnectionPool::with_capacity_limit(
+                resource_budget.tcp_pool_entries,
+            )),
             connection_tracker: Arc::new(ConnectionTracker::new()),
             cache_db: None,
             outbound_id_map,
-            concurrency_limit: Arc::new(tokio::sync::Semaphore::new(1024)),
-            udp_concurrency_limit: Arc::new(tokio::sync::Semaphore::new(256)),
-            dns_concurrency_limit: Arc::new(tokio::sync::Semaphore::new(256)),
+            resource_budget,
+            concurrency_limit: Arc::new(tokio::sync::Semaphore::new(
+                resource_budget.active_tcp_flows,
+            )),
+            udp_concurrency_limit: Arc::new(tokio::sync::Semaphore::new(
+                resource_budget.udp_slow_path,
+            )),
+            dns_concurrency_limit: Arc::new(tokio::sync::Semaphore::new(
+                resource_budget.dns_slow_path,
+            )),
             background_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             udp_warm_task: tokio::sync::Mutex::new(None),
             mode_state: None,

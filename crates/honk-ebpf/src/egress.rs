@@ -29,8 +29,8 @@ use network_types::udp::UdpHdr;
 
 use crate::{
     contrack::{
-        build_routing_meta, copy_reversed_tuples, is_new_tcp_connection,
-        is_short_lived_udp_traffic, mark_tcp_seen, mark_udp_seen, publish_routing_meta,
+        AUXILIARY_MAP_REFRESH_INTERVAL_NS, copy_reversed_tuples, is_new_tcp_connection,
+        is_short_lived_udp_traffic, lookup_udp_seen, mark_tcp_seen, mark_udp_seen,
     },
     maps::{
         COOKIE_PID_MAP, OUTBOUND_CONNECTIVITY_MAP, PARAM, PKT_SCRATCH_KEY, REDIRECT_TRACK,
@@ -107,10 +107,8 @@ pub fn wan_outbound_is_alive(ctx: &TcContext, outbound: u8, l4proto: u8, dport: 
 }
 
 /// Look up the socket cookie in `COOKIE_PID_MAP` to determine whether this
-/// packet originated from the control-plane daemon process.
-///
-/// Returns `Some(&PIDName)` when the PID is found in the cookie map (regardless
-/// of whether it *is* the control plane), with `last_seen_ns` updated.
+/// packet originated from the control-plane daemon process. A hit refreshes
+/// `last_seen_ns` only after the shared one-second auxiliary-map interval.
 /// Returns `None` when no PID mapping exists.
 ///
 /// The caller must additionally check:
@@ -121,20 +119,13 @@ pub fn wan_outbound_is_alive(ctx: &TcContext, outbound: u8, l4proto: u8, dport: 
 #[inline(always)]
 pub fn pid_is_control_plane(ctx: &TcContext) -> Option<&PIDName> {
     let cookie = unsafe { bpf_get_socket_cookie(ctx.skb.skb as *mut c_void) };
-
-    if let Some(_pid_pname) = unsafe { COOKIE_PID_MAP.get(cookie) } {
-        let now = unsafe { bpf_ktime_get_ns() };
-        unsafe {
-            let ptr = COOKIE_PID_MAP.get_ptr_mut(cookie);
-            if let Some(inner) = ptr {
-                (*inner).last_seen_ns = now;
-            }
-        }
-        // Re-fetch the immutable reference after mutation (verifier-friendly).
-        return unsafe { COOKIE_PID_MAP.get(cookie) };
+    let ptr = COOKIE_PID_MAP.get_ptr_mut(cookie)?;
+    let now = unsafe { bpf_ktime_get_ns() };
+    let entry = unsafe { &mut *ptr };
+    if now.wrapping_sub(entry.last_seen_ns) >= AUXILIARY_MAP_REFRESH_INTERVAL_NS {
+        entry.last_seen_ns = now;
     }
-
-    None
+    Some(entry)
 }
 
 /// Convenience: true when the packet is from the control plane (any detection
@@ -171,7 +162,7 @@ pub fn is_control_plane(ctx: &TcContext) -> bool {
 /// When `refresh_if_stale` is true (cached-flow packets, where every packet
 /// would otherwise rewrite the same entry) the `REDIRECT_TRACK` update is
 /// skipped while the existing entry is fresher than
-/// [`crate::contrack::REDIRECT_REFRESH_INTERVAL_NS`].  New flows pass false
+/// [`crate::contrack::AUXILIARY_MAP_REFRESH_INTERVAL_NS`]. New flows pass false
 /// and always write.
 ///
 /// Returns 0 on success, non-zero on failure.
@@ -239,7 +230,7 @@ pub fn prep_redirect_to_control_plane(
         let stale = match REDIRECT_TRACK.get_ptr_mut(redirect_tuple) {
             Some(old) => {
                 now.wrapping_sub(unsafe { (*old).last_seen_ns })
-                    >= crate::contrack::REDIRECT_REFRESH_INTERVAL_NS
+                    >= crate::contrack::AUXILIARY_MAP_REFRESH_INTERVAL_NS
             }
             None => true,
         };
@@ -618,12 +609,12 @@ fn fast_path_decision(
     // packet of a flow always finds the entry absent (new map entry, or
     // already consumed by userspace) and rewrites it, so userspace still
     // sees a handoff on endpoint-pool miss; later packets of the same flow
-    // refresh it at most once per REDIRECT_REFRESH_INTERVAL_NS.
+    // refresh it at most once per AUXILIARY_MAP_REFRESH_INTERVAL_NS.
     let now = unsafe { bpf_ktime_get_ns() };
     let write_handoff = match ROUTING_HANDOFF_MAP.get_ptr_mut(tuples.five) {
         Some(old) => {
             now.wrapping_sub(unsafe { (*old).last_seen_ns })
-                >= crate::contrack::REDIRECT_REFRESH_INTERVAL_NS
+                >= crate::contrack::AUXILIARY_MAP_REFRESH_INTERVAL_NS
         }
         None => true,
     };
@@ -692,62 +683,37 @@ fn do_tproxy_wan_egress_udp(
         }
     }
 
-    // Try to use cached routing state for non-DNS UDP.
-    if !is_short_lived_udp_traffic(&tuples.five) {
-        let conn = mark_udp_seen(
-            &tuples.five,
-            0u8,  // is_wan_ingress_direction
-            None, // outbound
-            None, // mark
-            None, // must
-            None, // mac
-            0,    // dscp
-            None, // pname
-            0,    // pid
-        );
+    // A live non-DNS entry already carries a complete routing decision.
+    // Lookup-only admission avoids allocating an empty entry before a miss is
+    // routed and refreshes the cached entry's timestamp at most once per second.
+    if !is_short_lived_udp_traffic(&tuples.five)
+        && let Some(conn_state) = lookup_udp_seen(&tuples.five)
+    {
+        if conn_state.is_wan_ingress_direction != 0 {
+            return Err(TC_ACT_OK);
+        }
 
-        if let Some(conn_state) = conn {
-            if conn_state.is_wan_ingress_direction != 0 {
-                return Err(TC_ACT_OK);
-            }
+        let meta_raw = unsafe { conn_state.meta.raw };
+        if (meta_raw >> 56) & 1 != 0 {
+            outbound = (meta_raw & 0xFF) as u8;
+            mark = ((meta_raw >> 8) & 0xFFFFFFFF) as u32;
+            must = ((meta_raw >> 40) & 1) != 0;
+            mac.copy_from_slice(&conn_state.mac);
+            handoff_pname = Some(&conn_state.pname);
+            handoff_pid = conn_state.pid;
 
-            let meta_raw = unsafe { conn_state.meta.raw };
-            if (meta_raw >> 56) & 1 != 0 {
-                outbound = (meta_raw & 0xFF) as u8;
-                mark = ((meta_raw >> 8) & 0xFFFFFFFF) as u32;
-                must = ((meta_raw >> 40) & 1) != 0;
-                mac.copy_from_slice(&conn_state.mac);
-
-                if tuples.five.dst_port != 53u16 {
-                    if outbound != OUTBOUND_DIRECT || mark != 0 || must {
-                        conn_state.mac.copy_from_slice(&mac);
-                        if let Some(pid_pname) = pid_pname_opt {
-                            conn_state.pname.copy_from_slice(&pid_pname.pname);
-                            conn_state.pid = pid_pname.pid;
-                        }
-                        let meta = build_routing_meta(outbound, mark, must as u8, tuples.dscp);
-                        publish_routing_meta(&mut conn_state.meta, meta);
-                    }
-                    conn_state.last_seen_ns = unsafe { bpf_ktime_get_ns() };
-                }
-
-                // Take reference AFTER mutations to avoid borrow conflict.
-                handoff_pname = Some(&conn_state.pname);
-                handoff_pid = conn_state.pid;
-
-                return fast_path_decision(
-                    ctx,
-                    link_h_len,
-                    tuples,
-                    ethh,
-                    outbound,
-                    mark,
-                    must,
-                    mac,
-                    handoff_pname,
-                    handoff_pid,
-                );
-            }
+            return fast_path_decision(
+                ctx,
+                link_h_len,
+                tuples,
+                ethh,
+                outbound,
+                mark,
+                must,
+                mac,
+                handoff_pname,
+                handoff_pid,
+            );
         }
     }
 
@@ -796,20 +762,26 @@ fn do_tproxy_wan_egress_udp(
     must = ((s64_ret >> 40) & 1) != 0;
 
     if !is_short_lived_udp_traffic(&tuples.five) {
-        let conn = mark_udp_seen(&tuples.five, 0u8, None, None, None, None, 0, None, 0);
-        if let Some(conn_state) = conn {
-            if tuples.five.dst_port != 53u16 {
-                if outbound != OUTBOUND_DIRECT || mark != 0 || must {
-                    conn_state.mac.copy_from_slice(&mac);
-                    if let Some(pid_pname) = pid_pname_opt {
-                        conn_state.pname.copy_from_slice(&pid_pname.pname);
-                        conn_state.pid = pid_pname.pid;
-                    }
-                    let meta = build_routing_meta(outbound, mark, must as u8, tuples.dscp);
-                    publish_routing_meta(&mut conn_state.meta, meta);
-                }
-                conn_state.last_seen_ns = unsafe { bpf_ktime_get_ns() };
+        let must_u8 = must as u8;
+        let pname = pid_pname_opt.map(|pid_pname| &pid_pname.pname);
+        let pid = pid_pname_opt.map_or(0, |pid_pname| pid_pname.pid);
+        if mark_udp_seen(
+            &tuples.five,
+            0u8,
+            Some(&outbound),
+            Some(&mark),
+            Some(&must_u8),
+            Some(&mac),
+            tuples.dscp,
+            pname,
+            pid,
+        )
+        .is_none()
+        {
+            if outbound == OUTBOUND_DIRECT && mark == 0 {
+                return Err(TC_ACT_OK);
             }
+            return Err(TC_ACT_SHOT);
         }
     }
 

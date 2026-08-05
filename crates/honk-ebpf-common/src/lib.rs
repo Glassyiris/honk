@@ -16,10 +16,12 @@ pub use crate::redirect_need::{
 };
 pub use crate::route::{
     MatchSet, MatchSetValue, MatchType, PortRange, ROUTING_GENERATION_COUNT,
-    ROUTING_GROUP_BITMAP_WORDS, ROUTING_GROUP_COUNT, ROUTING_GROUP_TCP4, ROUTING_GROUP_TCP6,
-    ROUTING_GROUP_UDP4, ROUTING_GROUP_UDP6, ROUTING_MAP_LEN, ROUTING_META_ACTIVE_GENERATION_SLOT,
-    ROUTING_META_GENERATION_STRIDE, ROUTING_META_MAP_LEN, RoutingGroupBitmaps, routing_group_index,
-    routing_meta_bitmap_base, routing_meta_count_slot, routing_meta_generation_base,
+    ROUTING_GROUP_BITMAP_WORDS, ROUTING_GROUP_COUNT, ROUTING_GROUP_META_MAP_LEN,
+    ROUTING_GROUP_TCP4, ROUTING_GROUP_TCP6, ROUTING_GROUP_UDP4, ROUTING_GROUP_UDP6,
+    ROUTING_MAP_LEN, ROUTING_META_ACTIVE_GENERATION_SLOT, ROUTING_META_GENERATION_STRIDE,
+    ROUTING_META_MAP_LEN, RoutingGroupBitmaps, RoutingGroupMeta, routing_group_index,
+    routing_group_meta_index, routing_meta_bitmap_base, routing_meta_count_slot,
+    routing_meta_generation_base,
 };
 
 pub const TASK_COMM_LEN: usize = 16;

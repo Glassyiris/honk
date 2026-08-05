@@ -68,6 +68,13 @@ impl SelectionNetwork {
             ProbeDomain::DnsUdp | ProbeDomain::DataUdp => SelectionNetwork::Udp,
         }
     }
+
+    const fn slot(self) -> usize {
+        match self {
+            Self::Tcp => 0,
+            Self::Udp => 1,
+        }
+    }
 }
 
 /// Provenance of a group selection plan.
@@ -142,12 +149,10 @@ pub struct GroupManager {
     alive_set: Option<Arc<AliveDialerSet>>,
     /// Per-group URLTest selection cache, split by network (TCP/UDP).
     urltest_cache: RwLock<HashMap<String, UrlTestSelections>>,
-    /// Per-group, per-network round-robin counters for LoadBalance. TCP and
-    /// UDP must not advance each other's sequence.
-    lb_counters: HashMap<(String, SelectionNetwork), AtomicUsize>,
-    /// Per-group, per-network Fallback pin. A TCP-alive/UDP-dead member must
-    /// not pin both traffic classes to the same leaf.
-    fallback_cache: RwLock<HashMap<(String, SelectionNetwork), String>>,
+    /// Per-group TCP/UDP round-robin counters for LoadBalance.
+    lb_counters: HashMap<String, [AtomicUsize; 2]>,
+    /// Per-group TCP/UDP Fallback pins.
+    fallback_cache: RwLock<HashMap<String, [Option<String>; 2]>>,
     /// Per-group last-used timestamp for idle timeout.
     last_used: RwLock<HashMap<String, Instant>>,
     /// Per-group selector choice (set via API, persisted by caller).
@@ -187,9 +192,11 @@ impl GroupManager {
             urltest_cache: RwLock::new(HashMap::new()),
             lb_counters: groups
                 .iter()
-                .flat_map(|g| {
-                    [SelectionNetwork::Tcp, SelectionNetwork::Udp]
-                        .map(move |network| ((g.name.clone(), network), AtomicUsize::new(0)))
+                .map(|group| {
+                    (
+                        group.name.clone(),
+                        std::array::from_fn(|_| AtomicUsize::new(0)),
+                    )
                 })
                 .collect(),
             fallback_cache: RwLock::new(HashMap::new()),
@@ -338,6 +345,15 @@ impl GroupManager {
         };
         if effects.applies() {
             self.mark_used(group_name);
+        }
+        if group.policy == GroupPolicy::Selector && group.groups.is_empty() {
+            return SelectionPlan {
+                mode: SelectionPlanMode::Authoritative,
+                nodes: self
+                    .pick_direct_selector(group, domain, ipver)
+                    .into_iter()
+                    .collect(),
+            };
         }
         let mut visited = Vec::new();
         let candidates = self.flatten_candidates(group, domain, ipver, &mut visited, 0, effects);

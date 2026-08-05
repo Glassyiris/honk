@@ -1297,17 +1297,6 @@ pub(super) async fn udp_fast_path(
         "UDP endpoint enqueue for {} -> {}",
         client_addr, original_dst
     );
-    // Keep the cache's lazy TTL invalidation behavior without sending from
-    // the receive loop. The driver owns mark_sent, refresh and byte counts
-    // after a real PacketTransport send succeeds.
-    if let Some(ep) = udp_pool.get(client_addr, original_dst)
-        && ep.get_cached_routing(original_dst).is_some()
-    {
-        debug!(
-            "UDP routing cache hit for {} -> {}",
-            client_addr, original_dst
-        );
-    }
     debug_assert!(matches!(
         result,
         EndpointReservation::Enqueued | EndpointReservation::QueueFull

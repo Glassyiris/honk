@@ -939,10 +939,41 @@ async fn udp_fast_path_hit_enqueues_for_the_endpoint_driver() {
     let mut buf = [0u8; 64];
     // First packet was delivered through the driver start barrier.
     echo.recv_from(&mut buf).await.unwrap();
+    assert!(!udp_fast_path(&pool, &stats, b"wrong-client", addr("10.0.0.2:12345"), dst,).await);
+    assert!(
+        !udp_fast_path(
+            &pool,
+            &stats,
+            b"wrong-destination",
+            client,
+            addr("203.0.113.2:443"),
+        )
+        .await
+    );
+    assert!(
+        !udp_fast_path(
+            &pool,
+            &stats,
+            b"wrong-client-port",
+            addr("10.0.0.1:12346"),
+            dst,
+        )
+        .await
+    );
+    assert!(
+        !udp_fast_path(
+            &pool,
+            &stats,
+            b"wrong-destination-port",
+            client,
+            addr("203.0.113.1:444"),
+        )
+        .await
+    );
     assert!(udp_fast_path(&pool, &stats, b"hello", client, dst).await);
     let udp = stats.udp_snapshot();
     assert_eq!(udp.endpoint_hits, 1);
-    assert_eq!(udp.endpoint_misses, 0);
+    assert_eq!(udp.endpoint_misses, 4);
 
     let (n, from) = tokio::time::timeout(Duration::from_secs(2), echo.recv_from(&mut buf))
         .await

@@ -56,6 +56,30 @@ pub const ROUTING_META_MAP_LEN: usize =
 /// `bitmaps[g][w]` is word w of group g's 128-bit bitmap over logical rule indices.
 pub type RoutingGroupBitmaps = [[u32; ROUTING_GROUP_BITMAP_WORDS]; ROUTING_GROUP_COUNT];
 
+/// Packed routing metadata for one generation and flow group.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct RoutingGroupMeta {
+    pub rule_count: u32,
+    pub bitmap: [u32; ROUTING_GROUP_BITMAP_WORDS],
+}
+
+/// Four flow groups in each of the two routing generations.
+pub const ROUTING_GROUP_META_MAP_LEN: usize = ROUTING_GENERATION_COUNT * ROUTING_GROUP_COUNT;
+
+#[inline(always)]
+pub const fn routing_group_meta_index(generation: u32, group: u32) -> u32 {
+    generation * ROUTING_GROUP_COUNT as u32 + group
+}
+
+const _ROUTING_GROUP_META_SIZE: () =
+    assert!(core::mem::size_of::<RoutingGroupMeta>() == 5 * core::mem::size_of::<u32>());
+const _ROUTING_GROUP_META_ALIGN: () =
+    assert!(core::mem::align_of::<RoutingGroupMeta>() == core::mem::align_of::<u32>());
+
+#[cfg(not(target_arch = "bpf"))]
+unsafe impl aya::Pod for RoutingGroupMeta {}
+
 /// Map a flow's (L4 protocol, IP version) pair to its routing group index.
 ///
 /// `l4proto`/`ipversion` use the datapath encodings (`L4ProtoType`:
@@ -164,5 +188,31 @@ impl core::fmt::Debug for MatchSet {
             .field("must", &self.must)
             .field("mark", &self.mark)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packed_group_meta_layout_and_indices_are_stable() {
+        assert_eq!(core::mem::size_of::<RoutingGroupMeta>(), 20);
+        assert_eq!(core::mem::align_of::<RoutingGroupMeta>(), 4);
+        assert_eq!(core::mem::offset_of!(RoutingGroupMeta, rule_count), 0);
+        assert_eq!(core::mem::offset_of!(RoutingGroupMeta, bitmap), 4);
+        assert_eq!(ROUTING_GROUP_META_MAP_LEN, 8);
+        assert_eq!(ROUTING_GENERATION_COUNT, 2);
+        assert_eq!(ROUTING_MAP_LEN, 256);
+        assert_eq!(ROUTING_META_GENERATION_STRIDE, 17);
+        assert_eq!(ROUTING_META_MAP_LEN, 35);
+        for generation in 0..ROUTING_GENERATION_COUNT as u32 {
+            for group in 0..ROUTING_GROUP_COUNT as u32 {
+                assert_eq!(
+                    routing_group_meta_index(generation, group),
+                    generation * ROUTING_GROUP_COUNT as u32 + group
+                );
+            }
+        }
     }
 }

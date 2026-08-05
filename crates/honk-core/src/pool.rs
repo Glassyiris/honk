@@ -18,8 +18,8 @@
 //! because the completed handshake already committed the stream to that
 //! exact pair — lookup by the same pair is the only correct reuse.
 //!
-//! Budgets beyond the per-key cap: a global FD budget
-//! ([`MAX_TOTAL_ENTRIES`]), a per-node ready-target cardinality cap
+//! Budgets beyond the per-key cap: an explicit global FD capacity (bounded by
+//! [`MAX_TOTAL_ENTRIES`]), a per-node ready-target cardinality cap
 //! ([`MAX_READY_TARGETS_PER_NODE`]), and hot-target gating
 //! ([`ConnectionPool::note_target`]) so only repeat destinations earn a
 //! speculative ready deposit. Deposits are also capability-checked at the
@@ -77,6 +77,7 @@ struct TimedStream {
 pub struct ConnectionPool {
     entries: DashMap<String, Arc<Mutex<Vec<TimedStream>>>>,
     total_entries: AtomicU64,
+    capacity_limit: u64,
     /// Ready-key cardinality per node, updated only when a ready key enters
     /// or leaves `entries`; no deposit scans every shard.
     ready_targets: DashMap<String, Arc<AtomicU64>>,
@@ -115,10 +116,16 @@ pub struct ReadyPoolMetrics {
 }
 
 impl ConnectionPool {
+    /// Construct a max-capacity pool for tests and standalone callers.
     pub fn new() -> Self {
+        Self::with_capacity_limit(MAX_TOTAL_ENTRIES)
+    }
+
+    pub(crate) fn with_capacity_limit(capacity_limit: usize) -> Self {
         Self {
             entries: DashMap::new(),
             total_entries: AtomicU64::new(0),
+            capacity_limit: capacity_limit.min(MAX_TOTAL_ENTRIES) as u64,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             ready_idle_timeout: READY_IDLE_TIMEOUT,
             ready_targets: DashMap::new(),
@@ -317,7 +324,7 @@ impl ConnectionPool {
         if !self.reserve_total() {
             debug!(
                 "Pool global cap reached ({}); dropping deposit for {}",
-                MAX_TOTAL_ENTRIES, addr
+                self.capacity_limit, addr
             );
             return;
         }
@@ -372,7 +379,7 @@ impl ConnectionPool {
     fn reserve_total(&self) -> bool {
         self.total_entries
             .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                (current < MAX_TOTAL_ENTRIES as u64).then_some(current + 1)
+                (current < self.capacity_limit).then_some(current + 1)
             })
             .is_ok()
     }
@@ -635,6 +642,16 @@ mod tests {
             MAX_TOTAL_ENTRIES as u64,
             "a refused deposit must not bump the counter"
         );
+    }
+
+    #[test]
+    fn explicit_pool_capacity_is_enforced() {
+        let pool = ConnectionPool::with_capacity_limit(3);
+        assert!(pool.reserve_total());
+        assert!(pool.reserve_total());
+        assert!(pool.reserve_total());
+        assert!(!pool.reserve_total());
+        assert_eq!(pool.total_entries.load(Ordering::Acquire), 3);
     }
 
     /// Phase 5: hot-target gating — the first flow is cold, the second

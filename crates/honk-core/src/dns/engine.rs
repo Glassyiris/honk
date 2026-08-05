@@ -1,4 +1,5 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use thiserror::Error;
 
 use super::cache::KeyIdentity;
@@ -25,7 +26,7 @@ pub(crate) struct DnsEngine {
 pub(crate) struct PreparedQuery {
     query: QueryContext,
     key_identity: KeyIdentity,
-    domain: String,
+    domain: Arc<str>,
     qtype: u16,
     plan: RequestPlan,
 }
@@ -33,6 +34,7 @@ pub(crate) struct PreparedQuery {
 pub(crate) struct AnalyzedResponse {
     pub wire: Vec<u8>,
     pub class: ResponseClass,
+    pub answer_ips: Vec<IpAddr>,
 }
 
 pub(crate) enum ResponseDirective {
@@ -92,7 +94,8 @@ impl DnsEngine {
         compatibility: bool,
     ) -> Result<PreparedQuery, EngineError> {
         let query = QueryContext::parse_with_profile(raw_query, ingress)?;
-        let domain = decode_name(query.qname().ok_or(EngineError::MissingQuestion)?)?;
+        let domain: Arc<str> =
+            decode_name(query.qname().ok_or(EngineError::MissingQuestion)?)?.into();
         let qtype = query.qtype().ok_or(EngineError::MissingQuestion)?.get();
         let context = RequestContext {
             domain: &domain,
@@ -125,14 +128,17 @@ impl DnsEngine {
             ResponseTemplate::validate(&prepared.query, &wire)?;
         }
         let class = classify_response(&wire);
-        let response = AnalyzedResponse { wire, class };
         if matches!(class, ResponseClass::Nxdomain | ResponseClass::Servfail) {
             return Ok(ResponseDirective::Accept {
-                response,
+                response: AnalyzedResponse {
+                    wire,
+                    class,
+                    answer_ips: Vec::new(),
+                },
                 traversal,
             });
         }
-        let answer_ips = super::forwarder::extract_answer_ips(&response.wire);
+        let answer_ips = super::forwarder::extract_answer_ips(&wire);
         let current_traversal = traversal.clone();
         let planned = self.planner.plan_response(
             ResponseContext {
@@ -142,6 +148,11 @@ impl DnsEngine {
             },
             traversal,
         );
+        let response = AnalyzedResponse {
+            wire,
+            class,
+            answer_ips,
+        };
         let plan = match planned {
             Err(PlanError::UpstreamCycle { .. } | PlanError::DepthExceeded { .. }) if !strict => {
                 return Ok(ResponseDirective::Accept {
@@ -190,6 +201,10 @@ impl PreparedQuery {
 
     pub(crate) fn domain(&self) -> &str {
         &self.domain
+    }
+
+    pub(crate) fn domain_arc(&self) -> Arc<str> {
+        Arc::clone(&self.domain)
     }
 
     pub(crate) const fn qtype(&self) -> u16 {
