@@ -278,16 +278,12 @@ async fn fetch_proxied(
     let connect_timeout = Duration::from_millis(ctx.config.read().await.global.connect_timeout_ms);
     // Tunnel handlers dial by domain; the address is only a fallback for
     // handlers that need a numeric target.
-    let domain = if host.parse::<std::net::IpAddr>().is_ok() {
-        None
-    } else {
-        Some(host)
-    };
-    let addr = match tokio::net::lookup_host((host, port)).await {
-        Ok(mut addrs) => addrs
-            .next()
-            .unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], port))),
-        Err(_) => std::net::SocketAddr::from(([0, 0, 0, 0], port)),
+    let (domain, addr) = match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => (None, std::net::SocketAddr::new(ip, port)),
+        Err(_) => (
+            Some(host),
+            std::net::SocketAddr::from(([0, 0, 0, 0], port)),
+        ),
     };
     let generation = ctx.runtime_registry.read().clone();
     let (runtime, guard) = match generation
