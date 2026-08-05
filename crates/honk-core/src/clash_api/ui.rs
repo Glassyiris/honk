@@ -425,28 +425,29 @@ where
 /// Split a download URL into (host, port, path, is_https); the scheme is
 /// required and must be http or https.
 fn parse_download_url(url: &str) -> anyhow::Result<(String, u16, String, bool)> {
-    let (default_port, rest, is_https) = if let Some(r) = url.strip_prefix("https://") {
-        (443u16, r, true)
-    } else if let Some(r) = url.strip_prefix("http://") {
-        (80u16, r, false)
-    } else {
-        anyhow::bail!("unsupported scheme in external UI URL '{url}'");
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| anyhow::anyhow!("invalid external UI URL '{url}': {e}"))?;
+
+    let is_https = match parsed.scheme() {
+        "https" => true,
+        "http" => false,
+        _ => anyhow::bail!("unsupported scheme in external UI URL '{url}'"),
     };
-    let (authority, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
-    };
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) => match p.parse::<u16>() {
-            Ok(p) => (h, p),
-            Err(_) => (authority, default_port),
-        },
-        None => (authority, default_port),
-    };
-    if host.is_empty() {
-        anyhow::bail!("empty host in external UI URL '{url}'");
+
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("empty host in external UI URL '{url}'"))?;
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| anyhow::anyhow!("missing port in external UI URL '{url}'"))? as u16;
+
+    let mut path = parsed.path().to_string();
+    if let Some(q) = parsed.query() {
+        path.push('?');
+        path.push_str(q);
     }
-    Ok((host.to_string(), port, path.to_string(), is_https))
+
+    Ok((host.to_string(), port, path, is_https))
 }
 
 /// Extract a zip archive into `output`, stripping the single top-level
