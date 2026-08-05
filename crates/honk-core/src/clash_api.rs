@@ -1040,19 +1040,26 @@ fn connections_json_tracker(
                 .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339())
                 .unwrap_or_default();
 
+            let mut metadata = serde_json::json!({
+                "network": e.network,
+                "type": e.network,
+                "sourceIP": src_ip,
+                "destinationIP": dst_ip,
+                "sourcePort": src_port,
+                "destinationPort": dst_port,
+                "host": e.domain.clone().unwrap_or_default(),
+                "dnsMode": "normal",
+                "processPath": e.process_path.clone().unwrap_or_default(),
+            });
+            // mihomo omits `process` entirely for flows without process
+            // attribution (LAN-forwarded traffic has none).
+            if let Some(process) = &e.process {
+                metadata["process"] = serde_json::Value::String(process.clone());
+            }
+
             serde_json::json!({
                 "id": e.id,
-                "metadata": {
-                    "network": e.network,
-                    "type": e.network,
-                    "sourceIP": src_ip,
-                    "destinationIP": dst_ip,
-                    "sourcePort": src_port,
-                    "destinationPort": dst_port,
-                    "host": e.domain.clone().unwrap_or_default(),
-                    "dnsMode": "normal",
-                    "processPath": "",
-                },
+                "metadata": metadata,
                 "upload": e.upload,
                 "download": e.download,
                 "start": start,

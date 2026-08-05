@@ -26,6 +26,12 @@ pub struct ConnectionSnapshot {
     pub start_time: Instant,
     pub domain: Option<String>,
     pub network: String,
+    /// Originating process name for locally-generated flows (cgroup cookie
+    /// attribution); None for LAN-forwarded traffic.
+    pub process: Option<String>,
+    /// /proc/<pid>/exe at registration time; None when the pid is unknown
+    /// or the process already exited.
+    pub process_path: Option<String>,
 }
 
 /// Live per-connection entry, updated concurrently from the relay task.
@@ -44,6 +50,12 @@ pub struct ConnectionEntry {
     pub start_time: Instant,
     pub domain: Option<String>,
     pub network: String,
+    /// Originating process name for locally-generated flows (cgroup cookie
+    /// attribution); None for LAN-forwarded traffic.
+    pub process: Option<String>,
+    /// /proc/<pid>/exe resolved at registration; None when the pid is
+    /// unknown or the process already exited.
+    pub process_path: Option<String>,
 }
 
 impl ConnectionEntry {
@@ -62,6 +74,8 @@ impl ConnectionEntry {
             start_time: self.start_time,
             domain: self.domain.clone(),
             network: self.network.clone(),
+            process: self.process.clone(),
+            process_path: self.process_path.clone(),
         }
     }
 }
