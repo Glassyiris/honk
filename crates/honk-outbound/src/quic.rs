@@ -979,8 +979,13 @@ where
             Ok((send, recv)) => {
                 let open = Arc::clone(state.open_counter());
                 open.fetch_add(1, Ordering::Relaxed);
+                // The flow owns its `(Connection, Arc<S>)` pair: the guard
+                // must hold the state, not just the open counter — a
+                // dropped state makes the connection reaper kill the live
+                // connection ("state dropped") under the stream.
                 let stream = QuicBiStream::new(send, recv).with_on_drop(move || {
                     open.fetch_sub(1, Ordering::Relaxed);
+                    let _state_kept_alive_under_this_stream = &state;
                 });
                 return Ok(stream);
             }
