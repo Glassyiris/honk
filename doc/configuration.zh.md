@@ -276,7 +276,7 @@ routing {
 
 **Must 规则**（`-> direct(must)`）：命中不终结，继续匹配并传播 must 语义（兼容 Go dae）。Clash 的 Global/Direct 模式不会覆盖 must/block。
 
-Geo 资源：将 `geoip.dat` / `geosite.dat` 放到运行时可加载的位置（开发时常用仓库根目录副本）。
+Geo 资源：将 `geoip.dat` / `geosite.dat` 放到运行时可加载的位置（开发时常用仓库根目录副本）。geosite 类目支持 dae 的属性过滤：`domain(geosite: category-games@cn)` 只保留带 `@cn` 属性的条目（属性名大小写不敏感；第一个 `@` 之后整体作为选择器）。展开为零匹配的 code（类目不存在或属性无命中）会告警且永不命中。
 
 ### 路由片段
 

@@ -9,6 +9,13 @@ mod lpm;
 
 pub(crate) use geo::GeoAssets;
 pub(crate) use lpm::BinaryLpmTrie;
+
+// Read-only dat scan API consumed by honk-tool (`geosite`/`geoip`
+// subcommands); separate from the routing hot path.
+pub use geo::{
+    GeoipCategory, GeoipScan, GeositeCategory, GeositeEntry, GeositeKind, GeositeScan,
+    find_geoip_dat, find_geosite_dat,
+};
 const KERNEL_COMM_VISIBLE_LEN: usize = honk_ebpf_common::TASK_COMM_LEN - 1;
 
 fn normalize_process_matcher(name: &str) -> String {

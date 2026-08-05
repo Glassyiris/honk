@@ -295,7 +295,7 @@ Outbound targets: `direct`, `block`, any **group** or **node** name.
 
 **Must rules** (`-> direct(must)`): match does not finalize; continues matching and propagates must semantics (Go dae compatible). Clash Global/Direct mode does not override must/block.
 
-Geo assets: place `geoip.dat` / `geosite.dat` where the runtime can load them (repo root copies are common in dev). Geosite codes are matched as-is (e.g. `domain(geosite: category-games)`); `@attr` filters are not rewritten — a code that matches no category logs a warning and never matches.
+Geo assets: place `geoip.dat` / `geosite.dat` where the runtime can load them (repo root copies are common in dev). Geosite codes support dae's attribute filter: `domain(geosite: category-games@cn)` keeps only entries carrying the `@cn` attribute (key match is case-insensitive; everything after the first `@` is the selector). A code that expands to zero matchers — unknown category or unmatched attribute — logs a warning and never matches.
 
 ### Full routing snippet
 

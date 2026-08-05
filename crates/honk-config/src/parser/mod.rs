@@ -1265,13 +1265,12 @@ fn strip_tag_arg(arg: &str, prefix: &str) -> Option<String> {
     arg.strip_prefix(prefix).map(|s| s.trim().to_string())
 }
 
-/// Normalize a geosite list name.  Dae uses `list@cn` to request the
-/// China-specific variant; the dat files flatten those as `list-cn`.
+/// Normalize a geosite list name.
 fn normalize_geosite_code(code: &str) -> String {
-    // Keep the code verbatim: `@attr` is an attribute filter, not part of the
-    // category name — remapping it to `-` silently mismatched into a
-    // nonexistent category. Codes that resolve to nothing are warned about at
-    // expansion time (honk-core routing/geo.rs).
+    // Keep the code verbatim: `@attr` is an attribute filter applied at
+    // expansion time (honk-core routing/geo.rs), not part of the category
+    // name — remapping it to `-` silently mismatched into a nonexistent
+    // category.
     code.trim().to_string()
 }
 
