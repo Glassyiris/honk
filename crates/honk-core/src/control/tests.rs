@@ -3355,3 +3355,130 @@ async fn shutdown_detaches_hooks_and_stays_bounded_with_stuck_flow() {
         "shutdown must detach the datapath hooks"
     );
 }
+
+fn offload_flags_test_plane(
+    config: Config,
+) -> (ControlPlane, std::sync::Arc<std::sync::Mutex<Vec<u32>>>) {
+    let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut backend = crate::ebpf::mock::MockEbpfBackend::new();
+    backend.datapath_flags_writes = writes.clone();
+    let router = Router::new(&config.routing.rules, &config.routing.default_outbound).unwrap();
+    let plane = ControlPlane::new(
+        config,
+        Box::new(backend),
+        router,
+        Arc::new(ProxyRegistry::default_resolver().unwrap()),
+        DnsResolver::new(&honk_config::dns::DnsConfig::default()).unwrap(),
+        udp_test_forwarder(),
+    )
+    .unwrap();
+    (plane, writes)
+}
+
+fn domain_rule(outbound: &str) -> honk_config::routing::RoutingRule {
+    honk_config::routing::RoutingRule {
+        name: "domain-rule".into(),
+        condition: honk_config::routing::RoutingCondition {
+            domain_suffix: vec!["example.com".into()],
+            ..Default::default()
+        },
+        outbound: honk_config::routing::RoutingOutbound::Simple(outbound.into()),
+        priority: 0,
+        must: false,
+        mark: 0,
+    }
+}
+
+#[tokio::test]
+async fn sync_direct_offload_flags_composes_mode_and_static_bits() {
+    use honk_ebpf_common::{
+        DATAPATH_FLAG_OFFLOAD_ALL as ALL, DATAPATH_FLAG_OFFLOAD_NO_DOMAIN_RULES as NO_DOMAIN,
+        DATAPATH_FLAG_OFFLOAD_RULE_DIRECT as RULE,
+    };
+
+    // dial_mode ip: the static bit is set even with domain rules present —
+    // sniffing is disabled, so no domain re-evaluation can ever happen.
+    let mut config = udp_test_config("direct", vec![], vec![]);
+    config.global.dial_mode = "ip".into();
+    config.routing.rules = vec![domain_rule("direct")];
+    let (mut plane, writes) = offload_flags_test_plane(config);
+
+    // No mode state (clash API disabled) behaves as Rule.
+    plane.sync_direct_offload_flags().await;
+    plane.set_mode_state(std::sync::Arc::new(parking_lot::RwLock::new(
+        crate::mode::ModeState::new("global", "proxy"),
+    )));
+    plane.sync_direct_offload_flags().await;
+    plane.set_mode_state(std::sync::Arc::new(parking_lot::RwLock::new(
+        crate::mode::ModeState::new("direct", "proxy"),
+    )));
+    plane.sync_direct_offload_flags().await;
+    plane.set_mode_state(std::sync::Arc::new(parking_lot::RwLock::new(
+        crate::mode::ModeState::new("rule", "proxy"),
+    )));
+    plane.sync_direct_offload_flags().await;
+    assert_eq!(
+        writes.lock().unwrap().clone(),
+        vec![
+            RULE | NO_DOMAIN,
+            NO_DOMAIN,
+            ALL | NO_DOMAIN,
+            RULE | NO_DOMAIN
+        ]
+    );
+
+    // dial_mode domain++ with a domain rule: the static bit stays clear, so
+    // Rule-mode offload remains constrained by per-flow DomainRouting hits.
+    let mut config = udp_test_config("direct", vec![], vec![]);
+    config.global.dial_mode = "domain++".into();
+    config.routing.rules = vec![domain_rule("direct")];
+    let (plane, writes) = offload_flags_test_plane(config);
+    plane.sync_direct_offload_flags().await;
+    assert_eq!(writes.lock().unwrap().clone(), vec![RULE]);
+
+    // dial_mode domain++ without any domain-class rule: sniffing cannot
+    // change routing, so the static bit is set.
+    let mut config = udp_test_config("direct", vec![], vec![]);
+    config.global.dial_mode = "domain++".into();
+    let (plane, writes) = offload_flags_test_plane(config);
+    plane.sync_direct_offload_flags().await;
+    assert_eq!(writes.lock().unwrap().clone(), vec![RULE | NO_DOMAIN]);
+}
+
+/// A reload re-asserts the datapath offload flags and recomputes the static
+/// bit from the NEW config (dial_mode / domain rules), not the old one.
+#[tokio::test]
+async fn reload_reasserts_and_recomputes_datapath_offload_flags() {
+    use honk_ebpf_common::{
+        DATAPATH_FLAG_OFFLOAD_NO_DOMAIN_RULES as NO_DOMAIN,
+        DATAPATH_FLAG_OFFLOAD_RULE_DIRECT as RULE,
+    };
+
+    let mut config = udp_test_config("direct", vec![], vec![]);
+    config.global.dial_mode = "domain++".into();
+    config.routing.rules = vec![domain_rule("direct")];
+    let (plane, writes) = offload_flags_test_plane(config);
+
+    let mut new_config = udp_test_config("direct", vec![], vec![]);
+    new_config.global.dial_mode = "ip".into();
+    new_config.routing.rules = vec![domain_rule("direct")];
+    assert!(
+        plane
+            .apply_runtime_config(new_config, &DrainTracker::new())
+            .await
+    );
+
+    // dial_mode switched to ip: the static bit is now set even though the
+    // domain rule survived the reload.
+    assert_eq!(
+        writes.lock().unwrap().clone(),
+        vec![RULE | NO_DOMAIN],
+        "reload must re-assert the flags recomputed from the new config"
+    );
+    assert_eq!(
+        plane
+            .direct_offload_static_handle()
+            .load(std::sync::atomic::Ordering::Relaxed),
+        NO_DOMAIN
+    );
+}

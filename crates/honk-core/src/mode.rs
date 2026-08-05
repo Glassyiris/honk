@@ -49,9 +49,9 @@ impl ModeState {
         self.mode.eq_ignore_ascii_case("direct")
     }
 
-    /// Whether the current mode is `Rule` — the only mode in which the eBPF
-    /// datapath may offload non-`must` `direct` flows, because the mode
-    /// override is the identity there.
+    /// Whether the current mode is `Rule` — in `Rule` the mode override is
+    /// the identity, so the eBPF datapath may offload non-`must` `direct`
+    /// flows (subject to the domain-rule constraint).
     pub fn is_rule(&self) -> bool {
         self.mode.eq_ignore_ascii_case("rule")
     }
@@ -59,6 +59,20 @@ impl ModeState {
     /// Whether the current mode is `Global`.
     pub fn is_global(&self) -> bool {
         self.mode.eq_ignore_ascii_case("global")
+    }
+
+    /// The mode's contribution to the eBPF datapath offload flags:
+    /// `Rule` → offload `direct`-routed flows, `Direct` → offload every
+    /// non-`must`/non-`block` flow (the override would force `direct`
+    /// anyway), `Global` → nothing beyond `must`-direct (status quo).
+    pub fn direct_offload_mode_bits(&self) -> u32 {
+        if self.is_direct() {
+            honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_ALL
+        } else if self.is_rule() {
+            honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_RULE_DIRECT
+        } else {
+            0
+        }
     }
 
     /// Decide the effective outbound after clash-mode override.
@@ -95,6 +109,25 @@ impl ModeState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_direct_offload_mode_bits() {
+        use honk_ebpf_common::{
+            DATAPATH_FLAG_OFFLOAD_ALL as ALL, DATAPATH_FLAG_OFFLOAD_RULE_DIRECT as RULE,
+        };
+        assert_eq!(
+            ModeState::new("rule", "proxy").direct_offload_mode_bits(),
+            RULE
+        );
+        assert_eq!(
+            ModeState::new("direct", "proxy").direct_offload_mode_bits(),
+            ALL
+        );
+        assert_eq!(
+            ModeState::new("global", "proxy").direct_offload_mode_bits(),
+            0
+        );
+    }
 
     #[test]
     fn test_normalize() {

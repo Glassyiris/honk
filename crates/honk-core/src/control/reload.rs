@@ -355,10 +355,10 @@ impl ControlPlane {
             self.alive_set
                 .sync_group_check_urls(&group_check_url_registrations(&config));
         }
-        // The flag lives in a persistent map, but re-assert it after a
+        // The flags live in a persistent map, but re-assert them after a
         // successful reload so a missed or failed earlier write cannot leave
-        // the datapath out of sync with the clash mode.
-        self.sync_direct_offload_flag().await;
+        // the datapath out of sync with the clash mode and routing config.
+        self.sync_direct_offload_flags().await;
         info!("Configuration applied — {} routes active", route_count);
 
         self.stop_reload_rejection_if_healthy(drain);

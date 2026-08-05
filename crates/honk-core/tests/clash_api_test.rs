@@ -60,8 +60,8 @@ struct TestApp {
     state: Arc<ClashState>,
     log_dispatch: tracing::Dispatch,
     db_path: std::path::PathBuf,
-    /// Every `set_direct_offload` value the mock backend received.
-    ebpf_direct_offload_writes: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
+    /// Every `set_datapath_flags` value the mock backend received.
+    ebpf_datapath_flags_writes: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
     _tmp: tempfile::TempDir,
 }
 
@@ -157,9 +157,9 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
     let traffic_router =
         honk_core::routing::Router::new(&config.routing.rules, &config.routing.default_outbound)
             .unwrap();
-    let ebpf_direct_offload_writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let ebpf_datapath_flags_writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut mock_ebpf = honk_core::ebpf::mock::MockEbpfBackend::new();
-    mock_ebpf.direct_offload_writes = ebpf_direct_offload_writes.clone();
+    mock_ebpf.datapath_flags_writes = ebpf_datapath_flags_writes.clone();
     let state = Arc::new(ClashState {
         config: Arc::new(tokio::sync::RwLock::new(config)),
         stats: stats.clone(),
@@ -173,6 +173,7 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
         ebpf: Arc::new(tokio::sync::RwLock::new(
             Box::new(mock_ebpf) as Box<dyn honk_core::ebpf::EbpfBackend>
         )),
+        direct_offload_static: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         secret: secret.to_string(),
         external_ui: external_ui.to_string(),
         router: Arc::new(tokio::sync::RwLock::new(traffic_router)),
@@ -198,7 +199,7 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
         state,
         log_dispatch,
         db_path,
-        ebpf_direct_offload_writes,
+        ebpf_datapath_flags_writes,
         _tmp: tmp,
     }
 }
@@ -559,18 +560,27 @@ async fn test_global_selection_and_mode_persisted() {
     }
 }
 
-/// A mode switch over PATCH /configs flips the eBPF direct-offload flag:
-/// Rule offloads non-must direct flows in the kernel, Global/Direct keep
-/// them on the control-plane path so the mode override can re-decide them.
+/// A mode switch over PATCH /configs rewrites the datapath offload flags:
+/// Rule offloads direct-routed flows, Direct offloads every
+/// non-must/non-block flow, Global keeps only must-direct offload.  The
+/// static NO_DOMAIN_RULES bit rides along unchanged.
 #[tokio::test]
-async fn test_mode_switch_updates_direct_offload_flag() {
+async fn test_mode_switch_updates_datapath_flags() {
     let app = spawn_app("", "").await;
     let client = http_client();
 
-    let writes = || app.ebpf_direct_offload_writes.lock().unwrap().clone();
-    assert_eq!(writes(), Vec::<bool>::new());
+    use honk_ebpf_common::{
+        DATAPATH_FLAG_OFFLOAD_ALL as OFFLOAD_ALL, DATAPATH_FLAG_OFFLOAD_RULE_DIRECT as OFFLOAD_RULE,
+    };
 
-    for (mode, expect_offload) in [("global", false), ("direct", false), ("rule", true)] {
+    let writes = || app.ebpf_datapath_flags_writes.lock().unwrap().clone();
+    assert_eq!(writes(), Vec::<u32>::new());
+
+    for (mode, expect_flags) in [
+        ("global", 0),
+        ("direct", OFFLOAD_ALL),
+        ("rule", OFFLOAD_RULE),
+    ] {
         let resp = client
             .patch(app.url("/configs"))
             .json(&serde_json::json!({"mode": mode}))
@@ -578,11 +588,11 @@ async fn test_mode_switch_updates_direct_offload_flag() {
             .await
             .unwrap();
         assert_eq!(resp.status(), 204);
-        assert_eq!(writes().last().copied(), Some(expect_offload));
+        assert_eq!(writes().last().copied(), Some(expect_flags));
     }
-    assert_eq!(writes(), vec![false, false, true]);
+    assert_eq!(writes(), vec![0, OFFLOAD_ALL, OFFLOAD_RULE]);
 
-    // An invalid mode must not touch the datapath flag.
+    // An invalid mode must not touch the datapath flags.
     let resp = client
         .patch(app.url("/configs"))
         .json(&serde_json::json!({"mode": "bogus"}))
@@ -590,7 +600,7 @@ async fn test_mode_switch_updates_direct_offload_flag() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 400);
-    assert_eq!(writes(), vec![false, false, true]);
+    assert_eq!(writes(), vec![0, OFFLOAD_ALL, OFFLOAD_RULE]);
 }
 
 #[tokio::test]
@@ -1191,6 +1201,7 @@ async fn test_dns_query_upstream_and_nxdomain() {
         runtime_registry: app.state.runtime_registry.clone(),
         mode_state: app.state.mode_state.clone(),
         ebpf: app.state.ebpf.clone(),
+        direct_offload_static: app.state.direct_offload_static.clone(),
         secret: String::new(),
         external_ui: String::new(),
         router: app.state.router.clone(),

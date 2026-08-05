@@ -110,6 +110,10 @@ pub struct RoutingPushPlan {
     domain_bitmaps: HashMap<String, Vec<DomainRouting>>,
     lpm: LpmPushPlan,
     group_bitmaps: RoutingGroupBitmaps,
+    /// Any route references a domain-class matcher (negated or not), so a
+    /// kernel decision made without the destination domain is not final.
+    /// Drives the `DATAPATH_FLAG_OFFLOAD_NO_DOMAIN_RULES` static flag.
+    pub has_domain_rules: bool,
 }
 
 impl RoutingPushPlan {
@@ -255,6 +259,10 @@ impl RoutingMatcherBuilder {
         dial_mode: DialMode,
     ) -> anyhow::Result<RoutingPushPlan> {
         // Phase 1: compile the ruleset without touching any BPF map.
+        // Domain-class rules are scanned over the full (unsorted,
+        // uncapped) ruleset: even a rule that never reaches the kernel bank
+        // can still re-route a sniffed flow in userspace.
+        let has_domain_rules = routes.iter().any(|r| r.has_domain_conditions());
         let mut routes: Vec<&CompiledRoute> = routes.iter().collect();
         routes.sort_by_key(|r| r.priority);
 
@@ -373,6 +381,7 @@ impl RoutingMatcherBuilder {
             domain_bitmaps,
             lpm: lpm_plan,
             group_bitmaps,
+            has_domain_rules,
         })
     }
 
@@ -1415,6 +1424,38 @@ mod tests {
         assert_eq!(backend.active_routing_rule_count(), 2);
         assert_eq!(backend.source_lpm_bitmap.len(), 1);
         assert!(backend.dest_lpm_bitmap.is_empty());
+    }
+
+    #[test]
+    fn test_plan_has_domain_rules_flag() {
+        let mut outbound_map = HashMap::new();
+        outbound_map.insert("direct".to_string(), OutboundIndex::Direct as u8);
+
+        let plan = RoutingMatcherBuilder::compile(
+            &[make_route("ip-only", "direct")],
+            &outbound_map,
+            "direct",
+            DialMode::Ip,
+        )
+        .unwrap();
+        assert!(!plan.has_domain_rules);
+
+        let mut suffix_route = make_route("suffix", "direct");
+        suffix_route.domain_suffixes = vec!["example.com".into()];
+        let plan =
+            RoutingMatcherBuilder::compile(&[suffix_route], &outbound_map, "direct", DialMode::Ip)
+                .unwrap();
+        assert!(plan.has_domain_rules);
+
+        // Negated domain matchers also constrain offload: with an unknown
+        // domain the kernel evaluates them as non-matching, while userspace
+        // after SNI sniffing could veto the rule.
+        let mut negated_route = make_route("negated", "direct");
+        negated_route.not_domain_keywords = vec!["ads".into()];
+        let plan =
+            RoutingMatcherBuilder::compile(&[negated_route], &outbound_map, "direct", DialMode::Ip)
+                .unwrap();
+        assert!(plan.has_domain_rules);
     }
 
     #[test]
