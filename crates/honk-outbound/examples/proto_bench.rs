@@ -45,7 +45,9 @@ async fn bench_down(
     node: &Node,
     target: SocketAddr,
 ) -> anyhow::Result<Sample> {
-    let mut s = tcp.dial(node, target, None, Duration::from_secs(10)).await?;
+    let mut s = tcp
+        .dial(node, target, None, Duration::from_secs(10))
+        .await?;
     s.stream
         .write_all(b"GET /big.bin HTTP/1.1\r\nHost: bench\r\nConnection: close\r\n\r\n")
         .await?;
@@ -87,7 +89,9 @@ async fn bench_up(
     target: SocketAddr,
     bytes: u64,
 ) -> anyhow::Result<Sample> {
-    let mut s = tcp.dial(node, target, None, Duration::from_secs(10)).await?;
+    let mut s = tcp
+        .dial(node, target, None, Duration::from_secs(10))
+        .await?;
     s.stream
         .write_all(
             format!(
