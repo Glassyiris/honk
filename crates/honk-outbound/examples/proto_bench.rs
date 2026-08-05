@@ -64,15 +64,35 @@ async fn bench_down(
     }
     let ticks0 = cpu_ticks();
     let t0 = Instant::now();
+    let verify = std::env::args().any(|a| a == "verify=1");
+    let mut hasher = verify.then(|| {
+        use sha2::Digest;
+        sha2::Sha256::new()
+    });
     let mut total = 0u64;
     let mut buf = vec![0u8; 256 * 1024];
     loop {
         match tokio::time::timeout(Duration::from_secs(30), s.stream.read(&mut buf)).await {
             Ok(Ok(0)) => break,
-            Ok(Ok(n)) => total += n as u64,
+            Ok(Ok(n)) => {
+                if let Some(h) = hasher.as_mut() {
+                    use sha2::Digest;
+                    h.update(&buf[..n]);
+                }
+                total += n as u64;
+            }
             Ok(Err(e)) => anyhow::bail!("read error: {e}"),
             Err(_) => anyhow::bail!("read timeout"),
         }
+    }
+    if let Some(h) = hasher {
+        use sha2::Digest;
+        let digest: String = h
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        println!("down sha256({total}B): {digest}");
     }
     let secs = t0.elapsed().as_secs_f64();
     let ticks1 = cpu_ticks();
