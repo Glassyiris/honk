@@ -47,8 +47,7 @@ async fn link_lifecycle_held_until_detach_hooks() {
         Err(_) => return, // cgroup2 unavailable: nothing to attach, nothing to test
     };
     let cgroup_file = std::fs::File::open(&cgroup_path).unwrap();
-    let pin_root =
-        Path::new("/sys/fs/bpf").join(format!("honk-link-test-{}", std::process::id()));
+    let pin_root = Path::new("/sys/fs/bpf").join(format!("honk-link-test-{}", std::process::id()));
     // Other agents (systemd, …) may legitimately hold root-cgroup programs;
     // only the delta belongs to this backend.
     let baseline = cgroup_attached_prog_count(cgroup_file.as_raw_fd());
@@ -77,7 +76,11 @@ async fn link_lifecycle_held_until_detach_hooks() {
     );
 
     backend.detach_hooks().expect("detach_hooks");
-    assert_eq!(held_bpf_link_count(), 0, "detach_hooks must release every link");
+    assert_eq!(
+        held_bpf_link_count(),
+        0,
+        "detach_hooks must release every link"
+    );
     assert_eq!(
         cgroup_attached_prog_count(cgroup_file.as_raw_fd()),
         baseline,
