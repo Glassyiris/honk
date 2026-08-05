@@ -89,12 +89,22 @@ pub struct ClashState {
     /// Shared clash mode + GLOBAL selection (also held by the control
     /// plane, which applies the mode override on the outbound path).
     pub mode_state: SharedModeState,
+    /// Shared eBPF backend; a mode switch rewrites the datapath's offload
+    /// flags (Rule offloads direct-routed flows, Direct offloads every
+    /// non-must/non-block flow, Global keeps only must-direct offload).
+    pub ebpf: Arc<tokio::sync::RwLock<Box<dyn crate::ebpf::EbpfBackend>>>,
+    /// The static half of the offload policy (`NO_DOMAIN_RULES` or 0),
+    /// maintained by the control plane; composed with the mode bits here.
+    pub direct_offload_static: Arc<std::sync::atomic::AtomicU32>,
     /// Bearer secret from `experimental.clash_api.secret`; empty = no auth.
     pub secret: String,
     /// Shared connection pool (ready-pool hit/miss metrics in `/stats`).
     pub connection_pool: Arc<crate::pool::ConnectionPool>,
     /// External UI directory (`experimental.clash_api.external_ui`).
     pub external_ui: String,
+    /// Traffic router; the external-UI download routes its fetch through it
+    /// like user traffic.
+    pub router: Arc<tokio::sync::RwLock<crate::routing::Router>>,
     /// Active-level handle for the Clash API tracing layer.
     pub log_handle: logs::ClashLogHandle,
     pub dns_service: crate::dns::DnsService,
@@ -138,8 +148,16 @@ pub fn router(state: Arc<ClashState>) -> Router {
     if !state.external_ui.is_empty() {
         // sing-box server_resources.go: download the dashboard in the
         // background when the directory is missing/empty; ServeDir keeps
-        // returning 404 until the files land (never blocks startup).
-        ui::spawn_ui_download_if_needed(state.external_ui.clone());
+        // returning 404 until the files land (never blocks startup). The
+        // fetch follows the traffic routing decision (direct/block/proxy).
+        ui::spawn_ui_download_if_needed(ui::UiDownloadContext {
+            external_ui: state.external_ui.clone(),
+            router: state.router.clone(),
+            config: state.config.clone(),
+            group_manager: state.group_manager.clone(),
+            proxy_registry: state.proxy_registry.clone(),
+            runtime_registry: state.runtime_registry.clone(),
+        });
         app = app
             // 301 Moved Permanently, matching sing-box's RedirectHandler.
             .route(
@@ -339,6 +357,18 @@ async fn patch_configs(State(s): State<Arc<ClashState>>, body: Bytes) -> Respons
         s.mode_state.write().mode = mode.clone();
         if let Some(ref db) = s.cache_db {
             db.save_clash_mode(&mode);
+        }
+        // A failed write leaves the datapath out of sync with the mode: in
+        // Global the kernel would keep offloading flows past the mode
+        // override, so log at error level (the userspace mode still applies
+        // to every flow that does reach the control plane).  Established
+        // flows keep the offload decision they were created with — the new
+        // policy binds at flow creation only.
+        let flags = s.mode_state.read().direct_offload_mode_bits()
+            | s.direct_offload_static
+                .load(std::sync::atomic::Ordering::Relaxed);
+        if let Err(error) = s.ebpf.write().await.set_datapath_flags(flags) {
+            tracing::error!(%error, mode = %mode, "failed to update eBPF datapath offload flags");
         }
         tracing::info!("clash mode updated: {}", mode);
     }
@@ -1040,19 +1070,28 @@ fn connections_json_tracker(
                 .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339())
                 .unwrap_or_default();
 
+            let mut metadata = serde_json::json!({
+                "network": &e.network,
+                "type": &e.network,
+                "sourceIP": src_ip,
+                "destinationIP": dst_ip,
+                "sourcePort": src_port,
+                "destinationPort": dst_port,
+                "host": e.domain.clone().unwrap_or_default(),
+                "dnsMode": "normal",
+            });
+            // mihomo omits the process keys entirely for flows without
+            // process attribution (LAN-forwarded traffic has none).
+            if let Some(process) = &e.process {
+                metadata["process"] = serde_json::Value::String(process.clone());
+            }
+            if let Some(process_path) = &e.process_path {
+                metadata["processPath"] = serde_json::Value::String(process_path.clone());
+            }
+
             serde_json::json!({
                 "id": e.id,
-                "metadata": {
-                    "network": e.network,
-                    "type": e.network,
-                    "sourceIP": src_ip,
-                    "destinationIP": dst_ip,
-                    "sourcePort": src_port,
-                    "destinationPort": dst_port,
-                    "host": e.domain.clone().unwrap_or_default(),
-                    "dnsMode": "normal",
-                    "processPath": "",
-                },
+                "metadata": metadata,
                 "upload": e.upload,
                 "download": e.download,
                 "start": start,

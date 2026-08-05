@@ -60,6 +60,8 @@ struct TestApp {
     state: Arc<ClashState>,
     log_dispatch: tracing::Dispatch,
     db_path: std::path::PathBuf,
+    /// Every `set_datapath_flags` value the mock backend received.
+    ebpf_datapath_flags_writes: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
     _tmp: tempfile::TempDir,
 }
 
@@ -152,6 +154,12 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
     let runtime_registry = honk_outbound::runtime::OutboundRuntimeRegistry::build(&config.nodes)
         .unwrap()
         .into_shared();
+    let traffic_router =
+        honk_core::routing::Router::new(&config.routing.rules, &config.routing.default_outbound)
+            .unwrap();
+    let ebpf_datapath_flags_writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut mock_ebpf = honk_core::ebpf::mock::MockEbpfBackend::new();
+    mock_ebpf.datapath_flags_writes = ebpf_datapath_flags_writes.clone();
     let state = Arc::new(ClashState {
         config: Arc::new(tokio::sync::RwLock::new(config)),
         stats: stats.clone(),
@@ -162,8 +170,13 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
         proxy_registry: Arc::new(ProxyRegistry::default_resolver().unwrap()),
         runtime_registry,
         mode_state: Arc::new(parking_lot::RwLock::new(ModeState::new("Rule", "proxy"))),
+        ebpf: Arc::new(tokio::sync::RwLock::new(
+            Box::new(mock_ebpf) as Box<dyn honk_core::ebpf::EbpfBackend>
+        )),
+        direct_offload_static: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         secret: secret.to_string(),
         external_ui: external_ui.to_string(),
+        router: Arc::new(tokio::sync::RwLock::new(traffic_router)),
         log_handle,
         dns_service,
         connection_pool: Arc::new(honk_core::pool::ConnectionPool::new()),
@@ -186,6 +199,7 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
         state,
         log_dispatch,
         db_path,
+        ebpf_datapath_flags_writes,
         _tmp: tmp,
     }
 }
@@ -546,12 +560,56 @@ async fn test_global_selection_and_mode_persisted() {
     }
 }
 
+/// A mode switch over PATCH /configs rewrites the datapath offload flags:
+/// Rule offloads direct-routed flows, Direct offloads every
+/// non-must/non-block flow, Global keeps only must-direct offload.  The
+/// static NO_DOMAIN_RULES bit rides along unchanged.
+#[tokio::test]
+async fn test_mode_switch_updates_datapath_flags() {
+    let app = spawn_app("", "").await;
+    let client = http_client();
+
+    use honk_ebpf_common::{
+        DATAPATH_FLAG_OFFLOAD_ALL as OFFLOAD_ALL, DATAPATH_FLAG_OFFLOAD_RULE_DIRECT as OFFLOAD_RULE,
+    };
+
+    let writes = || app.ebpf_datapath_flags_writes.lock().unwrap().clone();
+    assert_eq!(writes(), Vec::<u32>::new());
+
+    for (mode, expect_flags) in [
+        ("global", 0),
+        ("direct", OFFLOAD_ALL),
+        ("rule", OFFLOAD_RULE),
+    ] {
+        let resp = client
+            .patch(app.url("/configs"))
+            .json(&serde_json::json!({"mode": mode}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204);
+        assert_eq!(writes().last().copied(), Some(expect_flags));
+    }
+    assert_eq!(writes(), vec![0, OFFLOAD_ALL, OFFLOAD_RULE]);
+
+    // An invalid mode must not touch the datapath flags.
+    let resp = client
+        .patch(app.url("/configs"))
+        .json(&serde_json::json!({"mode": "bogus"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    assert_eq!(writes(), vec![0, OFFLOAD_ALL, OFFLOAD_RULE]);
+}
+
 #[tokio::test]
 async fn test_connections_snapshot_and_delete() {
     let app = spawn_app("", "").await;
     let client = http_client();
 
-    // Inject one tracked connection.
+    // Inject one tracked connection with process attribution (as the eBPF
+    // handoff provides for locally-originated flows).
     let id = app.state.connection_tracker.register(ConnectionEntry {
         id: "conn-1".into(),
         source: "10.0.0.2:12345".into(),
@@ -565,6 +623,25 @@ async fn test_connections_snapshot_and_delete() {
         start_time: Instant::now(),
         domain: Some("example.com".into()),
         network: "tcp".into(),
+        process: Some("curl".into()),
+        process_path: Some("/usr/bin/curl".into()),
+    });
+    // A LAN-forwarded flow carries no process attribution.
+    app.state.connection_tracker.register(ConnectionEntry {
+        id: "conn-2".into(),
+        source: "192.168.1.10:4321".into(),
+        destination: "1.1.1.1:443".into(),
+        proxy: "proxy".into(),
+        rule: "Match".into(),
+        rule_payload: String::new(),
+        chains: vec!["node-a".into(), "proxy".into()],
+        upload: std::sync::Arc::new(AtomicU64::new(0)),
+        download: std::sync::Arc::new(AtomicU64::new(0)),
+        start_time: Instant::now(),
+        domain: None,
+        network: "udp".into(),
+        process: None,
+        process_path: None,
     });
 
     let body: serde_json::Value = client
@@ -576,13 +653,14 @@ async fn test_connections_snapshot_and_delete() {
         .await
         .unwrap();
     let conns = body["connections"].as_array().unwrap();
-    assert_eq!(conns.len(), 1);
-    let c = &conns[0];
-    assert_eq!(c["id"], id);
+    assert_eq!(conns.len(), 2);
+    let c = conns.iter().find(|c| c["id"] == id).unwrap();
     assert_eq!(c["metadata"]["sourceIP"], "10.0.0.2");
     assert_eq!(c["metadata"]["destinationIP"], "142.250.72.14");
     assert_eq!(c["metadata"]["sourcePort"], "12345");
     assert_eq!(c["metadata"]["host"], "example.com");
+    assert_eq!(c["metadata"]["process"], "curl");
+    assert_eq!(c["metadata"]["processPath"], "/usr/bin/curl");
     assert_eq!(c["upload"], 100);
     assert_eq!(c["download"], 200);
     assert_eq!(c["rule"], "suffix");
@@ -595,6 +673,10 @@ async fn test_connections_snapshot_and_delete() {
     // RFC3339 start timestamp.
     let start = c["start"].as_str().unwrap();
     assert!(chrono::DateTime::parse_from_rfc3339(start).is_ok());
+    // A flow without process attribution omits both process keys entirely.
+    let c2 = conns.iter().find(|c| c["id"] == "conn-2").unwrap();
+    assert!(c2["metadata"].get("process").is_none());
+    assert!(c2["metadata"].get("processPath").is_none());
     assert_eq!(body["uploadTotal"], 100);
     assert_eq!(body["downloadTotal"], 200);
 
@@ -613,7 +695,9 @@ async fn test_connections_snapshot_and_delete() {
         .json()
         .await
         .unwrap();
-    assert_eq!(body["connections"].as_array().unwrap().len(), 0);
+    let remaining = body["connections"].as_array().unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0]["id"], "conn-2");
 }
 
 /// Plaintext HTTP server answering 204 to everything.
@@ -987,6 +1071,8 @@ async fn test_connections_ws_stream() {
         start_time: Instant::now(),
         domain: None,
         network: "tcp".into(),
+        process: None,
+        process_path: None,
     });
 
     let ws_url = format!("ws://{}/connections?interval=200", app.addr);
@@ -1114,8 +1200,11 @@ async fn test_dns_query_upstream_and_nxdomain() {
         proxy_registry: app.state.proxy_registry.clone(),
         runtime_registry: app.state.runtime_registry.clone(),
         mode_state: app.state.mode_state.clone(),
+        ebpf: app.state.ebpf.clone(),
+        direct_offload_static: app.state.direct_offload_static.clone(),
         secret: String::new(),
         external_ui: String::new(),
+        router: app.state.router.clone(),
         log_handle: app.state.log_handle.clone(),
         dns_service: nx_service,
         connection_pool: app.state.connection_pool.clone(),

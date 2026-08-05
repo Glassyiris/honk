@@ -1,10 +1,12 @@
 //! honk-tool — CLI toolbox for honk diagnostics.
 //!
 //! Currently implemented: `sub` (subscription availability check),
-//! `bpf` (pinned-map quick reads), `diagnose` (one-shot health check).
+//! `bpf` (pinned-map quick reads), `diagnose` (one-shot health check),
+//! `geosite` / `geoip` (dat file content search).
 
 mod bpf;
 mod diagnose;
+mod geo;
 mod sub;
 
 use clap::{Parser, Subcommand};
@@ -25,6 +27,11 @@ enum Command {
     Bpf(bpf::BpfArgs),
     /// One-shot health check of a running honk engine.
     Diagnose(diagnose::DiagnoseArgs),
+    /// Search geosite.dat: list categories, show entries (with @attr),
+    /// reverse-lookup a domain.
+    Geosite(geo::GeositeArgs),
+    /// Search geoip.dat: list codes, show CIDRs, longest-prefix IP lookup.
+    Geoip(geo::GeoipArgs),
 }
 
 #[tokio::main]
@@ -40,5 +47,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Sub(args) => sub::run(args).await,
         Command::Bpf(args) => bpf::run(args).await,
         Command::Diagnose(args) => diagnose::run(args).await,
+        Command::Geosite(args) => geo::run_geosite(args),
+        Command::Geoip(args) => geo::run_geoip(args),
     }
 }

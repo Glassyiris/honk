@@ -21,8 +21,8 @@
 | `so_mark_from_dae` | u32 | `0` | honk 打开套接字的可选 SO_MARK |
 | `log_level` | string | `"info"` | `trace`/`debug`/`info`/`warn`/`error` |
 | `disable_waiting_network` | bool | `false` | 启动时不等待网络就绪 |
-| `lan_interface` | string[] | `[]` | 拦截的 LAN 网卡；空 = 不拦截；逗号分隔 |
-| `wan_interface` | string[] | `[]` | WAN 网卡；dae 允许 `auto`；逗号分隔 |
+| `lan_interface` | string[] | `[]` | 拦截的 LAN 网卡；空时不安装任何 LAN hook；逗号分隔 |
+| `wan_interface` | string[] | `[]` | 拦截本机发起 TCP/UDP 的 WAN 网卡；支持 `auto`；逗号分隔 |
 | `auto_config_kernel_parameter` | bool | `false` | 自动 sysctl（需 root） |
 | `tcp_check_url` | string[] | Cloudflare HTTP + 1.1.1.1 + IPv6 | TCP 健康检查目标；逗号分隔 |
 | `tcp_check_http_method` | string | `"HEAD"` | URL 检查的 HTTP 方法 |
@@ -337,7 +337,7 @@ domain/geosite matcher 视为"不是 x"，不会被其否决。
 | `pname` | `process_name` |
 | `mac` / `dscp` / `ipversion` | 同名字段 |
 
-`domain` 参数标签：裸值/`suffix:` → 后缀；`keyword:`；`full:`；`regex:`；`geosite:`（`@` → `-`）。
+`domain` 参数标签：裸值/`suffix:` → 后缀；`keyword:`；`full:`；`regex:`；`geosite:`（原样匹配；`category@attr` 按条目属性名过滤，同 dae 语义——大小写不敏感，第一个 `@` 之后整体为选择器；展开为零匹配时告警且永不命中）。
 
 ### 复杂出站（仅结构化模型）
 

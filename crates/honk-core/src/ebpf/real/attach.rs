@@ -6,7 +6,7 @@ impl RealEbpfBackend {
         pin_root: &Path,
         tproxy_port: u16,
         tproxy_mark: u32,
-        lan_ifname: &str,
+        lan_ifname: Option<&str>,
         wan_ifname: &str,
         single_homed: bool,
     ) -> anyhow::Result<Self> {
@@ -29,15 +29,23 @@ impl RealEbpfBackend {
                 mac
             })
             .unwrap_or([0u8; 6]);
+        let ebpf_lan_ifname = lan_ifname
+            .map(|name| Self::bridge_interface(name).unwrap_or_else(|| name.to_string()))
+            .unwrap_or_default();
         // Determine the actual WAN interface (bond master if the configured
         // interface is a slave) so the eBPF datapath can identify locally-
         // generated packets that the bonding driver forwards onto the master.
         let ebpf_wan_ifname = if single_homed {
-            Self::bridge_interface(lan_ifname).unwrap_or_else(|| lan_ifname.to_string())
+            ebpf_lan_ifname.clone()
         } else {
             Self::bridge_interface(wan_ifname).unwrap_or_else(|| wan_ifname.to_string())
         };
         let wan_ifindex = Self::iface_ifindex(&ebpf_wan_ifname);
+        let local_ifname = if ebpf_lan_ifname.is_empty() {
+            &ebpf_wan_ifname
+        } else {
+            &ebpf_lan_ifname
+        };
 
         // Enable bpf_redirect_peer on kernels >= 6.8, and also on backported
         // LTS kernels that received the CVE-2024-37959 fix:
@@ -79,7 +87,7 @@ impl RealEbpfBackend {
             use_redirect_peer,
             dae_socket_mark: DAE_BYPASS_MARK,
             control_plane_pid: std::process::id(),
-            local_ip: Self::iface_ipv4(lan_ifname),
+            local_ip: Self::iface_ipv4(local_ifname),
             ..Default::default()
         };
         debug!(
@@ -236,27 +244,28 @@ impl RealEbpfBackend {
             .map_err(|e| anyhow::anyhow!("OUTBOUND_CONNECTIVITY_MAP init: {}", e))?;
         }
 
-        // If the configured LAN interface is a bridge slave, attach the eBPF
-        // programs to the bridge master instead.  This lets a single eBPF
-        // attachment handle all containers on the bridge, rather than only the
-        // one specific veth configured as lan_interface.
-        let ebpf_lan_ifname =
-            Self::bridge_interface(lan_ifname).unwrap_or_else(|| lan_ifname.to_string());
-        info!(
-            "Attaching eBPF TC programs to LAN interface: {} (configured: {})",
-            ebpf_lan_ifname, lan_ifname
-        );
-        if let Err(e) = aya::programs::tc::qdisc_add_clsact(&ebpf_lan_ifname) {
-            let msg = e.to_string();
-            if !msg.contains("File exists") && !msg.contains("Exclusivity flag") {
-                warn!("failed to add clsact qdisc to {}: {}", ebpf_lan_ifname, e);
+        if ebpf_lan_ifname.is_empty() {
+            info!("LAN interception disabled; attaching only configured WAN hooks");
+        } else {
+            info!(
+                "Attaching eBPF TC programs to LAN interface: {} (configured: {})",
+                ebpf_lan_ifname,
+                lan_ifname.unwrap_or_default()
+            );
+            if let Err(e) = aya::programs::tc::qdisc_add_clsact(&ebpf_lan_ifname) {
+                let msg = e.to_string();
+                if !msg.contains("File exists") && !msg.contains("Exclusivity flag") {
+                    warn!("failed to add clsact qdisc to {}: {}", ebpf_lan_ifname, e);
+                }
             }
         }
         let (lan_ingress_prog, lan_egress_prog) = Self::lan_program_pair(&ebpf_lan_ifname);
 
         // Attach LAN programs and take ownership of the links so they stay alive
         // and can be explicitly detached on shutdown.
-        let lan_ingress_link = {
+        let lan_ingress_link = if ebpf_lan_ifname.is_empty() {
+            None
+        } else {
             let id = Self::attach_tc(&mut bpf, lan_ingress_prog, &ebpf_lan_ifname)
                 .map_err(|e| anyhow::anyhow!("attach {}: {}", lan_ingress_prog, e))?;
             let p: &mut aya::programs::SchedClassifier = bpf
@@ -268,7 +277,9 @@ impl RealEbpfBackend {
         // In a single-homed setup (LAN and WAN share the same physical
         // interface) attaching lan_egress to the host's only outbound interface
         // would drop the host's own traffic. Attach only ingress in that case.
-        let lan_egress_link = if single_homed {
+        let lan_egress_link = if ebpf_lan_ifname.is_empty() {
+            None
+        } else if single_homed {
             info!("Single-homed interface detected; skipping lan_egress attach");
             None
         } else {
@@ -374,7 +385,11 @@ impl RealEbpfBackend {
         // without that the watcher's `dynamic_hooked` dedup never sees them
         // and retries the attach every tick, failing with AlreadyExists.
         let mut dynamic_links = Vec::new();
-        let br_slaves = Self::bridge_slaves(&ebpf_lan_ifname);
+        let br_slaves = if ebpf_lan_ifname.is_empty() {
+            Vec::new()
+        } else {
+            Self::bridge_slaves(&ebpf_lan_ifname)
+        };
         if !br_slaves.is_empty() {
             info!(
                 "Bridge master {} has slaves {:?}; attaching LAN programs to bridge slaves",
@@ -442,16 +457,20 @@ impl RealEbpfBackend {
         // slaves above, the links go into `dynamic_links` so the watcher's
         // `dynamic_hooked` dedup sees them and does not stack a duplicate
         // hook on the first reconcile.
-        let slaves = Self::bond_slaves(&ebpf_lan_ifname);
-        if !slaves.is_empty() {
+        let lan_slaves = if ebpf_lan_ifname.is_empty() {
+            Vec::new()
+        } else {
+            Self::bond_slaves(&ebpf_lan_ifname)
+        };
+        if !lan_slaves.is_empty() {
             info!(
                 "Bond master {} has slaves {:?}; attaching lan_ingress to slaves",
-                ebpf_lan_ifname, slaves
+                ebpf_lan_ifname, lan_slaves
             );
             // The ingress program is already loaded for the master; reuse the
             // same loaded program object and attach it to each slave.
             let slave_dir = aya::programs::TcAttachType::Ingress;
-            for slave in &slaves {
+            for slave in &lan_slaves {
                 if let Err(e) = aya::programs::tc::qdisc_add_clsact(slave) {
                     warn!("failed to add clsact qdisc to slave {}: {}", slave, e);
                 }
@@ -478,17 +497,23 @@ impl RealEbpfBackend {
             }
         }
 
-        // For bond masters, outbound packets may leave via a slave without
-        // traversing the master's egress qdisc. Attach wan_egress to each slave
-        // so locally-generated traffic is intercepted regardless of the bond's
-        // egress slave selection.
-        if !slaves.is_empty() {
+        // Preserve the LAN-bond egress hooks used by single-homed setups, then
+        // add WAN-bond slaves so WAN-only hosts cover the same physical path.
+        let mut wan_egress_slaves = lan_slaves.clone();
+        if !ebpf_wan_ifname.is_empty() {
+            for slave in Self::bond_slaves(&ebpf_wan_ifname) {
+                if !wan_egress_slaves.contains(&slave) {
+                    wan_egress_slaves.push(slave);
+                }
+            }
+        }
+        if !wan_egress_slaves.is_empty() {
             info!(
-                "Bond master {} has slaves {:?}; attaching wan_egress to slaves",
-                ebpf_wan_ifname, slaves
+                "Attaching wan_egress to bond slaves {:?}",
+                wan_egress_slaves
             );
             let slave_dir = aya::programs::TcAttachType::Egress;
-            for slave in &slaves {
+            for slave in &wan_egress_slaves {
                 if let Err(e) = aya::programs::tc::qdisc_add_clsact(slave) {
                     warn!("failed to add clsact qdisc to slave {}: {}", slave, e);
                 }

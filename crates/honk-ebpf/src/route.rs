@@ -155,6 +155,10 @@ pub enum RouteStateFlags {
     GoodSubrule = 1 << 1,
     Must = 1 << 2,
     DnsQuery = 1 << 3,
+    /// The flow's destination domain was found in `DOMAIN_ROUTING_MAP`
+    /// (DNS-learned), so every domain-set evaluation on this route pass used
+    /// a complete bitmap and the decision needs no SNI re-evaluation.
+    DomainKnown = 1 << 4,
 }
 
 #[repr(C)]
@@ -219,6 +223,7 @@ impl RouteCtx {
             self.domain_word_idx = bitmap_word_idx;
             match unsafe { DOMAIN_ROUTING_MAP.get(key) } {
                 Some(domain_routing) => {
+                    self.route_state |= RouteStateFlags::DomainKnown as u8;
                     let idx = core::hint::black_box(bitmap_word_idx).min(max_word_idx) as usize;
                     self.domain_word_bits = domain_routing.bitmap[idx];
                 }

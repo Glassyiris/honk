@@ -150,13 +150,25 @@ experimental {
 
 | 主题 | 关键字段 | 建议 |
 | ------ | ---------- | ------ |
-| 拦截网卡 | `lan_interface`、`wan_interface` | LAN 为空则不拦截 LAN。`auto` 解析默认路由网卡 |
+| 拦截网卡 | `lan_interface`、`wan_interface` | 省略 LAN 时不安装任何 LAN hook；已配置的 WAN hook 仍代理本机发起的 TCP/UDP。`auto` 解析默认路由网卡 |
 | 监听 | `tproxy_port` | 默认 `12345`；`tproxy_mark`（默认 `0x08000000`）在 dae 语法中不可设置 |
 | 内核 | `auto_config_kernel_parameter` | 需 root；自动设置有用的 sysctl |
 | 健康检查 | `tcp_check_url`、`udp_check_dns`、`check_interval`、`check_tolerance` | 驱动 AliveDialerSet / URLTest；时长写作 `30s` / `50ms` |
 | 拨号 | `dial_mode` | `ip` / `domain` / `domain+` / `domain++` |
 | 解析 | `bootstrap_resolver`、`fallback_resolver` | 解析节点域名时避免自拦截死锁 |
 | 超时 | `connect_timeout_ms`、`dns_resolve_timeout_ms`、`relay_idle_timeout_secs` | dae 语法暂不解析这些字段，使用内置默认值 |
+
+**仅代理本机流量：** 主机没有需要拦截的下游 LAN 流量时，省略 `lan_interface`：
+
+```dae
+global {
+    wan_interface: ens3
+    dial_mode: ip
+}
+```
+
+此模式只安装 WAN ingress/egress hook。本机创建并经 `ens3` 发出的 TCP/UDP 会进入 honk；转发的 LAN 流量和 loopback 流量不受影响。不要把 `lo` 当作虚拟 LAN 接口加入配置。
+
 
 **拨号模式：**
 
@@ -264,7 +276,7 @@ routing {
 
 **Must 规则**（`-> direct(must)`）：命中不终结，继续匹配并传播 must 语义（兼容 Go dae）。Clash 的 Global/Direct 模式不会覆盖 must/block。
 
-Geo 资源：将 `geoip.dat` / `geosite.dat` 放到运行时可加载的位置（开发时常用仓库根目录副本）。
+Geo 资源：将 `geoip.dat` / `geosite.dat` 放到运行时可加载的位置（开发时常用仓库根目录副本）。geosite 类目支持 dae 的属性过滤：`domain(geosite: category-games@cn)` 只保留带 `@cn` 属性的条目（属性名大小写不敏感；第一个 `@` 之后整体作为选择器）。展开为零匹配的 code（类目不存在或属性无命中）会告警且永不命中。
 
 ### 路由片段
 
@@ -386,7 +398,7 @@ experimental {
 
 常用接口：`/proxies`、`/proxies/{name}`（PUT 切换 Selector）、delay、`/connections`、`/traffic`、`/logs`、`/dns/query`、`/stats`。
 
-环境变量：`HONK_UI_DOWNLOAD_URL` 可覆盖默认 zashboard zip（当 `external_ui` 目录为空/不存在时后台下载）。
+环境变量：`HONK_UI_DOWNLOAD_URL` 可覆盖默认 zashboard zip（当 `external_ui` 目录为空/不存在时后台下载）。下载走与用户流量相同的路由判定（Router + 组选择）：`direct` 直连下载，`block` 放弃下载，其余 outbound 经所选节点隧道下载。
 
 ### 缓存文件
 

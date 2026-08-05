@@ -110,6 +110,10 @@ pub struct RoutingPushPlan {
     domain_bitmaps: HashMap<String, Vec<DomainRouting>>,
     lpm: LpmPushPlan,
     group_bitmaps: RoutingGroupBitmaps,
+    /// Any route references a domain-class matcher (negated or not), so a
+    /// kernel decision made without the destination domain is not final.
+    /// Drives the `DATAPATH_FLAG_OFFLOAD_NO_DOMAIN_RULES` static flag.
+    pub has_domain_rules: bool,
 }
 
 impl RoutingPushPlan {
@@ -255,6 +259,10 @@ impl RoutingMatcherBuilder {
         dial_mode: DialMode,
     ) -> anyhow::Result<RoutingPushPlan> {
         // Phase 1: compile the ruleset without touching any BPF map.
+        // Domain-class rules are scanned over the full (unsorted,
+        // uncapped) ruleset: even a rule that never reaches the kernel bank
+        // can still re-route a sniffed flow in userspace.
+        let has_domain_rules = routes.iter().any(|r| r.has_domain_conditions());
         let mut routes: Vec<&CompiledRoute> = routes.iter().collect();
         routes.sort_by_key(|r| r.priority);
 
@@ -373,6 +381,7 @@ impl RoutingMatcherBuilder {
             domain_bitmaps,
             lpm: lpm_plan,
             group_bitmaps,
+            has_domain_rules,
         })
     }
 
@@ -909,8 +918,22 @@ impl RoutingMatcherBuilder {
         }
     }
 
+    fn process_name_value(name: &str) -> [u32; TASK_COMM_LEN / 4] {
+        let mut bytes = [0u8; TASK_COMM_LEN];
+        let len = name.len().min(TASK_COMM_LEN - 1);
+        bytes[..len].copy_from_slice(&name.as_bytes()[..len]);
+
+        let mut value = [0u32; TASK_COMM_LEN / 4];
+        let (chunks, _) = bytes.as_chunks::<4>();
+        for (word, chunk) in value.iter_mut().zip(chunks) {
+            *word = u32::from_ne_bytes(*chunk);
+        }
+
+        value
+    }
+
     /// Append one MatchSet per process name, ORing multiple names with LogicalOr.
-    /// Each name is truncated to TASK_COMM_LEN (16 bytes) and stored as [u32; 4].
+    /// Linux reserves the final TASK_COMM_LEN byte for a trailing NUL.
     fn push_process_name_match_sets(
         names: &[String],
         not: u8,
@@ -927,16 +950,7 @@ impl RoutingMatcherBuilder {
             } else {
                 OutboundIndex::LogicalOr as u8
             };
-            let mut pname = [0u32; 4];
-            let src = name.as_bytes();
-            let len = src.len().min(TASK_COMM_LEN);
-            // SAFETY: pname is [u32; 4] = 16 bytes, same size as TASK_COMM_LEN.
-            let dst = &mut pname as *mut [u32; 4] as *mut u8;
-            for (i, &b) in src.iter().enumerate().take(len) {
-                unsafe {
-                    *dst.add(i) = b;
-                }
-            }
+            let pname = Self::process_name_value(name);
             match_sets.push(MatchSet {
                 value: MatchSetValue { pname },
                 not,
@@ -1307,6 +1321,13 @@ mod tests {
         assert_eq!(parse_mac_to_bytes(""), None);
     }
 
+    #[test]
+    fn test_process_name_value_matches_kernel_comm_truncation() {
+        let value = RoutingMatcherBuilder::process_name_value("systemd-resolved");
+        let bytes: Vec<u8> = value.into_iter().flat_map(u32::to_ne_bytes).collect();
+        assert_eq!(bytes.as_slice(), b"systemd-resolve\0");
+    }
+
     fn make_route(name: &str, outbound: &str) -> CompiledRoute {
         CompiledRoute {
             name: name.into(),
@@ -1403,6 +1424,38 @@ mod tests {
         assert_eq!(backend.active_routing_rule_count(), 2);
         assert_eq!(backend.source_lpm_bitmap.len(), 1);
         assert!(backend.dest_lpm_bitmap.is_empty());
+    }
+
+    #[test]
+    fn test_plan_has_domain_rules_flag() {
+        let mut outbound_map = HashMap::new();
+        outbound_map.insert("direct".to_string(), OutboundIndex::Direct as u8);
+
+        let plan = RoutingMatcherBuilder::compile(
+            &[make_route("ip-only", "direct")],
+            &outbound_map,
+            "direct",
+            DialMode::Ip,
+        )
+        .unwrap();
+        assert!(!plan.has_domain_rules);
+
+        let mut suffix_route = make_route("suffix", "direct");
+        suffix_route.domain_suffixes = vec!["example.com".into()];
+        let plan =
+            RoutingMatcherBuilder::compile(&[suffix_route], &outbound_map, "direct", DialMode::Ip)
+                .unwrap();
+        assert!(plan.has_domain_rules);
+
+        // Negated domain matchers also constrain offload: with an unknown
+        // domain the kernel evaluates them as non-matching, while userspace
+        // after SNI sniffing could veto the rule.
+        let mut negated_route = make_route("negated", "direct");
+        negated_route.not_domain_keywords = vec!["ads".into()];
+        let plan =
+            RoutingMatcherBuilder::compile(&[negated_route], &outbound_map, "direct", DialMode::Ip)
+                .unwrap();
+        assert!(plan.has_domain_rules);
     }
 
     #[test]

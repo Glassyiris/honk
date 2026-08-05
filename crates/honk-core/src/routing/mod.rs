@@ -10,6 +10,20 @@ mod lpm;
 pub(crate) use geo::GeoAssets;
 pub(crate) use lpm::BinaryLpmTrie;
 
+// Read-only dat scan API consumed by honk-tool (`geosite`/`geoip`
+// subcommands); separate from the routing hot path.
+pub use geo::{
+    GeoipCategory, GeoipScan, GeositeCategory, GeositeEntry, GeositeKind, GeositeScan,
+    find_geoip_dat, find_geosite_dat,
+};
+const KERNEL_COMM_VISIBLE_LEN: usize = honk_ebpf_common::TASK_COMM_LEN - 1;
+
+fn normalize_process_matcher(name: &str) -> String {
+    let bytes = name.as_bytes();
+    let len = bytes.len().min(KERNEL_COMM_VISIBLE_LEN);
+    String::from_utf8_lossy(&bytes[..len]).into_owned()
+}
+
 #[derive(Debug, Clone)]
 pub struct CompiledRoute {
     pub name: String,
@@ -68,6 +82,24 @@ pub struct CompiledRoute {
     /// tells the control plane to skip TLS/HTTP sniffing.
     pub must: bool,
     pub mark: u32,
+}
+
+impl CompiledRoute {
+    /// Whether the rule references any domain-class matcher (suffix, keyword,
+    /// geosite, regex; negated or not).  While any such rule exists, a
+    /// kernel routing decision made without the destination domain is not
+    /// final — userspace SNI sniffing could re-route the flow — so the
+    /// datapath's Rule-mode direct offload stays constrained.
+    pub fn has_domain_conditions(&self) -> bool {
+        !self.domain_suffixes.is_empty()
+            || !self.domain_keywords.is_empty()
+            || !self.geosite_domains.is_empty()
+            || !self.domain_patterns.is_empty()
+            || !self.not_domain_suffixes.is_empty()
+            || !self.not_domain_keywords.is_empty()
+            || !self.not_geosite_domains.is_empty()
+            || !self.not_domain_patterns.is_empty()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -334,7 +366,12 @@ impl Router {
                 ports,
                 source_ports,
                 protocols: rule.condition.protocol.clone(),
-                process_names: rule.condition.process_name.clone(),
+                process_names: rule
+                    .condition
+                    .process_name
+                    .iter()
+                    .map(|name| normalize_process_matcher(name))
+                    .collect(),
                 mac_addresses,
                 geosite_domains,
                 geosite_matcher,
@@ -350,7 +387,12 @@ impl Router {
                 not_ports,
                 not_source_ports,
                 not_protocols: not.protocol.clone(),
-                not_process_names: not.process_name.clone(),
+                not_process_names: not
+                    .process_name
+                    .iter()
+                    .map(|name| normalize_process_matcher(name))
+                    .collect(),
+
                 not_mac_addresses,
                 not_geosite_domains,
                 not_geosite_matcher,

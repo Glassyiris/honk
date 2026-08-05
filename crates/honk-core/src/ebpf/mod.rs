@@ -114,6 +114,9 @@ pub enum IfaceRole {
     /// the slave without touching the master's qdiscs, so it gets
     /// lan_ingress + wan_egress (mirrors the startup expansion).
     LanBondSlave,
+    /// Slave of a WAN bond master: locally-originated traffic can bypass the
+    /// master's egress qdisc, so only wan_egress belongs on this interface.
+    WanBondSlave,
 }
 
 /// Per-direction outcome of a dynamic attach: which hooks are live on the
@@ -165,6 +168,17 @@ pub trait EbpfBackend: Send + Sync {
     /// Open or close admission at the TC entry points. Implementations must
     /// publish listener sockets before setting this to `true`.
     fn set_datapath_ready(&mut self, _ready: bool) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Write the mode-based direct-offload policy (the
+    /// `DATAPATH_FLAG_OFFLOAD_*` bits) into `DATAPATH_FLAGS_MAP`.  The
+    /// control plane recomputes and pushes the full word on startup, at the
+    /// reload commit point, and on every clash mode switch; `lan_ingress`
+    /// reads it once per new flow and caches the decision per flow, so the
+    /// write takes effect for new flows only — established flows keep the
+    /// decision they were created with.
+    fn set_datapath_flags(&mut self, _flags: u32) -> anyhow::Result<()> {
         Ok(())
     }
 

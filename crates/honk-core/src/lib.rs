@@ -83,6 +83,36 @@ fn raise_nofile_rlimit() -> anyhow::Result<usize> {
         .min(control::MAX_EFFECTIVE_NOFILE))
 }
 
+#[cfg(feature = "ebpf")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfiguredInterfaces {
+    pub(crate) lan: Vec<String>,
+    pub(crate) wan: Vec<String>,
+    pub(crate) single_homed: bool,
+}
+
+#[cfg(feature = "ebpf")]
+pub(crate) fn configured_interfaces(config: &honk_config::Config) -> ConfiguredInterfaces {
+    let lan: Vec<String> = config
+        .global
+        .lan_interface
+        .iter()
+        .map(|name| resolve_interface(name))
+        .collect();
+    let wan: Vec<String> = config
+        .global
+        .wan_interface
+        .iter()
+        .map(|name| resolve_interface(name))
+        .collect();
+    let single_homed = !wan.is_empty() && lan.iter().any(|name| wan.contains(name));
+    ConfiguredInterfaces {
+        lan,
+        wan,
+        single_homed,
+    }
+}
+
 /// Resolve an interface name, expanding `"auto"` or empty to the default route interface.
 #[cfg(feature = "ebpf")]
 pub(crate) fn resolve_interface(name: &str) -> String {
@@ -455,6 +485,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     );
 
     let mock_mode = cli.mock_ebpf || cfg!(not(feature = "ebpf"));
+    #[cfg(feature = "ebpf")]
+    let configured_ifaces = configured_interfaces(&config);
 
     // Singleton guard: the datapath uses fixed names (dae0, daens, TC
     // hooks), and a stopping instance's cleanup destroys them. A second
@@ -488,16 +520,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         #[cfg(feature = "ebpf")]
         {
-            let lan_ifname = resolve_interface(
-                config
-                    .global
-                    .lan_interface
-                    .first()
-                    .map(|s| s.as_str())
-                    .unwrap_or("lo"),
-            );
-            let _ = set_sysctl(&format!("net.ipv4.conf.{}.rp_filter", lan_ifname), "0");
-            _dae0_guard = Some(create_dae0_veth(&lan_ifname)?);
+            if let Some(lan_ifname) = configured_ifaces.lan.first() {
+                let _ = set_sysctl(&format!("net.ipv4.conf.{}.rp_filter", lan_ifname), "0");
+            }
+            _dae0_guard = Some(create_dae0_veth()?);
             info!(
                 "dae0 veth created before eBPF load (ifindex={})",
                 _dae0_guard.as_ref().unwrap().ifindex
@@ -532,39 +558,18 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     DEFAULT_BPF_OBJECT.to_vec()
                 }
             };
-            let lan_ifnames: Vec<String> = if config.global.lan_interface.is_empty() {
-                vec!["lo".to_string()]
-            } else {
-                config
-                    .global
-                    .lan_interface
-                    .iter()
-                    .map(|s| resolve_interface(s))
-                    .collect()
-            };
-            let wan_ifnames: Vec<String> = if config.global.wan_interface.is_empty() {
-                vec![]
-            } else {
-                config
-                    .global
-                    .wan_interface
-                    .iter()
-                    .map(|s| resolve_interface(s))
-                    .collect()
-            };
-            let single_homed =
-                !wan_ifnames.is_empty() && lan_ifnames.iter().any(|l| wan_ifnames.contains(l));
-            let primary_lan =
-                resolve_interface(lan_ifnames.first().map(|s| s.as_str()).unwrap_or("lo"));
-            let primary_wan =
-                resolve_interface(wan_ifnames.first().map(|s| s.as_str()).unwrap_or(""));
+            let lan_ifnames = &configured_ifaces.lan;
+            let wan_ifnames = &configured_ifaces.wan;
+            let single_homed = configured_ifaces.single_homed;
+            let primary_lan = lan_ifnames.first().map(String::as_str);
+            let primary_wan = wan_ifnames.first().map(String::as_str).unwrap_or("");
             let mut backend = ebpf::real::RealEbpfBackend::load(
                 &bpf_object_bytes,
                 &cli.bpf_pin_root,
                 config.global.tproxy_port,
                 config.global.tproxy_mark,
-                &primary_lan,
-                &primary_wan,
+                primary_lan,
+                primary_wan,
                 single_homed,
             )
             .await?;
@@ -574,9 +579,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     .ok()
                     .and_then(|s| s.trim().parse().ok())
             };
-            if let Some(i) = ifindex_of(&primary_lan) {
+            if let Some(primary_lan) = primary_lan
+                && let Some(i) = ifindex_of(primary_lan)
+            {
                 attached_ifaces.insert(
-                    primary_lan.clone(),
+                    primary_lan.to_string(),
                     (
                         i,
                         ebpf::DynamicHooks {
@@ -588,10 +595,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
             if !single_homed
                 && !primary_wan.is_empty()
-                && let Some(i) = ifindex_of(&primary_wan)
+                && let Some(i) = ifindex_of(primary_wan)
             {
                 attached_ifaces.insert(
-                    primary_wan.clone(),
+                    primary_wan.to_string(),
                     (
                         i,
                         ebpf::DynamicHooks {
@@ -855,9 +862,12 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                         proxy_registry: control_plane.proxy_registry(),
                         runtime_registry: control_plane.runtime_registry(),
                         mode_state,
+                        ebpf: control_plane.ebpf_handle(),
+                        direct_offload_static: control_plane.direct_offload_static_handle(),
                         secret: clash_cfg.secret.clone(),
                         connection_pool: control_plane.connection_pool(),
                         external_ui: clash_cfg.external_ui.clone(),
+                        router: control_plane.traffic_router(),
                         log_handle: clash_log_handle.clone(),
                         dns_service: control_plane.dns_service(),
                         stream_samplers,
@@ -1167,9 +1177,7 @@ impl Drop for Dae0Guard {
 }
 
 #[cfg(feature = "ebpf")]
-fn create_dae0_veth(lan_ifname: &str) -> anyhow::Result<Dae0Guard> {
-    let _ = lan_ifname; // kept for symmetry with call site; dae0 sysctls don't need it
-
+fn create_dae0_veth() -> anyhow::Result<Dae0Guard> {
     let mut guard = Dae0Guard::new();
 
     // Stale-state cleanup (previous run): drop the compat bind-mount (the

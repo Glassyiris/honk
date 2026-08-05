@@ -355,6 +355,10 @@ impl ControlPlane {
             self.alive_set
                 .sync_group_check_urls(&group_check_url_registrations(&config));
         }
+        // The flags live in a persistent map, but re-assert them after a
+        // successful reload so a missed or failed earlier write cannot leave
+        // the datapath out of sync with the clash mode and routing config.
+        self.sync_direct_offload_flags().await;
         info!("Configuration applied — {} routes active", route_count);
 
         self.stop_reload_rejection_if_healthy(drain);
@@ -1012,7 +1016,7 @@ fn open_group_connectivity(ebpf: &mut dyn EbpfBackend, group_count: usize) -> an
     Ok(())
 }
 
-pub(super) fn resolve_outbound_nodes(
+pub(crate) fn resolve_outbound_nodes(
     config: &Config,
     group_manager: &GroupManager,
     outbound_name: &str,

@@ -708,8 +708,8 @@ mod builtin_nodes_tests {
     #[test]
     fn test_ensure_local_direct_rules_injects_and_is_idempotent() {
         let mut config = Config::default();
-        config.global.lan_interface = vec!["lo".to_string()];
-        config.global.wan_interface = vec!["definitely-not-an-iface0".to_string()];
+        config.global.wan_interface =
+            vec!["lo".to_string(), "definitely-not-an-iface0".to_string()];
         config.ensure_local_direct_rules();
 
         let injected: Vec<_> = config

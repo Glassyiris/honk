@@ -174,6 +174,9 @@ pub struct MockEbpfBackend {
     /// Whether TC entry points may redirect traffic into the control plane.
     pub datapath_ready: bool,
     pub listener_sockets_published: bool,
+    /// Every `set_datapath_flags` value written (shared so tests can read it
+    /// after the backend is boxed).
+    pub datapath_flags_writes: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
     /// Lifecycle counters (shared so tests can read them after the backend is
     /// boxed): detach_hooks must only ever run during shutdown.
     pub detach_calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -510,6 +513,11 @@ impl EbpfBackend for MockEbpfBackend {
             anyhow::bail!("listener socket generation is not fully published");
         }
         self.datapath_ready = ready;
+        Ok(())
+    }
+
+    fn set_datapath_flags(&mut self, flags: u32) -> anyhow::Result<()> {
+        self.datapath_flags_writes.lock().unwrap().push(flags);
         Ok(())
     }
 

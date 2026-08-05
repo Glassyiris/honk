@@ -19,8 +19,8 @@ Source of truth: `crates/honk-config/src/*`, the dae parser in `crates/honk-conf
 | `so_mark_from_dae` | `so_mark_from_dae` | `0` | Optional SO_MARK for honk-opened sockets |
 | `log_level` | `log_level` | `"info"` | `trace`/`debug`/`info`/`warn`/`error` |
 | `disable_waiting_network` | `disable_waiting_network` | `false` | Skip waiting for network readiness |
-| `lan_interface` | `lan_interface` | `[]` | LAN ifaces to intercept (comma-separated); empty = none |
-| `wan_interface` | `wan_interface` | `[]` | WAN ifaces; `auto` allowed |
+| `lan_interface` | `lan_interface` | `[]` | LAN ifaces to intercept (comma-separated); empty installs no LAN hooks |
+| `wan_interface` | `wan_interface` | `[]` | WAN ifaces that intercept host-originated TCP/UDP; `auto` allowed |
 | `auto_config_kernel_parameter` | `auto_config_kernel_parameter` | `false` | Auto sysctl (root) |
 | `tcp_check_url` | `tcp_check_url` | Cloudflare HTTP + 1.1.1.1 + IPv6 | TCP health targets (comma-separated) |
 | `tcp_check_http_method` | `tcp_check_http_method` | `"HEAD"` | HTTP method for URL checks |
@@ -376,7 +376,7 @@ Multiple functions on one rule are AND'd with `&&`.
 | `pname` | `process_name` |
 | `mac` / `dscp` / `ipversion` | same |
 
-`domain` arg tags: bare/`suffix:` → suffix; `keyword:`; `full:`; `regex:`; `geosite:` (`@` → `-`). `dip` args: plain CIDRs or `geoip: code`.
+`domain` arg tags: bare/`suffix:` → suffix; `keyword:`; `full:`; `regex:`; `geosite:` (verbatim; `category@attr` filters entries by attribute key, dae semantics — case-insensitive, everything after the first `@` is the selector; zero-match expansion warns and never matches). `dip` args: plain CIDRs or `geoip: code`.
 
 ### Complex outbound (not in dae syntax)
 

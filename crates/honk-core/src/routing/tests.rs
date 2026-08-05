@@ -381,6 +381,32 @@ fn test_process_name_route_matching() {
 }
 
 #[test]
+fn test_process_name_route_matching_uses_kernel_comm_limit() {
+    let rules = vec![RoutingRule {
+        name: "resolved-direct".into(),
+        condition: RoutingCondition {
+            process_name: vec!["systemd-resolved".into()],
+            ..Default::default()
+        },
+        outbound: RoutingOutbound::Simple("direct".into()),
+        priority: 0,
+        must: true,
+        mark: 0,
+    }];
+
+    let router = Router::new(&rules, "proxy").unwrap();
+
+    assert_eq!(
+        router.route(&make_conn(Some("systemd-resolve"), None)),
+        "direct"
+    );
+    assert_eq!(
+        router.compiled_routes()[0].process_names,
+        vec!["systemd-resolve"]
+    );
+}
+
+#[test]
 fn test_mac_and_process_name_combined() {
     let rules = vec![RoutingRule {
         name: "curl-on-device".into(),
@@ -1087,6 +1113,13 @@ mod negation {
         let mut veto = conn();
         veto.process_name = Some("wget".into());
         check(not(&[("process_name", "wget")]), &hit, &veto);
+        let mut resolved = conn();
+        resolved.process_name = Some("systemd-resolve".into());
+        check(
+            not(&[("process_name", "systemd-resolved")]),
+            &hit,
+            &resolved,
+        );
     }
 
     #[test]

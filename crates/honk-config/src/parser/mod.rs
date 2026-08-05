@@ -629,10 +629,20 @@ fn parse_global_section(section: &Section) -> Result<GlobalConfig, crate::Config
         cfg.disable_waiting_network = parse_bool(v);
     }
     if let Some(v) = kv.get("lan_interface") {
-        cfg.lan_interface = v.split(',').map(|s| s.trim().to_string()).collect();
+        cfg.lan_interface = v
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect();
     }
     if let Some(v) = kv.get("wan_interface") {
-        cfg.wan_interface = v.split(',').map(|s| s.trim().to_string()).collect();
+        cfg.wan_interface = v
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect();
     }
     if let Some(v) = kv.get("auto_config_kernel_parameter") {
         cfg.auto_config_kernel_parameter = parse_bool(v);
@@ -1255,15 +1265,13 @@ fn strip_tag_arg(arg: &str, prefix: &str) -> Option<String> {
     arg.strip_prefix(prefix).map(|s| s.trim().to_string())
 }
 
-/// Normalize a geosite list name.  Dae uses `list@cn` to request the
-/// China-specific variant; the dat files flatten those as `list-cn`.
+/// Normalize a geosite list name.
 fn normalize_geosite_code(code: &str) -> String {
-    let code = code.trim();
-    if code.contains('@') {
-        code.replace('@', "-")
-    } else {
-        code.to_string()
-    }
+    // Keep the code verbatim: `@attr` is an attribute filter applied at
+    // expansion time (honk-core routing/geo.rs), not part of the category
+    // name — remapping it to `-` silently mismatched into a nonexistent
+    // category.
+    code.trim().to_string()
 }
 
 /// Dispatch `domain(...)` arguments to the correct condition fields.

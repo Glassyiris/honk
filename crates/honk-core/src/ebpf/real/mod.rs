@@ -175,6 +175,9 @@ fn sum_percpu_u64(buf: &[u8], ncpu: usize) -> u64 {
     total
 }
 
+/// Chunked visitor used by the batch map scanners.
+type ChunkVisitor<'a, K, V> = dyn FnMut(&[(K, V)]) -> bool + 'a;
+
 impl RealEbpfBackend {
     fn hash_insert<K: Sized, V: Sized>(&mut self, map: &str, k: &K, v: &V) -> anyhow::Result<()> {
         bpf_hash_insert(self.bpf_mut()?, map, unsafe { as_bytes(k) }, unsafe {
@@ -265,7 +268,7 @@ impl RealEbpfBackend {
         &self,
         map: &str,
         chunk_size: usize,
-        visit: &mut dyn FnMut(&[(K, V)]) -> bool,
+        visit: &mut ChunkVisitor<'_, K, V>,
     ) -> anyhow::Result<()> {
         let bpf = self.bpf()?;
         if bpf_lookup_batch_scan_cb(bpf, &self.cap_lookup_batch, map, visit)? {
@@ -368,6 +371,13 @@ impl EbpfBackend for RealEbpfBackend {
                     egress: true,
                 })
             }
+            super::IfaceRole::WanBondSlave => {
+                self.attach_wan_egress(ifname)?;
+                Ok(super::DynamicHooks {
+                    ingress: false,
+                    egress: true,
+                })
+            }
             super::IfaceRole::LanBridgeSlave | super::IfaceRole::LanBondSlave => {
                 self.attach_slave(ifname, role)
             }
@@ -385,6 +395,10 @@ impl EbpfBackend for RealEbpfBackend {
             anyhow::bail!("listener socket generation is not fully published");
         }
         self.array_set("DATAPATH_STATE_MAP", 0, &u32::from(ready))
+    }
+
+    fn set_datapath_flags(&mut self, flags: u32) -> anyhow::Result<()> {
+        self.array_set("DATAPATH_FLAGS_MAP", 0, &flags)
     }
 
     fn set_param(&mut self, _key: ParamKey, _value: u32) -> anyhow::Result<()> {
@@ -1014,11 +1028,12 @@ impl EbpfBackend for RealEbpfBackend {
         let mut stats = OutboundStats::default();
         let ncpu = possible_cpus();
         let mut buf = vec![0u8; ncpu * core::mem::size_of::<OutboundStatsCounters>()];
-        let idx = OutboundStatsCounters::for_outbound(o as u8);
+        let idx = OutboundStatsCounters::for_outbound(o);
         if let Some(()) =
             bpf_hash_lookup(bpf, "OUTBOUND_STATS", unsafe { as_bytes(&idx) }, &mut buf)?
         {
-            for cpu in buf.chunks_exact(core::mem::size_of::<OutboundStatsCounters>()) {
+            let (cpus, _) = buf.as_chunks::<{ core::mem::size_of::<OutboundStatsCounters>() }>();
+            for cpu in cpus {
                 let counters = unsafe {
                     core::ptr::read_unaligned(cpu.as_ptr().cast::<OutboundStatsCounters>())
                 };
