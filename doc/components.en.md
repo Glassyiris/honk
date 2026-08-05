@@ -355,7 +355,7 @@ Multiple functions on one rule are AND'd with `&&`.
 | `pname` | `process_name` |
 | `mac` / `dscp` / `ipversion` | same |
 
-`domain` arg tags: bare/`suffix:` → suffix; `keyword:`; `full:`; `regex:`; `geosite:` (verbatim; `@attr` filters are not materialized — a code matching no category warns and never matches). `dip` args: plain CIDRs or `geoip: code`.
+`domain` arg tags: bare/`suffix:` → suffix; `keyword:`; `full:`; `regex:`; `geosite:` (verbatim; `category@attr` filters entries by attribute key, dae semantics — case-insensitive, everything after the first `@` is the selector; zero-match expansion warns and never matches). `dip` args: plain CIDRs or `geoip: code`.
 
 ### Complex outbound (not in dae syntax)
 
