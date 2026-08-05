@@ -1041,8 +1041,8 @@ fn connections_json_tracker(
                 .unwrap_or_default();
 
             let mut metadata = serde_json::json!({
-                "network": e.network,
-                "type": e.network,
+                "network": &e.network,
+                "type": &e.network,
                 "sourceIP": src_ip,
                 "destinationIP": dst_ip,
                 "sourcePort": src_port,
