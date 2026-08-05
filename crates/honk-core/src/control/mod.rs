@@ -1292,17 +1292,12 @@ impl ControlPlane {
             }
         }
         // Stop the interface watcher first: it shares the backend and could
-        // re-attach hooks mid-drain.
+        // re-attach hooks mid-drain. The timeout aborts the worker instead
+        // of detaching it (a detached watcher could re-attach hooks after
+        // detach_hooks).
         #[cfg(feature = "ebpf")]
-        if let Some(watcher) = self.iface_watcher.take()
-            && tokio::time::timeout(SHUTDOWN_STAGE_TIMEOUT, watcher.shutdown())
-                .await
-                .is_err()
-        {
-            warn!(
-                "interface watcher shutdown exceeded {:?}; continuing",
-                SHUTDOWN_STAGE_TIMEOUT
-            );
+        if let Some(watcher) = self.iface_watcher.take() {
+            watcher.shutdown(SHUTDOWN_STAGE_TIMEOUT).await;
         }
         // Detach BPF hooks immediately to restore network connectivity
         // before draining connections (matches Go dae behaviour).
@@ -1317,6 +1312,9 @@ impl ControlPlane {
         drain.drain().await?;
         // Active flows own the current runtime until the drain completes; only
         // then terminally close its AnyTLS pools and reject any late warm work.
+        // Dropping this future on timeout detaches nothing: the force-closes
+        // are synchronous once entered and none of the runtimes touch the
+        // eBPF backend.
         let generation = self.runtime_registry.read().clone();
         info!("shutdown: retiring outbound runtime generation");
         if tokio::time::timeout(SHUTDOWN_STAGE_TIMEOUT, generation.shutdown())
@@ -1336,18 +1334,14 @@ impl ControlPlane {
     /// DNS transport cannot pin the process after the datapath is down.
     async fn finalize_shutdown(&mut self) -> anyhow::Result<()> {
         info!("shutdown: stopping DNS controller");
-        if tokio::time::timeout(SHUTDOWN_STAGE_TIMEOUT, self.dns_controller.shutdown())
-            .await
-            .is_err()
-        {
-            warn!(
-                "DNS controller shutdown exceeded {:?}; continuing",
-                SHUTDOWN_STAGE_TIMEOUT
-            );
-        }
+        self.dns_controller.shutdown(SHUTDOWN_STAGE_TIMEOUT).await;
         let dns_cache = self.dns_controller.cache().await;
         let persistence = dns_cache.lock().await.persistence();
         if let Some(persistence) = persistence {
+            // The worker is a std thread that cannot be aborted, but the
+            // Shutdown command is queued before the join starts, and the
+            // spawn_blocking join keeps owning the thread handle even if
+            // this future is dropped on timeout — no detached writer.
             match tokio::time::timeout(SHUTDOWN_STAGE_TIMEOUT, persistence.shutdown()).await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => warn!(%error, "DNS persistence shutdown failed"),

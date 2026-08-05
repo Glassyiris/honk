@@ -54,9 +54,16 @@ impl IfaceWatcher {
         Some(Self { handle, stop })
     }
 
-    pub async fn shutdown(self) {
+    pub async fn shutdown(self, timeout: Duration) {
         let _ = self.stop.send(true);
-        let _ = self.handle.await;
+        let mut handle = self.handle;
+        // A watcher wedged mid-reconcile holds the backend write lock and
+        // could re-attach hooks after detach_hooks — abort it rather than
+        // drop the handle and leave the task running into teardown.
+        if tokio::time::timeout(timeout, &mut handle).await.is_err() {
+            handle.abort();
+            let _ = (&mut handle).await;
+        }
     }
 }
 
