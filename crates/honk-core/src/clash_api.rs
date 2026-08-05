@@ -1049,12 +1049,14 @@ fn connections_json_tracker(
                 "destinationPort": dst_port,
                 "host": e.domain.clone().unwrap_or_default(),
                 "dnsMode": "normal",
-                "processPath": e.process_path.clone().unwrap_or_default(),
             });
-            // mihomo omits `process` entirely for flows without process
-            // attribution (LAN-forwarded traffic has none).
+            // mihomo omits the process keys entirely for flows without
+            // process attribution (LAN-forwarded traffic has none).
             if let Some(process) = &e.process {
                 metadata["process"] = serde_json::Value::String(process.clone());
+            }
+            if let Some(process_path) = &e.process_path {
+                metadata["processPath"] = serde_json::Value::String(process_path.clone());
             }
 
             serde_json::json!({
