@@ -280,10 +280,7 @@ async fn fetch_proxied(
     // handlers that need a numeric target.
     let (domain, addr) = match host.parse::<std::net::IpAddr>() {
         Ok(ip) => (None, std::net::SocketAddr::new(ip, port)),
-        Err(_) => (
-            Some(host),
-            std::net::SocketAddr::from(([0, 0, 0, 0], port)),
-        ),
+        Err(_) => (Some(host), std::net::SocketAddr::from(([0, 0, 0, 0], port))),
     };
     let generation = ctx.runtime_registry.read().clone();
     let (runtime, guard) = match generation
@@ -439,7 +436,8 @@ fn parse_download_url(url: &str) -> anyhow::Result<(String, u16, String, bool)> 
         .ok_or_else(|| anyhow::anyhow!("empty host in external UI URL '{url}'"))?;
     let port = parsed
         .port_or_known_default()
-        .ok_or_else(|| anyhow::anyhow!("missing port in external UI URL '{url}'"))? as u16;
+        .ok_or_else(|| anyhow::anyhow!("missing port in external UI URL '{url}'"))?
+        as u16;
 
     let mut path = parsed.path().to_string();
     if let Some(q) = parsed.query() {

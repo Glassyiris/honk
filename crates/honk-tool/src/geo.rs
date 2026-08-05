@@ -129,7 +129,9 @@ fn render_geosite_list(scan: &GeositeScan, filter: Option<&str>) -> String {
     let filter = filter.map(str::to_lowercase);
     let mut out = String::new();
     for cat in scan.categories() {
-        if let Some(f) = &filter && !cat.code.to_lowercase().contains(f) {
+        if let Some(f) = &filter
+            && !cat.code.to_lowercase().contains(f)
+        {
             continue;
         }
         let _ = writeln!(out, "{} {}", cat.code, cat.entries.len());
