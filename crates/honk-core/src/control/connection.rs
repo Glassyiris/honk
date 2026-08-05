@@ -1734,9 +1734,9 @@ impl ControlPlaneHandle {
         client_addr: SocketAddr,
         original_dst: SocketAddr,
     ) {
-        let mode = self.mode_state.as_ref().map(|state| state.read().clone());
+        let mode = self.mode_state.as_ref().map(|state| state.read());
         if !udp_post_decision_offload_allowed(
-            mode.as_ref(),
+            mode.as_deref(),
             outbound_name,
             must,
             client_addr,
