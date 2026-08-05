@@ -1734,14 +1734,18 @@ impl ControlPlaneHandle {
         client_addr: SocketAddr,
         original_dst: SocketAddr,
     ) {
-        let mode = self.mode_state.as_ref().map(|state| state.read());
-        if !udp_post_decision_offload_allowed(
-            mode.as_deref(),
-            outbound_name,
-            must,
-            client_addr,
-            original_dst,
-        ) {
+        // Evaluate the predicate before the await: the read guard is !Send.
+        let allowed = {
+            let mode = self.mode_state.as_ref().map(|state| state.read());
+            udp_post_decision_offload_allowed(
+                mode.as_deref(),
+                outbound_name,
+                must,
+                client_addr,
+                original_dst,
+            )
+        };
+        if !allowed {
             return;
         }
         // Best-effort: a write failure forfeits only the offload, the flow
