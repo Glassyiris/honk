@@ -150,12 +150,17 @@ async fn decide_route(ctx: &UiDownloadContext, host: &str, port: u16) -> anyhow:
     let nodes = {
         let config = ctx.config.read().await;
         let group_manager = ctx.group_manager.read().clone();
+        let ipver = if matches!(dst_ip, std::net::IpAddr::V6(_)) {
+            IpVersion::V6
+        } else {
+            IpVersion::V4
+        };
         crate::control::reload::resolve_outbound_nodes(
             &config,
             &group_manager,
             &outbound,
             ProbeDomain::Tcp,
-            IpVersion::V4,
+            ipver,
         )
     };
     let Some(node) = nodes.into_iter().next() else {
