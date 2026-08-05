@@ -501,4 +501,77 @@ fn test_vless_reality_full() {
         node.password.as_deref(),
         Some("b831381d-6324-4d53-ad4f-8cda48b30811")
     );
+    assert!(node.tls);
+    assert_eq!(
+        node.reality_public_key.as_deref(),
+        Some("jHkr1EmJCyQxjU0HXJlNblVdXB4Z7yODHJhgJ5lqmzc")
+    );
+    assert_eq!(node.reality_short_id.as_deref(), Some("a1b2c3d4e5f60718"));
+    assert_eq!(node.reality_spider_x.as_deref(), Some("/"));
+    assert_eq!(node.flow.as_deref(), Some("xtls-rprx-vision"));
+
+    // A valid REALITY+flow node passes config validation.
+    let mut config = Config::default();
+    config.nodes.push(node);
+    config.validate().unwrap();
+}
+
+#[test]
+fn test_vless_reality_spx_default() {
+    // A missing `spx` falls back to the share-link default `/`.
+    let node = Node::from_share_link(
+        "vless://uuid@example.com:443?security=reality&pbk=jHkr1EmJCyQxjU0HXJlNblVdXB4Z7yODHJhgJ5lqmzc#n",
+    )
+    .unwrap();
+    assert!(node.tls);
+    assert_eq!(node.reality_spider_x.as_deref(), Some("/"));
+    assert!(node.reality_short_id.is_none());
+}
+
+#[test]
+fn test_vless_security_none() {
+    let node = Node::from_share_link("vless://uuid@example.com:443?security=none#n").unwrap();
+    assert!(!node.tls);
+    assert!(node.reality_public_key.is_none());
+}
+
+#[test]
+fn test_vless_no_security_keeps_tls_default() {
+    // Existing links without a `security` parameter keep the historical
+    // TLS-on default.
+    let node = Node::from_share_link("vless://uuid@example.com:443#n").unwrap();
+    assert!(node.tls);
+    assert!(node.reality_public_key.is_none());
+}
+
+#[test]
+fn test_vless_derive_id_differs_by_reality_public_key() {
+    let a =
+        Node::from_share_link("vless://uuid@example.com:443?security=reality&pbk=AAA#a").unwrap();
+    let b =
+        Node::from_share_link("vless://uuid@example.com:443?security=reality&pbk=BBB#b").unwrap();
+    assert_ne!(a.derive_id(), b.derive_id());
+    assert_ne!(a.id, b.id);
+}
+
+#[test]
+fn test_validate_flow_requires_tls_or_reality() {
+    let node = Node::from_share_link(
+        "vless://uuid@example.com:443?security=none&flow=xtls-rprx-vision#flow-no-tls",
+    )
+    .unwrap();
+    let mut config = Config::default();
+    config.nodes.push(node);
+    assert!(config.validate().is_err());
+}
+
+#[test]
+fn test_validate_flow_rejects_unknown_value() {
+    let node = Node::from_share_link(
+        "vless://uuid@example.com:443?flow=xtls-rprx-vision-udp443#flow-bad-value",
+    )
+    .unwrap();
+    let mut config = Config::default();
+    config.nodes.push(node);
+    assert!(config.validate().is_err());
 }

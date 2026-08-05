@@ -122,17 +122,27 @@ impl Node {
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| format!("{}-{}", scheme, host));
 
-        match protocol {
-            NodeProtocol::Trojan | NodeProtocol::VLess | NodeProtocol::AnyTLS => {
-                node.tls = true;
-            }
-            _ => {}
-        }
-
         let query: HashMap<String, String> = url
             .query_pairs()
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
             .collect();
+
+        match protocol {
+            NodeProtocol::Trojan | NodeProtocol::AnyTLS => {
+                node.tls = true;
+            }
+            // An explicit `security` overrides the historical vless default
+            // of TLS-on; a missing parameter keeps it so existing links
+            // parse unchanged.
+            NodeProtocol::VLess | NodeProtocol::VMess => {
+                node.tls = match query.get("security").map(String::as_str) {
+                    Some("none") => false,
+                    Some(_) => true,
+                    None => protocol == NodeProtocol::VLess,
+                };
+            }
+            _ => {}
+        }
 
         // Transport selection comes first so that transport-specific
         // parameters (ws path/host, grpc service name) can be interpreted.
@@ -319,6 +329,26 @@ impl Node {
             }
             if let Some(v) = query.get("min_idle_session") {
                 node.anytls_min_idle_session = v.parse::<u16>().ok().map(usize::from);
+            }
+        }
+
+        if matches!(protocol, NodeProtocol::VLess | NodeProtocol::VMess) {
+            // `security=reality` carries the REALITY handshake parameters.
+            if query.get("security").is_some_and(|v| v == "reality") {
+                node.tls = true;
+                node.reality_public_key = query.get("pbk").cloned();
+                node.reality_short_id = query.get("sid").cloned();
+                // `spx` defaults to `/` in the share-link convention.
+                node.reality_spider_x = Some(
+                    query
+                        .get("spx")
+                        .filter(|s| !s.is_empty())
+                        .cloned()
+                        .unwrap_or_else(|| "/".to_string()),
+                );
+            }
+            if let Some(v) = query.get("flow") {
+                node.flow = Some(v.clone());
             }
         }
 
