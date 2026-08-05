@@ -9,6 +9,13 @@ mod lpm;
 
 pub(crate) use geo::GeoAssets;
 pub(crate) use lpm::BinaryLpmTrie;
+const KERNEL_COMM_VISIBLE_LEN: usize = honk_ebpf_common::TASK_COMM_LEN - 1;
+
+fn normalize_process_matcher(name: &str) -> String {
+    let bytes = name.as_bytes();
+    let len = bytes.len().min(KERNEL_COMM_VISIBLE_LEN);
+    String::from_utf8_lossy(&bytes[..len]).into_owned()
+}
 
 #[derive(Debug, Clone)]
 pub struct CompiledRoute {
@@ -334,7 +341,12 @@ impl Router {
                 ports,
                 source_ports,
                 protocols: rule.condition.protocol.clone(),
-                process_names: rule.condition.process_name.clone(),
+                process_names: rule
+                    .condition
+                    .process_name
+                    .iter()
+                    .map(|name| normalize_process_matcher(name))
+                    .collect(),
                 mac_addresses,
                 geosite_domains,
                 geosite_matcher,
@@ -350,7 +362,12 @@ impl Router {
                 not_ports,
                 not_source_ports,
                 not_protocols: not.protocol.clone(),
-                not_process_names: not.process_name.clone(),
+                not_process_names: not
+                    .process_name
+                    .iter()
+                    .map(|name| normalize_process_matcher(name))
+                    .collect(),
+
                 not_mac_addresses,
                 not_geosite_domains,
                 not_geosite_matcher,

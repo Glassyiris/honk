@@ -909,8 +909,22 @@ impl RoutingMatcherBuilder {
         }
     }
 
+    fn process_name_value(name: &str) -> [u32; TASK_COMM_LEN / 4] {
+        let mut bytes = [0u8; TASK_COMM_LEN];
+        let len = name.len().min(TASK_COMM_LEN - 1);
+        bytes[..len].copy_from_slice(&name.as_bytes()[..len]);
+
+        let mut value = [0u32; TASK_COMM_LEN / 4];
+        let (chunks, _) = bytes.as_chunks::<4>();
+        for (word, chunk) in value.iter_mut().zip(chunks) {
+            *word = u32::from_ne_bytes(*chunk);
+        }
+
+        value
+    }
+
     /// Append one MatchSet per process name, ORing multiple names with LogicalOr.
-    /// Each name is truncated to TASK_COMM_LEN (16 bytes) and stored as [u32; 4].
+    /// Linux reserves the final TASK_COMM_LEN byte for a trailing NUL.
     fn push_process_name_match_sets(
         names: &[String],
         not: u8,
@@ -927,16 +941,7 @@ impl RoutingMatcherBuilder {
             } else {
                 OutboundIndex::LogicalOr as u8
             };
-            let mut pname = [0u32; 4];
-            let src = name.as_bytes();
-            let len = src.len().min(TASK_COMM_LEN);
-            // SAFETY: pname is [u32; 4] = 16 bytes, same size as TASK_COMM_LEN.
-            let dst = &mut pname as *mut [u32; 4] as *mut u8;
-            for (i, &b) in src.iter().enumerate().take(len) {
-                unsafe {
-                    *dst.add(i) = b;
-                }
-            }
+            let pname = Self::process_name_value(name);
             match_sets.push(MatchSet {
                 value: MatchSetValue { pname },
                 not,
@@ -1305,6 +1310,13 @@ mod tests {
         );
         assert_eq!(parse_mac_to_bytes("aa:bb:cc:dd:ee"), None);
         assert_eq!(parse_mac_to_bytes(""), None);
+    }
+
+    #[test]
+    fn test_process_name_value_matches_kernel_comm_truncation() {
+        let value = RoutingMatcherBuilder::process_name_value("systemd-resolved");
+        let bytes: Vec<u8> = value.into_iter().flat_map(u32::to_ne_bytes).collect();
+        assert_eq!(bytes.as_slice(), b"systemd-resolve\0");
     }
 
     fn make_route(name: &str, outbound: &str) -> CompiledRoute {
