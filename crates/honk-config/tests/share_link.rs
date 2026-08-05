@@ -575,3 +575,44 @@ fn test_validate_flow_rejects_unknown_value() {
     config.nodes.push(node);
     assert!(config.validate().is_err());
 }
+
+#[test]
+fn test_vless_ws_transport_params() {
+    let node = Node::from_share_link(
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=tls&type=ws&path=%2Fvless-ws&host=cdn.example&sni=cdn.example#n",
+    )
+    .unwrap();
+    assert_eq!(node.protocol, NodeProtocol::VLess);
+    assert!(node.tls);
+    assert_eq!(node.transport, "ws");
+    assert_eq!(node.ws_path.as_deref(), Some("/vless-ws"));
+    // `host` on a ws link is the WS Host header, not the SNI.
+    assert_eq!(node.ws_host.as_deref(), Some("cdn.example"));
+    assert_eq!(node.sni.as_deref(), Some("cdn.example"));
+    assert_eq!(
+        node.password.as_deref(),
+        Some("b831381d-6324-4d53-ad4f-8cda48b30811")
+    );
+}
+
+#[test]
+fn test_vless_grpc_transport_params() {
+    let node = Node::from_share_link(
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=none&type=grpc&serviceName=vless-grpc#n",
+    )
+    .unwrap();
+    assert!(!node.tls);
+    assert_eq!(node.transport, "grpc");
+    assert_eq!(node.grpc_service.as_deref(), Some("vless-grpc"));
+}
+
+#[test]
+fn test_vless_ws_host_falls_back_to_sni_without_ws() {
+    // `host` on a non-ws link keeps its SNI meaning.
+    let node = Node::from_share_link(
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=tls&host=cdn.example#n",
+    )
+    .unwrap();
+    assert_eq!(node.sni.as_deref(), Some("cdn.example"));
+    assert!(node.ws_host.is_none());
+}

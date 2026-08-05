@@ -153,10 +153,10 @@ impl Node {
             node.sni = Some(v.clone());
         }
 
-        // Trojan transport options.  `alpn` is accepted for
+        // Trojan and VLess transport options.  `alpn` is accepted for
         // compatibility but intentionally not stored.
         let mut host_consumed = false;
-        if protocol == NodeProtocol::Trojan {
+        if matches!(protocol, NodeProtocol::Trojan | NodeProtocol::VLess) {
             match node.transport.as_str() {
                 "ws" => {
                     if let Some(v) = query.get("host") {
