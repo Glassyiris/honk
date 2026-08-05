@@ -59,7 +59,8 @@ pub(crate) async fn wrap_transport(
 }
 
 /// Wrap the stream in TLS when `node.tls` is set, using `node.sni` (or the
-/// server host) as the SNI.
+/// server host) as the SNI. A node with REALITY parameters takes the
+/// REALITY handshake instead of plain TLS (`security=reality` sets both).
 pub(crate) async fn maybe_tls_wrap(
     node: &Node,
     stream: TcpStream,
@@ -82,6 +83,11 @@ pub(crate) async fn maybe_tls_wrap_concrete(
     node: &Node,
     tcp: TcpStream,
 ) -> anyhow::Result<MaybeTls> {
+    if let Some(reality) = crate::reality::parse_reality_config(node)? {
+        let tls_stream =
+            crate::reality::reality_connect(tcp, &reality, crate::tls::chrome_mode()).await?;
+        return Ok(MaybeTls::Tls(Box::new(tls_stream)));
+    }
     if node.tls {
         let connector = crate::tls::build_connector(node)?;
         let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
