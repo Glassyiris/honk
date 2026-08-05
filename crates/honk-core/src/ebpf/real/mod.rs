@@ -53,16 +53,9 @@ pub struct RealEbpfBackend {
     /// Skipped in single-homed setups, where lan_ingress already owns the
     /// shared interface's ingress hook.
     wan_ingress_link: Option<aya::programs::tc::SchedClassifierLink>,
-    /// Additional ingress links for bond slaves. Packets may arrive on the
-    /// physical slaves before the bonding driver aggregates them onto the
-    /// master, so we attach the same lan_ingress program to each slave.
-    lan_slave_links: Vec<aya::programs::tc::SchedClassifierLink>,
-    /// Additional egress links for bond slaves. Outbound packets leaving a bond
-    /// slave may bypass the master's egress qdisc, so attach wan_egress there too.
-    wan_slave_links: Vec<aya::programs::tc::SchedClassifierLink>,
-    /// Links installed by dynamic attach (startup bridge slaves, extra
-    /// startup interfaces, and the interface watcher), keyed by (ifindex,
-    /// is_egress).  Keeping them here
+    /// Links installed by dynamic attach (startup bridge and bond slaves,
+    /// extra startup interfaces, and the interface watcher), keyed by
+    /// (ifindex, is_egress).  Keeping them here
     /// serves three purposes: the fd stays alive until `detach_hooks`, the
     /// watcher can drop dead links when a device vanishes, and the (ifindex,
     /// direction) pair dedupes retries after a partial failure.
@@ -1075,8 +1068,6 @@ impl EbpfBackend for RealEbpfBackend {
         self.lan_egress_link = None;
         self.wan_egress_link = None;
         self.wan_ingress_link = None;
-        self.lan_slave_links.clear();
-        self.wan_slave_links.clear();
         self.dynamic_links.clear();
         self.cgroup_sock_links.clear();
         self.cgroup_sock_addr_links.clear();

@@ -438,8 +438,10 @@ impl RealEbpfBackend {
 
         // For bond masters, packets may be delivered on the slave interfaces
         // before they are aggregated onto the master. Attach lan_ingress to
-        // each slave so we do not miss downstream traffic.
-        let mut lan_slave_links = Vec::new();
+        // each slave so we do not miss downstream traffic.  Like bridge
+        // slaves above, the links go into `dynamic_links` so the watcher's
+        // `dynamic_hooked` dedup sees them and does not stack a duplicate
+        // hook on the first reconcile.
         let slaves = Self::bond_slaves(&ebpf_lan_ifname);
         if !slaves.is_empty() {
             info!(
@@ -466,7 +468,7 @@ impl RealEbpfBackend {
                     let id = p.attach(slave, slave_dir).map_err(|e| {
                         anyhow::anyhow!("attach {} to {}: {}", slave_prog, slave, e)
                     })?;
-                    lan_slave_links.push(p.take_link(id)?);
+                    dynamic_links.push((Self::iface_ifindex(slave), false, p.take_link(id)?));
                     Ok(())
                 })();
                 attach_result.map_err(|e| {
@@ -480,7 +482,6 @@ impl RealEbpfBackend {
         // traversing the master's egress qdisc. Attach wan_egress to each slave
         // so locally-generated traffic is intercepted regardless of the bond's
         // egress slave selection.
-        let mut wan_slave_links = Vec::new();
         if !slaves.is_empty() {
             info!(
                 "Bond master {} has slaves {:?}; attaching wan_egress to slaves",
@@ -503,7 +504,7 @@ impl RealEbpfBackend {
                     let id = p.attach(slave, slave_dir).map_err(|e| {
                         anyhow::anyhow!("attach {} to {}: {}", slave_prog, slave, e)
                     })?;
-                    wan_slave_links.push(p.take_link(id)?);
+                    dynamic_links.push((Self::iface_ifindex(slave), true, p.take_link(id)?));
                     Ok(())
                 })();
                 attach_result.map_err(|e| {
@@ -604,8 +605,6 @@ impl RealEbpfBackend {
             lan_egress_link,
             wan_egress_link,
             wan_ingress_link,
-            lan_slave_links,
-            wan_slave_links,
             dynamic_links,
             cgroup_sock_links,
             cgroup_sock_addr_links,
