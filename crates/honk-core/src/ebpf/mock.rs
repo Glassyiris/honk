@@ -1280,6 +1280,100 @@ mod tests {
         assert_eq!(backend.conn_track_lookup(&tuple).unwrap(), None);
     }
 
+    fn offload_test_key() -> TuplesKey {
+        let mut key: TuplesKey = unsafe { std::mem::zeroed() };
+        key.dst_ip[15] = 1;
+        key.src_ip[15] = 2;
+        key.dst_port = 443;
+        key.src_port = 53000;
+        key.l4proto = 17;
+        key
+    }
+
+    /// Mirror of the kernel's `build_routing_meta` bit encoding.
+    fn offload_test_meta_raw(outbound: u8, mark: u32, must: u8, dscp: u8) -> u64 {
+        (outbound as u64)
+            | ((mark as u64) << 8)
+            | ((must as u64) << 40)
+            | ((dscp as u64) << 48)
+            | ROUTING_META_FLAG_PUBLISHED
+    }
+
+    fn offload_test_state(raw: u64) -> ConnState {
+        ConnState {
+            last_seen_ns: 1,
+            meta: RoutingMeta { raw },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn offload_udp_flow_rewrites_published_proxy_decision_to_direct() {
+        let mut backend = MockEbpfBackend::new();
+        let key = offload_test_key();
+        let raw = offload_test_meta_raw(OutboundIndex::UserBase as u8, TPROXY_MARK, 0, 5);
+        backend
+            .udp_conn_state_store(&key, &offload_test_state(raw))
+            .unwrap();
+
+        assert!(backend.offload_udp_flow(&key).unwrap());
+
+        let stored = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
+        let stored_raw = unsafe { stored.meta.raw };
+        assert_ne!(stored_raw & ROUTING_META_FLAG_OFFLOAD, 0);
+        assert_ne!(stored_raw & ROUTING_META_FLAG_PUBLISHED, 0);
+        assert_eq!(stored_raw & 0xFF, OutboundIndex::Direct as u64);
+        assert_eq!((stored_raw >> 8) & 0xFFFF_FFFF, 0, "tproxy mark cleared");
+        assert_eq!((stored_raw >> 40) & 1, 0, "must bit cleared");
+        assert_eq!((stored_raw >> 48) & 0xFF, 5, "dscp preserved");
+    }
+
+    #[test]
+    fn offload_udp_flow_requires_a_published_conn_state() {
+        let mut backend = MockEbpfBackend::new();
+        let key = offload_test_key();
+        assert!(!backend.offload_udp_flow(&key).unwrap(), "missing entry");
+
+        let raw = offload_test_meta_raw(OutboundIndex::UserBase as u8, TPROXY_MARK, 0, 0)
+            & !ROUTING_META_FLAG_PUBLISHED;
+        backend
+            .udp_conn_state_store(&key, &offload_test_state(raw))
+            .unwrap();
+        assert!(!backend.offload_udp_flow(&key).unwrap(), "unpublished meta");
+        let stored = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
+        assert_eq!(unsafe { stored.meta.raw }, raw, "meta left untouched");
+    }
+
+    #[test]
+    fn offload_udp_flow_is_idempotent() {
+        let mut backend = MockEbpfBackend::new();
+        let key = offload_test_key();
+        let raw = offload_test_meta_raw(OutboundIndex::Direct as u8, 0, 0, 0);
+        backend
+            .udp_conn_state_store(&key, &offload_test_state(raw))
+            .unwrap();
+
+        assert!(backend.offload_udp_flow(&key).unwrap());
+        let first = unsafe {
+            backend
+                .udp_conn_state_lookup(&key)
+                .unwrap()
+                .unwrap()
+                .meta
+                .raw
+        };
+        assert!(backend.offload_udp_flow(&key).unwrap());
+        let second = unsafe {
+            backend
+                .udp_conn_state_lookup(&key)
+                .unwrap()
+                .unwrap()
+                .meta
+                .raw
+        };
+        assert_eq!(first, second);
+    }
+
     #[test]
     fn test_parse_ipv4() {
         assert_eq!(parse_ipv4("192.168.1.1").unwrap(), 0xc0a80101);

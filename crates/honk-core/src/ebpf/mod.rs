@@ -383,6 +383,36 @@ pub trait EbpfBackend: Send + Sync {
         Ok(keys.len())
     }
 
+    /// UDP post-decision offload: rewrite the flow's published conn_state
+    /// routing meta to an offloaded direct decision
+    /// (`RoutingMeta::set_offloaded_direct`), so the `lan_ingress`
+    /// established-UDP path passes subsequent packets straight through the
+    /// kernel.  Called by the control plane only after its decision for the
+    /// flow has fully converged to `direct` — never during endpoint
+    /// initialization or cold-URLTest staggering, and never for a proxied
+    /// or port-53 flow.
+    ///
+    /// Returns `Ok(false)` when the flow has no published conn_state
+    /// (already swept, or never conntracked); the flow then simply stays on
+    /// the userspace datapath.  The read-modify-write races only with the
+    /// datapath's throttled `last_seen_ns` refresh, which may be rolled
+    /// back by a few seconds at worst — established packets never
+    /// republish the meta.
+    fn offload_udp_flow(&mut self, key: &TuplesKey) -> anyhow::Result<bool> {
+        let Some(mut state) = self.udp_conn_state_lookup(key)? else {
+            return Ok(false);
+        };
+        if !state.meta.is_published() {
+            return Ok(false);
+        }
+        if unsafe { state.meta.raw } & ROUTING_META_FLAG_OFFLOAD != 0 {
+            return Ok(true);
+        }
+        state.meta.set_offloaded_direct();
+        self.udp_conn_state_store(key, &state)?;
+        Ok(true)
+    }
+
     fn redirect_track_lookup(&self, key: &RedirectTuple) -> anyhow::Result<Option<RedirectEntry>>;
     fn redirect_track_store(
         &mut self,
