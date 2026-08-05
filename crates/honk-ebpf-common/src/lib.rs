@@ -225,6 +225,37 @@ pub struct RoutingMetaData {
 /// and never re-reads the datapath flags per packet.
 pub const ROUTING_META_FLAG_OFFLOAD: u64 = 1 << 57;
 
+/// Bit 56 of `RoutingMeta::raw`: the datapath published a routing decision
+/// for this flow.  The established-packet fast paths ignore the meta
+/// entirely until this bit is set.
+pub const ROUTING_META_FLAG_PUBLISHED: u64 = 1 << 56;
+
+impl RoutingMeta {
+    /// Whether the datapath has published a routing decision (bit 56).
+    pub fn is_published(&self) -> bool {
+        let raw = unsafe { self.raw };
+        raw & ROUTING_META_FLAG_PUBLISHED != 0
+    }
+
+    /// UDP post-decision offload: rewrite an already-published decision to a
+    /// kernel-offloaded direct one.  Unlike TCP, UDP carries no sequence
+    /// state the kernel must track from the first byte, so once the control
+    /// plane's decision for a flow has fully converged to `direct` it may
+    /// leave the userspace datapath mid-stream: the `lan_ingress`
+    /// established-UDP path reads [`ROUTING_META_FLAG_OFFLOAD`] and passes
+    /// subsequent packets straight through.
+    ///
+    /// The cached outbound is normalized to `OUTBOUND_DIRECT` (0) and the
+    /// tproxy mark and `must` bit are cleared — a direct flow must not keep
+    /// a mark, or policy routing would send the passed-through packets back
+    /// into `daens`.  DSCP and the published bit are preserved.
+    pub fn set_offloaded_direct(&mut self) {
+        const DSCP_MASK: u64 = 0xFF << 48;
+        let preserved = unsafe { self.raw } & (DSCP_MASK | ROUTING_META_FLAG_PUBLISHED);
+        self.raw = preserved | ROUTING_META_FLAG_OFFLOAD;
+    }
+}
+
 // Layout assertions — must hold for the union to work correctly.
 // RoutingMeta is a union of u64 and RoutingMetaData, so both must be 8 bytes
 // and field byte-offsets must match the bit-encoding in build_routing_meta().

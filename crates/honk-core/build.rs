@@ -45,12 +45,11 @@ fn embed_ebpf_object() {
                 let path = entry.path();
                 if path.is_dir() {
                     stack.push(path);
-                } else if let Ok(meta) = path.metadata() {
-                    if let Ok(mtime) = meta.modified() {
-                        if newest.is_none_or(|n| mtime > n) {
-                            newest = Some(mtime);
-                        }
-                    }
+                } else if let Ok(meta) = path.metadata()
+                    && let Ok(mtime) = meta.modified()
+                    && newest.is_none_or(|n| mtime > n)
+                {
+                    newest = Some(mtime);
                 }
             }
         }
@@ -87,13 +86,14 @@ fn embed_ebpf_object() {
             p
         }
         stale => {
-            if let Some(p) = &stale {
-                if p.exists() && object_has_btf(p) {
-                    println!(
-                        "cargo:warning=eBPF object at {} is older than the eBPF sources — rebuilding",
-                        p.display()
-                    );
-                }
+            if let Some(p) = &stale
+                && p.exists()
+                && object_has_btf(p)
+            {
+                println!(
+                    "cargo:warning=eBPF object at {} is older than the eBPF sources — rebuilding",
+                    p.display()
+                );
             }
             // Missing, or stale without .BTF (e.g. built while an environment
             // RUSTFLAGS overrode crates/honk-ebpf/.cargo/config.toml): (re)build.

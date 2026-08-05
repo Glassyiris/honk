@@ -2065,6 +2065,406 @@ async fn udp_stats_lifecycle_success_and_reply_eof_close_guard() {
     assert_udp_outbound(&stats, "udp-test", 1, 0, 0);
 }
 
+// --- UDP post-decision kernel offload -------------------------------------
+
+#[test]
+fn udp_offload_predicate_mode_and_outbound_matrix() {
+    let rule = crate::mode::ModeState::new("rule", "proxy");
+    let direct = crate::mode::ModeState::new("direct", "proxy");
+    let global = crate::mode::ModeState::new("global", "direct");
+    let client = addr("10.0.0.2:53000");
+    let dst = addr("203.0.113.2:443");
+    let allow = super::connection::udp_post_decision_offload_allowed;
+
+    // Rule (and clash-API-disabled, where no override ever applies) offload
+    // a converged direct decision.
+    assert!(allow(Some(&rule), "direct", false, client, dst));
+    assert!(allow(None, "direct", false, client, dst));
+    // Direct normalizes every non-must/block decision to direct.
+    assert!(allow(Some(&direct), "direct", false, client, dst));
+    // A proxied or blocked decision is never offloaded, in any mode.
+    assert!(!allow(Some(&rule), "proxy", false, client, dst));
+    assert!(!allow(Some(&direct), "proxy", false, client, dst));
+    assert!(!allow(None, "block", false, client, dst));
+    // Global keeps non-must flows in userspace, even when the GLOBAL
+    // selection itself resolves to direct.
+    assert!(!allow(Some(&global), "direct", false, client, dst));
+    // must-direct finals offload in every mode.
+    assert!(allow(Some(&global), "direct", true, client, dst));
+    assert!(allow(Some(&rule), "direct", true, client, dst));
+    // Port 53 is never offloaded, in either direction: the DNS hijack
+    // depends on the DnsController seeing every packet.
+    assert!(!allow(
+        None,
+        "direct",
+        false,
+        client,
+        addr("203.0.113.2:53")
+    ));
+    assert!(!allow(None, "direct", true, client, addr("203.0.113.2:53")));
+    assert!(!allow(None, "direct", false, addr("10.0.0.2:53"), dst));
+}
+
+/// A transport whose receive side never completes, so the endpoint driver
+/// stays alive and the Ready endpoint remains observable in the pool.
+#[derive(Debug)]
+struct UdpOffloadTestTransport {
+    relay: SocketAddr,
+}
+
+#[async_trait::async_trait]
+impl honk_outbound::proxy::PacketTransport for UdpOffloadTestTransport {
+    fn relay_addr(&self) -> SocketAddr {
+        self.relay
+    }
+
+    async fn send_packet(&self, _data: &[u8]) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    async fn recv_packet(&self, _buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        std::future::pending().await
+    }
+}
+
+#[derive(Debug)]
+struct UdpOffloadTestHandler;
+
+#[async_trait::async_trait]
+impl honk_outbound::proxy::TcpOutbound for UdpOffloadTestHandler {
+    async fn dial(
+        &self,
+        _node: &Node,
+        _target: SocketAddr,
+        _target_domain: Option<&str>,
+        _connect_timeout: Duration,
+    ) -> anyhow::Result<honk_outbound::proxy::ProxyStream> {
+        Err(anyhow::anyhow!(
+            "TCP dial is not used by the UDP offload tests"
+        ))
+    }
+}
+
+#[async_trait::async_trait]
+impl honk_outbound::proxy::PacketOutbound for UdpOffloadTestHandler {
+    async fn dial_udp_transport(
+        &self,
+        _node: &Node,
+        target: SocketAddr,
+        _target_domain: Option<&str>,
+        _connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn honk_outbound::proxy::PacketTransport>> {
+        Ok(Arc::new(UdpOffloadTestTransport { relay: target }))
+    }
+}
+
+/// Registers the offload test handler for both the Socks5 (proxy leaf) and
+/// Direct (built-in) protocols, and optionally installs a clash mode state.
+fn udp_offload_test_handle(
+    config: Config,
+    clash: Option<crate::mode::ModeState>,
+) -> ControlPlaneHandle {
+    let router = Router::new(&config.routing.rules, &config.routing.default_outbound).unwrap();
+    let mut registry = honk_outbound::proxy::ProxyRegistry::new();
+    let handler = Arc::new(UdpOffloadTestHandler);
+    registry.register(
+        honk_outbound::proxy::ProtocolEntry::new(
+            honk_config::types::NodeProtocol::Socks5,
+            handler.clone(),
+        )
+        .with_packet(handler.clone()),
+    );
+    registry.register(
+        honk_outbound::proxy::ProtocolEntry::new(
+            honk_config::types::NodeProtocol::Direct,
+            handler.clone(),
+        )
+        .with_packet(handler),
+    );
+    let mut control_plane = ControlPlane::new(
+        config,
+        Box::new(crate::ebpf::mock::MockEbpfBackend::new()),
+        router,
+        Arc::new(registry),
+        DnsResolver::new(&honk_config::dns::DnsConfig::default()).unwrap(),
+        udp_test_forwarder(),
+    )
+    .unwrap();
+    control_plane.udp_pool = Arc::new(UdpEndpointPool::with_reply_socket_factory(
+        8,
+        Arc::new(UdpTestReplySocketFactory),
+    ));
+    if let Some(state) = clash {
+        control_plane.set_mode_state(Arc::new(parking_lot::RwLock::new(state)));
+    }
+    control_plane.spawn_handle()
+}
+
+fn udp_offload_test_config(default_outbound: &str, nodes: Vec<Node>) -> Config {
+    let mut config = udp_test_config(default_outbound, nodes, vec![]);
+    config.ensure_builtin_nodes();
+    config
+}
+
+/// Mirror of the kernel's `build_routing_meta` bit encoding.
+fn seeded_meta_raw(outbound: u8, mark: u32, must: u8) -> u64 {
+    (outbound as u64)
+        | ((mark as u64) << 8)
+        | ((must as u64) << 40)
+        | honk_ebpf_common::ROUTING_META_FLAG_PUBLISHED
+}
+
+async fn seed_udp_conn_state(
+    handle: &ControlPlaneHandle,
+    client: SocketAddr,
+    dst: SocketAddr,
+    raw: u64,
+) -> TuplesKey {
+    let key =
+        super::connection::build_tuples_key(dst.ip(), dst.port(), client.ip(), client.port(), 17);
+    let state = ConnState {
+        last_seen_ns: 1,
+        meta: RoutingMeta { raw },
+        ..Default::default()
+    };
+    handle
+        .ebpf
+        .write()
+        .await
+        .udp_conn_state_store(&key, &state)
+        .unwrap();
+    key
+}
+
+async fn udp_conn_meta_raw(handle: &ControlPlaneHandle, key: &TuplesKey) -> Option<u64> {
+    handle
+        .ebpf
+        .read()
+        .await
+        .udp_conn_state_lookup(key)
+        .unwrap()
+        .map(|state| unsafe { state.meta.raw })
+}
+
+async fn serve_test_udp_to(
+    handle: &ControlPlaneHandle,
+    client: SocketAddr,
+    dst: SocketAddr,
+) -> anyhow::Result<()> {
+    let slow_permit = Arc::new(tokio::sync::Semaphore::new(1))
+        .try_acquire_owned()
+        .expect("test slow permit");
+    let reservation = handle.udp_pool.reserve_or_enqueue(
+        client,
+        dst,
+        b"UDP test packet",
+        slow_permit,
+        &handle.stats,
+    );
+    match reservation {
+        crate::control::udp_endpoint::EndpointReservation::Initializing(lease) => {
+            handle
+                .serve_udp_connection(
+                    lease,
+                    Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+                )
+                .await
+        }
+        crate::control::udp_endpoint::EndpointReservation::Enqueued
+        | crate::control::udp_endpoint::EndpointReservation::CapacityRejected
+        | crate::control::udp_endpoint::EndpointReservation::QueueFull
+        | crate::control::udp_endpoint::EndpointReservation::QueueClosed => Ok(()),
+    }
+}
+
+#[tokio::test]
+async fn udp_offload_converged_direct_marks_conn_state() {
+    for (client, dst) in [
+        (addr("10.0.0.2:53000"), addr("203.0.113.2:443")),
+        (addr("[2001:db8::2]:53000"), addr("[2001:db8::3]:443")),
+    ] {
+        let config = udp_offload_test_config("direct", vec![]);
+        let handle = udp_offload_test_handle(config, None);
+        let key = seed_udp_conn_state(
+            &handle,
+            client,
+            dst,
+            seeded_meta_raw(honk_ebpf_common::OutboundIndex::Direct as u8, 0, 0),
+        )
+        .await;
+
+        serve_test_udp_to(&handle, client, dst).await.unwrap();
+
+        let raw = udp_conn_meta_raw(&handle, &key)
+            .await
+            .expect("conn state kept");
+        assert_ne!(
+            raw & honk_ebpf_common::ROUTING_META_FLAG_OFFLOAD,
+            0,
+            "converged direct flow must be offloaded ({client} -> {dst})"
+        );
+        assert_ne!(raw & honk_ebpf_common::ROUTING_META_FLAG_PUBLISHED, 0);
+        // The Ready endpoint stays up to deliver the in-flight first reply —
+        // single-shot UDP must not lose it — and is later retired by the
+        // normal idle reaper.
+        assert!(handle.udp_pool.get(client, dst).is_some());
+    }
+}
+
+#[tokio::test]
+async fn udp_offload_direct_mode_normalizes_proxy_decision() {
+    let client = addr("10.0.0.2:53000");
+    let dst = addr("203.0.113.2:443");
+    let config = udp_offload_test_config("udp-test", vec![udp_test_node()]);
+    let handle =
+        udp_offload_test_handle(config, Some(crate::mode::ModeState::new("direct", "proxy")));
+    // The kernel cached a proxy decision for this flow (e.g. it was routed
+    // before the mode switch); the userspace override re-decides it to
+    // direct, so the cached meta must be normalized along with the offload
+    // bit.
+    let key = seed_udp_conn_state(
+        &handle,
+        client,
+        dst,
+        seeded_meta_raw(
+            honk_ebpf_common::OutboundIndex::UserBase as u8,
+            honk_ebpf_common::TPROXY_MARK,
+            0,
+        ),
+    )
+    .await;
+
+    serve_test_udp_to(&handle, client, dst).await.unwrap();
+
+    let raw = udp_conn_meta_raw(&handle, &key)
+        .await
+        .expect("conn state kept");
+    assert_ne!(raw & honk_ebpf_common::ROUTING_META_FLAG_OFFLOAD, 0);
+    assert_eq!(
+        raw & 0xFF,
+        honk_ebpf_common::OutboundIndex::Direct as u64,
+        "cached outbound normalized to direct"
+    );
+    assert_eq!(
+        (raw >> 8) & 0xFFFF_FFFF,
+        0,
+        "tproxy mark must be cleared or policy routing loops the flow back into daens"
+    );
+}
+
+#[tokio::test]
+async fn udp_offload_rule_mode_keeps_proxy_decision_in_userspace() {
+    let client = addr("10.0.0.2:53000");
+    let dst = addr("203.0.113.2:443");
+    let config = udp_offload_test_config("udp-test", vec![udp_test_node()]);
+    let handle = udp_offload_test_handle(config, None);
+    let proxied = seeded_meta_raw(
+        honk_ebpf_common::OutboundIndex::UserBase as u8,
+        honk_ebpf_common::TPROXY_MARK,
+        0,
+    );
+    let key = seed_udp_conn_state(&handle, client, dst, proxied).await;
+
+    serve_test_udp_to(&handle, client, dst).await.unwrap();
+
+    assert_eq!(
+        udp_conn_meta_raw(&handle, &key).await,
+        Some(proxied),
+        "a converged proxy decision must never be offloaded"
+    );
+    assert!(handle.udp_pool.get(client, dst).is_some());
+}
+
+#[tokio::test]
+async fn udp_offload_global_mode_keeps_direct_decision_in_userspace() {
+    let client = addr("10.0.0.2:53000");
+    let dst = addr("203.0.113.2:443");
+    let config = udp_offload_test_config("direct", vec![]);
+    // GLOBAL selection resolves to direct: the decision converges to direct,
+    // but Global mode offloads only must-direct finals.
+    let handle = udp_offload_test_handle(
+        config,
+        Some(crate::mode::ModeState::new("global", "direct")),
+    );
+    let direct = seeded_meta_raw(honk_ebpf_common::OutboundIndex::Direct as u8, 0, 0);
+    let key = seed_udp_conn_state(&handle, client, dst, direct).await;
+
+    serve_test_udp_to(&handle, client, dst).await.unwrap();
+
+    assert_eq!(udp_conn_meta_raw(&handle, &key).await, Some(direct));
+    assert!(handle.udp_pool.get(client, dst).is_some());
+}
+
+#[tokio::test]
+async fn udp_offload_first_send_failure_never_marks_conn_state() {
+    let client = addr("10.0.0.2:53000");
+    let dst = addr("203.0.113.2:443");
+    let config = udp_offload_test_config("direct", vec![]);
+    let handle = udp_offload_test_handle(config, None);
+    let direct = seeded_meta_raw(honk_ebpf_common::OutboundIndex::Direct as u8, 0, 0);
+    let key = seed_udp_conn_state(&handle, client, dst, direct).await;
+    // Retire the initializer mid-flight: no Ready commit, no offload write.
+    let slow_permit = Arc::new(tokio::sync::Semaphore::new(1))
+        .try_acquire_owned()
+        .expect("test slow permit");
+    let crate::control::udp_endpoint::EndpointReservation::Initializing(lease) = handle
+        .udp_pool
+        .reserve_or_enqueue(client, dst, b"UDP test packet", slow_permit, &handle.stats)
+    else {
+        panic!("fresh flow must reserve an initializer");
+    };
+    drop(lease);
+
+    assert_eq!(
+        udp_conn_meta_raw(&handle, &key).await,
+        Some(direct),
+        "an uncommitted initializer must never offload"
+    );
+}
+
+#[tokio::test]
+async fn udp_offload_repeats_after_conn_state_sweep_without_leaking() {
+    let client = addr("10.0.0.2:53000");
+    let dst = addr("203.0.113.2:443");
+    let config = udp_offload_test_config("direct", vec![]);
+    let handle = udp_offload_test_handle(config, None);
+    let direct = seeded_meta_raw(honk_ebpf_common::OutboundIndex::Direct as u8, 0, 0);
+    let key = seed_udp_conn_state(&handle, client, dst, direct).await;
+
+    serve_test_udp_to(&handle, client, dst).await.unwrap();
+    assert_ne!(
+        udp_conn_meta_raw(&handle, &key).await.unwrap()
+            & honk_ebpf_common::ROUTING_META_FLAG_OFFLOAD,
+        0
+    );
+
+    // The flow goes silent: the idle reaper retires the userspace endpoint
+    // (30s) long before the datapath sweeps the conn_state (120s).  The next
+    // datagram then repeats the decide-and-offload cycle exactly once.
+    handle.udp_pool.remove(client, dst);
+    handle
+        .ebpf
+        .write()
+        .await
+        .udp_conn_state_remove(&key)
+        .unwrap();
+    let key = seed_udp_conn_state(&handle, client, dst, direct).await;
+
+    serve_test_udp_to(&handle, client, dst).await.unwrap();
+
+    assert_ne!(
+        udp_conn_meta_raw(&handle, &key).await.unwrap()
+            & honk_ebpf_common::ROUTING_META_FLAG_OFFLOAD,
+        0,
+        "re-created flow must be offloaded again"
+    );
+    assert_eq!(
+        handle.udp_pool.len(),
+        1,
+        "exactly one live endpoint generation"
+    );
+}
+
 #[test]
 fn udp_slow_admission_is_identical_for_ipv4_and_ipv6() {
     for (client, dst) in [
