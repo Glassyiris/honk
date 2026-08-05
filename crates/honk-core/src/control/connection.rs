@@ -174,6 +174,33 @@ pub(crate) fn build_tuples_key(
     key
 }
 
+/// Whether a fully-converged UDP flow decision may leave the userspace
+/// datapath via the per-flow offload bit.  Mirrors the mode semantics of the
+/// route-time offload policy (`DATAPATH_FLAG_OFFLOAD_*`): Rule — and
+/// clash-API-disabled, where no mode override ever applies — offloads a
+/// converged `direct` decision; Direct normalizes every
+/// non-`must`/non-`block` decision to `direct`, so the same condition
+/// covers it; Global keeps every non-`must` flow in userspace.  A proxied
+/// decision is never offloaded, and port 53 on either side is never
+/// offloaded: DNS hijack semantics depend on the DnsController seeing every
+/// packet (structurally, port-53 UDP has no conn_state to flag — this is
+/// the explicit guard that keeps it that way).
+pub(super) fn udp_post_decision_offload_allowed(
+    mode: Option<&crate::mode::ModeState>,
+    outbound_name: &str,
+    must: bool,
+    client_addr: SocketAddr,
+    original_dst: SocketAddr,
+) -> bool {
+    if outbound_name != "direct" {
+        return false;
+    }
+    if original_dst.port() == 53 || client_addr.port() == 53 {
+        return false;
+    }
+    must || !mode.is_some_and(|state| state.is_global())
+}
+
 impl ControlPlaneHandle {
     /// Look up the eBPF routing handoff entry for a connection, consuming it.
     ///
@@ -1672,11 +1699,73 @@ impl ControlPlaneHandle {
             self.stats.record_error(&outbound_name);
             return Err(error.into());
         }
+        self.maybe_offload_udp_flow(&tuples, &outbound_name, must, client_addr, original_dst)
+            .await;
         debug!(
             "Proxying UDP {} -> {} via {} (endpoint driver ready)",
             client_addr, original_dst, node.name
         );
         Ok(())
+    }
+
+    /// UDP post-decision kernel offload.  The flow's decision has fully
+    /// converged (routing, mode override, group selection) and the first
+    /// packet went out, so — unlike TCP, where the kernel must track
+    /// sequence state from the first byte — the flow may leave the
+    /// userspace datapath mid-stream: publish `ROUTING_META_FLAG_OFFLOAD`
+    /// on its conn_state and the `lan_ingress` established-UDP path passes
+    /// subsequent packets straight through.
+    ///
+    /// The Ready endpoint is deliberately kept: it delivers the in-flight
+    /// first reply (a single-shot UDP exchange must not lose it) and is
+    /// then reclaimed by the normal idle reaper together with its tracker
+    /// entry — a `direct` endpoint holds no AnyTLS/QUIC resources, so
+    /// nothing leaks.  Subsequent packets no longer enter userspace at all,
+    /// so offloaded flows stop appearing in `/connections` and their rx
+    /// bytes are not counted (rx is accounted at `dae0_ingress`), exactly
+    /// like route-time `must`-direct offload.  After 120s of silence the
+    /// conn_state is swept and the next datagram simply repeats this
+    /// decision-and-offload cycle.
+    async fn maybe_offload_udp_flow(
+        &self,
+        tuples: &TuplesKey,
+        outbound_name: &str,
+        must: bool,
+        client_addr: SocketAddr,
+        original_dst: SocketAddr,
+    ) {
+        let mode = self.mode_state.as_ref().map(|state| state.read().clone());
+        if !udp_post_decision_offload_allowed(
+            mode.as_ref(),
+            outbound_name,
+            must,
+            client_addr,
+            original_dst,
+        ) {
+            return;
+        }
+        // Best-effort: a write failure forfeits only the offload, the flow
+        // keeps working through userspace.
+        match self.ebpf.write().await.offload_udp_flow(tuples) {
+            Ok(true) => debug!(
+                network = "udp",
+                outbound = %outbound_name,
+                ip = %original_dst,
+                src = %client_addr,
+                ebpf_offload = true,
+                "UDP offloaded to eBPF: {} -> {}",
+                client_addr,
+                original_dst,
+            ),
+            Ok(false) => trace!(
+                "UDP offload skipped, no published conn_state: {} -> {}",
+                client_addr, original_dst,
+            ),
+            Err(error) => warn!(
+                "UDP offload write failed for {} -> {}; staying in userspace: {}",
+                client_addr, original_dst, error
+            ),
+        }
     }
 
     /// Dial through a node using the TCP connection pool.
