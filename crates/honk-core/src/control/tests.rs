@@ -2191,12 +2191,6 @@ impl honk_outbound::proxy::PacketOutbound for UdpOffloadTestHandler {
     }
 }
 
-/// The offload gate defaults to off (see connection.rs); these tests
-/// exercise the gated logic, so enable it.
-fn enable_udp_offload() {
-    unsafe { std::env::set_var("HONK_UDP_POST_DECISION_OFFLOAD", "1") }
-}
-
 /// Registers the offload test handler for both the Socks5 (proxy leaf) and
 /// Direct (built-in) protocols, and optionally installs a clash mode state.
 fn udp_offload_test_handle(
@@ -2237,6 +2231,7 @@ fn udp_offload_test_handle(
     if let Some(state) = clash {
         control_plane.set_mode_state(Arc::new(parking_lot::RwLock::new(state)));
     }
+    control_plane.udp_post_decision_offload = true;
     (control_plane.spawn_handle(), handler)
 }
 
@@ -2303,7 +2298,6 @@ async fn udp_conn_meta_raw(handle: &ControlPlaneHandle, key: &TuplesKey) -> Opti
 
 #[tokio::test]
 async fn udp_offload_converged_direct_marks_conn_state() {
-    enable_udp_offload();
     for (client, dst) in [
         (addr("10.0.0.2:53000"), addr("203.0.113.2:443")),
         (addr("[2001:db8::2]:53000"), addr("[2001:db8::3]:443")),
@@ -2344,7 +2338,6 @@ async fn udp_offload_converged_direct_marks_conn_state() {
 
 #[tokio::test]
 async fn udp_offload_direct_mode_normalizes_proxy_decision() {
-    enable_udp_offload();
     let client = addr("10.0.0.2:53000");
     let dst = addr("203.0.113.2:443");
     let config = udp_offload_test_config("udp-test", vec![udp_test_node()]);
@@ -2390,7 +2383,6 @@ async fn udp_offload_direct_mode_normalizes_proxy_decision() {
 
 #[tokio::test]
 async fn udp_offload_rule_mode_keeps_proxy_decision_in_userspace() {
-    enable_udp_offload();
     let client = addr("10.0.0.2:53000");
     let dst = addr("203.0.113.2:443");
     let config = udp_offload_test_config("udp-test", vec![udp_test_node()]);
@@ -2420,7 +2412,6 @@ async fn udp_offload_rule_mode_keeps_proxy_decision_in_userspace() {
 
 #[tokio::test]
 async fn udp_offload_global_mode_keeps_direct_decision_in_userspace() {
-    enable_udp_offload();
     let client = addr("10.0.0.2:53000");
     let dst = addr("203.0.113.2:443");
     let config = udp_offload_test_config("direct", vec![]);
@@ -2448,7 +2439,6 @@ async fn udp_offload_global_mode_keeps_direct_decision_in_userspace() {
 /// userspace relay — no offload, and its packet is relayed, never dropped.
 #[tokio::test]
 async fn udp_offload_non_quic_flow_stays_in_userspace() {
-    enable_udp_offload();
     let client = addr("10.0.0.2:53000");
     let dst = addr("203.0.113.2:443");
     let config = udp_offload_test_config("direct", vec![]);
@@ -2478,7 +2468,6 @@ async fn udp_offload_non_quic_flow_stays_in_userspace() {
 /// QUIC, so a converged-direct decision may offload it.
 #[tokio::test]
 async fn udp_offload_quic_initial_without_sni_is_confirmed() {
-    enable_udp_offload();
     let client = addr("10.0.0.2:53000");
     let dst = addr("203.0.113.2:443");
     let config = udp_offload_test_config("direct", vec![]);
@@ -2505,7 +2494,6 @@ async fn udp_offload_quic_initial_without_sni_is_confirmed() {
 
 #[tokio::test]
 async fn udp_offload_uncommitted_initializer_never_marks_conn_state() {
-    enable_udp_offload();
     let client = addr("10.0.0.2:53000");
     let dst = addr("203.0.113.2:443");
     let config = udp_offload_test_config("direct", vec![]);
@@ -2534,7 +2522,6 @@ async fn udp_offload_uncommitted_initializer_never_marks_conn_state() {
 
 #[tokio::test]
 async fn udp_offload_repeats_after_conn_state_sweep_without_leaking() {
-    enable_udp_offload();
     let client = addr("10.0.0.2:53000");
     let dst = addr("203.0.113.2:443");
     let config = udp_offload_test_config("direct", vec![]);
@@ -2629,7 +2616,6 @@ async fn domain_route_bitmap(
 
 #[tokio::test]
 async fn udp_offload_writes_domain_bitmap_for_sniffed_direct_flow() {
-    enable_udp_offload();
     for (client, dst) in [
         (addr("10.0.0.2:53000"), addr("203.0.113.2:443")),
         (addr("[2001:db8::2]:53000"), addr("[2001:db8::3]:443")),
@@ -2681,7 +2667,6 @@ async fn udp_offload_writes_domain_bitmap_for_sniffed_direct_flow() {
 
 #[tokio::test]
 async fn udp_offload_domain_bitmap_survives_conn_state_sweep() {
-    enable_udp_offload();
     let client = addr("10.0.0.2:53000");
     let dst = addr("203.0.113.2:443");
     let (handle, handler) = udp_offload_test_handle(udp_offload_domain_rule_config(), None);
@@ -2724,7 +2709,6 @@ async fn udp_offload_domain_bitmap_survives_conn_state_sweep() {
 
 #[tokio::test]
 async fn udp_offload_domain_bitmap_write_failure_is_not_fatal() {
-    enable_udp_offload();
     let client = addr("10.0.0.2:53000");
     let dst = addr("203.0.113.2:443");
     let (handle, handler) = udp_offload_test_handle(udp_offload_domain_rule_config(), None);
@@ -2761,6 +2745,200 @@ async fn udp_offload_domain_bitmap_write_failure_is_not_fatal() {
     assert_eq!(handler.dial_count(), 0);
 }
 
+/// A genuine QUIC v1 client Initial whose ClientHello SNI is split across
+/// two CRYPTO fragments (two Initial packets).
+fn split_quic_initial(sni: &str) -> (Vec<u8>, Vec<u8>) {
+    use super::quic::test_utils;
+    let hello = test_utils::build_client_hello(Some(sni));
+    let split = 40;
+    (
+        test_utils::protect_initial_packet(
+            b"dcid1234",
+            b"",
+            super::quic::QUIC_VERSION_1,
+            0,
+            1,
+            &test_utils::wrap_crypto_frame(0, &hello[..split]),
+        ),
+        test_utils::protect_initial_packet(
+            b"dcid1234",
+            b"",
+            super::quic::QUIC_VERSION_1,
+            1,
+            1,
+            &test_utils::wrap_crypto_frame(split as u64, &hello[split..]),
+        ),
+    )
+}
+
+/// Reserve an initializer with the first fragment, queue the second as a
+/// follower, then serve.
+async fn serve_split_initial(
+    handle: &ControlPlaneHandle,
+    client: SocketAddr,
+    dst: SocketAddr,
+    first: &[u8],
+    second: &[u8],
+) -> anyhow::Result<()> {
+    let slow_permit = Arc::new(tokio::sync::Semaphore::new(1))
+        .try_acquire_owned()
+        .expect("test slow permit");
+    let crate::control::udp_endpoint::EndpointReservation::Initializing(lease) = handle
+        .udp_pool
+        .reserve_or_enqueue(client, dst, first, slow_permit, &handle.stats)
+    else {
+        panic!("fresh flow must reserve an initializer");
+    };
+    let follower_permit = Arc::new(tokio::sync::Semaphore::new(1))
+        .try_acquire_owned()
+        .expect("test slow permit");
+    assert!(matches!(
+        handle
+            .udp_pool
+            .reserve_or_enqueue(client, dst, second, follower_permit, &handle.stats),
+        crate::control::udp_endpoint::EndpointReservation::Enqueued
+    ));
+    handle
+        .serve_udp_connection(
+            lease,
+            Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+        )
+        .await
+}
+
+/// A fragmented ClientHello whose SNI matches a proxy domain rule: the
+/// engine must collect the follower fragment, complete the sniff, and relay
+/// via the proxy — never offload on the IP-only first-fragment view.
+#[tokio::test]
+async fn udp_offload_fragmented_client_hello_proxy_domain_is_not_offloaded() {
+    let client = addr("10.0.0.2:53000");
+    let dst = addr("203.0.113.2:443");
+    let mut config = udp_offload_test_config("direct", vec![udp_test_node()]);
+    let mut rule = domain_rule("udp-test");
+    rule.name = "split-proxy".into();
+    rule.condition.domain_suffix = vec!["split-proxy.example".into()];
+    config.routing.rules = vec![rule];
+    config.global.dial_mode = "domain++".into();
+    let (handle, handler) = udp_offload_test_handle(config, None);
+    let proxied = seeded_meta_raw(
+        honk_ebpf_common::OutboundIndex::UserBase as u8,
+        honk_ebpf_common::TPROXY_MARK,
+        0,
+    );
+    let key = seed_udp_conn_state(&handle, client, dst, proxied).await;
+    let (first, second) = split_quic_initial("split-proxy.example");
+
+    serve_split_initial(&handle, client, dst, &first, &second)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        udp_conn_meta_raw(&handle, &key).await,
+        Some(proxied),
+        "a flow whose fragmented SNI matches a proxy rule must never be offloaded"
+    );
+    assert!(handle.udp_pool.get(client, dst).is_some());
+    assert_eq!(handler.dial_count(), 1);
+}
+
+/// The same fragmented ClientHello converging to direct is collected and
+/// then offloaded exactly like a single-Initial flow.
+#[tokio::test]
+async fn udp_offload_fragmented_client_hello_direct_offloads_after_collection() {
+    let client = addr("10.0.0.2:53000");
+    let dst = addr("203.0.113.2:443");
+    let mut config = udp_offload_test_config("direct", vec![]);
+    config.global.dial_mode = "domain++".into();
+    let (handle, handler) = udp_offload_test_handle(config, None);
+    let direct = seeded_meta_raw(honk_ebpf_common::OutboundIndex::Direct as u8, 0, 0);
+    let key = seed_udp_conn_state(&handle, client, dst, direct).await;
+    let (first, second) = split_quic_initial("quic.example.org");
+
+    serve_split_initial(&handle, client, dst, &first, &second)
+        .await
+        .unwrap();
+
+    let raw = udp_conn_meta_raw(&handle, &key)
+        .await
+        .expect("conn state kept");
+    assert_ne!(
+        raw & honk_ebpf_common::ROUTING_META_FLAG_OFFLOAD,
+        0,
+        "a fragmented CH that resolves to direct must still be offloaded"
+    );
+    assert!(handle.udp_pool.is_empty());
+    assert_eq!(handler.dial_count(), 0);
+}
+
+/// P1a regression, with the real production removal worker: the offload
+/// handoff (`commit_offloaded` / KernelOffloadHandoff) must leave the
+/// offloaded conn_state in place — a plain lease drop would notify
+/// UserspaceEndpointRetired and the worker would delete the very conn_state
+/// that anchors the offload, bouncing the retransmission back to userspace.
+#[tokio::test]
+async fn udp_offload_conn_state_survives_production_removal_worker() {
+    let client = addr("10.0.0.2:53000");
+    let dst = addr("203.0.113.2:443");
+    let (handle, handler) =
+        udp_offload_test_handle(udp_offload_test_config("direct", vec![]), None);
+    let worker = super::spawn_udp_removal_worker(
+        handle.udp_pool.clone(),
+        handle.ebpf.clone(),
+        handle.connection_tracker.clone(),
+    );
+
+    let key = seed_udp_conn_state(
+        &handle,
+        client,
+        dst,
+        seeded_meta_raw(honk_ebpf_common::OutboundIndex::Direct as u8, 0, 0),
+    )
+    .await;
+    let initial = quic_initial_payload(Some("quic.example.org"));
+    serve_test_udp_to(&handle, client, dst, &initial)
+        .await
+        .unwrap();
+    assert!(
+        handle.udp_pool.is_empty(),
+        "commit_offloaded retires the reservation"
+    );
+
+    // Push a real userspace-endpoint retirement through the same worker and
+    // wait for its conn_state deletion — the FIFO channel then proves the
+    // earlier KernelOffloadHandoff notification was already processed.
+    let client2 = addr("10.0.0.3:53001");
+    let dst2 = addr("203.0.113.9:443");
+    let key2 = seed_udp_conn_state(
+        &handle,
+        client2,
+        dst2,
+        seeded_meta_raw(honk_ebpf_common::OutboundIndex::Direct as u8, 0, 0),
+    )
+    .await;
+    serve_test_udp_to(&handle, client2, dst2, b"plain udp payload")
+        .await
+        .unwrap();
+    assert!(handle.udp_pool.get(client2, dst2).is_some());
+    handle.udp_pool.remove(client2, dst2);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if udp_conn_meta_raw(&handle, &key2).await.is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the removal worker must retire a userspace endpoint's conn_state");
+    assert_eq!(handler.dial_count(), 1);
+
+    let raw = udp_conn_meta_raw(&handle, &key)
+        .await
+        .expect("the offloaded conn_state must survive the removal worker");
+    assert_ne!(raw & honk_ebpf_common::ROUTING_META_FLAG_OFFLOAD, 0);
+    worker.abort();
+}
+
 /// End-to-end drop-and-reinject: a real quinn client's first Initial is fed
 /// to the engine (which offloads the flow and drops the packet), the
 /// client's retransmission is then forwarded along the "kernel path" stand-
@@ -2771,7 +2949,6 @@ async fn udp_offload_domain_bitmap_write_failure_is_not_fatal() {
 /// must never appear on the wire).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn udp_offload_quic_handshake_after_initial_drop_keeps_single_server_tuple() {
-    enable_udp_offload();
     use tokio_rustls::rustls;
 
     // QUIC server (rustls, self-signed "localhost").
@@ -2965,6 +3142,520 @@ async fn udp_offload_quic_handshake_after_initial_drop_keeps_single_server_tuple
         0,
         "the engine must never relay an offloaded flow (no ephemeral socket on the wire)"
     );
+}
+
+/// Quantify the cost the drop-and-reinject offload adds to a QUIC handshake:
+/// exactly one Initial PTO.  A plain relay harness forwards everything
+/// except — in the drop run — the client's very first datagram.  Prints both
+/// handshake times; the assertion stays deliberately loose (the numbers are
+/// for the commit message / docs).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn udp_offload_pto_cost_measurement() {
+    use tokio_rustls::rustls;
+    let mut timings = Vec::new();
+    for drop_first in [false, true] {
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let mut tls_server = rustls::ServerConfig::builder_with_provider(
+            rustls::crypto::aws_lc_rs::default_provider().into(),
+        )
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.der().clone()],
+            rustls::pki_types::PrivateKeyDer::Pkcs8(signing_key.serialize_der().into()),
+        )
+        .unwrap();
+        tls_server.alpn_protocols = vec![b"h3".to_vec()];
+        let server_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls_server).unwrap();
+        let server_ep = quinn::Endpoint::server(
+            quinn::ServerConfig::with_crypto(Arc::new(server_crypto)),
+            addr("127.0.0.1:0"),
+        )
+        .unwrap();
+        let server_addr = server_ep.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let incoming = server_ep.accept().await.expect("server must accept");
+            incoming.await.expect("server-side handshake")
+        });
+
+        // Relay: client-facing socket + server-facing socket; optionally
+        // drop the first client datagram (the offloaded Initial).
+        let front = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let front_addr = front.local_addr().unwrap();
+        let back = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client_slot = Arc::new(std::sync::Mutex::new(None::<SocketAddr>));
+        {
+            let front = front.clone();
+            let back = back.clone();
+            let client_slot = client_slot.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65536];
+                let mut dropped = false;
+                loop {
+                    let (n, peer) = front.recv_from(&mut buf).await.unwrap();
+                    *client_slot.lock().unwrap() = Some(peer);
+                    if drop_first && !dropped {
+                        dropped = true;
+                        continue;
+                    }
+                    back.send_to(&buf[..n], server_addr).await.unwrap();
+                }
+            });
+        }
+        {
+            let front = front.clone();
+            let back = back.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65536];
+                loop {
+                    let (n, peer) = back.recv_from(&mut buf).await.unwrap();
+                    if peer != server_addr {
+                        continue;
+                    }
+                    let client = *client_slot.lock().unwrap();
+                    if let Some(client) = client {
+                        front.send_to(&buf[..n], client).await.unwrap();
+                    }
+                }
+            });
+        }
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.der().clone()).unwrap();
+        let mut tls_client = rustls::ClientConfig::builder_with_provider(
+            rustls::crypto::aws_lc_rs::default_provider().into(),
+        )
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        tls_client.alpn_protocols = vec![b"h3".to_vec()];
+        let client_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls_client).unwrap();
+        let mut client_config = quinn::ClientConfig::new(Arc::new(client_crypto));
+        let mut transport = quinn::TransportConfig::default();
+        transport.initial_rtt(Duration::from_millis(50));
+        client_config.transport_config(Arc::new(transport));
+        let mut client_ep = quinn::Endpoint::client(addr("127.0.0.1:0")).unwrap();
+        client_ep.set_default_client_config(client_config);
+
+        let started = std::time::Instant::now();
+        let connection = tokio::time::timeout(
+            Duration::from_secs(15),
+            client_ep.connect(front_addr, "localhost").unwrap(),
+        )
+        .await
+        .expect("handshake must complete")
+        .expect("connect failed");
+        let elapsed = started.elapsed();
+        timings.push((drop_first, elapsed));
+        connection.close(0u32.into(), b"done");
+        server_task.abort();
+        client_ep.close(0u32.into(), b"done");
+    }
+    let baseline = timings[0].1;
+    let dropped = timings[1].1;
+    eprintln!(
+        "drop-and-reinject PTO cost: baseline={baseline:?} drop-first-initial={dropped:?} delta={:?}",
+        dropped - baseline
+    );
+    assert!(
+        dropped < Duration::from_secs(5),
+        "one Initial PTO must stay bounded"
+    );
+}
+
+/// Run a command, panicking with stderr on failure (netns test setup).
+#[cfg(target_os = "linux")]
+fn run_cmd(program: &str, args: &[&str]) {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("spawn {program}: {e}"));
+    assert!(
+        output.status.success(),
+        "{program} {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Run `f` inside the named network namespace, restoring the caller's
+/// namespace afterwards.  Socket creation pins the fd to the namespace it
+/// was created in, so the returned socket keeps working after the restore.
+#[cfg(target_os = "linux")]
+fn with_netns<R>(name: &str, f: impl FnOnce() -> R) -> R {
+    use std::os::fd::AsRawFd;
+    let current = std::fs::File::open("/proc/thread-self/ns/net").unwrap();
+    let target = std::fs::File::open(format!("/var/run/netns/{name}")).expect("named netns exists");
+    assert_eq!(
+        unsafe { libc::setns(target.as_raw_fd(), libc::CLONE_NEWNET) },
+        0
+    );
+    let result = f();
+    assert_eq!(
+        unsafe { libc::setns(current.as_raw_fd(), libc::CLONE_NEWNET) },
+        0
+    );
+    result
+}
+
+/// Real netns/kernel-path variant of the drop-and-reinject e2e: three
+/// namespaces (client — root gateway — server) with genuine kernel routing.
+/// A stateless TPROXY rule diverts only the flow's first datagram(s) to the
+/// harness (which feeds the engine and lets it offload+drop); deleting the
+/// rule then lets the client's retransmission flow entirely through the
+/// kernel.  The server must observe the client's real tuple end-to-end —
+/// no userspace socket ever appears on the wire.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires root; run via just test-netns"]
+async fn udp_offload_netns_retransmit_uses_real_kernel_path() {
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("skipping: requires root");
+        return;
+    }
+    use tokio_rustls::rustls;
+
+    let pid = std::process::id();
+    let ns_cl = format!("honkcl{pid}");
+    let ns_srv = format!("honksrv{pid}");
+    let v_cl = format!("vcl{pid}");
+    let v_cl_br = format!("vcb{pid}");
+    let v_srv = format!("vsv{pid}");
+    let v_srv_br = format!("vsb{pid}");
+    const CLIENT_IP: &str = "10.177.0.2";
+    const SERVER_IP: &str = "10.177.1.2";
+    const SERVER_PORT: u16 = 4433;
+    const HARNESS_PORT: u16 = 14434;
+
+    // Best-effort teardown of everything the setup created.
+    struct Cleanup {
+        rule: Vec<String>,
+        ns_cl: String,
+        ns_srv: String,
+        ip_forward_was: String,
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("iptables")
+                .args(&self.rule)
+                .output();
+            let _ = std::process::Command::new("ip")
+                .args(["rule", "del", "fwmark", "0x66/0x66", "lookup", "106"])
+                .output();
+            let _ = std::process::Command::new("ip")
+                .args(["route", "flush", "table", "106"])
+                .output();
+            for ns in [&self.ns_cl, &self.ns_srv] {
+                let _ = std::process::Command::new("ip")
+                    .args(["netns", "del", ns])
+                    .output();
+            }
+            let _ = std::fs::write(
+                "/proc/sys/net/ipv4/ip_forward",
+                self.ip_forward_was.as_bytes(),
+            );
+        }
+    }
+
+    let ip_forward_was =
+        std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward").unwrap_or_else(|_| "1\n".into());
+    let rule: Vec<String> = [
+        "-t",
+        "mangle",
+        "-D",
+        "PREROUTING",
+        "-i",
+        &v_cl_br,
+        "-p",
+        "udp",
+        "-d",
+        SERVER_IP,
+        "--dport",
+        "4433",
+        "-j",
+        "TPROXY",
+        "--on-ip",
+        "127.0.0.1",
+        "--on-port",
+        "14434",
+        "--tproxy-mark",
+        "0x66/0x66",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let _cleanup = Cleanup {
+        rule,
+        ns_cl: ns_cl.clone(),
+        ns_srv: ns_srv.clone(),
+        ip_forward_was,
+    };
+
+    run_cmd("ip", &["netns", "add", &ns_cl]);
+    run_cmd("ip", &["netns", "add", &ns_srv]);
+    run_cmd(
+        "ip",
+        &[
+            "link", "add", &v_cl, "type", "veth", "peer", "name", &v_cl_br,
+        ],
+    );
+    run_cmd(
+        "ip",
+        &[
+            "link", "add", &v_srv, "type", "veth", "peer", "name", &v_srv_br,
+        ],
+    );
+    run_cmd("ip", &["link", "set", &v_cl, "netns", &ns_cl]);
+    run_cmd("ip", &["link", "set", &v_srv, "netns", &ns_srv]);
+    run_cmd("ip", &["addr", "add", "10.177.0.1/24", "dev", &v_cl_br]);
+    run_cmd("ip", &["link", "set", &v_cl_br, "up"]);
+    run_cmd("ip", &["addr", "add", "10.177.1.1/24", "dev", &v_srv_br]);
+    run_cmd("ip", &["link", "set", &v_srv_br, "up"]);
+    for (ns, dev, ip_addr, gw) in [
+        (&ns_cl, &v_cl, "10.177.0.2/24", "10.177.0.1"),
+        (&ns_srv, &v_srv, "10.177.1.2/24", "10.177.1.1"),
+    ] {
+        run_cmd(
+            "ip",
+            &["netns", "exec", ns, "ip", "link", "set", "lo", "up"],
+        );
+        run_cmd(
+            "ip",
+            &[
+                "netns", "exec", ns, "ip", "addr", "add", ip_addr, "dev", dev,
+            ],
+        );
+        run_cmd("ip", &["netns", "exec", ns, "ip", "link", "set", dev, "up"]);
+        run_cmd(
+            "ip",
+            &[
+                "netns", "exec", ns, "ip", "route", "add", "default", "via", gw,
+            ],
+        );
+    }
+    std::fs::write("/proc/sys/net/ipv4/ip_forward", "1").unwrap();
+    run_cmd(
+        "ip",
+        &["rule", "add", "fwmark", "0x66/0x66", "lookup", "106"],
+    );
+    run_cmd(
+        "ip",
+        &[
+            "route",
+            "add",
+            "local",
+            "0.0.0.0/0",
+            "dev",
+            "lo",
+            "table",
+            "106",
+        ],
+    );
+    run_cmd(
+        "iptables",
+        &[
+            "-t",
+            "mangle",
+            "-A",
+            "PREROUTING",
+            "-i",
+            &v_cl_br,
+            "-p",
+            "udp",
+            "-d",
+            SERVER_IP,
+            "--dport",
+            "4433",
+            "-j",
+            "TPROXY",
+            "--on-ip",
+            "127.0.0.1",
+            "--on-port",
+            "14434",
+            "--tproxy-mark",
+            "0x66/0x66",
+        ],
+    );
+
+    // Harness socket: the TPROXY target for the flow's first datagram(s).
+    // IP_TRANSPARENT must be set before bind so the TPROXY socket lookup
+    // finds it.
+    let harness_std = {
+        use std::os::fd::AsRawFd;
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .unwrap();
+        let one: libc::c_int = 1;
+        let rc = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_IP,
+                libc::IP_TRANSPARENT,
+                &one as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of_val(&one) as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "IP_TRANSPARENT");
+        socket
+            .bind(&SocketAddr::from(([127, 0, 0, 1], HARNESS_PORT)).into())
+            .unwrap();
+        socket.set_nonblocking(true).unwrap();
+        std::net::UdpSocket::from(socket)
+    };
+    let harness = UdpSocket::from_std(harness_std).unwrap();
+
+    // QUIC server living in the server namespace.
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let mut tls_server = rustls::ServerConfig::builder_with_provider(
+        rustls::crypto::aws_lc_rs::default_provider().into(),
+    )
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![cert.der().clone()],
+        rustls::pki_types::PrivateKeyDer::Pkcs8(signing_key.serialize_der().into()),
+    )
+    .unwrap();
+    tls_server.alpn_protocols = vec![b"h3".to_vec()];
+    let server_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls_server).unwrap();
+    let server_socket = with_netns(&ns_srv, || {
+        let socket = std::net::UdpSocket::bind(("0.0.0.0", SERVER_PORT)).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        socket
+    });
+    let server_ep = quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(quinn::ServerConfig::with_crypto(Arc::new(server_crypto))),
+        server_socket,
+        quinn::default_runtime().unwrap(),
+    )
+    .unwrap();
+    let server_task = tokio::spawn(async move {
+        let incoming = server_ep.accept().await.expect("server must accept");
+        incoming.await.expect("server-side handshake")
+    });
+
+    // Engine under test (mock backend): decides the diverted first datagram.
+    let (handle, handler) =
+        udp_offload_test_handle(udp_offload_test_config("direct", vec![]), None);
+    let server_addr = addr(&format!("{SERVER_IP}:{SERVER_PORT}"));
+
+    // QUIC client living in the client namespace.
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert.der().clone()).unwrap();
+    let mut tls_client = rustls::ClientConfig::builder_with_provider(
+        rustls::crypto::aws_lc_rs::default_provider().into(),
+    )
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    tls_client.alpn_protocols = vec![b"h3".to_vec()];
+    let client_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls_client).unwrap();
+    let mut client_config = quinn::ClientConfig::new(Arc::new(client_crypto));
+    let mut transport = quinn::TransportConfig::default();
+    transport.initial_rtt(Duration::from_millis(50));
+    client_config.transport_config(Arc::new(transport));
+    let client_socket = with_netns(&ns_cl, || {
+        let socket = std::net::UdpSocket::bind(("0.0.0.0", 0)).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        socket
+    });
+    let mut client_ep = quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        None,
+        client_socket,
+        quinn::default_runtime().unwrap(),
+    )
+    .unwrap();
+    client_ep.set_default_client_config(client_config);
+
+    // Start the client first: its Initial is what the harness waits for.
+    let connecting = client_ep.connect(server_addr, "localhost").unwrap();
+
+    // The client's first Initial arrives via TPROXY; feed it to the engine
+    // exactly like the production slow path (kernel route-time publication
+    // emulated by the seed).
+    let mut buf = vec![0u8; 65536];
+    let (n, peer) = tokio::time::timeout(Duration::from_secs(5), harness.recv_from(&mut buf))
+        .await
+        .expect("the client's Initial must be diverted to the harness")
+        .unwrap();
+    assert_eq!(peer.ip().to_string(), CLIENT_IP);
+    seed_udp_conn_state(
+        &handle,
+        peer,
+        server_addr,
+        seeded_meta_raw(honk_ebpf_common::OutboundIndex::Direct as u8, 0, 0),
+    )
+    .await;
+    let slow_permit = Arc::new(tokio::sync::Semaphore::new(1))
+        .try_acquire_owned()
+        .expect("harness slow permit");
+    if let crate::control::udp_endpoint::EndpointReservation::Initializing(lease) = handle
+        .udp_pool
+        .reserve_or_enqueue(peer, server_addr, &buf[..n], slow_permit, &handle.stats)
+    {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        handle.serve_udp_connection(lease, socket).await.unwrap();
+    }
+    assert_eq!(
+        handler.dial_count(),
+        0,
+        "the engine must drop-and-reinject, never relay"
+    );
+    // The offload is published: remove the divert rule so the client's
+    // retransmission takes the real kernel path, end to end.
+    run_cmd(
+        "iptables",
+        &[
+            "-t",
+            "mangle",
+            "-D",
+            "PREROUTING",
+            "-i",
+            &v_cl_br,
+            "-p",
+            "udp",
+            "-d",
+            SERVER_IP,
+            "--dport",
+            "4433",
+            "-j",
+            "TPROXY",
+            "--on-ip",
+            "127.0.0.1",
+            "--on-port",
+            "14434",
+            "--tproxy-mark",
+            "0x66/0x66",
+        ],
+    );
+
+    let connection = tokio::time::timeout(Duration::from_secs(15), connecting)
+        .await
+        .expect("QUIC handshake must complete over the real kernel path after the Initial drop")
+        .expect("QUIC connect failed");
+    let server_conn = tokio::time::timeout(Duration::from_secs(15), server_task)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        server_conn.remote_address(),
+        peer,
+        "the server must see the client's real tuple — no userspace socket on the wire"
+    );
+    assert_eq!(handler.dial_count(), 0);
+    connection.close(0u32.into(), b"done");
 }
 
 #[test]

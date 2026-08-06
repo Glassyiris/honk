@@ -277,8 +277,26 @@ impl EndpointKey {
     }
 }
 
-/// Message sent to the endpoint-removal sink: `(client, dst, conn_id)`.
-type EndpointRemoval = (SocketAddr, SocketAddr, Option<String>);
+/// Why a UDP pool entry went away.  The removal worker retires the flow's
+/// conntrack entries only when userspace owned the datapath.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum RemovalReason {
+    /// A userspace endpoint (or its uncommitted reservation) is gone; the
+    /// flow's conntrack entries are retired with it.
+    UserspaceEndpointRetired,
+    /// The flow was handed to the kernel (drop-and-reinject offload): its
+    /// conn_state now anchors the offloaded flow and must NOT be deleted.
+    KernelOffloadHandoff,
+}
+
+/// Message sent to the endpoint-removal sink.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct EndpointRemoval {
+    pub(crate) client: SocketAddr,
+    pub(crate) dst: SocketAddr,
+    pub(crate) conn_id: Option<String>,
+    pub(crate) reason: RemovalReason,
+}
 
 /// A synchronously-created anyfrom socket. The default factory calls the
 /// daens-scoped production helper; tests and embedders may inject a real
@@ -303,6 +321,12 @@ pub(super) struct QueuedDatagram {
     data: Bytes,
     _flow_permit: OwnedSemaphorePermit,
     _global_byte_permit: Option<OwnedSemaphorePermit>,
+}
+
+impl QueuedDatagram {
+    pub(super) fn payload(&self) -> &[u8] {
+        &self.data
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -585,6 +609,45 @@ impl UdpInitLease {
         self.committed = true;
         true
     }
+
+    /// Terminal state for the drop-and-reinject kernel offload: the flow's
+    /// conn_state now carries the offload bit, so this reservation is
+    /// retired with a `KernelOffloadHandoff` removal reason — the production
+    /// removal worker must NOT delete that conn_state (a plain drop would
+    /// unwind the offload and bounce the retransmission back to userspace).
+    /// Generation/epoch-safe exactly like `commit_ready`; on failure the
+    /// caller must not treat the flow as offloaded.  Releases the first
+    /// datagram, queued followers, and every permit exactly like a drop.
+    pub(super) fn commit_offloaded(&mut self) -> bool {
+        // Same map-entry → epoch-gate order as reservation and commit_ready.
+        let occupied = match self.pool.endpoints.entry(self.key) {
+            dashmap::mapref::entry::Entry::Occupied(occupied) => occupied,
+            dashmap::mapref::entry::Entry::Vacant(_) => return false,
+        };
+        let _epoch_gate = self.pool.initialization_epoch.lock();
+        if self.pool.terminal.load(Ordering::Acquire) || self.epoch != *_epoch_gate {
+            return false;
+        }
+        if !matches!(
+            occupied.get(),
+            EndpointEntry::Initializing(initializing)
+                if initializing.generation == self.generation
+        ) {
+            return false;
+        }
+        let entry = occupied.remove();
+        // No tracker was registered on this path, so this carries no conn_id;
+        // the reason is what matters to the removal worker.
+        let conn_id = entry.retire();
+        self.pool.notify_removed(
+            SocketAddr::new(self.key.client_ip(), self.key.client_port),
+            SocketAddr::new(self.key.dst_ip(), self.key.dst_port),
+            conn_id,
+            RemovalReason::KernelOffloadHandoff,
+        );
+        self.committed = true;
+        true
+    }
 }
 
 impl Drop for UdpInitLease {
@@ -778,7 +841,7 @@ impl UdpEndpointPool {
         self.reply_socket_factory.create(original_dst)
     }
 
-    pub fn set_remove_sink(&self, tx: tokio::sync::mpsc::Sender<EndpointRemoval>) {
+    pub(crate) fn set_remove_sink(&self, tx: tokio::sync::mpsc::Sender<EndpointRemoval>) {
         *self.remove_sink.lock() = Some(tx);
         self.flush_removal_dirty();
     }
@@ -808,8 +871,19 @@ impl UdpEndpointPool {
         }
     }
 
-    fn notify_removed(&self, client: SocketAddr, dst: SocketAddr, conn_id: Option<String>) {
-        let removal = (client, dst, conn_id);
+    fn notify_removed(
+        &self,
+        client: SocketAddr,
+        dst: SocketAddr,
+        conn_id: Option<String>,
+        reason: RemovalReason,
+    ) {
+        let removal = EndpointRemoval {
+            client,
+            dst,
+            conn_id,
+            reason,
+        };
         let delivered = self
             .remove_sink
             .lock()
@@ -1089,6 +1163,7 @@ impl UdpEndpointPool {
                 SocketAddr::new(key.client_ip(), key.client_port),
                 SocketAddr::new(key.dst_ip(), key.dst_port),
                 conn_id,
+                RemovalReason::UserspaceEndpointRetired,
             );
             true
         } else {
@@ -2287,7 +2362,12 @@ mod tests {
 
         assert_eq!(
             removed_rx.try_recv().unwrap(),
-            (client, dst, Some("tracker-before-commit".to_owned()))
+            EndpointRemoval {
+                client,
+                dst,
+                conn_id: Some("tracker-before-commit".to_owned()),
+                reason: RemovalReason::UserspaceEndpointRetired,
+            }
         );
         assert!(matches!(
             removed_rx.try_recv(),
@@ -2727,7 +2807,12 @@ mod tests {
         tokio::time::advance(REPLY_IDLE_TIMEOUT).await;
         assert_eq!(
             removed_rx.recv().await,
-            Some((client, dst, Some("idle-tracker".to_owned())))
+            Some(EndpointRemoval {
+                client,
+                dst,
+                conn_id: Some("idle-tracker".to_owned()),
+                reason: RemovalReason::UserspaceEndpointRetired,
+            })
         );
         assert!(pool.is_empty());
         let history = alive.get_probe_history(
@@ -2809,7 +2894,12 @@ mod tests {
         );
         assert_eq!(
             removed_rx.recv().await,
-            Some((client, dst, Some("shutdown-tracker".to_owned())))
+            Some(EndpointRemoval {
+                client,
+                dst,
+                conn_id: Some("shutdown-tracker".to_owned()),
+                reason: RemovalReason::UserspaceEndpointRetired,
+            })
         );
         assert_eq!(removed_rx.recv().await, None);
         assert_eq!(
@@ -2862,7 +2952,12 @@ mod tests {
         assert_eq!(stats.snapshot()["stuck-initializer"].active_conns, 0);
         assert_eq!(
             removed_rx.recv().await,
-            Some((client, dst, Some("stuck-tracker".to_owned())))
+            Some(EndpointRemoval {
+                client,
+                dst,
+                conn_id: Some("stuck-tracker".to_owned()),
+                reason: RemovalReason::UserspaceEndpointRetired,
+            })
         );
         assert_eq!(removed_rx.recv().await, None);
         assert_eq!(
@@ -2931,7 +3026,12 @@ mod tests {
             driver.wait_first_ack().await.unwrap();
             assert_eq!(
                 removed_rx.recv().await,
-                Some((client, dst, Some("receive-tracker".to_owned())))
+                Some(EndpointRemoval {
+                    client,
+                    dst,
+                    conn_id: Some("receive-tracker".to_owned()),
+                    reason: RemovalReason::UserspaceEndpointRetired,
+                })
             );
             assert!(pool.is_empty());
             let history = alive.get_probe_history(
@@ -3001,7 +3101,12 @@ mod tests {
         receive_failure.notify_waiters();
         assert_eq!(
             removed_rx.recv().await,
-            Some((client, dst, Some("blocked-receive-tracker".to_owned())))
+            Some(EndpointRemoval {
+                client,
+                dst,
+                conn_id: Some("blocked-receive-tracker".to_owned()),
+                reason: RemovalReason::UserspaceEndpointRetired,
+            })
         );
         assert!(pool.is_empty());
         assert_eq!(
@@ -3056,7 +3161,12 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(1), removed_rx.recv())
                 .await
                 .unwrap(),
-            Some((client, dst, Some("worker-tracker".to_owned())))
+            Some(EndpointRemoval {
+                client,
+                dst,
+                conn_id: Some("worker-tracker".to_owned()),
+                reason: RemovalReason::UserspaceEndpointRetired,
+            })
         );
         tokio::task::yield_now().await;
         assert!(matches!(
@@ -3110,7 +3220,12 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(1), removed_rx.recv())
                 .await
                 .expect("panic cleanup must notify the removal sink"),
-            Some((client, dst, Some("panic-tracker".to_owned())))
+            Some(EndpointRemoval {
+                client,
+                dst,
+                conn_id: Some("panic-tracker".to_owned()),
+                reason: RemovalReason::UserspaceEndpointRetired,
+            })
         );
         assert!(pool.is_empty());
         assert_eq!(endpoint.ref_count(), 0, "endpoint.release must run once");
@@ -3172,7 +3287,12 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(1), removed_rx.recv())
                 .await
                 .expect("aborted driver must notify the removal sink"),
-            Some((client, dst, Some("abort-tracker".to_owned())))
+            Some(EndpointRemoval {
+                client,
+                dst,
+                conn_id: Some("abort-tracker".to_owned()),
+                reason: RemovalReason::UserspaceEndpointRetired,
+            })
         );
         assert!(pool.is_empty());
         assert_eq!(endpoint.ref_count(), 0, "endpoint.release must run once");
@@ -3246,7 +3366,12 @@ mod tests {
         pool.remove(client, dst);
         assert_eq!(
             removed_rx.try_recv().unwrap(),
-            (client, dst, Some("old-tracker".to_owned()))
+            EndpointRemoval {
+                client,
+                dst,
+                conn_id: Some("old-tracker".to_owned()),
+                reason: RemovalReason::UserspaceEndpointRetired,
+            }
         );
         let replacement_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
         let replacement =
@@ -3291,7 +3416,15 @@ mod tests {
         );
         assert!(pool.is_empty());
         // No tracker was attached yet, so sink sees None conn_id.
-        assert_eq!(removed_rx.try_recv().unwrap(), (client, dst, None));
+        assert_eq!(
+            removed_rx.try_recv().unwrap(),
+            EndpointRemoval {
+                client,
+                dst,
+                conn_id: None,
+                reason: RemovalReason::UserspaceEndpointRetired,
+            }
+        );
 
         let relay = make_addr("192.168.1.1", 1080);
         let transport = Arc::new(ScriptedPacketTransport::new(relay, [DriverSendAction::Ok]));
@@ -3339,7 +3472,12 @@ mod tests {
         assert!(!lease.still_initializing());
         assert_eq!(
             removed_rx.try_recv().unwrap(),
-            (client, dst, Some("during-dial".to_owned()))
+            EndpointRemoval {
+                client,
+                dst,
+                conn_id: Some("during-dial".to_owned()),
+                reason: RemovalReason::UserspaceEndpointRetired,
+            }
         );
 
         let relay = make_addr("192.168.1.1", 1080);
@@ -3404,7 +3542,12 @@ mod tests {
         assert!(pool.is_empty());
         assert_eq!(
             removed_rx.try_recv().unwrap(),
-            (client, dst, Some("before-commit".to_owned()))
+            EndpointRemoval {
+                client,
+                dst,
+                conn_id: Some("before-commit".to_owned()),
+                reason: RemovalReason::UserspaceEndpointRetired,
+            }
         );
         assert!(
             !lease.commit_ready(endpoint),
@@ -3463,7 +3606,12 @@ mod tests {
         );
         assert_eq!(
             removed_rx.try_recv().unwrap(),
-            (client, dst, Some("dead-before-start".to_owned()))
+            EndpointRemoval {
+                client,
+                dst,
+                conn_id: Some("dead-before-start".to_owned()),
+                reason: RemovalReason::UserspaceEndpointRetired,
+            }
         );
         let replacement_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
         let replacement =
@@ -3568,7 +3716,12 @@ mod tests {
         pool.remove_by_node(DEAD_NODE_ID);
         assert_eq!(
             removed_rx.try_recv().unwrap(),
-            (node_client, dst, Some("node-tracker".to_owned()))
+            EndpointRemoval {
+                client: node_client,
+                dst,
+                conn_id: Some("node-tracker".to_owned()),
+                reason: RemovalReason::UserspaceEndpointRetired,
+            }
         );
 
         let janitor_client = make_addr("10.0.0.2", 12345);
@@ -3589,7 +3742,12 @@ mod tests {
         assert_eq!(pool.janitor_cycle(), 1);
         assert_eq!(
             removed_rx.try_recv().unwrap(),
-            (janitor_client, dst, Some("janitor-tracker".to_owned()))
+            EndpointRemoval {
+                client: janitor_client,
+                dst,
+                conn_id: Some("janitor-tracker".to_owned()),
+                reason: RemovalReason::UserspaceEndpointRetired,
+            }
         );
         assert!(matches!(
             removed_rx.try_recv(),

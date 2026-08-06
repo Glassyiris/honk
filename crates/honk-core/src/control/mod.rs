@@ -145,6 +145,10 @@ pub struct ControlPlane {
     /// Shared clash mode state (Rule/Global/Direct + GLOBAL selection),
     /// installed by `set_mode_state` when the clash API is enabled.
     mode_state: Option<crate::mode::SharedModeState>,
+    /// Drop-and-reinject UDP post-decision offload, parsed once from
+    /// `HONK_UDP_POST_DECISION_OFFLOAD` at startup (tests inject the field
+    /// directly — no env mutation).
+    udp_post_decision_offload: bool,
     /// Cached static half of the datapath offload policy
     /// (`DATAPATH_FLAG_OFFLOAD_NO_DOMAIN_RULES` or 0), recomputed by
     /// `sync_direct_offload_flags` and shared with the clash API.
@@ -159,6 +163,77 @@ pub struct ControlPlane {
 
 fn accepts_transparent_connection(drain: &DrainTracker) -> bool {
     !drain.should_reject()
+}
+
+/// Retire conntrack entries as UDP endpoints die (event-driven lifecycle;
+/// the datapath/janitor timeouts remain the backstop), and drop the flow
+/// from the clash-API tracker.  A `KernelOffloadHandoff` removal keeps the
+/// conn_state: it anchors a flow that was handed to the kernel by the
+/// drop-and-reinject offload.  Extracted so tests can run the real
+/// production worker against a mock backend.
+pub(crate) fn spawn_udp_removal_worker(
+    udp_pool: Arc<UdpEndpointPool>,
+    ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+    tracker: Arc<ConnectionTracker>,
+) -> tokio::task::JoinHandle<()> {
+    use crate::control::udp_endpoint::RemovalReason;
+    const UDP_REMOVAL_QUEUE_CAPACITY: usize = 1024;
+    const UDP_REMOVAL_BATCH_SIZE: usize = 128;
+    let (remove_tx, mut remove_rx) = tokio::sync::mpsc::channel::<
+        crate::control::udp_endpoint::EndpointRemoval,
+    >(UDP_REMOVAL_QUEUE_CAPACITY);
+    udp_pool.set_remove_sink(remove_tx);
+    tokio::spawn(async move {
+        let mut removals = Vec::with_capacity(UDP_REMOVAL_BATCH_SIZE);
+        let mut keys = Vec::with_capacity(UDP_REMOVAL_BATCH_SIZE * 2);
+        while let Some(first) = remove_rx.recv().await {
+            removals.clear();
+            removals.push(first);
+            while removals.len() < UDP_REMOVAL_BATCH_SIZE {
+                match remove_rx.try_recv() {
+                    Ok(removal) => removals.push(removal),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                    | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                }
+            }
+
+            keys.clear();
+            for removal in removals.drain(..) {
+                if let Some(id) = removal.conn_id {
+                    tracker.remove(&id);
+                }
+                if removal.reason == RemovalReason::KernelOffloadHandoff {
+                    continue;
+                }
+                let fwd = crate::control::connection::build_tuples_key(
+                    removal.dst.ip(),
+                    removal.dst.port(),
+                    removal.client.ip(),
+                    removal.client.port(),
+                    17,
+                );
+                let mut rev = fwd;
+                std::mem::swap(&mut rev.src_ip, &mut rev.dst_ip);
+                std::mem::swap(&mut rev.src_port, &mut rev.dst_port);
+                keys.extend([fwd, rev]);
+            }
+            if keys.is_empty() {
+                udp_pool.flush_removal_dirty();
+                continue;
+            }
+
+            let mut ebpf = ebpf.write().await;
+            match ebpf.udp_conn_state_remove_batch(&keys) {
+                Ok(removed) => {
+                    crate::ebpf::USERSPACE_CONN_STATE_DELETES
+                        .fetch_add(removed as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(error) => warn!(%error, "failed to remove UDP conntrack batch"),
+            }
+            drop(ebpf);
+            udp_pool.flush_removal_dirty();
+        }
+    })
 }
 
 impl ControlPlane {
@@ -430,6 +505,8 @@ impl ControlPlane {
             background_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             udp_warm_task: tokio::sync::Mutex::new(None),
             mode_state: None,
+            udp_post_decision_offload: std::env::var("HONK_UDP_POST_DECISION_OFFLOAD").as_deref()
+                == Ok("1"),
             direct_offload_static,
             datapath_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             active_routing_plan: Arc::new(parking_lot::RwLock::new(initial_routing_plan)),
@@ -841,64 +918,11 @@ impl ControlPlane {
             tasks.push(janitor.spawn());
             info!("BPF map janitor started");
 
-            // Retire conntrack entries as UDP endpoints die (event-driven
-            // lifecycle; the datapath/janitor timeouts remain the backstop),
-            // and drop the flow from the clash-API tracker.
-            const UDP_REMOVAL_QUEUE_CAPACITY: usize = 1024;
-            const UDP_REMOVAL_BATCH_SIZE: usize = 128;
-            let (remove_tx, mut remove_rx) = tokio::sync::mpsc::channel::<(
-                std::net::SocketAddr,
-                std::net::SocketAddr,
-                Option<String>,
-            )>(UDP_REMOVAL_QUEUE_CAPACITY);
-            self.udp_pool.set_remove_sink(remove_tx);
-            let udp_pool = Arc::clone(&self.udp_pool);
-            let ebpf = self.ebpf.clone();
-            let tracker = self.connection_tracker.clone();
-            let removal_task = tokio::spawn(async move {
-                let mut removals = Vec::with_capacity(UDP_REMOVAL_BATCH_SIZE);
-                let mut keys = Vec::with_capacity(UDP_REMOVAL_BATCH_SIZE * 2);
-                while let Some(first) = remove_rx.recv().await {
-                    removals.clear();
-                    removals.push(first);
-                    while removals.len() < UDP_REMOVAL_BATCH_SIZE {
-                        match remove_rx.try_recv() {
-                            Ok(removal) => removals.push(removal),
-                            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-                            | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
-                        }
-                    }
-
-                    keys.clear();
-                    for (client, dst, conn_id) in removals.drain(..) {
-                        if let Some(id) = conn_id {
-                            tracker.remove(&id);
-                        }
-                        let fwd = crate::control::connection::build_tuples_key(
-                            dst.ip(),
-                            dst.port(),
-                            client.ip(),
-                            client.port(),
-                            17,
-                        );
-                        let mut rev = fwd;
-                        std::mem::swap(&mut rev.src_ip, &mut rev.dst_ip);
-                        std::mem::swap(&mut rev.src_port, &mut rev.dst_port);
-                        keys.extend([fwd, rev]);
-                    }
-
-                    let mut ebpf = ebpf.write().await;
-                    match ebpf.udp_conn_state_remove_batch(&keys) {
-                        Ok(removed) => {
-                            crate::ebpf::USERSPACE_CONN_STATE_DELETES
-                                .fetch_add(removed as u64, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        Err(error) => warn!(%error, "failed to remove UDP conntrack batch"),
-                    }
-                    drop(ebpf);
-                    udp_pool.flush_removal_dirty();
-                }
-            });
+            let removal_task = spawn_udp_removal_worker(
+                Arc::clone(&self.udp_pool),
+                self.ebpf.clone(),
+                self.connection_tracker.clone(),
+            );
 
             tasks.push(self.udp_pool.spawn_janitor());
 
@@ -1423,6 +1447,7 @@ impl ControlPlane {
             connection_pool: self.connection_pool.clone(),
             connection_tracker: self.connection_tracker.clone(),
             mode_state: self.mode_state.clone(),
+            udp_post_decision_offload: self.udp_post_decision_offload,
         }
     }
 }
