@@ -1,7 +1,7 @@
 [target.bpfel-unknown-none]
 rustflags = [
   "-C",
-  "opt-level=z",
+  "opt-level=2",
   "-C",
   "llvm-args=-inline-threshold=300",
   "-C",
