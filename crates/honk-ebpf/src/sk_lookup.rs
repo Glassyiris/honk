@@ -16,7 +16,7 @@ use crate::{
     maps::LISTEN_SOCKET_MAP,
     transport::{IPPROTO_TCP, IPPROTO_UDP},
 };
-use aya_ebpf::programs::SkLookupContext;
+use aya_ebpf::{bindings::bpf_sk_lookup, programs::SkLookupContext};
 
 const AF_INET: u32 = 2;
 const AF_INET6: u32 = 10;
@@ -60,21 +60,10 @@ fn do_tproxy_sk_lookup(ctx: &SkLookupContext) -> u32 {
     } else if family == AF_INET6 && protocol as u32 == IPPROTO_TCP as u32 {
         KEY_TCP6
     } else if protocol as u32 == IPPROTO_UDP as u32 {
-        let (remote, local) = if family == AF_INET {
-            (lookup.remote_ip4, lookup.local_ip4)
-        } else {
-            (lookup.remote_ip6[3], lookup.local_ip6[3])
-        };
-        let h = listener_hash(
-            remote,
-            local,
-            (lookup.remote_port as u32) << 16,
-            lookup.local_port,
-        );
         if family == AF_INET {
-            KEY_UDP4_BASE + h
+            udp_listener_key_v4(ctx.lookup)
         } else {
-            KEY_UDP6_BASE + h
+            udp_listener_key_v6(ctx.lookup)
         }
     } else {
         return SK_PASS;
@@ -84,4 +73,34 @@ fn do_tproxy_sk_lookup(ctx: &SkLookupContext) -> u32 {
         Ok(_) => SK_PASS,
         Err(_) => SK_DROP,
     }
+}
+
+// `#[inline(never)]` keeps each family variant in its own subprogram so every
+// ctx read stays a constant-offset access. Inlined at opt-level=2, LLVM
+// if-converts the family branch into one load through a computed ctx offset
+// (`r2 = r1; r2 += select(...)`), which the verifier rejects ("dereference of
+// modified ctx ptr") — volatile reads do not stop the fold.
+#[inline(never)]
+fn udp_listener_key_v4(lookup: *const bpf_sk_lookup) -> u32 {
+    let lookup = unsafe { &*lookup };
+    let h = listener_hash(
+        lookup.remote_ip4,
+        lookup.local_ip4,
+        (lookup.remote_port as u32) << 16,
+        lookup.local_port,
+    );
+    KEY_UDP4_BASE + h
+}
+
+/// IPv6 variant of [`udp_listener_key_v4`]; see its `#[inline(never)]` note.
+#[inline(never)]
+fn udp_listener_key_v6(lookup: *const bpf_sk_lookup) -> u32 {
+    let lookup = unsafe { &*lookup };
+    let h = listener_hash(
+        lookup.remote_ip6[3],
+        lookup.local_ip6[3],
+        (lookup.remote_port as u32) << 16,
+        lookup.local_port,
+    );
+    KEY_UDP6_BASE + h
 }

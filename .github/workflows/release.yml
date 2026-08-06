@@ -86,7 +86,7 @@ jobs:
           sudo apt-get install -y clang llvm libbpf-dev pkg-config cmake libclang-dev
 
       - name: Install bpf-linker
-        run: cargo install bpf-linker --version 0.10.3  # 0.10.4 dropped -Oz, which our opt-level="z" profile needs
+        run: cargo install bpf-linker --version 0.10.3  # pinned: keep the version the eBPF build was verified with
 
       - name: Point eBPF .cargo/config at the installed bpf-linker
         run: |
