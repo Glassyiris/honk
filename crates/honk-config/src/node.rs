@@ -82,6 +82,19 @@ pub struct Node {
     /// Path to a file containing a base64-encoded ECHConfigList
     #[serde(default)]
     pub ech_config_path: Option<String>,
+    /// REALITY public key (share-link `pbk`); selects the REALITY handshake
+    #[serde(default)]
+    pub reality_public_key: Option<String>,
+    /// REALITY short id (share-link `sid`)
+    #[serde(default)]
+    pub reality_short_id: Option<String>,
+    /// REALITY spider path (share-link `spx`, share-link default `/`)
+    #[serde(default)]
+    pub reality_spider_x: Option<String>,
+    /// VLESS flow control; only `xtls-rprx-vision` is supported and it
+    /// requires REALITY or TLS (enforced by `Config::validate`)
+    #[serde(default)]
+    pub flow: Option<String>,
     /// Network type for V2Ray (tcp/ws/grpc/h2/quic/kcp)
     #[serde(default)]
     pub network: Option<String>,
@@ -216,6 +229,10 @@ impl Default for Node {
             ech_enabled: false,
             ech_config: None,
             ech_config_path: None,
+            reality_public_key: None,
+            reality_short_id: None,
+            reality_spider_x: None,
+            flow: None,
             network: None,
             ws_path: None,
             ws_host: None,
@@ -269,8 +286,9 @@ impl Node {
     /// (health state, latency history, and session pools survive); renaming
     /// a node does NOT change the ID — identity is the dialable endpoint,
     /// not the label. Dial shape covers SNI (CDN fronting makes the same
-    /// server a different endpoint per SNI), transport, and obfs;
-    /// validation and tuning knobs are excluded.
+    /// server a different endpoint per SNI), transport, obfs, and the
+    /// REALITY/flow handshake shape; validation and tuning knobs are
+    /// excluded.
     pub fn derive_id(&self) -> uuid::Uuid {
         let material = format!(
             "{}|{}|{}|{}|{}",
@@ -291,6 +309,10 @@ impl Node {
             self.ws_host.as_deref().unwrap_or(""),
             self.grpc_service.as_deref().unwrap_or(""),
             self.hy2_obfs.as_deref().unwrap_or(""),
+            self.reality_public_key.as_deref().unwrap_or(""),
+            self.reality_short_id.as_deref().unwrap_or(""),
+            self.reality_spider_x.as_deref().unwrap_or(""),
+            self.flow.as_deref().unwrap_or(""),
         ]
         .join("|")
     }

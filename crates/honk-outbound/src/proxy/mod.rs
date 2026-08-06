@@ -15,7 +15,9 @@ pub(crate) mod ss_stream;
 pub(crate) mod transport;
 pub mod trojan;
 pub mod tuic;
+#[cfg(feature = "rprx")]
 pub mod vless;
+#[cfg(feature = "rprx")]
 pub mod vmess;
 
 use anytls::AnyTlsHandler;
@@ -35,7 +37,9 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use trojan::TrojanHandler;
 use tuic::TuicHandler;
+#[cfg(feature = "rprx")]
 use vless::VLessHandler;
+#[cfg(feature = "rprx")]
 use vmess::VmessHandler;
 
 /// Trait object-compatible combination of async I/O traits used for proxy streams.
@@ -504,12 +508,17 @@ impl ProxyRegistry {
                 .with_packet(shadowsocks.clone())
                 .with_probeable(shadowsocks),
         );
-        let vless = Arc::new(VLessHandler::new());
-        registry
-            .register(ProtocolEntry::new(NodeProtocol::VLess, vless.clone()).with_probeable(vless));
-        let vmess = Arc::new(VmessHandler::new());
-        registry
-            .register(ProtocolEntry::new(NodeProtocol::VMess, vmess.clone()).with_probeable(vmess));
+        #[cfg(feature = "rprx")]
+        {
+            let vless = Arc::new(VLessHandler::new());
+            registry.register(
+                ProtocolEntry::new(NodeProtocol::VLess, vless.clone()).with_probeable(vless),
+            );
+            let vmess = Arc::new(VmessHandler::new());
+            registry.register(
+                ProtocolEntry::new(NodeProtocol::VMess, vmess.clone()).with_probeable(vmess),
+            );
+        }
         let anytls = Arc::new(AnyTlsHandler::new());
         registry.register(
             ProtocolEntry::new(NodeProtocol::AnyTLS, anytls.clone())
@@ -743,9 +752,35 @@ mod tests {
         assert!(registry.find(NodeProtocol::SS).is_some());
         assert!(registry.find(NodeProtocol::AnyTLS).is_some());
         assert!(registry.find(NodeProtocol::Hysteria2).is_some());
+        #[cfg(feature = "rprx")]
         assert!(registry.find(NodeProtocol::VMess).is_some());
         assert!(registry.find(NodeProtocol::Tuic).is_some());
         assert!(registry.find(NodeProtocol::Juicity).is_some());
+    }
+
+    /// Without the `rprx` feature a parsed VLESS/VMess node must hit the
+    /// ordinary no-handler refusal, never a panic.
+    #[cfg(not(feature = "rprx"))]
+    #[tokio::test]
+    async fn rprx_off_refuses_vless_vmess_without_handler() {
+        let registry = ProxyRegistry::default_resolver().unwrap();
+        for protocol in [NodeProtocol::VLess, NodeProtocol::VMess] {
+            assert!(registry.find(protocol).is_none());
+            let node = Node {
+                protocol,
+                ..Default::default()
+            };
+            let err = registry
+                .dial(
+                    &node,
+                    "93.184.216.34:443".parse().unwrap(),
+                    None,
+                    Duration::from_secs(1),
+                )
+                .await
+                .expect_err("no handler registered without rprx");
+            assert!(err.to_string().contains("No handler for protocol"));
+        }
     }
 
     #[test]

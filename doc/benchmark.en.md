@@ -111,6 +111,186 @@ ssh root@10.10.10.57 "bash /root/lab-bench.sh 'honk dae' 'hy2 tuic ss2022 trojan
 ssh root@10.10.10.57 bash /root/test-protocols.sh
 ```
 
+## Results (2026-08-06, UDP post-decision offload verification @ NanoPi R2S)
+
+Verifies the QUIC UDP offload (drop-and-reinject rebuild,
+`HONK_UDP_POST_DECISION_OFFLOAD=1`). The standard UDP rows (iperf3/echo
+through proxy groups) are unaffected by design — matching the previous round
+line by line (within noise) is the correct outcome. A supplementary QUIC-type
+direct-UDP load (juicity tunnel through `domain(suffix:hy2.test)->direct`,
+domain++):
+
+| Load | offload ON | offload OFF |
+| --- | --- | --- |
+| QUIC direct UDP (juicity) | **149.1 Mbps @ 0.00 cores** (endpoint hits=0) | 33.2 Mbps @ 0.78 cores (hits=13588) |
+
+4.5× throughput with the engine CPU at zero (the 149 Mbps ceiling is the
+juicity client's own QUIC crypto on the A53). The direct row holds at
+874 Mbps @ 0.00 cores (dae 889, on par); TCP protocol rows within ≤2.3% — no
+regression.
+
+## Results (2026-08-06, direct kernel-offload verification @ NanoPi R2S)
+
+Verifies PR #17 (kernel offload of direct-routed flows in Rule mode, per-flow
+cached decision, zero per-packet cost). Engine is feat/rprx (incl. main
+`ac5ffbb`) aarch64-musl; the lab's 8080/5300 targets route via
+`fallback: direct` (non-must) — exactly the path this feature targets. Two
+alternating rounds; dae re-measured in the same window.
+
+| Engine | Protocol | cold | bw (Mbps) | cpu | RSS |
+| --- | --- | --- | --- | --- | --- |
+| honk | direct (with offload) | 0.0043 | **880** (prev 370) | **0.01** (prev 0.71) | 61 |
+| dae | direct | 0.0041 | 896 | 0.01 | 39 |
+
+All protocol rows within noise of the previous round (hy2 267/268, tuic
+260/262, ss2022 353/353, trojan 279/282) — no regression. honk direct now
+matches dae (the 1.8% gap is link noise); cold improved too (6.2→4.3ms, on
+par with dae's 4.1ms).
+
+## Results (2026-08-05, ARM A/B: honk vs dae @ NanoPi R2S)
+
+Two-engine comparison on the NanoPi R2S (two runs: .43 onboard NIC, then a
+.45 re-run over a USB NIC); honk is feat/rprx `2ad0a93` aarch64-musl, dae is
+kdae `ae056a6a` (go1.26.5). Methodology unchanged; only one engine runs at a
+time. dae only supports the shared protocol rows (hy2/tuic/ss2022/trojan).
+Values are means of two alternating rounds, <5% intra-round deviation.
+**The .45 re-run used a USB NIC, shifting absolute bandwidth down ~10–15% —
+compare ratios, not absolutes.**
+
+### TCP (.45 re-run values; `→` shows the .43 first round)
+
+| Engine | Protocol | cold | hot p50 | bw (Mbps) | cpu | RSS (MB) |
+| --- | --- | --- | --- | --- | --- | --- |
+| honk | direct | 0.0062 | – | 370 →458 | 0.71 | 52 |
+| dae | direct | 0.0057 | – | 895 →931 | 0.01 | 39 |
+| honk | hy2 | 0.0091 | 0.0081 | 268 →303 | 1.34 | 59 |
+| dae | hy2 | 0.0367 | 0.0079 | 191 →197 | 1.86 | 57 |
+| honk | tuic | 0.0070 | 0.0070 | 262 →293 | 1.36 | 59 |
+| dae | tuic | 0.1040 | 0.0834 | 196 →208 | 1.80 | 49 |
+| honk | ss2022 | 0.0070 | 0.0058 | 353 →385 | 0.88 | 51 |
+| dae | ss2022 | 0.0114 | 0.0092 | 247 →265 | 0.87 | 41 |
+| honk | trojan | 0.0221 | 0.0061 | 282 →328 | 0.88 | 53 |
+| dae | trojan | 0.0228 | 0.0163 | 171 →201 | 0.78 | 42 |
+
+### UDP (.45 re-run; echo RTT s / saturated receive Mbps / cpu)
+
+| Engine | Protocol | RTT | bw | cpu |
+| --- | --- | --- | --- | --- |
+| honk | hy2/udp | 0.0029 | 33 | 1.85 |
+| dae | hy2/udp | 0.0034 | 31 | 2.14 |
+| honk | tuic/udp | 0.0028 | 53 | 1.76 |
+| dae | tuic/udp | 0.0034 | 33 | 2.21 |
+| honk | ss2022/udp | 0.0021 | 34 (73.8%) | 0.93 |
+| dae | ss2022/udp | 0.0027 | 40 (87.9%) | 1.29 |
+| honk | trojan/udp | 0.0019 | 31 | 0.88 |
+| dae | trojan/udp | 0.0031 | 49 | 1.45 |
+
+Read-out:
+
+- **honk leads TCP throughput by 35–65%, reproducibly**: hy2 1.40×, tuic
+  1.34×, trojan 1.65×, ss2022 1.43× (ratio drift vs the .43 round ≤0.1); CPU
+  cost per Mbps is about half of dae's (hy2: 1.34 cores@268 vs 1.86@191). On
+  A53 little cores the Go runtime's per-byte cost is amplified most on QUIC.
+- **Latency**: dae's tuic hot p50 83ms / cold 104ms (per-connection QUIC
+  session rebuild) reproduces exactly; honk stays ≤8ms hot p50 across all
+  protocols. honk's UDP echo RTT is consistently 0.5–1.2ms lower per row.
+- **The direct-row gap is path, not engine**: dae offloads fallback-direct
+  fully in eBPF (895Mbps@0.01 cores); honk only offloads must-marked direct
+  and relays fallback-direct in userspace (370@0.71) — a candidate honk
+  optimization.
+- **UDP** hits the A53 platform ceiling for both engines (30–57 Mbps); memory
+  slightly favors dae (38–59 vs 48–61MB), neither is a constraint at 1GB.
+- Fairness: both engines relay TCP in userspace (dae log confirms eBPF
+  offload disabled).
+
+## Results (2026-08-05, ARM round: NanoPi R2S / RK3328)
+
+Engine host 10.10.10.43 (NanoPi R2S: 4×Cortex-A53 @1.3GHz, 968MB RAM, end0
+1Gbps, kernel 6.18, cpuinfo shows `aes pmull sha1 sha2`), running a feat/rprx
+`2ad0a93` aarch64-musl build. Methodology unchanged (netns lab → real eBPF
+datapath → .70). **Line-rate anchor: with the engine off, the same netns+NAT
+path saturates 941 Mbps**, so every number below is bounded by the userspace
+engine. The cpu column counts only honk's utime/stime (no softirq).
+
+### TCP
+
+| Engine | Protocol | cold | hot p50 | hot p95 | bw (Mbps) | cpu | RSS (MB) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| honk | direct | 0.0064 | – | – | 437 | 0.74 | 50 |
+| honk | hy2 | 0.0100 | 0.0084 | 0.0090 | 301 | 1.34 | 61 |
+| honk | tuic | 0.0097 | 0.0073 | 0.0082 | 304 | 1.33 | 56 |
+| honk | ss2022 | 0.0105 | 0.0057 | 0.0065 | 388 | 0.83 | 55 |
+| honk | trojan | 0.0213 | 0.0060 | 0.0205 | 329 | 0.91 | 50 |
+| honk | anytls-sb | 0.0066 | 0.0061 | 0.0065 | 336 | 0.98 | 51 |
+| honk | anytls-go | 0.0116 | 0.0065 | 0.0076 | 337 | 0.96 | 51 |
+| honk | vless-reality-vision | 0.0225 | 0.0181 | 0.0196 | 183 | 0.74 | 51 |
+| honk | vless-reality | 0.0208 | 0.0174 | 0.0287 | 332 | 0.88 | 52 |
+| honk | vmess (tcp) | 0.0076 | 0.0067 | 0.0087 | 416 | 1.50 | 47 |
+
+### UDP (hot, `udp_warm_node_count: 8`)
+
+| Protocol | echo RTT p50 | bw Mbps (loss) | cpu |
+| --- | --- | --- | --- |
+| hy2 | 2.77 ms | 34 (97.8%) | 1.91 |
+| tuic | 2.88 ms | 46 (98.1%) | 1.86 |
+| ss2022 | 2.09 ms | 42 (91.0%) | 0.92 |
+| trojan | 2.12 ms | 38 (98.1%) | 0.90 |
+| anytls-sb | 2.23 ms | 50 (89.3%) | 1.79 |
+| anytls-go | 2.54 ms | 57 (87.7%) | 1.80 |
+
+Read-out (A53 little cores vs x86 E-13600K, same methodology as 08-04):
+
+- **Everything is CPU-bound**: direct 437 (vs 9390 on x86); TCP protocols
+  flatten at 330–390 Mbps (flat across rows = the shared relay+crypto path is
+  the bottleneck, not any single handler); QUIC per-core efficiency is ~20×
+  lower. vmess at 416 is closest to the direct baseline, confirming `5dc47cf`'s
+  BoringSSL AEAD pays off equally under ARM crypto extensions; its 1.50 cores
+  remain the highest among TCP rows (a cross-platform optimization target).
+  vless-vision at 183 is the lowest TCP row; the vision/reality hot p50 of
+  ~18ms (vs 3.3ms on x86) is the REALITY handshake cost on slow crypto.
+- **UDP suffers most**: 34–57 Mbps with 88–98% loss — the per-packet path
+  (TPROXY recvmsg provenance + anyfrom replies + tunnel framing) saturates the
+  little cores; echo RTT is an order of magnitude slower than x86.
+- **RSS 47–61MB matches x86 exactly**; a 1GB device shows zero memory
+  pressure — the constraint is purely CPU.
+- The .70 rprx target services (8007-8009/5207-5209/53537-53539) were
+  half-broken this round; those three rows used an equivalent variant (working
+  targets 8001/5201 re-routed to the respective groups) with unchanged
+  methodology.
+
+## Results (2026-08-05, rprx family: VLESS+REALITY(±vision)/VMess join the matrix)
+
+Covers the protocol rows added by feat/rprx (PR #12); engine is a feat/rprx
+musl+mimalloc build (vless rows measured on `67b5a56`, the vmess row on a
+rebuild with the `5dc47cf` AEAD fix). Methodology identical to the rounds
+above. New server matrix on 10.10.10.70 (sing-box 1.13.14):
+vless+reality+vision `:2448`, vless+reality `:2449`, vmess bare tcp `:2450`;
+targets http `8007-8009`, iperf3 `5207-5209`, udp echo `53537-53539`; engine
+routes by port (`5207/8007/53537→vision`, `…8→reality`, `…9→vmess`). The
+REALITY dest is a local TLS service (note: the dest's TLS Certificate message
+must fit the server's 8 KiB capture buffer or auth fails).
+
+Calibration anchors (this round vs 08-04): direct 9411/9390, ss2022
+9399/9398, anytls-sb 9406/9388 Mbps — environment consistent, so the table
+below compares directly against the 08-04 rows.
+
+| Engine | Protocol | cold | hot p50 | hot p95 | bw (Mbps) | cpu | RSS (MB) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| honk | vless-reality-vision | 0.0037 | 0.0033 | 0.0050 | 9372 | 0.60 | 45 |
+| honk | vless-reality | 0.0043 | 0.0034 | 0.0042 | 9383 | 0.49 | 54 |
+| honk | vmess (tcp) | 0.0022 | 0.0010 | 0.0014 | 9313 | 0.78 | 50 |
+
+- All three rows sit at line rate (~9.4G). The vmess row is post-`5dc47cf`
+  (body AEAD moved from RustCrypto to BoringSSL); before the fix the same
+  path measured ~420 MB/s handler-level (single core at 105%). vmess cpu
+  (0.78) is still the highest of the TCP protocols (per-chunk SHAKE size
+  masking + framing) — a follow-up optimization candidate.
+- vision vs non-vision shows no bandwidth difference (BoringSSL AES-NI is
+  already line-rate below 10G); the vision row pays slightly more cpu
+  (0.60 vs 0.49) for framing, and its cold includes the REALITY handshake.
+- vless/vmess have no UDP datapath in honk (README TODO); the UDP rows are
+  empty by design, not a measurement failure.
+
 ## Results (2026-08-04, honk outbound-v2 refactor regression check)
 
 Single-engine regression round for the outbound-v2 refactor merge — no

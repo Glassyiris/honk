@@ -40,6 +40,7 @@ pub(crate) const ATYP_SOCKS5: AtypScheme = AtypScheme {
 };
 
 /// V2Ray numbering used by VMess.
+#[cfg(feature = "rprx")]
 pub(crate) const ATYP_VMESS: AtypScheme = AtypScheme {
     ipv4: 0x01,
     domain: 0x02,
@@ -291,6 +292,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "rprx")]
     fn test_encode_vmess_atyp() {
         // VMess uses the V2Ray ATYP numbering: domain = 0x02, IPv6 = 0x03.
         let domain = SocksAddr::Domain("example.com".to_string(), 443);

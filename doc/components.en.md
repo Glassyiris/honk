@@ -99,7 +99,7 @@ The fields below are what a parsed node carries. In dae syntax they are **derive
 
 | Field | Type | Default | Meaning |
 | ------- | ------ | --------- | --------- |
-| `id` | UUID | content-derived | Stable identity: UUID v5 over `protocol\|host\|port\|credential\|dial-shape` (dial shape = sni/transport/ws/grpc/obfs); renames keep it, two nodes deriving the same ID are rejected (subscription duplicates are skipped with a warning) |
+| `id` | UUID | content-derived | Stable identity: UUID v5 over `protocol\|host\|port\|credential\|dial-shape` (dial shape = sni/transport/ws/grpc/obfs plus the REALITY/flow handshake shape); renames keep it, two nodes deriving the same ID are rejected (subscription duplicates are skipped with a warning) |
 | `name` | string | **required** | Routing / API name |
 | `protocol` | enum | `ss` | See protocol table |
 | `address` | string | required* | Host or `host:port` |
@@ -115,6 +115,10 @@ The fields below are what a parsed node carries. In dae syntax they are **derive
 | `ech_enabled` | bool | `false` | Offer ECH (share-link `ech=1`, or implied by `ech_config`) |
 | `ech_config` | string? | null | Base64 ECHConfigList (share-link `ech_config=`) |
 | `ech_config_path` | string? | null | File holding a base64 ECHConfigList |
+| `reality_public_key` | string? | null | REALITY server X25519 public key (share-link `pbk`); when set the node takes the REALITY handshake instead of plain TLS (`security=reality` implies `tls=true`) |
+| `reality_short_id` | string? | null | REALITY short id (share-link `sid`, even-length hex ≤ 8 bytes) |
+| `reality_spider_x` | string? | null | REALITY spider path (share-link `spx`, share-link default `/`) |
+| `flow` | string? | null | VLESS flow control (share-link `flow=`); only `xtls-rprx-vision` is supported and it requires TLS or REALITY — enforced by `Config::validate` |
 | `network` | string? | null | V2Ray-style network hint |
 | `ws_path` / `ws_host` | string? | null | WebSocket (share-link `path=`/`host=`) |
 | `grpc_service` | string? | null | gRPC service name (`serviceName=`) |
@@ -144,8 +148,8 @@ The fields below are what a parsed node carries. In dae syntax they are **derive
 | ------- | --------- | ----- | ----- | ------- |
 | `ss` | `shadowsocks` | Yes | Yes | AEAD + `2022-blake3-*` |
 | `trojan` | | Yes | Yes | TLS; WS/gRPC via transport |
-| `vmess` | | Yes | No | AEAD; WS/gRPC |
-| `vless` | | Yes | No | Header UDP exists in tests only |
+| `vmess` | | Yes | No | AEAD; WS/gRPC; REALITY via `security=reality`; registered only with the `rprx` feature (on in honk-core's default build) |
+| `vless` | | Yes | No | REALITY + `xtls-rprx-vision` flow; WS/gRPC via transport; header UDP exists in tests only; registered only with the `rprx` feature |
 | `socks5` | | Yes | Yes | UDP ASSOCIATE |
 | `hysteria2` | | Yes | Yes | Real QUIC/H3; salamander; brutal (with bandwidth) or BBR; port hopping |
 | `tuic` | | Yes | Yes | TUIC v5 / quinn |
@@ -173,6 +177,23 @@ node {
     trojan_grpc: 'trojan://secret@example.com:443?type=grpc&serviceName=GunService#trojan_grpc'
 }
 ```
+
+Verified VLESS combinations (live interop against a sing-box 1.13 server): TCP+REALITY+vision, TCP+REALITY, TCP+WS, TCP+WS+TLS, TCP+gRPC. The `xtls-rprx-vision` flow only combines with TCP+REALITY/TLS — over WS/gRPC there is no raw socket for the XTLS direct-copy switch, matching upstream.
+
+**VLESS + REALITY (xtls-rprx-vision)**
+
+`security=reality` switches a vless (or vmess) node from plain TLS to the REALITY handshake; `pbk`/`sid`/`spx` carry the REALITY parameters and `flow=xtls-rprx-vision` enables the XTLS Vision splice:
+
+```dae
+node {
+    vless_r: 'vless://uuid@example.com:443?security=reality&sni=dl.google.com&pbk=<base64url-pubkey>&sid=ab12&flow=xtls-rprx-vision#vless_r'
+}
+```
+
+- An explicit `security=` overrides the historical vless TLS-on default: `security=none` disables TLS, any other value enables it; a link without `security=` parses exactly as before (vless TLS on, vmess off). `fp=` is accepted but ignored — the ClientHello fingerprint follows the global `tls_implementation` mode.
+- REALITY needs no CA and no `skip_cert_verify`: the server is authenticated post-handshake against the REALITY auth key (see `doc/design.en.md`), and authentication failure is fail-closed.
+- Pick a REALITY `dest`/SNI whose TLS Certificate message stays under 8 KiB (sing-box reality buffers 8192 bytes) — `dl.google.com` works, `www.microsoft.com` does not.
+- VMess and VLESS handlers are compiled behind honk-outbound's `rprx` cargo feature (enabled by default in honk-core). A build without it parses such nodes but refuses dials with "No handler for protocol".
 
 ### TLS fingerprint and ECH
 
@@ -219,7 +240,7 @@ node {
 | -------- | ------- |
 | `ss://` | SIP002 |
 | `vmess://` | base64 JSON (v2rayN) |
-| `vless://` / `trojan://` | query params for transport/TLS |
+| `vless://` / `trojan://` | query params for transport/TLS; vless/vmess also take `security=reality|tls|none`, `pbk`, `sid`, `spx`, `flow` (REALITY + xtls-rprx-vision) |
 | `anytls://` | pool params in query |
 | `hysteria2://` / `tuic://` / `juicity://` | QUIC family |
 | `socks5://` | simple |

@@ -132,7 +132,15 @@ pub(crate) const CHROME_SIGALGS: &str = "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha
      rsa_pss_rsae_sha512:rsa_pkcs1_sha512";
 // Chrome 131+: MLKEM hybrid first. Requires boring's `mlkem` feature.
 pub(crate) const CHROME_CURVES: &str = "X25519MLKEM768:X25519:P-256:P-384";
-const CHROME_ALPN_WIRE: &[u8] = b"\x02h2\x08http/1.1";
+pub(crate) const CHROME_ALPN_WIRE: &[u8] = b"\x02h2\x08http/1.1";
+
+/// Chrome's TLS 1.2 cipher list (TLS 1.3 ciphers are implicit and always
+/// lead). Order is irrelevant to JA4 (it sorts), the set is not.
+pub(crate) const CHROME_CIPHER_LIST: &str = "ECDHE-ECDSA-AES128-GCM-SHA256:\
+     ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:\
+     ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:\
+     ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-SHA:ECDHE-RSA-AES256-SHA:\
+     AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA:AES256-SHA";
 
 // BoringSSL group IDs (ssl.h) for SSL_set1_client_key_shares: Chrome sends
 // exactly two shares, MLKEM hybrid then X25519.
@@ -265,10 +273,13 @@ fn set_chrome_key_shares_ssl_ref(ssl: &boring::ssl::SslRef) -> anyhow::Result<()
 }
 
 /// Chrome sends ALPS for h2 with an empty settings payload whenever ALPN
-/// offers h2. boring exposes this only via FFI.
-fn add_chrome_alps(cfg: &mut ConnectConfiguration) -> anyhow::Result<()> {
+/// offers h2. boring exposes this only via FFI. Chrome uses the old ALPS
+/// codepoint (0x4469) on TCP+h2; BoringSSL defaults to the new one (0x44cd),
+/// which is JA4-distinguishable from real Chrome.
+pub(crate) fn add_chrome_alps(cfg: &mut ConnectConfiguration) -> anyhow::Result<()> {
     let ssl: &boring::ssl::SslRef = cfg;
     let ok = unsafe {
+        boring_sys::SSL_set_alps_use_new_codepoint(ssl.as_ptr(), 0);
         boring_sys::SSL_add_application_settings(
             ssl.as_ptr(),
             b"h2".as_ptr(),
@@ -1040,4 +1051,23 @@ mod batch_read_tests {
             assert!(buf[i * 8..(i + 1) * 8].iter().all(|&b| b == i as u8));
         }
     }
+}
+
+/// REALITY connector: accept-all certificate verification (the real server
+/// authentication runs post-handshake against the session-id auth key in
+/// `reality::verify_server_certificate`). Chrome mode adds the pieces of
+/// the real Chrome ClientHello the ctx controls: cipher list, ALPN,
+/// OCSP stapling and SCT extensions. Session resumption stays impossible
+/// because nothing ever calls `SSL_set_session` — the empty session_ticket
+/// extension real Chrome sends is just an offer, never a resumption.
+pub fn build_reality_connector(chrome: bool) -> anyhow::Result<SslConnector> {
+    let mut builder = base_builder(true)?;
+    if chrome {
+        apply_chrome_ctx(&mut builder)?;
+        builder.set_cipher_list(CHROME_CIPHER_LIST)?;
+        builder.set_alpn_protos(CHROME_ALPN_WIRE)?;
+        builder.enable_ocsp_stapling();
+        builder.enable_signed_cert_timestamps();
+    }
+    Ok(builder.build())
 }

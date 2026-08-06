@@ -553,6 +553,20 @@ impl Config {
                     node.name, node.transport
                 )));
             }
+            if let Some(flow) = node.flow.as_deref() {
+                if node.reality_public_key.is_none() && !node.tls {
+                    return Err(crate::ConfigError::Validation(format!(
+                        "Node '{}' sets flow '{}' without TLS or REALITY",
+                        node.name, flow
+                    )));
+                }
+                if flow != "xtls-rprx-vision" {
+                    return Err(crate::ConfigError::Validation(format!(
+                        "Node '{}' has unsupported flow '{}' (expected xtls-rprx-vision)",
+                        node.name, flow
+                    )));
+                }
+            }
             // direct/block are the injected built-ins; a user node may
             // neither take their names nor their protocols.
             if matches!(

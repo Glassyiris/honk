@@ -2024,7 +2024,6 @@ pub(crate) struct AnyTlsStream {
             >,
         >,
     >,
-    fin_sent: bool,
     /// Stream-slot capacity, held until either endpoint closes the stream.
     /// A server FIN releases it immediately even if callers retain the EOF
     /// stream object.
@@ -2048,7 +2047,6 @@ impl AnyTlsStream {
             read_err: None,
             out_slot: None,
             permit_fut: None,
-            fin_sent: false,
             _permit: Some(permit),
         }
     }
@@ -2071,8 +2069,7 @@ impl Drop for AnyTlsStream {
     fn drop(&mut self) {
         let session = Arc::clone(&self.session);
         let sid = self.sid;
-        let notify_fin = !self.fin_sent;
-        tokio::spawn(async move { session.end_stream(sid, notify_fin).await });
+        tokio::spawn(async move { session.end_stream(sid, true).await });
     }
 }
 
@@ -2284,17 +2281,12 @@ impl tokio::io::AsyncWrite for AnyTlsStream {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        match self.as_mut().poll_flush(cx) {
-            std::task::Poll::Ready(Ok(())) => {}
-            other => return other,
-        }
-        if !self.fin_sent {
-            self.fin_sent = true;
-            self.session
-                .enqueue_control(CMD_FIN, self.sid, bytes::Bytes::new())
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
-        }
-        std::task::Poll::Ready(Ok(()))
+        // No FIN on a write-side shutdown: the reference sing-anytls
+        // stream has no half-close — a FIN deletes the whole stream
+        // server-side and discards the in-flight response, and the
+        // reference client only ever FINs on full close. Drop still
+        // notifies the server when the stream is released.
+        self.as_mut().poll_flush(cx)
     }
 }
 
@@ -4657,15 +4649,34 @@ mod tests {
             .unwrap();
         assert_eq!(received, payload);
 
-        // Server FIN → EOF: our shutdown sent FIN; the echo server answers
-        // FIN → read EOF.
+        // A write-side shutdown must NOT send FIN: the reference
+        // sing-anytls stream has no half-close, and a FIN deletes the
+        // stream server-side, discarding the in-flight response. So no
+        // EOF follows shutdown; the FIN goes out when the stream drops.
         stream.shutdown().await.unwrap();
         let mut b = [0u8; 1];
-        let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut b))
+        let early = tokio::time::timeout(Duration::from_millis(300), stream.read(&mut b)).await;
+        assert!(early.is_err(), "shutdown must not FIN the stream");
+        drop(stream);
+
+        // The drop-FIN is answered by the echo server without tearing the
+        // session down: a fresh stream still echoes.
+        let permit = session.try_reserve().unwrap();
+        let mut stream2 = session
+            .open_stream_direct(target.clone(), permit)
             .await
-            .expect("FIN read timed out")
             .unwrap();
-        assert_eq!(n, 0);
+        let _ = tokio::time::timeout(Duration::from_secs(2), addr_rx.recv())
+            .await
+            .expect("second stream address frame")
+            .unwrap();
+        stream2.write_all(b"ping").await.unwrap();
+        let mut four = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(2), stream2.read_exact(&mut four))
+            .await
+            .expect("second stream echo")
+            .unwrap();
+        assert_eq!(&four, b"ping");
     }
 
     /// Three concurrent streams multiplexed on one session, echoing in

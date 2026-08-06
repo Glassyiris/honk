@@ -19,6 +19,7 @@ chrono.workspace = true
 serde.workspace = true
 sha1.workspace = true
 sha2.workspace = true
+sha3.workspace = true
 hmac.workspace = true
 hkdf.workspace = true
 boring.workspace = true
@@ -59,9 +60,31 @@ tokio-rustls.workspace = true
 rustls-pemfile.workspace = true
 webpki-roots.workspace = true
 
+[features]
+# VLESS (xtls-rprx-vision flow) / VMess proxy handlers. Off by default:
+# the descriptor facts stay unconditional, the registry simply has no
+# handler to dispatch for those protocols without the feature.
+rprx = []
+
 [[bench]]
 name = "ss_aead"
 harness = false
+
+[[example]]
+name = "vmess_lab59"
+required-features = ["rprx"]
+
+[[example]]
+name = "vless_bench"
+required-features = ["rprx"]
+
+[[example]]
+name = "proto_bench"
+required-features = ["rprx"]
+
+[[example]]
+name = "vless_transports"
+required-features = ["rprx"]
 
 [[bench]]
 name = "group_selection"

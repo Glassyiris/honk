@@ -12,6 +12,7 @@ pub mod group;
 pub mod proxy;
 pub mod quic;
 pub mod quic_boring;
+pub mod reality;
 pub mod runtime;
 pub(crate) mod session;
 pub mod tls;

@@ -97,6 +97,168 @@ ssh root@10.10.10.57 "bash /root/lab-bench.sh 'honk dae' 'hy2 tuic ss2022 trojan
 ssh root@10.10.10.57 bash /root/test-protocols.sh
 ```
 
+## 结果(2026-08-06,UDP post-decision 卸载验证轮 @ NanoPi R2S)
+
+验证 UDP QUIC 卸载(drop-and-reinject 重构版,`HONK_UDP_POST_DECISION_OFFLOAD=1`)。
+标准 UDP 行(iperf3/echo,代理协议组)不受此功能影响——数值与上轮逐行吻合
+(噪声内)即为正确结果;另增 QUIC 型 direct UDP 负载补测(juicity 隧道穿
+`domain(suffix:hy2.test)->direct`,domain++):
+
+| 负载 | 卸载开 | 卸载关 |
+| --- | --- | --- |
+| QUIC direct UDP(juicity) | **149.1 Mbps @ 0.00 核**(endpoint hits=0) | 33.2 Mbps @ 0.78 核(hits=13588) |
+
+吞吐 4.5×、引擎 CPU 归零(149Mbps 上限来自 juicity 客户端自身在 A53 上的
+QUIC crypto)。direct 行保持 874 Mbps @ 0.00 核(dae 889 持平),TCP 协议行
+偏差 ≤2.3% 无回归。
+
+## 结果(2026-08-06,direct 内核卸载验证轮 @ NanoPi R2S)
+
+验证 PR #17(Rule 模式 direct 流全量内核卸载,按流缓存决策,零每包开销)。
+引擎为 feat/rprx(含 main `ac5ffbb`)aarch64 musl,lab 的 8080/5300 目标走
+`fallback: direct`(非 must)——正是本功能的目标路径。两轮交替,dae 同窗口
+重测。
+
+| 引擎 | 协议 | cold | bw (Mbps) | cpu | RSS |
+| --- | --- | --- | --- | --- | --- |
+| honk | direct(卸载后) | 0.0043 | **880**(上轮 370) | **0.01**(上轮 0.71) | 61 |
+| dae | direct | 0.0041 | 896 | 0.01 | 39 |
+
+协议行两轮全部在上轮噪声内(hy2 267/268、tuic 260/262、ss2022 353/353、
+trojan 279/282),无回归。honk direct 与 dae 同量级(差距 1.8% 属链路噪声),
+cold 同步改善(6.2→4.3ms,与 dae 4.1ms 持平)。
+
+## 结果(2026-08-05,ARM A/B: honk vs dae @ NanoPi R2S)
+
+双引擎对照轮,引擎机 NanoPi R2S(两轮:.43 板载网口 / .45 USB 网卡复测),
+honk 为 feat/rprx `2ad0a93` aarch64 musl,dae 为 kdae `ae056a6a`(go1.26.5)。
+方法学不变;两引擎同一时刻只跑一个。dae 仅支持共有协议行(hy2/tuic/
+ss2022/trojan)。两轮交替取均值,轮内偏差 <5%。**注意 .45 复测用 USB 网卡,
+绝对带宽整体下移 ~10–15%,引擎间比值才是可比项。**
+
+### TCP(.45 复测值;`→` 后为 .43 首轮值)
+
+| 引擎 | 协议 | cold | hot p50 | bw (Mbps) | cpu | RSS (MB) |
+| --- | --- | --- | --- | --- | --- | --- |
+| honk | direct | 0.0062 | – | 370 →458 | 0.71 | 52 |
+| dae | direct | 0.0057 | – | 895 →931 | 0.01 | 39 |
+| honk | hy2 | 0.0091 | 0.0081 | 268 →303 | 1.34 | 59 |
+| dae | hy2 | 0.0367 | 0.0079 | 191 →197 | 1.86 | 57 |
+| honk | tuic | 0.0070 | 0.0070 | 262 →293 | 1.36 | 59 |
+| dae | tuic | 0.1040 | 0.0834 | 196 →208 | 1.80 | 49 |
+| honk | ss2022 | 0.0070 | 0.0058 | 353 →385 | 0.88 | 51 |
+| dae | ss2022 | 0.0114 | 0.0092 | 247 →265 | 0.87 | 41 |
+| honk | trojan | 0.0221 | 0.0061 | 282 →328 | 0.88 | 53 |
+| dae | trojan | 0.0228 | 0.0163 | 171 →201 | 0.78 | 42 |
+
+### UDP(.45 复测值;echo RTT 秒 / 饱和接收 Mbps / cpu)
+
+| 引擎 | 协议 | RTT | bw | cpu |
+| --- | --- | --- | --- | --- |
+| honk | hy2/udp | 0.0029 | 33 | 1.85 |
+| dae | hy2/udp | 0.0034 | 31 | 2.14 |
+| honk | tuic/udp | 0.0028 | 53 | 1.76 |
+| dae | tuic/udp | 0.0034 | 33 | 2.21 |
+| honk | ss2022/udp | 0.0021 | 34 (73.8%) | 0.93 |
+| dae | ss2022/udp | 0.0027 | 40 (87.9%) | 1.29 |
+| honk | trojan/udp | 0.0019 | 31 | 0.88 |
+| dae | trojan/udp | 0.0031 | 49 | 1.45 |
+
+解读:
+
+- **honk TCP 吞吐领先 35–65% 且可复现**:hy2 1.40×、tuic 1.34×、trojan
+  1.65×、ss2022 1.43×(与 .43 轮比值漂移 ≤0.1);每 Mbps 的 CPU 成本约为
+  dae 的一半(hy2: 1.34 核@268 vs 1.86 核@191)。A53 弱核上 Go 运行时的
+  每字节成本在 QUIC 协议上被放大得最厉害。
+- **延迟**:dae tuic 热 p50 83ms/冷 104ms(每连接重建 QUIC 会话)两轮原样
+  重现;honk 全协议热 p50 ≤8ms。UDP echo RTT honk 各行稳定低 0.5–1.2ms。
+- **direct 行差异是路径而非引擎**:dae 把 fallback direct 全量 eBPF 卸载
+  (895Mbps@0.01 核),honk 只对 must 标记的 direct 卸载,fallback direct
+  走用户态 relay(370@0.71)——可作 honk 后续优化点。
+- **UDP** 两引擎都触及 A53 平台瓶颈(30–57Mbps),互有胜负;内存 dae 略省
+  (38–59MB vs 48–61MB),1GB 设备上均非约束。
+- 公平性:双方 TCP relay 均在用户态(dae 日志确认 eBPF offload 关闭)。
+
+## 结果(2026-08-05,ARM 轮: NanoPi R2S / RK3328)
+
+引擎机 10.10.10.43(NanoPi R2S: 4×Cortex-A53 @1.3GHz, 968MB RAM, end0
+1Gbps, kernel 6.18, cpuinfo 含 `aes pmull sha1 sha2`),引擎为 feat/rprx
+`2ad0a93` aarch64 musl 构建。方法学不变(netns lab → 真实 eBPF 数据面 →
+.70)。**线速锚点: 关闭引擎后 netns+NAT 路径打满 941 Mbps**,以下数字的
+瓶颈全在引擎用户态。CPU 列仅含 honk 进程 utime/stime,不含 softirq。
+
+### TCP
+
+| 引擎 | 协议 | cold | hot p50 | hot p95 | bw (Mbps) | cpu | RSS (MB) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| honk | direct | 0.0064 | – | – | 437 | 0.74 | 50 |
+| honk | hy2 | 0.0100 | 0.0084 | 0.0090 | 301 | 1.34 | 61 |
+| honk | tuic | 0.0097 | 0.0073 | 0.0082 | 304 | 1.33 | 56 |
+| honk | ss2022 | 0.0105 | 0.0057 | 0.0065 | 388 | 0.83 | 55 |
+| honk | trojan | 0.0213 | 0.0060 | 0.0205 | 329 | 0.91 | 50 |
+| honk | anytls-sb | 0.0066 | 0.0061 | 0.0065 | 336 | 0.98 | 51 |
+| honk | anytls-go | 0.0116 | 0.0065 | 0.0076 | 337 | 0.96 | 51 |
+| honk | vless-reality-vision | 0.0225 | 0.0181 | 0.0196 | 183 | 0.74 | 51 |
+| honk | vless-reality | 0.0208 | 0.0174 | 0.0287 | 332 | 0.88 | 52 |
+| honk | vmess (tcp) | 0.0076 | 0.0067 | 0.0087 | 416 | 1.50 | 47 |
+
+### UDP(热态,`udp_warm_node_count: 8`)
+
+| 协议 | echo RTT p50 | bw Mbps (loss) | cpu |
+| --- | --- | --- | --- |
+| hy2 | 2.77 ms | 34 (97.8%) | 1.91 |
+| tuic | 2.88 ms | 46 (98.1%) | 1.86 |
+| ss2022 | 2.09 ms | 42 (91.0%) | 0.92 |
+| trojan | 2.12 ms | 38 (98.1%) | 0.90 |
+| anytls-sb | 2.23 ms | 50 (89.3%) | 1.79 |
+| anytls-go | 2.54 ms | 57 (87.7%) | 1.80 |
+
+解读(A53 小核 vs x86 E-13600K,同方法学对照 08-04 轮):
+
+- **全部 CPU-bound**:direct 437(x86 9390);TCP 类被压平在 330–390
+  Mbps(行间扁平 = 瓶颈在公共 relay+crypto 路径);QUIC 每核效率差 ~20 倍。
+  vmess 416 最接近 direct 基线,印证 `5dc47cf` 的 BoringSSL AEAD 在 ARM
+  crypto extensions 下同样有效;其 cpu 1.50 仍是 TCP 类最高(跨平台共同
+  优化点)。vless-vision 183 为 TCP 最低行;vision/reality 行 hot p50
+  ~18ms(x86 3.3ms)是 REALITY 握手在慢 crypto 上的每连接成本。
+- **UDP 是重灾区**:34–57 Mbps、丢包 88–98%——A53 上逐包路径(TPROXY
+  recvmsg provenance + anyfrom 回复 + 隧道组帧)完全饱和,echo RTT 比
+  x86 慢一个量级。
+- **RSS 47–61MB 与 x86 相同**,1GB 设备全程无内存压力——瓶颈纯 CPU。
+- rprx 行的 .70 目标服务(8007-8009/5207-5209/53537-53539)本轮处于半坏
+  状态,三行用等价变体(工作目标 8001/5201 重路由到对应 group)测量,
+  方法学不变。
+
+## 结果(2026-08-05,rprx 协议族: VLESS+REALITY(±vision)/VMess 入列)
+
+本轮覆盖 feat/rprx(PR #12)新增的协议行,引擎为 feat/rprx musl+mimalloc 构建
+(vless 行于 `67b5a56` 测量,vmess 行在 `5dc47cf` AEAD 修复后重建测量;修复
+内容见该分支)。方法学与上文完全一致。新增服务端矩阵(10.10.10.70,sing-box
+1.13.14):vless+reality+vision `:2448`、vless+reality `:2449`、vmess 裸 tcp
+`:2450`;目标服务 http `8007-8009`、iperf3 `5207-5209`、udp echo
+`53537-53539`;引擎按端口路由(`5207/8007/53537→vision`、`…8→reality`、
+`…9→vmess`)。reality 伪装目标为本地 TLS 服务(注意:dest 的 TLS Certificate
+消息必须 <8KiB,否则 reality 服务端的 CH 缓存放不下会判定失败)。
+
+校准锚点(本轮 vs 08-04 轮):direct 9411/9390、ss2022 9399/9398、
+anytls-sb 9406/9388 Mbps——环境判定一致,下表可直接与 08-04 轮横向比较。
+
+| 引擎 | 协议 | cold | hot p50 | hot p95 | bw (Mbps) | cpu | RSS (MB) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| honk | vless-reality-vision | 0.0037 | 0.0033 | 0.0050 | 9372 | 0.60 | 45 |
+| honk | vless-reality | 0.0043 | 0.0034 | 0.0042 | 9383 | 0.49 | 54 |
+| honk | vmess (tcp) | 0.0022 | 0.0010 | 0.0014 | 9313 | 0.78 | 50 |
+
+- 三行全部贴线速(~9.4G)。vmess 行是 `5dc47cf`(body AEAD 从 RustCrypto
+  切到 BoringSSL)之后的结果;修复前同路径 handler 级测量仅 ~420 MB/s
+  (单核 105%)。vmess cpu 0.78 核仍是 TCP 类协议中最高(每 chunk 的
+  SHAKE 长度掩码 + 帧处理),可作后续优化点。
+- vision vs 无 vision 无带宽差异(10G 内非 vision 的 BoringSSL AES-NI 已
+  贴线速);vision 行 cpu 略高(0.60 vs 0.49)为组帧开销,cold 含 reality
+  握手。
+- vless/vmess 在 honk 无 UDP 数据面(README TODO),UDP 行无数据,非测量
+  失败。
+
 ## 结果(2026-08-04,honk outbound-v2 重构回归验证)
 
 本轮是 outbound-v2 重构合并的单引擎回归验证,不含 dae/sing-box 对照臂;
