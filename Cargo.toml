@@ -4,6 +4,7 @@ resolver = "2"
 members = [
     "crates/honk-config",
     "crates/honk-ebpf-common",
+    "crates/honk-nfqueue",
     "crates/honk-outbound",
     "crates/honk-core",
     "crates/honk-tool",
@@ -21,6 +22,7 @@ authors = ["glassyiris <honk@catmint.cc> and honk contributors"]
 # Internal
 honk-config = { path = "crates/honk-config" }
 honk-ebpf-common = { path = "crates/honk-ebpf-common" }
+honk-nfqueue = { path = "crates/honk-nfqueue" }
 honk-outbound = { path = "crates/honk-outbound" }
 
 # Async runtime

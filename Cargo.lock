@@ -1500,6 +1500,7 @@ dependencies = [
  "base64 0.23.0",
  "chrono",
  "glob",
+ "honk-ebpf-common",
  "libc",
  "regex",
  "serde",
@@ -1540,6 +1541,7 @@ dependencies = [
  "hkdf",
  "honk-config",
  "honk-ebpf-common",
+ "honk-nfqueue",
  "honk-outbound",
  "http",
  "ipnet",
@@ -1593,6 +1595,16 @@ dependencies = [
  "aya-ebpf",
  "aya-ebpf-bindings",
  "network-types",
+]
+
+[[package]]
+name = "honk-nfqueue"
+version = "0.0.1-alpha"
+dependencies = [
+ "libc",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
