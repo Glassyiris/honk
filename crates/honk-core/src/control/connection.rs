@@ -489,43 +489,8 @@ impl ControlPlaneHandle {
                 .map(|ho| ho.outbound == OutboundIndex::ControlPlaneRouting as u8)
                 .unwrap_or(true);
             if is_userspace_route {
-                let router = self.router.read().await;
-                if let Some(matched) = router.route_full(&conn_info) {
-                    let bitmaps = {
-                        let db = DOMAIN_BITMAPS.read();
-                        db.get(matched.rule_name).cloned().unwrap_or_default()
-                    };
-                    if !bitmaps.is_empty() {
-                        let mut merged = DomainRouting::default();
-                        for bm in &bitmaps {
-                            for (word, value) in merged.bitmap.iter_mut().zip(bm.bitmap) {
-                                *word |= value;
-                            }
-                        }
-                        let prefix_len = if original_dst.ip().is_ipv4() { 32 } else { 128 };
-                        let prefix = format!("{}/{}", original_dst.ip(), prefix_len);
-                        if let Ok(lpm_key) = cidr_to_lpm_key(&prefix) {
-                            let mut ebpf = self.ebpf.write().await;
-                            match ebpf.add_domain_ip_bitmap(&lpm_key, &merged) {
-                                Err(e) => {
-                                    debug!(
-                                        "Failed to update DOMAIN_ROUTING_MAP for {}: {}",
-                                        original_dst.ip(),
-                                        e
-                                    );
-                                }
-                                _ => {
-                                    debug!(
-                                        "DOMAIN_ROUTING_MAP updated: {} -> {} (rule '{}')",
-                                        original_dst.ip(),
-                                        domain,
-                                        matched.rule_name
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
+                self.push_sniffed_domain_bitmap(&conn_info, domain, original_dst.ip())
+                    .await;
             }
         }
 
@@ -1386,11 +1351,14 @@ impl ControlPlaneHandle {
         }
 
         let mut quic_domain: Option<String> = None;
+        let mut quic_confirmed = false;
         {
             let sniffer_key =
                 crate::control::packet_sniffer::PacketSnifferKey::new(client_addr, original_dst);
             if !self.sniffer_pool.is_dcid_failed(&sniffer_key) {
-                quic_domain = self.sniffer_pool.feed_quic_initial(sniffer_key, &data);
+                let outcome = self.sniffer_pool.feed_quic_initial(sniffer_key, &data);
+                quic_confirmed = outcome.is_quic_confirmed();
+                quic_domain = outcome.into_domain();
             }
         }
         if matches!(dial_mode, DialMode::Domain)
@@ -1447,6 +1415,43 @@ impl ControlPlaneHandle {
             (name.to_string(), must)
         };
         let outbound_name = self.apply_mode_override(outbound_name, must).await;
+
+        // Post-decision offload for confirmed-QUIC flows converging to
+        // direct: the flow leaves userspace without a single packet being
+        // relayed, so the server-visible 5-tuple never changes hands.
+        if self
+            .try_offload_quic_flow(
+                &tuples,
+                &outbound_name,
+                must,
+                client_addr,
+                original_dst,
+                quic_confirmed,
+            )
+            .await
+        {
+            // Close the offload lifecycle when a sniffed domain drove the
+            // decision: once the conn_state is swept (120s idle), a
+            // mid-session packet is not an Initial and cannot be re-sniffed,
+            // so the route-time re-decision must find the domain's bitmap in
+            // DOMAIN_ROUTING_MAP — DomainKnown lets the kernel re-decide
+            // direct and offload at route time, with no userspace round-trip
+            // and no server-visible tuple change.  Only the offloaded path
+            // writes back: for a userspace-relayed flow a post-sweep kernel
+            // offload would switch the tuple mid-session.
+            if let Some(ref domain) = quic_domain {
+                let domain_drove_decision = handoff
+                    .as_ref()
+                    .map(|ho| ho.outbound == OutboundIndex::ControlPlaneRouting as u8)
+                    .unwrap_or(true)
+                    || reroute_by_sniffed_domain;
+                if domain_drove_decision {
+                    self.push_sniffed_domain_bitmap(&conn_info, domain, original_dst.ip())
+                        .await;
+                }
+            }
+            return Ok(());
+        }
 
         let matched_rule = {
             let router = self.router.read().await;
@@ -1699,8 +1704,6 @@ impl ControlPlaneHandle {
             self.stats.record_error(&outbound_name);
             return Err(error.into());
         }
-        self.maybe_offload_udp_flow(&tuples, &outbound_name, must, client_addr, original_dst)
-            .await;
         debug!(
             "Proxying UDP {} -> {} via {} (endpoint driver ready)",
             client_addr, original_dst, node.name
@@ -1708,40 +1711,102 @@ impl ControlPlaneHandle {
         Ok(())
     }
 
-    /// UDP post-decision kernel offload.  The flow's decision has fully
-    /// converged (routing, mode override, group selection) and the first
-    /// packet went out, so — unlike TCP, where the kernel must track
-    /// sequence state from the first byte — the flow may leave the
-    /// userspace datapath mid-stream: publish `ROUTING_META_FLAG_OFFLOAD`
-    /// on its conn_state and the `lan_ingress` established-UDP path passes
-    /// subsequent packets straight through.
+    /// After a userspace routing decision that used a sniffed domain, write
+    /// the matched domain rule's bitmap back into `DOMAIN_ROUTING_MAP` for
+    /// the destination IP, so the datapath can re-decide later flows to that
+    /// IP from the learned entry (DomainKnown) instead of userspace
+    /// sniffing.  Shared by the TCP sniff path and the UDP drop-and-reinject
+    /// offload; the entry lives in the same map and follows the same
+    /// lifecycle as DNS-learned routes (it survives conn_state sweeps).
+    /// Best-effort: a write failure is logged and never fails the flow.
+    async fn push_sniffed_domain_bitmap(
+        &self,
+        conn_info: &ConnectionInfo,
+        domain: &str,
+        dst_ip: std::net::IpAddr,
+    ) {
+        let (rule_name, bitmaps) = {
+            let router = self.router.read().await;
+            match router.route_full(conn_info) {
+                Some(matched) => {
+                    let rule_name = matched.rule_name.to_string();
+                    let bitmaps = {
+                        let db = DOMAIN_BITMAPS.read();
+                        db.get(&rule_name).cloned().unwrap_or_default()
+                    };
+                    (rule_name, bitmaps)
+                }
+                None => return,
+            }
+        };
+        if bitmaps.is_empty() {
+            return;
+        }
+        let mut merged = DomainRouting::default();
+        for bm in &bitmaps {
+            for (word, value) in merged.bitmap.iter_mut().zip(bm.bitmap) {
+                *word |= value;
+            }
+        }
+        let prefix_len = if dst_ip.is_ipv4() { 32 } else { 128 };
+        let prefix = format!("{dst_ip}/{prefix_len}");
+        let Ok(lpm_key) = cidr_to_lpm_key(&prefix) else {
+            return;
+        };
+        let mut ebpf = self.ebpf.write().await;
+        match ebpf.add_domain_ip_bitmap(&lpm_key, &merged) {
+            Ok(()) => debug!(
+                "DOMAIN_ROUTING_MAP updated: {} -> {} (rule '{}')",
+                dst_ip, domain, rule_name
+            ),
+            Err(error) => warn!(
+                "Failed to update DOMAIN_ROUTING_MAP for {} ({}): {}",
+                dst_ip, domain, error
+            ),
+        }
+    }
+
+    /// UDP post-decision kernel offload via drop-and-reinject.  When the
+    /// flow's control-plane decision has fully converged (routing with the
+    /// sniffed domain, mode override) to `direct` and the first datagram is
+    /// a confirmed QUIC Initial, the flow is released back to the kernel
+    /// without userspace relaying a single byte: publish
+    /// `ROUTING_META_FLAG_OFFLOAD` on its conn_state and return, dropping
+    /// the lease — the in-flight Initial and any queued followers with it.
+    /// QUIC clients must retransmit a lost Initial (RFC 9000), so the
+    /// retransmission arrives on the `lan_ingress` established-UDP path and
+    /// passes straight through; from the first server-seen packet onward the
+    /// 5-tuple is the client's own, never the engine's ephemeral socket.
+    /// The only cost is one Initial RTO at flow setup.
     ///
-    /// The Ready endpoint is deliberately kept: it delivers the in-flight
-    /// first reply (a single-shot UDP exchange must not lose it) and is
-    /// then reclaimed by the normal idle reaper together with its tracker
-    /// entry — a `direct` endpoint holds no AnyTLS/QUIC resources, so
-    /// nothing leaks.  Subsequent packets no longer enter userspace at all,
-    /// so offloaded flows stop appearing in `/connections` and their rx
-    /// bytes are not counted (rx is accounted at `dae0_ingress`), exactly
-    /// like route-time `must`-direct offload.  After 120s of silence the
-    /// conn_state is swept and the next datagram simply repeats this
-    /// decision-and-offload cycle.
-    async fn maybe_offload_udp_flow(
+    /// Non-QUIC flows are never offloaded here: they have no retransmission
+    /// guarantee, so dropping their first datagram could lose it — they keep
+    /// the full userspace relay.  No endpoint, tracker entry, or stats
+    /// connection is created on this path (the branch runs before any of
+    /// them exist), so nothing userspace-side is left frozen behind an
+    /// offloaded flow.  After 120s of silence the conn_state is swept and
+    /// the next Initial simply repeats this decide-drop-reinject cycle.
+    ///
+    /// Returns `true` when the flow was offloaded and the caller must drop
+    /// the lease and return.  A failed or impossible conn_state write falls
+    /// back to the ordinary userspace relay (`false`).
+    async fn try_offload_quic_flow(
         &self,
         tuples: &TuplesKey,
         outbound_name: &str,
         must: bool,
         client_addr: SocketAddr,
         original_dst: SocketAddr,
-    ) {
-        // Disabled by default: the userspace first packet goes out from the
-        // engine's own ephemeral socket while offloaded packets continue via
-        // kernel NAT/forwarding, so the server-visible 5-tuple changes at the
-        // switch — unsafe for stateful UDP (QUIC handshakes, game/VoIP
-        // sessions). Opt in with HONK_UDP_POST_DECISION_OFFLOAD=1. Route-time
-        // must-direct offload is unaffected (kernel path from packet one).
+        quic_confirmed: bool,
+    ) -> bool {
+        // Opt-in while the semantics bed in:
+        // HONK_UDP_POST_DECISION_OFFLOAD=1.  Route-time must-direct offload
+        // is unaffected (kernel path from packet one).
         if std::env::var("HONK_UDP_POST_DECISION_OFFLOAD").as_deref() != Ok("1") {
-            return;
+            return false;
+        }
+        if !quic_confirmed {
+            return false;
         }
         // Evaluate the predicate before the await: the read guard is !Send.
         let allowed = {
@@ -1755,29 +1820,36 @@ impl ControlPlaneHandle {
             )
         };
         if !allowed {
-            return;
+            return false;
         }
-        // Best-effort: a write failure forfeits only the offload, the flow
-        // keeps working through userspace.
         match self.ebpf.write().await.offload_udp_flow(tuples) {
-            Ok(true) => debug!(
-                network = "udp",
-                outbound = %outbound_name,
-                ip = %original_dst,
-                src = %client_addr,
-                ebpf_offload = true,
-                "UDP offloaded to eBPF: {} -> {}",
-                client_addr,
-                original_dst,
-            ),
-            Ok(false) => trace!(
-                "UDP offload skipped, no published conn_state: {} -> {}",
-                client_addr, original_dst,
-            ),
-            Err(error) => warn!(
-                "UDP offload write failed for {} -> {}; staying in userspace: {}",
-                client_addr, original_dst, error
-            ),
+            Ok(true) => {
+                debug!(
+                    network = "udp",
+                    outbound = %outbound_name,
+                    ip = %original_dst,
+                    src = %client_addr,
+                    ebpf_offload = true,
+                    "QUIC flow offloaded to eBPF, Initial dropped for retransmit: {} -> {}",
+                    client_addr,
+                    original_dst,
+                );
+                true
+            }
+            Ok(false) => {
+                trace!(
+                    "UDP offload skipped, no published conn_state: {} -> {}",
+                    client_addr, original_dst,
+                );
+                false
+            }
+            Err(error) => {
+                warn!(
+                    "UDP offload write failed for {} -> {}; staying in userspace: {}",
+                    client_addr, original_dst, error
+                );
+                false
+            }
         }
     }
 
