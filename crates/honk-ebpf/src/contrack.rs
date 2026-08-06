@@ -59,6 +59,8 @@ fn occupancy_add(slot: u32) {
 /// |  56     | `has_routing` |
 /// |  57     | `offload` (mode-based direct offload; see
 ///           [`honk_ebpf_common::ROUTING_META_FLAG_OFFLOAD`]) |
+/// |  58–60  | NFQUEUE UDP decision state
+///           ([`honk_ebpf_common::UdpDecisionState`]) |
 ///
 /// **Note**: this differs from the C dae layout (where mark occupies bits 0–31
 /// and outbound bits 32–39). Do **not** copy bit offsets from C code.

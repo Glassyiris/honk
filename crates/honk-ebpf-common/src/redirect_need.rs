@@ -49,7 +49,17 @@ pub struct Tuples {
 pub struct RoutingHandoffEntry {
     pub last_seen_ns: u64,
     pub result: RoutingResult,
+    /// Copy of the flow's `ConnState::decision_cookie` at handoff time, so
+    /// the NFQUEUE decision path can pair a consumed handoff with the
+    /// conn_state it is about to rewrite.  Zero for flows that never
+    /// entered the staging path.  Fills the former tail padding; the map
+    /// value size is unchanged.
+    pub decision_cookie: u32,
 }
+
+const _HANDOFF_ENTRY_SIZE: () = assert!(core::mem::size_of::<RoutingHandoffEntry>() == 48);
+const _HANDOFF_ENTRY_COOKIE_OFFSET: () =
+    assert!(core::mem::offset_of!(RoutingHandoffEntry, decision_cookie) == 44);
 
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]

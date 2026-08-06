@@ -1604,6 +1604,7 @@ mod tests {
                 outbound: 3,
                 ..Default::default()
             },
+            decision_cookie: 0,
         };
         backend.routing_handoffs.lock().unwrap().insert(
             MockEbpfBackend::tuples_key_bytes(&handoff_key),
@@ -1782,6 +1783,7 @@ mod tests {
                 outbound: 5,
                 ..Default::default()
             },
+            decision_cookie: 0,
         };
         backend
             .routing_handoffs

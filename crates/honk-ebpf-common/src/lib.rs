@@ -26,6 +26,20 @@ pub use crate::route::{
 
 pub const TASK_COMM_LEN: usize = 16;
 pub const TPROXY_MARK: u32 = 0x0800_0000;
+/// skb->mark bit 29: the flow's UDP decision is still pending in the
+/// NFQUEUE staging path; netfilter queues these packets to userspace
+/// instead of letting them continue through the stack.  Set only by
+/// `queue_udp_for_decision`, cleared by the verdict (NFQA_MARK replaces
+/// the whole mark, so verdicts must preserve the routing mark bits).
+pub const NFQUEUE_PENDING_MARK: u32 = 0x2000_0000;
+/// skb->mark bit 30: the packet already passed `lan_ingress`
+/// classification once (bridge master + slave double-attach dedup).
+/// Defined here — not in honk-ebpf — so userspace can validate that
+/// user-configured marks never collide with the datapath-reserved bits.
+pub const CLASSIFIED_MARK: u32 = 0x4000_0000;
+/// skb->mark bits the datapath owns; user routing/fw marks must not
+/// overlap (config validation rejects them).
+pub const SKB_MARK_RESERVED_MASK: u32 = NFQUEUE_PENDING_MARK | CLASSIFIED_MARK;
 /// Socket mark bit used by the control plane to tell the eBPF datapath to
 /// pass its own traffic through without re-routing it.
 pub const DAE_BYPASS_MARK: u32 = 0x100;
@@ -211,7 +225,7 @@ pub struct RoutingMetaData {
     pub mark: u32,    // offset 1 → u64 bits 8-39
     pub must: u8,     // offset 5 → u64 bit 40
     pub dscp: u8,     // offset 6 → u64 bits 48-55
-    pub _pad: u8,     // offset 7 → u64 bits 56-63 (bit 56 published, bit 57 offload)
+    pub _pad: u8, // offset 7 → u64 bits 56-63 (56 published, 57 offload, 58-60 udp decision state)
 }
 
 /// Bit 57 of `RoutingMeta::raw`: the per-flow cached kernel-offload
@@ -230,11 +244,70 @@ pub const ROUTING_META_FLAG_OFFLOAD: u64 = 1 << 57;
 /// entirely until this bit is set.
 pub const ROUTING_META_FLAG_PUBLISHED: u64 = 1 << 56;
 
+/// Bits 58–60 of `RoutingMeta::raw`: the NFQUEUE UDP decision state
+/// ([`UdpDecisionState`]).  Bit 57 is the offload flag, so the staged
+/// decision state lives directly above it; `None` (0) is the value every
+/// pre-NFQUEUE flow carries, keeping old map entries valid.
+pub const ROUTING_META_UDP_STATE_SHIFT: u64 = 58;
+pub const ROUTING_META_UDP_STATE_MASK: u64 = 0b111 << ROUTING_META_UDP_STATE_SHIFT;
+
+/// Per-flow UDP decision state for the NFQUEUE staging path, carried in
+/// `RoutingMeta` bits 58–60.  Only `Pending` is produced by the datapath in
+/// the skeleton phase; the remaining states are written by the control
+/// plane when it commits a decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum UdpDecisionState {
+    /// No staged decision (all flows before the NFQUEUE path exists).
+    None = 0,
+    /// Decision pending: subsequent packets must keep entering NFQUEUE.
+    Pending = 1,
+    /// Direct decided, conn_state armed, but the verdicts are not all sent
+    /// yet: packets must still go through NFQUEUE (accepted there).
+    DirectArmed = 2,
+    /// Direct committed: equivalent to the offload bit, packets pass through
+    /// the kernel directly.
+    DirectActive = 3,
+    /// Proxy committed: packets take the existing TPROXY redirect.
+    ProxyActive = 4,
+    /// Blocked: packets are dropped.
+    Blocked = 5,
+}
+
+impl UdpDecisionState {
+    #[inline(always)]
+    pub const fn from_raw(v: u8) -> Self {
+        match v {
+            1 => Self::Pending,
+            2 => Self::DirectArmed,
+            3 => Self::DirectActive,
+            4 => Self::ProxyActive,
+            5 => Self::Blocked,
+            _ => Self::None,
+        }
+    }
+}
+
 impl RoutingMeta {
     /// Whether the datapath has published a routing decision (bit 56).
     pub fn is_published(&self) -> bool {
         let raw = unsafe { self.raw };
         raw & ROUTING_META_FLAG_PUBLISHED != 0
+    }
+
+    /// The NFQUEUE UDP decision state (bits 58–60).
+    pub fn udp_decision_state(&self) -> UdpDecisionState {
+        let raw = unsafe { self.raw };
+        UdpDecisionState::from_raw(
+            ((raw & ROUTING_META_UDP_STATE_MASK) >> ROUTING_META_UDP_STATE_SHIFT) as u8,
+        )
+    }
+
+    #[inline(always)]
+    pub fn set_udp_decision_state(&mut self, state: UdpDecisionState) {
+        let raw = unsafe { self.raw };
+        self.raw =
+            (raw & !ROUTING_META_UDP_STATE_MASK) | ((state as u64) << ROUTING_META_UDP_STATE_SHIFT);
     }
 
     /// UDP post-decision offload: rewrite an already-published decision to a
@@ -248,11 +321,16 @@ impl RoutingMeta {
     /// The cached outbound is normalized to `OUTBOUND_DIRECT` (0) and the
     /// tproxy mark and `must` bit are cleared — a direct flow must not keep
     /// a mark, or policy routing would send the passed-through packets back
-    /// into `daens`.  DSCP and the published bit are preserved.
+    /// into `daens`.  DSCP and the published bit are preserved, and the
+    /// NFQUEUE decision state is stamped `DirectActive`: the offload bit
+    /// and that state are the same commitment seen from the datapath and
+    /// the decision pipeline respectively.
     pub fn set_offloaded_direct(&mut self) {
         const DSCP_MASK: u64 = 0xFF << 48;
         let preserved = unsafe { self.raw } & (DSCP_MASK | ROUTING_META_FLAG_PUBLISHED);
-        self.raw = preserved | ROUTING_META_FLAG_OFFLOAD;
+        self.raw = preserved
+            | ROUTING_META_FLAG_OFFLOAD
+            | ((UdpDecisionState::DirectActive as u64) << ROUTING_META_UDP_STATE_SHIFT);
     }
 }
 
@@ -387,6 +465,14 @@ pub const DATAPATH_FLAG_OFFLOAD_ALL: u32 = 1 << 1;
 /// connection-tracker entry and no SNI-based re-route (Go dae parity), with
 /// tx stats still counted at `lan_ingress`.
 pub const DATAPATH_FLAG_OFFLOAD_NO_DOMAIN_RULES: u32 = 1 << 2;
+
+/// `DATAPATH_FLAG_NFQ_READY`: the NFQUEUE staging pipeline is fully up
+/// (listeners bound, nft rules installed and verified), so `lan_ingress`
+/// may tag eligible UDP flows with [`NFQUEUE_PENDING_MARK`] and hand them
+/// to netfilter.  Written only after the userspace self-check passes and
+/// cleared before the rules/listeners come down, so the datapath never
+/// produces a mark nobody is draining.
+pub const DATAPATH_FLAG_NFQ_READY: u32 = 1 << 3;
 
 /// Parameter keys for the `params` BPF array map.
 /// Used by honk-core to configure eBPF program behaviour at runtime.

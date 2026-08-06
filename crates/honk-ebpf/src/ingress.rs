@@ -24,10 +24,14 @@ use aya_ebpf_bindings::{
         __sk_buff, bpf_sock_tuple, bpf_sock_tuple__bindgen_ty_1__bindgen_ty_1,
         bpf_sock_tuple__bindgen_ty_1__bindgen_ty_2,
     },
-    helpers::{bpf_ktime_get_ns, bpf_redirect, bpf_redirect_peer, bpf_skb_store_bytes},
+    helpers::{
+        bpf_get_prandom_u32, bpf_ktime_get_ns, bpf_redirect, bpf_redirect_peer,
+        bpf_skb_store_bytes,
+    },
 };
 use honk_ebpf_common::{
-    RedirectEntry, RedirectTuple, RoutingMeta, TPROXY_MARK,
+    CLASSIFIED_MARK, NFQUEUE_PENDING_MARK, RedirectEntry, RedirectTuple, RoutingMeta, TPROXY_MARK,
+    UdpDecisionState,
     conn::{BpfStatsKey, ConnState},
     redirect_need::{RoutingHandoffEntry, TuplesKey},
 };
@@ -48,26 +52,7 @@ use crate::{
 };
 const IPV6_BYTE_LENGTH: usize = 16;
 
-/// skb->mark bit set on packets that already passed `lan_ingress`
-/// classification and were allowed through (`TC_ACT_OK`).
-///
-/// Userspace attaches `lan_ingress` to both the bridge master and every
-/// bridge slave (honk-core real.rs), so a forwarded packet would otherwise
-/// run the full parse + conntrack + socket lookup twice.  The first pass
-/// tags pass-through packets with this bit; the second pass sees it at the
-/// entry check and returns `TC_ACT_OK` immediately.
-///
-/// The mark rides with the skb into the network stack and is visible to
-/// netfilter (`iptables -m mark`) and other TC programs.  Bit 30 was chosen
-/// because it collides with none of the marks in use here — `TPROXY_MARK`
-/// is bit 27 and the dae socket mark is bit 8 — while staying clear of
-/// bit 31, which some userland tools print as a sign bit.  Redirected
-/// packets don't need the tag: their mark is overwritten with
-/// `TPROXY_MARK` and they leave towards dae0 instead of reaching the
-/// second attach point.
-const CLASSIFIED_MARK: u32 = 0x4000_0000;
-
-/// Handoff write modes for [`redirect_lan_packet_to_control_plane`].
+/// Handoff write modes for [`publish_udp_handoff`].
 ///
 /// `HANDOFF_WRITE_ALWAYS`: new TCP flow (pure-SYN path).  Userspace
 ///   consumes the entry once when the connection is accepted, so every new
@@ -86,8 +71,141 @@ const HANDOFF_WRITE_ALWAYS: u8 = 0;
 const HANDOFF_WRITE_SKIP: u8 = 1;
 const HANDOFF_WRITE_REFRESH: u8 = 2;
 
+/// Publish the userspace routing handoff for this flow, throttled by
+/// `handoff_mode` (see the HANDOFF_WRITE_* constants above).  Shared by the
+/// TPROXY redirect and the NFQUEUE staging path; `decision_cookie` is
+/// nonzero only for flows parked in the staging path.
 #[inline(always)]
-fn redirect_lan_packet_to_control_plane(
+fn publish_udp_handoff(
+    pkt: &ParsedPacket,
+    routing_meta: &RoutingMeta,
+    handoff_mode: u8,
+    decision_cookie: u32,
+    now: u64,
+) -> Result<(), c_long> {
+    let write_handoff = match handoff_mode {
+        HANDOFF_WRITE_ALWAYS => true,
+        HANDOFF_WRITE_REFRESH => match ROUTING_HANDOFF_MAP.get_ptr_mut(pkt.tuples.five) {
+            Some(old) => {
+                now.wrapping_sub(unsafe { (*old).last_seen_ns })
+                    >= crate::contrack::AUXILIARY_MAP_REFRESH_INTERVAL_NS
+            }
+            None => true,
+        },
+        _ => false,
+    };
+    if !write_handoff {
+        return Ok(());
+    }
+    let mut handoff: RoutingHandoffEntry = unsafe { mem::zeroed() };
+    handoff.last_seen_ns = now;
+    handoff.decision_cookie = decision_cookie;
+    unsafe {
+        handoff.result.mark = routing_meta.data.mark;
+        handoff.result.must = routing_meta.data.must;
+        handoff.result.outbound = routing_meta.data.outbound;
+        handoff.result.dscp = routing_meta.data.dscp;
+    }
+    handoff.result.mac.copy_from_slice(&pkt.ethh.src_addr);
+    if ROUTING_HANDOFF_MAP
+        .insert(pkt.tuples.five, handoff, 0)
+        .is_err()
+    {
+        increment_bpf_stat(BpfStatsKey::RoutingHandoffInsertFailure);
+        // The control plane would otherwise receive an unrouteable flow.
+        return Err(TC_ACT_SHOT);
+    }
+    Ok(())
+}
+
+/// Store the original LAN framing so dae0_ingress can rewrite replies back
+/// to the original client without involving host IP forwarding.  Only the
+/// TPROXY redirect path calls this — a queued (NFQUEUE) packet never
+/// crosses dae0, so it has no reply framing to restore.
+#[inline(always)]
+fn publish_redirect_track(
+    ctx: &TcContext,
+    pkt: &ParsedPacket,
+    routing_meta: &RoutingMeta,
+    handoff_mode: u8,
+    now: u64,
+) -> Result<(), c_long> {
+    // New flows write unconditionally; cached-flow packets only refresh the
+    // entry once it is older than AUXILIARY_MAP_REFRESH_INTERVAL_NS.
+    let redirect_tuple = RedirectTuple::from_tuples(&pkt.tuples.five);
+    let write_track = if handoff_mode == HANDOFF_WRITE_ALWAYS {
+        true
+    } else {
+        match REDIRECT_TRACK.get_ptr_mut(redirect_tuple) {
+            Some(old) => {
+                now.wrapping_sub(unsafe { (*old).last_seen_ns })
+                    >= crate::contrack::AUXILIARY_MAP_REFRESH_INTERVAL_NS
+            }
+            None => true,
+        }
+    };
+    if !write_track {
+        return Ok(());
+    }
+    let mut redirect_entry: RedirectEntry = unsafe { mem::zeroed() };
+    redirect_entry.ifindex = unsafe { (*ctx.skb.skb).ifindex };
+    redirect_entry.smac.copy_from_slice(&pkt.ethh.src_addr);
+    redirect_entry.dmac.copy_from_slice(&pkt.ethh.dst_addr);
+    redirect_entry.last_seen_ns = now;
+    // Record the final outbound so dae0_ingress can attribute replies.
+    redirect_entry.outbound = unsafe { routing_meta.data.outbound };
+    if REDIRECT_TRACK
+        .insert(redirect_tuple, redirect_entry, 0)
+        .is_err()
+    {
+        increment_bpf_stat(BpfStatsKey::RedirectTrackInsertFailure);
+        // Do not redirect when reply restoration cannot be guaranteed.
+        return Err(TC_ACT_SHOT);
+    }
+    Ok(())
+}
+
+/// Park a UDP packet whose flow decision is not final yet
+/// (`experimental.udp_nfqueue`): publish the handoff (carrying the flow's
+/// decision cookie) and tag the skb with `NFQUEUE_PENDING_MARK`, then let
+/// it continue into the stack (`TC_ACT_OK`) where the `honk_nfqueue` inet
+/// prerouting chain queues it to userspace.
+///
+/// Deliberately does none of what [`redirect_udp_to_tproxy`] does: no
+/// TPROXY_MARK (policy routing must not pull the packet into daens), no
+/// dae0 redirect, no reply-framing track, and no TX accounting against the
+/// final outbound — the flow has no committed decision to account yet.
+/// The caller owns stamping the conn_state `Pending` + cookie; this helper
+/// only handles the packet and the handoff.
+#[inline(always)]
+fn queue_udp_for_decision(
+    ctx: &TcContext,
+    pkt: &ParsedPacket,
+    routing_meta_raw: u64,
+    handoff_mode: u8,
+    decision_cookie: u32,
+) -> Verdict {
+    let routing_meta = RoutingMeta {
+        raw: routing_meta_raw,
+    };
+    let now = unsafe { bpf_ktime_get_ns() };
+    // Fail closed: a queued packet without its handoff would be decided
+    // blind by userspace.
+    publish_udp_handoff(pkt, &routing_meta, handoff_mode, decision_cookie, now)?;
+    // Keep the routing mark (policy routing still applies after the
+    // verdict) and add the pending bit; the NFQUEUE verdict clears the
+    // pending bit again via NFQA_MARK.
+    ctx.skb
+        .set_mark(unsafe { routing_meta.data.mark } | NFQUEUE_PENDING_MARK);
+    Err(TC_ACT_OK)
+}
+
+/// Redirect a packet into the TPROXY control plane via the dae0 veth:
+/// account TX against the final outbound, tag the skb for the daens
+/// listener handoff, publish the handoff + reply framing, and redirect.
+/// Both TCP and UDP flows use it (the NFQUEUE split only covers UDP).
+#[inline(always)]
+fn redirect_udp_to_tproxy(
     ctx: &TcContext,
     _link_h_len: u32,
     pkt: &ParsedPacket,
@@ -113,74 +231,8 @@ fn redirect_lan_packet_to_control_plane(
         (*ctx.skb.skb).cb[1] = pkt.listener_l4proto as u32;
     }
 
-    // Handoff entry for userspace lookup, throttled by mode (see the
-    // HANDOFF_WRITE_* constants): established TCP flows never write, UDP
-    // flows write at most once per AUXILIARY_MAP_REFRESH_INTERVAL_NS.
-    let write_handoff = match handoff_mode {
-        HANDOFF_WRITE_ALWAYS => true,
-        HANDOFF_WRITE_REFRESH => match ROUTING_HANDOFF_MAP.get_ptr_mut(pkt.tuples.five) {
-            Some(old) => {
-                now.wrapping_sub(unsafe { (*old).last_seen_ns })
-                    >= crate::contrack::AUXILIARY_MAP_REFRESH_INTERVAL_NS
-            }
-            None => true,
-        },
-        _ => false,
-    };
-    if write_handoff {
-        let mut handoff: RoutingHandoffEntry = unsafe { mem::zeroed() };
-        handoff.last_seen_ns = now;
-        unsafe {
-            handoff.result.mark = routing_meta.data.mark;
-            handoff.result.must = routing_meta.data.must;
-            handoff.result.outbound = routing_meta.data.outbound;
-            handoff.result.dscp = routing_meta.data.dscp;
-        }
-        handoff.result.mac.copy_from_slice(&pkt.ethh.src_addr);
-        if ROUTING_HANDOFF_MAP
-            .insert(pkt.tuples.five, handoff, 0)
-            .is_err()
-        {
-            increment_bpf_stat(BpfStatsKey::RoutingHandoffInsertFailure);
-            // The control plane would otherwise receive an unrouteable flow;
-            // do not redirect it without the required handoff.
-            return Err(TC_ACT_SHOT);
-        }
-    }
-
-    // Store the original LAN framing so dae0_ingress can rewrite replies
-    // back to the original client without involving host IP forwarding.
-    // New flows write unconditionally; cached-flow packets only refresh the
-    // entry once it is older than AUXILIARY_MAP_REFRESH_INTERVAL_NS.
-    let redirect_tuple = RedirectTuple::from_tuples(&pkt.tuples.five);
-    let write_track = if handoff_mode == HANDOFF_WRITE_ALWAYS {
-        true
-    } else {
-        match REDIRECT_TRACK.get_ptr_mut(redirect_tuple) {
-            Some(old) => {
-                now.wrapping_sub(unsafe { (*old).last_seen_ns })
-                    >= crate::contrack::AUXILIARY_MAP_REFRESH_INTERVAL_NS
-            }
-            None => true,
-        }
-    };
-    if write_track {
-        let mut redirect_entry: RedirectEntry = unsafe { mem::zeroed() };
-        redirect_entry.ifindex = unsafe { (*ctx.skb.skb).ifindex };
-        redirect_entry.smac.copy_from_slice(&pkt.ethh.src_addr);
-        redirect_entry.dmac.copy_from_slice(&pkt.ethh.dst_addr);
-        redirect_entry.last_seen_ns = now;
-        // Record the final outbound so dae0_ingress can attribute replies.
-        redirect_entry.outbound = unsafe { routing_meta.data.outbound };
-        if REDIRECT_TRACK
-            .insert(redirect_tuple, redirect_entry, 0)
-            .is_err()
-        {
-            increment_bpf_stat(BpfStatsKey::RedirectTrackInsertFailure);
-            // Do not redirect when reply restoration cannot be guaranteed.
-            return Err(TC_ACT_SHOT);
-        }
-    }
+    publish_udp_handoff(pkt, &routing_meta, handoff_mode, 0, now)?;
+    publish_redirect_track(ctx, pkt, &routing_meta, handoff_mode, now)?;
 
     // Redirect the packet to the host-side dae0 veth.  From there it crosses
     // into the isolated daens namespace via the veth peer (dae0peer), where
@@ -306,7 +358,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             return Err(TC_ACT_OK);
         }
         if outbound == OUTBOUND_DIRECT {
-            return redirect_lan_packet_to_control_plane(
+            return redirect_udp_to_tproxy(
                 ctx,
                 link_h_len,
                 pkt,
@@ -316,7 +368,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         }
         if outbound == OUTBOUND_BLOCK {
             // Redirect BLOCK to control plane so userspace can drop/log it.
-            return redirect_lan_packet_to_control_plane(
+            return redirect_udp_to_tproxy(
                 ctx,
                 link_h_len,
                 pkt,
@@ -327,7 +379,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         if !wan_outbound_is_alive(ctx, outbound, pkt.l4proto, pkt.tuples.five.dst_port) {
             return Err(TC_ACT_SHOT);
         }
-        return redirect_lan_packet_to_control_plane(
+        return redirect_udp_to_tproxy(
             ctx,
             link_h_len,
             pkt,
@@ -390,6 +442,27 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
                         ctx.skb.set_mark(mark | CLASSIFIED_MARK);
                         return Err(TC_ACT_OK);
                     }
+                    if outbound == OUTBOUND_DIRECT
+                        && udp_s.meta.udp_decision_state() == UdpDecisionState::Pending
+                        && crate::maps::datapath_flags()
+                            & honk_ebpf_common::DATAPATH_FLAG_NFQ_READY
+                            != 0
+                    {
+                        // A Pending flow's packets must keep entering
+                        // NFQUEUE until the control plane commits the
+                        // decision — redirecting them to the TPROXY listener
+                        // would switch the server-visible tuple after the
+                        // first packet already went direct.  When the
+                        // pipeline is down (flag cleared mid-flight), fall
+                        // through to the legacy redirect below.
+                        return queue_udp_for_decision(
+                            ctx,
+                            pkt,
+                            unsafe { udp_s.meta.raw },
+                            HANDOFF_WRITE_REFRESH,
+                            udp_s.decision_cookie,
+                        );
+                    }
                     if outbound == OUTBOUND_DIRECT {
                         if !wan_outbound_is_alive(
                             ctx,
@@ -399,7 +472,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
                         ) {
                             return Err(TC_ACT_SHOT);
                         }
-                        return redirect_lan_packet_to_control_plane(
+                        return redirect_udp_to_tproxy(
                             ctx,
                             link_h_len,
                             pkt,
@@ -425,7 +498,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
                         ) {
                             return Err(TC_ACT_SHOT);
                         }
-                        return redirect_lan_packet_to_control_plane(
+                        return redirect_udp_to_tproxy(
                             ctx,
                             link_h_len,
                             pkt,
@@ -445,7 +518,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
                     {
                         return Err(TC_ACT_SHOT);
                     }
-                    return redirect_lan_packet_to_control_plane(
+                    return redirect_udp_to_tproxy(
                         ctx,
                         link_h_len,
                         pkt,
@@ -551,7 +624,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
                 crate::contrack::publish_routing_meta(&mut state.meta, meta);
             }
         }
-        return redirect_lan_packet_to_control_plane(
+        return redirect_udp_to_tproxy(
             ctx,
             link_h_len,
             pkt,
@@ -716,6 +789,38 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         return Err(TC_ACT_OK);
     }
     if outbound == OUTBOUND_DIRECT {
+        // NFQUEUE staging (`experimental.udp_nfqueue`): in Rule mode a
+        // non-must, non-offloadable direct UDP flow is parked as Pending
+        // and handed to netfilter instead of the TPROXY control plane, so a
+        // decision that converges to direct never crosses a userspace
+        // socket (no server-visible tuple switch).  TCP, short-lived UDP
+        // and Global-mode flows keep the redirect path: the first two have
+        // no staging support, and Global still owes every flow the
+        // userspace mode override.
+        if pkt.l4proto == IPPROTO_UDP
+            && !short_lived_udp
+            && flags & honk_ebpf_common::DATAPATH_FLAG_NFQ_READY != 0
+            && flags & honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_RULE_DIRECT != 0
+        {
+            let Some(ref mut state) = udp_state else {
+                // Non-short-lived UDP without conn state was already shot
+                // above; never reach here with one.
+                return Err(TC_ACT_SHOT);
+            };
+            let cookie = unsafe { bpf_get_prandom_u32() };
+            state.decision_cookie = cookie;
+            let mut meta =
+                crate::contrack::build_routing_meta(outbound, mark, must, pkt.tuples.dscp);
+            meta.set_udp_decision_state(UdpDecisionState::Pending);
+            crate::contrack::publish_routing_meta(&mut state.meta, meta);
+            return queue_udp_for_decision(
+                ctx,
+                pkt,
+                unsafe { meta.raw },
+                HANDOFF_WRITE_ALWAYS,
+                cookie,
+            );
+        }
         // Non-must direct the mode policy may not offload (Global mode, or
         // Rule mode with a possible SNI re-route pending): redirect to the
         // control plane so the mode override — and the SNI-sniffed
@@ -723,7 +828,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         if PARAM.load().padding2 & 1 != 0 {
             info!(ctx, target: "honk", "direct(no must, no offload) → control plane");
         }
-        return redirect_lan_packet_to_control_plane(
+        return redirect_udp_to_tproxy(
             ctx,
             link_h_len,
             pkt,
@@ -738,7 +843,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         if !wan_outbound_is_alive(ctx, outbound, pkt.l4proto, pkt.tuples.five.dst_port) {
             return Err(TC_ACT_SHOT);
         }
-        return redirect_lan_packet_to_control_plane(
+        return redirect_udp_to_tproxy(
             ctx,
             link_h_len,
             pkt,
@@ -751,7 +856,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         return Err(TC_ACT_SHOT);
     }
 
-    redirect_lan_packet_to_control_plane(
+    redirect_udp_to_tproxy(
         ctx,
         link_h_len,
         pkt,

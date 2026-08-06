@@ -23,6 +23,8 @@ use network_types::{
 ///   offset 30: padding: [u8; 2]
 ///   offset 32: pname: [u8; TASK_COMM_LEN] (process name)
 ///   offset 48: pid: u32
+///   offset 52: decision_cookie: u32 (NFQUEUE staging; fills the former tail
+///              padding, so the map value size is unchanged)
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ConnState {
@@ -34,7 +36,19 @@ pub struct ConnState {
     pub padding: [u8; 2],
     pub pname: [u8; TASK_COMM_LEN],
     pub pid: u32,
+    /// Random per-decision-round cookie stamped when the datapath parks a
+    /// UDP flow in `UdpDecisionState::Pending`.  The control plane must
+    /// compare it against its own copy before writing a decision back, or a
+    /// re-used five-tuple (old entry swept, new flow same tuple) could
+    /// receive the previous flow's verdict.
+    pub decision_cookie: u32,
 }
+
+const _CONN_STATE_SIZE: () = assert!(core::mem::size_of::<ConnState>() == 56);
+const _CONN_STATE_META_OFFSET: () = assert!(core::mem::offset_of!(ConnState, meta) == 16);
+const _CONN_STATE_PID_OFFSET: () = assert!(core::mem::offset_of!(ConnState, pid) == 48);
+const _CONN_STATE_COOKIE_OFFSET: () =
+    assert!(core::mem::offset_of!(ConnState, decision_cookie) == 52);
 
 // Matches the C enum bpf_stats_key.
 // The C enum's underlying type defaults to int (32-bit); use u32 for compatibility.
