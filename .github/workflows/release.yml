@@ -75,7 +75,9 @@ jobs:
           target: ${{ matrix.target }}
 
       - name: Install Rust nightly (for the eBPF object)
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-20  # newer nightlies carry LLVM that rejects bpf-linker -Oz
         with:
           components: rust-src, llvm-tools
 
@@ -97,7 +99,7 @@ jobs:
       - name: Build eBPF object
         run: |
           cd crates/honk-ebpf
-          cargo +nightly build --release -Zbuild-std=core --target bpfel-unknown-none
+          cargo +nightly-2026-07-20 build --release -Zbuild-std=core --target bpfel-unknown-none
 
       # aya refuses objects without BTF ("no BTF parsed for object") — fail
       # the build here instead of at runtime on a gateway.
