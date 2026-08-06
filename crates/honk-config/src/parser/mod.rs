@@ -1483,7 +1483,7 @@ fn parse_subscription_section(section: &Section) -> Result<Vec<Subscription>, cr
 
 fn parse_experimental_section(section: &Section) -> Result<ExperimentalConfig, crate::ConfigError> {
     let mut cfg = ExperimentalConfig::default();
-    let subs = split_nested_sections(&section.body, &["clash_api", "cache_file"])?;
+    let subs = split_nested_sections(&section.body, &["clash_api", "cache_file", "udp_nfqueue"])?;
 
     for sub in &subs {
         let kv = parse_kv_pairs(&sub.body);
@@ -1517,6 +1517,45 @@ fn parse_experimental_section(section: &Section) -> Result<ExperimentalConfig, c
                 }
                 if let Some(v) = kv.get("store_dns") {
                     cfg.cache_file.store_dns = parse_bool(v);
+                }
+            }
+            "udp_nfqueue" => {
+                let nfq = &mut cfg.udp_nfqueue;
+                if let Some(v) = kv.get("enabled") {
+                    nfq.enabled = parse_bool(v);
+                }
+                if let Some(v) = kv.get("scope") {
+                    nfq.scope = v.trim_matches('"').to_string();
+                }
+                if let Some(v) = kv.get("queue_base") {
+                    nfq.queue_base = v.trim().parse().unwrap_or(0);
+                }
+                if let Some(v) = kv.get("workers") {
+                    nfq.workers = v.trim().parse().unwrap_or(0);
+                }
+                if let Some(v) = kv.get("queue_max_packets") {
+                    nfq.queue_max_packets = v.trim().parse().unwrap_or(0);
+                }
+                if let Some(v) = kv.get("global_copy_bytes") {
+                    nfq.global_copy_bytes = v.trim().parse().unwrap_or(0);
+                }
+                if let Some(v) = kv.get("per_flow_packets") {
+                    nfq.per_flow_packets = v.trim().parse().unwrap_or(0);
+                }
+                if let Some(v) = kv.get("per_flow_bytes") {
+                    nfq.per_flow_bytes = v.trim().parse().unwrap_or(0);
+                }
+                if let Some(v) = kv.get("decision_soft_timeout_ms") {
+                    nfq.decision_soft_timeout_ms = v.trim().parse().unwrap_or(0);
+                }
+                if let Some(v) = kv.get("decision_hard_timeout_ms") {
+                    nfq.decision_hard_timeout_ms = v.trim().parse().unwrap_or(0);
+                }
+                if let Some(v) = kv.get("failure_policy") {
+                    nfq.failure_policy = v.trim_matches('"').to_string();
+                }
+                if let Some(v) = kv.get("gso") {
+                    nfq.gso = parse_bool(v);
                 }
             }
             _ => {}

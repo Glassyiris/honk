@@ -512,6 +512,34 @@ impl Config {
                 default_tproxy_mark()
             )));
         }
+        // skb->mark bits 29/30 are owned by the datapath
+        // (NFQUEUE_PENDING_MARK / CLASSIFIED_MARK); a user mark overlapping
+        // them would corrupt the NFQUEUE staging match and the bridge
+        // double-attach dedup.
+        let reserved = honk_ebpf_common::SKB_MARK_RESERVED_MASK;
+        let mut user_marks: Vec<(String, u32)> = vec![
+            ("global.tproxy_mark".into(), self.global.tproxy_mark),
+            (
+                "global.so_mark_from_dae".into(),
+                self.global.so_mark_from_dae,
+            ),
+        ];
+        for (i, rule) in self.routing.rules.iter().enumerate() {
+            let name = if rule.name.is_empty() {
+                format!("routing.rules[{i}].mark")
+            } else {
+                format!("routing rule '{}'.mark", rule.name)
+            };
+            user_marks.push((name, rule.mark));
+        }
+        for (what, mark) in user_marks {
+            if mark & reserved != 0 {
+                return Err(crate::ConfigError::Validation(format!(
+                    "{what} ({mark:#x}) overlaps datapath-reserved skb mark bits {reserved:#x}"
+                )));
+            }
+        }
+        self.experimental.udp_nfqueue.validate()?;
         // Content-derived IDs collide when two nodes share protocol, server,
         // and credentials — they are the same endpoint and cannot coexist
         // in the runtime registry.

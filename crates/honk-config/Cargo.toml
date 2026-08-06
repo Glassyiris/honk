@@ -20,6 +20,8 @@ uuid.workspace = true
 base64.workspace = true
 # getifaddrs for interface address enumeration (replaces `ip addr show`)
 libc.workspace = true
+# datapath-owned skb->mark bits (SKB_MARK_RESERVED_MASK) for validation
+honk-ebpf-common.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -474,6 +474,97 @@ experimental {
         assert!(config.experimental.cache_file.store_fakeip);
         assert!(config.experimental.cache_file.store_dns);
     }
+
+    #[test]
+    fn test_parse_experimental_udp_nfqueue_section() {
+        let input = r#"
+experimental {
+    udp_nfqueue {
+        enabled: true
+        scope: quic
+        queue_base: 320
+        workers: 4
+        queue_max_packets: 4096
+        global_copy_bytes: 33554432
+        per_flow_packets: 16
+        per_flow_bytes: 131072
+        decision_soft_timeout_ms: 20
+        decision_hard_timeout_ms: 100
+        failure_policy: closed
+        gso: false
+    }
+}
+"#;
+        let config = parse_dae_config(input).unwrap();
+        let nfq = &config.experimental.udp_nfqueue;
+        assert!(nfq.enabled);
+        assert_eq!(nfq.scope, "quic");
+        assert_eq!(nfq.queue_base, 320);
+        assert_eq!(nfq.workers, 4);
+        assert_eq!(nfq.queue_max_packets, 4096);
+        assert_eq!(nfq.global_copy_bytes, 33554432);
+        assert_eq!(nfq.per_flow_packets, 16);
+        assert_eq!(nfq.per_flow_bytes, 131072);
+        assert_eq!(nfq.decision_soft_timeout_ms, 20);
+        assert_eq!(nfq.decision_hard_timeout_ms, 100);
+        assert_eq!(nfq.failure_policy, "closed");
+        assert!(!nfq.gso);
+        config.validate().unwrap();
+
+        // Absent block: disabled with sane defaults, validation passes.
+        let config = parse_dae_config("experimental { clash_api { secret: x } }").unwrap();
+        let nfq = &config.experimental.udp_nfqueue;
+        assert!(!nfq.enabled);
+        assert_eq!(nfq.queue_base, 320);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_udp_nfqueue_validation_rejects_bad_values() {
+        // parse_kv_pairs is line-based: one key per line, and section
+        // headers (`name {`) must open on their own line.
+        let bad = |body: &str| {
+            let input = format!("experimental {{\nudp_nfqueue {{\n    {body}\n}}\n}}");
+            parse_dae_config(&input).unwrap().validate().is_err()
+        };
+        assert!(bad("enabled: true\n    scope: all"));
+        assert!(bad("enabled: true\n    workers: 0"));
+        assert!(bad("enabled: true\n    queue_base: 65535\n    workers: 2"));
+        assert!(bad("enabled: true\n    queue_max_packets: 0"));
+        assert!(bad(
+            "enabled: true\n    decision_soft_timeout_ms: 100\n    decision_hard_timeout_ms: 20"
+        ));
+        assert!(bad("failure_policy: yolo"));
+        // failure_policy is validated even when disabled (a typo must not
+        // lie dormant until the feature is switched on).
+        assert!(!bad("failure_policy: availability"));
+    }
+
+    #[test]
+    fn test_validate_rejects_user_marks_on_datapath_bits() {
+        // Bit 29 (NFQUEUE_PENDING_MARK) on a routing rule mark.
+        let input = r#"
+global { }
+routing { }
+"#;
+        let mut config = parse_dae_config(input).unwrap();
+        config.routing.rules.push(crate::routing::RoutingRule {
+            name: "bad".into(),
+            condition: Default::default(),
+            outbound: crate::routing::RoutingOutbound::Simple("direct".into()),
+            priority: 0,
+            must: false,
+            mark: honk_ebpf_common::NFQUEUE_PENDING_MARK,
+        });
+        assert!(config.validate().is_err());
+        config.routing.rules[0].mark = honk_ebpf_common::CLASSIFIED_MARK;
+        assert!(config.validate().is_err());
+        config.routing.rules[0].mark = 0x80;
+        assert!(config.validate().is_ok());
+        // Same for so_mark_from_dae.
+        config.global.so_mark_from_dae = honk_ebpf_common::CLASSIFIED_MARK;
+        assert!(config.validate().is_err());
+    }
 }
 
 #[test]
