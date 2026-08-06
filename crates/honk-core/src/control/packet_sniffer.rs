@@ -24,30 +24,40 @@ const JANITOR_INTERVAL: Duration = Duration::from_millis(250);
 const NO_SNI_THRESHOLD: u32 = 4;
 /// How long sniffing is disabled after reaching the no-SNI threshold.
 const NO_SNI_BYPASS_TTL: Duration = Duration::from_secs(1);
+/// Upper bound on Initial packets sniffed per flow while a ClientHello
+/// stays fragmented; beyond it the flow is treated as unresolvable.
+const MAX_INITIAL_SNIFF_PACKETS: u32 = 8;
 
 /// Outcome of feeding one datagram to the QUIC Initial sniffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QuicSniffOutcome {
     /// Not a parseable/decryptable QUIC Initial (garbage, unsupported
     /// version, AEAD failure), or sniffing was skipped on a negative-cache
-    /// hit — the flow is not provably QUIC.
+    /// hit — the flow is not provably QUIC and must keep the full userspace
+    /// relay.
     NotQuic,
     /// A genuine, successfully decrypted QUIC Initial whose ClientHello
-    /// yielded no usable SNI (yet): a multi-packet ClientHello still waiting
-    /// for CRYPTO fragments, a complete ClientHello without SNI, or an
-    /// unparsable one.  The flow is provably QUIC.
-    ValidNoDomain,
-    /// SNI extracted from a decrypted Initial.
+    /// spans multiple CRYPTO fragments that have not all arrived yet.  The
+    /// flow is provably QUIC, but the domain decision is NOT final: the
+    /// remaining fragments may still carry an SNI that re-routes it.
+    Incomplete,
+    /// A genuine, fully reassembled ClientHello that carries no usable SNI
+    /// (or an unparsable one).  The flow is provably QUIC and no domain
+    /// will ever arrive — a terminal state.
+    CompleteNoDomain,
+    /// SNI extracted from a decrypted Initial — a terminal state.
     Domain(String),
 }
 
 impl QuicSniffOutcome {
-    /// Whether the datagram was confirmed to be a genuine QUIC Initial.
-    /// Only confirmed flows may be considered for drop-and-reinject
-    /// offload — a non-QUIC flow has no retransmission guarantee, so its
-    /// first datagram must never be dropped.
-    pub fn is_quic_confirmed(&self) -> bool {
-        !matches!(self, Self::NotQuic)
+    /// Whether the sniff reached a terminal state for a confirmed-QUIC
+    /// flow: an SNI was extracted, or the complete ClientHello proved to
+    /// carry none.  Only terminal outcomes may drive the drop-and-reinject
+    /// offload — an `Incomplete` ClientHello could still re-route the flow
+    /// once its remaining CRYPTO fragments arrive, and a non-QUIC flow has
+    /// no retransmission guarantee at all.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::CompleteNoDomain | Self::Domain(_))
     }
 
     /// The sniffed SNI, if extraction succeeded.
@@ -224,10 +234,21 @@ impl PacketSnifferPool {
                 .domain
                 .clone()
                 .map(QuicSniffOutcome::Domain)
-                .unwrap_or(QuicSniffOutcome::ValidNoDomain);
+                .unwrap_or(QuicSniffOutcome::CompleteNoDomain);
         }
 
         session.packets_seen += 1;
+        if session.packets_seen > MAX_INITIAL_SNIFF_PACKETS {
+            // A ClientHello that never completes within the packet budget is
+            // unresolvable: stop dropping this flow's packets and let it
+            // take the full userspace relay.  The session deliberately stays
+            // open — marking it done would later read as CompleteNoDomain
+            // and make an unresolved flow offloadable.
+            drop(sessions);
+            self.mark_dcid_failed_soft(key);
+            debug!("QUIC ClientHello never completed; flow bypassed");
+            return QuicSniffOutcome::NotQuic;
+        }
 
         let fragments = match fragments {
             Ok(fragments) => fragments,
@@ -275,12 +296,13 @@ impl PacketSnifferPool {
                 drop(sessions);
                 self.mark_dcid_failed_soft(key);
                 debug!("QUIC ClientHello carried no SNI; flow bypassed");
-                QuicSniffOutcome::ValidNoDomain
+                QuicSniffOutcome::CompleteNoDomain
             }
             quic::ClientHelloParse::Incomplete => {
-                // The ClientHello spans multiple Initial packets; wait for
-                // the remaining CRYPTO fragments.
-                QuicSniffOutcome::ValidNoDomain
+                // The ClientHello spans multiple Initial packets; the
+                // decision is NOT final — the remaining CRYPTO fragments may
+                // still carry an SNI that re-routes the flow.
+                QuicSniffOutcome::Incomplete
             }
             quic::ClientHelloParse::Invalid => {
                 session.no_sni_count += 1;
@@ -293,7 +315,7 @@ impl PacketSnifferPool {
                     self.mark_dcid_failed_soft(key);
                     debug!("QUIC DCID marked failed after no-SNI threshold");
                 }
-                QuicSniffOutcome::ValidNoDomain
+                QuicSniffOutcome::CompleteNoDomain
             }
         }
     }
@@ -372,7 +394,7 @@ mod tests {
 
         let result = pool.feed_quic_initial(key, &packet);
         assert_eq!(result, QuicSniffOutcome::Domain("example.com".into()));
-        assert!(result.is_quic_confirmed());
+        assert!(result.is_terminal());
 
         // The extracted domain is cached on the completed session.
         let result = pool.feed_quic_initial(key, &packet);
@@ -405,11 +427,12 @@ mod tests {
             &test_utils::wrap_crypto_frame(split as u64, &hello[split..]),
         );
 
-        // Second fragment first: buffered, nothing to parse yet — but the
-        // Initial decrypted, so the flow is already confirmed QUIC.
+        // Second fragment first: buffered, nothing to parse yet — the
+        // Initial decrypted, but the decision is not terminal until the
+        // remaining CRYPTO fragment arrives.
         let pending = pool.feed_quic_initial(key, &pkt1);
-        assert_eq!(pending, QuicSniffOutcome::ValidNoDomain);
-        assert!(pending.is_quic_confirmed());
+        assert_eq!(pending, QuicSniffOutcome::Incomplete);
+        assert!(!pending.is_terminal());
         assert!(!pool.is_dcid_failed(&key));
         // First fragment completes the ClientHello.
         let result = pool.feed_quic_initial(key, &pkt0);
@@ -432,11 +455,11 @@ mod tests {
             &test_utils::wrap_crypto_frame(0, &hello),
         );
 
-        // Decryption succeeded, so the flow is confirmed QUIC even though
-        // it can never yield a domain.
+        // Decryption succeeded, so the flow is confirmed QUIC and the
+        // complete ClientHello proves it can never yield a domain.
         let outcome = pool.feed_quic_initial(key, &packet);
-        assert_eq!(outcome, QuicSniffOutcome::ValidNoDomain);
-        assert!(outcome.is_quic_confirmed());
+        assert_eq!(outcome, QuicSniffOutcome::CompleteNoDomain);
+        assert!(outcome.is_terminal());
         assert!(pool.is_dcid_failed(&key));
     }
 
@@ -451,12 +474,43 @@ mod tests {
         let result = pool.feed_quic_initial(key, &data);
         // Decryption fails on the garbage payload: not provably QUIC.
         assert_eq!(result, QuicSniffOutcome::NotQuic);
-        assert!(!result.is_quic_confirmed());
+        assert!(!result.is_terminal());
         assert!(!pool.is_dcid_failed(&key));
 
         for _ in 0..4 {
             pool.feed_quic_initial(key, &data);
         }
+        assert!(pool.is_dcid_failed(&key));
+    }
+
+    /// A ClientHello that stays fragmented past the packet budget is
+    /// unresolvable: the flow must fall back to the userspace relay and
+    /// never become offloadable.
+    #[test]
+    fn test_pool_never_completing_client_hello_gives_up() {
+        let pool = PacketSnifferPool::new();
+        let key = test_key();
+        let hello = test_utils::build_client_hello(Some("quic.example.org"));
+        let split = 40;
+        // Only the second fragment ever arrives.
+        let pkt1 = test_utils::protect_initial_packet(
+            b"dcid1234",
+            b"",
+            QUIC_VERSION_1,
+            1,
+            1,
+            &test_utils::wrap_crypto_frame(split as u64, &hello[split..]),
+        );
+
+        for i in 0..MAX_INITIAL_SNIFF_PACKETS {
+            assert_eq!(
+                pool.feed_quic_initial(key, &pkt1),
+                QuicSniffOutcome::Incomplete,
+                "fragment {i} still incomplete"
+            );
+        }
+        let outcome = pool.feed_quic_initial(key, &pkt1);
+        assert_eq!(outcome, QuicSniffOutcome::NotQuic);
         assert!(pool.is_dcid_failed(&key));
     }
 }

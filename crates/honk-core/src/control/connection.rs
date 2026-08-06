@@ -114,6 +114,9 @@ pub(super) struct ControlPlaneHandle {
     pub(super) connection_tracker: Arc<ConnectionTracker>,
     /// Shared clash mode state (None when the clash API is disabled).
     pub(super) mode_state: Option<crate::mode::SharedModeState>,
+    /// Drop-and-reinject UDP post-decision offload switch, resolved once at
+    /// startup.
+    pub(super) udp_post_decision_offload: bool,
 }
 
 /// Check whether a connected TCP stream is still alive via SO_ERROR.
@@ -1350,16 +1353,44 @@ impl ControlPlaneHandle {
             }
         }
 
-        let mut quic_domain: Option<String> = None;
-        let mut quic_confirmed = false;
+        let mut quic_domain: Option<String>;
+        let sniff_terminal: bool;
+        let mut follower_rx = None;
         {
+            use crate::control::packet_sniffer::QuicSniffOutcome;
             let sniffer_key =
                 crate::control::packet_sniffer::PacketSnifferKey::new(client_addr, original_dst);
-            if !self.sniffer_pool.is_dcid_failed(&sniffer_key) {
-                let outcome = self.sniffer_pool.feed_quic_initial(sniffer_key, &data);
-                quic_confirmed = outcome.is_quic_confirmed();
-                quic_domain = outcome.into_domain();
+            let mut outcome = if self.sniffer_pool.is_dcid_failed(&sniffer_key) {
+                QuicSniffOutcome::NotQuic
+            } else {
+                self.sniffer_pool.feed_quic_initial(sniffer_key, &data)
+            };
+            // A fragmented ClientHello: collect the rest of the Initial
+            // flight from the follower queue before deciding.  Deciding on
+            // an Incomplete CH could offload or relay a flow whose SNI —
+            // still in flight — would have picked another outbound.
+            if matches!(outcome, QuicSniffOutcome::Incomplete) {
+                follower_rx = lease.take_queue_receiver();
+                if let Some(rx) = follower_rx.as_mut() {
+                    outcome = self.collect_initial_fragments(sniffer_key, rx).await;
+                }
             }
+            if matches!(outcome, QuicSniffOutcome::Incomplete) {
+                // Still unresolved within the budget.  The flow is confirmed
+                // QUIC (its Initial decrypted), so dropping is safe: the
+                // client retransmits into a fresh decision whose sniffer
+                // session already holds these fragments.  Relaying on an
+                // IP-only guess could pick the wrong outbound, offloading
+                // could bypass a domain rule — dropping is the only sound
+                // option.
+                debug!(
+                    "QUIC ClientHello unresolved within budget; dropping {} -> {} for retransmit",
+                    client_addr, original_dst
+                );
+                return Ok(());
+            }
+            sniff_terminal = outcome.is_terminal();
+            quic_domain = outcome.into_domain();
         }
         if matches!(dial_mode, DialMode::Domain)
             && let Some(domain) = &quic_domain
@@ -1419,17 +1450,24 @@ impl ControlPlaneHandle {
         // Post-decision offload for confirmed-QUIC flows converging to
         // direct: the flow leaves userspace without a single packet being
         // relayed, so the server-visible 5-tuple never changes hands.
-        if self
-            .try_offload_quic_flow(
-                &tuples,
-                &outbound_name,
-                must,
-                client_addr,
-                original_dst,
-                quic_confirmed,
-            )
-            .await
+        if sniff_terminal
+            && self
+                .try_offload_quic_flow(&tuples, &outbound_name, must, client_addr, original_dst)
+                .await
         {
+            // Commit the handoff BEFORE claiming success: a plain lease drop
+            // would notify endpoint removal as UserspaceEndpointRetired and
+            // the removal worker would delete the conn_state that now
+            // anchors the offloaded flow.  A failed commit means the
+            // generation was retired mid-flight (reload) — do not claim the
+            // offload; the drop path unwinds the conn_state as usual.
+            if !lease.commit_offloaded() {
+                warn!(
+                    "UDP offload commit raced a generation retire for {} -> {}; offload unwound",
+                    client_addr, original_dst
+                );
+                return Ok(());
+            }
             // Close the offload lifecycle when a sniffed domain drove the
             // decision: once the conn_state is swept (120s idle), a
             // mid-session packet is not an Initial and cannot be re-sniffed,
@@ -1669,9 +1707,13 @@ impl ControlPlaneHandle {
             ));
         }
 
-        let queue_rx = lease.take_queue_receiver().ok_or_else(|| {
-            anyhow::anyhow!("UDP initializer lost its bounded queue before driver start")
-        })?;
+        let queue_rx = match follower_rx {
+            // Already taken while collecting a fragmented ClientHello.
+            Some(rx) => rx,
+            None => lease.take_queue_receiver().ok_or_else(|| {
+                anyhow::anyhow!("UDP initializer lost its bounded queue before driver start")
+            })?,
+        };
         let mut driver = self.udp_pool.spawn_driver(
             client_addr,
             original_dst,
@@ -1766,18 +1808,54 @@ impl ControlPlaneHandle {
         }
     }
 
+    /// A fragmented ClientHello: feed queued follower Initials to the
+    /// sniffer until it resolves, or the packet/time budget runs out.
+    /// Fragments of one flight arrive back-to-back, so the budget is small
+    /// and the common single-Initial path never enters this loop.  Followers
+    /// consumed here are gone from the driver queue; a flow that proceeds
+    /// to the userspace relay relies on the client's retransmission for
+    /// them (the flow is confirmed QUIC at this point, so that is safe).
+    async fn collect_initial_fragments(
+        &self,
+        sniffer_key: crate::control::packet_sniffer::PacketSnifferKey,
+        rx: &mut tokio::sync::mpsc::Receiver<crate::control::udp_endpoint::QueuedDatagram>,
+    ) -> crate::control::packet_sniffer::QuicSniffOutcome {
+        use crate::control::packet_sniffer::QuicSniffOutcome;
+        const MAX_FRAGMENTS: u32 = 8;
+        const MAX_WAIT: Duration = Duration::from_millis(250);
+        let deadline = tokio::time::Instant::now() + MAX_WAIT;
+        let mut outcome = QuicSniffOutcome::Incomplete;
+        for _ in 0..MAX_FRAGMENTS {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(datagram)) => {
+                    outcome = self
+                        .sniffer_pool
+                        .feed_quic_initial(sniffer_key, datagram.payload());
+                    if !matches!(outcome, QuicSniffOutcome::Incomplete) {
+                        break;
+                    }
+                }
+                // Queue closed or budget exhausted.
+                _ => break,
+            }
+        }
+        outcome
+    }
+
     /// UDP post-decision kernel offload via drop-and-reinject.  When the
     /// flow's control-plane decision has fully converged (routing with the
-    /// sniffed domain, mode override) to `direct` and the first datagram is
-    /// a confirmed QUIC Initial, the flow is released back to the kernel
-    /// without userspace relaying a single byte: publish
-    /// `ROUTING_META_FLAG_OFFLOAD` on its conn_state and return, dropping
-    /// the lease — the in-flight Initial and any queued followers with it.
-    /// QUIC clients must retransmit a lost Initial (RFC 9000), so the
-    /// retransmission arrives on the `lan_ingress` established-UDP path and
-    /// passes straight through; from the first server-seen packet onward the
-    /// 5-tuple is the client's own, never the engine's ephemeral socket.
-    /// The only cost is one Initial RTO at flow setup.
+    /// sniffed domain, mode override) to `direct` and the sniff reached a
+    /// terminal confirmed-QUIC state (SNI extracted, or a complete
+    /// ClientHello without one — never an Incomplete CH), the flow is
+    /// released back to the kernel without userspace relaying a single
+    /// byte: publish `ROUTING_META_FLAG_OFFLOAD` on its conn_state and let
+    /// the caller commit the lease's `commit_offloaded` handoff, dropping
+    /// the in-flight Initial and any queued followers.  QUIC clients must
+    /// retransmit a lost Initial (RFC 9000), so the retransmission arrives
+    /// on the `lan_ingress` established-UDP path and passes straight
+    /// through; from the first server-seen packet onward the 5-tuple is the
+    /// client's own, never the engine's ephemeral socket.  The only cost is
+    /// one Initial RTO at flow setup.
     ///
     /// Non-QUIC flows are never offloaded here: they have no retransmission
     /// guarantee, so dropping their first datagram could lose it — they keep
@@ -1787,9 +1865,9 @@ impl ControlPlaneHandle {
     /// offloaded flow.  After 120s of silence the conn_state is swept and
     /// the next Initial simply repeats this decide-drop-reinject cycle.
     ///
-    /// Returns `true` when the flow was offloaded and the caller must drop
-    /// the lease and return.  A failed or impossible conn_state write falls
-    /// back to the ordinary userspace relay (`false`).
+    /// Returns `true` when the offload bit was published and the caller must
+    /// commit the handoff and return.  A failed or impossible conn_state
+    /// write falls back to the ordinary userspace relay (`false`).
     async fn try_offload_quic_flow(
         &self,
         tuples: &TuplesKey,
@@ -1797,15 +1875,11 @@ impl ControlPlaneHandle {
         must: bool,
         client_addr: SocketAddr,
         original_dst: SocketAddr,
-        quic_confirmed: bool,
     ) -> bool {
-        // Opt-in while the semantics bed in:
-        // HONK_UDP_POST_DECISION_OFFLOAD=1.  Route-time must-direct offload
-        // is unaffected (kernel path from packet one).
-        if std::env::var("HONK_UDP_POST_DECISION_OFFLOAD").as_deref() != Ok("1") {
-            return false;
-        }
-        if !quic_confirmed {
+        // Opt-in while the semantics bed in, parsed once at startup.
+        // Route-time must-direct offload is unaffected (kernel path from
+        // packet one).
+        if !self.udp_post_decision_offload {
             return false;
         }
         // Evaluate the predicate before the await: the read guard is !Send.
