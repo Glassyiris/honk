@@ -145,6 +145,13 @@ pub trait EbpfBackend: Send + Sync {
     ) -> anyhow::Result<()> {
         anyhow::bail!("projection fault injection is unsupported")
     }
+    /// Fail the next `times` `add_domain_ip_bitmap` writes (the sniffed-
+    /// domain writeback path).  Test-only, mirroring
+    /// `inject_projection_fault`.
+    #[cfg(test)]
+    fn inject_domain_bitmap_add_fault(&mut self, _times: usize) -> anyhow::Result<()> {
+        anyhow::bail!("domain bitmap add fault injection is unsupported")
+    }
     #[cfg(test)]
     fn projection_map_snapshot(&self) -> Vec<([u8; 20], DomainRouting)> {
         Vec::new()

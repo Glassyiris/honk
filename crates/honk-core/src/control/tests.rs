@@ -2578,6 +2578,189 @@ async fn udp_offload_repeats_after_conn_state_sweep_without_leaking() {
     assert_eq!(handler.dial_count(), 0);
 }
 
+/// Config carrying one domain-class rule (unique name/suffix) pointing at
+/// `direct`, so a sniffed `quic-offload.example` flow converges to direct
+/// through a domain rule and gets a DOMAIN_ROUTING_MAP writeback.
+fn udp_offload_domain_rule_config() -> Config {
+    let mut config = udp_offload_test_config("direct", vec![udp_test_node()]);
+    let mut rule = domain_rule("direct");
+    rule.name = "udp-offload-domain".into();
+    rule.condition.domain_suffix = vec!["quic-offload.example".into()];
+    config.routing.rules = vec![rule];
+    // domain++: sniff and re-route without the reality check (the test DNS
+    // forwarder cannot resolve the made-up domain).
+    config.global.dial_mode = "domain++".into();
+    config
+}
+
+/// Install a recognizable bitmap for the test domain rule.  Test control
+/// planes never run `activate_projection` (that happens at engine start),
+/// so the process-global DOMAIN_BITMAPS is populated directly — this also
+/// shields the serve from a concurrent test replacing the global.
+fn repin_offload_domain_bitmap() -> Vec<DomainRouting> {
+    let mut bitmap = DomainRouting::default();
+    bitmap.bitmap[0] = 0x5A00_0001;
+    bitmap.bitmap[2] = 0x0000_0042;
+    let expected = vec![bitmap];
+    crate::control::routing_matcher::DOMAIN_BITMAPS
+        .write()
+        .insert("udp-offload-domain".into(), expected.clone());
+    expected
+}
+
+/// The mock's DOMAIN_ROUTING_MAP entry for `dst`, keyed like the map.
+async fn domain_route_bitmap(
+    handle: &ControlPlaneHandle,
+    dst: SocketAddr,
+) -> Option<DomainRouting> {
+    let prefix_len = if dst.is_ipv4() { 32 } else { 128 };
+    let lpm_key =
+        crate::ebpf::maps::cidr_to_lpm_key(&format!("{}/{prefix_len}", dst.ip())).unwrap();
+    let key_bytes = crate::ebpf::maps::lpm_key_bytes(&lpm_key);
+    handle
+        .ebpf
+        .read()
+        .await
+        .projection_map_snapshot()
+        .into_iter()
+        .find(|(key, _)| *key == key_bytes)
+        .map(|(_, bitmap)| bitmap)
+}
+
+#[tokio::test]
+async fn udp_offload_writes_domain_bitmap_for_sniffed_direct_flow() {
+    enable_udp_offload();
+    for (client, dst) in [
+        (addr("10.0.0.2:53000"), addr("203.0.113.2:443")),
+        (addr("[2001:db8::2]:53000"), addr("[2001:db8::3]:443")),
+    ] {
+        let (handle, handler) = udp_offload_test_handle(udp_offload_domain_rule_config(), None);
+        let expected = repin_offload_domain_bitmap();
+        let key = seed_udp_conn_state(
+            &handle,
+            client,
+            dst,
+            seeded_meta_raw(honk_ebpf_common::OutboundIndex::Direct as u8, 0, 0),
+        )
+        .await;
+        let initial = quic_initial_payload(Some("quic-offload.example"));
+
+        serve_test_udp_to(&handle, client, dst, &initial)
+            .await
+            .unwrap();
+
+        let raw = udp_conn_meta_raw(&handle, &key)
+            .await
+            .expect("conn state kept");
+        assert_ne!(raw & honk_ebpf_common::ROUTING_META_FLAG_OFFLOAD, 0);
+        assert_eq!(handler.dial_count(), 0);
+        // The sniffed domain's rule bitmap was written back for the dst IP,
+        // transformed into the active routing generation exactly like a
+        // DNS-learned route.
+        let generation = handle
+            .ebpf
+            .read()
+            .await
+            .active_routing_generation()
+            .unwrap();
+        let mut merged = DomainRouting::default();
+        for bm in &expected {
+            for (word, value) in merged.bitmap.iter_mut().zip(bm.bitmap) {
+                *word |= value;
+            }
+        }
+        let expected_stored = merged.for_generation(generation);
+        let stored = domain_route_bitmap(&handle, dst).await;
+        assert_eq!(
+            stored.map(|bitmap| bitmap.bitmap),
+            Some(expected_stored.bitmap),
+            "DOMAIN_ROUTING_MAP must carry the sniffed rule bitmap ({client} -> {dst})"
+        );
+    }
+}
+
+#[tokio::test]
+async fn udp_offload_domain_bitmap_survives_conn_state_sweep() {
+    enable_udp_offload();
+    let client = addr("10.0.0.2:53000");
+    let dst = addr("203.0.113.2:443");
+    let (handle, handler) = udp_offload_test_handle(udp_offload_domain_rule_config(), None);
+    let _expected = repin_offload_domain_bitmap();
+    let key = seed_udp_conn_state(
+        &handle,
+        client,
+        dst,
+        seeded_meta_raw(honk_ebpf_common::OutboundIndex::Direct as u8, 0, 0),
+    )
+    .await;
+    let initial = quic_initial_payload(Some("quic-offload.example"));
+    serve_test_udp_to(&handle, client, dst, &initial)
+        .await
+        .unwrap();
+    assert!(domain_route_bitmap(&handle, dst).await.is_some());
+
+    // The flow goes silent and the datapath sweeps the conn_state (120s).
+    handle
+        .ebpf
+        .write()
+        .await
+        .udp_conn_state_remove(&key)
+        .unwrap();
+
+    // The learned domain route lives in DOMAIN_ROUTING_MAP, not the
+    // conn_state, so it survives the sweep: a mid-session packet is not an
+    // Initial and cannot be re-sniffed, but the route-time re-decision finds
+    // the bitmap (DomainKnown → direct → kernel route-time offload — the
+    // unchanged main path) and never re-enters userspace.  Assert the state
+    // that evaluation consumes and that nothing userspace-side exists.
+    assert!(
+        domain_route_bitmap(&handle, dst).await.is_some(),
+        "the learned domain route must survive the conn_state sweep"
+    );
+    assert!(handle.udp_pool.is_empty());
+    assert!(handle.connection_tracker.snapshot().is_empty());
+    assert_eq!(handler.dial_count(), 0);
+}
+
+#[tokio::test]
+async fn udp_offload_domain_bitmap_write_failure_is_not_fatal() {
+    enable_udp_offload();
+    let client = addr("10.0.0.2:53000");
+    let dst = addr("203.0.113.2:443");
+    let (handle, handler) = udp_offload_test_handle(udp_offload_domain_rule_config(), None);
+    let _expected = repin_offload_domain_bitmap();
+    let key = seed_udp_conn_state(
+        &handle,
+        client,
+        dst,
+        seeded_meta_raw(honk_ebpf_common::OutboundIndex::Direct as u8, 0, 0),
+    )
+    .await;
+    handle
+        .ebpf
+        .write()
+        .await
+        .inject_domain_bitmap_add_fault(1)
+        .unwrap();
+    let initial = quic_initial_payload(Some("quic-offload.example"));
+
+    // The writeback failure must not fail the flow or the offload.
+    serve_test_udp_to(&handle, client, dst, &initial)
+        .await
+        .unwrap();
+
+    let raw = udp_conn_meta_raw(&handle, &key)
+        .await
+        .expect("conn state kept");
+    assert_ne!(
+        raw & honk_ebpf_common::ROUTING_META_FLAG_OFFLOAD,
+        0,
+        "offload stands even when the bitmap writeback fails"
+    );
+    assert!(domain_route_bitmap(&handle, dst).await.is_none());
+    assert_eq!(handler.dial_count(), 0);
+}
+
 /// End-to-end drop-and-reinject: a real quinn client's first Initial is fed
 /// to the engine (which offloads the flow and drops the packet), the
 /// client's retransmission is then forwarded along the "kernel path" stand-

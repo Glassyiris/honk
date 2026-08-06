@@ -189,6 +189,8 @@ pub struct MockEbpfBackend {
     projection_fault: Option<(ProjectionMapOperation, usize, bool)>,
     #[cfg(test)]
     projection_writes: Vec<ProjectionMapOperation>,
+    #[cfg(test)]
+    domain_bitmap_add_faults: usize,
 }
 
 impl MockEbpfBackend {
@@ -478,6 +480,12 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     #[cfg(test)]
+    fn inject_domain_bitmap_add_fault(&mut self, times: usize) -> anyhow::Result<()> {
+        self.domain_bitmap_add_faults = times;
+        Ok(())
+    }
+
+    #[cfg(test)]
     fn projection_map_snapshot(&self) -> Vec<([u8; 20], DomainRouting)> {
         let mut snapshot = self
             .domain_routing_bitmap
@@ -644,6 +652,11 @@ impl EbpfBackend for MockEbpfBackend {
         ip_key: &LpmKey,
         bitmap: &DomainRouting,
     ) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if self.domain_bitmap_add_faults > 0 {
+            self.domain_bitmap_add_faults -= 1;
+            anyhow::bail!("injected domain bitmap write failure");
+        }
         let bitmap = self.bitmap_for_active_generation(bitmap);
         Self::or_bitmap(&mut self.domain_routing_bitmap, ip_key, &bitmap);
         Ok(())

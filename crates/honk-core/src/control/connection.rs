@@ -489,43 +489,8 @@ impl ControlPlaneHandle {
                 .map(|ho| ho.outbound == OutboundIndex::ControlPlaneRouting as u8)
                 .unwrap_or(true);
             if is_userspace_route {
-                let router = self.router.read().await;
-                if let Some(matched) = router.route_full(&conn_info) {
-                    let bitmaps = {
-                        let db = DOMAIN_BITMAPS.read();
-                        db.get(matched.rule_name).cloned().unwrap_or_default()
-                    };
-                    if !bitmaps.is_empty() {
-                        let mut merged = DomainRouting::default();
-                        for bm in &bitmaps {
-                            for (word, value) in merged.bitmap.iter_mut().zip(bm.bitmap) {
-                                *word |= value;
-                            }
-                        }
-                        let prefix_len = if original_dst.ip().is_ipv4() { 32 } else { 128 };
-                        let prefix = format!("{}/{}", original_dst.ip(), prefix_len);
-                        if let Ok(lpm_key) = cidr_to_lpm_key(&prefix) {
-                            let mut ebpf = self.ebpf.write().await;
-                            match ebpf.add_domain_ip_bitmap(&lpm_key, &merged) {
-                                Err(e) => {
-                                    debug!(
-                                        "Failed to update DOMAIN_ROUTING_MAP for {}: {}",
-                                        original_dst.ip(),
-                                        e
-                                    );
-                                }
-                                _ => {
-                                    debug!(
-                                        "DOMAIN_ROUTING_MAP updated: {} -> {} (rule '{}')",
-                                        original_dst.ip(),
-                                        domain,
-                                        matched.rule_name
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
+                self.push_sniffed_domain_bitmap(&conn_info, domain, original_dst.ip())
+                    .await;
             }
         }
 
@@ -1465,6 +1430,26 @@ impl ControlPlaneHandle {
             )
             .await
         {
+            // Close the offload lifecycle when a sniffed domain drove the
+            // decision: once the conn_state is swept (120s idle), a
+            // mid-session packet is not an Initial and cannot be re-sniffed,
+            // so the route-time re-decision must find the domain's bitmap in
+            // DOMAIN_ROUTING_MAP — DomainKnown lets the kernel re-decide
+            // direct and offload at route time, with no userspace round-trip
+            // and no server-visible tuple change.  Only the offloaded path
+            // writes back: for a userspace-relayed flow a post-sweep kernel
+            // offload would switch the tuple mid-session.
+            if let Some(ref domain) = quic_domain {
+                let domain_drove_decision = handoff
+                    .as_ref()
+                    .map(|ho| ho.outbound == OutboundIndex::ControlPlaneRouting as u8)
+                    .unwrap_or(true)
+                    || reroute_by_sniffed_domain;
+                if domain_drove_decision {
+                    self.push_sniffed_domain_bitmap(&conn_info, domain, original_dst.ip())
+                        .await;
+                }
+            }
             return Ok(());
         }
 
@@ -1724,6 +1709,61 @@ impl ControlPlaneHandle {
             client_addr, original_dst, node.name
         );
         Ok(())
+    }
+
+    /// After a userspace routing decision that used a sniffed domain, write
+    /// the matched domain rule's bitmap back into `DOMAIN_ROUTING_MAP` for
+    /// the destination IP, so the datapath can re-decide later flows to that
+    /// IP from the learned entry (DomainKnown) instead of userspace
+    /// sniffing.  Shared by the TCP sniff path and the UDP drop-and-reinject
+    /// offload; the entry lives in the same map and follows the same
+    /// lifecycle as DNS-learned routes (it survives conn_state sweeps).
+    /// Best-effort: a write failure is logged and never fails the flow.
+    async fn push_sniffed_domain_bitmap(
+        &self,
+        conn_info: &ConnectionInfo,
+        domain: &str,
+        dst_ip: std::net::IpAddr,
+    ) {
+        let (rule_name, bitmaps) = {
+            let router = self.router.read().await;
+            match router.route_full(conn_info) {
+                Some(matched) => {
+                    let rule_name = matched.rule_name.to_string();
+                    let bitmaps = {
+                        let db = DOMAIN_BITMAPS.read();
+                        db.get(&rule_name).cloned().unwrap_or_default()
+                    };
+                    (rule_name, bitmaps)
+                }
+                None => return,
+            }
+        };
+        if bitmaps.is_empty() {
+            return;
+        }
+        let mut merged = DomainRouting::default();
+        for bm in &bitmaps {
+            for (word, value) in merged.bitmap.iter_mut().zip(bm.bitmap) {
+                *word |= value;
+            }
+        }
+        let prefix_len = if dst_ip.is_ipv4() { 32 } else { 128 };
+        let prefix = format!("{dst_ip}/{prefix_len}");
+        let Ok(lpm_key) = cidr_to_lpm_key(&prefix) else {
+            return;
+        };
+        let mut ebpf = self.ebpf.write().await;
+        match ebpf.add_domain_ip_bitmap(&lpm_key, &merged) {
+            Ok(()) => debug!(
+                "DOMAIN_ROUTING_MAP updated: {} -> {} (rule '{}')",
+                dst_ip, domain, rule_name
+            ),
+            Err(error) => warn!(
+                "Failed to update DOMAIN_ROUTING_MAP for {} ({}): {}",
+                dst_ip, domain, error
+            ),
+        }
     }
 
     /// UDP post-decision kernel offload via drop-and-reinject.  When the
