@@ -25,6 +25,40 @@ const NO_SNI_THRESHOLD: u32 = 4;
 /// How long sniffing is disabled after reaching the no-SNI threshold.
 const NO_SNI_BYPASS_TTL: Duration = Duration::from_secs(1);
 
+/// Outcome of feeding one datagram to the QUIC Initial sniffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuicSniffOutcome {
+    /// Not a parseable/decryptable QUIC Initial (garbage, unsupported
+    /// version, AEAD failure), or sniffing was skipped on a negative-cache
+    /// hit — the flow is not provably QUIC.
+    NotQuic,
+    /// A genuine, successfully decrypted QUIC Initial whose ClientHello
+    /// yielded no usable SNI (yet): a multi-packet ClientHello still waiting
+    /// for CRYPTO fragments, a complete ClientHello without SNI, or an
+    /// unparsable one.  The flow is provably QUIC.
+    ValidNoDomain,
+    /// SNI extracted from a decrypted Initial.
+    Domain(String),
+}
+
+impl QuicSniffOutcome {
+    /// Whether the datagram was confirmed to be a genuine QUIC Initial.
+    /// Only confirmed flows may be considered for drop-and-reinject
+    /// offload — a non-QUIC flow has no retransmission guarantee, so its
+    /// first datagram must never be dropped.
+    pub fn is_quic_confirmed(&self) -> bool {
+        !matches!(self, Self::NotQuic)
+    }
+
+    /// The sniffed SNI, if extraction succeeded.
+    pub fn into_domain(self) -> Option<String> {
+        match self {
+            Self::Domain(domain) => Some(domain),
+            _ => None,
+        }
+    }
+}
+
 /// A key identifying a QUIC flow family: (src, dst).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PacketSnifferKey {
@@ -171,11 +205,12 @@ impl PacketSnifferPool {
     }
 
     /// Feed a UDP datagram (expected to carry QUIC Initial packet(s)) to the
-    /// sniffer for a flow. Returns the sniffed SNI hostname if extraction
-    /// succeeded.
-    pub fn feed_quic_initial(&self, key: PacketSnifferKey, data: &[u8]) -> Option<String> {
+    /// sniffer for a flow.  Returns whether the datagram was confirmed to be
+    /// a genuine QUIC Initial, carrying the SNI hostname when extraction
+    /// succeeded — see [`QuicSniffOutcome`].
+    pub fn feed_quic_initial(&self, key: PacketSnifferKey, data: &[u8]) -> QuicSniffOutcome {
         if self.is_dcid_failed(&key) {
-            return None;
+            return QuicSniffOutcome::NotQuic;
         }
 
         // Decrypt the Initial packet(s) first (stateless, no lock needed).
@@ -185,7 +220,11 @@ impl PacketSnifferPool {
         let session = sessions.entry(key).or_insert_with(SnifferSession::new);
 
         if session.done {
-            return session.domain.clone();
+            return session
+                .domain
+                .clone()
+                .map(QuicSniffOutcome::Domain)
+                .unwrap_or(QuicSniffOutcome::ValidNoDomain);
         }
 
         session.packets_seen += 1;
@@ -205,7 +244,7 @@ impl PacketSnifferPool {
                     debug!("QUIC sniffing bypassed after repeated decrypt failures: {err:?}");
                     self.mark_dcid_failed_decrypt(key);
                 }
-                return None;
+                return QuicSniffOutcome::NotQuic;
             }
         };
 
@@ -227,7 +266,7 @@ impl PacketSnifferPool {
                     "QUIC SNI extracted: {} (packets_seen={})",
                     domain, session.packets_seen
                 );
-                Some(domain)
+                QuicSniffOutcome::Domain(domain)
             }
             quic::ClientHelloParse::Complete(None) => {
                 // Complete ClientHello without SNI: this flow never yields
@@ -236,12 +275,12 @@ impl PacketSnifferPool {
                 drop(sessions);
                 self.mark_dcid_failed_soft(key);
                 debug!("QUIC ClientHello carried no SNI; flow bypassed");
-                None
+                QuicSniffOutcome::ValidNoDomain
             }
             quic::ClientHelloParse::Incomplete => {
                 // The ClientHello spans multiple Initial packets; wait for
                 // the remaining CRYPTO fragments.
-                None
+                QuicSniffOutcome::ValidNoDomain
             }
             quic::ClientHelloParse::Invalid => {
                 session.no_sni_count += 1;
@@ -254,7 +293,7 @@ impl PacketSnifferPool {
                     self.mark_dcid_failed_soft(key);
                     debug!("QUIC DCID marked failed after no-SNI threshold");
                 }
-                None
+                QuicSniffOutcome::ValidNoDomain
             }
         }
     }
@@ -332,11 +371,12 @@ mod tests {
         let packet = test_utils::rfc9001_client_initial();
 
         let result = pool.feed_quic_initial(key, &packet);
-        assert_eq!(result.as_deref(), Some("example.com"));
+        assert_eq!(result, QuicSniffOutcome::Domain("example.com".into()));
+        assert!(result.is_quic_confirmed());
 
         // The extracted domain is cached on the completed session.
         let result = pool.feed_quic_initial(key, &packet);
-        assert_eq!(result.as_deref(), Some("example.com"));
+        assert_eq!(result, QuicSniffOutcome::Domain("example.com".into()));
         assert!(!pool.is_dcid_failed(&key));
     }
 
@@ -365,12 +405,15 @@ mod tests {
             &test_utils::wrap_crypto_frame(split as u64, &hello[split..]),
         );
 
-        // Second fragment first: buffered, nothing to parse yet.
-        assert_eq!(pool.feed_quic_initial(key, &pkt1), None);
+        // Second fragment first: buffered, nothing to parse yet — but the
+        // Initial decrypted, so the flow is already confirmed QUIC.
+        let pending = pool.feed_quic_initial(key, &pkt1);
+        assert_eq!(pending, QuicSniffOutcome::ValidNoDomain);
+        assert!(pending.is_quic_confirmed());
         assert!(!pool.is_dcid_failed(&key));
         // First fragment completes the ClientHello.
         let result = pool.feed_quic_initial(key, &pkt0);
-        assert_eq!(result.as_deref(), Some("quic.example.org"));
+        assert_eq!(result, QuicSniffOutcome::Domain("quic.example.org".into()));
     }
 
     /// A complete ClientHello without an SNI extension bypasses the flow
@@ -389,7 +432,11 @@ mod tests {
             &test_utils::wrap_crypto_frame(0, &hello),
         );
 
-        assert_eq!(pool.feed_quic_initial(key, &packet), None);
+        // Decryption succeeded, so the flow is confirmed QUIC even though
+        // it can never yield a domain.
+        let outcome = pool.feed_quic_initial(key, &packet);
+        assert_eq!(outcome, QuicSniffOutcome::ValidNoDomain);
+        assert!(outcome.is_quic_confirmed());
         assert!(pool.is_dcid_failed(&key));
     }
 
@@ -402,8 +449,9 @@ mod tests {
         let data = garbage_initial();
 
         let result = pool.feed_quic_initial(key, &data);
-        // Decryption fails on the garbage payload; no domain yet.
-        assert!(result.is_none());
+        // Decryption fails on the garbage payload: not provably QUIC.
+        assert_eq!(result, QuicSniffOutcome::NotQuic);
+        assert!(!result.is_quic_confirmed());
         assert!(!pool.is_dcid_failed(&key));
 
         for _ in 0..4 {
