@@ -77,8 +77,7 @@ jobs:
       - name: Install Rust nightly (for the eBPF object)
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-07-20  # newer nightlies carry LLVM that rejects bpf-linker -Oz
-        with:
+          toolchain: nightly-2026-07-20 # newer nightlies carry LLVM that rejects bpf-linker -Oz
           components: rust-src, llvm-tools
 
       - name: Install system dependencies
