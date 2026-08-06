@@ -517,6 +517,20 @@ experimental {
         store_fakeip: false
         store_dns: false
     }
+    udp_nfqueue {
+        enabled: false
+        scope: quic
+        queue_base: 320
+        workers: 4
+        queue_max_packets: 4096
+        global_copy_bytes: 33554432
+        per_flow_packets: 16
+        per_flow_bytes: 131072
+        decision_soft_timeout_ms: 20
+        decision_hard_timeout_ms: 100
+        failure_policy: closed
+        gso: false
+    }
 }
 ```
 
@@ -610,6 +624,33 @@ Env: `HONK_UI_DOWNLOAD_URL` for UI zip override.
 | `store_dns` | `false` | Persist DNS answers |
 
 Stores selector choices and clash mode always when enabled.
+
+### `experimental { udp_nfqueue { ... } }`
+
+| Field | Default | Meaning |
+| ------- | --------- | --------- |
+| `enabled` | `false` | NFQUEUE UDP staged decision (phase-1 skeleton) |
+| `scope` | `"quic"` | Staged flow scope; only `quic` exists |
+| `queue_base` | `320` | First NFQUEUE queue number |
+| `workers` | `4` | Queue/worker count (flow-hashed queues base..base+workers-1) |
+| `queue_max_packets` | `4096` | Kernel queue maxlen per queue |
+| `global_copy_bytes` | `33554432` | Global staged-payload budget (phase 2) |
+| `per_flow_packets` | `16` | Per-flow staged packet budget (phase 2) |
+| `per_flow_bytes` | `131072` | Per-flow staged byte budget (phase 2) |
+| `decision_soft_timeout_ms` | `20` | Soft decision deadline (phase 2) |
+| `decision_hard_timeout_ms` | `100` | Hard decision deadline (phase 2) |
+| `failure_policy` | `"closed"` | `closed` drops on queue failure; `availability` sets the kernel fail-open flag; `legacy` is reserved |
+| `gso` | `false` | NFQA GSO super-packets (reserved, rejected when set) |
+
+When enabled, Rule-mode non-`must` direct UDP flows that cannot be
+route-time offloaded are parked with `NFQUEUE_PENDING_MARK` and queued to
+userspace, which currently commits every staged flow direct (phase-1
+skeleton: conn_state `DirectActive` + NF_ACCEPT of the original skb, so the
+first datagram keeps the client 5-tuple). Bring-up is all-or-nothing before
+datapath admission opens; a queue-number conflict or rule-install failure
+aborts startup. Requires at least one `lan_interface`. Validation rejects
+user marks overlapping skb-mark bits 29/30 regardless of `enabled`. Reload
+does not reconfigure the pipeline (changes log "requires a restart").
 
 ---
 

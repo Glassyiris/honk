@@ -864,6 +864,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                         mode_state,
                         ebpf: control_plane.ebpf_handle(),
                         direct_offload_static: control_plane.direct_offload_static_handle(),
+                        nfqueue_flag: control_plane.nfqueue_flag_handle(),
                         secret: clash_cfg.secret.clone(),
                         connection_pool: control_plane.connection_pool(),
                         external_ui: clash_cfg.external_ui.clone(),

@@ -109,9 +109,14 @@ fn embed_ebpf_object() {
                 ])
                 // An inherited RUSTFLAGS would override the crate's
                 // .cargo/config.toml rustflags (--btf, debuginfo) and silently
-                // produce a BTF-less object again.
+                // produce a BTF-less object again.  An inherited clippy/rustc
+                // wrapper (cargo clippy on the host workspace) is just as
+                // fatal: the eBPF crate is nightly+bpf-linker only and was
+                // never meant to pass through the host's driver.
                 .env_remove("RUSTFLAGS")
                 .env_remove("CARGO_ENCODED_RUSTFLAGS")
+                .env_remove("RUSTC_WRAPPER")
+                .env_remove("RUSTC_WORKSPACE_WRAPPER")
                 .current_dir(&ebpf_crate)
                 .status()
                 .expect("failed to build eBPF object");

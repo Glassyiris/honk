@@ -539,6 +539,48 @@ warm = {
 
 启用后会持久化 Selector 选择与 Clash 模式。
 
+### `experimental { udp_nfqueue { ... } }`
+
+```dae
+udp_nfqueue {
+    enabled: false
+    scope: quic
+    queue_base: 320
+    workers: 4
+    queue_max_packets: 4096
+    global_copy_bytes: 33554432
+    per_flow_packets: 16
+    per_flow_bytes: 131072
+    decision_soft_timeout_ms: 20
+    decision_hard_timeout_ms: 100
+    failure_policy: closed
+    gso: false
+}
+```
+
+| 字段 | 默认值 | 含义 |
+| ------ | -------- | ------ |
+| `enabled` | `false` | NFQUEUE UDP 暂存决策（第一阶段骨架） |
+| `scope` | `"quic"` | 暂存范围；目前只有 `quic` |
+| `queue_base` | `320` | 首个 NFQUEUE 队列号 |
+| `workers` | `4` | 队列/worker 数（按五元组 hash 分发 base..base+workers-1） |
+| `queue_max_packets` | `4096` | 每个内核队列的 maxlen |
+| `global_copy_bytes` | `33554432` | 全局暂存字节预算（阶段 2） |
+| `per_flow_packets` | `16` | 每流暂存包数预算（阶段 2） |
+| `per_flow_bytes` | `131072` | 每流暂存字节预算（阶段 2） |
+| `decision_soft_timeout_ms` | `20` | 决策软超时（阶段 2） |
+| `decision_hard_timeout_ms` | `100` | 决策硬超时（阶段 2） |
+| `failure_policy` | `"closed"` | `closed` 队列故障丢包；`availability` 置内核 fail-open 位；`legacy` 预留 |
+| `gso` | `false` | NFQA GSO 超包（预留，开启会被拒绝） |
+
+启用后，Rule 模式下非 `must`、无法路由时卸载的 direct UDP 流会被打上
+`NFQUEUE_PENDING_MARK` 并排入用户态；当前骨架把每条暂存流提交为 direct
+（conn_state 置 `DirectActive` 并对原 skb 发 NF_ACCEPT，首包保持客户端
+五元组）。启动是全有或全无：在数据面准入开放之前完成，队列号冲突或
+规则安装失败都会拒绝启动。需要至少一个 `lan_interface`。无论是否启用，
+配置校验都会拒绝与 skb mark 第 29/30 位冲突的用户 mark。reload 不会
+重配该流水线（改动只记录"需要重启"日志）。
+
 ---
 
 ## 8. CLI（`honk-core`）

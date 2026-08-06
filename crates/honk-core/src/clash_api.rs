@@ -96,6 +96,9 @@ pub struct ClashState {
     /// The static half of the offload policy (`NO_DOMAIN_RULES` or 0),
     /// maintained by the control plane; composed with the mode bits here.
     pub direct_offload_static: Arc<std::sync::atomic::AtomicU32>,
+    /// The NFQUEUE pipeline's NFQ_READY bit (0 when down), composed into
+    /// the flags word like `direct_offload_static`.
+    pub nfqueue_flag: Arc<std::sync::atomic::AtomicU32>,
     /// Bearer secret from `experimental.clash_api.secret`; empty = no auth.
     pub secret: String,
     /// Shared connection pool (ready-pool hit/miss metrics in `/stats`).
@@ -366,7 +369,8 @@ async fn patch_configs(State(s): State<Arc<ClashState>>, body: Bytes) -> Respons
         // policy binds at flow creation only.
         let flags = s.mode_state.read().direct_offload_mode_bits()
             | s.direct_offload_static
-                .load(std::sync::atomic::Ordering::Relaxed);
+                .load(std::sync::atomic::Ordering::Relaxed)
+            | s.nfqueue_flag.load(std::sync::atomic::Ordering::Relaxed);
         if let Err(error) = s.ebpf.write().await.set_datapath_flags(flags) {
             tracing::error!(%error, mode = %mode, "failed to update eBPF datapath offload flags");
         }

@@ -355,6 +355,16 @@ impl ControlPlane {
             self.alive_set
                 .sync_group_check_urls(&group_check_url_registrations(&config));
         }
+        // The NFQUEUE pipeline is not reconfigurable at runtime in this
+        // phase; a changed block only takes effect at the next startup.
+        {
+            let config = self.config.read().await;
+            if config.experimental.udp_nfqueue != self.nfqueue_config.clone().unwrap_or_default() {
+                warn!(
+                    "experimental.udp_nfqueue changes require a restart; the running pipeline is unchanged"
+                );
+            }
+        }
         // The flags live in a persistent map, but re-assert them after a
         // successful reload so a missed or failed earlier write cannot leave
         // the datapath out of sync with the clash mode and routing config.

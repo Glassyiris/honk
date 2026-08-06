@@ -174,6 +174,7 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
             Box::new(mock_ebpf) as Box<dyn honk_core::ebpf::EbpfBackend>
         )),
         direct_offload_static: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        nfqueue_flag: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         secret: secret.to_string(),
         external_ui: external_ui.to_string(),
         router: Arc::new(tokio::sync::RwLock::new(traffic_router)),
@@ -1203,6 +1204,7 @@ async fn test_dns_query_upstream_and_nxdomain() {
         mode_state: app.state.mode_state.clone(),
         ebpf: app.state.ebpf.clone(),
         direct_offload_static: app.state.direct_offload_static.clone(),
+        nfqueue_flag: app.state.nfqueue_flag.clone(),
         secret: String::new(),
         external_ui: String::new(),
         router: app.state.router.clone(),

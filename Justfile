@@ -95,6 +95,10 @@ test-netns:
     cargo test -p honk-core --features ebpf --lib netns -- --ignored --test-threads=1
     cargo test -p honk-core --features ebpf --lib link_lifecycle -- --ignored --test-threads=1
 
+# Root-gated real-kernel NFQUEUE test (private netns; needs nfnetlink_queue/nft_queue)
+test-nfqueue:
+    cargo test -p honk-nfqueue -- --ignored --test-threads=1
+
 # Full honk-outbound gate after outbound changes (fmt + clippy + config & outbound suites)
 outbound-ci:
     ci/outbound-ci.sh

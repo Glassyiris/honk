@@ -4,6 +4,7 @@ mod connection;
 pub mod dns_control;
 pub mod drain;
 pub mod janitor;
+pub(crate) mod nfqueue;
 pub mod packet_sniffer;
 mod probers;
 pub mod quic;
@@ -145,14 +146,19 @@ pub struct ControlPlane {
     /// Shared clash mode state (Rule/Global/Direct + GLOBAL selection),
     /// installed by `set_mode_state` when the clash API is enabled.
     mode_state: Option<crate::mode::SharedModeState>,
-    /// Drop-and-reinject UDP post-decision offload, parsed once from
-    /// `HONK_UDP_POST_DECISION_OFFLOAD` at startup (tests inject the field
-    /// directly — no env mutation).
-    udp_post_decision_offload: bool,
     /// Cached static half of the datapath offload policy
     /// (`DATAPATH_FLAG_OFFLOAD_NO_DOMAIN_RULES` or 0), recomputed by
     /// `sync_direct_offload_flags` and shared with the clash API.
     direct_offload_static: Arc<std::sync::atomic::AtomicU32>,
+    /// NFQUEUE staged-decision runtime (experimental.udp_nfqueue); None
+    /// unless the feature is enabled and the phase-1 pipeline came up.
+    nfqueue: Option<nfqueue::NfqueueRuntime>,
+    /// The config block the NFQUEUE runtime was started with, so a reload
+    /// can warn that changing it requires a restart.
+    nfqueue_config: Option<honk_config::experimental::UdpNfqueueConfig>,
+    /// Shared NFQ_READY cell OR-ed into every datapath-flags write; 0 while
+    /// the NFQUEUE pipeline is down (the default).
+    nfqueue_flag: Arc<std::sync::atomic::AtomicU32>,
     datapath_healthy: Arc<std::sync::atomic::AtomicBool>,
     active_routing_plan: Arc<parking_lot::RwLock<Arc<routing_matcher::RoutingPushPlan>>>,
     /// Interface watcher, stopped and joined before `detach_hooks` during
@@ -168,9 +174,8 @@ fn accepts_transparent_connection(drain: &DrainTracker) -> bool {
 /// Retire conntrack entries as UDP endpoints die (event-driven lifecycle;
 /// the datapath/janitor timeouts remain the backstop), and drop the flow
 /// from the clash-API tracker.  A `KernelOffloadHandoff` removal keeps the
-/// conn_state: it anchors a flow that was handed to the kernel by the
-/// drop-and-reinject offload.  Extracted so tests can run the real
-/// production worker against a mock backend.
+/// conn_state: it anchors a flow that was handed to the kernel.  Extracted
+/// so tests can run the real production worker against a mock backend.
 pub(crate) fn spawn_udp_removal_worker(
     udp_pool: Arc<UdpEndpointPool>,
     ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
@@ -505,9 +510,10 @@ impl ControlPlane {
             background_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             udp_warm_task: tokio::sync::Mutex::new(None),
             mode_state: None,
-            udp_post_decision_offload: std::env::var("HONK_UDP_POST_DECISION_OFFLOAD").as_deref()
-                == Ok("1"),
             direct_offload_static,
+            nfqueue: None,
+            nfqueue_config: None,
+            nfqueue_flag: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             datapath_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             active_routing_plan: Arc::new(parking_lot::RwLock::new(initial_routing_plan)),
             #[cfg(feature = "ebpf")]
@@ -717,7 +723,8 @@ impl ControlPlane {
             .as_ref()
             .map(|state| state.read().direct_offload_mode_bits())
             .unwrap_or(honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_RULE_DIRECT);
-        let flags = mode_bits | static_bit;
+        let flags =
+            mode_bits | static_bit | self.nfqueue_flag.load(std::sync::atomic::Ordering::Relaxed);
         if let Err(error) = self.ebpf.write().await.set_datapath_flags(flags) {
             warn!(%error, flags, "failed to update eBPF datapath offload flags");
         }
@@ -728,6 +735,11 @@ impl ControlPlane {
     /// flags word without reading the config or routing plan.
     pub fn direct_offload_static_handle(&self) -> Arc<std::sync::atomic::AtomicU32> {
         self.direct_offload_static.clone()
+    }
+
+    /// The NFQ_READY cell, shared with the clash API for the same reason.
+    pub fn nfqueue_flag_handle(&self) -> Arc<std::sync::atomic::AtomicU32> {
+        self.nfqueue_flag.clone()
     }
 
     pub fn config_handle(&self) -> Arc<RwLock<Config>> {
@@ -1173,6 +1185,28 @@ impl ControlPlane {
             self.background_tasks.lock().await.push(handle);
         }
 
+        // NFQUEUE staged decision (experimental.udp_nfqueue) must be fully up
+        // — listeners, rules, self-check — before the flags sync publishes
+        // NFQ_READY and the datapath opens; a failed bring-up aborts startup.
+        {
+            let (nfq_config, lan_interfaces) = {
+                let config = self.config.read().await;
+                (
+                    config.experimental.udp_nfqueue.clone(),
+                    config.global.lan_interface.clone(),
+                )
+            };
+            self.nfqueue = nfqueue::NfqueueRuntime::start(
+                &nfq_config,
+                &lan_interfaces,
+                self.ebpf.clone(),
+                self.nfqueue_flag.clone(),
+            )
+            .await?;
+            if self.nfqueue.is_some() {
+                self.nfqueue_config = Some(nfq_config);
+            }
+        }
         self.sync_direct_offload_flags().await;
         {
             let mut ebpf = self.ebpf.write().await;
@@ -1345,6 +1379,15 @@ impl ControlPlane {
         if let Err(error) = self.ebpf.write().await.set_datapath_ready(false) {
             warn!(%error, "failed to close eBPF datapath admission");
         }
+        // NFQUEUE teardown mirrors its bring-up: stop new PENDING packets at
+        // the datapath first, then drain workers (in-flight guards fail
+        // closed) and remove only our own nft objects.
+        if let Some(nfqueue) = self.nfqueue.take() {
+            self.nfqueue_flag
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            self.sync_direct_offload_flags().await;
+            nfqueue.shutdown().await;
+        }
         drain.start_rejecting();
         self.stop_udp_warm_coordinator().await;
         if !self.udp_pool.shutdown().await {
@@ -1447,7 +1490,6 @@ impl ControlPlane {
             connection_pool: self.connection_pool.clone(),
             connection_tracker: self.connection_tracker.clone(),
             mode_state: self.mode_state.clone(),
-            udp_post_decision_offload: self.udp_post_decision_offload,
         }
     }
 }

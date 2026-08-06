@@ -284,7 +284,7 @@ pub(crate) enum RemovalReason {
     /// A userspace endpoint (or its uncommitted reservation) is gone; the
     /// flow's conntrack entries are retired with it.
     UserspaceEndpointRetired,
-    /// The flow was handed to the kernel (drop-and-reinject offload): its
+    /// The flow was handed to the kernel (kernel-offload handoff): its
     /// conn_state now anchors the offloaded flow and must NOT be deleted.
     KernelOffloadHandoff,
 }
@@ -610,14 +610,18 @@ impl UdpInitLease {
         true
     }
 
-    /// Terminal state for the drop-and-reinject kernel offload: the flow's
-    /// conn_state now carries the offload bit, so this reservation is
-    /// retired with a `KernelOffloadHandoff` removal reason — the production
-    /// removal worker must NOT delete that conn_state (a plain drop would
-    /// unwind the offload and bounce the retransmission back to userspace).
+    /// Terminal state for a kernel-offload handoff: the flow's conn_state
+    /// now carries the offload bit, so this reservation is retired with a
+    /// `KernelOffloadHandoff` removal reason — the production removal worker
+    /// must NOT delete that conn_state (a plain drop would unwind the
+    /// offload and bounce the flow back to userspace).
     /// Generation/epoch-safe exactly like `commit_ready`; on failure the
     /// caller must not treat the flow as offloaded.  Releases the first
     /// datagram, queued followers, and every permit exactly like a drop.
+    ///
+    /// Currently unused: the NFQUEUE staged-decision commit (phase 2) is its
+    /// caller.
+    #[allow(dead_code)]
     pub(super) fn commit_offloaded(&mut self) -> bool {
         // Same map-entry → epoch-gate order as reservation and commit_ready.
         let occupied = match self.pool.endpoints.entry(self.key) {

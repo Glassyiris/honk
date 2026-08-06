@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 honk-config.workspace = true
 honk-ebpf-common.workspace = true
+honk-nfqueue.workspace = true
 honk-outbound.workspace = true
 
 # eBPF (optional; enable with the `ebpf` feature)
