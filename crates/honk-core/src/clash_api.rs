@@ -1080,14 +1080,12 @@ fn connections_json_tracker(
                 "host": e.domain.clone().unwrap_or_default(),
                 "dnsMode": "normal",
             });
-            // mihomo omits the process keys entirely for flows without
-            // process attribution (LAN-forwarded traffic has none).
-            if let Some(process) = &e.process {
-                metadata["process"] = serde_json::Value::String(process.clone());
-            }
-            if let Some(process_path) = &e.process_path {
-                metadata["processPath"] = serde_json::Value::String(process_path.clone());
-            }
+            // mihomo always emits both process keys (empty when unattributed);
+            // zashboard's accessor does processPath.replace(...) unguarded, so
+            // omitting them breaks its connection detail dialog.
+            metadata["process"] = serde_json::Value::String(e.process.clone().unwrap_or_default());
+            metadata["processPath"] =
+                serde_json::Value::String(e.process_path.clone().unwrap_or_default());
 
             serde_json::json!({
                 "id": e.id,

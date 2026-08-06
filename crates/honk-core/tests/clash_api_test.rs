@@ -673,10 +673,11 @@ async fn test_connections_snapshot_and_delete() {
     // RFC3339 start timestamp.
     let start = c["start"].as_str().unwrap();
     assert!(chrono::DateTime::parse_from_rfc3339(start).is_ok());
-    // A flow without process attribution omits both process keys entirely.
+    // A flow without process attribution emits both keys with empty values
+    // (mihomo semantics; zashboard reads processPath unguarded).
     let c2 = conns.iter().find(|c| c["id"] == "conn-2").unwrap();
-    assert!(c2["metadata"].get("process").is_none());
-    assert!(c2["metadata"].get("processPath").is_none());
+    assert_eq!(c2["metadata"]["process"], "");
+    assert_eq!(c2["metadata"]["processPath"], "");
     assert_eq!(body["uploadTotal"], 100);
     assert_eq!(body["downloadTotal"], 200);
 
