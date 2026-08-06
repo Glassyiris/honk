@@ -67,7 +67,7 @@ jobs:
         with:
           components: rust-src, llvm-tools
       - name: Install bpf-linker
-        run: cargo install bpf-linker
+        run: cargo install bpf-linker --version 0.10.3  # 0.10.4 dropped -Oz, which our opt-level="z" profile needs
       - name: Point eBPF .cargo/config at the installed bpf-linker
         run: |
           sed -i 's|linker=/root/.cargo/bin/bpf-linker-wrapper|linker=bpf-linker|' \
