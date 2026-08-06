@@ -97,6 +97,21 @@ ssh root@10.10.10.57 "bash /root/lab-bench.sh 'honk dae' 'hy2 tuic ss2022 trojan
 ssh root@10.10.10.57 bash /root/test-protocols.sh
 ```
 
+## 结果(2026-08-06,UDP post-decision 卸载验证轮 @ NanoPi R2S)
+
+验证 UDP QUIC 卸载(drop-and-reinject 重构版,`HONK_UDP_POST_DECISION_OFFLOAD=1`)。
+标准 UDP 行(iperf3/echo,代理协议组)不受此功能影响——数值与上轮逐行吻合
+(噪声内)即为正确结果;另增 QUIC 型 direct UDP 负载补测(juicity 隧道穿
+`domain(suffix:hy2.test)->direct`,domain++):
+
+| 负载 | 卸载开 | 卸载关 |
+| --- | --- | --- |
+| QUIC direct UDP(juicity) | **149.1 Mbps @ 0.00 核**(endpoint hits=0) | 33.2 Mbps @ 0.78 核(hits=13588) |
+
+吞吐 4.5×、引擎 CPU 归零(149Mbps 上限来自 juicity 客户端自身在 A53 上的
+QUIC crypto)。direct 行保持 874 Mbps @ 0.00 核(dae 889 持平),TCP 协议行
+偏差 ≤2.3% 无回归。
+
 ## 结果(2026-08-06,direct 内核卸载验证轮 @ NanoPi R2S)
 
 验证 PR #17(Rule 模式 direct 流全量内核卸载,按流缓存决策,零每包开销)。

@@ -111,6 +111,24 @@ ssh root@10.10.10.57 "bash /root/lab-bench.sh 'honk dae' 'hy2 tuic ss2022 trojan
 ssh root@10.10.10.57 bash /root/test-protocols.sh
 ```
 
+## Results (2026-08-06, UDP post-decision offload verification @ NanoPi R2S)
+
+Verifies the QUIC UDP offload (drop-and-reinject rebuild,
+`HONK_UDP_POST_DECISION_OFFLOAD=1`). The standard UDP rows (iperf3/echo
+through proxy groups) are unaffected by design — matching the previous round
+line by line (within noise) is the correct outcome. A supplementary QUIC-type
+direct-UDP load (juicity tunnel through `domain(suffix:hy2.test)->direct`,
+domain++):
+
+| Load | offload ON | offload OFF |
+| --- | --- | --- |
+| QUIC direct UDP (juicity) | **149.1 Mbps @ 0.00 cores** (endpoint hits=0) | 33.2 Mbps @ 0.78 cores (hits=13588) |
+
+4.5× throughput with the engine CPU at zero (the 149 Mbps ceiling is the
+juicity client's own QUIC crypto on the A53). The direct row holds at
+874 Mbps @ 0.00 cores (dae 889, on par); TCP protocol rows within ≤2.3% — no
+regression.
+
 ## Results (2026-08-06, direct kernel-offload verification @ NanoPi R2S)
 
 Verifies PR #17 (kernel offload of direct-routed flows in Rule mode, per-flow
