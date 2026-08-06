@@ -1734,6 +1734,15 @@ impl ControlPlaneHandle {
         client_addr: SocketAddr,
         original_dst: SocketAddr,
     ) {
+        // Disabled by default: the userspace first packet goes out from the
+        // engine's own ephemeral socket while offloaded packets continue via
+        // kernel NAT/forwarding, so the server-visible 5-tuple changes at the
+        // switch — unsafe for stateful UDP (QUIC handshakes, game/VoIP
+        // sessions). Opt in with HONK_UDP_POST_DECISION_OFFLOAD=1. Route-time
+        // must-direct offload is unaffected (kernel path from packet one).
+        if std::env::var("HONK_UDP_POST_DECISION_OFFLOAD").as_deref() != Ok("1") {
+            return;
+        }
         // Evaluate the predicate before the await: the read guard is !Send.
         let allowed = {
             let mode = self.mode_state.as_ref().map(|state| state.read());

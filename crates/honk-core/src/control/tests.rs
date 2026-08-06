@@ -2158,6 +2158,12 @@ impl honk_outbound::proxy::PacketOutbound for UdpOffloadTestHandler {
     }
 }
 
+/// The offload gate defaults to off (unsafe 5-tuple switch, see
+/// connection.rs); these tests exercise the gated logic, so enable it.
+fn enable_udp_offload() {
+    unsafe { std::env::set_var("HONK_UDP_POST_DECISION_OFFLOAD", "1") }
+}
+
 /// Registers the offload test handler for both the Socks5 (proxy leaf) and
 /// Direct (built-in) protocols, and optionally installs a clash mode state.
 fn udp_offload_test_handle(
@@ -2279,6 +2285,7 @@ async fn serve_test_udp_to(
 
 #[tokio::test]
 async fn udp_offload_converged_direct_marks_conn_state() {
+    enable_udp_offload();
     for (client, dst) in [
         (addr("10.0.0.2:53000"), addr("203.0.113.2:443")),
         (addr("[2001:db8::2]:53000"), addr("[2001:db8::3]:443")),
@@ -2313,6 +2320,7 @@ async fn udp_offload_converged_direct_marks_conn_state() {
 
 #[tokio::test]
 async fn udp_offload_direct_mode_normalizes_proxy_decision() {
+    enable_udp_offload();
     let client = addr("10.0.0.2:53000");
     let dst = addr("203.0.113.2:443");
     let config = udp_offload_test_config("udp-test", vec![udp_test_node()]);
@@ -2354,6 +2362,7 @@ async fn udp_offload_direct_mode_normalizes_proxy_decision() {
 
 #[tokio::test]
 async fn udp_offload_rule_mode_keeps_proxy_decision_in_userspace() {
+    enable_udp_offload();
     let client = addr("10.0.0.2:53000");
     let dst = addr("203.0.113.2:443");
     let config = udp_offload_test_config("udp-test", vec![udp_test_node()]);
@@ -2377,6 +2386,7 @@ async fn udp_offload_rule_mode_keeps_proxy_decision_in_userspace() {
 
 #[tokio::test]
 async fn udp_offload_global_mode_keeps_direct_decision_in_userspace() {
+    enable_udp_offload();
     let client = addr("10.0.0.2:53000");
     let dst = addr("203.0.113.2:443");
     let config = udp_offload_test_config("direct", vec![]);
@@ -2397,6 +2407,7 @@ async fn udp_offload_global_mode_keeps_direct_decision_in_userspace() {
 
 #[tokio::test]
 async fn udp_offload_first_send_failure_never_marks_conn_state() {
+    enable_udp_offload();
     let client = addr("10.0.0.2:53000");
     let dst = addr("203.0.113.2:443");
     let config = udp_offload_test_config("direct", vec![]);
@@ -2424,6 +2435,7 @@ async fn udp_offload_first_send_failure_never_marks_conn_state() {
 
 #[tokio::test]
 async fn udp_offload_repeats_after_conn_state_sweep_without_leaking() {
+    enable_udp_offload();
     let client = addr("10.0.0.2:53000");
     let dst = addr("203.0.113.2:443");
     let config = udp_offload_test_config("direct", vec![]);
