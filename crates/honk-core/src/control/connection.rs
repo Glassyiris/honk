@@ -743,55 +743,53 @@ impl ControlPlaneHandle {
                 }
                 remaining -= 1;
                 match tokio::time::timeout_at(dial_deadline, set.join_next()).await {
-                    Ok(Some(task_result)) => {
-                        match task_result {
-                            Ok((Ok(stream), idx, _elapsed)) => {
-                                let node = &candidates[idx];
-                                let ipver = if original_dst.is_ipv6() {
-                                    IpVersion::V6
-                                } else {
-                                    IpVersion::V4
-                                };
-                                ctx.alive_set.report_available_traffic(
-                                    node.id,
-                                    ProbeDomain::Tcp,
-                                    ipver,
-                                );
-                                winner = Some((stream, idx));
-                                set.abort_all();
-                                break;
-                            }
-                            Ok((Err(e), idx, _elapsed)) => {
-                                let node = &candidates[idx];
-                                debug!("Parallel dial to {} failed: {}", node.name, e);
-                                ctx.stats.record_error(&outbound);
-                                let ipver = if original_dst.is_ipv6() {
-                                    IpVersion::V6
-                                } else {
-                                    IpVersion::V4
-                                };
-                                ctx.alive_set.report_unavailable_traffic(
-                                    node.id,
-                                    ProbeDomain::Tcp,
-                                    ipver,
-                                );
-                                ctx.alive_set
-                                    .record_dial_failure(node.id, ProbeDomain::Tcp, ipver);
-                                ctx.alive_set.notify_check_tcp(node.id);
-                                let msg = e.to_string();
-                                if msg.starts_with("dial timed out after") {
-                                    timeout_count += 1;
-                                }
-                                if first_err.is_none() {
-                                    first_err = Some((msg.clone(), node.name.clone()));
-                                }
-                                if remaining == 0 {
-                                    last_err = Some((msg, node.name.clone()));
-                                }
-                            }
-                            Err(_join_err) => {}
+                    Ok(Some(task_result)) => match task_result {
+                        Ok((Ok(stream), idx, _elapsed)) => {
+                            let node = &candidates[idx];
+                            let ipver = if original_dst.is_ipv6() {
+                                IpVersion::V6
+                            } else {
+                                IpVersion::V4
+                            };
+                            ctx.alive_set.report_available_traffic(
+                                node.id,
+                                ProbeDomain::Tcp,
+                                ipver,
+                            );
+                            winner = Some((stream, idx));
+                            set.abort_all();
+                            break;
                         }
-                    }
+                        Ok((Err(e), idx, _elapsed)) => {
+                            let node = &candidates[idx];
+                            debug!("Parallel dial to {} failed: {}", node.name, e);
+                            ctx.stats.record_error(&outbound);
+                            let ipver = if original_dst.is_ipv6() {
+                                IpVersion::V6
+                            } else {
+                                IpVersion::V4
+                            };
+                            ctx.alive_set.report_unavailable_traffic(
+                                node.id,
+                                ProbeDomain::Tcp,
+                                ipver,
+                            );
+                            ctx.alive_set
+                                .record_dial_failure(node.id, ProbeDomain::Tcp, ipver);
+                            ctx.alive_set.notify_check_tcp(node.id);
+                            let msg = e.to_string();
+                            if msg.starts_with("dial timed out after") {
+                                timeout_count += 1;
+                            }
+                            if first_err.is_none() {
+                                first_err = Some((msg.clone(), node.name.clone()));
+                            }
+                            if remaining == 0 {
+                                last_err = Some((msg, node.name.clone()));
+                            }
+                        }
+                        Err(_join_err) => {}
+                    },
                     Ok(None) => break,
                     Err(_elapsed) => {
                         set.abort_all();
