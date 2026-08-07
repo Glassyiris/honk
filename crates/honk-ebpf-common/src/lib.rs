@@ -163,16 +163,18 @@ impl L4ProtoType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum IpVersionType {
-    V4 = 4,
-    V6 = 6,
+    V4 = 1,
+    V6 = 2,
+    Any = 3,
 }
 
 impl IpVersionType {
     #[inline(always)]
     pub const fn from_u8(v: u8) -> Option<Self> {
         match v {
-            4 => Some(Self::V4),
-            6 => Some(Self::V6),
+            1 => Some(Self::V4),
+            2 => Some(Self::V6),
+            3 => Some(Self::Any),
             _ => None,
         }
     }

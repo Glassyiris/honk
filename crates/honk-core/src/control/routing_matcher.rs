@@ -985,9 +985,6 @@ impl RoutingMatcherBuilder {
     /// an IpVersion entry does the same for the address family.  A rule
     /// without such entries can match any flow and belongs to all groups.
     ///
-    /// Note the IpVersion dimension currently never narrows: values use
-    /// the OR-of-enum encoding (V4=4, V6=6) and `4 & 6 != 0`, so every
-    /// stored value matches both versions in `eval_match` as well.
     fn rule_group_mask(chain: &[MatchSet]) -> u8 {
         let mut l4 = 0b11u8; // bit 0: tcp allowed, bit 1: udp allowed
         let mut ip = 0b11u8; // bit 0: v4 allowed, bit 1: v6 allowed
@@ -1859,24 +1856,38 @@ mod tests {
     }
 
     #[test]
-    fn test_group_mask_ipversion_does_not_narrow() {
-        // eval_match compares `ipversion & value`; with the OR-of-enum
-        // encoding (V4=4, V6=6) every stored value matches both versions
-        // (4 & 6 != 0), so an IpVersion entry must not narrow the group
-        // mask either — otherwise flows would skip rules eval_match
-        // would actually match.
-        for version in [IpVersionType::V4, IpVersionType::V6] {
-            let chain = [MatchSet {
-                value: MatchSetValue {
-                    ip_version: version,
-                },
-                match_type: MatchType::IpVersion as u8,
-                ..Default::default()
-            }];
-            assert_eq!(
-                RoutingMatcherBuilder::rule_group_mask(&chain),
-                RoutingMatcherBuilder::ALL_GROUPS
-            );
+    fn test_ipversion_rules_narrow_to_selected_groups() {
+        let outbound_map = HashMap::from([("proxy".to_string(), OutboundIndex::UserBase as u8)]);
+        for (versions, expected_value, expected_groups) in [
+            (
+                vec![4],
+                IpVersionType::V4,
+                (1 << ROUTING_GROUP_TCP4) | (1 << ROUTING_GROUP_UDP4),
+            ),
+            (
+                vec![6],
+                IpVersionType::V6,
+                (1 << ROUTING_GROUP_TCP6) | (1 << ROUTING_GROUP_UDP6),
+            ),
+            (
+                vec![4, 6],
+                IpVersionType::Any,
+                RoutingMatcherBuilder::ALL_GROUPS,
+            ),
+        ] {
+            let route = CompiledRoute {
+                ip_versions: versions,
+                ..make_route("ip-version", "proxy")
+            };
+            let plan =
+                RoutingMatcherBuilder::compile(&[route], &outbound_map, "direct", DialMode::Ip)
+                    .unwrap();
+            let stored_value = unsafe { plan.match_sets[0].value.ip_version };
+            assert_eq!(stored_value, expected_value);
+            for (group, bitmap) in plan.group_bitmaps.iter().enumerate() {
+                let included = bitmap[0] & 1 != 0;
+                assert_eq!(included, expected_groups & (1 << group) != 0);
+            }
         }
     }
 

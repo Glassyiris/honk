@@ -27,7 +27,7 @@ use aya_ebpf_bindings::{
     helpers::{bpf_ktime_get_ns, bpf_redirect, bpf_redirect_peer, bpf_skb_store_bytes},
 };
 use honk_ebpf_common::{
-    RedirectEntry, RedirectTuple, RoutingMeta, TPROXY_MARK,
+    IpVersionType, RedirectEntry, RedirectTuple, RoutingMeta, TPROXY_MARK,
     conn::{BpfStatsKey, ConnState},
     redirect_need::{RoutingHandoffEntry, TuplesKey},
 };
@@ -468,7 +468,11 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     };
 
     let protocol = unsafe { (*ctx.skb.skb).protocol as u16 };
-    route_flag[1] = if protocol == ETH_P_IP.to_be() { 4 } else { 6 };
+    route_flag[1] = if protocol == ETH_P_IP.to_be() {
+        IpVersionType::V4 as u32
+    } else {
+        IpVersionType::V6 as u32
+    };
     route_flag[6] = pkt.tuples.dscp as u32;
 
     let mac_be: [u32; 4] = [

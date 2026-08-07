@@ -19,7 +19,7 @@ use aya_ebpf_cty::c_void;
 use core::ffi::c_long;
 use core::mem;
 use honk_ebpf_common::{
-    RedirectEntry, RedirectTuple, TASK_COMM_LEN, TPROXY_MARK,
+    IpVersionType, RedirectEntry, RedirectTuple, TASK_COMM_LEN, TPROXY_MARK,
     conn::BpfStatsKey,
     redirect_need::{PIDName, RoutingHandoffEntry, Tuples, TuplesKey},
 };
@@ -398,9 +398,9 @@ fn do_tproxy_wan_egress_tcp(
 
         let proto = ctx.skb.protocol() as u16;
         scratch.flag[1] = if proto == ETH_P_IP.to_be() {
-            4u32
+            IpVersionType::V4 as u32
         } else {
-            6u32
+            IpVersionType::V6 as u32
         };
         scratch.flag[6] = tuples.dscp as u32;
 
@@ -668,9 +668,9 @@ fn do_tproxy_wan_egress_udp(
 
     let proto = ctx.skb.protocol() as u16;
     scratch.flag[1] = if proto == ETH_P_IP.to_be() {
-        4u32
+        IpVersionType::V4 as u32
     } else {
-        6u32
+        IpVersionType::V6 as u32
     };
     scratch.flag[6] = tuples.dscp as u32;
 

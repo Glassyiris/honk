@@ -56,7 +56,7 @@ const MATCH_ERR: c_long = 1;
 ///
 /// Parameters map directly to the C `route()` function arguments:
 /// - `flag[0]` = L4ProtoType (TCP=1, UDP=2)
-/// - `flag[1]` = IpVersionType (IPv4=4, IPv6=6)
+/// - `flag[1]` = IpVersionType bit (IPv4=1, IPv6=2)
 /// - `flag[2..6]` = Process name (4 × u32, WAN egress only)
 /// - `flag[6]` = DSCP value
 /// - `flag[7]` = is_wan flag

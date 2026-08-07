@@ -82,8 +82,8 @@ unsafe impl aya::Pod for RoutingGroupMeta {}
 
 /// Map a flow's (L4 protocol, IP version) pair to its routing group index.
 ///
-/// `l4proto`/`ipversion` use the datapath encodings (`L4ProtoType`:
-/// Tcp=1, Udp=2; `IpVersionType`: V4=4, V6=6).  Unknown values fall back
+/// `l4proto`/`ipversion` use bitmask encodings (`L4ProtoType`:
+/// Tcp=1, Udp=2; `IpVersionType`: V4=1, V6=2). Unknown values fall back
 /// to group 0 (tcp4) so the flow still evaluates a deterministic subset.
 #[inline(always)]
 pub const fn routing_group_index(l4proto: u8, ipversion: u8) -> u32 {
