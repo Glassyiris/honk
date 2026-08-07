@@ -1,7 +1,7 @@
 //! [`Umem`] creation and operation
 
 use crate::{
-    FrameError, FrameState, Packet,
+    FrameError, FrameState, FrameStateCounts, Packet,
     error::{ConfigError, Error},
     frame::FrameRegistry,
     libc::{self, InternalXdpFlags, xdp::xdp_desc},
@@ -254,6 +254,21 @@ impl Umem {
     #[inline]
     pub fn integrity_faults(&self) -> u64 {
         self.registry.integrity_faults()
+    }
+
+    /// Returns a consistent snapshot of frame ownership counters.
+    pub fn frame_state_counts(&self) -> FrameStateCounts {
+        self.registry.state_counts()
+    }
+
+    /// Reclaims frames left in the kernel fill state after socket teardown.
+    ///
+    /// # Safety
+    ///
+    /// Every socket and ring registered against this UMEM must already be
+    /// closed. No kernel or userspace thread may access its descriptors.
+    pub unsafe fn reclaim_fill_after_socket_close(&self) -> Result<usize, FrameError> {
+        self.registry.reclaim_fill_after_socket_close()
     }
 }
 

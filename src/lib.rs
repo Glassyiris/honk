@@ -25,7 +25,7 @@ pub mod affinity;
 pub mod error;
 mod frame;
 pub mod packet;
-pub use frame::{FrameError, FrameState};
+pub use frame::{FrameError, FrameState, FrameStateCounts};
 pub use packet::Packet;
 pub mod libc;
 mod mmap;

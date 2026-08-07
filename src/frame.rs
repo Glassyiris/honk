@@ -36,6 +36,30 @@ impl FrameState {
     }
 }
 
+/// Counts of frames held by each ownership state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FrameStateCounts {
+    /// Frames available for allocation.
+    pub free: usize,
+    /// Frames submitted to a kernel fill ring.
+    pub fill: usize,
+    /// Frames held by userspace receive processing.
+    pub rx: usize,
+    /// Frames submitted to a transmit ring.
+    pub tx: usize,
+    /// Frames returned on a completion ring but not released.
+    pub completion: usize,
+    /// Frames containing an unknown state byte.
+    pub invalid: usize,
+}
+
+impl FrameStateCounts {
+    /// Returns all frames not available for allocation.
+    pub fn outstanding(self) -> usize {
+        self.fill + self.rx + self.tx + self.completion + self.invalid
+    }
+}
+
 /// A frame ownership or descriptor integrity violation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FrameError {
@@ -69,6 +93,17 @@ pub enum FrameError {
         /// The observed owner, or `None` for a corrupt state byte.
         actual: Option<FrameState>,
     },
+    /// Quiescent teardown found frames outside the reclaimable fill state.
+    OutstandingFrames {
+        /// Frames still held by userspace receive processing.
+        rx: usize,
+        /// Frames still submitted for transmit.
+        tx: usize,
+        /// Frames returned but not consumed from the completion ring.
+        completion: usize,
+        /// Frames containing an unknown state byte.
+        invalid: usize,
+    },
 }
 
 impl fmt::Display for FrameError {
@@ -96,6 +131,15 @@ impl fmt::Display for FrameError {
             } => write!(
                 f,
                 "frame {frame} ownership mismatch: expected {expected:?}, got {actual:?}"
+            ),
+            Self::OutstandingFrames {
+                rx,
+                tx,
+                completion,
+                invalid,
+            } => write!(
+                f,
+                "quiescent UMEM still owns frames: rx={rx} tx={tx} completion={completion} invalid={invalid}"
             ),
         }
     }
@@ -152,6 +196,56 @@ impl FrameRegistry {
     #[inline]
     pub(crate) fn outstanding(&self) -> usize {
         self.capacity() - self.allocatable()
+    }
+
+    pub(crate) fn state_counts(&self) -> FrameStateCounts {
+        let mut counts = FrameStateCounts::default();
+        for state in &self.states {
+            match FrameState::from_raw(state.load(Ordering::Acquire)) {
+                Some(FrameState::Free) => counts.free += 1,
+                Some(FrameState::Fill) => counts.fill += 1,
+                Some(FrameState::Rx) => counts.rx += 1,
+                Some(FrameState::Tx) => counts.tx += 1,
+                Some(FrameState::Completion) => counts.completion += 1,
+                None => counts.invalid += 1,
+            }
+        }
+        counts
+    }
+
+    pub(crate) fn reclaim_fill_after_socket_close(&self) -> Result<usize, FrameError> {
+        let counts = self.state_counts();
+        if counts.rx != 0 || counts.tx != 0 || counts.completion != 0 || counts.invalid != 0 {
+            return self.fail(FrameError::OutstandingFrames {
+                rx: counts.rx,
+                tx: counts.tx,
+                completion: counts.completion,
+                invalid: counts.invalid,
+            });
+        }
+
+        let mut available = self.available.borrow_mut();
+        for (frame, state) in self.states.iter().enumerate() {
+            if state.load(Ordering::Acquire) != FrameState::Fill as u8 {
+                continue;
+            }
+            state
+                .compare_exchange(
+                    FrameState::Fill as u8,
+                    FrameState::Free as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .map_err(|actual| {
+                    self.record(FrameError::InvalidTransition {
+                        frame,
+                        expected: FrameState::Fill,
+                        actual: FrameState::from_raw(actual),
+                    })
+                })?;
+            available.push_front(frame as u64 * self.frame_size);
+        }
+        Ok(counts.fill)
     }
 
     pub(crate) fn take(&self, next: FrameState) -> Result<Option<(u64, usize)>, FrameError> {
@@ -294,5 +388,33 @@ mod tests {
         assert_eq!(source.outstanding(), 0);
         assert_eq!(source.integrity_faults(), 0);
         assert_eq!(destination.integrity_faults(), 1);
+    }
+
+    #[test]
+    fn quiescent_teardown_reclaims_only_fill_frames() {
+        let registry = FrameRegistry::new(3, 4096, !(4096 - 1));
+        registry.take(FrameState::Fill).unwrap().unwrap();
+        registry.take(FrameState::Fill).unwrap().unwrap();
+
+        assert_eq!(registry.state_counts().fill, 2);
+        assert_eq!(registry.reclaim_fill_after_socket_close().unwrap(), 2);
+        assert_eq!(registry.state_counts().outstanding(), 0);
+        assert_eq!(registry.allocatable(), 3);
+    }
+
+    #[test]
+    fn quiescent_teardown_rejects_userspace_owned_frames() {
+        let registry = FrameRegistry::new(2, 4096, !(4096 - 1));
+        let (_, frame) = registry.take(FrameState::Rx).unwrap().unwrap();
+        registry.take(FrameState::Fill).unwrap().unwrap();
+
+        assert!(matches!(
+            registry.reclaim_fill_after_socket_close(),
+            Err(FrameError::OutstandingFrames { rx: 1, .. })
+        ));
+        assert_eq!(registry.state_counts().fill, 1);
+        registry.release(frame, FrameState::Rx).unwrap();
+        assert_eq!(registry.reclaim_fill_after_socket_close().unwrap(), 1);
+        assert_eq!(registry.state_counts().outstanding(), 0);
     }
 }
