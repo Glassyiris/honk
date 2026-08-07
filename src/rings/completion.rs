@@ -77,19 +77,19 @@ impl CompletionRing {
         umem: &Umem,
         batch_error: Option<FrameError>,
     ) -> Result<(), FrameError> {
-        if let Some(error) = batch_error {
-            self.next_quarantine.clear();
-            return Err(error);
-        }
+        preserve_failed_batch(&mut self.quarantine, &mut self.next_quarantine, batch_error)?;
 
         let mut release_error = None;
-        for frame in self.quarantine.drain(..) {
-            if let Err(error) = umem.release_completion(frame) {
+        self.quarantine.retain(|frame| {
+            if let Err(error) = umem.release_completion(*frame) {
                 release_error.get_or_insert(error);
+                true
+            } else {
+                false
             }
-        }
+        });
         if let Some(error) = release_error {
-            self.next_quarantine.clear();
+            self.quarantine.append(&mut self.next_quarantine);
             return Err(error);
         }
         std::mem::swap(&mut self.quarantine, &mut self.next_quarantine);
@@ -131,6 +131,18 @@ impl CompletionRing {
     }
 }
 
+fn preserve_failed_batch(
+    quarantine: &mut Vec<usize>,
+    next_quarantine: &mut Vec<usize>,
+    error: Option<FrameError>,
+) -> Result<(), FrameError> {
+    if let Some(error) = error {
+        quarantine.append(next_quarantine);
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn validate_completion_capacity(available: usize, capacity: usize) -> Result<(), FrameError> {
     if available > capacity {
         return Err(FrameError::CompletionBatchTooSmall {
@@ -156,5 +168,24 @@ mod tests {
                 capacity: 1
             })
         ));
+    }
+
+    #[test]
+    fn failed_batch_keeps_successful_completions_quarantined() {
+        let mut quarantine = vec![1];
+        let mut next = vec![2, 3];
+        let error = preserve_failed_batch(
+            &mut quarantine,
+            &mut next,
+            Some(FrameError::InvalidLength {
+                length: 65,
+                capacity: 64,
+            }),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, FrameError::InvalidLength { .. }));
+        assert_eq!(quarantine, vec![1, 2, 3]);
+        assert!(next.is_empty());
     }
 }
