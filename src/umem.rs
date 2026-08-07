@@ -131,29 +131,36 @@ impl Umem {
         let frame =
             self.registry
                 .transition_address(desc.addr, FrameState::Fill, FrameState::Rx)?;
-        let max_len = self.frame_size - self.head_room;
-        if desc.len as usize > max_len {
-            self.registry.release(frame, FrameState::Rx)?;
-            return Err(self.registry.record(FrameError::InvalidLength {
-                length: desc.len as usize,
-                capacity: max_len,
-            }));
-        }
-        let Some(data_offset) = desc.addr.checked_sub(self.head_room as u64) else {
+        let raw_frame_size = self.frame_size + libc::xdp::XDP_PACKET_HEADROOM as usize;
+        let frame_base = frame * raw_frame_size;
+        let data_offset = frame_base + libc::xdp::XDP_PACKET_HEADROOM as usize;
+        let data_end = data_offset + self.frame_size;
+        let descriptor_offset = desc.addr as usize;
+        if descriptor_offset < data_offset || descriptor_offset > data_end {
             self.registry.release(frame, FrameState::Rx)?;
             return Err(self.registry.record(FrameError::InvalidAddress {
                 address: desc.addr,
                 umem_len: self.mmap.len(),
             }));
-        };
+        }
 
-        // SAFETY: descriptor ownership and bounds were validated above.
+        let head = descriptor_offset - data_offset;
+        let available = data_end - descriptor_offset;
+        if desc.len as usize > available {
+            self.registry.release(frame, FrameState::Rx)?;
+            return Err(self.registry.record(FrameError::InvalidLength {
+                length: desc.len as usize,
+                capacity: available,
+            }));
+        }
+
+        // SAFETY: the descriptor range was validated inside its owning frame.
         let data = unsafe { self.mmap.ptr.byte_offset(data_offset as _) };
         Ok(Packet {
             data,
             capacity: self.frame_size,
-            head: self.head_room,
-            tail: self.head_room + desc.len as usize,
+            head,
+            tail: head + desc.len as usize,
             base: self.mmap.ptr,
             options: desc.options | self.options,
             registry: Some(NonNull::from(self.registry.as_ref())),
@@ -212,13 +219,16 @@ impl Umem {
             .map(|(address, _)| address + libc::xdp::XDP_PACKET_HEADROOM + self.head_room as u64))
     }
 
-    pub(crate) fn complete_addr(&self, address: u64) -> Result<(), FrameError> {
-        self.registry.complete(address).map(|_| ())
+    pub(crate) fn complete_addr(&self, address: u64) -> Result<usize, FrameError> {
+        self.registry.complete(address)
     }
 
-    /// Returns the completion timestamp and releases the transmitted frame.
+    /// Returns the completed frame and its transmit timestamp.
     #[inline]
-    pub(crate) fn free_get_timestamp(&self, address: u64) -> Result<u64, FrameError> {
+    pub(crate) fn get_completion_timestamp(
+        &self,
+        address: u64,
+    ) -> Result<(usize, u64), FrameError> {
         use libc::xdp::xsk_tx_metadata;
 
         let frame =
@@ -241,8 +251,11 @@ impl Umem {
             0
         };
 
-        self.registry.release(frame, FrameState::Completion)?;
-        Ok(timestamp)
+        Ok((frame, timestamp))
+    }
+
+    pub(crate) fn release_completion(&self, frame: usize) -> Result<(), FrameError> {
+        self.registry.release_completion(frame)
     }
 
     #[inline]
@@ -393,4 +406,69 @@ pub struct UmemCfg {
     frame_count: u32,
     head_room: u32,
     options: InternalXdpFlags::Enum,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config(frame_count: u32, head_room: u32) -> UmemCfg {
+        UmemCfgBuilder {
+            frame_count,
+            head_room,
+            ..UmemCfgBuilder::default()
+        }
+        .build()
+        .unwrap()
+    }
+
+    #[test]
+    fn adjusted_rx_descriptor_uses_stable_frame_base() {
+        let umem = Umem::map(test_config(1, 256)).unwrap();
+        let fill_address = umem.take_fill_addr().unwrap().unwrap();
+        let descriptor = xdp_desc {
+            addr: fill_address + 14,
+            len: 128,
+            options: 0,
+        };
+
+        // SAFETY: the packet is dropped before its UMEM.
+        let packet = unsafe { umem.packet(descriptor) }.unwrap();
+        assert_eq!(packet.head, 270);
+        assert_eq!(packet.len(), 128);
+        // SAFETY: the descriptor range was validated by Umem::packet.
+        assert_eq!(packet.as_ptr(), unsafe {
+            umem.mmap.ptr.add(descriptor.addr as usize)
+        });
+        drop(packet);
+        assert_eq!(umem.outstanding(), 0);
+    }
+
+    #[test]
+    fn rx_descriptor_cannot_cross_its_frame_boundary() {
+        let umem = Umem::map(test_config(2, 256)).unwrap();
+        let _first = umem.take_fill_addr().unwrap().unwrap();
+        let second = umem.take_fill_addr().unwrap().unwrap();
+        let frame_base = second & !(4096 - 1);
+        let descriptor = xdp_desc {
+            addr: frame_base + 4090,
+            len: 14,
+            options: 0,
+        };
+
+        // SAFETY: the malformed descriptor is rejected before a packet is exposed.
+        let error = match unsafe { umem.packet(descriptor) } {
+            Err(error) => error,
+            Ok(_) => panic!("cross-frame descriptor was accepted"),
+        };
+        assert!(matches!(
+            error,
+            FrameError::InvalidLength {
+                length: 14,
+                capacity: 6
+            }
+        ));
+        assert_eq!(umem.frame_state_counts().rx, 0);
+        assert_eq!(umem.integrity_faults(), 1);
+    }
 }

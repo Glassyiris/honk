@@ -84,6 +84,13 @@ pub enum FrameError {
         /// The maximum packet length for the frame.
         capacity: usize,
     },
+    /// A dequeue buffer could not cover every currently published completion.
+    CompletionBatchTooSmall {
+        /// Completion descriptors currently visible to userspace.
+        available: usize,
+        /// Descriptors the caller was prepared to consume.
+        capacity: usize,
+    },
     /// A frame did not have the owner required by an operation.
     InvalidTransition {
         /// The zero-based frame index.
@@ -124,6 +131,13 @@ impl fmt::Display for FrameError {
                     "descriptor length {length} exceeds frame capacity {capacity}"
                 )
             }
+            Self::CompletionBatchTooSmall {
+                available,
+                capacity,
+            } => write!(
+                f,
+                "completion batch has {available} descriptors but capacity is {capacity}"
+            ),
             Self::InvalidTransition {
                 frame,
                 expected,
@@ -305,11 +319,12 @@ impl FrameRegistry {
     }
 
     pub(crate) fn complete(&self, address: u64) -> Result<usize, FrameError> {
-        let frame = self.transition_address(address, FrameState::Tx, FrameState::Completion)?;
-        self.release(frame, FrameState::Completion)?;
-        Ok(frame)
+        self.transition_address(address, FrameState::Tx, FrameState::Completion)
     }
 
+    pub(crate) fn release_completion(&self, frame: usize) -> Result<(), FrameError> {
+        self.release(frame, FrameState::Completion)
+    }
     #[inline]
     pub(crate) fn integrity_faults(&self) -> u64 {
         self.integrity_faults.load(Ordering::Acquire)
@@ -349,7 +364,10 @@ mod tests {
         registry
             .transition(frame, FrameState::Rx, FrameState::Tx)
             .unwrap();
-        registry.complete(address + 256).unwrap();
+        let completed = registry.complete(address + 256).unwrap();
+        assert_eq!(completed, frame);
+        assert_eq!(registry.allocatable(), 1);
+        registry.release_completion(completed).unwrap();
 
         assert_eq!(registry.allocatable(), 2);
         assert!(matches!(
@@ -362,6 +380,28 @@ mod tests {
         ));
         assert_eq!(registry.allocatable(), 2);
         assert_eq!(registry.integrity_faults(), 1);
+    }
+
+    #[test]
+    fn duplicate_completion_is_rejected_before_frame_reuse() {
+        let registry = FrameRegistry::new(2, 4096, !(4096 - 1));
+        let (address, frame) = registry.take(FrameState::Rx).unwrap().unwrap();
+        registry
+            .transition(frame, FrameState::Rx, FrameState::Tx)
+            .unwrap();
+
+        let completed = registry.complete(address).unwrap();
+        assert!(matches!(
+            registry.complete(address),
+            Err(FrameError::InvalidTransition {
+                expected: FrameState::Tx,
+                actual: Some(FrameState::Completion),
+                ..
+            })
+        ));
+        assert_eq!(registry.allocatable(), 1);
+        registry.release_completion(completed).unwrap();
+        assert_eq!(registry.allocatable(), 2);
     }
 
     #[test]

@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Removed copyable packets and manual frame return APIs in favor of a checked `Free -> Fill -> Rx -> Tx -> Completion -> Free` lifecycle.
 - Made fill, RX, TX, and completion operations report descriptor and ownership failures.
 - Moved `XDP_RING_NEED_WAKEUP` decisions into the producer rings and report descriptors submitted before a wake syscall failure.
+- Validated each RX descriptor against its exact frame and quarantined completions through a full-ring drain before frame reuse.
 
 ### Added
 - Added kernel-reported copy/zero-copy bind mode through `XDP_OPTIONS`.

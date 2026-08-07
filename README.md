@@ -21,7 +21,7 @@ The primary difference between this crate and the other XSK/XDP crates available
 
 The `honk-linear-umem` branch is a deliberately source-incompatible fork for Honk's optional first-packet `AF_XDP` path. It pins the upstream `0.7.3` lineage while adding release-build frame ownership checks, automatic `XDP_RING_NEED_WAKEUP` handling, kernel-reported copy/zero-copy mode, and quiescent teardown accounting.
 
-Packets follow one checked lifecycle: `Free -> Fill -> Rx -> Tx -> Completion -> Free`. Packet cloning and manual address/free APIs are removed; unsubmitted packets return their frame on drop, while ring operations report foreign-UMEM, invalid-descriptor, duplicate-completion, and post-submission wake failures. Shared UMEM and multi-buffer support remain intentionally unavailable.
+Packets follow one checked lifecycle: `Free -> Fill -> Rx -> Tx -> Completion -> Free`. Packet cloning and manual address/free APIs are removed; unsubmitted packets return their frame on drop, RX descriptors are range-checked within their exact UMEM frame, and completion frames remain quarantined through a full-ring drain before reuse. Ring operations report foreign-UMEM, invalid-descriptor, duplicate-completion, partial-drain, and post-submission wake failures. Shared UMEM and multi-buffer support remain intentionally unavailable.
 
 ## Why not use this crate?
 

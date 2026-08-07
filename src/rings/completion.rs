@@ -6,6 +6,8 @@ use crate::{FrameError, Umem, libc::rings};
 /// The ring used to dequeue buffers that the kernel has finished sending
 pub struct CompletionRing {
     ring: super::XskConsumer<u64>,
+    quarantine: Vec<usize>,
+    next_quarantine: Vec<usize>,
     _mmap: crate::mmap::Mmap,
 }
 
@@ -31,57 +33,90 @@ impl CompletionRing {
 
         Ok(Self {
             ring: super::XskConsumer(ring),
+            quarantine: Vec::with_capacity(cfg.completion_count as usize),
+            next_quarantine: Vec::with_capacity(cfg.completion_count as usize),
             _mmap,
         })
     }
 
-    /// Dequeues up to `num_packets` and makes them available for use again
+    /// Dequeues every completion currently visible, up to `capacity`.
     ///
-    /// # Returns
-    ///
-    /// The number of packets that were actually dequeued.
-    pub fn dequeue(&mut self, umem: &Umem, num_packets: usize) -> Result<usize, FrameError> {
-        if num_packets == 0 {
-            return Ok(0);
-        }
-
-        let (actual, idx) = self.ring.peek(num_packets as _);
+    /// The operation fails without consuming descriptors when `capacity` is too
+    /// small. Completed frames remain quarantined until the next full drain
+    /// observes no stale duplicate before making those frames allocatable again.
+    pub fn dequeue(&mut self, umem: &Umem, capacity: usize) -> Result<usize, FrameError> {
+        let available = self.checked_available(capacity)?;
+        let (actual, idx) = self.ring.peek(available as u32);
+        debug_assert_eq!(actual, available);
+        debug_assert!(self.next_quarantine.is_empty());
         let mut first_error = None;
         for i in idx..idx + actual {
             let address = self.ring.get(i);
-            if let Err(error) = umem.complete_addr(address) {
-                first_error.get_or_insert(error);
+            match umem.complete_addr(address) {
+                Ok(frame) => self.next_quarantine.push(frame),
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
             }
         }
         if actual > 0 {
             self.ring.release(actual as _);
         }
-        if let Some(error) = first_error {
-            Err(error)
-        } else {
-            Ok(actual)
-        }
+        self.finish_batch(umem, first_error)?;
+        Ok(actual)
     }
 
-    /// The same as [`Self::dequeue`], except the timestamp each packet was
-    /// transmitted is written to the provided slice.
+    fn checked_available(&mut self, capacity: usize) -> Result<usize, FrameError> {
+        let available = self.ring.available(u32::MAX) as usize;
+        validate_completion_capacity(available, capacity)?;
+        Ok(available)
+    }
+
+    fn finish_batch(
+        &mut self,
+        umem: &Umem,
+        batch_error: Option<FrameError>,
+    ) -> Result<(), FrameError> {
+        if let Some(error) = batch_error {
+            self.next_quarantine.clear();
+            return Err(error);
+        }
+
+        let mut release_error = None;
+        for frame in self.quarantine.drain(..) {
+            if let Err(error) = umem.release_completion(frame) {
+                release_error.get_or_insert(error);
+            }
+        }
+        if let Some(error) = release_error {
+            self.next_quarantine.clear();
+            return Err(error);
+        }
+        std::mem::swap(&mut self.quarantine, &mut self.next_quarantine);
+        Ok(())
+    }
+
+    /// The same as [`Self::dequeue`], except the timestamp for each packet is
+    /// written to the provided slice.
     ///
-    /// Note this requires that [`crate::Packet::set_tx_metadata`] was called
+    /// Note this requires that [`crate::Packet::set_tx_metadata`] was called.
     pub fn dequeue_with_timestamps(
         &mut self,
         umem: &Umem,
         timestamps: &mut [u64],
     ) -> Result<usize, FrameError> {
-        if timestamps.is_empty() {
-            return Ok(0);
-        }
-
-        let (actual, idx) = self.ring.peek(timestamps.len() as _);
+        let available = self.checked_available(timestamps.len())?;
+        let (actual, idx) = self.ring.peek(available as u32);
+        debug_assert_eq!(actual, available);
+        debug_assert!(self.next_quarantine.is_empty());
         let mut first_error = None;
         for (timestamp, i) in timestamps.iter_mut().zip(idx..idx + actual) {
             let address = self.ring.get(i);
-            match umem.free_get_timestamp(address) {
-                Ok(value) => *timestamp = value,
+            match umem.get_completion_timestamp(address) {
+                Ok((frame, value)) => {
+                    self.next_quarantine.push(frame);
+                    *timestamp = value;
+                }
                 Err(error) => {
                     *timestamp = 0;
                     first_error.get_or_insert(error);
@@ -91,10 +126,35 @@ impl CompletionRing {
         if actual > 0 {
             self.ring.release(actual as _);
         }
-        if let Some(error) = first_error {
-            Err(error)
-        } else {
-            Ok(actual)
-        }
+        self.finish_batch(umem, first_error)?;
+        Ok(actual)
+    }
+}
+
+fn validate_completion_capacity(available: usize, capacity: usize) -> Result<(), FrameError> {
+    if available > capacity {
+        return Err(FrameError::CompletionBatchTooSmall {
+            available,
+            capacity,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_completion_batches_are_rejected() {
+        assert!(validate_completion_capacity(0, 0).is_ok());
+        assert!(validate_completion_capacity(4, 4).is_ok());
+        assert!(matches!(
+            validate_completion_capacity(2, 1),
+            Err(FrameError::CompletionBatchTooSmall {
+                available: 2,
+                capacity: 1
+            })
+        ));
     }
 }
