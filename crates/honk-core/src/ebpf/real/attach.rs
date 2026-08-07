@@ -87,7 +87,7 @@ impl RealEbpfBackend {
             use_redirect_peer,
             dae_socket_mark: DAE_BYPASS_MARK,
             control_plane_pid: std::process::id(),
-            local_ip: Self::iface_ipv4(local_ifname),
+            local_ip: Self::iface_ipv4(local_ifname).unwrap_or(0),
             ..Default::default()
         };
         debug!(
@@ -132,13 +132,8 @@ impl RealEbpfBackend {
                 outbound: OutboundIndex::ControlPlaneRouting as u8,
                 ..Default::default()
             };
-            bpf_hash_insert(
-                &mut bpf,
-                "ROUTING_MAP",
-                unsafe { as_bytes(&0u32) },
-                unsafe { as_bytes(&cold_start) },
-            )
-            .map_err(|e| anyhow::anyhow!("cold-start ROUTING_MAP init: {}", e))?;
+            set_array_value(&mut bpf, "ROUTING_MAP", 0, &cold_start)
+                .map_err(|e| anyhow::anyhow!("cold-start ROUTING_MAP init: {e}"))?;
 
             let bitmap = [1u32, 0, 0, 0];
             for group in 0..ROUTING_GROUP_COUNT as u32 {
@@ -146,45 +141,30 @@ impl RealEbpfBackend {
                     let slot = routing_meta_bitmap_base(generation)
                         + group * ROUTING_GROUP_BITMAP_WORDS as u32
                         + word as u32;
-                    bpf_hash_insert(
-                        &mut bpf,
-                        "ROUTING_META_MAP",
-                        unsafe { as_bytes(&slot) },
-                        unsafe { as_bytes(value) },
-                    )
-                    .map_err(|e| anyhow::anyhow!("cold-start ROUTING_META_MAP init: {}", e))?;
+                    set_array_value(&mut bpf, "ROUTING_META_MAP", slot, value)
+                        .map_err(|e| anyhow::anyhow!("cold-start ROUTING_META_MAP init: {e}"))?;
                 }
             }
             let count = 1u32;
             let count_slot = routing_meta_count_slot(generation);
-            bpf_hash_insert(
-                &mut bpf,
-                "ROUTING_META_MAP",
-                unsafe { as_bytes(&count_slot) },
-                unsafe { as_bytes(&count) },
-            )
-            .map_err(|e| anyhow::anyhow!("cold-start ROUTING_META_MAP init: {}", e))?;
+            set_array_value(&mut bpf, "ROUTING_META_MAP", count_slot, &count)
+                .map_err(|e| anyhow::anyhow!("cold-start ROUTING_META_MAP init: {e}"))?;
             for group in 0..ROUTING_GROUP_COUNT as u32 {
                 let index = routing_group_meta_index(generation, group);
                 let meta = RoutingGroupMeta {
                     rule_count: count,
                     bitmap,
                 };
-                bpf_hash_insert(
-                    &mut bpf,
-                    "ROUTING_GROUP_META_MAP",
-                    unsafe { as_bytes(&index) },
-                    unsafe { as_bytes(&meta) },
-                )
-                .map_err(|e| anyhow::anyhow!("cold-start ROUTING_GROUP_META_MAP init: {}", e))?;
+                set_array_value(&mut bpf, "ROUTING_GROUP_META_MAP", index, &meta)
+                    .map_err(|e| anyhow::anyhow!("cold-start ROUTING_GROUP_META_MAP init: {e}"))?;
             }
-            bpf_hash_insert(
+            set_array_value(
                 &mut bpf,
                 "ROUTING_META_MAP",
-                unsafe { as_bytes(&ROUTING_META_ACTIVE_GENERATION_SLOT) },
-                unsafe { as_bytes(&generation) },
+                ROUTING_META_ACTIVE_GENERATION_SLOT,
+                &generation,
             )
-            .map_err(|e| anyhow::anyhow!("cold-start routing selector init: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("cold-start routing selector init: {e}"))?;
         }
         // Attach cgroup programs to root cgroup2 for cookie→PID mapping.
         // This enables pname routing and control-plane traffic bypass (Go dae parity).
@@ -234,14 +214,9 @@ impl RealEbpfBackend {
         // This map is updated by health checks; until then we must not drop
         // proxy-bound traffic. Skipping entries here marks every outbound
         // dead, so an insert error aborts startup.
-        for i in 0..honk_ebpf_common::MAX_OUTBOUNDS * 6 {
-            bpf_hash_insert(
-                &mut bpf,
-                "OUTBOUND_CONNECTIVITY_MAP",
-                unsafe { as_bytes(&i) },
-                unsafe { as_bytes(&1u64) },
-            )
-            .map_err(|e| anyhow::anyhow!("OUTBOUND_CONNECTIVITY_MAP init: {}", e))?;
+        for index in 0..honk_ebpf_common::MAX_OUTBOUNDS * 6 {
+            set_array_value(&mut bpf, "OUTBOUND_CONNECTIVITY_MAP", index, &1u64)
+                .map_err(|e| anyhow::anyhow!("OUTBOUND_CONNECTIVITY_MAP init: {e}"))?;
         }
 
         if ebpf_lan_ifname.is_empty() {
@@ -260,50 +235,46 @@ impl RealEbpfBackend {
             }
         }
         let (lan_ingress_prog, lan_egress_prog) = Self::lan_program_pair(&ebpf_lan_ifname);
+        // Primary hooks share the watcher-owned table so an interface rebind
+        // can drop the old TCX fd before attaching its replacement.
+        let mut interface_links = Vec::new();
 
-        // Attach LAN programs and take ownership of the links so they stay alive
-        // and can be explicitly detached on shutdown.
-        let lan_ingress_link = if ebpf_lan_ifname.is_empty() {
-            None
-        } else {
-            let id = Self::attach_tc(&mut bpf, lan_ingress_prog, &ebpf_lan_ifname)
-                .map_err(|e| anyhow::anyhow!("attach {}: {}", lan_ingress_prog, e))?;
-            let p: &mut aya::programs::SchedClassifier = bpf
-                .program_mut(lan_ingress_prog)
-                .ok_or_else(|| anyhow::anyhow!("{} program disappeared", lan_ingress_prog))?
-                .try_into()?;
-            Some(p.take_link(id)?)
-        };
+        if !ebpf_lan_ifname.is_empty() {
+            interface_links.push(
+                Self::attach_tc_owned(
+                    &mut bpf,
+                    lan_ingress_prog,
+                    &ebpf_lan_ifname,
+                    aya::programs::TcAttachType::Ingress,
+                )
+                .map_err(|e| anyhow::anyhow!("attach {}: {}", lan_ingress_prog, e))?,
+            );
+        }
         // In a single-homed setup (LAN and WAN share the same physical
         // interface) attaching lan_egress to the host's only outbound interface
         // would drop the host's own traffic. Attach only ingress in that case.
-        let lan_egress_link = if ebpf_lan_ifname.is_empty() {
-            None
-        } else if single_homed {
-            info!("Single-homed interface detected; skipping lan_egress attach");
-            None
-        } else {
-            let id = Self::attach_tc_at(
-                &mut bpf,
-                lan_egress_prog,
-                &ebpf_lan_ifname,
-                aya::programs::TcAttachType::Egress,
-            )
-            .map_err(|e| anyhow::anyhow!("attach {}: {}", lan_egress_prog, e))?;
-            let p: &mut aya::programs::SchedClassifier = bpf
-                .program_mut(lan_egress_prog)
-                .ok_or_else(|| anyhow::anyhow!("{} program disappeared", lan_egress_prog))?
-                .try_into()?;
-            Some(p.take_link(id)?)
-        };
+        if !ebpf_lan_ifname.is_empty() {
+            if single_homed {
+                info!("Single-homed interface detected; skipping lan_egress attach");
+            } else {
+                interface_links.push(
+                    Self::attach_tc_owned(
+                        &mut bpf,
+                        lan_egress_prog,
+                        &ebpf_lan_ifname,
+                        aya::programs::TcAttachType::Egress,
+                    )
+                    .map_err(|e| anyhow::anyhow!("attach {}: {}", lan_egress_prog, e))?,
+                );
+            }
+        }
 
         // Attach WAN egress program to intercept locally-generated traffic.
         // In single-homed setups the WAN and LAN share the same interface, so
         // we attach wan_egress there (lan_egress is skipped above to avoid
         // interfering with host traffic).
-        let wan_egress_link = if ebpf_wan_ifname.is_empty() {
+        if ebpf_wan_ifname.is_empty() {
             warn!("WAN interface name is empty; skipping wan_egress attach");
-            None
         } else {
             if let Err(e) = aya::programs::tc::qdisc_add_clsact(&ebpf_wan_ifname) {
                 let msg = e.to_string();
@@ -311,34 +282,22 @@ impl RealEbpfBackend {
                     warn!("failed to add clsact qdisc to {}: {}", ebpf_wan_ifname, e);
                 }
             }
-            // Choose the L2/L3 variant by interface type (Go dae mapLinkType
-            // semantics): ARPHRD_ETHER interfaces (incl. bond masters) carry
-            // fully-framed packets at TC egress — neigh_output runs
-            // dev_hard_header before dev_queue_xmit, so the Ethernet header
-            // is already present when the TC hook fires.  Only genuinely
-            // headerless interfaces (PPP/tun/IPIP) get the L3 program.
+
             let wan_egress_prog = if Self::iface_is_ethernet(&ebpf_wan_ifname) {
                 "wan_egress_l2"
             } else {
                 "wan_egress_l3"
             };
-            let id = Self::attach_tc_at(
-                &mut bpf,
-                wan_egress_prog,
-                &ebpf_wan_ifname,
-                aya::programs::TcAttachType::Egress,
-            )
-            .map_err(|e| anyhow::anyhow!("attach {}: {}", wan_egress_prog, e))?;
-            let p: &mut aya::programs::SchedClassifier = bpf
-                .program_mut(wan_egress_prog)
-                .ok_or_else(|| anyhow::anyhow!("{} program disappeared", wan_egress_prog))?
-                .try_into()?;
-            info!(
-                "attached '{}' to {} (Egress)",
-                wan_egress_prog, ebpf_wan_ifname
+            interface_links.push(
+                Self::attach_tc_owned(
+                    &mut bpf,
+                    wan_egress_prog,
+                    &ebpf_wan_ifname,
+                    aya::programs::TcAttachType::Egress,
+                )
+                .map_err(|e| anyhow::anyhow!("attach {}: {}", wan_egress_prog, e))?,
             );
-            Some(p.take_link(id)?)
-        };
+        }
 
         // Attach the WAN ingress program so replies arriving from the WAN
         // refresh the reverse-direction conntrack state (the datapath's
@@ -352,39 +311,27 @@ impl RealEbpfBackend {
         // Single-homed setups share one interface between LAN and WAN and
         // lan_ingress already owns that ingress hook, so wan_ingress is
         // skipped there (mirroring the lan_egress skip above).
-        let wan_ingress_link = if single_homed {
+        if single_homed {
             info!("Single-homed interface detected; skipping wan_ingress attach");
-            None
-        } else if ebpf_wan_ifname.is_empty() {
-            // Already warned in the wan_egress block above.
-            None
-        } else {
+        } else if !ebpf_wan_ifname.is_empty() {
             let wan_ingress_prog = if Self::iface_is_ethernet(&ebpf_wan_ifname) {
                 "wan_ingress_l2"
             } else {
                 "wan_ingress_l3"
             };
-            let id = Self::attach_tc(&mut bpf, wan_ingress_prog, &ebpf_wan_ifname)
-                .map_err(|e| anyhow::anyhow!("attach {}: {}", wan_ingress_prog, e))?;
-            let p: &mut aya::programs::SchedClassifier = bpf
-                .program_mut(wan_ingress_prog)
-                .ok_or_else(|| anyhow::anyhow!("{} program disappeared", wan_ingress_prog))?
-                .try_into()?;
-            info!(
-                "attached '{}' to {} (Ingress)",
-                wan_ingress_prog, ebpf_wan_ifname
+            interface_links.push(
+                Self::attach_tc_owned(
+                    &mut bpf,
+                    wan_ingress_prog,
+                    &ebpf_wan_ifname,
+                    aya::programs::TcAttachType::Ingress,
+                )
+                .map_err(|e| anyhow::anyhow!("attach {}: {}", wan_ingress_prog, e))?,
             );
-            Some(p.take_link(id)?)
-        };
+        }
 
         // For bridge masters, forwarded L2 traffic does not traverse the
-        // master's TC hooks; it is switched directly between slave ports.
-        // Attach the LAN programs to each bridge slave so container traffic
-        // is intercepted.
-        // Slave links go into `dynamic_links` (keyed by ifindex/direction):
-        // without that the watcher's `dynamic_hooked` dedup never sees them
-        // and retries the attach every tick, failing with AlreadyExists.
-        let mut dynamic_links = Vec::new();
+        // master's TC hooks; attach the LAN programs to every slave.
         let br_slaves = if ebpf_lan_ifname.is_empty() {
             Vec::new()
         } else {
@@ -412,51 +359,39 @@ impl RealEbpfBackend {
                 } else {
                     "lan_ingress_l3"
                 };
-                let ingress_result: anyhow::Result<()> = (|| {
-                    let p: &mut aya::programs::SchedClassifier = bpf
-                        .program_mut(slave_prog)
-                        .ok_or_else(|| anyhow::anyhow!("{} program disappeared", slave_prog))?
-                        .try_into()?;
-                    let id = p.attach(slave, ingress_dir).map_err(|e| {
-                        anyhow::anyhow!("attach {} to {}: {}", slave_prog, slave, e)
-                    })?;
-                    dynamic_links.push((Self::iface_ifindex(slave), false, p.take_link(id)?));
-                    Ok(())
-                })();
                 // A slave we cannot attach silently leaves that traffic
                 // outside the proxy — abort rather than run half-covered.
-                ingress_result.map_err(|e| {
-                    anyhow::anyhow!("attach {} to bridge slave {}: {}", slave_prog, slave, e)
-                })?;
+                interface_links.push(
+                    Self::attach_tc_owned(&mut bpf, slave_prog, slave, ingress_dir).map_err(
+                        |e| {
+                            anyhow::anyhow!(
+                                "attach {} to bridge slave {}: {}",
+                                slave_prog,
+                                slave,
+                                e
+                            )
+                        },
+                    )?,
+                );
                 info!(
                     "attached {} to bridge slave {} (Ingress)",
                     slave_prog, slave
                 );
 
-                let egress_result: anyhow::Result<()> = (|| {
-                    let p: &mut aya::programs::SchedClassifier = bpf
-                        .program_mut("lan_egress_l2")
-                        .ok_or_else(|| anyhow::anyhow!("lan_egress_l2 program disappeared"))?
-                        .try_into()?;
-                    let id = p
-                        .attach(slave, egress_dir)
-                        .map_err(|e| anyhow::anyhow!("attach lan_egress_l2 to {}: {}", slave, e))?;
-                    dynamic_links.push((Self::iface_ifindex(slave), true, p.take_link(id)?));
-                    Ok(())
-                })();
-                egress_result.map_err(|e| {
-                    anyhow::anyhow!("attach lan_egress_l2 to bridge slave {}: {}", slave, e)
-                })?;
+                interface_links.push(
+                    Self::attach_tc_owned(&mut bpf, "lan_egress_l2", slave, egress_dir).map_err(
+                        |e| {
+                            anyhow::anyhow!("attach lan_egress_l2 to bridge slave {}: {}", slave, e)
+                        },
+                    )?,
+                );
                 info!("attached lan_egress_l2 to bridge slave {} (Egress)", slave);
             }
         }
 
-        // For bond masters, packets may be delivered on the slave interfaces
-        // before they are aggregated onto the master. Attach lan_ingress to
-        // each slave so we do not miss downstream traffic.  Like bridge
-        // slaves above, the links go into `dynamic_links` so the watcher's
-        // `dynamic_hooked` dedup sees them and does not stack a duplicate
-        // hook on the first reconcile.
+        // Bond slaves can receive packets before the master; keep their
+        // startup links in the same ownership table so watcher retries only
+        // a missing direction.
         let lan_slaves = if ebpf_lan_ifname.is_empty() {
             Vec::new()
         } else {
@@ -479,20 +414,11 @@ impl RealEbpfBackend {
                 } else {
                     "lan_ingress_l3"
                 };
-                let attach_result: anyhow::Result<()> = (|| {
-                    let p: &mut aya::programs::SchedClassifier = bpf
-                        .program_mut(slave_prog)
-                        .ok_or_else(|| anyhow::anyhow!("{} program disappeared", slave_prog))?
-                        .try_into()?;
-                    let id = p.attach(slave, slave_dir).map_err(|e| {
-                        anyhow::anyhow!("attach {} to {}: {}", slave_prog, slave, e)
-                    })?;
-                    dynamic_links.push((Self::iface_ifindex(slave), false, p.take_link(id)?));
-                    Ok(())
-                })();
-                attach_result.map_err(|e| {
-                    anyhow::anyhow!("attach lan_ingress to bond slave {}: {}", slave, e)
-                })?;
+                interface_links.push(
+                    Self::attach_tc_owned(&mut bpf, slave_prog, slave, slave_dir).map_err(|e| {
+                        anyhow::anyhow!("attach lan_ingress to bond slave {}: {}", slave, e)
+                    })?,
+                );
                 info!("attached lan_ingress to bond slave {}", slave);
             }
         }
@@ -521,20 +447,11 @@ impl RealEbpfBackend {
                 // their TC egress hook (the bond driver has already built
                 // the Ethernet header), so use the L2 program.
                 let slave_prog = "wan_egress_l2";
-                let attach_result: anyhow::Result<()> = (|| {
-                    let p: &mut aya::programs::SchedClassifier = bpf
-                        .program_mut(slave_prog)
-                        .ok_or_else(|| anyhow::anyhow!("{} program disappeared", slave_prog))?
-                        .try_into()?;
-                    let id = p.attach(slave, slave_dir).map_err(|e| {
-                        anyhow::anyhow!("attach {} to {}: {}", slave_prog, slave, e)
-                    })?;
-                    dynamic_links.push((Self::iface_ifindex(slave), true, p.take_link(id)?));
-                    Ok(())
-                })();
-                attach_result.map_err(|e| {
-                    anyhow::anyhow!("attach wan_egress to bond slave {}: {}", slave, e)
-                })?;
+                interface_links.push(
+                    Self::attach_tc_owned(&mut bpf, slave_prog, slave, slave_dir).map_err(|e| {
+                        anyhow::anyhow!("attach wan_egress to bond slave {}: {}", slave, e)
+                    })?,
+                );
                 info!("attached wan_egress to bond slave {}", slave);
             }
         }
@@ -626,11 +543,7 @@ impl RealEbpfBackend {
             pin_root: pin_root.to_path_buf(),
             tproxy_port,
             tproxy_mark,
-            lan_ingress_link,
-            lan_egress_link,
-            wan_egress_link,
-            wan_ingress_link,
-            dynamic_links,
+            interface_links,
             cgroup_sock_links,
             cgroup_sock_addr_links,
             dae0_ingress_link: None,
@@ -674,6 +587,25 @@ impl RealEbpfBackend {
         Ok(id)
     }
 
+    /// Attach a TC program and transfer the resulting link into the common
+    /// (ifindex, direction, link) ownership shape used by startup and rebinds.
+    fn attach_tc_owned(
+        bpf: &mut Ebpf,
+        prog: &str,
+        iface: &str,
+        dir: aya::programs::TcAttachType,
+    ) -> anyhow::Result<(u32, bool, aya::programs::tc::SchedClassifierLink)> {
+        let ifindex = Self::iface_ifindex(iface);
+        let id = Self::attach_tc_at(bpf, prog, iface, dir)?;
+        let p: &mut aya::programs::SchedClassifier = bpf
+            .program_mut(prog)
+            .ok_or_else(|| anyhow::anyhow!("{} program disappeared", prog))?
+            .try_into()?;
+        let link = p.take_link(id)?;
+        let is_egress = matches!(dir, aya::programs::TcAttachType::Egress);
+        Ok((ifindex, is_egress, link))
+    }
+
     pub fn attach_tc(
         bpf: &mut Ebpf,
         prog: &str,
@@ -707,33 +639,15 @@ impl RealEbpfBackend {
 
     /// Read the IPv4 address of an interface in big-endian u32, or 0
     /// (getifaddrs — no `ip` subprocess needed).
-    fn iface_ipv4(iface: &str) -> u32 {
-        // SAFETY: getifaddrs allocates a linked list freed by freeifaddrs;
-        // all pointers are checked before dereference.
-        unsafe {
-            let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
-            if libc::getifaddrs(&mut head) != 0 {
-                return 0;
+    fn iface_ipv4(iface: &str) -> Option<u32> {
+        nix::ifaddrs::getifaddrs().ok()?.find_map(|ifa| {
+            if ifa.interface_name != iface {
+                return None;
             }
-            let mut result = 0u32;
-            let mut cur = head;
-            while !cur.is_null() {
-                let ifa = &*cur;
-                let name = std::ffi::CStr::from_ptr(ifa.ifa_name).to_string_lossy();
-                if name == iface
-                    && !ifa.ifa_addr.is_null()
-                    && (*ifa.ifa_addr).sa_family as i32 == libc::AF_INET
-                {
-                    result = (*(ifa.ifa_addr as *const libc::sockaddr_in))
-                        .sin_addr
-                        .s_addr;
-                    break;
-                }
-                cur = ifa.ifa_next;
-            }
-            libc::freeifaddrs(head);
-            result
-        }
+            ifa.address?
+                .as_sockaddr_in()
+                .map(|sock| u32::from_ne_bytes(sock.ip().octets()))
+        })
     }
 
     /// Read the kernel ifindex for an interface, or 0 if it cannot be read.
@@ -788,21 +702,13 @@ impl RealEbpfBackend {
         iface: &str,
         dir: aya::programs::TcAttachType,
     ) -> anyhow::Result<()> {
-        let ifindex = Self::iface_ifindex(iface);
-        let id = Self::attach_tc_at(self.bpf_mut()?, prog, iface, dir)?;
-        let p: &mut aya::programs::SchedClassifier = self
-            .bpf_mut()?
-            .program_mut(prog)
-            .ok_or_else(|| anyhow::anyhow!("{} program disappeared", prog))?
-            .try_into()?;
-        let link = p.take_link(id)?;
-        let is_egress = matches!(dir, aya::programs::TcAttachType::Egress);
-        self.dynamic_links.push((ifindex, is_egress, link));
+        let link = Self::attach_tc_owned(self.bpf_mut()?, prog, iface, dir)?;
+        self.interface_links.push(link);
         Ok(())
     }
 
-    fn dynamic_hooked(&self, ifindex: u32, is_egress: bool) -> bool {
-        self.dynamic_links
+    fn interface_hooked(&self, ifindex: u32, is_egress: bool) -> bool {
+        self.interface_links
             .iter()
             .any(|(i, e, _)| *i == ifindex && *e == is_egress)
     }
@@ -821,8 +727,8 @@ impl RealEbpfBackend {
         let ifindex = Self::iface_ifindex(&ifname);
         let (ingress_prog, egress_prog) = Self::lan_program_pair(&ifname);
         let mut hooks = crate::ebpf::DynamicHooks {
-            ingress: self.dynamic_hooked(ifindex, false),
-            egress: self.dynamic_hooked(ifindex, true),
+            ingress: self.interface_hooked(ifindex, false),
+            egress: self.interface_hooked(ifindex, true),
         };
         if !hooks.ingress {
             self.attach_tc_tracked(ingress_prog, &ifname, aya::programs::TcAttachType::Ingress)?;
@@ -839,7 +745,7 @@ impl RealEbpfBackend {
     pub fn attach_wan_egress(&mut self, ifname: &str) -> anyhow::Result<()> {
         info!("Attaching WAN egress to additional interface: {}", ifname);
         let _ = aya::programs::tc::qdisc_add_clsact(ifname);
-        if self.dynamic_hooked(Self::iface_ifindex(ifname), true) {
+        if self.interface_hooked(Self::iface_ifindex(ifname), true) {
             return Ok(());
         }
         let prog = if Self::iface_is_ethernet(ifname) {
@@ -856,7 +762,7 @@ impl RealEbpfBackend {
     pub fn attach_wan_ingress(&mut self, ifname: &str) -> anyhow::Result<()> {
         info!("Attaching WAN ingress to additional interface: {}", ifname);
         let _ = aya::programs::tc::qdisc_add_clsact(ifname);
-        if self.dynamic_hooked(Self::iface_ifindex(ifname), false) {
+        if self.interface_hooked(Self::iface_ifindex(ifname), false) {
             return Ok(());
         }
         let prog = if Self::iface_is_ethernet(ifname) {
@@ -883,8 +789,8 @@ impl RealEbpfBackend {
         let _ = aya::programs::tc::qdisc_add_clsact(ifname);
         let ifindex = Self::iface_ifindex(ifname);
         let mut hooks = crate::ebpf::DynamicHooks {
-            ingress: self.dynamic_hooked(ifindex, false),
-            egress: self.dynamic_hooked(ifindex, true),
+            ingress: self.interface_hooked(ifindex, false),
+            egress: self.interface_hooked(ifindex, true),
         };
         let ingress_prog = if Self::iface_is_ethernet(ifname) {
             "lan_ingress_l2"

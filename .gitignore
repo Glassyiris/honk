@@ -56,3 +56,7 @@ yacd/
 AGENTS.md
 
 docs
+.zed
+results
+.sisyphus
+.expect

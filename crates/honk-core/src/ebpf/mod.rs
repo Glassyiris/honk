@@ -64,7 +64,7 @@ pub struct LpmKeepSet {
 /// chunk boundary (used to enforce the janitor time budget).
 pub type ConnStateChunkVisitor<'a> = dyn FnMut(&[(TuplesKey, ConnState)]) -> bool + 'a;
 pub type RedirectTrackChunkVisitor<'a> = dyn FnMut(&[(RedirectTuple, RedirectEntry)]) -> bool + 'a;
-pub type CookiePidChunkVisitor<'a> = dyn FnMut(&[(u64, PidPname)]) -> bool + 'a;
+pub type CookiePidChunkVisitor<'a> = dyn FnMut(&[(u64, PIDName)]) -> bool + 'a;
 pub type RoutingHandoffChunkVisitor<'a> =
     dyn FnMut(&[(TuplesKey, RoutingHandoffEntry)]) -> bool + 'a;
 
@@ -444,8 +444,8 @@ pub trait EbpfBackend: Send + Sync {
     /// `cleanup()`, which takes the write lock.
     fn routing_handoff_take(&self, key: &TuplesKey) -> anyhow::Result<Option<RoutingHandoffEntry>>;
 
-    fn cookie_pid_lookup(&self, cookie: u64) -> anyhow::Result<Option<PidPname>>;
-    fn cookie_pid_store(&mut self, cookie: u64, entry: &PidPname) -> anyhow::Result<()>;
+    fn cookie_pid_lookup(&self, cookie: u64) -> anyhow::Result<Option<PIDName>>;
+    fn cookie_pid_store(&mut self, cookie: u64, entry: &PIDName) -> anyhow::Result<()>;
     fn cookie_pid_remove(&mut self, cookie: &u64) -> anyhow::Result<()>;
 
     fn set_outbound_alive(
@@ -506,7 +506,7 @@ pub trait EbpfBackend: Send + Sync {
         &self,
         out: &mut Vec<(RedirectTuple, RedirectEntry)>,
     ) -> anyhow::Result<()>;
-    fn cookie_pid_snapshot(&self, out: &mut Vec<(u64, PidPname)>) -> anyhow::Result<()>;
+    fn cookie_pid_snapshot(&self, out: &mut Vec<(u64, PIDName)>) -> anyhow::Result<()>;
     fn routing_handoff_snapshot(
         &self,
         out: &mut Vec<(TuplesKey, RoutingHandoffEntry)>,
@@ -577,7 +577,7 @@ pub trait EbpfBackend: Send + Sync {
     ) -> anyhow::Result<u64>;
     fn cookie_pid_remove_if_unchanged(
         &mut self,
-        entries: &[(u64, PidPname)],
+        entries: &[(u64, PIDName)],
         expired_before_ns: u64,
     ) -> anyhow::Result<u64>;
     fn routing_handoff_remove_if_unchanged(

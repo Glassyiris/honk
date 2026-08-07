@@ -284,10 +284,10 @@ impl Node {
             NodeProtocol::Hysteria2 | NodeProtocol::Tuic | NodeProtocol::Juicity
         ) && let Some(v) = query.get("mtu")
             && let Ok(mtu) = v.parse::<u16>()
-                && (1200..=65527).contains(&mtu)
-            {
-                node.quic_mtu = Some(mtu);
-            }
+            && (1200..=65527).contains(&mtu)
+        {
+            node.quic_mtu = Some(mtu);
+        }
 
         if protocol == NodeProtocol::Tuic {
             // QUIC flow-control knobs (same spelling as the hy2 fields).

@@ -1,26 +1,30 @@
+//! Raw extensions for BPF map commands that Aya 0.14 does not expose.
+//!
+//! Ordinary map reads, writes, deletes, iteration, and per-CPU access use
+//! Aya's typed map APIs in `real::mod`. This module is limited to atomic
+//! lookup-and-delete and Linux batch commands, while retaining Aya `Pod`
+//! bounds so callers cannot pass arbitrary wire layouts.
+
 use super::*;
 
-// We use `libc::syscall(libc::SYS_bpf, ...)` because libc 0.2 does not
-// expose a dedicated `bpf()` wrapper.  Constants come from `aya-obj`
-// (already a transitive dependency).
-
+use aya::Pod;
 use aya_obj::generated::bpf_attr;
 use aya_obj::generated::bpf_cmd::*;
 use std::ffi::c_long;
+use std::mem::MaybeUninit;
 
-pub const ENOENT: c_long = libc::ENOENT as c_long;
+const ENOENT: c_long = libc::ENOENT as c_long;
+pub const BPF_BATCH_CHUNK: usize = 128;
 
-/// Callback invoked once per batch chunk by [`bpf_lookup_batch_scan_cb`].
-/// Returning `false` stops the scan early.
+pub enum LookupAndDelete<V> {
+    Unsupported,
+    Missing,
+    Value(V),
+}
+
 pub type BatchVisitor<'a, K, V> = dyn FnMut(&[(K, V)]) -> bool + 'a;
 
-/// Call the `bpf()` syscall.  Returns `Ok(())` on success, `Err(errno)`.
-///
-/// # Safety
-///
-/// `attr` must point to a live `bpf_attr` appropriate for `cmd` for the
-/// duration of the call.
-pub unsafe fn bpf_syscall(cmd: c_long, attr: &mut bpf_attr) -> Result<(), c_long> {
+pub(super) unsafe fn bpf_syscall(cmd: c_long, attr: &mut bpf_attr) -> Result<(), c_long> {
     let ret = unsafe {
         libc::syscall(
             libc::SYS_bpf,
@@ -30,33 +34,15 @@ pub unsafe fn bpf_syscall(cmd: c_long, attr: &mut bpf_attr) -> Result<(), c_long
         )
     };
     if ret < 0 {
-        Err(unsafe { *libc::__errno_location() } as c_long)
+        Err(std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO) as c_long)
     } else {
         Ok(())
     }
 }
 
-/// Reinterpret a POD value as its raw bytes.
-///
-/// # Safety
-///
-/// `T` must be valid to view as bytes (no padding-sensitive invariants);
-/// used only with the `#[repr(C)]` wire types.
-pub unsafe fn as_bytes<T: Sized>(t: &T) -> &[u8] {
-    unsafe { core::slice::from_raw_parts(t as *const T as *const u8, core::mem::size_of::<T>()) }
-}
-
-/// Read a `T` out of a raw byte slice, possibly unaligned.
-///
-/// # Safety
-///
-/// `bytes` must be at least `size_of::<T>()` long and hold a valid `T`.
-pub unsafe fn from_bytes<T: Sized + Copy>(bytes: &[u8]) -> T {
-    unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const T) }
-}
-
-/// Extract the raw file descriptor from any `aya::maps::Map` variant.
-pub fn map_raw_fd(map: &aya::maps::Map) -> anyhow::Result<RawFd> {
+fn map_raw_fd(map: &aya::maps::Map) -> RawFd {
     use aya::maps::Map;
     let data: &aya::maps::MapData = match map {
         Map::Array(d)
@@ -90,183 +76,61 @@ pub fn map_raw_fd(map: &aya::maps::Map) -> anyhow::Result<RawFd> {
         | Map::Unsupported(d)
         | Map::XskMap(d) => d,
     };
-    Ok(data.fd().as_fd().as_raw_fd())
+    data.fd().as_fd().as_raw_fd()
 }
 
-pub fn map_fd(bpf: &Ebpf, name: &str) -> anyhow::Result<RawFd> {
-    map_raw_fd(
-        bpf.map(name)
-            .ok_or_else(|| anyhow::anyhow!("map '{}' not found", name))?,
-    )
+fn map_fd(bpf: &Ebpf, name: &str) -> anyhow::Result<RawFd> {
+    bpf.map(name)
+        .map(map_raw_fd)
+        .ok_or_else(|| anyhow::anyhow!("map '{name}' not found"))
 }
 
-pub fn map_fd_mut(bpf: &mut Ebpf, name: &str) -> anyhow::Result<RawFd> {
-    map_raw_fd(
-        bpf.map_mut(name)
-            .ok_or_else(|| anyhow::anyhow!("map '{}' not found", name))?,
-    )
-}
-
-pub const BPF_ANY: u64 = 0;
-
-pub fn bpf_hash_insert(bpf: &mut Ebpf, map: &str, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
-    let fd = map_fd_mut(bpf, map)?;
-    let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
-    attr.__bindgen_anon_2.map_fd = fd as u32;
-    attr.__bindgen_anon_2.key = key.as_ptr() as u64;
-    attr.__bindgen_anon_2.__bindgen_anon_1.value = value.as_ptr() as u64;
-    attr.__bindgen_anon_2.flags = BPF_ANY;
-    unsafe {
-        bpf_syscall(BPF_MAP_UPDATE_ELEM as c_long, &mut attr)
-            .map_err(|e| anyhow::anyhow!("bpf update({}) errno={}", map, e))?;
-    }
-    Ok(())
-}
-
-pub fn bpf_hash_insert_domain(
-    bpf: &mut Ebpf,
-    map: &str,
-    key: &[u8],
-    value: &[u8],
-) -> Result<(), super::super::DomainRouteWriteError> {
-    let fd = map_fd_mut(bpf, map).map_err(super::super::DomainRouteWriteError::Other)?;
-    let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
-    attr.__bindgen_anon_2.map_fd = fd as u32;
-    attr.__bindgen_anon_2.key = key.as_ptr() as u64;
-    attr.__bindgen_anon_2.__bindgen_anon_1.value = value.as_ptr() as u64;
-    attr.__bindgen_anon_2.flags = BPF_ANY;
-    match unsafe { bpf_syscall(BPF_MAP_UPDATE_ELEM as c_long, &mut attr) } {
-        Ok(()) => Ok(()),
-        Err(errno) if errno == libc::ENOSPC as c_long => {
-            Err(super::super::DomainRouteWriteError::MapFull)
-        }
-        Err(errno) => Err(super::super::DomainRouteWriteError::Other(anyhow::anyhow!(
-            "bpf update({}) errno={}",
-            map,
-            errno
-        ))),
-    }
-}
-
-pub fn bpf_hash_lookup(
-    bpf: &Ebpf,
-    map: &str,
-    key: &[u8],
-    buf: &mut [u8],
-) -> anyhow::Result<Option<()>> {
-    let fd = map_fd(bpf, map)?;
-    let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
-    attr.__bindgen_anon_2.map_fd = fd as u32;
-    attr.__bindgen_anon_2.key = key.as_ptr() as u64;
-    attr.__bindgen_anon_2.__bindgen_anon_1.value = buf.as_mut_ptr() as u64;
-    match unsafe { bpf_syscall(BPF_MAP_LOOKUP_ELEM as c_long, &mut attr) } {
-        Ok(()) => Ok(Some(())),
-        Err(ENOENT) => Ok(None),
-        Err(e) => Err(anyhow::anyhow!("bpf lookup({}) errno={}", map, e)),
-    }
-}
-
-pub fn bpf_hash_delete(bpf: &Ebpf, map: &str, key: &[u8]) -> anyhow::Result<()> {
-    let fd = map_fd(bpf, map)?;
-    let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
-    attr.__bindgen_anon_2.map_fd = fd as u32;
-    attr.__bindgen_anon_2.key = key.as_ptr() as u64;
-    match unsafe { bpf_syscall(BPF_MAP_DELETE_ELEM as c_long, &mut attr) } {
-        Ok(()) | Err(ENOENT) => Ok(()),
-        Err(e) => Err(anyhow::anyhow!("bpf delete({}) errno={}", map, e)),
-    }
-}
-
-pub fn bpf_map_keys(bpf: &Ebpf, map: &str, key_size: usize) -> anyhow::Result<Vec<Vec<u8>>> {
-    let fd = map_fd(bpf, map)?;
-    let mut keys: Vec<Vec<u8>> = Vec::new();
-    loop {
-        let mut next = vec![0u8; key_size];
-        let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
-        attr.__bindgen_anon_2.map_fd = fd as u32;
-        // The previous key always lives in the last slot of `keys`.  The
-        // pointer is re-derived every iteration (a push may reallocate the
-        // outer Vec), so no per-key clone is needed.
-        attr.__bindgen_anon_2.key = keys.last().map_or(0, |k| k.as_ptr() as u64);
-        attr.__bindgen_anon_2.__bindgen_anon_1.next_key = next.as_mut_ptr() as u64;
-        match unsafe { bpf_syscall(BPF_MAP_GET_NEXT_KEY as c_long, &mut attr) } {
-            Ok(()) => keys.push(next),
-            Err(ENOENT) => break,
-            Err(e) => return Err(anyhow::anyhow!("bpf get_next_key({}) errno={}", map, e)),
-        }
-    }
-    Ok(keys)
-}
-
-// aya 0.14 does not wrap these commands, so they go through the same raw
-// bpf() layer as the single-element helpers.  Each command's availability
-// is probed once per backend via `BatchCapability` (see `ebpf::probe`):
-// the first call tries the batch command and latches the verdict; when the
-// kernel lacks it the callers below transparently fall back to the
-// per-element paths.
-
-/// Entries per chunk for the batched scan/delete helpers.
-pub const BPF_BATCH_CHUNK: usize = 128;
-
-/// Try `BPF_MAP_LOOKUP_AND_DELETE_ELEM` (hash maps, kernel 4.20+).
-///
-/// Returns `Ok(Some(true))` when the entry was found (and deleted; its
-/// value is in `buf`), `Ok(Some(false))` on a miss, `Ok(None)` when the
-/// kernel lacks the command (Unsupported latched — caller must fall back),
-/// and `Err` on a real failure.
-pub fn bpf_lookup_and_delete(
+pub fn bpf_lookup_and_delete<K: Pod, V: Pod>(
     bpf: &Ebpf,
     cap: &BatchCapability,
     map: &str,
-    key: &[u8],
-    buf: &mut [u8],
-) -> anyhow::Result<Option<bool>> {
+    key: &K,
+) -> anyhow::Result<LookupAndDelete<V>> {
     if cap.is_unsupported() {
-        return Ok(None);
+        return Ok(LookupAndDelete::Unsupported);
     }
     let fd = map_fd(bpf, map)?;
+    let mut value = MaybeUninit::<V>::uninit();
     let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
     attr.__bindgen_anon_2.map_fd = fd as u32;
-    attr.__bindgen_anon_2.key = key.as_ptr() as u64;
-    attr.__bindgen_anon_2.__bindgen_anon_1.value = buf.as_mut_ptr() as u64;
-    let res = unsafe { bpf_syscall(BPF_MAP_LOOKUP_AND_DELETE_ELEM as c_long, &mut attr) };
-    if !cap.observe(res) {
+    attr.__bindgen_anon_2.key = key as *const K as u64;
+    attr.__bindgen_anon_2.__bindgen_anon_1.value = value.as_mut_ptr() as u64;
+    let result = unsafe { bpf_syscall(BPF_MAP_LOOKUP_AND_DELETE_ELEM as c_long, &mut attr) };
+    if !cap.observe(result) {
         debug!(
             "bpf lookup_and_delete({}) unsupported, using lookup+delete",
             map
         );
-        return Ok(None);
+        return Ok(LookupAndDelete::Unsupported);
     }
-    match res {
-        Ok(()) => Ok(Some(true)),
-        Err(ENOENT) => Ok(Some(false)),
-        Err(e) => Err(anyhow::anyhow!(
-            "bpf lookup_and_delete({}) errno={}",
-            map,
-            e
+    match result {
+        Ok(()) => Ok(LookupAndDelete::Value(unsafe { value.assume_init() })),
+        Err(ENOENT) => Ok(LookupAndDelete::Missing),
+        Err(error) => Err(anyhow::anyhow!(
+            "bpf lookup_and_delete({map}) errno={error}"
         )),
     }
 }
 
-/// Decode entries returned by one lookup-batch syscall. Linux writes the
-/// processed count even when it returns terminal `ENOENT`.
-fn decode_lookup_batch<K: Copy, V: Copy>(
-    keys_buf: &[u8],
-    vals_buf: &[u8],
-    count: u32,
-    mut emit: impl FnMut(K, V),
-) {
-    let ksz = core::mem::size_of::<K>();
-    let vsz = core::mem::size_of::<V>();
-    for i in 0..(count as usize).min(BPF_BATCH_CHUNK) {
-        let key = unsafe { core::ptr::read_unaligned(keys_buf[i * ksz..].as_ptr() as *const K) };
-        let value = unsafe { core::ptr::read_unaligned(vals_buf[i * vsz..].as_ptr() as *const V) };
-        emit(key, value);
+/// Delete through a shared Aya map handle. This is only used by the legacy
+/// fallback for `routing_handoff_take`, whose public contract deliberately
+/// takes `&self` so hot-path callers can retain a backend read lock.
+pub fn bpf_delete_shared<K: Pod>(bpf: &Ebpf, map: &str, key: &K) -> anyhow::Result<()> {
+    let fd = map_fd(bpf, map)?;
+    let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
+    attr.__bindgen_anon_2.map_fd = fd as u32;
+    attr.__bindgen_anon_2.key = key as *const K as u64;
+    match unsafe { bpf_syscall(BPF_MAP_DELETE_ELEM as c_long, &mut attr) } {
+        Ok(()) | Err(ENOENT) => Ok(()),
+        Err(error) => Err(anyhow::anyhow!("bpf delete({map}) errno={error}")),
     }
 }
 
-/// A terminal `ENOENT` still carries entries in `count`; it merely marks the
-/// end of this scan.
 fn lookup_batch_result(result: Result<(), c_long>, count: u32) -> Result<(usize, bool), c_long> {
     match result {
         Ok(()) => Ok(((count as usize).min(BPF_BATCH_CHUNK), false)),
@@ -275,18 +139,28 @@ fn lookup_batch_result(result: Result<(), c_long>, count: u32) -> Result<(usize,
     }
 }
 
-/// Scan the whole map into `out` with `BPF_MAP_LOOKUP_BATCH` (hash/LRU-hash
-/// maps, kernel 5.6+), one syscall per [`BPF_BATCH_CHUNK`] entries.
-///
-/// Returns `Ok(true)` when the scan completed via the batch path,
-/// `Ok(false)` when the kernel lacks the command (`out` is left unchanged
-/// and the caller must fall back), and `Err` on a real failure.
-///
-/// NOTE: the scan is not an atomic snapshot — entries inserted or deleted
-/// concurrently may be skipped or returned twice.  Callers (the map
-/// janitor) tolerate this: missed entries are retried on the next round
-/// and duplicates are re-validated before deletion.
-pub fn bpf_lookup_batch_scan<K: Copy, V: Copy>(
+fn uninitialized<T>(len: usize) -> Vec<MaybeUninit<T>> {
+    std::iter::repeat_with(MaybeUninit::uninit)
+        .take(len)
+        .collect()
+}
+
+fn append_initialized<K: Pod, V: Pod>(
+    keys: &[MaybeUninit<K>],
+    values: &[MaybeUninit<V>],
+    count: usize,
+    out: &mut Vec<(K, V)>,
+) {
+    for index in 0..count {
+        out.push((unsafe { keys[index].assume_init() }, unsafe {
+            values[index].assume_init()
+        }));
+    }
+}
+
+/// Scan a hash-family map with `BPF_MAP_LOOKUP_BATCH` (Linux 5.6+).
+/// Returns `false` without changing `out` when the command is unsupported.
+pub fn bpf_lookup_batch_scan<K: Pod, V: Pod>(
     bpf: &Ebpf,
     cap: &BatchCapability,
     map: &str,
@@ -297,53 +171,46 @@ pub fn bpf_lookup_batch_scan<K: Copy, V: Copy>(
     }
     let fd = map_fd(bpf, map)?;
     let initial_len = out.len();
-    let ksz = core::mem::size_of::<K>();
-    let vsz = core::mem::size_of::<V>();
-    let mut keys_buf = vec![0u8; BPF_BATCH_CHUNK * ksz];
-    let mut vals_buf = vec![0u8; BPF_BATCH_CHUNK * vsz];
-    let mut next_key = vec![0u8; ksz];
-    // Continuation key from the previous call (out_batch); None = scan from
-    // the start of the map.
-    let mut in_batch: Option<Vec<u8>> = None;
+    let mut keys = uninitialized::<K>(BPF_BATCH_CHUNK);
+    let mut values = uninitialized::<V>(BPF_BATCH_CHUNK);
+    let mut next_key = MaybeUninit::<K>::uninit();
+    let mut previous_key: Option<K> = None;
     loop {
         let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
         attr.batch.map_fd = fd as u32;
-        attr.batch.in_batch = in_batch.as_ref().map_or(0, |b| b.as_ptr() as u64);
+        attr.batch.in_batch = previous_key
+            .as_ref()
+            .map_or(0, |key| key as *const K as u64);
         attr.batch.out_batch = next_key.as_mut_ptr() as u64;
-        attr.batch.keys = keys_buf.as_mut_ptr() as u64;
-        attr.batch.values = vals_buf.as_mut_ptr() as u64;
+        attr.batch.keys = keys.as_mut_ptr() as u64;
+        attr.batch.values = values.as_mut_ptr() as u64;
         attr.batch.count = BPF_BATCH_CHUNK as u32;
-        let res = unsafe { bpf_syscall(BPF_MAP_LOOKUP_BATCH as c_long, &mut attr) };
-        if !cap.observe(res) {
+        let result = unsafe { bpf_syscall(BPF_MAP_LOOKUP_BATCH as c_long, &mut attr) };
+        if !cap.observe(result) {
             out.truncate(initial_len);
             debug!(
-                "bpf lookup_batch({}) unsupported, using GET_NEXT_KEY walk",
+                "bpf lookup_batch({}) unsupported, using Aya map iteration",
                 map
             );
             return Ok(false);
         }
-        let (n, terminal) = match lookup_batch_result(res, unsafe { attr.batch.count }) {
+        let (count, terminal) = match lookup_batch_result(result, unsafe { attr.batch.count }) {
             Ok(result) => result,
             Err(error) => {
                 out.truncate(initial_len);
-                return Err(anyhow::anyhow!("bpf lookup_batch({}) errno={}", map, error));
+                return Err(anyhow::anyhow!("bpf lookup_batch({map}) errno={error}"));
             }
         };
-        decode_lookup_batch(&keys_buf, &vals_buf, n as u32, |key, value| {
-            out.push((key, value))
-        });
-        if terminal || n < BPF_BATCH_CHUNK {
+        append_initialized(&keys, &values, count, out);
+        if terminal || count < BPF_BATCH_CHUNK {
             return Ok(true);
         }
-        in_batch = Some(next_key.clone());
+        previous_key = Some(unsafe { next_key.assume_init() });
     }
 }
 
-/// Streaming variant of [`bpf_lookup_batch_scan`]: invokes `visit` once per
-/// chunk instead of accumulating the whole map, so memory stays bounded by
-/// `BPF_BATCH_CHUNK` regardless of map size. Same fallback contract —
-/// `Ok(false)` when the kernel lacks `BPF_MAP_LOOKUP_BATCH`.
-pub fn bpf_lookup_batch_scan_cb<K: Copy, V: Copy>(
+/// Streaming lookup-batch variant that keeps memory bounded to one chunk.
+pub fn bpf_lookup_batch_scan_cb<K: Pod, V: Pod>(
     bpf: &Ebpf,
     cap: &BatchCapability,
     map: &str,
@@ -353,51 +220,45 @@ pub fn bpf_lookup_batch_scan_cb<K: Copy, V: Copy>(
         return Ok(false);
     }
     let fd = map_fd(bpf, map)?;
-    let ksz = core::mem::size_of::<K>();
-    let vsz = core::mem::size_of::<V>();
-    let mut keys_buf = vec![0u8; BPF_BATCH_CHUNK * ksz];
-    let mut vals_buf = vec![0u8; BPF_BATCH_CHUNK * vsz];
-    let mut next_key = vec![0u8; ksz];
-    let mut in_batch: Option<Vec<u8>> = None;
-    let mut chunk: Vec<(K, V)> = Vec::with_capacity(BPF_BATCH_CHUNK);
+    let mut keys = uninitialized::<K>(BPF_BATCH_CHUNK);
+    let mut values = uninitialized::<V>(BPF_BATCH_CHUNK);
+    let mut next_key = MaybeUninit::<K>::uninit();
+    let mut previous_key: Option<K> = None;
+    let mut chunk = Vec::with_capacity(BPF_BATCH_CHUNK);
     loop {
         let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
         attr.batch.map_fd = fd as u32;
-        attr.batch.in_batch = in_batch.as_ref().map_or(0, |b| b.as_ptr() as u64);
+        attr.batch.in_batch = previous_key
+            .as_ref()
+            .map_or(0, |key| key as *const K as u64);
         attr.batch.out_batch = next_key.as_mut_ptr() as u64;
-        attr.batch.keys = keys_buf.as_mut_ptr() as u64;
-        attr.batch.values = vals_buf.as_mut_ptr() as u64;
+        attr.batch.keys = keys.as_mut_ptr() as u64;
+        attr.batch.values = values.as_mut_ptr() as u64;
         attr.batch.count = BPF_BATCH_CHUNK as u32;
-        let res = unsafe { bpf_syscall(BPF_MAP_LOOKUP_BATCH as c_long, &mut attr) };
-        if !cap.observe(res) {
+        let result = unsafe { bpf_syscall(BPF_MAP_LOOKUP_BATCH as c_long, &mut attr) };
+        if !cap.observe(result) {
             debug!(
-                "bpf lookup_batch({}) unsupported, using GET_NEXT_KEY walk",
+                "bpf lookup_batch({}) unsupported, using Aya map iteration",
                 map
             );
             return Ok(false);
         }
-        let (n, terminal) = match lookup_batch_result(res, unsafe { attr.batch.count }) {
-            Ok(result) => result,
-            Err(error) => return Err(anyhow::anyhow!("bpf lookup_batch({}) errno={}", map, error)),
-        };
+        let (count, terminal) = lookup_batch_result(result, unsafe { attr.batch.count })
+            .map_err(|error| anyhow::anyhow!("bpf lookup_batch({map}) errno={error}"))?;
         chunk.clear();
-        decode_lookup_batch(&keys_buf, &vals_buf, n as u32, |key, value| {
-            chunk.push((key, value))
-        });
+        append_initialized(&keys, &values, count, &mut chunk);
         if !chunk.is_empty() && !visit(&chunk) {
             return Ok(true);
         }
-        if terminal || n < BPF_BATCH_CHUNK {
+        if terminal || count < BPF_BATCH_CHUNK {
             return Ok(true);
         }
-        in_batch = Some(next_key.clone());
+        previous_key = Some(unsafe { next_key.assume_init() });
     }
 }
 
-/// Delete `keys` with `BPF_MAP_DELETE_BATCH` (hash/LRU-hash maps, kernel
-/// 5.6+).  Returns `Ok(true)` when the batch path ran (keys already gone
-/// are tolerated), `Ok(false)` when the kernel lacks the command.
-pub fn bpf_delete_batch<K: Copy>(
+/// Delete keys with `BPF_MAP_DELETE_BATCH` (Linux 5.6+).
+pub fn bpf_delete_batch<K: Pod>(
     bpf: &Ebpf,
     cap: &BatchCapability,
     map: &str,
@@ -415,27 +276,26 @@ pub fn bpf_delete_batch<K: Copy>(
         attr.batch.map_fd = fd as u32;
         attr.batch.keys = chunk.as_ptr() as u64;
         attr.batch.count = chunk.len() as u32;
-        let res = unsafe { bpf_syscall(BPF_MAP_DELETE_BATCH as c_long, &mut attr) };
-        if !cap.observe(res) {
+        let result = unsafe { bpf_syscall(BPF_MAP_DELETE_BATCH as c_long, &mut attr) };
+        if !cap.observe(result) {
             debug!(
-                "bpf delete_batch({}) unsupported, using per-key deletes",
+                "bpf delete_batch({}) unsupported, using Aya map deletes",
                 map
             );
             return Ok(false);
         }
-        match res {
-            // ENOENT only means some (or all) keys were already gone.
+        match result {
             Ok(()) | Err(ENOENT) => {}
-            Err(e) => return Err(anyhow::anyhow!("bpf delete_batch({}) errno={}", map, e)),
+            Err(error) => {
+                return Err(anyhow::anyhow!("bpf delete_batch({map}) errno={error}"));
+            }
         }
     }
     Ok(true)
 }
 
-/// Write `values` at `keys` with `BPF_MAP_UPDATE_BATCH` (array/hash maps,
-/// kernel 5.6+), a single syscall.  Returns `Ok(true)` when the batch path
-/// ran, `Ok(false)` when the kernel lacks the command.
-pub fn bpf_update_batch<K: Copy, V: Copy>(
+/// Write one bounded chunk with `BPF_MAP_UPDATE_BATCH` (Linux 5.6+).
+pub fn bpf_update_batch<K: Pod, V: Pod>(
     bpf: &Ebpf,
     cap: &BatchCapability,
     map: &str,
@@ -450,14 +310,11 @@ pub fn bpf_update_batch<K: Copy, V: Copy>(
     }
     anyhow::ensure!(
         keys.len() == values.len(),
-        "update_batch({}): keys/values length mismatch",
-        map
+        "update_batch({map}): keys/values length mismatch"
     );
     anyhow::ensure!(
         keys.len() <= BPF_BATCH_CHUNK,
-        "update_batch({}): limited to {} elements per call",
-        map,
-        BPF_BATCH_CHUNK
+        "update_batch({map}): limited to {BPF_BATCH_CHUNK} elements per call"
     );
     let fd = map_fd(bpf, map)?;
     let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
@@ -465,15 +322,15 @@ pub fn bpf_update_batch<K: Copy, V: Copy>(
     attr.batch.keys = keys.as_ptr() as u64;
     attr.batch.values = values.as_ptr() as u64;
     attr.batch.count = keys.len() as u32;
-    let res = unsafe { bpf_syscall(BPF_MAP_UPDATE_BATCH as c_long, &mut attr) };
-    if !cap.observe(res) {
+    let result = unsafe { bpf_syscall(BPF_MAP_UPDATE_BATCH as c_long, &mut attr) };
+    if !cap.observe(result) {
         debug!(
-            "bpf update_batch({}) unsupported, using per-element updates",
+            "bpf update_batch({}) unsupported, using Aya array writes",
             map
         );
         return Ok(false);
     }
-    res.map_err(|e| anyhow::anyhow!("bpf update_batch({}) errno={}", map, e))?;
+    result.map_err(|error| anyhow::anyhow!("bpf update_batch({map}) errno={error}"))?;
     Ok(true)
 }
 
@@ -488,25 +345,5 @@ mod tests {
             assert!(terminal);
             assert_eq!(returned, (count as usize).min(BPF_BATCH_CHUNK));
         }
-    }
-
-    #[test]
-    fn decodes_only_reported_entries() {
-        let keys = [10u32, 20, 30];
-        let values = [100u32, 200, 300];
-        let keys_buf = unsafe {
-            core::slice::from_raw_parts(keys.as_ptr() as *const u8, core::mem::size_of_val(&keys))
-        };
-        let values_buf = unsafe {
-            core::slice::from_raw_parts(
-                values.as_ptr() as *const u8,
-                core::mem::size_of_val(&values),
-            )
-        };
-        let mut decoded = Vec::new();
-        decode_lookup_batch(keys_buf, values_buf, 2, |key, value| {
-            decoded.push((key, value))
-        });
-        assert_eq!(decoded, vec![(10, 100), (20, 200)]);
     }
 }

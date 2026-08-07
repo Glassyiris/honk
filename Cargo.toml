@@ -117,7 +117,7 @@ libc = "0.2"
 parking_lot = "0.12"
 dashmap = "6"
 libsystemd = "0.7"
-nix = { version = "0.31", features = ["time", "fs"] }
+nix = { version = "0.31", features = ["time", "fs", "net"] }
 pin-project-lite = "0.2"
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
 

@@ -1,9 +1,13 @@
 use async_trait::async_trait;
-use aya::Ebpf;
-use aya::EbpfLoader;
+use aya::maps::lpm_trie::Key as AyaLpmKey;
+use aya::maps::{
+    Array as AyaArray, HashMap as AyaHashMap, LpmTrie as AyaLpmTrie, MapData as AyaMapData,
+    MapError, PerCpuArray as AyaPerCpuArray, PerCpuValues, SockMap as AyaSockMap,
+};
+use aya::{Ebpf, EbpfLoader, Pod};
 
 use honk_ebpf_common::*;
-use std::os::fd::{AsFd, AsRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
@@ -29,37 +33,22 @@ fn kernel_version() -> Option<(u32, u32, u32)> {
     }
 }
 
-/// Real eBPF backend backed by the aya library and kernel BPF maps.
+/// Real eBPF backend backed by Aya and kernel BPF maps.
 ///
-/// Uses raw `bpf()` syscalls via `libc::syscall` for all map data-plane
-/// operations.  This avoids aya's `Pod` trait bound, letting us use the
-/// project's own `#[repr(C)]` types from the `no_std` `honk-ebpf-common`
-/// crate without pulling aya into that crate.
+/// Normal map operations go through Aya's typed APIs. The small raw syscall
+/// extension is restricted to atomic lookup-and-delete and batch commands
+/// that Aya 0.14 does not expose.
 pub struct RealEbpfBackend {
     bpf: Option<Ebpf>,
     pin_root: PathBuf,
     tproxy_port: u16,
     tproxy_mark: u32,
-    // Keep TC links alive explicitly.  In some aya versions the link
-    // stored inside the Ebpf object is dropped when the program reference goes
-    // out of scope, so we hold the owned link here.
-    lan_ingress_link: Option<aya::programs::tc::SchedClassifierLink>,
-    lan_egress_link: Option<aya::programs::tc::SchedClassifierLink>,
-    /// WAN egress link: intercepts locally-generated traffic before it leaves
-    /// the WAN interface so it can be routed through the proxy.
-    wan_egress_link: Option<aya::programs::tc::SchedClassifierLink>,
-    /// WAN ingress link: refreshes reverse-direction conntrack state for
-    /// replies arriving from the WAN (direct-flow keepalive / close tracking).
-    /// Skipped in single-homed setups, where lan_ingress already owns the
-    /// shared interface's ingress hook.
-    wan_ingress_link: Option<aya::programs::tc::SchedClassifierLink>,
-    /// Links installed by dynamic attach (startup bridge and bond slaves,
-    /// extra startup interfaces, and the interface watcher), keyed by
-    /// (ifindex, is_egress).  Keeping them here
-    /// serves three purposes: the fd stays alive until `detach_hooks`, the
-    /// watcher can drop dead links when a device vanishes, and the (ifindex,
-    /// direction) pair dedupes retries after a partial failure.
-    dynamic_links: Vec<(u32, bool, aya::programs::tc::SchedClassifierLink)>,
+    /// Every TC link attached to a configured interface, including the four
+    /// primary LAN/WAN hooks, startup bridge/bond slaves, extra configured
+    /// interfaces, and watcher rebinds. Keying ownership by (ifindex,is_egress)
+    /// lets a reconnect release stale primary links and makes a
+    /// retry observe hooks that are still live instead of stacking them.
+    interface_links: Vec<(u32, bool, aya::programs::tc::SchedClassifierLink)>,
     /// cgroup sock_create/sock_release links (cookie→PID mapping, control-plane
     /// bypass). Held for the backend lifetime — dropping one detaches the
     /// program in the kernel.
@@ -120,7 +109,10 @@ mod syscall;
 
 pub use events::*;
 pub use iface_watch::IfaceWatcher;
-pub use syscall::*;
+use syscall::{
+    LookupAndDelete, bpf_delete_batch, bpf_delete_shared, bpf_lookup_and_delete,
+    bpf_lookup_batch_scan, bpf_lookup_batch_scan_cb, bpf_update_batch,
+};
 
 fn conn_key(outbound: u8, domain: u32, ipver: u32) -> u32 {
     (outbound as u32)
@@ -129,172 +121,200 @@ fn conn_key(outbound: u8, domain: u32, ipver: u32) -> u32 {
         .wrapping_add(ipver)
 }
 
-/// Number of per-CPU slots the kernel allocates for each per-CPU map value
-/// (the possible-CPUs count), parsed from sysfs.
-fn possible_cpus() -> usize {
-    let raw = std::fs::read_to_string("/sys/devices/system/cpu/possible")
-        .unwrap_or_else(|_| "0".to_string());
-    parse_possible_cpus(raw.trim())
-}
-
-/// Parse a `/sys/devices/system/cpu/possible` CPU list ("0-3,8-11") into a
-/// CPU count.  Returns at least 1.
-fn parse_possible_cpus(list: &str) -> usize {
-    let mut n = 0usize;
-    for part in list.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        match part.split_once('-') {
-            Some((a, b)) => {
-                if let (Ok(a), Ok(b)) = (a.parse::<usize>(), b.parse::<usize>()) {
-                    n += b.saturating_sub(a) + 1;
-                }
-            }
-            None => {
-                if part.parse::<usize>().is_ok() {
-                    n += 1;
-                }
-            }
-        }
-    }
-    n.max(1)
-}
-
-/// Sum `ncpu` native-endian u64 slots out of a per-CPU map value buffer.
-/// The kernel pads each per-CPU slot to 8 bytes; u64 values need no extra
-/// padding, so the slots are contiguous.
-fn sum_percpu_u64(buf: &[u8], ncpu: usize) -> u64 {
-    let mut total: u64 = 0;
-    for i in 0..ncpu {
-        if let Some(slot) = buf.get(i * 8..i * 8 + 8) {
-            total = total.wrapping_add(u64::from_ne_bytes(slot.try_into().unwrap()));
-        }
-    }
-    total
+fn set_array_value<V: Pod>(
+    bpf: &mut Ebpf,
+    name: &str,
+    index: u32,
+    value: &V,
+) -> anyhow::Result<()> {
+    let map = bpf
+        .map_mut(name)
+        .ok_or_else(|| anyhow::anyhow!("map '{name}' not found"))?;
+    let mut array = AyaArray::<_, V>::try_from(map)
+        .map_err(|error| anyhow::anyhow!("map '{name}': {error}"))?;
+    array
+        .set(index, value, 0)
+        .map_err(|error| anyhow::anyhow!("map '{name}' set[{index}]: {error}"))
 }
 
 /// Chunked visitor used by the batch map scanners.
 type ChunkVisitor<'a, K, V> = dyn FnMut(&[(K, V)]) -> bool + 'a;
 
 impl RealEbpfBackend {
-    fn hash_insert<K: Sized, V: Sized>(&mut self, map: &str, k: &K, v: &V) -> anyhow::Result<()> {
-        bpf_hash_insert(self.bpf_mut()?, map, unsafe { as_bytes(k) }, unsafe {
-            as_bytes(v)
-        })
+    fn hash_map<'a, K: Pod, V: Pod>(
+        &'a self,
+        name: &str,
+    ) -> anyhow::Result<AyaHashMap<&'a AyaMapData, K, V>> {
+        let map = self
+            .bpf()?
+            .map(name)
+            .ok_or_else(|| anyhow::anyhow!("map '{name}' not found"))?;
+        AyaHashMap::try_from(map).map_err(|error| anyhow::anyhow!("map '{name}': {error}"))
     }
 
-    fn hash_lookup<K: Sized, V: Sized + Copy>(
-        &self,
-        map: &str,
-        k: &K,
-    ) -> anyhow::Result<Option<V>> {
-        // Stack buffer — no per-call heap allocation.  The kernel writes
-        // exactly size_of::<V>() bytes on a hit, so the value is fully
-        // initialized before assume_init().
-        let mut val = core::mem::MaybeUninit::<V>::uninit();
-        let buf = unsafe {
-            core::slice::from_raw_parts_mut(val.as_mut_ptr() as *mut u8, core::mem::size_of::<V>())
-        };
-        match bpf_hash_lookup(self.bpf()?, map, unsafe { as_bytes(k) }, buf)? {
-            Some(()) => Ok(Some(unsafe { val.assume_init() })),
-            None => Ok(None),
+    fn hash_map_mut<'a, K: Pod, V: Pod>(
+        &'a mut self,
+        name: &str,
+    ) -> anyhow::Result<AyaHashMap<&'a mut AyaMapData, K, V>> {
+        let map = self
+            .bpf_mut()?
+            .map_mut(name)
+            .ok_or_else(|| anyhow::anyhow!("map '{name}' not found"))?;
+        AyaHashMap::try_from(map).map_err(|error| anyhow::anyhow!("map '{name}': {error}"))
+    }
+
+    fn hash_insert<K: Pod, V: Pod>(
+        &mut self,
+        name: &str,
+        key: &K,
+        value: &V,
+    ) -> anyhow::Result<()> {
+        self.hash_map_mut::<K, V>(name)?
+            .insert(key, value, 0)
+            .map_err(|error| anyhow::anyhow!("map '{name}' insert: {error}"))
+    }
+
+    fn hash_lookup<K: Pod, V: Pod>(&self, name: &str, key: &K) -> anyhow::Result<Option<V>> {
+        match self.hash_map(name)?.get(key, 0) {
+            Ok(value) => Ok(Some(value)),
+            Err(MapError::KeyNotFound) => Ok(None),
+            Err(error) => Err(anyhow::anyhow!("map '{name}' lookup: {error}")),
         }
     }
 
-    fn hash_remove<K: Sized>(&mut self, map: &str, k: &K) -> anyhow::Result<()> {
-        bpf_hash_delete(self.bpf()?, map, unsafe { as_bytes(k) })
-    }
-
-    fn array_set<V: Sized>(&mut self, map: &str, idx: u32, v: &V) -> anyhow::Result<()> {
-        bpf_hash_insert(self.bpf_mut()?, map, unsafe { as_bytes(&idx) }, unsafe {
-            as_bytes(v)
-        })
-    }
-
-    fn array_get<V: Sized + Copy>(&self, map: &str, idx: u32) -> anyhow::Result<Option<V>> {
-        let mut val = core::mem::MaybeUninit::<V>::uninit();
-        let buf = unsafe {
-            core::slice::from_raw_parts_mut(val.as_mut_ptr() as *mut u8, core::mem::size_of::<V>())
-        };
-        match bpf_hash_lookup(self.bpf()?, map, unsafe { as_bytes(&idx) }, buf)? {
-            Some(()) => Ok(Some(unsafe { val.assume_init() })),
-            None => Ok(None),
+    fn hash_remove<K: Pod, V: Pod>(&mut self, name: &str, key: &K) -> anyhow::Result<()> {
+        match self.hash_map_mut::<K, V>(name)?.remove(key) {
+            Ok(()) => Ok(()),
+            Err(error) if Self::map_error_is_missing(&error) => Ok(()),
+            Err(error) => Err(anyhow::anyhow!("map '{name}' delete: {error}")),
         }
     }
 
-    fn collect_keys(&self, map: &str, key_sz: usize) -> anyhow::Result<Vec<Vec<u8>>> {
-        bpf_map_keys(self.bpf()?, map, key_sz)
+    fn map_error_is_missing(error: &MapError) -> bool {
+        matches!(error, MapError::KeyNotFound)
+            || matches!(
+                error,
+                MapError::SyscallError(error)
+                    if error.io_error.raw_os_error() == Some(libc::ENOENT)
+            )
     }
 
-    /// Snapshot all entries of a hash-family map into typed (K, V) pairs.
-    ///
-    /// Prefers `BPF_MAP_LOOKUP_BATCH` (one syscall per 128-entry chunk);
-    /// falls back to a GET_NEXT_KEY walk plus per-key lookups on kernels
-    /// without batch support.  See [`EbpfBackend::redirect_track_snapshot`]
-    /// for the snapshot consistency notes.
-    fn map_snapshot<K: Copy, V: Copy>(
+    fn array_set<V: Pod>(&mut self, name: &str, index: u32, value: &V) -> anyhow::Result<()> {
+        set_array_value(self.bpf_mut()?, name, index, value)
+    }
+
+    fn array_get<V: Pod>(&self, name: &str, index: u32) -> anyhow::Result<Option<V>> {
+        let map = self
+            .bpf()?
+            .map(name)
+            .ok_or_else(|| anyhow::anyhow!("map '{name}' not found"))?;
+        let array = AyaArray::<_, V>::try_from(map)
+            .map_err(|error| anyhow::anyhow!("map '{name}': {error}"))?;
+        match array.get(&index, 0) {
+            Ok(value) => Ok(Some(value)),
+            Err(MapError::KeyNotFound) => Ok(None),
+            Err(error) => Err(anyhow::anyhow!("map '{name}' get[{index}]: {error}")),
+        }
+    }
+
+    fn lpm_insert(
+        &mut self,
+        name: &str,
+        key: &LpmKey,
+        value: &DomainRouting,
+    ) -> anyhow::Result<()> {
+        let map = self
+            .bpf_mut()?
+            .map_mut(name)
+            .ok_or_else(|| anyhow::anyhow!("map '{name}' not found"))?;
+        let mut trie = AyaLpmTrie::<_, [u32; 4], DomainRouting>::try_from(map)
+            .map_err(|error| anyhow::anyhow!("map '{name}': {error}"))?;
+        trie.insert(&AyaLpmKey::new(key.prefix_len, key.data), value, 0)
+            .map_err(|error| anyhow::anyhow!("map '{name}' insert: {error}"))
+    }
+
+    fn lpm_keys(&self, name: &str) -> anyhow::Result<Vec<AyaLpmKey<[u32; 4]>>> {
+        let map = self
+            .bpf()?
+            .map(name)
+            .ok_or_else(|| anyhow::anyhow!("map '{name}' not found"))?;
+        let trie = AyaLpmTrie::<_, [u32; 4], DomainRouting>::try_from(map)
+            .map_err(|error| anyhow::anyhow!("map '{name}': {error}"))?;
+        trie.keys()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| anyhow::anyhow!("map '{name}' keys: {error}"))
+    }
+
+    fn lpm_remove(&mut self, name: &str, key: &AyaLpmKey<[u32; 4]>) -> anyhow::Result<()> {
+        let map = self
+            .bpf_mut()?
+            .map_mut(name)
+            .ok_or_else(|| anyhow::anyhow!("map '{name}' not found"))?;
+        let mut trie = AyaLpmTrie::<_, [u32; 4], DomainRouting>::try_from(map)
+            .map_err(|error| anyhow::anyhow!("map '{name}': {error}"))?;
+        match trie.remove(key) {
+            Ok(()) => Ok(()),
+            Err(error) if Self::map_error_is_missing(&error) => Ok(()),
+            Err(error) => Err(anyhow::anyhow!("map '{name}' delete: {error}")),
+        }
+    }
+
+    fn domain_insert(
+        &mut self,
+        key: &[u32; 4],
+        value: &DomainRouting,
+    ) -> Result<(), super::DomainRouteWriteError> {
+        let mut map = self
+            .hash_map_mut::<[u32; 4], DomainRouting>("DOMAIN_ROUTING_MAP")
+            .map_err(super::DomainRouteWriteError::Other)?;
+        match map.insert(key, value, 0) {
+            Ok(()) => Ok(()),
+            Err(MapError::SyscallError(error))
+                if error.io_error.raw_os_error() == Some(libc::ENOSPC) =>
+            {
+                Err(super::DomainRouteWriteError::MapFull)
+            }
+            Err(error) => Err(super::DomainRouteWriteError::Other(anyhow::anyhow!(
+                "map 'DOMAIN_ROUTING_MAP' insert: {error}"
+            ))),
+        }
+    }
+
+    /// Snapshot all entries of a hash-family map. Batch commands remain an
+    /// optimization; Aya iteration is the compatibility fallback.
+    fn map_snapshot<K: Pod, V: Pod>(
         &self,
-        map: &str,
+        name: &str,
         out: &mut Vec<(K, V)>,
     ) -> anyhow::Result<()> {
         let bpf = self.bpf()?;
-        if bpf_lookup_batch_scan(bpf, &self.cap_lookup_batch, map, out)? {
+        if bpf_lookup_batch_scan(bpf, &self.cap_lookup_batch, name, out)? {
             return Ok(());
         }
-        for kb in bpf_map_keys(bpf, map, core::mem::size_of::<K>())? {
-            if kb.len() < core::mem::size_of::<K>() {
-                continue;
-            }
-            let mut val = core::mem::MaybeUninit::<V>::uninit();
-            let buf = unsafe {
-                core::slice::from_raw_parts_mut(
-                    val.as_mut_ptr() as *mut u8,
-                    core::mem::size_of::<V>(),
-                )
-            };
-            if let Some(()) = bpf_hash_lookup(bpf, map, &kb, buf)? {
-                let k = unsafe { core::ptr::read_unaligned(kb.as_ptr() as *const K) };
-                out.push((k, unsafe { val.assume_init() }));
-            }
+        for entry in self.hash_map(name)?.iter() {
+            out.push(entry.map_err(|error| anyhow::anyhow!("map '{name}' iteration: {error}"))?);
         }
         Ok(())
     }
 
-    /// Visit a hash-family map in chunks. Kernels with LOOKUP_BATCH stream
-    /// directly from the map; the legacy fallback preserves compatibility.
-    fn for_each_map_chunk<K: Copy, V: Copy>(
+    fn for_each_map_chunk<K: Pod, V: Pod>(
         &self,
-        map: &str,
+        name: &str,
         chunk_size: usize,
         visit: &mut ChunkVisitor<'_, K, V>,
     ) -> anyhow::Result<()> {
         let bpf = self.bpf()?;
-        if bpf_lookup_batch_scan_cb(bpf, &self.cap_lookup_batch, map, visit)? {
+        if bpf_lookup_batch_scan_cb(bpf, &self.cap_lookup_batch, name, visit)? {
             return Ok(());
         }
-        // Old kernels lack LOOKUP_BATCH. Avoid the snapshot helper here:
-        // it would allocate one entry per map element and defeat the janitor
-        // memory bound.
         let mut chunk = Vec::with_capacity(chunk_size.max(1));
-        for kb in bpf_map_keys(bpf, map, core::mem::size_of::<K>())? {
-            let mut value = core::mem::MaybeUninit::<V>::uninit();
-            let buf = unsafe {
-                core::slice::from_raw_parts_mut(
-                    value.as_mut_ptr() as *mut u8,
-                    core::mem::size_of::<V>(),
-                )
-            };
-            if bpf_hash_lookup(bpf, map, &kb, buf)?.is_some() {
-                let key = unsafe { core::ptr::read_unaligned(kb.as_ptr() as *const K) };
-                chunk.push((key, unsafe { value.assume_init() }));
-                if chunk.len() == chunk_size.max(1) {
-                    if !visit(&chunk) {
-                        return Ok(());
-                    }
-                    chunk.clear();
+        for entry in self.hash_map(name)?.iter() {
+            chunk.push(entry.map_err(|error| anyhow::anyhow!("map '{name}' iteration: {error}"))?);
+            if chunk.len() == chunk_size.max(1) {
+                if !visit(&chunk) {
+                    return Ok(());
                 }
+                chunk.clear();
             }
         }
         if !chunk.is_empty() {
@@ -303,53 +323,33 @@ impl RealEbpfBackend {
         Ok(())
     }
 
-    /// Delete multiple keys from a hash-family map, preferring
-    /// `BPF_MAP_DELETE_BATCH` and falling back to per-key deletes.
-    fn map_delete_batch<K: Copy>(&mut self, map: &str, keys: &[K]) -> anyhow::Result<()> {
-        let bpf = self.bpf()?;
-        if bpf_delete_batch(bpf, &self.cap_delete_batch, map, keys)? {
+    fn map_delete_batch<K: Pod, V: Pod>(&mut self, name: &str, keys: &[K]) -> anyhow::Result<()> {
+        if bpf_delete_batch(self.bpf()?, &self.cap_delete_batch, name, keys)? {
             return Ok(());
         }
-        for k in keys {
-            bpf_hash_delete(bpf, map, unsafe { as_bytes(k) })?;
+        let mut map = self.hash_map_mut::<K, V>(name)?;
+        for key in keys {
+            if let Err(error) = map.remove(key)
+                && !Self::map_error_is_missing(&error)
+            {
+                return Err(anyhow::anyhow!("map '{name}' delete: {error}"));
+            }
         }
         Ok(())
     }
 
-    /// Read the existing bitmap for `key` in `map`, OR it with `bm`, and write
-    /// it back. Works for both HASH maps and LPM_TRIE maps because the syscall
-    /// ABI is identical.
-    fn or_update_bitmap(
-        bpf: &mut Ebpf,
-        map: &str,
-        key: &LpmKey,
-        bm: &DomainRouting,
+    fn or_update_domain_bitmap(
+        &mut self,
+        key: &[u32; 4],
+        bitmap: &DomainRouting,
     ) -> anyhow::Result<()> {
-        Self::or_update_bitmap_raw(bpf, map, unsafe { as_bytes(key) }, bm)
-    }
-
-    /// Raw-byte variant of `or_update_bitmap` for callers whose key is not a
-    /// full `LpmKey` (e.g. `DOMAIN_ROUTING_MAP` uses only the 16-byte IP data).
-    fn or_update_bitmap_raw(
-        bpf: &mut Ebpf,
-        map: &str,
-        key_bytes: &[u8],
-        bm: &DomainRouting,
-    ) -> anyhow::Result<()> {
-        // For LPM trie maps, bpf_map_lookup_elem returns the *longest-prefix match*,
-        // not the exact key. OR-ing that value into a new more-specific entry would
-        // incorrectly inherit the less-specific rule. Use the supplied bitmap only.
-        let mut cur = *bm;
-        if !map.contains("LPM") {
-            let mut buf = vec![0u8; core::mem::size_of::<DomainRouting>()];
-            if let Some(()) = bpf_hash_lookup(bpf, map, key_bytes, &mut buf)? {
-                let existing = unsafe { from_bytes::<DomainRouting>(&buf) };
-                for i in 0..cur.bitmap.len() {
-                    cur.bitmap[i] |= existing.bitmap[i];
-                }
+        let mut current = *bitmap;
+        if let Some(existing) = self.hash_lookup::<_, DomainRouting>("DOMAIN_ROUTING_MAP", key)? {
+            for (current, existing) in current.bitmap.iter_mut().zip(existing.bitmap) {
+                *current |= existing;
             }
         }
-        bpf_hash_insert(bpf, map, key_bytes, unsafe { as_bytes(&cur) })
+        self.hash_insert("DOMAIN_ROUTING_MAP", key, &current)
     }
 }
 
@@ -385,9 +385,10 @@ impl EbpfBackend for RealEbpfBackend {
     }
 
     fn forget_dynamic_interface(&mut self, ifindex: u32) {
-        // Dropping the links detaches nothing (the device is already gone);
-        // it only releases the fds and the dedup state.
-        self.dynamic_links.retain(|(i, _, _)| *i != ifindex);
+        // The device may still exist when an auto-resolved route changes, so
+        // dropping every owned link for this ifindex must perform the detach
+        // before a later reconcile attempts to bind it again.
+        self.interface_links.retain(|(i, _, _)| *i != ifindex);
     }
 
     fn set_datapath_ready(&mut self, ready: bool) -> anyhow::Result<()> {
@@ -471,64 +472,44 @@ impl EbpfBackend for RealEbpfBackend {
     }
 
     fn add_domain_route(&mut self, domain: &str, outbound: OutboundIndex) -> anyhow::Result<()> {
-        let h = maps::fnv1a_hash(domain.as_bytes());
-        let key = LpmKey {
-            prefix_len: (h >> 32) as u32,
-            data: [(h as u32), ((h >> 32) as u32), 0, 0],
-        };
-        // DOMAIN_ROUTING_MAP key is the 16-byte IP data portion.
-        let key_bytes = unsafe { as_bytes(&key.data) };
-        let mut buf = vec![0u8; core::mem::size_of::<DomainRouting>()];
-        let mut cur: DomainRouting =
-            match bpf_hash_lookup(self.bpf()?, "DOMAIN_ROUTING_MAP", key_bytes, &mut buf)? {
-                Some(()) => unsafe { from_bytes::<DomainRouting>(&buf) },
-                None => DomainRouting::default(),
-            };
-        let ob = outbound as u32;
-        let wi = (ob / 32) as usize;
-        if wi < ROUTING_BITMAP_WORDS_PER_GENERATION {
+        let hash = maps::fnv1a_hash(domain.as_bytes());
+        let key = [hash as u32, (hash >> 32) as u32, 0, 0];
+        let mut current = self
+            .hash_lookup::<_, DomainRouting>("DOMAIN_ROUTING_MAP", &key)?
+            .unwrap_or_default();
+        let outbound = outbound as u32;
+        let word = (outbound / 32) as usize;
+        if word < ROUTING_BITMAP_WORDS_PER_GENERATION {
             let generation = self.active_routing_generation()? as usize;
-            cur.bitmap[generation * ROUTING_BITMAP_WORDS_PER_GENERATION + wi] |= 1 << (ob % 32);
+            current.bitmap[generation * ROUTING_BITMAP_WORDS_PER_GENERATION + word] |=
+                1 << (outbound % 32);
         }
-        bpf_hash_insert(self.bpf_mut()?, "DOMAIN_ROUTING_MAP", key_bytes, unsafe {
-            as_bytes(&cur)
-        })
+        self.hash_insert("DOMAIN_ROUTING_MAP", &key, &current)
     }
 
     fn add_domain_routing_bitmap(
         &mut self,
         key: &LpmKey,
-        bm: &DomainRouting,
+        bitmap: &DomainRouting,
     ) -> anyhow::Result<()> {
-        let bitmap = bm.for_generation(self.active_routing_generation()?);
-        Self::or_update_bitmap(self.bpf_mut()?, "DOMAIN_ROUTING_MAP", key, &bitmap)
+        let bitmap = bitmap.for_generation(self.active_routing_generation()?);
+        self.or_update_domain_bitmap(&key.data, &bitmap)
     }
 
-    fn add_dest_lpm_bitmap(&mut self, key: &LpmKey, bm: &DomainRouting) -> anyhow::Result<()> {
-        bpf_hash_insert(
-            self.bpf_mut()?,
-            "DEST_LPM_ROUTING_MAP",
-            unsafe { as_bytes(key) },
-            unsafe { as_bytes(bm) },
-        )
+    fn add_dest_lpm_bitmap(&mut self, key: &LpmKey, bitmap: &DomainRouting) -> anyhow::Result<()> {
+        self.lpm_insert("DEST_LPM_ROUTING_MAP", key, bitmap)
     }
 
-    fn add_source_lpm_bitmap(&mut self, key: &LpmKey, bm: &DomainRouting) -> anyhow::Result<()> {
-        bpf_hash_insert(
-            self.bpf_mut()?,
-            "SOURCE_LPM_ROUTING_MAP",
-            unsafe { as_bytes(key) },
-            unsafe { as_bytes(bm) },
-        )
+    fn add_source_lpm_bitmap(
+        &mut self,
+        key: &LpmKey,
+        bitmap: &DomainRouting,
+    ) -> anyhow::Result<()> {
+        self.lpm_insert("SOURCE_LPM_ROUTING_MAP", key, bitmap)
     }
 
-    fn add_mac_lpm_bitmap(&mut self, key: &LpmKey, bm: &DomainRouting) -> anyhow::Result<()> {
-        bpf_hash_insert(
-            self.bpf_mut()?,
-            "MAC_LPM_ROUTING_MAP",
-            unsafe { as_bytes(key) },
-            unsafe { as_bytes(bm) },
-        )
+    fn add_mac_lpm_bitmap(&mut self, key: &LpmKey, bitmap: &DomainRouting) -> anyhow::Result<()> {
+        self.lpm_insert("MAC_LPM_ROUTING_MAP", key, bitmap)
     }
 
     fn add_domain_ip_bitmap(
@@ -537,8 +518,7 @@ impl EbpfBackend for RealEbpfBackend {
         bitmap: &DomainRouting,
     ) -> anyhow::Result<()> {
         let bitmap = bitmap.for_generation(self.active_routing_generation()?);
-        let key_bytes = unsafe { as_bytes(&ip_key.data) };
-        Self::or_update_bitmap_raw(self.bpf_mut()?, "DOMAIN_ROUTING_MAP", key_bytes, &bitmap)
+        self.or_update_domain_bitmap(&ip_key.data, &bitmap)
     }
 
     fn set_domain_ip_bitmap(
@@ -549,28 +529,14 @@ impl EbpfBackend for RealEbpfBackend {
         let generation = self
             .active_routing_generation()
             .map_err(super::DomainRouteWriteError::Other)?;
-        let key_bytes = unsafe { as_bytes(&ip_key.data) };
-        let mut buf = vec![0u8; core::mem::size_of::<DomainRouting>()];
-        let mut current = match bpf_hash_lookup(
-            self.bpf().map_err(super::DomainRouteWriteError::Other)?,
-            "DOMAIN_ROUTING_MAP",
-            key_bytes,
-            &mut buf,
-        )
-        .map_err(super::DomainRouteWriteError::Other)?
-        {
-            Some(()) => unsafe { from_bytes::<DomainRouting>(&buf) },
-            None => DomainRouting::default(),
-        };
+        let mut current = self
+            .hash_lookup::<_, DomainRouting>("DOMAIN_ROUTING_MAP", &ip_key.data)
+            .map_err(super::DomainRouteWriteError::Other)?
+            .unwrap_or_default();
         let offset = generation as usize * ROUTING_BITMAP_WORDS_PER_GENERATION;
         current.bitmap[offset..offset + ROUTING_BITMAP_WORDS_PER_GENERATION]
             .copy_from_slice(&bitmap.bitmap[..ROUTING_BITMAP_WORDS_PER_GENERATION]);
-        let bpf = self
-            .bpf_mut()
-            .map_err(super::DomainRouteWriteError::Other)?;
-        bpf_hash_insert_domain(bpf, "DOMAIN_ROUTING_MAP", key_bytes, unsafe {
-            as_bytes(&current)
-        })
+        self.domain_insert(&ip_key.data, &current)
     }
 
     fn remove_domain_ip_bitmap(
@@ -580,31 +546,19 @@ impl EbpfBackend for RealEbpfBackend {
         let generation = self
             .active_routing_generation()
             .map_err(super::DomainRouteWriteError::Other)?;
-        let key_bytes = unsafe { as_bytes(&ip_key.data) };
-        let mut buf = vec![0u8; core::mem::size_of::<DomainRouting>()];
-        let Some(()) = bpf_hash_lookup(
-            self.bpf().map_err(super::DomainRouteWriteError::Other)?,
-            "DOMAIN_ROUTING_MAP",
-            key_bytes,
-            &mut buf,
-        )
-        .map_err(super::DomainRouteWriteError::Other)?
+        let Some(mut bitmap) = self
+            .hash_lookup::<_, DomainRouting>("DOMAIN_ROUTING_MAP", &ip_key.data)
+            .map_err(super::DomainRouteWriteError::Other)?
         else {
             return Ok(());
         };
-        let mut bitmap = unsafe { from_bytes::<DomainRouting>(&buf) };
         let offset = generation as usize * ROUTING_BITMAP_WORDS_PER_GENERATION;
         bitmap.bitmap[offset..offset + ROUTING_BITMAP_WORDS_PER_GENERATION].fill(0);
-        let bpf = self
-            .bpf_mut()
-            .map_err(super::DomainRouteWriteError::Other)?;
         if bitmap.bitmap.iter().all(|word| *word == 0) {
-            bpf_hash_delete(bpf, "DOMAIN_ROUTING_MAP", key_bytes)
+            self.hash_remove::<_, DomainRouting>("DOMAIN_ROUTING_MAP", &ip_key.data)
                 .map_err(super::DomainRouteWriteError::Other)
         } else {
-            bpf_hash_insert_domain(bpf, "DOMAIN_ROUTING_MAP", key_bytes, unsafe {
-                as_bytes(&bitmap)
-            })
+            self.domain_insert(&ip_key.data, &bitmap)
         }
     }
 
@@ -618,104 +572,93 @@ impl EbpfBackend for RealEbpfBackend {
             "invalid routing generation {generation}"
         );
         let offset = generation as usize * ROUTING_BITMAP_WORDS_PER_GENERATION;
-        let keys = self.collect_keys("DOMAIN_ROUTING_MAP", core::mem::size_of::<[u32; 4]>())?;
+        let keys = self
+            .hash_map::<[u32; 4], DomainRouting>("DOMAIN_ROUTING_MAP")?
+            .keys()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| anyhow::anyhow!("map 'DOMAIN_ROUTING_MAP' keys: {error}"))?;
         for key in keys {
-            let mut buf = vec![0u8; core::mem::size_of::<DomainRouting>()];
-            let Some(()) = bpf_hash_lookup(self.bpf()?, "DOMAIN_ROUTING_MAP", &key, &mut buf)?
+            let Some(mut bitmap) =
+                self.hash_lookup::<_, DomainRouting>("DOMAIN_ROUTING_MAP", &key)?
             else {
                 continue;
             };
-            let mut bitmap = unsafe { from_bytes::<DomainRouting>(&buf) };
             bitmap.bitmap[offset..offset + ROUTING_BITMAP_WORDS_PER_GENERATION].fill(0);
-            bpf_hash_insert(self.bpf_mut()?, "DOMAIN_ROUTING_MAP", &key, unsafe {
-                as_bytes(&bitmap)
-            })?;
+            self.hash_insert("DOMAIN_ROUTING_MAP", &key, &bitmap)?;
         }
         for (key, logical) in entries {
-            let key_bytes = unsafe { as_bytes(&key.data) };
-            let mut buf = vec![0u8; core::mem::size_of::<DomainRouting>()];
-            let mut bitmap =
-                match bpf_hash_lookup(self.bpf()?, "DOMAIN_ROUTING_MAP", key_bytes, &mut buf)? {
-                    Some(()) => unsafe { from_bytes::<DomainRouting>(&buf) },
-                    None => DomainRouting::default(),
-                };
+            let mut bitmap = self
+                .hash_lookup::<_, DomainRouting>("DOMAIN_ROUTING_MAP", &key.data)?
+                .unwrap_or_default();
             bitmap.bitmap[offset..offset + ROUTING_BITMAP_WORDS_PER_GENERATION]
                 .copy_from_slice(&logical.bitmap[..ROUTING_BITMAP_WORDS_PER_GENERATION]);
-            bpf_hash_insert(self.bpf_mut()?, "DOMAIN_ROUTING_MAP", key_bytes, unsafe {
-                as_bytes(&bitmap)
-            })?;
+            self.hash_insert("DOMAIN_ROUTING_MAP", &key.data, &bitmap)?;
         }
         Ok(())
     }
 
     fn add_ip_route(&mut self, prefix: &str, outbound: OutboundIndex) -> anyhow::Result<()> {
-        let lk = maps::cidr_to_lpm_key(prefix)?;
+        let key = maps::cidr_to_lpm_key(prefix)?;
         let mut routing = DomainRouting::default();
-        let ob = outbound as u32;
-        let wi = (ob / 32) as usize;
-        if wi < ROUTING_BITMAP_WORDS_PER_GENERATION {
-            routing.bitmap[wi] = 1 << (ob % 32);
+        let outbound = outbound as u32;
+        let word = (outbound / 32) as usize;
+        if word < ROUTING_BITMAP_WORDS_PER_GENERATION {
+            routing.bitmap[word] = 1 << (outbound % 32);
         }
         let routing = routing.for_generation(self.active_routing_generation()?);
-        let key_bytes = unsafe { as_bytes(&lk.data) };
-        bpf_hash_insert(self.bpf_mut()?, "DOMAIN_ROUTING_MAP", key_bytes, unsafe {
-            as_bytes(&routing)
-        })
+        self.hash_insert("DOMAIN_ROUTING_MAP", &key.data, &routing)
     }
 
     fn clear_routes(&mut self) -> anyhow::Result<()> {
-        let d = MatchSet::default();
-        for i in 0..ROUTING_MAP_LEN as u32 {
-            let _ = self.array_set("ROUTING_MAP", i, &d);
+        let empty_rule = MatchSet::default();
+        for index in 0..ROUTING_MAP_LEN as u32 {
+            self.array_set("ROUTING_MAP", index, &empty_rule)?;
         }
-        for i in 0..ROUTING_META_MAP_LEN as u32 {
-            let _ = self.array_set("ROUTING_META_MAP", i, &0u32);
+        for index in 0..ROUTING_META_MAP_LEN as u32 {
+            self.array_set("ROUTING_META_MAP", index, &0u32)?;
         }
-        for i in 0..ROUTING_GROUP_META_MAP_LEN as u32 {
-            let _ = self.array_set("ROUTING_GROUP_META_MAP", i, &RoutingGroupMeta::default());
+        for index in 0..ROUTING_GROUP_META_MAP_LEN as u32 {
+            self.array_set(
+                "ROUTING_GROUP_META_MAP",
+                index,
+                &RoutingGroupMeta::default(),
+            )?;
         }
-        // DOMAIN_ROUTING_MAP is HashMap<[__be32; 4], DomainRouting>: the key
-        // is the 16-byte IP data alone, NOT the 20-byte LpmKey.
-        for kb in self
-            .collect_keys("DOMAIN_ROUTING_MAP", core::mem::size_of::<[u32; 4]>())
-            .unwrap_or_default()
-        {
-            let _ = bpf_hash_delete(self.bpf_mut()?, "DOMAIN_ROUTING_MAP", &kb);
+        let domain_keys = self
+            .hash_map::<[u32; 4], DomainRouting>("DOMAIN_ROUTING_MAP")?
+            .keys()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| anyhow::anyhow!("map 'DOMAIN_ROUTING_MAP' keys: {error}"))?;
+        for key in domain_keys {
+            self.hash_remove::<_, DomainRouting>("DOMAIN_ROUTING_MAP", &key)?;
         }
-        // Clear per-match-type LPM tries so stale prefixes from the previous
-        // ruleset do not influence the new one.
-        for map_name in &[
+        for name in [
             "DEST_LPM_ROUTING_MAP",
             "SOURCE_LPM_ROUTING_MAP",
             "MAC_LPM_ROUTING_MAP",
         ] {
-            for kb in self
-                .collect_keys(map_name, core::mem::size_of::<LpmKey>())
-                .unwrap_or_default()
-            {
-                let _ = bpf_hash_delete(self.bpf_mut()?, map_name, &kb);
+            for key in self.lpm_keys(name)? {
+                self.lpm_remove(name, &key)?;
             }
         }
         Ok(())
     }
 
     fn prune_lpm_entries(&mut self, keep: &LpmKeepSet) -> anyhow::Result<()> {
-        // Keep every key referenced by the active or staged generation.
-        // A key retired by the latest switch remains for one transition so a
-        // packet that already read the old selector cannot observe its LPM
-        // value disappear mid-evaluation.
-        for (map_name, keys) in [
+        // Retain both banks for one transition so readers that captured the
+        // previous selector cannot lose an LPM value mid-evaluation.
+        for (name, retained) in [
             ("DEST_LPM_ROUTING_MAP", &keep.dest),
             ("SOURCE_LPM_ROUTING_MAP", &keep.source),
             ("MAC_LPM_ROUTING_MAP", &keep.mac),
         ] {
-            for kb in self.collect_keys(map_name, core::mem::size_of::<LpmKey>())? {
-                let mut raw = [0u8; 20];
-                if kb.len() >= 20 {
-                    raw.copy_from_slice(&kb[..20]);
-                }
-                if !keys.contains(&raw) {
-                    bpf_hash_delete(self.bpf_mut()?, map_name, &kb)?;
+            for key in self.lpm_keys(name)? {
+                let key_bytes = maps::lpm_key_bytes(&LpmKey {
+                    prefix_len: key.prefix_len(),
+                    data: key.data(),
+                });
+                if !retained.contains(&key_bytes) {
+                    self.lpm_remove(name, &key)?;
                 }
             }
         }
@@ -729,7 +672,7 @@ impl EbpfBackend for RealEbpfBackend {
         self.hash_insert("CONN_STATE_MAP", k, s)
     }
     fn tcp_conn_state_remove(&mut self, k: &TuplesKey) -> anyhow::Result<()> {
-        self.hash_remove("CONN_STATE_MAP", k)
+        self.hash_remove::<_, ConnState>("CONN_STATE_MAP", k)
     }
 
     fn udp_conn_state_lookup(&self, k: &TuplesKey) -> anyhow::Result<Option<ConnState>> {
@@ -739,7 +682,7 @@ impl EbpfBackend for RealEbpfBackend {
         self.hash_insert("CONN_STATE_MAP", k, s)
     }
     fn udp_conn_state_remove(&mut self, k: &TuplesKey) -> anyhow::Result<()> {
-        self.hash_remove("CONN_STATE_MAP", k)
+        self.hash_remove::<_, ConnState>("CONN_STATE_MAP", k)
     }
 
     fn redirect_track_lookup(&self, k: &RedirectTuple) -> anyhow::Result<Option<RedirectEntry>> {
@@ -749,50 +692,38 @@ impl EbpfBackend for RealEbpfBackend {
         self.hash_insert("REDIRECT_TRACK", k, e)
     }
     fn redirect_track_remove(&mut self, k: &RedirectTuple) -> anyhow::Result<()> {
-        self.hash_remove("REDIRECT_TRACK", k)
+        self.hash_remove::<_, RedirectEntry>("REDIRECT_TRACK", k)
     }
 
-    fn routing_handoff_take(&self, k: &TuplesKey) -> anyhow::Result<Option<RoutingHandoffEntry>> {
+    fn routing_handoff_take(&self, key: &TuplesKey) -> anyhow::Result<Option<RoutingHandoffEntry>> {
         let bpf = self.bpf()?;
-        let key = unsafe { as_bytes(k) };
-        let mut val = core::mem::MaybeUninit::<RoutingHandoffEntry>::uninit();
-        let buf = unsafe {
-            core::slice::from_raw_parts_mut(
-                val.as_mut_ptr() as *mut u8,
-                core::mem::size_of::<RoutingHandoffEntry>(),
-            )
-        };
-        // Fast path: a single BPF_MAP_LOOKUP_AND_DELETE_ELEM syscall.
-        match bpf_lookup_and_delete(
+        match bpf_lookup_and_delete::<_, RoutingHandoffEntry>(
             bpf,
             &self.cap_lookup_and_delete,
             "ROUTING_HANDOFF_MAP",
             key,
-            buf,
         )? {
-            Some(true) => return Ok(Some(unsafe { val.assume_init() })),
-            Some(false) => return Ok(None),
-            None => {}
+            LookupAndDelete::Value(entry) => return Ok(Some(entry)),
+            LookupAndDelete::Missing => return Ok(None),
+            LookupAndDelete::Unsupported => {}
         }
-        // Fallback for kernels without LOOKUP_AND_DELETE_ELEM (< 4.20):
-        // lookup + delete in two syscalls.  Not atomic — the datapath may
-        // re-insert between the calls, dropping a fresh entry; the flow is
-        // then re-routed in userspace, which is harmless.
-        let entry: Option<RoutingHandoffEntry> = self.hash_lookup("ROUTING_HANDOFF_MAP", k)?;
+        // The pre-4.20 fallback is intentionally non-atomic. A concurrent
+        // replacement can be dropped, but this handoff is only a routing hint.
+        let entry = self.hash_lookup("ROUTING_HANDOFF_MAP", key)?;
         if entry.is_some() {
-            bpf_hash_delete(bpf, "ROUTING_HANDOFF_MAP", key)?;
+            bpf_delete_shared(bpf, "ROUTING_HANDOFF_MAP", key)?;
         }
         Ok(entry)
     }
 
-    fn cookie_pid_lookup(&self, c: u64) -> anyhow::Result<Option<PidPname>> {
+    fn cookie_pid_lookup(&self, c: u64) -> anyhow::Result<Option<PIDName>> {
         self.hash_lookup("COOKIE_PID_MAP", &c)
     }
-    fn cookie_pid_store(&mut self, c: u64, e: &PidPname) -> anyhow::Result<()> {
+    fn cookie_pid_store(&mut self, c: u64, e: &PIDName) -> anyhow::Result<()> {
         self.hash_insert("COOKIE_PID_MAP", &c, e)
     }
-    fn cookie_pid_remove(&mut self, c: &u64) -> anyhow::Result<()> {
-        self.hash_remove("COOKIE_PID_MAP", c)
+    fn cookie_pid_remove(&mut self, cookie: &u64) -> anyhow::Result<()> {
+        self.hash_remove::<_, PIDName>("COOKIE_PID_MAP", cookie)
     }
 
     fn redirect_track_snapshot(
@@ -835,57 +766,46 @@ impl EbpfBackend for RealEbpfBackend {
         chunk_size: usize,
         visit: &mut crate::ebpf::ConnStateChunkVisitor<'_>,
     ) -> anyhow::Result<()> {
-        let bpf = self.bpf()?;
-        // Stream chunks straight from the kernel when LOOKUP_BATCH is
-        // available; otherwise fall back to the snapshot-based default.
-        if syscall::bpf_lookup_batch_scan_cb(bpf, &self.cap_lookup_batch, "CONN_STATE_MAP", visit)?
-        {
-            return Ok(());
-        }
-        let mut entries = Vec::new();
-        self.map_snapshot("CONN_STATE_MAP", &mut entries)?;
-        for chunk in entries.chunks(chunk_size.max(1)) {
-            if !visit(chunk) {
-                break;
-            }
-        }
-        Ok(())
+        self.for_each_map_chunk("CONN_STATE_MAP", chunk_size, visit)
     }
 
     fn conn_state_remove_batch(&mut self, keys: &[TuplesKey]) -> anyhow::Result<()> {
-        self.map_delete_batch("CONN_STATE_MAP", keys)
+        self.map_delete_batch::<_, ConnState>("CONN_STATE_MAP", keys)
     }
 
     fn conn_state_occupancy(&self) -> anyhow::Result<(u64, u64)> {
         let bpf = self.bpf()?;
-        // Objects from an older build (supplied via --bpf-object) may not
-        // carry the gauge; report zeros instead of failing.
-        if bpf.map("CONN_STATE_OCCUPANCY").is_none() {
+        let Some(map) = bpf.map("CONN_STATE_OCCUPANCY") else {
             return Ok((0, 0));
-        }
-        let ncpu = possible_cpus();
-        let mut slots = [0u64; 2];
-        for (i, slot) in [
+        };
+        let array = AyaPerCpuArray::<_, u64>::try_from(map)
+            .map_err(|error| anyhow::anyhow!("map 'CONN_STATE_OCCUPANCY': {error}"))?;
+        let mut totals = [0u64; 2];
+        for (index, slot) in [
             honk_ebpf_common::conn::OCCUPANCY_INSERTS,
             honk_ebpf_common::conn::OCCUPANCY_EBPF_DELETES,
         ]
         .into_iter()
         .enumerate()
         {
-            let mut buf = vec![0u8; ncpu * 8];
-            if let Some(()) = bpf_hash_lookup(
-                bpf,
-                "CONN_STATE_OCCUPANCY",
-                unsafe { as_bytes(&slot) },
-                &mut buf,
-            )? {
-                slots[i] = sum_percpu_u64(&buf, ncpu);
+            match array.get(&slot, 0) {
+                Ok(values) => {
+                    totals[index] = values
+                        .iter()
+                        .fold(0u64, |total, value| total.wrapping_add(*value));
+                }
+                Err(MapError::KeyNotFound) => {}
+                Err(error) => {
+                    return Err(anyhow::anyhow!(
+                        "map 'CONN_STATE_OCCUPANCY' get[{slot}]: {error}"
+                    ));
+                }
             }
         }
-        Ok((slots[0], slots[1]))
+        Ok((totals[0], totals[1]))
     }
 
-    fn cookie_pid_snapshot(&self, out: &mut Vec<(u64, PidPname)>) -> anyhow::Result<()> {
+    fn cookie_pid_snapshot(&self, out: &mut Vec<(u64, PIDName)>) -> anyhow::Result<()> {
         self.map_snapshot("COOKIE_PID_MAP", out)
     }
 
@@ -897,15 +817,15 @@ impl EbpfBackend for RealEbpfBackend {
     }
 
     fn redirect_track_remove_batch(&mut self, keys: &[RedirectTuple]) -> anyhow::Result<()> {
-        self.map_delete_batch("REDIRECT_TRACK", keys)
+        self.map_delete_batch::<_, RedirectEntry>("REDIRECT_TRACK", keys)
     }
 
     fn cookie_pid_remove_batch(&mut self, cookies: &[u64]) -> anyhow::Result<()> {
-        self.map_delete_batch("COOKIE_PID_MAP", cookies)
+        self.map_delete_batch::<_, PIDName>("COOKIE_PID_MAP", cookies)
     }
 
     fn routing_handoff_remove_batch(&mut self, keys: &[TuplesKey]) -> anyhow::Result<()> {
-        self.map_delete_batch("ROUTING_HANDOFF_MAP", keys)
+        self.map_delete_batch::<_, RoutingHandoffEntry>("ROUTING_HANDOFF_MAP", keys)
     }
 
     fn conn_state_remove_if_unchanged(
@@ -922,7 +842,7 @@ impl EbpfBackend for RealEbpfBackend {
                         && current.last_seen_ns <= expired_before_ns
                 })
             {
-                self.hash_remove("CONN_STATE_MAP", key)?;
+                self.hash_remove::<_, ConnState>("CONN_STATE_MAP", key)?;
                 removed += 1;
             }
         }
@@ -943,7 +863,7 @@ impl EbpfBackend for RealEbpfBackend {
                         && current.last_seen_ns <= expired_before_ns
                 })
             {
-                self.hash_remove("REDIRECT_TRACK", key)?;
+                self.hash_remove::<_, RedirectEntry>("REDIRECT_TRACK", key)?;
                 removed += 1;
             }
         }
@@ -952,19 +872,19 @@ impl EbpfBackend for RealEbpfBackend {
 
     fn cookie_pid_remove_if_unchanged(
         &mut self,
-        entries: &[(u64, PidPname)],
+        entries: &[(u64, PIDName)],
         expired_before_ns: u64,
     ) -> anyhow::Result<u64> {
         let mut removed = 0;
         for (cookie, scanned) in entries {
             if self
-                .hash_lookup::<_, PidPname>("COOKIE_PID_MAP", cookie)?
+                .hash_lookup::<_, PIDName>("COOKIE_PID_MAP", cookie)?
                 .is_some_and(|current| {
                     current.last_seen_ns == scanned.last_seen_ns
                         && current.last_seen_ns <= expired_before_ns
                 })
             {
-                self.hash_remove("COOKIE_PID_MAP", cookie)?;
+                self.hash_remove::<_, PIDName>("COOKIE_PID_MAP", cookie)?;
                 removed += 1;
             }
         }
@@ -985,79 +905,73 @@ impl EbpfBackend for RealEbpfBackend {
                         && current.last_seen_ns <= expired_before_ns
                 })
             {
-                self.hash_remove("ROUTING_HANDOFF_MAP", key)?;
+                self.hash_remove::<_, RoutingHandoffEntry>("ROUTING_HANDOFF_MAP", key)?;
                 removed += 1;
             }
         }
         Ok(removed)
     }
 
-    fn set_outbound_alive(&mut self, o: u8, d: u32, ip: u32, alive: bool) -> anyhow::Result<()> {
-        let k = conn_key(o, d, ip);
-        let v: u64 = if alive { 1 } else { 0 };
-        bpf_hash_insert(
-            self.bpf_mut()?,
-            "OUTBOUND_CONNECTIVITY_MAP",
-            unsafe { as_bytes(&k) },
-            unsafe { as_bytes(&v) },
-        )
+    fn set_outbound_alive(
+        &mut self,
+        outbound: u8,
+        domain: u32,
+        ipver: u32,
+        alive: bool,
+    ) -> anyhow::Result<()> {
+        let key = conn_key(outbound, domain, ipver);
+        self.array_set("OUTBOUND_CONNECTIVITY_MAP", key, &u64::from(alive))
     }
 
-    fn get_outbound_alive(&self, o: u8, d: u32, ip: u32) -> anyhow::Result<bool> {
-        let k = conn_key(o, d, ip);
-        let mut buf = [0u8; 8];
-        match bpf_hash_lookup(
-            self.bpf()?,
-            "OUTBOUND_CONNECTIVITY_MAP",
-            unsafe { as_bytes(&k) },
-            &mut buf,
-        )? {
-            Some(()) => Ok(u64::from_ne_bytes(buf) != 0),
-            None => Ok(false),
-        }
+    fn get_outbound_alive(&self, outbound: u8, domain: u32, ipver: u32) -> anyhow::Result<bool> {
+        let key = conn_key(outbound, domain, ipver);
+        Ok(self
+            .array_get::<u64>("OUTBOUND_CONNECTIVITY_MAP", key)?
+            .unwrap_or(0)
+            != 0)
     }
 
-    fn get_outbound_stats(&self, o: OutboundIndex) -> anyhow::Result<OutboundStats> {
+    fn get_outbound_stats(&self, outbound: OutboundIndex) -> anyhow::Result<OutboundStats> {
         let bpf = self.bpf()?;
-        // Objects from an older build (supplied via --bpf-object) may not
-        // carry the OUTBOUND_STATS map; report zeros instead of failing.
-        if bpf.map("OUTBOUND_STATS").is_none() {
+        let Some(map) = bpf.map("OUTBOUND_STATS") else {
             return Ok(OutboundStats::default());
-        }
-        let o = o as u8;
-        let mut stats = OutboundStats::default();
-        let ncpu = possible_cpus();
-        let mut buf = vec![0u8; ncpu * core::mem::size_of::<OutboundStatsCounters>()];
-        let idx = OutboundStatsCounters::for_outbound(o);
-        if let Some(()) =
-            bpf_hash_lookup(bpf, "OUTBOUND_STATS", unsafe { as_bytes(&idx) }, &mut buf)?
-        {
-            let (cpus, _) = buf.as_chunks::<{ core::mem::size_of::<OutboundStatsCounters>() }>();
-            for cpu in cpus {
-                let counters = unsafe {
-                    core::ptr::read_unaligned(cpu.as_ptr().cast::<OutboundStatsCounters>())
-                };
-                stats.tx_packets = stats.tx_packets.wrapping_add(counters.tx_packets);
-                stats.tx_bytes = stats.tx_bytes.wrapping_add(counters.tx_bytes);
-                stats.rx_packets = stats.rx_packets.wrapping_add(counters.rx_packets);
-                stats.rx_bytes = stats.rx_bytes.wrapping_add(counters.rx_bytes);
+        };
+        let array = AyaPerCpuArray::<_, OutboundStatsCounters>::try_from(map)
+            .map_err(|error| anyhow::anyhow!("map 'OUTBOUND_STATS': {error}"))?;
+        let index = OutboundStatsCounters::for_outbound(outbound as u8);
+        let values = match array.get(&index, 0) {
+            Ok(values) => values,
+            Err(MapError::KeyNotFound) => return Ok(OutboundStats::default()),
+            Err(error) => {
+                anyhow::bail!("map 'OUTBOUND_STATS' get[{index}]: {error}");
             }
+        };
+        let mut stats = OutboundStats::default();
+        for counters in values.iter() {
+            stats.tx_packets = stats.tx_packets.wrapping_add(counters.tx_packets);
+            stats.tx_bytes = stats.tx_bytes.wrapping_add(counters.tx_bytes);
+            stats.rx_packets = stats.rx_packets.wrapping_add(counters.rx_packets);
+            stats.rx_bytes = stats.rx_bytes.wrapping_add(counters.rx_bytes);
         }
         Ok(stats)
     }
-    fn clear_outbound_stats(&mut self, o: OutboundIndex) -> anyhow::Result<()> {
+    fn clear_outbound_stats(&mut self, outbound: OutboundIndex) -> anyhow::Result<()> {
         if self.bpf()?.map("OUTBOUND_STATS").is_none() {
             return Ok(());
         }
-        let zeros = vec![0u8; possible_cpus() * core::mem::size_of::<OutboundStatsCounters>()];
-        let idx = OutboundStatsCounters::for_outbound(o as u8);
-        bpf_hash_insert(
-            self.bpf_mut()?,
-            "OUTBOUND_STATS",
-            unsafe { as_bytes(&idx) },
-            &zeros,
-        )?;
-        Ok(())
+        let cpu_count = aya::util::nr_cpus()
+            .map_err(|(path, error)| anyhow::anyhow!("read {path}: {error}"))?;
+        let zeros = PerCpuValues::try_from(vec![OutboundStatsCounters::default(); cpu_count])?;
+        let map = self
+            .bpf_mut()?
+            .map_mut("OUTBOUND_STATS")
+            .ok_or_else(|| anyhow::anyhow!("map 'OUTBOUND_STATS' not found"))?;
+        let mut array = AyaPerCpuArray::<_, OutboundStatsCounters>::try_from(map)
+            .map_err(|error| anyhow::anyhow!("map 'OUTBOUND_STATS': {error}"))?;
+        let index = OutboundStatsCounters::for_outbound(outbound as u8);
+        array
+            .set(index, zeros, 0)
+            .map_err(|error| anyhow::anyhow!("map 'OUTBOUND_STATS' set[{index}]: {error}"))
     }
     fn get_bpf_stats(&self, k: u32) -> anyhow::Result<Option<u64>> {
         self.array_get("BPF_STATS_MAP", k)
@@ -1079,11 +993,7 @@ impl EbpfBackend for RealEbpfBackend {
         info!(
             "Detaching BPF hooks (lan_ingress, lan_egress, wan_egress, wan_ingress, bond slaves, bridge slaves, cgroup, dae0, sk_lookup)"
         );
-        self.lan_ingress_link = None;
-        self.lan_egress_link = None;
-        self.wan_egress_link = None;
-        self.wan_ingress_link = None;
-        self.dynamic_links.clear();
+        self.interface_links.clear();
         self.cgroup_sock_links.clear();
         self.cgroup_sock_addr_links.clear();
         self.dae0_ingress_link = None;
@@ -1220,32 +1130,36 @@ impl EbpfBackend for RealEbpfBackend {
         udp6_fds: &[RawFd],
     ) -> anyhow::Result<()> {
         self.listeners_published = false;
-        // Publish the listener FDs so the sk_lookup/dae0peer programs can
-        // `bpf_sk_assign` proxy-bound flows. Key mapping: 0=tcp4, 1=tcp6,
-        // 2..=UDP4 group, 2+4..=UDP6 group (see sk_lookup.rs). The programs
-        // hash the flow tuple into the group, so each socket must sit at its
-        // exact slot.
+        // Slot layout is part of the sk_lookup ABI: TCP4/TCP6, then four
+        // UDP4 sockets and four UDP6 sockets.
         let mut entries = vec![(0u32, tcp4_fd), (1u32, tcp6_fd)];
-        for (i, fd) in udp4_fds.iter().enumerate() {
-            entries.push((2 + i as u32, *fd));
-        }
-        for (i, fd) in udp6_fds.iter().enumerate() {
-            entries.push((6 + i as u32, *fd));
-        }
-        for (key, fd) in entries {
-            // SockMap expects a 4-byte socket FD as the value, not an 8-byte pointer.
-            let fd_u32 = fd as u32;
-            bpf_hash_insert(
-                self.bpf_mut()?,
-                "LISTEN_SOCKET_MAP",
-                unsafe { as_bytes(&key) },
-                unsafe { as_bytes(&fd_u32) },
-            )
-            .map_err(|e| anyhow::anyhow!("listen_socket_map update key={}: {}", key, e))?;
-            info!(
-                "Published listener fd {} to LISTEN_SOCKET_MAP key {}",
-                fd, key
-            );
+        entries.extend(
+            udp4_fds
+                .iter()
+                .enumerate()
+                .map(|(index, fd)| (2 + index as u32, *fd)),
+        );
+        entries.extend(
+            udp6_fds
+                .iter()
+                .enumerate()
+                .map(|(index, fd)| (6 + index as u32, *fd)),
+        );
+        {
+            let map = self
+                .bpf_mut()?
+                .map_mut("LISTEN_SOCKET_MAP")
+                .ok_or_else(|| anyhow::anyhow!("map 'LISTEN_SOCKET_MAP' not found"))?;
+            let mut sockets = AyaSockMap::try_from(map)
+                .map_err(|error| anyhow::anyhow!("map 'LISTEN_SOCKET_MAP': {error}"))?;
+            for (key, fd) in entries {
+                // The control plane owns every listener for this entire call.
+                let socket = unsafe { BorrowedFd::borrow_raw(fd) };
+                sockets.set(key, &socket, 0).map_err(|error| {
+                    anyhow::anyhow!("map 'LISTEN_SOCKET_MAP' set[{key}]: {error}")
+                })?;
+                info!(fd, key, "Published listener socket to LISTEN_SOCKET_MAP");
+            }
         }
         self.listeners_published = true;
         Ok(())

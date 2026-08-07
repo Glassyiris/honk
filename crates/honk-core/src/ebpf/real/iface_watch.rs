@@ -3,8 +3,11 @@
 //! re-expands LAN bridge/bond slaves, and follows WAN bond slaves so newly
 //! added physical egress paths receive the matching hooks.
 
+use nix::sys::socket::{
+    AddressFamily, MsgFlags, NetlinkAddr, SockFlag, SockProtocol, SockType, bind, recv, socket,
+};
 use std::collections::HashMap;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -68,32 +71,14 @@ impl IfaceWatcher {
 }
 
 fn subscribe_links() -> std::io::Result<OwnedFd> {
-    // SAFETY: plain socket creation; OwnedFd takes ownership on success.
-    let raw = unsafe {
-        libc::socket(
-            libc::AF_NETLINK,
-            libc::SOCK_RAW | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
-            libc::NETLINK_ROUTE,
-        )
-    };
-    if raw < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-    let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
-    addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
-    addr.nl_groups = RTMGRP_LINK_MASK;
-    // SAFETY: addr is a valid sockaddr_nl for this socket.
-    let rc = unsafe {
-        libc::bind(
-            fd.as_raw_fd(),
-            &addr as *const libc::sockaddr_nl as *const libc::sockaddr,
-            std::mem::size_of::<libc::sockaddr_nl>() as u32,
-        )
-    };
-    if rc < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    let fd = socket(
+        AddressFamily::Netlink,
+        SockType::Raw,
+        SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+        Some(SockProtocol::NetlinkRoute),
+    )
+    .map_err(std::io::Error::from)?;
+    bind(fd.as_raw_fd(), &NetlinkAddr::new(0, RTMGRP_LINK_MASK)).map_err(std::io::Error::from)?;
     Ok(fd)
 }
 
@@ -136,20 +121,11 @@ async fn run(
                 };
                 // Drain pending link events; their contents are irrelevant
                 // because reconcile re-derives state from /sys.
-                let drained = guard.try_io(|inner| {
-                    loop {
-                        // SAFETY: buf is a valid writable region; fd is
-                        // non-blocking, so EAGAIN ends the drain.
-                        let n = unsafe {
-                            libc::recv(
-                                inner.as_raw_fd(),
-                                buf.as_mut_ptr().cast(),
-                                buf.len(),
-                                0,
-                            )
-                        };
-                        if n < 0 {
-                            let e = std::io::Error::last_os_error();
+                let drained = guard.try_io(|inner| loop {
+                    match recv(inner.as_raw_fd(), &mut buf, MsgFlags::empty()) {
+                        Ok(_) => {}
+                        Err(errno) => {
+                            let e = std::io::Error::from(errno);
                             if e.kind() == std::io::ErrorKind::WouldBlock {
                                 return Ok(());
                             }

@@ -341,14 +341,6 @@ pub struct RedirectEntry {
     pub ifindex: u32,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-#[repr(C)]
-pub struct PidPname {
-    pub last_seen_ns: u64,
-    pub pid: u32,
-    pub pname: [u8; 16],
-}
-
 /// Bits of the single-slot `DATAPATH_FLAGS_MAP` array, written by userspace
 /// at runtime (unlike `DaeParam`, which is fixed at load time).  They encode
 /// the mode-based direct-offload policy and are read **once per new flow**
@@ -434,6 +426,9 @@ pub struct OutboundStatsCounters {
     pub rx_packets: u64,
     pub rx_bytes: u64,
 }
+
+#[cfg(not(target_arch = "bpf"))]
+unsafe impl aya::Pod for OutboundStatsCounters {}
 
 impl OutboundStatsCounters {
     #[inline(always)]

@@ -165,8 +165,8 @@ pub struct MockEbpfBackend {
     /// Behind a Mutex because `routing_handoff_take` takes `&self` (the
     /// per-connection hot path holds only a read lock on the backend).
     pub routing_handoffs: std::sync::Mutex<HashMap<[u8; 40], RoutingHandoffEntry>>,
-    /// Cookie PID map (cookie → PidPname)
-    pub cookie_pids: HashMap<u64, PidPname>,
+    /// Cookie PID map (cookie → PIDName)
+    pub cookie_pids: HashMap<u64, PIDName>,
     /// Outbound alive bitmap: (outbound*6 + domain*2 + ipver) → 0|1
     pub outbound_alive: HashMap<u32, u32>,
     /// BPF statistics overflow counters
@@ -820,11 +820,11 @@ impl EbpfBackend for MockEbpfBackend {
             .remove(&Self::tuples_key_bytes(key)))
     }
 
-    fn cookie_pid_lookup(&self, cookie: u64) -> anyhow::Result<Option<PidPname>> {
+    fn cookie_pid_lookup(&self, cookie: u64) -> anyhow::Result<Option<PIDName>> {
         Ok(self.cookie_pids.get(&cookie).copied())
     }
 
-    fn cookie_pid_store(&mut self, cookie: u64, entry: &PidPname) -> anyhow::Result<()> {
+    fn cookie_pid_store(&mut self, cookie: u64, entry: &PIDName) -> anyhow::Result<()> {
         self.cookie_pids.insert(cookie, *entry);
         Ok(())
     }
@@ -919,7 +919,7 @@ impl EbpfBackend for MockEbpfBackend {
         Ok(())
     }
 
-    fn cookie_pid_snapshot(&self, out: &mut Vec<(u64, PidPname)>) -> anyhow::Result<()> {
+    fn cookie_pid_snapshot(&self, out: &mut Vec<(u64, PIDName)>) -> anyhow::Result<()> {
         out.extend(self.cookie_pids.iter().map(|(&c, &e)| (c, e)));
         Ok(())
     }
@@ -1064,7 +1064,7 @@ impl EbpfBackend for MockEbpfBackend {
 
     fn cookie_pid_remove_if_unchanged(
         &mut self,
-        entries: &[(u64, PidPname)],
+        entries: &[(u64, PIDName)],
         expired_before_ns: u64,
     ) -> anyhow::Result<u64> {
         let mut removed = 0;
@@ -1588,7 +1588,7 @@ mod tests {
             ..Default::default()
         };
         backend.redirect_track_store(&rt_key, &rt_entry).unwrap();
-        backend.cookie_pid_store(42, &PidPname::default()).unwrap();
+        backend.cookie_pid_store(42, &PIDName::default()).unwrap();
 
         let handoff_key = TuplesKey {
             src_ip: In6Addr::default(),
@@ -1802,7 +1802,7 @@ mod tests {
         let mut backend = MockEbpfBackend::new();
 
         let cookie: u64 = 0xDEAD_BEEF_CAFE_BABE;
-        let entry = PidPname {
+        let entry = PIDName {
             pid: 12345,
             pname: {
                 let mut buf = [0u8; 16];
@@ -1952,7 +1952,7 @@ mod tests {
             .redirect_track_store(&rt_key, &RedirectEntry::default())
             .unwrap();
 
-        backend.cookie_pid_store(42, &PidPname::default()).unwrap();
+        backend.cookie_pid_store(42, &PIDName::default()).unwrap();
         backend.set_outbound_alive(1, 0, 4, true).unwrap();
         backend.bpf_stats.insert(0, 999);
 
