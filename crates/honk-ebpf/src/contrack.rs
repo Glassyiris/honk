@@ -7,17 +7,17 @@
 use crate::log_shim::*;
 use crate::{
     event::send_dae_event,
-    maps::{BPF_STATS_MAP, CONN_STATE_MAP, CONN_STATE_OCCUPANCY, CONNTRACK_ARGS_MAP},
+    maps::{BPF_STATS_MAP, CONNTRACK_ARGS_MAP, CONN_STATE_MAP, CONN_STATE_OCCUPANCY},
 };
 use aya_ebpf_bindings::helpers::bpf_ktime_get_ns;
 use honk_ebpf_common::{
-    RoutingMeta,
     conn::{
-        BpfStatsKey, ConnState, ConntrackArgs, OCCUPANCY_EBPF_DELETES, OCCUPANCY_INSERTS,
-        TCP_CONN_STATE_CLOSING_TIMEOUT_NS, TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS, TcpState,
+        BpfStatsKey, ConnState, ConntrackArgs, TcpState, OCCUPANCY_EBPF_DELETES, OCCUPANCY_INSERTS,
+        TCP_CONN_STATE_CLOSING_TIMEOUT_NS, TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS,
         UDP_CONN_STATE_TIMEOUT_NS,
     },
     redirect_need::TuplesKey,
+    RoutingMeta,
 };
 use network_types::tcp::TcpHdr;
 
