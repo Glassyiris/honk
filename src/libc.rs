@@ -86,6 +86,8 @@ pub mod xdp {
     pub const XDP_PACKET_HEADROOM: u64 = 256;
     /// The default packet size used by [libxdp](https://github.com/xdp-project/xdp-tools/blob/3b199c0c185d4603406e6324ca5783b157c0e492/headers/xdp/xsk.h#L194)
     pub const XSK_UMEM_DEFAULT_FRAME_SIZE: u32 = 4096;
+    /// Ring flag set by the kernel when userspace must wake the driver.
+    pub const XDP_RING_NEED_WAKEUP: u32 = 1;
 
     /// The various `SOL_XDP` socket options.
     ///
@@ -100,7 +102,7 @@ pub mod xdp {
         pub const XDP_UMEM_FILL_RING: Enum = 5;
         pub const XDP_UMEM_COMPLETION_RING: Enum = 6;
         pub const XDP_STATISTICS: Enum = 7;
-        //pub const XDP_OPTIONS: Enum = 8;
+        pub const XDP_OPTIONS: Enum = 8;
     }
 
     /// The various `AF_XDP` bind flags.
@@ -139,6 +141,20 @@ pub mod xdp {
         /// This enables `AF_XDP` to split multi-buffer XDP frames into multiple
         /// Rx descriptors. Without this set such frames will be dropped.
         pub const XDP_USE_SG: Enum = 1 << 4;
+    }
+
+    /// Flags returned by `getsockopt(XDP_OPTIONS)`.
+    pub mod XdpOptionsFlags {
+        /// The socket is operating in zero-copy mode.
+        pub const XDP_OPTIONS_ZEROCOPY: u32 = 1 << 0;
+    }
+
+    /// The actual mode selected by the kernel for a bound `AF_XDP` socket.
+    #[repr(C)]
+    #[derive(Copy, Clone, Default)]
+    pub struct xdp_options {
+        /// A bitset of [`XdpOptionsFlags`].
+        pub flags: u32,
     }
 
     /// An RX/TX packet descriptor describing an area of a [`Umem`](crate::umem::Umem)
@@ -420,16 +436,6 @@ pub(crate) mod socket {
             flags: MsgFlags::Enum,
             addr: *const sockaddr,
             addrlen: u32,
-        ) -> isize;
-
-        /// <https://man7.org/linux/man-pages/man3/recvfrom.3p.html>
-        pub fn recvfrom(
-            socket: RawFd,
-            buf: *mut c_void,
-            len: usize,
-            flags: MsgFlags::Enum,
-            addr: *mut sockaddr,
-            addrlen: *mut u32,
         ) -> isize;
 
         /// <https://man7.org/linux/man-pages/man2/poll.2.html>

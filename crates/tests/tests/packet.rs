@@ -329,7 +329,7 @@ fn data_range() {
     assert_eq!(&packet[range], DATA);
 
     range.start = range.end + 1;
-    dbg!(&packet[range]);
+    let _ = &packet[range];
 }
 
 #[test]

@@ -62,6 +62,26 @@ pub enum Ring {
     Tx,
 }
 
+/// A frame ownership or ring wakeup failure.
+#[derive(Debug)]
+pub enum RingError {
+    /// Frame ownership was inconsistent.
+    Frame(crate::FrameError),
+    /// A ring wakeup syscall failed.
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for RingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Frame(error) => error.fmt(f),
+            Self::Io(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for RingError {}
+
 /// Builder for the rings that will be created for an XDP socket.
 ///
 /// All fields _must_ be a power of two, and both `fill_count` and `completion_count`
@@ -158,6 +178,7 @@ pub struct WakableRings {
 struct XskRing<T: 'static> {
     producer: &'static AtomicU32,
     consumer: &'static AtomicU32,
+    flags: &'static AtomicU32,
     ring: &'static mut [T],
     cached_produced: u32,
     cached_consumed: u32,
@@ -180,11 +201,17 @@ fn map_ring<T>(
     offset: libc::RingPageOffsets,
     offsets: &libc::xdp_ring_offset,
 ) -> std::io::Result<(crate::mmap::Mmap, XskRing<T>)> {
-    let mmap = crate::mmap::Mmap::map_ring(
-        offsets.desc as usize + (count as usize * std::mem::size_of::<T>()),
-        offset as u64,
-        socket,
-    )?;
+    let descriptor_end = offsets.desc as usize + (count as usize * std::mem::size_of::<T>());
+    let metadata_end = [
+        offsets.producer as usize + std::mem::size_of::<u32>(),
+        offsets.consumer as usize + std::mem::size_of::<u32>(),
+        offsets.flags as usize + std::mem::size_of::<u32>(),
+    ]
+    .into_iter()
+    .max()
+    .unwrap();
+    let mmap =
+        crate::mmap::Mmap::map_ring(descriptor_end.max(metadata_end), offset as u64, socket)?;
 
     // SAFETY: The lifetime of the pointers are the same as the mmap
     let ring = unsafe {
@@ -192,12 +219,14 @@ fn map_ring<T>(
 
         let producer = AtomicU32::from_ptr(map.byte_offset(offsets.producer as _).cast());
         let consumer = AtomicU32::from_ptr(map.byte_offset(offsets.consumer as _).cast());
+        let flags = AtomicU32::from_ptr(map.byte_offset(offsets.flags as _).cast());
         let ring =
             std::slice::from_raw_parts_mut(map.byte_offset(offsets.desc as _).cast(), count as _);
 
         XskRing {
             producer,
             consumer,
+            flags,
             count,
             mask: count as usize - 1,
             ring,
@@ -259,6 +288,16 @@ impl<T> XskProducer<T> {
     #[inline]
     fn submit(&mut self, nb: u32) {
         self.0.producer.fetch_add(nb, Ordering::Release);
+    }
+
+    #[inline]
+    fn cancel(&mut self, nb: u32) {
+        self.0.cached_produced -= nb;
+    }
+
+    #[inline]
+    fn needs_wakeup(&self) -> bool {
+        self.0.flags.load(Ordering::Acquire) & crate::libc::xdp::XDP_RING_NEED_WAKEUP != 0
     }
 }
 

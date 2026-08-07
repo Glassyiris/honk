@@ -2,7 +2,7 @@
 //! filled with data received on the NIC queue the ring is bound to
 
 use crate::{
-    Umem,
+    FrameError, Umem,
     libc::{self, rings},
 };
 
@@ -50,24 +50,34 @@ impl FillRing {
     /// The number of packets that were actually enqueued. This number can be
     /// lower than the requested `num_packets` if the [`Umem`] didn't have enough
     /// open slots, or the rx ring had insufficient capacity
-    pub unsafe fn enqueue(&mut self, umem: &mut Umem, num_packets: usize) -> usize {
-        let available = umem.available();
-        let requested = std::cmp::min(available.len(), num_packets);
+    pub unsafe fn enqueue(&mut self, umem: &Umem, num_packets: usize) -> Result<usize, FrameError> {
+        let requested = std::cmp::min(umem.allocatable(), num_packets);
         if requested == 0 {
-            return 0;
+            return Ok(0);
         }
 
         let (actual, idx) = self.ring.reserve(requested as _);
-
-        if actual > 0 {
-            for i in idx..idx + actual {
-                self.ring.set(i, available.pop_front().unwrap());
+        let mut queued = 0;
+        for i in idx..idx + actual {
+            match umem.take_fill_addr() {
+                Ok(Some(address)) => {
+                    self.ring.set(i, address);
+                    queued += 1;
+                }
+                Ok(None) => unreachable!("UMEM availability changed during fill reservation"),
+                Err(error) => {
+                    self.ring.cancel((actual - queued) as u32);
+                    if queued > 0 {
+                        self.ring.submit(queued as u32);
+                    }
+                    return Err(error);
+                }
             }
-
-            self.ring.submit(actual as _);
         }
-
-        actual
+        if queued > 0 {
+            self.ring.submit(queued as u32);
+        }
+        Ok(queued)
     }
 }
 
@@ -89,44 +99,47 @@ impl WakableFillRing {
         Ok(Self { inner, socket })
     }
 
-    /// The same as [`FillRing::enqueue`], except the additional `wakeup` parameter
-    /// determines if the kernel is actually informed of the new buffer(s) available
-    /// to fill with data
+    /// Enqueues buffers and wakes the driver only when the fill ring requests it.
     ///
     /// # Safety
     ///
-    /// The [`Umem`] must outlive the `AF_XDP` socket
+    /// The [`Umem`] must outlive the `AF_XDP` socket.
     #[inline]
     pub unsafe fn enqueue(
         &mut self,
-        umem: &mut Umem,
+        umem: &Umem,
         num_packets: usize,
-        wakeup: bool,
-    ) -> std::io::Result<usize> {
-        // SAFETY: FillRing::enqueue is unsafe
-        let queued = unsafe { self.inner.enqueue(umem, num_packets) };
-
-        if queued > 0 && wakeup {
-            // SAFETY: This is safe, even if the socket descriptor is invalid.
-            let ret = unsafe {
-                libc::socket::recvfrom(
-                    self.socket,
-                    std::ptr::null_mut(),
-                    0,
-                    libc::socket::MsgFlags::DONTWAIT,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                )
-            };
-
-            if ret < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.kind() != std::io::ErrorKind::Interrupted {
-                    return Err(err);
+    ) -> Result<usize, super::RingError> {
+        // SAFETY: FillRing::enqueue has the same UMEM lifetime requirement.
+        let queued =
+            unsafe { self.inner.enqueue(umem, num_packets) }.map_err(super::RingError::Frame)?;
+        if queued > 0 && self.inner.ring.needs_wakeup() {
+            loop {
+                // SAFETY: poll only reads the provided descriptor.
+                let ret = unsafe {
+                    libc::socket::poll(
+                        &mut libc::socket::pollfd {
+                            fd: self.socket,
+                            events: libc::socket::PollEvents::POLLIN,
+                            revents: 0,
+                        },
+                        1,
+                        0,
+                    )
+                };
+                if ret >= 0 {
+                    break;
                 }
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if error.kind() != std::io::ErrorKind::WouldBlock {
+                    return Err(super::RingError::Io(error));
+                }
+                break;
             }
         }
-
         Ok(queued)
     }
 }

@@ -30,15 +30,17 @@ fn edge_conditions() {
     assert_eq!(ss.len(), 0);
 
     for _ in 0..CAP {
-        let packet = unsafe { umem.alloc() }.unwrap();
-        ss.push_front(packet);
+        // SAFETY: every packet is drained before the UMEM is dropped.
+        let packet = unsafe { umem.alloc() }.unwrap().unwrap();
+        assert!(ss.push_front(packet).is_none());
     }
 
     assert!(!ss.is_empty());
     assert_eq!(ss.available(), 0);
     assert_eq!(ss.len(), CAP);
 
-    let over = unsafe { umem.alloc() }.unwrap();
+    // SAFETY: the packet remains within this test's UMEM lifetime.
+    let over = unsafe { umem.alloc() }.unwrap().unwrap();
     let over = ss.push_front(over).unwrap();
 
     let back = ss.pop_back().unwrap();
@@ -46,10 +48,10 @@ fn edge_conditions() {
     assert_eq!(ss.len(), CAP - 1);
     assert!(ss.push_front(over).is_none());
 
-    umem.free_packet(back);
+    drop(back);
 
-    while let Some(p) = ss.pop_back() {
-        umem.free_packet(p);
+    while let Some(packet) = ss.pop_back() {
+        drop(packet);
     }
 
     assert!(ss.is_empty());
@@ -57,9 +59,10 @@ fn edge_conditions() {
     assert_eq!(ss.len(), 0);
 
     for i in 0..CAP {
-        let mut packet = unsafe { umem.alloc() }.unwrap();
+        // SAFETY: every packet is drained before the UMEM is dropped.
+        let mut packet = unsafe { umem.alloc() }.unwrap().unwrap();
         packet.insert(0, &[i as u8]).unwrap();
-        ss.push_front(packet);
+        assert!(ss.push_front(packet).is_none());
     }
 
     assert!(!ss.is_empty());
@@ -82,9 +85,14 @@ fn edge_conditions() {
         if i % 2 == 1 {
             assert!(ss.push_front(p).is_none());
         } else {
-            umem.free_packet(p);
+            drop(p);
         }
     }
 
     assert_eq!(ss.len(), CAP >> 1);
+
+    while let Some(packet) = ss.pop_back() {
+        drop(packet);
+    }
+    assert_eq!(umem.outstanding(), 0);
 }

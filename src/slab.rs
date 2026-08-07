@@ -87,7 +87,7 @@ macro_rules! slab {
     ($name:ident, $int:ty) => {
         /// A stack allocated, fixed size, ring buffer
         pub struct $name<const N: usize> {
-            ring: [$crate::Packet; N],
+            ring: [std::mem::MaybeUninit<$crate::Packet>; N],
             read: $int,
             write: $int,
         }
@@ -97,10 +97,8 @@ macro_rules! slab {
             #[allow(clippy::new_without_default)]
             pub fn new() -> Self {
                 $crate::slab::assert_power_of_2::<N>();
-
                 Self {
-                    // SAFETY: Packet is just a POD
-                    ring: unsafe { std::mem::zeroed() },
+                    ring: [const { std::mem::MaybeUninit::uninit() }; N],
                     read: 0,
                     write: 0,
                 }
@@ -108,7 +106,6 @@ macro_rules! slab {
         }
 
         impl<const N: usize> $crate::slab::Slab for $name<N> {
-            /// The current number of packets in the slab
             #[inline]
             fn len(&self) -> usize {
                 if self.write >= self.read {
@@ -118,40 +115,46 @@ macro_rules! slab {
                 }
             }
 
-            /// True if the slab is empty
             #[inline]
             fn is_empty(&self) -> bool {
                 self.write == self.read
             }
 
-            /// The number of packets that can be pushed to the slab
             #[inline]
             fn available(&self) -> usize {
                 N - self.len()
             }
 
-            /// Pops the back packet if any
             #[inline]
             fn pop_back(&mut self) -> Option<$crate::Packet> {
                 if self.is_empty() {
                     return None;
                 }
-
                 let index = self.read as usize % N;
                 self.read = self.read.wrapping_add(1);
-                Some(self.ring[index].__inner_copy())
+                // SAFETY: slots between read and write are initialized exactly once.
+                Some(unsafe { self.ring[index].assume_init_read() })
             }
 
-            /// Pushes a packet to the front, returning `Some` if the slab is at capacity
             #[inline]
             fn push_front(&mut self, item: $crate::Packet) -> Option<$crate::Packet> {
-                if self.available() > 0 {
-                    let index = self.write as usize % N;
-                    self.write = self.write.wrapping_add(1);
-                    self.ring[index] = item;
-                    None
-                } else {
-                    Some(item)
+                if self.available() == 0 {
+                    return Some(item);
+                }
+                let index = self.write as usize % N;
+                self.write = self.write.wrapping_add(1);
+                self.ring[index].write(item);
+                None
+            }
+        }
+
+        impl<const N: usize> Drop for $name<N> {
+            fn drop(&mut self) {
+                while self.read != self.write {
+                    let index = self.read as usize % N;
+                    self.read = self.read.wrapping_add(1);
+                    // SAFETY: slots between read and write are initialized.
+                    unsafe { self.ring[index].assume_init_drop() };
                 }
             }
         }

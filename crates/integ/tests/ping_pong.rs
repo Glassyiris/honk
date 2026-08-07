@@ -25,7 +25,10 @@ async fn ping_pong() {
 
     // Enqueue a buffer to receive the packet
     let mut fr = rings.fill_ring;
-    assert_eq!(unsafe { fr.enqueue(&mut umem, BATCH_SIZE) }, BATCH_SIZE);
+    assert_eq!(
+        unsafe { fr.enqueue(&mut umem, BATCH_SIZE) }.unwrap(),
+        BATCH_SIZE
+    );
     let mut rx = rings.rx_ring.expect("rx ring not created");
     let mut cr = rings.completion_ring;
     let mut tx = rings.tx_ring.expect("tx ring not created");
@@ -78,7 +81,7 @@ async fn ping_pong() {
 
             // The entry we queued up in the fill ring is now filled, get it
             loop {
-                if unsafe { rx.recv(&umem, &mut slab) } > 0 {
+                if unsafe { rx.recv(&umem, &mut slab) }.unwrap() > 0 {
                     println!("received packet");
                     break;
                 }
@@ -131,7 +134,7 @@ async fn ping_pong() {
                 udp_packet.source.port
             );
             slab.push_back(packet);
-            assert_eq!(unsafe { tx.send(&mut slab) }, 1);
+            assert_eq!(unsafe { tx.send(&mut slab) }.unwrap(), 1);
 
             println!("waiting tx finish...");
             loop {
@@ -149,7 +152,7 @@ async fn ping_pong() {
                         panic!("{}", std::io::Error::last_os_error());
                     }
                 }
-                if cr.dequeue(&mut umem, 1) == 1 {
+                if cr.dequeue(&umem, 1).unwrap() == 1 {
                     println!("tx finished...");
                     break;
                 }

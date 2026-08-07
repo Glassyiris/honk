@@ -77,6 +77,8 @@ pub enum OptName {
     XdpMmapOffsets = libc::xdp::SockOpts::XDP_MMAP_OFFSETS,
     /// Used to retrieve [`xdp::XdpStatistics`]
     Statistics = libc::xdp::SockOpts::XDP_STATISTICS,
+    /// Used to retrieve the mode selected by the kernel after bind.
+    Options = libc::xdp::SockOpts::XDP_OPTIONS,
     // PreferBusyPoll = 69, // SO_PREFER_BUSY_POLL
     // BusyPoll = libc::SO_BUSY_POLL,
     // BusyPollBudget = 70, // SO_BUSY_POLL_BUDGET
@@ -86,6 +88,15 @@ pub enum OptName {
 /// to use when binding the `AF_XDP` socket
 #[derive(Copy, Clone)]
 pub struct BindFlags(xdp::BindFlags::Enum);
+
+/// The data-transfer mode actually selected by the kernel.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ActualMode {
+    /// Packets are copied between the driver and UMEM.
+    Copy,
+    /// The driver DMA-maps UMEM directly.
+    ZeroCopy,
+}
 
 impl BindFlags {
     fn new() -> Self {
@@ -204,7 +215,7 @@ impl XdpSocketBuilder {
 
         let completion_ring = rings::CompletionRing::new(socket, &cfg, &offsets)?;
         let tx_ring = if cfg.tx_count > 0 {
-            Some(rings::TxRing::new(socket, &cfg, &offsets)?)
+            Some(rings::TxRing::new(socket, umem, &cfg, &offsets)?)
         } else {
             None
         };
@@ -242,7 +253,7 @@ impl XdpSocketBuilder {
 
         let completion_ring = rings::CompletionRing::new(socket, &cfg, &offsets)?;
         let tx_ring = if cfg.tx_count > 0 {
-            Some(rings::WakableTxRing::new(socket, &cfg, &offsets)?)
+            Some(rings::WakableTxRing::new(socket, umem, &cfg, &offsets)?)
         } else {
             None
         };
@@ -337,11 +348,12 @@ impl XdpSocketBuilder {
             sxdp_queue_id: queue_id,
             sxdp_shared_umem_fd: 0,
         };
+        let fd = self.sock.as_raw_fd();
 
-        // SAFETY: syscall, all inputs are valid
+        // SAFETY: syscall, all inputs are valid.
         if unsafe {
             socket::bind(
-                self.sock.as_raw_fd(),
+                fd,
                 (&xdp_sockaddr as *const xdp::sockaddr_xdp).cast(),
                 std::mem::size_of_val(&xdp_sockaddr) as _,
             )
@@ -350,7 +362,18 @@ impl XdpSocketBuilder {
             return Err(SocketError::Bind(std::io::Error::last_os_error()));
         }
 
-        Ok(XdpSocket { sock: self.sock })
+        let mut options = xdp::xdp_options::default();
+        get_sock_opt(fd, OptName::Options, &mut options)?;
+        let actual_mode = if options.flags & xdp::XdpOptionsFlags::XDP_OPTIONS_ZEROCOPY != 0 {
+            ActualMode::ZeroCopy
+        } else {
+            ActualMode::Copy
+        };
+
+        Ok(XdpSocket {
+            sock: self.sock,
+            actual_mode,
+        })
     }
 
     #[inline]
@@ -386,6 +409,7 @@ impl std::os::fd::AsRawFd for XdpSocketBuilder {
 /// that can be polled for I/O operations
 pub struct XdpSocket {
     sock: std::os::fd::OwnedFd,
+    actual_mode: ActualMode,
 }
 
 /// A timeout that must be passed to one of the poll operations on [`XdpSocket`]
@@ -435,28 +459,28 @@ impl XdpSocket {
 
     #[inline]
     fn poll_inner(&self, events: i16, timeout: PollTimeout) -> std::io::Result<bool> {
-        // SAFETY: syscall, all inputs are valid
-        let ret = unsafe {
-            socket::poll(
-                &mut socket::pollfd {
-                    fd: self.sock.as_raw_fd(),
-                    events,
-                    revents: 0,
-                },
-                1,
-                timeout.0,
-            )
-        };
-
-        if ret < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                Ok(false)
-            } else {
-                Err(err)
+        loop {
+            // SAFETY: poll only reads and writes the provided descriptor.
+            let ret = unsafe {
+                socket::poll(
+                    &mut socket::pollfd {
+                        fd: self.sock.as_raw_fd(),
+                        events,
+                        revents: 0,
+                    },
+                    1,
+                    timeout.0,
+                )
+            };
+            if ret >= 0 {
+                return Ok(ret != 0);
             }
-        } else {
-            Ok(ret != 0)
+            let error = std::io::Error::last_os_error();
+            match error.kind() {
+                std::io::ErrorKind::Interrupted => {}
+                std::io::ErrorKind::WouldBlock => return Ok(false),
+                _ => return Err(error),
+            }
         }
     }
 
@@ -473,6 +497,12 @@ impl XdpSocket {
     #[inline]
     pub fn raw_fd(&self) -> std::os::fd::RawFd {
         self.sock.as_raw_fd()
+    }
+
+    /// Returns the copy or zero-copy mode reported by `XDP_OPTIONS` after bind.
+    #[inline]
+    pub fn actual_mode(&self) -> ActualMode {
+        self.actual_mode
     }
 }
 

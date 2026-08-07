@@ -1,7 +1,7 @@
 //! The [`CompletionRing`] is a consumer ring that userspace can dequeue packets
 //! that have been sent on the NIC queue the ring is bound to
 
-use crate::{Umem, libc::rings};
+use crate::{FrameError, Umem, libc::rings};
 
 /// The ring used to dequeue buffers that the kernel has finished sending
 pub struct CompletionRing {
@@ -40,48 +40,61 @@ impl CompletionRing {
     /// # Returns
     ///
     /// The number of packets that were actually dequeued.
-    pub fn dequeue(&mut self, umem: &mut Umem, num_packets: usize) -> usize {
-        let requested = num_packets;
-        if requested == 0 {
-            return 0;
+    pub fn dequeue(&mut self, umem: &Umem, num_packets: usize) -> Result<usize, FrameError> {
+        if num_packets == 0 {
+            return Ok(0);
         }
 
-        let (actual, idx) = self.ring.peek(requested as _);
-
-        if actual > 0 {
-            for i in idx..idx + actual {
-                // SAFETY: The mask ensures the index is always within range
-                let addr = self.ring.get(i);
-                umem.free_addr(addr);
+        let (actual, idx) = self.ring.peek(num_packets as _);
+        let mut first_error = None;
+        for i in idx..idx + actual {
+            let address = self.ring.get(i);
+            if let Err(error) = umem.complete_addr(address) {
+                first_error.get_or_insert(error);
             }
-
+        }
+        if actual > 0 {
             self.ring.release(actual as _);
         }
-
-        actual
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(actual)
+        }
     }
 
     /// The same as [`Self::dequeue`], except the timestamp each packet was
     /// transmitted is written to the provided slice.
     ///
     /// Note this requires that [`crate::Packet::set_tx_metadata`] was called
-    pub fn dequeue_with_timestamps(&mut self, umem: &mut Umem, timestamps: &mut [u64]) -> usize {
-        let requested = timestamps.len();
-        if requested == 0 {
-            return 0;
+    pub fn dequeue_with_timestamps(
+        &mut self,
+        umem: &Umem,
+        timestamps: &mut [u64],
+    ) -> Result<usize, FrameError> {
+        if timestamps.is_empty() {
+            return Ok(0);
         }
 
-        let (actual, idx) = self.ring.peek(requested as _);
-
-        if actual > 0 {
-            for (ts, i) in timestamps.iter_mut().zip(idx..idx + actual) {
-                let addr = self.ring.get(i);
-                *ts = umem.free_get_timestamp(addr);
+        let (actual, idx) = self.ring.peek(timestamps.len() as _);
+        let mut first_error = None;
+        for (timestamp, i) in timestamps.iter_mut().zip(idx..idx + actual) {
+            let address = self.ring.get(i);
+            match umem.free_get_timestamp(address) {
+                Ok(value) => *timestamp = value,
+                Err(error) => {
+                    *timestamp = 0;
+                    first_error.get_or_insert(error);
+                }
             }
-
+        }
+        if actual > 0 {
             self.ring.release(actual as _);
         }
-
-        actual
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(actual)
+        }
     }
 }

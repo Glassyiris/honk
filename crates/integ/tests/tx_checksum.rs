@@ -26,7 +26,7 @@ fn verify_checksum() {
 }
 
 fn do_checksum_test(software: bool, vpair: &VethPair) {
-    let mut umem = Umem::map(
+    let umem = Umem::map(
         UmemCfgBuilder {
             frame_size: FrameSize::TwoK,
             head_room: 20,
@@ -48,7 +48,7 @@ fn do_checksum_test(software: bool, vpair: &VethPair) {
             .build_rings(&umem, RingConfigBuilder::default().build().unwrap())
             .expect("failed to build rings");
 
-        let nic = xdp::nic::NicIndex::lookup_by_name(&vpair.inside.name)
+        let nic = xdp::nic::NicIndex::lookup_by_name(vpair.inside.name)
             .expect("failed to resolve NIC")
             .expect("failed to find NIC");
         // We are doing software checksums, which requires copy mode
@@ -67,7 +67,11 @@ fn do_checksum_test(software: bool, vpair: &VethPair) {
 
     // Enqueue a buffer to receive the packet
     let mut fr = rings.fill_ring;
-    assert_eq!(unsafe { fr.enqueue(&mut umem, BATCH_SIZE) }, BATCH_SIZE);
+    assert_eq!(
+        // SAFETY: the rings and packets cannot outlive this UMEM.
+        unsafe { fr.enqueue(&umem, BATCH_SIZE) }.unwrap(),
+        BATCH_SIZE
+    );
     let mut rx = rings.rx_ring.expect("rx ring not created");
     let mut cr = rings.completion_ring;
     let mut tx = rings.tx_ring.expect("tx ring not created");
@@ -107,10 +111,11 @@ fn do_checksum_test(software: bool, vpair: &VethPair) {
 
         let mut slab = xdp::slab::StackSlab::<BATCH_SIZE>::new();
 
+        // SAFETY: all ring operations and packets remain inside the moved UMEM lifetime.
         unsafe {
             poll_loop!({
                 xdp_socket.poll_read(timeout).unwrap();
-                if rx.recv(&umem, &mut slab) == 1 {
+                if rx.recv(&umem, &mut slab).unwrap() == 1 {
                     break;
                 }
             });
@@ -152,18 +157,18 @@ fn do_checksum_test(software: bool, vpair: &VethPair) {
             println!("Full checksum: {full_checksum:04x}");
 
             slab.push_front(packet);
-            assert_eq!(tx.send(&mut slab), 1);
+            assert_eq!(tx.send(&mut slab).unwrap(), 1);
 
             poll_loop!({
                 xdp_socket.poll(timeout).unwrap();
-                if cr.dequeue(&mut umem, 1) == 1 {
+                if cr.dequeue(&umem, 1).unwrap() == 1 {
                     break;
                 }
             });
 
             poll_loop!({
                 xdp_socket.poll_read(timeout).unwrap();
-                if rx.recv(&umem, &mut slab) == 1 {
+                if rx.recv(&umem, &mut slab).unwrap() == 1 {
                     break;
                 }
             });
@@ -204,11 +209,11 @@ fn do_checksum_test(software: bool, vpair: &VethPair) {
             );
 
             slab.push_front(packet);
-            assert_eq!(tx.send(&mut slab), 1);
+            assert_eq!(tx.send(&mut slab).unwrap(), 1);
 
             poll_loop!({
                 xdp_socket.poll(timeout).unwrap();
-                if cr.dequeue(&mut umem, 1) == 1 {
+                if cr.dequeue(&umem, 1).unwrap() == 1 {
                     break;
                 }
             });

@@ -1,11 +1,12 @@
 //! [`Umem`] creation and operation
 
 use crate::{
-    Packet,
+    FrameError, FrameState, Packet,
     error::{ConfigError, Error},
+    frame::FrameRegistry,
     libc::{self, InternalXdpFlags, xdp::xdp_desc},
 };
-use std::collections::VecDeque;
+use std::ptr::NonNull;
 
 /// The packet size (`libc::xdp_umem_reg::chunk_size`) can only be [>=2048 or <=4096](https://github.com/torvalds/linux/blob/c2ee9f594da826bea183ed14f2cc029c719bf4da/Documentation/networking/af_xdp.rst#xdp_umem_reg-setsockopt)
 ///
@@ -61,13 +62,10 @@ impl TryFrom<FrameSize> for u32 {
 pub struct Umem {
     /// The actual memory mapping
     pub(crate) mmap: crate::mmap::Mmap,
-    /// Addresses available to be written to by the kernel or userspace
-    available: VecDeque<u64>,
+    /// Runtime ownership of every frame in the mapping.
+    pub(crate) registry: Box<FrameRegistry>,
     /// The size of each individual packet within the mapping
     pub(crate) frame_size: usize,
-    /// Masked used to determine the true start address of a packet regardless
-    /// of the address used when freeing the packet back to this Umem
-    frame_mask: u64,
     /// The headroom configured for the Umem, a number of bytes (after the kernel
     /// reserved [`XDP_PACKET_HEADROOM`]) where the kernel will not place packet
     /// data when receiving, which allows the packet to grow downward when eg.
@@ -88,16 +86,16 @@ impl Umem {
     /// ```
     pub fn map(cfg: UmemCfg) -> std::io::Result<Self> {
         let mmap = crate::mmap::Mmap::map_umem(cfg.frame_count as usize * cfg.frame_size as usize)?;
-
-        let mut available = VecDeque::with_capacity(cfg.frame_count as _);
-        let frame_size = cfg.frame_size as u64;
-        available.extend((0..cfg.frame_count as u64).map(|i| i * frame_size));
+        let registry = Box::new(FrameRegistry::new(
+            cfg.frame_count,
+            cfg.frame_size,
+            cfg.frame_mask,
+        ));
 
         Ok(Self {
             mmap,
-            available,
+            registry,
             frame_size: cfg.frame_size as usize - libc::xdp::XDP_PACKET_HEADROOM as usize,
-            frame_mask: cfg.frame_mask,
             head_room: cfg.head_room as _,
             options: cfg.options,
         })
@@ -106,19 +104,19 @@ impl Umem {
     /// The total capacity of this [`Umem`] in number of frames
     #[inline]
     pub fn capacity(&self) -> usize {
-        self.available.capacity()
+        self.registry.capacity()
     }
 
     /// The number of frames that are currently allocated from this [`Umem`]
     #[inline]
     pub fn outstanding(&self) -> usize {
-        self.available.capacity() - self.available.len()
+        self.registry.outstanding()
     }
 
     /// The number of frames that can be allocated from this [`Umem`] before it is exhausted
     #[inline]
     pub fn allocatable(&self) -> usize {
-        self.available.len()
+        self.registry.allocatable()
     }
 
     /// Given an [`xdp_desc`] filled by the kernel, retrieves the memory block
@@ -129,28 +127,42 @@ impl Umem {
     /// The [`Packet`] returned by this function is pointing to memory owned by
     /// this [`Umem`], it must not outlive this [`Umem`]
     #[inline]
-    pub(crate) unsafe fn packet(&self, desc: xdp_desc) -> Packet {
-        // SAFETY: Barring kernel bugs, we should only ever get valid addresses
-        // within the range of our map
-        unsafe {
-            let data = self
-                .mmap
-                .ptr
-                .byte_offset((desc.addr - self.head_room as u64) as _);
-
-            Packet {
-                data,
-                capacity: self.frame_size,
-                head: self.head_room,
-                tail: self.head_room + desc.len as usize,
-                base: self.mmap.ptr,
-                options: desc.options | self.options,
-            }
+    pub(crate) unsafe fn packet(&self, desc: xdp_desc) -> Result<Packet, FrameError> {
+        let frame =
+            self.registry
+                .transition_address(desc.addr, FrameState::Fill, FrameState::Rx)?;
+        let max_len = self.frame_size - self.head_room;
+        if desc.len as usize > max_len {
+            self.registry.release(frame, FrameState::Rx)?;
+            return Err(self.registry.record(FrameError::InvalidLength {
+                length: desc.len as usize,
+                capacity: max_len,
+            }));
         }
+        let Some(data_offset) = desc.addr.checked_sub(self.head_room as u64) else {
+            self.registry.release(frame, FrameState::Rx)?;
+            return Err(self.registry.record(FrameError::InvalidAddress {
+                address: desc.addr,
+                umem_len: self.mmap.len(),
+            }));
+        };
+
+        // SAFETY: descriptor ownership and bounds were validated above.
+        let data = unsafe { self.mmap.ptr.byte_offset(data_offset as _) };
+        Ok(Packet {
+            data,
+            capacity: self.frame_size,
+            head: self.head_room,
+            tail: self.head_room + desc.len as usize,
+            base: self.mmap.ptr,
+            options: desc.options | self.options,
+            registry: Some(NonNull::from(self.registry.as_ref())),
+            frame_index: frame,
+        })
     }
 
-    /// Attempts to allocate a packet from the [`Umem`], returning `None` if there
-    /// are no available frames.
+    /// Attempts to allocate a packet from the [`Umem`]. Returns `Ok(None)` when
+    /// there are no available frames and [`FrameError`] on an ownership fault.
     ///
     /// # Safety
     ///
@@ -163,95 +175,59 @@ impl Umem {
     /// let mut umem = xdp::Umem::map(xdp::umem::UmemCfgBuilder::default().build().expect("failed to build umem cfg")).expect("failed to map memory");
     ///
     /// unsafe {
-    ///     let mut packet = umem.alloc().expect("failed to allocate packet");
+    ///     let mut packet = umem.alloc()
+    ///         .expect("UMEM invariant violated")
+    ///         .expect("UMEM exhausted");
     ///     assert!(packet.is_empty());
     /// }
     /// ```
     #[inline]
-    pub unsafe fn alloc(&mut self) -> Option<Packet> {
-        let addr = self.available.pop_front()?;
+    pub unsafe fn alloc(&mut self) -> Result<Option<Packet>, FrameError> {
+        let Some((address, frame)) = self.registry.take(FrameState::Rx)? else {
+            return Ok(None);
+        };
 
-        // SAFETY: The free list of addresses will always be within the range
-        // of the mmap
-        unsafe {
-            let data = self
-                .mmap
+        // SAFETY: the registry only returns addresses inside the live mmap.
+        let data = unsafe {
+            self.mmap
                 .ptr
-                .byte_offset((addr + libc::xdp::XDP_PACKET_HEADROOM) as _);
-
-            Some(Packet {
-                data,
-                capacity: self.frame_size,
-                head: self.head_room,
-                tail: self.head_room,
-                base: self.mmap.ptr,
-                options: self.options,
-            })
-        }
+                .byte_offset((address + libc::xdp::XDP_PACKET_HEADROOM) as _)
+        };
+        Ok(Some(Packet {
+            data,
+            capacity: self.frame_size,
+            head: self.head_room,
+            tail: self.head_room,
+            base: self.mmap.ptr,
+            options: self.options,
+            registry: Some(NonNull::from(self.registry.as_ref())),
+            frame_index: frame,
+        }))
     }
 
-    /// Given an address offset, adds the packet it points to to the free list
-    ///
-    /// This function assumes that frames are power of 2, and thus it doesn't
-    /// matter where the offset is relative to the packet offset
-    #[inline]
-    pub(crate) fn free_addr(&mut self, address: u64) {
-        self.available.push_front(address & self.frame_mask);
+    pub(crate) fn take_fill_addr(&self) -> Result<Option<u64>, FrameError> {
+        Ok(self
+            .registry
+            .take(FrameState::Fill)?
+            .map(|(address, _)| address + libc::xdp::XDP_PACKET_HEADROOM + self.head_room as u64))
     }
 
-    /// Returns the memory block where the [`Packet`] resides to the available
-    /// pool for future use
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// let mut umem = xdp::Umem::map(xdp::umem::UmemCfgBuilder {
-    ///     frame_count: 1,
-    ///     ..Default::default()
-    /// }.build().expect("failed to build umem cfg")).expect("failed to map memory");
-    ///
-    /// unsafe {
-    ///     let mut packet = umem.alloc().expect("failed to allocate packet");
-    ///     packet.insert(0, &[1, 2, 3, 4]).expect("failed to insert bytes");
-    ///     // Only 1 frame was requested when building the umem
-    ///     assert!(umem.alloc().is_none());
-    ///     umem.free_packet(packet);
-    ///
-    ///     let mut packet = umem.alloc().expect("failed to allocate packet");
-    ///     // The packet will be the same memory region, but will be empty, but
-    ///     // we can cheat and recover the data we wrote
-    ///     packet.adjust_tail(4).unwrap();
-    ///     assert_eq!(&packet[..4], &[1, 2, 3, 4]);
-    /// }
-    /// ```
-    #[inline]
-    pub fn free_packet(&mut self, packet: Packet) {
-        debug_assert_eq!(
-            packet.base, self.mmap.ptr,
-            "the packet was not allocated from this Umem"
-        );
-
-        self.free_addr(
-            // SAFETY: We've checked that the packet is owned by this Umem
-            unsafe {
-                packet
-                    .data
-                    .byte_offset(packet.head as _)
-                    .offset_from(packet.base) as _
-            },
-        );
+    pub(crate) fn complete_addr(&self, address: u64) -> Result<(), FrameError> {
+        self.registry.complete(address).map(|_| ())
     }
 
-    /// The equivalent of [`Self::free_addr`], but returns the timestamp the
-    /// NIC recorded the send completed
+    /// Returns the completion timestamp and releases the transmitted frame.
     #[inline]
-    pub(crate) fn free_get_timestamp(&mut self, address: u64) -> u64 {
+    pub(crate) fn free_get_timestamp(&self, address: u64) -> Result<u64, FrameError> {
         use libc::xdp::xsk_tx_metadata;
 
-        let align_offset = address % self.frame_size as u64;
+        let frame =
+            self.registry
+                .transition_address(address, FrameState::Tx, FrameState::Completion)?;
+        let raw_frame_size = self.frame_size + libc::xdp::XDP_PACKET_HEADROOM as usize;
+        let align_offset = address % raw_frame_size as u64;
         let timestamp = if align_offset >= std::mem::size_of::<xsk_tx_metadata>() as u64 {
-            // SAFETY: This is a pod, so even if this wasn't actually enabled when
-            // the packet was enqueued, it shouldn't result in UB
+            // SAFETY: the descriptor address was validated by transition_address.
             unsafe {
                 let tx_meta = std::ptr::read_unaligned(
                     self.mmap
@@ -265,13 +241,19 @@ impl Umem {
             0
         };
 
-        self.free_addr(address);
-        timestamp
+        self.registry.release(frame, FrameState::Completion)?;
+        Ok(timestamp)
     }
 
     #[inline]
-    pub(crate) fn available(&mut self) -> &mut VecDeque<u64> {
-        &mut self.available
+    pub(crate) fn frame_registry(&self) -> &FrameRegistry {
+        &self.registry
+    }
+
+    /// Returns the number of frame ownership violations observed by this UMEM.
+    #[inline]
+    pub fn integrity_faults(&self) -> u64 {
+        self.registry.integrity_faults()
     }
 }
 

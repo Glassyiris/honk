@@ -3,8 +3,8 @@
 pub mod csum;
 pub mod net_types;
 
-use crate::libc;
-use std::fmt;
+use crate::{FrameError, FrameState, frame::FrameRegistry, libc};
+use std::{fmt, ptr::NonNull};
 
 /// The maximum size of an XDP chunk is 4k, so any offsets or sizes larger than
 /// that indicates calling code is probably not correct
@@ -166,6 +166,8 @@ pub struct Packet {
     pub(crate) tail: usize,
     pub(crate) base: *const u8,
     pub(crate) options: u32,
+    pub(crate) registry: Option<NonNull<FrameRegistry>>,
+    pub(crate) frame_index: usize,
 }
 
 impl Packet {
@@ -180,6 +182,8 @@ impl Packet {
             tail: 0,
             base: std::ptr::null(),
             options: 0,
+            registry: None,
+            frame_index: usize::MAX,
         }
     }
 
@@ -230,7 +234,9 @@ impl Packet {
     /// ).expect("failed to map Umem");
     ///
     /// unsafe {
-    ///     let packet = umem.alloc().expect("failed to allocate packet");
+    ///     let packet = umem.alloc()
+    ///         .expect("UMEM invariant violated")
+    ///         .expect("UMEM exhausted");
     ///     // The default size is 4k (page size)
     ///     assert_eq!(packet.capacity(), 4 * 1024 - xdp::libc::xdp::XDP_PACKET_HEADROOM as usize);
     /// }
@@ -293,7 +299,9 @@ impl Packet {
     /// ).expect("failed to map Umem");
     ///
     /// unsafe {
-    ///     let mut packet = umem.alloc().expect("failed to allocate packet");
+    ///     let mut packet = umem.alloc()
+    ///         .expect("UMEM invariant violated")
+    ///         .expect("UMEM exhausted");
     ///
     ///     // We can't extend the head past the tail, so first insert some data
     ///     packet.insert(0, &[0xff; 33]).unwrap();
@@ -353,7 +361,9 @@ impl Packet {
     /// ).expect("failed to map Umem");
     ///
     /// unsafe {
-    ///     let mut packet = umem.alloc().expect("failed to allocate packet");
+    ///     let mut packet = umem.alloc()
+    ///         .expect("UMEM invariant violated")
+    ///         .expect("UMEM exhausted");
     ///     packet.insert(0, &[0xff; 10]).unwrap();
     ///     assert_eq!(10, packet.len());
     ///
@@ -411,7 +421,9 @@ impl Packet {
     /// #    }.build().unwrap()
     /// # ).expect("failed to map Umem");
     /// # let mut packet = unsafe {
-    /// #    let mut packet = umem.alloc().expect("failed to allocate packet");
+    /// #    let mut packet = umem.alloc()
+    /// #        .expect("UMEM invariant violated")
+    /// #        .expect("UMEM exhausted");
     /// #    packet.adjust_tail(34).unwrap();
     /// #    packet.write(0, net_types::EthHdr {
     /// #        source: net_types::MacAddress([1; 6]),
@@ -484,7 +496,9 @@ impl Packet {
     /// #    }.build().unwrap()
     /// # ).expect("failed to map Umem");
     /// # let mut packet = unsafe {
-    /// #    umem.alloc().expect("failed to allocate packet")
+    /// #    umem.alloc()
+    /// #        .expect("UMEM invariant violated")
+    /// #        .expect("UMEM exhausted")
     /// # };
     /// // Extend the tail so we have enough space for the writes
     /// packet.adjust_tail(42).unwrap();
@@ -568,7 +582,9 @@ impl Packet {
     /// #    }.build().unwrap()
     /// # ).expect("failed to map Umem");
     /// # let mut packet = unsafe {
-    /// #    umem.alloc().expect("failed to allocate packet")
+    /// #    umem.alloc()
+    /// #        .expect("UMEM invariant violated")
+    /// #        .expect("UMEM exhausted")
     /// # };
     /// // Insert a u32
     /// packet.insert(0, &0xaabbccddu32.to_ne_bytes()).unwrap();
@@ -635,7 +651,9 @@ impl Packet {
     /// #    }.build().unwrap()
     /// # ).expect("failed to map Umem");
     /// # let mut packet = unsafe {
-    /// #    umem.alloc().expect("failed to allocate packet")
+    /// #    umem.alloc()
+    /// #        .expect("UMEM invariant violated")
+    /// #        .expect("UMEM exhausted")
     /// # };
     /// // Insert string slice
     /// packet.insert(0, b"abcd").unwrap();
@@ -686,7 +704,9 @@ impl Packet {
     /// #    }.build().unwrap()
     /// # ).expect("failed to map Umem");
     /// # let mut packet = unsafe {
-    /// #    umem.alloc().expect("failed to allocate packet")
+    /// #    umem.alloc()
+    /// #        .expect("UMEM invariant violated")
+    /// #        .expect("UMEM exhausted")
     /// # };
     /// // Insert a u32
     /// packet.insert(0, &0xf0f1f2f3u32.to_ne_bytes()).unwrap();
@@ -832,17 +852,39 @@ impl Packet {
         Ok(())
     }
 
-    #[doc(hidden)]
-    #[inline]
-    pub fn __inner_copy(&mut self) -> Self {
-        Self {
-            data: self.data,
-            capacity: self.capacity,
-            head: self.head,
-            tail: self.tail,
-            base: self.base,
-            options: self.options,
+    pub(crate) fn into_descriptor(
+        mut self,
+        expected_registry: &FrameRegistry,
+    ) -> Result<libc::xdp::xdp_desc, FrameError> {
+        let Some(registry) = self.registry else {
+            return Err(expected_registry.record(FrameError::ForeignUmem {
+                expected: expected_registry.id(),
+                actual: 0,
+            }));
+        };
+        // SAFETY: managed packets cannot outlive their UMEM by API contract.
+        let actual_registry = unsafe { registry.as_ref() };
+        if actual_registry.id() != expected_registry.id() {
+            return Err(expected_registry.record(FrameError::ForeignUmem {
+                expected: expected_registry.id(),
+                actual: actual_registry.id(),
+            }));
         }
+        if let Err(error) =
+            expected_registry.transition(self.frame_index, FrameState::Rx, FrameState::Tx)
+        {
+            self.registry = None;
+            return Err(error);
+        }
+
+        let descriptor = libc::xdp::xdp_desc {
+            // SAFETY: the packet belongs to expected_registry's live UMEM.
+            addr: unsafe { self.data.byte_offset(self.head as _).offset_from(self.base) as _ },
+            len: (self.tail - self.head) as _,
+            options: self.options & !libc::InternalXdpFlags::MASK,
+        };
+        self.registry = None;
+        Ok(descriptor)
     }
 }
 
@@ -864,20 +906,13 @@ impl std::ops::DerefMut for Packet {
     }
 }
 
-impl From<Packet> for libc::xdp::xdp_desc {
-    fn from(packet: Packet) -> Self {
-        libc::xdp::xdp_desc {
-            // SAFETY: the pointer is valid as long as the mmap it is allocated
-            // from is alive
-            addr: unsafe {
-                packet
-                    .data
-                    .byte_offset(packet.head as _)
-                    .offset_from(packet.base) as _
-            },
-            len: (packet.tail - packet.head) as _,
-            options: packet.options & !libc::InternalXdpFlags::MASK,
-        }
+impl Drop for Packet {
+    fn drop(&mut self) {
+        let Some(registry) = self.registry.take() else {
+            return;
+        };
+        // SAFETY: managed packets cannot outlive their UMEM by API contract.
+        let _ = unsafe { registry.as_ref() }.release(self.frame_index, FrameState::Rx);
     }
 }
 

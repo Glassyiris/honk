@@ -36,6 +36,7 @@ fn generate(packet: &mut xdp::Packet, len: usize, ipv4: bool) -> u16 {
         .write(packet, &PAYLOAD[..len])
         .unwrap();
 
+    // SAFETY: PacketBuilder initialized a complete UDP header inside the packet.
     unsafe {
         (*packet
             .as_ptr()

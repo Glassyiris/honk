@@ -23,19 +23,21 @@ macro_rules! within_range {
 
 pub mod affinity;
 pub mod error;
+mod frame;
 pub mod packet;
+pub use frame::{FrameError, FrameState};
 pub use packet::Packet;
 pub mod libc;
 mod mmap;
 pub mod nic;
 mod rings;
 pub mod slab;
+pub use socket::ActualMode;
 pub mod socket;
 pub mod umem;
-
 pub use umem::Umem;
 
 pub use rings::{
-    CompletionRing, FillRing, RingConfig, RingConfigBuilder, Rings, RxRing, TxRing,
+    CompletionRing, FillRing, RingConfig, RingConfigBuilder, RingError, Rings, RxRing, TxRing,
     WakableFillRing, WakableRings, WakableTxRing,
 };

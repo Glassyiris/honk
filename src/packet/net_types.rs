@@ -603,7 +603,9 @@ impl UdpHeaders {
     /// # ).expect("failed to map Umem");
     /// #
     /// # let mut packet = unsafe {
-    /// #    let mut packet = umem.alloc().expect("failed to allocate packet");
+    /// #    let mut packet = umem.alloc()
+    /// #        .expect("UMEM invariant violated")
+    /// #        .expect("UMEM exhausted");
     /// #    packet.adjust_tail(14 + 20 + 8).unwrap();
     /// #    packet.write(0, nt::EthHdr {
     /// #       source: nt::MacAddress([1; 6]),

@@ -300,7 +300,10 @@ impl Proxy {
     fn new(tb: TestBed, rings: xdp::Rings, mut umem: Umem, socketfd: std::os::fd::RawFd) -> Self {
         // Enqueue a buffer to receive the packet
         let mut fr = rings.fill_ring;
-        assert_eq!(fr.enqueue(&mut umem, BATCH_SIZE), BATCH_SIZE);
+        assert_eq!(
+            unsafe { fr.enqueue(&mut umem, BATCH_SIZE) }.unwrap(),
+            BATCH_SIZE
+        );
 
         Self {
             tb,
@@ -327,16 +330,19 @@ impl Proxy {
         while expected > 0 {
             // The entry we queued up in the fill ring is now filled, get it
             loop {
-                if self.rx.recv(&self.umem, &mut rx_slab) > 0 {
+                if unsafe { self.rx.recv(&self.umem, &mut rx_slab) }.unwrap() > 0 {
                     break;
                 }
             }
 
             expected -= rx_slab.len();
-            self.fr.enqueue(
-                &mut self.umem,
-                std::cmp::min(BATCH_SIZE, BATCH_SIZE - rx_slab.len()),
-            );
+            unsafe {
+                self.fr.enqueue(
+                    &mut self.umem,
+                    std::cmp::min(BATCH_SIZE, BATCH_SIZE - rx_slab.len()),
+                )
+            }
+            .unwrap();
 
             while let Some(mut packet) = rx_slab.pop_front() {
                 let udp_packet = test_utils::UdpPacket::parse_packet(&packet);
@@ -463,7 +469,7 @@ impl Proxy {
                 tx_slab.push_back(packet);
             }
 
-            let mut enqueued = self.tx.send(&mut tx_slab);
+            let mut enqueued = unsafe { self.tx.send(&mut tx_slab) }.unwrap();
 
             while enqueued > 0 {
                 unsafe {
@@ -484,7 +490,7 @@ impl Proxy {
                     }
                 }
 
-                enqueued -= self.cr.dequeue(&mut self.umem, enqueued);
+                enqueued -= self.cr.dequeue(&self.umem, enqueued).unwrap();
             }
         }
     }
