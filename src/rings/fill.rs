@@ -135,7 +135,10 @@ impl WakableFillRing {
                     continue;
                 }
                 if error.kind() != std::io::ErrorKind::WouldBlock {
-                    return Err(super::RingError::Io(error));
+                    return Err(super::RingError::Io {
+                        error,
+                        submitted: queued,
+                    });
                 }
                 break;
             }

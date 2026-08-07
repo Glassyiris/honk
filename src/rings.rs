@@ -67,20 +67,40 @@ pub enum Ring {
 pub enum RingError {
     /// Frame ownership was inconsistent.
     Frame(crate::FrameError),
-    /// A ring wakeup syscall failed.
-    Io(std::io::Error),
+    /// A ring wakeup syscall failed after descriptors were submitted.
+    Io {
+        /// The syscall failure.
+        error: std::io::Error,
+        /// Descriptors already published to the kernel ring.
+        submitted: usize,
+    },
 }
 
 impl std::fmt::Display for RingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Frame(error) => error.fmt(f),
-            Self::Io(error) => error.fmt(f),
+            Self::Io { error, submitted } => {
+                write!(
+                    f,
+                    "ring wakeup failed after {submitted} submissions: {error}"
+                )
+            }
         }
     }
 }
 
 impl std::error::Error for RingError {}
+
+impl RingError {
+    /// Returns descriptors already published before this error occurred.
+    pub fn submitted(&self) -> usize {
+        match self {
+            Self::Frame(_) => 0,
+            Self::Io { submitted, .. } => *submitted,
+        }
+    }
+}
 
 /// Builder for the rings that will be created for an XDP socket.
 ///
