@@ -460,20 +460,18 @@ impl XdpSocket {
     #[inline]
     fn poll_inner(&self, events: i16, timeout: PollTimeout) -> std::io::Result<bool> {
         loop {
-            // SAFETY: poll only reads and writes the provided descriptor.
-            let ret = unsafe {
-                socket::poll(
-                    &mut socket::pollfd {
-                        fd: self.sock.as_raw_fd(),
-                        events,
-                        revents: 0,
-                    },
-                    1,
-                    timeout.0,
-                )
+            let mut descriptor = socket::pollfd {
+                fd: self.sock.as_raw_fd(),
+                events,
+                revents: 0,
             };
-            if ret >= 0 {
-                return Ok(ret != 0);
+            // SAFETY: poll only reads and writes the provided descriptor.
+            let ret = unsafe { socket::poll(&mut descriptor, 1, timeout.0) };
+            if ret > 0 {
+                return classify_poll_events(descriptor.revents, events);
+            }
+            if ret == 0 {
+                return Ok(false);
             }
             let error = std::io::Error::last_os_error();
             match error.kind() {
@@ -483,7 +481,21 @@ impl XdpSocket {
             }
         }
     }
+}
 
+fn classify_poll_events(revents: i16, requested: i16) -> std::io::Result<bool> {
+    let errors =
+        socket::PollEvents::POLLERR | socket::PollEvents::POLLHUP | socket::PollEvents::POLLNVAL;
+    if revents & errors != 0 {
+        return Err(std::io::Error::other(format!(
+            "AF_XDP poll reported error events {:#x}",
+            revents & errors
+        )));
+    }
+    Ok(revents & requested != 0)
+}
+
+impl XdpSocket {
     /// Retrieves the statistics for this socket
     #[inline]
     pub fn statistics(&self) -> Result<xdp::XdpStatistics, SocketError> {
@@ -510,5 +522,29 @@ impl std::os::fd::AsRawFd for XdpSocket {
     #[inline]
     fn as_raw_fd(&self) -> std::os::fd::RawFd {
         self.sock.as_raw_fd()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poll_errors_are_not_reported_as_readiness() {
+        assert!(classify_poll_events(0, socket::PollEvents::POLLIN).is_ok_and(|ready| !ready));
+        assert!(
+            classify_poll_events(socket::PollEvents::POLLIN, socket::PollEvents::POLLIN)
+                .is_ok_and(|ready| ready)
+        );
+        assert!(
+            classify_poll_events(socket::PollEvents::POLLHUP, socket::PollEvents::POLLIN).is_err()
+        );
+        assert!(
+            classify_poll_events(
+                socket::PollEvents::POLLIN | socket::PollEvents::POLLERR,
+                socket::PollEvents::POLLIN,
+            )
+            .is_err()
+        );
     }
 }

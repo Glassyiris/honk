@@ -393,6 +393,9 @@ pub(crate) mod socket {
 
         pub const POLLIN: Enum = 0x1;
         pub const POLLOUT: Enum = 0x4;
+        pub const POLLERR: Enum = 0x8;
+        pub const POLLHUP: Enum = 0x10;
+        pub const POLLNVAL: Enum = 0x20;
     }
 
     #[link(name = "c")]
