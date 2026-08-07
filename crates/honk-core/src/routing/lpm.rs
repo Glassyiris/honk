@@ -24,7 +24,6 @@ impl BinaryLpmTrie {
             };
         }
 
-        // Determine address family from the first entry.
         let first = nets[0].addr();
         let (key_bits, to_chunks) = if first.is_ipv4() {
             (32u8, ipv4_to_chunks as fn(IpAddr) -> Vec<u8>)
@@ -38,7 +37,6 @@ impl BinaryLpmTrie {
         };
 
         for net in nets {
-            // Skip entries of the wrong family (shouldn't happen, but be safe).
             if net.addr().is_ipv4() != (key_bits == 32) {
                 continue;
             }
@@ -56,7 +54,6 @@ impl BinaryLpmTrie {
             let byte = chunks[(bit_idx / 8) as usize];
             let bit = (byte >> (7 - (bit_idx % 8))) & 1;
 
-            // Read the current child index (copy out of self.nodes).
             let child_val = if bit == 0 {
                 self.nodes[node_idx as usize].zero
             } else {

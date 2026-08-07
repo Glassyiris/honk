@@ -1119,7 +1119,7 @@ mod brutal_tests {
 
     #[test]
     fn window_is_rate_times_rtt() {
-        let cc = controller(100_000_000); // 100 Mbps → 12.5 MB/s
+        let cc = controller(100_000_000);
         // Initial RTT guess 333ms: BDP = 12.5e6 × 0.333 ≈ 4.16 MB.
         let w = cc.window();
         assert!((4_000_000..4_400_000).contains(&w), "window {w}");

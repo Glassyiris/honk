@@ -789,9 +789,7 @@ impl ControlPlaneHandle {
                                     last_err = Some((msg, node.name.clone()));
                                 }
                             }
-                            Err(_join_err) => {
-                                // Task was cancelled (abort_all) or panicked — ignore.
-                            }
+                            Err(_join_err) => {}
                         }
                     }
                     Ok(None) => break,
@@ -1835,7 +1833,6 @@ impl ControlPlaneHandle {
                         break;
                     }
                 }
-                // Queue closed or budget exhausted.
                 _ => break,
             }
         }

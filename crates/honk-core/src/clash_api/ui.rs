@@ -95,7 +95,6 @@ pub async fn ensure_external_ui(ctx: &UiDownloadContext) -> anyhow::Result<bool>
     match std::fs::read_dir(path) {
         Ok(mut entries) => {
             if entries.next().is_some() {
-                // Already populated — nothing to do.
                 return Ok(false);
             }
         }

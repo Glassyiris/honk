@@ -31,17 +31,14 @@ fn test_parse_url_host_strips_path_and_missing_scheme() {
         AliveDialerSet::parse_url_host("http://www.google-analytics.com/generate_204").as_deref(),
         Some("www.google-analytics.com")
     );
-    // No scheme at all.
     assert_eq!(
         AliveDialerSet::parse_url_host("www.google-analytics.com/generate_204").as_deref(),
         Some("www.google-analytics.com")
     );
-    // Path + port + query.
     assert_eq!(
         AliveDialerSet::parse_url_host("https://example.com:8443/check?q=1#f").as_deref(),
         Some("example.com")
     );
-    // Bracketed IPv6 with port and path, scheme or not.
     assert_eq!(
         AliveDialerSet::parse_url_host("http://[2606:4700:4700::1111]:443/").as_deref(),
         Some("2606:4700:4700::1111")
@@ -123,7 +120,6 @@ fn test_alive_set_basic() {
     assert!(set.is_alive_for(id(1), ProbeDomain::DnsUdp, IpVersion::V4));
     set.mark_dead_for(id(1), ProbeDomain::DnsUdp, IpVersion::V4);
     assert!(!set.is_alive_for(id(1), ProbeDomain::DnsUdp, IpVersion::V4));
-    // Mark alive should restore all domains
     set.mark_alive_for(id(1), ProbeDomain::Tcp, IpVersion::V4);
     assert!(set.is_alive(id(1)));
 }
@@ -234,12 +230,10 @@ async fn test_urltest_idle_suspension() {
     assert!(set.is_urltest_group_idle("g"));
     assert!(set.is_probe_suspended(id(1)));
 
-    // Activity wakes the group.
     set.mark_group_active("g");
     assert!(!set.is_urltest_group_idle("g"));
     assert!(!set.is_probe_suspended(id(1)));
 
-    // After the idle timeout it goes idle again.
     tokio::time::sleep(Duration::from_millis(60)).await;
     assert!(set.is_urltest_group_idle("g"));
     assert!(set.is_probe_suspended(id(1)));
@@ -270,7 +264,6 @@ async fn test_health_cycle_skips_idle_urltest_nodes() {
         "ungrouped node must be probed"
     );
 
-    // Wake the group → next cycle probes n1 again.
     set.mark_group_active("g");
     set.run_health_check_cycle(Duration::from_millis(200)).await;
     assert!(

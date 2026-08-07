@@ -359,7 +359,6 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         );
         route_flag[0] = 1; // L4ProtoType_TCP
     } else {
-        // UDP
         if !crate::contrack::is_short_lived_udp_traffic(&pkt.tuples.five) {
             udp_state = crate::contrack::mark_udp_seen(
                 &pkt.tuples.five,

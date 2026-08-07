@@ -2094,7 +2094,6 @@ impl tokio::io::AsyncRead for AnyTlsStream {
         // frames would otherwise cost one relay wakeup per frame.
         let mut got_any = this.read_pos < this.read_buf.len();
         loop {
-            // Copy what the current frame buffer has.
             let n = (this.read_buf.len() - this.read_pos).min(out.remaining());
             if n > 0 {
                 out.put_slice(&this.read_buf[this.read_pos..this.read_pos + n]);

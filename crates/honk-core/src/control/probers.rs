@@ -197,7 +197,6 @@ impl ProxyHttpProber {
             extract_url_host_path(url).ok_or_else(|| format!("invalid check URL: {}", url))?;
         let method = if method.is_empty() { "GET" } else { method };
 
-        // Build minimal HTTP/1.1 request
         let request = format!(
             "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: honk-health/1.0\r\nConnection: close\r\n\r\n",
             method, path, host
@@ -208,7 +207,6 @@ impl ProxyHttpProber {
             .await
             .map_err(|e| format!("HTTP write failed: {}", e))?;
 
-        // Read response until we have the status line
         let mut buf = vec![0u8; 4096];
         let n = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf))
             .await
@@ -222,7 +220,6 @@ impl ProxyHttpProber {
         let response = String::from_utf8_lossy(&buf[..n]);
         let status_line = response.lines().next().unwrap_or("");
 
-        // Parse status code: "HTTP/1.1 200 OK" → 200
         let parts: Vec<&str> = status_line.split_whitespace().collect();
         if parts.len() < 2 {
             return Err(format!("malformed HTTP status: {}", status_line));

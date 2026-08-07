@@ -694,8 +694,6 @@ async fn get_proxy_delay(
         };
     }
 
-    // Group: measure the flattened members (sub-groups measured through
-    // their representative leaf), report the current selection's delay.
     if config.groups.iter().any(|g| g.name == name) {
         let members = {
             let gm = s.group_manager.read();
@@ -1462,8 +1460,6 @@ async fn logs_ws(mut socket: WebSocket, mut subscription: logs::LogSubscription)
                     break;
                 }
             }
-            // Lagging subscribers skip ahead; a closed channel (shutdown)
-            // ends the stream.
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
@@ -1491,7 +1487,6 @@ fn logs_chunk_stream(
                     );
                     return Some((Ok(Bytes::from(line)), subscription));
                 }
-                // Lagging subscribers skip ahead; a closed channel ends it.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
             }

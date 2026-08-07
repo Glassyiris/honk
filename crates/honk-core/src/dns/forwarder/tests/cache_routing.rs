@@ -10,7 +10,6 @@ fn test_extract_soa_negative_ttl() {
         0x00, 0x01, // NSCOUNT
         0x00, 0x00, // ARCOUNT
     ];
-    // Question: example.com A IN
     for label in ["example", "com"] {
         resp.push(label.len() as u8);
         resp.extend_from_slice(label.as_bytes());

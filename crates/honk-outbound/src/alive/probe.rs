@@ -311,7 +311,6 @@ impl AliveDialerSet {
             return false;
         }
 
-        // Pick at most one address per IP version
         let mut probe_addrs: Vec<SocketAddr> = Vec::new();
         let mut any_v4 = false;
         let mut any_v6 = false;

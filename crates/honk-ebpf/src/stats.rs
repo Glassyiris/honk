@@ -2,8 +2,8 @@
 //!
 //! Counters live in the per-CPU `OUTBOUND_STATS` array (see `maps.rs`) so
 //! the per-packet update never contends across CPUs; each packed entry holds
-//! packet and byte counters for one outbound.
-//! `lan_ingress` when the routing decision lands — both for redirected
+//! packet and byte counters for one outbound.  Tx (LAN → outbound) is
+//! counted at `lan_ingress` when the routing decision lands — both for redirected
 //! flows and for direct+must pass-throughs — and rx (outbound → LAN) at
 //! `dae0_ingress` on the reply path.  Flows that never carry an outbound
 //! index (unclassified pass-throughs, drops) are not counted.

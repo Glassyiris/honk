@@ -28,7 +28,6 @@ pub use honk_ebpf_common::LpmKey;
 /// assert_eq!(key.data[3], 0x0000000a);
 /// ```
 pub fn cidr_to_lpm_key(prefix: &str) -> anyhow::Result<LpmKey> {
-    // If no '/' is present, append the default host prefix length.
     let owned: String;
     let prefix_str = if prefix.contains('/') {
         prefix

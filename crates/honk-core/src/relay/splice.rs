@@ -215,11 +215,6 @@ async fn pump(
     }
 }
 
-/// Grace window for the surviving direction after the first EOF. A peer
-/// that received our half-close should finish draining within seconds;
-/// without a bound, a silent peer (dead node, blackholed tunnel) pins the
-/// relay task and both sockets forever — observed in production as a
-/// growing pile of CLOSE-WAIT accepted sockets.
 /// Idle budget for the surviving direction after the first EOF: it is cut
 /// only when this much time passes without any byte of progress, so a
 /// silent peer cannot pin the relay task and both sockets forever —

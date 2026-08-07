@@ -953,7 +953,6 @@ fn parse_dns_request_routing(body: &str) -> crate::dns::DnsRequestRouting {
 
     for line in body.lines() {
         let mut trimmed = line.trim();
-        // Strip trailing inline comment
         if let Some(pos) = trimmed.find("//") {
             trimmed = trimmed[..pos].trim();
         } else if let Some(pos) = trimmed.find('#') {
@@ -966,14 +965,12 @@ fn parse_dns_request_routing(body: &str) -> crate::dns::DnsRequestRouting {
             continue;
         }
 
-        // fallback/default
         if trimmed.starts_with("fallback:") || trimmed.starts_with("default:") {
             let fb = trimmed.split_once(':').unwrap().1.trim();
             routing.fallback = crate::dns::DnsRequestAction::parse(fb);
             continue;
         }
 
-        // Rule: COND -> action
         if let Some(arrow_pos) = trimmed.find("->") {
             let left = trimmed[..arrow_pos].trim();
             let right = trimmed[arrow_pos + 2..].trim();
@@ -997,7 +994,6 @@ fn parse_dns_response_routing(body: &str) -> crate::dns::DnsResponseRouting {
 
     for line in body.lines() {
         let mut trimmed = line.trim();
-        // Strip trailing inline comment
         if let Some(pos) = trimmed.find("//") {
             trimmed = trimmed[..pos].trim();
         } else if let Some(pos) = trimmed.find('#')
@@ -1010,14 +1006,12 @@ fn parse_dns_response_routing(body: &str) -> crate::dns::DnsResponseRouting {
             continue;
         }
 
-        // fallback/default
         if trimmed.starts_with("fallback:") || trimmed.starts_with("default:") {
             let fb = trimmed.split_once(':').unwrap().1.trim();
             routing.fallback = crate::dns::DnsResponseAction::parse(fb);
             continue;
         }
 
-        // Rule: COND -> action
         if let Some(arrow_pos) = trimmed.find("->") {
             let left = trimmed[..arrow_pos].trim();
             let right = trimmed[arrow_pos + 2..].trim();
@@ -1045,21 +1039,18 @@ fn parse_dns_conditions(expr: &str, is_response: bool) -> Vec<crate::dns::DnsCon
         if part.is_empty() {
             continue;
         }
-        // Negation
         let (not, inner) = if let Some(rest) = part.strip_prefix('!') {
             (true, rest.trim())
         } else {
             (false, part)
         };
 
-        // qname(...)
         if let Some(args) = extract_fn_args(inner, "qname") {
             let matchers = parse_dns_qname_args(&args);
             conds.push(crate::dns::DnsCond::Qname { not, matchers });
             continue;
         }
 
-        // qtype(...)
         if let Some(args) = extract_fn_args(inner, "qtype") {
             let types: Vec<u16> = args
                 .iter()
@@ -1069,7 +1060,6 @@ fn parse_dns_conditions(expr: &str, is_response: bool) -> Vec<crate::dns::DnsCon
             continue;
         }
 
-        // Response-only functions
         if is_response {
             if let Some(args) = extract_fn_args(inner, "upstream") {
                 conds.push(crate::dns::DnsCond::Upstream { not, names: args });

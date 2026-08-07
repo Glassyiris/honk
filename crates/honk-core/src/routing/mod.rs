@@ -601,7 +601,6 @@ impl Router {
             }
         }
 
-        // MAC address matching (exact, canonical form)
         if !route.mac_addresses.is_empty() {
             match conn.mac {
                 Some(ref mac) => match normalize_mac(mac) {

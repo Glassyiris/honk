@@ -73,7 +73,6 @@ fn make_a_response(ip: [u8; 4], ttl: u32) -> Vec<u8> {
         0x00, // NSCOUNT
         0x00,
         0x00, // ARCOUNT
-        // Question: example.com A IN
         0x07,
         b'e',
         b'x',
@@ -91,7 +90,6 @@ fn make_a_response(ip: [u8; 4], ttl: u32) -> Vec<u8> {
         0x01, // QTYPE A
         0x00,
         0x01, // QCLASS IN
-        // Answer
         0xc0,
         0x0c, // NAME pointer to offset 12
         0x00,

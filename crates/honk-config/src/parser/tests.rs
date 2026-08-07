@@ -648,7 +648,6 @@ dns {
         rule.action,
         crate::dns::DnsRequestAction::Upstream("alidns".to_string())
     );
-    // fallback synced to legacy field
     assert_eq!(config.dns.routing.fallback, "default");
 }
 
@@ -666,7 +665,6 @@ dns {
 "#;
     let config = parse_dae_config(input).unwrap();
     assert_eq!(config.dns.routing.request.rules.len(), 2);
-    // First rule: qtype(a,aaaa) -> alidns
     match &config.dns.routing.request.rules[0].conditions[0] {
         crate::dns::DnsCond::Qtype { not, types } => {
             assert!(!not);
@@ -675,7 +673,6 @@ dns {
         }
         _ => panic!("expected Qtype"),
     }
-    // Second rule: qtype(https) -> reject
     match &config.dns.routing.request.rules[1].conditions[0] {
         crate::dns::DnsCond::Qtype { not, types } => {
             assert!(!not);
@@ -703,9 +700,7 @@ dns {
 "#;
     let config = parse_dae_config(input).unwrap();
     assert_eq!(config.dns.routing.request.rules.len(), 2);
-    // First rule: AND of qname + qtype
     assert_eq!(config.dns.routing.request.rules[0].conditions.len(), 2);
-    // Second rule: reject
     assert_eq!(
         config.dns.routing.request.rules[1].action,
         crate::dns::DnsRequestAction::Reject
@@ -787,11 +782,9 @@ dns {
 "#;
     let config = parse_dae_config(input).unwrap();
     assert_eq!(config.dns.routing.response.rules.len(), 2);
-    // First rule
     let rule0 = &config.dns.routing.response.rules[0];
     assert_eq!(rule0.conditions.len(), 2);
     assert_eq!(rule0.action, crate::dns::DnsResponseAction::Accept);
-    // Second rule
     let rule1 = &config.dns.routing.response.rules[1];
     match &rule1.conditions[0] {
         crate::dns::DnsCond::Upstream { not, names } => {

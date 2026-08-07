@@ -465,7 +465,6 @@ impl AliveDialerSet {
             );
             *self.check_url_ips.write() = ips;
         } else {
-            // No URL hostname at all — literal-only form.
             let ips = Self::merge_check_addrs(Vec::new(), &check_url, port);
             if !ips.is_empty() {
                 *self.check_url_ips.write() = ips;
@@ -899,11 +898,9 @@ impl AliveDialerSet {
         let revived = self.with_state(node_id, idx, |e| {
             let was = e.alive;
             if was {
-                // Already alive: straightforward reset.
                 e.reset_on_success();
                 false
             } else {
-                // Was dead: apply recovery hysteresis.
                 e.consecutive_successes += 1;
                 e.consecutive_failures = 0;
                 e.traffic_failures = 0;

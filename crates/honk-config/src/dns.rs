@@ -332,11 +332,10 @@ fn parse_legacy_pattern(pattern: &str) -> (DnsDomainMatcher, String) {
 /// Returns `None` for unrecognised names.
 pub fn parse_qtype_token(s: &str) -> Option<u16> {
     let s = s.trim();
-    // Try numeric first
     if let Ok(n) = s.parse::<u16>() {
         return Some(n);
     }
-    // Named types
+
     match s.to_ascii_uppercase().as_str() {
         "A" => Some(1),
         "AAAA" => Some(28),

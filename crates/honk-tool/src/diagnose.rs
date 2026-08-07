@@ -23,7 +23,6 @@ pub struct DiagnoseArgs {
 pub async fn run(args: DiagnoseArgs) -> anyhow::Result<()> {
     let mut issues = 0usize;
 
-    // 1. Engine process.
     match find_engine() {
         Some((pid, comm)) => println!("[ok] engine running: pid {pid} ({comm})"),
         None => {
@@ -32,7 +31,6 @@ pub async fn run(args: DiagnoseArgs) -> anyhow::Result<()> {
         }
     }
 
-    // 2. Namespace plumbing.
     check_path(
         "/var/run/netns/daens",
         "daens network namespace",
@@ -50,7 +48,6 @@ pub async fn run(args: DiagnoseArgs) -> anyhow::Result<()> {
         issues += 1;
     }
 
-    // 4. Pinned maps.
     for name in [
         "CONN_STATE_MAP",
         "REDIRECT_TRACK",
@@ -75,7 +72,6 @@ pub async fn run(args: DiagnoseArgs) -> anyhow::Result<()> {
         }
     }
 
-    // 6. Clash API.
     if !args.api.is_empty() {
         let url = format!("{}/version", args.api.trim_end_matches('/'));
         match reqwest_get(&url).await {

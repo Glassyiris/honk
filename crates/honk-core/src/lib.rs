@@ -286,7 +286,6 @@ pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// to 90s for the previous instance to exit, then fails loudly.
 /// Take the process-wide instance lock: the datapath uses fixed names
 /// (dae0, daens, TC hooks) and a stopping instance's cleanup destroys
 /// them, so a second instance must never start while the first is still
@@ -1205,7 +1204,6 @@ fn create_dae0_veth() -> anyhow::Result<Dae0Guard> {
     let dae0_idx = netlink::ifindex_of("dae0")?;
     let peer_idx = netlink::ifindex_of("dae0peer")?;
 
-    // Bring up dae0. dae0peer stays down until after BPF attach.
     // These are datapath-critical: a "successful" startup without them is
     // worse than a loud failure.
     nl.set_link_up(dae0_idx, true)

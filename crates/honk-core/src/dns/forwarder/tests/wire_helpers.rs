@@ -75,7 +75,6 @@ fn test_extract_min_ttl_no_answers() {
         0x00, 0x00, // ANCOUNT = 0
         0x00, 0x00, // NSCOUNT
         0x00, 0x00, // ARCOUNT
-        // Question
         0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01,
         0x00, 0x01,
     ];

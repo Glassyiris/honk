@@ -196,10 +196,8 @@ fn test_idle_with_timeout() {
     let m = GroupManager::new(&[group], &nodes);
     // Never used → idle.
     assert!(m.is_group_idle("g"));
-    // Use it.
     m.select_node("g");
     assert!(!m.is_group_idle("g"));
-    // After 1s it's idle again.
     std::thread::sleep(Duration::from_secs(1));
     assert!(m.is_group_idle("g"));
 }
@@ -314,7 +312,6 @@ fn test_interrupt_callback_urltest_switch() {
     assert_eq!(sel.name, "b");
     assert_eq!(calls.lock().unwrap().as_slice(), &["g".to_string()]);
 
-    // Re-selecting the same node fires nothing more.
     m.select_node("g");
     assert_eq!(calls.lock().unwrap().len(), 1);
 }
@@ -751,7 +748,6 @@ fn test_fallback_first_alive_switch_and_no_flap_back() {
     assert_eq!(m.select_node("fb").unwrap().name, "a");
     assert_eq!(m.get_fallback_selection("fb"), Some("a".into()));
 
-    // Current pin dies → switch to the next alive node.
     alive.report_unavailable_forced(nid("a"), ProbeDomain::Tcp, IpVersion::V4);
     assert_eq!(m.select_node("fb").unwrap().name, "b");
     assert_eq!(m.get_fallback_selection("fb"), Some("b".into()));
@@ -810,12 +806,10 @@ fn test_fallback_interrupt_on_switch() {
     assert_eq!(m.select_node("fb").unwrap().name, "a");
     assert!(calls.lock().unwrap().is_empty());
 
-    // Pin dies → switch fires the interrupt once.
     alive.report_unavailable_forced(nid("a"), ProbeDomain::Tcp, IpVersion::V4);
     assert_eq!(m.select_node("fb").unwrap().name, "b");
     assert_eq!(calls.lock().unwrap().as_slice(), &["fb".to_string()]);
 
-    // Re-selecting the same pin fires nothing more.
     m.select_node("fb");
     assert_eq!(calls.lock().unwrap().len(), 1);
 }

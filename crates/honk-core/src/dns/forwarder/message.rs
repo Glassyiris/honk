@@ -58,7 +58,7 @@ fn encode_dns_name(domain: &str) -> Vec<u8> {
     let mut encoded = Vec::new();
     for label in domain.split('.') {
         if label.len() > 63 {
-            continue; // skip invalid labels
+            continue;
         }
         encoded.push(label.len() as u8);
         encoded.extend_from_slice(label.as_bytes());
@@ -150,10 +150,6 @@ fn decode_dns_name(data: &[u8], pos: &mut usize) -> Option<String> {
     }
 }
 
-/// Resolve the TTL used for positive cache inserts.
-///
-/// `configured` is `dns.cache.ttl` / `optimistic_cache_ttl`. Non-zero values
-/// win (fixed override); `0` keeps the answer-section minimum.
 /// Extract A/AAAA answer IPs from a wire-format DNS response.
 pub fn extract_answer_ips(data: &[u8]) -> Vec<IpAddr> {
     crate::dns::wire::extract_ips_from_dns_response(data)

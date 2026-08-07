@@ -152,7 +152,6 @@ fn make_aaaa_response(ip: [u8; 16], ttl: u32) -> Vec<u8> {
         0x00, // NSCOUNT
         0x00,
         0x00, // ARCOUNT
-        // Question: example.com AAAA IN
         0x07,
         b'e',
         b'x',
@@ -170,7 +169,6 @@ fn make_aaaa_response(ip: [u8; 16], ttl: u32) -> Vec<u8> {
         0x1c, // QTYPE AAAA
         0x00,
         0x01, // QCLASS IN
-        // Answer
         0xc0,
         0x0c, // NAME pointer to offset 12
         0x00,

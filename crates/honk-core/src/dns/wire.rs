@@ -56,7 +56,6 @@ pub(crate) fn extract_ips_with_ttl(response: &[u8]) -> Vec<(IpAddr, u32)> {
     let ancount = u16::from_be_bytes([response[6], response[7]]) as usize;
     let mut pos = 12;
 
-    // Skip question section
     for _ in 0..qdcount {
         if !skip_dns_name(response, &mut pos) {
             return out;
@@ -128,7 +127,6 @@ mod tests {
             0x00, // NSCOUNT
             0x00,
             0x00, // ARCOUNT
-            // Question: example.com
             0x07,
             b'e',
             b'x',

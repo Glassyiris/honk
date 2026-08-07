@@ -303,7 +303,6 @@ fn parse_answers(msg: &[u8], qtype: u16) -> io::Result<Vec<IpAddr>> {
     let qd = u16::from_be_bytes([msg[4], msg[5]]) as usize;
     let an = u16::from_be_bytes([msg[6], msg[7]]) as usize;
     let mut pos = 12;
-    // Skip the question section.
     for _ in 0..qd {
         pos = skip_name(msg, pos)?;
         pos = pos.checked_add(4).ok_or_else(bad)?; // qtype + qclass
@@ -358,7 +357,6 @@ fn skip_name(msg: &[u8], mut pos: usize) -> io::Result<usize> {
             return Err(bad());
         };
         if len & 0xC0 == 0xC0 {
-            // Compression pointer: two bytes, done.
             return Ok(pos + 2);
         }
         if len == 0 {
@@ -393,8 +391,6 @@ mod tests {
 
     #[test]
     fn test_build_and_parse_roundtrip() {
-        // Hand-craft a response for the query: copy the question, set flags
-        // and append one A answer with a compression pointer.
         let query = build_query("example.com", 1);
         let mut resp = query.clone();
         resp[2] = 0x81;

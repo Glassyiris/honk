@@ -73,7 +73,6 @@ pub fn parse_answers(msg: &[u8]) -> Vec<DohAnswer> {
     let ancount = u16::from_be_bytes([msg[6], msg[7]]) as usize;
 
     let mut pos = 12;
-    // Skip the question section.
     for _ in 0..qdcount {
         let Some((_, next)) = decode_name(msg, pos) else {
             return out;

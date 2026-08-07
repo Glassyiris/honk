@@ -50,7 +50,6 @@ pub(crate) fn extract_soa_negative_ttl(data: &[u8], default_ttl: u32) -> u32 {
             return default_ttl;
         }
     }
-    // Skip answers; scan authority records for SOA (TYPE 6).
     for i in 0..(ancount + nscount) {
         if !skip_dns_name(data, &mut pos) {
             return default_ttl;
@@ -133,7 +132,6 @@ pub(crate) fn extract_min_ttl(data: &[u8]) -> u32 {
 
     let mut pos = 12;
 
-    // Skip question section
     for _ in 0..qdcount {
         if !skip_dns_name(data, &mut pos) {
             return 60;
