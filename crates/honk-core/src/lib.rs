@@ -97,13 +97,13 @@ pub(crate) fn configured_interfaces(config: &honk_config::Config) -> ConfiguredI
         .global
         .lan_interface
         .iter()
-        .map(|name| resolve_interface(name))
+        .filter_map(|name| resolve_interface(name))
         .collect();
     let wan: Vec<String> = config
         .global
         .wan_interface
         .iter()
-        .map(|name| resolve_interface(name))
+        .filter_map(|name| resolve_interface(name))
         .collect();
     let single_homed = !wan.is_empty() && lan.iter().any(|name| wan.contains(name));
     ConfiguredInterfaces {
@@ -114,15 +114,13 @@ pub(crate) fn configured_interfaces(config: &honk_config::Config) -> ConfiguredI
 }
 
 /// Resolve an interface name, expanding `"auto"` or empty to the default route interface.
+/// never fallback to "lo"
 #[cfg(feature = "ebpf")]
-pub(crate) fn resolve_interface(name: &str) -> String {
+pub(crate) fn resolve_interface(name: &str) -> Option<String> {
     if name == "auto" || name.is_empty() {
-        detect_default_interface().unwrap_or_else(|| {
-            warn!("could not detect default route interface; falling back to 'lo'");
-            "lo".to_string()
-        })
+        detect_default_interface()
     } else {
-        name.to_string()
+        Some(name.to_string())
     }
 }
 
