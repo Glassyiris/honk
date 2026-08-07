@@ -17,6 +17,12 @@ This crate allows for the creation and usage of [AF_XDP] sockets on Linux, along
 
 The primary difference between this crate and the other XSK/XDP crates available on crates.io is that this crate does not depend on any C code.
 
+## Honk hardening fork
+
+The `honk-linear-umem` branch is a deliberately source-incompatible fork for Honk's optional first-packet AF_XDP path. It pins the upstream `0.7.3` lineage while adding release-build frame ownership checks, automatic `XDP_RING_NEED_WAKEUP` handling, kernel-reported copy/zero-copy mode, and quiescent teardown accounting.
+
+Packets follow one checked lifecycle: `Free -> Fill -> Rx -> Tx -> Completion -> Free`. Packet cloning and manual address/free APIs are removed; unsubmitted packets return their frame on drop, while ring operations report foreign-UMEM, invalid-descriptor, duplicate-completion, and post-submission wake failures. Shared UMEM and multi-buffer support remain intentionally unavailable.
+
 ## Why not use this crate?
 
 This crate is still early days, and focused on the needs of [Quilkin](https://github.com/googleforgames/quilkin), so feature requests or bug fixes that don't pertain to it would most likely need outside contribution. There are already several other Rust crates available that (probably) have more full featured support.

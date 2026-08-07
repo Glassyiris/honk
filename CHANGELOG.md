@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
+### Changed
+- Removed copyable packets and manual frame return APIs in favor of a checked `Free -> Fill -> Rx -> Tx -> Completion -> Free` lifecycle.
+- Made fill, RX, TX, and completion operations report descriptor and ownership failures.
+- Moved `XDP_RING_NEED_WAKEUP` decisions into the producer rings and report descriptors submitted before a wake syscall failure.
+
+### Added
+- Added kernel-reported copy/zero-copy bind mode through `XDP_OPTIONS`.
+- Added UMEM ownership counters, cross-UMEM rejection, automatic return of unsubmitted packets, and quiescent fill-frame reclamation.
+
 ## [0.7.3] - 2026-02-25
 ### Added
 - [PR#38](https://codeberg.org/ca1ne/xdp/pulls/38) added checksum calculation support for `aarch64`, resolving [#5](https://codeberg.org/ca1ne/xdp/issues/5).
