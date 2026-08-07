@@ -374,3 +374,26 @@ impl<T: Copy> XskConsumer<T> {
         self.0.consumer.fetch_add(nb, Ordering::Release);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ring_errors_preserve_published_descriptor_count() {
+        let frame = RingError::Frame {
+            error: crate::FrameError::InvalidLength {
+                length: 65,
+                capacity: 64,
+            },
+            submitted: 3,
+        };
+        assert_eq!(frame.submitted(), 3);
+
+        let wake = RingError::Io {
+            error: std::io::Error::from_raw_os_error(5),
+            submitted: 2,
+        };
+        assert_eq!(wake.submitted(), 2);
+    }
+}
