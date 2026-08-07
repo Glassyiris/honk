@@ -65,8 +65,13 @@ pub enum Ring {
 /// A frame ownership or ring wakeup failure.
 #[derive(Debug)]
 pub enum RingError {
-    /// Frame ownership was inconsistent.
-    Frame(crate::FrameError),
+    /// Frame ownership failed after zero or more descriptors were submitted.
+    Frame {
+        /// Ownership or descriptor fault.
+        error: crate::FrameError,
+        /// Descriptors already published to the kernel ring.
+        submitted: usize,
+    },
     /// A ring wakeup syscall failed after descriptors were submitted.
     Io {
         /// The syscall failure.
@@ -79,7 +84,12 @@ pub enum RingError {
 impl std::fmt::Display for RingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Frame(error) => error.fmt(f),
+            Self::Frame { error, submitted } => {
+                write!(
+                    f,
+                    "frame operation failed after {submitted} submissions: {error}"
+                )
+            }
             Self::Io { error, submitted } => {
                 write!(
                     f,
@@ -96,8 +106,7 @@ impl RingError {
     /// Returns descriptors already published before this error occurred.
     pub fn submitted(&self) -> usize {
         match self {
-            Self::Frame(_) => 0,
-            Self::Io { submitted, .. } => *submitted,
+            Self::Frame { submitted, .. } | Self::Io { submitted, .. } => *submitted,
         }
     }
 }

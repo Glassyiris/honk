@@ -2,7 +2,7 @@
 //! filled with data received on the NIC queue the ring is bound to
 
 use crate::{
-    FrameError, Umem,
+    Umem,
     libc::{self, rings},
 };
 
@@ -50,7 +50,11 @@ impl FillRing {
     /// The number of packets that were actually enqueued. This number can be
     /// lower than the requested `num_packets` if the [`Umem`] didn't have enough
     /// open slots, or the rx ring had insufficient capacity
-    pub unsafe fn enqueue(&mut self, umem: &Umem, num_packets: usize) -> Result<usize, FrameError> {
+    pub unsafe fn enqueue(
+        &mut self,
+        umem: &Umem,
+        num_packets: usize,
+    ) -> Result<usize, super::RingError> {
         let requested = std::cmp::min(umem.allocatable(), num_packets);
         if requested == 0 {
             return Ok(0);
@@ -70,7 +74,10 @@ impl FillRing {
                     if queued > 0 {
                         self.ring.submit(queued as u32);
                     }
-                    return Err(error);
+                    return Err(super::RingError::Frame {
+                        error,
+                        submitted: queued,
+                    });
                 }
             }
         }
@@ -111,8 +118,7 @@ impl WakableFillRing {
         num_packets: usize,
     ) -> Result<usize, super::RingError> {
         // SAFETY: FillRing::enqueue has the same UMEM lifetime requirement.
-        let queued =
-            unsafe { self.inner.enqueue(umem, num_packets) }.map_err(super::RingError::Frame)?;
+        let queued = unsafe { self.inner.enqueue(umem, num_packets) }?;
         if queued > 0 && self.inner.ring.needs_wakeup() {
             loop {
                 // SAFETY: poll only reads the provided descriptor.
