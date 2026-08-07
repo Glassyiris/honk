@@ -750,7 +750,11 @@ protocol = "udp"
         };
         // Startup resolves filter-based membership (filter-less group → all
         // nodes), exactly like run() does before ControlPlane::new.
-        honk_config::parser::resolve_group_filters(&mut config.groups, &config.nodes);
+        honk_config::parser::resolve_group_filters(
+            &mut config.groups,
+            &config.nodes,
+            &config.subscriptions,
+        );
         // A routing rule targeting the group, so the merge pipeline has a
         // ruleset to rebuild and push.
         config.routing.rules = vec![routing::RoutingRule {

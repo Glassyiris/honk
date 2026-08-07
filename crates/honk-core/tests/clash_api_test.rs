@@ -259,6 +259,72 @@ async fn test_auth_secret_enforced() {
 }
 
 #[tokio::test]
+async fn test_rules_aggregate_simple_and_preserve_complex() {
+    let config = honk_config::parser::parse_dae_config(
+        r#"
+routing {
+    sip(10.10.10.24/32,
+        10.10.10.25/32
+    ) -> direct
+    pname(curl, wget) && l4proto(tcp) -> proxy
+    dport(80, 443) -> proxy
+    domain(suffix: example.com, keyword: tracker) -> proxy
+    !dport(53) -> block
+    dip(geoip: private) -> direct(must)
+    fallback: direct
+}
+"#,
+    )
+    .unwrap();
+    let app = spawn_app_with_config(config, "", "").await;
+
+    let body: serde_json::Value = http_client()
+        .get(app.url("/rules"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        body["rules"],
+        serde_json::json!([
+            {
+                "type": "src-ip-cidr",
+                "payload": "10.10.10.24/32,10.10.10.25/32",
+                "proxy": "direct"
+            },
+            {
+                "type": "complex",
+                "payload": "pname(curl, wget) && l4proto(tcp) -> proxy",
+                "proxy": "proxy"
+            },
+            {
+                "type": "dst-port",
+                "payload": "80,443",
+                "proxy": "proxy"
+            },
+            {
+                "type": "complex",
+                "payload": "domain(suffix: example.com, keyword: tracker) -> proxy",
+                "proxy": "proxy"
+            },
+            {
+                "type": "complex",
+                "payload": "!dport(53) -> block",
+                "proxy": "block"
+            },
+            {
+                "type": "complex",
+                "payload": "dip(geoip: private) -> direct(must)",
+                "proxy": "direct"
+            }
+        ])
+    );
+}
+
+#[tokio::test]
 async fn test_proxies_structure_and_selector_switch() {
     let app = spawn_app("", "").await;
     let client = http_client();

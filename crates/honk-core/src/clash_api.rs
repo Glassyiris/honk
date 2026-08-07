@@ -28,7 +28,6 @@ use bytes::Bytes;
 use honk_config::Config;
 use honk_config::group::GroupPolicy;
 use honk_config::node::{Group, Node};
-use honk_config::routing::{RoutingCondition, RoutingOutbound};
 use honk_config::types::NodeProtocol;
 use honk_outbound::alive::{AliveDialerSet, IpVersion, ProbeDomain};
 use honk_outbound::group::{GroupManager, SharedGroupManager};
@@ -795,142 +794,21 @@ async fn get_group_delay(
     Json(serde_json::Value::Object(delays)).into_response()
 }
 
-/// Map a single routing condition entry to a Clash rule object.
-fn condition_to_rule_entry(
-    condition: &RoutingCondition,
-    proxy_tag: &str,
-) -> Vec<serde_json::Value> {
-    let mut entries = Vec::new();
-
-    for domain in &condition.domain {
-        entries.push(serde_json::json!({
-            "type": "domain",
-            "payload": domain,
-            "proxy": proxy_tag,
-        }));
-    }
-    for suffix in &condition.domain_suffix {
-        entries.push(serde_json::json!({
-            "type": "domain-suffix",
-            "payload": suffix,
-            "proxy": proxy_tag,
-        }));
-    }
-    for keyword in &condition.domain_keyword {
-        entries.push(serde_json::json!({
-            "type": "domain-keyword",
-            "payload": keyword,
-            "proxy": proxy_tag,
-        }));
-    }
-    for regex in &condition.domain_regex {
-        entries.push(serde_json::json!({
-            "type": "domain-regex",
-            "payload": regex,
-            "proxy": proxy_tag,
-        }));
-    }
-    for ip in &condition.ip {
-        entries.push(serde_json::json!({
-            "type": "ip-cidr",
-            "payload": ip,
-            "proxy": proxy_tag,
-        }));
-    }
-    for src_ip in &condition.source_ip {
-        entries.push(serde_json::json!({
-            "type": "src-ip-cidr",
-            "payload": src_ip,
-            "proxy": proxy_tag,
-        }));
-    }
-    for port in &condition.port {
-        entries.push(serde_json::json!({
-            "type": "dst-port",
-            "payload": port,
-            "proxy": proxy_tag,
-        }));
-    }
-    for src_port in &condition.source_port {
-        entries.push(serde_json::json!({
-            "type": "src-port",
-            "payload": src_port,
-            "proxy": proxy_tag,
-        }));
-    }
-    for proto in &condition.protocol {
-        entries.push(serde_json::json!({
-            "type": "protocol",
-            "payload": proto,
-            "proxy": proxy_tag,
-        }));
-    }
-    for process in &condition.process_name {
-        entries.push(serde_json::json!({
-            "type": "process-name",
-            "payload": process,
-            "proxy": proxy_tag,
-        }));
-    }
-    for mac in &condition.mac {
-        entries.push(serde_json::json!({
-            "type": "src-mac",
-            "payload": mac,
-            "proxy": proxy_tag,
-        }));
-    }
-    for geo_ip in &condition.geo_ip {
-        entries.push(serde_json::json!({
-            "type": "geoip",
-            "payload": geo_ip,
-            "proxy": proxy_tag,
-        }));
-    }
-    for geosite in &condition.geosite {
-        entries.push(serde_json::json!({
-            "type": "geosite",
-            "payload": geosite,
-            "proxy": proxy_tag,
-        }));
-    }
-    for ip_ver in &condition.ip_version {
-        entries.push(serde_json::json!({
-            "type": "ip-version",
-            "payload": ip_ver,
-            "proxy": proxy_tag,
-        }));
-    }
-    for dscp in &condition.dscp {
-        entries.push(serde_json::json!({
-            "type": "dscp",
-            "payload": dscp,
-            "proxy": proxy_tag,
-        }));
-    }
-
-    entries
-}
-
-/// Extract the proxy tag name from a RoutingOutbound.
-fn outbound_tag(outbound: &RoutingOutbound) -> String {
-    match outbound {
-        RoutingOutbound::Simple(name) => name.clone(),
-        RoutingOutbound::Complex { outbounds, .. } => outbounds
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "unknown".into()),
-    }
-}
-
 async fn get_rules(State(s): State<Arc<ClashState>>) -> Json<serde_json::Value> {
     let config = s.config.read().await;
-    let mut rules: Vec<serde_json::Value> = Vec::new();
-
-    for rule in &config.routing.rules {
-        let proxy_tag = outbound_tag(&rule.outbound);
-        let entries = condition_to_rule_entry(&rule.condition, &proxy_tag);
-        rules.extend(entries);
-    }
+    let rules = config
+        .routing
+        .rules
+        .iter()
+        .map(|rule| {
+            let display = config.routing.clash_rule_display(rule);
+            serde_json::json!({
+                "type": display.rule_type(),
+                "payload": display.payload(),
+                "proxy": rule.outbound.as_str(),
+            })
+        })
+        .collect::<Vec<_>>();
 
     Json(serde_json::json!({"rules": rules}))
 }

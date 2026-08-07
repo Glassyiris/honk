@@ -393,28 +393,75 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         info!("Bootstrap resolver: {}", config.global.bootstrap_resolver);
     }
 
-    // Fetch any configured subscriptions concurrently with a 5-second
-    // startup deadline.  Subscriptions that complete within the deadline are
-    // merged before the control plane starts; pending ones keep fetching in
-    // the background and are merged through the command channel
-    // (ControlCommand::MergeSubscription) once they complete, alongside the
-    // periodic refreshes scheduled at each subscription's update_interval.
+    // A valid stored body makes network refresh non-blocking for startup.
+    // Missing subscriptions still get the bounded first-fetch grace period;
+    // every fetch continues in the background after the control plane starts.
+    let subscription_store = if config.global.store_subscribe {
+        match subscription::SubscriptionStore::in_current_dir() {
+            Ok(store) => {
+                info!(directory = %store.root().display(), "Subscription store ready");
+                Some(store)
+            }
+            Err(error) => {
+                warn!(%error, "Subscription store unavailable; continuing without persistence");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut sub_manager: Option<std::sync::Arc<subscription::SubscriptionManager>> = None;
     let mut late_sub_rx = None;
-    let mut subscriptions = Vec::new();
-    if !config.subscriptions.is_empty() {
+    let subscriptions: Vec<_> = config
+        .subscriptions
+        .iter()
+        .filter(|sub| sub.enabled)
+        .cloned()
+        .collect();
+    if !subscriptions.is_empty() {
         let manager = std::sync::Arc::new(subscription::SubscriptionManager::new()?);
-        subscriptions = config.subscriptions.clone();
         let sub_count = subscriptions.len();
+        let mut requires_network = std::collections::HashSet::new();
+
+        for (index, sub) in subscriptions.iter().enumerate() {
+            let Some(store) = subscription_store.as_ref() else {
+                requires_network.insert(index);
+                continue;
+            };
+            match store.load_nodes(sub).await {
+                Ok(Some(nodes)) => {
+                    info!(
+                        subscription = %sub.name,
+                        nodes = nodes.len(),
+                        "Restored subscription"
+                    );
+                    config
+                        .nodes
+                        .retain(|node| node.subscription_id != Some(sub.id));
+                    config.nodes.extend(nodes);
+                }
+                Ok(None) => {
+                    requires_network.insert(index);
+                }
+                Err(error) => {
+                    warn!(
+                        subscription = %sub.name,
+                        %error,
+                        "Failed to restore subscription"
+                    );
+                    requires_network.insert(index);
+                }
+            }
+        }
 
         let (results_tx, mut results_rx) = tokio::sync::mpsc::unbounded_channel();
-        for sub in &subscriptions {
-            let sub = sub.clone();
+        for (index, sub) in subscriptions.iter().cloned().enumerate() {
             let manager = manager.clone();
+            let store = subscription_store.clone();
             let tx = results_tx.clone();
             tokio::spawn(async move {
-                let result = manager.fetch(&sub).await;
-                let _ = tx.send((sub, result));
+                let result = manager.fetch_and_store(&sub, store.as_ref()).await;
+                let _ = tx.send((index, sub, result));
             });
         }
         drop(results_tx);
@@ -423,16 +470,25 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         tokio::pin!(deadline);
 
         let mut received = 0usize;
-        loop {
+        while !requires_network.is_empty() {
             tokio::select! {
                 result = results_rx.recv() => {
                     match result {
-                        Some((sub, Ok(nodes))) => {
-                            info!("Subscription '{}' fetched {} nodes", sub.name, nodes.len());
+                        Some((index, sub, Ok(nodes))) => {
+                            info!(
+                                subscription = %sub.name,
+                                nodes = nodes.len(),
+                                "Subscription fetched"
+                            );
+                            config
+                                .nodes
+                                .retain(|node| node.subscription_id != Some(sub.id));
                             config.nodes.extend(nodes);
+                            requires_network.remove(&index);
                         }
-                        Some((sub, Err(e))) => {
-                            warn!("Failed to fetch subscription '{}': {}", sub.name, e);
+                        Some((index, sub, Err(error))) => {
+                            warn!(subscription = %sub.name, %error, "Failed to fetch subscription");
+                            requires_network.remove(&index);
                         }
                         None => break,
                     }
@@ -440,22 +496,19 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 }
                 _ = &mut deadline => {
                     info!(
-                        "Subscription fetch deadline reached ({}/{} complete); starting control plane",
-                        received, sub_count
+                        received,
+                        total = sub_count,
+                        "Subscription fetch deadline reached; starting control plane"
                     );
                     break;
                 }
             }
         }
 
-        // Subscriptions still in flight keep their fetch tasks alive; the
-        // receiver is handed to a background forwarder (spawned once the
-        // command channel exists) that merges each result into the running
-        // control plane.
         if received < sub_count {
             info!(
-                "{} subscription(s) still fetching in background; nodes will merge when ready",
-                sub_count - received
+                pending = sub_count - received,
+                "Subscriptions still refreshing in background"
             );
             late_sub_rx = Some(results_rx);
         }
@@ -466,8 +519,12 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // config — not just when subscriptions delivered nodes — because groups
     // defined with `filter:` (or with no filter at all, meaning "all nodes")
     // would otherwise end up with an empty member list for static configs.
-    // The merge is idempotent (existing IDs are kept, no duplicates).
-    honk_config::parser::resolve_group_filters(&mut config.groups, &config.nodes);
+    // Filter-backed membership is rebuilt from the current node provenance.
+    honk_config::parser::resolve_group_filters(
+        &mut config.groups,
+        &config.nodes,
+        &config.subscriptions,
+    );
     for group in &config.groups {
         info!(
             "Group '{}' resolved {} node(s)",
@@ -893,15 +950,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     let cmd_tx = control_plane.command_sender();
 
-    // Late startup fetches and periodic refreshes both deliver nodes through
-    // the command channel, where they merge into the running config via the
-    // same serialized rebuild path as SIGHUP reloads. Subscription nodes
-    // live in memory only and are never written back to the config file.
+    // Late startup fetches and periodic refreshes both persist validated raw
+    // bodies before delivering nodes through the serialized rebuild path.
+    // Subscription nodes are never written back to the config file.
     let mut sub_tasks = Vec::new();
     if let Some(mut rx) = late_sub_rx {
         let merge_tx = cmd_tx.clone();
         sub_tasks.push(tokio::spawn(async move {
-            while let Some((sub, result)) = rx.recv().await {
+            while let Some((_index, sub, result)) = rx.recv().await {
                 match result {
                     Ok(nodes) => {
                         info!(
@@ -939,10 +995,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             let sub = sub.clone();
             let manager = manager.clone();
             let merge_tx = cmd_tx.clone();
+            let store = subscription_store.clone();
             sub_tasks.push(tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(sub.update_interval)).await;
-                    match manager.fetch(&sub).await {
+                    match manager.fetch_and_store(&sub, store.as_ref()).await {
                         Ok(nodes) => {
                             info!(
                                 "Subscription '{}' refreshed: {} nodes",
@@ -978,6 +1035,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let config_path = cli.config.clone();
     let reload_tx = cmd_tx.clone();
     let config_handle = control_plane.config_handle();
+    let reload_subscription_store = subscription_store.clone();
     let sighup_handle = tokio::spawn(async move {
         let mut sighup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
         {
@@ -1015,8 +1073,12 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                                 sub.id = old.id;
                             }
                         }
-                        let known: std::collections::HashSet<uuid::Uuid> =
-                            new_config.subscriptions.iter().map(|s| s.id).collect();
+                        let known: std::collections::HashSet<uuid::Uuid> = new_config
+                            .subscriptions
+                            .iter()
+                            .filter(|sub| sub.enabled)
+                            .map(|sub| sub.id)
+                            .collect();
                         let carried: Vec<_> = current
                             .nodes
                             .iter()
@@ -1037,12 +1099,42 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                             .cloned()
                             .collect()
                     };
+                    if new_config.global.store_subscribe
+                        && let Some(store) = reload_subscription_store.as_ref()
+                    {
+                        for sub in &refresh_subs {
+                            if new_config
+                                .nodes
+                                .iter()
+                                .any(|node| node.subscription_id == Some(sub.id))
+                            {
+                                continue;
+                            }
+                            match store.load_nodes(sub).await {
+                                Ok(Some(nodes)) => {
+                                    info!(
+                                        subscription = %sub.name,
+                                        nodes = nodes.len(),
+                                        "Restored subscription during reload"
+                                    );
+                                    new_config.nodes.extend(nodes);
+                                }
+                                Ok(None) => {}
+                                Err(error) => warn!(
+                                    subscription = %sub.name,
+                                    %error,
+                                    "Failed to restore subscription during reload"
+                                ),
+                            }
+                        }
+                    }
                     // Resolve group filters into concrete node IDs, same as
                     // startup — otherwise filter-based groups keep stale
                     // (or empty) member lists in the rebuilt GroupManager.
                     honk_config::parser::resolve_group_filters(
                         &mut new_config.groups,
                         &new_config.nodes,
+                        &new_config.subscriptions,
                     );
                     if let Err(e) = reload_tx
                         .send(control::ControlCommand::ReloadConfig {
@@ -1061,6 +1153,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     // snapshot for up to `update_interval`.
                     if !refresh_subs.is_empty() {
                         let tx = reload_tx.clone();
+                        let store = reload_subscription_store.clone();
                         tokio::spawn(async move {
                             let manager = match crate::subscription::SubscriptionManager::new() {
                                 Ok(m) => m,
@@ -1070,7 +1163,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                                 }
                             };
                             for sub in refresh_subs {
-                                match manager.fetch(&sub).await {
+                                match manager.fetch_and_store(&sub, store.as_ref()).await {
                                     Ok(nodes) => {
                                         let _ = tx
                                             .send(control::ControlCommand::MergeSubscription {

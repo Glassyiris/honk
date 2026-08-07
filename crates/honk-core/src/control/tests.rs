@@ -1200,7 +1200,11 @@ fn subscription_merge_replaces_only_that_subscription() {
     };
     // Resolve initial membership exactly like startup does; the
     // filter-less group swallows every node.
-    honk_config::parser::resolve_group_filters(&mut current.groups, &current.nodes);
+    honk_config::parser::resolve_group_filters(
+        &mut current.groups,
+        &current.nodes,
+        &current.subscriptions,
+    );
     assert_eq!(current.groups[0].nodes.len(), 4);
 
     let new_a1 = node("a-new-1", Some(sub_a));

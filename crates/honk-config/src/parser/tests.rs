@@ -35,6 +35,22 @@ global {
     }
 
     #[test]
+    fn test_parse_store_subscribe() {
+        assert!(
+            parse_dae_config("global {}")
+                .unwrap()
+                .global
+                .store_subscribe
+        );
+        assert!(
+            !parse_dae_config("global {\n store_subscribe: false\n}")
+                .unwrap()
+                .global
+                .store_subscribe
+        );
+    }
+
+    #[test]
     fn test_parse_wan_only_global() {
         let input = r#"
 global {
@@ -332,6 +348,14 @@ subscription {
 "#;
         let config = parse_dae_config(input).unwrap();
         assert_eq!(config.subscriptions.len(), 2);
+        assert!(config.subscriptions.iter().all(|sub| sub.enabled));
+        assert!(
+            config
+                .subscriptions
+                .iter()
+                .all(|sub| sub.update_interval == 86_400 && !sub.id.is_nil())
+        );
+        assert_ne!(config.subscriptions[0].id, config.subscriptions[1].id);
     }
 
     #[test]
@@ -415,6 +439,34 @@ routing {
             config.routing.rules[1].condition.ip,
             vec!["172.16.0.0/12", "192.168.0.0/16"]
         );
+    }
+
+    #[test]
+    fn test_parse_multiline_routing_matcher() {
+        let input = r#"
+routing {
+    sip(10.10.10.24/32,
+        10.10.10.25/32
+    ) -> direct
+    dport(443) -> proxy
+    fallback: block
+}
+"#;
+        let config = parse_dae_config(input).unwrap();
+
+        assert_eq!(config.routing.rules.len(), 2);
+        assert_eq!(
+            config.routing.rules[0].condition.source_ip,
+            vec!["10.10.10.24/32", "10.10.10.25/32"]
+        );
+        assert_eq!(
+            config.routing.clash_rule_display(&config.routing.rules[0]),
+            crate::routing::ClashRuleDisplay::Simple {
+                rule_type: "src-ip-cidr",
+                payload: "10.10.10.24/32,10.10.10.25/32".to_owned(),
+            }
+        );
+        assert_eq!(config.routing.default_outbound, "block");
     }
 
     #[test]
@@ -578,6 +630,109 @@ group {
     assert!(names("nomatch").is_empty());
 }
 
+#[test]
+fn test_group_subscription_filter_exact_regex_and_compound() {
+    let input = r#"
+subscription {
+    paid: 'https://example.com/paid'
+    free: 'https://example.com/free'
+}
+node {
+    paid-hk: 'socks5://10.0.0.1:1080'
+    ExpireAt-old: 'socks5://10.0.0.2:1080'
+    free-node: 'socks5://10.0.0.3:1080'
+    static: 'socks5://10.0.0.4:1080'
+}
+group {
+    only-paid {
+        filter: subtag('paid')
+    }
+    eligible-paid {
+        filter: subtag(paid) && !name(keyword: 'ExpireAt-')
+    }
+    regex-or-exact {
+        filter: subtag(regex: '^pa', free)
+    }
+    keyword {
+        filter: subtag(keyword: 'aid')
+    }
+    separate-lines-or {
+        filter: subtag(free)
+        filter: name(static)
+    }
+    missing {
+        filter: subtag(unknown)
+    }
+}
+"#;
+    let mut config = parse_dae_config(input).unwrap();
+    let paid = config
+        .subscriptions
+        .iter()
+        .find(|subscription| subscription.name == "paid")
+        .unwrap()
+        .id;
+    let free = config
+        .subscriptions
+        .iter()
+        .find(|subscription| subscription.name == "free")
+        .unwrap()
+        .id;
+    for node in &mut config.nodes {
+        node.subscription_id = match node.name.as_str() {
+            "paid-hk" | "ExpireAt-old" => Some(paid),
+            "free-node" => Some(free),
+            _ => None,
+        };
+    }
+    crate::parser::resolve_group_filters(&mut config.groups, &config.nodes, &config.subscriptions);
+
+    let names = |tag: &str| {
+        let group = config
+            .groups
+            .iter()
+            .find(|group| group.name == tag)
+            .unwrap();
+        let mut names: Vec<_> = group
+            .nodes
+            .iter()
+            .map(|id| {
+                config
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == *id)
+                    .unwrap()
+                    .name
+                    .as_str()
+            })
+            .collect();
+        names.sort_unstable();
+        names
+    };
+    assert_eq!(names("only-paid"), vec!["ExpireAt-old", "paid-hk"]);
+    assert_eq!(names("eligible-paid"), vec!["paid-hk"]);
+    assert_eq!(
+        names("regex-or-exact"),
+        vec!["ExpireAt-old", "free-node", "paid-hk"]
+    );
+    assert_eq!(names("keyword"), vec!["ExpireAt-old", "paid-hk"]);
+    assert_eq!(names("separate-lines-or"), vec!["free-node", "static"]);
+    assert!(names("missing").is_empty());
+
+    config
+        .nodes
+        .iter_mut()
+        .find(|node| node.name == "free-node")
+        .unwrap()
+        .subscription_id = Some(paid);
+    crate::parser::resolve_group_filters(&mut config.groups, &config.nodes, &config.subscriptions);
+    let paid_group = config
+        .groups
+        .iter()
+        .find(|group| group.name == "only-paid")
+        .unwrap();
+    assert_eq!(paid_group.nodes.len(), 3);
+}
 #[test]
 fn test_group_filter_multi_tags_comma_and_pipe() {
     let input = r#"

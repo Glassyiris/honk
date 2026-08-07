@@ -10,6 +10,8 @@ global {
     udp_check_dns: 'dns.google.com:53,8.8.8.8,2001:4860:4860::8888'
     check_interval: 300s
     bootstrap_resolver: '1.1.1.1:53'
+    # 保存成功获取的订阅正文到运行目录 .sub,启动/重载时可离线恢复
+    store_subscribe: true
 
     # Group will switch node only when new_latency <= old_latency - tolerance.
     check_tolerance: 30ms
@@ -51,6 +53,7 @@ dns {
 
 # 代理组
 group {
+    # 按订阅 tag 过滤示例：filter: subtag(sub) && !name(keyword: 'ExpireAt-')
     # 固定节点
     iris {
         filter: name('iris')

@@ -40,6 +40,7 @@ log/
 # Local artifacts
 cache.db
 sing-box/
+.sub/
 
 honk/
 

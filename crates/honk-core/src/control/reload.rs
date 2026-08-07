@@ -523,6 +523,9 @@ fn restart_required_changes(current: &Config, candidate: &Config) -> Vec<&'stati
     if old_global.auto_config_kernel_parameter != new_global.auto_config_kernel_parameter {
         changed.push("global.auto_config_kernel_parameter");
     }
+    if old_global.store_subscribe != new_global.store_subscribe {
+        changed.push("global.store_subscribe");
+    }
 
     let old_api = &current.experimental.clash_api;
     let new_api = &candidate.experimental.clash_api;
@@ -745,14 +748,17 @@ pub(super) fn config_with_subscription_nodes(
         .nodes
         .retain(|n| n.subscription_id != Some(subscription_id));
     config.nodes.extend(nodes);
-    // Group membership is filter-derived state: drop dangling IDs left
-    // behind by replaced subscription nodes (refreshed parses mint fresh
-    // UUIDs), then re-resolve filters against the merged node set.
+    // Stable node IDs may survive a rename or move between subscriptions, so
+    // prune dead members and rebuild filter-derived membership from provenance.
     let live: std::collections::HashSet<uuid::Uuid> = config.nodes.iter().map(|n| n.id).collect();
     for group in &mut config.groups {
         group.nodes.retain(|id| live.contains(id));
     }
-    honk_config::parser::resolve_group_filters(&mut config.groups, &config.nodes);
+    honk_config::parser::resolve_group_filters(
+        &mut config.groups,
+        &config.nodes,
+        &config.subscriptions,
+    );
     config
 }
 
@@ -1245,6 +1251,18 @@ mod atomic_reload_tests {
     use crate::ebpf::RoutingPushPhase;
     use crate::ebpf::mock::MockEbpfBackend;
     use crate::stats::StatsManager;
+
+    #[test]
+    fn subscription_store_toggle_requires_restart() {
+        let current = Config::default();
+        let mut replacement = current.clone();
+        replacement.global.store_subscribe = !current.global.store_subscribe;
+
+        assert_eq!(
+            restart_required_changes(&current, &replacement),
+            vec!["global.store_subscribe"]
+        );
+    }
 
     fn test_dns_forwarder() -> std::sync::Arc<dns::forwarder::DnsForwarder> {
         let cache = Arc::new(tokio::sync::Mutex::new(dns::cache::DnsCache::new(100)));

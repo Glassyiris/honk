@@ -1,6 +1,6 @@
 //! Routing engine: compiles rules and determines outbound for connections.
 
-use honk_config::routing::{RoutingOutbound, RoutingRule};
+use honk_config::routing::RoutingRule;
 use regex::Regex;
 use std::net::IpAddr;
 
@@ -338,12 +338,7 @@ impl Router {
             let not_ip_trie = BinaryLpmTrie::from_nets(&not_ip_nets);
             let not_source_ip_trie = BinaryLpmTrie::from_nets(&not_source_ip_nets);
 
-            let (outbound, outbound_must) = match &rule.outbound {
-                RoutingOutbound::Simple(name) => parse_outbound(name),
-                RoutingOutbound::Complex { outbounds, .. } => {
-                    parse_outbound(outbounds.first().cloned().unwrap_or_default().as_str())
-                }
-            };
+            let (outbound, outbound_must) = parse_outbound(rule.outbound.as_str());
 
             let (rule_type, rule_payload) = rule
                 .condition

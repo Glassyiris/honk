@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// A routing rule that matches traffic and sends it to an outbound.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,67 +155,123 @@ impl RoutingNotCondition {
 }
 
 impl RoutingCondition {
-    /// Clash-style `(rule, rulePayload)` pair for the matched rule: the
-    /// rule's OWN type and payload (e.g. `("GeoIP", "telegram")`), NOT the
-    /// connection's domain/IP — `/connections` `metadata.host` already
-    /// carries that. First non-empty condition kind wins (declaration order
-    /// below matches typical dae rule shape); multi-value payloads are
-    /// comma-joined. Returns `None` for a condition-less rule (fallback
-    /// renders as `Match`).
+    fn matchers(&self) -> impl Iterator<Item = (&'static str, &[String])> {
+        [
+            ("domain", self.domain.as_slice()),
+            ("suffix", self.domain_suffix.as_slice()),
+            ("keyword", self.domain_keyword.as_slice()),
+            ("regex", self.domain_regex.as_slice()),
+            ("geosite", self.geosite.as_slice()),
+            ("dip", self.ip.as_slice()),
+            ("geoip", self.geo_ip.as_slice()),
+            ("src_ip", self.source_ip.as_slice()),
+            ("dport", self.port.as_slice()),
+            ("sport", self.source_port.as_slice()),
+            ("protocol", self.protocol.as_slice()),
+            ("process", self.process_name.as_slice()),
+            ("smac", self.mac.as_slice()),
+            ("ip_version", self.ip_version.as_slice()),
+            ("dscp", self.dscp.as_slice()),
+        ]
+        .into_iter()
+        .filter(|(_, values)| !values.is_empty())
+    }
+
+    /// Clash-style `(rule, rulePayload)` pair for connection metadata.
     pub fn clash_rule_parts(&self) -> Option<(&'static str, String)> {
-        let pick = |ty: &'static str, vals: &[String]| {
-            if vals.is_empty() {
-                None
-            } else {
-                Some((ty, vals.join(",")))
-            }
-        };
-        pick("domain", &self.domain)
-            .or_else(|| pick("suffix", &self.domain_suffix))
-            .or_else(|| pick("keyword", &self.domain_keyword))
-            .or_else(|| pick("regex", &self.domain_regex))
-            .or_else(|| pick("geosite", &self.geosite))
-            .or_else(|| pick("dip", &self.ip))
-            .or_else(|| pick("geoip", &self.geo_ip))
-            .or_else(|| pick("src_ip", &self.source_ip))
-            .or_else(|| pick("dport", &self.port))
-            .or_else(|| pick("sport", &self.source_port))
-            .or_else(|| pick("protocol", &self.protocol))
-            .or_else(|| pick("process", &self.process_name))
-            .or_else(|| pick("smac", &self.mac))
-            .or_else(|| pick("ip_version", &self.ip_version))
-            .or_else(|| pick("dscp", &self.dscp))
+        self.matchers()
+            .next()
+            .map(|(kind, values)| (kind, values.join(",")))
+    }
+
+    pub(crate) fn needs_complex_display(&self) -> bool {
+        !self.not.is_empty() || self.matchers().nth(1).is_some()
     }
 }
 
-/// Outbound target for routing.
+impl RoutingNotCondition {
+    fn is_empty(&self) -> bool {
+        [
+            self.domain.as_slice(),
+            self.domain_suffix.as_slice(),
+            self.domain_keyword.as_slice(),
+            self.domain_regex.as_slice(),
+            self.ip.as_slice(),
+            self.source_ip.as_slice(),
+            self.port.as_slice(),
+            self.source_port.as_slice(),
+            self.protocol.as_slice(),
+            self.process_name.as_slice(),
+            self.mac.as_slice(),
+            self.geo_ip.as_slice(),
+            self.geosite.as_slice(),
+            self.ip_version.as_slice(),
+            self.dscp.as_slice(),
+        ]
+        .into_iter()
+        .all(|values| values.is_empty())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ClashRuleDisplay<'a> {
+    Simple {
+        rule_type: &'static str,
+        payload: String,
+    },
+    Complex {
+        payload: &'a str,
+    },
+    Match,
+}
+
+impl ClashRuleDisplay<'_> {
+    pub fn rule_type(&self) -> &'static str {
+        match self {
+            Self::Simple { rule_type, .. } => rule_type,
+            Self::Complex { .. } => "complex",
+            Self::Match => "match",
+        }
+    }
+
+    pub fn payload(&self) -> &str {
+        match self {
+            Self::Simple { payload, .. } => payload,
+            Self::Complex { payload } => payload,
+            Self::Match => "",
+        }
+    }
+}
+
+fn clash_api_rule_type(kind: &'static str) -> &'static str {
+    match kind {
+        "suffix" => "domain-suffix",
+        "keyword" => "domain-keyword",
+        "regex" => "domain-regex",
+        "dip" => "ip-cidr",
+        "src_ip" => "src-ip-cidr",
+        "dport" => "dst-port",
+        "sport" => "src-port",
+        "process" => "process-name",
+        "smac" => "src-mac",
+        "ip_version" => "ip-version",
+        other => other,
+    }
+}
+
+/// A routing target. Dae and supported structured formats use one node or
+/// group tag; partially wired chain/balancer variants were removed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RoutingOutbound {
-    /// Simple outbound name
     Simple(String),
-    /// Complex outbound with chain/balancer
-    Complex {
-        /// Outbound type
-        #[serde(rename = "type")]
-        outbound_type: RoutingOutboundType,
-        /// Outbound names
-        outbounds: Vec<String>,
-    },
 }
 
-/// Outbound type for complex routing.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RoutingOutboundType {
-    /// Logical OR (try each in order)
-    Or,
-    /// Logical AND (all must succeed)
-    And,
-    /// Load balancer
-    Balancer,
-    /// Chain (one after another)
-    Chain,
+impl RoutingOutbound {
+    pub fn as_str(&self) -> &str {
+        let Self::Simple(name) = self;
+        name
+    }
 }
 
 /// Routing configuration.
@@ -226,6 +283,8 @@ pub struct RoutingConfig {
     /// Default outbound when no rules match
     #[serde(default = "default_outbound")]
     pub default_outbound: String,
+    #[serde(skip)]
+    complex_rule_sources: HashMap<String, String>,
 }
 
 fn default_outbound() -> String {
@@ -237,7 +296,31 @@ impl Default for RoutingConfig {
         Self {
             rules: vec![],
             default_outbound: "direct".to_string(),
+            complex_rule_sources: HashMap::new(),
         }
+    }
+}
+
+impl RoutingConfig {
+    pub(crate) fn record_complex_rule_source(&mut self, name: String, source: String) {
+        self.complex_rule_sources.insert(name, source);
+    }
+
+    pub fn clash_rule_display<'a>(&'a self, rule: &'a RoutingRule) -> ClashRuleDisplay<'a> {
+        self.complex_rule_sources
+            .get(&rule.name)
+            .map(|source| ClashRuleDisplay::Complex {
+                payload: source.as_str(),
+            })
+            .or_else(|| {
+                rule.condition
+                    .clash_rule_parts()
+                    .map(|(kind, payload)| ClashRuleDisplay::Simple {
+                        rule_type: clash_api_rule_type(kind),
+                        payload,
+                    })
+            })
+            .unwrap_or(ClashRuleDisplay::Match)
     }
 }
 
@@ -276,5 +359,11 @@ mod tests {
         );
 
         assert_eq!(RoutingCondition::default().clash_rule_parts(), None);
+    }
+
+    #[test]
+    fn structured_complex_outbound_is_rejected() {
+        let encoded = r#"{"type":"or","outbounds":["direct","proxy"]}"#;
+        assert!(serde_json::from_str::<RoutingOutbound>(encoded).is_err());
     }
 }

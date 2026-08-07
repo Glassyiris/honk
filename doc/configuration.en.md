@@ -236,9 +236,9 @@ Groups are named sub-sections of `group { ... }`:
 ```dae
 group {
     proxy {
-        filter: name(keyword: 'HK')
-        filter: name('us1')
-        filter: group('hk', 'jp')   # nested sub-groups (optional)
+        filter: subtag('my-sub') && !name(keyword: 'ExpireAt-')
+        filter: name('us1')              # another filter line is OR-ed
+        filter: group('hk', 'jp')        # nested sub-groups (optional)
         policy: min_moving_avg      # selector | urltest | loadbalance | fallback (aliases below)
         default: 'us1'              # selector default
         final: direct               # when all members are dead
@@ -254,13 +254,18 @@ Group-level knobs without a dae-syntax key keep their defaults: URLTest `toleran
 | ------------ | --------- |
 | `name('exact')` | Exact name |
 | `name(keyword: 'pat')` | Substring |
+| `name(regex: '^HK-')` | Regular expression |
+| `subtag('my-sub')` | Nodes produced by the exact tag in `subscription { ... }` |
+| `subtag(regex: '^paid-', free)` | Subscription-tag regex or exact alternatives |
+| `subtag('my-sub') && !name(keyword: 'ExpireAt-')` | AND predicates; `!` negates one predicate |
 | `group('hk')` / `group('hk', 'jp')` | Nested groups |
 
 Rules of thumb:
 
 - No filters **and** no nested groups → include **all** nodes.
 - Nested groups only → does **not** auto-include every node.
-- Multiple `name(...)` filters OR together (one `filter:` line each).
+- Each `filter:` line is OR-ed. Predicates joined by `&&` inside one line are AND-ed; prefix a predicate with `!` to negate it.
+- `name(...)` and `subtag(...)` matching is case-sensitive. `subtag` uses the subscription tag to the left of `:` and never matches static nodes.
 
 **Policies:**
 
@@ -273,11 +278,14 @@ Rules of thumb:
 
 ## 8. Routing
 
-The `routing { ... }` section holds one rule per line, matched in **source order** (top to bottom), ending in a `fallback:`:
+The `routing { ... }` section holds ordered rules, matched in **source order** (top to bottom), ending in a `fallback:`. A matcher's parenthesized argument list may span physical lines; it remains one rule through `-> outbound`:
 
 ```dae
 routing {
     domain(suffix: doubleclick.net) -> block
+    sip(10.10.10.24/32,
+        10.10.10.25/32
+    ) -> direct
     fallback: direct
 }
 ```
@@ -419,8 +427,10 @@ subscription {
 
 Each entry is `tag: 'url'` (a bare quoted URL is also accepted). In dae syntax the subscription type, update interval, and enabled flag keep their defaults (auto/simple, 86400 s, enabled).
 
-- Startup fetch races a short deadline; late results merge via the control-plane channel.
-- Subscription nodes live **in memory only** (not written back to the config file).
+- `global { store_subscribe: true }` is the default. A successfully fetched and parsed raw body is atomically stored under `<working-directory>/.sub` with private permissions (`0700` directory, `0600` files). The cached body is never written back into the config, and request identity appears only as a hash filename.
+- Startup restores valid stored bodies first. A restored subscription starts immediately while its network refresh continues in the background; an uncached subscription retains the five-second first-fetch grace period.
+- SIGHUP reload carries active subscription nodes and restores the stored body when an enabled subscription has no nodes to carry. Fetch, parse, or write failure leaves the active nodes and last valid body untouched. A corrupt body is ignored until a valid refresh replaces it.
+- Subscription nodes remain runtime-only and are never written back to the config file. Changing `store_subscribe` requires a process restart.
 - Share links inside the body are parsed by `Node::from_share_link`.
 
 ## 11. Experimental

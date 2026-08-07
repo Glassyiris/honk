@@ -1,6 +1,5 @@
 use std::fs;
 
-use honk_config::routing::RoutingOutbound;
 use honk_config::{Config, ConfigError};
 
 fn write(path: &std::path::Path, content: &str) {
@@ -153,10 +152,7 @@ routing {{
             .routing
             .rules
             .iter()
-            .map(|rule| match &rule.outbound {
-                RoutingOutbound::Simple(name) => name.as_str(),
-                RoutingOutbound::Complex { .. } => panic!("expected a simple outbound"),
-            })
+            .map(|rule| rule.outbound.as_str())
             .collect::<Vec<_>>(),
         vec!["direct", "proxy"]
     );

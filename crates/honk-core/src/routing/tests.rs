@@ -1,5 +1,5 @@
 use super::*;
-use honk_config::routing::RoutingCondition;
+use honk_config::routing::{RoutingCondition, RoutingOutbound};
 
 #[test]
 fn test_trie_empty() {

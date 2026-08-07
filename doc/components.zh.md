@@ -24,6 +24,7 @@
 | `lan_interface` | string[] | `[]` | 拦截的 LAN 网卡；空时不安装任何 LAN hook；逗号分隔 |
 | `wan_interface` | string[] | `[]` | 拦截本机发起 TCP/UDP 的 WAN 网卡；支持 `auto`；逗号分隔 |
 | `auto_config_kernel_parameter` | bool | `false` | 自动 sysctl（需 root） |
+| `store_subscribe` | bool | `true` | 将每个订阅最近一次有效正文持久化到 `<运行目录>/.sub`，供启动/重载在网络不可用时恢复；修改后需重启进程。 |
 | `tcp_check_url` | string[] | Cloudflare HTTP + 1.1.1.1 + IPv6 | TCP 健康检查目标；逗号分隔 |
 | `tcp_check_http_method` | string | `"HEAD"` | URL 检查的 HTTP 方法 |
 | `udp_check_dns` | string[] | dns.google / 8.8.8.8 / IPv6 | UDP 健康检查 DNS 目标；逗号分隔 |
@@ -236,7 +237,7 @@ group {
 | `name` | string | **必填** | 路由中的出站标签；dae 中为子节名 |
 | `policy` | enum | `selector` | 选择策略 |
 | `nodes` | UUID[] | `[]` | 通常由 filters 填充 |
-| `filters` | string[] | `[]` | `name(...)` / `group(...)`；dae 中每条一个 `filter:` 行 |
+| `filters` | string[] | `[]` | `name(...)` / `subtag(...)` / `group(...)`；dae 中每条一个 `filter:` 行 |
 | `groups` | string[] | `[]` | 嵌套组标签；`filter: group('a', 'b')`，也接受 `'a\|b'` / `'a, b'` |
 | `default` | string? | null | Selector 默认节点名 |
 | `final_outbound` | string? | null | 全死时出站。**dae：** `final` |
@@ -260,9 +261,10 @@ group {
 ### 过滤解析
 
 1. `group('tag')` → 嵌套标签（`groups`），不进节点列表。
-2. `name(...)` 过滤以 OR 方式匹配成员。
-3. 无 filters 且无嵌套组 → **全部节点**。
-4. 仅有嵌套组 → **不是**全部节点。
+2. `name(...)` 匹配节点名；`subtag(...)` 匹配产生该节点的订阅 tag。两者均支持精确值、`keyword:`、`regex:`，并区分大小写。
+3. 同一行内 `&&` 为 AND，支持 `!` 取反；不同 `filter:` 行之间为 OR。
+4. 每次订阅刷新都会重建过滤成员；节点 UUID 即使稳定，也不会在更换订阅后错误残留。
+5. 无 filters 且无嵌套组 → **全部节点**；仅有嵌套组 → **不是**全部节点。
 
 ### 嵌套组
 
@@ -272,12 +274,15 @@ group {
 
 ## 4. 路由（`routing { ... }`）
 
-dae 语法中每条规则一行：`条件函数 && 条件函数 -> 出站`，以 `fallback:` 收尾：
+dae 规则写作 `条件函数 && 条件函数 -> 出站`，按书写顺序匹配并以 `fallback:` 收尾。matcher 的括号参数可跨物理行，仍作为一条规则：
 
 ```
 routing {
     domain(suffix: google.com) -> proxy
     dip(geoip: cn) -> direct(must)
+    sip(10.10.10.24/32,
+        10.10.10.25/32
+    ) -> direct
     fallback: direct
 }
 ```
@@ -298,7 +303,7 @@ domain/geosite matcher 视为"不是 x"，不会被其否决。
 | ------ | ------ | -------- | ------ |
 | `name` | string | `""` | 显示名（dae 自动 `rule-N`） |
 | 条件字段 | 扁平 | | 见下表 |
-| `outbound` | string / complex | 必填 | 目标；dae 中 `->` 后为简单出站名 |
+| `outbound` | string | 必填 | 单个节点/组标签（dae 中 `->` 的右侧） |
 | `priority` | u32 | `0` | 越小优先级越高；dae 中按行序自动编号 |
 | `must` | bool | `false` | 非终结 must 规则；dae 中写作 `-> direct(must)` |
 | `mark` | u32 | `0` | fwmark；`0` = 无（结构化模型字段，dae 语法无对应写法） |
@@ -338,10 +343,6 @@ domain/geosite matcher 视为"不是 x"，不会被其否决。
 | `mac` / `dscp` / `ipversion` | 同名字段 |
 
 `domain` 参数标签：裸值/`suffix:` → 后缀；`keyword:`；`full:`；`regex:`；`geosite:`（原样匹配；`category@attr` 按条目属性名过滤，同 dae 语义——大小写不敏感，第一个 `@` 之后整体为选择器；展开为零匹配时告警且永不命中）。
-
-### 复杂出站（仅结构化模型）
-
-dae 语法的 `->` 目标只接受简单出站名（节点 / 组标签）。结构化模型中保留了 `or` / `and` / `balancer` / `chain` 复合出站 schema，但 **balancer/chain 未像简单字符串出站那样完整接通**。优先使用组策略。
 
 ---
 
@@ -464,7 +465,12 @@ dae 语法中每个订阅一行：`tag: 'https://...'` 或裸 `'https://...'`（
 | `node_count` | u32 | `0` | 上次节点数 |
 | `created_at` | datetime | now | 创建时间 |
 
-节点仅存内存；周期刷新经控制面合并。
+节点仍只存在于运行时，不会写回配置文件。默认启用
+`global { store_subscribe: true }`：每次成功获取并解析的原始正文会原子写入
+`<运行目录>/.sub`；目录权限为 `0700`、文件权限为 `0600`，文件名由 URL 与
+请求身份散列得到。启动时先恢复有效缓存，再在后台联网刷新；已恢复的订阅不再占用
+5 秒首次拉取等待时间。重载先沿用当前节点，并为没有可沿用节点的已启用订阅读取缓存。
+拉取、解析或落盘失败时，当前节点与上一次有效缓存均保持不变。
 
 ---
 
@@ -489,7 +495,7 @@ dae 语法中每个订阅一行：`tag: 'https://...'` 或裸 `'https://...'`（
 | GET/PUT | `/proxies/{name}` | 详情 / 设置 Selector |
 | GET | `/proxies/{name}/delay` | 按需测速 |
 | GET | `/group/{name}/delay` | 组测速 |
-| GET | `/rules` | 规则 |
+| GET | `/rules` | 每条规则一行：简单 matcher 使用原生 Clash 类型；组合、取反或 `must` dae 规则使用 `complex` 并保留完整语句 |
 | GET/DELETE | `/connections` | 列表 / 关闭全部 |
 | DELETE | `/connections/{id}` | 关闭单个 |
 | GET | `/traffic` | WS 或分块 JSON 行 |

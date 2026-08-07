@@ -4,9 +4,17 @@
 //! YAML subscriptions. Individual share links are parsed with the unified
 //! [`Node::from_share_link`] parser from honk-config.
 
+use std::fs::{self, DirBuilder, File, OpenOptions};
+use std::io::{ErrorKind, Read as _, Write as _};
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use anyhow::Context as _;
 use honk_config::node::Node;
 use honk_config::subscription::Subscription;
 use honk_config::types::{NodeProtocol, SubscriptionType};
+use sha2::{Digest as _, Sha256};
 
 /// reqwest DNS resolver backed by honk's bootstrap resolver
 /// (bypass-marked UDP/TCP), so subscription fetches do not depend on the
@@ -28,6 +36,144 @@ impl reqwest::dns::Resolve for BootstrapDnsResolve {
     }
 }
 
+const SUBSCRIPTION_STORE_DIR: &str = ".sub";
+
+/// Durable raw subscription bodies keyed by their fetch identity.
+#[derive(Clone, Debug)]
+pub struct SubscriptionStore {
+    root: Arc<PathBuf>,
+}
+
+impl SubscriptionStore {
+    pub fn in_current_dir() -> anyhow::Result<Self> {
+        Self::open(std::env::current_dir()?.join(SUBSCRIPTION_STORE_DIR))
+    }
+
+    fn open(root: PathBuf) -> anyhow::Result<Self> {
+        ensure_store_directory(&root)?;
+        Ok(Self {
+            root: Arc::new(root),
+        })
+    }
+
+    pub fn root(&self) -> &Path {
+        self.root.as_path()
+    }
+
+    pub async fn load_nodes(&self, sub: &Subscription) -> anyhow::Result<Option<Vec<Node>>> {
+        let path = self.path_for(sub);
+        let content = match tokio::task::spawn_blocking(move || read_store_file(&path)).await? {
+            Ok(content) => content,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        parse_subscription_content(sub, &content)
+            .with_context(|| format!("invalid stored subscription '{}'", sub.name))
+            .map(Some)
+    }
+
+    async fn store_content(&self, sub: &Subscription, content: String) -> anyhow::Result<()> {
+        let root = Arc::clone(&self.root);
+        let destination = self.path_for(sub);
+        tokio::task::spawn_blocking(move || {
+            write_store_file(&root, &destination, content.as_bytes())
+        })
+        .await??;
+        Ok(())
+    }
+
+    fn path_for(&self, sub: &Subscription) -> PathBuf {
+        self.root.join(subscription_filename(sub))
+    }
+}
+
+fn subscription_filename(sub: &Subscription) -> String {
+    fn add_part(hasher: &mut Sha256, value: &[u8]) {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value);
+    }
+
+    let mut hasher = Sha256::new();
+    add_part(&mut hasher, sub.url.as_bytes());
+    add_part(
+        &mut hasher,
+        sub.user_agent.as_deref().unwrap_or_default().as_bytes(),
+    );
+    for header in &sub.headers {
+        add_part(&mut hasher, header.key.as_bytes());
+        add_part(&mut hasher, header.value.as_bytes());
+    }
+    use base64::Engine as _;
+    format!(
+        "{}.sub",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize())
+    )
+}
+
+fn ensure_store_directory(root: &Path) -> anyhow::Result<()> {
+    match fs::symlink_metadata(root) {
+        Ok(metadata) => {
+            anyhow::ensure!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "subscription store is not a directory: {}",
+                root.display()
+            );
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            let mut builder = DirBuilder::new();
+            builder.mode(0o700).create(root)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+fn read_store_file(path: &Path) -> std::io::Result<String> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other(
+            "subscription cache is not a regular file",
+        ));
+    }
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    Ok(content)
+}
+
+fn write_store_file(root: &Path, destination: &Path, content: &[u8]) -> anyhow::Result<()> {
+    ensure_store_directory(root)?;
+    let destination_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("invalid subscription cache filename")?;
+    let temporary = root.join(format!(
+        ".{destination_name}.{}.{}.tmp",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+
+    let result = (|| -> anyhow::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(content)?;
+        file.sync_all()?;
+        fs::rename(&temporary, destination)?;
+        File::open(root)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
 /// Manager for fetching and parsing proxy subscriptions.
 pub struct SubscriptionManager {
     client: reqwest::Client,
@@ -44,6 +190,14 @@ impl SubscriptionManager {
 
     /// Fetch a subscription URL and parse its contents into a list of nodes.
     pub async fn fetch(&self, sub: &Subscription) -> anyhow::Result<Vec<Node>> {
+        self.fetch_and_store(sub, None).await
+    }
+
+    pub async fn fetch_and_store(
+        &self,
+        sub: &Subscription,
+        store: Option<&SubscriptionStore>,
+    ) -> anyhow::Result<Vec<Node>> {
         let mut request = self.client.get(&sub.url);
 
         if let Some(ref ua) = sub.user_agent {
@@ -54,35 +208,44 @@ impl SubscriptionManager {
             request = request.header(&header.key, &header.value);
         }
 
-        let response = request.send().await?;
-        let content = response.text().await?;
-
-        let nodes = match sub.sub_type {
-            SubscriptionType::Simple | SubscriptionType::Sip008 => {
-                parse_base64_subscription(&content, Some(sub.id))
-            }
-            SubscriptionType::Clash => parse_clash_subscription(&content, Some(sub.id)),
-            SubscriptionType::Custom => parse_base64_subscription(&content, Some(sub.id))
-                .or_else(|_| parse_clash_subscription(&content, Some(sub.id))),
-        }?;
-
-        // Providers legitimately list the same dialable endpoint under
-        // several names; identical content-derived IDs would abort the
-        // runtime registry build, so the first one wins.
-        let mut seen = std::collections::HashSet::new();
-        Ok(nodes
-            .into_iter()
-            .filter(|node| {
-                seen.insert(node.id) || {
-                    tracing::warn!(
-                        node = %node.name,
-                        "skipping subscription node with a duplicate endpoint identity"
-                    );
-                    false
-                }
-            })
-            .collect())
+        let content = request.send().await?.error_for_status()?.text().await?;
+        let nodes = parse_subscription_content(sub, &content)?;
+        if let Some(store) = store
+            && let Err(error) = store.store_content(sub, content).await
+        {
+            tracing::warn!(
+                subscription = %sub.name,
+                %error,
+                "failed to persist subscription"
+            );
+        }
+        Ok(nodes)
     }
+}
+
+fn parse_subscription_content(sub: &Subscription, content: &str) -> anyhow::Result<Vec<Node>> {
+    let nodes = match sub.sub_type {
+        SubscriptionType::Simple | SubscriptionType::Sip008 => {
+            parse_base64_subscription(content, Some(sub.id))
+        }
+        SubscriptionType::Clash => parse_clash_subscription(content, Some(sub.id)),
+        SubscriptionType::Custom => parse_base64_subscription(content, Some(sub.id))
+            .or_else(|_| parse_clash_subscription(content, Some(sub.id))),
+    }?;
+
+    let mut seen = std::collections::HashSet::new();
+    Ok(nodes
+        .into_iter()
+        .filter(|node| {
+            seen.insert(node.id) || {
+                tracing::warn!(
+                    node = %node.name,
+                    "skipping subscription node with a duplicate endpoint identity"
+                );
+                false
+            }
+        })
+        .collect())
 }
 
 fn parse_base64_subscription(
@@ -441,5 +604,68 @@ not-proxies: []
 "#;
         let result = parse_clash_subscription(yaml, None);
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn subscription_store_recovers_last_valid_fetch() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = SubscriptionStore::open(temp.path().join(SUBSCRIPTION_STORE_DIR)).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let valid = "socks5://127.0.0.1:1080#stored";
+        let server = tokio::spawn(async move {
+            for body in [valid, "not a subscription"] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 1024];
+                let _ = stream.read(&mut request).await.unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let mut sub = Subscription {
+            name: "provider".into(),
+            url: format!("http://{address}/subscription"),
+            ..Subscription::default()
+        };
+        let path = store.path_for(&sub);
+        let original_id = sub.id;
+        let manager = SubscriptionManager::new().unwrap();
+        let fetched = manager.fetch_and_store(&sub, Some(&store)).await.unwrap();
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].subscription_id, Some(original_id));
+        assert!(manager.fetch_and_store(&sub, Some(&store)).await.is_err());
+        server.await.unwrap();
+
+        sub.id = uuid::Uuid::new_v4();
+        sub.name = "renamed-provider".into();
+        assert_eq!(store.path_for(&sub), path);
+        let restored = store.load_nodes(&sub).await.unwrap().unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].name, "stored");
+        assert_eq!(restored[0].subscription_id, Some(sub.id));
+
+        let directory_mode = fs::metadata(store.root()).unwrap().permissions().mode() & 0o777;
+        let file_mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(directory_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
+        assert_eq!(fs::read_dir(store.root()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn subscription_store_rejects_symlink_directory() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let link = temp.path().join(SUBSCRIPTION_STORE_DIR);
+        symlink(target, &link).unwrap();
+        assert!(SubscriptionStore::open(link).is_err());
     }
 }

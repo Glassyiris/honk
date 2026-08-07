@@ -400,31 +400,37 @@ pub fn parse_dae_config(input: &str) -> Result<Config, crate::ConfigError> {
         }
     }
 
-    resolve_group_filters(&mut config.groups, &config.nodes);
+    resolve_group_filters(&mut config.groups, &config.nodes, &config.subscriptions);
 
     Ok(config)
 }
 
 /// Resolve group filters into concrete node UUIDs.
 ///
-/// Supports `name('pattern')` where `pattern` is a regular expression matched
-/// against the node name. This lets groups include static nodes as well as
-/// nodes added dynamically (for example, from a fetched subscription).
+/// Each `filter:` line is OR-ed. Predicates joined by `&&` within one line
+/// are AND-ed and may be negated with `!`. Supported predicates are
+/// `name(...)` and dae-compatible `subtag(...)`; both accept exact values,
+/// `keyword:`, and `regex:` arguments.
 ///
 /// `group('tag')` entries are not node filters — the dae parser routes them
-/// into `Group.groups` (nested sub-groups) at parse time; any that still end
-/// up here are ignored by node-filter resolution.
-pub fn resolve_group_filters(groups: &mut [Group], nodes: &[Node]) {
+/// into `Group.groups` at parse time.
+pub fn resolve_group_filters(groups: &mut [Group], nodes: &[Node], subscriptions: &[Subscription]) {
+    let mut subscription_tags: HashMap<uuid::Uuid, Vec<&str>> = HashMap::new();
+    for subscription in subscriptions {
+        subscription_tags
+            .entry(subscription.id)
+            .or_default()
+            .push(subscription.name.as_str());
+    }
+
     for group in groups {
         let filters: Vec<&str> = group
             .filters
             .iter()
-            .map(|f| f.trim())
-            .filter(|f| !f.starts_with("group("))
+            .map(|filter| filter.trim())
+            .filter(|filter| !filter.starts_with("group("))
             .collect();
 
-        // A group with no filters and no sub-groups includes all nodes.
-        // (A group that only names sub-groups must NOT swallow every node.)
         if filters.is_empty() {
             if group.groups.is_empty() {
                 for node in nodes {
@@ -436,51 +442,148 @@ pub fn resolve_group_filters(groups: &mut [Group], nodes: &[Node]) {
             continue;
         }
 
-        for filter in &filters {
-            let re = parse_name_filter(filter);
-            let Some(re) = re else { continue };
-            for node in nodes {
-                if re.is_match(&node.name) && !group.nodes.contains(&node.id) {
-                    group.nodes.push(node.id);
-                }
+        let filters: Vec<Vec<GroupFilterTerm>> = filters
+            .into_iter()
+            .filter_map(parse_group_filter_expression)
+            .collect();
+        group.nodes.clear();
+        for node in nodes {
+            if filters.iter().any(|filter| {
+                filter
+                    .iter()
+                    .all(|term| term.matches(node, &subscription_tags))
+            }) && !group.nodes.contains(&node.id)
+            {
+                group.nodes.push(node.id);
             }
         }
     }
 }
 
-/// Parse a `name(...)` filter into a regex (Go dae `filter.go` parity).
-///
-/// Supported patterns:
-///   name('a', 'b')          — exact match of any listed name (params OR-ed)
-///   name(keyword: 'pat')    — substring match
-///   name(regex: '^ju')      — raw regex match
-fn parse_name_filter(filter: &str) -> Option<Regex> {
-    let body = filter
-        .strip_prefix("name(")
-        .and_then(|s| s.strip_suffix(")"))?;
-    let body = body.trim();
+struct GroupFilterTerm {
+    matcher: GroupFilterMatcher,
+    negated: bool,
+}
 
-    if let Some(keyword) = body.strip_prefix("keyword:") {
-        let kw = keyword.trim().trim_matches(|c: char| c == '\'' || c == '"');
-        Regex::new(&regex::escape(kw)).ok()
-    } else if let Some(pattern) = body.strip_prefix("regex:") {
-        let pat = pattern.trim().trim_matches(|c: char| c == '\'' || c == '"');
-        Regex::new(pat).ok()
-    } else {
-        // Plain params: comma-separated exact names, OR-ed — dae matches a
-        // node when ANY param equals its name.
-        let pattern = body
-            .split(',')
-            .map(|p| p.trim().trim_matches(|c: char| c == '\'' || c == '"'))
-            .filter(|p| !p.is_empty())
-            .map(|n| format!("^{}$", regex::escape(n)))
-            .collect::<Vec<_>>()
-            .join("|");
-        if pattern.is_empty() {
-            return None;
-        }
-        Regex::new(&pattern).ok()
+enum GroupFilterMatcher {
+    Name(Regex),
+    SubscriptionTag(Regex),
+}
+
+impl GroupFilterTerm {
+    fn matches(&self, node: &Node, subscription_tags: &HashMap<uuid::Uuid, Vec<&str>>) -> bool {
+        let matched = match &self.matcher {
+            GroupFilterMatcher::Name(pattern) => pattern.is_match(&node.name),
+            GroupFilterMatcher::SubscriptionTag(pattern) => node
+                .subscription_id
+                .and_then(|id| subscription_tags.get(&id))
+                .is_some_and(|tags| tags.iter().any(|tag| pattern.is_match(tag))),
+        };
+        if self.negated { !matched } else { matched }
     }
+}
+
+fn parse_group_filter_expression(filter: &str) -> Option<Vec<GroupFilterTerm>> {
+    let mut terms = Vec::new();
+    for raw_term in filter.split("&&") {
+        let raw_term = raw_term.trim();
+        let (negated, predicate) = match raw_term.strip_prefix('!') {
+            Some(predicate) => (true, predicate.trim()),
+            None => (false, raw_term),
+        };
+        let matcher = if predicate.starts_with("name(") {
+            GroupFilterMatcher::Name(parse_text_filter(predicate, "name")?)
+        } else if predicate.starts_with("subtag(") {
+            GroupFilterMatcher::SubscriptionTag(parse_text_filter(predicate, "subtag")?)
+        } else {
+            return None;
+        };
+        terms.push(GroupFilterTerm { matcher, negated });
+    }
+    (!terms.is_empty()).then_some(terms)
+}
+
+fn parse_text_filter(filter: &str, function: &str) -> Option<Regex> {
+    let body = filter
+        .strip_prefix(function)?
+        .strip_prefix('(')?
+        .strip_suffix(')')?
+        .trim();
+    let mut patterns = Vec::new();
+    for argument in split_filter_arguments(body)? {
+        let argument = argument.trim();
+        let pattern = if let Some(value) = argument.strip_prefix("keyword:") {
+            let value = unquote_filter_argument(value);
+            if value.is_empty() {
+                continue;
+            }
+            regex::escape(value)
+        } else if let Some(value) = argument.strip_prefix("regex:") {
+            let value = unquote_filter_argument(value);
+            if value.is_empty() {
+                continue;
+            }
+            format!("(?:{value})")
+        } else {
+            let value = unquote_filter_argument(argument);
+            if value.is_empty() {
+                continue;
+            }
+            format!("^(?:{})$", regex::escape(value))
+        };
+        patterns.push(pattern);
+    }
+    if patterns.is_empty() {
+        return None;
+    }
+    Regex::new(&patterns.join("|")).ok()
+}
+
+fn split_filter_arguments(body: &str) -> Option<Vec<&str>> {
+    let bytes = body.as_bytes();
+    let mut arguments = Vec::new();
+    let mut start = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        match byte {
+            b'\'' | b'"' => quote = Some(byte),
+            b',' => {
+                arguments.push(&body[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    arguments.push(&body[start..]);
+    Some(arguments)
+}
+
+fn unquote_filter_argument(value: &str) -> &str {
+    let value = value.trim();
+    if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        if matches!(
+            (bytes[0], bytes[value.len() - 1]),
+            (b'\'', b'\'') | (b'"', b'"')
+        ) {
+            return &value[1..value.len() - 1];
+        }
+    }
+    value
 }
 
 fn strip_comments(input: &str) -> String {
@@ -646,6 +749,9 @@ fn parse_global_section(section: &Section) -> Result<GlobalConfig, crate::Config
     }
     if let Some(v) = kv.get("auto_config_kernel_parameter") {
         cfg.auto_config_kernel_parameter = parse_bool(v);
+    }
+    if let Some(v) = kv.get("store_subscribe") {
+        cfg.store_subscribe = parse_bool(v);
     }
     if let Some(v) = kv.get("tcp_check_url") {
         cfg.tcp_check_url = v
@@ -1131,122 +1237,212 @@ fn parse_dns_ip_args(args: &[String]) -> (Vec<String>, Vec<String>) {
     (cidrs, geoip)
 }
 
-fn parse_routing_section(section: &Section) -> Result<RoutingConfig, crate::ConfigError> {
-    let mut cfg = RoutingConfig::default();
-    let body = section.body.clone();
+fn split_routing_statements(body: &str) -> Result<Vec<String>, crate::ConfigError> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut parenthesis_depth = 0usize;
 
-    for line in body.lines() {
-        let trimmed = line.trim();
-        let trimmed = trimmed
-            .split_once('#')
-            .map(|(l, _)| l.trim())
-            .unwrap_or(trimmed);
-        if trimmed.is_empty() {
-            continue;
+    for (line_index, line) in body.lines().enumerate() {
+        let mut chunk = String::new();
+        let mut quote = None;
+        let mut escaped = false;
+
+        for ch in line.chars() {
+            if let Some(delimiter) = quote {
+                chunk.push(ch);
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == delimiter {
+                    quote = None;
+                }
+                continue;
+            }
+
+            match ch {
+                '#' => break,
+                '\'' | '"' => {
+                    quote = Some(ch);
+                    chunk.push(ch);
+                }
+                '(' => {
+                    parenthesis_depth += 1;
+                    chunk.push(ch);
+                }
+                ')' => {
+                    if parenthesis_depth == 0 {
+                        return Err(crate::ConfigError::Parse(format!(
+                            "routing line {}: unmatched ')'",
+                            line_index + 1
+                        )));
+                    }
+                    parenthesis_depth -= 1;
+                    chunk.push(ch);
+                }
+                _ => chunk.push(ch),
+            }
         }
-        if trimmed.starts_with("fallback:") || trimmed.starts_with("default:") {
-            cfg.default_outbound = trimmed.split_once(':').unwrap().1.trim().to_string();
-            continue;
+
+        if quote.is_some() {
+            return Err(crate::ConfigError::Parse(format!(
+                "routing line {}: unterminated quote",
+                line_index + 1
+            )));
         }
-        if let Some(arrow_pos) = trimmed.find("->") {
-            let left = trimmed[..arrow_pos].trim();
-            let right = trimmed[arrow_pos + 2..].trim();
-            let (outbound, must) = if let Some(name) = right.strip_suffix("(must)") {
-                (name.trim().to_string(), true)
-            } else {
-                (right.to_string(), false)
-            };
-            let rule = crate::routing::RoutingRule {
-                name: format!("rule-{}", cfg.rules.len()),
-                condition: parse_route_condition(left),
-                outbound: crate::routing::RoutingOutbound::Simple(outbound),
-                priority: cfg.rules.len() as u32,
-                must,
-                mark: 0,
-            };
-            cfg.rules.push(rule);
+
+        let chunk = chunk.trim();
+        if !chunk.is_empty() {
+            if !current.is_empty() && !chunk.starts_with([')', ',']) {
+                current.push(' ');
+            }
+            current.push_str(chunk);
+        }
+
+        if parenthesis_depth == 0 && !current.is_empty() {
+            statements.push(std::mem::take(&mut current));
         }
     }
 
-    Ok(cfg)
+    if parenthesis_depth != 0 {
+        return Err(crate::ConfigError::Parse(
+            "routing section: unterminated parenthesized rule".into(),
+        ));
+    }
+
+    Ok(statements)
+}
+
+fn parse_default_outbound(statement: &str) -> Option<String> {
+    ["fallback:", "default:"]
+        .into_iter()
+        .find_map(|prefix| statement.strip_prefix(prefix))
+        .map(str::trim)
+        .map(str::to_owned)
+}
+
+fn parse_routing_rule(
+    statement: String,
+    index: usize,
+) -> Option<(crate::routing::RoutingRule, Option<String>)> {
+    let (left, right) = statement.split_once("->")?;
+    let left = left.trim();
+    let right = right.trim();
+    let (outbound, must) = right.strip_suffix("(must)").map_or_else(
+        || (right.to_owned(), false),
+        |name| (name.trim().to_owned(), true),
+    );
+    let condition = parse_route_condition(left);
+    let is_complex = must || left.split("&&").nth(1).is_some() || condition.needs_complex_display();
+    let rule = crate::routing::RoutingRule {
+        name: format!("rule-{index}"),
+        condition,
+        outbound: crate::routing::RoutingOutbound::Simple(outbound),
+        priority: index as u32,
+        must,
+        mark: 0,
+    };
+
+    Some((rule, is_complex.then_some(statement)))
+}
+
+fn parse_routing_section(section: &Section) -> Result<RoutingConfig, crate::ConfigError> {
+    split_routing_statements(&section.body).map(|statements| {
+        statements
+            .into_iter()
+            .fold(RoutingConfig::default(), |mut config, statement| {
+                if let Some(outbound) = parse_default_outbound(&statement) {
+                    config.default_outbound = outbound;
+                } else if let Some((rule, complex_source)) =
+                    parse_routing_rule(statement, config.rules.len())
+                {
+                    if let Some(source) = complex_source {
+                        config.record_complex_rule_source(rule.name.clone(), source);
+                    }
+                    config.rules.push(rule);
+                }
+                config
+            })
+    })
+}
+
+fn parse_route_matcher(condition: &mut crate::routing::RoutingCondition, matcher: &str) {
+    let (negated, matcher) = matcher
+        .strip_prefix('!')
+        .map_or((false, matcher), |rest| (true, rest.trim()));
+    if matcher.is_empty() {
+        return;
+    }
+
+    let mut target = if negated {
+        condition.not.fields_mut()
+    } else {
+        condition.fields_mut()
+    };
+    if let Some(args) = extract_fn_args(matcher, "pname") {
+        target.process_name.extend(args);
+    } else if let Some(args) = extract_fn_args(matcher, "dip") {
+        parse_ip_args(&args, &mut target);
+    } else if let Some(args) = extract_fn_args(matcher, "sip") {
+        target.source_ip.extend(args);
+    } else if let Some(args) = extract_fn_args(matcher, "domain") {
+        parse_domain_args(&args, &mut target);
+    } else if let Some(args) = extract_fn_args(matcher, "dport") {
+        target.port.extend(args);
+    } else if let Some(args) = extract_fn_args(matcher, "sport") {
+        target.source_port.extend(args);
+    } else if let Some(args) = extract_fn_args(matcher, "l4proto") {
+        target.protocol.extend(args);
+    } else if let Some(args) = extract_fn_args(matcher, "ipversion") {
+        target.ip_version.extend(args);
+    } else if let Some(args) = extract_fn_args(matcher, "mac") {
+        target.mac.extend(args);
+    } else if let Some(args) = extract_fn_args(matcher, "dscp") {
+        target.dscp.extend(args);
+    } else if let Some(value) = strip_tag_arg(matcher, "geosite:") {
+        target.geosite.push(normalize_geosite_code(&value));
+    } else if let Some(value) = strip_tag_arg(matcher, "geoip:") {
+        target.geo_ip.push(normalize_geosite_code(&value));
+    } else if let Some(value) = strip_tag_arg(matcher, "domain:") {
+        target.domain_suffix.push(value);
+    } else if let Some(value) = strip_tag_arg(matcher, "suffix:") {
+        target.domain_suffix.push(value);
+    } else if let Some(value) = strip_tag_arg(matcher, "keyword:") {
+        target.domain_keyword.push(value);
+    } else if let Some(value) = strip_tag_arg(matcher, "full:") {
+        target.domain.push(value);
+    } else if let Some(value) = strip_tag_arg(matcher, "regex:") {
+        target.domain_regex.push(value);
+    }
 }
 
 fn parse_route_condition(expr: &str) -> crate::routing::RoutingCondition {
-    let mut cond = crate::routing::RoutingCondition::default();
-    let parts: Vec<&str> = expr.split("&&").map(|s| s.trim()).collect();
-
-    for part in parts {
-        // dae negation: `!` binds to the single matcher that follows it.
-        let (not, part) = match part.strip_prefix('!') {
-            Some(rest) => (true, rest.trim()),
-            None => (false, part),
-        };
-        if part.is_empty() {
-            continue;
-        }
-        let mut target = if not {
-            cond.not.fields_mut()
-        } else {
-            cond.fields_mut()
-        };
-        if let Some(args) = extract_fn_args(part, "pname") {
-            target.process_name.extend(args);
-        } else if let Some(args) = extract_fn_args(part, "dip") {
-            parse_ip_args(&args, &mut target);
-        } else if let Some(args) = extract_fn_args(part, "sip") {
-            target.source_ip.extend(args);
-        } else if let Some(args) = extract_fn_args(part, "domain") {
-            parse_domain_args(&args, &mut target);
-        } else if let Some(args) = extract_fn_args(part, "dport") {
-            target.port.extend(args);
-        } else if let Some(args) = extract_fn_args(part, "sport") {
-            target.source_port.extend(args);
-        } else if let Some(args) = extract_fn_args(part, "l4proto") {
-            target.protocol.extend(args);
-        } else if let Some(args) = extract_fn_args(part, "ipversion") {
-            target.ip_version.extend(args);
-        } else if let Some(args) = extract_fn_args(part, "mac") {
-            target.mac.extend(args);
-        } else if let Some(args) = extract_fn_args(part, "dscp") {
-            target.dscp.extend(args);
-        } else {
-            // Bare prefix-style conditions used outside function wrappers:
-            // geosite:cn, geoip:cn, domain:example.com, suffix:example.com, etc.
-            if let Some(v) = strip_tag_arg(part, "geosite:") {
-                target.geosite.push(normalize_geosite_code(&v));
-            } else if let Some(v) = strip_tag_arg(part, "geoip:") {
-                target.geo_ip.push(normalize_geosite_code(&v));
-            } else if let Some(v) = strip_tag_arg(part, "domain:") {
-                target.domain_suffix.push(v);
-            } else if let Some(v) = strip_tag_arg(part, "suffix:") {
-                target.domain_suffix.push(v);
-            } else if let Some(v) = strip_tag_arg(part, "keyword:") {
-                target.domain_keyword.push(v);
-            } else if let Some(v) = strip_tag_arg(part, "full:") {
-                target.domain.push(v);
-            } else if let Some(v) = strip_tag_arg(part, "regex:") {
-                target.domain_regex.push(v);
-            }
-        }
-    }
-
-    cond
+    expr.split("&&")
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .fold(
+            crate::routing::RoutingCondition::default(),
+            |mut condition, matcher| {
+                parse_route_matcher(&mut condition, matcher);
+                condition
+            },
+        )
 }
 
 fn extract_fn_args(expr: &str, fn_name: &str) -> Option<Vec<String>> {
-    let prefix = format!("{}(", fn_name);
-    if let Some(rest) = expr.strip_prefix(&prefix)
-        && let Some(end) = rest.find(')')
-    {
-        let args_str = &rest[..end];
-        let args: Vec<String> = args_str
-            .split(',')
-            .map(|s| s.trim().trim_matches(|c| c == '\'' || c == '"').to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        return Some(args);
-    }
-    None
+    let args = expr
+        .strip_prefix(fn_name)?
+        .strip_prefix('(')?
+        .split_once(')')?
+        .0;
+    Some(
+        args.split(',')
+            .map(str::trim)
+            .map(|arg| arg.trim_matches(['\'', '"']))
+            .filter(|arg| !arg.is_empty())
+            .map(str::to_owned)
+            .collect(),
+    )
 }
 
 /// Strip a `prefix:` marker from a route argument and trim surrounding
@@ -1396,9 +1592,6 @@ fn parse_group_section(section: &Section) -> Result<Vec<Group>, crate::ConfigErr
             .collect();
         for line in filter_lines {
             let val = line.split_once(':').map(|(_, v)| v.trim()).unwrap_or("");
-            // `filter: group('tag', ...)` names nested sub-groups (sing-box
-            // style): their tags go to `Group.groups`, everything else stays
-            // a node filter resolved by `resolve_group_filters`. Tags may be
             // separated by commas or pipes: `group('hk', 'jp')`, `group('hk|jp')`.
             if let Some(tags) = extract_fn_args(val, "group") {
                 for tag in tags

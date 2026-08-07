@@ -60,6 +60,10 @@ pub struct GlobalConfig {
     pub wan_interface: Vec<String>,
     #[serde(default)]
     pub auto_config_kernel_parameter: bool,
+    /// Persist successfully fetched subscription bodies under `.sub` in the
+    /// process working directory so startup can recover without the network.
+    #[serde(default = "default_store_subscribe")]
+    pub store_subscribe: bool,
     #[serde(default = "default_tcp_check_urls")]
     pub tcp_check_url: Vec<String>,
     #[serde(default = "default_tcp_check_http_method")]
@@ -279,6 +283,9 @@ fn default_preconnect_node_count() -> usize {
 fn default_udp_warm_node_count() -> usize {
     0
 }
+fn default_store_subscribe() -> bool {
+    true
+}
 fn default_max_concurrent_dials() -> usize {
     64
 }
@@ -296,6 +303,7 @@ impl Default for GlobalConfig {
             lan_interface: vec![],
             wan_interface: vec![],
             auto_config_kernel_parameter: false,
+            store_subscribe: default_store_subscribe(),
             tcp_check_url: default_tcp_check_urls(),
             tcp_check_http_method: default_tcp_check_http_method(),
             udp_check_dns: default_udp_check_dns(),
@@ -726,9 +734,11 @@ mod builtin_nodes_tests {
             "loopback v4 must be injected: {injected:?}"
         );
         assert!(injected.iter().all(|r| r.must));
-        assert!(injected.iter().all(
-            |r| matches!(&r.outbound, crate::routing::RoutingOutbound::Simple(o) if o == "direct")
-        ));
+        assert!(
+            injected
+                .iter()
+                .all(|rule| rule.outbound.as_str() == "direct")
+        );
 
         let count = config.routing.rules.len();
         config.ensure_local_direct_rules();

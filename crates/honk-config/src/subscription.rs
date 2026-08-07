@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use crate::types::SubscriptionType;
 
 /// A proxy subscription (e.g., subscription link).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Subscription {
     #[serde(default = "uuid::Uuid::new_v4")]
     pub id: uuid::Uuid,
@@ -34,6 +34,24 @@ pub struct Subscription {
 
 fn default_update_interval() -> u64 {
     86400 // 24 hours
+}
+
+impl Default for Subscription {
+    fn default() -> Self {
+        Self {
+            id: uuid::Uuid::new_v4(),
+            name: String::new(),
+            url: String::new(),
+            sub_type: SubscriptionType::default(),
+            update_interval: default_update_interval(),
+            user_agent: None,
+            headers: Vec::new(),
+            enabled: true,
+            last_updated: None,
+            node_count: 0,
+            created_at: Utc::now(),
+        }
+    }
 }
 
 /// Custom HTTP header for subscription fetch.

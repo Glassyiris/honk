@@ -210,9 +210,9 @@ honk 有三套互相独立的预热机制，全部有预算约束——都不随
 ```dae
 group {
     proxy {
-        filter: name(keyword: 'HK')
-        filter: name('us1')
-        filter: group('hk', 'jp')   # 嵌套子组（可选）
+        filter: subtag('my-sub') && !name(keyword: 'ExpireAt-')
+        filter: name('us1')              # 另一条 filter 与本行是 OR
+        filter: group('hk', 'jp')        # 嵌套子组（可选）
         policy: min_moving_avg      # fixed(0) | min_moving_avg | roundrobin | fallback
         default: 'us1'              # selector 默认节点
         final: direct               # 成员全死时的出站
@@ -228,13 +228,18 @@ group {
 | -------- | ------ |
 | `name('exact')` | 精确名称 |
 | `name(keyword: 'pat')` | 子串匹配 |
+| `name(regex: '^HK-')` | 正则匹配 |
+| `subtag('my-sub')` | 只选择 `subscription { ... }` 中该精确 tag 产生的节点 |
+| `subtag(regex: '^paid-', free)` | 订阅 tag 的正则或精确候选 |
+| `subtag('my-sub') && !name(keyword: 'ExpireAt-')` | 同一行内 AND；`!` 对单个条件取反 |
 | `group('hk')` / `group('hk', 'jp')` | 嵌套子组 |
 
 经验规则：
 
-- **无** filters 且 **无** 嵌套组 → 包含**全部**节点。
+- **无** filters 且 **无**嵌套组 → 包含**全部**节点。
 - 仅有嵌套组 → **不会**自动吞入全部节点。
-- 多个 `filter: name(...)` 行之间是 OR。
+- 每条 `filter:` 行之间是 OR；同一行以 `&&` 连接的条件是 AND，条件前加 `!` 表示取反。
+- `name(...)` 与 `subtag(...)` 均区分大小写。`subtag` 使用 `subscription` 中冒号左侧的 tag，静态节点不会匹配。
 
 **策略：**
 
@@ -247,13 +252,16 @@ group {
 
 ## 8. 路由（routing）
 
-规则有序，按源码书写顺序匹配（靠前优先），以 `fallback:` 收尾。
+规则有序，按源码书写顺序匹配（靠前优先），以 `fallback:` 收尾。matcher 的括号参数列表可以跨物理行书写，直到 `-> 出站` 仍算同一条规则。
 
 条件写成**函数调用**，可用 `&&` 组合：
 
 ```dae
 routing {
     domain(suffix: doubleclick.net) -> block
+    sip(10.10.10.24/32,
+        10.10.10.25/32
+    ) -> direct
     fallback: direct
 }
 ```
@@ -377,8 +385,10 @@ subscription {
 
 dae 语法仅支持 `tag: 'url'` 形式；`sub_type`（simple | clash | sip008 | custom）、`update_interval`（秒，默认 86400，0 = 仅手动）、`enabled` 等字段使用默认值，在 dae 语法中不可设置。
 
-- 启动拉取有短截止时间；迟到结果经控制面通道合并。
-- 订阅节点**只在内存中**（不会回写配置文件）。
+- `global { store_subscribe: true }` 默认开启。成功获取且解析通过的原始正文会原子保存到 `<运行目录>/.sub`，目录权限 `0700`、文件权限 `0600`；缓存正文不会写回配置文件，请求身份只以散列文件名出现。
+- 启动时先恢复有效缓存。已有缓存的订阅可立即启动，同时继续后台联网刷新；无缓存的订阅仍保留 5 秒首次拉取等待时间。
+- SIGHUP 重载先沿用当前订阅节点；已启用但没有可沿用节点的订阅会从缓存恢复。拉取、解析或写入失败不会清空当前节点或上一次有效缓存；损坏缓存会被忽略，直到一次有效刷新替换它。
+- 订阅节点仍只存在于运行时，不会回写配置文件。修改 `store_subscribe` 后需重启进程。
 - 正文中的分享链接由 `Node::from_share_link` 解析。
 
 ## 11. Experimental

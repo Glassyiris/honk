@@ -14,6 +14,8 @@ global {
     dial_mode: domain
     allow_insecure: false
     auto_config_kernel_parameter: true
+    # 保存成功获取的订阅正文到运行目录 .sub（默认开启）
+    store_subscribe: true
 
     # 健康检查：TCP 用 HTTP 探测，UDP 用 DNS 探测（经节点自身隧道）
     tcp_check_url: 'http://cp.cloudflare.com,1.1.1.1,2606:4700:4700::1111'
@@ -37,7 +39,7 @@ global {
     # max_concurrent_dials: 64
 }
 
-# 订阅（可选）：节点只合并进内存，不回写本文件
+# 订阅（可选）：节点只合并进内存、不回写本文件；原始正文默认缓存到 .sub
 # subscription {
 #     mysub: 'https://example.com/subscription'
 # }
@@ -52,6 +54,8 @@ node {
 
 # 分组
 group {
+    # 也可按 subscription 中冒号左侧的 tag 过滤:
+    # filter: subtag(mysub) && !name(keyword: 'ExpireAt-')
     # 固定使用组内第一个节点
     manual {
         filter: name('home-socks5')
