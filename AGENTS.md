@@ -10,7 +10,7 @@ This file is written for AI coding agents that need to understand, build, test, 
 - Shared configuration types and parsers (`honk-config`) parse the original dae `{ section { ... } }` configuration syntax — the primary and only documented config format.
 - Status: **experimental alpha** (`v0.0.1-alpha`). Expect breaking changes.
 - License: **GPL-3.0-only**. Repository: <https://github.com/Glassyiris/honk>
-- Documentation: `README.md` / `README_CN.md` (bilingual overview, feature checklist, TODO list) and `doc/` — `design.en.md`, `configuration.en.md`, `components.en.md`, `benchmark.en.md` (lab topology, how to run, honk-vs-dae results; plus `.zh.md` translations), all currently in sync with the code.
+- Documentation: `README.md` / `README_CN.md` (bilingual overview, feature checklist, TODO list) and `doc/` — `design.en.md`, `configuration.en.md`, `components.en.md` plus `.zh.md` translations, all currently in sync with the code. Lab benchmark tooling, evidence, and bilingual benchmark docs live only on the dedicated `bench` branch.
 
 ## Repository layout
 
@@ -24,8 +24,7 @@ This file is written for AI coding agents that need to understand, build, test, 
 ├── config.dae                # Full-featured example config (production-leaning)
 ├── config.min.dae            # Minimal example (good for --mock-ebpf dev)
 ├── example.dae               # Annotated example (Chinese comments)
-├── doc/                      # design / configuration / components / benchmark docs (en + zh)
-├── bench/                    # lab A/B harnesses: engine/protocol, UDP latency, release matrix, and paired runtime-memory; README has usage + traps
+├── doc/                      # design / configuration / components docs (en + zh)
 ├── ci/                       # zigcc/zigcxx: zig cc/c++ wrappers for cross builds (strip CMake's clang-style --target from boring-sys ASM rules + rustc's aarch64 errata linker args; used by build-musl and the release workflow); zig-bindgen-env: derive BINDGEN_EXTRA_CLANG_ARGS from `zig cc -E -v` for cross bindgen
 ├── .github/workflows/        # release.yml: tag-triggered test + cross-build + GitHub Release
 └── crates/
@@ -180,7 +179,7 @@ CLI (`honk-core` binary):
 - Flags: `--config/-c` (default `/etc/honk/config.dae`), `--bpf-object/-b`, `--bpf-pin-root` (default `/sys/fs/bpf`), `--debug/-d`, `--mock-ebpf`. Log-level order: `--debug` → `RUST_LOG` → `global.log_level` → `info`.
 - Subcommands (clash-style, **local only — none talks to a running engine**): `mode <rule|global|direct>` (rewrites `global.dial_mode` in the config file), `proxy <group> <node>` (validates existence and prints; persists nothing), `delay <node> [--url HOST:PORT]` (raw TCP connect timing, not a proxied urltest).
 
-Benchmarks: `benches/dns.rs` (criterion, `harness = false`) — DNS endpoint parse, cache get/put + 90/10 mix, per-query routing match, framing, forwarder cache-hit, TcpPool/UpstreamPool exchange (mock servers must set nodelay or TCP exchanges measure Nagle, not the code). Run: `cargo bench -p honk-core --features dns-bench --bench dns` (no external network needed). `benches/udp.rs` is the candidate-only UDP Criterion suite; run `cargo bench -p honk-core --bench udp -- --save-baseline udp-candidate`. `bench/udp-latency.sh` is the hook-driven deployment A/B driver, with deterministic JSONL fixtures in `bench/tests/fixtures/udp-latency` checked by `bench/tests/udp-latency-cli.sh`. honk-outbound has `benches/ss_aead.rs` (RustCrypto-vs-BoringSSL AEAD on SS chunk sizes) and `benches/vless_vision.rs` (rprx-only, deterministic 16 MiB framed/Direct Vision response decoding over a clear loopback carrier; paired release-musl binaries run on `10.10.10.50`, see `doc/benchmark.en.md`).
+Benchmarks kept on `main`: `benches/dns.rs` (criterion, `harness = false`) covers DNS endpoint parse, cache get/put + 90/10 mix, per-query routing match, framing, forwarder cache-hit, and TcpPool/UpstreamPool exchange; run `cargo bench -p honk-core --features dns-bench --bench dns`. `benches/udp.rs` is the candidate-only UDP Criterion suite; run `cargo bench -p honk-core --bench udp -- --save-baseline udp-candidate`. Lab/deployment harnesses, raw evidence, and their documentation live only on branch `bench`; use `git worktree add ../honk-bench bench` when benchmarking so they never enter the `main` worktree.
 
 ### `crates/honk-tool`
 
@@ -323,8 +322,8 @@ For UDP work, also run focused `honk-outbound` SOCKS5/group tests and
 tests before the workspace gate. The in-process rustls loopback servers are
 **test-only interoperability fixtures**; production TLS and QUIC use BoringSSL.
 A real UDP deployment A/B requires TPROXY, eBPF/netns, and upstreams; it is not
-satisfied by this unprivileged suite. See `doc/benchmark.en.md` for the fixed
-candidate and deployment-gate procedures.
+satisfied by this unprivileged suite. The fixed candidate and deployment-gate
+procedures live with the lab harness on branch `bench`.
 
 Environment notes: `routing::tests::test_geosite_*` needs `/etc/dae/geosite.dat`
 and `geoip.dat`; tests must run with `HTTP_PROXY`/`HTTPS_PROXY` unset because
@@ -376,7 +375,7 @@ with the `ja4probe` tool on .59 (`/usr/local/bin/ja4probe`, source at
   - `crates/honk-core/tests/clash_api_test.rs` — Clash API endpoints (auth, proxies, delay, connections, traffic/logs chunked + WS, `/dns/query`, cache flush, providers, UI hosting, store_dns).
   - `crates/honk-core/tests/config_dae_routing_test.rs` — end-to-end routing assertions against the root `config.dae`.
   - Inline unit tests in `honk-core/src/control/*`, `routing/tests.rs`, `dns/*` (incl. `transport/tests_proto.rs` — DoT/DoH round-trips with rcgen self-signed certs; one `#[ignore]`d live Google DoH test), `relay/*`, `ebpf/real/tests.rs` (only with `ebpf` feature).
-  - Benchmarks: `cargo bench -p honk-core --features dns-bench --bench dns`; `cargo bench -p honk-core --bench udp -- --save-baseline udp-candidate`; `cargo bench -p honk-outbound --features rprx --bench vless_vision`; `bash bench/tests/udp-latency-cli.sh` for the UDP deployment-driver fixture; and `bash bench/tests/runtime-memory-cli.sh` for the paired runtime-memory driver contract. Real runtime-memory gates use `bench/runtime-memory.sh` on the fixed lab. The candidate, VLESS Vision pair, and live deployment-gate invocations are fixed in `doc/benchmark.en.md`.
+  - Benchmarks kept on `main`: `cargo bench -p honk-core --features dns-bench --bench dns`; `cargo bench -p honk-core --bench udp -- --save-baseline udp-candidate`; and `cargo bench -p honk-outbound --features rprx --bench vless_vision`. Lab/deployment benchmark commands and fixtures live only on branch `bench`; use its `bench/README.md` and `doc/benchmark.en.md` from a separate worktree.
 - The root-only netns/podman integration scripts referenced by older docs are not in this checkout.
 
 ## Configuration
