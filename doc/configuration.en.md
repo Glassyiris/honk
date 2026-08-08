@@ -167,7 +167,7 @@ All of these live in the `global { ... }` section:
 
 | Topic | Key fields | Guidance |
 | ------- | ------------ | ---------- |
-| Intercept | `lan_interface`, `wan_interface` | Omit LAN to install no LAN hooks; configured WAN hooks still proxy host-originated TCP/UDP. `auto` resolves the default-route iface. |
+| Intercept | `lan_interface`, `wan_interface` | Omit LAN to install no LAN hooks; configured WAN hooks still proxy host-originated TCP/UDP. `auto` follows the IPv4 default-route iface, stays pending when no route exists, and attaches after link/address/route changes without a restart; generated gateway-address `direct(must)` rules are republished and health-backed outbounds are re-probed at the same time. |
 | Listen | `tproxy_port` | Default `12345`; the TPROXY traffic mark defaults to `0x08000000`. |
 | Kernel | `auto_config_kernel_parameter` | Needs root; enables helpful sysctls |
 | Health | `tcp_check_url`, `udp_check_dns`, `check_interval`, `check_tolerance` | Drives AliveDialerSet / URLTest. Durations: `check_interval: 30s`, `check_tolerance: 50ms`. |

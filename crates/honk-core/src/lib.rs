@@ -93,18 +93,15 @@ pub(crate) struct ConfiguredInterfaces {
 
 #[cfg(feature = "ebpf")]
 pub(crate) fn configured_interfaces(config: &honk_config::Config) -> ConfiguredInterfaces {
-    let lan: Vec<String> = config
-        .global
-        .lan_interface
-        .iter()
-        .filter_map(|name| resolve_interface(name))
-        .collect();
-    let wan: Vec<String> = config
-        .global
-        .wan_interface
-        .iter()
-        .filter_map(|name| resolve_interface(name))
-        .collect();
+    let default_interface = detect_default_interface();
+    let lan = resolve_configured_interface_names(
+        &config.global.lan_interface,
+        default_interface.as_deref(),
+    );
+    let wan = resolve_configured_interface_names(
+        &config.global.wan_interface,
+        default_interface.as_deref(),
+    );
     let single_homed = !wan.is_empty() && lan.iter().any(|name| wan.contains(name));
     ConfiguredInterfaces {
         lan,
@@ -113,15 +110,28 @@ pub(crate) fn configured_interfaces(config: &honk_config::Config) -> ConfiguredI
     }
 }
 
-/// Resolve an interface name, expanding `"auto"` or empty to the default route interface.
-/// never fallback to "lo"
+/// Resolve an interface list against one default-route snapshot. An unresolved
+/// `auto` entry stays pending instead of binding the datapath to loopback.
 #[cfg(feature = "ebpf")]
-pub(crate) fn resolve_interface(name: &str) -> Option<String> {
-    if name == "auto" || name.is_empty() {
-        detect_default_interface()
-    } else {
-        Some(name.to_string())
+pub(crate) fn resolve_configured_interface_names(
+    configured: &[String],
+    default_interface: Option<&str>,
+) -> Vec<String> {
+    let mut resolved = Vec::with_capacity(configured.len());
+    for name in configured {
+        let name = if name == "auto" || name.is_empty() {
+            let Some(default_interface) = default_interface else {
+                continue;
+            };
+            default_interface
+        } else {
+            name.as_str()
+        };
+        if !resolved.iter().any(|existing| existing == name) {
+            resolved.push(name.to_string());
+        }
     }
+    resolved
 }
 
 /// Detect the interface used by the IPv4 default route.
@@ -130,29 +140,12 @@ pub(crate) fn resolve_interface(name: &str) -> Option<String> {
 /// Parses `/proc/net/route` and returns the interface with destination
 /// `00000000` and mask `00000000` and the lowest metric.
 fn detect_default_interface() -> Option<String> {
-    let content = std::fs::read_to_string("/proc/net/route").ok()?;
-    let mut best: Option<(u32, String)> = None;
-    for line in content.lines().skip(1) {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 8 {
-            continue;
-        }
-        let iface = parts[0];
-        let dest = parts[1];
-        let mask = parts[7];
-        if dest != "00000000" || mask != "00000000" {
-            continue;
-        }
-        let metric = parts[6].parse::<u32>().unwrap_or(u32::MAX);
-        let better = match &best {
-            None => true,
-            Some((m, _)) => metric < *m,
-        };
-        if better {
-            best = Some((metric, iface.to_string()));
-        }
-    }
-    best.map(|(_, iface)| iface)
+    honk_config::config::default_route_interface()
+}
+
+#[cfg(all(feature = "ebpf", test))]
+pub(crate) fn detect_default_interface_from(content: &str) -> Option<String> {
+    honk_config::config::default_route_interface_from(content)
 }
 
 /// Default eBPF object file embedded into the binary.
@@ -592,8 +585,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     }
 
     #[cfg(feature = "ebpf")]
-    let mut attached_ifaces: std::collections::HashMap<String, (u32, ebpf::DynamicHooks)> =
-        Default::default();
+    let mut attached_ifaces: ebpf::real::AttachedMap = Default::default();
     let mut ebpf_backend: Box<dyn ebpf::EbpfBackend> = if cli.mock_ebpf {
         info!("Using mock eBPF backend");
         Box::new(ebpf::mock::MockEbpfBackend::new())
@@ -638,13 +630,18 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             {
                 attached_ifaces.insert(
                     primary_lan.to_string(),
-                    (
-                        i,
-                        ebpf::DynamicHooks {
-                            ingress: true,
-                            egress: !single_homed,
+                    ebpf::real::AttachedInterface {
+                        ifindex: i,
+                        role: if single_homed {
+                            ebpf::IfaceRole::LanWan
+                        } else {
+                            ebpf::IfaceRole::Lan
                         },
-                    ),
+                        hooks: ebpf::DynamicHooks {
+                            ingress: true,
+                            egress: true,
+                        },
+                    },
                 );
             }
             if !single_homed
@@ -653,20 +650,32 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             {
                 attached_ifaces.insert(
                     primary_wan.to_string(),
-                    (
-                        i,
-                        ebpf::DynamicHooks {
+                    ebpf::real::AttachedInterface {
+                        ifindex: i,
+                        role: ebpf::IfaceRole::Wan,
+                        hooks: ebpf::DynamicHooks {
                             ingress: true,
                             egress: true,
                         },
-                    ),
+                    },
                 );
             }
             for extra_lan in lan_ifnames.iter().skip(1) {
                 match backend.attach_lan(extra_lan, single_homed) {
                     Ok(hooks) => {
                         if let Some(i) = ifindex_of(extra_lan) {
-                            attached_ifaces.insert(extra_lan.clone(), (i, hooks));
+                            attached_ifaces.insert(
+                                extra_lan.clone(),
+                                ebpf::real::AttachedInterface {
+                                    ifindex: i,
+                                    role: if single_homed && wan_ifnames.contains(extra_lan) {
+                                        ebpf::IfaceRole::LanWan
+                                    } else {
+                                        ebpf::IfaceRole::Lan
+                                    },
+                                    hooks,
+                                },
+                            );
                         }
                     }
                     Err(e) => warn!("Failed to attach LAN programs to {}: {}", extra_lan, e),
@@ -688,7 +697,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 if (hooks.ingress || hooks.egress)
                     && let Some(i) = ifindex_of(extra_wan)
                 {
-                    attached_ifaces.insert(extra_wan.clone(), (i, hooks));
+                    attached_ifaces.insert(
+                        extra_wan.clone(),
+                        ebpf::real::AttachedInterface {
+                            ifindex: i,
+                            role: ebpf::IfaceRole::Wan,
+                            hooks,
+                        },
+                    );
                 }
             }
 
@@ -839,6 +855,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         ebpf::real::IfaceWatcher::spawn(
             control_plane.ebpf_handle(),
             control_plane.config_handle(),
+            control_plane.command_sender(),
             attached_ifaces,
         )
     } else {

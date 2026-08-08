@@ -81,6 +81,9 @@ pub mod commands {
             name: String,
             nodes: Vec<Node>,
         },
+        /// Refresh generated gateway-address rules and bypass stale health
+        /// backoff after a link, address, route, or interface-role change.
+        NetworkChanged,
         Shutdown,
         GetStats(mpsc::Sender<super::StatsSnapshot>),
     }
@@ -1309,6 +1312,20 @@ impl ControlPlane {
                             // Same serialized rebuild path as ReloadConfig —
                             // both commands queue on this single channel.
                             let _ = self.apply_runtime_config(new_config, &drain).await;
+                        }
+                        Some(ControlCommand::NetworkChanged) => {
+                            let new_config = {
+                                let current = self.config.read().await;
+                                let mut next = current.clone();
+                                next.ensure_local_direct_rules().then_some(next)
+                            };
+                            if let Some(new_config) = new_config {
+                                info!("refreshing local direct rules after network change");
+                                if !self.apply_runtime_config(new_config, &drain).await {
+                                    warn!("network-triggered routing refresh rejected");
+                                }
+                            }
+                            self.alive_set.notify_network_change();
                         }
                         Some(ControlCommand::GetStats(tx)) => {
                             let snap = self.stats.snapshot();

@@ -91,7 +91,7 @@ flowchart TB
 
 ### 报文路径（简）
 
-1. 每个 `lan_interface` 上的 **TC ingress** 负责分类转发的客户端流量；每个 `wan_interface` 上的 **TC egress** 独立分类本机发起的 TCP/UDP。省略 `lan_interface` 时只安装 WAN 路径。
+1. 每个 `lan_interface` 上的 **TC ingress** 负责分类转发的客户端流量；每个 `wan_interface` 上的 **TC egress** 独立分类本机发起的 TCP/UDP。省略 `lan_interface` 时只安装 WAN 路径。尚无默认路由时，未解析的 `auto` 保持未挂载且流量原样通过；rtnetlink 的网卡、地址或路由事件会重新解析并安装正确的双臂或单宿主程序组合，无需重启；随后通过运行时配置流水线重新发布网关本机地址的 `direct(must)` 规则，并立即复测健康退避可能仍反映旧网络状态的出站。
 2. 目的端口 53 的 DNS 走**快路径**（跳过昂贵 match 环），重定向到控制面。
 3. 结果：
    - `direct + must` → 留在主机协议栈（不 redirect），任何模式皆如此。
@@ -293,7 +293,7 @@ VMess 与 VLESS 由 honk-outbound 的 `rprx` cargo feature 编译（honk-core �
 ### 健康检查（`AliveDialerSet`）
 
 - 每节点状态：TCP / DnsUDP / DataUDP × v4/v6
-- 并发探测（默认批次 10）、恢复滞后、宽限期、指数退避（深度退避节点仍以 max_cooldown 慢速节奏继续探测，永不完全停止）
+- 并发探测（默认批次 10）、恢复滞后、宽限期及 5s→300s 指数退避；独立的 `min(5s, check_interval)` 调度器只检查退避已到期的死亡 TCP/UDP 协议族，避免常规周期很长时阻塞恢复（深度退避节点的实际探测仍只按 max_cooldown 发生）
 - TCP：HTTP HEAD 或裸连接；UDP：经节点自身 `dial_udp_transport` 发 DNS 查询
 - 将连通性推入 eBPF，避免把流量 redirect 到已死出站
 

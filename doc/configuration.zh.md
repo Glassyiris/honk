@@ -150,7 +150,7 @@ experimental {
 
 | 主题 | 关键字段 | 建议 |
 | ------ | ---------- | ------ |
-| 拦截网卡 | `lan_interface`、`wan_interface` | 省略 LAN 时不安装任何 LAN hook；已配置的 WAN hook 仍代理本机发起的 TCP/UDP。`auto` 解析默认路由网卡 |
+| 拦截网卡 | `lan_interface`、`wan_interface` | 省略 LAN 时不安装任何 LAN hook；已配置的 WAN hook 仍代理本机发起的 TCP/UDP。`auto` 跟随 IPv4 默认路由；没有默认路由时保持待定，并在网卡、地址或路由变化后自动挂载，无需重启；网关本机地址的 `direct(must)` 规则会同时重新发布，受健康状态控制的出站也会立即复测。 |
 | 监听 | `tproxy_port` | 默认 `12345`；`tproxy_mark`（默认 `0x08000000`）在 dae 语法中不可设置 |
 | 内核 | `auto_config_kernel_parameter` | 需 root；自动设置有用的 sysctl |
 | 健康检查 | `tcp_check_url`、`udp_check_dns`、`check_interval`、`check_tolerance` | 驱动 AliveDialerSet / URLTest；时长写作 `30s` / `50ms` |

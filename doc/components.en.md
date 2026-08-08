@@ -20,7 +20,7 @@ Source of truth: `crates/honk-config/src/*`, the dae parser in `crates/honk-conf
 | `log_level` | `log_level` | `"info"` | `trace`/`debug`/`info`/`warn`/`error` |
 | `disable_waiting_network` | `disable_waiting_network` | `false` | Skip waiting for network readiness |
 | `lan_interface` | `lan_interface` | `[]` | LAN ifaces to intercept (comma-separated); empty installs no LAN hooks |
-| `wan_interface` | `wan_interface` | `[]` | WAN ifaces that intercept host-originated TCP/UDP; `auto` allowed |
+| `wan_interface` | `wan_interface` | `[]` | WAN ifaces that intercept host-originated TCP/UDP. `auto` follows the IPv4 default route; while none exists it stays pending (never falls back to `lo`) and attaches on link/address/route events. The same event republishes generated gateway-address `direct(must)` rules and immediately re-probes health-backed outbounds. |
 | `auto_config_kernel_parameter` | `auto_config_kernel_parameter` | `false` | Auto sysctl (root) |
 | `store_subscribe` | `store_subscribe` | `true` | Persist each last valid subscription body under `<working-directory>/.sub` for network-independent startup/reload recovery. Changing it requires a process restart. |
 | `tcp_check_url` | `tcp_check_url` | Cloudflare HTTP + 1.1.1.1 + IPv6 | TCP health targets (comma-separated) |
@@ -691,7 +691,8 @@ Configured via `global { ... }` keys (`tcp_check_url`, `udp_check_dns`, `check_i
 | UDP probe | DNS to first usable `udp_check_dns` via node `dial_udp_transport` |
 | Per-group check URL | Groups with `check_url` probe members against it (sub-group members via their current pick, keyed by tag — sing-box RealTag); (tag, url) state independent of the global one — dead-for-this-URL excludes the member from that group only |
 | Concurrency | Default batch 10 |
-| Recovery | 2 consecutive successes |
+| Recovery | 2 consecutive successes; a relevant link/address/route change clears stale cooldown and lets the next successful probe verify recovery |
+| Dead-node retry | Due dead TCP/UDP families are reconsidered every `min(5s, check_interval)`; actual probes still honor the 5s→300s exponential backoff |
 | Deep backoff | After 10 consecutive failures, probing continues at the max-cooldown (300s) cadence — no permanent stop |
 | Dial failure | Latency history cleared + one synthetic 10s penalty sample (sing-box `DeleteURLTestHistory` + flap guard); a node's pooled connections and UDP endpoints are purged when it flips alive→dead |
 | UDP driver failure | Transport send/receive/reply-idle errors report a DataUdp traffic failure; intentional endpoint retirement and shutdown are health-neutral |

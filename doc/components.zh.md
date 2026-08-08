@@ -22,7 +22,7 @@
 | `log_level` | string | `"info"` | `trace`/`debug`/`info`/`warn`/`error` |
 | `disable_waiting_network` | bool | `false` | 启动时不等待网络就绪 |
 | `lan_interface` | string[] | `[]` | 拦截的 LAN 网卡；空时不安装任何 LAN hook；逗号分隔 |
-| `wan_interface` | string[] | `[]` | 拦截本机发起 TCP/UDP 的 WAN 网卡；支持 `auto`；逗号分隔 |
+| `wan_interface` | string[] | `[]` | 拦截本机发起 TCP/UDP 的 WAN 网卡；`auto` 跟随 IPv4 默认路由。默认路由不存在时保持待定（不会回退到 `lo`），并在网卡、地址或路由事件后自动挂载；同一事件还会重新发布网关本机地址的 `direct(must)` 规则，并立即复测受健康状态控制的出站。 |
 | `auto_config_kernel_parameter` | bool | `false` | 自动 sysctl（需 root） |
 | `store_subscribe` | bool | `true` | 将每个订阅最近一次有效正文持久化到 `<运行目录>/.sub`，供启动/重载在网络不可用时恢复；修改后需重启进程。 |
 | `tcp_check_url` | string[] | Cloudflare HTTP + 1.1.1.1 + IPv6 | TCP 健康检查目标；逗号分隔 |
@@ -614,7 +614,8 @@ honk-core delay <node> [--url HOST:PORT]
 | UDP 探测 | 经节点 `dial_udp_transport` 向 `udp_check_dns` 发 DNS |
 | 按组 check URL | 配了 `check_url` 的组按其目标探测成员（子组成员经其当前选中节点探测，结果记到子组 tag,与 sing-box RealTag 一致）；(tag, url) 状态与全局独立——对该 URL 死亡只把该成员排除出该组 |
 | 并发 | 默认批次 10 |
-| 恢复 | 连续 2 次成功 |
+| 恢复 | 连续 2 次成功；相关网卡、地址或路由变化会清除旧退避，并让下一次成功探测直接验证恢复 |
+| 死亡节点重试 | 每 `min(5s, check_interval)` 重新检查退避已到期的死亡 TCP/UDP 协议族；实际探测仍遵循 5s→300s 指数退避 |
 | 深度退避 | 连续失败 10 次后仍以 max_cooldown（300s）慢速节奏继续探测，不永久停止 |
 | 拨号失败 | 清除延迟历史并注入一个 10s 合成罚样本（sing-box `DeleteURLTestHistory` + 防抖动）；节点 alive→dead 翻转时清除其连接池条目并回收 UDP endpoint |
 | UDP driver 失败 | transport 发送、接收或回包空闲超时会上报 DataUdp 流量失败；主动 endpoint 退役和进程关闭不影响健康状态 |

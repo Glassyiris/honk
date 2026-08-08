@@ -108,7 +108,7 @@ mod iface_watch;
 mod syscall;
 
 pub use events::*;
-pub use iface_watch::IfaceWatcher;
+pub use iface_watch::{AttachedInterface, AttachedMap, IfaceWatcher};
 use syscall::{
     LookupAndDelete, bpf_delete_batch, bpf_delete_shared, bpf_lookup_and_delete,
     bpf_lookup_batch_scan, bpf_lookup_batch_scan_cb, bpf_update_batch,
@@ -366,6 +366,14 @@ impl EbpfBackend for RealEbpfBackend {
             super::IfaceRole::Wan => {
                 self.attach_wan_egress(ifname)?;
                 self.attach_wan_ingress(ifname)?;
+                Ok(super::DynamicHooks {
+                    ingress: true,
+                    egress: true,
+                })
+            }
+            super::IfaceRole::LanWan => {
+                self.attach_lan(ifname, true)?;
+                self.attach_wan_egress(ifname)?;
                 Ok(super::DynamicHooks {
                     ingress: true,
                     egress: true,
