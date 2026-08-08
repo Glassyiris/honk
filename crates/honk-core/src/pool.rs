@@ -115,6 +115,13 @@ pub struct ReadyPoolMetrics {
     pub entries: u64,
 }
 
+pub(crate) fn is_tcp_stream_alive(stream: &TcpStream) -> bool {
+    matches!(
+        nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::SocketError),
+        Ok(0)
+    )
+}
+
 impl ConnectionPool {
     /// Construct a max-capacity pool for tests and standalone callers.
     pub fn new() -> Self {
@@ -499,26 +506,9 @@ impl ConnectionPool {
 
     fn is_entry_alive(entry: &TimedStream) -> bool {
         match &entry.stream {
-            PooledStream::Bare(tcp) => Self::is_stream_alive(tcp),
+            PooledStream::Bare(tcp) => is_tcp_stream_alive(tcp),
             PooledStream::Ready(stream) => Self::is_ready_stream_alive(stream),
         }
-    }
-
-    fn is_stream_alive(stream: &TcpStream) -> bool {
-        use std::os::unix::io::AsRawFd;
-        let fd = stream.as_raw_fd();
-        let mut err: libc::c_int = 0;
-        let mut err_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-        let ret = unsafe {
-            libc::getsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_ERROR,
-                &mut err as *mut _ as *mut libc::c_void,
-                &mut err_len,
-            )
-        };
-        ret == 0 && err == 0
     }
 
     /// Liveness probe for Ready streams: `MSG_PEEK | MSG_DONTWAIT` on the
@@ -549,25 +539,17 @@ impl ConnectionPool {
             return true;
         };
         let mut buf = [0u8; 1];
-        let ret = unsafe {
-            libc::recv(
-                fd,
-                buf.as_mut_ptr() as *mut libc::c_void,
-                1,
-                libc::MSG_PEEK | libc::MSG_DONTWAIT,
-            )
-        };
-        if ret == 0 {
-            return false; // orderly FIN from the peer
-        }
-        if ret > 0 {
-            return true; // pending bytes (TLS ciphertext counts as alive)
-        }
-        match std::io::Error::last_os_error().raw_os_error() {
-            Some(libc::ECONNRESET) | Some(libc::ENOTCONN) => false,
+        match nix::sys::socket::recv(
+            fd,
+            &mut buf,
+            nix::sys::socket::MsgFlags::MSG_PEEK | nix::sys::socket::MsgFlags::MSG_DONTWAIT,
+        ) {
+            Ok(0) => false,
+            Ok(_) => true,
+            Err(nix::errno::Errno::ECONNRESET | nix::errno::Errno::ENOTCONN) => false,
             // EAGAIN/EWOULDBLOCK (nothing to read) and anything unexpected:
             // conservatively alive.
-            _ => true,
+            Err(_) => true,
         }
     }
 }

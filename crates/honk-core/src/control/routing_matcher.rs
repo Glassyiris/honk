@@ -35,16 +35,9 @@ struct Condition<'a> {
 
 #[derive(Debug)]
 enum ConditionKind<'a> {
-    /// Domain/geosite conditions are represented in eBPF as a `DomainSet`
-    /// placeholder. The actual domain→IP mapping is populated by DNS snooping:
-    /// when DNS resolves a matching domain, the resolved IPs are inserted into
-    /// `DOMAIN_ROUTING_MAP` with the bitmap pointing to this match_set index.
-    #[allow(dead_code)]
-    Domain {
-        suffixes: &'a [String],
-        keywords: &'a [String],
-        geosite_domains: &'a [crate::routing::GeositeDomain],
-    },
+    /// Domain conditions are represented in eBPF as a `DomainSet`
+    /// placeholder; DNS snooping populates the actual IP bitmap.
+    Domain,
     SourceIp {
         nets: &'a [ipnet::IpNet],
     },
@@ -577,7 +570,7 @@ impl RoutingMatcherBuilder {
                 // The actual domain→IP mapping will be populated by DNS snooping:
                 // when DNS resolves a domain to IPs, those IPs are pushed to
                 // DOMAIN_ROUTING_MAP with the bitmap pointing to this match_set.
-                ConditionKind::Domain { .. } => {
+                ConditionKind::Domain => {
                     let idx = match_sets.len() as u32;
                     // A negated DomainSet must NOT receive DNS-snooped bitmap
                     // pushes: they record IPs whose domain matched the rule in
@@ -623,11 +616,7 @@ impl RoutingMatcherBuilder {
                 if has_domain {
                     conditions.push(Condition {
                         not: $not,
-                        kind: ConditionKind::Domain {
-                            suffixes: $domain_suffixes,
-                            keywords: $domain_keywords,
-                            geosite_domains: $geosite_domains,
-                        },
+                        kind: ConditionKind::Domain,
                     });
                 }
                 if !$source_ip_nets.is_empty() {

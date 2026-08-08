@@ -58,7 +58,6 @@ impl GroupManager {
             .map(|node| Candidate {
                 tag: node.name.as_str(),
                 node,
-                via: None,
             })
             .collect();
         for sub_tag in &group.groups {
@@ -76,7 +75,6 @@ impl GroupManager {
                 out.push(Candidate {
                     tag: sub_tag.as_str(),
                     node: leaf,
-                    via: Some(sub_tag.as_str()),
                 });
             }
         }

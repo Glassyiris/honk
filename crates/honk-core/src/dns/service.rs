@@ -148,9 +148,7 @@ impl DnsService {
 
     pub fn cache(&self) -> Arc<Mutex<DnsCache>> {
         match self.backend.as_ref() {
-            DnsServiceBackend::Runtime(provider) => {
-                Arc::clone(provider.acquire().runtime().cache())
-            }
+            DnsServiceBackend::Runtime(provider) => provider.acquire().runtime().cache(),
             DnsServiceBackend::Standalone(forwarder) => forwarder.cache(),
         }
     }

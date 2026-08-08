@@ -31,7 +31,6 @@
 | `check_interval_secs` | u64 | `30` | 检查间隔（秒）。**dae：** `check_interval` 时长（如 `300s`） |
 | `check_tolerance_ms` | u64 | `50` | URLTest 切换阈值（ms）。**dae：** `check_tolerance`（如 `30ms`） |
 | `dial_mode` | string | `"domain"` | `ip` / `domain` / `domain+` / `domain++` |
-| `lan_tcp_mss` | u16 | `0` | 已弃用；仅解析兼容 |
 | `allow_insecure` | bool | `false` | 全局 TLS 跳过校验回退 |
 | `sniffing_timeout_ms` | u64 | `30` | 嗅探超时（ms）。**dae：** `sniffing_timeout` 时长 |
 | `tls_implementation` | string | `"tls"` | TLS 栈：`tls`（原生 BoringSSL）/ `utls`（真实 Chrome 指纹） |

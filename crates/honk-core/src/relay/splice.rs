@@ -25,7 +25,7 @@
 use super::{RelayStats, is_ignorable_connection_error, relay_tcp};
 use std::io;
 use std::net::SocketAddr;
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::Interest;
 use tokio::net::TcpStream;
@@ -82,26 +82,24 @@ impl SpliceError {
 }
 
 /// Thin wrapper over `splice(2)` (non-blocking, retries on EINTR).
-fn raw_splice(fd_in: RawFd, fd_out: RawFd, len: usize) -> io::Result<usize> {
+fn raw_splice(
+    fd_in: &impl std::os::fd::AsFd,
+    fd_out: &impl std::os::fd::AsFd,
+    len: usize,
+) -> io::Result<usize> {
     loop {
-        let n = unsafe {
-            libc::splice(
-                fd_in,
-                std::ptr::null_mut(),
-                fd_out,
-                std::ptr::null_mut(),
-                len,
-                libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK,
-            )
-        };
-        if n < 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(err);
+        match nix::fcntl::splice(
+            fd_in,
+            None,
+            fd_out,
+            None,
+            len,
+            nix::fcntl::SpliceFFlags::SPLICE_F_MOVE | nix::fcntl::SpliceFFlags::SPLICE_F_NONBLOCK,
+        ) {
+            Ok(moved) => return Ok(moved),
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(error) => return Err(io::Error::from(error)),
         }
-        return Ok(n as usize);
     }
 }
 
@@ -114,24 +112,22 @@ struct Pipe {
 
 impl Pipe {
     fn new() -> io::Result<Self> {
-        let mut fds = [0i32; 2];
-        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let (read, write) =
+            nix::unistd::pipe2(nix::fcntl::OFlag::O_NONBLOCK | nix::fcntl::OFlag::O_CLOEXEC)
+                .map_err(io::Error::from)?;
         // Best-effort: grow the pipe to reduce syscall frequency.
-        unsafe {
-            libc::fcntl(fds[1], libc::F_SETPIPE_SZ, PIPE_SIZE as libc::c_int);
-        }
-        let capacity = unsafe { libc::fcntl(fds[1], libc::F_GETPIPE_SZ) };
-        let capacity = if capacity > 0 {
-            capacity as usize
-        } else {
-            DEFAULT_PIPE_SIZE
-        };
-        // Safety: both fds were just created by pipe2 and are uniquely owned.
+        let _ = nix::fcntl::fcntl(
+            &write,
+            nix::fcntl::FcntlArg::F_SETPIPE_SZ(PIPE_SIZE as libc::c_int),
+        );
+        let capacity = nix::fcntl::fcntl(&write, nix::fcntl::FcntlArg::F_GETPIPE_SZ)
+            .ok()
+            .and_then(|capacity| usize::try_from(capacity).ok())
+            .filter(|capacity| *capacity > 0)
+            .unwrap_or(DEFAULT_PIPE_SIZE);
         Ok(Pipe {
-            read: unsafe { OwnedFd::from_raw_fd(fds[0]) },
-            write: unsafe { OwnedFd::from_raw_fd(fds[1]) },
+            read,
+            write,
             capacity,
         })
     }
@@ -139,7 +135,7 @@ impl Pipe {
 
 /// Half-close the write side of a socket (best-effort).
 fn shutdown_write(stream: &TcpStream) {
-    let _ = unsafe { libc::shutdown(stream.as_raw_fd(), libc::SHUT_WR) };
+    let _ = nix::sys::socket::shutdown(stream.as_raw_fd(), nix::sys::socket::Shutdown::Write);
 }
 
 /// Perform the very first splice of a direction without waiting for
@@ -154,7 +150,7 @@ fn probe(src: &TcpStream, pipe: &Pipe) -> Result<usize, SpliceError> {
     if let Some(errno) = test_hook::forced_probe_errno() {
         return Err(SpliceError::classify(io::Error::from_raw_os_error(errno)));
     }
-    match raw_splice(src.as_raw_fd(), pipe.write.as_raw_fd(), pipe.capacity) {
+    match raw_splice(src, &pipe.write, pipe.capacity) {
         Ok(n) => Ok(n),
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(0),
         Err(e) => Err(SpliceError::classify(e)),
@@ -176,17 +172,13 @@ async fn pump(
     mut staged: usize,
     progress: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 ) -> io::Result<u64> {
-    let src_fd = src.as_raw_fd();
-    let dst_fd = dst.as_raw_fd();
-    let pipe_r = pipe.read.as_raw_fd();
-    let pipe_w = pipe.write.as_raw_fd();
     let mut total = 0u64;
 
     loop {
         if staged == 0 {
             staged = src
                 .async_io(Interest::READABLE, || {
-                    raw_splice(src_fd, pipe_w, pipe.capacity)
+                    raw_splice(src, &pipe.write, pipe.capacity)
                 })
                 .await?;
             if staged == 0 {
@@ -196,7 +188,7 @@ async fn pump(
             }
         } else {
             let n = dst
-                .async_io(Interest::WRITABLE, || raw_splice(pipe_r, dst_fd, staged))
+                .async_io(Interest::WRITABLE, || raw_splice(&pipe.read, dst, staged))
                 .await?;
             if n == 0 {
                 // A non-empty pipe must always make progress; bail out

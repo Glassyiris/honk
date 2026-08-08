@@ -55,8 +55,6 @@ const RETRY_INTEGRITY_NONCE_V1: [u8; 12] = [
 
 // BoringSSL encryption levels (ssl.h ssl_encryption_level_t).
 const LEVEL_INITIAL: usize = 0;
-#[allow(dead_code)] // BoringSSL level 1 (0-RTT); unused, honk offers no early data
-const LEVEL_EARLY_DATA: usize = 1;
 const LEVEL_HANDSHAKE: usize = 2;
 const LEVEL_APPLICATION: usize = 3;
 

@@ -76,11 +76,6 @@ pub struct GlobalConfig {
     pub check_tolerance_ms: u64,
     #[serde(default = "default_dial_mode")]
     pub dial_mode: String,
-    // lan_tcp_mss is no longer used (link-local addressing eliminates the
-    // need for iptables TCPMSS clamping).  Parsed for backward compatibility.
-    #[serde(default = "default_lan_tcp_mss")]
-    #[allow(dead_code)]
-    pub lan_tcp_mss: u16,
     #[serde(default)]
     pub allow_insecure: bool,
     #[serde(default = "default_sniffing_timeout_ms")]
@@ -267,9 +262,6 @@ fn default_check_tolerance_ms() -> u64 {
 fn default_dial_mode() -> String {
     "domain".into()
 }
-fn default_lan_tcp_mss() -> u16 {
-    0
-}
 fn default_sniffing_timeout_ms() -> u64 {
     30
 }
@@ -327,7 +319,6 @@ impl Default for GlobalConfig {
             check_interval_secs: default_check_interval_secs(),
             check_tolerance_ms: default_check_tolerance_ms(),
             dial_mode: default_dial_mode(),
-            lan_tcp_mss: default_lan_tcp_mss(),
             allow_insecure: false,
             sniffing_timeout_ms: default_sniffing_timeout_ms(),
             tls_implementation: default_tls_impl(),

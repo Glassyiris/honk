@@ -29,7 +29,6 @@ Source of truth: `crates/honk-config/src/*`, the dae parser in `crates/honk-conf
 | `check_interval` | `check_interval_secs` | `30` | Health interval, duration form (e.g. `30s`) |
 | `check_tolerance` | `check_tolerance_ms` | `50` | URLTest switch delta, duration form (e.g. `50ms`) |
 | `dial_mode` | `dial_mode` | `"domain"` | `ip` / `domain` / `domain+` / `domain++` |
-| `lan_tcp_mss` | `lan_tcp_mss` | `0` | Deprecated; parsed only |
 | `allow_insecure` | `allow_insecure` | `false` | Global TLS skip-verify fallback |
 | `sniffing_timeout` | `sniffing_timeout_ms` | `30` | Sniff timeout, duration form (e.g. `30ms`) |
 | `tls_implementation` | `tls_implementation` | `"tls"` | TLS stack: `tls` (plain BoringSSL) / `utls` (real Chrome fingerprint) |

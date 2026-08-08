@@ -36,12 +36,6 @@ use state::UrlTestSelections;
 
 pub use state::{InterruptCallback, PersistCallback};
 
-/// Tolerance for URLTest cache replacement: a new measurement must beat
-/// the current selection by at least `group.tolerance` ms.  Default 50 ms
-/// matches sing-box.
-#[allow(dead_code)]
-const DEFAULT_URLTEST_TOLERANCE_MS: u64 = 50;
-
 /// Maximum nesting depth for group → sub-group resolution. Construction-
 /// time cycle breaking keeps the group graph acyclic; this bound (plus the
 /// per-resolution visited set) is defense in depth against pathological
@@ -123,22 +117,15 @@ impl SelectionEffects {
 /// keeps the hot path cheap.
 pub type SharedGroupManager = Arc<parking_lot::RwLock<Arc<GroupManager>>>;
 
-/// A dialable candidate of a group: a leaf node plus how the group
-/// reached it. Direct members carry their own node name as `tag`;
-/// candidates contributed by a nested sub-group carry the sub-group's tag
-/// (with `via` naming that sub-group) and the leaf the sub-group's own
-/// policy currently selects.
+/// A dialable candidate of a group: a leaf node plus the member tag that
+/// selected it. Direct members use their node name; nested candidates use
+/// the sub-group tag while retaining the leaf chosen by that sub-group.
 #[derive(Debug, Clone, Copy)]
 struct Candidate<'a> {
     /// Display tag: node name for direct members, sub-group tag for nested.
     tag: &'a str,
     /// Leaf node that would actually be dialed.
     node: &'a Node,
-    /// Sub-group tag through which the leaf was reached (`None` for direct
-    /// members). Kept for introspection/debugging; selection identity uses
-    /// `tag` alone.
-    #[allow(dead_code)]
-    via: Option<&'a str>,
 }
 
 pub struct GroupManager {

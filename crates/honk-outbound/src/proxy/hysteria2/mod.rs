@@ -262,7 +262,7 @@ struct UdpInbound {
     packet_id: u16,
     frag_id: u8,
     frag_total: u8,
-    #[allow(dead_code)]
+    #[cfg(test)]
     addr: String,
     data: Vec<u8>,
 }
@@ -294,13 +294,14 @@ fn decode_udp_message(data: &[u8]) -> Option<UdpInbound> {
     if data.len() < end {
         return None;
     }
-    let addr = String::from_utf8(data[start..end].to_vec()).ok()?;
+    let _addr = std::str::from_utf8(&data[start..end]).ok()?;
     Some(UdpInbound {
         session_id,
         packet_id,
         frag_id,
         frag_total,
-        addr,
+        #[cfg(test)]
+        addr: _addr.to_owned(),
         data: data[end..].to_vec(),
     })
 }

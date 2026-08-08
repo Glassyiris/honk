@@ -12,9 +12,7 @@ use super::{
 };
 use crate::dns::cache::DnsCache;
 use crate::dns::forwarder::{DnsForwarder, DnsUpstreamPool};
-use crate::dns::policy::PolicyId;
 use crate::dns::routing::DnsRouter;
-use crate::group::GroupManager;
 use crate::routing::Router;
 use tokio::sync::{Mutex, Notify};
 
@@ -106,16 +104,11 @@ fn runtime_with_outbound(
     let runtime = DnsRuntime::new(DnsRuntimeParts {
         generation: RuntimeGeneration::new(generation),
         forwarder,
-        router: Arc::clone(&router),
-        group_manager: Arc::new(GroupManager::new(&config.groups, &config.nodes)),
-        policy_id: PolicyId::from_config(&config.dns).expect("valid policy"),
         routing_projection: Arc::new(RoutingProjectionSnapshot::new(
             generation,
             router,
             Default::default(),
         )),
-        cache: Arc::clone(&cache),
-        persistence: super::ProcessPersistenceHandle::new(Arc::clone(&cache)),
         outbound_runtime,
         transport: transport.clone(),
     });
@@ -143,16 +136,11 @@ fn runtime_with_bootstrap_pool(generation: u64, pool: Arc<LazyBootstrapPool>) ->
     DnsRuntime::new(DnsRuntimeParts {
         generation: RuntimeGeneration::new(generation),
         forwarder,
-        router: Arc::clone(&router),
-        group_manager: Arc::new(GroupManager::new(&config.groups, &config.nodes)),
-        policy_id: PolicyId::from_config(&config.dns).expect("valid policy"),
         routing_projection: Arc::new(RoutingProjectionSnapshot::new(
             generation,
             router,
             Default::default(),
         )),
-        cache: Arc::clone(&cache),
-        persistence: super::ProcessPersistenceHandle::new(cache),
         outbound_runtime: None,
         transport: pool,
     })
@@ -164,9 +152,8 @@ async fn old_dns_request_keeps_generation_snapshots_after_publication() {
     let (old, old_transport) = runtime(1, 11);
     let provider = DnsServiceProvider::new(Arc::clone(&old));
     let old_lease = provider.acquire();
-    let old_router = Arc::clone(old_lease.runtime().router());
-    let old_groups = Arc::clone(old_lease.runtime().group_manager());
-    let old_policy = old_lease.runtime().policy_id().clone();
+    let old_forwarder = Arc::clone(old_lease.runtime().forwarder());
+    let old_cache = old_lease.runtime().cache();
     let (new, _) = runtime(2, 22);
 
     // When: the new coherent runtime is published.
@@ -176,19 +163,15 @@ async fn old_dns_request_keeps_generation_snapshots_after_publication() {
     // Then: each lease sees only its own generation's snapshot.
     assert_eq!(old_lease.runtime().generation(), RuntimeGeneration::new(1));
     assert_eq!(old_lease.runtime().routing_projection().generation(), 1);
-    assert!(Arc::ptr_eq(old_lease.runtime().router(), &old_router));
-    assert!(Arc::ptr_eq(
-        old_lease.runtime().group_manager(),
-        &old_groups
-    ));
-    assert_eq!(old_lease.runtime().policy_id(), &old_policy);
+    assert!(Arc::ptr_eq(old_lease.runtime().forwarder(), &old_forwarder));
+    assert!(Arc::ptr_eq(&old_lease.runtime().cache(), &old_cache));
     assert_eq!(new_lease.runtime().generation(), RuntimeGeneration::new(2));
     assert_eq!(new_lease.runtime().routing_projection().generation(), 2);
-    assert!(!Arc::ptr_eq(new_lease.runtime().router(), &old_router));
     assert!(!Arc::ptr_eq(
-        new_lease.runtime().group_manager(),
-        &old_groups
+        new_lease.runtime().forwarder(),
+        &old_forwarder
     ));
+    assert!(!Arc::ptr_eq(&new_lease.runtime().cache(), &old_cache));
     assert_eq!(old_transport.closes.load(Ordering::SeqCst), 0);
 }
 

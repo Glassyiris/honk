@@ -4,11 +4,7 @@ use std::time::Duration;
 
 use tokio::sync::Notify;
 
-use super::cache::DnsCache;
 use super::forwarder::DnsForwarder;
-use super::policy::PolicyId;
-use crate::group::GroupManager;
-use crate::routing::Router;
 
 pub(crate) const RETIREMENT_DEADLINE: Duration = Duration::from_secs(30);
 pub(crate) const MAX_RETIRED_RUNTIMES: usize = 4;
@@ -16,7 +12,7 @@ pub(crate) const MAX_RETIRED_RUNTIMES: usize = 4;
 mod provider;
 pub(crate) use provider::DnsServiceProvider;
 mod resources;
-pub(crate) use resources::{ProcessPersistenceHandle, RuntimeTransport};
+pub(crate) use resources::RuntimeTransport;
 mod state;
 pub(crate) use state::{RuntimeGeneration, RuntimeState};
 #[cfg(test)]
@@ -29,15 +25,7 @@ pub(crate) use super::projection::RoutingProjectionSnapshot;
 pub(crate) struct DnsRuntimeParts {
     pub(crate) generation: RuntimeGeneration,
     pub(crate) forwarder: Arc<DnsForwarder>,
-    #[allow(dead_code)]
-    pub(crate) router: Arc<Router>,
-    #[allow(dead_code)]
-    pub(crate) group_manager: Arc<GroupManager>,
-    #[allow(dead_code)]
-    pub(crate) policy_id: PolicyId,
     pub(crate) routing_projection: Arc<RoutingProjectionSnapshot>,
-    pub(crate) cache: Arc<tokio::sync::Mutex<DnsCache>>,
-    pub(crate) persistence: Arc<ProcessPersistenceHandle>,
     /// Outbound session generation captured with this DNS snapshot. It stays
     /// available to existing leases after publication and begins graceful
     /// pool drain only when the runtime itself retires.
@@ -80,35 +68,16 @@ impl DnsRuntime {
         self.leases.load(Ordering::Acquire)
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn router(&self) -> &Arc<Router> {
-        &self.parts.router
-    }
-
     pub(crate) fn forwarder(&self) -> &Arc<DnsForwarder> {
         &self.parts.forwarder
-    }
-
-    #[cfg(test)]
-    pub(crate) fn group_manager(&self) -> &Arc<GroupManager> {
-        &self.parts.group_manager
-    }
-
-    #[cfg(test)]
-    pub(crate) fn policy_id(&self) -> &PolicyId {
-        &self.parts.policy_id
     }
 
     pub(crate) fn routing_projection(&self) -> &Arc<RoutingProjectionSnapshot> {
         &self.parts.routing_projection
     }
 
-    pub(crate) fn cache(&self) -> &Arc<tokio::sync::Mutex<DnsCache>> {
-        &self.parts.cache
-    }
-
-    pub(crate) fn persistence(&self) -> &Arc<ProcessPersistenceHandle> {
-        &self.parts.persistence
+    pub(crate) fn cache(&self) -> Arc<tokio::sync::Mutex<super::cache::DnsCache>> {
+        self.parts.forwarder.cache()
     }
 
     fn acquire(runtime: &Arc<Self>) -> RuntimeLease {

@@ -4,21 +4,13 @@
 
 use super::*;
 
-/// Per-group URLTest selection entry. `tag` is the member tag the group
-/// selected (a direct member's node name, or a sub-group's tag) — it is
-/// the selection's identity for hysteresis and display; `node_id` records
-/// the leaf the tag resolved to at selection time.
+/// Per-group URLTest selection entry. `tag` is the selected member tag: a
+/// direct node name or a sub-group tag. It is the selection identity used
+/// for hysteresis and display.
 #[derive(Debug, Clone)]
 pub(super) struct UrlTestEntry {
-    /// Leaf the selection resolved to when it was made. Informational —
-    /// selection identity is `tag`, so a sub-group swapping its internal
-    /// leaf keeps the parent's selection stable.
-    #[allow(dead_code)]
-    pub(super) node_id: uuid::Uuid,
     pub(super) tag: String,
     pub(super) latency: Duration,
-    #[allow(dead_code)]
-    pub(super) updated_at: Instant,
 }
 
 /// Per-group URLTest selections, one per network. The UDP selection is
@@ -205,10 +197,8 @@ impl GroupManager {
         selections.set(
             network,
             UrlTestEntry {
-                node_id: candidate.node.id,
                 tag: candidate.tag.to_string(),
                 latency,
-                updated_at: Instant::now(),
             },
         );
         changed

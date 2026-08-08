@@ -121,7 +121,7 @@ struct UdpInbound {
     packet_id: u16,
     frag_total: u8,
     frag_id: u8,
-    #[allow(dead_code)] // address is informational; the relay keys sessions by target
+    #[cfg(test)]
     addr: TuicAddr,
     data: Vec<u8>,
 }
@@ -140,7 +140,7 @@ fn decode_udp_message(data: &[u8]) -> io::Result<UdpInbound> {
     let frag_id = data[5];
     let size = u16::from_be_bytes(data[6..8].try_into().expect("len checked")) as usize;
     let mut cursor = &data[8..];
-    let addr = TuicAddr::decode(&mut cursor)?;
+    let _addr = TuicAddr::decode(&mut cursor)?;
     if cursor.len() != size {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -152,7 +152,8 @@ fn decode_udp_message(data: &[u8]) -> io::Result<UdpInbound> {
         packet_id,
         frag_total,
         frag_id,
-        addr,
+        #[cfg(test)]
+        addr: _addr,
         data: cursor.to_vec(),
     })
 }
@@ -166,7 +167,7 @@ async fn read_udp_message_stream(recv: &mut quinn::RecvStream) -> io::Result<Udp
     let frag_total = fixed[4];
     let frag_id = fixed[5];
     let size = u16::from_be_bytes(fixed[6..8].try_into().expect("array length")) as usize;
-    let addr = TuicAddr::read_from_stream(recv).await?;
+    let _addr = TuicAddr::read_from_stream(recv).await?;
     let mut data = vec![0u8; size];
     read_exact(recv, &mut data).await?;
     Ok(UdpInbound {
@@ -174,7 +175,8 @@ async fn read_udp_message_stream(recv: &mut quinn::RecvStream) -> io::Result<Udp
         packet_id,
         frag_total,
         frag_id,
-        addr,
+        #[cfg(test)]
+        addr: _addr,
         data,
     })
 }

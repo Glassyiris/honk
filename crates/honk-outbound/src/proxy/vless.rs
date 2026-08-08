@@ -40,7 +40,7 @@ use super::{AsyncReadWrite, ProbeableOutbound, ProxyStream, TcpOutbound};
 
 const VLESS_VERSION: u8 = 0x00;
 const CMD_TCP: u8 = 0x01;
-#[allow(dead_code)]
+#[cfg(test)]
 const CMD_UDP: u8 = 0x02;
 const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x02;

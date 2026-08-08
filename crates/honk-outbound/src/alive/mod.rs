@@ -303,9 +303,6 @@ pub struct AliveDialerSet {
     registered: RwLock<HashMap<Uuid, RegisteredNode>>,
     ebpf_callback: RwLock<Option<EbpfAliveCallback>>,
     death_callback: RwLock<Option<DeathCallback>>,
-    /// Deprecated: per-protocol thresholds are now used via probe_failure_threshold/traffic_failure_threshold.
-    #[allow(dead_code)]
-    failure_threshold: u32,
     base_cooldown: Duration,
     max_cooldown: Duration,
     /// Bounded node-deduplicated emergency probe queue. A pending node owns
@@ -393,7 +390,6 @@ impl AliveDialerSet {
             ebpf_callback: RwLock::new(None),
             death_callback: RwLock::new(None),
             resolver: RwLock::new(None),
-            failure_threshold: 3,
             base_cooldown: Duration::from_secs(5),
             max_cooldown: Duration::from_secs(300),
             trigger_tx: tx,
@@ -625,7 +621,7 @@ impl AliveDialerSet {
         self.states.read().values().filter(|s| s[idx].alive).count()
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn mark_alive_for(&self, node_id: Uuid, domain: ProbeDomain, ipver: IpVersion) {
         self.mark_alive_for_latency(node_id, domain, ipver, Duration::ZERO);
     }
