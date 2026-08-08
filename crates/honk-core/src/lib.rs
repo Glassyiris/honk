@@ -1503,6 +1503,12 @@ pub(crate) static DAENS_READY: std::sync::atomic::AtomicBool =
 /// never a same-named mount belonging to another tool.
 #[cfg(feature = "ebpf")]
 static COMPAT_MOUNTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Whether THIS instance created the regular file used as the compat
+/// bind-mount target. If `/run/netns` belongs to iproute2, unmounting the
+/// child does not remove that file, so cleanup must remove its own target.
+#[cfg(feature = "ebpf")]
+static COMPAT_FILE_CREATED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// The engine-owned daens namespace FD, created by
 /// [`create_daens_namespace`] at startup. An open namespace FD pins the
@@ -1567,19 +1573,35 @@ fn create_daens_namespace() -> anyhow::Result<&'static std::os::unix::io::OwnedF
                 Err(error) => warn!("tmpfs mount on /run/netns failed: {error}"),
             }
         }
-        let _ = std::fs::File::create(DAENS_NS_PATH);
-        // The bind result is reported, never silently ignored — a failed
-        // compat mount leaves debug tooling unable to find daens.
-        match nix::mount::mount(
-            Some(task_ns),
-            DAENS_NS_PATH,
-            None::<&str>,
-            nix::mount::MsFlags::MS_BIND,
-            None::<&str>,
-        ) {
-            Ok(()) => COMPAT_MOUNTED.store(true, std::sync::atomic::Ordering::Relaxed),
+        let compat_target_ready = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(DAENS_NS_PATH)
+        {
+            Ok(_) => {
+                COMPAT_FILE_CREATED.store(true, std::sync::atomic::Ordering::Relaxed);
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => true,
             Err(error) => {
-                warn!("compat bind-mount of daens failed (debug tooling degraded): {error}");
+                warn!("create compat daens target failed: {error}");
+                false
+            }
+        };
+        if compat_target_ready {
+            // The bind result is reported, never silently ignored — a failed
+            // compat mount leaves debug tooling unable to find daens.
+            match nix::mount::mount(
+                Some(task_ns),
+                DAENS_NS_PATH,
+                None::<&str>,
+                nix::mount::MsFlags::MS_BIND,
+                None::<&str>,
+            ) {
+                Ok(()) => COMPAT_MOUNTED.store(true, std::sync::atomic::Ordering::Relaxed),
+                Err(error) => {
+                    warn!("compat bind-mount of daens failed (debug tooling degraded): {error}");
+                }
             }
         }
         let result = std::fs::File::open(task_ns).map(OwnedFd::from);
@@ -1689,6 +1711,12 @@ fn cleanup_dae0_interface(recorded_ifindex: Option<u32>) {
     // a same-named mount from another tool is never ours to tear down.
     if COMPAT_MOUNTED.swap(false, std::sync::atomic::Ordering::Relaxed) {
         let _ = nix::mount::umount2(DAENS_NS_PATH, nix::mount::MntFlags::MNT_DETACH);
+    }
+    if COMPAT_FILE_CREATED.swap(false, std::sync::atomic::Ordering::Relaxed)
+        && let Err(error) = std::fs::remove_file(DAENS_NS_PATH)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!("remove compat daens target failed: {error}");
     }
     // Same ownership rule for the parent tmpfs (child must go first).
     if PARENT_TMPFS_MOUNTED.swap(false, std::sync::atomic::Ordering::Relaxed) {
