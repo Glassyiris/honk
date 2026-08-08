@@ -150,7 +150,7 @@ The fields below are what a parsed node carries. In dae syntax they are **derive
 | `ss` | `shadowsocks` | Yes | Yes | AEAD + `2022-blake3-*` |
 | `trojan` | | Yes | Yes | TLS; WS/gRPC via transport |
 | `vmess` | | Yes | No | AEAD; WS/gRPC; REALITY via `security=reality`; registered only with the `rprx` feature (on in honk-core's default build) |
-| `vless` | | Yes | No | REALITY + `xtls-rprx-vision` flow; WS/gRPC via transport; header UDP exists in tests only; registered only with the `rprx` feature |
+| `vless` | | Yes | No | REALITY + `xtls-rprx-vision` flow; WS/gRPC via transport; registered only with the `rprx` feature |
 | `socks5` | | Yes | Yes | UDP ASSOCIATE |
 | `hysteria2` | | Yes | Yes | Real QUIC/H3; salamander; brutal (with bandwidth) or BBR; port hopping |
 | `tuic` | | Yes | Yes | TUIC v5 / quinn |
@@ -180,6 +180,13 @@ node {
 ```
 
 Verified VLESS combinations (live interop against a sing-box 1.13 server): TCP+REALITY+vision, TCP+REALITY, TCP+WS, TCP+WS+TLS, TCP+gRPC. The `xtls-rprx-vision` flow only combines with TCP+REALITY/TLS — over WS/gRPC there is no raw socket for the XTLS direct-copy switch, matching upstream.
+
+Clash subscriptions map VLESS `uuid`, `servername`/`sni`, `flow`, `network`,
+nested `reality-opts`, `ws-opts`, and `grpc-opts` into the same node fields
+before identity derivation. Incomplete `reality-opts` entries are skipped.
+Feed shapes outside TCP/WS/gRPC, non-Vision flows, Vision without TLS/REALITY,
+and Vision over WS/gRPC are reported by `honk-tool sub` but not probed.
+`client-fingerprint` is not a node field; the global TLS mode owns it.
 
 **VLESS + REALITY (xtls-rprx-vision)**
 
