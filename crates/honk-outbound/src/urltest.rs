@@ -139,7 +139,16 @@ pub async fn urltest_node(
         }
     };
 
-    measure_head_exchange(runtime, handler, &host, is_https, addr, timeout).await
+    measure_head_exchange(
+        runtime,
+        handler,
+        &host,
+        Some(&host),
+        is_https,
+        addr,
+        timeout,
+    )
+    .await
 }
 
 /// [`urltest_node`] with a caller-chosen destination address (e.g. an
@@ -153,7 +162,7 @@ pub async fn urltest_node_addr(
 ) -> anyhow::Result<Duration> {
     let url = normalize_url(url);
     let (host, _, is_https) = parse_url_host_port(url)?;
-    measure_head_exchange(runtime, handler, &host, is_https, addr, timeout).await
+    measure_head_exchange(runtime, handler, &host, None, is_https, addr, timeout).await
 }
 
 /// Dial `addr` through the node and time the full exchange up to the first
@@ -162,6 +171,7 @@ async fn measure_head_exchange(
     runtime: &Arc<crate::runtime::NodeRuntime>,
     handler: &dyn TcpOutbound,
     host: &str,
+    target_domain: Option<&str>,
     is_https: bool,
     addr: SocketAddr,
     timeout: Duration,
@@ -170,7 +180,7 @@ async fn measure_head_exchange(
     let fut = async {
         let start = Instant::now();
         let proxy = handler
-            .dial_runtime(Arc::clone(runtime), addr, Some(host), timeout)
+            .dial_runtime(Arc::clone(runtime), addr, target_domain, timeout)
             .await?;
         tracing::debug!(node = %node.name, %addr, "urltest: dial established");
         let stream = proxy.stream;
@@ -483,6 +493,99 @@ mod tests {
             protocol: NodeProtocol::Socks5,
             ..Default::default()
         }
+    }
+
+    struct RecordingHandler {
+        target_domains: Arc<parking_lot::Mutex<Vec<Option<String>>>>,
+        client_hellos: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TcpOutbound for RecordingHandler {
+        async fn dial(
+            &self,
+            _node: &Node,
+            target: SocketAddr,
+            target_domain: Option<&str>,
+            _connect_timeout: Duration,
+        ) -> anyhow::Result<ProxyStream> {
+            self.target_domains
+                .lock()
+                .push(target_domain.map(str::to_string));
+            let (client, mut server) = tokio::io::duplex(16 * 1024);
+            let client_hellos = self.client_hellos.clone();
+            tokio::spawn(async move {
+                let mut bytes = vec![0_u8; 16 * 1024];
+                let size = server.read(&mut bytes).await.unwrap_or(0);
+                bytes.truncate(size);
+                let _ = client_hellos.send(bytes);
+            });
+            Ok(ProxyStream {
+                stream: Box::new(client),
+                target_addr: target,
+                target_domain: target_domain.map(str::to_string),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn urltest_distinguishes_domain_and_address_targets() {
+        let target_domains = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (client_hellos, mut recorded_hellos) = tokio::sync::mpsc::unbounded_channel();
+        let handler = RecordingHandler {
+            target_domains: Arc::clone(&target_domains),
+            client_hellos,
+        };
+        let node = make_node("recording");
+        let runtime = crate::runtime::NodeRuntime::ephemeral(&node);
+        let url = "https://localhost/";
+
+        let _ = urltest_node(&runtime, &handler, url, Duration::from_secs(2)).await;
+        let domain_hello = tokio::time::timeout(Duration::from_secs(1), recorded_hellos.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = urltest_node_addr(
+            &runtime,
+            &handler,
+            url,
+            "127.0.0.1:443".parse().unwrap(),
+            Duration::from_secs(2),
+        )
+        .await;
+        let address_hello = tokio::time::timeout(Duration::from_secs(1), recorded_hellos.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            *target_domains.lock(),
+            vec![Some("localhost".to_string()), None]
+        );
+        for hello in [domain_hello, address_hello] {
+            assert!(
+                hello
+                    .windows(b"localhost".len())
+                    .any(|part| part == b"localhost")
+            );
+        }
+
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let server = tokio::spawn(async move {
+            let mut request = [0_u8; 1024];
+            let size = server.read(&mut request).await.unwrap();
+            assert!(
+                request[..size]
+                    .windows(b"Host: localhost\r\n".len())
+                    .any(|part| { part == b"Host: localhost\r\n" })
+            );
+            server
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        exchange_head(&mut client, "localhost").await.unwrap();
+        server.await.unwrap();
     }
 
     /// Spawn a minimal HTTP server answering every request with 204.

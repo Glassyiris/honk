@@ -433,6 +433,21 @@ Each entry is `tag: 'url'` (a bare quoted URL is also accepted). In dae syntax t
 - Subscription nodes remain runtime-only and are never written back to the config file. Changing `store_subscribe` requires a process restart.
 - Share links inside the body are parsed by `Node::from_share_link`.
 
+Clash YAML VLESS entries map `uuid` (with legacy `password` fallback),
+`servername` (with `sni` fallback), `flow`, and `network` before deriving the
+node ID. Nested `reality-opts` maps `public-key`, `short-id`, and `spider-x`
+(default `/`) and enables the REALITY TLS carrier; nested `ws-opts` maps
+`path` plus a case-insensitive `headers.Host`, and `grpc-opts` maps
+`grpc-service-name`. Existing flat WS/gRPC aliases remain accepted. A VLESS
+entry with `reality-opts` but no non-empty `public-key` is skipped instead of
+falling back to ordinary TLS. Clash `client-fingerprint` is intentionally
+unmapped because honk selects the fingerprint process-wide.
+
+The supported VLESS transport shapes are plain/TLS/REALITY over TCP, WS, or
+gRPC, except that `xtls-rprx-vision` requires TLS or REALITY and TCP. Other
+transports and flows are parsed for visibility but are not dialed by
+`honk-tool sub`; VLESS has no UDP packet handler.
+
 ## 11. Experimental
 
 ### Clash API

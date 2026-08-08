@@ -34,19 +34,35 @@ scp target/x86_64-unknown-linux-musl/release/honk-tool vyos@<gateway>:/tmp/
 ### `sub` — subscription availability check
 
 ```bash
-honk-tool sub <url|file> [--target HOST:PORT] [--url TEST_URL]
+honk-tool sub <url|file|-> [--target HOST:PORT] [--url TEST_URL]
               [--timeout SECS] [--concurrency N] [--limit N] [--ua UA]
               [--v4-target IP:PORT] [--v6-target [IP]:PORT]
+              [--tls-implementation tls|utls] [--utls-imitate chrome_auto]
 ```
 
 Fetches a subscription (base64 / raw-line / Clash YAML, auto-detected) or
 reads a local share-link file, prints the per-protocol breakdown, then probes
 every node concurrently:
 
-Defaults follow dae's `tcp_check_url` triple: `cp.cloudflare.com:80` as the
-test host, `1.1.1.1:80` for v4 and `[2606:4700:4700::1111]:80` for v6 — so
-the family probes work even when the resolver returns no AAAA (e.g.
-`ipversion_prefer: 4`). Override with `--target/--v4-target/--v6-target`.
+Use source `-` for a credential-bearing provider URL: the command reads the
+complete stdin value, trims surrounding whitespace, and accepts exactly one
+`http`/`https` URL. This keeps the URL out of argv and command listings. Fetch
+errors and per-node failures omit URLs and endpoint details:
+
+```bash
+set +x
+printf '%s\n' "$SUBSCRIPTION_URL" | honk-tool sub - --tls-implementation utls
+```
+
+`--tls-implementation` defaults to `tls`; `utls` enables the process-wide
+Chrome ClientHello. `--utls-imitate` accepts only `chrome*` profiles and
+defaults to `chrome_auto`. Clash `client-fingerprint` remains unmapped because
+the fingerprint is process-wide, not a per-node property.
+
+Defaults use `cp.cloudflare.com:443` as the test host, `1.1.1.1:443` for v4,
+and `[2606:4700:4700::1111]:443` for v6, so the family probes work even when
+the resolver returns no AAAA. Override them with
+`--target/--v4-target/--v6-target`.
 
 - server IP families (does the node host resolve to v4/v6?),
 - proxied connectivity to the test host over **IPv4 and IPv6** — a full
@@ -54,17 +70,23 @@ the family probes work even when the resolver returns no AAAA (e.g.
 - proxied latency via `urltest_node` (default target:
   `https://www.gstatic.com/generate_204`),
 - UDP liveness: a minimal DNS A query **and** a real QUIC handshake (h3,
-  certificates skipped) through the node's `dial_udp_transport` — via the
-  reusable `quic::quic_handshake_probe` in honk-outbound, which drives quinn
-  over a custom `AsyncUdpSocket` on top of the tunnel.
+  certificates skipped) through a node's packet handler. Protocols without a
+  packet handler, including VLESS and VMess, report `n/a` rather than a
+  failure.
 
 Ends with alive-per-family counts and the median latency.
 
-**v6 shows `no-AAAA`?** The v4/v6 probes resolve the test host and pick an
-address of each family. When the resolver returns no AAAA (e.g. honk's DNS
-with `ipversion_prefer: 4`, which suppresses AAAA answers), the v6 probe
-reports `no-AAAA`. Pass explicit dae-style targets to skip DNS:
+**v6 shows `n/a`?** The family probe had no address of that family and no
+explicit target. Pass dae-style targets to skip DNS:
 `--v4-target 1.1.1.1:443 --v6-target '[2606:4700:4700::1111]:443'`.
+
+VLESS output uses only the node display name and a normalized shape such as
+`vless/reality/tcp/vision`. Invalid and intentionally unsupported feed entries
+remain visible with fixed codes (`invalid-uuid`, `invalid-reality`,
+`unsupported-transport`, `unsupported-flow`, `vision-without-tls`, or
+`vision-non-tcp`) but perform no network work. Network failures are limited to
+`resolve`, `timeout`, `exchange`, and `handler`; raw errors, proxy endpoints,
+SNI, UUIDs, REALITY keys, and URL query data are never printed.
 
 ```text
 $ honk-tool sub https://example.com/sub --limit 3
