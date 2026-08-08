@@ -76,11 +76,6 @@ pub struct GlobalConfig {
     pub check_tolerance_ms: u64,
     #[serde(default = "default_dial_mode")]
     pub dial_mode: String,
-    // lan_tcp_mss is no longer used (link-local addressing eliminates the
-    // need for iptables TCPMSS clamping).  Parsed for backward compatibility.
-    #[serde(default = "default_lan_tcp_mss")]
-    #[allow(dead_code)]
-    pub lan_tcp_mss: u16,
     #[serde(default)]
     pub allow_insecure: bool,
     #[serde(default = "default_sniffing_timeout_ms")]
@@ -139,14 +134,13 @@ fn default_tproxy_port() -> u16 {
 }
 
 /// Host CIDRs (`addr/32`, `addr/128`) for every global-scoped address on
-/// `iface`, read via `ip -o addr show dev`. The literal `auto` resolves
-/// through the default route's dev. Missing interfaces/tools yield an
-/// empty list — best effort by design.
+/// `iface`. The literal `auto` resolves through the lowest-metric IPv4
+/// default route. Missing or unresolved interfaces yield an empty list.
 fn interface_host_cidrs(iface: &str) -> Vec<String> {
     let iface = iface.trim();
     let owned;
     let iface = if iface.eq_ignore_ascii_case("auto") {
-        owned = default_route_iface().unwrap_or_default();
+        owned = default_route_interface().unwrap_or_default();
         if owned.is_empty() {
             return Vec::new();
         }
@@ -197,20 +191,38 @@ fn interface_host_cidrs(iface: &str) -> Vec<String> {
     cidrs
 }
 
-/// Interface name owning the first default route, if any
-/// (/proc/net/route — no `ip route` subprocess needed).
-fn default_route_iface() -> Option<String> {
+/// Interface owning the lowest-metric IPv4 default route.
+pub fn default_route_interface() -> Option<String> {
     let text = std::fs::read_to_string("/proc/net/route").ok()?;
+    default_route_interface_from(&text)
+}
+
+/// Parse `/proc/net/route` and select a real destination/mask-zero route.
+pub fn default_route_interface_from(text: &str) -> Option<String> {
+    let mut best: Option<(u32, String)> = None;
     for line in text.lines().skip(1) {
-        let mut tokens = line.split_whitespace();
-        let (Some(name), Some(dest)) = (tokens.next(), tokens.next()) else {
+        let mut fields = line.split_whitespace();
+        let Some(interface) = fields.next() else {
             continue;
         };
-        if dest == "00000000" {
-            return Some(name.to_string());
+        let Some(destination) = fields.next() else {
+            continue;
+        };
+        let Some(metric) = fields.nth(4) else {
+            continue;
+        };
+        let Some(mask) = fields.next() else {
+            continue;
+        };
+        if destination != "00000000" || mask != "00000000" {
+            continue;
+        }
+        let metric = metric.parse::<u32>().unwrap_or(u32::MAX);
+        if best.as_ref().is_none_or(|(current, _)| metric < *current) {
+            best = Some((metric, interface.to_string()));
         }
     }
-    None
+    best.map(|(_, interface)| interface)
 }
 
 fn default_tproxy_mark() -> u32 {
@@ -249,9 +261,6 @@ fn default_check_tolerance_ms() -> u64 {
 }
 fn default_dial_mode() -> String {
     "domain".into()
-}
-fn default_lan_tcp_mss() -> u16 {
-    0
 }
 fn default_sniffing_timeout_ms() -> u64 {
     30
@@ -310,7 +319,6 @@ impl Default for GlobalConfig {
             check_interval_secs: default_check_interval_secs(),
             check_tolerance_ms: default_check_tolerance_ms(),
             dial_mode: default_dial_mode(),
-            lan_tcp_mss: default_lan_tcp_mss(),
             allow_insecure: false,
             sniffing_timeout_ms: default_sniffing_timeout_ms(),
             tls_implementation: default_tls_impl(),
@@ -393,21 +401,9 @@ impl Config {
         }
     }
 
-    /// Inject must-direct routing rules for every address assigned to the
-    /// configured lan/wan interfaces, so traffic to the gateway itself
-    /// (admin UI, SSH, clash API) bypasses the proxy even when every node
-    /// is dead. `must` rules never finalize, so user rules can still
-    /// override; without any match these save local traffic from a
-    /// proxied fallback (and from the eBPF fail-closed drop when the
-    /// fallback outbound is down).
-    ///
-    /// Best-effort and idempotent: interfaces that cannot be read
-    /// (missing, `auto` without a default route) are skipped.
-    pub fn ensure_local_direct_rules(&mut self) {
-        const MARK: &str = "__local_direct_";
-        if self.routing.rules.iter().any(|r| r.name.starts_with(MARK)) {
-            return;
-        }
+    /// Current host CIDRs on configured LAN/WAN interfaces. Missing
+    /// interfaces and an unresolved `auto` entry are omitted.
+    pub fn local_direct_cidrs(&self) -> Vec<String> {
         let mut cidrs = Vec::new();
         for iface in &self.global.lan_interface {
             cidrs.extend(interface_host_cidrs(iface));
@@ -417,11 +413,41 @@ impl Config {
         }
         cidrs.sort();
         cidrs.dedup();
+        cidrs
+    }
+
+    /// Inject must-direct routing rules for every address assigned to the
+    /// configured lan/wan interfaces, so traffic to the gateway itself
+    /// (admin UI, SSH, clash API) bypasses the proxy even when every node
+    /// is dead. `must` rules never finalize, so user rules can still
+    /// override; without any match these save local traffic from a
+    /// proxied fallback (and from the eBPF fail-closed drop when the
+    /// fallback outbound is down).
+    ///
+    /// Best-effort and idempotent: interfaces that cannot be read
+    /// (missing, `auto` without a default route) are skipped. Returns whether
+    /// the generated address set changed.
+    pub fn ensure_local_direct_rules(&mut self) -> bool {
+        const MARK: &str = "__local_direct_";
+        let mut previous: Vec<String> = self
+            .routing
+            .rules
+            .iter()
+            .filter_map(|rule| rule.name.strip_prefix(MARK).map(str::to_owned))
+            .collect();
+        previous.sort();
+        previous.dedup();
+        self.routing
+            .rules
+            .retain(|rule| !rule.name.starts_with(MARK));
+
+        let cidrs = self.local_direct_cidrs();
+        let changed = previous != cidrs;
         for cidr in cidrs {
             self.routing.rules.push(crate::routing::RoutingRule {
                 name: format!("{MARK}{cidr}"),
                 condition: crate::routing::RoutingCondition {
-                    ip: vec![cidr.clone()],
+                    ip: vec![cidr],
                     ..Default::default()
                 },
                 outbound: crate::routing::RoutingOutbound::Simple("direct".to_string()),
@@ -430,6 +456,7 @@ impl Config {
                 mark: 0,
             });
         }
+        changed
     }
 
     pub fn from_file(path: &str) -> Result<Self, crate::ConfigError> {
@@ -714,11 +741,11 @@ mod builtin_nodes_tests {
     }
 
     #[test]
-    fn test_ensure_local_direct_rules_injects_and_is_idempotent() {
+    fn test_ensure_local_direct_rules_injects_refreshes_and_is_idempotent() {
         let mut config = Config::default();
         config.global.wan_interface =
             vec!["lo".to_string(), "definitely-not-an-iface0".to_string()];
-        config.ensure_local_direct_rules();
+        assert!(config.ensure_local_direct_rules());
 
         let injected: Vec<_> = config
             .routing
@@ -741,7 +768,18 @@ mod builtin_nodes_tests {
         );
 
         let count = config.routing.rules.len();
-        config.ensure_local_direct_rules();
+        assert!(!config.ensure_local_direct_rules());
         assert_eq!(config.routing.rules.len(), count, "must be idempotent");
+
+        config.global.wan_interface = vec!["definitely-not-an-iface0".to_string()];
+        assert!(config.ensure_local_direct_rules());
+        assert!(
+            config
+                .routing
+                .rules
+                .iter()
+                .all(|rule| !rule.name.starts_with("__local_direct_")),
+            "stale generated rules must be removed"
+        );
     }
 }

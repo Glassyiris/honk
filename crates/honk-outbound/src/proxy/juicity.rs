@@ -67,8 +67,8 @@ async fn read_udp_frame(recv: &mut quinn::RecvStream) -> io::Result<(JuiceAddr, 
 
 /// Per-QUIC-connection protocol state.
 struct JuicityConnState {
-    #[allow(dead_code)] // kept to own the connection handle
-    conn: quinn::Connection,
+    /// Owns the underlying connection for this protocol state’s lifetime.
+    _conn: quinn::Connection,
     /// Kept open for the connection lifetime — dropping it would send FIN on
     /// the authenticate stream (see module docs).
     _auth_stream: quinn::SendStream,
@@ -91,7 +91,7 @@ impl QuicConnState for JuicityConnState {
 impl JuicityConnState {
     fn new(conn: quinn::Connection, auth_stream: quinn::SendStream) -> Self {
         let state = Self {
-            conn: conn.clone(),
+            _conn: conn.clone(),
             _auth_stream: auth_stream,
             open: Arc::new(AtomicUsize::new(0)),
             last_activity: Arc::new(AtomicU64::new(now_secs())),

@@ -7,14 +7,11 @@ use honk_config::Config;
 use tokio::sync::{Mutex, Notify};
 
 use super::{
-    DnsRuntime, DnsRuntimeParts, ProcessPersistenceHandle, RoutingProjectionSnapshot,
-    RuntimeGeneration, RuntimeTransport,
+    DnsRuntime, DnsRuntimeParts, RoutingProjectionSnapshot, RuntimeGeneration, RuntimeTransport,
 };
 use crate::dns::cache::DnsCache;
 use crate::dns::forwarder::{DnsForwarder, DnsUpstreamPool};
-use crate::dns::policy::PolicyId;
 use crate::dns::routing::DnsRouter;
-use crate::group::GroupManager;
 use crate::routing::Router;
 
 struct DropSignal<'a>(&'a BlockingTransport);
@@ -68,16 +65,11 @@ fn runtime(transport: Arc<BlockingTransport>) -> Arc<DnsRuntime> {
     DnsRuntime::new(DnsRuntimeParts {
         generation: RuntimeGeneration::new(1),
         forwarder,
-        router: Arc::clone(&router),
-        group_manager: Arc::new(GroupManager::new(&config.groups, &config.nodes)),
-        policy_id: PolicyId::from_config(&config.dns).expect("valid policy"),
         routing_projection: Arc::new(RoutingProjectionSnapshot::new(
             1,
             router,
             Default::default(),
         )),
-        cache: Arc::clone(&cache),
-        persistence: ProcessPersistenceHandle::new(cache),
         outbound_runtime: None,
         transport: transport.clone(),
     })

@@ -140,14 +140,6 @@ impl ControlPlane {
                 return false;
             }
         };
-        let policy_id = match crate::dns::policy::PolicyId::from_config(&new_config.dns) {
-            Ok(policy_id) => policy_id,
-            Err(error) => {
-                error!(%error, "Failed to build DNS policy identity");
-                self.stop_reload_rejection_if_healthy(drain);
-                return false;
-            }
-        };
         let new_outbound_id_map = build_outbound_id_map(&new_config);
         let old_connectivity =
             group_connectivity_snapshot(&current_config, &old_group_manager, &self.alive_set);
@@ -180,12 +172,9 @@ impl ControlPlane {
                 .get()
                 .saturating_add(1),
         );
-        let (persistence, old_projection_snapshot) = {
+        let old_projection_snapshot = {
             let current = self.dns_controller.runtime_provider().acquire();
-            (
-                Arc::clone(current.runtime().persistence()),
-                Arc::clone(current.runtime().routing_projection()),
-            )
+            Arc::clone(current.runtime().routing_projection())
         };
         let projection_snapshot = Arc::new(crate::dns::runtime::RoutingProjectionSnapshot::new(
             generation.get(),
@@ -208,12 +197,7 @@ impl ControlPlane {
             crate::dns::runtime::DnsRuntime::new(crate::dns::runtime::DnsRuntimeParts {
                 generation,
                 forwarder: Arc::clone(&new_dns_forwarder),
-                router: Arc::clone(&pinned_router),
-                group_manager: Arc::clone(&new_group_manager),
-                policy_id,
                 routing_projection: Arc::clone(&projection_snapshot),
-                cache: self.dns_controller.cache().await,
-                persistence,
                 outbound_runtime: Some(Arc::clone(&new_runtime_registry)),
                 transport: new_upstream_pool,
             });
@@ -1649,7 +1633,7 @@ mod atomic_reload_tests {
         let expected_interval = Config::default().global.check_interval_secs + 1;
         let cp = test_cp();
         let before_runtime = cp.dns_controller.runtime_provider().acquire();
-        let persistence_id = before_runtime.runtime().persistence().identity();
+        let cache = before_runtime.runtime().cache();
         assert_eq!(
             before_runtime.runtime().routing_projection().generation(),
             0
@@ -1665,10 +1649,7 @@ mod atomic_reload_tests {
             "valid reload should swap the live config"
         );
         let after_runtime = cp.dns_controller.runtime_provider().acquire();
-        assert_eq!(
-            after_runtime.runtime().persistence().identity(),
-            persistence_id
-        );
+        assert!(Arc::ptr_eq(&after_runtime.runtime().cache(), &cache));
         assert_eq!(after_runtime.runtime().routing_projection().generation(), 1);
     }
 

@@ -88,23 +88,16 @@ pub enum SessionState {
 /// RAII stream-slot reservation on one session — the single capacity
 /// truth. Released on Drop (stream end, failed open, caller cancel).
 pub struct SessionPermit<S> {
-    session: Arc<S>,
+    _session: Arc<S>,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl<S> SessionPermit<S> {
     pub fn new(session: Arc<S>, permit: tokio::sync::OwnedSemaphorePermit) -> Self {
         Self {
-            session,
+            _session: session,
             _permit: permit,
         }
-    }
-
-    /// The session this permit reserves capacity on.
-    // Used by the typed-event/writer work (3B).
-    #[allow(dead_code)]
-    pub fn session(&self) -> &Arc<S> {
-        &self.session
     }
 }
 
@@ -199,16 +192,6 @@ pub enum OpenError {
     /// The target/protocol refused or auth failed: the session is
     /// healthy — surface immediately, never retry.
     Refused(anyhow::Error),
-}
-
-impl OpenError {
-    // Used by the typed-event mapping (3B).
-    #[allow(dead_code)]
-    pub fn into_inner(self) -> anyhow::Error {
-        match self {
-            OpenError::Session(e) | OpenError::Refused(e) => e,
-        }
-    }
 }
 
 /// A speculative checkout atomically either reserves one stream on an
@@ -316,15 +299,11 @@ impl<S> Drop for DialGuard<S> {
     }
 }
 
-/// Aggregate pool metrics (clash-API / diagnostics snapshot).
+/// Aggregate pool metrics used by behavioral tests.
+#[cfg(test)]
 #[derive(Debug, Clone, Default)]
-// Used by the clash API once pools are wired into it.
-#[allow(dead_code)]
 pub struct PoolMetrics {
-    pub keys: usize,
     pub sessions: usize,
-    pub active_streams: usize,
-    pub dial_failures: u64,
 }
 
 /// Generic session pool. Cheap to clone (shares the inner state); one
@@ -332,7 +311,6 @@ pub struct PoolMetrics {
 pub struct SessionPool<S: ManagedSession + 'static> {
     config: SessionPoolConfig,
     keys: Arc<Mutex<HashMap<String, KeyPool<S>>>>,
-    dial_failures_total: Arc<AtomicUsize>,
     state: Arc<AtomicUsize>,
     shutdown_tx: Arc<tokio::sync::watch::Sender<bool>>,
 }
@@ -351,7 +329,6 @@ impl<S: ManagedSession + 'static> Clone for SessionPool<S> {
         Self {
             config: self.config.clone(),
             keys: Arc::clone(&self.keys),
-            dial_failures_total: Arc::clone(&self.dial_failures_total),
             state: Arc::clone(&self.state),
             shutdown_tx: Arc::clone(&self.shutdown_tx),
         }
@@ -364,7 +341,6 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         Self {
             config,
             keys: Arc::new(Mutex::new(HashMap::new())),
-            dial_failures_total: Arc::new(AtomicUsize::new(0)),
             state: Arc::new(AtomicUsize::new(PoolState::Running as usize)),
             shutdown_tx: Arc::new(shutdown_tx),
         }
@@ -531,7 +507,6 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                     };
                     let task_keys = Arc::clone(&self.keys);
                     let task_key = key.to_string();
-                    let failures_total = Arc::clone(&self.dial_failures_total);
                     let task_state = Arc::clone(&self.state);
                     let config = self.config.clone();
                     let mut task_shutdown_rx = self.shutdown_tx.subscribe();
@@ -577,7 +552,6 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                                         DialSignal::Done
                                     }
                                     Ok(Err(e)) => {
-                                        failures_total.fetch_add(1, Ordering::Relaxed);
                                         pool.dial_failures += 1;
                                         let shift = pool.dial_failures.min(8) - 1;
                                         let backoff =
@@ -591,7 +565,6 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                                         ))))
                                     }
                                     Err(_panic) => {
-                                        failures_total.fetch_add(1, Ordering::Relaxed);
                                         pool.dial_failures += 1;
                                         pool.next_dial_at =
                                             Some(Instant::now() + config.dial_backoff);
@@ -773,7 +746,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
     /// its demux task holds it (and its TCP connection) open forever.
     /// Over-cap entries are transient; the janitor reaps them when idle.
     /// After shutdown the session is closed instead of inserted.
-    #[allow(dead_code)] // test pools insert externally-established sessions
+    #[cfg(test)]
     pub fn insert(&self, key: &str, session: &Arc<S>) {
         if self.state() != PoolState::Running {
             session.close();
@@ -793,19 +766,11 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
     }
 
     /// Current metrics snapshot across all keys.
-    // Used by the clash API once pools are wired into it.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn metrics(&self) -> PoolMetrics {
         let keys = self.keys.lock();
         PoolMetrics {
-            keys: keys.len(),
-            sessions: keys.values().map(|p| p.sessions.len()).sum(),
-            active_streams: keys
-                .values()
-                .flat_map(|p| p.sessions.iter())
-                .map(|s| s.active_streams())
-                .sum(),
-            dial_failures: self.dial_failures_total.load(Ordering::Relaxed) as u64,
+            sessions: keys.values().map(|pool| pool.sessions.len()).sum(),
         }
     }
 
@@ -914,7 +879,6 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
     /// fresh session and is only called when below `min_idle`.
     /// `min_idle`/`idle_timeout` are per-key (node-level policies, e.g.
     /// AnyTLS's node fields).
-    #[allow(dead_code)]
     pub fn ensure_janitor<F, Fut>(
         self: &Arc<Self>,
         key: &str,

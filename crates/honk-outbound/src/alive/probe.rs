@@ -476,12 +476,59 @@ impl AliveDialerSet {
         self.run_health_check_cycle_concurrent(timeout, 1).await;
     }
 
+    /// Probe only dead protocol families whose exponential backoff elapsed.
+    /// This runs between full configured health cycles so a long check
+    /// interval cannot turn a transient uplink outage into a long lockout.
+    pub(super) async fn run_recovery_check_cycle_concurrent(
+        self: &Arc<Self>,
+        timeout: Duration,
+        concurrency: usize,
+    ) {
+        let nodes: Vec<Uuid> = self.registered.read().keys().copied().collect();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
+        let mut join_set = tokio::task::JoinSet::new();
+
+        for id in nodes {
+            if self.is_probe_suspended(id) {
+                continue;
+            }
+            let tcp_due = [IpVersion::V4, IpVersion::V6].into_iter().any(|ipver| {
+                !self.is_alive_for(id, ProbeDomain::Tcp, ipver)
+                    && self.should_probe(id, ProbeDomain::Tcp, ipver)
+            });
+            let udp_due = [ProbeDomain::DataUdp, ProbeDomain::DnsUdp]
+                .into_iter()
+                .any(|domain| {
+                    [IpVersion::V4, IpVersion::V6].into_iter().any(|ipver| {
+                        !self.is_alive_for(id, domain, ipver)
+                            && self.should_probe(id, domain, ipver)
+                    })
+                });
+            if !tcp_due && !udp_due {
+                continue;
+            }
+            let this = self.clone();
+            let permit = semaphore.clone();
+            join_set.spawn(async move {
+                let _permit = permit.acquire().await;
+                if tcp_due {
+                    this.probe_node(id, timeout).await;
+                }
+                if udp_due {
+                    this.probe_node_udp(id, timeout).await;
+                }
+            });
+        }
+
+        while join_set.join_next().await.is_some() {}
+    }
+
     /// Run health check cycle with concurrent probing.
     ///
     /// Uses a `JoinSet` with a semaphore to limit concurrency (default 10,
-    /// matching sing-box).  Nodes in backoff cooldown are skipped; stopped
-    /// nodes (deep backoff) probe on their slow max_cooldown cadence.  Emergency probes triggered via `trigger_probe` bypass
-    /// the semaphore and are handled separately.
+    /// matching sing-box). Nodes in backoff are skipped; the recovery runner
+    /// revisits due dead nodes between full cycles. Emergency probes triggered
+    /// via `trigger_probe` use their own bounded worker set.
     pub async fn run_health_check_cycle_concurrent(
         self: &Arc<Self>,
         timeout: Duration,
@@ -591,9 +638,9 @@ impl AliveDialerSet {
         self.spawn_health_check_loop_concurrent(interval, timeout, 10)
     }
 
-    /// Spawn periodic and emergency probes through one bounded worker pool.
-    /// Triggered work is node-deduplicated by `AliveDialerSet`, and periodic
-    /// cycles remain independent so a trigger storm cannot serialize them.
+    /// Spawn periodic, recovery, and emergency probes through bounded worker
+    /// pools. Triggered work is node-deduplicated; full periodic cycles and
+    /// dead-node recovery checks remain independently scheduled.
     pub fn spawn_health_check_loop_concurrent(
         self: &Arc<Self>,
         interval: Duration,
@@ -618,6 +665,13 @@ impl AliveDialerSet {
 
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let recovery_interval = std::cmp::max(
+                std::cmp::min(interval, this.base_cooldown),
+                Duration::from_secs(1),
+            );
+            let mut recovery_ticker = tokio::time::interval(recovery_interval);
+            recovery_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            recovery_ticker.tick().await;
             loop {
                 tokio::select! {
                     biased;
@@ -650,6 +704,9 @@ impl AliveDialerSet {
                     }
                     _ = ticker.tick() => {
                         this.run_health_check_cycle_concurrent(timeout, concurrency).await;
+                    }
+                    _ = recovery_ticker.tick() => {
+                        this.run_recovery_check_cycle_concurrent(timeout, concurrency).await;
                     }
                 }
             }

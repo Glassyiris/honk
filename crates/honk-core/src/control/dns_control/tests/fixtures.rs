@@ -155,12 +155,7 @@ pub(super) async fn publish_snapshot_forwarder(
             current.runtime().generation().get().saturating_add(1),
         ),
         forwarder: Arc::clone(&forwarder),
-        router: Arc::clone(current.runtime().router()),
-        group_manager: Arc::clone(current.runtime().group_manager()),
-        policy_id: current.runtime().policy_id().clone(),
         routing_projection: Arc::clone(current.runtime().routing_projection()),
-        cache: forwarder.cache(),
-        persistence: Arc::clone(current.runtime().persistence()),
         outbound_runtime: None,
         transport: Arc::new(NoopRuntimeTransport),
     });

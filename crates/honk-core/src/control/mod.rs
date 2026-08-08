@@ -24,7 +24,7 @@ use crate::dns::DnsResolver;
 use crate::ebpf::EbpfBackend;
 use crate::ebpf::maps::cidr_to_lpm_key;
 use crate::group::{GroupManager, SharedGroupManager};
-use crate::pool::ConnectionPool;
+use crate::pool::{ConnectionPool, is_tcp_stream_alive};
 use crate::proxy::ProxyRegistry;
 use crate::relay;
 use crate::routing::{ConnectionInfo, Router};
@@ -81,6 +81,9 @@ pub mod commands {
             name: String,
             nodes: Vec<Node>,
         },
+        /// Refresh generated gateway-address rules and bypass stale health
+        /// backoff after a link, address, route, or interface-role change.
+        NetworkChanged,
         Shutdown,
         GetStats(mpsc::Sender<super::StatsSnapshot>),
     }
@@ -395,13 +398,11 @@ impl ControlPlane {
         let pinned_groups = group_manager.read().clone();
         dns_upstream_pool.set_group_manager_snapshot(Arc::clone(&pinned_groups));
         dns_upstream_pool.set_traffic_router_snapshot(Arc::clone(&pinned_router));
-        let policy_id = crate::dns::policy::PolicyId::from_config(&config.dns)?;
         let initial_routing_plan = Arc::new(Self::compile_routing_plan(&config, &router)?);
         let initial_push_result = initial_routing_plan.result();
         let direct_offload_static = Arc::new(std::sync::atomic::AtomicU32::new(
             direct_offload_static_bit(&config, &initial_routing_plan),
         ));
-        let persistence = crate::dns::runtime::ProcessPersistenceHandle::new(dns_forwarder.cache());
         let ebpf_arc = Arc::new(RwLock::new(ebpf));
         let router_arc = Arc::new(RwLock::new(router));
         let config_arc = Arc::new(RwLock::new(config));
@@ -409,16 +410,11 @@ impl ControlPlane {
             crate::dns::runtime::DnsRuntime::new(crate::dns::runtime::DnsRuntimeParts {
                 generation: crate::dns::runtime::RuntimeGeneration::new(0),
                 forwarder: dns_forwarder.clone(),
-                router: Arc::clone(&pinned_router),
-                group_manager: pinned_groups,
-                policy_id,
                 routing_projection: Arc::new(crate::dns::runtime::RoutingProjectionSnapshot::new(
                     0,
                     pinned_router,
                     initial_push_result.domain_bitmaps,
                 )),
-                cache: dns_forwarder.cache(),
-                persistence,
                 outbound_runtime: Some(outbound_runtime),
                 transport: dns_upstream_pool,
             });
@@ -1202,7 +1198,7 @@ impl ControlPlane {
                     match accept_result {
                         Ok((stream, addr)) => {
                             debug!("Accepted TPROXY TCPv4 connection from {}", addr);
-                            if let Err(e) = set_so_mark_zero(stream.as_raw_fd()) {
+                            if let Err(e) = set_so_mark_zero(&stream) {
                                 warn!("Failed to clear SO_MARK on accepted socket from {}: {}", addr, e);
                             }
                             if !accepts_transparent_connection(&drain) {
@@ -1253,7 +1249,7 @@ impl ControlPlane {
                     match accept6_result {
                         Ok((stream, addr)) => {
                             debug!("Accepted TPROXY TCPv6 connection from {}", addr);
-                            if let Err(e) = set_so_mark_zero(stream.as_raw_fd()) {
+                            if let Err(e) = set_so_mark_zero(&stream) {
                                 warn!("Failed to clear SO_MARK on accepted socket from {}: {}", addr, e);
                             }
                             if !accepts_transparent_connection(&drain) {
@@ -1309,6 +1305,20 @@ impl ControlPlane {
                             // Same serialized rebuild path as ReloadConfig —
                             // both commands queue on this single channel.
                             let _ = self.apply_runtime_config(new_config, &drain).await;
+                        }
+                        Some(ControlCommand::NetworkChanged) => {
+                            let new_config = {
+                                let current = self.config.read().await;
+                                let mut next = current.clone();
+                                next.ensure_local_direct_rules().then_some(next)
+                            };
+                            if let Some(new_config) = new_config {
+                                info!("refreshing local direct rules after network change");
+                                if !self.apply_runtime_config(new_config, &drain).await {
+                                    warn!("network-triggered routing refresh rejected");
+                                }
+                            }
+                            self.alive_set.notify_network_change();
                         }
                         Some(ControlCommand::GetStats(tx)) => {
                             let snap = self.stats.snapshot();

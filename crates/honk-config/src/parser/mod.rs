@@ -777,9 +777,6 @@ fn parse_global_section(section: &Section) -> Result<GlobalConfig, crate::Config
     if let Some(v) = kv.get("dial_mode") {
         cfg.dial_mode = v.clone();
     }
-    if let Some(v) = kv.get("lan_tcp_mss") {
-        cfg.lan_tcp_mss = v.parse().unwrap_or(0);
-    }
     if let Some(v) = kv.get("allow_insecure") {
         cfg.allow_insecure = parse_bool(v);
     }

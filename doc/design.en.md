@@ -91,7 +91,7 @@ flowchart TB
 
 ### Packet walk (simplified)
 
-1. **TC ingress** on each `lan_interface` classifies forwarded client traffic; independently, **TC egress** on each `wan_interface` classifies host-originated TCP/UDP. Omitting `lan_interface` installs only the WAN path.
+1. **TC ingress** on each `lan_interface` classifies forwarded client traffic; independently, **TC egress** on each `wan_interface` classifies host-originated TCP/UDP. Omitting `lan_interface` installs only the WAN path. An unresolved `auto` entry remains unattached and fail-open; rtnetlink link/address/route events re-resolve it and install the correct dual- or single-homed program pair without a restart, republish the generated gateway-address `direct(must)` rules through the runtime configuration pipeline, and immediately re-probe outbounds whose health backoff may reflect the old network state.
 2. DNS to port 53 takes a **fast path** (skip expensive match loop) and is redirected to the control plane.
 3. Outcomes:
    - `direct + must` → leave on host stack (no redirect), in every mode.
@@ -307,7 +307,7 @@ Nested groups (`groups` field) flatten recursively (depth ≤ 8) to a single lea
 ### Health (`AliveDialerSet`)
 
 - Per-node states: TCP / DnsUDP / DataUDP × v4/v6
-- Concurrent probes (default batch 10), recovery hysteresis, grace period, exponential backoff (deep-backoff nodes keep probing on the slow max-cooldown cadence — never a full stop)
+- Concurrent probes (default batch 10), recovery hysteresis, grace period, and 5s→300s exponential backoff; a separate `min(5s, check_interval)` scheduler considers only due dead TCP/UDP families, so a long normal interval cannot lock out recovery (deep-backoff nodes still probe only at max-cooldown)
 - TCP: HTTP HEAD or raw connect; UDP: DNS query through the node’s own `dial_udp_transport`
 - Pushes connectivity into eBPF so dead outbounds are not redirected
 

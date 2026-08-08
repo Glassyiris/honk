@@ -9,6 +9,8 @@
 //! [`UdpProber`] is installed): a DNS exchange through the node's own UDP
 //! data path whose result drives both UDP domains — catching nodes with
 //! healthy TCP but broken UDP (e.g. an AnyTLS server without UoT).
+//! Due dead TCP/UDP states are retried between full cycles on the same
+//! exponential schedule, independent of a long configured check interval.
 //!
 //! Go reference: `component/outbound/dialer/dialer.go`, `connectivity_check.go`
 
@@ -301,9 +303,6 @@ pub struct AliveDialerSet {
     registered: RwLock<HashMap<Uuid, RegisteredNode>>,
     ebpf_callback: RwLock<Option<EbpfAliveCallback>>,
     death_callback: RwLock<Option<DeathCallback>>,
-    /// Deprecated: per-protocol thresholds are now used via probe_failure_threshold/traffic_failure_threshold.
-    #[allow(dead_code)]
-    failure_threshold: u32,
     base_cooldown: Duration,
     max_cooldown: Duration,
     /// Bounded node-deduplicated emergency probe queue. A pending node owns
@@ -391,7 +390,6 @@ impl AliveDialerSet {
             ebpf_callback: RwLock::new(None),
             death_callback: RwLock::new(None),
             resolver: RwLock::new(None),
-            failure_threshold: 3,
             base_cooldown: Duration::from_secs(5),
             max_cooldown: Duration::from_secs(300),
             trigger_tx: tx,
@@ -623,7 +621,7 @@ impl AliveDialerSet {
         self.states.read().values().filter(|s| s[idx].alive).count()
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn mark_alive_for(&self, node_id: Uuid, domain: ProbeDomain, ipver: IpVersion) {
         self.mark_alive_for_latency(node_id, domain, ipver, Duration::ZERO);
     }
@@ -1074,6 +1072,32 @@ impl AliveDialerSet {
         self.node_urltest_groups.write().remove(&node_id);
         let mut history = self.probe_history.write();
         history.retain(|(id, _), _| *id != node_id);
+    }
+
+    /// A link/address/route change invalidates probe backoff that may have
+    /// been accumulated while the host had no usable uplink. Keep nodes
+    /// fail-closed until a fresh probe succeeds, but let that verified
+    /// success satisfy the recovery hysteresis immediately.
+    pub fn notify_network_change(&self) {
+        let node_ids: Vec<Uuid> = self.registered.read().keys().copied().collect();
+        let now = Instant::now();
+        {
+            let mut states = self.states.write();
+            for node_id in &node_ids {
+                let Some(protocol_states) = states.get_mut(node_id) else {
+                    continue;
+                };
+                for state in protocol_states {
+                    state.cooldown_until = now;
+                    if !state.alive {
+                        state.consecutive_successes = RECOVERY_SUCCESSES_NEEDED - 1;
+                    }
+                }
+            }
+        }
+        for node_id in node_ids {
+            self.trigger_probe(node_id);
+        }
     }
 
     pub fn trigger_probe(&self, node_id: Uuid) {

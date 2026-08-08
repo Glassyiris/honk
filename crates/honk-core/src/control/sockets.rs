@@ -2,13 +2,15 @@ use super::*;
 use crate::dns::wire::extract_ips_from_dns_response;
 
 #[cfg(target_os = "linux")]
-const IPV6_TRANSPARENT_OPT: libc::c_int = libc::IPV6_TRANSPARENT;
-#[cfg(target_os = "linux")]
-const IPV6_RECVORIGDSTADDR_OPT: libc::c_int = 74;
-#[cfg(target_os = "linux")]
 const IPV6_ORIGDSTADDR_OPT: libc::c_int = 74;
 #[cfg(target_os = "linux")]
-const IP6T_SO_ORIGINAL_DST_OPT: libc::c_int = 80;
+fn set_ip_transparent(socket: &Socket, is_v6: bool) -> io::Result<()> {
+    if is_v6 {
+        socket.set_ip_transparent_v6(true)
+    } else {
+        socket.set_ip_transparent_v4(true)
+    }
+}
 
 /// Bind the transparent TCP TPROXY listener.
 ///
@@ -54,45 +56,13 @@ fn build_tproxy_tcp(addr: SocketAddr) -> anyhow::Result<TcpListener> {
     }
 
     #[cfg(target_os = "linux")]
-    unsafe {
-        let fd = socket.as_raw_fd();
-        let one: libc::c_int = 1;
-        if addr.is_ipv4() {
-            let ret = libc::setsockopt(
-                fd,
-                libc::SOL_IP,
-                libc::IP_TRANSPARENT,
-                &one as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&one) as libc::socklen_t,
-            );
-            if ret != 0 {
-                anyhow::bail!(
-                    "setsockopt(IP_TRANSPARENT): {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-        } else {
-            let ret = libc::setsockopt(
-                fd,
-                libc::SOL_IPV6,
-                IPV6_TRANSPARENT_OPT,
-                &one as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&one) as libc::socklen_t,
-            );
-            if ret != 0 {
-                anyhow::bail!(
-                    "setsockopt(IPV6_TRANSPARENT): {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-        }
-    }
+    set_ip_transparent(&socket, addr.is_ipv6())?;
 
     // Same identification mark as the UDP listeners: established-flow TCP
     // probes must not mistake the TPROXY listener for a local service.
     // Accepted sockets inherit the mark; the accept loop clears it.
     #[cfg(target_os = "linux")]
-    set_so_mark(socket.as_raw_fd(), honk_ebpf_common::DAE_BYPASS_MARK)?;
+    set_so_mark(&socket, honk_ebpf_common::DAE_BYPASS_MARK)?;
 
     socket.bind(&addr.into())?;
     socket.listen(128)?;
@@ -102,7 +72,7 @@ fn build_tproxy_tcp(addr: SocketAddr) -> anyhow::Result<TcpListener> {
 
 /// Clear the packet mark on a socket so that locally generated replies are
 /// routed through the ordinary routing table, not the TPROXY policy route.
-pub(super) fn set_so_mark_zero(fd: RawFd) -> io::Result<()> {
+pub(super) fn set_so_mark_zero(fd: &impl std::os::fd::AsFd) -> io::Result<()> {
     set_so_mark(fd, 0)
 }
 
@@ -111,25 +81,13 @@ pub(super) fn set_so_mark_zero(fd: RawFd) -> io::Result<()> {
 /// `PARAM.dae_socket_mark`) recognizes them as proxy-engine sockets instead
 /// of misreading them as local services to pass through.
 #[cfg(target_os = "linux")]
-pub(super) fn set_so_mark(fd: RawFd, mark: u32) -> io::Result<()> {
-    unsafe {
-        let mark: libc::c_uint = mark;
-        let ret = libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_MARK,
-            &mark as *const _ as *const libc::c_void,
-            std::mem::size_of_val(&mark) as libc::socklen_t,
-        );
-        if ret != 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    Ok(())
+pub(super) fn set_so_mark(fd: &impl std::os::fd::AsFd, mark: u32) -> io::Result<()> {
+    nix::sys::socket::setsockopt(fd, nix::sys::socket::sockopt::Mark, &mark)
+        .map_err(io::Error::from)
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(super) fn set_so_mark(_fd: RawFd, _mark: u32) -> io::Result<()> {
+pub(super) fn set_so_mark(_fd: &impl std::os::fd::AsFd, _mark: u32) -> io::Result<()> {
     Ok(())
 }
 
@@ -190,101 +148,35 @@ fn build_tproxy_udp(addr: SocketAddr, reuse_port: bool) -> anyhow::Result<UdpSoc
     let _ = socket.set_recv_buffer_size(8 << 20);
 
     #[cfg(target_os = "linux")]
-    unsafe {
-        let fd = socket.as_raw_fd();
-        let one: libc::c_int = 1;
+    {
+        set_ip_transparent(&socket, addr.is_ipv6())?;
         if addr.is_ipv4() {
-            let ret = libc::setsockopt(
-                fd,
-                libc::SOL_IP,
-                libc::IP_TRANSPARENT,
-                &one as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&one) as libc::socklen_t,
-            );
-            if ret != 0 {
-                anyhow::bail!(
-                    "setsockopt(IP_TRANSPARENT): {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-            // IP_RECVORIGDSTADDR is required to retrieve the original destination
-            // of TPROXY UDP datagrams (the eBPF path replaces the destination with
-            // the local tproxy listener address).
-            let ret = libc::setsockopt(
-                fd,
-                libc::IPPROTO_IP,
-                libc::IP_RECVORIGDSTADDR,
-                &one as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&one) as libc::socklen_t,
-            );
-            if ret != 0 {
-                anyhow::bail!(
-                    "setsockopt(IP_RECVORIGDSTADDR): {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-            // Preserve the address in the packet header when ORIGDST is not
-            // available, so only an exact DNS query can reconstruct :53.
-            let ret = libc::setsockopt(
-                fd,
-                libc::IPPROTO_IP,
-                libc::IP_PKTINFO,
-                &one as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&one) as libc::socklen_t,
-            );
-            if ret != 0 {
-                anyhow::bail!(
-                    "setsockopt(IP_PKTINFO): {}",
-                    std::io::Error::last_os_error()
-                );
-            }
+            // Preserve both authoritative ORIGDST and packet-header fallback.
+            nix::sys::socket::setsockopt(
+                &socket,
+                nix::sys::socket::sockopt::Ipv4OrigDstAddr,
+                &true,
+            )
+            .map_err(io::Error::from)?;
+            nix::sys::socket::setsockopt(&socket, nix::sys::socket::sockopt::Ipv4PacketInfo, &true)
+                .map_err(io::Error::from)?;
         } else {
-            let ret = libc::setsockopt(
-                fd,
-                libc::SOL_IPV6,
-                IPV6_TRANSPARENT_OPT,
-                &one as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&one) as libc::socklen_t,
-            );
-            if ret != 0 {
-                anyhow::bail!(
-                    "setsockopt(IPV6_TRANSPARENT): {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-            let ret = libc::setsockopt(
-                fd,
-                libc::SOL_IPV6,
-                IPV6_RECVORIGDSTADDR_OPT,
-                &one as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&one) as libc::socklen_t,
-            );
-            if ret != 0 {
-                anyhow::bail!(
-                    "setsockopt(IPV6_RECVORIGDSTADDR): {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-            // IPv6 mirrors IPv4's IP_PKTINFO provenance fallback.
-            let ret = libc::setsockopt(
-                fd,
-                libc::IPPROTO_IPV6,
-                libc::IPV6_RECVPKTINFO,
-                &one as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&one) as libc::socklen_t,
-            );
-            if ret != 0 {
-                anyhow::bail!(
-                    "setsockopt(IPV6_RECVPKTINFO): {}",
-                    std::io::Error::last_os_error()
-                );
-            }
+            nix::sys::socket::setsockopt(
+                &socket,
+                nix::sys::socket::sockopt::Ipv6OrigDstAddr,
+                &true,
+            )
+            .map_err(io::Error::from)?;
+            nix::sys::socket::setsockopt(
+                &socket,
+                nix::sys::socket::sockopt::Ipv6RecvPacketInfo,
+                &true,
+            )
+            .map_err(io::Error::from)?;
         }
-        // The listener never originates replies (those go through dedicated
-        // reply sockets), so the mark costs nothing; it is what lets the
-        // eBPF NAT-loopback UDP probe tell this socket apart from a local
-        // service (an unmarked listener would be passed through directly).
-        set_so_mark(socket.as_raw_fd(), honk_ebpf_common::DAE_BYPASS_MARK)?;
+        // The listener never sends replies; the mark identifies it to the
+        // eBPF NAT-loopback socket probe as an engine-owned listener.
+        set_so_mark(&socket, honk_ebpf_common::DAE_BYPASS_MARK)?;
     }
 
     socket.bind(&addr.into())?;
@@ -393,33 +285,7 @@ fn build_udp_reply_socket(original_dst: SocketAddr) -> io::Result<UdpSocket> {
     socket.set_reuse_address(true)?;
 
     #[cfg(target_os = "linux")]
-    unsafe {
-        let fd = socket.as_raw_fd();
-        let one: libc::c_int = 1;
-        if original_dst.is_ipv4() {
-            let ret = libc::setsockopt(
-                fd,
-                libc::SOL_IP,
-                libc::IP_TRANSPARENT,
-                &one as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&one) as libc::socklen_t,
-            );
-            if ret != 0 {
-                return Err(io::Error::last_os_error());
-            }
-        } else {
-            let ret = libc::setsockopt(
-                fd,
-                libc::SOL_IPV6,
-                IPV6_TRANSPARENT_OPT,
-                &one as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&one) as libc::socklen_t,
-            );
-            if ret != 0 {
-                return Err(io::Error::last_os_error());
-            }
-        }
-    }
+    set_ip_transparent(&socket, original_dst.is_ipv6())?;
 
     socket.bind(&original_dst.into())?;
     UdpSocket::from_std(socket.into())
@@ -488,25 +354,7 @@ fn build_dns_reply_socket(is_v6: bool) -> io::Result<UdpSocket> {
         socket.set_only_v6(true)?;
     }
 
-    unsafe {
-        let fd = socket.as_raw_fd();
-        let one: libc::c_int = 1;
-        let (level, opt) = if is_v6 {
-            (libc::SOL_IPV6, IPV6_TRANSPARENT_OPT)
-        } else {
-            (libc::SOL_IP, libc::IP_TRANSPARENT)
-        };
-        let ret = libc::setsockopt(
-            fd,
-            level,
-            opt,
-            &one as *const _ as *const libc::c_void,
-            std::mem::size_of_val(&one) as libc::socklen_t,
-        );
-        if ret != 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
+    set_ip_transparent(&socket, is_v6)?;
 
     let bind_addr = if is_v6 {
         SocketAddr::new(
@@ -1045,60 +893,24 @@ fn sockaddr_to_std(addr: &libc::sockaddr_storage, len: libc::socklen_t) -> io::R
 }
 
 pub(super) fn get_original_dst(stream: &TcpStream) -> anyhow::Result<SocketAddr> {
-    use std::os::unix::io::AsRawFd;
-    let fd = stream.as_raw_fd();
-
     #[cfg(target_os = "linux")]
-    unsafe {
-        let mut ss: libc::sockaddr_storage = std::mem::zeroed();
-        let mut ss_len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-        if libc::getsockname(fd, &mut ss as *mut _ as *mut libc::sockaddr, &mut ss_len) < 0 {
-            anyhow::bail!("getsockname: {}", std::io::Error::last_os_error());
-        }
-
-        if ss.ss_family as libc::c_int == libc::AF_INET {
-            let mut addr: libc::sockaddr_in = std::mem::zeroed();
-            let mut addr_len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-            let ret = libc::getsockopt(
-                fd,
-                libc::SOL_IP,
-                libc::SO_ORIGINAL_DST,
-                &mut addr as *mut _ as *mut libc::c_void,
-                &mut addr_len,
-            );
-            if ret != 0 {
-                anyhow::bail!(
-                    "getsockopt(SO_ORIGINAL_DST): {}",
-                    std::io::Error::last_os_error()
-                );
-            }
+    {
+        if stream.local_addr()?.is_ipv4() {
+            let addr = nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::OriginalDst)
+                .map_err(|error| anyhow::anyhow!("getsockopt(SO_ORIGINAL_DST): {error}"))?;
             let ip = std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
             let port = u16::from_be(addr.sin_port);
-            return Ok(SocketAddr::new(std::net::IpAddr::V4(ip), port));
+            Ok(SocketAddr::new(std::net::IpAddr::V4(ip), port))
+        } else {
+            let addr =
+                nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::Ip6tOriginalDst)
+                    .map_err(|error| {
+                        anyhow::anyhow!("getsockopt(IP6T_SO_ORIGINAL_DST): {error}")
+                    })?;
+            let ip = std::net::Ipv6Addr::from(addr.sin6_addr.s6_addr);
+            let port = u16::from_be(addr.sin6_port);
+            Ok(SocketAddr::new(std::net::IpAddr::V6(ip), port))
         }
-
-        if ss.ss_family as libc::c_int == libc::AF_INET6 {
-            let mut addr6: libc::sockaddr_in6 = std::mem::zeroed();
-            let mut addr6_len = std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
-            let ret = libc::getsockopt(
-                fd,
-                libc::SOL_IPV6,
-                IP6T_SO_ORIGINAL_DST_OPT,
-                &mut addr6 as *mut _ as *mut libc::c_void,
-                &mut addr6_len,
-            );
-            if ret != 0 {
-                anyhow::bail!(
-                    "getsockopt(IP6T_SO_ORIGINAL_DST): {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-            let ip = std::net::Ipv6Addr::from(addr6.sin6_addr.s6_addr);
-            let port = u16::from_be(addr6.sin6_port);
-            return Ok(SocketAddr::new(std::net::IpAddr::V6(ip), port));
-        }
-
-        anyhow::bail!("unsupported socket address family {}", ss.ss_family)
     }
 
     #[cfg(not(target_os = "linux"))]

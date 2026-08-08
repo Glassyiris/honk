@@ -15,8 +15,6 @@
 use crate::dns::forwarder::DnsForwarder;
 use crate::ebpf::EbpfBackend;
 #[cfg(test)]
-use crate::group::GroupManager;
-#[cfg(test)]
 use crate::routing::Router;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -71,23 +69,11 @@ impl DnsController {
         let runtime = crate::dns::runtime::DnsRuntime::new(crate::dns::runtime::DnsRuntimeParts {
             generation: crate::dns::runtime::RuntimeGeneration::new(0),
             forwarder: Arc::clone(&forwarder),
-            router: Arc::clone(&runtime_router),
-            group_manager: Arc::new(GroupManager::new(&config.groups, &config.nodes)),
-            policy_id: crate::dns::policy::PolicyId::from_config(&config.dns).unwrap_or_else(
-                |_| {
-                    crate::dns::policy::PolicyId::from_config(
-                        &honk_config::dns::DnsConfig::default(),
-                    )
-                    .unwrap()
-                },
-            ),
             routing_projection: Arc::new(crate::dns::runtime::RoutingProjectionSnapshot::new(
                 0,
                 runtime_router,
                 std::collections::HashMap::new(),
             )),
-            cache: forwarder.cache(),
-            persistence: crate::dns::runtime::ProcessPersistenceHandle::new(forwarder.cache()),
             outbound_runtime: None,
             transport: Arc::new(NoopRuntimeTransport),
         });

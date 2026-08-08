@@ -14,10 +14,8 @@ use super::projection::{ProjectionReplacementBenchmark, RoutingProjectionSnapsho
 use super::query::{IngressProfile, QueryContext};
 use super::routing::DnsRouter;
 use super::runtime::{
-    DnsRuntime, DnsRuntimeParts, DnsServiceProvider, ProcessPersistenceHandle, RuntimeGeneration,
-    RuntimeTransport,
+    DnsRuntime, DnsRuntimeParts, DnsServiceProvider, RuntimeGeneration, RuntimeTransport,
 };
-use crate::group::GroupManager;
 use crate::routing::Router;
 
 pub struct CacheKeyBenchmarkInput {
@@ -110,10 +108,6 @@ pub struct RuntimeBenchmark {
 struct RuntimeShared {
     forwarder: Arc<DnsForwarder>,
     router: Arc<Router>,
-    group_manager: Arc<GroupManager>,
-    policy_id: PolicyId,
-    cache: Arc<Mutex<DnsCache>>,
-    persistence: Arc<ProcessPersistenceHandle>,
 }
 
 impl RuntimeBenchmark {
@@ -132,10 +126,6 @@ impl RuntimeBenchmark {
                 Router::new(&config.routing.rules, &config.routing.default_outbound)
                     .expect("benchmark router"),
             ),
-            group_manager: Arc::new(GroupManager::new(&config.groups, &config.nodes)),
-            policy_id: PolicyId::from_config(&config.dns).expect("benchmark policy"),
-            persistence: ProcessPersistenceHandle::new(Arc::clone(&cache)),
-            cache,
         };
         let initial = runtime(&shared, 1);
         Self {
@@ -182,16 +172,11 @@ fn runtime(shared: &RuntimeShared, generation: u64) -> Arc<DnsRuntime> {
     DnsRuntime::new(DnsRuntimeParts {
         generation: RuntimeGeneration::new(generation),
         forwarder: Arc::clone(&shared.forwarder),
-        router: Arc::clone(&shared.router),
-        group_manager: Arc::clone(&shared.group_manager),
-        policy_id: shared.policy_id.clone(),
         routing_projection: Arc::new(RoutingProjectionSnapshot::new(
             generation,
             Arc::clone(&shared.router),
             Default::default(),
         )),
-        cache: Arc::clone(&shared.cache),
-        persistence: Arc::clone(&shared.persistence),
         outbound_runtime: None,
         transport: Arc::new(NoopTransport),
     })

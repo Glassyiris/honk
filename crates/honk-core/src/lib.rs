@@ -37,43 +37,33 @@ use tracing::{info, warn};
 /// Raise the soft descriptor limit toward the hard maximum, then return the
 /// one startup snapshot used to size every control-plane descriptor owner.
 fn raise_nofile_rlimit() -> anyhow::Result<usize> {
-    use std::io::Error;
+    use nix::sys::resource::{RLIM_INFINITY, Resource, getrlimit, setrlimit};
 
-    let mut limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
-        anyhow::bail!("getrlimit(RLIMIT_NOFILE): {}", Error::last_os_error());
-    }
-
-    let original_soft = limit.rlim_cur;
-    let desired_soft = if limit.rlim_max == libc::RLIM_INFINITY {
+    let (original_soft, hard) = getrlimit(Resource::RLIMIT_NOFILE)
+        .map_err(|error| anyhow::anyhow!("getrlimit(RLIMIT_NOFILE): {error}"))?;
+    let desired_soft = if hard == RLIM_INFINITY {
         1_048_576
     } else {
-        limit.rlim_max
+        hard
     };
     let active_soft = if original_soft < desired_soft {
-        limit.rlim_cur = desired_soft;
-        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } == 0 {
-            info!(
-                "Raised NOFILE rlimit to {} (hard={})",
-                desired_soft, limit.rlim_max
-            );
-            desired_soft
-        } else {
-            warn!(
-                "Failed to raise NOFILE rlimit to {}: {}; using soft limit {}",
-                desired_soft,
-                Error::last_os_error(),
+        match setrlimit(Resource::RLIMIT_NOFILE, desired_soft, hard) {
+            Ok(()) => {
+                info!("Raised NOFILE rlimit to {} (hard={})", desired_soft, hard);
+                desired_soft
+            }
+            Err(error) => {
+                warn!(
+                    "Failed to raise NOFILE rlimit to {}: {}; using soft limit {}",
+                    desired_soft, error, original_soft
+                );
                 original_soft
-            );
-            original_soft
+            }
         }
     } else {
         info!(
             "NOFILE rlimit already {} (soft) / {} (hard)",
-            original_soft, limit.rlim_max
+            original_soft, hard
         );
         original_soft
     };
@@ -93,18 +83,15 @@ pub(crate) struct ConfiguredInterfaces {
 
 #[cfg(feature = "ebpf")]
 pub(crate) fn configured_interfaces(config: &honk_config::Config) -> ConfiguredInterfaces {
-    let lan: Vec<String> = config
-        .global
-        .lan_interface
-        .iter()
-        .map(|name| resolve_interface(name))
-        .collect();
-    let wan: Vec<String> = config
-        .global
-        .wan_interface
-        .iter()
-        .map(|name| resolve_interface(name))
-        .collect();
+    let default_interface = detect_default_interface();
+    let lan = resolve_configured_interface_names(
+        &config.global.lan_interface,
+        default_interface.as_deref(),
+    );
+    let wan = resolve_configured_interface_names(
+        &config.global.wan_interface,
+        default_interface.as_deref(),
+    );
     let single_homed = !wan.is_empty() && lan.iter().any(|name| wan.contains(name));
     ConfiguredInterfaces {
         lan,
@@ -113,17 +100,28 @@ pub(crate) fn configured_interfaces(config: &honk_config::Config) -> ConfiguredI
     }
 }
 
-/// Resolve an interface name, expanding `"auto"` or empty to the default route interface.
+/// Resolve an interface list against one default-route snapshot. An unresolved
+/// `auto` entry stays pending instead of binding the datapath to loopback.
 #[cfg(feature = "ebpf")]
-pub(crate) fn resolve_interface(name: &str) -> String {
-    if name == "auto" || name.is_empty() {
-        detect_default_interface().unwrap_or_else(|| {
-            warn!("could not detect default route interface; falling back to 'lo'");
-            "lo".to_string()
-        })
-    } else {
-        name.to_string()
+pub(crate) fn resolve_configured_interface_names(
+    configured: &[String],
+    default_interface: Option<&str>,
+) -> Vec<String> {
+    let mut resolved = Vec::with_capacity(configured.len());
+    for name in configured {
+        let name = if name == "auto" || name.is_empty() {
+            let Some(default_interface) = default_interface else {
+                continue;
+            };
+            default_interface
+        } else {
+            name.as_str()
+        };
+        if !resolved.iter().any(|existing| existing == name) {
+            resolved.push(name.to_string());
+        }
     }
+    resolved
 }
 
 /// Detect the interface used by the IPv4 default route.
@@ -132,29 +130,12 @@ pub(crate) fn resolve_interface(name: &str) -> String {
 /// Parses `/proc/net/route` and returns the interface with destination
 /// `00000000` and mask `00000000` and the lowest metric.
 fn detect_default_interface() -> Option<String> {
-    let content = std::fs::read_to_string("/proc/net/route").ok()?;
-    let mut best: Option<(u32, String)> = None;
-    for line in content.lines().skip(1) {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 8 {
-            continue;
-        }
-        let iface = parts[0];
-        let dest = parts[1];
-        let mask = parts[7];
-        if dest != "00000000" || mask != "00000000" {
-            continue;
-        }
-        let metric = parts[6].parse::<u32>().unwrap_or(u32::MAX);
-        let better = match &best {
-            None => true,
-            Some((m, _)) => metric < *m,
-        };
-        if better {
-            best = Some((metric, iface.to_string()));
-        }
-    }
-    best.map(|(_, iface)| iface)
+    honk_config::config::default_route_interface()
+}
+
+#[cfg(all(feature = "ebpf", test))]
+pub(crate) fn detect_default_interface_from(content: &str) -> Option<String> {
+    honk_config::config::default_route_interface_from(content)
 }
 
 /// Default eBPF object file embedded into the binary.
@@ -594,8 +575,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     }
 
     #[cfg(feature = "ebpf")]
-    let mut attached_ifaces: std::collections::HashMap<String, (u32, ebpf::DynamicHooks)> =
-        Default::default();
+    let mut attached_ifaces: ebpf::real::AttachedMap = Default::default();
     let mut ebpf_backend: Box<dyn ebpf::EbpfBackend> = if cli.mock_ebpf {
         info!("Using mock eBPF backend");
         Box::new(ebpf::mock::MockEbpfBackend::new())
@@ -640,13 +620,18 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             {
                 attached_ifaces.insert(
                     primary_lan.to_string(),
-                    (
-                        i,
-                        ebpf::DynamicHooks {
-                            ingress: true,
-                            egress: !single_homed,
+                    ebpf::real::AttachedInterface {
+                        ifindex: i,
+                        role: if single_homed {
+                            ebpf::IfaceRole::LanWan
+                        } else {
+                            ebpf::IfaceRole::Lan
                         },
-                    ),
+                        hooks: ebpf::DynamicHooks {
+                            ingress: true,
+                            egress: true,
+                        },
+                    },
                 );
             }
             if !single_homed
@@ -655,20 +640,32 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             {
                 attached_ifaces.insert(
                     primary_wan.to_string(),
-                    (
-                        i,
-                        ebpf::DynamicHooks {
+                    ebpf::real::AttachedInterface {
+                        ifindex: i,
+                        role: ebpf::IfaceRole::Wan,
+                        hooks: ebpf::DynamicHooks {
                             ingress: true,
                             egress: true,
                         },
-                    ),
+                    },
                 );
             }
             for extra_lan in lan_ifnames.iter().skip(1) {
                 match backend.attach_lan(extra_lan, single_homed) {
                     Ok(hooks) => {
                         if let Some(i) = ifindex_of(extra_lan) {
-                            attached_ifaces.insert(extra_lan.clone(), (i, hooks));
+                            attached_ifaces.insert(
+                                extra_lan.clone(),
+                                ebpf::real::AttachedInterface {
+                                    ifindex: i,
+                                    role: if single_homed && wan_ifnames.contains(extra_lan) {
+                                        ebpf::IfaceRole::LanWan
+                                    } else {
+                                        ebpf::IfaceRole::Lan
+                                    },
+                                    hooks,
+                                },
+                            );
                         }
                     }
                     Err(e) => warn!("Failed to attach LAN programs to {}: {}", extra_lan, e),
@@ -690,7 +687,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 if (hooks.ingress || hooks.egress)
                     && let Some(i) = ifindex_of(extra_wan)
                 {
-                    attached_ifaces.insert(extra_wan.clone(), (i, hooks));
+                    attached_ifaces.insert(
+                        extra_wan.clone(),
+                        ebpf::real::AttachedInterface {
+                            ifindex: i,
+                            role: ebpf::IfaceRole::Wan,
+                            hooks,
+                        },
+                    );
                 }
             }
 
@@ -841,6 +845,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         ebpf::real::IfaceWatcher::spawn(
             control_plane.ebpf_handle(),
             control_plane.config_handle(),
+            control_plane.command_sender(),
             attached_ifaces,
         )
     } else {
@@ -1276,9 +1281,7 @@ fn create_dae0_veth() -> anyhow::Result<Dae0Guard> {
     // FD-held namespace dies with its owner process) and any leftover dae0.
     // The singleton lock guarantees no live sibling owns these names.
     if is_mountpoint("/run/netns/daens") {
-        let target = std::ffi::CString::new(DAENS_NS_PATH).unwrap();
-        // SAFETY: plain umount2 of a stale bind-mount.
-        unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
+        let _ = nix::mount::umount2(DAENS_NS_PATH, nix::mount::MntFlags::MNT_DETACH);
     }
     if let Ok(idx) = netlink::ifindex_of("dae0")
         && let Ok(mut nl) = netlink::NlSock::new()
@@ -1500,6 +1503,12 @@ pub(crate) static DAENS_READY: std::sync::atomic::AtomicBool =
 /// never a same-named mount belonging to another tool.
 #[cfg(feature = "ebpf")]
 static COMPAT_MOUNTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Whether THIS instance created the regular file used as the compat
+/// bind-mount target. If `/run/netns` belongs to iproute2, unmounting the
+/// child does not remove that file, so cleanup must remove its own target.
+#[cfg(feature = "ebpf")]
+static COMPAT_FILE_CREATED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// The engine-owned daens namespace FD, created by
 /// [`create_daens_namespace`] at startup. An open namespace FD pins the
@@ -1514,12 +1523,12 @@ static DAENS_FD: std::sync::OnceLock<std::os::unix::io::OwnedFd> = std::sync::On
 static PARENT_TMPFS_MOUNTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Create the daens network namespace without iproute2: a throwaway
-/// thread `unshare(CLONE_NEWNET)`s, hands its `/proc/self/ns/net` FD back
-/// (the FD pins the namespace after the thread exits), and the FD is
-/// stored process-wide. For external tooling compatibility the namespace
-/// is also bind-mounted to [`DAENS_NS_PATH`] (best-effort — the engine
-/// works fine without the mount).
+/// Create the daens network namespace without iproute2: a throwaway thread
+/// `unshare(CLONE_NEWNET)`s, hands its `/proc/thread-self/ns/net` FD back
+/// (the FD pins the namespace after the thread exits), and the FD is stored
+/// process-wide. For external tooling compatibility the namespace is also
+/// bind-mounted to [`DAENS_NS_PATH`] (best-effort — the engine works fine
+/// without the mount).
 #[cfg(feature = "ebpf")]
 fn create_daens_namespace() -> anyhow::Result<&'static std::os::unix::io::OwnedFd> {
     use std::os::unix::io::OwnedFd;
@@ -1529,18 +1538,13 @@ fn create_daens_namespace() -> anyhow::Result<&'static std::os::unix::io::OwnedF
     }
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        // SAFETY: unshare the network namespace of this throwaway thread.
-        if unsafe { libc::unshare(libc::CLONE_NEWNET) } != 0 {
-            let _ = tx.send(Err(std::io::Error::last_os_error()));
+        if let Err(error) = nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET) {
+            let _ = tx.send(Err(std::io::Error::from(error)));
             return;
         }
-        // /proc/self/ns/net always shows the MAIN thread's namespace — the
-        // new namespace lives at the per-TASK path after unshare. (Opening
-        // /proc/self/ns/net here once returned the host ns and attached the
-        // sk_lookup hijack program host-wide — do not regress this.)
-        // SAFETY: plain syscall to learn this thread's kernel tid.
-        let tid = unsafe { libc::syscall(libc::SYS_gettid) };
-        let task_ns = format!("/proc/self/task/{tid}/ns/net");
+        // /proc/self/ns/net always shows the main thread's namespace. This
+        // thread-local path is the namespace created by unshare above.
+        let task_ns = "/proc/thread-self/ns/net";
         // Best-effort compat mount: /var/run/netns/daens (iproute2 shape).
         // The target must be a FILE — namespace handles are files, and a
         // file bind-mount onto a directory fails with ENOTDIR. The parent
@@ -1548,10 +1552,6 @@ fn create_daens_namespace() -> anyhow::Result<&'static std::os::unix::io::OwnedF
         // crucially NOT via a self-MS_BIND, which would stack-duplicate
         // every nsfs mount beneath it (lab ns pins included) on every
         // engine restart.
-        let dir = std::ffi::CString::new("/var/run/netns").unwrap();
-        let target = std::ffi::CString::new(DAENS_NS_PATH).unwrap();
-        let src = std::ffi::CString::new(task_ns.clone()).unwrap();
-        let tmpfs = std::ffi::CString::new("tmpfs").unwrap();
         let _ = std::fs::create_dir_all("/var/run/netns");
         // /proc/mounts lists the real path (/var/run is a symlink to
         // /run) — check the canonical path or every engine start
@@ -1560,48 +1560,53 @@ fn create_daens_namespace() -> anyhow::Result<&'static std::os::unix::io::OwnedF
         // be mounted BEFORE the target file is created, or the mount
         // hides it and the bind below fails on a first clean deploy.
         if !is_mountpoint("/run/netns") {
-            // SAFETY: plain mount; the target dir was just ensured.
-            let rc = unsafe {
-                libc::mount(
-                    tmpfs.as_ptr(),
-                    dir.as_ptr(),
-                    tmpfs.as_ptr(),
-                    0,
-                    std::ptr::null(),
-                )
-            };
-            if rc == 0 {
-                PARENT_TMPFS_MOUNTED.store(true, std::sync::atomic::Ordering::Relaxed);
-            } else {
-                warn!(
-                    "tmpfs mount on /run/netns failed: {}",
-                    std::io::Error::last_os_error()
-                );
+            match nix::mount::mount(
+                Some("tmpfs"),
+                "/var/run/netns",
+                Some("tmpfs"),
+                nix::mount::MsFlags::empty(),
+                None::<&str>,
+            ) {
+                Ok(()) => {
+                    PARENT_TMPFS_MOUNTED.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(error) => warn!("tmpfs mount on /run/netns failed: {error}"),
             }
         }
-        let _ = std::fs::File::create(DAENS_NS_PATH);
-        // The bind result is reported, never silently ignored — a failed
-        // compat mount leaves debug tooling unable to find daens.
-        let rc = unsafe {
-            libc::mount(
-                src.as_ptr(),
-                target.as_ptr(),
-                std::ptr::null(),
-                libc::MS_BIND,
-                std::ptr::null(),
-            )
+        let compat_target_ready = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(DAENS_NS_PATH)
+        {
+            Ok(_) => {
+                COMPAT_FILE_CREATED.store(true, std::sync::atomic::Ordering::Relaxed);
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => true,
+            Err(error) => {
+                warn!("create compat daens target failed: {error}");
+                false
+            }
         };
-        if rc != 0 {
-            warn!(
-                "compat bind-mount of daens failed (debug tooling degraded): {}",
-                std::io::Error::last_os_error()
-            );
-        } else {
-            COMPAT_MOUNTED.store(true, std::sync::atomic::Ordering::Relaxed);
+        if compat_target_ready {
+            // The bind result is reported, never silently ignored — a failed
+            // compat mount leaves debug tooling unable to find daens.
+            match nix::mount::mount(
+                Some(task_ns),
+                DAENS_NS_PATH,
+                None::<&str>,
+                nix::mount::MsFlags::MS_BIND,
+                None::<&str>,
+            ) {
+                Ok(()) => COMPAT_MOUNTED.store(true, std::sync::atomic::Ordering::Relaxed),
+                Err(error) => {
+                    warn!("compat bind-mount of daens failed (debug tooling degraded): {error}");
+                }
+            }
         }
-        let result = std::fs::File::open(&task_ns).map(OwnedFd::from);
+        let result = std::fs::File::open(task_ns).map(OwnedFd::from);
         if result.is_ok() {
-            let link = std::fs::read_link(&task_ns)
+            let link = std::fs::read_link(task_ns)
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|e| format!("<readlink failed: {e}>"));
             info!("daens FD source: {} -> {}", task_ns, link);
@@ -1646,8 +1651,6 @@ pub(crate) fn with_daens_netns<R>(
     op: &str,
     f: impl FnOnce() -> anyhow::Result<R>,
 ) -> anyhow::Result<R> {
-    use std::os::unix::io::AsRawFd;
-
     static DAENS_SWITCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Restores the saved network namespace on drop, so the original
@@ -1660,12 +1663,11 @@ pub(crate) fn with_daens_netns<R>(
     }
     impl Drop for RestoreNs<'_> {
         fn drop(&mut self) {
-            let ret = unsafe { libc::setns(self.fd.as_raw_fd(), libc::CLONE_NEWNET) };
-            if ret != 0 {
+            if let Err(error) = nix::sched::setns(&self.fd, nix::sched::CloneFlags::CLONE_NEWNET) {
                 tracing::error!(
                     "failed to restore original netns after '{}': {} — aborting",
                     self.op,
-                    std::io::Error::last_os_error()
+                    error
                 );
                 std::process::abort();
             }
@@ -1684,20 +1686,20 @@ pub(crate) fn with_daens_netns<R>(
         .map_err(|e| anyhow::anyhow!("{}: open /proc/thread-self/ns/net: {}", op, e))?;
 
     // The FD-owned namespace is the primary handle; the compat bind-mount
-    // path is the fallback (tests, mock mode, non-ebpf builds). The File
-    // must outlive the setns call — a temporary's raw fd dangles.
+    // path is the fallback for tests, mock mode, and non-ebpf builds.
     #[cfg(feature = "ebpf")]
-    let daens_raw = daens_fd()
-        .map(|fd| fd.as_raw_fd())
-        .map_err(|e| anyhow::anyhow!("{}: daens namespace unavailable: {:#}", op, e))?;
+    {
+        let daens = daens_fd()
+            .map_err(|error| anyhow::anyhow!("{op}: daens namespace unavailable: {error:#}"))?;
+        nix::sched::setns(daens, nix::sched::CloneFlags::CLONE_NEWNET)
+            .map_err(|error| anyhow::anyhow!("{op}: setns(daens): {error}"))?;
+    }
     #[cfg(not(feature = "ebpf"))]
-    let daens_file = std::fs::File::open(DAENS_NS_PATH)
-        .map_err(|e| anyhow::anyhow!("{}: open {}: {}", op, DAENS_NS_PATH, e))?;
-    #[cfg(not(feature = "ebpf"))]
-    let daens_raw = daens_file.as_raw_fd();
-
-    if unsafe { libc::setns(daens_raw, libc::CLONE_NEWNET) } != 0 {
-        anyhow::bail!("{}: setns(daens): {}", op, std::io::Error::last_os_error());
+    {
+        let daens = std::fs::File::open(DAENS_NS_PATH)
+            .map_err(|error| anyhow::anyhow!("{op}: open {DAENS_NS_PATH}: {error}"))?;
+        nix::sched::setns(&daens, nix::sched::CloneFlags::CLONE_NEWNET)
+            .map_err(|error| anyhow::anyhow!("{op}: setns(daens): {error}"))?;
     }
     let _restore_guard = RestoreNs { fd: orig_ns, op };
     f()
@@ -1708,15 +1710,17 @@ fn cleanup_dae0_interface(recorded_ifindex: Option<u32>) {
     // Unmount the compat bind-mount only when THIS instance mounted it —
     // a same-named mount from another tool is never ours to tear down.
     if COMPAT_MOUNTED.swap(false, std::sync::atomic::Ordering::Relaxed) {
-        let target = std::ffi::CString::new(DAENS_NS_PATH).unwrap();
-        // SAFETY: plain umount2; errors (already unmounted) are ignored.
-        unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
+        let _ = nix::mount::umount2(DAENS_NS_PATH, nix::mount::MntFlags::MNT_DETACH);
+    }
+    if COMPAT_FILE_CREATED.swap(false, std::sync::atomic::Ordering::Relaxed)
+        && let Err(error) = std::fs::remove_file(DAENS_NS_PATH)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!("remove compat daens target failed: {error}");
     }
     // Same ownership rule for the parent tmpfs (child must go first).
     if PARENT_TMPFS_MOUNTED.swap(false, std::sync::atomic::Ordering::Relaxed) {
-        let parent = std::ffi::CString::new("/run/netns").unwrap();
-        // SAFETY: plain umount2; errors (busy) are ignored.
-        unsafe { libc::umount2(parent.as_ptr(), libc::MNT_DETACH) };
+        let _ = nix::mount::umount2("/run/netns", nix::mount::MntFlags::MNT_DETACH);
     }
     DAENS_READY.store(false, std::sync::atomic::Ordering::Release);
     // The FD-owned namespace dies with the process (dae0peer goes with it).
@@ -1752,16 +1756,16 @@ fn cleanup_dae0_interface(recorded_ifindex: Option<u32>) {
 /// Link-local addresses (169.254.0.0/16) are used instead of a private
 /// subnet so that the kernel treats daens-originated traffic as local — no
 /// iptables MASQUERADE or TCP MSS clamping is needed.
-#[cfg_attr(not(feature = "ebpf"), allow(dead_code))]
+#[cfg(any(feature = "ebpf", test))]
 pub(crate) const DAENS_HOST_IP: &str = "169.254.0.1";
-#[cfg_attr(not(feature = "ebpf"), allow(dead_code))]
+#[cfg(any(feature = "ebpf", test))]
 pub(crate) const DAENS_PEER_IP: &str = "169.254.0.11";
 /// IPv6 ULA addresses of the dae0/dae0peer veth pair (fd00:686f:6e6b::/64).
 /// The middle hextets are ASCII "honk" (`68 6f 6e 6b`) so the mnemonic
 /// stays readable while remaining a valid IPv6 ULA prefix.
-#[cfg_attr(not(feature = "ebpf"), allow(dead_code))]
+#[cfg(any(feature = "ebpf", test))]
 pub(crate) const DAENS_HOST_IPV6: &str = "fd00:686f:6e6b::1";
-#[cfg_attr(not(feature = "ebpf"), allow(dead_code))]
+#[cfg(any(feature = "ebpf", test))]
 pub(crate) const DAENS_PEER_IPV6: &str = "fd00:686f:6e6b::2";
 
 /// First 64 bits of `DAENS_HOST_IPV6`/`DAENS_PEER_IPV6` — the

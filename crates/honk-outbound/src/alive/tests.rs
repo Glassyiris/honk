@@ -206,6 +206,77 @@ fn test_probe_cooldown_backoff() {
 }
 
 #[test]
+fn test_network_change_bypasses_backoff_but_requires_fresh_success() {
+    let set = AliveDialerSet::new();
+    let node_id = id(1);
+    set.register_node(node_id, "n1".into(), "127.0.0.1:1".into());
+    set.report_unavailable_forced(node_id, ProbeDomain::Tcp, IpVersion::V4);
+    {
+        let mut states = set.states.write();
+        let state =
+            &mut states.get_mut(&node_id).unwrap()[alive_index(ProbeDomain::Tcp, IpVersion::V4)];
+        state.cooldown_until = Instant::now() + Duration::from_secs(300);
+    }
+    assert!(!set.is_alive_for(node_id, ProbeDomain::Tcp, IpVersion::V4));
+    assert!(!set.should_probe(node_id, ProbeDomain::Tcp, IpVersion::V4));
+    let mut trigger_rx = set.take_trigger_rx().expect("trigger receiver");
+
+    set.notify_network_change();
+
+    assert!(set.should_probe(node_id, ProbeDomain::Tcp, IpVersion::V4));
+    assert_eq!(trigger_rx.try_recv(), Ok(node_id));
+    assert!(!set.is_alive_for(node_id, ProbeDomain::Tcp, IpVersion::V4));
+    set.record_probe_latency(
+        node_id,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(10),
+    );
+    assert!(set.is_alive_for(node_id, ProbeDomain::Tcp, IpVersion::V4));
+}
+
+#[tokio::test]
+async fn test_recovery_cycle_probes_due_dead_nodes() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let set = Arc::new(AliveDialerSet::new());
+    let node_id = id(2);
+    set.register_node(
+        node_id,
+        "n2".into(),
+        listener.local_addr().unwrap().to_string(),
+    );
+    set.report_unavailable_forced(node_id, ProbeDomain::Tcp, IpVersion::V4);
+    {
+        let mut states = set.states.write();
+        let state =
+            &mut states.get_mut(&node_id).unwrap()[alive_index(ProbeDomain::Tcp, IpVersion::V4)];
+        state.consecutive_successes = RECOVERY_SUCCESSES_NEEDED - 1;
+        state.cooldown_until = Instant::now();
+    }
+
+    set.run_recovery_check_cycle_concurrent(Duration::from_secs(1), 1)
+        .await;
+
+    assert!(set.is_alive_for(node_id, ProbeDomain::Tcp, IpVersion::V4));
+}
+
+#[tokio::test]
+async fn test_recovery_cycle_probes_due_dead_udp_nodes() {
+    let set = Arc::new(AliveDialerSet::new());
+    let node_id = id(3);
+    set.register_node(node_id, "n3".into(), "127.0.0.1:1".into());
+    set.set_udp_probe(Arc::new(MockUdpProber::ok(Duration::from_millis(5))));
+    set.report_unavailable_forced(node_id, ProbeDomain::DataUdp, IpVersion::V4);
+    assert!(!set.is_alive_for(node_id, ProbeDomain::DataUdp, IpVersion::V4));
+
+    set.run_recovery_check_cycle_concurrent(Duration::from_secs(1), 1)
+        .await;
+
+    assert!(set.is_alive_for(node_id, ProbeDomain::DataUdp, IpVersion::V4));
+    assert!(set.is_alive_for(node_id, ProbeDomain::DnsUdp, IpVersion::V6));
+}
+
+#[test]
 fn test_sticky_cache_ttl() {
     let c = StickyCache::new(Duration::from_millis(10));
     c.set_sticky(

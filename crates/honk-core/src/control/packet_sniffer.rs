@@ -10,9 +10,10 @@
 //! Mirrors the Go `packet_sniffer_pool.go` (1001L).
 
 use crate::control::quic::{self, CryptoReassembly};
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::debug;
 
@@ -148,24 +149,10 @@ impl SnifferSession {
     }
 }
 
-/// Entry in the failed DCID negative cache.
-#[derive(Debug, Clone)]
-struct FailedDcidEntry {
-    #[allow(dead_code)]
-    reason: DcidFailureReason,
-    expires_at: Instant,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DcidFailureReason {
-    SoftBypass,
-    DecryptFailure,
-}
-
 /// Pool of packet sniffers with DCID negative caching.
 pub struct PacketSnifferPool {
     sessions: Mutex<HashMap<PacketSnifferKey, SnifferSession>>,
-    failed_dcids: Mutex<HashMap<PacketSnifferKey, FailedDcidEntry>>,
+    failed_dcids: Mutex<HashMap<PacketSnifferKey, Instant>>,
 }
 
 impl PacketSnifferPool {
@@ -178,40 +165,28 @@ impl PacketSnifferPool {
 
     /// Check if a DCID is in the failed cache (should skip sniffing).
     pub fn is_dcid_failed(&self, key: &PacketSnifferKey) -> bool {
-        let cache = self.failed_dcids.lock().unwrap();
-        if let Some(entry) = cache.get(key)
-            && Instant::now() < entry.expires_at
-        {
-            return true;
-        }
-        false
+        self.failed_dcids
+            .lock()
+            .get(key)
+            .is_some_and(|expires_at| Instant::now() < *expires_at)
     }
 
     /// Record a failed DCID with a soft bypass duration.
     pub fn mark_dcid_failed_soft(&self, key: PacketSnifferKey) {
-        let mut cache = self.failed_dcids.lock().unwrap();
-        cache.insert(
-            key,
-            FailedDcidEntry {
-                reason: DcidFailureReason::SoftBypass,
-                expires_at: Instant::now() + NO_SNI_BYPASS_TTL,
-            },
-        );
-        if cache.len() > 16384 {
-            cache.retain(|_, v| Instant::now() < v.expires_at);
-        }
+        self.mark_dcid_failed_for(key, NO_SNI_BYPASS_TTL);
     }
 
     /// Record a failed DCID due to decrypt failure (longer bypass).
     pub fn mark_dcid_failed_decrypt(&self, key: PacketSnifferKey) {
-        let mut cache = self.failed_dcids.lock().unwrap();
-        cache.insert(
-            key,
-            FailedDcidEntry {
-                reason: DcidFailureReason::DecryptFailure,
-                expires_at: Instant::now() + Duration::from_secs(30),
-            },
-        );
+        self.mark_dcid_failed_for(key, Duration::from_secs(30));
+    }
+
+    fn mark_dcid_failed_for(&self, key: PacketSnifferKey, ttl: Duration) {
+        let mut cache = self.failed_dcids.lock();
+        cache.insert(key, Instant::now() + ttl);
+        if cache.len() > 16_384 {
+            cache.retain(|_, expires_at| Instant::now() < *expires_at);
+        }
     }
 
     /// Feed a UDP datagram (expected to carry QUIC Initial packet(s)) to the
@@ -226,7 +201,7 @@ impl PacketSnifferPool {
         // Decrypt the Initial packet(s) first (stateless, no lock needed).
         let fragments = quic::decrypt_initial_datagram(data);
 
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.lock();
         let session = sessions.entry(key).or_insert_with(SnifferSession::new);
 
         if session.done {
@@ -322,7 +297,7 @@ impl PacketSnifferPool {
 
     /// Run a janitor cycle: remove expired sessions.
     pub fn janitor_cycle(&self) -> usize {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.lock();
         let before = sessions.len();
         sessions.retain(|_, s| !s.is_expired());
         let removed = before - sessions.len();
@@ -333,8 +308,8 @@ impl PacketSnifferPool {
             );
         }
 
-        let mut dcids = self.failed_dcids.lock().unwrap();
-        dcids.retain(|_, v| Instant::now() < v.expires_at);
+        let mut dcids = self.failed_dcids.lock();
+        dcids.retain(|_, expires_at| Instant::now() < *expires_at);
 
         removed
     }

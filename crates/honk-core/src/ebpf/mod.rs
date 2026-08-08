@@ -106,12 +106,15 @@ impl DomainRouteWriteError {
 pub enum IfaceRole {
     Lan,
     Wan,
+    /// LAN and WAN resolve to the same interface. The startup datapath uses
+    /// LAN ingress plus WAN egress, not the LAN egress/WAN ingress pair.
+    LanWan,
     /// Slave port of a configured LAN bridge master: forwarded L2 traffic
     /// never crosses the master's TC hooks, so the LAN programs go on each
     /// slave (mirrors the startup expansion).
     LanBridgeSlave,
-    /// Slave of a configured LAN bond master: packets may arrive/leave on
-    /// the slave without touching the master's qdiscs, so it gets
+    /// Slave of a configured LAN bond master: packets may arrive/leave on the
+    /// slave without touching the master's qdiscs, so it gets
     /// lan_ingress + wan_egress (mirrors the startup expansion).
     LanBondSlave,
     /// Slave of a WAN bond master: locally-originated traffic can bypass the

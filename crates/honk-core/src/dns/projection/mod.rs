@@ -90,7 +90,7 @@ pub(crate) struct ProjectionCounters {
 }
 
 impl ProjectionCounters {
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> ProjectionCounterSnapshot {
         ProjectionCounterSnapshot {
             write_failures: self.write_failures.load(Ordering::Relaxed),
@@ -102,7 +102,7 @@ impl ProjectionCounters {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProjectionCounterSnapshot {
     pub(crate) write_failures: u64,
@@ -182,7 +182,7 @@ impl RoutingProjection {
         });
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn counters(&self) -> ProjectionCounterSnapshot {
         self.counters.snapshot()
     }

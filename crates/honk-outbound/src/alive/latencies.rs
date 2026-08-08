@@ -81,12 +81,6 @@ impl Latencies10 {
         Some(self.buf[self.last_index()?].latency)
     }
 
-    /// Latest sample, synthetic included.
-    #[allow(dead_code)]
-    pub(crate) fn last_sample(&self) -> Option<LatencySample> {
-        Some(self.buf[self.last_index()?])
-    }
-
     /// Latest REAL (non-synthetic) sample, scanning back from the tail —
     /// display semantics (clash delay history).
     pub(crate) fn last_real_sample(&self) -> Option<LatencySample> {
@@ -113,7 +107,7 @@ impl Latencies10 {
         Some(self.sum / self.len as u32)
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn count(&self) -> usize {
         self.len
     }
@@ -144,11 +138,6 @@ impl SyncLatencies10 {
 
     pub(crate) fn avg(&self) -> Option<Duration> {
         self.inner.lock().avg()
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn count(&self) -> usize {
-        self.inner.lock().count()
     }
 }
 

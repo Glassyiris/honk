@@ -59,17 +59,7 @@ impl DialerCollection {
         self.update_moving_average(latency);
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn set_alive(&self, alive: bool) {
-        self.alive.store(alive, Ordering::Release);
-    }
-
     pub(crate) fn moving_average_duration(&self) -> Duration {
         *self.moving_average.lock()
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn is_alive(&self) -> bool {
-        self.alive.load(Ordering::Acquire)
     }
 }

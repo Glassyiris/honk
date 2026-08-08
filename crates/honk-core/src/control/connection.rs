@@ -119,26 +119,6 @@ pub(super) struct ControlPlaneHandle {
     pub(super) udp_post_decision_offload: bool,
 }
 
-/// Check whether a connected TCP stream is still alive via SO_ERROR.
-///
-/// Returns true if the socket is healthy (no pending error).
-pub(super) fn is_tcp_stream_alive(stream: &TcpStream) -> bool {
-    use std::os::unix::io::AsRawFd;
-    let fd = stream.as_raw_fd();
-    let mut err: libc::c_int = 0;
-    let mut err_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-    let ret = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_ERROR,
-            &mut err as *mut _ as *mut libc::c_void,
-            &mut err_len,
-        )
-    };
-    ret == 0 && err == 0
-}
-
 /// Build the eBPF conntrack key for a flow: IPs as 16-byte v4-mapped
 /// addresses, ports in host byte order, `l4proto` as the IANA number.
 pub(crate) fn build_tuples_key(

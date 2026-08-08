@@ -1,4 +1,4 @@
-//! Minimal synchronous rtnetlink client (NETLINK_ROUTE) over `libc`.
+//! Minimal synchronous rtnetlink client (NETLINK_ROUTE).
 //!
 //! Replaces the engine's `ip`/`nsenter` shell-outs: veth pair creation,
 //! link up/down/netns-move, v4/v6 addresses, routes (incl. table 100 +
@@ -12,13 +12,18 @@
 //! daens-internal setup works without `nsenter`.
 
 use std::io;
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
+
+use nix::sys::socket::{
+    AddressFamily, MsgFlags, NetlinkAddr, SockFlag, SockProtocol, SockType, bind, recv, recvfrom,
+    send, setsockopt, socket, sockopt,
+};
+use nix::sys::time::TimeVal;
 
 // ---- kernel ABI (stable) --------------------------------------------------
 
 const AF_INET: i32 = libc::AF_INET;
 const AF_INET6: i32 = libc::AF_INET6;
-const NETLINK_ROUTE: i32 = 0;
 
 const NLM_F_REQUEST: u16 = 0x01;
 const NLM_F_ACK: u16 = 0x04;
@@ -186,49 +191,15 @@ pub(crate) struct NlSock {
 
 impl NlSock {
     pub(crate) fn new() -> io::Result<Self> {
-        // SAFETY: plain socket creation; OwnedFd takes ownership.
-        let raw = unsafe {
-            libc::socket(
-                libc::AF_NETLINK,
-                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-                NETLINK_ROUTE,
-            )
-        };
-        if raw < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-        // A netlink reply that never comes must not hang engine startup.
-        let timeout = libc::timeval {
-            tv_sec: 2,
-            tv_usec: 0,
-        };
-        // SAFETY: standard setsockopt on the fresh socket.
-        let rc = unsafe {
-            libc::setsockopt(
-                fd.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_RCVTIMEO,
-                &timeout as *const libc::timeval as *const libc::c_void,
-                std::mem::size_of::<libc::timeval>() as u32,
-            )
-        };
-        if rc < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
-        addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
-        // SAFETY: addr is a valid sockaddr_nl.
-        let rc = unsafe {
-            libc::bind(
-                fd.as_raw_fd(),
-                &addr as *const libc::sockaddr_nl as *const libc::sockaddr,
-                std::mem::size_of::<libc::sockaddr_nl>() as u32,
-            )
-        };
-        if rc < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let fd = socket(
+            AddressFamily::Netlink,
+            SockType::Raw,
+            SockFlag::SOCK_CLOEXEC,
+            SockProtocol::NetlinkRoute,
+        )
+        .map_err(io::Error::from)?;
+        setsockopt(&fd, sockopt::ReceiveTimeout, &TimeVal::new(2, 0)).map_err(io::Error::from)?;
+        bind(fd.as_raw_fd(), &NetlinkAddr::new(0, 0)).map_err(io::Error::from)?;
         Ok(Self { fd, seq: 0 })
     }
 
@@ -239,24 +210,15 @@ impl NlSock {
     fn recv_one(&self, buf: &mut Vec<u8>) -> io::Result<usize> {
         const MAX_BUF: usize = 1 << 20;
         loop {
-            // SAFETY: valid socket; MSG_PEEK|MSG_TRUNC with no iovec reports
-            // the pending datagram's full length without consuming it.
-            let mut probe: libc::msghdr = unsafe { std::mem::zeroed() };
-            let needed = unsafe {
-                libc::recvmsg(
-                    self.fd.as_raw_fd(),
-                    &mut probe,
-                    libc::MSG_PEEK | libc::MSG_TRUNC,
-                )
+            let needed = match recv(
+                self.fd.as_raw_fd(),
+                &mut [0u8; 1],
+                MsgFlags::MSG_PEEK | MsgFlags::MSG_TRUNC,
+            ) {
+                Ok(needed) => needed,
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(error) => return Err(io::Error::from(error)),
             };
-            if needed < 0 {
-                let e = io::Error::last_os_error();
-                if e.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(e);
-            }
-            let needed = needed as usize;
             if needed > MAX_BUF {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -266,44 +228,27 @@ impl NlSock {
             if needed > buf.len() {
                 buf.resize(needed, 0);
             }
-            // SAFETY: buf is a valid writable region of buf.len() bytes;
-            // src captures the sender — only kernel (pid 0) datagrams are
-            // accepted, anything else is dropped and re-probed.
-            let mut iov = libc::iovec {
-                iov_base: buf.as_mut_ptr() as *mut libc::c_void,
-                iov_len: buf.len(),
+            let (received, source) = match recvfrom::<NetlinkAddr>(self.fd.as_raw_fd(), buf) {
+                Ok(received) => received,
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(error) => return Err(io::Error::from(error)),
             };
-            let mut src: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
-            let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
-            hdr.msg_name = (&mut src as *mut libc::sockaddr_nl).cast();
-            hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_nl>() as u32;
-            hdr.msg_iov = &mut iov;
-            hdr.msg_iovlen = 1;
-            let n = unsafe { libc::recvmsg(self.fd.as_raw_fd(), &mut hdr, 0) };
-            if n < 0 {
-                let e = io::Error::last_os_error();
-                if e.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(e);
-            }
-            if src.nl_pid != 0 {
+            if source.is_some_and(|source| source.pid() != 0) {
                 continue;
             }
-            if hdr.msg_flags & libc::MSG_TRUNC != 0 {
-                // A larger datagram cannot replace the probed one, but stay
-                // defensive: grow and re-probe rather than accept a
-                // truncated read.
-                if buf.len() >= MAX_BUF {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "netlink message exceeds 1 MiB",
-                    ));
-                }
-                buf.resize((buf.len() * 2).min(MAX_BUF), 0);
-                continue;
-            }
-            return Ok(n as usize);
+            return Ok(received);
+        }
+    }
+
+    fn send_datagram(&self, buf: &[u8]) -> io::Result<()> {
+        let sent = send(self.fd.as_raw_fd(), buf, MsgFlags::empty()).map_err(io::Error::from)?;
+        if sent == buf.len() {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "short netlink datagram send",
+            ))
         }
     }
 
@@ -331,18 +276,7 @@ impl NlSock {
         let len = buf.len() as u32;
         buf[0..4].copy_from_slice(&len.to_ne_bytes());
 
-        // SAFETY: buf holds a well-formed nlmsghdr blob.
-        let sent = unsafe {
-            libc::send(
-                self.fd.as_raw_fd(),
-                buf.as_ptr() as *const libc::c_void,
-                buf.len(),
-                0,
-            )
-        };
-        if sent < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        self.send_datagram(&buf)?;
 
         let mut resp = vec![0u8; 4096];
         loop {
@@ -657,18 +591,7 @@ impl NlSock {
         buf.extend_from_slice(pod_bytes(&header));
         let len = buf.len() as u32;
         buf[0..4].copy_from_slice(&len.to_ne_bytes());
-        // SAFETY: buf holds a well-formed nlmsghdr blob.
-        let sent = unsafe {
-            libc::send(
-                self.fd.as_raw_fd(),
-                buf.as_ptr() as *const libc::c_void,
-                buf.len(),
-                0,
-            )
-        };
-        if sent < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        self.send_datagram(&buf)?;
 
         let mut resp = vec![0u8; 8192];
         let mut found: Option<(u32, [u8; 6])> = None;
@@ -847,18 +770,7 @@ mod tests {
         buf.extend_from_slice(&[0u8; 12]); // fib_rule_hdr
         let len = buf.len() as u32;
         buf[0..4].copy_from_slice(&len.to_ne_bytes());
-        // SAFETY: buf holds a well-formed nlmsghdr blob.
-        let sent = unsafe {
-            libc::send(
-                nl.fd.as_raw_fd(),
-                buf.as_ptr() as *const libc::c_void,
-                buf.len(),
-                0,
-            )
-        };
-        if sent < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        nl.send_datagram(&buf)?;
         let mut out = Vec::new();
         let mut resp = vec![0u8; 8192];
         'outer: loop {
