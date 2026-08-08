@@ -1,8 +1,8 @@
 //! VLESS proxy handler.
 //!
-//! VLESS is Xray's simplified protocol — NO encryption, relies entirely
-//! on outer TLS for security. The handshake is a single request header
-//! followed by a 1-byte response.
+//! VLESS itself is unencrypted. Deployments normally use TLS or REALITY,
+//! although cleartext is explicitly configurable. The handshake is one
+//! request header followed by a two-byte response prefix and optional addons.
 //!
 //! Protocol flow:
 //! 1. Connect to the server via the shared transport layer
@@ -17,20 +17,21 @@
 //!    - `uuid`: 16 raw bytes parsed from `node.password` (UUID string)
 //!    - `addon_len` / `addon`: Xray `encoding.Addons` protobuf carrying
 //!      the flow (`node.flow`, e.g. `xtls-rprx-vision`); empty otherwise
-//!    - `cmd`: 0x01 TCP, 0x02 UDP
+//!    - `cmd`: 0x01 TCP
 //!    - `port`: big-endian u16
 //!    - `atyp`: 0x01 IPv4, 0x02 Domain, 0x03 IPv6
 //!    - `addr`: 4 bytes (IPv4) / 1+len bytes (Domain) / 16 bytes (IPv6)
-//! 3. The response header (`ver(1) | addon_len(1) | [addon]`) is stripped
-//!    lazily on the first read: real servers piggyback it on the target's
-//!    first downstream bytes, so awaiting it in dial would deadlock with
-//!    target-speaks-first protocols like TLS.
+//! 3. The response prefix (`ver(1) | addon_len(1) | [addon]`) is stripped
+//!    lazily on the first read. Real servers emit it with the target's first
+//!    downstream bytes; awaiting it during dial deadlocks when target output
+//!    depends on client bytes, including the target TLS handshake.
 //! 4. The stream is then transparently connected to the target (with XTLS
 //!    Vision unpadding on the read path when `flow = xtls-rprx-vision`).
 //!
 //! Reference: <https://xtls.github.io/en/development/protocols/vless.html>
 
 use async_trait::async_trait;
+use bytes::{Buf, BytesMut};
 use honk_config::node::Node;
 use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -40,13 +41,11 @@ use super::{AsyncReadWrite, ProbeableOutbound, ProxyStream, TcpOutbound};
 
 const VLESS_VERSION: u8 = 0x00;
 const CMD_TCP: u8 = 0x01;
-#[cfg(test)]
-const CMD_UDP: u8 = 0x02;
+
 const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x02;
 const ATYP_IPV6: u8 = 0x03;
 
-/// VLESS proxy handler.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct VLessHandler;
 
@@ -55,75 +54,64 @@ impl VLessHandler {
         Self
     }
 
-    /// Parse a UUID string into a 16-byte array.
     fn parse_uuid(uuid_str: &str) -> anyhow::Result<[u8; 16]> {
         let uuid = uuid::Uuid::parse_str(uuid_str)?;
         Ok(*uuid.as_bytes())
     }
 
-    /// Xray `encoding.Addons` protobuf (`string Flow = 1`) for the addon
-    /// block: tag 0x0A (field 1, length-delimited) plus the length-prefixed
-    /// flow name. The flow only selects server-side behavior (e.g.
-    /// xtls-rprx-vision splice); the VLESS layer itself stays unencrypted
-    /// either way.
-    fn flow_addons(flow: Option<&str>) -> Vec<u8> {
-        let Some(flow) = flow.filter(|f| !f.is_empty()) else {
-            return Vec::new();
-        };
-        let mut addons = Vec::with_capacity(2 + flow.len());
-        addons.push(0x0a);
-        addons.push(flow.len() as u8);
-        addons.extend_from_slice(flow.as_bytes());
-        addons
-    }
-
-    /// Build the VLESS request header.
-    ///
-    /// Layout: `ver(1) | uuid(16) | addon_len(1) | addon(addon_len) | cmd(1) | port(2) | atyp(1) | addr(var)`
     fn build_request_header(
         uuid_bytes: &[u8; 16],
-        cmd: u8,
         target: SocketAddr,
         target_domain: Option<&str>,
         flow: Option<&str>,
-    ) -> Vec<u8> {
-        let addons = Self::flow_addons(flow);
-        let max_addr = if target_domain.is_some() {
-            1 + 255
-        } else if target.is_ipv6() {
-            16
-        } else {
-            4
+    ) -> anyhow::Result<Vec<u8>> {
+        let flow = match flow.filter(|flow| !flow.is_empty()) {
+            None => None,
+            Some("xtls-rprx-vision") => Some("xtls-rprx-vision"),
+            Some(_) => anyhow::bail!("VLESS: unsupported flow"),
         };
-        let mut buf = Vec::with_capacity(1 + 16 + 1 + addons.len() + 1 + 2 + 1 + max_addr);
+        let addon_len = flow.map_or(0, |flow| 2 + flow.len());
+        let encoded_address_len = match target_domain {
+            Some(domain) => {
+                anyhow::ensure!(
+                    domain.len() <= u8::MAX as usize,
+                    "VLESS: target domain exceeds 255 bytes"
+                );
+                1 + 1 + domain.len()
+            }
+            None if target.is_ipv6() => 1 + 16,
+            None => 1 + 4,
+        };
+        let mut buf = Vec::with_capacity(1 + 16 + 1 + addon_len + 1 + 2 + encoded_address_len);
 
         buf.push(VLESS_VERSION);
         buf.extend_from_slice(uuid_bytes);
-        buf.push(addons.len() as u8);
-        buf.extend_from_slice(&addons);
-        buf.push(cmd);
-
+        buf.push(addon_len as u8);
+        if let Some(flow) = flow {
+            buf.push(0x0a);
+            buf.push(flow.len() as u8);
+            buf.extend_from_slice(flow.as_bytes());
+        }
+        buf.push(CMD_TCP);
         buf.extend_from_slice(&target.port().to_be_bytes());
 
         if let Some(domain) = target_domain {
             buf.push(ATYP_DOMAIN);
-            let domain_bytes = domain.as_bytes();
-            buf.push(domain_bytes.len().min(u8::MAX as usize) as u8);
-            buf.extend_from_slice(domain_bytes);
+            buf.push(domain.len() as u8);
+            buf.extend_from_slice(domain.as_bytes());
         } else {
             match target {
-                SocketAddr::V4(v4) => {
+                SocketAddr::V4(address) => {
                     buf.push(ATYP_IPV4);
-                    buf.extend_from_slice(&v4.ip().octets());
+                    buf.extend_from_slice(&address.ip().octets());
                 }
-                SocketAddr::V6(v6) => {
+                SocketAddr::V6(address) => {
                     buf.push(ATYP_IPV6);
-                    buf.extend_from_slice(&v6.ip().octets());
+                    buf.extend_from_slice(&address.ip().octets());
                 }
             }
         }
-
-        buf
+        Ok(buf)
     }
 }
 
@@ -155,8 +143,6 @@ impl VLessHandler {
         Ok(Self::wrap_response_stream(node, uuid, stream))
     }
 
-    /// Wrap the post-handshake stream: strip the response header lazily on
-    /// first read, then unpad vision frames when the flow requires it.
     fn wrap_response_stream(
         node: &Node,
         uuid: [u8; 16],
@@ -171,15 +157,12 @@ impl VLessHandler {
     }
 }
 
-/// Lazy VLESS response-header stripper.
-///
-/// Real servers do not send the response header `[version][addon_len]
-/// [addon]` on request acceptance — it is piggybacked on the first
-/// downstream data from the target (sing-vmess serverConn.Write, Xray
-/// alike). Reading it eagerly in dial() would deadlock whenever the target
-/// speaks first (e.g. TLS), so the header is consumed on the first read,
-/// exactly like the reference clients' `responseRead` flag. A non-zero
-/// version surfaces as a read error rather than a dial error.
+/// Real servers do not send the two-byte `[version][addon_len]` prefix and
+/// optional addons on request acceptance. They emit them with the target's
+/// first downstream data (sing-vmess `serverConn.Write`, Xray alike). Reading
+/// eagerly during dial deadlocks when the target needs client bytes before it
+/// responds, so the prefix is consumed on the first read. A non-zero version
+/// surfaces as a read error rather than a dial error.
 #[derive(Debug)]
 struct ResponseHeaderStrip<S> {
     inner: S,
@@ -325,17 +308,13 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ResponseHeaderStrip<S> {
 struct VisionStream<S> {
     inner: S,
     uuid: [u8; 16],
-    /// Bytes pulled from `inner` but not yet parsed.
-    inbox: Vec<u8>,
-    /// Decoded payload ready for delivery.
-    outbox: std::collections::VecDeque<u8>,
+    inbox: BytesMut,
     state: VisionState,
     inner_eof: bool,
 }
 
-/// Reach the raw TCP socket under a (TLS) stream for the vision direct
-/// copy read switch. Streams that cannot unwrap (WS/gRPC bridges) get the
-/// default `None` and degrade to framed passthrough.
+/// Reach the raw TCP socket for the Vision direct-copy read switch. WS/gRPC
+/// streams cannot unwrap and fall back to outer-stream raw passthrough.
 pub(crate) trait RawTcp {
     fn raw_tcp(&mut self) -> Option<&mut TcpStream> {
         None
@@ -393,103 +372,9 @@ impl<S> VisionStream<S> {
         Self {
             inner,
             uuid,
-            inbox: Vec::new(),
-            outbox: std::collections::VecDeque::new(),
+            inbox: BytesMut::new(),
             state: VisionState::Detect,
             inner_eof: false,
-        }
-    }
-}
-
-impl<S: AsyncRead + RawTcp + Unpin> VisionStream<S> {
-    fn parse(&mut self) {
-        if matches!(self.state, VisionState::Detect) {
-            if self.inbox.len() < 21 && !self.inner_eof {
-                return;
-            }
-            self.state = if self.inbox.len() >= 21 && self.inbox[..16] == self.uuid {
-                self.inbox.drain(..16);
-                VisionState::Framed {
-                    content_remaining: 0,
-                    padding_remaining: 0,
-                    command: 0,
-                }
-            } else {
-                VisionState::Raw
-            };
-        }
-        loop {
-            match self.state {
-                VisionState::Framed {
-                    ref mut content_remaining,
-                    ref mut padding_remaining,
-                    command,
-                } => {
-                    if *content_remaining > 0 {
-                        let n = (*content_remaining).min(self.inbox.len());
-                        self.outbox.extend(self.inbox.drain(..n));
-                        *content_remaining -= n;
-                        // An incomplete frame waits for more input; a just
-                        // completed frame must fall through to the command
-                        // dispatch — End/Direct change the read channel and
-                        // cannot wait for the next one.
-                        if *content_remaining > 0 {
-                            break;
-                        }
-                        continue;
-                    }
-                    if *padding_remaining > 0 {
-                        let n = (*padding_remaining).min(self.inbox.len());
-                        self.inbox.drain(..n);
-                        *padding_remaining -= n;
-                        if *padding_remaining > 0 {
-                            break;
-                        }
-                        continue;
-                    }
-                    match command {
-                        VISION_COMMAND_END => {
-                            self.state = VisionState::Raw;
-                        }
-                        VISION_COMMAND_DIRECT => {
-                            // Anything already pulled through the TLS layer
-                            // is valid framed data (bare TCP) or nothing at
-                            // all (TLS — plaintext would never decrypt), so
-                            // it is safe to deliver before going raw.
-                            self.outbox.extend(self.inbox.drain(..));
-                            self.state = if self.inner.raw_tcp().is_some() {
-                                VisionState::DirectRaw
-                            } else {
-                                VisionState::Raw
-                            };
-                        }
-                        0 => {
-                            if self.inbox.len() < 5 {
-                                break;
-                            }
-                            let next = self.inbox[0];
-                            let content =
-                                u16::from_be_bytes([self.inbox[1], self.inbox[2]]) as usize;
-                            let padding =
-                                u16::from_be_bytes([self.inbox[3], self.inbox[4]]) as usize;
-                            self.inbox.drain(..5);
-                            self.state = VisionState::Framed {
-                                content_remaining: content,
-                                padding_remaining: padding,
-                                command: next,
-                            };
-                        }
-                        _ => {
-                            self.state = VisionState::Failed;
-                        }
-                    }
-                }
-                VisionState::Raw => {
-                    self.outbox.extend(self.inbox.drain(..));
-                    break;
-                }
-                _ => break,
-            }
         }
     }
 }
@@ -500,45 +385,199 @@ impl<S: AsyncRead + RawTcp + Unpin> AsyncRead for VisionStream<S> {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
+        if buf.remaining() == 0 {
+            return std::task::Poll::Ready(Ok(()));
+        }
+        let initial_filled = buf.filled().len();
+
         loop {
-            if !self.outbox.is_empty() {
-                let n = self.outbox.len().min(buf.remaining());
-                let (front, _) = self.outbox.as_slices();
-                buf.put_slice(&front[..n]);
-                self.outbox.drain(..n);
-                return std::task::Poll::Ready(Ok(()));
-            }
-            match self.state {
-                VisionState::Raw => {
-                    return std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
-                }
-                VisionState::DirectRaw => {
-                    let tcp = self.inner.raw_tcp().expect("checked at transition");
-                    return std::pin::Pin::new(tcp).poll_read(cx, buf);
-                }
-                VisionState::Failed => {
-                    return std::task::Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "vision: unknown padding command",
-                    )));
-                }
-                _ => {}
-            }
-            if self.inner_eof {
-                return std::task::Poll::Ready(Ok(()));
-            }
-            let mut chunk = [0u8; 8192];
-            let mut chunk_buf = tokio::io::ReadBuf::new(&mut chunk);
-            match std::pin::Pin::new(&mut self.inner).poll_read(cx, &mut chunk_buf) {
-                std::task::Poll::Pending => return std::task::Poll::Pending,
-                std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
-                std::task::Poll::Ready(Ok(())) => {
-                    if chunk_buf.filled().is_empty() {
-                        self.inner_eof = true;
-                    } else {
-                        self.inbox.extend_from_slice(chunk_buf.filled());
+            let needs_inner_read = {
+                let this = &mut *self;
+                let state = std::mem::replace(&mut this.state, VisionState::Failed);
+                match state {
+                    VisionState::Detect => {
+                        if this.inbox.len() < 21 {
+                            if this.inner_eof {
+                                this.state = VisionState::Raw;
+                                continue;
+                            }
+                            this.state = VisionState::Detect;
+                            true
+                        } else if this.inbox[..16] == this.uuid {
+                            this.inbox.advance(16);
+                            this.state = VisionState::Framed {
+                                content_remaining: 0,
+                                padding_remaining: 0,
+                                command: 0,
+                            };
+                            continue;
+                        } else {
+                            this.state = VisionState::Raw;
+                            continue;
+                        }
                     }
-                    self.parse();
+                    VisionState::Framed {
+                        mut content_remaining,
+                        mut padding_remaining,
+                        command,
+                    } => {
+                        if content_remaining > 0 {
+                            let count =
+                                content_remaining.min(this.inbox.len()).min(buf.remaining());
+                            if count > 0 {
+                                buf.put_slice(&this.inbox[..count]);
+                                this.inbox.advance(count);
+                                content_remaining -= count;
+                            }
+                            this.state = VisionState::Framed {
+                                content_remaining,
+                                padding_remaining,
+                                command,
+                            };
+                            if buf.remaining() == 0 {
+                                return std::task::Poll::Ready(Ok(()));
+                            }
+                            if content_remaining == 0 {
+                                continue;
+                            }
+                            if this.inner_eof || buf.filled().len() > initial_filled {
+                                return std::task::Poll::Ready(Ok(()));
+                            }
+                            true
+                        } else if padding_remaining > 0 {
+                            let count = padding_remaining.min(this.inbox.len());
+                            this.inbox.advance(count);
+                            padding_remaining -= count;
+                            this.state = VisionState::Framed {
+                                content_remaining,
+                                padding_remaining,
+                                command,
+                            };
+                            if padding_remaining == 0 {
+                                continue;
+                            }
+                            if this.inner_eof || buf.filled().len() > initial_filled {
+                                return std::task::Poll::Ready(Ok(()));
+                            }
+                            true
+                        } else {
+                            match command {
+                                VISION_COMMAND_END => {
+                                    this.state = VisionState::Raw;
+                                    continue;
+                                }
+                                VISION_COMMAND_DIRECT => {
+                                    // Drain bytes already read through the outer TLS stream
+                                    // before switching the read side to the raw socket.
+                                    this.state = if this.inner.raw_tcp().is_some() {
+                                        VisionState::DirectRaw
+                                    } else {
+                                        VisionState::Raw
+                                    };
+                                    continue;
+                                }
+                                0 => {
+                                    if this.inbox.len() < 5 {
+                                        this.state = VisionState::Framed {
+                                            content_remaining,
+                                            padding_remaining,
+                                            command,
+                                        };
+                                        if this.inner_eof || buf.filled().len() > initial_filled {
+                                            return std::task::Poll::Ready(Ok(()));
+                                        }
+                                        true
+                                    } else {
+                                        let command = this.inbox[0];
+                                        let content_remaining =
+                                            u16::from_be_bytes([this.inbox[1], this.inbox[2]])
+                                                as usize;
+                                        let padding_remaining =
+                                            u16::from_be_bytes([this.inbox[3], this.inbox[4]])
+                                                as usize;
+                                        this.inbox.advance(5);
+                                        this.state = VisionState::Framed {
+                                            content_remaining,
+                                            padding_remaining,
+                                            command,
+                                        };
+                                        continue;
+                                    }
+                                }
+                                _ => {
+                                    this.state = VisionState::Failed;
+                                    if buf.filled().len() > initial_filled {
+                                        return std::task::Poll::Ready(Ok(()));
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    VisionState::Raw => {
+                        this.state = VisionState::Raw;
+                        if !this.inbox.is_empty() {
+                            let count = this.inbox.len().min(buf.remaining());
+                            buf.put_slice(&this.inbox[..count]);
+                            this.inbox.advance(count);
+                            return std::task::Poll::Ready(Ok(()));
+                        }
+                        if buf.filled().len() > initial_filled {
+                            return std::task::Poll::Ready(Ok(()));
+                        }
+                        return std::pin::Pin::new(&mut this.inner).poll_read(cx, buf);
+                    }
+                    VisionState::DirectRaw => {
+                        this.state = VisionState::DirectRaw;
+                        if !this.inbox.is_empty() {
+                            let count = this.inbox.len().min(buf.remaining());
+                            buf.put_slice(&this.inbox[..count]);
+                            this.inbox.advance(count);
+                            return std::task::Poll::Ready(Ok(()));
+                        }
+                        if buf.filled().len() > initial_filled {
+                            return std::task::Poll::Ready(Ok(()));
+                        }
+                        let tcp = this.inner.raw_tcp().expect("checked at transition");
+                        return std::pin::Pin::new(tcp).poll_read(cx, buf);
+                    }
+                    VisionState::Failed => {
+                        this.state = VisionState::Failed;
+                        if buf.filled().len() > initial_filled {
+                            return std::task::Poll::Ready(Ok(()));
+                        }
+                        return std::task::Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "vision: unknown padding command",
+                        )));
+                    }
+                }
+            };
+
+            debug_assert!(needs_inner_read);
+            let this = &mut *self;
+            let old_len = this.inbox.len();
+            this.inbox.resize(old_len + 8192, 0);
+            let (poll, filled) = {
+                let mut read_buf = tokio::io::ReadBuf::new(&mut this.inbox[old_len..]);
+                let poll = std::pin::Pin::new(&mut this.inner).poll_read(cx, &mut read_buf);
+                let filled = read_buf.filled().len();
+                (poll, filled)
+            };
+            match poll {
+                std::task::Poll::Pending => {
+                    this.inbox.truncate(old_len);
+                    return std::task::Poll::Pending;
+                }
+                std::task::Poll::Ready(Err(error)) => {
+                    this.inbox.truncate(old_len);
+                    return std::task::Poll::Ready(Err(error));
+                }
+                std::task::Poll::Ready(Ok(())) => {
+                    this.inbox.truncate(old_len + filled);
+                    if filled == 0 {
+                        this.inner_eof = true;
+                    }
                 }
             }
         }
@@ -581,13 +620,8 @@ impl TcpOutbound for VLessHandler {
         let uuid_str = node.password.as_deref().unwrap_or("");
         let uuid_bytes = Self::parse_uuid(uuid_str)?;
 
-        let header = Self::build_request_header(
-            &uuid_bytes,
-            CMD_TCP,
-            target,
-            target_domain,
-            node.flow.as_deref(),
-        );
+        let header =
+            Self::build_request_header(&uuid_bytes, target, target_domain, node.flow.as_deref())?;
         let addr = format!("{}:{}", node.host(), node.port);
         let tcp = crate::util::connect_outbound(&addr, connect_timeout).await?;
         let mut stream = Self::dial_stream(node, uuid_bytes, tcp).await?;
@@ -611,13 +645,8 @@ impl TcpOutbound for VLessHandler {
         let uuid_str = node.password.as_deref().unwrap_or("");
         let uuid_bytes = Self::parse_uuid(uuid_str)?;
 
-        let header = Self::build_request_header(
-            &uuid_bytes,
-            CMD_TCP,
-            target,
-            target_domain,
-            node.flow.as_deref(),
-        );
+        let header =
+            Self::build_request_header(&uuid_bytes, target, target_domain, node.flow.as_deref())?;
         let mut stream = Self::dial_stream(node, uuid_bytes, tcp).await?;
         stream.write_all(&header).await?;
 
@@ -660,6 +689,90 @@ mod tests {
     }
 
     impl RawTcp for ChunkedReader {}
+
+    struct SegmentedReader {
+        segments: std::collections::VecDeque<std::collections::VecDeque<u8>>,
+    }
+
+    impl tokio::io::AsyncRead for SegmentedReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            while self
+                .segments
+                .front()
+                .is_some_and(|segment| segment.is_empty())
+            {
+                self.segments.pop_front();
+            }
+            let Some(segment) = self.segments.front_mut() else {
+                return std::task::Poll::Ready(Ok(()));
+            };
+            let count = segment.len().min(buf.remaining());
+            let (front, _) = segment.as_slices();
+            buf.put_slice(&front[..count]);
+            segment.drain(..count);
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl RawTcp for SegmentedReader {}
+
+    struct DirectSwitchIo {
+        prefix: std::collections::VecDeque<u8>,
+        raw: TcpStream,
+        outer_writes: std::sync::Arc<parking_lot::Mutex<Vec<u8>>>,
+    }
+
+    impl tokio::io::AsyncRead for DirectSwitchIo {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.prefix.is_empty() {
+                return std::pin::Pin::new(&mut self.raw).poll_read(cx, buf);
+            }
+            let count = self.prefix.len().min(buf.remaining());
+            let (front, _) = self.prefix.as_slices();
+            buf.put_slice(&front[..count]);
+            self.prefix.drain(..count);
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl tokio::io::AsyncWrite for DirectSwitchIo {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.outer_writes.lock().extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl RawTcp for DirectSwitchIo {
+        fn raw_tcp(&mut self) -> Option<&mut TcpStream> {
+            Some(&mut self.raw)
+        }
+    }
 
     fn vision_frame(command: u8, content: &[u8], padding: usize) -> Vec<u8> {
         let mut frame = vec![
@@ -715,6 +828,113 @@ mod tests {
                 "chunk={chunk}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn vision_one_byte_destination_buffers_preserve_payload() {
+        let uuid = [3_u8; 16];
+        let mut data = uuid.to_vec();
+        data.extend(vision_frame(0, b"first", 4));
+        data.extend(vision_frame(0, b"", 0));
+        data.extend(vision_frame(VISION_COMMAND_END, b"second", 2));
+        data.extend_from_slice(b"-raw");
+        let reader = ChunkedReader {
+            data: data.into(),
+            chunk: 8192,
+        };
+        let mut stream = VisionStream::new(reader, uuid);
+        let mut output = Vec::new();
+        loop {
+            let mut byte = [0_u8; 1];
+            let size = stream.read(&mut byte).await.unwrap();
+            if size == 0 {
+                break;
+            }
+            assert_eq!(size, 1);
+            output.push(byte[0]);
+        }
+        assert_eq!(output, b"firstsecond-raw");
+    }
+
+    #[tokio::test]
+    async fn vision_accepts_every_source_frame_boundary() {
+        let uuid = [4_u8; 16];
+        let mut data = uuid.to_vec();
+        data.extend(vision_frame(0, b"alpha", 3));
+        data.extend(vision_frame(0, b"", 2));
+        data.extend(vision_frame(VISION_COMMAND_END, b"omega", 0));
+        data.extend_from_slice(b"-tail");
+
+        for boundary in 0..=data.len() {
+            let reader = SegmentedReader {
+                segments: vec![
+                    data[..boundary].iter().copied().collect(),
+                    data[boundary..].iter().copied().collect(),
+                ]
+                .into(),
+            };
+            let mut stream = VisionStream::new(reader, uuid);
+            let mut output = Vec::new();
+            stream.read_to_end(&mut output).await.unwrap();
+            assert_eq!(output, b"alphaomega-tail", "boundary={boundary}");
+        }
+    }
+
+    #[tokio::test]
+    async fn vision_truncated_detected_frame_ends_cleanly() {
+        let uuid = [5_u8; 16];
+        let mut truncated_content = uuid.to_vec();
+        truncated_content.extend_from_slice(&[0, 0, 5, 0, 0]);
+        truncated_content.extend_from_slice(b"ab");
+        assert_eq!(unpad_all(uuid, &truncated_content, 2).await, b"ab");
+
+        let mut truncated_padding = uuid.to_vec();
+        truncated_padding.extend_from_slice(&[0, 0, 3, 0, 5]);
+        truncated_padding.extend_from_slice(b"abc\0\0");
+        assert_eq!(unpad_all(uuid, &truncated_padding, 3).await, b"abc");
+    }
+
+    #[tokio::test]
+    async fn vision_sub_probe_size_streams_pass_through_raw() {
+        let uuid = [6_u8; 16];
+        let mut source = uuid.to_vec();
+        source.extend_from_slice(&[0, 0, 0, 0]);
+        for length in 0..21 {
+            assert_eq!(
+                unpad_all(uuid, &source[..length], 1).await,
+                source[..length],
+                "length={length}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn vision_direct_drains_buffered_tail_and_keeps_outer_writes() {
+        let uuid = [8_u8; 16];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(b"raw-tail").await.unwrap();
+        });
+        let raw = TcpStream::connect(address).await.unwrap();
+        let mut prefix = uuid.to_vec();
+        prefix.extend(vision_frame(VISION_COMMAND_DIRECT, b"framed-", 1));
+        prefix.extend_from_slice(b"buffered-");
+        let outer_writes = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let io = DirectSwitchIo {
+            prefix: prefix.into(),
+            raw,
+            outer_writes: std::sync::Arc::clone(&outer_writes),
+        };
+        let mut stream = VisionStream::new(io, uuid);
+        let mut output = Vec::new();
+        stream.read_to_end(&mut output).await.unwrap();
+        assert_eq!(output, b"framed-buffered-raw-tail");
+
+        stream.write_all(b"outer-uplink").await.unwrap();
+        assert_eq!(&*outer_writes.lock(), b"outer-uplink");
+        server.await.unwrap();
     }
 
     /// After a Direct command the server abandons the outer TLS session
@@ -937,7 +1157,7 @@ mod tests {
         let uuid_bytes = VLessHandler::parse_uuid(uuid_str).unwrap();
         let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
 
-        let header = VLessHandler::build_request_header(&uuid_bytes, CMD_TCP, target, None, None);
+        let header = VLessHandler::build_request_header(&uuid_bytes, target, None, None).unwrap();
 
         // ver(1) + uuid(16) + addon_len(1) + cmd(1) + port(2) + atyp(1) + addr(4)
         assert_eq!(header.len(), 1 + 16 + 1 + 1 + 2 + 1 + 4);
@@ -958,7 +1178,7 @@ mod tests {
         let domain = "example.com";
 
         let header =
-            VLessHandler::build_request_header(&uuid_bytes, CMD_TCP, target, Some(domain), None);
+            VLessHandler::build_request_header(&uuid_bytes, target, Some(domain), None).unwrap();
 
         // ver(1) + uuid(16) + addon_len(1) + cmd(1) + port(2) + atyp(1) + domain_len(1) + domain(11)
         assert_eq!(header.len(), 1 + 16 + 1 + 1 + 2 + 1 + 1 + domain.len());
@@ -978,7 +1198,7 @@ mod tests {
         let uuid_bytes = VLessHandler::parse_uuid(uuid_str).unwrap();
         let target: SocketAddr = "[::1]:1080".parse().unwrap();
 
-        let header = VLessHandler::build_request_header(&uuid_bytes, CMD_TCP, target, None, None);
+        let header = VLessHandler::build_request_header(&uuid_bytes, target, None, None).unwrap();
 
         // ver(1) + uuid(16) + addon_len(1) + cmd(1) + port(2) + atyp(1) + addr(16)
         assert_eq!(header.len(), 1 + 16 + 1 + 1 + 2 + 1 + 16);
@@ -994,30 +1214,14 @@ mod tests {
     }
 
     #[test]
-    fn test_vless_header_udp() {
-        let uuid_str = "b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3";
-        let uuid_bytes = VLessHandler::parse_uuid(uuid_str).unwrap();
-        let target: SocketAddr = "1.2.3.4:9999".parse().unwrap();
-
-        let header = VLessHandler::build_request_header(&uuid_bytes, CMD_UDP, target, None, None);
-
-        assert_eq!(header[18], CMD_UDP);
-        assert_eq!(&header[19..21], &[0x27, 0x0f]); // port 9999
-    }
-
-    #[test]
     fn test_vless_header_vision_flow() {
         let uuid_str = "b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3";
         let uuid_bytes = VLessHandler::parse_uuid(uuid_str).unwrap();
         let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
 
-        let header = VLessHandler::build_request_header(
-            &uuid_bytes,
-            CMD_TCP,
-            target,
-            None,
-            Some("xtls-rprx-vision"),
-        );
+        let header =
+            VLessHandler::build_request_header(&uuid_bytes, target, None, Some("xtls-rprx-vision"))
+                .unwrap();
 
         // ver(1) + uuid(16) + addon_len(1) + addon(18) + cmd(1) + port(2) + atyp(1) + addr(4)
         assert_eq!(header.len(), 1 + 16 + 1 + 18 + 1 + 2 + 1 + 4);
@@ -1030,6 +1234,30 @@ mod tests {
         assert_eq!(&header[37..39], &[0x01, 0xbb]); // port 443
         assert_eq!(header[39], ATYP_IPV4);
         assert_eq!(&header[40..44], &[93, 184, 216, 34]);
+    }
+
+    #[test]
+    fn test_vless_header_rejects_unsupported_flow_and_long_domain() {
+        let uuid_bytes = VLessHandler::parse_uuid("b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3").unwrap();
+        let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
+
+        let flow_error =
+            VLessHandler::build_request_header(&uuid_bytes, target, None, Some("unsupported"))
+                .unwrap_err();
+        assert_eq!(flow_error.to_string(), "VLESS: unsupported flow");
+
+        let long_domain = "a".repeat(256);
+        let domain_error =
+            VLessHandler::build_request_header(&uuid_bytes, target, Some(&long_domain), None)
+                .unwrap_err();
+        assert_eq!(
+            domain_error.to_string(),
+            "VLESS: target domain exceeds 255 bytes"
+        );
+
+        let empty_flow =
+            VLessHandler::build_request_header(&uuid_bytes, target, None, Some("")).unwrap();
+        assert_eq!(empty_flow[17], 0);
     }
 
     #[test]

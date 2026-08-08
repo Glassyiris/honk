@@ -119,7 +119,7 @@ dae 语法中节点**只能以分享链接书写**：`tag: 'scheme://...'` 或�
 | `ss` | `shadowsocks` | 是 | 是 | AEAD + `2022-blake3-*` |
 | `trojan` | | 是 | 是 | TLS；经 transport 支持 WS/gRPC |
 | `vmess` | | 是 | 否 | AEAD；WS/gRPC；`security=reality` 可启用 REALITY；仅在 `rprx` feature 下注册（honk-core 默认构建开启） |
-| `vless` | | 是 | 否 | REALITY + `xtls-rprx-vision` flow；经 transport 支持 WS/gRPC；头里的 UDP 仅测试存在；仅在 `rprx` feature 下注册 |
+| `vless` | | 是 | 否 | REALITY + `xtls-rprx-vision` flow；经 transport 支持 WS/gRPC；仅在 `rprx` feature 下注册 |
 | `socks5` | | 是 | 是 | UDP ASSOCIATE |
 | `hysteria2` | | 是 | 是 | 真实 QUIC/H3；salamander；brutal（配带宽时）或 BBR；端口跳跃 |
 | `tuic` | | 是 | 是 | TUIC v5 / quinn |
@@ -149,6 +149,14 @@ node {
 ```
 
 已实测互通的 VLESS 组合（对 sing-box 1.13 服务端）：TCP+REALITY+vision、TCP+REALITY、TCP+WS、TCP+WS+TLS、TCP+gRPC。`xtls-rprx-vision` flow 仅与 TCP+REALITY/TLS 组合——WS/gRPC 下没有可供 XTLS direct-copy 切换的裸连接，与上游一致。
+
+Clash 订阅会在派生节点身份前把 VLESS 的 `uuid`、`servername`/`sni`、
+`flow`、`network` 以及嵌套 `reality-opts`、`ws-opts`、`grpc-opts` 映射到
+同一组节点字段；不完整的 `reality-opts` 条目直接跳过。TCP/WS/gRPC
+以外的传输、非 Vision flow、缺少 TLS/REALITY 的 Vision，以及经
+WS/gRPC 的 Vision 会由 `honk-tool sub` 显示但不探测。
+`client-fingerprint` 不是节点字段，由全局 TLS 模式统一控制。
+
 **VLESS + REALITY（xtls-rprx-vision）**
 
 `security=reality` 把 vless（或 vmess）节点从普通 TLS 切换为 REALITY 握手；`pbk`/`sid`/`spx` 携带 REALITY 参数，`flow=xtls-rprx-vision` 启用 XTLS Vision 拼接：
