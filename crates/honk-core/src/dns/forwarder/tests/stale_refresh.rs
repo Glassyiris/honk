@@ -128,7 +128,6 @@ async fn hot_near_expiry_hits_own_one_refresh_task_and_close_cleans_it() {
     ));
     let service = forwarder.cache_service().await;
     forwarder.resolve(&make_a_query()).await.expect("prime");
-    tokio::time::sleep(Duration::from_millis(1900)).await;
 
     let start = Arc::new(tokio::sync::Barrier::new(CALLERS + 1));
     let mut callers = tokio::task::JoinSet::new();
