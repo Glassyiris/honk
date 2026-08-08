@@ -97,6 +97,31 @@ ssh root@10.10.10.57 "bash /root/lab-bench.sh 'honk dae' 'hy2 tuic ss2022 trojan
 ssh root@10.10.10.57 bash /root/test-protocols.sh
 ```
 
+### VLESS Vision codec 候选基准
+
+`crates/honk-outbound/benches/vless_vision.rs` 以明文 loopback 承载隔离响应
+解码开销；生产 Vision 仍只允许 TLS/REALITY。两个用例都从确定性的
+16 KiB 源写入中解码恰好 **16 MiB**，且每个二进制会在 Criterion 计时前
+校验解码字节数：
+
+- `vision_framed_16m`：多组 content/padding frame，最后为 `End`；
+- `vision_direct_16m`：一个 `Direct` frame，随后为 raw tail。
+
+配对的 release-musl 二进制仅在已确认的 x86-64 Debian 主机
+`root@10.10.10.50` 上执行，并在同一 Criterion 目录中背靠背运行：
+
+```bash
+ssh root@10.10.10.50 \
+  'mkdir -p /root/vless-vision-criterion && cd /root/vless-vision-criterion && \
+   /root/vless-vision-bench.before --bench --save-baseline vless-before-final'
+ssh root@10.10.10.50 \
+  'cd /root/vless-vision-criterion && \
+   /root/vless-vision-bench.after --bench --baseline vless-before-final'
+```
+
+候选仅在 framed 点估计改善、其 95% 区间排除超过 3% 的降速，且 Direct
+点估计回退不超过 3% 时通过。
+
 ## 结果(2026-08-06,UDP post-decision 卸载验证轮 @ NanoPi R2S)
 
 验证 UDP QUIC 卸载(drop-and-reinject 重构版,`HONK_UDP_POST_DECISION_OFFLOAD=1`)。

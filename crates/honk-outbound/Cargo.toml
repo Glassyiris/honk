@@ -53,7 +53,7 @@ http.workspace = true
 rcgen.workspace = true
 tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
-criterion = { version = "0.8", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["async_tokio", "html_reports"] }
 # rustls: test-only — loopback TLS/QUIC servers prove wire interop with the
 # BoringSSL client stack (and cross-check the QUIC crypto backend)
 tokio-rustls.workspace = true
@@ -89,3 +89,8 @@ required-features = ["rprx"]
 [[bench]]
 name = "group_selection"
 harness = false
+
+[[bench]]
+name = "vless_vision"
+harness = false
+required-features = ["rprx"]

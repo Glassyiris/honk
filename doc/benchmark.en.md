@@ -111,6 +111,32 @@ ssh root@10.10.10.57 "bash /root/lab-bench.sh 'honk dae' 'hy2 tuic ss2022 trojan
 ssh root@10.10.10.57 bash /root/test-protocols.sh
 ```
 
+### VLESS Vision codec candidate benchmark
+
+`crates/honk-outbound/benches/vless_vision.rs` isolates response decoding on a
+clear loopback carrier; production Vision remains TLS/REALITY-only. Both cases
+decode exactly **16 MiB** from deterministic 16 KiB source writes, and each
+binary validates the decoded byte count before Criterion starts timing:
+
+- `vision_framed_16m`: many content/padding frames ending with `End`;
+- `vision_direct_16m`: one `Direct` frame followed by the raw tail.
+
+The paired release-musl binaries run on the confirmed x86-64 Debian host
+`root@10.10.10.50`, from one Criterion directory and back-to-back:
+
+```bash
+ssh root@10.10.10.50 \
+  'mkdir -p /root/vless-vision-criterion && cd /root/vless-vision-criterion && \
+   /root/vless-vision-bench.before --bench --save-baseline vless-before-final'
+ssh root@10.10.10.50 \
+  'cd /root/vless-vision-criterion && \
+   /root/vless-vision-bench.after --bench --baseline vless-before-final'
+```
+
+Accept a candidate only when the framed point estimate improves and its 95%
+interval excludes a slowdown greater than 3%; the Direct point estimate may
+regress by at most 3%.
+
 ## Results (2026-08-06, UDP post-decision offload verification @ NanoPi R2S)
 
 Verifies the QUIC UDP offload (drop-and-reinject rebuild,
