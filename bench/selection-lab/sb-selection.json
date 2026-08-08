@@ -1,0 +1,39 @@
+{
+  "log": { "level": "warn" },
+  "experimental": {
+    "clash_api": { "external_controller": "127.0.0.1:9091" }
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "sb0",
+      "address": ["172.19.0.1/30"],
+      "auto_route": true,
+      "strict_route": true,
+      "stack": "mixed"
+    }
+  ],
+  "outbounds": [
+    { "type": "socks", "tag": "relay-a", "server": "10.10.10.70", "server_port": 12001 },
+    { "type": "socks", "tag": "relay-b", "server": "10.10.10.70", "server_port": 12002 },
+    { "type": "socks", "tag": "relay-c", "server": "10.10.10.70", "server_port": 12003 },
+    {
+      "type": "urltest",
+      "tag": "proxy",
+      "outbounds": ["relay-a", "relay-b", "relay-c"],
+      "url": "http://10.10.10.70/",
+      "interval": "3s",
+      "tolerance": 50
+    },
+    { "type": "direct", "tag": "direct" }
+  ],
+  "route": {
+    "rules": [
+      { "port": [12001, 12002, 12003], "outbound": "direct" },
+      { "port": [9001, 9002, 9003], "outbound": "proxy" }
+    ],
+    "final": "direct",
+    "auto_detect_interface": true
+  }
+}

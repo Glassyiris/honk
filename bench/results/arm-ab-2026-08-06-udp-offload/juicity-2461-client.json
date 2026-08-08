@@ -1,0 +1,10 @@
+{
+  "listen": "127.0.0.1:11080",
+  "server": "10.10.10.70:2461",
+  "uuid": "00000000-0000-0000-0000-000000000001",
+  "password": "testpass123",
+  "sni": "hy2.test",
+  "allow_insecure": true,
+  "congestion_control": "bbr",
+  "log_level": "info"
+}

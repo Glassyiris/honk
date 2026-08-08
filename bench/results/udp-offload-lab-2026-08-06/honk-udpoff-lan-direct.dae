@@ -1,0 +1,26 @@
+global {
+    lan_interface: veth-lab
+    wan_interface: ens3
+    log_level: info
+    dial_mode: domain++
+    allow_insecure: true
+    auto_config_kernel_parameter: true
+    check_interval: 3600s
+}
+node {
+    ps: 'socks5://10.10.10.70:12081'
+}
+routing {
+    dip(10.10.10.0/24) -> direct(must)
+    domain(suffix: hy2.test) -> direct
+    fallback: direct
+}
+dns {
+    upstream { alidns: 'udp://223.5.5.5:53' }
+    routing { request { fallback: alidns } }
+}
+experimental {
+    clash_api {
+        external_controller: '127.0.0.1:19099'
+    }
+}

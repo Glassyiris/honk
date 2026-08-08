@@ -1,0 +1,251 @@
+time="Aug 08 11:50:53" level=info msg="Include config files: [/root/dae-benchmark-20260808.dae]"
+time="Aug 08 11:50:53" level=warning msg="so_mark_from_dae is unset; using internal socket mark 0x100 to prevent dae UDP self-capture"
+time="Aug 08 11:50:53" level=info msg="purging stale TC filters before startup"
+time="Aug 08 11:50:53" level=info msg="Waiting for network..."
+time="Aug 08 11:50:53" level=info msg="Network online."
+time="Aug 08 11:50:53" level=info msg="Building control plane and routing rules..."
+time="Aug 08 11:50:53" level=info msg="Kernel v6.18.41 supports Netkit, attempting to create Netkit device pair"
+time="Aug 08 11:50:53" level=info msg="Successfully created Netkit device pair dae0 <-> dae0peer via netlink API (scrub=false)"
+time="Aug 08 11:50:53" level=info msg="Successfully created Netkit device pair dae0 <-> dae0peer using netlink API"
+time="Aug 08 11:50:53" level=info msg="Successfully created Netkit device pair (performance mode)"
+time="Aug 08 11:50:53" level=info msg="Loading eBPF programs and maps into the kernel..."
+time="Aug 08 11:50:53" level=info msg="The loading process takes about 120MB free memory, which will be released after loading. Insufficient memory will cause loading failure."
+time="Aug 08 11:50:53" level=info msg="Safely enabled bpf_redirect_peer() (kernel v6.18.41, netkit+scrub=NONE)"
+time="Aug 08 11:50:55" level=info msg="Loaded eBPF programs and maps"
+time="Aug 08 11:50:55" level=warning msg="AllowInsecure is enabled, but it is not recommended. Please make sure you have to turn it on."
+time="Aug 08 11:50:55" level=info msg="Optimizing and loading routing rules (this may take a while for large rule sets)..."
+time="Aug 08 11:50:55" level=info msg="Building routing matcher..."
+time="Aug 08 11:50:55" level=info msg="Loading routing rules into kernel space (BPF)..."
+time="Aug 08 11:50:55" level=info msg="Routing match set len: 17/1024"
+time="Aug 08 11:50:55" level=info msg="Building userspace routing matcher..."
+time="Aug 08 11:50:55" level=info msg="Health check will only verify 5 outbounds referenced by routing rules: [direct hy2 tuic ss2022 trojan]"
+time="Aug 08 11:50:55" level=info msg="Memory usage after routing build: Alloc=4MiB, Sys=26MiB, HeapObjects=11175"
+time="Aug 08 11:50:55" level=info msg="Bind to LAN: veth-lab"
+time="Aug 08 11:50:55" level=info msg="TCP relay eBPF offload is disabled due to kernel panic issues; falling back to userspace relay"
+time="Aug 08 11:50:55" level=info msg="Bind to WAN: enxbada2e0076a1"
+time="Aug 08 11:50:55" level=info msg="Control plane built in 1.896820156s"
+time="Aug 08 11:50:55" level=info msg="Total startup time: 2.070892098s"
+time="Aug 08 11:51:00" level=info msg="192.168.222.2:40766 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:00" level=info msg="192.168.222.2:40778 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:00" level=info msg="192.168.222.2:40794 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:00" level=info msg="192.168.222.2:40808 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:00" level=info msg="192.168.222.2:40822 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:00" level=info msg="192.168.222.2:40832 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:00" level=info msg="192.168.222.2:48814 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:00" level=info msg="192.168.222.2:48822 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:00" level=info msg="192.168.222.2:48828 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:00" level=info msg="192.168.222.2:48832 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:00" level=info msg="192.168.222.2:48848 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:01" level=info msg="192.168.222.2:48850 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:01" level=info msg="192.168.222.2:48854 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:01" level=info msg="192.168.222.2:48858 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:01" level=info msg="192.168.222.2:48862 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:01" level=info msg="192.168.222.2:48878 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:01" level=info msg="192.168.222.2:59960 <-> 10.10.10.70:5204" dialer=trojan dscp=0 ip="10.10.10.70:5204" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:01" level=info msg="192.168.222.2:59970 <-> 10.10.10.70:5204" dialer=trojan dscp=0 ip="10.10.10.70:5204" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:09" level=info msg="192.168.222.2:59982 <-> 10.10.10.70:5204" dialer=trojan dscp=0 ip="10.10.10.70:5204" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:09" level=info msg="192.168.222.2:59990 <-> 10.10.10.70:5204" dialer=trojan dscp=0 ip="10.10.10.70:5204" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:18" level=info msg="192.168.222.2:33272 <-> 10.10.10.70:5204" dialer=trojan dscp=0 ip="10.10.10.70:5204" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:18" level=info msg="192.168.222.2:33284 <-> 10.10.10.70:5204" dialer=trojan dscp=0 ip="10.10.10.70:5204" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:26" level=info msg="192.168.222.2:57766 <-> 10.10.10.70:5204" dialer=trojan dscp=0 ip="10.10.10.70:5204" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:26" level=info msg="192.168.222.2:57780 <-> 10.10.10.70:5204" dialer=trojan dscp=0 ip="10.10.10.70:5204" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:29" level=info msg="192.168.222.2:46918 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:29" level=info msg="192.168.222.2:46932 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:29" level=info msg="192.168.222.2:46940 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:29" level=info msg="192.168.222.2:46942 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:29" level=info msg="192.168.222.2:46952 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:30" level=info msg="192.168.222.2:46962 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:30" level=info msg="192.168.222.2:46972 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:30" level=info msg="192.168.222.2:44804 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:30" level=info msg="192.168.222.2:44812 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:31" level=info msg="192.168.222.2:44828 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:31" level=info msg="192.168.222.2:44842 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:31" level=info msg="192.168.222.2:44856 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:31" level=info msg="192.168.222.2:44868 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:32" level=info msg="192.168.222.2:44876 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:32" level=info msg="192.168.222.2:44878 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:32" level=info msg="192.168.222.2:44892 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:32" level=info msg="192.168.222.2:44900 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:33" level=info msg="192.168.222.2:44916 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:33" level=info msg="192.168.222.2:44920 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:33" level=info msg="192.168.222.2:44930 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:33" level=info msg="192.168.222.2:44936 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:34" level=info msg="192.168.222.2:44948 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:34" level=info msg="192.168.222.2:44964 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:34" level=info msg="192.168.222.2:44980 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:34" level=info msg="192.168.222.2:44992 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:35" level=info msg="192.168.222.2:44994 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:35" level=info msg="192.168.222.2:45008 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:35" level=info msg="192.168.222.2:45018 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:35" level=info msg="192.168.222.2:45028 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:36" level=info msg="192.168.222.2:45030 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:36" level=info msg="192.168.222.2:45034 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:36" level=info msg="192.168.222.2:45048 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:36" level=info msg="192.168.222.2:45052 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:37" level=info msg="192.168.222.2:45058 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:37" level=info msg="192.168.222.2:45068 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:37" level=info msg="192.168.222.2:45072 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:37" level=info msg="192.168.222.2:45086 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:38" level=info msg="192.168.222.2:45092 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:38" level=info msg="192.168.222.2:45094 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:38" level=info msg="192.168.222.2:45110 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:38" level=info msg="192.168.222.2:45114 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:39" level=info msg="192.168.222.2:45128 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:39" level=info msg="192.168.222.2:45136 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:39" level=info msg="192.168.222.2:45140 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:39" level=info msg="192.168.222.2:45148 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:40" level=info msg="192.168.222.2:45152 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:40" level=info msg="192.168.222.2:45156 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:40" level=info msg="192.168.222.2:36708 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:40" level=info msg="192.168.222.2:36710 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:41" level=info msg="192.168.222.2:36724 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:41" level=info msg="192.168.222.2:36730 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:41" level=info msg="192.168.222.2:36740 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:41" level=info msg="192.168.222.2:36746 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:42" level=info msg="192.168.222.2:36750 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:42" level=info msg="192.168.222.2:36756 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:42" level=info msg="192.168.222.2:36770 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:42" level=info msg="192.168.222.2:36778 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:43" level=info msg="192.168.222.2:36790 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:43" level=info msg="192.168.222.2:36794 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:43" level=info msg="192.168.222.2:36796 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:43" level=info msg="192.168.222.2:36806 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:44" level=info msg="192.168.222.2:36808 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:44" level=info msg="192.168.222.2:36816 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:44" level=info msg="192.168.222.2:36826 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:44" level=info msg="192.168.222.2:36842 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:45" level=info msg="192.168.222.2:36858 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:45" level=info msg="192.168.222.2:36866 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:45" level=info msg="192.168.222.2:36880 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:45" level=info msg="192.168.222.2:36882 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:46" level=info msg="192.168.222.2:36888 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:46" level=info msg="192.168.222.2:36898 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:46" level=info msg="192.168.222.2:36910 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:46" level=info msg="192.168.222.2:36922 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:47" level=info msg="192.168.222.2:36936 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:47" level=info msg="192.168.222.2:36946 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:47" level=info msg="192.168.222.2:36948 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:47" level=info msg="192.168.222.2:36960 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:48" level=info msg="192.168.222.2:36972 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:48" level=info msg="192.168.222.2:36988 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:48" level=info msg="192.168.222.2:36994 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:48" level=info msg="192.168.222.2:36998 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:49" level=info msg="192.168.222.2:37004 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:49" level=info msg="192.168.222.2:37016 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:49" level=info msg="192.168.222.2:37024 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:49" level=info msg="192.168.222.2:37030 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:50" level=info msg="192.168.222.2:37046 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:50" level=info msg="192.168.222.2:37056 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:50" level=info msg="192.168.222.2:40070 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:50" level=info msg="192.168.222.2:40076 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:51" level=info msg="192.168.222.2:40080 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:51" level=info msg="192.168.222.2:40094 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:51" level=info msg="192.168.222.2:40102 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:51" level=info msg="192.168.222.2:40112 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:52" level=info msg="192.168.222.2:40116 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:52" level=info msg="192.168.222.2:40126 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:52" level=info msg="192.168.222.2:40128 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:52" level=info msg="192.168.222.2:40140 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:53" level=info msg="192.168.222.2:40142 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:53" level=info msg="192.168.222.2:40158 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:53" level=info msg="192.168.222.2:40166 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:53" level=info msg="192.168.222.2:40176 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:54" level=info msg="192.168.222.2:40190 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:54" level=info msg="192.168.222.2:40200 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:54" level=info msg="192.168.222.2:40206 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:54" level=info msg="192.168.222.2:40220 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:55" level=info msg="192.168.222.2:40222 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:55" level=info msg="192.168.222.2:40230 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:55" level=info msg="192.168.222.2:40236 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:55" level=info msg="192.168.222.2:40242 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:56" level=info msg="192.168.222.2:40252 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:56" level=info msg="192.168.222.2:40256 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:56" level=info msg="192.168.222.2:40272 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:56" level=info msg="192.168.222.2:40284 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:57" level=info msg="192.168.222.2:40300 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:57" level=info msg="192.168.222.2:40306 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:57" level=info msg="192.168.222.2:40312 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:57" level=info msg="192.168.222.2:40324 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:58" level=info msg="192.168.222.2:40326 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:58" level=info msg="192.168.222.2:40338 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:58" level=info msg="192.168.222.2:40344 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:58" level=info msg="192.168.222.2:40354 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:59" level=info msg="192.168.222.2:40368 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:59" level=info msg="192.168.222.2:40370 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:59" level=info msg="192.168.222.2:40380 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:51:59" level=info msg="192.168.222.2:40386 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:00" level=info msg="192.168.222.2:40402 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:00" level=info msg="192.168.222.2:40414 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:00" level=info msg="192.168.222.2:44126 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:00" level=info msg="192.168.222.2:44140 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:01" level=info msg="192.168.222.2:44148 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:01" level=info msg="192.168.222.2:44156 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:01" level=info msg="192.168.222.2:44172 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:01" level=info msg="192.168.222.2:44174 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:02" level=info msg="192.168.222.2:44188 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:02" level=info msg="192.168.222.2:44190 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:02" level=info msg="192.168.222.2:44194 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:02" level=info msg="192.168.222.2:44196 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:03" level=info msg="192.168.222.2:44206 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:03" level=info msg="192.168.222.2:44216 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:03" level=info msg="192.168.222.2:44226 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:03" level=info msg="192.168.222.2:44234 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:04" level=info msg="192.168.222.2:44244 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:04" level=info msg="192.168.222.2:44246 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:04" level=info msg="192.168.222.2:44262 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:04" level=info msg="192.168.222.2:44278 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:05" level=info msg="192.168.222.2:44290 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:05" level=info msg="192.168.222.2:44304 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:05" level=info msg="192.168.222.2:44316 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:05" level=info msg="192.168.222.2:44332 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:06" level=info msg="192.168.222.2:44344 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:06" level=info msg="192.168.222.2:44350 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:06" level=info msg="192.168.222.2:44364 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:06" level=info msg="192.168.222.2:44376 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:07" level=info msg="192.168.222.2:44382 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:07" level=info msg="192.168.222.2:44388 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:07" level=info msg="192.168.222.2:44402 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:07" level=info msg="192.168.222.2:44408 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:08" level=info msg="192.168.222.2:44420 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:08" level=info msg="192.168.222.2:44434 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:08" level=info msg="192.168.222.2:44448 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:08" level=info msg="192.168.222.2:44464 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:09" level=info msg="192.168.222.2:44476 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:09" level=info msg="192.168.222.2:44490 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:09" level=info msg="192.168.222.2:44506 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:09" level=info msg="192.168.222.2:44510 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:10" level=info msg="192.168.222.2:44520 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:10" level=info msg="192.168.222.2:44530 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:10" level=info msg="192.168.222.2:40982 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:10" level=info msg="192.168.222.2:40984 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:11" level=info msg="192.168.222.2:40998 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:11" level=info msg="192.168.222.2:41000 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:11" level=info msg="192.168.222.2:41008 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:11" level=info msg="192.168.222.2:41010 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:12" level=info msg="192.168.222.2:41014 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:12" level=info msg="192.168.222.2:41026 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:12" level=info msg="192.168.222.2:41040 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:12" level=info msg="192.168.222.2:41050 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:13" level=info msg="192.168.222.2:41062 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:13" level=info msg="192.168.222.2:41078 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:13" level=info msg="192.168.222.2:41094 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:13" level=info msg="192.168.222.2:41106 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:14" level=info msg="192.168.222.2:41114 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:14" level=info msg="192.168.222.2:41130 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:14" level=info msg="192.168.222.2:41136 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:14" level=info msg="192.168.222.2:41140 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:15" level=info msg="192.168.222.2:41150 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:15" level=info msg="192.168.222.2:41158 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:15" level=info msg="192.168.222.2:41160 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:15" level=info msg="192.168.222.2:41172 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:16" level=info msg="192.168.222.2:41180 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:16" level=info msg="192.168.222.2:41194 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:16" level=info msg="192.168.222.2:41200 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:16" level=info msg="192.168.222.2:41214 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:17" level=info msg="192.168.222.2:41220 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:17" level=info msg="192.168.222.2:41228 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:17" level=info msg="192.168.222.2:41234 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:17" level=info msg="192.168.222.2:41246 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:18" level=info msg="192.168.222.2:41256 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:18" level=info msg="192.168.222.2:41268 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=
+time="Aug 08 11:52:18" level=info msg="192.168.222.2:41280 <-> 10.10.10.70:8004" dialer=trojan dscp=0 ip="10.10.10.70:8004" mac="36:87:94:ae:f1:14" network=tcp4 outbound=trojan pname= policy=fixed sniffed=

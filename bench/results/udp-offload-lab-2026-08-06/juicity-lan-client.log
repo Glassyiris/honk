@@ -1,0 +1,8 @@
+[2m2026-08-06T06:06:11.628893Z[0m [32m INFO[0m [2mjuicity_client[0m[2m:[0m Juicity client starting...
+[2m2026-08-06T06:06:11.630056Z[0m [33m WARN[0m [2mjuicity_client::client[0m[2m:[0m TLS certificate verification is DISABLED (allow_insecure=true). This is insecure and should only be used for testing.
+[2m2026-08-06T06:06:11.630137Z[0m [32m INFO[0m [2mjuicity_client::local[0m[2m:[0m Local proxy listening on 127.0.0.1:11080
+[2m2026-08-06T06:06:40.389639Z[0m [32m INFO[0m [2mjuicity_client::local[0m[2m:[0m SOCKS5 CONNECT [3mtarget_addr[0m[2m=[0m10.10.10.70 [3mtarget_port[0m[2m=[0m8080
+[2m2026-08-06T06:06:40.389657Z[0m [32m INFO[0m [2mjuicity_client::local[0m[2m:[0m New connection [3mclient_addr[0m[2m=[0m127.0.0.1:60810 [3mtarget_addr[0m[2m=[0m10.10.10.70 [3mtarget_port[0m[2m=[0m8080 [3mprotocol[0m[2m=[0m"socks5"
+[2m2026-08-06T06:06:40.389683Z[0m [32m INFO[0m [2mjuicity_client::client[0m[2m:[0m Connecting to Juicity server at 198.18.0.70:2460 (slot 1/4)
+[2m2026-08-06T06:06:41.415264Z[0m [32m INFO[0m [2mjuicity_client::client[0m[2m:[0m Authenticated as user 00000000-0000-0000-0000-000000000001 (slot 1/4)
+[2m2026-08-06T06:07:15.883386Z[0m [32m INFO[0m [2mjuicity_client::local[0m[2m:[0m SOCKS5 copy error [3merror[0m[2m=[0mBroken pipe (os error 32) [3mdirection[0m[2m=[0m"quic->local" [3mprotocol[0m[2m=[0m"socks5"

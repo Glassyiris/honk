@@ -1,0 +1,233 @@
+time="Aug 08 06:51:01" level=info msg="Include config files: [/root/dae-benchmark-20260808.dae]"
+time="Aug 08 06:51:01" level=warning msg="so_mark_from_dae is unset; using internal socket mark 0x100 to prevent dae UDP self-capture"
+time="Aug 08 06:51:01" level=info msg="purging stale TC filters before startup"
+time="Aug 08 06:51:01" level=info msg="Waiting for network..."
+time="Aug 08 06:51:01" level=info msg="Network online."
+time="Aug 08 06:51:01" level=info msg="Building control plane and routing rules..."
+time="Aug 08 06:51:01" level=info msg="Kernel v6.12.94 supports Netkit, attempting to create Netkit device pair"
+time="Aug 08 06:51:01" level=info msg="Successfully created Netkit device pair dae0 <-> dae0peer via netlink API (scrub=false)"
+time="Aug 08 06:51:01" level=info msg="Successfully created Netkit device pair dae0 <-> dae0peer using netlink API"
+time="Aug 08 06:51:01" level=info msg="Successfully created Netkit device pair (performance mode)"
+time="Aug 08 06:51:01" level=info msg="Loading eBPF programs and maps into the kernel..."
+time="Aug 08 06:51:01" level=info msg="The loading process takes about 120MB free memory, which will be released after loading. Insufficient memory will cause loading failure."
+time="Aug 08 06:51:01" level=info msg="sysctl /proc/sys/net/ipv4/conf/dae0/rp_filter has unexpected value 2, expected 0"
+time="Aug 08 06:51:01" level=info msg="Safely enabled bpf_redirect_peer() (kernel v6.12.94, netkit+scrub=NONE)"
+time="Aug 08 06:51:01" level=info msg="Loaded eBPF programs and maps"
+time="Aug 08 06:51:01" level=warning msg="AllowInsecure is enabled, but it is not recommended. Please make sure you have to turn it on."
+time="Aug 08 06:51:01" level=info msg="Optimizing and loading routing rules (this may take a while for large rule sets)..."
+time="Aug 08 06:51:01" level=info msg="Building routing matcher..."
+time="Aug 08 06:51:01" level=info msg="Loading routing rules into kernel space (BPF)..."
+time="Aug 08 06:51:01" level=info msg="Routing match set len: 25/128"
+time="Aug 08 06:51:01" level=info msg="Building userspace routing matcher..."
+time="Aug 08 06:51:01" level=info msg="Health check will only verify 7 outbounds referenced by routing rules: [direct hy2 tuic ss2022 trojan anytls-sb anytls-go]"
+time="Aug 08 06:51:01" level=info msg="Memory usage after routing build: Alloc=10MiB, Sys=34MiB, HeapObjects=12065"
+time="Aug 08 06:51:01" level=info msg="Bind to LAN: veth-lab"
+time="Aug 08 06:51:01" level=info msg="TCP relay eBPF offload is disabled due to kernel panic issues; falling back to userspace relay"
+time="Aug 08 06:51:01" level=info msg="Bind to WAN: ens3"
+time="Aug 08 06:51:01" level=info msg="Control plane built in 216.576062ms"
+time="Aug 08 06:51:01" level=info msg="Total startup time: 236.256108ms"
+time="Aug 08 06:51:04" level=info msg="192.168.222.2:60210 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:04" level=info msg="192.168.222.2:60216 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:04" level=info msg="192.168.222.2:53186 <-> 10.10.10.70:5205" dialer=anytls-sb dscp=0 ip="10.10.10.70:5205" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:04" level=info msg="192.168.222.2:53188 <-> 10.10.10.70:5205" dialer=anytls-sb dscp=0 ip="10.10.10.70:5205" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:05" level=info msg="192.168.222.2:53204 <-> 10.10.10.70:5205" dialer=anytls-sb dscp=0 ip="10.10.10.70:5205" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:05" level=info msg="192.168.222.2:53206 <-> 10.10.10.70:5205" dialer=anytls-sb dscp=0 ip="10.10.10.70:5205" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:06" level=info msg="192.168.222.2:60230 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:06" level=info msg="192.168.222.2:60246 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:06" level=info msg="192.168.222.2:60262 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:07" level=info msg="192.168.222.2:60276 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:07" level=info msg="192.168.222.2:60284 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:07" level=info msg="192.168.222.2:60296 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:07" level=info msg="192.168.222.2:60302 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:08" level=info msg="192.168.222.2:60314 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:08" level=info msg="192.168.222.2:60318 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:08" level=info msg="192.168.222.2:60324 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:08" level=info msg="192.168.222.2:60332 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:09" level=info msg="192.168.222.2:60348 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:09" level=info msg="192.168.222.2:60364 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:09" level=info msg="192.168.222.2:60374 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:09" level=info msg="192.168.222.2:60386 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:10" level=info msg="192.168.222.2:60390 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:10" level=info msg="192.168.222.2:60402 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:10" level=info msg="192.168.222.2:60414 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:10" level=info msg="192.168.222.2:60424 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:11" level=info msg="192.168.222.2:46092 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:11" level=info msg="192.168.222.2:46094 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:11" level=info msg="192.168.222.2:46106 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:11" level=info msg="192.168.222.2:46120 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:12" level=info msg="192.168.222.2:46132 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:12" level=info msg="192.168.222.2:46146 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:12" level=info msg="192.168.222.2:46156 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:12" level=info msg="192.168.222.2:46160 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:13" level=info msg="192.168.222.2:46164 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:13" level=info msg="192.168.222.2:46176 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:13" level=info msg="192.168.222.2:46178 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:13" level=info msg="192.168.222.2:46186 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:14" level=info msg="192.168.222.2:46190 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:14" level=info msg="192.168.222.2:46206 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:14" level=info msg="192.168.222.2:46218 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:14" level=info msg="192.168.222.2:46234 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:15" level=info msg="192.168.222.2:46238 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:15" level=info msg="192.168.222.2:46252 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:15" level=info msg="192.168.222.2:46268 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:15" level=info msg="192.168.222.2:46282 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:16" level=info msg="192.168.222.2:46294 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:16" level=info msg="192.168.222.2:46296 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:16" level=info msg="192.168.222.2:46308 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:16" level=info msg="192.168.222.2:46316 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:17" level=info msg="192.168.222.2:46320 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:17" level=info msg="192.168.222.2:46334 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:17" level=info msg="192.168.222.2:46344 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:17" level=info msg="192.168.222.2:46358 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:18" level=info msg="192.168.222.2:46364 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:18" level=info msg="192.168.222.2:46370 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:18" level=info msg="192.168.222.2:46386 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:18" level=info msg="192.168.222.2:46402 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:19" level=info msg="192.168.222.2:46408 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:19" level=info msg="192.168.222.2:46416 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:19" level=info msg="192.168.222.2:46430 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:19" level=info msg="192.168.222.2:46444 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:20" level=info msg="192.168.222.2:46452 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:20" level=info msg="192.168.222.2:46460 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:20" level=info msg="192.168.222.2:46466 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:20" level=info msg="192.168.222.2:46474 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:21" level=info msg="192.168.222.2:37376 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:21" level=info msg="192.168.222.2:37386 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:21" level=info msg="192.168.222.2:37398 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:21" level=info msg="192.168.222.2:37406 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:22" level=info msg="192.168.222.2:37418 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:22" level=info msg="192.168.222.2:37432 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:22" level=info msg="192.168.222.2:37446 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:22" level=info msg="192.168.222.2:37450 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:23" level=info msg="192.168.222.2:37460 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:23" level=info msg="192.168.222.2:37470 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:23" level=info msg="192.168.222.2:37474 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:23" level=info msg="192.168.222.2:37480 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:24" level=info msg="192.168.222.2:37486 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:24" level=info msg="192.168.222.2:37488 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:24" level=info msg="192.168.222.2:37492 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:24" level=info msg="192.168.222.2:37494 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:25" level=info msg="192.168.222.2:37510 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:25" level=info msg="192.168.222.2:37518 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:25" level=info msg="192.168.222.2:37526 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:25" level=info msg="192.168.222.2:37538 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:26" level=info msg="192.168.222.2:37550 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:26" level=info msg="192.168.222.2:37562 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:26" level=info msg="192.168.222.2:37572 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:26" level=info msg="192.168.222.2:37588 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:27" level=info msg="192.168.222.2:37598 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:27" level=info msg="192.168.222.2:37608 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:27" level=info msg="192.168.222.2:37610 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:27" level=info msg="192.168.222.2:37624 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:28" level=info msg="192.168.222.2:37636 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:28" level=info msg="192.168.222.2:37642 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:28" level=info msg="192.168.222.2:37644 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:28" level=info msg="192.168.222.2:37648 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:29" level=info msg="192.168.222.2:37654 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:29" level=info msg="192.168.222.2:37662 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:29" level=info msg="192.168.222.2:37668 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:29" level=info msg="192.168.222.2:37684 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:30" level=info msg="192.168.222.2:37698 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:30" level=info msg="192.168.222.2:37712 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:30" level=info msg="192.168.222.2:37724 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:30" level=info msg="192.168.222.2:37740 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:31" level=info msg="192.168.222.2:45950 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:31" level=info msg="192.168.222.2:45960 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:31" level=info msg="192.168.222.2:45972 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:31" level=info msg="192.168.222.2:45974 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:32" level=info msg="192.168.222.2:45978 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:32" level=info msg="192.168.222.2:45992 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:32" level=info msg="192.168.222.2:46004 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:32" level=info msg="192.168.222.2:46018 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:33" level=info msg="192.168.222.2:46030 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:33" level=info msg="192.168.222.2:46046 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:33" level=info msg="192.168.222.2:46062 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:33" level=info msg="192.168.222.2:46074 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:34" level=info msg="192.168.222.2:46082 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:34" level=info msg="192.168.222.2:46096 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:34" level=info msg="192.168.222.2:46098 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:34" level=info msg="192.168.222.2:46114 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:35" level=info msg="192.168.222.2:46118 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:35" level=info msg="192.168.222.2:46130 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:35" level=info msg="192.168.222.2:46138 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:35" level=info msg="192.168.222.2:46144 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:36" level=info msg="192.168.222.2:46158 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:36" level=info msg="192.168.222.2:46168 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:36" level=info msg="192.168.222.2:46174 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:36" level=info msg="192.168.222.2:46188 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:37" level=info msg="192.168.222.2:46194 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:37" level=info msg="192.168.222.2:46202 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:37" level=info msg="192.168.222.2:46214 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:37" level=info msg="192.168.222.2:46230 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:38" level=info msg="192.168.222.2:46236 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:38" level=info msg="192.168.222.2:46244 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:38" level=info msg="192.168.222.2:46250 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:39" level=info msg="192.168.222.2:46270 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:39" level=info msg="192.168.222.2:46278 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:39" level=info msg="192.168.222.2:46290 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:39" level=info msg="192.168.222.2:46292 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:40" level=info msg="192.168.222.2:46302 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:40" level=info msg="192.168.222.2:46306 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:40" level=info msg="192.168.222.2:46310 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:40" level=info msg="192.168.222.2:46322 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:41" level=info msg="192.168.222.2:42522 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:41" level=info msg="192.168.222.2:42528 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:41" level=info msg="192.168.222.2:42540 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:41" level=info msg="192.168.222.2:42554 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:42" level=info msg="192.168.222.2:42562 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:42" level=info msg="192.168.222.2:42576 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:42" level=info msg="192.168.222.2:42584 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:42" level=info msg="192.168.222.2:42586 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:43" level=info msg="192.168.222.2:42590 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:43" level=info msg="192.168.222.2:42594 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:43" level=info msg="192.168.222.2:42608 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:43" level=info msg="192.168.222.2:42612 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:44" level=info msg="192.168.222.2:42618 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:44" level=info msg="192.168.222.2:42628 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:44" level=info msg="192.168.222.2:42644 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:44" level=info msg="192.168.222.2:42646 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:45" level=info msg="192.168.222.2:42658 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:45" level=info msg="192.168.222.2:42664 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:45" level=info msg="192.168.222.2:42668 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:45" level=info msg="192.168.222.2:42676 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:46" level=info msg="192.168.222.2:42682 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:46" level=info msg="192.168.222.2:42694 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:46" level=info msg="192.168.222.2:42702 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:46" level=info msg="192.168.222.2:42708 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:47" level=info msg="192.168.222.2:42710 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:47" level=info msg="192.168.222.2:42714 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:47" level=info msg="192.168.222.2:42722 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:47" level=info msg="192.168.222.2:42724 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:48" level=info msg="192.168.222.2:42740 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:48" level=info msg="192.168.222.2:42742 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:48" level=info msg="192.168.222.2:42746 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:48" level=info msg="192.168.222.2:42762 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:49" level=info msg="192.168.222.2:42770 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:49" level=info msg="192.168.222.2:42780 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:49" level=info msg="192.168.222.2:42782 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:49" level=info msg="192.168.222.2:42796 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:50" level=info msg="192.168.222.2:42806 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:50" level=info msg="192.168.222.2:42820 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:50" level=info msg="192.168.222.2:42836 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:50" level=info msg="192.168.222.2:42848 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:51" level=info msg="192.168.222.2:56558 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:51" level=info msg="192.168.222.2:56566 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:51" level=info msg="192.168.222.2:56572 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:51" level=info msg="192.168.222.2:56584 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:52" level=info msg="192.168.222.2:56592 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:52" level=info msg="192.168.222.2:56594 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:52" level=info msg="192.168.222.2:56604 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:52" level=info msg="192.168.222.2:56610 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:53" level=info msg="192.168.222.2:56612 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:53" level=info msg="192.168.222.2:56616 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:53" level=info msg="192.168.222.2:56618 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:53" level=info msg="192.168.222.2:56630 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:54" level=info msg="192.168.222.2:56634 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:54" level=info msg="192.168.222.2:56644 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:54" level=info msg="192.168.222.2:56646 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:54" level=info msg="192.168.222.2:56652 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:55" level=info msg="192.168.222.2:56666 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:55" level=info msg="192.168.222.2:56676 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:55" level=info msg="192.168.222.2:56684 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:55" level=info msg="192.168.222.2:56700 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=
+time="Aug 08 06:51:56" level=info msg="192.168.222.2:56702 <-> 10.10.10.70:8005" dialer=anytls-sb dscp=0 ip="10.10.10.70:8005" mac="e2:04:32:1e:89:a6" network=tcp4 outbound=anytls-sb pname= policy=fixed sniffed=

@@ -1,0 +1,97 @@
+[2m2026-08-08T13:08:57.706739Z[0m [32m INFO[0m [2mhonk_core[0m[2m:[0m honk-core v0.0.1-alpha starting
+[2m2026-08-08T13:08:57.706755Z[0m [32m INFO[0m [2mhonk_core[0m[2m:[0m Config: /root/honk-rprx-benchmark-20260808.dae
+[2m2026-08-08T13:08:57.706759Z[0m [32m INFO[0m [2mhonk_core[0m[2m:[0m Raised NOFILE rlimit to 524288 (hard=524288)
+[2m2026-08-08T13:08:57.706768Z[0m [32m INFO[0m [2mhonk_core[0m[2m:[0m Subscription store ready [3mdirectory[0m[2m=[0m/root/.sub
+[2m2026-08-08T13:08:57.706867Z[0m [32m INFO[0m [2mhonk_core[0m[2m:[0m Group 'vless-vision' resolved 1 node(s)
+[2m2026-08-08T13:08:57.706868Z[0m [32m INFO[0m [2mhonk_core[0m[2m:[0m Group 'vless-reality' resolved 1 node(s)
+[2m2026-08-08T13:08:57.706869Z[0m [32m INFO[0m [2mhonk_core[0m[2m:[0m Group 'vmess' resolved 1 node(s)
+[2m2026-08-08T13:08:57.706870Z[0m [32m INFO[0m [2mhonk_core[0m[2m:[0m Loaded 5 nodes, 3 groups, 10 routing rules
+[2m2026-08-08T13:08:57.707272Z[0m [32m INFO[0m [2mhonk_core[0m[2m:[0m daens FD source: /proc/thread-self/ns/net -> net:[4026532277]
+[2m2026-08-08T13:08:57.707869Z[0m [32m INFO[0m [2mhonk_core[0m[2m:[0m Created daens network namespace (FD-owned)
+[2m2026-08-08T13:08:57.708422Z[0m [32m INFO[0m [2mhonk_core[0m[2m:[0m Created dae0/dae0peer veth pair
+[2m2026-08-08T13:08:57.708670Z[0m [32m INFO[0m [2mhonk_core[0m[2m:[0m net.ipv4.conf.dae0.rp_filter = 0
+[2m2026-08-08T13:08:57.708675Z[0m [32m INFO[0m [2mhonk_core[0m[2m:[0m net.ipv4.conf.dae0.accept_local = 1
+[2m2026-08-08T13:08:57.710491Z[0m [32m INFO[0m [2mhonk_core[0m[2m:[0m dae0 veth created before eBPF load (ifindex=218)
+[2m2026-08-08T13:08:57.710499Z[0m [32m INFO[0m [2mhonk_core[0m[2m:[0m Loading real eBPF backend from built-in object
+[2m2026-08-08T13:08:57.710789Z[0m [32m INFO[0m [2mhonk_core::ebpf::real::attach[0m[2m:[0m Loading eBPF programs (1209488 bytes)
+[2m2026-08-08T13:08:57.710828Z[0m [32m INFO[0m [2mhonk_core::ebpf::real::attach[0m[2m:[0m Kernel 6.12.0 supports bpf_redirect_peer, enabling
+[2m2026-08-08T13:08:57.724207Z[0m [32m INFO[0m [2mhonk_core::ebpf::real::attach[0m[2m:[0m Attached 6 cgroup programs to /sys/fs/cgroup
+[2m2026-08-08T13:08:57.724607Z[0m [32m INFO[0m [2mhonk_core::ebpf::real::attach[0m[2m:[0m Attaching eBPF TC programs to LAN interface: veth-lab (configured: veth-lab)
+[2m2026-08-08T13:08:57.761830Z[0m [32m INFO[0m [2mhonk_core::ebpf::real::attach[0m[2m:[0m attached 'lan_ingress_l2' to veth-lab (Ingress) link_id=SchedClassifierLinkId(FdLinkId(FdLinkId(50)))
+[2m2026-08-08T13:08:57.793826Z[0m [32m INFO[0m [2mhonk_core::ebpf::real::attach[0m[2m:[0m attached 'lan_egress_l2' to veth-lab (Egress) link_id=SchedClassifierLinkId(FdLinkId(FdLinkId(52)))
+[2m2026-08-08T13:08:57.833880Z[0m [32m INFO[0m [2mhonk_core::ebpf::real::attach[0m[2m:[0m attached 'wan_egress_l2' to ens3 (Egress) link_id=SchedClassifierLinkId(FdLinkId(FdLinkId(54)))
+[2m2026-08-08T13:08:57.861871Z[0m [32m INFO[0m [2mhonk_core::ebpf::real::attach[0m[2m:[0m attached 'wan_ingress_l2' to ens3 (Ingress) link_id=SchedClassifierLinkId(FdLinkId(FdLinkId(56)))
+[2m2026-08-08T13:08:57.861978Z[0m [32m INFO[0m [2mhonk_core::ebpf::real::attach[0m[2m:[0m eBPF loaded and attached
+[2m2026-08-08T13:08:57.862144Z[0m [32m INFO[0m [2mhonk_core::ebpf::real[0m[2m:[0m PARAM defaults in effect (tproxy_port=12345, tproxy_mark=0x8000000)
+[2m2026-08-08T13:08:57.862152Z[0m [32m INFO[0m [2mhonk_core[0m[2m:[0m eBPF backend initialized with tproxy_port=12345
+[2m2026-08-08T13:08:57.862157Z[0m [32m INFO[0m [2mhonk_core[0m[2m:[0m eBPF parameters set
+[2m2026-08-08T13:08:57.885861Z[0m [32m INFO[0m [2mhonk_core::ebpf::real::attach[0m[2m:[0m attached 'dae0_ingress' to dae0 (Ingress) link_id=SchedClassifierLinkId(FdLinkId(FdLinkId(58)))
+[2m2026-08-08T13:08:57.885895Z[0m [32m INFO[0m [2mhonk_core::ebpf::real[0m[2m:[0m dae0_ingress attached and link held
+[2m2026-08-08T13:08:57.885901Z[0m [32m INFO[0m [2mhonk_core[0m[2m:[0m dae0 programs attached
+[2m2026-08-08T13:08:57.906270Z[0m [32m INFO[0m [2mhonk_core[0m[2m:[0m Moved dae0peer to daens
+[2m2026-08-08T13:08:57.907203Z[0m [32m INFO[0m [2mhonk_core[0m[2m:[0m Configured daens namespace (mark=0x8000000)
+[2m2026-08-08T13:08:57.907218Z[0m [32m INFO[0m [2mhonk_core[0m[2m:[0m dae0peer moved to daens netns
+[2m2026-08-08T13:08:57.907609Z[0m [32m INFO[0m [2mhonk_core::ebpf::real[0m[2m:[0m tproxy_sk_lookup attached to daens namespace
+[2m2026-08-08T13:08:57.907621Z[0m [32m INFO[0m [2mhonk_core[0m[2m:[0m tproxy_sk_lookup attached in daens
+[2m2026-08-08T13:08:57.925888Z[0m [32m INFO[0m [2mhonk_core::ebpf::real::attach[0m[2m:[0m attached 'dae0peer_ingress' to dae0peer (Ingress) link_id=SchedClassifierLinkId(FdLinkId(FdLinkId(63)))
+[2m2026-08-08T13:08:57.925922Z[0m [32m INFO[0m [2mhonk_core::ebpf::real[0m[2m:[0m dae0peer_ingress attached and link held
+[2m2026-08-08T13:08:57.925945Z[0m [32m INFO[0m [2mhonk_core[0m[2m:[0m dae0peer_ingress attached in daens
+[2m2026-08-08T13:08:57.925950Z[0m [32m INFO[0m [2mhonk_core[0m[2m:[0m Using eBPF TC redirect datapath (tproxy_mark=0x8000000)
+[2m2026-08-08T13:08:57.926044Z[0m [32m INFO[0m [2mhonk_core[0m[2m:[0m Router ready with 10 compiled routes
+[2m2026-08-08T13:08:57.926072Z[0m [32m INFO[0m [2mhonk_core[0m[2m:[0m Proxy registry ready (11 handlers)
+[2m2026-08-08T13:08:57.926115Z[0m [32m INFO[0m [2mhonk_core[0m[2m:[0m DNS upstream config: name=alidns addr=223.5.5.5:53 proto=Udp outbound=None
+[2m2026-08-08T13:08:57.926143Z[0m [32m INFO[0m [2mhonk_core[0m[2m:[0m DNS forwarder ready
+[2m2026-08-08T13:08:57.926198Z[0m [32m INFO[0m [2mhonk_core::control[0m[2m:[0m Registered 3/5 nodes for health check (2 skipped: not in any group)
+[2m2026-08-08T13:08:57.926247Z[0m [32m INFO[0m [2mhonk_core::control[0m[2m:[0m Control-plane descriptor budget [3mnofile[0m[2m=[0m16384 [3mfixed[0m[2m=[0m256 [3mtcp_flows[0m[2m=[0m672 [3mtcp_pool[0m[2m=[0m2016 [3mdials[0m[2m=[0m64 [3mdial_ceiling[0m[2m=[0m1008 [3mudp_endpoints[0m[2m=[0m3024 [3mudp_slow[0m[2m=[0m256 [3mdns_slow[0m[2m=[0m256
+[2m2026-08-08T13:08:57.926308Z[0m [32m INFO[0m [2mhonk_core::control::routing_matcher[0m[2m:[0m rule 'rule-0' outbound='direct' -> id=0 (cp=false)
+[2m2026-08-08T13:08:57.926315Z[0m [32m INFO[0m [2mhonk_core::control::routing_matcher[0m[2m:[0m rule '__local_direct_10.10.10.49/32' outbound='direct' -> id=0 (cp=false)
+[2m2026-08-08T13:08:57.926330Z[0m [32m INFO[0m [2mhonk_core::control::routing_matcher[0m[2m:[0m Planned 1 destination IP routes for rule 3
+[2m2026-08-08T13:08:57.926334Z[0m [32m INFO[0m [2mhonk_core::control::routing_matcher[0m[2m:[0m rule '__local_direct_192.168.222.1/32' outbound='direct' -> id=0 (cp=false)
+[2m2026-08-08T13:08:57.926340Z[0m [32m INFO[0m [2mhonk_core::control::routing_matcher[0m[2m:[0m Planned 1 destination IP routes for rule 4
+[2m2026-08-08T13:08:57.926344Z[0m [32m INFO[0m [2mhonk_core::control::routing_matcher[0m[2m:[0m rule '__local_direct_240e:3b6:32b2:e6d0:2a0:98ff:fe04:2a4b/128' outbound='direct' -> id=0 (cp=false)
+[2m2026-08-08T13:08:57.926352Z[0m [32m INFO[0m [2mhonk_core::control::routing_matcher[0m[2m:[0m Planned 1 destination IP routes for rule 5
+[2m2026-08-08T13:08:57.926356Z[0m [32m INFO[0m [2mhonk_core::control::routing_matcher[0m[2m:[0m rule '__local_direct_240e:3b6:32b2:e6d0:b49d:572d:37b4:a16c/128' outbound='direct' -> id=0 (cp=false)
+[2m2026-08-08T13:08:57.926363Z[0m [32m INFO[0m [2mhonk_core::control::routing_matcher[0m[2m:[0m Planned 1 destination IP routes for rule 6
+[2m2026-08-08T13:08:57.926367Z[0m [32m INFO[0m [2mhonk_core::control::routing_matcher[0m[2m:[0m rule '__local_direct_fd00:abab::2a0:98ff:fe04:2a4b/128' outbound='direct' -> id=0 (cp=false)
+[2m2026-08-08T13:08:57.926374Z[0m [32m INFO[0m [2mhonk_core::control::routing_matcher[0m[2m:[0m Planned 1 destination IP routes for rule 7
+[2m2026-08-08T13:08:57.926378Z[0m [32m INFO[0m [2mhonk_core::control::routing_matcher[0m[2m:[0m rule '__local_direct_fd00:abab::8630:2b:16a3:c069/128' outbound='direct' -> id=0 (cp=false)
+[2m2026-08-08T13:08:57.926399Z[0m [32m INFO[0m [2mhonk_core::control::routing_matcher[0m[2m:[0m Planned 1 destination IP routes for rule 8
+[2m2026-08-08T13:08:57.926404Z[0m [32m INFO[0m [2mhonk_core::control::routing_matcher[0m[2m:[0m rule 'rule-1' outbound='vless-vision' -> id=2 (cp=false)
+[2m2026-08-08T13:08:57.926408Z[0m [32m INFO[0m [2mhonk_core::control::routing_matcher[0m[2m:[0m rule 'rule-2' outbound='vless-reality' -> id=3 (cp=false)
+[2m2026-08-08T13:08:57.926412Z[0m [32m INFO[0m [2mhonk_core::control::routing_matcher[0m[2m:[0m rule 'rule-3' outbound='vmess' -> id=4 (cp=false)
+[2m2026-08-08T13:08:57.926669Z[0m [32m INFO[0m [2mhonk_core[0m[2m:[0m DNS upstream pool attached to SharedGroupManager + traffic Router
+[2m2026-08-08T13:08:57.926695Z[0m [32m INFO[0m [2mhonk_core[0m[2m:[0m Control plane ready, starting accept loop
+[2m2026-08-08T13:08:57.926702Z[0m [32m INFO[0m [2mhonk_core[0m[2m:[0m honk-core is running. Press Ctrl+C to stop.
+[2m2026-08-08T13:08:57.957991Z[0m [32m INFO[0m [2mhonk_core::clash_api[0m[2m:[0m clash API listening on http://127.0.0.1:9090
+[2m2026-08-08T13:08:57.958149Z[0m [32m INFO[0m [2mhonk_core::control[0m[2m:[0m Control plane listening for TPROXY TCPv4 on 0.0.0.0:12345
+[2m2026-08-08T13:08:57.958196Z[0m [32m INFO[0m [2mhonk_core::control[0m[2m:[0m Control plane listening for TPROXY TCPv6 on [::]:12345
+[2m2026-08-08T13:08:57.958301Z[0m [32m INFO[0m [2mhonk_core::control[0m[2m:[0m Control plane listening for TPROXY UDPv4 x4 on 0.0.0.0:12345
+[2m2026-08-08T13:08:57.958410Z[0m [32m INFO[0m [2mhonk_core::control[0m[2m:[0m Control plane listening for TPROXY UDPv6 x4 on [::]:12345
+[2m2026-08-08T13:08:57.958430Z[0m [32m INFO[0m [2mhonk_core::ebpf::real[0m[2m:[0m Published listener socket to LISTEN_SOCKET_MAP [3mfd[0m[2m=[0m64 [3mkey[0m[2m=[0m0
+[2m2026-08-08T13:08:57.958439Z[0m [32m INFO[0m [2mhonk_core::ebpf::real[0m[2m:[0m Published listener socket to LISTEN_SOCKET_MAP [3mfd[0m[2m=[0m68 [3mkey[0m[2m=[0m1
+[2m2026-08-08T13:08:57.958447Z[0m [32m INFO[0m [2mhonk_core::ebpf::real[0m[2m:[0m Published listener socket to LISTEN_SOCKET_MAP [3mfd[0m[2m=[0m66 [3mkey[0m[2m=[0m2
+[2m2026-08-08T13:08:57.958454Z[0m [32m INFO[0m [2mhonk_core::ebpf::real[0m[2m:[0m Published listener socket to LISTEN_SOCKET_MAP [3mfd[0m[2m=[0m70 [3mkey[0m[2m=[0m3
+[2m2026-08-08T13:08:57.958461Z[0m [32m INFO[0m [2mhonk_core::ebpf::real[0m[2m:[0m Published listener socket to LISTEN_SOCKET_MAP [3mfd[0m[2m=[0m71 [3mkey[0m[2m=[0m4
+[2m2026-08-08T13:08:57.958467Z[0m [32m INFO[0m [2mhonk_core::ebpf::real[0m[2m:[0m Published listener socket to LISTEN_SOCKET_MAP [3mfd[0m[2m=[0m69 [3mkey[0m[2m=[0m5
+[2m2026-08-08T13:08:57.958474Z[0m [32m INFO[0m [2mhonk_core::ebpf::real[0m[2m:[0m Published listener socket to LISTEN_SOCKET_MAP [3mfd[0m[2m=[0m67 [3mkey[0m[2m=[0m6
+[2m2026-08-08T13:08:57.958482Z[0m [32m INFO[0m [2mhonk_core::ebpf::real[0m[2m:[0m Published listener socket to LISTEN_SOCKET_MAP [3mfd[0m[2m=[0m73 [3mkey[0m[2m=[0m7
+[2m2026-08-08T13:08:57.958489Z[0m [32m INFO[0m [2mhonk_core::ebpf::real[0m[2m:[0m Published listener socket to LISTEN_SOCKET_MAP [3mfd[0m[2m=[0m74 [3mkey[0m[2m=[0m8
+[2m2026-08-08T13:08:57.958496Z[0m [32m INFO[0m [2mhonk_core::ebpf::real[0m[2m:[0m Published listener socket to LISTEN_SOCKET_MAP [3mfd[0m[2m=[0m76 [3mkey[0m[2m=[0m9
+[2m2026-08-08T13:08:57.958670Z[0m [32m INFO[0m [2mhonk_core::control::routing_matcher[0m[2m:[0m Pushed 19 MatchSet entries to eBPF ROUTING_MAP
+[2m2026-08-08T13:08:57.958680Z[0m [32m INFO[0m [2mhonk_core::control[0m[2m:[0m BPF map janitor started
+[2m2026-08-08T13:08:57.958691Z[0m [32m INFO[0m [2mhonk_outbound::tls[0m[2m:[0m TLS mode: tls (Chrome fingerprint=false)
+[2m2026-08-08T13:08:57.958987Z[0m [32m INFO[0m [2mhonk_core::control::janitor[0m[2m:[0m BPF janitor: started (tick=2s; conn-state sweep is watermark-driven)
+[2m2026-08-08T13:08:57.960700Z[0m [32m INFO[0m [2mhonk_outbound::alive[0m[2m:[0m Health check DNS resolved 'cp.cloudflare.com' → 4 IPs
+[2m2026-08-08T13:08:57.960711Z[0m [32m INFO[0m [2mhonk_core::control[0m[2m:[0m HTTP health check enabled (url=http://cp.cloudflare.com, method=HEAD)
+[2m2026-08-08T13:08:57.960722Z[0m [32m INFO[0m [2mhonk_core::control[0m[2m:[0m UDP health check enabled (dns=8.8.8.8:53)
+[2m2026-08-08T13:08:57.960727Z[0m [32m INFO[0m [2mhonk_core::control[0m[2m:[0m Starting health check loop (interval=3600s, timeout=5s)
+[2m2026-08-08T13:08:57.960734Z[0m [32m INFO[0m [2mhonk_core::control[0m[2m:[0m Outbound health check loop started (interval=3600s)
+[2m2026-08-08T13:08:57.960751Z[0m [32m INFO[0m [2mhonk_core::control[0m[2m:[0m Connection pool janitor started
+[2m2026-08-08T13:08:57.960772Z[0m [32m INFO[0m [2mhonk_core::control[0m[2m:[0m Preconnect warmup started for 3 nodes (max 4 concurrent)
+[2m2026-08-08T13:08:57.960792Z[0m [32m INFO[0m [2mhonk_core::control[0m[2m:[0m eBPF datapath admission opened after listener publication
+[2m2026-08-08T13:09:02.868198Z[0m [32m INFO[0m [2mhonk_outbound::alive::probe[0m[2m:[0m Node 'vmess' is alive after HTTP health check
+[2m2026-08-08T13:09:02.871106Z[0m [32m INFO[0m [2mhonk_outbound::alive::probe[0m[2m:[0m Node 'vmess' is alive after HTTP health check
+[2m2026-08-08T13:09:02.876934Z[0m [32m INFO[0m [2mhonk_outbound::alive::probe[0m[2m:[0m Node 'vless-vision' is alive after HTTP health check
+[2m2026-08-08T13:09:02.876940Z[0m [32m INFO[0m [2mhonk_outbound::alive::probe[0m[2m:[0m Node 'vless-reality' is alive after HTTP health check
+[2m2026-08-08T13:09:02.876968Z[0m [32m INFO[0m [2mhonk_outbound::alive::probe[0m[2m:[0m Node 'vless-vision' is alive after HTTP health check
+[2m2026-08-08T13:09:02.877835Z[0m [32m INFO[0m [2mhonk_outbound::alive::probe[0m[2m:[0m Node 'vless-reality' is alive after HTTP health check

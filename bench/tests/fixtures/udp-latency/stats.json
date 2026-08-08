@@ -1,0 +1,28 @@
+{
+  "baseline": {
+    "default": {
+      "queue_drops": {
+        "queue_full": 0,
+        "capacity_rejections": 0,
+        "slow_permit_rejected": 0
+      },
+      "warm_hit": {
+        "attempts": 0,
+        "successes": 0
+      }
+    }
+  },
+  "candidate": {
+    "default": {
+      "queue_drops": {
+        "queue_full": 2,
+        "capacity_rejections": 1,
+        "slow_permit_rejected": 3
+      },
+      "warm_hit": {
+        "attempts": 5,
+        "successes": 4
+      }
+    }
+  }
+}
