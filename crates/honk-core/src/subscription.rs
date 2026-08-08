@@ -463,7 +463,11 @@ fn parse_clash_subscription(
             };
             node.reality_public_key = Some(public_key);
             node.reality_short_id = nested("short-id");
-            node.reality_spider_x = Some(nested("spider-x").unwrap_or_else(|| "/".to_string()));
+            node.reality_spider_x = Some(
+                nested("spider-x")
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| "/".to_string()),
+            );
             node.tls = true;
         }
 
