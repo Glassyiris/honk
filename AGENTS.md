@@ -280,6 +280,8 @@ The old `run` / `deploy` / `docker*` recipes were removed: they called `scripts/
 
 ### CI / releases
 
+`.github/workflows/ci.yml` runs on pushes and pull requests to `main`/`dev`: fmt + clippy, the workspace test gate, and an Ubuntu 24.04 hosted-VM eBPF job. The VM job builds and BTF-checks the kernel object, mounts bpffs when needed, loads and attaches the real TC/cgroup programs through `link_lifecycle`, then runs the root-only netns tests serially; it deliberately does not use a job container.
+
 `.github/workflows/release.yml` runs on `v*` tags: a test gate (`cargo test --workspace --no-fail-fast` with the three named temporary excludes listed below — boring-sys needs `cmake` + `libclang-dev` installed), then builds `honk-core --features ebpf` for `x86_64`/`aarch64` × `gnu`/`musl` (native gnu via `cargo build`; the other three via **zig cc/c++ wrapper scripts `ci/zigcc` / `ci/zigcxx`** — under cross, CMake injects clang-style `--target` flags into boring-sys' ASM rules that real GCC rejects and zig rejects in Rust-triple spelling, so the wrappers strip them and re-anchor on `$ZIGCC_TARGET`; musl targets also set `link-self-contained=no` so zig supplies the CRT). Each of the four target triples ships a default mimalloc build and a `-stock` build without the `mimalloc` feature (lower RSS high-water on small gateways). The eBPF object is built once on the host with nightly + `bpf-linker` (the workflow substitutes the hardcoded linker path) and **verified to contain `.BTF`** before packaging. Tarballs go to a GitHub Release (prerelease when the tag contains `alpha`/`beta`/`rc`).
 
 ### Release process (standing convention)
