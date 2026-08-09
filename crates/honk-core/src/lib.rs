@@ -848,7 +848,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         .with_strategy(config.dns.strategy.clone())
         .with_cache_enabled(config.dns.cache.enabled)
         .with_cache_ttl(config.dns.cache.ttl.min(u64::from(u32::MAX)) as u32)
-        .with_policy_from_config(&config.dns)?,
+        .with_policy_from_config(&config.dns)?
+        .with_hosts_from_config(&config.dns)?,
     );
     info!("DNS forwarder ready");
 

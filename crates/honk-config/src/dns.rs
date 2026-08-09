@@ -167,6 +167,9 @@ pub struct DnsConfig {
     /// Standalone DNS listener endpoint. Empty disables the listener.
     #[serde(default)]
     pub bind: String,
+    /// Resolve A/AAAA queries from `/etc/hosts` before DNS routing and upstreams.
+    #[serde(default)]
+    pub use_host: bool,
     #[serde(default)]
     pub upstream: Vec<DnsUpstream>,
     #[serde(default)]
@@ -577,6 +580,7 @@ impl Default for DnsConfig {
     fn default() -> Self {
         Self {
             bind: String::new(),
+            use_host: false,
             upstream: vec![DnsUpstream {
                 name: "default".to_string(),
                 address: "223.5.5.5:53".to_string(),
@@ -686,6 +690,17 @@ mod tests {
         assert!(endpoint.udp_enabled());
         assert_eq!(endpoint.host(), "localhost");
         assert_eq!(endpoint.port(), 53);
+    }
+
+    #[test]
+    fn use_host_is_serde_defaulted_and_explicitly_configurable() {
+        assert!(!DnsConfig::default().use_host);
+        assert!(!serde_json::from_str::<DnsConfig>("{}").unwrap().use_host);
+        assert!(
+            serde_json::from_str::<DnsConfig>(r#"{"use_host":true}"#)
+                .unwrap()
+                .use_host
+        );
     }
 
     /// Regression: a `[dns]` section without `cache` must still get the

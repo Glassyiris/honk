@@ -399,6 +399,7 @@ Multiple functions on one rule are AND'd with `&&`.
 dns {
     # bind: 'tcp+udp://:1053'   # leave commented to keep standalone DNS off
     ipversion_prefer: 4
+    use_host: true
     optimistic_cache: true
     optimistic_cache_ttl: 600
     max_cache_size: 10000
@@ -420,12 +421,35 @@ dns {
 | dae key | Internal field | Default | Meaning |
 | ------- | -------------- | --------- | --------- |
 | `bind` | `bind` | `""` | Optional standalone UDP/TCP listener in the host network namespace; empty disables only this listener |
+| `use_host` | `use_host` | `false` | Resolve IN-class A/AAAA queries from `/etc/hosts` before DNS routing, cache, and upstreams |
 | `upstream { ... }` | `upstream` | one `default` @ 223.5.5.5 UDP | Servers |
 | `routing { ... }` | `routing` | fallback default | Request routing |
 | `ipversion_prefer` | `strategy` | `both` when omitted; `preferipv4`/`preferipv6` when set to `4`/`6` | Address-family preference (`4`/`6`) |
 | `optimistic_cache` | `cache.enabled` | `true` | Cache on/off |
 | `optimistic_cache_ttl` | `cache.ttl` | `600` | Fixed positive-cache TTL (overrides answer min TTL; `0` keeps answer TTL) |
 | `max_cache_size` | `cache.max_size` | `10000` | Max entries; also scales the retained query/response wire-byte budget at 4 KiB/entry (minimum 65,535 bytes/shard, global maximum 64 MiB); `0` is accepted, warned, and clamped to `1` |
+
+### Hosts file
+
+With `use_host: true`, generation construction reads `/etc/hosts` once. Each
+valid address line contributes its canonical name and aliases; matching is
+exact and ASCII case-insensitive, trailing dots are normalized, duplicate
+addresses are removed, and both IPv4 and IPv6 are supported. Invalid-address
+lines and comments are ignored.
+
+Hard `ipv4_only`/`ipv6_only` strategy filtering remains first. Otherwise a
+known IN-class A/AAAA name takes precedence over request rules (including
+`reject`), cache entries, and upstreams. If the name exists but has no address
+in the requested family, honk returns NOERROR/NODATA instead of leaking the
+query upstream. Non-address qtypes and non-IN classes keep the normal routing
+path. Host answers participate in the normal DNS routing projection, advertise
+a 60-second TTL, and bypass honk's response cache.
+
+The loaded table is immutable for the lifetime of its DNS runtime generation;
+the query path never reads the file. Send SIGHUP after editing `/etc/hosts`.
+The replacement generation loads the new snapshot atomically while in-flight
+leases may finish on the old one. If the file cannot be read, startup fails or
+the reload aborts before publication, retaining the active generation.
 
 ### Standalone listener
 

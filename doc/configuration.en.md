@@ -372,6 +372,7 @@ dns {
     # Standalone listener is disabled unless bind is set.
     # bind: 'tcp+udp://:1053'
     ipversion_prefer: 4
+    use_host: true
 
     upstream {
         alidns: 'udp://223.5.5.5:53'
@@ -409,6 +410,15 @@ dns {
     max_cache_size: 10000
 }
 ```
+
+`use_host` defaults to `false`. When enabled, honk loads `/etc/hosts` while
+building each DNS runtime generation. Matching IN-class A/AAAA queries are
+answered before request routing, cache lookup, or upstream exchange; a known
+name without the requested address family returns NOERROR/NODATA. Other query
+types continue through the normal pipeline. The snapshot is immutable on the
+query path and is refreshed by SIGHUP; an unreadable file fails startup or the
+new reload generation. Synthesized records advertise a 60-second TTL and are
+not inserted into honk's DNS cache.
 
 Upstream URIs take a scheme prefix: `udp://`, `tcp://`, `tcp+udp://`, `tls://`, `https://`, `quic://`, `h3://`; a bare `host:port` defaults to UDP.
 
