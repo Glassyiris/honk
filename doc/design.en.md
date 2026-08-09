@@ -23,7 +23,7 @@
 | TC classify + match_set routing | **dae** | `ROUTING_MAP` MatchSets, LPM tries, domain bitmaps, must/OR/AND |
 | `dae0` / `dae0peer` + netns delivery | **dae** | Isolated `daens`, sk_lookup / SockMap, reply rewrite |
 | Process matching via cgroup cookie→pid | **dae** | `COOKIE_PID_MAP` |
-| DNS learning into domain routing maps | **dae** | Userspace notify → `DOMAIN_ROUTING_MAP` |
+| DNS learning into domain routing maps | **dae** | Generation-aware outcome projection → `DOMAIN_ROUTING_MAP` |
 | Config section syntax | **dae** | `global { } node { } group { } routing { }` |
 | Group policies & nested outbounds | **sing-box** | Selector / URLTest / LB / Fallback, RealTag-style chain |
 | TCP/UDP separate URLTest picks | **sing-box** | Tolerance, idle_timeout, interrupt_connections |

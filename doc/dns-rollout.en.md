@@ -10,8 +10,8 @@ explicitly authorized Linux host with root access.
 - A disposable or isolated authorized host, an out-of-band recovery path, and
   a maintenance window. Do not use a shared production gateway as the first
   canary.
-- Root or passwordless `sudo`; a supported Linux kernel with BTF; the target
-  interfaces, routes, and DNS clients needed for a real smoke test.
+- For the privileged canary only: root or passwordless `sudo`, a supported
+  Linux kernel with BTF, and the target interfaces, routes, and DNS clients.
 - Rust stable plus the project nightly toolchain, `rust-src`, `bpf-linker`,
   CMake, C/C++ compiler, libclang/bindgen dependencies, and `readelf`.
 - Exact paths for the active binary, config, BPF object, and `cache.db`;
@@ -24,17 +24,16 @@ explicitly authorized Linux host with root access.
 
 1. Record the host, kernel, interfaces, current binary/config checksums,
    current routing generation from logs, service command, and UTC time.
-2. Run the unprivileged gates from the exact candidate source:
+2. Run the unprivileged standalone DNS smoke from the exact candidate source:
 
    ```bash
-   just dns-ci
-   just clash-ci
-   cargo test -p honk-core --no-default-features
-   just run-dae
+   just dns-smoke
    ```
 
-   The mock run must answer its configured loopback DNS smoke before any
-   privileged action. Stop the mock process normally afterward.
+   This command builds the debug `honk-core`, runs it with `--mock-ebpf`, and
+   proves the configured loopback listener over UDP and a persistent TCP
+   connection before and after an unchanged SIGHUP. It stops the process and
+   removes all temporary resources before returning.
 3. Quiesce the installed service using its normal service manager. Copy the
    current binary and config to timestamped, read-only rollback paths.
 4. Back up `cache.db` while the service is quiesced, preserving ownership and
@@ -44,6 +43,10 @@ explicitly authorized Linux host with root access.
    proceeding. This proves the rollback bundle rather than merely creating it.
 
 ## Privileged canary
+
+> Status: **NOT EXECUTED** in the local development environment. Run these
+> steps only on an isolated, explicitly authorized host that meets every
+> prerequisite above.
 
 1. Build and inspect the candidate on the authorized host:
 

@@ -395,6 +395,7 @@ Multiple functions on one rule are AND'd with `&&`.
 
 ```dae
 dns {
+    # bind: 'tcp+udp://:1053'   # leave commented to keep standalone DNS off
     ipversion_prefer: 4
     optimistic_cache: true
     optimistic_cache_ttl: 600
@@ -416,12 +417,55 @@ dns {
 
 | dae key | Internal field | Default | Meaning |
 | ------- | -------------- | --------- | --------- |
+| `bind` | `bind` | `""` | Optional standalone UDP/TCP listener in the host network namespace; empty disables only this listener |
 | `upstream { ... }` | `upstream` | one `default` @ 223.5.5.5 UDP | Servers |
 | `routing { ... }` | `routing` | fallback default | Request routing |
 | `ipversion_prefer` | `strategy` | `both` when omitted; `preferipv4`/`preferipv6` when set to `4`/`6` | Address-family preference (`4`/`6`) |
 | `optimistic_cache` | `cache.enabled` | `true` | Cache on/off |
 | `optimistic_cache_ttl` | `cache.ttl` | `600` | Fixed positive-cache TTL (overrides answer min TTL; `0` keeps answer TTL) |
-| `max_cache_size` | `cache.max_size` | `10000` | Max entries; `0` is accepted, warned, and clamped to `1` |
+| `max_cache_size` | `cache.max_size` | `10000` | Max entries; also scales the retained query/response wire-byte budget at 4 KiB/entry (minimum 65,535 bytes/shard, global maximum 64 MiB); `0` is accepted, warned, and clamped to `1` |
+
+### Standalone listener
+
+`dns.bind` accepts exactly these dae-compatible forms:
+
+| Value | Listener |
+| ----- | -------- |
+| absent or `""` | Disabled; transparent TCP/UDP port-53 interception remains active |
+| numeric `IP:port`, for example `127.0.0.1:1053` or `[::1]:1053` | UDP only |
+| `udp://host:port` | UDP |
+| `tcp://host:port` | TCP |
+| `tcp+udp://host:port` | TCP and UDP |
+
+Schemed forms accept a hostname (`udp://localhost:1053`), a bracketed IPv6
+literal (`tcp://[::1]:1053`), or an empty host as a wildcard
+(`tcp+udp://:1053`). The port is always explicit; `0` requests an ephemeral
+port and the selected address is logged. A bare hostname is invalid, and
+userinfo, paths, queries, fragments, and IPv6 zone identifiers are rejected.
+Hostnames select the first resolved address on which every requested transport
+can bind.
+
+These are ordinary, unmarked host-netns sockets. A LAN-facing local TCP or UDP
+listener on `:53` takes precedence for its transport; wildcard precedence is
+limited to host-local destinations. Disabling `bind` does not disable
+transparent port-53 interception. All requested sockets are bound
+synchronously and all-or-nothing: one bind failure closes the others and fails
+startup. The listener is process-owned, so a semantic endpoint change on
+SIGHUP is rejected as restart-required; an unchanged endpoint continues using
+the newly published DNS runtime. Wildcard and LAN binds expose an unauthenticated
+recursive resolver and require host-firewall source restrictions.
+
+Each query uses the current `DnsServiceProvider` generation and therefore the
+same request/response routing, cache, singleflight, upstream pools, and routing
+projection as transparent DNS. Only complete single-question requests are
+forwarded. UDP reply limits clamp the client EDNS size to `512..=1232` and
+preserve the queried local address on wildcard sockets. TCP DNS on both transparent and standalone paths uses persistent RFC 7766
+two-octet framing and bounds every length/body read and response write to 30
+seconds. Standalone TCP consumes at most one quarter of the global connection
+budget.
+Standalone queries have no intercepted original destination: if request
+routing selects `asis`, honk returns a DNS failure rather than recursing into
+its own listener.
 
 ### Upstream
 
@@ -441,7 +485,7 @@ Each upstream is a `name: 'uri'` line; an optional trailing `-> tag` (or legacy 
 
 | Item | Meaning |
 | ------ | --------- |
-| `request { <cond> [&& <cond>...] -> <action> }` | Request rules, first match wins. Conditions: `qname(suffix:/keyword:/full:/regex:/geosite:...)`, `qtype(a/aaaa/...)`; `!` negates a condition. Actions: `reject`, `asis` (dial the query's original destination), or an upstream name |
+| `request { <cond> [&& <cond>...] -> <action> }` | Request rules, first match wins. Conditions: `qname(suffix:/keyword:/full:/regex:/geosite:...)`, `qtype(a/aaaa/...)`; `!` negates a condition. Actions: `reject`, `asis` (transparent queries preserve the client transport when dialing the intercepted destination, with UDP TC→TCP retry; standalone queries return a DNS failure), or an upstream name |
 | `request { fallback: name }` | Upstream when no request rule matches |
 | `response { <cond> [&& <cond>...] -> <action> }` | Response rules, first match wins. Conditions: `upstream(name)`, `qname(...)`, `ip(cidr, geoip:...)`; `!` negates. Actions: `accept`, `reject`, or an upstream name (re-query, depth ≤ 3) |
 | `response { fallback: accept\|reject }` | Verdict when no response rule matches |
@@ -452,7 +496,7 @@ Each upstream is a `name: 'uri'` line; an optional trailing `-> tag` (or legacy 
 Internal values: `preferipv4` | `preferipv6` | `ipv4only` | `ipv6only` | `both`.
 
 - `ipv4only` / `ipv6only`: the other family's queries are answered NODATA at request time and never forwarded upstream.
-- `preferipv4` / `preferipv6`: both families are forwarded. When the preferred family has answers for the name, the other family's response is suppressed (NODATA); when it has none, the other family's answers are returned (fallback allowed). The preferred-family check costs one extra upstream query per name on cache miss.
+- `preferipv4` / `preferipv6`: both families are forwarded. When the preferred family has answers for the name, the other family's response is suppressed (NODATA); when it has none, the other family's answers are returned (fallback allowed). The preferred-family check costs one extra upstream query per name on cache miss and preserves the original query wire profile except for QTYPE.
 - `both`: the default `DnsConfig` strategy; eligible A and AAAA queries are forwarded concurrently and neither family is suppressed. A missing `ipversion_prefer` in honk's config keeps this default.
 
 dae: `ipversion_prefer: 4` maps to `preferipv4`, `6` to `preferipv6` (anything else = `preferipv4`). The only-modes are not expressible in dae syntax.
@@ -465,9 +509,9 @@ Cache and singleflight eligibility are intentionally shared. Only a standard
 single-question QUERY with no answer/authority records and at most one
 option-free EDNS-v0 OPT is eligible. RD/AD/CD, DO, exact question wire, UDP
 size, ingress profile, policy, scope, and operation remain isolated in the
-key. Unsupported flags, EDNS options (including ECS/COOKIE), EDNS-v1, and
-multi-question messages bypass both optimizations; cancellation releases the
-flight.
+key. Multi-question requests are rejected before policy planning. Unsupported
+flags, EDNS options (including ECS/COOKIE), and EDNS-v1 bypass both
+optimizations; cancellation releases the flight.
 
 Runtime cache and singleflight keys share one immutable binary query identity;
 operation variants retain that allocation, and cache sharding uses a precomputed
@@ -495,8 +539,8 @@ bounded `error_kind` values: forwarder
 `worker_closed`/`ack_dropped`/`worker_failed`/`database`, projection
 `map_full`/`backend_write`, and transport `exchange_failed` with a bounded
 transport label. They do not log query names, upstream addresses, or
-free-form errors. `/stats` remains the outbound statistics surface; no public
-DNS metric, endpoint, API, or tuning key is added.
+free-form errors. `/stats` remains the outbound statistics surface; runtime
+DNS telemetry adds no public metric or API.
 
 ---
 
