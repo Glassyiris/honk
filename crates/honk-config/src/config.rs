@@ -122,9 +122,9 @@ pub struct GlobalConfig {
     /// disables this independent warm-up path.
     #[serde(default = "default_udp_warm_node_count")]
     pub udp_warm_node_count: usize,
-    /// Process-wide cap on concurrent proxied dials (connect + protocol
-    /// handshake). Built-in direct/block dials are exempt — they are local
-    /// connects already bounded by the connection admission limit.
+    /// Process-wide cap on physical proxied connects and protocol handshakes.
+    /// Ready-pool hits, logical streams on warm generation transports, and
+    /// built-in direct/block dials are exempt.
     #[serde(default = "default_max_concurrent_dials")]
     pub max_concurrent_dials: usize,
 }
@@ -237,11 +237,7 @@ fn default_log_level() -> String {
     "info".into()
 }
 fn default_tcp_check_urls() -> Vec<String> {
-    vec![
-        "http://cp.cloudflare.com".into(),
-        "1.1.1.1".into(),
-        "2606:4700:4700::1111".into(),
-    ]
+    vec!["https://www.gstatic.com/generate_204".into()]
 }
 fn default_tcp_check_http_method() -> String {
     "HEAD".into()

@@ -25,7 +25,7 @@
 | `wan_interface` | string[] | `[]` | 拦截本机发起 TCP/UDP 的 WAN 网卡；`auto` 跟随 IPv4 默认路由。默认路由不存在时保持待定（不会回退到 `lo`），并在网卡、地址或路由事件后自动挂载；同一事件还会重新发布网关本机地址的 `direct(must)` 规则，并立即复测受健康状态控制的出站。 |
 | `auto_config_kernel_parameter` | bool | `false` | 自动 sysctl（需 root） |
 | `store_subscribe` | bool | `true` | 将每个订阅最近一次有效正文持久化到 `<运行目录>/.sub`，供启动/重载在网络不可用时恢复；修改后需重启进程。 |
-| `tcp_check_url` | string[] | Cloudflare HTTP + 1.1.1.1 + IPv6 | TCP 健康检查目标；逗号分隔 |
+| `tcp_check_url` | string[] | gstatic HTTPS | TCP 健康检查目标；HTTPS 会先完成并校验目标 TLS，再发送配置的 HTTP 方法。 |
 | `tcp_check_http_method` | string | `"HEAD"` | URL 检查的 HTTP 方法 |
 | `udp_check_dns` | string[] | dns.google / 8.8.8.8 / IPv6 | UDP 健康检查 DNS 目标；逗号分隔 |
 | `check_interval_secs` | u64 | `30` | 检查间隔（秒）。**dae：** `check_interval` 时长（如 `300s`） |
@@ -46,9 +46,9 @@
 | `connect_timeout_ms` | u64 | `3000` | TCP 连接超时（结构化模型字段，dae 语法无对应键） |
 | `dns_resolve_timeout_ms` | u64 | `2000` | 控制面解析超时（结构化模型字段，dae 语法无对应键） |
 | `relay_idle_timeout_secs` | u64 | `300` | 空闲中继断开；`0` = 关闭（结构化模型字段，dae 语法无对应键） |
-| `preconnect_node_count` | usize | `'auto'` | 启动裸 TCP 预连接数。`'auto'` = `min(nodes,8)`；`0` 严格关闭预热。候选顺序为各组当前选择优先、再按配置顺序补足；仅可池化裸 TCP 的协议入选（AnyTLS/QUIC 永远不会消费池化裸 TCP），且排除内置 `direct`/`block`。 |
-| `udp_warm_node_count` | usize | `0` | 每组 UDP 预热上限。`0` 为严格关闭：不创建 coordinator task，也不产生 warm metrics。正值 N（封顶 3）会在启动后以及**每个探测周期**（`check_interval`）预热每组按延迟排名前 N 的 UDP 可用节点——测速后新变快的节点在赢得选择前就已拨好 transport。dispatch 仍最多四个并发 task。另有进程级总量上限 `4 × N`：合并后的候选按全局 UDP 延迟重排并截断，组再多也不会膨胀驻留 transport。 |
-| `max_concurrent_dials` | usize | `64` | 按 runtime generation 生效的并发代理拨号上限（connect + 协议握手）；另受所有重叠 reload generation 共享的、启动时不可变的进程级描述符 gate 约束。内置 `direct`/`block` 拨号豁免——它们是本地 connect，已由 TCP 准入限制。replacement generation 立即采用新值；旧 generation 中进行中的拨号继续占用同一个进程级 gate，直至结束。 |
+| `preconnect_node_count` | usize | `'auto'` | 启动时执行一轮裸 TCP 预连接。`'auto'` 最多尝试 8 个节点；`0` 关闭；显式 `N` 可覆盖所有合格节点，但最多 8 个并发尝试。候选按各组当前选择、再按配置顺序；仅可池化裸 TCP 的协议入选（AnyTLS/QUIC 与内置 `direct`/`block` 排除）。 |
+| `udp_warm_node_count` | usize | `0` | 每组 UDP 预热上限。`0` 严格关闭。正值 N 取各组延迟 top `min(N,3)` 的 UDP 叶子；独立 coordinator 启动后立即运行，随后每批完成再等待一个 `check_interval`，最多并发四个尝试。合并候选按全局 UDP 延迟重排，进程驻留总量封顶 `4×N`。 |
+| `max_concurrent_dials` | usize | `64` | 按 runtime generation 生效的物理代理连接与协议握手并发上限，另受所有重叠 reload generation 共享的启动时描述符 gate 约束。Ready 池命中、已热 AnyTLS/QUIC transport 上的逻辑流，以及内置 `direct`/`block` 均不占额度。replacement generation 立即采用新值；旧 generation 中进行中的拨号继续占用同一个进程级 gate，直至结束。 |
 
 ### 拨号模式细节
 
@@ -102,7 +102,7 @@ dae 语法中节点**只能以分享链接书写**：`tag: 'scheme://...'` 或�
 | `tuic_init_stream_recv_window` / `tuic_init_conn_recv_window` | u64? | 8 MiB / quinn 默认 | TUIC QUIC 接收窗口；8 MiB 流窗口默认值提升高 RTT 链路单流吞吐（quinn 默认 1.25 MiB 每 100ms RTT 封顶约 12.5MB/s） |
 | `juicity_uuid` / `juicity_password` | string? | null | Juicity |
 | `anytls_password` | string? | null | AnyTLS 密钥（等于链接密码） |
-| `anytls_min_idle_session` | usize? | 1 | 池最小空闲会话；链接 `min_idle_session`。默认 1 保持拨号热度（0 = 回收全部空闲会话） |
+| `anytls_min_idle_session` | usize? | null（实际为 0） | 显式池待机会话下限；链接 `min_idle_session`。Selector 当前叶节点会独立把有效下限提升到至少 1；其他节点设为 `0` 时可回收全部空闲会话。 |
 | `anytls_idle_session_check_interval` | u64? | null | 空闲检查周期（秒）；链接 `idle_session_check_interval` |
 | `anytls_idle_session_timeout` | u64? | null | 空闲驱逐（秒）；链接 `idle_session_timeout` |
 | `mark` | u32? | null | 出站 SO_MARK（结构化模型字段，dae 语法无对应键） |
@@ -260,7 +260,7 @@ group {
 
 | 规范名 | 别名 | 行为 |
 | -------- | ------ | ------ |
-| `selector` | `select`、`fixed`、`fixed(0)` | 手动固定；API + cache |
+| `selector` | `select`、`fixed`、`fixed(0)` | 手动固定；API + cache。其配置叶节点始终保持热态：AnyTLS/QUIC 保留可复用状态，其他代理协议保留一条服务端裸 TCP。 |
 | `urltest` | `min_moving_avg`、`min_avg10`、`min_last_delay` | 最低延迟 + tolerance；按减半递推移动平均 `(prev+sample)/2` 排名（dae `min_moving_avg` 语义）；**TCP/UDP 分离** |
 | `loadbalance` | `roundrobin`、`round_robin`、`balance` | 每组、每网络独立对存活成员轮询 |
 | `fallback` | | TCP/UDP 各自固定第一个存活成员；无立即 failback |
@@ -539,24 +539,25 @@ H = { count, sumNanos, buckets }  // buckets 有固定 64 个 log2 slot
 
 `queue` 是 endpoint driver 队列，与记录 slow-path admission 的
 `slowPermit` 不同。stagger counter 只用于 cold URLTest preparation。AnyTLS
-candidate 使用计入 pool cap 的 caller-owned provisional session slot；loser
-取消会关闭 detached work，winner 则在 endpoint publication 前提交到捕获的
-generation。warm 的 `successes` 只计 `Ready` 或 `AlreadyReady`；
-`NotApplicable` 保持中性。
+candidate 使用计入 pool cap 的 caller-owned provisional session slot，QUIC
+candidate 使用 detached client。loser 取消会关闭对应 detached work；winner 在
+endpoint publication 前完成 promotion/arbitration。若普通流量已先填充 QUIC
+generation slot，则保留该 incumbent，winner transport 只为当前选中流持有自己的
+connection。warm 的 `successes` 只计 `Ready`；`NotApplicable` 保持中性。
 
 `/stats` 另有顶层 `warm` 对象，为即时 gauge：
 
 ```text
 warm = {
-  nodes: { preconnect, health, udp, traffic },
+  nodes: { preconnect, health, udp, selector, traffic },
   sessions: { anytls, tuic, juicity, hysteria2 }
 }
 ```
 
-`nodes` 按热资源建立的原因统计当前热节点（一个节点可同时计入多个原因；
-无记录原因的热节点计为 `traffic`）。`sessions` 按协议统计驻留的 AnyTLS
-池 session 与已占用的 QUIC client 槽。gauge 跟随当前 generation：资源
-排干后节点在下一个快照中消失。
+`nodes` 按保留热资源的原因统计当前热节点（一个节点可同时计入多个原因；
+无记录原因的热节点计为 `traffic`）；`selector` 表示始终启用的 Selector
+当前叶节点常驻。`sessions` 按协议统计驻留的 AnyTLS 池 session 与已占用的
+QUIC client 槽。gauge 跟随当前 generation：资源排干后节点在下一个快照中消失。
 
 环境变量：`HONK_UI_DOWNLOAD_URL` 覆盖 UI zip。
 

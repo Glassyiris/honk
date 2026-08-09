@@ -1034,6 +1034,7 @@ impl EbpfBackend for MockEbpfBackend {
             let raw = Self::tuples_key_bytes(key);
             if map.get(&raw).is_some_and(|current| {
                 current.last_seen_ns == scanned.last_seen_ns
+                    && current.state == scanned.state
                     && current.last_seen_ns <= expired_before_ns
             }) {
                 map.remove(&raw);
@@ -1230,7 +1231,36 @@ fn parse_ipv4(s: &str) -> anyhow::Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use honk_ebpf_common::conn::TcpState;
     use honk_ebpf_common::dae_ip::In6Addr;
+
+    #[test]
+    fn conn_state_conditional_delete_rejects_state_change() {
+        let mut backend = MockEbpfBackend::new();
+        let mut key: TuplesKey = unsafe { std::mem::zeroed() };
+        key.l4proto = 6;
+        let scanned = ConnState {
+            state: TcpState::TcpStateActive as u8,
+            last_seen_ns: 1,
+            ..Default::default()
+        };
+        let current = ConnState {
+            state: TcpState::TcpStateClosing as u8,
+            ..scanned
+        };
+        backend.tcp_conn_state_store(&key, &current).unwrap();
+
+        assert_eq!(
+            backend
+                .conn_state_remove_if_unchanged(&[(key, scanned)], 10)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            backend.tcp_conn_state_lookup(&key).unwrap().unwrap().state,
+            current.state
+        );
+    }
 
     #[test]
     fn test_mock_params() {

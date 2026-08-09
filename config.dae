@@ -5,7 +5,7 @@ global {
     dial_mode: domain++
     allow_insecure: false
     auto_config_kernel_parameter: true
-    tcp_check_url: 'http://cp.cloudflare.com,1.1.1.1,2606:4700:4700::1111'
+    tcp_check_url: 'https://www.gstatic.com/generate_204'
     tcp_check_http_method: HEAD
     udp_check_dns: 'dns.google.com:53,8.8.8.8,2001:4860:4860::8888'
     check_interval: 300s
@@ -17,13 +17,11 @@ global {
     check_tolerance: 30ms
 
     # 预热与拨号预算(小中规模节点的推荐值;大订阅见 doc/configuration.zh.md)
-    # 每组每 IP 族保活的最快 AnyTLS/TCP 叶子数(默认 1;节点少时可调到 3-5)
-    tcp_warm_node_count: 3
-    # 每组 UDP 预热候选(0=关闭;进程级总量自动封顶为 4 倍该值)
-    udp_warm_node_count: 8
-    # 启动裸 TCP 预连接:'auto'(默认,最多 8 个) / 0(关闭) / N;AnyTLS/QUIC 自动跳过
-    # preconnect_node_count: 'auto'
-    # 并发代理拨号上限(默认 64;direct/block 不占额度)
+    # 大订阅基线关闭额外 UDP 预热；Selector 选择仍单独保活。
+    udp_warm_node_count: 0
+    # 大订阅诊断基线也关闭启动裸 TCP 预连接。
+    preconnect_node_count: 0
+    # 物理代理连接/握手上限（默认 64；Ready/已热复用和 direct/block 不占额度）
     # max_concurrent_dials: 64
 }
 

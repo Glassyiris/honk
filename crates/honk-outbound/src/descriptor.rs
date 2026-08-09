@@ -1,20 +1,17 @@
-//! Per-protocol facts — capabilities, pooling behavior, generation runtime
-//! ownership, and share-link schemes — converged into one table.
-//! These used to be spread across `OutboundCapabilities::for_node`, handler
-//! `pool_ready_streams`/`pool_bare_tcp` overrides, and the runtime-registry
-//! build match.
+//! Per-protocol facts: UDP support, pooling behavior, generation runtime
+//! ownership, and share-link schemes.
 
 use honk_config::node::Node;
 use honk_config::types::NodeProtocol;
 
-use crate::runtime::{GenerationRuntime, OutboundCapabilities};
+use crate::runtime::GenerationRuntime;
 
-/// The per-protocol facts. Function-typed fields cover per-node conditions
-/// (trojan pools ready streams only on the plain TCP transport; trojan and
-/// anytls carry UDP only when `node.network` allows it).
+/// Per-protocol facts. Function-typed fields cover per-node conditions:
+/// Trojan and AnyTLS gate UDP on `node.network`, while Trojan ready-stream
+/// pooling additionally depends on its transport.
 pub struct ProtocolDescriptor {
     pub protocol: NodeProtocol,
-    pub capabilities: fn(&Node) -> OutboundCapabilities,
+    pub supports_udp: fn(&Node) -> bool,
     pub pool_ready_streams: fn(&Node) -> bool,
     pub pool_bare_tcp: fn(&Node) -> bool,
     pub generation_runtime: GenerationRuntime,
@@ -27,14 +24,6 @@ impl ProtocolDescriptor {
     }
 }
 
-const fn capabilities(udp: bool, multiplexed: bool) -> OutboundCapabilities {
-    OutboundCapabilities {
-        tcp: true,
-        udp,
-        multiplexed,
-    }
-}
-
 /// The dial-time network gate, shared by the capability table and the
 /// trojan/anytls UDP dial paths: no `network` restriction means UDP is
 /// allowed; otherwise the list must contain "udp".
@@ -44,22 +33,6 @@ pub(crate) fn network_allows_udp(node: &Node) -> bool {
             .split(',')
             .any(|entry| entry.trim().eq_ignore_ascii_case("udp"))
     })
-}
-
-fn caps_tcp_udp(_: &Node) -> OutboundCapabilities {
-    capabilities(true, false)
-}
-
-fn caps_tcp_only(_: &Node) -> OutboundCapabilities {
-    capabilities(false, false)
-}
-
-fn caps_trojan(node: &Node) -> OutboundCapabilities {
-    capabilities(network_allows_udp(node), false)
-}
-
-fn caps_anytls(node: &Node) -> OutboundCapabilities {
-    capabilities(network_allows_udp(node), true)
 }
 
 fn never(_: &Node) -> bool {
@@ -83,7 +56,7 @@ fn trojan_pool_ready_streams(node: &Node) -> bool {
 static DESCRIPTORS: &[ProtocolDescriptor] = &[
     ProtocolDescriptor {
         protocol: NodeProtocol::SS,
-        capabilities: caps_tcp_udp,
+        supports_udp: always,
         pool_ready_streams: never,
         pool_bare_tcp: always,
         generation_runtime: GenerationRuntime::None,
@@ -91,7 +64,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
     },
     ProtocolDescriptor {
         protocol: NodeProtocol::Trojan,
-        capabilities: caps_trojan,
+        supports_udp: network_allows_udp,
         pool_ready_streams: trojan_pool_ready_streams,
         pool_bare_tcp: always,
         generation_runtime: GenerationRuntime::None,
@@ -99,7 +72,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
     },
     ProtocolDescriptor {
         protocol: NodeProtocol::VMess,
-        capabilities: caps_tcp_only,
+        supports_udp: never,
         pool_ready_streams: never,
         pool_bare_tcp: always,
         generation_runtime: GenerationRuntime::None,
@@ -107,7 +80,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
     },
     ProtocolDescriptor {
         protocol: NodeProtocol::VLess,
-        capabilities: caps_tcp_only,
+        supports_udp: never,
         pool_ready_streams: never,
         pool_bare_tcp: always,
         generation_runtime: GenerationRuntime::None,
@@ -119,7 +92,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
     // stream is safe to pool and reuse directly.
     ProtocolDescriptor {
         protocol: NodeProtocol::Socks5,
-        capabilities: caps_tcp_udp,
+        supports_udp: always,
         pool_ready_streams: always,
         pool_bare_tcp: always,
         generation_runtime: GenerationRuntime::None,
@@ -130,7 +103,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
     // would poison the first flow).
     ProtocolDescriptor {
         protocol: NodeProtocol::Hysteria2,
-        capabilities: caps_tcp_udp,
+        supports_udp: always,
         pool_ready_streams: never,
         pool_bare_tcp: never,
         generation_runtime: GenerationRuntime::Quic,
@@ -138,7 +111,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
     },
     ProtocolDescriptor {
         protocol: NodeProtocol::Tuic,
-        capabilities: caps_tcp_udp,
+        supports_udp: always,
         pool_ready_streams: never,
         pool_bare_tcp: never,
         generation_runtime: GenerationRuntime::Quic,
@@ -146,19 +119,18 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
     },
     ProtocolDescriptor {
         protocol: NodeProtocol::Juicity,
-        capabilities: caps_tcp_udp,
+        supports_udp: always,
         pool_ready_streams: never,
         pool_bare_tcp: never,
         generation_runtime: GenerationRuntime::Quic,
         share_link_schemes: &["juicity"],
     },
-    // Multiplexed: the session pool already keeps warm connections; a pooled
-    // bare TCP would force a new session (TLS + auth) per flow, and sessions
-    // created over the pool cap leak (orphaned from the janitor, held forever
-    // by their demux task).
+    // Multiplexed: the node-owned session pool already keeps reusable
+    // connections. Bare-TCP or ready-stream pooling would bypass that owner,
+    // creating an untracked TLS/auth session outside its lifecycle.
     ProtocolDescriptor {
         protocol: NodeProtocol::AnyTLS,
-        capabilities: caps_anytls,
+        supports_udp: network_allows_udp,
         pool_ready_streams: never,
         pool_bare_tcp: never,
         generation_runtime: GenerationRuntime::AnyTls,
@@ -166,7 +138,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
     },
     ProtocolDescriptor {
         protocol: NodeProtocol::Direct,
-        capabilities: caps_tcp_udp,
+        supports_udp: always,
         pool_ready_streams: never,
         pool_bare_tcp: always,
         generation_runtime: GenerationRuntime::None,
@@ -174,7 +146,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
     },
     ProtocolDescriptor {
         protocol: NodeProtocol::Block,
-        capabilities: caps_tcp_only,
+        supports_udp: never,
         pool_ready_streams: never,
         pool_bare_tcp: always,
         generation_runtime: GenerationRuntime::None,
@@ -228,34 +200,33 @@ mod tests {
             protocol: NodeProtocol::Trojan,
             ..Default::default()
         };
-        let trojan = descriptor(NodeProtocol::Trojan).capabilities;
-        assert!(trojan(&base).udp, "no network restriction allows UDP");
+        let trojan = descriptor(NodeProtocol::Trojan).supports_udp;
+        assert!(trojan(&base), "no network restriction allows UDP");
         let ws_only = Node {
             network: Some("ws".to_string()),
             ..base.clone()
         };
-        assert!(!trojan(&ws_only).udp);
+        assert!(!trojan(&ws_only));
         let mixed = Node {
             network: Some("tcp, udp".to_string()),
             ..base.clone()
         };
-        assert!(trojan(&mixed).udp);
+        assert!(trojan(&mixed));
 
-        let anytls = descriptor(NodeProtocol::AnyTLS).capabilities;
+        let anytls = descriptor(NodeProtocol::AnyTLS).supports_udp;
         let ws_only = Node {
             protocol: NodeProtocol::AnyTLS,
             network: Some("ws".to_string()),
             ..Default::default()
         };
-        let caps = anytls(&ws_only);
-        assert!(caps.multiplexed && !caps.udp);
+        assert!(!anytls(&ws_only));
 
-        let ss = descriptor(NodeProtocol::SS).capabilities;
+        let ss = descriptor(NodeProtocol::SS).supports_udp;
         let restricted = Node {
             protocol: NodeProtocol::SS,
             network: Some("tcp".to_string()),
             ..Default::default()
         };
-        assert!(ss(&restricted).udp, "SS UDP is not network-gated");
+        assert!(ss(&restricted), "SS UDP is not network-gated");
     }
 }

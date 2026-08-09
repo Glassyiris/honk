@@ -847,6 +847,7 @@ impl EbpfBackend for RealEbpfBackend {
                 .hash_lookup::<_, ConnState>("CONN_STATE_MAP", key)?
                 .is_some_and(|current| {
                     current.last_seen_ns == scanned.last_seen_ns
+                        && current.state == scanned.state
                         && current.last_seen_ns <= expired_before_ns
                 })
             {

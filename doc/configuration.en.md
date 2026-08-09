@@ -10,7 +10,7 @@ honk is configured in the **dae configuration syntax** — the original `{ secti
 
 - Configuration is organized into **sections**: `include { ... }`, `global { ... }`, `node { ... }`, `group { ... }`, `routing { ... }`, `dns { ... }`, `subscription { ... }`, `experimental { ... }`.
 - Inside non-`include` sections, settings are `key: value` pairs, one per line.
-- Strings containing special characters (URLs, `+`, `//`, `:`) should be **quoted** (single or double quotes both work): `tcp_check_url: 'http://cp.cloudflare.com,1.1.1.1'`.
+- Strings containing special characters (URLs, `+`, `//`, `:`) should be **quoted** (single or double quotes both work): `tcp_check_url: 'https://www.gstatic.com/generate_204'`.
 - Lists are comma-separated inside a single value: `lan_interface: eth0, eth1`.
 - Durations accept suffixes: `30s`, `50ms`, `5m`, `1h`.
 - `#` starts a comment (whole-line or trailing).
@@ -63,7 +63,7 @@ global {
     log_level: info
     dial_mode: domain
     auto_config_kernel_parameter: true
-    tcp_check_url: 'http://cp.cloudflare.com,1.1.1.1'
+    tcp_check_url: 'https://www.gstatic.com/generate_204'
     check_interval: 30s
     check_tolerance: 50ms
     bootstrap_resolver: '223.5.5.5:53'
@@ -108,7 +108,7 @@ global {
     lan_interface: eth0
     wan_interface: auto
     auto_config_kernel_parameter: true
-    tcp_check_url: 'http://cp.cloudflare.com'
+    tcp_check_url: 'https://www.gstatic.com/generate_204'
     check_interval: 30s
     dial_mode: domain
     bootstrap_resolver: '223.5.5.5:53'
@@ -197,20 +197,20 @@ This installs only the WAN ingress/egress hooks. TCP and UDP created by the host
 
 ### Warm-up and dial budget
 
-honk warms up in three distinct ways, all budgeted — none of them scales
-with raw node count, so large subscriptions are safe:
+honk has three independent warm-up mechanisms. Their bounds depend on
+configured groups or explicit budgets rather than raw subscription size:
 
 | Mechanism | Key | Default | Notes |
 | ----------- | ----- | --------- | ------- |
-| Bare TCP preconnect at startup | `preconnect_node_count` | `'auto'` | `'auto'` = up to 8 nodes (each group's current pick first, then config order); `0` disables; `N` pins the count. Only bare-TCP-poolable protocols qualify — AnyTLS/QUIC and the built-in `direct`/`block` are always skipped. |
-| TCP/TLS warm set | `tcp_warm_node_count` | `1` | Keeps the K fastest AnyTLS/TCP leaves per group per IP family warm. With few nodes (<50) `3`-`5` noticeably cuts first-hit latency on off-winner chains; with large subscriptions keep `1`-`2`. |
-| UDP warm set | `udp_warm_node_count` | `0` | Top-N UDP leaves per group per IP family; the process-wide total is capped at `4×N`, so many groups cannot blow the budget. |
-| Concurrent dial cap | `max_concurrent_dials` | `64` | Bounds concurrent proxied dials (connect + handshake) per generation. Built-in `direct`/`block` dials are exempt (local connects). Reload changes the replacement's local limit, while old and new generations share one immutable startup descriptor gate. |
+| Bare TCP preconnect at startup | `preconnect_node_count` | `'auto'` | One startup pass only. `'auto'` tries up to 8 nodes (each group's current pick first, then config order); `0` disables; explicit `N` may cover all eligible nodes with at most 8 concurrent attempts. Only bare-TCP-poolable protocols qualify — AnyTLS/QUIC and the built-in `direct`/`block` are always skipped. |
+| Selector pin | — | always on | Keeps the configured leaf of every `selector` group warm, including an explicitly selected node while it is unhealthy. AnyTLS and QUIC protocols retain their reusable session/client; other proxy protocols retain one bare server TCP connection. A Clash API choice change wakes reconciliation immediately, releases the previous leaf without cutting active flows, and warms the replacement. Reload preserves ownership for unchanged selected nodes. |
+| UDP warm set | `udp_warm_node_count` | `0` | Takes the top `min(N,3)` UDP leaves per group and IP family, dispatches at most 4 attempts concurrently, and caps the process-wide retained set at `4×N`. UDP and Selector ownership are independent: a shared resource is released only after both reasons disappear. |
+| Concurrent dial cap | `max_concurrent_dials` | `64` | Bounds physical proxy connects and protocol handshakes per generation. Ready-pool hits, logical streams on warm AnyTLS/QUIC transports, and built-in `direct`/`block` dials are exempt. Reload changes the replacement's local limit, while old and new generations share one immutable startup descriptor gate. |
 
-Health checks probe but never warm: a probe on a cold node leaves no
-session behind, so `check_interval` on a 400-node subscription does not
-create 400 idle tunnels. `/stats` exposes the live warm inventory under
-`warm` (reason × hot-node count, sessions per protocol).
+Health checks probe but never warm a cold node, so `check_interval` on a
+400-node subscription does not create 400 idle tunnels. The Selector pin is
+reconciled every 10 seconds as a repair backstop. `/stats` exposes the live
+warm inventory under `warm` (reason × hot-node count, sessions per protocol).
 
 ## 6. Nodes and share links
 

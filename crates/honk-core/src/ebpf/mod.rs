@@ -565,9 +565,10 @@ pub trait EbpfBackend: Send + Sync {
         Ok(())
     }
 
-    /// Re-check candidates before deleting them. A key reused after the scan
-    /// is retained unless its current incarnation has the scanned timestamp
-    /// and is still older than `expired_before_ns`.
+    /// Re-check candidates before deleting them. A key reused or transitioned
+    /// after the scan is retained unless its current timestamp and TCP state
+    /// match the scanned incarnation and it is no newer than
+    /// `expired_before_ns`.
     fn conn_state_remove_if_unchanged(
         &mut self,
         entries: &[(TuplesKey, ConnState)],

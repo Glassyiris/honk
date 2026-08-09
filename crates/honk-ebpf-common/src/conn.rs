@@ -53,9 +53,9 @@ pub enum BpfStatsKey {
 /// entries.
 pub const MAX_CONN_STATE_NUM: u32 = 65536 * 8;
 
-/// Conn-state entry timeouts, applied lazily by the eBPF datapath on every
-/// hit and proactively by the userspace janitor sweep.  Both sides must use
-/// the same values.
+/// Conn-state entry timeouts used by the eBPF datapath and userspace janitor.
+/// TCP ACTIVE expiry is a userspace-only backstop for unowned state; the
+/// datapath expires only CLOSING state. UDP remains a 120-second backstop.
 pub const TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS: u64 = 120_000_000_000; // 120 s
 pub const TCP_CONN_STATE_CLOSING_TIMEOUT_NS: u64 = 10_000_000_000; // 10 s
 pub const UDP_CONN_STATE_TIMEOUT_NS: u64 = 120_000_000_000; // 120 s backstop
@@ -73,6 +73,11 @@ pub const OCCUPANCY_EBPF_DELETES: u32 = 1;
 pub enum TcpState {
     TcpStateActive = 0,
     TcpStateClosing = 1,
+}
+
+#[inline(always)]
+pub fn tcp_conn_state_expired(state: &ConnState, elapsed_ns: u64) -> bool {
+    state.state == TcpState::TcpStateClosing as u8 && elapsed_ns > TCP_CONN_STATE_CLOSING_TIMEOUT_NS
 }
 
 #[repr(C)]
@@ -195,3 +200,35 @@ impl ConntrackArgs {
 
 #[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for ConnState {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tcp_active_never_expires() {
+        let state = ConnState {
+            state: TcpState::TcpStateActive as u8,
+            ..Default::default()
+        };
+
+        assert!(!tcp_conn_state_expired(&state, u64::MAX));
+    }
+
+    #[test]
+    fn tcp_closing_uses_strict_timeout() {
+        let state = ConnState {
+            state: TcpState::TcpStateClosing as u8,
+            ..Default::default()
+        };
+
+        assert!(!tcp_conn_state_expired(
+            &state,
+            TCP_CONN_STATE_CLOSING_TIMEOUT_NS
+        ));
+        assert!(tcp_conn_state_expired(
+            &state,
+            TCP_CONN_STATE_CLOSING_TIMEOUT_NS + 1
+        ));
+    }
+}

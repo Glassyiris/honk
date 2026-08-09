@@ -7,10 +7,12 @@
 //!
 //! All swept maps are plain hashes: the kernel never evicts on its own
 //! (silent LRU eviction could re-route or break live flows mid-flight), so
-//! occupancy management lives here.  Conn-state entries expire with
-//! state-based timeouts mirroring the datapath's lazy expiry (TCP closing /
-//! TCP active / UDP); the datapath's `CONN_STATE_OCCUPANCY` counters feed a
-//! live pressure gauge so sweeps run earlier as the map fills:
+//! occupancy management lives here. Accepted TCP owners pin conn-state and
+//! redirect metadata for their full relay lifetime; unpinned TCP ACTIVE and
+//! UDP entries keep the 120-second userspace backstop, while TCP CLOSING uses
+//! the datapath's strict 10-second rule. The datapath's
+//! `CONN_STATE_OCCUPANCY` counters feed a live pressure gauge so sweeps run
+//! earlier as the map fills:
 //!
 //! - `< 70%` full: steady sweep interval (60 s)
 //! - `70–85%`: elevated interval (15 s)
@@ -18,11 +20,12 @@
 //!   sweeps (overflow-counter growth also latches pressure mode on, as the
 //!   fail-closed last resort)
 
+use super::connection::{TcpFlowKey, TcpFlowPins};
 use crate::ebpf::EbpfBackend;
 use honk_ebpf_common::TuplesKey;
 use honk_ebpf_common::conn::{
-    BpfStatsKey, ConnState, MAX_CONN_STATE_NUM, TCP_CONN_STATE_CLOSING_TIMEOUT_NS,
-    TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS, TcpState, UDP_CONN_STATE_TIMEOUT_NS,
+    BpfStatsKey, ConnState, MAX_CONN_STATE_NUM, TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS, TcpState,
+    UDP_CONN_STATE_TIMEOUT_NS, tcp_conn_state_expired,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -54,6 +57,7 @@ const CONN_STATE_PRESSURE_WATERMARK: f64 = 0.85;
 const JANITOR_MIN_SCAN_CHUNK: usize = 128;
 const JANITOR_BASE_SCAN_CHUNK: usize = 256;
 const JANITOR_MAX_SCAN_CHUNK: usize = 1024;
+const JANITOR_DELETE_CHUNK: usize = 128;
 const JANITOR_BASE_CANDIDATES: usize = 1024;
 const JANITOR_MAX_CANDIDATES: usize = 4096;
 const JANITOR_BASE_SCAN_BUDGET: Duration = Duration::from_millis(100);
@@ -169,14 +173,22 @@ struct PressureState {
 /// and memory pressure. The janitor adapts its behaviour based on map pressure.
 pub struct BpfJanitor {
     ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+    tcp_flow_pins: Arc<TcpFlowPins>,
     stop_tx: tokio::sync::watch::Sender<bool>,
 }
 
 impl BpfJanitor {
     /// Create a new janitor bound to the given eBPF backend.
-    pub fn new(ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>) -> Self {
+    pub(super) fn new(
+        ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+        tcp_flow_pins: Arc<TcpFlowPins>,
+    ) -> Self {
         let (stop_tx, _) = tokio::sync::watch::channel(false);
-        Self { ebpf, stop_tx }
+        Self {
+            ebpf,
+            tcp_flow_pins,
+            stop_tx,
+        }
     }
 
     /// Return a receiver that fires when `stop()` is called.
@@ -344,29 +356,60 @@ impl BpfJanitor {
             }
         })
     }
-    async fn run_blocking_scan<T, F>(&self, label: &'static str, work: F) -> Option<T>
+    async fn run_blocking_read<T, F>(&self, label: &'static str, work: F) -> Option<T>
     where
         T: Send + 'static,
-        F: FnOnce(&mut dyn EbpfBackend) -> T + Send + 'static,
+        F: FnOnce(&dyn EbpfBackend) -> T + Send + 'static,
     {
         let ebpf = Arc::clone(&self.ebpf);
         match tokio::task::spawn_blocking(move || {
-            let mut ebpf = ebpf.blocking_write();
-            work(ebpf.as_mut())
+            let ebpf = ebpf.blocking_read();
+            work(ebpf.as_ref())
         })
         .await
         {
             Ok(result) => Some(result),
             Err(error) => {
-                error!(%error, map = label, "BPF janitor blocking scan task failed");
+                error!(%error, map = label, "BPF janitor blocking read task failed");
                 None
             }
         }
     }
 
-    /// Clean up expired conn-state entries with state-based timeouts
-    /// mirroring the datapath's lazy expiry (TCP closing: 10 s, TCP active:
-    /// 120 s, UDP: 120 s).  Returns `(deleted, total_scanned)` and
+    async fn run_blocking_chunked_delete<T, F>(
+        &self,
+        label: &'static str,
+        entries: Vec<T>,
+        mut work: F,
+    ) -> Option<anyhow::Result<u64>>
+    where
+        T: Send + 'static,
+        F: FnMut(&mut dyn EbpfBackend, &[T]) -> anyhow::Result<u64> + Send + 'static,
+    {
+        let ebpf = Arc::clone(&self.ebpf);
+        match tokio::task::spawn_blocking(move || {
+            let mut deleted = 0u64;
+            // Releasing between chunks lets queued per-flow readers run before
+            // the next bounded delete batch reacquires the writer lock.
+            for chunk in entries.chunks(JANITOR_DELETE_CHUNK) {
+                let mut ebpf = ebpf.blocking_write();
+                deleted += work(ebpf.as_mut(), chunk)?;
+            }
+            anyhow::Ok(deleted)
+        })
+        .await
+        {
+            Ok(result) => Some(result),
+            Err(error) => {
+                error!(%error, map = label, "BPF janitor blocking delete task failed");
+                None
+            }
+        }
+    }
+
+    /// Clean up unowned conn-state entries with state-based timeouts (TCP
+    /// closing: 10 s, TCP active: 120 s, UDP: 120 s). Accepted TCP owners are
+    /// never eviction candidates. Returns `(deleted, total_scanned)` and
     /// recalibrates the occupancy gauge against the exact entry count.
     async fn cleanup_conn_state(
         &self,
@@ -381,11 +424,21 @@ impl BpfJanitor {
                 return (0, 0);
             }
         };
-        // Map iteration uses synchronous BPF syscalls. Run a bounded scan in
-        // the blocking pool while retaining exclusive access for race-safe
-        // conditional deletion.
-        let result = self
-            .run_blocking_scan("conn-state", move |ebpf| {
+        self.cleanup_conn_state_at(now_ns, gauge, occ_counters, tuning)
+            .await
+    }
+
+    async fn cleanup_conn_state_at(
+        &self,
+        now_ns: u64,
+        gauge: &mut OccupancyGauge,
+        occ_counters: ((u64, u64), u64),
+        tuning: ScanTuning,
+    ) -> (u64, usize) {
+        let pins = Arc::clone(&self.tcp_flow_pins);
+        let scanned = self
+            .run_blocking_read("conn-state", move |ebpf| {
+                let pinned = pins.snapshot();
                 let deadline = Instant::now() + tuning.budget;
                 let mut expired = Vec::<(TuplesKey, ConnState)>::with_capacity(tuning.candidates);
                 let mut total = 0usize;
@@ -395,11 +448,12 @@ impl BpfJanitor {
                     for (key, state) in chunk {
                         let age = now_ns.saturating_sub(state.last_seen_ns);
                         let stale = if key.l4proto == IPPROTO_TCP {
-                            if state.state == TcpState::TcpStateClosing as u8 {
-                                age > TCP_CONN_STATE_CLOSING_TIMEOUT_NS
-                            } else {
-                                age > TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS
+                            if pinned.contains(&TcpFlowKey::from_tuples(key)) {
+                                continue;
                             }
+                            tcp_conn_state_expired(state, age)
+                                || (state.state != TcpState::TcpStateClosing as u8
+                                    && age > TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS)
                         } else {
                             age > UDP_CONN_STATE_TIMEOUT_NS
                         };
@@ -413,22 +467,34 @@ impl BpfJanitor {
                     keep_scanning
                 })?;
                 expired.truncate(tuning.candidates);
-                let deleted = if expired.is_empty() {
-                    0
-                } else {
-                    ebpf.conn_state_remove_if_unchanged(&expired, now_ns)?
-                };
-                anyhow::Ok((deleted, total, completed))
+                anyhow::Ok((expired, total, completed))
             })
             .await;
-        let Some(result) = result else {
+        let Some(scanned) = scanned else {
             return (0, 0);
         };
-        let (deleted, total, completed) = match result {
+        let (expired, total, completed) = match scanned {
             Ok(result) => result,
             Err(error) => {
                 debug!(%error, "BPF janitor: conn-state scan failed");
                 return (0, 0);
+            }
+        };
+        let deleted = if expired.is_empty() {
+            0
+        } else {
+            match self
+                .run_blocking_chunked_delete("conn-state", expired, move |ebpf, entries| {
+                    ebpf.conn_state_remove_if_unchanged(entries, now_ns)
+                })
+                .await
+            {
+                Some(Ok(deleted)) => deleted,
+                Some(Err(error)) => {
+                    debug!(%error, "BPF janitor: conn-state delete failed");
+                    0
+                }
+                None => 0,
             }
         };
         if completed {
@@ -437,6 +503,22 @@ impl BpfJanitor {
         }
         gauge.note_janitor_deletes(deleted);
         (deleted, total)
+    }
+
+    #[cfg(test)]
+    pub(super) async fn cleanup_conn_state_for_test(&self, now_ns: u64) -> (u64, usize) {
+        let mut gauge = OccupancyGauge::default();
+        self.cleanup_conn_state_at(
+            now_ns,
+            &mut gauge,
+            ((0, 0), 0),
+            ScanTuning {
+                chunk: JANITOR_MAX_SCAN_CHUNK,
+                candidates: JANITOR_MAX_CANDIDATES,
+                budget: Duration::from_secs(1),
+            },
+        )
+        .await
     }
 
     /// Clean up stale redirect track entries.
@@ -448,14 +530,25 @@ impl BpfJanitor {
                 return (0, 0);
             }
         };
-        let result = self
-            .run_blocking_scan("redirect-track", move |ebpf| {
+        self.cleanup_redirect_track_at(now_ns, tuning).await
+    }
+
+    async fn cleanup_redirect_track_at(&self, now_ns: u64, tuning: ScanTuning) -> (u64, usize) {
+        let pins = Arc::clone(&self.tcp_flow_pins);
+        let scanned = self
+            .run_blocking_read("redirect-track", move |ebpf| {
+                let pinned = pins.snapshot();
                 let deadline = Instant::now() + tuning.budget;
                 let mut expired = Vec::with_capacity(tuning.candidates);
                 let mut total = 0usize;
                 ebpf.redirect_track_for_each_chunk(tuning.chunk, &mut |chunk| {
                     total += chunk.len();
                     for (key, entry) in chunk {
+                        if key.l4proto == IPPROTO_TCP
+                            && pinned.contains(&TcpFlowKey::from_redirect(key))
+                        {
+                            continue;
+                        }
                         if now_ns.saturating_sub(entry.last_seen_ns) > REDIRECT_TRACK_TIMEOUT_NS {
                             expired.push((*key, *entry));
                         }
@@ -463,27 +556,51 @@ impl BpfJanitor {
                     expired.len() < tuning.candidates && Instant::now() < deadline
                 })?;
                 expired.truncate(tuning.candidates);
-                let deleted = if expired.is_empty() {
-                    0
-                } else {
-                    ebpf.redirect_track_remove_if_unchanged(&expired, now_ns)?
-                };
-                anyhow::Ok((deleted, total))
+                anyhow::Ok((expired, total))
             })
             .await;
-        match result {
-            Some(Ok((deleted, total))) => {
-                if deleted > 0 {
-                    debug!(deleted, "BPF janitor: removed redirect track entries");
-                }
-                (deleted, total)
-            }
+        let (expired, total) = match scanned {
+            Some(Ok(scanned)) => scanned,
             Some(Err(error)) => {
                 debug!(%error, "BPF janitor: redirect-track scan failed");
-                (0, 0)
+                return (0, 0);
             }
-            None => (0, 0),
+            None => return (0, 0),
+        };
+        let deleted = if expired.is_empty() {
+            0
+        } else {
+            match self
+                .run_blocking_chunked_delete("redirect-track", expired, move |ebpf, entries| {
+                    ebpf.redirect_track_remove_if_unchanged(entries, now_ns)
+                })
+                .await
+            {
+                Some(Ok(deleted)) => deleted,
+                Some(Err(error)) => {
+                    debug!(%error, "BPF janitor: redirect-track delete failed");
+                    0
+                }
+                None => 0,
+            }
+        };
+        if deleted > 0 {
+            debug!(deleted, "BPF janitor: removed redirect track entries");
         }
+        (deleted, total)
+    }
+
+    #[cfg(test)]
+    pub(super) async fn cleanup_redirect_track_for_test(&self, now_ns: u64) -> (u64, usize) {
+        self.cleanup_redirect_track_at(
+            now_ns,
+            ScanTuning {
+                chunk: JANITOR_MAX_SCAN_CHUNK,
+                candidates: JANITOR_MAX_CANDIDATES,
+                budget: Duration::from_secs(1),
+            },
+        )
+        .await
     }
 
     /// Clean up stale cookie PID metadata entries.
@@ -498,8 +615,8 @@ impl BpfJanitor {
                 return (0, 0);
             }
         };
-        let result = self
-            .run_blocking_scan("cookie-pid", move |ebpf| {
+        let scanned = self
+            .run_blocking_read("cookie-pid", move |ebpf| {
                 let deadline = Instant::now() + tuning.budget;
                 let mut expired = Vec::with_capacity(tuning.candidates);
                 let mut total = 0usize;
@@ -513,27 +630,38 @@ impl BpfJanitor {
                     expired.len() < tuning.candidates && Instant::now() < deadline
                 })?;
                 expired.truncate(tuning.candidates);
-                let deleted = if expired.is_empty() {
-                    0
-                } else {
-                    ebpf.cookie_pid_remove_if_unchanged(&expired, now_ns)?
-                };
-                anyhow::Ok((deleted, total))
+                anyhow::Ok((expired, total))
             })
             .await;
-        match result {
-            Some(Ok((deleted, total))) => {
-                if deleted > 0 {
-                    debug!(deleted, "BPF janitor: removed cookie PID entries");
-                }
-                (deleted, total)
-            }
+        let (expired, total) = match scanned {
+            Some(Ok(scanned)) => scanned,
             Some(Err(error)) => {
                 debug!(%error, "BPF janitor: cookie-PID scan failed");
-                (0, 0)
+                return (0, 0);
             }
-            None => (0, 0),
+            None => return (0, 0),
+        };
+        let deleted = if expired.is_empty() {
+            0
+        } else {
+            match self
+                .run_blocking_chunked_delete("cookie-pid", expired, move |ebpf, entries| {
+                    ebpf.cookie_pid_remove_if_unchanged(entries, now_ns)
+                })
+                .await
+            {
+                Some(Ok(deleted)) => deleted,
+                Some(Err(error)) => {
+                    debug!(%error, "BPF janitor: cookie-PID delete failed");
+                    0
+                }
+                None => 0,
+            }
+        };
+        if deleted > 0 {
+            debug!(deleted, "BPF janitor: removed cookie PID entries");
         }
+        (deleted, total)
     }
 
     /// Clean up expired routing handoff entries.
@@ -545,8 +673,8 @@ impl BpfJanitor {
                 return (0, 0);
             }
         };
-        let result = self
-            .run_blocking_scan("routing-handoff", move |ebpf| {
+        let scanned = self
+            .run_blocking_read("routing-handoff", move |ebpf| {
                 let deadline = Instant::now() + tuning.budget;
                 let mut expired = Vec::with_capacity(tuning.candidates);
                 let mut total = 0usize;
@@ -560,27 +688,38 @@ impl BpfJanitor {
                     expired.len() < tuning.candidates && Instant::now() < deadline
                 })?;
                 expired.truncate(tuning.candidates);
-                let deleted = if expired.is_empty() {
-                    0
-                } else {
-                    ebpf.routing_handoff_remove_if_unchanged(&expired, now_ns)?
-                };
-                anyhow::Ok((deleted, total))
+                anyhow::Ok((expired, total))
             })
             .await;
-        match result {
-            Some(Ok((deleted, total))) => {
-                if deleted > 0 {
-                    debug!(deleted, "BPF janitor: removed routing handoff entries");
-                }
-                (deleted, total)
-            }
+        let (expired, total) = match scanned {
+            Some(Ok(scanned)) => scanned,
             Some(Err(error)) => {
                 debug!(%error, "BPF janitor: routing-handoff scan failed");
-                (0, 0)
+                return (0, 0);
             }
-            None => (0, 0),
+            None => return (0, 0),
+        };
+        let deleted = if expired.is_empty() {
+            0
+        } else {
+            match self
+                .run_blocking_chunked_delete("routing-handoff", expired, move |ebpf, entries| {
+                    ebpf.routing_handoff_remove_if_unchanged(entries, now_ns)
+                })
+                .await
+            {
+                Some(Ok(deleted)) => deleted,
+                Some(Err(error)) => {
+                    debug!(%error, "BPF janitor: routing-handoff delete failed");
+                    0
+                }
+                None => 0,
+            }
+        };
+        if deleted > 0 {
+            debug!(deleted, "BPF janitor: removed routing handoff entries");
         }
+        (deleted, total)
     }
 
     /// Check BPF map health — overflow counter warnings plus conn-state
@@ -674,7 +813,7 @@ impl BpfJanitor {
 ///
 /// Uses `nix::time::clock_gettime` for cross-platform monotonic time access.
 /// This matches `bpf_ktime_get_ns()` which also uses CLOCK_MONOTONIC on Linux.
-fn monotonic_now_ns() -> anyhow::Result<u64> {
+pub(super) fn monotonic_now_ns() -> anyhow::Result<u64> {
     let ts = nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC)?;
     Ok(ts.tv_sec() as u64 * 1_000_000_000 + ts.tv_nsec() as u64)
 }
@@ -720,6 +859,8 @@ fn update_pressure_state(state: &mut PressureState, overflow_delta: bool, utiliz
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ebpf::mock::MockEbpfBackend;
+    use honk_ebpf_common::{RedirectEntry, RedirectTuple};
     #[test]
     fn scan_tuning_grows_with_pressure() {
         let steady = scan_tuning(0.5, Duration::ZERO);
@@ -745,6 +886,35 @@ mod tests {
         assert!(slow.chunk < fast.chunk);
         assert_eq!(slow.candidates, fast.candidates);
         assert_eq!(slow.budget, fast.budget);
+    }
+
+    #[tokio::test]
+    async fn blocking_scan_keeps_hot_path_readers_available() {
+        let backend: Arc<RwLock<Box<dyn EbpfBackend>>> =
+            Arc::new(RwLock::new(Box::new(MockEbpfBackend::new())));
+        let janitor = BpfJanitor::new(Arc::clone(&backend), Arc::new(TcpFlowPins::default()));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let scan = tokio::spawn(async move {
+            janitor
+                .run_blocking_read("test", move |_| {
+                    entered_tx.send(()).expect("test receiver stays alive");
+                    release_rx.recv().expect("test scan gets released");
+                })
+                .await
+        });
+
+        entered_rx.await.expect("blocking scan started");
+        let read_available = tokio::time::timeout(Duration::from_millis(100), backend.read())
+            .await
+            .is_ok();
+        release_tx.send(()).expect("release blocking scan");
+        scan.await.expect("scan task joins");
+
+        assert!(
+            read_available,
+            "bounded janitor scans must not block per-flow eBPF reads"
+        );
     }
 
     #[test]
@@ -851,5 +1021,136 @@ mod tests {
     fn test_monotonic_now_ns_returns_value() {
         let ns = monotonic_now_ns().expect("monotonic time should be available");
         assert!(ns > 0, "monotonic time should be positive, got {}", ns);
+    }
+    fn test_tuple(src_port: u16, l4proto: u8) -> TuplesKey {
+        let mut key: TuplesKey = unsafe { std::mem::zeroed() };
+        key.src_ip[15] = 1;
+        key.dst_ip[15] = 2;
+        key.src_port = src_port;
+        key.dst_port = 443;
+        key.l4proto = l4proto;
+        key
+    }
+
+    fn test_state(state: TcpState, last_seen_ns: u64) -> ConnState {
+        ConnState {
+            state: state as u8,
+            last_seen_ns,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_pin_conn_state_matrix() -> anyhow::Result<()> {
+        let pinned_active = test_tuple(10_001, IPPROTO_TCP);
+        let pinned_closing = test_tuple(10_002, IPPROTO_TCP);
+        let unpinned_active = test_tuple(10_003, IPPROTO_TCP);
+        let unpinned_closing = test_tuple(10_004, IPPROTO_TCP);
+        let udp = test_tuple(10_005, 17);
+        let now_ns = TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS + 1;
+
+        let backend: Arc<RwLock<Box<dyn EbpfBackend>>> =
+            Arc::new(RwLock::new(Box::new(MockEbpfBackend::new())));
+        {
+            let mut backend = backend.write().await;
+            backend
+                .tcp_conn_state_store(&pinned_active, &test_state(TcpState::TcpStateActive, 0))?;
+            backend
+                .tcp_conn_state_store(&pinned_closing, &test_state(TcpState::TcpStateClosing, 0))?;
+            backend
+                .tcp_conn_state_store(&unpinned_active, &test_state(TcpState::TcpStateActive, 0))?;
+            backend.tcp_conn_state_store(
+                &unpinned_closing,
+                &test_state(TcpState::TcpStateClosing, 0),
+            )?;
+            backend.udp_conn_state_store(&udp, &test_state(TcpState::TcpStateActive, 0))?;
+        }
+
+        let pins = Arc::new(TcpFlowPins::default());
+        pins.retain_for_test(TcpFlowKey::from_tuples(&pinned_active));
+        pins.retain_for_test(TcpFlowKey::from_tuples(&pinned_closing));
+        let janitor = BpfJanitor::new(Arc::clone(&backend), Arc::clone(&pins));
+
+        assert_eq!(janitor.cleanup_conn_state_for_test(now_ns).await, (3, 5));
+        {
+            let backend = backend.read().await;
+            assert!(backend.tcp_conn_state_lookup(&pinned_active)?.is_some());
+            assert!(backend.tcp_conn_state_lookup(&pinned_closing)?.is_some());
+            assert!(backend.tcp_conn_state_lookup(&unpinned_active)?.is_none());
+            assert!(backend.tcp_conn_state_lookup(&unpinned_closing)?.is_none());
+            assert!(backend.udp_conn_state_lookup(&udp)?.is_none());
+        }
+
+        assert_eq!(
+            pins.release_for_test(TcpFlowKey::from_tuples(&pinned_active)),
+            Some(true)
+        );
+        assert_eq!(
+            pins.release_for_test(TcpFlowKey::from_tuples(&pinned_closing)),
+            Some(true)
+        );
+        assert_eq!(janitor.cleanup_conn_state_for_test(now_ns).await, (2, 2));
+        let backend = backend.read().await;
+        assert!(backend.tcp_conn_state_lookup(&pinned_active)?.is_none());
+        assert!(backend.tcp_conn_state_lookup(&pinned_closing)?.is_none());
+
+        anyhow::Ok(())
+    }
+
+    #[tokio::test]
+    async fn tcp_pin_redirect_matrix() -> anyhow::Result<()> {
+        let pinned_key = test_tuple(20_001, IPPROTO_TCP);
+        let unpinned_key = test_tuple(20_002, IPPROTO_TCP);
+        let udp_key = test_tuple(20_003, 17);
+        let pinned = RedirectTuple::from_tuples(&pinned_key);
+        let unpinned = RedirectTuple::from_tuples(&unpinned_key);
+        let udp = RedirectTuple::from_tuples(&udp_key);
+        let stale = RedirectEntry {
+            last_seen_ns: 0,
+            ..Default::default()
+        };
+        let now_ns = REDIRECT_TRACK_TIMEOUT_NS + 1;
+
+        let backend: Arc<RwLock<Box<dyn EbpfBackend>>> =
+            Arc::new(RwLock::new(Box::new(MockEbpfBackend::new())));
+        {
+            let mut backend = backend.write().await;
+            backend.redirect_track_store(&pinned, &stale)?;
+            backend.redirect_track_store(&unpinned, &stale)?;
+            backend.redirect_track_store(&udp, &stale)?;
+        }
+
+        let pins = Arc::new(TcpFlowPins::default());
+        pins.retain_for_test(TcpFlowKey::from_tuples(&pinned_key));
+        let janitor = BpfJanitor::new(Arc::clone(&backend), Arc::clone(&pins));
+
+        assert_eq!(
+            janitor.cleanup_redirect_track_for_test(now_ns).await,
+            (2, 3)
+        );
+        {
+            let backend = backend.read().await;
+            assert!(backend.redirect_track_lookup(&pinned)?.is_some());
+            assert!(backend.redirect_track_lookup(&unpinned)?.is_none());
+            assert!(backend.redirect_track_lookup(&udp)?.is_none());
+        }
+
+        assert_eq!(
+            pins.release_for_test(TcpFlowKey::from_tuples(&pinned_key)),
+            Some(true)
+        );
+        assert_eq!(
+            janitor.cleanup_redirect_track_for_test(now_ns).await,
+            (1, 1)
+        );
+        assert!(
+            backend
+                .read()
+                .await
+                .redirect_track_lookup(&pinned)?
+                .is_none()
+        );
+
+        Ok(())
     }
 }

@@ -83,7 +83,7 @@ pub const URLTEST_MAX_CONCURRENT: usize = 10;
 /// headers are fully received. A TLS handshake failure counts as a
 /// measurement failure.
 ///
-/// An empty `url` — or one starting with `http://` — falls back to
+/// An empty `url` or one starting with `http://` falls back to
 /// [`DEFAULT_URLTEST_URL`]. A zero `timeout` falls back to
 /// [`DEFAULT_URLTEST_TIMEOUT`].
 pub async fn urltest_node(
@@ -149,6 +149,32 @@ pub async fn urltest_node(
         timeout,
     )
     .await
+}
+/// Measure through reusable generation state only when that state is already
+/// warm. Cold session-owning nodes use an ephemeral runtime so a dashboard
+/// group scan cannot retain one QUIC client or AnyTLS pool per tested node.
+pub async fn urltest_node_in_generation(
+    generation: &Arc<crate::runtime::OutboundRuntimeRegistry>,
+    node: &Node,
+    handler: &dyn TcpOutbound,
+    url: &str,
+    timeout: Duration,
+) -> anyhow::Result<Duration> {
+    let (runtime, guard) = match generation
+        .get(&node.id)
+        .filter(|runtime| runtime.is_warm_or_stateless())
+    {
+        Some(runtime) => (runtime, None),
+        None => {
+            let guard = crate::runtime::NodeRuntime::ephemeral_guarded(node);
+            (guard.runtime(), Some(guard))
+        }
+    };
+    let result = urltest_node(&runtime, handler, url, timeout).await;
+    if let Some(guard) = guard {
+        guard.close().await;
+    }
+    result
 }
 
 /// [`urltest_node`] with a caller-chosen destination address (e.g. an
@@ -312,13 +338,7 @@ pub async fn urltest_group(
 
     for node in members {
         let node = node.clone();
-        let (runtime, guard) = match generation.get(&node.id) {
-            Some(runtime) => (runtime, None),
-            None => {
-                let guard = crate::runtime::NodeRuntime::ephemeral_guarded(&node);
-                (guard.runtime(), Some(guard))
-            }
-        };
+        let generation = Arc::clone(generation);
         let registry = registry.clone();
         let alive_set = alive_set.clone();
         let url = url.clone();
@@ -326,12 +346,18 @@ pub async fn urltest_group(
         join_set.spawn(async move {
             let _permit = permit.acquire_owned().await;
             let result = match registry.find(node.protocol) {
-                Some(entry) => urltest_node(&runtime, entry.tcp.as_ref(), &url, timeout).await,
+                Some(entry) => {
+                    urltest_node_in_generation(
+                        &generation,
+                        &node,
+                        entry.tcp.as_ref(),
+                        &url,
+                        timeout,
+                    )
+                    .await
+                }
                 None => Err(anyhow!("no handler for protocol {:?}", node.protocol)),
             };
-            if let Some(guard) = guard {
-                guard.close().await;
-            }
             match &result {
                 Ok(latency) => {
                     alive_set.record_probe_latency(

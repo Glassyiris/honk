@@ -61,4 +61,8 @@ docs
 results
 .sisyphus
 .expect
+.codex
+.agents
 bench
+.task*
+.qa*

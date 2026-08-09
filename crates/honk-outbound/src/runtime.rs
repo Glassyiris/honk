@@ -2,9 +2,9 @@
 //! session-layer resources through immutable runtime generations.
 //!
 //! `OutboundRuntimeRegistry` maps `Node.id` (UUID) to a `NodeRuntime` —
-//! the minimal PreparedOutbound: the immutable node config, its
-//! capabilities, and the protocol runtime that owns its sessions. The
-//! registry lives on the ControlPlane (never on the GroupManager — a leaf
+//! immutable node config, its UDP capability, and generation-owned protocol
+//! state.
+//! The registry lives on the ControlPlane (never on the GroupManager — a leaf
 //! node may belong to many groups, and group rebuilds must not destroy
 //! live sessions). ProxyRegistry stays stateless handlers.
 //!
@@ -22,26 +22,6 @@ pub const TLS_IDLE_RETENTION: Duration = Duration::from_secs(10 * 60);
 pub const TLS_REAP_INTERVAL: Duration = Duration::from_secs(60);
 
 use honk_config::node::Node;
-
-/// What a node can do, derived from its protocol and config — the basis
-/// for capability-based pooling decisions (e.g. the ready-pool allowlist
-/// in phase 5, bare-pool eligibility).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OutboundCapabilities {
-    /// Carries TCP flows (all current protocols).
-    pub tcp: bool,
-    /// Carries UDP flows (`dial_udp_transport` works end to end).
-    pub udp: bool,
-    /// Multiplexes many logical streams over one physical session —
-    /// these protocols pool sessions, never bare TCP or ready streams.
-    pub multiplexed: bool,
-}
-
-impl OutboundCapabilities {
-    pub fn for_node(node: &Node) -> Self {
-        (crate::descriptor::descriptor(node.protocol).capabilities)(node)
-    }
-}
 
 /// The generation-scoped session runtime a protocol owns, if any.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,12 +47,10 @@ impl GenerationRuntime {
 #[derive(Debug)]
 pub enum ProtocolRuntime {
     None,
-    /// AnyTLS: the node's own session pool (2B). One pool per node — no
-    /// static/global pool, no shared string keys.
+    /// One node-local AnyTLS session pool.
     AnyTls(AnyTlsRuntime),
-    /// TUIC, Juicity, and Hysteria2: type-erased, node-local client slots.
-    /// Each concrete handler occupies one slot and retains its own typed
-    /// `QuicClient`; the runtime retains it for this generation's lifetime.
+    /// Type-erased TUIC, Juicity, or Hysteria2 client slot. Policy warm
+    /// ownership may release the cached client before generation retirement.
     Quic(QuicRuntime),
 }
 
@@ -85,18 +63,25 @@ pub trait QuicRuntimeClient: Send + Sync + 'static {
     /// Close the cached connection and endpoint, awaiting any in-flight
     /// dial so its late-arriving connection is closed too.
     async fn force_close(&self);
+    /// Drop only reusable warm ownership. Existing flows keep their own
+    /// connection/state clones and future dials may rebuild the client.
+    async fn release_warm(&self);
 }
 
-/// Generation-owned storage for protocol-specific QUIC clients.
+/// Generation-owned storage for one protocol-specific QUIC client.
 ///
-/// The mutex deliberately covers construction: TLS config construction may
-/// perform ECH discovery, and admitting two first flows must still result in
-/// one client/connection single-flight for this generation.
+/// Each node has one immutable protocol, so a runtime needs one type-erased
+/// slot rather than a type-indexed map. The mutex deliberately covers
+/// construction and promotion: first traffic, warm-up, and a finalized
+/// speculative transport must converge on one reusable client.
 pub struct QuicRuntime {
-    clients: tokio::sync::Mutex<HashMap<std::any::TypeId, Arc<dyn QuicRuntimeClient>>>,
-    /// Set by [`Self::force_close_all`] under the clients lock, so a client
-    /// build can never slip past a completed close.
-    closed: AtomicBool,
+    state: tokio::sync::Mutex<QuicRuntimeState>,
+}
+
+#[derive(Default)]
+struct QuicRuntimeState {
+    client: Option<Arc<dyn QuicRuntimeClient>>,
+    closed: bool,
 }
 
 impl std::fmt::Debug for QuicRuntime {
@@ -108,8 +93,7 @@ impl std::fmt::Debug for QuicRuntime {
 impl QuicRuntime {
     pub(crate) fn new() -> Self {
         Self {
-            clients: tokio::sync::Mutex::new(HashMap::new()),
-            closed: AtomicBool::new(false),
+            state: tokio::sync::Mutex::new(QuicRuntimeState::default()),
         }
     }
 
@@ -119,55 +103,75 @@ impl QuicRuntime {
         F: FnOnce() -> Fut,
         Fut: Future<Output = anyhow::Result<Arc<T>>>,
     {
-        let mut clients = self.clients.lock().await;
-        if self.closed.load(Ordering::Acquire) {
+        let mut state = self.state.lock().await;
+        if state.closed {
             anyhow::bail!("QUIC runtime is closed");
         }
-        let key = std::any::TypeId::of::<T>();
-        if let Some(client) = clients.get(&key) {
+        if let Some(client) = state.client.as_ref() {
             return Arc::clone(client)
                 .into_erased()
                 .downcast::<T>()
                 .map_err(|_| anyhow::anyhow!("QUIC client slot type mismatch"));
         }
         let client = build().await?;
-        clients.insert(key, Arc::clone(&client) as Arc<dyn QuicRuntimeClient>);
+        state.client = Some(Arc::clone(&client) as Arc<dyn QuicRuntimeClient>);
         Ok(client)
     }
 
-    /// Force-close every cached client and reject future client builds.
-    /// Awaits the construction/dial critical sections: a client or
-    /// connection completed just before the close is closed here rather
-    /// than leaked into a terminating generation. The map is drained so a
-    /// closed runtime neither pins dead clients nor reports them as warm.
-    pub(crate) async fn force_close_all(&self) {
-        let clients: Vec<Arc<dyn QuicRuntimeClient>> = {
-            let mut clients = self.clients.lock().await;
-            self.closed.store(true, Ordering::Release);
-            clients.drain().map(|(_, client)| client).collect()
+    /// Publish a detached speculative client after its transport wins. If
+    /// ordinary traffic filled the slot meanwhile, retain that incumbent:
+    /// the winning transport already owns its connection/state clones. There
+    /// is no await after slot mutation, so cancellation cannot publish a
+    /// client without completing the commit.
+    pub(crate) async fn publish_client<T>(&self, client: Arc<T>) -> anyhow::Result<()>
+    where
+        T: QuicRuntimeClient,
+    {
+        let mut state = self.state.lock().await;
+        if state.closed {
+            anyhow::bail!("QUIC runtime is closed");
+        }
+        if let Some(incumbent) = state.client.as_ref() {
+            Arc::clone(incumbent)
+                .into_erased()
+                .downcast::<T>()
+                .map_err(|_| anyhow::anyhow!("QUIC client slot type mismatch"))?;
+            return Ok(());
+        }
+        state.client = Some(client as Arc<dyn QuicRuntimeClient>);
+        Ok(())
+    }
+
+    /// Force-close the cached client and reject future client builds.
+    /// Awaits the construction/promotion critical section, so a client
+    /// completed just before close cannot leak into a terminal generation.
+    pub(crate) async fn force_close(&self) {
+        let client = {
+            let mut state = self.state.lock().await;
+            state.closed = true;
+            state.client.take()
         };
-        for client in clients {
+        if let Some(client) = client {
             client.force_close().await;
         }
     }
 
-    /// Whether any protocol client already occupies a slot. A contended lock
-    /// means a client build is in flight, which counts as warm: callers use
-    /// this to decide between reusing the runtime and dialing ephemerally,
-    /// and the ephemeral dial would only duplicate that build.
-    pub(crate) fn has_client(&self) -> bool {
-        self.clients
-            .try_lock()
-            .map(|c| !c.is_empty())
-            .unwrap_or(true)
+    /// Drop reusable ownership without making this runtime terminal.
+    /// Established flows retain their own connection clones.
+    async fn release_warm(&self) {
+        let client = self.state.lock().await.client.take();
+        if let Some(client) = client {
+            client.release_warm().await;
+        }
     }
 
-    /// Number of occupied client slots, or `None` when the map is locked by
-    /// an in-flight client build — "unknown", deliberately distinct from
-    /// zero: gauges must not treat a contended read as a cold node and
-    /// prune its attribution.
+    /// Occupancy (zero or one), or `None` while the slot lock is held.
+    /// Gauges treat contention as unknown rather than pruning attribution.
     pub(crate) fn client_count(&self) -> Option<usize> {
-        self.clients.try_lock().map(|c| c.len()).ok()
+        self.state
+            .try_lock()
+            .map(|state| usize::from(state.client.is_some()))
+            .ok()
     }
 }
 
@@ -220,6 +224,13 @@ impl TlsConnectorSlot {
         true
     }
 
+    fn evict(&self) {
+        let mut state = self.state.lock();
+        if state.cached.take().is_some() {
+            state.revision = state.revision.wrapping_add(1);
+        }
+    }
+
     #[cfg(test)]
     fn is_loaded(&self) -> bool {
         self.state.lock().cached.is_some()
@@ -246,7 +257,7 @@ impl AnyTlsRuntime {
 }
 
 /// Live warm-session gauge of one runtime: retained AnyTLS pool sessions
-/// and occupied QUIC client slots (`None` = count unknown under lock
+/// and one occupied QUIC client slot (`None` = count unknown under lock
 /// contention, to be treated as warm rather than cold).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WarmCounts {
@@ -263,19 +274,95 @@ impl Default for WarmCounts {
     }
 }
 
-/// The minimal per-node runtime entry (the honest, minimal
-/// PreparedOutbound — not the full scaffold).
+/// Independent policy-warm owners of reusable node state. The final policy
+/// release drops future reuse without cutting active flow-owned clones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WarmRetention {
+    Selector,
+    Udp,
+}
+
+impl WarmRetention {
+    fn bit(self) -> u8 {
+        match self {
+            Self::Selector => 1,
+            Self::Udp => 1 << 1,
+        }
+    }
+}
+
+/// Immutable configuration and reusable protocol state for one node.
 #[derive(Debug)]
 pub struct NodeRuntime {
     /// Immutable node config for this generation.
     pub node: Arc<Node>,
-    pub capabilities: OutboundCapabilities,
+    pub udp_capable: bool,
     pub runtime: ProtocolRuntime,
     /// One-shot runtime outside any generation (see [`Self::ephemeral`]).
     /// Session protocols skip their standby janitor for these: there is no
     /// long-lived owner to keep warm state for, only [`Self::close`] to
     /// release it deterministically.
     ephemeral: bool,
+    /// Serializes warm establishment and release while tracking independent
+    /// selector/UDP owners across runtime reuse on reload.
+    warm_retention: Arc<tokio::sync::Mutex<u8>>,
+}
+
+/// Warm establishment transaction. Cancellation rolls back only a bit this
+/// attempt inserted; QUIC cleanup rechecks the bitmap after reacquiring the
+/// lock so it cannot dismantle a successor attempt's client.
+pub(crate) struct WarmAttempt {
+    runtime: Arc<NodeRuntime>,
+    retention: Option<tokio::sync::OwnedMutexGuard<u8>>,
+    reason: WarmRetention,
+    inserted: bool,
+}
+
+impl WarmAttempt {
+    pub(crate) fn commit(mut self) {
+        self.retention.take();
+    }
+
+    pub(crate) async fn rollback(mut self) {
+        let retention = self
+            .retention
+            .take()
+            .expect("live warm attempt owns the retention lock");
+        if self.inserted {
+            self.runtime
+                .release_warm_locked(retention, self.reason)
+                .await;
+        }
+    }
+}
+
+impl Drop for WarmAttempt {
+    fn drop(&mut self) {
+        if !self.inserted {
+            return;
+        }
+        let Some(mut retention) = self.retention.take() else {
+            return;
+        };
+        *retention &= !self.reason.bit();
+        if *retention != 0 {
+            return;
+        }
+        match &self.runtime.runtime {
+            ProtocolRuntime::AnyTls(runtime) => {
+                runtime.pool.set_warm_retained(false);
+                runtime.tls.evict();
+            }
+            ProtocolRuntime::Quic(_) => {
+                drop(retention);
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let runtime = Arc::clone(&self.runtime);
+                    handle.spawn(async move { runtime.release_if_unretained().await });
+                }
+            }
+            ProtocolRuntime::None => {}
+        }
+    }
 }
 
 impl NodeRuntime {
@@ -287,11 +374,12 @@ impl NodeRuntime {
     pub fn ephemeral(node: &Node) -> Arc<Self> {
         Arc::new(Self {
             node: Arc::new(node.clone()),
-            capabilities: OutboundCapabilities::for_node(node),
+            udp_capable: (crate::descriptor::descriptor(node.protocol).supports_udp)(node),
             runtime: crate::descriptor::descriptor(node.protocol)
                 .generation_runtime
                 .build(),
             ephemeral: true,
+            warm_retention: Arc::new(tokio::sync::Mutex::new(0)),
         })
     }
 
@@ -308,15 +396,104 @@ impl NodeRuntime {
         self.ephemeral
     }
 
+    pub(crate) async fn retain_warm(self: &Arc<Self>, reason: WarmRetention) -> WarmAttempt {
+        let mut retention = Arc::clone(&self.warm_retention).lock_owned().await;
+        let bit = reason.bit();
+        let inserted = *retention & bit == 0;
+        let was_unretained = *retention == 0;
+        *retention |= bit;
+        if was_unretained && let ProtocolRuntime::AnyTls(runtime) = &self.runtime {
+            runtime.pool.set_warm_retained(true);
+        }
+        WarmAttempt {
+            runtime: Arc::clone(self),
+            retention: Some(retention),
+            reason,
+            inserted,
+        }
+    }
+
+    async fn release_warm_state(&self) {
+        match &self.runtime {
+            ProtocolRuntime::AnyTls(runtime) => {
+                runtime.pool.set_warm_retained(false);
+                runtime.tls.evict();
+            }
+            ProtocolRuntime::Quic(runtime) => runtime.release_warm().await,
+            ProtocolRuntime::None => {}
+        }
+    }
+
+    async fn release_warm_locked(
+        self: &Arc<Self>,
+        mut retention: tokio::sync::OwnedMutexGuard<u8>,
+        reason: WarmRetention,
+    ) {
+        let bit = reason.bit();
+        if *retention & bit == 0 {
+            return;
+        }
+        *retention &= !bit;
+        if *retention != 0 {
+            return;
+        }
+        if matches!(&self.runtime, ProtocolRuntime::Quic(_)) {
+            drop(retention);
+            let runtime = Arc::clone(self);
+            // Spawn before awaiting so cancellation of the releasing caller
+            // cannot strand a client after the ownership bit reached zero.
+            let cleanup = tokio::spawn(async move { runtime.release_if_unretained().await });
+            let _ = cleanup.await;
+        } else {
+            self.release_warm_state().await;
+        }
+    }
+
+    /// Finish cancellation-driven QUIC cleanup after the owned guard drops.
+    /// A successor may have retained the runtime meanwhile, so zero is
+    /// revalidated under the same lock before releasing the client slot.
+    async fn release_if_unretained(self: Arc<Self>) {
+        let retention = Arc::clone(&self.warm_retention).lock_owned().await;
+        if *retention == 0 {
+            self.release_warm_state().await;
+        }
+    }
+
+    /// Release one policy's warm ownership. A later selection may warm this
+    /// runtime again; active logical flows are never cut.
+    pub async fn release_warm(self: &Arc<Self>, reason: WarmRetention) {
+        let retention = Arc::clone(&self.warm_retention).lock_owned().await;
+        self.release_warm_locked(retention, reason).await;
+    }
+
     /// Close every session-layer resource this runtime owns: AnyTLS pool
-    /// sessions (connections + demux tasks) and cached QUIC clients
+    /// sessions (connections + demux tasks) or one cached QUIC client
     /// (connection + endpoint driver). Terminal for the runtime; idempotent.
     pub async fn close(&self) {
         match &self.runtime {
             ProtocolRuntime::AnyTls(runtime) => runtime.pool.shutdown(),
-            ProtocolRuntime::Quic(runtime) => runtime.force_close_all().await,
+            ProtocolRuntime::Quic(runtime) => runtime.force_close().await,
             ProtocolRuntime::None => {}
         }
+    }
+
+    pub(crate) fn anytls_pool(&self) -> anyhow::Result<Arc<crate::proxy::anytls::AnyTlsPool>> {
+        let ProtocolRuntime::AnyTls(runtime) = &self.runtime else {
+            anyhow::bail!("node '{}' has no AnyTLS runtime", self.node.name);
+        };
+        Ok(Arc::clone(&runtime.pool))
+    }
+
+    pub(crate) async fn quic_client<T, F, Fut>(&self, build: F) -> anyhow::Result<Arc<T>>
+    where
+        T: QuicRuntimeClient,
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = anyhow::Result<Arc<T>>>,
+    {
+        let ProtocolRuntime::Quic(runtime) = &self.runtime else {
+            anyhow::bail!("node '{}' has no QUIC runtime", self.node.name);
+        };
+        runtime.client(build).await
     }
 
     pub(crate) fn anytls_tls_connector(&self) -> anyhow::Result<Arc<crate::tls::TlsConnector>> {
@@ -326,34 +503,26 @@ impl NodeRuntime {
         runtime.tls.get_or_build(&self.node)
     }
 
-    /// Whether dialing through this runtime reuses already-warm session
-    /// state instead of establishing — and then retaining — new state.
-    /// Health probes key on this: a warm runtime is reused (the probe then
-    /// measures the hot path), a cold one is bypassed for an ephemeral
-    /// one-shot dial so a probe cycle never fills every node's pool with
-    /// standby sessions. Runtimes without session state report warm: the
-    /// generation and ephemeral forms of their dial are identical.
-    pub fn has_warm_resources(&self) -> bool {
+    /// Whether one-shot work should use this generation instead of an
+    /// ephemeral runtime. Stateless protocols are always safe; session
+    /// protocols qualify only when a reusable session/client exists or a
+    /// QUIC client build already holds the slot lock.
+    pub fn is_warm_or_stateless(&self) -> bool {
         match &self.runtime {
             ProtocolRuntime::None => true,
-            ProtocolRuntime::AnyTls(runtime) => runtime
-                .pool
-                .has_usable_session(crate::proxy::anytls::POOL_KEY),
-            ProtocolRuntime::Quic(runtime) => runtime.has_client(),
+            ProtocolRuntime::AnyTls(runtime) => runtime.pool.has_usable_session(),
+            ProtocolRuntime::Quic(runtime) => runtime.client_count().is_none_or(|count| count != 0),
         }
     }
 
-    /// Retained warm state of this runtime: live AnyTLS pool sessions and
-    /// occupied QUIC client slots. `clients` is `None` when the count is
-    /// unknown (client map locked by an in-flight build) — callers must
-    /// treat unknown as warm, never as cold.
+    /// Live reusable state: AnyTLS sessions or one occupied QUIC client slot.
+    /// `clients` is `None` while the slot lock is held; callers treat that
+    /// in-flight state as warm rather than pruning its attribution.
     pub fn warm_counts(&self) -> WarmCounts {
         match &self.runtime {
             ProtocolRuntime::None => WarmCounts::default(),
             ProtocolRuntime::AnyTls(runtime) => WarmCounts {
-                sessions: runtime
-                    .pool
-                    .live_session_count(crate::proxy::anytls::POOL_KEY),
+                sessions: runtime.pool.live_session_count(),
                 clients: Some(0),
             },
             ProtocolRuntime::Quic(runtime) => WarmCounts {
@@ -585,11 +754,12 @@ impl OutboundRuntimeRegistry {
                 }
                 None => Arc::new(NodeRuntime {
                     node: Arc::new(node.clone()),
-                    capabilities: OutboundCapabilities::for_node(node),
+                    udp_capable: (crate::descriptor::descriptor(node.protocol).supports_udp)(node),
                     runtime: crate::descriptor::descriptor(node.protocol)
                         .generation_runtime
                         .build(),
                     ephemeral: false,
+                    warm_retention: Arc::new(tokio::sync::Mutex::new(0)),
                 }),
             };
             if let Some(prev) = map.insert(node.id, runtime) {
@@ -746,11 +916,7 @@ impl OutboundRuntimeRegistry {
             if moved_out.contains(id) {
                 continue;
             }
-            match &runtime.runtime {
-                ProtocolRuntime::AnyTls(anytls) => anytls.pool.shutdown(),
-                ProtocolRuntime::Quic(quic) => quic.force_close_all().await,
-                ProtocolRuntime::None => {}
-            }
+            runtime.close().await;
         }
     }
 }
@@ -767,6 +933,27 @@ mod tests {
             protocol,
             address: "1.2.3.4:443".to_string(),
             ..Default::default()
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeQuicClient {
+        force_closed: AtomicBool,
+        warm_released: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl QuicRuntimeClient for FakeQuicClient {
+        fn into_erased(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
+            self
+        }
+
+        async fn force_close(&self) {
+            self.force_closed.store(true, Ordering::Release);
+        }
+
+        async fn release_warm(&self) {
+            self.warm_released.store(true, Ordering::Release);
         }
     }
 
@@ -788,6 +975,26 @@ mod tests {
             .anytls_tls_connector()
             .unwrap();
         assert!(!Arc::ptr_eq(&first_connector, &reloaded_connector));
+    }
+
+    #[tokio::test]
+    async fn warm_retention_releases_only_after_last_owner() {
+        let node = node("anytls-retained", NodeProtocol::AnyTLS);
+        let registry = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
+        let runtime = registry.get(&node.id).unwrap();
+
+        runtime.retain_warm(WarmRetention::Selector).await.commit();
+        runtime.retain_warm(WarmRetention::Udp).await.commit();
+        let ProtocolRuntime::AnyTls(anytls) = &runtime.runtime else {
+            panic!("AnyTLS node must own a session pool");
+        };
+        assert!(anytls.pool.is_warm_retained());
+
+        runtime.release_warm(WarmRetention::Selector).await;
+        assert!(anytls.pool.is_warm_retained());
+
+        runtime.release_warm(WarmRetention::Udp).await;
+        assert!(!anytls.pool.is_warm_retained());
     }
 
     #[test]
@@ -861,10 +1068,10 @@ mod tests {
 
         let anytls_runtime = registry.get(&anytls.id).unwrap();
         let tuic_runtime = registry.get(&tuic.id).unwrap();
-        assert!(!anytls_runtime.has_warm_resources());
-        assert!(!tuic_runtime.has_warm_resources());
+        assert!(!anytls_runtime.is_warm_or_stateless());
+        assert!(!tuic_runtime.is_warm_or_stateless());
         assert!(
-            registry.get(&trojan.id).unwrap().has_warm_resources(),
+            registry.get(&trojan.id).unwrap().is_warm_or_stateless(),
             "session-less protocols have nothing to retain either way"
         );
 
@@ -875,6 +1082,7 @@ mod tests {
                 self
             }
             async fn force_close(&self) {}
+            async fn release_warm(&self) {}
         }
         let ProtocolRuntime::Quic(quic) = &tuic_runtime.runtime else {
             panic!("tuic runtime expected");
@@ -882,7 +1090,7 @@ mod tests {
         quic.client(|| async { Ok(Arc::new(FakeClient)) })
             .await
             .unwrap();
-        assert!(tuic_runtime.has_warm_resources());
+        assert!(tuic_runtime.is_warm_or_stateless());
     }
 
     #[tokio::test]
@@ -895,8 +1103,7 @@ mod tests {
         assert_eq!(registry.len(), 2);
         let rt = registry.get(&nodes[0].id).unwrap();
         assert_eq!(rt.node.name, "a");
-        assert!(rt.capabilities.multiplexed);
-        assert!(rt.capabilities.udp);
+        assert!(rt.udp_capable);
         registry.shutdown().await; // terminal cleanup is idempotent
     }
 
@@ -952,15 +1159,15 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_matrix() {
+    fn udp_capability_matrix() {
         let anytls = node("x", NodeProtocol::AnyTLS);
-        assert!(OutboundCapabilities::for_node(&anytls).multiplexed);
+        assert!((crate::descriptor::descriptor(anytls.protocol).supports_udp)(&anytls));
         let vmess = node("x", NodeProtocol::VMess);
-        let caps = OutboundCapabilities::for_node(&vmess);
-        assert!(!caps.multiplexed && !caps.udp);
+        assert!(!(crate::descriptor::descriptor(vmess.protocol).supports_udp)(&vmess));
         let hy2 = node("x", NodeProtocol::Hysteria2);
-        let caps = OutboundCapabilities::for_node(&hy2);
-        assert!(!caps.multiplexed && caps.udp);
+        assert!((crate::descriptor::descriptor(hy2.protocol).supports_udp)(
+            &hy2
+        ));
     }
 
     #[test]
@@ -1058,29 +1265,106 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quic_runtime_close_covers_clients_and_rejects_new_builds() {
-        struct FakeClient(AtomicBool);
-        #[async_trait::async_trait]
-        impl QuicRuntimeClient for FakeClient {
-            fn into_erased(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
-                self
-            }
-            async fn force_close(&self) {
-                self.0.store(true, Ordering::Release);
-            }
-        }
-
+    async fn speculative_quic_publish_keeps_a_concurrent_incumbent() {
         let runtime = QuicRuntime::new();
-        let client: Arc<FakeClient> = runtime
-            .client(|| async { Ok(Arc::new(FakeClient(AtomicBool::new(false)))) })
+        let incumbent: Arc<FakeQuicClient> = runtime
+            .client(|| async { Ok(Arc::new(FakeQuicClient::default())) })
             .await
             .unwrap();
-        runtime.force_close_all().await;
-        assert!(client.0.load(Ordering::Acquire));
+        let detached = Arc::new(FakeQuicClient::default());
+        let detached_weak = Arc::downgrade(&detached);
+
+        runtime.publish_client(detached).await.unwrap();
+
+        assert!(detached_weak.upgrade().is_none());
+        let selected: Arc<FakeQuicClient> = runtime
+            .client(|| async { panic!("occupied slot must not rebuild") })
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&selected, &incumbent));
+        assert!(!incumbent.warm_released.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn cancelled_quic_publish_before_slot_lock_changes_nothing() {
+        let runtime = Arc::new(QuicRuntime::new());
+        let state_guard = runtime.state.lock().await;
+        let detached = Arc::new(FakeQuicClient::default());
+        let detached_weak = Arc::downgrade(&detached);
+        let publish = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            async move { runtime.publish_client(detached).await }
+        });
+        tokio::task::yield_now().await;
+
+        publish.abort();
+        let _ = publish.await;
+        drop(state_guard);
+
+        assert_eq!(runtime.client_count(), Some(0));
+        assert!(detached_weak.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_last_quic_release_still_clears_the_client_slot() {
+        let node = node("tuic-release", NodeProtocol::Tuic);
+        let registry = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
+        let runtime = registry.get(&node.id).unwrap();
+        let client: Arc<FakeQuicClient> = runtime
+            .quic_client(|| async { Ok(Arc::new(FakeQuicClient::default())) })
+            .await
+            .unwrap();
+        runtime.retain_warm(WarmRetention::Selector).await.commit();
+        let quic = match &runtime.runtime {
+            ProtocolRuntime::Quic(quic) => quic,
+            _ => panic!("TUIC node must own a QUIC runtime"),
+        };
+        let state_guard = quic.state.lock().await;
+        let release = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            async move { runtime.release_warm(WarmRetention::Selector).await }
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if runtime.warm_retention.try_lock().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached cleanup must hold the retention lock while blocked");
+        release.abort();
+        let _ = release.await;
+        drop(state_guard);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if quic.client_count() == Some(0) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached cleanup must clear the QUIC client slot");
+        assert!(client.warm_released.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn quic_runtime_close_covers_client_and_rejects_new_builds() {
+        let runtime = QuicRuntime::new();
+        let client: Arc<FakeQuicClient> = runtime
+            .client(|| async { Ok(Arc::new(FakeQuicClient::default())) })
+            .await
+            .unwrap();
+        runtime.force_close().await;
+        assert!(client.force_closed.load(Ordering::Acquire));
         assert!(
             runtime
-                .client::<FakeClient, _, _>(|| async {
-                    Ok(Arc::new(FakeClient(AtomicBool::new(false))))
+                .client::<FakeQuicClient, _, _>(|| async {
+                    Ok(Arc::new(FakeQuicClient::default()))
                 })
                 .await
                 .is_err(),

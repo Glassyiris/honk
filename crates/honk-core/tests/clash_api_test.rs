@@ -1489,6 +1489,7 @@ async fn stats_exposes_udp_metrics() {
     assert_eq!(warm["nodes"]["preconnect"], 0);
     assert_eq!(warm["nodes"]["health"], 0);
     assert_eq!(warm["nodes"]["udp"], 0);
+    assert_eq!(warm["nodes"]["selector"], 0);
     assert_eq!(warm["nodes"]["traffic"], 0);
     assert_eq!(warm["sessions"]["anytls"], 0);
     assert_eq!(warm["sessions"]["tuic"], 0);

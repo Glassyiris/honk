@@ -9,7 +9,7 @@
 honk 使用原始的 **dae 配置语法**（`{ section { ... } }`）作为配置格式，配置文件通常以 `.dae` 结尾。语法要点：
 
 - 顶层由若干 `section { ... }` 组成（包括 `include { ... }`）；`#` 为行注释。
-- 除 `include` 外，键值对写作 `key: value`；含特殊字符的值用引号包裹（单双引号均可，如 `tcp_check_url: 'http://cp.cloudflare.com,1.1.1.1'`）。
+- 除 `include` 外，键值对写作 `key: value`；含特殊字符的值用引号包裹（单双引号均可，如 `tcp_check_url: 'https://www.gstatic.com/generate_204'`）。
 - 列表值用逗号分隔写在同一行（如 `lan_interface: eth0, eth1`）。
 
 仓库内示例：
@@ -60,7 +60,7 @@ global {
     log_level: info
     dial_mode: domain
     auto_config_kernel_parameter: true
-    tcp_check_url: 'http://cp.cloudflare.com,1.1.1.1'
+    tcp_check_url: 'https://www.gstatic.com/generate_204'
     check_interval: 30s
     check_tolerance: 50ms
     bootstrap_resolver: '223.5.5.5:53'
@@ -93,7 +93,7 @@ global {
     lan_interface: eth0
     wan_interface: auto
     auto_config_kernel_parameter: true
-    tcp_check_url: 'http://cp.cloudflare.com'
+    tcp_check_url: 'https://www.gstatic.com/generate_204'
     check_interval: 30s
     check_tolerance: 50ms
     dial_mode: domain
@@ -181,19 +181,19 @@ global {
 
 ### 预热与拨号预算
 
-honk 有三套互相独立的预热机制，全部有预算约束——都不随节点数量膨胀，
-大订阅可放心使用：
+honk 有三套互相独立的预热机制。其上限由已配置的组或显式预算决定，
+不会按订阅原始节点数无限膨胀：
 
 | 机制 | 配置项 | 默认 | 说明 |
 | ------ | -------- | ------ | ------ |
-| 启动裸 TCP 预连接 | `preconnect_node_count` | `'auto'` | `'auto'` = 最多 8 个节点（各组当前选中优先，其次配置顺序）;`0` 关闭；`N` 指定数量。仅可裸 TCP 池化的协议参与——AnyTLS/QUIC 与内置 `direct`/`block` 一律跳过。 |
-| TCP/TLS 保活集合 | `tcp_warm_node_count` | `1` | 每组每 IP 族保活最快的 K 个 AnyTLS/TCP 叶子。节点少（<50）时设 `3`-`5` 可明显降低非 winner 链路的首连延迟；大订阅保持 `1`-`2`。 |
-| UDP 预热集合 | `udp_warm_node_count` | `0` | 每组每 IP 族 top-N 个 UDP 叶子；进程级总量自动封顶为 `4×N`，组再多也不会失控。 |
-| 并发拨号上限 | `max_concurrent_dials` | `64` | 按 generation 限制并发代理拨号（connect + 协议握手）；内置 `direct`/`block` 本地拨号不占额度。reload 会更新 replacement 的局部上限，但新旧 generation 始终共享启动时确定的同一个描述符 gate。 |
+| 启动裸 TCP 预连接 | `preconnect_node_count` | `'auto'` | 只在启动时执行一轮。`'auto'` 最多尝试 8 个节点（各组当前选中优先，其次配置顺序）；`0` 关闭；显式 `N` 可覆盖全部合格节点，但最多 8 个并发尝试。仅可裸 TCP 池化的协议参与——AnyTLS/QUIC 与内置 `direct`/`block` 一律跳过。 |
+| Selector 常驻 | — | 始终启用 | 每个 `selector` 组按配置选中的叶节点都会保持热态；即使显式选中的节点暂时不健康，也不会改暖其他节点。AnyTLS 与 QUIC 协议保留可复用 session/client，其他代理协议保留一条到服务端的裸 TCP。Clash API 切换选择会立即唤醒协调器：不打断活动流，释放旧节点的 warm 所有权并预热新节点。reload 时未变的已选节点延续原资源。 |
+| UDP 预热集合 | `udp_warm_node_count` | `0` | 每组每 IP 族取 top `min(N,3)` 个 UDP 叶子，最多并发 4 个尝试，进程级驻留总量封顶为 `4×N`。UDP 与 Selector 是独立所有者；只有两种原因都消失时才释放共享资源。 |
+| 并发拨号上限 | `max_concurrent_dials` | `64` | 按 generation 限制物理代理连接和协议握手；Ready 池命中、已热 AnyTLS/QUIC transport 的逻辑流及内置 `direct`/`block` 均不占额度。reload 会更新 replacement 的局部上限，但新旧 generation 始终共享启动时确定的同一个描述符 gate。 |
 
-健康探测只测不暖：冷节点被探测后不会留下任何常驻会话，400 节点的
-订阅也不会因健康检查常驻 400 条隧道。`/stats` 的 `warm` 字段可观测
-当前预热清单（来源 × 热节点数、每协议驻留会话数）。
+健康探测不会把冷节点变热，因此 400 节点订阅不会因 `check_interval`
+常驻 400 条隧道。Selector 常驻另以 10 秒周期作丢失资源的兜底修复。
+`/stats` 的 `warm` 字段可观测当前预热清单（来源 × 热节点数、每协议驻留会话数）。
 
 ## 6. 节点与分享链接
 

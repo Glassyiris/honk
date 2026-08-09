@@ -21,6 +21,7 @@ pub mod util;
 
 pub use proxy::{
     AsyncReadWrite, PacketOutbound, PacketTransport, PreparedUdpTransport, ProbeableOutbound,
-    ProtocolEntry, ProxyRegistry, ProxyStream, TcpOutbound, UdpWarmStatus, WarmableOutbound,
+    ProtocolEntry, ProxyRegistry, ProxyStream, TcpOutbound, WarmOutcome, WarmRequirement,
+    WarmableOutbound,
 };
 pub use util::{connect_marked, connect_marked_addr, connect_outbound, udp_marked_bind};

@@ -267,6 +267,8 @@ pub enum WarmReason {
     Health,
     /// The UDP warm coordinator established the session/client.
     Udp,
+    /// The node is the configured leaf of at least one Selector group.
+    Selector,
 }
 
 impl WarmReason {
@@ -275,6 +277,7 @@ impl WarmReason {
             WarmReason::Preconnect => 1,
             WarmReason::Health => 1 << 1,
             WarmReason::Udp => 1 << 2,
+            WarmReason::Selector => 1 << 3,
         }
     }
 }
@@ -286,6 +289,7 @@ pub struct WarmSnapshot {
     pub preconnect_nodes: u64,
     pub health_nodes: u64,
     pub udp_nodes: u64,
+    pub selector_nodes: u64,
     pub traffic_nodes: u64,
     pub anytls_sessions: u64,
     pub tuic_clients: u64,
@@ -308,6 +312,14 @@ impl StatsManager {
             .entry(node)
             .or_default()
             .fetch_or(reason.bit(), Ordering::Relaxed);
+    }
+
+    /// Remove one attribution without disturbing other owners of the same
+    /// live resource. Zero-valued entries are pruned by the next snapshot.
+    pub fn clear_warm(&self, node: uuid::Uuid, reason: WarmReason) {
+        if let Some(mark) = self.warm_marks.get(&node) {
+            mark.fetch_and(!reason.bit(), Ordering::Relaxed);
+        }
     }
 
     /// Current warm-resource gauges: warm nodes counted per reason (an
@@ -360,6 +372,9 @@ impl StatsManager {
             }
             if marks & WarmReason::Udp.bit() != 0 {
                 snap.udp_nodes += 1;
+            }
+            if marks & WarmReason::Selector.bit() != 0 {
+                snap.selector_nodes += 1;
             }
         }
         self.warm_marks.retain(|id, _| warm_ids.contains(id));
@@ -710,6 +725,7 @@ mod tests {
                 self
             }
             async fn force_close(&self) {}
+            async fn release_warm(&self) {}
         }
 
         let stats = StatsManager::new();

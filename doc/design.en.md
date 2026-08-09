@@ -180,6 +180,17 @@ Plain-TCP splice requests at most 64 KiB for each direction's private
 nonblocking pipe (128 KiB and four pipe FDs per full-duplex relay). Unsupported
 splice paths fall back losslessly before moving bytes.
 
+Accepted TCP flows are adopted only while their canonical client-to-destination
+`CONN_STATE_MAP` entry exists. The control plane reference-counts that directional
+tuple for the accepted socket's lifetime, and the janitor skips both its conn-state
+and matching `REDIRECT_TRACK` metadata. The packet path expires only TCP
+`CLOSING` entries strictly older than 10 seconds; unowned `ACTIVE` entries retain
+the 120-second userspace pressure backstop. When the final relay owner finishes,
+it conditionally removes only the forward conn-state incarnation whose timestamp
+and TCP state are unchanged; redirect metadata keeps its normal janitor lifetime.
+This preserves one relay and Clash connection identity across long server-first or
+client-first idle periods without letting an old handler delete a reused tuple.
+
 
 ### Dial modes (`global.dial_mode`)
 
@@ -250,20 +261,37 @@ binding. Only an observed preparation error affects traffic health; cancelled or
 successfully drained speculative losers are health-neutral. AnyTLS uses a caller-owned,
 cap-counted provisional session slot on this path rather than its normal pool-owned
 dial task. A loser closes its detached session synchronously; only the finalized winner
-commits into the captured runtime-generation pool and starts that pool's janitor, before
-any endpoint publication or application send.
+commits into the captured runtime-generation pool and starts that pool's janitor. QUIC
+protocols likewise prepare detached clients and force-close losers. Winner commit
+publishes its client only when the generation slot is still empty; if ordinary traffic
+filled it meanwhile, the incumbent remains and the winning transport keeps its own
+connection/state clones. Slot mutation has no following await, so cancellation cannot
+publish an uncommitted winner. Both protocols finish promotion/arbitration before
+endpoint publication or application send.
 
-**UDP warm-up is opt-in and generation-owned.** `global.udp_warm_node_count`
-defaults to 0, which creates no coordinator work or warm metrics. With a positive
-budget, discovery peeks authoritative DataUdp group plans in V4 then V6 order,
-UUID-deduplicates eligible configured leaves, and applies the budget; direct,
-block, and cold URLTest plans are excluded. Dispatch has a maximum of four tasks.
-AnyTLS owns the reusable pool in its runtime generation. Reload makes the old
-generation terminal to new warm/speculative work, but existing TCP streams and Ready
-UDP endpoints keep their sessions; after the old DNS runtime's leases and transports
-retire, its pools reject new opens and close each session only when its last stream
-releases. Only `Ready` and `AlreadyReady` are warm successes. Direct, other non-AnyTLS, and
-currently deferred QUIC warm-up return `NotApplicable`, not a false success.
+**Warm ownership is generation-owned and retained independently by policy
+reason.** Every Selector contributes its configured leaf (runtime choice, then
+default, then first member); leaves shared by several Selectors are
+UUID-deduplicated. AnyTLS retains one pool session, TUIC/Juicity/Hysteria2
+retain their QUIC client and connection, and other proxy protocols retain one
+bare server TCP connection. An effective Selector change wakes reconciliation
+immediately; a 10-second pass repairs dead, consumed, or expired resources.
+Removing the final Selector owner drains only reusable state—active flows keep
+their own stream/connection—and unchanged runtimes carry ownership across
+reload. Startup preconnect is separate: it is a one-shot bare-TCP seed and owns
+no Selector/UDP retention bit.
+
+**UDP warm-up remains opt-in.** `global.udp_warm_node_count=0` creates no UDP
+coordinator or attempt metrics. A positive budget merges each group's top-N
+latency-ranked leaves that own reusable UDP-capable generation state
+(AnyTLS/TUIC/Juicity/Hysteria2), UUID-deduplicates them, and applies a
+process-wide `4×N` cap. At most four handshakes run concurrently; one pass runs
+at startup and each later pass waits for the previous batch plus the configured
+check interval. Selector and UDP bits are independent, so a shared AnyTLS/QUIC
+resource is released only after its final owner disappears. Reload makes the
+old generation terminal to new warm work while existing streams and Ready UDP
+endpoints drain normally. `Ready` counts as success; the generic
+`NotApplicable` result is neutral.
 
 ## 8. Outbound stack
 

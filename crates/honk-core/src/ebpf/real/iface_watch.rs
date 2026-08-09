@@ -394,14 +394,17 @@ mod tests {
     fn default_route_parser_waits_for_a_real_default_and_uses_lowest_metric() {
         let header = "Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n";
         let no_default = format!("{header}campus0 0000A8C0 00000000 0001 0 0 10 00FFFFFF 0 0 0\n");
-        assert_eq!(crate::detect_default_interface_from(&no_default), None);
+        assert_eq!(
+            honk_config::config::default_route_interface_from(&no_default),
+            None
+        );
 
         let routes = format!(
             "{header}ethernet0 00000000 00000000 0003 0 0 600 00000000 0 0 0\n\
              wifi0 00000000 00000000 0003 0 0 100 00000000 0 0 0\n"
         );
         assert_eq!(
-            crate::detect_default_interface_from(&routes).as_deref(),
+            honk_config::config::default_route_interface_from(&routes).as_deref(),
             Some("wifi0")
         );
     }
@@ -519,11 +522,10 @@ mod tests {
         .expect("network namespace thread");
     }
 
-    /// Reconcile attaches an interface's hooks exactly once and never
-    /// detaches: hook removal belongs to shutdown alone, a periodic
-    /// reconcile must not tear down the datapath.
+    /// An unchanged topology keeps the original hooks: the ticker must not
+    /// churn working TC links merely because it reconciles periodically.
     #[tokio::test]
-    async fn reconcile_attaches_once_and_never_detaches() {
+    async fn reconcile_reuses_unchanged_hooks() {
         let backend = crate::ebpf::mock::MockEbpfBackend::new();
         let attach = backend.dynamic_attach_calls.clone();
         let detach = backend.detach_calls.clone();
@@ -547,7 +549,7 @@ mod tests {
         assert_eq!(
             detach.load(Ordering::Relaxed),
             0,
-            "reconcile must never detach"
+            "unchanged reconcile must not detach"
         );
     }
 }

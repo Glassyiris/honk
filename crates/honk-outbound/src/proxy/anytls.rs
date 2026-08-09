@@ -23,6 +23,7 @@
 use crate::tls::TlsConnector;
 use async_trait::async_trait;
 use honk_config::node::Node;
+#[cfg(test)]
 use honk_config::types::NodeProtocol;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -39,7 +40,7 @@ use tracing::{debug, warn};
 use super::addr;
 use super::{
     PacketOutbound, PacketTransport, PreparedUdpTransport, ProbeableOutbound, ProxyStream,
-    TcpOutbound, UdpWarmStatus, WarmableOutbound,
+    TcpOutbound, WarmRequirement, WarmableOutbound,
 };
 use crate::session::{ManagedSession as _, SpeculativeCheckout};
 
@@ -121,13 +122,9 @@ type BoxedWriter = Box<dyn AsyncWrite + Send + Unpin>;
 #[derive(Debug, Default, Clone)]
 pub struct AnyTlsHandler;
 
-/// Key inside a node's own session pool: pools are per-node (runtime
-/// registry), so the key is a constant.
-pub(crate) const POOL_KEY: &str = "self";
-
-/// Pool configuration for one AnyTLS node (least-loaded scheduling
-/// without a stream cap (sing-anytls parity); the hard session cap still
-/// applies). Shared by the generation-owned pools and throwaway pools.
+/// Pool configuration for one AnyTLS node. The session's 128-permit
+/// semaphore is the capacity truth; the pool adds a two-session hard cap and
+/// least-loaded scheduling. Shared by generation-owned and ephemeral pools.
 pub(crate) fn session_pool_config() -> crate::session::SessionPoolConfig {
     crate::session::SessionPoolConfig {
         // v3.1 sizing: two sessions per node, 128 streams each (initial
@@ -143,7 +140,7 @@ pub(crate) fn session_pool_config() -> crate::session::SessionPoolConfig {
     }
 }
 
-/// Monotonic session id for pool bookkeeping (sing `sessionCounter`).
+/// Monotonic diagnostic session id (sing `sessionCounter`).
 static SESSION_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// Inbound events delivered from the session demux to a stream task.
@@ -760,7 +757,7 @@ async fn session_writer(
     }
 }
 
-/// Session pool type for one AnyTLS node (runtime-registry owned).
+/// Session pool type for one AnyTLS node, either generation-owned or ephemeral.
 pub(crate) type AnyTlsPool = crate::session::SessionPool<AnyTlsSession>;
 
 /// Per-session stream capacity (v3.1): the semaphore is the single
@@ -771,7 +768,7 @@ pub(crate) const MAX_STREAMS_PER_SESSION: usize = 128;
 /// A multiplexed AnyTLS session: one TLS connection carrying any number of
 /// concurrent streams (sing-anytls `Session`).
 pub(crate) struct AnyTlsSession {
-    /// Unique id within the pool (used for removal on close).
+    /// Process-unique diagnostic id.
     seq: u64,
     /// AnyTLS server address retained for diagnostics.
     addr: String,
@@ -1617,7 +1614,7 @@ async fn connect_transport(
 
     let connector = match tls_connector {
         Some(connector) => connector,
-        None => Arc::new(AnyTlsHandler::build_tls_connector(node)?),
+        None => Arc::new(crate::tls::build_connector(node)?),
     };
     let server_name = node.sni.clone().unwrap_or_else(|| node.host().to_string());
     let tls = connector.connect(&server_name, tcp).await?;
@@ -1647,11 +1644,6 @@ impl AnyTlsHandler {
             .unwrap_or("")
     }
 
-    /// Build the TLS connector for the node.
-    fn build_tls_connector(node: &Node) -> anyhow::Result<TlsConnector> {
-        crate::tls::build_connector(node)
-    }
-
     /// Build the client settings frame payload.
     fn settings_payload() -> Vec<u8> {
         let scheme = b"stop=0\n";
@@ -1671,22 +1663,19 @@ impl AnyTlsHandler {
         pool: &Arc<AnyTlsPool>,
         runtime: Option<Arc<crate::runtime::NodeRuntime>>,
     ) {
-        // Always run the janitor: it pre-establishes min_idle sessions
-        // (default 1) and, just as importantly, reaps idle-expired ones —
-        // skipping it entirely leaks idle sessions into the pool forever.
-        // An explicit `min_idle_session=0` disables standby sessions only,
-        // never pruning.
-        // Default 1 (not sing-box's 0): a single standby session per node
-        // keeps every dial warm after the first — cold dials otherwise pay
-        // TCP connect + TLS handshake (2 RTT) per burst.
-        let min_idle = node.anytls_min_idle_session.unwrap_or(1);
+        // Always run the janitor: warm retention and explicit min_idle
+        // establish standby sessions, while an unpinned default-zero node
+        // reaps idle sessions instead of retaining every node ever touched.
+        // Selector/UDP ownership pins the effective floor to one without
+        // overriding an explicit larger min_idle_session value.
+        let min_idle = node.anytls_min_idle_session.unwrap_or(0);
         let idle_timeout = Duration::from_secs(
             node.anytls_idle_session_timeout
                 .unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS),
         );
         let prewarm_node = node.clone();
         let label = format!("{}:{}", node.host(), node.port);
-        pool.ensure_janitor(POOL_KEY, min_idle, idle_timeout, move || {
+        pool.ensure_janitor(min_idle, idle_timeout, move || {
             let node = prewarm_node.clone();
             let label = label.clone();
             let runtime = runtime.clone();
@@ -1705,33 +1694,19 @@ impl AnyTlsHandler {
     /// in-memory AnyTLS session fixture instead of a network connection.
     async fn warm_pool_with<F, Fut>(
         runtime: Arc<crate::runtime::NodeRuntime>,
-        _connect_timeout: Duration,
         dial: F,
-    ) -> anyhow::Result<UdpWarmStatus>
+    ) -> anyhow::Result<()>
     where
         F: FnOnce() -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = anyhow::Result<Arc<AnyTlsSession>>> + Send + 'static,
+        Fut: Future<Output = anyhow::Result<Arc<AnyTlsSession>>> + Send + 'static,
     {
-        if runtime.node.protocol != NodeProtocol::AnyTLS {
-            return Ok(UdpWarmStatus::NotApplicable);
-        }
-        let pool = match &runtime.runtime {
-            crate::runtime::ProtocolRuntime::AnyTls(runtime) => Arc::clone(&runtime.pool),
-            crate::runtime::ProtocolRuntime::None | crate::runtime::ProtocolRuntime::Quic(_) => {
-                return Ok(UdpWarmStatus::NotApplicable);
-            }
-        };
-        let already_ready = pool.has_usable_session(POOL_KEY);
+        let pool = runtime.anytls_pool()?;
         Self::ensure_janitor(&runtime.node, &pool, Some(Arc::clone(&runtime)));
-        let _session = pool.offer(POOL_KEY, dial).await?;
-        if !pool.has_usable_session(POOL_KEY) {
+        let _session = pool.offer(dial).await?;
+        if !pool.has_usable_session() {
             anyhow::bail!("AnyTLS warm dial completed without a usable session");
         }
-        Ok(if already_ready {
-            UdpWarmStatus::AlreadyReady
-        } else {
-            UdpWarmStatus::Ready
-        })
+        Ok(())
     }
 
     /// Open a stream on an explicitly captured generation-owned pool. One
@@ -1758,7 +1733,6 @@ impl AnyTlsHandler {
         let dial_addr = addr.to_string();
         let target = target_addr.to_vec();
         pool.open_with(
-            POOL_KEY,
             move || {
                 let node = dial_node.clone();
                 let addr = dial_addr.clone();
@@ -1808,7 +1782,7 @@ impl AnyTlsHandler {
     ) -> anyhow::Result<PreparedUdpTransport>
     where
         F: FnOnce() -> Fut + Send,
-        Fut: std::future::Future<Output = anyhow::Result<Arc<AnyTlsSession>>> + Send,
+        Fut: Future<Output = anyhow::Result<Arc<AnyTlsSession>>> + Send,
     {
         Self::dial_udp_transport_speculative_for_pool_with(
             node,
@@ -1836,14 +1810,14 @@ impl AnyTlsHandler {
     ) -> anyhow::Result<PreparedUdpTransport>
     where
         F: FnOnce() -> Fut + Send,
-        Fut: std::future::Future<Output = anyhow::Result<Arc<AnyTlsSession>>> + Send,
+        Fut: Future<Output = anyhow::Result<Arc<AnyTlsSession>>> + Send,
     {
         if !crate::descriptor::network_allows_udp(node) {
             anyhow::bail!("node '{}' does not allow UDP", node.name);
         }
 
         let magic = addr::encode_address("0.0.0.0:0".parse().unwrap(), Some(UOT_MAGIC));
-        let (session, permit, detached) = match pool.checkout_speculative(POOL_KEY).await? {
+        let (session, permit, detached) = match pool.checkout_speculative().await? {
             SpeculativeCheckout::Shared { session, permit } => (session, permit, None),
             SpeculativeCheckout::Detached(mut reservation) => {
                 // This future is owned by the speculative caller, not by the
@@ -1893,7 +1867,7 @@ impl AnyTlsHandler {
             let commit_node = node.clone();
             let commit_pool = Arc::clone(&pool);
             let commit_runtime = runtime.clone();
-            return Ok(PreparedUdpTransport::new(transport, move || {
+            return Ok(PreparedUdpTransport::new(transport, move || async move {
                 reservation.commit()?;
                 if commit_runtime.is_some() {
                     Self::ensure_janitor(&commit_node, &commit_pool, commit_runtime);
@@ -1903,7 +1877,7 @@ impl AnyTlsHandler {
         }
 
         let commit_node = node.clone();
-        Ok(PreparedUdpTransport::new(transport, move || {
+        Ok(PreparedUdpTransport::new(transport, move || async move {
             if runtime.is_some() {
                 Self::ensure_janitor(&commit_node, &pool, runtime);
             }
@@ -1933,7 +1907,6 @@ impl AnyTlsHandler {
         let dial_addr = addr.clone();
         let (session, sid, rx, mut guard) = pool
             .open_with(
-                POOL_KEY,
                 move || {
                     let node = Arc::clone(&dial_node);
                     let addr = dial_addr.clone();
@@ -1990,10 +1963,8 @@ impl AnyTlsHandler {
     }
 }
 
-/// Direct-path AnyTLS stream: `AsyncRead`/`AsyncWrite` over a session
-/// stream without the stream task and duplex the old path had (those cost
-/// two task hops and two copies per byte — the SS codec review's
-/// measurement, applied here).
+/// Direct `AsyncRead`/`AsyncWrite` over a session stream. Avoiding an
+/// intermediate duplex bridge removes two task hops and two copies per byte.
 pub(crate) struct AnyTlsStream {
     session: Arc<AnyTlsSession>,
     sid: u32,
@@ -2018,10 +1989,7 @@ pub(crate) struct AnyTlsStream {
     /// Waiter for a writer-queue data permit while `out_slot` is occupied.
     permit_fut: Option<
         std::pin::Pin<
-            Box<
-                dyn std::future::Future<Output = std::io::Result<tokio::sync::OwnedSemaphorePermit>>
-                    + Send,
-            >,
+            Box<dyn Future<Output = std::io::Result<tokio::sync::OwnedSemaphorePermit>> + Send>,
         >,
     >,
     /// Stream-slot capacity, held until either endpoint closes the stream.
@@ -2303,15 +2271,16 @@ enum UotMode {
 
 #[async_trait]
 impl WarmableOutbound for AnyTlsHandler {
-    async fn warm_udp(
+    async fn warm(
         &self,
         runtime: Arc<crate::runtime::NodeRuntime>,
         connect_timeout: Duration,
-    ) -> anyhow::Result<UdpWarmStatus> {
+        _requirement: WarmRequirement,
+    ) -> anyhow::Result<()> {
         let node = Arc::clone(&runtime.node);
         let addr = format!("{}:{}", node.host(), node.port);
         let dial_runtime = Arc::clone(&runtime);
-        Self::warm_pool_with(runtime, connect_timeout, move || async move {
+        Self::warm_pool_with(runtime, move || async move {
             let tls_connector = dial_runtime.anytls_tls_connector()?;
             dial_session(&node, &addr, connect_timeout, Some(tls_connector)).await
         })
@@ -2328,28 +2297,11 @@ impl TcpOutbound for AnyTlsHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let addr = format!("{}:{}", node.host(), node.port);
-        let target_addr = addr::encode_address(target, target_domain);
-        debug!(
-            "AnyTLS: connecting to {} for target {} (tls={} sni={:?} skip={})",
-            addr, target, node.tls, node.sni, node.skip_cert_verify
-        );
+        let owner = crate::runtime::NodeRuntime::ephemeral_guarded(node);
         let stream = self
-            .open_pooled_stream_for_pool(
-                node,
-                Arc::new(crate::session::SessionPool::new(session_pool_config())),
-                &addr,
-                &target_addr,
-                connect_timeout,
-                None,
-            )
+            .dial_runtime(owner.runtime(), target, target_domain, connect_timeout)
             .await?;
-
-        Ok(ProxyStream {
-            stream: Box::new(stream),
-            target_addr: target,
-            target_domain: target_domain.map(|s| s.to_string()),
-        })
+        Ok(stream.with_owner(owner))
     }
 
     async fn dial_runtime(
@@ -2359,12 +2311,7 @@ impl TcpOutbound for AnyTlsHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let pool = match &runtime.runtime {
-            crate::runtime::ProtocolRuntime::AnyTls(runtime) => Arc::clone(&runtime.pool),
-            crate::runtime::ProtocolRuntime::None | crate::runtime::ProtocolRuntime::Quic(_) => {
-                anyhow::bail!("AnyTLS node runtime does not own an AnyTLS pool")
-            }
-        };
+        let pool = runtime.anytls_pool()?;
         let node = Arc::clone(&runtime.node);
         let addr = format!("{}:{}", node.host(), node.port);
         let target_addr = addr::encode_address(target, target_domain);
@@ -2395,15 +2342,11 @@ impl PacketOutbound for AnyTlsHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        self.dial_udp_transport_for_pool(
-            Arc::new(node.clone()),
-            Arc::new(crate::session::SessionPool::new(session_pool_config())),
-            target,
-            target_domain,
-            connect_timeout,
-            None,
-        )
-        .await
+        let owner = crate::runtime::NodeRuntime::ephemeral_guarded(node);
+        let transport = self
+            .dial_udp_transport_runtime(owner.runtime(), target, target_domain, connect_timeout)
+            .await?;
+        Ok(super::packet_transport_with_owner(transport, owner))
     }
 
     async fn dial_udp_transport_runtime(
@@ -2413,12 +2356,7 @@ impl PacketOutbound for AnyTlsHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        let pool = match &runtime.runtime {
-            crate::runtime::ProtocolRuntime::AnyTls(runtime) => Arc::clone(&runtime.pool),
-            crate::runtime::ProtocolRuntime::None | crate::runtime::ProtocolRuntime::Quic(_) => {
-                anyhow::bail!("AnyTLS node runtime does not own an AnyTLS pool")
-            }
-        };
+        let pool = runtime.anytls_pool()?;
         let node = Arc::clone(&runtime.node);
         self.dial_udp_transport_for_pool(
             node,
@@ -2431,29 +2369,6 @@ impl PacketOutbound for AnyTlsHandler {
         .await
     }
 
-    async fn dial_udp_transport_speculative(
-        &self,
-        node: &Node,
-        target: SocketAddr,
-        target_domain: Option<&str>,
-        connect_timeout: Duration,
-    ) -> anyhow::Result<PreparedUdpTransport> {
-        let dial_node = node.clone();
-        let dial_addr = format!("{}:{}", node.host(), node.port);
-        Self::dial_udp_transport_speculative_for_pool_with(
-            node,
-            Arc::new(crate::session::SessionPool::new(session_pool_config())),
-            target,
-            target_domain,
-            connect_timeout,
-            None,
-            move || async move {
-                dial_session(&dial_node, &dial_addr, connect_timeout, None).await
-            },
-        )
-        .await
-    }
-
     async fn dial_udp_transport_speculative_runtime(
         &self,
         runtime: Arc<crate::runtime::NodeRuntime>,
@@ -2461,12 +2376,7 @@ impl PacketOutbound for AnyTlsHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<PreparedUdpTransport> {
-        let pool = match &runtime.runtime {
-            crate::runtime::ProtocolRuntime::AnyTls(runtime) => Arc::clone(&runtime.pool),
-            crate::runtime::ProtocolRuntime::None | crate::runtime::ProtocolRuntime::Quic(_) => {
-                anyhow::bail!("AnyTLS node runtime does not own an AnyTLS pool")
-            }
-        };
+        let pool = runtime.anytls_pool()?;
         let node = Arc::clone(&runtime.node);
         let dial_node = Arc::clone(&node);
         let dial_runtime = Arc::clone(&runtime);
@@ -3161,7 +3071,7 @@ mod tests {
         };
         let (session, mut server) = establish_test_session("runtime-udp-hit").await;
         expect_handshake(&mut server).await;
-        pool.insert(POOL_KEY, &session);
+        pool.insert(&session);
         assert!(!runtime.tls_connector_loaded());
 
         let handler = AnyTlsHandler::new();
@@ -3205,7 +3115,7 @@ mod tests {
             let crate::runtime::ProtocolRuntime::AnyTls(anytls) = &runtime.runtime else {
                 panic!("expected AnyTLS runtime")
             };
-            anytls.pool.insert(POOL_KEY, &probe_session);
+            anytls.pool.insert(&probe_session);
             std::future::pending::<()>().await;
         });
         tokio::task::yield_now().await;
@@ -3242,7 +3152,7 @@ mod tests {
         };
         let (session, mut server) = establish_test_session("ephemeral-probe").await;
         expect_handshake(&mut server).await;
-        pool.insert(POOL_KEY, &session);
+        pool.insert(&session);
 
         // The probe dial reuses the pooled session and opens its stream.
         let handler = AnyTlsHandler::new();
@@ -3264,7 +3174,7 @@ mod tests {
 
         runtime.close().await;
         assert!(session.is_closed());
-        assert_eq!(pool.live_session_count(POOL_KEY), 0);
+        assert_eq!(pool.live_session_count(), 0);
         // The underlying transport is closed: the server reader hits EOF
         // once the remaining frames (e.g. the stream FIN) are consumed.
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -3286,20 +3196,20 @@ mod tests {
         let generation =
             crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
         let runtime = generation.get(&node.id).unwrap();
-        assert!(!runtime.has_warm_resources());
+        assert!(!runtime.is_warm_or_stateless());
 
         let crate::runtime::ProtocolRuntime::AnyTls(anytls) = &runtime.runtime else {
             panic!("expected AnyTLS runtime")
         };
         let (session, mut server) = establish_test_session("warm-resources").await;
         expect_handshake(&mut server).await;
-        anytls.pool.insert(POOL_KEY, &session);
-        assert!(runtime.has_warm_resources());
+        anytls.pool.insert(&session);
+        assert!(runtime.is_warm_or_stateless());
         assert_eq!(runtime.warm_counts().sessions, 1);
 
         session.close();
         assert!(
-            !runtime.has_warm_resources(),
+            !runtime.is_warm_or_stateless(),
             "a closed session no longer counts as warm"
         );
         assert_eq!(runtime.warm_counts().sessions, 0);
@@ -3328,7 +3238,7 @@ mod tests {
         let (session, mut server) = establish_test_session("captured-generation").await;
         expect_handshake(&mut server).await;
         let _addresses = spawn_echo_server(server);
-        old_pool.insert(POOL_KEY, &session);
+        old_pool.insert(&session);
 
         let mut replacement_node = old_node.clone();
         replacement_node.address = "127.0.0.1:10".into();
@@ -3356,8 +3266,8 @@ mod tests {
         let mut echoed = vec![0; b"old-generation".len()];
         stream.read_exact(&mut echoed).await.unwrap();
         assert_eq!(echoed, b"old-generation");
-        assert!(old_pool.has_usable_session(POOL_KEY));
-        assert!(!replacement_pool.has_usable_session(POOL_KEY));
+        assert!(old_pool.has_usable_session());
+        assert!(!replacement_pool.has_usable_session());
         session.close();
     }
 
@@ -3379,7 +3289,7 @@ mod tests {
         };
         let (session, mut server) = establish_test_session("retiring-anytls").await;
         expect_handshake(&mut server).await;
-        pool.insert(POOL_KEY, &session);
+        pool.insert(&session);
         let permit = session.try_reserve().expect("live stream permit");
 
         generation.begin_retirement();
@@ -3557,20 +3467,20 @@ mod tests {
         let addr = "127.0.0.1:1234";
         let (session, mut server) = establish_test_session(addr).await;
         expect_handshake(&mut server).await;
-        pool.insert(addr, &session);
+        pool.insert(&session);
 
         // A live pooled session is offered without dialing.
         let offered = pool
-            .offer(addr, || async { anyhow::bail!("must not dial") })
+            .offer(|| async { anyhow::bail!("must not dial") })
             .await
             .unwrap();
         assert!(Arc::ptr_eq(&session, &offered));
 
         // Invalidation closes it; the next offer dials (fails here).
-        pool.invalidate(addr, &session);
+        pool.invalidate(&session);
         assert!(session.is_closed());
         assert!(
-            pool.offer(addr, || async { anyhow::bail!("no server") })
+            pool.offer(|| async { anyhow::bail!("no server") })
                 .await
                 .is_err()
         );
@@ -4790,7 +4700,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn warm_udp_uses_only_its_generation_owned_runtime_pool() {
+    async fn warm_uses_only_its_generation_owned_runtime_pool() {
         let node = Node {
             id: uuid::Uuid::new_v4(),
             name: "warm-anytls".into(),
@@ -4811,29 +4721,25 @@ mod tests {
         let (session, mut server) = establish_test_session("warm-anytls").await;
         expect_handshake(&mut server).await;
 
-        let status = AnyTlsHandler::warm_pool_with(
-            Arc::clone(&runtime),
-            Duration::from_secs(1),
-            move || async move { Ok(session) },
-        )
-        .await
-        .unwrap();
-        assert_eq!(status, UdpWarmStatus::Ready);
-        assert!(pool.has_usable_session(POOL_KEY));
+        AnyTlsHandler::warm_pool_with(Arc::clone(&runtime), move || async move { Ok(session) })
+            .await
+            .unwrap();
+        assert!(pool.has_usable_session());
 
         let handler = AnyTlsHandler::new();
-        assert_eq!(
-            handler
-                .warm_udp(Arc::clone(&runtime), Duration::from_secs(1))
-                .await
-                .unwrap(),
-            UdpWarmStatus::AlreadyReady
-        );
+        handler
+            .warm(
+                Arc::clone(&runtime),
+                Duration::from_secs(1),
+                WarmRequirement::Session,
+            )
+            .await
+            .unwrap();
         drop(server);
     }
 
     #[tokio::test]
-    async fn warm_udp_shutdown_cancels_a_notify_blocked_dial_and_keeps_pool_terminal() {
+    async fn warm_shutdown_cancels_a_notify_blocked_dial_and_keeps_pool_terminal() {
         let node = Node {
             id: uuid::Uuid::new_v4(),
             name: "shutdown-warm-anytls".into(),
@@ -4858,7 +4764,7 @@ mod tests {
             let dial_started = Arc::clone(&dial_started);
             let dial_blocked = Arc::clone(&dial_blocked);
             async move {
-                AnyTlsHandler::warm_pool_with(runtime, Duration::from_secs(1), move || {
+                AnyTlsHandler::warm_pool_with(runtime, move || {
                     let dial_started = Arc::clone(&dial_started);
                     let dial_blocked = Arc::clone(&dial_blocked);
                     async move {
@@ -4881,11 +4787,11 @@ mod tests {
             .expect("warm task must not panic");
         assert!(result.is_err(), "terminal pool shutdown rejects the warm");
         assert!(
-            !pool.has_usable_session(POOL_KEY),
+            !pool.has_usable_session(),
             "a cancelled dial must not leave a usable session in the pool"
         );
         assert!(
-            AnyTlsHandler::warm_pool_with(Arc::clone(&runtime), Duration::from_secs(1), || async {
+            AnyTlsHandler::warm_pool_with(Arc::clone(&runtime), || async {
                 unreachable!("a terminal pool must reject before invoking a new dial")
             })
             .await
@@ -4907,7 +4813,7 @@ mod tests {
         let pool: Arc<AnyTlsPool> =
             Arc::new(crate::session::SessionPool::new(session_pool_config()));
         let (session, _server) = establish_test_session("speculative-shared").await;
-        pool.insert(POOL_KEY, &session);
+        pool.insert(&session);
         let prepared = handler
             .dial_udp_transport_speculative_with(
                 &node,
@@ -4963,9 +4869,9 @@ mod tests {
         assert_eq!(pool.metrics().sessions, 0);
         assert_eq!(session.streams.lock().unwrap().len(), 1);
 
-        let transport = prepared.commit().unwrap();
+        let transport = prepared.commit().await.unwrap();
         assert_eq!(pool.metrics().sessions, 1);
-        assert!(pool.has_usable_session(POOL_KEY));
+        assert!(pool.has_usable_session());
         drop(transport);
         assert!(session.streams.lock().unwrap().is_empty());
         pool.shutdown();
@@ -5000,7 +4906,7 @@ mod tests {
             .unwrap();
 
         pool.shutdown();
-        assert!(prepared.commit().is_err());
+        assert!(prepared.commit().await.is_err());
         assert!(session.is_closed());
         assert!(session.streams.lock().unwrap().is_empty());
         assert_eq!(pool.metrics().sessions, 0);
@@ -5063,14 +4969,11 @@ mod tests {
             "aborting the speculative caller must drop the physical dial future"
         );
         assert_eq!(pool.metrics().sessions, 0);
-        let first = pool.checkout_speculative(POOL_KEY).await.unwrap();
-        let second = tokio::time::timeout(
-            Duration::from_millis(100),
-            pool.checkout_speculative(POOL_KEY),
-        )
-        .await
-        .expect("cancelled speculative work must not leave a provisional slot")
-        .unwrap();
+        let first = pool.checkout_speculative().await.unwrap();
+        let second = tokio::time::timeout(Duration::from_millis(100), pool.checkout_speculative())
+            .await
+            .expect("cancelled speculative work must not leave a provisional slot")
+            .unwrap();
         assert!(matches!(
             first,
             crate::session::SpeculativeCheckout::Detached(_)

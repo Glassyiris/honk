@@ -7,17 +7,16 @@
 use crate::log_shim::*;
 use crate::{
     event::send_dae_event,
-    maps::{BPF_STATS_MAP, CONNTRACK_ARGS_MAP, CONN_STATE_MAP, CONN_STATE_OCCUPANCY},
+    maps::{BPF_STATS_MAP, CONN_STATE_MAP, CONN_STATE_OCCUPANCY, CONNTRACK_ARGS_MAP},
 };
 use aya_ebpf_bindings::helpers::bpf_ktime_get_ns;
 use honk_ebpf_common::{
+    RoutingMeta,
     conn::{
-        BpfStatsKey, ConnState, ConntrackArgs, TcpState, OCCUPANCY_EBPF_DELETES, OCCUPANCY_INSERTS,
-        TCP_CONN_STATE_CLOSING_TIMEOUT_NS, TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS,
-        UDP_CONN_STATE_TIMEOUT_NS,
+        BpfStatsKey, ConnState, ConntrackArgs, OCCUPANCY_EBPF_DELETES, OCCUPANCY_INSERTS, TcpState,
+        UDP_CONN_STATE_TIMEOUT_NS, tcp_conn_state_expired,
     },
     redirect_need::TuplesKey,
-    RoutingMeta,
 };
 use network_types::tcp::TcpHdr;
 
@@ -141,17 +140,6 @@ pub fn is_new_tcp_connection(tcph: &TcpHdr) -> bool {
     tcph.syn() != 0 && tcph.ack() == 0
 }
 
-/// TCP connection state expiry: 120 s for ACTIVE, 10 s for CLOSING.
-#[inline(always)]
-fn tcp_conn_state_expired(state: &ConnState, now: u64) -> bool {
-    let timeout = if state.state == TcpState::TcpStateClosing as u8 {
-        TCP_CONN_STATE_CLOSING_TIMEOUT_NS
-    } else {
-        TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS
-    };
-    now.wrapping_sub(state.last_seen_ns) > timeout
-}
-
 /// UDP connection state expiry: 120 s backstop.
 #[inline(always)]
 fn udp_conn_state_expired(state: &ConnState, now: u64) -> bool {
@@ -201,7 +189,7 @@ fn __mark_tcp_seen(
         // Non-SYN fast path: hold the pointer from a single lookup, check
         // expiry, and mutate in place.  Only re-look up after a remove.
         let state = unsafe { &mut *ptr };
-        if tcp_conn_state_expired(state, now) {
+        if tcp_conn_state_expired(state, now.wrapping_sub(state.last_seen_ns)) {
             let _ = CONN_STATE_MAP.remove(key);
             occupancy_add(OCCUPANCY_EBPF_DELETES);
             // Non-SYN packets without valid state must never allocate.

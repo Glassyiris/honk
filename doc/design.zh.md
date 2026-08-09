@@ -178,6 +178,15 @@ SockMap 即使只发布了一部分，也不会把流量 redirect 到缺失的 l
 裸 TCP 的 splice 每个方向最多申请 64 KiB 私有非阻塞 pipe（全双工每条 relay
 共 128 KiB 与四个 pipe FD）。不支持 splice 的路径会在移动任何字节前无损回退。
 
+已接受的 TCP 流仅在其规范化的「客户端→原始目的地址」`CONN_STATE_MAP`
+条目仍存在时才会被接管。控制面对该有向五元组按 accepted socket 生命周期做
+引用计数，janitor 会跳过对应的 conn-state 与 `REDIRECT_TRACK` 元数据。packet
+path 只回收严格空闲超过 10 秒的 TCP `CLOSING` 条目；无人持有的 `ACTIVE`
+条目仍保留 120 秒的用户态压力兜底。最后一个 relay owner 结束时，只在时间戳和
+TCP state 都未变化的前提下条件删除 forward conn-state incarnation；redirect
+元数据继续走原有 janitor 生命周期。这样，长时间空闲后的服务端先发或客户端先发
+仍沿用同一 relay 与 Clash connection id，同时旧 handler 不会误删复用五元组的新流。
+
 
 ### 拨号模式（`global.dial_mode`）
 
@@ -237,19 +246,31 @@ LoadBalance 游标与 Fallback pin 均按 TCP/UDP 独立维护，一个网络的
 只有观察到的 preparation error 会影响 traffic health；取消或成功 drain 的推测性
 loser 对 health 保持中性。AnyTLS 在该路径使用 caller-owned、计入 session cap 的
 provisional slot，而不是普通 pool-owned dial task。loser 会同步关闭 detached
-session；只有最终 winner 才会在 endpoint publication 与 application send 之前
-提交到捕获的 runtime-generation pool，并启动该 pool 的 janitor。
+session，只有最终 winner 才会提交到捕获的 runtime-generation pool 并启动 janitor。
+QUIC 协议同样先建立 detached client 并强制关闭 loser。winner commit 仅在
+generation client slot 仍为空时发布；若普通流量已先填充，保留 incumbent，winner
+transport 自己持有本流的 connection/state clone。slot mutation 后不再 await，因此
+取消不可能留下未完成 commit 的 winner。两类协议都在 endpoint publication 与
+application send 之前完成 promotion/arbitration。
 
-**UDP warm-up 是 opt-in 且 generation-owned。** `global.udp_warm_node_count`
-默认值为 0，不创建 coordinator work 或 warm metrics。预算为正时，discovery 按
-V4 后 V6 顺序 peek 权威 DataUdp group plan，对 eligible 的已配置 leaf 按 UUID
-去重并应用预算；direct、block 与 cold URLTest plan 被排除。dispatch 最多四个 task。
-AnyTLS 在自己的 runtime generation 中拥有可复用 pool。reload 会让旧 generation
-对新的 warm/speculative work 进入 terminal，但已有 TCP stream 与 Ready UDP endpoint
-继续使用原 session；旧 DNS runtime 的 lease 与 transport 退役后，旧 pool 才拒绝新
-open，并在每个 session 的最后一个 stream 释放后关闭它。仅 `Ready` 与
-`AlreadyReady` 记为 warm success。direct、其他非 AnyTLS 以及当前延后的 QUIC
-warm-up 返回 `NotApplicable`，不会伪造成功。
+**Warm 所有权按 generation 管理，并按策略原因独立保留。** 每个 Selector
+提供其配置叶节点（运行时选择优先，其次 default，再其次首个成员）；多个
+Selector 共享的叶节点按 UUID 去重。AnyTLS 保留一条池 session，
+TUIC/Juicity/Hysteria2 保留 QUIC client 与 connection，其他代理协议保留一条
+到服务端的裸 TCP。Selector 的有效选择变化会立即唤醒 reconciliation，另有
+10 秒周期修复死亡、被消费或已过期的资源。最后一个 Selector 所有者消失时
+只排干可复用状态；活动 flow 继续持有自己的 stream/connection，reload 时未变
+runtime 延续所有权。启动 preconnect 与此分离：它只做一次裸 TCP 预置，不持有
+Selector/UDP retention bit。
+
+**UDP warm-up 仍为 opt-in。** `global.udp_warm_node_count=0` 不创建 UDP
+coordinator，也不产生 attempt metrics。预算为正时，只合并每组拥有可复用 UDP
+generation 状态的延迟 top-N 叶节点（AnyTLS/TUIC/Juicity/Hysteria2），按 UUID
+去重后再受进程级 `4×N` 上限约束。每次最多并发四个握手；启动时立即执行一次，
+之后每次都在上一批完成并经过配置的检查间隔后执行。Selector 与 UDP 使用独立
+bit，因此共享的 AnyTLS/QUIC 资源只在最后一种所有权消失后释放。reload 会让旧
+generation 拒绝新的 warm 工作，但已有 stream 与 Ready UDP endpoint 正常排干。
+`Ready` 记为 success；通用的 `NotApplicable` 结果保持中性。
 
 ## 8. 出站栈
 

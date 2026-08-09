@@ -34,7 +34,7 @@ use crate::alive::{AliveDialerSet, IpVersion, ProbeDomain};
 
 use state::UrlTestSelections;
 
-pub use state::{InterruptCallback, PersistCallback};
+pub use state::{InterruptCallback, PersistCallback, SelectorChangeCallback};
 
 /// Maximum nesting depth for group → sub-group resolution. Construction-
 /// time cycle breaking keeps the group graph acyclic; this bound (plus the
@@ -147,6 +147,8 @@ pub struct GroupManager {
     selector_choice: RwLock<HashMap<String, String>>,
     /// Invoked on selector choice changes (cache.db persistence hook).
     persist_callback: RwLock<Option<PersistCallback>>,
+    /// Wakes the generation-owned selector warm coordinator.
+    selector_change_callback: RwLock<Option<SelectorChangeCallback>>,
     /// Invoked on selection changes for groups with interrupt_connections.
     interrupt_callback: RwLock<Option<InterruptCallback>>,
 }
@@ -190,6 +192,7 @@ impl GroupManager {
             last_used: RwLock::new(HashMap::new()),
             selector_choice: RwLock::new(HashMap::new()),
             persist_callback: RwLock::new(None),
+            selector_change_callback: RwLock::new(None),
             interrupt_callback: RwLock::new(None),
         }
     }

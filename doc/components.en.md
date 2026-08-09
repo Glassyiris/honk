@@ -23,7 +23,7 @@ Source of truth: `crates/honk-config/src/*`, the dae parser in `crates/honk-conf
 | `wan_interface` | `wan_interface` | `[]` | WAN ifaces that intercept host-originated TCP/UDP. `auto` follows the IPv4 default route; while none exists it stays pending (never falls back to `lo`) and attaches on link/address/route events. The same event republishes generated gateway-address `direct(must)` rules and immediately re-probes health-backed outbounds. |
 | `auto_config_kernel_parameter` | `auto_config_kernel_parameter` | `false` | Auto sysctl (root) |
 | `store_subscribe` | `store_subscribe` | `true` | Persist each last valid subscription body under `<working-directory>/.sub` for network-independent startup/reload recovery. Changing it requires a process restart. |
-| `tcp_check_url` | `tcp_check_url` | Cloudflare HTTP + 1.1.1.1 + IPv6 | TCP health targets (comma-separated) |
+| `tcp_check_url` | `tcp_check_url` | gstatic HTTPS | TCP health target. HTTPS performs verified target TLS before the configured HTTP method. |
 | `tcp_check_http_method` | `tcp_check_http_method` | `"HEAD"` | HTTP method for URL checks |
 | `udp_check_dns` | `udp_check_dns` | dns.google / 8.8.8.8 / IPv6 | UDP health DNS targets (comma-separated) |
 | `check_interval` | `check_interval_secs` | `30` | Health interval, duration form (e.g. `30s`) |
@@ -44,9 +44,9 @@ Source of truth: `crates/honk-config/src/*`, the dae parser in `crates/honk-conf
 | — | `connect_timeout_ms` | `3000` | TCP connect timeout; not settable in dae syntax |
 | — | `dns_resolve_timeout_ms` | `2000` | Control-plane resolve timeout; not settable in dae syntax |
 | — | `relay_idle_timeout_secs` | `300` | Idle relay kill; `0` = off; not settable in dae syntax |
-| `preconnect_node_count` | `preconnect_node_count` | `'auto'` | Startup bare-TCP preconnect count. `'auto'` = `min(nodes,8)`; `0` strictly disables the warm-up. Candidates are each group's current pick first, then config order; only bare-TCP-poolable protocols qualify (AnyTLS/QUIC never consume a pooled bare TCP) and the built-in `direct`/`block` are excluded. |
-| `udp_warm_node_count` | `udp_warm_node_count` | `0` | Per-group UDP warm-up cap. `0` is strictly disabled: no coordinator task and no warm metrics. A positive value N (capped at 3) warms each group's top-N latency-ranked, UDP-capable leaves after startup and after every probe cycle (`check_interval`), so newly fast nodes are pre-dialed before they win a selection. Dispatch stays capped at four concurrent tasks. A process-wide cap of `4 × N` bounds the total: the merged candidate set is re-ranked by global UDP latency and truncated, so many groups cannot inflate retained transports. |
-| `max_concurrent_dials` | `max_concurrent_dials` | `64` | Generation-local cap on concurrent proxied dials (connect + protocol handshake), clamped to an immutable process-wide startup descriptor gate shared by overlapping reload generations. Built-in `direct`/`block` dials are exempt — they are local connects already bounded by TCP admission. A changed limit applies to the replacement generation immediately; old-generation in-flight permits continue consuming the same process gate until they finish. |
+| `preconnect_node_count` | `preconnect_node_count` | `'auto'` | One startup bare-TCP preconnect pass. `'auto'` tries up to 8 nodes; `0` disables; explicit `N` can cover every eligible node with at most 8 concurrent attempts. Candidates are each group's current pick first, then config order; only bare-TCP-poolable protocols qualify (AnyTLS/QUIC and built-in `direct`/`block` are skipped). |
+| `udp_warm_node_count` | `udp_warm_node_count` | `0` | Per-group UDP warm-up cap. `0` is strictly disabled. A positive N takes each group's top `min(N,3)` latency-ranked UDP leaves; its independent coordinator runs immediately, then one `check_interval` after each completed batch, with at most four concurrent attempts. The process-wide retained set is re-ranked and capped at `4×N`. |
+| `max_concurrent_dials` | `max_concurrent_dials` | `64` | Generation-local cap on physical proxied connects and protocol handshakes, clamped to an immutable process-wide startup descriptor gate shared by overlapping reload generations. Ready-pool hits and logical streams on already-warm AnyTLS/QUIC transports bypass it; built-in `direct`/`block` dials are also exempt. A changed limit applies to the replacement generation immediately; old-generation in-flight permits continue consuming the same process gate until they finish. |
 
 ```dae
 global {
@@ -57,7 +57,7 @@ global {
     dial_mode: domain++
     allow_insecure: false
     auto_config_kernel_parameter: true
-    tcp_check_url: 'http://cp.cloudflare.com,1.1.1.1,2606:4700:4700::1111'
+    tcp_check_url: 'https://www.gstatic.com/generate_204'
     tcp_check_http_method: HEAD
     udp_check_dns: 'dns.google.com:53,8.8.8.8,2001:4860:4860::8888'
     check_interval: 30s
@@ -132,7 +132,7 @@ The fields below are what a parsed node carries. In dae syntax they are **derive
 | `tuic_init_stream_recv_window` / `tuic_init_conn_recv_window` | u64? | 8 MiB / quinn default | TUIC QUIC receive windows; the 8 MiB stream-window default lifts single-stream throughput on high-RTT links (quinn's 1.25 MiB caps ~12.5 MB/s per 100 ms RTT) |
 | `juicity_uuid` / `juicity_password` | string? | null | Juicity |
 | `anytls_password` | string? | null | AnyTLS secret |
-| `anytls_min_idle_session` | usize? | 1 | Pool min idle sessions (`min_idle_session=`); default 1 keeps dials warm (0 = reap all idle sessions) |
+| `anytls_min_idle_session` | usize? | null (effective 0) | Explicit pool standby floor (`min_idle_session=`). A selected Selector leaf independently raises its effective floor to at least one; `0` otherwise lets idle sessions drain. |
 | `anytls_idle_session_check_interval` | u64? | null | Idle check period, s (`idle_session_check_interval=`) |
 | `anytls_idle_session_timeout` | u64? | null | Idle eviction, s (`idle_session_timeout=`) |
 | `mark` | u32? | null | Outbound SO_MARK |
@@ -297,7 +297,7 @@ group {
 
 | Canonical | dae spellings | Behavior |
 | ----------- | ------------- | ---------- |
-| `selector` | `select`, `fixed`, `fixed(0)` | Manual pin; API + cache |
+| `selector` | `select`, `fixed`, `fixed(0)` | Manual pin; API + cache. Its configured leaf is always warm: reusable AnyTLS/QUIC state or one bare server TCP for other proxy protocols. |
 | `urltest` | `min_moving_avg`, `min_avg10`, `min_last_delay` | Lowest latency + tolerance; ranks by a halving moving average `(prev+sample)/2` (dae `min_moving_avg` semantics); **TCP/UDP separate** |
 | `loadbalance` | `roundrobin`, `round_robin`, `balance` | Per-group, per-network RR among alive members |
 | `fallback` | `fallback` | First alive sticky per TCP/UDP network; no instant failback |
@@ -615,24 +615,27 @@ H = { count, sumNanos, buckets }  // buckets has 64 fixed log2 slots
 `queue` is the endpoint-driver queue; it is distinct from `slowPermit`, which
 records slow-path admission. Stagger counters are used only for cold URLTest
 preparation. AnyTLS candidates use caller-owned provisional session slots counted
-against the pool cap; loser cancellation closes detached work, while the winner
-commits into the captured generation before endpoint publication. Warm `successes`
-count only `Ready` or `AlreadyReady`; a `NotApplicable` result is neutral.
+against the pool cap. QUIC candidates use detached clients. Loser cancellation closes
+either form of detached work; the winner finishes promotion/arbitration before endpoint
+publication. If ordinary traffic already filled a QUIC generation slot, that incumbent
+remains and the winning transport owns its connection only for the selected flow. Warm
+`successes` count `Ready`; a `NotApplicable` result is neutral.
 
 `/stats` also carries a top-level `warm` object of point-in-time gauges:
 
 ```text
 warm = {
-  nodes: { preconnect, health, udp, traffic },
+  nodes: { preconnect, health, udp, selector, traffic },
   sessions: { anytls, tuic, juicity, hysteria2 }
 }
 ```
 
-`nodes` counts currently warm nodes by the reason their resources were
-established (a node may count under several reasons; a warm node with no
-recorded reason counts as `traffic`). `sessions` counts retained AnyTLS pool
-sessions and occupied QUIC client slots per protocol. Gauges track the live
-generation: a node whose resources drain drops out of the next snapshot.
+`nodes` counts currently warm nodes by the reason retaining their resources
+(a node may count under several reasons; a warm node with no recorded reason
+counts as `traffic`). `selector` is the always-on pin for configured Selector
+leaves. `sessions` counts retained AnyTLS pool sessions and occupied QUIC
+client slots per protocol. Gauges track the live generation: a node whose
+resources drain drops out of the next snapshot.
 
 Env: `HONK_UI_DOWNLOAD_URL` for UI zip override.
 

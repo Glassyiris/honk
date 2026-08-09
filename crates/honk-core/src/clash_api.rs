@@ -31,7 +31,7 @@ use honk_config::node::{Group, Node};
 use honk_config::types::NodeProtocol;
 use honk_outbound::alive::{AliveDialerSet, IpVersion, ProbeDomain};
 use honk_outbound::group::{GroupManager, SharedGroupManager};
-use honk_outbound::urltest::{urltest_group, urltest_node};
+use honk_outbound::urltest::{urltest_group, urltest_node_in_generation};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -630,7 +630,7 @@ struct DelayQuery {
 
 impl DelayQuery {
     fn timeout(&self) -> Duration {
-        // Zero means "use the urltest default" (urltest_node normalizes).
+        // Zero means "use the urltest default" (the measurement normalizes it).
         self.timeout
             .map(Duration::from_millis)
             .unwrap_or(Duration::ZERO)
@@ -662,17 +662,14 @@ async fn get_proxy_delay(
         };
         let tcp = entry.tcp.clone();
         let generation = s.runtime_registry.read().clone();
-        let (runtime, guard) = match generation.get(&node.id) {
-            Some(runtime) => (runtime, None),
-            None => {
-                let guard = honk_outbound::runtime::NodeRuntime::ephemeral_guarded(&node);
-                (guard.runtime(), Some(guard))
-            }
-        };
-        let measured = urltest_node(&runtime, tcp.as_ref(), &query.url, query.timeout()).await;
-        if let Some(guard) = guard {
-            guard.close().await;
-        }
+        let measured = urltest_node_in_generation(
+            &generation,
+            &node,
+            tcp.as_ref(),
+            &query.url,
+            query.timeout(),
+        )
+        .await;
         return match measured {
             Ok(latency) => {
                 s.alive_set
@@ -859,6 +856,7 @@ async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json
                 "preconnect": warm.preconnect_nodes,
                 "health": warm.health_nodes,
                 "udp": warm.udp_nodes,
+                "selector": warm.selector_nodes,
                 "traffic": warm.traffic_nodes,
             },
             "sessions": {

@@ -1384,12 +1384,17 @@ impl Default for UdpEndpointPool {
     }
 }
 
+struct UdpDriverStart {
+    first: QueuedDatagram,
+    followers: Vec<QueuedDatagram>,
+}
+
 /// Channels that establish the driver barrier. The initializer creates the
 /// anyfrom socket, spawns this driver, awaits `ready`, commits the map entry,
-/// then transfers the first packet through `start` and waits for `first_ack`.
+/// then transfers the retained initial flight and waits for `first_ack`.
 pub(super) struct UdpDriverHandle {
     ready: Option<oneshot::Receiver<()>>,
-    start: Option<oneshot::Sender<QueuedDatagram>>,
+    start: Option<oneshot::Sender<UdpDriverStart>>,
     first_ack: Option<oneshot::Receiver<io::Result<()>>>,
     /// Test-only cancellation handle; production ownership remains in the
     /// pool's driver registry until terminal shutdown joins every task.
@@ -1450,11 +1455,20 @@ impl UdpDriverHandle {
             .map_err(|_| io::Error::other("UDP endpoint driver exited before ready"))
     }
 
+    #[cfg(test)]
     pub(super) fn start(&mut self, first: QueuedDatagram) -> io::Result<()> {
+        self.start_with_followers(first, Vec::new())
+    }
+
+    pub(super) fn start_with_followers(
+        &mut self,
+        first: QueuedDatagram,
+        followers: Vec<QueuedDatagram>,
+    ) -> io::Result<()> {
         self.start
             .take()
             .ok_or_else(|| io::Error::other("UDP endpoint driver start already consumed"))?
-            .send(first)
+            .send(UdpDriverStart { first, followers })
             .map_err(|_| io::Error::other("UDP endpoint driver exited before first send"))
     }
 
@@ -1522,8 +1536,8 @@ impl UdpEndpointPool {
                 Arc::clone(&endpoint),
             );
             let _ = ready_tx.send(());
-            let first = match start_rx.await {
-                Ok(first) => first,
+            let initial = match start_rx.await {
+                Ok(initial) => initial,
                 Err(_) => return,
             };
             let result = run_endpoint_driver(
@@ -1537,7 +1551,7 @@ impl UdpEndpointPool {
                     stats,
                     outbound_tracker,
                 },
-                first,
+                initial,
                 first_ack_tx,
             )
             .await;
@@ -1563,7 +1577,7 @@ impl UdpEndpointPool {
 
 async fn run_endpoint_driver(
     context: UdpDriverContext,
-    first: QueuedDatagram,
+    initial: UdpDriverStart,
     first_ack: oneshot::Sender<io::Result<()>>,
 ) -> io::Result<()> {
     let UdpDriverContext {
@@ -1576,9 +1590,22 @@ async fn run_endpoint_driver(
         stats,
         outbound_tracker,
     } = context;
-    // Establish send ordering before supervising the steady send/receive
-    // futures. A recv EOF must not race ahead and cancel the first packet.
-    match send_one(&endpoint, &stats, &outbound_tracker, first, true).await {
+    // Sniffing may have consumed later QUIC Initial fragments from the queue.
+    // Send that retained prefix before the untouched receiver queue so the
+    // server sees the original flight in order without waiting for a PTO.
+    let UdpDriverStart { first, followers } = initial;
+    let mut initial_result = send_one(&endpoint, &stats, &outbound_tracker, first, true).await;
+    if initial_result.is_ok() {
+        for follower in followers {
+            if let Err(error) =
+                send_one(&endpoint, &stats, &outbound_tracker, follower, false).await
+            {
+                initial_result = Err(error);
+                break;
+            }
+        }
+    }
+    match initial_result {
         Ok(()) => {
             let _ = first_ack.send(Ok(()));
         }
@@ -1814,7 +1841,10 @@ mod tests {
                 stats,
                 outbound_tracker,
             },
-            first,
+            UdpDriverStart {
+                first,
+                followers: Vec::new(),
+            },
             first_ack,
         )
         .await

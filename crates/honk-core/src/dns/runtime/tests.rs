@@ -353,15 +353,30 @@ async fn explicit_shutdown_awaits_each_generation_transport_once() {
 async fn completed_retirement_supervisors_are_reaped_during_publication() {
     let (initial, _) = runtime(0, 0);
     let provider = DnsServiceProvider::new(initial);
+    let mut transports = Vec::new();
 
     for generation in 1..=64 {
-        provider.publish(runtime(generation, generation as usize).0);
-        tokio::task::yield_now().await;
+        let (replacement, transport) = runtime(generation, generation as usize);
+        provider.publish(replacement);
+        transports.push(transport);
     }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while transports[..63]
+            .iter()
+            .any(|transport| transport.closes.load(Ordering::SeqCst) == 0)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("retirement supervisors complete");
 
+    // The next publication synchronously reaps completed JoinSet records,
+    // then installs at most the new retirement plus cap-eviction supervisor.
+    provider.publish(runtime(65, 65).0);
     assert!(provider.retired_count() <= MAX_RETIRED_RUNTIMES);
     assert!(
-        provider.supervisor_count() <= 1,
-        "completed supervisor records must not accumulate"
+        provider.supervisor_count() <= 2,
+        "only supervisors from the latest publication may remain"
     );
 }

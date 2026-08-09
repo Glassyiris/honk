@@ -125,6 +125,7 @@ pub struct ControlPlane {
     alive_set: Arc<crate::outbound::AliveDialerSet>,
     connection_pool: Arc<ConnectionPool>,
     connection_tracker: Arc<ConnectionTracker>,
+    tcp_flow_pins: Arc<TcpFlowPins>,
     /// Persistent cache (selector choices, clash mode); opened by `run()`
     /// via `init_cache_db` when `experimental.cache_file` is enabled.
     cache_db: Option<Arc<crate::cachedb::CacheDb>>,
@@ -145,6 +146,20 @@ pub struct ControlPlane {
     /// separate from generic background tasks so reload/shutdown can abort
     /// and drain it in the required ownership order.
     udp_warm_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// UDP warm NodeIds survive task replacement so a reload can release
+    /// retention that disappeared from the replacement plan.
+    udp_warm_ids: Arc<parking_lot::Mutex<std::collections::HashSet<uuid::Uuid>>>,
+    /// Generation-owned task that pins every Selector's configured leaf.
+    selector_warm_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Choice changes wake reconciliation immediately; a short periodic pass
+    /// repairs sessions lost independently of group changes.
+    selector_warm_notify: Arc<tokio::sync::Notify>,
+    /// Desired selector NodeIds survive task replacement across reloads so
+    /// reused runtimes can release choices that disappeared.
+    selector_warm_ids: Arc<parking_lot::Mutex<std::collections::HashSet<uuid::Uuid>>>,
+    /// Bare-TCP pins are userspace-pool resources rather than NodeRuntime
+    /// state, so their addresses are tracked separately for exact cleanup.
+    selector_bare_warm: Arc<parking_lot::Mutex<std::collections::HashMap<uuid::Uuid, String>>>,
     /// Shared clash mode state (Rule/Global/Direct + GLOBAL selection),
     /// installed by `set_mode_state` when the clash API is enabled.
     mode_state: Option<crate::mode::SharedModeState>,
@@ -486,6 +501,7 @@ impl ControlPlane {
                 resource_budget.tcp_pool_entries,
             )),
             connection_tracker: Arc::new(ConnectionTracker::new()),
+            tcp_flow_pins: Arc::new(TcpFlowPins::default()),
             cache_db: None,
             outbound_id_map,
             resource_budget,
@@ -500,6 +516,11 @@ impl ControlPlane {
             )),
             background_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             udp_warm_task: tokio::sync::Mutex::new(None),
+            udp_warm_ids: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+            selector_warm_task: tokio::sync::Mutex::new(None),
+            selector_warm_notify: Arc::new(tokio::sync::Notify::new()),
+            selector_warm_ids: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+            selector_bare_warm: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             mode_state: None,
             udp_post_decision_offload: std::env::var("HONK_UDP_POST_DECISION_OFFLOAD").as_deref()
                 == Ok("1"),
@@ -516,6 +537,10 @@ impl ControlPlane {
             &control_plane.group_manager.read(),
             &control_plane.group_manager,
             &control_plane.connection_tracker,
+        );
+        install_selector_warm_callback(
+            &control_plane.group_manager.read(),
+            &control_plane.selector_warm_notify,
         );
         // Node death may race an initializer before the listener/background
         // loops start, so this production lifecycle callback belongs to
@@ -910,7 +935,7 @@ impl ControlPlane {
         let mut udp_removal_task = {
             let mut tasks = self.background_tasks.lock().await;
 
-            let janitor = BpfJanitor::new(self.ebpf.clone());
+            let janitor = BpfJanitor::new(self.ebpf.clone(), self.tcp_flow_pins.clone());
             tasks.push(janitor.spawn());
             info!("BPF map janitor started");
 
@@ -1147,10 +1172,12 @@ impl ControlPlane {
             }
         }
 
-        // The warm coordinator starts only after group/runtime setup and
-        // retains this exact registry Arc for its complete lifetime.
+        // Warm coordinators start only after group/runtime setup and retain
+        // this exact registry Arc for their complete lifetime.
         let warm_generation = self.runtime_registry.read().clone();
-        self.start_udp_warm_coordinator(warm_generation).await;
+        self.start_udp_warm_coordinator(Arc::clone(&warm_generation))
+            .await;
+        self.start_selector_warm_coordinator(warm_generation).await;
 
         {
             let runtime_registry = self.runtime_registry.clone();
@@ -1357,6 +1384,7 @@ impl ControlPlane {
         }
         drain.start_rejecting();
         self.stop_udp_warm_coordinator().await;
+        self.stop_selector_warm_coordinator().await;
         if !self.udp_pool.shutdown().await {
             error!("UDP endpoint shutdown required forced cleanup");
         }
@@ -1456,6 +1484,7 @@ impl ControlPlane {
             alive_set: self.alive_set.clone(),
             connection_pool: self.connection_pool.clone(),
             connection_tracker: self.connection_tracker.clone(),
+            tcp_flow_pins: self.tcp_flow_pins.clone(),
             mode_state: self.mode_state.clone(),
             udp_post_decision_offload: self.udp_post_decision_offload,
         }

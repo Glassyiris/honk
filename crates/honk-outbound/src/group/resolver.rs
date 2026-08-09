@@ -238,6 +238,29 @@ impl GroupManager {
         chain
     }
 
+    /// Resolve a Selector's configured choice to the leaf that must remain
+    /// warm. Unlike traffic selection, an explicitly chosen direct node is
+    /// retained even while unhealthy so recovery can make it hot again.
+    /// Nested policies use their stable current selection; a cold/invalid
+    /// chain falls back to the next production TCP leaf without mutating it.
+    pub fn selector_warm_node(&self, group_name: &str) -> Option<&Node> {
+        let group = self.groups.get(group_name)?;
+        if group.policy != GroupPolicy::Selector {
+            return None;
+        }
+        if let Some(node) = self
+            .selection_chain(group_name)
+            .last()
+            .and_then(|name| self.node_by_name(name))
+        {
+            return Some(node);
+        }
+        self.peek_selection_plan_for_domain(group_name, ProbeDomain::Tcp, IpVersion::V4)
+            .nodes
+            .first()
+            .copied()
+    }
+
     /// Flattened members for an explicit delay test: one `(tag, leaf)`
     /// pair per member — direct members under their node name, sub-groups
     /// under their tag with the leaf their policy currently selects (or,

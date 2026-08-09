@@ -470,6 +470,10 @@ impl crate::runtime::QuicRuntimeClient for Hy2Client {
     async fn force_close(&self) {
         self.quic.force_close().await;
     }
+
+    async fn release_warm(&self) {
+        self.quic.release_cached().await;
+    }
 }
 
 impl Hy2Client {
@@ -655,33 +659,26 @@ impl Hysteria2Handler {
         &self,
         runtime: &crate::runtime::NodeRuntime,
     ) -> anyhow::Result<Arc<Hy2Client>> {
-        let crate::runtime::ProtocolRuntime::Quic(quic_runtime) = &runtime.runtime else {
-            anyhow::bail!("Hysteria2 runtime is not QUIC-owned");
-        };
-        quic_runtime
-            .client(|| self.build_client(runtime.node.as_ref()))
+        runtime
+            .quic_client(|| self.build_client(runtime.node.as_ref()))
             .await
     }
 }
 
 #[async_trait]
 impl WarmableOutbound for Hysteria2Handler {
-    async fn warm_udp(
+    async fn warm(
         &self,
         runtime: Arc<crate::runtime::NodeRuntime>,
         connect_timeout: Duration,
-    ) -> anyhow::Result<super::UdpWarmStatus> {
+        requirement: super::WarmRequirement,
+    ) -> anyhow::Result<()> {
         let client = self.client_for_runtime(&runtime).await?;
-        let already_ready = client.quic.has_live_connection().await;
         let (_, state) = client.connection(connect_timeout).await?;
-        if state.udp_disabled {
+        if requirement == super::WarmRequirement::Udp && state.udp_disabled {
             anyhow::bail!("Hysteria2: UDP disabled by server");
         }
-        Ok(if already_ready {
-            super::UdpWarmStatus::AlreadyReady
-        } else {
-            super::UdpWarmStatus::Ready
-        })
+        Ok(())
     }
 }
 
@@ -849,9 +846,12 @@ impl PacketOutbound for Hysteria2Handler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<super::PreparedUdpTransport> {
-        self.dial_udp_transport_runtime(runtime, target, target_domain, connect_timeout)
-            .await
-            .map(super::PreparedUdpTransport::ready)
+        let client = self.build_client(runtime.node.as_ref()).await?;
+        super::prepare_detached_quic_transport(runtime, client, |client| async move {
+            self.udp_transport_via_client(client, target, target_domain, connect_timeout)
+                .await
+        })
+        .await
     }
 }
 

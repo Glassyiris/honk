@@ -3,6 +3,7 @@ use super::*;
 use crate::control::udp_endpoint::{UdpEndpoint, UdpInitLease};
 use crate::group::SelectionPlanMode;
 use honk_config::types::NodeProtocol;
+use std::collections::{HashMap, HashSet};
 
 /// Result from the eBPF routing handoff map lookup.
 #[derive(Debug, Clone)]
@@ -14,6 +15,20 @@ struct HandoffResult {
     mac: [u8; 6],
     pname: [u8; 16],
     pid: u32,
+}
+
+impl From<RoutingHandoffEntry> for HandoffResult {
+    fn from(entry: RoutingHandoffEntry) -> Self {
+        Self {
+            outbound: entry.result.outbound,
+            mark: entry.result.mark,
+            must: entry.result.must,
+            dscp: entry.result.dscp,
+            mac: entry.result.mac,
+            pname: entry.result.pname,
+            pid: entry.result.pid,
+        }
+    }
 }
 
 impl HandoffResult {
@@ -61,6 +76,180 @@ impl HandoffResult {
                 .collect::<Vec<_>>()
                 .join(":"),
         )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) struct TcpFlowKey {
+    src_ip: [u8; 16],
+    dst_ip: [u8; 16],
+    src_port: u16,
+    dst_port: u16,
+    l4proto: u8,
+}
+
+impl TcpFlowKey {
+    pub(super) fn from_tuples(tuples: &TuplesKey) -> Self {
+        Self {
+            src_ip: *tuples.src_ip.as_bytes(),
+            dst_ip: *tuples.dst_ip.as_bytes(),
+            src_port: tuples.src_port,
+            dst_port: tuples.dst_port,
+            l4proto: tuples.l4proto,
+        }
+    }
+
+    pub(super) fn from_redirect(tuple: &RedirectTuple) -> Self {
+        Self {
+            src_ip: *tuple.src_ip.as_bytes(),
+            dst_ip: *tuple.dst_ip.as_bytes(),
+            src_port: tuple.src_port,
+            dst_port: tuple.dst_port,
+            l4proto: tuple.l4proto,
+        }
+    }
+}
+
+#[derive(Default)]
+pub(super) struct TcpFlowPins {
+    inner: parking_lot::Mutex<HashMap<TcpFlowKey, usize>>,
+}
+
+impl TcpFlowPins {
+    fn retain(&self, key: TcpFlowKey) {
+        *self.inner.lock().entry(key).or_default() += 1;
+    }
+
+    fn release(&self, key: TcpFlowKey) -> Option<bool> {
+        let mut pins = self.inner.lock();
+        let owners = pins.get_mut(&key)?;
+        if *owners > 1 {
+            *owners -= 1;
+            Some(false)
+        } else {
+            pins.remove(&key);
+            Some(true)
+        }
+    }
+
+    pub(super) fn snapshot(&self) -> HashSet<TcpFlowKey> {
+        self.inner.lock().keys().copied().collect()
+    }
+
+    #[cfg(test)]
+    pub(super) fn retain_for_test(&self, key: TcpFlowKey) {
+        self.retain(key);
+    }
+
+    #[cfg(test)]
+    pub(super) fn release_for_test(&self, key: TcpFlowKey) -> Option<bool> {
+        self.release(key)
+    }
+}
+
+struct TcpFlowGuard {
+    stream: TcpStream,
+    tuples: TuplesKey,
+    pin_key: Option<TcpFlowKey>,
+    pins: Arc<TcpFlowPins>,
+    ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+    tracker: Arc<ConnectionTracker>,
+    tracker_id: Option<String>,
+}
+
+impl TcpFlowGuard {
+    fn new(
+        stream: TcpStream,
+        tuples: TuplesKey,
+        pins: Arc<TcpFlowPins>,
+        ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+        tracker: Arc<ConnectionTracker>,
+    ) -> Self {
+        let pin_key = TcpFlowKey::from_tuples(&tuples);
+        pins.retain(pin_key);
+        Self {
+            stream,
+            tuples,
+            pin_key: Some(pin_key),
+            pins,
+            ebpf,
+            tracker,
+            tracker_id: None,
+        }
+    }
+
+    fn stream_mut(&mut self) -> &mut TcpStream {
+        &mut self.stream
+    }
+
+    fn track(&mut self, entry: crate::connection_tracker::ConnectionEntry) {
+        assert!(
+            self.tracker_id.is_none(),
+            "TCP flow tracker attached more than once"
+        );
+        self.tracker_id = Some(self.tracker.register(entry));
+    }
+
+    fn untrack(&mut self) {
+        if let Some(id) = self.tracker_id.take() {
+            self.tracker.remove(&id);
+        }
+    }
+
+    fn release_pin(&mut self) -> Option<bool> {
+        let key = self.pin_key.take()?;
+        match self.pins.release(key) {
+            Some(last_owner) => Some(last_owner),
+            None => {
+                error!(?key, "TCP flow pin release found no owner");
+                None
+            }
+        }
+    }
+
+    async fn retire(mut self) {
+        self.untrack();
+        let now_ns = match super::janitor::monotonic_now_ns() {
+            Ok(now_ns) => now_ns,
+            Err(error) => {
+                error!(%error, "TCP flow retirement could not read monotonic clock");
+                return;
+            }
+        };
+        let retire_cutoff_ns = now_ns.saturating_sub(1);
+        let ebpf = Arc::clone(&self.ebpf);
+        let mut backend = ebpf.write().await;
+        if self.release_pin() != Some(true) {
+            return;
+        }
+
+        let current = match backend.tcp_conn_state_lookup(&self.tuples) {
+            Ok(Some(current)) => current,
+            Ok(None) => return,
+            Err(error) => {
+                error!(%error, ?self.tuples, "TCP flow retirement lookup failed");
+                return;
+            }
+        };
+        match backend.conn_state_remove_if_unchanged(&[(self.tuples, current)], retire_cutoff_ns) {
+            Ok(removed) => {
+                if removed != 0 {
+                    crate::ebpf::USERSPACE_CONN_STATE_DELETES
+                        .fetch_add(removed, std::sync::atomic::Ordering::Relaxed);
+                }
+                debug!(removed, ?self.tuples, "TCP flow conn-state retired");
+            }
+            Err(error) => {
+                error!(%error, ?self.tuples, "TCP flow conditional retirement failed");
+            }
+        }
+    }
+}
+
+impl Drop for TcpFlowGuard {
+    fn drop(&mut self) {
+        self.untrack();
+        self.release_pin();
     }
 }
 
@@ -112,6 +301,7 @@ pub(super) struct ControlPlaneHandle {
     pub(super) alive_set: Arc<AliveDialerSet>,
     pub(super) connection_pool: Arc<ConnectionPool>,
     pub(super) connection_tracker: Arc<ConnectionTracker>,
+    pub(super) tcp_flow_pins: Arc<TcpFlowPins>,
     /// Shared clash mode state (None when the clash API is disabled).
     pub(super) mode_state: Option<crate::mode::SharedModeState>,
     /// Drop-and-reinject UDP post-decision offload switch, resolved once at
@@ -193,19 +383,44 @@ impl ControlPlaneHandle {
     /// backend (and its map fds) alive against `cleanup()`, which takes the
     /// write lock.
     async fn lookup_handoff(&self, tuples: &TuplesKey) -> Option<HandoffResult> {
-        let ebpf = self.ebpf.read().await;
-        let entry = ebpf.routing_handoff_take(tuples).ok().flatten();
-        drop(ebpf);
+        self.ebpf
+            .read()
+            .await
+            .routing_handoff_take(tuples)
+            .ok()
+            .flatten()
+            .map(Into::into)
+    }
 
-        entry.map(|entry| HandoffResult {
-            outbound: entry.result.outbound,
-            mark: entry.result.mark,
-            must: entry.result.must,
-            dscp: entry.result.dscp,
-            mac: entry.result.mac,
-            pname: entry.result.pname,
-            pid: entry.result.pid,
-        })
+    async fn adopt_tcp_flow(
+        &self,
+        stream: TcpStream,
+        tuples: TuplesKey,
+    ) -> anyhow::Result<(TcpFlowGuard, Option<HandoffResult>)> {
+        let backend = self.ebpf.read().await;
+        match backend.tcp_conn_state_lookup(&tuples) {
+            Ok(Some(_)) => {}
+            Ok(None) => anyhow::bail!("accepted TCP flow has no conn-state: {tuples:?}"),
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "accepted TCP flow conn-state lookup failed for {tuples:?}: {error}"
+                ));
+            }
+        }
+
+        let flow = TcpFlowGuard::new(
+            stream,
+            tuples,
+            Arc::clone(&self.tcp_flow_pins),
+            Arc::clone(&self.ebpf),
+            Arc::clone(&self.connection_tracker),
+        );
+        let handoff = backend
+            .routing_handoff_take(&tuples)
+            .ok()
+            .flatten()
+            .map(Into::into);
+        Ok((flow, handoff))
     }
 
     async fn outbound_index_to_name(&self, index: u8) -> String {
@@ -269,7 +484,7 @@ impl ControlPlaneHandle {
 
     pub(super) async fn serve_connection(
         &self,
-        mut stream: TcpStream,
+        stream: TcpStream,
         client_addr: SocketAddr,
     ) -> anyhow::Result<()> {
         debug!("TPROXY TCP connection from {}", client_addr);
@@ -305,15 +520,6 @@ impl ControlPlaneHandle {
             }
         };
         debug!("Original destination: {}", original_dst);
-
-        if let Ok(true) = self
-            .dns_controller
-            .handle_tcp_dns(&mut stream, client_addr, original_dst)
-            .await
-        {
-            return Ok(());
-        }
-
         let tuples = build_tuples_key(
             original_dst.ip(),
             original_dst.port(),
@@ -321,8 +527,15 @@ impl ControlPlaneHandle {
             client_addr.port(),
             6, // TCP
         );
+        let (mut flow, handoff) = self.adopt_tcp_flow(stream, tuples).await?;
 
-        let handoff = self.lookup_handoff(&tuples).await;
+        if let Ok(true) = self
+            .dns_controller
+            .handle_tcp_dns(flow.stream_mut(), client_addr, original_dst)
+            .await
+        {
+            return Ok(());
+        }
 
         let dial_mode = {
             let config = self.config.read().await;
@@ -367,7 +580,7 @@ impl ControlPlaneHandle {
         let sniff_result = if skip_sniff {
             sniffing::SniffResult::unknown()
         } else {
-            sniffing::sniff_tcp(&mut stream).await
+            sniffing::sniff_tcp(flow.stream_mut()).await
         };
         let mut domain = sniff_result.domain.clone();
         if let Some(ref d) = domain {
@@ -661,15 +874,6 @@ impl ControlPlaneHandle {
                     }
                     let start = std::time::Instant::now();
                     let per_dial_timeout = connect_timeout * 3;
-                    // Built-in direct/block dials are local connects bounded
-                    // by the connection admission limit; dead direct peers
-                    // must not starve the proxied-dial budget.
-                    let _dial_permit =
-                        if matches!(node.protocol, NodeProtocol::Direct | NodeProtocol::Block) {
-                            None
-                        } else {
-                            Some(generation.acquire_dial_permit().await)
-                        };
                     let result = tokio::time::timeout(
                         per_dial_timeout,
                         Self::dial_pooled(
@@ -797,11 +1001,8 @@ impl ControlPlaneHandle {
                         let (ready_capable, bare_capable) = registry
                             .find(node.protocol)
                             .map(|entry| {
-                                let caps = (entry.descriptor.capabilities)(&node);
                                 (
-                                    (entry.descriptor.pool_ready_streams)(&node)
-                                        && caps.tcp
-                                        && !caps.multiplexed,
+                                    (entry.descriptor.pool_ready_streams)(&node),
                                     (entry.descriptor.pool_bare_tcp)(&node),
                                 )
                             })
@@ -933,23 +1134,22 @@ impl ControlPlaneHandle {
             Some(ho) => ho.process_path().await,
             None => None,
         };
-        self.connection_tracker
-            .register(crate::connection_tracker::ConnectionEntry {
-                id: conn_id.clone(),
-                source: client_addr.to_string(),
-                destination: resolved_target.to_string(),
-                proxy: node.name.clone(),
-                rule,
-                rule_payload,
-                chains,
-                upload: conn_upload.clone(),
-                download: conn_download.clone(),
-                start_time: std::time::Instant::now(),
-                domain: target_domain.clone(),
-                network: "tcp".to_string(),
-                process: handoff.as_ref().and_then(|ho| ho.process_name()),
-                process_path,
-            });
+        flow.track(crate::connection_tracker::ConnectionEntry {
+            id: conn_id,
+            source: client_addr.to_string(),
+            destination: resolved_target.to_string(),
+            proxy: node.name.clone(),
+            rule,
+            rule_payload,
+            chains,
+            upload: conn_upload.clone(),
+            download: conn_download.clone(),
+            start_time: std::time::Instant::now(),
+            domain: target_domain.clone(),
+            network: "tcp".to_string(),
+            process: handoff.as_ref().and_then(|ho| ho.process_name()),
+            process_path,
+        });
 
         debug!(
             network = "tcp",
@@ -968,7 +1168,6 @@ impl ControlPlaneHandle {
                 warn!("Failed to write sniffed bytes to proxy: {}", e);
                 self.stats.record_error(&outbound_name);
                 self.stats.record_close(&outbound_name);
-                self.connection_tracker.remove(&conn_id);
                 return Ok(());
             }
         }
@@ -982,7 +1181,7 @@ impl ControlPlaneHandle {
         let relay_result = match proxy_stream.into_tcp_stream() {
             Ok(upstream) => {
                 relay::splice::relay_splice(
-                    stream,
+                    flow.stream_mut(),
                     upstream,
                     client_addr,
                     resolved_target,
@@ -992,7 +1191,7 @@ impl ControlPlaneHandle {
             }
             Err(proxy_stream) => {
                 relay::splice::relay_auto(
-                    stream,
+                    flow.stream_mut(),
                     proxy_stream.stream,
                     client_addr,
                     resolved_target,
@@ -1001,10 +1200,10 @@ impl ControlPlaneHandle {
                 .await
             }
         };
+        flow.retire().await;
 
         match relay_result {
             Ok(relay_stats) => {
-                self.connection_tracker.remove(&conn_id);
                 self.stats.record_bytes(
                     &outbound_name,
                     relay_stats.client_to_proxy,
@@ -1027,11 +1226,8 @@ impl ControlPlaneHandle {
                         let (ready_capable, bare_capable) = registry
                             .find(node.protocol)
                             .map(|entry| {
-                                let caps = (entry.descriptor.capabilities)(&node);
                                 (
-                                    (entry.descriptor.pool_ready_streams)(&node)
-                                        && caps.tcp
-                                        && !caps.multiplexed,
+                                    (entry.descriptor.pool_ready_streams)(&node),
                                     (entry.descriptor.pool_bare_tcp)(&node),
                                 )
                             })
@@ -1092,7 +1288,6 @@ impl ControlPlaneHandle {
                 }
             }
             Err(e) => {
-                self.connection_tracker.remove(&conn_id);
                 // The relay updates these atomics as every read/splice completes.
                 // Preserve bytes moved before an I/O failure rather than turning
                 // the whole flow into a synthetic zero-byte success.
@@ -1123,31 +1318,6 @@ impl ControlPlaneHandle {
                 self.stats.record_error(&outbound_name);
                 self.stats.record_close(&outbound_name);
             }
-        }
-
-        // Event-driven lifecycle: the userspace relay has ended, so this
-        // flow's conntrack entries are dead state — retire both directions
-        // now instead of leaving them to the datapath/janitor timeouts
-        // (the model dae's SessionManager releaseFlow uses).  Late FIN/ACK
-        // stragglers hitting an empty entry simply pass through, which is
-        // harmless for a closed flow.
-        let mut reversed = tuples;
-        std::mem::swap(&mut reversed.src_ip, &mut reversed.dst_ip);
-        std::mem::swap(&mut reversed.src_port, &mut reversed.dst_port);
-        {
-            let mut ebpf = self.ebpf.write().await;
-            let mut removed = 0u32;
-            for key in [&tuples, &reversed] {
-                if ebpf.tcp_conn_state_remove(key).is_ok() {
-                    removed += 1;
-                    crate::ebpf::USERSPACE_CONN_STATE_DELETES
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
-            debug!(
-                "conn-state retire: {} -> {} removed {} entr(ies)",
-                client_addr, resolved_target, removed
-            );
         }
 
         if let (Some(ref ho), Some(ref domain)) = (handoff, sniff_result.domain)
@@ -1325,6 +1495,7 @@ impl ControlPlaneHandle {
         let mut quic_domain: Option<String>;
         let sniff_terminal: bool;
         let mut follower_rx = None;
+        let mut sniffed_followers = Vec::new();
         {
             use crate::control::packet_sniffer::QuicSniffOutcome;
             let sniffer_key =
@@ -1341,7 +1512,8 @@ impl ControlPlaneHandle {
             if matches!(outcome, QuicSniffOutcome::Incomplete) {
                 follower_rx = lease.take_queue_receiver();
                 if let Some(rx) = follower_rx.as_mut() {
-                    outcome = self.collect_initial_fragments(sniffer_key, rx).await;
+                    (outcome, sniffed_followers) =
+                        self.collect_initial_fragments(sniffer_key, rx).await;
                 }
             }
             if matches!(outcome, QuicSniffOutcome::Incomplete) {
@@ -1607,8 +1779,9 @@ impl ControlPlaneHandle {
             ));
         }
         // Promotion is explicit and still pre-publication: detached AnyTLS
-        // sessions become generation-owned only for the finalized winner.
-        let transport = prepared_transport.commit()?;
+        // sessions and QUIC clients become generation-owned only for the
+        // finalized winner.
+        let transport = prepared_transport.commit().await?;
 
         // Both capacity (at reservation time) and anyfrom creation happen
         // after the winner is finalized and before the only first send. Any
@@ -1708,10 +1881,10 @@ impl ControlPlaneHandle {
         let first = lease.take_first().ok_or_else(|| {
             anyhow::anyhow!("UDP initializer lost its first packet before driver start")
         })?;
-        driver.start(first)?;
+        driver.start_with_followers(first, sniffed_followers)?;
         if let Err(error) = driver.wait_first_ack().await {
-            // PacketTransport Err and timeout are both ambiguous: the winner
-            // may have received data, so never replay this packet elsewhere.
+            // PacketTransport Err and timeout are ambiguous: the winner may
+            // have received part of the initial flight, so never replay it.
             self.stats.record_error(&outbound_name);
             return Err(error.into());
         }
@@ -1780,26 +1953,31 @@ impl ControlPlaneHandle {
     /// A fragmented ClientHello: feed queued follower Initials to the
     /// sniffer until it resolves, or the packet/time budget runs out.
     /// Fragments of one flight arrive back-to-back, so the budget is small
-    /// and the common single-Initial path never enters this loop.  Followers
-    /// consumed here are gone from the driver queue; a flow that proceeds
-    /// to the userspace relay relies on the client's retransmission for
-    /// them (the flow is confirmed QUIC at this point, so that is safe).
+    /// and the common single-Initial path never enters this loop. Retained
+    /// followers are returned in receive order: userspace relay forwards
+    /// them immediately, while unresolved/offloaded flows drop the flight by
+    /// design and let QUIC retransmission drive the kernel handoff.
     async fn collect_initial_fragments(
         &self,
         sniffer_key: crate::control::packet_sniffer::PacketSnifferKey,
         rx: &mut tokio::sync::mpsc::Receiver<crate::control::udp_endpoint::QueuedDatagram>,
-    ) -> crate::control::packet_sniffer::QuicSniffOutcome {
+    ) -> (
+        crate::control::packet_sniffer::QuicSniffOutcome,
+        Vec<crate::control::udp_endpoint::QueuedDatagram>,
+    ) {
         use crate::control::packet_sniffer::QuicSniffOutcome;
         const MAX_FRAGMENTS: u32 = 8;
         const MAX_WAIT: Duration = Duration::from_millis(250);
         let deadline = tokio::time::Instant::now() + MAX_WAIT;
         let mut outcome = QuicSniffOutcome::Incomplete;
+        let mut collected = Vec::with_capacity(MAX_FRAGMENTS as usize);
         for _ in 0..MAX_FRAGMENTS {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
                 Ok(Some(datagram)) => {
                     outcome = self
                         .sniffer_pool
                         .feed_quic_initial(sniffer_key, datagram.payload());
+                    collected.push(datagram);
                     if !matches!(outcome, QuicSniffOutcome::Incomplete) {
                         break;
                     }
@@ -1807,7 +1985,7 @@ impl ControlPlaneHandle {
                 _ => break,
             }
         }
-        outcome
+        (outcome, collected)
     }
 
     /// UDP post-decision kernel offload via drop-and-reinject.  When the
@@ -1928,34 +2106,45 @@ impl ControlPlaneHandle {
             .find(node.protocol)
             .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", node.protocol))?;
 
-        if !pool_disabled {
-            // Ready pool: a fully-dialed stream bound to this exact
-            // node+target. Reused directly as the data channel.
-            if (entry.descriptor.pool_ready_streams)(node) {
-                let key = ConnectionPool::ready_key(&addr, target, target_domain);
-                if let Some(stream) = pool.acquire_ready(&key).await {
-                    tracing::debug!(
-                        "Pooled ready stream via {} acquired for {} (handshake skipped)",
-                        addr,
-                        target
-                    );
-                    return Ok(stream);
-                }
+        if !pool_disabled && (entry.descriptor.pool_ready_streams)(node) {
+            let key = ConnectionPool::ready_key(&addr, target, target_domain);
+            if let Some(stream) = pool.acquire_ready(&key).await {
+                tracing::debug!(
+                    "Pooled ready stream via {} acquired for {} (handshake skipped)",
+                    addr,
+                    target
+                );
+                return Ok(stream);
             }
+        }
 
-            // Bare pool: raw TCP to the proxy server. Multiplexed
-            // protocols opt out (pool_bare_tcp): their session pool
-            // already holds warm connections and a bare hit would force
-            // a new mux session per flow.
-            if (entry.descriptor.pool_bare_tcp)(node)
-                && let Some(tcp) = pool.acquire_tcp(&addr).await
-            {
-                tracing::debug!("Pooled TCP to {} acquired for {}", addr, target);
-                return entry
-                    .tcp
-                    .dial_with_tcp(node, target, target_domain, tcp, connect_timeout)
-                    .await;
-            }
+        // Ready streams paid their connect and protocol handshake before
+        // entering this path. For a pool miss, gate only work that can open
+        // a physical connection: a warm generation-owned QUIC/AnyTLS runtime
+        // merely opens a logical stream on its retained transport.
+        let reuses_generation_transport = entry.descriptor.has_generation_runtime()
+            && generation
+                .get(&node.id)
+                .is_some_and(|runtime| runtime.is_warm_or_stateless());
+        let _dial_permit = if matches!(node.protocol, NodeProtocol::Direct | NodeProtocol::Block)
+            || reuses_generation_transport
+        {
+            None
+        } else {
+            Some(generation.acquire_dial_permit().await)
+        };
+
+        // A raw pooled TCP still needs its protocol handshake. Multiplexed
+        // protocols opt out because their node runtime owns the transport.
+        if !pool_disabled
+            && (entry.descriptor.pool_bare_tcp)(node)
+            && let Some(tcp) = pool.acquire_tcp(&addr).await
+        {
+            tracing::debug!("Pooled TCP to {} acquired for {}", addr, target);
+            return entry
+                .tcp
+                .dial_with_tcp(node, target, target_domain, tcp, connect_timeout)
+                .await;
         }
 
         // Pool miss (or pools disabled) — fresh connect through the
@@ -2159,5 +2348,327 @@ mod cold_urltest_tests {
             2,
             "cancelled unreleased candidate must not start"
         );
+    }
+}
+
+#[cfg(test)]
+mod tcp_flow_lifecycle_tests {
+    use super::*;
+    use crate::connection_tracker::ConnectionEntry;
+    use crate::ebpf::mock::MockEbpfBackend;
+    use honk_ebpf_common::RedirectTuple;
+    use honk_ebpf_common::conn::{ConnState, TcpState};
+    use std::net::{IpAddr, Ipv4Addr};
+    use tokio::io::AsyncReadExt;
+
+    fn forward_tuple() -> TuplesKey {
+        build_tuples_key(
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2)),
+            443,
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            50_000,
+            6,
+        )
+    }
+
+    fn reverse_tuple() -> TuplesKey {
+        build_tuples_key(
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            50_000,
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2)),
+            443,
+            6,
+        )
+    }
+
+    fn set_padding(tuple: &mut TuplesKey, padding: [u8; 3]) {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                padding.as_ptr(),
+                (tuple as *mut TuplesKey).cast::<u8>().add(37),
+                padding.len(),
+            );
+        }
+    }
+
+    fn backend() -> Arc<RwLock<Box<dyn EbpfBackend>>> {
+        Arc::new(RwLock::new(Box::new(MockEbpfBackend::new())))
+    }
+
+    fn tracked_entry(id: &str) -> ConnectionEntry {
+        ConnectionEntry {
+            id: id.to_string(),
+            source: "192.0.2.1:50000".to_string(),
+            destination: "203.0.113.2:443".to_string(),
+            proxy: "direct".to_string(),
+            rule: "Fallback".to_string(),
+            rule_payload: String::new(),
+            chains: vec!["direct".to_string()],
+            upload: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            download: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            start_time: std::time::Instant::now(),
+            domain: None,
+            network: "tcp".to_string(),
+            process: None,
+            process_path: None,
+        }
+    }
+
+    async fn tcp_pair() -> anyhow::Result<(TcpStream, TcpStream)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let connect = TcpStream::connect(addr);
+        let (accepted, peer) = tokio::join!(listener.accept(), connect);
+        Ok((accepted?.0, peer?))
+    }
+
+    #[test]
+    fn directional_key_ignores_padding_and_refcounts_owners() {
+        let mut first = forward_tuple();
+        let mut second = forward_tuple();
+        set_padding(&mut first, [1, 2, 3]);
+        set_padding(&mut second, [4, 5, 6]);
+        let key = TcpFlowKey::from_tuples(&first);
+
+        assert_eq!(key, TcpFlowKey::from_tuples(&second));
+        assert_eq!(
+            key,
+            TcpFlowKey::from_redirect(&RedirectTuple::from_tuples(&first))
+        );
+        let reverse = TcpFlowKey::from_tuples(&reverse_tuple());
+        assert_ne!(key, reverse);
+
+        let pins = TcpFlowPins::default();
+        pins.retain(key);
+        pins.retain(key);
+        pins.retain(reverse);
+        assert_eq!(pins.snapshot().len(), 2);
+        assert_eq!(pins.release(key), Some(false));
+        assert!(pins.snapshot().contains(&key));
+        assert_eq!(pins.release(key), Some(true));
+        assert!(!pins.snapshot().contains(&key));
+        assert!(pins.snapshot().contains(&reverse));
+        assert_eq!(pins.release(key), None);
+        assert_eq!(pins.release(reverse), Some(true));
+        assert!(pins.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tcp_flow_guard_abort_releases_pin_tracker_and_socket() -> anyhow::Result<()> {
+        let (stream, mut peer) = tcp_pair().await?;
+        let pins = Arc::new(TcpFlowPins::default());
+        let tracker = Arc::new(ConnectionTracker::new());
+        let mut flow = TcpFlowGuard::new(
+            stream,
+            forward_tuple(),
+            Arc::clone(&pins),
+            backend(),
+            Arc::clone(&tracker),
+        );
+        flow.track(tracked_entry("abort"));
+        assert_eq!(pins.snapshot().len(), 1);
+        assert_eq!(tracker.snapshot().len(), 1);
+
+        let task = tokio::spawn(async move {
+            let _flow = flow;
+            std::future::pending::<()>().await;
+        });
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(pins.snapshot().is_empty());
+        assert!(tracker.snapshot().is_empty());
+
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), peer.read(&mut byte)).await??,
+            0
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tcp_retire_waits_for_final_owner() -> anyhow::Result<()> {
+        let tuple = forward_tuple();
+        let backend = backend();
+        backend.write().await.tcp_conn_state_store(
+            &tuple,
+            &ConnState {
+                state: TcpState::TcpStateActive as u8,
+                last_seen_ns: 0,
+                ..Default::default()
+            },
+        )?;
+        let pins = Arc::new(TcpFlowPins::default());
+        let tracker = Arc::new(ConnectionTracker::new());
+        let (first_stream, _first_peer) = tcp_pair().await?;
+        let (second_stream, _second_peer) = tcp_pair().await?;
+        let first = TcpFlowGuard::new(
+            first_stream,
+            tuple,
+            Arc::clone(&pins),
+            Arc::clone(&backend),
+            Arc::clone(&tracker),
+        );
+        let second = TcpFlowGuard::new(
+            second_stream,
+            tuple,
+            Arc::clone(&pins),
+            Arc::clone(&backend),
+            tracker,
+        );
+
+        first.retire().await;
+        assert!(
+            backend
+                .read()
+                .await
+                .tcp_conn_state_lookup(&tuple)?
+                .is_some()
+        );
+        assert!(pins.snapshot().contains(&TcpFlowKey::from_tuples(&tuple)));
+
+        second.retire().await;
+        assert!(
+            backend
+                .read()
+                .await
+                .tcp_conn_state_lookup(&tuple)?
+                .is_none()
+        );
+        assert!(pins.snapshot().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tcp_retire_preserves_newer_incarnation() -> anyhow::Result<()> {
+        let tuple = forward_tuple();
+        let reverse = reverse_tuple();
+        let old = ConnState {
+            state: TcpState::TcpStateActive as u8,
+            last_seen_ns: 0,
+            ..Default::default()
+        };
+        let backend = backend();
+        {
+            let mut backend = backend.write().await;
+            backend.tcp_conn_state_store(&tuple, &old)?;
+            backend.tcp_conn_state_store(&reverse, &old)?;
+        }
+
+        let pins = Arc::new(TcpFlowPins::default());
+        let tracker = Arc::new(ConnectionTracker::new());
+        let (stream, mut peer) = tcp_pair().await?;
+        let mut flow = TcpFlowGuard::new(
+            stream,
+            tuple,
+            Arc::clone(&pins),
+            Arc::clone(&backend),
+            Arc::clone(&tracker),
+        );
+        flow.track(tracked_entry("replacement"));
+
+        let mut backend_guard = backend.write().await;
+        let retire = tokio::spawn(flow.retire());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !tracker.snapshot().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        backend_guard.tcp_conn_state_store(
+            &tuple,
+            &ConnState {
+                last_seen_ns: u64::MAX,
+                ..old
+            },
+        )?;
+        drop(backend_guard);
+        retire.await?;
+
+        let backend = backend.read().await;
+        assert_eq!(
+            backend
+                .tcp_conn_state_lookup(&tuple)?
+                .expect("replacement state")
+                .last_seen_ns,
+            u64::MAX
+        );
+        assert!(backend.tcp_conn_state_lookup(&reverse)?.is_some());
+        drop(backend);
+        assert!(pins.snapshot().is_empty());
+        assert!(tracker.snapshot().is_empty());
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), peer.read(&mut byte)).await??,
+            0
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod dial_permit_scope_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ready_pool_hit_does_not_wait_for_physical_dial_permit() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let tcp = tokio::net::TcpStream::connect(server_addr).await.unwrap();
+        let target: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let mut node = Node {
+            name: "ready-socks".into(),
+            protocol: NodeProtocol::Socks5,
+            address: server_addr.ip().to_string(),
+            port: server_addr.port(),
+            ..Default::default()
+        };
+        node.id = node.derive_id();
+        let generation = Arc::new(
+            honk_outbound::runtime::OutboundRuntimeRegistry::build_reusing(
+                &[node.clone()],
+                1,
+                None,
+            )
+            .unwrap()
+            .0,
+        );
+        let _held = generation.acquire_dial_permit().await;
+        let pool = ConnectionPool::new();
+        let key =
+            ConnectionPool::ready_key(&format!("{}:{}", node.host(), node.port), target, None);
+        pool.deposit_ready(
+            &key,
+            crate::proxy::ProxyStream {
+                stream: Box::new(tcp),
+                target_addr: target,
+                target_domain: None,
+            },
+        )
+        .await;
+        let registry = ProxyRegistry::default_resolver().unwrap();
+
+        let stream = tokio::time::timeout(
+            Duration::from_millis(100),
+            ControlPlaneHandle::dial_pooled(
+                &registry,
+                &pool,
+                &generation,
+                &node,
+                target,
+                None,
+                Duration::from_secs(1),
+            ),
+        )
+        .await
+        .expect("ready stream must bypass an exhausted physical-dial gate")
+        .unwrap();
+
+        drop(stream);
+        server.abort();
     }
 }

@@ -13,9 +13,9 @@ impl ControlPlane {
     }
 
     /// Start a warm coordinator bound to one immutable runtime generation.
-    /// A zero count is a strict no-op: no task is created and no warm metrics
-    /// are touched. The coordinator re-runs after every probe cycle so the
-    /// per-group top-N follows fresh latency measurements.
+    /// A zero count releases the prior UDP retention set without creating a
+    /// task or touching attempt metrics. Positive counts re-rank after every
+    /// probe cycle.
     pub(super) async fn start_udp_warm_coordinator(
         &self,
         generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
@@ -25,6 +25,7 @@ impl ControlPlane {
         }
         let count = self.config.read().await.global.udp_warm_node_count;
         if count == 0 {
+            reconcile_udp_warm_retention(&[], &generation, &self.stats, &self.udp_warm_ids).await;
             return;
         }
         let connect_timeout = {
@@ -46,8 +47,43 @@ impl ControlPlane {
             generation,
             self.stats.clone(),
             dispatch,
+            self.udp_warm_ids.clone(),
         ));
         *self.udp_warm_task.lock().await = Some(handle);
+    }
+
+    pub(super) async fn stop_selector_warm_coordinator(&self) {
+        let handle = self.selector_warm_task.lock().await.take();
+        if let Some(handle) = handle {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+
+    /// Pin every configured Selector leaf in this immutable runtime
+    /// generation. Choice changes wake the task immediately; the periodic
+    /// pass repairs independently lost sessions and consumed bare sockets.
+    pub(super) async fn start_selector_warm_coordinator(
+        &self,
+        generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
+    ) {
+        if generation.is_shutdown() {
+            return;
+        }
+        let handle = tokio::spawn(run_selector_warm_coordinator(SelectorWarmCoordinator {
+            config: self.config.clone(),
+            group_manager: self.group_manager.clone(),
+            notify: self.selector_warm_notify.clone(),
+            resources: SelectorWarmResources {
+                generation,
+                proxy_registry: self.proxy_registry.clone(),
+                connection_pool: self.connection_pool.clone(),
+                stats: self.stats.clone(),
+                selected_ids: self.selector_warm_ids.clone(),
+                bare_warm: self.selector_bare_warm.clone(),
+            },
+        }));
+        *self.selector_warm_task.lock().await = Some(handle);
     }
 
     /// Atomically publish a rebuilt router, config, group manager, outbound
@@ -319,12 +355,17 @@ impl ControlPlane {
             &self.group_manager,
             &self.connection_tracker,
         );
+        install_selector_warm_callback(&new_group_manager, &self.selector_warm_notify);
         // No new generation-owned work may start on the old snapshot. Its
         // DNS runtime still owns it until old leases and transports retire;
         // only then do the pools enter graceful session drain.
         old_registry.begin_retirement();
         self.stop_udp_warm_coordinator().await;
-        self.start_udp_warm_coordinator(new_runtime_registry).await;
+        self.stop_selector_warm_coordinator().await;
+        self.start_udp_warm_coordinator(Arc::clone(&new_runtime_registry))
+            .await;
+        self.start_selector_warm_coordinator(new_runtime_registry)
+            .await;
         if let Some(ref db) = self.cache_db {
             let db_cb = Arc::clone(db);
             new_group_manager.set_persist_callback(Some(Arc::new(move |group, node| {
@@ -533,19 +574,232 @@ fn restart_required_changes(current: &Config, candidate: &Config) -> Vec<&'stati
     changed
 }
 
+const SELECTOR_WARM_RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
+
+#[derive(Clone)]
+struct SelectorWarmResources {
+    generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
+    proxy_registry: Arc<ProxyRegistry>,
+    connection_pool: Arc<ConnectionPool>,
+    stats: Arc<StatsManager>,
+    selected_ids: Arc<parking_lot::Mutex<std::collections::HashSet<uuid::Uuid>>>,
+    bare_warm: Arc<parking_lot::Mutex<std::collections::HashMap<uuid::Uuid, String>>>,
+}
+
+struct SelectorWarmCoordinator {
+    config: Arc<tokio::sync::RwLock<Config>>,
+    group_manager: crate::group::SharedGroupManager,
+    notify: Arc<tokio::sync::Notify>,
+    resources: SelectorWarmResources,
+}
+
+/// One configured leaf per Selector, preserving config order and deduplicating
+/// nodes shared by several groups. The group manager intentionally resolves
+/// the configured choice rather than liveness-falling away from it.
+pub(super) fn selector_warm_candidates(
+    config: &Config,
+    group_manager: &GroupManager,
+    generation: &honk_outbound::runtime::OutboundRuntimeRegistry,
+) -> Vec<Node> {
+    if generation.is_shutdown() {
+        return Vec::new();
+    }
+    let configured: std::collections::HashSet<uuid::Uuid> =
+        config.nodes.iter().map(|node| node.id).collect();
+    let mut seen = std::collections::HashSet::new();
+    config
+        .groups
+        .iter()
+        .filter(|group| group.policy == GroupPolicy::Selector)
+        .filter_map(|group| group_manager.selector_warm_node(&group.name))
+        .filter(|node| {
+            !matches!(node.protocol, NodeProtocol::Direct | NodeProtocol::Block)
+                && configured.contains(&node.id)
+                && generation.get(&node.id).is_some()
+                && seen.insert(node.id)
+        })
+        .cloned()
+        .collect()
+}
+
+async fn run_selector_warm_coordinator(context: SelectorWarmCoordinator) {
+    let SelectorWarmCoordinator {
+        config,
+        group_manager,
+        notify,
+        resources,
+    } = context;
+    loop {
+        if resources.generation.is_shutdown() {
+            return;
+        }
+        let (connect_timeout, candidates) = {
+            let config = config.read().await;
+            let manager = group_manager.read().clone();
+            (
+                Duration::from_millis(config.global.connect_timeout_ms),
+                selector_warm_candidates(&config, &manager, &resources.generation),
+            )
+        };
+        reconcile_selector_warm(candidates, &resources, connect_timeout).await;
+        if resources.generation.is_shutdown() {
+            return;
+        }
+        tokio::select! {
+            _ = notify.notified() => {}
+            _ = tokio::time::sleep(SELECTOR_WARM_RECONCILE_INTERVAL) => {}
+        }
+    }
+}
+
+async fn reconcile_selector_warm(
+    candidates: Vec<Node>,
+    resources: &SelectorWarmResources,
+    connect_timeout: Duration,
+) {
+    let SelectorWarmResources {
+        generation,
+        connection_pool,
+        stats,
+        selected_ids,
+        bare_warm,
+        ..
+    } = resources;
+    let desired: std::collections::HashSet<uuid::Uuid> =
+        candidates.iter().map(|node| node.id).collect();
+    let previous = selected_ids.lock().clone();
+    for node_id in previous.difference(&desired) {
+        if let Some(runtime) = generation.get(node_id) {
+            runtime
+                .release_warm(honk_outbound::runtime::WarmRetention::Selector)
+                .await;
+        }
+        stats.clear_warm(*node_id, crate::stats::WarmReason::Selector);
+    }
+    *selected_ids.lock() = desired.clone();
+
+    let stale_bare: Vec<String> = {
+        let mut retained = bare_warm.lock();
+        let stale: Vec<uuid::Uuid> = retained
+            .keys()
+            .filter(|id| !desired.contains(id))
+            .copied()
+            .collect();
+        stale
+            .into_iter()
+            .filter_map(|id| retained.remove(&id))
+            .collect()
+    };
+    for addr in stale_bare {
+        connection_pool.purge_bare(&addr);
+    }
+
+    let mut pending = candidates.into_iter();
+    let mut tasks = tokio::task::JoinSet::new();
+    loop {
+        while tasks.len() < 4 {
+            let Some(node) = pending.next() else {
+                break;
+            };
+            tasks.spawn(warm_selector_candidate(
+                node,
+                resources.clone(),
+                connect_timeout,
+            ));
+        }
+        if tasks.is_empty() {
+            break;
+        }
+        let _ = tasks.join_next().await;
+    }
+}
+
+async fn warm_selector_candidate(
+    node: Node,
+    resources: SelectorWarmResources,
+    connect_timeout: Duration,
+) {
+    let SelectorWarmResources {
+        generation,
+        proxy_registry,
+        connection_pool,
+        stats,
+        bare_warm,
+        ..
+    } = resources;
+    // Purge a moved endpoint before redial: failure must not keep the old
+    // socket pinned under a stable node ID.
+    let supports_bare = (honk_outbound::descriptor::descriptor(node.protocol).pool_bare_tcp)(&node);
+    let bare_addr = supports_bare.then(|| format!("{}:{}", node.host(), node.port));
+    let stale = {
+        let mut retained = bare_warm.lock();
+        match (retained.get(&node.id), bare_addr.as_ref()) {
+            (Some(old), Some(current)) if old == current => None,
+            (Some(_), _) => retained.remove(&node.id),
+            (None, _) => None,
+        }
+    };
+    if let Some(stale) = stale {
+        connection_pool.purge_bare(&stale);
+        stats.clear_warm(node.id, crate::stats::WarmReason::Selector);
+    }
+    match proxy_registry
+        .warm_session(Arc::clone(&generation), node.id, connect_timeout)
+        .await
+    {
+        Ok(honk_outbound::proxy::WarmOutcome::Ready) => {
+            if let Some(addr) = bare_warm.lock().remove(&node.id) {
+                connection_pool.purge_bare(&addr);
+            }
+            stats.mark_warm(node.id, crate::stats::WarmReason::Selector);
+        }
+        Ok(honk_outbound::proxy::WarmOutcome::NotApplicable) => {
+            let Some(addr) = bare_addr else {
+                return;
+            };
+            if !connection_pool.has_live_bare_entry(&addr) {
+                let stream =
+                    match honk_outbound::util::connect_outbound(&addr, connect_timeout).await {
+                        Ok(stream) if !generation.is_shutdown() && is_tcp_stream_alive(&stream) => {
+                            stream
+                        }
+                        Ok(_) => return,
+                        Err(error) => {
+                            debug!(node = %node.name, %error, "Selector warm bare TCP failed");
+                            return;
+                        }
+                    };
+                connection_pool.deposit_tcp(&addr, stream).await;
+            }
+            if connection_pool.has_live_bare_entry(&addr) {
+                let old = bare_warm.lock().insert(node.id, addr.clone());
+                if let Some(old) = old.filter(|old| old != &addr) {
+                    connection_pool.purge_bare(&old);
+                }
+                stats.mark_warm(node.id, crate::stats::WarmReason::Selector);
+            }
+        }
+        Err(error) if generation.is_shutdown() => {
+            debug!(node = %node.name, %error, "Selector warm generation ended");
+        }
+        Err(error) => {
+            debug!(node = %node.name, %error, "Selector warm session failed");
+        }
+    }
+}
+
 /// Select warm candidates: the top `count` UDP leaves (latency order, capped
 /// at three) of every configured group, for both IP versions. This replaces
-/// winner-only warming: after each probe cycle the latency order is
-/// re-evaluated, so freshly measured fast leaves get pre-dialed even before
-/// they win a selection. Cold URLTest groups contribute their full ranked
-/// list (they are exactly the groups that benefit from pre-dialed
-/// transports). UUID-deduplicated across groups, direct/block leaves and
-/// nodes without a UDP-capable runtime stay out.
+/// winner-only warming: each pass re-evaluates the latency order, so freshly
+/// measured fast leaves get reusable session state before they win a
+/// selection. Cold URLTest groups contribute their full ranked list. UUIDs
+/// are deduplicated across groups; direct/block leaves and nodes without a
+/// reusable UDP-capable generation runtime stay out.
 ///
 /// On top of the per-group top-N, a process-wide cap of `4 × count` keeps
-/// the retained transports bounded when the group count grows: the merged
-/// set is re-ranked by the global UDP latency and truncated, so the cap
-/// sacrifices only the slowest leaves.
+/// retained resources bounded as the group count grows. The merged set is
+/// re-ranked by global UDP latency and truncated, sacrificing only the
+/// slowest leaves.
 pub(super) fn udp_warm_candidates(
     config: &Config,
     group_manager: &GroupManager,
@@ -585,7 +839,10 @@ pub(super) fn udp_warm_candidates(
                 let Some(runtime) = generation.get(&node.id) else {
                     continue;
                 };
-                if !runtime.capabilities.udp {
+                if !runtime.udp_capable
+                    || !honk_outbound::descriptor::descriptor(node.protocol)
+                        .has_generation_runtime()
+                {
                     continue;
                 }
                 let latency = group_manager.udp_latency(node, ipver);
@@ -603,40 +860,61 @@ pub(super) fn udp_warm_candidates(
     selected.into_iter().map(|(id, _)| id).collect()
 }
 
-/// Periodic warm coordinator: one pass immediately, then one pass per probe
-/// cycle (`check_interval`, floored at 10s). Each pass recomputes the
-/// per-group top-N from the freshest probe data; already-warm transports are
-/// cheap `AlreadyReady` no-ops. Exits when the count is disabled or the
-/// generation turns terminal (reload/shutdown replaces the task).
+async fn reconcile_udp_warm_retention(
+    candidates: &[uuid::Uuid],
+    generation: &Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
+    stats: &Arc<StatsManager>,
+    retained_ids: &Arc<parking_lot::Mutex<std::collections::HashSet<uuid::Uuid>>>,
+) {
+    let desired: std::collections::HashSet<uuid::Uuid> = candidates.iter().copied().collect();
+    let previous = retained_ids.lock().clone();
+    for node_id in previous.difference(&desired) {
+        if let Some(runtime) = generation.get(node_id) {
+            runtime
+                .release_warm(honk_outbound::runtime::WarmRetention::Udp)
+                .await;
+        }
+        stats.clear_warm(*node_id, crate::stats::WarmReason::Udp);
+    }
+    *retained_ids.lock() = desired;
+}
+
+/// Periodic warm coordinator: one immediate pass, then another after each
+/// completed dispatch batch plus `check_interval` (floored at 10s). Every pass
+/// re-ranks the per-group top-N from current probe data; handlers reuse live
+/// sessions/clients, so repeat dispatch is cheap. Exits when the count is
+/// disabled or the generation turns terminal (reload/shutdown replaces it).
 async fn run_udp_warm_coordinator<F, Fut>(
     config: Arc<tokio::sync::RwLock<Config>>,
     group_manager: crate::group::SharedGroupManager,
     generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
     stats: Arc<StatsManager>,
     dispatch: Arc<F>,
+    retained_ids: Arc<parking_lot::Mutex<std::collections::HashSet<uuid::Uuid>>>,
 ) where
     F: Fn(Arc<honk_outbound::runtime::OutboundRuntimeRegistry>, uuid::Uuid) -> Fut
         + Send
         + Sync
         + 'static,
-    Fut: std::future::Future<Output = anyhow::Result<honk_outbound::proxy::UdpWarmStatus>>
-        + Send
-        + 'static,
+    Fut: Future<Output = anyhow::Result<honk_outbound::proxy::WarmOutcome>> + Send + 'static,
 {
     loop {
-        let (interval, candidates) = {
+        if generation.is_shutdown() {
+            return;
+        }
+        let (interval, count, candidates) = {
             let cfg = config.read().await.clone();
             let count = cfg.global.udp_warm_node_count;
-            if count == 0 || generation.is_shutdown() {
-                return;
-            }
             let interval = Duration::from_secs(cfg.global.check_interval_secs.max(10));
             let manager = group_manager.read().clone();
-            (
-                interval,
-                udp_warm_candidates(&cfg, &manager, &generation, count),
-            )
+            let candidates = udp_warm_candidates(&cfg, &manager, &generation, count);
+            (interval, count, candidates)
         };
+        if count == 0 {
+            reconcile_udp_warm_retention(&[], &generation, &stats, &retained_ids).await;
+            return;
+        }
+        reconcile_udp_warm_retention(&candidates, &generation, &stats, &retained_ids).await;
         run_udp_warm_dispatches(
             candidates,
             generation.clone(),
@@ -664,9 +942,7 @@ async fn run_udp_warm_dispatches<F, Fut>(
         + Send
         + Sync
         + 'static,
-    Fut: std::future::Future<Output = anyhow::Result<honk_outbound::proxy::UdpWarmStatus>>
-        + Send
-        + 'static,
+    Fut: Future<Output = anyhow::Result<honk_outbound::proxy::WarmOutcome>> + Send + 'static,
 {
     if candidates.is_empty() {
         return;
@@ -684,14 +960,11 @@ async fn run_udp_warm_dispatches<F, Fut>(
             tasks.spawn(async move {
                 stats.record_udp_warm_attempt();
                 match dispatch(generation.clone(), node_id).await {
-                    Ok(
-                        honk_outbound::proxy::UdpWarmStatus::Ready
-                        | honk_outbound::proxy::UdpWarmStatus::AlreadyReady,
-                    ) => {
+                    Ok(honk_outbound::proxy::WarmOutcome::Ready) => {
                         stats.record_udp_warm_success();
                         stats.mark_warm(node_id, crate::stats::WarmReason::Udp);
                     }
-                    Ok(honk_outbound::proxy::UdpWarmStatus::NotApplicable) => {}
+                    Ok(honk_outbound::proxy::WarmOutcome::NotApplicable) => {}
                     Err(err) if generation.is_shutdown() => {
                         debug!("UDP warm ended with terminal generation: {err}");
                     }
@@ -929,6 +1202,19 @@ pub(super) fn install_interrupt_callback(
                 closed, group_name
             );
         }
+    })));
+}
+
+/// Wake the Selector warm coordinator after a manual choice changes. The
+/// task re-resolves every Selector so shared/nested leaves stay reference
+/// correct without putting async work in the synchronous group callback.
+pub(super) fn install_selector_warm_callback(
+    group_manager: &GroupManager,
+    notify: &Arc<tokio::sync::Notify>,
+) {
+    let notify = Arc::clone(notify);
+    group_manager.set_selector_change_callback(Some(Arc::new(move || {
+        notify.notify_one();
     })));
 }
 
@@ -1750,6 +2036,209 @@ mod atomic_reload_tests {
     }
 
     #[test]
+    fn selector_warm_candidates_follow_configured_leaves_and_deduplicate() {
+        let node = |name: &str, protocol| Node {
+            id: uuid::Uuid::new_v4(),
+            name: name.into(),
+            protocol,
+            address: "127.0.0.1:9".into(),
+            ..Default::default()
+        };
+        let anytls = node("selector-anytls", NodeProtocol::AnyTLS);
+        let socks = node("selector-socks", NodeProtocol::Socks5);
+        let direct = node("selector-direct", NodeProtocol::Direct);
+        let groups = vec![
+            Group {
+                name: "first".into(),
+                policy: GroupPolicy::Selector,
+                nodes: vec![anytls.id, direct.id],
+                ..Default::default()
+            },
+            Group {
+                name: "shared".into(),
+                policy: GroupPolicy::Selector,
+                nodes: vec![anytls.id],
+                ..Default::default()
+            },
+            Group {
+                name: "child".into(),
+                policy: GroupPolicy::Selector,
+                nodes: vec![socks.id],
+                ..Default::default()
+            },
+            Group {
+                name: "parent".into(),
+                policy: GroupPolicy::Selector,
+                groups: vec!["child".into()],
+                ..Default::default()
+            },
+        ];
+        let config = Config {
+            nodes: vec![anytls.clone(), socks.clone(), direct],
+            groups,
+            ..Default::default()
+        };
+        let manager = GroupManager::new(&config.groups, &config.nodes);
+        let generation =
+            honk_outbound::runtime::OutboundRuntimeRegistry::build(&config.nodes).unwrap();
+
+        assert_eq!(
+            selector_warm_candidates(&config, &manager, &generation)
+                .into_iter()
+                .map(|node| node.id)
+                .collect::<Vec<_>>(),
+            vec![anytls.id, socks.id]
+        );
+    }
+
+    #[tokio::test]
+    async fn selector_choice_switch_replaces_bare_tcp_pin_immediately() {
+        let first_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_socket = first_listener.local_addr().unwrap();
+        let second_socket = second_listener.local_addr().unwrap();
+        let first_addr = first_socket.to_string();
+        let second_addr = second_socket.to_string();
+        let first = Node {
+            id: uuid::Uuid::new_v4(),
+            name: "selector-first".into(),
+            protocol: NodeProtocol::Socks5,
+            address: first_addr.clone(),
+            host: first_socket.ip().to_string(),
+            port: first_socket.port(),
+            ..Default::default()
+        };
+        let second = Node {
+            id: uuid::Uuid::new_v4(),
+            name: "selector-second".into(),
+            protocol: NodeProtocol::Socks5,
+            address: second_addr.clone(),
+            host: second_socket.ip().to_string(),
+            port: second_socket.port(),
+            ..Default::default()
+        };
+        let config = Config {
+            nodes: vec![first.clone(), second.clone()],
+            groups: vec![Group {
+                name: "manual".into(),
+                policy: GroupPolicy::Selector,
+                nodes: vec![first.id, second.id],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let manager = Arc::new(GroupManager::new(&config.groups, &config.nodes));
+        let generation = Arc::new(
+            honk_outbound::runtime::OutboundRuntimeRegistry::build(&config.nodes).unwrap(),
+        );
+        assert_eq!(
+            selector_warm_candidates(&config, &manager, &generation)
+                .into_iter()
+                .map(|node| node.id)
+                .collect::<Vec<_>>(),
+            vec![first.id]
+        );
+        let cp = test_cp();
+        *cp.config.write().await = config;
+        *cp.group_manager.write() = Arc::clone(&manager);
+        *cp.runtime_registry.write() = Arc::clone(&generation);
+        install_selector_warm_callback(&manager, &cp.selector_warm_notify);
+
+        cp.start_selector_warm_coordinator(Arc::clone(&generation))
+            .await;
+        let (first_server, _) =
+            tokio::time::timeout(Duration::from_secs(1), first_listener.accept())
+                .await
+                .expect("first selector must preconnect")
+                .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !cp.connection_pool.has_live_bare_entry(&first_addr) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        manager.set_selector_choice("manual", "selector-second");
+        let (second_server, _) =
+            tokio::time::timeout(Duration::from_secs(1), second_listener.accept())
+                .await
+                .expect("choice change must preconnect immediately")
+                .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while cp.connection_pool.has_live_bare_entry(&first_addr)
+                || !cp.connection_pool.has_live_bare_entry(&second_addr)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("choice change must replace the old pin");
+
+        drop((first_server, second_server));
+        cp.stop_selector_warm_coordinator().await;
+        generation.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn changed_selector_bare_endpoint_is_purged_before_failed_replacement() {
+        let old_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let old_socket = old_listener.local_addr().unwrap();
+        let old_addr = old_socket.to_string();
+        let node = Node {
+            id: uuid::Uuid::new_v4(),
+            name: "selector-moved".into(),
+            protocol: NodeProtocol::Socks5,
+            address: old_addr.clone(),
+            host: old_socket.ip().to_string(),
+            port: old_socket.port(),
+            ..Default::default()
+        };
+        let generation = Arc::new(
+            honk_outbound::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node))
+                .unwrap(),
+        );
+        let cp = test_cp();
+        let resources = SelectorWarmResources {
+            generation: Arc::clone(&generation),
+            proxy_registry: cp.proxy_registry.clone(),
+            connection_pool: cp.connection_pool.clone(),
+            stats: cp.stats.clone(),
+            selected_ids: cp.selector_warm_ids.clone(),
+            bare_warm: cp.selector_bare_warm.clone(),
+        };
+
+        warm_selector_candidate(node.clone(), resources.clone(), Duration::from_secs(1)).await;
+        let (old_server, _) = tokio::time::timeout(Duration::from_secs(1), old_listener.accept())
+            .await
+            .expect("initial selector must preconnect")
+            .unwrap();
+        assert!(cp.connection_pool.has_live_bare_entry(&old_addr));
+        assert_eq!(cp.selector_bare_warm.lock().get(&node.id), Some(&old_addr));
+
+        let unavailable = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable_socket = unavailable.local_addr().unwrap();
+        drop(unavailable);
+        let mut moved = node.clone();
+        moved.address = unavailable_socket.to_string();
+        moved.host = unavailable_socket.ip().to_string();
+        moved.port = unavailable_socket.port();
+        warm_selector_candidate(moved, resources, Duration::from_millis(100)).await;
+
+        assert!(!cp.connection_pool.has_live_bare_entry(&old_addr));
+        assert!(!cp.selector_bare_warm.lock().contains_key(&node.id));
+        assert_eq!(
+            cp.stats
+                .warm_snapshot(&generation, &cp.connection_pool)
+                .selector_nodes,
+            0
+        );
+
+        drop(old_server);
+        generation.shutdown().await;
+    }
+
+    #[test]
     fn udp_warm_candidates_only_use_authoritative_group_leaves() {
         let node = |name: &str, protocol| Node {
             id: uuid::Uuid::new_v4(),
@@ -1759,7 +2248,7 @@ mod atomic_reload_tests {
             ..Default::default()
         };
         let anytls = node("anytls", honk_config::types::NodeProtocol::AnyTLS);
-        let socks = node("socks", honk_config::types::NodeProtocol::Socks5);
+        let nested_warmable = node("socks", honk_config::types::NodeProtocol::AnyTLS);
         let cold = node("cold", honk_config::types::NodeProtocol::VMess);
         let standalone = node("standalone", honk_config::types::NodeProtocol::VMess);
         let groups = vec![
@@ -1772,7 +2261,7 @@ mod atomic_reload_tests {
             Group {
                 name: "nested".into(),
                 policy: GroupPolicy::Selector,
-                nodes: vec![socks.id],
+                nodes: vec![nested_warmable.id],
                 ..Default::default()
             },
             Group {
@@ -1802,7 +2291,7 @@ mod atomic_reload_tests {
         ];
         let mut config = Config::default();
         config.routing.default_outbound = "direct".into();
-        config.nodes = vec![anytls.clone(), socks.clone(), cold, standalone];
+        config.nodes = vec![anytls.clone(), nested_warmable.clone(), cold, standalone];
         config.groups = groups;
         let manager = GroupManager::new(&config.groups, &config.nodes);
         let runtime =
@@ -1810,13 +2299,13 @@ mod atomic_reload_tests {
 
         assert_eq!(
             udp_warm_candidates(&config, &manager, &runtime, 8),
-            vec![anytls.id, socks.id],
+            vec![anytls.id, nested_warmable.id],
             "V4/V6 and final/nested paths deduplicate UUIDs; cold/standalone stay out, \
              direct-final contributes nothing"
         );
         assert_eq!(
             udp_warm_candidates(&config, &manager, &runtime, 1),
-            vec![anytls.id, socks.id],
+            vec![anytls.id, nested_warmable.id],
             "the count is a per-group cap; the process-wide cap (4x) does not bind here"
         );
         assert!(udp_warm_candidates(&config, &manager, &runtime, 0).is_empty());
@@ -1827,7 +2316,7 @@ mod atomic_reload_tests {
         let node = |name: &str| Node {
             id: uuid::Uuid::new_v4(),
             name: name.into(),
-            protocol: honk_config::types::NodeProtocol::Socks5,
+            protocol: honk_config::types::NodeProtocol::AnyTLS,
             address: "127.0.0.1:9".into(),
             ..Default::default()
         };
@@ -1887,7 +2376,7 @@ mod atomic_reload_tests {
                 let node = Node {
                     id: uuid::Uuid::new_v4(),
                     name: format!("n{g}-{i}"),
-                    protocol: honk_config::types::NodeProtocol::Socks5,
+                    protocol: honk_config::types::NodeProtocol::AnyTLS,
                     address: "127.0.0.1:9".into(),
                     ..Default::default()
                 };
@@ -1931,7 +2420,7 @@ mod atomic_reload_tests {
         let node = |name: &str| Node {
             id: uuid::Uuid::new_v4(),
             name: name.into(),
-            protocol: honk_config::types::NodeProtocol::Socks5,
+            protocol: honk_config::types::NodeProtocol::AnyTLS,
             address: "127.0.0.1:9".into(),
             ..Default::default()
         };
@@ -2059,7 +2548,7 @@ mod atomic_reload_tests {
                     peak.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
                     tokio::time::sleep(Duration::from_millis(20)).await;
                     active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                    Ok(honk_outbound::proxy::UdpWarmStatus::Ready)
+                    Ok(honk_outbound::proxy::WarmOutcome::Ready)
                 }
             })
         };
@@ -2103,7 +2592,6 @@ mod atomic_reload_tests {
         #[derive(Clone, Copy)]
         enum Outcome {
             Ready,
-            AlreadyReady,
             NotApplicable,
             LiveError,
             TerminalError,
@@ -2113,7 +2601,6 @@ mod atomic_reload_tests {
 
         let cases = [
             ("ready", Outcome::Ready, 1, 0),
-            ("already-ready", Outcome::AlreadyReady, 1, 0),
             ("not-applicable", Outcome::NotApplicable, 0, 0),
             ("live-error", Outcome::LiveError, 0, 1),
             ("terminal-error", Outcome::TerminalError, 0, 0),
@@ -2138,12 +2625,9 @@ mod atomic_reload_tests {
                 move |generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
                       _node_id: uuid::Uuid| async move {
                     match outcome {
-                        Outcome::Ready => Ok(honk_outbound::proxy::UdpWarmStatus::Ready),
-                        Outcome::AlreadyReady => {
-                            Ok(honk_outbound::proxy::UdpWarmStatus::AlreadyReady)
-                        }
+                        Outcome::Ready => Ok(honk_outbound::proxy::WarmOutcome::Ready),
                         Outcome::NotApplicable => {
-                            Ok(honk_outbound::proxy::UdpWarmStatus::NotApplicable)
+                            Ok(honk_outbound::proxy::WarmOutcome::NotApplicable)
                         }
                         Outcome::LiveError => Err(anyhow::anyhow!("live warm error")),
                         Outcome::TerminalError => {
@@ -2207,11 +2691,12 @@ mod atomic_reload_tests {
 
         #[async_trait::async_trait]
         impl honk_outbound::proxy::WarmableOutbound for BlockingWarmHandler {
-            async fn warm_udp(
+            async fn warm(
                 &self,
                 runtime: Arc<honk_outbound::runtime::NodeRuntime>,
                 _connect_timeout: Duration,
-            ) -> anyhow::Result<honk_outbound::proxy::UdpWarmStatus> {
+                _requirement: honk_outbound::proxy::WarmRequirement,
+            ) -> anyhow::Result<()> {
                 self.started
                     .send(runtime)
                     .expect("warm coordinator receiver must stay open");
@@ -2224,7 +2709,7 @@ mod atomic_reload_tests {
         let node = Node {
             id: uuid::Uuid::new_v4(),
             name: "warm-node".into(),
-            protocol: honk_config::types::NodeProtocol::Socks5,
+            protocol: honk_config::types::NodeProtocol::AnyTLS,
             address: "127.0.0.1:9".into(),
             ..Default::default()
         };
@@ -2248,7 +2733,7 @@ mod atomic_reload_tests {
         });
         proxy_registry.register(
             honk_outbound::proxy::ProtocolEntry::new(
-                honk_config::types::NodeProtocol::Socks5,
+                honk_config::types::NodeProtocol::AnyTLS,
                 warm_handler.clone(),
             )
             .with_warmable(warm_handler),
@@ -2264,6 +2749,15 @@ mod atomic_reload_tests {
         .unwrap();
 
         let old_generation = cp.runtime_registry.read().clone();
+        assert_eq!(
+            udp_warm_candidates(
+                &config,
+                &cp.group_manager.read(),
+                &old_generation,
+                config.global.udp_warm_node_count,
+            ),
+            vec![node.id]
+        );
         cp.start_udp_warm_coordinator(Arc::clone(&old_generation))
             .await;
         let old_runtime = tokio::time::timeout(Duration::from_secs(1), started_rx.recv())

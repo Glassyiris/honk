@@ -1,25 +1,6 @@
 //! Shared QUIC client plumbing for QUIC-based proxy protocols.
 //!
-//! Used by the TUIC v5, Juicity, and Hysteria2 outbounds. It provides:
-//!
-//! - [`rustls_client_config`] — rustls client config built from the shared
-//!   `tls.rs` helpers (webpki roots or no-verify) with a per-protocol ALPN.
-//! - [`client_config`] — assembles a quinn [`ClientConfig`] (TLS + transport:
-//!   congestion controller selection, datagram support, keep-alive).
-//! - [`client_endpoint`] — a quinn [`Endpoint`] bound on an `SO_MARK`'ed UDP
-//!   socket (`DAE_BYPASS_MARK`) so traffic to the proxy server bypasses the
-//!   eBPF datapath instead of looping back into it.
-//! - [`QuicClient`] — a per-server connection holder: at most one active QUIC
-//!   connection, re-dialed on demand, with the protocol-specific post-connect
-//!   setup (auth handshake, demux tasks) running inside the single-flight
-//!   critical section.
-//! - [`QuicBiStream`] — `AsyncRead + AsyncWrite` wrapper pairing a quinn
-//!   [`SendStream`]/[`RecvStream`] so it can be boxed into a
-//!   [`crate::proxy::ProxyStream`].
-//! - Small pieces shared verbatim by the three protocol handlers:
-//!   [`now_secs`], [`recv_read_exact`], the UDP fragment [`defrag`] module,
-//!   [`exporter_auth`], [`spawn_conn_reaper`] and the [`dial_quic_stream`]
-//!   retry skeleton.
+//! Used by the TUIC v5, Juicity, and Hysteria2 outbounds.
 
 use std::io;
 use std::net::SocketAddr;
@@ -303,6 +284,15 @@ pub(crate) async fn recv_read_exact(recv: &mut RecvStream, buf: &mut [u8]) -> io
     recv.read_exact(buf)
         .await
         .map_err(|e| io::Error::new(io::ErrorKind::UnexpectedEof, e))
+}
+/// Wait long enough for a server to reject zero-grace authentication after
+/// the handshake. The final close check covers a close racing the timer.
+pub(crate) async fn survives_auth_close_window(conn: &Connection) -> bool {
+    let wait = (2 * conn.rtt()).max(Duration::from_millis(2));
+    tokio::select! {
+        _ = conn.closed() => false,
+        _ = tokio::time::sleep(wait) => conn.close_reason().is_none(),
+    }
 }
 
 /// UDP fragment reassembly shared by the TUIC and Hysteria2 session bridges
@@ -728,24 +718,19 @@ impl<C> QuicClient<C> {
             state.conn = None;
         }
     }
-    /// Whether this client already owns a live reusable QUIC connection.
-    /// Warm-up uses this only to report whether it established a connection;
-    /// the connection itself remains owned by the generation runtime.
-    pub async fn has_live_connection(&self) -> bool {
-        self.state
-            .lock()
-            .await
-            .conn
-            .as_ref()
-            .is_some_and(|(conn, _)| conn.close_reason().is_none())
+
+    /// Release the reusable holder without closing flows that already own
+    /// connection/state clones. A later dial may rebuild this client.
+    pub async fn release_cached(&self) {
+        let mut state = self.state.lock().await;
+        state.conn = None;
+        state.endpoint = None;
     }
 
-    /// Close the cached connection and endpoint, and reject future dials.
-    /// Awaits an in-flight dial's single-flight section instead of skipping:
-    /// that dial caches its fresh connection first, and this close then
-    /// covers it — a try-lock skip would leak the late connection and its
-    /// endpoint driver. Flows already owning a `(Connection, Arc<C>)` pair
-    /// keep it — this only stops future reuse.
+    /// Close the cached connection and endpoint, terminating every flow that
+    /// still owns a connection clone, and reject future dials. Awaits an
+    /// in-flight dial's single-flight section so its late connection is also
+    /// closed; a try-lock skip would leak that connection and endpoint driver.
     pub async fn force_close(&self) {
         let mut state = self.state.lock().await;
         state.closed = true;
@@ -1216,6 +1201,34 @@ mod client_tests {
         );
     }
 
+    #[tokio::test]
+    async fn release_cached_keeps_client_reusable_for_a_fresh_connection() {
+        let (endpoint, addr) = testutil::server_endpoint(&[b"h3"], true).unwrap();
+        spawn_accept_loop(endpoint);
+        let client = test_client(addr.port()).await;
+        let (first, _) = client
+            .connection_with(Duration::from_secs(5), |_conn| async {
+                Ok::<(), anyhow::Error>(())
+            })
+            .await
+            .unwrap();
+
+        client.release_cached().await;
+        let state = client.state.lock().await;
+        assert!(state.conn.is_none());
+        assert!(!state.closed);
+        drop(state);
+
+        let (second, _) = client
+            .connection_with(Duration::from_secs(5), |_conn| async {
+                Ok::<(), anyhow::Error>(())
+            })
+            .await
+            .unwrap();
+        assert_ne!(first.stable_id(), second.stable_id());
+        client.force_close().await;
+    }
+
     /// A cold-node health probe dials QUIC through an ephemeral runtime;
     /// closing it must deterministically close the cached connection and
     /// endpoint driver (drop-alone is not relied upon).
@@ -1227,6 +1240,9 @@ mod client_tests {
         }
         async fn force_close(&self) {
             self.0.force_close().await;
+        }
+        async fn release_warm(&self) {
+            self.0.release_cached().await;
         }
     }
 
@@ -1265,7 +1281,7 @@ mod client_tests {
         let runtime = tuic_ephemeral();
         let (_client, conn) = probe_client(&runtime, addr.port()).await;
         assert!(conn.close_reason().is_none());
-        assert!(runtime.has_warm_resources());
+        assert!(runtime.is_warm_or_stateless());
 
         runtime.close().await;
         assert!(
@@ -1273,7 +1289,7 @@ mod client_tests {
             "closing the ephemeral runtime must close the probe connection"
         );
         assert!(
-            !runtime.has_warm_resources(),
+            !runtime.is_warm_or_stateless(),
             "a closed runtime no longer reports warm clients"
         );
     }

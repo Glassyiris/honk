@@ -133,11 +133,6 @@ fn detect_default_interface() -> Option<String> {
     honk_config::config::default_route_interface()
 }
 
-#[cfg(all(feature = "ebpf", test))]
-pub(crate) fn detect_default_interface_from(content: &str) -> Option<String> {
-    honk_config::config::default_route_interface_from(content)
-}
-
 /// Default eBPF object file embedded into the binary.
 /// Built-in eBPF object embedded at compile time by build.rs.
 /// `--bpf-object` CLI flag overrides this at runtime.
@@ -524,6 +519,20 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let mock_mode = cli.mock_ebpf || cfg!(not(feature = "ebpf"));
     #[cfg(feature = "ebpf")]
     let configured_ifaces = configured_interfaces(&config);
+    #[cfg(feature = "ebpf")]
+    if !mock_mode
+        && detect_default_interface().is_none()
+        && config
+            .global
+            .lan_interface
+            .iter()
+            .chain(&config.global.wan_interface)
+            .any(|name| name == "auto" || name.is_empty())
+    {
+        warn!(
+            "default route unavailable; auto interface binding is pending until a network route appears"
+        );
+    }
 
     // Singleton guard: the datapath uses fixed names (dae0, daens, TC
     // hooks), and a stopping instance's cleanup destroys them. A second

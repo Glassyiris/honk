@@ -284,7 +284,7 @@ async fn fetch_proxied(
     let generation = ctx.runtime_registry.read().clone();
     let (runtime, guard) = match generation
         .get(&node.id)
-        .filter(|runtime| runtime.has_warm_resources())
+        .filter(|runtime| runtime.is_warm_or_stateless())
     {
         Some(runtime) => (runtime, None),
         None => {

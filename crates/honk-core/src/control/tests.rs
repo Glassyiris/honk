@@ -1444,21 +1444,26 @@ impl honk_outbound::proxy::PacketOutbound for UdpTestHandler {
         }
     }
 
-    async fn dial_udp_transport_speculative(
+    async fn dial_udp_transport_speculative_runtime(
         &self,
-        node: &Node,
+        runtime: Arc<honk_outbound::runtime::NodeRuntime>,
         target: SocketAddr,
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<honk_outbound::proxy::PreparedUdpTransport> {
         let transport = self
-            .dial_udp_transport(node, target, target_domain, connect_timeout)
+            .dial_udp_transport(
+                runtime.node.as_ref(),
+                target,
+                target_domain,
+                connect_timeout,
+            )
             .await?;
         if let UdpTestMode::PreparedCommitError { commits, .. } = &self.mode {
             let commits = Arc::clone(commits);
             return Ok(honk_outbound::proxy::PreparedUdpTransport::new(
                 transport,
-                move || {
+                move || async move {
                     commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     Err(anyhow::anyhow!(
                         "scripted prepared transport commit failure"
@@ -1487,6 +1492,145 @@ fn udp_test_forwarder() -> Arc<crate::dns::forwarder::DnsForwarder> {
         )
         .with_cache_enabled(false),
     )
+}
+
+#[tokio::test]
+async fn tcp_idle_relay_survives_conn_state_sweep() -> anyhow::Result<()> {
+    use honk_ebpf_common::conn::{ConnState, TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS, TcpState};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let original_dst = listener.local_addr()?;
+    let mut client = TcpStream::connect(original_dst).await?;
+    let (accepted, client_addr) = listener.accept().await?;
+    let tuples = build_tuples_key(
+        original_dst.ip(),
+        original_dst.port(),
+        client_addr.ip(),
+        client_addr.port(),
+        6,
+    );
+    let redirect_key = RedirectTuple::from_tuples(&tuples);
+    let stale_timestamp = 1;
+    let stale_state = ConnState {
+        state: TcpState::TcpStateActive as u8,
+        last_seen_ns: stale_timestamp,
+        ..Default::default()
+    };
+    let stale_redirect = RedirectEntry {
+        last_seen_ns: stale_timestamp,
+        ..Default::default()
+    };
+    let handoff = RoutingHandoffEntry {
+        last_seen_ns: stale_timestamp,
+        result: RoutingResult {
+            outbound: OutboundIndex::Direct as u8,
+            mark: 0,
+            ..Default::default()
+        },
+    };
+
+    let mut mock = crate::ebpf::mock::MockEbpfBackend::new();
+    mock.tcp_conn_state_store(&tuples, &stale_state)?;
+    mock.redirect_track_store(&redirect_key, &stale_redirect)?;
+    let raw_tuples: [u8; 40] = bytes_of(&tuples).try_into().expect("40-byte tuple key");
+    mock.routing_handoffs
+        .lock()
+        .unwrap()
+        .insert(raw_tuples, handoff);
+
+    let mut config = Config::default();
+    config.ensure_builtin_nodes();
+    config.global.dial_mode = "ip".to_string();
+    config.routing.default_outbound = "direct".to_string();
+    let router = Router::new(&config.routing.rules, &config.routing.default_outbound)?;
+    let plane = ControlPlane::new(
+        config,
+        Box::new(mock),
+        router,
+        Arc::new(ProxyRegistry::default_resolver()?),
+        DnsResolver::new(&honk_config::dns::DnsConfig::default())?,
+        udp_test_forwarder(),
+    )?;
+    let handle = plane.spawn_handle();
+    let handler_handle = handle.clone();
+    let handler =
+        tokio::spawn(async move { handler_handle.serve_connection(accepted, client_addr).await });
+    let (mut upstream, _) =
+        tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
+
+    let tracked_before = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let snapshot = handle.connection_tracker.snapshot();
+            if snapshot.len() == 1 {
+                break snapshot.into_iter().next().unwrap();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+
+    let synthetic_now = TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS + stale_timestamp + 1;
+    let janitor = BpfJanitor::new(handle.ebpf.clone(), handle.tcp_flow_pins.clone());
+    assert_eq!(
+        janitor.cleanup_conn_state_for_test(synthetic_now).await,
+        (0, 1)
+    );
+    assert_eq!(
+        janitor.cleanup_redirect_track_for_test(synthetic_now).await,
+        (0, 1)
+    );
+    {
+        let backend = handle.ebpf.read().await;
+        assert!(backend.tcp_conn_state_lookup(&tuples)?.is_some());
+        assert!(backend.redirect_track_lookup(&redirect_key)?.is_some());
+    }
+
+    upstream.write_all(b"S").await?;
+    let mut byte = [0u8; 1];
+    client.read_exact(&mut byte).await?;
+    assert_eq!(&byte, b"S");
+
+    client.write_all(b"C").await?;
+    upstream.read_exact(&mut byte).await?;
+    assert_eq!(&byte, b"C");
+    upstream.write_all(b"R").await?;
+    client.read_exact(&mut byte).await?;
+    assert_eq!(&byte, b"R");
+
+    let tracked_after = handle.connection_tracker.snapshot();
+    assert_eq!(tracked_after.len(), 1);
+    assert_eq!(tracked_after[0].id, tracked_before.id);
+    assert_eq!(tracked_after[0].proxy, tracked_before.proxy);
+    assert_eq!(tracked_after[0].chains, tracked_before.chains);
+
+    client.shutdown().await?;
+    upstream.shutdown().await?;
+    drop(client);
+    drop(upstream);
+    let handler_result = tokio::time::timeout(Duration::from_secs(5), handler).await?;
+    handler_result??;
+
+    {
+        let backend = handle.ebpf.read().await;
+        assert!(backend.tcp_conn_state_lookup(&tuples)?.is_none());
+        assert!(backend.redirect_track_lookup(&redirect_key)?.is_some());
+    }
+    assert!(handle.tcp_flow_pins.snapshot().is_empty());
+    assert!(handle.connection_tracker.snapshot().is_empty());
+    assert_eq!(
+        janitor.cleanup_redirect_track_for_test(synthetic_now).await,
+        (1, 1)
+    );
+    assert!(
+        handle
+            .ebpf
+            .read()
+            .await
+            .redirect_track_lookup(&redirect_key)?
+            .is_none()
+    );
+    Ok(())
 }
 
 fn udp_test_config(default_outbound: &str, nodes: Vec<Node>, groups: Vec<Group>) -> Config {
@@ -2843,6 +2987,11 @@ async fn udp_offload_fragmented_client_hello_proxy_domain_is_not_offloaded() {
     );
     assert!(handle.udp_pool.get(client, dst).is_some());
     assert_eq!(handler.dial_count(), 1);
+    assert_eq!(
+        handler.send_count(),
+        2,
+        "every Initial fragment consumed for sniffing must still reach the proxy transport"
+    );
 }
 
 /// The same fragmented ClientHello converging to direct is collected and
@@ -3262,7 +3411,7 @@ async fn udp_offload_pto_cost_measurement() {
     let dropped = timings[1].1;
     eprintln!(
         "drop-and-reinject PTO cost: baseline={baseline:?} drop-first-initial={dropped:?} delta={:?}",
-        dropped - baseline
+        dropped.saturating_sub(baseline)
     );
     assert!(
         dropped < Duration::from_secs(5),

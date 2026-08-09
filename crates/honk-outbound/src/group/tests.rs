@@ -124,6 +124,27 @@ fn test_selector_runtime_choice_overrides_default() {
 }
 
 #[test]
+fn selector_warm_node_keeps_configured_dead_leaf_and_resolves_nested_choice() {
+    let (a, b) = (nid("warm-a"), nid("warm-b"));
+    let nodes = vec![make_node(a, "warm-a"), make_node(b, "warm-b")];
+    let mut child = make_group("warm-child", GroupPolicy::Selector, vec![a, b]);
+    child.default = Some("warm-b".into());
+    let parent = make_subgroup("warm-parent", GroupPolicy::Selector, &["warm-child"]);
+    let alive = Arc::new(AliveDialerSet::new());
+    let manager = GroupManager::with_alive_set(&[child, parent], &nodes, Some(alive.clone()));
+
+    manager.set_selector_choice("warm-child", "warm-a");
+    alive.report_unavailable_forced(a, ProbeDomain::Tcp, IpVersion::V4);
+    assert_eq!(
+        manager
+            .selector_warm_node("warm-parent")
+            .map(|node| node.id),
+        Some(a),
+        "warm ownership follows the configured choice instead of liveness fallback"
+    );
+}
+
+#[test]
 fn test_not_found() {
     let n = make_node(nid("x"), "x");
     let m = GroupManager::new(&[make_group("g", GroupPolicy::Selector, vec![n.id])], &[n]);
@@ -242,6 +263,28 @@ fn test_persist_callback_on_selector_change() {
     m.set_persist_callback(None);
     m.set_selector_choice("g", "a");
     assert_eq!(calls.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn selector_change_callback_fires_only_for_effective_choice_changes() {
+    let node = make_node(nid("warm-callback"), "warm-callback");
+    let manager = GroupManager::new(
+        &[make_group(
+            "warm-callback-group",
+            GroupPolicy::Selector,
+            vec![node.id],
+        )],
+        &[node],
+    );
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let callback_calls = Arc::clone(&calls);
+    manager.set_selector_change_callback(Some(Arc::new(move || {
+        callback_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    })));
+
+    manager.set_selector_choice("warm-callback-group", "warm-callback");
+    manager.set_selector_choice("warm-callback-group", "warm-callback");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
 }
 
 #[test]

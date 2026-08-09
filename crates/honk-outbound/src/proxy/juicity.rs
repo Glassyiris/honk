@@ -1,25 +1,4 @@
 //! Juicity proxy handler (QUIC), implemented against the daeuniverse
-//! reference client (`outbound/protocol/juicity`):
-//!
-//! - QUIC with TLS ALPN `h3` (`dialer/juicity/juicity.go:49-54`).
-//! - Authentication reuses the TUIC frame on a uni stream:
-//!   `[version = 0x00, command = 0x00, uuid(16), token(32)]` with
-//!   `token = TLS ExportKeyingMaterial(label = uuid bytes, context = password,
-//!   len = 32)` (`juice.go`, `client.go:122-157`, `protocol/tuic/
-//!   protocol.go:146-154`). The stream is kept open for the connection
-//!   lifetime; the reference client multiplexes per-underlay UDP auth
-//!   messages on it (not implemented here — that exotic port-0 raw-UDP mode
-//!   is never used by normal proxying).
-//! - TCP: one bi stream per connection, `[network = 0x01][metadata]` followed
-//!   by raw payload (`stream_conn.go:29-36`).
-//! - UDP: one bi stream per session, `[network = 0x03][metadata]` followed by
-//!   frames of `[metadata][len u16][payload]` in both directions
-//!   (`stream_packet_conn.go`, `SealUDP`).
-//! - Metadata (trojanc wire format): type 0x01 = IPv4 (4B + port),
-//!   0x03 = domain (len byte + bytes + port), 0x04 = IPv6 (16B + port)
-//!   (`protocol/trojanc/addr.go:89-111`).
-//! - Keep-alive: QUIC keep-alive every 5s (`dialer.go:58`); there is no
-//!   application-level heartbeat command.
 
 use std::io;
 use std::net::SocketAddr;
@@ -123,6 +102,10 @@ impl crate::runtime::QuicRuntimeClient for JuicityClient {
     async fn force_close(&self) {
         self.quic.force_close().await;
     }
+
+    async fn release_warm(&self) {
+        self.quic.release_cached().await;
+    }
 }
 
 impl JuicityClient {
@@ -219,11 +202,8 @@ impl JuicityHandler {
         &self,
         runtime: &crate::runtime::NodeRuntime,
     ) -> anyhow::Result<Arc<JuicityClient>> {
-        let crate::runtime::ProtocolRuntime::Quic(quic_runtime) = &runtime.runtime else {
-            anyhow::bail!("Juicity runtime is not QUIC-owned");
-        };
-        quic_runtime
-            .client(|| self.build_client(runtime.node.as_ref()))
+        runtime
+            .quic_client(|| self.build_client(runtime.node.as_ref()))
             .await
     }
 
@@ -294,19 +274,15 @@ impl JuicityHandler {
 
 #[async_trait]
 impl WarmableOutbound for JuicityHandler {
-    async fn warm_udp(
+    async fn warm(
         &self,
         runtime: Arc<crate::runtime::NodeRuntime>,
         connect_timeout: Duration,
-    ) -> anyhow::Result<super::UdpWarmStatus> {
+        _requirement: super::WarmRequirement,
+    ) -> anyhow::Result<()> {
         let client = self.client_for_runtime(&runtime).await?;
-        let already_ready = client.quic.has_live_connection().await;
         client.connection(connect_timeout).await?;
-        Ok(if already_ready {
-            super::UdpWarmStatus::AlreadyReady
-        } else {
-            super::UdpWarmStatus::Ready
-        })
+        Ok(())
     }
 }
 
@@ -381,9 +357,12 @@ impl PacketOutbound for JuicityHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<super::PreparedUdpTransport> {
-        self.dial_udp_transport_runtime(runtime, target, target_domain, connect_timeout)
-            .await
-            .map(super::PreparedUdpTransport::ready)
+        let client = self.build_client(runtime.node.as_ref()).await?;
+        super::prepare_detached_quic_transport(runtime, client, |client| async move {
+            self.udp_transport_via_client(client, target, target_domain, connect_timeout)
+                .await
+        })
+        .await
     }
 }
 
@@ -391,20 +370,8 @@ impl PacketOutbound for JuicityHandler {
 impl ProbeableOutbound for JuicityHandler {
     async fn test_connectivity(&self, node: &Node) -> bool {
         match self.build_client(node).await {
-            // Zero auth grace on the dial path (tuic parity): wait ~1 RTT
-            // for the server to close on bad credentials.
             Ok(client) => match client.connection(Duration::from_secs(5)).await {
-                Ok((conn, _)) => {
-                    let wait = (2 * conn.rtt()).max(Duration::from_millis(2));
-                    tokio::select! {
-                        _ = conn.closed() => false,
-                        _ = tokio::time::sleep(wait) => {
-                            // Re-check after the wait (tuic parity): a close
-                            // racing the sleep may not have won the select.
-                            conn.close_reason().is_none()
-                        }
-                    }
-                }
+                Ok((conn, _)) => crate::quic::survives_auth_close_window(&conn).await,
                 Err(_) => false,
             },
             Err(e) => {

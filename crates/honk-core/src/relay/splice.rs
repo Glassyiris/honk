@@ -338,7 +338,7 @@ pub async fn splice_bidirectional(
 /// is moved, and it is latched process-wide so later connections go
 /// straight to the copy path.
 pub async fn relay_splice(
-    client: TcpStream,
+    client: &mut TcpStream,
     upstream: TcpStream,
     client_addr: SocketAddr,
     target_addr: SocketAddr,
@@ -355,9 +355,9 @@ pub async fn relay_splice(
         client_addr, target_addr
     );
 
-    match run(&client, &upstream, progress.clone()).await {
+    match run(client, &upstream, progress.clone()).await {
         Ok((c2p_bytes, p2c_bytes)) => {
-            shutdown_write(&client);
+            shutdown_write(client);
             shutdown_write(&upstream);
             let duration_ms = start.elapsed().as_millis() as u64;
             let stats = RelayStats {
@@ -381,7 +381,7 @@ pub async fn relay_splice(
             relay_tcp_counted(client, upstream, client_addr, target_addr, progress).await
         }
         Err(SpliceError::Io(e)) => {
-            shutdown_write(&client);
+            shutdown_write(client);
             shutdown_write(&upstream);
             if !is_ignorable_connection_error(&e) {
                 warn!(
@@ -398,7 +398,7 @@ pub async fn relay_splice(
 /// side is wrapped in a [`super::ReadCounter`] so byte totals update as data
 /// flows, not only at close.
 async fn relay_tcp_counted(
-    client: TcpStream,
+    client: &mut TcpStream,
     upstream: TcpStream,
     client_addr: SocketAddr,
     target_addr: SocketAddr,
@@ -433,8 +433,8 @@ pub async fn relay_auto<S1, S2>(
     progress: super::RelayProgress,
 ) -> anyhow::Result<RelayStats>
 where
-    S1: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
-    S2: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+    S1: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin,
+    S2: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin,
 {
     match progress {
         Some((up, down)) => {
@@ -739,9 +739,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let front = listener.local_addr().unwrap();
         let relay = tokio::spawn(async move {
-            let (client, client_addr) = listener.accept().await.unwrap();
+            let (mut client, client_addr) = listener.accept().await.unwrap();
             let upstream = TcpStream::connect(echo).await.unwrap();
-            relay_splice(client, upstream, client_addr, echo, None)
+            relay_splice(&mut client, upstream, client_addr, echo, None)
                 .await
                 .unwrap()
         });
@@ -779,9 +779,9 @@ mod tests {
         let down = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (up2, down2) = (up.clone(), down.clone());
         let relay = tokio::spawn(async move {
-            let (client, client_addr) = listener.accept().await.unwrap();
+            let (mut client, client_addr) = listener.accept().await.unwrap();
             let upstream = TcpStream::connect(echo).await.unwrap();
-            relay_splice(client, upstream, client_addr, echo, Some((up2, down2))).await
+            relay_splice(&mut client, upstream, client_addr, echo, Some((up2, down2))).await
         });
 
         let mut client = TcpStream::connect(front).await.unwrap();
@@ -858,9 +858,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let front = listener.local_addr().unwrap();
         let relay = tokio::spawn(async move {
-            let (client, client_addr) = listener.accept().await.unwrap();
+            let (mut client, client_addr) = listener.accept().await.unwrap();
             let upstream = TcpStream::connect(echo).await.unwrap();
-            relay_splice(client, upstream, client_addr, echo, None)
+            relay_splice(&mut client, upstream, client_addr, echo, None)
                 .await
                 .unwrap()
         });
@@ -894,9 +894,9 @@ mod tests {
         let listener2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let front2 = listener2.local_addr().unwrap();
         let relay2 = tokio::spawn(async move {
-            let (client, client_addr) = listener2.accept().await.unwrap();
+            let (mut client, client_addr) = listener2.accept().await.unwrap();
             let upstream = TcpStream::connect(echo).await.unwrap();
-            relay_splice(client, upstream, client_addr, echo, None)
+            relay_splice(&mut client, upstream, client_addr, echo, None)
                 .await
                 .unwrap()
         });
