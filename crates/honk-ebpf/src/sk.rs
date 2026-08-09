@@ -95,22 +95,32 @@ fn probe_result(sk: *mut bpf_sock) -> Option<SkProbe> {
     if sk.is_null() {
         return None;
     }
-    let socket = unsafe { &*sk };
-    let is_wildcard = if socket.family == AF_INET {
-        socket.src_ip4 == 0
-    } else if socket.family == AF_INET6 {
-        socket.src_ip6[0] == 0
-            && socket.src_ip6[1] == 0
-            && socket.src_ip6[2] == 0
-            && socket.src_ip6[3] == 0
+    let family = unsafe { (*sk).family };
+    let is_wildcard = if family == AF_INET {
+        socket_is_v4_wildcard(sk)
+    } else if family == AF_INET6 {
+        socket_is_v6_wildcard(sk)
     } else {
         true
     };
     let probe = SkProbe {
-        state: socket.state,
+        state: unsafe { (*sk).state },
         is_dae_socket: bpf_sock_is_dae_socket(sk as *const _),
         is_wildcard,
     };
     unsafe { bpf_sk_release(sk as *mut c_void) };
     Some(probe)
+}
+
+// Family-specific subprograms keep LLVM from folding these field reads into
+// pointer arithmetic on `bpf_sock`, which the verifier rejects at opt-level 2.
+#[inline(never)]
+fn socket_is_v4_wildcard(sk: *const bpf_sock) -> bool {
+    unsafe { (*sk).src_ip4 == 0 }
+}
+
+#[inline(never)]
+fn socket_is_v6_wildcard(sk: *const bpf_sock) -> bool {
+    let address = unsafe { (*sk).src_ip6 };
+    address[0] == 0 && address[1] == 0 && address[2] == 0 && address[3] == 0
 }
