@@ -3727,6 +3727,7 @@ async fn udp_offload_netns_retransmit_uses_real_kernel_path() {
     struct Cleanup {
         rule: Vec<String>,
         ns_cl: String,
+        forward_rules: Vec<(String, String)>,
         ns_srv: String,
         ip_forward_was: String,
     }
@@ -3735,6 +3736,20 @@ async fn udp_offload_netns_retransmit_uses_real_kernel_path() {
             let _ = std::process::Command::new("iptables")
                 .args(&self.rule)
                 .output();
+            for (input, output) in &self.forward_rules {
+                let _ = std::process::Command::new("iptables")
+                    .args([
+                        "-D",
+                        "FORWARD",
+                        "-i",
+                        input.as_str(),
+                        "-o",
+                        output.as_str(),
+                        "-j",
+                        "ACCEPT",
+                    ])
+                    .output();
+            }
             let _ = std::process::Command::new("ip")
                 .args(["rule", "del", "fwmark", "0x66/0x66", "lookup", "106"])
                 .output();
@@ -3780,8 +3795,13 @@ async fn udp_offload_netns_retransmit_uses_real_kernel_path() {
     .iter()
     .map(|s| s.to_string())
     .collect();
+    let forward_rules = vec![
+        (v_cl_br.clone(), v_srv_br.clone()),
+        (v_srv_br.clone(), v_cl_br.clone()),
+    ];
     let _cleanup = Cleanup {
         rule,
+        forward_rules: forward_rules.clone(),
         ns_cl: ns_cl.clone(),
         ns_srv: ns_srv.clone(),
         ip_forward_was,
@@ -3807,6 +3827,23 @@ async fn udp_offload_netns_retransmit_uses_real_kernel_path() {
     run_cmd("ip", &["link", "set", &v_cl_br, "up"]);
     run_cmd("ip", &["addr", "add", "10.177.1.1/24", "dev", &v_srv_br]);
     run_cmd("ip", &["link", "set", &v_srv_br, "up"]);
+    // GitHub-hosted VMs default FORWARD to DROP. Admit only this test's veth pair.
+    for (input, output) in &forward_rules {
+        run_cmd(
+            "iptables",
+            &[
+                "-I",
+                "FORWARD",
+                "1",
+                "-i",
+                input.as_str(),
+                "-o",
+                output.as_str(),
+                "-j",
+                "ACCEPT",
+            ],
+        );
+    }
     for (ns, dev, ip_addr, gw) in [
         (&ns_cl, &v_cl, "10.177.0.2/24", "10.177.0.1"),
         (&ns_srv, &v_srv, "10.177.1.2/24", "10.177.1.1"),
