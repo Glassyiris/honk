@@ -40,8 +40,9 @@ These checkboxes indicate maintainer review status, not feature availability:
 
 - [x] eBPF routing, maps, and semantics
 - [x] Control plane
-- [x] AnyTLS / Trojan / Shadowsocks (including 2022) / SOCKS5
+- [x] AnyTLS / Shadowsocks (including 2022) / SOCKS5
 - [ ] RPRX (VLESS / XTLS / XHTTP / WSS / REALITY)
+- [ ] Trojan-GFW (needs UoT implementation)
 - [x] DNS logic
 - [ ] Configuration parser (dae extensions)
 - [ ] Reload logic

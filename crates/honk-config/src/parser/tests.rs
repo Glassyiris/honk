@@ -1254,6 +1254,29 @@ fn test_parse_dns_zero_max_cache_size_is_preserved_for_runtime_clamp() {
 }
 
 #[test]
+fn use_host_defaults_off_and_parses_dae_boolean_forms() {
+    assert!(!parse_dae_config("dns {}").unwrap().dns.use_host);
+    assert!(
+        parse_dae_config("dns {\n    use_host: true\n}")
+            .unwrap()
+            .dns
+            .use_host
+    );
+    assert!(
+        parse_dae_config("dns {\n    use_host: on\n}")
+            .unwrap()
+            .dns
+            .use_host
+    );
+    assert!(
+        !parse_dae_config("dns {\n    use_host: false\n}")
+            .unwrap()
+            .dns
+            .use_host
+    );
+}
+
+#[test]
 fn udp_warm_node_count_defaults_to_strictly_disabled() {
     assert_eq!(crate::Config::default().global.udp_warm_node_count, 0);
     assert_eq!(

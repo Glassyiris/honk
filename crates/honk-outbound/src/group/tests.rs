@@ -908,6 +908,14 @@ fn test_urltest_tcp_udp_separate_selections() {
         m.get_urltest_selection_for_network("g", SelectionNetwork::Udp),
         Some("b".into())
     );
+    assert_eq!(
+        m.selection_chain_for_network("g", SelectionNetwork::Tcp),
+        vec!["g", "a"]
+    );
+    assert_eq!(
+        m.selection_chain_for_network("g", SelectionNetwork::Udp),
+        vec!["g", "b"]
+    );
 }
 
 #[test]

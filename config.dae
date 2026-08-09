@@ -41,6 +41,7 @@ dns {
     # 保持注释可避免与现有 dnsmasq/AdGuardHome 抢占；透明 :53 仍生效
     # bind: 'tcp+udp://:1053'
     ipversion_prefer: 4
+    # use_host: true  # SIGHUP 后重新加载 /etc/hosts
     upstream {
         homedns: 'udp+tcp://10.10.10.1:53'
     }

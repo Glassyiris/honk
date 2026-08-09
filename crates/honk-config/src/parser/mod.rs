@@ -868,6 +868,9 @@ fn parse_dns_section(section: &Section) -> Result<DnsConfig, crate::ConfigError>
         cfg.bind_endpoint()
             .map_err(|error| crate::ConfigError::Parse(error.to_string()))?;
     }
+    if let Some(v) = kv.get("use_host") {
+        cfg.use_host = parse_bool(v);
+    }
 
     if let Some(v) = kv.get("ipversion_prefer") {
         cfg.strategy = parse_ip_prefer(v);

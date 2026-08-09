@@ -332,6 +332,7 @@ impl QueuedDatagram {
 
 enum DatagramPayload<'a> {
     Borrowed(&'a [u8]),
+    #[cfg(any(feature = "ebpf", test))]
     Owned(Bytes),
 }
 
@@ -339,6 +340,7 @@ impl DatagramPayload<'_> {
     fn len(&self) -> usize {
         match self {
             Self::Borrowed(data) => data.len(),
+            #[cfg(any(feature = "ebpf", test))]
             Self::Owned(data) => data.len(),
         }
     }
@@ -346,6 +348,7 @@ impl DatagramPayload<'_> {
     fn into_bytes(self) -> Bytes {
         match self {
             Self::Borrowed(data) => Bytes::copy_from_slice(data),
+            #[cfg(any(feature = "ebpf", test))]
             Self::Owned(data) => data,
         }
     }

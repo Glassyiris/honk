@@ -60,6 +60,12 @@ pub(crate) struct PreparedQuery {
     plan: RequestPlan,
 }
 
+pub(crate) struct ParsedQuery {
+    query: QueryContext,
+    domain: Arc<str>,
+    qtype: u16,
+}
+
 pub(crate) struct AnalyzedResponse {
     pub wire: Vec<u8>,
     pub class: ResponseClass,
@@ -97,31 +103,21 @@ impl DnsEngine {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare(
         &self,
         raw_query: &[u8],
         original_dst: Option<SocketAddr>,
         ingress: IngressProfile,
     ) -> Result<PreparedQuery, EngineError> {
-        self.prepare_with_mode(raw_query, original_dst, ingress, false)
+        let parsed = Self::parse_query(raw_query, ingress)?;
+        self.prepare_parsed(parsed, original_dst, false)
     }
 
-    pub(crate) fn prepare_compatibility(
-        &self,
+    pub(crate) fn parse_query(
         raw_query: &[u8],
-        original_dst: Option<SocketAddr>,
         ingress: IngressProfile,
-    ) -> Result<PreparedQuery, EngineError> {
-        self.prepare_with_mode(raw_query, original_dst, ingress, true)
-    }
-
-    fn prepare_with_mode(
-        &self,
-        raw_query: &[u8],
-        original_dst: Option<SocketAddr>,
-        ingress: IngressProfile,
-        compatibility: bool,
-    ) -> Result<PreparedQuery, EngineError> {
+    ) -> Result<ParsedQuery, EngineError> {
         let query = QueryContext::parse_with_profile(raw_query, ingress)?;
         if query.questions().len() > 1 {
             return Err(EngineError::MultipleQuestions);
@@ -133,6 +129,24 @@ impl DnsEngine {
             .ok_or(EngineError::MalformedCanonicalName)?
             .into();
         let qtype = query.qtype().ok_or(EngineError::MissingQuestion)?.get();
+        Ok(ParsedQuery {
+            query,
+            domain,
+            qtype,
+        })
+    }
+
+    pub(crate) fn prepare_parsed(
+        &self,
+        parsed: ParsedQuery,
+        original_dst: Option<SocketAddr>,
+        compatibility: bool,
+    ) -> Result<PreparedQuery, EngineError> {
+        let ParsedQuery {
+            query,
+            domain,
+            qtype,
+        } = parsed;
         let context = RequestContext {
             domain: &domain,
             qtype,
@@ -219,6 +233,24 @@ impl DnsEngine {
 
     pub(crate) const fn policy_id(&self) -> Option<&PolicyId> {
         self.policy_id.as_ref()
+    }
+}
+
+impl ParsedQuery {
+    pub(crate) const fn query(&self) -> &QueryContext {
+        &self.query
+    }
+
+    pub(crate) fn domain(&self) -> &str {
+        &self.domain
+    }
+
+    pub(crate) fn domain_arc(&self) -> Arc<str> {
+        Arc::clone(&self.domain)
+    }
+
+    pub(crate) const fn qtype(&self) -> u16 {
+        self.qtype
     }
 }
 

@@ -337,6 +337,7 @@ dns {
     # 未设置 bind 时不启动独立监听。
     # bind: 'tcp+udp://:1053'
     ipversion_prefer: 4
+    use_host: true
     optimistic_cache: true        # 缓存开关
     # 正缓存固定 TTL（覆盖应答 min TTL，并改写 wire RR TTL）。0 = 沿用上游应答 TTL。
     optimistic_cache_ttl: 600
@@ -368,6 +369,13 @@ dns {
     }
 }
 ```
+
+`use_host` 默认为 `false`。启用后，honk 会在构建每个 DNS runtime generation 时
+加载 `/etc/hosts`。IN class 的 A/AAAA 查询命中后，会先于 request routing、缓存查询
+和上游交换直接应答；名称存在但缺少所请求的地址族时返回 NOERROR/NODATA，其他查询
+类型继续走原有管线。查询热路径只读不可变快照，SIGHUP 会重新加载；文件不可读会令
+启动失败，或令新的 reload generation 构建失败并保留旧 generation。合成记录的 TTL
+为 60 秒，且不写入 honk DNS 缓存。
 
 上游 URI 协议前缀：`udp://`、`tcp://`、`tcp+udp://`、`tls://`、`https://`、`h3://`、`quic://`；无前缀按 UDP 处理。
 
