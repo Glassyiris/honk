@@ -14,11 +14,17 @@ pub async fn exchange_length_prefixed<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    write_length_prefixed(stream, raw_query).await?;
-    read_length_prefixed(stream, query_timeout).await
+    timeout(query_timeout, async {
+        write_length_prefixed(stream, raw_query).await?;
+        let mut response = Vec::new();
+        read_length_prefixed_into(stream, &mut response, None).await?;
+        Ok::<_, anyhow::Error>(response)
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("DNS stream exchange timed out after {query_timeout:?}"))?
 }
 
-pub(super) async fn write_length_prefixed<S>(stream: &mut S, raw_query: &[u8]) -> anyhow::Result<()>
+pub(crate) async fn write_length_prefixed<S>(stream: &mut S, raw_query: &[u8]) -> anyhow::Result<()>
 where
     S: AsyncWrite + Unpin,
 {
@@ -37,19 +43,63 @@ pub(super) async fn read_length_prefixed<S>(
 where
     S: AsyncRead + Unpin,
 {
+    let mut buffer = Vec::new();
+    read_length_prefixed_into(stream, &mut buffer, Some(query_timeout)).await?;
+    Ok(buffer)
+}
+
+/// Read one RFC 7766 frame into reusable storage.
+///
+/// Upstream callers pass a timeout, which is applied independently to the
+/// length and body stages. Server-side callers pass `None` to retain their
+/// existing connection-lifetime behavior without an idle timeout.
+pub(crate) async fn read_length_prefixed_into<S>(
+    stream: &mut S,
+    buffer: &mut Vec<u8>,
+    query_timeout: Option<Duration>,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + Unpin,
+{
     let mut len_buf = [0u8; 2];
-    timeout(query_timeout, stream.read_exact(&mut len_buf))
-        .await
-        .map_err(|_| anyhow::anyhow!("DNS stream read length timed out"))??;
-    let resp_len = u16::from_be_bytes(len_buf) as usize;
-    if resp_len == 0 || resp_len > 65535 {
-        anyhow::bail!("invalid DNS stream response length {resp_len}");
+    read_exact_stage(
+        stream,
+        &mut len_buf,
+        query_timeout,
+        "DNS stream read length timed out",
+    )
+    .await?;
+    let message_len = usize::from(u16::from_be_bytes(len_buf));
+    if message_len == 0 {
+        anyhow::bail!("invalid DNS stream message length {message_len}");
     }
-    let mut buf = vec![0u8; resp_len];
-    timeout(query_timeout, stream.read_exact(&mut buf))
-        .await
-        .map_err(|_| anyhow::anyhow!("DNS stream read body timed out"))??;
-    Ok(buf)
+    buffer.resize(message_len, 0);
+    read_exact_stage(
+        stream,
+        buffer,
+        query_timeout,
+        "DNS stream read body timed out",
+    )
+    .await
+}
+
+async fn read_exact_stage<S>(
+    stream: &mut S,
+    buffer: &mut [u8],
+    stage_timeout: Option<Duration>,
+    timeout_message: &'static str,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + Unpin,
+{
+    if let Some(duration) = stage_timeout {
+        timeout(duration, stream.read_exact(buffer))
+            .await
+            .map_err(|_| anyhow::anyhow!(timeout_message))??;
+    } else {
+        stream.read_exact(buffer).await?;
+    }
+    Ok(())
 }
 
 /// Force DNS message ID to 0 (DoH/DoQ cache-friendly / RFC 9250 §4.2.1).
@@ -124,5 +174,68 @@ mod tests {
             .unwrap();
         assert_eq!(got, response);
         server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exchange_deadline_covers_a_stalled_request_write() {
+        use tokio::io::duplex;
+
+        let (mut client, _server) = duplex(1);
+        let error = exchange_length_prefixed(&mut client, &[0; 512], Duration::from_millis(20))
+            .await
+            .expect_err("stalled request write must expire");
+
+        assert!(error.to_string().contains("exchange timed out"));
+    }
+
+    #[tokio::test]
+    async fn exchange_deadline_is_shared_across_response_stages() {
+        use tokio::io::duplex;
+
+        let (mut client, mut server) = duplex(4096);
+        let server_task = tokio::spawn(async move {
+            let mut request = [0_u8; 14];
+            server.read_exact(&mut request).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            server.write_all(&2_u16.to_be_bytes()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let _ = server.write_all(&[0, 0]).await;
+        });
+
+        let error = exchange_length_prefixed(&mut client, &[0; 12], Duration::from_millis(60))
+            .await
+            .expect_err("staged slow response must exceed one deadline");
+
+        assert!(error.to_string().contains("exchange timed out"));
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_into_reuses_capacity_across_frames() {
+        use tokio::io::duplex;
+
+        let (mut reader, mut writer) = duplex(4096);
+        let first = vec![0x11; 512];
+        let second = vec![0x22; 12];
+        let expected_first = first.clone();
+        let expected_second = second.clone();
+        let writer_task = tokio::spawn(async move {
+            write_length_prefixed(&mut writer, &first).await.unwrap();
+            write_length_prefixed(&mut writer, &second).await.unwrap();
+        });
+
+        let mut buffer = Vec::new();
+        read_length_prefixed_into(&mut reader, &mut buffer, None)
+            .await
+            .unwrap();
+        assert_eq!(buffer, expected_first);
+        let first_capacity = buffer.capacity();
+
+        read_length_prefixed_into(&mut reader, &mut buffer, None)
+            .await
+            .unwrap();
+        assert_eq!(buffer, expected_second);
+        assert_eq!(buffer.capacity(), first_capacity);
+        writer_task.await.unwrap();
     }
 }

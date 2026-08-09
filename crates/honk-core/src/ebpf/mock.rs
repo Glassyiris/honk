@@ -6,7 +6,11 @@
 
 #[cfg(test)]
 use super::ProjectionMapOperation;
-use super::{EbpfBackend, LpmKeepSet, RoutingPushPhase};
+use super::{
+    EbpfBackend, LpmKeepSet, RoutingPushPhase, UdpDecisionCommitResult, UdpDecisionTransition,
+    apply_udp_decision_transition, udp_state_is_legacy_userspace_owned,
+    udp_state_is_userspace_owned, validate_udp_decision_transition,
+};
 use async_trait::async_trait;
 use honk_ebpf_common::*;
 use std::collections::HashMap;
@@ -164,7 +168,7 @@ pub struct MockEbpfBackend {
     ///
     /// Behind a Mutex because `routing_handoff_take` takes `&self` (the
     /// per-connection hot path holds only a read lock on the backend).
-    pub routing_handoffs: std::sync::Mutex<HashMap<[u8; 40], RoutingHandoffEntry>>,
+    pub routing_handoffs: parking_lot::Mutex<HashMap<[u8; 40], RoutingHandoffEntry>>,
     /// Cookie PID map (cookie → PIDName)
     pub cookie_pids: HashMap<u64, PIDName>,
     /// Outbound alive bitmap: (outbound*6 + domain*2 + ipver) → 0|1
@@ -184,6 +188,9 @@ pub struct MockEbpfBackend {
     pub dynamic_forget_calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub routing_meta_write_order: Vec<u32>,
     pub routing_publication_order: Vec<MockRoutingPublicationWrite>,
+    /// Persistent allocator state; cleanup intentionally leaves this intact.
+    pub udp_decision_sequence_next: u32,
+    pub udp_decision_sequence_exhausted: bool,
     routing_fault: Option<(RoutingPushPhase, usize)>,
     #[cfg(test)]
     projection_fault: Option<(ProjectionMapOperation, usize, bool)>,
@@ -197,6 +204,80 @@ impl MockEbpfBackend {
     /// Create a new mock backend.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_staged_udp_flow(&mut self, key: &TuplesKey, state: ConnState) {
+        let token = state.decision_token;
+        assert_ne!(token, 0);
+        assert_eq!(state.state, UdpDecisionState::Pending as u8);
+        self.udp_conn_state_store(key, &state).unwrap();
+        self.routing_handoffs.lock().insert(
+            Self::tuples_key_bytes(key),
+            RoutingHandoffEntry {
+                result: RoutingResult {
+                    decision_token: token,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        self.redirect_track_store(
+            &RedirectTuple::from_tuples(key),
+            &RedirectEntry {
+                decision_token: token,
+                outbound: OutboundIndex::UserBase as u8,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+
+    fn remove_token_bound_udp_flow(
+        &mut self,
+        key: &TuplesKey,
+        token: u32,
+        pending_only: bool,
+    ) -> anyhow::Result<UdpDecisionCommitResult> {
+        if token == 0 && !pending_only {
+            return Ok(UdpDecisionCommitResult::TokenMismatch);
+        }
+        let key_bytes = Self::tuples_key_bytes(key);
+        let Some(state) = self.udp_conn_states.get(&key_bytes).copied() else {
+            return Ok(UdpDecisionCommitResult::Missing);
+        };
+        if state.decision_token != token {
+            return Ok(UdpDecisionCommitResult::TokenMismatch);
+        }
+        let state_allowed = if pending_only {
+            state.state == UdpDecisionState::Preparing as u8
+                || state.state == UdpDecisionState::Pending as u8
+        } else {
+            udp_state_is_userspace_owned(state.state)
+        };
+        if !state_allowed {
+            return Ok(UdpDecisionCommitResult::StateMismatch);
+        }
+        let handoff = self.routing_handoffs.lock().get(&key_bytes).copied();
+        if handoff.is_some_and(|entry| entry.result.decision_token != token) {
+            return Ok(UdpDecisionCommitResult::TokenMismatch);
+        }
+        let track_key = Self::redirect_tuple_bytes(&RedirectTuple::from_tuples(key));
+        if self
+            .redirect_tracks
+            .get(&track_key)
+            .is_some_and(|entry| entry.decision_token != token)
+        {
+            return Ok(UdpDecisionCommitResult::TokenMismatch);
+        }
+        if handoff.is_some() {
+            self.routing_handoffs.lock().remove(&key_bytes);
+        }
+        self.redirect_tracks.remove(&track_key);
+        if self.udp_conn_states.remove(&key_bytes).is_some() {
+            super::USERSPACE_CONN_STATE_DELETES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(UdpDecisionCommitResult::Applied)
     }
 
     pub fn fail_next_routing_phase(&mut self, phase: RoutingPushPhase) {
@@ -529,6 +610,29 @@ impl EbpfBackend for MockEbpfBackend {
         Ok(())
     }
 
+    fn quiesce_udp_staging(&mut self) -> anyhow::Result<()> {
+        let staged = self
+            .udp_conn_states
+            .iter()
+            .filter_map(|(key, state)| {
+                (state.state == UdpDecisionState::Preparing as u8
+                    || state.state == UdpDecisionState::Pending as u8)
+                    .then_some((Self::bytes_to_tuples_key(key), state.decision_token))
+            })
+            .collect::<Vec<_>>();
+        for (key, token) in staged {
+            let result = self.remove_token_bound_udp_flow(&key, token, true)?;
+            anyhow::ensure!(
+                matches!(
+                    result,
+                    UdpDecisionCommitResult::Applied | UdpDecisionCommitResult::Missing
+                ),
+                "mock UDP staging quiescence rejected {token}: {result:?}"
+            );
+        }
+        Ok(())
+    }
+
     fn set_param(&mut self, key: ParamKey, value: u32) -> anyhow::Result<()> {
         self.params.insert(key as u32, value);
         Ok(())
@@ -789,6 +893,114 @@ impl EbpfBackend for MockEbpfBackend {
         Ok(())
     }
 
+    fn commit_udp_decision(
+        &mut self,
+        key: &TuplesKey,
+        token: u32,
+        transition: UdpDecisionTransition,
+    ) -> anyhow::Result<UdpDecisionCommitResult> {
+        validate_udp_decision_transition(transition)?;
+        if token == 0 {
+            return Ok(UdpDecisionCommitResult::TokenMismatch);
+        }
+        let key_bytes = Self::tuples_key_bytes(key);
+        let Some(mut state) = self.udp_conn_states.get(&key_bytes).copied() else {
+            return Ok(UdpDecisionCommitResult::Missing);
+        };
+        if state.decision_token != token {
+            return Ok(UdpDecisionCommitResult::TokenMismatch);
+        }
+        if let Err(result) = apply_udp_decision_transition(&mut state, transition) {
+            return Ok(result);
+        }
+        let handoff = self.routing_handoffs.lock().get(&key_bytes).copied();
+        if handoff.is_some_and(|entry| entry.result.decision_token != token) {
+            return Ok(UdpDecisionCommitResult::TokenMismatch);
+        }
+        let track_key = Self::redirect_tuple_bytes(&RedirectTuple::from_tuples(key));
+        let track = self.redirect_tracks.get(&track_key).copied();
+        if track.is_some_and(|entry| entry.decision_token != token) {
+            return Ok(UdpDecisionCommitResult::TokenMismatch);
+        }
+        let initial_transition = !matches!(transition, UdpDecisionTransition::ActivateDirect(_));
+        if initial_transition && (handoff.is_none() || track.is_none()) {
+            return Ok(UdpDecisionCommitResult::Missing);
+        }
+
+        if handoff.is_some() {
+            self.routing_handoffs.lock().remove(&key_bytes);
+        }
+        match transition {
+            UdpDecisionTransition::ActivateProxy(outbound, _) => {
+                let mut track = track.expect("proxy track checked above");
+                track.outbound = outbound;
+                self.redirect_tracks.insert(track_key, track);
+            }
+            UdpDecisionTransition::ArmDirect(_)
+            | UdpDecisionTransition::ActivateDirect(_)
+            | UdpDecisionTransition::Block => {
+                self.redirect_tracks.remove(&track_key);
+            }
+        }
+        self.udp_conn_states.insert(key_bytes, state);
+        Ok(UdpDecisionCommitResult::Applied)
+    }
+
+    fn abort_pending_udp_flow(
+        &mut self,
+        key: &TuplesKey,
+        token: u32,
+    ) -> anyhow::Result<UdpDecisionCommitResult> {
+        self.remove_token_bound_udp_flow(key, token, true)
+    }
+
+    fn remove_udp_flow(
+        &mut self,
+        key: &TuplesKey,
+        token: u32,
+    ) -> anyhow::Result<UdpDecisionCommitResult> {
+        if token != 0 {
+            return self.remove_token_bound_udp_flow(key, token, false);
+        }
+        let key_bytes = Self::tuples_key_bytes(key);
+        let Some(state) = self.udp_conn_states.get(&key_bytes).copied() else {
+            return Ok(UdpDecisionCommitResult::Missing);
+        };
+        if !udp_state_is_legacy_userspace_owned(&state) {
+            return Ok(UdpDecisionCommitResult::StateMismatch);
+        }
+        if self.udp_conn_states.remove(&key_bytes).is_some() {
+            super::USERSPACE_CONN_STATE_DELETES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(UdpDecisionCommitResult::Applied)
+        } else {
+            Ok(UdpDecisionCommitResult::Missing)
+        }
+    }
+
+    fn verify_udp_decision_sequence(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.udp_decision_sequence_next <= NFQUEUE_TOKEN_MASK,
+            "UDP decision sequence next token exceeds reserved token space"
+        );
+        Ok(())
+    }
+
+    fn udp_decision_sequence_exhausted(&self) -> anyhow::Result<bool> {
+        self.verify_udp_decision_sequence()?;
+        Ok(self.udp_decision_sequence_exhausted)
+    }
+
+    fn routing_handoff_lookup(
+        &self,
+        key: &TuplesKey,
+    ) -> anyhow::Result<Option<RoutingHandoffEntry>> {
+        Ok(self
+            .routing_handoffs
+            .lock()
+            .get(&Self::tuples_key_bytes(key))
+            .copied())
+    }
+
     fn redirect_track_lookup(&self, key: &RedirectTuple) -> anyhow::Result<Option<RedirectEntry>> {
         Ok(self
             .redirect_tracks
@@ -816,7 +1028,6 @@ impl EbpfBackend for MockEbpfBackend {
         Ok(self
             .routing_handoffs
             .lock()
-            .unwrap()
             .remove(&Self::tuples_key_bytes(key)))
     }
 
@@ -949,7 +1160,7 @@ impl EbpfBackend for MockEbpfBackend {
         &self,
         out: &mut Vec<(TuplesKey, RoutingHandoffEntry)>,
     ) -> anyhow::Result<()> {
-        for (kb, entry) in self.routing_handoffs.lock().unwrap().iter() {
+        for (kb, entry) in self.routing_handoffs.lock().iter() {
             out.push((Self::bytes_to_tuples_key(kb), *entry));
         }
         Ok(())
@@ -961,7 +1172,7 @@ impl EbpfBackend for MockEbpfBackend {
         visit: &mut super::RoutingHandoffChunkVisitor<'_>,
     ) -> anyhow::Result<()> {
         let mut chunk = Vec::with_capacity(chunk_size.max(1));
-        for (key, entry) in self.routing_handoffs.lock().unwrap().iter() {
+        for (key, entry) in self.routing_handoffs.lock().iter() {
             chunk.push((Self::bytes_to_tuples_key(key), *entry));
             if chunk.len() == chunk_size.max(1) {
                 if !visit(&chunk) {
@@ -1012,7 +1223,7 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     fn routing_handoff_remove_batch(&mut self, keys: &[TuplesKey]) -> anyhow::Result<()> {
-        let handoffs = self.routing_handoffs.get_mut().unwrap();
+        let handoffs = self.routing_handoffs.get_mut();
         for key in keys {
             handoffs.remove(&Self::tuples_key_bytes(key));
         }
@@ -1034,6 +1245,7 @@ impl EbpfBackend for MockEbpfBackend {
             let raw = Self::tuples_key_bytes(key);
             if map.get(&raw).is_some_and(|current| {
                 current.last_seen_ns == scanned.last_seen_ns
+                    && current.state == scanned.state
                     && current.last_seen_ns <= expired_before_ns
             }) {
                 map.remove(&raw);
@@ -1086,7 +1298,7 @@ impl EbpfBackend for MockEbpfBackend {
         expired_before_ns: u64,
     ) -> anyhow::Result<u64> {
         let mut removed = 0;
-        let handoffs = self.routing_handoffs.get_mut().unwrap();
+        let handoffs = self.routing_handoffs.get_mut();
         for (key, scanned) in entries {
             let raw = Self::tuples_key_bytes(key);
             if handoffs.get(&raw).is_some_and(|current| {
@@ -1139,7 +1351,7 @@ impl EbpfBackend for MockEbpfBackend {
         self.tcp_conn_states.clear();
         self.udp_conn_states.clear();
         self.redirect_tracks.clear();
-        self.routing_handoffs.get_mut().unwrap().clear();
+        self.routing_handoffs.get_mut().clear();
         self.cookie_pids.clear();
         self.outbound_alive.clear();
         self.bpf_stats.clear();
@@ -1230,7 +1442,36 @@ fn parse_ipv4(s: &str) -> anyhow::Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use honk_ebpf_common::conn::TcpState;
     use honk_ebpf_common::dae_ip::In6Addr;
+
+    #[test]
+    fn conn_state_conditional_delete_rejects_state_change() {
+        let mut backend = MockEbpfBackend::new();
+        let mut key: TuplesKey = unsafe { std::mem::zeroed() };
+        key.l4proto = 6;
+        let scanned = ConnState {
+            state: TcpState::TcpStateActive as u8,
+            last_seen_ns: 1,
+            ..Default::default()
+        };
+        let current = ConnState {
+            state: TcpState::TcpStateClosing as u8,
+            ..scanned
+        };
+        backend.tcp_conn_state_store(&key, &current).unwrap();
+
+        assert_eq!(
+            backend
+                .conn_state_remove_if_unchanged(&[(key, scanned)], 10)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            backend.tcp_conn_state_lookup(&key).unwrap().unwrap().state,
+            current.state
+        );
+    }
 
     #[test]
     fn test_mock_params() {
@@ -1293,7 +1534,7 @@ mod tests {
         assert_eq!(backend.conn_track_lookup(&tuple).unwrap(), None);
     }
 
-    fn offload_test_key() -> TuplesKey {
+    fn decision_test_key() -> TuplesKey {
         let mut key: TuplesKey = unsafe { std::mem::zeroed() };
         key.dst_ip[15] = 1;
         key.src_ip[15] = 2;
@@ -1303,88 +1544,267 @@ mod tests {
         key
     }
 
-    /// Mirror of the kernel's `build_routing_meta` bit encoding.
-    fn offload_test_meta_raw(outbound: u8, mark: u32, must: u8, dscp: u8) -> u64 {
-        (outbound as u64)
-            | ((mark as u64) << 8)
-            | ((must as u64) << 40)
-            | ((dscp as u64) << 48)
-            | ROUTING_META_FLAG_PUBLISHED
+    fn decision_test_meta(outbound: u8, mark: u32, dscp: u8) -> RoutingMeta {
+        RoutingMeta {
+            raw: outbound as u64
+                | ((mark as u64) << 8)
+                | (1 << 40)
+                | ((dscp as u64) << 48)
+                | ROUTING_META_FLAG_PUBLISHED,
+        }
     }
 
-    fn offload_test_state(raw: u64) -> ConnState {
-        ConnState {
-            last_seen_ns: 1,
-            meta: RoutingMeta { raw },
-            ..Default::default()
+    fn seed_staged_flow(backend: &mut MockEbpfBackend, key: &TuplesKey, token: u32) {
+        backend.seed_staged_udp_flow(
+            key,
+            ConnState {
+                state: UdpDecisionState::Pending as u8,
+                decision_token: token,
+                last_seen_ns: 1,
+                meta: decision_test_meta(OutboundIndex::UserBase as u8, TPROXY_MARK, 5),
+                pid: 99,
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    fn udp_direct_transition_is_two_phase_and_preserves_metadata() {
+        let mut backend = MockEbpfBackend::new();
+        let key = decision_test_key();
+        seed_staged_flow(&mut backend, &key, 7);
+
+        assert_eq!(
+            backend
+                .commit_udp_decision(&key, 7, UdpDecisionTransition::ArmDirect(0x1234))
+                .unwrap(),
+            UdpDecisionCommitResult::Applied
+        );
+        let armed = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
+        let armed_raw = unsafe { armed.meta.raw };
+        assert_eq!(armed.state, UdpDecisionState::DirectArmed as u8);
+        assert_eq!(armed.decision_token, 7);
+        assert_eq!(armed.pid, 99);
+        assert_eq!(armed_raw & 0xff, OutboundIndex::Direct as u64);
+        assert_eq!((armed_raw >> 8) & 0xffff_ffff, 0x1234);
+        assert_eq!((armed_raw >> 48) & 0xff, 5);
+        assert_eq!(armed_raw & ROUTING_META_FLAG_OFFLOAD, 0);
+        assert!(backend.routing_handoff_lookup(&key).unwrap().is_none());
+        assert!(
+            backend
+                .redirect_track_lookup(&RedirectTuple::from_tuples(&key))
+                .unwrap()
+                .is_none()
+        );
+
+        assert_eq!(
+            backend
+                .commit_udp_decision(&key, 7, UdpDecisionTransition::ActivateDirect(0x5678))
+                .unwrap(),
+            UdpDecisionCommitResult::StateMismatch
+        );
+        assert_eq!(
+            backend
+                .commit_udp_decision(&key, 7, UdpDecisionTransition::ActivateDirect(0x1234))
+                .unwrap(),
+            UdpDecisionCommitResult::Applied
+        );
+        let active = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
+        let active_raw = unsafe { active.meta.raw };
+        assert_eq!(active.state, UdpDecisionState::None as u8);
+        assert_eq!((active_raw >> 8) & 0xffff_ffff, 0x1234);
+        assert_ne!(active_raw & ROUTING_META_FLAG_OFFLOAD, 0);
+        assert_eq!(
+            backend
+                .commit_udp_decision(&key, 7, UdpDecisionTransition::ActivateDirect(0x1234))
+                .unwrap(),
+            UdpDecisionCommitResult::StateMismatch
+        );
+    }
+
+    #[test]
+    fn udp_proxy_transition_rewrites_exact_track() {
+        let mut backend = MockEbpfBackend::new();
+        let key = decision_test_key();
+        seed_staged_flow(&mut backend, &key, 11);
+        assert_eq!(
+            backend
+                .commit_udp_decision(
+                    &key,
+                    11,
+                    UdpDecisionTransition::ActivateProxy(OutboundIndex::UserBase as u8 + 2, 42),
+                )
+                .unwrap(),
+            UdpDecisionCommitResult::Applied
+        );
+        let state = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
+        let raw = unsafe { state.meta.raw };
+        assert_eq!(state.state, UdpDecisionState::Proxy as u8);
+        assert_eq!(raw & 0xff, (OutboundIndex::UserBase as u8 + 2) as u64);
+        assert_eq!((raw >> 8) & 0xffff_ffff, 42);
+        assert_eq!((raw >> 48) & 0xff, 5);
+        let track = backend
+            .redirect_track_lookup(&RedirectTuple::from_tuples(&key))
+            .unwrap()
+            .unwrap();
+        assert_eq!(track.decision_token, 11);
+        assert_eq!(track.outbound, OutboundIndex::UserBase as u8 + 2);
+        assert!(backend.routing_handoff_lookup(&key).unwrap().is_none());
+        assert_eq!(
+            backend.remove_udp_flow(&key, 11).unwrap(),
+            UdpDecisionCommitResult::Applied
+        );
+        assert!(backend.udp_conn_state_lookup(&key).unwrap().is_none());
+        assert!(
+            backend
+                .redirect_track_lookup(&RedirectTuple::from_tuples(&key))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn udp_transition_distinguishes_missing_token_and_state_mismatches() {
+        let mut backend = MockEbpfBackend::new();
+        let key = decision_test_key();
+        assert_eq!(
+            backend
+                .commit_udp_decision(&key, 1, UdpDecisionTransition::Block)
+                .unwrap(),
+            UdpDecisionCommitResult::Missing
+        );
+        seed_staged_flow(&mut backend, &key, 17);
+        assert_eq!(
+            backend
+                .commit_udp_decision(&key, 18, UdpDecisionTransition::Block)
+                .unwrap(),
+            UdpDecisionCommitResult::TokenMismatch
+        );
+        let mut newer = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
+        newer.state = UdpDecisionState::Proxy as u8;
+        backend.udp_conn_state_store(&key, &newer).unwrap();
+        assert_eq!(
+            backend
+                .commit_udp_decision(&key, 17, UdpDecisionTransition::Block)
+                .unwrap(),
+            UdpDecisionCommitResult::StateMismatch
+        );
+        assert!(backend.routing_handoff_lookup(&key).unwrap().is_some());
+    }
+
+    #[test]
+    fn stale_auxiliary_token_never_mutates_newer_incarnation() {
+        let mut backend = MockEbpfBackend::new();
+        let key = decision_test_key();
+        seed_staged_flow(&mut backend, &key, 21);
+        backend
+            .routing_handoffs
+            .lock()
+            .get_mut(&MockEbpfBackend::tuples_key_bytes(&key))
+            .unwrap()
+            .result
+            .decision_token = 22;
+        assert_eq!(
+            backend.abort_pending_udp_flow(&key, 21).unwrap(),
+            UdpDecisionCommitResult::TokenMismatch
+        );
+        assert_eq!(
+            backend
+                .udp_conn_state_lookup(&key)
+                .unwrap()
+                .unwrap()
+                .decision_token,
+            21
+        );
+        assert_eq!(
+            backend
+                .routing_handoff_lookup(&key)
+                .unwrap()
+                .unwrap()
+                .result
+                .decision_token,
+            22
+        );
+    }
+
+    #[test]
+    fn legacy_removal_deletes_only_non_offloaded_forward_state() {
+        let mut backend = MockEbpfBackend::new();
+        let key = decision_test_key();
+        backend
+            .udp_conn_state_store(
+                &key,
+                &ConnState {
+                    state: UdpDecisionState::None as u8,
+                    meta: RoutingMeta {
+                        raw: OutboundIndex::UserBase as u64 | ROUTING_META_FLAG_PUBLISHED,
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        backend.routing_handoffs.lock().insert(
+            MockEbpfBackend::tuples_key_bytes(&key),
+            RoutingHandoffEntry::default(),
+        );
+        backend
+            .redirect_track_store(&RedirectTuple::from_tuples(&key), &RedirectEntry::default())
+            .unwrap();
+
+        assert_eq!(
+            backend.remove_udp_flow(&key, 0).unwrap(),
+            UdpDecisionCommitResult::Applied
+        );
+        assert!(backend.udp_conn_state_lookup(&key).unwrap().is_none());
+        assert!(backend.routing_handoff_lookup(&key).unwrap().is_some());
+        assert!(
+            backend
+                .redirect_track_lookup(&RedirectTuple::from_tuples(&key))
+                .unwrap()
+                .is_some()
+        );
+
+        for terminal_raw in [
+            OutboundIndex::Direct as u64 | ROUTING_META_FLAG_PUBLISHED | ROUTING_META_FLAG_OFFLOAD,
+            OutboundIndex::Direct as u64 | ROUTING_META_FLAG_PUBLISHED | (1 << 40),
+            OutboundIndex::Block as u64 | ROUTING_META_FLAG_PUBLISHED,
+        ] {
+            backend
+                .udp_conn_state_store(
+                    &key,
+                    &ConnState {
+                        state: UdpDecisionState::None as u8,
+                        meta: RoutingMeta { raw: terminal_raw },
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                backend.remove_udp_flow(&key, 0).unwrap(),
+                UdpDecisionCommitResult::StateMismatch
+            );
+            assert!(backend.udp_conn_state_lookup(&key).unwrap().is_some());
         }
     }
 
     #[test]
-    fn offload_udp_flow_rewrites_published_proxy_decision_to_direct() {
+    fn abort_accounts_state_delete_and_sequence_survives_cleanup() {
         let mut backend = MockEbpfBackend::new();
-        let key = offload_test_key();
-        let raw = offload_test_meta_raw(OutboundIndex::UserBase as u8, TPROXY_MARK, 0, 5);
-        backend
-            .udp_conn_state_store(&key, &offload_test_state(raw))
-            .unwrap();
-
-        assert!(backend.offload_udp_flow(&key).unwrap());
-
-        let stored = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
-        let stored_raw = unsafe { stored.meta.raw };
-        assert_ne!(stored_raw & ROUTING_META_FLAG_OFFLOAD, 0);
-        assert_ne!(stored_raw & ROUTING_META_FLAG_PUBLISHED, 0);
-        assert_eq!(stored_raw & 0xFF, OutboundIndex::Direct as u64);
-        assert_eq!((stored_raw >> 8) & 0xFFFF_FFFF, 0, "tproxy mark cleared");
-        assert_eq!((stored_raw >> 40) & 1, 0, "must bit cleared");
-        assert_eq!((stored_raw >> 48) & 0xFF, 5, "dscp preserved");
-    }
-
-    #[test]
-    fn offload_udp_flow_requires_a_published_conn_state() {
-        let mut backend = MockEbpfBackend::new();
-        let key = offload_test_key();
-        assert!(!backend.offload_udp_flow(&key).unwrap(), "missing entry");
-
-        let raw = offload_test_meta_raw(OutboundIndex::UserBase as u8, TPROXY_MARK, 0, 0)
-            & !ROUTING_META_FLAG_PUBLISHED;
-        backend
-            .udp_conn_state_store(&key, &offload_test_state(raw))
-            .unwrap();
-        assert!(!backend.offload_udp_flow(&key).unwrap(), "unpublished meta");
-        let stored = backend.udp_conn_state_lookup(&key).unwrap().unwrap();
-        assert_eq!(unsafe { stored.meta.raw }, raw, "meta left untouched");
-    }
-
-    #[test]
-    fn offload_udp_flow_is_idempotent() {
-        let mut backend = MockEbpfBackend::new();
-        let key = offload_test_key();
-        let raw = offload_test_meta_raw(OutboundIndex::Direct as u8, 0, 0, 0);
-        backend
-            .udp_conn_state_store(&key, &offload_test_state(raw))
-            .unwrap();
-
-        assert!(backend.offload_udp_flow(&key).unwrap());
-        let first = unsafe {
-            backend
-                .udp_conn_state_lookup(&key)
-                .unwrap()
-                .unwrap()
-                .meta
-                .raw
-        };
-        assert!(backend.offload_udp_flow(&key).unwrap());
-        let second = unsafe {
-            backend
-                .udp_conn_state_lookup(&key)
-                .unwrap()
-                .unwrap()
-                .meta
-                .raw
-        };
-        assert_eq!(first, second);
+        let key = decision_test_key();
+        seed_staged_flow(&mut backend, &key, 31);
+        let before =
+            crate::ebpf::USERSPACE_CONN_STATE_DELETES.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            backend.abort_pending_udp_flow(&key, 31).unwrap(),
+            UdpDecisionCommitResult::Applied
+        );
+        assert!(
+            crate::ebpf::USERSPACE_CONN_STATE_DELETES.load(std::sync::atomic::Ordering::Relaxed)
+                > before
+        );
+        backend.udp_decision_sequence_next = 123;
+        futures::executor::block_on(backend.cleanup()).unwrap();
+        assert_eq!(backend.udp_decision_sequence_next, 123);
     }
 
     #[test]
@@ -1605,7 +2025,7 @@ mod tests {
                 ..Default::default()
             },
         };
-        backend.routing_handoffs.lock().unwrap().insert(
+        backend.routing_handoffs.lock().insert(
             MockEbpfBackend::tuples_key_bytes(&handoff_key),
             handoff_entry,
         );
@@ -1633,7 +2053,7 @@ mod tests {
 
         assert!(backend.redirect_tracks.is_empty());
         assert!(backend.cookie_pids.is_empty());
-        assert!(backend.routing_handoffs.lock().unwrap().is_empty());
+        assert!(backend.routing_handoffs.lock().is_empty());
     }
 
     #[test]
@@ -1786,7 +2206,6 @@ mod tests {
         backend
             .routing_handoffs
             .lock()
-            .unwrap()
             .insert(MockEbpfBackend::tuples_key_bytes(&key), entry);
 
         // take() returns the entry and removes it in one step.
@@ -1969,7 +2388,7 @@ mod tests {
         assert!(backend.tcp_conn_states.is_empty());
         assert!(backend.udp_conn_states.is_empty());
         assert!(backend.redirect_tracks.is_empty());
-        assert!(backend.routing_handoffs.lock().unwrap().is_empty());
+        assert!(backend.routing_handoffs.lock().is_empty());
         assert!(backend.cookie_pids.is_empty());
         assert!(backend.outbound_alive.is_empty());
         assert!(backend.bpf_stats.is_empty());

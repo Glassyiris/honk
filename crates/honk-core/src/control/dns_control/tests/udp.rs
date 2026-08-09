@@ -7,11 +7,6 @@ async fn udp_overload_is_refused_while_permit_owner_is_in_flight() {
         release_first: Notify::new(),
     });
     let controller = controller_with_limit(upstream.clone(), 1);
-    let ingress = Arc::new(
-        tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
-            .expect("bind ingress"),
-    );
     let first_client = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
         .expect("bind first client");
@@ -31,11 +26,10 @@ async fn udp_overload_is_refused_while_permit_owner_is_in_flight() {
     let first_query = query_with_txid("first.example", 0x1111);
     let first_task = {
         let controller = controller.clone();
-        let ingress = ingress.clone();
         let client_addr = first_client.local_addr().expect("first client address");
         tokio::spawn(async move {
             controller
-                .handle_udp_dns(ingress.as_ref(), &first_query, client_addr, original_dst)
+                .handle_udp_dns(&first_query, client_addr, original_dst)
                 .await
         })
     };
@@ -45,7 +39,6 @@ async fn udp_overload_is_refused_while_permit_owner_is_in_flight() {
     assert!(
         controller
             .handle_udp_dns(
-                ingress.as_ref(),
                 &second_query,
                 second_client.local_addr().expect("second client address"),
                 original_dst,

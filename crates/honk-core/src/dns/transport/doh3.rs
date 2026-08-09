@@ -37,6 +37,7 @@ struct H3Session {
 pub struct Doh3Client {
     endpoint: DnsEndpoint,
     query_timeout: Duration,
+    dial_timeout: Duration,
     quic_config: ClientConfig,
     quic_ep: SharedQuicEndpoint,
     session: LifecycleSlot<H3Session>,
@@ -44,19 +45,31 @@ pub struct Doh3Client {
 }
 
 impl Doh3Client {
-    pub async fn new(endpoint: DnsEndpoint, query_timeout: Duration) -> anyhow::Result<Arc<Self>> {
-        Self::new_tracked(endpoint, query_timeout, Arc::new(AtomicUsize::new(0))).await
+    pub async fn new(
+        endpoint: DnsEndpoint,
+        query_timeout: Duration,
+        dial_timeout: Duration,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::new_tracked(
+            endpoint,
+            query_timeout,
+            dial_timeout,
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .await
     }
 
     pub(crate) async fn new_tracked(
         endpoint: DnsEndpoint,
         query_timeout: Duration,
+        dial_timeout: Duration,
         active_tasks: Arc<AtomicUsize>,
     ) -> anyhow::Result<Arc<Self>> {
         let quic_config = dns_quic_config(&[b"h3"]).await?;
         Ok(Arc::new(Self {
             endpoint,
             query_timeout,
+            dial_timeout,
             quic_config,
             quic_ep: SharedQuicEndpoint::new(),
             session: LifecycleSlot::new(),
@@ -78,52 +91,51 @@ impl Doh3Client {
     async fn exchange_once(&self, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
         let mut sender = self.get_sender().await?;
 
-        let mut wire = raw_query.to_vec();
-        let orig_id = force_dns_id_zero(&mut wire);
+        tokio::time::timeout(self.query_timeout, async {
+            let mut wire = raw_query.to_vec();
+            let orig_id = force_dns_id_zero(&mut wire);
 
-        let req = build_doh_request(&self.endpoint, None, "DoH3")?;
+            let req = build_doh_request(&self.endpoint, None, "DoH3")?;
 
-        let mut stream = sender
-            .send_request(req)
-            .await
-            .map_err(|e| anyhow::anyhow!("DoH3 send_request: {e}"))?;
-
-        stream
-            .send_data(Bytes::from(wire))
-            .await
-            .map_err(|e| anyhow::anyhow!("DoH3 send_data: {e}"))?;
-        stream
-            .finish()
-            .await
-            .map_err(|e| anyhow::anyhow!("DoH3 finish: {e}"))?;
-
-        let response = tokio::time::timeout(self.query_timeout, stream.recv_response())
-            .await
-            .map_err(|_| anyhow::anyhow!("DoH3 response timed out"))?
-            .map_err(|e| anyhow::anyhow!("DoH3 recv_response: {e}"))?;
-
-        let status = response.status();
-        let content_length = doh_content_length("DoH3", response.headers())?;
-        let mut buf = DnsMessageBody::new("DoH3", content_length)?;
-        loop {
-            let chunk = tokio::time::timeout(self.query_timeout, stream.recv_data())
+            let mut stream = sender
+                .send_request(req)
                 .await
-                .map_err(|_| anyhow::anyhow!("DoH3 body timed out"))?
-                .map_err(|e| anyhow::anyhow!("DoH3 recv_data: {e}"))?;
-            match chunk {
-                Some(mut b) => {
-                    while b.has_remaining() {
-                        let chunk = b.chunk();
-                        let len = chunk.len();
-                        buf.push(chunk)?;
-                        b.advance(len);
-                    }
-                }
-                None => break,
-            }
-        }
+                .map_err(|e| anyhow::anyhow!("DoH3 send_request: {e}"))?;
 
-        finish_doh_response("DoH3", status, buf.into_bytes(), orig_id)
+            stream
+                .send_data(Bytes::from(wire))
+                .await
+                .map_err(|e| anyhow::anyhow!("DoH3 send_data: {e}"))?;
+            stream
+                .finish()
+                .await
+                .map_err(|e| anyhow::anyhow!("DoH3 finish: {e}"))?;
+
+            let response = stream
+                .recv_response()
+                .await
+                .map_err(|e| anyhow::anyhow!("DoH3 recv_response: {e}"))?;
+
+            let status = response.status();
+            let content_length = doh_content_length("DoH3", response.headers())?;
+            let mut buf = DnsMessageBody::new("DoH3", content_length)?;
+            while let Some(mut bytes) = stream
+                .recv_data()
+                .await
+                .map_err(|e| anyhow::anyhow!("DoH3 recv_data: {e}"))?
+            {
+                while bytes.has_remaining() {
+                    let chunk = bytes.chunk();
+                    let len = chunk.len();
+                    buf.push(chunk)?;
+                    bytes.advance(len);
+                }
+            }
+
+            finish_doh_response("DoH3", status, buf.into_bytes(), orig_id)
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("DoH3 exchange timed out after {:?}", self.query_timeout))?
     }
 
     async fn get_sender(&self) -> anyhow::Result<H3Sender> {
@@ -137,21 +149,25 @@ impl Doh3Client {
     }
 
     async fn handshake(&self) -> anyhow::Result<H3Session> {
-        let addr: SocketAddr = self.endpoint.resolve_addr().await?;
-        let conn = quic_connect(
-            &self.quic_ep,
-            &self.quic_config,
-            addr,
-            &self.endpoint.sni,
-            self.query_timeout,
-            "DoH3 QUIC",
-        )
-        .await?;
-
-        let quinn_conn = H3QuinnConnection::new(conn.clone());
-        let (mut driver, sender) = h3::client::new(quinn_conn)
-            .await
-            .map_err(|e| anyhow::anyhow!("DoH3 h3::client::new: {e}"))?;
+        let (conn, mut driver, sender) = tokio::time::timeout(self.dial_timeout, async {
+            let addr: SocketAddr = self.endpoint.resolve_addr().await?;
+            let conn = quic_connect(
+                &self.quic_ep,
+                &self.quic_config,
+                addr,
+                &self.endpoint.sni,
+                self.dial_timeout,
+                "DoH3 QUIC",
+            )
+            .await?;
+            let quinn_conn = H3QuinnConnection::new(conn.clone());
+            let (driver, sender) = h3::client::new(quinn_conn)
+                .await
+                .map_err(|e| anyhow::anyhow!("DoH3 h3::client::new: {e}"))?;
+            Ok::<_, anyhow::Error>((conn, driver, sender))
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("DoH3 dial timed out after {:?}", self.dial_timeout))??;
 
         let driver = OwnedTask::spawn(
             async move {
@@ -184,13 +200,15 @@ impl Doh3Client {
 
     pub(crate) async fn close(&self) {
         self.close_session().await;
-        self.quic_ep.close().await;
+        self.quic_ep.close(self.query_timeout).await;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::{DnsMessageBody, DnsMessageTooLarge, MAX_DNS_MESSAGE_SIZE};
+    use honk_config::types::DnsProtocol;
+    use std::time::Duration;
 
     #[test]
     fn h3_body_rejects_hostile_multichunk_response_before_append() {
@@ -220,5 +238,25 @@ mod tests {
 
         // Then
         assert_eq!(body.len(), MAX_DNS_MESSAGE_SIZE);
+    }
+
+    #[tokio::test]
+    async fn constructor_keeps_query_and_dial_timeouts_distinct() {
+        let endpoint = crate::dns::endpoint::DnsEndpoint::parse(
+            "127.0.0.1/dns-query",
+            DnsProtocol::H3,
+            Some("localhost"),
+        )
+        .expect("DoH3 endpoint");
+        let client = super::Doh3Client::new(
+            endpoint,
+            Duration::from_millis(111),
+            Duration::from_millis(222),
+        )
+        .await
+        .expect("DoH3 client");
+
+        assert_eq!(client.query_timeout, Duration::from_millis(111));
+        assert_eq!(client.dial_timeout, Duration::from_millis(222));
     }
 }

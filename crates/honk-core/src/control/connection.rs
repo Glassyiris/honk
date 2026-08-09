@@ -3,6 +3,7 @@ use super::*;
 use crate::control::udp_endpoint::{UdpEndpoint, UdpInitLease};
 use crate::group::SelectionPlanMode;
 use honk_config::types::NodeProtocol;
+use std::collections::{HashMap, HashSet};
 
 /// Result from the eBPF routing handoff map lookup.
 #[derive(Debug, Clone)]
@@ -10,10 +11,26 @@ struct HandoffResult {
     outbound: u8,
     mark: u32,
     must: u8,
+    decision_token: u32,
     dscp: u8,
     mac: [u8; 6],
     pname: [u8; 16],
     pid: u32,
+}
+
+impl From<RoutingHandoffEntry> for HandoffResult {
+    fn from(entry: RoutingHandoffEntry) -> Self {
+        Self {
+            outbound: entry.result.outbound,
+            mark: entry.result.mark,
+            must: entry.result.must,
+            decision_token: entry.result.decision_token,
+            dscp: entry.result.dscp,
+            mac: entry.result.mac,
+            pname: entry.result.pname,
+            pid: entry.result.pid,
+        }
+    }
 }
 
 impl HandoffResult {
@@ -64,6 +81,180 @@ impl HandoffResult {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) struct TcpFlowKey {
+    src_ip: [u8; 16],
+    dst_ip: [u8; 16],
+    src_port: u16,
+    dst_port: u16,
+    l4proto: u8,
+}
+
+impl TcpFlowKey {
+    pub(super) fn from_tuples(tuples: &TuplesKey) -> Self {
+        Self {
+            src_ip: *tuples.src_ip.as_bytes(),
+            dst_ip: *tuples.dst_ip.as_bytes(),
+            src_port: tuples.src_port,
+            dst_port: tuples.dst_port,
+            l4proto: tuples.l4proto,
+        }
+    }
+
+    pub(super) fn from_redirect(tuple: &RedirectTuple) -> Self {
+        Self {
+            src_ip: *tuple.src_ip.as_bytes(),
+            dst_ip: *tuple.dst_ip.as_bytes(),
+            src_port: tuple.src_port,
+            dst_port: tuple.dst_port,
+            l4proto: tuple.l4proto,
+        }
+    }
+}
+
+#[derive(Default)]
+pub(super) struct TcpFlowPins {
+    inner: parking_lot::Mutex<HashMap<TcpFlowKey, usize>>,
+}
+
+impl TcpFlowPins {
+    fn retain(&self, key: TcpFlowKey) {
+        *self.inner.lock().entry(key).or_default() += 1;
+    }
+
+    fn release(&self, key: TcpFlowKey) -> Option<bool> {
+        let mut pins = self.inner.lock();
+        let owners = pins.get_mut(&key)?;
+        if *owners > 1 {
+            *owners -= 1;
+            Some(false)
+        } else {
+            pins.remove(&key);
+            Some(true)
+        }
+    }
+
+    pub(super) fn snapshot(&self) -> HashSet<TcpFlowKey> {
+        self.inner.lock().keys().copied().collect()
+    }
+
+    #[cfg(test)]
+    pub(super) fn retain_for_test(&self, key: TcpFlowKey) {
+        self.retain(key);
+    }
+
+    #[cfg(test)]
+    pub(super) fn release_for_test(&self, key: TcpFlowKey) -> Option<bool> {
+        self.release(key)
+    }
+}
+
+struct TcpFlowGuard {
+    stream: TcpStream,
+    tuples: TuplesKey,
+    pin_key: Option<TcpFlowKey>,
+    pins: Arc<TcpFlowPins>,
+    ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+    tracker: Arc<ConnectionTracker>,
+    tracker_id: Option<String>,
+}
+
+impl TcpFlowGuard {
+    fn new(
+        stream: TcpStream,
+        tuples: TuplesKey,
+        pins: Arc<TcpFlowPins>,
+        ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+        tracker: Arc<ConnectionTracker>,
+    ) -> Self {
+        let pin_key = TcpFlowKey::from_tuples(&tuples);
+        pins.retain(pin_key);
+        Self {
+            stream,
+            tuples,
+            pin_key: Some(pin_key),
+            pins,
+            ebpf,
+            tracker,
+            tracker_id: None,
+        }
+    }
+
+    fn stream_mut(&mut self) -> &mut TcpStream {
+        &mut self.stream
+    }
+
+    fn track(&mut self, entry: crate::connection_tracker::ConnectionEntry) {
+        assert!(
+            self.tracker_id.is_none(),
+            "TCP flow tracker attached more than once"
+        );
+        self.tracker_id = Some(self.tracker.register(entry));
+    }
+
+    fn untrack(&mut self) {
+        if let Some(id) = self.tracker_id.take() {
+            self.tracker.remove(&id);
+        }
+    }
+
+    fn release_pin(&mut self) -> Option<bool> {
+        let key = self.pin_key.take()?;
+        match self.pins.release(key) {
+            Some(last_owner) => Some(last_owner),
+            None => {
+                error!(?key, "TCP flow pin release found no owner");
+                None
+            }
+        }
+    }
+
+    async fn retire(mut self) {
+        self.untrack();
+        let now_ns = match super::janitor::monotonic_now_ns() {
+            Ok(now_ns) => now_ns,
+            Err(error) => {
+                error!(%error, "TCP flow retirement could not read monotonic clock");
+                return;
+            }
+        };
+        let retire_cutoff_ns = now_ns.saturating_sub(1);
+        let ebpf = Arc::clone(&self.ebpf);
+        let mut backend = ebpf.write().await;
+        if self.release_pin() != Some(true) {
+            return;
+        }
+
+        let current = match backend.tcp_conn_state_lookup(&self.tuples) {
+            Ok(Some(current)) => current,
+            Ok(None) => return,
+            Err(error) => {
+                error!(%error, ?self.tuples, "TCP flow retirement lookup failed");
+                return;
+            }
+        };
+        match backend.conn_state_remove_if_unchanged(&[(self.tuples, current)], retire_cutoff_ns) {
+            Ok(removed) => {
+                if removed != 0 {
+                    crate::ebpf::USERSPACE_CONN_STATE_DELETES
+                        .fetch_add(removed, std::sync::atomic::Ordering::Relaxed);
+                }
+                debug!(removed, ?self.tuples, "TCP flow conn-state retired");
+            }
+            Err(error) => {
+                error!(%error, ?self.tuples, "TCP flow conditional retirement failed");
+            }
+        }
+    }
+}
+
+impl Drop for TcpFlowGuard {
+    fn drop(&mut self) {
+        self.untrack();
+        self.release_pin();
+    }
+}
+
 const COLD_URLTEST_STAGGER: Duration = Duration::from_millis(200);
 
 /// Wait until this candidate's absolute cold-URLTest release offset. The
@@ -106,17 +297,17 @@ pub(super) struct ControlPlaneHandle {
     pub(super) stats: Arc<StatsManager>,
     pub(super) ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
     pub(super) udp_pool: Arc<UdpEndpointPool>,
+    #[cfg(feature = "ebpf")]
+    pub(super) pending_udp_verdicts: Option<Arc<crate::control::nfqueue::PendingUdpVerdicts>>,
     pub(super) tcp_sniff_neg_cache: Arc<crate::control::tcp_sniff::TcpSniffNegCache>,
     pub(super) sniffer_pool: Arc<crate::control::packet_sniffer::PacketSnifferPool>,
     pub(super) dns_controller: Arc<crate::control::dns_control::DnsController>,
     pub(super) alive_set: Arc<AliveDialerSet>,
     pub(super) connection_pool: Arc<ConnectionPool>,
     pub(super) connection_tracker: Arc<ConnectionTracker>,
+    pub(super) tcp_flow_pins: Arc<TcpFlowPins>,
     /// Shared clash mode state (None when the clash API is disabled).
     pub(super) mode_state: Option<crate::mode::SharedModeState>,
-    /// Drop-and-reinject UDP post-decision offload switch, resolved once at
-    /// startup.
-    pub(super) udp_post_decision_offload: bool,
 }
 
 /// Build the eBPF conntrack key for a flow: IPs as 16-byte v4-mapped
@@ -157,34 +348,29 @@ pub(crate) fn build_tuples_key(
     key
 }
 
-/// Whether a fully-converged UDP flow decision may leave the userspace
-/// datapath via the per-flow offload bit.  Mirrors the mode semantics of the
-/// route-time offload policy (`DATAPATH_FLAG_OFFLOAD_*`): Rule — and
-/// clash-API-disabled, where no mode override ever applies — offloads a
-/// converged `direct` decision; Direct normalizes every
-/// non-`must`/non-`block` decision to `direct`, so the same condition
-/// covers it; Global keeps every non-`must` flow in userspace.  A proxied
-/// decision is never offloaded, and port 53 on either side is never
-/// offloaded: DNS hijack semantics depend on the DnsController seeing every
-/// packet (structurally, port-53 UDP has no conn_state to flag — this is
-/// the explicit guard that keeps it that way).
-pub(super) fn udp_post_decision_offload_allowed(
-    mode: Option<&crate::mode::ModeState>,
-    outbound_name: &str,
-    must: bool,
-    client_addr: SocketAddr,
-    original_dst: SocketAddr,
-) -> bool {
-    if outbound_name != "direct" {
-        return false;
+#[cfg(any(feature = "ebpf", test))]
+fn final_udp_rule_mark(routed_direct: bool, final_outbound: &str, routed_mark: u32) -> u32 {
+    if final_outbound == "direct" && !routed_direct {
+        0
+    } else {
+        routed_mark
     }
-    if original_dst.port() == 53 || client_addr.port() == 53 {
-        return false;
-    }
-    must || !mode.is_some_and(|state| state.is_global())
 }
 
 impl ControlPlaneHandle {
+    /// `/proc/<pid>/exe` is display-only enrichment. Never hold first-packet
+    /// delivery behind the blocking pool used to resolve it.
+    fn spawn_process_path_enrichment(&self, conn_id: String, handoff: Option<&HandoffResult>) {
+        let Some(handoff) = handoff.filter(|handoff| handoff.pid != 0).cloned() else {
+            return;
+        };
+        let tracker = Arc::clone(&self.connection_tracker);
+        tokio::spawn(async move {
+            if let Some(process_path) = handoff.process_path().await {
+                tracker.update_process_path(&conn_id, process_path);
+            }
+        });
+    }
     /// Look up the eBPF routing handoff entry for a connection, consuming it.
     ///
     /// Only a read lock is taken: `routing_handoff_take` performs raw bpf()
@@ -193,19 +379,71 @@ impl ControlPlaneHandle {
     /// backend (and its map fds) alive against `cleanup()`, which takes the
     /// write lock.
     async fn lookup_handoff(&self, tuples: &TuplesKey) -> Option<HandoffResult> {
-        let ebpf = self.ebpf.read().await;
-        let entry = ebpf.routing_handoff_take(tuples).ok().flatten();
-        drop(ebpf);
+        self.ebpf
+            .read()
+            .await
+            .routing_handoff_take(tuples)
+            .ok()
+            .flatten()
+            .map(Into::into)
+    }
 
-        entry.map(|entry| HandoffResult {
-            outbound: entry.result.outbound,
-            mark: entry.result.mark,
-            must: entry.result.must,
-            dscp: entry.result.dscp,
-            mac: entry.result.mac,
-            pname: entry.result.pname,
-            pid: entry.result.pid,
-        })
+    /// Staged UDP transitions consume their handoff atomically at commit, so
+    /// initialization may only inspect it. Legacy socket ingress keeps the
+    /// existing take-once behavior.
+    async fn lookup_udp_handoff(
+        &self,
+        tuples: &TuplesKey,
+        decision_token: u32,
+    ) -> anyhow::Result<Option<HandoffResult>> {
+        if decision_token == 0 {
+            return Ok(self.lookup_handoff(tuples).await);
+        }
+        let entry = self
+            .ebpf
+            .read()
+            .await
+            .routing_handoff_lookup(tuples)?
+            .ok_or_else(|| anyhow::anyhow!("staged UDP flow has no routing handoff"))?;
+        if entry.result.decision_token != decision_token {
+            anyhow::bail!(
+                "staged UDP handoff token mismatch: expected {}, found {}",
+                decision_token,
+                entry.result.decision_token
+            );
+        }
+        Ok(Some(entry.into()))
+    }
+
+    async fn adopt_tcp_flow(
+        &self,
+        stream: TcpStream,
+        tuples: TuplesKey,
+    ) -> anyhow::Result<(TcpFlowGuard, Option<HandoffResult>)> {
+        let backend = self.ebpf.read().await;
+        match backend.tcp_conn_state_lookup(&tuples) {
+            Ok(Some(_)) => {}
+            Ok(None) => anyhow::bail!("accepted TCP flow has no conn-state: {tuples:?}"),
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "accepted TCP flow conn-state lookup failed for {tuples:?}: {error}"
+                ));
+            }
+        }
+
+        let flow = TcpFlowGuard::new(
+            stream,
+            tuples,
+            Arc::clone(&self.tcp_flow_pins),
+            Arc::clone(&self.ebpf),
+            Arc::clone(&self.connection_tracker),
+        );
+        let handoff = backend
+            .routing_handoff_take(&tuples)
+            .ok()
+            .flatten()
+            .map(Into::into);
+        Ok((flow, handoff))
     }
 
     async fn outbound_index_to_name(&self, index: u8) -> String {
@@ -224,6 +462,26 @@ impl ControlPlaneHandle {
                     .get(user_idx as usize)
                     .map(|g| g.name.clone())
                     .unwrap_or_else(|| config.routing.default_outbound.clone())
+            }
+        }
+    }
+
+    #[cfg(feature = "ebpf")]
+    async fn outbound_name_to_index(&self, outbound_name: &str) -> u8 {
+        match outbound_name {
+            "direct" => OutboundIndex::Direct as u8,
+            "block" => OutboundIndex::Block as u8,
+            "must_rules" => OutboundIndex::MustRules as u8,
+            "control_plane_routing" => OutboundIndex::ControlPlaneRouting as u8,
+            _ => {
+                let config = self.config.read().await;
+                config
+                    .groups
+                    .iter()
+                    .position(|group| group.name == outbound_name)
+                    .and_then(|index| u8::try_from(index).ok())
+                    .and_then(|index| (OutboundIndex::UserBase as u8).checked_add(index))
+                    .unwrap_or(OutboundIndex::ControlPlaneRouting as u8)
             }
         }
     }
@@ -269,7 +527,7 @@ impl ControlPlaneHandle {
 
     pub(super) async fn serve_connection(
         &self,
-        mut stream: TcpStream,
+        stream: TcpStream,
         client_addr: SocketAddr,
     ) -> anyhow::Result<()> {
         debug!("TPROXY TCP connection from {}", client_addr);
@@ -305,15 +563,6 @@ impl ControlPlaneHandle {
             }
         };
         debug!("Original destination: {}", original_dst);
-
-        if let Ok(true) = self
-            .dns_controller
-            .handle_tcp_dns(&mut stream, client_addr, original_dst)
-            .await
-        {
-            return Ok(());
-        }
-
         let tuples = build_tuples_key(
             original_dst.ip(),
             original_dst.port(),
@@ -321,8 +570,15 @@ impl ControlPlaneHandle {
             client_addr.port(),
             6, // TCP
         );
+        let (mut flow, handoff) = self.adopt_tcp_flow(stream, tuples).await?;
 
-        let handoff = self.lookup_handoff(&tuples).await;
+        if let Ok(true) = self
+            .dns_controller
+            .handle_tcp_dns(flow.stream_mut(), client_addr, original_dst)
+            .await
+        {
+            return Ok(());
+        }
 
         let dial_mode = {
             let config = self.config.read().await;
@@ -367,7 +623,7 @@ impl ControlPlaneHandle {
         let sniff_result = if skip_sniff {
             sniffing::SniffResult::unknown()
         } else {
-            sniffing::sniff_tcp(&mut stream).await
+            sniffing::sniff_tcp(flow.stream_mut()).await
         };
         let mut domain = sniff_result.domain.clone();
         if let Some(ref d) = domain {
@@ -661,15 +917,6 @@ impl ControlPlaneHandle {
                     }
                     let start = std::time::Instant::now();
                     let per_dial_timeout = connect_timeout * 3;
-                    // Built-in direct/block dials are local connects bounded
-                    // by the connection admission limit; dead direct peers
-                    // must not starve the proxied-dial budget.
-                    let _dial_permit =
-                        if matches!(node.protocol, NodeProtocol::Direct | NodeProtocol::Block) {
-                            None
-                        } else {
-                            Some(generation.acquire_dial_permit().await)
-                        };
                     let result = tokio::time::timeout(
                         per_dial_timeout,
                         Self::dial_pooled(
@@ -797,11 +1044,8 @@ impl ControlPlaneHandle {
                         let (ready_capable, bare_capable) = registry
                             .find(node.protocol)
                             .map(|entry| {
-                                let caps = (entry.descriptor.capabilities)(&node);
                                 (
-                                    (entry.descriptor.pool_ready_streams)(&node)
-                                        && caps.tcp
-                                        && !caps.multiplexed,
+                                    (entry.descriptor.pool_ready_streams)(&node),
                                     (entry.descriptor.pool_bare_tcp)(&node),
                                 )
                             })
@@ -929,27 +1173,23 @@ impl ControlPlaneHandle {
         // single close-time (never-visible) update.
         let conn_upload = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let conn_download = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let process_path = match &handoff {
-            Some(ho) => ho.process_path().await,
-            None => None,
-        };
-        self.connection_tracker
-            .register(crate::connection_tracker::ConnectionEntry {
-                id: conn_id.clone(),
-                source: client_addr.to_string(),
-                destination: resolved_target.to_string(),
-                proxy: node.name.clone(),
-                rule,
-                rule_payload,
-                chains,
-                upload: conn_upload.clone(),
-                download: conn_download.clone(),
-                start_time: std::time::Instant::now(),
-                domain: target_domain.clone(),
-                network: "tcp".to_string(),
-                process: handoff.as_ref().and_then(|ho| ho.process_name()),
-                process_path,
-            });
+        flow.track(crate::connection_tracker::ConnectionEntry {
+            id: conn_id.clone(),
+            source: client_addr.to_string(),
+            destination: resolved_target.to_string(),
+            proxy: node.name.clone(),
+            rule,
+            rule_payload,
+            chains,
+            upload: conn_upload.clone(),
+            download: conn_download.clone(),
+            start_time: std::time::Instant::now(),
+            domain: target_domain.clone(),
+            network: "tcp".to_string(),
+            process: handoff.as_ref().and_then(|ho| ho.process_name()),
+            process_path: None,
+        });
+        self.spawn_process_path_enrichment(conn_id, handoff.as_ref());
 
         debug!(
             network = "tcp",
@@ -968,7 +1208,6 @@ impl ControlPlaneHandle {
                 warn!("Failed to write sniffed bytes to proxy: {}", e);
                 self.stats.record_error(&outbound_name);
                 self.stats.record_close(&outbound_name);
-                self.connection_tracker.remove(&conn_id);
                 return Ok(());
             }
         }
@@ -982,7 +1221,7 @@ impl ControlPlaneHandle {
         let relay_result = match proxy_stream.into_tcp_stream() {
             Ok(upstream) => {
                 relay::splice::relay_splice(
-                    stream,
+                    flow.stream_mut(),
                     upstream,
                     client_addr,
                     resolved_target,
@@ -992,7 +1231,7 @@ impl ControlPlaneHandle {
             }
             Err(proxy_stream) => {
                 relay::splice::relay_auto(
-                    stream,
+                    flow.stream_mut(),
                     proxy_stream.stream,
                     client_addr,
                     resolved_target,
@@ -1001,10 +1240,10 @@ impl ControlPlaneHandle {
                 .await
             }
         };
+        flow.retire().await;
 
         match relay_result {
             Ok(relay_stats) => {
-                self.connection_tracker.remove(&conn_id);
                 self.stats.record_bytes(
                     &outbound_name,
                     relay_stats.client_to_proxy,
@@ -1027,11 +1266,8 @@ impl ControlPlaneHandle {
                         let (ready_capable, bare_capable) = registry
                             .find(node.protocol)
                             .map(|entry| {
-                                let caps = (entry.descriptor.capabilities)(&node);
                                 (
-                                    (entry.descriptor.pool_ready_streams)(&node)
-                                        && caps.tcp
-                                        && !caps.multiplexed,
+                                    (entry.descriptor.pool_ready_streams)(&node),
                                     (entry.descriptor.pool_bare_tcp)(&node),
                                 )
                             })
@@ -1092,7 +1328,6 @@ impl ControlPlaneHandle {
                 }
             }
             Err(e) => {
-                self.connection_tracker.remove(&conn_id);
                 // The relay updates these atomics as every read/splice completes.
                 // Preserve bytes moved before an I/O failure rather than turning
                 // the whole flow into a synthetic zero-byte success.
@@ -1123,31 +1358,6 @@ impl ControlPlaneHandle {
                 self.stats.record_error(&outbound_name);
                 self.stats.record_close(&outbound_name);
             }
-        }
-
-        // Event-driven lifecycle: the userspace relay has ended, so this
-        // flow's conntrack entries are dead state — retire both directions
-        // now instead of leaving them to the datapath/janitor timeouts
-        // (the model dae's SessionManager releaseFlow uses).  Late FIN/ACK
-        // stragglers hitting an empty entry simply pass through, which is
-        // harmless for a closed flow.
-        let mut reversed = tuples;
-        std::mem::swap(&mut reversed.src_ip, &mut reversed.dst_ip);
-        std::mem::swap(&mut reversed.src_port, &mut reversed.dst_port);
-        {
-            let mut ebpf = self.ebpf.write().await;
-            let mut removed = 0u32;
-            for key in [&tuples, &reversed] {
-                if ebpf.tcp_conn_state_remove(key).is_ok() {
-                    removed += 1;
-                    crate::ebpf::USERSPACE_CONN_STATE_DELETES
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
-            debug!(
-                "conn-state retire: {} -> {} removed {} entr(ies)",
-                client_addr, resolved_target, removed
-            );
         }
 
         if let (Some(ref ho), Some(ref domain)) = (handoff, sniff_result.domain)
@@ -1240,40 +1450,78 @@ impl ControlPlaneHandle {
                 .unwrap_or(true)
     }
 
-    pub(super) async fn serve_udp_connection(
-        &self,
-        lease: UdpInitLease,
-        udp_socket: Arc<UdpSocket>,
-    ) -> anyhow::Result<()> {
-        let mut cancellation = lease.cancellation();
+    pub(super) async fn serve_udp_connection(&self, lease: UdpInitLease) -> anyhow::Result<()> {
+        #[cfg(feature = "ebpf")]
+        let pending_cleanup = if lease.decision_token() == 0 {
+            None
+        } else {
+            let verdicts = self
+                .pending_udp_verdicts
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("staged UDP lease has no verdict owner"))?;
+            Some((
+                verdicts,
+                crate::control::nfqueue::PendingUdpVerdicts::identity_for_lease(&lease),
+            ))
+        };
+        #[cfg(not(feature = "ebpf"))]
+        if lease.decision_token() != 0 {
+            anyhow::bail!("staged UDP lease requires the ebpf feature");
+        }
+        let cancellation = lease.wait_cancellation();
         tokio::select! {
-            _ = cancellation.changed() => {
-                // Dropping the uncommitted lease removes only its generation.
+            _ = cancellation => {
+                #[cfg(feature = "ebpf")]
+                if let Some((verdicts, identity)) = &pending_cleanup {
+                    verdicts.cancel(*identity).await?;
+                }
                 Ok(())
             }
-            result = self.initialize_udp_connection(lease, udp_socket) => result,
+            result = self.initialize_udp_connection(lease) => {
+                let Err(error) = result else {
+                    return Ok(());
+                };
+                #[cfg(feature = "ebpf")]
+                if let Some((verdicts, identity)) = &pending_cleanup
+                    && let Err(cancel_error) = verdicts.cancel(*identity).await
+                {
+                    return Err(error.context(format!(
+                        "staged UDP cleanup also failed: {cancel_error}"
+                    )));
+                }
+                Err(error)
+            }
         }
     }
 
-    async fn initialize_udp_connection(
-        &self,
-        mut lease: UdpInitLease,
-        udp_socket: Arc<UdpSocket>,
-    ) -> anyhow::Result<()> {
+    async fn initialize_udp_connection(&self, mut lease: UdpInitLease) -> anyhow::Result<()> {
         let client_addr = lease.client_addr();
         let original_dst = lease.original_dst();
         let data = lease.first_payload();
+        #[cfg(feature = "ebpf")]
+        let pending = if lease.decision_token() == 0 {
+            None
+        } else {
+            let verdicts = self
+                .pending_udp_verdicts
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("staged UDP lease has no verdict owner"))?;
+            Some((
+                verdicts,
+                crate::control::nfqueue::PendingUdpVerdicts::identity_for_lease(&lease),
+            ))
+        };
+        #[cfg(not(feature = "ebpf"))]
+        if lease.decision_token() != 0 {
+            anyhow::bail!("staged UDP lease requires the ebpf feature");
+        }
         debug!(
-            "TPROXY UDP datagram from {} -> {} ({} bytes)",
+            "UDP datagram from {} -> {} ({} bytes, decision token {})",
             client_addr,
             original_dst,
-            data.len()
+            data.len(),
+            lease.decision_token()
         );
-
-        let connect_timeout = {
-            let config = self.config.read().await;
-            std::time::Duration::from_millis(config.global.connect_timeout_ms)
-        };
 
         let dial_mode = {
             let config = self.config.read().await;
@@ -1285,14 +1533,18 @@ impl ControlPlaneHandle {
                 .unwrap_or(DialMode::DomainPlusPlus)
         };
 
-        // These checks remain after the reservation only because DNS and
-        // sniffing historically lived in this slow handler. Their early exit
-        // drops the lease and therefore releases every reservation resource.
+        // These checks remain after reservation because DNS and sniffing
+        // share this initializer. A staged early exit must retire its held
+        // originals immediately.
         if is_honk_internal_addr(&original_dst.ip()) || is_honk_internal_addr(&client_addr.ip()) {
             trace!(
                 "Skipping honk-internal UDP {} -> {}",
                 client_addr, original_dst
             );
+            #[cfg(feature = "ebpf")]
+            if let Some((verdicts, identity)) = &pending {
+                verdicts.cancel(*identity).await?;
+            }
             return Ok(());
         }
         if is_broadcast_or_multicast(&original_dst.ip()) {
@@ -1300,16 +1552,26 @@ impl ControlPlaneHandle {
                 "Skipping broadcast/multicast UDP {} -> {}",
                 client_addr, original_dst
             );
+            #[cfg(feature = "ebpf")]
+            if let Some((verdicts, identity)) = &pending {
+                verdicts.cancel(*identity).await?;
+            }
             return Ok(());
         }
 
         if !lease.dns_checked() {
             match self
                 .dns_controller
-                .handle_udp_dns(&udp_socket, &data, client_addr, original_dst)
+                .handle_udp_dns(&data, client_addr, original_dst)
                 .await
             {
-                Ok(true) => return Ok(()),
+                Ok(true) => {
+                    #[cfg(feature = "ebpf")]
+                    if let Some((verdicts, identity)) = &pending {
+                        verdicts.cancel(*identity).await?;
+                    }
+                    return Ok(());
+                }
                 Ok(false) => {}
                 Err(error) => {
                     // Keep ordinary UDP forwarding available when DNS control
@@ -1323,8 +1585,8 @@ impl ControlPlaneHandle {
         }
 
         let mut quic_domain: Option<String>;
-        let sniff_terminal: bool;
         let mut follower_rx = None;
+        let mut sniffed_followers = Vec::new();
         {
             use crate::control::packet_sniffer::QuicSniffOutcome;
             let sniffer_key =
@@ -1341,24 +1603,21 @@ impl ControlPlaneHandle {
             if matches!(outcome, QuicSniffOutcome::Incomplete) {
                 follower_rx = lease.take_queue_receiver();
                 if let Some(rx) = follower_rx.as_mut() {
-                    outcome = self.collect_initial_fragments(sniffer_key, rx).await;
+                    (outcome, sniffed_followers) =
+                        self.collect_initial_fragments(sniffer_key, rx).await;
                 }
             }
             if matches!(outcome, QuicSniffOutcome::Incomplete) {
-                // Still unresolved within the budget.  The flow is confirmed
-                // QUIC (its Initial decrypted), so dropping is safe: the
-                // client retransmits into a fresh decision whose sniffer
-                // session already holds these fragments.  Relaying on an
-                // IP-only guess could pick the wrong outbound, offloading
-                // could bypass a domain rule — dropping is the only sound
-                // option.
                 debug!(
-                    "QUIC ClientHello unresolved within budget; dropping {} -> {} for retransmit",
+                    "QUIC ClientHello unresolved within budget; dropping for retransmit {} -> {}",
                     client_addr, original_dst
                 );
+                #[cfg(feature = "ebpf")]
+                if let Some((verdicts, identity)) = &pending {
+                    verdicts.cancel(*identity).await?;
+                }
                 return Ok(());
             }
-            sniff_terminal = outcome.is_terminal();
             quic_domain = outcome.into_domain();
         }
         if matches!(dial_mode, DialMode::Domain)
@@ -1381,7 +1640,9 @@ impl ControlPlaneHandle {
             client_addr.port(),
             17, // UDP
         );
-        let handoff = self.lookup_handoff(&tuples).await;
+        let handoff = self
+            .lookup_udp_handoff(&tuples, lease.decision_token())
+            .await?;
         let conn_info = ConnectionInfo {
             domain: quic_domain.clone(),
             dst_ip: original_dst.ip(),
@@ -1399,75 +1660,76 @@ impl ControlPlaneHandle {
             quic_domain.as_deref(),
             handoff.as_ref(),
         );
-        let (outbound_name, must) = if let Some(ho) = &handoff {
-            debug!("eBPF handoff UDP: outbound={}", ho.outbound);
+        let (userspace_outbound, userspace_must, userspace_mark, matched_rule) = {
+            let router = self.router.read().await;
+            if let Some(route) = router.route_full(&conn_info) {
+                (
+                    route.outbound_name.to_string(),
+                    route.must,
+                    route.mark,
+                    Some((route.rule_type.to_string(), route.rule_payload.to_string())),
+                )
+            } else {
+                (router.route(&conn_info).to_string(), false, 0, None)
+            }
+        };
+        let (routed_outbound, must, routed_mark) = if let Some(ho) = &handoff {
+            debug!(
+                "eBPF handoff UDP: outbound={}, token={}",
+                ho.outbound, ho.decision_token
+            );
             if ho.outbound == OutboundIndex::ControlPlaneRouting as u8 || reroute_by_sniffed_domain
             {
-                let router = self.router.read().await;
-                let (name, must) = router.route_with_must(&conn_info);
-                (name.to_string(), must)
+                (userspace_outbound, userspace_must, userspace_mark)
             } else {
-                (self.outbound_index_to_name(ho.outbound).await, ho.must != 0)
+                (
+                    self.outbound_index_to_name(ho.outbound).await,
+                    ho.must != 0,
+                    ho.mark,
+                )
             }
         } else {
-            let router = self.router.read().await;
-            let (name, must) = router.route_with_must(&conn_info);
-            (name.to_string(), must)
+            (userspace_outbound, userspace_must, userspace_mark)
         };
-        let outbound_name = self.apply_mode_override(outbound_name, must).await;
-
-        // Post-decision offload for confirmed-QUIC flows converging to
-        // direct: the flow leaves userspace without a single packet being
-        // relayed, so the server-visible 5-tuple never changes hands.
-        if sniff_terminal
-            && self
-                .try_offload_quic_flow(&tuples, &outbound_name, must, client_addr, original_dst)
-                .await
-        {
-            // Commit the handoff BEFORE claiming success: a plain lease drop
-            // would notify endpoint removal as UserspaceEndpointRetired and
-            // the removal worker would delete the conn_state that now
-            // anchors the offloaded flow.  A failed commit means the
-            // generation was retired mid-flight (reload) — do not claim the
-            // offload; the drop path unwinds the conn_state as usual.
-            if !lease.commit_offloaded() {
-                warn!(
-                    "UDP offload commit raced a generation retire for {} -> {}; offload unwound",
-                    client_addr, original_dst
-                );
-                return Ok(());
-            }
-            // Close the offload lifecycle when a sniffed domain drove the
-            // decision: once the conn_state is swept (120s idle), a
-            // mid-session packet is not an Initial and cannot be re-sniffed,
-            // so the route-time re-decision must find the domain's bitmap in
-            // DOMAIN_ROUTING_MAP — DomainKnown lets the kernel re-decide
-            // direct and offload at route time, with no userspace round-trip
-            // and no server-visible tuple change.  Only the offloaded path
-            // writes back: for a userspace-relayed flow a post-sweep kernel
-            // offload would switch the tuple mid-session.
-            if let Some(ref domain) = quic_domain {
-                let domain_drove_decision = handoff
-                    .as_ref()
-                    .map(|ho| ho.outbound == OutboundIndex::ControlPlaneRouting as u8)
-                    .unwrap_or(true)
-                    || reroute_by_sniffed_domain;
-                if domain_drove_decision {
-                    self.push_sniffed_domain_bitmap(&conn_info, domain, original_dst.ip())
-                        .await;
-                }
-            }
-            return Ok(());
-        }
-
-        let matched_rule = {
-            let router = self.router.read().await;
-            router
-                .route_full(&conn_info)
-                .map(|m| (m.rule_type.to_string(), m.rule_payload.to_string()))
-        };
+        #[cfg(feature = "ebpf")]
+        let routed_direct = routed_outbound == "direct";
+        let outbound_name = self.apply_mode_override(routed_outbound, must).await;
+        #[cfg(feature = "ebpf")]
+        let final_rule_mark = final_udp_rule_mark(routed_direct, &outbound_name, routed_mark);
+        #[cfg(not(feature = "ebpf"))]
+        let _ = routed_mark;
         self.stats
             .record_udp_route_latency(route_started_at.elapsed());
+        #[cfg(feature = "ebpf")]
+        if let Some((verdicts, identity)) = &pending {
+            match outbound_name.as_str() {
+                "direct" => {
+                    verdicts
+                        .activate_direct(*identity, &mut lease, final_rule_mark)
+                        .await?;
+                    if let Some(domain) = &quic_domain
+                        && Self::should_write_sniffed_domain_bitmap(
+                            handoff.as_ref(),
+                            reroute_by_sniffed_domain,
+                        )
+                    {
+                        self.push_sniffed_domain_bitmap(&conn_info, domain, original_dst.ip())
+                            .await;
+                    }
+                    return Ok(());
+                }
+                "block" => {
+                    verdicts.block(*identity, &mut lease).await?;
+                    return Ok(());
+                }
+                _ => {
+                    let final_outbound = self.outbound_name_to_index(&outbound_name).await;
+                    verdicts
+                        .activate_proxy(*identity, &lease, final_outbound, final_rule_mark)
+                        .await?;
+                }
+            }
+        }
         // This guard is created exactly once and is transferred to Ready only
         // after a real driver has reached its barrier.
         lease.set_connection_guard(self.stats.track_connection(&outbound_name));
@@ -1495,6 +1757,11 @@ impl ControlPlaneHandle {
             self.stats.record_error(&outbound_name);
             return Ok(());
         }
+
+        let connect_timeout = {
+            let config = self.config.read().await;
+            std::time::Duration::from_millis(config.global.connect_timeout_ms)
+        };
 
         // Cold URLTest preparation owns no endpoint state: no lease binding,
         // reply socket, driver, tracker, or application packet exists until
@@ -1607,8 +1874,9 @@ impl ControlPlaneHandle {
             ));
         }
         // Promotion is explicit and still pre-publication: detached AnyTLS
-        // sessions become generation-owned only for the finalized winner.
-        let transport = prepared_transport.commit()?;
+        // sessions and QUIC clients become generation-owned only for the
+        // finalized winner.
+        let transport = prepared_transport.commit().await?;
 
         // Both capacity (at reservation time) and anyfrom creation happen
         // after the winner is finalized and before the only first send. Any
@@ -1644,10 +1912,6 @@ impl ControlPlaneHandle {
             chain
         };
         let (conn_upload, conn_download) = endpoint.byte_counters();
-        let process_path = match &handoff {
-            Some(ho) => ho.process_path().await,
-            None => None,
-        };
         self.connection_tracker
             .register(crate::connection_tracker::ConnectionEntry {
                 id: conn_id.clone(),
@@ -1663,7 +1927,7 @@ impl ControlPlaneHandle {
                 domain: quic_domain.clone(),
                 network: "udp".to_string(),
                 process: handoff.as_ref().and_then(|ho| ho.process_name()),
-                process_path,
+                process_path: None,
             });
         endpoint.set_tracker(conn_id.clone());
         if !lease.set_tracker_id(conn_id.clone()) {
@@ -1687,6 +1951,7 @@ impl ControlPlaneHandle {
             client_addr,
             original_dst,
             lease.generation(),
+            lease.decision_token(),
             Arc::clone(&endpoint),
             queue_rx,
             reply_socket,
@@ -1708,10 +1973,11 @@ impl ControlPlaneHandle {
         let first = lease.take_first().ok_or_else(|| {
             anyhow::anyhow!("UDP initializer lost its first packet before driver start")
         })?;
-        driver.start(first)?;
+        driver.start_with_followers(first, sniffed_followers)?;
+        self.spawn_process_path_enrichment(conn_id, handoff.as_ref());
         if let Err(error) = driver.wait_first_ack().await {
-            // PacketTransport Err and timeout are both ambiguous: the winner
-            // may have received data, so never replay this packet elsewhere.
+            // PacketTransport Err and timeout are ambiguous: the winner may
+            // have received part of the initial flight, so never replay it.
             self.stats.record_error(&outbound_name);
             return Err(error.into());
         }
@@ -1722,14 +1988,9 @@ impl ControlPlaneHandle {
         Ok(())
     }
 
-    /// After a userspace routing decision that used a sniffed domain, write
-    /// the matched domain rule's bitmap back into `DOMAIN_ROUTING_MAP` for
-    /// the destination IP, so the datapath can re-decide later flows to that
-    /// IP from the learned entry (DomainKnown) instead of userspace
-    /// sniffing.  Shared by the TCP sniff path and the UDP drop-and-reinject
-    /// offload; the entry lives in the same map and follows the same
-    /// lifecycle as DNS-learned routes (it survives conn_state sweeps).
-    /// Best-effort: a write failure is logged and never fails the flow.
+    /// Publish the matched sniffed-domain bitmap so later route-time
+    /// decisions can use the learned destination IP. Best-effort: a write
+    /// failure never fails the flow.
     async fn push_sniffed_domain_bitmap(
         &self,
         conn_info: &ConnectionInfo,
@@ -1780,26 +2041,30 @@ impl ControlPlaneHandle {
     /// A fragmented ClientHello: feed queued follower Initials to the
     /// sniffer until it resolves, or the packet/time budget runs out.
     /// Fragments of one flight arrive back-to-back, so the budget is small
-    /// and the common single-Initial path never enters this loop.  Followers
-    /// consumed here are gone from the driver queue; a flow that proceeds
-    /// to the userspace relay relies on the client's retransmission for
-    /// them (the flow is confirmed QUIC at this point, so that is safe).
+    /// and the common single-Initial path never enters this loop. Retained
+    /// followers are returned in receive order for the canonical UDP
+    /// endpoint driver.
     async fn collect_initial_fragments(
         &self,
         sniffer_key: crate::control::packet_sniffer::PacketSnifferKey,
         rx: &mut tokio::sync::mpsc::Receiver<crate::control::udp_endpoint::QueuedDatagram>,
-    ) -> crate::control::packet_sniffer::QuicSniffOutcome {
+    ) -> (
+        crate::control::packet_sniffer::QuicSniffOutcome,
+        Vec<crate::control::udp_endpoint::QueuedDatagram>,
+    ) {
         use crate::control::packet_sniffer::QuicSniffOutcome;
         const MAX_FRAGMENTS: u32 = 8;
         const MAX_WAIT: Duration = Duration::from_millis(250);
         let deadline = tokio::time::Instant::now() + MAX_WAIT;
         let mut outcome = QuicSniffOutcome::Incomplete;
+        let mut collected = Vec::with_capacity(MAX_FRAGMENTS as usize);
         for _ in 0..MAX_FRAGMENTS {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
                 Ok(Some(datagram)) => {
                     outcome = self
                         .sniffer_pool
                         .feed_quic_initial(sniffer_key, datagram.payload());
+                    collected.push(datagram);
                     if !matches!(outcome, QuicSniffOutcome::Incomplete) {
                         break;
                     }
@@ -1807,92 +2072,7 @@ impl ControlPlaneHandle {
                 _ => break,
             }
         }
-        outcome
-    }
-
-    /// UDP post-decision kernel offload via drop-and-reinject.  When the
-    /// flow's control-plane decision has fully converged (routing with the
-    /// sniffed domain, mode override) to `direct` and the sniff reached a
-    /// terminal confirmed-QUIC state (SNI extracted, or a complete
-    /// ClientHello without one — never an Incomplete CH), the flow is
-    /// released back to the kernel without userspace relaying a single
-    /// byte: publish `ROUTING_META_FLAG_OFFLOAD` on its conn_state and let
-    /// the caller commit the lease's `commit_offloaded` handoff, dropping
-    /// the in-flight Initial and any queued followers.  QUIC clients must
-    /// retransmit a lost Initial (RFC 9000), so the retransmission arrives
-    /// on the `lan_ingress` established-UDP path and passes straight
-    /// through; from the first server-seen packet onward the 5-tuple is the
-    /// client's own, never the engine's ephemeral socket.  The only cost is
-    /// one Initial RTO at flow setup.
-    ///
-    /// Non-QUIC flows are never offloaded here: they have no retransmission
-    /// guarantee, so dropping their first datagram could lose it — they keep
-    /// the full userspace relay.  No endpoint, tracker entry, or stats
-    /// connection is created on this path (the branch runs before any of
-    /// them exist), so nothing userspace-side is left frozen behind an
-    /// offloaded flow.  After 120s of silence the conn_state is swept and
-    /// the next Initial simply repeats this decide-drop-reinject cycle.
-    ///
-    /// Returns `true` when the offload bit was published and the caller must
-    /// commit the handoff and return.  A failed or impossible conn_state
-    /// write falls back to the ordinary userspace relay (`false`).
-    async fn try_offload_quic_flow(
-        &self,
-        tuples: &TuplesKey,
-        outbound_name: &str,
-        must: bool,
-        client_addr: SocketAddr,
-        original_dst: SocketAddr,
-    ) -> bool {
-        // Opt-in while the semantics bed in, parsed once at startup.
-        // Route-time must-direct offload is unaffected (kernel path from
-        // packet one).
-        if !self.udp_post_decision_offload {
-            return false;
-        }
-        // Evaluate the predicate before the await: the read guard is !Send.
-        let allowed = {
-            let mode = self.mode_state.as_ref().map(|state| state.read());
-            udp_post_decision_offload_allowed(
-                mode.as_deref(),
-                outbound_name,
-                must,
-                client_addr,
-                original_dst,
-            )
-        };
-        if !allowed {
-            return false;
-        }
-        match self.ebpf.write().await.offload_udp_flow(tuples) {
-            Ok(true) => {
-                debug!(
-                    network = "udp",
-                    outbound = %outbound_name,
-                    ip = %original_dst,
-                    src = %client_addr,
-                    ebpf_offload = true,
-                    "QUIC flow offloaded to eBPF, Initial dropped for retransmit: {} -> {}",
-                    client_addr,
-                    original_dst,
-                );
-                true
-            }
-            Ok(false) => {
-                trace!(
-                    "UDP offload skipped, no published conn_state: {} -> {}",
-                    client_addr, original_dst,
-                );
-                false
-            }
-            Err(error) => {
-                warn!(
-                    "UDP offload write failed for {} -> {}; staying in userspace: {}",
-                    client_addr, original_dst, error
-                );
-                false
-            }
-        }
+        (outcome, collected)
     }
 
     /// Dial through a node using the TCP connection pool.
@@ -1928,34 +2108,45 @@ impl ControlPlaneHandle {
             .find(node.protocol)
             .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", node.protocol))?;
 
-        if !pool_disabled {
-            // Ready pool: a fully-dialed stream bound to this exact
-            // node+target. Reused directly as the data channel.
-            if (entry.descriptor.pool_ready_streams)(node) {
-                let key = ConnectionPool::ready_key(&addr, target, target_domain);
-                if let Some(stream) = pool.acquire_ready(&key).await {
-                    tracing::debug!(
-                        "Pooled ready stream via {} acquired for {} (handshake skipped)",
-                        addr,
-                        target
-                    );
-                    return Ok(stream);
-                }
+        if !pool_disabled && (entry.descriptor.pool_ready_streams)(node) {
+            let key = ConnectionPool::ready_key(&addr, target, target_domain);
+            if let Some(stream) = pool.acquire_ready(&key).await {
+                tracing::debug!(
+                    "Pooled ready stream via {} acquired for {} (handshake skipped)",
+                    addr,
+                    target
+                );
+                return Ok(stream);
             }
+        }
 
-            // Bare pool: raw TCP to the proxy server. Multiplexed
-            // protocols opt out (pool_bare_tcp): their session pool
-            // already holds warm connections and a bare hit would force
-            // a new mux session per flow.
-            if (entry.descriptor.pool_bare_tcp)(node)
-                && let Some(tcp) = pool.acquire_tcp(&addr).await
-            {
-                tracing::debug!("Pooled TCP to {} acquired for {}", addr, target);
-                return entry
-                    .tcp
-                    .dial_with_tcp(node, target, target_domain, tcp, connect_timeout)
-                    .await;
-            }
+        // Ready streams paid their connect and protocol handshake before
+        // entering this path. For a pool miss, gate only work that can open
+        // a physical connection: a warm generation-owned QUIC/AnyTLS runtime
+        // merely opens a logical stream on its retained transport.
+        let reuses_generation_transport = entry.descriptor.has_generation_runtime()
+            && generation
+                .get(&node.id)
+                .is_some_and(|runtime| runtime.is_warm_or_stateless());
+        let _dial_permit = if matches!(node.protocol, NodeProtocol::Direct | NodeProtocol::Block)
+            || reuses_generation_transport
+        {
+            None
+        } else {
+            Some(generation.acquire_dial_permit().await)
+        };
+
+        // A raw pooled TCP still needs its protocol handshake. Multiplexed
+        // protocols opt out because their node runtime owns the transport.
+        if !pool_disabled
+            && (entry.descriptor.pool_bare_tcp)(node)
+            && let Some(tcp) = pool.acquire_tcp(&addr).await
+        {
+            tracing::debug!("Pooled TCP to {} acquired for {}", addr, target);
+            return entry
+                .tcp
+                .dial_with_tcp(node, target, target_domain, tcp, connect_timeout)
+                .await;
         }
 
         // Pool miss (or pools disabled) — fresh connect through the
@@ -2035,11 +2226,19 @@ mod sniffed_domain_routing_tests {
             outbound,
             must,
             mark: 0,
+            decision_token: 0,
             dscp: 0,
             mac: [0; 6],
             pname: [0; 16],
             pid: 0,
         }
+    }
+
+    #[test]
+    fn udp_direct_mark_preserves_rule_and_clears_override() {
+        assert_eq!(final_udp_rule_mark(true, "direct", 0x1234), 0x1234);
+        assert_eq!(final_udp_rule_mark(false, "direct", 0x1234), 0);
+        assert_eq!(final_udp_rule_mark(false, "proxy", 0x1234), 0x1234);
     }
 
     #[test]
@@ -2159,5 +2358,327 @@ mod cold_urltest_tests {
             2,
             "cancelled unreleased candidate must not start"
         );
+    }
+}
+
+#[cfg(test)]
+mod tcp_flow_lifecycle_tests {
+    use super::*;
+    use crate::connection_tracker::ConnectionEntry;
+    use crate::ebpf::mock::MockEbpfBackend;
+    use honk_ebpf_common::RedirectTuple;
+    use honk_ebpf_common::conn::{ConnState, TcpState};
+    use std::net::{IpAddr, Ipv4Addr};
+    use tokio::io::AsyncReadExt;
+
+    fn forward_tuple() -> TuplesKey {
+        build_tuples_key(
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2)),
+            443,
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            50_000,
+            6,
+        )
+    }
+
+    fn reverse_tuple() -> TuplesKey {
+        build_tuples_key(
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            50_000,
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2)),
+            443,
+            6,
+        )
+    }
+
+    fn set_padding(tuple: &mut TuplesKey, padding: [u8; 3]) {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                padding.as_ptr(),
+                (tuple as *mut TuplesKey).cast::<u8>().add(37),
+                padding.len(),
+            );
+        }
+    }
+
+    fn backend() -> Arc<RwLock<Box<dyn EbpfBackend>>> {
+        Arc::new(RwLock::new(Box::new(MockEbpfBackend::new())))
+    }
+
+    fn tracked_entry(id: &str) -> ConnectionEntry {
+        ConnectionEntry {
+            id: id.to_string(),
+            source: "192.0.2.1:50000".to_string(),
+            destination: "203.0.113.2:443".to_string(),
+            proxy: "direct".to_string(),
+            rule: "Fallback".to_string(),
+            rule_payload: String::new(),
+            chains: vec!["direct".to_string()],
+            upload: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            download: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            start_time: std::time::Instant::now(),
+            domain: None,
+            network: "tcp".to_string(),
+            process: None,
+            process_path: None,
+        }
+    }
+
+    async fn tcp_pair() -> anyhow::Result<(TcpStream, TcpStream)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let connect = TcpStream::connect(addr);
+        let (accepted, peer) = tokio::join!(listener.accept(), connect);
+        Ok((accepted?.0, peer?))
+    }
+
+    #[test]
+    fn directional_key_ignores_padding_and_refcounts_owners() {
+        let mut first = forward_tuple();
+        let mut second = forward_tuple();
+        set_padding(&mut first, [1, 2, 3]);
+        set_padding(&mut second, [4, 5, 6]);
+        let key = TcpFlowKey::from_tuples(&first);
+
+        assert_eq!(key, TcpFlowKey::from_tuples(&second));
+        assert_eq!(
+            key,
+            TcpFlowKey::from_redirect(&RedirectTuple::from_tuples(&first))
+        );
+        let reverse = TcpFlowKey::from_tuples(&reverse_tuple());
+        assert_ne!(key, reverse);
+
+        let pins = TcpFlowPins::default();
+        pins.retain(key);
+        pins.retain(key);
+        pins.retain(reverse);
+        assert_eq!(pins.snapshot().len(), 2);
+        assert_eq!(pins.release(key), Some(false));
+        assert!(pins.snapshot().contains(&key));
+        assert_eq!(pins.release(key), Some(true));
+        assert!(!pins.snapshot().contains(&key));
+        assert!(pins.snapshot().contains(&reverse));
+        assert_eq!(pins.release(key), None);
+        assert_eq!(pins.release(reverse), Some(true));
+        assert!(pins.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tcp_flow_guard_abort_releases_pin_tracker_and_socket() -> anyhow::Result<()> {
+        let (stream, mut peer) = tcp_pair().await?;
+        let pins = Arc::new(TcpFlowPins::default());
+        let tracker = Arc::new(ConnectionTracker::new());
+        let mut flow = TcpFlowGuard::new(
+            stream,
+            forward_tuple(),
+            Arc::clone(&pins),
+            backend(),
+            Arc::clone(&tracker),
+        );
+        flow.track(tracked_entry("abort"));
+        assert_eq!(pins.snapshot().len(), 1);
+        assert_eq!(tracker.snapshot().len(), 1);
+
+        let task = tokio::spawn(async move {
+            let _flow = flow;
+            std::future::pending::<()>().await;
+        });
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(pins.snapshot().is_empty());
+        assert!(tracker.snapshot().is_empty());
+
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), peer.read(&mut byte)).await??,
+            0
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tcp_retire_waits_for_final_owner() -> anyhow::Result<()> {
+        let tuple = forward_tuple();
+        let backend = backend();
+        backend.write().await.tcp_conn_state_store(
+            &tuple,
+            &ConnState {
+                state: TcpState::TcpStateActive as u8,
+                last_seen_ns: 0,
+                ..Default::default()
+            },
+        )?;
+        let pins = Arc::new(TcpFlowPins::default());
+        let tracker = Arc::new(ConnectionTracker::new());
+        let (first_stream, _first_peer) = tcp_pair().await?;
+        let (second_stream, _second_peer) = tcp_pair().await?;
+        let first = TcpFlowGuard::new(
+            first_stream,
+            tuple,
+            Arc::clone(&pins),
+            Arc::clone(&backend),
+            Arc::clone(&tracker),
+        );
+        let second = TcpFlowGuard::new(
+            second_stream,
+            tuple,
+            Arc::clone(&pins),
+            Arc::clone(&backend),
+            tracker,
+        );
+
+        first.retire().await;
+        assert!(
+            backend
+                .read()
+                .await
+                .tcp_conn_state_lookup(&tuple)?
+                .is_some()
+        );
+        assert!(pins.snapshot().contains(&TcpFlowKey::from_tuples(&tuple)));
+
+        second.retire().await;
+        assert!(
+            backend
+                .read()
+                .await
+                .tcp_conn_state_lookup(&tuple)?
+                .is_none()
+        );
+        assert!(pins.snapshot().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tcp_retire_preserves_newer_incarnation() -> anyhow::Result<()> {
+        let tuple = forward_tuple();
+        let reverse = reverse_tuple();
+        let old = ConnState {
+            state: TcpState::TcpStateActive as u8,
+            last_seen_ns: 0,
+            ..Default::default()
+        };
+        let backend = backend();
+        {
+            let mut backend = backend.write().await;
+            backend.tcp_conn_state_store(&tuple, &old)?;
+            backend.tcp_conn_state_store(&reverse, &old)?;
+        }
+
+        let pins = Arc::new(TcpFlowPins::default());
+        let tracker = Arc::new(ConnectionTracker::new());
+        let (stream, mut peer) = tcp_pair().await?;
+        let mut flow = TcpFlowGuard::new(
+            stream,
+            tuple,
+            Arc::clone(&pins),
+            Arc::clone(&backend),
+            Arc::clone(&tracker),
+        );
+        flow.track(tracked_entry("replacement"));
+
+        let mut backend_guard = backend.write().await;
+        let retire = tokio::spawn(flow.retire());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !tracker.snapshot().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        backend_guard.tcp_conn_state_store(
+            &tuple,
+            &ConnState {
+                last_seen_ns: u64::MAX,
+                ..old
+            },
+        )?;
+        drop(backend_guard);
+        retire.await?;
+
+        let backend = backend.read().await;
+        assert_eq!(
+            backend
+                .tcp_conn_state_lookup(&tuple)?
+                .expect("replacement state")
+                .last_seen_ns,
+            u64::MAX
+        );
+        assert!(backend.tcp_conn_state_lookup(&reverse)?.is_some());
+        drop(backend);
+        assert!(pins.snapshot().is_empty());
+        assert!(tracker.snapshot().is_empty());
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), peer.read(&mut byte)).await??,
+            0
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod dial_permit_scope_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ready_pool_hit_does_not_wait_for_physical_dial_permit() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let tcp = tokio::net::TcpStream::connect(server_addr).await.unwrap();
+        let target: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let mut node = Node {
+            name: "ready-socks".into(),
+            protocol: NodeProtocol::Socks5,
+            address: server_addr.ip().to_string(),
+            port: server_addr.port(),
+            ..Default::default()
+        };
+        node.id = node.derive_id();
+        let generation = Arc::new(
+            honk_outbound::runtime::OutboundRuntimeRegistry::build_reusing(
+                &[node.clone()],
+                1,
+                None,
+            )
+            .unwrap()
+            .0,
+        );
+        let _held = generation.acquire_dial_permit().await;
+        let pool = ConnectionPool::new();
+        let key =
+            ConnectionPool::ready_key(&format!("{}:{}", node.host(), node.port), target, None);
+        pool.deposit_ready(
+            &key,
+            crate::proxy::ProxyStream {
+                stream: Box::new(tcp),
+                target_addr: target,
+                target_domain: None,
+            },
+        )
+        .await;
+        let registry = ProxyRegistry::default_resolver().unwrap();
+
+        let stream = tokio::time::timeout(
+            Duration::from_millis(100),
+            ControlPlaneHandle::dial_pooled(
+                &registry,
+                &pool,
+                &generation,
+                &node,
+                target,
+                None,
+                Duration::from_secs(1),
+            ),
+        )
+        .await
+        .expect("ready stream must bypass an exhausted physical-dial gate")
+        .unwrap();
+
+        drop(stream);
+        server.abort();
     }
 }

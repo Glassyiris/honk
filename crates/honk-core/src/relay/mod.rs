@@ -200,8 +200,8 @@ pub async fn relay_tcp<S1, S2>(
     target_addr: SocketAddr,
 ) -> anyhow::Result<RelayStats>
 where
-    S1: AsyncRead + AsyncWrite + Send + Unpin + 'static,
-    S2: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    S1: AsyncRead + AsyncWrite + Send + Unpin,
+    S2: AsyncRead + AsyncWrite + Send + Unpin,
 {
     let start = tokio::time::Instant::now();
 

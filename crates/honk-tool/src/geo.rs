@@ -15,8 +15,8 @@ use honk_core::routing::{GeoipScan, GeositeEntry, GeositeScan, find_geoip_dat, f
 pub struct GeositeArgs {
     #[command(subcommand)]
     action: GeositeAction,
-    /// Path to geosite.dat (default: ./geosite.dat, then the dae asset
-    /// locations /usr/local/share/dae, /usr/share/dae, /etc/dae).
+    /// Path to geosite.dat (default: $DAE_LOCATION_ASSET, then
+    /// /var/share/honk/geosite.dat, ./geosite.dat, and dae asset locations).
     #[arg(long, global = true)]
     pub file: Option<PathBuf>,
 }
@@ -42,8 +42,8 @@ enum GeositeAction {
 pub struct GeoipArgs {
     #[command(subcommand)]
     action: GeoipAction,
-    /// Path to geoip.dat (default: ./geoip.dat, then the dae asset
-    /// locations /usr/local/share/dae, /usr/share/dae, /etc/dae).
+    /// Path to geoip.dat (default: $DAE_LOCATION_ASSET, then
+    /// /var/share/honk/geoip.dat, ./geoip.dat, and dae asset locations).
     #[arg(long, global = true)]
     pub file: Option<PathBuf>,
 }
@@ -111,8 +111,8 @@ fn resolve_dat(
     }
     find().ok_or_else(|| {
         anyhow::anyhow!(
-            "{name} not found (tried ./{name}, /usr/local/share/dae, /usr/share/dae, \
-             /etc/dae, $DAE_LOCATION_ASSET) — pass --file PATH"
+            "{name} not found (tried $DAE_LOCATION_ASSET, /var/share/honk/{name}, ./{name}, \
+             /usr/local/share/dae, /usr/share/dae, /etc/dae) — pass --file PATH"
         )
     })
 }

@@ -2,8 +2,11 @@
 
 mod connection;
 pub mod dns_control;
+mod dns_listener;
 pub mod drain;
 pub mod janitor;
+#[cfg(feature = "ebpf")]
+pub(crate) mod nfqueue;
 pub mod packet_sniffer;
 mod probers;
 pub mod quic;
@@ -32,6 +35,8 @@ use crate::sniffing;
 use crate::stats::StatsManager;
 use bytes::Bytes;
 use drain::DrainTracker;
+#[cfg(feature = "ebpf")]
+use futures::FutureExt;
 use honk_config::node::{Group, GroupPolicy};
 use honk_config::{
     Config,
@@ -45,7 +50,7 @@ use socket2::{Domain, Socket, Type};
 use std::io;
 use std::net::SocketAddr;
 use std::os::unix::io::{AsRawFd, RawFd};
-
+use std::path::Path;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::Mutex;
@@ -54,6 +59,173 @@ use tokio::io::Interest;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, trace, warn};
+
+#[cfg(feature = "ebpf")]
+#[derive(Debug, thiserror::Error)]
+enum NfqueueRuntimeFatal {
+    #[error("NFQUEUE listener failed: {0}")]
+    Listener(#[source] honk_nfqueue::FatalError),
+    #[error("NFQUEUE listener fatal channel closed")]
+    ListenerChannelClosed,
+    #[error("{0}")]
+    Pending(#[source] nfqueue::PendingUdpFatal),
+    #[error("NFQUEUE pending fatal channel closed")]
+    PendingChannelClosed,
+    #[error("UDP decision token allocator exhausted (locked backstop)")]
+    TokenExhaustionBackstop,
+    #[error("UDP decision token backstop failed: {0}")]
+    TokenBackstop(String),
+    #[error("NFQUEUE watchdog exited unexpectedly: {0}")]
+    Watchdog(String),
+}
+
+#[cfg(feature = "ebpf")]
+struct NfqueueRuntime {
+    service: Option<honk_nfqueue::NfqueueService>,
+    listener_fatal: honk_nfqueue::FatalReceiver,
+    pending_fatal: mpsc::UnboundedReceiver<nfqueue::PendingUdpFatal>,
+    stats: Arc<StatsManager>,
+    pending: Arc<nfqueue::PendingUdpVerdicts>,
+    stop: tokio::sync::watch::Sender<bool>,
+    watchdog: Option<tokio::task::JoinHandle<()>>,
+    token_backstop: tokio::time::Interval,
+}
+
+#[cfg(feature = "ebpf")]
+impl NfqueueRuntime {
+    async fn next_fatal(
+        &mut self,
+        ebpf: &Arc<RwLock<Box<dyn EbpfBackend>>>,
+    ) -> NfqueueRuntimeFatal {
+        loop {
+            let listener_fatal = &mut self.listener_fatal;
+            let pending_fatal = &mut self.pending_fatal;
+            let token_backstop = &mut self.token_backstop;
+            let watchdog = self
+                .watchdog
+                .as_mut()
+                .expect("NFQUEUE watchdog is retained until shutdown");
+            tokio::select! {
+                result = listener_fatal => {
+                    return match result {
+                        Ok(error) => NfqueueRuntimeFatal::Listener(error),
+                        Err(_) => NfqueueRuntimeFatal::ListenerChannelClosed,
+                    };
+                }
+                fatal = pending_fatal.recv() => {
+                    return fatal
+                        .map(NfqueueRuntimeFatal::Pending)
+                        .unwrap_or(NfqueueRuntimeFatal::PendingChannelClosed);
+                }
+                result = watchdog => {
+                    return NfqueueRuntimeFatal::Watchdog(match result {
+                        Ok(()) => "completed".to_string(),
+                        Err(error) => error.to_string(),
+                    });
+                }
+                _ = token_backstop.tick() => {
+                    match ebpf.read().await.udp_decision_sequence_exhausted() {
+                        Ok(true) => {
+                            self.stats.record_udp_nfqueue_token_exhaustion();
+                            return NfqueueRuntimeFatal::TokenExhaustionBackstop;
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            return NfqueueRuntimeFatal::TokenBackstop(error.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    async fn check_startup_health(
+        &mut self,
+        ebpf: &Arc<RwLock<Box<dyn EbpfBackend>>>,
+    ) -> Result<(), NfqueueRuntimeFatal> {
+        match self.listener_fatal.try_recv() {
+            Ok(error) => return Err(NfqueueRuntimeFatal::Listener(error)),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                return Err(NfqueueRuntimeFatal::ListenerChannelClosed);
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+        }
+        match self.pending_fatal.try_recv() {
+            Ok(error) => return Err(NfqueueRuntimeFatal::Pending(error)),
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                return Err(NfqueueRuntimeFatal::PendingChannelClosed);
+            }
+            Err(mpsc::error::TryRecvError::Empty) => {}
+        }
+        if self
+            .watchdog
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+        {
+            return Err(NfqueueRuntimeFatal::Watchdog("completed".to_string()));
+        }
+        match ebpf.read().await.udp_decision_sequence_exhausted() {
+            Ok(false) => Ok(()),
+            Ok(true) => {
+                self.stats.record_udp_nfqueue_token_exhaustion();
+                Err(NfqueueRuntimeFatal::TokenExhaustionBackstop)
+            }
+            Err(error) => Err(NfqueueRuntimeFatal::TokenBackstop(error.to_string())),
+        }
+    }
+    async fn begin_pending_drain(&self) {
+        self.pending.cancel_all().await;
+        self.pending.wait_empty().await;
+    }
+
+    async fn finish_pending_drain(&mut self) -> anyhow::Result<()> {
+        self.pending.cancel_all().await;
+        self.pending.wait_empty().await;
+        let _ = self.stop.send(true);
+        if let Some(watchdog) = self.watchdog.take() {
+            watchdog
+                .await
+                .map_err(|error| anyhow::anyhow!("join NFQUEUE watchdog: {error}"))?;
+        }
+        Ok(())
+    }
+    async fn shutdown_service(&mut self) -> anyhow::Result<()> {
+        let service = self
+            .service
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("NFQUEUE service already stopped"))?;
+        tokio::task::spawn_blocking(move || service.shutdown())
+            .await
+            .map_err(|error| anyhow::anyhow!("join NFQUEUE shutdown: {error}"))?
+            .map_err(|error| anyhow::anyhow!("shutdown NFQUEUE: {error}"))
+    }
+    fn take_shutdown_fatal(&mut self) -> Option<NfqueueRuntimeFatal> {
+        if let Ok(error) = self.listener_fatal.try_recv() {
+            return Some(NfqueueRuntimeFatal::Listener(error));
+        }
+        if let Ok(error) = self.pending_fatal.try_recv() {
+            return Some(NfqueueRuntimeFatal::Pending(error));
+        }
+        None
+    }
+}
+#[cfg(feature = "ebpf")]
+async fn wait_nfqueue_fatal(
+    runtime: &mut Option<NfqueueRuntime>,
+    ebpf: &Arc<RwLock<Box<dyn EbpfBackend>>>,
+) -> anyhow::Error {
+    let Some(runtime) = runtime.as_mut() else {
+        return std::future::pending::<anyhow::Error>().await;
+    };
+    anyhow::Error::new(runtime.next_fatal(ebpf).await)
+}
+
+#[cfg(not(feature = "ebpf"))]
+async fn wait_nfqueue_fatal(
+    _runtime: &mut (),
+    _ebpf: &Arc<RwLock<Box<dyn EbpfBackend>>>,
+) -> anyhow::Error {
+    std::future::pending::<anyhow::Error>().await
+}
 
 /// Bound for shutdown stages that have no natural deadline (watcher join,
 /// runtime-generation retirement, DNS controller/persistence close). The
@@ -94,7 +266,6 @@ use connection::*;
 use probers::*;
 use reload::*;
 pub(crate) use resource_budget::{MAX_EFFECTIVE_NOFILE, ResourceBudget};
-pub use sockets::DnsBpfNotifier;
 use sockets::*;
 
 #[derive(Debug, Clone)]
@@ -125,6 +296,7 @@ pub struct ControlPlane {
     alive_set: Arc<crate::outbound::AliveDialerSet>,
     connection_pool: Arc<ConnectionPool>,
     connection_tracker: Arc<ConnectionTracker>,
+    tcp_flow_pins: Arc<TcpFlowPins>,
     /// Persistent cache (selector choices, clash mode); opened by `run()`
     /// via `init_cache_db` when `experimental.cache_file` is enabled.
     cache_db: Option<Arc<crate::cachedb::CacheDb>>,
@@ -145,17 +317,26 @@ pub struct ControlPlane {
     /// separate from generic background tasks so reload/shutdown can abort
     /// and drain it in the required ownership order.
     udp_warm_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// Shared clash mode state (Rule/Global/Direct + GLOBAL selection),
-    /// installed by `set_mode_state` when the clash API is enabled.
+    /// UDP warm NodeIds survive task replacement so a reload can release
+    /// retention that disappeared from the replacement plan.
+    udp_warm_ids: Arc<parking_lot::Mutex<std::collections::HashSet<uuid::Uuid>>>,
+    /// Generation-owned task that pins every Selector's configured leaf.
+    selector_warm_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Choice changes wake reconciliation immediately; a short periodic pass
+    /// repairs sessions lost independently of group changes.
+    selector_warm_notify: Arc<tokio::sync::Notify>,
+    /// Desired selector NodeIds survive task replacement across reloads so
+    /// reused runtimes can release choices that disappeared.
+    selector_warm_ids: Arc<parking_lot::Mutex<std::collections::HashSet<uuid::Uuid>>>,
+    /// Bare-TCP pins are userspace-pool resources rather than NodeRuntime
+    /// state, so their addresses are tracked separately for exact cleanup.
+    selector_bare_warm: Arc<parking_lot::Mutex<std::collections::HashMap<uuid::Uuid, String>>>,
+    /// Startup mode snapshot shared by routing decisions and serialized flags updates.
     mode_state: Option<crate::mode::SharedModeState>,
-    /// Drop-and-reinject UDP post-decision offload, parsed once from
-    /// `HONK_UDP_POST_DECISION_OFFLOAD` at startup (tests inject the field
-    /// directly — no env mutation).
-    udp_post_decision_offload: bool,
-    /// Cached static half of the datapath offload policy
-    /// (`DATAPATH_FLAG_OFFLOAD_NO_DOMAIN_RULES` or 0), recomputed by
-    /// `sync_direct_offload_flags` and shared with the clash API.
-    direct_offload_static: Arc<std::sync::atomic::AtomicU32>,
+    /// Sole writer for mode state and DATAPATH_FLAGS_MAP publication.
+    datapath_flags: Option<crate::mode::DatapathFlagsHandle>,
+    #[cfg(feature = "ebpf")]
+    pending_udp_verdicts: Option<Arc<nfqueue::PendingUdpVerdicts>>,
     datapath_healthy: Arc<std::sync::atomic::AtomicBool>,
     active_routing_plan: Arc<parking_lot::RwLock<Arc<routing_matcher::RoutingPushPlan>>>,
     /// Interface watcher, stopped and joined before `detach_hooks` during
@@ -168,16 +349,13 @@ fn accepts_transparent_connection(drain: &DrainTracker) -> bool {
     !drain.should_reject()
 }
 
-/// Retire conntrack entries as UDP endpoints die (event-driven lifecycle;
-/// the datapath/janitor timeouts remain the backstop), and drop the flow
-/// from the clash-API tracker.  A `KernelOffloadHandoff` removal keeps the
-/// conn_state: it anchors a flow that was handed to the kernel by the
-/// drop-and-reinject offload.  Extracted so tests can run the real
-/// production worker against a mock backend.
+/// Retire an endpoint only through its token-bound backend incarnation, then
+/// acknowledge the exact pool tombstone while preserving kernel handoffs.
 pub(crate) fn spawn_udp_removal_worker(
     udp_pool: Arc<UdpEndpointPool>,
     ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
     tracker: Arc<ConnectionTracker>,
+    fatal_tx: mpsc::UnboundedSender<anyhow::Error>,
 ) -> tokio::task::JoinHandle<()> {
     use crate::control::udp_endpoint::RemovalReason;
     const UDP_REMOVAL_QUEUE_CAPACITY: usize = 1024;
@@ -188,7 +366,6 @@ pub(crate) fn spawn_udp_removal_worker(
     udp_pool.set_remove_sink(remove_tx);
     tokio::spawn(async move {
         let mut removals = Vec::with_capacity(UDP_REMOVAL_BATCH_SIZE);
-        let mut keys = Vec::with_capacity(UDP_REMOVAL_BATCH_SIZE * 2);
         while let Some(first) = remove_rx.recv().await {
             removals.clear();
             removals.push(first);
@@ -200,40 +377,70 @@ pub(crate) fn spawn_udp_removal_worker(
                 }
             }
 
-            keys.clear();
+            let mut backend = ebpf.write().await;
             for removal in removals.drain(..) {
-                if let Some(id) = removal.conn_id {
-                    tracker.remove(&id);
+                if let Some(id) = removal.conn_id.as_deref() {
+                    tracker.remove(id);
                 }
-                if removal.reason == RemovalReason::KernelOffloadHandoff {
-                    continue;
+                let backend_clean = if removal.reason == RemovalReason::UserspaceEndpointRetired {
+                    let key = crate::control::connection::build_tuples_key(
+                        removal.dst.ip(),
+                        removal.dst.port(),
+                        removal.client.ip(),
+                        removal.client.port(),
+                        17,
+                    );
+                    match backend.remove_udp_flow(&key, removal.decision_token) {
+                        Ok(crate::ebpf::UdpDecisionCommitResult::Applied)
+                        | Ok(crate::ebpf::UdpDecisionCommitResult::Missing) => true,
+                        Ok(result) => {
+                            warn!(
+                                ?result,
+                                token = removal.decision_token,
+                                generation = removal.generation,
+                                "UDP retirement identity mismatch; retaining tombstone and signaling fatal"
+                            );
+                            let _ = fatal_tx.send(anyhow::anyhow!(
+                                "UDP retirement identity mismatch: result={result:?}, token={}, generation={}",
+                                removal.decision_token,
+                                removal.generation
+                            ));
+                            false
+                        }
+                        Err(error) => {
+                            error!(
+                                %error,
+                                token = removal.decision_token,
+                                generation = removal.generation,
+                                "token-bound UDP retirement failed; retaining tombstone and signaling fatal"
+                            );
+                            let _ = fatal_tx.send(anyhow::anyhow!(
+                                "token-bound UDP retirement failed: {error}; token={}, generation={}",
+                                removal.decision_token,
+                                removal.generation
+                            ));
+                            false
+                        }
+                    }
+                } else {
+                    true
+                };
+                if backend_clean
+                    && !udp_pool.complete_removal(
+                        removal.client,
+                        removal.dst,
+                        removal.decision_token,
+                        removal.generation,
+                    )
+                {
+                    debug!(
+                        token = removal.decision_token,
+                        generation = removal.generation,
+                        "ignored stale UDP retirement acknowledgement"
+                    );
                 }
-                let fwd = crate::control::connection::build_tuples_key(
-                    removal.dst.ip(),
-                    removal.dst.port(),
-                    removal.client.ip(),
-                    removal.client.port(),
-                    17,
-                );
-                let mut rev = fwd;
-                std::mem::swap(&mut rev.src_ip, &mut rev.dst_ip);
-                std::mem::swap(&mut rev.src_port, &mut rev.dst_port);
-                keys.extend([fwd, rev]);
             }
-            if keys.is_empty() {
-                udp_pool.flush_removal_dirty();
-                continue;
-            }
-
-            let mut ebpf = ebpf.write().await;
-            match ebpf.udp_conn_state_remove_batch(&keys) {
-                Ok(removed) => {
-                    crate::ebpf::USERSPACE_CONN_STATE_DELETES
-                        .fetch_add(removed as u64, std::sync::atomic::Ordering::Relaxed);
-                }
-                Err(error) => warn!(%error, "failed to remove UDP conntrack batch"),
-            }
-            drop(ebpf);
+            drop(backend);
             udp_pool.flush_removal_dirty();
         }
     })
@@ -400,9 +607,6 @@ impl ControlPlane {
         dns_upstream_pool.set_traffic_router_snapshot(Arc::clone(&pinned_router));
         let initial_routing_plan = Arc::new(Self::compile_routing_plan(&config, &router)?);
         let initial_push_result = initial_routing_plan.result();
-        let direct_offload_static = Arc::new(std::sync::atomic::AtomicU32::new(
-            direct_offload_static_bit(&config, &initial_routing_plan),
-        ));
         let ebpf_arc = Arc::new(RwLock::new(ebpf));
         let router_arc = Arc::new(RwLock::new(router));
         let config_arc = Arc::new(RwLock::new(config));
@@ -486,6 +690,7 @@ impl ControlPlane {
                 resource_budget.tcp_pool_entries,
             )),
             connection_tracker: Arc::new(ConnectionTracker::new()),
+            tcp_flow_pins: Arc::new(TcpFlowPins::default()),
             cache_db: None,
             outbound_id_map,
             resource_budget,
@@ -500,10 +705,15 @@ impl ControlPlane {
             )),
             background_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             udp_warm_task: tokio::sync::Mutex::new(None),
+            udp_warm_ids: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+            selector_warm_task: tokio::sync::Mutex::new(None),
+            selector_warm_notify: Arc::new(tokio::sync::Notify::new()),
+            selector_warm_ids: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+            selector_bare_warm: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             mode_state: None,
-            udp_post_decision_offload: std::env::var("HONK_UDP_POST_DECISION_OFFLOAD").as_deref()
-                == Ok("1"),
-            direct_offload_static,
+            datapath_flags: None,
+            #[cfg(feature = "ebpf")]
+            pending_udp_verdicts: None,
             datapath_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             active_routing_plan: Arc::new(parking_lot::RwLock::new(initial_routing_plan)),
             #[cfg(feature = "ebpf")]
@@ -516,6 +726,10 @@ impl ControlPlane {
             &control_plane.group_manager.read(),
             &control_plane.group_manager,
             &control_plane.connection_tracker,
+        );
+        install_selector_warm_callback(
+            &control_plane.group_manager.read(),
+            &control_plane.selector_warm_notify,
         );
         // Node death may race an initializer before the listener/background
         // loops start, so this production lifecycle callback belongs to
@@ -550,11 +764,14 @@ impl ControlPlane {
 
     /// Open the persistent cache database (sing-box `cache_file`), wire
     /// selector-choice persistence into the group manager, and restore
-    /// persisted choices. No-op when `experimental.cache_file` is disabled
-    /// or the database cannot be opened. Called once from `run()`.
-    pub async fn init_cache_db(&mut self, config_dir: Option<&str>) {
+    /// persisted choices. An existing cache relative to the original config
+    /// directory is retained during the data-directory cutover. No-op when
+    /// `experimental.cache_file` is disabled or the database cannot be opened.
+    /// Called once from `run()`.
+    pub async fn init_cache_db(&mut self, legacy_config_dir: Option<&Path>) {
         let cache_cfg = self.config.read().await.experimental.cache_file.clone();
-        let Some(db) = crate::cachedb::CacheDb::open(&cache_cfg, config_dir) else {
+        let Some(db) = crate::cachedb::CacheDb::open_with_config_dir(&cache_cfg, legacy_config_dir)
+        else {
             return;
         };
         let db = Arc::new(db);
@@ -680,50 +897,51 @@ impl ControlPlane {
         self.cache_db.clone()
     }
 
-    /// Install the shared clash mode state (called by `run()` when the
-    /// clash API is enabled). The outbound decision path applies the
-    /// mode override through this handle.
+    /// Install the startup mode snapshot before the flags writer starts.
     pub fn set_mode_state(&mut self, mode_state: crate::mode::SharedModeState) {
+        assert!(
+            self.datapath_flags.is_none(),
+            "mode state cannot be replaced after datapath flags startup"
+        );
         self.mode_state = Some(mode_state);
     }
 
-    /// Recompute and push the datapath offload policy (the
-    /// `DATAPATH_FLAG_OFFLOAD_*` word): the mode bits come from the current
-    /// clash mode (no mode state at all — clash API disabled — means no
-    /// override ever applies and behaves as `Rule`); the static
-    /// `NO_DOMAIN_RULES` bit comes from `dial_mode` plus the active routing
-    /// plan and is also stored in `direct_offload_static` so the clash
-    /// API's mode-switch path can reuse it without touching the config.
-    ///
-    /// Called before datapath admission opens in `run()` and re-asserted at
-    /// the reload commit point; runtime mode switches go through the clash
-    /// API's own write (PATCH /configs).  The datapath reads the word once
-    /// per new flow, so a changed policy applies to new flows only —
-    /// established flows keep the offload decision they were created with.
-    pub async fn sync_direct_offload_flags(&self) {
-        let static_bit = {
+    /// Install the serialized flags writer after cache-backed mode restoration.
+    pub fn start_datapath_flags_coordinator(&mut self) -> anyhow::Result<()> {
+        if self.datapath_flags.is_some() {
+            anyhow::bail!("datapath flags writer already started");
+        }
+        let mode_state = self
+            .mode_state
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("mode state is not initialized"))?;
+        self.datapath_flags = Some(crate::mode::DatapathFlagsHandle::new(
+            Arc::clone(&self.ebpf),
+            mode_state,
+            self.cache_db.clone(),
+        ));
+        Ok(())
+    }
+
+    pub fn datapath_flags_handle(&self) -> Option<crate::mode::DatapathFlagsHandle> {
+        self.datapath_flags.clone()
+    }
+
+    async fn initialize_datapath_flags(
+        &self,
+        nfqueue_enabled: bool,
+        nfqueue_ready: bool,
+    ) -> anyhow::Result<()> {
+        let static_flags = {
             let config = self.config.read().await;
             let plan = self.active_routing_plan.read();
             direct_offload_static_bit(&config, &plan)
         };
-        self.direct_offload_static
-            .store(static_bit, std::sync::atomic::Ordering::Relaxed);
-        let mode_bits = self
-            .mode_state
+        self.datapath_flags
             .as_ref()
-            .map(|state| state.read().direct_offload_mode_bits())
-            .unwrap_or(honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_RULE_DIRECT);
-        let flags = mode_bits | static_bit;
-        if let Err(error) = self.ebpf.write().await.set_datapath_flags(flags) {
-            warn!(%error, flags, "failed to update eBPF datapath offload flags");
-        }
-    }
-
-    /// The cached static offload bit (`NO_DOMAIN_RULES` or 0), shared with
-    /// the clash API so PATCH /configs mode switches can compose the full
-    /// flags word without reading the config or routing plan.
-    pub fn direct_offload_static_handle(&self) -> Arc<std::sync::atomic::AtomicU32> {
-        self.direct_offload_static.clone()
+            .ok_or_else(|| anyhow::anyhow!("datapath flags writer is not running"))?
+            .initialize(static_flags, nfqueue_enabled, nfqueue_ready)
+            .await
     }
 
     pub fn config_handle(&self) -> Arc<RwLock<Config>> {
@@ -791,12 +1009,167 @@ impl ControlPlane {
         self.datapath_healthy
             .load(std::sync::atomic::Ordering::Acquire)
     }
+    #[cfg(feature = "ebpf")]
+    async fn start_nfqueue_runtime(
+        &mut self,
+        enabled: bool,
+    ) -> anyhow::Result<Option<NfqueueRuntime>> {
+        if !enabled {
+            return Ok(None);
+        }
+
+        {
+            let backend = self.ebpf.read().await;
+            backend
+                .verify_udp_decision_sequence()
+                .map_err(|error| anyhow::anyhow!("verify UDP decision sequence: {error}"))?;
+            if backend.udp_decision_sequence_exhausted()? {
+                self.stats.record_udp_nfqueue_token_exhaustion();
+                anyhow::bail!("UDP decision token allocator is exhausted; reboot is required");
+            }
+        }
+
+        let (pending, pending_fatal) = nfqueue::PendingUdpVerdicts::new(
+            Arc::clone(&self.ebpf),
+            Arc::clone(&self.udp_pool),
+            Arc::clone(&self.stats),
+        );
+        let pending = Arc::new(pending);
+        self.pending_udp_verdicts = Some(Arc::clone(&pending));
+
+        let runtime = tokio::runtime::Handle::current();
+        let callback_pending = Arc::clone(&pending);
+        let initializer = self.spawn_handle();
+        let slow_limit = Arc::clone(&self.udp_concurrency_limit);
+        let drain = Arc::clone(&self.drain_tracker);
+        let callback: honk_nfqueue::PacketCallback = Arc::new(move |packet, guard| {
+            let permit = Arc::clone(&slow_limit).try_acquire_owned().ok();
+            let nfqueue::NfqueueIngest::Initialize { lease, identity } =
+                callback_pending.ingest(packet, guard, permit)
+            else {
+                return;
+            };
+            let initializer = initializer.clone();
+            let pending = Arc::clone(&callback_pending);
+            let drain = Arc::clone(&drain);
+            drop(runtime.spawn(async move {
+                let _guard = ConnectionGuard::new(drain);
+                match std::panic::AssertUnwindSafe(initializer.serve_udp_connection(lease))
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        warn!(%error, "NFQUEUE UDP initializer failed");
+                        let _ = pending.cancel(identity).await;
+                    }
+                    Err(_) => {
+                        error!("NFQUEUE UDP initializer panicked");
+                        let _ = pending.cancel(identity).await;
+                    }
+                }
+            }));
+        });
+        let (service, listener_fatal) = match honk_nfqueue::NfqueueService::start(callback) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                self.pending_udp_verdicts = None;
+                return Err(anyhow::anyhow!("start UDP NFQUEUE service: {error}"));
+            }
+        };
+        let (stop, stop_receiver) = tokio::sync::watch::channel(false);
+        let watchdog = tokio::spawn(Arc::clone(&pending).run_watchdog(stop_receiver));
+        let mut token_backstop = tokio::time::interval_at(
+            tokio::time::Instant::now() + nfqueue::WATCHDOG_INTERVAL,
+            nfqueue::WATCHDOG_INTERVAL,
+        );
+        token_backstop.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        Ok(Some(NfqueueRuntime {
+            service: Some(service),
+            listener_fatal,
+            pending_fatal,
+            stats: Arc::clone(&self.stats),
+            pending,
+            stop,
+            watchdog: Some(watchdog),
+            token_backstop,
+        }))
+    }
+    #[cfg(feature = "ebpf")]
+    async fn cleanup_nfqueue_startup_failure(&mut self, runtime: &mut Option<NfqueueRuntime>) {
+        let Some(runtime) = runtime.as_mut() else {
+            return;
+        };
+        runtime.begin_pending_drain().await;
+        if let Err(error) = runtime.shutdown_service().await {
+            error!(%error, "failed to stop NFQUEUE after startup failure");
+        }
+        if let Err(error) = runtime.finish_pending_drain().await {
+            error!(%error, "failed to drain NFQUEUE after startup failure");
+        }
+        self.pending_udp_verdicts = None;
+    }
+
+    async fn cleanup_flags_startup_failure(&mut self) {
+        if let Some(flags) = self.datapath_flags.as_ref()
+            && let Err(error) = flags.disable().await
+        {
+            error!(%error, "datapath flags startup cleanup failed");
+        }
+    }
+    async fn cleanup_pre_admission_failure(&mut self) {
+        self.drain_tracker.start_rejecting();
+        self.cleanup_flags_startup_failure().await;
+        {
+            let mut tasks = self.background_tasks.lock().await;
+            for task in tasks.drain(..) {
+                task.abort();
+            }
+        }
+        #[cfg(feature = "ebpf")]
+        if let Some(watcher) = self.iface_watcher.take() {
+            watcher.shutdown(SHUTDOWN_STAGE_TIMEOUT).await;
+        }
+        if let Err(error) = self.ebpf.write().await.detach_hooks() {
+            error!(%error, "failed to detach eBPF hooks after startup failure");
+        }
+        if let Err(error) = self.finalize_shutdown().await {
+            error!(%error, "failed to finalize startup rollback");
+        }
+    }
+    async fn cleanup_started_control_tasks(
+        &mut self,
+        udp_removal_task: &mut tokio::task::JoinHandle<()>,
+        dns_listener: Option<&mut dns_listener::DnsListener>,
+    ) {
+        if let Some(listener) = dns_listener {
+            listener.stop_accepting();
+            listener.abort_and_join().await;
+        }
+        if !self.udp_pool.shutdown().await {
+            error!("UDP endpoint shutdown required forced cleanup during startup rollback");
+        }
+        if let Err(error) = udp_removal_task.await {
+            error!(%error, "UDP removal worker failed during startup rollback");
+        }
+        self.cleanup_pre_admission_failure().await;
+    }
 
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let config = self.config.read().await;
         let tproxy_port = config.global.tproxy_port;
         let tproxy_mark = config.global.tproxy_mark;
+        let udp_nfqueue_enabled = config.experimental.udp_nfqueue.enabled;
+        let dns_bind_endpoint = config
+            .dns
+            .bind_endpoint()
+            .map_err(|error| anyhow::anyhow!("invalid dns.bind: {error}"))?;
         drop(config);
+        let bound_dns_listener = dns_bind_endpoint
+            .as_ref()
+            .map(dns_listener::BoundDnsListener::bind)
+            .transpose()
+            .map_err(|error| anyhow::anyhow!("bind dns.bind listener: {error}"))?;
         let tcp4_addr = SocketAddr::new("0.0.0.0".parse()?, tproxy_port);
         let tcp6_addr = SocketAddr::new("::".parse()?, tproxy_port);
         let udp4_addr = tcp4_addr;
@@ -864,6 +1237,28 @@ impl ControlPlane {
                 .map_err(|e| anyhow::anyhow!("publish listener sockets to eBPF: {}", e))?;
         }
 
+        let mut dns_listener = match bound_dns_listener {
+            Some(bound) => {
+                let listener = bound
+                    .spawn(
+                        Arc::clone(&self.dns_controller),
+                        Arc::clone(&self.dns_concurrency_limit),
+                        Arc::clone(&self.concurrency_limit),
+                        Arc::clone(&self.stats),
+                        Arc::clone(&self.drain_tracker),
+                    )
+                    .map_err(|error| anyhow::anyhow!("start dns.bind listener: {error}"))?;
+                info!(
+                    address = %listener.local_addr(),
+                    tcp = dns_bind_endpoint.as_ref().is_some_and(|endpoint| endpoint.tcp_enabled()),
+                    udp = dns_bind_endpoint.as_ref().is_some_and(|endpoint| endpoint.udp_enabled()),
+                    "Standalone DNS listener started"
+                );
+                Some(listener)
+            }
+            None => None,
+        };
+
         // One receive loop per listener socket. The datapath hashes flows
         // into the group (see the comment above), so loops are flow-disjoint.
         {
@@ -894,6 +1289,20 @@ impl ControlPlane {
         }
 
         let tcp6_listener = tcp6_listener;
+        #[cfg(feature = "ebpf")]
+        let mut nfqueue_runtime = match self.start_nfqueue_runtime(udp_nfqueue_enabled).await {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                if let Some(listener) = dns_listener.as_mut() {
+                    listener.stop_accepting();
+                    listener.abort_and_join().await;
+                }
+                self.cleanup_pre_admission_failure().await;
+                return Err(error);
+            }
+        };
+        #[cfg(not(feature = "ebpf"))]
+        let mut nfqueue_runtime = ();
 
         {
             let plan = self.active_routing_plan.read().clone();
@@ -907,10 +1316,11 @@ impl ControlPlane {
                 }
             }
         }
-        let mut udp_removal_task = {
+        let (mut udp_removal_task, mut udp_removal_fatal_rx) = {
+            let (fatal_tx, fatal_rx) = mpsc::unbounded_channel();
             let mut tasks = self.background_tasks.lock().await;
 
-            let janitor = BpfJanitor::new(self.ebpf.clone());
+            let janitor = BpfJanitor::new(self.ebpf.clone(), self.tcp_flow_pins.clone());
             tasks.push(janitor.spawn());
             info!("BPF map janitor started");
 
@@ -918,6 +1328,7 @@ impl ControlPlane {
                 Arc::clone(&self.udp_pool),
                 self.ebpf.clone(),
                 self.connection_tracker.clone(),
+                fatal_tx,
             );
 
             tasks.push(self.udp_pool.spawn_janitor());
@@ -927,7 +1338,7 @@ impl ControlPlane {
             tasks.push(crate::control::tcp_sniff::spawn_sniff_neg_cache_janitor(
                 self.tcp_sniff_neg_cache.clone(),
             ));
-            removal_task
+            (removal_task, fatal_rx)
         };
 
         {
@@ -1147,10 +1558,12 @@ impl ControlPlane {
             }
         }
 
-        // The warm coordinator starts only after group/runtime setup and
-        // retains this exact registry Arc for its complete lifetime.
+        // Warm coordinators start only after group/runtime setup and retain
+        // this exact registry Arc for their complete lifetime.
         let warm_generation = self.runtime_registry.read().clone();
-        self.start_udp_warm_coordinator(warm_generation).await;
+        self.start_udp_warm_coordinator(Arc::clone(&warm_generation))
+            .await;
+        self.start_selector_warm_coordinator(warm_generation).await;
 
         {
             let runtime_registry = self.runtime_registry.clone();
@@ -1169,16 +1582,61 @@ impl ControlPlane {
             self.background_tasks.lock().await.push(handle);
         }
 
-        self.sync_direct_offload_flags().await;
+        #[cfg(feature = "ebpf")]
+        let nfqueue_startup_health = match nfqueue_runtime.as_mut() {
+            Some(runtime) => runtime.check_startup_health(&self.ebpf).await,
+            None => Ok(()),
+        };
+        #[cfg(feature = "ebpf")]
+        if let Err(error) = nfqueue_startup_health {
+            self.cleanup_nfqueue_startup_failure(&mut nfqueue_runtime)
+                .await;
+            self.cleanup_started_control_tasks(&mut udp_removal_task, dns_listener.as_mut())
+                .await;
+            return Err(anyhow::anyhow!("NFQUEUE failed before readiness: {error}"));
+        }
+        if let Err(error) = self
+            .initialize_datapath_flags(udp_nfqueue_enabled, udp_nfqueue_enabled)
+            .await
         {
-            let mut ebpf = self.ebpf.write().await;
-            ebpf.set_datapath_ready(true)
-                .map_err(|error| anyhow::anyhow!("open eBPF datapath admission: {error}"))?;
+            #[cfg(feature = "ebpf")]
+            self.cleanup_nfqueue_startup_failure(&mut nfqueue_runtime)
+                .await;
+            self.cleanup_started_control_tasks(&mut udp_removal_task, dns_listener.as_mut())
+                .await;
+            return Err(anyhow::anyhow!("initialize datapath flags: {error:#}"));
+        }
+        #[cfg(feature = "ebpf")]
+        if let Some(runtime) = nfqueue_runtime.as_ref() {
+            runtime.pending.open_admission();
+        }
+        let datapath_open = {
+            let mut backend = self.ebpf.write().await;
+            backend.set_datapath_ready(true)
+        };
+        if let Err(error) = datapath_open {
+            if let Some(flags) = self.datapath_flags.as_ref() {
+                let _ = flags.fence_nfqueue().await;
+            }
+            #[cfg(feature = "ebpf")]
+            self.cleanup_nfqueue_startup_failure(&mut nfqueue_runtime)
+                .await;
+            self.cleanup_started_control_tasks(&mut udp_removal_task, dns_listener.as_mut())
+                .await;
+            return Err(anyhow::anyhow!("open eBPF datapath admission: {error}"));
         }
         info!("eBPF datapath admission opened after listener publication");
+        #[cfg(target_os = "linux")]
+        if let Err(error) =
+            libsystemd::daemon::notify(false, &[libsystemd::daemon::NotifyState::Ready])
+        {
+            warn!(%error, "sd_notify readiness failed");
+        }
 
         let mut rx = self.command_rx.take().expect("command_rx already taken");
         let drain = self.drain_tracker.clone();
+        let fatal_ebpf = Arc::clone(&self.ebpf);
+        let mut fatal_error = None;
 
         let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1186,6 +1644,16 @@ impl ControlPlane {
         loop {
             loop_count += 1;
             tokio::select! {
+                error = udp_removal_fatal_rx.recv() => {
+                    fatal_error = Some(error.unwrap_or_else(|| {
+                        anyhow::anyhow!("UDP removal fatal channel closed unexpectedly")
+                    }));
+                    break;
+                }
+                error = wait_nfqueue_fatal(&mut nfqueue_runtime, &fatal_ebpf) => {
+                    fatal_error = Some(error);
+                    break;
+                }
                 _ = heartbeat.tick() => {
                     trace!(
                         "control plane heartbeat (iteration {}, active_connections={})",
@@ -1325,16 +1793,74 @@ impl ControlPlane {
                             let total = snap.values().map(|s| s.total_conns as u64).sum();
                             let _ = tx.send(StatsSnapshot { per_outbound: snap, total_connections: total }).await;
                         }
-                        Some(ControlCommand::Shutdown) | None => {
-                            self.shutdown_datapath(&drain, &mut udp_removal_task).await?;
-                            break;
-                        }
+                        Some(ControlCommand::Shutdown) | None => break,
                     }
                 }
             }
         }
 
-        self.finalize_shutdown().await
+        if let Some(flags) = self.datapath_flags.as_ref()
+            && let Err(error) = flags.fence_nfqueue().await
+        {
+            fatal_error.get_or_insert_with(|| {
+                anyhow::anyhow!("failed to fence NFQUEUE during shutdown: {error:#}")
+            });
+        }
+        let datapath_closed = {
+            let mut backend = self.ebpf.write().await;
+            backend.set_datapath_ready(false)
+        };
+        if let Err(error) = datapath_closed {
+            fatal_error.get_or_insert_with(|| {
+                anyhow::anyhow!("failed to close eBPF datapath admission: {error:#}")
+            });
+        }
+        drain.start_rejecting();
+        #[cfg(feature = "ebpf")]
+        if let Some(runtime) = nfqueue_runtime.as_mut() {
+            runtime.begin_pending_drain().await;
+            if let Err(error) = runtime.check_startup_health(&fatal_ebpf).await {
+                fatal_error.get_or_insert_with(|| anyhow::Error::new(error));
+            }
+        }
+
+        if let Err(error) = self
+            .shutdown_datapath(&drain, &mut udp_removal_task, dns_listener.as_mut())
+            .await
+        {
+            fatal_error.get_or_insert(error);
+        }
+
+        #[cfg(feature = "ebpf")]
+        if let Some(runtime) = nfqueue_runtime.as_mut() {
+            if let Err(error) = runtime.shutdown_service().await {
+                fatal_error.get_or_insert(error);
+            }
+            if let Some(error) = runtime.take_shutdown_fatal() {
+                fatal_error.get_or_insert_with(|| anyhow::Error::new(error));
+            }
+            if let Err(error) = runtime.finish_pending_drain().await {
+                fatal_error.get_or_insert(error);
+            }
+            self.pending_udp_verdicts = None;
+        }
+
+        if let Some(flags) = self.datapath_flags.as_ref()
+            && let Err(error) = flags.disable().await
+        {
+            fatal_error.get_or_insert_with(|| {
+                anyhow::anyhow!("failed to disable datapath flags: {error:#}")
+            });
+        }
+
+        if let Err(error) = self.finalize_shutdown().await {
+            fatal_error.get_or_insert(error);
+        }
+        if let Some(error) = fatal_error {
+            Err(error)
+        } else {
+            Ok(())
+        }
     }
 
     /// Datapath half of shutdown: close admission, stop background work,
@@ -1347,16 +1873,17 @@ impl ControlPlane {
         &mut self,
         drain: &Arc<DrainTracker>,
         udp_removal_task: &mut tokio::task::JoinHandle<()>,
+        dns_listener: Option<&mut dns_listener::DnsListener>,
     ) -> anyhow::Result<()> {
         info!(
             "Control plane shutting down, draining {} active connections",
             drain.active_count()
         );
-        if let Err(error) = self.ebpf.write().await.set_datapath_ready(false) {
-            warn!(%error, "failed to close eBPF datapath admission");
+        if let Some(listener) = dns_listener.as_ref() {
+            listener.stop_accepting();
         }
-        drain.start_rejecting();
         self.stop_udp_warm_coordinator().await;
+        self.stop_selector_warm_coordinator().await;
         if !self.udp_pool.shutdown().await {
             error!("UDP endpoint shutdown required forced cleanup");
         }
@@ -1392,6 +1919,9 @@ impl ControlPlane {
         }
         info!("shutdown: draining connections");
         drain.drain().await?;
+        if let Some(listener) = dns_listener {
+            listener.abort_and_join().await;
+        }
         // Active flows own the current runtime until the drain completes; only
         // then terminally close its AnyTLS pools and reject any late warm work.
         // Dropping this future on timeout detaches nothing: the force-closes
@@ -1450,14 +1980,16 @@ impl ControlPlane {
             stats: self.stats.clone(),
             ebpf: self.ebpf.clone(),
             udp_pool: self.udp_pool.clone(),
+            #[cfg(feature = "ebpf")]
+            pending_udp_verdicts: self.pending_udp_verdicts.clone(),
             tcp_sniff_neg_cache: self.tcp_sniff_neg_cache.clone(),
             sniffer_pool: self.sniffer_pool.clone(),
             dns_controller: self.dns_controller.clone(),
             alive_set: self.alive_set.clone(),
             connection_pool: self.connection_pool.clone(),
             connection_tracker: self.connection_tracker.clone(),
+            tcp_flow_pins: self.tcp_flow_pins.clone(),
             mode_state: self.mode_state.clone(),
-            udp_post_decision_offload: self.udp_post_decision_offload,
         }
     }
 }
@@ -1496,7 +2028,7 @@ fn begin_udp_slow_path(
     let Some(permit) = try_admit_udp_slow_path(stats, concurrency_limit) else {
         return UdpSlowPathWork::Done;
     };
-    if original_dst.port() == 53 && is_exact_dns_query(data) {
+    if original_dst.port() == 53 && crate::dns::query::is_exact_dns_query(data) {
         // Permit is acquired before the heap copy required to leave the
         // receive buffer for a permit-bounded DNS task.
         return UdpSlowPathWork::DnsThenMaybeInitialize {
@@ -1509,6 +2041,7 @@ fn begin_udp_slow_path(
         EndpointReservation::Enqueued
         | EndpointReservation::CapacityRejected
         | EndpointReservation::QueueFull
+        | EndpointReservation::IdentityMismatch
         | EndpointReservation::QueueClosed => UdpSlowPathWork::Done,
     }
 }
@@ -1517,7 +2050,6 @@ struct UdpDnsSlowPathContext<'a> {
     pool: &'a Arc<UdpEndpointPool>,
     stats: &'a StatsManager,
     dns_controller: &'a crate::control::dns_control::DnsController,
-    udp_socket: &'a UdpSocket,
     src_addr: SocketAddr,
     original_dst: SocketAddr,
 }
@@ -1535,12 +2067,11 @@ async fn complete_udp_dns_slow_path(
         pool,
         stats,
         dns_controller,
-        udp_socket,
         src_addr,
         original_dst,
     } = context;
     match dns_controller
-        .handle_udp_dns(udp_socket, data, src_addr, original_dst)
+        .handle_udp_dns(data, src_addr, original_dst)
         .await
     {
         Ok(true) => return None,
@@ -1566,6 +2097,7 @@ async fn complete_udp_dns_slow_path(
         EndpointReservation::Enqueued
         | EndpointReservation::CapacityRejected
         | EndpointReservation::QueueFull
+        | EndpointReservation::IdentityMismatch
         | EndpointReservation::QueueClosed => None,
     }
 }
@@ -1618,7 +2150,7 @@ async fn udp_listener_loop(state: UdpLoopState, socket: Arc<UdpSocket>, family: 
                 {
                     continue;
                 }
-                dispatch_udp_slow_path(&state, &socket, src_addr, original_dst, &buf[..n]);
+                dispatch_udp_slow_path(&state, src_addr, original_dst, &buf[..n]);
             }
             Err(e) => error!("{} UDP recv error: {}", family, e),
         }
@@ -1627,16 +2159,16 @@ async fn udp_listener_loop(state: UdpLoopState, socket: Arc<UdpSocket>, family: 
 
 fn dispatch_udp_slow_path(
     state: &UdpLoopState,
-    udp_socket: &Arc<UdpSocket>,
     src_addr: SocketAddr,
     original_dst: SocketAddr,
     data: &[u8],
 ) {
-    let concurrency_limit = if original_dst.port() == 53 && is_exact_dns_query(data) {
-        &state.dns_concurrency_limit
-    } else {
-        &state.udp_concurrency_limit
-    };
+    let concurrency_limit =
+        if original_dst.port() == 53 && crate::dns::query::is_exact_dns_query(data) {
+            &state.dns_concurrency_limit
+        } else {
+            &state.udp_concurrency_limit
+        };
     match begin_udp_slow_path(
         &state.udp_pool,
         &state.stats,
@@ -1648,11 +2180,10 @@ fn dispatch_udp_slow_path(
         UdpSlowPathWork::Done => {}
         UdpSlowPathWork::Initialize(lease) => {
             let handle = state.handle.clone();
-            let socket = Arc::clone(udp_socket);
             let drain = Arc::clone(&state.drain);
             state.udp_pool.spawn_slow_path(async move {
                 let _guard = ConnectionGuard::new(drain);
-                if let Err(e) = handle.serve_udp_connection(lease, socket).await {
+                if let Err(e) = handle.serve_udp_connection(lease).await {
                     warn!(
                         "Error handling UDP from {} (orig {}): {}",
                         src_addr, original_dst, e
@@ -1662,7 +2193,6 @@ fn dispatch_udp_slow_path(
         }
         UdpSlowPathWork::DnsThenMaybeInitialize { permit, data } => {
             let handle = state.handle.clone();
-            let socket = Arc::clone(udp_socket);
             let guard = ConnectionGuard::new(Arc::clone(&state.drain));
             let pool = Arc::clone(&state.udp_pool);
             let stats = Arc::clone(&state.stats);
@@ -1677,7 +2207,6 @@ fn dispatch_udp_slow_path(
                         pool: &pool,
                         stats: &stats,
                         dns_controller: dns_controller.as_ref(),
-                        udp_socket: socket.as_ref(),
                         src_addr,
                         original_dst,
                     },
@@ -1688,7 +2217,7 @@ fn dispatch_udp_slow_path(
                 else {
                     return;
                 };
-                if let Err(e) = handle.serve_udp_connection(lease, socket).await {
+                if let Err(e) = handle.serve_udp_connection(lease).await {
                     warn!(
                         "Error handling UDP from {} (orig {}): {}",
                         src_addr, original_dst, e

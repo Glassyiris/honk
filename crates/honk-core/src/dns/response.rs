@@ -10,6 +10,8 @@ const HEADER_LEN: usize = 12;
 const QR: u16 = 0x8000;
 const TC: u16 = 0x0200;
 const OPCODE_MASK: u16 = 0x7800;
+const RA: u16 = 0x0080;
+const QUERY_ECHO_MASK: u16 = OPCODE_MASK | 0x0110;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ResponseError {
@@ -219,6 +221,32 @@ fn write_u16(response: &mut [u8], offset: usize, value: u16) -> Result<(), Respo
         .ok_or(ResponseError::MalformedRecord)?
         .copy_from_slice(&value.to_be_bytes());
     Ok(())
+}
+
+pub(crate) fn dns_error_flags(query: &[u8], rcode: u8) -> u16 {
+    let request_flags = query
+        .get(2..4)
+        .map(|flags| u16::from_be_bytes([flags[0], flags[1]]))
+        .unwrap_or(0x0100);
+    QR | RA | (request_flags & QUERY_ECHO_MASK) | u16::from(rcode & 0x0f)
+}
+
+/// Build a minimal DNS error response while preserving the request payload.
+pub(crate) fn build_dns_error_response(query: &[u8], rcode: u8) -> Vec<u8> {
+    if query.len() < HEADER_LEN {
+        return vec![0u8; HEADER_LEN];
+    }
+    let mut response = query.to_vec();
+    response[2..4].copy_from_slice(&dns_error_flags(query, rcode).to_be_bytes());
+    response
+}
+
+pub(crate) fn build_dns_servfail(query: &[u8]) -> Vec<u8> {
+    build_dns_error_response(query, 2)
+}
+
+pub(crate) fn build_dns_refused(query: &[u8]) -> Vec<u8> {
+    build_dns_error_response(query, 5)
 }
 
 #[cfg(test)]

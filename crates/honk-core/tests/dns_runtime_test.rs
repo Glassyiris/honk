@@ -175,9 +175,8 @@ async fn public_service_rejects_malformed_and_bypasses_cache_for_uncacheable_que
     assert_eq!(upstream.calls(), 0);
 
     let mut uncacheable = build_dns_query("uncacheable.example", 1);
-    uncacheable[4..6].copy_from_slice(&2_u16.to_be_bytes());
-    let duplicate = build_dns_query("uncacheable.example", 1);
-    uncacheable.extend_from_slice(&duplicate[12..]);
+    uncacheable[10..12].copy_from_slice(&1_u16.to_be_bytes());
+    uncacheable.extend_from_slice(&[0, 0, 41, 0x04, 0xd0, 0, 0, 0, 0, 0, 5, 0, 12, 0, 1, 0]);
     for _ in 0..2 {
         service
             .resolve(&uncacheable, IngressProfile::Api)

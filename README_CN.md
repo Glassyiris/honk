@@ -14,6 +14,22 @@
 
 许可证：**GPL-3.0-only**。
 
+### 实验性首包保留 UDP 决策
+
+默认关闭的 UDP NFQUEUE 路径只保留仍需用户态判定的 **LAN 转发**首包：报文已经过 LAN TC，但尚未进入 conntrack/NAT。通过进程配置启用：
+
+```dae
+experimental {
+    udp_nfqueue {
+        enabled: true
+    }
+}
+```
+
+修改 `experimental.udp_nfqueue.enabled` 后必须重启。启用时必须使用带 `ebpf` feature 的构建和真实 eBPF 后端；`--mock-ebpf` 或不带 `ebpf` 的构建会在启动时被拒绝。本机发起的 WAN 出口流量仍走规范 TPROXY 路径。DNS 53、`must`、`block` 和已经可以安全地在路由时直连的决策不会进入 NFQUEUE；只暂存仍可能在用户态改判的决策。
+
+该路径拥有 raw-netlink 队列 `320` 和 nftables 对象 `inet honk_nfqueue` / `udp_decision`；honk 运行期间，同一网络命名空间中的防火墙管理器不得修改它们。Direct 释放被保留的 skb，Proxy 把唯一的 payload 副本交给正常 UDP 初始化器，block/取消则丢弃报文。启用 Clash API 后，运行时计数器与 receipt-to-verdict 延迟位于 `/stats.udp.nfqueue`。完整不变量和指标 schema 见[设计文档](doc/design.zh.md)与[配置参考](doc/configuration.zh.md)。
+
 ### 文档
 
 | 文档         | English                                              | 中文                                                 |
@@ -30,11 +46,12 @@ crates/
 ├── honk-core/          # 引擎二进制：控制面、DNS、中继、Clash API、eBPF 挂载
 ├── honk-config/        # 配置 schema + dae 语法解析 + 分享链接
 ├── honk-outbound/      # 协议 Handler、组、健康检查
+├── honk-nfqueue/       # 单队列 raw-netlink NFQUEUE + 自有 nftables 规则
 ├── honk-ebpf-common/   # 内核/用户态共享 no_std #[repr(C)] 类型
 └── honk-ebpf/          # 内核 eBPF 程序（bpfel-unknown-none；不在 workspace 内）
 ```
 
-高层路径：**TC 分类 → 经 `dae0`/`daens` redirect → sk_lookup 透明监听 → 用户态拨号/中继**。细节见设计文档。
+高层路径：通常为 **TC 分类 → 经 `dae0`/`daens` redirect → sk_lookup 透明监听 → 用户态拨号/中继**；启用实验配置后，仍有歧义的 LAN 转发 UDP 会改为 **TC 暂存 → NFQUEUE 保留原始 skb → token 校验后的 direct/proxy/block 提交**。细节见设计文档。
 
 ### 与 dae 的差异（eBPF / 控制面）
 
@@ -82,6 +99,7 @@ honk 沿用 dae 的内核模型，但并非移植。主要不同点：
 - [x] 每出站 `OUTBOUND_STATS` + `EVENT_RINGBUF` 消费
 - [x] 用户态健康检查推送连通性 map
 - [x] 无特权测试用的 Mock eBPF 后端
+- [x] 单队列 NFQUEUE 保留首个 UDP skb、持久 token 与 token 校验终态提交
 
 #### 配置与路由（用户态）
 
@@ -126,6 +144,7 @@ honk 沿用 dae 的内核模型，但并非移植。主要不同点：
 - [ ] FakeIP 引擎
 - [ ] 内核侧 eBPF DNS 应答缓存（用户态缓存已有）
 - [ ] 一致性哈希负载均衡（轮询 LoadBalance 已有）
+- [ ] 评估 AF_XDP 与 XDP 路径以进一步提升性能
 - [ ] 对生产环境对端的更广 live 互通测试；root netns 门禁例行化
 
 ### 环境要求

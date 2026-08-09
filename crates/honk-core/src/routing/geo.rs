@@ -218,26 +218,28 @@ fn load_geosite_index(
     }
 }
 
-/// Locate geosite.dat for tooling queries (`honk-tool geosite`): the
-/// explicit `--file` path wins at the call site; this is the fallback search
-/// (current directory, then the dae asset locations).
+/// Locate geosite.dat for tooling queries (`honk-tool geosite`): an explicit
+/// `--file` path wins at the call site; otherwise the runtime data directory
+/// precedes dae's legacy asset locations.
 pub fn find_geosite_dat() -> Option<std::path::PathBuf> {
-    const CANDIDATES: &[&str] = &[
-        "./geosite.dat",
-        "/usr/local/share/dae/geosite.dat",
-        "/usr/share/dae/geosite.dat",
-        "/etc/dae/geosite.dat",
-    ];
+    find_dat("geosite.dat")
+}
+
+fn find_dat(name: &str) -> Option<std::path::PathBuf> {
     if let Ok(asset) = std::env::var("DAE_LOCATION_ASSET") {
-        let p = std::path::Path::new(&asset).join("geosite.dat");
-        if p.is_file() {
-            return Some(p);
+        let path = std::path::Path::new(&asset).join(name);
+        if path.is_file() {
+            return Some(path);
         }
     }
-    for c in CANDIDATES {
-        let p = std::path::Path::new(c);
-        if p.is_file() {
-            return Some(p.to_path_buf());
+    let data_path = honk_config::paths::resolve_artifact_path(name);
+    if data_path.is_file() {
+        return Some(data_path);
+    }
+    for directory in [".", "/usr/local/share/dae", "/usr/share/dae", "/etc/dae"] {
+        let path = std::path::Path::new(directory).join(name);
+        if path.is_file() {
+            return Some(path);
         }
     }
     None
@@ -402,25 +404,7 @@ fn load_geoip_index(
 /// Locate geoip.dat for tooling queries (`honk-tool geoip`); see
 /// [`find_geosite_dat`].
 pub fn find_geoip_dat() -> Option<std::path::PathBuf> {
-    const CANDIDATES: &[&str] = &[
-        "./geoip.dat",
-        "/usr/local/share/dae/geoip.dat",
-        "/usr/share/dae/geoip.dat",
-        "/etc/dae/geoip.dat",
-    ];
-    if let Ok(asset) = std::env::var("DAE_LOCATION_ASSET") {
-        let p = std::path::Path::new(&asset).join("geoip.dat");
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    for c in CANDIDATES {
-        let p = std::path::Path::new(c);
-        if p.is_file() {
-            return Some(p.to_path_buf());
-        }
-    }
-    None
+    find_dat("geoip.dat")
 }
 
 /// Parse geoip.dat once into a per-code index. Only codes in `codes`

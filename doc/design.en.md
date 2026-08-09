@@ -23,7 +23,7 @@
 | TC classify + match_set routing | **dae** | `ROUTING_MAP` MatchSets, LPM tries, domain bitmaps, must/OR/AND |
 | `dae0` / `dae0peer` + netns delivery | **dae** | Isolated `daens`, sk_lookup / SockMap, reply rewrite |
 | Process matching via cgroup cookie→pid | **dae** | `COOKIE_PID_MAP` |
-| DNS learning into domain routing maps | **dae** | Userspace notify → `DOMAIN_ROUTING_MAP` |
+| DNS learning into domain routing maps | **dae** | Generation-aware outcome projection → `DOMAIN_ROUTING_MAP` |
 | Config section syntax | **dae** | `global { } node { } group { } routing { }` |
 | Group policies & nested outbounds | **sing-box** | Selector / URLTest / LB / Fallback, RealTag-style chain |
 | TCP/UDP separate URLTest picks | **sing-box** | Tolerance, idle_timeout, interrupt_connections |
@@ -37,8 +37,9 @@ crates/
 ├── honk-config         # Schema + dae-syntax parser + share links
 ├── honk-ebpf-common    # no_std #[repr(C)] types shared kernel ↔ userspace
 ├── honk-ebpf           # Kernel programs (excluded from workspace; bpfel-unknown-none)
+├── honk-nfqueue        # Single raw-netlink queue + owned nftables transaction
 ├── honk-outbound       # Proxy handlers, groups, AliveDialerSet, URLTest
-└── honk-core           # Engine binary: control plane, DNS, relay, Clash API, eBPF attach
+└── honk-core           # Engine binary: control plane, DNS, relay, Clash API, eBPF/NFQUEUE runtime
 ```
 
 ```mermaid
@@ -49,6 +50,7 @@ flowchart TB
   CORE --> COM[honk-ebpf-common]
   EBPF[honk-ebpf] --> COM
   CORE -->|embeds object| EBPF
+  CORE --> NFQ[honk-nfqueue]
 ```
 
 **ABI rule:** any change to map keys/values or constants must update both `honk-ebpf-common` and `honk-ebpf` (and the userspace map writers in `honk-core`).
@@ -65,6 +67,7 @@ flowchart TB
     TC[TC lan/wan ingress+egress]
     MAPS[MatchSets + handoff maps]
     DAE0[dae0 veth 169.254.0.1]
+    NFQ[inet prerouting / NFQUEUE 320]
   end
 
   subgraph daens
@@ -74,6 +77,7 @@ flowchart TB
   end
 
   subgraph Userspace
+    NFQL[honk-nfqueue raw-netlink listener]
     CP[ControlPlane]
     SNIFF[SNI / HTTP Host / QUIC SNI]
     R[Router fallback]
@@ -83,7 +87,8 @@ flowchart TB
   end
 
   APP --> TC --> MAPS
-  MAPS -->|proxy / need userspace| DAE0 --> PEER --> SK --> LISTEN --> CP
+  MAPS -->|proxy / ordinary userspace path| DAE0 --> PEER --> SK --> LISTEN --> CP
+  MAPS -->|ambiguous LAN UDP: pending + token| NFQ --> NFQL --> CP
   CP --> SNIFF --> R --> G --> D --> REL
   REL -->|SO_MARK bypass| WAN[WAN egress]
   REL -->|UDP anyfrom replies| PEER
@@ -97,16 +102,21 @@ flowchart TB
    - `direct + must` → leave on host stack (no redirect), in every mode.
    - `direct` without must → also left on the host stack when the per-flow offload decision allows it (cached in `RoutingMeta` bit 57 at route time): in clash `Rule` mode (or with the clash API disabled) when no SNI re-evaluation can change the decision — `dial_mode: ip`, no domain-class rule in the config, or the flow's domain was DNS-learned and evaluated through `DOMAIN_ROUTING_MAP`; in clash `Direct` mode unconditionally (the userspace override would force `direct` anyway). In `Global` mode — and in `Rule` mode when a domain re-route may still apply — it redirects into `dae0`.
    - user outbound / block / control-plane routing → redirect into `dae0` when the outbound is considered alive. (In clash `Direct` mode a non-`must` user-outbound flow is instead passed through as direct — same offload as above.)
-4. In **daens**, `sk_lookup` assigns the flow to transparent TCP/UDP listeners.
-5. **Userspace** takes the routing handoff, optionally sniffs domain, falls back to the full `Router`, applies Clash mode override, selects a group leaf, dials, and relays.
-6. Dial/probe/DNS-upstream sockets use **`DAE_BYPASS_MARK` (`0x100`)** so eBPF does not re-proxy control-plane traffic.
-7. UDP replies use per-endpoint **anyfrom** transparent sockets (dae parity) so source addresses stay correct on the way back through `dae0_ingress`.
+4. With `experimental { udp_nfqueue { enabled: true } }`, only an ambiguous LAN-forwarded UDP decision is marked Pending with a unique token and held by queue `320` after LAN TC but before conntrack/NAT. DNS 53, internal/special, reverse, `must`, `block`, and already-safe direct traffic keep the ordinary paths. Host-originated WAN egress never reaches this hook and remains canonical TPROXY.
+5. In **daens**, `sk_lookup` assigns ordinary userspace flows to transparent TCP/UDP listeners.
+6. **Userspace** takes the routing handoff, optionally sniffs domain, falls back to the full `Router`, applies Clash mode override, selects a group leaf, dials, and relays. A staged UDP flow instead resolves through token-checked NFQUEUE terminal transitions described below.
+7. Dial/probe/DNS-upstream sockets use **`DAE_BYPASS_MARK` (`0x100`)** so eBPF does not re-proxy control-plane traffic.
+8. UDP replies use per-endpoint **anyfrom** transparent sockets (dae parity) so source addresses stay correct on the way back through `dae0_ingress`.
 
 Startup admission is fail-open until the listener generation is complete: TC hooks
 leave traffic untouched while `DATAPATH_STATE_MAP[0]` is zero. Userspace publishes
 every TCP/UDP listener FD, starts the receive loops, then opens that single gate;
 shutdown closes it before listener teardown. A partial SockMap publication can
 therefore never redirect a flow into a missing listener slot.
+
+NFQUEUE readiness is a separate fail-closed gate. When the feature is enabled but
+not ready (startup, reload fence, shutdown), a new flow that requires staging is
+dropped; traffic that does not require staging keeps its normal path.
 
 > **Note:** Older docs mentioned host `iptables TPROXY` on the bridge master as the primary path. The live path is **TC redirect + daens + sk_lookup**. Listeners are still `IP_TRANSPARENT`. Cleanup scripts may still remove leftover legacy iptables rules.
 
@@ -116,7 +126,7 @@ therefore never redirect a flow into a missing listener slot.
 
 | Program family | Hook | Role |
 | ---------------- | ------ | ------ |
-| `lan_ingress_l2/l3` | TC ingress LAN | Classify, route, redirect, TX stats |
+| `lan_ingress_l2/l3` | TC ingress LAN | Classify, route, stage ambiguous UDP with a unique token, redirect, TX stats |
 | `wan_ingress_l2/l3` | TC ingress WAN | WAN-side / reverse path (dual-homed) |
 | `tproxy_lan/wan_egress_*` | TC egress | Local-originated traffic + reverse conn state |
 | `dae0_ingress` | TC ingress dae0 | Reply rewrite + RX stats |
@@ -133,13 +143,16 @@ therefore never redirect a flow into a missing listener slot.
 | `DOMAIN_ROUTING_MAP` | IP → domain-rule bitmaps (DNS-learned) |
 | `ROUTING_HANDOFF_MAP` | Tuple → userspace handoff |
 | `REDIRECT_TRACK` / `CONN_STATE_MAP` | Redirect + conntrack state |
+| `UDP_DECISION_SEQUENCE` | Pinned one-slot, spin-locked unique token sequence; preserved across ordinary restart/cleanup; exhaustion is sticky until reboot |
+| `UDP_DECISION_EPOCH` / `UDP_DECISION_INFLIGHT` | Two-slot userspace-flipped grace period plus per-CPU readers; a fence waits only for kernel work that observed the previous slot |
+| `UDP_DECISION_RETIRE_FENCE` | Tuple → expected token; blocks new claims while exact-token retirement revalidates state and auxiliaries |
 | `BPF_STATS_MAP` | Conn-state overflow plus redirect/handoff/cookie insert failures |
 | `OUTBOUND_CONNECTIVITY_MAP` | Alive bits pushed from userspace health checks |
 | `OUTBOUND_STATS` | Per-CPU tx/rx packets/bytes per outbound |
 | `LISTEN_SOCKET_MAP` | SockMap of transparent listeners |
 | `DATAPATH_STATE_MAP` | Admission gate opened only after the complete listener generation is published |
-| `DATAPATH_FLAGS_MAP` | Runtime flags written by userspace: the mode-based direct-offload policy (`DATAPATH_FLAG_OFFLOAD_RULE_DIRECT` / `_ALL` / `_NO_DOMAIN_RULES`), read once per new flow at route time; the decision is cached per flow in `RoutingMeta` bit 57 |
-| `EVENT_RINGBUF` | Overflow events drained to tracing |
+| `DATAPATH_FLAGS_MAP` | Serialized runtime flags: mode-based direct-offload policy plus NFQUEUE enabled/ready fencing, read when a new flow is classified |
+| `EVENT_RINGBUF` | Rate-limited diagnostic events for datapath overflows and token exhaustion; the supervisor polls the locked allocator state independently |
 
 ### Reserved outbound indices
 
@@ -155,7 +168,11 @@ Aligned with dae-core:
 - **At SYN time**, pure domain rules often cannot match without a prior DNS learn or userspace sniff.
 - DNS answers update `DOMAIN_ROUTING_MAP` so subsequent TCP can match in eBPF.
 - `direct` without `must` reaches userspace only when the mode policy says so — always in `Global` mode, and in `Rule` mode when an SNI re-route may still apply (domain-class rules exist, `dial_mode` sniffs, and the flow's domain was not DNS-learned). Otherwise it is offloaded in the kernel exactly like `must` direct (Go dae parity): no userspace relay, no `/connections` entry, and no SNI-based re-route; tx stats are still counted at `lan_ingress`. In `Direct` mode every non-`must`/non-`block` flow is offloaded (the override would force `direct` regardless). The decision is made once per flow at route time and cached in the flow's `RoutingMeta` (bit 57) — the policy word itself (`DATAPATH_FLAGS_MAP`) is written on startup (cachedb-restored mode), on every PATCH `/configs` mode switch, and re-asserted after each reload, and binds at flow creation only.
-- (**Experimental, OFF by default** — enable with `HONK_UDP_POST_DECISION_OFFLOAD=1`.) UDP flows whose first datagram is a confirmed QUIC Initial (SNI extracted, or at least a valid decrypted Initial) can additionally be offloaded **after** the userspace decision fully converges to `direct`, via *drop-and-reinject*: the control plane rewrites the flow's published conn_state meta in place (`RoutingMeta::set_offloaded_direct`: outbound normalized to `Direct`, tproxy mark cleared, bit 57 set) and drops the in-flight Initial (with any queued followers) **without relaying a single packet**. QUIC clients must retransmit a lost Initial (RFC 9000), so the retransmission arrives on the `lan_ingress` established-UDP path and passes straight through — the server-visible 5-tuple is the client's own from the first server-seen packet, and the only cost is one Initial RTO at flow setup. Non-QUIC UDP has no retransmission guarantee, so it is never dropped or offloaded here and keeps the full userspace relay; proxied decisions and port 53 are likewise never offloaded, and `Global` mode keeps every non-`must` flow in userspace (`Rule`/clash-API-disabled offload a converged `direct`, `Direct` normalizes every non-`must`/non-`block` decision to `direct` — same semantics as the route-time policy). The branch runs before any dial, so an offloaded flow gets no endpoint, no `/connections` entry, and no stats connection — nothing userspace-side is left behind; its rx bytes are not counted (rx is accounted at `dae0_ingress`), exactly like `must`-direct. After 120s of silence the conn_state is swept and the next Initial simply repeats the decide-drop-reinject cycle. The per-flow bit binds at decision time, so flows created before a reload or mode switch keep their cached decision. When the sniffed domain drove the decision, the offload additionally writes the matched domain rule's bitmap back into `DOMAIN_ROUTING_MAP` for the destination IP (same map and lifecycle as DNS-learned routes: it survives conn_state sweeps and follows the existing reload rebuild), so once the conn_state is swept, a mid-session packet — not an Initial, no longer sniffable — is re-decided `DomainKnown → direct` and offloaded at route time with zero loss and zero userspace round-trips; without the writeback the IP-only re-decision could flip the flow to a proxy mid-session. The writeback is best-effort (a failure only forfeits the fast re-decision, never the flow) and happens only for flows that were actually offloaded: for a userspace-relayed flow a post-sweep kernel offload would switch the server-visible tuple. The offload is committed via the lease's `commit_offloaded` handoff (a `KernelOffloadHandoff` removal reason — the endpoint-removal worker deletes conn_states only for `UserspaceEndpointRetired`), so the just-published offload bit is never unwound by reservation teardown. A ClientHello fragmented across CRYPTO frames is completed from the follower queue first (bounded: 8 packets / 250 ms); a still-unresolved flow is dropped unresolved (confirmed QUIC retransmits; the sniffer session keeps the fragments) rather than decided on an IP-only guess that could bypass a domain rule. Measured cost: one Initial PTO per offloaded flow — ~136 ms at a 50 ms initial RTT (≈2–3× RTT), paid once at flow setup; established flows are unaffected. Coverage caveat: only a decision that matched a domain rule has a bitmap to write back — fallback-direct, IP/CIDR-rule direct, and negated-domain-rule directs get no `DOMAIN_ROUTING_MAP` entry, so their post-sweep mid-session packets re-enter userspace and are relayed (QUIC connection migration absorbs the tuple change; a per-tuple kernel decision cache was considered and rejected as kernel-ABI cost disproportionate to this 120s-idle edge case).
+- The held-first-packet path is **experimental and OFF by default**. Enable it only with `experimental { udp_nfqueue { enabled: true } }`; changing the bit requires a restart, and enabled startup rejects `--mock-ebpf` or a build without `ebpf`.
+- Scope is LAN-forwarded UDP because host `inet prerouting` follows LAN TC. Host-originated WAN egress remains canonical TPROXY. Port 53, internal/special traffic, reverse traffic, `must`, `block`, and decisions already safe for route-time direct are excluded; only preliminary direct/control-plane decisions or domain/QUIC-dependent proxy decisions that can still converge differently are staged.
+- eBPF allocates a nonzero unique token from the persistent pinned `UDP_DECISION_SEQUENCE`, publishes token-bound handoff/redirect/`ConnState::Pending`, and marks the skb Pending. The one raw-netlink listener holds originals on fixed queue `320` before conntrack/NAT; there is no bypass, fanout, fail-open, or automatic recovery mode. The userspace correlator retains verdict guards separately while transferring the one exact NFQUEUE payload allocation into the existing canonical UDP initializer.
+- A final direct decision performs token-checked Arm → FIFO `NF_ACCEPT` of every original skb with its final direct mark → Activate. A follower arriving after Arm appends only its verdict guard; its payload and any slow permit are discarded without endpoint admission. Direct opens no userspace socket, retains no payload copy, deliberately retransmits nothing, and creates no UDP endpoint or `/connections` entry. A final proxy decision commits the token-bound outbound/mark before a reply can race, transfers its one payload copy to the canonical initializer, drops the originals, and dials/sends once. Block and cancellation drop the originals. No terminal transition can mutate a missing, stale-token, wrong-state, or newer tuple incarnation.
+- Reload and shutdown first publish NFQUEUE-not-ready, flip the two-slot decision epoch, wait for every pre-fence per-CPU reader, and remove residual Preparing/Pending states before the fence is acknowledged. Delayed queue deliveries therefore fail token lookup instead of crossing runtime generations. Exact retirement separately installs a `BPF_NOEXIST` tuple fence, waits for pre-fence token readers, revalidates state/auxiliaries, deletes, and releases that fence; it never writes a cached state over a newer token. Userspace then cancels/drains token-bound cells, leases, guards, and retiring endpoints before closing the queue and removing its owned table. Queue/listener/verdict/retirement faults and token exhaustion are fatal. The allocator pin survives ordinary cleanup so a process restart cannot reuse a token while an old skb/task may still exist; exhaustion requires reboot.
 - TCP SNI/HTTP Host and QUIC Initial SNI both re-run the userspace Router for non-`must`, non-`block` handoffs in domain-aware modes.
 
 ## 7. Userspace control plane
@@ -165,7 +182,8 @@ Aligned with dae-core:
 | Subsystem | Responsibility |
 | ----------- | ---------------- |
 | Netns / veth setup | Create `daens`, `dae0`/`dae0peer`, addresses, policy routing |
-| `EbpfBackend` | Load/attach programs, push maps, stats, mock backend for tests |
+| `EbpfBackend` | Load/attach programs, publish maps, inspect token/state, commit `ArmDirect`/`ActivateDirect`/`ActivateProxy`/`Block`, abort/remove only matching token incarnations, validate the persistent allocator; mock backend for non-NFQUEUE tests |
+| NFQUEUE runtime | `honk-nfqueue` queue/table ownership plus `PendingUdpVerdicts` token/generation correlator, watchdog, fatal supervision, reload/shutdown fencing |
 | Accept loop | Transparent TCP/UDP, original destination, handoff take |
 | `Router` | Full condition set (domain/geoip/geosite/process/…) |
 | Sniffing | TCP SNI/Host, QUIC SNI |
@@ -179,6 +197,17 @@ Aligned with dae-core:
 Plain-TCP splice requests at most 64 KiB for each direction's private
 nonblocking pipe (128 KiB and four pipe FDs per full-duplex relay). Unsupported
 splice paths fall back losslessly before moving bytes.
+
+Accepted TCP flows are adopted only while their canonical client-to-destination
+`CONN_STATE_MAP` entry exists. The control plane reference-counts that directional
+tuple for the accepted socket's lifetime, and the janitor skips both its conn-state
+and matching `REDIRECT_TRACK` metadata. The packet path expires only TCP
+`CLOSING` entries strictly older than 10 seconds; unowned `ACTIVE` entries retain
+the 120-second userspace pressure backstop. When the final relay owner finishes,
+it conditionally removes only the forward conn-state incarnation whose timestamp
+and TCP state are unchanged; redirect metadata keeps its normal janitor lifetime.
+This preserves one relay and Clash connection identity across long server-first or
+client-first idle periods without letting an old handler delete a reused tuple.
 
 
 ### Dial modes (`global.dial_mode`)
@@ -217,6 +246,14 @@ driver owns the first send, follower sends, and replies. A first or steady send 
 a five-second timeout; a timeout or error is ambiguous, so the packet is never
 replayed through another candidate.
 
+NFQUEUE ingress reuses this initializer instead of creating a second UDP path.
+`PendingUdpVerdicts` stores only token/generation identity, FIFO verdict guards,
+phase, and the final direct mark; payload, routing, sniffing, candidate, dial, and
+cancellation ownership remain in `UdpInitLease` / `UdpEndpointPool`. Direct never
+publishes an endpoint. Proxy commits kernel state before the existing initializer
+publishes/dials/sends, so the retained payload is sent once; endpoint retirement
+uses token + generation tombstones so delayed cleanup cannot erase a replacement.
+
 **Queue and process budgets are ownership bounds.** A flow retains at most 64
 datagrams, including the first, and all flows together retain at most 8 MiB of
 payload. Slow admission and flow/global permits are acquired before payload
@@ -250,20 +287,37 @@ binding. Only an observed preparation error affects traffic health; cancelled or
 successfully drained speculative losers are health-neutral. AnyTLS uses a caller-owned,
 cap-counted provisional session slot on this path rather than its normal pool-owned
 dial task. A loser closes its detached session synchronously; only the finalized winner
-commits into the captured runtime-generation pool and starts that pool's janitor, before
-any endpoint publication or application send.
+commits into the captured runtime-generation pool and starts that pool's janitor. QUIC
+protocols likewise prepare detached clients and force-close losers. Winner commit
+publishes its client only when the generation slot is still empty; if ordinary traffic
+filled it meanwhile, the incumbent remains and the winning transport keeps its own
+connection/state clones. Slot mutation has no following await, so cancellation cannot
+publish an uncommitted winner. Both protocols finish promotion/arbitration before
+endpoint publication or application send.
 
-**UDP warm-up is opt-in and generation-owned.** `global.udp_warm_node_count`
-defaults to 0, which creates no coordinator work or warm metrics. With a positive
-budget, discovery peeks authoritative DataUdp group plans in V4 then V6 order,
-UUID-deduplicates eligible configured leaves, and applies the budget; direct,
-block, and cold URLTest plans are excluded. Dispatch has a maximum of four tasks.
-AnyTLS owns the reusable pool in its runtime generation. Reload makes the old
-generation terminal to new warm/speculative work, but existing TCP streams and Ready
-UDP endpoints keep their sessions; after the old DNS runtime's leases and transports
-retire, its pools reject new opens and close each session only when its last stream
-releases. Only `Ready` and `AlreadyReady` are warm successes. Direct, other non-AnyTLS, and
-currently deferred QUIC warm-up return `NotApplicable`, not a false success.
+**Warm ownership is generation-owned and retained independently by policy
+reason.** Every Selector contributes its configured leaf (runtime choice, then
+default, then first member); leaves shared by several Selectors are
+UUID-deduplicated. AnyTLS retains one pool session, TUIC/Juicity/Hysteria2
+retain their QUIC client and connection, and other proxy protocols retain one
+bare server TCP connection. An effective Selector change wakes reconciliation
+immediately; a 10-second pass repairs dead, consumed, or expired resources.
+Removing the final Selector owner drains only reusable state—active flows keep
+their own stream/connection—and unchanged runtimes carry ownership across
+reload. Startup preconnect is separate: it is a one-shot bare-TCP seed and owns
+no Selector/UDP retention bit.
+
+**UDP warm-up remains opt-in.** `global.udp_warm_node_count=0` creates no UDP
+coordinator or attempt metrics. A positive budget merges each group's top-N
+latency-ranked leaves that own reusable UDP-capable generation state
+(AnyTLS/TUIC/Juicity/Hysteria2), UUID-deduplicates them, and applies a
+process-wide `4×N` cap. At most four handshakes run concurrently; one pass runs
+at startup and each later pass waits for the previous batch plus the configured
+check interval. Selector and UDP bits are independent, so a shared AnyTLS/QUIC
+resource is released only after its final owner disappears. Reload makes the
+old generation terminal to new warm work while existing streams and Ready UDP
+endpoints drain normally. `Ready` counts as success; the generic
+`NotApplicable` result is neutral.
 
 ## 8. Outbound stack
 
@@ -361,7 +415,7 @@ configuration key, or API.
 
 Enabled when `experimental.clash_api.external_controller` is non-empty.
 
-Core surface: `/version`, `/configs`, `/proxies`, delay endpoints, `/rules`, `/connections`, `/traffic`, `/stats`, `/logs`, `/dns/query`, cache flush, `/providers/proxies`, external UI auto-download (Yacd-meta). `GET /stats` includes a stable nested `udp` object; its complete schema is documented in the component reference.
+Core surface: `/version`, `/configs`, `/proxies`, delay endpoints, `/rules`, `/connections`, `/traffic`, `/stats`, `/logs`, `/dns/query`, cache flush, `/providers/proxies`, external UI auto-download (Yacd-meta). `GET /stats` includes the stable nested `udp` object and its `nfqueue` object (`received`, `activeFlows`, `directAccepted`, `proxyCopied`, `proxyDropped`, `block`, `cancel`, `drop`, `tokenMismatch`, `tokenExhaustion`, `verdictErrors`, `receiptToVerdict`); the complete schema is documented in the component reference.
 
 Auth: `Authorization: Bearer` or `?token=` (percent-decoded).
 
@@ -370,12 +424,14 @@ Auth: `Authorization: Bearer` or `?token=` (percent-decoded).
 - **root** required for real eBPF: load BPF, TC/cgroup/sk_lookup attach, netns, veth, transparent bind, sysctl.
 - Docker: `--privileged --network=host --pid=host` and mount `/sys`.
 - Tests use `MockEbpfBackend` / `--mock-ebpf` without privileges.
+- Enabling `experimental.udp_nfqueue` additionally requires the real eBPF backend; startup rejects mock/no-`ebpf` configurations, and changing the setting requires restart.
 
 ## 12. Security notes
 
 - Treat config files and BPF objects as **privileged input**.
 - Clash API has **no TLS**; bind to localhost or put a reverse proxy in front; set a strong `secret`.
 - Bypass mark must stay on control-plane dial sockets or the gateway will loop its own traffic.
+- With UDP NFQUEUE enabled, honk exclusively owns the exact nftables objects `inet honk_nfqueue` / `udp_decision`; a firewall manager in the same network namespace must not mutate them while honk runs.
 
 ## 13. Authorship (design process)
 

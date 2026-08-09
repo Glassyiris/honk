@@ -40,7 +40,8 @@ pub struct CacheFileConfig {
     /// Enable cache file persistence.
     #[serde(default)]
     pub enabled: bool,
-    /// Path to cache database file. Defaults to "cache.db" if empty.
+    /// Cache database path. New relative paths resolve below `global.data_dir`;
+    /// an existing legacy config-directory path is retained.
     #[serde(default = "default_cache_path")]
     pub path: String,
     /// Unique identifier for this router instance.
@@ -70,6 +71,14 @@ impl Default for CacheFileConfig {
     }
 }
 
+/// Held-first-packet UDP decision pipeline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct UdpNfqueueConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 /// Experimental features configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ExperimentalConfig {
@@ -77,4 +86,6 @@ pub struct ExperimentalConfig {
     pub clash_api: ClashApiConfig,
     #[serde(default)]
     pub cache_file: CacheFileConfig,
+    #[serde(default)]
+    pub udp_nfqueue: UdpNfqueueConfig,
 }

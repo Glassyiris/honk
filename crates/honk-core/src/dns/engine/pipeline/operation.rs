@@ -22,7 +22,11 @@ pub(super) async fn run_as_leader(
 pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, DnsForwardError> {
     let upstream_result = context
         .forwarder
-        .exchange(&context.request_scope, context.raw_query)
+        .exchange(
+            &context.request_scope,
+            context.raw_query,
+            context.prepared.query().ingress(),
+        )
         .await;
     let (mut response, mut upstream_name) = match upstream_result {
         Ok(response) => (response, context.logical_upstream.clone()),
@@ -77,11 +81,7 @@ pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, Dn
                 response: analyzed,
                 traversal: rejected,
             } => {
-                response = make_empty_response(
-                    context.raw_query,
-                    context.prepared.domain(),
-                    context.prepared.qtype(),
-                );
+                response = make_empty_response(context.raw_query, context.prepared.query());
                 traversal = rejected;
                 break (OutcomeStatus::Rejected, analyzed.class, None);
             }
@@ -106,9 +106,6 @@ pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, Dn
 
     let exact_cache_key = context.cache_key.clone();
     let expiry = cache::store(context, &exact_cache_key, &mut response, class).await;
-    if let Some(notifier) = &context.forwarder.notifier {
-        notifier.on_domain_resolved(context.prepared.domain(), &response);
-    }
     debug!(
         ttl = expiry.ttl().as_secs(),
         bytes = response.len(),
@@ -118,11 +115,10 @@ pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, Dn
         .forwarder
         .apply_prefer_strategy(
             context.raw_query,
-            context.prepared.domain(),
+            context.prepared.query(),
             context.prepared.qtype(),
             response.into(),
             context.original_dst,
-            context.prepared.query().ingress(),
         )
         .await?;
     context.forwarder.outcome_from_wire(
@@ -147,11 +143,7 @@ async fn stale_outcome(
 ) -> Result<Option<DnsOutcome>, DnsForwardError> {
     let Some(stale) = context
         .forwarder
-        .try_serve_stale(
-            &context.cache_key,
-            context.raw_query,
-            context.prepared.domain(),
-        )
+        .try_serve_stale(&context.cache_key, context.raw_query)
         .await
     else {
         return Ok(None);
@@ -160,11 +152,10 @@ async fn stale_outcome(
         .forwarder
         .apply_prefer_strategy(
             context.raw_query,
-            context.prepared.domain(),
+            context.prepared.query(),
             context.prepared.qtype(),
             stale.into(),
             context.original_dst,
-            context.prepared.query().ingress(),
         )
         .await?;
     context

@@ -19,9 +19,7 @@ pub fn event_ip(chunks: &[u32; 4]) -> std::net::IpAddr {
 /// so a conntrack overflow burst cannot storm the log.
 pub const EVENT_LOG_MAX_PER_SEC: u32 = 32;
 
-/// Drain `EVENT_RINGBUF` and forward `DaeEvent`s to the tracing log.
-/// Conntrack overflow events log at `warn`, everything else at `info`.
-/// Follows the same `AsyncFd` readiness pattern as the aya-log flush task.
+/// Drain `EVENT_RINGBUF` into rate-limited structured logs.
 pub async fn consume_dae_events(
     mut async_fd: tokio::io::unix::AsyncFd<aya::maps::RingBuf<aya::maps::MapData>>,
 ) {
@@ -72,14 +70,21 @@ pub async fn consume_dae_events(
                 let dip = event_ip(&ev.dip);
                 let is_overflow = ev.type_ == DaeEventType::UdpConnOverflow as u32
                     || ev.type_ == DaeEventType::TcpConnOverflow as u32;
+                let is_token_exhaustion =
+                    ev.type_ == DaeEventType::UdpDecisionTokenExhausted as u32;
                 let kind = match ev.type_ {
                     t if t == DaeEventType::UdpConnOverflow as u32 => "udp_conn_overflow",
                     t if t == DaeEventType::TcpConnOverflow as u32 => "tcp_conn_overflow",
                     t if t == DaeEventType::Blocked as u32 => "blocked",
+                    t if t == DaeEventType::UdpDecisionTokenExhausted as u32 => {
+                        "udp_decision_token_exhausted"
+                    }
                     _ => "unknown",
                 };
                 if is_overflow {
                     warn!(target: "honk-ebpf", event = kind, pid = ev.pid, pname = %pname, l4proto = ev.l4proto, %sip, sport = ev.sport, %dip, dport = ev.dport, outbound = ev.outbound, "eBPF conntrack overflow");
+                } else if is_token_exhaustion {
+                    warn!(target: "honk-ebpf", event = kind, "UDP decision token allocator exhausted");
                 } else {
                     info!(target: "honk-ebpf", event = kind, pid = ev.pid, pname = %pname, l4proto = ev.l4proto, %sip, sport = ev.sport, %dip, dport = ev.dport, outbound = ev.outbound, "eBPF datapath event");
                 }

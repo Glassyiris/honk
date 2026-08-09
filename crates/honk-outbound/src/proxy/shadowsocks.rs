@@ -482,10 +482,6 @@ impl ShadowsocksHandler {
         };
         let outbound = crate::util::udp_marked_bind(bind_addr).await?;
         outbound.connect(server_addr).await?;
-        // Establish write-readiness once: try_send on a freshly created
-        // socket reports WouldBlock until the reactor has seen it writable,
-        // which would silently drop the first datagrams.
-        let _ = outbound.writable().await;
         debug!(
             "Shadowsocks UDP: session to {} for target {}",
             server_addr, target
@@ -518,22 +514,23 @@ impl PacketTransport for SsUdpTransport {
     }
 
     async fn send_packet(&self, data: &[u8]) -> std::io::Result<()> {
-        // Overload discipline: drop instead of parking. Awaiting the cipher
-        // lock or a full socket buffer would put the flow task to sleep and
-        // wake it per packet — at tunnel capacity that costs more CPU than
-        // the crypto itself, and UDP tolerates the loss anyway.
-        let Ok(mut crypto) = self.crypto.try_lock() else {
-            return Ok(());
-        };
+        // The endpoint driver already serializes this flow's sends. Receive
+        // holds the shared cipher only for one decrypt, so awaiting that
+        // short critical section preserves datagrams without an unobservable
+        // overload drop or a per-packet task.
+        let mut crypto = self.crypto.lock().await;
         let packet = crypto
             .seal(&self.socks, self.target.port(), data)
             .map_err(std::io::Error::other)?;
         drop(crypto);
-        match self.socket.try_send(&packet) {
-            Ok(_) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
-            Err(e) => Err(e),
+        let sent = self.socket.send(&packet).await?;
+        if sent != packet.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "partial Shadowsocks UDP datagram send",
+            ));
         }
+        Ok(())
     }
 
     async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
@@ -807,6 +804,42 @@ mod tests {
         assert!(packet.len() > 16 + 16 + payload.len());
         let opened = crypto.open(&packet).unwrap();
         assert_eq!(opened, payload);
+    }
+
+    #[tokio::test]
+    async fn udp_send_waits_for_cipher_instead_of_reporting_a_drop_as_success() {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.connect(server.local_addr().unwrap()).await.unwrap();
+        let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let transport = Arc::new(SsUdpTransport {
+            socket: Arc::new(client),
+            crypto: tokio::sync::Mutex::new(SsUdpCrypto::Legacy(
+                LegacyUdpCrypto::new("aes-128-gcm", "test-password").unwrap(),
+            )),
+            socks: addr::encode_address(target, None),
+            target,
+        });
+        let guard = transport.crypto.lock().await;
+        let sender = {
+            let transport = Arc::clone(&transport);
+            tokio::spawn(async move { transport.send_packet(b"retained").await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(
+            !sender.is_finished(),
+            "cipher contention must apply backpressure instead of returning false success"
+        );
+
+        drop(guard);
+        sender.await.unwrap().unwrap();
+        let mut packet = [0u8; 256];
+        let received =
+            tokio::time::timeout(std::time::Duration::from_secs(1), server.recv(&mut packet))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(received > b"retained".len());
     }
 
     #[test]

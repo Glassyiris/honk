@@ -15,6 +15,9 @@ use aya_ebpf_bindings::{
 
 use crate::{errno::ENOENT, routing::bpf_sock_is_dae_socket};
 
+const AF_INET: u32 = 2;
+const AF_INET6: u32 = 10;
+
 /// TC-side `SockMap::redirect_sk_lookup`: look the socket up by sockmap
 /// index and assign it to the current skb.
 ///
@@ -57,6 +60,9 @@ pub(crate) struct SkProbe {
     /// The socket belongs to the proxy engine itself (its own listeners and
     /// control-plane sockets must not be re-intercepted).
     pub is_dae_socket: bool,
+    /// Wildcard binds need an independent route-locality check because socket
+    /// lookup alone also matches forwarded destinations.
+    pub is_wildcard: bool,
 }
 
 /// Probe the TCP socket matching `tuple` in `netns_id`, releasing the
@@ -89,10 +95,32 @@ fn probe_result(sk: *mut bpf_sock) -> Option<SkProbe> {
     if sk.is_null() {
         return None;
     }
+    let family = unsafe { (*sk).family };
+    let is_wildcard = if family == AF_INET {
+        socket_is_v4_wildcard(sk)
+    } else if family == AF_INET6 {
+        socket_is_v6_wildcard(sk)
+    } else {
+        true
+    };
     let probe = SkProbe {
         state: unsafe { (*sk).state },
         is_dae_socket: bpf_sock_is_dae_socket(sk as *const _),
+        is_wildcard,
     };
     unsafe { bpf_sk_release(sk as *mut c_void) };
     Some(probe)
+}
+
+// Family-specific subprograms keep LLVM from folding these field reads into
+// pointer arithmetic on `bpf_sock`, which the verifier rejects at opt-level 2.
+#[inline(never)]
+fn socket_is_v4_wildcard(sk: *const bpf_sock) -> bool {
+    unsafe { (*sk).src_ip4 == 0 }
+}
+
+#[inline(never)]
+fn socket_is_v6_wildcard(sk: *const bpf_sock) -> bool {
+    let address = unsafe { (*sk).src_ip6 };
+    address[0] == 0 && address[1] == 0 && address[2] == 0 && address[3] == 0
 }

@@ -25,7 +25,21 @@ pub struct RoutingResult {
     pub pname: [u8; 16],
     pub pid: u32,
     pub dscp: u8,
+    pub decision_token: u32,
 }
+
+const _ROUTING_RESULT_SIZE: () = assert!(core::mem::size_of::<RoutingResult>() == 40);
+const _ROUTING_RESULT_ALIGN: () = assert!(core::mem::align_of::<RoutingResult>() == 4);
+const _ROUTING_RESULT_MARK_OFFSET: () = assert!(core::mem::offset_of!(RoutingResult, mark) == 0);
+const _ROUTING_RESULT_MUST_OFFSET: () = assert!(core::mem::offset_of!(RoutingResult, must) == 4);
+const _ROUTING_RESULT_MAC_OFFSET: () = assert!(core::mem::offset_of!(RoutingResult, mac) == 5);
+const _ROUTING_RESULT_OUTBOUND_OFFSET: () =
+    assert!(core::mem::offset_of!(RoutingResult, outbound) == 11);
+const _ROUTING_RESULT_PNAME_OFFSET: () = assert!(core::mem::offset_of!(RoutingResult, pname) == 12);
+const _ROUTING_RESULT_PID_OFFSET: () = assert!(core::mem::offset_of!(RoutingResult, pid) == 28);
+const _ROUTING_RESULT_DSCP_OFFSET: () = assert!(core::mem::offset_of!(RoutingResult, dscp) == 32);
+const _ROUTING_RESULT_TOKEN_OFFSET: () =
+    assert!(core::mem::offset_of!(RoutingResult, decision_token) == 36);
 
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
@@ -50,6 +64,18 @@ pub struct RoutingHandoffEntry {
     pub last_seen_ns: u64,
     pub result: RoutingResult,
 }
+
+const _ROUTING_HANDOFF_ENTRY_SIZE: () = assert!(core::mem::size_of::<RoutingHandoffEntry>() == 48);
+const _ROUTING_HANDOFF_ENTRY_ALIGN: () = assert!(core::mem::align_of::<RoutingHandoffEntry>() == 8);
+const _ROUTING_HANDOFF_LAST_SEEN_OFFSET: () =
+    assert!(core::mem::offset_of!(RoutingHandoffEntry, last_seen_ns) == 0);
+const _ROUTING_HANDOFF_RESULT_OFFSET: () =
+    assert!(core::mem::offset_of!(RoutingHandoffEntry, result) == 8);
+const _ROUTING_HANDOFF_TOKEN_OFFSET: () = assert!(
+    core::mem::offset_of!(RoutingHandoffEntry, result)
+        + core::mem::offset_of!(RoutingResult, decision_token)
+        == 44
+);
 
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]

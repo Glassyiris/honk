@@ -47,12 +47,12 @@ impl PreparedPublication<'_> {
                 "DNS runtime forced close"
             );
             oldest.request_cancellation();
-            // The bounded-generation policy is an explicit force-close: do
-            // not leave this evicted runtime's outbound pools unreachable by
-            // the later process-shutdown sweep. Commit is synchronous (it
-            // runs under the publication guards), so the close is fired off
-            // detached; the registry shutdown is idempotent.
-            tokio::spawn(async move { oldest.force_shutdown_outbound().await });
+            // The evicted runtime is no longer reachable from `state.retired`.
+            // Publication is synchronous under the provider guards, so its
+            // asynchronous outbound shutdown remains owned by the same supervisor
+            // set as runtime retirement and is joined during provider shutdown.
+            self.supervisors
+                .spawn(async move { oldest.force_shutdown_outbound().await });
         }
         let deadline = self.deadline;
         self.supervisors

@@ -51,6 +51,16 @@ global {
     }
 
     #[test]
+    fn test_parse_data_dir() {
+        let default = parse_dae_config("global {}").unwrap();
+        assert_eq!(default.global.data_dir, "/var/share/honk");
+
+        let custom = parse_dae_config("global {\n data_dir: '/srv/honk'\n}").unwrap();
+        assert_eq!(custom.global.data_dir, "/srv/honk");
+        custom.validate().unwrap();
+    }
+
+    #[test]
     fn test_parse_wan_only_global() {
         let input = r#"
 global {
@@ -118,6 +128,52 @@ dns {
         // Legacy `outbound:` still accepted.
         let legacy = &config.dns.upstream[8];
         assert_eq!(legacy.outbound.as_deref(), Some("oldproxy"));
+    }
+
+    #[test]
+    fn test_parse_dns_bind_scalar_and_current_dae_bare_udp() {
+        let bare = parse_dae_config("dns {\n bind: 127.0.0.1:53\n}").unwrap();
+        assert_eq!(bare.dns.bind, "127.0.0.1:53");
+        let endpoint = bare.dns.bind_endpoint().unwrap().unwrap();
+        assert!(endpoint.udp_enabled());
+        assert!(!endpoint.tcp_enabled());
+        assert_eq!(endpoint.host(), "127.0.0.1");
+        assert_eq!(endpoint.port(), 53);
+
+        let dual = parse_dae_config("dns {\n bind: 'TcP+UdP://[::1]:0'\n}").unwrap();
+        assert_eq!(dual.dns.bind, "TcP+UdP://[::1]:0");
+        let endpoint = dual.dns.bind_endpoint().unwrap().unwrap();
+        assert!(endpoint.udp_enabled());
+        assert!(endpoint.tcp_enabled());
+        assert_eq!(endpoint.host(), "::1");
+        assert_eq!(endpoint.port(), 0);
+
+        let commented =
+            parse_dae_config("dns {\n bind: 'udp://localhost:53' # local resolver\n}").unwrap();
+        assert_eq!(commented.dns.bind, "udp://localhost:53");
+    }
+
+    #[test]
+    fn test_parse_dns_bind_rejects_invalid_values_clearly() {
+        for value in [
+            "localhost:53",
+            "udp://localhost",
+            "udp://user@localhost:53",
+            "udp://localhost:53/path",
+            "udp://localhost:53?query",
+            "udp://localhost:53#fragment",
+            "udp+tcp://localhost:53",
+            "udp://[::1:53",
+            "udp://localhost:65536",
+        ] {
+            let input = format!("dns {{\n bind: '{value}'\n}}");
+            let error = parse_dae_config(&input).unwrap_err();
+            assert!(matches!(error, crate::ConfigError::Parse(_)), "{value}");
+            assert!(
+                error.to_string().contains("dns.bind"),
+                "error must identify dns.bind for {value}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -398,6 +454,36 @@ global {
     }
 
     #[test]
+    fn test_global_check_tolerance_applies_to_dae_urltest_groups() {
+        let config = parse_dae_config(
+            r#"
+global {
+    check_tolerance: 120ms
+}
+group {
+    url {
+        policy: urltest
+    }
+    select {
+        policy: select
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let group = |name: &str| {
+            config
+                .groups
+                .iter()
+                .find(|group| group.name == name)
+                .unwrap_or_else(|| panic!("group '{name}' missing"))
+        };
+        assert_eq!(group("url").tolerance, 120);
+        assert_eq!(group("select").tolerance, 50);
+    }
+
+    #[test]
     fn test_parse_domain_condition_prefixes() {
         let input = r#"
 routing {
@@ -510,6 +596,9 @@ experimental {
         store_fakeip: true
         store_dns: true
     }
+    udp_nfqueue {
+        enabled: true
+    }
 }
 "#;
         let config = parse_dae_config(input).unwrap();
@@ -525,6 +614,28 @@ experimental {
         assert_eq!(config.experimental.cache_file.cache_id, "router1");
         assert!(config.experimental.cache_file.store_fakeip);
         assert!(config.experimental.cache_file.store_dns);
+        assert!(config.experimental.udp_nfqueue.enabled);
+
+        let defaulted = parse_dae_config("experimental {\n    udp_nfqueue {\n    }\n}").unwrap();
+        assert!(!defaulted.experimental.udp_nfqueue.enabled);
+    }
+
+    #[test]
+    fn test_udp_nfqueue_rejects_unknown_or_invalid_settings() {
+        for input in [
+            "experimental {\n    other {\n        enabled: true\n    }\n}",
+            "experimental {\n    udp_nfqueue {\n        workers: 4\n    }\n}",
+            "experimental {\n    udp_nfqueue {\n        enabled: maybe\n    }\n}",
+        ] {
+            let error = parse_dae_config(input).expect_err("unsupported NFQUEUE config must fail");
+            assert!(matches!(error, crate::ConfigError::Parse(_)), "{error}");
+        }
+
+        let error = crate::Config::from_json_str(
+            r#"{"experimental":{"udp_nfqueue":{"enabled":true,"workers":4}}}"#,
+        )
+        .expect_err("structured config must expose only enabled");
+        assert!(matches!(error, crate::ConfigError::Parse(_)));
     }
 }
 

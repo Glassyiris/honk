@@ -95,13 +95,17 @@ impl DnsService {
                         lease
                             .runtime()
                             .forwarder()
-                            .resolve_with_context_and_profile(raw_query, original_dst, ingress),
+                            .resolve_strict_with_context_and_profile(
+                                raw_query,
+                                original_dst,
+                                ingress,
+                            ),
                     )
                     .await?
             }
             DnsServiceBackend::Standalone(forwarder) => {
                 operation
-                    .run(forwarder.resolve_with_context_and_profile(
+                    .run(forwarder.resolve_strict_with_context_and_profile(
                         raw_query,
                         original_dst,
                         ingress,

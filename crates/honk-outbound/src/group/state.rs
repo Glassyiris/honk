@@ -42,6 +42,11 @@ impl UrlTestSelections {
 /// Used by honk-core to persist choices to cache.db.
 pub type PersistCallback = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
+/// Callback invoked after an effective Selector choice write. The callback
+/// is deliberately argument-free: the warm coordinator re-reads the whole
+/// deduplicated selector set, which handles shared and nested selections.
+pub type SelectorChangeCallback = Arc<dyn Fn() + Send + Sync>;
+
 /// Callback invoked when a group's selected node changes while the group
 /// has `interrupt_connections = true`. Argument is the group name;
 /// honk-core closes the group's tracked connections.
@@ -64,6 +69,9 @@ impl GroupManager {
         if let Some(ref cb) = *self.persist_callback.read() {
             cb(group_name, node_name);
         }
+        if let Some(ref cb) = *self.selector_change_callback.read() {
+            cb();
+        }
         self.maybe_interrupt(group_name);
     }
 
@@ -76,6 +84,11 @@ impl GroupManager {
     /// (group_name, node_name). Re-callable; pass `None` to remove.
     pub fn set_persist_callback(&self, cb: Option<PersistCallback>) {
         *self.persist_callback.write() = cb;
+    }
+
+    /// Install the callback that wakes Selector warm reconciliation.
+    pub fn set_selector_change_callback(&self, cb: Option<SelectorChangeCallback>) {
+        *self.selector_change_callback.write() = cb;
     }
 
     /// Install the callback invoked when a group's selected node changes

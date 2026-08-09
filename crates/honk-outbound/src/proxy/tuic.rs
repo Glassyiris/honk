@@ -1,26 +1,4 @@
-//! TUIC v5 proxy handler (QUIC), implemented against the sing-quic reference:
-//!
-//! - Commands: AUTHENTICATE 0x00 / CONNECT 0x01 / PACKET 0x02 / DISSOCIATE
-//!   0x03 / HEARTBEAT 0x04, all headed by version 0x05
-//!   (`sing-quic/tuic/protocol.go`).
-//! - Authentication: one uni stream carrying
-//!   `[0x05, 0x00, uuid(16), token(32)]` where
-//!   `token = TLS ExportKeyingMaterial(label = uuid bytes, context = password,
-//!   len = 32)` (`sing-quic/tuic/client.go:197-214`); the stream is finished
-//!   right after the write, like the reference client.
-//! - TCP: one bi stream per connection, `[0x05, 0x01, addr]` followed by raw
-//!   payload (`client.go:347-364`).
-//! - UDP: PACKET frames `[0x05, 0x02, session u16, packet u16, frag_total u8,
-//!   frag_id u8, len u16, addr, payload]` sent either as native QUIC datagrams
-//!   (default, fragmented when exceeding the datagram MTU) or as one uni
-//!   stream per packet when the peer did not negotiate datagram support
-//!   (`packet.go:69-87`, `packet.go:302-328`). Responses are demultiplexed by
-//!   session id from both paths (`client_packet.go`).
-//! - Heartbeat: datagram `[0x05, 0x04]` every 10s while the connection is in
-//!   use (`client.go:216-230`).
-//! - Address encoding: ATYP 0x00 = domain (len byte + bytes + port),
-//!   0x01 = IPv4, 0x02 = IPv6, 0xff = none (continuation fragment)
-//!   (`address.go`, sing `metadata` serializer).
+//! TUIC v5 proxy handler (QUIC)
 
 use std::collections::HashMap;
 use std::io;
@@ -399,6 +377,10 @@ impl crate::runtime::QuicRuntimeClient for TuicClient {
     async fn force_close(&self) {
         self.quic.force_close().await;
     }
+
+    async fn release_warm(&self) {
+        self.quic.release_cached().await;
+    }
 }
 
 impl TuicClient {
@@ -484,11 +466,8 @@ impl TuicHandler {
         &self,
         runtime: &crate::runtime::NodeRuntime,
     ) -> anyhow::Result<Arc<TuicClient>> {
-        let crate::runtime::ProtocolRuntime::Quic(quic_runtime) = &runtime.runtime else {
-            anyhow::bail!("TUIC runtime is not QUIC-owned");
-        };
-        quic_runtime
-            .client(|| self.build_client(runtime.node.as_ref()))
+        runtime
+            .quic_client(|| self.build_client(runtime.node.as_ref()))
             .await
     }
 
@@ -596,19 +575,15 @@ impl TuicHandler {
 
 #[async_trait]
 impl WarmableOutbound for TuicHandler {
-    async fn warm_udp(
+    async fn warm(
         &self,
         runtime: Arc<crate::runtime::NodeRuntime>,
         connect_timeout: Duration,
-    ) -> anyhow::Result<super::UdpWarmStatus> {
+        _requirement: super::WarmRequirement,
+    ) -> anyhow::Result<()> {
         let client = self.client_for_runtime(&runtime).await?;
-        let already_ready = client.quic.has_live_connection().await;
         client.connection(connect_timeout).await?;
-        Ok(if already_ready {
-            super::UdpWarmStatus::AlreadyReady
-        } else {
-            super::UdpWarmStatus::Ready
-        })
+        Ok(())
     }
 }
 
@@ -683,9 +658,12 @@ impl PacketOutbound for TuicHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<super::PreparedUdpTransport> {
-        self.dial_udp_transport_runtime(runtime, target, target_domain, connect_timeout)
-            .await
-            .map(super::PreparedUdpTransport::ready)
+        let client = self.build_client(runtime.node.as_ref()).await?;
+        super::prepare_detached_quic_transport(runtime, client, |client| async move {
+            self.udp_transport_via_client(client, target, target_domain, connect_timeout)
+                .await
+        })
+        .await
     }
 }
 
@@ -693,21 +671,8 @@ impl PacketOutbound for TuicHandler {
 impl ProbeableOutbound for TuicHandler {
     async fn test_connectivity(&self, node: &Node) -> bool {
         match self.build_client(node).await {
-            // With the zero auth grace on the dial path, a wrong password is
-            // only visible when the server closes the connection (~1 RTT) —
-            // wait for that here, scaled to the measured RTT.
             Ok(client) => match client.connection(Duration::from_secs(5)).await {
-                Ok((conn, _)) => {
-                    let wait = (2 * conn.rtt()).max(Duration::from_millis(2));
-                    tokio::select! {
-                        _ = conn.closed() => false,
-                        _ = tokio::time::sleep(wait) => {
-                            // Re-check after the wait: a close racing the
-                            // sleep may not have won the select.
-                            conn.close_reason().is_none()
-                        }
-                    }
-                }
+                Ok((conn, _)) => crate::quic::survives_auth_close_window(&conn).await,
                 Err(_) => false,
             },
             Err(e) => {

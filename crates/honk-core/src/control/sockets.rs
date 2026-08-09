@@ -1,5 +1,5 @@
 use super::*;
-use crate::dns::wire::extract_ips_from_dns_response;
+use crate::dns::query::is_exact_dns_query;
 
 #[cfg(target_os = "linux")]
 const IPV6_ORIGDSTADDR_OPT: libc::c_int = 74;
@@ -14,21 +14,17 @@ fn set_ip_transparent(socket: &Socket, is_v6: bool) -> io::Result<()> {
 
 /// Bind the transparent TCP TPROXY listener.
 ///
-/// Go dae alignment ("listen and serve in dae netns", cmd/run.go:367): in
-/// real eBPF mode the socket is created, configured and bound inside daens
-/// via a scoped `crate::with_daens_netns` switch.  A socket is pinned to the
-/// netns it was created in, so afterwards any (host-netns) worker thread may
-/// accept on it; connection handling and upstream dialing run in the host
-/// netns, while replies to the client are written back on the daens-resident
-/// socket so the kernel routes them via dae0peer → host dae0_ingress
-/// (REDIRECT_TRACK rewrite) to the LAN.  In mock mode there is no daens and
-/// the listener is bound in the current (host) netns.
+/// Real mode creates and configures the socket inside daens. Mock mode binds
+/// an ordinary host-netns listener so the process remains runnable without
+/// `CAP_NET_ADMIN`; no datapath can deliver transparent traffic in that mode.
 pub(super) fn bind_tproxy_tcp(addr: SocketAddr, _mark: u32) -> anyhow::Result<TcpListener> {
     #[cfg(target_os = "linux")]
     if daens_netns_exists() {
-        return crate::with_daens_netns("bind TPROXY TCP listener", || build_tproxy_tcp(addr));
+        return crate::with_daens_netns("bind TPROXY TCP listener", || {
+            build_tproxy_tcp(addr, true)
+        });
     }
-    build_tproxy_tcp(addr)
+    build_tproxy_tcp(addr, false)
 }
 
 /// Whether the daens namespace is fully set up (FD-owned namespace +
@@ -40,7 +36,7 @@ fn daens_netns_exists() -> bool {
     crate::DAENS_READY.load(std::sync::atomic::Ordering::Acquire)
 }
 
-fn build_tproxy_tcp(addr: SocketAddr) -> anyhow::Result<TcpListener> {
+fn build_tproxy_tcp(addr: SocketAddr, transparent: bool) -> anyhow::Result<TcpListener> {
     let domain = if addr.is_ipv4() {
         Domain::IPV4
     } else {
@@ -56,13 +52,13 @@ fn build_tproxy_tcp(addr: SocketAddr) -> anyhow::Result<TcpListener> {
     }
 
     #[cfg(target_os = "linux")]
-    set_ip_transparent(&socket, addr.is_ipv6())?;
-
-    // Same identification mark as the UDP listeners: established-flow TCP
-    // probes must not mistake the TPROXY listener for a local service.
-    // Accepted sockets inherit the mark; the accept loop clears it.
-    #[cfg(target_os = "linux")]
-    set_so_mark(&socket, honk_ebpf_common::DAE_BYPASS_MARK)?;
+    if transparent {
+        set_ip_transparent(&socket, addr.is_ipv6())?;
+        // Accepted sockets inherit the listener mark; the accept loop clears it.
+        set_so_mark(&socket, honk_ebpf_common::DAE_BYPASS_MARK)?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = transparent;
 
     socket.bind(&addr.into())?;
     socket.listen(128)?;
@@ -70,9 +66,12 @@ fn build_tproxy_tcp(addr: SocketAddr) -> anyhow::Result<TcpListener> {
     Ok(TcpListener::from_std(socket.into())?)
 }
 
-/// Clear the packet mark on a socket so that locally generated replies are
-/// routed through the ordinary routing table, not the TPROXY policy route.
+/// Clear the inherited bypass mark on an accepted transparent socket.
 pub(super) fn set_so_mark_zero(fd: &impl std::os::fd::AsFd) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if !daens_netns_exists() {
+        return Ok(());
+    }
     set_so_mark(fd, 0)
 }
 
@@ -91,30 +90,25 @@ pub(super) fn set_so_mark(_fd: &impl std::os::fd::AsFd, _mark: u32) -> io::Resul
     Ok(())
 }
 
-/// Bind the transparent UDP TPROXY socket.
+/// Bind a group of UDP TPROXY sockets.
 ///
-/// Bound inside daens like the TCP listener (scoped `with_daens_netns`
-/// switch; falls back to the current netns in mock mode) so the daens-side
-/// TC/sk_lookup programs deliver datagrams to it in its own namespace.
-/// Replies to clients are sent through dedicated daens-resident reply
-/// sockets (see `new_udp_reply_socket` / the cached DNS reply sockets
-/// below), not through this listener socket.
-/// Bind `count` transparent UDP listeners on the same address. The eBPF
-/// programs hash each UDP flow's tuple into one of the sockets; SO_REUSEPORT
-/// keeps the normal lookup path working (and hashing) too. Each gets its own
-/// receive loop, so flows drain in parallel across runtime workers.
+/// Real mode configures transparent daens sockets. Mock mode uses ordinary
+/// host-netns sockets, retaining packet-info only for local provenance tests.
 pub(super) fn bind_tproxy_udp_listeners(
     addr: SocketAddr,
     count: usize,
 ) -> anyhow::Result<Vec<UdpSocket>> {
-    let build = |addr: SocketAddr| -> anyhow::Result<UdpSocket> { build_tproxy_udp(addr, true) };
     #[cfg(target_os = "linux")]
     if daens_netns_exists() {
         return crate::with_daens_netns("bind TPROXY UDP listener group", || {
-            (0..count).map(|_| build(addr)).collect()
+            (0..count)
+                .map(|_| build_tproxy_udp(addr, true, true))
+                .collect()
         });
     }
-    (0..count).map(|_| build(addr)).collect()
+    (0..count)
+        .map(|_| build_tproxy_udp(addr, true, false))
+        .collect()
 }
 
 pub(super) fn new_udp_listener_socket(domain: Domain, reuse_port: bool) -> io::Result<Socket> {
@@ -132,7 +126,11 @@ pub(super) fn new_udp_listener_socket(domain: Domain, reuse_port: bool) -> io::R
     Ok(socket)
 }
 
-fn build_tproxy_udp(addr: SocketAddr, reuse_port: bool) -> anyhow::Result<UdpSocket> {
+fn build_tproxy_udp(
+    addr: SocketAddr,
+    reuse_port: bool,
+    transparent: bool,
+) -> anyhow::Result<UdpSocket> {
     let domain = if addr.is_ipv4() {
         Domain::IPV4
     } else {
@@ -149,24 +147,29 @@ fn build_tproxy_udp(addr: SocketAddr, reuse_port: bool) -> anyhow::Result<UdpSoc
 
     #[cfg(target_os = "linux")]
     {
-        set_ip_transparent(&socket, addr.is_ipv6())?;
+        if transparent {
+            set_ip_transparent(&socket, addr.is_ipv6())?;
+            if addr.is_ipv4() {
+                nix::sys::socket::setsockopt(
+                    &socket,
+                    nix::sys::socket::sockopt::Ipv4OrigDstAddr,
+                    &true,
+                )
+                .map_err(io::Error::from)?;
+            } else {
+                nix::sys::socket::setsockopt(
+                    &socket,
+                    nix::sys::socket::sockopt::Ipv6OrigDstAddr,
+                    &true,
+                )
+                .map_err(io::Error::from)?;
+            }
+            set_so_mark(&socket, honk_ebpf_common::DAE_BYPASS_MARK)?;
+        }
         if addr.is_ipv4() {
-            // Preserve both authoritative ORIGDST and packet-header fallback.
-            nix::sys::socket::setsockopt(
-                &socket,
-                nix::sys::socket::sockopt::Ipv4OrigDstAddr,
-                &true,
-            )
-            .map_err(io::Error::from)?;
             nix::sys::socket::setsockopt(&socket, nix::sys::socket::sockopt::Ipv4PacketInfo, &true)
                 .map_err(io::Error::from)?;
         } else {
-            nix::sys::socket::setsockopt(
-                &socket,
-                nix::sys::socket::sockopt::Ipv6OrigDstAddr,
-                &true,
-            )
-            .map_err(io::Error::from)?;
             nix::sys::socket::setsockopt(
                 &socket,
                 nix::sys::socket::sockopt::Ipv6RecvPacketInfo,
@@ -174,10 +177,9 @@ fn build_tproxy_udp(addr: SocketAddr, reuse_port: bool) -> anyhow::Result<UdpSoc
             )
             .map_err(io::Error::from)?;
         }
-        // The listener never sends replies; the mark identifies it to the
-        // eBPF NAT-loopback socket probe as an engine-owned listener.
-        set_so_mark(&socket, honk_ebpf_common::DAE_BYPASS_MARK)?;
     }
+    #[cfg(not(target_os = "linux"))]
+    let _ = transparent;
 
     socket.bind(&addr.into())?;
     Ok(UdpSocket::from_std(socket.into())?)
@@ -433,7 +435,7 @@ async fn send_dns_reply_cached(
     };
     let first = sock
         .async_io(Interest::WRITABLE, || {
-            sendmsg_with_src(sock.as_raw_fd(), data, original_dst.ip(), client_addr)
+            sendmsg_with_src(sock.as_raw_fd(), data, original_dst.ip(), 0, client_addr)
         })
         .await;
     match first {
@@ -457,7 +459,7 @@ async fn send_dns_reply_cached(
     };
     Some(
         sock.async_io(Interest::WRITABLE, || {
-            sendmsg_with_src(sock.as_raw_fd(), data, original_dst.ip(), client_addr)
+            sendmsg_with_src(sock.as_raw_fd(), data, original_dst.ip(), 0, client_addr)
         })
         .await,
     )
@@ -470,6 +472,7 @@ fn sendmsg_with_src(
     fd: RawFd,
     data: &[u8],
     src_ip: std::net::IpAddr,
+    src_ifindex: u32,
     dst: SocketAddr,
 ) -> io::Result<usize> {
     let dst_addr = socket2::SockAddr::from(dst);
@@ -477,14 +480,13 @@ fn sendmsg_with_src(
         iov_base: data.as_ptr() as *mut libc::c_void,
         iov_len: data.len(),
     };
-    // Sized for the largest pktinfo payload (in6_pktinfo) + cmsg header.
-    let mut cmsg_buf = [0u8; 64];
+    let mut cmsg_buf = CmsgStorage::new();
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_name = dst_addr.as_ptr() as *mut libc::c_void;
     msg.msg_namelen = dst_addr.len();
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
-    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_control = cmsg_buf.bytes.as_mut_ptr() as *mut libc::c_void;
 
     let payload_len = match src_ip {
         std::net::IpAddr::V4(_) => std::mem::size_of::<libc::in_pktinfo>(),
@@ -508,7 +510,7 @@ fn sendmsg_with_src(
                 (*hdr).cmsg_type = libc::IP_PKTINFO;
                 (*hdr).cmsg_len = libc::CMSG_LEN(payload_len as _) as _;
                 let pktinfo = libc::CMSG_DATA(hdr) as *mut libc::in_pktinfo;
-                (*pktinfo).ipi_ifindex = 0;
+                (*pktinfo).ipi_ifindex = src_ifindex as libc::c_int;
                 (*pktinfo).ipi_spec_dst = libc::in_addr {
                     s_addr: u32::from(ip).to_be(),
                 };
@@ -522,7 +524,7 @@ fn sendmsg_with_src(
                 (*pktinfo).ipi6_addr = libc::in6_addr {
                     s6_addr: ip.octets(),
                 };
-                (*pktinfo).ipi6_ifindex = 0;
+                (*pktinfo).ipi6_ifindex = src_ifindex;
             }
         }
         let n = libc::sendmsg(fd, &msg, libc::MSG_DONTWAIT);
@@ -531,6 +533,20 @@ fn sendmsg_with_src(
         }
         Ok(n as usize)
     }
+}
+
+pub(super) async fn send_to_with_src(
+    socket: &UdpSocket,
+    data: &[u8],
+    src_ip: std::net::IpAddr,
+    src_ifindex: u32,
+    dst: SocketAddr,
+) -> io::Result<usize> {
+    socket
+        .async_io(Interest::WRITABLE, || {
+            sendmsg_with_src(socket.as_raw_fd(), data, src_ip, src_ifindex, dst)
+        })
+        .await
 }
 
 // Accommodate two IPv6-sized ancillary records (ORIGDST + PKTINFO). The
@@ -580,6 +596,7 @@ pub(super) fn cmsg_control_capacity_is_sufficient() -> bool {
 pub(super) struct UdpRecvMeta {
     pub(super) original_dst_cmsg: Option<SocketAddr>,
     pub(super) packet_dst_ip: Option<std::net::IpAddr>,
+    pub(super) packet_ifindex: Option<u32>,
     pub(super) local_addr: SocketAddr,
 }
 
@@ -653,7 +670,7 @@ fn recvmsg_origdst(
     // Only kernel-returned bytes are trusted. A larger value can never make
     // the parser read past our actual allocation.
     let control_len = returned_control_len.min(cmsg_buf.bytes.len());
-    let (original_dst_cmsg, packet_dst_ip) =
+    let (original_dst_cmsg, packet_dst_ip, packet_ifindex) =
         parse_cmsg_control(&cmsg_buf.bytes[..control_len], msg.msg_flags)?;
 
     Ok((
@@ -662,6 +679,7 @@ fn recvmsg_origdst(
         UdpRecvMeta {
             original_dst_cmsg,
             packet_dst_ip,
+            packet_ifindex,
             local_addr,
         },
     ))
@@ -675,7 +693,7 @@ fn recvmsg_origdst(
 pub(super) fn parse_cmsg_control(
     control: &[u8],
     msg_flags: libc::c_int,
-) -> io::Result<(Option<SocketAddr>, Option<std::net::IpAddr>)> {
+) -> io::Result<(Option<SocketAddr>, Option<std::net::IpAddr>, Option<u32>)> {
     if msg_flags & libc::MSG_CTRUNC != 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -687,6 +705,7 @@ pub(super) fn parse_cmsg_control(
     let mut offset = 0;
     let mut original_dst_cmsg = None;
     let mut packet_dst_ip = None;
+    let mut packet_ifindex = None;
     while offset < control.len() {
         if control.len() - offset < header_len {
             return Err(io::Error::new(
@@ -747,11 +766,12 @@ pub(super) fn parse_cmsg_control(
                     "duplicate PKTINFO cmsg",
                 ));
             }
-            let packet_dst = packet_dst_ip_from_cmsg(cmsg.cmsg_level, cmsg.cmsg_type, data)
-                .ok_or_else(|| {
+            let (packet_dst, ifindex) =
+                packet_info_from_cmsg(cmsg.cmsg_level, cmsg.cmsg_type, data).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, "malformed PKTINFO cmsg")
                 })?;
             packet_dst_ip = Some(packet_dst);
+            packet_ifindex = Some(ifindex);
         }
 
         let next = offset
@@ -771,7 +791,7 @@ pub(super) fn parse_cmsg_control(
         offset = next;
     }
 
-    Ok((original_dst_cmsg, packet_dst_ip))
+    Ok((original_dst_cmsg, packet_dst_ip, packet_ifindex))
 }
 
 fn original_dst_from_cmsg(
@@ -810,19 +830,23 @@ fn original_dst_from_cmsg(
     None
 }
 
-pub(super) fn packet_dst_ip_from_cmsg(
+fn packet_info_from_cmsg(
     cmsg_level: libc::c_int,
     cmsg_type: libc::c_int,
     data: &[u8],
-) -> Option<std::net::IpAddr> {
+) -> Option<(std::net::IpAddr, u32)> {
     if cmsg_level == libc::IPPROTO_IP && cmsg_type == libc::IP_PKTINFO {
         if data.len() != std::mem::size_of::<libc::in_pktinfo>() {
             return None;
         }
         let pktinfo = unsafe { std::ptr::read_unaligned(data.as_ptr().cast::<libc::in_pktinfo>()) };
-        return Some(std::net::IpAddr::V4(std::net::Ipv4Addr::from(
-            u32::from_be(pktinfo.ipi_addr.s_addr),
-        )));
+        let ifindex = u32::try_from(pktinfo.ipi_ifindex).ok()?;
+        return Some((
+            std::net::IpAddr::V4(std::net::Ipv4Addr::from(u32::from_be(
+                pktinfo.ipi_addr.s_addr,
+            ))),
+            ifindex,
+        ));
     }
     if cmsg_level == libc::IPPROTO_IPV6 && cmsg_type == libc::IPV6_PKTINFO {
         if data.len() != std::mem::size_of::<libc::in6_pktinfo>() {
@@ -830,11 +854,21 @@ pub(super) fn packet_dst_ip_from_cmsg(
         }
         let pktinfo =
             unsafe { std::ptr::read_unaligned(data.as_ptr().cast::<libc::in6_pktinfo>()) };
-        return Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(
-            pktinfo.ipi6_addr.s6_addr,
-        )));
+        return Some((
+            std::net::IpAddr::V6(std::net::Ipv6Addr::from(pktinfo.ipi6_addr.s6_addr)),
+            pktinfo.ipi6_ifindex,
+        ));
     }
     None
+}
+
+#[cfg(test)]
+pub(super) fn packet_dst_ip_from_cmsg(
+    cmsg_level: libc::c_int,
+    cmsg_type: libc::c_int,
+    data: &[u8],
+) -> Option<std::net::IpAddr> {
+    packet_info_from_cmsg(cmsg_level, cmsg_type, data).map(|(ip, _)| ip)
 }
 
 /// Select a real original destination without inventing one from UDP payload
@@ -920,134 +954,6 @@ pub(super) fn get_original_dst(stream: &TcpStream) -> anyhow::Result<SocketAddr>
     }
 }
 
-/// Strict DNS query validation shared by provenance, the controller, and
-/// both UDP dispatch paths. It accepts exactly one fully encoded question,
-/// walks every RR declared by the header, consumes the entire datagram, and
-/// requires the controller's `parse_dns_question` consumer to accept it.
-pub(super) fn is_exact_dns_query(data: &[u8]) -> bool {
-    if data.len() < 12 || data[2] & 0x80 != 0 {
-        return false;
-    }
-
-    let qdcount = u16::from_be_bytes([data[4], data[5]]) as usize;
-    if qdcount != 1 {
-        return false;
-    }
-    let counts = [
-        u16::from_be_bytes([data[6], data[7]]) as usize,
-        u16::from_be_bytes([data[8], data[9]]) as usize,
-        u16::from_be_bytes([data[10], data[11]]) as usize,
-    ];
-    let mut pos = 12;
-    // Label starts observed while walking question/owner names. Compression
-    // pointers may only land on these boundaries (not header/RDATA/interior
-    // label bytes). Unparsed RDATA is intentionally not scanned.
-    let mut label_boundaries = vec![false; data.len()];
-
-    if !skip_strict_dns_name(data, &mut pos, &mut label_boundaries)
-        || pos.checked_add(4).is_none_or(|end| end > data.len())
-    {
-        return false;
-    }
-    pos += 4; // QTYPE + QCLASS
-
-    for count in counts {
-        for _ in 0..count {
-            if !skip_strict_dns_name(data, &mut pos, &mut label_boundaries)
-                || pos.checked_add(10).is_none_or(|end| end > data.len())
-            {
-                return false;
-            }
-            let rdlength = u16::from_be_bytes([data[pos + 8], data[pos + 9]]) as usize;
-            pos += 10; // TYPE + CLASS + TTL + RDLENGTH
-            let Some(rdata_end) = pos.checked_add(rdlength) else {
-                return false;
-            };
-            if rdata_end > data.len() {
-                return false;
-            }
-            pos = rdata_end;
-        }
-    }
-
-    if pos != data.len() {
-        return false;
-    }
-
-    // Keep the shared predicate inside the controller's actual parseable set
-    // so root/binary names fall back to ordinary UDP instead of SERVFAIL.
-    crate::dns::forwarder::parse_dns_question(data).is_some()
-}
-
-/// Bounds-safe name walk that enforces the RFC expanded-name limit and
-/// restricts compression pointers to previously observed label boundaries.
-fn skip_strict_dns_name(data: &[u8], pos: &mut usize, label_boundaries: &mut [bool]) -> bool {
-    let mut cursor = *pos;
-    let mut expanded = 0usize;
-    let mut jumped = false;
-    let mut depth = 0usize;
-
-    loop {
-        if depth > 128 || cursor >= data.len() || cursor >= label_boundaries.len() {
-            return false;
-        }
-
-        if jumped {
-            if !label_boundaries[cursor] {
-                return false;
-            }
-        } else {
-            label_boundaries[cursor] = true;
-        }
-
-        let label_len = data[cursor];
-        if label_len == 0 {
-            if expanded.checked_add(1).is_none_or(|v| v > 255) {
-                return false;
-            }
-            if !jumped {
-                *pos = cursor + 1;
-            }
-            return true;
-        }
-
-        if label_len & 0xc0 == 0xc0 {
-            let Some(&next) = data.get(cursor + 1) else {
-                return false;
-            };
-            let target = (((label_len & 0x3f) as usize) << 8) | next as usize;
-            // Pointers name an earlier observed label start only.
-            if target >= cursor || target >= label_boundaries.len() || !label_boundaries[target] {
-                return false;
-            }
-            if !jumped {
-                *pos = cursor + 2;
-            }
-            jumped = true;
-            cursor = target;
-            depth += 1;
-            continue;
-        }
-
-        if label_len > 63 {
-            return false;
-        }
-
-        let label_octets = 1 + label_len as usize;
-        expanded = match expanded.checked_add(label_octets) {
-            Some(v) if v <= 255 => v,
-            _ => return false,
-        };
-        let Some(next_pos) = cursor.checked_add(label_octets) else {
-            return false;
-        };
-        if next_pos > data.len() {
-            return false;
-        }
-        cursor = next_pos;
-    }
-}
-
 /// UDP datapath fast path: classify/drop and, for a live Ready endpoint,
 /// perform a bounded synchronous `try_enqueue` in the accept loop.
 ///
@@ -1114,84 +1020,4 @@ pub(super) async fn udp_fast_path(
         EndpointReservation::Enqueued | EndpointReservation::QueueFull
     ));
     true
-}
-
-use crate::dns::forwarder::DomainResolveNotifier;
-
-/// Bridges DNS resolution to eBPF DOMAIN_ROUTING_MAP updates.
-///
-/// When the DNS forwarder resolves a domain (cache miss → upstream),
-/// this notifier extracts the resolved IP addresses and pushes them
-/// into the eBPF domain routing table so that future connections to
-/// those IPs can be matched against domain-based rules in eBPF
-/// without requiring userspace intervention.
-///
-/// Only domain/geosite rules produce map entries (via rule bitmaps).
-/// Domains that fall through to the routing default intentionally get
-/// no entry — connection-time routing still sees the full 5-tuple.
-pub struct DnsBpfNotifier {
-    ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
-    router: Arc<RwLock<Router>>,
-}
-
-impl DnsBpfNotifier {
-    pub fn new(ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>, router: Arc<RwLock<Router>>) -> Self {
-        Self { ebpf, router }
-    }
-}
-
-impl DomainResolveNotifier for DnsBpfNotifier {
-    fn on_domain_resolved(&self, domain: &str, response: &[u8]) {
-        use crate::control::routing_matcher::DOMAIN_BITMAPS;
-        use crate::ebpf::maps::cidr_to_lpm_key;
-        use honk_ebpf_common::DomainRouting;
-
-        let ips = extract_ips_from_dns_response(response);
-        if ips.is_empty() {
-            return;
-        }
-
-        let rule_name = {
-            let router = self.router.blocking_read();
-            match router.route_domain(domain) {
-                Some(m) => m.rule_name.to_string(),
-                None => return,
-            }
-        };
-
-        let bitmaps: Vec<DomainRouting> = {
-            let db = DOMAIN_BITMAPS.read();
-            db.get(&rule_name).cloned().unwrap_or_default()
-        };
-        if bitmaps.is_empty() {
-            return;
-        }
-        let mut merged = DomainRouting::default();
-        for bm in &bitmaps {
-            for (word, value) in merged.bitmap.iter_mut().zip(bm.bitmap) {
-                *word |= value;
-            }
-        }
-
-        let mut ebpf = self.ebpf.blocking_write();
-        for ip in &ips {
-            let prefix = match ip {
-                std::net::IpAddr::V4(_) => format!("{ip}/32"),
-                std::net::IpAddr::V6(_) => format!("{ip}/128"),
-            };
-            if let Ok(lpm_key) = cidr_to_lpm_key(&prefix)
-                && let Err(e) = ebpf.add_domain_ip_bitmap(&lpm_key, &merged)
-            {
-                debug!(
-                    "DNS BPF update: failed to push {} for {} (rule '{}'): {}",
-                    ip, domain, rule_name, e
-                );
-            }
-        }
-
-        debug!(
-            "DNS BPF update: domain={} rule='{}' ips={:?}",
-            domain, rule_name, ips
-        );
-    }
 }

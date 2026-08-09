@@ -17,8 +17,7 @@ pub(super) async fn lookup(
     }
     let cache = context.forwarder.cache_service().await;
     if let Some(hit) = cache.negative_hit_exact(&context.cache_key) {
-        let response =
-            crate::control::dns_control::build_dns_error_response(context.raw_query, hit.rcode);
+        let response = crate::dns::response::build_dns_error_response(context.raw_query, hit.rcode);
         return context
             .forwarder
             .outcome_from_wire(
@@ -56,11 +55,10 @@ pub(super) async fn lookup(
         .forwarder
         .apply_prefer_strategy(
             context.raw_query,
-            context.prepared.domain(),
+            context.prepared.query(),
             context.prepared.qtype(),
             response,
             context.original_dst,
-            context.prepared.query().ingress(),
         )
         .await?;
     context

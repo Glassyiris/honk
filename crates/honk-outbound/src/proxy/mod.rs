@@ -71,6 +71,51 @@ where
     }
 }
 
+struct RuntimeOwnedIo<T> {
+    inner: Box<dyn AsyncReadWrite>,
+    _owner: T,
+}
+
+impl<T> std::fmt::Debug for RuntimeOwnedIo<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeOwnedIo").finish_non_exhaustive()
+    }
+}
+
+impl<T: Unpin> AsyncRead for RuntimeOwnedIo<T> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(self.inner.as_mut()).poll_read(cx, buf)
+    }
+}
+
+impl<T: Unpin> AsyncWrite for RuntimeOwnedIo<T> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(self.inner.as_mut()).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(self.inner.as_mut()).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(self.inner.as_mut()).poll_shutdown(cx)
+    }
+}
+
 #[derive(Debug)]
 pub struct ProxyStream {
     /// Boxed so it can hold either a plain TCP or TLS-wrapped stream.
@@ -121,6 +166,16 @@ impl ProxyStream {
         }
         None
     }
+    pub(crate) fn with_owner<T>(mut self, owner: T) -> Self
+    where
+        T: Send + Unpin + 'static,
+    {
+        self.stream = Box::new(RuntimeOwnedIo {
+            inner: self.stream,
+            _owner: owner,
+        });
+        self
+    }
 }
 
 /// Framed UDP packet transport — the production UDP contract. Native UDP
@@ -132,34 +187,87 @@ pub trait PacketTransport: Send + Sync + Debug {
     /// The relay target a flow reports as its destination.
     fn relay_addr(&self) -> SocketAddr;
     async fn send_packet(&self, data: &[u8]) -> std::io::Result<()>;
+    /// Stronger admission for a flow's first datagram. Queue-backed tunnels
+    /// override this to complete only after their writer flushes the packet.
+    async fn send_packet_confirmed(&self, data: &[u8]) -> std::io::Result<()> {
+        self.send_packet(data).await
+    }
     async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)>;
 }
+
+struct RuntimeOwnedPacketTransport<T> {
+    inner: Arc<dyn PacketTransport>,
+    _owner: T,
+}
+
+impl<T> std::fmt::Debug for RuntimeOwnedPacketTransport<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeOwnedPacketTransport")
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl<T: Send + Sync> PacketTransport for RuntimeOwnedPacketTransport<T> {
+    fn relay_addr(&self) -> SocketAddr {
+        self.inner.relay_addr()
+    }
+
+    async fn send_packet(&self, data: &[u8]) -> std::io::Result<()> {
+        self.inner.send_packet(data).await
+    }
+
+    async fn send_packet_confirmed(&self, data: &[u8]) -> std::io::Result<()> {
+        self.inner.send_packet_confirmed(data).await
+    }
+
+    async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        self.inner.recv_packet(buf).await
+    }
+}
+
+pub(crate) fn packet_transport_with_owner<T>(
+    transport: Arc<dyn PacketTransport>,
+    owner: T,
+) -> Arc<dyn PacketTransport>
+where
+    T: Send + Sync + 'static,
+{
+    Arc::new(RuntimeOwnedPacketTransport {
+        inner: transport,
+        _owner: owner,
+    })
+}
+
+type PreparedUdpCommitFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>;
+type PreparedUdpCommit = Box<dyn FnOnce() -> PreparedUdpCommitFuture + Send>;
 
 /// A prepared UDP transport that is usable only after its final side effects
 /// have been committed. Dropping it without [`Self::commit`] abandons the
 /// preparation; protocol-specific resources then clean themselves up via
 /// normal RAII. Commit failure drops the transport and returns no value.
 pub struct PreparedUdpTransport {
-    transport: Option<Arc<dyn PacketTransport>>,
-    commit: Option<Box<dyn FnOnce() -> anyhow::Result<()> + Send>>,
+    transport: Arc<dyn PacketTransport>,
+    commit: PreparedUdpCommit,
 }
 
 impl std::fmt::Debug for PreparedUdpTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PreparedUdpTransport")
-            .field("prepared", &self.transport.is_some())
             .finish_non_exhaustive()
     }
 }
 
 impl PreparedUdpTransport {
-    pub fn new<F>(transport: Arc<dyn PacketTransport>, commit: F) -> Self
+    pub fn new<F, Fut>(transport: Arc<dyn PacketTransport>, commit: F) -> Self
     where
-        F: FnOnce() -> anyhow::Result<()> + Send + 'static,
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
     {
         Self {
-            transport: Some(transport),
-            commit: Some(Box::new(commit)),
+            transport,
+            commit: Box::new(move || Box::pin(commit())),
         }
     }
 
@@ -167,27 +275,37 @@ impl PreparedUdpTransport {
     /// preserves `dial_udp_transport` semantics for protocols with no
     /// speculative ownership to promote.
     pub fn ready(transport: Arc<dyn PacketTransport>) -> Self {
-        Self::new(transport, || Ok(()))
+        Self::new(transport, || async { Ok(()) })
     }
 
     /// Consume the preparation, run its one-shot promotion, then expose the
     /// transport. A failed promotion is fail-closed: the transport is dropped
     /// and cannot be sent on by a caller.
-    pub fn commit(mut self) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        let transport = self
-            .transport
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("UDP transport preparation already consumed"))?;
-        let commit = self
-            .commit
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("UDP transport commit already consumed"))?;
-        if let Err(error) = commit() {
-            drop(transport);
-            return Err(error);
-        }
-        Ok(transport)
+    pub async fn commit(self) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        (self.commit)().await?;
+        Ok(self.transport)
     }
+}
+async fn prepare_detached_quic_transport<T, F, Fut>(
+    runtime: Arc<crate::runtime::NodeRuntime>,
+    client: Arc<T>,
+    prepare: F,
+) -> anyhow::Result<PreparedUdpTransport>
+where
+    T: crate::runtime::QuicRuntimeClient,
+    F: FnOnce(Arc<T>) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Arc<dyn PacketTransport>>>,
+{
+    if !matches!(runtime.runtime, crate::runtime::ProtocolRuntime::Quic(_)) {
+        anyhow::bail!("node '{}' has no QUIC runtime", runtime.node.name);
+    }
+    let transport = prepare(Arc::clone(&client)).await?;
+    Ok(PreparedUdpTransport::new(transport, move || async move {
+        let crate::runtime::ProtocolRuntime::Quic(quic) = &runtime.runtime else {
+            anyhow::bail!("node '{}' lost its QUIC runtime", runtime.node.name);
+        };
+        quic.publish_client(client).await
+    }))
 }
 
 /// Adapter presenting a raw `UdpSocket` (e.g. the direct handler's
@@ -218,13 +336,12 @@ impl PacketTransport for UdpSocketTransport {
     }
 }
 
-/// Outcome of an additive UDP session warm-up request. A status is not a
-/// protocol capability claim: only handlers that own a reusable UDP-capable
-/// session return `Ready` or `AlreadyReady`.
+/// Result of requesting reusable protocol state. `Ready` means the state is
+/// usable after the call; `NotApplicable` means the protocol owns no
+/// generation-scoped session or client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UdpWarmStatus {
+pub enum WarmOutcome {
     Ready,
-    AlreadyReady,
     NotApplicable,
 }
 
@@ -277,7 +394,7 @@ pub trait TcpOutbound: Send + Sync {
 }
 
 /// Framed UDP transports — only protocols with UDP capability (see
-/// [`crate::descriptor::ProtocolDescriptor::capabilities`]).
+/// [`crate::descriptor::ProtocolDescriptor::supports_udp`]).
 #[async_trait]
 pub trait PacketOutbound: Send + Sync {
     async fn dial_udp_transport(
@@ -307,25 +424,9 @@ pub trait PacketOutbound: Send + Sync {
         .await
     }
 
-    /// Prepare a UDP transport for a Cold URLTest candidate. Protocols that
-    /// do not need speculative ownership can use their ordinary transport;
-    /// session protocols override this to defer pool publication until the
-    /// caller has selected and committed a winner.
-    async fn dial_udp_transport_speculative(
-        &self,
-        node: &Node,
-        target: SocketAddr,
-        target_domain: Option<&str>,
-        connect_timeout: Duration,
-    ) -> anyhow::Result<PreparedUdpTransport> {
-        self.dial_udp_transport(node, target, target_domain, connect_timeout)
-            .await
-            .map(PreparedUdpTransport::ready)
-    }
-
-    /// Generation-pinned speculative preparation. The default delegates to
-    /// the node-based method; session-owning handlers override this so every
-    /// provisional resource stays attached to the captured runtime generation.
+    /// Generation-pinned speculative preparation. The default wraps the
+    /// authoritative runtime transport; session handlers override this when
+    /// loser cancellation must avoid publishing reusable state.
     async fn dial_udp_transport_speculative_runtime(
         &self,
         runtime: Arc<crate::runtime::NodeRuntime>,
@@ -333,26 +434,29 @@ pub trait PacketOutbound: Send + Sync {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<PreparedUdpTransport> {
-        self.dial_udp_transport_speculative(
-            runtime.node.as_ref(),
-            target,
-            target_domain,
-            connect_timeout,
-        )
-        .await
+        self.dial_udp_transport_runtime(runtime, target, target_domain, connect_timeout)
+            .await
+            .map(PreparedUdpTransport::ready)
     }
 }
 
-/// Warming of generation-owned reusable UDP session resources. Transport
-/// support alone does not imply a warmable session; only session-owning
-/// protocols (AnyTLS, the QUIC tunnels) implement this.
+/// Which property a warm request must establish. Selector ownership needs
+/// the shared session; UDP top-N ownership additionally validates that the
+/// server admitted UDP on protocols where that is negotiated separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WarmRequirement {
+    Session,
+    Udp,
+}
+
 #[async_trait]
 pub trait WarmableOutbound: Send + Sync {
-    async fn warm_udp(
+    async fn warm(
         &self,
         runtime: Arc<crate::runtime::NodeRuntime>,
         connect_timeout: Duration,
-    ) -> anyhow::Result<UdpWarmStatus>;
+        requirement: WarmRequirement,
+    ) -> anyhow::Result<()>;
 }
 
 /// Raw server reachability checks.
@@ -384,10 +488,9 @@ pub struct ProtocolEntry {
     pub packet: Option<Arc<dyn PacketOutbound>>,
     pub warmable: Option<Arc<dyn WarmableOutbound>>,
     pub probeable: Option<Arc<dyn ProbeableOutbound>>,
-    /// Declared reason a packet slot may exist despite the descriptor
-    /// reporting `udp: false` for a default node (Block: the slot answers
-    /// blocked UDP flows with the routing refusal). `None` enforces
-    /// slot/table parity in [`Self::validate_consistency`].
+    /// Declared reason a packet slot may exist even when `supports_udp`
+    /// rejects the default node (Block: the slot returns the routing refusal).
+    /// `None` enforces slot/table parity in [`Self::validate_consistency`].
     packet_udp_exemption: Option<&'static str>,
 }
 
@@ -433,7 +536,7 @@ impl ProtocolEntry {
             protocol,
             ..Default::default()
         };
-        let udp_capable = (self.descriptor.capabilities)(&default_node).udp;
+        let udp_capable = (self.descriptor.supports_udp)(&default_node);
         if self.packet.is_some() != udp_capable && self.packet_udp_exemption.is_none() {
             panic!(
                 "protocol {}: packet slot (present={}) disagrees with descriptor udp={}; \
@@ -612,15 +715,13 @@ impl ProxyRegistry {
         Ok(stream)
     }
 
-    /// Warm a node using the explicitly supplied runtime generation. This
-    /// deliberately never reads the mutable shared runtime-registry cell:
-    /// reload-owned work must stay attached to its original generation.
-    pub async fn warm_udp(
+    async fn warm_retained(
         &self,
         generation: Arc<crate::runtime::OutboundRuntimeRegistry>,
         node_id: uuid::Uuid,
         connect_timeout: Duration,
-    ) -> anyhow::Result<UdpWarmStatus> {
+        reason: crate::runtime::WarmRetention,
+    ) -> anyhow::Result<WarmOutcome> {
         if generation.is_shutdown() {
             anyhow::bail!("outbound runtime generation is shut down");
         }
@@ -631,13 +732,61 @@ impl ProxyRegistry {
             anyhow::anyhow!("No handler for protocol {:?}", runtime.node.protocol)
         })?;
         let Some(warmable) = entry.warmable.as_ref() else {
-            return Ok(UdpWarmStatus::NotApplicable);
+            return Ok(WarmOutcome::NotApplicable);
         };
-        let status = warmable.warm_udp(runtime, connect_timeout).await?;
+        if reason == crate::runtime::WarmRetention::Udp && !runtime.udp_capable {
+            return Ok(WarmOutcome::NotApplicable);
+        }
+        let requirement = match reason {
+            crate::runtime::WarmRetention::Selector => WarmRequirement::Session,
+            crate::runtime::WarmRetention::Udp => WarmRequirement::Udp,
+        };
+        let attempt = runtime.retain_warm(reason).await;
+        if let Err(error) = warmable
+            .warm(Arc::clone(&runtime), connect_timeout, requirement)
+            .await
+        {
+            attempt.rollback().await;
+            return Err(error);
+        }
         if generation.is_shutdown() {
+            attempt.rollback().await;
             anyhow::bail!("outbound runtime generation shut down during warm-up");
         }
-        Ok(status)
+        attempt.commit();
+        Ok(WarmOutcome::Ready)
+    }
+
+    /// Warm a selected node's reusable session in the captured generation.
+    pub async fn warm_session(
+        &self,
+        generation: Arc<crate::runtime::OutboundRuntimeRegistry>,
+        node_id: uuid::Uuid,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<WarmOutcome> {
+        self.warm_retained(
+            generation,
+            node_id,
+            connect_timeout,
+            crate::runtime::WarmRetention::Selector,
+        )
+        .await
+    }
+
+    /// Warm a UDP-capable node in the explicitly supplied runtime generation.
+    pub async fn warm_udp(
+        &self,
+        generation: Arc<crate::runtime::OutboundRuntimeRegistry>,
+        node_id: uuid::Uuid,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<WarmOutcome> {
+        self.warm_retained(
+            generation,
+            node_id,
+            connect_timeout,
+            crate::runtime::WarmRetention::Udp,
+        )
+        .await
     }
 
     /// Framed UDP transport for a flow, dispatching to the node's packet
@@ -876,7 +1025,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn warm_udp_is_not_applicable_for_handlers_without_reusable_sessions() {
+    async fn warm_udp_is_not_applicable_without_reusable_udp_state() {
         let mut nodes = Vec::new();
         for (name, protocol) in [
             ("direct", NodeProtocol::Direct),
@@ -891,6 +1040,13 @@ mod tests {
                 ..Default::default()
             });
         }
+        nodes.push(Node {
+            id: uuid::Uuid::new_v4(),
+            name: "tcp-only-anytls".into(),
+            protocol: NodeProtocol::AnyTLS,
+            network: Some("tcp".into()),
+            ..Default::default()
+        });
         let generation = Arc::new(crate::runtime::OutboundRuntimeRegistry::build(&nodes).unwrap());
         let registry = ProxyRegistry::default_resolver().unwrap();
 
@@ -900,11 +1056,147 @@ mod tests {
                     .warm_udp(Arc::clone(&generation), node.id, Duration::from_secs(1))
                     .await
                     .unwrap(),
-                UdpWarmStatus::NotApplicable,
+                WarmOutcome::NotApplicable,
                 "{} must not masquerade as a warmable UDP session",
                 node.name
             );
         }
+    }
+    struct RejectingWarmable;
+
+    #[async_trait]
+    impl WarmableOutbound for RejectingWarmable {
+        async fn warm(
+            &self,
+            _runtime: Arc<crate::runtime::NodeRuntime>,
+            _connect_timeout: Duration,
+            _requirement: WarmRequirement,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("warm rejected")
+        }
+    }
+
+    struct PendingWarmable {
+        started: tokio::sync::mpsc::UnboundedSender<()>,
+    }
+
+    #[async_trait]
+    impl WarmableOutbound for PendingWarmable {
+        async fn warm(
+            &self,
+            _runtime: Arc<crate::runtime::NodeRuntime>,
+            _connect_timeout: Duration,
+            _requirement: WarmRequirement,
+        ) -> anyhow::Result<()> {
+            self.started.send(()).unwrap();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_warm_releases_only_its_inserted_retention() {
+        let node = Node {
+            id: uuid::Uuid::new_v4(),
+            name: "cancelled-anytls".into(),
+            protocol: NodeProtocol::AnyTLS,
+            ..Default::default()
+        };
+        let generation = Arc::new(
+            crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
+        );
+        let runtime = generation.get(&node.id).unwrap();
+        let pool = runtime.anytls_pool().unwrap();
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut registry = ProxyRegistry::default_resolver().unwrap();
+        registry
+            .entries
+            .iter_mut()
+            .find(|entry| entry.descriptor.protocol == NodeProtocol::AnyTLS)
+            .unwrap()
+            .warmable = Some(Arc::new(PendingWarmable {
+            started: started_tx,
+        }));
+        let registry = Arc::new(registry);
+
+        let task = tokio::spawn({
+            let registry = Arc::clone(&registry);
+            let generation = Arc::clone(&generation);
+            async move {
+                registry
+                    .warm_session(generation, node.id, Duration::from_secs(1))
+                    .await
+            }
+        });
+        started_rx.recv().await.unwrap();
+        assert!(pool.is_warm_retained());
+        task.abort();
+        let _ = task.await;
+        assert!(!pool.is_warm_retained());
+
+        runtime
+            .retain_warm(crate::runtime::WarmRetention::Selector)
+            .await
+            .commit();
+        let task = tokio::spawn({
+            let registry = Arc::clone(&registry);
+            async move {
+                registry
+                    .warm_session(generation, node.id, Duration::from_secs(1))
+                    .await
+            }
+        });
+        started_rx.recv().await.unwrap();
+        task.abort();
+        let _ = task.await;
+        assert!(pool.is_warm_retained());
+        runtime
+            .release_warm(crate::runtime::WarmRetention::Selector)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn failed_warm_releases_its_policy_retention() {
+        let node = Node {
+            id: uuid::Uuid::new_v4(),
+            name: "failing-anytls".into(),
+            protocol: NodeProtocol::AnyTLS,
+            ..Default::default()
+        };
+        let generation = Arc::new(
+            crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
+        );
+        let runtime = generation.get(&node.id).unwrap();
+        let pool = runtime.anytls_pool().unwrap();
+        let mut registry = ProxyRegistry::default_resolver().unwrap();
+        registry
+            .entries
+            .iter_mut()
+            .find(|entry| entry.descriptor.protocol == NodeProtocol::AnyTLS)
+            .unwrap()
+            .warmable = Some(Arc::new(RejectingWarmable));
+
+        let error = registry
+            .warm_session(Arc::clone(&generation), node.id, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("warm rejected"));
+        assert!(!pool.is_warm_retained());
+
+        runtime
+            .retain_warm(crate::runtime::WarmRetention::Selector)
+            .await
+            .commit();
+        assert!(pool.is_warm_retained());
+        registry
+            .warm_session(generation, node.id, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(pool.is_warm_retained());
+        runtime
+            .release_warm(crate::runtime::WarmRetention::Selector)
+            .await;
+        assert!(!pool.is_warm_retained());
     }
 
     #[tokio::test]
@@ -966,14 +1258,14 @@ mod tests {
         let commits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let prepared = PreparedUdpTransport::new(Arc::clone(&transport), {
             let commits = Arc::clone(&commits);
-            move || {
+            move || async move {
                 commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
         });
         assert_eq!(commits.load(std::sync::atomic::Ordering::Relaxed), 0);
 
-        let committed = prepared.commit().unwrap();
+        let committed = prepared.commit().await.unwrap();
 
         assert_eq!(commits.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert!(Arc::ptr_eq(&transport, &committed));

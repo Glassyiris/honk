@@ -400,6 +400,12 @@ pub fn parse_dae_config(input: &str) -> Result<Config, crate::ConfigError> {
         }
     }
 
+    for group in &mut config.groups {
+        if group.policy == crate::node::GroupPolicy::URLTest {
+            group.tolerance = config.global.check_tolerance_ms;
+        }
+    }
+
     resolve_group_filters(&mut config.groups, &config.nodes, &config.subscriptions);
 
     Ok(config)
@@ -649,12 +655,6 @@ fn split_sections(input: &str) -> Result<Vec<Section>, crate::ConfigError> {
             } else {
                 current_body.push_str(trimmed);
                 current_body.push('\n');
-                for _ in 0..close_count {
-                    current_body.push('}');
-                }
-                if close_count > 0 {
-                    current_body.push('\n');
-                }
             }
         }
     }
@@ -688,14 +688,10 @@ fn merge_top_level_sections(sections: Vec<Section>) -> Vec<Section> {
 fn parse_kv_pairs(body: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
     for line in body.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
+        let trimmed = strip_unquoted_comment(line.trim()).trim();
+        if trimmed.is_empty() {
             continue;
         }
-        let trimmed = trimmed
-            .split_once('#')
-            .map(|(l, _)| l.trim())
-            .unwrap_or(trimmed);
         if let Some(pos) = trimmed.find(':') {
             let key = trimmed[..pos].trim().to_string();
             let val = trimmed[pos + 1..]
@@ -707,6 +703,27 @@ fn parse_kv_pairs(body: &str) -> HashMap<String, String> {
         }
     }
     map
+}
+
+fn strip_unquoted_comment(line: &str) -> &str {
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in line.char_indices() {
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == delimiter {
+                quote = None;
+            }
+        } else if matches!(character, '\'' | '"') {
+            quote = Some(character);
+        } else if character == '#' {
+            return &line[..index];
+        }
+    }
+    line
 }
 
 fn parse_global_section(section: &Section) -> Result<GlobalConfig, crate::ConfigError> {
@@ -749,6 +766,9 @@ fn parse_global_section(section: &Section) -> Result<GlobalConfig, crate::Config
     }
     if let Some(v) = kv.get("auto_config_kernel_parameter") {
         cfg.auto_config_kernel_parameter = parse_bool(v);
+    }
+    if let Some(v) = kv.get("data_dir") {
+        cfg.data_dir = v.clone();
     }
     if let Some(v) = kv.get("store_subscribe") {
         cfg.store_subscribe = parse_bool(v);
@@ -843,6 +863,11 @@ fn parse_dns_section(section: &Section) -> Result<DnsConfig, crate::ConfigError>
     let mut cfg = DnsConfig::default();
     let mut saw_upstream = false;
     let kv = parse_kv_pairs(dns_subs.first().map(|s| s.body.as_str()).unwrap_or(""));
+    if let Some(bind) = kv.get("bind") {
+        cfg.bind.clone_from(bind);
+        cfg.bind_endpoint()
+            .map_err(|error| crate::ConfigError::Parse(error.to_string()))?;
+    }
 
     if let Some(v) = kv.get("ipversion_prefer") {
         cfg.strategy = parse_ip_prefer(v);
@@ -1663,7 +1688,14 @@ fn parse_subscription_section(section: &Section) -> Result<Vec<Subscription>, cr
 
 fn parse_experimental_section(section: &Section) -> Result<ExperimentalConfig, crate::ConfigError> {
     let mut cfg = ExperimentalConfig::default();
-    let subs = split_nested_sections(&section.body, &["clash_api", "cache_file"])?;
+    let subs = split_nested_sections(&section.body, &["clash_api", "cache_file", "udp_nfqueue"])?;
+
+    if let Some(unparsed) = subs.first().filter(|sub| !sub.body.trim().is_empty()) {
+        let setting = unparsed.body.lines().next().unwrap_or_default().trim();
+        return Err(crate::ConfigError::Parse(format!(
+            "unknown experimental setting: {setting}"
+        )));
+    }
 
     for sub in &subs {
         let kv = parse_kv_pairs(&sub.body);
@@ -1699,11 +1731,32 @@ fn parse_experimental_section(section: &Section) -> Result<ExperimentalConfig, c
                     cfg.cache_file.store_dns = parse_bool(v);
                 }
             }
+            "udp_nfqueue" => {
+                if let Some(key) = kv.keys().find(|key| key.as_str() != "enabled") {
+                    return Err(crate::ConfigError::Parse(format!(
+                        "unknown experimental.udp_nfqueue setting: {key}"
+                    )));
+                }
+                if let Some(v) = kv.get("enabled") {
+                    cfg.udp_nfqueue.enabled =
+                        parse_checked_bool(v, "experimental.udp_nfqueue.enabled")?;
+                }
+            }
             _ => {}
         }
     }
 
     Ok(cfg)
+}
+
+fn parse_checked_bool(s: &str, setting: &str) -> Result<bool, crate::ConfigError> {
+    match s.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "1" | "on" => Ok(true),
+        "false" | "no" | "0" | "off" => Ok(false),
+        _ => Err(crate::ConfigError::Parse(format!(
+            "invalid boolean for {setting}: {s}"
+        ))),
+    }
 }
 
 fn parse_bool(s: &str) -> bool {

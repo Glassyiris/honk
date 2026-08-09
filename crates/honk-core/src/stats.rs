@@ -142,6 +142,63 @@ impl UdpLatencyHistogramSnapshot {
     }
 }
 
+#[derive(Debug, Default)]
+struct UdpNfqueueStats {
+    received: AtomicU64,
+    active_flows: AtomicU64,
+    direct_accepted: AtomicU64,
+    proxy_copied: AtomicU64,
+    proxy_dropped: AtomicU64,
+    block: AtomicU64,
+    cancel: AtomicU64,
+    drop: AtomicU64,
+    token_mismatch: AtomicU64,
+    token_exhaustion: AtomicU64,
+    verdict_errors: AtomicU64,
+    receipt_to_verdict_latency: Log2Histogram,
+}
+
+impl UdpNfqueueStats {
+    fn record_verdict(&self, counter: &AtomicU64, elapsed: std::time::Duration) {
+        counter.fetch_add(1, Ordering::Relaxed);
+        self.receipt_to_verdict_latency.record(elapsed);
+    }
+
+    fn snapshot(&self) -> UdpNfqueueStatsSnapshot {
+        UdpNfqueueStatsSnapshot {
+            received: self.received.load(Ordering::Relaxed),
+            active_flows: self.active_flows.load(Ordering::Relaxed),
+            direct_accepted: self.direct_accepted.load(Ordering::Relaxed),
+            proxy_copied: self.proxy_copied.load(Ordering::Relaxed),
+            proxy_dropped: self.proxy_dropped.load(Ordering::Relaxed),
+            block: self.block.load(Ordering::Relaxed),
+            cancel: self.cancel.load(Ordering::Relaxed),
+            drop: self.drop.load(Ordering::Relaxed),
+            token_mismatch: self.token_mismatch.load(Ordering::Relaxed),
+            token_exhaustion: self.token_exhaustion.load(Ordering::Relaxed),
+            verdict_errors: self.verdict_errors.load(Ordering::Relaxed),
+            receipt_to_verdict_latency: self.receipt_to_verdict_latency.snapshot(),
+        }
+    }
+}
+
+/// Immutable snapshot of the fixed NFQUEUE UDP metrics schema.
+#[derive(Debug, Clone)]
+pub struct UdpNfqueueStatsSnapshot {
+    pub received: u64,
+    pub active_flows: u64,
+    pub direct_accepted: u64,
+    pub proxy_copied: u64,
+    pub proxy_dropped: u64,
+    pub block: u64,
+    pub cancel: u64,
+    pub drop: u64,
+    pub token_mismatch: u64,
+    pub token_exhaustion: u64,
+    pub verdict_errors: u64,
+    pub receipt_to_verdict_latency: UdpLatencyHistogramSnapshot,
+}
+
 /// Fixed, allocation-free UDP pipeline metrics for the current control-plane
 /// path. The schema is intentionally stable while each recorder is wired to
 /// its corresponding production event.
@@ -173,6 +230,7 @@ struct UdpStats {
     warm_attempts: AtomicU64,
     warm_successes: AtomicU64,
     warm_failures: AtomicU64,
+    nfqueue: UdpNfqueueStats,
 }
 
 /// Immutable snapshot of the fixed UDP metrics schema exposed by `/stats`.
@@ -201,6 +259,7 @@ pub struct UdpStatsSnapshot {
     pub warm_attempts: u64,
     pub warm_successes: u64,
     pub warm_failures: u64,
+    pub nfqueue: UdpNfqueueStatsSnapshot,
 }
 
 impl UdpStats {
@@ -229,6 +288,7 @@ impl UdpStats {
             warm_attempts: self.warm_attempts.load(Ordering::Relaxed),
             warm_successes: self.warm_successes.load(Ordering::Relaxed),
             warm_failures: self.warm_failures.load(Ordering::Relaxed),
+            nfqueue: self.nfqueue.snapshot(),
         }
     }
 }
@@ -267,6 +327,8 @@ pub enum WarmReason {
     Health,
     /// The UDP warm coordinator established the session/client.
     Udp,
+    /// The node is the configured leaf of at least one Selector group.
+    Selector,
 }
 
 impl WarmReason {
@@ -275,6 +337,7 @@ impl WarmReason {
             WarmReason::Preconnect => 1,
             WarmReason::Health => 1 << 1,
             WarmReason::Udp => 1 << 2,
+            WarmReason::Selector => 1 << 3,
         }
     }
 }
@@ -286,6 +349,7 @@ pub struct WarmSnapshot {
     pub preconnect_nodes: u64,
     pub health_nodes: u64,
     pub udp_nodes: u64,
+    pub selector_nodes: u64,
     pub traffic_nodes: u64,
     pub anytls_sessions: u64,
     pub tuic_clients: u64,
@@ -308,6 +372,14 @@ impl StatsManager {
             .entry(node)
             .or_default()
             .fetch_or(reason.bit(), Ordering::Relaxed);
+    }
+
+    /// Remove one attribution without disturbing other owners of the same
+    /// live resource. Zero-valued entries are pruned by the next snapshot.
+    pub fn clear_warm(&self, node: uuid::Uuid, reason: WarmReason) {
+        if let Some(mark) = self.warm_marks.get(&node) {
+            mark.fetch_and(!reason.bit(), Ordering::Relaxed);
+        }
     }
 
     /// Current warm-resource gauges: warm nodes counted per reason (an
@@ -360,6 +432,9 @@ impl StatsManager {
             }
             if marks & WarmReason::Udp.bit() != 0 {
                 snap.udp_nodes += 1;
+            }
+            if marks & WarmReason::Selector.bit() != 0 {
+                snap.selector_nodes += 1;
             }
         }
         self.warm_marks.retain(|id, _| warm_ids.contains(id));
@@ -525,6 +600,92 @@ impl StatsManager {
         self.udp.slow_permit_closed.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record one packet delivered by the NFQUEUE listener.
+    pub fn record_udp_nfqueue_received(&self) {
+        self.udp.nfqueue.received.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Add one flow owned by the pending-verdict correlator.
+    pub fn increment_udp_nfqueue_active_flows(&self) {
+        self.udp
+            .nfqueue
+            .active_flows
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Remove one flow from the pending-verdict correlator.
+    pub fn decrement_udp_nfqueue_active_flows(&self) {
+        let _ = self.udp.nfqueue.active_flows.try_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |active| Some(active.saturating_sub(1)),
+        );
+    }
+
+    /// Record a successful direct accept and its receipt-to-verdict latency.
+    pub fn record_udp_nfqueue_direct_accepted(&self, elapsed: std::time::Duration) {
+        self.udp
+            .nfqueue
+            .record_verdict(&self.udp.nfqueue.direct_accepted, elapsed);
+    }
+
+    /// Record one NFQUEUE payload transferred to the canonical UDP pool.
+    pub fn record_udp_nfqueue_proxy_copied(&self) {
+        self.udp
+            .nfqueue
+            .proxy_copied
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a successful original-skb drop and its receipt-to-verdict latency.
+    pub fn record_udp_nfqueue_proxy_dropped(&self, elapsed: std::time::Duration) {
+        self.udp
+            .nfqueue
+            .record_verdict(&self.udp.nfqueue.proxy_dropped, elapsed);
+    }
+
+    /// Record a successful policy-block drop verdict.
+    pub fn record_udp_nfqueue_block(&self, elapsed: std::time::Duration) {
+        self.udp
+            .nfqueue
+            .record_verdict(&self.udp.nfqueue.block, elapsed);
+    }
+
+    /// Record a successful cancellation drop verdict.
+    pub fn record_udp_nfqueue_cancel(&self, elapsed: std::time::Duration) {
+        self.udp
+            .nfqueue
+            .record_verdict(&self.udp.nfqueue.cancel, elapsed);
+    }
+
+    /// Record another successful fail-closed drop verdict.
+    pub fn record_udp_nfqueue_drop(&self, elapsed: std::time::Duration) {
+        self.udp
+            .nfqueue
+            .record_verdict(&self.udp.nfqueue.drop, elapsed);
+    }
+
+    pub fn record_udp_nfqueue_token_mismatch(&self) {
+        self.udp
+            .nfqueue
+            .token_mismatch
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_udp_nfqueue_token_exhaustion(&self) {
+        self.udp
+            .nfqueue
+            .token_exhaustion
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_udp_nfqueue_verdict_error(&self) {
+        self.udp
+            .nfqueue
+            .verdict_errors
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record a closed connection on an outbound.
     pub fn record_close(&self, outbound: &str) {
         if let Some(tracker) = self.trackers.get(outbound) {
@@ -651,6 +812,47 @@ mod tests {
         assert_eq!(route.quantile_upper_bound_ns(0.5), Some(3));
     }
 
+    #[test]
+    fn udp_nfqueue_counters_and_verdict_latency_are_fixed_and_aggregate() {
+        let manager = StatsManager::new();
+        manager.record_udp_nfqueue_received();
+        manager.increment_udp_nfqueue_active_flows();
+        manager.increment_udp_nfqueue_active_flows();
+        manager.decrement_udp_nfqueue_active_flows();
+        manager.record_udp_nfqueue_direct_accepted(std::time::Duration::from_nanos(1));
+        manager.record_udp_nfqueue_proxy_copied();
+        manager.record_udp_nfqueue_proxy_dropped(std::time::Duration::from_nanos(2));
+        manager.record_udp_nfqueue_block(std::time::Duration::from_nanos(4));
+        manager.record_udp_nfqueue_cancel(std::time::Duration::from_nanos(8));
+        manager.record_udp_nfqueue_drop(std::time::Duration::from_nanos(16));
+        manager.record_udp_nfqueue_token_mismatch();
+        manager.record_udp_nfqueue_token_exhaustion();
+        manager.record_udp_nfqueue_verdict_error();
+
+        let nfqueue = manager.udp_snapshot().nfqueue;
+        assert_eq!(nfqueue.received, 1);
+        assert_eq!(nfqueue.active_flows, 1);
+        assert_eq!(nfqueue.direct_accepted, 1);
+        assert_eq!(nfqueue.proxy_copied, 1);
+        assert_eq!(nfqueue.proxy_dropped, 1);
+        assert_eq!(nfqueue.block, 1);
+        assert_eq!(nfqueue.cancel, 1);
+        assert_eq!(nfqueue.drop, 1);
+        assert_eq!(nfqueue.token_mismatch, 1);
+        assert_eq!(nfqueue.token_exhaustion, 1);
+        assert_eq!(nfqueue.verdict_errors, 1);
+        assert_eq!(nfqueue.receipt_to_verdict_latency.count, 5);
+        assert_eq!(nfqueue.receipt_to_verdict_latency.sum_nanos, 31);
+    }
+
+    #[test]
+    fn config_reserved_mark_mask_matches_the_datapath() {
+        assert_eq!(
+            honk_config::routing::DATAPATH_RESERVED_MARK_MASK,
+            honk_ebpf_common::SKB_MARK_RESERVED_MASK
+        );
+    }
+
     #[tokio::test]
     async fn warm_snapshot_attributes_reasons_and_prunes_cold_nodes() {
         let stats = StatsManager::new();
@@ -710,6 +912,7 @@ mod tests {
                 self
             }
             async fn force_close(&self) {}
+            async fn release_warm(&self) {}
         }
 
         let stats = StatsManager::new();

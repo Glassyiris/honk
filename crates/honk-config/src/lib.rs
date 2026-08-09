@@ -12,6 +12,7 @@ pub mod experimental;
 pub mod group;
 pub mod node;
 pub mod parser;
+pub mod paths;
 pub mod routing;
 pub mod share_link;
 pub mod subscription;

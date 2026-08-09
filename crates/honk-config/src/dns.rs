@@ -1,12 +1,172 @@
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use url::Host;
 
 use crate::types::DnsProtocol;
+
+/// Transports served by a standalone DNS bind endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnsBindTransport {
+    Udp,
+    Tcp,
+    TcpUdp,
+}
+
+/// A validated standalone DNS bind endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsBindEndpoint {
+    transport: DnsBindTransport,
+    host: String,
+    port: u16,
+}
+
+/// Error returned when `dns.bind` is not a supported bind endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("invalid dns.bind {value:?}: {reason}")]
+pub struct DnsBindError {
+    value: String,
+    reason: &'static str,
+}
+
+impl DnsBindError {
+    fn new(value: &str, reason: &'static str) -> Self {
+        Self {
+            value: value.to_string(),
+            reason,
+        }
+    }
+}
+
+impl DnsBindEndpoint {
+    /// Parse one non-empty `dns.bind` value.
+    pub fn parse(value: &str) -> Result<Self, DnsBindError> {
+        if value.is_empty() {
+            return Err(DnsBindError::new(value, "an endpoint value is required"));
+        }
+
+        let Some((scheme, authority)) = value.split_once("://") else {
+            let address = value.parse::<SocketAddr>().map_err(|_| {
+                DnsBindError::new(value, "a bare endpoint must be a numeric IP socket address")
+            })?;
+            return Ok(Self {
+                transport: DnsBindTransport::Udp,
+                host: address.ip().to_string(),
+                port: address.port(),
+            });
+        };
+
+        let transport = if scheme.eq_ignore_ascii_case("udp") {
+            DnsBindTransport::Udp
+        } else if scheme.eq_ignore_ascii_case("tcp") {
+            DnsBindTransport::Tcp
+        } else if scheme.eq_ignore_ascii_case("tcp+udp") {
+            DnsBindTransport::TcpUdp
+        } else {
+            return Err(DnsBindError::new(
+                value,
+                "unsupported scheme (expected udp://, tcp://, or tcp+udp://)",
+            ));
+        };
+
+        if authority
+            .chars()
+            .any(|character| matches!(character, '/' | '?' | '#' | '@' | '\\' | '%'))
+        {
+            return Err(DnsBindError::new(
+                value,
+                "the endpoint must contain only a host and port",
+            ));
+        }
+
+        let (host, port) = parse_bind_authority(value, authority)?;
+        Ok(Self {
+            transport,
+            host,
+            port,
+        })
+    }
+
+    pub fn tcp_enabled(&self) -> bool {
+        matches!(
+            self.transport,
+            DnsBindTransport::Tcp | DnsBindTransport::TcpUdp
+        )
+    }
+
+    pub fn udp_enabled(&self) -> bool {
+        matches!(
+            self.transport,
+            DnsBindTransport::Udp | DnsBindTransport::TcpUdp
+        )
+    }
+
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+fn parse_bind_authority(value: &str, authority: &str) -> Result<(String, u16), DnsBindError> {
+    let (host, port, bracketed) = if let Some(bracketed) = authority.strip_prefix('[') {
+        let close = bracketed
+            .find(']')
+            .ok_or_else(|| DnsBindError::new(value, "malformed bracketed IPv6 host"))?;
+        let host = &bracketed[..close];
+        let suffix = &bracketed[close + 1..];
+        let port = suffix
+            .strip_prefix(':')
+            .ok_or_else(|| DnsBindError::new(value, "an explicit port is required"))?;
+        (host, port, true)
+    } else {
+        let (host, port) = authority
+            .rsplit_once(':')
+            .ok_or_else(|| DnsBindError::new(value, "an explicit port is required"))?;
+        if host.contains(':') || host.contains('[') || host.contains(']') {
+            return Err(DnsBindError::new(value, "IPv6 hosts must use brackets"));
+        }
+        (host, port, false)
+    };
+
+    if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(DnsBindError::new(
+            value,
+            "the port must be an explicit decimal u16",
+        ));
+    }
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| DnsBindError::new(value, "the port must be an explicit decimal u16"))?;
+
+    let host = if bracketed {
+        host.parse::<Ipv6Addr>()
+            .map(|address| address.to_string())
+            .map_err(|_| DnsBindError::new(value, "malformed bracketed IPv6 host"))?
+    } else if host.is_empty() {
+        String::new()
+    } else if let Ok(address) = host.parse::<IpAddr>() {
+        address.to_string()
+    } else {
+        match Host::parse(host) {
+            Ok(Host::Domain(domain)) => domain,
+            _ => return Err(DnsBindError::new(value, "invalid host")),
+        }
+    };
+
+    Ok((host, port))
+}
 
 /// DNS configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DnsConfig {
+    /// Standalone DNS listener endpoint. Empty disables the listener.
+    #[serde(default)]
+    pub bind: String,
     #[serde(default)]
     pub upstream: Vec<DnsUpstream>,
     #[serde(default)]
@@ -21,6 +181,17 @@ pub struct DnsConfig {
     /// A value of 0 means "never cache".
     #[serde(default)]
     pub fixed_domain_ttl: HashMap<String, u32>,
+}
+
+impl DnsConfig {
+    /// Return the configured standalone endpoint, or `None` when disabled.
+    pub fn bind_endpoint(&self) -> Result<Option<DnsBindEndpoint>, DnsBindError> {
+        if self.bind.is_empty() {
+            Ok(None)
+        } else {
+            DnsBindEndpoint::parse(&self.bind).map(Some)
+        }
+    }
 }
 
 /// A DNS upstream server.
@@ -405,6 +576,7 @@ impl Default for DnsCacheConfig {
 impl Default for DnsConfig {
     fn default() -> Self {
         Self {
+            bind: String::new(),
             upstream: vec![DnsUpstream {
                 name: "default".to_string(),
                 address: "223.5.5.5:53".to_string(),
@@ -427,6 +599,94 @@ impl Default for DnsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_bind_endpoint(value: &str, tcp: bool, udp: bool, host: &str, port: u16) {
+        let endpoint = DnsBindEndpoint::parse(value).unwrap();
+        assert_eq!(endpoint.tcp_enabled(), tcp, "tcp flag for {value}");
+        assert_eq!(endpoint.udp_enabled(), udp, "udp flag for {value}");
+        assert_eq!(endpoint.host(), host, "host for {value}");
+        assert_eq!(endpoint.port(), port, "port for {value}");
+    }
+
+    #[test]
+    fn dns_bind_supported_forms_select_exact_transports() {
+        assert_bind_endpoint("127.0.0.1:53", false, true, "127.0.0.1", 53);
+        assert_bind_endpoint("[2001:db8::1]:0", false, true, "2001:db8::1", 0);
+        assert_bind_endpoint("uDp://DNS.Example:0053", false, true, "dns.example", 53);
+        assert_bind_endpoint("TCP://127.0.0.1:853", true, false, "127.0.0.1", 853);
+        assert_bind_endpoint(
+            "TcP+UdP://[2001:0DB8:0:0::1]:53",
+            true,
+            true,
+            "2001:db8::1",
+            53,
+        );
+        assert_bind_endpoint("udp://:0", false, true, "", 0);
+    }
+
+    #[test]
+    fn dns_bind_bare_numeric_is_udp_and_semantically_canonical() {
+        let bare_v4 = DnsBindEndpoint::parse("127.0.0.1:53").unwrap();
+        let udp_v4 = DnsBindEndpoint::parse("UDP://127.0.0.1:0053").unwrap();
+        assert_eq!(bare_v4, udp_v4);
+        assert!(bare_v4.udp_enabled());
+        assert!(!bare_v4.tcp_enabled());
+
+        let bare_v6 = DnsBindEndpoint::parse("[2001:db8::1]:53").unwrap();
+        let udp_v6 = DnsBindEndpoint::parse("udp://[2001:0db8:0:0::1]:53").unwrap();
+        assert_eq!(bare_v6, udp_v6);
+    }
+
+    #[test]
+    fn dns_bind_rejects_undocumented_or_malformed_forms() {
+        for value in [
+            "",
+            "localhost:53",
+            "udp://localhost",
+            "udp://user@localhost:53",
+            "udp://localhost:53/path",
+            "udp://localhost:53?option=true",
+            "udp://localhost:53#fragment",
+            "tls://localhost:853",
+            "udp+tcp://localhost:53",
+            "tcp+udp+tcp://localhost:53",
+            "udp://tcp://localhost:53",
+            "udp://[::1:53",
+            "udp://::1:53",
+            "udp://[::1]53",
+            "udp://[::1]:",
+            "udp://localhost:http",
+            "udp://localhost:+53",
+            "udp://localhost:65536",
+            "udp://[fe80::1%25lo]:53",
+            " udp://localhost:53",
+        ] {
+            let error = DnsBindEndpoint::parse(value).unwrap_err();
+            assert!(
+                error.to_string().contains("dns.bind"),
+                "error must identify dns.bind for {value:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn dns_bind_is_serde_defaulted_and_empty_disables_it() {
+        let default = DnsConfig::default();
+        assert!(default.bind.is_empty());
+        assert_eq!(default.bind_endpoint().unwrap(), None);
+
+        let missing: DnsConfig = serde_json::from_str("{}").unwrap();
+        assert!(missing.bind.is_empty());
+        assert_eq!(missing.bind_endpoint().unwrap(), None);
+
+        let configured: DnsConfig =
+            serde_json::from_str(r#"{"bind":"tcp+udp://localhost:53"}"#).unwrap();
+        let endpoint = configured.bind_endpoint().unwrap().unwrap();
+        assert!(endpoint.tcp_enabled());
+        assert!(endpoint.udp_enabled());
+        assert_eq!(endpoint.host(), "localhost");
+        assert_eq!(endpoint.port(), 53);
+    }
 
     /// Regression: a `[dns]` section without `cache` must still get the
     /// documented defaults (max_size=10000). The derived `Default` used to

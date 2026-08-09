@@ -4,6 +4,7 @@ use aya_ebpf::btf_maps::{Array, HashMap, LpmTrie, PerCpuArray, RingBuf, SockMap}
 use aya_ebpf::macros::btf_map;
 use honk_ebpf_common::conn::{
     BpfStatsKey, ConnState, ConntrackArgs, MAX_CONN_STATE_NUM, ParseTransportCtx,
+    UdpDecisionSequence,
 };
 use honk_ebpf_common::event::DaeEvent;
 use honk_ebpf_common::redirect_need::{
@@ -26,6 +27,14 @@ pub const MAX_ROUTING_HANDOFF_NUM: usize = 65536;
 pub const MAX_LPM_NUM: usize = MAX_MATCH_SET_LEN + 8;
 pub const MAX_COOKIE_PID_PNAME_MAPPING_NUM: usize = 65536;
 pub const MAX_DOMAIN_ROUTING_NUM: usize = 65536;
+
+#[repr(C)]
+pub struct UdpDecisionScratch {
+    pub redirect_key: RedirectTuple,
+    pub redirect: RedirectEntry,
+    pub handoff: RoutingHandoffEntry,
+    pub state: ConnState,
+}
 
 // Global variable: corresponds to the C `const volatile struct dae_param PARAM = {};`.
 #[unsafe(no_mangle)]
@@ -68,17 +77,80 @@ pub fn datapath_ready() -> bool {
     DATAPATH_STATE_MAP.get(0).is_some_and(|ready| *ready != 0)
 }
 
-/// Runtime datapath flags written by userspace; see the
-/// `DATAPATH_FLAG_OFFLOAD_*` bits in honk-ebpf-common.
+/// Runtime offload and NFQUEUE readiness flags written by the sole userspace coordinator.
 #[btf_map]
 pub static DATAPATH_FLAGS_MAP: Array<u32, 1, 0> = Array::new();
 
-/// Read the mode-based offload policy.  `lan_ingress` calls this once per
-/// new flow (at route-decision time) and caches the outcome per flow in
-/// `ROUTING_META_FLAG_OFFLOAD`; established packets must not re-read it.
+/// Route-time offload policy is cached per flow; UDP staging paths re-read
+/// only the enabled/readiness fence before publishing an exact pending mark.
 #[inline(always)]
 pub fn datapath_flags() -> u32 {
     DATAPATH_FLAGS_MAP.get(0).copied().unwrap_or(0)
+}
+
+/// Persistent across process reloads so no live held skb can observe token reuse.
+#[btf_map]
+pub static UDP_DECISION_SEQUENCE: Array<UdpDecisionSequence, 1, 0> = Array::new();
+
+/// Active grace-period slot for token-bound decision work. Userspace flips
+/// this before waiting on the previous per-CPU slot.
+#[btf_map]
+pub static UDP_DECISION_EPOCH: Array<u32, 1, 0> = Array::new();
+
+/// Per-CPU readers for the two decision grace-period slots.
+#[btf_map]
+pub static UDP_DECISION_INFLIGHT: PerCpuArray<u32, 2> = PerCpuArray::new();
+
+/// Tuple fence installed by userspace before token-conditioned retirement.
+/// New claims and cached followers fail closed while an entry exists.
+#[btf_map]
+pub static UDP_DECISION_RETIRE_FENCE: HashMap<TuplesKey, u32, 65536, 1> = HashMap::new();
+
+#[inline(always)]
+fn try_begin_udp_decision(slot: u32) -> bool {
+    let Some(counter) = UDP_DECISION_INFLIGHT.get_ptr_mut(slot) else {
+        return false;
+    };
+    unsafe {
+        *counter = (*counter).wrapping_add(1);
+    }
+    if UDP_DECISION_EPOCH
+        .get(0)
+        .is_some_and(|epoch| *epoch & 1 == slot)
+    {
+        return true;
+    }
+    unsafe {
+        *counter = (*counter).wrapping_sub(1);
+    }
+    false
+}
+
+#[inline(always)]
+pub fn begin_udp_decision() -> Option<u32> {
+    let first = UDP_DECISION_EPOCH.get(0).map_or(0, |epoch| *epoch & 1);
+    if try_begin_udp_decision(first) {
+        return Some(first);
+    }
+    let second = UDP_DECISION_EPOCH.get(0).map_or(0, |epoch| *epoch & 1);
+    if try_begin_udp_decision(second) {
+        return Some(second);
+    }
+    None
+}
+
+#[inline(always)]
+pub fn end_udp_decision(slot: u32) {
+    if let Some(counter) = UDP_DECISION_INFLIGHT.get_ptr_mut(slot & 1) {
+        unsafe {
+            *counter = (*counter).wrapping_sub(1);
+        }
+    }
+}
+
+#[inline(always)]
+pub fn udp_decision_retiring(key: &TuplesKey) -> bool {
+    unsafe { UDP_DECISION_RETIRE_FENCE.get(key).is_some() }
 }
 
 #[btf_map]
@@ -192,3 +264,6 @@ pub static CONNTRACK_ARGS_MAP: PerCpuArray<ConntrackArgs, 1> = PerCpuArray::new(
 
 #[btf_map]
 pub static PARSE_CTX_MAP: PerCpuArray<ParseTransportCtx, 1> = PerCpuArray::new();
+
+#[btf_map]
+pub static UDP_DECISION_SCRATCH_MAP: PerCpuArray<UdpDecisionScratch, 1> = PerCpuArray::new();

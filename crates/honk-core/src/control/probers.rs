@@ -130,7 +130,7 @@ pub(super) fn warm_runtime(
 ) -> Option<Arc<honk_outbound::runtime::NodeRuntime>> {
     generation
         .get(&node.id)
-        .filter(|runtime| runtime.has_warm_resources())
+        .filter(|runtime| runtime.is_warm_or_stateless())
 }
 
 /// Dial `node` through its warm generation runtime when it has one, else
@@ -183,59 +183,86 @@ fn url_host(url: &str) -> Option<String> {
 
 impl ProxyHttpProber {
     /// Perform an HTTP health check over an already-established connection.
-    ///
-    /// Sends a minimal HTTP request, reads the response status line, and
-    /// validates the status code.  Status codes 200-399 are considered healthy.
+    /// HTTPS targets get a verified TLS layer before the HTTP/1.1 exchange;
+    /// status codes 200-499 are considered healthy.
     async fn http_check(
-        mut stream: Box<dyn crate::proxy::AsyncReadWrite>,
+        stream: Box<dyn crate::proxy::AsyncReadWrite>,
         url: &str,
         method: &str,
     ) -> Result<(), String> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
         let (host, path) =
-            extract_url_host_path(url).ok_or_else(|| format!("invalid check URL: {}", url))?;
+            extract_url_host_path(url).ok_or_else(|| format!("invalid check URL: {url}"))?;
         let method = if method.is_empty() { "GET" } else { method };
 
-        let request = format!(
-            "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: honk-health/1.0\r\nConnection: close\r\n\r\n",
-            method, path, host
-        );
+        if url.trim().starts_with("https://") {
+            let connector = health_https_connector()?;
+            let mut tls = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                connector.connect(host, stream),
+            )
+            .await
+            .map_err(|_| "HTTPS handshake timeout".to_string())?
+            .map_err(|error| format!("HTTPS handshake failed: {error}"))?;
+            Self::http1_exchange(&mut tls, host, path, method).await
+        } else {
+            let mut stream = stream;
+            Self::http1_exchange(stream.as_mut(), host, path, method).await
+        }
+    }
 
+    async fn http1_exchange<S>(
+        stream: &mut S,
+        host: &str,
+        path: &str,
+        method: &str,
+    ) -> Result<(), String>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + ?Sized,
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: honk-health/1.0\r\nConnection: close\r\n\r\n"
+        );
         stream
             .write_all(request.as_bytes())
             .await
-            .map_err(|e| format!("HTTP write failed: {}", e))?;
+            .map_err(|error| format!("HTTP write failed: {error}"))?;
 
         let mut buf = vec![0u8; 4096];
         let n = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf))
             .await
             .map_err(|_| "HTTP read timeout".to_string())?
-            .map_err(|e| format!("HTTP read failed: {}", e))?;
-
+            .map_err(|error| format!("HTTP read failed: {error}"))?;
         if n == 0 {
             return Err("empty HTTP response".to_string());
         }
 
         let response = String::from_utf8_lossy(&buf[..n]);
         let status_line = response.lines().next().unwrap_or("");
-
-        let parts: Vec<&str> = status_line.split_whitespace().collect();
-        if parts.len() < 2 {
-            return Err(format!("malformed HTTP status: {}", status_line));
-        }
-
-        let status_code: u16 = parts[1]
-            .parse()
-            .map_err(|_| format!("invalid status code: {}", parts[1]))?;
-
-        // Go: 200-499 = success, 5xx = failure
+        let mut parts = status_line.split_whitespace();
+        let _version = parts
+            .next()
+            .ok_or_else(|| format!("malformed HTTP status: {status_line}"))?;
+        let status_code = parts
+            .next()
+            .ok_or_else(|| format!("malformed HTTP status: {status_line}"))?
+            .parse::<u16>()
+            .map_err(|error| format!("invalid HTTP status '{status_line}': {error}"))?;
         if !(200..500).contains(&status_code) {
-            return Err(format!("bad status code: {}", status_code));
+            return Err(format!("bad status code: {status_code}"));
         }
-
         Ok(())
     }
+}
+
+fn health_https_connector() -> Result<honk_outbound::tls::TlsConnector, String> {
+    static CONNECTOR: std::sync::LazyLock<Result<honk_outbound::tls::TlsConnector, String>> =
+        std::sync::LazyLock::new(|| {
+            honk_outbound::tls::build_dns_connector(false, b"\x08http/1.1")
+                .map_err(|error| format!("failed to build health-check TLS connector: {error:#}"))
+        });
+    CONNECTOR.clone()
 }
 
 /// Default DNS target for UDP health checks when `udp_check_dns` is unset
@@ -505,5 +532,30 @@ pub(super) fn extract_url_host_path(url: &str) -> Option<(&str, &str)> {
         None
     } else {
         Some((host, path))
+    }
+}
+#[cfg(test)]
+mod http_probe_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn https_health_check_starts_with_tls_client_hello() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut content_type = [0u8; 1];
+            stream.read_exact(&mut content_type).await.unwrap();
+            content_type[0]
+        });
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        let result =
+            ProxyHttpProber::http_check(Box::new(stream), "https://localhost/generate_204", "HEAD")
+                .await;
+
+        assert!(result.is_err());
+        assert_eq!(peer.await.unwrap(), 22, "TLS handshake record expected");
     }
 }

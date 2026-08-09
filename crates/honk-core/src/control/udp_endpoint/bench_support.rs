@@ -190,7 +190,18 @@ impl ReadyBatch {
     }
 
     fn release_and_assert(self) {
+        let (remove_tx, mut remove_rx) = mpsc::channel(1);
+        self.pool.set_remove_sink(remove_tx);
         self.pool.remove(self.client, self.destination);
+        let removal = remove_rx
+            .try_recv()
+            .unwrap_or_else(|error| panic!("benchmark removal must be published: {error}"));
+        assert!(self.pool.complete_removal(
+            removal.client,
+            removal.dst,
+            removal.decision_token,
+            removal.generation,
+        ));
         let pool = Arc::clone(&self.pool);
         let slow_slots = Arc::clone(&self.slow_slots);
         let slow_capacity = self.slow_capacity;
@@ -224,6 +235,8 @@ pub fn reserve_rollback_batch(iterations: usize) {
     let stats = StatsManager::new();
     let slow_slots = Arc::new(Semaphore::new(iterations));
     let (client, destination) = bench_addresses();
+    let (remove_tx, mut remove_rx) = mpsc::channel(1);
+    pool.set_remove_sink(remove_tx);
 
     for _ in 0..iterations {
         let lease = match pool.reserve_or_enqueue(
@@ -237,6 +250,15 @@ pub fn reserve_rollback_batch(iterations: usize) {
             _ => panic!("rollback benchmark must reserve a fresh mapping"),
         };
         drop(lease);
+        let removal = remove_rx
+            .try_recv()
+            .unwrap_or_else(|error| panic!("rollback removal must be published: {error}"));
+        assert!(pool.complete_removal(
+            removal.client,
+            removal.dst,
+            removal.decision_token,
+            removal.generation,
+        ));
         assert_released(&pool, &slow_slots, iterations);
     }
 }

@@ -31,6 +31,7 @@ use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use parking_lot::Mutex;
 use std::net::SocketAddr;
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -116,10 +117,23 @@ pub struct ReadyPoolMetrics {
 }
 
 pub(crate) fn is_tcp_stream_alive(stream: &TcpStream) -> bool {
-    matches!(
+    if !matches!(
         nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::SocketError),
         Ok(0)
-    )
+    ) {
+        return false;
+    }
+    let mut buf = [0u8; 1];
+    match nix::sys::socket::recv(
+        stream.as_raw_fd(),
+        &mut buf,
+        nix::sys::socket::MsgFlags::MSG_PEEK | nix::sys::socket::MsgFlags::MSG_DONTWAIT,
+    ) {
+        Ok(0) => false,
+        Ok(_) => true,
+        Err(nix::errno::Errno::ECONNRESET | nix::errno::Errno::ENOTCONN) => false,
+        Err(_) => true,
+    }
 }
 
 impl ConnectionPool {
@@ -306,16 +320,28 @@ impl ConnectionPool {
     }
 
     /// Whether a live, unexpired bare-TCP entry exists for `addr`
-    /// (`host:port`) — the preconnect warm gauge behind `/stats`.
+    /// (`host:port`) — the preconnect warm gauge behind `/stats`. Dead and
+    /// expired entries are removed here so a long-lived warm owner can
+    /// replace them instead of eventually filling the per-host vector.
     pub(crate) fn has_live_bare_entry(&self, addr: &str) -> bool {
         let now = Instant::now();
-        self.entries.get(addr).is_some_and(|list| {
-            list.lock().iter().any(|entry| {
-                matches!(entry.stream, PooledStream::Bare(_))
-                    && !self.entry_expired(entry, now)
-                    && Self::is_entry_alive(entry)
-            })
-        })
+        let Some(entries) = self.entries.get(addr) else {
+            return false;
+        };
+        let mut entries = entries.lock();
+        let before = entries.len();
+        entries.retain(|entry| {
+            !matches!(entry.stream, PooledStream::Bare(_))
+                || (!self.entry_expired(entry, now) && Self::is_entry_alive(entry))
+        });
+        let removed = before - entries.len();
+        if removed > 0 {
+            self.total_entries
+                .fetch_sub(removed as u64, Ordering::Relaxed);
+        }
+        entries
+            .iter()
+            .any(|entry| matches!(entry.stream, PooledStream::Bare(_)))
     }
 
     /// Deposit a fully-dialed stream under `key` (see [`ready_key`]).
@@ -414,6 +440,22 @@ impl ConnectionPool {
     fn release_ready_target(&self, node: &str) {
         if let Some(counter) = self.ready_targets.get(node) {
             counter.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Drop only the bare preconnect for a node. Ready streams may belong to
+    /// active traffic policy and are not selector warm ownership.
+    pub(crate) fn purge_bare(&self, node_addr: &str) {
+        let Some((_, entries)) = self.entries.remove(node_addr) else {
+            return;
+        };
+        let removed = entries.lock().len() as u64;
+        if removed > 0 {
+            self.total_entries.fetch_sub(removed, Ordering::Relaxed);
+            debug!(
+                "Purged {} selector-warm bare connections for {}",
+                removed, node_addr
+            );
         }
     }
 
@@ -609,6 +651,27 @@ mod tests {
         assert!(acquired.is_some());
     }
 
+    #[tokio::test]
+    async fn live_bare_check_prunes_expired_entry_for_repin() {
+        let mut pool = ConnectionPool::new();
+        pool.idle_timeout = Duration::from_millis(20);
+        let addr = spawn_hold_open_listener().await.to_string();
+
+        let first = TcpStream::connect(&addr).await.unwrap();
+        pool.deposit_tcp(&addr, first).await;
+        assert!(pool.has_live_bare_entry(&addr));
+        assert_eq!(pool.total_entries.load(Ordering::Relaxed), 1);
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!pool.has_live_bare_entry(&addr));
+        assert_eq!(pool.total_entries.load(Ordering::Relaxed), 0);
+
+        let replacement = TcpStream::connect(&addr).await.unwrap();
+        pool.deposit_tcp(&addr, replacement).await;
+        assert!(pool.has_live_bare_entry(&addr));
+        assert_eq!(pool.total_entries.load(Ordering::Relaxed), 1);
+    }
+
     /// Phase 5: deposits past the global FD budget are refused.
     #[tokio::test]
     async fn test_pool_global_cap_refused() {
@@ -775,6 +838,31 @@ mod tests {
         let key = ConnectionPool::ready_key("proxy.example:1080", target, None);
         pool.deposit_ready(&key, stream).await;
         assert!(pool.acquire_ready(&key).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pool_bare_dead_fin_evicted() {
+        let pool = ConnectionPool::new();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+        });
+        let tcp = TcpStream::connect(server_addr).await.unwrap();
+
+        for _ in 0..100 {
+            if !is_tcp_stream_alive(&tcp) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !is_tcp_stream_alive(&tcp),
+            "MSG_PEEK never observed the peer FIN"
+        );
+        pool.deposit_tcp("proxy.example:1080", tcp).await;
+        assert!(pool.acquire_tcp("proxy.example:1080").await.is_none());
     }
 
     /// End-to-end: a SOCKS5 stream pooled after a full dial is reused

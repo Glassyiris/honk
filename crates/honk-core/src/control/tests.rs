@@ -1,6 +1,7 @@
 use super::udp_dial::{UdpPrepare, UdpStaggerCallbacks, prepare_udp_plan};
 use super::*;
 use crate::control::udp_endpoint::UdpEndpoint;
+use crate::dns::query::is_exact_dns_query;
 
 #[test]
 fn test_build_dns_probe_query() {
@@ -234,7 +235,8 @@ fn udp_original_dst_cmsg_parser_walks_aligned_ipv4_multi_cmsg() {
         bytes_of(&pktinfo),
     );
 
-    let (original_dst, packet_dst_ip) = parse_cmsg_control(&storage.bytes[..used], 0).unwrap();
+    let (original_dst, packet_dst_ip, packet_ifindex) =
+        parse_cmsg_control(&storage.bytes[..used], 0).unwrap();
     assert_eq!(original_dst, Some(addr("203.0.113.10:4444")));
     assert_eq!(
         packet_dst_ip,
@@ -242,6 +244,7 @@ fn udp_original_dst_cmsg_parser_walks_aligned_ipv4_multi_cmsg() {
             198, 51, 100, 53
         )))
     );
+    assert_eq!(packet_ifindex, Some(0));
 }
 
 #[test]
@@ -258,7 +261,7 @@ fn udp_original_dst_cmsg_parser_walks_aligned_ipv6_multi_cmsg() {
         ipi6_addr: libc::in6_addr {
             s6_addr: expected_packet.octets(),
         },
-        ipi6_ifindex: 0,
+        ipi6_ifindex: 7,
     };
     let mut storage = AlignedTestCmsgStorage::new();
     let mut used = 0;
@@ -277,9 +280,11 @@ fn udp_original_dst_cmsg_parser_walks_aligned_ipv6_multi_cmsg() {
         bytes_of(&pktinfo),
     );
 
-    let (original_dst, packet_dst_ip) = parse_cmsg_control(&storage.bytes[..used], 0).unwrap();
+    let (original_dst, packet_dst_ip, packet_ifindex) =
+        parse_cmsg_control(&storage.bytes[..used], 0).unwrap();
     assert_eq!(original_dst, Some(addr("[2001:db8::4444]:4444")));
     assert_eq!(packet_dst_ip, Some(std::net::IpAddr::V6(expected_packet)));
+    assert_eq!(packet_ifindex, Some(7));
 }
 
 #[test]
@@ -349,6 +354,7 @@ fn udp_original_dst_unspecified_origdst_is_authoritative_and_fails_closed() {
     let meta = UdpRecvMeta {
         original_dst_cmsg: Some(addr("0.0.0.0:53")),
         packet_dst_ip: Some("198.51.100.53".parse().unwrap()),
+        packet_ifindex: None,
         local_addr: addr("192.0.2.20:5353"),
     };
 
@@ -532,7 +538,8 @@ fn udp_original_dst_cmsg_parser_skips_unknown_cmsg_with_padding() {
         bytes_of(&pktinfo),
     );
 
-    let (original_dst, packet_dst_ip) = parse_cmsg_control(&storage.bytes[..used], 0).unwrap();
+    let (original_dst, packet_dst_ip, packet_ifindex) =
+        parse_cmsg_control(&storage.bytes[..used], 0).unwrap();
     assert_eq!(original_dst, Some(addr("203.0.113.10:4444")));
     assert_eq!(
         packet_dst_ip,
@@ -540,6 +547,7 @@ fn udp_original_dst_cmsg_parser_skips_unknown_cmsg_with_padding() {
             198, 51, 100, 53
         )))
     );
+    assert_eq!(packet_ifindex, Some(0));
 }
 
 async fn ready_udp_endpoint(
@@ -564,6 +572,7 @@ async fn ready_udp_endpoint(
         client,
         dst,
         lease.generation(),
+        lease.decision_token(),
         Arc::clone(&endpoint),
         queue_rx,
         reply_socket,
@@ -592,7 +601,7 @@ fn udp_original_dst_exact_dns_predicate_matches_controller_condition() {
 }
 
 #[test]
-fn udp_strict_dns_validator_accepts_complete_query_and_edns_only() {
+fn strict_dns_query_accepts_complete_query_and_edns_only() {
     let query = dns_query_payload();
     assert!(is_exact_dns_query(&query));
 
@@ -653,7 +662,7 @@ fn dns_query_with_qname(qname: &[u8]) -> Vec<u8> {
 }
 
 #[test]
-fn udp_strict_dns_validator_enforces_expanded_name_limit_and_label_boundaries() {
+fn strict_dns_query_enforces_expanded_name_limit_and_label_boundaries() {
     // Four 63-byte labels + root expand to 257 octets (>255) and must fail.
     let mut overlong_name = Vec::new();
     for _ in 0..4 {
@@ -703,7 +712,7 @@ fn udp_strict_dns_validator_enforces_expanded_name_limit_and_label_boundaries() 
 }
 
 #[test]
-fn udp_strict_dns_validator_requires_controller_parseable_question() {
+fn strict_dns_query_requires_forwarder_parseable_question() {
     // Root qname is wire-valid but parse_dns_question rejects empty labels.
     let root = dns_query_with_qname(&[0x00]);
     assert!(crate::dns::forwarder::parse_dns_question(&root).is_none());
@@ -724,23 +733,19 @@ fn udp_strict_dns_validator_requires_controller_parseable_question() {
 async fn udp_dns_controller_declines_root_and_binary_questions() {
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let controller = production_dns_controller(calls.clone(), dns_response_payload());
-    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let client = addr("127.0.0.1:34567");
     let dst = addr("203.0.113.53:53");
 
     let root = dns_query_with_qname(&[0x00]);
     assert!(
-        !controller
-            .handle_udp_dns(&sock, &root, client, dst)
-            .await
-            .unwrap(),
+        !controller.handle_udp_dns(&root, client, dst).await.unwrap(),
         "root qname must fall back to ordinary UDP"
     );
 
     let binary = dns_query_with_qname(&[0x01, 0xff, 0x00]);
     assert!(
         !controller
-            .handle_udp_dns(&sock, &binary, client, dst)
+            .handle_udp_dns(&binary, client, dst)
             .await
             .unwrap(),
         "binary qname must fall back to ordinary UDP"
@@ -789,6 +794,7 @@ fn udp_original_dst_cmsg_takes_precedence_over_other_metadata() {
     let meta = UdpRecvMeta {
         original_dst_cmsg: Some(addr("203.0.113.10:4444")),
         packet_dst_ip: Some("198.51.100.10".parse().unwrap()),
+        packet_ifindex: None,
         local_addr: addr("192.0.2.10:5353"),
     };
 
@@ -815,6 +821,7 @@ fn udp_original_dst_uses_ipv4_pktinfo_for_exact_dns_query() {
     let meta = UdpRecvMeta {
         original_dst_cmsg: None,
         packet_dst_ip,
+        packet_ifindex: None,
         local_addr: addr("0.0.0.0:15000"),
     };
     assert_eq!(
@@ -839,6 +846,7 @@ fn udp_original_dst_uses_ipv6_pktinfo_for_exact_dns_query() {
     let meta = UdpRecvMeta {
         original_dst_cmsg: None,
         packet_dst_ip,
+        packet_ifindex: None,
         local_addr: addr("[::]:15000"),
     };
     assert_eq!(
@@ -853,6 +861,7 @@ fn udp_original_dst_uses_non_wildcard_local_fallback() {
     let meta = UdpRecvMeta {
         original_dst_cmsg: None,
         packet_dst_ip: None,
+        packet_ifindex: None,
         local_addr,
     };
 
@@ -865,6 +874,7 @@ fn udp_original_dst_fails_closed_for_wildcard_local_without_metadata() {
         let meta = UdpRecvMeta {
             original_dst_cmsg: None,
             packet_dst_ip: None,
+            packet_ifindex: None,
             local_addr,
         };
         assert_eq!(udp_original_dst(&meta, b"opaque UDP"), None);
@@ -876,12 +886,14 @@ fn udp_original_dst_does_not_rewrite_non_exact_dns_payloads() {
     let packet_meta = UdpRecvMeta {
         original_dst_cmsg: None,
         packet_dst_ip: Some("198.51.100.53".parse().unwrap()),
+        packet_ifindex: None,
         local_addr: addr("0.0.0.0:15000"),
     };
     let local_fallback = addr("192.0.2.20:5353");
     let fallback_meta = UdpRecvMeta {
         original_dst_cmsg: None,
         packet_dst_ip: None,
+        packet_ifindex: None,
         local_addr: local_fallback,
     };
     let mut dns_response = dns_query_payload();
@@ -1444,21 +1456,26 @@ impl honk_outbound::proxy::PacketOutbound for UdpTestHandler {
         }
     }
 
-    async fn dial_udp_transport_speculative(
+    async fn dial_udp_transport_speculative_runtime(
         &self,
-        node: &Node,
+        runtime: Arc<honk_outbound::runtime::NodeRuntime>,
         target: SocketAddr,
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<honk_outbound::proxy::PreparedUdpTransport> {
         let transport = self
-            .dial_udp_transport(node, target, target_domain, connect_timeout)
+            .dial_udp_transport(
+                runtime.node.as_ref(),
+                target,
+                target_domain,
+                connect_timeout,
+            )
             .await?;
         if let UdpTestMode::PreparedCommitError { commits, .. } = &self.mode {
             let commits = Arc::clone(commits);
             return Ok(honk_outbound::proxy::PreparedUdpTransport::new(
                 transport,
-                move || {
+                move || async move {
                     commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     Err(anyhow::anyhow!(
                         "scripted prepared transport commit failure"
@@ -1487,6 +1504,142 @@ fn udp_test_forwarder() -> Arc<crate::dns::forwarder::DnsForwarder> {
         )
         .with_cache_enabled(false),
     )
+}
+
+#[tokio::test]
+async fn tcp_idle_relay_survives_conn_state_sweep() -> anyhow::Result<()> {
+    use honk_ebpf_common::conn::{ConnState, TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS, TcpState};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let original_dst = listener.local_addr()?;
+    let mut client = TcpStream::connect(original_dst).await?;
+    let (accepted, client_addr) = listener.accept().await?;
+    let tuples = build_tuples_key(
+        original_dst.ip(),
+        original_dst.port(),
+        client_addr.ip(),
+        client_addr.port(),
+        6,
+    );
+    let redirect_key = RedirectTuple::from_tuples(&tuples);
+    let stale_timestamp = 1;
+    let stale_state = ConnState {
+        state: TcpState::TcpStateActive as u8,
+        last_seen_ns: stale_timestamp,
+        ..Default::default()
+    };
+    let stale_redirect = RedirectEntry {
+        last_seen_ns: stale_timestamp,
+        ..Default::default()
+    };
+    let handoff = RoutingHandoffEntry {
+        last_seen_ns: stale_timestamp,
+        result: RoutingResult {
+            outbound: OutboundIndex::Direct as u8,
+            mark: 0,
+            ..Default::default()
+        },
+    };
+
+    let mut mock = crate::ebpf::mock::MockEbpfBackend::new();
+    mock.tcp_conn_state_store(&tuples, &stale_state)?;
+    mock.redirect_track_store(&redirect_key, &stale_redirect)?;
+    let raw_tuples: [u8; 40] = bytes_of(&tuples).try_into().expect("40-byte tuple key");
+    mock.routing_handoffs.lock().insert(raw_tuples, handoff);
+
+    let mut config = Config::default();
+    config.ensure_builtin_nodes();
+    config.global.dial_mode = "ip".to_string();
+    config.routing.default_outbound = "direct".to_string();
+    let router = Router::new(&config.routing.rules, &config.routing.default_outbound)?;
+    let plane = ControlPlane::new(
+        config,
+        Box::new(mock),
+        router,
+        Arc::new(ProxyRegistry::default_resolver()?),
+        DnsResolver::new(&honk_config::dns::DnsConfig::default())?,
+        udp_test_forwarder(),
+    )?;
+    let handle = plane.spawn_handle();
+    let handler_handle = handle.clone();
+    let handler =
+        tokio::spawn(async move { handler_handle.serve_connection(accepted, client_addr).await });
+    let (mut upstream, _) =
+        tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
+
+    let tracked_before = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let snapshot = handle.connection_tracker.snapshot();
+            if snapshot.len() == 1 {
+                break snapshot.into_iter().next().unwrap();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+
+    let synthetic_now = TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS + stale_timestamp + 1;
+    let janitor = BpfJanitor::new(handle.ebpf.clone(), handle.tcp_flow_pins.clone());
+    assert_eq!(
+        janitor.cleanup_conn_state_for_test(synthetic_now).await,
+        (0, 1)
+    );
+    assert_eq!(
+        janitor.cleanup_redirect_track_for_test(synthetic_now).await,
+        (0, 1)
+    );
+    {
+        let backend = handle.ebpf.read().await;
+        assert!(backend.tcp_conn_state_lookup(&tuples)?.is_some());
+        assert!(backend.redirect_track_lookup(&redirect_key)?.is_some());
+    }
+
+    upstream.write_all(b"S").await?;
+    let mut byte = [0u8; 1];
+    client.read_exact(&mut byte).await?;
+    assert_eq!(&byte, b"S");
+
+    client.write_all(b"C").await?;
+    upstream.read_exact(&mut byte).await?;
+    assert_eq!(&byte, b"C");
+    upstream.write_all(b"R").await?;
+    client.read_exact(&mut byte).await?;
+    assert_eq!(&byte, b"R");
+
+    let tracked_after = handle.connection_tracker.snapshot();
+    assert_eq!(tracked_after.len(), 1);
+    assert_eq!(tracked_after[0].id, tracked_before.id);
+    assert_eq!(tracked_after[0].proxy, tracked_before.proxy);
+    assert_eq!(tracked_after[0].chains, tracked_before.chains);
+
+    client.shutdown().await?;
+    upstream.shutdown().await?;
+    drop(client);
+    drop(upstream);
+    let handler_result = tokio::time::timeout(Duration::from_secs(5), handler).await?;
+    handler_result??;
+
+    {
+        let backend = handle.ebpf.read().await;
+        assert!(backend.tcp_conn_state_lookup(&tuples)?.is_none());
+        assert!(backend.redirect_track_lookup(&redirect_key)?.is_some());
+    }
+    assert!(handle.tcp_flow_pins.snapshot().is_empty());
+    assert!(handle.connection_tracker.snapshot().is_empty());
+    assert_eq!(
+        janitor.cleanup_redirect_track_for_test(synthetic_now).await,
+        (1, 1)
+    );
+    assert!(
+        handle
+            .ebpf
+            .read()
+            .await
+            .redirect_track_lookup(&redirect_key)?
+            .is_none()
+    );
+    Ok(())
 }
 
 fn udp_test_config(default_outbound: &str, nodes: Vec<Node>, groups: Vec<Group>) -> Config {
@@ -1598,17 +1751,13 @@ async fn serve_test_udp_to(
             .reserve_or_enqueue(client, dst, payload, slow_permit, &handle.stats);
     match reservation {
         crate::control::udp_endpoint::EndpointReservation::Initializing(lease) => {
-            handle
-                .serve_udp_connection(
-                    lease,
-                    Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
-                )
-                .await
+            handle.serve_udp_connection(lease).await
         }
         crate::control::udp_endpoint::EndpointReservation::Enqueued
         | crate::control::udp_endpoint::EndpointReservation::CapacityRejected
         | crate::control::udp_endpoint::EndpointReservation::QueueFull
-        | crate::control::udp_endpoint::EndpointReservation::QueueClosed => Ok(()),
+        | crate::control::udp_endpoint::EndpointReservation::QueueClosed
+        | crate::control::udp_endpoint::EndpointReservation::IdentityMismatch => Ok(()),
     }
 }
 
@@ -2079,1589 +2228,6 @@ async fn udp_stats_lifecycle_success_and_reply_eof_close_guard() {
     assert_udp_outbound(&stats, "udp-test", 1, 0, 0);
 }
 
-// --- UDP post-decision kernel offload -------------------------------------
-
-#[test]
-fn udp_offload_predicate_mode_and_outbound_matrix() {
-    let rule = crate::mode::ModeState::new("rule", "proxy");
-    let direct = crate::mode::ModeState::new("direct", "proxy");
-    let global = crate::mode::ModeState::new("global", "direct");
-    let client = addr("10.0.0.2:53000");
-    let dst = addr("203.0.113.2:443");
-    let allow = super::connection::udp_post_decision_offload_allowed;
-
-    // Rule (and clash-API-disabled, where no override ever applies) offload
-    // a converged direct decision.
-    assert!(allow(Some(&rule), "direct", false, client, dst));
-    assert!(allow(None, "direct", false, client, dst));
-    // Direct normalizes every non-must/block decision to direct.
-    assert!(allow(Some(&direct), "direct", false, client, dst));
-    // A proxied or blocked decision is never offloaded, in any mode.
-    assert!(!allow(Some(&rule), "proxy", false, client, dst));
-    assert!(!allow(Some(&direct), "proxy", false, client, dst));
-    assert!(!allow(None, "block", false, client, dst));
-    // Global keeps non-must flows in userspace, even when the GLOBAL
-    // selection itself resolves to direct.
-    assert!(!allow(Some(&global), "direct", false, client, dst));
-    // must-direct finals offload in every mode.
-    assert!(allow(Some(&global), "direct", true, client, dst));
-    assert!(allow(Some(&rule), "direct", true, client, dst));
-    // Port 53 is never offloaded, in either direction: the DNS hijack
-    // depends on the DnsController seeing every packet.
-    assert!(!allow(
-        None,
-        "direct",
-        false,
-        client,
-        addr("203.0.113.2:53")
-    ));
-    assert!(!allow(None, "direct", true, client, addr("203.0.113.2:53")));
-    assert!(!allow(None, "direct", false, addr("10.0.0.2:53"), dst));
-}
-
-/// A transport whose receive side never completes, so the endpoint driver
-/// stays alive and the Ready endpoint remains observable in the pool.
-#[derive(Debug)]
-struct UdpOffloadTestTransport {
-    relay: SocketAddr,
-    sends: Arc<std::sync::atomic::AtomicUsize>,
-}
-
-#[async_trait::async_trait]
-impl honk_outbound::proxy::PacketTransport for UdpOffloadTestTransport {
-    fn relay_addr(&self) -> SocketAddr {
-        self.relay
-    }
-
-    async fn send_packet(&self, _data: &[u8]) -> std::io::Result<()> {
-        self.sends
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
-    }
-
-    async fn recv_packet(&self, _buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
-        std::future::pending().await
-    }
-}
-
-/// Counts dials/sends so offload tests can prove the userspace datapath was
-/// never used for an offloaded flow.
-#[derive(Debug, Clone, Default)]
-struct UdpOffloadTestHandler {
-    dials: Arc<std::sync::atomic::AtomicUsize>,
-    sends: Arc<std::sync::atomic::AtomicUsize>,
-}
-
-impl UdpOffloadTestHandler {
-    fn dial_count(&self) -> usize {
-        self.dials.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    fn send_count(&self) -> usize {
-        self.sends.load(std::sync::atomic::Ordering::Relaxed)
-    }
-}
-
-#[async_trait::async_trait]
-impl honk_outbound::proxy::TcpOutbound for UdpOffloadTestHandler {
-    async fn dial(
-        &self,
-        _node: &Node,
-        _target: SocketAddr,
-        _target_domain: Option<&str>,
-        _connect_timeout: Duration,
-    ) -> anyhow::Result<honk_outbound::proxy::ProxyStream> {
-        Err(anyhow::anyhow!(
-            "TCP dial is not used by the UDP offload tests"
-        ))
-    }
-}
-
-#[async_trait::async_trait]
-impl honk_outbound::proxy::PacketOutbound for UdpOffloadTestHandler {
-    async fn dial_udp_transport(
-        &self,
-        _node: &Node,
-        target: SocketAddr,
-        _target_domain: Option<&str>,
-        _connect_timeout: Duration,
-    ) -> anyhow::Result<Arc<dyn honk_outbound::proxy::PacketTransport>> {
-        self.dials
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(Arc::new(UdpOffloadTestTransport {
-            relay: target,
-            sends: self.sends.clone(),
-        }))
-    }
-}
-
-/// Registers the offload test handler for both the Socks5 (proxy leaf) and
-/// Direct (built-in) protocols, and optionally installs a clash mode state.
-fn udp_offload_test_handle(
-    config: Config,
-    clash: Option<crate::mode::ModeState>,
-) -> (ControlPlaneHandle, UdpOffloadTestHandler) {
-    let router = Router::new(&config.routing.rules, &config.routing.default_outbound).unwrap();
-    let mut registry = honk_outbound::proxy::ProxyRegistry::new();
-    let handler = UdpOffloadTestHandler::default();
-    let handler_arc = Arc::new(handler.clone());
-    registry.register(
-        honk_outbound::proxy::ProtocolEntry::new(
-            honk_config::types::NodeProtocol::Socks5,
-            handler_arc.clone(),
-        )
-        .with_packet(handler_arc.clone()),
-    );
-    registry.register(
-        honk_outbound::proxy::ProtocolEntry::new(
-            honk_config::types::NodeProtocol::Direct,
-            handler_arc.clone(),
-        )
-        .with_packet(handler_arc),
-    );
-    let mut control_plane = ControlPlane::new(
-        config,
-        Box::new(crate::ebpf::mock::MockEbpfBackend::new()),
-        router,
-        Arc::new(registry),
-        DnsResolver::new(&honk_config::dns::DnsConfig::default()).unwrap(),
-        udp_test_forwarder(),
-    )
-    .unwrap();
-    control_plane.udp_pool = Arc::new(UdpEndpointPool::with_reply_socket_factory(
-        8,
-        Arc::new(UdpTestReplySocketFactory),
-    ));
-    if let Some(state) = clash {
-        control_plane.set_mode_state(Arc::new(parking_lot::RwLock::new(state)));
-    }
-    control_plane.udp_post_decision_offload = true;
-    (control_plane.spawn_handle(), handler)
-}
-
-fn udp_offload_test_config(default_outbound: &str, nodes: Vec<Node>) -> Config {
-    let mut config = udp_test_config(default_outbound, nodes, vec![]);
-    config.ensure_builtin_nodes();
-    config
-}
-
-/// A genuine QUIC v1 client Initial whose ClientHello carries `sni`, built
-/// with the sniffer's own test utils (the encryption-side mirror of the
-/// decryption pipeline).
-fn quic_initial_payload(sni: Option<&str>) -> Vec<u8> {
-    use super::quic::test_utils;
-    test_utils::protect_initial_packet(
-        b"dcid1234",
-        b"",
-        super::quic::QUIC_VERSION_1,
-        0,
-        1,
-        &test_utils::wrap_crypto_frame(0, &test_utils::build_client_hello(sni)),
-    )
-}
-
-/// Mirror of the kernel's `build_routing_meta` bit encoding.
-fn seeded_meta_raw(outbound: u8, mark: u32, must: u8) -> u64 {
-    (outbound as u64)
-        | ((mark as u64) << 8)
-        | ((must as u64) << 40)
-        | honk_ebpf_common::ROUTING_META_FLAG_PUBLISHED
-}
-
-async fn seed_udp_conn_state(
-    handle: &ControlPlaneHandle,
-    client: SocketAddr,
-    dst: SocketAddr,
-    raw: u64,
-) -> TuplesKey {
-    let key =
-        super::connection::build_tuples_key(dst.ip(), dst.port(), client.ip(), client.port(), 17);
-    let state = ConnState {
-        last_seen_ns: 1,
-        meta: RoutingMeta { raw },
-        ..Default::default()
-    };
-    handle
-        .ebpf
-        .write()
-        .await
-        .udp_conn_state_store(&key, &state)
-        .unwrap();
-    key
-}
-
-async fn udp_conn_meta_raw(handle: &ControlPlaneHandle, key: &TuplesKey) -> Option<u64> {
-    handle
-        .ebpf
-        .read()
-        .await
-        .udp_conn_state_lookup(key)
-        .unwrap()
-        .map(|state| unsafe { state.meta.raw })
-}
-
-#[tokio::test]
-async fn udp_offload_converged_direct_marks_conn_state() {
-    for (client, dst) in [
-        (addr("10.0.0.2:53000"), addr("203.0.113.2:443")),
-        (addr("[2001:db8::2]:53000"), addr("[2001:db8::3]:443")),
-    ] {
-        let config = udp_offload_test_config("direct", vec![]);
-        let (handle, handler) = udp_offload_test_handle(config, None);
-        let key = seed_udp_conn_state(
-            &handle,
-            client,
-            dst,
-            seeded_meta_raw(honk_ebpf_common::OutboundIndex::Direct as u8, 0, 0),
-        )
-        .await;
-        let initial = quic_initial_payload(Some("quic.example.org"));
-
-        serve_test_udp_to(&handle, client, dst, &initial)
-            .await
-            .unwrap();
-
-        let raw = udp_conn_meta_raw(&handle, &key)
-            .await
-            .expect("conn state kept");
-        assert_ne!(
-            raw & honk_ebpf_common::ROUTING_META_FLAG_OFFLOAD,
-            0,
-            "converged direct QUIC flow must be offloaded ({client} -> {dst})"
-        );
-        assert_ne!(raw & honk_ebpf_common::ROUTING_META_FLAG_PUBLISHED, 0);
-        // Drop-and-reinject: no endpoint, no tracker entry, no stats
-        // connection, and not a single userspace dial — nothing is left
-        // frozen behind the offloaded flow.
-        assert!(handle.udp_pool.get(client, dst).is_none());
-        assert!(handle.connection_tracker.snapshot().is_empty());
-        assert!(!handle.stats.snapshot().contains_key("direct"));
-        assert_eq!(handler.dial_count(), 0);
-    }
-}
-
-#[tokio::test]
-async fn udp_offload_direct_mode_normalizes_proxy_decision() {
-    let client = addr("10.0.0.2:53000");
-    let dst = addr("203.0.113.2:443");
-    let config = udp_offload_test_config("udp-test", vec![udp_test_node()]);
-    let (handle, handler) =
-        udp_offload_test_handle(config, Some(crate::mode::ModeState::new("direct", "proxy")));
-    // The kernel cached a proxy decision for this flow (e.g. it was routed
-    // before the mode switch); the userspace override re-decides it to
-    // direct, so the cached meta must be normalized along with the offload
-    // bit.
-    let key = seed_udp_conn_state(
-        &handle,
-        client,
-        dst,
-        seeded_meta_raw(
-            honk_ebpf_common::OutboundIndex::UserBase as u8,
-            honk_ebpf_common::TPROXY_MARK,
-            0,
-        ),
-    )
-    .await;
-    let initial = quic_initial_payload(Some("quic.example.org"));
-
-    serve_test_udp_to(&handle, client, dst, &initial)
-        .await
-        .unwrap();
-
-    let raw = udp_conn_meta_raw(&handle, &key)
-        .await
-        .expect("conn state kept");
-    assert_ne!(raw & honk_ebpf_common::ROUTING_META_FLAG_OFFLOAD, 0);
-    assert_eq!(
-        raw & 0xFF,
-        honk_ebpf_common::OutboundIndex::Direct as u64,
-        "cached outbound normalized to direct"
-    );
-    assert_eq!(
-        (raw >> 8) & 0xFFFF_FFFF,
-        0,
-        "tproxy mark must be cleared or policy routing loops the flow back into daens"
-    );
-    assert_eq!(handler.dial_count(), 0);
-}
-
-#[tokio::test]
-async fn udp_offload_rule_mode_keeps_proxy_decision_in_userspace() {
-    let client = addr("10.0.0.2:53000");
-    let dst = addr("203.0.113.2:443");
-    let config = udp_offload_test_config("udp-test", vec![udp_test_node()]);
-    let (handle, handler) = udp_offload_test_handle(config, None);
-    let proxied = seeded_meta_raw(
-        honk_ebpf_common::OutboundIndex::UserBase as u8,
-        honk_ebpf_common::TPROXY_MARK,
-        0,
-    );
-    let key = seed_udp_conn_state(&handle, client, dst, proxied).await;
-    let initial = quic_initial_payload(Some("quic.example.org"));
-
-    serve_test_udp_to(&handle, client, dst, &initial)
-        .await
-        .unwrap();
-
-    assert_eq!(
-        udp_conn_meta_raw(&handle, &key).await,
-        Some(proxied),
-        "a converged proxy decision must never be offloaded"
-    );
-    // Zero impact: the flow is relayed in userspace exactly as before.
-    assert!(handle.udp_pool.get(client, dst).is_some());
-    assert_eq!(handler.dial_count(), 1);
-    assert_eq!(handler.send_count(), 1);
-}
-
-#[tokio::test]
-async fn udp_offload_global_mode_keeps_direct_decision_in_userspace() {
-    let client = addr("10.0.0.2:53000");
-    let dst = addr("203.0.113.2:443");
-    let config = udp_offload_test_config("direct", vec![]);
-    // GLOBAL selection resolves to direct: the decision converges to direct,
-    // but Global mode offloads only must-direct finals.
-    let (handle, handler) = udp_offload_test_handle(
-        config,
-        Some(crate::mode::ModeState::new("global", "direct")),
-    );
-    let direct = seeded_meta_raw(honk_ebpf_common::OutboundIndex::Direct as u8, 0, 0);
-    let key = seed_udp_conn_state(&handle, client, dst, direct).await;
-    let initial = quic_initial_payload(Some("quic.example.org"));
-
-    serve_test_udp_to(&handle, client, dst, &initial)
-        .await
-        .unwrap();
-
-    assert_eq!(udp_conn_meta_raw(&handle, &key).await, Some(direct));
-    assert!(handle.udp_pool.get(client, dst).is_some());
-    assert_eq!(handler.dial_count(), 1);
-}
-
-/// Same offloadable conditions (direct decision, Rule semantics), but the
-/// first datagram is not a QUIC Initial: the flow must stay on the full
-/// userspace relay — no offload, and its packet is relayed, never dropped.
-#[tokio::test]
-async fn udp_offload_non_quic_flow_stays_in_userspace() {
-    let client = addr("10.0.0.2:53000");
-    let dst = addr("203.0.113.2:443");
-    let config = udp_offload_test_config("direct", vec![]);
-    let (handle, handler) = udp_offload_test_handle(config, None);
-    let direct = seeded_meta_raw(honk_ebpf_common::OutboundIndex::Direct as u8, 0, 0);
-    let key = seed_udp_conn_state(&handle, client, dst, direct).await;
-
-    serve_test_udp_to(&handle, client, dst, b"plain udp payload")
-        .await
-        .unwrap();
-
-    assert_eq!(
-        udp_conn_meta_raw(&handle, &key).await,
-        Some(direct),
-        "a non-QUIC flow must never be offloaded (no retransmission guarantee)"
-    );
-    assert!(handle.udp_pool.get(client, dst).is_some());
-    assert_eq!(handler.dial_count(), 1);
-    assert_eq!(
-        handler.send_count(),
-        1,
-        "the packet must be relayed, not dropped"
-    );
-}
-
-/// A decrypted Initial whose ClientHello carries no SNI is still confirmed
-/// QUIC, so a converged-direct decision may offload it.
-#[tokio::test]
-async fn udp_offload_quic_initial_without_sni_is_confirmed() {
-    let client = addr("10.0.0.2:53000");
-    let dst = addr("203.0.113.2:443");
-    let config = udp_offload_test_config("direct", vec![]);
-    let (handle, handler) = udp_offload_test_handle(config, None);
-    let key = seed_udp_conn_state(
-        &handle,
-        client,
-        dst,
-        seeded_meta_raw(honk_ebpf_common::OutboundIndex::Direct as u8, 0, 0),
-    )
-    .await;
-    let initial = quic_initial_payload(None);
-
-    serve_test_udp_to(&handle, client, dst, &initial)
-        .await
-        .unwrap();
-
-    let raw = udp_conn_meta_raw(&handle, &key)
-        .await
-        .expect("conn state kept");
-    assert_ne!(raw & honk_ebpf_common::ROUTING_META_FLAG_OFFLOAD, 0);
-    assert_eq!(handler.dial_count(), 0);
-}
-
-#[tokio::test]
-async fn udp_offload_uncommitted_initializer_never_marks_conn_state() {
-    let client = addr("10.0.0.2:53000");
-    let dst = addr("203.0.113.2:443");
-    let config = udp_offload_test_config("direct", vec![]);
-    let (handle, _handler) = udp_offload_test_handle(config, None);
-    let direct = seeded_meta_raw(honk_ebpf_common::OutboundIndex::Direct as u8, 0, 0);
-    let key = seed_udp_conn_state(&handle, client, dst, direct).await;
-    // Retire the initializer mid-flight: no decision ever converges, so no
-    // offload write may happen.
-    let slow_permit = Arc::new(tokio::sync::Semaphore::new(1))
-        .try_acquire_owned()
-        .expect("test slow permit");
-    let crate::control::udp_endpoint::EndpointReservation::Initializing(lease) = handle
-        .udp_pool
-        .reserve_or_enqueue(client, dst, b"UDP test packet", slow_permit, &handle.stats)
-    else {
-        panic!("fresh flow must reserve an initializer");
-    };
-    drop(lease);
-
-    assert_eq!(
-        udp_conn_meta_raw(&handle, &key).await,
-        Some(direct),
-        "an uncommitted initializer must never offload"
-    );
-}
-
-#[tokio::test]
-async fn udp_offload_repeats_after_conn_state_sweep_without_leaking() {
-    let client = addr("10.0.0.2:53000");
-    let dst = addr("203.0.113.2:443");
-    let config = udp_offload_test_config("direct", vec![]);
-    let (handle, handler) = udp_offload_test_handle(config, None);
-    let direct = seeded_meta_raw(honk_ebpf_common::OutboundIndex::Direct as u8, 0, 0);
-    let key = seed_udp_conn_state(&handle, client, dst, direct).await;
-    let initial = quic_initial_payload(Some("quic.example.org"));
-
-    serve_test_udp_to(&handle, client, dst, &initial)
-        .await
-        .unwrap();
-    assert_ne!(
-        udp_conn_meta_raw(&handle, &key).await.unwrap()
-            & honk_ebpf_common::ROUTING_META_FLAG_OFFLOAD,
-        0
-    );
-
-    // The flow goes silent and the datapath sweeps its conn_state after
-    // 120s; the next Initial repeats the decide-drop-reinject cycle.
-    // Nothing userspace-side exists that could leak: this path never
-    // creates an endpoint.
-    handle
-        .ebpf
-        .write()
-        .await
-        .udp_conn_state_remove(&key)
-        .unwrap();
-    let key = seed_udp_conn_state(&handle, client, dst, direct).await;
-
-    serve_test_udp_to(&handle, client, dst, &initial)
-        .await
-        .unwrap();
-
-    assert_ne!(
-        udp_conn_meta_raw(&handle, &key).await.unwrap()
-            & honk_ebpf_common::ROUTING_META_FLAG_OFFLOAD,
-        0,
-        "re-created flow must be offloaded again"
-    );
-    assert!(handle.udp_pool.is_empty(), "no endpoint was ever created");
-    assert_eq!(handler.dial_count(), 0);
-}
-
-/// Config carrying one domain-class rule (unique name/suffix) pointing at
-/// `direct`, so a sniffed `quic-offload.example` flow converges to direct
-/// through a domain rule and gets a DOMAIN_ROUTING_MAP writeback.
-fn udp_offload_domain_rule_config() -> Config {
-    let mut config = udp_offload_test_config("direct", vec![udp_test_node()]);
-    let mut rule = domain_rule("direct");
-    rule.name = "udp-offload-domain".into();
-    rule.condition.domain_suffix = vec!["quic-offload.example".into()];
-    config.routing.rules = vec![rule];
-    // domain++: sniff and re-route without the reality check (the test DNS
-    // forwarder cannot resolve the made-up domain).
-    config.global.dial_mode = "domain++".into();
-    config
-}
-
-/// Install a recognizable bitmap for the test domain rule.  Test control
-/// planes never run `activate_projection` (that happens at engine start),
-/// so the process-global DOMAIN_BITMAPS is populated directly — this also
-/// shields the serve from a concurrent test replacing the global.
-fn repin_offload_domain_bitmap() -> Vec<DomainRouting> {
-    let mut bitmap = DomainRouting::default();
-    bitmap.bitmap[0] = 0x5A00_0001;
-    bitmap.bitmap[2] = 0x0000_0042;
-    let expected = vec![bitmap];
-    crate::control::routing_matcher::DOMAIN_BITMAPS
-        .write()
-        .insert("udp-offload-domain".into(), expected.clone());
-    expected
-}
-
-/// The mock's DOMAIN_ROUTING_MAP entry for `dst`, keyed like the map.
-async fn domain_route_bitmap(
-    handle: &ControlPlaneHandle,
-    dst: SocketAddr,
-) -> Option<DomainRouting> {
-    let prefix_len = if dst.is_ipv4() { 32 } else { 128 };
-    let lpm_key =
-        crate::ebpf::maps::cidr_to_lpm_key(&format!("{}/{prefix_len}", dst.ip())).unwrap();
-    let key_bytes = crate::ebpf::maps::lpm_key_bytes(&lpm_key);
-    handle
-        .ebpf
-        .read()
-        .await
-        .projection_map_snapshot()
-        .into_iter()
-        .find(|(key, _)| *key == key_bytes)
-        .map(|(_, bitmap)| bitmap)
-}
-
-#[tokio::test]
-async fn udp_offload_writes_domain_bitmap_for_sniffed_direct_flow() {
-    for (client, dst) in [
-        (addr("10.0.0.2:53000"), addr("203.0.113.2:443")),
-        (addr("[2001:db8::2]:53000"), addr("[2001:db8::3]:443")),
-    ] {
-        let (handle, handler) = udp_offload_test_handle(udp_offload_domain_rule_config(), None);
-        let expected = repin_offload_domain_bitmap();
-        let key = seed_udp_conn_state(
-            &handle,
-            client,
-            dst,
-            seeded_meta_raw(honk_ebpf_common::OutboundIndex::Direct as u8, 0, 0),
-        )
-        .await;
-        let initial = quic_initial_payload(Some("quic-offload.example"));
-
-        serve_test_udp_to(&handle, client, dst, &initial)
-            .await
-            .unwrap();
-
-        let raw = udp_conn_meta_raw(&handle, &key)
-            .await
-            .expect("conn state kept");
-        assert_ne!(raw & honk_ebpf_common::ROUTING_META_FLAG_OFFLOAD, 0);
-        assert_eq!(handler.dial_count(), 0);
-        // The sniffed domain's rule bitmap was written back for the dst IP,
-        // transformed into the active routing generation exactly like a
-        // DNS-learned route.
-        let generation = handle
-            .ebpf
-            .read()
-            .await
-            .active_routing_generation()
-            .unwrap();
-        let mut merged = DomainRouting::default();
-        for bm in &expected {
-            for (word, value) in merged.bitmap.iter_mut().zip(bm.bitmap) {
-                *word |= value;
-            }
-        }
-        let expected_stored = merged.for_generation(generation);
-        let stored = domain_route_bitmap(&handle, dst).await;
-        assert_eq!(
-            stored.map(|bitmap| bitmap.bitmap),
-            Some(expected_stored.bitmap),
-            "DOMAIN_ROUTING_MAP must carry the sniffed rule bitmap ({client} -> {dst})"
-        );
-    }
-}
-
-#[tokio::test]
-async fn udp_offload_domain_bitmap_survives_conn_state_sweep() {
-    let client = addr("10.0.0.2:53000");
-    let dst = addr("203.0.113.2:443");
-    let (handle, handler) = udp_offload_test_handle(udp_offload_domain_rule_config(), None);
-    let _expected = repin_offload_domain_bitmap();
-    let key = seed_udp_conn_state(
-        &handle,
-        client,
-        dst,
-        seeded_meta_raw(honk_ebpf_common::OutboundIndex::Direct as u8, 0, 0),
-    )
-    .await;
-    let initial = quic_initial_payload(Some("quic-offload.example"));
-    serve_test_udp_to(&handle, client, dst, &initial)
-        .await
-        .unwrap();
-    assert!(domain_route_bitmap(&handle, dst).await.is_some());
-
-    // The flow goes silent and the datapath sweeps the conn_state (120s).
-    handle
-        .ebpf
-        .write()
-        .await
-        .udp_conn_state_remove(&key)
-        .unwrap();
-
-    // The learned domain route lives in DOMAIN_ROUTING_MAP, not the
-    // conn_state, so it survives the sweep: a mid-session packet is not an
-    // Initial and cannot be re-sniffed, but the route-time re-decision finds
-    // the bitmap (DomainKnown → direct → kernel route-time offload — the
-    // unchanged main path) and never re-enters userspace.  Assert the state
-    // that evaluation consumes and that nothing userspace-side exists.
-    assert!(
-        domain_route_bitmap(&handle, dst).await.is_some(),
-        "the learned domain route must survive the conn_state sweep"
-    );
-    assert!(handle.udp_pool.is_empty());
-    assert!(handle.connection_tracker.snapshot().is_empty());
-    assert_eq!(handler.dial_count(), 0);
-}
-
-#[tokio::test]
-async fn udp_offload_domain_bitmap_write_failure_is_not_fatal() {
-    let client = addr("10.0.0.2:53000");
-    let dst = addr("203.0.113.2:443");
-    let (handle, handler) = udp_offload_test_handle(udp_offload_domain_rule_config(), None);
-    let _expected = repin_offload_domain_bitmap();
-    let key = seed_udp_conn_state(
-        &handle,
-        client,
-        dst,
-        seeded_meta_raw(honk_ebpf_common::OutboundIndex::Direct as u8, 0, 0),
-    )
-    .await;
-    handle
-        .ebpf
-        .write()
-        .await
-        .inject_domain_bitmap_add_fault(1)
-        .unwrap();
-    let initial = quic_initial_payload(Some("quic-offload.example"));
-
-    // The writeback failure must not fail the flow or the offload.
-    serve_test_udp_to(&handle, client, dst, &initial)
-        .await
-        .unwrap();
-
-    let raw = udp_conn_meta_raw(&handle, &key)
-        .await
-        .expect("conn state kept");
-    assert_ne!(
-        raw & honk_ebpf_common::ROUTING_META_FLAG_OFFLOAD,
-        0,
-        "offload stands even when the bitmap writeback fails"
-    );
-    assert!(domain_route_bitmap(&handle, dst).await.is_none());
-    assert_eq!(handler.dial_count(), 0);
-}
-
-/// A genuine QUIC v1 client Initial whose ClientHello SNI is split across
-/// two CRYPTO fragments (two Initial packets).
-fn split_quic_initial(sni: &str) -> (Vec<u8>, Vec<u8>) {
-    use super::quic::test_utils;
-    let hello = test_utils::build_client_hello(Some(sni));
-    let split = 40;
-    (
-        test_utils::protect_initial_packet(
-            b"dcid1234",
-            b"",
-            super::quic::QUIC_VERSION_1,
-            0,
-            1,
-            &test_utils::wrap_crypto_frame(0, &hello[..split]),
-        ),
-        test_utils::protect_initial_packet(
-            b"dcid1234",
-            b"",
-            super::quic::QUIC_VERSION_1,
-            1,
-            1,
-            &test_utils::wrap_crypto_frame(split as u64, &hello[split..]),
-        ),
-    )
-}
-
-/// Reserve an initializer with the first fragment, queue the second as a
-/// follower, then serve.
-async fn serve_split_initial(
-    handle: &ControlPlaneHandle,
-    client: SocketAddr,
-    dst: SocketAddr,
-    first: &[u8],
-    second: &[u8],
-) -> anyhow::Result<()> {
-    let slow_permit = Arc::new(tokio::sync::Semaphore::new(1))
-        .try_acquire_owned()
-        .expect("test slow permit");
-    let crate::control::udp_endpoint::EndpointReservation::Initializing(lease) = handle
-        .udp_pool
-        .reserve_or_enqueue(client, dst, first, slow_permit, &handle.stats)
-    else {
-        panic!("fresh flow must reserve an initializer");
-    };
-    let follower_permit = Arc::new(tokio::sync::Semaphore::new(1))
-        .try_acquire_owned()
-        .expect("test slow permit");
-    assert!(matches!(
-        handle
-            .udp_pool
-            .reserve_or_enqueue(client, dst, second, follower_permit, &handle.stats),
-        crate::control::udp_endpoint::EndpointReservation::Enqueued
-    ));
-    handle
-        .serve_udp_connection(
-            lease,
-            Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
-        )
-        .await
-}
-
-/// A fragmented ClientHello whose SNI matches a proxy domain rule: the
-/// engine must collect the follower fragment, complete the sniff, and relay
-/// via the proxy — never offload on the IP-only first-fragment view.
-#[tokio::test]
-async fn udp_offload_fragmented_client_hello_proxy_domain_is_not_offloaded() {
-    let client = addr("10.0.0.2:53000");
-    let dst = addr("203.0.113.2:443");
-    let mut config = udp_offload_test_config("direct", vec![udp_test_node()]);
-    let mut rule = domain_rule("udp-test");
-    rule.name = "split-proxy".into();
-    rule.condition.domain_suffix = vec!["split-proxy.example".into()];
-    config.routing.rules = vec![rule];
-    config.global.dial_mode = "domain++".into();
-    let (handle, handler) = udp_offload_test_handle(config, None);
-    let proxied = seeded_meta_raw(
-        honk_ebpf_common::OutboundIndex::UserBase as u8,
-        honk_ebpf_common::TPROXY_MARK,
-        0,
-    );
-    let key = seed_udp_conn_state(&handle, client, dst, proxied).await;
-    let (first, second) = split_quic_initial("split-proxy.example");
-
-    serve_split_initial(&handle, client, dst, &first, &second)
-        .await
-        .unwrap();
-
-    assert_eq!(
-        udp_conn_meta_raw(&handle, &key).await,
-        Some(proxied),
-        "a flow whose fragmented SNI matches a proxy rule must never be offloaded"
-    );
-    assert!(handle.udp_pool.get(client, dst).is_some());
-    assert_eq!(handler.dial_count(), 1);
-}
-
-/// The same fragmented ClientHello converging to direct is collected and
-/// then offloaded exactly like a single-Initial flow.
-#[tokio::test]
-async fn udp_offload_fragmented_client_hello_direct_offloads_after_collection() {
-    let client = addr("10.0.0.2:53000");
-    let dst = addr("203.0.113.2:443");
-    let mut config = udp_offload_test_config("direct", vec![]);
-    config.global.dial_mode = "domain++".into();
-    let (handle, handler) = udp_offload_test_handle(config, None);
-    let direct = seeded_meta_raw(honk_ebpf_common::OutboundIndex::Direct as u8, 0, 0);
-    let key = seed_udp_conn_state(&handle, client, dst, direct).await;
-    let (first, second) = split_quic_initial("quic.example.org");
-
-    serve_split_initial(&handle, client, dst, &first, &second)
-        .await
-        .unwrap();
-
-    let raw = udp_conn_meta_raw(&handle, &key)
-        .await
-        .expect("conn state kept");
-    assert_ne!(
-        raw & honk_ebpf_common::ROUTING_META_FLAG_OFFLOAD,
-        0,
-        "a fragmented CH that resolves to direct must still be offloaded"
-    );
-    assert!(handle.udp_pool.is_empty());
-    assert_eq!(handler.dial_count(), 0);
-}
-
-/// P1a regression, with the real production removal worker: the offload
-/// handoff (`commit_offloaded` / KernelOffloadHandoff) must leave the
-/// offloaded conn_state in place — a plain lease drop would notify
-/// UserspaceEndpointRetired and the worker would delete the very conn_state
-/// that anchors the offload, bouncing the retransmission back to userspace.
-#[tokio::test]
-async fn udp_offload_conn_state_survives_production_removal_worker() {
-    let client = addr("10.0.0.2:53000");
-    let dst = addr("203.0.113.2:443");
-    let (handle, handler) =
-        udp_offload_test_handle(udp_offload_test_config("direct", vec![]), None);
-    let worker = super::spawn_udp_removal_worker(
-        handle.udp_pool.clone(),
-        handle.ebpf.clone(),
-        handle.connection_tracker.clone(),
-    );
-
-    let key = seed_udp_conn_state(
-        &handle,
-        client,
-        dst,
-        seeded_meta_raw(honk_ebpf_common::OutboundIndex::Direct as u8, 0, 0),
-    )
-    .await;
-    let initial = quic_initial_payload(Some("quic.example.org"));
-    serve_test_udp_to(&handle, client, dst, &initial)
-        .await
-        .unwrap();
-    assert!(
-        handle.udp_pool.is_empty(),
-        "commit_offloaded retires the reservation"
-    );
-
-    // Push a real userspace-endpoint retirement through the same worker and
-    // wait for its conn_state deletion — the FIFO channel then proves the
-    // earlier KernelOffloadHandoff notification was already processed.
-    let client2 = addr("10.0.0.3:53001");
-    let dst2 = addr("203.0.113.9:443");
-    let key2 = seed_udp_conn_state(
-        &handle,
-        client2,
-        dst2,
-        seeded_meta_raw(honk_ebpf_common::OutboundIndex::Direct as u8, 0, 0),
-    )
-    .await;
-    serve_test_udp_to(&handle, client2, dst2, b"plain udp payload")
-        .await
-        .unwrap();
-    assert!(handle.udp_pool.get(client2, dst2).is_some());
-    handle.udp_pool.remove(client2, dst2);
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if udp_conn_meta_raw(&handle, &key2).await.is_none() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("the removal worker must retire a userspace endpoint's conn_state");
-    assert_eq!(handler.dial_count(), 1);
-
-    let raw = udp_conn_meta_raw(&handle, &key)
-        .await
-        .expect("the offloaded conn_state must survive the removal worker");
-    assert_ne!(raw & honk_ebpf_common::ROUTING_META_FLAG_OFFLOAD, 0);
-    worker.abort();
-}
-
-/// End-to-end drop-and-reinject: a real quinn client's first Initial is fed
-/// to the engine (which offloads the flow and drops the packet), the
-/// client's retransmission is then forwarded along the "kernel path" stand-
-/// in, and the QUIC handshake must complete.  A raw recorder in front of
-/// the QUIC server logs every client-side `recvfrom` peer: the whole flow —
-/// everything after the offload switch included — must show exactly one
-/// tuple, and the engine must never have dialed (its own ephemeral socket
-/// must never appear on the wire).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn udp_offload_quic_handshake_after_initial_drop_keeps_single_server_tuple() {
-    use tokio_rustls::rustls;
-
-    // QUIC server (rustls, self-signed "localhost").
-    let rcgen::CertifiedKey { cert, signing_key } =
-        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-    let mut tls_server = rustls::ServerConfig::builder_with_provider(
-        rustls::crypto::aws_lc_rs::default_provider().into(),
-    )
-    .with_safe_default_protocol_versions()
-    .unwrap()
-    .with_no_client_auth()
-    .with_single_cert(
-        vec![cert.der().clone()],
-        rustls::pki_types::PrivateKeyDer::Pkcs8(signing_key.serialize_der().into()),
-    )
-    .unwrap();
-    tls_server.alpn_protocols = vec![b"h3".to_vec()];
-    let server_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls_server).unwrap();
-    let server_ep = quinn::Endpoint::server(
-        quinn::ServerConfig::with_crypto(Arc::new(server_crypto)),
-        addr("127.0.0.1:0"),
-    )
-    .unwrap();
-    let server_addr = server_ep.local_addr().unwrap();
-    // quinn drives the server handshake only while `accept` is polled.
-    let server_task = tokio::spawn(async move {
-        let incoming = server_ep.accept().await.expect("server must accept");
-        incoming.await.expect("server-side handshake")
-    });
-
-    // Raw recorder in front of the server: logs every client-side peer and
-    // relays datagrams between the current peer and the server.
-    let recorder = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-    let recorder_addr = recorder.local_addr().unwrap();
-    let seen_peers = Arc::new(std::sync::Mutex::new(
-        std::collections::HashSet::<SocketAddr>::new(),
-    ));
-    {
-        let recorder = recorder.clone();
-        let seen_peers = seen_peers.clone();
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 65536];
-            let mut uplink: Option<SocketAddr> = None;
-            loop {
-                let (n, peer) = recorder.recv_from(&mut buf).await.unwrap();
-                if peer == server_addr {
-                    if let Some(uplink) = uplink {
-                        recorder.send_to(&buf[..n], uplink).await.unwrap();
-                    }
-                } else {
-                    seen_peers.lock().unwrap().insert(peer);
-                    uplink = Some(peer);
-                    recorder.send_to(&buf[..n], server_addr).await.unwrap();
-                }
-            }
-        });
-    }
-
-    // Engine under test: a domain-class rule (matching nothing here) makes
-    // the flow genuinely require userspace evaluation, exactly the flows
-    // this offload exists for; the sniffed "localhost" misses it and the
-    // decision converges to the default direct.
-    let mut config = udp_offload_test_config("direct", vec![udp_test_node()]);
-    config.routing.rules = vec![domain_rule("udp-test")];
-    let (handle, handler) = udp_offload_test_handle(config, None);
-
-    // Harness "network": the client connects here.  Each client datagram
-    // either goes through the engine (no offload bit yet) or — once the
-    // conn_state carries the offload bit — is forwarded unchanged from the
-    // kernel-path socket, like the offloaded datapath preserving the client
-    // tuple.
-    let net = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-    let net_addr = net.local_addr().unwrap();
-    let kernel_fwd = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-    let kernel_addr = kernel_fwd.local_addr().unwrap();
-    {
-        let handle = handle.clone();
-        let net = net.clone();
-        let kernel_fwd = kernel_fwd.clone();
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 65536];
-            loop {
-                let (n, peer) = net.recv_from(&mut buf).await.unwrap();
-                let payload = buf[..n].to_vec();
-                let key = super::connection::build_tuples_key(
-                    recorder_addr.ip(),
-                    recorder_addr.port(),
-                    peer.ip(),
-                    peer.port(),
-                    17,
-                );
-                let meta = udp_conn_meta_raw(&handle, &key).await;
-                let offloaded = meta
-                    .map(|raw| raw & honk_ebpf_common::ROUTING_META_FLAG_OFFLOAD != 0)
-                    .unwrap_or(false);
-                if offloaded {
-                    kernel_fwd.send_to(&payload, recorder_addr).await.unwrap();
-                    continue;
-                }
-                if meta.is_none() {
-                    // Emulate the kernel's route-time publication for a flow
-                    // that needed userspace evaluation.
-                    seed_udp_conn_state(
-                        &handle,
-                        peer,
-                        recorder_addr,
-                        seeded_meta_raw(honk_ebpf_common::OutboundIndex::Direct as u8, 0, 0),
-                    )
-                    .await;
-                }
-                let slow_permit = Arc::new(tokio::sync::Semaphore::new(1))
-                    .try_acquire_owned()
-                    .expect("harness slow permit");
-                if let crate::control::udp_endpoint::EndpointReservation::Initializing(lease) =
-                    handle.udp_pool.reserve_or_enqueue(
-                        peer,
-                        recorder_addr,
-                        &payload,
-                        slow_permit,
-                        &handle.stats,
-                    )
-                {
-                    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-                    let _ = handle.serve_udp_connection(lease, socket).await;
-                }
-            }
-        });
-    }
-    // quinn client endpoint is created up front so its address is known to
-    // the reply forwarder; the connect happens after the harness is live.
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(cert.der().clone()).unwrap();
-    let mut tls_client = rustls::ClientConfig::builder_with_provider(
-        rustls::crypto::aws_lc_rs::default_provider().into(),
-    )
-    .with_safe_default_protocol_versions()
-    .unwrap()
-    .with_root_certificates(roots)
-    .with_no_client_auth();
-    tls_client.alpn_protocols = vec![b"h3".to_vec()];
-    let client_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls_client).unwrap();
-    let mut client_config = quinn::ClientConfig::new(Arc::new(client_crypto));
-    let mut transport = quinn::TransportConfig::default();
-    transport.initial_rtt(Duration::from_millis(50));
-    client_config.transport_config(Arc::new(transport));
-    let mut client_ep = quinn::Endpoint::client(addr("127.0.0.1:0")).unwrap();
-    client_ep.set_default_client_config(client_config);
-    let client_addr = client_ep.local_addr().unwrap();
-
-    // Kernel-path replies: server → recorder → kernel_fwd → client.
-    {
-        let net = net.clone();
-        let kernel_fwd = kernel_fwd.clone();
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 65536];
-            loop {
-                let (n, peer) = kernel_fwd.recv_from(&mut buf).await.unwrap();
-                if peer == recorder_addr {
-                    net.send_to(&buf[..n], client_addr).await.unwrap();
-                }
-            }
-        });
-    }
-
-    let connection = tokio::time::timeout(
-        Duration::from_secs(15),
-        client_ep.connect(net_addr, "localhost").unwrap(),
-    )
-    .await
-    .expect("QUIC handshake must complete via retransmission after the Initial drop")
-    .expect("QUIC connect failed");
-
-    let server_conn = tokio::time::timeout(Duration::from_secs(15), server_task)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(server_conn.remote_address(), recorder_addr);
-
-    connection.close(0u32.into(), b"done");
-
-    let peers = seen_peers.lock().unwrap();
-    assert_eq!(
-        peers.len(),
-        1,
-        "the whole flow must show a single server-visible tuple, got {peers:?}"
-    );
-    assert!(peers.contains(&kernel_addr));
-    drop(peers);
-    assert_eq!(
-        handler.dial_count(),
-        0,
-        "the engine must never relay an offloaded flow (no ephemeral socket on the wire)"
-    );
-}
-
-/// Quantify the cost the drop-and-reinject offload adds to a QUIC handshake:
-/// exactly one Initial PTO.  A plain relay harness forwards everything
-/// except — in the drop run — the client's very first datagram.  Prints both
-/// handshake times; the assertion stays deliberately loose (the numbers are
-/// for the commit message / docs).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn udp_offload_pto_cost_measurement() {
-    use tokio_rustls::rustls;
-    let mut timings = Vec::new();
-    for drop_first in [false, true] {
-        let rcgen::CertifiedKey { cert, signing_key } =
-            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let mut tls_server = rustls::ServerConfig::builder_with_provider(
-            rustls::crypto::aws_lc_rs::default_provider().into(),
-        )
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![cert.der().clone()],
-            rustls::pki_types::PrivateKeyDer::Pkcs8(signing_key.serialize_der().into()),
-        )
-        .unwrap();
-        tls_server.alpn_protocols = vec![b"h3".to_vec()];
-        let server_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls_server).unwrap();
-        let server_ep = quinn::Endpoint::server(
-            quinn::ServerConfig::with_crypto(Arc::new(server_crypto)),
-            addr("127.0.0.1:0"),
-        )
-        .unwrap();
-        let server_addr = server_ep.local_addr().unwrap();
-        let server_task = tokio::spawn(async move {
-            let incoming = server_ep.accept().await.expect("server must accept");
-            incoming.await.expect("server-side handshake")
-        });
-
-        // Relay: client-facing socket + server-facing socket; optionally
-        // drop the first client datagram (the offloaded Initial).
-        let front = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let front_addr = front.local_addr().unwrap();
-        let back = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let client_slot = Arc::new(std::sync::Mutex::new(None::<SocketAddr>));
-        {
-            let front = front.clone();
-            let back = back.clone();
-            let client_slot = client_slot.clone();
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; 65536];
-                let mut dropped = false;
-                loop {
-                    let (n, peer) = front.recv_from(&mut buf).await.unwrap();
-                    *client_slot.lock().unwrap() = Some(peer);
-                    if drop_first && !dropped {
-                        dropped = true;
-                        continue;
-                    }
-                    back.send_to(&buf[..n], server_addr).await.unwrap();
-                }
-            });
-        }
-        {
-            let front = front.clone();
-            let back = back.clone();
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; 65536];
-                loop {
-                    let (n, peer) = back.recv_from(&mut buf).await.unwrap();
-                    if peer != server_addr {
-                        continue;
-                    }
-                    let client = *client_slot.lock().unwrap();
-                    if let Some(client) = client {
-                        front.send_to(&buf[..n], client).await.unwrap();
-                    }
-                }
-            });
-        }
-
-        let mut roots = rustls::RootCertStore::empty();
-        roots.add(cert.der().clone()).unwrap();
-        let mut tls_client = rustls::ClientConfig::builder_with_provider(
-            rustls::crypto::aws_lc_rs::default_provider().into(),
-        )
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-        tls_client.alpn_protocols = vec![b"h3".to_vec()];
-        let client_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls_client).unwrap();
-        let mut client_config = quinn::ClientConfig::new(Arc::new(client_crypto));
-        let mut transport = quinn::TransportConfig::default();
-        transport.initial_rtt(Duration::from_millis(50));
-        client_config.transport_config(Arc::new(transport));
-        let mut client_ep = quinn::Endpoint::client(addr("127.0.0.1:0")).unwrap();
-        client_ep.set_default_client_config(client_config);
-
-        let started = std::time::Instant::now();
-        let connection = tokio::time::timeout(
-            Duration::from_secs(15),
-            client_ep.connect(front_addr, "localhost").unwrap(),
-        )
-        .await
-        .expect("handshake must complete")
-        .expect("connect failed");
-        let elapsed = started.elapsed();
-        timings.push((drop_first, elapsed));
-        connection.close(0u32.into(), b"done");
-        server_task.abort();
-        client_ep.close(0u32.into(), b"done");
-    }
-    let baseline = timings[0].1;
-    let dropped = timings[1].1;
-    eprintln!(
-        "drop-and-reinject PTO cost: baseline={baseline:?} drop-first-initial={dropped:?} delta={:?}",
-        dropped - baseline
-    );
-    assert!(
-        dropped < Duration::from_secs(5),
-        "one Initial PTO must stay bounded"
-    );
-}
-
-/// Run a command, panicking with stderr on failure (netns test setup).
-#[cfg(target_os = "linux")]
-fn run_cmd(program: &str, args: &[&str]) {
-    let output = std::process::Command::new(program)
-        .args(args)
-        .output()
-        .unwrap_or_else(|e| panic!("spawn {program}: {e}"));
-    assert!(
-        output.status.success(),
-        "{program} {} failed: {}",
-        args.join(" "),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-/// Run `f` inside the named network namespace, restoring the caller's
-/// namespace afterwards.  Socket creation pins the fd to the namespace it
-/// was created in, so the returned socket keeps working after the restore.
-#[cfg(target_os = "linux")]
-fn with_netns<R>(name: &str, f: impl FnOnce() -> R) -> R {
-    use std::os::fd::AsRawFd;
-    let current = std::fs::File::open("/proc/thread-self/ns/net").unwrap();
-    let target = std::fs::File::open(format!("/var/run/netns/{name}")).expect("named netns exists");
-    assert_eq!(
-        unsafe { libc::setns(target.as_raw_fd(), libc::CLONE_NEWNET) },
-        0
-    );
-    let result = f();
-    assert_eq!(
-        unsafe { libc::setns(current.as_raw_fd(), libc::CLONE_NEWNET) },
-        0
-    );
-    result
-}
-
-/// Real netns/kernel-path variant of the drop-and-reinject e2e: three
-/// namespaces (client — root gateway — server) with genuine kernel routing.
-/// A stateless TPROXY rule diverts only the flow's first datagram(s) to the
-/// harness (which feeds the engine and lets it offload+drop); deleting the
-/// rule then lets the client's retransmission flow entirely through the
-/// kernel.  The server must observe the client's real tuple end-to-end —
-/// no userspace socket ever appears on the wire.
-#[cfg(target_os = "linux")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires root; run via just test-netns"]
-async fn udp_offload_netns_retransmit_uses_real_kernel_path() {
-    if unsafe { libc::geteuid() } != 0 {
-        eprintln!("skipping: requires root");
-        return;
-    }
-    use tokio_rustls::rustls;
-
-    let pid = std::process::id();
-    let ns_cl = format!("honkcl{pid}");
-    let ns_srv = format!("honksrv{pid}");
-    let v_cl = format!("vcl{pid}");
-    let v_cl_br = format!("vcb{pid}");
-    let v_srv = format!("vsv{pid}");
-    let v_srv_br = format!("vsb{pid}");
-    const CLIENT_IP: &str = "10.177.0.2";
-    const SERVER_IP: &str = "10.177.1.2";
-    const SERVER_PORT: u16 = 4433;
-    const HARNESS_PORT: u16 = 14434;
-
-    // Best-effort teardown of everything the setup created.
-    struct Cleanup {
-        rule: Vec<String>,
-        ns_cl: String,
-        ns_srv: String,
-        ip_forward_was: String,
-    }
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            let _ = std::process::Command::new("iptables")
-                .args(&self.rule)
-                .output();
-            let _ = std::process::Command::new("ip")
-                .args(["rule", "del", "fwmark", "0x66/0x66", "lookup", "106"])
-                .output();
-            let _ = std::process::Command::new("ip")
-                .args(["route", "flush", "table", "106"])
-                .output();
-            for ns in [&self.ns_cl, &self.ns_srv] {
-                let _ = std::process::Command::new("ip")
-                    .args(["netns", "del", ns])
-                    .output();
-            }
-            let _ = std::fs::write(
-                "/proc/sys/net/ipv4/ip_forward",
-                self.ip_forward_was.as_bytes(),
-            );
-        }
-    }
-
-    let ip_forward_was =
-        std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward").unwrap_or_else(|_| "1\n".into());
-    let rule: Vec<String> = [
-        "-t",
-        "mangle",
-        "-D",
-        "PREROUTING",
-        "-i",
-        &v_cl_br,
-        "-p",
-        "udp",
-        "-d",
-        SERVER_IP,
-        "--dport",
-        "4433",
-        "-j",
-        "TPROXY",
-        "--on-ip",
-        "127.0.0.1",
-        "--on-port",
-        "14434",
-        "--tproxy-mark",
-        "0x66/0x66",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
-    let _cleanup = Cleanup {
-        rule,
-        ns_cl: ns_cl.clone(),
-        ns_srv: ns_srv.clone(),
-        ip_forward_was,
-    };
-
-    run_cmd("ip", &["netns", "add", &ns_cl]);
-    run_cmd("ip", &["netns", "add", &ns_srv]);
-    run_cmd(
-        "ip",
-        &[
-            "link", "add", &v_cl, "type", "veth", "peer", "name", &v_cl_br,
-        ],
-    );
-    run_cmd(
-        "ip",
-        &[
-            "link", "add", &v_srv, "type", "veth", "peer", "name", &v_srv_br,
-        ],
-    );
-    run_cmd("ip", &["link", "set", &v_cl, "netns", &ns_cl]);
-    run_cmd("ip", &["link", "set", &v_srv, "netns", &ns_srv]);
-    run_cmd("ip", &["addr", "add", "10.177.0.1/24", "dev", &v_cl_br]);
-    run_cmd("ip", &["link", "set", &v_cl_br, "up"]);
-    run_cmd("ip", &["addr", "add", "10.177.1.1/24", "dev", &v_srv_br]);
-    run_cmd("ip", &["link", "set", &v_srv_br, "up"]);
-    for (ns, dev, ip_addr, gw) in [
-        (&ns_cl, &v_cl, "10.177.0.2/24", "10.177.0.1"),
-        (&ns_srv, &v_srv, "10.177.1.2/24", "10.177.1.1"),
-    ] {
-        run_cmd(
-            "ip",
-            &["netns", "exec", ns, "ip", "link", "set", "lo", "up"],
-        );
-        run_cmd(
-            "ip",
-            &[
-                "netns", "exec", ns, "ip", "addr", "add", ip_addr, "dev", dev,
-            ],
-        );
-        run_cmd("ip", &["netns", "exec", ns, "ip", "link", "set", dev, "up"]);
-        run_cmd(
-            "ip",
-            &[
-                "netns", "exec", ns, "ip", "route", "add", "default", "via", gw,
-            ],
-        );
-    }
-    std::fs::write("/proc/sys/net/ipv4/ip_forward", "1").unwrap();
-    run_cmd(
-        "ip",
-        &["rule", "add", "fwmark", "0x66/0x66", "lookup", "106"],
-    );
-    run_cmd(
-        "ip",
-        &[
-            "route",
-            "add",
-            "local",
-            "0.0.0.0/0",
-            "dev",
-            "lo",
-            "table",
-            "106",
-        ],
-    );
-    run_cmd(
-        "iptables",
-        &[
-            "-t",
-            "mangle",
-            "-A",
-            "PREROUTING",
-            "-i",
-            &v_cl_br,
-            "-p",
-            "udp",
-            "-d",
-            SERVER_IP,
-            "--dport",
-            "4433",
-            "-j",
-            "TPROXY",
-            "--on-ip",
-            "127.0.0.1",
-            "--on-port",
-            "14434",
-            "--tproxy-mark",
-            "0x66/0x66",
-        ],
-    );
-
-    // Harness socket: the TPROXY target for the flow's first datagram(s).
-    // IP_TRANSPARENT must be set before bind so the TPROXY socket lookup
-    // finds it.
-    let harness_std = {
-        use std::os::fd::AsRawFd;
-        let socket = socket2::Socket::new(
-            socket2::Domain::IPV4,
-            socket2::Type::DGRAM,
-            Some(socket2::Protocol::UDP),
-        )
-        .unwrap();
-        let one: libc::c_int = 1;
-        let rc = unsafe {
-            libc::setsockopt(
-                socket.as_raw_fd(),
-                libc::SOL_IP,
-                libc::IP_TRANSPARENT,
-                &one as *const libc::c_int as *const libc::c_void,
-                std::mem::size_of_val(&one) as libc::socklen_t,
-            )
-        };
-        assert_eq!(rc, 0, "IP_TRANSPARENT");
-        socket
-            .bind(&SocketAddr::from(([127, 0, 0, 1], HARNESS_PORT)).into())
-            .unwrap();
-        socket.set_nonblocking(true).unwrap();
-        std::net::UdpSocket::from(socket)
-    };
-    let harness = UdpSocket::from_std(harness_std).unwrap();
-
-    // QUIC server living in the server namespace.
-    let rcgen::CertifiedKey { cert, signing_key } =
-        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-    let mut tls_server = rustls::ServerConfig::builder_with_provider(
-        rustls::crypto::aws_lc_rs::default_provider().into(),
-    )
-    .with_safe_default_protocol_versions()
-    .unwrap()
-    .with_no_client_auth()
-    .with_single_cert(
-        vec![cert.der().clone()],
-        rustls::pki_types::PrivateKeyDer::Pkcs8(signing_key.serialize_der().into()),
-    )
-    .unwrap();
-    tls_server.alpn_protocols = vec![b"h3".to_vec()];
-    let server_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls_server).unwrap();
-    let server_socket = with_netns(&ns_srv, || {
-        let socket = std::net::UdpSocket::bind(("0.0.0.0", SERVER_PORT)).unwrap();
-        socket.set_nonblocking(true).unwrap();
-        socket
-    });
-    let server_ep = quinn::Endpoint::new(
-        quinn::EndpointConfig::default(),
-        Some(quinn::ServerConfig::with_crypto(Arc::new(server_crypto))),
-        server_socket,
-        quinn::default_runtime().unwrap(),
-    )
-    .unwrap();
-    let server_task = tokio::spawn(async move {
-        let incoming = server_ep.accept().await.expect("server must accept");
-        incoming.await.expect("server-side handshake")
-    });
-
-    // Engine under test (mock backend): decides the diverted first datagram.
-    let (handle, handler) =
-        udp_offload_test_handle(udp_offload_test_config("direct", vec![]), None);
-    let server_addr = addr(&format!("{SERVER_IP}:{SERVER_PORT}"));
-
-    // QUIC client living in the client namespace.
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(cert.der().clone()).unwrap();
-    let mut tls_client = rustls::ClientConfig::builder_with_provider(
-        rustls::crypto::aws_lc_rs::default_provider().into(),
-    )
-    .with_safe_default_protocol_versions()
-    .unwrap()
-    .with_root_certificates(roots)
-    .with_no_client_auth();
-    tls_client.alpn_protocols = vec![b"h3".to_vec()];
-    let client_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls_client).unwrap();
-    let mut client_config = quinn::ClientConfig::new(Arc::new(client_crypto));
-    let mut transport = quinn::TransportConfig::default();
-    transport.initial_rtt(Duration::from_millis(50));
-    client_config.transport_config(Arc::new(transport));
-    let client_socket = with_netns(&ns_cl, || {
-        let socket = std::net::UdpSocket::bind(("0.0.0.0", 0)).unwrap();
-        socket.set_nonblocking(true).unwrap();
-        socket
-    });
-    let mut client_ep = quinn::Endpoint::new(
-        quinn::EndpointConfig::default(),
-        None,
-        client_socket,
-        quinn::default_runtime().unwrap(),
-    )
-    .unwrap();
-    client_ep.set_default_client_config(client_config);
-
-    // Start the client first: its Initial is what the harness waits for.
-    let connecting = client_ep.connect(server_addr, "localhost").unwrap();
-
-    // The client's first Initial arrives via TPROXY; feed it to the engine
-    // exactly like the production slow path (kernel route-time publication
-    // emulated by the seed).
-    let mut buf = vec![0u8; 65536];
-    let (n, peer) = tokio::time::timeout(Duration::from_secs(5), harness.recv_from(&mut buf))
-        .await
-        .expect("the client's Initial must be diverted to the harness")
-        .unwrap();
-    assert_eq!(peer.ip().to_string(), CLIENT_IP);
-    seed_udp_conn_state(
-        &handle,
-        peer,
-        server_addr,
-        seeded_meta_raw(honk_ebpf_common::OutboundIndex::Direct as u8, 0, 0),
-    )
-    .await;
-    let slow_permit = Arc::new(tokio::sync::Semaphore::new(1))
-        .try_acquire_owned()
-        .expect("harness slow permit");
-    if let crate::control::udp_endpoint::EndpointReservation::Initializing(lease) = handle
-        .udp_pool
-        .reserve_or_enqueue(peer, server_addr, &buf[..n], slow_permit, &handle.stats)
-    {
-        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        handle.serve_udp_connection(lease, socket).await.unwrap();
-    }
-    assert_eq!(
-        handler.dial_count(),
-        0,
-        "the engine must drop-and-reinject, never relay"
-    );
-    // The offload is published: remove the divert rule so the client's
-    // retransmission takes the real kernel path, end to end.
-    run_cmd(
-        "iptables",
-        &[
-            "-t",
-            "mangle",
-            "-D",
-            "PREROUTING",
-            "-i",
-            &v_cl_br,
-            "-p",
-            "udp",
-            "-d",
-            SERVER_IP,
-            "--dport",
-            "4433",
-            "-j",
-            "TPROXY",
-            "--on-ip",
-            "127.0.0.1",
-            "--on-port",
-            "14434",
-            "--tproxy-mark",
-            "0x66/0x66",
-        ],
-    );
-
-    let connection = tokio::time::timeout(Duration::from_secs(15), connecting)
-        .await
-        .expect("QUIC handshake must complete over the real kernel path after the Initial drop")
-        .expect("QUIC connect failed");
-    let server_conn = tokio::time::timeout(Duration::from_secs(15), server_task)
-        .await
-        .unwrap()
-        .unwrap();
-
-    assert_eq!(
-        server_conn.remote_address(),
-        peer,
-        "the server must see the client's real tuple — no userspace socket on the wire"
-    );
-    assert_eq!(handler.dial_count(), 0);
-    connection.close(0u32.into(), b"done");
-}
-
 #[test]
 fn udp_slow_admission_is_identical_for_ipv4_and_ipv6() {
     for (client, dst) in [
@@ -3847,7 +2413,6 @@ async fn udp_dns_dispatch_registers_connection_guard_before_task_poll() {
         release: release.clone(),
     }));
     let drain = Arc::new(DrainTracker::new());
-    let listener = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let client = addr("10.0.0.3:53000");
     let dst = addr("203.0.113.3:53");
 
@@ -3860,7 +2425,7 @@ async fn udp_dns_dispatch_registers_connection_guard_before_task_poll() {
         drain: Arc::clone(&drain),
         handle: plane.spawn_handle(),
     };
-    super::dispatch_udp_slow_path(&state, &listener, client, dst, &dns_query_payload());
+    super::dispatch_udp_slow_path(&state, client, dst, &dns_query_payload());
     assert_eq!(
         drain.active_count(),
         1,
@@ -3920,13 +2485,11 @@ async fn udp_dns_with_ready_endpoint_uses_controller_not_queue() {
 
     match super::begin_udp_slow_path(&pool, &stats, &slow, client, dst, &query) {
         super::UdpSlowPathWork::DnsThenMaybeInitialize { permit, data } => {
-            let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let lease = super::complete_udp_dns_slow_path(
                 super::UdpDnsSlowPathContext {
                     pool: &pool,
                     stats: &stats,
                     dns_controller: dns.as_ref(),
-                    udp_socket: &listener,
                     src_addr: client,
                     original_dst: dst,
                 },
@@ -3983,13 +2546,11 @@ async fn udp_dns_with_initializing_endpoint_uses_controller_not_queue() {
     assert!(!udp_fast_path(&pool, &stats, &query, client, dst).await);
     match super::begin_udp_slow_path(&pool, &stats, &slow, client, dst, &query) {
         super::UdpSlowPathWork::DnsThenMaybeInitialize { permit, data } => {
-            let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let maybe_lease = super::complete_udp_dns_slow_path(
                 super::UdpDnsSlowPathContext {
                     pool: &pool,
                     stats: &stats,
                     dns_controller: dns.as_ref(),
-                    udp_socket: &listener,
                     src_addr: client,
                     original_dst: dst,
                 },
@@ -4910,7 +3471,12 @@ async fn reload_and_merge_never_touch_ebpf_hooks() {
     let detach = backend.detach_calls.clone();
     let dyn_attach = backend.dynamic_attach_calls.clone();
     let dyn_forget = backend.dynamic_forget_calls.clone();
-    let cp = link_lifecycle_cp(backend);
+    let mut cp = link_lifecycle_cp(backend);
+    cp.set_mode_state(Arc::new(parking_lot::RwLock::new(
+        crate::mode::ModeState::new("Rule", "Proxy"),
+    )));
+    cp.start_datapath_flags_coordinator().unwrap();
+    cp.initialize_datapath_flags(false, false).await.unwrap();
 
     let drain = DrainTracker::new();
     assert!(cp.apply_runtime_config(Config::default(), &drain).await);
@@ -4923,6 +3489,7 @@ async fn reload_and_merge_never_touch_ebpf_hooks() {
     );
     assert_eq!(dyn_attach.load(Ordering::Relaxed), 0);
     assert_eq!(dyn_forget.load(Ordering::Relaxed), 0);
+    cp.datapath_flags.as_ref().unwrap().disable().await.unwrap();
 }
 
 /// Shutdown with a flow that never finishes must still detach the hooks and
@@ -4940,7 +3507,7 @@ async fn shutdown_detaches_hooks_and_stays_bounded_with_stuck_flow() {
     let mut removal_task = tokio::spawn(async {});
 
     tokio::time::timeout(Duration::from_secs(30), async {
-        cp.shutdown_datapath(&drain, &mut removal_task)
+        cp.shutdown_datapath(&drain, &mut removal_task, None)
             .await
             .unwrap();
         cp.finalize_shutdown().await.unwrap();
@@ -4953,129 +3520,115 @@ async fn shutdown_detaches_hooks_and_stays_bounded_with_stuck_flow() {
     );
 }
 
-fn offload_flags_test_plane(
-    config: Config,
-) -> (ControlPlane, std::sync::Arc<std::sync::Mutex<Vec<u32>>>) {
-    let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let mut backend = crate::ebpf::mock::MockEbpfBackend::new();
-    backend.datapath_flags_writes = writes.clone();
-    let router = Router::new(&config.routing.rules, &config.routing.default_outbound).unwrap();
-    let plane = ControlPlane::new(
-        config,
-        Box::new(backend),
-        router,
-        Arc::new(ProxyRegistry::default_resolver().unwrap()),
-        DnsResolver::new(&honk_config::dns::DnsConfig::default()).unwrap(),
-        udp_test_forwarder(),
+#[tokio::test]
+async fn udp_removal_worker_retires_legacy_token_zero_conn_state() {
+    use honk_ebpf_common::conn::{ConnState, UdpDecisionState};
+    use honk_ebpf_common::{ROUTING_META_FLAG_PUBLISHED, RoutingMeta};
+
+    let client: SocketAddr = "10.0.0.1:53000".parse().unwrap();
+    let dst: SocketAddr = "203.0.113.1:443".parse().unwrap();
+    let key = connection::build_tuples_key(dst.ip(), dst.port(), client.ip(), client.port(), 17);
+    let mut mock = crate::ebpf::mock::MockEbpfBackend::new();
+    mock.udp_conn_state_store(
+        &key,
+        &ConnState {
+            state: UdpDecisionState::None as u8,
+            decision_token: 0,
+            meta: RoutingMeta {
+                raw: ROUTING_META_FLAG_PUBLISHED | 2,
+            },
+            ..ConnState::default()
+        },
     )
     .unwrap();
-    (plane, writes)
-}
-
-fn domain_rule(outbound: &str) -> honk_config::routing::RoutingRule {
-    honk_config::routing::RoutingRule {
-        name: "domain-rule".into(),
-        condition: honk_config::routing::RoutingCondition {
-            domain_suffix: vec!["example.com".into()],
-            ..Default::default()
-        },
-        outbound: honk_config::routing::RoutingOutbound::Simple(outbound.into()),
-        priority: 0,
-        must: false,
-        mark: 0,
-    }
-}
-
-#[tokio::test]
-async fn sync_direct_offload_flags_composes_mode_and_static_bits() {
-    use honk_ebpf_common::{
-        DATAPATH_FLAG_OFFLOAD_ALL as ALL, DATAPATH_FLAG_OFFLOAD_NO_DOMAIN_RULES as NO_DOMAIN,
-        DATAPATH_FLAG_OFFLOAD_RULE_DIRECT as RULE,
-    };
-
-    // dial_mode ip: the static bit is set even with domain rules present —
-    // sniffing is disabled, so no domain re-evaluation can ever happen.
-    let mut config = udp_test_config("direct", vec![], vec![]);
-    config.global.dial_mode = "ip".into();
-    config.routing.rules = vec![domain_rule("direct")];
-    let (mut plane, writes) = offload_flags_test_plane(config);
-
-    // No mode state (clash API disabled) behaves as Rule.
-    plane.sync_direct_offload_flags().await;
-    plane.set_mode_state(std::sync::Arc::new(parking_lot::RwLock::new(
-        crate::mode::ModeState::new("global", "proxy"),
-    )));
-    plane.sync_direct_offload_flags().await;
-    plane.set_mode_state(std::sync::Arc::new(parking_lot::RwLock::new(
-        crate::mode::ModeState::new("direct", "proxy"),
-    )));
-    plane.sync_direct_offload_flags().await;
-    plane.set_mode_state(std::sync::Arc::new(parking_lot::RwLock::new(
-        crate::mode::ModeState::new("rule", "proxy"),
-    )));
-    plane.sync_direct_offload_flags().await;
-    assert_eq!(
-        writes.lock().unwrap().clone(),
-        vec![
-            RULE | NO_DOMAIN,
-            NO_DOMAIN,
-            ALL | NO_DOMAIN,
-            RULE | NO_DOMAIN
-        ]
+    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(mock)));
+    let pool = Arc::new(UdpEndpointPool::new());
+    let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel();
+    let removal_task = spawn_udp_removal_worker(
+        Arc::clone(&pool),
+        Arc::clone(&backend),
+        Arc::new(ConnectionTracker::new()),
+        fatal_tx,
     );
-
-    // dial_mode domain++ with a domain rule: the static bit stays clear, so
-    // Rule-mode offload remains constrained by per-flow DomainRouting hits.
-    let mut config = udp_test_config("direct", vec![], vec![]);
-    config.global.dial_mode = "domain++".into();
-    config.routing.rules = vec![domain_rule("direct")];
-    let (plane, writes) = offload_flags_test_plane(config);
-    plane.sync_direct_offload_flags().await;
-    assert_eq!(writes.lock().unwrap().clone(), vec![RULE]);
-
-    // dial_mode domain++ without any domain-class rule: sniffing cannot
-    // change routing, so the static bit is set.
-    let mut config = udp_test_config("direct", vec![], vec![]);
-    config.global.dial_mode = "domain++".into();
-    let (plane, writes) = offload_flags_test_plane(config);
-    plane.sync_direct_offload_flags().await;
-    assert_eq!(writes.lock().unwrap().clone(), vec![RULE | NO_DOMAIN]);
-}
-
-/// A reload re-asserts the datapath offload flags and recomputes the static
-/// bit from the NEW config (dial_mode / domain rules), not the old one.
-#[tokio::test]
-async fn reload_reasserts_and_recomputes_datapath_offload_flags() {
-    use honk_ebpf_common::{
-        DATAPATH_FLAG_OFFLOAD_NO_DOMAIN_RULES as NO_DOMAIN,
-        DATAPATH_FLAG_OFFLOAD_RULE_DIRECT as RULE,
+    let permit = Arc::new(tokio::sync::Semaphore::new(1))
+        .try_acquire_owned()
+        .unwrap();
+    let lease = match pool.reserve_or_enqueue(
+        client,
+        dst,
+        b"legacy first datagram",
+        permit,
+        &StatsManager::new(),
+    ) {
+        udp_endpoint::EndpointReservation::Initializing(lease) => lease,
+        _ => panic!("expected an initializing lease"),
     };
 
-    let mut config = udp_test_config("direct", vec![], vec![]);
-    config.global.dial_mode = "domain++".into();
-    config.routing.rules = vec![domain_rule("direct")];
-    let (plane, writes) = offload_flags_test_plane(config);
-
-    let mut new_config = udp_test_config("direct", vec![], vec![]);
-    new_config.global.dial_mode = "ip".into();
-    new_config.routing.rules = vec![domain_rule("direct")];
+    drop(lease);
+    assert!(pool.wait_for_retirements().await);
+    assert!(pool.is_empty());
     assert!(
-        plane
-            .apply_runtime_config(new_config, &DrainTracker::new())
+        backend
+            .read()
             .await
+            .udp_conn_state_lookup(&key)
+            .unwrap()
+            .is_none()
     );
+    assert!(fatal_rx.try_recv().is_err());
 
-    // dial_mode switched to ip: the static bit is now set even though the
-    // domain rule survived the reload.
-    assert_eq!(
-        writes.lock().unwrap().clone(),
-        vec![RULE | NO_DOMAIN],
-        "reload must re-assert the flags recomputed from the new config"
+    assert!(pool.shutdown().await);
+    removal_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn udp_removal_worker_escalates_token_mismatch() {
+    use honk_ebpf_common::conn::{ConnState, UdpDecisionState};
+
+    let client: SocketAddr = "10.0.0.1:53000".parse().unwrap();
+    let dst: SocketAddr = "203.0.113.1:443".parse().unwrap();
+    let key = connection::build_tuples_key(dst.ip(), dst.port(), client.ip(), client.port(), 17);
+    let mut mock = crate::ebpf::mock::MockEbpfBackend::new();
+    mock.udp_conn_state_store(
+        &key,
+        &ConnState {
+            state: UdpDecisionState::Pending as u8,
+            decision_token: 42,
+            ..ConnState::default()
+        },
+    )
+    .unwrap();
+    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(mock)));
+    let pool = Arc::new(UdpEndpointPool::new());
+    let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel();
+    let removal_task = spawn_udp_removal_worker(
+        Arc::clone(&pool),
+        backend,
+        Arc::new(ConnectionTracker::new()),
+        fatal_tx,
     );
-    assert_eq!(
-        plane
-            .direct_offload_static_handle()
-            .load(std::sync::atomic::Ordering::Relaxed),
-        NO_DOMAIN
-    );
+    let lease = match pool.reserve_owned_or_enqueue(
+        client,
+        dst,
+        Bytes::from_static(b"held datagram"),
+        41,
+        None,
+        Arc::new(tokio::sync::Semaphore::new(1))
+            .try_acquire_owned()
+            .unwrap(),
+        &StatsManager::new(),
+    ) {
+        udp_endpoint::EndpointReservation::Initializing(lease) => lease,
+        _ => panic!("expected an initializing lease"),
+    };
+
+    drop(lease);
+    let fatal = tokio::time::timeout(Duration::from_secs(1), fatal_rx.recv())
+        .await
+        .expect("removal mismatch must reach supervision")
+        .expect("removal fatal channel must remain open");
+    assert!(fatal.to_string().contains("identity mismatch"));
+
+    removal_task.abort();
+    let _ = removal_task.await;
 }

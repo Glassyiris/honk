@@ -8,6 +8,9 @@
 
 use std::sync::Arc;
 
+use anyhow::Context;
+type SharedEbpfBackend = Arc<tokio::sync::RwLock<Box<dyn crate::ebpf::EbpfBackend>>>;
+
 /// Clash mode + GLOBAL selection, shared via [`SharedModeState`].
 #[derive(Debug, Clone)]
 pub struct ModeState {
@@ -61,12 +64,9 @@ impl ModeState {
         self.mode.eq_ignore_ascii_case("global")
     }
 
-    /// The mode's contribution to the eBPF datapath offload flags:
-    /// `Rule` → offload `direct`-routed flows, `Direct` → offload every
-    /// non-`must`/non-`block` flow (the override would force `direct`
-    /// anyway), `Global` → nothing beyond `must`-direct (status quo).
+    /// The mode-dependent part of the eBPF datapath policy.
     pub fn direct_offload_mode_bits(&self) -> u32 {
-        if self.is_direct() {
+        if self.is_direct() || (self.is_global() && self.global_selection == "direct") {
             honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_ALL
         } else if self.is_rule() {
             honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_RULE_DIRECT
@@ -106,6 +106,185 @@ impl ModeState {
     }
 }
 
+#[derive(Clone)]
+pub struct DatapathFlagsHandle {
+    inner: Arc<tokio::sync::Mutex<DatapathFlagsInner>>,
+}
+
+#[derive(Clone)]
+struct DatapathFlagsState {
+    static_flags: u32,
+    nfqueue_enabled: bool,
+    nfqueue_ready: bool,
+    initialized: bool,
+}
+
+impl DatapathFlagsState {
+    fn managed_mask() -> u32 {
+        honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_RULE_DIRECT
+            | honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_ALL
+            | honk_ebpf_common::DATAPATH_FLAG_NFQ_ENABLED
+            | honk_ebpf_common::DATAPATH_FLAG_NFQ_READY
+    }
+
+    fn sanitize_static(flags: u32) -> u32 {
+        flags & !Self::managed_mask()
+    }
+
+    fn compose(&self, mode: &ModeState) -> u32 {
+        let mut flags = self.static_flags | mode.direct_offload_mode_bits();
+        if self.nfqueue_enabled {
+            flags |= honk_ebpf_common::DATAPATH_FLAG_NFQ_ENABLED;
+            if self.nfqueue_ready {
+                flags |= honk_ebpf_common::DATAPATH_FLAG_NFQ_READY;
+            }
+        }
+        flags
+    }
+}
+
+enum Persistence {
+    None,
+    Mode,
+    Global,
+}
+
+struct DatapathFlagsInner {
+    backend: SharedEbpfBackend,
+    mode_state: SharedModeState,
+    cache_db: Option<Arc<crate::cachedb::CacheDb>>,
+    state: DatapathFlagsState,
+}
+
+impl DatapathFlagsHandle {
+    pub fn new(
+        backend: SharedEbpfBackend,
+        mode_state: SharedModeState,
+        cache_db: Option<Arc<crate::cachedb::CacheDb>>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(tokio::sync::Mutex::new(DatapathFlagsInner {
+                backend,
+                mode_state,
+                cache_db,
+                state: DatapathFlagsState {
+                    static_flags: 0,
+                    nfqueue_enabled: false,
+                    nfqueue_ready: false,
+                    initialized: false,
+                },
+            })),
+        }
+    }
+
+    async fn update(
+        &self,
+        quiesce: bool,
+        change: impl FnOnce(&mut DatapathFlagsState, &mut ModeState) -> anyhow::Result<Persistence>,
+    ) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock().await;
+        let mut state = inner.state.clone();
+        let mut mode = inner.mode_state.read().clone();
+        let persistence = change(&mut state, &mut mode)?;
+        let flags = state.compose(&mode);
+        {
+            let mut backend = inner.backend.write().await;
+            backend
+                .set_datapath_flags(flags)
+                .with_context(|| format!("failed to publish datapath flags {flags:#010x}"))?;
+            if quiesce {
+                backend
+                    .quiesce_udp_staging()
+                    .context("failed to quiesce staged UDP decisions")?;
+            }
+        }
+        inner.state = state;
+        *inner.mode_state.write() = mode.clone();
+        if let Some(db) = &inner.cache_db {
+            match persistence {
+                Persistence::None => {}
+                Persistence::Mode => db.save_clash_mode(&mode.mode),
+                Persistence::Global => db.save_selector_choice("GLOBAL", &mode.global_selection),
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn initialize(
+        &self,
+        static_flags: u32,
+        nfqueue_enabled: bool,
+        nfqueue_ready: bool,
+    ) -> anyhow::Result<()> {
+        self.update(false, |state, _| {
+            anyhow::ensure!(!state.initialized, "datapath flags are already initialized");
+            state.static_flags = DatapathFlagsState::sanitize_static(static_flags);
+            state.nfqueue_enabled = nfqueue_enabled;
+            state.nfqueue_ready = nfqueue_enabled && nfqueue_ready;
+            state.initialized = true;
+            Ok(Persistence::None)
+        })
+        .await
+    }
+
+    pub async fn set_mode(&self, mode: &str) -> anyhow::Result<()> {
+        let mode = ModeState::normalize(mode).context("invalid clash mode")?;
+        self.update(false, move |state, current| {
+            anyhow::ensure!(state.initialized, "datapath flags are not initialized");
+            current.mode = mode;
+            Ok(Persistence::Mode)
+        })
+        .await
+    }
+
+    pub async fn set_global_selection(&self, selection: String) -> anyhow::Result<()> {
+        self.update(false, move |state, mode| {
+            anyhow::ensure!(state.initialized, "datapath flags are not initialized");
+            mode.global_selection = selection;
+            Ok(Persistence::Global)
+        })
+        .await
+    }
+
+    pub async fn set_static(&self, flags: u32) -> anyhow::Result<()> {
+        self.update(false, move |state, _| {
+            anyhow::ensure!(state.initialized, "datapath flags are not initialized");
+            state.static_flags = DatapathFlagsState::sanitize_static(flags);
+            Ok(Persistence::None)
+        })
+        .await
+    }
+
+    pub async fn fence_nfqueue(&self) -> anyhow::Result<()> {
+        self.update(true, |state, _| {
+            anyhow::ensure!(state.initialized, "datapath flags are not initialized");
+            state.nfqueue_ready = false;
+            Ok(Persistence::None)
+        })
+        .await
+    }
+
+    pub async fn reopen_nfqueue(&self) -> anyhow::Result<()> {
+        self.update(false, |state, _| {
+            anyhow::ensure!(state.initialized, "datapath flags are not initialized");
+            state.nfqueue_ready = state.nfqueue_enabled;
+            Ok(Persistence::None)
+        })
+        .await
+    }
+
+    pub async fn disable(&self) -> anyhow::Result<()> {
+        self.update(false, |state, _| {
+            anyhow::ensure!(state.initialized, "datapath flags are not initialized");
+            state.nfqueue_enabled = false;
+            state.nfqueue_ready = false;
+            state.initialized = false;
+            Ok(Persistence::None)
+        })
+        .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,6 +301,14 @@ mod tests {
         assert_eq!(
             ModeState::new("direct", "proxy").direct_offload_mode_bits(),
             ALL
+        );
+        assert_eq!(
+            ModeState::new("global", "direct").direct_offload_mode_bits(),
+            ALL
+        );
+        assert_eq!(
+            ModeState::new("global", "Direct").direct_offload_mode_bits(),
+            0
         );
         assert_eq!(
             ModeState::new("global", "proxy").direct_offload_mode_bits(),
@@ -187,5 +374,111 @@ mod tests {
             assert_eq!(state.override_outbound("direct", true, true), "direct");
             assert_eq!(state.override_outbound("block", true, true), "block");
         }
+    }
+
+    type FlagsFixture = (
+        DatapathFlagsHandle,
+        SharedModeState,
+        Arc<std::sync::Mutex<Vec<u32>>>,
+        SharedEbpfBackend,
+    );
+
+    fn flags_fixture() -> FlagsFixture {
+        let backend = crate::ebpf::mock::MockEbpfBackend::new();
+        let writes = backend.datapath_flags_writes.clone();
+        let backend: SharedEbpfBackend = Arc::new(tokio::sync::RwLock::new(Box::new(backend)));
+        let state = Arc::new(parking_lot::RwLock::new(ModeState::new("Rule", "Proxy")));
+        let handle = DatapathFlagsHandle::new(Arc::clone(&backend), Arc::clone(&state), None);
+        (handle, state, writes, backend)
+    }
+
+    #[tokio::test]
+    async fn flags_fence_wins_racing_mode_global_and_static_updates() {
+        use honk_ebpf_common::{
+            DATAPATH_FLAG_NFQ_ENABLED as ENABLED, DATAPATH_FLAG_NFQ_READY as READY,
+            DATAPATH_FLAG_OFFLOAD_ALL as ALL, DATAPATH_FLAG_OFFLOAD_NO_DOMAIN_RULES as STATIC,
+            DATAPATH_FLAG_OFFLOAD_RULE_DIRECT as RULE,
+        };
+
+        let (handle, state, writes, _) = flags_fixture();
+        handle.initialize(STATIC, true, true).await.unwrap();
+        handle.fence_nfqueue().await.unwrap();
+        let (mode_result, selection_result) = tokio::join!(
+            handle.set_mode("Global"),
+            handle.set_global_selection("direct".to_string()),
+        );
+        mode_result.unwrap();
+        selection_result.unwrap();
+        handle.set_static(STATIC | RULE | READY).await.unwrap();
+        handle.reopen_nfqueue().await.unwrap();
+
+        assert_eq!(state.read().mode, "Global");
+        assert_eq!(state.read().global_selection, "direct");
+        let writes = writes.lock().unwrap().clone();
+        assert_eq!(writes.len(), 6);
+        assert_eq!(writes[0], STATIC | RULE | ENABLED | READY);
+        assert_eq!(writes[1], STATIC | RULE | ENABLED);
+        assert!(writes[2..5].iter().all(|flags| flags & READY == 0));
+        assert_eq!(writes[4], STATIC | ALL | ENABLED);
+        assert_eq!(writes[5], STATIC | ALL | ENABLED | READY);
+    }
+
+    #[tokio::test]
+    async fn flags_fence_quiesces_undelivered_staged_state() {
+        use honk_ebpf_common::conn::{ConnState, UdpDecisionState};
+
+        let key = honk_ebpf_common::redirect_need::TuplesKey::default();
+        let mut mock = crate::ebpf::mock::MockEbpfBackend::new();
+        mock.seed_staged_udp_flow(
+            &key,
+            ConnState {
+                state: UdpDecisionState::Pending as u8,
+                decision_token: 41,
+                ..ConnState::default()
+            },
+        );
+        let backend: SharedEbpfBackend = Arc::new(tokio::sync::RwLock::new(Box::new(mock)));
+        let state = Arc::new(parking_lot::RwLock::new(ModeState::new("Rule", "Proxy")));
+        let handle = DatapathFlagsHandle::new(Arc::clone(&backend), state, None);
+
+        handle.initialize(0, true, true).await.unwrap();
+        handle.fence_nfqueue().await.unwrap();
+        assert!(
+            backend
+                .read()
+                .await
+                .udp_conn_state_lookup(&key)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_update_leaves_public_and_kernel_state_unchanged() {
+        use honk_ebpf_common::{
+            DATAPATH_FLAG_NFQ_ENABLED as ENABLED, DATAPATH_FLAG_NFQ_READY as READY,
+            DATAPATH_FLAG_OFFLOAD_ALL as ALL, DATAPATH_FLAG_OFFLOAD_RULE_DIRECT as RULE,
+        };
+
+        let (handle, state, writes, backend) = flags_fixture();
+        handle.initialize(0, true, true).await.unwrap();
+        let backend_guard = backend.write().await;
+        let pending = {
+            let handle = handle.clone();
+            tokio::spawn(async move { handle.set_mode("Direct").await })
+        };
+        tokio::task::yield_now().await;
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
+        drop(backend_guard);
+
+        assert_eq!(state.read().mode, "Rule");
+        assert_eq!(writes.lock().unwrap().as_slice(), [RULE | ENABLED | READY]);
+        handle.set_mode("Direct").await.unwrap();
+        assert_eq!(state.read().mode, "Direct");
+        assert_eq!(
+            writes.lock().unwrap().as_slice(),
+            [RULE | ENABLED | READY, ALL | ENABLED | READY]
+        );
     }
 }

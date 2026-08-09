@@ -22,8 +22,9 @@ Source of truth: `crates/honk-config/src/*`, the dae parser in `crates/honk-conf
 | `lan_interface` | `lan_interface` | `[]` | LAN ifaces to intercept (comma-separated); empty installs no LAN hooks |
 | `wan_interface` | `wan_interface` | `[]` | WAN ifaces that intercept host-originated TCP/UDP. `auto` follows the IPv4 default route; while none exists it stays pending (never falls back to `lo`) and attaches on link/address/route events. The same event republishes generated gateway-address `direct(must)` rules and immediately re-probes health-backed outbounds. |
 | `auto_config_kernel_parameter` | `auto_config_kernel_parameter` | `false` | Auto sysctl (root) |
-| `store_subscribe` | `store_subscribe` | `true` | Persist each last valid subscription body under `<working-directory>/.sub` for network-independent startup/reload recovery. Changing it requires a process restart. |
-| `tcp_check_url` | `tcp_check_url` | Cloudflare HTTP + 1.1.1.1 + IPv6 | TCP health targets (comma-separated) |
+| `data_dir` | `data_dir` | `"/var/share/honk"` | Non-empty absolute root for generated state and relative runtime assets. Changing it requires a process restart. |
+| `store_subscribe` | `store_subscribe` | `true` | Persist each last valid subscription body in `.sub` below `global.data_dir` for network-independent startup/reload recovery. An existing `./.sub` store is retained until moved. Changing it requires a process restart. |
+| `tcp_check_url` | `tcp_check_url` | gstatic HTTPS | TCP health target. HTTPS performs verified target TLS before the configured HTTP method. |
 | `tcp_check_http_method` | `tcp_check_http_method` | `"HEAD"` | HTTP method for URL checks |
 | `udp_check_dns` | `udp_check_dns` | dns.google / 8.8.8.8 / IPv6 | UDP health DNS targets (comma-separated) |
 | `check_interval` | `check_interval_secs` | `30` | Health interval, duration form (e.g. `30s`) |
@@ -44,20 +45,21 @@ Source of truth: `crates/honk-config/src/*`, the dae parser in `crates/honk-conf
 | — | `connect_timeout_ms` | `3000` | TCP connect timeout; not settable in dae syntax |
 | — | `dns_resolve_timeout_ms` | `2000` | Control-plane resolve timeout; not settable in dae syntax |
 | — | `relay_idle_timeout_secs` | `300` | Idle relay kill; `0` = off; not settable in dae syntax |
-| `preconnect_node_count` | `preconnect_node_count` | `'auto'` | Startup bare-TCP preconnect count. `'auto'` = `min(nodes,8)`; `0` strictly disables the warm-up. Candidates are each group's current pick first, then config order; only bare-TCP-poolable protocols qualify (AnyTLS/QUIC never consume a pooled bare TCP) and the built-in `direct`/`block` are excluded. |
-| `udp_warm_node_count` | `udp_warm_node_count` | `0` | Per-group UDP warm-up cap. `0` is strictly disabled: no coordinator task and no warm metrics. A positive value N (capped at 3) warms each group's top-N latency-ranked, UDP-capable leaves after startup and after every probe cycle (`check_interval`), so newly fast nodes are pre-dialed before they win a selection. Dispatch stays capped at four concurrent tasks. A process-wide cap of `4 × N` bounds the total: the merged candidate set is re-ranked by global UDP latency and truncated, so many groups cannot inflate retained transports. |
-| `max_concurrent_dials` | `max_concurrent_dials` | `64` | Generation-local cap on concurrent proxied dials (connect + protocol handshake), clamped to an immutable process-wide startup descriptor gate shared by overlapping reload generations. Built-in `direct`/`block` dials are exempt — they are local connects already bounded by TCP admission. A changed limit applies to the replacement generation immediately; old-generation in-flight permits continue consuming the same process gate until they finish. |
+| `preconnect_node_count` | `preconnect_node_count` | `'auto'` | One startup bare-TCP preconnect pass. `'auto'` tries up to 8 nodes; `0` disables; explicit `N` can cover every eligible node with at most 8 concurrent attempts. Candidates are each group's current pick first, then config order; only bare-TCP-poolable protocols qualify (AnyTLS/QUIC and built-in `direct`/`block` are skipped). |
+| `udp_warm_node_count` | `udp_warm_node_count` | `0` | Per-group UDP warm-up cap. `0` is strictly disabled. A positive N takes each group's top `min(N,3)` latency-ranked UDP leaves; its independent coordinator runs immediately, then one `check_interval` after each completed batch, with at most four concurrent attempts. The process-wide retained set is re-ranked and capped at `4×N`. |
+| `max_concurrent_dials` | `max_concurrent_dials` | `64` | Generation-local cap on physical proxied connects and protocol handshakes, clamped to an immutable process-wide startup descriptor gate shared by overlapping reload generations. Ready-pool hits and logical streams on already-warm AnyTLS/QUIC transports bypass it; built-in `direct`/`block` dials are also exempt. A changed limit applies to the replacement generation immediately; old-generation in-flight permits continue consuming the same process gate until they finish. |
 
 ```dae
 global {
     tproxy_port: 12345
     log_level: info
+    data_dir: '/var/share/honk'
     lan_interface: podman0
     wan_interface: auto
     dial_mode: domain++
     allow_insecure: false
     auto_config_kernel_parameter: true
-    tcp_check_url: 'http://cp.cloudflare.com,1.1.1.1,2606:4700:4700::1111'
+    tcp_check_url: 'https://www.gstatic.com/generate_204'
     tcp_check_http_method: HEAD
     udp_check_dns: 'dns.google.com:53,8.8.8.8,2001:4860:4860::8888'
     check_interval: 30s
@@ -114,7 +116,7 @@ The fields below are what a parsed node carries. In dae syntax they are **derive
 | `skip_cert_verify` | bool | `false` | Insecure TLS (share-link `allowInsecure=1`/`insecure=1`) |
 | `ech_enabled` | bool | `false` | Offer ECH (share-link `ech=1`, or implied by `ech_config`) |
 | `ech_config` | string? | null | Base64 ECHConfigList (share-link `ech_config=`) |
-| `ech_config_path` | string? | null | File holding a base64 ECHConfigList |
+| `ech_config_path` | string? | null | File holding a base64 ECHConfigList. A relative path prefers `<global.data_dir>/<path>` and falls back to the legacy working-directory-relative file. |
 | `reality_public_key` | string? | null | REALITY server X25519 public key (share-link `pbk`); when set the node takes the REALITY handshake instead of plain TLS (`security=reality` implies `tls=true`) |
 | `reality_short_id` | string? | null | REALITY short id (share-link `sid`, even-length hex ≤ 8 bytes) |
 | `reality_spider_x` | string? | null | REALITY spider path (share-link `spx`, share-link default `/`) |
@@ -132,7 +134,7 @@ The fields below are what a parsed node carries. In dae syntax they are **derive
 | `tuic_init_stream_recv_window` / `tuic_init_conn_recv_window` | u64? | 8 MiB / quinn default | TUIC QUIC receive windows; the 8 MiB stream-window default lifts single-stream throughput on high-RTT links (quinn's 1.25 MiB caps ~12.5 MB/s per 100 ms RTT) |
 | `juicity_uuid` / `juicity_password` | string? | null | Juicity |
 | `anytls_password` | string? | null | AnyTLS secret |
-| `anytls_min_idle_session` | usize? | 1 | Pool min idle sessions (`min_idle_session=`); default 1 keeps dials warm (0 = reap all idle sessions) |
+| `anytls_min_idle_session` | usize? | null (effective 0) | Explicit pool standby floor (`min_idle_session=`). A selected Selector leaf independently raises its effective floor to at least one; `0` otherwise lets idle sessions drain. |
 | `anytls_idle_session_check_interval` | u64? | null | Idle check period, s (`idle_session_check_interval=`) |
 | `anytls_idle_session_timeout` | u64? | null | Idle eviction, s (`idle_session_timeout=`) |
 | `mark` | u32? | null | Outbound SO_MARK |
@@ -297,7 +299,7 @@ group {
 
 | Canonical | dae spellings | Behavior |
 | ----------- | ------------- | ---------- |
-| `selector` | `select`, `fixed`, `fixed(0)` | Manual pin; API + cache |
+| `selector` | `select`, `fixed`, `fixed(0)` | Manual pin; API + cache. Its configured leaf is always warm: reusable AnyTLS/QUIC state or one bare server TCP for other proxy protocols. |
 | `urltest` | `min_moving_avg`, `min_avg10`, `min_last_delay` | Lowest latency + tolerance; ranks by a halving moving average `(prev+sample)/2` (dae `min_moving_avg` semantics); **TCP/UDP separate** |
 | `loadbalance` | `roundrobin`, `round_robin`, `balance` | Per-group, per-network RR among alive members |
 | `fallback` | `fallback` | First alive sticky per TCP/UDP network; no instant failback |
@@ -395,6 +397,7 @@ Multiple functions on one rule are AND'd with `&&`.
 
 ```dae
 dns {
+    # bind: 'tcp+udp://:1053'   # leave commented to keep standalone DNS off
     ipversion_prefer: 4
     optimistic_cache: true
     optimistic_cache_ttl: 600
@@ -416,12 +419,55 @@ dns {
 
 | dae key | Internal field | Default | Meaning |
 | ------- | -------------- | --------- | --------- |
+| `bind` | `bind` | `""` | Optional standalone UDP/TCP listener in the host network namespace; empty disables only this listener |
 | `upstream { ... }` | `upstream` | one `default` @ 223.5.5.5 UDP | Servers |
 | `routing { ... }` | `routing` | fallback default | Request routing |
 | `ipversion_prefer` | `strategy` | `both` when omitted; `preferipv4`/`preferipv6` when set to `4`/`6` | Address-family preference (`4`/`6`) |
 | `optimistic_cache` | `cache.enabled` | `true` | Cache on/off |
 | `optimistic_cache_ttl` | `cache.ttl` | `600` | Fixed positive-cache TTL (overrides answer min TTL; `0` keeps answer TTL) |
-| `max_cache_size` | `cache.max_size` | `10000` | Max entries; `0` is accepted, warned, and clamped to `1` |
+| `max_cache_size` | `cache.max_size` | `10000` | Max entries; also scales the retained query/response wire-byte budget at 4 KiB/entry (minimum 65,535 bytes/shard, global maximum 64 MiB); `0` is accepted, warned, and clamped to `1` |
+
+### Standalone listener
+
+`dns.bind` accepts exactly these dae-compatible forms:
+
+| Value | Listener |
+| ----- | -------- |
+| absent or `""` | Disabled; transparent TCP/UDP port-53 interception remains active |
+| numeric `IP:port`, for example `127.0.0.1:1053` or `[::1]:1053` | UDP only |
+| `udp://host:port` | UDP |
+| `tcp://host:port` | TCP |
+| `tcp+udp://host:port` | TCP and UDP |
+
+Schemed forms accept a hostname (`udp://localhost:1053`), a bracketed IPv6
+literal (`tcp://[::1]:1053`), or an empty host as a wildcard
+(`tcp+udp://:1053`). The port is always explicit; `0` requests an ephemeral
+port and the selected address is logged. A bare hostname is invalid, and
+userinfo, paths, queries, fragments, and IPv6 zone identifiers are rejected.
+Hostnames select the first resolved address on which every requested transport
+can bind.
+
+These are ordinary, unmarked host-netns sockets. A LAN-facing local TCP or UDP
+listener on `:53` takes precedence for its transport; wildcard precedence is
+limited to host-local destinations. Disabling `bind` does not disable
+transparent port-53 interception. All requested sockets are bound
+synchronously and all-or-nothing: one bind failure closes the others and fails
+startup. The listener is process-owned, so a semantic endpoint change on
+SIGHUP is rejected as restart-required; an unchanged endpoint continues using
+the newly published DNS runtime. Wildcard and LAN binds expose an unauthenticated
+recursive resolver and require host-firewall source restrictions.
+
+Each query uses the current `DnsServiceProvider` generation and therefore the
+same request/response routing, cache, singleflight, upstream pools, and routing
+projection as transparent DNS. Only complete single-question requests are
+forwarded. UDP reply limits clamp the client EDNS size to `512..=1232` and
+preserve the queried local address on wildcard sockets. TCP DNS on both transparent and standalone paths uses persistent RFC 7766
+two-octet framing and bounds every length/body read and response write to 30
+seconds. Standalone TCP consumes at most one quarter of the global connection
+budget.
+Standalone queries have no intercepted original destination: if request
+routing selects `asis`, honk returns a DNS failure rather than recursing into
+its own listener.
 
 ### Upstream
 
@@ -441,7 +487,7 @@ Each upstream is a `name: 'uri'` line; an optional trailing `-> tag` (or legacy 
 
 | Item | Meaning |
 | ------ | --------- |
-| `request { <cond> [&& <cond>...] -> <action> }` | Request rules, first match wins. Conditions: `qname(suffix:/keyword:/full:/regex:/geosite:...)`, `qtype(a/aaaa/...)`; `!` negates a condition. Actions: `reject`, `asis` (dial the query's original destination), or an upstream name |
+| `request { <cond> [&& <cond>...] -> <action> }` | Request rules, first match wins. Conditions: `qname(suffix:/keyword:/full:/regex:/geosite:...)`, `qtype(a/aaaa/...)`; `!` negates a condition. Actions: `reject`, `asis` (transparent queries preserve the client transport when dialing the intercepted destination, with UDP TC→TCP retry; standalone queries return a DNS failure), or an upstream name |
 | `request { fallback: name }` | Upstream when no request rule matches |
 | `response { <cond> [&& <cond>...] -> <action> }` | Response rules, first match wins. Conditions: `upstream(name)`, `qname(...)`, `ip(cidr, geoip:...)`; `!` negates. Actions: `accept`, `reject`, or an upstream name (re-query, depth ≤ 3) |
 | `response { fallback: accept\|reject }` | Verdict when no response rule matches |
@@ -452,7 +498,7 @@ Each upstream is a `name: 'uri'` line; an optional trailing `-> tag` (or legacy 
 Internal values: `preferipv4` | `preferipv6` | `ipv4only` | `ipv6only` | `both`.
 
 - `ipv4only` / `ipv6only`: the other family's queries are answered NODATA at request time and never forwarded upstream.
-- `preferipv4` / `preferipv6`: both families are forwarded. When the preferred family has answers for the name, the other family's response is suppressed (NODATA); when it has none, the other family's answers are returned (fallback allowed). The preferred-family check costs one extra upstream query per name on cache miss.
+- `preferipv4` / `preferipv6`: both families are forwarded. When the preferred family has answers for the name, the other family's response is suppressed (NODATA); when it has none, the other family's answers are returned (fallback allowed). The preferred-family check costs one extra upstream query per name on cache miss and preserves the original query wire profile except for QTYPE.
 - `both`: the default `DnsConfig` strategy; eligible A and AAAA queries are forwarded concurrently and neither family is suppressed. A missing `ipversion_prefer` in honk's config keeps this default.
 
 dae: `ipversion_prefer: 4` maps to `preferipv4`, `6` to `preferipv6` (anything else = `preferipv4`). The only-modes are not expressible in dae syntax.
@@ -465,9 +511,9 @@ Cache and singleflight eligibility are intentionally shared. Only a standard
 single-question QUERY with no answer/authority records and at most one
 option-free EDNS-v0 OPT is eligible. RD/AD/CD, DO, exact question wire, UDP
 size, ingress profile, policy, scope, and operation remain isolated in the
-key. Unsupported flags, EDNS options (including ECS/COOKIE), EDNS-v1, and
-multi-question messages bypass both optimizations; cancellation releases the
-flight.
+key. Multi-question requests are rejected before policy planning. Unsupported
+flags, EDNS options (including ECS/COOKIE), and EDNS-v1 bypass both
+optimizations; cancellation releases the flight.
 
 Runtime cache and singleflight keys share one immutable binary query identity;
 operation variants retain that allocation, and cache sharding uses a precomputed
@@ -495,8 +541,8 @@ bounded `error_kind` values: forwarder
 `worker_closed`/`ack_dropped`/`worker_failed`/`database`, projection
 `map_full`/`backend_write`, and transport `exchange_failed` with a bounded
 transport label. They do not log query names, upstream addresses, or
-free-form errors. `/stats` remains the outbound statistics surface; no public
-DNS metric, endpoint, API, or tuning key is added.
+free-form errors. `/stats` remains the outbound statistics surface; runtime
+DNS telemetry adds no public metric or API.
 
 ---
 
@@ -526,10 +572,10 @@ In dae syntax only `name` (the tag) and `url` are settable; the rest is runtime 
 
 Nodes remain runtime-only and are never written into the config file. With
 `global { store_subscribe: true }` (the default), each successfully fetched and
-parsed raw body is atomically stored under `<working-directory>/.sub`; the
-directory is mode `0700`, files are mode `0600`, and filenames are hashes of
-the URL plus request identity. Startup restores valid bodies before network
-refresh. A restored subscription does not consume the five-second first-fetch
+parsed raw body is atomically stored in `.sub` below `global.data_dir`; an
+existing legacy `./.sub` store is retained until moved. The directory is mode `0700`,
+files are mode `0600`, and filenames are hashes of the URL plus request identity.
+Startup restores valid bodies before network refresh. A restored subscription does not consume the five-second
 grace period, but its online refresh still runs in the background. Reload
 first carries active nodes and uses the stored body for any enabled subscription
 without carried nodes. Fetch, parse, or store failure keeps both the active
@@ -554,15 +600,48 @@ experimental {
         store_fakeip: false
         store_dns: false
     }
+    udp_nfqueue {
+        enabled: false
+    }
 }
 ```
+
+### `experimental { udp_nfqueue { ... } }`
+
+| Field | Default | Meaning |
+| ------- | --------- | --------- |
+| `enabled` | `false` | Hold ambiguous LAN-forwarded UDP first packets in NFQUEUE for a final userspace decision |
+
+This field is restart-required. When it is `true`, startup accepts only a build
+with the `ebpf` feature using the real eBPF backend; `--mock-ebpf` and builds
+without `ebpf` are rejected. The hook covers LAN-forwarded traffic because host
+`inet prerouting` follows LAN TC. Host-originated WAN egress stays on the
+canonical TPROXY path. DNS port 53, internal/special traffic, `must`, `block`,
+reverse traffic, and already-safe direct decisions are never queued; only
+ambiguous userspace/domain decisions are staged.
+
+The mechanism is fixed: raw-netlink queue `320`, one listener, and no bypass,
+fanout, fail-open, or user-selectable queue/worker policy. honk exclusively owns
+the exact nftables names `inet honk_nfqueue` / `udp_decision`; firewall managers
+in the same network namespace must not mutate them while honk runs. The pinned
+`UDP_DECISION_SEQUENCE` allocator survives ordinary restart/cleanup and cannot
+be reset without risking token reuse; exhaustion requires a reboot.
+
+Held skbs are before conntrack/NAT. A final direct decision uses a token-checked
+Arm → FIFO accept with the final mark → Activate transition and creates no
+userspace direct socket, payload copy, deliberate retransmission, endpoint, or
+connection entry. Proxy first commits its token-bound state, moves the one
+retained payload copy into the canonical UDP initializer, drops the originals,
+then dials/sends exactly once. Block/cancel drop. Reload and shutdown fence
+readiness and quiesce/cancel all guards before queue/table teardown.
+Queue/listener/verdict failures and token exhaustion are fatal.
 
 ### `experimental { clash_api { ... } }`
 
 | Field | Default | Meaning |
 | ------- | --------- | --------- |
 | `external_controller` | `""` | Listen addr; empty = disabled |
-| `external_ui` | `""` | Static UI dir |
+| `external_ui` | `""` | Static UI dir; relative paths prefer an existing directory below `global.data_dir`, then an existing working-directory-relative directory; missing paths target `global.data_dir` |
 | `secret` | `""` | Bearer / `?token=`; empty = no auth |
 | `default_mode` | `"Rule"` | `Rule` / `Global` / `Direct` |
 
@@ -607,7 +686,12 @@ udp = {
   queue: { accepted, full, closed },
   firstSend: { failures },
   stagger: { attempts, winners, cancellations },
-  warm: { attempts, successes, failures }
+  warm: { attempts, successes, failures },
+  nfqueue: {
+    received, activeFlows, directAccepted, proxyCopied, proxyDropped,
+    block, cancel, drop, tokenMismatch, tokenExhaustion, verdictErrors,
+    receiptToVerdict: H
+  }
 }
 H = { count, sumNanos, buckets }  // buckets has 64 fixed log2 slots
 ```
@@ -615,24 +699,35 @@ H = { count, sumNanos, buckets }  // buckets has 64 fixed log2 slots
 `queue` is the endpoint-driver queue; it is distinct from `slowPermit`, which
 records slow-path admission. Stagger counters are used only for cold URLTest
 preparation. AnyTLS candidates use caller-owned provisional session slots counted
-against the pool cap; loser cancellation closes detached work, while the winner
-commits into the captured generation before endpoint publication. Warm `successes`
-count only `Ready` or `AlreadyReady`; a `NotApplicable` result is neutral.
+against the pool cap. QUIC candidates use detached clients. Loser cancellation closes
+either form of detached work; the winner finishes promotion/arbitration before endpoint
+publication. If ordinary traffic already filled a QUIC generation slot, that incumbent
+remains and the winning transport owns its connection only for the selected flow. Warm
+`successes` count `Ready`; a `NotApplicable` result is neutral.
+
+`nfqueue.received` counts listener deliveries and `activeFlows` is the current
+pending-correlator gauge. `directAccepted`, `proxyDropped`, `block`, `cancel`,
+and `drop` count successful kernel verdicts; `proxyCopied` counts the single
+payload ownership transfer into the canonical initializer. `tokenMismatch`,
+`tokenExhaustion`, and `verdictErrors` expose fail-closed faults.
+`receiptToVerdict` measures listener receipt to successful verdict and is not
+labelled as kernel queue residence because NFQA timestamps are not guaranteed.
 
 `/stats` also carries a top-level `warm` object of point-in-time gauges:
 
 ```text
 warm = {
-  nodes: { preconnect, health, udp, traffic },
+  nodes: { preconnect, health, udp, selector, traffic },
   sessions: { anytls, tuic, juicity, hysteria2 }
 }
 ```
 
-`nodes` counts currently warm nodes by the reason their resources were
-established (a node may count under several reasons; a warm node with no
-recorded reason counts as `traffic`). `sessions` counts retained AnyTLS pool
-sessions and occupied QUIC client slots per protocol. Gauges track the live
-generation: a node whose resources drain drops out of the next snapshot.
+`nodes` counts currently warm nodes by the reason retaining their resources
+(a node may count under several reasons; a warm node with no recorded reason
+counts as `traffic`). `selector` is the always-on pin for configured Selector
+leaves. `sessions` counts retained AnyTLS pool sessions and occupied QUIC
+client slots per protocol. Gauges track the live generation: a node whose
+resources drain drops out of the next snapshot.
 
 Env: `HONK_UI_DOWNLOAD_URL` for UI zip override.
 
@@ -641,7 +736,7 @@ Env: `HONK_UI_DOWNLOAD_URL` for UI zip override.
 | Field | Default | Meaning |
 | ------- | --------- | --------- |
 | `enabled` | `false` | Persist SQLite cache |
-| `path` | `"cache.db"` | DB path |
+| `path` | `"cache.db"` | DB path; relative paths prefer `global.data_dir`, then an existing path relative to the original config directory |
 | `cache_id` | `""` | Namespace id |
 | `store_fakeip` | `false` | FakeIP persistence intent (engine incomplete) |
 | `store_dns` | `false` | Persist DNS answers |

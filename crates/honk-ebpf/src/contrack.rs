@@ -7,17 +7,22 @@
 use crate::log_shim::*;
 use crate::{
     event::send_dae_event,
-    maps::{BPF_STATS_MAP, CONNTRACK_ARGS_MAP, CONN_STATE_MAP, CONN_STATE_OCCUPANCY},
+    maps::{
+        BPF_STATS_MAP, CONN_STATE_MAP, CONN_STATE_OCCUPANCY, CONNTRACK_ARGS_MAP,
+        UDP_DECISION_SEQUENCE, udp_decision_retiring,
+    },
 };
-use aya_ebpf_bindings::helpers::bpf_ktime_get_ns;
+use aya_ebpf_bindings::{
+    bindings::{BPF_EXIST, BPF_NOEXIST},
+    helpers::{bpf_ktime_get_ns, bpf_spin_lock, bpf_spin_unlock},
+};
 use honk_ebpf_common::{
+    NFQUEUE_TOKEN_MASK, RoutingMeta,
     conn::{
-        BpfStatsKey, ConnState, ConntrackArgs, TcpState, OCCUPANCY_EBPF_DELETES, OCCUPANCY_INSERTS,
-        TCP_CONN_STATE_CLOSING_TIMEOUT_NS, TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS,
-        UDP_CONN_STATE_TIMEOUT_NS,
+        BpfStatsKey, ConnState, ConntrackArgs, OCCUPANCY_EBPF_DELETES, OCCUPANCY_INSERTS, TcpState,
+        UDP_CONN_STATE_TIMEOUT_NS, UdpDecisionState, tcp_conn_state_expired,
     },
     redirect_need::TuplesKey,
-    RoutingMeta,
 };
 use network_types::tcp::TcpHdr;
 
@@ -43,6 +48,139 @@ fn occupancy_add(slot: u32) {
             *counter += 1;
         }
     }
+}
+
+/// Atomically reserve a new UDP tuple for the current CPU's route decision.
+#[inline(always)]
+pub fn claim_udp_preparing(key: &TuplesKey, mac: &[u8; 6]) -> bool {
+    if udp_decision_retiring(key) {
+        return false;
+    }
+    let mut state: ConnState = unsafe { core::mem::zeroed() };
+    state.state = UdpDecisionState::Preparing as u8;
+    state.last_seen_ns = unsafe { bpf_ktime_get_ns() };
+    state.mac.copy_from_slice(mac);
+
+    if CONN_STATE_MAP
+        .insert(key, state, BPF_NOEXIST as u64)
+        .is_ok()
+    {
+        occupancy_add(OCCUPANCY_INSERTS);
+        return true;
+    }
+
+    if CONN_STATE_MAP.get_ptr(key).is_none() {
+        let stats_key = BpfStatsKey::UdpConnOverflow as u32;
+        if let Some(counter) = BPF_STATS_MAP.get_ptr_mut(stats_key) {
+            unsafe {
+                *counter += 1;
+            }
+        }
+        send_dae_event(
+            honk_ebpf_common::event::DaeEventType::UdpConnOverflow as u32,
+            0,
+            None,
+            0,
+            key.l4proto,
+            Some(unsafe { &key.src_ip.u6_addr32 }),
+            Some(unsafe { &key.dst_ip.u6_addr32 }),
+            key.src_port,
+            key.dst_port,
+        );
+    }
+    false
+}
+
+/// Replace only the Preparing claim; followers can never publish a decision.
+#[inline(always)]
+pub fn publish_claimed_udp_state(key: &TuplesKey, state: &ConnState) -> bool {
+    let Some(current) = CONN_STATE_MAP.get_ptr(key) else {
+        return false;
+    };
+    if unsafe {
+        (*current).state != UdpDecisionState::Preparing as u8 || (*current).decision_token != 0
+    } {
+        return false;
+    }
+    CONN_STATE_MAP.insert(key, state, BPF_EXIST as u64).is_ok()
+}
+
+/// Remove only this unpublished claim and account for its successful insertion.
+#[inline(always)]
+pub fn remove_udp_preparing(key: &TuplesKey) {
+    let Some(current) = CONN_STATE_MAP.get_ptr(key) else {
+        return;
+    };
+    if unsafe {
+        (*current).state != UdpDecisionState::Preparing as u8 || (*current).decision_token != 0
+    } {
+        return;
+    }
+    if CONN_STATE_MAP.remove(key).is_ok() {
+        occupancy_add(OCCUPANCY_EBPF_DELETES);
+    }
+}
+
+#[inline(always)]
+pub fn populate_udp_conn_state(
+    conn: &mut ConnState,
+    meta: RoutingMeta,
+    mac: &[u8; 6],
+    state: UdpDecisionState,
+    decision_token: u32,
+) {
+    *conn = unsafe { core::mem::zeroed() };
+    conn.state = state as u8;
+    conn.decision_token = decision_token;
+    conn.last_seen_ns = unsafe { bpf_ktime_get_ns() };
+    conn.meta = meta;
+    conn.mac.copy_from_slice(mac);
+}
+
+/// Allocate each nonzero mark token once for the lifetime of the pinned map.
+#[inline(always)]
+pub fn allocate_udp_decision_token(key: &TuplesKey) -> Option<u32> {
+    let sequence_ptr = UDP_DECISION_SEQUENCE.get_ptr_mut(0)?;
+    let sequence = unsafe { &mut *sequence_ptr };
+    unsafe {
+        bpf_spin_lock(&mut sequence.lock);
+    }
+
+    let mut became_exhausted = false;
+    let token = if sequence.exhausted != 0 {
+        0
+    } else if sequence.next >= NFQUEUE_TOKEN_MASK {
+        sequence.exhausted = 1;
+        became_exhausted = true;
+        0
+    } else {
+        sequence.next += 1;
+        if sequence.next == NFQUEUE_TOKEN_MASK {
+            sequence.exhausted = 1;
+            became_exhausted = true;
+        }
+        sequence.next
+    };
+
+    unsafe {
+        bpf_spin_unlock(&mut sequence.lock);
+    }
+
+    if became_exhausted {
+        send_dae_event(
+            honk_ebpf_common::event::DaeEventType::UdpDecisionTokenExhausted as u32,
+            0,
+            None,
+            0,
+            key.l4proto,
+            Some(unsafe { &key.src_ip.u6_addr32 }),
+            Some(unsafe { &key.dst_ip.u6_addr32 }),
+            key.src_port,
+            key.dst_port,
+        );
+    }
+
+    if token == 0 { None } else { Some(token) }
 }
 
 /// Build a [`RoutingMeta`] from routing parameters.
@@ -141,17 +279,6 @@ pub fn is_new_tcp_connection(tcph: &TcpHdr) -> bool {
     tcph.syn() != 0 && tcph.ack() == 0
 }
 
-/// TCP connection state expiry: 120 s for ACTIVE, 10 s for CLOSING.
-#[inline(always)]
-fn tcp_conn_state_expired(state: &ConnState, now: u64) -> bool {
-    let timeout = if state.state == TcpState::TcpStateClosing as u8 {
-        TCP_CONN_STATE_CLOSING_TIMEOUT_NS
-    } else {
-        TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS
-    };
-    now.wrapping_sub(state.last_seen_ns) > timeout
-}
-
 /// UDP connection state expiry: 120 s backstop.
 #[inline(always)]
 fn udp_conn_state_expired(state: &ConnState, now: u64) -> bool {
@@ -201,7 +328,7 @@ fn __mark_tcp_seen(
         // Non-SYN fast path: hold the pointer from a single lookup, check
         // expiry, and mutate in place.  Only re-look up after a remove.
         let state = unsafe { &mut *ptr };
-        if tcp_conn_state_expired(state, now) {
+        if tcp_conn_state_expired(state, now.wrapping_sub(state.last_seen_ns)) {
             let _ = CONN_STATE_MAP.remove(key);
             occupancy_add(OCCUPANCY_EBPF_DELETES);
             // Non-SYN packets without valid state must never allocate.
@@ -389,6 +516,7 @@ fn __mark_udp_seen(
 
     let mut new_state: ConnState = unsafe { core::mem::zeroed() };
     new_state.is_wan_ingress_direction = (is_wan_ingress_direction != 0) as u8;
+    new_state.state = UdpDecisionState::None as u8;
     new_state.last_seen_ns = now;
     new_state.pid = args.pid;
 

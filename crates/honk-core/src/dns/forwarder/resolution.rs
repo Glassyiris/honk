@@ -59,6 +59,19 @@ impl DnsForwarder {
             .to_vec())
     }
 
+    pub(crate) async fn resolve_strict_with_context_and_profile(
+        &self,
+        raw_query: &[u8],
+        original_dst: Option<SocketAddr>,
+        ingress: IngressProfile,
+    ) -> anyhow::Result<Vec<u8>> {
+        Ok(self
+            .resolve_inner(raw_query, original_dst, ingress, false, ResolveMode::Strict)
+            .await?
+            .rendered()
+            .to_vec())
+    }
+
     pub async fn resolve_outcome(&self, raw_query: &[u8]) -> Result<DnsOutcome, DnsForwardError> {
         self.resolve_outcome_with_context(raw_query, None).await
     }

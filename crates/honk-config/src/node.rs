@@ -356,7 +356,7 @@ impl Node {
 ///
 /// Modeled after sing-box's outbound groups: Selector (manual), URLTest
 /// (auto), LoadBalance (round-robin) and Fallback (first alive, sticky).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Group {
     #[serde(default = "uuid::Uuid::new_v4")]
     pub id: uuid::Uuid,
@@ -406,6 +406,27 @@ pub struct Group {
     pub interrupt_connections: bool,
     #[serde(default = "chrono::Utc::now")]
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl Default for Group {
+    fn default() -> Self {
+        Self {
+            id: uuid::Uuid::new_v4(),
+            name: String::new(),
+            policy: GroupPolicy::default(),
+            nodes: Vec::new(),
+            filters: Vec::new(),
+            groups: Vec::new(),
+            default: None,
+            final_outbound: None,
+            check_url: None,
+            check_interval: None,
+            tolerance: default_tolerance(),
+            idle_timeout: None,
+            interrupt_connections: false,
+            created_at: chrono::Utc::now(),
+        }
+    }
 }
 
 fn default_tolerance() -> u64 {

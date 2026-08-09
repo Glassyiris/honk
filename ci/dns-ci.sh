@@ -4,11 +4,10 @@
 #   1. fmt check (dns-touched crates)
 #   2. clippy -D warnings
 #   3. honk-config tests (skip known pre-existing failures)
-#   4. honk-core dns module tests
-#   5. focused runtime/projection/resolver and DNS contract tests
-#   6. dns_runtime integration test (mock eBPF, no Clash API)
-#   7. honk-core control tests (probers / resolver wiring)
-#   8. honk-outbound full suite (alive/urltest/bootstrap/quic transports)
+#   4. all honk-core DNS unit tests
+#   5. dns_runtime integration test (mock eBPF, no Clash API)
+#   6. honk-core control tests (listeners / probers / resolver wiring)
+#   7. honk-outbound full suite (alive/urltest/bootstrap/quic transports)
 #
 # Usage: ci/dns-ci.sh
 set -eu
@@ -29,16 +28,6 @@ cargo test -p honk-config -- --skip test_config_toml_round_trip --skip test_to_f
 
 step "cargo test -p honk-core (all DNS unit tests)"
 cargo test -p honk-core --lib dns::
-
-step "cargo test -p honk-core (runtime / projection / resolver)"
-cargo test -p honk-core --lib dns::runtime
-cargo test -p honk-core --lib dns::projection
-cargo test -p honk-core --lib dns::resolver
-
-step "cargo test -p honk-core (focused DNS contract probes)"
-cargo test -p honk-core --lib dns::query::tests::rejects_malformed_name_compression_without_panicking
-cargo test -p honk-core --lib dns::engine::tests::ineligible_queries_bypass_cache_while_eligible_queries_reuse_it
-cargo test -p honk-core --lib dns::transport::upstream_lifecycle_tests
 
 step "cargo test -p honk-core --test dns_runtime_test"
 cargo test -p honk-core --test dns_runtime_test

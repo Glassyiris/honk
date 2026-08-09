@@ -33,7 +33,7 @@ pub(super) fn controller_with_limit(
     max_concurrent_queries: usize,
 ) -> Arc<DnsController> {
     let mut controller = controller_for_upstream(upstream);
-    controller.concurrency_limit = Semaphore::new(max_concurrent_queries);
+    controller.concurrency_limit = Arc::new(Semaphore::new(max_concurrent_queries));
     Arc::new(controller)
 }
 
@@ -72,14 +72,6 @@ pub(super) fn response_with_txid(domain: &str, txid: u16) -> Vec<u8> {
     response[2] = 0x81;
     response[3] = 0x80;
     response
-}
-
-pub(super) fn multi_question_query(txid: u16) -> Vec<u8> {
-    let mut query = query_with_txid("example.com", txid);
-    let second = query_with_txid("other.example", txid);
-    query[4..6].copy_from_slice(&2_u16.to_be_bytes());
-    query.extend_from_slice(&second[12..]);
-    query
 }
 
 pub(super) struct SnapshotUpstream {

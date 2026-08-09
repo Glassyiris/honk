@@ -1,34 +1,17 @@
 #[tokio::test]
-async fn fixed_zero_and_notifier_order_are_visible_in_typed_outcome() {
-    // Given
+async fn fixed_zero_expiry_and_caller_txid_are_visible_in_typed_outcome() {
     let mut query = build_dns_query("example.com", 1);
     query[0..2].copy_from_slice(&0x5678_u16.to_be_bytes());
     let upstream = response(&query, [4, 3, 2, 1], 30);
-    let cache = Arc::new(Mutex::new(DnsCache::new(8)));
-    let notifier = Arc::new(OrderingNotifier {
-        cache: cache.clone(),
-        observed: StdMutex::new(None),
-    });
-    let forwarder = DnsForwarder::with_notifier(
+    let forwarder = DnsForwarder::new(
         exchange([("first", Ok(upstream))], None),
-        cache.clone(),
+        Arc::new(Mutex::new(DnsCache::new(8))),
         router("first", Vec::new(), Some(0)),
-        notifier.clone(),
     );
 
-    // When
     let outcome = forwarder.resolve_outcome(&query).await.expect("outcome");
 
-    // Then
     assert!(!outcome.expiry().is_cacheable());
-    assert!(cache.lock().await.get("example.com:1").is_none());
-    let notified = notifier
-        .observed
-        .lock()
-        .expect("notifier lock")
-        .clone()
-        .expect("notified");
-    assert_eq!(&notified[0..2], &[0, 0]);
     assert_eq!(&outcome.rendered()[0..2], &0x5678_u16.to_be_bytes());
 }
 

@@ -31,7 +31,7 @@ use honk_config::node::{Group, Node};
 use honk_config::types::NodeProtocol;
 use honk_outbound::alive::{AliveDialerSet, IpVersion, ProbeDomain};
 use honk_outbound::group::{GroupManager, SharedGroupManager};
-use honk_outbound::urltest::{urltest_group, urltest_node};
+use honk_outbound::urltest::{urltest_group, urltest_node_in_generation};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -69,7 +69,7 @@ impl Default for StreamSamplers {
     }
 }
 
-use crate::mode::{ModeState, SharedModeState};
+use crate::mode::{DatapathFlagsHandle, ModeState, SharedModeState};
 
 pub struct ClashState {
     pub config: Arc<tokio::sync::RwLock<Config>>,
@@ -88,13 +88,8 @@ pub struct ClashState {
     /// Shared clash mode + GLOBAL selection (also held by the control
     /// plane, which applies the mode override on the outbound path).
     pub mode_state: SharedModeState,
-    /// Shared eBPF backend; a mode switch rewrites the datapath's offload
-    /// flags (Rule offloads direct-routed flows, Direct offloads every
-    /// non-must/non-block flow, Global keeps only must-direct offload).
-    pub ebpf: Arc<tokio::sync::RwLock<Box<dyn crate::ebpf::EbpfBackend>>>,
-    /// The static half of the offload policy (`NO_DOMAIN_RULES` or 0),
-    /// maintained by the control plane; composed with the mode bits here.
-    pub direct_offload_static: Arc<std::sync::atomic::AtomicU32>,
+    /// Sole writer for mode/global persistence and datapath policy flags.
+    pub datapath_flags: DatapathFlagsHandle,
     /// Bearer secret from `experimental.clash_api.secret`; empty = no auth.
     pub secret: String,
     /// Shared connection pool (ready-pool hit/miss metrics in `/stats`).
@@ -353,23 +348,14 @@ async fn patch_configs(State(s): State<Arc<ClashState>>, body: Bytes) -> Respons
                 "invalid mode (expected Rule/Global/Direct)",
             );
         };
-        s.mode_state.write().mode = mode.clone();
-        if let Some(ref db) = s.cache_db {
-            db.save_clash_mode(&mode);
+        if let Err(error) = s.datapath_flags.set_mode(&mode).await {
+            tracing::error!(%error, mode = %mode, "failed to update clash mode");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to update clash mode",
+            );
         }
-        // A failed write leaves the datapath out of sync with the mode: in
-        // Global the kernel would keep offloading flows past the mode
-        // override, so log at error level (the userspace mode still applies
-        // to every flow that does reach the control plane).  Established
-        // flows keep the offload decision they were created with — the new
-        // policy binds at flow creation only.
-        let flags = s.mode_state.read().direct_offload_mode_bits()
-            | s.direct_offload_static
-                .load(std::sync::atomic::Ordering::Relaxed);
-        if let Err(error) = s.ebpf.write().await.set_datapath_flags(flags) {
-            tracing::error!(%error, mode = %mode, "failed to update eBPF datapath offload flags");
-        }
-        tracing::info!("clash mode updated: {}", mode);
+        tracing::info!(%mode, "clash mode updated");
     }
     StatusCode::NO_CONTENT.into_response()
 }
@@ -583,9 +569,16 @@ async fn put_proxy(
         if !valid {
             return error_response(StatusCode::BAD_REQUEST, "unknown proxy name");
         }
-        s.mode_state.write().global_selection = body.name.clone();
-        if let Some(ref db) = s.cache_db {
-            db.save_selector_choice("GLOBAL", &body.name);
+        if let Err(error) = s
+            .datapath_flags
+            .set_global_selection(body.name.clone())
+            .await
+        {
+            tracing::error!(%error, selection = %body.name, "failed to update GLOBAL selection");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to update GLOBAL selection",
+            );
         }
         return StatusCode::NO_CONTENT.into_response();
     }
@@ -630,7 +623,7 @@ struct DelayQuery {
 
 impl DelayQuery {
     fn timeout(&self) -> Duration {
-        // Zero means "use the urltest default" (urltest_node normalizes).
+        // Zero means "use the urltest default" (the measurement normalizes it).
         self.timeout
             .map(Duration::from_millis)
             .unwrap_or(Duration::ZERO)
@@ -662,17 +655,14 @@ async fn get_proxy_delay(
         };
         let tcp = entry.tcp.clone();
         let generation = s.runtime_registry.read().clone();
-        let (runtime, guard) = match generation.get(&node.id) {
-            Some(runtime) => (runtime, None),
-            None => {
-                let guard = honk_outbound::runtime::NodeRuntime::ephemeral_guarded(&node);
-                (guard.runtime(), Some(guard))
-            }
-        };
-        let measured = urltest_node(&runtime, tcp.as_ref(), &query.url, query.timeout()).await;
-        if let Some(guard) = guard {
-            guard.close().await;
-        }
+        let measured = urltest_node_in_generation(
+            &generation,
+            &node,
+            tcp.as_ref(),
+            &query.url,
+            query.timeout(),
+        )
+        .await;
         return match measured {
             Ok(latency) => {
                 s.alive_set
@@ -859,6 +849,7 @@ async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json
                 "preconnect": warm.preconnect_nodes,
                 "health": warm.health_nodes,
                 "udp": warm.udp_nodes,
+                "selector": warm.selector_nodes,
                 "traffic": warm.traffic_nodes,
             },
             "sessions": {
@@ -907,6 +898,20 @@ async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json
                 "attempts": udp.warm_attempts,
                 "successes": udp.warm_successes,
                 "failures": udp.warm_failures,
+            },
+            "nfqueue": {
+                "received": udp.nfqueue.received,
+                "activeFlows": udp.nfqueue.active_flows,
+                "directAccepted": udp.nfqueue.direct_accepted,
+                "proxyCopied": udp.nfqueue.proxy_copied,
+                "proxyDropped": udp.nfqueue.proxy_dropped,
+                "block": udp.nfqueue.block,
+                "cancel": udp.nfqueue.cancel,
+                "drop": udp.nfqueue.drop,
+                "tokenMismatch": udp.nfqueue.token_mismatch,
+                "tokenExhaustion": udp.nfqueue.token_exhaustion,
+                "verdictErrors": udp.nfqueue.verdict_errors,
+                "receiptToVerdict": udp_histogram_json(&udp.nfqueue.receipt_to_verdict_latency),
             },
         },
     }))

@@ -60,8 +60,11 @@ pub struct GlobalConfig {
     pub wan_interface: Vec<String>,
     #[serde(default)]
     pub auto_config_kernel_parameter: bool,
-    /// Persist successfully fetched subscription bodies under `.sub` in the
-    /// process working directory so startup can recover without the network.
+    /// Root for generated state and relative runtime-supplied assets.
+    #[serde(default = "default_data_dir")]
+    pub data_dir: String,
+    /// Persist successfully fetched subscription bodies below the configured
+    /// runtime data directory so startup can recover without the network.
     #[serde(default = "default_store_subscribe")]
     pub store_subscribe: bool,
     #[serde(default = "default_tcp_check_urls")]
@@ -122,9 +125,9 @@ pub struct GlobalConfig {
     /// disables this independent warm-up path.
     #[serde(default = "default_udp_warm_node_count")]
     pub udp_warm_node_count: usize,
-    /// Process-wide cap on concurrent proxied dials (connect + protocol
-    /// handshake). Built-in direct/block dials are exempt — they are local
-    /// connects already bounded by the connection admission limit.
+    /// Process-wide cap on physical proxied connects and protocol handshakes.
+    /// Ready-pool hits, logical streams on warm generation transports, and
+    /// built-in direct/block dials are exempt.
     #[serde(default = "default_max_concurrent_dials")]
     pub max_concurrent_dials: usize,
 }
@@ -237,11 +240,7 @@ fn default_log_level() -> String {
     "info".into()
 }
 fn default_tcp_check_urls() -> Vec<String> {
-    vec![
-        "http://cp.cloudflare.com".into(),
-        "1.1.1.1".into(),
-        "2606:4700:4700::1111".into(),
-    ]
+    vec!["https://www.gstatic.com/generate_204".into()]
 }
 fn default_tcp_check_http_method() -> String {
     "HEAD".into()
@@ -292,6 +291,9 @@ fn default_preconnect_node_count() -> usize {
 fn default_udp_warm_node_count() -> usize {
     0
 }
+fn default_data_dir() -> String {
+    crate::paths::DEFAULT_DATA_DIR.to_string()
+}
 fn default_store_subscribe() -> bool {
     true
 }
@@ -312,6 +314,7 @@ impl Default for GlobalConfig {
             lan_interface: vec![],
             wan_interface: vec![],
             auto_config_kernel_parameter: false,
+            data_dir: default_data_dir(),
             store_subscribe: default_store_subscribe(),
             tcp_check_url: default_tcp_check_urls(),
             tcp_check_http_method: default_tcp_check_http_method(),
@@ -539,12 +542,44 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), crate::ConfigError> {
+        let data_dir = std::path::Path::new(&self.global.data_dir);
+        if self.global.data_dir.is_empty() || !data_dir.is_absolute() {
+            return Err(crate::ConfigError::Validation(
+                "global.data_dir must be a non-empty absolute path".into(),
+            ));
+        }
+
+        self.dns
+            .bind_endpoint()
+            .map_err(|error| crate::ConfigError::Validation(error.to_string()))?;
+
         // The eBPF datapath has the mark compiled in; userspace cannot inject
         // a different value, so a custom mark would silently break the proxy.
         if self.global.tproxy_mark != default_tproxy_mark() {
             return Err(crate::ConfigError::Validation(format!(
                 "global.tproxy_mark must be {:#x} (compiled into the eBPF datapath)",
                 default_tproxy_mark()
+            )));
+        }
+        let reserved = crate::routing::DATAPATH_RESERVED_MARK_MASK;
+        if self.global.so_mark_from_dae & reserved != 0 {
+            return Err(crate::ConfigError::Validation(format!(
+                "global.so_mark_from_dae ({:#x}) overlaps datapath-reserved skb mark bits {reserved:#x}",
+                self.global.so_mark_from_dae
+            )));
+        }
+        for (index, rule) in self.routing.rules.iter().enumerate() {
+            if rule.mark & reserved == 0 {
+                continue;
+            }
+            let rule_name = if rule.name.is_empty() {
+                format!("routing.rules[{index}].mark")
+            } else {
+                format!("routing rule '{}'.mark", rule.name)
+            };
+            return Err(crate::ConfigError::Validation(format!(
+                "{rule_name} ({:#x}) overlaps datapath-reserved skb mark bits {reserved:#x}",
+                rule.mark
             )));
         }
         // Content-derived IDs collide when two nodes share protocol, server,
@@ -641,6 +676,64 @@ fn parse_yaml(content: &str) -> Result<Config, crate::ConfigError> {
 #[cfg(test)]
 mod builtin_nodes_tests {
     use super::*;
+
+    #[test]
+    fn test_validate_accepts_supported_dns_bind() {
+        let mut config = Config::default();
+        config.dns.bind = "tcp+udp://localhost:0".into();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_structured_dns_bind_clearly() {
+        let config = Config::from_json_str(r#"{"dns":{"bind":"udp://localhost"}}"#).unwrap();
+        let error = config.validate().unwrap_err();
+        assert!(matches!(error, crate::ConfigError::Validation(_)));
+        assert!(
+            error.to_string().contains("dns.bind"),
+            "validation error must identify dns.bind: {error}"
+        );
+    }
+
+    #[test]
+    fn test_validate_requires_absolute_data_dir() {
+        let mut config = Config::default();
+        assert_eq!(config.global.data_dir, crate::paths::DEFAULT_DATA_DIR);
+        config.validate().unwrap();
+
+        for invalid in ["", "relative/data"] {
+            config.global.data_dir = invalid.into();
+            let error = config.validate().unwrap_err();
+            assert!(error.to_string().contains("global.data_dir"));
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_datapath_reserved_routing_marks() {
+        let mut config = Config::default();
+        config.routing.rules.push(crate::routing::RoutingRule {
+            name: "reserved-mark".into(),
+            condition: crate::routing::RoutingCondition::default(),
+            outbound: crate::routing::RoutingOutbound::Simple("direct".into()),
+            priority: 0,
+            must: false,
+            mark: 0,
+        });
+
+        for reserved_bit in [0x4000_0000, 0x8000_0000] {
+            config.routing.rules[0].mark = reserved_bit;
+            let error = config
+                .validate()
+                .expect_err("reserved routing mark must fail");
+            assert!(error.to_string().contains("reserved skb mark"), "{error}");
+        }
+
+        config.routing.rules[0].mark = 0x3fff_ffff;
+        config.global.so_mark_from_dae = 0x8000_0000;
+        assert!(config.validate().is_err());
+        config.global.so_mark_from_dae = 0;
+        assert!(config.validate().is_ok());
+    }
 
     #[test]
     fn test_validate_rejects_unknown_transport() {

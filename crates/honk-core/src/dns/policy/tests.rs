@@ -120,6 +120,18 @@ fn semantic_policy_fields_change_identity() {
 }
 
 #[test]
+fn listener_bind_does_not_change_resolution_policy_identity() {
+    let base = representative_config();
+    let mut bound = base.clone();
+    bound.bind = "tcp+udp://127.0.0.1:53".into();
+
+    assert_eq!(
+        PolicyId::from_config(&base).expect("base policy"),
+        PolicyId::from_config(&bound).expect("bound policy"),
+    );
+}
+
+#[test]
 fn request_and_response_rule_order_change_identity() {
     // Given
     let mut base = representative_config();

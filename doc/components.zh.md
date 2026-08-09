@@ -24,8 +24,9 @@
 | `lan_interface` | string[] | `[]` | 拦截的 LAN 网卡；空时不安装任何 LAN hook；逗号分隔 |
 | `wan_interface` | string[] | `[]` | 拦截本机发起 TCP/UDP 的 WAN 网卡；`auto` 跟随 IPv4 默认路由。默认路由不存在时保持待定（不会回退到 `lo`），并在网卡、地址或路由事件后自动挂载；同一事件还会重新发布网关本机地址的 `direct(must)` 规则，并立即复测受健康状态控制的出站。 |
 | `auto_config_kernel_parameter` | bool | `false` | 自动 sysctl（需 root） |
-| `store_subscribe` | bool | `true` | 将每个订阅最近一次有效正文持久化到 `<运行目录>/.sub`，供启动/重载在网络不可用时恢复；修改后需重启进程。 |
-| `tcp_check_url` | string[] | Cloudflare HTTP + 1.1.1.1 + IPv6 | TCP 健康检查目标；逗号分隔 |
+| `data_dir` | string | `"/var/share/honk"` | 生成状态与相对运行时资源的绝对根目录；不能为空，修改后需重启进程。 |
+| `store_subscribe` | bool | `true` | 将每个订阅最近一次有效正文持久化到 `global.data_dir` 下的 `.sub`，供启动/重载在网络不可用时恢复；已有 `./.sub` 会继续使用，直至手动迁移；修改后需重启进程。 |
+| `tcp_check_url` | string[] | gstatic HTTPS | TCP 健康检查目标；HTTPS 会先完成并校验目标 TLS，再发送配置的 HTTP 方法。 |
 | `tcp_check_http_method` | string | `"HEAD"` | URL 检查的 HTTP 方法 |
 | `udp_check_dns` | string[] | dns.google / 8.8.8.8 / IPv6 | UDP 健康检查 DNS 目标；逗号分隔 |
 | `check_interval_secs` | u64 | `30` | 检查间隔（秒）。**dae：** `check_interval` 时长（如 `300s`） |
@@ -46,9 +47,9 @@
 | `connect_timeout_ms` | u64 | `3000` | TCP 连接超时（结构化模型字段，dae 语法无对应键） |
 | `dns_resolve_timeout_ms` | u64 | `2000` | 控制面解析超时（结构化模型字段，dae 语法无对应键） |
 | `relay_idle_timeout_secs` | u64 | `300` | 空闲中继断开；`0` = 关闭（结构化模型字段，dae 语法无对应键） |
-| `preconnect_node_count` | usize | `'auto'` | 启动裸 TCP 预连接数。`'auto'` = `min(nodes,8)`；`0` 严格关闭预热。候选顺序为各组当前选择优先、再按配置顺序补足；仅可池化裸 TCP 的协议入选（AnyTLS/QUIC 永远不会消费池化裸 TCP），且排除内置 `direct`/`block`。 |
-| `udp_warm_node_count` | usize | `0` | 每组 UDP 预热上限。`0` 为严格关闭：不创建 coordinator task，也不产生 warm metrics。正值 N（封顶 3）会在启动后以及**每个探测周期**（`check_interval`）预热每组按延迟排名前 N 的 UDP 可用节点——测速后新变快的节点在赢得选择前就已拨好 transport。dispatch 仍最多四个并发 task。另有进程级总量上限 `4 × N`：合并后的候选按全局 UDP 延迟重排并截断，组再多也不会膨胀驻留 transport。 |
-| `max_concurrent_dials` | usize | `64` | 按 runtime generation 生效的并发代理拨号上限（connect + 协议握手）；另受所有重叠 reload generation 共享的、启动时不可变的进程级描述符 gate 约束。内置 `direct`/`block` 拨号豁免——它们是本地 connect，已由 TCP 准入限制。replacement generation 立即采用新值；旧 generation 中进行中的拨号继续占用同一个进程级 gate，直至结束。 |
+| `preconnect_node_count` | usize | `'auto'` | 启动时执行一轮裸 TCP 预连接。`'auto'` 最多尝试 8 个节点；`0` 关闭；显式 `N` 可覆盖所有合格节点，但最多 8 个并发尝试。候选按各组当前选择、再按配置顺序；仅可池化裸 TCP 的协议入选（AnyTLS/QUIC 与内置 `direct`/`block` 排除）。 |
+| `udp_warm_node_count` | usize | `0` | 每组 UDP 预热上限。`0` 严格关闭。正值 N 取各组延迟 top `min(N,3)` 的 UDP 叶子；独立 coordinator 启动后立即运行，随后每批完成再等待一个 `check_interval`，最多并发四个尝试。合并候选按全局 UDP 延迟重排，进程驻留总量封顶 `4×N`。 |
+| `max_concurrent_dials` | usize | `64` | 按 runtime generation 生效的物理代理连接与协议握手并发上限，另受所有重叠 reload generation 共享的启动时描述符 gate 约束。Ready 池命中、已热 AnyTLS/QUIC transport 上的逻辑流，以及内置 `direct`/`block` 均不占额度。replacement generation 立即采用新值；旧 generation 中进行中的拨号继续占用同一个进程级 gate，直至结束。 |
 
 ### 拨号模式细节
 
@@ -84,7 +85,7 @@ dae 语法中节点**只能以分享链接书写**：`tag: 'scheme://...'` 或�
 | `skip_cert_verify` | bool | `false` | 跳过证书校验；链接 `allowInsecure` / `insecure` 参数 |
 | `ech_enabled` | bool | `false` | 提供 ECH；链接 `ech=1`（或 `ech_config` 隐式开启） |
 | `ech_config` | string? | null | Base64 编码的 ECHConfigList；链接 `ech_config` 参数 |
-| `ech_config_path` | string? | null | 存放 base64 ECHConfigList 的文件路径 |
+| `ech_config_path` | string? | null | 存放 base64 ECHConfigList 的文件路径；相对路径优先读取 `<global.data_dir>/<path>`，不存在时兼容旧的工作目录相对文件。 |
 | `reality_public_key` | string? | null | REALITY 服务端 X25519 公钥（分享链接 `pbk`）；设置后该节点走 REALITY 握手而非普通 TLS（`security=reality` 隐含 `tls=true`） |
 | `reality_short_id` | string? | null | REALITY short id（链接 `sid`，偶数长度 hex，至多 8 字节） |
 | `reality_spider_x` | string? | null | REALITY spider 路径（链接 `spx`，链接约定默认 `/`） |
@@ -102,7 +103,7 @@ dae 语法中节点**只能以分享链接书写**：`tag: 'scheme://...'` 或�
 | `tuic_init_stream_recv_window` / `tuic_init_conn_recv_window` | u64? | 8 MiB / quinn 默认 | TUIC QUIC 接收窗口；8 MiB 流窗口默认值提升高 RTT 链路单流吞吐（quinn 默认 1.25 MiB 每 100ms RTT 封顶约 12.5MB/s） |
 | `juicity_uuid` / `juicity_password` | string? | null | Juicity |
 | `anytls_password` | string? | null | AnyTLS 密钥（等于链接密码） |
-| `anytls_min_idle_session` | usize? | 1 | 池最小空闲会话；链接 `min_idle_session`。默认 1 保持拨号热度（0 = 回收全部空闲会话） |
+| `anytls_min_idle_session` | usize? | null（实际为 0） | 显式池待机会话下限；链接 `min_idle_session`。Selector 当前叶节点会独立把有效下限提升到至少 1；其他节点设为 `0` 时可回收全部空闲会话。 |
 | `anytls_idle_session_check_interval` | u64? | null | 空闲检查周期（秒）；链接 `idle_session_check_interval` |
 | `anytls_idle_session_timeout` | u64? | null | 空闲驱逐（秒）；链接 `idle_session_timeout` |
 | `mark` | u32? | null | 出站 SO_MARK（结构化模型字段，dae 语法无对应键） |
@@ -260,7 +261,7 @@ group {
 
 | 规范名 | 别名 | 行为 |
 | -------- | ------ | ------ |
-| `selector` | `select`、`fixed`、`fixed(0)` | 手动固定；API + cache |
+| `selector` | `select`、`fixed`、`fixed(0)` | 手动固定；API + cache。其配置叶节点始终保持热态：AnyTLS/QUIC 保留可复用状态，其他代理协议保留一条服务端裸 TCP。 |
 | `urltest` | `min_moving_avg`、`min_avg10`、`min_last_delay` | 最低延迟 + tolerance；按减半递推移动平均 `(prev+sample)/2` 排名（dae `min_moving_avg` 语义）；**TCP/UDP 分离** |
 | `loadbalance` | `roundrobin`、`round_robin`、`balance` | 每组、每网络独立对存活成员轮询 |
 | `fallback` | | TCP/UDP 各自固定第一个存活成员；无立即 failback |
@@ -357,6 +358,7 @@ domain/geosite matcher 视为"不是 x"，不会被其否决。
 
 ```
 dns {
+    # bind: 'tcp+udp://:1053'   # 保持注释即可只用透明 DNS
     ipversion_prefer: 4
     upstream {
         homedns: 'udp+tcp://10.10.10.1:53'
@@ -373,10 +375,44 @@ dns {
 
 | 字段 | 类型 | 默认值 | 含义 |
 | ------ | ------ | -------- | ------ |
+| `bind` | string | `""` | host netns 中可选的独立 UDP/TCP 监听；空值只关闭此监听 |
 | `upstream` | list | 一个 `default` @ 223.5.5.5 UDP | 服务器；dae：`upstream { name: 'uri' }` |
 | `routing` | object | fallback 默认 | 请求路由；dae：`routing { request { ... } }` |
 | `strategy` | enum | 未指定时为 `both`；设置 `ipversion_prefer: 4\|6` 时分别为 `preferipv4`/`preferipv6` | 地址族策略 |
 | `cache` | object | 启用 | 缓存；dae：`optimistic_cache` / `optimistic_cache_ttl` / `max_cache_size` |
+
+### 独立监听
+
+`dns.bind` 只接受下列 dae 兼容形式：
+
+| 值 | 监听 |
+| --- | ---- |
+| 省略或 `""` | 关闭；透明 TCP/UDP 53 端口拦截仍生效 |
+| 数字 `IP:port`，如 `127.0.0.1:1053` 或 `[::1]:1053` | 仅 UDP |
+| `udp://host:port` | UDP |
+| `tcp://host:port` | TCP |
+| `tcp+udp://host:port` | TCP 与 UDP |
+
+带 scheme 的形式可使用主机名（`udp://localhost:1053`）、方括号包裹的 IPv6
+字面量（`tcp://[::1]:1053`），或用空 host 表示通配地址
+（`tcp+udp://:1053`）。端口必须显式给出；`0` 表示申请临时端口，最终地址会写入
+日志。裸主机名、userinfo、path、query、fragment 和 IPv6 zone identifier 均无效。
+主机名选择第一个能让全部请求 transport 成功 bind 的解析地址。
+
+这些是在 host netns 中创建的普通、未打 mark 的 socket。LAN 侧本地 TCP 或 UDP
+`:53` 监听对相应 transport 优先；通配监听只有在目的地址属于本机时才优先。关闭
+`bind` 不会关闭透明 53 端口拦截。所有请求的 socket 会同步、all-or-nothing 地
+bind：任一失败会关闭其他 socket 并令启动失败。监听器归进程所有，因此 SIGHUP 中
+endpoint 语义变化会被拒绝并提示必须重启；endpoint 不变时继续使用新发布的 DNS
+runtime。通配和 LAN bind 会暴露无认证的递归 resolver，必须用主机防火墙限制来源。
+
+每个查询都取当前 `DnsServiceProvider` generation，因此与透明 DNS 共享
+request/response routing、缓存、singleflight、上游连接池和路由投影。只转发完整的
+单问题请求。UDP 应答将客户端 EDNS size 钳制到 `512..=1232`，且通配 socket 会保留
+查询命中的本地地址作为应答源。透明与独立 TCP DNS 都支持 RFC 7766 双字节 framing 与持久连接，并将每次长度/
+正文读取及应答写入限制在 30 秒内。独立 TCP 最多占用全局连接预算的四分之一。
+独立查询没有拦截所得的原始目的地址：若 request routing 选择 `asis`，honk 会返回
+DNS 失败，而不会递归拨回自己的监听器。
 
 ### 上游
 
@@ -394,7 +430,7 @@ dns {
 
 | 字段 | 含义 |
 | ------ | ------ |
-| `request { <条件> [&& <条件>...] -> <动作> }` | 请求规则，首条命中。条件：`qname(suffix:/keyword:/full:/regex:/geosite:...)`、`qtype(a/aaaa/...)`；`!` 取反。动作：`reject`、`asis`（拨查询的原始目的地址）或上游名 |
+| `request { <条件> [&& <条件>...] -> <动作> }` | 请求规则，首条命中。条件：`qname(suffix:/keyword:/full:/regex:/geosite:...)`、`qtype(a/aaaa/...)`；`!` 取反。动作：`reject`、`asis`（透明查询使用客户端原 transport 拨拦截所得原始目的地址，UDP TC 时改用 TCP 重试；独立查询返回 DNS 失败）或上游名 |
 | `request { fallback: <上游名> }` | 无请求规则命中时的上游 |
 | `response { <条件> [&& <条件>...] -> <动作> }` | 响应规则，首条命中。条件：`upstream(name)`、`qname(...)`、`ip(cidr, geoip:...)`；`!` 取反。动作：`accept`、`reject` 或上游名（重新查询，深度 ≤ 3） |
 | `response { fallback: accept\|reject }` | 无响应规则命中时的判定 |
@@ -405,7 +441,7 @@ dns {
 `preferipv4` | `preferipv6` | `ipv4only` | `ipv6only` | `both`
 
 - `ipv4only` / `ipv6only`：另一地址族的查询在请求期直接回 NODATA，不转发上游。
-- `preferipv4` / `preferipv6`：两个地址族都会转发；当偏好族对同名有应答时，另一族的应答被压制（NODATA）；偏好族无应答时返回另一族的真实应答（允许回退）。缓存未命中时偏好族检查需额外一次上游查询。
+- `preferipv4` / `preferipv6`：两个地址族都会转发；当偏好族对同名有应答时，另一族的应答被压制（NODATA）；偏好族无应答时返回另一族的真实应答（允许回退）。缓存未命中时偏好族检查需额外一次上游查询，并保留原查询除 QTYPE 外的完整 wire profile。
 - `both`：`DnsConfig` 的实际默认值；并发转发符合资格的 A 与 AAAA，两个地址族都不压制。honk 配置省略 `ipversion_prefer` 时保持此默认值。
 
 dae：`ipversion_prefer: 4` 映射 `preferipv4`，`6` 映射 `preferipv6`（其他值 = `preferipv4`）；only 模式无法通过 dae 语法表达。
@@ -416,7 +452,7 @@ dae：`ipversion_prefer: 4` 映射 `preferipv4`，`6` 映射 `preferipv6`（其�
 | ------ | -------- | ------ |
 | `enabled` | `true` | 开关。**dae：** `optimistic_cache` |
 | `ttl` | `600` | 正缓存固定 TTL（覆盖应答 min TTL；`0` 表示沿用上游）。**dae：** `optimistic_cache_ttl` |
-| `max_size` | `10000` | 最大条目；`0` 仍接受，但会告警并钳制为 `1`。**dae：** `max_cache_size` |
+| `max_size` | `10000` | 最大条目，同时按每条 4 KiB 限制保留的 query/response wire 总字节（每分片至少 65,535 字节、全局最多 64 MiB）；`0` 仍接受，但会告警并钳制为 `1`。**dae：** `max_cache_size` |
 
 可选持久化：`experimental { cache_file { ... } }` 的 `store_dns`。条目使用可回滚的
 `dns:v2:` 命名空间，只有 expiry、wire identity、入口 profile、scope、operation 与
@@ -425,9 +461,9 @@ dae：`ipversion_prefer: 4` 映射 `preferipv4`，`6` 映射 `preferipv6`（其�
 
 缓存与 singleflight 共用资格判定。只有标准单问题 QUERY、answer/authority 计数为零、
 最多一个无 option 的 EDNS-v0 OPT 才符合资格。RD/AD/CD、DO、精确 question wire、
-UDP size、入口 profile、策略、scope 与 operation 均在 key 中保持隔离。不受支持的
-flags、EDNS option（包括 ECS/COOKIE）、EDNS-v1 与多问题消息绕过这两项优化；取消会
-释放 flight。
+UDP size、入口 profile、策略、scope 与 operation 均在 key 中保持隔离。多问题请求
+会在策略规划前被拒绝；不受支持的 flags、EDNS option（包括 ECS/COOKIE）与 EDNS-v1
+绕过这两项优化；取消会释放 flight。
 
 运行时 cache 与 singleflight key 共享同一份不可变二进制 query identity；
 operation 变体复用该分配，cache 分片使用预计算的运行时 hash。SQLite 文本编码
@@ -450,7 +486,7 @@ forwarder 为 `engine`/`exchange`/`response`/`internal`/`rejected_plan`，持久
 `worker_closed`/`ack_dropped`/`worker_failed`/`database`，投影为
 `map_full`/`backend_write`，transport 为 `exchange_failed` 并带有界 transport label。
 日志不记录 query name、upstream 地址或自由格式 error。`/stats` 仍是出站统计面；
-没有新增公开 DNS metric、endpoint、API 或调优项。
+runtime DNS 遥测不会新增公开 metric 或 API。
 
 ---
 
@@ -474,21 +510,68 @@ dae 语法中每个订阅一行：`tag: 'https://...'` 或裸 `'https://...'`（
 
 节点仍只存在于运行时，不会写回配置文件。默认启用
 `global { store_subscribe: true }`：每次成功获取并解析的原始正文会原子写入
-`<运行目录>/.sub`；目录权限为 `0700`、文件权限为 `0600`，文件名由 URL 与
-请求身份散列得到。启动时先恢复有效缓存，再在后台联网刷新；已恢复的订阅不再占用
-5 秒首次拉取等待时间。重载先沿用当前节点，并为没有可沿用节点的已启用订阅读取缓存。
-拉取、解析或落盘失败时，当前节点与上一次有效缓存均保持不变。
+`global.data_dir` 下的 `.sub`；已有旧 `./.sub` 会继续使用，直至手动迁移。目录权限为
+`0700`、文件权限为 `0600`，文件名由 URL 与请求身份散列得到。启动时先恢复有效缓存，
+再在后台联网刷新；已恢复的订阅不再占用 5 秒首次拉取等待时间。重载先沿用当前节点，
+并为没有可沿用节点的已启用订阅读取缓存。拉取、解析或落盘失败时，当前节点与上一次
+有效缓存均保持不变。
 
 ---
 
 ## 7. Experimental（`experimental { ... }`）
+
+```dae
+experimental {
+    clash_api {
+        external_controller: '0.0.0.0:9090'
+        external_ui: yacd
+        secret: ''
+        default_mode: Rule
+    }
+    cache_file {
+        enabled: false
+        path: 'cache.db'
+        cache_id: ''
+        store_fakeip: false
+        store_dns: false
+    }
+    udp_nfqueue {
+        enabled: false
+    }
+}
+```
+
+### `experimental { udp_nfqueue { ... } }`
+
+| 字段 | 默认值 | 含义 |
+| ------ | -------- | ------ |
+| `enabled` | `false` | 用 NFQUEUE 保留仍有歧义的 LAN 转发 UDP 首包，等待用户态终判 |
+
+该字段修改后必须重启。设为 `true` 时，启动只接受带 `ebpf` feature 且使用真实 eBPF
+后端的构建；`--mock-ebpf` 和不带 `ebpf` 的构建会被拒绝。该 hook 覆盖 LAN 转发流量，
+因为主机 `inet prerouting` 位于 LAN TC 之后。本机发起的 WAN 出口流量仍走规范 TPROXY
+路径。DNS 53、内部/特殊流量、`must`、`block`、反向流量和已经可以安全直连的决策
+绝不入队；只暂存仍有歧义的用户态/域名决策。
+
+机制固定为：raw-netlink 队列 `320`、单 listener，不启用 bypass、fanout、fail-open，
+也没有用户可配置的队列/worker 策略。honk 独占名称精确为
+`inet honk_nfqueue` / `udp_decision` 的 nftables 对象；运行期间，同一网络命名空间中的
+防火墙管理器不得修改它们。固定的 `UDP_DECISION_SEQUENCE` 分配器会跨普通重启/清理
+保留，不能在仍可能复用 token 时重置；耗尽后必须重启操作系统。
+
+被保留的 skb 位于 conntrack/NAT 之前。最终 direct 使用 token 校验的
+Arm → 按 FIFO 以最终 mark accept → Activate，不创建用户态直连 socket、payload 副本、
+故意重传、endpoint 或 connection 条目。Proxy 先提交 token 绑定状态，再把唯一的保留
+payload 副本转交给规范 UDP 初始化器，丢弃原始 skb，最后只拨号/发送一次。Block/cancel
+丢弃原始 skb。重载与关闭会 fence readiness，并在队列/表拆除前静默/取消所有 guard。
+队列、listener、verdict 故障和 token 耗尽均为致命错误。
 
 ### `experimental { clash_api { ... } }`
 
 | 字段 | 默认值 | 含义 |
 | ------ | -------- | ------ |
 | `external_controller` | `""` | 监听地址；空 = 关闭 |
-| `external_ui` | `""` | 静态 UI 目录 |
+| `external_ui` | `""` | 静态 UI 目录；相对路径优先使用 `global.data_dir` 下的已有目录，再使用已有工作目录相对目录；不存在时指向 `global.data_dir` |
 | `secret` | `""` | Bearer / `?token=`；空 = 无鉴权 |
 | `default_mode` | `"Rule"` | `Rule` / `Global` / `Direct` |
 
@@ -532,31 +615,44 @@ udp = {
   queue: { accepted, full, closed },
   firstSend: { failures },
   stagger: { attempts, winners, cancellations },
-  warm: { attempts, successes, failures }
+  warm: { attempts, successes, failures },
+  nfqueue: {
+    received, activeFlows, directAccepted, proxyCopied, proxyDropped,
+    block, cancel, drop, tokenMismatch, tokenExhaustion, verdictErrors,
+    receiptToVerdict: H
+  }
 }
 H = { count, sumNanos, buckets }  // buckets 有固定 64 个 log2 slot
 ```
 
 `queue` 是 endpoint driver 队列，与记录 slow-path admission 的
 `slowPermit` 不同。stagger counter 只用于 cold URLTest preparation。AnyTLS
-candidate 使用计入 pool cap 的 caller-owned provisional session slot；loser
-取消会关闭 detached work，winner 则在 endpoint publication 前提交到捕获的
-generation。warm 的 `successes` 只计 `Ready` 或 `AlreadyReady`；
-`NotApplicable` 保持中性。
+candidate 使用计入 pool cap 的 caller-owned provisional session slot，QUIC
+candidate 使用 detached client。loser 取消会关闭对应 detached work；winner 在
+endpoint publication 前完成 promotion/arbitration。若普通流量已先填充 QUIC
+generation slot，则保留该 incumbent，winner transport 只为当前选中流持有自己的
+connection。warm 的 `successes` 只计 `Ready`；`NotApplicable` 保持中性。
+
+`nfqueue.received` 统计 listener 投递；`activeFlows` 是当前 pending correlator gauge。
+`directAccepted`、`proxyDropped`、`block`、`cancel` 和 `drop` 统计成功的内核 verdict；
+`proxyCopied` 统计把唯一 payload 所有权转交给规范初始化器的次数。
+`tokenMismatch`、`tokenExhaustion` 和 `verdictErrors` 暴露 fail-closed 故障。
+`receiptToVerdict` 测量 listener 收包到成功 verdict 的时间；NFQA timestamp 不保证存在，
+因此它不表示内核队列驻留时间。
 
 `/stats` 另有顶层 `warm` 对象，为即时 gauge：
 
 ```text
 warm = {
-  nodes: { preconnect, health, udp, traffic },
+  nodes: { preconnect, health, udp, selector, traffic },
   sessions: { anytls, tuic, juicity, hysteria2 }
 }
 ```
 
-`nodes` 按热资源建立的原因统计当前热节点（一个节点可同时计入多个原因；
-无记录原因的热节点计为 `traffic`）。`sessions` 按协议统计驻留的 AnyTLS
-池 session 与已占用的 QUIC client 槽。gauge 跟随当前 generation：资源
-排干后节点在下一个快照中消失。
+`nodes` 按保留热资源的原因统计当前热节点（一个节点可同时计入多个原因；
+无记录原因的热节点计为 `traffic`）；`selector` 表示始终启用的 Selector
+当前叶节点常驻。`sessions` 按协议统计驻留的 AnyTLS 池 session 与已占用的
+QUIC client 槽。gauge 跟随当前 generation：资源排干后节点在下一个快照中消失。
 
 环境变量：`HONK_UI_DOWNLOAD_URL` 覆盖 UI zip。
 
@@ -565,7 +661,7 @@ warm = {
 | 字段 | 默认值 | 含义 |
 | ------ | -------- | ------ |
 | `enabled` | `false` | 持久化 SQLite 缓存 |
-| `path` | `"cache.db"` | 数据库路径 |
+| `path` | `"cache.db"` | 数据库路径；相对路径优先使用 `global.data_dir`，再使用原配置目录下已有路径 |
 | `cache_id` | `""` | 命名空间 id |
 | `store_fakeip` | `false` | FakeIP 持久化意图（引擎未完成） |
 | `store_dns` | `false` | 持久化 DNS 应答 |

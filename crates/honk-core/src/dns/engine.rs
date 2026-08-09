@@ -9,11 +9,40 @@ use super::planner::{
     ResponseTraversal, UpstreamTag,
 };
 use super::policy::PolicyId;
-use super::query::{DnsName, IngressProfile, QueryContext, QueryError};
+use super::query::{IngressProfile, QueryContext, QueryError};
 use super::response::{ResponseError, ResponseTemplate};
 use super::routing::DnsRouter;
 
-mod metadata;
+mod metadata {
+    use std::time::Duration;
+
+    use crate::dns::outcome::{EffectiveExpiry, ResponseClass};
+
+    pub(crate) fn classify_response(wire: &[u8]) -> ResponseClass {
+        let rcode = wire.get(3).copied().unwrap_or_default() & 0x0f;
+        match rcode {
+            2 => ResponseClass::Servfail,
+            3 => ResponseClass::Nxdomain,
+            _ if wire.get(6..8) == Some(&[0, 0]) => ResponseClass::Nodata,
+            _ => ResponseClass::Positive,
+        }
+    }
+
+    pub(crate) fn effective_expiry(
+        fixed_ttl: Option<u32>,
+        configured_ttl: u32,
+        answer_ttl: u32,
+    ) -> EffectiveExpiry {
+        match fixed_ttl {
+            Some(0) => EffectiveExpiry::do_not_cache(),
+            Some(ttl) => EffectiveExpiry::cacheable(Duration::from_secs(u64::from(ttl))),
+            None if configured_ttl > 0 => {
+                EffectiveExpiry::cacheable(Duration::from_secs(u64::from(configured_ttl)))
+            }
+            None => EffectiveExpiry::cacheable(Duration::from_secs(u64::from(answer_ttl.max(1)))),
+        }
+    }
+}
 pub(crate) mod pipeline;
 
 pub(crate) use metadata::{classify_response, effective_expiry};
@@ -94,8 +123,15 @@ impl DnsEngine {
         compatibility: bool,
     ) -> Result<PreparedQuery, EngineError> {
         let query = QueryContext::parse_with_profile(raw_query, ingress)?;
-        let domain: Arc<str> =
-            decode_name(query.qname().ok_or(EngineError::MissingQuestion)?)?.into();
+        if query.questions().len() > 1 {
+            return Err(EngineError::MultipleQuestions);
+        }
+        let domain: Arc<str> = query
+            .qname()
+            .ok_or(EngineError::MissingQuestion)?
+            .to_domain_name()
+            .ok_or(EngineError::MalformedCanonicalName)?
+            .into();
         let qtype = query.qtype().ok_or(EngineError::MissingQuestion)?.get();
         let context = RequestContext {
             domain: &domain,
@@ -224,38 +260,14 @@ impl PreparedQuery {
     }
 }
 
-fn decode_name(name: &DnsName) -> Result<String, EngineError> {
-    let mut labels = Vec::new();
-    let mut cursor = 0;
-    while let Some(&length) = name.as_wire().get(cursor) {
-        if length == 0 {
-            break;
-        }
-        cursor += 1;
-        let end = cursor + usize::from(length);
-        let label = name
-            .as_wire()
-            .get(cursor..end)
-            .ok_or(EngineError::MalformedCanonicalName)?;
-        labels.push(
-            std::str::from_utf8(label)
-                .map_err(|_| EngineError::MalformedCanonicalName)?
-                .to_ascii_lowercase(),
-        );
-        cursor = end;
-    }
-    if labels.is_empty() {
-        return Err(EngineError::MalformedCanonicalName);
-    }
-    Ok(labels.join("."))
-}
-
 #[derive(Debug, Error)]
 pub enum EngineError {
     #[error("DNS query parse failed: {0}")]
     Query(#[from] QueryError),
     #[error("DNS request has no question")]
     MissingQuestion,
+    #[error("DNS requests with multiple questions are unsupported")]
+    MultipleQuestions,
     #[error("DNS canonical question name is malformed")]
     MalformedCanonicalName,
     #[error("DNS planning failed: {0}")]

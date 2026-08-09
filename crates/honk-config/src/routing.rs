@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// skb mark bits reserved for datapath classification and pending decisions.
+pub const DATAPATH_RESERVED_MARK_MASK: u32 = 0xc000_0000;
+
 /// A routing rule that matches traffic and sends it to an outbound.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingRule {
