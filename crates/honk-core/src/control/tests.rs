@@ -1312,6 +1312,10 @@ enum UdpTestMode {
         sends: Arc<std::sync::atomic::AtomicUsize>,
     },
     Success,
+    TcpHold {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    },
     Hold {
         entered: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
@@ -1397,13 +1401,23 @@ impl honk_outbound::proxy::TcpOutbound for UdpTestHandler {
     async fn dial(
         &self,
         _node: &Node,
-        _target: SocketAddr,
-        _target_domain: Option<&str>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
         _connect_timeout: Duration,
     ) -> anyhow::Result<honk_outbound::proxy::ProxyStream> {
-        Err(anyhow::anyhow!(
-            "TCP dial is not used by the UDP lifecycle tests"
-        ))
+        let UdpTestMode::TcpHold { entered, release } = &self.mode else {
+            return Err(anyhow::anyhow!(
+                "TCP dial is not used by the UDP lifecycle tests"
+            ));
+        };
+        entered.notify_one();
+        release.notified().await;
+        let stream = TcpStream::connect(target).await?;
+        Ok(honk_outbound::proxy::ProxyStream {
+            stream: Box::new(stream),
+            target_addr: target,
+            target_domain: target_domain.map(str::to_owned),
+        })
     }
 }
 
@@ -1645,6 +1659,217 @@ async fn tcp_idle_relay_survives_conn_state_sweep() -> anyhow::Result<()> {
             .redirect_track_lookup(&redirect_key)?
             .is_none()
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn tcp_tracker_keeps_the_dial_selection_snapshot() -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut hk = Node {
+        name: "hk-140".into(),
+        protocol: honk_config::types::NodeProtocol::Socks5,
+        address: "127.0.0.1".into(),
+        port: 140,
+        ..Default::default()
+    };
+    hk.id = hk.derive_id();
+    let mut us = Node {
+        name: "us-163".into(),
+        protocol: honk_config::types::NodeProtocol::Socks5,
+        address: "127.0.0.1".into(),
+        port: 163,
+        ..Default::default()
+    };
+    us.id = us.derive_id();
+    let mut config = udp_test_config(
+        "devops",
+        vec![hk.clone(), us.clone()],
+        vec![Group {
+            name: "devops".into(),
+            policy: honk_config::group::GroupPolicy::Selector,
+            nodes: vec![hk.id, us.id],
+            default: Some(hk.name.clone()),
+            ..Default::default()
+        }],
+    );
+    config.ensure_builtin_nodes();
+    config.global.dial_mode = "ip".into();
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let handle = udp_test_handle(
+        config,
+        UdpTestMode::TcpHold {
+            entered: entered.clone(),
+            release: release.clone(),
+        },
+        1,
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let original_dst = listener.local_addr()?;
+    let mut client = TcpStream::connect(original_dst).await?;
+    let (accepted, client_addr) = listener.accept().await?;
+    let tuples = build_tuples_key(
+        original_dst.ip(),
+        original_dst.port(),
+        client_addr.ip(),
+        client_addr.port(),
+        6,
+    );
+    handle.ebpf.write().await.tcp_conn_state_store(
+        &tuples,
+        &honk_ebpf_common::conn::ConnState {
+            state: honk_ebpf_common::conn::TcpState::TcpStateActive as u8,
+            last_seen_ns: 1,
+            ..Default::default()
+        },
+    )?;
+    let task_handle = handle.clone();
+    let mut task =
+        tokio::spawn(async move { task_handle.serve_connection(accepted, client_addr).await });
+
+    tokio::select! {
+        _ = entered.notified() => {}
+        result = &mut task => panic!("TCP handler exited before dial: {result:?}"),
+        _ = tokio::time::sleep(Duration::from_secs(5)) => {
+            panic!("TCP dial did not reach the injected handler")
+        }
+    }
+    assert_eq!(
+        handle.group_manager.read().selection_chain("devops"),
+        vec!["devops", "hk-140"]
+    );
+    handle
+        .group_manager
+        .read()
+        .set_selector_choice("devops", "us-163");
+    assert_eq!(
+        handle.group_manager.read().selection_chain("devops"),
+        vec!["devops", "us-163"]
+    );
+
+    release.notify_one();
+    let (mut upstream, _) =
+        tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
+    let tracked = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(entry) = handle.connection_tracker.snapshot().into_iter().next() {
+                break entry;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert_eq!(tracked.proxy, "hk-140");
+    assert_eq!(tracked.chains, vec!["hk-140", "devops"]);
+
+    client.shutdown().await?;
+    upstream.shutdown().await?;
+    drop(client);
+    drop(upstream);
+    tokio::time::timeout(Duration::from_secs(5), task).await???;
+    Ok(())
+}
+
+#[tokio::test]
+async fn udp_tracker_uses_the_udp_selection_snapshot() -> anyhow::Result<()> {
+    let mut tcp_node = Node {
+        name: "tcp-node".into(),
+        protocol: honk_config::types::NodeProtocol::Socks5,
+        address: "127.0.0.1".into(),
+        port: 140,
+        ..Default::default()
+    };
+    tcp_node.id = tcp_node.derive_id();
+    let mut udp_node = Node {
+        name: "udp-node".into(),
+        protocol: honk_config::types::NodeProtocol::Socks5,
+        address: "127.0.0.1".into(),
+        port: 163,
+        ..Default::default()
+    };
+    udp_node.id = udp_node.derive_id();
+    let config = udp_test_config(
+        "traffic",
+        vec![tcp_node.clone(), udp_node.clone()],
+        vec![Group {
+            name: "traffic".into(),
+            policy: honk_config::group::GroupPolicy::URLTest,
+            nodes: vec![tcp_node.id, udp_node.id],
+            ..Default::default()
+        }],
+    );
+    let handle = udp_test_handle(config, UdpTestMode::Success, 1);
+    handle.alive_set.record_probe_latency(
+        tcp_node.id,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(10),
+    );
+    handle.alive_set.record_probe_latency(
+        udp_node.id,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(100),
+    );
+    handle.alive_set.record_probe_latency(
+        tcp_node.id,
+        ProbeDomain::DataUdp,
+        IpVersion::V4,
+        Duration::from_millis(100),
+    );
+    handle.alive_set.record_probe_latency(
+        udp_node.id,
+        ProbeDomain::DataUdp,
+        IpVersion::V4,
+        Duration::from_millis(10),
+    );
+    assert_eq!(
+        handle
+            .group_manager
+            .read()
+            .select_node_for_domain("traffic", ProbeDomain::Tcp, IpVersion::V4)
+            .expect("TCP selection")
+            .name,
+        "tcp-node"
+    );
+    assert_eq!(
+        handle
+            .group_manager
+            .read()
+            .select_node_for_domain("traffic", ProbeDomain::DataUdp, IpVersion::V4)
+            .expect("UDP selection")
+            .name,
+        "udp-node"
+    );
+    assert_eq!(
+        handle
+            .group_manager
+            .read()
+            .selection_chain_for_network("traffic", crate::group::SelectionNetwork::Tcp),
+        vec!["traffic", "tcp-node"]
+    );
+    assert_eq!(
+        handle
+            .group_manager
+            .read()
+            .selection_chain_for_network("traffic", crate::group::SelectionNetwork::Udp),
+        vec!["traffic", "udp-node"]
+    );
+
+    serve_test_udp(&handle).await?;
+    let tracked = handle
+        .connection_tracker
+        .snapshot()
+        .into_iter()
+        .next()
+        .expect("ready UDP endpoint must be tracked");
+    assert_eq!(tracked.proxy, "udp-node");
+    assert_eq!(tracked.chains, vec!["udp-node", "traffic"]);
+    handle
+        .udp_pool
+        .remove(addr("10.0.0.2:53000"), addr("203.0.113.2:443"));
     Ok(())
 }
 

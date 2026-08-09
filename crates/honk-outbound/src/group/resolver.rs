@@ -198,17 +198,23 @@ impl GroupManager {
         result
     }
 
-    /// The selection chain from a group down to the leaf its current
-    /// selections resolve to: `[group, ..sub-group tags.., leaf node]`.
-    ///
-    /// Each step uses the group's current selection for its policy
-    /// (Selector: runtime choice → `default` → first member tag; URLTest:
-    /// cached TCP selection; Fallback: pinned tag). The chain stops at the
-    /// first group without a formed selection (a URLTest group before any
-    /// measurement, or LoadBalance which has no stable pick to report).
-    /// Intended for debugging/introspection — the clash `now` field keeps
-    /// showing the immediate member tag.
+    /// The current TCP selection chain from a group down to its leaf.
     pub fn selection_chain(&self, group_name: &str) -> Vec<String> {
+        self.selection_chain_for_network(group_name, SelectionNetwork::Tcp)
+    }
+
+    /// The current selection chain for one network: `[group, ..sub-groups, leaf]`.
+    ///
+    /// The chain stops at the first group without a formed selection (a
+    /// URLTest group before any measurement, or LoadBalance, which has no
+    /// stable pick). Callers that dial must snapshot this together with the
+    /// selection plan; reading it again after an await can combine a newer
+    /// group choice with an older physical connection.
+    pub fn selection_chain_for_network(
+        &self,
+        group_name: &str,
+        network: SelectionNetwork,
+    ) -> Vec<String> {
         let mut chain = vec![group_name.to_string()];
         let mut current = group_name.to_string();
         for _ in 0..MAX_GROUP_DEPTH {
@@ -223,14 +229,17 @@ impl GroupManager {
                     .cloned()
                     .or_else(|| group.default.clone())
                     .or_else(|| self.member_tags(group).first().map(|s| s.to_string())),
-                GroupPolicy::URLTest => self.get_urltest_selection(&group.name),
-                GroupPolicy::Fallback => self.get_fallback_selection(&group.name),
-                // Round-robin has no stable selection to report.
+                GroupPolicy::URLTest => {
+                    self.get_urltest_selection_for_network(&group.name, network)
+                }
+                GroupPolicy::Fallback => {
+                    self.get_fallback_selection_for_network(&group.name, network)
+                }
                 GroupPolicy::LoadBalance => None,
             };
             let Some(tag) = next else { break };
             if tag == current || chain.contains(&tag) {
-                break; // cycle guard
+                break;
             }
             chain.push(tag.clone());
             current = tag;
