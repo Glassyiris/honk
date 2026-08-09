@@ -1121,13 +1121,13 @@ fn spawn_connection_sampler(
 
 async fn delete_connections(State(s): State<Arc<ClashState>>) -> StatusCode {
     for snap in s.connection_tracker.snapshot() {
-        s.connection_tracker.close_connection(&snap.id);
+        s.connection_tracker.remove(&snap.id);
     }
     StatusCode::NO_CONTENT
 }
 
 async fn delete_connection(State(s): State<Arc<ClashState>>, Path(id): Path<String>) -> StatusCode {
-    s.connection_tracker.close_connection(&id);
+    s.connection_tracker.remove(&id);
     StatusCode::NO_CONTENT
 }
 

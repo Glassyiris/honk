@@ -235,7 +235,6 @@ const SHUTDOWN_STAGE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub mod commands {
     use honk_config::{Config, node::Node};
-    use tokio::sync::mpsc;
 
     #[derive(Debug)]
     #[allow(clippy::large_enum_variant)]
@@ -257,7 +256,6 @@ pub mod commands {
         /// backoff after a link, address, route, or interface-role change.
         NetworkChanged,
         Shutdown,
-        GetStats(mpsc::Sender<super::StatsSnapshot>),
     }
 }
 
@@ -267,12 +265,6 @@ use probers::*;
 use reload::*;
 pub(crate) use resource_budget::{MAX_EFFECTIVE_NOFILE, ResourceBudget};
 use sockets::*;
-
-#[derive(Debug, Clone)]
-pub struct StatsSnapshot {
-    pub per_outbound: std::collections::HashMap<String, OutboundStats>,
-    pub total_connections: u64,
-}
 
 /// The main control plane.
 pub struct ControlPlane {
@@ -1788,11 +1780,6 @@ impl ControlPlane {
                                 }
                             }
                             self.alive_set.notify_network_change();
-                        }
-                        Some(ControlCommand::GetStats(tx)) => {
-                            let snap = self.stats.snapshot();
-                            let total = snap.values().map(|s| s.total_conns as u64).sum();
-                            let _ = tx.send(StatsSnapshot { per_outbound: snap, total_connections: total }).await;
                         }
                         Some(ControlCommand::Shutdown) | None => break,
                     }

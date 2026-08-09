@@ -1,4 +1,3 @@
-mod section_parser;
 #[cfg(test)]
 mod tests;
 
@@ -14,7 +13,11 @@ use crate::node::Node;
 use crate::routing::RoutingConfig;
 use crate::subscription::Subscription;
 use regex::Regex;
-use section_parser::Section;
+#[derive(Debug, Clone)]
+struct Section {
+    name: String,
+    body: String,
+}
 
 /// Load a dae configuration file, resolving its top-level `include` blocks.
 ///

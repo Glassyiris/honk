@@ -1346,7 +1346,7 @@ pub(super) fn install_interrupt_callback(
         let mut closed = 0usize;
         for snap in tracker.snapshot() {
             if targets.contains(&snap.proxy) {
-                tracker.close_connection(&snap.id);
+                tracker.remove(&snap.id);
                 closed += 1;
             }
         }

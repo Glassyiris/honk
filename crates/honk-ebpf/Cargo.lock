@@ -281,7 +281,6 @@ name = "honk-ebpf-common"
 version = "0.0.1-alpha"
 dependencies = [
  "aya",
- "aya-ebpf",
  "aya-ebpf-bindings",
  "network-types",
 ]

@@ -354,19 +354,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aya-ebpf"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eace5970943931fea46a8cbdca208a8f6a9e0413d85a5a6c4e168f0b909570bc"
-dependencies = [
- "aya-build",
- "aya-ebpf-bindings",
- "aya-ebpf-cty",
- "aya-ebpf-macros",
- "rustversion",
-]
-
-[[package]]
 name = "aya-ebpf-bindings"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -383,18 +370,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0884264bc8a51a49fed03df8feada3a21d703cf501dae33c28bdba5d2313ef33"
 dependencies = [
  "aya-build",
-]
-
-[[package]]
-name = "aya-ebpf-macros"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23e3a7f86e914df106dd00f9d757bc93f7d5c93380c51eead23d8d2ccd15a87a"
-dependencies = [
- "proc-macro2",
- "proc-macro2-diagnostics",
- "quote",
- "syn 2.0.119",
 ]
 
 [[package]]
@@ -1495,7 +1470,6 @@ dependencies = [
 name = "honk-config"
 version = "0.0.1-alpha"
 dependencies = [
- "anyhow",
  "base64 0.23.0",
  "chrono",
  "glob",
@@ -1524,9 +1498,7 @@ dependencies = [
  "aya-log",
  "aya-obj",
  "base64 0.23.0",
- "boring",
  "bytes",
- "chacha20poly1305",
  "chrono",
  "clap",
  "criterion",
@@ -1546,9 +1518,7 @@ dependencies = [
  "libc",
  "libmimalloc-sys",
  "libsystemd",
- "log",
  "lru",
- "md-5",
  "mimalloc",
  "nix 0.31.3",
  "parking_lot",
@@ -1564,22 +1534,18 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "sha1 0.11.0",
  "sha2 0.11.0",
  "socket2",
  "stats_alloc",
  "tempfile",
  "thiserror",
  "tokio",
- "tokio-boring",
  "tokio-rustls",
- "tokio-test",
  "tokio-tungstenite 0.30.0",
  "toml",
  "tower-http 0.7.0",
  "tracing",
  "tracing-subscriber",
- "url",
  "uuid",
  "webpki-roots",
  "zip",
@@ -1590,7 +1556,6 @@ name = "honk-ebpf-common"
 version = "0.0.1-alpha"
 dependencies = [
  "aya",
- "aya-ebpf",
  "aya-ebpf-bindings",
  "network-types",
 ]
@@ -1640,7 +1605,6 @@ dependencies = [
  "rand 0.10.2",
  "rcgen",
  "rustls-pemfile",
- "serde",
  "sha1 0.11.0",
  "sha2 0.11.0",
  "sha3",
@@ -1670,7 +1634,6 @@ dependencies = [
  "libc",
  "tempfile",
  "tokio",
- "tracing",
  "tracing-subscriber",
  "url",
  "uuid",
@@ -2595,18 +2558,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "proc-macro2-diagnostics"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af066a9c399a26e020ada66a034357a868728e72cd426f3adcd35f80d88d88c8"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
- "version_check",
 ]
 
 [[package]]
@@ -3546,28 +3497,6 @@ checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
 dependencies = [
  "rustls",
  "tokio",
-]
-
-[[package]]
-name = "tokio-stream"
-version = "0.1.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32da49809aab5c3bc678af03902d4ccddea2a87d028d86392a4b1560c6906c70"
-dependencies = [
- "futures-core",
- "pin-project-lite",
- "tokio",
-]
-
-[[package]]
-name = "tokio-test"
-version = "0.4.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f6d24790a10a7af737693a3e8f1d03faef7e6ca0cc99aae5066f533766de545"
-dependencies = [
- "futures-core",
- "tokio",
- "tokio-stream",
 ]
 
 [[package]]

@@ -26,9 +26,6 @@ use honk_ebpf_common::{
 };
 use network_types::tcp::TcpHdr;
 
-/// Type alias so callers can refer to [`ConnState`] through the contrack module.
-pub type ConnStateAlias = ConnState;
-
 /// Lazy-timestamp update interval: only bump `last_seen_ns` when > 1 s elapsed.
 pub const UDP_CONN_STATE_UPDATE_INTERVAL_NS: u64 = 1_000_000_000;
 
