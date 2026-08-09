@@ -50,6 +50,12 @@ use crate::session::{ManagedSession as _, SpeculativeCheckout};
 /// pseudo-target inside the AnyTLS session.
 const UOT_MAGIC: &str = "sp.v2.udp-over-tcp.arpa";
 
+fn encode_uot_connect_request(target: SocketAddr, target_domain: Option<&str>) -> bytes::Bytes {
+    let mut request = vec![1u8];
+    request.extend(addr::encode_address(target, target_domain));
+    bytes::Bytes::from(request)
+}
+
 /// UoT v1 packet address types (sing uot v1 / non-connect form).
 const UOT_V1_ATYP_V4: u8 = 0x00;
 const UOT_V1_ATYP_V6: u8 = 0x01;
@@ -123,16 +129,13 @@ type BoxedWriter = Box<dyn AsyncWrite + Send + Unpin>;
 #[derive(Debug, Default, Clone)]
 pub struct AnyTlsHandler;
 
-/// Pool configuration for one AnyTLS node. The session's 128-permit
-/// semaphore is the capacity truth; the pool adds a two-session hard cap and
-/// least-loaded scheduling. Shared by generation-owned and ephemeral pools.
+/// Pool configuration shared by generation-owned and ephemeral AnyTLS runtimes.
 pub(crate) fn session_pool_config() -> crate::session::SessionPoolConfig {
     crate::session::SessionPoolConfig {
-        // v3.1 sizing: two sessions per node, 128 streams each (initial
-        // values, tune by load test). The per-session semaphore is the
-        // capacity truth; this cap only steers least-loaded scheduling.
+        // Bound sing-anytls's exclusive active-stream checkout to two sessions.
         max_sessions: 2,
         max_streams_per_session: MAX_STREAMS_PER_SESSION,
+        spread_sessions: true,
         janitor_interval: Duration::from_secs(DEFAULT_IDLE_CHECK_INTERVAL_SECS),
         // Sessions rotate out after ~30 min (jittered ±10% per session,
         // so a batch of same-age sessions never reconnects in lockstep).
@@ -534,10 +537,9 @@ impl StreamSink {
 
 /// Ownership token for one registered stream id: the session's active
 /// count moves exactly once in each direction through this token, and a
-/// registration abandoned mid-handshake is cleaned up on Drop. Commit
-/// boundaries: TCP streams commit when the SYN+PSH opening pair is
-/// written; UoT streams commit only after the UoT request is fully
-/// written and the transport is constructed.
+/// registration abandoned mid-open is cleaned up on Drop. TCP streams commit
+/// after their SYN+PSH opening pair is queued; a UoT transport owns its lazy
+/// connect request from commit until the first datagram is queued.
 struct StreamRegistration {
     session: Arc<AnyTlsSession>,
     sid: u32,
@@ -901,16 +903,26 @@ impl AnyTlsSession {
     }
 
     /// Enqueue one frame and wait until the session writer flushes its batch.
-    /// Used only for endpoint setup and the first datagram, where an enqueue
-    /// acknowledgement would turn writer loss into a false successful send.
+    /// Used where an enqueue acknowledgement would turn writer loss into a
+    /// false successful send.
     async fn enqueue_confirmed_data(&self, sid: u32, payload: bytes::Bytes) -> std::io::Result<()> {
+        let permit = self.acquire_data_permit().await?;
+        let completed = self.enqueue_confirmed_data_with_permit(sid, payload, permit)?;
+        Self::wait_for_confirmed_data(completed).await
+    }
+
+    fn enqueue_confirmed_data_with_permit(
+        &self,
+        sid: u32,
+        payload: bytes::Bytes,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> std::io::Result<tokio::sync::oneshot::Receiver<bool>> {
         if self.is_closed() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::ConnectionAborted,
                 "AnyTLS session is closed",
             ));
         }
-        let permit = self.acquire_data_permit().await?;
         let (completion, completed) = tokio::sync::oneshot::channel();
         {
             let mut queue = self.writer_q.queue.lock();
@@ -928,6 +940,12 @@ impl AnyTlsSession {
             });
         }
         self.writer_q.notify.notify_one();
+        Ok(completed)
+    }
+
+    async fn wait_for_confirmed_data(
+        completed: tokio::sync::oneshot::Receiver<bool>,
+    ) -> std::io::Result<()> {
         match completed.await {
             Ok(true) => Ok(()),
             Ok(false) | Err(_) => Err(std::io::Error::new(
@@ -1065,10 +1083,8 @@ impl AnyTlsSession {
     /// Saturation retires this sid instead of blocking sibling streams or
     /// silently corrupting the UoT byte stream.
     ///
-    /// The returned guard is **uncommitted**: the caller must drive the
-    /// UoT request write and then [`StreamRegistration::commit`] —
-    /// abandoning the stream in between cleans up the sid and releases
-    /// the slot.
+    /// The returned guard is uncommitted. Once committed, the transport owns
+    /// the lazy UoT connect request and folds it into its first datagram.
     async fn open_uot_stream(
         self: &Arc<Self>,
         target_addr: Vec<u8>,
@@ -1090,12 +1106,6 @@ impl AnyTlsSession {
                 "AnyTLS UoT stream is no longer registered",
             ))
         }
-    }
-
-    /// Flush the mandatory request before publishing the UoT transport.
-    async fn write_uot_setup_frame(&self, sid: u32, data: &[u8]) -> std::io::Result<()> {
-        self.enqueue_confirmed_data(sid, bytes::Bytes::copy_from_slice(data))
-            .await
     }
 
     /// Open a TCP stream with the direct data path (no stream task, no
@@ -1824,7 +1834,6 @@ impl AnyTlsHandler {
         pool: Arc<AnyTlsPool>,
         target: SocketAddr,
         target_domain: Option<&str>,
-        connect_timeout: Duration,
         dial: F,
     ) -> anyhow::Result<PreparedUdpTransport>
     where
@@ -1836,7 +1845,6 @@ impl AnyTlsHandler {
             pool,
             target,
             target_domain,
-            connect_timeout,
             None,
             dial,
         )
@@ -1851,7 +1859,6 @@ impl AnyTlsHandler {
         pool: Arc<AnyTlsPool>,
         target: SocketAddr,
         target_domain: Option<&str>,
-        connect_timeout: Duration,
         runtime: Option<Arc<crate::runtime::NodeRuntime>>,
         dial: F,
     ) -> anyhow::Result<PreparedUdpTransport>
@@ -1884,26 +1891,13 @@ impl AnyTlsHandler {
             }
         };
 
-        let (sid, rx, mut guard) = session.open_uot_stream(magic, permit).await?;
-        let mut request = vec![1u8];
-        request.extend(addr::encode_address(target, target_domain));
-        guard.frame_started = true;
-        let request_written = tokio::time::timeout(
-            connect_timeout,
-            session.write_uot_setup_frame(sid, &request),
-        )
-        .await;
-        match request_written {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => return Err(error.into()),
-            Err(elapsed) => return Err(elapsed.into()),
-        }
-        guard.frame_started = false;
+        let (sid, rx, guard) = session.open_uot_stream(magic, permit).await?;
         let permit = guard.commit();
         let transport: Arc<dyn PacketTransport> = Arc::new(AnyTlsUotTransport {
             session,
             sid,
             receive: tokio::sync::Mutex::new(UotReceiveState::new(rx)),
+            setup: tokio::sync::Mutex::new(Some(encode_uot_connect_request(target, target_domain))),
             target,
             target_domain: target_domain.map(str::to_string),
             _permit: permit,
@@ -1951,7 +1945,7 @@ impl AnyTlsHandler {
         }
         let dial_node = Arc::clone(&node);
         let dial_addr = addr.clone();
-        let (session, sid, rx, mut guard) = pool
+        let (session, sid, rx, guard) = pool
             .open_with(
                 move || {
                     let node = Arc::clone(&dial_node);
@@ -1981,26 +1975,13 @@ impl AnyTlsHandler {
             )
             .await?;
 
-        let mut request = vec![1u8];
-        request.extend(addr::encode_address(target, target_domain));
-        guard.frame_started = true;
-        let request_written = tokio::time::timeout(
-            connect_timeout,
-            session.write_uot_setup_frame(sid, &request),
-        )
-        .await;
-        match request_written {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => return Err(error.into()),
-            Err(elapsed) => return Err(elapsed.into()),
-        }
-        guard.frame_started = false;
         let permit = guard.commit();
 
         Ok(Arc::new(AnyTlsUotTransport {
             session,
             sid,
             receive: tokio::sync::Mutex::new(UotReceiveState::new(rx)),
+            setup: tokio::sync::Mutex::new(Some(encode_uot_connect_request(target, target_domain))),
             target,
             target_domain: target_domain.map(str::to_string),
             _permit: permit,
@@ -2431,7 +2412,6 @@ impl PacketOutbound for AnyTlsHandler {
             pool,
             target,
             target_domain,
-            connect_timeout,
             Some(runtime),
             move || async move {
                 let tls_connector = dial_runtime.anytls_tls_connector()?;
@@ -2451,15 +2431,16 @@ impl PacketOutbound for AnyTlsHandler {
 #[async_trait]
 impl ProbeableOutbound for AnyTlsHandler {}
 
-/// Framed UoT transport over a multiplexed AnyTLS stream. Inbound bytes come
-/// straight from the session demux through a bounded queue; saturation
-/// retires the sid rather than losing part of the UoT byte stream. Outbound
-/// frames go directly to the session writer. No stream task, duplex, or
-/// drain task sits between the session and the flow's reply handler.
+/// Framed UoT transport over a multiplexed AnyTLS stream. The connect request
+/// and first datagram share one PSH; later datagrams go straight to the session
+/// writer. Inbound bytes arrive directly from the demux through a bounded queue;
+/// saturation retires the sid rather than corrupting the UoT byte stream.
 struct AnyTlsUotTransport {
     session: Arc<AnyTlsSession>,
     sid: u32,
     receive: tokio::sync::Mutex<UotReceiveState>,
+    /// UoT v2 connect request, atomically consumed when its first datagram is queued.
+    setup: tokio::sync::Mutex<Option<bytes::Bytes>>,
     target: SocketAddr,
     target_domain: Option<String>,
     /// Stream-slot capacity, held for the transport's life.
@@ -2630,18 +2611,83 @@ impl std::fmt::Debug for AnyTlsUotTransport {
 }
 
 impl AnyTlsUotTransport {
-    fn encode_packet(data: &[u8]) -> std::io::Result<bytes::Bytes> {
+    fn validate_packet_len(data: &[u8]) -> std::io::Result<()> {
         if data.len() > u16::MAX as usize - 2 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "uot datagram exceeds AnyTLS frame capacity",
             ));
         }
+        Ok(())
+    }
+
+    fn encode_packet(data: &[u8]) -> std::io::Result<bytes::Bytes> {
+        Self::validate_packet_len(data)?;
         let mut frame = bytes::BytesMut::with_capacity(2 + data.len());
         use bytes::BufMut as _;
         frame.put_u16(data.len() as u16);
         frame.extend_from_slice(data);
         Ok(frame.freeze())
+    }
+
+    async fn send_packet_inner(&self, data: &[u8], confirmed: bool) -> std::io::Result<()> {
+        self.session.ensure_stream_registered(self.sid)?;
+        Self::validate_packet_len(data)?;
+        let mut setup = self.setup.lock().await;
+        let Some(request) = setup.as_ref() else {
+            drop(setup);
+            let packet = Self::encode_packet(data)?;
+            return if confirmed {
+                self.session
+                    .write_uot_datagram_confirmed(self.sid, packet)
+                    .await
+            } else {
+                self.session.write_uot_datagram(self.sid, packet).await
+            };
+        };
+
+        let permit = self.session.acquire_data_permit().await?;
+        self.session.ensure_stream_registered(self.sid)?;
+        let packet_len = 2 + data.len();
+        if request.len() + packet_len <= u16::MAX as usize {
+            use bytes::BufMut as _;
+            let mut payload = bytes::BytesMut::with_capacity(request.len() + packet_len);
+            payload.extend_from_slice(request);
+            payload.put_u16(data.len() as u16);
+            payload.extend_from_slice(data);
+            if confirmed {
+                let completed = self.session.enqueue_confirmed_data_with_permit(
+                    self.sid,
+                    payload.freeze(),
+                    permit,
+                )?;
+                setup.take();
+                drop(setup);
+                AnyTlsSession::wait_for_confirmed_data(completed).await
+            } else {
+                self.session
+                    .enqueue_data_with_permit(self.sid, payload.freeze(), permit)?;
+                setup.take();
+                Ok(())
+            }
+        } else {
+            let completed = self.session.enqueue_confirmed_data_with_permit(
+                self.sid,
+                request.clone(),
+                permit,
+            )?;
+            setup.take();
+            drop(setup);
+            AnyTlsSession::wait_for_confirmed_data(completed).await?;
+            let packet = Self::encode_packet(data)?;
+            if confirmed {
+                self.session
+                    .write_uot_datagram_confirmed(self.sid, packet)
+                    .await
+            } else {
+                self.session.write_uot_datagram(self.sid, packet).await
+            }
+        }
     }
 }
 
@@ -2652,15 +2698,11 @@ impl PacketTransport for AnyTlsUotTransport {
     }
 
     async fn send_packet(&self, data: &[u8]) -> std::io::Result<()> {
-        self.session
-            .write_uot_datagram(self.sid, Self::encode_packet(data)?)
-            .await
+        self.send_packet_inner(data, false).await
     }
 
     async fn send_packet_confirmed(&self, data: &[u8]) -> std::io::Result<()> {
-        self.session
-            .write_uot_datagram_confirmed(self.sid, Self::encode_packet(data)?)
-            .await
+        self.send_packet_inner(data, true).await
     }
 
     async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
@@ -3424,7 +3466,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uot_setup_waits_for_writer_capacity_and_cancellation_does_not_enqueue() {
+    async fn uot_setup_fallback_waits_for_capacity_and_cancellation_does_not_enqueue() {
         let (session, mut server) = establish_test_session("uot-setup-capacity").await;
         expect_handshake(&mut server).await;
         let capacity = (WRITER_QUEUE_CAP - WRITER_CONTROL_RESERVED) as u32;
@@ -3433,13 +3475,13 @@ mod tests {
             .await
             .unwrap();
 
-        let setup = session.write_uot_setup_frame(7, b"setup");
+        let setup = session.enqueue_confirmed_data(7, bytes::Bytes::from_static(b"setup"));
         tokio::pin!(setup);
         assert!(
             tokio::time::timeout(Duration::from_millis(20), &mut setup)
                 .await
                 .is_err(),
-            "mandatory UoT setup must wait rather than report a dropped frame"
+            "oversized first datagrams must not drop their fallback setup"
         );
         drop(held);
         tokio::time::timeout(Duration::from_secs(1), setup)
@@ -3463,7 +3505,7 @@ mod tests {
         assert!(
             tokio::time::timeout(
                 Duration::from_millis(20),
-                session.write_uot_setup_frame(7, b"cancelled"),
+                session.enqueue_confirmed_data(7, bytes::Bytes::from_static(b"cancelled")),
             )
             .await
             .is_err()
@@ -4937,7 +4979,6 @@ mod tests {
                 Arc::clone(&pool),
                 "8.8.8.8:53".parse().unwrap(),
                 None,
-                Duration::from_secs(1),
                 || async { unreachable!("a shared checkout cannot dial") },
             )
             .await
@@ -4975,7 +5016,6 @@ mod tests {
                 Arc::clone(&pool),
                 "8.8.8.8:53".parse().unwrap(),
                 None,
-                Duration::from_secs(1),
                 {
                     let session = Arc::clone(&session);
                     move || async move { Ok(session) }
@@ -5013,7 +5053,6 @@ mod tests {
                 Arc::clone(&pool),
                 "8.8.8.8:53".parse().unwrap(),
                 None,
-                Duration::from_secs(1),
                 {
                     let session = Arc::clone(&session);
                     move || async move { Ok(session) }
@@ -5064,7 +5103,6 @@ mod tests {
                         pool,
                         "8.8.8.8:53".parse().unwrap(),
                         None,
-                        Duration::from_secs(1),
                         move || async move {
                             let _cancelled = CancelledDial(cancelled);
                             started.notify_one();
@@ -5128,7 +5166,6 @@ mod tests {
                         pool,
                         "8.8.8.8:53".parse().unwrap(),
                         None,
-                        Duration::from_secs(1),
                         move || async move {
                             let _cancelled = CancelledDial(cancelled);
                             started.notify_one();
@@ -5229,6 +5266,7 @@ mod uot_transport_tests {
                 session,
                 sid,
                 receive: tokio::sync::Mutex::new(UotReceiveState::new(rx)),
+                setup: tokio::sync::Mutex::new(Some(encode_uot_connect_request(target, None))),
                 target,
                 target_domain: None,
                 _permit: permit,
@@ -5237,19 +5275,28 @@ mod uot_transport_tests {
         )
     }
 
-    /// UoT v2 framing: send writes PSH(`u16 len + payload`) to the session;
-    /// an inbound PSH datagram is delivered by recv.
+    /// The UoT request and first datagram share one PSH; later datagrams carry
+    /// only their length-prefixed payload.
     #[tokio::test]
     async fn uot_transport_frame_roundtrip() {
         let target: SocketAddr = "93.184.216.34:53".parse().unwrap();
+        let request = encode_uot_connect_request(target, None);
         let (transport, mut server) = uot_test_transport(target).await;
 
         transport.send_packet(b"dns-packet").await.unwrap();
-        // The datagram PSH follows the consumed opening pair.
         let (cmd, sid, data) = read_frame(&mut server).await.unwrap();
         assert_eq!(cmd, CMD_PSH);
-        assert_eq!(data.len(), 2 + 10);
-        assert_eq!(&data[2..], b"dns-packet");
+        assert_eq!(&data[..request.len()], request.as_ref());
+        assert_eq!(
+            u16::from_be_bytes([data[request.len()], data[request.len() + 1]]),
+            10
+        );
+        assert_eq!(&data[request.len() + 2..], b"dns-packet");
+
+        transport.send_packet(b"next").await.unwrap();
+        let (cmd, next_sid, data) = read_frame(&mut server).await.unwrap();
+        assert_eq!((cmd, next_sid), (CMD_PSH, sid));
+        assert_eq!(data, [&4u16.to_be_bytes()[..], b"next"].concat());
 
         // server → client datagram frame
         let mut frame = Vec::new();
@@ -5267,6 +5314,7 @@ mod uot_transport_tests {
     #[tokio::test]
     async fn confirmed_uot_send_waits_for_physical_flush() {
         let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let request = encode_uot_connect_request(target, None);
         let (transport, mut server) = uot_test_transport_with_capacity(target, 64).await;
         let payload = vec![0x5a; 256];
         let send = transport.send_packet_confirmed(&payload);
@@ -5282,11 +5330,68 @@ mod uot_transport_tests {
         sent.unwrap();
         let (cmd, sid, data) = frame.unwrap();
         assert_eq!((cmd, sid), (CMD_PSH, transport.sid));
+        let packet = &data[request.len()..];
         assert_eq!(
-            u16::from_be_bytes([data[0], data[1]]) as usize,
+            u16::from_be_bytes([packet[0], packet[1]]) as usize,
             payload.len()
         );
-        assert_eq!(&data[2..], payload);
+        assert_eq!(&packet[2..], payload);
+    }
+
+    #[tokio::test]
+    async fn oversized_first_uot_datagram_uses_ordered_setup_fallback() {
+        let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let request = encode_uot_connect_request(target, None);
+        let (transport, mut server) = uot_test_transport(target).await;
+        let payload = vec![0x5a; u16::MAX as usize - 2];
+
+        transport.send_packet(&payload).await.unwrap();
+        let (cmd, sid, setup) = read_frame(&mut server).await.unwrap();
+        assert_eq!(
+            (cmd, sid, setup.as_slice()),
+            (CMD_PSH, transport.sid, request.as_ref())
+        );
+        let (cmd, sid, packet) = read_frame(&mut server).await.unwrap();
+        assert_eq!((cmd, sid), (CMD_PSH, transport.sid));
+        assert_eq!(
+            u16::from_be_bytes([packet[0], packet[1]]) as usize,
+            payload.len()
+        );
+        assert_eq!(&packet[2..], payload);
+    }
+
+    #[tokio::test]
+    async fn cancelled_first_uot_send_preserves_lazy_setup() {
+        let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let request = encode_uot_connect_request(target, None);
+        let (transport, mut server) = uot_test_transport(target).await;
+        let capacity = (WRITER_QUEUE_CAP - WRITER_CONTROL_RESERVED) as u32;
+        let held = Arc::clone(&transport.session.writer_q.data_permits)
+            .acquire_many_owned(capacity)
+            .await
+            .unwrap();
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                transport.send_packet_confirmed(b"cancelled"),
+            )
+            .await
+            .is_err()
+        );
+        drop(held);
+
+        transport.send_packet_confirmed(b"kept").await.unwrap();
+        let (cmd, sid, data) = read_frame(&mut server).await.unwrap();
+        assert_eq!((cmd, sid), (CMD_PSH, transport.sid));
+        assert_eq!(&data[..request.len()], request.as_ref());
+        assert_eq!(&data[request.len()..], b"\0\x04kept");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), read_frame(&mut server))
+                .await
+                .is_err(),
+            "the cancelled datagram must not be queued"
+        );
     }
 
     #[tokio::test(start_paused = true)]

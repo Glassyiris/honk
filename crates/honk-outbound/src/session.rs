@@ -4,8 +4,8 @@
 //!
 //! Pool invariants:
 //! - one node-owned pool with a hard session cap;
-//! - least-loaded scheduling over `Active` sessions (Draining ones take
-//!   no new channels);
+//! - optional idle-first spreading, then least-loaded scheduling over `Active`
+//!   sessions (Draining ones take no new channels);
 //! - **pool-owned dial single-flight**: the first caller to find no
 //!   in-flight dial registers it and the pool spawns the dial task — a
 //!   cancelled caller only ends its own wait, never the shared dial
@@ -45,6 +45,9 @@ pub struct SessionPoolConfig {
     /// Soft per-session stream cap: sessions at or above it are skipped
     /// by the scheduler (a new session is dialed instead).
     pub max_streams_per_session: usize,
+    /// Prefer an idle session; while every usable session is busy, establish
+    /// another one up to `max_sessions` before multiplexing more streams.
+    pub spread_sessions: bool,
     /// Janitor tick (prune + prewarm cadence).
     pub janitor_interval: Duration,
     /// First dial-failure backoff; doubles per consecutive failure up to
@@ -63,6 +66,7 @@ impl Default for SessionPoolConfig {
         Self {
             max_sessions: 8,
             max_streams_per_session: 8,
+            spread_sessions: false,
             janitor_interval: Duration::from_secs(30),
             dial_backoff: Duration::from_secs(1),
             max_dial_backoff: Duration::from_secs(30),
@@ -415,12 +419,10 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         self.pool.lock().warm_retained
     }
 
-    /// Offer the least-loaded live session, dialing one when none is
-    /// usable. Concurrent callers share one establishment: the first caller
-    /// to find no in-flight dial registers it and the pool spawns it as an
-    /// owned task — cancelling any caller only ends its own wait, never the
-    /// shared dial. Dial failures broadcast to every waiter; repeated failures
-    /// back off for the pool.
+    /// Offer a live session. Pools may fill idle physical-session capacity
+    /// before least-loaded multiplexing; otherwise a new session is dialed
+    /// only when none is usable. Concurrent callers share one pool-owned
+    /// establishment, and dial failures back off for the pool.
     pub async fn offer<F, Fut>(&self, dial: F) -> anyhow::Result<Arc<S>>
     where
         F: FnOnce() -> Fut + Send + 'static,
@@ -447,7 +449,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                     Step::Closed
                 } else {
                     pool.sessions.retain(|s| !s.is_closed());
-                    if let Some(s) = pool
+                    let candidate = pool
                         .sessions
                         .iter()
                         // Draining sessions take no new channels.
@@ -455,9 +457,13 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                             s.state() == SessionState::Active
                                 && s.active_streams() < self.config.max_streams_per_session
                         })
-                        .min_by_key(|s| s.active_streams())
-                    {
-                        Step::Have(Arc::clone(s))
+                        .min_by_key(|s| s.active_streams());
+                    let occupied_slots = pool.sessions.len() + pool.provisional.len();
+                    let should_spread = self.config.spread_sessions
+                        && candidate.is_some_and(|session| session.active_streams() > 0)
+                        && occupied_slots < self.config.max_sessions;
+                    if !should_spread && let Some(candidate) = candidate {
+                        Step::Have(Arc::clone(candidate))
                     } else if let Some((_, done)) = &pool.dial_done {
                         Step::Wait(done.subscribe())
                     } else if let Some(wait) = pool
@@ -465,15 +471,21 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                         .and_then(|t| t.checked_duration_since(Instant::now()))
                         .filter(|w| *w > Duration::ZERO)
                     {
-                        Step::Backoff(wait)
-                    } else if pool.sessions.len() + pool.provisional.len()
-                        >= self.config.max_sessions
-                    {
-                        // At the hard cap with every session saturated (including
-                        // caller-owned speculative slots): wait
-                        // for capacity to free up (a stream closes, a session
-                        // is reaped) instead of stampeding past the cap.
-                        Step::Backoff(self.config.janitor_interval.min(Duration::from_secs(5)))
+                        candidate.map_or(Step::Backoff(wait), |session| {
+                            Step::Have(Arc::clone(session))
+                        })
+                    } else if occupied_slots >= self.config.max_sessions {
+                        candidate.map_or_else(
+                            || {
+                                // At the hard cap with every session saturated
+                                // (including caller-owned speculative slots): wait
+                                // for capacity instead of stampeding past the cap.
+                                Step::Backoff(
+                                    self.config.janitor_interval.min(Duration::from_secs(5)),
+                                )
+                            },
+                            |session| Step::Have(Arc::clone(session)),
+                        )
                     } else {
                         let id = pool.next_inflight_id;
                         pool.next_inflight_id += 1;
@@ -514,6 +526,9 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                     match signal {
                         DialSignal::Closed => return Err(Self::pool_closed_err()),
                         DialSignal::Failed(e) => {
+                            if self.config.spread_sessions && self.has_usable_session() {
+                                continue;
+                            }
                             return Err(anyhow::anyhow!(e).context("session dial failed"));
                         }
                         DialSignal::Pending | DialSignal::Done => {}
@@ -1232,6 +1247,72 @@ mod tests {
             .unwrap();
         assert!(Arc::ptr_eq(&s1, &s2));
         assert_eq!(dials.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn spread_sessions_fills_idle_capacity_before_multiplexing() {
+        let pool = pool(SessionPoolConfig {
+            max_sessions: 2,
+            spread_sessions: true,
+            ..Default::default()
+        });
+        let dials = Arc::new(AtomicUsize::new(0));
+        let dial = |dials: Arc<AtomicUsize>| async move {
+            dials.fetch_add(1, Ordering::Relaxed);
+            Ok(TestSession::new())
+        };
+
+        let first = pool
+            .offer({
+                let dials = Arc::clone(&dials);
+                move || dial(dials)
+            })
+            .await
+            .unwrap();
+        first.streams.store(1, Ordering::Relaxed);
+        let second = pool
+            .offer({
+                let dials = Arc::clone(&dials);
+                move || dial(dials)
+            })
+            .await
+            .unwrap();
+
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(dials.load(Ordering::Relaxed), 2);
+
+        second.streams.store(2, Ordering::Relaxed);
+        let at_cap = pool
+            .offer({
+                let dials = Arc::clone(&dials);
+                move || dial(dials)
+            })
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &at_cap));
+        assert_eq!(dials.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn spread_sessions_reuses_busy_session_when_extra_dial_fails() {
+        let pool = pool(SessionPoolConfig {
+            max_sessions: 2,
+            spread_sessions: true,
+            ..Default::default()
+        });
+        let first = pool
+            .offer(|| async { Ok(TestSession::new()) })
+            .await
+            .unwrap();
+        first.streams.store(1, Ordering::Relaxed);
+
+        let fallback = pool
+            .offer(|| async { anyhow::bail!("extra session unavailable") })
+            .await
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&first, &fallback));
+        assert!(!first.is_closed());
     }
 
     #[tokio::test(start_paused = true)]
