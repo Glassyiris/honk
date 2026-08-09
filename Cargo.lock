@@ -1539,6 +1539,7 @@ dependencies = [
  "hkdf",
  "honk-config",
  "honk-ebpf-common",
+ "honk-nfqueue",
  "honk-outbound",
  "http",
  "ipnet",
@@ -1592,6 +1593,17 @@ dependencies = [
  "aya-ebpf",
  "aya-ebpf-bindings",
  "network-types",
+]
+
+[[package]]
+name = "honk-nfqueue"
+version = "0.0.1-alpha"
+dependencies = [
+ "bytes",
+ "libc",
+ "parking_lot",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
