@@ -400,6 +400,12 @@ pub fn parse_dae_config(input: &str) -> Result<Config, crate::ConfigError> {
         }
     }
 
+    for group in &mut config.groups {
+        if group.policy == crate::node::GroupPolicy::URLTest {
+            group.tolerance = config.global.check_tolerance_ms;
+        }
+    }
+
     resolve_group_filters(&mut config.groups, &config.nodes, &config.subscriptions);
 
     Ok(config)

@@ -398,6 +398,36 @@ global {
     }
 
     #[test]
+    fn test_global_check_tolerance_applies_to_dae_urltest_groups() {
+        let config = parse_dae_config(
+            r#"
+global {
+    check_tolerance: 120ms
+}
+group {
+    url {
+        policy: urltest
+    }
+    select {
+        policy: select
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let group = |name: &str| {
+            config
+                .groups
+                .iter()
+                .find(|group| group.name == name)
+                .unwrap_or_else(|| panic!("group '{name}' missing"))
+        };
+        assert_eq!(group("url").tolerance, 120);
+        assert_eq!(group("select").tolerance, 50);
+    }
+
+    #[test]
     fn test_parse_domain_condition_prefixes() {
         let input = r#"
 routing {
