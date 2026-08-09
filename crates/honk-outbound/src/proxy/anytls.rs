@@ -22,6 +22,7 @@
 
 use crate::tls::TlsConnector;
 use async_trait::async_trait;
+use bytes::Buf as _;
 use honk_config::node::Node;
 #[cfg(test)]
 use honk_config::types::NodeProtocol;
@@ -503,27 +504,22 @@ enum StreamSink {
     /// flush progress past [`OVERFLOW_STALL_GRACE`] gets only its own
     /// stream reset.
     Tcp(mpsc::Sender<StreamEvent>),
-    /// UoT streams: drop-on-full (UDP semantics) — a slow consumer must
-    /// never backpressure the session demux, or one hot UDP flow wedges
-    /// every stream on the session (production h3 stall).
+    /// UoT streams: a saturated receiver retires only this sid. Dropping an
+    /// arbitrary AnyTLS chunk would corrupt the length-delimited byte stream.
     Uot(mpsc::Sender<StreamEvent>),
 }
 
 impl StreamSink {
-    /// Deliver a payload frame: demux-bounded for TCP, drop-on-full for UoT.
-    /// Returns false when the receiver is gone (stream died unregistered).
+    /// Deliver a payload frame. A false result makes the caller retire the
+    /// stream; UoT must never continue after losing a byte-stream chunk.
     async fn send_data(&self, data: Vec<u8>) -> bool {
         match self {
             StreamSink::Tcp(tx) => tx.send(StreamEvent::Data(data)).await.is_ok(),
-            StreamSink::Uot(tx) => match tx.try_send(StreamEvent::Data(data)) {
-                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
-                Err(mpsc::error::TrySendError::Closed(_)) => false,
-            },
+            StreamSink::Uot(tx) => tx.try_send(StreamEvent::Data(data)).is_ok(),
         }
     }
 
-    /// Deliver a FIN. TCP waits for capacity; UoT uses best-effort
-    /// delivery so a full datagram queue cannot backpressure the session.
+    #[cfg(test)]
     async fn send_fin(&self) {
         match self {
             StreamSink::Tcp(tx) => {
@@ -531,20 +527,6 @@ impl StreamSink {
             }
             StreamSink::Uot(tx) => {
                 let _ = tx.try_send(StreamEvent::Fin);
-            }
-        }
-    }
-
-    /// Deliver a stream-level failure (open error). Same delivery
-    /// semantics as FIN: never dropped for TCP.
-    async fn send_error(&self, message: Arc<str>) {
-        let event = StreamEvent::Error(message);
-        match self {
-            StreamSink::Tcp(tx) => {
-                let _ = tx.send(event).await;
-            }
-            StreamSink::Uot(tx) => {
-                let _ = tx.try_send(event);
             }
         }
     }
@@ -604,6 +586,7 @@ enum FrameCommand {
         sid: u32,
         payload: bytes::Bytes,
         _permit: tokio::sync::OwnedSemaphorePermit,
+        completion: Option<tokio::sync::oneshot::Sender<bool>>,
     },
     Control {
         cmd: u8,
@@ -643,7 +626,7 @@ impl FrameCommand {
 /// session). Data capacity is `WRITER_QUEUE_CAP - WRITER_CONTROL_RESERVED`;
 /// control frames take the reserved headroom.
 struct WriterQueue {
-    queue: Mutex<std::collections::VecDeque<FrameCommand>>,
+    queue: parking_lot::Mutex<std::collections::VecDeque<FrameCommand>>,
     notify: tokio::sync::Notify,
     data_permits: Arc<tokio::sync::Semaphore>,
 }
@@ -653,11 +636,14 @@ const WRITER_QUEUE_CAP: usize = 1024;
 /// Slots reserved for control frames (SYN/FIN/HEART) — data can never
 /// fill the queue past `WRITER_QUEUE_CAP - WRITER_CONTROL_RESERVED`.
 const WRITER_CONTROL_RESERVED: usize = 128;
+/// sing-anytls bounds control writes at five seconds. A stuck shared writer
+/// must become terminal instead of remaining selectable by the session pool.
+const WRITER_IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl WriterQueue {
     fn new() -> Self {
         Self {
-            queue: Mutex::new(std::collections::VecDeque::new()),
+            queue: parking_lot::Mutex::new(std::collections::VecDeque::new()),
             notify: tokio::sync::Notify::new(),
             data_permits: Arc::new(tokio::sync::Semaphore::new(
                 WRITER_QUEUE_CAP - WRITER_CONTROL_RESERVED,
@@ -668,13 +654,13 @@ impl WriterQueue {
     /// Push commands atomically as one batch (the SYN+PSH opening pair is
     /// never interleaved with another stream's frame).
     fn push_batch(&self, cmds: impl IntoIterator<Item = FrameCommand>) {
-        self.queue.lock().unwrap().extend(cmds);
+        self.queue.lock().extend(cmds);
         self.notify.notify_one();
     }
 
     async fn pop(&self) -> FrameCommand {
         loop {
-            if let Some(cmd) = self.queue.lock().unwrap().pop_front() {
+            if let Some(cmd) = self.queue.lock().pop_front() {
                 return cmd;
             }
             self.notify.notified().await;
@@ -686,7 +672,7 @@ impl WriterQueue {
     /// blocking. Only drains what is queued *now* — never waits, so it adds
     /// no latency to a live writer loop.
     fn drain_available(&self, out: &mut Vec<FrameCommand>, max_frames: usize, max_bytes: usize) {
-        let mut q = self.queue.lock().unwrap();
+        let mut q = self.queue.lock();
         let mut bytes = 0usize;
         let mut taken = 0usize;
         while taken < max_frames {
@@ -702,7 +688,7 @@ impl WriterQueue {
     }
 
     fn clear(&self) {
-        self.queue.lock().unwrap().clear();
+        self.queue.lock().clear();
     }
 }
 
@@ -739,14 +725,25 @@ async fn session_writer(
         for cmd in &batch {
             cmd.encode_into(&mut buf);
         }
-        let failed = match write.write_all(&buf).await {
-            Ok(()) => write.flush().await.is_err(),
-            Err(_) => true,
-        };
+        let succeeded = matches!(
+            tokio::time::timeout(WRITER_IO_TIMEOUT, async {
+                write.write_all(&buf).await?;
+                write.flush().await
+            })
+            .await,
+            Ok(Ok(()))
+        );
+        for command in &mut batch {
+            if let FrameCommand::Data { completion, .. } = command
+                && let Some(completion) = completion.take()
+            {
+                let _ = completion.send(succeeded);
+            }
+        }
         // Dropping the batch here releases data permits only after the
         // bytes are actually written — backpressure spans the write.
         batch.clear();
-        if failed {
+        if !succeeded {
             debug!("AnyTLS session {} writer failed, closing", session.seq);
             session.fail(anyhow::anyhow!("writer task write failed"));
             break;
@@ -903,6 +900,43 @@ impl AnyTlsSession {
         self.enqueue_data_with_permit(sid, payload, permit)
     }
 
+    /// Enqueue one frame and wait until the session writer flushes its batch.
+    /// Used only for endpoint setup and the first datagram, where an enqueue
+    /// acknowledgement would turn writer loss into a false successful send.
+    async fn enqueue_confirmed_data(&self, sid: u32, payload: bytes::Bytes) -> std::io::Result<()> {
+        if self.is_closed() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "AnyTLS session is closed",
+            ));
+        }
+        let permit = self.acquire_data_permit().await?;
+        let (completion, completed) = tokio::sync::oneshot::channel();
+        {
+            let mut queue = self.writer_q.queue.lock();
+            if self.is_closed() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "AnyTLS session is closed",
+                ));
+            }
+            queue.push_back(FrameCommand::Data {
+                sid,
+                payload,
+                _permit: permit,
+                completion: Some(completion),
+            });
+        }
+        self.writer_q.notify.notify_one();
+        match completed.await {
+            Ok(true) => Ok(()),
+            Ok(false) | Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "AnyTLS writer failed before flushing frame",
+            )),
+        }
+    }
+
     /// Acquire one writer-queue data permit (async).
     async fn acquire_data_permit(&self) -> std::io::Result<tokio::sync::OwnedSemaphorePermit> {
         if self.is_closed() {
@@ -935,6 +969,7 @@ impl AnyTlsSession {
             sid,
             payload,
             _permit: permit,
+            completion: None,
         }]);
         Ok(())
     }
@@ -956,28 +991,23 @@ impl AnyTlsSession {
             sid,
             payload,
             _permit: permit,
+            completion: None,
         }]);
         Ok(())
     }
 
-    /// Enqueue a UoT datagram: drop-on-full (UDP semantics) — a hot UDP
-    /// flow must never backpressure the session writer.
-    fn enqueue_uot(&self, sid: u32, payload: bytes::Bytes) -> std::io::Result<()> {
-        if self.is_closed() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionAborted,
-                "AnyTLS session is closed",
-            ));
-        }
-        let Ok(permit) = Arc::clone(&self.writer_q.data_permits).try_acquire_owned() else {
-            return Ok(()); // saturated: drop the datagram
-        };
-        self.writer_q.push_batch([FrameCommand::Data {
-            sid,
-            payload,
-            _permit: permit,
-        }]);
-        Ok(())
+    async fn write_uot_datagram(&self, sid: u32, payload: bytes::Bytes) -> std::io::Result<()> {
+        self.ensure_stream_registered(sid)?;
+        self.enqueue_data(sid, payload).await
+    }
+
+    async fn write_uot_datagram_confirmed(
+        &self,
+        sid: u32,
+        payload: bytes::Bytes,
+    ) -> std::io::Result<()> {
+        self.ensure_stream_registered(sid)?;
+        self.enqueue_confirmed_data(sid, payload).await
     }
 
     /// Register a sid and enqueue the SYN+PSH opening pair as one atomic
@@ -1030,12 +1060,10 @@ impl AnyTlsSession {
     }
 
     /// Open a UoT stream: same SYN+PSH opening as [`Self::open_stream`],
-    /// but inbound datagrams go straight from the demux into a drop-on-full
-    /// queue (no stream task, no duplex) and outbound frames are written
-    /// directly to the session writer. A hot UDP flow therefore cannot
-    /// backpressure the session demux — before this, one burst past the
-    /// stream's buffers wedged the whole session (demux blocks on a full
-    /// per-stream queue) and every flow on it died.
+    /// but inbound bytes go straight from the demux into a bounded queue (no
+    /// stream task or duplex) and outbound frames go to the session writer.
+    /// Saturation retires this sid instead of blocking sibling streams or
+    /// silently corrupting the UoT byte stream.
     ///
     /// The returned guard is **uncommitted**: the caller must drive the
     /// UoT request write and then [`StreamRegistration::commit`] —
@@ -1053,16 +1081,21 @@ impl AnyTlsSession {
         Ok((sid, rx, guard))
     }
 
-    /// Reliably enqueue the mandatory UoT setup request. Unlike application
-    /// datagrams, setup waits for bounded writer capacity or fails; reporting
-    /// success after dropping it would publish an unusable transport.
-    async fn write_uot_setup_frame(&self, sid: u32, data: &[u8]) -> std::io::Result<()> {
-        self.enqueue_data(sid, bytes::Bytes::copy_from_slice(data))
-            .await
+    fn ensure_stream_registered(&self, sid: u32) -> std::io::Result<()> {
+        if self.streams.lock().unwrap().contains_key(&sid) {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "AnyTLS UoT stream is no longer registered",
+            ))
+        }
     }
 
-    async fn write_uot_datagram(&self, sid: u32, payload: bytes::Bytes) -> std::io::Result<()> {
-        self.enqueue_uot(sid, payload)
+    /// Flush the mandatory request before publishing the UoT transport.
+    async fn write_uot_setup_frame(&self, sid: u32, data: &[u8]) -> std::io::Result<()> {
+        self.enqueue_confirmed_data(sid, bytes::Bytes::copy_from_slice(data))
+            .await
     }
 
     /// Open a TCP stream with the direct data path (no stream task, no
@@ -1154,7 +1187,7 @@ impl AnyTlsSession {
     /// peer bursts megabytes before the reader task is first scheduled),
     /// only missing flush progress past the grace kills. At a hard cap
     /// the demux waits bounded rounds for that progress (see
-    /// [`Self::park_overflow`]). UoT sinks drop on full.
+    /// [`Self::park_overflow`]). A saturated UoT sink retires only its sid.
     async fn dispatch_data(self: &Arc<Self>, sid: u32, data: Vec<u8>) {
         // Ordering: if this sid already has parked frames, the new frame
         // goes behind them, never past them.
@@ -1176,9 +1209,11 @@ impl AnyTlsSession {
             },
             Some(sink) => {
                 if !sink.send_data(data).await {
-                    // Stream task died without unregistering; clean up.
-                    self.streams.lock().unwrap().remove(&sid);
+                    let removed = self.streams.lock().unwrap().remove(&sid).is_some();
                     self.discard_overflow(sid);
+                    if removed {
+                        let _ = self.enqueue_control(CMD_FIN, sid, bytes::Bytes::new());
+                    }
                 }
             }
             None => {
@@ -1419,7 +1454,13 @@ impl AnyTlsSession {
                     self.discard_overflow(sid);
                 }
             },
-            Some(sink) => sink.send_fin().await,
+            Some(StreamSink::Uot(tx)) => match tx.try_send(StreamEvent::Fin) {
+                Ok(()) => {}
+                Err(_) => {
+                    self.streams.lock().unwrap().remove(&sid);
+                    self.discard_overflow(sid);
+                }
+            },
             None => {}
         }
     }
@@ -1444,7 +1485,13 @@ impl AnyTlsSession {
                     }
                 }
             }
-            Some(sink) => sink.send_error(message).await,
+            Some(StreamSink::Uot(tx)) => match tx.try_send(StreamEvent::Error(message)) {
+                Ok(()) => {}
+                Err(_) => {
+                    self.streams.lock().unwrap().remove(&sid);
+                    self.discard_overflow(sid);
+                }
+            },
             None => {}
         }
     }
@@ -1856,8 +1903,7 @@ impl AnyTlsHandler {
         let transport: Arc<dyn PacketTransport> = Arc::new(AnyTlsUotTransport {
             session,
             sid,
-            rx: tokio::sync::Mutex::new(rx),
-            mode: tokio::sync::Mutex::new(None),
+            receive: tokio::sync::Mutex::new(UotReceiveState::new(rx)),
             target,
             target_domain: target_domain.map(str::to_string),
             _permit: permit,
@@ -1954,8 +2000,7 @@ impl AnyTlsHandler {
         Ok(Arc::new(AnyTlsUotTransport {
             session,
             sid,
-            rx: tokio::sync::Mutex::new(rx),
-            mode: tokio::sync::Mutex::new(None),
+            receive: tokio::sync::Mutex::new(UotReceiveState::new(rx)),
             target,
             target_domain: target_domain.map(str::to_string),
             _permit: permit,
@@ -2406,85 +2451,121 @@ impl PacketOutbound for AnyTlsHandler {
 #[async_trait]
 impl ProbeableOutbound for AnyTlsHandler {}
 
-/// Framed UoT transport over a multiplexed AnyTLS stream. Inbound
-/// datagrams come straight from the session demux (drop-on-full queue);
-/// outbound frames are written directly to the session writer. No stream
-/// task, no duplex, no drain task: the only buffer between the server and
-/// the flow's reply handler is the demux queue, and it can never
-/// backpressure the session.
+/// Framed UoT transport over a multiplexed AnyTLS stream. Inbound bytes come
+/// straight from the session demux through a bounded queue; saturation
+/// retires the sid rather than losing part of the UoT byte stream. Outbound
+/// frames go directly to the session writer. No stream task, duplex, or
+/// drain task sits between the session and the flow's reply handler.
 struct AnyTlsUotTransport {
     session: Arc<AnyTlsSession>,
     sid: u32,
-    rx: tokio::sync::Mutex<mpsc::Receiver<StreamEvent>>,
-    /// Response framing, detected on the first datagram (v2 `len+payload`
-    /// vs v1 `atyp+addr+port+len+payload` — see `UotMode`).
-    mode: tokio::sync::Mutex<Option<UotMode>>,
+    receive: tokio::sync::Mutex<UotReceiveState>,
     target: SocketAddr,
     target_domain: Option<String>,
     /// Stream-slot capacity, held for the transport's life.
     _permit: crate::session::SessionPermit<AnyTlsSession>,
 }
 
-impl AnyTlsUotTransport {
-    /// Strip the UoT per-datagram header, detecting the framing once.
-    fn strip_uot_header<'a>(
-        &self,
-        mode: &mut Option<UotMode>,
-        data: &'a [u8],
-    ) -> std::io::Result<&'a [u8]> {
-        const BAD: &str = "invalid UoT datagram";
-        let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, BAD);
-        match mode {
-            Some(UotMode::V2Connect) => {
-                if data.len() < 2 {
-                    return Err(bad());
-                }
-                let len = u16::from_be_bytes([data[0], data[1]]) as usize;
-                if data.len() < 2 + len {
-                    return Err(bad());
-                }
-                Ok(&data[2..2 + len])
-            }
-            Some(UotMode::V1Packet) => {
-                let (header, payload_len) = parse_v1_header(data)?;
-                if data.len() < header + payload_len {
-                    return Err(bad());
-                }
-                Ok(&data[header..header + payload_len])
-            }
-            None => {
-                // v1 servers echo the connect destination as the packet
-                // source; anything else is the spec's v2 length prefix.
-                let v1 = matches!(
-                    parse_v1_header(data),
-                    Ok((header, _))
-                        if v1_header_matches(data, header, &self.target, self.target_domain.as_deref())
-                );
-                *mode = Some(if v1 {
-                    UotMode::V1Packet
-                } else {
-                    UotMode::V2Connect
-                });
-                self.strip_uot_header(mode, data)
-            }
+struct UotReceiveState {
+    rx: mpsc::Receiver<StreamEvent>,
+    mode: Option<UotMode>,
+    buffered: bytes::BytesMut,
+}
+
+impl UotReceiveState {
+    fn new(rx: mpsc::Receiver<StreamEvent>) -> Self {
+        Self {
+            rx,
+            mode: None,
+            buffered: bytes::BytesMut::new(),
         }
     }
 }
 
+#[derive(Clone, Copy)]
+struct UotFrameBounds {
+    payload_start: usize,
+    frame_end: usize,
+}
+// The largest valid buffered state is one byte short of a maximum v1
+// domain-form datagram followed by one full AnyTLS PSH.
+const UOT_MAX_V1_HEADER_BYTES: usize = 1 + 1 + u8::MAX as usize + 2 + 2;
+const UOT_MAX_BUFFERED_BYTES: usize =
+    UOT_MAX_V1_HEADER_BYTES + u16::MAX as usize + u16::MAX as usize - 1;
+
+impl AnyTlsUotTransport {
+    fn detect_uot_mode(&self, data: &[u8]) -> std::io::Result<Option<UotMode>> {
+        if data.len() < 2 {
+            return Ok(None);
+        }
+        let v2_frame_len = 2 + u16::from_be_bytes([data[0], data[1]]) as usize;
+        match parse_v1_header(data) {
+            Ok(Some((header, _)))
+                if v1_header_matches(data, header, &self.target, self.target_domain.as_deref()) =>
+            {
+                Ok(Some(UotMode::V1Packet))
+            }
+            Ok(Some(_)) | Err(_) => Ok(Some(UotMode::V2Connect)),
+            Ok(None) if data.len() >= v2_frame_len => Ok(Some(UotMode::V2Connect)),
+            Ok(None) => Ok(None),
+        }
+    }
+
+    fn next_uot_frame(
+        &self,
+        state: &mut UotReceiveState,
+    ) -> std::io::Result<Option<UotFrameBounds>> {
+        if state.mode.is_none() {
+            state.mode = self.detect_uot_mode(&state.buffered)?;
+        }
+        let Some(mode) = state.mode else {
+            return Ok(None);
+        };
+        let (payload_start, payload_len) = match mode {
+            UotMode::V2Connect => {
+                if state.buffered.len() < 2 {
+                    return Ok(None);
+                }
+                (
+                    2,
+                    u16::from_be_bytes([state.buffered[0], state.buffered[1]]) as usize,
+                )
+            }
+            UotMode::V1Packet => {
+                let Some((header, payload_len)) = parse_v1_header(&state.buffered)? else {
+                    return Ok(None);
+                };
+                (header, payload_len)
+            }
+        };
+        let frame_end = payload_start.checked_add(payload_len).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid UoT datagram")
+        })?;
+        if state.buffered.len() < frame_end {
+            return Ok(None);
+        }
+        Ok(Some(UotFrameBounds {
+            payload_start,
+            frame_end,
+        }))
+    }
+}
+
 /// v1 packet layout header (`atyp + addr + port + u16 len`) length and
-/// payload length at the start of `data`.
-fn parse_v1_header(data: &[u8]) -> std::io::Result<(usize, usize)> {
+/// payload length at the start of `data`. An incomplete stream prefix is not
+/// malformed; the next AnyTLS PSH may contain the rest.
+fn parse_v1_header(data: &[u8]) -> std::io::Result<Option<(usize, usize)>> {
     const BAD: &str = "invalid UoT v1 packet header";
     let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, BAD);
     if data.is_empty() {
-        return Err(bad());
+        return Ok(None);
     }
     let addr_len = match data[0] {
         UOT_V1_ATYP_V4 => 4,
         UOT_V1_ATYP_V6 => 16,
         UOT_V1_ATYP_DOMAIN => {
             if data.len() < 2 {
-                return Err(bad());
+                return Ok(None);
             }
             1 + data[1] as usize
         }
@@ -2492,11 +2573,11 @@ fn parse_v1_header(data: &[u8]) -> std::io::Result<(usize, usize)> {
     };
     let header = 1 + addr_len + 2 + 2;
     if data.len() < header {
-        return Err(bad());
+        return Ok(None);
     }
     let len_at = 1 + addr_len + 2;
     let payload_len = u16::from_be_bytes([data[len_at], data[len_at + 1]]) as usize;
-    Ok((header, payload_len))
+    Ok(Some((header, payload_len)))
 }
 
 /// Whether the v1 header at the start of `data` echoes the connect
@@ -2528,10 +2609,9 @@ fn v1_header_matches(
     }
 }
 
-/// Per-stream UoT demux queue depth. UDP semantics: drop on a full queue,
-/// never queue unboundedly. Sized for bursts: at ~1.2KB per datagram,
-/// 4096 entries absorbs a ~40ms burst at 100k pps while the reply handler
-/// drains.
+/// Per-stream UoT demux queue depth. At ~1.2KB per datagram, 4096 entries
+/// absorb a ~40ms burst at 100k pps while the reply handler drains. A full
+/// queue retires only this sid; arbitrary chunks cannot be dropped safely.
 const UOT_DRAIN_QUEUE_CAP: usize = 4096;
 
 impl Drop for AnyTlsUotTransport {
@@ -2549,6 +2629,22 @@ impl std::fmt::Debug for AnyTlsUotTransport {
     }
 }
 
+impl AnyTlsUotTransport {
+    fn encode_packet(data: &[u8]) -> std::io::Result<bytes::Bytes> {
+        if data.len() > u16::MAX as usize - 2 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "uot datagram exceeds AnyTLS frame capacity",
+            ));
+        }
+        let mut frame = bytes::BytesMut::with_capacity(2 + data.len());
+        use bytes::BufMut as _;
+        frame.put_u16(data.len() as u16);
+        frame.extend_from_slice(data);
+        Ok(frame.freeze())
+    }
+}
+
 #[async_trait]
 impl PacketTransport for AnyTlsUotTransport {
     fn relay_addr(&self) -> SocketAddr {
@@ -2556,45 +2652,60 @@ impl PacketTransport for AnyTlsUotTransport {
     }
 
     async fn send_packet(&self, data: &[u8]) -> std::io::Result<()> {
-        if data.len() > u16::MAX as usize {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "uot datagram too large",
-            ));
-        }
-        let mut frame = bytes::BytesMut::with_capacity(2 + data.len());
-        use bytes::BufMut as _;
-        frame.put_u16(data.len() as u16);
-        frame.extend_from_slice(data);
         self.session
-            .write_uot_datagram(self.sid, frame.freeze())
+            .write_uot_datagram(self.sid, Self::encode_packet(data)?)
+            .await
+    }
+
+    async fn send_packet_confirmed(&self, data: &[u8]) -> std::io::Result<()> {
+        self.session
+            .write_uot_datagram_confirmed(self.sid, Self::encode_packet(data)?)
             .await
     }
 
     async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
-        let event = self.rx.lock().await.recv().await.ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "UoT stream closed")
-        })?;
-        match event {
-            StreamEvent::Data(data) => {
-                let payload = self.strip_uot_header(&mut *self.mode.lock().await, &data)?;
-                if payload.len() > buf.len() {
+        let mut receive = self.receive.lock().await;
+        loop {
+            if let Some(frame) = self.next_uot_frame(&mut receive)? {
+                let payload_len = frame.frame_end - frame.payload_start;
+                if payload_len > buf.len() {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "uot datagram exceeds buffer",
                     ));
                 }
-                buf[..payload.len()].copy_from_slice(payload);
-                Ok((payload.len(), self.target))
+                buf[..payload_len]
+                    .copy_from_slice(&receive.buffered[frame.payload_start..frame.frame_end]);
+                receive.buffered.advance(frame.frame_end);
+                return Ok((payload_len, self.target));
             }
-            StreamEvent::Fin => Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "UoT stream closed by server",
-            )),
-            StreamEvent::Error(e) => Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionReset,
-                e.to_string(),
-            )),
+
+            let event = receive.rx.recv().await.ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "UoT stream closed")
+            })?;
+            match event {
+                StreamEvent::Data(data) => {
+                    if receive.buffered.len().saturating_add(data.len()) > UOT_MAX_BUFFERED_BYTES {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "UoT stream frame exceeds buffer limit",
+                        ));
+                    }
+                    receive.buffered.extend_from_slice(&data);
+                }
+                StreamEvent::Fin => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "UoT stream closed by server",
+                    ));
+                }
+                StreamEvent::Error(error) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        error.to_string(),
+                    ));
+                }
+            }
         }
     }
 }
@@ -2953,11 +3064,13 @@ mod tests {
                 sid: 1,
                 payload: bytes::Bytes::from_static(b"hello"),
                 _permit: p1,
+                completion: None,
             },
             FrameCommand::Data {
                 sid: 2,
                 payload: bytes::Bytes::from_static(b"world"),
                 _permit: p2,
+                completion: None,
             },
             FrameCommand::Control {
                 cmd: CMD_FIN,
@@ -3016,7 +3129,7 @@ mod tests {
         let mut batch = Vec::new();
         q.drain_available(&mut batch, usize::MAX, usize::MAX);
         assert_eq!(batch.len(), 1);
-        assert!(q.queue.lock().unwrap().is_empty());
+        assert!(q.queue.lock().is_empty());
     }
 
     const TEST_AUTH: &[u8] = b"test-auth";
@@ -4453,11 +4566,12 @@ mod tests {
         session.close();
     }
 
-    /// UoT sinks are drop-on-full: a flooded datagram queue parks nothing
-    /// in the session overflow.
+    /// UoT saturation retires only the affected sid and never parks bytes in
+    /// the session-wide TCP overflow.
     #[tokio::test]
-    async fn uot_sink_drop_on_full_never_parks_overflow() {
-        let (session, _server) = establish_test_session("127.0.0.1:443").await;
+    async fn uot_sink_saturation_retires_only_stream() {
+        let (session, mut server) = establish_test_session("127.0.0.1:443").await;
+        expect_handshake(&mut server).await;
         let (tx, _rx) = mpsc::channel(1);
         tx.try_send(StreamEvent::Data(vec![0])).unwrap();
         session
@@ -4466,9 +4580,12 @@ mod tests {
             .unwrap()
             .insert(77, StreamSink::Uot(tx));
         session.dispatch_data(77, vec![1; 16]).await;
-        session.dispatch_fin(77).await;
+        assert!(!session.streams.lock().unwrap().contains_key(&77));
+        assert!(!session.is_closed());
         assert_eq!(session.overflow.lock().usage(), OverflowUsage::default());
         assert!(session.watchdog.lock().unwrap().is_none());
+        let (cmd, sid, _) = read_frame(&mut server).await.unwrap();
+        assert_eq!((cmd, sid), (CMD_FIN, 77));
         session.close();
     }
 
@@ -5071,8 +5188,15 @@ mod uot_transport_tests {
     async fn uot_test_transport(
         target: SocketAddr,
     ) -> (Arc<AnyTlsUotTransport>, tokio::io::DuplexStream) {
+        uot_test_transport_with_capacity(target, 1 << 20).await
+    }
+
+    async fn uot_test_transport_with_capacity(
+        target: SocketAddr,
+        capacity: usize,
+    ) -> (Arc<AnyTlsUotTransport>, tokio::io::DuplexStream) {
         let addr = "127.0.0.1:2443";
-        let (client_end, mut server_end) = tokio::io::duplex(1 << 20);
+        let (client_end, mut server_end) = tokio::io::duplex(capacity);
         let (read, write) = tokio::io::split(client_end);
         let session = AnyTlsSession::establish(
             addr,
@@ -5104,8 +5228,7 @@ mod uot_transport_tests {
             Arc::new(AnyTlsUotTransport {
                 session,
                 sid,
-                rx: tokio::sync::Mutex::new(rx),
-                mode: tokio::sync::Mutex::new(None),
+                receive: tokio::sync::Mutex::new(UotReceiveState::new(rx)),
                 target,
                 target_domain: None,
                 _permit: permit,
@@ -5141,16 +5264,149 @@ mod uot_transport_tests {
         assert_eq!(src, target);
     }
 
-    /// Backpressure guard: a flood of inbound datagrams with no recv call
-    /// must be dropped at the demux queue, never block the session — the
-    /// transport keeps working afterwards.
     #[tokio::test]
-    async fn uot_transport_drops_when_consumer_stops() {
+    async fn confirmed_uot_send_waits_for_physical_flush() {
+        let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let (transport, mut server) = uot_test_transport_with_capacity(target, 64).await;
+        let payload = vec![0x5a; 256];
+        let send = transport.send_packet_confirmed(&payload);
+        tokio::pin!(send);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut send)
+                .await
+                .is_err(),
+            "confirmation must wait while the physical writer is blocked"
+        );
+        let (sent, frame) = tokio::join!(&mut send, read_frame(&mut server));
+        sent.unwrap();
+        let (cmd, sid, data) = frame.unwrap();
+        assert_eq!((cmd, sid), (CMD_PSH, transport.sid));
+        assert_eq!(
+            u16::from_be_bytes([data[0], data[1]]) as usize,
+            payload.len()
+        );
+        assert_eq!(&data[2..], payload);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blocked_anytls_writer_becomes_terminal() {
+        let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let (transport, _server) = uot_test_transport_with_capacity(target, 64).await;
+        let session = Arc::clone(&transport.session);
+        let send =
+            tokio::spawn(async move { transport.send_packet_confirmed(&vec![0x5a; 256]).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(WRITER_IO_TIMEOUT + Duration::from_millis(1)).await;
+        let error = send.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        tokio::task::yield_now().await;
+        assert!(session.is_closed());
+    }
+
+    #[tokio::test]
+    async fn uot_send_rejects_outer_frame_length_overflow() {
+        let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let (transport, _server) = uot_test_transport(target).await;
+        let error = transport
+            .send_packet(&vec![0; u16::MAX as usize - 1])
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn uot_transport_reassembles_datagram_across_anytls_frames() {
+        let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let (transport, mut server) = uot_test_transport(target).await;
+        let sid = transport.sid;
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&12u16.to_be_bytes());
+        frame.extend_from_slice(b"quic-initial");
+
+        write_frame(&mut server, CMD_PSH, sid, &frame[..1])
+            .await
+            .unwrap();
+        write_frame(&mut server, CMD_PSH, sid, &frame[1..5])
+            .await
+            .unwrap();
+        write_frame(&mut server, CMD_PSH, sid, &frame[5..])
+            .await
+            .unwrap();
+
+        let mut buf = [0u8; 64];
+        let (n, source) = transport.recv_packet(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"quic-initial");
+        assert_eq!(source, target);
+    }
+
+    #[tokio::test]
+    async fn uot_v1_max_domain_frame_survives_valid_chunking() {
+        let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let (mut transport, mut server) = uot_test_transport(target).await;
+        let domain = "d".repeat(u8::MAX as usize);
+        Arc::get_mut(&mut transport).unwrap().target_domain = Some(domain.clone());
+        let sid = transport.sid;
+
+        let mut stream = Vec::with_capacity(UOT_MAX_BUFFERED_BYTES);
+        stream.push(UOT_V1_ATYP_DOMAIN);
+        stream.push(u8::MAX);
+        stream.extend_from_slice(domain.as_bytes());
+        stream.extend_from_slice(&target.port().to_be_bytes());
+        stream.extend_from_slice(&u16::MAX.to_be_bytes());
+        stream.extend(std::iter::repeat_n(0x5a, u16::MAX as usize));
+        let first_frame_end = stream.len();
+        stream.extend(std::iter::repeat_n(0, u16::MAX as usize - 1));
+        assert_eq!(stream.len(), UOT_MAX_BUFFERED_BYTES);
+
+        for chunk in [
+            &stream[..32_768],
+            &stream[32_768..first_frame_end - 1],
+            &stream[first_frame_end - 1..],
+        ] {
+            write_frame(&mut server, CMD_PSH, sid, chunk).await.unwrap();
+        }
+
+        let mut packet = vec![0; u16::MAX as usize];
+        let (received, source) = transport.recv_packet(&mut packet).await.unwrap();
+        assert_eq!(received, packet.len());
+        assert!(packet.iter().all(|byte| *byte == 0x5a));
+        assert_eq!(source, target);
+    }
+
+    #[tokio::test]
+    async fn uot_transport_preserves_coalesced_datagrams() {
+        let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let (transport, mut server) = uot_test_transport(target).await;
+        let sid = transport.sid;
+        let mut frame = Vec::new();
+        for payload in [b"server-initial".as_slice(), b"server-handshake".as_slice()] {
+            frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            frame.extend_from_slice(payload);
+        }
+        write_frame(&mut server, CMD_PSH, sid, &frame)
+            .await
+            .unwrap();
+
+        let mut buf = [0u8; 64];
+        let (first, _) = transport.recv_packet(&mut buf).await.unwrap();
+        assert_eq!(&buf[..first], b"server-initial");
+        let (second, _) =
+            tokio::time::timeout(Duration::from_millis(100), transport.recv_packet(&mut buf))
+                .await
+                .expect("coalesced second datagram must already be buffered")
+                .unwrap();
+        assert_eq!(&buf[..second], b"server-handshake");
+    }
+
+    /// A stalled UoT consumer retires its sid instead of silently dropping a
+    /// chunk from the length-delimited receive stream.
+    #[tokio::test]
+    async fn uot_transport_saturation_retires_stream() {
         let target: SocketAddr = "93.184.216.34:53".parse().unwrap();
         let (transport, mut server) = uot_test_transport(target).await;
         let sid = transport.sid;
 
-        // Flood far more datagrams than the demux queue holds.
         let mut frame = Vec::new();
         frame.extend_from_slice(&5u16.to_be_bytes());
         frame.extend_from_slice(b"flood");
@@ -5159,13 +5415,17 @@ mod uot_transport_tests {
                 .await
                 .unwrap();
         }
-        // The transport still works afterwards (overflow was dropped).
-        transport.send_packet(b"ping").await.unwrap();
-        let mut buf = [0u8; 64];
-        let (n, _) = tokio::time::timeout(Duration::from_secs(2), transport.recv_packet(&mut buf))
-            .await
-            .expect("recv must not stall")
-            .unwrap();
-        assert_eq!(&buf[..n], b"flood");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while transport.session.streams.lock().unwrap().contains_key(&sid) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("saturated UoT sid must retire");
+        assert!(!transport.session.is_closed());
+        let error = transport.send_packet(b"ping").await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        let (cmd, fin_sid, _) = read_frame(&mut server).await.unwrap();
+        assert_eq!((cmd, fin_sid), (CMD_FIN, sid));
     }
 }

@@ -1690,10 +1690,16 @@ async fn send_one(
     // this driver never retries the packet or starts later followers.
     endpoint.begin_send_attempt()?;
     let started = first.then(Instant::now);
-    let sent = tokio::time::timeout(
-        TRANSPORT_SEND_TIMEOUT,
-        endpoint.proxy_socket.send_packet(&packet.data),
-    )
+    let sent = tokio::time::timeout(TRANSPORT_SEND_TIMEOUT, async {
+        if first {
+            endpoint
+                .proxy_socket
+                .send_packet_confirmed(&packet.data)
+                .await
+        } else {
+            endpoint.proxy_socket.send_packet(&packet.data).await
+        }
+    })
     .await;
     let result = match sent {
         Ok(result) => result,
@@ -1878,6 +1884,7 @@ mod tests {
         actions: Mutex<std::collections::VecDeque<DriverSendAction>>,
         recv_actions: Mutex<std::collections::VecDeque<DriverReceiveAction>>,
         sent: Mutex<Vec<Vec<u8>>>,
+        confirmed_sends: std::sync::atomic::AtomicUsize,
         send_progress: tokio::sync::Notify,
     }
 
@@ -1888,6 +1895,7 @@ mod tests {
                 actions: Mutex::new(actions.into_iter().collect()),
                 recv_actions: Mutex::new(std::collections::VecDeque::new()),
                 sent: Mutex::new(Vec::new()),
+                confirmed_sends: std::sync::atomic::AtomicUsize::new(0),
                 send_progress: tokio::sync::Notify::new(),
             }
         }
@@ -1902,12 +1910,18 @@ mod tests {
                 actions: Mutex::new(send_actions.into_iter().collect()),
                 recv_actions: Mutex::new(recv_actions.into_iter().collect()),
                 sent: Mutex::new(Vec::new()),
+                confirmed_sends: std::sync::atomic::AtomicUsize::new(0),
                 send_progress: tokio::sync::Notify::new(),
             }
         }
 
         fn sent_packets(&self) -> Vec<Vec<u8>> {
             self.sent.lock().clone()
+        }
+
+        fn confirmed_send_count(&self) -> usize {
+            self.confirmed_sends
+                .load(std::sync::atomic::Ordering::Relaxed)
         }
 
         async fn wait_for_send_count(&self, count: usize) {
@@ -1948,6 +1962,12 @@ mod tests {
                     Err(io::Error::other("released scripted UDP send failure"))
                 }
             }
+        }
+
+        async fn send_packet_confirmed(&self, data: &[u8]) -> io::Result<()> {
+            self.confirmed_sends
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.send_packet(data).await
         }
 
         async fn recv_packet(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
@@ -2564,6 +2584,7 @@ mod tests {
             transport.sent_packets(),
             vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()]
         );
+        assert_eq!(transport.confirmed_send_count(), 1);
         assert_eq!(stats.udp_snapshot().first_send_latency.count, 1);
         worker.abort();
     }

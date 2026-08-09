@@ -375,6 +375,19 @@ pub(super) fn udp_post_decision_offload_allowed(
 }
 
 impl ControlPlaneHandle {
+    /// `/proc/<pid>/exe` is display-only enrichment. Never hold first-packet
+    /// delivery behind the blocking pool used to resolve it.
+    fn spawn_process_path_enrichment(&self, conn_id: String, handoff: Option<&HandoffResult>) {
+        let Some(handoff) = handoff.filter(|handoff| handoff.pid != 0).cloned() else {
+            return;
+        };
+        let tracker = Arc::clone(&self.connection_tracker);
+        tokio::spawn(async move {
+            if let Some(process_path) = handoff.process_path().await {
+                tracker.update_process_path(&conn_id, process_path);
+            }
+        });
+    }
     /// Look up the eBPF routing handoff entry for a connection, consuming it.
     ///
     /// Only a read lock is taken: `routing_handoff_take` performs raw bpf()
@@ -1130,12 +1143,8 @@ impl ControlPlaneHandle {
         // single close-time (never-visible) update.
         let conn_upload = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let conn_download = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let process_path = match &handoff {
-            Some(ho) => ho.process_path().await,
-            None => None,
-        };
         flow.track(crate::connection_tracker::ConnectionEntry {
-            id: conn_id,
+            id: conn_id.clone(),
             source: client_addr.to_string(),
             destination: resolved_target.to_string(),
             proxy: node.name.clone(),
@@ -1148,8 +1157,9 @@ impl ControlPlaneHandle {
             domain: target_domain.clone(),
             network: "tcp".to_string(),
             process: handoff.as_ref().and_then(|ho| ho.process_name()),
-            process_path,
+            process_path: None,
         });
+        self.spawn_process_path_enrichment(conn_id, handoff.as_ref());
 
         debug!(
             network = "tcp",
@@ -1817,10 +1827,6 @@ impl ControlPlaneHandle {
             chain
         };
         let (conn_upload, conn_download) = endpoint.byte_counters();
-        let process_path = match &handoff {
-            Some(ho) => ho.process_path().await,
-            None => None,
-        };
         self.connection_tracker
             .register(crate::connection_tracker::ConnectionEntry {
                 id: conn_id.clone(),
@@ -1836,7 +1842,7 @@ impl ControlPlaneHandle {
                 domain: quic_domain.clone(),
                 network: "udp".to_string(),
                 process: handoff.as_ref().and_then(|ho| ho.process_name()),
-                process_path,
+                process_path: None,
             });
         endpoint.set_tracker(conn_id.clone());
         if !lease.set_tracker_id(conn_id.clone()) {
@@ -1882,6 +1888,7 @@ impl ControlPlaneHandle {
             anyhow::anyhow!("UDP initializer lost its first packet before driver start")
         })?;
         driver.start_with_followers(first, sniffed_followers)?;
+        self.spawn_process_path_enrichment(conn_id, handoff.as_ref());
         if let Err(error) = driver.wait_first_ack().await {
             // PacketTransport Err and timeout are ambiguous: the winner may
             // have received part of the initial flight, so never replay it.
