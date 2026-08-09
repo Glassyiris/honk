@@ -89,13 +89,6 @@ fn exchange(
     })
 }
 
-fn multi_question_query() -> Vec<u8> {
-    let mut query = build_dns_query("example.com", 1);
-    let second = build_dns_query("other.example", 28);
-    query[4..6].copy_from_slice(&2_u16.to_be_bytes());
-    query.extend_from_slice(&second[12..]);
-    query
-}
 
 fn edns_query(version: u8, option: Option<(u16, &[u8])>) -> Vec<u8> {
     let mut query = build_dns_query("example.com", 1);
@@ -119,7 +112,6 @@ fn ineligible_queries() -> Vec<(&'static str, Vec<u8>)> {
     let mut unsupported_flags = build_dns_query("example.com", 1);
     unsupported_flags[2..4].copy_from_slice(&0x0140_u16.to_be_bytes());
     vec![
-        ("multi-question", multi_question_query()),
         ("non-QUERY", non_query),
         ("unsupported-flags", unsupported_flags),
         ("EDNSv1", edns_query(1, None)),

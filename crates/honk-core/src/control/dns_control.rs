@@ -1,15 +1,9 @@
-//! DNS Controller — intercepts TPROXY DNS traffic and routes it through
-//! the DNS forwarder, updating eBPF domain routing on resolution.
+//! Generation-pinned DNS query orchestration shared by transparent port-53
+//! interception and the optional standalone listener.
 //!
-//! ## Features
-//!
-//! - DNS query interception (UDP + TCP)
-//! - Singleflight deduplication for concurrent identical queries
-//! - Async BPF cache update channel (non-blocking)
-//! - Periodic route refresh worker
-//! - Concurrency limit with graceful REFUSED degradation
-//!
-//! Go ref: `dns_control.go` (2943L)
+//! Transport adapters own admission and reply I/O. Successful outcomes are
+//! submitted to the generation-aware routing projection; no adapter writes
+//! domain routes directly.
 
 #[cfg(test)]
 use crate::dns::forwarder::DnsForwarder;
@@ -27,8 +21,7 @@ mod transport;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use transport::build_dns_error_response;
-use transport::build_dns_servfail;
+use crate::dns::response::{build_dns_refused, build_dns_servfail};
 
 #[cfg(test)]
 struct NoopRuntimeTransport;
@@ -46,12 +39,12 @@ impl crate::dns::runtime::RuntimeTransport for NoopRuntimeTransport {
 /// says "busy, back off".
 const DEFAULT_MAX_CONCURRENT_QUERIES: usize = 2048;
 
-/// DNS Controller — intercepts TPROXY DNS traffic and forwards it through
-/// the DNS forwarding engine with proactive eBPF route updates.
+/// DNS Controller — resolves admitted queries and publishes domain routes.
+/// Transport adapters own socket admission and replies.
 pub struct DnsController {
     dns_service: crate::dns::DnsService,
     routing_projection: Arc<crate::dns::projection::RoutingProjection>,
-    concurrency_limit: Semaphore,
+    concurrency_limit: Arc<Semaphore>,
 }
 
 impl DnsController {
@@ -110,7 +103,7 @@ impl DnsController {
         Self {
             dns_service,
             routing_projection,
-            concurrency_limit: Semaphore::new(DEFAULT_MAX_CONCURRENT_QUERIES),
+            concurrency_limit: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_QUERIES)),
         }
     }
 
@@ -120,8 +113,11 @@ impl DnsController {
     pub async fn resolve_domain(&self, domain: &str) -> Vec<std::net::IpAddr> {
         match self.dns_service.resolve_name(domain).await {
             Ok(resolved) => resolved.ipv4.into_iter().chain(resolved.ipv6).collect(),
-            Err(error) => {
-                debug!(%error, "DNS controller name resolution failed");
+            Err(_) => {
+                debug!(
+                    error_kind = "lookup_failed",
+                    "DNS controller name resolution failed"
+                );
                 Vec::new()
             }
         }
@@ -172,23 +168,21 @@ impl DnsController {
         self.dns_service.cache()
     }
 
-    /// Resolve a DNS query with singleflight deduplication.
-    async fn resolve_with_singleflight(
+    /// Acquire admission for one complete query lifecycle. The owned permit
+    /// can move into an adapter task and remain held through its reply write.
+    pub(crate) fn try_acquire_query(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::TryAcquireError> {
+        Arc::clone(&self.concurrency_limit).try_acquire_owned()
+    }
+
+    /// Resolve and project one generation-pinned DNS query.
+    pub(crate) async fn answer_query(
         &self,
         data: &[u8],
         original_dst: Option<SocketAddr>,
         ingress: crate::dns::query::IngressProfile,
     ) -> Vec<u8> {
-        self.resolve_and_notify(data, original_dst, ingress).await.0
-    }
-
-    /// Resolve a raw DNS query and notify BPF on success.
-    async fn resolve_and_notify(
-        &self,
-        data: &[u8],
-        original_dst: Option<SocketAddr>,
-        ingress: crate::dns::query::IngressProfile,
-    ) -> (Vec<u8>, bool) {
         match self
             .dns_service
             .resolve_outcome_with_runtime(data, original_dst, ingress)
@@ -196,21 +190,24 @@ impl DnsController {
         {
             Ok((outcome, runtime)) => {
                 self.submit_projection(runtime.runtime(), &outcome);
-                let resp = outcome.rendered().to_vec();
-                (resp, true)
+                outcome.rendered().to_vec()
             }
-            Err(e)
-                if e.downcast_ref::<crate::dns::forwarder::DnsForwardError>()
+            Err(error)
+                if error
+                    .downcast_ref::<crate::dns::forwarder::DnsForwardError>()
                     .is_some_and(|error| {
                         matches!(error, crate::dns::forwarder::DnsForwardError::Overloaded)
                     }) =>
             {
                 crate::stats::record_dns_event(crate::stats::DnsStatEvent::OutcomeRejected);
-                (transport::build_dns_refused(data), false)
+                build_dns_refused(data)
             }
-            Err(e) => {
-                debug!("DNS controller forward failed: {}; sending SERVFAIL", e);
-                (build_dns_servfail(data), true)
+            Err(_) => {
+                debug!(
+                    error_kind = "resolve_failed",
+                    "DNS controller forward failed; sending SERVFAIL"
+                );
+                build_dns_servfail(data)
             }
         }
     }

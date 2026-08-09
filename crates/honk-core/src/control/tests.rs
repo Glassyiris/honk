@@ -1,6 +1,7 @@
 use super::udp_dial::{UdpPrepare, UdpStaggerCallbacks, prepare_udp_plan};
 use super::*;
 use crate::control::udp_endpoint::UdpEndpoint;
+use crate::dns::query::is_exact_dns_query;
 
 #[test]
 fn test_build_dns_probe_query() {
@@ -234,7 +235,8 @@ fn udp_original_dst_cmsg_parser_walks_aligned_ipv4_multi_cmsg() {
         bytes_of(&pktinfo),
     );
 
-    let (original_dst, packet_dst_ip) = parse_cmsg_control(&storage.bytes[..used], 0).unwrap();
+    let (original_dst, packet_dst_ip, packet_ifindex) =
+        parse_cmsg_control(&storage.bytes[..used], 0).unwrap();
     assert_eq!(original_dst, Some(addr("203.0.113.10:4444")));
     assert_eq!(
         packet_dst_ip,
@@ -242,6 +244,7 @@ fn udp_original_dst_cmsg_parser_walks_aligned_ipv4_multi_cmsg() {
             198, 51, 100, 53
         )))
     );
+    assert_eq!(packet_ifindex, Some(0));
 }
 
 #[test]
@@ -258,7 +261,7 @@ fn udp_original_dst_cmsg_parser_walks_aligned_ipv6_multi_cmsg() {
         ipi6_addr: libc::in6_addr {
             s6_addr: expected_packet.octets(),
         },
-        ipi6_ifindex: 0,
+        ipi6_ifindex: 7,
     };
     let mut storage = AlignedTestCmsgStorage::new();
     let mut used = 0;
@@ -277,9 +280,11 @@ fn udp_original_dst_cmsg_parser_walks_aligned_ipv6_multi_cmsg() {
         bytes_of(&pktinfo),
     );
 
-    let (original_dst, packet_dst_ip) = parse_cmsg_control(&storage.bytes[..used], 0).unwrap();
+    let (original_dst, packet_dst_ip, packet_ifindex) =
+        parse_cmsg_control(&storage.bytes[..used], 0).unwrap();
     assert_eq!(original_dst, Some(addr("[2001:db8::4444]:4444")));
     assert_eq!(packet_dst_ip, Some(std::net::IpAddr::V6(expected_packet)));
+    assert_eq!(packet_ifindex, Some(7));
 }
 
 #[test]
@@ -349,6 +354,7 @@ fn udp_original_dst_unspecified_origdst_is_authoritative_and_fails_closed() {
     let meta = UdpRecvMeta {
         original_dst_cmsg: Some(addr("0.0.0.0:53")),
         packet_dst_ip: Some("198.51.100.53".parse().unwrap()),
+        packet_ifindex: None,
         local_addr: addr("192.0.2.20:5353"),
     };
 
@@ -532,7 +538,8 @@ fn udp_original_dst_cmsg_parser_skips_unknown_cmsg_with_padding() {
         bytes_of(&pktinfo),
     );
 
-    let (original_dst, packet_dst_ip) = parse_cmsg_control(&storage.bytes[..used], 0).unwrap();
+    let (original_dst, packet_dst_ip, packet_ifindex) =
+        parse_cmsg_control(&storage.bytes[..used], 0).unwrap();
     assert_eq!(original_dst, Some(addr("203.0.113.10:4444")));
     assert_eq!(
         packet_dst_ip,
@@ -540,6 +547,7 @@ fn udp_original_dst_cmsg_parser_skips_unknown_cmsg_with_padding() {
             198, 51, 100, 53
         )))
     );
+    assert_eq!(packet_ifindex, Some(0));
 }
 
 async fn ready_udp_endpoint(
@@ -592,7 +600,7 @@ fn udp_original_dst_exact_dns_predicate_matches_controller_condition() {
 }
 
 #[test]
-fn udp_strict_dns_validator_accepts_complete_query_and_edns_only() {
+fn strict_dns_query_accepts_complete_query_and_edns_only() {
     let query = dns_query_payload();
     assert!(is_exact_dns_query(&query));
 
@@ -653,7 +661,7 @@ fn dns_query_with_qname(qname: &[u8]) -> Vec<u8> {
 }
 
 #[test]
-fn udp_strict_dns_validator_enforces_expanded_name_limit_and_label_boundaries() {
+fn strict_dns_query_enforces_expanded_name_limit_and_label_boundaries() {
     // Four 63-byte labels + root expand to 257 octets (>255) and must fail.
     let mut overlong_name = Vec::new();
     for _ in 0..4 {
@@ -703,7 +711,7 @@ fn udp_strict_dns_validator_enforces_expanded_name_limit_and_label_boundaries() 
 }
 
 #[test]
-fn udp_strict_dns_validator_requires_controller_parseable_question() {
+fn strict_dns_query_requires_forwarder_parseable_question() {
     // Root qname is wire-valid but parse_dns_question rejects empty labels.
     let root = dns_query_with_qname(&[0x00]);
     assert!(crate::dns::forwarder::parse_dns_question(&root).is_none());
@@ -789,6 +797,7 @@ fn udp_original_dst_cmsg_takes_precedence_over_other_metadata() {
     let meta = UdpRecvMeta {
         original_dst_cmsg: Some(addr("203.0.113.10:4444")),
         packet_dst_ip: Some("198.51.100.10".parse().unwrap()),
+        packet_ifindex: None,
         local_addr: addr("192.0.2.10:5353"),
     };
 
@@ -815,6 +824,7 @@ fn udp_original_dst_uses_ipv4_pktinfo_for_exact_dns_query() {
     let meta = UdpRecvMeta {
         original_dst_cmsg: None,
         packet_dst_ip,
+        packet_ifindex: None,
         local_addr: addr("0.0.0.0:15000"),
     };
     assert_eq!(
@@ -839,6 +849,7 @@ fn udp_original_dst_uses_ipv6_pktinfo_for_exact_dns_query() {
     let meta = UdpRecvMeta {
         original_dst_cmsg: None,
         packet_dst_ip,
+        packet_ifindex: None,
         local_addr: addr("[::]:15000"),
     };
     assert_eq!(
@@ -853,6 +864,7 @@ fn udp_original_dst_uses_non_wildcard_local_fallback() {
     let meta = UdpRecvMeta {
         original_dst_cmsg: None,
         packet_dst_ip: None,
+        packet_ifindex: None,
         local_addr,
     };
 
@@ -865,6 +877,7 @@ fn udp_original_dst_fails_closed_for_wildcard_local_without_metadata() {
         let meta = UdpRecvMeta {
             original_dst_cmsg: None,
             packet_dst_ip: None,
+            packet_ifindex: None,
             local_addr,
         };
         assert_eq!(udp_original_dst(&meta, b"opaque UDP"), None);
@@ -876,12 +889,14 @@ fn udp_original_dst_does_not_rewrite_non_exact_dns_payloads() {
     let packet_meta = UdpRecvMeta {
         original_dst_cmsg: None,
         packet_dst_ip: Some("198.51.100.53".parse().unwrap()),
+        packet_ifindex: None,
         local_addr: addr("0.0.0.0:15000"),
     };
     let local_fallback = addr("192.0.2.20:5353");
     let fallback_meta = UdpRecvMeta {
         original_dst_cmsg: None,
         packet_dst_ip: None,
+        packet_ifindex: None,
         local_addr: local_fallback,
     };
     let mut dns_response = dns_query_payload();
@@ -5089,7 +5104,7 @@ async fn shutdown_detaches_hooks_and_stays_bounded_with_stuck_flow() {
     let mut removal_task = tokio::spawn(async {});
 
     tokio::time::timeout(Duration::from_secs(30), async {
-        cp.shutdown_datapath(&drain, &mut removal_task)
+        cp.shutdown_datapath(&drain, &mut removal_task, None)
             .await
             .unwrap();
         cp.finalize_shutdown().await.unwrap();

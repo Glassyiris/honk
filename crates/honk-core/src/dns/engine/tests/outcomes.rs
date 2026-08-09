@@ -254,3 +254,17 @@ async fn stale_outcome_covers_upstream_error_and_servfail_without_sleeping() {
         &[9, 9, 9, 9]
     );
 }
+
+#[test]
+fn engine_rejects_multiple_questions_before_policy_planning() {
+    let mut wire = build_dns_query("allowed.example", 1);
+    let second = build_dns_query("blocked.example", 1);
+    wire[4..6].copy_from_slice(&2u16.to_be_bytes());
+    wire.extend_from_slice(&second[12..]);
+    let router = DnsRouter::new(&DnsRouting::default()).expect("router");
+    let engine = DnsEngine::from_router(&router, None).expect("engine");
+
+    let result = engine.prepare(&wire, None, IngressProfile::Internal);
+
+    assert!(matches!(result, Err(EngineError::MultipleQuestions)));
+}

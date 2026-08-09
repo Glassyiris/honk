@@ -13,8 +13,12 @@ static ZERO_CAPACITY_WARNED: AtomicBool = AtomicBool::new(false);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PublicationEpoch(pub(super) u64);
 
+const TARGET_WIRE_BYTES_PER_ENTRY: usize = 4 * 1024;
+const MIN_WIRE_BYTES_PER_SHARD: usize = u16::MAX as usize;
+const MAX_TOTAL_WIRE_BYTES: usize = 64 * 1024 * 1024;
+
 pub struct DnsCacheService {
-    pub(super) shards: Vec<Mutex<lru::LruCache<CacheSlot, CacheValue>>>,
+    pub(super) shards: Vec<Mutex<CacheShard>>,
     pub(super) flights: Singleflight,
     pub(super) counters: CacheCounterSet,
     pub(super) persister: Mutex<Option<crate::dns::persist::DnsCachePersister>>,
@@ -26,6 +30,107 @@ pub struct DnsCacheService {
 pub(crate) enum CacheSlot {
     Exact(CacheKey),
     Legacy(String),
+}
+
+impl CacheSlot {
+    fn wire_bytes(&self) -> usize {
+        match self {
+            Self::Exact(key) => {
+                let scope_bytes = match key.scope() {
+                    crate::dns::planner::RequestScope::Upstream(tag) => tag.as_str().len(),
+                    crate::dns::planner::RequestScope::AsIs(_) => 0,
+                };
+                key.wire_identity().len().saturating_add(scope_bytes)
+            }
+            Self::Legacy(key) => key.len(),
+        }
+    }
+}
+
+pub(super) struct CacheShard {
+    entries: lru::LruCache<CacheSlot, CacheValue>,
+    wire_bytes: usize,
+    wire_byte_capacity: usize,
+}
+
+impl CacheShard {
+    fn new(entry_capacity: NonZeroUsize, wire_byte_capacity: usize) -> Self {
+        Self {
+            entries: lru::LruCache::new(entry_capacity),
+            wire_bytes: 0,
+            wire_byte_capacity,
+        }
+    }
+
+    fn entry_wire_bytes(key: &CacheSlot, value: &CacheValue) -> usize {
+        key.wire_bytes().saturating_add(value.response_bytes())
+    }
+
+    pub(super) fn put(&mut self, key: CacheSlot, value: CacheValue) -> bool {
+        let retained_key = key.clone();
+        self.wire_bytes = self
+            .wire_bytes
+            .saturating_add(Self::entry_wire_bytes(&key, &value));
+        if let Some((removed_key, removed_value)) = self.entries.push(key, value) {
+            self.wire_bytes = self
+                .wire_bytes
+                .saturating_sub(Self::entry_wire_bytes(&removed_key, &removed_value));
+        }
+        while self.wire_bytes > self.wire_byte_capacity {
+            let Some((removed_key, removed_value)) = self.entries.pop_lru() else {
+                self.wire_bytes = 0;
+                break;
+            };
+            self.wire_bytes = self
+                .wire_bytes
+                .saturating_sub(Self::entry_wire_bytes(&removed_key, &removed_value));
+        }
+        self.entries.contains(&retained_key)
+    }
+
+    pub(super) fn pop(&mut self, key: &CacheSlot) -> Option<CacheValue> {
+        let (removed_key, removed_value) = self.entries.pop_entry(key)?;
+        self.wire_bytes = self
+            .wire_bytes
+            .saturating_sub(Self::entry_wire_bytes(&removed_key, &removed_value));
+        Some(removed_value)
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.entries.clear();
+        self.wire_bytes = 0;
+    }
+
+    pub(super) fn remove_positive(&mut self, key: &CacheSlot) {
+        let mut removed_response_bytes = 0;
+        let mut remove_slot = false;
+        if let Some(value) = self.entries.get_mut(key) {
+            if let Some(entry) = value.positive.take() {
+                removed_response_bytes = entry.response.len();
+            }
+            remove_slot = value.negative.is_none();
+        }
+        self.wire_bytes = self.wire_bytes.saturating_sub(removed_response_bytes);
+        if remove_slot && let Some((removed_key, removed_value)) = self.entries.pop_entry(key) {
+            self.wire_bytes = self
+                .wire_bytes
+                .saturating_sub(Self::entry_wire_bytes(&removed_key, &removed_value));
+        }
+    }
+}
+
+impl std::ops::Deref for CacheShard {
+    type Target = lru::LruCache<CacheSlot, CacheValue>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+impl std::ops::DerefMut for CacheShard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.entries
+    }
 }
 
 pub(super) struct RefreshTasks {
@@ -56,12 +161,20 @@ impl DnsCache {
         let shard_count = capacity.min(16);
         let quotient = capacity / shard_count;
         let remainder = capacity % shard_count;
+        let minimum_total = shard_count.saturating_mul(MIN_WIRE_BYTES_PER_SHARD);
+        let wire_byte_capacity = capacity
+            .saturating_mul(TARGET_WIRE_BYTES_PER_ENTRY)
+            .clamp(minimum_total, MAX_TOTAL_WIRE_BYTES);
+        let byte_quotient = wire_byte_capacity / shard_count;
+        let byte_remainder = wire_byte_capacity % shard_count;
         let shards = (0..shard_count)
             .map(|index| {
                 let shard_capacity = quotient + usize::from(index < remainder);
-                Mutex::new(lru::LruCache::new(
+                let shard_byte_capacity = byte_quotient + usize::from(index < byte_remainder);
+                Mutex::new(CacheShard::new(
                     NonZeroUsize::new(shard_capacity)
                         .unwrap_or_else(|| unreachable!("shard capacity is positive")),
+                    shard_byte_capacity,
                 ))
             })
             .collect();

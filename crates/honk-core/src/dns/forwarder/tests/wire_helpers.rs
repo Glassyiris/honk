@@ -88,11 +88,6 @@ fn test_extract_min_ttl_short_response() {
     assert_eq!(extract_min_ttl(&short), 60);
 }
 
-#[test]
-fn test_cache_key_format() {
-    assert_eq!(dns_cache_key("example.com", 1), "example.com:1");
-    assert_eq!(dns_cache_key("test.org", 28), "test.org:28");
-}
 
 #[test]
 fn test_build_and_parse_roundtrip() {
@@ -131,4 +126,45 @@ fn test_rewrite_answer_ttls_overrides_wire() {
     assert_eq!(extract_min_ttl(&resp), 30);
     rewrite_answer_ttls(&mut resp, 600);
     assert_eq!(extract_min_ttl(&resp), 600);
+}
+
+#[test]
+fn ttl_helpers_preserve_edns_opt_control_word() {
+    let mut response = make_a_response([1, 2, 3, 4], 60_000);
+    response[10..12].copy_from_slice(&1u16.to_be_bytes());
+    let opt_offset = response.len();
+    let control_word = [0x00, 0x00, 0x80, 0x00];
+    response.extend_from_slice(&[
+        0x00, 0x00, 0x29, 0x04, 0xd0, control_word[0], control_word[1], control_word[2],
+        control_word[3], 0x00, 0x00,
+    ]);
+
+    assert_eq!(extract_min_ttl(&response), 60_000);
+    rewrite_answer_ttls(&mut response, 600);
+    assert_eq!(extract_min_ttl(&response), 600);
+    assert_eq!(&response[opt_offset + 5..opt_offset + 9], &control_word);
+}
+
+#[test]
+fn empty_response_preserves_exact_question_and_sanitizes_edns() {
+    let mut query = build_dns_query("MiXeD.Example", 28);
+    let question_end = query.len();
+    query[3] |= 0x10;
+    query[question_end - 2..question_end].copy_from_slice(&3u16.to_be_bytes());
+    query[10..12].copy_from_slice(&1u16.to_be_bytes());
+    query.extend_from_slice(&[
+        0x00, 0x00, 0x29, 0x04, 0xd0, 0x00, 0x00, 0x80, 0x00, 0x00, 0x04, 0x00, 0x0c,
+        0x00, 0x00,
+    ]);
+    let context = crate::dns::query::QueryContext::parse(&query).expect("EDNS query");
+
+    let response = make_empty_response(&query, &context);
+
+    assert_eq!(&response[12..question_end], &query[12..question_end]);
+    assert_eq!(u16::from_be_bytes([response[2], response[3]]), 0x8190);
+    assert_eq!(&response[4..12], &[0, 1, 0, 0, 0, 0, 0, 1]);
+    assert_eq!(
+        &response[question_end..],
+        &[0x00, 0x00, 0x29, 0x04, 0xd0, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00]
+    );
 }

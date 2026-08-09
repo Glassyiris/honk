@@ -96,6 +96,50 @@ async fn test_stale_while_revalidate_refresh() {
     assert_eq!(calls, 2, "background refresh should re-query upstream");
 }
 
+#[tokio::test]
+async fn background_refresh_rejects_a_mismatched_question_before_cache_write() {
+    struct InvalidRefreshUpstream {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl DnsUpstreamPool for InvalidRefreshUpstream {
+        async fn query(&self, _: &str, _: &[u8]) -> anyhow::Result<Vec<u8>> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut response = make_a_response(
+                if call == 0 { [192, 0, 2, 1] } else { [192, 0, 2, 2] },
+                2,
+            );
+            if call > 0 {
+                response[13..20].copy_from_slice(b"poisonx");
+            }
+            Ok(response)
+        }
+    }
+
+    let upstream = Arc::new(InvalidRefreshUpstream {
+        calls: AtomicUsize::new(0),
+    });
+    let forwarder = DnsForwarder::new(upstream.clone(), test_cache(), test_router());
+    let service = forwarder.cache_service().await;
+    let query = make_a_query();
+    forwarder.resolve(&query).await.expect("prime cache");
+    tokio::time::sleep(Duration::from_millis(1900)).await;
+
+    forwarder.resolve(&query).await.expect("near-expiry hit");
+    for _ in 0..20 {
+        if service.refresh_task_count() == 0 && upstream.calls.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(upstream.calls.load(Ordering::SeqCst), 2);
+    let entries = service.positive_entries_for_test();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(&entries[0].response[entries[0].response.len() - 4..], &[192, 0, 2, 1]);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hot_near_expiry_hits_own_one_refresh_task_and_close_cleans_it() {
     const CALLERS: usize = 128;

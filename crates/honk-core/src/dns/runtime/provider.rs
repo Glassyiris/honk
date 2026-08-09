@@ -47,9 +47,10 @@ impl PreparedPublication<'_> {
                 "DNS runtime forced close"
             );
             oldest.request_cancellation();
-            // Publication is synchronous under the provider guards, so the
-            // asynchronous outbound shutdown is owned by the same supervisor
-            // set as runtime retirement and joined during provider shutdown.
+            // The evicted runtime is no longer reachable from `state.retired`.
+            // Publication is synchronous under the provider guards, so its
+            // asynchronous outbound shutdown remains owned by the same supervisor
+            // set as runtime retirement and is joined during provider shutdown.
             self.supervisors
                 .spawn(async move { oldest.force_shutdown_outbound().await });
         }

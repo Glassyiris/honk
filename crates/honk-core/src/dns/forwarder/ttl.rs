@@ -76,10 +76,9 @@ pub(crate) fn extract_soa_negative_ttl(data: &[u8], default_ttl: u32) -> u32 {
     default_ttl
 }
 
-/// Overwrite TTL fields on every answer/authority/additional RR with `ttl`.
-///
-/// Used so cached (and client-visible) records reflect `optimistic_cache_ttl`
-/// rather than the upstream's original values. Malformed tails are left as-is.
+/// Overwrite TTL fields on answer/authority/additional records with `ttl`,
+/// excluding EDNS OPT pseudo-records whose field is an extended control word.
+/// Malformed tails are left as-is.
 pub(crate) fn rewrite_answer_ttls(data: &mut [u8], ttl: u32) {
     if data.len() < 12 {
         return;
@@ -109,17 +108,17 @@ pub(crate) fn rewrite_answer_ttls(data: &mut [u8], ttl: u32) {
             return;
         }
         // TYPE(2) CLASS(2) TTL(4) RDLENGTH(2) RDATA
-        data[pos + 4] = ttl_be[0];
-        data[pos + 5] = ttl_be[1];
-        data[pos + 6] = ttl_be[2];
-        data[pos + 7] = ttl_be[3];
+        let rtype = u16::from_be_bytes([data[pos], data[pos + 1]]);
+        if rtype != 41 {
+            data[pos + 4..pos + 8].copy_from_slice(&ttl_be);
+        }
         let rdlength = u16::from_be_bytes([data[pos + 8], data[pos + 9]]) as usize;
         pos += 10 + rdlength;
     }
 }
 
-/// Extract the minimum positive TTL from all answer/authority/additional
-/// records in a DNS response.  Returns 60 if no TTL is found.
+/// Extract the minimum positive TTL from DNS records, excluding EDNS OPT
+/// pseudo-records. Returns 60 if no TTL is found.
 pub(crate) fn extract_min_ttl(data: &[u8]) -> u32 {
     if data.len() < 12 {
         return 60;
@@ -157,8 +156,9 @@ pub(crate) fn extract_min_ttl(data: &[u8]) -> u32 {
         }
 
         // Record layout after NAME: TYPE(2) CLASS(2) TTL(4) RDLENGTH(2) RDATA(n)
+        let rtype = u16::from_be_bytes([data[pos], data[pos + 1]]);
         let ttl = u32::from_be_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]]);
-        if ttl > 0 && ttl < min_ttl {
+        if rtype != 41 && ttl > 0 && ttl < min_ttl {
             min_ttl = ttl;
         }
 

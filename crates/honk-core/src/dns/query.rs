@@ -11,7 +11,152 @@ const HEADER_LEN: usize = 12;
 const MIN_QUESTION_WIRE_LEN: usize = 5;
 const OPT_TYPE: u16 = 41;
 const ALLOWED_QUERY_FLAGS: u16 = 0x0130;
+/// Validate a complete DNS request structurally. Ingress adapters and the
+/// policy engine apply the stricter single-question contract before any raw
+/// query can be forwarded.
+pub(crate) fn is_dns_request(data: &[u8]) -> bool {
+    data.len() >= HEADER_LEN
+        && data[2] & 0x80 == 0
+        && QueryContext::parse(data)
+            .ok()
+            .and_then(|query| query.qname()?.to_domain_name())
+            .is_some()
+}
 
+/// Return whether `data` is exactly one DNS query that the forwarding path
+/// can consume. Every record declared by the header must be complete and the
+/// message must end at the final record; compression pointers may only target
+/// previously observed label boundaries.
+pub(crate) fn is_exact_dns_query(data: &[u8]) -> bool {
+    if data.len() < HEADER_LEN || data[2] & 0x80 != 0 {
+        return false;
+    }
+
+    let qdcount = usize::from(u16::from_be_bytes([data[4], data[5]]));
+    if qdcount != 1 {
+        return false;
+    }
+    let counts = [
+        usize::from(u16::from_be_bytes([data[6], data[7]])),
+        usize::from(u16::from_be_bytes([data[8], data[9]])),
+        usize::from(u16::from_be_bytes([data[10], data[11]])),
+    ];
+    let mut pos = HEADER_LEN;
+    // Label starts observed while walking question/owner names. Compression
+    // pointers may only land on these boundaries (not header/RDATA/interior
+    // label bytes). Unparsed RDATA is intentionally not scanned.
+    let mut label_boundaries = vec![false; data.len()];
+
+    if !skip_strict_dns_name(data, &mut pos, &mut label_boundaries)
+        || pos.checked_add(4).is_none_or(|end| end > data.len())
+    {
+        return false;
+    }
+    pos += 4; // QTYPE + QCLASS
+
+    for count in counts {
+        for _ in 0..count {
+            if !skip_strict_dns_name(data, &mut pos, &mut label_boundaries)
+                || pos.checked_add(10).is_none_or(|end| end > data.len())
+            {
+                return false;
+            }
+            let rdlength = usize::from(u16::from_be_bytes([data[pos + 8], data[pos + 9]]));
+            pos += 10; // TYPE + CLASS + TTL + RDLENGTH
+            let Some(rdata_end) = pos.checked_add(rdlength) else {
+                return false;
+            };
+            if rdata_end > data.len() {
+                return false;
+            }
+            pos = rdata_end;
+        }
+    }
+
+    if pos != data.len() {
+        return false;
+    }
+
+    is_dns_request(data)
+}
+
+/// Derive the response-size policy advertised by a UDP DNS query.
+pub(crate) fn udp_ingress_profile(data: &[u8]) -> IngressProfile {
+    let advertised_size = QueryContext::parse(data)
+        .ok()
+        .and_then(|query| query.edns().map(|edns| edns.advertised_size()))
+        .unwrap_or(512);
+    IngressProfile::Udp { advertised_size }
+}
+
+/// Bounds-safe name walk that enforces the RFC expanded-name limit and
+/// restricts compression pointers to previously observed label boundaries.
+fn skip_strict_dns_name(data: &[u8], pos: &mut usize, label_boundaries: &mut [bool]) -> bool {
+    let mut cursor = *pos;
+    let mut expanded = 0usize;
+    let mut jumped = false;
+    let mut depth = 0usize;
+
+    loop {
+        if depth > 128 || cursor >= data.len() || cursor >= label_boundaries.len() {
+            return false;
+        }
+
+        if jumped {
+            if !label_boundaries[cursor] {
+                return false;
+            }
+        } else {
+            label_boundaries[cursor] = true;
+        }
+
+        let label_len = data[cursor];
+        if label_len == 0 {
+            if expanded.checked_add(1).is_none_or(|value| value > 255) {
+                return false;
+            }
+            if !jumped {
+                *pos = cursor + 1;
+            }
+            return true;
+        }
+
+        if label_len & 0xc0 == 0xc0 {
+            let Some(&next) = data.get(cursor + 1) else {
+                return false;
+            };
+            let target = (usize::from(label_len & 0x3f) << 8) | usize::from(next);
+            // Pointers name an earlier observed label start only.
+            if target >= cursor || target >= label_boundaries.len() || !label_boundaries[target] {
+                return false;
+            }
+            if !jumped {
+                *pos = cursor + 2;
+            }
+            jumped = true;
+            cursor = target;
+            depth += 1;
+            continue;
+        }
+
+        if label_len > 63 {
+            return false;
+        }
+
+        let label_octets = 1 + usize::from(label_len);
+        expanded = match expanded.checked_add(label_octets) {
+            Some(value) if value <= 255 => value,
+            _ => return false,
+        };
+        let Some(next_pos) = cursor.checked_add(label_octets) else {
+            return false;
+        };
+        if next_pos > data.len() {
+            return false;
+        }
+        cursor = next_pos;
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TxId(u16);
 
@@ -45,6 +190,30 @@ pub struct DnsName(Box<[u8]>);
 impl DnsName {
     pub fn as_wire(&self) -> &[u8] {
         &self.0
+    }
+
+    /// Decode the canonical wire name as a lowercase dotted UTF-8 domain.
+    pub fn to_domain_name(&self) -> Option<String> {
+        let mut domain = String::with_capacity(self.0.len());
+        let mut cursor = 0usize;
+        loop {
+            let length = usize::from(*self.0.get(cursor)?);
+            cursor += 1;
+            if length == 0 {
+                if domain.is_empty() || cursor != self.0.len() {
+                    return None;
+                }
+                domain.make_ascii_lowercase();
+                return Some(domain);
+            }
+            let end = cursor.checked_add(length)?;
+            let label = std::str::from_utf8(self.0.get(cursor..end)?).ok()?;
+            if !domain.is_empty() {
+                domain.push('.');
+            }
+            domain.push_str(label);
+            cursor = end;
+        }
     }
 }
 

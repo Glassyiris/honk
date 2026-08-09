@@ -7,6 +7,7 @@
 //! warm the cache for frequently-accessed domains.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -81,41 +82,9 @@ pub(crate) enum ResolveMode {
     Compatibility,
 }
 
-/// Notifier called when a domain is resolved (cache miss → upstream query).
-///
-/// The control plane implements this to update eBPF DOMAIN_ROUTING_MAP
-/// proactively, so subsequent connections to the resolved IPs can be
-/// routed by eBPF without userspace involvement.
-pub trait DomainResolveNotifier: Send + Sync {
-    /// Called after a successful upstream resolution with the domain name
-    /// and the raw DNS response bytes.
-    fn on_domain_resolved(&self, domain: &str, response: &[u8]);
-}
-
-/// DNS forwarder that resolves queries through a pipeline of
-/// cache → routing → upstream → cache.
-///
-/// Optionally notifies a [`DomainResolveNotifier`] after successful
-/// resolution so the control plane can proactively update eBPF
-/// domain routing maps.
-///
-/// # Pipeline
-///
-/// ```text
-/// raw_query
-///   │
-///   ├─ parse domain + qtype
-///   ├─ strategy filter (empty A/AAAA)
-///   ├─ request routing (reject / asis / upstream)  — before cache (dae order)
-///   ├─ cache.get(key)  ── hit ──→ return cached bytes
-///   │       │ miss
-///   ├─ upstream_pool.query / asis dial
-///   ├─ response routing loop (accept / reject / requery, depth ≤ 3)
-///   ├─ fixed_domain_ttl / optimistic_cache_ttl
-///   ├─ cache.put
-///   ├─ notifier.on_domain_resolved
-///   └─ return response
-/// ```
+/// DNS query pipeline: strategy and request routing, exact-identity cache,
+/// upstream exchange, bounded response re-query, TTL policy, then cache write.
+/// Domain-route learning is owned by `DnsController`'s outcome projection.
 #[derive(Clone)]
 pub struct DnsForwarder {
     pub(crate) upstream_pool: Arc<dyn DnsUpstreamPool>,
@@ -132,8 +101,9 @@ pub struct DnsForwarder {
     /// and when rewriting wire TTLs on the way into the cache. `0` falls
     /// back to the answer min TTL (default path uses 600).
     pub(crate) cache_ttl: u32,
-    pub(crate) notifier: Option<Arc<dyn DomainResolveNotifier>>,
     pub(crate) policy_id: Option<PolicyId>,
+    pub(crate) query_timeout: Duration,
+    pub(crate) dial_timeout: Duration,
     prefetch_tasks: Arc<prefetch::PrefetchTasks>,
 }
 
@@ -154,30 +124,9 @@ impl DnsForwarder {
             cache_enabled: true,
             // 0 = keep answer min TTL until `with_cache_ttl` is applied from config.
             cache_ttl: 0,
-            notifier: None,
             policy_id: None,
-            prefetch_tasks: prefetch::PrefetchTasks::new(),
-        }
-    }
-
-    /// Create a new forwarder with a domain resolve notifier.
-    pub fn with_notifier(
-        upstream_pool: Arc<dyn DnsUpstreamPool>,
-        cache: Arc<Mutex<DnsCache>>,
-        routing: Arc<DnsRouter>,
-        notifier: Arc<dyn DomainResolveNotifier>,
-    ) -> Self {
-        Self {
-            upstream_pool,
-            cache,
-            cache_service: Arc::new(OnceCell::new()),
-            engine: Arc::new(OnceCell::new()),
-            routing,
-            strategy: DnsStrategy::default(),
-            cache_enabled: true,
-            cache_ttl: 0,
-            notifier: Some(notifier),
-            policy_id: None,
+            query_timeout: Duration::from_secs(5),
+            dial_timeout: Duration::from_secs(10),
             prefetch_tasks: prefetch::PrefetchTasks::new(),
         }
     }
@@ -201,6 +150,13 @@ impl DnsForwarder {
     /// stored in the cache. `0` keeps answer min TTL behaviour.
     pub fn with_cache_ttl(mut self, ttl_secs: u32) -> Self {
         self.cache_ttl = ttl_secs;
+        self
+    }
+
+    /// Set the DNS exchange and TCP dial timeouts.
+    pub fn with_timeouts(mut self, query_timeout: Duration, dial_timeout: Duration) -> Self {
+        self.query_timeout = query_timeout;
+        self.dial_timeout = dial_timeout;
         self
     }
 
@@ -249,8 +205,9 @@ impl DnsForwarder {
             strategy: self.strategy.clone(),
             cache_enabled: self.cache_enabled,
             cache_ttl: self.cache_ttl,
-            notifier: self.notifier.clone(),
             policy_id: self.policy_id.clone(),
+            query_timeout: self.query_timeout,
+            dial_timeout: self.dial_timeout,
             prefetch_tasks: prefetch::PrefetchTasks::closed(),
         }
     }
@@ -261,18 +218,260 @@ impl DnsForwarder {
 }
 
 mod exchange;
-mod message;
+mod message {
+    use crate::dns::query::{NameParseState, parse_name};
+    use std::net::{IpAddr, SocketAddr};
+
+    use super::AsIsExchangeError;
+
+    pub(super) fn new_asis_socket_with_mark(
+        destination: SocketAddr,
+        mark: impl FnOnce(&socket2::Socket) -> std::io::Result<()>,
+    ) -> Result<socket2::Socket, AsIsExchangeError> {
+        let domain = if destination.is_ipv4() {
+            socket2::Domain::IPV4
+        } else {
+            socket2::Domain::IPV6
+        };
+        let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, None)
+            .map_err(|source| AsIsExchangeError::Socket { source })?;
+        socket
+            .set_nonblocking(true)
+            .map_err(|source| AsIsExchangeError::Nonblocking { source })?;
+        mark(&socket).map_err(|source| AsIsExchangeError::BypassMark { source })?;
+        let bind_address = SocketAddr::new(
+            if destination.is_ipv4() {
+                IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+            } else {
+                IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+            },
+            0,
+        );
+        socket
+            .bind(&bind_address.into())
+            .map_err(|source| AsIsExchangeError::Bind { source })?;
+        Ok(socket)
+    }
+
+    /// Build a minimal DNS query for the given domain and query type.
+    pub fn build_dns_query(domain: &str, qtype: u16) -> Vec<u8> {
+        let qname = encode_dns_name(domain);
+        let mut query = Vec::with_capacity(12 + qname.len() + 4);
+
+        // Header: ID=0, flags=0x0100 (RD), QDCOUNT=1, rest=0
+        query.extend_from_slice(&[0x00, 0x00]); // ID
+        query.extend_from_slice(&[0x01, 0x00]); // Flags (recursion desired)
+        query.extend_from_slice(&[0x00, 0x01]); // QDCOUNT
+        query.extend_from_slice(&[0x00, 0x00]); // ANCOUNT
+        query.extend_from_slice(&[0x00, 0x00]); // NSCOUNT
+        query.extend_from_slice(&[0x00, 0x00]); // ARCOUNT
+
+        query.extend_from_slice(&qname);
+        query.extend_from_slice(&qtype.to_be_bytes());
+        query.extend_from_slice(&[0x00, 0x01]); // QCLASS = IN
+
+        query
+    }
+
+    /// Encode a domain name into DNS label format.
+    ///
+    /// Example: `"example.com"` → `[0x07, b'e', ..., 0x03, b'c', b'o', b'm', 0x00]`
+    fn encode_dns_name(domain: &str) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        for label in domain.split('.') {
+            if label.len() > 63 {
+                continue;
+            }
+            encoded.push(label.len() as u8);
+            encoded.extend_from_slice(label.as_bytes());
+        }
+        encoded.push(0x00); // terminator
+        encoded
+    }
+
+    /// Parse the first question from a raw DNS query.
+    ///
+    /// Returns the domain name and QTYPE on success, or `None` if the
+    /// message is truncated or malformed.
+    pub fn parse_dns_question(data: &[u8]) -> Option<(String, u16)> {
+        if data.len() < 16 || u16::from_be_bytes([data[4], data[5]]) == 0 {
+            return None;
+        }
+
+        let mut state = NameParseState::new(data.len());
+        let (name, question_end) = parse_name(data, 12, &mut state).ok()?;
+        let fields_end = question_end.checked_add(4)?;
+        let fields = data.get(question_end..fields_end)?;
+        let qtype = u16::from_be_bytes([fields[0], fields[1]]);
+        Some((name.to_domain_name()?, qtype))
+    }
+
+    /// Extract A/AAAA answer IPs from a wire-format DNS response.
+    pub fn extract_answer_ips(data: &[u8]) -> Vec<IpAddr> {
+        crate::dns::wire::extract_ips_from_dns_response(data)
+    }
+}
 mod prefetch;
 mod resolution;
-mod response;
-mod strategy;
+mod response {
+    use super::message::extract_answer_ips;
+    use crate::dns::query::QueryContext;
+    use crate::dns::response::dns_error_flags;
+    use honk_config::dns::DnsStrategy;
+
+    /// Return `true` if the given query type is hard-filtered at request time.
+    /// Only the `*_only` strategies filter here; prefer strategies forward both
+    /// families and suppress at response time instead.
+    pub(crate) fn is_filtered_qtype(qtype: u16, strategy: &DnsStrategy) -> bool {
+        match strategy {
+            DnsStrategy::Ipv4Only => qtype == 28, // AAAA
+            DnsStrategy::Ipv6Only => qtype == 1,  // A
+            DnsStrategy::PreferIpv4 | DnsStrategy::PreferIpv6 | DnsStrategy::Both => false,
+        }
+    }
+
+    /// Whether a wire-format response contains at least one address record of
+    /// the given family (qtype 1 = A, 28 = AAAA).
+    pub(super) fn response_has_family_ips(response: &[u8], qtype: u16) -> bool {
+        extract_answer_ips(response).iter().any(|ip| match qtype {
+            1 => ip.is_ipv4(),
+            28 => ip.is_ipv6(),
+            _ => false,
+        })
+    }
+
+    /// Human-readable qtype name for logging.
+    pub(crate) fn qtype_name(qtype: u16) -> &'static str {
+        match qtype {
+            1 => "A",
+            28 => "AAAA",
+            5 => "CNAME",
+            15 => "MX",
+            16 => "TXT",
+            2 => "NS",
+            _ => "OTHER",
+        }
+    }
+
+    /// Build a NODATA response while preserving the exact question bytes.
+    pub(crate) fn make_empty_response(raw_query: &[u8], query: &QueryContext) -> Vec<u8> {
+        let question_end = query
+            .question_offsets()
+            .map(|offsets| offsets.end())
+            .unwrap_or(12)
+            .min(raw_query.len());
+        let mut response = raw_query[..question_end].to_vec();
+        response.resize(response.len().max(12), 0);
+        response[2..4].copy_from_slice(&dns_error_flags(raw_query, 0).to_be_bytes());
+        response[4..6].copy_from_slice(&1u16.to_be_bytes());
+        response[6..12].fill(0);
+
+        if let Some(edns) = query.edns().filter(|edns| edns.version() == 0) {
+            response[10..12].copy_from_slice(&1u16.to_be_bytes());
+            response.extend_from_slice(&[0, 0, 41]);
+            response.extend_from_slice(&edns.advertised_size().to_be_bytes());
+            let flags = if edns.dnssec_ok() { 0x8000u32 } else { 0 };
+            response.extend_from_slice(&flags.to_be_bytes());
+            response.extend_from_slice(&0u16.to_be_bytes());
+        }
+        response
+    }
+}
+mod strategy {
+    use anyhow::Context;
+    use bytes::Bytes;
+    use std::net::SocketAddr;
+
+    use tracing::debug;
+
+    use crate::dns::query::QueryContext;
+    use honk_config::dns::DnsStrategy;
+
+    use super::DnsForwarder;
+    use super::response::{make_empty_response, qtype_name, response_has_family_ips};
+
+    impl DnsForwarder {
+        /// Prefer-mode strategy (sing-box / dae `ipversion_prefer` semantics):
+        /// when the preferred family has answers for the same name, suppress the
+        /// non-preferred family's response with NODATA; otherwise return it
+        /// unchanged. Only-modes are handled earlier at request time.
+        pub(crate) async fn apply_prefer_strategy(
+            &self,
+            raw_query: &[u8],
+            query: &QueryContext,
+            qtype: u16,
+            response: Bytes,
+            original_dst: Option<SocketAddr>,
+        ) -> anyhow::Result<Bytes> {
+            let preferred = match (&self.strategy, qtype) {
+                (DnsStrategy::PreferIpv4, 28) => 1u16,
+                (DnsStrategy::PreferIpv6, 1) => 28u16,
+                _ => return Ok(response),
+            };
+            if self
+                .preferred_family_has_answers(raw_query, query, preferred, original_dst)
+                .await?
+            {
+                debug!(
+                    qtype = qtype_name(qtype),
+                    preferred_qtype = qtype_name(preferred),
+                    "DNS forwarder suppressed non-preferred address family"
+                );
+                return Ok(make_empty_response(raw_query, query).into());
+            }
+            Ok(response)
+        }
+
+        /// Whether the preferred address family has answers for the same query,
+        /// issuing a sibling query through the normal pipeline. Only the first
+        /// question's QTYPE changes, preserving the caller's complete wire profile.
+        async fn preferred_family_has_answers(
+            &self,
+            raw_query: &[u8],
+            query: &QueryContext,
+            preferred_qtype: u16,
+            original_dst: Option<SocketAddr>,
+        ) -> anyhow::Result<bool> {
+            let offsets = query
+                .question_offsets()
+                .context("preferred-family probe is missing question offsets")?;
+            let qtype_start = offsets
+                .end()
+                .checked_sub(4)
+                .context("preferred-family question offsets are invalid")?;
+            let qtype_end = qtype_start + 2;
+            let mut sibling_query = raw_query.to_vec();
+            sibling_query
+                .get_mut(qtype_start..qtype_end)
+                .context("preferred-family QTYPE lies outside the query")?
+                .copy_from_slice(&preferred_qtype.to_be_bytes());
+
+            // Boxed: breaks the async recursion cycle through resolve_with_context
+            // (the sibling uses the preferred qtype, so it never re-enters here).
+            let sibling = Box::pin(self.resolve_with_context_and_profile(
+                &sibling_query,
+                original_dst,
+                query.ingress(),
+            ))
+            .await;
+            Ok(match sibling {
+                Ok(resp) => response_has_family_ips(&resp, preferred_qtype),
+                Err(_) => {
+                    debug!(
+                        error_kind = "preferred_family_probe_failed",
+                        preferred_qtype, "DNS forwarder preferred-family probe failed"
+                    );
+                    false
+                }
+            })
+        }
+    }
+}
 mod ttl;
 
 #[cfg(test)]
 use message::new_asis_socket_with_mark;
 pub use message::{build_dns_query, extract_answer_ips, parse_dns_question};
-#[cfg(test)]
-use response::dns_cache_key;
 pub(crate) use response::{is_filtered_qtype, make_empty_response};
 #[cfg(test)]
 use ttl::effective_cache_ttl;
@@ -298,4 +497,5 @@ mod tests {
     include!("forwarder/tests/requery_singleflight.rs");
     include!("forwarder/tests/context_and_family.rs");
     include!("forwarder/tests/family_and_negative.rs");
+    include!("forwarder/tests/asis_transport.rs");
 }

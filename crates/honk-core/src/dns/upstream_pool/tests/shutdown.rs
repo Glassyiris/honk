@@ -127,3 +127,47 @@ async fn cancelled_admission_releases_concurrent_close_waiters() {
     assert!(error.to_string().contains("closed"));
     assert_eq!(pool.lifecycle_stats(), TransportLifecycleStats::default());
 }
+
+#[tokio::test]
+async fn close_joins_udp_receive_task_and_removes_query_path() {
+    let server = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("UDP server");
+    let address = server.local_addr().expect("UDP server address");
+    let responder = tokio::spawn(async move {
+        let mut buffer = [0_u8; 512];
+        let (length, peer) = server.recv_from(&mut buffer).await.expect("UDP query");
+        let mut response = mock_dns_response(0);
+        response[..2].copy_from_slice(&buffer[..2]);
+        assert!(length >= response.len() - 16);
+        server.send_to(&response, peer).await.expect("UDP response");
+    });
+    let pool = UpstreamPool::new(
+        &[make_upstream(
+            "default",
+            &address.to_string(),
+            DnsProtocol::Udp,
+        )],
+        make_router(),
+    )
+    .expect("pool");
+    pool.query("default", &mock_dns_query(0x1234))
+        .await
+        .expect("UDP response");
+    responder.await.expect("UDP responder");
+    assert_eq!(pool.lifecycle_stats().tasks, 1);
+    assert!(pool.entries["default"].udp.lock().is_some());
+
+    pool.close().await;
+    pool.close().await;
+
+    assert_eq!(pool.lifecycle_stats().tasks, 0);
+    assert!(pool.entries["default"].udp.lock().is_none());
+    assert!(
+        pool.query("default", &mock_dns_query(0x5678))
+            .await
+            .expect_err("closed UDP path rejects queries")
+            .to_string()
+            .contains("closed")
+    );
+}

@@ -121,6 +121,52 @@ dns {
     }
 
     #[test]
+    fn test_parse_dns_bind_scalar_and_current_dae_bare_udp() {
+        let bare = parse_dae_config("dns {\n bind: 127.0.0.1:53\n}").unwrap();
+        assert_eq!(bare.dns.bind, "127.0.0.1:53");
+        let endpoint = bare.dns.bind_endpoint().unwrap().unwrap();
+        assert!(endpoint.udp_enabled());
+        assert!(!endpoint.tcp_enabled());
+        assert_eq!(endpoint.host(), "127.0.0.1");
+        assert_eq!(endpoint.port(), 53);
+
+        let dual = parse_dae_config("dns {\n bind: 'TcP+UdP://[::1]:0'\n}").unwrap();
+        assert_eq!(dual.dns.bind, "TcP+UdP://[::1]:0");
+        let endpoint = dual.dns.bind_endpoint().unwrap().unwrap();
+        assert!(endpoint.udp_enabled());
+        assert!(endpoint.tcp_enabled());
+        assert_eq!(endpoint.host(), "::1");
+        assert_eq!(endpoint.port(), 0);
+
+        let commented =
+            parse_dae_config("dns {\n bind: 'udp://localhost:53' # local resolver\n}").unwrap();
+        assert_eq!(commented.dns.bind, "udp://localhost:53");
+    }
+
+    #[test]
+    fn test_parse_dns_bind_rejects_invalid_values_clearly() {
+        for value in [
+            "localhost:53",
+            "udp://localhost",
+            "udp://user@localhost:53",
+            "udp://localhost:53/path",
+            "udp://localhost:53?query",
+            "udp://localhost:53#fragment",
+            "udp+tcp://localhost:53",
+            "udp://[::1:53",
+            "udp://localhost:65536",
+        ] {
+            let input = format!("dns {{\n bind: '{value}'\n}}");
+            let error = parse_dae_config(&input).unwrap_err();
+            assert!(matches!(error, crate::ConfigError::Parse(_)), "{value}");
+            assert!(
+                error.to_string().contains("dns.bind"),
+                "error must identify dns.bind for {value}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn test_parse_dns_upstream_tls_server_name() {
         let input = r#"
 dns {

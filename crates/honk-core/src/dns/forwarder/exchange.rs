@@ -1,6 +1,5 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::Context;
 use bytes::Bytes;
@@ -23,12 +22,15 @@ impl DnsForwarder {
         &self,
         scope: &RequestScope,
         raw_query: &[u8],
+        ingress: IngressProfile,
     ) -> anyhow::Result<Vec<u8>> {
         match scope {
             RequestScope::Upstream(upstream) => {
                 self.upstream_pool.query(upstream.as_str(), raw_query).await
             }
-            RequestScope::AsIs(destination) => self.query_asis(raw_query, Some(*destination)).await,
+            RequestScope::AsIs(destination) => {
+                self.query_asis(raw_query, *destination, ingress).await
+            }
         }
     }
 
@@ -93,7 +95,6 @@ impl DnsForwarder {
         &self,
         cache_key: &CacheKey,
         raw_query: &[u8],
-        domain: &str,
     ) -> Option<Vec<u8>> {
         if !self.cache_enabled {
             return None;
@@ -105,10 +106,7 @@ impl DnsForwarder {
         if response.len() >= 2 && raw_query.len() >= 2 {
             response[0..2].copy_from_slice(&raw_query[0..2]);
         }
-        debug!(
-            "DNS forwarder: serving stale cache for {} (upstream failure)",
-            domain
-        );
+        debug!("DNS forwarder serving stale cache after upstream failure");
         Some(response)
     }
 
@@ -139,12 +137,15 @@ impl DnsForwarder {
                 original_dst,
                 ingress,
                 true,
-                ResolveMode::Compatibility,
+                ResolveMode::Strict,
                 crate::dns::engine::pipeline::ResolveExecution::refresh(owner, publication_epoch),
             )
             .await;
-            if let Err(error) = result {
-                debug!("DNS forwarder: background refresh failed: {error:#}");
+            if result.is_err() {
+                debug!(
+                    error_kind = "background_refresh_failed",
+                    "DNS background refresh failed"
+                );
             }
         });
         if !spawned {
@@ -156,15 +157,36 @@ impl DnsForwarder {
     async fn query_asis(
         &self,
         raw_query: &[u8],
-        original_dst: Option<SocketAddr>,
+        destination: SocketAddr,
+        ingress: IngressProfile,
     ) -> anyhow::Result<Vec<u8>> {
-        let Some(dst) = original_dst else {
-            debug!("DNS forwarder: asis without original_dst — falling back to default upstream");
-            return self.upstream_pool.query("default", raw_query).await;
-        };
+        match ingress {
+            IngressProfile::Udp { .. } => {
+                let response = self.query_asis_udp(raw_query, destination).await?;
+                if response.get(2).is_some_and(|flags| flags & 0x02 != 0) {
+                    debug!(
+                        destination = %destination,
+                        "DNS forwarder: truncated asis UDP response, retrying over TCP"
+                    );
+                    self.query_asis_tcp(raw_query, destination).await
+                } else {
+                    Ok(response)
+                }
+            }
+            IngressProfile::Tcp => self.query_asis_tcp(raw_query, destination).await,
+            IngressProfile::Api | IngressProfile::Internal => {
+                unreachable!("internal/API asis request escaped planning")
+            }
+        }
+    }
 
-        debug!("DNS forwarder: asis dial {}", dst);
-        let sock2 = new_asis_socket_with_mark(dst, |socket| {
+    async fn query_asis_udp(
+        &self,
+        raw_query: &[u8],
+        destination: SocketAddr,
+    ) -> anyhow::Result<Vec<u8>> {
+        debug!(%destination, "DNS forwarder: asis UDP dial");
+        let sock2 = new_asis_socket_with_mark(destination, |socket| {
             #[cfg(target_os = "linux")]
             {
                 honk_outbound::util::set_mark_best_effort(socket, DAE_BYPASS_MARK)
@@ -175,20 +197,40 @@ impl DnsForwarder {
                 Ok(())
             }
         })?;
-        let socket = tokio::net::UdpSocket::from_std(sock2.into()).context("asis from_std")?;
-        socket.connect(dst).await.context("asis connect")?;
+        let socket = tokio::net::UdpSocket::from_std(sock2.into()).context("asis UDP from_std")?;
+        socket
+            .connect(destination)
+            .await
+            .context("asis UDP connect")?;
 
-        let resp = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(self.query_timeout, async {
             socket.send(raw_query).await?;
-            let mut buf = vec![0u8; 4096];
-            let n = socket.recv(&mut buf).await?;
-            buf.truncate(n);
-            Ok::<_, std::io::Error>(buf)
+            let mut response = vec![0u8; usize::from(u16::MAX)];
+            let received = socket.recv(&mut response).await?;
+            response.truncate(received);
+            Ok::<_, std::io::Error>(response)
         })
         .await
-        .context("asis recv timeout")?
-        .context("asis recv")?;
-        Ok(resp)
+        .context("asis UDP query timeout")?
+        .context("asis UDP exchange")
+    }
+
+    async fn query_asis_tcp(
+        &self,
+        raw_query: &[u8],
+        destination: SocketAddr,
+    ) -> anyhow::Result<Vec<u8>> {
+        debug!(%destination, "DNS forwarder: asis TCP dial");
+        let mut stream = honk_outbound::util::connect_marked_addr(
+            destination,
+            Some(DAE_BYPASS_MARK),
+            self.dial_timeout,
+        )
+        .await
+        .context("asis TCP connect")?;
+        crate::dns::transport::exchange_length_prefixed(&mut stream, raw_query, self.query_timeout)
+            .await
+            .context("asis TCP exchange")
     }
 
     /// Prefetch domains asynchronously to warm the cache.
@@ -206,11 +248,11 @@ impl DnsForwarder {
                     .resolve_with_profile(&query, IngressProfile::Internal)
                     .await
                 {
-                    Err(e) => {
-                        debug!("DNS prefetch: {} failed: {:#}", domain, e);
+                    Err(_) => {
+                        debug!(error_kind = "prefetch_failed", "DNS prefetch failed");
                     }
                     _ => {
-                        trace!("DNS prefetch: {} cached successfully", domain);
+                        trace!("DNS prefetch cached successfully");
                     }
                 }
             });

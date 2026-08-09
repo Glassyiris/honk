@@ -21,17 +21,23 @@ use super::{SharedQuicEndpoint, dns_quic_config, exchange_with_retry, quic_conne
 pub struct DoqClient {
     endpoint: DnsEndpoint,
     query_timeout: Duration,
+    dial_timeout: Duration,
     quic_config: ClientConfig,
     quic_ep: SharedQuicEndpoint,
     connection: LifecycleSlot<Connection>,
 }
 
 impl DoqClient {
-    pub async fn new(endpoint: DnsEndpoint, query_timeout: Duration) -> anyhow::Result<Arc<Self>> {
+    pub async fn new(
+        endpoint: DnsEndpoint,
+        query_timeout: Duration,
+        dial_timeout: Duration,
+    ) -> anyhow::Result<Arc<Self>> {
         let quic_config = dns_quic_config(&[b"doq"]).await?;
         Ok(Arc::new(Self {
             endpoint,
             query_timeout,
+            dial_timeout,
             quic_config,
             quic_ep: SharedQuicEndpoint::new(),
             connection: LifecycleSlot::new(),
@@ -51,20 +57,24 @@ impl DoqClient {
 
     async fn exchange_once(&self, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
         let conn = self.get_conn().await?;
-        let (mut send, mut recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| anyhow::anyhow!("DoQ open_bi: {e}"))?;
+        tokio::time::timeout(self.query_timeout, async {
+            let (mut send, mut recv) = conn
+                .open_bi()
+                .await
+                .map_err(|e| anyhow::anyhow!("DoQ open_bi: {e}"))?;
 
-        let mut wire = raw_query.to_vec();
-        let orig_id = force_dns_id_zero(&mut wire);
-        write_length_prefixed(&mut send, &wire).await?;
-        send.finish()
-            .map_err(|e| anyhow::anyhow!("DoQ finish send: {e}"))?;
+            let mut wire = raw_query.to_vec();
+            let orig_id = force_dns_id_zero(&mut wire);
+            write_length_prefixed(&mut send, &wire).await?;
+            send.finish()
+                .map_err(|e| anyhow::anyhow!("DoQ finish send: {e}"))?;
 
-        let mut resp = read_length_prefixed(&mut recv, self.query_timeout).await?;
-        restore_dns_id(&mut resp, orig_id);
-        Ok(resp)
+            let mut resp = read_length_prefixed(&mut recv, self.query_timeout).await?;
+            restore_dns_id(&mut resp, orig_id);
+            Ok::<_, anyhow::Error>(resp)
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("DoQ exchange timed out after {:?}", self.query_timeout))?
     }
 
     async fn get_conn(&self) -> anyhow::Result<Connection> {
@@ -81,30 +91,56 @@ impl DoqClient {
     }
 
     async fn dial(&self) -> anyhow::Result<Connection> {
-        let addr: SocketAddr = self.endpoint.resolve_addr().await?;
-        let conn = quic_connect(
-            &self.quic_ep,
-            &self.quic_config,
-            addr,
-            &self.endpoint.sni,
-            self.query_timeout,
-            "DoQ",
-        )
-        .await?;
-        Ok(conn)
+        tokio::time::timeout(self.dial_timeout, async {
+            let addr: SocketAddr = self.endpoint.resolve_addr().await?;
+            quic_connect(
+                &self.quic_ep,
+                &self.quic_config,
+                addr,
+                &self.endpoint.sni,
+                self.dial_timeout,
+                "DoQ",
+            )
+            .await
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("DoQ dial timed out after {:?}", self.dial_timeout))?
     }
 
     async fn close_connection(&self) {
+        let timeout = self.query_timeout;
         self.connection
             .close(|connection| async move {
                 connection.close(0_u32.into(), b"shutdown");
-                let _ = connection.closed().await;
+                let _ = tokio::time::timeout(timeout, connection.closed()).await;
             })
             .await;
     }
 
     pub(crate) async fn close(&self) {
         self.close_connection().await;
-        self.quic_ep.close().await;
+        self.quic_ep.close(self.query_timeout).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use honk_config::types::DnsProtocol;
+
+    #[tokio::test]
+    async fn constructor_keeps_query_and_dial_timeouts_distinct() {
+        let endpoint = DnsEndpoint::parse("127.0.0.1", DnsProtocol::Quic, Some("localhost"))
+            .expect("DoQ endpoint");
+        let client = DoqClient::new(
+            endpoint,
+            Duration::from_millis(111),
+            Duration::from_millis(222),
+        )
+        .await
+        .expect("DoQ client");
+
+        assert_eq!(client.query_timeout, Duration::from_millis(111));
+        assert_eq!(client.dial_timeout, Duration::from_millis(222));
     }
 }

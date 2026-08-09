@@ -11,9 +11,58 @@ pub(crate) const MAX_RETIRED_RUNTIMES: usize = 4;
 
 mod provider;
 pub(crate) use provider::DnsServiceProvider;
-mod resources;
+mod resources {
+    use async_trait::async_trait;
+
+    use crate::dns::upstream_pool::UpstreamPool;
+
+    #[async_trait]
+    pub(crate) trait RuntimeTransport: Send + Sync {
+        async fn close(&self);
+    }
+
+    #[async_trait]
+    impl RuntimeTransport for UpstreamPool {
+        async fn close(&self) {
+            UpstreamPool::close(self).await;
+        }
+    }
+}
 pub(crate) use resources::RuntimeTransport;
-mod state;
+mod state {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub(crate) struct RuntimeGeneration(u64);
+
+    impl RuntimeGeneration {
+        pub(crate) const fn new(value: u64) -> Self {
+            Self(value)
+        }
+
+        pub(crate) const fn get(self) -> u64 {
+            self.0
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[repr(u8)]
+    pub(crate) enum RuntimeState {
+        Active,
+        Draining,
+        Closing,
+        Closed,
+    }
+
+    impl RuntimeState {
+        pub(super) const fn from_raw(value: u8) -> Self {
+            match value {
+                0 => Self::Active,
+                1 => Self::Draining,
+                2 => Self::Closing,
+                _ => Self::Closed,
+            }
+        }
+    }
+}
 pub(crate) use state::{RuntimeGeneration, RuntimeState};
 #[cfg(test)]
 mod prefetch_tests;

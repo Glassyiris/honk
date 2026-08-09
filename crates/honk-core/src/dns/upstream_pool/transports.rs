@@ -74,24 +74,29 @@ impl UpstreamPool {
     ) -> anyhow::Result<PooledTransport> {
         let dial = self.dial_context(entry, proxy_node);
         Ok(match entry.protocol {
-            DnsProtocol::Tcp => PooledTransport::Tcp(TcpPool::new(dial)),
+            DnsProtocol::Udp | DnsProtocol::Tcp => PooledTransport::Tcp(TcpPool::new(dial)),
             DnsProtocol::Tls => PooledTransport::Dot(DotPool::new(dial)?),
             DnsProtocol::Https => PooledTransport::Doh(DohClient::new_tracked(
                 dial,
                 Arc::clone(&self.active_transport_tasks),
             )?),
             DnsProtocol::Quic => PooledTransport::Doq(
-                DoqClient::new(entry.endpoint.clone(), self.dns_query_timeout).await?,
+                DoqClient::new(
+                    entry.endpoint.clone(),
+                    self.dns_query_timeout,
+                    self.dns_dial_timeout,
+                )
+                .await?,
             ),
             DnsProtocol::H3 => PooledTransport::Doh3(
                 Doh3Client::new_tracked(
                     entry.endpoint.clone(),
                     self.dns_query_timeout,
+                    self.dns_dial_timeout,
                     Arc::clone(&self.active_transport_tasks),
                 )
                 .await?,
             ),
-            DnsProtocol::Udp => anyhow::bail!("internal: UDP has a dedicated pool"),
         })
     }
 
@@ -157,8 +162,13 @@ impl UpstreamPool {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        for entry in self.entries.values() {
-            entry.udp.lock().take();
+        let udp_pools = self
+            .entries
+            .values()
+            .filter_map(|entry| entry.udp.lock().take())
+            .collect::<Vec<_>>();
+        for pool in udp_pools {
+            pool.close().await;
         }
         for slot in slots {
             slot.close(|transport| async move {

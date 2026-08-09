@@ -534,14 +534,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         );
     }
 
-    // Singleton guard: the datapath uses fixed names (dae0, daens, TC
-    // hooks), and a stopping instance's cleanup destroys them. A second
-    // instance that starts while the first is still draining would have
-    // its fresh datapath ripped out from under it by that cleanup —
-    // silently, minutes later (the restart race that hung the lab for a
-    // day). Take an exclusive flock for the process lifetime; a second
-    // instance waits for the first to fully exit instead of overlapping.
-    let _instance_lock = acquire_instance_lock(&cli.bpf_pin_root)?;
+    // Only the real datapath owns fixed dae0/daens/TC resources. Mock mode
+    // must remain usable without access to the process-global /run lock.
+    let _instance_lock = if mock_mode {
+        None
+    } else {
+        Some(acquire_instance_lock(&cli.bpf_pin_root)?)
+    };
 
     // Create dae0 veth BEFORE eBPF load so PARAM.dae0_ifindex is correct.
     // dae0peer stays in the host namespace during the dae0 attach, then moves
@@ -831,6 +830,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             dns_upstream_pool.clone() as std::sync::Arc<dyn dns::forwarder::DnsUpstreamPool>,
             dns_cache,
             dns_router,
+        )
+        .with_timeouts(
+            std::time::Duration::from_millis(config.global.dns_resolve_timeout_ms),
+            std::time::Duration::from_millis(config.global.connect_timeout_ms),
         )
         .with_strategy(config.dns.strategy.clone())
         .with_cache_enabled(config.dns.cache.enabled)

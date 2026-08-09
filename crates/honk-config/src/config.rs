@@ -535,6 +535,10 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), crate::ConfigError> {
+        self.dns
+            .bind_endpoint()
+            .map_err(|error| crate::ConfigError::Validation(error.to_string()))?;
+
         // The eBPF datapath has the mark compiled in; userspace cannot inject
         // a different value, so a custom mark would silently break the proxy.
         if self.global.tproxy_mark != default_tproxy_mark() {
@@ -637,6 +641,24 @@ fn parse_yaml(content: &str) -> Result<Config, crate::ConfigError> {
 #[cfg(test)]
 mod builtin_nodes_tests {
     use super::*;
+
+    #[test]
+    fn test_validate_accepts_supported_dns_bind() {
+        let mut config = Config::default();
+        config.dns.bind = "tcp+udp://localhost:0".into();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_structured_dns_bind_clearly() {
+        let config = Config::from_json_str(r#"{"dns":{"bind":"udp://localhost"}}"#).unwrap();
+        let error = config.validate().unwrap_err();
+        assert!(matches!(error, crate::ConfigError::Validation(_)));
+        assert!(
+            error.to_string().contains("dns.bind"),
+            "validation error must identify dns.bind: {error}"
+        );
+    }
 
     #[test]
     fn test_validate_rejects_unknown_transport() {

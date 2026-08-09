@@ -32,11 +32,11 @@ impl SharedQuicEndpoint {
         Ok(ep)
     }
 
-    pub(super) async fn close(&self) {
+    pub(super) async fn close(&self, timeout: Duration) {
         let endpoint = self.0.lock().await.take();
         if let Some(endpoint) = endpoint {
             endpoint.close(0_u32.into(), b"shutdown");
-            endpoint.wait_idle().await;
+            let _ = tokio::time::timeout(timeout, endpoint.wait_idle()).await;
         }
     }
 }
