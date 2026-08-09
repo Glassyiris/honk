@@ -67,25 +67,8 @@ fn direct_target() -> SocketAddr {
         .unwrap_or_else(|| crate::alive::DEFAULT_DIRECT_CHECK_ADDR.parse().unwrap())
 }
 
-/// Maximum concurrent node measurements inside [`urltest_group`]
-/// (matches sing-box's health check concurrency).
 pub const URLTEST_MAX_CONCURRENT: usize = 10;
 
-/// Measure the round-trip latency to `url` through the node's runtime via
-/// `handler`. Session-owning protocols multiplex the probe onto their
-/// generation-warm session, so the measurement matches the real data path.
-///
-/// Dials the URL's host on port 443 (https) or 80 (http) through the proxy
-/// handler. For https URLs the stream is then wrapped in a real TLS
-/// handshake (server_name = host, standard webpki verification) and the
-/// probe issues a HEAD request over HTTP/1.1 or HTTP/2, whichever ALPN
-/// negotiated; the measurement runs from dial start until the response
-/// headers are fully received. A TLS handshake failure counts as a
-/// measurement failure.
-///
-/// An empty `url` or one starting with `http://` falls back to
-/// [`DEFAULT_URLTEST_URL`]. A zero `timeout` falls back to
-/// [`DEFAULT_URLTEST_TIMEOUT`].
 pub async fn urltest_node(
     runtime: &Arc<crate::runtime::NodeRuntime>,
     handler: &dyn TcpOutbound,
@@ -99,12 +82,7 @@ pub async fn urltest_node(
     } else {
         timeout
     };
-    // direct: the check URL is chosen for proxied egress and is commonly
-    // unreachable over a direct connection (e.g. google-analytics from CN),
-    // so measure a raw connect against the bootstrap resolver instead —
-    // the same target the periodic direct probe uses. A failed exchange
-    // here previously also cleared direct's latency history (sing-box
-    // delete-on-failure), leaving dashboards with no direct delay at all.
+
     if node.protocol == honk_config::types::NodeProtocol::Direct {
         let target = direct_target();
         let start = Instant::now();
@@ -400,8 +378,6 @@ fn normalize_url(url: &str) -> &str {
     }
 }
 
-/// Split a URL into (host, port, is_https): scheme default 443/80,
-/// explicit `:port` suffix wins. A schemeless URL is treated as https.
 fn parse_url_host_port(url: &str) -> anyhow::Result<(String, u16, bool)> {
     let (default_port, rest, is_https) = if let Some(r) = url.strip_prefix("https://") {
         (443u16, r, true)
@@ -425,8 +401,6 @@ fn parse_url_host_port(url: &str) -> anyhow::Result<(String, u16, bool)> {
     Ok((authority.to_string(), default_port, is_https))
 }
 
-/// Validate the HTTP response status line; 200–499 count as reachable
-/// (same convention as the periodic HTTP health check).
 fn validate_status(buf: &[u8]) -> anyhow::Result<()> {
     let line_end = buf.iter().position(|&b| b == b'\n').unwrap_or(buf.len());
     let status_line = String::from_utf8_lossy(&buf[..line_end]);
