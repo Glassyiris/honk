@@ -66,7 +66,7 @@ group { ... }          # selection policies over nodes / nested groups
 routing { ... }        # ordered traffic rules + fallback outbound
 dns { ... }            # upstreams, DNS routing, cache
 subscription { ... }   # remote node lists
-experimental { ... }   # clash_api, cache_file
+experimental { ... }   # clash_api, cache_file, udp_nfqueue
 ```
 
 Built-ins:
@@ -177,6 +177,9 @@ experimental {
         enabled: true
         path: 'cache.db'
         store_dns: true
+    }
+    udp_nfqueue {
+        enabled: false
     }
 }
 ```
@@ -527,6 +530,53 @@ transports and flows are parsed for visibility but are not dialed by
 
 ## 11. Experimental
 
+### Held-first-packet UDP NFQUEUE
+
+```dae
+experimental {
+    udp_nfqueue {
+        enabled: true
+    }
+}
+```
+
+`enabled` is the only setting and defaults to `false`. Changing
+`experimental.udp_nfqueue.enabled` is restart-required; a SIGHUP reload rejects
+the change. Enabled startup requires a build with the `ebpf` feature and the
+real eBPF backend. A build without `ebpf` or a run with `--mock-ebpf` is rejected
+at startup rather than silently falling back.
+
+This path covers **LAN-forwarded UDP only**: host `inet prerouting` follows the
+LAN TC staging point, while host-originated WAN egress remains on the canonical
+TPROXY path. Port 53, internal/special traffic, `must`, `block`, reverse traffic,
+and already-safe route-time direct decisions are excluded. Only an ambiguous
+decision that may still change after userspace routing or domain/QUIC inspection
+is staged.
+
+honk binds one raw-netlink NFQUEUE, fixed queue `320`, with no bypass, fanout, or
+fail-open mode. It owns the exact nftables table and chain names
+`inet honk_nfqueue` / `udp_decision`. A firewall manager in the same network
+namespace must not flush, replace, or mutate either object while honk is running.
+The eBPF `UDP_DECISION_SEQUENCE` pin is persistent across ordinary restart and
+cleanup so a token is not reused while an old skb or task can still exist;
+exhaustion requires a reboot.
+
+The original skb is held before conntrack/NAT. Direct performs token-checked
+Arm → FIFO `NF_ACCEPT` with the final mark → Activate, without a userspace direct
+socket, payload copy, endpoint, connection entry, or deliberate retransmission.
+Proxy commits token-bound state, transfers the one retained payload copy into
+the existing UDP initializer, drops the original skb(s), and dials/sends once.
+Block and cancellation drop the originals. Reload and shutdown clear readiness,
+quiesce/cancel pending ownership, and only then tear down the queue and owned
+table. Queue/listener/verdict errors and token exhaustion are fatal rather than
+fail-open.
+
+With the Clash API enabled, `GET /stats` exposes the fixed object
+`/stats.udp.nfqueue` (dotted path, not a separate route): `received`,
+`activeFlows`, `directAccepted`, `proxyCopied`, `proxyDropped`, `block`, `cancel`,
+`drop`, `tokenMismatch`, `tokenExhaustion`, `verdictErrors`, and
+`receiptToVerdict`. See the component reference for field meanings.
+
 ### Clash API
 
 ```dae
@@ -595,7 +645,8 @@ Subcommands: `mode`, `proxy`, `delay` (see [components.en.md](./components.en.md
 2. Ensure every `routing` fallback / rule target, `dns` fallback, and group `final:` name refers to a real group, node, `direct`, or `block`.
 3. For domain rules on first connection, use `dial_mode: domain` / `domain++` or ensure DNS goes through honk so domain bitmaps fill.
 4. After changing groups/policies, reload (SIGHUP) rebuilds `GroupManager`; selector choices migrate when still valid.
-5. Run `cargo test -p honk-config` to ensure examples still parse if you add fixtures.
+5. Changing `experimental.udp_nfqueue.enabled` requires a process restart; verify that an enabled deployment uses the real eBPF backend and that its firewall manager leaves `inet honk_nfqueue` / `udp_decision` alone.
+6. Run `cargo test -p honk-config` to ensure examples still parse if you add fixtures.
 
 ## 14. Related docs
 

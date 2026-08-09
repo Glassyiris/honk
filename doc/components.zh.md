@@ -520,6 +520,52 @@ dae 语法中每个订阅一行：`tag: 'https://...'` 或裸 `'https://...'`（
 
 ## 7. Experimental（`experimental { ... }`）
 
+```dae
+experimental {
+    clash_api {
+        external_controller: '0.0.0.0:9090'
+        external_ui: yacd
+        secret: ''
+        default_mode: Rule
+    }
+    cache_file {
+        enabled: false
+        path: 'cache.db'
+        cache_id: ''
+        store_fakeip: false
+        store_dns: false
+    }
+    udp_nfqueue {
+        enabled: false
+    }
+}
+```
+
+### `experimental { udp_nfqueue { ... } }`
+
+| 字段 | 默认值 | 含义 |
+| ------ | -------- | ------ |
+| `enabled` | `false` | 用 NFQUEUE 保留仍有歧义的 LAN 转发 UDP 首包，等待用户态终判 |
+
+该字段修改后必须重启。设为 `true` 时，启动只接受带 `ebpf` feature 且使用真实 eBPF
+后端的构建；`--mock-ebpf` 和不带 `ebpf` 的构建会被拒绝。该 hook 覆盖 LAN 转发流量，
+因为主机 `inet prerouting` 位于 LAN TC 之后。本机发起的 WAN 出口流量仍走规范 TPROXY
+路径。DNS 53、内部/特殊流量、`must`、`block`、反向流量和已经可以安全直连的决策
+绝不入队；只暂存仍有歧义的用户态/域名决策。
+
+机制固定为：raw-netlink 队列 `320`、单 listener，不启用 bypass、fanout、fail-open，
+也没有用户可配置的队列/worker 策略。honk 独占名称精确为
+`inet honk_nfqueue` / `udp_decision` 的 nftables 对象；运行期间，同一网络命名空间中的
+防火墙管理器不得修改它们。固定的 `UDP_DECISION_SEQUENCE` 分配器会跨普通重启/清理
+保留，不能在仍可能复用 token 时重置；耗尽后必须重启操作系统。
+
+被保留的 skb 位于 conntrack/NAT 之前。最终 direct 使用 token 校验的
+Arm → 按 FIFO 以最终 mark accept → Activate，不创建用户态直连 socket、payload 副本、
+故意重传、endpoint 或 connection 条目。Proxy 先提交 token 绑定状态，再把唯一的保留
+payload 副本转交给规范 UDP 初始化器，丢弃原始 skb，最后只拨号/发送一次。Block/cancel
+丢弃原始 skb。重载与关闭会 fence readiness，并在队列/表拆除前静默/取消所有 guard。
+队列、listener、verdict 故障和 token 耗尽均为致命错误。
+
 ### `experimental { clash_api { ... } }`
 
 | 字段 | 默认值 | 含义 |
@@ -569,7 +615,12 @@ udp = {
   queue: { accepted, full, closed },
   firstSend: { failures },
   stagger: { attempts, winners, cancellations },
-  warm: { attempts, successes, failures }
+  warm: { attempts, successes, failures },
+  nfqueue: {
+    received, activeFlows, directAccepted, proxyCopied, proxyDropped,
+    block, cancel, drop, tokenMismatch, tokenExhaustion, verdictErrors,
+    receiptToVerdict: H
+  }
 }
 H = { count, sumNanos, buckets }  // buckets 有固定 64 个 log2 slot
 ```
@@ -581,6 +632,13 @@ candidate 使用 detached client。loser 取消会关闭对应 detached work；w
 endpoint publication 前完成 promotion/arbitration。若普通流量已先填充 QUIC
 generation slot，则保留该 incumbent，winner transport 只为当前选中流持有自己的
 connection。warm 的 `successes` 只计 `Ready`；`NotApplicable` 保持中性。
+
+`nfqueue.received` 统计 listener 投递；`activeFlows` 是当前 pending correlator gauge。
+`directAccepted`、`proxyDropped`、`block`、`cancel` 和 `drop` 统计成功的内核 verdict；
+`proxyCopied` 统计把唯一 payload 所有权转交给规范初始化器的次数。
+`tokenMismatch`、`tokenExhaustion` 和 `verdictErrors` 暴露 fail-closed 故障。
+`receiptToVerdict` 测量 listener 收包到成功 verdict 的时间；NFQA timestamp 不保证存在，
+因此它不表示内核队列驻留时间。
 
 `/stats` 另有顶层 `warm` 对象，为即时 gauge：
 
