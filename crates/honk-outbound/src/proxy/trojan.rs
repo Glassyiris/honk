@@ -1,28 +1,5 @@
 //! Trojan proxy handler.
-//!
-//! Implements the Trojan-GFW protocol over a plain TCP, TLS-wrapped,
-//! WebSocket, or gRPC connection. The protocol header consists of:
-//!
-//! ```text
-//! SHA224(password) as 56 hex bytes | CRLF | cmd(1) | address | CRLF
-//! ```
-//!
-//! Address encoding follows the SOCKS5-style format used by Trojan:
-//! - IPv4:  `0x01` + 4 octets + 2-byte port
-//! - IPv6:  `0x04` + 16 octets + 2-byte port
-//! - Domain: `0x03` + 1-byte length + domain + 2-byte port
-//!
-//! Command bytes: `0x01` for TCP, `0x03` for UDP.
-//!
-//! ### Transport wrapping
-//!
-//! When `node.transport` is set to `"ws"` or `"grpc"`, the underlying
-//! TCP (or TLS) connection is wrapped before the Trojan handshake. The
-//! transport layer itself (WebSocket upgrade via tokio-tungstenite,
-//! minimal HTTP/2 + gRPC-Length-Prefixed framing) lives in
-//! [`super::transport`], shared with the VMess/VLESS handlers.
-//!
-//! Reference: <https://trojan-gfw.github.io/trojan/protocol>
+//! https://github.com/trojan-gfw/trojan
 
 use async_trait::async_trait;
 use honk_config::node::Node;
