@@ -770,7 +770,7 @@ protocol = "udp"
         }];
         let rules = config.routing.rules.clone();
 
-        let cp = ControlPlane::new(
+        let mut cp = ControlPlane::new(
             config,
             Box::new(MockEbpfBackend::new()),
             Router::new(&rules, "direct").unwrap(),
@@ -779,6 +779,15 @@ protocol = "udp"
             test_dns_forwarder(),
         )
         .unwrap();
+        cp.set_mode_state(std::sync::Arc::new(parking_lot::RwLock::new(
+            honk_core::mode::ModeState::new("Rule", "Proxy"),
+        )));
+        cp.start_datapath_flags_coordinator().unwrap();
+        cp.datapath_flags_handle()
+            .unwrap()
+            .initialize(0, false, false)
+            .await
+            .unwrap();
 
         // Simulate a late subscription fetch completing: two new nodes with
         // fresh UUIDs replace the previous generation.

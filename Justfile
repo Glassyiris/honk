@@ -90,8 +90,9 @@ test-config:
 test-ebpf:
     cargo test -p honk-ebpf-common
 
-# Root-gated netlink/netns integration tests (veth/route/rule roundtrip)
+# Root-gated netlink/netns integration tests (NFQUEUE + veth/route/rule roundtrip)
 test-netns:
+    cargo test -p honk-nfqueue --lib nfqueue_service_isolated_netns_kernel_contract -- --ignored --test-threads=1
     cargo test -p honk-core --features ebpf --lib netns -- --ignored --test-threads=1
     cargo test -p honk-core --features ebpf --lib link_lifecycle -- --ignored --test-threads=1
 
@@ -123,7 +124,7 @@ run-debug:
     @pkill honk-core 2>/dev/null || true
     @ip link del dae0 2>/dev/null || true
     @ip netns del daens 2>/dev/null || true
-    @find /sys/fs/bpf -maxdepth 1 -type f -delete 2>/dev/null || true
+    @find /sys/fs/bpf -maxdepth 1 -type f ! -name UDP_DECISION_SEQUENCE -delete 2>/dev/null || true
     sleep 1
     RUST_LOG=info ./target/release/honk-core \
         --config config.dae \
@@ -169,9 +170,9 @@ bpf-maps:
 clean:
     cargo clean
 
-# Clean all honk-core state (process, netns, veth, bpf maps, policy routes).
-# No iptables rules are installed by the live engine; the MASQUERADE/table-2023
-# lines below only remove legacy leftovers.
+# Clean transient honk-core state while preserving the boot-lifetime UDP
+# decision sequence pin. The MASQUERADE/table-2023 lines remove only legacy
+# leftovers; no iptables rules are installed by the live engine.
 clean-all:
     @echo "=== Stopping honk-core ==="
     @pkill honk-core 2>/dev/null || true
@@ -179,8 +180,8 @@ clean-all:
     @echo "=== Removing veth + netns ==="
     @ip link del dae0 2>/dev/null || true
     @ip netns del daens 2>/dev/null || true
-    @echo "=== Cleaning BPF maps ==="
-    @find /sys/fs/bpf -maxdepth 1 -type f -delete 2>/dev/null || true
+    @echo "=== Cleaning ephemeral BPF maps (preserving UDP_DECISION_SEQUENCE) ==="
+    @find /sys/fs/bpf -maxdepth 1 -type f ! -name UDP_DECISION_SEQUENCE -delete 2>/dev/null || true
     @echo "=== Cleaning policy routes (live: table 100) ==="
     @ip rule del fwmark 0x8000000/0x8000000 table 100 2>/dev/null || true
     @ip route flush table 100 2>/dev/null || true

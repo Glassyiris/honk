@@ -596,6 +596,9 @@ experimental {
         store_fakeip: true
         store_dns: true
     }
+    udp_nfqueue {
+        enabled: true
+    }
 }
 "#;
         let config = parse_dae_config(input).unwrap();
@@ -611,6 +614,28 @@ experimental {
         assert_eq!(config.experimental.cache_file.cache_id, "router1");
         assert!(config.experimental.cache_file.store_fakeip);
         assert!(config.experimental.cache_file.store_dns);
+        assert!(config.experimental.udp_nfqueue.enabled);
+
+        let defaulted = parse_dae_config("experimental {\n    udp_nfqueue {\n    }\n}").unwrap();
+        assert!(!defaulted.experimental.udp_nfqueue.enabled);
+    }
+
+    #[test]
+    fn test_udp_nfqueue_rejects_unknown_or_invalid_settings() {
+        for input in [
+            "experimental {\n    other {\n        enabled: true\n    }\n}",
+            "experimental {\n    udp_nfqueue {\n        workers: 4\n    }\n}",
+            "experimental {\n    udp_nfqueue {\n        enabled: maybe\n    }\n}",
+        ] {
+            let error = parse_dae_config(input).expect_err("unsupported NFQUEUE config must fail");
+            assert!(matches!(error, crate::ConfigError::Parse(_)), "{error}");
+        }
+
+        let error = crate::Config::from_json_str(
+            r#"{"experimental":{"udp_nfqueue":{"enabled":true,"workers":4}}}"#,
+        )
+        .expect_err("structured config must expose only enabled");
+        assert!(matches!(error, crate::ConfigError::Parse(_)));
     }
 }
 
