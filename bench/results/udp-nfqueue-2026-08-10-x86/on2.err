@@ -1,0 +1,5 @@
+# host=tester arch=x86_64 kernel=6.12.94+deb13-amd64
+# honk_bin=/root/nfq-bench-1c06f44/honk-core sha256=638325c436e59fa37dd3ac370a382bd4c31269e076bed6a87c8a53863930c1d1
+# dae_bin=/root/dae sha256=02ba6d1e12cfca3201107be4008d5b466dfd3c4ad57d68135df8cb0124aebe6e
+# lab-bench 2026-08-09T18:59:42Z engines=(honk) protos=(ss2022 trojan)
+# engine=honk

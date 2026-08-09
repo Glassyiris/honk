@@ -1,0 +1,5 @@
+case	work	time_low	time_estimate	time_high	throughput_estimate
+udp_steady_enqueue_128b	1000000	228.97 ms	232.79 ms	236.85 ms	524.37 MiB/s
+udp_reserve_rollback	10000	19.437 ms	20.019 ms	20.299 ms	499.54 Kelem/s
+udp_histogram_record_snapshot	1000000	11.292 ms	11.483 ms	11.844 ms	87.082 Melem/s
+udp_queue_saturation	64 admitted then drop newest	13.459 us	13.837 us	14.189 us	4.6252 Melem/s

@@ -1,0 +1,4 @@
+arm	runs	samples	received	nfqueue_received	p50_us	p95_us	p99_us	max_us
+off	5	5000	5000	0	140.957	320.528	606.557	29422.980
+on	5	5000	5000	5011	147.699	382.942	797.840	28767.094
+delta_pct	-	-	-	-	4.783	19.472	31.536	-2.229
