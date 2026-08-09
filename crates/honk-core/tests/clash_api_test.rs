@@ -129,7 +129,7 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
         path: db_path.to_str().unwrap().to_string(),
         ..Default::default()
     };
-    let db = Arc::new(CacheDb::open(&cache_cfg, None).expect("cache.db opens"));
+    let db = Arc::new(CacheDb::open(&cache_cfg).expect("cache.db opens"));
 
     let alive_set = Arc::new(AliveDialerSet::new());
     let group_manager =
@@ -611,7 +611,7 @@ async fn test_global_selection_and_mode_persisted() {
         path: app.db_path.to_str().unwrap().to_string(),
         ..Default::default()
     };
-    let reopened = CacheDb::open(&cache_cfg, None).unwrap();
+    let reopened = CacheDb::open(&cache_cfg).unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
     loop {
         if reopened.load_clash_mode().as_deref() == Some("Global")
@@ -1385,7 +1385,7 @@ async fn test_store_dns_persister_end_to_end() {
         store_dns: true,
         ..Default::default()
     };
-    let db = Arc::new(CacheDb::open(&cache_cfg, None).unwrap());
+    let db = Arc::new(CacheDb::open(&cache_cfg).unwrap());
 
     let dns_cache = Arc::new(tokio::sync::Mutex::new(DnsCache::new(16)));
     let dns_config = DnsConfig::default();

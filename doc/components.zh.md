@@ -24,7 +24,8 @@
 | `lan_interface` | string[] | `[]` | 拦截的 LAN 网卡；空时不安装任何 LAN hook；逗号分隔 |
 | `wan_interface` | string[] | `[]` | 拦截本机发起 TCP/UDP 的 WAN 网卡；`auto` 跟随 IPv4 默认路由。默认路由不存在时保持待定（不会回退到 `lo`），并在网卡、地址或路由事件后自动挂载；同一事件还会重新发布网关本机地址的 `direct(must)` 规则，并立即复测受健康状态控制的出站。 |
 | `auto_config_kernel_parameter` | bool | `false` | 自动 sysctl（需 root） |
-| `store_subscribe` | bool | `true` | 将每个订阅最近一次有效正文持久化到 `<运行目录>/.sub`，供启动/重载在网络不可用时恢复；修改后需重启进程。 |
+| `data_dir` | string | `"/var/share/honk"` | 生成状态与相对运行时资源的绝对根目录；不能为空，修改后需重启进程。 |
+| `store_subscribe` | bool | `true` | 将每个订阅最近一次有效正文持久化到 `global.data_dir` 下的 `.sub`，供启动/重载在网络不可用时恢复；已有 `./.sub` 会继续使用，直至手动迁移；修改后需重启进程。 |
 | `tcp_check_url` | string[] | gstatic HTTPS | TCP 健康检查目标；HTTPS 会先完成并校验目标 TLS，再发送配置的 HTTP 方法。 |
 | `tcp_check_http_method` | string | `"HEAD"` | URL 检查的 HTTP 方法 |
 | `udp_check_dns` | string[] | dns.google / 8.8.8.8 / IPv6 | UDP 健康检查 DNS 目标；逗号分隔 |
@@ -84,7 +85,7 @@ dae 语法中节点**只能以分享链接书写**：`tag: 'scheme://...'` 或�
 | `skip_cert_verify` | bool | `false` | 跳过证书校验；链接 `allowInsecure` / `insecure` 参数 |
 | `ech_enabled` | bool | `false` | 提供 ECH；链接 `ech=1`（或 `ech_config` 隐式开启） |
 | `ech_config` | string? | null | Base64 编码的 ECHConfigList；链接 `ech_config` 参数 |
-| `ech_config_path` | string? | null | 存放 base64 ECHConfigList 的文件路径 |
+| `ech_config_path` | string? | null | 存放 base64 ECHConfigList 的文件路径；相对路径优先读取 `<global.data_dir>/<path>`，不存在时兼容旧的工作目录相对文件。 |
 | `reality_public_key` | string? | null | REALITY 服务端 X25519 公钥（分享链接 `pbk`）；设置后该节点走 REALITY 握手而非普通 TLS（`security=reality` 隐含 `tls=true`） |
 | `reality_short_id` | string? | null | REALITY short id（链接 `sid`，偶数长度 hex，至多 8 字节） |
 | `reality_spider_x` | string? | null | REALITY spider 路径（链接 `spx`，链接约定默认 `/`） |
@@ -509,10 +510,11 @@ dae 语法中每个订阅一行：`tag: 'https://...'` 或裸 `'https://...'`（
 
 节点仍只存在于运行时，不会写回配置文件。默认启用
 `global { store_subscribe: true }`：每次成功获取并解析的原始正文会原子写入
-`<运行目录>/.sub`；目录权限为 `0700`、文件权限为 `0600`，文件名由 URL 与
-请求身份散列得到。启动时先恢复有效缓存，再在后台联网刷新；已恢复的订阅不再占用
-5 秒首次拉取等待时间。重载先沿用当前节点，并为没有可沿用节点的已启用订阅读取缓存。
-拉取、解析或落盘失败时，当前节点与上一次有效缓存均保持不变。
+`global.data_dir` 下的 `.sub`；已有旧 `./.sub` 会继续使用，直至手动迁移。目录权限为
+`0700`、文件权限为 `0600`，文件名由 URL 与请求身份散列得到。启动时先恢复有效缓存，
+再在后台联网刷新；已恢复的订阅不再占用 5 秒首次拉取等待时间。重载先沿用当前节点，
+并为没有可沿用节点的已启用订阅读取缓存。拉取、解析或落盘失败时，当前节点与上一次
+有效缓存均保持不变。
 
 ---
 
@@ -523,7 +525,7 @@ dae 语法中每个订阅一行：`tag: 'https://...'` 或裸 `'https://...'`（
 | 字段 | 默认值 | 含义 |
 | ------ | -------- | ------ |
 | `external_controller` | `""` | 监听地址；空 = 关闭 |
-| `external_ui` | `""` | 静态 UI 目录 |
+| `external_ui` | `""` | 静态 UI 目录；相对路径优先使用 `global.data_dir` 下的已有目录，再使用已有工作目录相对目录；不存在时指向 `global.data_dir` |
 | `secret` | `""` | Bearer / `?token=`；空 = 无鉴权 |
 | `default_mode` | `"Rule"` | `Rule` / `Global` / `Direct` |
 
@@ -601,7 +603,7 @@ QUIC client 槽。gauge 跟随当前 generation：资源排干后节点在下一
 | 字段 | 默认值 | 含义 |
 | ------ | -------- | ------ |
 | `enabled` | `false` | 持久化 SQLite 缓存 |
-| `path` | `"cache.db"` | 数据库路径 |
+| `path` | `"cache.db"` | 数据库路径；相对路径优先使用 `global.data_dir`，再使用原配置目录下已有路径 |
 | `cache_id` | `""` | 命名空间 id |
 | `store_fakeip` | `false` | FakeIP 持久化意图（引擎未完成） |
 | `store_dns` | `false` | 持久化 DNS 应答 |

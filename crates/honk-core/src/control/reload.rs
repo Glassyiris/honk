@@ -562,6 +562,9 @@ fn restart_required_changes(current: &Config, candidate: &Config) -> Vec<&'stati
     if old_global.auto_config_kernel_parameter != new_global.auto_config_kernel_parameter {
         changed.push("global.auto_config_kernel_parameter");
     }
+    if old_global.data_dir != new_global.data_dir {
+        changed.push("global.data_dir");
+    }
     if old_global.store_subscribe != new_global.store_subscribe {
         changed.push("global.store_subscribe");
     }
@@ -1580,6 +1583,18 @@ mod atomic_reload_tests {
         assert_eq!(
             restart_required_changes(&current, &replacement),
             vec!["dns.bind"]
+        );
+    }
+
+    #[test]
+    fn data_directory_change_requires_restart() {
+        let current = Config::default();
+        let mut replacement = current.clone();
+        replacement.global.data_dir = "/srv/honk".into();
+
+        assert_eq!(
+            restart_required_changes(&current, &replacement),
+            vec!["global.data_dir"]
         );
     }
 

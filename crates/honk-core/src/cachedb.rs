@@ -201,11 +201,20 @@ impl CacheDb {
     /// Open (or create) the cache database at the configured path.
     /// Returns `None` when `config.enabled` is false, or when the database
     /// cannot be opened even after a corruption reset.
-    pub fn open(config: &CacheFileConfig, config_dir: Option<&str>) -> Option<Self> {
+    pub fn open(config: &CacheFileConfig) -> Option<Self> {
+        Self::open_with_config_dir(config, None)
+    }
+
+    /// Open a cache database while preserving an existing path resolved
+    /// relative to the legacy configuration directory.
+    pub fn open_with_config_dir(
+        config: &CacheFileConfig,
+        legacy_config_dir: Option<&Path>,
+    ) -> Option<Self> {
         if !config.enabled {
             return None;
         }
-        let path = resolve_path(&config.path, config_dir);
+        let path = resolve_path(&config.path, legacy_config_dir);
         let prefix = if config.cache_id.is_empty() {
             String::new()
         } else {
@@ -698,6 +707,9 @@ pub struct PersistedDnsAnswer {
 
 /// Open the database, apply pragmas, and verify integrity via quick_check.
 fn open_and_check(path: &Path) -> Result<Connection, String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
     let conn = Connection::open(path).map_err(|e| e.to_string())?;
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;
@@ -749,15 +761,20 @@ fn reset_corrupt(path: &Path) {
     }
 }
 
-/// Resolve the cache file path. Relative paths are relative to the config dir.
-fn resolve_path(path: &str, config_dir: Option<&str>) -> PathBuf {
-    let p = PathBuf::from(if path.is_empty() { "cache.db" } else { path });
-    if p.is_absolute() {
-        p
-    } else if let Some(dir) = config_dir {
-        PathBuf::from(dir).join(p)
+/// Resolve a cache path. Relative paths prefer the runtime data directory,
+/// then an existing path under the legacy configuration directory.
+fn resolve_path(path: &str, legacy_config_dir: Option<&Path>) -> PathBuf {
+    let configured = if path.is_empty() { "cache.db" } else { path };
+    let configured_path = Path::new(configured);
+    let legacy_path = legacy_cache_path(configured_path, legacy_config_dir);
+    honk_config::paths::resolve_artifact_path_with_legacy(configured_path, legacy_path.as_deref())
+}
+
+fn legacy_cache_path(path: &Path, config_dir: Option<&Path>) -> Option<PathBuf> {
+    if path.is_absolute() {
+        None
     } else {
-        p
+        Some(config_dir.map_or_else(|| path.to_path_buf(), |dir| dir.join(path)))
     }
 }
 
@@ -776,10 +793,54 @@ mod tests {
     }
 
     #[test]
+    fn relative_cache_path_uses_the_data_directory() {
+        assert_eq!(
+            resolve_path("cache.db", None),
+            PathBuf::from("/var/share/honk/cache.db")
+        );
+    }
+
+    #[test]
+    fn cache_legacy_path_uses_the_original_config_directory() {
+        assert_eq!(
+            legacy_cache_path(Path::new("cache.db"), Some(Path::new("/etc/honk"))),
+            Some(PathBuf::from("/etc/honk/cache.db"))
+        );
+        assert_eq!(
+            legacy_cache_path(Path::new("cache.db"), Some(Path::new(""))),
+            Some(PathBuf::from("cache.db"))
+        );
+        assert_eq!(
+            legacy_cache_path(
+                Path::new("/srv/honk/cache.db"),
+                Some(Path::new("/etc/honk"))
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn existing_legacy_cache_stays_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let filename = format!("cache-{}.db", uuid::Uuid::new_v4());
+        let legacy_path = dir.path().join(&filename);
+        let seed = CacheDb::open(&cfg(&legacy_path, "")).unwrap();
+        seed.save_selector_choice("proxy", "legacy-node");
+        drop(seed);
+
+        let config = cfg(Path::new(&filename), "");
+        let db = CacheDb::open_with_config_dir(&config, Some(dir.path())).unwrap();
+        assert_eq!(
+            db.load_selector_choice("proxy").as_deref(),
+            Some("legacy-node")
+        );
+    }
+
+    #[test]
     fn basic_get_set_overwrite_remove() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cache.db");
-        let db = CacheDb::open(&cfg(&path, ""), None).unwrap();
+        let db = CacheDb::open(&cfg(&path, "")).unwrap();
 
         assert!(db.get("missing").is_none());
         db.set("k", "v1");
@@ -794,7 +855,7 @@ mod tests {
     fn point_writes_are_latest_wins_without_blocking_readers() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cache.db");
-        let db = std::sync::Arc::new(CacheDb::open(&cfg(&path, ""), None).unwrap());
+        let db = std::sync::Arc::new(CacheDb::open(&cfg(&path, "")).unwrap());
         let writer = std::sync::Arc::clone(&db);
         let worker = std::thread::spawn(move || {
             for value in 0..10_000 {
@@ -812,7 +873,7 @@ mod tests {
     fn point_save_does_not_wait_for_sqlite() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cache.db");
-        let db = Arc::new(CacheDb::open(&cfg(&path, ""), None).unwrap());
+        let db = Arc::new(CacheDb::open(&cfg(&path, "")).unwrap());
         let writer_guard = db.lock_for_test();
         let (completed, completion) = mpsc::channel();
         let saving = Arc::clone(&db);
@@ -834,7 +895,7 @@ mod tests {
     fn periodic_flush_bounds_point_write_durability() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cache.db");
-        let db = CacheDb::open(&cfg(&path, ""), None).unwrap();
+        let db = CacheDb::open(&cfg(&path, "")).unwrap();
         db.set("k", "v");
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
@@ -862,7 +923,7 @@ mod tests {
     fn selector_choice_and_clash_mode() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cache.db");
-        let db = CacheDb::open(&cfg(&path, ""), None).unwrap();
+        let db = CacheDb::open(&cfg(&path, "")).unwrap();
 
         assert!(db.load_selector_choice("proxy").is_none());
         db.save_selector_choice("proxy", "node-a");
@@ -877,8 +938,8 @@ mod tests {
     fn cache_id_isolation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cache.db");
-        let a = CacheDb::open(&cfg(&path, "a"), None).unwrap();
-        let b = CacheDb::open(&cfg(&path, "b"), None).unwrap();
+        let a = CacheDb::open(&cfg(&path, "a")).unwrap();
+        let b = CacheDb::open(&cfg(&path, "b")).unwrap();
 
         a.save_selector_choice("proxy", "node-a");
         a.save_clash_mode("Global");
@@ -892,7 +953,7 @@ mod tests {
         assert_eq!(b.load_selector_choice("proxy").as_deref(), Some("node-b"));
 
         // Empty cache_id is yet another (legacy) namespace.
-        let plain = CacheDb::open(&cfg(&path, ""), None).unwrap();
+        let plain = CacheDb::open(&cfg(&path, "")).unwrap();
         assert!(plain.load_selector_choice("proxy").is_none());
     }
 
@@ -900,7 +961,7 @@ mod tests {
     fn delay_sample_save_load_and_age_out() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cache.db");
-        let db = CacheDb::open(&cfg(&path, ""), None).unwrap();
+        let db = CacheDb::open(&cfg(&path, "")).unwrap();
         let now = 1_700_000_000u64;
 
         db.save_delay_sample("node-a", 123, now - 60);
@@ -927,7 +988,7 @@ mod tests {
         // Garbage large enough that SQLite cannot treat it as an empty db.
         std::fs::write(&path, vec![0xABu8; 256]).unwrap();
 
-        let db = CacheDb::open(&cfg(&path, ""), None).expect("open should recover");
+        let db = CacheDb::open(&cfg(&path, "")).expect("open should recover");
 
         let backup_exists = std::fs::read_dir(dir.path())
             .unwrap()
@@ -958,7 +1019,7 @@ mod tests {
             .unwrap();
         }
 
-        let db = CacheDb::open(&cfg(&path, ""), None).unwrap();
+        let db = CacheDb::open(&cfg(&path, "")).unwrap();
         assert_eq!(db.load_selector_choice("iris").as_deref(), Some("iris"));
 
         // The meta table is added on top without touching existing rows.
@@ -977,7 +1038,7 @@ mod tests {
     fn dns_answer_save_load_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cache.db");
-        let db = CacheDb::open(&cfg(&path, ""), None).unwrap();
+        let db = CacheDb::open(&cfg(&path, "")).unwrap();
         let now = 1_000_000u64;
 
         db.save_dns_answer("example.com", 1, r#"{"r":"QUJD"}"#, now + 300);
@@ -1003,7 +1064,7 @@ mod tests {
     fn dns_answer_expired_is_skipped_and_lazily_deleted() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cache.db");
-        let db = CacheDb::open(&cfg(&path, ""), None).unwrap();
+        let db = CacheDb::open(&cfg(&path, "")).unwrap();
         let now = 1_000_000u64;
 
         db.save_dns_answer("stale.com", 1, r#"{"r":"QUJD"}"#, now - 1);
@@ -1022,7 +1083,7 @@ mod tests {
     fn dns_flush_only_clears_dns_prefix() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cache.db");
-        let db = CacheDb::open(&cfg(&path, ""), None).unwrap();
+        let db = CacheDb::open(&cfg(&path, "")).unwrap();
         let now = 1_000_000u64;
 
         db.save_dns_answer("example.com", 1, r#"{"r":"QUJD"}"#, now + 300);
@@ -1038,8 +1099,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cache.db");
         let now = 1_000_000u64;
-        let a = CacheDb::open(&cfg(&path, "a"), None).unwrap();
-        let b = CacheDb::open(&cfg(&path, "b"), None).unwrap();
+        let a = CacheDb::open(&cfg(&path, "a")).unwrap();
+        let b = CacheDb::open(&cfg(&path, "b")).unwrap();
 
         a.save_dns_answer("example.com", 1, r#"{"r":"QUJD"}"#, now + 300);
         assert_eq!(a.load_dns_answers(now).len(), 1);
@@ -1057,7 +1118,7 @@ mod tests {
     fn legacy_loader_skips_v2_blob_without_touching_it() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cache.db");
-        let db = CacheDb::open(&cfg(&path, ""), None).unwrap();
+        let db = CacheDb::open(&cfg(&path, "")).unwrap();
         let now = 1_000_000u64;
         db.save_dns_answer("legacy.example", 1, r#"{"r":"QUJD"}"#, now + 300);
         db.write_dns_v2(&[("opaque".to_string(), vec![0, 1, 2, 3])])
@@ -1075,8 +1136,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cache.db");
         let now = 1_000_000u64;
-        let first = CacheDb::open(&cfg(&path, "first"), None).unwrap();
-        let second = CacheDb::open(&cfg(&path, "second"), None).unwrap();
+        let first = CacheDb::open(&cfg(&path, "first")).unwrap();
+        let second = CacheDb::open(&cfg(&path, "second")).unwrap();
         for db in [&first, &second] {
             db.save_dns_answer("example.com", 1, r#"{"r":"QUJD"}"#, now + 300);
             db.write_dns_v2(&[("opaque".to_string(), vec![0, 1, 2, 3])])
@@ -1104,7 +1165,7 @@ mod tests {
     fn v2_blob_keeps_schema_version_and_non_dns_rows_unchanged() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cache.db");
-        let db = CacheDb::open(&cfg(&path, ""), None).unwrap();
+        let db = CacheDb::open(&cfg(&path, "")).unwrap();
         db.save_selector_choice("proxy", "node-a");
         db.write_dns_v2(&[("opaque".to_string(), vec![0, 255, 1])])
             .unwrap();

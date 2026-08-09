@@ -331,8 +331,9 @@ pub fn load_ech_config_list(node: &Node) -> anyhow::Result<Option<Vec<u8>>> {
             .with_context(|| format!("node {}: ech_config", node.name));
     }
     if let Some(path) = &node.ech_config_path {
-        let contents = std::fs::read_to_string(path)
-            .with_context(|| format!("node {}: read {path}", node.name))?;
+        let path = honk_config::paths::resolve_dependency_path(path);
+        let contents = std::fs::read_to_string(&path)
+            .with_context(|| format!("node {}: read {}", node.name, path.display()))?;
         return decode_ech_config_list(&contents)
             .map(Some)
             .with_context(|| format!("node {}: ech_config_path", node.name));

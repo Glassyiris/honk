@@ -20,7 +20,7 @@ fn test_db(dir: &tempfile::TempDir, cache_id: &str) -> Arc<CacheDb> {
         store_fakeip: false,
         store_dns: true,
     };
-    Arc::new(CacheDb::open(&config, None).expect("cache.db"))
+    Arc::new(CacheDb::open(&config).expect("cache.db"))
 }
 
 fn policy(ttl: u64) -> PolicyId {

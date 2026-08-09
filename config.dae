@@ -5,6 +5,8 @@ global {
     dial_mode: domain++
     allow_insecure: false
     auto_config_kernel_parameter: true
+    # 运行时状态与相对资源根目录（须为绝对路径；修改后需重启）
+    data_dir: '/var/share/honk'
     tcp_check_url: 'https://www.gstatic.com/generate_204'
     tcp_check_http_method: HEAD
     udp_check_dns: 'dns.google.com:53,8.8.8.8,2001:4860:4860::8888'

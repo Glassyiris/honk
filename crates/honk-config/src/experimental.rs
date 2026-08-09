@@ -40,7 +40,8 @@ pub struct CacheFileConfig {
     /// Enable cache file persistence.
     #[serde(default)]
     pub enabled: bool,
-    /// Path to cache database file. Defaults to "cache.db" if empty.
+    /// Cache database path. New relative paths resolve below `global.data_dir`;
+    /// an existing legacy config-directory path is retained.
     #[serde(default = "default_cache_path")]
     pub path: String,
     /// Unique identifier for this router instance.

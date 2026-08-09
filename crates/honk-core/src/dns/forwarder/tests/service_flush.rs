@@ -107,7 +107,6 @@ async fn service_flush_fences_background_refresh_memory_and_persistence() {
                 store_fakeip: false,
                 store_dns: true,
             },
-            None,
         )
         .expect("cache.db"),
     );
@@ -188,7 +187,6 @@ async fn cancelled_persistent_flush_reopens_cache_publication() {
                 store_fakeip: false,
                 store_dns: true,
             },
-            None,
         )
         .expect("cache.db"),
     );

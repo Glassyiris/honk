@@ -38,6 +38,13 @@ impl reqwest::dns::Resolve for BootstrapDnsResolve {
 
 const SUBSCRIPTION_STORE_DIR: &str = ".sub";
 
+fn default_store_root() -> PathBuf {
+    honk_config::paths::resolve_artifact_path_with_legacy(
+        SUBSCRIPTION_STORE_DIR,
+        Some(Path::new(SUBSCRIPTION_STORE_DIR)),
+    )
+}
+
 /// Durable raw subscription bodies keyed by their fetch identity.
 #[derive(Clone, Debug)]
 pub struct SubscriptionStore {
@@ -45,8 +52,33 @@ pub struct SubscriptionStore {
 }
 
 impl SubscriptionStore {
-    pub fn in_current_dir() -> anyhow::Result<Self> {
-        Self::open(std::env::current_dir()?.join(SUBSCRIPTION_STORE_DIR))
+    /// Open the subscription store below `global.data_dir`, retaining an
+    /// existing legacy `./.sub` store during the data-directory cutover.
+    pub fn in_data_dir() -> anyhow::Result<Self> {
+        let root = default_store_root();
+        let preferred = honk_config::paths::resolve_artifact_path(SUBSCRIPTION_STORE_DIR);
+        if root == preferred {
+            return Self::open(root);
+        }
+        match Self::open(root.clone()) {
+            Ok(store) => {
+                tracing::warn!(
+                    legacy = %root.display(),
+                    preferred = %preferred.display(),
+                    "using legacy subscription store; move it to the runtime data directory"
+                );
+                Ok(store)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    legacy = %root.display(),
+                    preferred = %preferred.display(),
+                    %error,
+                    "legacy subscription store is unusable; starting a data-directory store"
+                );
+                Self::open(preferred)
+            }
+        }
     }
 
     fn open(root: PathBuf) -> anyhow::Result<Self> {
@@ -121,7 +153,7 @@ fn ensure_store_directory(root: &Path) -> anyhow::Result<()> {
         }
         Err(error) if error.kind() == ErrorKind::NotFound => {
             let mut builder = DirBuilder::new();
-            builder.mode(0o700).create(root)?;
+            builder.recursive(true).mode(0o700).create(root)?;
         }
         Err(error) => return Err(error.into()),
     }

@@ -60,8 +60,11 @@ pub struct GlobalConfig {
     pub wan_interface: Vec<String>,
     #[serde(default)]
     pub auto_config_kernel_parameter: bool,
-    /// Persist successfully fetched subscription bodies under `.sub` in the
-    /// process working directory so startup can recover without the network.
+    /// Root for generated state and relative runtime-supplied assets.
+    #[serde(default = "default_data_dir")]
+    pub data_dir: String,
+    /// Persist successfully fetched subscription bodies below the configured
+    /// runtime data directory so startup can recover without the network.
     #[serde(default = "default_store_subscribe")]
     pub store_subscribe: bool,
     #[serde(default = "default_tcp_check_urls")]
@@ -288,6 +291,9 @@ fn default_preconnect_node_count() -> usize {
 fn default_udp_warm_node_count() -> usize {
     0
 }
+fn default_data_dir() -> String {
+    crate::paths::DEFAULT_DATA_DIR.to_string()
+}
 fn default_store_subscribe() -> bool {
     true
 }
@@ -308,6 +314,7 @@ impl Default for GlobalConfig {
             lan_interface: vec![],
             wan_interface: vec![],
             auto_config_kernel_parameter: false,
+            data_dir: default_data_dir(),
             store_subscribe: default_store_subscribe(),
             tcp_check_url: default_tcp_check_urls(),
             tcp_check_http_method: default_tcp_check_http_method(),
@@ -535,6 +542,13 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), crate::ConfigError> {
+        let data_dir = std::path::Path::new(&self.global.data_dir);
+        if self.global.data_dir.is_empty() || !data_dir.is_absolute() {
+            return Err(crate::ConfigError::Validation(
+                "global.data_dir must be a non-empty absolute path".into(),
+            ));
+        }
+
         self.dns
             .bind_endpoint()
             .map_err(|error| crate::ConfigError::Validation(error.to_string()))?;
@@ -658,6 +672,19 @@ mod builtin_nodes_tests {
             error.to_string().contains("dns.bind"),
             "validation error must identify dns.bind: {error}"
         );
+    }
+
+    #[test]
+    fn test_validate_requires_absolute_data_dir() {
+        let mut config = Config::default();
+        assert_eq!(config.global.data_dir, crate::paths::DEFAULT_DATA_DIR);
+        config.validate().unwrap();
+
+        for invalid in ["", "relative/data"] {
+            config.global.data_dir = invalid.into();
+            let error = config.validate().unwrap_err();
+            assert!(error.to_string().contains("global.data_dir"));
+        }
     }
 
     #[test]

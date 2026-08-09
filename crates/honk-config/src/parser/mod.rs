@@ -773,6 +773,9 @@ fn parse_global_section(section: &Section) -> Result<GlobalConfig, crate::Config
     if let Some(v) = kv.get("auto_config_kernel_parameter") {
         cfg.auto_config_kernel_parameter = parse_bool(v);
     }
+    if let Some(v) = kv.get("data_dir") {
+        cfg.data_dir = v.clone();
+    }
     if let Some(v) = kv.get("store_subscribe") {
         cfg.store_subscribe = parse_bool(v);
     }

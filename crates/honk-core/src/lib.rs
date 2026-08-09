@@ -316,6 +316,15 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // effect and config log_level was silently ignored).
     let mut config = Config::from_file(cli.config.to_str().unwrap())?;
     config.validate()?;
+    honk_config::paths::set_data_dir(PathBuf::from(&config.global.data_dir)).map_err(
+        |requested| {
+            anyhow::anyhow!(
+                "runtime data directory is already {}; cannot switch to {}",
+                honk_config::paths::data_dir().display(),
+                requested.display()
+            )
+        },
+    )?;
     // Make `direct`/`block` usable as group members without declaring them
     // in the config (Direct/Block protocols → DirectHandler/BlockHandler).
     config.ensure_builtin_nodes();
@@ -347,6 +356,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     info!("honk-core v{} starting", env!("CARGO_PKG_VERSION"));
     info!("Config: {}", cli.config.display());
+    info!(directory = %honk_config::paths::data_dir().display(), "Runtime data directory configured");
 
     let effective_nofile = match raise_nofile_rlimit() {
         Ok(limit) => limit,
@@ -373,7 +383,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // Missing subscriptions still get the bounded first-fetch grace period;
     // every fetch continues in the background after the control plane starts.
     let subscription_store = if config.global.store_subscribe {
-        match subscription::SubscriptionStore::in_current_dir() {
+        match subscription::SubscriptionStore::in_data_dir() {
             Ok(store) => {
                 info!(directory = %store.root().display(), "Subscription store ready");
                 Some(store)
@@ -874,8 +884,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // Persistent cache (selector choices, clash mode): opens cache.db when
     // `experimental.cache_file` is enabled, restores Selector choices, and
     // wires change persistence into the group manager.
-    let config_dir = cli.config.parent().and_then(|p| p.to_str());
-    control_plane.init_cache_db(config_dir).await;
+    control_plane.init_cache_db(cli.config.parent()).await;
 
     // Starts only when external_controller is configured; bind/parse
     // failures are logged and never abort startup.
@@ -889,6 +898,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             .clash_api
             .clone();
         if !clash_cfg.external_controller.is_empty() {
+            let external_ui = if clash_cfg.external_ui.is_empty() {
+                String::new()
+            } else {
+                honk_config::paths::resolve_dependency_path(&clash_cfg.external_ui)
+                    .to_string_lossy()
+                    .into_owned()
+            };
             // Restore persisted clash mode and GLOBAL selection from
             // cache.db; fall back to the configured defaults.
             let cache_db = control_plane.cache_db();
@@ -939,7 +955,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                         direct_offload_static: control_plane.direct_offload_static_handle(),
                         secret: clash_cfg.secret.clone(),
                         connection_pool: control_plane.connection_pool(),
-                        external_ui: clash_cfg.external_ui.clone(),
+                        external_ui,
                         router: control_plane.traffic_router(),
                         log_handle: clash_log_handle.clone(),
                         dns_service: control_plane.dns_service(),

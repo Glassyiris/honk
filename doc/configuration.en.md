@@ -36,6 +36,26 @@ include {
 - The entry file's sections are merged first, followed by each included file and its descendants. Later scalar settings override earlier ones; nodes, groups, upstreams, and routing rules append in that order.
 - Repeating a file (including through a cycle) is rejected.
 
+
+### Runtime data directory
+
+`global.data_dir` selects the runtime-state root independently of the process
+`WorkingDirectory`. It must be a non-empty absolute path and defaults to
+`/var/share/honk`; changing it requires a process restart. New relative
+`experimental.cache_file.path` and `experimental.clash_api.external_ui` values
+target it, as does the durable `.sub` subscription store. Parent directories
+are created as needed. Absolute child paths remain literal. For upgrade
+compatibility, an existing cache relative to the original config directory, an
+existing `./.sub` store, or an existing working-directory-relative UI directory
+remains in use until moved below the configured data directory.
+
+Place runtime-supplied `geoip.dat`, `geosite.dat`, and a relative
+`ech_config_path` below `global.data_dir` to make systemd and manual starts
+behave identically. An explicit `$DAE_LOCATION_ASSET` geo directory takes
+precedence; otherwise geo assets fall back to the working directory and dae's
+standard asset directories. For compatibility, a relative `ech_config_path`
+falls back to its old working-directory-relative location when no data-directory
+copy exists.
 ## 2. Top-level structure
 
 ```text
@@ -303,7 +323,14 @@ Outbound targets: `direct`, `block`, any **group** or **node** name.
 
 **Must rules** (`-> direct(must)`): match does not finalize; continues matching and propagates must semantics (Go dae compatible). Clash Global/Direct mode does not override must/block.
 
-Geo assets: place `geoip.dat` / `geosite.dat` where the runtime can load them (repo root copies are common in dev). Geosite codes support dae's attribute filter: `domain(geosite: category-games@cn)` keeps only entries carrying the `@cn` attribute (key match is case-insensitive; everything after the first `@` is the selector). A code that expands to zero matchers — unknown category or unmatched attribute — logs a warning and never matches.
+Geo assets: place `geoip.dat` / `geosite.dat` below `global.data_dir` for a
+service-independent installation. An explicit `$DAE_LOCATION_ASSET` directory
+takes precedence; the loader otherwise falls back to the working directory and
+dae's standard asset directories. Geosite codes support dae's attribute filter:
+`domain(geosite: category-games@cn)` keeps only entries carrying the `@cn`
+attribute (key match is case-insensitive; everything after the first `@` is
+the selector). A code that expands to zero matchers — unknown category or
+unmatched attribute — logs a warning and never matches.
 
 ### Full routing snippet
 
@@ -477,7 +504,7 @@ subscription {
 
 Each entry is `tag: 'url'` (a bare quoted URL is also accepted). In dae syntax the subscription type, update interval, and enabled flag keep their defaults (auto/simple, 86400 s, enabled).
 
-- `global { store_subscribe: true }` is the default. A successfully fetched and parsed raw body is atomically stored under `<working-directory>/.sub` with private permissions (`0700` directory, `0600` files). The cached body is never written back into the config, and request identity appears only as a hash filename.
+- `global { store_subscribe: true }` is the default. A successfully fetched and parsed raw body is atomically stored in `.sub` below `global.data_dir` with private permissions (`0700` directory, `0600` files). An existing legacy `./.sub` store is retained until moved. The cached body is never written back into the config, and request identity appears only as a hash filename.
 - Startup restores valid stored bodies first. A restored subscription starts immediately while its network refresh continues in the background; an uncached subscription retains the five-second first-fetch grace period.
 - SIGHUP reload carries active subscription nodes and restores the stored body when an enabled subscription has no nodes to carry. Fetch, parse, or write failure leaves the active nodes and last valid body untouched. A corrupt body is ignored until a valid refresh replaces it.
 - Subscription nodes remain runtime-only and are never written back to the config file. Changing `store_subscribe` requires a process restart.
@@ -515,7 +542,7 @@ experimental {
 
 Useful endpoints: `/proxies`, `/proxies/{name}` (PUT selector), `/proxies/{name}/delay`, `/group/{name}/delay`, `/connections`, `/traffic`, `/logs`, `/dns/query`, `/stats`.
 
-Env: `HONK_UI_DOWNLOAD_URL` overrides the default zashboard zip URL when `external_ui` is empty/missing. The download follows the traffic routing decision (Router + group selection): `direct` fetches directly, `block` aborts it, any other outbound is dialed through the selected node.
+Env: `HONK_UI_DOWNLOAD_URL` overrides the default zashboard zip URL when `external_ui` is empty/missing. A relative `external_ui` prefers an existing directory below `global.data_dir`, then an existing working-directory-relative directory; a missing directory is created below `global.data_dir`. An absolute path is used unchanged. The download follows the traffic routing decision (Router + group selection): `direct` fetches directly, `block` aborts it, any other outbound is dialed through the selected node.
 
 ### Cache file
 
@@ -530,6 +557,11 @@ experimental {
     }
 }
 ```
+
+New relative `path` values resolve below `global.data_dir`; use an absolute path
+to keep the database elsewhere. When `<global.data_dir>/<path>` does not exist,
+an existing legacy path relative to the original config directory is retained
+until moved.
 
 Persists selector choices and clash mode. DNS answers use versioned `HDNS`
 records under the `dns:v2:` key namespace. Upgrade starts this namespace cold:

@@ -46,7 +46,7 @@ use socket2::{Domain, Socket, Type};
 use std::io;
 use std::net::SocketAddr;
 use std::os::unix::io::{AsRawFd, RawFd};
-
+use std::path::Path;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::Mutex;
@@ -575,11 +575,14 @@ impl ControlPlane {
 
     /// Open the persistent cache database (sing-box `cache_file`), wire
     /// selector-choice persistence into the group manager, and restore
-    /// persisted choices. No-op when `experimental.cache_file` is disabled
-    /// or the database cannot be opened. Called once from `run()`.
-    pub async fn init_cache_db(&mut self, config_dir: Option<&str>) {
+    /// persisted choices. An existing cache relative to the original config
+    /// directory is retained during the data-directory cutover. No-op when
+    /// `experimental.cache_file` is disabled or the database cannot be opened.
+    /// Called once from `run()`.
+    pub async fn init_cache_db(&mut self, legacy_config_dir: Option<&Path>) {
         let cache_cfg = self.config.read().await.experimental.cache_file.clone();
-        let Some(db) = crate::cachedb::CacheDb::open(&cache_cfg, config_dir) else {
+        let Some(db) = crate::cachedb::CacheDb::open_with_config_dir(&cache_cfg, legacy_config_dir)
+        else {
             return;
         };
         let db = Arc::new(db);

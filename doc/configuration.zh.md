@@ -33,6 +33,20 @@ include {
 - 先合并入口文件的各分段，再依次合并每个被包含文件及其子文件。后面的标量覆盖前面的值；节点、组、DNS 上游与路由规则按此顺序追加。
 - 同一文件被重复包含（包括循环）会报错。
 
+### 运行时数据目录
+
+`global.data_dir` 用于指定不依赖进程 `WorkingDirectory` 的运行时状态根目录。
+该值必须是非空绝对路径，默认 `/var/share/honk`；修改后需重启进程。新的相对
+`experimental.cache_file.path` 和 `experimental.clash_api.external_ui` 会指向该目录；
+订阅持久化也使用其下的 `.sub`。需要时会自动创建父目录；子项的绝对路径保持原样。
+为兼容升级，若原配置目录下已有相对缓存、已有 `./.sub`，或工作目录下已有相对 UI
+目录，则继续使用它，直至手动移到配置的数据目录。
+
+应将运行期提供的 `geoip.dat`、`geosite.dat` 和相对 `ech_config_path` 放到
+`global.data_dir` 下，使 systemd 和手工启动完全一致。显式 `$DAE_LOCATION_ASSET`
+的 Geo 目录优先；否则 Geo 文件回退到工作目录和 dae 标准资源目录。为兼容旧部署，
+当数据目录中不存在同名文件时，相对 `ech_config_path` 会回退到旧的工作目录相对位置。
+
 ## 2. 顶层结构
 
 ```text
@@ -284,7 +298,12 @@ routing {
 
 **Must 规则**（`-> direct(must)`）：命中不终结，继续匹配并传播 must 语义（兼容 Go dae）。Clash 的 Global/Direct 模式不会覆盖 must/block。
 
-Geo 资源：将 `geoip.dat` / `geosite.dat` 放到运行时可加载的位置（开发时常用仓库根目录副本）。geosite 类目支持 dae 的属性过滤：`domain(geosite: category-games@cn)` 只保留带 `@cn` 属性的条目（属性名大小写不敏感；第一个 `@` 之后整体作为选择器）。展开为零匹配的 code（类目不存在或属性无命中）会告警且永不命中。
+Geo 资源：将 `geoip.dat` / `geosite.dat` 放到 `global.data_dir` 下，即可避免受
+服务工作目录影响。显式 `$DAE_LOCATION_ASSET` 目录优先；否则加载器回退到工作目录
+和 dae 标准资源目录。geosite 类目支持 dae 的属性过滤：
+`domain(geosite: category-games@cn)` 只保留带 `@cn` 属性的条目（属性名大小写
+不敏感；第一个 `@` 之后整体作为选择器）。展开为零匹配的 code（类目不存在或
+属性无命中）会告警且永不命中。
 
 ### 路由片段
 
@@ -425,7 +444,7 @@ subscription {
 
 dae 语法仅支持 `tag: 'url'` 形式；`sub_type`（simple | clash | sip008 | custom）、`update_interval`（秒，默认 86400，0 = 仅手动）、`enabled` 等字段使用默认值，在 dae 语法中不可设置。
 
-- `global { store_subscribe: true }` 默认开启。成功获取且解析通过的原始正文会原子保存到 `<运行目录>/.sub`，目录权限 `0700`、文件权限 `0600`；缓存正文不会写回配置文件，请求身份只以散列文件名出现。
+- `global { store_subscribe: true }` 默认开启。成功获取且解析通过的原始正文会原子保存到 `global.data_dir` 下的 `.sub`，目录权限 `0700`、文件权限 `0600`；已有旧 `./.sub` 会继续使用，直至手动迁移。缓存正文不会写回配置文件，请求身份只以散列文件名出现。
 - 启动时先恢复有效缓存。已有缓存的订阅可立即启动，同时继续后台联网刷新；无缓存的订阅仍保留 5 秒首次拉取等待时间。
 - SIGHUP 重载先沿用当前订阅节点；已启用但没有可沿用节点的订阅会从缓存恢复。拉取、解析或写入失败不会清空当前节点或上一次有效缓存；损坏缓存会被忽略，直到一次有效刷新替换它。
 - 订阅节点仍只存在于运行时，不会回写配置文件。修改 `store_subscribe` 后需重启进程。
@@ -462,7 +481,7 @@ experimental {
 
 常用接口：`/proxies`、`/proxies/{name}`（PUT 切换 Selector）、delay、`/connections`、`/traffic`、`/logs`、`/dns/query`、`/stats`。
 
-环境变量：`HONK_UI_DOWNLOAD_URL` 可覆盖默认 zashboard zip（当 `external_ui` 目录为空/不存在时后台下载）。下载走与用户流量相同的路由判定（Router + 组选择）：`direct` 直连下载，`block` 放弃下载，其余 outbound 经所选节点隧道下载。
+环境变量：`HONK_UI_DOWNLOAD_URL` 可覆盖默认 zashboard zip（当 `external_ui` 目录为空/不存在时后台下载）。相对 `external_ui` 优先使用 `global.data_dir` 下的已有目录，再使用已有工作目录相对目录；目录均不存在时在 `global.data_dir` 下创建。绝对路径保持原样。下载走与用户流量相同的路由判定（Router + 组选择）：`direct` 直连下载，`block` 放弃下载，其余 outbound 经所选节点隧道下载。
 
 ### 缓存文件
 
@@ -477,6 +496,8 @@ experimental {
     }
 }
 ```
+
+新的相对 `path` 解析到 `global.data_dir`；需要将数据库置于其他位置时请使用绝对路径。若 `<global.data_dir>/<path>` 不存在，则保留原配置目录下已有的相对路径，直至手动迁移。
 
 持久化 Selector 选择与 Clash 模式。DNS 应答使用 `dns:v2:` key 命名空间下的版本化
 `HDNS` 记录。升级时此命名空间冷启动：旧 DNS 行既不导入也不删除。恢复仅接受未过期、

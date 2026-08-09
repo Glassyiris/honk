@@ -22,7 +22,8 @@ Source of truth: `crates/honk-config/src/*`, the dae parser in `crates/honk-conf
 | `lan_interface` | `lan_interface` | `[]` | LAN ifaces to intercept (comma-separated); empty installs no LAN hooks |
 | `wan_interface` | `wan_interface` | `[]` | WAN ifaces that intercept host-originated TCP/UDP. `auto` follows the IPv4 default route; while none exists it stays pending (never falls back to `lo`) and attaches on link/address/route events. The same event republishes generated gateway-address `direct(must)` rules and immediately re-probes health-backed outbounds. |
 | `auto_config_kernel_parameter` | `auto_config_kernel_parameter` | `false` | Auto sysctl (root) |
-| `store_subscribe` | `store_subscribe` | `true` | Persist each last valid subscription body under `<working-directory>/.sub` for network-independent startup/reload recovery. Changing it requires a process restart. |
+| `data_dir` | `data_dir` | `"/var/share/honk"` | Non-empty absolute root for generated state and relative runtime assets. Changing it requires a process restart. |
+| `store_subscribe` | `store_subscribe` | `true` | Persist each last valid subscription body in `.sub` below `global.data_dir` for network-independent startup/reload recovery. An existing `./.sub` store is retained until moved. Changing it requires a process restart. |
 | `tcp_check_url` | `tcp_check_url` | gstatic HTTPS | TCP health target. HTTPS performs verified target TLS before the configured HTTP method. |
 | `tcp_check_http_method` | `tcp_check_http_method` | `"HEAD"` | HTTP method for URL checks |
 | `udp_check_dns` | `udp_check_dns` | dns.google / 8.8.8.8 / IPv6 | UDP health DNS targets (comma-separated) |
@@ -52,6 +53,7 @@ Source of truth: `crates/honk-config/src/*`, the dae parser in `crates/honk-conf
 global {
     tproxy_port: 12345
     log_level: info
+    data_dir: '/var/share/honk'
     lan_interface: podman0
     wan_interface: auto
     dial_mode: domain++
@@ -114,7 +116,7 @@ The fields below are what a parsed node carries. In dae syntax they are **derive
 | `skip_cert_verify` | bool | `false` | Insecure TLS (share-link `allowInsecure=1`/`insecure=1`) |
 | `ech_enabled` | bool | `false` | Offer ECH (share-link `ech=1`, or implied by `ech_config`) |
 | `ech_config` | string? | null | Base64 ECHConfigList (share-link `ech_config=`) |
-| `ech_config_path` | string? | null | File holding a base64 ECHConfigList |
+| `ech_config_path` | string? | null | File holding a base64 ECHConfigList. A relative path prefers `<global.data_dir>/<path>` and falls back to the legacy working-directory-relative file. |
 | `reality_public_key` | string? | null | REALITY server X25519 public key (share-link `pbk`); when set the node takes the REALITY handshake instead of plain TLS (`security=reality` implies `tls=true`) |
 | `reality_short_id` | string? | null | REALITY short id (share-link `sid`, even-length hex ≤ 8 bytes) |
 | `reality_spider_x` | string? | null | REALITY spider path (share-link `spx`, share-link default `/`) |
@@ -570,10 +572,10 @@ In dae syntax only `name` (the tag) and `url` are settable; the rest is runtime 
 
 Nodes remain runtime-only and are never written into the config file. With
 `global { store_subscribe: true }` (the default), each successfully fetched and
-parsed raw body is atomically stored under `<working-directory>/.sub`; the
-directory is mode `0700`, files are mode `0600`, and filenames are hashes of
-the URL plus request identity. Startup restores valid bodies before network
-refresh. A restored subscription does not consume the five-second first-fetch
+parsed raw body is atomically stored in `.sub` below `global.data_dir`; an
+existing legacy `./.sub` store is retained until moved. The directory is mode `0700`,
+files are mode `0600`, and filenames are hashes of the URL plus request identity.
+Startup restores valid bodies before network refresh. A restored subscription does not consume the five-second
 grace period, but its online refresh still runs in the background. Reload
 first carries active nodes and uses the stored body for any enabled subscription
 without carried nodes. Fetch, parse, or store failure keeps both the active
@@ -606,7 +608,7 @@ experimental {
 | Field | Default | Meaning |
 | ------- | --------- | --------- |
 | `external_controller` | `""` | Listen addr; empty = disabled |
-| `external_ui` | `""` | Static UI dir |
+| `external_ui` | `""` | Static UI dir; relative paths prefer an existing directory below `global.data_dir`, then an existing working-directory-relative directory; missing paths target `global.data_dir` |
 | `secret` | `""` | Bearer / `?token=`; empty = no auth |
 | `default_mode` | `"Rule"` | `Rule` / `Global` / `Direct` |
 
@@ -688,7 +690,7 @@ Env: `HONK_UI_DOWNLOAD_URL` for UI zip override.
 | Field | Default | Meaning |
 | ------- | --------- | --------- |
 | `enabled` | `false` | Persist SQLite cache |
-| `path` | `"cache.db"` | DB path |
+| `path` | `"cache.db"` | DB path; relative paths prefer `global.data_dir`, then an existing path relative to the original config directory |
 | `cache_id` | `""` | Namespace id |
 | `store_fakeip` | `false` | FakeIP persistence intent (engine incomplete) |
 | `store_dns` | `false` | Persist DNS answers |
