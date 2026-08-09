@@ -107,7 +107,7 @@ async fn cancelled_first_tcp_frame_releases_permit() {
 }
 
 #[tokio::test]
-async fn malformed_first_tcp_frame_is_not_handled() {
+async fn malformed_first_tcp_frame_is_closed_as_dns() {
     use tokio::io::AsyncWriteExt;
 
     let (controller, _) =
@@ -131,7 +131,35 @@ async fn malformed_first_tcp_frame_is_not_handled() {
         .await
         .expect("write malformed query");
 
-    assert!(!task.await.expect("task").expect("handler"));
+    assert!(task.await.expect("task").expect("handler"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn partial_transparent_tcp_frame_expires() {
+    use tokio::io::AsyncWriteExt;
+
+    let (controller, _) =
+        test_controller(response_with_txid("example.com", 0x5555), Duration::ZERO);
+    let (mut client, mut server) = tcp_pair().await;
+    let task = tokio::spawn(async move {
+        controller
+            .handle_tcp_dns(
+                &mut server,
+                "127.0.0.1:10010".parse().expect("client address"),
+                "127.0.0.1:53".parse().expect("original destination"),
+            )
+            .await
+    });
+    client
+        .write_all(&512u16.to_be_bytes())
+        .await
+        .expect("write frame length");
+    client.write_all(&[0]).await.expect("write partial frame");
+    tokio::task::yield_now().await;
+
+    tokio::time::advance(super::super::transport::TCP_DNS_IO_TIMEOUT).await;
+
+    assert!(task.await.expect("task").expect("handler"));
 }
 
 #[tokio::test]
@@ -139,13 +167,14 @@ async fn tcp_connection_handles_multiple_frames() {
     let (controller, _) = test_controller(response_with_txid("example.com", 0), Duration::ZERO);
     let (mut client, mut server) = tcp_pair().await;
     let task = tokio::spawn(async move {
-        controller
+        let handled = controller
             .handle_tcp_dns(
                 &mut server,
                 "127.0.0.1:10006".parse().expect("client address"),
                 "127.0.0.1:53".parse().expect("original destination"),
             )
-            .await
+            .await?;
+        Ok::<_, anyhow::Error>((handled, server.nodelay()?))
     });
 
     let first = query_with_txid("example.com", 0x1111);
@@ -157,5 +186,49 @@ async fn tcp_connection_handles_multiple_frames() {
     assert_eq!(&read_tcp_response(&mut client).await[0..2], &second[0..2]);
 
     drop(client);
-    assert!(task.await.expect("task").expect("handler"));
+    assert_eq!(task.await.expect("task").expect("handler"), (true, true));
+}
+
+#[tokio::test]
+async fn bound_tcp_connection_uses_shared_persistent_frame_loop() {
+    let (controller, _) = test_controller(response_with_txid("example.com", 0), Duration::ZERO);
+    let (mut client, mut server) = tcp_pair().await;
+    let task = tokio::spawn(async move {
+        controller
+            .serve_bound_tcp_dns(
+                &mut server,
+                "127.0.0.1:10007".parse().expect("client address"),
+            )
+            .await
+    });
+
+    for txid in [0x3333, 0x4444] {
+        let query = query_with_txid("example.com", txid);
+        write_tcp_query(&mut client, &query).await;
+        assert_eq!(&read_tcp_response(&mut client).await[0..2], &query[0..2]);
+    }
+
+    drop(client);
+    task.await.expect("bound task").expect("bound connection");
+}
+
+#[tokio::test(start_paused = true)]
+async fn bound_tcp_connection_closes_after_idle_timeout() {
+    let (controller, _) = test_controller(response_with_txid("example.com", 0), Duration::ZERO);
+    let (_client, mut server) = tcp_pair().await;
+    let task = tokio::spawn(async move {
+        controller
+            .serve_bound_tcp_dns(
+                &mut server,
+                "127.0.0.1:10008".parse().expect("client address"),
+            )
+            .await
+    });
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(31)).await;
+
+    task.await
+        .expect("bound task")
+        .expect("idle timeout closes cleanly");
 }

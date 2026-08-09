@@ -15,6 +15,9 @@ use aya_ebpf_bindings::{
 
 use crate::{errno::ENOENT, routing::bpf_sock_is_dae_socket};
 
+const AF_INET: u32 = 2;
+const AF_INET6: u32 = 10;
+
 /// TC-side `SockMap::redirect_sk_lookup`: look the socket up by sockmap
 /// index and assign it to the current skb.
 ///
@@ -57,6 +60,9 @@ pub(crate) struct SkProbe {
     /// The socket belongs to the proxy engine itself (its own listeners and
     /// control-plane sockets must not be re-intercepted).
     pub is_dae_socket: bool,
+    /// Wildcard binds need an independent route-locality check because socket
+    /// lookup alone also matches forwarded destinations.
+    pub is_wildcard: bool,
 }
 
 /// Probe the TCP socket matching `tuple` in `netns_id`, releasing the
@@ -89,9 +95,21 @@ fn probe_result(sk: *mut bpf_sock) -> Option<SkProbe> {
     if sk.is_null() {
         return None;
     }
+    let socket = unsafe { &*sk };
+    let is_wildcard = if socket.family == AF_INET {
+        socket.src_ip4 == 0
+    } else if socket.family == AF_INET6 {
+        socket.src_ip6[0] == 0
+            && socket.src_ip6[1] == 0
+            && socket.src_ip6[2] == 0
+            && socket.src_ip6[3] == 0
+    } else {
+        true
+    };
     let probe = SkProbe {
-        state: unsafe { (*sk).state },
+        state: socket.state,
         is_dae_socket: bpf_sock_is_dae_socket(sk as *const _),
+        is_wildcard,
     };
     unsafe { bpf_sk_release(sk as *mut c_void) };
     Some(probe)

@@ -1,6 +1,5 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use honk_config::types::DnsProtocol;
 use tracing::debug;
@@ -8,23 +7,32 @@ use tracing::debug;
 use super::UpstreamPool;
 use super::entries::UpstreamEntry;
 use crate::dns::forwarder::DnsUpstreamPool;
-use crate::dns::transport::TcpPool;
 
 impl UpstreamPool {
-    async fn query_udp(
-        entry: &UpstreamEntry,
-        raw_query: &[u8],
-        query_timeout: Duration,
-    ) -> anyhow::Result<Vec<u8>> {
-        let pool = {
-            if let Some(pool) = entry.udp.lock().as_ref() {
-                Arc::clone(pool)
-            } else {
-                let address = Self::resolve_udp_addr(entry).await?;
-                let pool = crate::dns::transport::UdpPool::new(address, query_timeout).await?;
+    async fn query_udp(&self, entry: &UpstreamEntry, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let pool = if let Some(pool) = entry.udp.lock().as_ref() {
+            Arc::clone(pool)
+        } else {
+            let address = Self::resolve_udp_addr(entry).await?;
+            let candidate = crate::dns::transport::UdpPool::new_tracked(
+                address,
+                self.dns_query_timeout,
+                Arc::clone(&self.active_transport_tasks),
+            )
+            .await?;
+            let (pool, unused) = {
                 let mut slot = entry.udp.lock();
-                Arc::clone(slot.get_or_insert(pool))
+                if let Some(pool) = slot.as_ref() {
+                    (Arc::clone(pool), Some(candidate))
+                } else {
+                    *slot = Some(Arc::clone(&candidate));
+                    (candidate, None)
+                }
+            };
+            if let Some(unused) = unused {
+                unused.close().await;
             }
+            pool
         };
         match pool.exchange(raw_query).await {
             Ok(response) => Ok(response),
@@ -50,8 +58,11 @@ impl UpstreamPool {
         raw_query: &[u8],
     ) -> anyhow::Result<Vec<u8>> {
         if let Some(node) = proxy_node {
-            let pool = TcpPool::new(self.dial_context(entry, Some(node)));
-            let response = pool.exchange(raw_query).await?;
+            let response = self
+                .get_transport(entry, Some(node))
+                .await?
+                .exchange(raw_query)
+                .await?;
             debug!(
                 "DNS upstream '{}' (udp via proxy {}) returned {} bytes",
                 upstream_name,
@@ -61,13 +72,15 @@ impl UpstreamPool {
             return Ok(response);
         }
 
-        let response = Self::query_udp(entry, raw_query, self.dns_query_timeout).await?;
+        let response = self.query_udp(entry, raw_query).await?;
         if response.len() >= 4 && response[2] & 0x02 != 0 {
             debug!(
                 "DNS upstream '{}' UDP answer has TC set — retrying over TCP",
                 upstream_name
             );
-            return TcpPool::new(self.dial_context(entry, None))
+            return self
+                .get_transport(entry, None)
+                .await?
                 .exchange(raw_query)
                 .await;
         }

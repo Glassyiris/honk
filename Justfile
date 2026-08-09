@@ -107,6 +107,10 @@ outbound-ci-e2e:
 dns-ci:
     ci/dns-ci.sh
 
+# Unprivileged actual-process DNS listener smoke (UDP + persistent TCP + SIGHUP)
+dns-smoke:
+    python3 ci/dns-smoke.py
+
 # Clash API gate (including Clash-only DNS query/flush scenarios)
 clash-ci:
     ci/clash-ci.sh

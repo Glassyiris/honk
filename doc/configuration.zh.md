@@ -312,6 +312,8 @@ honk 的数据面与 Go dae 一样是 fail-closed：健康检查判定 outbound 
 
 ```dae
 dns {
+    # 未设置 bind 时不启动独立监听。
+    # bind: 'tcp+udp://:1053'
     ipversion_prefer: 4
     optimistic_cache: true        # 缓存开关
     # 正缓存固定 TTL（覆盖应答 min TTL，并改写 wire RR TTL）。0 = 沿用上游应答 TTL。
@@ -347,8 +349,44 @@ dns {
 
 上游 URI 协议前缀：`udp://`、`tcp://`、`tcp+udp://`、`tls://`、`https://`、`h3://`、`quic://`；无前缀按 UDP 处理。
 
-**request 动作：** 命名上游、`reject`（空成功应答）、`asis`（拨向拦截包原始 DNS 目标）。
-**response 动作：** `accept`、`reject`、或命名上游重查。
+### 独立监听（`dns.bind`）
+
+`bind` 可省略；省略或设为空只会关闭独立监听，透明 TCP/UDP 53 端口拦截仍照常
+工作。只接受当前 dae 的下列形式：
+
+```dae
+dns {
+    bind: '127.0.0.1:1053'          # 裸数字 IP:port：仅 UDP
+    # bind: 'udp://localhost:1053'   # 主机名必须带 scheme
+    # bind: 'tcp://[::1]:1053'       # IPv6 字面量必须加方括号
+    # bind: 'tcp+udp://:1053'        # 空 host：通配地址，TCP+UDP
+}
+```
+
+每种形式都必须显式写端口；端口 `0` 表示让内核分配临时端口，最终地址会写入启动
+日志。裸主机名 `localhost:1053` 无效，userinfo、path、query 与 fragment 也不接受。
+主机名按系统解析顺序尝试，选择第一个能让全部请求 transport 成功 bind 的地址。
+目前不支持 IPv6 zone identifier；请改用带方括号的 global、ULA 或 loopback 字面量。
+
+监听器在 host netns 中使用普通、未打 mark 的 socket。LAN 侧已有的本地 TCP 或 UDP
+`:53` 监听对相应 transport 优先；通配 socket 只有在目的地址属于本机时才优先，因此
+发往远端 resolver 的查询仍走透明路径。通配或 LAN bind 会暴露一个没有应用层认证的
+递归 resolver；必须用主机防火墙限制来源，不能发布到不可信网络。
+
+独立请求与透明请求共享同一套 generation-pinned request/response routing、缓存、
+singleflight、上游连接池与路由投影。只接受完整的单问题 DNS 请求：多问题 UDP 请求
+返回 FORMERR，多问题 TCP stream 在转发前关闭。UDP 应答将客户端 EDNS size 钳制到
+`512..=1232` 字节；通配监听会保留查询命中的本地目的地址作为应答源地址。透明与
+独立 TCP 都支持 RFC 7766 双字节 framing 与持久连接，并将每次长度/正文读取及应答
+写入限制在 30 秒内；独立监听另受不超过全局连接预算四分之一的容量限制。
+
+启动采用 all-or-nothing：所有选中的 socket 都成功 bind 后才算启动成功；任一
+bind 失败会关闭其他已选 socket 并令进程启动失败。监听器归进程所有。SIGHUP
+可以重载共享 DNS runtime，但 `bind` 的语义变化（host、port 或 transport 集合）
+会被拒绝并提示必须重启。
+
+**request 动作：** 命名上游、`reject`（空成功应答）或 `asis`。透明查询的 `asis` 会使用客户端原 transport 拨向拦截包的原始 DNS 目标；UDP 应答带 TC 时会改用 TCP 重试。拨号/connect timeout 单独计时；连接/会话取得后，每次尝试只使用一个覆盖完整请求写入与应答读取的绝对 DNS query deadline。transport 最多重试一次，因此总时长受两次 query deadline 加有界 reset/setup 约束。独立查询没有原始目的地址，因此 `asis` 返回 DNS 失败，而不会递归拨回监听器。
+**response 动作：** `accept`、`reject`、或命名上游重查。所有生产 service 路径都会先校验精确 question 与完整 response wire，再发布到缓存。
 
 **当前限制：**
 
@@ -362,18 +400,20 @@ dns {
 **兼容性与生命周期：**
 
 - 未配置 `ipversion_prefer` 时保留实际的 `DnsConfig` 默认值 `both`，符合资格的
-  A 与 AAAA 工作并发执行。设置 `4` 或 `6` 选择相应的偏好模式；没有新增配置面。
+  A 与 AAAA 工作并发执行。设置 `4` 或 `6` 选择相应偏好模式；其 sibling 查询会
+  保留调用方的完整 wire profile，只修改 QTYPE。
 - 缓存与 singleflight 仅适用于标准单问题 QUERY：answer/authority 计数为零，最多
   一个无 option 的 EDNS-v0 OPT。受支持的 RD/AD/CD 与 DO 状态、精确 question wire、
-  UDP size、调用方 profile、策略和逻辑目的地都属于 identity。多问题、异常 flags、
-  EDNS option（包括 ECS/COOKIE）和 EDNS-v1 请求仍会转发，但绕过缓存与合并。
+  UDP size、调用方 profile、策略和逻辑目的地都属于 identity。多问题请求会在策略
+  规划前被拒绝；异常 flags、EDNS option（包括 ECS/COOKIE）和 EDNS-v1 请求仍会转发，
+  但绕过缓存与合并。
 - 重载一次发布包含策略、路由、组、transport 与投影的完整 DNS runtime generation。
   已有请求在旧 generation 上持有 lease，新请求使用替换版本。runtime 退役与池化
   transport 关闭都有界且会被等待。
 - DNS 可观测性仅供内部使用。相互独立、单调递增的 atomic counter 使请求记录保持
   non-blocking。内部 best-effort scrape 逐项读取，不承诺 counter 之间的一致性。
-  失败日志仅使用有界 `error_kind` 分类和 transport label 等有界字段，不记录 query name、
-  upstream 地址或自由格式 error payload。没有新增 DNS endpoint、配置项或 API。
+  失败日志只使用有界 `error_kind` 分类和 transport label 等有界字段，不记录 query name、
+  upstream 地址或自由格式 error payload。这些内部遥测不会新增公开 DNS metric 或 API。
 
 ## 10. 订阅（subscription）
 

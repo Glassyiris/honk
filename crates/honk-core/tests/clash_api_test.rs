@@ -95,11 +95,12 @@ fn a_record_response(ip: [u8; 4], ttl: u32) -> Vec<u8> {
     ]
 }
 
-/// NXDOMAIN response for example.com (ANCOUNT = 0, RCODE = 3).
+/// NXDOMAIN response for nx.example.com (ANCOUNT = 0, RCODE = 3).
 fn nxdomain_response() -> Vec<u8> {
     vec![
         0x00, 0x00, 0x81, 0x83, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // header
-        0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, // qname
+        0x02, b'n', b'x', 0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm',
+        0x00, // qname
         0x00, 0x01, 0x00, 0x01, // qtype A, qclass IN
     ]
 }

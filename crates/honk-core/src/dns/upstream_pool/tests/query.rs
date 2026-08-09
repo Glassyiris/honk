@@ -115,7 +115,7 @@ async fn test_udp_txid_mismatch_discarded() {
 }
 
 #[tokio::test]
-async fn test_udp_truncated_answer_upgrades_to_tcp() {
+async fn udp_truncated_fallback_reuses_tcp_connection_and_closes_once() {
     let mut truncated = mock_dns_response(0x1234);
     truncated[2] |= 0x02;
     let full = mock_dns_response(0x1234);
@@ -144,36 +144,51 @@ async fn test_udp_truncated_answer_upgrades_to_tcp() {
     }
     .await;
     let (tcp_listener, udp_server, address) = sockets.expect("matching TCP/UDP listener bind");
-    tokio::spawn(async move {
+    let udp_responder = tokio::spawn(async move {
         let mut buffer = [0_u8; 512];
-        let (_, source) = udp_server.recv_from(&mut buffer).await.unwrap();
-        let mut response = truncated;
-        response[..2].copy_from_slice(&buffer[..2]);
-        udp_server.send_to(&response, source).await.unwrap();
+        for _ in 0..2 {
+            let (_, source) = udp_server.recv_from(&mut buffer).await.unwrap();
+            let mut response = truncated.clone();
+            response[..2].copy_from_slice(&buffer[..2]);
+            udp_server.send_to(&response, source).await.unwrap();
+        }
     });
     let full_clone = full.clone();
-    tokio::spawn(async move {
+    let tcp_responder = tokio::spawn(async move {
         let (mut stream, _) = tcp_listener.accept().await.unwrap();
-        let mut length_buffer = [0_u8; 2];
-        stream.read_exact(&mut length_buffer).await.unwrap();
-        let query_length = usize::from(u16::from_be_bytes(length_buffer));
-        let mut query_buffer = vec![0_u8; query_length];
-        stream.read_exact(&mut query_buffer).await.unwrap();
-        let response_length = u16::try_from(full_clone.len()).unwrap();
-        stream
-            .write_all(&response_length.to_be_bytes())
-            .await
-            .unwrap();
-        stream.write_all(&full_clone).await.unwrap();
+        for _ in 0..2 {
+            let mut length_buffer = [0_u8; 2];
+            stream.read_exact(&mut length_buffer).await.unwrap();
+            let query_length = usize::from(u16::from_be_bytes(length_buffer));
+            let mut query_buffer = vec![0_u8; query_length];
+            stream.read_exact(&mut query_buffer).await.unwrap();
+            let response_length = u16::try_from(full_clone.len()).unwrap();
+            stream
+                .write_all(&response_length.to_be_bytes())
+                .await
+                .unwrap();
+            stream.write_all(&full_clone).await.unwrap();
+        }
     });
 
     let upstream = make_upstream("tc", &address.to_string(), DnsProtocol::Udp);
     let pool = UpstreamPool::new(&[upstream], make_router()).unwrap();
-    let result = pool
-        .query("tc", &mock_dns_query(0x1234))
-        .await
-        .expect("TC upgrade should succeed");
-    assert_eq!(result, full);
+    let query = mock_dns_query(0x1234);
+    for _ in 0..2 {
+        let result = pool
+            .query("tc", &query)
+            .await
+            .expect("TC upgrade should succeed");
+        assert_eq!(result, full);
+    }
+    assert_eq!(pool.lifecycle_stats().init_count, 1);
+
+    pool.close().await;
+    udp_responder.await.unwrap();
+    tcp_responder.await.unwrap();
+    let stats = pool.lifecycle_stats();
+    assert_eq!(stats.close_count, 1);
+    assert_eq!(stats.tasks, 0);
 }
 
 #[test]

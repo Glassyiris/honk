@@ -694,14 +694,10 @@ fn merge_top_level_sections(sections: Vec<Section>) -> Vec<Section> {
 fn parse_kv_pairs(body: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
     for line in body.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
+        let trimmed = strip_unquoted_comment(line.trim()).trim();
+        if trimmed.is_empty() {
             continue;
         }
-        let trimmed = trimmed
-            .split_once('#')
-            .map(|(l, _)| l.trim())
-            .unwrap_or(trimmed);
         if let Some(pos) = trimmed.find(':') {
             let key = trimmed[..pos].trim().to_string();
             let val = trimmed[pos + 1..]
@@ -713,6 +709,27 @@ fn parse_kv_pairs(body: &str) -> HashMap<String, String> {
         }
     }
     map
+}
+
+fn strip_unquoted_comment(line: &str) -> &str {
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in line.char_indices() {
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == delimiter {
+                quote = None;
+            }
+        } else if matches!(character, '\'' | '"') {
+            quote = Some(character);
+        } else if character == '#' {
+            return &line[..index];
+        }
+    }
+    line
 }
 
 fn parse_global_section(section: &Section) -> Result<GlobalConfig, crate::ConfigError> {
@@ -849,6 +866,11 @@ fn parse_dns_section(section: &Section) -> Result<DnsConfig, crate::ConfigError>
     let mut cfg = DnsConfig::default();
     let mut saw_upstream = false;
     let kv = parse_kv_pairs(dns_subs.first().map(|s| s.body.as_str()).unwrap_or(""));
+    if let Some(bind) = kv.get("bind") {
+        cfg.bind.clone_from(bind);
+        cfg.bind_endpoint()
+            .map_err(|error| crate::ConfigError::Parse(error.to_string()))?;
+    }
 
     if let Some(v) = kv.get("ipversion_prefer") {
         cfg.strategy = parse_ip_prefer(v);

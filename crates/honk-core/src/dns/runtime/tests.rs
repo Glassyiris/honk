@@ -314,6 +314,7 @@ async fn fifth_retirement_cancels_oldest_and_retains_four() {
         .await
         .expect("oldest generation closed at retirement cap");
     assert_eq!(oldest_lease.runtime().state(), RuntimeState::Closed);
+    provider.shutdown().await;
     assert!(
         oldest_outbound.is_shutdown(),
         "cap eviction must force-shutdown its outbound generation"

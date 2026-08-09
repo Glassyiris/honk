@@ -302,6 +302,7 @@ fn projection_for_test(snapshot: Arc<RoutingProjectionSnapshot>) -> TestProjecti
     (
         RoutingProjection {
             state: parking_lot::Mutex::new(DesiredState::new(snapshot, 10_000)),
+            publication_fence: parking_lot::RwLock::new(()),
             wake: parking_lot::Mutex::new(Some(wake)),
             wake_pending: std::sync::atomic::AtomicBool::new(false),
             counters,

@@ -48,6 +48,7 @@ pub use doh3::Doh3Client;
 pub use doq::DoqClient;
 pub use dot::DotPool;
 pub use framing::{exchange_length_prefixed, force_dns_id_zero, restore_dns_id};
+pub(crate) use framing::{read_length_prefixed_into, write_length_prefixed};
 pub(crate) use lifecycle::LifecycleSlot;
 pub use tcp_pool::TcpPool;
 pub use udp_pool::UdpPool;

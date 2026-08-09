@@ -31,13 +31,7 @@ impl DnsCacheService {
             None => (None, false),
         };
         if clear_positive {
-            let remove_slot = shard.get_mut(key).is_some_and(|value| {
-                value.positive = None;
-                value.negative.is_none()
-            });
-            if remove_slot {
-                shard.pop(key);
-            }
+            shard.remove_positive(key);
         }
         if result.is_some() {
             self.counters.hits.fetch_add(1, Ordering::Relaxed);
@@ -81,14 +75,14 @@ impl DnsCacheService {
     pub(crate) fn put_exact(&self, key: CacheKey, response: Vec<u8>, min_ttl: u32) {
         let ttl = min_ttl.max(1);
         let response = bytes::Bytes::from(response);
-        if let Some(persister) = lock(&self.persister).clone() {
+        let retained = self.put_slot(CacheSlot::Exact(key.clone()), response.clone(), ttl);
+        if retained && let Some(persister) = lock(&self.persister).clone() {
             persister.save(
-                key.clone(),
-                response.clone(),
+                key,
+                response,
                 crate::dns::persist::unix_now() + u64::from(ttl),
             );
         }
-        self.put_slot(CacheSlot::Exact(key), response, ttl);
     }
 
     pub(crate) fn put_exact_if_current(
@@ -113,7 +107,7 @@ impl DnsCacheService {
         self.put_slot(CacheSlot::Exact(key), response.into(), min_ttl);
     }
 
-    fn put_slot(&self, key: CacheSlot, response: bytes::Bytes, min_ttl: u32) {
+    fn put_slot(&self, key: CacheSlot, response: bytes::Bytes, min_ttl: u32) -> bool {
         let ttl = min_ttl.max(1);
         let entry = CachedEntry {
             response,
@@ -121,7 +115,7 @@ impl DnsCacheService {
             min_ttl,
         };
         let index = self.shard_index(&key);
-        lock(&self.shards[index]).put(key, CacheValue::positive(entry));
+        lock(&self.shards[index]).put(key, CacheValue::positive(entry))
     }
 
     #[cfg(test)]

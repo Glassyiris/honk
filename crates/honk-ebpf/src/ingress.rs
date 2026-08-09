@@ -21,10 +21,15 @@ use crate::{
 use aya_ebpf::programs::TcContext;
 use aya_ebpf_bindings::{
     bindings::{
-        __sk_buff, bpf_sock_tuple, bpf_sock_tuple__bindgen_ty_1__bindgen_ty_1,
+        __sk_buff, BPF_FIB_LKUP_RET_NOT_FWDED, bpf_fib_lookup as BpfFibLookup,
+        bpf_sock_tuple,
+        bpf_sock_tuple__bindgen_ty_1__bindgen_ty_1,
         bpf_sock_tuple__bindgen_ty_1__bindgen_ty_2,
     },
-    helpers::{bpf_ktime_get_ns, bpf_redirect, bpf_redirect_peer, bpf_skb_store_bytes},
+    helpers::{
+        bpf_fib_lookup, bpf_ktime_get_ns, bpf_redirect, bpf_redirect_peer,
+        bpf_skb_store_bytes,
+    },
 };
 use honk_ebpf_common::{
     IpVersionType, RedirectEntry, RedirectTuple, RoutingMeta, TPROXY_MARK,
@@ -47,6 +52,8 @@ use crate::{
     transport::{ETH_HLEN, ETH_P_IP, ETH_P_IPV6, IPPROTO_TCP, IPPROTO_UDP, parse_packet},
 };
 const IPV6_BYTE_LENGTH: usize = 16;
+const AF_INET: u8 = 2;
+const AF_INET6: u8 = 10;
 
 /// skb->mark bit set on packets that already passed `lan_ingress`
 /// classification and were allowed through (`TC_ACT_OK`).
@@ -232,6 +239,59 @@ fn wan_outbound_is_alive(ctx: &TcContext, outbound: u8, l4proto: u8, dport: u16)
         None => true,
     }
 }
+
+/// Confirm that a wildcard socket match names a host-local route. Socket
+/// lookup also matches forwarded destinations; only `NOT_FWDED` is eligible
+/// after the earlier broadcast/multicast rejection. Every forwarded or
+/// ambiguous FIB result stays on the transparent routing path.
+#[inline(always)]
+fn wildcard_socket_destination_is_local(ctx: &TcContext, pkt: &ParsedPacket) -> bool {
+    let mut fib: BpfFibLookup = unsafe { mem::zeroed() };
+    fib.family = if pkt.ethh.ether_type == ETH_P_IP.to_be() {
+        AF_INET
+    } else {
+        AF_INET6
+    };
+    fib.l4_protocol = pkt.l4proto;
+    fib.sport = pkt.tuples.five.src_port.to_be();
+    fib.dport = pkt.tuples.five.dst_port.to_be();
+    fib.ifindex = unsafe { (*ctx.skb.skb).ifindex };
+    unsafe {
+        fib.__bindgen_anon_1.tot_len = (*ctx.skb.skb).len as u16;
+        if fib.family == AF_INET {
+            fib.__bindgen_anon_2.tos = pkt.tuples.dscp << 2;
+        }
+        if fib.family == AF_INET {
+            fib.__bindgen_anon_3.ipv4_src = pkt.tuples.five.src_ip.u6_addr32[3];
+            fib.__bindgen_anon_4.ipv4_dst = pkt.tuples.five.dst_ip.u6_addr32[3];
+        } else {
+            fib.__bindgen_anon_3.ipv6_src = pkt.tuples.five.src_ip.u6_addr32;
+            fib.__bindgen_anon_4.ipv6_dst = pkt.tuples.five.dst_ip.u6_addr32;
+        }
+    }
+    let result = unsafe {
+        bpf_fib_lookup(
+            ctx.skb.skb as *mut c_void,
+            &mut fib,
+            mem::size_of::<BpfFibLookup>() as i32,
+            0,
+        )
+    };
+    result == BPF_FIB_LKUP_RET_NOT_FWDED as c_long
+}
+
+/// Existing flows probe for a local owner as before. Pure SYNs normally skip
+/// this lookup, except TCP DNS: a real host-netns port-53 LISTEN socket must
+/// get first refusal before the unconditional DNS redirect.
+#[inline(always)]
+const fn tcp_socket_probe_required(pure_syn: bool, destination_port: u16) -> bool {
+    !pure_syn || destination_port == 53
+}
+
+// Host-build-free structural coverage for the no_std eBPF crate.
+const _: [(); 1] = [(); tcp_socket_probe_required(true, 53) as usize];
+const _: [(); 0] = [(); tcp_socket_probe_required(true, 443) as usize];
+const _: [(); 1] = [(); tcp_socket_probe_required(false, 443) as usize];
 
 /// Check if a destination IP is likely a local address where a socket lookup
 /// could find a matching listening socket (RFC 1918, loopback, ULA, link-local).
@@ -517,8 +577,11 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         }
 
         if pkt.l4proto == IPPROTO_TCP {
-            // Skip socket lookup for SYN packets
-            if !(pkt.tcph.syn() != 0 && pkt.tcph.ack() == 0) {
+            // Preserve the general pure-SYN lookup skip. TCP DNS is the sole
+            // exception so LAN clients can reach an ordinary host listener
+            // before the unconditional port-53 fast path below.
+            let pure_syn = pkt.tcph.syn() != 0 && pkt.tcph.ack() == 0;
+            if tcp_socket_probe_required(pure_syn, pkt.tuples.five.dst_port) {
                 let param = PARAM.load();
                 if let Some(probe) =
                     sk::probe_tcp_socket(ctx, &mut tuple, tuple_size, param.dae_netns_id as u64)
@@ -526,7 +589,11 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
                     // A local (non-dae) LISTEN socket owns this destination:
                     // NAT loopback — leave it to the kernel.
                     // BPF_TCP_LISTEN = 10
-                    if !probe.is_dae_socket && probe.state == 10 {
+                    if !probe.is_dae_socket
+                        && probe.state == 10
+                        && (!probe.is_wildcard
+                            || wildcard_socket_destination_is_local(ctx, pkt))
+                    {
                         return pass_through_classified(ctx);
                     }
                 }
@@ -536,7 +603,9 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             if let Some(probe) =
                 sk::probe_udp_socket(ctx, &mut tuple, tuple_size, param.dae_netns_id as u64)
             {
-                if !probe.is_dae_socket {
+                if !probe.is_dae_socket
+                    && (!probe.is_wildcard || wildcard_socket_destination_is_local(ctx, pkt))
+                {
                     return pass_through_classified(ctx);
                 }
             }

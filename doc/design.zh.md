@@ -23,7 +23,7 @@
 | TC 分类 + match_set 路由 | **dae** | `ROUTING_MAP` MatchSet、LPM、域名位图、must/OR/AND |
 | `dae0` / `dae0peer` + netns 投递 | **dae** | 隔离 `daens`、sk_lookup / SockMap、回程改写 |
 | cgroup cookie→pid 进程匹配 | **dae** | `COOKIE_PID_MAP` |
-| DNS 学习写入域名路由图 | **dae** | 用户态 notify → `DOMAIN_ROUTING_MAP` |
+| DNS 学习写入域名路由图 | **dae** | generation-aware outcome 投影 → `DOMAIN_ROUTING_MAP` |
 | 分段配置语法 | **dae** | `global { } node { } group { } routing { }` |
 | 组策略与嵌套出站 | **sing-box** | Selector / URLTest / LB / Fallback、RealTag 风格链 |
 | TCP/UDP 独立 URLTest 选择 | **sing-box** | tolerance、idle_timeout、interrupt_connections |

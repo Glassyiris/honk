@@ -1,23 +1,18 @@
-//! DNS resolver, forwarder, cache, and routing.
+//! Generation-pinned DNS forwarding, caching, routing, and transports.
 //!
-//! ## Modules
+//! The subsystem is split by invariant rather than protocol call depth:
 //!
-//! - `routing` — DNS request routing (domain → upstream)
-//! - `cache` — DNS response cache with LRU and TTL
-//! - `endpoint` — upstream address / SNI / path parsing
-//! - `transport` — pooled UDP/TCP/DoT/DoH/DoQ/DoH3 clients
-//! - `upstream_pool` — per-upstream DNS query management
-//! - `forwarder` — DNS forwarding engine (cache + upstream + routing)
-//! - `persist` — optional cache.db persistence for DNS answers
-//! - `wire` — shared wire-format parsing helpers
+//! - `query`, `response`, and `wire` validate DNS wire identities.
+//! - `engine`, `planner`, `policy`, `routing`, and `outcome` evaluate policy.
+//! - `cache`, `singleflight`, and `persist` own response reuse and durability.
+//! - `endpoint`, `transport`, and `upstream_pool` own upstream I/O.
+//! - `forwarder`, `service`, and `resolver` expose resolution workflows.
+//! - `runtime` and `projection` publish coherent reload generations and eBPF
+//!   domain-routing state.
 //!
-//! ## `DnsResolver`
-//!
-//! Application-level domain → IP helper used by the control plane (SNI
-//! reality checks, etc.). Always resolves through a [`DnsForwarder`] so
-//! the same upstream stack (including encrypted DNS and `outbound:`) is
-//! shared with intercepted client queries. There is no separate stub
-//! resolver dependency.
+//! [`DnsResolver`] is the application-level domain-to-address helper used by
+//! the control plane. It resolves through the same current [`DnsForwarder`]
+//! generation as intercepted and standalone client requests.
 
 #[cfg(feature = "dns-bench")]
 pub mod bench_support;

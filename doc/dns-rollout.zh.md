@@ -8,8 +8,8 @@
 
 - 一台可丢弃或隔离的授权主机、带外恢复通道和维护窗口。不要把共享生产网关
   作为首次灰度主机。
-- root 或免密 `sudo`；带 BTF 的受支持 Linux 内核；真实 smoke 所需的目标接口、
-  路由与 DNS 客户端。
+- 仅特权灰度需要 root 或免密 `sudo`、带 BTF 的受支持 Linux 内核，以及真实
+  smoke 所需的目标接口、路由与 DNS 客户端。
 - Rust stable、项目 nightly toolchain、`rust-src`、`bpf-linker`、CMake、C/C++
   编译器、libclang/bindgen 依赖与 `readelf`。
 - 当前 binary、config、BPF object 与 `cache.db` 的准确路径；足够保存不可变回滚
@@ -21,17 +21,15 @@
 
 1. 记录主机、内核、接口、当前 binary/config checksum、日志中的当前 routing
    generation、服务命令与 UTC 时间。
-2. 从候选版本的准确源码运行无特权门禁：
+2. 从候选版本的准确源码运行无特权独立 DNS smoke：
 
    ```bash
-   just dns-ci
-   just clash-ci
-   cargo test -p honk-core --no-default-features
-   just run-dae
+   just dns-smoke
    ```
 
-   执行任何特权操作前，mock 运行必须完成其配置的 loopback DNS smoke；随后正常
-   停止 mock 进程。
+   此命令构建 debug `honk-core`，通过 `--mock-ebpf` 启动实际进程，并在未变
+   SIGHUP 前后经 UDP 与一条持久 TCP 连接验证配置的 loopback 监听器。命令返回前
+   会停止进程并移除所有临时资源。
 3. 使用正常 service manager 暂停已安装服务。把当前 binary 与 config 复制到带
    时间戳、只读的回滚路径。
 4. 服务暂停期间备份 `cache.db`，保留 owner 与 mode。记录三个回滚 artifact 的
@@ -40,6 +38,9 @@
    创建回滚包。
 
 ## 特权灰度
+
+> 状态：本地开发环境中**未执行**。只有在满足以上全部前置条件、隔离且明确授权的
+> 主机上才能执行以下步骤。
 
 1. 在授权主机上构建并检查候选版本：
 

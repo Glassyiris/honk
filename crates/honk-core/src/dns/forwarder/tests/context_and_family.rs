@@ -64,45 +64,6 @@ async fn test_response_requery_stops_at_depth_limit() {
 }
 
 #[tokio::test]
-async fn test_asis_uses_original_destination() {
-    use honk_config::dns::{DnsRequestAction, DnsRequestRouting};
-
-    let socket = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-        .await
-        .unwrap();
-    let original_dst = socket.local_addr().unwrap();
-    let responder = tokio::spawn(async move {
-        let mut request = vec![0u8; 512];
-        let (size, peer) = socket.recv_from(&mut request).await.unwrap();
-        request.truncate(size);
-        let mut response = make_a_response([203, 0, 113, 7], 60);
-        response[0..2].copy_from_slice(&request[0..2]);
-        socket.send_to(&response, peer).await.unwrap();
-    });
-    let router = Arc::new(
-        DnsRouter::new(&DnsRouting {
-            request: DnsRequestRouting {
-                rules: vec![],
-                fallback: DnsRequestAction::AsIs,
-            },
-            ..Default::default()
-        })
-        .unwrap(),
-    );
-    let forwarder = DnsForwarder::new(Arc::new(FailUpstream), test_cache(), router);
-    let query = make_a_query();
-
-    let response = forwarder
-        .resolve_with_context(&query, Some(original_dst))
-        .await
-        .unwrap();
-    responder.await.unwrap();
-
-    assert_eq!(&response[0..2], &query[0..2]);
-    assert_eq!(&response[response.len() - 4..], &[203, 0, 113, 7]);
-}
-
-#[tokio::test]
 async fn test_fixed_domain_ttl_zero_skips_cache() {
     use std::collections::HashMap;
 
@@ -187,7 +148,9 @@ fn make_aaaa_response(ip: [u8; 16], ttl: u32) -> Vec<u8> {
 }
 
 fn nodata_response(domain: &str, qtype: u16) -> Vec<u8> {
-    make_empty_response(&build_dns_query(domain, qtype), domain, qtype)
+    let query = build_dns_query(domain, qtype);
+    let context = crate::dns::query::QueryContext::parse(&query).expect("query context");
+    make_empty_response(&query, &context)
 }
 
 fn answer_count(resp: &[u8]) -> u16 {
@@ -205,11 +168,15 @@ struct QtypeMock {
 impl DnsUpstreamPool for QtypeMock {
     async fn query(&self, _upstream_name: &str, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
-        let (domain, qtype) = parse_dns_question(raw_query).expect("question");
+        let (_, qtype) = parse_dns_question(raw_query).expect("question");
         Ok(match qtype {
             1 => self.a.clone(),
             28 => self.aaaa.clone(),
-            _ => make_empty_response(raw_query, &domain, qtype),
+            _ => {
+                let context = crate::dns::query::QueryContext::parse(raw_query)
+                    .expect("query context");
+                make_empty_response(raw_query, &context)
+            }
         })
     }
 }

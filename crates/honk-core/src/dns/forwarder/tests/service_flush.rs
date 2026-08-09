@@ -38,6 +38,26 @@ async fn explicit_ingress_profiles_do_not_share_cache_entries() {
 }
 
 #[tokio::test]
+async fn service_rejects_a_mismatched_question_before_cache_write() {
+    let mut response = make_a_response([192, 0, 2, 9], 300);
+    response[13..20].copy_from_slice(b"poisonx");
+    let cache = test_cache();
+    let service = crate::dns::DnsService::with_forwarder(Arc::new(DnsForwarder::new(
+        Arc::new(MockUpstream::new(response)),
+        cache.clone(),
+        test_router(),
+    )));
+
+    let error = service
+        .resolve(&make_a_query(), IngressProfile::Api)
+        .await
+        .expect_err("mismatched upstream question must fail");
+
+    assert!(error.to_string().contains("question does not match"));
+    assert!(cache.lock().await.is_empty());
+}
+
+#[tokio::test]
 async fn service_flush_cancels_stalled_query_without_cache_resurrection() {
     let upstream = Arc::new(GatedUpstream {
         response: make_a_response([192, 0, 2, 1], 300),
@@ -70,7 +90,7 @@ async fn service_flush_cancels_stalled_query_without_cache_resurrection() {
 }
 
 #[tokio::test]
-async fn service_flush_fences_detached_refresh_memory_and_persistence() {
+async fn service_flush_fences_background_refresh_memory_and_persistence() {
     use honk_config::experimental::CacheFileConfig;
 
     let directory = tempfile::tempdir().expect("tempdir");
@@ -120,7 +140,7 @@ async fn service_flush_fences_detached_refresh_memory_and_persistence() {
     assert!(cached.windows(4).any(|bytes| bytes == [192, 0, 2, 1]));
     tokio::time::timeout(Duration::from_secs(1), upstream.refresh_entered.notified())
         .await
-        .expect("detached refresh entered");
+        .expect("background refresh entered");
 
     let persisted = tokio::time::timeout(Duration::from_secs(1), service.flush_cache())
         .await

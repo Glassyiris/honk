@@ -1,4 +1,7 @@
-use super::{ResponseError, ResponseTemplate};
+use super::{
+    ResponseError, ResponseTemplate, build_dns_error_response, build_dns_refused,
+    build_dns_servfail,
+};
 use crate::dns::query::{IngressProfile, QueryContext};
 
 fn query(txid: u16, profile: IngressProfile) -> QueryContext {
@@ -108,4 +111,29 @@ fn rejects_stale_identity_and_malformed_responses() {
         template.render(&different),
         Err(ResponseError::RequestIdentityMismatch)
     ));
+}
+
+#[test]
+fn builds_error_responses_in_the_dns_response_layer() {
+    let request = query(0x1234, IngressProfile::Internal);
+    let mut wire = request.canonical_wire().to_vec();
+    wire[..2].copy_from_slice(&0x1234_u16.to_be_bytes());
+    let servfail = build_dns_servfail(&wire);
+    let refused = build_dns_refused(&wire);
+
+    assert_eq!(&servfail[..2], &[0x12, 0x34]);
+    assert_eq!(servfail[2], 0x81);
+    assert_eq!(servfail[3], 0x82);
+    assert_eq!(refused[3], 0x85);
+
+    wire[2..4].copy_from_slice(&0x2930_u16.to_be_bytes());
+    let opcode_refused = build_dns_refused(&wire);
+    assert_eq!(
+        u16::from_be_bytes([opcode_refused[2], opcode_refused[3]]) & 0x7800,
+        0x2800
+    );
+    let opcode_flags = u16::from_be_bytes([opcode_refused[2], opcode_refused[3]]);
+    assert_eq!(opcode_flags & 0x0020, 0, "AD must not be asserted locally");
+    assert_ne!(opcode_flags & 0x0010, 0, "CD is echoed from the request");
+    assert_eq!(build_dns_error_response(&[1, 2], 15), vec![0; 12]);
 }

@@ -84,6 +84,19 @@ async fn flush_after_snapshot(
     let mut failures = Vec::new();
     {
         let mut backend = ebpf.write().await;
+        let publication = projection.publication_fence.read();
+        if batch.generation != projection.state.lock().snapshot.generation() {
+            drop(publication);
+            drop(backend);
+            counters.generation_rebuilds.fetch_add(1, Ordering::Relaxed);
+            crate::stats::record_dns_event(crate::stats::DnsStatEvent::ProjectionStaleGeneration);
+            tracing::debug!(
+                reason = "generation_changed_before_write",
+                "DNS routing projection skipped stale write"
+            );
+            projection.notify_worker();
+            return;
+        }
         for set in &batch.sets {
             let key = maps::ip_addr_to_lpm_key(set.ip);
             match backend.set_domain_ip_bitmap(&key, &set.bitmap) {

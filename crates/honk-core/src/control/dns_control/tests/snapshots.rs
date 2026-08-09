@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test]
-async fn snapshot_publication_does_not_wait_for_resolve_and_notify_exchange() {
+async fn snapshot_publication_does_not_wait_for_answer_query_exchange() {
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let old = snapshot_forwarder(Arc::new(SnapshotUpstream {
@@ -17,7 +17,7 @@ async fn snapshot_publication_does_not_wait_for_resolve_and_notify_exchange() {
         let query = query.clone();
         tokio::spawn(async move {
             controller
-                .resolve_and_notify(&query, None, crate::dns::query::IngressProfile::Internal)
+                .answer_query(&query, None, crate::dns::query::IngressProfile::Internal)
                 .await
         })
     };
@@ -41,9 +41,9 @@ async fn snapshot_publication_does_not_wait_for_resolve_and_notify_exchange() {
     }
     assert!(!running.is_finished(), "old query must remain paused");
     release.notify_waiters();
-    let (old_response, _) = running.await.expect("old query task");
-    let (new_response, _) = controller
-        .resolve_and_notify(&query, None, crate::dns::query::IngressProfile::Internal)
+    let old_response = running.await.expect("old query task");
+    let new_response = controller
+        .answer_query(&query, None, crate::dns::query::IngressProfile::Internal)
         .await;
 
     assert_eq!(

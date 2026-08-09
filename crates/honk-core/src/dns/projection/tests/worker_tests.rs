@@ -32,6 +32,33 @@ async fn same_generation_interleaving_converges_exact_mock_value() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn generation_change_before_backend_write_skips_stale_batch() {
+    let (projection, mut receiver, ebpf) = projection_for_test(snapshot(1, 1, 2));
+    let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 32));
+    projection.submit(
+        snapshot(1, 1, 2),
+        positive("a.test", &[ip], Duration::from_secs(30)),
+    );
+    receiver.try_recv().expect("initial wake");
+    projection.clear_worker_wake();
+
+    worker::flush_for_test_after_snapshot(&projection, &ebpf, || {
+        projection.update_snapshot(snapshot(2, 4, 8));
+    })
+    .await;
+
+    assert!(ebpf.read().await.projection_map_snapshot().is_empty());
+    assert_eq!(projection.counters().generation_rebuilds, 1);
+    receiver.try_recv().expect("replacement generation wake");
+    projection.clear_worker_wake();
+    worker::flush_for_test(&projection, &ebpf).await;
+    assert_eq!(
+        ebpf.read().await.projection_map_snapshot()[0].1.bitmap,
+        [4, 0, 0, 0, 0, 0, 0, 0]
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn stale_remove_is_repaired_by_new_same_generation_owner() {
     let now = tokio::time::Instant::now();
     let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 31));

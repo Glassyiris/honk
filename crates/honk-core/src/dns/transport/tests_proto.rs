@@ -375,6 +375,27 @@ async fn doh_post_over_h2_roundtrip() {
 }
 
 #[tokio::test]
+async fn doh_connector_rejects_http1_only_server() {
+    let (mut server_config, _) = self_signed_server_config();
+    server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let acceptor = TlsAcceptor::from(Arc::new(server_config));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        acceptor.accept(tcp).await
+    });
+    let connector =
+        honk_outbound::tls::build_dns_connector(true, super::doh::DOH_ALPN_WIRE).unwrap();
+    let tcp = tokio::net::TcpStream::connect(address).await.unwrap();
+
+    let result = connector.connect("localhost", tcp).await;
+
+    assert!(result.is_err(), "DoH must not negotiate HTTP/1.1");
+    assert!(server.await.unwrap().is_err());
+}
+
+#[tokio::test]
 async fn forwarder_cache_hit_all_protocols_udp() {
     let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = udp.local_addr().unwrap();
@@ -624,14 +645,22 @@ async fn live_google_doh_request_path() {
 async fn doq_doh3_clients_construct() {
     let ep = DnsEndpoint::parse("127.0.0.1", DnsProtocol::Quic, Some("localhost")).unwrap();
     assert!(
-        crate::dns::transport::DoqClient::new(ep.clone(), Duration::from_secs(1))
-            .await
-            .is_ok()
+        crate::dns::transport::DoqClient::new(
+            ep.clone(),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        )
+        .await
+        .is_ok()
     );
     let ep3 =
         DnsEndpoint::parse("127.0.0.1/dns-query", DnsProtocol::H3, Some("localhost")).unwrap();
     assert!(
-        crate::dns::transport::Doh3Client::new(ep3, Duration::from_secs(1))
+        crate::dns::transport::Doh3Client::new(
+            ep3,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        )
             .await
             .is_ok()
     );

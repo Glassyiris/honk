@@ -293,3 +293,54 @@ async fn query_paused_in_leaf_routing_cannot_publish_after_close() {
     assert_eq!(stats.close_count, 0);
     assert_eq!(stats.tasks, 0);
 }
+
+#[tokio::test]
+async fn stalled_tls_setups_use_dial_timeout_for_dot_and_doh() {
+    for protocol in [DnsProtocol::Tls, DnsProtocol::Https] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let mut _connections = Vec::new();
+            for _ in 0..2 {
+                _connections.push(listener.accept().await.expect("accept").0);
+            }
+            std::future::pending::<()>().await;
+        });
+        let endpoint = match protocol {
+            DnsProtocol::Https => format!("localhost:{}/dns-query", address.port()),
+            _ => address.to_string(),
+        };
+        let pool = UpstreamPool::new(
+            &[DnsUpstream {
+                name: "tls".to_string(),
+                address: endpoint,
+                protocol,
+                tls_server_name: Some("localhost".to_string()),
+                outbound: None,
+            }],
+            Arc::new(
+                DnsRouter::new(&DnsRouting {
+                    fallback: "tls".to_string(),
+                    ..Default::default()
+                })
+                .expect("router"),
+            ),
+        )
+        .expect("pool")
+        .with_timeouts(Duration::from_secs(5), Duration::from_millis(20));
+
+        let result = tokio::time::timeout(Duration::from_secs(1), pool.query("tls", &[0_u8; 12]))
+            .await
+            .expect("TLS setup ignored dial timeout")
+            .expect_err("stalled TLS setup must fail");
+
+        assert!(
+            result.to_string().contains("timed out"),
+            "unexpected {protocol:?} setup error: {result}"
+        );
+        pool.close().await;
+        assert_eq!(pool.lifecycle_stats().tasks, 0);
+        server.abort();
+        let _ = server.await;
+    }
+}

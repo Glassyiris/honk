@@ -2,6 +2,7 @@
 
 mod connection;
 pub mod dns_control;
+mod dns_listener;
 pub mod drain;
 pub mod janitor;
 pub mod packet_sniffer;
@@ -94,7 +95,6 @@ use connection::*;
 use probers::*;
 use reload::*;
 pub(crate) use resource_budget::{MAX_EFFECTIVE_NOFILE, ResourceBudget};
-pub use sockets::DnsBpfNotifier;
 use sockets::*;
 
 #[derive(Debug, Clone)]
@@ -821,7 +821,16 @@ impl ControlPlane {
         let config = self.config.read().await;
         let tproxy_port = config.global.tproxy_port;
         let tproxy_mark = config.global.tproxy_mark;
+        let dns_bind_endpoint = config
+            .dns
+            .bind_endpoint()
+            .map_err(|error| anyhow::anyhow!("invalid dns.bind: {error}"))?;
         drop(config);
+        let bound_dns_listener = dns_bind_endpoint
+            .as_ref()
+            .map(dns_listener::BoundDnsListener::bind)
+            .transpose()
+            .map_err(|error| anyhow::anyhow!("bind dns.bind listener: {error}"))?;
         let tcp4_addr = SocketAddr::new("0.0.0.0".parse()?, tproxy_port);
         let tcp6_addr = SocketAddr::new("::".parse()?, tproxy_port);
         let udp4_addr = tcp4_addr;
@@ -888,6 +897,28 @@ impl ControlPlane {
             ebpf.publish_listener_sockets(tcp4_fd, tcp6_fd, &udp4_fds, &udp6_fds)
                 .map_err(|e| anyhow::anyhow!("publish listener sockets to eBPF: {}", e))?;
         }
+
+        let mut dns_listener = match bound_dns_listener {
+            Some(bound) => {
+                let listener = bound
+                    .spawn(
+                        Arc::clone(&self.dns_controller),
+                        Arc::clone(&self.dns_concurrency_limit),
+                        Arc::clone(&self.concurrency_limit),
+                        Arc::clone(&self.stats),
+                        Arc::clone(&self.drain_tracker),
+                    )
+                    .map_err(|error| anyhow::anyhow!("start dns.bind listener: {error}"))?;
+                info!(
+                    address = %listener.local_addr(),
+                    tcp = dns_bind_endpoint.as_ref().is_some_and(|endpoint| endpoint.tcp_enabled()),
+                    udp = dns_bind_endpoint.as_ref().is_some_and(|endpoint| endpoint.udp_enabled()),
+                    "Standalone DNS listener started"
+                );
+                Some(listener)
+            }
+            None => None,
+        };
 
         // One receive loop per listener socket. The datapath hashes flows
         // into the group (see the comment above), so loops are flow-disjoint.
@@ -1353,7 +1384,12 @@ impl ControlPlane {
                             let _ = tx.send(StatsSnapshot { per_outbound: snap, total_connections: total }).await;
                         }
                         Some(ControlCommand::Shutdown) | None => {
-                            self.shutdown_datapath(&drain, &mut udp_removal_task).await?;
+                            self.shutdown_datapath(
+                                &drain,
+                                &mut udp_removal_task,
+                                dns_listener.as_mut(),
+                            )
+                            .await?;
                             break;
                         }
                     }
@@ -1374,11 +1410,15 @@ impl ControlPlane {
         &mut self,
         drain: &Arc<DrainTracker>,
         udp_removal_task: &mut tokio::task::JoinHandle<()>,
+        dns_listener: Option<&mut dns_listener::DnsListener>,
     ) -> anyhow::Result<()> {
         info!(
             "Control plane shutting down, draining {} active connections",
             drain.active_count()
         );
+        if let Some(listener) = dns_listener.as_ref() {
+            listener.stop_accepting();
+        }
         if let Err(error) = self.ebpf.write().await.set_datapath_ready(false) {
             warn!(%error, "failed to close eBPF datapath admission");
         }
@@ -1420,6 +1460,9 @@ impl ControlPlane {
         }
         info!("shutdown: draining connections");
         drain.drain().await?;
+        if let Some(listener) = dns_listener {
+            listener.abort_and_join().await;
+        }
         // Active flows own the current runtime until the drain completes; only
         // then terminally close its AnyTLS pools and reject any late warm work.
         // Dropping this future on timeout detaches nothing: the force-closes
@@ -1525,7 +1568,7 @@ fn begin_udp_slow_path(
     let Some(permit) = try_admit_udp_slow_path(stats, concurrency_limit) else {
         return UdpSlowPathWork::Done;
     };
-    if original_dst.port() == 53 && is_exact_dns_query(data) {
+    if original_dst.port() == 53 && crate::dns::query::is_exact_dns_query(data) {
         // Permit is acquired before the heap copy required to leave the
         // receive buffer for a permit-bounded DNS task.
         return UdpSlowPathWork::DnsThenMaybeInitialize {
@@ -1661,11 +1704,12 @@ fn dispatch_udp_slow_path(
     original_dst: SocketAddr,
     data: &[u8],
 ) {
-    let concurrency_limit = if original_dst.port() == 53 && is_exact_dns_query(data) {
-        &state.dns_concurrency_limit
-    } else {
-        &state.udp_concurrency_limit
-    };
+    let concurrency_limit =
+        if original_dst.port() == 53 && crate::dns::query::is_exact_dns_query(data) {
+            &state.dns_concurrency_limit
+        } else {
+            &state.udp_concurrency_limit
+        };
     match begin_udp_slow_path(
         &state.udp_pool,
         &state.stats,
