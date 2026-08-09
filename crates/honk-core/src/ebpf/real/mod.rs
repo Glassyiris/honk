@@ -69,7 +69,6 @@ pub struct RealEbpfBackend {
     log_flush_handle: Option<tokio::task::JoinHandle<()>>,
     /// Background task that drains EVENT_RINGBUF (DaeEvent) into the log.
     event_flush_handle: Option<tokio::task::JoinHandle<()>>,
-    udp_decision_exhaustion_rx: Option<tokio::sync::mpsc::Receiver<()>>,
     /// Runtime probe for `BPF_MAP_LOOKUP_AND_DELETE_ELEM` (handoff take).
     cap_lookup_and_delete: BatchCapability,
     /// Runtime probe for `BPF_MAP_LOOKUP_BATCH` (janitor map scans).
@@ -990,10 +989,6 @@ impl EbpfBackend for RealEbpfBackend {
             sequence.exhausted
         );
         Ok(sequence.exhausted != 0)
-    }
-
-    fn take_udp_decision_exhaustion_receiver(&mut self) -> Option<tokio::sync::mpsc::Receiver<()>> {
-        self.udp_decision_exhaustion_rx.take()
     }
 
     fn routing_handoff_lookup(

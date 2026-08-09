@@ -241,33 +241,28 @@ impl ControlPlane {
         let route_count = new_router.route_count();
         let old_static_flags = direct_offload_static_bit(&current_config, &old_plan);
         let new_static_flags = direct_offload_static_bit(&new_config, &new_plan);
-        let (datapath_flags, _ephemeral_flags_task) =
-            if let Some(handle) = self.datapath_flags.clone() {
-                (handle, None)
-            } else {
-                if current_config.experimental.udp_nfqueue.enabled
-                    || new_config.experimental.udp_nfqueue.enabled
-                {
-                    error!("datapath flags coordinator is unavailable during NFQUEUE reload");
-                    return false;
-                }
-                let mode_state = self.mode_state.clone().unwrap_or_else(|| {
-                    Arc::new(parking_lot::RwLock::new(crate::mode::ModeState::new(
-                        "Rule", "Proxy",
-                    )))
-                });
-                let (handle, task) = crate::mode::DatapathFlagsCoordinator::spawn(
-                    Arc::clone(&self.ebpf),
-                    mode_state,
-                    None,
-                );
-                if let Err(error) = handle.initialize(old_static_flags, false, false).await {
-                    task.abort();
-                    error!(%error, "failed to initialize reload-scoped datapath flags coordinator");
-                    return false;
-                }
-                (handle, Some(task))
-            };
+        let datapath_flags = if let Some(handle) = self.datapath_flags.clone() {
+            handle
+        } else {
+            if current_config.experimental.udp_nfqueue.enabled
+                || new_config.experimental.udp_nfqueue.enabled
+            {
+                error!("datapath flags writer is unavailable during NFQUEUE reload");
+                return false;
+            }
+            let mode_state = self.mode_state.clone().unwrap_or_else(|| {
+                Arc::new(parking_lot::RwLock::new(crate::mode::ModeState::new(
+                    "Rule", "Proxy",
+                )))
+            });
+            let handle =
+                crate::mode::DatapathFlagsHandle::new(Arc::clone(&self.ebpf), mode_state, None);
+            if let Err(error) = handle.initialize(old_static_flags, false, false).await {
+                error!(%error, "failed to initialize reload-scoped datapath flags writer");
+                return false;
+            }
+            handle
+        };
         if let Err(error) = datapath_flags.fence_nfqueue().await {
             error!(%error, "failed to fence NFQUEUE before reload");
             self.datapath_healthy

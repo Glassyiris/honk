@@ -330,6 +330,27 @@ impl QueuedDatagram {
     }
 }
 
+enum DatagramPayload<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Bytes),
+}
+
+impl DatagramPayload<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Borrowed(data) => data.len(),
+            Self::Owned(data) => data.len(),
+        }
+    }
+
+    fn into_bytes(self) -> Bytes {
+        match self {
+            Self::Borrowed(data) => Bytes::copy_from_slice(data),
+            Self::Owned(data) => data,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PacketAdmissionError {
     FlowQueueFull,
@@ -1012,26 +1033,12 @@ impl UdpEndpointPool {
 
     fn make_packet(
         &self,
-        data: &[u8],
+        data: DatagramPayload<'_>,
         flow_slots: &Arc<Semaphore>,
     ) -> Result<QueuedDatagram, PacketAdmissionError> {
         let (flow_permit, global_byte_permit) = self.packet_permits(data.len(), flow_slots)?;
         Ok(QueuedDatagram {
-            data: Bytes::copy_from_slice(data),
-            _flow_permit: flow_permit,
-            _global_byte_permit: global_byte_permit,
-        })
-    }
-
-    #[cfg(any(feature = "ebpf", test))]
-    fn make_owned_packet(
-        &self,
-        data: Bytes,
-        flow_slots: &Arc<Semaphore>,
-    ) -> Result<QueuedDatagram, PacketAdmissionError> {
-        let (flow_permit, global_byte_permit) = self.packet_permits(data.len(), flow_slots)?;
-        Ok(QueuedDatagram {
-            data,
+            data: data.into_bytes(),
             _flow_permit: flow_permit,
             _global_byte_permit: global_byte_permit,
         })
@@ -1041,7 +1048,7 @@ impl UdpEndpointPool {
         &self,
         sender: &mpsc::Sender<QueuedDatagram>,
         flow_slots: &Arc<Semaphore>,
-        data: &[u8],
+        data: DatagramPayload<'_>,
         stats: &StatsManager,
     ) -> EndpointReservation {
         if sender.is_closed() {
@@ -1075,19 +1082,23 @@ impl UdpEndpointPool {
         }
     }
 
-    #[cfg(any(feature = "ebpf", test))]
-    fn enqueue_owned(
-        &self,
-        sender: &mpsc::Sender<QueuedDatagram>,
-        flow_slots: &Arc<Semaphore>,
-        data: Bytes,
+    fn reserve_new(
+        self: &Arc<Self>,
+        vacant: dashmap::mapref::entry::VacantEntry<'_, EndpointKey, EndpointEntry>,
+        data: DatagramPayload<'_>,
+        decision_token: u32,
+        slow_permit: OwnedSemaphorePermit,
         stats: &StatsManager,
     ) -> EndpointReservation {
-        if sender.is_closed() {
-            stats.record_udp_queue_closed();
-            return EndpointReservation::QueueClosed;
-        }
-        let packet = match self.make_owned_packet(data, flow_slots) {
+        let endpoint_permit = match self.endpoint_slots.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                stats.record_udp_capacity_rejection();
+                return EndpointReservation::CapacityRejected;
+            }
+        };
+        let flow_slots = Arc::new(Semaphore::new(FLOW_QUEUE_CAPACITY));
+        let first = match self.make_packet(data, &flow_slots) {
             Ok(packet) => packet,
             Err(PacketAdmissionError::FlowQueueFull) => {
                 stats.record_udp_flow_queue_full();
@@ -1098,22 +1109,49 @@ impl UdpEndpointPool {
                 return EndpointReservation::QueueFull;
             }
         };
-        match sender.try_send(packet) {
-            Ok(()) => {
-                stats.record_udp_queue_accepted();
-                EndpointReservation::Enqueued
-            }
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                stats.record_udp_flow_queue_full();
-                EndpointReservation::QueueFull
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                stats.record_udp_queue_closed();
-                EndpointReservation::QueueClosed
-            }
+        let (queue_tx, queue_rx) = mpsc::channel(FLOW_QUEUE_CAPACITY);
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let epoch_gate = self.initialization_epoch.lock();
+        if self.terminal.load(Ordering::Acquire) {
+            stats.record_udp_queue_closed();
+            return EndpointReservation::QueueClosed;
         }
+        let epoch = *epoch_gate;
+        let cancellation = self.cancel_epoch.subscribe();
+        let initializer_guard = UdpInitializerGuard::new(Arc::clone(self));
+        let initializer = Arc::new(InitializingEndpoint {
+            decision_token,
+            generation,
+            queue_tx,
+            queue_rx: Mutex::new(Some(queue_rx)),
+            flow_slots,
+            endpoint_permit: Mutex::new(Some(endpoint_permit)),
+            tracker_id: Mutex::new(None),
+            selected_node: Mutex::new(None),
+            cancelled: AtomicBool::new(false),
+            cancel_notify: Notify::new(),
+        });
+        let key = *vacant.key();
+        vacant.insert(EndpointEntry::Initializing(Arc::clone(&initializer)));
+        drop(epoch_gate);
+        #[cfg(test)]
+        self.pause_after_reservation_publication();
+        EndpointReservation::Initializing(UdpInitLease {
+            pool: Arc::clone(self),
+            key,
+            generation,
+            decision_token,
+            epoch,
+            first: Some(first),
+            _slow_permit: slow_permit,
+            cancellation,
+            initializer,
+            _initializer_guard: initializer_guard,
+            connection_guard: None,
+            dns_checked: decision_token != 0,
+            committed: false,
+        })
     }
-
     /// Atomically reserve a cold tuple or synchronously enqueue onto its
     /// existing Initializing/Ready incarnation. No map or std-mutex guard is
     /// held across await because this entire operation is synchronous.
@@ -1138,7 +1176,7 @@ impl UdpEndpointPool {
                             match self.enqueue(
                                 &initializing.queue_tx,
                                 &initializing.flow_slots,
-                                data,
+                                DatagramPayload::Borrowed(data),
                                 stats,
                             ) {
                                 EndpointReservation::QueueClosed => {
@@ -1151,7 +1189,12 @@ impl UdpEndpointPool {
                             if ready.alive.load(Ordering::Acquire)
                                 && !ready.endpoint.dead.load(Ordering::Acquire) =>
                         {
-                            match self.enqueue(&ready.queue_tx, &ready.flow_slots, data, stats) {
+                            match self.enqueue(
+                                &ready.queue_tx,
+                                &ready.flow_slots,
+                                DatagramPayload::Borrowed(data),
+                                stats,
+                            ) {
                                 EndpointReservation::QueueClosed => {
                                     (ready.decision_token, ready.generation)
                                 }
@@ -1168,71 +1211,13 @@ impl UdpEndpointPool {
                     self.retire_if_same(key, stale_token, stale_generation);
                 }
                 dashmap::mapref::entry::Entry::Vacant(vacant) => {
-                    let endpoint_permit = match self.endpoint_slots.clone().try_acquire_owned() {
-                        Ok(permit) => permit,
-                        Err(_) => {
-                            stats.record_udp_capacity_rejection();
-                            return EndpointReservation::CapacityRejected;
-                        }
-                    };
-                    let flow_slots = Arc::new(Semaphore::new(FLOW_QUEUE_CAPACITY));
-                    let first = match self.make_packet(data, &flow_slots) {
-                        Ok(packet) => packet,
-                        Err(PacketAdmissionError::FlowQueueFull) => {
-                            stats.record_udp_flow_queue_full();
-                            return EndpointReservation::QueueFull;
-                        }
-                        Err(PacketAdmissionError::GlobalPayloadFull) => {
-                            stats.record_udp_global_payload_full();
-                            return EndpointReservation::QueueFull;
-                        }
-                    };
-                    let (queue_tx, queue_rx) = mpsc::channel(FLOW_QUEUE_CAPACITY);
-                    let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
-                    // Map-entry → epoch-gate is the only nested lock order.
-                    // Capture the epoch, subscribe, account, and publish
-                    // while the same gate held by cancellation is locked.
-                    // A cancellation can therefore linearize wholly before
-                    // or after this reservation, never in its middle.
-                    let epoch_gate = self.initialization_epoch.lock();
-                    if self.terminal.load(Ordering::Acquire) {
-                        stats.record_udp_queue_closed();
-                        return EndpointReservation::QueueClosed;
-                    }
-                    let epoch = *epoch_gate;
-                    let cancellation = self.cancel_epoch.subscribe();
-                    let initializer_guard = UdpInitializerGuard::new(Arc::clone(self));
-                    let initializer = Arc::new(InitializingEndpoint {
-                        decision_token: 0,
-                        generation,
-                        queue_tx,
-                        queue_rx: Mutex::new(Some(queue_rx)),
-                        flow_slots,
-                        endpoint_permit: Mutex::new(Some(endpoint_permit)),
-                        tracker_id: Mutex::new(None),
-                        selected_node: Mutex::new(None),
-                        cancelled: AtomicBool::new(false),
-                        cancel_notify: Notify::new(),
-                    });
-                    vacant.insert(EndpointEntry::Initializing(Arc::clone(&initializer)));
-                    drop(epoch_gate);
-                    #[cfg(test)]
-                    self.pause_after_reservation_publication();
-                    return EndpointReservation::Initializing(UdpInitLease {
-                        pool: Arc::clone(self),
-                        key,
-                        generation,
-                        decision_token: 0,
-                        epoch,
-                        first: Some(first),
-                        _slow_permit: slow_permit,
-                        cancellation,
-                        initializer,
-                        _initializer_guard: initializer_guard,
-                        connection_guard: None,
-                        dns_checked: false,
-                        committed: false,
-                    });
+                    return self.reserve_new(
+                        vacant,
+                        DatagramPayload::Borrowed(data),
+                        0,
+                        slow_permit,
+                        stats,
+                    );
                 }
             }
         }
@@ -1274,17 +1259,22 @@ impl UdpEndpointPool {
                     return EndpointReservation::IdentityMismatch;
                 }
                 match occupied.get() {
-                    EndpointEntry::Initializing(initializing) => self.enqueue_owned(
+                    EndpointEntry::Initializing(initializing) => self.enqueue(
                         &initializing.queue_tx,
                         &initializing.flow_slots,
-                        data,
+                        DatagramPayload::Owned(data),
                         stats,
                     ),
                     EndpointEntry::Ready(ready)
                         if ready.alive.load(Ordering::Acquire)
                             && !ready.endpoint.dead.load(Ordering::Acquire) =>
                     {
-                        self.enqueue_owned(&ready.queue_tx, &ready.flow_slots, data, stats)
+                        self.enqueue(
+                            &ready.queue_tx,
+                            &ready.flow_slots,
+                            DatagramPayload::Owned(data),
+                            stats,
+                        )
                     }
                     EndpointEntry::Ready(_) | EndpointEntry::Retiring { .. } => {
                         stats.record_udp_queue_closed();
@@ -1296,66 +1286,13 @@ impl UdpEndpointPool {
                 if expected_generation.is_some() {
                     return EndpointReservation::IdentityMismatch;
                 }
-                let endpoint_permit = match self.endpoint_slots.clone().try_acquire_owned() {
-                    Ok(permit) => permit,
-                    Err(_) => {
-                        stats.record_udp_capacity_rejection();
-                        return EndpointReservation::CapacityRejected;
-                    }
-                };
-                let flow_slots = Arc::new(Semaphore::new(FLOW_QUEUE_CAPACITY));
-                let first = match self.make_owned_packet(data, &flow_slots) {
-                    Ok(packet) => packet,
-                    Err(PacketAdmissionError::FlowQueueFull) => {
-                        stats.record_udp_flow_queue_full();
-                        return EndpointReservation::QueueFull;
-                    }
-                    Err(PacketAdmissionError::GlobalPayloadFull) => {
-                        stats.record_udp_global_payload_full();
-                        return EndpointReservation::QueueFull;
-                    }
-                };
-                let (queue_tx, queue_rx) = mpsc::channel(FLOW_QUEUE_CAPACITY);
-                let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
-                let epoch_gate = self.initialization_epoch.lock();
-                if self.terminal.load(Ordering::Acquire) {
-                    stats.record_udp_queue_closed();
-                    return EndpointReservation::QueueClosed;
-                }
-                let epoch = *epoch_gate;
-                let cancellation = self.cancel_epoch.subscribe();
-                let initializer_guard = UdpInitializerGuard::new(Arc::clone(self));
-                let initializer = Arc::new(InitializingEndpoint {
+                self.reserve_new(
+                    vacant,
+                    DatagramPayload::Owned(data),
                     decision_token,
-                    generation,
-                    queue_tx,
-                    queue_rx: Mutex::new(Some(queue_rx)),
-                    flow_slots,
-                    endpoint_permit: Mutex::new(Some(endpoint_permit)),
-                    tracker_id: Mutex::new(None),
-                    selected_node: Mutex::new(None),
-                    cancelled: AtomicBool::new(false),
-                    cancel_notify: Notify::new(),
-                });
-                vacant.insert(EndpointEntry::Initializing(Arc::clone(&initializer)));
-                drop(epoch_gate);
-                #[cfg(test)]
-                self.pause_after_reservation_publication();
-                EndpointReservation::Initializing(UdpInitLease {
-                    pool: Arc::clone(self),
-                    key,
-                    generation,
-                    decision_token,
-                    epoch,
-                    first: Some(first),
-                    _slow_permit: slow_permit,
-                    cancellation,
-                    initializer,
-                    _initializer_guard: initializer_guard,
-                    connection_guard: None,
-                    dns_checked: true,
-                    committed: false,
-                })
+                    slow_permit,
+                    stats,
+                )
             }
         }
     }
@@ -1387,10 +1324,10 @@ impl UdpEndpointPool {
             {
                 (
                     initializing.generation,
-                    self.enqueue_owned(
+                    self.enqueue(
                         &initializing.queue_tx,
                         &initializing.flow_slots,
-                        data,
+                        DatagramPayload::Owned(data),
                         stats,
                     ),
                 )
@@ -1402,7 +1339,12 @@ impl UdpEndpointPool {
             {
                 (
                     ready.generation,
-                    self.enqueue_owned(&ready.queue_tx, &ready.flow_slots, data, stats),
+                    self.enqueue(
+                        &ready.queue_tx,
+                        &ready.flow_slots,
+                        DatagramPayload::Owned(data),
+                        stats,
+                    ),
                 )
             }
             EndpointEntry::Retiring { token, .. } if *token == decision_token => {
@@ -1450,7 +1392,12 @@ impl UdpEndpointPool {
                     && !ready.endpoint.dead.load(Ordering::Acquire) =>
             {
                 (
-                    self.enqueue(&ready.queue_tx, &ready.flow_slots, data, stats),
+                    self.enqueue(
+                        &ready.queue_tx,
+                        &ready.flow_slots,
+                        DatagramPayload::Borrowed(data),
+                        stats,
+                    ),
                     (ready.decision_token, ready.generation),
                 )
             }

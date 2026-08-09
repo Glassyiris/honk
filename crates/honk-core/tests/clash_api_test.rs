@@ -17,7 +17,7 @@ use honk_core::connection_tracker::{ConnectionEntry, ConnectionTracker};
 use honk_core::dns::cache::DnsCache;
 use honk_core::dns::forwarder::{DnsForwarder, DnsUpstreamPool, build_dns_query};
 use honk_core::dns::routing::DnsRouter;
-use honk_core::mode::{DatapathFlagsCoordinator, ModeState};
+use honk_core::mode::{DatapathFlagsHandle, ModeState};
 use honk_core::stats::StatsManager;
 use honk_outbound::alive::{AliveDialerSet, IpVersion, ProbeDomain};
 use honk_outbound::group::GroupManager;
@@ -164,8 +164,8 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
     let mode_state = Arc::new(parking_lot::RwLock::new(ModeState::new("Rule", "proxy")));
     let ebpf: Arc<tokio::sync::RwLock<Box<dyn honk_core::ebpf::EbpfBackend>>> =
         Arc::new(tokio::sync::RwLock::new(Box::new(mock_ebpf)));
-    let (datapath_flags, _datapath_flags_task) =
-        DatapathFlagsCoordinator::spawn(ebpf, Arc::clone(&mode_state), Some(Arc::clone(&db)));
+    let datapath_flags =
+        DatapathFlagsHandle::new(ebpf, Arc::clone(&mode_state), Some(Arc::clone(&db)));
     datapath_flags.initialize(0, false, false).await.unwrap();
     let state = Arc::new(ClashState {
         config: Arc::new(tokio::sync::RwLock::new(config)),

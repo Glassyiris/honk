@@ -969,7 +969,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     mode_state,
                     datapath_flags: control_plane
                         .datapath_flags_handle()
-                        .expect("datapath flags coordinator started above"),
+                        .expect("datapath flags writer started above"),
                     secret: clash_cfg.secret.clone(),
                     connection_pool: control_plane.connection_pool(),
                     external_ui,

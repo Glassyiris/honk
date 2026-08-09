@@ -30,9 +30,7 @@ experimental {
 
 Changing `experimental.udp_nfqueue.enabled` requires a restart. Enabled startup requires a build with the `ebpf` feature and the real eBPF backend; `--mock-ebpf` and builds without `ebpf` are rejected. Host-originated WAN egress remains on the canonical TPROXY path. DNS port 53, `must`, `block`, and already-safe route-time direct decisions never enter NFQUEUE; only decisions that can still change in userspace are staged.
 
-The implementation owns one raw-netlink queue, number `320`, and the exact nftables objects `inet honk_nfqueue` / `udp_decision`; it uses no bypass, fanout, or fail-open option. Same-network-namespace firewall managers must not modify those objects while honk is running. Direct accepts each held original skb in FIFO order with its final mark and creates no userspace direct socket, payload copy, endpoint, connection entry, or deliberate retransmission. Proxy transfers its one retained payload copy into the normal UDP initializer, drops the originals, and dials/sends once; block and cancellation drop the originals.
-
-When the Clash API is enabled, `GET /stats` exposes this path under `/stats.udp.nfqueue`: `received`, `activeFlows`, `directAccepted`, `proxyCopied`, `proxyDropped`, `block`, `cancel`, `drop`, `tokenMismatch`, `tokenExhaustion`, `verdictErrors`, and `receiptToVerdict`.
+The path owns raw-netlink queue `320` and nftables objects `inet honk_nfqueue` / `udp_decision`; same-namespace firewall managers must leave them untouched while honk runs. Direct releases the held skb, proxy submits one retained payload to the normal UDP initializer, and block/cancellation drops it. With the Clash API enabled, runtime counters and receipt-to-verdict latency appear under `/stats.udp.nfqueue`. See the [design](doc/design.en.md) and [configuration reference](doc/configuration.en.md) for invariants and the full metric schema.
 
 ## Before Using This Repository
 

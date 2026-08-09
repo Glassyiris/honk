@@ -71,10 +71,6 @@ enum NfqueueRuntimeFatal {
     Pending(#[source] nfqueue::PendingUdpFatal),
     #[error("NFQUEUE pending fatal channel closed")]
     PendingChannelClosed,
-    #[error("UDP decision token allocator exhausted (ring event)")]
-    TokenExhaustionPrompt,
-    #[error("UDP decision token exhaustion event channel closed")]
-    TokenPromptChannelClosed,
     #[error("UDP decision token allocator exhausted (locked backstop)")]
     TokenExhaustionBackstop,
     #[error("UDP decision token backstop failed: {0}")]
@@ -92,7 +88,6 @@ struct NfqueueRuntime {
     pending: Arc<nfqueue::PendingUdpVerdicts>,
     stop: tokio::sync::watch::Sender<bool>,
     watchdog: Option<tokio::task::JoinHandle<()>>,
-    token_prompt: mpsc::Receiver<()>,
     token_backstop: tokio::time::Interval,
 }
 
@@ -105,7 +100,6 @@ impl NfqueueRuntime {
         loop {
             let listener_fatal = &mut self.listener_fatal;
             let pending_fatal = &mut self.pending_fatal;
-            let token_prompt = &mut self.token_prompt;
             let token_backstop = &mut self.token_backstop;
             let watchdog = self
                 .watchdog
@@ -122,14 +116,6 @@ impl NfqueueRuntime {
                     return fatal
                         .map(NfqueueRuntimeFatal::Pending)
                         .unwrap_or(NfqueueRuntimeFatal::PendingChannelClosed);
-                }
-                prompt = token_prompt.recv() => {
-                    return if prompt.is_some() {
-                        self.stats.record_udp_nfqueue_token_exhaustion();
-                        NfqueueRuntimeFatal::TokenExhaustionPrompt
-                    } else {
-                        NfqueueRuntimeFatal::TokenPromptChannelClosed
-                    };
                 }
                 result = watchdog => {
                     return NfqueueRuntimeFatal::Watchdog(match result {
@@ -167,16 +153,6 @@ impl NfqueueRuntime {
             Ok(error) => return Err(NfqueueRuntimeFatal::Pending(error)),
             Err(mpsc::error::TryRecvError::Disconnected) => {
                 return Err(NfqueueRuntimeFatal::PendingChannelClosed);
-            }
-            Err(mpsc::error::TryRecvError::Empty) => {}
-        }
-        match self.token_prompt.try_recv() {
-            Ok(()) => {
-                self.stats.record_udp_nfqueue_token_exhaustion();
-                return Err(NfqueueRuntimeFatal::TokenExhaustionPrompt);
-            }
-            Err(mpsc::error::TryRecvError::Disconnected) => {
-                return Err(NfqueueRuntimeFatal::TokenPromptChannelClosed);
             }
             Err(mpsc::error::TryRecvError::Empty) => {}
         }
@@ -228,10 +204,6 @@ impl NfqueueRuntime {
         }
         if let Ok(error) = self.pending_fatal.try_recv() {
             return Some(NfqueueRuntimeFatal::Pending(error));
-        }
-        if self.token_prompt.try_recv().is_ok() {
-            self.stats.record_udp_nfqueue_token_exhaustion();
-            return Some(NfqueueRuntimeFatal::TokenExhaustionPrompt);
         }
         None
     }
@@ -359,11 +331,10 @@ pub struct ControlPlane {
     /// Bare-TCP pins are userspace-pool resources rather than NodeRuntime
     /// state, so their addresses are tracked separately for exact cleanup.
     selector_bare_warm: Arc<parking_lot::Mutex<std::collections::HashMap<uuid::Uuid, String>>>,
-    /// Startup mode snapshot shared by routing decisions and the flags actor.
+    /// Startup mode snapshot shared by routing decisions and serialized flags updates.
     mode_state: Option<crate::mode::SharedModeState>,
-    /// Sole owner handle for mode state and DATAPATH_FLAGS_MAP publication.
+    /// Sole writer for mode state and DATAPATH_FLAGS_MAP publication.
     datapath_flags: Option<crate::mode::DatapathFlagsHandle>,
-    datapath_flags_task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
     #[cfg(feature = "ebpf")]
     pending_udp_verdicts: Option<Arc<nfqueue::PendingUdpVerdicts>>,
     datapath_healthy: Arc<std::sync::atomic::AtomicBool>,
@@ -741,7 +712,6 @@ impl ControlPlane {
             selector_bare_warm: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             mode_state: None,
             datapath_flags: None,
-            datapath_flags_task: None,
             #[cfg(feature = "ebpf")]
             pending_udp_verdicts: None,
             datapath_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
@@ -927,7 +897,7 @@ impl ControlPlane {
         self.cache_db.clone()
     }
 
-    /// Install the startup mode snapshot before the flags coordinator starts.
+    /// Install the startup mode snapshot before the flags writer starts.
     pub fn set_mode_state(&mut self, mode_state: crate::mode::SharedModeState) {
         assert!(
             self.datapath_flags.is_none(),
@@ -936,22 +906,20 @@ impl ControlPlane {
         self.mode_state = Some(mode_state);
     }
 
-    /// Start the sole flags writer after cache-backed mode restoration.
+    /// Install the serialized flags writer after cache-backed mode restoration.
     pub fn start_datapath_flags_coordinator(&mut self) -> anyhow::Result<()> {
-        if self.datapath_flags.is_some() || self.datapath_flags_task.is_some() {
-            anyhow::bail!("datapath flags coordinator already started");
+        if self.datapath_flags.is_some() {
+            anyhow::bail!("datapath flags writer already started");
         }
         let mode_state = self
             .mode_state
             .clone()
             .ok_or_else(|| anyhow::anyhow!("mode state is not initialized"))?;
-        let (handle, task) = crate::mode::DatapathFlagsCoordinator::spawn(
+        self.datapath_flags = Some(crate::mode::DatapathFlagsHandle::new(
             Arc::clone(&self.ebpf),
             mode_state,
             self.cache_db.clone(),
-        );
-        self.datapath_flags = Some(handle);
-        self.datapath_flags_task = Some(task);
+        ));
         Ok(())
     }
 
@@ -971,7 +939,7 @@ impl ControlPlane {
         };
         self.datapath_flags
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("datapath flags coordinator is not running"))?
+            .ok_or_else(|| anyhow::anyhow!("datapath flags writer is not running"))?
             .initialize(static_flags, nfqueue_enabled, nfqueue_ready)
             .await
     }
@@ -1050,8 +1018,8 @@ impl ControlPlane {
             return Ok(None);
         }
 
-        let token_prompt = {
-            let mut backend = self.ebpf.write().await;
+        {
+            let backend = self.ebpf.read().await;
             backend
                 .verify_udp_decision_sequence()
                 .map_err(|error| anyhow::anyhow!("verify UDP decision sequence: {error}"))?;
@@ -1059,10 +1027,7 @@ impl ControlPlane {
                 self.stats.record_udp_nfqueue_token_exhaustion();
                 anyhow::bail!("UDP decision token allocator is exhausted; reboot is required");
             }
-            backend
-                .take_udp_decision_exhaustion_receiver()
-                .ok_or_else(|| anyhow::anyhow!("UDP decision exhaustion receiver unavailable"))?
-        };
+        }
 
         let (pending, pending_fatal) = nfqueue::PendingUdpVerdicts::new(
             Arc::clone(&self.ebpf),
@@ -1127,7 +1092,6 @@ impl ControlPlane {
             pending,
             stop,
             watchdog: Some(watchdog),
-            token_prompt,
             token_backstop,
         }))
     }
@@ -1147,21 +1111,10 @@ impl ControlPlane {
     }
 
     async fn cleanup_flags_startup_failure(&mut self) {
-        let disable_failed = match self.datapath_flags.as_ref() {
-            Some(flags) => flags.disable().await.is_err(),
-            None => true,
-        };
-        let Some(task) = self.datapath_flags_task.take() else {
-            return;
-        };
-        if disable_failed {
-            task.abort();
-        }
-        match task.await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => error!(%error, "datapath flags startup failed"),
-            Err(error) if error.is_cancelled() && disable_failed => {}
-            Err(error) => error!(%error, "datapath flags coordinator task failed during startup"),
+        if let Some(flags) = self.datapath_flags.as_ref()
+            && let Err(error) = flags.disable().await
+        {
+            error!(%error, "datapath flags startup cleanup failed");
         }
     }
     async fn cleanup_pre_admission_failure(&mut self) {
@@ -1683,11 +1636,6 @@ impl ControlPlane {
         let mut rx = self.command_rx.take().expect("command_rx already taken");
         let drain = self.drain_tracker.clone();
         let fatal_ebpf = Arc::clone(&self.ebpf);
-        let mut datapath_flags_task = self
-            .datapath_flags_task
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("datapath flags coordinator is not running"))?;
-        let mut datapath_flags_completed = false;
         let mut fatal_error = None;
 
         let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -1696,15 +1644,6 @@ impl ControlPlane {
         loop {
             loop_count += 1;
             tokio::select! {
-                result = &mut datapath_flags_task => {
-                    datapath_flags_completed = true;
-                    fatal_error = Some(match result {
-                        Ok(Ok(())) => anyhow::anyhow!("datapath flags coordinator exited unexpectedly"),
-                        Ok(Err(error)) => anyhow::anyhow!("datapath flags coordinator failed: {error:#}"),
-                        Err(error) => anyhow::anyhow!("datapath flags coordinator task failed: {error}"),
-                    });
-                    break;
-                }
                 error = udp_removal_fatal_rx.recv() => {
                     fatal_error = Some(error.unwrap_or_else(|| {
                         anyhow::anyhow!("UDP removal fatal channel closed unexpectedly")
@@ -1860,8 +1799,7 @@ impl ControlPlane {
             }
         }
 
-        if !datapath_flags_completed
-            && let Some(flags) = self.datapath_flags.as_ref()
+        if let Some(flags) = self.datapath_flags.as_ref()
             && let Err(error) = flags.fence_nfqueue().await
         {
             fatal_error.get_or_insert_with(|| {
@@ -1907,27 +1845,12 @@ impl ControlPlane {
             self.pending_udp_verdicts = None;
         }
 
-        if !datapath_flags_completed {
-            if let Some(flags) = self.datapath_flags.as_ref()
-                && let Err(error) = flags.disable().await
-            {
-                fatal_error.get_or_insert_with(|| {
-                    anyhow::anyhow!("failed to disable datapath flags: {error:#}")
-                });
-            }
-            match (&mut datapath_flags_task).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    fatal_error.get_or_insert_with(|| {
-                        anyhow::anyhow!("datapath flags coordinator failed: {error:#}")
-                    });
-                }
-                Err(error) => {
-                    fatal_error.get_or_insert_with(|| {
-                        anyhow::anyhow!("datapath flags coordinator task failed: {error}")
-                    });
-                }
-            }
+        if let Some(flags) = self.datapath_flags.as_ref()
+            && let Err(error) = flags.disable().await
+        {
+            fatal_error.get_or_insert_with(|| {
+                anyhow::anyhow!("failed to disable datapath flags: {error:#}")
+            });
         }
 
         if let Err(error) = self.finalize_shutdown().await {

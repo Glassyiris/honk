@@ -547,10 +547,6 @@ pub trait EbpfBackend: Send + Sync {
     /// `BPF_F_LOCK` lookup so the embedded spin lock is never copied.
     fn udp_decision_sequence_exhausted(&self) -> anyhow::Result<bool>;
 
-    /// Take the ring-event prompt exactly once. The periodic locked read
-    /// remains authoritative if the bounded prompt channel ever loses a send.
-    fn take_udp_decision_exhaustion_receiver(&mut self) -> Option<tokio::sync::mpsc::Receiver<()>>;
-
     /// Inspect a staged handoff without consuming it. UDP decision commit owns
     /// the token-checked removal; legacy consumers may still use `take`.
     fn routing_handoff_lookup(

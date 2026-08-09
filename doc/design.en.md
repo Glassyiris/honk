@@ -151,8 +151,8 @@ dropped; traffic that does not require staging keeps its normal path.
 | `OUTBOUND_STATS` | Per-CPU tx/rx packets/bytes per outbound |
 | `LISTEN_SOCKET_MAP` | SockMap of transparent listeners |
 | `DATAPATH_STATE_MAP` | Admission gate opened only after the complete listener generation is published |
-| `DATAPATH_FLAGS_MAP` | Sole-coordinator runtime flags: mode-based direct-offload policy plus NFQUEUE enabled/ready fencing, read when a new flow is classified |
-| `EVENT_RINGBUF` | Overflow and token-exhaustion prompt events drained to supervised userspace handling |
+| `DATAPATH_FLAGS_MAP` | Serialized runtime flags: mode-based direct-offload policy plus NFQUEUE enabled/ready fencing, read when a new flow is classified |
+| `EVENT_RINGBUF` | Rate-limited diagnostic events for datapath overflows and token exhaustion; the supervisor polls the locked allocator state independently |
 
 ### Reserved outbound indices
 

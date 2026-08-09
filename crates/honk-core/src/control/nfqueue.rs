@@ -22,8 +22,6 @@ use crate::stats::StatsManager;
 pub(super) const TERMINAL_GRACE: Duration = Duration::from_millis(500);
 pub(super) const WATCHDOG_INTERVAL: Duration = Duration::from_millis(100);
 pub(super) const HARD_HOLD_TIMEOUT: Duration = Duration::from_secs(3);
-// Control tasks hold these locks briefly; bounded retries preserve held skbs without stalling the queue indefinitely.
-const CALLBACK_LOCK_WAIT: Duration = Duration::from_millis(50);
 const MAX_SCHEDULED_CLEANUPS: usize = honk_nfqueue::QUEUE_MAXLEN as usize;
 const IPPROTO_UDP: u8 = 17;
 
@@ -460,17 +458,7 @@ impl PendingUdpVerdicts {
         };
 
         loop {
-            let cell_deadline = Instant::now() + CALLBACK_LOCK_WAIT;
-            let entry = loop {
-                if let Some(entry) = self.cells.try_entry(key) {
-                    break Some(entry);
-                }
-                if Instant::now() >= cell_deadline {
-                    break None;
-                }
-                std::thread::sleep(Duration::from_micros(50));
-            };
-            let Some(entry) = entry else {
+            let Some(entry) = self.cells.try_entry(key) else {
                 self.schedule_cleanup(CleanupRequest::Token {
                     key,
                     decision_token,
@@ -675,17 +663,7 @@ impl PendingUdpVerdicts {
         slow_permit: Option<OwnedSemaphorePermit>,
     ) -> NfqueueIngest {
         let retained = {
-            let backend_deadline = Instant::now() + CALLBACK_LOCK_WAIT;
-            let backend = loop {
-                if let Ok(backend) = self.ebpf.try_read() {
-                    break Some(backend);
-                }
-                if Instant::now() >= backend_deadline {
-                    break None;
-                }
-                std::thread::sleep(Duration::from_micros(50));
-            };
-            let Some(backend) = backend else {
+            let Ok(backend) = self.ebpf.try_read() else {
                 drop(vacant);
                 self.schedule_cleanup(CleanupRequest::Token {
                     key,

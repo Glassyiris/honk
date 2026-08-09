@@ -3490,12 +3490,6 @@ async fn reload_and_merge_never_touch_ebpf_hooks() {
     assert_eq!(dyn_attach.load(Ordering::Relaxed), 0);
     assert_eq!(dyn_forget.load(Ordering::Relaxed), 0);
     cp.datapath_flags.as_ref().unwrap().disable().await.unwrap();
-    cp.datapath_flags_task
-        .take()
-        .unwrap()
-        .await
-        .unwrap()
-        .unwrap();
 }
 
 /// Shutdown with a flow that never finishes must still detach the hooks and

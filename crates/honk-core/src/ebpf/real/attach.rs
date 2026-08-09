@@ -518,8 +518,6 @@ impl RealEbpfBackend {
         // AsyncFd readiness pattern as the aya-log flush task above.  The map
         // is taken out of the Ebpf object so the task owns it outright; the
         // pinned copy under pin_root remains for external inspection.
-        let (udp_decision_exhaustion_tx, udp_decision_exhaustion_rx) =
-            tokio::sync::mpsc::channel(1);
         let event_flush_handle = match bpf.take_map("EVENT_RINGBUF") {
             Some(map) => match aya::maps::RingBuf::try_from(map) {
                 Ok(ring_buf) => {
@@ -527,10 +525,7 @@ impl RealEbpfBackend {
                         ring_buf,
                         tokio::io::Interest::READABLE,
                     ) {
-                        Ok(async_fd) => Some(tokio::spawn(consume_dae_events(
-                            async_fd,
-                            udp_decision_exhaustion_tx.clone(),
-                        ))),
+                        Ok(async_fd) => Some(tokio::spawn(consume_dae_events(async_fd))),
                         Err(e) => {
                             warn!(
                                 "DaeEvent ringbuf AsyncFd setup failed (events will not be drained): {}",
@@ -568,7 +563,6 @@ impl RealEbpfBackend {
             listeners_published: false,
             log_flush_handle,
             event_flush_handle,
-            udp_decision_exhaustion_rx: Some(udp_decision_exhaustion_rx),
             cap_lookup_and_delete: BatchCapability::new(),
             cap_lookup_batch: BatchCapability::new(),
             cap_delete_batch: BatchCapability::new(),

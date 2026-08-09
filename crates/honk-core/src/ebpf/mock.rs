@@ -191,8 +191,6 @@ pub struct MockEbpfBackend {
     /// Persistent allocator state; cleanup intentionally leaves this intact.
     pub udp_decision_sequence_next: u32,
     pub udp_decision_sequence_exhausted: bool,
-    pub udp_decision_exhaustion_tx: Option<tokio::sync::mpsc::Sender<()>>,
-    udp_decision_exhaustion_rx: Option<tokio::sync::mpsc::Receiver<()>>,
     routing_fault: Option<(RoutingPushPhase, usize)>,
     #[cfg(test)]
     projection_fault: Option<(ProjectionMapOperation, usize, bool)>,
@@ -205,18 +203,7 @@ pub struct MockEbpfBackend {
 impl MockEbpfBackend {
     /// Create a new mock backend.
     pub fn new() -> Self {
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
-        Self {
-            udp_decision_exhaustion_tx: Some(tx),
-            udp_decision_exhaustion_rx: Some(rx),
-            ..Self::default()
-        }
-    }
-
-    pub fn signal_udp_decision_exhaustion(&self) {
-        if let Some(tx) = &self.udp_decision_exhaustion_tx {
-            let _ = tx.try_send(());
-        }
+        Self::default()
     }
 
     #[cfg(test)]
@@ -1001,10 +988,6 @@ impl EbpfBackend for MockEbpfBackend {
     fn udp_decision_sequence_exhausted(&self) -> anyhow::Result<bool> {
         self.verify_udp_decision_sequence()?;
         Ok(self.udp_decision_sequence_exhausted)
-    }
-
-    fn take_udp_decision_exhaustion_receiver(&mut self) -> Option<tokio::sync::mpsc::Receiver<()>> {
-        self.udp_decision_exhaustion_rx.take()
     }
 
     fn routing_handoff_lookup(
@@ -1822,19 +1805,6 @@ mod tests {
         backend.udp_decision_sequence_next = 123;
         futures::executor::block_on(backend.cleanup()).unwrap();
         assert_eq!(backend.udp_decision_sequence_next, 123);
-    }
-
-    #[test]
-    fn udp_exhaustion_prompt_is_take_once_and_coalesced() {
-        let mut backend = MockEbpfBackend::new();
-        let mut receiver = backend
-            .take_udp_decision_exhaustion_receiver()
-            .expect("first receiver take");
-        assert!(backend.take_udp_decision_exhaustion_receiver().is_none());
-        backend.signal_udp_decision_exhaustion();
-        backend.signal_udp_decision_exhaustion();
-        assert_eq!(receiver.try_recv(), Ok(()));
-        assert!(receiver.try_recv().is_err());
     }
 
     #[test]

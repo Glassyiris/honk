@@ -149,8 +149,8 @@ fence、关闭）时，需要暂存的新流会被丢弃；无需暂存的流量
 | `OUTBOUND_STATS` | 每出站 per-CPU tx/rx 包/字节 |
 | `LISTEN_SOCKET_MAP` | 透明监听 SockMap |
 | `DATAPATH_STATE_MAP` | 仅在完整 listener generation 发布后打开的 admission gate |
-| `DATAPATH_FLAGS_MAP` | 唯一 coordinator 写入的运行时标志：按模式的 direct 卸载策略以及 NFQUEUE enabled/ready fence，在新流分类时读取 |
-| `EVENT_RINGBUF` | 溢出与 token 耗尽提示事件，由受监督的用户态逻辑消费 |
+| `DATAPATH_FLAGS_MAP` | 串行写入的运行时标志：按模式的 direct 卸载策略以及 NFQUEUE enabled/ready fence，在新流分类时读取 |
+| `EVENT_RINGBUF` | 对 datapath 溢出与 token 耗尽进行限速诊断记录；supervisor 独立轮询带锁的分配器状态 |
 
 ### 保留出站索引
 

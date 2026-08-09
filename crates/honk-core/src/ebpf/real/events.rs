@@ -19,11 +19,9 @@ pub fn event_ip(chunks: &[u32; 4]) -> std::net::IpAddr {
 /// so a conntrack overflow burst cannot storm the log.
 pub const EVENT_LOG_MAX_PER_SEC: u32 = 32;
 
-/// Drain `EVENT_RINGBUF`, forwarding token exhaustion before rate-limited
-/// logging so the fatal prompt cannot be suppressed by an overflow burst.
+/// Drain `EVENT_RINGBUF` into rate-limited structured logs.
 pub async fn consume_dae_events(
     mut async_fd: tokio::io::unix::AsyncFd<aya::maps::RingBuf<aya::maps::MapData>>,
-    udp_decision_exhaustion_tx: tokio::sync::mpsc::Sender<()>,
 ) {
     use honk_ebpf_common::event::{DaeEvent, DaeEventType};
     let mut window = std::time::Instant::now();
@@ -46,9 +44,6 @@ pub async fn consume_dae_events(
                 }
                 let ev: DaeEvent =
                     unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const DaeEvent) };
-                if ev.type_ == DaeEventType::UdpDecisionTokenExhausted as u32 {
-                    let _ = udp_decision_exhaustion_tx.try_send(());
-                }
                 if window.elapsed() >= std::time::Duration::from_secs(1) {
                     if suppressed > 0 {
                         warn!(
