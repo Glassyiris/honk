@@ -187,8 +187,14 @@ pub trait PacketTransport: Send + Sync + Debug {
     /// The relay target a flow reports as its destination.
     fn relay_addr(&self) -> SocketAddr;
     async fn send_packet(&self, data: &[u8]) -> std::io::Result<()>;
+    /// Stronger admission for a flow's first datagram. Queue-backed tunnels
+    /// override this to complete only after their writer flushes the packet.
+    async fn send_packet_confirmed(&self, data: &[u8]) -> std::io::Result<()> {
+        self.send_packet(data).await
+    }
     async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)>;
 }
+
 struct RuntimeOwnedPacketTransport<T> {
     inner: Arc<dyn PacketTransport>,
     _owner: T,
@@ -209,6 +215,10 @@ impl<T: Send + Sync> PacketTransport for RuntimeOwnedPacketTransport<T> {
 
     async fn send_packet(&self, data: &[u8]) -> std::io::Result<()> {
         self.inner.send_packet(data).await
+    }
+
+    async fn send_packet_confirmed(&self, data: &[u8]) -> std::io::Result<()> {
+        self.inner.send_packet_confirmed(data).await
     }
 
     async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {

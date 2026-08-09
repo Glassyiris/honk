@@ -113,6 +113,14 @@ impl ConnectionTracker {
         }
     }
 
+    /// Attach process metadata after registration. A missing entry means the
+    /// flow closed before the blocking `/proc` lookup completed.
+    pub fn update_process_path(&self, id: &str, process_path: String) {
+        if let Some(mut entry) = self.entries.get_mut(id) {
+            entry.process_path = Some(process_path);
+        }
+    }
+
     /// Remove a connection from the tracker.
     pub fn remove(&self, id: &str) {
         self.entries.remove(id);
