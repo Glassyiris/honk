@@ -172,13 +172,18 @@ pub(crate) async fn resolve_with_owner(
     } = execution;
     debug!("DNS forwarder: resolving {} bytes", raw_query.len());
     let engine = forwarder.engine().await?;
-    let prepared = match mode {
-        ResolveMode::Strict => engine.prepare(raw_query, original_dst, ingress)?,
-        ResolveMode::Compatibility => {
-            engine.prepare_compatibility(raw_query, original_dst, ingress)?
-        }
-    };
-    let qtype = prepared.qtype();
+    let parsed = DnsEngine::parse_query(raw_query, ingress)?;
+    let qtype = parsed.qtype();
+    if !is_filtered_qtype(qtype, &forwarder.strategy)
+        && let Some(outcome) = forwarder.resolve_hosts(engine, &parsed, raw_query, mode)?
+    {
+        return Ok(outcome);
+    }
+    let prepared = engine.prepare_parsed(
+        parsed,
+        original_dst,
+        matches!(mode, ResolveMode::Compatibility),
+    )?;
     let reuse_eligible = prepared.is_cacheable() && prepared.is_coalescable();
 
     if is_filtered_qtype(qtype, &forwarder.strategy) {

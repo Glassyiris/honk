@@ -360,6 +360,7 @@ domain/geosite matcher 视为"不是 x"，不会被其否决。
 dns {
     # bind: 'tcp+udp://:1053'   # 保持注释即可只用透明 DNS
     ipversion_prefer: 4
+    use_host: true
     upstream {
         homedns: 'udp+tcp://10.10.10.1:53'
     }
@@ -376,10 +377,28 @@ dns {
 | 字段 | 类型 | 默认值 | 含义 |
 | ------ | ------ | -------- | ------ |
 | `bind` | string | `""` | host netns 中可选的独立 UDP/TCP 监听；空值只关闭此监听 |
+| `use_host` | bool | `false` | 先于 DNS 路由、缓存和上游，用 `/etc/hosts` 应答 IN class A/AAAA 查询 |
 | `upstream` | list | 一个 `default` @ 223.5.5.5 UDP | 服务器；dae：`upstream { name: 'uri' }` |
 | `routing` | object | fallback 默认 | 请求路由；dae：`routing { request { ... } }` |
 | `strategy` | enum | 未指定时为 `both`；设置 `ipversion_prefer: 4\|6` 时分别为 `preferipv4`/`preferipv6` | 地址族策略 |
 | `cache` | object | 启用 | 缓存；dae：`optimistic_cache` / `optimistic_cache_ttl` / `max_cache_size` |
+
+### hosts 文件
+
+`use_host: true` 时，每次构建 DNS generation 都会读取一次 `/etc/hosts`。每个有效
+地址行的规范名和别名都会生效；匹配为精确、ASCII 大小写不敏感，末尾点会归一化，
+重复地址会去重，同时支持 IPv4 与 IPv6。无效地址行和注释会被忽略。
+
+`ipv4_only`/`ipv6_only` 的硬地址族过滤仍最先执行。除此之外，已知名称的 IN class
+A/AAAA 查询优先于 request 规则（包括 `reject`）、缓存条目和上游。名称存在但缺少所
+请求地址族时返回 NOERROR/NODATA，不会把查询泄漏给上游；非地址 qtype 与非 IN class
+仍走原路由管线。hosts 应答参与正常的 DNS 路由投影，wire TTL 为 60 秒，且绕过 honk
+应答缓存。
+
+加载后的表在该 DNS runtime generation 生命周期内不可变，查询路径不会读文件。
+修改 `/etc/hosts` 后需发送 SIGHUP；替换 generation 会原子加载新快照，已取得 lease
+的在途请求仍可在旧快照上结束。文件不可读会令启动失败，或在发布前中止 reload 并
+保留当前 generation。
 
 ### 独立监听
 

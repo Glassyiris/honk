@@ -6,10 +6,10 @@ use bytes::Bytes;
 use tracing::{debug, trace};
 
 use crate::dns::cache::{CacheKey, DnsCacheService, PublicationEpoch};
-use crate::dns::engine::{DnsEngine, PreparedQuery};
+use crate::dns::engine::{DnsEngine, ParsedQuery, PreparedQuery};
 use crate::dns::outcome::{DnsOutcome, EffectiveExpiry, OutcomeParts, OutcomeStatus, Provenance};
 use crate::dns::planner::RequestScope;
-use crate::dns::query::IngressProfile;
+use crate::dns::query::{IngressProfile, QueryContext};
 use crate::dns::response::ResponseTemplate;
 use honk_ebpf_common::DAE_BYPASS_MARK;
 
@@ -49,15 +49,70 @@ impl DnsForwarder {
         requery_history: Vec<String>,
         mode: ResolveMode,
     ) -> Result<DnsOutcome, DnsForwardError> {
+        self.outcome_from_query(
+            engine,
+            prepared.query(),
+            prepared.domain_arc(),
+            reusable,
+            analyzed_answer_ips,
+            status,
+            provenance,
+            expiry,
+            logical_upstream,
+            final_upstream,
+            requery_history,
+            mode,
+        )
+    }
+
+    pub(crate) fn local_outcome_from_wire(
+        &self,
+        engine: &DnsEngine,
+        parsed: &ParsedQuery,
+        reusable: impl Into<Bytes>,
+        mode: ResolveMode,
+    ) -> Result<DnsOutcome, DnsForwardError> {
+        self.outcome_from_query(
+            engine,
+            parsed.query(),
+            parsed.domain_arc(),
+            reusable,
+            None,
+            OutcomeStatus::Accepted,
+            Provenance::Fresh,
+            EffectiveExpiry::do_not_cache(),
+            None,
+            None,
+            Vec::new(),
+            mode,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn outcome_from_query(
+        &self,
+        engine: &DnsEngine,
+        query: &QueryContext,
+        domain: Arc<str>,
+        reusable: impl Into<Bytes>,
+        analyzed_answer_ips: Option<(usize, Vec<IpAddr>)>,
+        status: OutcomeStatus,
+        provenance: Provenance,
+        expiry: EffectiveExpiry,
+        logical_upstream: Option<String>,
+        final_upstream: Option<String>,
+        requery_history: Vec<String>,
+        mode: ResolveMode,
+    ) -> Result<DnsOutcome, DnsForwardError> {
         let reusable = reusable.into();
-        let template = match ResponseTemplate::validate_owned(prepared.query(), reusable.clone()) {
+        let template = match ResponseTemplate::validate_owned(query, reusable.clone()) {
             Ok(template) => Some(template),
             Err(_) if matches!(mode, ResolveMode::Compatibility) => None,
             Err(error) => return Err(error.into()),
         };
         let rendered = match &template {
-            Some(template) => template.render(prepared.query())?,
-            None => patch_txid(reusable.to_vec(), prepared.query().txid().get()),
+            Some(template) => template.render(query)?,
+            None => patch_txid(reusable.to_vec(), query.txid().get()),
         };
         let response_class = crate::dns::engine::classify_response(&reusable);
         let answer_ips = if status == OutcomeStatus::Accepted
@@ -74,7 +129,7 @@ impl DnsForwarder {
             status,
             response_class,
             provenance,
-            domain: prepared.domain_arc(),
+            domain,
             answer_ips,
             expiry,
             logical_upstream,

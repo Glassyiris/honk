@@ -73,6 +73,7 @@ dns {
     # 默认只用透明 :53；需要普通 host-netns UDP socket 时再启用
     # bind: '127.0.0.1:1053'
     ipversion_prefer: 4
+    # use_host: true  # 优先使用 /etc/hosts；修改后需 SIGHUP
     upstream {
         alidns: 'udp://223.5.5.5:53'
         googledns: 'udp+tcp://8.8.8.8:53'
