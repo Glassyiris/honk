@@ -51,12 +51,10 @@ pub enum QuicSniffOutcome {
 }
 
 impl QuicSniffOutcome {
-    /// Whether the sniff reached a terminal state for a confirmed-QUIC
-    /// flow: an SNI was extracted, or the complete ClientHello proved to
-    /// carry none.  Only terminal outcomes may drive the drop-and-reinject
-    /// offload — an `Incomplete` ClientHello could still re-route the flow
-    /// once its remaining CRYPTO fragments arrive, and a non-QUIC flow has
-    /// no retransmission guarantee at all.
+    /// Whether a confirmed-QUIC sniff reached a terminal state: an SNI was
+    /// extracted, or the complete ClientHello proved that none is available.
+    /// Incomplete input may still change the routing decision when its
+    /// remaining CRYPTO fragments arrive.
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::CompleteNoDomain | Self::Domain(_))
     }

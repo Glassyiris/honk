@@ -94,20 +94,31 @@ impl RealEbpfBackend {
             "PARAM: port={} dae0_ifindex={} wan_ifindex={} (iface={})",
             tproxy_port, dae0_ifindex, wan_ifindex, ebpf_wan_ifname
         );
-        // A stale pin must never hide the map owned by this generation.
-        // The singleton lock guarantees the previous engine has exited.
+        std::fs::create_dir_all(pin_root)?;
+        let sequence_pin = pin_root.join(UDP_DECISION_SEQUENCE_MAP);
+        if sequence_pin.try_exists()? {
+            syscall::validate_pinned_udp_decision_sequence(&sequence_pin)?;
+        }
+
+        // A stale pin must never hide a generation-owned map. The token
+        // allocator is the sole exception because token reuse is forbidden.
         let _ = std::fs::remove_file(pin_root.join("LISTEN_SOCKET_MAP"));
-        let mut bpf = EbpfLoader::new()
+        let mut loader = EbpfLoader::new();
+        loader
             .override_global("PARAM", &dae_param, true)
             .override_global("WAN_IFINDEX", &wan_ifindex, true)
             .override_global("DAE0PEER_IFINDEX", &dae0peer_ifindex, true)
-            .load(obj)?;
-        std::fs::create_dir_all(pin_root)?;
+            .map_pin_path(UDP_DECISION_SEQUENCE_MAP, sequence_pin.as_path());
+        let mut bpf = loader.load(obj)?;
+        syscall::validate_loaded_udp_decision_sequence(&bpf)?;
         for (name, map) in bpf.maps() {
             // aya exposes ELF internal sections (.rodata, .bss, etc.) as maps.
             // These cannot be pinned to bpffs; skip them to avoid noisy warnings.
             if name.starts_with('.') {
                 debug!("skipping internal map '{}'", name);
+                continue;
+            }
+            if name == UDP_DECISION_SEQUENCE_MAP {
                 continue;
             }
             let pin_path = pin_root.join(name);
@@ -507,6 +518,8 @@ impl RealEbpfBackend {
         // AsyncFd readiness pattern as the aya-log flush task above.  The map
         // is taken out of the Ebpf object so the task owns it outright; the
         // pinned copy under pin_root remains for external inspection.
+        let (udp_decision_exhaustion_tx, udp_decision_exhaustion_rx) =
+            tokio::sync::mpsc::channel(1);
         let event_flush_handle = match bpf.take_map("EVENT_RINGBUF") {
             Some(map) => match aya::maps::RingBuf::try_from(map) {
                 Ok(ring_buf) => {
@@ -514,7 +527,10 @@ impl RealEbpfBackend {
                         ring_buf,
                         tokio::io::Interest::READABLE,
                     ) {
-                        Ok(async_fd) => Some(tokio::spawn(consume_dae_events(async_fd))),
+                        Ok(async_fd) => Some(tokio::spawn(consume_dae_events(
+                            async_fd,
+                            udp_decision_exhaustion_tx.clone(),
+                        ))),
                         Err(e) => {
                             warn!(
                                 "DaeEvent ringbuf AsyncFd setup failed (events will not be drained): {}",
@@ -552,6 +568,7 @@ impl RealEbpfBackend {
             listeners_published: false,
             log_flush_handle,
             event_flush_handle,
+            udp_decision_exhaustion_rx: Some(udp_decision_exhaustion_rx),
             cap_lookup_and_delete: BatchCapability::new(),
             cap_lookup_batch: BatchCapability::new(),
             cap_delete_batch: BatchCapability::new(),

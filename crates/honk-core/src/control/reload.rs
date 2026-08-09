@@ -239,17 +239,74 @@ impl ControlPlane {
             });
 
         let route_count = new_router.route_count();
-        // All fallible preparation is complete. Fence only the atomic routing
-        // publication: existing Ready UDP endpoints remain independently
-        // serviceable, while new TCP/UDP slow-path admissions cannot observe a
-        // half-published eBPF/runtime generation.
-        drain.start_rejecting();
-        if !self.udp_pool.cancel_initializers_and_wait().await {
-            warn!("UDP initializers did not drain before reload commit");
-            self.stop_reload_rejection_if_healthy(drain);
+        let old_static_flags = direct_offload_static_bit(&current_config, &old_plan);
+        let new_static_flags = direct_offload_static_bit(&new_config, &new_plan);
+        let (datapath_flags, _ephemeral_flags_task) =
+            if let Some(handle) = self.datapath_flags.clone() {
+                (handle, None)
+            } else {
+                if current_config.experimental.udp_nfqueue.enabled
+                    || new_config.experimental.udp_nfqueue.enabled
+                {
+                    error!("datapath flags coordinator is unavailable during NFQUEUE reload");
+                    return false;
+                }
+                let mode_state = self.mode_state.clone().unwrap_or_else(|| {
+                    Arc::new(parking_lot::RwLock::new(crate::mode::ModeState::new(
+                        "Rule", "Proxy",
+                    )))
+                });
+                let (handle, task) = crate::mode::DatapathFlagsCoordinator::spawn(
+                    Arc::clone(&self.ebpf),
+                    mode_state,
+                    None,
+                );
+                if let Err(error) = handle.initialize(old_static_flags, false, false).await {
+                    task.abort();
+                    error!(%error, "failed to initialize reload-scoped datapath flags coordinator");
+                    return false;
+                }
+                (handle, Some(task))
+            };
+        if let Err(error) = datapath_flags.fence_nfqueue().await {
+            error!(%error, "failed to fence NFQUEUE before reload");
+            self.datapath_healthy
+                .store(false, std::sync::atomic::Ordering::Release);
+            drain.start_rejecting();
+            self.drain_tracker.start_rejecting();
+            self.close_and_drain_pending_udp_admission().await;
             return false;
         }
-        let old_registry = {
+        drain.start_rejecting();
+        #[cfg(feature = "ebpf")]
+        if let Some(pending) = self.pending_udp_verdicts.as_ref() {
+            pending.cancel_all().await;
+        }
+        if !self.udp_pool.cancel_initializers_and_wait().await {
+            warn!("UDP initializers did not drain before reload commit");
+            self.restore_datapath_flags_after_rejected_reload(
+                &datapath_flags,
+                old_static_flags,
+                drain,
+            )
+            .await;
+            return false;
+        }
+        #[cfg(feature = "ebpf")]
+        if let Some(pending) = self.pending_udp_verdicts.as_ref() {
+            pending.wait_empty().await;
+        }
+        if !self.udp_pool.wait_for_retirements().await {
+            warn!("UDP endpoint retirements did not drain before reload commit");
+            self.restore_datapath_flags_after_rejected_reload(
+                &datapath_flags,
+                old_static_flags,
+                drain,
+            )
+            .await;
+            return false;
+        }
+        let old_registry_result = {
             let mut router_guard = self.router.write().await;
             let mut config_guard = self.config.write().await;
             let mut ebpf = self.ebpf.write().await;
@@ -257,96 +314,107 @@ impl ControlPlane {
             let mut outbound_guard = self.outbound_id_map.write();
             let mut plan_guard = self.active_routing_plan.write();
             let mut runtime_guard = self.runtime_registry.write();
-            let provider = self.dns_controller.runtime_provider();
-            let publication = provider.prepare_publication(new_runtime);
+            'publication: {
+                let provider = self.dns_controller.runtime_provider();
+                let publication = provider.prepare_publication(new_runtime);
 
-            let transition_group_count = current_config.groups.len().max(new_config.groups.len());
-            if let Err(error) = open_group_connectivity(ebpf.as_mut(), transition_group_count) {
-                let restore = publish_group_connectivity(ebpf.as_mut(), &old_connectivity);
-                error!(%error, ?restore, "Failed to open group connectivity for reload transition");
-                self.stop_reload_rejection_if_healthy(drain);
-                return false;
-            }
-            let active_generation = match ebpf.active_routing_generation() {
-                Ok(generation) => generation,
-                Err(error) => {
-                    error!(%error, "Failed to read active routing generation");
-                    self.stop_reload_rejection_if_healthy(drain);
-                    return false;
+                let transition_group_count =
+                    current_config.groups.len().max(new_config.groups.len());
+                if let Err(error) = open_group_connectivity(ebpf.as_mut(), transition_group_count) {
+                    let restore = publish_group_connectivity(ebpf.as_mut(), &old_connectivity);
+                    error!(%error, ?restore, "Failed to open group connectivity for reload transition");
+                    break 'publication Err(());
                 }
-            };
-            let next_generation =
-                active_generation ^ (honk_ebpf_common::ROUTING_GENERATION_COUNT as u32 - 1);
-            if let Err(error) =
-                ebpf.stage_domain_routing_generation(next_generation, &new_domain_routes)
-            {
-                let restore = publish_group_connectivity(ebpf.as_mut(), &old_connectivity);
-                error!(%error, ?restore, "Failed to stage learned domain routes");
-                self.stop_reload_rejection_if_healthy(drain);
-                return false;
-            }
-            if let Err(error) = routing_matcher::RoutingMatcherBuilder::push_transition(
-                ebpf.as_mut(),
-                Some(&old_plan),
-                &new_plan,
-            ) {
-                let replay = ebpf
-                    .stage_domain_routing_generation(next_generation, &old_domain_routes)
-                    .and_then(|_| {
-                        routing_matcher::RoutingMatcherBuilder::push_transition(
-                            ebpf.as_mut(),
-                            Some(&old_plan),
-                            &old_plan,
-                        )
-                        .map(|_| ())
-                    })
-                    .and_then(|_| publish_group_connectivity(ebpf.as_mut(), &old_connectivity));
-                match replay {
-                    Ok(()) => {
-                        error!(
-                            %error,
-                            "Failed to push routing to eBPF; exact active plan replayed"
-                        );
-                        self.stop_reload_rejection_if_healthy(drain);
+                let active_generation = match ebpf.active_routing_generation() {
+                    Ok(generation) => generation,
+                    Err(error) => {
+                        error!(%error, "Failed to read active routing generation");
+                        break 'publication Err(());
                     }
-                    Err(replay_error) => {
-                        error!(
-                            %error,
-                            %replay_error,
-                            "Routing push and active-plan replay failed; datapath unhealthy"
-                        );
-                        self.datapath_healthy
-                            .store(false, std::sync::atomic::Ordering::Release);
-                        self.drain_tracker.start_rejecting();
-                    }
+                };
+                let next_generation =
+                    active_generation ^ (honk_ebpf_common::ROUTING_GENERATION_COUNT as u32 - 1);
+                if let Err(error) =
+                    ebpf.stage_domain_routing_generation(next_generation, &new_domain_routes)
+                {
+                    let restore = publish_group_connectivity(ebpf.as_mut(), &old_connectivity);
+                    error!(%error, ?restore, "Failed to stage learned domain routes");
+                    break 'publication Err(());
                 }
-                return false;
-            }
+                if let Err(error) = routing_matcher::RoutingMatcherBuilder::push_transition(
+                    ebpf.as_mut(),
+                    Some(&old_plan),
+                    &new_plan,
+                ) {
+                    let replay = ebpf
+                        .stage_domain_routing_generation(next_generation, &old_domain_routes)
+                        .and_then(|_| {
+                            routing_matcher::RoutingMatcherBuilder::push_transition(
+                                ebpf.as_mut(),
+                                Some(&old_plan),
+                                &old_plan,
+                            )
+                            .map(|_| ())
+                        })
+                        .and_then(|_| publish_group_connectivity(ebpf.as_mut(), &old_connectivity));
+                    match replay {
+                        Ok(()) => {
+                            error!(
+                                %error,
+                                "Failed to push routing to eBPF; exact active plan replayed"
+                            );
+                        }
+                        Err(replay_error) => {
+                            error!(
+                                %error,
+                                %replay_error,
+                                "Routing push and active-plan replay failed; datapath unhealthy"
+                            );
+                            self.datapath_healthy
+                                .store(false, std::sync::atomic::Ordering::Release);
+                            self.drain_tracker.start_rejecting();
+                        }
+                    }
+                    break 'publication Err(());
+                }
 
-            if let Err(error) = publish_group_connectivity(ebpf.as_mut(), &new_connectivity) {
-                warn!(
-                    %error,
-                    "Failed to publish exact group connectivity after reload; remaining slots stay fail-open"
-                );
+                if let Err(error) = publish_group_connectivity(ebpf.as_mut(), &new_connectivity) {
+                    warn!(
+                        %error,
+                        "Failed to publish exact group connectivity after reload; remaining slots stay fail-open"
+                    );
+                }
+                let old_registry =
+                    std::mem::replace(&mut *runtime_guard, Arc::clone(&new_runtime_registry));
+                // Commit point for runtime reuse: only now, with the successor
+                // published, does the old generation record the transfer and
+                // skip those runtimes at drain/shutdown.
+                old_registry.mark_moved_out(reused_runtime_ids);
+                publication.commit();
+                *router_guard = new_router;
+                *config_guard = new_config;
+                *group_guard = Arc::clone(&new_group_manager);
+                *outbound_guard = new_outbound_id_map;
+                *plan_guard = Arc::clone(&new_plan);
+                // The projection worker takes eBPF before its generation fence;
+                // install the snapshot under the same lock so no old batch can
+                // enter the newly activated datapath generation.
+                self.dns_controller
+                    .update_projection_snapshot(projection_snapshot);
+                Ok(old_registry)
             }
-            let old_registry =
-                std::mem::replace(&mut *runtime_guard, Arc::clone(&new_runtime_registry));
-            // Commit point for runtime reuse: only now, with the successor
-            // published, does the old generation record the transfer and
-            // skip those runtimes at drain/shutdown.
-            old_registry.mark_moved_out(reused_runtime_ids);
-            publication.commit();
-            *router_guard = new_router;
-            *config_guard = new_config;
-            *group_guard = Arc::clone(&new_group_manager);
-            *outbound_guard = new_outbound_id_map;
-            *plan_guard = Arc::clone(&new_plan);
-            // The projection worker takes eBPF before its generation fence;
-            // install the snapshot under the same lock so no old batch can
-            // enter the newly activated datapath generation.
-            self.dns_controller
-                .update_projection_snapshot(projection_snapshot);
-            old_registry
+        };
+        let old_registry = match old_registry_result {
+            Ok(old_registry) => old_registry,
+            Err(()) => {
+                self.restore_datapath_flags_after_rejected_reload(
+                    &datapath_flags,
+                    old_static_flags,
+                    drain,
+                )
+                .await;
+                return false;
+            }
         };
 
         routing_matcher::RoutingMatcherBuilder::activate_projection(&new_plan);
@@ -383,14 +451,84 @@ impl ControlPlane {
             self.alive_set
                 .sync_group_check_urls(&group_check_url_registrations(&config));
         }
-        // The flags live in a persistent map, but re-assert them after a
-        // successful reload so a missed or failed earlier write cannot leave
-        // the datapath out of sync with the clash mode and routing config.
-        self.sync_direct_offload_flags().await;
+        if let Err(error) = datapath_flags.set_static(new_static_flags).await {
+            error!(%error, "failed to publish reloaded datapath flags");
+            self.datapath_healthy
+                .store(false, std::sync::atomic::Ordering::Release);
+            drain.start_rejecting();
+            self.drain_tracker.start_rejecting();
+            return false;
+        }
+        if let Err(error) = datapath_flags.reopen_nfqueue().await {
+            error!(%error, "failed to reopen NFQUEUE after reload");
+            self.close_and_drain_pending_udp_admission().await;
+            self.datapath_healthy
+                .store(false, std::sync::atomic::Ordering::Release);
+            drain.start_rejecting();
+            self.drain_tracker.start_rejecting();
+            return false;
+        }
+        self.open_pending_udp_admission();
         info!("Configuration applied — {} routes active", route_count);
 
         self.stop_reload_rejection_if_healthy(drain);
         true
+    }
+
+    async fn restore_datapath_flags_after_rejected_reload(
+        &self,
+        datapath_flags: &crate::mode::DatapathFlagsHandle,
+        old_static_flags: u32,
+        drain: &DrainTracker,
+    ) {
+        if let Err(error) = datapath_flags.set_static(old_static_flags).await {
+            error!(%error, "failed to restore datapath flags after rejected reload");
+            self.datapath_healthy
+                .store(false, std::sync::atomic::Ordering::Release);
+            drain.start_rejecting();
+            self.drain_tracker.start_rejecting();
+            return;
+        }
+        if !self.is_datapath_healthy() {
+            drain.start_rejecting();
+            self.drain_tracker.start_rejecting();
+            return;
+        }
+        if let Err(error) = datapath_flags.reopen_nfqueue().await {
+            error!(%error, "failed to reopen NFQUEUE after rejected reload");
+            self.close_and_drain_pending_udp_admission().await;
+            self.datapath_healthy
+                .store(false, std::sync::atomic::Ordering::Release);
+            drain.start_rejecting();
+            self.drain_tracker.start_rejecting();
+            return;
+        }
+        self.open_pending_udp_admission();
+        drain.stop_rejecting();
+    }
+
+    fn open_pending_udp_admission(&self) {
+        #[cfg(feature = "ebpf")]
+        if let Some(pending) = self.pending_udp_verdicts.as_ref() {
+            pending.open_admission();
+        }
+    }
+
+    async fn close_and_drain_pending_udp_admission(&self) {
+        #[cfg(feature = "ebpf")]
+        if let Some(pending) = self.pending_udp_verdicts.as_ref() {
+            pending.cancel_all().await;
+        }
+        if !self.udp_pool.cancel_initializers_and_wait().await {
+            warn!("UDP initializers did not drain after NFQUEUE reopen failure");
+        }
+        #[cfg(feature = "ebpf")]
+        if let Some(pending) = self.pending_udp_verdicts.as_ref() {
+            pending.wait_empty().await;
+        }
+        if !self.udp_pool.wait_for_retirements().await {
+            warn!("UDP endpoint retirements did not drain after NFQUEUE reopen failure");
+        }
     }
 
     /// End reload admission once the datapath is known healthy.
@@ -587,6 +725,9 @@ fn restart_required_changes(current: &Config, candidate: &Config) -> Vec<&'stati
         != serde_json::to_value(&candidate.experimental.cache_file).ok()
     {
         changed.push("experimental.cache_file");
+    }
+    if current.experimental.udp_nfqueue.enabled != candidate.experimental.udp_nfqueue.enabled {
+        changed.push("experimental.udp_nfqueue.enabled");
     }
     changed
 }
@@ -1552,6 +1693,18 @@ mod atomic_reload_tests {
     }
 
     #[test]
+    fn udp_nfqueue_toggle_requires_restart() {
+        let current = Config::default();
+        let mut replacement = current.clone();
+        replacement.experimental.udp_nfqueue.enabled = !current.experimental.udp_nfqueue.enabled;
+
+        assert_eq!(
+            restart_required_changes(&current, &replacement),
+            vec!["experimental.udp_nfqueue.enabled"]
+        );
+    }
+
+    #[test]
     fn semantically_equivalent_dns_bind_does_not_require_restart() {
         let mut current = Config::default();
         current.dns.bind = "127.0.0.1:53".into();
@@ -1680,8 +1833,8 @@ mod atomic_reload_tests {
         );
     }
 
-    fn test_cp() -> ControlPlane {
-        ControlPlane::new(
+    async fn test_cp() -> ControlPlane {
+        let mut control_plane = ControlPlane::new(
             Config::default(),
             Box::new(MockEbpfBackend::new()),
             Router::new(&[], "direct").unwrap(),
@@ -1689,12 +1842,21 @@ mod atomic_reload_tests {
             DnsResolver::new(&honk_config::dns::DnsConfig::default()).unwrap(),
             test_dns_forwarder(),
         )
-        .unwrap()
+        .unwrap();
+        control_plane.set_mode_state(Arc::new(parking_lot::RwLock::new(
+            crate::mode::ModeState::new("Rule", "Proxy"),
+        )));
+        control_plane.start_datapath_flags_coordinator().unwrap();
+        control_plane
+            .initialize_datapath_flags(false, false)
+            .await
+            .unwrap();
+        control_plane
     }
 
     #[tokio::test]
     async fn reload_clamps_dials_to_startup_descriptor_reservation() {
-        let cp = test_cp();
+        let cp = test_cp().await;
         let ceiling = cp.resource_budget.transient_dials;
         let mut config = cp.config_handle().read().await.clone();
         config.global.max_concurrent_dials = usize::MAX;
@@ -1708,7 +1870,7 @@ mod atomic_reload_tests {
     /// two-phase apply.
     #[tokio::test]
     async fn build_failure_leaves_live_config_untouched() {
-        let cp = test_cp();
+        let cp = test_cp().await;
         let before = cp.config_handle().read().await.global.check_interval_secs;
 
         // An upstream with an empty address fails DnsEndpoint::parse during
@@ -1782,7 +1944,7 @@ mod atomic_reload_tests {
             }
         }
 
-        let cp = test_cp();
+        let cp = test_cp().await;
         let pool = cp.udp_pool.clone();
         let stats = Arc::new(StatsManager::new());
         let ready_client: std::net::SocketAddr = "10.0.0.1:53000".parse().unwrap();
@@ -1819,6 +1981,7 @@ mod atomic_reload_tests {
             ready_client,
             dst,
             ready_lease.generation(),
+            ready_lease.decision_token(),
             Arc::clone(&ready_endpoint),
             queue_rx,
             reply_socket,
@@ -1923,7 +2086,7 @@ mod atomic_reload_tests {
 
     #[tokio::test(start_paused = true)]
     async fn reload_timeout_keeps_runtime_and_restores_admission() {
-        let cp = Arc::new(test_cp());
+        let cp = Arc::new(test_cp().await);
         let pool = cp.udp_pool.clone();
         let stats = Arc::new(StatsManager::new());
         let client: std::net::SocketAddr = "10.0.0.9:53000".parse().unwrap();
@@ -1981,7 +2144,7 @@ mod atomic_reload_tests {
     #[tokio::test]
     async fn valid_reload_commits() {
         let expected_interval = Config::default().global.check_interval_secs + 1;
-        let cp = test_cp();
+        let cp = test_cp().await;
         let before_runtime = cp.dns_controller.runtime_provider().acquire();
         let cache = before_runtime.runtime().cache();
         assert_eq!(
@@ -2005,7 +2168,7 @@ mod atomic_reload_tests {
 
     #[tokio::test]
     async fn routing_push_failure_replays_old_plan_and_keeps_userspace_generation() {
-        let cp = test_cp();
+        let cp = test_cp().await;
         cp.ebpf
             .write()
             .await
@@ -2027,7 +2190,7 @@ mod atomic_reload_tests {
 
     #[tokio::test]
     async fn domain_route_staging_failure_keeps_the_active_generation() {
-        let cp = test_cp();
+        let cp = test_cp().await;
         let before = cp.ebpf.read().await.active_routing_generation().unwrap();
         cp.ebpf
             .write()
@@ -2053,7 +2216,7 @@ mod atomic_reload_tests {
 
     #[tokio::test]
     async fn replay_failure_marks_unhealthy_and_rejects_connections() {
-        let cp = test_cp();
+        let cp = test_cp().await;
         cp.ebpf
             .write()
             .await
@@ -2078,7 +2241,7 @@ mod atomic_reload_tests {
 
     #[tokio::test]
     async fn default_udp_warm_is_disabled_without_a_task_or_metrics() {
-        let cp = test_cp();
+        let cp = test_cp().await;
         let generation = cp.runtime_registry.read().clone();
 
         cp.start_udp_warm_coordinator(generation).await;
@@ -2202,7 +2365,7 @@ mod atomic_reload_tests {
                 .collect::<Vec<_>>(),
             vec![first.id]
         );
-        let cp = test_cp();
+        let cp = test_cp().await;
         *cp.config.write().await = config;
         *cp.group_manager.write() = Arc::clone(&manager);
         *cp.runtime_registry.write() = Arc::clone(&generation);
@@ -2262,7 +2425,7 @@ mod atomic_reload_tests {
             honk_outbound::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node))
                 .unwrap(),
         );
-        let cp = test_cp();
+        let cp = test_cp().await;
         let resources = SelectorWarmResources {
             generation: Arc::clone(&generation),
             proxy_registry: cp.proxy_registry.clone(),
@@ -2802,7 +2965,7 @@ mod atomic_reload_tests {
             )
             .with_warmable(warm_handler),
         );
-        let cp = ControlPlane::new(
+        let mut cp = ControlPlane::new(
             config.clone(),
             Box::new(MockEbpfBackend::new()),
             router,
@@ -2811,6 +2974,11 @@ mod atomic_reload_tests {
             test_dns_forwarder(),
         )
         .unwrap();
+        cp.set_mode_state(Arc::new(parking_lot::RwLock::new(
+            crate::mode::ModeState::new("Rule", "Proxy"),
+        )));
+        cp.start_datapath_flags_coordinator().unwrap();
+        cp.initialize_datapath_flags(false, false).await.unwrap();
 
         let old_generation = cp.runtime_registry.read().clone();
         assert_eq!(
