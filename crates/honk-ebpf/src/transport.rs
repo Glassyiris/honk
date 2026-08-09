@@ -118,6 +118,96 @@ pub fn dst_is_special(pkt: &ParsedPacket, link_h_len: u32) -> bool {
     }
 }
 
+/// Proxy preliminaries need a userspace domain decision only for QUIC long headers.
+#[inline(always)]
+pub fn udp_has_quic_long_header(ctx: &TcContext, link_h_len: u32, pkt: &ParsedPacket) -> bool {
+    if pkt.l4proto != IPPROTO_UDP {
+        return false;
+    }
+
+    let skb = ctx.skb.skb as *mut _;
+    let mut offset = link_h_len;
+    let mut nexthdr = IPPROTO_UDP;
+
+    if pkt.ethh.ether_type == ETH_P_IP.to_be() {
+        let mut version_ihl = 0u8;
+        if unsafe { bpf_skb_load_bytes(skb, offset, &mut version_ihl as *mut u8 as *mut _, 1) } != 0
+        {
+            return false;
+        }
+        let ihl = ((version_ihl & 0x0f) as u32) * 4;
+        if ihl < 20 {
+            return false;
+        }
+        offset += ihl;
+    } else if pkt.ethh.ether_type == ETH_P_IPV6.to_be() {
+        if unsafe { bpf_skb_load_bytes(skb, offset + 6, &mut nexthdr as *mut u8 as *mut _, 1) } != 0
+        {
+            return false;
+        }
+        offset += mem::size_of::<Ipv6Hdr>() as u32;
+
+        for _ in 0..IPV6_MAX_EXTENSIONS {
+            if nexthdr == IPPROTO_UDP {
+                break;
+            }
+            if nexthdr == IPPROTO_FRAGMENT {
+                let mut fragment: FragHdr = unsafe { mem::zeroed() };
+                if unsafe {
+                    bpf_skb_load_bytes(
+                        skb,
+                        offset,
+                        &mut fragment as *mut FragHdr as *mut _,
+                        mem::size_of::<FragHdr>() as u32,
+                    )
+                } != 0
+                {
+                    return false;
+                }
+                nexthdr = fragment.nexthdr;
+                offset += mem::size_of::<FragHdr>() as u32;
+                continue;
+            }
+            if !is_extension_header(nexthdr) {
+                return false;
+            }
+            let mut extension = [0u8; 2];
+            if unsafe {
+                bpf_skb_load_bytes(
+                    skb,
+                    offset,
+                    extension.as_mut_ptr() as *mut _,
+                    extension.len() as u32,
+                )
+            } != 0
+            {
+                return false;
+            }
+            nexthdr = extension[0];
+            offset += ipv6_optlen(extension[1]);
+        }
+        if nexthdr != IPPROTO_UDP {
+            return false;
+        }
+    } else {
+        return false;
+    }
+
+    let mut first = 0u8;
+    if unsafe {
+        bpf_skb_load_bytes(
+            skb,
+            offset + mem::size_of::<UdpHdr>() as u32,
+            &mut first as *mut u8 as *mut _,
+            1,
+        )
+    } != 0
+    {
+        return false;
+    }
+    first & 0x80 != 0
+}
+
 trait ParseTransportExt {
     fn parse_fast(&mut self, ctx: &TcContext, link_h_len: u32) -> Result<(), c_long>;
     fn parse_slow(&mut self, ctx: &TcContext, link_h_len: u32) -> Result<(), c_long>;

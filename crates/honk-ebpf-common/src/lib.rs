@@ -9,7 +9,7 @@ pub mod redirect_need;
 pub mod route;
 
 // Re-export types moved to sub-modules (for honk-core compatibility)
-pub use crate::conn::ConnState;
+pub use crate::conn::{ConnState, UdpDecisionSequence, UdpDecisionState};
 pub use crate::redirect_need::{
     DomainRouting, IPPort, IPPortProto, PIDName, ROUTING_BITMAP_GENERATIONS, ROUTING_BITMAP_WORDS,
     ROUTING_BITMAP_WORDS_PER_GENERATION, RoutingHandoffEntry, RoutingResult, Tuples, TuplesKey,
@@ -26,6 +26,41 @@ pub use crate::route::{
 
 pub const TASK_COMM_LEN: usize = 16;
 pub const TPROXY_MARK: u32 = 0x0800_0000;
+/// Packet has already crossed LAN classification; also used on final direct verdicts.
+pub const CLASSIFIED_MARK: u32 = 0x4000_0000;
+/// Packet must be held by the owned NFQUEUE before conntrack and NAT.
+pub const NFQUEUE_PENDING_MARK: u32 = 0x8000_0000;
+/// Exact two-bit carrier signature owned by staged NFQUEUE packets.
+pub const NFQUEUE_SIGNATURE_MARK: u32 = CLASSIFIED_MARK | NFQUEUE_PENDING_MARK;
+/// Persistent decision tokens occupy the remaining skb-mark bits.
+pub const NFQUEUE_TOKEN_MASK: u32 = !NFQUEUE_SIGNATURE_MARK;
+/// Routing marks may not consume datapath-owned classification bits.
+pub const SKB_MARK_RESERVED_MASK: u32 = NFQUEUE_SIGNATURE_MARK;
+
+#[inline(always)]
+pub const fn skb_mark_has_reserved_bits(mark: u32) -> bool {
+    mark & SKB_MARK_RESERVED_MASK != 0
+}
+
+/// Packs a valid persistent token into the exact mark consumed by the NFQUEUE rule.
+#[inline(always)]
+pub const fn pack_nfqueue_mark(token: u32) -> Option<u32> {
+    if token == 0 || token & !NFQUEUE_TOKEN_MASK != 0 {
+        None
+    } else {
+        Some(NFQUEUE_SIGNATURE_MARK | token)
+    }
+}
+
+/// Extracts a nonzero token only from a mark owned by the NFQUEUE staging path.
+#[inline(always)]
+pub const fn extract_nfqueue_token(mark: u32) -> Option<u32> {
+    if mark & NFQUEUE_SIGNATURE_MARK != NFQUEUE_SIGNATURE_MARK {
+        return None;
+    }
+    let token = mark & NFQUEUE_TOKEN_MASK;
+    if token == 0 { None } else { Some(token) }
+}
 /// Socket mark bit used by the control plane to tell the eBPF datapath to
 /// pass its own traffic through without re-routing it.
 pub const DAE_BYPASS_MARK: u32 = 0x100;
@@ -238,24 +273,6 @@ impl RoutingMeta {
         let raw = unsafe { self.raw };
         raw & ROUTING_META_FLAG_PUBLISHED != 0
     }
-
-    /// UDP post-decision offload: rewrite an already-published decision to a
-    /// kernel-offloaded direct one.  Unlike TCP, UDP carries no sequence
-    /// state the kernel must track from the first byte, so once the control
-    /// plane's decision for a flow has fully converged to `direct` it may
-    /// leave the userspace datapath mid-stream: the `lan_ingress`
-    /// established-UDP path reads [`ROUTING_META_FLAG_OFFLOAD`] and passes
-    /// subsequent packets straight through.
-    ///
-    /// The cached outbound is normalized to `OUTBOUND_DIRECT` (0) and the
-    /// tproxy mark and `must` bit are cleared — a direct flow must not keep
-    /// a mark, or policy routing would send the passed-through packets back
-    /// into `daens`.  DSCP and the published bit are preserved.
-    pub fn set_offloaded_direct(&mut self) {
-        const DSCP_MASK: u64 = 0xFF << 48;
-        let preserved = unsafe { self.raw } & (DSCP_MASK | ROUTING_META_FLAG_PUBLISHED);
-        self.raw = preserved | ROUTING_META_FLAG_OFFLOAD;
-    }
 }
 
 // Layout assertions — must hold for the union to work correctly.
@@ -341,7 +358,25 @@ pub struct RedirectEntry {
     pub outbound: u8,
     pub padding: [u8; 2],
     pub ifindex: u32,
+    pub decision_token: u32,
 }
+
+const _REDIRECT_ENTRY_SIZE: () = assert!(core::mem::size_of::<RedirectEntry>() == 32);
+const _REDIRECT_ENTRY_ALIGN: () = assert!(core::mem::align_of::<RedirectEntry>() == 8);
+const _REDIRECT_ENTRY_LAST_SEEN_OFFSET: () =
+    assert!(core::mem::offset_of!(RedirectEntry, last_seen_ns) == 0);
+const _REDIRECT_ENTRY_DMAC_OFFSET: () = assert!(core::mem::offset_of!(RedirectEntry, dmac) == 8);
+const _REDIRECT_ENTRY_SMAC_OFFSET: () = assert!(core::mem::offset_of!(RedirectEntry, smac) == 14);
+const _REDIRECT_ENTRY_FROM_WAN_OFFSET: () =
+    assert!(core::mem::offset_of!(RedirectEntry, from_wan) == 20);
+const _REDIRECT_ENTRY_OUTBOUND_OFFSET: () =
+    assert!(core::mem::offset_of!(RedirectEntry, outbound) == 21);
+const _REDIRECT_ENTRY_PADDING_OFFSET: () =
+    assert!(core::mem::offset_of!(RedirectEntry, padding) == 22);
+const _REDIRECT_ENTRY_IFINDEX_OFFSET: () =
+    assert!(core::mem::offset_of!(RedirectEntry, ifindex) == 24);
+const _REDIRECT_ENTRY_TOKEN_OFFSET: () =
+    assert!(core::mem::offset_of!(RedirectEntry, decision_token) == 28);
 
 /// Bits of the single-slot `DATAPATH_FLAGS_MAP` array, written by userspace
 /// at runtime (unlike `DaeParam`, which is fixed at load time).  They encode
@@ -357,9 +392,10 @@ pub struct RedirectEntry {
 /// redirecting them into userspace.
 pub const DATAPATH_FLAG_OFFLOAD_RULE_DIRECT: u32 = 1 << 0;
 
-/// `DATAPATH_FLAG_OFFLOAD_ALL`: the effective clash mode is `Direct`.  The
-/// userspace mode override would re-decide every non-`must`/non-`block`
-/// flow to `direct` anyway, so the kernel offloads all of them (including
+/// `DATAPATH_FLAG_OFFLOAD_ALL`: the effective clash policy always selects
+/// direct (`Direct` mode, or `Global` with the exact `direct` selection).
+/// The userspace override would re-decide every non-`must`/non-`block` flow
+/// to `direct` anyway, so the kernel offloads all of them (including
 /// flows routed to a proxy), normalizing their cached outbound to
 /// `OUTBOUND_DIRECT`.  The SNI constraint does not apply here: no sniffed
 /// domain can change an always-direct outcome.
@@ -373,14 +409,21 @@ pub const DATAPATH_FLAG_OFFLOAD_ALL: u32 = 1 << 1;
 /// domain-judged via `DOMAIN_ROUTING_MAP` (DNS-learned bitmap).  Meaningful
 /// only together with `DATAPATH_FLAG_OFFLOAD_RULE_DIRECT`.
 ///
-/// `Global` mode pushes none of the offload bits: only `must`-direct flows
-/// pass through in the kernel (status quo), and every other flow still
-/// reaches the control plane so the mode override can re-decide it.
+/// `Global` with the exact `direct` selection pushes `OFFLOAD_ALL`, because
+/// every non-final route converges to direct without userspace re-evaluation.
+/// Other Global selections push neither mode offload bit so traffic reaches
+/// the control plane for the selection override.
 /// `must`/`block` finals are never offloaded beyond the `must`-direct case
 /// in any mode.  Offloaded flows skip userspace relay entirely: no
 /// connection-tracker entry and no SNI-based re-route (Go dae parity), with
 /// tx stats still counted at `lan_ingress`.
 pub const DATAPATH_FLAG_OFFLOAD_NO_DOMAIN_RULES: u32 = 1 << 2;
+
+/// NFQUEUE staging is configured; without readiness, eligible new flows fail closed.
+pub const DATAPATH_FLAG_NFQ_ENABLED: u32 = 1 << 3;
+
+/// The queue and its owned nftables rule are ready to hold staged packets.
+pub const DATAPATH_FLAG_NFQ_READY: u32 = 1 << 4;
 
 /// Parameter keys for the `params` BPF array map.
 /// Used by honk-core to configure eBPF program behaviour at runtime.
@@ -499,6 +542,36 @@ pub struct OutboundStats {
 unsafe impl aya::Pod for RedirectTuple {}
 #[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for RedirectEntry {}
+
+#[cfg(test)]
+mod nfqueue_abi_tests {
+    use super::*;
+
+    #[test]
+    fn token_marks_require_exact_signature_and_nonzero_token() {
+        assert_eq!(pack_nfqueue_mark(0), None);
+        assert_eq!(pack_nfqueue_mark(NFQUEUE_SIGNATURE_MARK), None);
+        assert_eq!(extract_nfqueue_token(0), None);
+        assert_eq!(extract_nfqueue_token(NFQUEUE_PENDING_MARK | 1), None);
+        assert_eq!(extract_nfqueue_token(CLASSIFIED_MARK | 1), None);
+        assert_eq!(extract_nfqueue_token(NFQUEUE_SIGNATURE_MARK), None);
+        assert_eq!(extract_nfqueue_token(1), None);
+
+        for token in [1, NFQUEUE_TOKEN_MASK - 1, NFQUEUE_TOKEN_MASK] {
+            let mark = pack_nfqueue_mark(token).expect("nonzero in-range token");
+            assert_eq!(mark & NFQUEUE_SIGNATURE_MARK, NFQUEUE_SIGNATURE_MARK);
+            assert_eq!(extract_nfqueue_token(mark), Some(token));
+        }
+    }
+
+    #[test]
+    fn reserved_mark_bits_are_exact() {
+        assert_eq!(SKB_MARK_RESERVED_MASK, 0xc000_0000);
+        assert!(!skb_mark_has_reserved_bits(0x3fff_ffff));
+        assert!(skb_mark_has_reserved_bits(CLASSIFIED_MARK));
+        assert!(skb_mark_has_reserved_bits(NFQUEUE_PENDING_MARK));
+    }
+}
 
 #[cfg(test)]
 mod outbound_stats_counter_tests {
