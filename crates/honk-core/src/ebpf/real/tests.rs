@@ -81,7 +81,7 @@ async fn link_lifecycle_holds_links_and_rebinds_primary_wan() {
         backend
             .remove_udp_flow(&staged_key, 41)
             .expect("stale retirement result"),
-        UdpDecisionCommitResult::TokenMismatch
+        UdpDecisionCommitResult::Superseded
     );
     assert_eq!(
         backend

@@ -1102,7 +1102,9 @@ impl PendingUdpVerdicts {
                 .abort_pending_udp_flow(&identity.tuples(), identity.decision_token)
                 .map_err(|error| self.fatal_error("abort pending flow", error.to_string()))?;
             let mismatch = match result {
-                UdpDecisionCommitResult::Applied | UdpDecisionCommitResult::Missing => None,
+                UdpDecisionCommitResult::Applied
+                | UdpDecisionCommitResult::Missing
+                | UdpDecisionCommitResult::Superseded => None,
                 UdpDecisionCommitResult::TokenMismatch => {
                     self.stats.record_udp_nfqueue_token_mismatch();
                     Some(UdpDecisionCommitResult::TokenMismatch)
@@ -1138,9 +1140,11 @@ impl PendingUdpVerdicts {
                 Err(fatal.into())
             }
             None => Ok(()),
-            Some(UdpDecisionCommitResult::Applied | UdpDecisionCommitResult::Missing) => {
-                unreachable!("applied and missing aborts are not mismatches")
-            }
+            Some(
+                UdpDecisionCommitResult::Applied
+                | UdpDecisionCommitResult::Missing
+                | UdpDecisionCommitResult::Superseded,
+            ) => unreachable!("successful abort results are not mismatches"),
         }
     }
 

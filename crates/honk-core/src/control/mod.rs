@@ -392,7 +392,8 @@ pub(crate) fn spawn_udp_removal_worker(
                     );
                     match backend.remove_udp_flow(&key, removal.decision_token) {
                         Ok(crate::ebpf::UdpDecisionCommitResult::Applied)
-                        | Ok(crate::ebpf::UdpDecisionCommitResult::Missing) => true,
+                        | Ok(crate::ebpf::UdpDecisionCommitResult::Missing)
+                        | Ok(crate::ebpf::UdpDecisionCommitResult::Superseded) => true,
                         Ok(result) => {
                             warn!(
                                 ?result,
