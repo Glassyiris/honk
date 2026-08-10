@@ -656,12 +656,21 @@ canonical TPROXY path. DNS port 53, internal/special traffic, `must`, `block`,
 reverse traffic, and already-safe direct decisions are never queued; only
 ambiguous userspace/domain decisions are staged.
 
-The mechanism is fixed: raw-netlink queue `320`, one listener, and no bypass,
-fanout, fail-open, or user-selectable queue/worker policy. honk exclusively owns
-the exact nftables names `inet honk_nfqueue` / `udp_decision`; firewall managers
-in the same network namespace must not mutate them while honk runs. The pinned
-`UDP_DECISION_SEQUENCE` allocator survives ordinary restart/cleanup and cannot
-be reset without risking token reuse; exhaustion requires a reboot.
+The mechanism is fixed: raw-netlink queue `320`, one listener feeding one bounded
+ingest actor, and no bypass, fanout, fail-open, or user-selectable queue/worker
+policy. honk exclusively owns the exact nftables names `inet honk_nfqueue` /
+`udp_decision`; firewall managers in the same network namespace must not mutate
+them while honk runs. The pinned `UDP_DECISION_SEQUENCE` allocator survives
+ordinary restart/cleanup. Its rollback-compatible 12-byte value keeps the full
+raw token in `next`; startup validates it without rewriting it, so an older
+binary resumes at the same token boundary. Tokens still divide that raw value
+into a two-bit generation and 28-bit sequence. At sequence exhaustion, honk
+fences new staging, drains held packets and deferred token cleanups, hard-rebinds
+the queue, and switches only when the candidate generation and every higher
+generation through 3 are absent from all live token-bound maps. A rolled-back
+legacy allocator can advance only through that range. If no such candidate is
+clear, staging stays fenced and the supervisor retries; non-staged UDP continues
+while ambiguous new flows fail closed. No reboot is required.
 
 Held skbs are before conntrack/NAT. A final direct decision uses a token-checked
 Arm → FIFO accept with the final mark → Activate transition and creates no
@@ -670,7 +679,8 @@ connection entry. Proxy first commits its token-bound state, moves the one
 retained payload copy into the canonical UDP initializer, drops the originals,
 then dials/sends exactly once. Block/cancel drop. Reload and shutdown fence
 readiness and quiesce/cancel all guards before queue/table teardown.
-Queue/listener/verdict failures and token exhaustion are fatal.
+Queue/listener/verdict failures remain fatal; allocator exhaustion is recovered
+by the fenced generation rotation above.
 
 ### `experimental { clash_api { ... } }`
 
@@ -724,9 +734,12 @@ udp = {
   stagger: { attempts, winners, cancellations },
   warm: { attempts, successes, failures },
   nfqueue: {
-    received, activeFlows, directAccepted, proxyCopied, proxyDropped,
-    block, cancel, drop, tokenMismatch, tokenExhaustion, verdictErrors,
-    receiptToVerdict: H
+    received, activeFlows, kernelQueueDepth, kernelStatsAvailable,
+    kernelStatsReadErrors, kernelDropped, kernelUserDropped, heldPackets,
+    heldPeak, socketReceiveBufferBytes, actorQueueFull, correlatorFull,
+    actorQueueDepth, actorQueuedBytes, actorOldestAgeNanos, directAccepted,
+    proxyCopied, proxyDropped, block, cancel, drop, tokenMismatch,
+    tokenExhaustion, tokenRollovers, verdictErrors, receiptToVerdict: H
   }
 }
 H = { count, sumNanos, buckets }  // buckets has 64 fixed log2 slots
@@ -742,12 +755,26 @@ remains and the winning transport owns its connection only for the selected flow
 `successes` count `Ready`; a `NotApplicable` result is neutral.
 
 `nfqueue.received` counts listener deliveries and `activeFlows` is the current
-pending-correlator gauge. `directAccepted`, `proxyDropped`, `block`, `cancel`,
-and `drop` count successful kernel verdicts; `proxyCopied` counts the single
-payload ownership transfer into the canonical initializer. `tokenMismatch`,
-`tokenExhaustion`, and `verdictErrors` expose fail-closed faults.
-`receiptToVerdict` measures listener receipt to successful verdict and is not
-labelled as kernel queue residence because NFQA timestamps are not guaranteed.
+pending-correlator gauge. A one-second task samples the owned kernel queue
+independently of packet dispatch. `kernelStatsAvailable` says whether the latest
+read succeeded; `kernelStatsReadErrors` is cumulative. On failure, the last
+`kernelQueueDepth`, `kernelDropped`, and `kernelUserDropped` values remain visible
+rather than becoming ambiguous zeroes, while the local `heldPackets`, `heldPeak`,
+and `socketReceiveBufferBytes` gauges continue to refresh. `kernelDropped` and
+`kernelUserDropped` are process-lifetime counters accumulated across queue hard
+rebinds; `kernelQueueDepth` remains the current-instance gauge. `heldPackets` and
+`heldPeak` count dispatched verdict guards. `socketReceiveBufferBytes` is the
+effective netlink receive buffer. `actorQueueFull` counts fail-closed ingest-actor
+admission drops. `correlatorFull` counts packets dropped at the hard limit of
+4,096 concurrent flow cells or 64 held verdicts per flow. `actorQueueDepth`,
+`actorQueuedBytes`, and `actorOldestAgeNanos` expose current ingest pressure.
+`directAccepted`, `proxyDropped`, `block`, `cancel`, and `drop` count successful
+kernel verdicts; `proxyCopied` counts the single payload
+ownership transfer into the canonical initializer. `tokenMismatch`,
+`tokenExhaustion`, `tokenRollovers`, and `verdictErrors` expose token and verdict
+events. `receiptToVerdict` measures listener receipt to successful verdict and
+is not labelled as kernel queue residence because NFQA timestamps are not
+guaranteed.
 
 `/stats` also carries a top-level `warm` object of point-in-time gauges:
 

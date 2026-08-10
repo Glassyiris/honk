@@ -94,7 +94,7 @@ test-ebpf:
 test-netns:
     cargo test -p honk-nfqueue --lib nfqueue_service_isolated_netns_kernel_contract -- --ignored --test-threads=1
     cargo test -p honk-core --features ebpf --lib netns -- --ignored --test-threads=1
-    cargo test -p honk-core --features ebpf --lib link_lifecycle -- --ignored --test-threads=1
+    cargo test -p honk-core --features ebpf --lib ebpf::real::tests -- --ignored --test-threads=1
 
 # Full honk-outbound gate after outbound changes (fmt + clippy + config & outbound suites)
 outbound-ci:

@@ -568,8 +568,21 @@ fail-open mode. It owns the exact nftables table and chain names
 `inet honk_nfqueue` / `udp_decision`. A firewall manager in the same network
 namespace must not flush, replace, or mutate either object while honk is running.
 The eBPF `UDP_DECISION_SEQUENCE` pin is persistent across ordinary restart and
-cleanup so a token is not reused while an old skb or task can still exist;
-exhaustion requires a reboot.
+cleanup. Tokens combine a two-bit generation and a 28-bit sequence. The pin
+keeps the legacy 12-byte layout and stores the full raw token in `next`; startup
+validates but does not rewrite it, so the previous binary can resume from the
+same boundary after a rollback without token reuse. Preserve this pin for normal
+upgrade and downgrade. If startup rejects a corrupt or incompatible pin, keep
+NFQUEUE fenced, stop every honk process, verify the queue and token-bound maps
+are gone, then remove the pin once before restarting; deleting it while a queue
+or token-bound map is live can reuse an active token. Exhaustion fences and
+drains staging before switching only when the candidate generation and every
+higher generation through 3 are absent from every live token-bound map. A
+rolled-back legacy allocator can advance only through that range, so this
+prevents reuse. If no such candidate is clear, retries back off through 1, 2,
+5, then 30 seconds;
+non-staged UDP continues while ambiguous new flows fail closed. No reboot or
+manual reset is required during normal operation.
 
 The original skb is held before conntrack/NAT. Direct performs token-checked
 Arm → FIFO `NF_ACCEPT` with the final mark → Activate, without a userspace direct
@@ -578,14 +591,27 @@ Proxy commits token-bound state, transfers the one retained payload copy into
 the existing UDP initializer, drops the original skb(s), and dials/sends once.
 Block and cancellation drop the originals. Reload and shutdown clear readiness,
 quiesce/cancel pending ownership, and only then tear down the queue and owned
-table. Queue/listener/verdict errors and token exhaustion are fatal rather than
-fail-open.
+table. Queue/listener/verdict errors remain fatal rather than fail-open;
+allocator exhaustion uses fenced generation rotation.
+
+The ingest actor admits at most 256 packets and 8 MiB of retained payload. A
+typical 1,200-byte workload reaches the entry cap first; maximum 65,507-byte UDP
+payloads reach the byte cap at 128 queued packets. The correlator additionally
+caps live flow cells at 4,096 and held verdicts at 64 per flow. Slow-path permits
+are acquired when the actor dequeues, not while requests wait in the actor queue.
+The absolute hold deadline is three seconds from listener receipt and includes
+backend-lock acquisition before Arm and the post-Arm Activate acquisition. Full
+or expired work is dropped rather than allowed to grow memory or bypass policy.
 
 With the Clash API enabled, `GET /stats` exposes the fixed object
 `/stats.udp.nfqueue` (dotted path, not a separate route): `received`,
-`activeFlows`, `directAccepted`, `proxyCopied`, `proxyDropped`, `block`, `cancel`,
-`drop`, `tokenMismatch`, `tokenExhaustion`, `verdictErrors`, and
-`receiptToVerdict`. See the component reference for field meanings.
+`activeFlows`, `kernelQueueDepth`, `kernelStatsAvailable`,
+`kernelStatsReadErrors`, `kernelDropped`, `kernelUserDropped`, `heldPackets`,
+`heldPeak`, `socketReceiveBufferBytes`, `actorQueueFull`, `correlatorFull`,
+`actorQueueDepth`, `actorQueuedBytes`, `actorOldestAgeNanos`, `directAccepted`,
+`proxyCopied`, `proxyDropped`, `block`, `cancel`, `drop`, `tokenMismatch`,
+`tokenExhaustion`, `tokenRollovers`, `verdictErrors`, and `receiptToVerdict`. See
+the component reference for field meanings.
 
 ### Clash API
 

@@ -37,6 +37,7 @@ pub(crate) struct QueueSocket {
     fd: OwnedFd,
     sequence: AtomicU32,
     alive: AtomicBool,
+    receive_buffer_bytes: usize,
     fatal: Arc<FatalNotifier>,
 }
 
@@ -44,10 +45,12 @@ impl QueueSocket {
     pub(crate) fn bind(fatal: Arc<FatalNotifier>) -> Result<Arc<Self>, QueueError> {
         let fd = netlink::open_socket(false)?;
         set_receive_buffer(fd.as_raw_fd())?;
+        let receive_buffer_bytes = receive_buffer_size(fd.as_raw_fd())?;
         let socket = Arc::new(Self {
             fd,
             sequence: AtomicU32::new(1),
             alive: AtomicBool::new(true),
+            receive_buffer_bytes,
             fatal,
         });
         socket.configure()?;
@@ -143,6 +146,10 @@ impl QueueSocket {
         self.alive.store(false, Ordering::Release);
     }
 
+    pub(crate) fn receive_buffer_bytes(&self) -> usize {
+        self.receive_buffer_bytes
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test() -> (Arc<Self>, OwnedFd, crate::FatalReceiver) {
         use std::os::fd::FromRawFd;
@@ -158,10 +165,12 @@ impl QueueSocket {
         };
         assert_eq!(result, 0, "socketpair: {}", io::Error::last_os_error());
         let (fatal, receiver) = crate::fatal_channel();
+        let receive_buffer_bytes = receive_buffer_size(descriptors[0]).unwrap();
         let socket = Arc::new(Self {
             fd: unsafe { OwnedFd::from_raw_fd(descriptors[0]) },
             sequence: AtomicU32::new(1),
             alive: AtomicBool::new(true),
+            receive_buffer_bytes,
             fatal,
         });
         let reader = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
@@ -336,6 +345,24 @@ fn set_receive_buffer(fd: RawFd) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+fn receive_buffer_size(fd: RawFd) -> io::Result<usize> {
+    let mut value = 0 as libc::c_int;
+    let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            (&mut value as *mut libc::c_int).cast::<libc::c_void>(),
+            &mut length,
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(value.max(0) as usize)
 }
 
 fn set_nonblocking(fd: RawFd) -> io::Result<()> {

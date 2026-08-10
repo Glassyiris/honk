@@ -141,7 +141,7 @@ fence、关闭）时，需要暂存的新流会被丢弃；无需暂存的流量
 | `DOMAIN_ROUTING_MAP` | IP → 域名规则位图（DNS 学习） |
 | `ROUTING_HANDOFF_MAP` | 五元组 → 用户态 handoff |
 | `REDIRECT_TRACK` / `CONN_STATE_MAP` | redirect 与 conntrack |
-| `UDP_DECISION_SEQUENCE` | 固定的一槽 spin-lock 唯一 token 序列；跨普通重启/清理保留；耗尽状态粘滞至系统重启 |
+| `UDP_DECISION_SEQUENCE` | 固定的一槽 spin-lock 两位 generation + 28 位 sequence；跨普通重启/清理保留；耗尽时 fence 并轮换到回滚安全的空 generation 后缀 |
 | `UDP_DECISION_EPOCH` / `UDP_DECISION_INFLIGHT` | 用户态切换的双槽 grace period 与 per-CPU reader；fence 只等待观察到旧槽的内核工作 |
 | `UDP_DECISION_RETIRE_FENCE` | 五元组 → 预期 token；精确 token 回收重验 state/辅助项期间阻止新 claim |
 | `BPF_STATS_MAP` | conn-state 溢出，以及 redirect/handoff/cookie 插入失败 |
@@ -168,9 +168,10 @@ fence、关闭）时，需要暂存的新流会被丢弃；无需暂存的流量
 - 非 `must` 的 `direct` 仅在模式策略要求时进用户态——`Global` 模式全部如此，`Rule` 模式下仅当仍可能被 SNI 改判时（存在域名类规则、`dial_mode` 启用嗅探、且该流域名未经 DNS 学习）。其余情形它与 `must` direct 一样在内核卸载（对齐 Go dae）：不经用户态中继、不出现在 `/connections`、也不再走 SNI 改判；tx 统计仍在 `lan_ingress` 计数。`Direct` 模式下所有非 `must`/非 `block` 流均被卸载（覆盖反正会强制 direct）。卸载决定在路由时按流做一次并缓存在该流的 `RoutingMeta`（位 57）；策略字（`DATAPATH_FLAGS_MAP`）由用户态在启动时（按 cachedb 恢复的模式）、每次 PATCH `/configs` 切换模式时写入，并在每次 reload 后重新断言，只在流创建时生效。
 - 首包保留路径是**实验特性且默认关闭**。只能用 `experimental { udp_nfqueue { enabled: true } }` 启用；修改该值后必须重启，启用时会拒绝 `--mock-ebpf` 或不带 `ebpf` 的构建。
 - 范围仅为 LAN 转发 UDP，因为主机 `inet prerouting` 位于 LAN TC 之后。本机发起的 WAN 出口仍走规范 TPROXY。53 端口、内部/特殊流量、反向流量、`must`、`block` 和已经可以安全地在路由时直连的决策均被排除；只有仍可能收敛为不同结果的 preliminary direct/control-plane 或依赖域名/QUIC 的 proxy 决策才会暂存。
-- eBPF 从持久 pin 的 `UDP_DECISION_SEQUENCE` 分配非零唯一 token，发布 token 绑定的 handoff/redirect/`ConnState::Pending`，再把 skb 标为 Pending。唯一的 raw-netlink listener 在 conntrack/NAT 之前用固定队列 `320` 保留原始 skb；没有 bypass、fanout、fail-open 或自动恢复模式。用户态 correlator 只单独保留 verdict guard，同时把唯一且大小精确的 NFQUEUE payload allocation 转交给现有规范 UDP 初始化器。
+- eBPF 从持久 pin 的 `UDP_DECISION_SEQUENCE` 分配非零 token；token 由两位 generation 和 28 位 sequence 组成。pin 保留旧版 12 字节 raw-counter ABI，因此启动只校验、不改写，回滚后会从同一数值边界继续。eBPF 发布 token 绑定的 handoff/redirect/`ConnState::Pending`，再把 skb 标为 Pending。唯一的 raw-netlink listener 向同时受 256 项和 8 MiB payload 上限约束的 ingest actor 投递；slow permit 只在 actor 出队时获取。所有 backend 锁等待（包括 Arm 后的 Activate）都沿用从 listener 收包开始计算的固定三秒绝对期限；饱和或超期均 fail closed 丢包。独立的一秒 sampler 分别刷新内核队列与本地 guard/actor gauge，因此 dispatcher 停顿或 procfs 失败不会掩盖本地压力。队列 `320` 在 conntrack/NAT 之前保留原始 skb；没有 bypass、fanout 或 fail-open。
 - 最终 direct 执行 token 校验的 Arm → 按 FIFO 以最终 direct mark `NF_ACCEPT` 每个原始 skb → Activate。Arm 后到达的 follower 只追加 verdict guard；其 payload 与 slow permit 会被丢弃，不经过 endpoint admission。Direct 不创建用户态 socket、不保留 payload 副本、不故意触发重传，也不创建 UDP endpoint 或 `/connections` 条目。最终 proxy 在回包可能发生竞争前提交 token 绑定的 outbound/mark，把唯一 payload 副本转交给规范初始化器，丢弃原始 skb，并且只拨号/发送一次。Block 与取消丢弃原始 skb。任何终态转换都不能修改缺失、旧 token、错误 state 或更新的五元组 incarnation。
-- 重载与关闭先发布 NFQUEUE-not-ready，切换双槽 decision epoch，等待所有 fence 前的 per-CPU reader，并在确认 fence 前删除残留的 Preparing/Pending state；延迟到达的队列包会因 token 查询失败而丢弃，不会跨越 runtime generation。精确回收另行以 `BPF_NOEXIST` 安装五元组 fence，等待 fence 前的 token reader，重新校验 state/辅助项，删除后再释放 fence；不会用缓存的旧 state 覆盖新 token。随后用户态取消并排空 token 绑定的 cell、lease、guard 和正在退役的 endpoint，再关闭队列并移除自有表。队列、listener、verdict、回收故障和 token 耗尽均为致命错误。分配器 pin 跨普通清理保留，使进程重启无法在旧 skb/任务仍可能存在时复用 token；耗尽后必须重启操作系统。
+- 重载与关闭先发布 NFQUEUE-not-ready，切换双槽 decision epoch，等待所有 fence 前的 per-CPU reader，并删除残留 Preparing/Pending state。延迟队列包因此无法跨 runtime generation。精确回收另行安装 `BPF_NOEXIST` 五元组 fence，等待 fence 前 reader，重新校验并删除。sequence 耗尽时使用同一 fence/drain 协议：关闭旧队列，等待所有 verdict guard、correlator cell 与延期 token cleanup，再选择 conn-state、handoff、redirect 与 retirement-fence map 均未使用的 generation；完整扫描会跨越成功但不足一批的 BPF batch，直到终止 `ENOENT`。若四个都仍存活，则按 1、2、5、30 秒退避重试并保持 staging fenced。队列、listener、verdict 与 cleanup 故障仍为致命错误；正常回滚会原样保留 raw allocator pin。
+- 为保证回滚安全，候选 generation 及其到 generation 3 的所有更高 generation 都必须未出现在这四类 map 中。旧 allocator 会从重置后的 raw 值开始，并且只会沿该后缀单调递增；没有安全后缀时，staging 保持 fenced 并退避重试。
 - TCP SNI/HTTP Host 与 QUIC Initial SNI 在域名感知模式下都会对非 `must`、非 `block` handoff 重新执行用户态 Router。
 
 ## 7. 用户态控制面
@@ -180,8 +181,8 @@ fence、关闭）时，需要暂存的新流会被丢弃；无需暂存的流量
 | 子系统 | 职责 |
 | -------- | ------ |
 | Netns / veth | 创建 `daens`、`dae0`/`dae0peer`、地址与策略路由 |
-| `EbpfBackend` | 加载/挂载程序、发布 map、检查 token/state、提交 `ArmDirect`/`ActivateDirect`/`ActivateProxy`/`Block`、只中止/移除匹配 token 的 incarnation、校验持久分配器；Mock 供非 NFQUEUE 测试使用 |
-| NFQUEUE runtime | `honk-nfqueue` 队列/表所有权，以及 `PendingUdpVerdicts` token/generation correlator、watchdog、致命故障监督、重载/关闭 fence |
+| `EbpfBackend` | 加载/挂载程序、发布 map、检查 token/state、提交终态、只中止/移除匹配 token 的 incarnation、校验并轮换持久分配器；Mock 供非 NFQUEUE 测试使用 |
+| NFQUEUE runtime | `honk-nfqueue` 队列/表所有权、有界 ingest actor、`PendingUdpVerdicts` correlator、watchdog、压力指标、致命故障监督及重载/关闭/耗尽 fence |
 | Accept 循环 | 透明 TCP/UDP、原始目的地址、获取 handoff |
 | `Router` | 完整条件集（域名/geoip/geosite/进程/…） |
 | 嗅探 | TCP SNI/Host、QUIC SNI |
@@ -388,7 +389,7 @@ counter 之间的不变量。
 
 当 `experimental.clash_api.external_controller` 非空时启用。
 
-核心接口：`/version`、`/configs`、`/proxies`、delay、`/rules`、`/connections`、`/traffic`、`/stats`、`/logs`、`/dns/query`、缓存清理、`/providers/proxies`、外部 UI 自动下载（Yacd-meta）。`GET /stats` 含稳定的嵌套 `udp` 对象及其 `nfqueue` 对象（`received`、`activeFlows`、`directAccepted`、`proxyCopied`、`proxyDropped`、`block`、`cancel`、`drop`、`tokenMismatch`、`tokenExhaustion`、`verdictErrors`、`receiptToVerdict`）；完整 schema 见组件参考。
+核心接口：`/version`、`/configs`、`/proxies`、delay、`/rules`、`/connections`、`/traffic`、`/stats`、`/logs`、`/dns/query`、缓存清理、`/providers/proxies`、外部 UI 自动下载（Yacd-meta）。`GET /stats` 的 `udp.nfqueue` 对象包含队列压力、verdict、token 与 receipt-to-verdict 指标；完整 schema 见组件参考。
 
 鉴权：`Authorization: Bearer` 或 `?token=`（已做 percent-decode）。
 

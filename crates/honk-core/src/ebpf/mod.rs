@@ -102,6 +102,18 @@ pub enum UdpDecisionCommitResult {
     StateMismatch,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UdpDecisionSequenceStatus {
+    pub next: u32,
+    pub generation: u32,
+}
+
+impl UdpDecisionSequenceStatus {
+    pub fn exhausted(self) -> bool {
+        self.next >= honk_ebpf_common::UDP_DECISION_SEQUENCE_MASK
+    }
+}
+
 pub(crate) fn validate_udp_decision_transition(
     transition: UdpDecisionTransition,
 ) -> anyhow::Result<()> {
@@ -543,12 +555,15 @@ pub trait EbpfBackend: Send + Sync {
         token: u32,
     ) -> anyhow::Result<UdpDecisionCommitResult>;
 
-    /// Validate the persistent allocator map before NFQUEUE admission opens.
+    /// Validate the pinned allocator map and its locked value before admission.
     fn verify_udp_decision_sequence(&self) -> anyhow::Result<()>;
 
-    /// Lossless allocator-exhaustion backstop. Real backends must use a
-    /// `BPF_F_LOCK` lookup so the embedded spin lock is never copied.
-    fn udp_decision_sequence_exhausted(&self) -> anyhow::Result<bool>;
+    /// Read the persistent allocator under its embedded BPF spin lock.
+    fn udp_decision_sequence_status(&self) -> anyhow::Result<UdpDecisionSequenceStatus>;
+
+    /// Reset an exhausted allocator only when no live token is reachable by a
+    /// rolled-back legacy monotonic allocator starting at `generation`.
+    fn reset_udp_decision_sequence(&mut self, generation: u32) -> anyhow::Result<bool>;
 
     /// Inspect a staged handoff without consuming it. UDP decision commit owns
     /// the token-checked removal; legacy consumers may still use `take`.

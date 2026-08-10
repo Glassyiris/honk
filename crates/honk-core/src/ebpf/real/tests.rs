@@ -62,9 +62,17 @@ async fn link_lifecycle_holds_links_and_rebinds_primary_wan() {
     )
     .await
     .expect("backend load");
-    let sequence_map_id = aya::maps::MapInfo::from_pin(pin_root.join(UDP_DECISION_SEQUENCE_MAP))
-        .expect("initial sequence map info")
-        .id();
+    syscall::reset_udp_decision_sequence_locked(backend.bpf().unwrap(), 2)
+        .expect("locked sequence reset");
+    assert_eq!(
+        backend
+            .udp_decision_sequence_status()
+            .expect("sequence status after reset"),
+        UdpDecisionSequenceStatus {
+            next: 0,
+            generation: 2,
+        }
+    );
 
     let staged_key = TuplesKey::default();
     backend
@@ -153,6 +161,42 @@ async fn link_lifecycle_holds_links_and_rebinds_primary_wan() {
         pin_root.join(UDP_DECISION_SEQUENCE_MAP).exists(),
         "ordinary cleanup must preserve the token allocator pin"
     );
+    std::fs::remove_file(pin_root.join(UDP_DECISION_SEQUENCE_MAP))
+        .expect("remove test allocator pin");
+    std::fs::remove_dir(&pin_root).expect("remove test pin root");
+}
+
+#[tokio::test]
+#[ignore = "requires root; run via just test-netns"]
+async fn pinned_raw_udp_decision_sequence_survives_reload() {
+    let pin_root =
+        Path::new("/sys/fs/bpf").join(format!("honk-sequence-reload-test-{}", std::process::id()));
+    let mut backend = RealEbpfBackend::load(
+        crate::DEFAULT_BPF_OBJECT,
+        &pin_root,
+        12345,
+        0x0800_0000,
+        None,
+        "lo",
+        false,
+    )
+    .await
+    .expect("backend load");
+    let sequence_map_id = aya::maps::MapInfo::from_pin(pin_root.join(UDP_DECISION_SEQUENCE_MAP))
+        .expect("initial sequence map info")
+        .id();
+    let persisted_next = (1 << UDP_DECISION_GENERATION_SHIFT) | 42;
+    syscall::write_udp_decision_sequence_locked(
+        backend.bpf().unwrap(),
+        &UdpDecisionSequence {
+            next: persisted_next,
+            ..UdpDecisionSequence::default()
+        },
+    )
+    .expect("seed rollback-compatible persistent allocator value");
+    backend.detach_hooks().expect("detach hooks");
+    backend.cleanup().await.expect("cleanup");
+
     let mut reloaded = RealEbpfBackend::load(
         crate::DEFAULT_BPF_OBJECT,
         &pin_root,
@@ -171,6 +215,54 @@ async fn link_lifecycle_holds_links_and_rebinds_primary_wan() {
         sequence_map_id,
         "backend reload must reuse the exact pinned allocator map"
     );
+    assert_eq!(
+        reloaded
+            .udp_decision_sequence_status()
+            .expect("reloaded sequence status"),
+        UdpDecisionSequenceStatus {
+            next: 42,
+            generation: 1,
+        },
+        "raw token progress must resume at the same numeric boundary"
+    );
+    let fence_key = TuplesKey::default();
+    let fence_token = udp_decision_token(2, 7).unwrap();
+    reloaded
+        .hash_insert(UDP_DECISION_RETIRE_FENCE_MAP, &fence_key, &fence_token)
+        .expect("seed live retirement fence");
+    syscall::write_udp_decision_sequence_locked(
+        reloaded.bpf().unwrap(),
+        &UdpDecisionSequence {
+            next: udp_decision_token(1, UDP_DECISION_SEQUENCE_MASK).unwrap(),
+            ..UdpDecisionSequence::default()
+        },
+    )
+    .expect("exhaust sequence before retirement-fence check");
+    assert!(
+        !reloaded
+            .reset_udp_decision_sequence(1)
+            .expect("reject rollback-reachable retirement generation"),
+        "a higher live generation must block a legacy allocator starting below it"
+    );
+    assert!(
+        !reloaded
+            .reset_udp_decision_sequence(2)
+            .expect("reject live retirement generation"),
+        "a live retirement fence must prevent generation reuse"
+    );
+    reloaded
+        .hash_remove::<TuplesKey, u32>(UDP_DECISION_RETIRE_FENCE_MAP, &fence_key)
+        .expect("remove live retirement fence");
+    assert!(
+        reloaded
+            .reset_udp_decision_sequence(2)
+            .expect("reset after retirement fence removal")
+    );
+    let reset = syscall::read_udp_decision_sequence_locked(reloaded.bpf().unwrap())
+        .expect("read reset rollback-compatible sequence");
+    assert_eq!(reset.next, 2 << UDP_DECISION_GENERATION_SHIFT);
+    assert_eq!(reset.exhausted, 0);
+    reloaded.detach_hooks().expect("detach hooks after reload");
     reloaded.cleanup().await.expect("reload cleanup");
     std::fs::remove_file(pin_root.join(UDP_DECISION_SEQUENCE_MAP))
         .expect("remove test allocator pin");

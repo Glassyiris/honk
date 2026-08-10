@@ -626,12 +626,24 @@ impl RealEbpfBackend {
     }
 
     /// Determine whether an interface carries Ethernet frames (ARPHRD_ETHER).
-    /// Non-Ethernet interfaces (e.g. loopback, tunnel) should use L3 TC programs.
+    /// `getifaddrs` covers private network namespaces whose `/sys` mount still
+    /// reflects the parent namespace.
     fn iface_is_ethernet(iface: &str) -> bool {
-        std::fs::read_to_string(format!("/sys/class/net/{}/type", iface))
+        std::fs::read_to_string(format!("/sys/class/net/{iface}/type"))
             .ok()
-            .and_then(|s| s.trim().parse::<u32>().ok())
-            .map(|t| t == 1) // ARPHRD_ETHER
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .map(|kind| kind == libc::ARPHRD_ETHER as u32)
+            .or_else(|| {
+                nix::ifaddrs::getifaddrs().ok()?.find_map(|entry| {
+                    if entry.interface_name != iface {
+                        return None;
+                    }
+                    entry
+                        .address?
+                        .as_link_addr()
+                        .map(|address| address.hatype() == libc::ARPHRD_ETHER)
+                })
+            })
             .unwrap_or(false)
     }
 

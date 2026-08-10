@@ -584,18 +584,24 @@ experimental {
 路径。DNS 53、内部/特殊流量、`must`、`block`、反向流量和已经可以安全直连的决策
 绝不入队；只暂存仍有歧义的用户态/域名决策。
 
-机制固定为：raw-netlink 队列 `320`、单 listener，不启用 bypass、fanout、fail-open，
-也没有用户可配置的队列/worker 策略。honk 独占名称精确为
-`inet honk_nfqueue` / `udp_decision` 的 nftables 对象；运行期间，同一网络命名空间中的
-防火墙管理器不得修改它们。固定的 `UDP_DECISION_SEQUENCE` 分配器会跨普通重启/清理
-保留，不能在仍可能复用 token 时重置；耗尽后必须重启操作系统。
+机制固定为：raw-netlink 队列 `320`、一个 listener 向一个有界 ingest actor 投递，
+不启用 bypass、fanout、fail-open，也没有用户可配置的队列/worker 策略。honk 独占
+名称精确为 `inet honk_nfqueue` / `udp_decision` 的 nftables 对象；运行期间，同一网络
+命名空间中的防火墙管理器不得修改它们。固定的 `UDP_DECISION_SEQUENCE` 分配器跨普通
+重启/清理保留。其兼容回滚的 12 字节值在 `next` 中保存完整 raw token；启动只校验、
+不改写，因此旧 binary 会从同一 token 边界继续。该 raw 值仍划分为两位 generation 与
+28 位 sequence。sequence 耗尽时，honk 先 fence 新暂存，排空已保留报文与延期 token
+cleanup 并硬重绑队列；只有候选 generation 及其到 generation 3 的所有更高 generation
+都未出现在存活 token 绑定 map 中，才能切换。旧 allocator 回滚后只会沿该区间单调
+递增。若没有满足条件的候选，暂存保持 fenced 且 supervisor 持续重试；无需暂存的 UDP
+继续工作，新的歧义流 fail closed。无需重启操作系统。
 
 被保留的 skb 位于 conntrack/NAT 之前。最终 direct 使用 token 校验的
 Arm → 按 FIFO 以最终 mark accept → Activate，不创建用户态直连 socket、payload 副本、
 故意重传、endpoint 或 connection 条目。Proxy 先提交 token 绑定状态，再把唯一的保留
 payload 副本转交给规范 UDP 初始化器，丢弃原始 skb，最后只拨号/发送一次。Block/cancel
 丢弃原始 skb。重载与关闭会 fence readiness，并在队列/表拆除前静默/取消所有 guard。
-队列、listener、verdict 故障和 token 耗尽均为致命错误。
+队列、listener 和 verdict 故障仍为致命错误；分配器耗尽按上述 fenced generation 轮换恢复。
 
 ### `experimental { clash_api { ... } }`
 
@@ -648,9 +654,12 @@ udp = {
   stagger: { attempts, winners, cancellations },
   warm: { attempts, successes, failures },
   nfqueue: {
-    received, activeFlows, directAccepted, proxyCopied, proxyDropped,
-    block, cancel, drop, tokenMismatch, tokenExhaustion, verdictErrors,
-    receiptToVerdict: H
+    received, activeFlows, kernelQueueDepth, kernelStatsAvailable,
+    kernelStatsReadErrors, kernelDropped, kernelUserDropped, heldPackets,
+    heldPeak, socketReceiveBufferBytes, actorQueueFull, correlatorFull,
+    actorQueueDepth, actorQueuedBytes, actorOldestAgeNanos, directAccepted,
+    proxyCopied, proxyDropped, block, cancel, drop, tokenMismatch,
+    tokenExhaustion, tokenRollovers, verdictErrors, receiptToVerdict: H
   }
 }
 H = { count, sumNanos, buckets }  // buckets 有固定 64 个 log2 slot
@@ -665,11 +674,21 @@ generation slot，则保留该 incumbent，winner transport 只为当前选中�
 connection。warm 的 `successes` 只计 `Ready`；`NotApplicable` 保持中性。
 
 `nfqueue.received` 统计 listener 投递；`activeFlows` 是当前 pending correlator gauge。
-`directAccepted`、`proxyDropped`、`block`、`cancel` 和 `drop` 统计成功的内核 verdict；
-`proxyCopied` 统计把唯一 payload 所有权转交给规范初始化器的次数。
-`tokenMismatch`、`tokenExhaustion` 和 `verdictErrors` 暴露 fail-closed 故障。
-`receiptToVerdict` 测量 listener 收包到成功 verdict 的时间；NFQA timestamp 不保证存在，
-因此它不表示内核队列驻留时间。
+独立于报文 dispatch 的一秒任务采样自有内核队列。`kernelStatsAvailable` 表示最近一次
+读取是否成功；`kernelStatsReadErrors` 是累计失败数。读取失败时仍保留最近的
+`kernelQueueDepth`、`kernelDropped` 和 `kernelUserDropped`，不会用含义不明的零值覆盖；
+本地 `heldPackets`、`heldPeak` 和 `socketReceiveBufferBytes` gauge 仍继续刷新。
+`kernelDropped` 与 `kernelUserDropped` 是跨队列硬重绑累加的进程生命周期 counter，
+`kernelQueueDepth` 则是当前队列实例的 gauge。`heldPackets` 与 `heldPeak` 统计已投递的
+verdict guard；`socketReceiveBufferBytes` 是 netlink 实际接收缓冲区大小。
+`actorQueueFull` 统计 ingest actor 的 fail-closed admission 丢包；`correlatorFull`
+统计达到 4,096 个并发 flow cell 或单流 64 个保留 verdict 硬上限时的丢包。
+`actorQueueDepth`、`actorQueuedBytes` 和 `actorOldestAgeNanos` 暴露当前 ingest 压力。
+`directAccepted`、`proxyDropped`、`block`、`cancel` 和 `drop` 统计成功内核 verdict；
+`proxyCopied` 统计唯一 payload
+所有权转交。`tokenMismatch`、`tokenExhaustion`、`tokenRollovers` 和 `verdictErrors`
+暴露 token/verdict 事件。`receiptToVerdict` 测量 listener 收包到成功 verdict 的时间；
+NFQA timestamp 不保证存在，因此不表示内核队列驻留时间。
 
 `/stats` 另有顶层 `warm` 对象，为即时 gauge：
 
