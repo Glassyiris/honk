@@ -161,9 +161,10 @@ impl NfqueueService {
         ))
     }
 
-    pub fn stats(&self) -> QueueStats {
+    pub async fn stats(&self) -> QueueStats {
         let (kernel_queue_depth, kernel_dropped, kernel_user_dropped) =
-            std::fs::read_to_string("/proc/net/netfilter/nfnetlink_queue")
+            tokio::fs::read_to_string("/proc/net/netfilter/nfnetlink_queue")
+                .await
                 .ok()
                 .and_then(|contents| parse_kernel_queue_stats(&contents))
                 .unwrap_or_default();

@@ -59,6 +59,13 @@ use tokio::io::Interest;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, trace, warn};
+#[cfg(feature = "ebpf")]
+const NFQUEUE_STATS_INTERVAL: Duration = Duration::from_secs(1);
+#[cfg(feature = "ebpf")]
+const NFQUEUE_INGEST_QUEUE_LEN: usize = 256;
+#[cfg(feature = "ebpf")]
+const _: () =
+    assert!(NFQUEUE_INGEST_QUEUE_LEN * honk_nfqueue::MAX_DATAGRAM_SIZE <= 32 * 1024 * 1024);
 
 #[cfg(feature = "ebpf")]
 #[derive(Debug, thiserror::Error)]
@@ -96,6 +103,7 @@ struct NfqueueRuntime {
     watchdog: Option<tokio::task::JoinHandle<()>>,
     ingest_worker: Option<tokio::task::JoinHandle<()>>,
     token_backstop: tokio::time::Interval,
+    queue_stats: tokio::time::Interval,
     sequence_ready: bool,
 }
 
@@ -109,6 +117,7 @@ impl NfqueueRuntime {
             let listener_fatal = &mut self.listener_fatal;
             let pending_fatal = &mut self.pending_fatal;
             let token_backstop = &mut self.token_backstop;
+            let queue_stats = &mut self.queue_stats;
             let watchdog = self
                 .watchdog
                 .as_mut()
@@ -147,10 +156,12 @@ impl NfqueueRuntime {
                         }),
                     ));
                 }
-                _ = token_backstop.tick() => {
+                _ = queue_stats.tick() => {
                     if let Some(service) = self.service.as_ref() {
-                        self.stats.update_udp_nfqueue_service_stats(service.stats());
+                        self.stats.update_udp_nfqueue_service_stats(service.stats().await);
                     }
+                }
+                _ = token_backstop.tick() => {
                     match ebpf.read().await.udp_decision_sequence_status() {
                         Ok(status) if status.exhausted() => {
                             self.stats.record_udp_nfqueue_token_exhaustion();
@@ -1115,8 +1126,7 @@ impl ControlPlane {
             honk_nfqueue::VerdictGuard,
             Option<tokio::sync::OwnedSemaphorePermit>,
         );
-        let (ingest_tx, mut ingest_rx) =
-            mpsc::channel::<IngestRequest>(honk_nfqueue::QUEUE_MAXLEN as usize);
+        let (ingest_tx, mut ingest_rx) = mpsc::channel::<IngestRequest>(NFQUEUE_INGEST_QUEUE_LEN);
         let slow_limit = Arc::clone(&self.udp_concurrency_limit);
         let callback_stats = Arc::clone(&self.stats);
         let callback: honk_nfqueue::PacketCallback = Arc::new(move |packet, guard| {
@@ -1173,6 +1183,11 @@ impl ControlPlane {
             nfqueue::WATCHDOG_INTERVAL,
         );
         token_backstop.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut queue_stats = tokio::time::interval_at(
+            tokio::time::Instant::now() + NFQUEUE_STATS_INTERVAL,
+            NFQUEUE_STATS_INTERVAL,
+        );
+        queue_stats.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         Ok(Some(NfqueueRuntime {
             service: Some(service),
             listener_fatal,
@@ -1183,6 +1198,7 @@ impl ControlPlane {
             watchdog: Some(watchdog),
             ingest_worker: Some(ingest_worker),
             token_backstop,
+            queue_stats,
             sequence_ready,
         }))
     }
