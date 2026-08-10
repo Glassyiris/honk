@@ -4433,3 +4433,146 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
     .join()
     .map_err(|_| anyhow::anyhow!("NFQUEUE network test thread panicked"))?
 }
+
+#[cfg(feature = "ebpf")]
+struct NfqueueRuntimeFixture {
+    runtime: NfqueueRuntime,
+    listener_fatal_tx: tokio::sync::oneshot::Sender<honk_nfqueue::FatalError>,
+    pending: Arc<nfqueue::PendingUdpVerdicts>,
+    ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+}
+
+#[cfg(feature = "ebpf")]
+fn stop_waiting_task(stop: &tokio::sync::watch::Sender<bool>) -> tokio::task::JoinHandle<()> {
+    let mut rx = stop.subscribe();
+    tokio::spawn(async move {
+        let _ = rx.changed().await;
+    })
+}
+
+#[cfg(feature = "ebpf")]
+fn nfqueue_runtime_fixture(
+    watchdog: tokio::task::JoinHandle<()>,
+    ingest_worker: tokio::task::JoinHandle<()>,
+    stats_sampler: tokio::task::JoinHandle<()>,
+    stop: tokio::sync::watch::Sender<bool>,
+) -> NfqueueRuntimeFixture {
+    let stats = Arc::new(StatsManager::new());
+    let ebpf: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(
+        crate::ebpf::mock::MockEbpfBackend::new(),
+    )));
+    let (pending, pending_fatal) = nfqueue::PendingUdpVerdicts::new(
+        Arc::clone(&ebpf),
+        Arc::new(UdpEndpointPool::new()),
+        Arc::clone(&stats),
+    );
+    let pending = Arc::new(pending);
+    let (listener_fatal_tx, listener_fatal) =
+        tokio::sync::oneshot::channel::<honk_nfqueue::FatalError>();
+    let start = tokio::time::Instant::now() + Duration::from_secs(3600);
+    let token_backstop = tokio::time::interval_at(start, Duration::from_secs(3600));
+    let runtime = NfqueueRuntime {
+        service: None,
+        listener_fatal,
+        pending_fatal,
+        stats,
+        pending: Arc::clone(&pending),
+        stop,
+        watchdog: Some(watchdog),
+        ingest_worker: Some(ingest_worker),
+        stats_sampler: Some(stats_sampler),
+        token_backstop,
+        token_retry: NfqueueTokenRetryBackoff::default(),
+        sequence_ready: true,
+    };
+    NfqueueRuntimeFixture {
+        runtime,
+        listener_fatal_tx,
+        pending,
+        ebpf,
+    }
+}
+
+#[cfg(feature = "ebpf")]
+#[tokio::test]
+async fn nfqueue_watchdog_exit_completes_shutdown_without_double_join() {
+    let (stop, _) = tokio::sync::watch::channel(false);
+    let mut fixture = nfqueue_runtime_fixture(
+        tokio::spawn(async {}),
+        stop_waiting_task(&stop),
+        stop_waiting_task(&stop),
+        stop,
+    );
+    tokio::task::yield_now().await;
+    let NfqueueRuntimeEvent::Fatal(error) = fixture.runtime.next_event(&fixture.ebpf).await else {
+        panic!("watchdog exit must be fatal");
+    };
+    assert!(matches!(
+        error.downcast_ref::<NfqueueRuntimeFatal>(),
+        Some(NfqueueRuntimeFatal::Watchdog(_))
+    ));
+    assert!(fixture.runtime.watchdog.is_none());
+    fixture
+        .runtime
+        .finish_pending_drain()
+        .await
+        .expect("shutdown after watchdog exit");
+    assert!(fixture.pending.is_empty());
+    assert!(!fixture.listener_fatal_tx.is_closed());
+}
+
+#[cfg(feature = "ebpf")]
+#[tokio::test]
+async fn nfqueue_ingest_actor_exit_completes_shutdown_without_double_join() {
+    let (stop, _) = tokio::sync::watch::channel(false);
+    let mut fixture = nfqueue_runtime_fixture(
+        stop_waiting_task(&stop),
+        tokio::spawn(async {}),
+        stop_waiting_task(&stop),
+        stop,
+    );
+    tokio::task::yield_now().await;
+    let NfqueueRuntimeEvent::Fatal(error) = fixture.runtime.next_event(&fixture.ebpf).await else {
+        panic!("ingest actor exit must be fatal");
+    };
+    assert!(matches!(
+        error.downcast_ref::<NfqueueRuntimeFatal>(),
+        Some(NfqueueRuntimeFatal::IngestActor(_))
+    ));
+    assert!(fixture.runtime.ingest_worker.is_none());
+    fixture
+        .runtime
+        .finish_pending_drain()
+        .await
+        .expect("shutdown after ingest actor exit");
+    assert!(fixture.pending.is_empty());
+    assert!(!fixture.listener_fatal_tx.is_closed());
+}
+
+#[cfg(feature = "ebpf")]
+#[tokio::test]
+async fn nfqueue_stats_sampler_exit_completes_shutdown_without_double_join() {
+    let (stop, _) = tokio::sync::watch::channel(false);
+    let mut fixture = nfqueue_runtime_fixture(
+        stop_waiting_task(&stop),
+        stop_waiting_task(&stop),
+        tokio::spawn(async {}),
+        stop,
+    );
+    tokio::task::yield_now().await;
+    let NfqueueRuntimeEvent::Fatal(error) = fixture.runtime.next_event(&fixture.ebpf).await else {
+        panic!("stats sampler exit must be fatal");
+    };
+    assert!(matches!(
+        error.downcast_ref::<NfqueueRuntimeFatal>(),
+        Some(NfqueueRuntimeFatal::StatsSampler(_))
+    ));
+    assert!(fixture.runtime.stats_sampler.is_none());
+    fixture
+        .runtime
+        .finish_pending_drain()
+        .await
+        .expect("shutdown after stats sampler exit");
+    assert!(fixture.pending.is_empty());
+    assert!(!fixture.listener_fatal_tx.is_closed());
+}

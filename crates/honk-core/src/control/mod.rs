@@ -221,6 +221,11 @@ impl NfqueueRuntime {
         &mut self,
         ebpf: &Arc<RwLock<Box<dyn EbpfBackend>>>,
     ) -> NfqueueRuntimeEvent {
+        enum ExitedTask {
+            Watchdog(Result<(), tokio::task::JoinError>),
+            IngestActor(Result<(), tokio::task::JoinError>),
+            StatsSampler(Result<(), tokio::task::JoinError>),
+        }
         loop {
             let listener_fatal = &mut self.listener_fatal;
             let pending_fatal = &mut self.pending_fatal;
@@ -237,7 +242,7 @@ impl NfqueueRuntime {
                 .ingest_worker
                 .as_mut()
                 .expect("NFQUEUE ingest actor is retained until shutdown");
-            tokio::select! {
+            let exited = tokio::select! {
                 result = listener_fatal => {
                     return NfqueueRuntimeEvent::Fatal(anyhow::Error::new(match result {
                         Ok(error) => NfqueueRuntimeFatal::Listener(error),
@@ -251,43 +256,49 @@ impl NfqueueRuntime {
                             .unwrap_or(NfqueueRuntimeFatal::PendingChannelClosed),
                     ));
                 }
-                result = watchdog => {
-                    return NfqueueRuntimeEvent::Fatal(anyhow::Error::new(
+                result = watchdog => Some(ExitedTask::Watchdog(result)),
+                result = ingest_worker => Some(ExitedTask::IngestActor(result)),
+                result = stats_sampler => Some(ExitedTask::StatsSampler(result)),
+                _ = token_backstop.tick() => None,
+            };
+            // A resolved JoinHandle panics if awaited again; drop it so the
+            // shutdown path skips the already-consumed task.
+            if let Some(exited) = exited {
+                let fatal = match exited {
+                    ExitedTask::Watchdog(result) => {
+                        self.watchdog.take();
                         NfqueueRuntimeFatal::Watchdog(match result {
                             Ok(()) => "completed".to_string(),
                             Err(error) => error.to_string(),
-                        }),
-                    ));
-                }
-                result = ingest_worker => {
-                    return NfqueueRuntimeEvent::Fatal(anyhow::Error::new(
+                        })
+                    }
+                    ExitedTask::IngestActor(result) => {
+                        self.ingest_worker.take();
                         NfqueueRuntimeFatal::IngestActor(match result {
                             Ok(()) => "completed".to_string(),
                             Err(error) => error.to_string(),
-                        }),
-                    ));
-                }
-                result = stats_sampler => {
-                    return NfqueueRuntimeEvent::Fatal(anyhow::Error::new(
+                        })
+                    }
+                    ExitedTask::StatsSampler(result) => {
+                        self.stats_sampler.take();
                         NfqueueRuntimeFatal::StatsSampler(match result {
                             Ok(()) => "completed".to_string(),
                             Err(error) => error.to_string(),
-                        }),
-                    ));
-                }
-                _ = token_backstop.tick() => {
-                    match ebpf.read().await.udp_decision_sequence_status() {
-                        Ok(status) if status.exhausted() => {
-                            self.stats.record_udp_nfqueue_token_exhaustion();
-                            return NfqueueRuntimeEvent::TokenExhausted;
-                        }
-                        Ok(_) => {}
-                        Err(error) => {
-                            return NfqueueRuntimeEvent::Fatal(anyhow::Error::new(
-                                NfqueueRuntimeFatal::TokenBackstop(error.to_string()),
-                            ));
-                        }
+                        })
                     }
+                };
+                return NfqueueRuntimeEvent::Fatal(anyhow::Error::new(fatal));
+            }
+            match ebpf.read().await.udp_decision_sequence_status() {
+                Ok(status) if status.exhausted() => {
+                    self.stats.record_udp_nfqueue_token_exhaustion();
+                    return NfqueueRuntimeEvent::TokenExhausted;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    return NfqueueRuntimeEvent::Fatal(anyhow::Error::new(
+                        NfqueueRuntimeFatal::TokenBackstop(error.to_string()),
+                    ));
                 }
             }
         }
