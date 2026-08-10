@@ -501,7 +501,6 @@ impl PendingUdpVerdicts {
                 dashmap::mapref::entry::Entry::Vacant(vacant) => {
                     return self.ingest_vacant(
                         vacant,
-                        key,
                         decision_token,
                         packet.payload,
                         held,
@@ -667,13 +666,13 @@ impl PendingUdpVerdicts {
     fn ingest_vacant(
         &self,
         vacant: dashmap::mapref::entry::VacantEntry<'_, FlowKey, Arc<FlowCell>>,
-        key: FlowKey,
         decision_token: u32,
         payload: bytes::Bytes,
         held: HeldVerdict,
         slow_permit: Option<OwnedSemaphorePermit>,
         backend: &dyn EbpfBackend,
     ) -> NfqueueIngest {
+        let key = *vacant.key();
         let retained = match backend.udp_conn_state_lookup(&key.tuples()) {
             Ok(Some(state)) if state.decision_token == decision_token => retained_state(&state),
             Ok(Some(_)) | Ok(None) => {

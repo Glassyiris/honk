@@ -641,7 +641,7 @@ impl RealEbpfBackend {
                     entry
                         .address?
                         .as_link_addr()
-                        .map(|address| address.hatype() == libc::ARPHRD_ETHER as u16)
+                        .map(|address| address.hatype() == libc::ARPHRD_ETHER)
                 })
             })
             .unwrap_or(false)
