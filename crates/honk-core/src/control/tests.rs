@@ -3789,7 +3789,7 @@ fn link_lifecycle_cp(backend: crate::ebpf::mock::MockEbpfBackend) -> ControlPlan
 
 #[cfg(feature = "ebpf")]
 #[tokio::test]
-async fn exhausted_udp_tokens_wait_for_an_unused_generation() {
+async fn exhausted_udp_tokens_wait_for_a_rollback_safe_generation() {
     use honk_ebpf_common::conn::{ConnState, UdpDecisionState};
 
     let mut backend = crate::ebpf::mock::MockEbpfBackend::new();
@@ -3834,6 +3834,14 @@ async fn exhausted_udp_tokens_wait_for_an_unused_generation() {
         .await
         .udp_conn_state_remove(&keys[2])
         .unwrap();
+    assert!(!control.rotate_udp_decision_generation().await.unwrap());
+    control
+        .ebpf
+        .write()
+        .await
+        .udp_conn_state_remove(&keys[3])
+        .unwrap();
+
     assert!(control.rotate_udp_decision_generation().await.unwrap());
     assert_eq!(
         control

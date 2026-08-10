@@ -579,9 +579,10 @@ experimental {
 重启/清理保留。其兼容回滚的 12 字节值在 `next` 中保存完整 raw token；启动只校验、
 不改写，因此旧 binary 会从同一 token 边界继续。该 raw 值仍划分为两位 generation 与
 28 位 sequence。sequence 耗尽时，honk 先 fence 新暂存，排空已保留报文与延期 token
-cleanup，硬重绑队列，再切换到所有存活 token 绑定 map 均未使用的 generation。若四个
-generation 都仍存活，暂存会保持 fenced 且 supervisor 持续重试；无需暂存的 UDP 继续
-工作，新的歧义流 fail closed。无需重启操作系统。
+cleanup 并硬重绑队列；只有候选 generation 及其到 generation 3 的所有更高 generation
+都未出现在存活 token 绑定 map 中，才能切换。旧 allocator 回滚后只会沿该区间单调
+递增。若没有满足条件的候选，暂存保持 fenced 且 supervisor 持续重试；无需暂存的 UDP
+继续工作，新的歧义流 fail closed。无需重启操作系统。
 
 被保留的 skb 位于 conntrack/NAT 之前。最终 direct 使用 token 校验的
 Arm → 按 FIFO 以最终 mark accept → Activate，不创建用户态直连 socket、payload 副本、

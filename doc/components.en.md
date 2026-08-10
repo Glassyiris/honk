@@ -654,10 +654,11 @@ raw token in `next`; startup validates it without rewriting it, so an older
 binary resumes at the same token boundary. Tokens still divide that raw value
 into a two-bit generation and 28-bit sequence. At sequence exhaustion, honk
 fences new staging, drains held packets and deferred token cleanups, hard-rebinds
-the queue, and switches to a generation absent from all live token-bound maps.
-If all four generations remain live, staging stays fenced and the supervisor
-retries; non-staged UDP continues while ambiguous new flows fail closed. No
-reboot is required.
+the queue, and switches only when the candidate generation and every higher
+generation through 3 are absent from all live token-bound maps. A rolled-back
+legacy allocator can advance only through that range. If no such candidate is
+clear, staging stays fenced and the supervisor retries; non-staged UDP continues
+while ambiguous new flows fail closed. No reboot is required.
 
 Held skbs are before conntrack/NAT. A final direct decision uses a token-checked
 Arm → FIFO accept with the final mark → Activate transition and creates no

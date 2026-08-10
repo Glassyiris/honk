@@ -998,13 +998,13 @@ impl EbpfBackend for RealEbpfBackend {
             self.udp_decision_sequence_status()?.exhausted(),
             "UDP decision sequence is not exhausted"
         );
-        let matches_generation =
-            |token| token != 0 && udp_decision_token_generation(token) == generation;
+        let conflicts_with_rollback =
+            |token| token != 0 && udp_decision_token_generation(token) >= generation;
         let mut live = false;
         self.for_each_map_chunk::<TuplesKey, ConnState>("CONN_STATE_MAP", 256, &mut |chunk| {
             live = chunk
                 .iter()
-                .any(|(_, state)| matches_generation(state.decision_token));
+                .any(|(_, state)| conflicts_with_rollback(state.decision_token));
             !live
         })?;
         if !live {
@@ -1012,7 +1012,9 @@ impl EbpfBackend for RealEbpfBackend {
                 UDP_DECISION_RETIRE_FENCE_MAP,
                 256,
                 &mut |chunk| {
-                    live = chunk.iter().any(|(_, token)| matches_generation(*token));
+                    live = chunk
+                        .iter()
+                        .any(|(_, token)| conflicts_with_rollback(*token));
                     !live
                 },
             )?;
@@ -1025,7 +1027,7 @@ impl EbpfBackend for RealEbpfBackend {
                 &mut |chunk| {
                     live = chunk
                         .iter()
-                        .any(|(_, entry)| matches_generation(entry.result.decision_token));
+                        .any(|(_, entry)| conflicts_with_rollback(entry.result.decision_token));
                     !live
                 },
             )?;
@@ -1037,7 +1039,7 @@ impl EbpfBackend for RealEbpfBackend {
                 &mut |chunk| {
                     live = chunk
                         .iter()
-                        .any(|(_, entry)| matches_generation(entry.decision_token));
+                        .any(|(_, entry)| conflicts_with_rollback(entry.decision_token));
                     !live
                 },
             )?;

@@ -506,9 +506,10 @@ eBPF `UDP_DECISION_SEQUENCE` pin 会跨普通重启和清理保留。token 由�
 正常升级/降级必须保留该 pin。只有启动明确拒绝损坏或不兼容的 pin 时，才应保持
 NFQUEUE fenced，停止所有 honk 进程，确认队列和 token 绑定 map 已消失，再删除一次 pin
 并重启；仍有队列或 token 绑定 map 存活时删除会复用活动 token。耗尽时先 fence 并
-排空暂存，再切换到存活 map 未使用的 generation。若四个 generation 都仍存活，则按
-1、2、5、30 秒退避重试：无需暂存的 UDP 继续工作，新的歧义流 fail closed；正常运行
-无需重启系统或手工重置 allocator。
+排空暂存；只有候选 generation 及其到 generation 3 的所有更高 generation 都未出现在
+任何存活 token 绑定 map 中，才能切换。旧 allocator 只会沿该区间单调递增，因此回滚
+后不会复用 token。若没有满足条件的候选，则按 1、2、5、30 秒退避重试：无需暂存的
+UDP 继续工作，新的歧义流 fail closed；正常运行无需重启系统或手工重置 allocator。
 
 原始 skb 在 conntrack/NAT 之前被保留。Direct 执行 token 校验的
 Arm → 按 FIFO 以最终 mark `NF_ACCEPT` → Activate，不创建用户态直连 socket、

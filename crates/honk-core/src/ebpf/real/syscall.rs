@@ -489,7 +489,7 @@ pub fn bpf_update_batch<K: Pod, V: Pod>(
 mod tests {
     use super::*;
     #[test]
-    fn raw_sequence_value_stays_compatible_with_rollback_allocator() {
+    fn raw_sequence_value_stays_compatible_with_rollback_allocator_across_generation_boundary() {
         let mut sequence = UdpDecisionSequence {
             next: udp_decision_token(1, 42).unwrap(),
             ..UdpDecisionSequence::default()
@@ -499,6 +499,13 @@ mod tests {
         assert_eq!(sequence.exhausted, 0);
         sequence.next += 1;
         assert_eq!(sequence.next, udp_decision_token(1, 43).unwrap());
+
+        sequence.next = udp_decision_token(0, UDP_DECISION_SEQUENCE_MASK).unwrap();
+        validate_udp_decision_sequence_value(sequence).unwrap();
+        sequence.next += 1;
+        assert_eq!(sequence.next, 1 << UDP_DECISION_GENERATION_SHIFT);
+        sequence.next += 1;
+        assert_eq!(sequence.next, udp_decision_token(1, 1).unwrap());
 
         let exhausted = UdpDecisionSequence {
             next: NFQUEUE_TOKEN_MASK,

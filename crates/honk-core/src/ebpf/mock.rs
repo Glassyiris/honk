@@ -1010,26 +1010,26 @@ impl EbpfBackend for MockEbpfBackend {
             self.udp_decision_sequence_status()?.exhausted(),
             "UDP decision sequence is not exhausted"
         );
-        let matches_generation = |token| {
-            token != 0 && honk_ebpf_common::udp_decision_token_generation(token) == generation
+        let conflicts_with_rollback = |token| {
+            token != 0 && honk_ebpf_common::udp_decision_token_generation(token) >= generation
         };
         let generation_is_live = self
             .udp_conn_states
             .values()
-            .any(|state| matches_generation(state.decision_token))
+            .any(|state| conflicts_with_rollback(state.decision_token))
             || self
                 .udp_retire_fences
                 .values()
-                .any(|token| matches_generation(*token))
+                .any(|token| conflicts_with_rollback(*token))
             || self
                 .routing_handoffs
                 .lock()
                 .values()
-                .any(|entry| matches_generation(entry.result.decision_token))
+                .any(|entry| conflicts_with_rollback(entry.result.decision_token))
             || self
                 .redirect_tracks
                 .values()
-                .any(|entry| matches_generation(entry.decision_token));
+                .any(|entry| conflicts_with_rollback(entry.decision_token));
         if generation_is_live {
             return Ok(false);
         }
@@ -1856,7 +1856,7 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_sequence_skips_live_generation_before_reset() {
+    fn exhausted_sequence_skips_rollback_reachable_generations() {
         let mut backend = MockEbpfBackend::new();
         backend.udp_decision_sequence_next = UDP_DECISION_SEQUENCE_MASK;
         let key = decision_test_key();
@@ -1872,7 +1872,9 @@ mod tests {
             )
             .unwrap();
 
+        assert!(!backend.reset_udp_decision_sequence(0).unwrap());
         assert!(!backend.reset_udp_decision_sequence(1).unwrap());
+
         assert!(backend.reset_udp_decision_sequence(2).unwrap());
         assert_eq!(
             backend.udp_decision_sequence_status().unwrap(),

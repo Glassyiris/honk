@@ -561,8 +561,8 @@ pub trait EbpfBackend: Send + Sync {
     /// Read the persistent allocator under its embedded BPF spin lock.
     fn udp_decision_sequence_status(&self) -> anyhow::Result<UdpDecisionSequenceStatus>;
 
-    /// Reset an exhausted allocator to an unused generation. Returns false if
-    /// any live token-bound map entry still carries that generation.
+    /// Reset an exhausted allocator only when no live token is reachable by a
+    /// rolled-back legacy monotonic allocator starting at `generation`.
     fn reset_udp_decision_sequence(&mut self, generation: u32) -> anyhow::Result<bool>;
 
     /// Inspect a staged handoff without consuming it. UDP decision commit owns

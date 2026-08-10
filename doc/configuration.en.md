@@ -576,8 +576,11 @@ upgrade and downgrade. If startup rejects a corrupt or incompatible pin, keep
 NFQUEUE fenced, stop every honk process, verify the queue and token-bound maps
 are gone, then remove the pin once before restarting; deleting it while a queue
 or token-bound map is live can reuse an active token. Exhaustion fences and
-drains staging before switching to an unused live-map generation. If all four
-generations remain live, retries back off through 1, 2, 5, then 30 seconds;
+drains staging before switching only when the candidate generation and every
+higher generation through 3 are absent from every live token-bound map. A
+rolled-back legacy allocator can advance only through that range, so this
+prevents reuse. If no such candidate is clear, retries back off through 1, 2,
+5, then 30 seconds;
 non-staged UDP continues while ambiguous new flows fail closed. No reboot or
 manual reset is required during normal operation.
 

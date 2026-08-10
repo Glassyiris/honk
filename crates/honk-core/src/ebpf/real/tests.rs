@@ -240,6 +240,12 @@ async fn pinned_raw_udp_decision_sequence_survives_reload() {
     .expect("exhaust sequence before retirement-fence check");
     assert!(
         !reloaded
+            .reset_udp_decision_sequence(1)
+            .expect("reject rollback-reachable retirement generation"),
+        "a higher live generation must block a legacy allocator starting below it"
+    );
+    assert!(
+        !reloaded
             .reset_udp_decision_sequence(2)
             .expect("reject live retirement generation"),
         "a live retirement fence must prevent generation reuse"

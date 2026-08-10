@@ -141,7 +141,7 @@ fence、关闭）时，需要暂存的新流会被丢弃；无需暂存的流量
 | `DOMAIN_ROUTING_MAP` | IP → 域名规则位图（DNS 学习） |
 | `ROUTING_HANDOFF_MAP` | 五元组 → 用户态 handoff |
 | `REDIRECT_TRACK` / `CONN_STATE_MAP` | redirect 与 conntrack |
-| `UDP_DECISION_SEQUENCE` | 固定的一槽 spin-lock 两位 generation + 28 位 sequence；跨普通重启/清理保留；耗尽时 fence 并轮换到存活 map 未使用的 generation |
+| `UDP_DECISION_SEQUENCE` | 固定的一槽 spin-lock 两位 generation + 28 位 sequence；跨普通重启/清理保留；耗尽时 fence 并轮换到回滚安全的空 generation 后缀 |
 | `UDP_DECISION_EPOCH` / `UDP_DECISION_INFLIGHT` | 用户态切换的双槽 grace period 与 per-CPU reader；fence 只等待观察到旧槽的内核工作 |
 | `UDP_DECISION_RETIRE_FENCE` | 五元组 → 预期 token；精确 token 回收重验 state/辅助项期间阻止新 claim |
 | `BPF_STATS_MAP` | conn-state 溢出，以及 redirect/handoff/cookie 插入失败 |
@@ -171,6 +171,7 @@ fence、关闭）时，需要暂存的新流会被丢弃；无需暂存的流量
 - eBPF 从持久 pin 的 `UDP_DECISION_SEQUENCE` 分配非零 token；token 由两位 generation 和 28 位 sequence 组成。pin 保留旧版 12 字节 raw-counter ABI，因此启动只校验、不改写，回滚后会从同一数值边界继续。eBPF 发布 token 绑定的 handoff/redirect/`ConnState::Pending`，再把 skb 标为 Pending。唯一的 raw-netlink listener 向同时受 256 项和 8 MiB payload 上限约束的 ingest actor 投递；slow permit 只在 actor 出队时获取。所有 backend 锁等待（包括 Arm 后的 Activate）都沿用从 listener 收包开始计算的固定三秒绝对期限；饱和或超期均 fail closed 丢包。独立的一秒 sampler 分别刷新内核队列与本地 guard/actor gauge，因此 dispatcher 停顿或 procfs 失败不会掩盖本地压力。队列 `320` 在 conntrack/NAT 之前保留原始 skb；没有 bypass、fanout 或 fail-open。
 - 最终 direct 执行 token 校验的 Arm → 按 FIFO 以最终 direct mark `NF_ACCEPT` 每个原始 skb → Activate。Arm 后到达的 follower 只追加 verdict guard；其 payload 与 slow permit 会被丢弃，不经过 endpoint admission。Direct 不创建用户态 socket、不保留 payload 副本、不故意触发重传，也不创建 UDP endpoint 或 `/connections` 条目。最终 proxy 在回包可能发生竞争前提交 token 绑定的 outbound/mark，把唯一 payload 副本转交给规范初始化器，丢弃原始 skb，并且只拨号/发送一次。Block 与取消丢弃原始 skb。任何终态转换都不能修改缺失、旧 token、错误 state 或更新的五元组 incarnation。
 - 重载与关闭先发布 NFQUEUE-not-ready，切换双槽 decision epoch，等待所有 fence 前的 per-CPU reader，并删除残留 Preparing/Pending state。延迟队列包因此无法跨 runtime generation。精确回收另行安装 `BPF_NOEXIST` 五元组 fence，等待 fence 前 reader，重新校验并删除。sequence 耗尽时使用同一 fence/drain 协议：关闭旧队列，等待所有 verdict guard、correlator cell 与延期 token cleanup，再选择 conn-state、handoff、redirect 与 retirement-fence map 均未使用的 generation；完整扫描会跨越成功但不足一批的 BPF batch，直到终止 `ENOENT`。若四个都仍存活，则按 1、2、5、30 秒退避重试并保持 staging fenced。队列、listener、verdict 与 cleanup 故障仍为致命错误；正常回滚会原样保留 raw allocator pin。
+- 为保证回滚安全，候选 generation 及其到 generation 3 的所有更高 generation 都必须未出现在这四类 map 中。旧 allocator 会从重置后的 raw 值开始，并且只会沿该后缀单调递增；没有安全后缀时，staging 保持 fenced 并退避重试。
 - TCP SNI/HTTP Host 与 QUIC Initial SNI 在域名感知模式下都会对非 `must`、非 `block` handoff 重新执行用户态 Router。
 
 ## 7. 用户态控制面
