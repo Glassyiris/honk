@@ -649,11 +649,15 @@ ingest actor, and no bypass, fanout, fail-open, or user-selectable queue/worker
 policy. honk exclusively owns the exact nftables names `inet honk_nfqueue` /
 `udp_decision`; firewall managers in the same network namespace must not mutate
 them while honk runs. The pinned `UDP_DECISION_SEQUENCE` allocator survives
-ordinary restart/cleanup. Its tokens combine a two-bit generation with a 28-bit
-sequence. At sequence exhaustion, honk fences new staging, drains held packets,
-and switches to a generation absent from all live token-bound maps. If all four
-generations remain live, staging stays fenced and the supervisor retries;
-non-staged UDP continues while ambiguous new flows fail closed. No reboot is required.
+ordinary restart/cleanup. Its rollback-compatible 12-byte value keeps the full
+raw token in `next`; startup validates it without rewriting it, so an older
+binary resumes at the same token boundary. Tokens still divide that raw value
+into a two-bit generation and 28-bit sequence. At sequence exhaustion, honk
+fences new staging, drains held packets and deferred token cleanups, hard-rebinds
+the queue, and switches to a generation absent from all live token-bound maps.
+If all four generations remain live, staging stays fenced and the supervisor
+retries; non-staged UDP continues while ambiguous new flows fail closed. No
+reboot is required.
 
 Held skbs are before conntrack/NAT. A final direct decision uses a token-checked
 Arm → FIFO accept with the final mark → Activate transition and creates no
@@ -719,10 +723,10 @@ udp = {
   nfqueue: {
     received, activeFlows, kernelQueueDepth, kernelStatsAvailable,
     kernelStatsReadErrors, kernelDropped, kernelUserDropped, heldPackets,
-    heldPeak, socketReceiveBufferBytes, actorQueueFull, actorQueueDepth,
-    actorQueuedBytes, actorOldestAgeNanos, directAccepted, proxyCopied,
-    proxyDropped, block, cancel, drop, tokenMismatch, tokenExhaustion,
-    tokenRollovers, verdictErrors, receiptToVerdict: H
+    heldPeak, socketReceiveBufferBytes, actorQueueFull, correlatorFull,
+    actorQueueDepth, actorQueuedBytes, actorOldestAgeNanos, directAccepted,
+    proxyCopied, proxyDropped, block, cancel, drop, tokenMismatch,
+    tokenExhaustion, tokenRollovers, verdictErrors, receiptToVerdict: H
   }
 }
 H = { count, sumNanos, buckets }  // buckets has 64 fixed log2 slots
@@ -742,12 +746,17 @@ pending-correlator gauge. A one-second task samples the owned kernel queue
 independently of packet dispatch. `kernelStatsAvailable` says whether the latest
 read succeeded; `kernelStatsReadErrors` is cumulative. On failure, the last
 `kernelQueueDepth`, `kernelDropped`, and `kernelUserDropped` values remain visible
-rather than becoming ambiguous zeroes. `heldPackets` and `heldPeak` count
-dispatched verdict guards. `socketReceiveBufferBytes` is the effective netlink
-receive buffer. `actorQueueFull` counts fail-closed admission drops;
-`actorQueueDepth`, `actorQueuedBytes`, and `actorOldestAgeNanos` expose current
-ingest pressure. `directAccepted`, `proxyDropped`, `block`, `cancel`, and `drop`
-count successful kernel verdicts; `proxyCopied` counts the single payload
+rather than becoming ambiguous zeroes, while the local `heldPackets`, `heldPeak`,
+and `socketReceiveBufferBytes` gauges continue to refresh. `kernelDropped` and
+`kernelUserDropped` are process-lifetime counters accumulated across queue hard
+rebinds; `kernelQueueDepth` remains the current-instance gauge. `heldPackets` and
+`heldPeak` count dispatched verdict guards. `socketReceiveBufferBytes` is the
+effective netlink receive buffer. `actorQueueFull` counts fail-closed ingest-actor
+admission drops. `correlatorFull` counts packets dropped at the hard limit of
+4,096 concurrent flow cells or 64 held verdicts per flow. `actorQueueDepth`,
+`actorQueuedBytes`, and `actorOldestAgeNanos` expose current ingest pressure.
+`directAccepted`, `proxyDropped`, `block`, `cancel`, and `drop` count successful
+kernel verdicts; `proxyCopied` counts the single payload
 ownership transfer into the canonical initializer. `tokenMismatch`,
 `tokenExhaustion`, `tokenRollovers`, and `verdictErrors` expose token and verdict
 events. `receiptToVerdict` measures listener receipt to successful verdict and

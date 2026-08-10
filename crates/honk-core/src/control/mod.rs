@@ -114,14 +114,16 @@ struct NfqueueActorQueueState {
 struct NfqueueActorQueue {
     state: parking_lot::Mutex<NfqueueActorQueueState>,
     stats: Arc<StatsManager>,
+    slow_limit: Arc<tokio::sync::Semaphore>,
 }
 
 #[cfg(feature = "ebpf")]
 impl NfqueueActorQueue {
-    fn new(stats: Arc<StatsManager>) -> Self {
+    fn new(stats: Arc<StatsManager>, slow_limit: Arc<tokio::sync::Semaphore>) -> Self {
         Self {
             state: parking_lot::Mutex::new(NfqueueActorQueueState::default()),
             stats,
+            slow_limit,
         }
     }
 
@@ -141,7 +143,7 @@ impl NfqueueActorQueue {
         true
     }
 
-    fn dequeue(&self, payload_bytes: usize) {
+    fn dequeue(&self, payload_bytes: usize) -> Option<tokio::sync::OwnedSemaphorePermit> {
         let mut state = self.state.lock();
         let entry = state
             .entries
@@ -150,6 +152,8 @@ impl NfqueueActorQueue {
         debug_assert_eq!(entry.payload_bytes, payload_bytes);
         state.payload_bytes = state.payload_bytes.saturating_sub(entry.payload_bytes);
         self.publish(&state);
+        drop(state);
+        Arc::clone(&self.slow_limit).try_acquire_owned().ok()
     }
 
     fn sample(&self) {
@@ -199,7 +203,7 @@ enum NfqueueRuntimeEvent {
 struct NfqueueRuntime {
     service: Option<honk_nfqueue::NfqueueService>,
     listener_fatal: honk_nfqueue::FatalReceiver,
-    pending_fatal: mpsc::UnboundedReceiver<nfqueue::PendingUdpFatal>,
+    pending_fatal: mpsc::Receiver<nfqueue::PendingUdpFatal>,
     stats: Arc<StatsManager>,
     pending: Arc<nfqueue::PendingUdpVerdicts>,
     stop: tokio::sync::watch::Sender<bool>,
@@ -331,14 +335,7 @@ impl NfqueueRuntime {
         self.pending.wait_empty().await;
     }
 
-    async fn finish_pending_drain(&mut self) -> anyhow::Result<()> {
-        if let Some(worker) = self.ingest_worker.take() {
-            worker
-                .await
-                .map_err(|error| anyhow::anyhow!("join NFQUEUE ingest actor: {error}"))?;
-        }
-        self.pending.cancel_all().await;
-        self.pending.wait_empty().await;
+    async fn stop_observers(&mut self) -> anyhow::Result<()> {
         let _ = self.stop.send(true);
         if let Some(stats_sampler) = self.stats_sampler.take() {
             stats_sampler
@@ -352,16 +349,58 @@ impl NfqueueRuntime {
         }
         Ok(())
     }
+
+    async fn finish_pending_drain(&mut self) -> anyhow::Result<()> {
+        let observer_result = self.stop_observers().await;
+        if let Some(worker) = self.ingest_worker.take() {
+            worker
+                .await
+                .map_err(|error| anyhow::anyhow!("join NFQUEUE ingest actor: {error}"))?;
+        }
+        self.pending.cancel_all().await;
+        self.pending.wait_empty().await;
+        observer_result
+    }
+
     async fn shutdown_service(&mut self) -> anyhow::Result<()> {
+        let observer_result = self.stop_observers().await;
+        let service_result = async {
+            let service = self
+                .service
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("NFQUEUE service already stopped"))?;
+            tokio::task::spawn_blocking(move || service.shutdown())
+                .await
+                .map_err(|error| anyhow::anyhow!("join NFQUEUE shutdown: {error}"))?
+                .map_err(|error| anyhow::anyhow!("shutdown NFQUEUE: {error}"))
+        }
+        .await;
+        observer_result?;
+        service_result
+    }
+    async fn hard_rebind_service(&mut self) -> anyhow::Result<()> {
+        self.check_startup_health()
+            .await
+            .map_err(anyhow::Error::new)?;
         let service = self
             .service
             .take()
             .ok_or_else(|| anyhow::anyhow!("NFQUEUE service already stopped"))?;
-        tokio::task::spawn_blocking(move || service.shutdown())
+        let (service, listener_fatal) = tokio::task::spawn_blocking(move || service.rebind())
             .await
-            .map_err(|error| anyhow::anyhow!("join NFQUEUE shutdown: {error}"))?
-            .map_err(|error| anyhow::anyhow!("shutdown NFQUEUE: {error}"))
+            .map_err(|error| anyhow::anyhow!("join NFQUEUE hard rebind: {error}"))?
+            .map_err(|error| anyhow::anyhow!("hard rebind NFQUEUE: {error}"))?;
+        let old_fatal = self.listener_fatal.try_recv().ok();
+        self.service = Some(service);
+        self.listener_fatal = listener_fatal;
+        if let Some(error) = old_fatal {
+            return Err(anyhow::Error::new(NfqueueRuntimeFatal::Listener(error)));
+        }
+        self.check_startup_health()
+            .await
+            .map_err(anyhow::Error::new)
     }
+
     fn take_shutdown_fatal(&mut self) -> Option<NfqueueRuntimeFatal> {
         if let Ok(error) = self.listener_fatal.try_recv() {
             return Some(NfqueueRuntimeFatal::Listener(error));
@@ -1214,12 +1253,19 @@ impl ControlPlane {
             runtime.sequence_ready = false;
             runtime.pending.cancel_all().await;
             runtime.pending.wait_empty().await;
+            runtime.hard_rebind_service().await?;
+            runtime.pending.cancel_all().await;
+            runtime.pending.wait_empty().await;
         }
         if !self.rotate_udp_decision_generation().await? {
             runtime.defer_token_retry();
             warn!("all UDP decision token generations remain live; NFQUEUE staging stays fenced");
             return Ok(());
         }
+        runtime
+            .check_startup_health()
+            .await
+            .map_err(anyhow::Error::new)?;
         runtime.pending.open_admission();
         self.datapath_flags
             .as_ref()
@@ -1254,14 +1300,10 @@ impl ControlPlane {
         let pending = Arc::new(pending);
         self.pending_udp_verdicts = Some(Arc::clone(&pending));
 
-        type IngestRequest = (
-            honk_nfqueue::QueuedPacket,
-            honk_nfqueue::VerdictGuard,
-            Option<tokio::sync::OwnedSemaphorePermit>,
-        );
+        type IngestRequest = (honk_nfqueue::QueuedPacket, honk_nfqueue::VerdictGuard);
         let (ingest_tx, mut ingest_rx) = mpsc::channel::<IngestRequest>(NFQUEUE_INGEST_QUEUE_LEN);
-        let actor_queue = Arc::new(NfqueueActorQueue::new(Arc::clone(&self.stats)));
         let slow_limit = Arc::clone(&self.udp_concurrency_limit);
+        let actor_queue = Arc::new(NfqueueActorQueue::new(Arc::clone(&self.stats), slow_limit));
         let callback_pending = Arc::clone(&pending);
         let callback_queue = Arc::clone(&actor_queue);
         let callback: honk_nfqueue::PacketCallback = Arc::new(move |packet, guard| {
@@ -1273,8 +1315,7 @@ impl ControlPlane {
                 callback_pending.reject_actor_queue(packet, guard);
                 return;
             }
-            let permit = Arc::clone(&slow_limit).try_acquire_owned().ok();
-            slot.send((packet, guard, permit));
+            slot.send((packet, guard));
         });
         let (service, listener_fatal) = match honk_nfqueue::NfqueueService::start(callback) {
             Ok(runtime) => runtime,
@@ -1288,8 +1329,8 @@ impl ControlPlane {
         let drain = Arc::clone(&self.drain_tracker);
         let ingest_queue = Arc::clone(&actor_queue);
         let ingest_worker = tokio::spawn(async move {
-            while let Some((packet, guard, permit)) = ingest_rx.recv().await {
-                ingest_queue.dequeue(packet.payload.len());
+            while let Some((packet, guard)) = ingest_rx.recv().await {
+                let permit = ingest_queue.dequeue(packet.payload.len());
                 let nfqueue::NfqueueIngest::Initialize { lease, identity } =
                     actor_pending.ingest_wait(packet, guard, permit).await
                 else {
@@ -1339,6 +1380,7 @@ impl ControlPlane {
                     }
                     _ = interval.tick() => {
                         sampler_queue.sample();
+                        sampler_stats.update_udp_nfqueue_local_stats(stats_reader.local_stats());
                         match stats_reader.stats().await {
                             Ok(sample) => {
                                 if unavailable {

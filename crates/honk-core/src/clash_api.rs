@@ -911,6 +911,7 @@ async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json
                 "heldPeak": udp.nfqueue.held_peak,
                 "socketReceiveBufferBytes": udp.nfqueue.socket_receive_buffer_bytes,
                 "actorQueueFull": udp.nfqueue.actor_queue_full,
+                "correlatorFull": udp.nfqueue.correlator_full,
                 "actorQueueDepth": udp.nfqueue.actor_queue_depth,
                 "actorQueuedBytes": udp.nfqueue.actor_queued_bytes,
                 "actorOldestAgeNanos": udp.nfqueue.actor_oldest_age_nanos,

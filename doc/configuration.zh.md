@@ -501,10 +501,14 @@ honk 通过 raw netlink 绑定唯一且固定的 NFQUEUE `320`，不启用 bypas
 fail-open。它拥有名称精确为 `inet honk_nfqueue` / `udp_decision` 的 nftables 表与链。
 honk 运行期间，同一网络命名空间中的防火墙管理器不得 flush、替换或修改任一对象。
 eBPF `UDP_DECISION_SEQUENCE` pin 会跨普通重启和清理保留。token 由两位 generation 与
-28 位 sequence 组成；加载时会迁移旧的线性持久值且不会复用 token。耗尽时会先 fence
-并排空暂存，再切换到存活 map 未使用的 generation。若四个 generation 都仍存活，按
-1、2、5、30 秒退避重试：非暂存 UDP 继续工作，新的歧义流 fail closed；无需重启系统
-或手工重置 allocator。
+28 位 sequence 组成。pin 保留旧版本的 12 字节布局，并在 `next` 中保存完整 raw token；
+启动只校验、不改写，因此回滚到上一 binary 时会从同一边界继续分配而不复用 token。
+正常升级/降级必须保留该 pin。只有启动明确拒绝损坏或不兼容的 pin 时，才应保持
+NFQUEUE fenced，停止所有 honk 进程，确认队列和 token 绑定 map 已消失，再删除一次 pin
+并重启；仍有队列或 token 绑定 map 存活时删除会复用活动 token。耗尽时先 fence 并
+排空暂存，再切换到存活 map 未使用的 generation。若四个 generation 都仍存活，则按
+1、2、5、30 秒退避重试：无需暂存的 UDP 继续工作，新的歧义流 fail closed；正常运行
+无需重启系统或手工重置 allocator。
 
 原始 skb 在 conntrack/NAT 之前被保留。Direct 执行 token 校验的
 Arm → 按 FIFO 以最终 mark `NF_ACCEPT` → Activate，不创建用户态直连 socket、
@@ -515,18 +519,20 @@ payload 副本、endpoint、connection 条目，也不故意触发重传。Proxy
 fail-open；分配器耗尽使用带 fence 的 generation 轮换恢复。
 
 ingest actor 最多接纳 256 个报文和 8 MiB 保留 payload。典型 1,200 字节负载先达到
-项数上限；65,507 字节的最大 UDP payload 在 128 个排队报文时达到字节上限。绝对保留
-期限从 listener 收包起固定为三秒，包含 backend 锁获取与 Arm 前的所有转换。队列满或
-超期时直接丢弃，既不让内存继续增长，也不绕过策略。
+项数上限；65,507 字节的最大 UDP payload 在 128 个排队报文时达到字节上限。
+correlator 另将存活 flow cell 限制为 4,096 个，并将每条流的保留 verdict 限制为 64 个。
+slow-path permit 在 actor 出队时获取，而不是在请求等待队列时预占。绝对保留期限从
+listener 收包起固定为三秒，既包含 Arm 前的 backend 锁获取，也包含 Arm 后 Activate
+的锁获取。队列满或超期时直接丢弃，既不让内存继续增长，也不绕过策略。
 
 启用 Clash API 后，`GET /stats` 暴露固定对象 `/stats.udp.nfqueue`（点路径，不是
 独立路由）：`received`、`activeFlows`、`kernelQueueDepth`、
 `kernelStatsAvailable`、`kernelStatsReadErrors`、`kernelDropped`、
 `kernelUserDropped`、`heldPackets`、`heldPeak`、`socketReceiveBufferBytes`、
-`actorQueueFull`、`actorQueueDepth`、`actorQueuedBytes`、`actorOldestAgeNanos`、
-`directAccepted`、`proxyCopied`、`proxyDropped`、`block`、`cancel`、`drop`、
-`tokenMismatch`、`tokenExhaustion`、`tokenRollovers`、`verdictErrors` 和
-`receiptToVerdict`。字段含义见组件参考。
+`actorQueueFull`、`correlatorFull`、`actorQueueDepth`、`actorQueuedBytes`、
+`actorOldestAgeNanos`、`directAccepted`、`proxyCopied`、`proxyDropped`、`block`、
+`cancel`、`drop`、`tokenMismatch`、`tokenExhaustion`、`tokenRollovers`、
+`verdictErrors` 和 `receiptToVerdict`。字段含义见组件参考。
 
 ### Clash API
 

@@ -17,13 +17,12 @@ use aya_ebpf_bindings::{
     helpers::{bpf_ktime_get_ns, bpf_spin_lock, bpf_spin_unlock},
 };
 use honk_ebpf_common::{
-    RoutingMeta, UDP_DECISION_SEQUENCE_MASK,
+    NFQUEUE_TOKEN_MASK, RoutingMeta, UDP_DECISION_SEQUENCE_MASK,
     conn::{
         BpfStatsKey, ConnState, ConntrackArgs, OCCUPANCY_EBPF_DELETES, OCCUPANCY_INSERTS, TcpState,
         UDP_CONN_STATE_TIMEOUT_NS, UdpDecisionState, tcp_conn_state_expired,
     },
     redirect_need::TuplesKey,
-    udp_decision_token,
 };
 use network_types::tcp::TcpHdr;
 
@@ -145,12 +144,17 @@ pub fn allocate_udp_decision_token(key: &TuplesKey) -> Option<u32> {
     }
 
     let mut became_exhausted = false;
-    let token = if sequence.next >= UDP_DECISION_SEQUENCE_MASK {
+    let token = if sequence.exhausted != 0
+        || sequence.next & UDP_DECISION_SEQUENCE_MASK >= UDP_DECISION_SEQUENCE_MASK
+    {
         0
     } else {
         sequence.next += 1;
-        became_exhausted = sequence.next == UDP_DECISION_SEQUENCE_MASK;
-        udp_decision_token(sequence.generation, sequence.next).unwrap_or(0)
+        became_exhausted = sequence.next & UDP_DECISION_SEQUENCE_MASK == UDP_DECISION_SEQUENCE_MASK;
+        if sequence.next == NFQUEUE_TOKEN_MASK {
+            sequence.exhausted = 1;
+        }
+        sequence.next
     };
 
     unsafe {

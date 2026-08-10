@@ -168,11 +168,9 @@ async fn link_lifecycle_holds_links_and_rebinds_primary_wan() {
 
 #[tokio::test]
 #[ignore = "requires root; run via just test-netns"]
-async fn pinned_legacy_udp_decision_sequence_migrates_on_reload() {
-    let pin_root = Path::new("/sys/fs/bpf").join(format!(
-        "honk-sequence-migration-test-{}",
-        std::process::id()
-    ));
+async fn pinned_raw_udp_decision_sequence_survives_reload() {
+    let pin_root =
+        Path::new("/sys/fs/bpf").join(format!("honk-sequence-reload-test-{}", std::process::id()));
     let mut backend = RealEbpfBackend::load(
         crate::DEFAULT_BPF_OBJECT,
         &pin_root,
@@ -187,16 +185,15 @@ async fn pinned_legacy_udp_decision_sequence_migrates_on_reload() {
     let sequence_map_id = aya::maps::MapInfo::from_pin(pin_root.join(UDP_DECISION_SEQUENCE_MAP))
         .expect("initial sequence map info")
         .id();
-    let legacy_next = (1 << UDP_DECISION_GENERATION_SHIFT) | 42;
+    let persisted_next = (1 << UDP_DECISION_GENERATION_SHIFT) | 42;
     syscall::write_udp_decision_sequence_locked(
         backend.bpf().unwrap(),
         &UdpDecisionSequence {
-            next: legacy_next,
-            generation: 0,
+            next: persisted_next,
             ..UdpDecisionSequence::default()
         },
     )
-    .expect("seed legacy persistent allocator value");
+    .expect("seed rollback-compatible persistent allocator value");
     backend.detach_hooks().expect("detach hooks");
     backend.cleanup().await.expect("cleanup");
 
@@ -221,12 +218,12 @@ async fn pinned_legacy_udp_decision_sequence_migrates_on_reload() {
     assert_eq!(
         reloaded
             .udp_decision_sequence_status()
-            .expect("migrated sequence status"),
+            .expect("reloaded sequence status"),
         UdpDecisionSequenceStatus {
             next: 42,
             generation: 1,
         },
-        "legacy linear token progress must resume at the same numeric boundary"
+        "raw token progress must resume at the same numeric boundary"
     );
     let fence_key = TuplesKey::default();
     let fence_token = udp_decision_token(2, 7).unwrap();
@@ -236,8 +233,7 @@ async fn pinned_legacy_udp_decision_sequence_migrates_on_reload() {
     syscall::write_udp_decision_sequence_locked(
         reloaded.bpf().unwrap(),
         &UdpDecisionSequence {
-            next: UDP_DECISION_SEQUENCE_MASK,
-            generation: 1,
+            next: udp_decision_token(1, UDP_DECISION_SEQUENCE_MASK).unwrap(),
             ..UdpDecisionSequence::default()
         },
     )
@@ -256,6 +252,10 @@ async fn pinned_legacy_udp_decision_sequence_migrates_on_reload() {
             .reset_udp_decision_sequence(2)
             .expect("reset after retirement fence removal")
     );
+    let reset = syscall::read_udp_decision_sequence_locked(reloaded.bpf().unwrap())
+        .expect("read reset rollback-compatible sequence");
+    assert_eq!(reset.next, 2 << UDP_DECISION_GENERATION_SHIFT);
+    assert_eq!(reset.exhausted, 0);
     reloaded.detach_hooks().expect("detach hooks after reload");
     reloaded.cleanup().await.expect("reload cleanup");
     std::fs::remove_file(pin_root.join(UDP_DECISION_SEQUENCE_MAP))

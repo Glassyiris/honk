@@ -7,7 +7,8 @@ use crate::dns::query::is_exact_dns_query;
 #[test]
 fn nfqueue_actor_queue_bounds_small_and_max_payloads() {
     let stats = Arc::new(StatsManager::new());
-    let queue = NfqueueActorQueue::new(Arc::clone(&stats));
+    let queue =
+        NfqueueActorQueue::new(Arc::clone(&stats), Arc::new(tokio::sync::Semaphore::new(1)));
     let oldest = Instant::now() - Duration::from_millis(25);
     assert!(queue.try_enqueue(oldest, 1_200));
     assert!(queue.try_enqueue(Instant::now(), 65_507));
@@ -17,8 +18,8 @@ fn nfqueue_actor_queue_bounds_small_and_max_payloads() {
     assert_eq!(snapshot.actor_queued_bytes, 66_707);
     assert!(snapshot.actor_oldest_age_nanos >= Duration::from_millis(25).as_nanos() as u64);
 
-    queue.dequeue(1_200);
-    queue.dequeue(65_507);
+    drop(queue.dequeue(1_200));
+    drop(queue.dequeue(65_507));
     let mut max_payloads = 0;
     while queue.try_enqueue(Instant::now(), 65_507) {
         max_payloads += 1;
@@ -29,12 +30,27 @@ fn nfqueue_actor_queue_bounds_small_and_max_payloads() {
     assert!(max_payloads < NFQUEUE_INGEST_QUEUE_LEN);
 
     for _ in 0..max_payloads {
-        queue.dequeue(65_507);
+        drop(queue.dequeue(65_507));
     }
     let empty = stats.udp_snapshot().nfqueue;
     assert_eq!(empty.actor_queue_depth, 0);
     assert_eq!(empty.actor_queued_bytes, 0);
     assert_eq!(empty.actor_oldest_age_nanos, 0);
+}
+
+#[cfg(feature = "ebpf")]
+#[test]
+fn nfqueue_actor_acquires_slow_permits_only_at_dequeue() {
+    let limit = Arc::new(tokio::sync::Semaphore::new(1));
+    let queue = NfqueueActorQueue::new(Arc::new(StatsManager::new()), Arc::clone(&limit));
+    assert!(queue.try_enqueue(Instant::now(), 0));
+    assert!(queue.try_enqueue(Instant::now(), 0));
+    assert_eq!(limit.available_permits(), 1);
+
+    let first = queue.dequeue(0).expect("first dequeued request permit");
+    assert_eq!(limit.available_permits(), 0);
+    drop(first);
+    assert!(queue.dequeue(0).is_some());
 }
 
 #[cfg(feature = "ebpf")]
@@ -4392,6 +4408,15 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
             exercise?;
             service_shutdown?;
             pending_shutdown?;
+            anyhow::ensure!(
+                control
+                    .stats
+                    .udp_snapshot()
+                    .nfqueue
+                    .kernel_stats_read_errors
+                    == 0,
+                "stats sampler read the queue after teardown"
+            );
             datapath_shutdown?;
             backend_shutdown?;
             Ok(())

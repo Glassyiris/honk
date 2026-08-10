@@ -119,8 +119,7 @@ pub use iface_watch::{AttachedInterface, AttachedMap, IfaceWatcher};
 use syscall::{
     LookupAndDelete, bpf_delete_batch, bpf_delete_shared, bpf_lookup_and_delete,
     bpf_lookup_batch_scan, bpf_lookup_batch_scan_cb, bpf_update_batch,
-    read_udp_decision_sequence_locked, reset_udp_decision_sequence_locked,
-    validate_loaded_udp_decision_sequence,
+    reset_udp_decision_sequence_locked, validate_loaded_udp_decision_sequence,
 };
 
 fn conn_key(outbound: u8, domain: u32, ipver: u32) -> u32 {
@@ -983,19 +982,10 @@ impl EbpfBackend for RealEbpfBackend {
         validate_loaded_udp_decision_sequence(self.bpf()?).map(|_| ())
     }
     fn udp_decision_sequence_status(&self) -> anyhow::Result<UdpDecisionSequenceStatus> {
-        let sequence = read_udp_decision_sequence_locked(self.bpf()?)?;
-        anyhow::ensure!(
-            sequence.next <= UDP_DECISION_SEQUENCE_MASK,
-            "UDP_DECISION_SEQUENCE next token exceeds its generation sequence space"
-        );
-        anyhow::ensure!(
-            sequence.generation <= UDP_DECISION_GENERATION_MASK,
-            "UDP_DECISION_SEQUENCE has invalid generation {}",
-            sequence.generation
-        );
+        let sequence = validate_loaded_udp_decision_sequence(self.bpf()?)?;
         Ok(UdpDecisionSequenceStatus {
-            next: sequence.next,
-            generation: sequence.generation,
+            next: sequence.next & UDP_DECISION_SEQUENCE_MASK,
+            generation: udp_decision_token_generation(sequence.next),
         })
     }
 

@@ -79,6 +79,13 @@ jobs:
         run: |
           sed -i 's|linker=/root/.cargo/bin/bpf-linker-wrapper|linker=bpf-linker|' \
             crates/honk-ebpf/.cargo/config.toml
+      - name: Install geo assets for eBPF-feature unit tests
+        run: |
+          sudo mkdir -p /etc/dae
+          sudo curl -sL --retry 3 -o /etc/dae/geosite.dat \
+            https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat
+          sudo curl -sL --retry 3 -o /etc/dae/geoip.dat \
+            https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
       - name: Build eBPF object
         run: |
           cd crates/honk-ebpf
@@ -87,6 +94,12 @@ jobs:
       # here instead of at runtime on a gateway.
       - name: Verify eBPF object has BTF
         run: readelf -S crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf | grep -q '\.BTF'
+      - name: Run eBPF-feature unit tests
+        run: |
+          cargo +stable test -p honk-core --features ebpf --lib -- \
+            --skip test_config_toml_round_trip \
+            --skip test_to_file_and_from_file_by_extension \
+            --skip test_routing_with_config_dae
       # Map pinning needs bpffs; the hosted VM image does not guarantee that it is mounted.
       - name: Prepare the VM kernel
         run: |

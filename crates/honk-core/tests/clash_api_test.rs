@@ -1520,6 +1520,7 @@ async fn stats_exposes_udp_metrics() {
     assert_eq!(nfqueue["heldPeak"], 0);
     assert_eq!(nfqueue["socketReceiveBufferBytes"], 0);
     assert_eq!(nfqueue["actorQueueFull"], 0);
+    assert_eq!(nfqueue["correlatorFull"], 0);
     assert_eq!(nfqueue["actorQueueDepth"], 0);
     assert_eq!(nfqueue["actorQueuedBytes"], 0);
     assert_eq!(nfqueue["actorOldestAgeNanos"], 0);

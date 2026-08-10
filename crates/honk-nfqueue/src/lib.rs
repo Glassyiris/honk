@@ -9,7 +9,7 @@ mod kernel_tests;
 
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 pub use packet::{PacketError, QueuedPacket, UdpTuple};
 pub use rules::{CHAIN_NAME, CHAIN_PRIORITY, TABLE_NAME};
@@ -32,6 +32,13 @@ pub struct QueueStats {
     pub kernel_queue_depth: u64,
     pub kernel_dropped: u64,
     pub kernel_user_dropped: u64,
+    pub held_packets: usize,
+    pub held_peak: usize,
+    pub socket_receive_buffer_bytes: usize,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct QueueLocalStats {
     pub held_packets: usize,
     pub held_peak: usize,
     pub socket_receive_buffer_bytes: usize,
@@ -104,17 +111,75 @@ pub struct NfqueueService {
     socket: Option<Arc<queue::QueueSocket>>,
     rules: Option<rules::NftRuleset>,
     guards: Arc<verdict::GuardTracker>,
+    socket_receive_buffer_bytes: Arc<AtomicUsize>,
+    kernel_counters: Arc<parking_lot::Mutex<KernelCounterState>>,
+    callback: PacketCallback,
     shutdown_complete: bool,
 }
 
 #[derive(Clone)]
 pub struct QueueStatsReader {
     guards: Arc<verdict::GuardTracker>,
-    socket_receive_buffer_bytes: usize,
+    socket_receive_buffer_bytes: Arc<AtomicUsize>,
+    kernel_counters: Arc<parking_lot::Mutex<KernelCounterState>>,
+}
+
+#[derive(Default)]
+struct KernelCounterState {
+    generation: u64,
+    last_dropped: u64,
+    last_user_dropped: u64,
+    total_dropped: u64,
+    total_user_dropped: u64,
+}
+
+impl KernelCounterState {
+    fn reset_instance(&mut self) {
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .expect("NFQUEUE instance generation overflow");
+        self.last_dropped = 0;
+        self.last_user_dropped = 0;
+    }
+
+    fn accumulate(
+        &mut self,
+        generation: u64,
+        dropped: u64,
+        user_dropped: u64,
+    ) -> io::Result<(u64, u64)> {
+        if generation != self.generation {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "NFQUEUE instance changed during statistics read",
+            ));
+        }
+        self.total_dropped = self
+            .total_dropped
+            .saturating_add(dropped.checked_sub(self.last_dropped).unwrap_or(dropped));
+        self.total_user_dropped = self.total_user_dropped.saturating_add(
+            user_dropped
+                .checked_sub(self.last_user_dropped)
+                .unwrap_or(user_dropped),
+        );
+        self.last_dropped = dropped;
+        self.last_user_dropped = user_dropped;
+        Ok((self.total_dropped, self.total_user_dropped))
+    }
 }
 
 impl QueueStatsReader {
+    pub fn local_stats(&self) -> QueueLocalStats {
+        QueueLocalStats {
+            held_packets: self.guards.count(),
+            held_peak: self.guards.peak(),
+            socket_receive_buffer_bytes: self.socket_receive_buffer_bytes.load(Ordering::Relaxed),
+        }
+    }
+
     pub async fn stats(&self) -> io::Result<QueueStats> {
+        let generation = self.kernel_counters.lock().generation;
         let contents = tokio::fs::read_to_string("/proc/net/netfilter/nfnetlink_queue").await?;
         let (kernel_queue_depth, kernel_dropped, kernel_user_dropped) =
             parse_kernel_queue_stats(&contents).ok_or_else(|| {
@@ -123,15 +188,43 @@ impl QueueStatsReader {
                     "owned NFQUEUE status row is absent",
                 )
             })?;
+        let (kernel_dropped, kernel_user_dropped) = self.kernel_counters.lock().accumulate(
+            generation,
+            kernel_dropped,
+            kernel_user_dropped,
+        )?;
+        let local = self.local_stats();
         Ok(QueueStats {
             kernel_queue_depth,
             kernel_dropped,
             kernel_user_dropped,
-            held_packets: self.guards.count(),
-            held_peak: self.guards.peak(),
-            socket_receive_buffer_bytes: self.socket_receive_buffer_bytes,
+            held_packets: local.held_packets,
+            held_peak: local.held_peak,
+            socket_receive_buffer_bytes: local.socket_receive_buffer_bytes,
         })
     }
+}
+
+fn spawn_listener(
+    socket: Arc<queue::QueueSocket>,
+    stop: Arc<AtomicBool>,
+    callback: PacketCallback,
+    guards: Arc<verdict::GuardTracker>,
+    fatal: Arc<FatalNotifier>,
+) -> io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("honk-nfqueue".into())
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                queue::listen(socket, Arc::clone(&stop), callback, guards)
+            }));
+            match result {
+                Ok(Ok(())) if stop.load(Ordering::Acquire) => {}
+                Ok(Ok(())) => fatal.notify(FatalError::ListenerExited),
+                Ok(Err(error)) => fatal.notify(error),
+                Err(_) => fatal.notify(FatalError::ListenerPanicked),
+            }
+        })
 }
 
 impl NfqueueService {
@@ -144,29 +237,16 @@ impl NfqueueService {
             rules::NftRuleset::install().map_err(|error| StartError::Rules(error.to_string()))?;
         let stop = Arc::new(AtomicBool::new(false));
         let guards = verdict::GuardTracker::new();
+        let socket_receive_buffer_bytes = Arc::new(AtomicUsize::new(socket.receive_buffer_bytes()));
+        let kernel_counters = Arc::new(parking_lot::Mutex::new(KernelCounterState::default()));
 
-        let listener_socket = Arc::clone(&socket);
-        let listener_stop = Arc::clone(&stop);
-        let listener_guards = Arc::clone(&guards);
-        let listener_fatal = Arc::clone(&fatal);
-        let listener = match std::thread::Builder::new()
-            .name("honk-nfqueue".into())
-            .spawn(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    queue::listen(
-                        listener_socket,
-                        Arc::clone(&listener_stop),
-                        callback,
-                        listener_guards,
-                    )
-                }));
-                match result {
-                    Ok(Ok(())) if listener_stop.load(Ordering::Acquire) => {}
-                    Ok(Ok(())) => listener_fatal.notify(FatalError::ListenerExited),
-                    Ok(Err(error)) => listener_fatal.notify(error),
-                    Err(_) => listener_fatal.notify(FatalError::ListenerPanicked),
-                }
-            }) {
+        let listener = match spawn_listener(
+            Arc::clone(&socket),
+            Arc::clone(&stop),
+            Arc::clone(&callback),
+            Arc::clone(&guards),
+            Arc::clone(&fatal),
+        ) {
             Ok(listener) => listener,
             Err(error) => {
                 socket.mark_closed();
@@ -182,6 +262,9 @@ impl NfqueueService {
                 socket: Some(socket),
                 rules: Some(rules),
                 guards,
+                socket_receive_buffer_bytes,
+                kernel_counters,
+                callback,
                 shutdown_complete: false,
             },
             fatal_receiver,
@@ -191,11 +274,42 @@ impl NfqueueService {
     pub fn stats_reader(&self) -> QueueStatsReader {
         QueueStatsReader {
             guards: Arc::clone(&self.guards),
-            socket_receive_buffer_bytes: self
-                .socket
-                .as_ref()
-                .map_or(0, |socket| socket.receive_buffer_bytes()),
+            socket_receive_buffer_bytes: Arc::clone(&self.socket_receive_buffer_bytes),
+            kernel_counters: Arc::clone(&self.kernel_counters),
         }
+    }
+
+    /// Drop every skb owned by the old queue before rebinding it. Producers
+    /// must already be fenced, and callers must drain their callback state.
+    pub fn rebind(mut self) -> Result<(Self, FatalReceiver), StartError> {
+        self.stop_listener();
+        drop(self.socket.take());
+        self.guards.wait_until_drained();
+
+        let (fatal, fatal_receiver) = fatal_channel();
+        let socket = queue::QueueSocket::bind(Arc::clone(&fatal))
+            .map_err(|error| StartError::Queue(error.to_string()))?;
+        self.socket_receive_buffer_bytes
+            .store(socket.receive_buffer_bytes(), Ordering::Relaxed);
+        self.kernel_counters.lock().reset_instance();
+        let stop = Arc::new(AtomicBool::new(false));
+        let listener = match spawn_listener(
+            Arc::clone(&socket),
+            Arc::clone(&stop),
+            Arc::clone(&self.callback),
+            Arc::clone(&self.guards),
+            fatal,
+        ) {
+            Ok(listener) => listener,
+            Err(error) => {
+                socket.mark_closed();
+                return Err(StartError::ListenerThread(error));
+            }
+        };
+        self.stop = stop;
+        self.listener = Some(listener);
+        self.socket = Some(socket);
+        Ok((self, fatal_receiver))
     }
 
     /// The caller must fence packet producers first; this waits for every
@@ -274,5 +388,44 @@ mod tests {
     fn parses_owned_kernel_queue_stats() {
         let input = "319 10 1 2 65535 3 4 8\n320 20 17 2 65535 5 6 9\n";
         assert_eq!(super::parse_kernel_queue_stats(input), Some((17, 5, 6)));
+    }
+
+    #[test]
+    fn local_stats_change_without_kernel_procfs() {
+        let tracker = super::verdict::GuardTracker::new();
+        let reader = super::QueueStatsReader {
+            guards: std::sync::Arc::clone(&tracker),
+            socket_receive_buffer_bytes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
+                4096,
+            )),
+            kernel_counters: std::sync::Arc::new(parking_lot::Mutex::new(
+                super::KernelCounterState::default(),
+            )),
+        };
+        let (socket, _peer, _fatal) = super::queue::QueueSocket::for_test();
+        let guard = super::verdict::VerdictGuard::new(socket, 1, tracker);
+
+        assert_eq!(
+            reader.local_stats(),
+            super::QueueLocalStats {
+                held_packets: 1,
+                held_peak: 1,
+                socket_receive_buffer_bytes: 4096,
+            }
+        );
+        drop(guard);
+        assert_eq!(reader.local_stats().held_packets, 0);
+        assert_eq!(reader.local_stats().held_peak, 1);
+    }
+
+    #[test]
+    fn kernel_drop_counters_continue_across_queue_rebind() {
+        let mut counters = super::KernelCounterState::default();
+        assert_eq!(counters.accumulate(0, 5, 6).unwrap(), (5, 6));
+        assert_eq!(counters.accumulate(0, 7, 9).unwrap(), (7, 9));
+
+        counters.reset_instance();
+        assert!(counters.accumulate(0, 8, 10).is_err());
+        assert_eq!(counters.accumulate(1, 2, 1).unwrap(), (9, 10));
     }
 }

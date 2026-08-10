@@ -576,10 +576,12 @@ experimental {
 不启用 bypass、fanout、fail-open，也没有用户可配置的队列/worker 策略。honk 独占
 名称精确为 `inet honk_nfqueue` / `udp_decision` 的 nftables 对象；运行期间，同一网络
 命名空间中的防火墙管理器不得修改它们。固定的 `UDP_DECISION_SEQUENCE` 分配器跨普通
-重启/清理保留。token 由两位 generation 和 28 位 sequence 组成。sequence 耗尽时，
-honk 先 fence 新暂存、排空已保留报文，再切换到所有存活 token 绑定 map 均未使用的
-generation。若四个 generation 都仍存活，暂存会保持 fenced 且 supervisor 持续重试；
-无需暂存的 UDP 继续工作，新的歧义流 fail closed。无需重启操作系统。
+重启/清理保留。其兼容回滚的 12 字节值在 `next` 中保存完整 raw token；启动只校验、
+不改写，因此旧 binary 会从同一 token 边界继续。该 raw 值仍划分为两位 generation 与
+28 位 sequence。sequence 耗尽时，honk 先 fence 新暂存，排空已保留报文与延期 token
+cleanup，硬重绑队列，再切换到所有存活 token 绑定 map 均未使用的 generation。若四个
+generation 都仍存活，暂存会保持 fenced 且 supervisor 持续重试；无需暂存的 UDP 继续
+工作，新的歧义流 fail closed。无需重启操作系统。
 
 被保留的 skb 位于 conntrack/NAT 之前。最终 direct 使用 token 校验的
 Arm → 按 FIFO 以最终 mark accept → Activate，不创建用户态直连 socket、payload 副本、
@@ -641,10 +643,10 @@ udp = {
   nfqueue: {
     received, activeFlows, kernelQueueDepth, kernelStatsAvailable,
     kernelStatsReadErrors, kernelDropped, kernelUserDropped, heldPackets,
-    heldPeak, socketReceiveBufferBytes, actorQueueFull, actorQueueDepth,
-    actorQueuedBytes, actorOldestAgeNanos, directAccepted, proxyCopied,
-    proxyDropped, block, cancel, drop, tokenMismatch, tokenExhaustion,
-    tokenRollovers, verdictErrors, receiptToVerdict: H
+    heldPeak, socketReceiveBufferBytes, actorQueueFull, correlatorFull,
+    actorQueueDepth, actorQueuedBytes, actorOldestAgeNanos, directAccepted,
+    proxyCopied, proxyDropped, block, cancel, drop, tokenMismatch,
+    tokenExhaustion, tokenRollovers, verdictErrors, receiptToVerdict: H
   }
 }
 H = { count, sumNanos, buckets }  // buckets 有固定 64 个 log2 slot
@@ -661,14 +663,19 @@ connection。warm 的 `successes` 只计 `Ready`；`NotApplicable` 保持中性�
 `nfqueue.received` 统计 listener 投递；`activeFlows` 是当前 pending correlator gauge。
 独立于报文 dispatch 的一秒任务采样自有内核队列。`kernelStatsAvailable` 表示最近一次
 读取是否成功；`kernelStatsReadErrors` 是累计失败数。读取失败时仍保留最近的
-`kernelQueueDepth`、`kernelDropped` 和 `kernelUserDropped`，不会用含义不明的零值覆盖。
-`heldPackets` 与 `heldPeak` 统计已投递的 verdict guard；`socketReceiveBufferBytes` 是
-netlink 实际接收缓冲区大小。`actorQueueFull` 统计 fail-closed admission 丢包；
+`kernelQueueDepth`、`kernelDropped` 和 `kernelUserDropped`，不会用含义不明的零值覆盖；
+本地 `heldPackets`、`heldPeak` 和 `socketReceiveBufferBytes` gauge 仍继续刷新。
+`kernelDropped` 与 `kernelUserDropped` 是跨队列硬重绑累加的进程生命周期 counter，
+`kernelQueueDepth` 则是当前队列实例的 gauge。`heldPackets` 与 `heldPeak` 统计已投递的
+verdict guard；`socketReceiveBufferBytes` 是 netlink 实际接收缓冲区大小。
+`actorQueueFull` 统计 ingest actor 的 fail-closed admission 丢包；`correlatorFull`
+统计达到 4,096 个并发 flow cell 或单流 64 个保留 verdict 硬上限时的丢包。
 `actorQueueDepth`、`actorQueuedBytes` 和 `actorOldestAgeNanos` 暴露当前 ingest 压力。
 `directAccepted`、`proxyDropped`、`block`、`cancel` 和 `drop` 统计成功内核 verdict；
-`proxyCopied` 统计唯一 payload 所有权转交。`tokenMismatch`、`tokenExhaustion`、
-`tokenRollovers` 和 `verdictErrors` 暴露 token/verdict 事件。`receiptToVerdict` 测量
-listener 收包到成功 verdict 的时间；NFQA timestamp 不保证存在，因此不表示内核队列驻留时间。
+`proxyCopied` 统计唯一 payload
+所有权转交。`tokenMismatch`、`tokenExhaustion`、`tokenRollovers` 和 `verdictErrors`
+暴露 token/verdict 事件。`receiptToVerdict` 测量 listener 收包到成功 verdict 的时间；
+NFQA timestamp 不保证存在，因此不表示内核队列驻留时间。
 
 `/stats` 另有顶层 `warm` 对象，为即时 gauge：
 

@@ -165,43 +165,21 @@ fn validate_udp_decision_sequence_info(info: &bpf_map_info) -> anyhow::Result<()
 
 fn validate_udp_decision_sequence_value(sequence: UdpDecisionSequence) -> anyhow::Result<()> {
     anyhow::ensure!(
-        sequence.next <= honk_ebpf_common::UDP_DECISION_SEQUENCE_MASK,
-        "UDP_DECISION_SEQUENCE next token exceeds its generation sequence space"
-    );
-    anyhow::ensure!(
-        sequence.generation <= honk_ebpf_common::UDP_DECISION_GENERATION_MASK,
-        "UDP_DECISION_SEQUENCE has invalid generation {}",
-        sequence.generation
-    );
-    Ok(())
-}
-
-fn migrate_legacy_udp_decision_sequence(
-    mut sequence: UdpDecisionSequence,
-) -> anyhow::Result<(UdpDecisionSequence, bool)> {
-    if sequence.next <= honk_ebpf_common::UDP_DECISION_SEQUENCE_MASK
-        && sequence.generation <= honk_ebpf_common::UDP_DECISION_GENERATION_MASK
-    {
-        return Ok((sequence, false));
-    }
-    anyhow::ensure!(
         sequence.next <= honk_ebpf_common::NFQUEUE_TOKEN_MASK,
-        "legacy UDP_DECISION_SEQUENCE next token exceeds its token space"
+        "UDP_DECISION_SEQUENCE next token exceeds its token space"
     );
     anyhow::ensure!(
-        sequence.generation <= 1,
-        "UDP_DECISION_SEQUENCE is neither current nor a valid legacy allocator"
+        sequence.exhausted <= 1,
+        "UDP_DECISION_SEQUENCE has invalid exhausted flag {}",
+        sequence.exhausted
     );
-    if sequence.generation == 1 {
+    if sequence.exhausted != 0 {
         anyhow::ensure!(
             sequence.next == honk_ebpf_common::NFQUEUE_TOKEN_MASK,
-            "legacy UDP_DECISION_SEQUENCE has an inconsistent exhausted flag"
+            "UDP_DECISION_SEQUENCE has an inconsistent exhausted flag"
         );
     }
-    sequence.generation = sequence.next >> honk_ebpf_common::UDP_DECISION_GENERATION_SHIFT;
-    sequence.next &= honk_ebpf_common::UDP_DECISION_SEQUENCE_MASK;
-    validate_udp_decision_sequence_value(sequence)?;
-    Ok((sequence, true))
+    Ok(())
 }
 
 fn validate_udp_decision_sequence_fd(fd: RawFd) -> anyhow::Result<UdpDecisionSequence> {
@@ -212,30 +190,24 @@ fn validate_udp_decision_sequence_fd(fd: RawFd) -> anyhow::Result<UdpDecisionSeq
     Ok(sequence)
 }
 
-pub fn validate_pinned_udp_decision_sequence(path: &Path) -> anyhow::Result<bool> {
+pub fn validate_pinned_udp_decision_sequence(path: &Path) -> anyhow::Result<()> {
     let map = aya::maps::MapData::from_pin(path)
         .map_err(|error| anyhow::anyhow!("open persistent map '{}': {error}", path.display()))?;
-    let fd = map.fd().as_fd().as_raw_fd();
-    validate_udp_decision_sequence_info(&raw_map_info(fd)?)?;
-    let (sequence, migrated) =
-        migrate_legacy_udp_decision_sequence(locked_udp_decision_sequence(fd)?)?;
-    if migrated {
-        update_locked_udp_decision_sequence(fd, &sequence)?;
-    }
-    Ok(migrated)
+    validate_udp_decision_sequence_fd(map.fd().as_fd().as_raw_fd()).map(|_| ())
 }
 
 pub fn validate_loaded_udp_decision_sequence(bpf: &Ebpf) -> anyhow::Result<UdpDecisionSequence> {
     validate_udp_decision_sequence_fd(map_fd(bpf, super::super::UDP_DECISION_SEQUENCE_MAP)?)
 }
 
-pub fn read_udp_decision_sequence_locked(bpf: &Ebpf) -> anyhow::Result<UdpDecisionSequence> {
+#[cfg(test)]
+pub(super) fn read_udp_decision_sequence_locked(bpf: &Ebpf) -> anyhow::Result<UdpDecisionSequence> {
     locked_udp_decision_sequence(map_fd(bpf, super::super::UDP_DECISION_SEQUENCE_MAP)?)
 }
 
 pub fn reset_udp_decision_sequence_locked(bpf: &Ebpf, generation: u32) -> anyhow::Result<()> {
     let value = UdpDecisionSequence {
-        generation,
+        next: generation << honk_ebpf_common::UDP_DECISION_GENERATION_SHIFT,
         ..Default::default()
     };
     update_locked_udp_decision_sequence(
@@ -517,50 +489,44 @@ pub fn bpf_update_batch<K: Pod, V: Pod>(
 mod tests {
     use super::*;
     #[test]
-    fn legacy_sequence_values_continue_without_token_reuse() {
-        let current = UdpDecisionSequence {
-            next: 42,
-            generation: 1,
+    fn raw_sequence_value_stays_compatible_with_rollback_allocator() {
+        let mut sequence = UdpDecisionSequence {
+            next: udp_decision_token(1, 42).unwrap(),
             ..UdpDecisionSequence::default()
         };
-        let (unchanged, migrated) = migrate_legacy_udp_decision_sequence(current).unwrap();
-        assert!(!migrated);
-        assert_eq!(unchanged.next, 42);
-        assert_eq!(unchanged.generation, 1);
+        validate_udp_decision_sequence_value(sequence).unwrap();
 
-        let legacy = UdpDecisionSequence {
-            next: (1 << UDP_DECISION_GENERATION_SHIFT) | 42,
-            generation: 0,
-            ..UdpDecisionSequence::default()
-        };
-        let (continued, migrated) = migrate_legacy_udp_decision_sequence(legacy).unwrap();
-        assert!(migrated);
-        assert_eq!(continued.next, 42);
-        assert_eq!(continued.generation, 1);
-        assert_eq!(
-            udp_decision_token(continued.generation, continued.next + 1),
-            Some(legacy.next + 1)
-        );
+        assert_eq!(sequence.exhausted, 0);
+        sequence.next += 1;
+        assert_eq!(sequence.next, udp_decision_token(1, 43).unwrap());
 
         let exhausted = UdpDecisionSequence {
             next: NFQUEUE_TOKEN_MASK,
-            generation: 1,
+            exhausted: 1,
             ..UdpDecisionSequence::default()
         };
-        let (exhausted, migrated) = migrate_legacy_udp_decision_sequence(exhausted).unwrap();
-        assert!(migrated);
-        assert_eq!(exhausted.next, UDP_DECISION_SEQUENCE_MASK);
-        assert_eq!(exhausted.generation, UDP_DECISION_GENERATION_MASK);
+        validate_udp_decision_sequence_value(exhausted).unwrap();
     }
 
     #[test]
-    fn malformed_legacy_sequence_is_rejected() {
-        let inconsistent = UdpDecisionSequence {
-            next: UDP_DECISION_SEQUENCE_MASK + 1,
-            generation: 1,
-            ..UdpDecisionSequence::default()
-        };
-        assert!(migrate_legacy_udp_decision_sequence(inconsistent).is_err());
+    fn malformed_sequence_values_are_rejected() {
+        for malformed in [
+            UdpDecisionSequence {
+                next: NFQUEUE_TOKEN_MASK + 1,
+                ..UdpDecisionSequence::default()
+            },
+            UdpDecisionSequence {
+                exhausted: 2,
+                ..UdpDecisionSequence::default()
+            },
+            UdpDecisionSequence {
+                next: UDP_DECISION_SEQUENCE_MASK,
+                exhausted: 1,
+                ..UdpDecisionSequence::default()
+            },
+        ] {
+            assert!(validate_udp_decision_sequence_value(malformed).is_err());
+        }
     }
 
     #[test]

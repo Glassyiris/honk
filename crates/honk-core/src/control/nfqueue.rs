@@ -12,7 +12,7 @@ use honk_ebpf_common::{
 };
 use honk_nfqueue::{QueuedPacket, VerdictGuard};
 use parking_lot::Mutex;
-use tokio::sync::{Notify, OwnedSemaphorePermit, RwLock, mpsc, watch};
+use tokio::sync::{Notify, OwnedSemaphorePermit, RwLock, Semaphore, mpsc, watch};
 
 use super::connection::build_tuples_key;
 use super::udp_endpoint::{EndpointReservation, OwnedEnqueueError, UdpEndpointPool, UdpInitLease};
@@ -23,6 +23,8 @@ pub(super) const TERMINAL_GRACE: Duration = Duration::from_millis(500);
 pub(super) const WATCHDOG_INTERVAL: Duration = Duration::from_millis(100);
 pub(super) const HARD_HOLD_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_SCHEDULED_CLEANUPS: usize = honk_nfqueue::QUEUE_MAXLEN as usize;
+const MAX_CORRELATOR_FLOWS: usize = honk_nfqueue::QUEUE_MAXLEN as usize;
+const MAX_HELD_VERDICTS_PER_FLOW: usize = 64;
 const IPPROTO_UDP: u8 = 17;
 
 const _: () = {
@@ -222,15 +224,22 @@ impl CellState {
 
 struct FlowCell {
     identity: PendingUdpIdentity,
+    _flow_slot: OwnedSemaphorePermit,
     state: Mutex<CellState>,
     changed: Notify,
 }
 
 impl FlowCell {
-    fn pending(identity: PendingUdpIdentity, started_at: Instant, verdict: HeldVerdict) -> Self {
+    fn pending(
+        identity: PendingUdpIdentity,
+        started_at: Instant,
+        verdict: HeldVerdict,
+        flow_slot: OwnedSemaphorePermit,
+    ) -> Self {
         let mut verdicts = VecDeque::with_capacity(1);
         verdicts.push_back(verdict);
         Self {
+            _flow_slot: flow_slot,
             identity,
             state: Mutex::new(CellState::Pending {
                 started_at,
@@ -242,8 +251,13 @@ impl FlowCell {
         }
     }
 
-    fn terminal(identity: PendingUdpIdentity, state: CellState) -> Self {
+    fn terminal(
+        identity: PendingUdpIdentity,
+        state: CellState,
+        flow_slot: OwnedSemaphorePermit,
+    ) -> Self {
         Self {
+            _flow_slot: flow_slot,
             identity,
             state: Mutex::new(state),
             changed: Notify::new(),
@@ -376,13 +390,15 @@ impl Drop for AdmissionTicket<'_> {
 
 pub(super) struct PendingUdpVerdicts {
     cells: DashMap<FlowKey, Arc<FlowCell>>,
+    flow_slots: Arc<Semaphore>,
     scheduled_cleanups: Mutex<HashSet<CleanupRequest>>,
+    cleanup_drainer: tokio::sync::Mutex<()>,
     admission: AdmissionGate,
     empty: Notify,
     ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
     endpoints: Arc<UdpEndpointPool>,
     stats: Arc<StatsManager>,
-    fatal: mpsc::UnboundedSender<PendingUdpFatal>,
+    fatal: mpsc::Sender<PendingUdpFatal>,
 }
 
 impl PendingUdpVerdicts {
@@ -390,12 +406,14 @@ impl PendingUdpVerdicts {
         ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
         endpoints: Arc<UdpEndpointPool>,
         stats: Arc<StatsManager>,
-    ) -> (Self, mpsc::UnboundedReceiver<PendingUdpFatal>) {
-        let (fatal, receiver) = mpsc::unbounded_channel();
+    ) -> (Self, mpsc::Receiver<PendingUdpFatal>) {
+        let (fatal, receiver) = mpsc::channel(1);
         (
             Self {
                 cells: DashMap::new(),
+                flow_slots: Arc::new(Semaphore::new(MAX_CORRELATOR_FLOWS)),
                 scheduled_cleanups: Mutex::new(HashSet::new()),
+                cleanup_drainer: tokio::sync::Mutex::new(()),
                 admission: AdmissionGate::new(),
                 empty: Notify::new(),
                 ebpf,
@@ -454,6 +472,30 @@ impl PendingUdpVerdicts {
         slow_permit: Option<OwnedSemaphorePermit>,
     ) -> NfqueueIngest {
         self.stats.record_udp_nfqueue_received();
+        let Some(decision_token) = extract_nfqueue_token(packet.mark) else {
+            self.drop_one(held, DropOutcome::Other);
+            return NfqueueIngest::Dropped;
+        };
+        let key = FlowKey::new(packet.tuple.client, packet.tuple.destination);
+        let Some(_admission) = self.admission.try_enter() else {
+            self.schedule_cleanup_for_key(key, decision_token);
+            self.drop_one(held, DropOutcome::Cancel);
+            return NfqueueIngest::Dropped;
+        };
+        if let Some(dashmap::mapref::entry::Entry::Occupied(occupied)) = self.cells.try_entry(key) {
+            let cell = Arc::clone(occupied.get());
+            if !terminal_cell_is_stale(&cell, decision_token, Instant::now()) {
+                drop(occupied);
+                return self.ingest_existing(
+                    cell,
+                    decision_token,
+                    packet.payload,
+                    held,
+                    slow_permit,
+                );
+            }
+        }
+
         let deadline = tokio::time::Instant::from_std(packet.received_at + HARD_HOLD_TIMEOUT);
         let backend = match tokio::time::timeout_at(deadline, self.ebpf.read()).await {
             Ok(backend) => backend,
@@ -462,7 +504,14 @@ impl PendingUdpVerdicts {
                 return NfqueueIngest::Dropped;
             }
         };
-        self.ingest_with_backend(packet, held, slow_permit, backend.as_ref())
+        self.ingest_admitted_with_backend(
+            packet,
+            held,
+            slow_permit,
+            backend.as_ref(),
+            key,
+            decision_token,
+        )
     }
 
     pub(super) fn reject_actor_queue(&self, packet: QueuedPacket, guard: VerdictGuard) {
@@ -491,25 +540,15 @@ impl PendingUdpVerdicts {
         self.drop_one(held, outcome);
     }
 
-    fn ingest_with_backend(
+    fn ingest_admitted_with_backend(
         &self,
         packet: QueuedPacket,
         held: HeldVerdict,
         slow_permit: Option<OwnedSemaphorePermit>,
         backend: &dyn EbpfBackend,
+        key: FlowKey,
+        decision_token: u32,
     ) -> NfqueueIngest {
-        let Some(decision_token) = extract_nfqueue_token(packet.mark) else {
-            self.drop_one(held, DropOutcome::Other);
-            return NfqueueIngest::Dropped;
-        };
-        let key = FlowKey::new(packet.tuple.client, packet.tuple.destination);
-
-        let Some(_admission) = self.admission.try_enter() else {
-            self.schedule_cleanup_for_key(key, decision_token);
-            self.drop_one(held, DropOutcome::Cancel);
-            return NfqueueIngest::Dropped;
-        };
-
         loop {
             let Some(entry) = self.cells.try_entry(key) else {
                 self.schedule_cleanup(CleanupRequest::Token {
@@ -580,6 +619,12 @@ impl PendingUdpVerdicts {
                 cancelling,
                 verdicts,
             } => {
+                if verdicts.len() >= MAX_HELD_VERDICTS_PER_FLOW {
+                    drop(state);
+                    self.stats.record_udp_nfqueue_correlator_full();
+                    self.drop_one(held, DropOutcome::Other);
+                    return NfqueueIngest::Dropped;
+                }
                 if *armed {
                     verdicts.push_back(held);
                     drop(state);
@@ -715,6 +760,18 @@ impl PendingUdpVerdicts {
         backend: &dyn EbpfBackend,
     ) -> NfqueueIngest {
         let key = *vacant.key();
+        let Ok(flow_slot) = Arc::clone(&self.flow_slots).try_acquire_owned() else {
+            drop(vacant);
+            self.stats.record_udp_nfqueue_correlator_full();
+            self.schedule_cleanup(CleanupRequest::Token {
+                key,
+                decision_token,
+            });
+            drop(payload);
+            drop(slow_permit);
+            self.drop_one(held, DropOutcome::Other);
+            return NfqueueIngest::Dropped;
+        };
         let retained = match backend.udp_conn_state_lookup(&key.tuples()) {
             Ok(Some(state)) if state.decision_token == decision_token => retained_state(&state),
             Ok(Some(_)) | Ok(None) => {
@@ -738,7 +795,7 @@ impl PendingUdpVerdicts {
         match retained {
             RetainedState::Pending => {
                 let Some(slow_permit) = slow_permit else {
-                    self.insert_dead_vacant(vacant, key, decision_token);
+                    self.insert_dead_vacant(vacant, key, decision_token, flow_slot);
                     self.schedule_cleanup(CleanupRequest::Token {
                         key,
                         decision_token,
@@ -757,13 +814,18 @@ impl PendingUdpVerdicts {
                 ) {
                     EndpointReservation::Initializing(lease) => {
                         let identity = Self::identity_for_lease(&lease);
-                        let cell = Arc::new(FlowCell::pending(identity, held.received_at, held));
+                        let cell = Arc::new(FlowCell::pending(
+                            identity,
+                            held.received_at,
+                            held,
+                            flow_slot,
+                        ));
                         vacant.insert(cell);
                         self.stats.increment_udp_nfqueue_active_flows();
                         NfqueueIngest::Initialize { lease, identity }
                     }
                     EndpointReservation::IdentityMismatch => {
-                        self.insert_dead_vacant(vacant, key, decision_token);
+                        self.insert_dead_vacant(vacant, key, decision_token, flow_slot);
                         self.stats.record_udp_nfqueue_token_mismatch();
                         self.schedule_cleanup(CleanupRequest::Token {
                             key,
@@ -773,7 +835,7 @@ impl PendingUdpVerdicts {
                         NfqueueIngest::Dropped
                     }
                     EndpointReservation::Enqueued => {
-                        self.insert_dead_vacant(vacant, key, decision_token);
+                        self.insert_dead_vacant(vacant, key, decision_token, flow_slot);
                         self.schedule_cleanup(CleanupRequest::Token {
                             key,
                             decision_token,
@@ -784,7 +846,7 @@ impl PendingUdpVerdicts {
                     EndpointReservation::CapacityRejected
                     | EndpointReservation::QueueFull
                     | EndpointReservation::QueueClosed => {
-                        self.insert_dead_vacant(vacant, key, decision_token);
+                        self.insert_dead_vacant(vacant, key, decision_token, flow_slot);
                         self.schedule_cleanup(CleanupRequest::Token {
                             key,
                             decision_token,
@@ -804,6 +866,7 @@ impl PendingUdpVerdicts {
                         expires_at: Instant::now() + TERMINAL_GRACE,
                         final_mark,
                     },
+                    flow_slot,
                 )));
                 self.stats.increment_udp_nfqueue_active_flows();
                 self.accept_one(held, final_mark);
@@ -825,6 +888,7 @@ impl PendingUdpVerdicts {
                             CellState::Proxy {
                                 expires_at: Instant::now() + TERMINAL_GRACE,
                             },
+                            flow_slot,
                         )));
                         self.stats.increment_udp_nfqueue_active_flows();
                         self.drop_one(held, DropOutcome::Proxy);
@@ -852,6 +916,7 @@ impl PendingUdpVerdicts {
                     CellState::Block {
                         expires_at: Instant::now() + TERMINAL_GRACE,
                     },
+                    flow_slot,
                 )));
                 self.stats.increment_udp_nfqueue_active_flows();
                 self.drop_one(held, DropOutcome::Block);
@@ -955,10 +1020,11 @@ impl PendingUdpVerdicts {
                 self.accept_one_fatal(verdict, final_mark)?;
             }
 
-            let mut backend = self.ebpf.write().await;
+            let mut backend = self.armed_backend_before_deadline(&cell, identity).await?;
             let mut state = cell.state.lock();
             let CellState::Pending {
                 armed: true,
+                started_at,
                 verdicts,
                 ..
             } = &mut *state
@@ -970,6 +1036,12 @@ impl PendingUdpVerdicts {
                 self.signal_fatal(fatal.clone());
                 return Err(fatal.into());
             };
+            if started_at.elapsed() >= HARD_HOLD_TIMEOUT {
+                drop(state);
+                drop(backend);
+                self.fail_armed(&cell, identity);
+                return Err(PendingUdpDecisionError::ArmedInProgress);
+            }
             if !verdicts.is_empty() {
                 drop(state);
                 drop(backend);
@@ -1343,35 +1415,28 @@ impl PendingUdpVerdicts {
     }
 
     async fn drain_scheduled_cleanups(&self) {
+        let _drainer = self.cleanup_drainer.lock().await;
         loop {
-            let request = {
-                let mut requests = self.scheduled_cleanups.lock();
-                let request = requests.iter().next().copied();
-                if let Some(request) = request {
-                    requests.remove(&request);
-                }
-                request
-            };
+            let request = self.scheduled_cleanups.lock().iter().next().copied();
             let Some(request) = request else {
                 self.notify_empty_if_needed();
                 return;
             };
-            match request {
+            let retry = match request {
                 CleanupRequest::Flow(identity) => match self.cancel(identity).await {
-                    Ok(()) | Err(PendingUdpDecisionError::StaleIdentity) => {}
-                    Err(PendingUdpDecisionError::ArmedInProgress) => {
-                        self.schedule_cleanup(request);
-                        return;
-                    }
+                    Ok(()) | Err(PendingUdpDecisionError::StaleIdentity) => false,
+                    Err(PendingUdpDecisionError::ArmedInProgress) => true,
                     Err(PendingUdpDecisionError::ReservedDirectMark) => unreachable!(),
-                    Err(PendingUdpDecisionError::Fatal(_)) => {}
+                    Err(PendingUdpDecisionError::Fatal(_)) => false,
                 },
                 CleanupRequest::Token {
                     key,
                     decision_token,
                 } => {
                     let result = {
-                        let mut backend = self.ebpf.write().await;
+                        let Ok(mut backend) = self.ebpf.try_write() else {
+                            return;
+                        };
                         backend.abort_pending_udp_flow(&key.tuples(), decision_token)
                     };
                     match result {
@@ -1383,7 +1448,42 @@ impl PendingUdpVerdicts {
                             error.to_string(),
                         )),
                     }
+                    false
                 }
+            };
+            if retry {
+                return;
+            }
+            self.scheduled_cleanups.lock().remove(&request);
+            self.notify_empty_if_needed();
+        }
+    }
+
+    async fn armed_backend_before_deadline<'a>(
+        &'a self,
+        cell: &Arc<FlowCell>,
+        identity: PendingUdpIdentity,
+    ) -> Result<tokio::sync::RwLockWriteGuard<'a, Box<dyn EbpfBackend>>, PendingUdpDecisionError>
+    {
+        let deadline = {
+            let state = cell.state.lock();
+            let CellState::Pending {
+                started_at,
+                armed: true,
+                ..
+            } = &*state
+            else {
+                return Err(PendingUdpDecisionError::StaleIdentity);
+            };
+            *started_at + HARD_HOLD_TIMEOUT
+        };
+        match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), self.ebpf.write())
+            .await
+        {
+            Ok(backend) => Ok(backend),
+            Err(_) => {
+                self.fail_armed(cell, identity);
+                Err(PendingUdpDecisionError::ArmedInProgress)
             }
         }
     }
@@ -1467,6 +1567,7 @@ impl PendingUdpVerdicts {
         vacant: dashmap::mapref::entry::VacantEntry<'_, FlowKey, Arc<FlowCell>>,
         key: FlowKey,
         decision_token: u32,
+        flow_slot: OwnedSemaphorePermit,
     ) {
         let identity = PendingUdpIdentity::new(key, decision_token, 0);
         vacant.insert(Arc::new(FlowCell::terminal(
@@ -1474,6 +1575,7 @@ impl PendingUdpVerdicts {
             CellState::Dead {
                 expires_at: Instant::now() + TERMINAL_GRACE,
             },
+            flow_slot,
         )));
         self.stats.increment_udp_nfqueue_active_flows();
     }
@@ -1653,7 +1755,7 @@ impl PendingUdpVerdicts {
     }
 
     fn signal_fatal(&self, fatal: PendingUdpFatal) {
-        let _ = self.fatal.send(fatal);
+        let _ = self.fatal.try_send(fatal);
     }
 
     fn notify_empty_if_needed(&self) {
@@ -1701,6 +1803,10 @@ mod tests {
             token,
             generation,
         )
+    }
+
+    fn test_flow_slot() -> OwnedSemaphorePermit {
+        Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap()
     }
 
     fn retained(token: u32, state: UdpDecisionState, raw: u64) -> ConnState {
@@ -1773,6 +1879,7 @@ mod tests {
             CellState::Dead {
                 expires_at: Instant::now() + TERMINAL_GRACE,
             },
+            test_flow_slot(),
         );
         assert_eq!(cell.identity, exact);
         assert_ne!(cell.identity, identity(12, 3));
@@ -1787,14 +1894,20 @@ mod tests {
             CellState::Dead {
                 expires_at: now + TERMINAL_GRACE,
             },
+            test_flow_slot(),
         );
         assert!(!terminal_cell_is_stale(&terminal, 11, now));
         assert!(terminal_cell_is_stale(&terminal, 12, now));
 
-        let expired = FlowCell::terminal(identity(11, 3), CellState::Dead { expires_at: now });
+        let expired = FlowCell::terminal(
+            identity(11, 3),
+            CellState::Dead { expires_at: now },
+            test_flow_slot(),
+        );
         assert!(terminal_cell_is_stale(&expired, 11, now));
 
         let pending = FlowCell {
+            _flow_slot: test_flow_slot(),
             identity: identity(11, 3),
             state: Mutex::new(CellState::Pending {
                 started_at: now,
@@ -1860,6 +1973,7 @@ mod tests {
             identity,
             Instant::now(),
             HeldVerdict::test(1, Instant::now(), Arc::clone(&sink)),
+            test_flow_slot(),
         ));
         pending.cells.insert(identity.key, Arc::clone(&cell));
 
@@ -1878,7 +1992,7 @@ mod tests {
         identity: PendingUdpIdentity,
         sink: Arc<Mutex<Vec<TestVerdict>>>,
         stats: Arc<StatsManager>,
-        fatal: mpsc::UnboundedReceiver<PendingUdpFatal>,
+        fatal: mpsc::Receiver<PendingUdpFatal>,
     }
 
     fn pending_fixture(token: u32) -> DecisionFixture {
@@ -1926,6 +2040,7 @@ mod tests {
                 identity,
                 Instant::now(),
                 HeldVerdict::test(1, Instant::now(), Arc::clone(&sink)),
+                Arc::clone(&pending.flow_slots).try_acquire_owned().unwrap(),
             )),
         );
         stats.increment_udp_nfqueue_active_flows();
@@ -1974,6 +2089,268 @@ mod tests {
             panic!("armed cell must remain pending until activation");
         };
         assert_eq!(verdicts.len(), 2);
+    }
+
+    #[test]
+    fn armed_direct_verdicts_are_bounded_per_flow() {
+        let fixture = pending_fixture(39);
+        let cell = Arc::clone(
+            fixture
+                .pending
+                .cells
+                .get(&fixture.identity.key)
+                .unwrap()
+                .value(),
+        );
+        {
+            let mut state = cell.state.lock();
+            let CellState::Pending {
+                armed, verdicts, ..
+            } = &mut *state
+            else {
+                panic!("fixture cell must be pending");
+            };
+            *armed = true;
+            for id in 2..=MAX_HELD_VERDICTS_PER_FLOW as u64 {
+                verdicts.push_back(HeldVerdict::test(
+                    id,
+                    Instant::now(),
+                    Arc::clone(&fixture.sink),
+                ));
+            }
+        }
+
+        let result = fixture.pending.ingest_existing(
+            Arc::clone(&cell),
+            fixture.identity.decision_token,
+            bytes::Bytes::from_static(b"bounded armed payload"),
+            HeldVerdict::test(
+                MAX_HELD_VERDICTS_PER_FLOW as u64 + 1,
+                Instant::now(),
+                Arc::clone(&fixture.sink),
+            ),
+            None,
+        );
+
+        assert!(matches!(result, NfqueueIngest::Dropped));
+        assert_eq!(
+            *fixture.sink.lock(),
+            vec![TestVerdict::Drop {
+                id: MAX_HELD_VERDICTS_PER_FLOW as u64 + 1,
+            }]
+        );
+        let state = cell.state.lock();
+        let CellState::Pending { verdicts, .. } = &*state else {
+            panic!("armed cell must remain pending");
+        };
+        assert_eq!(verdicts.len(), MAX_HELD_VERDICTS_PER_FLOW);
+        assert_eq!(fixture.stats.udp_snapshot().nfqueue.correlator_full, 1);
+    }
+
+    #[tokio::test]
+    async fn correlator_flow_slots_fail_closed_at_the_hard_cap() {
+        let token = 40;
+        let key = identity(token, 0).key;
+        let mut mock = crate::ebpf::mock::MockEbpfBackend::new();
+        mock.seed_staged_udp_flow(
+            &key.tuples(),
+            ConnState {
+                state: UdpDecisionState::Pending as u8,
+                decision_token: token,
+                ..ConnState::default()
+            },
+        );
+        let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(mock)));
+        let stats = Arc::new(StatsManager::new());
+        let (pending, _fatal) = PendingUdpVerdicts::new(
+            backend,
+            Arc::new(UdpEndpointPool::new()),
+            Arc::clone(&stats),
+        );
+        pending.open_admission();
+        let _all_slots = Arc::clone(&pending.flow_slots)
+            .try_acquire_many_owned(MAX_CORRELATOR_FLOWS as u32)
+            .unwrap();
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let received_at = Instant::now();
+        let packet = QueuedPacket {
+            tuple: honk_nfqueue::UdpTuple {
+                client: key.client,
+                destination: key.destination,
+            },
+            payload: bytes::Bytes::from_static(b"over capacity"),
+            mark: honk_ebpf_common::pack_nfqueue_mark(token).unwrap(),
+            received_at,
+        };
+
+        let result = pending
+            .ingest_held_wait(
+                packet,
+                HeldVerdict::test(1, received_at, Arc::clone(&sink)),
+                Some(test_flow_slot()),
+            )
+            .await;
+
+        assert!(matches!(result, NfqueueIngest::Dropped));
+        assert_eq!(*sink.lock(), vec![TestVerdict::Drop { id: 1 }]);
+        assert_eq!(stats.udp_snapshot().nfqueue.correlator_full, 1);
+        assert!(
+            pending
+                .scheduled_cleanups
+                .lock()
+                .contains(&CleanupRequest::Token {
+                    key,
+                    decision_token: token,
+                })
+        );
+    }
+
+    #[tokio::test]
+    async fn armed_direct_backend_wait_is_bounded_by_hold_deadline() {
+        let DecisionFixture {
+            pending,
+            backend,
+            mut lease,
+            identity,
+            sink,
+            mut fatal,
+            ..
+        } = pending_fixture(26);
+        let pending = Arc::new(pending);
+        let initial_reader = backend.read().await;
+        let activation_pending = Arc::clone(&pending);
+        let activation = tokio::spawn(async move {
+            activation_pending
+                .activate_direct(identity, &mut lease, 0x1200)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let blocked_backend = Arc::clone(&backend);
+        let (blocked_tx, blocked_rx) = tokio::sync::oneshot::channel();
+        let blocker = tokio::spawn(async move {
+            let _backend = blocked_backend.write().await;
+            let _ = blocked_tx.send(());
+            tokio::time::sleep(HARD_HOLD_TIMEOUT + Duration::from_secs(1)).await;
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        drop(initial_reader);
+        tokio::time::timeout(Duration::from_secs(1), blocked_rx)
+            .await
+            .expect("second backend writer must acquire after ArmDirect")
+            .expect("second backend writer signal");
+        assert_eq!(
+            *sink.lock(),
+            vec![TestVerdict::Accept {
+                id: 1,
+                mark: CLASSIFIED_MARK | 0x1200,
+            }],
+            "the competing writer must acquire between ArmDirect and ActivateDirect"
+        );
+        let cell = Arc::clone(pending.cells.get(&identity.key).unwrap().value());
+        assert!(matches!(
+            pending.ingest_existing(
+                cell,
+                identity.decision_token,
+                bytes::Bytes::from_static(b"armed follower"),
+                HeldVerdict::test(2, Instant::now(), Arc::clone(&sink)),
+                None,
+            ),
+            NfqueueIngest::Queued
+        ));
+
+        assert!(matches!(
+            activation.await.expect("activation task"),
+            Err(PendingUdpDecisionError::ArmedInProgress)
+        ));
+        assert_eq!(
+            *sink.lock(),
+            vec![
+                TestVerdict::Accept {
+                    id: 1,
+                    mark: CLASSIFIED_MARK | 0x1200,
+                },
+                TestVerdict::Drop { id: 2 },
+            ]
+        );
+        let fatal = tokio::time::timeout(Duration::from_secs(1), fatal.recv())
+            .await
+            .expect("armed timeout must report fatal")
+            .expect("armed timeout fatal channel");
+        assert_eq!(fatal.operation, "armed flow cancellation");
+        blocker.abort();
+    }
+
+    #[tokio::test]
+    async fn wait_empty_includes_cleanup_blocked_on_backend() {
+        let identity = identity(27, 0);
+        let mut mock = crate::ebpf::mock::MockEbpfBackend::new();
+        mock.seed_staged_udp_flow(
+            &identity.tuples(),
+            retained(27, UdpDecisionState::Pending, 0),
+        );
+        let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(mock)));
+        let (pending, _fatal) = PendingUdpVerdicts::new(
+            Arc::clone(&backend),
+            Arc::new(UdpEndpointPool::new()),
+            Arc::new(StatsManager::new()),
+        );
+        let pending = Arc::new(pending);
+        pending.schedule_cleanup(CleanupRequest::Token {
+            key: identity.key,
+            decision_token: identity.decision_token,
+        });
+
+        let backend_guard = backend.write().await;
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            pending.drain_scheduled_cleanups(),
+        )
+        .await
+        .expect("contended cleanup must defer without blocking");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), pending.wait_empty())
+                .await
+                .is_err(),
+            "a deferred token abort must keep the generation drain non-empty"
+        );
+        drop(backend_guard);
+        pending.drain_scheduled_cleanups().await;
+        tokio::time::timeout(Duration::from_secs(1), pending.wait_empty())
+            .await
+            .expect("completed token abort must release the generation drain");
+        assert!(
+            backend
+                .read()
+                .await
+                .udp_conn_state_lookup(&identity.tuples())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_token_cleanup_does_not_stall_hold_watchdog() {
+        let fixture = pending_fixture(29);
+        {
+            let cell = fixture.pending.cells.get(&fixture.identity.key).unwrap();
+            let mut state = cell.state.lock();
+            let CellState::Pending { started_at, .. } = &mut *state else {
+                panic!("fixture cell must be pending");
+            };
+            *started_at = Instant::now() - HARD_HOLD_TIMEOUT;
+        }
+        fixture.pending.schedule_cleanup(CleanupRequest::Token {
+            key: fixture.identity.key,
+            decision_token: 30,
+        });
+        let _writer = fixture.backend.write().await;
+
+        tokio::time::timeout(Duration::from_millis(20), fixture.pending.watchdog_tick())
+            .await
+            .expect("contended token cleanup must not stall the hold watchdog");
+
+        assert_eq!(*fixture.sink.lock(), vec![TestVerdict::Drop { id: 1 }]);
     }
 
     #[tokio::test]
@@ -2199,6 +2576,50 @@ mod tests {
         assert_eq!(snapshot.nfqueue.cancel, 1);
         assert_eq!(snapshot.nfqueue.receipt_to_verdict_latency.count, 1);
         drop(writer);
+    }
+
+    #[tokio::test]
+    async fn active_direct_follower_does_not_wait_for_backend() {
+        let fixture = pending_fixture(28);
+        {
+            let cell = fixture.pending.cells.get(&fixture.identity.key).unwrap();
+            *cell.state.lock() = CellState::ActiveDirect {
+                expires_at: Instant::now() + TERMINAL_GRACE,
+                final_mark: CLASSIFIED_MARK | 0x1200,
+            };
+        }
+        fixture.sink.lock().clear();
+        let received_at = Instant::now() - HARD_HOLD_TIMEOUT + Duration::from_millis(50);
+        let packet = QueuedPacket {
+            tuple: honk_nfqueue::UdpTuple {
+                client: fixture.identity.client(),
+                destination: fixture.identity.destination(),
+            },
+            payload: bytes::Bytes::from_static(b"direct follower"),
+            mark: honk_ebpf_common::pack_nfqueue_mark(fixture.identity.decision_token).unwrap(),
+            received_at,
+        };
+        let _writer = fixture.backend.write().await;
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(20),
+            fixture.pending.ingest_held_wait(
+                packet,
+                HeldVerdict::test(2, received_at, Arc::clone(&fixture.sink)),
+                None,
+            ),
+        )
+        .await
+        .expect("known direct flow must bypass backend lookup");
+
+        assert!(matches!(result, NfqueueIngest::Queued));
+        assert_eq!(
+            *fixture.sink.lock(),
+            vec![TestVerdict::Accept {
+                id: 2,
+                mark: CLASSIFIED_MARK | 0x1200,
+            }]
+        );
     }
     #[tokio::test]
     async fn transition_write_lock_respects_original_packet_deadline() {

@@ -454,6 +454,7 @@ impl ControlPlane {
             self.drain_tracker.start_rejecting();
             return false;
         }
+        self.open_pending_udp_admission();
         if let Err(error) = datapath_flags.reopen_nfqueue().await {
             error!(%error, "failed to reopen NFQUEUE after reload");
             self.close_and_drain_pending_udp_admission().await;
@@ -463,7 +464,6 @@ impl ControlPlane {
             self.drain_tracker.start_rejecting();
             return false;
         }
-        self.open_pending_udp_admission();
         info!("Configuration applied — {} routes active", route_count);
 
         self.stop_reload_rejection_if_healthy(drain);
@@ -489,6 +489,7 @@ impl ControlPlane {
             self.drain_tracker.start_rejecting();
             return;
         }
+        self.open_pending_udp_admission();
         if let Err(error) = datapath_flags.reopen_nfqueue().await {
             error!(%error, "failed to reopen NFQUEUE after rejected reload");
             self.close_and_drain_pending_udp_admission().await;
@@ -498,7 +499,6 @@ impl ControlPlane {
             self.drain_tracker.start_rejecting();
             return;
         }
-        self.open_pending_udp_admission();
         drain.stop_rejecting();
     }
 
