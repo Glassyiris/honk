@@ -62,6 +62,46 @@ async fn link_lifecycle_holds_links_and_rebinds_primary_wan() {
     )
     .await
     .expect("backend load");
+    let sequence_map_id = aya::maps::MapInfo::from_pin(pin_root.join(UDP_DECISION_SEQUENCE_MAP))
+        .expect("initial sequence map info")
+        .id();
+
+    let staged_key = TuplesKey::default();
+    backend
+        .udp_conn_state_store(
+            &staged_key,
+            &ConnState {
+                state: UdpDecisionState::Pending as u8,
+                decision_token: 42,
+                ..ConnState::default()
+            },
+        )
+        .expect("seed newer staged token");
+    assert_eq!(
+        backend
+            .remove_udp_flow(&staged_key, 41)
+            .expect("stale retirement result"),
+        UdpDecisionCommitResult::TokenMismatch
+    );
+    assert_eq!(
+        backend
+            .udp_conn_state_lookup(&staged_key)
+            .expect("newer staged lookup")
+            .expect("newer staged state retained")
+            .decision_token,
+        42,
+        "stale cleanup must not overwrite or delete the newer token"
+    );
+    assert!(
+        backend
+            .hash_lookup::<_, u32>(UDP_DECISION_RETIRE_FENCE_MAP, &staged_key)
+            .expect("retirement fence lookup")
+            .is_none(),
+        "completed stale cleanup must release its exact fence"
+    );
+    backend
+        .udp_conn_state_remove(&staged_key)
+        .expect("remove staged test state");
 
     // 6 cgroup links + wan_ingress/wan_egress on lo.
     let held = held_bpf_link_count();
@@ -109,6 +149,32 @@ async fn link_lifecycle_holds_links_and_rebinds_primary_wan() {
         "detach_hooks must detach the cgroup programs"
     );
     backend.cleanup().await.expect("cleanup");
+    assert!(
+        pin_root.join(UDP_DECISION_SEQUENCE_MAP).exists(),
+        "ordinary cleanup must preserve the token allocator pin"
+    );
+    let mut reloaded = RealEbpfBackend::load(
+        crate::DEFAULT_BPF_OBJECT,
+        &pin_root,
+        12345,
+        0x0800_0000,
+        None,
+        "lo",
+        false,
+    )
+    .await
+    .expect("backend reload");
+    assert_eq!(
+        aya::maps::MapInfo::from_pin(pin_root.join(UDP_DECISION_SEQUENCE_MAP))
+            .expect("reloaded sequence map info")
+            .id(),
+        sequence_map_id,
+        "backend reload must reuse the exact pinned allocator map"
+    );
+    reloaded.cleanup().await.expect("reload cleanup");
+    std::fs::remove_file(pin_root.join(UDP_DECISION_SEQUENCE_MAP))
+        .expect("remove test allocator pin");
+    std::fs::remove_dir(&pin_root).expect("remove test pin root");
 }
 
 #[test]

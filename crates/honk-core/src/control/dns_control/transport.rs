@@ -4,7 +4,7 @@ use crate::dns::response::build_dns_refused;
 use crate::dns::transport::{read_length_prefixed_into, write_length_prefixed};
 use std::net::SocketAddr;
 use std::time::Duration;
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::TcpStream;
 use tracing::debug;
 
 pub(super) const TCP_DNS_IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -13,7 +13,6 @@ impl DnsController {
     /// Handle a UDP DNS query from TPROXY.
     pub async fn handle_udp_dns(
         &self,
-        _udp_socket: &UdpSocket,
         data: &[u8],
         client_addr: SocketAddr,
         original_dst: SocketAddr,

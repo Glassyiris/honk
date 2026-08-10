@@ -17,7 +17,7 @@ use honk_core::connection_tracker::{ConnectionEntry, ConnectionTracker};
 use honk_core::dns::cache::DnsCache;
 use honk_core::dns::forwarder::{DnsForwarder, DnsUpstreamPool, build_dns_query};
 use honk_core::dns::routing::DnsRouter;
-use honk_core::mode::ModeState;
+use honk_core::mode::{DatapathFlagsHandle, ModeState};
 use honk_core::stats::StatsManager;
 use honk_outbound::alive::{AliveDialerSet, IpVersion, ProbeDomain};
 use honk_outbound::group::GroupManager;
@@ -161,6 +161,12 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
     let ebpf_datapath_flags_writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut mock_ebpf = honk_core::ebpf::mock::MockEbpfBackend::new();
     mock_ebpf.datapath_flags_writes = ebpf_datapath_flags_writes.clone();
+    let mode_state = Arc::new(parking_lot::RwLock::new(ModeState::new("Rule", "proxy")));
+    let ebpf: Arc<tokio::sync::RwLock<Box<dyn honk_core::ebpf::EbpfBackend>>> =
+        Arc::new(tokio::sync::RwLock::new(Box::new(mock_ebpf)));
+    let datapath_flags =
+        DatapathFlagsHandle::new(ebpf, Arc::clone(&mode_state), Some(Arc::clone(&db)));
+    datapath_flags.initialize(0, false, false).await.unwrap();
     let state = Arc::new(ClashState {
         config: Arc::new(tokio::sync::RwLock::new(config)),
         stats: stats.clone(),
@@ -170,11 +176,8 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
         connection_tracker: connection_tracker.clone(),
         proxy_registry: Arc::new(ProxyRegistry::default_resolver().unwrap()),
         runtime_registry,
-        mode_state: Arc::new(parking_lot::RwLock::new(ModeState::new("Rule", "proxy"))),
-        ebpf: Arc::new(tokio::sync::RwLock::new(
-            Box::new(mock_ebpf) as Box<dyn honk_core::ebpf::EbpfBackend>
-        )),
-        direct_offload_static: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        mode_state,
+        datapath_flags,
         secret: secret.to_string(),
         external_ui: external_ui.to_string(),
         router: Arc::new(tokio::sync::RwLock::new(traffic_router)),
@@ -641,7 +644,7 @@ async fn test_mode_switch_updates_datapath_flags() {
     };
 
     let writes = || app.ebpf_datapath_flags_writes.lock().unwrap().clone();
-    assert_eq!(writes(), Vec::<u32>::new());
+    assert_eq!(writes(), vec![OFFLOAD_RULE]);
 
     for (mode, expect_flags) in [
         ("global", 0),
@@ -657,7 +660,7 @@ async fn test_mode_switch_updates_datapath_flags() {
         assert_eq!(resp.status(), 204);
         assert_eq!(writes().last().copied(), Some(expect_flags));
     }
-    assert_eq!(writes(), vec![0, OFFLOAD_ALL, OFFLOAD_RULE]);
+    assert_eq!(writes(), vec![OFFLOAD_RULE, 0, OFFLOAD_ALL, OFFLOAD_RULE]);
 
     // An invalid mode must not touch the datapath flags.
     let resp = client
@@ -667,7 +670,7 @@ async fn test_mode_switch_updates_datapath_flags() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 400);
-    assert_eq!(writes(), vec![0, OFFLOAD_ALL, OFFLOAD_RULE]);
+    assert_eq!(writes(), vec![OFFLOAD_RULE, 0, OFFLOAD_ALL, OFFLOAD_RULE]);
 }
 
 #[tokio::test]
@@ -1268,8 +1271,7 @@ async fn test_dns_query_upstream_and_nxdomain() {
         proxy_registry: app.state.proxy_registry.clone(),
         runtime_registry: app.state.runtime_registry.clone(),
         mode_state: app.state.mode_state.clone(),
-        ebpf: app.state.ebpf.clone(),
-        direct_offload_static: app.state.direct_offload_static.clone(),
+        datapath_flags: app.state.datapath_flags.clone(),
         secret: String::new(),
         external_ui: String::new(),
         router: app.state.router.clone(),
@@ -1446,6 +1448,27 @@ async fn stats_exposes_udp_metrics() {
     let app = spawn_app("", "").await;
     app.state.stats.record_udp_endpoint_hit();
     app.state.stats.record_udp_slow_permit_accepted();
+    app.state.stats.record_udp_nfqueue_received();
+    app.state.stats.increment_udp_nfqueue_active_flows();
+    app.state
+        .stats
+        .record_udp_nfqueue_direct_accepted(Duration::from_millis(1));
+    app.state.stats.record_udp_nfqueue_proxy_copied();
+    app.state
+        .stats
+        .record_udp_nfqueue_proxy_dropped(Duration::from_millis(2));
+    app.state
+        .stats
+        .record_udp_nfqueue_block(Duration::from_millis(3));
+    app.state
+        .stats
+        .record_udp_nfqueue_cancel(Duration::from_millis(4));
+    app.state
+        .stats
+        .record_udp_nfqueue_drop(Duration::from_millis(5));
+    app.state.stats.record_udp_nfqueue_token_mismatch();
+    app.state.stats.record_udp_nfqueue_token_exhaustion();
+    app.state.stats.record_udp_nfqueue_verdict_error();
 
     let body: serde_json::Value = http_client()
         .get(app.url("/stats"))
@@ -1483,6 +1506,20 @@ async fn stats_exposes_udp_metrics() {
     assert_eq!(udp["warm"]["attempts"], 0);
     assert_eq!(udp["warm"]["successes"], 0);
     assert_eq!(udp["warm"]["failures"], 0);
+
+    let nfqueue = &udp["nfqueue"];
+    assert_eq!(nfqueue["received"], 1);
+    assert_eq!(nfqueue["activeFlows"], 1);
+    assert_eq!(nfqueue["directAccepted"], 1);
+    assert_eq!(nfqueue["proxyCopied"], 1);
+    assert_eq!(nfqueue["proxyDropped"], 1);
+    assert_eq!(nfqueue["block"], 1);
+    assert_eq!(nfqueue["cancel"], 1);
+    assert_eq!(nfqueue["drop"], 1);
+    assert_eq!(nfqueue["tokenMismatch"], 1);
+    assert_eq!(nfqueue["tokenExhaustion"], 1);
+    assert_eq!(nfqueue["verdictErrors"], 1);
+    assert_eq!(nfqueue["receiptToVerdict"]["count"], 5);
 
     // Top-level warm gauges: nodes by reason and per-protocol retained
     // sessions/clients, all zero before any warm-up runs.

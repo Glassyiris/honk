@@ -310,12 +310,26 @@ fn acquire_instance_lock(
     }
 }
 
+fn validate_udp_nfqueue_runtime(enabled: bool, mock_ebpf: bool) -> anyhow::Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+    if mock_ebpf {
+        anyhow::bail!("experimental.udp_nfqueue requires the real eBPF backend");
+    }
+    #[cfg(not(feature = "ebpf"))]
+    anyhow::bail!("experimental.udp_nfqueue requires a build with the ebpf feature");
+    #[cfg(feature = "ebpf")]
+    Ok(())
+}
+
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // Load the configuration before initializing logging so `log_level` in
     // the config file is honored (previously only --debug/RUST_LOG had any
     // effect and config log_level was silently ignored).
     let mut config = Config::from_file(cli.config.to_str().unwrap())?;
     config.validate()?;
+    validate_udp_nfqueue_runtime(config.experimental.udp_nfqueue.enabled, cli.mock_ebpf)?;
     honk_config::paths::set_data_dir(PathBuf::from(&config.global.data_dir)).map_err(
         |requested| {
             anyhow::anyhow!(
@@ -887,100 +901,96 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // wires change persistence into the group manager.
     control_plane.init_cache_db(cli.config.parent()).await;
 
+    #[cfg(feature = "clash-api")]
+    let clash_cfg = control_plane
+        .config_handle()
+        .read()
+        .await
+        .experimental
+        .clash_api
+        .clone();
+    let cache_db = control_plane.cache_db();
+    #[cfg(feature = "clash-api")]
+    let mode = cache_db
+        .as_ref()
+        .and_then(|db| db.load_clash_mode())
+        .and_then(|mode| mode::ModeState::normalize(&mode))
+        .or_else(|| mode::ModeState::normalize(&clash_cfg.default_mode))
+        .unwrap_or_else(|| "Rule".to_string());
+    #[cfg(not(feature = "clash-api"))]
+    let mode = "Rule".to_string();
+    let default_selection = {
+        let config = control_plane.config_handle();
+        let config = config.read().await;
+        config
+            .groups
+            .first()
+            .map(|group| group.name.clone())
+            .unwrap_or_else(|| "Proxy".to_string())
+    };
+    let global_selection = cache_db
+        .as_ref()
+        .and_then(|db| db.load_selector_choice("GLOBAL"))
+        .unwrap_or(default_selection);
+    let mode_state: mode::SharedModeState = std::sync::Arc::new(parking_lot::RwLock::new(
+        mode::ModeState::new(&mode, global_selection),
+    ));
+    control_plane.set_mode_state(mode_state.clone());
+    control_plane.start_datapath_flags_coordinator()?;
+
     // Starts only when external_controller is configured; bind/parse
     // failures are logged and never abort startup.
     #[cfg(feature = "clash-api")]
-    {
-        let clash_cfg = control_plane
-            .config_handle()
-            .read()
-            .await
-            .experimental
-            .clash_api
-            .clone();
-        if !clash_cfg.external_controller.is_empty() {
-            let external_ui = if clash_cfg.external_ui.is_empty() {
-                String::new()
-            } else {
-                honk_config::paths::resolve_dependency_path(&clash_cfg.external_ui)
-                    .to_string_lossy()
-                    .into_owned()
-            };
-            // Restore persisted clash mode and GLOBAL selection from
-            // cache.db; fall back to the configured defaults.
-            let cache_db = control_plane.cache_db();
-            let mode = cache_db
-                .as_ref()
-                .and_then(|db| db.load_clash_mode())
-                .and_then(|m| mode::ModeState::normalize(&m))
-                .or_else(|| mode::ModeState::normalize(&clash_cfg.default_mode))
-                .unwrap_or_else(|| "Rule".to_string());
-            let default_selection = {
-                let config = control_plane.config_handle();
-                let config = config.read().await;
-                config
-                    .groups
-                    .first()
-                    .map(|g| g.name.clone())
-                    .unwrap_or_else(|| "Proxy".to_string())
-            };
-            let global_selection = cache_db
-                .as_ref()
-                .and_then(|db| db.load_selector_choice("GLOBAL"))
-                .unwrap_or(default_selection);
-            let mode_state: mode::SharedModeState = std::sync::Arc::new(parking_lot::RwLock::new(
-                mode::ModeState::new(&mode, global_selection),
-            ));
-            control_plane.set_mode_state(mode_state.clone());
-
-            // Accept "host:port"; a bare ":port" listens on all interfaces.
-            let listen_str = if clash_cfg.external_controller.starts_with(':') {
-                format!("0.0.0.0{}", clash_cfg.external_controller)
-            } else {
-                clash_cfg.external_controller.clone()
-            };
-            match listen_str.parse::<std::net::SocketAddr>() {
-                Ok(listen) => {
-                    let stream_samplers = std::sync::Arc::new(clash_api::StreamSamplers::new());
-                    let state = std::sync::Arc::new(clash_api::ClashState {
-                        config: control_plane.config_handle(),
-                        stats: control_plane.stats_handle(),
-                        alive_set: control_plane.alive_set(),
-                        group_manager: control_plane.group_manager(),
-                        cache_db: control_plane.cache_db(),
-                        connection_tracker: control_plane.connection_tracker(),
-                        proxy_registry: control_plane.proxy_registry(),
-                        runtime_registry: control_plane.runtime_registry(),
-                        mode_state,
-                        ebpf: control_plane.ebpf_handle(),
-                        direct_offload_static: control_plane.direct_offload_static_handle(),
-                        secret: clash_cfg.secret.clone(),
-                        connection_pool: control_plane.connection_pool(),
-                        external_ui,
-                        router: control_plane.traffic_router(),
-                        log_handle: clash_log_handle.clone(),
-                        dns_service: control_plane.dns_service(),
-                        stream_samplers,
-                    });
-                    tokio::spawn(clash_api::serve(state, listen));
-                }
-                Err(e) => {
-                    warn!(
-                        "invalid clash_api external_controller '{}': {}",
-                        clash_cfg.external_controller, e
-                    );
-                }
+    if !clash_cfg.external_controller.is_empty() {
+        let external_ui = if clash_cfg.external_ui.is_empty() {
+            String::new()
+        } else {
+            honk_config::paths::resolve_dependency_path(&clash_cfg.external_ui)
+                .to_string_lossy()
+                .into_owned()
+        };
+        // Accept "host:port"; a bare ":port" listens on all interfaces.
+        let listen_str = if clash_cfg.external_controller.starts_with(':') {
+            format!("0.0.0.0{}", clash_cfg.external_controller)
+        } else {
+            clash_cfg.external_controller.clone()
+        };
+        match listen_str.parse::<std::net::SocketAddr>() {
+            Ok(listen) => {
+                let stream_samplers = std::sync::Arc::new(clash_api::StreamSamplers::new());
+                let state = std::sync::Arc::new(clash_api::ClashState {
+                    config: control_plane.config_handle(),
+                    stats: control_plane.stats_handle(),
+                    alive_set: control_plane.alive_set(),
+                    group_manager: control_plane.group_manager(),
+                    cache_db: control_plane.cache_db(),
+                    connection_tracker: control_plane.connection_tracker(),
+                    proxy_registry: control_plane.proxy_registry(),
+                    runtime_registry: control_plane.runtime_registry(),
+                    mode_state,
+                    datapath_flags: control_plane
+                        .datapath_flags_handle()
+                        .expect("datapath flags writer started above"),
+                    secret: clash_cfg.secret.clone(),
+                    connection_pool: control_plane.connection_pool(),
+                    external_ui,
+                    router: control_plane.traffic_router(),
+                    log_handle: clash_log_handle.clone(),
+                    dns_service: control_plane.dns_service(),
+                    stream_samplers,
+                });
+                tokio::spawn(clash_api::serve(state, listen));
+            }
+            Err(error) => {
+                warn!(
+                    "invalid clash_api external_controller '{}': {}",
+                    clash_cfg.external_controller, error
+                );
             }
         }
     }
 
-    info!("Control plane ready, starting accept loop");
-
-    // Signal systemd that the service is ready (Type=notify / NotifyAccess=all)
-    #[cfg(target_os = "linux")]
-    if let Err(e) = libsystemd::daemon::notify(false, &[libsystemd::daemon::NotifyState::Ready]) {
-        warn!("sd_notify failed: {}", e);
-    }
+    info!("Starting control plane listeners and accept loop");
 
     let cmd_tx = control_plane.command_sender();
 
@@ -1249,7 +1259,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     });
 
     info!("honk-core is running. Press Ctrl+C to stop.");
-    control_plane.run().await?;
+    let control_result = control_plane.run().await;
 
     // Signal systemd that we're stopping (Type=notify)
     #[cfg(target_os = "linux")]
@@ -1262,7 +1272,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     }
     info!("honk-core stopped");
 
-    Ok(())
+    control_result
 }
 
 #[cfg(feature = "ebpf")]
@@ -1832,4 +1842,28 @@ fn is_mountpoint(path: &str) -> bool {
     std::fs::read_to_string("/proc/mounts")
         .map(|m| m.lines().any(|l| l.split_whitespace().nth(1) == Some(path)))
         .unwrap_or(false)
+}
+#[cfg(test)]
+mod startup_lifecycle_tests {
+    use super::validate_udp_nfqueue_runtime;
+
+    #[test]
+    fn udp_nfqueue_rejects_mock_backend() {
+        assert!(validate_udp_nfqueue_runtime(true, true).is_err());
+        assert!(validate_udp_nfqueue_runtime(false, true).is_ok());
+    }
+
+    #[cfg(not(feature = "ebpf"))]
+    #[test]
+    fn udp_nfqueue_rejects_build_without_ebpf() {
+        assert!(validate_udp_nfqueue_runtime(true, false).is_err());
+    }
+
+    #[test]
+    fn config_reserved_mark_mask_matches_datapath_abi() {
+        assert_eq!(
+            honk_config::routing::DATAPATH_RESERVED_MARK_MASK,
+            honk_ebpf_common::SKB_MARK_RESERVED_MASK,
+        );
+    }
 }

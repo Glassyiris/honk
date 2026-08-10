@@ -10,6 +10,11 @@ use async_trait::async_trait;
 use honk_ebpf_common::*;
 use std::sync::atomic::AtomicU64;
 
+pub const UDP_DECISION_SEQUENCE_MAP: &str = "UDP_DECISION_SEQUENCE";
+pub const UDP_DECISION_EPOCH_MAP: &str = "UDP_DECISION_EPOCH";
+pub const UDP_DECISION_INFLIGHT_MAP: &str = "UDP_DECISION_INFLIGHT";
+pub const UDP_DECISION_RETIRE_FENCE_MAP: &str = "UDP_DECISION_RETIRE_FENCE";
+
 /// Cumulative conn-state entries deleted by userspace (TCP relay teardown,
 /// UDP endpoint reaper), for the janitor's occupancy gauge.  eBPF-side
 /// inserts/deletes are counted by the `CONN_STATE_OCCUPANCY` map; deletions
@@ -77,6 +82,114 @@ pub enum RoutingPushPhase {
     MacLpm,
     Meta,
     PruneLpm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UdpDecisionTransition {
+    ArmDirect(u32),
+    ActivateDirect(u32),
+    ActivateProxy(u8, u32),
+    Block,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UdpDecisionCommitResult {
+    Applied,
+    Missing,
+    TokenMismatch,
+    StateMismatch,
+}
+
+pub(crate) fn validate_udp_decision_transition(
+    transition: UdpDecisionTransition,
+) -> anyhow::Result<()> {
+    let mark = match transition {
+        UdpDecisionTransition::ArmDirect(mark)
+        | UdpDecisionTransition::ActivateDirect(mark)
+        | UdpDecisionTransition::ActivateProxy(_, mark) => mark,
+        UdpDecisionTransition::Block => return Ok(()),
+    };
+    anyhow::ensure!(
+        !skb_mark_has_reserved_bits(mark),
+        "UDP decision rule mark contains reserved skb bits: 0x{mark:08x}"
+    );
+    Ok(())
+}
+
+fn final_udp_meta(previous: RoutingMeta, outbound: u8, mark: u32, offload: bool) -> RoutingMeta {
+    const DSCP_MASK: u64 = 0xff << 48;
+    let preserved = unsafe { previous.raw } & (DSCP_MASK | ROUTING_META_FLAG_PUBLISHED);
+    let flags = if offload {
+        ROUTING_META_FLAG_OFFLOAD
+    } else {
+        0
+    };
+    RoutingMeta {
+        raw: preserved | outbound as u64 | ((mark as u64) << 8) | flags,
+    }
+}
+
+pub(crate) fn apply_udp_decision_transition(
+    state: &mut ConnState,
+    transition: UdpDecisionTransition,
+) -> Result<(), UdpDecisionCommitResult> {
+    let expected = match transition {
+        UdpDecisionTransition::ActivateDirect(_) => UdpDecisionState::DirectArmed,
+        UdpDecisionTransition::ArmDirect(_)
+        | UdpDecisionTransition::ActivateProxy(_, _)
+        | UdpDecisionTransition::Block => UdpDecisionState::Pending,
+    };
+    if state.state != expected as u8 {
+        return Err(UdpDecisionCommitResult::StateMismatch);
+    }
+    if let UdpDecisionTransition::ActivateDirect(mark) = transition {
+        let raw = unsafe { state.meta.raw };
+        let armed_mark = ((raw >> 8) & 0xffff_ffff) as u32;
+        if raw & 0xff != OutboundIndex::Direct as u64
+            || armed_mark != mark
+            || raw & ROUTING_META_FLAG_OFFLOAD != 0
+        {
+            return Err(UdpDecisionCommitResult::StateMismatch);
+        }
+    }
+    match transition {
+        UdpDecisionTransition::ArmDirect(mark) => {
+            state.state = UdpDecisionState::DirectArmed as u8;
+            state.meta = final_udp_meta(state.meta, OutboundIndex::Direct as u8, mark, false);
+        }
+        UdpDecisionTransition::ActivateDirect(mark) => {
+            state.state = UdpDecisionState::None as u8;
+            state.meta = final_udp_meta(state.meta, OutboundIndex::Direct as u8, mark, true);
+        }
+        UdpDecisionTransition::ActivateProxy(outbound, mark) => {
+            state.state = UdpDecisionState::Proxy as u8;
+            state.meta = final_udp_meta(state.meta, outbound, mark, false);
+        }
+        UdpDecisionTransition::Block => {
+            state.state = UdpDecisionState::Block as u8;
+            state.meta = final_udp_meta(state.meta, OutboundIndex::Block as u8, 0, false);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn udp_state_is_userspace_owned(state: u8) -> bool {
+    state == UdpDecisionState::Preparing as u8
+        || state == UdpDecisionState::Pending as u8
+        || state == UdpDecisionState::Proxy as u8
+}
+
+pub(crate) fn udp_state_is_legacy_userspace_owned(state: &ConnState) -> bool {
+    if state.decision_token != 0 || state.state != UdpDecisionState::None as u8 {
+        return false;
+    }
+    let raw = unsafe { state.meta.raw };
+    if raw & ROUTING_META_FLAG_PUBLISHED == 0 || raw & ROUTING_META_FLAG_OFFLOAD != 0 {
+        return false;
+    }
+    let outbound = (raw & 0xff) as u8;
+    let must = ((raw >> 40) & 1) != 0;
+    outbound != OutboundIndex::Block as u8 && !(outbound == OutboundIndex::Direct as u8 && must)
 }
 
 #[cfg(test)]
@@ -189,6 +302,14 @@ pub trait EbpfBackend: Send + Sync {
     /// write takes effect for new flows only — established flows keep the
     /// decision they were created with.
     fn set_datapath_flags(&mut self, _flags: u32) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// After READY has been cleared, wait for every kernel invocation that
+    /// observed the prior fence to finish, then remove all unpublished or
+    /// pending staged states. Delayed NFQUEUE deliveries therefore fail
+    /// token lookup instead of crossing a runtime-generation boundary.
+    fn quiesce_udp_staging(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -393,35 +514,45 @@ pub trait EbpfBackend: Send + Sync {
         Ok(keys.len())
     }
 
-    /// UDP post-decision offload: rewrite the flow's published conn_state
-    /// routing meta to an offloaded direct decision
-    /// (`RoutingMeta::set_offloaded_direct`), so the `lan_ingress`
-    /// established-UDP path passes subsequent packets straight through the
-    /// kernel.  Called by the control plane only after its decision for the
-    /// flow has fully converged to `direct` — never during endpoint
-    /// initialization or cold-URLTest staggering, and never for a proxied
-    /// or port-53 flow.
-    ///
-    /// Returns `Ok(false)` when the flow has no published conn_state
-    /// (already swept, or never conntracked); the flow then simply stays on
-    /// the userspace datapath.  The read-modify-write races only with the
-    /// datapath's throttled `last_seen_ns` refresh, which may be rolled
-    /// back by a few seconds at worst — established packets never
-    /// republish the meta.
-    fn offload_udp_flow(&mut self, key: &TuplesKey) -> anyhow::Result<bool> {
-        let Some(mut state) = self.udp_conn_state_lookup(key)? else {
-            return Ok(false);
-        };
-        if !state.meta.is_published() {
-            return Ok(false);
-        }
-        if unsafe { state.meta.raw } & ROUTING_META_FLAG_OFFLOAD != 0 {
-            return Ok(true);
-        }
-        state.meta.set_offloaded_direct();
-        self.udp_conn_state_store(key, &state)?;
-        Ok(true)
-    }
+    /// Publish one token-bound UDP decision transition. The caller holds the
+    /// backend write lock; implementations validate the state incarnation and
+    /// every auxiliary entry before changing any map.
+    fn commit_udp_decision(
+        &mut self,
+        key: &TuplesKey,
+        token: u32,
+        transition: UdpDecisionTransition,
+    ) -> anyhow::Result<UdpDecisionCommitResult>;
+
+    /// Fail a staged flow closed without touching a later tuple incarnation.
+    fn abort_pending_udp_flow(
+        &mut self,
+        key: &TuplesKey,
+        token: u32,
+    ) -> anyhow::Result<UdpDecisionCommitResult>;
+
+    /// Retire a userspace-owned flow. Nonzero tokens remove only the matching
+    /// staged/proxy incarnation and auxiliaries; zero removes only a legacy
+    /// published, non-offloaded forward state. Kernel handoffs are retained.
+    fn remove_udp_flow(
+        &mut self,
+        key: &TuplesKey,
+        token: u32,
+    ) -> anyhow::Result<UdpDecisionCommitResult>;
+
+    /// Validate the persistent allocator map before NFQUEUE admission opens.
+    fn verify_udp_decision_sequence(&self) -> anyhow::Result<()>;
+
+    /// Lossless allocator-exhaustion backstop. Real backends must use a
+    /// `BPF_F_LOCK` lookup so the embedded spin lock is never copied.
+    fn udp_decision_sequence_exhausted(&self) -> anyhow::Result<bool>;
+
+    /// Inspect a staged handoff without consuming it. UDP decision commit owns
+    /// the token-checked removal; legacy consumers may still use `take`.
+    fn routing_handoff_lookup(
+        &self,
+        key: &TuplesKey,
+    ) -> anyhow::Result<Option<RoutingHandoffEntry>>;
 
     fn redirect_track_lookup(&self, key: &RedirectTuple) -> anyhow::Result<Option<RedirectEntry>>;
     fn redirect_track_store(

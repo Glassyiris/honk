@@ -57,7 +57,7 @@ group          # 节点/嵌套组的选择策略
 routing        # 有序流量规则 + fallback
 dns            # 上游、DNS 路由、缓存
 subscription   # 远程节点列表
-experimental   # clash_api、cache_file
+experimental   # clash_api、cache_file、udp_nfqueue
 ```
 
 内置：
@@ -156,6 +156,9 @@ experimental {
         enabled: true
         path: 'cache.db'
         store_dns: true
+    }
+    udp_nfqueue {
+        enabled: false
     }
 }
 ```
@@ -474,6 +477,45 @@ packet handler。
 
 ## 11. Experimental
 
+### 首包保留 UDP NFQUEUE
+
+```dae
+experimental {
+    udp_nfqueue {
+        enabled: true
+    }
+}
+```
+
+`enabled` 是唯一设置，默认 `false`。修改
+`experimental.udp_nfqueue.enabled` 后必须重启；SIGHUP 重载会拒绝该变化。
+启用时必须使用带 `ebpf` feature 的构建和真实 eBPF 后端。不带 `ebpf` 的构建或
+使用 `--mock-ebpf` 的运行会在启动时被拒绝，不会静默回退。
+
+该路径**仅覆盖 LAN 转发 UDP**：主机的 `inet prerouting` 位于 LAN TC 暂存点之后；
+本机发起的 WAN 出口流量仍走规范 TPROXY 路径。53 端口、内部/特殊流量、`must`、
+`block`、反向流量以及已经可以安全地在路由时直连的决策均被排除。只有在用户态路由或
+域名/QUIC 检查后仍可能改判的歧义决策才会暂存。
+
+honk 通过 raw netlink 绑定唯一且固定的 NFQUEUE `320`，不启用 bypass、fanout 或
+fail-open。它拥有名称精确为 `inet honk_nfqueue` / `udp_decision` 的 nftables 表与链。
+honk 运行期间，同一网络命名空间中的防火墙管理器不得 flush、替换或修改任一对象。
+eBPF `UDP_DECISION_SEQUENCE` pin 会跨普通重启和清理保留，确保旧 skb 或任务仍可能
+存在时不会复用 token；耗尽后必须重启操作系统。
+
+原始 skb 在 conntrack/NAT 之前被保留。Direct 执行 token 校验的
+Arm → 按 FIFO 以最终 mark `NF_ACCEPT` → Activate，不创建用户态直连 socket、
+payload 副本、endpoint、connection 条目，也不故意触发重传。Proxy 提交 token 绑定
+状态，把唯一的保留 payload 副本转交给现有 UDP 初始化器，丢弃原始 skb，并且只
+拨号/发送一次。Block 和取消会丢弃原始 skb。重载与关闭先清除 readiness，静默并取消
+待定所有权，再拆除队列及自有表。队列、listener、verdict 错误和 token 耗尽均为致命
+错误，不会 fail-open。
+
+启用 Clash API 后，`GET /stats` 暴露固定对象 `/stats.udp.nfqueue`（点路径，不是
+独立路由）：`received`、`activeFlows`、`directAccepted`、`proxyCopied`、
+`proxyDropped`、`block`、`cancel`、`drop`、`tokenMismatch`、`tokenExhaustion`、
+`verdictErrors` 和 `receiptToVerdict`。字段含义见组件参考。
+
 ### Clash API
 
 ```dae
@@ -538,7 +580,8 @@ CLI 参数：`--config` / `-c`、`--bpf-object` / `-b`、`--bpf-pin-root`、`--d
 2. 确保 routing / dns / 组的 `final` 中的名称指向真实组、节点、`direct` 或 `block`。
 3. 首连域名规则：使用 `dial_mode: domain` / `domain++`，或让 DNS 走 honk 以填充域名位图。
 4. 修改组/策略后，SIGHUP 重载会重建 `GroupManager`；仍有效的 Selector 选择会迁移。
-5. 若增加示例夹具，可跑 `cargo test -p honk-config` 确认仍能解析。
+5. 修改 `experimental.udp_nfqueue.enabled` 后必须重启进程；启用时应确认使用真实 eBPF 后端，且防火墙管理器不会修改 `inet honk_nfqueue` / `udp_decision`。
+6. 若增加示例夹具，可跑 `cargo test -p honk-config` 确认仍能解析。
 
 ## 14. 相关文档
 

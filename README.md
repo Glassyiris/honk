@@ -16,6 +16,22 @@ It is **not** a line-for-line port of either project. The kernel path follows da
 
 License: **GPL-3.0-only**.
 
+## Experimental held-first-packet UDP decisions
+
+The default-off UDP NFQUEUE path holds only ambiguous **LAN-forwarded** first packets after LAN TC and before conntrack/NAT. Enable it with a process configuration change:
+
+```dae
+experimental {
+    udp_nfqueue {
+        enabled: true
+    }
+}
+```
+
+Changing `experimental.udp_nfqueue.enabled` requires a restart. Enabled startup requires a build with the `ebpf` feature and the real eBPF backend; `--mock-ebpf` and builds without `ebpf` are rejected. Host-originated WAN egress remains on the canonical TPROXY path. DNS port 53, `must`, `block`, and already-safe route-time direct decisions never enter NFQUEUE; only decisions that can still change in userspace are staged.
+
+The path owns raw-netlink queue `320` and nftables objects `inet honk_nfqueue` / `udp_decision`; same-namespace firewall managers must leave them untouched while honk runs. Direct releases the held skb, proxy submits one retained payload to the normal UDP initializer, and block/cancellation drops it. With the Clash API enabled, runtime counters and receipt-to-verdict latency appear under `/stats.udp.nfqueue`. See the [design](doc/design.en.md) and [configuration reference](doc/configuration.en.md) for invariants and the full metric schema.
+
 ## Before Using This Repository
 
 ### Important: Review Status
@@ -34,7 +50,7 @@ These checkboxes indicate maintainer review status, not feature availability:
 
 ### TODO
 
-- [ ] Evaluate AF_XDP, XDP, and NFQUEUE paths for further performance gains
+- [ ] Evaluate AF_XDP and XDP paths for further performance gains
 - [ ] Add a honk REST API
 - [ ] Add a score-based group policy
 - [ ] Add inbound support

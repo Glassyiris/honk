@@ -624,8 +624,41 @@ experimental {
         store_fakeip: false
         store_dns: false
     }
+    udp_nfqueue {
+        enabled: false
+    }
 }
 ```
+
+### `experimental { udp_nfqueue { ... } }`
+
+| Field | Default | Meaning |
+| ------- | --------- | --------- |
+| `enabled` | `false` | Hold ambiguous LAN-forwarded UDP first packets in NFQUEUE for a final userspace decision |
+
+This field is restart-required. When it is `true`, startup accepts only a build
+with the `ebpf` feature using the real eBPF backend; `--mock-ebpf` and builds
+without `ebpf` are rejected. The hook covers LAN-forwarded traffic because host
+`inet prerouting` follows LAN TC. Host-originated WAN egress stays on the
+canonical TPROXY path. DNS port 53, internal/special traffic, `must`, `block`,
+reverse traffic, and already-safe direct decisions are never queued; only
+ambiguous userspace/domain decisions are staged.
+
+The mechanism is fixed: raw-netlink queue `320`, one listener, and no bypass,
+fanout, fail-open, or user-selectable queue/worker policy. honk exclusively owns
+the exact nftables names `inet honk_nfqueue` / `udp_decision`; firewall managers
+in the same network namespace must not mutate them while honk runs. The pinned
+`UDP_DECISION_SEQUENCE` allocator survives ordinary restart/cleanup and cannot
+be reset without risking token reuse; exhaustion requires a reboot.
+
+Held skbs are before conntrack/NAT. A final direct decision uses a token-checked
+Arm → FIFO accept with the final mark → Activate transition and creates no
+userspace direct socket, payload copy, deliberate retransmission, endpoint, or
+connection entry. Proxy first commits its token-bound state, moves the one
+retained payload copy into the canonical UDP initializer, drops the originals,
+then dials/sends exactly once. Block/cancel drop. Reload and shutdown fence
+readiness and quiesce/cancel all guards before queue/table teardown.
+Queue/listener/verdict failures and token exhaustion are fatal.
 
 ### `experimental { clash_api { ... } }`
 
@@ -677,7 +710,12 @@ udp = {
   queue: { accepted, full, closed },
   firstSend: { failures },
   stagger: { attempts, winners, cancellations },
-  warm: { attempts, successes, failures }
+  warm: { attempts, successes, failures },
+  nfqueue: {
+    received, activeFlows, directAccepted, proxyCopied, proxyDropped,
+    block, cancel, drop, tokenMismatch, tokenExhaustion, verdictErrors,
+    receiptToVerdict: H
+  }
 }
 H = { count, sumNanos, buckets }  // buckets has 64 fixed log2 slots
 ```
@@ -690,6 +728,14 @@ either form of detached work; the winner finishes promotion/arbitration before e
 publication. If ordinary traffic already filled a QUIC generation slot, that incumbent
 remains and the winning transport owns its connection only for the selected flow. Warm
 `successes` count `Ready`; a `NotApplicable` result is neutral.
+
+`nfqueue.received` counts listener deliveries and `activeFlows` is the current
+pending-correlator gauge. `directAccepted`, `proxyDropped`, `block`, `cancel`,
+and `drop` count successful kernel verdicts; `proxyCopied` counts the single
+payload ownership transfer into the canonical initializer. `tokenMismatch`,
+`tokenExhaustion`, and `verdictErrors` expose fail-closed faults.
+`receiptToVerdict` measures listener receipt to successful verdict and is not
+labelled as kernel queue residence because NFQA timestamps are not guaranteed.
 
 `/stats` also carries a top-level `warm` object of point-in-time gauges:
 

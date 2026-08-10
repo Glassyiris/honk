@@ -923,6 +923,7 @@ impl AnyTlsSession {
                 "AnyTLS session is closed",
             ));
         }
+
         let (completion, completed) = tokio::sync::oneshot::channel();
         {
             let mut queue = self.writer_q.queue.lock();

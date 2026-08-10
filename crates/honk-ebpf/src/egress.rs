@@ -49,6 +49,7 @@ use crate::action::{TC_ACT_OK, TC_ACT_PIPE, TC_ACT_SHOT, Verdict, flatten};
 const NOWHERE_IFINDEX: u32 = 0;
 /// ICMPv6 Neighbor Discovery Redirect type.
 const NDP_REDIRECT: u8 = 137;
+const TOKEN_IDENTITY_MISMATCH: i32 = -2;
 
 #[inline(always)]
 fn skb_ingress_ifindex(ctx: &TcContext) -> u32 {
@@ -175,6 +176,7 @@ pub fn prep_redirect_to_control_plane(
     from_wan: u8,
     refresh_if_stale: bool,
     outbound: u8,
+    decision_token: u32,
 ) -> i32 {
     let param = PARAM.load();
 
@@ -228,10 +230,13 @@ pub fn prep_redirect_to_control_plane(
     if refresh_if_stale {
         let now = unsafe { bpf_ktime_get_ns() };
         let stale = match REDIRECT_TRACK.get_ptr_mut(redirect_tuple) {
-            Some(old) => {
-                now.wrapping_sub(unsafe { (*old).last_seen_ns })
+            Some(old) => unsafe {
+                if (*old).decision_token != decision_token {
+                    return TOKEN_IDENTITY_MISMATCH;
+                }
+                now.wrapping_sub((*old).last_seen_ns)
                     >= crate::contrack::AUXILIARY_MAP_REFRESH_INTERVAL_NS
-            }
+            },
             None => true,
         };
         if !stale {
@@ -246,6 +251,7 @@ pub fn prep_redirect_to_control_plane(
     redirect_entry.last_seen_ns = unsafe { bpf_ktime_get_ns() };
     // Record the final outbound so dae0_ingress can attribute replies.
     redirect_entry.outbound = outbound;
+    redirect_entry.decision_token = decision_token;
 
     if link_h_len == ETH_HLEN {
         redirect_entry.smac.copy_from_slice(&ethh.src_addr);
@@ -531,10 +537,21 @@ fn do_tproxy_wan_egress_tcp(
         return Err(TC_ACT_SHOT);
     }
 
-    if prep_redirect_to_control_plane(ctx, link_h_len, tuples, ethh, 1, !tcp_state_syn, outbound)
-        != 0
-    {
-        // Failed to prepare → fallback to direct pass.
+    let prepare_result = prep_redirect_to_control_plane(
+        ctx,
+        link_h_len,
+        tuples,
+        ethh,
+        1,
+        !tcp_state_syn,
+        outbound,
+        0,
+    );
+    if prepare_result != 0 {
+        if prepare_result == TOKEN_IDENTITY_MISMATCH {
+            return Err(TC_ACT_SHOT);
+        }
+        // Preserve the existing direct-pass fallback for map write failures.
         return Err(TC_ACT_OK);
     }
 
@@ -556,6 +573,7 @@ fn do_tproxy_wan_egress_tcp(
         handoff.result.outbound = outbound;
         handoff.result.pid = handoff_pid;
         handoff.result.dscp = tuples.dscp;
+        handoff.result.decision_token = 0;
         handoff.result.mac.copy_from_slice(&scratch.mac);
         if let Some(pname) = handoff_pname {
             handoff.result.pname.copy_from_slice(pname);
@@ -585,6 +603,7 @@ fn fast_path_decision(
     mac: [u8; 6],
     handoff_pname: Option<&[u8; TASK_COMM_LEN]>,
     handoff_pid: u32,
+    decision_token: u32,
 ) -> Verdict {
     if outbound == OUTBOUND_DIRECT && mark == 0 {
         return Err(TC_ACT_OK);
@@ -596,7 +615,20 @@ fn fast_path_decision(
         return Err(TC_ACT_SHOT);
     }
 
-    if prep_redirect_to_control_plane(ctx, link_h_len, tuples, ethh, 1, true, outbound) != 0 {
+    let prepare_result = prep_redirect_to_control_plane(
+        ctx,
+        link_h_len,
+        tuples,
+        ethh,
+        1,
+        true,
+        outbound,
+        decision_token,
+    );
+    if prepare_result != 0 {
+        if prepare_result == TOKEN_IDENTITY_MISMATCH || decision_token != 0 {
+            return Err(TC_ACT_SHOT);
+        }
         return Err(TC_ACT_OK);
     }
 
@@ -612,10 +644,13 @@ fn fast_path_decision(
     // refresh it at most once per AUXILIARY_MAP_REFRESH_INTERVAL_NS.
     let now = unsafe { bpf_ktime_get_ns() };
     let write_handoff = match ROUTING_HANDOFF_MAP.get_ptr_mut(tuples.five) {
-        Some(old) => {
-            now.wrapping_sub(unsafe { (*old).last_seen_ns })
+        Some(old) => unsafe {
+            if (*old).result.decision_token != decision_token {
+                return Err(TC_ACT_SHOT);
+            }
+            now.wrapping_sub((*old).last_seen_ns)
                 >= crate::contrack::AUXILIARY_MAP_REFRESH_INTERVAL_NS
-        }
+        },
         None => true,
     };
     if write_handoff {
@@ -626,6 +661,7 @@ fn fast_path_decision(
         handoff.result.outbound = outbound;
         handoff.result.pid = handoff_pid;
         handoff.result.dscp = tuples.dscp;
+        handoff.result.decision_token = decision_token;
         handoff.result.mac.copy_from_slice(&mac);
         if let Some(pname) = handoff_pname {
             handoff.result.pname.copy_from_slice(pname);
@@ -650,12 +686,13 @@ fn do_tproxy_wan_egress_udp(
     ethh: &EthHdr,
     udph: &UdpHdr,
 ) -> Verdict {
-    let outbound: u8;
-    let mark: u32;
+    let mut outbound: u8;
+    let mut mark: u32;
     let must: bool;
     let mut mac: [u8; 6] = [0; 6];
     let mut handoff_pname: Option<&[u8; TASK_COMM_LEN]> = None;
     let mut handoff_pid: u32 = 0;
+    let mut decision_token: u32 = 0;
 
     let scratch_key: u32 = 0;
     let scratch = match unsafe { WAN_EGRESS_ROUTE_SCRATCH_MAP.get_ptr_mut(scratch_key) } {
@@ -701,6 +738,7 @@ fn do_tproxy_wan_egress_udp(
             mac.copy_from_slice(&conn_state.mac);
             handoff_pname = Some(&conn_state.pname);
             handoff_pid = conn_state.pid;
+            decision_token = conn_state.decision_token;
 
             return fast_path_decision(
                 ctx,
@@ -713,6 +751,7 @@ fn do_tproxy_wan_egress_udp(
                 mac,
                 handoff_pname,
                 handoff_pid,
+                decision_token,
             );
         }
     }
@@ -760,6 +799,15 @@ fn do_tproxy_wan_egress_udp(
     outbound = (s64_ret & 0xFF) as u8;
     mark = (s64_ret >> 8) as u32;
     must = ((s64_ret >> 40) & 1) != 0;
+    if !must
+        && outbound != OUTBOUND_BLOCK
+        && crate::maps::datapath_flags() & honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_ALL != 0
+    {
+        if outbound != OUTBOUND_DIRECT {
+            mark = 0;
+        }
+        outbound = OUTBOUND_DIRECT;
+    }
 
     if !is_short_lived_udp_traffic(&tuples.five) {
         let must_u8 = must as u8;
@@ -796,6 +844,7 @@ fn do_tproxy_wan_egress_udp(
         mac,
         handoff_pname,
         handoff_pid,
+        decision_token,
     )
 }
 

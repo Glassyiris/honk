@@ -284,9 +284,9 @@ pub(crate) enum RemovalReason {
     /// A userspace endpoint (or its uncommitted reservation) is gone; the
     /// flow's conntrack entries are retired with it.
     UserspaceEndpointRetired,
-    /// The flow was handed to the kernel (drop-and-reinject offload): its
-    /// conn_state now anchors the offloaded flow and must NOT be deleted.
-    KernelOffloadHandoff,
+    #[cfg(any(feature = "ebpf", test))]
+    /// The flow was handed to the kernel; its terminal conn_state must remain.
+    KernelHandoff,
 }
 
 /// Message sent to the endpoint-removal sink.
@@ -294,6 +294,8 @@ pub(crate) enum RemovalReason {
 pub(crate) struct EndpointRemoval {
     pub(crate) client: SocketAddr,
     pub(crate) dst: SocketAddr,
+    pub(crate) decision_token: u32,
+    pub(crate) generation: u64,
     pub(crate) conn_id: Option<String>,
     pub(crate) reason: RemovalReason,
 }
@@ -313,10 +315,9 @@ impl UdpReplySocketFactory for SystemUdpReplySocketFactory {
         super::new_udp_reply_socket(original_dst)
     }
 }
-
-/// One retained packet owns all permits that account for it. The permits are
-/// acquired before copying from the receive buffer and are released exactly
-/// when the packet is sent or dropped.
+/// One retained packet owns all permits that account for it. Socket ingress
+/// acquires them before copying; owned ingress transfers its allocation only
+/// after the same bounded admission succeeds.
 pub(super) struct QueuedDatagram {
     data: Bytes,
     _flow_permit: OwnedSemaphorePermit,
@@ -329,12 +330,37 @@ impl QueuedDatagram {
     }
 }
 
+enum DatagramPayload<'a> {
+    Borrowed(&'a [u8]),
+    #[cfg(any(feature = "ebpf", test))]
+    Owned(Bytes),
+}
+
+impl DatagramPayload<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Borrowed(data) => data.len(),
+            #[cfg(any(feature = "ebpf", test))]
+            Self::Owned(data) => data.len(),
+        }
+    }
+
+    fn into_bytes(self) -> Bytes {
+        match self {
+            Self::Borrowed(data) => Bytes::copy_from_slice(data),
+            #[cfg(any(feature = "ebpf", test))]
+            Self::Owned(data) => data,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PacketAdmissionError {
     FlowQueueFull,
     GlobalPayloadFull,
 }
 struct InitializingEndpoint {
+    decision_token: u32,
     generation: u64,
     queue_tx: mpsc::Sender<QueuedDatagram>,
     queue_rx: Mutex<Option<mpsc::Receiver<QueuedDatagram>>>,
@@ -347,6 +373,8 @@ struct InitializingEndpoint {
     /// speculative preparation has drained, so a death callback can
     /// generation-safely retire the entry before `commit_ready` publishes Ready.
     selected_node: Mutex<Option<uuid::Uuid>>,
+    cancelled: AtomicBool,
+    cancel_notify: Notify,
 }
 
 impl InitializingEndpoint {
@@ -382,9 +410,26 @@ impl InitializingEndpoint {
     fn selected_node_is(&self, node_id: uuid::Uuid) -> bool {
         *self.selected_node.lock() == Some(node_id)
     }
+
+    fn cancel(&self) {
+        if !self.cancelled.swap(true, Ordering::AcqRel) {
+            self.cancel_notify.notify_waiters();
+        }
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            let notified = self.cancel_notify.notified();
+            if self.cancelled.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 struct ReadyEndpoint {
+    decision_token: u32,
     generation: u64,
     endpoint: Arc<UdpEndpoint>,
     queue_tx: mpsc::Sender<QueuedDatagram>,
@@ -397,6 +442,7 @@ struct ReadyEndpoint {
 enum EndpointEntry {
     Initializing(Arc<InitializingEndpoint>),
     Ready(Arc<ReadyEndpoint>),
+    Retiring { generation: u64, token: u32 },
 }
 
 impl EndpointEntry {
@@ -404,7 +450,20 @@ impl EndpointEntry {
         match self {
             Self::Initializing(entry) => entry.generation,
             Self::Ready(entry) => entry.generation,
+            Self::Retiring { generation, .. } => *generation,
         }
+    }
+
+    fn decision_token(&self) -> u32 {
+        match self {
+            Self::Initializing(entry) => entry.decision_token,
+            Self::Ready(entry) => entry.decision_token,
+            Self::Retiring { token, .. } => *token,
+        }
+    }
+
+    fn matches_identity(&self, generation: u64, token: u32) -> bool {
+        self.generation() == generation && self.decision_token() == token
     }
 
     fn retire(&self) -> Option<String> {
@@ -415,6 +474,7 @@ impl EndpointEntry {
                 entry.endpoint.kill();
                 entry.endpoint.take_tracker_id()
             }
+            Self::Retiring { .. } => None,
         }
     }
 }
@@ -430,15 +490,26 @@ pub(super) enum EndpointReservation {
     CapacityRejected,
     QueueFull,
     QueueClosed,
+    #[cfg_attr(not(feature = "ebpf"), allow(dead_code))]
+    IdentityMismatch,
 }
 
-/// Owns an uncommitted Initializing incarnation. Dropping it is transactional:
-/// it removes only this incarnation, closes followers, returns all permits,
-/// and wakes reload waiters. It can never delete a newer entry for the key.
+#[cfg(any(feature = "ebpf", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OwnedEnqueueError {
+    IdentityMismatch,
+    QueueFull,
+    QueueClosed,
+}
+
+/// Owns an uncommitted Initializing incarnation. Dropping it transactionally
+/// tombstones only this identity, closes followers, returns all permits, and
+/// wakes reload waiters. It can never retire a newer entry for the key.
 pub(super) struct UdpInitLease {
     pool: Arc<UdpEndpointPool>,
     key: EndpointKey,
     generation: u64,
+    decision_token: u32,
     /// Cancellation epoch captured while publishing this Initializing entry.
     /// `commit_ready` compares it under the pool's shared epoch gate, so a
     /// cancellation that linearizes first can never publish Ready afterwards.
@@ -446,6 +517,7 @@ pub(super) struct UdpInitLease {
     first: Option<QueuedDatagram>,
     _slow_permit: OwnedSemaphorePermit,
     cancellation: watch::Receiver<u64>,
+    initializer: Arc<InitializingEndpoint>,
     _initializer_guard: UdpInitializerGuard,
     connection_guard: Option<ActiveConnectionGuard>,
     /// The DNS controller already examined this first datagram before the
@@ -467,8 +539,24 @@ impl UdpInitLease {
         self.generation
     }
 
+    pub(super) fn decision_token(&self) -> u32 {
+        self.decision_token
+    }
+
+    #[cfg(test)]
     pub(super) fn cancellation(&self) -> watch::Receiver<u64> {
         self.cancellation.clone()
+    }
+
+    pub(super) fn wait_cancellation(&self) -> impl Future<Output = ()> + Send + 'static {
+        let mut epoch = self.cancellation.clone();
+        let initializer = Arc::clone(&self.initializer);
+        async move {
+            tokio::select! {
+                _ = epoch.changed() => {}
+                _ = initializer.cancelled() => {}
+            }
+        }
     }
 
     pub(super) fn set_connection_guard(&mut self, guard: ActiveConnectionGuard) {
@@ -493,7 +581,8 @@ impl UdpInitLease {
         };
         match entry.value() {
             EndpointEntry::Initializing(initializing)
-                if initializing.generation == self.generation =>
+                if initializing.generation == self.generation
+                    && initializing.decision_token == self.decision_token =>
             {
                 initializing.set_tracker_id(tracker_id)
             }
@@ -511,7 +600,8 @@ impl UdpInitLease {
         };
         match entry.value() {
             EndpointEntry::Initializing(initializing)
-                if initializing.generation == self.generation =>
+                if initializing.generation == self.generation
+                    && initializing.decision_token == self.decision_token =>
             {
                 initializing.bind_selected_node(node_id);
                 true
@@ -528,6 +618,7 @@ impl UdpInitLease {
         };
         if let EndpointEntry::Initializing(initializing) = entry.value()
             && initializing.generation == self.generation
+            && initializing.decision_token == self.decision_token
         {
             initializing.clear_selected_node();
         }
@@ -544,6 +635,7 @@ impl UdpInitLease {
             entry.value(),
             EndpointEntry::Initializing(initializing)
                 if initializing.generation == self.generation
+                    && initializing.decision_token == self.decision_token
         )
     }
 
@@ -551,7 +643,8 @@ impl UdpInitLease {
         let entry = self.pool.endpoints.get(&self.key)?;
         match entry.value() {
             EndpointEntry::Initializing(initializing)
-                if initializing.generation == self.generation =>
+                if initializing.generation == self.generation
+                    && initializing.decision_token == self.decision_token =>
             {
                 initializing.take_receiver()
             }
@@ -588,7 +681,8 @@ impl UdpInitLease {
         }
         let initializing = match occupied.get() {
             EndpointEntry::Initializing(initializing)
-                if initializing.generation == self.generation =>
+                if initializing.generation == self.generation
+                    && initializing.decision_token == self.decision_token =>
             {
                 Arc::clone(initializing)
             }
@@ -599,6 +693,7 @@ impl UdpInitLease {
         };
         occupied.insert(EndpointEntry::Ready(Arc::new(ReadyEndpoint {
             generation: self.generation,
+            decision_token: self.decision_token,
             endpoint,
             queue_tx: initializing.queue_tx.clone(),
             flow_slots: initializing.flow_slots.clone(),
@@ -610,17 +705,12 @@ impl UdpInitLease {
         true
     }
 
-    /// Terminal state for the drop-and-reinject kernel offload: the flow's
-    /// conn_state now carries the offload bit, so this reservation is
-    /// retired with a `KernelOffloadHandoff` removal reason — the production
-    /// removal worker must NOT delete that conn_state (a plain drop would
-    /// unwind the offload and bounce the retransmission back to userspace).
-    /// Generation/epoch-safe exactly like `commit_ready`; on failure the
-    /// caller must not treat the flow as offloaded.  Releases the first
-    /// datagram, queued followers, and every permit exactly like a drop.
-    pub(super) fn commit_offloaded(&mut self) -> bool {
-        // Same map-entry → epoch-gate order as reservation and commit_ready.
-        let occupied = match self.pool.endpoints.entry(self.key) {
+    /// Retire a direct or blocked staged flow after its terminal conn_state is
+    /// published. The exact tombstone prevents this tuple from being reused
+    /// until the removal worker acknowledges the kernel handoff.
+    #[cfg(any(feature = "ebpf", test))]
+    pub(super) fn commit_kernel_handoff(&mut self) -> bool {
+        let mut occupied = match self.pool.endpoints.entry(self.key) {
             dashmap::mapref::entry::Entry::Occupied(occupied) => occupied,
             dashmap::mapref::entry::Entry::Vacant(_) => return false,
         };
@@ -632,18 +722,27 @@ impl UdpInitLease {
             occupied.get(),
             EndpointEntry::Initializing(initializing)
                 if initializing.generation == self.generation
+                    && initializing.decision_token == self.decision_token
         ) {
             return false;
         }
-        let entry = occupied.remove();
-        // No tracker was registered on this path, so this carries no conn_id;
-        // the reason is what matters to the removal worker.
+        self.pool.active_retirements.fetch_add(1, Ordering::AcqRel);
+        let entry = occupied.insert(EndpointEntry::Retiring {
+            generation: self.generation,
+            token: self.decision_token,
+        });
+        drop(occupied);
         let conn_id = entry.retire();
+        drop(entry);
+        drop(self.first.take());
+        drop(self.connection_guard.take());
         self.pool.notify_removed(
             SocketAddr::new(self.key.client_ip(), self.key.client_port),
             SocketAddr::new(self.key.dst_ip(), self.key.dst_port),
             conn_id,
-            RemovalReason::KernelOffloadHandoff,
+            RemovalReason::KernelHandoff,
+            self.decision_token,
+            self.generation,
         );
         self.committed = true;
         true
@@ -653,7 +752,10 @@ impl UdpInitLease {
 impl Drop for UdpInitLease {
     fn drop(&mut self) {
         if !self.committed {
-            self.pool.remove_if_same(self.key, self.generation);
+            drop(self.first.take());
+            drop(self.connection_guard.take());
+            self.pool
+                .retire_if_same(self.key, self.decision_token, self.generation);
         }
     }
 }
@@ -750,8 +852,8 @@ async fn join_registered_tasks(
     }
 }
 
-/// Pool state is a single map entry per tuple: a reservation is either
-/// Initializing or Ready, never a second independently inserted endpoint.
+/// Pool state is a single map entry per tuple: Initializing, Ready, or the
+/// exact Retiring identity that fences reuse until cleanup is acknowledged.
 pub struct UdpEndpointPool {
     endpoints: DashMap<EndpointKey, EndpointEntry>,
     endpoint_slots: Arc<Semaphore>,
@@ -774,6 +876,8 @@ pub struct UdpEndpointPool {
     remove_sink: Mutex<Option<tokio::sync::mpsc::Sender<EndpointRemoval>>>,
     /// Bounded compensation for removals observed while the sink is full.
     removal_dirty: Mutex<HashSet<EndpointRemoval>>,
+    active_retirements: AtomicUsize,
+    retirements_empty: Notify,
     /// Test-only synchronous barrier at the historical publication point.
     /// It makes the cancellation linearization regression reproducible
     /// without introducing an await into reservation.
@@ -818,6 +922,8 @@ impl UdpEndpointPool {
             reply_socket_factory,
             remove_sink: Mutex::new(None),
             removal_dirty: Mutex::new(HashSet::new()),
+            active_retirements: AtomicUsize::new(0),
+            retirements_empty: Notify::new(),
             #[cfg(test)]
             reservation_publication_hook: Mutex::new(None),
         }
@@ -877,13 +983,22 @@ impl UdpEndpointPool {
         dst: SocketAddr,
         conn_id: Option<String>,
         reason: RemovalReason,
+        decision_token: u32,
+        generation: u64,
     ) {
         let removal = EndpointRemoval {
             client,
             dst,
+            decision_token,
+            generation,
             conn_id,
             reason,
         };
+        #[cfg(test)]
+        if self.remove_sink.lock().is_none() {
+            self.complete_removal(client, dst, decision_token, generation);
+            return;
+        }
         let delivered = self
             .remove_sink
             .lock()
@@ -895,33 +1010,38 @@ impl UdpEndpointPool {
         self.flush_removal_dirty();
     }
 
-    fn make_packet(
+    fn packet_permits(
         &self,
-        data: &[u8],
+        len: usize,
         flow_slots: &Arc<Semaphore>,
-    ) -> Result<QueuedDatagram, PacketAdmissionError> {
+    ) -> Result<(OwnedSemaphorePermit, Option<OwnedSemaphorePermit>), PacketAdmissionError> {
         let flow_permit = flow_slots
             .clone()
             .try_acquire_owned()
             .map_err(|_| PacketAdmissionError::FlowQueueFull)?;
-        let global_byte_permit = if data.is_empty() {
+        let global_byte_permit = if len == 0 {
             None
         } else {
             let byte_count =
-                u32::try_from(data.len()).map_err(|_| PacketAdmissionError::GlobalPayloadFull)?;
-            match self
-                .global_payload_bytes
-                .clone()
-                .try_acquire_many_owned(byte_count)
-            {
-                Ok(permit) => Some(permit),
-                Err(_) => return Err(PacketAdmissionError::GlobalPayloadFull),
-            }
+                u32::try_from(len).map_err(|_| PacketAdmissionError::GlobalPayloadFull)?;
+            Some(
+                self.global_payload_bytes
+                    .clone()
+                    .try_acquire_many_owned(byte_count)
+                    .map_err(|_| PacketAdmissionError::GlobalPayloadFull)?,
+            )
         };
-        // Allocation/copy is intentionally last: all bounded resources were
-        // acquired after slow admission and before payload duplication.
+        Ok((flow_permit, global_byte_permit))
+    }
+
+    fn make_packet(
+        &self,
+        data: DatagramPayload<'_>,
+        flow_slots: &Arc<Semaphore>,
+    ) -> Result<QueuedDatagram, PacketAdmissionError> {
+        let (flow_permit, global_byte_permit) = self.packet_permits(data.len(), flow_slots)?;
         Ok(QueuedDatagram {
-            data: Bytes::copy_from_slice(data),
+            data: data.into_bytes(),
             _flow_permit: flow_permit,
             _global_byte_permit: global_byte_permit,
         })
@@ -931,7 +1051,7 @@ impl UdpEndpointPool {
         &self,
         sender: &mpsc::Sender<QueuedDatagram>,
         flow_slots: &Arc<Semaphore>,
-        data: &[u8],
+        data: DatagramPayload<'_>,
         stats: &StatsManager,
     ) -> EndpointReservation {
         if sender.is_closed() {
@@ -965,6 +1085,76 @@ impl UdpEndpointPool {
         }
     }
 
+    fn reserve_new(
+        self: &Arc<Self>,
+        vacant: dashmap::mapref::entry::VacantEntry<'_, EndpointKey, EndpointEntry>,
+        data: DatagramPayload<'_>,
+        decision_token: u32,
+        slow_permit: OwnedSemaphorePermit,
+        stats: &StatsManager,
+    ) -> EndpointReservation {
+        let endpoint_permit = match self.endpoint_slots.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                stats.record_udp_capacity_rejection();
+                return EndpointReservation::CapacityRejected;
+            }
+        };
+        let flow_slots = Arc::new(Semaphore::new(FLOW_QUEUE_CAPACITY));
+        let first = match self.make_packet(data, &flow_slots) {
+            Ok(packet) => packet,
+            Err(PacketAdmissionError::FlowQueueFull) => {
+                stats.record_udp_flow_queue_full();
+                return EndpointReservation::QueueFull;
+            }
+            Err(PacketAdmissionError::GlobalPayloadFull) => {
+                stats.record_udp_global_payload_full();
+                return EndpointReservation::QueueFull;
+            }
+        };
+        let (queue_tx, queue_rx) = mpsc::channel(FLOW_QUEUE_CAPACITY);
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let epoch_gate = self.initialization_epoch.lock();
+        if self.terminal.load(Ordering::Acquire) {
+            stats.record_udp_queue_closed();
+            return EndpointReservation::QueueClosed;
+        }
+        let epoch = *epoch_gate;
+        let cancellation = self.cancel_epoch.subscribe();
+        let initializer_guard = UdpInitializerGuard::new(Arc::clone(self));
+        let initializer = Arc::new(InitializingEndpoint {
+            decision_token,
+            generation,
+            queue_tx,
+            queue_rx: Mutex::new(Some(queue_rx)),
+            flow_slots,
+            endpoint_permit: Mutex::new(Some(endpoint_permit)),
+            tracker_id: Mutex::new(None),
+            selected_node: Mutex::new(None),
+            cancelled: AtomicBool::new(false),
+            cancel_notify: Notify::new(),
+        });
+        let key = *vacant.key();
+        vacant.insert(EndpointEntry::Initializing(Arc::clone(&initializer)));
+        drop(epoch_gate);
+        #[cfg(test)]
+        self.pause_after_reservation_publication();
+        EndpointReservation::Initializing(UdpInitLease {
+            pool: Arc::clone(self),
+            key,
+            generation,
+            decision_token,
+            epoch,
+            first: Some(first),
+            _slow_permit: slow_permit,
+            cancellation,
+            initializer,
+            _initializer_guard: initializer_guard,
+            connection_guard: None,
+            dns_checked: decision_token != 0,
+            committed: false,
+        })
+    }
     /// Atomically reserve a cold tuple or synchronously enqueue onto its
     /// existing Initializing/Ready incarnation. No map or std-mutex guard is
     /// held across await because this entire operation is synchronous.
@@ -984,15 +1174,17 @@ impl UdpEndpointPool {
             }
             match self.endpoints.entry(key) {
                 dashmap::mapref::entry::Entry::Occupied(occupied) => {
-                    let stale_generation = match occupied.get() {
+                    let (stale_token, stale_generation) = match occupied.get() {
                         EndpointEntry::Initializing(initializing) => {
                             match self.enqueue(
                                 &initializing.queue_tx,
                                 &initializing.flow_slots,
-                                data,
+                                DatagramPayload::Borrowed(data),
                                 stats,
                             ) {
-                                EndpointReservation::QueueClosed => initializing.generation,
+                                EndpointReservation::QueueClosed => {
+                                    (initializing.decision_token, initializing.generation)
+                                }
                                 other => return other,
                             }
                         }
@@ -1000,79 +1192,178 @@ impl UdpEndpointPool {
                             if ready.alive.load(Ordering::Acquire)
                                 && !ready.endpoint.dead.load(Ordering::Acquire) =>
                         {
-                            match self.enqueue(&ready.queue_tx, &ready.flow_slots, data, stats) {
-                                EndpointReservation::QueueClosed => ready.generation,
+                            match self.enqueue(
+                                &ready.queue_tx,
+                                &ready.flow_slots,
+                                DatagramPayload::Borrowed(data),
+                                stats,
+                            ) {
+                                EndpointReservation::QueueClosed => {
+                                    (ready.decision_token, ready.generation)
+                                }
                                 other => return other,
                             }
                         }
-                        EndpointEntry::Ready(ready) => ready.generation,
+                        EndpointEntry::Ready(ready) => (ready.decision_token, ready.generation),
+                        EndpointEntry::Retiring { .. } => {
+                            stats.record_udp_queue_closed();
+                            return EndpointReservation::QueueClosed;
+                        }
                     };
                     drop(occupied);
-                    self.remove_if_same(key, stale_generation);
+                    self.retire_if_same(key, stale_token, stale_generation);
                 }
                 dashmap::mapref::entry::Entry::Vacant(vacant) => {
-                    let endpoint_permit = match self.endpoint_slots.clone().try_acquire_owned() {
-                        Ok(permit) => permit,
-                        Err(_) => {
-                            stats.record_udp_capacity_rejection();
-                            return EndpointReservation::CapacityRejected;
-                        }
-                    };
-                    let flow_slots = Arc::new(Semaphore::new(FLOW_QUEUE_CAPACITY));
-                    let first = match self.make_packet(data, &flow_slots) {
-                        Ok(packet) => packet,
-                        Err(PacketAdmissionError::FlowQueueFull) => {
-                            stats.record_udp_flow_queue_full();
-                            return EndpointReservation::QueueFull;
-                        }
-                        Err(PacketAdmissionError::GlobalPayloadFull) => {
-                            stats.record_udp_global_payload_full();
-                            return EndpointReservation::QueueFull;
-                        }
-                    };
-                    let (queue_tx, queue_rx) = mpsc::channel(FLOW_QUEUE_CAPACITY);
-                    let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
-                    // Map-entry → epoch-gate is the only nested lock order.
-                    // Capture the epoch, subscribe, account, and publish
-                    // while the same gate held by cancellation is locked.
-                    // A cancellation can therefore linearize wholly before
-                    // or after this reservation, never in its middle.
-                    let epoch_gate = self.initialization_epoch.lock();
-                    if self.terminal.load(Ordering::Acquire) {
-                        stats.record_udp_queue_closed();
-                        return EndpointReservation::QueueClosed;
-                    }
-                    let epoch = *epoch_gate;
-                    let cancellation = self.cancel_epoch.subscribe();
-                    let initializer_guard = UdpInitializerGuard::new(Arc::clone(self));
-                    vacant.insert(EndpointEntry::Initializing(Arc::new(
-                        InitializingEndpoint {
-                            generation,
-                            queue_tx,
-                            queue_rx: Mutex::new(Some(queue_rx)),
-                            flow_slots,
-                            endpoint_permit: Mutex::new(Some(endpoint_permit)),
-                            tracker_id: Mutex::new(None),
-                            selected_node: Mutex::new(None),
-                        },
-                    )));
-                    drop(epoch_gate);
-                    #[cfg(test)]
-                    self.pause_after_reservation_publication();
-                    return EndpointReservation::Initializing(UdpInitLease {
-                        pool: Arc::clone(self),
-                        key,
-                        generation,
-                        epoch,
-                        first: Some(first),
-                        _slow_permit: slow_permit,
-                        cancellation,
-                        _initializer_guard: initializer_guard,
-                        connection_guard: None,
-                        dns_checked: false,
-                        committed: false,
-                    });
+                    return self.reserve_new(
+                        vacant,
+                        DatagramPayload::Borrowed(data),
+                        0,
+                        slow_permit,
+                        stats,
+                    );
                 }
+            }
+        }
+    }
+
+    /// Admit a retained NFQUEUE allocation without duplicating its payload.
+    /// A fresh call uses `None`; followers name the exact published generation.
+    #[cfg(any(feature = "ebpf", test))]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn reserve_owned_or_enqueue(
+        self: &Arc<Self>,
+        client: SocketAddr,
+        dst: SocketAddr,
+        data: Bytes,
+        decision_token: u32,
+        expected_generation: Option<u64>,
+        slow_permit: OwnedSemaphorePermit,
+        stats: &StatsManager,
+    ) -> EndpointReservation {
+        if self.terminal.load(Ordering::Acquire) {
+            stats.record_udp_queue_closed();
+            return EndpointReservation::QueueClosed;
+        }
+        if decision_token == 0 {
+            return EndpointReservation::IdentityMismatch;
+        }
+
+        let key = EndpointKey::new(client, dst);
+        match self.endpoints.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(occupied) => {
+                let Some(generation) = expected_generation else {
+                    return if matches!(occupied.get(), EndpointEntry::Retiring { .. }) {
+                        EndpointReservation::QueueClosed
+                    } else {
+                        EndpointReservation::IdentityMismatch
+                    };
+                };
+                if !occupied.get().matches_identity(generation, decision_token) {
+                    return EndpointReservation::IdentityMismatch;
+                }
+                match occupied.get() {
+                    EndpointEntry::Initializing(initializing) => self.enqueue(
+                        &initializing.queue_tx,
+                        &initializing.flow_slots,
+                        DatagramPayload::Owned(data),
+                        stats,
+                    ),
+                    EndpointEntry::Ready(ready)
+                        if ready.alive.load(Ordering::Acquire)
+                            && !ready.endpoint.dead.load(Ordering::Acquire) =>
+                    {
+                        self.enqueue(
+                            &ready.queue_tx,
+                            &ready.flow_slots,
+                            DatagramPayload::Owned(data),
+                            stats,
+                        )
+                    }
+                    EndpointEntry::Ready(_) | EndpointEntry::Retiring { .. } => {
+                        stats.record_udp_queue_closed();
+                        EndpointReservation::QueueClosed
+                    }
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                if expected_generation.is_some() {
+                    return EndpointReservation::IdentityMismatch;
+                }
+                self.reserve_new(
+                    vacant,
+                    DatagramPayload::Owned(data),
+                    decision_token,
+                    slow_permit,
+                    stats,
+                )
+            }
+        }
+    }
+
+    /// Reconstruct an expired terminal Proxy cell from the same-token live
+    /// initializer or Ready entry and return its generation with the enqueue.
+    #[cfg(any(feature = "ebpf", test))]
+    pub(super) fn enqueue_owned_by_token(
+        &self,
+        client: SocketAddr,
+        dst: SocketAddr,
+        data: Bytes,
+        decision_token: u32,
+        stats: &StatsManager,
+    ) -> Result<u64, OwnedEnqueueError> {
+        if decision_token == 0 {
+            return Err(OwnedEnqueueError::IdentityMismatch);
+        }
+        if self.terminal.load(Ordering::Acquire) {
+            stats.record_udp_queue_closed();
+            return Err(OwnedEnqueueError::QueueClosed);
+        }
+        let Some(entry) = self.endpoints.get(&EndpointKey::new(client, dst)) else {
+            return Err(OwnedEnqueueError::IdentityMismatch);
+        };
+        let (generation, result) = match entry.value() {
+            EndpointEntry::Initializing(initializing)
+                if initializing.decision_token == decision_token =>
+            {
+                (
+                    initializing.generation,
+                    self.enqueue(
+                        &initializing.queue_tx,
+                        &initializing.flow_slots,
+                        DatagramPayload::Owned(data),
+                        stats,
+                    ),
+                )
+            }
+            EndpointEntry::Ready(ready)
+                if ready.decision_token == decision_token
+                    && ready.alive.load(Ordering::Acquire)
+                    && !ready.endpoint.dead.load(Ordering::Acquire) =>
+            {
+                (
+                    ready.generation,
+                    self.enqueue(
+                        &ready.queue_tx,
+                        &ready.flow_slots,
+                        DatagramPayload::Owned(data),
+                        stats,
+                    ),
+                )
+            }
+            EndpointEntry::Retiring { token, .. } if *token == decision_token => {
+                stats.record_udp_queue_closed();
+                return Err(OwnedEnqueueError::QueueClosed);
+            }
+            _ => return Err(OwnedEnqueueError::IdentityMismatch),
+        };
+        match result {
+            EndpointReservation::Enqueued => Ok(generation),
+            EndpointReservation::QueueFull => Err(OwnedEnqueueError::QueueFull),
+            EndpointReservation::QueueClosed => Err(OwnedEnqueueError::QueueClosed),
+            EndpointReservation::Initializing(_)
+            | EndpointReservation::CapacityRejected
+            | EndpointReservation::IdentityMismatch => {
+                unreachable!("enqueue-by-token returned an impossible reservation")
             }
         }
     }
@@ -1080,9 +1371,9 @@ impl UdpEndpointPool {
     /// Receive-loop fast path: only a live Ready entry may be enqueued here.
     /// Initializing followers must take the slow admission path so they
     /// acquire the bounded slow permit before any payload copy/queue work.
-    /// This helper never awaits PacketTransport I/O. Closed/dead Ready
-    /// entries are retired by generation and returned as a miss so the same
-    /// datagram can reserve. Terminal shutdown returns `QueueClosed` directly
+    /// Closed entries are tombstoned by exact identity and reject the packet;
+    /// the tuple remains fenced until the removal worker acknowledges cleanup.
+    /// Terminal shutdown returns `QueueClosed` directly
     /// so the listener drops the datagram instead of attempting slow admission.
     pub(super) fn fast_path_enqueue(
         &self,
@@ -1097,26 +1388,36 @@ impl UdpEndpointPool {
         }
         let key = EndpointKey::new(client, dst);
         let entry = self.endpoints.get(&key)?;
-        let result = match entry.value() {
-            // Initializing is intentionally a fast-path miss: followers must
-            // pass through try_admit_udp_slow_path before reserve_or_enqueue.
+        let (result, identity) = match entry.value() {
             EndpointEntry::Initializing(_) => return None,
             EndpointEntry::Ready(ready)
                 if ready.alive.load(Ordering::Acquire)
                     && !ready.endpoint.dead.load(Ordering::Acquire) =>
             {
-                self.enqueue(&ready.queue_tx, &ready.flow_slots, data, stats)
+                (
+                    self.enqueue(
+                        &ready.queue_tx,
+                        &ready.flow_slots,
+                        DatagramPayload::Borrowed(data),
+                        stats,
+                    ),
+                    (ready.decision_token, ready.generation),
+                )
             }
-            EndpointEntry::Ready(_) => EndpointReservation::QueueClosed,
+            EndpointEntry::Ready(ready) => (
+                EndpointReservation::QueueClosed,
+                (ready.decision_token, ready.generation),
+            ),
+            EndpointEntry::Retiring { .. } => {
+                stats.record_udp_queue_closed();
+                return Some(EndpointReservation::QueueClosed);
+            }
         };
-        let generation = entry.value().generation();
         drop(entry);
         if matches!(result, EndpointReservation::QueueClosed) {
-            self.remove_if_same(key, generation);
-            None
-        } else {
-            Some(result)
+            self.retire_if_same(key, identity.0, identity.1);
         }
+        Some(result)
     }
 
     #[cfg(test)]
@@ -1133,42 +1434,84 @@ impl UdpEndpointPool {
         }
     }
 
-    /// Remove any incarnation for an explicit administrative cleanup.
+    /// Begin exact retirement of the currently observed incarnation.
     pub fn remove(&self, client: SocketAddr, dst: SocketAddr) {
         let key = EndpointKey::new(client, dst);
-        let generation = self
-            .endpoints
-            .get(&key)
-            .map(|entry| entry.value().generation());
-        if let Some(generation) = generation {
-            self.remove_if_same(key, generation);
+        let identity = self.endpoints.get(&key).and_then(|entry| {
+            (!matches!(entry.value(), EndpointEntry::Retiring { .. }))
+                .then(|| (entry.value().decision_token(), entry.value().generation()))
+        });
+        if let Some((token, generation)) = identity {
+            self.retire_if_same(key, token, generation);
         }
     }
 
-    /// Remove only the incarnation observed by the caller. This is used by
-    /// lease Drop, worker cleanup, node death and closed fast paths so an old
-    /// worker can never remove a replacement entry.
-    fn remove_if_same(&self, key: EndpointKey, generation: u64) -> bool {
+    #[cfg(any(feature = "ebpf", test))]
+    pub(super) fn retire_staged_identity(
+        &self,
+        client: SocketAddr,
+        dst: SocketAddr,
+        decision_token: u32,
+        generation: u64,
+    ) -> bool {
+        decision_token != 0
+            && self.retire_if_same(EndpointKey::new(client, dst), decision_token, generation)
+    }
+
+    /// Replace only the exact live incarnation with its removal tombstone.
+    fn retire_if_same(&self, key: EndpointKey, token: u32, generation: u64) -> bool {
+        let entry = match self.endpoints.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(mut occupied)
+                if occupied.get().matches_identity(generation, token)
+                    && !matches!(occupied.get(), EndpointEntry::Retiring { .. }) =>
+            {
+                if let EndpointEntry::Initializing(initializing) = occupied.get() {
+                    initializing.cancel();
+                }
+                self.active_retirements.fetch_add(1, Ordering::AcqRel);
+                occupied.insert(EndpointEntry::Retiring { generation, token })
+            }
+            _ => return false,
+        };
+        let conn_id = entry.retire();
+        drop(entry);
+        self.notify_removed(
+            SocketAddr::new(key.client_ip(), key.client_port),
+            SocketAddr::new(key.dst_ip(), key.dst_port),
+            conn_id,
+            RemovalReason::UserspaceEndpointRetired,
+            token,
+            generation,
+        );
+        true
+    }
+
+    /// Acknowledge backend/tracker cleanup and delete only its exact tombstone.
+    pub(crate) fn complete_removal(
+        &self,
+        client: SocketAddr,
+        dst: SocketAddr,
+        decision_token: u32,
+        generation: u64,
+    ) -> bool {
+        let key = EndpointKey::new(client, dst);
         let removed = match self.endpoints.entry(key) {
             dashmap::mapref::entry::Entry::Occupied(occupied)
-                if occupied.get().generation() == generation =>
+                if matches!(
+                    occupied.get(),
+                    EndpointEntry::Retiring { generation: found, token }
+                        if *found == generation && *token == decision_token
+                ) =>
             {
-                Some(occupied.remove())
+                occupied.remove();
+                true
             }
-            _ => None,
+            _ => false,
         };
-        if let Some(entry) = removed {
-            let conn_id = entry.retire();
-            self.notify_removed(
-                SocketAddr::new(key.client_ip(), key.client_port),
-                SocketAddr::new(key.dst_ip(), key.dst_port),
-                conn_id,
-                RemovalReason::UserspaceEndpointRetired,
-            );
-            true
-        } else {
-            false
+        if removed && self.active_retirements.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.retirements_empty.notify_waiters();
         }
+        removed
     }
 
     /// Retire Ready and bound-Initializing mappings for a dead node.
@@ -1176,24 +1519,28 @@ impl UdpEndpointPool {
     /// removed; an unbound reservation is still awaiting a winner. Removal is
     /// generation-safe.
     pub fn remove_by_node(&self, node_id: uuid::Uuid) {
-        let stale: Vec<(EndpointKey, u64)> = self
+        let stale: Vec<(EndpointKey, u32, u64)> = self
             .endpoints
             .iter()
             .filter_map(|entry| match entry.value() {
                 EndpointEntry::Ready(ready) if ready.endpoint.node_id == node_id => {
-                    Some((*entry.key(), ready.generation))
+                    Some((*entry.key(), ready.decision_token, ready.generation))
                 }
                 EndpointEntry::Initializing(initializing)
                     if initializing.selected_node_is(node_id) =>
                 {
-                    Some((*entry.key(), initializing.generation))
+                    Some((
+                        *entry.key(),
+                        initializing.decision_token,
+                        initializing.generation,
+                    ))
                 }
                 _ => None,
             })
             .collect();
         let removed = stale
             .into_iter()
-            .filter(|(key, generation)| self.remove_if_same(*key, *generation))
+            .filter(|(key, token, generation)| self.retire_if_same(*key, *token, *generation))
             .count();
         if removed != 0 {
             debug!(
@@ -1207,21 +1554,21 @@ impl UdpEndpointPool {
     /// I/O failure. Keep this janitor as a conservative backstop for entries
     /// whose reply task has already released its reference.
     pub fn janitor_cycle(&self) -> usize {
-        let stale: Vec<(EndpointKey, u64)> = self
+        let stale: Vec<(EndpointKey, u32, u64)> = self
             .endpoints
             .iter()
             .filter_map(|entry| match entry.value() {
                 EndpointEntry::Ready(ready)
                     if ready.endpoint.ref_count() <= 0 && ready.endpoint.is_expired() =>
                 {
-                    Some((*entry.key(), ready.generation))
+                    Some((*entry.key(), ready.decision_token, ready.generation))
                 }
                 _ => None,
             })
             .collect();
         let removed = stale
             .iter()
-            .filter(|(key, generation)| self.remove_if_same(*key, *generation))
+            .filter(|(key, token, generation)| self.retire_if_same(*key, *token, *generation))
             .count();
         if removed > 0 {
             debug!("UDP endpoint janitor removed {} expired endpoints", removed);
@@ -1265,6 +1612,24 @@ impl UdpEndpointPool {
                 }
                 let notified = self.initializers_empty.notified();
                 if self.active_initializers.load(Ordering::Acquire) == 0 {
+                    return;
+                }
+                notified.await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .is_ok()
+    }
+
+    pub(super) async fn wait_for_retirements(&self) -> bool {
+        let wait = async {
+            loop {
+                if self.active_retirements.load(Ordering::Acquire) == 0 {
+                    return;
+                }
+                let notified = self.retirements_empty.notified();
+                if self.active_retirements.load(Ordering::Acquire) == 0 {
                     return;
                 }
                 notified.await;
@@ -1326,13 +1691,23 @@ impl UdpEndpointPool {
         let initializers_clean =
             slow_tasks_clean && self.active_initializers.load(Ordering::Acquire) == 0;
 
-        let stale: Vec<(EndpointKey, u64)> = self
+        let stale: Vec<(EndpointKey, u32, u64)> = self
             .endpoints
             .iter()
-            .map(|entry| (*entry.key(), entry.value().generation()))
+            .filter_map(|entry| match entry.value() {
+                EndpointEntry::Initializing(initializing) => Some((
+                    *entry.key(),
+                    initializing.decision_token,
+                    initializing.generation,
+                )),
+                EndpointEntry::Ready(ready) => {
+                    Some((*entry.key(), ready.decision_token, ready.generation))
+                }
+                EndpointEntry::Retiring { .. } => None,
+            })
             .collect();
-        for (key, generation) in stale {
-            self.remove_if_same(key, generation);
+        for (key, token, generation) in stale {
+            self.retire_if_same(key, token, generation);
         }
 
         let driver_tasks = {
@@ -1348,8 +1723,9 @@ impl UdpEndpointPool {
         .await;
 
         self.drain_removal_dirty().await;
+        let retirements_clean = self.wait_for_retirements().await;
         self.remove_sink.lock().take();
-        initializers_clean && drivers_clean
+        initializers_clean && drivers_clean && retirements_clean
     }
 
     #[cfg(test)]
@@ -1403,12 +1779,13 @@ pub(super) struct UdpDriverHandle {
 }
 
 /// Owns every terminal driver action. Its synchronous Drop runs after normal
-/// completion, panic unwind, and Tokio task abort; generation-safe removal
-/// makes a stale driver harmless to a replacement mapping.
+/// completion, panic unwind, and Tokio task abort; token-and-generation-safe
+/// retirement makes a stale driver harmless to a replacement mapping.
 struct UdpDriverCleanupGuard {
     pool: Arc<UdpEndpointPool>,
     key: EndpointKey,
     generation: u64,
+    decision_token: u32,
     endpoint: Arc<UdpEndpoint>,
 }
 
@@ -1417,12 +1794,14 @@ impl UdpDriverCleanupGuard {
         pool: Arc<UdpEndpointPool>,
         key: EndpointKey,
         generation: u64,
+        decision_token: u32,
         endpoint: Arc<UdpEndpoint>,
     ) -> Self {
         Self {
             pool,
             key,
             generation,
+            decision_token,
             endpoint,
         }
     }
@@ -1442,7 +1821,8 @@ struct UdpDriverContext {
 impl Drop for UdpDriverCleanupGuard {
     fn drop(&mut self) {
         self.endpoint.release();
-        self.pool.remove_if_same(self.key, self.generation);
+        self.pool
+            .retire_if_same(self.key, self.decision_token, self.generation);
     }
 }
 
@@ -1495,6 +1875,7 @@ impl UdpEndpointPool {
         client_addr: SocketAddr,
         client_dst: SocketAddr,
         generation: u64,
+        decision_token: u32,
         endpoint: Arc<UdpEndpoint>,
         queue_rx: mpsc::Receiver<QueuedDatagram>,
         reply_socket: Arc<UdpSocket>,
@@ -1533,6 +1914,7 @@ impl UdpEndpointPool {
                 Arc::clone(&pool),
                 key,
                 generation,
+                decision_token,
                 Arc::clone(&endpoint),
             );
             let _ = ready_tx.send(());
@@ -1802,6 +2184,34 @@ mod tests {
     }
 
     use super::*;
+
+    async fn recv_and_ack(
+        pool: &UdpEndpointPool,
+        rx: &mut mpsc::Receiver<EndpointRemoval>,
+    ) -> Option<EndpointRemoval> {
+        let removal = rx.recv().await?;
+        assert!(pool.complete_removal(
+            removal.client,
+            removal.dst,
+            removal.decision_token,
+            removal.generation,
+        ));
+        Some(removal)
+    }
+
+    fn try_recv_and_ack(
+        pool: &UdpEndpointPool,
+        rx: &mut mpsc::Receiver<EndpointRemoval>,
+    ) -> Result<EndpointRemoval, mpsc::error::TryRecvError> {
+        let removal = rx.try_recv()?;
+        assert!(pool.complete_removal(
+            removal.client,
+            removal.dst,
+            removal.decision_token,
+            removal.generation,
+        ));
+        Ok(removal)
+    }
     #[test]
     fn pool_constructors_use_max_or_explicit_capacity() {
         assert_eq!(
@@ -2131,6 +2541,7 @@ mod tests {
         };
         let key = first.key;
         let old_generation = first.generation();
+        let old_token = first.decision_token();
         drop(first);
 
         let replacement_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
@@ -2144,10 +2555,269 @@ mod tests {
             EndpointReservation::Initializing(lease) => lease,
             _ => panic!("replacement reservation must initialize"),
         };
-        pool.remove_if_same(key, old_generation);
+        pool.retire_if_same(key, old_token, old_generation);
         assert_eq!(pool.len(), 1, "old cleanup must not remove replacement");
         drop(replacement);
         assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn udp_owned_admission_transfers_allocations_and_preserves_identity() {
+        let pool = Arc::new(UdpEndpointPool::new());
+        let stats = StatsManager::new();
+        let client = make_addr("10.0.0.1", 12345);
+        let dst = make_addr("8.8.8.8", 443);
+        let slow_slots = Arc::new(Semaphore::new(1));
+        let payload = Bytes::from(vec![0x41; 37]);
+        let payload_ptr = payload.as_ptr();
+        let slow_permit = slow_slots.clone().try_acquire_owned().unwrap();
+        let mut lease = match pool.reserve_owned_or_enqueue(
+            client,
+            dst,
+            payload,
+            41,
+            None,
+            slow_permit,
+            &stats,
+        ) {
+            EndpointReservation::Initializing(lease) => lease,
+            _ => panic!("owned first payload must initialize"),
+        };
+        assert_eq!(lease.first_payload().as_ptr(), payload_ptr);
+        assert_eq!(lease.decision_token(), 41);
+        assert!(lease.dns_checked());
+        assert_eq!(slow_slots.available_permits(), 0);
+        assert_eq!(
+            pool.global_payload_bytes.available_permits(),
+            GLOBAL_PAYLOAD_CAPACITY - 37
+        );
+
+        let mut receiver = lease.take_queue_receiver().unwrap();
+        let follower = Bytes::from(vec![0x42; 19]);
+        let follower_ptr = follower.as_ptr();
+        let follower_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        assert!(matches!(
+            pool.reserve_owned_or_enqueue(
+                client,
+                dst,
+                follower,
+                41,
+                Some(lease.generation()),
+                follower_permit,
+                &stats,
+            ),
+            EndpointReservation::Enqueued
+        ));
+        let queued = receiver.try_recv().unwrap();
+        assert_eq!(queued.data.as_ptr(), follower_ptr);
+        drop(queued);
+        drop(lease.take_first());
+        drop(lease);
+        assert_eq!(slow_slots.available_permits(), 1);
+        assert_eq!(
+            pool.global_payload_bytes.available_permits(),
+            GLOBAL_PAYLOAD_CAPACITY
+        );
+    }
+
+    #[test]
+    fn udp_retiring_tombstone_requires_exact_ack_before_tuple_reuse() {
+        let pool = Arc::new(UdpEndpointPool::new());
+        let stats = StatsManager::new();
+        let client = make_addr("10.0.0.1", 12345);
+        let dst = make_addr("8.8.8.8", 443);
+        let (removed_tx, mut removed_rx) = mpsc::channel(4);
+        pool.set_remove_sink(removed_tx);
+        let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        let lease = match pool.reserve_owned_or_enqueue(
+            client,
+            dst,
+            Bytes::from_static(b"held"),
+            77,
+            None,
+            slow_permit,
+            &stats,
+        ) {
+            EndpointReservation::Initializing(lease) => lease,
+            _ => panic!("staged payload must initialize"),
+        };
+        let generation = lease.generation();
+        assert!(pool.retire_staged_identity(client, dst, 77, generation));
+        assert!(!lease.still_initializing());
+        assert!(matches!(
+            pool.reserve_or_enqueue(
+                client,
+                dst,
+                b"too-early",
+                Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+                &stats,
+            ),
+            EndpointReservation::QueueClosed
+        ));
+        assert!(!pool.complete_removal(client, dst, 78, generation));
+        assert!(!pool.complete_removal(client, dst, 77, generation + 1));
+        let removal = removed_rx.try_recv().unwrap();
+        assert_eq!(removal.decision_token, 77);
+        assert_eq!(removal.generation, generation);
+        assert!(pool.complete_removal(client, dst, 77, generation));
+
+        let replacement = match pool.reserve_or_enqueue(
+            client,
+            dst,
+            b"replacement",
+            Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+            &stats,
+        ) {
+            EndpointReservation::Initializing(lease) => lease,
+            _ => panic!("acknowledged tombstone must allow replacement"),
+        };
+        assert_ne!(replacement.generation(), generation);
+        assert!(!pool.complete_removal(client, dst, 77, generation));
+        assert!(replacement.still_initializing());
+        drop(replacement);
+        let replacement_removal = removed_rx.try_recv().unwrap();
+        assert!(pool.complete_removal(
+            replacement_removal.client,
+            replacement_removal.dst,
+            replacement_removal.decision_token,
+            replacement_removal.generation,
+        ));
+    }
+
+    #[test]
+    fn udp_kernel_handoff_preserves_terminal_identity_until_ack() {
+        let pool = Arc::new(UdpEndpointPool::new());
+        let stats = StatsManager::new();
+        let client = make_addr("10.0.0.1", 12345);
+        let dst = make_addr("8.8.8.8", 443);
+        let (removed_tx, mut removed_rx) = mpsc::channel(1);
+        pool.set_remove_sink(removed_tx);
+        let mut lease = match pool.reserve_owned_or_enqueue(
+            client,
+            dst,
+            Bytes::from_static(b"held"),
+            91,
+            None,
+            Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+            &stats,
+        ) {
+            EndpointReservation::Initializing(lease) => lease,
+            _ => panic!("staged payload must initialize"),
+        };
+        let generation = lease.generation();
+        assert!(lease.commit_kernel_handoff());
+        let removal = removed_rx.try_recv().unwrap();
+        assert_eq!(removal.reason, RemovalReason::KernelHandoff);
+        assert_eq!(removal.decision_token, 91);
+        assert_eq!(removal.generation, generation);
+        assert!(matches!(
+            pool.reserve_owned_or_enqueue(
+                client,
+                dst,
+                Bytes::from_static(b"late"),
+                91,
+                Some(generation),
+                Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+                &stats,
+            ),
+            EndpointReservation::QueueClosed
+        ));
+        assert!(pool.complete_removal(client, dst, 91, generation));
+    }
+
+    #[tokio::test]
+    async fn udp_exact_retirement_cancels_matching_initializer() {
+        let pool = Arc::new(UdpEndpointPool::new());
+        let stats = StatsManager::new();
+        let client = make_addr("10.0.0.1", 12345);
+        let dst = make_addr("8.8.8.8", 443);
+        let (removed_tx, mut removed_rx) = mpsc::channel(1);
+        pool.set_remove_sink(removed_tx);
+        let lease = match pool.reserve_owned_or_enqueue(
+            client,
+            dst,
+            Bytes::from_static(b"held"),
+            97,
+            None,
+            Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+            &stats,
+        ) {
+            EndpointReservation::Initializing(lease) => lease,
+            _ => panic!("staged payload must initialize"),
+        };
+        let generation = lease.generation();
+        let cancellation = lease.wait_cancellation();
+
+        assert!(pool.retire_staged_identity(client, dst, 97, generation));
+        tokio::time::timeout(Duration::from_millis(100), cancellation)
+            .await
+            .expect("exact retirement must wake the initializer");
+        let removal = removed_rx.try_recv().unwrap();
+        assert!(pool.complete_removal(
+            removal.client,
+            removal.dst,
+            removal.decision_token,
+            removal.generation,
+        ));
+        drop(lease);
+    }
+
+    #[test]
+    fn udp_live_reconstruction_enqueues_owned_payload_by_token() {
+        let pool = Arc::new(UdpEndpointPool::new());
+        let stats = StatsManager::new();
+        let client = make_addr("10.0.0.1", 12345);
+        let dst = make_addr("8.8.8.8", 443);
+        let relay = make_addr("192.168.1.1", 1080);
+        let mut lease = match pool.reserve_owned_or_enqueue(
+            client,
+            dst,
+            Bytes::from_static(b"first"),
+            101,
+            None,
+            Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+            &stats,
+        ) {
+            EndpointReservation::Initializing(lease) => lease,
+            _ => panic!("staged payload must initialize"),
+        };
+        let generation = lease.generation();
+        let mut receiver = lease.take_queue_receiver().unwrap();
+        let initializing_payload = Bytes::from(vec![0x44; 19]);
+        let initializing_ptr = initializing_payload.as_ptr();
+        assert!(matches!(
+            pool.enqueue_owned_by_token(client, dst, initializing_payload, 101, &stats),
+            Ok(found) if found == generation
+        ));
+        let queued = receiver.try_recv().unwrap();
+        assert_eq!(queued.data.as_ptr(), initializing_ptr);
+        drop(queued);
+        let endpoint =
+            driver_test_endpoint(Arc::new(ScriptedPacketTransport::new(relay, [])), relay);
+        assert!(lease.commit_ready(endpoint));
+
+        let payload = Bytes::from(vec![0x55; 23]);
+        let payload_ptr = payload.as_ptr();
+        assert!(matches!(
+            pool.enqueue_owned_by_token(client, dst, payload, 101, &stats),
+            Ok(found) if found == generation
+        ));
+        let queued = receiver.try_recv().unwrap();
+        assert_eq!(queued.data.as_ptr(), payload_ptr);
+        drop(queued);
+        assert!(matches!(
+            pool.reserve_owned_or_enqueue(
+                client,
+                dst,
+                Bytes::from_static(b"stale"),
+                101,
+                Some(generation + 1),
+                Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+                &stats,
+            ),
+            EndpointReservation::IdentityMismatch
+        ));
+        pool.remove(client, dst);
     }
 
     #[test]
@@ -2227,7 +2897,7 @@ mod tests {
                 _ => panic!("closed queue must allow recreation as Initializing"),
             };
         // The closed Initializing generation was retired; only the replacement remains.
-        // Drop the original lease (its remove_if_same is a no-op against the newer gen).
+        // The old lease identity cannot retire the newer generation.
         drop(lease);
         assert_eq!(pool.len(), 1);
         assert!(replacement.still_initializing());
@@ -2411,10 +3081,12 @@ mod tests {
         drop(lease);
 
         assert_eq!(
-            removed_rx.try_recv().unwrap(),
+            try_recv_and_ack(&pool, &mut removed_rx).unwrap(),
             EndpointRemoval {
                 client,
                 dst,
+                decision_token: 0,
+                generation: 1,
                 conn_id: Some("tracker-before-commit".to_owned()),
                 reason: RemovalReason::UserspaceEndpointRetired,
             }
@@ -2510,6 +3182,7 @@ mod tests {
             client,
             dst,
             lease.generation(),
+            lease.decision_token(),
             Arc::clone(&endpoint),
             queue_rx,
             test_reply_socket().await,
@@ -2842,6 +3515,7 @@ mod tests {
             client,
             dst,
             lease.generation(),
+            lease.decision_token(),
             Arc::clone(&endpoint),
             queue_rx,
             test_reply_socket().await,
@@ -2857,10 +3531,12 @@ mod tests {
         tokio::task::yield_now().await;
         tokio::time::advance(REPLY_IDLE_TIMEOUT).await;
         assert_eq!(
-            removed_rx.recv().await,
+            recv_and_ack(&pool, &mut removed_rx).await,
             Some(EndpointRemoval {
                 client,
                 dst,
+                decision_token: 0,
+                generation: 1,
                 conn_id: Some("idle-tracker".to_owned()),
                 reason: RemovalReason::UserspaceEndpointRetired,
             })
@@ -2912,6 +3588,7 @@ mod tests {
             client,
             dst,
             lease.generation(),
+            lease.decision_token(),
             Arc::clone(&endpoint),
             queue_rx,
             test_reply_socket().await,
@@ -2927,7 +3604,14 @@ mod tests {
         assert_eq!(pool.driver_count(), 1);
         assert_eq!(stats.snapshot()["shutdown-node"].active_conns, 1);
 
+        let ack_pool = Arc::clone(&pool);
+        let removal_ack = tokio::spawn(async move {
+            let removal = recv_and_ack(&ack_pool, &mut removed_rx).await;
+            let closed = removed_rx.recv().await;
+            (removal, closed)
+        });
         assert!(pool.shutdown().await);
+        let (removal, removal_channel_closed) = removal_ack.await.unwrap();
 
         assert!(pool.is_terminal());
         assert!(pool.is_empty());
@@ -2944,15 +3628,17 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(
-            removed_rx.recv().await,
+            removal,
             Some(EndpointRemoval {
                 client,
                 dst,
+                decision_token: 0,
+                generation: 1,
                 conn_id: Some("shutdown-tracker".to_owned()),
                 reason: RemovalReason::UserspaceEndpointRetired,
             })
         );
-        assert_eq!(removed_rx.recv().await, None);
+        assert_eq!(removal_channel_closed, None);
         assert_eq!(
             pool.global_payload_bytes.available_permits(),
             GLOBAL_PAYLOAD_CAPACITY
@@ -2995,22 +3681,31 @@ mod tests {
         assert_eq!(pool.slow_task_count(), 1);
         assert_eq!(stats.snapshot()["stuck-initializer"].active_conns, 1);
 
+        let ack_pool = Arc::clone(&pool);
+        let removal_ack = tokio::spawn(async move {
+            let removal = recv_and_ack(&ack_pool, &mut removed_rx).await;
+            let closed = removed_rx.recv().await;
+            (removal, closed)
+        });
         assert!(pool.shutdown().await);
+        let (removal, removal_channel_closed) = removal_ack.await.unwrap();
 
         assert_eq!(pool.slow_task_count(), 0);
         assert!(!pool.spawn_slow_path(async {}));
         assert!(pool.is_empty());
         assert_eq!(stats.snapshot()["stuck-initializer"].active_conns, 0);
         assert_eq!(
-            removed_rx.recv().await,
+            removal,
             Some(EndpointRemoval {
                 client,
                 dst,
+                decision_token: 0,
+                generation: 1,
                 conn_id: Some("stuck-tracker".to_owned()),
                 reason: RemovalReason::UserspaceEndpointRetired,
             })
         );
-        assert_eq!(removed_rx.recv().await, None);
+        assert_eq!(removal_channel_closed, None);
         assert_eq!(
             pool.global_payload_bytes.available_permits(),
             GLOBAL_PAYLOAD_CAPACITY
@@ -3019,7 +3714,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn udp_endpoint_driver_receive_and_reinject_errors_clean_up() {
+    async fn udp_endpoint_driver_receive_and_reply_errors_clean_up() {
         for (client, transport) in [
             (
                 make_addr("10.0.0.1", 12345),
@@ -3063,6 +3758,7 @@ mod tests {
                 client,
                 dst,
                 lease.generation(),
+                lease.decision_token(),
                 Arc::clone(&endpoint),
                 queue_rx,
                 test_reply_socket().await,
@@ -3076,10 +3772,12 @@ mod tests {
             drop(lease);
             driver.wait_first_ack().await.unwrap();
             assert_eq!(
-                removed_rx.recv().await,
+                recv_and_ack(&pool, &mut removed_rx).await,
                 Some(EndpointRemoval {
                     client,
                     dst,
+                    decision_token: 0,
+                    generation: 1,
                     conn_id: Some("receive-tracker".to_owned()),
                     reason: RemovalReason::UserspaceEndpointRetired,
                 })
@@ -3136,6 +3834,7 @@ mod tests {
             client,
             dst,
             lease.generation(),
+            lease.decision_token(),
             Arc::clone(&endpoint),
             queue_rx,
             test_reply_socket().await,
@@ -3151,10 +3850,12 @@ mod tests {
         transport.wait_for_send_count(2).await;
         receive_failure.notify_waiters();
         assert_eq!(
-            removed_rx.recv().await,
+            recv_and_ack(&pool, &mut removed_rx).await,
             Some(EndpointRemoval {
                 client,
                 dst,
+                decision_token: 0,
+                generation: 1,
                 conn_id: Some("blocked-receive-tracker".to_owned()),
                 reason: RemovalReason::UserspaceEndpointRetired,
             })
@@ -3196,6 +3897,7 @@ mod tests {
             client,
             dst,
             lease.generation(),
+            lease.decision_token(),
             Arc::clone(&endpoint),
             queue_rx,
             test_reply_socket().await,
@@ -3209,12 +3911,14 @@ mod tests {
         assert!(driver.wait_first_ack().await.is_err());
 
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), removed_rx.recv())
+            tokio::time::timeout(Duration::from_secs(1), recv_and_ack(&pool, &mut removed_rx))
                 .await
                 .unwrap(),
             Some(EndpointRemoval {
                 client,
                 dst,
+                decision_token: 0,
+                generation: 1,
                 conn_id: Some("worker-tracker".to_owned()),
                 reason: RemovalReason::UserspaceEndpointRetired,
             })
@@ -3254,6 +3958,7 @@ mod tests {
             client,
             dst,
             lease.generation(),
+            lease.decision_token(),
             Arc::clone(&endpoint),
             queue_rx,
             test_reply_socket().await,
@@ -3268,12 +3973,14 @@ mod tests {
 
         assert!(driver.wait_first_ack().await.is_err());
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), removed_rx.recv())
+            tokio::time::timeout(Duration::from_secs(1), recv_and_ack(&pool, &mut removed_rx))
                 .await
                 .expect("panic cleanup must notify the removal sink"),
             Some(EndpointRemoval {
                 client,
                 dst,
+                decision_token: 0,
+                generation: 1,
                 conn_id: Some("panic-tracker".to_owned()),
                 reason: RemovalReason::UserspaceEndpointRetired,
             })
@@ -3320,6 +4027,7 @@ mod tests {
             client,
             dst,
             lease.generation(),
+            lease.decision_token(),
             Arc::clone(&endpoint),
             queue_rx,
             test_reply_socket().await,
@@ -3335,12 +4043,14 @@ mod tests {
 
         driver.abort();
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), removed_rx.recv())
+            tokio::time::timeout(Duration::from_secs(1), recv_and_ack(&pool, &mut removed_rx))
                 .await
                 .expect("aborted driver must notify the removal sink"),
             Some(EndpointRemoval {
                 client,
                 dst,
+                decision_token: 0,
+                generation: 1,
                 conn_id: Some("abort-tracker".to_owned()),
                 reason: RemovalReason::UserspaceEndpointRetired,
             })
@@ -3402,6 +4112,7 @@ mod tests {
             client,
             dst,
             old_lease.generation(),
+            old_lease.decision_token(),
             Arc::clone(&old_endpoint),
             old_queue_rx,
             test_reply_socket().await,
@@ -3416,10 +4127,12 @@ mod tests {
 
         pool.remove(client, dst);
         assert_eq!(
-            removed_rx.try_recv().unwrap(),
+            try_recv_and_ack(&pool, &mut removed_rx).unwrap(),
             EndpointRemoval {
                 client,
                 dst,
+                decision_token: 0,
+                generation: 1,
                 conn_id: Some("old-tracker".to_owned()),
                 reason: RemovalReason::UserspaceEndpointRetired,
             }
@@ -3465,17 +4178,19 @@ mod tests {
             !lease.still_initializing(),
             "bound Initializing entry must be generation-safely removed"
         );
-        assert!(pool.is_empty());
         // No tracker was attached yet, so sink sees None conn_id.
         assert_eq!(
-            removed_rx.try_recv().unwrap(),
+            try_recv_and_ack(&pool, &mut removed_rx).unwrap(),
             EndpointRemoval {
                 client,
                 dst,
+                decision_token: 0,
+                generation: 1,
                 conn_id: None,
                 reason: RemovalReason::UserspaceEndpointRetired,
             }
         );
+        assert!(pool.is_empty());
 
         let relay = make_addr("192.168.1.1", 1080);
         let transport = Arc::new(ScriptedPacketTransport::new(relay, [DriverSendAction::Ok]));
@@ -3522,10 +4237,12 @@ mod tests {
         pool.remove_by_node(DEAD_NODE_ID);
         assert!(!lease.still_initializing());
         assert_eq!(
-            removed_rx.try_recv().unwrap(),
+            try_recv_and_ack(&pool, &mut removed_rx).unwrap(),
             EndpointRemoval {
                 client,
                 dst,
+                decision_token: 0,
+                generation: 1,
                 conn_id: Some("during-dial".to_owned()),
                 reason: RemovalReason::UserspaceEndpointRetired,
             }
@@ -3578,6 +4295,7 @@ mod tests {
             client,
             dst,
             lease.generation(),
+            lease.decision_token(),
             Arc::clone(&endpoint),
             queue_rx,
             test_reply_socket().await,
@@ -3590,16 +4308,18 @@ mod tests {
         // Death wins after driver-ready, before commit_ready.
         pool.remove_by_node(DEAD_NODE_ID);
         assert!(!lease.still_initializing());
-        assert!(pool.is_empty());
         assert_eq!(
-            removed_rx.try_recv().unwrap(),
+            try_recv_and_ack(&pool, &mut removed_rx).unwrap(),
             EndpointRemoval {
                 client,
                 dst,
+                decision_token: 0,
+                generation: 1,
                 conn_id: Some("before-commit".to_owned()),
                 reason: RemovalReason::UserspaceEndpointRetired,
             }
         );
+        assert!(pool.is_empty());
         assert!(
             !lease.commit_ready(endpoint),
             "commit after death-before-commit must fail"
@@ -3640,6 +4360,7 @@ mod tests {
             client,
             dst,
             lease.generation(),
+            lease.decision_token(),
             Arc::clone(&endpoint),
             queue_rx,
             test_reply_socket().await,
@@ -3651,19 +4372,18 @@ mod tests {
         assert!(lease.commit_ready(endpoint));
 
         pool.remove_by_node(DEAD_NODE_ID);
-        assert!(
-            pool.is_empty(),
-            "node death must retire every Ready mapping"
-        );
         assert_eq!(
-            removed_rx.try_recv().unwrap(),
+            try_recv_and_ack(&pool, &mut removed_rx).unwrap(),
             EndpointRemoval {
                 client,
                 dst,
+                decision_token: 0,
+                generation: 1,
                 conn_id: Some("dead-before-start".to_owned()),
                 reason: RemovalReason::UserspaceEndpointRetired,
             }
         );
+        assert!(pool.is_empty(), "acknowledged node death must remove Ready");
         let replacement_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
         let replacement =
             pool.reserve_or_enqueue(client, dst, b"replacement", replacement_permit, &stats);
@@ -3766,10 +4486,12 @@ mod tests {
 
         pool.remove_by_node(DEAD_NODE_ID);
         assert_eq!(
-            removed_rx.try_recv().unwrap(),
+            try_recv_and_ack(&pool, &mut removed_rx).unwrap(),
             EndpointRemoval {
                 client: node_client,
                 dst,
+                decision_token: 0,
+                generation: 1,
                 conn_id: Some("node-tracker".to_owned()),
                 reason: RemovalReason::UserspaceEndpointRetired,
             }
@@ -3792,10 +4514,12 @@ mod tests {
 
         assert_eq!(pool.janitor_cycle(), 1);
         assert_eq!(
-            removed_rx.try_recv().unwrap(),
+            try_recv_and_ack(&pool, &mut removed_rx).unwrap(),
             EndpointRemoval {
                 client: janitor_client,
                 dst,
+                decision_token: 0,
+                generation: 2,
                 conn_id: Some("janitor-tracker".to_owned()),
                 reason: RemovalReason::UserspaceEndpointRetired,
             }

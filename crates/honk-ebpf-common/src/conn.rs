@@ -16,7 +16,8 @@ use network_types::{
 ///
 /// Layout (repr(C), total 56 bytes):
 ///   offset 0:  is_wan_ingress_direction: u8
-///   offset 1:  state: u8 (0=active, 1=closing for TCP)
+///   offset 1:  state: u8 (`TcpState` for TCP, `UdpDecisionState` for UDP)
+///   offset 4:  decision_token: u32 (nonzero only for staged UDP flows)
 ///   offset 8:  last_seen_ns: u64 (monotonic timestamp from bpf_ktime_get_ns)
 ///   offset 16: meta: RoutingMeta (cached routing decision)
 ///   offset 24: mac: [u8; 6] (source MAC)
@@ -28,6 +29,7 @@ use network_types::{
 pub struct ConnState {
     pub is_wan_ingress_direction: u8,
     pub state: u8,
+    pub decision_token: u32,
     pub last_seen_ns: u64,
     pub meta: RoutingMeta,
     pub mac: [u8; 6],
@@ -35,6 +37,20 @@ pub struct ConnState {
     pub pname: [u8; TASK_COMM_LEN],
     pub pid: u32,
 }
+
+const _CONN_STATE_SIZE: () = assert!(core::mem::size_of::<ConnState>() == 56);
+const _CONN_STATE_ALIGN: () = assert!(core::mem::align_of::<ConnState>() == 8);
+const _CONN_STATE_DIRECTION_OFFSET: () =
+    assert!(core::mem::offset_of!(ConnState, is_wan_ingress_direction) == 0);
+const _CONN_STATE_STATE_OFFSET: () = assert!(core::mem::offset_of!(ConnState, state) == 1);
+const _CONN_STATE_TOKEN_OFFSET: () = assert!(core::mem::offset_of!(ConnState, decision_token) == 4);
+const _CONN_STATE_LAST_SEEN_OFFSET: () =
+    assert!(core::mem::offset_of!(ConnState, last_seen_ns) == 8);
+const _CONN_STATE_META_OFFSET: () = assert!(core::mem::offset_of!(ConnState, meta) == 16);
+const _CONN_STATE_MAC_OFFSET: () = assert!(core::mem::offset_of!(ConnState, mac) == 24);
+const _CONN_STATE_PADDING_OFFSET: () = assert!(core::mem::offset_of!(ConnState, padding) == 30);
+const _CONN_STATE_PNAME_OFFSET: () = assert!(core::mem::offset_of!(ConnState, pname) == 32);
+const _CONN_STATE_PID_OFFSET: () = assert!(core::mem::offset_of!(ConnState, pid) == 48);
 
 // Matches the C enum bpf_stats_key.
 // The C enum's underlying type defaults to int (32-bit); use u32 for compatibility.
@@ -74,6 +90,56 @@ pub enum TcpState {
     TcpStateActive = 0,
     TcpStateClosing = 1,
 }
+
+/// Protocol-specific state stored in [`ConnState::state`] for UDP entries.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UdpDecisionState {
+    None = 0,
+    Preparing = 1,
+    Pending = 2,
+    DirectArmed = 3,
+    Proxy = 4,
+    Block = 5,
+}
+
+const _UDP_DECISION_STATE_SIZE: () = assert!(core::mem::size_of::<UdpDecisionState>() == 1);
+const _UDP_DECISION_STATE_VALUES: () = assert!(
+    UdpDecisionState::None as u8 == 0
+        && UdpDecisionState::Preparing as u8 == 1
+        && UdpDecisionState::Pending as u8 == 2
+        && UdpDecisionState::DirectArmed as u8 == 3
+        && UdpDecisionState::Proxy as u8 == 4
+        && UdpDecisionState::Block as u8 == 5
+);
+
+/// Persistent allocator value shared by the BPF sequence map and userspace.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct UdpDecisionSequence {
+    pub lock: aya_ebpf_bindings::bindings::bpf_spin_lock,
+    pub next: u32,
+    pub exhausted: u32,
+}
+
+impl Default for UdpDecisionSequence {
+    fn default() -> Self {
+        Self {
+            lock: aya_ebpf_bindings::bindings::bpf_spin_lock { val: 0 },
+            next: 0,
+            exhausted: 0,
+        }
+    }
+}
+
+const _UDP_DECISION_SEQUENCE_SIZE: () = assert!(core::mem::size_of::<UdpDecisionSequence>() == 12);
+const _UDP_DECISION_SEQUENCE_ALIGN: () = assert!(core::mem::align_of::<UdpDecisionSequence>() == 4);
+const _UDP_DECISION_SEQUENCE_LOCK_OFFSET: () =
+    assert!(core::mem::offset_of!(UdpDecisionSequence, lock) == 0);
+const _UDP_DECISION_SEQUENCE_NEXT_OFFSET: () =
+    assert!(core::mem::offset_of!(UdpDecisionSequence, next) == 4);
+const _UDP_DECISION_SEQUENCE_EXHAUSTED_OFFSET: () =
+    assert!(core::mem::offset_of!(UdpDecisionSequence, exhausted) == 8);
 
 #[inline(always)]
 pub fn tcp_conn_state_expired(state: &ConnState, elapsed_ns: u64) -> bool {
@@ -200,6 +266,8 @@ impl ConntrackArgs {
 
 #[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for ConnState {}
+#[cfg(not(target_arch = "bpf"))]
+unsafe impl aya::Pod for UdpDecisionSequence {}
 
 #[cfg(test)]
 mod tests {
@@ -230,5 +298,22 @@ mod tests {
             &state,
             TCP_CONN_STATE_CLOSING_TIMEOUT_NS + 1
         ));
+    }
+
+    #[test]
+    fn udp_state_and_token_share_the_conn_state_without_aliasing() {
+        let mut state = ConnState {
+            state: UdpDecisionState::Pending as u8,
+            ..Default::default()
+        };
+        state.decision_token = 0x7fff_ffff;
+
+        assert_eq!(state.state, UdpDecisionState::Pending as u8);
+        assert_eq!(state.decision_token, 0x7fff_ffff);
+        assert_eq!(UdpDecisionState::None as u8, TcpState::TcpStateActive as u8);
+        assert_eq!(
+            UdpDecisionState::Preparing as u8,
+            TcpState::TcpStateClosing as u8
+        );
     }
 }
