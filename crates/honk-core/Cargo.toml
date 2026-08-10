@@ -118,6 +118,7 @@ anyhow.workspace = true
 
 [dev-dependencies]
 # Test utilities
+tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
 tokio-tungstenite.workspace = true
 rcgen.workspace = true
