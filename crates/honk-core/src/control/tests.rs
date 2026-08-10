@@ -3807,7 +3807,7 @@ async fn udp_removal_worker_retires_legacy_token_zero_conn_state() {
 }
 
 #[tokio::test]
-async fn udp_removal_worker_escalates_token_mismatch() {
+async fn udp_removal_worker_acknowledges_superseding_token() {
     use honk_ebpf_common::conn::{ConnState, UdpDecisionState};
 
     let client: SocketAddr = "10.0.0.1:53000".parse().unwrap();
@@ -3820,6 +3820,74 @@ async fn udp_removal_worker_escalates_token_mismatch() {
             state: UdpDecisionState::Pending as u8,
             decision_token: 42,
             ..ConnState::default()
+        },
+    )
+    .unwrap();
+    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(mock)));
+    let pool = Arc::new(UdpEndpointPool::new());
+    let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel();
+    let removal_task = spawn_udp_removal_worker(
+        Arc::clone(&pool),
+        Arc::clone(&backend),
+        Arc::new(ConnectionTracker::new()),
+        fatal_tx,
+    );
+    let lease = match pool.reserve_owned_or_enqueue(
+        client,
+        dst,
+        Bytes::from_static(b"held datagram"),
+        41,
+        None,
+        Arc::new(tokio::sync::Semaphore::new(1))
+            .try_acquire_owned()
+            .unwrap(),
+        &StatsManager::new(),
+    ) {
+        udp_endpoint::EndpointReservation::Initializing(lease) => lease,
+        _ => panic!("expected an initializing lease"),
+    };
+
+    drop(lease);
+    assert!(pool.wait_for_retirements().await);
+    assert!(pool.is_empty());
+    assert_eq!(
+        backend
+            .read()
+            .await
+            .udp_conn_state_lookup(&key)
+            .unwrap()
+            .unwrap()
+            .decision_token,
+        42
+    );
+    assert!(fatal_rx.try_recv().is_err());
+
+    assert!(pool.shutdown().await);
+    removal_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn udp_removal_worker_escalates_auxiliary_token_mismatch() {
+    use honk_ebpf_common::conn::{ConnState, UdpDecisionState};
+    use honk_ebpf_common::{RedirectEntry, RedirectTuple};
+
+    let client: SocketAddr = "10.0.0.1:53000".parse().unwrap();
+    let dst: SocketAddr = "203.0.113.1:443".parse().unwrap();
+    let key = connection::build_tuples_key(dst.ip(), dst.port(), client.ip(), client.port(), 17);
+    let mut mock = crate::ebpf::mock::MockEbpfBackend::new();
+    mock.seed_staged_udp_flow(
+        &key,
+        ConnState {
+            state: UdpDecisionState::Pending as u8,
+            decision_token: 41,
+            ..ConnState::default()
+        },
+    );
+    mock.redirect_track_store(
+        &RedirectTuple::from_tuples(&key),
+        &RedirectEntry {
+            decision_token: 42,
+            ..RedirectEntry::default()
         },
     )
     .unwrap();
@@ -3850,7 +3918,7 @@ async fn udp_removal_worker_escalates_token_mismatch() {
     drop(lease);
     let fatal = tokio::time::timeout(Duration::from_secs(1), fatal_rx.recv())
         .await
-        .expect("removal mismatch must reach supervision")
+        .expect("auxiliary mismatch must reach supervision")
         .expect("removal fatal channel must remain open");
     assert!(fatal.to_string().contains("identity mismatch"));
 

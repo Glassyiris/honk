@@ -96,6 +96,8 @@ pub enum UdpDecisionTransition {
 pub enum UdpDecisionCommitResult {
     Applied,
     Missing,
+    /// A newer kernel incarnation owns the tuple; nothing was removed.
+    Superseded,
     TokenMismatch,
     StateMismatch,
 }
@@ -533,7 +535,8 @@ pub trait EbpfBackend: Send + Sync {
 
     /// Retire a userspace-owned flow. Nonzero tokens remove only the matching
     /// staged/proxy incarnation and auxiliaries; zero removes only a legacy
-    /// published, non-offloaded forward state. Kernel handoffs are retained.
+    /// published, non-offloaded forward state. Kernel handoffs and superseding
+    /// tuple incarnations are retained.
     fn remove_udp_flow(
         &mut self,
         key: &TuplesKey,

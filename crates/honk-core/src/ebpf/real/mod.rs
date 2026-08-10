@@ -460,7 +460,11 @@ impl RealEbpfBackend {
                 return Ok(UdpDecisionCommitResult::Missing);
             };
             if state.decision_token != token {
-                return Ok(UdpDecisionCommitResult::TokenMismatch);
+                return Ok(if pending_only {
+                    UdpDecisionCommitResult::TokenMismatch
+                } else {
+                    UdpDecisionCommitResult::Superseded
+                });
             }
             let state_allowed = if pending_only {
                 state.state == UdpDecisionState::Preparing as u8
@@ -963,7 +967,7 @@ impl EbpfBackend for RealEbpfBackend {
                 return Ok(UdpDecisionCommitResult::Missing);
             };
             if !udp_state_is_legacy_userspace_owned(&state) {
-                return Ok(UdpDecisionCommitResult::StateMismatch);
+                return Ok(UdpDecisionCommitResult::Superseded);
             }
             if !backend.hash_remove_present::<_, ConnState>("CONN_STATE_MAP", key)? {
                 return Ok(UdpDecisionCommitResult::Missing);

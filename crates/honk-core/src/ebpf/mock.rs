@@ -247,7 +247,11 @@ impl MockEbpfBackend {
             return Ok(UdpDecisionCommitResult::Missing);
         };
         if state.decision_token != token {
-            return Ok(UdpDecisionCommitResult::TokenMismatch);
+            return Ok(if pending_only {
+                UdpDecisionCommitResult::TokenMismatch
+            } else {
+                UdpDecisionCommitResult::Superseded
+            });
         }
         let state_allowed = if pending_only {
             state.state == UdpDecisionState::Preparing as u8
@@ -967,7 +971,7 @@ impl EbpfBackend for MockEbpfBackend {
             return Ok(UdpDecisionCommitResult::Missing);
         };
         if !udp_state_is_legacy_userspace_owned(&state) {
-            return Ok(UdpDecisionCommitResult::StateMismatch);
+            return Ok(UdpDecisionCommitResult::Superseded);
         }
         if self.udp_conn_states.remove(&key_bytes).is_some() {
             super::USERSPACE_CONN_STATE_DELETES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1781,7 +1785,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 backend.remove_udp_flow(&key, 0).unwrap(),
-                UdpDecisionCommitResult::StateMismatch
+                UdpDecisionCommitResult::Superseded
             );
             assert!(backend.udp_conn_state_lookup(&key).unwrap().is_some());
         }
