@@ -437,12 +437,8 @@ impl ClientConfig {
 }
 
 fn select_padding(rng: &mut impl rand::Rng, spec: PaddingSpec) -> usize {
-    if spec.probability >= rng.random_range(0..100) {
-        if spec.min == spec.max {
-            spec.min
-        } else {
-            rng.random_range(spec.min..spec.max)
-        }
+    if rng.random_range(0u8..100) < spec.probability {
+        rng.random_range(spec.min..=spec.max)
     } else {
         0
     }
