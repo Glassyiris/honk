@@ -1,46 +1,4 @@
 //! VMess AEAD outbound handler (alterId = 0).
-//!
-//! Implements the VMess AEAD wire format as specified by Xray-core
-//! (`proxy/vmess/aead`, `proxy/vmess/encoding`) and sing-vmess — the format
-//! sing-box/v2ray servers actually speak:
-//!
-//! 1. **Request header** (`aead/encrypt.go` `SealVMessAEADHeader`):
-//!    ```text
-//!    auth_id(16) | enc_len(2+16) | conn_nonce(8) | enc_header(N+16)
-//!    ```
-//!    - `auth_id`: AES-128 single-block encrypt of
-//!      `ts(8 BE) | rand(4) | crc32(ts|rand)(4 BE)` under
-//!      `KDF16(cmd_key, "AES Auth ID Encryption")` (`aead/authid.go`).
-//!    - `enc_len`/`enc_header`: AES-128-GCM with keys/nonces from
-//!      `KDF(cmd_key, salt, auth_id, conn_nonce)`, AAD = auth_id.
-//!    - `cmd_key = MD5(uuid || "c48619fe-8f02-49e0-b9e9-edf763e17e21")`.
-//!    - `KDF` is the chained HMAC-SHA256 of `aead/kdf.go` with salt seed
-//!      `"VMess AEAD KDF"`.
-//!
-//! 2. **Header plaintext** (`encoding/client.go` `EncodeRequestHeader`):
-//!    ```text
-//!    version(1) | req_iv(16) | req_key(16) | resp_header(1) | option(1) |
-//!    padding_len<<4|security(1) | 0(1) | cmd(1) | port(2 BE) | atyp+addr |
-//!    padding | fnv1a32(4 BE)
-//!    ```
-//!    ATYP numbering is V2Ray's (IPv4=1, Domain=2, IPv6=3) and the port
-//!    comes FIRST (`addrParser.WriteAddressPort`).
-//!
-//! 3. **Body chunks** (`common/crypto` `AuthenticationWriter` +
-//!    `encoding/auth.go` `ShakeSizeParser`):
-//!    ```text
-//!    masked_len(2) | encrypted_payload(len+16)
-//!    ```
-//!    - `masked_len = BE16(payload_len+16) XOR SHAKE128(iv)` (2 bytes per
-//!      chunk from one continuous SHAKE stream, option `ChunkMasking`).
-//!    - AES-128-GCM key = body key, nonce = `count(2 BE) | iv[2..12]`,
-//!      count starts at 0 (`GenerateChunkNonce`).
-//!    - An empty-payload chunk (len field = 16) terminates the request body.
-//!
-//! 4. **Response**: body key/iv are `SHA256(req_key/req_iv)[..16]`; the
-//!    response header is AES-128-GCM with `KDF` salts
-//!    `"AEAD Resp Header {Len,}{Key,IV}"` and no AAD
-//!    (`encoding/client.go` `DecodeResponseHeader`).
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use async_trait::async_trait;
@@ -450,12 +408,12 @@ impl ProbeableOutbound for VmessHandler {}
 
 /// `ShakeSizeParser` (encoding/auth.go): a SHAKE128 stream over the body IV
 /// yielding the 2-byte XOR mask for each chunk's length field, in order.
-struct ShakeSizeParser(sha3::Shake128Reader);
+struct ShakeSizeParser(shake::ShakeReader<168>);
 
 impl ShakeSizeParser {
     fn new(iv: &[u8; 16]) -> Self {
         use sha3::digest::{ExtendableOutput, Update};
-        let mut h = sha3::Shake128::default();
+        let mut h = shake::Shake128::default();
         h.update(iv);
         Self(h.finalize_xof())
     }
