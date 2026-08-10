@@ -853,7 +853,13 @@ Log level order: `--debug` → `RUST_LOG` → `global { log_level }` → `info`.
 honk-core mode <rule|global|direct>
 honk-core proxy <group> <node>
 honk-core delay <node> [--url HOST:PORT]
+honk-core reload
 ```
+
+`reload` sends SIGHUP to the real-datapath process identified by
+`/run/honk-core.lock`; mock-mode instances do not own this lock. Successful
+signal delivery is reported by the command, while the running process logs
+whether the configuration was applied or rejected.
 
 ---
 

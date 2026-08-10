@@ -601,7 +601,7 @@ cargo run --release -p honk-core -- \
 
 CLI 参数：`--config` / `-c`、`--bpf-object` / `-b`、`--bpf-pin-root`、`--debug` / `-d`、`--mock-ebpf`。
 
-子命令：`mode`、`proxy`、`delay`（详见 [components.zh.md](./components.zh.md)）。
+子命令：`reload`、`mode`、`proxy`、`delay`（详见 [components.zh.md](./components.zh.md)）。
 
 ## 13. 校验建议
 

@@ -685,7 +685,7 @@ cargo run --release -p honk-core -- \
 
 CLI flags: `--config` / `-c`, `--bpf-object` / `-b`, `--bpf-pin-root`, `--debug` / `-d`, `--mock-ebpf`.
 
-Subcommands: `mode`, `proxy`, `delay` (see [components.en.md](./components.en.md)).
+Subcommands: `reload`, `mode`, `proxy`, `delay` (see [components.en.md](./components.en.md)).
 
 ## 13. Validation tips
 

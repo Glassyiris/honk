@@ -765,7 +765,11 @@ QUIC client 槽。gauge 跟随当前 generation：资源排干后节点在下一
 honk-core mode <rule|global|direct>
 honk-core proxy <group> <node>
 honk-core delay <node> [--url HOST:PORT]
+honk-core reload
 ```
+
+`reload` 会向 `/run/honk-core.lock` 标识的真实数据面进程发送 SIGHUP；mock 模式
+不持有该锁。命令成功只表示信号已送达，配置最终应用或拒绝结果以运行进程日志为准。
 
 ---
 

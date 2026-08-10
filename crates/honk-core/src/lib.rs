@@ -161,12 +161,14 @@ pub enum ClashCommand {
         #[arg(short, long)]
         url: Option<String>,
     },
+    /// Ask the running instance to reload its configured file
+    Reload,
 }
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub struct Cli {
-    /// Clash-style subcommand (mode, proxy, delay)
+    /// Subcommand (reload, mode, proxy, delay)
     #[command(subcommand)]
     pub command: Option<ClashCommand>,
 
@@ -196,9 +198,13 @@ pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
     use std::net::ToSocketAddrs;
     use std::time::Duration;
 
-    let cmd = cli.command.as_ref().expect("clash subcommand required");
+    let cmd = cli.command.as_ref().expect("subcommand required");
 
     match cmd {
+        ClashCommand::Reload => {
+            let pid = request_reload(std::path::Path::new(INSTANCE_LOCK_PATH))?;
+            println!("Reload requested for honk-core process {pid}");
+        }
         ClashCommand::Mode { mode } => {
             let valid_modes = ["rule", "global", "direct"];
             if !valid_modes.contains(&mode.as_str()) {
@@ -262,6 +268,69 @@ pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
+const INSTANCE_LOCK_PATH: &str = "/run/honk-core.lock";
+
+fn publish_instance_pid(file: &mut std::fs::File) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    file.set_len(0)
+        .map_err(|error| anyhow::anyhow!("truncate instance lock: {error}"))?;
+    writeln!(file, "{}", std::process::id())
+        .map_err(|error| anyhow::anyhow!("write instance PID: {error}"))
+}
+
+fn running_instance_pid(path: &std::path::Path) -> anyhow::Result<libc::pid_t> {
+    use nix::fcntl::{Flock, FlockArg};
+    use std::io::Read;
+
+    let file = std::fs::File::open(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            anyhow::anyhow!(
+                "no running honk-core instance; {} does not exist",
+                path.display()
+            )
+        } else {
+            anyhow::anyhow!("open instance lock {}: {error}", path.display())
+        }
+    })?;
+    let mut file = match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        Ok(_) => anyhow::bail!("no running honk-core instance holds {}", path.display()),
+        Err((file, error)) if error == nix::errno::Errno::EWOULDBLOCK => file,
+        Err((_, error)) => {
+            anyhow::bail!("inspect instance lock {}: {error}", path.display())
+        }
+    };
+    let mut value = String::new();
+    file.read_to_string(&mut value)
+        .map_err(|error| anyhow::anyhow!("read instance lock {}: {error}", path.display()))?;
+    let value = value.trim();
+    if value.is_empty() {
+        anyhow::bail!(
+            "running honk-core instance has no PID in {}; restart it with this binary",
+            path.display()
+        );
+    }
+    let pid = value
+        .parse::<libc::pid_t>()
+        .map_err(|error| anyhow::anyhow!("invalid instance PID in {}: {error}", path.display()))?;
+    if pid <= 0 {
+        anyhow::bail!("invalid instance PID {pid} in {}", path.display());
+    }
+    Ok(pid)
+}
+
+fn request_reload(path: &std::path::Path) -> anyhow::Result<libc::pid_t> {
+    let pid = running_instance_pid(path)?;
+    // SAFETY: libc::kill has no pointer or lifetime requirements.
+    if unsafe { libc::kill(pid, libc::SIGHUP) } == -1 {
+        anyhow::bail!(
+            "send SIGHUP to honk-core process {pid}: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(pid)
+}
+
 /// Take the process-wide instance lock: the datapath uses fixed names
 /// (dae0, daens, TC hooks) and a stopping instance's cleanup destroys
 /// them, so a second instance must never start while the first is still
@@ -274,7 +343,7 @@ fn acquire_instance_lock(
 ) -> anyhow::Result<nix::fcntl::Flock<std::fs::File>> {
     use nix::fcntl::{Flock, FlockArg};
     // /run (not the bpffs pin root, which rejects regular files).
-    let path = std::path::PathBuf::from("/run/honk-core.lock");
+    let path = std::path::PathBuf::from(INSTANCE_LOCK_PATH);
     let mut file = std::fs::File::options()
         .create(true)
         .truncate(false)
@@ -286,7 +355,10 @@ fn acquire_instance_lock(
     let mut logged = false;
     loop {
         match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-            Ok(flock) => return Ok(flock),
+            Ok(mut flock) => {
+                publish_instance_pid(&mut flock)?;
+                return Ok(flock);
+            }
             Err((f, _)) if std::time::Instant::now() < deadline => {
                 file = f; // the failed lock hands the file back for the retry
                 if !logged {
@@ -1845,7 +1917,10 @@ fn is_mountpoint(path: &str) -> bool {
 }
 #[cfg(test)]
 mod startup_lifecycle_tests {
-    use super::validate_udp_nfqueue_runtime;
+    use super::{
+        ClashCommand, Cli, publish_instance_pid, running_instance_pid, validate_udp_nfqueue_runtime,
+    };
+    use clap::Parser;
 
     #[test]
     fn udp_nfqueue_rejects_mock_backend() {
@@ -1865,5 +1940,31 @@ mod startup_lifecycle_tests {
             honk_config::routing::DATAPATH_RESERVED_MARK_MASK,
             honk_ebpf_common::SKB_MARK_RESERVED_MASK,
         );
+    }
+
+    #[test]
+    fn reload_command_targets_only_a_locked_instance() {
+        let cli = Cli::try_parse_from(["honk-core", "reload"]).expect("parse reload command");
+        assert!(matches!(cli.command, Some(ClashCommand::Reload)));
+
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let path = directory.path().join("honk-core.lock");
+        let file = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open instance lock");
+        let mut lock = nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+            .expect("acquire instance lock");
+        publish_instance_pid(&mut lock).expect("publish instance PID");
+
+        assert_eq!(
+            running_instance_pid(&path).expect("read locked instance PID"),
+            std::process::id() as libc::pid_t
+        );
+        drop(lock);
+        assert!(running_instance_pid(&path).is_err());
     }
 }
