@@ -524,7 +524,7 @@ Each entry is `tag: 'url'` (a bare quoted URL is also accepted). In dae syntax t
 - Share links inside the body are parsed by `Node::from_share_link`.
 
 Clash YAML VLESS entries map `uuid` (with legacy `password` fallback),
-`servername` (with `sni` fallback), `flow`, and `network` before deriving the
+`encryption`, `servername` (with `sni` fallback), `flow`, and `network` before deriving the
 node ID. Nested `reality-opts` maps `public-key`, `short-id`, and `spider-x`
 (default `/`) and enables the REALITY TLS carrier; nested `ws-opts` maps
 `path` plus a case-insensitive `headers.Host`, and `grpc-opts` maps

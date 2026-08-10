@@ -462,7 +462,7 @@ dae 语法仅支持 `tag: 'url'` 形式；`sub_type`（simple | clash | sip008 |
 - 正文中的分享链接由 `Node::from_share_link` 解析。
 
 Clash YAML 的 VLESS 条目会在派生节点 ID 前映射 `uuid`（兼容旧
-`password`）、`servername`（回退到 `sni`）、`flow` 与 `network`。嵌套
+`password`）、`encryption`、`servername`（回退到 `sni`）、`flow` 与 `network`。嵌套
 `reality-opts` 映射 `public-key`、`short-id`、`spider-x`（缺省 `/`）并启用
 REALITY TLS 承载；嵌套 `ws-opts` 映射 `path` 及大小写不敏感的
 `headers.Host`，`grpc-opts` 映射 `grpc-service-name`。原有扁平 WS/gRPC

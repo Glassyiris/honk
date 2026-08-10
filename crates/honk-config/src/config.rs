@@ -637,6 +637,18 @@ impl Config {
                     )));
                 }
             }
+            if node.protocol == crate::types::NodeProtocol::VLess
+                && node
+                    .encryption
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty() && value != "none")
+                && node.flow.as_deref().is_some_and(|flow| !flow.is_empty())
+            {
+                return Err(crate::ConfigError::Validation(format!(
+                    "Node '{}' combines VLESS Encryption with flow; this combination is unsupported",
+                    node.name
+                )));
+            }
             // direct/block are the injected built-ins; a user node may
             // neither take their names nor their protocols.
             if matches!(

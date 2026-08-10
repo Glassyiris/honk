@@ -346,6 +346,9 @@ impl Node {
             if let Some(v) = query.get("flow") {
                 node.flow = Some(v.clone());
             }
+            if let Some(v) = query.get("encryption").filter(|v| !v.trim().is_empty()) {
+                node.encryption = Some(v.clone());
+            }
         }
 
         node.id = node.derive_id();

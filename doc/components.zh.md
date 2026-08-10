@@ -77,7 +77,7 @@ dae 语法中节点**只能以分享链接书写**：`tag: 'scheme://...'` 或�
 | `host` | string | `""` | 显式主机；否则从 `address` 取 |
 | `port` | u16 | `0` | 服务端口 |
 | `username` / `password` | string? | null | 认证 / UUID / 密钥；链接 userinfo |
-| `encryption` | string? | null | SS/VMess 加密 |
+| `encryption` | string? | null | SS/VMess 加密，或 Xray VLESS Encryption 客户端字符串（分享链接 `encryption=`） |
 | `plugin` / `plugin_opts` | string? | null | 插件名/参数；链接 `plugin` / `plugin-opts` |
 | `transport` | string | `"tcp"` | `tcp` / `ws` / `grpc` / …；链接 `type`（或 `network`）参数 |
 | `tls` | bool | `false` | 启用 TLS；trojan/vless/anytls 等链接自动开启 |
@@ -89,7 +89,7 @@ dae 语法中节点**只能以分享链接书写**：`tag: 'scheme://...'` 或�
 | `reality_public_key` | string? | null | REALITY 服务端 X25519 公钥（分享链接 `pbk`）；设置后该节点走 REALITY 握手而非普通 TLS（`security=reality` 隐含 `tls=true`） |
 | `reality_short_id` | string? | null | REALITY short id（链接 `sid`，偶数长度 hex，至多 8 字节） |
 | `reality_spider_x` | string? | null | REALITY spider 路径（链接 `spx`，链接约定默认 `/`） |
-| `flow` | string? | null | VLESS flow 控制（链接 `flow=`）；仅支持 `xtls-rprx-vision`，且要求 TLS 或 REALITY 承载——由 `Config::validate` 强制校验 |
+| `flow` | string? | null | VLESS flow 控制（链接 `flow=`）；仅支持 `xtls-rprx-vision`，要求 TLS 或 REALITY 承载，且不能与 VLESS Encryption 组合——由 `Config::validate` 强制校验 |
 | `network` | string? | null | V2Ray 风格 network 提示 |
 | `ws_path` / `ws_host` | string? | null | WebSocket；链接 `path` / `host` 参数 |
 | `grpc_service` | string? | null | gRPC service 名；链接 `serviceName` 参数 |
@@ -120,7 +120,7 @@ dae 语法中节点**只能以分享链接书写**：`tag: 'scheme://...'` 或�
 | `ss` | `shadowsocks` | 是 | 是 | AEAD + `2022-blake3-*` |
 | `trojan` | | 是 | 是 | TLS；经 transport 支持 WS/gRPC |
 | `vmess` | | 是 | 否 | AEAD；WS/gRPC；`security=reality` 可启用 REALITY；仅在 `rprx` feature 下注册（honk-core 默认构建开启） |
-| `vless` | | 是 | 否 | REALITY + `xtls-rprx-vision` flow；经 transport 支持 WS/gRPC；仅在 `rprx` feature 下注册 |
+| `vless` | | 是 | 否 | Xray VLESS Encryption；REALITY + `xtls-rprx-vision` flow；经 transport 支持 WS/gRPC；仅在 `rprx` feature 下注册 |
 | `socks5` | | 是 | 是 | UDP ASSOCIATE |
 | `hysteria2` | | 是 | 是 | 真实 QUIC/H3；salamander；brutal（配带宽时）或 BBR；端口跳跃 |
 | `tuic` | | 是 | 是 | TUIC v5 / quinn |
@@ -151,12 +151,24 @@ node {
 
 已实测互通的 VLESS 组合（对 sing-box 1.13 服务端）：TCP+REALITY+vision、TCP+REALITY、TCP+WS、TCP+WS+TLS、TCP+gRPC。`xtls-rprx-vision` flow 仅与 TCP+REALITY/TLS 组合——WS/gRPC 下没有可供 XTLS direct-copy 切换的裸连接，与上游一致。
 
-Clash 订阅会在派生节点身份前把 VLESS 的 `uuid`、`servername`/`sni`、
-`flow`、`network` 以及嵌套 `reality-opts`、`ws-opts`、`grpc-opts` 映射到
+Clash 订阅会在派生节点身份前把 VLESS 的 `uuid`、`encryption`、
+`servername`/`sni`、`flow`、`network` 以及嵌套 `reality-opts`、`ws-opts`、`grpc-opts` 映射到
 同一组节点字段；不完整的 `reality-opts` 条目直接跳过。TCP/WS/gRPC
 以外的传输、非 Vision flow、缺少 TLS/REALITY 的 Vision，以及经
 WS/gRPC 的 Vision 会由 `honk-tool sub` 显示但不探测。
 `client-fingerprint` 不是节点字段，由全局 TLS 模式统一控制。
+
+**VLESS Encryption**
+
+把分享链接的 `encryption=` query（或结构化配置的 `Node.encryption` 字段）设为 `xray vlessenc` 生成的客户端字符串：
+
+```dae
+node {
+    vless_e: 'vless://uuid@example.com:443?security=none&encryption=mlkem768x25519plus.native.0rtt.<base64url-公钥>#vless_e'
+}
+```
+
+客户端支持 Xray 的 `native`、`xorpub`、`random` 三种 wire mode；X25519 或 ML-KEM-768 认证密钥（含链式多密钥）；每连接 ML-KEM-768 + X25519 前向保密；以及 `1rtt` 或基于缓存 ticket 的 `0rtt`。payload record 在硬件加速可用时使用 AES-256-GCM，否则使用 ChaCha20-Poly1305。VLESS Encryption 位于所选 TCP/TLS/REALITY/WS/gRPC transport 内层，但不能与 `xtls-rprx-vision` 组合。已对 Xray 26.7.28 的裸 TCP 服务端实测三种模式、两类认证密钥、链式 X25519 密钥及 1-RTT → 0-RTT 切换。
 
 **VLESS + REALITY（xtls-rprx-vision）**
 

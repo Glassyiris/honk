@@ -1,15 +1,17 @@
 //! VLESS proxy handler.
 //!
-//! VLESS itself is unencrypted. Deployments normally use TLS or REALITY,
-//! although cleartext is explicitly configurable. The handshake is one
-//! request header followed by a two-byte response prefix and optional addons.
+//! The base VLESS request is unencrypted. `node.encryption` optionally adds
+//! Xray VLESS Encryption inside the selected transport; otherwise deployments
+//! normally use TLS or REALITY, although cleartext is explicitly configurable.
+//! The handshake is one request header followed by a two-byte response prefix
+//! and optional addons.
 //!
 //! Protocol flow:
 //! 1. Connect to the server via the shared transport layer
 //!    (`super::transport`): TCP, optionally TLS-wrapped (`node.tls`),
 //!    optionally carried over WebSocket (`node.transport = "ws"`) or
 //!    gRPC (`"grpc"`).
-//! 2. Send the VLESS request header:
+//! 2. When configured, complete the VLESS Encryption key exchange, then send the VLESS request header:
 //!    ```text
 //!    ver(1) | uuid(16) | addon_len(1) | [addon(addon_len)] | cmd(1) | port(2) | atyp(1) | addr(var)
 //!    ```
@@ -33,7 +35,10 @@
 use async_trait::async_trait;
 use bytes::{Buf, BytesMut};
 use honk_config::node::Node;
+use parking_lot::RwLock;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -46,12 +51,58 @@ const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x02;
 const ATYP_IPV6: u8 = 0x03;
 
-#[derive(Debug, Default, Clone, Copy)]
-pub struct VLessHandler;
+#[derive(Debug)]
+pub struct VLessHandler {
+    encryption_configs:
+        RwLock<lru::LruCache<uuid::Uuid, Arc<super::vless_encryption::ClientConfig>>>,
+}
+
+impl Default for VLessHandler {
+    fn default() -> Self {
+        Self {
+            encryption_configs: RwLock::new(lru::LruCache::new(
+                NonZeroUsize::new(1024).expect("non-zero VLESS config cache capacity"),
+            )),
+        }
+    }
+}
 
 impl VLessHandler {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    fn encryption_config(
+        &self,
+        node: &Node,
+    ) -> anyhow::Result<Option<Arc<super::vless_encryption::ClientConfig>>> {
+        let Some(value) = node
+            .encryption
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && *value != "none")
+        else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            node.flow.as_deref().is_none_or(str::is_empty),
+            "VLESS Encryption cannot be combined with XTLS flow"
+        );
+        let cache_key = if node.id.is_nil() {
+            node.derive_id()
+        } else {
+            node.id
+        };
+        if let Some(config) = self.encryption_configs.read().peek(&cache_key).cloned() {
+            return Ok(Some(config));
+        }
+        let parsed = super::vless_encryption::ClientConfig::parse(value)?;
+        let mut configs = self.encryption_configs.write();
+        if let Some(config) = configs.peek(&cache_key).cloned() {
+            return Ok(Some(config));
+        }
+        configs.put(cache_key, parsed.clone());
+        Ok(Some(parsed))
     }
 
     fn parse_uuid(uuid_str: &str) -> anyhow::Result<[u8; 16]> {
@@ -116,15 +167,21 @@ impl VLessHandler {
 }
 
 impl VLessHandler {
-    /// Build the post-connect stream for a dial. Vision over raw TCP/TLS
-    /// keeps the concrete stream type so the direct-copy read switch can
-    /// reach the socket; every other case goes through the shared
-    /// transport wrapping and erases it.
+    /// Build the post-connect stream for a dial. VLESS Encryption wraps and
+    /// erases the selected transport. Vision over raw TCP/TLS instead keeps
+    /// the concrete stream type so the direct-copy read switch can reach the
+    /// socket; every other case uses the ordinary erased transport.
     async fn dial_stream(
+        &self,
         node: &Node,
         uuid: [u8; 16],
         tcp: TcpStream,
     ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
+        if let Some(config) = self.encryption_config(node)? {
+            let stream = super::transport::wrap_transport(node, tcp).await?;
+            let encrypted = config.connect(stream).await?;
+            return Ok(Self::wrap_response_stream(node, uuid, Box::new(encrypted)));
+        }
         if node.flow.as_deref() == Some("xtls-rprx-vision")
             && matches!(node.transport.as_str(), "" | "tcp")
         {
@@ -624,8 +681,9 @@ impl TcpOutbound for VLessHandler {
             Self::build_request_header(&uuid_bytes, target, target_domain, node.flow.as_deref())?;
         let addr = format!("{}:{}", node.host(), node.port);
         let tcp = crate::util::connect_outbound(&addr, connect_timeout).await?;
-        let mut stream = Self::dial_stream(node, uuid_bytes, tcp).await?;
+        let mut stream = self.dial_stream(node, uuid_bytes, tcp).await?;
         stream.write_all(&header).await?;
+        stream.flush().await?;
 
         Ok(ProxyStream {
             stream,
@@ -647,8 +705,9 @@ impl TcpOutbound for VLessHandler {
 
         let header =
             Self::build_request_header(&uuid_bytes, target, target_domain, node.flow.as_deref())?;
-        let mut stream = Self::dial_stream(node, uuid_bytes, tcp).await?;
+        let mut stream = self.dial_stream(node, uuid_bytes, tcp).await?;
         stream.write_all(&header).await?;
+        stream.flush().await?;
 
         Ok(ProxyStream {
             stream,
