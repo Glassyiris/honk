@@ -308,8 +308,13 @@ generation 拒绝新的 warm 工作，但已有 stream 与 Ready UDP endpoint �
 - `quic.rs` — Hy2 / TUIC / Juicity 共用 quinn 客户端
 - `tls.rs` — BoringSSL TLS 与 Chrome 指纹辅助
 - `reality.rs` — REALITY 客户端握手（见下文）
+- `vless_encryption.rs` — 兼容 Xray 的 VLESS Encryption 认证、混合前向保密、ticket 0-RTT 与 record framing
 
 VMess 与 VLESS 由 honk-outbound 的 `rprx` cargo feature 编译（honk-core 默认构建开启）；不带该 feature 时节点可解析，但拨号以 "No handler for protocol" 拒绝。
+
+### VLESS Encryption
+
+`honk-outbound/src/proxy/vless_encryption.rs` 在普通 VLESS 请求写入前，先包裹已选定的 VLESS transport。握手可认证 X25519 和/或 ML-KEM-768 服务端密钥（含链式 relay key），每连接执行新的 ML-KEM-768 + X25519 交换，再通过 Xray 的字节 context BLAKE3 KDF 派生双向 AES-256-GCM 或 ChaCha20-Poly1305 record key。`0rtt` 配置按节点缓存服务端 ticket 与 PFS key；冷缓存或过期缓存走 1-RTT。`native`、`xorpub`、`random` 三种流量形态共用同一 codec，其中 `random` 还会掩码每个 record header。handler 拒绝 VLESS Encryption 与 `xtls-rprx-vision` 组合，因为二者都会接管内层 stream framing。
 
 ### REALITY 客户端
 

@@ -108,7 +108,7 @@ The fields below are what a parsed node carries. In dae syntax they are **derive
 | `host` | string | `""` | Explicit host; else from `address` |
 | `port` | u16 | `0` | Server port |
 | `username` / `password` | string? | null | Auth / UUID / secret |
-| `encryption` | string? | null | SS/VMess cipher |
+| `encryption` | string? | null | SS/VMess cipher or Xray VLESS Encryption client string (share-link `encryption=`) |
 | `plugin` / `plugin_opts` | string? | null | Plugin name/opts |
 | `transport` | string | `"tcp"` | `tcp` / `ws` / `grpc` / … (share-link `type=`/`net`) |
 | `tls` | bool | `false` | Enable TLS |
@@ -120,7 +120,7 @@ The fields below are what a parsed node carries. In dae syntax they are **derive
 | `reality_public_key` | string? | null | REALITY server X25519 public key (share-link `pbk`); when set the node takes the REALITY handshake instead of plain TLS (`security=reality` implies `tls=true`) |
 | `reality_short_id` | string? | null | REALITY short id (share-link `sid`, even-length hex ≤ 8 bytes) |
 | `reality_spider_x` | string? | null | REALITY spider path (share-link `spx`, share-link default `/`) |
-| `flow` | string? | null | VLESS flow control (share-link `flow=`); only `xtls-rprx-vision` is supported and it requires TLS or REALITY — enforced by `Config::validate` |
+| `flow` | string? | null | VLESS flow control (share-link `flow=`); only `xtls-rprx-vision` is supported, it requires TLS or REALITY, and it cannot be combined with VLESS Encryption — enforced by `Config::validate` |
 | `network` | string? | null | V2Ray-style network hint |
 | `ws_path` / `ws_host` | string? | null | WebSocket (share-link `path=`/`host=`) |
 | `grpc_service` | string? | null | gRPC service name (`serviceName=`) |
@@ -151,7 +151,7 @@ The fields below are what a parsed node carries. In dae syntax they are **derive
 | `ss` | `shadowsocks` | Yes | Yes | AEAD + `2022-blake3-*` |
 | `trojan` | | Yes | Yes | TLS; WS/gRPC via transport |
 | `vmess` | | Yes | No | AEAD; WS/gRPC; REALITY via `security=reality`; registered only with the `rprx` feature (on in honk-core's default build) |
-| `vless` | | Yes | No | REALITY + `xtls-rprx-vision` flow; WS/gRPC via transport; registered only with the `rprx` feature |
+| `vless` | | Yes | No | Xray VLESS Encryption; REALITY + `xtls-rprx-vision` flow; WS/gRPC via transport; registered only with the `rprx` feature |
 | `socks5` | | Yes | Yes | UDP ASSOCIATE |
 | `hysteria2` | | Yes | Yes | Real QUIC/H3; salamander; brutal (with bandwidth) or BBR; port hopping |
 | `tuic` | | Yes | Yes | TUIC v5 / quinn |
@@ -182,12 +182,24 @@ node {
 
 Verified VLESS combinations (live interop against a sing-box 1.13 server): TCP+REALITY+vision, TCP+REALITY, TCP+WS, TCP+WS+TLS, TCP+gRPC. The `xtls-rprx-vision` flow only combines with TCP+REALITY/TLS — over WS/gRPC there is no raw socket for the XTLS direct-copy switch, matching upstream.
 
-Clash subscriptions map VLESS `uuid`, `servername`/`sni`, `flow`, `network`,
+Clash subscriptions map VLESS `uuid`, `encryption`, `servername`/`sni`, `flow`, `network`,
 nested `reality-opts`, `ws-opts`, and `grpc-opts` into the same node fields
 before identity derivation. Incomplete `reality-opts` entries are skipped.
 Feed shapes outside TCP/WS/gRPC, non-Vision flows, Vision without TLS/REALITY,
 and Vision over WS/gRPC are reported by `honk-tool sub` but not probed.
 `client-fingerprint` is not a node field; the global TLS mode owns it.
+
+**VLESS Encryption**
+
+Set the share-link `encryption=` query parameter (or the structured `Node.encryption` field) to the client string produced by `xray vlessenc`:
+
+```dae
+node {
+    vless_e: 'vless://uuid@example.com:443?security=none&encryption=mlkem768x25519plus.native.0rtt.<base64url-public-key>#vless_e'
+}
+```
+
+The client supports Xray's `native`, `xorpub`, and `random` wire modes; X25519 or ML-KEM-768 authentication keys (including chained keys); per-connection ML-KEM-768 + X25519 forward secrecy; and `1rtt` or cached-ticket `0rtt`. Payload records use AES-256-GCM when hardware acceleration is available and ChaCha20-Poly1305 otherwise. VLESS Encryption runs inside the selected TCP/TLS/REALITY/WS/gRPC transport, but cannot be combined with `xtls-rprx-vision`. Raw-TCP interoperability is verified against Xray 26.7.28 for all three modes, both authentication key types, chained X25519 keys, and the 1-RTT → 0-RTT transition.
 
 **VLESS + REALITY (xtls-rprx-vision)**
 

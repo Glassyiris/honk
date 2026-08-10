@@ -331,8 +331,13 @@ Shared layers:
 - `quic.rs` — shared quinn client for Hy2 / TUIC / Juicity
 - `tls.rs` — BoringSSL TLS and Chrome-fingerprint helpers
 - `reality.rs` — REALITY client handshake (see below)
+- `vless_encryption.rs` — Xray-compatible VLESS Encryption authentication, hybrid PFS, ticketed 0-RTT, and record framing
 
 VMess and VLESS are compiled behind honk-outbound's `rprx` cargo feature (on in honk-core's default build); without it those nodes parse but dials are refused with "No handler for protocol".
+
+### VLESS Encryption
+
+`honk-outbound/src/proxy/vless_encryption.rs` wraps the selected VLESS transport before the ordinary VLESS request. The prologue authenticates X25519 and/or ML-KEM-768 server keys (including chained relay keys), performs a fresh ML-KEM-768 + X25519 exchange, and derives directional AES-256-GCM or ChaCha20-Poly1305 record keys with Xray's byte-context BLAKE3 KDF. `0rtt` configurations cache the server ticket and PFS key per node; a cold or expired cache takes the 1-RTT path. The `native`, `xorpub`, and `random` traffic shapes share one codec, and `random` additionally masks each record header. The handler rejects VLESS Encryption combined with `xtls-rprx-vision` because both own the inner stream framing.
 
 ### REALITY client
 
