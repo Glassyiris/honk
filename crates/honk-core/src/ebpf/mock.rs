@@ -169,6 +169,8 @@ pub struct MockEbpfBackend {
     /// Behind a Mutex because `routing_handoff_take` takes `&self` (the
     /// per-connection hot path holds only a read lock on the backend).
     pub routing_handoffs: parking_lot::Mutex<HashMap<[u8; 40], RoutingHandoffEntry>>,
+    /// Exact tuple retirement fences (TuplesKey → decision token).
+    udp_retire_fences: HashMap<[u8; 40], u32>,
     /// Cookie PID map (cookie → PIDName)
     pub cookie_pids: HashMap<u64, PIDName>,
     /// Outbound alive bitmap: (outbound*6 + domain*2 + ipver) → 0|1
@@ -1015,6 +1017,10 @@ impl EbpfBackend for MockEbpfBackend {
             .udp_conn_states
             .values()
             .any(|state| matches_generation(state.decision_token))
+            || self
+                .udp_retire_fences
+                .values()
+                .any(|token| matches_generation(*token))
             || self
                 .routing_handoffs
                 .lock()
@@ -1875,6 +1881,21 @@ mod tests {
                 generation: 2,
             }
         );
+    }
+
+    #[test]
+    fn exhausted_sequence_skips_live_retirement_fence() {
+        let mut backend = MockEbpfBackend::new();
+        backend.udp_decision_sequence_next = UDP_DECISION_SEQUENCE_MASK;
+        let key = decision_test_key();
+        backend.udp_retire_fences.insert(
+            MockEbpfBackend::tuples_key_bytes(&key),
+            udp_decision_token(1, 7).unwrap(),
+        );
+
+        assert!(!backend.reset_udp_decision_sequence(1).unwrap());
+        backend.udp_retire_fences.clear();
+        assert!(backend.reset_udp_decision_sequence(1).unwrap());
     }
 
     #[test]

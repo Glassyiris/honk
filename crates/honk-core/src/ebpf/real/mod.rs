@@ -1018,6 +1018,17 @@ impl EbpfBackend for RealEbpfBackend {
             !live
         })?;
         if !live {
+            self.for_each_map_chunk::<TuplesKey, u32>(
+                UDP_DECISION_RETIRE_FENCE_MAP,
+                256,
+                &mut |chunk| {
+                    live = chunk.iter().any(|(_, token)| matches_generation(*token));
+                    !live
+                },
+            )?;
+        }
+
+        if !live {
             self.for_each_map_chunk::<TuplesKey, RoutingHandoffEntry>(
                 "ROUTING_HANDOFF_MAP",
                 256,

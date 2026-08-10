@@ -163,10 +163,7 @@ fn validate_udp_decision_sequence_info(info: &bpf_map_info) -> anyhow::Result<()
     Ok(())
 }
 
-fn validate_udp_decision_sequence_fd(fd: RawFd) -> anyhow::Result<UdpDecisionSequence> {
-    let info = raw_map_info(fd)?;
-    validate_udp_decision_sequence_info(&info)?;
-    let sequence = locked_udp_decision_sequence(fd)?;
+fn validate_udp_decision_sequence_value(sequence: UdpDecisionSequence) -> anyhow::Result<()> {
     anyhow::ensure!(
         sequence.next <= honk_ebpf_common::UDP_DECISION_SEQUENCE_MASK,
         "UDP_DECISION_SEQUENCE next token exceeds its generation sequence space"
@@ -176,13 +173,56 @@ fn validate_udp_decision_sequence_fd(fd: RawFd) -> anyhow::Result<UdpDecisionSeq
         "UDP_DECISION_SEQUENCE has invalid generation {}",
         sequence.generation
     );
+    Ok(())
+}
+
+fn migrate_legacy_udp_decision_sequence(
+    mut sequence: UdpDecisionSequence,
+) -> anyhow::Result<(UdpDecisionSequence, bool)> {
+    if sequence.next <= honk_ebpf_common::UDP_DECISION_SEQUENCE_MASK
+        && sequence.generation <= honk_ebpf_common::UDP_DECISION_GENERATION_MASK
+    {
+        return Ok((sequence, false));
+    }
+    anyhow::ensure!(
+        sequence.next <= honk_ebpf_common::NFQUEUE_TOKEN_MASK,
+        "legacy UDP_DECISION_SEQUENCE next token exceeds its token space"
+    );
+    anyhow::ensure!(
+        sequence.generation <= 1,
+        "UDP_DECISION_SEQUENCE is neither current nor a valid legacy allocator"
+    );
+    if sequence.generation == 1 {
+        anyhow::ensure!(
+            sequence.next == honk_ebpf_common::NFQUEUE_TOKEN_MASK,
+            "legacy UDP_DECISION_SEQUENCE has an inconsistent exhausted flag"
+        );
+    }
+    sequence.generation = sequence.next >> honk_ebpf_common::UDP_DECISION_GENERATION_SHIFT;
+    sequence.next &= honk_ebpf_common::UDP_DECISION_SEQUENCE_MASK;
+    validate_udp_decision_sequence_value(sequence)?;
+    Ok((sequence, true))
+}
+
+fn validate_udp_decision_sequence_fd(fd: RawFd) -> anyhow::Result<UdpDecisionSequence> {
+    let info = raw_map_info(fd)?;
+    validate_udp_decision_sequence_info(&info)?;
+    let sequence = locked_udp_decision_sequence(fd)?;
+    validate_udp_decision_sequence_value(sequence)?;
     Ok(sequence)
 }
 
-pub fn validate_pinned_udp_decision_sequence(path: &Path) -> anyhow::Result<UdpDecisionSequence> {
+pub fn validate_pinned_udp_decision_sequence(path: &Path) -> anyhow::Result<bool> {
     let map = aya::maps::MapData::from_pin(path)
         .map_err(|error| anyhow::anyhow!("open persistent map '{}': {error}", path.display()))?;
-    validate_udp_decision_sequence_fd(map.fd().as_fd().as_raw_fd())
+    let fd = map.fd().as_fd().as_raw_fd();
+    validate_udp_decision_sequence_info(&raw_map_info(fd)?)?;
+    let (sequence, migrated) =
+        migrate_legacy_udp_decision_sequence(locked_udp_decision_sequence(fd)?)?;
+    if migrated {
+        update_locked_udp_decision_sequence(fd, &sequence)?;
+    }
+    Ok(migrated)
 }
 
 pub fn validate_loaded_udp_decision_sequence(bpf: &Ebpf) -> anyhow::Result<UdpDecisionSequence> {
@@ -201,6 +241,17 @@ pub fn reset_udp_decision_sequence_locked(bpf: &Ebpf, generation: u32) -> anyhow
     update_locked_udp_decision_sequence(
         map_fd(bpf, super::super::UDP_DECISION_SEQUENCE_MAP)?,
         &value,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn write_udp_decision_sequence_locked(
+    bpf: &Ebpf,
+    value: &UdpDecisionSequence,
+) -> anyhow::Result<()> {
+    update_locked_udp_decision_sequence(
+        map_fd(bpf, super::super::UDP_DECISION_SEQUENCE_MAP)?,
+        value,
     )
 }
 
@@ -321,8 +372,13 @@ pub fn bpf_lookup_batch_scan<K: Pod, V: Pod>(
             }
         };
         append_initialized(&keys, &values, count, out);
-        if terminal || count < BPF_BATCH_CHUNK {
+        // A successful batch may be short; only ENOENT marks the final batch.
+        if terminal {
             return Ok(true);
+        }
+        if count == 0 {
+            out.truncate(initial_len);
+            anyhow::bail!("bpf lookup_batch({map}) returned an empty nonterminal batch");
         }
         previous_key = Some(unsafe { next_key.assume_init() });
     }
@@ -369,8 +425,12 @@ pub fn bpf_lookup_batch_scan_cb<K: Pod, V: Pod>(
         if !chunk.is_empty() && !visit(&chunk) {
             return Ok(true);
         }
-        if terminal || count < BPF_BATCH_CHUNK {
+        // A successful batch may be short; only ENOENT marks the final batch.
+        if terminal {
             return Ok(true);
+        }
+        if count == 0 {
+            anyhow::bail!("bpf lookup_batch({map}) returned an empty nonterminal batch");
         }
         previous_key = Some(unsafe { next_key.assume_init() });
     }
@@ -456,6 +516,61 @@ pub fn bpf_update_batch<K: Pod, V: Pod>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_sequence_values_continue_without_token_reuse() {
+        let current = UdpDecisionSequence {
+            next: 42,
+            generation: 1,
+            ..UdpDecisionSequence::default()
+        };
+        let (unchanged, migrated) = migrate_legacy_udp_decision_sequence(current).unwrap();
+        assert!(!migrated);
+        assert_eq!(unchanged.next, 42);
+        assert_eq!(unchanged.generation, 1);
+
+        let legacy = UdpDecisionSequence {
+            next: (1 << UDP_DECISION_GENERATION_SHIFT) | 42,
+            generation: 0,
+            ..UdpDecisionSequence::default()
+        };
+        let (continued, migrated) = migrate_legacy_udp_decision_sequence(legacy).unwrap();
+        assert!(migrated);
+        assert_eq!(continued.next, 42);
+        assert_eq!(continued.generation, 1);
+        assert_eq!(
+            udp_decision_token(continued.generation, continued.next + 1),
+            Some(legacy.next + 1)
+        );
+
+        let exhausted = UdpDecisionSequence {
+            next: NFQUEUE_TOKEN_MASK,
+            generation: 1,
+            ..UdpDecisionSequence::default()
+        };
+        let (exhausted, migrated) = migrate_legacy_udp_decision_sequence(exhausted).unwrap();
+        assert!(migrated);
+        assert_eq!(exhausted.next, UDP_DECISION_SEQUENCE_MASK);
+        assert_eq!(exhausted.generation, UDP_DECISION_GENERATION_MASK);
+    }
+
+    #[test]
+    fn malformed_legacy_sequence_is_rejected() {
+        let inconsistent = UdpDecisionSequence {
+            next: UDP_DECISION_SEQUENCE_MASK + 1,
+            generation: 1,
+            ..UdpDecisionSequence::default()
+        };
+        assert!(migrate_legacy_udp_decision_sequence(inconsistent).is_err());
+    }
+
+    #[test]
+    fn successful_short_batch_is_not_terminal() {
+        for count in [1, BPF_BATCH_CHUNK as u32 - 1] {
+            let (returned, terminal) = lookup_batch_result(Ok(()), count).unwrap();
+            assert!(!terminal);
+            assert_eq!(returned, count as usize);
+        }
+    }
 
     #[test]
     fn terminal_enoent_preserves_partial_count() {

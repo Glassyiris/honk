@@ -717,11 +717,12 @@ udp = {
   stagger: { attempts, winners, cancellations },
   warm: { attempts, successes, failures },
   nfqueue: {
-    received, activeFlows, kernelQueueDepth, kernelDropped, kernelUserDropped,
-    heldPackets, heldPeak, socketReceiveBufferBytes, actorQueueFull,
-    directAccepted, proxyCopied, proxyDropped, block, cancel, drop,
-    tokenMismatch, tokenExhaustion, tokenRollovers, verdictErrors,
-    receiptToVerdict: H
+    received, activeFlows, kernelQueueDepth, kernelStatsAvailable,
+    kernelStatsReadErrors, kernelDropped, kernelUserDropped, heldPackets,
+    heldPeak, socketReceiveBufferBytes, actorQueueFull, actorQueueDepth,
+    actorQueuedBytes, actorOldestAgeNanos, directAccepted, proxyCopied,
+    proxyDropped, block, cancel, drop, tokenMismatch, tokenExhaustion,
+    tokenRollovers, verdictErrors, receiptToVerdict: H
   }
 }
 H = { count, sumNanos, buckets }  // buckets has 64 fixed log2 slots
@@ -737,13 +738,17 @@ remains and the winning transport owns its connection only for the selected flow
 `successes` count `Ready`; a `NotApplicable` result is neutral.
 
 `nfqueue.received` counts listener deliveries and `activeFlows` is the current
-pending-correlator gauge. `kernelQueueDepth`, `kernelDropped`, and
-`kernelUserDropped` come from the owned queue's kernel status; `heldPackets` and
-`heldPeak` count dispatched verdict guards. `socketReceiveBufferBytes` is the
-effective netlink receive buffer, and `actorQueueFull` counts fail-closed drops
-at the bounded ingest actor. `directAccepted`, `proxyDropped`, `block`, `cancel`,
-and `drop` count successful kernel verdicts; `proxyCopied` counts the single
-payload ownership transfer into the canonical initializer. `tokenMismatch`,
+pending-correlator gauge. A one-second task samples the owned kernel queue
+independently of packet dispatch. `kernelStatsAvailable` says whether the latest
+read succeeded; `kernelStatsReadErrors` is cumulative. On failure, the last
+`kernelQueueDepth`, `kernelDropped`, and `kernelUserDropped` values remain visible
+rather than becoming ambiguous zeroes. `heldPackets` and `heldPeak` count
+dispatched verdict guards. `socketReceiveBufferBytes` is the effective netlink
+receive buffer. `actorQueueFull` counts fail-closed admission drops;
+`actorQueueDepth`, `actorQueuedBytes`, and `actorOldestAgeNanos` expose current
+ingest pressure. `directAccepted`, `proxyDropped`, `block`, `cancel`, and `drop`
+count successful kernel verdicts; `proxyCopied` counts the single payload
+ownership transfer into the canonical initializer. `tokenMismatch`,
 `tokenExhaustion`, `tokenRollovers`, and `verdictErrors` expose token and verdict
 events. `receiptToVerdict` measures listener receipt to successful verdict and
 is not labelled as kernel queue residence because NFQA timestamps are not

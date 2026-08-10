@@ -442,20 +442,62 @@ impl PendingUdpVerdicts {
         guard: VerdictGuard,
         slow_permit: Option<OwnedSemaphorePermit>,
     ) -> NfqueueIngest {
-        let backend = self.ebpf.read().await;
-        self.ingest_with_backend(packet, guard, slow_permit, backend.as_ref())
+        let received_at = packet.received_at;
+        self.ingest_held_wait(packet, HeldVerdict::kernel(guard, received_at), slow_permit)
+            .await
+    }
+
+    async fn ingest_held_wait(
+        &self,
+        packet: QueuedPacket,
+        held: HeldVerdict,
+        slow_permit: Option<OwnedSemaphorePermit>,
+    ) -> NfqueueIngest {
+        self.stats.record_udp_nfqueue_received();
+        let deadline = tokio::time::Instant::from_std(packet.received_at + HARD_HOLD_TIMEOUT);
+        let backend = match tokio::time::timeout_at(deadline, self.ebpf.read()).await {
+            Ok(backend) => backend,
+            Err(_) => {
+                self.reject_before_backend(&packet, held, DropOutcome::Cancel);
+                return NfqueueIngest::Dropped;
+            }
+        };
+        self.ingest_with_backend(packet, held, slow_permit, backend.as_ref())
+    }
+
+    pub(super) fn reject_actor_queue(&self, packet: QueuedPacket, guard: VerdictGuard) {
+        self.stats.record_udp_nfqueue_received();
+        self.stats.record_udp_nfqueue_actor_queue_full();
+        let received_at = packet.received_at;
+        self.reject_before_backend(
+            &packet,
+            HeldVerdict::kernel(guard, received_at),
+            DropOutcome::Other,
+        );
+    }
+
+    fn reject_before_backend(
+        &self,
+        packet: &QueuedPacket,
+        held: HeldVerdict,
+        outcome: DropOutcome,
+    ) {
+        if let Some(decision_token) = extract_nfqueue_token(packet.mark) {
+            self.schedule_cleanup_for_key(
+                FlowKey::new(packet.tuple.client, packet.tuple.destination),
+                decision_token,
+            );
+        }
+        self.drop_one(held, outcome);
     }
 
     fn ingest_with_backend(
         &self,
         packet: QueuedPacket,
-        guard: VerdictGuard,
+        held: HeldVerdict,
         slow_permit: Option<OwnedSemaphorePermit>,
         backend: &dyn EbpfBackend,
     ) -> NfqueueIngest {
-        self.stats.record_udp_nfqueue_received();
-        let received_at = packet.received_at;
-        let held = HeldVerdict::kernel(guard, received_at);
         let Some(decision_token) = extract_nfqueue_token(packet.mark) else {
             self.drop_one(held, DropOutcome::Other);
             return NfqueueIngest::Dropped;
@@ -853,14 +895,22 @@ impl PendingUdpVerdicts {
         let cell = self.matching_cell(identity)?;
 
         {
-            let mut backend = self.ebpf.write().await;
+            let mut backend = self.backend_before_deadline(&cell, identity).await?;
             let mut state = cell.state.lock();
             let CellState::Pending {
-                armed, cancelling, ..
+                started_at,
+                armed,
+                cancelling,
+                ..
             } = &mut *state
             else {
                 return Err(PendingUdpDecisionError::StaleIdentity);
             };
+            if started_at.elapsed() >= HARD_HOLD_TIMEOUT {
+                drop(state);
+                drop(backend);
+                return Err(self.expire_unarmed_pending(&cell, identity));
+            }
             if *armed {
                 return Err(PendingUdpDecisionError::ArmedInProgress);
             }
@@ -972,17 +1022,22 @@ impl PendingUdpVerdicts {
         }
         let cell = self.matching_cell(identity)?;
         let verdicts = {
-            let mut backend = self.ebpf.write().await;
+            let mut backend = self.backend_before_deadline(&cell, identity).await?;
             let mut state = cell.state.lock();
             let CellState::Pending {
+                started_at,
                 armed: false,
                 cancelling: false,
                 verdicts,
-                ..
             } = &mut *state
             else {
                 return Err(PendingUdpDecisionError::StaleIdentity);
             };
+            if started_at.elapsed() >= HARD_HOLD_TIMEOUT {
+                drop(state);
+                drop(backend);
+                return Err(self.expire_unarmed_pending(&cell, identity));
+            }
             let result = backend
                 .commit_udp_decision(
                     &identity.tuples(),
@@ -1017,17 +1072,22 @@ impl PendingUdpVerdicts {
         }
         let cell = self.matching_cell(identity)?;
         let verdicts = {
-            let mut backend = self.ebpf.write().await;
+            let mut backend = self.backend_before_deadline(&cell, identity).await?;
             let mut state = cell.state.lock();
             let CellState::Pending {
+                started_at,
                 armed: false,
                 cancelling: false,
                 verdicts,
-                ..
             } = &mut *state
             else {
                 return Err(PendingUdpDecisionError::StaleIdentity);
             };
+            if started_at.elapsed() >= HARD_HOLD_TIMEOUT {
+                drop(state);
+                drop(backend);
+                return Err(self.expire_unarmed_pending(&cell, identity));
+            }
             let result = backend
                 .commit_udp_decision(
                     &identity.tuples(),
@@ -1079,9 +1139,10 @@ impl PendingUdpVerdicts {
         }
 
         let (verdicts, mismatch) = {
-            let mut backend = self.ebpf.write().await;
+            let mut backend = self.backend_before_deadline(&cell, identity).await?;
             let mut state = cell.state.lock();
             let CellState::Pending {
+                started_at,
                 armed: false,
                 verdicts,
                 ..
@@ -1096,6 +1157,11 @@ impl PendingUdpVerdicts {
                 }
                 return Ok(());
             };
+            if started_at.elapsed() >= HARD_HOLD_TIMEOUT {
+                drop(state);
+                drop(backend);
+                return Err(self.expire_unarmed_pending(&cell, identity));
+            }
             let result = backend
                 .abort_pending_udp_flow(&identity.tuples(), identity.decision_token)
                 .map_err(|error| self.fatal_error("abort pending flow", error.to_string()))?;
@@ -1320,6 +1386,64 @@ impl PendingUdpVerdicts {
                 }
             }
         }
+    }
+
+    async fn backend_before_deadline<'a>(
+        &'a self,
+        cell: &Arc<FlowCell>,
+        identity: PendingUdpIdentity,
+    ) -> Result<tokio::sync::RwLockWriteGuard<'a, Box<dyn EbpfBackend>>, PendingUdpDecisionError>
+    {
+        let deadline = {
+            let state = cell.state.lock();
+            let CellState::Pending { started_at, .. } = &*state else {
+                return Err(PendingUdpDecisionError::StaleIdentity);
+            };
+            *started_at + HARD_HOLD_TIMEOUT
+        };
+        match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), self.ebpf.write())
+            .await
+        {
+            Ok(backend) => Ok(backend),
+            Err(_) => Err(self.expire_unarmed_pending(cell, identity)),
+        }
+    }
+
+    fn expire_unarmed_pending(
+        &self,
+        cell: &Arc<FlowCell>,
+        identity: PendingUdpIdentity,
+    ) -> PendingUdpDecisionError {
+        let verdicts = {
+            let mut state = cell.state.lock();
+            let CellState::Pending {
+                armed, verdicts, ..
+            } = &mut *state
+            else {
+                return PendingUdpDecisionError::StaleIdentity;
+            };
+            if *armed {
+                return PendingUdpDecisionError::ArmedInProgress;
+            }
+            let verdicts = std::mem::take(verdicts);
+            *state = CellState::Dead {
+                expires_at: Instant::now() + TERMINAL_GRACE,
+            };
+            verdicts
+        };
+        cell.changed.notify_waiters();
+        self.drop_many(verdicts, DropOutcome::Cancel);
+        self.endpoints.retire_staged_identity(
+            identity.client(),
+            identity.destination(),
+            identity.decision_token,
+            identity.endpoint_generation,
+        );
+        self.schedule_cleanup(CleanupRequest::Token {
+            key: identity.key,
+            decision_token: identity.decision_token,
+        });
+        PendingUdpDecisionError::StaleIdentity
     }
 
     fn matching_cell(
@@ -2017,6 +2141,90 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(gate.try_enter().is_none());
+    }
+
+    #[tokio::test]
+    async fn backend_write_lock_cannot_extend_packet_hold_deadline() {
+        let token = 25;
+        let key = identity(token, 0).key;
+        let mut mock = crate::ebpf::mock::MockEbpfBackend::new();
+        mock.seed_staged_udp_flow(
+            &key.tuples(),
+            ConnState {
+                state: UdpDecisionState::Pending as u8,
+                decision_token: token,
+                ..ConnState::default()
+            },
+        );
+        let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(mock)));
+        let stats = Arc::new(StatsManager::new());
+        let (pending, _fatal) = PendingUdpVerdicts::new(
+            Arc::clone(&backend),
+            Arc::new(UdpEndpointPool::new()),
+            Arc::clone(&stats),
+        );
+        pending.open_admission();
+        let pending = Arc::new(pending);
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let received_at = Instant::now();
+        let packet = QueuedPacket {
+            tuple: honk_nfqueue::UdpTuple {
+                client: key.client,
+                destination: key.destination,
+            },
+            payload: bytes::Bytes::from_static(b"held"),
+            mark: honk_ebpf_common::pack_nfqueue_mark(token).unwrap(),
+            received_at,
+        };
+        let writer = backend.write().await;
+
+        let task = tokio::spawn({
+            let pending = Arc::clone(&pending);
+            let sink = Arc::clone(&sink);
+            async move {
+                pending
+                    .ingest_held_wait(packet, HeldVerdict::test(1, received_at, sink), None)
+                    .await
+            }
+        });
+
+        let result = tokio::time::timeout(HARD_HOLD_TIMEOUT + Duration::from_secs(1), task)
+            .await
+            .expect("ingest must resolve at its absolute hold deadline")
+            .unwrap();
+        assert!(matches!(result, NfqueueIngest::Dropped));
+        assert_eq!(*sink.lock(), vec![TestVerdict::Drop { id: 1 }]);
+        let snapshot = stats.udp_snapshot();
+        assert_eq!(snapshot.nfqueue.received, 1);
+        assert_eq!(snapshot.nfqueue.cancel, 1);
+        assert_eq!(snapshot.nfqueue.receipt_to_verdict_latency.count, 1);
+        drop(writer);
+    }
+    #[tokio::test]
+    async fn transition_write_lock_respects_original_packet_deadline() {
+        let fixture = pending_fixture(26);
+        {
+            let cell = fixture.pending.cells.get(&fixture.identity.key).unwrap();
+            let mut state = cell.state.lock();
+            let CellState::Pending { started_at, .. } = &mut *state else {
+                panic!("fixture cell must be pending");
+            };
+            *started_at = Instant::now() - HARD_HOLD_TIMEOUT + Duration::from_millis(50);
+        }
+        let writer = fixture.backend.write().await;
+        let started = Instant::now();
+        let result = fixture
+            .pending
+            .activate_proxy(fixture.identity, &fixture.lease, 4, 0x3400)
+            .await;
+        assert!(matches!(
+            result,
+            Err(PendingUdpDecisionError::StaleIdentity)
+        ));
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(*fixture.sink.lock(), vec![TestVerdict::Drop { id: 1 }]);
+        assert_eq!(fixture.stats.udp_snapshot().nfqueue.cancel, 1);
+        drop(writer);
     }
 
     #[test]

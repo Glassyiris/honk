@@ -3,6 +3,53 @@ use super::*;
 use crate::control::udp_endpoint::UdpEndpoint;
 use crate::dns::query::is_exact_dns_query;
 
+#[cfg(feature = "ebpf")]
+#[test]
+fn nfqueue_actor_queue_bounds_small_and_max_payloads() {
+    let stats = Arc::new(StatsManager::new());
+    let queue = NfqueueActorQueue::new(Arc::clone(&stats));
+    let oldest = Instant::now() - Duration::from_millis(25);
+    assert!(queue.try_enqueue(oldest, 1_200));
+    assert!(queue.try_enqueue(Instant::now(), 65_507));
+
+    let snapshot = stats.udp_snapshot().nfqueue;
+    assert_eq!(snapshot.actor_queue_depth, 2);
+    assert_eq!(snapshot.actor_queued_bytes, 66_707);
+    assert!(snapshot.actor_oldest_age_nanos >= Duration::from_millis(25).as_nanos() as u64);
+
+    queue.dequeue(1_200);
+    queue.dequeue(65_507);
+    let mut max_payloads = 0;
+    while queue.try_enqueue(Instant::now(), 65_507) {
+        max_payloads += 1;
+    }
+    let saturated = stats.udp_snapshot().nfqueue;
+    assert!(saturated.actor_queue_depth <= NFQUEUE_INGEST_QUEUE_LEN as u64);
+    assert!(saturated.actor_queued_bytes <= NFQUEUE_INGEST_BYTE_BUDGET as u64);
+    assert!(max_payloads < NFQUEUE_INGEST_QUEUE_LEN);
+
+    for _ in 0..max_payloads {
+        queue.dequeue(65_507);
+    }
+    let empty = stats.udp_snapshot().nfqueue;
+    assert_eq!(empty.actor_queue_depth, 0);
+    assert_eq!(empty.actor_queued_bytes, 0);
+    assert_eq!(empty.actor_oldest_age_nanos, 0);
+}
+
+#[cfg(feature = "ebpf")]
+#[test]
+fn nfqueue_token_retry_backoff_caps_at_thirty_seconds() {
+    let mut backoff = NfqueueTokenRetryBackoff::default();
+    assert_eq!(backoff.failed(), Duration::from_secs(1));
+    assert_eq!(backoff.failed(), Duration::from_secs(2));
+    assert_eq!(backoff.failed(), Duration::from_secs(5));
+    assert_eq!(backoff.failed(), Duration::from_secs(30));
+    assert_eq!(backoff.failed(), Duration::from_secs(30));
+    backoff.reset();
+    assert_eq!(backoff.failed(), Duration::from_secs(1));
+}
+
 #[test]
 fn test_build_dns_probe_query() {
     let q = build_dns_probe_query();

@@ -96,7 +96,7 @@ jobs:
           fi
           test "$(stat -f -c %T /sys/fs/bpf)" = bpf_fs
 
-      - name: Load and attach eBPF in the VM kernel
+      - name: Verify eBPF lifecycle and pinned-map compatibility
         run: |
           sudo env \
             HOME="$HOME" \
@@ -106,7 +106,7 @@ jobs:
             CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" \
             RUST_BACKTRACE=1 \
             "$HOME/.cargo/bin/cargo" +stable test \
-              -p honk-core --features ebpf --lib link_lifecycle -- \
+              -p honk-core --features ebpf --lib ebpf::real::tests -- \
               --ignored --test-threads=1
 
       - name: Run real-kernel NFQUEUE contract

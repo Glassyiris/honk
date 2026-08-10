@@ -107,6 +107,33 @@ pub struct NfqueueService {
     shutdown_complete: bool,
 }
 
+#[derive(Clone)]
+pub struct QueueStatsReader {
+    guards: Arc<verdict::GuardTracker>,
+    socket_receive_buffer_bytes: usize,
+}
+
+impl QueueStatsReader {
+    pub async fn stats(&self) -> io::Result<QueueStats> {
+        let contents = tokio::fs::read_to_string("/proc/net/netfilter/nfnetlink_queue").await?;
+        let (kernel_queue_depth, kernel_dropped, kernel_user_dropped) =
+            parse_kernel_queue_stats(&contents).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "owned NFQUEUE status row is absent",
+                )
+            })?;
+        Ok(QueueStats {
+            kernel_queue_depth,
+            kernel_dropped,
+            kernel_user_dropped,
+            held_packets: self.guards.count(),
+            held_peak: self.guards.peak(),
+            socket_receive_buffer_bytes: self.socket_receive_buffer_bytes,
+        })
+    }
+}
+
 impl NfqueueService {
     /// Binds the fixed queue before publishing the atomic nftables transaction.
     pub fn start(callback: PacketCallback) -> Result<(Self, FatalReceiver), StartError> {
@@ -161,19 +188,9 @@ impl NfqueueService {
         ))
     }
 
-    pub async fn stats(&self) -> QueueStats {
-        let (kernel_queue_depth, kernel_dropped, kernel_user_dropped) =
-            tokio::fs::read_to_string("/proc/net/netfilter/nfnetlink_queue")
-                .await
-                .ok()
-                .and_then(|contents| parse_kernel_queue_stats(&contents))
-                .unwrap_or_default();
-        QueueStats {
-            kernel_queue_depth,
-            kernel_dropped,
-            kernel_user_dropped,
-            held_packets: self.guards.count(),
-            held_peak: self.guards.peak(),
+    pub fn stats_reader(&self) -> QueueStatsReader {
+        QueueStatsReader {
+            guards: Arc::clone(&self.guards),
             socket_receive_buffer_bytes: self
                 .socket
                 .as_ref()

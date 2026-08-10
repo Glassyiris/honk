@@ -96,8 +96,10 @@ impl RealEbpfBackend {
         );
         std::fs::create_dir_all(pin_root)?;
         let sequence_pin = pin_root.join(UDP_DECISION_SEQUENCE_MAP);
-        if sequence_pin.try_exists()? {
-            syscall::validate_pinned_udp_decision_sequence(&sequence_pin)?;
+        if sequence_pin.try_exists()?
+            && syscall::validate_pinned_udp_decision_sequence(&sequence_pin)?
+        {
+            info!("migrated legacy UDP decision token allocator");
         }
 
         // A stale pin must never hide a generation-owned map. The token

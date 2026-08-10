@@ -147,12 +147,17 @@ struct UdpNfqueueStats {
     received: AtomicU64,
     active_flows: AtomicU64,
     kernel_queue_depth: AtomicU64,
+    kernel_stats_available: AtomicU64,
+    kernel_stats_read_errors: AtomicU64,
     kernel_dropped: AtomicU64,
     kernel_user_dropped: AtomicU64,
     held_packets: AtomicU64,
     held_peak: AtomicU64,
     socket_receive_buffer_bytes: AtomicU64,
     actor_queue_full: AtomicU64,
+    actor_queue_depth: AtomicU64,
+    actor_queued_bytes: AtomicU64,
+    actor_oldest_age_nanos: AtomicU64,
     direct_accepted: AtomicU64,
     proxy_copied: AtomicU64,
     proxy_dropped: AtomicU64,
@@ -177,12 +182,17 @@ impl UdpNfqueueStats {
             received: self.received.load(Ordering::Relaxed),
             active_flows: self.active_flows.load(Ordering::Relaxed),
             kernel_queue_depth: self.kernel_queue_depth.load(Ordering::Relaxed),
+            kernel_stats_available: self.kernel_stats_available.load(Ordering::Relaxed) != 0,
+            kernel_stats_read_errors: self.kernel_stats_read_errors.load(Ordering::Relaxed),
             kernel_dropped: self.kernel_dropped.load(Ordering::Relaxed),
             kernel_user_dropped: self.kernel_user_dropped.load(Ordering::Relaxed),
             held_packets: self.held_packets.load(Ordering::Relaxed),
             held_peak: self.held_peak.load(Ordering::Relaxed),
             socket_receive_buffer_bytes: self.socket_receive_buffer_bytes.load(Ordering::Relaxed),
             actor_queue_full: self.actor_queue_full.load(Ordering::Relaxed),
+            actor_queue_depth: self.actor_queue_depth.load(Ordering::Relaxed),
+            actor_queued_bytes: self.actor_queued_bytes.load(Ordering::Relaxed),
+            actor_oldest_age_nanos: self.actor_oldest_age_nanos.load(Ordering::Relaxed),
             direct_accepted: self.direct_accepted.load(Ordering::Relaxed),
             proxy_copied: self.proxy_copied.load(Ordering::Relaxed),
             proxy_dropped: self.proxy_dropped.load(Ordering::Relaxed),
@@ -204,12 +214,17 @@ pub struct UdpNfqueueStatsSnapshot {
     pub received: u64,
     pub active_flows: u64,
     pub kernel_queue_depth: u64,
+    pub kernel_stats_available: bool,
+    pub kernel_stats_read_errors: u64,
     pub kernel_dropped: u64,
     pub kernel_user_dropped: u64,
     pub held_packets: u64,
     pub held_peak: u64,
     pub socket_receive_buffer_bytes: u64,
     pub actor_queue_full: u64,
+    pub actor_queue_depth: u64,
+    pub actor_queued_bytes: u64,
+    pub actor_oldest_age_nanos: u64,
     pub direct_accepted: u64,
     pub proxy_copied: u64,
     pub proxy_dropped: u64,
@@ -627,6 +642,10 @@ impl StatsManager {
     pub fn update_udp_nfqueue_service_stats(&self, stats: honk_nfqueue::QueueStats) {
         self.udp
             .nfqueue
+            .kernel_stats_available
+            .store(1, Ordering::Relaxed);
+        self.udp
+            .nfqueue
             .kernel_queue_depth
             .store(stats.kernel_queue_depth, Ordering::Relaxed);
         self.udp
@@ -652,15 +671,44 @@ impl StatsManager {
     }
 
     #[cfg(feature = "ebpf")]
-    pub fn record_udp_nfqueue_actor_queue_full(&self, elapsed: std::time::Duration) {
-        self.udp.nfqueue.received.fetch_add(1, Ordering::Relaxed);
+    pub fn record_udp_nfqueue_service_stats_error(&self) {
+        self.udp
+            .nfqueue
+            .kernel_stats_available
+            .store(0, Ordering::Relaxed);
+        self.udp
+            .nfqueue
+            .kernel_stats_read_errors
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "ebpf")]
+    pub fn update_udp_nfqueue_actor_queue(
+        &self,
+        depth: usize,
+        queued_bytes: usize,
+        oldest_age: std::time::Duration,
+    ) {
+        self.udp
+            .nfqueue
+            .actor_queue_depth
+            .store(depth as u64, Ordering::Relaxed);
+        self.udp
+            .nfqueue
+            .actor_queued_bytes
+            .store(queued_bytes as u64, Ordering::Relaxed);
+        self.udp.nfqueue.actor_oldest_age_nanos.store(
+            oldest_age.as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    #[cfg(feature = "ebpf")]
+    pub fn record_udp_nfqueue_actor_queue_full(&self) {
         self.udp
             .nfqueue
             .actor_queue_full
             .fetch_add(1, Ordering::Relaxed);
-        self.udp
-            .nfqueue
-            .record_verdict(&self.udp.nfqueue.drop, elapsed);
     }
 
     /// Record one packet delivered by the NFQUEUE listener.
@@ -1051,5 +1099,28 @@ mod tests {
         assert_eq!(settled.udp_nodes, 1);
         assert_eq!(settled.tuic_clients, 1);
         generation.shutdown().await;
+    }
+    #[cfg(feature = "ebpf")]
+    #[test]
+    fn nfqueue_kernel_stats_failures_are_visible() {
+        let stats = StatsManager::new();
+        stats.update_udp_nfqueue_service_stats(honk_nfqueue::QueueStats {
+            kernel_queue_depth: 7,
+            kernel_dropped: 2,
+            kernel_user_dropped: 3,
+            held_packets: 4,
+            held_peak: 5,
+            socket_receive_buffer_bytes: 6,
+        });
+        let available = stats.udp_snapshot().nfqueue;
+        assert!(available.kernel_stats_available);
+        assert_eq!(available.kernel_queue_depth, 7);
+        assert_eq!(available.kernel_stats_read_errors, 0);
+
+        stats.record_udp_nfqueue_service_stats_error();
+        let unavailable = stats.udp_snapshot().nfqueue;
+        assert!(!unavailable.kernel_stats_available);
+        assert_eq!(unavailable.kernel_stats_read_errors, 1);
+        assert_eq!(unavailable.kernel_queue_depth, 7);
     }
 }

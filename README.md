@@ -30,7 +30,7 @@ experimental {
 
 Changing `experimental.udp_nfqueue.enabled` requires a restart. Enabled startup requires a build with the `ebpf` feature and the real eBPF backend; `--mock-ebpf` and builds without `ebpf` are rejected. Host-originated WAN egress remains on the canonical TPROXY path. DNS port 53, `must`, `block`, and already-safe route-time direct decisions never enter NFQUEUE; only decisions that can still change in userspace are staged.
 
-The path owns raw-netlink queue `320` and nftables objects `inet honk_nfqueue` / `udp_decision`; same-namespace firewall managers must leave them untouched while honk runs. Direct releases the held skb, proxy submits one retained payload to the normal UDP initializer, and block/cancellation drops it. With the Clash API enabled, runtime counters and receipt-to-verdict latency appear under `/stats.udp.nfqueue`. See the [design](doc/design.en.md) and [configuration reference](doc/configuration.en.md) for invariants and the full metric schema.
+The path owns raw-netlink queue `320` and nftables objects `inet honk_nfqueue` / `udp_decision`; same-namespace firewall managers must leave them untouched while honk runs. Direct releases the held skb, proxy submits one retained payload to the normal UDP initializer, and block/cancellation drops it. The ingest actor is bounded to 256 packets and 8 MiB of payload, and every packet keeps a three-second absolute deadline from listener receipt. With the Clash API enabled, `/stats.udp.nfqueue` exposes actor depth/bytes/oldest age plus explicit kernel-stat availability and read failures. See the [design](doc/design.en.md) and [configuration reference](doc/configuration.en.md) for invariants and the full metric schema.
 
 ## Before Using This Repository
 

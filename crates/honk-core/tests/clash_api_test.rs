@@ -1512,12 +1512,17 @@ async fn stats_exposes_udp_metrics() {
     assert_eq!(nfqueue["received"], 1);
     assert_eq!(nfqueue["activeFlows"], 1);
     assert_eq!(nfqueue["kernelQueueDepth"], 0);
+    assert_eq!(nfqueue["kernelStatsAvailable"], false);
+    assert_eq!(nfqueue["kernelStatsReadErrors"], 0);
     assert_eq!(nfqueue["kernelDropped"], 0);
     assert_eq!(nfqueue["kernelUserDropped"], 0);
     assert_eq!(nfqueue["heldPackets"], 0);
     assert_eq!(nfqueue["heldPeak"], 0);
     assert_eq!(nfqueue["socketReceiveBufferBytes"], 0);
     assert_eq!(nfqueue["actorQueueFull"], 0);
+    assert_eq!(nfqueue["actorQueueDepth"], 0);
+    assert_eq!(nfqueue["actorQueuedBytes"], 0);
+    assert_eq!(nfqueue["actorOldestAgeNanos"], 0);
     assert_eq!(nfqueue["directAccepted"], 1);
     assert_eq!(nfqueue["proxyCopied"], 1);
     assert_eq!(nfqueue["proxyDropped"], 1);

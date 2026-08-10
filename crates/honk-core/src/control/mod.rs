@@ -55,6 +55,8 @@ use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::Mutex;
 use std::time::Duration;
+#[cfg(feature = "ebpf")]
+use std::time::Instant;
 use tokio::io::Interest;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{RwLock, mpsc};
@@ -64,8 +66,107 @@ const NFQUEUE_STATS_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg(feature = "ebpf")]
 const NFQUEUE_INGEST_QUEUE_LEN: usize = 256;
 #[cfg(feature = "ebpf")]
-const _: () =
-    assert!(NFQUEUE_INGEST_QUEUE_LEN * honk_nfqueue::MAX_DATAGRAM_SIZE <= 32 * 1024 * 1024);
+const NFQUEUE_INGEST_BYTE_BUDGET: usize = 8 * 1024 * 1024;
+#[cfg(feature = "ebpf")]
+const NFQUEUE_TOKEN_RETRY_DELAYS: [Duration; 4] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(30),
+];
+
+#[cfg(feature = "ebpf")]
+#[derive(Debug, Default)]
+struct NfqueueTokenRetryBackoff {
+    failures: usize,
+}
+
+#[cfg(feature = "ebpf")]
+impl NfqueueTokenRetryBackoff {
+    fn failed(&mut self) -> Duration {
+        let delay =
+            NFQUEUE_TOKEN_RETRY_DELAYS[self.failures.min(NFQUEUE_TOKEN_RETRY_DELAYS.len() - 1)];
+        self.failures = self.failures.saturating_add(1);
+        delay
+    }
+
+    fn reset(&mut self) {
+        self.failures = 0;
+    }
+}
+
+#[cfg(feature = "ebpf")]
+#[derive(Debug)]
+struct NfqueueActorQueueEntry {
+    received_at: Instant,
+    payload_bytes: usize,
+}
+
+#[cfg(feature = "ebpf")]
+#[derive(Debug, Default)]
+struct NfqueueActorQueueState {
+    entries: std::collections::VecDeque<NfqueueActorQueueEntry>,
+    payload_bytes: usize,
+}
+
+#[cfg(feature = "ebpf")]
+#[derive(Debug)]
+struct NfqueueActorQueue {
+    state: parking_lot::Mutex<NfqueueActorQueueState>,
+    stats: Arc<StatsManager>,
+}
+
+#[cfg(feature = "ebpf")]
+impl NfqueueActorQueue {
+    fn new(stats: Arc<StatsManager>) -> Self {
+        Self {
+            state: parking_lot::Mutex::new(NfqueueActorQueueState::default()),
+            stats,
+        }
+    }
+
+    fn try_enqueue(&self, received_at: Instant, payload_bytes: usize) -> bool {
+        let mut state = self.state.lock();
+        if state.entries.len() >= NFQUEUE_INGEST_QUEUE_LEN
+            || state.payload_bytes.saturating_add(payload_bytes) > NFQUEUE_INGEST_BYTE_BUDGET
+        {
+            return false;
+        }
+        state.entries.push_back(NfqueueActorQueueEntry {
+            received_at,
+            payload_bytes,
+        });
+        state.payload_bytes += payload_bytes;
+        self.publish(&state);
+        true
+    }
+
+    fn dequeue(&self, payload_bytes: usize) {
+        let mut state = self.state.lock();
+        let entry = state
+            .entries
+            .pop_front()
+            .expect("NFQUEUE actor queue accounting underflow");
+        debug_assert_eq!(entry.payload_bytes, payload_bytes);
+        state.payload_bytes = state.payload_bytes.saturating_sub(entry.payload_bytes);
+        self.publish(&state);
+    }
+
+    fn sample(&self) {
+        self.publish(&self.state.lock());
+    }
+
+    fn publish(&self, state: &NfqueueActorQueueState) {
+        self.stats.update_udp_nfqueue_actor_queue(
+            state.entries.len(),
+            state.payload_bytes,
+            state
+                .entries
+                .front()
+                .map_or(Duration::ZERO, |entry| entry.received_at.elapsed()),
+        );
+    }
+}
 
 #[cfg(feature = "ebpf")]
 #[derive(Debug, thiserror::Error)]
@@ -84,6 +185,8 @@ enum NfqueueRuntimeFatal {
     Watchdog(String),
     #[error("NFQUEUE ingest actor exited unexpectedly: {0}")]
     IngestActor(String),
+    #[error("NFQUEUE stats sampler exited unexpectedly: {0}")]
+    StatsSampler(String),
 }
 
 #[cfg_attr(not(feature = "ebpf"), allow(dead_code))]
@@ -102,8 +205,9 @@ struct NfqueueRuntime {
     stop: tokio::sync::watch::Sender<bool>,
     watchdog: Option<tokio::task::JoinHandle<()>>,
     ingest_worker: Option<tokio::task::JoinHandle<()>>,
+    stats_sampler: Option<tokio::task::JoinHandle<()>>,
     token_backstop: tokio::time::Interval,
-    queue_stats: tokio::time::Interval,
+    token_retry: NfqueueTokenRetryBackoff,
     sequence_ready: bool,
 }
 
@@ -117,11 +221,14 @@ impl NfqueueRuntime {
             let listener_fatal = &mut self.listener_fatal;
             let pending_fatal = &mut self.pending_fatal;
             let token_backstop = &mut self.token_backstop;
-            let queue_stats = &mut self.queue_stats;
             let watchdog = self
                 .watchdog
                 .as_mut()
                 .expect("NFQUEUE watchdog is retained until shutdown");
+            let stats_sampler = self
+                .stats_sampler
+                .as_mut()
+                .expect("NFQUEUE stats sampler is retained until shutdown");
             let ingest_worker = self
                 .ingest_worker
                 .as_mut()
@@ -156,10 +263,13 @@ impl NfqueueRuntime {
                         }),
                     ));
                 }
-                _ = queue_stats.tick() => {
-                    if let Some(service) = self.service.as_ref() {
-                        self.stats.update_udp_nfqueue_service_stats(service.stats().await);
-                    }
+                result = stats_sampler => {
+                    return NfqueueRuntimeEvent::Fatal(anyhow::Error::new(
+                        NfqueueRuntimeFatal::StatsSampler(match result {
+                            Ok(()) => "completed".to_string(),
+                            Err(error) => error.to_string(),
+                        }),
+                    ));
                 }
                 _ = token_backstop.tick() => {
                     match ebpf.read().await.udp_decision_sequence_status() {
@@ -201,6 +311,13 @@ impl NfqueueRuntime {
             return Err(NfqueueRuntimeFatal::Watchdog("completed".to_string()));
         }
         if self
+            .stats_sampler
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+        {
+            return Err(NfqueueRuntimeFatal::StatsSampler("completed".to_string()));
+        }
+        if self
             .ingest_worker
             .as_ref()
             .is_none_or(tokio::task::JoinHandle::is_finished)
@@ -223,6 +340,11 @@ impl NfqueueRuntime {
         self.pending.cancel_all().await;
         self.pending.wait_empty().await;
         let _ = self.stop.send(true);
+        if let Some(stats_sampler) = self.stats_sampler.take() {
+            stats_sampler
+                .await
+                .map_err(|error| anyhow::anyhow!("join NFQUEUE stats sampler: {error}"))?;
+        }
         if let Some(watchdog) = self.watchdog.take() {
             watchdog
                 .await
@@ -248,6 +370,15 @@ impl NfqueueRuntime {
             return Some(NfqueueRuntimeFatal::Pending(error));
         }
         None
+    }
+
+    fn defer_token_retry(&mut self) {
+        self.token_backstop.reset_after(self.token_retry.failed());
+    }
+
+    fn reset_token_retry(&mut self) {
+        self.token_retry.reset();
+        self.token_backstop.reset_after(nfqueue::WATCHDOG_INTERVAL);
     }
 }
 #[cfg(feature = "ebpf")]
@@ -1085,6 +1216,7 @@ impl ControlPlane {
             runtime.pending.wait_empty().await;
         }
         if !self.rotate_udp_decision_generation().await? {
+            runtime.defer_token_retry();
             warn!("all UDP decision token generations remain live; NFQUEUE staging stays fenced");
             return Ok(());
         }
@@ -1095,6 +1227,7 @@ impl ControlPlane {
             .reopen_nfqueue()
             .await?;
         runtime.sequence_ready = true;
+        runtime.reset_token_retry();
         Ok(())
     }
 
@@ -1127,15 +1260,21 @@ impl ControlPlane {
             Option<tokio::sync::OwnedSemaphorePermit>,
         );
         let (ingest_tx, mut ingest_rx) = mpsc::channel::<IngestRequest>(NFQUEUE_INGEST_QUEUE_LEN);
+        let actor_queue = Arc::new(NfqueueActorQueue::new(Arc::clone(&self.stats)));
         let slow_limit = Arc::clone(&self.udp_concurrency_limit);
-        let callback_stats = Arc::clone(&self.stats);
+        let callback_pending = Arc::clone(&pending);
+        let callback_queue = Arc::clone(&actor_queue);
         let callback: honk_nfqueue::PacketCallback = Arc::new(move |packet, guard| {
-            let permit = Arc::clone(&slow_limit).try_acquire_owned().ok();
-            if let Err(error) = ingest_tx.try_send((packet, guard, permit)) {
-                let (packet, guard, permit) = error.into_inner();
-                callback_stats.record_udp_nfqueue_actor_queue_full(packet.received_at.elapsed());
-                drop((packet, guard, permit));
+            let Ok(slot) = ingest_tx.try_reserve() else {
+                callback_pending.reject_actor_queue(packet, guard);
+                return;
+            };
+            if !callback_queue.try_enqueue(packet.received_at, packet.payload.len()) {
+                callback_pending.reject_actor_queue(packet, guard);
+                return;
             }
+            let permit = Arc::clone(&slow_limit).try_acquire_owned().ok();
+            slot.send((packet, guard, permit));
         });
         let (service, listener_fatal) = match honk_nfqueue::NfqueueService::start(callback) {
             Ok(runtime) => runtime,
@@ -1147,8 +1286,10 @@ impl ControlPlane {
         let actor_pending = Arc::clone(&pending);
         let initializer = self.spawn_handle();
         let drain = Arc::clone(&self.drain_tracker);
+        let ingest_queue = Arc::clone(&actor_queue);
         let ingest_worker = tokio::spawn(async move {
             while let Some((packet, guard, permit)) = ingest_rx.recv().await {
+                ingest_queue.dequeue(packet.payload.len());
                 let nfqueue::NfqueueIngest::Initialize { lease, identity } =
                     actor_pending.ingest_wait(packet, guard, permit).await
                 else {
@@ -1178,16 +1319,57 @@ impl ControlPlane {
         });
         let (stop, stop_receiver) = tokio::sync::watch::channel(false);
         let watchdog = tokio::spawn(Arc::clone(&pending).run_watchdog(stop_receiver));
+        let stats_reader = service.stats_reader();
+        let sampler_stats = Arc::clone(&self.stats);
+        let sampler_queue = Arc::clone(&actor_queue);
+        let mut sampler_stop = stop.subscribe();
+        let stats_sampler = tokio::spawn(async move {
+            let mut interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + NFQUEUE_STATS_INTERVAL,
+                NFQUEUE_STATS_INTERVAL,
+            );
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut unavailable = false;
+            loop {
+                tokio::select! {
+                    changed = sampler_stop.changed() => {
+                        if changed.is_err() || *sampler_stop.borrow() {
+                            break;
+                        }
+                    }
+                    _ = interval.tick() => {
+                        sampler_queue.sample();
+                        match stats_reader.stats().await {
+                            Ok(sample) => {
+                                if unavailable {
+                                    info!("NFQUEUE kernel statistics are available again");
+                                }
+                                unavailable = false;
+                                sampler_stats.update_udp_nfqueue_service_stats(sample);
+                            }
+                            Err(error) => {
+                                sampler_stats.record_udp_nfqueue_service_stats_error();
+                                if !unavailable {
+                                    warn!(%error, "NFQUEUE kernel statistics are unavailable");
+                                }
+                                unavailable = true;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let mut token_retry = NfqueueTokenRetryBackoff::default();
+        let first_token_check = if sequence_ready {
+            nfqueue::WATCHDOG_INTERVAL
+        } else {
+            token_retry.failed()
+        };
         let mut token_backstop = tokio::time::interval_at(
-            tokio::time::Instant::now() + nfqueue::WATCHDOG_INTERVAL,
+            tokio::time::Instant::now() + first_token_check,
             nfqueue::WATCHDOG_INTERVAL,
         );
         token_backstop.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut queue_stats = tokio::time::interval_at(
-            tokio::time::Instant::now() + NFQUEUE_STATS_INTERVAL,
-            NFQUEUE_STATS_INTERVAL,
-        );
-        queue_stats.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         Ok(Some(NfqueueRuntime {
             service: Some(service),
             listener_fatal,
@@ -1197,8 +1379,9 @@ impl ControlPlane {
             stop,
             watchdog: Some(watchdog),
             ingest_worker: Some(ingest_worker),
+            stats_sampler: Some(stats_sampler),
             token_backstop,
-            queue_stats,
+            token_retry,
             sequence_ready,
         }))
     }

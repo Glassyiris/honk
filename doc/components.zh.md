@@ -639,11 +639,12 @@ udp = {
   stagger: { attempts, winners, cancellations },
   warm: { attempts, successes, failures },
   nfqueue: {
-    received, activeFlows, kernelQueueDepth, kernelDropped, kernelUserDropped,
-    heldPackets, heldPeak, socketReceiveBufferBytes, actorQueueFull,
-    directAccepted, proxyCopied, proxyDropped, block, cancel, drop,
-    tokenMismatch, tokenExhaustion, tokenRollovers, verdictErrors,
-    receiptToVerdict: H
+    received, activeFlows, kernelQueueDepth, kernelStatsAvailable,
+    kernelStatsReadErrors, kernelDropped, kernelUserDropped, heldPackets,
+    heldPeak, socketReceiveBufferBytes, actorQueueFull, actorQueueDepth,
+    actorQueuedBytes, actorOldestAgeNanos, directAccepted, proxyCopied,
+    proxyDropped, block, cancel, drop, tokenMismatch, tokenExhaustion,
+    tokenRollovers, verdictErrors, receiptToVerdict: H
   }
 }
 H = { count, sumNanos, buckets }  // buckets 有固定 64 个 log2 slot
@@ -658,10 +659,13 @@ generation slot，则保留该 incumbent，winner transport 只为当前选中�
 connection。warm 的 `successes` 只计 `Ready`；`NotApplicable` 保持中性。
 
 `nfqueue.received` 统计 listener 投递；`activeFlows` 是当前 pending correlator gauge。
-`kernelQueueDepth`、`kernelDropped` 和 `kernelUserDropped` 来自自有队列的内核状态；
-`heldPackets` 与 `heldPeak` 统计已投递的 verdict guard。`socketReceiveBufferBytes` 是
-netlink 实际接收缓冲区大小，`actorQueueFull` 统计有界 ingest actor 饱和时的 fail-closed
-丢包。`directAccepted`、`proxyDropped`、`block`、`cancel` 和 `drop` 统计成功内核 verdict；
+独立于报文 dispatch 的一秒任务采样自有内核队列。`kernelStatsAvailable` 表示最近一次
+读取是否成功；`kernelStatsReadErrors` 是累计失败数。读取失败时仍保留最近的
+`kernelQueueDepth`、`kernelDropped` 和 `kernelUserDropped`，不会用含义不明的零值覆盖。
+`heldPackets` 与 `heldPeak` 统计已投递的 verdict guard；`socketReceiveBufferBytes` 是
+netlink 实际接收缓冲区大小。`actorQueueFull` 统计 fail-closed admission 丢包；
+`actorQueueDepth`、`actorQueuedBytes` 和 `actorOldestAgeNanos` 暴露当前 ingest 压力。
+`directAccepted`、`proxyDropped`、`block`、`cancel` 和 `drop` 统计成功内核 verdict；
 `proxyCopied` 统计唯一 payload 所有权转交。`tokenMismatch`、`tokenExhaustion`、
 `tokenRollovers` 和 `verdictErrors` 暴露 token/verdict 事件。`receiptToVerdict` 测量
 listener 收包到成功 verdict 的时间；NFQA timestamp 不保证存在，因此不表示内核队列驻留时间。

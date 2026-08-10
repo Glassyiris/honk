@@ -568,10 +568,12 @@ fail-open mode. It owns the exact nftables table and chain names
 `inet honk_nfqueue` / `udp_decision`. A firewall manager in the same network
 namespace must not flush, replace, or mutate either object while honk is running.
 The eBPF `UDP_DECISION_SEQUENCE` pin is persistent across ordinary restart and
-cleanup. Tokens combine a two-bit generation and a 28-bit sequence. Exhaustion
-fences and drains staging before switching to an unused live-map generation; if
-all four generations remain live, staging stays fenced and retries; non-staged
-UDP continues while ambiguous new flows fail closed. It does not require a reboot.
+cleanup. Tokens combine a two-bit generation and a 28-bit sequence; a pinned
+legacy linear value is migrated at load without token reuse. Exhaustion fences
+and drains staging before switching to an unused live-map generation. If all
+four generations remain live, retries back off through 1, 2, 5, then 30 seconds;
+non-staged UDP continues while ambiguous new flows fail closed. No reboot or
+manual allocator reset is required.
 
 The original skb is held before conntrack/NAT. Direct performs token-checked
 Arm → FIFO `NF_ACCEPT` with the final mark → Activate, without a userspace direct
@@ -583,13 +585,22 @@ quiesce/cancel pending ownership, and only then tear down the queue and owned
 table. Queue/listener/verdict errors remain fatal rather than fail-open;
 allocator exhaustion uses fenced generation rotation.
 
+The ingest actor admits at most 256 packets and 8 MiB of retained payload. A
+typical 1,200-byte workload reaches the entry cap first; maximum 65,507-byte UDP
+payloads reach the byte cap at 128 queued packets. The absolute hold deadline is
+three seconds from listener receipt and includes backend-lock acquisition and
+all pre-Arm transitions. Full or expired work is dropped rather than allowed to
+grow memory or bypass policy.
+
 With the Clash API enabled, `GET /stats` exposes the fixed object
 `/stats.udp.nfqueue` (dotted path, not a separate route): `received`,
-`activeFlows`, `kernelQueueDepth`, `kernelDropped`, `kernelUserDropped`,
-`heldPackets`, `heldPeak`, `socketReceiveBufferBytes`, `actorQueueFull`,
-`directAccepted`, `proxyCopied`, `proxyDropped`, `block`, `cancel`, `drop`,
-`tokenMismatch`, `tokenExhaustion`, `tokenRollovers`, `verdictErrors`, and
-`receiptToVerdict`. See the component reference for field meanings.
+`activeFlows`, `kernelQueueDepth`, `kernelStatsAvailable`,
+`kernelStatsReadErrors`, `kernelDropped`, `kernelUserDropped`, `heldPackets`,
+`heldPeak`, `socketReceiveBufferBytes`, `actorQueueFull`, `actorQueueDepth`,
+`actorQueuedBytes`, `actorOldestAgeNanos`, `directAccepted`, `proxyCopied`,
+`proxyDropped`, `block`, `cancel`, `drop`, `tokenMismatch`, `tokenExhaustion`,
+`tokenRollovers`, `verdictErrors`, and `receiptToVerdict`. See the component
+reference for field meanings.
 
 ### Clash API
 
