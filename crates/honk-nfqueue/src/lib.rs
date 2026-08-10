@@ -27,6 +27,30 @@ pub const NFQUEUE_TOKEN_MASK: u32 = 0x3fff_ffff;
 pub type PacketCallback = Arc<dyn Fn(QueuedPacket, VerdictGuard) + Send + Sync + 'static>;
 pub type FatalReceiver = tokio::sync::oneshot::Receiver<FatalError>;
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct QueueStats {
+    pub kernel_queue_depth: u64,
+    pub kernel_dropped: u64,
+    pub kernel_user_dropped: u64,
+    pub held_packets: usize,
+    pub held_peak: usize,
+    pub socket_receive_buffer_bytes: usize,
+}
+
+fn parse_kernel_queue_stats(contents: &str) -> Option<(u64, u64, u64)> {
+    contents.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let queue = fields.next()?.parse::<u16>().ok()?;
+        let _peer_port = fields.next()?;
+        let depth = fields.next()?.parse().ok()?;
+        let _copy_mode = fields.next()?;
+        let _copy_range = fields.next()?;
+        let dropped = fields.next()?.parse().ok()?;
+        let user_dropped = fields.next()?.parse().ok()?;
+        (queue == QUEUE_NUM).then_some((depth, dropped, user_dropped))
+    })
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum FatalError {
     #[error("NFQUEUE receive lost packets with ENOBUFS")]
@@ -137,6 +161,25 @@ impl NfqueueService {
         ))
     }
 
+    pub fn stats(&self) -> QueueStats {
+        let (kernel_queue_depth, kernel_dropped, kernel_user_dropped) =
+            std::fs::read_to_string("/proc/net/netfilter/nfnetlink_queue")
+                .ok()
+                .and_then(|contents| parse_kernel_queue_stats(&contents))
+                .unwrap_or_default();
+        QueueStats {
+            kernel_queue_depth,
+            kernel_dropped,
+            kernel_user_dropped,
+            held_packets: self.guards.count(),
+            held_peak: self.guards.peak(),
+            socket_receive_buffer_bytes: self
+                .socket
+                .as_ref()
+                .map_or(0, |socket| socket.receive_buffer_bytes()),
+        }
+    }
+
     /// The caller must fence packet producers first; this waits for every
     /// dispatched guard, closes the queue, then deletes the wholly owned table.
     pub fn shutdown(mut self) -> Result<(), ShutdownError> {
@@ -205,4 +248,13 @@ pub(crate) fn fatal_channel() -> (Arc<FatalNotifier>, FatalReceiver) {
         }),
         receiver,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn parses_owned_kernel_queue_stats() {
+        let input = "319 10 1 2 65535 3 4 8\n320 20 17 2 65535 5 6 9\n";
+        assert_eq!(super::parse_kernel_queue_stats(input), Some((17, 5, 6)));
+    }
 }

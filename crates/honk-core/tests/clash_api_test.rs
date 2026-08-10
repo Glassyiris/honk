@@ -1468,6 +1468,7 @@ async fn stats_exposes_udp_metrics() {
         .record_udp_nfqueue_drop(Duration::from_millis(5));
     app.state.stats.record_udp_nfqueue_token_mismatch();
     app.state.stats.record_udp_nfqueue_token_exhaustion();
+    app.state.stats.record_udp_nfqueue_token_rollover();
     app.state.stats.record_udp_nfqueue_verdict_error();
 
     let body: serde_json::Value = http_client()
@@ -1510,6 +1511,13 @@ async fn stats_exposes_udp_metrics() {
     let nfqueue = &udp["nfqueue"];
     assert_eq!(nfqueue["received"], 1);
     assert_eq!(nfqueue["activeFlows"], 1);
+    assert_eq!(nfqueue["kernelQueueDepth"], 0);
+    assert_eq!(nfqueue["kernelDropped"], 0);
+    assert_eq!(nfqueue["kernelUserDropped"], 0);
+    assert_eq!(nfqueue["heldPackets"], 0);
+    assert_eq!(nfqueue["heldPeak"], 0);
+    assert_eq!(nfqueue["socketReceiveBufferBytes"], 0);
+    assert_eq!(nfqueue["actorQueueFull"], 0);
     assert_eq!(nfqueue["directAccepted"], 1);
     assert_eq!(nfqueue["proxyCopied"], 1);
     assert_eq!(nfqueue["proxyDropped"], 1);
@@ -1518,6 +1526,7 @@ async fn stats_exposes_udp_metrics() {
     assert_eq!(nfqueue["drop"], 1);
     assert_eq!(nfqueue["tokenMismatch"], 1);
     assert_eq!(nfqueue["tokenExhaustion"], 1);
+    assert_eq!(nfqueue["tokenRollovers"], 1);
     assert_eq!(nfqueue["verdictErrors"], 1);
     assert_eq!(nfqueue["receiptToVerdict"]["count"], 5);
 

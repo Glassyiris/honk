@@ -65,6 +65,17 @@ async fn link_lifecycle_holds_links_and_rebinds_primary_wan() {
     let sequence_map_id = aya::maps::MapInfo::from_pin(pin_root.join(UDP_DECISION_SEQUENCE_MAP))
         .expect("initial sequence map info")
         .id();
+    syscall::reset_udp_decision_sequence_locked(backend.bpf().unwrap(), 2)
+        .expect("locked sequence reset");
+    assert_eq!(
+        backend
+            .udp_decision_sequence_status()
+            .expect("sequence status after reset"),
+        UdpDecisionSequenceStatus {
+            next: 0,
+            generation: 2,
+        }
+    );
 
     let staged_key = TuplesKey::default();
     backend

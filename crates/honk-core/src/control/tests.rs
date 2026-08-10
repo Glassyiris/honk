@@ -1309,6 +1309,8 @@ enum UdpTestMode {
         sends: Arc<std::sync::atomic::AtomicUsize>,
     },
     Success,
+    #[cfg(feature = "ebpf")]
+    KernelSocket(Arc<UdpSocket>),
     TcpHold {
         entered: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
@@ -1359,11 +1361,21 @@ impl honk_outbound::proxy::PacketTransport for UdpTestTransport {
                 sends.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
+            #[cfg(feature = "ebpf")]
+            UdpTestMode::KernelSocket(socket) => {
+                socket.send_to(_data, self.relay).await?;
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
 
     async fn recv_packet(&self, _buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        #[cfg(feature = "ebpf")]
+        if let UdpTestMode::KernelSocket(socket) = &self.mode {
+            let (size, _) = socket.recv_from(_buf).await?;
+            return Ok((size, self.relay));
+        }
         Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
     }
 }
@@ -1376,6 +1388,32 @@ impl crate::control::udp_endpoint::UdpReplySocketFactory for UdpTestReplySocketF
         let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
         socket.set_nonblocking(true)?;
         UdpSocket::from_std(socket)
+    }
+}
+
+#[cfg(feature = "ebpf")]
+#[derive(Debug)]
+struct KernelUdpReplySocketFactory;
+
+#[cfg(feature = "ebpf")]
+impl crate::control::udp_endpoint::UdpReplySocketFactory for KernelUdpReplySocketFactory {
+    fn create(&self, original_dst: SocketAddr) -> std::io::Result<UdpSocket> {
+        let domain = if original_dst.is_ipv4() {
+            socket2::Domain::IPV4
+        } else {
+            socket2::Domain::IPV6
+        };
+        let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, None)?;
+        socket.set_nonblocking(true)?;
+        socket.set_reuse_address(true)?;
+        if original_dst.is_ipv4() {
+            socket.set_ip_transparent_v4(true)?;
+        } else {
+            socket.set_ip_transparent_v6(true)?;
+        }
+        socket.set_mark(DAE_BYPASS_MARK)?;
+        socket.bind(&original_dst.into())?;
+        UdpSocket::from_std(socket.into())
     }
 }
 
@@ -3686,6 +3724,69 @@ fn link_lifecycle_cp(backend: crate::ebpf::mock::MockEbpfBackend) -> ControlPlan
     .unwrap()
 }
 
+#[cfg(feature = "ebpf")]
+#[tokio::test]
+async fn exhausted_udp_tokens_wait_for_an_unused_generation() {
+    use honk_ebpf_common::conn::{ConnState, UdpDecisionState};
+
+    let mut backend = crate::ebpf::mock::MockEbpfBackend::new();
+    backend.udp_decision_sequence_next = UDP_DECISION_SEQUENCE_MASK;
+    let mut keys = Vec::new();
+    for generation in 0..=UDP_DECISION_GENERATION_MASK {
+        let key = connection::build_tuples_key(
+            "203.0.113.1".parse().unwrap(),
+            44000 + generation as u16,
+            "10.0.0.1".parse().unwrap(),
+            53000,
+            17,
+        );
+        backend
+            .udp_conn_state_store(
+                &key,
+                &ConnState {
+                    state: UdpDecisionState::DirectArmed as u8,
+                    decision_token: udp_decision_token(generation, 1).unwrap(),
+                    ..ConnState::default()
+                },
+            )
+            .unwrap();
+        keys.push(key);
+    }
+
+    let control = link_lifecycle_cp(backend);
+    assert!(!control.rotate_udp_decision_generation().await.unwrap());
+    assert!(
+        control
+            .ebpf
+            .read()
+            .await
+            .udp_decision_sequence_status()
+            .unwrap()
+            .exhausted()
+    );
+
+    control
+        .ebpf
+        .write()
+        .await
+        .udp_conn_state_remove(&keys[2])
+        .unwrap();
+    assert!(control.rotate_udp_decision_generation().await.unwrap());
+    assert_eq!(
+        control
+            .ebpf
+            .read()
+            .await
+            .udp_decision_sequence_status()
+            .unwrap(),
+        crate::ebpf::UdpDecisionSequenceStatus {
+            next: 0,
+            generation: 2,
+        }
+    );
+    assert_eq!(control.stats.udp_snapshot().nfqueue.token_rollovers, 1);
+}
+
 /// Reload and subscription merge share `apply_runtime_config`, which only
 /// rewrites maps through the live backend — datapath hooks must never be
 /// detached or re-attached outside shutdown.
@@ -3924,4 +4025,331 @@ async fn udp_removal_worker_escalates_auxiliary_token_mismatch() {
 
     removal_task.abort();
     let _ = removal_task.await;
+}
+
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+fn fresh_test_netns() -> std::os::fd::OwnedFd {
+    std::thread::spawn(|| {
+        nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET).expect("unshare test netns");
+        std::fs::File::open("/proc/thread-self/ns/net")
+            .expect("open test netns")
+            .into()
+    })
+    .join()
+    .expect("create test netns")
+}
+
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+fn in_test_netns<T>(netns: &std::os::fd::OwnedFd, f: impl FnOnce() -> T) -> T {
+    let current = std::fs::File::open("/proc/thread-self/ns/net").expect("open current netns");
+    nix::sched::setns(netns, nix::sched::CloneFlags::CLONE_NEWNET).expect("enter test netns");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    nix::sched::setns(&current, nix::sched::CloneFlags::CLONE_NEWNET).expect("restore test netns");
+    match result {
+        Ok(value) => value,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+fn configure_test_edge(
+    netns: &std::os::fd::OwnedFd,
+    interface: &str,
+    address: [u8; 4],
+    gateway: [u8; 4],
+    ports: &[u16],
+) -> Vec<std::net::UdpSocket> {
+    in_test_netns(netns, || {
+        let mut netlink = crate::netlink::NlSock::new().expect("edge netlink");
+        let (loopback, _) = netlink.get_link("lo").expect("edge loopback");
+        let (ifindex, _) = netlink.get_link(interface).expect("edge interface");
+        netlink
+            .set_link_up(loopback, true)
+            .expect("edge loopback up");
+        netlink
+            .set_link_up(ifindex, true)
+            .expect("edge interface up");
+        netlink
+            .addr_op(true, ifindex, libc::AF_INET as u8, &address, 24)
+            .expect("edge address");
+        netlink
+            .add_route(
+                libc::AF_INET as u8,
+                254,
+                1,
+                0,
+                4,
+                None,
+                Some(&gateway),
+                Some(ifindex),
+            )
+            .expect("edge default route");
+        ports
+            .iter()
+            .map(|port| {
+                let socket = std::net::UdpSocket::bind(SocketAddr::from((address, *port)))
+                    .expect("edge UDP bind");
+                socket.set_nonblocking(true).expect("edge UDP nonblocking");
+                socket
+            })
+            .collect()
+    })
+}
+
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[test]
+#[ignore = "requires root, bpffs, nftables, and eBPF TC support"]
+fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
+    std::thread::spawn(|| -> anyhow::Result<()> {
+        use std::os::fd::AsRawFd;
+
+        nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET)?;
+        let client_netns = fresh_test_netns();
+        let server_netns = fresh_test_netns();
+        let mut netlink = crate::netlink::NlSock::new()?;
+        netlink.add_veth_pair("honk-lan0", "honk-c0")?;
+        netlink.add_veth_pair("honk-wan0", "honk-s0")?;
+        let (lan, _) = netlink.get_link("honk-lan0")?;
+        let (client_peer, _) = netlink.get_link("honk-c0")?;
+        let (wan, _) = netlink.get_link("honk-wan0")?;
+        let (server_peer, _) = netlink.get_link("honk-s0")?;
+        netlink.set_link_netns_fd(client_peer, &client_netns)?;
+        netlink.set_link_netns_fd(server_peer, &server_netns)?;
+        netlink.set_link_up(lan, true)?;
+        netlink.set_link_up(wan, true)?;
+        netlink.addr_op(true, lan, libc::AF_INET as u8, &[10, 70, 0, 1], 24)?;
+        netlink.addr_op(true, wan, libc::AF_INET as u8, &[198, 51, 100, 1], 24)?;
+        std::fs::write("/proc/sys/net/ipv4/ip_forward", "1")?;
+
+        let client = configure_test_edge(
+            &client_netns,
+            "honk-c0",
+            [10, 70, 0, 2],
+            [10, 70, 0, 1],
+            &[0],
+        )
+        .pop()
+        .expect("client socket");
+        let mut servers = configure_test_edge(
+            &server_netns,
+            "honk-s0",
+            [198, 51, 100, 2],
+            [198, 51, 100, 1],
+            &[41001, 41002],
+        );
+        let server_proxy = servers.pop().expect("proxy server socket");
+        let server_direct = servers.pop().expect("direct server socket");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async move {
+            let pin_root = std::path::Path::new("/sys/fs/bpf")
+                .join(format!("honk-nfq-e2e-{}", std::process::id()));
+            let mut backend = crate::ebpf::real::RealEbpfBackend::load(
+                crate::DEFAULT_BPF_OBJECT,
+                &pin_root,
+                12345,
+                TPROXY_MARK,
+                Some("honk-lan0"),
+                "honk-wan0",
+                false,
+            )
+            .await?;
+            let tcp_listener = TcpListener::bind("0.0.0.0:0").await?;
+            let udp_listener = UdpSocket::bind("0.0.0.0:0").await?;
+            let udp_fds = vec![udp_listener.as_raw_fd(); 4];
+            backend.publish_listener_sockets(
+                tcp_listener.as_raw_fd(),
+                tcp_listener.as_raw_fd(),
+                &udp_fds,
+                &udp_fds,
+            )?;
+
+            let proxy_socket =
+                Arc::new(honk_outbound::util::udp_marked_bind("0.0.0.0:0".parse()?).await?);
+            let mut registry = honk_outbound::proxy::ProxyRegistry::new();
+            let handler = Arc::new(UdpTestHandler {
+                mode: UdpTestMode::KernelSocket(proxy_socket),
+            });
+            registry.register(
+                honk_outbound::proxy::ProtocolEntry::new(
+                    honk_config::types::NodeProtocol::Socks5,
+                    handler.clone(),
+                )
+                .with_packet(handler),
+            );
+
+            let mut config = udp_test_config("direct", vec![udp_test_node()], vec![]);
+            config.ensure_builtin_nodes();
+            config.global.lan_interface = vec!["honk-lan0".into()];
+            config.global.dial_mode = "domain++".into();
+            config.global.wan_interface = vec!["honk-wan0".into()];
+            config.experimental.udp_nfqueue.enabled = true;
+            config
+                .routing
+                .rules
+                .push(honk_config::routing::RoutingRule {
+                    name: "domain-can-reroute".into(),
+                    condition: honk_config::routing::RoutingCondition {
+                        domain_suffix: vec!["never.invalid".into()],
+                        ..Default::default()
+                    },
+                    outbound: honk_config::routing::RoutingOutbound::Simple("udp-test".into()),
+                    priority: 0,
+                    must: false,
+                    mark: 0,
+                });
+            config
+                .routing
+                .rules
+                .push(honk_config::routing::RoutingRule {
+                    name: "port-proxy".into(),
+                    condition: honk_config::routing::RoutingCondition {
+                        port: vec!["41002".into()],
+                        ..Default::default()
+                    },
+                    outbound: honk_config::routing::RoutingOutbound::Simple("udp-test".into()),
+                    priority: 0,
+                    must: false,
+                    mark: 0,
+                });
+            let router = Router::new(&config.routing.rules, &config.routing.default_outbound)?;
+            let mut control = ControlPlane::new(
+                config,
+                Box::new(backend),
+                router,
+                Arc::new(registry),
+                DnsResolver::new(&honk_config::dns::DnsConfig::default())?,
+                udp_test_forwarder(),
+            )?;
+            control.udp_pool = Arc::new(UdpEndpointPool::with_reply_socket_factory(
+                1024,
+                Arc::new(KernelUdpReplySocketFactory),
+            ));
+            control.set_mode_state(Arc::new(parking_lot::RwLock::new(
+                crate::mode::ModeState::new("Rule", "Proxy"),
+            )));
+            control.start_datapath_flags_coordinator()?;
+            {
+                let plan = control.active_routing_plan.read().clone();
+                let mut ebpf = control.ebpf.write().await;
+                routing_matcher::RoutingMatcherBuilder::push_plan(ebpf.as_mut(), &plan)?;
+            }
+            let mut nfqueue = control
+                .start_nfqueue_runtime(true)
+                .await?
+                .expect("enabled NFQUEUE runtime");
+            nfqueue.check_startup_health().await?;
+            control
+                .initialize_datapath_flags(true, nfqueue.sequence_ready)
+                .await?;
+            nfqueue.pending.open_admission();
+            control.ebpf.write().await.set_datapath_ready(true)?;
+            let (removal_fatal_tx, mut removal_fatal_rx) = mpsc::unbounded_channel();
+            let mut removal_task = spawn_udp_removal_worker(
+                Arc::clone(&control.udp_pool),
+                Arc::clone(&control.ebpf),
+                Arc::clone(&control.connection_tracker),
+                removal_fatal_tx,
+            );
+
+            let client = UdpSocket::from_std(client)?;
+            let server_direct = UdpSocket::from_std(server_direct)?;
+            let server_proxy = UdpSocket::from_std(server_proxy)?;
+            let exercise = async {
+                let direct_dst = SocketAddr::from(([198, 51, 100, 2], 41001));
+                client.send_to(b"direct-first", direct_dst).await?;
+                let mut buffer = [0u8; 128];
+                let (size, source) = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    server_direct.recv_from(&mut buffer),
+                )
+                .await??;
+                anyhow::ensure!(&buffer[..size] == b"direct-first");
+                anyhow::ensure!(source.ip() == "10.70.0.2".parse::<std::net::IpAddr>()?);
+                anyhow::ensure!(
+                    tokio::time::timeout(
+                        Duration::from_millis(250),
+                        server_direct.recv_from(&mut buffer),
+                    )
+                    .await
+                    .is_err(),
+                    "direct original arrived more than once"
+                );
+                let direct_stats = control.stats.udp_snapshot().nfqueue;
+                anyhow::ensure!(direct_stats.direct_accepted == 1);
+                anyhow::ensure!(direct_stats.proxy_copied == 0);
+
+                let proxy_dst = SocketAddr::from(([198, 51, 100, 2], 41002));
+                let proxy_payload = b"\x80proxy-first";
+                client.send_to(proxy_payload, proxy_dst).await?;
+                let (size, proxy_source) = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    server_proxy.recv_from(&mut buffer),
+                )
+                .await??;
+                anyhow::ensure!(&buffer[..size] == proxy_payload);
+                anyhow::ensure!(proxy_source.ip() == "198.51.100.1".parse::<std::net::IpAddr>()?);
+                anyhow::ensure!(
+                    tokio::time::timeout(
+                        Duration::from_millis(250),
+                        server_proxy.recv_from(&mut buffer),
+                    )
+                    .await
+                    .is_err(),
+                    "proxy payload arrived more than once"
+                );
+                server_proxy.send_to(b"proxy-reply", proxy_source).await?;
+                let (size, reply_source) =
+                    tokio::time::timeout(Duration::from_secs(3), client.recv_from(&mut buffer))
+                        .await??;
+                anyhow::ensure!(&buffer[..size] == b"proxy-reply");
+                anyhow::ensure!(reply_source == proxy_dst);
+                anyhow::ensure!(
+                    tokio::time::timeout(
+                        Duration::from_millis(250),
+                        client.recv_from(&mut buffer),
+                    )
+                    .await
+                    .is_err(),
+                    "proxy reply arrived more than once"
+                );
+                let proxy_stats = control.stats.udp_snapshot().nfqueue;
+                anyhow::ensure!(proxy_stats.proxy_copied == 1);
+                anyhow::ensure!(proxy_stats.proxy_dropped == 1);
+                anyhow::ensure!(removal_fatal_rx.try_recv().is_err());
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+
+            if let Some(flags) = control.datapath_flags.as_ref() {
+                let _ = flags.fence_nfqueue().await;
+            }
+            let _ = control.ebpf.write().await.set_datapath_ready(false);
+            nfqueue.begin_pending_drain().await;
+            let service_shutdown = nfqueue.shutdown_service().await;
+            let pending_shutdown = nfqueue.finish_pending_drain().await;
+            control.pending_udp_verdicts = None;
+            let drain = Arc::clone(&control.drain_tracker);
+            let datapath_shutdown = control
+                .shutdown_datapath(&drain, &mut removal_task, None)
+                .await;
+            if let Some(flags) = control.datapath_flags.as_ref() {
+                let _ = flags.disable().await;
+            }
+            let backend_shutdown = control.finalize_shutdown().await;
+            let _ = std::fs::remove_file(pin_root.join(crate::ebpf::UDP_DECISION_SEQUENCE_MAP));
+            let _ = std::fs::remove_dir(&pin_root);
+
+            exercise?;
+            service_shutdown?;
+            pending_shutdown?;
+            datapath_shutdown?;
+            backend_shutdown?;
+            Ok(())
+        })
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("NFQUEUE network test thread panicked"))?
 }

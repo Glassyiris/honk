@@ -436,11 +436,22 @@ impl PendingUdpVerdicts {
         }
     }
 
-    pub(super) fn ingest(
+    pub(super) async fn ingest_wait(
         &self,
         packet: QueuedPacket,
         guard: VerdictGuard,
         slow_permit: Option<OwnedSemaphorePermit>,
+    ) -> NfqueueIngest {
+        let backend = self.ebpf.read().await;
+        self.ingest_with_backend(packet, guard, slow_permit, backend.as_ref())
+    }
+
+    fn ingest_with_backend(
+        &self,
+        packet: QueuedPacket,
+        guard: VerdictGuard,
+        slow_permit: Option<OwnedSemaphorePermit>,
+        backend: &dyn EbpfBackend,
     ) -> NfqueueIngest {
         self.stats.record_udp_nfqueue_received();
         let received_at = packet.received_at;
@@ -471,7 +482,6 @@ impl PendingUdpVerdicts {
             match entry {
                 dashmap::mapref::entry::Entry::Occupied(occupied) => {
                     let cell = Arc::clone(occupied.get());
-                    // A newer kernel incarnation may reuse the tuple before terminal grace expires.
                     let stale = terminal_cell_is_stale(&cell, decision_token, Instant::now());
                     if stale {
                         occupied.remove();
@@ -496,6 +506,7 @@ impl PendingUdpVerdicts {
                         packet.payload,
                         held,
                         slow_permit,
+                        backend,
                     );
                 }
             }
@@ -661,37 +672,25 @@ impl PendingUdpVerdicts {
         payload: bytes::Bytes,
         held: HeldVerdict,
         slow_permit: Option<OwnedSemaphorePermit>,
+        backend: &dyn EbpfBackend,
     ) -> NfqueueIngest {
-        let retained = {
-            let Ok(backend) = self.ebpf.try_read() else {
+        let retained = match backend.udp_conn_state_lookup(&key.tuples()) {
+            Ok(Some(state)) if state.decision_token == decision_token => retained_state(&state),
+            Ok(Some(_)) | Ok(None) => {
+                drop(vacant);
+                self.stats.record_udp_nfqueue_token_mismatch();
+                self.drop_one(held, DropOutcome::Other);
+                return NfqueueIngest::Dropped;
+            }
+            Err(error) => {
                 drop(vacant);
                 self.schedule_cleanup(CleanupRequest::Token {
                     key,
                     decision_token,
                 });
+                self.signal_fatal(PendingUdpFatal::new("state inspection", error.to_string()));
                 self.drop_one(held, DropOutcome::Other);
                 return NfqueueIngest::Dropped;
-            };
-            match backend.udp_conn_state_lookup(&key.tuples()) {
-                Ok(Some(state)) if state.decision_token == decision_token => retained_state(&state),
-                Ok(Some(_)) | Ok(None) => {
-                    drop(backend);
-                    drop(vacant);
-                    self.stats.record_udp_nfqueue_token_mismatch();
-                    self.drop_one(held, DropOutcome::Other);
-                    return NfqueueIngest::Dropped;
-                }
-                Err(error) => {
-                    drop(backend);
-                    drop(vacant);
-                    self.schedule_cleanup(CleanupRequest::Token {
-                        key,
-                        decision_token,
-                    });
-                    self.signal_fatal(PendingUdpFatal::new("state inspection", error.to_string()));
-                    self.drop_one(held, DropOutcome::Other);
-                    return NfqueueIngest::Dropped;
-                }
             }
         };
 

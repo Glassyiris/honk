@@ -34,6 +34,29 @@ pub const NFQUEUE_PENDING_MARK: u32 = 0x8000_0000;
 pub const NFQUEUE_SIGNATURE_MARK: u32 = CLASSIFIED_MARK | NFQUEUE_PENDING_MARK;
 /// Persistent decision tokens occupy the remaining skb-mark bits.
 pub const NFQUEUE_TOKEN_MASK: u32 = !NFQUEUE_SIGNATURE_MARK;
+/// Low-order monotonic sequence bits within one UDP decision generation.
+pub const UDP_DECISION_SEQUENCE_MASK: u32 = 0x0fff_ffff;
+/// Number of low-order sequence bits in a persistent UDP decision token.
+pub const UDP_DECISION_GENERATION_SHIFT: u32 = 28;
+/// Generation tag carried in the remaining token bits.
+pub const UDP_DECISION_GENERATION_MASK: u32 = 0x3;
+
+#[inline(always)]
+pub const fn udp_decision_token(generation: u32, sequence: u32) -> Option<u32> {
+    if generation > UDP_DECISION_GENERATION_MASK
+        || sequence == 0
+        || sequence > UDP_DECISION_SEQUENCE_MASK
+    {
+        None
+    } else {
+        Some((generation << UDP_DECISION_GENERATION_SHIFT) | sequence)
+    }
+}
+
+#[inline(always)]
+pub const fn udp_decision_token_generation(token: u32) -> u32 {
+    (token >> UDP_DECISION_GENERATION_SHIFT) & UDP_DECISION_GENERATION_MASK
+}
 /// Routing marks may not consume datapath-owned classification bits.
 pub const SKB_MARK_RESERVED_MASK: u32 = NFQUEUE_SIGNATURE_MARK;
 
@@ -562,6 +585,17 @@ mod nfqueue_abi_tests {
             assert_eq!(mark & NFQUEUE_SIGNATURE_MARK, NFQUEUE_SIGNATURE_MARK);
             assert_eq!(extract_nfqueue_token(mark), Some(token));
         }
+    }
+
+    #[test]
+    fn decision_generations_share_mark_space_without_aliasing() {
+        for generation in 0..=UDP_DECISION_GENERATION_MASK {
+            let token = udp_decision_token(generation, 1).unwrap();
+            assert_eq!(udp_decision_token_generation(token), generation);
+            assert!(pack_nfqueue_mark(token).is_some());
+        }
+        assert_eq!(udp_decision_token(0, 0), None);
+        assert_eq!(udp_decision_token(0, UDP_DECISION_SEQUENCE_MASK + 1), None);
     }
 
     #[test]

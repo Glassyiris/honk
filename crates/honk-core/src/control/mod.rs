@@ -71,12 +71,18 @@ enum NfqueueRuntimeFatal {
     Pending(#[source] nfqueue::PendingUdpFatal),
     #[error("NFQUEUE pending fatal channel closed")]
     PendingChannelClosed,
-    #[error("UDP decision token allocator exhausted (locked backstop)")]
-    TokenExhaustionBackstop,
     #[error("UDP decision token backstop failed: {0}")]
     TokenBackstop(String),
     #[error("NFQUEUE watchdog exited unexpectedly: {0}")]
     Watchdog(String),
+    #[error("NFQUEUE ingest actor exited unexpectedly: {0}")]
+    IngestActor(String),
+}
+
+#[cfg_attr(not(feature = "ebpf"), allow(dead_code))]
+enum NfqueueRuntimeEvent {
+    Fatal(anyhow::Error),
+    TokenExhausted,
 }
 
 #[cfg(feature = "ebpf")]
@@ -88,15 +94,17 @@ struct NfqueueRuntime {
     pending: Arc<nfqueue::PendingUdpVerdicts>,
     stop: tokio::sync::watch::Sender<bool>,
     watchdog: Option<tokio::task::JoinHandle<()>>,
+    ingest_worker: Option<tokio::task::JoinHandle<()>>,
     token_backstop: tokio::time::Interval,
+    sequence_ready: bool,
 }
 
 #[cfg(feature = "ebpf")]
 impl NfqueueRuntime {
-    async fn next_fatal(
+    async fn next_event(
         &mut self,
         ebpf: &Arc<RwLock<Box<dyn EbpfBackend>>>,
-    ) -> NfqueueRuntimeFatal {
+    ) -> NfqueueRuntimeEvent {
         loop {
             let listener_fatal = &mut self.listener_fatal;
             let pending_fatal = &mut self.pending_fatal;
@@ -105,43 +113,61 @@ impl NfqueueRuntime {
                 .watchdog
                 .as_mut()
                 .expect("NFQUEUE watchdog is retained until shutdown");
+            let ingest_worker = self
+                .ingest_worker
+                .as_mut()
+                .expect("NFQUEUE ingest actor is retained until shutdown");
             tokio::select! {
                 result = listener_fatal => {
-                    return match result {
+                    return NfqueueRuntimeEvent::Fatal(anyhow::Error::new(match result {
                         Ok(error) => NfqueueRuntimeFatal::Listener(error),
                         Err(_) => NfqueueRuntimeFatal::ListenerChannelClosed,
-                    };
+                    }));
                 }
                 fatal = pending_fatal.recv() => {
-                    return fatal
-                        .map(NfqueueRuntimeFatal::Pending)
-                        .unwrap_or(NfqueueRuntimeFatal::PendingChannelClosed);
+                    return NfqueueRuntimeEvent::Fatal(anyhow::Error::new(
+                        fatal
+                            .map(NfqueueRuntimeFatal::Pending)
+                            .unwrap_or(NfqueueRuntimeFatal::PendingChannelClosed),
+                    ));
                 }
                 result = watchdog => {
-                    return NfqueueRuntimeFatal::Watchdog(match result {
-                        Ok(()) => "completed".to_string(),
-                        Err(error) => error.to_string(),
-                    });
+                    return NfqueueRuntimeEvent::Fatal(anyhow::Error::new(
+                        NfqueueRuntimeFatal::Watchdog(match result {
+                            Ok(()) => "completed".to_string(),
+                            Err(error) => error.to_string(),
+                        }),
+                    ));
+                }
+                result = ingest_worker => {
+                    return NfqueueRuntimeEvent::Fatal(anyhow::Error::new(
+                        NfqueueRuntimeFatal::IngestActor(match result {
+                            Ok(()) => "completed".to_string(),
+                            Err(error) => error.to_string(),
+                        }),
+                    ));
                 }
                 _ = token_backstop.tick() => {
-                    match ebpf.read().await.udp_decision_sequence_exhausted() {
-                        Ok(true) => {
+                    if let Some(service) = self.service.as_ref() {
+                        self.stats.update_udp_nfqueue_service_stats(service.stats());
+                    }
+                    match ebpf.read().await.udp_decision_sequence_status() {
+                        Ok(status) if status.exhausted() => {
                             self.stats.record_udp_nfqueue_token_exhaustion();
-                            return NfqueueRuntimeFatal::TokenExhaustionBackstop;
+                            return NfqueueRuntimeEvent::TokenExhausted;
                         }
-                        Ok(false) => {}
+                        Ok(_) => {}
                         Err(error) => {
-                            return NfqueueRuntimeFatal::TokenBackstop(error.to_string());
+                            return NfqueueRuntimeEvent::Fatal(anyhow::Error::new(
+                                NfqueueRuntimeFatal::TokenBackstop(error.to_string()),
+                            ));
                         }
                     }
                 }
             }
         }
     }
-    async fn check_startup_health(
-        &mut self,
-        ebpf: &Arc<RwLock<Box<dyn EbpfBackend>>>,
-    ) -> Result<(), NfqueueRuntimeFatal> {
+    async fn check_startup_health(&mut self) -> Result<(), NfqueueRuntimeFatal> {
         match self.listener_fatal.try_recv() {
             Ok(error) => return Err(NfqueueRuntimeFatal::Listener(error)),
             Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
@@ -163,14 +189,14 @@ impl NfqueueRuntime {
         {
             return Err(NfqueueRuntimeFatal::Watchdog("completed".to_string()));
         }
-        match ebpf.read().await.udp_decision_sequence_exhausted() {
-            Ok(false) => Ok(()),
-            Ok(true) => {
-                self.stats.record_udp_nfqueue_token_exhaustion();
-                Err(NfqueueRuntimeFatal::TokenExhaustionBackstop)
-            }
-            Err(error) => Err(NfqueueRuntimeFatal::TokenBackstop(error.to_string())),
+        if self
+            .ingest_worker
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+        {
+            return Err(NfqueueRuntimeFatal::IngestActor("completed".to_string()));
         }
+        Ok(())
     }
     async fn begin_pending_drain(&self) {
         self.pending.cancel_all().await;
@@ -178,6 +204,11 @@ impl NfqueueRuntime {
     }
 
     async fn finish_pending_drain(&mut self) -> anyhow::Result<()> {
+        if let Some(worker) = self.ingest_worker.take() {
+            worker
+                .await
+                .map_err(|error| anyhow::anyhow!("join NFQUEUE ingest actor: {error}"))?;
+        }
         self.pending.cancel_all().await;
         self.pending.wait_empty().await;
         let _ = self.stop.send(true);
@@ -209,22 +240,22 @@ impl NfqueueRuntime {
     }
 }
 #[cfg(feature = "ebpf")]
-async fn wait_nfqueue_fatal(
+async fn wait_nfqueue_event(
     runtime: &mut Option<NfqueueRuntime>,
     ebpf: &Arc<RwLock<Box<dyn EbpfBackend>>>,
-) -> anyhow::Error {
+) -> NfqueueRuntimeEvent {
     let Some(runtime) = runtime.as_mut() else {
-        return std::future::pending::<anyhow::Error>().await;
+        return std::future::pending::<NfqueueRuntimeEvent>().await;
     };
-    anyhow::Error::new(runtime.next_fatal(ebpf).await)
+    runtime.next_event(ebpf).await
 }
 
 #[cfg(not(feature = "ebpf"))]
-async fn wait_nfqueue_fatal(
+async fn wait_nfqueue_event(
     _runtime: &mut (),
     _ebpf: &Arc<RwLock<Box<dyn EbpfBackend>>>,
-) -> anyhow::Error {
-    std::future::pending::<anyhow::Error>().await
+) -> NfqueueRuntimeEvent {
+    std::future::pending::<NfqueueRuntimeEvent>().await
 }
 
 /// Bound for shutdown stages that have no natural deadline (watcher join,
@@ -1003,6 +1034,60 @@ impl ControlPlane {
             .load(std::sync::atomic::Ordering::Acquire)
     }
     #[cfg(feature = "ebpf")]
+    async fn rotate_udp_decision_generation(&self) -> anyhow::Result<bool> {
+        let mut backend = self.ebpf.write().await;
+        backend
+            .verify_udp_decision_sequence()
+            .map_err(|error| anyhow::anyhow!("verify UDP decision sequence: {error}"))?;
+        let status = backend.udp_decision_sequence_status()?;
+        if !status.exhausted() {
+            return Ok(true);
+        }
+        backend.quiesce_udp_staging()?;
+        for offset in 1..=UDP_DECISION_GENERATION_MASK + 1 {
+            let generation = (status.generation + offset) & UDP_DECISION_GENERATION_MASK;
+            if backend.reset_udp_decision_sequence(generation)? {
+                self.stats.record_udp_nfqueue_token_rollover();
+                info!(
+                    generation,
+                    "rotated exhausted UDP decision token generation"
+                );
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    #[cfg(feature = "ebpf")]
+    async fn recover_nfqueue_token_exhaustion(
+        &self,
+        runtime: &mut NfqueueRuntime,
+    ) -> anyhow::Result<()> {
+        if runtime.sequence_ready {
+            let flags = self
+                .datapath_flags
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("datapath flags writer is not initialized"))?;
+            flags.fence_nfqueue().await?;
+            runtime.sequence_ready = false;
+            runtime.pending.cancel_all().await;
+            runtime.pending.wait_empty().await;
+        }
+        if !self.rotate_udp_decision_generation().await? {
+            warn!("all UDP decision token generations remain live; NFQUEUE staging stays fenced");
+            return Ok(());
+        }
+        runtime.pending.open_admission();
+        self.datapath_flags
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("datapath flags writer is not initialized"))?
+            .reopen_nfqueue()
+            .await?;
+        runtime.sequence_ready = true;
+        Ok(())
+    }
+
+    #[cfg(feature = "ebpf")]
     async fn start_nfqueue_runtime(
         &mut self,
         enabled: bool,
@@ -1011,15 +1096,10 @@ impl ControlPlane {
             return Ok(None);
         }
 
-        {
-            let backend = self.ebpf.read().await;
-            backend
-                .verify_udp_decision_sequence()
-                .map_err(|error| anyhow::anyhow!("verify UDP decision sequence: {error}"))?;
-            if backend.udp_decision_sequence_exhausted()? {
-                self.stats.record_udp_nfqueue_token_exhaustion();
-                anyhow::bail!("UDP decision token allocator is exhausted; reboot is required");
-            }
+        let sequence_ready = self.rotate_udp_decision_generation().await?;
+        if !sequence_ready {
+            self.stats.record_udp_nfqueue_token_exhaustion();
+            warn!("all UDP decision token generations are live; starting with NFQUEUE fenced");
         }
 
         let (pending, pending_fatal) = nfqueue::PendingUdpVerdicts::new(
@@ -1030,38 +1110,22 @@ impl ControlPlane {
         let pending = Arc::new(pending);
         self.pending_udp_verdicts = Some(Arc::clone(&pending));
 
-        let runtime = tokio::runtime::Handle::current();
-        let callback_pending = Arc::clone(&pending);
-        let initializer = self.spawn_handle();
+        type IngestRequest = (
+            honk_nfqueue::QueuedPacket,
+            honk_nfqueue::VerdictGuard,
+            Option<tokio::sync::OwnedSemaphorePermit>,
+        );
+        let (ingest_tx, mut ingest_rx) =
+            mpsc::channel::<IngestRequest>(honk_nfqueue::QUEUE_MAXLEN as usize);
         let slow_limit = Arc::clone(&self.udp_concurrency_limit);
-        let drain = Arc::clone(&self.drain_tracker);
+        let callback_stats = Arc::clone(&self.stats);
         let callback: honk_nfqueue::PacketCallback = Arc::new(move |packet, guard| {
             let permit = Arc::clone(&slow_limit).try_acquire_owned().ok();
-            let nfqueue::NfqueueIngest::Initialize { lease, identity } =
-                callback_pending.ingest(packet, guard, permit)
-            else {
-                return;
-            };
-            let initializer = initializer.clone();
-            let pending = Arc::clone(&callback_pending);
-            let drain = Arc::clone(&drain);
-            drop(runtime.spawn(async move {
-                let _guard = ConnectionGuard::new(drain);
-                match std::panic::AssertUnwindSafe(initializer.serve_udp_connection(lease))
-                    .catch_unwind()
-                    .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
-                        warn!(%error, "NFQUEUE UDP initializer failed");
-                        let _ = pending.cancel(identity).await;
-                    }
-                    Err(_) => {
-                        error!("NFQUEUE UDP initializer panicked");
-                        let _ = pending.cancel(identity).await;
-                    }
-                }
-            }));
+            if let Err(error) = ingest_tx.try_send((packet, guard, permit)) {
+                let (packet, guard, permit) = error.into_inner();
+                callback_stats.record_udp_nfqueue_actor_queue_full(packet.received_at.elapsed());
+                drop((packet, guard, permit));
+            }
         });
         let (service, listener_fatal) = match honk_nfqueue::NfqueueService::start(callback) {
             Ok(runtime) => runtime,
@@ -1070,6 +1134,38 @@ impl ControlPlane {
                 return Err(anyhow::anyhow!("start UDP NFQUEUE service: {error}"));
             }
         };
+        let actor_pending = Arc::clone(&pending);
+        let initializer = self.spawn_handle();
+        let drain = Arc::clone(&self.drain_tracker);
+        let ingest_worker = tokio::spawn(async move {
+            while let Some((packet, guard, permit)) = ingest_rx.recv().await {
+                let nfqueue::NfqueueIngest::Initialize { lease, identity } =
+                    actor_pending.ingest_wait(packet, guard, permit).await
+                else {
+                    continue;
+                };
+                let initializer = initializer.clone();
+                let pending = Arc::clone(&actor_pending);
+                let drain = Arc::clone(&drain);
+                tokio::spawn(async move {
+                    let _guard = ConnectionGuard::new(drain);
+                    match std::panic::AssertUnwindSafe(initializer.serve_udp_connection(lease))
+                        .catch_unwind()
+                        .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            warn!(%error, "NFQUEUE UDP initializer failed");
+                            let _ = pending.cancel(identity).await;
+                        }
+                        Err(_) => {
+                            error!("NFQUEUE UDP initializer panicked");
+                            let _ = pending.cancel(identity).await;
+                        }
+                    }
+                });
+            }
+        });
         let (stop, stop_receiver) = tokio::sync::watch::channel(false);
         let watchdog = tokio::spawn(Arc::clone(&pending).run_watchdog(stop_receiver));
         let mut token_backstop = tokio::time::interval_at(
@@ -1085,7 +1181,9 @@ impl ControlPlane {
             pending,
             stop,
             watchdog: Some(watchdog),
+            ingest_worker: Some(ingest_worker),
             token_backstop,
+            sequence_ready,
         }))
     }
     #[cfg(feature = "ebpf")]
@@ -1577,7 +1675,7 @@ impl ControlPlane {
 
         #[cfg(feature = "ebpf")]
         let nfqueue_startup_health = match nfqueue_runtime.as_mut() {
-            Some(runtime) => runtime.check_startup_health(&self.ebpf).await,
+            Some(runtime) => runtime.check_startup_health().await,
             None => Ok(()),
         };
         #[cfg(feature = "ebpf")]
@@ -1588,8 +1686,14 @@ impl ControlPlane {
                 .await;
             return Err(anyhow::anyhow!("NFQUEUE failed before readiness: {error}"));
         }
+        #[cfg(feature = "ebpf")]
+        let nfqueue_ready = nfqueue_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.sequence_ready);
+        #[cfg(not(feature = "ebpf"))]
+        let nfqueue_ready = false;
         if let Err(error) = self
-            .initialize_datapath_flags(udp_nfqueue_enabled, udp_nfqueue_enabled)
+            .initialize_datapath_flags(udp_nfqueue_enabled, nfqueue_ready)
             .await
         {
             #[cfg(feature = "ebpf")]
@@ -1600,7 +1704,9 @@ impl ControlPlane {
             return Err(anyhow::anyhow!("initialize datapath flags: {error:#}"));
         }
         #[cfg(feature = "ebpf")]
-        if let Some(runtime) = nfqueue_runtime.as_ref() {
+        if let Some(runtime) = nfqueue_runtime.as_ref()
+            && runtime.sequence_ready
+        {
             runtime.pending.open_admission();
         }
         let datapath_open = {
@@ -1643,9 +1749,26 @@ impl ControlPlane {
                     }));
                     break;
                 }
-                error = wait_nfqueue_fatal(&mut nfqueue_runtime, &fatal_ebpf) => {
-                    fatal_error = Some(error);
-                    break;
+                event = wait_nfqueue_event(&mut nfqueue_runtime, &fatal_ebpf) => {
+                    match event {
+                        NfqueueRuntimeEvent::Fatal(error) => {
+                            fatal_error = Some(error);
+                            break;
+                        }
+                        NfqueueRuntimeEvent::TokenExhausted => {
+                            #[cfg(feature = "ebpf")]
+                            if let Some(runtime) = nfqueue_runtime.as_mut()
+                                && let Err(error) = self
+                                    .recover_nfqueue_token_exhaustion(runtime)
+                                    .await
+                            {
+                                fatal_error = Some(anyhow::anyhow!(
+                                    "recover exhausted UDP decision token generation: {error:#}"
+                                ));
+                                break;
+                            }
+                        }
+                    }
                 }
                 _ = heartbeat.tick() => {
                     trace!(
@@ -1807,7 +1930,7 @@ impl ControlPlane {
         #[cfg(feature = "ebpf")]
         if let Some(runtime) = nfqueue_runtime.as_mut() {
             runtime.begin_pending_drain().await;
-            if let Err(error) = runtime.check_startup_health(&fatal_ebpf).await {
+            if let Err(error) = runtime.check_startup_health().await {
                 fatal_error.get_or_insert_with(|| anyhow::Error::new(error));
             }
         }

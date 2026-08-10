@@ -8,7 +8,7 @@ use super::*;
 
 use aya::Pod;
 use aya_obj::generated::bpf_cmd::*;
-use aya_obj::generated::{BPF_F_LOCK, bpf_attr, bpf_map_info, bpf_map_type};
+use aya_obj::generated::{BPF_ANY, BPF_F_LOCK, bpf_attr, bpf_map_info, bpf_map_type};
 use std::ffi::c_long;
 use std::mem::MaybeUninit;
 use std::path::Path;
@@ -112,6 +112,24 @@ fn locked_udp_decision_sequence(fd: RawFd) -> anyhow::Result<UdpDecisionSequence
     Ok(value)
 }
 
+fn update_locked_udp_decision_sequence(
+    fd: RawFd,
+    value: &UdpDecisionSequence,
+) -> anyhow::Result<()> {
+    let key = 0u32;
+    let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
+    attr.__bindgen_anon_2.map_fd = fd as u32;
+    attr.__bindgen_anon_2.key = (&key as *const u32) as u64;
+    attr.__bindgen_anon_2.__bindgen_anon_1.value = (value as *const UdpDecisionSequence) as u64;
+    attr.__bindgen_anon_2.flags = (BPF_ANY | BPF_F_LOCK) as u64;
+    unsafe { bpf_syscall(BPF_MAP_UPDATE_ELEM as c_long, &mut attr) }.map_err(|error| {
+        anyhow::anyhow!(
+            "locked UDP_DECISION_SEQUENCE update failed (spin-lock BTF incompatible), errno={error}"
+        )
+    })?;
+    Ok(())
+}
+
 fn validate_udp_decision_sequence_info(info: &bpf_map_info) -> anyhow::Result<()> {
     anyhow::ensure!(
         info.type_ == bpf_map_type::BPF_MAP_TYPE_ARRAY as u32,
@@ -150,13 +168,13 @@ fn validate_udp_decision_sequence_fd(fd: RawFd) -> anyhow::Result<UdpDecisionSeq
     validate_udp_decision_sequence_info(&info)?;
     let sequence = locked_udp_decision_sequence(fd)?;
     anyhow::ensure!(
-        sequence.next <= NFQUEUE_TOKEN_MASK,
-        "UDP_DECISION_SEQUENCE next token exceeds reserved token space"
+        sequence.next <= honk_ebpf_common::UDP_DECISION_SEQUENCE_MASK,
+        "UDP_DECISION_SEQUENCE next token exceeds its generation sequence space"
     );
     anyhow::ensure!(
-        sequence.exhausted <= 1,
-        "UDP_DECISION_SEQUENCE has invalid exhausted value {}",
-        sequence.exhausted
+        sequence.generation <= honk_ebpf_common::UDP_DECISION_GENERATION_MASK,
+        "UDP_DECISION_SEQUENCE has invalid generation {}",
+        sequence.generation
     );
     Ok(sequence)
 }
@@ -173,6 +191,17 @@ pub fn validate_loaded_udp_decision_sequence(bpf: &Ebpf) -> anyhow::Result<UdpDe
 
 pub fn read_udp_decision_sequence_locked(bpf: &Ebpf) -> anyhow::Result<UdpDecisionSequence> {
     locked_udp_decision_sequence(map_fd(bpf, super::super::UDP_DECISION_SEQUENCE_MAP)?)
+}
+
+pub fn reset_udp_decision_sequence_locked(bpf: &Ebpf, generation: u32) -> anyhow::Result<()> {
+    let value = UdpDecisionSequence {
+        generation,
+        ..Default::default()
+    };
+    update_locked_udp_decision_sequence(
+        map_fd(bpf, super::super::UDP_DECISION_SEQUENCE_MAP)?,
+        &value,
+    )
 }
 
 pub fn bpf_lookup_and_delete<K: Pod, V: Pod>(

@@ -119,7 +119,7 @@ const _UDP_DECISION_STATE_VALUES: () = assert!(
 pub struct UdpDecisionSequence {
     pub lock: aya_ebpf_bindings::bindings::bpf_spin_lock,
     pub next: u32,
-    pub exhausted: u32,
+    pub generation: u32,
 }
 
 impl Default for UdpDecisionSequence {
@@ -127,7 +127,7 @@ impl Default for UdpDecisionSequence {
         Self {
             lock: aya_ebpf_bindings::bindings::bpf_spin_lock { val: 0 },
             next: 0,
-            exhausted: 0,
+            generation: 0,
         }
     }
 }
@@ -138,8 +138,8 @@ const _UDP_DECISION_SEQUENCE_LOCK_OFFSET: () =
     assert!(core::mem::offset_of!(UdpDecisionSequence, lock) == 0);
 const _UDP_DECISION_SEQUENCE_NEXT_OFFSET: () =
     assert!(core::mem::offset_of!(UdpDecisionSequence, next) == 4);
-const _UDP_DECISION_SEQUENCE_EXHAUSTED_OFFSET: () =
-    assert!(core::mem::offset_of!(UdpDecisionSequence, exhausted) == 8);
+const _UDP_DECISION_SEQUENCE_GENERATION_OFFSET: () =
+    assert!(core::mem::offset_of!(UdpDecisionSequence, generation) == 8);
 
 #[inline(always)]
 pub fn tcp_conn_state_expired(state: &ConnState, elapsed_ns: u64) -> bool {

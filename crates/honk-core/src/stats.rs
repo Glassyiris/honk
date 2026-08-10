@@ -146,6 +146,13 @@ impl UdpLatencyHistogramSnapshot {
 struct UdpNfqueueStats {
     received: AtomicU64,
     active_flows: AtomicU64,
+    kernel_queue_depth: AtomicU64,
+    kernel_dropped: AtomicU64,
+    kernel_user_dropped: AtomicU64,
+    held_packets: AtomicU64,
+    held_peak: AtomicU64,
+    socket_receive_buffer_bytes: AtomicU64,
+    actor_queue_full: AtomicU64,
     direct_accepted: AtomicU64,
     proxy_copied: AtomicU64,
     proxy_dropped: AtomicU64,
@@ -154,6 +161,7 @@ struct UdpNfqueueStats {
     drop: AtomicU64,
     token_mismatch: AtomicU64,
     token_exhaustion: AtomicU64,
+    token_rollovers: AtomicU64,
     verdict_errors: AtomicU64,
     receipt_to_verdict_latency: Log2Histogram,
 }
@@ -168,6 +176,13 @@ impl UdpNfqueueStats {
         UdpNfqueueStatsSnapshot {
             received: self.received.load(Ordering::Relaxed),
             active_flows: self.active_flows.load(Ordering::Relaxed),
+            kernel_queue_depth: self.kernel_queue_depth.load(Ordering::Relaxed),
+            kernel_dropped: self.kernel_dropped.load(Ordering::Relaxed),
+            kernel_user_dropped: self.kernel_user_dropped.load(Ordering::Relaxed),
+            held_packets: self.held_packets.load(Ordering::Relaxed),
+            held_peak: self.held_peak.load(Ordering::Relaxed),
+            socket_receive_buffer_bytes: self.socket_receive_buffer_bytes.load(Ordering::Relaxed),
+            actor_queue_full: self.actor_queue_full.load(Ordering::Relaxed),
             direct_accepted: self.direct_accepted.load(Ordering::Relaxed),
             proxy_copied: self.proxy_copied.load(Ordering::Relaxed),
             proxy_dropped: self.proxy_dropped.load(Ordering::Relaxed),
@@ -176,6 +191,7 @@ impl UdpNfqueueStats {
             drop: self.drop.load(Ordering::Relaxed),
             token_mismatch: self.token_mismatch.load(Ordering::Relaxed),
             token_exhaustion: self.token_exhaustion.load(Ordering::Relaxed),
+            token_rollovers: self.token_rollovers.load(Ordering::Relaxed),
             verdict_errors: self.verdict_errors.load(Ordering::Relaxed),
             receipt_to_verdict_latency: self.receipt_to_verdict_latency.snapshot(),
         }
@@ -187,6 +203,13 @@ impl UdpNfqueueStats {
 pub struct UdpNfqueueStatsSnapshot {
     pub received: u64,
     pub active_flows: u64,
+    pub kernel_queue_depth: u64,
+    pub kernel_dropped: u64,
+    pub kernel_user_dropped: u64,
+    pub held_packets: u64,
+    pub held_peak: u64,
+    pub socket_receive_buffer_bytes: u64,
+    pub actor_queue_full: u64,
     pub direct_accepted: u64,
     pub proxy_copied: u64,
     pub proxy_dropped: u64,
@@ -195,6 +218,7 @@ pub struct UdpNfqueueStatsSnapshot {
     pub drop: u64,
     pub token_mismatch: u64,
     pub token_exhaustion: u64,
+    pub token_rollovers: u64,
     pub verdict_errors: u64,
     pub receipt_to_verdict_latency: UdpLatencyHistogramSnapshot,
 }
@@ -599,6 +623,45 @@ impl StatsManager {
     pub fn record_udp_slow_permit_closed(&self) {
         self.udp.slow_permit_closed.fetch_add(1, Ordering::Relaxed);
     }
+    #[cfg(feature = "ebpf")]
+    pub fn update_udp_nfqueue_service_stats(&self, stats: honk_nfqueue::QueueStats) {
+        self.udp
+            .nfqueue
+            .kernel_queue_depth
+            .store(stats.kernel_queue_depth, Ordering::Relaxed);
+        self.udp
+            .nfqueue
+            .kernel_dropped
+            .store(stats.kernel_dropped, Ordering::Relaxed);
+        self.udp
+            .nfqueue
+            .kernel_user_dropped
+            .store(stats.kernel_user_dropped, Ordering::Relaxed);
+        self.udp
+            .nfqueue
+            .held_packets
+            .store(stats.held_packets as u64, Ordering::Relaxed);
+        self.udp
+            .nfqueue
+            .held_peak
+            .store(stats.held_peak as u64, Ordering::Relaxed);
+        self.udp
+            .nfqueue
+            .socket_receive_buffer_bytes
+            .store(stats.socket_receive_buffer_bytes as u64, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "ebpf")]
+    pub fn record_udp_nfqueue_actor_queue_full(&self, elapsed: std::time::Duration) {
+        self.udp.nfqueue.received.fetch_add(1, Ordering::Relaxed);
+        self.udp
+            .nfqueue
+            .actor_queue_full
+            .fetch_add(1, Ordering::Relaxed);
+        self.udp
+            .nfqueue
+            .record_verdict(&self.udp.nfqueue.drop, elapsed);
+    }
 
     /// Record one packet delivered by the NFQUEUE listener.
     pub fn record_udp_nfqueue_received(&self) {
@@ -656,6 +719,13 @@ impl StatsManager {
         self.udp
             .nfqueue
             .record_verdict(&self.udp.nfqueue.cancel, elapsed);
+    }
+
+    pub fn record_udp_nfqueue_token_rollover(&self) {
+        self.udp
+            .nfqueue
+            .token_rollovers
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record another successful fail-closed drop verdict.
@@ -827,6 +897,7 @@ mod tests {
         manager.record_udp_nfqueue_drop(std::time::Duration::from_nanos(16));
         manager.record_udp_nfqueue_token_mismatch();
         manager.record_udp_nfqueue_token_exhaustion();
+        manager.record_udp_nfqueue_token_rollover();
         manager.record_udp_nfqueue_verdict_error();
 
         let nfqueue = manager.udp_snapshot().nfqueue;
@@ -840,6 +911,14 @@ mod tests {
         assert_eq!(nfqueue.drop, 1);
         assert_eq!(nfqueue.token_mismatch, 1);
         assert_eq!(nfqueue.token_exhaustion, 1);
+        assert_eq!(nfqueue.token_rollovers, 1);
+        assert_eq!(nfqueue.kernel_queue_depth, 0);
+        assert_eq!(nfqueue.kernel_dropped, 0);
+        assert_eq!(nfqueue.kernel_user_dropped, 0);
+        assert_eq!(nfqueue.held_packets, 0);
+        assert_eq!(nfqueue.held_peak, 0);
+        assert_eq!(nfqueue.socket_receive_buffer_bytes, 0);
+        assert_eq!(nfqueue.actor_queue_full, 0);
         assert_eq!(nfqueue.verdict_errors, 1);
         assert_eq!(nfqueue.receipt_to_verdict_latency.count, 5);
         assert_eq!(nfqueue.receipt_to_verdict_latency.sum_nanos, 31);
