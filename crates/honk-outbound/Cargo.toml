@@ -39,6 +39,7 @@ md-5.workspace = true
 socket2.workspace = true
 libc.workspace = true
 parking_lot.workspace = true
+lru.workspace = true
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
 # QUIC transport (TUIC / Hysteria2 / Juicity outbounds)

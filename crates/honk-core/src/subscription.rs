@@ -438,7 +438,11 @@ fn parse_clash_subscription(
         } else {
             get_str("password")
         };
-        node.encryption = get_str("cipher");
+        node.encryption = if protocol == NodeProtocol::VLess {
+            get_str("encryption").or_else(|| get_str("cipher"))
+        } else {
+            get_str("cipher")
+        };
         node.plugin = get_str("plugin");
         node.plugin_opts = get_str("plugin-opts");
         if let Some(network) = get_str("network") {
@@ -655,6 +659,7 @@ proxies:
     port: 443
     uuid: 11111111-1111-4111-8111-111111111111
     tls: true
+    encryption: mlkem768x25519plus.native.1rtt.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
     servername: tls.example
     network: ws
     ws-path: /flat
@@ -708,6 +713,10 @@ proxies:
 
         let ws = &nodes[1];
         assert_eq!(ws.sni.as_deref(), Some("tls.example"));
+        assert_eq!(
+            ws.encryption.as_deref(),
+            Some("mlkem768x25519plus.native.1rtt.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+        );
         assert_eq!(ws.transport, "ws");
         assert_eq!(ws.ws_path.as_deref(), Some("/nested"));
         assert_eq!(ws.ws_host.as_deref(), Some("websocket.example"));

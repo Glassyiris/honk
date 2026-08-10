@@ -18,6 +18,8 @@ pub mod tuic;
 #[cfg(feature = "rprx")]
 pub mod vless;
 #[cfg(feature = "rprx")]
+mod vless_encryption;
+#[cfg(feature = "rprx")]
 pub mod vmess;
 
 use anytls::AnyTlsHandler;

@@ -545,6 +545,35 @@ fn test_vless_no_security_keeps_tls_default() {
 }
 
 #[test]
+fn test_vless_encryption_param_and_identity() {
+    let plain = Node::from_share_link("vless://uuid@example.com:443#plain").unwrap();
+    let encryption = "mlkem768x25519plus.native.1rtt.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let encrypted = Node::from_share_link(&format!(
+        "vless://uuid@example.com:443?encryption={encryption}#encrypted"
+    ))
+    .unwrap();
+    assert_eq!(encrypted.encryption.as_deref(), Some(encryption));
+    assert_ne!(plain.id, encrypted.id);
+}
+
+#[test]
+fn test_validate_rejects_vless_encryption_with_flow() {
+    let encryption = "mlkem768x25519plus.native.1rtt.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let node = Node::from_share_link(&format!(
+        "vless://uuid@example.com:443?security=tls&flow=xtls-rprx-vision&encryption={encryption}#encrypted-flow"
+    ))
+    .unwrap();
+    let mut config = Config::default();
+    config.nodes.push(node);
+    let error = config.validate().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("combines VLESS Encryption with flow")
+    );
+}
+
+#[test]
 fn test_vless_derive_id_differs_by_reality_public_key() {
     let a =
         Node::from_share_link("vless://uuid@example.com:443?security=reality&pbk=AAA#a").unwrap();

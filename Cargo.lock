@@ -1598,6 +1598,7 @@ dependencies = [
  "honk-ebpf-common",
  "http",
  "libc",
+ "lru",
  "md-5",
  "parking_lot",
  "quinn",

@@ -55,7 +55,7 @@ pub struct Node {
     /// Password / UUID for auth
     #[serde(default)]
     pub password: Option<String>,
-    /// Encryption method (for SS)
+    /// Protocol encryption/cipher setting (SS, VMess, or VLESS Encryption)
     #[serde(default)]
     pub encryption: Option<String>,
     #[serde(default)]
@@ -328,7 +328,20 @@ impl Node {
             NodeProtocol::SS => {
                 format!("{}|{}", self.encryption.as_deref().unwrap_or(""), pass)
             }
-            NodeProtocol::Trojan | NodeProtocol::VMess | NodeProtocol::VLess => pass.to_string(),
+            NodeProtocol::Trojan | NodeProtocol::VMess => pass.to_string(),
+            NodeProtocol::VLess
+                if self
+                    .encryption
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty() && value != "none") =>
+            {
+                format!(
+                    "{}|{}",
+                    self.encryption.as_deref().unwrap_or_default(),
+                    pass
+                )
+            }
+            NodeProtocol::VLess => pass.to_string(),
             NodeProtocol::Socks5 => format!("{user}|{pass}"),
             NodeProtocol::Hysteria2 => self.hy2_auth.as_deref().unwrap_or(pass).to_string(),
             NodeProtocol::Tuic => format!(
