@@ -568,8 +568,10 @@ fail-open mode. It owns the exact nftables table and chain names
 `inet honk_nfqueue` / `udp_decision`. A firewall manager in the same network
 namespace must not flush, replace, or mutate either object while honk is running.
 The eBPF `UDP_DECISION_SEQUENCE` pin is persistent across ordinary restart and
-cleanup so a token is not reused while an old skb or task can still exist;
-exhaustion requires a reboot.
+cleanup. Tokens combine a two-bit generation and a 28-bit sequence. Exhaustion
+fences and drains staging before switching to an unused live-map generation; if
+all four generations remain live, staging stays fenced and retries; non-staged
+UDP continues while ambiguous new flows fail closed. It does not require a reboot.
 
 The original skb is held before conntrack/NAT. Direct performs token-checked
 Arm → FIFO `NF_ACCEPT` with the final mark → Activate, without a userspace direct
@@ -578,13 +580,15 @@ Proxy commits token-bound state, transfers the one retained payload copy into
 the existing UDP initializer, drops the original skb(s), and dials/sends once.
 Block and cancellation drop the originals. Reload and shutdown clear readiness,
 quiesce/cancel pending ownership, and only then tear down the queue and owned
-table. Queue/listener/verdict errors and token exhaustion are fatal rather than
-fail-open.
+table. Queue/listener/verdict errors remain fatal rather than fail-open;
+allocator exhaustion uses fenced generation rotation.
 
 With the Clash API enabled, `GET /stats` exposes the fixed object
 `/stats.udp.nfqueue` (dotted path, not a separate route): `received`,
-`activeFlows`, `directAccepted`, `proxyCopied`, `proxyDropped`, `block`, `cancel`,
-`drop`, `tokenMismatch`, `tokenExhaustion`, `verdictErrors`, and
+`activeFlows`, `kernelQueueDepth`, `kernelDropped`, `kernelUserDropped`,
+`heldPackets`, `heldPeak`, `socketReceiveBufferBytes`, `actorQueueFull`,
+`directAccepted`, `proxyCopied`, `proxyDropped`, `block`, `cancel`, `drop`,
+`tokenMismatch`, `tokenExhaustion`, `tokenRollovers`, `verdictErrors`, and
 `receiptToVerdict`. See the component reference for field meanings.
 
 ### Clash API

@@ -644,12 +644,16 @@ canonical TPROXY path. DNS port 53, internal/special traffic, `must`, `block`,
 reverse traffic, and already-safe direct decisions are never queued; only
 ambiguous userspace/domain decisions are staged.
 
-The mechanism is fixed: raw-netlink queue `320`, one listener, and no bypass,
-fanout, fail-open, or user-selectable queue/worker policy. honk exclusively owns
-the exact nftables names `inet honk_nfqueue` / `udp_decision`; firewall managers
-in the same network namespace must not mutate them while honk runs. The pinned
-`UDP_DECISION_SEQUENCE` allocator survives ordinary restart/cleanup and cannot
-be reset without risking token reuse; exhaustion requires a reboot.
+The mechanism is fixed: raw-netlink queue `320`, one listener feeding one bounded
+ingest actor, and no bypass, fanout, fail-open, or user-selectable queue/worker
+policy. honk exclusively owns the exact nftables names `inet honk_nfqueue` /
+`udp_decision`; firewall managers in the same network namespace must not mutate
+them while honk runs. The pinned `UDP_DECISION_SEQUENCE` allocator survives
+ordinary restart/cleanup. Its tokens combine a two-bit generation with a 28-bit
+sequence. At sequence exhaustion, honk fences new staging, drains held packets,
+and switches to a generation absent from all live token-bound maps. If all four
+generations remain live, staging stays fenced and the supervisor retries;
+non-staged UDP continues while ambiguous new flows fail closed. No reboot is required.
 
 Held skbs are before conntrack/NAT. A final direct decision uses a token-checked
 Arm → FIFO accept with the final mark → Activate transition and creates no
@@ -658,7 +662,8 @@ connection entry. Proxy first commits its token-bound state, moves the one
 retained payload copy into the canonical UDP initializer, drops the originals,
 then dials/sends exactly once. Block/cancel drop. Reload and shutdown fence
 readiness and quiesce/cancel all guards before queue/table teardown.
-Queue/listener/verdict failures and token exhaustion are fatal.
+Queue/listener/verdict failures remain fatal; allocator exhaustion is recovered
+by the fenced generation rotation above.
 
 ### `experimental { clash_api { ... } }`
 
@@ -712,8 +717,10 @@ udp = {
   stagger: { attempts, winners, cancellations },
   warm: { attempts, successes, failures },
   nfqueue: {
-    received, activeFlows, directAccepted, proxyCopied, proxyDropped,
-    block, cancel, drop, tokenMismatch, tokenExhaustion, verdictErrors,
+    received, activeFlows, kernelQueueDepth, kernelDropped, kernelUserDropped,
+    heldPackets, heldPeak, socketReceiveBufferBytes, actorQueueFull,
+    directAccepted, proxyCopied, proxyDropped, block, cancel, drop,
+    tokenMismatch, tokenExhaustion, tokenRollovers, verdictErrors,
     receiptToVerdict: H
   }
 }
@@ -730,12 +737,17 @@ remains and the winning transport owns its connection only for the selected flow
 `successes` count `Ready`; a `NotApplicable` result is neutral.
 
 `nfqueue.received` counts listener deliveries and `activeFlows` is the current
-pending-correlator gauge. `directAccepted`, `proxyDropped`, `block`, `cancel`,
+pending-correlator gauge. `kernelQueueDepth`, `kernelDropped`, and
+`kernelUserDropped` come from the owned queue's kernel status; `heldPackets` and
+`heldPeak` count dispatched verdict guards. `socketReceiveBufferBytes` is the
+effective netlink receive buffer, and `actorQueueFull` counts fail-closed drops
+at the bounded ingest actor. `directAccepted`, `proxyDropped`, `block`, `cancel`,
 and `drop` count successful kernel verdicts; `proxyCopied` counts the single
 payload ownership transfer into the canonical initializer. `tokenMismatch`,
-`tokenExhaustion`, and `verdictErrors` expose fail-closed faults.
-`receiptToVerdict` measures listener receipt to successful verdict and is not
-labelled as kernel queue residence because NFQA timestamps are not guaranteed.
+`tokenExhaustion`, `tokenRollovers`, and `verdictErrors` expose token and verdict
+events. `receiptToVerdict` measures listener receipt to successful verdict and
+is not labelled as kernel queue residence because NFQA timestamps are not
+guaranteed.
 
 `/stats` also carries a top-level `warm` object of point-in-time gauges:
 

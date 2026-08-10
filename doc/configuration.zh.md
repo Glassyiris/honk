@@ -500,21 +500,24 @@ experimental {
 honk 通过 raw netlink 绑定唯一且固定的 NFQUEUE `320`，不启用 bypass、fanout 或
 fail-open。它拥有名称精确为 `inet honk_nfqueue` / `udp_decision` 的 nftables 表与链。
 honk 运行期间，同一网络命名空间中的防火墙管理器不得 flush、替换或修改任一对象。
-eBPF `UDP_DECISION_SEQUENCE` pin 会跨普通重启和清理保留，确保旧 skb 或任务仍可能
-存在时不会复用 token；耗尽后必须重启操作系统。
+eBPF `UDP_DECISION_SEQUENCE` pin 会跨普通重启和清理保留。token 由两位 generation 与
+28 位 sequence 组成。耗尽时会先 fence 并排空暂存，再切换到存活 map 未使用的 generation；
+若四个 generation 都仍存活，暂存保持 fenced 并重试：非暂存 UDP 继续工作，新的歧义流 fail closed，无需重启系统。
 
 原始 skb 在 conntrack/NAT 之前被保留。Direct 执行 token 校验的
 Arm → 按 FIFO 以最终 mark `NF_ACCEPT` → Activate，不创建用户态直连 socket、
 payload 副本、endpoint、connection 条目，也不故意触发重传。Proxy 提交 token 绑定
 状态，把唯一的保留 payload 副本转交给现有 UDP 初始化器，丢弃原始 skb，并且只
 拨号/发送一次。Block 和取消会丢弃原始 skb。重载与关闭先清除 readiness，静默并取消
-待定所有权，再拆除队列及自有表。队列、listener、verdict 错误和 token 耗尽均为致命
-错误，不会 fail-open。
+待定所有权，再拆除队列及自有表。队列、listener 和 verdict 错误仍为致命错误，不会
+fail-open；分配器耗尽使用带 fence 的 generation 轮换恢复。
 
 启用 Clash API 后，`GET /stats` 暴露固定对象 `/stats.udp.nfqueue`（点路径，不是
-独立路由）：`received`、`activeFlows`、`directAccepted`、`proxyCopied`、
-`proxyDropped`、`block`、`cancel`、`drop`、`tokenMismatch`、`tokenExhaustion`、
-`verdictErrors` 和 `receiptToVerdict`。字段含义见组件参考。
+独立路由）：`received`、`activeFlows`、`kernelQueueDepth`、`kernelDropped`、
+`kernelUserDropped`、`heldPackets`、`heldPeak`、`socketReceiveBufferBytes`、
+`actorQueueFull`、`directAccepted`、`proxyCopied`、`proxyDropped`、`block`、`cancel`、
+`drop`、`tokenMismatch`、`tokenExhaustion`、`tokenRollovers`、`verdictErrors` 和
+`receiptToVerdict`。字段含义见组件参考。
 
 ### Clash API
 
