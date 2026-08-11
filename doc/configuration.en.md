@@ -225,10 +225,10 @@ configured groups or explicit budgets rather than raw subscription size:
 
 | Mechanism | Key | Default | Notes |
 | ----------- | ----- | --------- | ------- |
-| Bare TCP preconnect at startup | `preconnect_node_count` | `'auto'` | One startup pass only. `'auto'` tries up to 8 nodes (each group's current pick first, then config order); `0` disables; explicit `N` may cover all eligible nodes with at most 8 concurrent attempts. Only bare-TCP-poolable protocols qualify — AnyTLS/QUIC and the built-in `direct`/`block` are always skipped. |
-| Selector pin | — | always on | Keeps the configured leaf of every `selector` group warm, including an explicitly selected node while it is unhealthy. AnyTLS and QUIC protocols retain their reusable session/client; other proxy protocols retain one bare server TCP connection. A Clash API choice change wakes reconciliation immediately, releases the previous leaf without cutting active flows, and warms the replacement. Reload preserves ownership for unchanged selected nodes. |
-| UDP warm set | `udp_warm_node_count` | `0` | Takes the top `min(N,3)` UDP leaves per group and IP family, dispatches at most 4 attempts concurrently, and caps the process-wide retained set at `4×N`. UDP and Selector ownership are independent: a shared resource is released only after both reasons disappear. |
-| Concurrent dial cap | `max_concurrent_dials` | `64` | Bounds physical proxy connects and protocol handshakes per generation. Ready-pool hits, logical streams on warm AnyTLS/QUIC transports, and built-in `direct`/`block` dials are exempt. Reload changes the replacement's local limit, while old and new generations share one immutable startup descriptor gate. |
+| Bare TCP preconnect at startup | `preconnect_node_count` | `'auto'` | One startup pass only. `'auto'` tries up to 8 nodes (each group's current pick first, then config order); `0` disables; explicit `N` may cover all eligible nodes with at most 8 concurrent attempts. Only bare-TCP-poolable protocols qualify — AnyTLS, VLESS H2MUX/Mux.Cool, QUIC, and the built-in `direct`/`block` are always skipped. |
+| Selector pin | — | always on | Keeps the configured leaf of every `selector` group warm, including an explicitly selected node while it is unhealthy. AnyTLS, VLESS H2MUX, and VLESS Mux.Cool retain a reusable session; QUIC protocols retain their client; other proxy protocols retain one bare server TCP connection. A Clash API choice change wakes reconciliation immediately, releases the previous leaf without cutting active flows, and warms the replacement. Reload preserves ownership for unchanged selected nodes. |
+| UDP warm set | `udp_warm_node_count` | `0` | Takes the top `min(N,3)` UDP leaves per group and IP family, dispatches at most 4 attempts concurrently, and caps the process-wide retained set at `4×N`. Reusable VLESS H2MUX/Mux.Cool state participates. UDP and Selector ownership are independent: a shared resource is released only after both reasons disappear. |
+| Concurrent dial cap | `max_concurrent_dials` | `64` | Bounds physical proxy connects and protocol handshakes per generation. Ready-pool hits, logical streams on warm AnyTLS/VLESS-H2MUX/VLESS-Mux.Cool/QUIC transports, and built-in `direct`/`block` dials are exempt. Reload changes the replacement's local limit, while old and new generations share one immutable startup descriptor gate. |
 
 Health checks probe but never warm a cold node, so `check_interval` on a
 400-node subscription does not create 400 idle tunnels. The Selector pin is
@@ -248,7 +248,9 @@ node {
 
 Supported schemes (parser): `ss://`, `socks5://`, `trojan://`, `vmess://`, `vless://`, `hysteria2://`, `tuic://`, `juicity://`, `anytls://`.
 
-Node parameters (credentials, `sni`, transport/ws/grpc options, protocol-specific Hy2/TUIC/Juicity/AnyTLS options) are carried by the share link's userinfo/host/query components — the same fields the `Node` model exposes (`name`, `protocol`, `address`/`host`, `port`, `password`/`username`, `encryption`, `tls`, `sni`, `transport`, `ws_path`, `ws_host`, `grpc_service`, ...). An explicit `tag:` prefix overrides the name embedded in the link.
+Node parameters (credentials, `sni`, transport/ws/grpc options, protocol-specific Hy2/TUIC/Juicity/AnyTLS options) are carried by the share link's userinfo/host/query components — the same fields the `Node` model exposes (`name`, `protocol`, `address`/`host`, `port`, `password`/`username`, `encryption`, `vless_mode`, `tls`, `sni`, `transport`, `ws_path`, `ws_host`, `grpc_service`, ...). An explicit `tag:` prefix overrides the name embedded in the link.
+
+VLESS uses the canonical share-link query `vless_mode=legacy|uot-v2|h2mux|h2mux-padded|xudp|mux-cool`; omission means `legacy`. The modes select legacy TCP/no UDP, direct UoT v2, sing-box H2MUX with optional padding, Xray Single XUDP, or pooled Xray Mux.Cool. They are never negotiated or downgraded. Every non-legacy mode rejects VLESS Encryption; only `xudp` may combine with `flow=xtls-rprx-vision`. See the component reference for the complete wire and subscription-import contract.
 
 See [components.en.md](./components.en.md) for the full field table and protocol notes (including UDP support matrix).
 
@@ -533,10 +535,20 @@ entry with `reality-opts` but no non-empty `public-key` is skipped instead of
 falling back to ordinary TLS. Clash `client-fingerprint` is intentionally
 unmapped because honk selects the fingerprint process-wide.
 
+Enabled Clash `smux`/`multiplex` with protocol `h2mux`, or with no protocol but
+an explicit `padding` boolean, maps to `h2mux` or `h2mux-padded`; an enabled
+block missing both discriminators is rejected. Enabled `udp-over-tcp` version
+0/2 maps to `uot-v2`; `packet-encoding: xudp` or `xudp: true` maps to Single
+`xudp`. Conflicting mode representations, enabled packetaddr, unsupported mux
+protocols/tuning, or `udp: true` without an explicit packet mode reject the
+entry. `mux-cool` is available only through the canonical share-link mode.
+
 The supported VLESS transport shapes are plain/TLS/REALITY over TCP, WS, or
 gRPC, except that `xtls-rprx-vision` requires TLS or REALITY and TCP. Other
 transports and flows are parsed for visibility but are not dialed by
-`honk-tool sub`; VLESS has no UDP packet handler.
+`honk-tool sub`. Legacy VLESS and nodes whose `network` excludes UDP render it
+as `n/a`; every non-legacy mode otherwise runs the UDP probes through its
+packet transport.
 
 ## 11. Experimental
 

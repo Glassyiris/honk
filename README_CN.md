@@ -30,6 +30,12 @@ experimental {
 
 该路径拥有 raw-netlink 队列 `320` 和 nftables 对象 `inet honk_nfqueue` / `udp_decision`；honk 运行期间，同一网络命名空间中的防火墙管理器不得修改它们。Direct 释放被保留的 skb，Proxy 把唯一的 payload 副本交给正常 UDP 初始化器，block/取消则丢弃报文。ingest actor 最多保留 256 个报文和 8 MiB payload；每个报文从 listener 收到时起都保留固定的三秒绝对期限。启用 Clash API 后，`/stats.udp.nfqueue` 会暴露 actor 深度、字节数、最老年龄以及明确的内核统计可用状态与读取失败数。完整不变量和指标 schema 见[设计文档](doc/design.zh.md)与[配置参考](doc/configuration.zh.md)。
 
+### VLESS UDP、H2MUX 与 XUDP
+
+VLESS 分享链接通过 `vless_mode=legacy|uot-v2|h2mux|h2mux-padded|xudp|mux-cool` 选择唯一模式。`legacy` 是保持兼容的 TCP-only 默认值；`uot-v2` 保留该 TCP 路径并增加直连 UoT v2 UDP；`h2mux` 在共享 HTTP/2 carrier 上承载逻辑 TCP 与 sing-mux 原生 connected UDP；`h2mux-padded` 再启用 sing-mux v1 padding；`xudp` 保留普通 VLESS TCP，并为每个 UDP transport 建立一条 Single XUDP carrier；`mux-cool` 让逻辑 TCP 与 XUDP 共用节点所有的 Xray Mux.Cool carrier。
+
+这些模式不协商、不降级，也不会重放 UDP 首包。所有非 `legacy` 模式都不能使用 VLESS Encryption；只有 `xudp` 可与 `flow=xtls-rprx-vision` 组合。官方互通套件覆盖 sing-box 与 Xray：六种明文模式、TLS/REALITY 上的 H2MUX、padding，以及 XUDP Vision。wire、生命周期和导入规则见[组件参考](doc/components.zh.md#vless-mode)。
+
 ### 文档
 
 | 文档         | English                                              | 中文                                                 |
@@ -114,6 +120,7 @@ honk 沿用 dae 的内核模型，但并非移植。主要不同点：
 
 - [x] Handler：Direct、Block、SOCKS5、SS（含 2022）、Trojan、VMess、VLESS、Hysteria2、TUIC、Juicity、AnyTLS
 - [x] VLESS + REALITY 客户端（含 `xtls-rprx-vision` flow），基于 boring-sys 补丁钩子改写 ClientHello；JA4 与真实 Chrome 对齐（ja4_a/ja4_b 完全一致）
+- [x] VLESS UDP/复用：UoT v2、H2MUX（padding）、Single XUDP 与 Mux.Cool；覆盖 TLS/REALITY
 - [x] 共享传输层（TLS/WS/gRPC）
 - [x] 组：Selector / URLTest / LoadBalance / Fallback + 嵌套组
 - [x] URLTest：tolerance、TCP/UDP 独立选择、idle_timeout、interrupt_connections
@@ -135,7 +142,7 @@ honk 沿用 dae 的内核模型，但并非移植。主要不同点：
 
 ### TODO
 
-- [ ] VMess / VLESS 的 UDP 中继
+- [ ] VMess 的 UDP 中继
 - [x] REALITY 客户端 + Chrome（uTLS 风格）指纹——BoringSSL 加两个 boring-sys 补丁钩子实现；支持 VLESS `xtls-rprx-vision`
 - [x] 真正的 DoT/DoH/DoQ/DoH3 上游（TLS/H2/QUIC 会话复用）
 - [x] Hysteria2 brutal（上下行 Mbps）、端口跳跃（`mport`/`mhop`）、`pinSHA256`、QUIC 接收窗口/PMTUD 参数；已对官方服务器实测验证

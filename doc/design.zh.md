@@ -280,9 +280,10 @@ application send 之前完成 promotion/arbitration。
 
 **Warm 所有权按 generation 管理，并按策略原因独立保留。** 每个 Selector
 提供其配置叶节点（运行时选择优先，其次 default，再其次首个成员）；多个
-Selector 共享的叶节点按 UUID 去重。AnyTLS 保留一条池 session，
-TUIC/Juicity/Hysteria2 保留 QUIC client 与 connection，其他代理协议保留一条
-到服务端的裸 TCP。Selector 的有效选择变化会立即唤醒 reconciliation，另有
+Selector 共享的叶节点按 UUID 去重。AnyTLS、VLESS H2MUX 与 VLESS Mux.Cool
+保留一条池 session，TUIC/Juicity/Hysteria2 保留 QUIC client 与 connection，
+其他代理协议保留一条到服务端的裸 TCP。Selector 的有效选择变化会立即唤醒
+reconciliation，另有
 10 秒周期修复死亡、被消费或已过期的资源。最后一个 Selector 所有者消失时
 只排干可复用状态；活动 flow 继续持有自己的 stream/connection，reload 时未变
 runtime 延续所有权。启动 preconnect 与此分离：它只做一次裸 TCP 预置，不持有
@@ -290,10 +291,11 @@ Selector/UDP retention bit。
 
 **UDP warm-up 仍为 opt-in。** `global.udp_warm_node_count=0` 不创建 UDP
 coordinator，也不产生 attempt metrics。预算为正时，只合并每组拥有可复用 UDP
-generation 状态的延迟 top-N 叶节点（AnyTLS/TUIC/Juicity/Hysteria2），按 UUID
+generation 状态的延迟 top-N 叶节点（AnyTLS/VLESS-H2MUX/VLESS-Mux.Cool/
+TUIC/Juicity/Hysteria2），按 UUID
 去重后再受进程级 `4×N` 上限约束。每次最多并发四个握手；启动时立即执行一次，
 之后每次都在上一批完成并经过配置的检查间隔后执行。Selector 与 UDP 使用独立
-bit，因此共享的 AnyTLS/QUIC 资源只在最后一种所有权消失后释放。reload 会让旧
+bit，因此共享的 session/client 资源只在最后一种所有权消失后释放。reload 会让旧
 generation 拒绝新的 warm 工作，但已有 stream 与 Ready UDP endpoint 正常排干。
 `Ready` 记为 success；通用的 `NotApplicable` 结果保持中性。
 
@@ -310,8 +312,21 @@ generation 拒绝新的 warm 工作，但已有 stream 与 Ready UDP endpoint �
 - `tls.rs` — BoringSSL TLS 与 Chrome 指纹辅助
 - `reality.rs` — REALITY 客户端握手（见下文）
 - `vless_encryption.rs` — 兼容 Xray 的 VLESS Encryption 认证、混合前向保密、ticket 0-RTT 与 record framing
+- `uot.rs` — AnyTLS 与 VLESS 直连 UoT v2 共用的 packet codec
+- `vless_mux.rs` — sing-mux H2MUX carrier、可选 v1 padding、逻辑 TCP 与原生 connected UDP
+- `vless_cool.rs` — Xray Mux.Cool 有序 carrier、逻辑 TCP、Single/池化 XUDP 与 full-cone 回包元数据
 
 VMess 与 VLESS 由 honk-outbound 的 `rprx` cargo feature 编译（honk-core 默认构建开启）；不带该 feature 时节点可解析，但拨号以 "No handler for protocol" 拒绝。
+
+### VLESS mode
+
+`Node.vless_mode: WireMode` 把行为归一化为六种互斥且不协商的 contract。`legacy` 保留原 TCP 路径且无 packet 能力；`uot-v2` 保持 TCP 不变，并为每个 connected UDP transport 新建一条直连 UoT v2 stream；`xudp` 同样保持 TCP 不变，但为每个 UDP transport 建立一条 VLESS mux-command carrier，并使用 XUDP session id 0。
+
+`h2mux` 向 `sp.mux.sing-box.arpa:444` 发出 VLESS 请求、选择 H2MUX backend 2，再打开 HTTP/2 CONNECT stream，首个 DATA 为 `[flags u16][SocksAddr]`——flag 0 承载逻辑 TCP，flag 1 通过共用 UoT 长度 codec 承载 connected UDP。`h2mux-padded` 再增加 sing-mux v1 随机 preface，并对每个方向前 16 个 record 做 padding framing。每个 H2MUX 节点拥有 `SessionPool<VlessMuxSession>`，上限为两条物理 carrier × 每条 128 个逻辑 stream。HTTP/2 capacity 决定 admission；GOAWAY 与提交前 session 故障会排干并重试一次，目标拒绝不重试。driver 故障向所有子流传播；stream wrapper 保留 flow-control capacity 释放、half-close、reset 与惰性响应错误。
+
+`mux-cool` 打开 Xray VLESS mux command，通过 `SessionPool<VlessCoolSession>` 承载逻辑 TCP 与 XUDP 子连接，上限同为两条 × 128。一个有序 writer 串行化所有子帧并保留取消时的 commitment；reader dispatch 不允许慢 TCP 子流阻塞兄弟。session id 单调且永不复用，因此发出 128 个 id 后 carrier 进入 drain。XUDP record 保留变化的回包地址，支持 full-cone UDP。不入池的 `xudp` 使用相同 frame codec 与保留 id 0，packet 上限为 7,526 字节；池化 Mux.Cool 最多接收 8 KiB。
+
+generation-pinned TCP/UDP、Selector warm-up 与 UDP warm-up 共用所选 H2MUX 或 Mux.Cool pool。冷 speculative 拨号占 provisional pool slot：loser 永不发布，winner 在 endpoint 发布前只 commit 一次。未变 generation 在 reload 时转移 live pool；最后一个所有者消失时只排干可复用状态，不切断活动子连接。饱和时施加 backpressure，而不是无限新建 carrier。不存在运行时探测、fallback 或首包重放。所有非 `legacy` 模式都拒绝 VLESS Encryption；`flow=xtls-rprx-vision` 只允许 `legacy` 与 Single `xudp`。
 
 ### VLESS Encryption
 
