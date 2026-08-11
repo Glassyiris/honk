@@ -24,7 +24,7 @@ The facade and its internals are split by responsibility:
 | `policy.rs` | Selector, URLTest, LoadBalance, and Fallback picks and latency ranking |
 | `state.rs` | URLTest/Fallback caches, Selector choices, idle timestamps, and callbacks |
 
-Selection follows one invariant: after resolution and liveness filtering, the dial path uses exactly the policy pick. Selector returns its effective manual choice, URLTest its current winner, LoadBalance its next member, and Fallback its pin. The only multi-candidate exception is an unmeasured top-level URLTest group; all warm URLTest and non-URLTest plans are authoritative single-leaf plans.
+Selection follows one invariant: after resolution and liveness filtering, the dial path uses exactly the policy pick. Selector returns its effective manual choice, URLTest its current winner, LoadBalance its next member, and Fallback its pin. The only multi-candidate exception is an unmeasured top-level URLTest group; all warm URLTest and non-URLTest plans are authoritative single-leaf plans. If a group with no `final` has exactly one unique leaf and TCP liveness excludes it, that same leaf remains an authoritative last resort: its health stays dead, but a real dial can prove recovery without leaking to `direct`. UDP keeps normal liveness exclusion.
 
 ## Policy semantics
 
@@ -90,7 +90,7 @@ Only an observed preparation `Err` affects traffic health. Never-started work, c
 
 | Failure source | `Tcp` | `DnsUdp` | `DataUdp` |
 | --- | ---: | ---: | ---: |
-| Periodic probe | 1 | 3 | 3 |
+| Periodic probe | 3 | 3 | 3 |
 | Real traffic | 10 | 3 | 50 |
 
 Probe and traffic failures have separate counters. Probe failures apply exponential cooldown from 5 seconds to 300 seconds. A separate `min(5s, check_interval)` recovery scheduler considers only dead domain/family states whose cooldown is due; deep-backoff states continue at the 300-second cadence rather than stopping permanently.

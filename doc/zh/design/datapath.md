@@ -54,7 +54,7 @@ Rtnetlink 创建 `dae0`/`dae0peer`，通过网络命名空间 FD 移动 `dae0pee
 
 `auto` 解析为当前默认路由接口。没有默认路由时，该项保持未挂载，而不会回退到 loopback。`IfaceWatcher` 订阅 rtnetlink 的链路、IPv4/IPv6 地址和 IPv4/IPv6 路由组；每 60 秒一次的协调 tick 作为事件交付的后备。协调过程重新解析 `auto`，通过 ifindex 识别接口重建，重新计算单网卡或双网卡角色，并安装或忘记进程持有的挂钩。
 
-链路、地址、路由或接口角色变化时，系统还会为已配置 LAN/WAN 接口上的每个地址重新发布生成的 `direct(must)` 规则。它清除健康检查 cooldown 并触发新探测。在新探测成功前，失效出站仍保持 fail-closed。
+链路、地址、路由或接口角色变化时，系统还会为已配置 LAN/WAN 接口上的每个地址重新发布生成的 `direct(must)` 规则。它清除健康检查 cooldown 并触发新探测。在新探测成功前，失效 UDP 和多叶节点出站仍保持 fail-closed；未配置 `final` 的单叶节点 TCP 组仍可作为用户态最后尝试。
 
 ## 程序清单
 
@@ -137,7 +137,7 @@ LAN TCP 和 UDP 的目的端口为 `53` 时跳过路由循环，直接进入控�
 
 ### 出站存活状态
 
-用户空间把 group-OR 健康状态发布到 `OUTBOUND_CONNECTIVITY_MAP`。若新 LAN 流被路由到显式标为失效的槽，内核以 `TC_ACT_SHOT` 丢弃；这是有意的 fail-closed 行为。LAN ingress 上的 TCP 和 UDP 目的端口 `53` 均获豁免。为当前每个网关接口地址生成的 must-direct 规则通过同一路由发布路径下发，即使代理出站失效也能保持本地管理可达。
+用户空间把 group-OR 健康状态发布到 `OUTBOUND_CONNECTIVITY_MAP`。若新 LAN 流被路由到显式标为失效的槽，内核以 `TC_ACT_SHOT` 丢弃；这是有意的 fail-closed 行为。唯一的窄例外是：未配置 `final` 且只有一个唯一叶节点的 TCP 组保持槽开放，使真实流量可经同一代理尝试并证明恢复，而不会隐式回退到 `direct`。UDP 和全部叶节点失活的多叶节点组仍保持 fail-closed。LAN ingress 上的 TCP 和 UDP 目的端口 `53` 均获豁免。为当前每个网关接口地址生成的 must-direct 规则通过同一路由发布路径下发，即使代理出站失效也能保持本地管理可达。
 
 ### 路由时 direct 卸载
 

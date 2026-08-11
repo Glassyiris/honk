@@ -98,10 +98,9 @@ impl AliveDialerSet {
             return false;
         }
 
-        // Try up to 3 addresses per family, stopping at the first success:
-        // the family-death threshold is 1 probe failure, so a single stale
-        // cached address (e.g. a v6 answer from a long-gone DNS cache entry)
-        // would otherwise pin the whole family as dead forever.
+        // Try up to 3 addresses per family, stopping at the first success.
+        // This prevents one stale cached address from consuming a failure on
+        // every probe cycle when another address in the family still works.
         let mut by_family: [Vec<SocketAddr>; 2] = [Vec::new(), Vec::new()];
         for a in &addrs {
             let idx = if a.is_ipv4() { 0 } else { 1 };
@@ -166,8 +165,9 @@ impl AliveDialerSet {
             tracing::info!("Node '{}' is alive after HTTP health check", node_name);
         } else {
             tracing::warn!(
-                "Node '{}' failed HTTP health check against all addresses ({})",
+                "Node '{}' failed HTTP health check for '{}' through proxy endpoint {}",
                 node_name,
+                check_url,
                 registered.address
             );
         }

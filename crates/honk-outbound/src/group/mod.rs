@@ -1,6 +1,7 @@
 //! Node group manager — Selector (manual), URLTest (auto lowest-latency with
 //! separate TCP/UDP selections), LoadBalance (per-group round-robin) and
-//! Fallback (sticky first-alive). Filters dead nodes via `AliveDialerSet`.
+//! Fallback (sticky first-alive). Filters dead nodes via `AliveDialerSet`, except
+//! that a sole TCP leaf with no `final` remains a last resort.
 //! Modeled after sing-box outbound groups.
 //!
 //! UDP candidate filtering is per-node: a node with both UDP probe domains
@@ -202,7 +203,7 @@ impl GroupManager {
         self.select_node_for_domain(name, ProbeDomain::Tcp, IpVersion::V4)
     }
 
-    /// Select a single alive node for the given domain and IP version.
+    /// Select one eligible node, or a sole TCP leaf as the last resort.
     pub fn select_node_for_domain(
         &self,
         group_name: &str,
@@ -215,7 +216,9 @@ impl GroupManager {
         // constructing its transient candidate/visited vectors; nested
         // groups still take the guarded recursive path below.
         if group.policy == GroupPolicy::Selector && group.groups.is_empty() {
-            return self.pick_direct_selector(group, domain, ipver);
+            return self
+                .pick_direct_selector(group, domain, ipver)
+                .or_else(|| self.last_resort_tcp_leaf(group, domain));
         }
         let mut visited = Vec::with_capacity(MAX_GROUP_DEPTH);
         self.pick_in_group(
@@ -341,6 +344,7 @@ impl GroupManager {
                 mode: SelectionPlanMode::Authoritative,
                 nodes: self
                     .pick_direct_selector(group, domain, ipver)
+                    .or_else(|| self.last_resort_tcp_leaf(group, domain))
                     .into_iter()
                     .collect(),
             };
@@ -359,6 +363,12 @@ impl GroupManager {
                     != Duration::MAX
             });
         if candidates.is_empty() {
+            if let Some(node) = self.last_resort_tcp_leaf(group, domain) {
+                return SelectionPlan {
+                    mode: SelectionPlanMode::Authoritative,
+                    nodes: vec![node],
+                };
+            }
             return SelectionPlan {
                 mode: if group.policy == GroupPolicy::URLTest && !urltest_has_data {
                     SelectionPlanMode::ColdUrlTest

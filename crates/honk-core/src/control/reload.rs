@@ -1396,6 +1396,22 @@ pub(super) fn build_outbound_id_map(config: &Config) -> std::collections::HashMa
 
 type GroupConnectivity = (u8, u32, u32, bool);
 
+/// A sole TCP leaf with no configured fallback remains a userspace last resort:
+/// suppressing it in TC would prevent real traffic from proving recovery.
+pub(super) fn group_datapath_alive(
+    group: &Group,
+    group_manager: &GroupManager,
+    alive_set: &crate::outbound::AliveDialerSet,
+    domain: ProbeDomain,
+    ipver: IpVersion,
+) -> bool {
+    let leaves = group_manager.leaf_nodes_in_group(&group.name);
+    (domain == ProbeDomain::Tcp && group.final_outbound.is_none() && leaves.len() == 1)
+        || leaves
+            .iter()
+            .any(|node| alive_set.is_alive_for(node.id, domain, ipver))
+}
+
 fn group_connectivity_snapshot(
     config: &Config,
     group_manager: &GroupManager,
@@ -1404,16 +1420,17 @@ fn group_connectivity_snapshot(
     let mut snapshot = Vec::with_capacity(config.groups.len() * 6);
     for (index, group) in config.groups.iter().enumerate() {
         let outbound = OutboundIndex::UserBase as u8 + index as u8;
-        let leaves = group_manager.leaf_nodes_in_group(&group.name);
         for (domain_index, domain) in [ProbeDomain::Tcp, ProbeDomain::DnsUdp, ProbeDomain::DataUdp]
             .into_iter()
             .enumerate()
         {
             for (ip_index, ipver) in [IpVersion::V4, IpVersion::V6].into_iter().enumerate() {
-                let any_alive = leaves
-                    .iter()
-                    .any(|node| alive_set.is_alive_for(node.id, domain, ipver));
-                snapshot.push((outbound, domain_index as u32, ip_index as u32, any_alive));
+                snapshot.push((
+                    outbound,
+                    domain_index as u32,
+                    ip_index as u32,
+                    group_datapath_alive(group, group_manager, alive_set, domain, ipver),
+                ));
             }
         }
     }
@@ -1774,6 +1791,34 @@ mod atomic_reload_tests {
             .with_cache_enabled(false)
             .into()
     }
+    #[test]
+    fn single_leaf_tcp_connectivity_stays_open_for_recovery() {
+        let node = Node {
+            id: uuid::Uuid::new_v4(),
+            name: "only".into(),
+            ..Default::default()
+        };
+        let config = Config {
+            nodes: vec![node.clone()],
+            groups: vec![Group {
+                name: "single".into(),
+                policy: GroupPolicy::Selector,
+                nodes: vec![node.id],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let alive = Arc::new(crate::outbound::AliveDialerSet::new());
+        alive.report_unavailable_forced(node.id, ProbeDomain::Tcp, IpVersion::V4);
+        alive.report_unavailable_forced(node.id, ProbeDomain::DataUdp, IpVersion::V4);
+        let manager =
+            GroupManager::with_alive_set(&config.groups, &config.nodes, Some(Arc::clone(&alive)));
+        let snapshot = group_connectivity_snapshot(&config, &manager, &alive);
+
+        assert!(snapshot.contains(&(OutboundIndex::UserBase as u8, 0, 0, true)));
+        assert!(snapshot.contains(&(OutboundIndex::UserBase as u8, 2, 0, false)));
+    }
+
     #[test]
     fn group_connectivity_follows_reordered_outbound_ids() {
         let a = Node {

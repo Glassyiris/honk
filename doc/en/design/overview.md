@@ -56,7 +56,7 @@ Changes to shared map keys, values, constants, or layouts must move together acr
 flowchart TB
   PACKET[LAN-forwarded or host-originated TCP/UDP] --> TC[TC classification]
   TC -->|direct must or route-time-safe direct| NATIVE[Native Linux path]
-  TC -->|block or dead outbound| DROP[Drop]
+  TC -->|block or fail-closed dead outbound| DROP[Drop]
   TC -->|DNS :53 fast path| DAE0[dae0]
   TC -->|proxy or userspace decision| DAE0
   TC -->|ambiguous LAN UDP, optional| NFQ[NFQUEUE 320]
@@ -91,8 +91,8 @@ flowchart TB
 - **NFQUEUE readiness and ownership:** enabled-but-not-ready staging drops only new flows that require staging. honk exclusively owns queue `320` and nftables `inet honk_nfqueue` / `udp_decision`; readiness changes are fenced, lifecycle ambiguity is fatal, and same-netns firewall managers must not mutate those objects.
 - **Token-checked terminal state:** a staged UDP token must agree across the skb mark, kernel state, handoff, redirect track, userspace verdict state, lease/endpoint, and backend transition. Direct follows Arm → all marked verdicts → Activate; proxy publishes final state before its one canonical dial/send path.
 - **`must`/`block` finality:** Clash mode overrides never replace a `block` result or a dae `(must)` result.
-- **Fail-closed dead outbounds:** `lan_ingress` drops new flows routed to a dead outbound. TCP and UDP port `53` are exempt, and `honk-core` injects `dip(<each LAN/WAN interface address>) -> direct(must)` at startup, reload, and interface-topology changes so local administration does not depend on proxy health.
-- **Group-OR connectivity:** the eBPF alive slot for a group is the OR of all leaf-member states. A single dead member must not make the whole group fail closed.
+- **Fail-closed dead outbounds:** `lan_ingress` drops new flows routed to a dead outbound. A TCP group with one unique leaf and no `final` keeps that same proxy as a userspace last resort; UDP and all-dead multi-leaf groups remain fail-closed. TCP and UDP port `53` are exempt, and `honk-core` injects `dip(<each LAN/WAN interface address>) -> direct(must)` at startup, reload, and interface-topology changes so local administration does not depend on proxy health.
+- **Group-OR connectivity:** the eBPF alive slot for a group is the OR of all leaf-member states, plus the sole-TCP-leaf last-resort exception above. A single dead member in a multi-leaf group must not make the whole group fail closed.
 - **Internal and special traffic:** honk's `169.254.0.0/16` and `fd00:686f:6e6b::/64` veth ranges are never proxied. L2 broadcast/multicast, IPv4 broadcast/multicast/unspecified destinations, and IPv6 multicast pass through before routing or conntrack.
 
 ## Build features and mock mode

@@ -48,6 +48,59 @@ fn direct_selector_plan_fast_path_preserves_choice_default_and_health() {
         "plan-b"
     );
 }
+
+#[test]
+fn dead_single_leaf_remains_a_tcp_last_resort_only() {
+    let node = make_node(nid("last-resort"), "last-resort");
+    let single = make_group("single", GroupPolicy::Selector, vec![node.id]);
+    let child = make_group("child", GroupPolicy::Selector, vec![node.id]);
+    let parent = make_subgroup("parent", GroupPolicy::Selector, &["child"]);
+    let alive = Arc::new(AliveDialerSet::new());
+    alive.report_unavailable_forced(node.id, ProbeDomain::Tcp, IpVersion::V4);
+    let manager = GroupManager::with_alive_set(
+        &[single.clone(), child.clone(), parent.clone()],
+        std::slice::from_ref(&node),
+        Some(Arc::clone(&alive)),
+    );
+
+    for group in ["single", "parent"] {
+        assert_eq!(
+            manager
+                .selection_plan_for_domain(group, ProbeDomain::Tcp, IpVersion::V4)
+                .nodes
+                .first()
+                .map(|node| node.name.as_str()),
+            Some("last-resort")
+        );
+        assert_eq!(
+            manager
+                .select_node_for_domain(group, ProbeDomain::Tcp, IpVersion::V4)
+                .map(|node| node.name.as_str()),
+            Some("last-resort")
+        );
+    }
+
+    for domain in [ProbeDomain::DnsUdp, ProbeDomain::DataUdp] {
+        alive.report_unavailable_forced(node.id, domain, IpVersion::V4);
+    }
+    assert!(
+        manager
+            .selection_plan_for_domain("single", ProbeDomain::DataUdp, IpVersion::V4)
+            .nodes
+            .is_empty()
+    );
+
+    let mut with_final = single;
+    with_final.final_outbound = Some("block".into());
+    let manager =
+        GroupManager::with_alive_set(&[with_final], std::slice::from_ref(&node), Some(alive));
+    assert!(
+        manager
+            .selection_plan_for_domain("single", ProbeDomain::Tcp, IpVersion::V4)
+            .nodes
+            .is_empty()
+    );
+}
 use chrono::Utc;
 
 fn nid(name: &str) -> uuid::Uuid {

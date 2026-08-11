@@ -55,6 +55,8 @@ group {
 
 Policy matching is ASCII case-insensitive. The parser removes an optional parenthesized suffix before matching, which accepts `fixed(0)`; an unrecognized policy silently becomes `selector`.
 
+If a group has exactly one unique leaf, no `final`, and that leaf is excluded by TCP health, honk still dials the same leaf as a last resort. The node remains marked dead until real traffic or probes recover it; this never implies a `direct` fallback. UDP keeps normal dead-member exclusion.
+
 Every configured Selector proxy leaf stays warm. After resolving a nested choice, honk retains a reusable multiplexed session, a QUIC client, or one bare server TCP connection according to the leaf protocol; `direct` and `block` need no warm resource.
 
 ## Filter resolution

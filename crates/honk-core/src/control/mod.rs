@@ -1778,12 +1778,9 @@ impl ControlPlane {
             let group_manager_for_push = self.group_manager.clone();
             let config_for_push = self.config.clone();
             alive_set.set_ebpf_callback(Box::new(move |outbound_idx, domain, ipver, _alive| {
-                // The eBPF connectivity slot is shared by every node in the
-                // group, so never write the transitioning node's own state:
-                // one dead member would silently TC_ACT_SHOT the whole
-                // group's new flows in the kernel datapath. Write the OR of
-                // member states instead — the group is "alive" in eBPF iff
-                // at least one member is alive for this domain/ipver.
+                // Group slots normally publish the OR of their leaf health.
+                // A sole TCP leaf without `final` stays open so userspace can
+                // make the one real dial capable of proving recovery.
                 let probe_domain = match domain {
                     1 => ProbeDomain::DnsUdp,
                     2 => ProbeDomain::DataUdp,
@@ -1795,20 +1792,21 @@ impl ControlPlane {
                     IpVersion::V4
                 };
                 // Group ids are OutboundIndex::UserBase + group index.
-                let group_name = config_for_push.try_read().ok().and_then(|c| {
+                let group = config_for_push.try_read().ok().and_then(|c| {
                     let idx = outbound_idx
                         .checked_sub(honk_ebpf_common::OutboundIndex::UserBase as u8)?;
-                    c.groups.get(idx as usize).map(|g| g.name.clone())
+                    c.groups.get(idx as usize).cloned()
                 });
-                let any_alive = match group_name {
-                    Some(name) => {
+                let any_alive = match group {
+                    Some(group) => {
                         let gm = group_manager_for_push.read().clone();
-                        // Leaf expansion matters here: member tags may name
-                        // nested sub-groups, which have no alive state of
-                        // their own — only real leaf nodes carry health.
-                        gm.leaf_nodes_in_group(&name)
-                            .iter()
-                            .any(|n| alive_for_push.is_alive_for(n.id, probe_domain, ip_version))
+                        reload::group_datapath_alive(
+                            &group,
+                            &gm,
+                            &alive_for_push,
+                            probe_domain,
+                            ip_version,
+                        )
                     }
                     // Unknown outbound: keep the datapath open (userspace
                     // makes the final decision anyway).

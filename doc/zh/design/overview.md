@@ -56,7 +56,7 @@ flowchart LR
 flowchart TB
   PACKET[LAN 转发或本机发起的 TCP/UDP] --> TC[TC 分类]
   TC -->|direct must 或路由时安全 direct| NATIVE[Linux 原生路径]
-  TC -->|block 或失活出站| DROP[丢弃]
+  TC -->|block 或执行 fail-closed 的失活出站| DROP[丢弃]
   TC -->|DNS :53 快速路径| DAE0[dae0]
   TC -->|proxy 或用户态决策| DAE0
   TC -->|有歧义的 LAN UDP，可选| NFQ[NFQUEUE 320]
@@ -91,8 +91,8 @@ flowchart TB
 - **NFQUEUE 就绪与所有权：** 启用但尚未 ready 时，只丢弃需要暂存的新流。honk 独占队列 `320` 和 nftables `inet honk_nfqueue` / `udp_decision`；ready 变更必须经过 fence，生命周期歧义为致命错误，同一 netns 的防火墙管理器不得修改这些对象。
 - **Token 校验终态：** 暂存 UDP token 必须在 skb mark、内核状态、handoff、redirect track、用户态 verdict 状态、lease/endpoint 和后端转换间一致。Direct 遵循 Arm → 全部带标记 verdict → Activate；proxy 在唯一的规范拨号/发送路径之前发布最终状态。
 - **`must`/`block` 终结性：** Clash 模式覆盖永远不会替换 `block` 结果或 dae `(must)` 结果。
-- **失活出站 fail-closed：** `lan_ingress` 丢弃路由到失活出站的新流。TCP 与 UDP 端口 `53` 例外；`honk-core` 在启动、重载和接口拓扑变化时注入 `dip(<每个 LAN/WAN 接口地址>) -> direct(must)`，使本机管理流量不依赖代理健康状态。
-- **组 OR 连通性：** 一个组的 eBPF alive slot 是全部叶子成员状态的 OR。单个成员失活不得使整个组 fail-closed。
+- **失活出站 fail-closed：** `lan_ingress` 丢弃路由到失活出站的新流。未配置 `final` 且只有一个唯一叶节点的 TCP 组会让同一代理继续作为用户态最后尝试；UDP 和全部叶节点失活的多叶节点组仍保持 fail-closed。TCP 与 UDP 端口 `53` 例外；`honk-core` 在启动、重载和接口拓扑变化时注入 `dip(<每个 LAN/WAN 接口地址>) -> direct(must)`，使本机管理流量不依赖代理健康状态。
+- **组 OR 连通性：** 一个组的 eBPF alive slot 是全部叶子成员状态的 OR，并包含上述单叶 TCP 最后尝试例外。多叶节点组中的单个成员失活不得使整个组 fail-closed。
 - **内部与特殊流量：** honk 自有 veth 网段 `169.254.0.0/16` 和 `fd00:686f:6e6b::/64` 永不代理。L2 广播/组播、IPv4 广播/组播/未指定目的地址以及 IPv6 组播会在路由或 conntrack 前直通。
 
 ## 构建 feature 与 mock 模式

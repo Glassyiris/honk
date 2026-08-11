@@ -24,7 +24,7 @@ facade 与内部实现按职责拆分：
 | `policy.rs` | Selector、URLTest、LoadBalance、Fallback 选择与延迟排名 |
 | `state.rs` | URLTest/Fallback 缓存、Selector 选择、空闲时间戳与回调 |
 
-选择遵循一个不变量：完成解析和存活性过滤后，拨号路径只使用策略选出的结果。Selector 返回其有效手动选择，URLTest 返回当前胜者，LoadBalance 返回下一个成员，Fallback 返回固定成员。唯一的多候选例外是尚无测量值的顶层 URLTest 组；已有测量值的 URLTest 和所有非 URLTest 计划都是权威的单叶节点计划。
+选择遵循一个不变量：完成解析和存活性过滤后，拨号路径只使用策略选出的结果。Selector 返回其有效手动选择，URLTest 返回当前胜者，LoadBalance 返回下一个成员，Fallback 返回固定成员。唯一的多候选例外是尚无测量值的顶层 URLTest 组；已有测量值的 URLTest 和所有非 URLTest 计划都是权威的单叶节点计划。若未配置 `final` 的组只有一个唯一叶节点，且 TCP 存活性过滤将其排除，该节点仍作为权威的最后尝试：健康状态仍是 dead，但真实拨号可以证明恢复，且不会泄漏到 `direct`。UDP 继续执行正常的存活性排除。
 
 ## 策略语义
 
@@ -90,7 +90,7 @@ facade 与内部实现按职责拆分：
 
 | 失败来源 | `Tcp` | `DnsUdp` | `DataUdp` |
 | --- | ---: | ---: | ---: |
-| 周期探测 | 1 | 3 | 3 |
+| 周期探测 | 3 | 3 | 3 |
 | 真实流量 | 10 | 3 | 50 |
 
 探测失败与流量失败使用独立计数器。探测失败应用从 5 秒到 300 秒的指数冷却。另一个 `min(5s, check_interval)` 恢复调度器只检查冷却已到期的死亡域/地址族状态；深度退避状态仍以 300 秒节奏继续探测，不会永久停止。

@@ -20,7 +20,7 @@ impl GroupManager {
         let candidates =
             self.filter_alive_candidates(candidates, domain, ipver, group.check_url.as_deref());
         if candidates.is_empty() {
-            return None;
+            return self.last_resort_tcp_leaf(group, domain);
         }
         let network = SelectionNetwork::from_probe_domain(domain);
         Some(match group.policy {
@@ -139,6 +139,24 @@ impl GroupManager {
         let mut visited: Vec<&str> = Vec::new();
         self.collect_leaf_nodes(group_name, 0, &mut visited, &mut out);
         out
+    }
+
+    /// Keep a sole TCP leaf dialable when probe health cannot choose an alternative.
+    /// A real dial can then prove recovery without leaking traffic to another outbound.
+    /// Explicit `final` fallbacks and UDP health remain authoritative.
+    pub(super) fn last_resort_tcp_leaf<'a>(
+        &'a self,
+        group: &'a Group,
+        domain: ProbeDomain,
+    ) -> Option<&'a Node> {
+        if domain != ProbeDomain::Tcp || group.final_outbound.is_some() {
+            return None;
+        }
+        let leaves = self.leaf_nodes_in_group(&group.name);
+        match leaves.as_slice() {
+            [node] => Some(*node),
+            _ => None,
+        }
     }
 
     fn collect_leaf_nodes<'a>(
