@@ -1739,7 +1739,6 @@ impl AnyTlsHandler {
         Ok(())
     }
 
-
     /// Keeps cancellation observable without opening a physical session.
     #[cfg(test)]
     async fn dial_udp_transport_speculative_with<F, Fut>(
