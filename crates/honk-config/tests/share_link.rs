@@ -554,9 +554,15 @@ fn test_vless_mode_query_rejects_duplicates() {
 
 #[test]
 fn test_rejects_vless_mode_on_other_protocols() {
-    let error = Node::from_share_link("trojan://password@example.com:443?vless_mode=h2mux#node")
-        .unwrap_err();
-    assert!(error.to_string().contains("only for VLESS"));
+    for query in ["vless_mode=h2mux", "packetEncoding=xudp"] {
+        let error =
+            Node::from_share_link(&format!("trojan://password@example.com:443?{query}#node"))
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("only for VLESS"),
+            "{query}: {error}"
+        );
+    }
 }
 
 #[test]
