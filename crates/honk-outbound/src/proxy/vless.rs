@@ -34,15 +34,19 @@
 
 use async_trait::async_trait;
 use bytes::{Buf, BytesMut};
-use honk_config::node::Node;
+use honk_config::node::{Node, WireMode};
 use parking_lot::RwLock;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use super::{AsyncReadWrite, ProbeableOutbound, ProxyStream, TcpOutbound};
+use super::{
+    AsyncReadWrite, MuxSession as _, PacketOutbound, PacketTransport, PreparedUdpTransport,
+    ProbeableOutbound, ProxyStream, TcpOutbound, WarmRequirement, WarmableOutbound,
+};
+use crate::session::{OpenError, SpeculativeCheckout};
 
 const VLESS_VERSION: u8 = 0x00;
 const CMD_TCP: u8 = 0x01;
@@ -112,7 +116,8 @@ impl VLessHandler {
 
     fn build_request_header(
         uuid_bytes: &[u8; 16],
-        target: SocketAddr,
+        command: u8,
+        target: Option<SocketAddr>,
         target_domain: Option<&str>,
         flow: Option<&str>,
     ) -> anyhow::Result<Vec<u8>> {
@@ -121,17 +126,29 @@ impl VLessHandler {
             Some("xtls-rprx-vision") => Some("xtls-rprx-vision"),
             Some(_) => anyhow::bail!("VLESS: unsupported flow"),
         };
+        anyhow::ensure!(
+            matches!(
+                (command, target),
+                (CMD_TCP, Some(_)) | (super::vless_cool::VLESS_MUX_COMMAND, None)
+            ),
+            "VLESS: invalid command target"
+        );
+        anyhow::ensure!(
+            target.is_some() || target_domain.is_none(),
+            "VLESS: command-Mux carries no target"
+        );
         let addon_len = flow.map_or(0, |flow| 2 + flow.len());
-        let encoded_address_len = match target_domain {
-            Some(domain) => {
+        let encoded_address_len = match (target, target_domain) {
+            (None, _) => 0,
+            (Some(_), Some(domain)) => {
                 anyhow::ensure!(
                     domain.len() <= u8::MAX as usize,
                     "VLESS: target domain exceeds 255 bytes"
                 );
                 1 + 1 + domain.len()
             }
-            None if target.is_ipv6() => 1 + 16,
-            None => 1 + 4,
+            (Some(target), None) if target.is_ipv6() => 1 + 16,
+            (Some(_), None) => 1 + 4,
         };
         let mut buf = Vec::with_capacity(1 + 16 + 1 + addon_len + 1 + 2 + encoded_address_len);
 
@@ -143,9 +160,11 @@ impl VLessHandler {
             buf.push(flow.len() as u8);
             buf.extend_from_slice(flow.as_bytes());
         }
-        buf.push(CMD_TCP);
+        buf.push(command);
+        let Some(target) = target else {
+            return Ok(buf);
+        };
         buf.extend_from_slice(&target.port().to_be_bytes());
-
         if let Some(domain) = target_domain {
             buf.push(ATYP_DOMAIN);
             buf.push(domain.len() as u8);
@@ -210,6 +229,318 @@ impl VLessHandler {
             Box::new(VisionStream::new(stripped, uuid))
         } else {
             Box::new(stripped)
+        }
+    }
+    async fn dial_carrier(
+        &self,
+        node: &Node,
+        uuid: [u8; 16],
+        header: Vec<u8>,
+        tcp: Option<TcpStream>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
+        let tcp = match tcp {
+            Some(tcp) => tcp,
+            None => {
+                let address = format!("{}:{}", node.host(), node.port);
+                crate::util::connect_outbound(&address, connect_timeout).await?
+            }
+        };
+        let mut stream = self.dial_stream(node, uuid, tcp).await?;
+        stream.write_all(&header).await?;
+        stream.flush().await?;
+        Ok(stream)
+    }
+
+    async fn dial_base(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        tcp: Option<TcpStream>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        let uuid_bytes = Self::parse_uuid(node.password.as_deref().unwrap_or(""))?;
+        let header = Self::build_request_header(
+            &uuid_bytes,
+            CMD_TCP,
+            Some(target),
+            target_domain,
+            node.flow.as_deref(),
+        )?;
+        let stream = self
+            .dial_carrier(node, uuid_bytes, header, tcp, connect_timeout)
+            .await?;
+        Ok(ProxyStream {
+            stream,
+            target_addr: target,
+            target_domain: target_domain.map(str::to_string),
+        })
+    }
+
+    async fn dial_mux_carrier(
+        &self,
+        node: &Node,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
+        let uuid = Self::parse_uuid(node.password.as_deref().unwrap_or(""))?;
+        let header = Self::build_request_header(
+            &uuid,
+            super::vless_cool::VLESS_MUX_COMMAND,
+            None,
+            None,
+            node.flow.as_deref(),
+        )?;
+        self.dial_carrier(node, uuid, header, None, connect_timeout)
+            .await
+    }
+
+    fn uses_mux_runtime(node: &Node) -> bool {
+        matches!(
+            node.vless_mode,
+            WireMode::H2mux | WireMode::H2muxPadded | WireMode::MuxCool
+        )
+    }
+
+    async fn dial_h2_session(
+        node: Arc<Node>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<Arc<super::vless_mux::VlessMuxSession>> {
+        let (target, domain) = super::vless_mux::physical_target();
+        let padded = node.vless_mode == WireMode::H2muxPadded;
+        let stream = Self::new()
+            .dial_base(&node, target, Some(domain), None, connect_timeout)
+            .await?
+            .stream;
+        super::vless_mux::connect(stream, padded).await
+    }
+
+    async fn open_h2_tcp(
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        let pool = runtime.vless_h2_pool()?;
+        let dial_node = Arc::clone(&runtime.node);
+        let domain = target_domain.map(str::to_string);
+        let stream = pool
+            .open_with(
+                move || {
+                    let node = Arc::clone(&dial_node);
+                    async move { Self::dial_h2_session(node, connect_timeout).await }
+                },
+                move |session, permit| {
+                    let domain = domain.clone();
+                    async move { session.open_stream(permit, target, domain.as_deref()).await }
+                },
+            )
+            .await?;
+        Ok(ProxyStream {
+            stream: Box::new(stream),
+            target_addr: target,
+            target_domain: target_domain.map(str::to_string),
+        })
+    }
+
+    async fn open_h2_udp(
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        let pool = runtime.vless_h2_pool()?;
+        let dial_node = Arc::clone(&runtime.node);
+        let domain = target_domain.map(str::to_string);
+        let transport = pool
+            .open_with(
+                move || {
+                    let node = Arc::clone(&dial_node);
+                    async move { Self::dial_h2_session(node, connect_timeout).await }
+                },
+                move |session, permit| {
+                    let domain = domain.clone();
+                    async move { session.open_packet(permit, target, domain.as_deref()).await }
+                },
+            )
+            .await?;
+        Ok(transport)
+    }
+
+    async fn dial_cool_session(
+        node: Arc<Node>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<Arc<super::vless_cool::VlessCoolSession>> {
+        let stream = Self::new().dial_mux_carrier(&node, connect_timeout).await?;
+        super::vless_cool::connect(stream).await
+    }
+
+    async fn open_cool_tcp(
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        let pool = runtime.vless_cool_pool()?;
+        let dial_node = Arc::clone(&runtime.node);
+        let domain = target_domain.map(str::to_string);
+        let stream = pool
+            .open_with(
+                move || {
+                    let node = Arc::clone(&dial_node);
+                    async move { Self::dial_cool_session(node, connect_timeout).await }
+                },
+                move |session, permit| {
+                    let domain = domain.clone();
+                    async move { session.open_stream(permit, target, domain.as_deref()).await }
+                },
+            )
+            .await?;
+        Ok(ProxyStream {
+            stream: Box::new(stream),
+            target_addr: target,
+            target_domain: target_domain.map(str::to_string),
+        })
+    }
+
+    async fn open_cool_udp(
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        let pool = runtime.vless_cool_pool()?;
+        let dial_node = Arc::clone(&runtime.node);
+        let domain = target_domain.map(str::to_string);
+        let transport = pool
+            .open_with(
+                move || {
+                    let node = Arc::clone(&dial_node);
+                    async move { Self::dial_cool_session(node, connect_timeout).await }
+                },
+                move |session, permit| {
+                    let domain = domain.clone();
+                    async move { session.open_packet(permit, target, domain.as_deref()).await }
+                },
+            )
+            .await?;
+        Ok(transport)
+    }
+
+    async fn prepare_mux_udp<S, Dial, DialFuture>(
+        pool: Arc<crate::session::SessionPool<S>>,
+        dial: Dial,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        retired_error: &'static str,
+    ) -> anyhow::Result<PreparedUdpTransport>
+    where
+        S: super::MuxSession,
+        Dial: FnOnce() -> DialFuture + Send,
+        DialFuture: std::future::Future<Output = anyhow::Result<Arc<S>>> + Send,
+    {
+        let domain = target_domain.map(str::to_string);
+        let mut dial = Some(dial);
+        let mut last_error = None;
+        for _ in 0..2 {
+            match pool.checkout_speculative().await? {
+                SpeculativeCheckout::Shared { session, permit } => {
+                    match session
+                        .clone()
+                        .open_packet(permit, target, domain.as_deref())
+                        .await
+                    {
+                        Ok(transport) => {
+                            let transport: Arc<dyn PacketTransport> = transport;
+                            return Ok(PreparedUdpTransport::ready(transport));
+                        }
+                        Err(OpenError::Refused(error)) => return Err(error),
+                        Err(OpenError::Draining(error)) => {
+                            crate::session::ManagedSession::begin_drain(session.as_ref());
+                            last_error = Some(error);
+                        }
+                        Err(OpenError::Session(error)) => {
+                            pool.invalidate(&session);
+                            last_error = Some(error);
+                        }
+                    }
+                }
+                SpeculativeCheckout::Detached(mut reservation) => {
+                    let dial = dial.take().expect("speculative dial runs at most once");
+                    let session = tokio::select! {
+                        result = dial() => result?,
+                        _ = reservation.cancelled() => anyhow::bail!(retired_error),
+                    };
+                    reservation.attach(&session)?;
+                    let permit = session
+                        .try_reserve()
+                        .ok_or_else(|| anyhow::anyhow!("new VLESS mux session has no capacity"))?;
+                    let transport = session
+                        .open_packet(permit, target, domain.as_deref())
+                        .await
+                        .map_err(Self::open_error)?;
+                    let transport: Arc<dyn PacketTransport> = transport;
+                    return Ok(PreparedUdpTransport::new(transport, move || async move {
+                        reservation.commit()?;
+                        Ok(())
+                    }));
+                }
+            }
+        }
+        Err(last_error.expect("shared mux open attempts record an error"))
+    }
+
+    async fn warm_mux_pool<S, Dial, DialFuture>(
+        pool: Arc<crate::session::SessionPool<S>>,
+        dial: Dial,
+        retired_error: &'static str,
+    ) -> anyhow::Result<()>
+    where
+        S: super::MuxSession,
+        Dial: FnOnce() -> DialFuture + Send,
+        DialFuture: std::future::Future<Output = anyhow::Result<Arc<S>>> + Send,
+    {
+        let mut last_error = None;
+        for _ in 0..2 {
+            match pool.checkout_speculative().await? {
+                SpeculativeCheckout::Shared { session, .. } => {
+                    match session.clone().check_ready().await {
+                        Ok(()) => return Ok(()),
+                        Err(OpenError::Refused(error)) => return Err(error),
+                        Err(OpenError::Draining(error)) => {
+                            crate::session::ManagedSession::begin_drain(session.as_ref());
+                            last_error = Some(error);
+                        }
+                        Err(OpenError::Session(error)) => {
+                            pool.invalidate(&session);
+                            last_error = Some(error);
+                        }
+                    }
+                }
+                SpeculativeCheckout::Detached(mut reservation) => {
+                    let session = tokio::select! {
+                        result = dial() => result?,
+                        _ = reservation.cancelled() => anyhow::bail!(retired_error),
+                    };
+                    reservation.attach(&session)?;
+                    session
+                        .clone()
+                        .check_ready()
+                        .await
+                        .map_err(Self::open_error)?;
+                    reservation.commit()?;
+                    return Ok(());
+                }
+            }
+        }
+        Err(last_error.expect("shared mux readiness attempts record an error"))
+    }
+
+    fn open_error(error: OpenError) -> anyhow::Error {
+        match error {
+            OpenError::Session(error) | OpenError::Draining(error) | OpenError::Refused(error) => {
+                error
+            }
         }
     }
 }
@@ -665,6 +996,107 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for VisionStream<S> {
     }
 }
 
+struct VlessUotReader {
+    stream: tokio::io::ReadHalf<Box<dyn AsyncReadWrite>>,
+    decoder: super::uot::Decoder,
+}
+
+struct VlessUotWriter {
+    stream: tokio::io::WriteHalf<Box<dyn AsyncReadWrite>>,
+    setup: Option<bytes::Bytes>,
+    pending: bool,
+}
+
+struct VlessUotTransport {
+    reader: tokio::sync::Mutex<VlessUotReader>,
+    writer: tokio::sync::Mutex<VlessUotWriter>,
+    target: SocketAddr,
+}
+
+impl VlessUotTransport {
+    fn new(stream: Box<dyn AsyncReadWrite>, target: SocketAddr, setup: bytes::Bytes) -> Self {
+        let (reader, writer) = tokio::io::split(stream);
+        Self {
+            reader: tokio::sync::Mutex::new(VlessUotReader {
+                stream: reader,
+                decoder: super::uot::Decoder::default(),
+            }),
+            writer: tokio::sync::Mutex::new(VlessUotWriter {
+                stream: writer,
+                setup: Some(setup),
+                pending: false,
+            }),
+            target,
+        }
+    }
+
+    async fn send(&self, data: &[u8]) -> std::io::Result<()> {
+        let packet = super::uot::encode_packet(data, super::uot::MAX_PACKET_SIZE)?;
+        let mut writer = self.writer.lock().await;
+        if writer.pending {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "VLESS UoT write was interrupted",
+            ));
+        }
+        let frame = if let Some(setup) = writer.setup.as_ref() {
+            let mut frame = bytes::BytesMut::with_capacity(setup.len() + packet.len());
+            frame.extend_from_slice(setup);
+            frame.extend_from_slice(&packet);
+            frame.freeze()
+        } else {
+            packet
+        };
+        writer.pending = true;
+        writer.stream.write_all(&frame).await?;
+        writer.stream.flush().await?;
+        writer.setup = None;
+        writer.pending = false;
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for VlessUotTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VlessUotTransport")
+            .field("target", &self.target)
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl PacketTransport for VlessUotTransport {
+    fn relay_addr(&self) -> SocketAddr {
+        self.target
+    }
+
+    async fn send_packet(&self, data: &[u8]) -> std::io::Result<()> {
+        self.send(data).await
+    }
+
+    async fn send_packet_confirmed(&self, data: &[u8]) -> std::io::Result<()> {
+        self.send(data).await
+    }
+
+    async fn recv_packet(&self, output: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        let mut reader = self.reader.lock().await;
+        loop {
+            if let Some(size) = reader.decoder.next_packet(output)? {
+                return Ok((size, self.target));
+            }
+            let mut chunk = [0; 16 * 1024];
+            let size = reader.stream.read(&mut chunk).await?;
+            if size == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "VLESS UoT stream closed",
+                ));
+            }
+            reader.decoder.push(&chunk[..size])?;
+        }
+    }
+}
+
 #[async_trait]
 impl TcpOutbound for VLessHandler {
     async fn dial(
@@ -674,22 +1106,26 @@ impl TcpOutbound for VLessHandler {
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let uuid_str = node.password.as_deref().unwrap_or("");
-        let uuid_bytes = Self::parse_uuid(uuid_str)?;
-
-        let header =
-            Self::build_request_header(&uuid_bytes, target, target_domain, node.flow.as_deref())?;
-        let addr = format!("{}:{}", node.host(), node.port);
-        let tcp = crate::util::connect_outbound(&addr, connect_timeout).await?;
-        let mut stream = self.dial_stream(node, uuid_bytes, tcp).await?;
-        stream.write_all(&header).await?;
-        stream.flush().await?;
-
-        Ok(ProxyStream {
-            stream,
-            target_addr: target,
-            target_domain: target_domain.map(|s| s.to_string()),
-        })
+        match node.vless_mode {
+            WireMode::H2mux | WireMode::H2muxPadded => {
+                let owner = crate::runtime::NodeRuntime::ephemeral_guarded(node);
+                let stream =
+                    Self::open_h2_tcp(owner.runtime(), target, target_domain, connect_timeout)
+                        .await?;
+                Ok(stream.with_owner(owner))
+            }
+            WireMode::MuxCool => {
+                let owner = crate::runtime::NodeRuntime::ephemeral_guarded(node);
+                let stream =
+                    Self::open_cool_tcp(owner.runtime(), target, target_domain, connect_timeout)
+                        .await?;
+                Ok(stream.with_owner(owner))
+            }
+            WireMode::Legacy | WireMode::UotV2 | WireMode::Xudp => {
+                self.dial_base(node, target, target_domain, None, connect_timeout)
+                    .await
+            }
+        }
     }
 
     async fn dial_with_tcp(
@@ -698,22 +1134,184 @@ impl TcpOutbound for VLessHandler {
         target: SocketAddr,
         target_domain: Option<&str>,
         tcp: TcpStream,
-        _connect_timeout: std::time::Duration,
+        connect_timeout: std::time::Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let uuid_str = node.password.as_deref().unwrap_or("");
-        let uuid_bytes = Self::parse_uuid(uuid_str)?;
+        if Self::uses_mux_runtime(node) {
+            anyhow::bail!("VLESS mux cannot use a bare pooled TCP connection");
+        }
+        self.dial_base(node, target, target_domain, Some(tcp), connect_timeout)
+            .await
+    }
 
-        let header =
-            Self::build_request_header(&uuid_bytes, target, target_domain, node.flow.as_deref())?;
-        let mut stream = self.dial_stream(node, uuid_bytes, tcp).await?;
-        stream.write_all(&header).await?;
-        stream.flush().await?;
+    async fn dial_runtime(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        match runtime.node.vless_mode {
+            WireMode::H2mux | WireMode::H2muxPadded => {
+                Self::open_h2_tcp(runtime, target, target_domain, connect_timeout).await
+            }
+            WireMode::MuxCool => {
+                Self::open_cool_tcp(runtime, target, target_domain, connect_timeout).await
+            }
+            WireMode::Legacy | WireMode::UotV2 | WireMode::Xudp => {
+                self.dial_base(&runtime.node, target, target_domain, None, connect_timeout)
+                    .await
+            }
+        }
+    }
+}
 
-        Ok(ProxyStream {
-            stream,
-            target_addr: target,
-            target_domain: target_domain.map(|s| s.to_string()),
-        })
+#[async_trait]
+impl PacketOutbound for VLessHandler {
+    async fn dial_udp_transport(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        if !crate::descriptor::network_allows_udp(node) {
+            anyhow::bail!("VLESS node '{}' disables UDP", node.name);
+        }
+        match node.vless_mode {
+            WireMode::Legacy => anyhow::bail!(
+                "VLESS UDP requires uot-v2, xudp, h2mux, h2mux-padded, or mux-cool mode"
+            ),
+            WireMode::UotV2 => {
+                let setup = super::uot::connect_request(target, target_domain)?;
+                let magic_target = SocketAddr::from(([0, 0, 0, 0], 0));
+                let stream = self
+                    .dial_base(
+                        node,
+                        magic_target,
+                        Some(super::uot::MAGIC_ADDRESS),
+                        None,
+                        connect_timeout,
+                    )
+                    .await?
+                    .stream;
+                Ok(Arc::new(VlessUotTransport::new(stream, target, setup)))
+            }
+            WireMode::Xudp => {
+                let stream = self.dial_mux_carrier(node, connect_timeout).await?;
+                Ok(super::vless_cool::connect_single_xudp(stream, target, target_domain).await?)
+            }
+            WireMode::H2mux | WireMode::H2muxPadded => {
+                let owner = crate::runtime::NodeRuntime::ephemeral_guarded(node);
+                let transport =
+                    Self::open_h2_udp(owner.runtime(), target, target_domain, connect_timeout)
+                        .await?;
+                Ok(super::packet_transport_with_owner(transport, owner))
+            }
+            WireMode::MuxCool => {
+                let owner = crate::runtime::NodeRuntime::ephemeral_guarded(node);
+                let transport =
+                    Self::open_cool_udp(owner.runtime(), target, target_domain, connect_timeout)
+                        .await?;
+                Ok(super::packet_transport_with_owner(transport, owner))
+            }
+        }
+    }
+
+    async fn dial_udp_transport_runtime(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        match runtime.node.vless_mode {
+            WireMode::H2mux | WireMode::H2muxPadded => {
+                Self::open_h2_udp(runtime, target, target_domain, connect_timeout).await
+            }
+            WireMode::MuxCool => {
+                Self::open_cool_udp(runtime, target, target_domain, connect_timeout).await
+            }
+            WireMode::Legacy | WireMode::UotV2 | WireMode::Xudp => {
+                self.dial_udp_transport(&runtime.node, target, target_domain, connect_timeout)
+                    .await
+            }
+        }
+    }
+
+    async fn dial_udp_transport_speculative_runtime(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<PreparedUdpTransport> {
+        match runtime.node.vless_mode {
+            WireMode::H2mux | WireMode::H2muxPadded => {
+                let pool = runtime.vless_h2_pool()?;
+                let node = Arc::clone(&runtime.node);
+                Self::prepare_mux_udp(
+                    pool,
+                    move || Self::dial_h2_session(node, connect_timeout),
+                    target,
+                    target_domain,
+                    "VLESS H2MUX pool retired during speculative dial",
+                )
+                .await
+            }
+            WireMode::MuxCool => {
+                let pool = runtime.vless_cool_pool()?;
+                let node = Arc::clone(&runtime.node);
+                Self::prepare_mux_udp(
+                    pool,
+                    move || Self::dial_cool_session(node, connect_timeout),
+                    target,
+                    target_domain,
+                    "VLESS Mux.Cool pool retired during speculative dial",
+                )
+                .await
+            }
+            WireMode::Legacy | WireMode::UotV2 | WireMode::Xudp => self
+                .dial_udp_transport_runtime(runtime, target, target_domain, connect_timeout)
+                .await
+                .map(PreparedUdpTransport::ready),
+        }
+    }
+}
+
+#[async_trait]
+impl WarmableOutbound for VLessHandler {
+    async fn warm(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        connect_timeout: std::time::Duration,
+        _requirement: WarmRequirement,
+    ) -> anyhow::Result<()> {
+        match runtime.node.vless_mode {
+            WireMode::H2mux | WireMode::H2muxPadded => {
+                let pool = runtime.vless_h2_pool()?;
+                let node = Arc::clone(&runtime.node);
+                Self::warm_mux_pool(
+                    pool,
+                    move || Self::dial_h2_session(node, connect_timeout),
+                    "VLESS H2MUX pool retired during warm-up",
+                )
+                .await?;
+            }
+            WireMode::MuxCool => {
+                let pool = runtime.vless_cool_pool()?;
+                let node = Arc::clone(&runtime.node);
+                Self::warm_mux_pool(
+                    pool,
+                    move || Self::dial_cool_session(node, connect_timeout),
+                    "VLESS Mux.Cool pool retired during warm-up",
+                )
+                .await?;
+            }
+            WireMode::Legacy | WireMode::UotV2 | WireMode::Xudp => {
+                anyhow::bail!("VLESS mode has no warmable runtime")
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1210,13 +1808,623 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn direct_uot_is_lazy_and_preserves_datagrams() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (lazy_tx, lazy_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = [0; 23];
+            stream.read_exact(&mut head).await.unwrap();
+            assert_eq!(head[18], CMD_TCP);
+            assert_eq!(&head[19..21], &[0, 0]);
+            assert_eq!(head[21], ATYP_DOMAIN);
+            assert_eq!(head[22] as usize, super::super::uot::MAGIC_ADDRESS.len());
+            let mut magic = vec![0; head[22] as usize];
+            stream.read_exact(&mut magic).await.unwrap();
+            assert_eq!(magic, super::super::uot::MAGIC_ADDRESS.as_bytes());
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(20), stream.read_u8())
+                    .await
+                    .is_err(),
+                "UoT setup must wait for the first datagram"
+            );
+            lazy_tx.send(()).unwrap();
+
+            let mut request = [0; 8];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(request, [1, ATYP_IPV4, 8, 8, 8, 8, 0, 53]);
+            let mut packet = [0; 5];
+            stream.read_exact(&mut packet).await.unwrap();
+            assert_eq!(&packet, b"\0\x03dns");
+
+            let mut response = vec![0, 0];
+            response.extend_from_slice(
+                &super::super::uot::encode_packet(b"first", super::super::uot::MAX_PACKET_SIZE)
+                    .unwrap(),
+            );
+            response.extend_from_slice(
+                &super::super::uot::encode_packet(b"second", super::super::uot::MAX_PACKET_SIZE)
+                    .unwrap(),
+            );
+            stream.write_all(&response).await.unwrap();
+        });
+
+        let node = Node {
+            name: "vless-uot".into(),
+            protocol: NodeProtocol::VLess,
+            address: format!("127.0.0.1:{port}"),
+            host: "127.0.0.1".into(),
+            port,
+            password: Some("b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3".into()),
+            vless_mode: WireMode::UotV2,
+            ..Default::default()
+        };
+        let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let transport = VLessHandler::new()
+            .dial_udp_transport(&node, target, None, std::time::Duration::from_secs(3))
+            .await
+            .unwrap();
+        lazy_rx.await.unwrap();
+        assert_eq!(transport.relay_addr(), target);
+        transport.send_packet_confirmed(b"dns").await.unwrap();
+
+        let error = transport.recv_packet(&mut [0; 1]).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        let mut output = [0; 8];
+        assert_eq!(
+            transport.recv_packet(&mut output).await.unwrap(),
+            (5, target)
+        );
+        assert_eq!(&output[..5], b"first");
+        assert_eq!(
+            transport.recv_packet(&mut output).await.unwrap(),
+            (6, target)
+        );
+        assert_eq!(&output[..6], b"second");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_mux_warm_dial_does_not_outlive_its_caller() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let node = Arc::new(Node {
+            name: "vless-h2mux-cancel".into(),
+            protocol: NodeProtocol::VLess,
+            address: format!("127.0.0.1:{port}"),
+            host: "127.0.0.1".into(),
+            port,
+            password: Some("b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3".into()),
+            vless_mode: WireMode::H2mux,
+            ..Default::default()
+        });
+        let pool = Arc::new(crate::session::SessionPool::new(
+            super::super::vless_mux::session_pool_config(),
+        ));
+        let warming = {
+            let pool = Arc::clone(&pool);
+            tokio::spawn(VLessHandler::warm_mux_pool(
+                pool,
+                move || VLessHandler::dial_h2_session(node, std::time::Duration::from_secs(3)),
+                "retired",
+            ))
+        };
+        let (accepted, _) = listener.accept().await.unwrap();
+        warming.abort();
+        assert!(warming.await.unwrap_err().is_cancelled());
+
+        let checkout = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            pool.checkout_speculative(),
+        )
+        .await
+        .expect("cancelled warm dial retained the pool reservation")
+        .unwrap();
+        assert!(matches!(checkout, SpeculativeCheckout::Detached(_)));
+        drop(accepted);
+        pool.shutdown();
+    }
+
+    #[tokio::test]
+    async fn h2mux_tcp_and_udp_share_one_vless_carrier() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = [0; 23];
+            stream.read_exact(&mut head).await.unwrap();
+            assert_eq!(head[18], CMD_TCP);
+            assert_eq!(&head[19..21], &444u16.to_be_bytes());
+            assert_eq!(head[21], ATYP_DOMAIN);
+            let mut domain = vec![0; head[22] as usize];
+            stream.read_exact(&mut domain).await.unwrap();
+            assert_eq!(domain, b"sp.mux.sing-box.arpa");
+            stream.write_all(&[0, 0]).await.unwrap();
+            let mut mux = [0; 2];
+            stream.read_exact(&mut mux).await.unwrap();
+            assert_eq!(mux, [0, 2]);
+
+            let mut connection = h2::server::handshake(stream).await.unwrap();
+            let mut handlers = tokio::task::JoinSet::new();
+            for _ in 0..2 {
+                let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+                handlers.spawn(async move {
+                    assert_eq!(request.method(), http::Method::CONNECT);
+                    assert_eq!(request.uri().authority().unwrap().as_str(), "localhost");
+                    let mut send = respond
+                        .send_response(http::Response::new(()), false)
+                        .unwrap();
+                    let mut recv = request.into_body();
+                    let mut body = bytes::BytesMut::new();
+                    while body.len() < 9 {
+                        let data = recv.data().await.unwrap().unwrap();
+                        let size = data.len();
+                        body.extend_from_slice(&data);
+                        recv.flow_control().release_capacity(size).unwrap();
+                    }
+                    match u16::from_be_bytes([body[0], body[1]]) {
+                        0 => {
+                            assert_eq!(&body[2..9], &[1, 93, 184, 216, 34, 1, 187]);
+                            send.send_data(bytes::Bytes::from_static(b"\0hello"), false)
+                                .unwrap();
+                            while body.len() < 13 {
+                                let data = recv.data().await.unwrap().unwrap();
+                                let size = data.len();
+                                body.extend_from_slice(&data);
+                                recv.flow_control().release_capacity(size).unwrap();
+                            }
+                            assert_eq!(&body[9..13], b"ping");
+                            send.send_data(bytes::Bytes::from_static(b"pong"), true)
+                                .unwrap();
+                        }
+                        1 => {
+                            assert_eq!(&body[2..9], &[1, 8, 8, 8, 8, 0, 53]);
+                            while body.len() < 14 {
+                                let data = recv.data().await.unwrap().unwrap();
+                                let size = data.len();
+                                body.extend_from_slice(&data);
+                                recv.flow_control().release_capacity(size).unwrap();
+                            }
+                            assert_eq!(&body[9..14], b"\0\x03dns");
+                            let packet = super::super::uot::encode_packet(
+                                b"answer",
+                                super::super::uot::MAX_PACKET_SIZE,
+                            )
+                            .unwrap();
+                            let mut response = bytes::BytesMut::with_capacity(1 + packet.len());
+                            response.extend_from_slice(&[0]);
+                            response.extend_from_slice(&packet);
+                            send.send_data(response.freeze(), true).unwrap();
+                        }
+                        flags => panic!("unexpected mux flags {flags}"),
+                    }
+                });
+            }
+            while !handlers.is_empty() {
+                tokio::select! {
+                    result = handlers.join_next() => result.unwrap().unwrap(),
+                    stream = connection.accept() => assert!(stream.is_none()),
+                }
+            }
+            while connection.accept().await.is_some() {}
+        });
+
+        let node = Node {
+            id: uuid::Uuid::new_v4(),
+            name: "vless-h2mux".into(),
+            protocol: NodeProtocol::VLess,
+            address: format!("127.0.0.1:{port}"),
+            host: "127.0.0.1".into(),
+            port,
+            password: Some("b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3".into()),
+            vless_mode: WireMode::H2mux,
+            ..Default::default()
+        };
+        let generation = Arc::new(
+            crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
+        );
+        let registry = super::super::ProxyRegistry::default_resolver().unwrap();
+        assert_eq!(
+            registry
+                .warm_session(
+                    Arc::clone(&generation),
+                    node.id,
+                    std::time::Duration::from_secs(3),
+                )
+                .await
+                .unwrap(),
+            super::super::WarmOutcome::Ready
+        );
+        assert_eq!(
+            registry
+                .warm_udp(
+                    Arc::clone(&generation),
+                    node.id,
+                    std::time::Duration::from_secs(3),
+                )
+                .await
+                .unwrap(),
+            super::super::WarmOutcome::Ready
+        );
+        let runtime = generation.get(&node.id).unwrap();
+        let pool = runtime.vless_h2_pool().unwrap();
+        assert_eq!(pool.live_session_count(), 1);
+        let (replacement, moved) = crate::runtime::OutboundRuntimeRegistry::build_reusing(
+            std::slice::from_ref(&node),
+            8,
+            Some(&generation),
+        )
+        .unwrap();
+        assert!(moved.contains(&node.id));
+        let replacement = Arc::new(replacement);
+        generation.mark_moved_out(moved);
+        generation.drain_session_pools();
+        generation.shutdown().await;
+        assert_eq!(pool.live_session_count(), 1);
+        let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let mut tcp = registry
+            .dial_runtime(
+                Arc::clone(&replacement),
+                node.id,
+                target,
+                None,
+                std::time::Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+        let mut greeting = [0; 5];
+        tcp.stream.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(&greeting, b"hello");
+        tcp.stream.write_all(b"ping").await.unwrap();
+        let mut pong = [0; 4];
+        tcp.stream.read_exact(&mut pong).await.unwrap();
+        assert_eq!(&pong, b"pong");
+
+        let udp_target: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let udp = registry
+            .dial_udp_transport_runtime(
+                Arc::clone(&replacement),
+                node.id,
+                udp_target,
+                None,
+                std::time::Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+        udp.send_packet_confirmed(b"dns").await.unwrap();
+        let mut answer = [0; 16];
+        assert_eq!(udp.recv_packet(&mut answer).await.unwrap(), (6, udp_target));
+        assert_eq!(&answer[..6], b"answer");
+        assert_eq!(pool.live_session_count(), 1);
+
+        drop(udp);
+        drop(tcp);
+        runtime
+            .release_warm(crate::runtime::WarmRetention::Selector)
+            .await;
+        assert!(pool.is_warm_retained());
+        runtime
+            .release_warm(crate::runtime::WarmRetention::Udp)
+            .await;
+        assert!(!pool.is_warm_retained());
+        assert_eq!(pool.live_session_count(), 0);
+        replacement.shutdown().await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the official sing-box and Xray executables"]
+    async fn official_sing_box_and_xray_mux_interop() {
+        async fn unused_port() -> u16 {
+            tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port()
+        }
+
+        async fn exercise(
+            registry: &super::super::ProxyRegistry,
+            mut node: Node,
+            tcp_target: SocketAddr,
+            udp_target: SocketAddr,
+        ) {
+            eprintln!("testing {}", node.name);
+            node.id = node.derive_id();
+            let generation = Arc::new(
+                crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node))
+                    .unwrap(),
+            );
+            let timeout = std::time::Duration::from_secs(5);
+            let mut tcp = registry
+                .dial_runtime(Arc::clone(&generation), node.id, tcp_target, None, timeout)
+                .await
+                .unwrap();
+            tcp.stream.write_all(node.name.as_bytes()).await.unwrap();
+            let mut echoed = vec![0; node.name.len()];
+            tcp.stream.read_exact(&mut echoed).await.unwrap();
+            assert_eq!(echoed, node.name.as_bytes());
+
+            let udp = registry
+                .dial_udp_transport_runtime(
+                    Arc::clone(&generation),
+                    node.id,
+                    udp_target,
+                    None,
+                    timeout,
+                )
+                .await
+                .unwrap();
+            udp.send_packet_confirmed(node.name.as_bytes())
+                .await
+                .unwrap();
+            let mut echoed = [0; 64];
+            let (size, peer) = udp.recv_packet(&mut echoed).await.unwrap();
+            assert_eq!(peer, udp_target);
+            assert_eq!(&echoed[..size], node.name.as_bytes());
+            drop(udp);
+            drop(tcp);
+            generation.shutdown().await;
+        }
+
+        let tcp_echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_target = tcp_echo.local_addr().unwrap();
+        let tcp_echo_task = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = tcp_echo.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buffer = [0; 1024];
+                    loop {
+                        let size = stream.read(&mut buffer).await.unwrap();
+                        if size == 0 {
+                            break;
+                        }
+                        stream.write_all(&buffer[..size]).await.unwrap();
+                    }
+                });
+            }
+        });
+        let udp_echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_target = udp_echo.local_addr().unwrap();
+        let udp_echo_task = tokio::spawn(async move {
+            let mut buffer = [0; 65535];
+            loop {
+                let (size, peer) = udp_echo.recv_from(&mut buffer).await.unwrap();
+                udp_echo.send_to(&buffer[..size], peer).await.unwrap();
+            }
+        });
+
+        let plain_port = unused_port().await;
+        let tls_port = unused_port().await;
+        let reality_port = unused_port().await;
+        let xray_port = unused_port().await;
+        let xray_vision_port = unused_port().await;
+        let directory = std::env::temp_dir().join(format!(
+            "honk-vless-sing-box-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let cert_path = directory.join("cert.pem");
+        let key_path = directory.join("key.pem");
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key.serialize_pem()).unwrap();
+        let config_path = directory.join("config.json");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"{{
+  "log": {{ "level": "warn" }},
+  "inbounds": [
+    {{ "type": "vless", "tag": "plain", "listen": "127.0.0.1", "listen_port": {plain_port}, "users": [{{ "uuid": "b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3" }}], "multiplex": {{ "enabled": true }} }},
+    {{ "type": "vless", "tag": "tls", "listen": "127.0.0.1", "listen_port": {tls_port}, "users": [{{ "uuid": "b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3" }}], "multiplex": {{ "enabled": true }}, "tls": {{ "enabled": true, "server_name": "localhost", "certificate_path": "{}", "key_path": "{}" }} }},
+    {{ "type": "vless", "tag": "reality", "listen": "127.0.0.1", "listen_port": {reality_port}, "users": [{{ "uuid": "b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3" }}], "multiplex": {{ "enabled": true }}, "tls": {{ "enabled": true, "server_name": "www.cloudflare.com", "reality": {{ "enabled": true, "handshake": {{ "server": "www.cloudflare.com", "server_port": 443 }}, "private_key": "GCrdIerhJnsv8UEGgVcP6Gpf_d13pziIcua09rRDqEA", "short_id": ["0123456789abcdef"] }} }} }}
+  ],
+  "outbounds": [{{ "type": "direct", "tag": "direct" }}],
+  "route": {{ "final": "direct" }}
+}}"#,
+                cert_path.display(),
+                key_path.display()
+            ),
+        )
+        .unwrap();
+        let xray_config_path = directory.join("xray.json");
+        std::fs::write(
+            &xray_config_path,
+            format!(
+                r#"{{
+  "log": {{ "loglevel": "warning" }},
+  "inbounds": [{{
+    "tag": "vless",
+    "listen": "127.0.0.1",
+    "port": {xray_port},
+    "protocol": "vless",
+    "settings": {{ "clients": [{{ "id": "b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3" }}], "decryption": "none" }},
+    "streamSettings": {{ "network": "tcp", "security": "none" }}
+  }}, {{
+    "tag": "vless-vision",
+    "listen": "127.0.0.1",
+    "port": {xray_vision_port},
+    "protocol": "vless",
+    "settings": {{ "clients": [{{ "id": "b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3", "flow": "xtls-rprx-vision" }}], "decryption": "none" }},
+    "streamSettings": {{ "network": "tcp", "security": "tls", "tlsSettings": {{ "certificates": [{{ "certificateFile": "{}", "keyFile": "{}" }}] }} }}
+  }}],
+  "outbounds": [{{ "tag": "direct", "protocol": "freedom" }}]
+}}"#,
+                cert_path.display(),
+                key_path.display()
+            ),
+        )
+        .unwrap();
+        let mut sing_box = tokio::process::Command::new("sing-box")
+            .args(["run", "--disable-color", "-c"])
+            .arg(&config_path)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut ready = false;
+        for _ in 0..100 {
+            assert!(sing_box.try_wait().unwrap().is_none(), "sing-box exited");
+            if tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, plain_port))
+                .await
+                .is_ok()
+            {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(ready, "sing-box did not bind its VLESS listeners");
+
+        let registry = super::super::ProxyRegistry::default_resolver().unwrap();
+        let base = Node {
+            protocol: NodeProtocol::VLess,
+            host: "127.0.0.1".into(),
+            password: Some("b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3".into()),
+            ..Default::default()
+        };
+        for (name, mode) in [
+            ("uot-v2", WireMode::UotV2),
+            ("xudp", WireMode::Xudp),
+            ("h2mux", WireMode::H2mux),
+            ("h2mux-padded", WireMode::H2muxPadded),
+            ("mux-cool", WireMode::MuxCool),
+        ] {
+            exercise(
+                &registry,
+                Node {
+                    name: name.into(),
+                    address: format!("127.0.0.1:{plain_port}"),
+                    port: plain_port,
+                    vless_mode: mode,
+                    ..base.clone()
+                },
+                tcp_target,
+                udp_target,
+            )
+            .await;
+        }
+        exercise(
+            &registry,
+            Node {
+                name: "h2mux-tls".into(),
+                address: format!("127.0.0.1:{tls_port}"),
+                port: tls_port,
+                tls: true,
+                skip_cert_verify: true,
+                sni: Some("localhost".into()),
+                vless_mode: WireMode::H2mux,
+                ..base.clone()
+            },
+            tcp_target,
+            udp_target,
+        )
+        .await;
+        exercise(
+            &registry,
+            Node {
+                name: "h2mux-reality".into(),
+                address: format!("127.0.0.1:{reality_port}"),
+                port: reality_port,
+                tls: true,
+                sni: Some("www.cloudflare.com".into()),
+                reality_public_key: Some("pYbbKZZ-9WsXODEENCcbisSN6ol6sx5GoVisiyN1oyo".into()),
+                reality_short_id: Some("0123456789abcdef".into()),
+                reality_spider_x: Some("/".into()),
+                vless_mode: WireMode::H2muxPadded,
+                ..base.clone()
+            },
+            tcp_target,
+            udp_target,
+        )
+        .await;
+
+        let xray_bin = std::env::var_os("HONK_XRAY_BIN").unwrap_or_else(|| "xray".into());
+        let mut xray = tokio::process::Command::new(xray_bin)
+            .args(["run", "-c"])
+            .arg(&xray_config_path)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut ready = false;
+        for _ in 0..100 {
+            assert!(xray.try_wait().unwrap().is_none(), "Xray exited");
+            if tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, xray_port))
+                .await
+                .is_ok()
+            {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(ready, "Xray did not bind its VLESS listener");
+        for (name, mode) in [
+            ("xray-xudp", WireMode::Xudp),
+            ("xray-mux-cool", WireMode::MuxCool),
+        ] {
+            exercise(
+                &registry,
+                Node {
+                    name: name.into(),
+                    address: format!("127.0.0.1:{xray_port}"),
+                    port: xray_port,
+                    vless_mode: mode,
+                    ..base.clone()
+                },
+                tcp_target,
+                udp_target,
+            )
+            .await;
+        }
+        exercise(
+            &registry,
+            Node {
+                name: "xray-xudp-vision".into(),
+                address: format!("127.0.0.1:{xray_vision_port}"),
+                port: xray_vision_port,
+                tls: true,
+                skip_cert_verify: true,
+                sni: Some("localhost".into()),
+                flow: Some("xtls-rprx-vision".into()),
+                vless_mode: WireMode::Xudp,
+                ..base.clone()
+            },
+            tcp_target,
+            udp_target,
+        )
+        .await;
+
+        xray.start_kill().unwrap();
+        xray.wait().await.unwrap();
+
+        sing_box.start_kill().unwrap();
+        sing_box.wait().await.unwrap();
+        tcp_echo_task.abort();
+        udp_echo_task.abort();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn test_vless_header_ipv4() {
         let uuid_str = "b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3";
         let uuid_bytes = VLessHandler::parse_uuid(uuid_str).unwrap();
         let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
 
-        let header = VLessHandler::build_request_header(&uuid_bytes, target, None, None).unwrap();
+        let header =
+            VLessHandler::build_request_header(&uuid_bytes, CMD_TCP, Some(target), None, None)
+                .unwrap();
 
         // ver(1) + uuid(16) + addon_len(1) + cmd(1) + port(2) + atyp(1) + addr(4)
         assert_eq!(header.len(), 1 + 16 + 1 + 1 + 2 + 1 + 4);
@@ -1236,8 +2444,14 @@ mod tests {
         let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
         let domain = "example.com";
 
-        let header =
-            VLessHandler::build_request_header(&uuid_bytes, target, Some(domain), None).unwrap();
+        let header = VLessHandler::build_request_header(
+            &uuid_bytes,
+            CMD_TCP,
+            Some(target),
+            Some(domain),
+            None,
+        )
+        .unwrap();
 
         // ver(1) + uuid(16) + addon_len(1) + cmd(1) + port(2) + atyp(1) + domain_len(1) + domain(11)
         assert_eq!(header.len(), 1 + 16 + 1 + 1 + 2 + 1 + 1 + domain.len());
@@ -1257,7 +2471,9 @@ mod tests {
         let uuid_bytes = VLessHandler::parse_uuid(uuid_str).unwrap();
         let target: SocketAddr = "[::1]:1080".parse().unwrap();
 
-        let header = VLessHandler::build_request_header(&uuid_bytes, target, None, None).unwrap();
+        let header =
+            VLessHandler::build_request_header(&uuid_bytes, CMD_TCP, Some(target), None, None)
+                .unwrap();
 
         // ver(1) + uuid(16) + addon_len(1) + cmd(1) + port(2) + atyp(1) + addr(16)
         assert_eq!(header.len(), 1 + 16 + 1 + 1 + 2 + 1 + 16);
@@ -1273,14 +2489,46 @@ mod tests {
     }
 
     #[test]
+    fn vless_mux_command_carries_no_target() {
+        let uuid = VLessHandler::parse_uuid("b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3").unwrap();
+        let header = VLessHandler::build_request_header(
+            &uuid,
+            super::super::vless_cool::VLESS_MUX_COMMAND,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(header.len(), 19);
+        assert_eq!(header[18], super::super::vless_cool::VLESS_MUX_COMMAND);
+
+        let target = Some("127.0.0.1:9527".parse().unwrap());
+        assert!(
+            VLessHandler::build_request_header(
+                &uuid,
+                super::super::vless_cool::VLESS_MUX_COMMAND,
+                target,
+                None,
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn test_vless_header_vision_flow() {
         let uuid_str = "b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3";
         let uuid_bytes = VLessHandler::parse_uuid(uuid_str).unwrap();
         let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
 
-        let header =
-            VLessHandler::build_request_header(&uuid_bytes, target, None, Some("xtls-rprx-vision"))
-                .unwrap();
+        let header = VLessHandler::build_request_header(
+            &uuid_bytes,
+            CMD_TCP,
+            Some(target),
+            None,
+            Some("xtls-rprx-vision"),
+        )
+        .unwrap();
 
         // ver(1) + uuid(16) + addon_len(1) + addon(18) + cmd(1) + port(2) + atyp(1) + addr(4)
         assert_eq!(header.len(), 1 + 16 + 1 + 18 + 1 + 2 + 1 + 4);
@@ -1300,22 +2548,33 @@ mod tests {
         let uuid_bytes = VLessHandler::parse_uuid("b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3").unwrap();
         let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
 
-        let flow_error =
-            VLessHandler::build_request_header(&uuid_bytes, target, None, Some("unsupported"))
-                .unwrap_err();
+        let flow_error = VLessHandler::build_request_header(
+            &uuid_bytes,
+            CMD_TCP,
+            Some(target),
+            None,
+            Some("unsupported"),
+        )
+        .unwrap_err();
         assert_eq!(flow_error.to_string(), "VLESS: unsupported flow");
 
         let long_domain = "a".repeat(256);
-        let domain_error =
-            VLessHandler::build_request_header(&uuid_bytes, target, Some(&long_domain), None)
-                .unwrap_err();
+        let domain_error = VLessHandler::build_request_header(
+            &uuid_bytes,
+            CMD_TCP,
+            Some(target),
+            Some(&long_domain),
+            None,
+        )
+        .unwrap_err();
         assert_eq!(
             domain_error.to_string(),
             "VLESS: target domain exceeds 255 bytes"
         );
 
         let empty_flow =
-            VLessHandler::build_request_header(&uuid_bytes, target, None, Some("")).unwrap();
+            VLessHandler::build_request_header(&uuid_bytes, CMD_TCP, Some(target), None, Some(""))
+                .unwrap();
         assert_eq!(empty_flow[17], 0);
     }
 

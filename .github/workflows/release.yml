@@ -122,7 +122,7 @@ jobs:
         shell: bash
         run: |
           if [[ "${{ matrix.suffix }}" == "-stock" ]]; then
-            echo "FEATURES=--no-default-features --features clash-api,ebpf" >> "$GITHUB_ENV"
+            echo "FEATURES=--no-default-features --features clash-api,ebpf,rprx" >> "$GITHUB_ENV"
           else
             echo "FEATURES=--features ebpf" >> "$GITHUB_ENV"
           fi

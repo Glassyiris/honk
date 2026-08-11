@@ -32,6 +32,12 @@ Changing `experimental.udp_nfqueue.enabled` requires a restart. Enabled startup 
 
 The path owns raw-netlink queue `320` and nftables objects `inet honk_nfqueue` / `udp_decision`; same-namespace firewall managers must leave them untouched while honk runs. Direct releases the held skb, proxy submits one retained payload to the normal UDP initializer, and block/cancellation drops it. The ingest actor is bounded to 256 packets and 8 MiB of payload, and every packet keeps a three-second absolute deadline from listener receipt. With the Clash API enabled, `/stats.udp.nfqueue` exposes actor depth/bytes/oldest age plus explicit kernel-stat availability and read failures. See the [design](doc/design.en.md) and [configuration reference](doc/configuration.en.md) for invariants and the full metric schema.
 
+## VLESS UDP, H2MUX, and XUDP
+
+VLESS share links select one explicit mode with `vless_mode=legacy|uot-v2|h2mux|h2mux-padded|xudp|mux-cool`. `legacy` is the backward-compatible TCP-only default. `uot-v2` keeps that TCP path and adds direct UoT v2 for UDP. `h2mux` carries logical TCP and native connected sing-mux UDP over shared HTTP/2 carriers; `h2mux-padded` adds sing-mux v1 padding. `xudp` keeps ordinary VLESS TCP and opens one Single XUDP carrier per UDP transport. `mux-cool` shares node-owned Xray Mux.Cool carriers across logical TCP and XUDP.
+
+Modes are not negotiated and never fall back or replay a UDP first packet. Non-legacy modes cannot use VLESS Encryption; only `xudp` may combine with `flow=xtls-rprx-vision`. The official interop suite covers sing-box and Xray: all six cleartext modes, H2MUX over TLS and REALITY, padding, and XUDP Vision. See the [component reference](doc/components.en.md#vless-modes) for wire, lifecycle, and import rules.
+
 ## Before Using This Repository
 
 ### Important: Review Status

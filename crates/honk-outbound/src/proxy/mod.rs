@@ -15,10 +15,13 @@ pub(crate) mod ss_stream;
 pub(crate) mod transport;
 pub mod trojan;
 pub mod tuic;
+pub(crate) mod uot;
 #[cfg(feature = "rprx")]
 pub mod vless;
+pub(crate) mod vless_cool;
 #[cfg(feature = "rprx")]
 mod vless_encryption;
+pub(crate) mod vless_mux;
 #[cfg(feature = "rprx")]
 pub mod vmess;
 
@@ -188,6 +191,11 @@ impl ProxyStream {
 pub trait PacketTransport: Send + Sync + Debug {
     /// The relay target a flow reports as its destination.
     fn relay_addr(&self) -> SocketAddr;
+    /// Whether server-carried metadata may authoritatively name a logical
+    /// reply source before the endpoint has observed its first response.
+    fn allows_full_cone_replies(&self) -> bool {
+        false
+    }
     async fn send_packet(&self, data: &[u8]) -> std::io::Result<()>;
     /// Stronger admission for a flow's first datagram. Queue-backed tunnels
     /// override this to complete only after their writer flushes the packet.
@@ -195,6 +203,45 @@ pub trait PacketTransport: Send + Sync + Debug {
         self.send_packet(data).await
     }
     async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)>;
+}
+
+pub(crate) trait MuxSession: crate::session::ManagedSession + Sized + 'static {
+    type Stream: AsyncReadWrite + 'static;
+    type Packet: PacketTransport + 'static;
+    #[cfg_attr(
+        not(any(feature = "rprx", test)),
+        allow(
+            dead_code,
+            reason = "only VLESS H2MUX performs a carrier readiness probe"
+        )
+    )]
+    fn check_ready(
+        self: Arc<Self>,
+    ) -> impl Future<Output = Result<(), crate::session::OpenError>> + Send {
+        std::future::ready(match self.state() {
+            crate::session::SessionState::Active => Ok(()),
+            crate::session::SessionState::Draining => Err(crate::session::OpenError::Draining(
+                anyhow::anyhow!("mux carrier is draining"),
+            )),
+            crate::session::SessionState::Closed => Err(crate::session::OpenError::Session(
+                anyhow::anyhow!("mux carrier is closed"),
+            )),
+        })
+    }
+
+    fn open_stream(
+        self: Arc<Self>,
+        permit: crate::session::SessionPermit<Self>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+    ) -> impl Future<Output = Result<Self::Stream, crate::session::OpenError>> + Send;
+
+    fn open_packet(
+        self: Arc<Self>,
+        permit: crate::session::SessionPermit<Self>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+    ) -> impl Future<Output = Result<Arc<Self::Packet>, crate::session::OpenError>> + Send;
 }
 
 struct RuntimeOwnedPacketTransport<T> {
@@ -213,6 +260,9 @@ impl<T> std::fmt::Debug for RuntimeOwnedPacketTransport<T> {
 impl<T: Send + Sync> PacketTransport for RuntimeOwnedPacketTransport<T> {
     fn relay_addr(&self) -> SocketAddr {
         self.inner.relay_addr()
+    }
+    fn allows_full_cone_replies(&self) -> bool {
+        self.inner.allows_full_cone_replies()
     }
 
     async fn send_packet(&self, data: &[u8]) -> std::io::Result<()> {
@@ -482,18 +532,14 @@ pub trait ProbeableOutbound: Send + Sync {
 }
 
 /// One registered protocol: its descriptor plus the capability objects it
-/// implements. A `None` slot means the protocol lacks that capability;
-/// dispatches into it are refused.
+/// implements. A `None` slot means the implementation lacks that capability;
+/// the descriptor decides whether a present slot applies to a particular node.
 pub struct ProtocolEntry {
     pub descriptor: &'static crate::descriptor::ProtocolDescriptor,
     pub tcp: Arc<dyn TcpOutbound>,
     pub packet: Option<Arc<dyn PacketOutbound>>,
     pub warmable: Option<Arc<dyn WarmableOutbound>>,
     pub probeable: Option<Arc<dyn ProbeableOutbound>>,
-    /// Declared reason a packet slot may exist even when `supports_udp`
-    /// rejects the default node (Block: the slot returns the routing refusal).
-    /// `None` enforces slot/table parity in [`Self::validate_consistency`].
-    packet_udp_exemption: Option<&'static str>,
 }
 
 impl ProtocolEntry {
@@ -504,17 +550,11 @@ impl ProtocolEntry {
             packet: None,
             warmable: None,
             probeable: None,
-            packet_udp_exemption: None,
         }
     }
 
     pub fn with_packet<T: PacketOutbound + 'static>(mut self, handler: Arc<T>) -> Self {
         self.packet = Some(handler);
-        self
-    }
-
-    pub fn with_packet_udp_exemption(mut self, reason: &'static str) -> Self {
-        self.packet_udp_exemption = Some(reason);
         self
     }
 
@@ -528,32 +568,28 @@ impl ProtocolEntry {
         self
     }
 
-    /// Cross-check the capability slots against the descriptor table. The
-    /// table drives selection and warm-candidate decisions; a slot that
-    /// disagrees with it silently misroutes work, so registry assembly
-    /// panics on inconsistency rather than starting up half-truthful.
+    /// Every capability enabled by the descriptor's default node must have an
+    /// implementation slot. Node-dependent descriptors may keep an extra slot;
+    /// dispatch checks the concrete node before calling it.
     fn validate_consistency(&self) {
         let protocol = self.descriptor.protocol;
         let default_node = Node {
             protocol,
             ..Default::default()
         };
-        let udp_capable = (self.descriptor.supports_udp)(&default_node);
-        if self.packet.is_some() != udp_capable && self.packet_udp_exemption.is_none() {
+        if (self.descriptor.supports_udp)(&default_node) && self.packet.is_none() {
             panic!(
-                "protocol {}: packet slot (present={}) disagrees with descriptor udp={}; \
-                 declare with_packet_udp_exemption if intentional",
-                protocol.as_str(),
-                self.packet.is_some(),
-                udp_capable
+                "protocol {} declares UDP without a packet handler",
+                protocol.as_str()
             );
         }
-        if self.warmable.is_some() != self.descriptor.has_generation_runtime() {
+        if self.descriptor.generation_runtime(&default_node)
+            != crate::runtime::GenerationRuntime::None
+            && self.warmable.is_none()
+        {
             panic!(
-                "protocol {}: warmable slot (present={}) disagrees with generation runtime {:?}",
-                protocol.as_str(),
-                self.warmable.is_some(),
-                self.descriptor.generation_runtime
+                "protocol {} declares a generation runtime without a warm handler",
+                protocol.as_str()
             );
         }
     }
@@ -589,9 +625,6 @@ impl ProxyRegistry {
         registry.register(
             ProtocolEntry::new(NodeProtocol::Block, block.clone())
                 .with_packet(block.clone())
-                // Blocked UDP flows get the routing refusal from the handler;
-                // the node itself is never UDP-selectable.
-                .with_packet_udp_exemption("block answers with the routing refusal")
                 .with_probeable(block),
         );
         let trojan = Arc::new(TrojanHandler::new());
@@ -617,7 +650,10 @@ impl ProxyRegistry {
         {
             let vless = Arc::new(VLessHandler::new());
             registry.register(
-                ProtocolEntry::new(NodeProtocol::VLess, vless.clone()).with_probeable(vless),
+                ProtocolEntry::new(NodeProtocol::VLess, vless.clone())
+                    .with_packet(vless.clone())
+                    .with_warmable(vless.clone())
+                    .with_probeable(vless),
             );
             let vmess = Arc::new(VmessHandler::new());
             registry.register(
@@ -733,6 +769,11 @@ impl ProxyRegistry {
         let entry = self.find(runtime.node.protocol).ok_or_else(|| {
             anyhow::anyhow!("No handler for protocol {:?}", runtime.node.protocol)
         })?;
+        if entry.descriptor.generation_runtime(&runtime.node)
+            == crate::runtime::GenerationRuntime::None
+        {
+            return Ok(WarmOutcome::NotApplicable);
+        }
         let Some(warmable) = entry.warmable.as_ref() else {
             return Ok(WarmOutcome::NotApplicable);
         };
@@ -803,6 +844,9 @@ impl ProxyRegistry {
         let entry = self
             .find(node.protocol)
             .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", node.protocol))?;
+        if node.protocol != NodeProtocol::Block && !(entry.descriptor.supports_udp)(node) {
+            anyhow::bail!("UDP not supported for protocol {}", node.protocol.as_str());
+        }
         let packet = entry.packet.as_ref().ok_or_else(|| {
             anyhow::anyhow!("UDP not supported for protocol {}", node.protocol.as_str())
         })?;
@@ -865,6 +909,12 @@ impl ProxyRegistry {
         let runtime = generation
             .get(&node_id)
             .ok_or_else(|| anyhow::anyhow!("node {node_id} is not in runtime generation"))?;
+        if runtime.node.protocol != NodeProtocol::Block && !runtime.udp_capable {
+            anyhow::bail!(
+                "UDP not supported for protocol {}",
+                runtime.node.protocol.as_str()
+            );
+        }
         let entry = self.find(runtime.node.protocol).ok_or_else(|| {
             anyhow::anyhow!("No handler for protocol {:?}", runtime.node.protocol)
         })?;
@@ -935,23 +985,57 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "packet slot")]
-    fn consistency_rejects_undeclared_packet_without_udp_capability() {
-        let block = Arc::new(BlockHandler::new());
-        ProtocolEntry::new(NodeProtocol::VMess, block.clone())
-            .with_packet(block)
-            .validate_consistency();
+    #[should_panic(expected = "declares UDP without a packet handler")]
+    fn consistency_rejects_missing_packet_implementation() {
+        let direct = Arc::new(DirectHandler::new());
+        ProtocolEntry::new(NodeProtocol::Direct, direct).validate_consistency();
     }
 
     #[test]
-    #[should_panic(expected = "warmable slot")]
-    fn consistency_rejects_warmable_without_generation_runtime() {
-        let socks5 = Arc::new(Socks5Handler::new());
+    #[should_panic(expected = "generation runtime without a warm handler")]
+    fn consistency_rejects_missing_warm_implementation() {
         let anytls = Arc::new(AnyTlsHandler::new());
-        ProtocolEntry::new(NodeProtocol::Socks5, socks5.clone())
-            .with_packet(socks5)
-            .with_warmable(anytls)
+        ProtocolEntry::new(NodeProtocol::AnyTLS, anytls.clone())
+            .with_packet(anytls)
             .validate_consistency();
+    }
+
+    #[cfg(feature = "rprx")]
+    #[tokio::test]
+    async fn vless_capabilities_follow_the_concrete_node() {
+        let registry = ProxyRegistry::default_resolver().unwrap();
+        let entry = registry.find(NodeProtocol::VLess).unwrap();
+        assert!(entry.packet.is_some());
+        assert!(entry.warmable.is_some());
+
+        let node = Node {
+            id: uuid::Uuid::new_v4(),
+            name: "legacy-vless".into(),
+            protocol: NodeProtocol::VLess,
+            address: "127.0.0.1:9".into(),
+            ..Default::default()
+        };
+        let generation = Arc::new(
+            crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
+        );
+        assert_eq!(
+            registry
+                .warm_session(Arc::clone(&generation), node.id, Duration::from_millis(10),)
+                .await
+                .unwrap(),
+            WarmOutcome::NotApplicable
+        );
+        let error = registry
+            .dial_udp_transport_runtime(
+                generation,
+                node.id,
+                "8.8.8.8:53".parse().unwrap(),
+                None,
+                Duration::from_millis(10),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("UDP not supported"));
     }
 
     /// The built-in block node carries NodeProtocol::Block; the registry must

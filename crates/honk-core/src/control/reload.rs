@@ -995,7 +995,7 @@ pub(super) fn udp_warm_candidates(
                 };
                 if !runtime.udp_capable
                     || !honk_outbound::descriptor::descriptor(node.protocol)
-                        .has_generation_runtime()
+                        .has_generation_runtime(node)
                 {
                     continue;
                 }

@@ -299,10 +299,11 @@ endpoint publication or application send.
 **Warm ownership is generation-owned and retained independently by policy
 reason.** Every Selector contributes its configured leaf (runtime choice, then
 default, then first member); leaves shared by several Selectors are
-UUID-deduplicated. AnyTLS retains one pool session, TUIC/Juicity/Hysteria2
-retain their QUIC client and connection, and other proxy protocols retain one
-bare server TCP connection. An effective Selector change wakes reconciliation
-immediately; a 10-second pass repairs dead, consumed, or expired resources.
+UUID-deduplicated. AnyTLS, VLESS H2MUX, and VLESS Mux.Cool retain one pool
+session; TUIC/Juicity/Hysteria2 retain their QUIC client and connection, and
+other proxy protocols retain one bare server TCP connection. An effective Selector
+change wakes reconciliation immediately; a 10-second pass repairs dead, consumed,
+or expired resources.
 Removing the final Selector owner drains only reusable state—active flows keep
 their own stream/connection—and unchanged runtimes carry ownership across
 reload. Startup preconnect is separate: it is a one-shot bare-TCP seed and owns
@@ -311,10 +312,11 @@ no Selector/UDP retention bit.
 **UDP warm-up remains opt-in.** `global.udp_warm_node_count=0` creates no UDP
 coordinator or attempt metrics. A positive budget merges each group's top-N
 latency-ranked leaves that own reusable UDP-capable generation state
-(AnyTLS/TUIC/Juicity/Hysteria2), UUID-deduplicates them, and applies a
+(AnyTLS/VLESS-H2MUX/VLESS-Mux.Cool/TUIC/Juicity/Hysteria2), UUID-deduplicates
+them, and applies a
 process-wide `4×N` cap. At most four handshakes run concurrently; one pass runs
 at startup and each later pass waits for the previous batch plus the configured
-check interval. Selector and UDP bits are independent, so a shared AnyTLS/QUIC
+check interval. Selector and UDP bits are independent, so a shared session/client
 resource is released only after its final owner disappears. Reload makes the
 old generation terminal to new warm work while existing streams and Ready UDP
 endpoints drain normally. `Ready` counts as success; the generic
@@ -333,8 +335,21 @@ Shared layers:
 - `tls.rs` — BoringSSL TLS and Chrome-fingerprint helpers
 - `reality.rs` — REALITY client handshake (see below)
 - `vless_encryption.rs` — Xray-compatible VLESS Encryption authentication, hybrid PFS, ticketed 0-RTT, and record framing
+- `uot.rs` — shared UoT packet codec used by AnyTLS and direct VLESS UoT v2
+- `vless_mux.rs` — sing-mux H2MUX carrier, optional v1 padding, logical TCP, and native connected UDP
+- `vless_cool.rs` — Xray Mux.Cool ordered carrier, logical TCP, Single/pooled XUDP, and full-cone reply metadata
 
 VMess and VLESS are compiled behind honk-outbound's `rprx` cargo feature (on in honk-core's default build); without it those nodes parse but dials are refused with "No handler for protocol".
+
+### VLESS modes
+
+`Node.vless_mode: WireMode` normalizes six mutually exclusive, non-negotiated contracts. `legacy` preserves the existing TCP path and has no packet capability. `uot-v2` leaves TCP unchanged and adds one direct UoT v2 stream per connected UDP transport. `xudp` also leaves TCP unchanged, but opens one VLESS mux-command carrier and uses XUDP session id 0 for each UDP transport.
+
+`h2mux` sends the VLESS request to `sp.mux.sing-box.arpa:444`, selects H2MUX backend 2, and opens HTTP/2 CONNECT streams whose first DATA is `[flags u16][SocksAddr]`; flag 0 carries logical TCP and flag 1 carries connected UDP with the shared UoT length codec. `h2mux-padded` adds the sing-mux v1 randomized preface and padded record framing for the first 16 records in each direction. Each H2MUX node owns a `SessionPool<VlessMuxSession>` capped at two reusable or dialing physical carriers × 128 logical streams; a draining carrier can overlap its replacement until existing streams finish. HTTP/2 capacity drives admission; GOAWAY and pre-commit session failures drain and retry once, while target refusal does not retry. Driver failure fans out and stream wrappers preserve flow-control release, half-close, reset, and lazy response errors.
+
+`mux-cool` opens the Xray VLESS mux command and carries logical TCP plus XUDP children through a `SessionPool<VlessCoolSession>` with the same two-active-carrier × 128 cap. One ordered writer serializes every child frame and preserves cancellation commitment; reader dispatch never lets a slow TCP child block siblings. Session IDs are monotonic and never reused, so the carrier drains after 128 issued IDs and can overlap its replacement until live children finish. XUDP records preserve changing reply addresses for full-cone UDP. The unpooled `xudp` mode uses the same frame codec with reserved id 0 and a smaller 7,526-byte packet ceiling; pooled Mux.Cool admits up to 8 KiB.
+
+Generation-pinned TCP/UDP, Selector warm-up, and UDP warm-up share the selected H2MUX or Mux.Cool pool. Cold speculative dials use provisional pool slots: losers never publish and winners commit exactly once before endpoint publication. Unchanged generations transfer the live pool on reload; final ownership drains reusable state without cutting active children. The two reusable/dialing carrier cap backpressures saturation; only draining carriers with live children may overlap their replacements. There is no runtime probing, fallback, or first-packet replay. All non-legacy modes reject VLESS Encryption; `flow=xtls-rprx-vision` is accepted only by `legacy` and Single `xudp`.
 
 ### VLESS Encryption
 

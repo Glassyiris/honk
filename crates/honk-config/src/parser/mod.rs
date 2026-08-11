@@ -1521,6 +1521,10 @@ fn parse_ip_args(args: &[String], cond: &mut crate::routing::ConditionFields<'_>
     }
 }
 
+fn node_parse_diagnostic(error: &crate::ConfigError) -> String {
+    format!("node section: skipping unparseable entry: {error}")
+}
+
 fn parse_node_section(section: &Section) -> Result<Vec<Node>, crate::ConfigError> {
     let mut nodes = Vec::new();
     for line in section.body.lines() {
@@ -1532,7 +1536,7 @@ fn parse_node_section(section: &Section) -> Result<Vec<Node>, crate::ConfigError
             && rest.trim_start().starts_with(['=', ':'])
         {
             return Err(crate::ConfigError::Parse(
-                "node section: 'mux' (h2mux) is no longer supported; remove the mux setting".into(),
+                "node section: standalone 'mux' is unsupported; set vless_mode on each VLESS share link".into(),
             ));
         }
         let unquote = |s: &str| s.trim().trim_matches(|c| c == '\'' || c == '"').to_string();
@@ -1572,9 +1576,7 @@ fn parse_node_section(section: &Section) -> Result<Vec<Node>, crate::ConfigError
             // A recognized-but-removed protocol in the config file is a hard
             // error (subscriptions skip such entries with a warning instead).
             Err(e @ crate::ConfigError::UnknownProtocol(_)) => return Err(e),
-            Err(e) => {
-                eprintln!("node section: skipping unparseable entry '{trimmed}': {e}");
-            }
+            Err(e) => eprintln!("{}", node_parse_diagnostic(&e)),
         }
     }
     Ok(nodes)

@@ -47,9 +47,9 @@
 | `connect_timeout_ms` | u64 | `3000` | TCP 连接超时（结构化模型字段，dae 语法无对应键） |
 | `dns_resolve_timeout_ms` | u64 | `2000` | 控制面解析超时（结构化模型字段，dae 语法无对应键） |
 | `relay_idle_timeout_secs` | u64 | `300` | 空闲中继断开；`0` = 关闭（结构化模型字段，dae 语法无对应键） |
-| `preconnect_node_count` | usize | `'auto'` | 启动时执行一轮裸 TCP 预连接。`'auto'` 最多尝试 8 个节点；`0` 关闭；显式 `N` 可覆盖所有合格节点，但最多 8 个并发尝试。候选按各组当前选择、再按配置顺序；仅可池化裸 TCP 的协议入选（AnyTLS/QUIC 与内置 `direct`/`block` 排除）。 |
-| `udp_warm_node_count` | usize | `0` | 每组 UDP 预热上限。`0` 严格关闭。正值 N 取各组延迟 top `min(N,3)` 的 UDP 叶子；独立 coordinator 启动后立即运行，随后每批完成再等待一个 `check_interval`，最多并发四个尝试。合并候选按全局 UDP 延迟重排，进程驻留总量封顶 `4×N`。 |
-| `max_concurrent_dials` | usize | `64` | 按 runtime generation 生效的物理代理连接与协议握手并发上限，另受所有重叠 reload generation 共享的启动时描述符 gate 约束。Ready 池命中、已热 AnyTLS/QUIC transport 上的逻辑流，以及内置 `direct`/`block` 均不占额度。replacement generation 立即采用新值；旧 generation 中进行中的拨号继续占用同一个进程级 gate，直至结束。 |
+| `preconnect_node_count` | usize | `'auto'` | 启动时执行一轮裸 TCP 预连接。`'auto'` 最多尝试 8 个节点；`0` 关闭；显式 `N` 可覆盖所有合格节点，但最多 8 个并发尝试。候选按各组当前选择、再按配置顺序；仅可池化裸 TCP 的协议入选（AnyTLS、VLESS H2MUX/Mux.Cool、QUIC 与内置 `direct`/`block` 排除）。 |
+| `udp_warm_node_count` | usize | `0` | 每组 UDP 预热上限。`0` 严格关闭。正值 N 取各组延迟 top `min(N,3)` 的 UDP 叶子；独立 coordinator 启动后立即运行，随后每批完成再等待一个 `check_interval`，最多并发四个尝试。可复用的 VLESS H2MUX/Mux.Cool 状态会参与；合并候选按全局 UDP 延迟重排，进程驻留总量封顶 `4×N`。 |
+| `max_concurrent_dials` | usize | `64` | 按 runtime generation 生效的物理代理连接与协议握手并发上限，另受所有重叠 reload generation 共享的启动时描述符 gate 约束。Ready 池命中、已热 AnyTLS/VLESS-H2MUX/VLESS-Mux.Cool/QUIC transport 上的逻辑流，以及内置 `direct`/`block` 均不占额度。replacement generation 立即采用新值；旧 generation 中进行中的拨号继续占用同一个进程级 gate，直至结束。 |
 
 ### 拨号模式细节
 
@@ -70,7 +70,7 @@ dae 语法中节点**只能以分享链接书写**：`tag: 'scheme://...'` 或�
 
 | 字段 | 类型 | 默认值 | 含义 |
 | ------ | ------ | -------- | ------ |
-| `id` | UUID | 内容派生 | 稳定身份：对 `protocol\|host\|port\|credential\|dial-shape`（dial shape = sni/transport/ws/grpc/obfs 外加 REALITY/flow 握手形态）取 UUID v5；改名不变，两个节点派生出相同 id 会被拒绝（订阅内重复端点跳过并告警） |
+| `id` | UUID | 内容派生 | 稳定身份：对 `protocol\|host\|port\|credential\|dial-shape`（dial shape = sni/transport/ws/grpc/obfs 外加 REALITY/flow 握手形态与非 legacy VLESS mode）取 UUID v5；改名不变，两个节点派生出相同 id 会被拒绝（订阅内重复端点跳过并告警） |
 | `name` | string | **必填** | 路由 / API 名称；dae 中为链接前的 tag |
 | `protocol` | enum | `ss` | 见协议表；dae 中由链接 scheme 决定 |
 | `address` | string | 必填* | 主机或 `host:port` |
@@ -78,6 +78,7 @@ dae 语法中节点**只能以分享链接书写**：`tag: 'scheme://...'` 或�
 | `port` | u16 | `0` | 服务端口 |
 | `username` / `password` | string? | null | 认证 / UUID / 密钥；链接 userinfo |
 | `encryption` | string? | null | SS/VMess 加密，或 Xray VLESS Encryption 客户端字符串（分享链接 `encryption=`） |
+| `vless_mode` | `WireMode` | `legacy` | `legacy` / `uot-v2` / `h2mux` / `h2mux-padded` / `xudp` / `mux-cool`；分享链接参数 `vless_mode=` |
 | `plugin` / `plugin_opts` | string? | null | 插件名/参数；链接 `plugin` / `plugin-opts` |
 | `transport` | string | `"tcp"` | `tcp` / `ws` / `grpc` / …；链接 `type`（或 `network`）参数 |
 | `tls` | bool | `false` | 启用 TLS；trojan/vless/anytls 等链接自动开启 |
@@ -89,7 +90,7 @@ dae 语法中节点**只能以分享链接书写**：`tag: 'scheme://...'` 或�
 | `reality_public_key` | string? | null | REALITY 服务端 X25519 公钥（分享链接 `pbk`）；设置后该节点走 REALITY 握手而非普通 TLS（`security=reality` 隐含 `tls=true`） |
 | `reality_short_id` | string? | null | REALITY short id（链接 `sid`，偶数长度 hex，至多 8 字节） |
 | `reality_spider_x` | string? | null | REALITY spider 路径（链接 `spx`，链接约定默认 `/`） |
-| `flow` | string? | null | VLESS flow 控制（链接 `flow=`）；仅支持 `xtls-rprx-vision`，要求 TLS 或 REALITY 承载，且不能与 VLESS Encryption 组合——由 `Config::validate` 强制校验 |
+| `flow` | string? | null | VLESS flow 控制（链接 `flow=`）；仅支持 `xtls-rprx-vision`，要求 TLS 或 REALITY 承载；非 legacy 模式中只有 `xudp` 可以使用——由 `Config::validate` 强制校验 |
 | `network` | string? | null | V2Ray 风格 network 提示 |
 | `ws_path` / `ws_host` | string? | null | WebSocket；链接 `path` / `host` 参数 |
 | `grpc_service` | string? | null | gRPC service 名；链接 `serviceName` 参数 |
@@ -120,7 +121,7 @@ dae 语法中节点**只能以分享链接书写**：`tag: 'scheme://...'` 或�
 | `ss` | `shadowsocks` | 是 | 是 | AEAD + `2022-blake3-*` |
 | `trojan` | | 是 | 是 | TLS；经 transport 支持 WS/gRPC |
 | `vmess` | | 是 | 否 | AEAD；WS/gRPC；`security=reality` 可启用 REALITY；仅在 `rprx` feature 下注册（honk-core 默认构建开启） |
-| `vless` | | 是 | 否 | Xray VLESS Encryption；REALITY + `xtls-rprx-vision` flow；经 transport 支持 WS/gRPC；仅在 `rprx` feature 下注册 |
+| `vless` | | 是 | 取决于模式 | Xray VLESS Encryption；REALITY + `xtls-rprx-vision`；UoT v2、sing-box H2MUX、Xray Single XUDP 或池化 Mux.Cool UDP；经 transport 支持 WS/gRPC；仅在 `rprx` feature 下注册 |
 | `socks5` | | 是 | 是 | UDP ASSOCIATE |
 | `hysteria2` | | 是 | 是 | 真实 QUIC/H3；salamander；brutal（配带宽时）或 BBR；端口跳跃 |
 | `tuic` | | 是 | 是 | TUIC v5 / quinn |
@@ -157,6 +158,32 @@ Clash 订阅会在派生节点身份前把 VLESS 的 `uuid`、`encryption`、
 以外的传输、非 Vision flow、缺少 TLS/REALITY 的 Vision，以及经
 WS/gRPC 的 Vision 会由 `honk-tool sub` 显示但不探测。
 `client-fingerprint` 不是节点字段，由全局 TLS 模式统一控制。
+
+#### VLESS mode
+
+`Node.vless_mode` 是唯一的 `WireMode`：必须显式选择、互斥且不协商。
+
+| 取值 | TCP | UDP | 行为 |
+| ------ | ----- | ----- | ------ |
+| `legacy` | 原有 VLESS stream | 否 | 保持兼容的默认值；旧节点 ID 不变 |
+| `uot-v2` | 原有 VLESS stream | 直连 UoT v2 | 每个 UDP transport 一条 connected UoT stream；不套复用层 |
+| `h2mux` | H2MUX 逻辑 stream | sing-mux 原生 connected UDP | TCP 与 UDP 共用节点所有的 HTTP/2 carrier pool |
+| `h2mux-padded` | H2MUX 逻辑 stream | sing-mux 原生 connected UDP | 在 `h2mux` 基础上启用 sing-mux v1 padding |
+| `xudp` | 原有 VLESS stream | Single XUDP | 每个 UDP transport 一条 VLESS mux-command carrier，使用 XUDP session id 0；TCP 保持普通路径 |
+| `mux-cool` | Mux.Cool 逻辑 stream | 池化 XUDP | 逻辑 TCP 与 UDP 共用节点所有的 Xray Mux.Cool carrier pool |
+
+规范 dae 配置仍写在 VLESS 分享链接内：
+
+```dae
+node {
+    vless_mux: 'vless://uuid@example.com:443?security=tls&vless_mode=h2mux#vless_mux'
+    vless_cool: 'vless://uuid@example.com:443?security=reality&pbk=...&sid=ab12&vless_mode=mux-cool#vless_cool'
+}
+```
+
+H2MUX 与 Mux.Cool 每个节点都最多使用两条可复用或正在拨号的 carrier、每条最多 128 个逻辑 stream。H2MUX 保留 HTTP/2 flow control、half-close/reset、GOAWAY 滚动与可选 v1 padding。Mux.Cool 用一个有序 writer 串行化全部子帧，session id 永不复用，支持 full-cone UDP 回包源地址，并在发出 128 个 id 后滚动 carrier。进入 draining 的 carrier 不再占用该上限：GOAWAY 或 id 耗尽后可在活动子连接结束期间拨号 replacement，旧 carrier 在最后一个子连接结束后关闭。两种 pool 都会在未变节点重载时复用，失去所有权后只排干可复用状态，不切断活动子连接。Single XUDP 明确不入池。两条 active carrier 均饱和时等待；speculative loser 永不发布；所有模式都不探测、不降级，也不重放首包。
+
+所有非 `legacy` 模式都拒绝非 `none` VLESS Encryption。`flow=xtls-rprx-vision` 只能与 `legacy` 或 `xudp` 组合；其他模式会接管不兼容的内层 framing。规范分享链接使用 `vless_mode`；兼容参数 `packetEncoding=xudp` 会导入为 `xudp`，而含义有歧义的 `smux`、`multiplex`、`udp-over-tcp`、`packet-encoding`、`packet-addr`、`xudp` query 会被拒绝。Clash/mihomo YAML 仅在 `protocol: h2mux` 或显式 `padding` 布尔值能够判别 wire mode 时，才把已启用的 `smux`/`multiplex` 导入为 H2MUX；两者都缺失的已启用配置会被拒绝。`udp-over-tcp` 版本 0/2 导入为 UoT v2，`packet-encoding: xudp` 或 `xudp: true` 导入为 Single XUDP；冲突表示、packetaddr、不支持的 mux 协议/调优，以及没有显式 packet mode 的 `udp: true` 都会被拒绝。`mux-cool` 当前必须使用规范分享链接模式。官方 live 互通覆盖 sing-box 的 UoT/H2MUX，以及 Xray 的 Single XUDP/Mux.Cool，并包含 TLS、REALITY、padding 与 XUDP Vision。
 
 **VLESS Encryption**
 
@@ -228,7 +255,7 @@ node {
 | -------- | ------ |
 | `ss://` | SIP002 |
 | `vmess://` | base64 JSON（v2rayN） |
-| `vless://` / `trojan://` | query 传 transport/TLS；vless/vmess 另支持 `security=reality|tls|none`、`pbk`、`sid`、`spx`、`flow`（REALITY + xtls-rprx-vision） |
+| `vless://` / `trojan://` | query 传 transport/TLS；vless/vmess 另支持 `security=reality|tls|none`、`pbk`、`sid`、`spx`、`flow`，VLESS 单独支持规范 `vless_mode=` |
 | `anytls://` | query 中的池参数 |
 | `hysteria2://` / `tuic://` / `juicity://` | QUIC 族 |
 | `socks5://` | 简单代理 |
@@ -273,7 +300,7 @@ group {
 
 | 规范名 | 别名 | 行为 |
 | -------- | ------ | ------ |
-| `selector` | `select`、`fixed`、`fixed(0)` | 手动固定；API + cache。其配置叶节点始终保持热态：AnyTLS/QUIC 保留可复用状态，其他代理协议保留一条服务端裸 TCP。 |
+| `selector` | `select`、`fixed`、`fixed(0)` | 手动固定；API + cache。其配置叶节点始终保持热态：AnyTLS/VLESS-H2MUX/VLESS-Mux.Cool 保留可复用 session，QUIC 保留 client，其他代理协议保留一条服务端裸 TCP。 |
 | `urltest` | `min_moving_avg`、`min_avg10`、`min_last_delay` | 最低延迟 + tolerance；按减半递推移动平均 `(prev+sample)/2` 排名（dae `min_moving_avg` 语义）；**TCP/UDP 分离** |
 | `loadbalance` | `roundrobin`、`round_robin`、`balance` | 每组、每网络独立对存活成员轮询 |
 | `fallback` | | TCP/UDP 各自固定第一个存活成员；无立即 failback |
@@ -695,13 +722,13 @@ NFQA timestamp 不保证存在，因此不表示内核队列驻留时间。
 ```text
 warm = {
   nodes: { preconnect, health, udp, selector, traffic },
-  sessions: { anytls, tuic, juicity, hysteria2 }
+  sessions: { anytls, vless, tuic, juicity, hysteria2 }
 }
 ```
 
 `nodes` 按保留热资源的原因统计当前热节点（一个节点可同时计入多个原因；
 无记录原因的热节点计为 `traffic`）；`selector` 表示始终启用的 Selector
-当前叶节点常驻。`sessions` 按协议统计驻留的 AnyTLS 池 session 与已占用的
+当前叶节点常驻。`sessions` 按协议统计驻留的 AnyTLS/VLESS 池 session 与已占用的
 QUIC client 槽。gauge 跟随当前 generation：资源排干后节点在下一个快照中消失。
 
 环境变量：`HONK_UI_DOWNLOAD_URL` 覆盖 UI zip。

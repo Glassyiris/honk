@@ -1545,6 +1545,7 @@ async fn stats_exposes_udp_metrics() {
     assert_eq!(warm["nodes"]["selector"], 0);
     assert_eq!(warm["nodes"]["traffic"], 0);
     assert_eq!(warm["sessions"]["anytls"], 0);
+    assert_eq!(warm["sessions"]["vless"], 0);
     assert_eq!(warm["sessions"]["tuic"], 0);
     assert_eq!(warm["sessions"]["juicity"], 0);
     assert_eq!(warm["sessions"]["hysteria2"], 0);

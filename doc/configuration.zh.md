@@ -203,10 +203,10 @@ honk 有三套互相独立的预热机制。其上限由已配置的组或显式
 
 | 机制 | 配置项 | 默认 | 说明 |
 | ------ | -------- | ------ | ------ |
-| 启动裸 TCP 预连接 | `preconnect_node_count` | `'auto'` | 只在启动时执行一轮。`'auto'` 最多尝试 8 个节点（各组当前选中优先，其次配置顺序）；`0` 关闭；显式 `N` 可覆盖全部合格节点，但最多 8 个并发尝试。仅可裸 TCP 池化的协议参与——AnyTLS/QUIC 与内置 `direct`/`block` 一律跳过。 |
-| Selector 常驻 | — | 始终启用 | 每个 `selector` 组按配置选中的叶节点都会保持热态；即使显式选中的节点暂时不健康，也不会改暖其他节点。AnyTLS 与 QUIC 协议保留可复用 session/client，其他代理协议保留一条到服务端的裸 TCP。Clash API 切换选择会立即唤醒协调器：不打断活动流，释放旧节点的 warm 所有权并预热新节点。reload 时未变的已选节点延续原资源。 |
-| UDP 预热集合 | `udp_warm_node_count` | `0` | 每组每 IP 族取 top `min(N,3)` 个 UDP 叶子，最多并发 4 个尝试，进程级驻留总量封顶为 `4×N`。UDP 与 Selector 是独立所有者；只有两种原因都消失时才释放共享资源。 |
-| 并发拨号上限 | `max_concurrent_dials` | `64` | 按 generation 限制物理代理连接和协议握手；Ready 池命中、已热 AnyTLS/QUIC transport 的逻辑流及内置 `direct`/`block` 均不占额度。reload 会更新 replacement 的局部上限，但新旧 generation 始终共享启动时确定的同一个描述符 gate。 |
+| 启动裸 TCP 预连接 | `preconnect_node_count` | `'auto'` | 只在启动时执行一轮。`'auto'` 最多尝试 8 个节点（各组当前选中优先，其次配置顺序）；`0` 关闭；显式 `N` 可覆盖全部合格节点，但最多 8 个并发尝试。仅可裸 TCP 池化的协议参与——AnyTLS、VLESS H2MUX/Mux.Cool、QUIC 与内置 `direct`/`block` 一律跳过。 |
+| Selector 常驻 | — | 始终启用 | 每个 `selector` 组按配置选中的叶节点都会保持热态；即使显式选中的节点暂时不健康，也不会改暖其他节点。AnyTLS、VLESS H2MUX 与 VLESS Mux.Cool 保留可复用 session，QUIC 协议保留 client，其他代理协议保留一条到服务端的裸 TCP。Clash API 切换选择会立即唤醒协调器：不打断活动流，释放旧节点的 warm 所有权并预热新节点。reload 时未变的已选节点延续原资源。 |
+| UDP 预热集合 | `udp_warm_node_count` | `0` | 每组每 IP 族取 top `min(N,3)` 个 UDP 叶子，最多并发 4 个尝试，进程级驻留总量封顶为 `4×N`；可复用的 VLESS H2MUX/Mux.Cool 状态会参与。UDP 与 Selector 是独立所有者；只有两种原因都消失时才释放共享资源。 |
+| 并发拨号上限 | `max_concurrent_dials` | `64` | 按 generation 限制物理代理连接和协议握手；Ready 池命中、已热 AnyTLS/VLESS-H2MUX/VLESS-Mux.Cool/QUIC transport 上的逻辑流及内置 `direct`/`block` 均不占额度。reload 会更新 replacement 的局部上限，但新旧 generation 始终共享启动时确定的同一个描述符 gate。 |
 
 健康探测不会把冷节点变热，因此 400 节点订阅不会因 `check_interval`
 常驻 400 条隧道。Selector 常驻另以 10 秒周期作丢失资源的兜底修复。
@@ -218,7 +218,9 @@ honk 有三套互相独立的预热机制。其上限由已配置的组或显式
 
 解析支持的 scheme：`ss://`、`socks5://`、`trojan://`、`vmess://`、`vless://`、`hysteria2://`、`tuic://`、`juicity://`、`anytls://`。
 
-分享链接中的参数会映射到 `Node` 字段：`name`、`protocol`、`address`/`host`、`port`、`password`/`username`、`encryption`、`tls`、`sni`、`transport`、`ws_path`、`ws_host`、`grpc_service`，以及 Hy2/TUIC/Juicity/AnyTLS 专用字段。
+分享链接中的参数会映射到 `Node` 字段：`name`、`protocol`、`address`/`host`、`port`、`password`/`username`、`encryption`、`vless_mode`、`tls`、`sni`、`transport`、`ws_path`、`ws_host`、`grpc_service`，以及 Hy2/TUIC/Juicity/AnyTLS 专用字段。
+
+VLESS 使用规范分享链接 query `vless_mode=legacy|uot-v2|h2mux|h2mux-padded|xudp|mux-cool`，省略时为 `legacy`。这些模式分别选择旧 TCP/无 UDP、直连 UoT v2、sing-box H2MUX（可带 padding）、Xray Single XUDP 或池化 Xray Mux.Cool；不会协商或降级。所有非 `legacy` 模式都拒绝 VLESS Encryption；只有 `xudp` 可与 `flow=xtls-rprx-vision` 组合。完整 wire 与订阅导入约束见组件参考。
 
 完整字段表与协议注意点（含 UDP 支持矩阵）见 [components.zh.md](./components.zh.md)。
 
@@ -470,10 +472,18 @@ REALITY TLS 承载；嵌套 `ws-opts` 映射 `path` 及大小写不敏感的
 该条目会被跳过，不会静默降级成普通 TLS。Clash `client-fingerprint`
 不映射，因为 honk 的指纹选择是进程级而非节点级。
 
+已启用且协议为 `h2mux`，或未写协议但显式提供 `padding` 布尔值的 Clash
+`smux`/`multiplex` 会映射为 `h2mux` 或 `h2mux-padded`；两个判别字段都缺失的
+已启用配置会被拒绝。已启用的 `udp-over-tcp` 版本 0/2 映射为 `uot-v2`；
+`packet-encoding: xudp` 或 `xudp: true` 映射为 Single `xudp`。冲突的模式表示、
+启用的 packetaddr、不支持的 mux 协议/调优，以及没有显式 packet mode 的
+`udp: true` 都会拒绝该条目。`mux-cool` 仅能通过规范分享链接模式启用。
+
 VLESS 支持 plain/TLS/REALITY 承载上的 TCP、WS、gRPC；其中
 `xtls-rprx-vision` 必须使用 TLS 或 REALITY，且仅支持 TCP。其他 transport
-与 flow 只保留用于可见性，`honk-tool sub` 不会拨号；VLESS 没有 UDP
-packet handler。
+与 flow 只保留用于可见性，`honk-tool sub` 不会拨号。Legacy VLESS 以及
+`network` 排除 UDP 的节点会把 UDP 显示为 `n/a`；其他所有非 `legacy`
+模式会通过各自 packet transport 执行 UDP 探测。
 
 ## 11. Experimental
 

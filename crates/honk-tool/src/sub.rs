@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use clap::{Args, ValueEnum};
 use honk_config::Config;
-use honk_config::node::Node;
+use honk_config::node::{Node, WireMode};
 use honk_config::subscription::Subscription;
 use honk_config::types::{NodeProtocol, SubscriptionType};
 use honk_core::proxy::ProxyRegistry;
@@ -376,7 +376,15 @@ fn vless_shape(node: &Node) -> String {
     } else {
         ""
     };
-    format!("vless/{carrier}/{transport}{vision}")
+    let wire = match node.vless_mode {
+        WireMode::Legacy => "",
+        WireMode::UotV2 => "/uot-v2",
+        WireMode::H2mux => "/h2mux",
+        WireMode::H2muxPadded => "/h2mux-padded",
+        WireMode::Xudp => "/xudp",
+        WireMode::MuxCool => "/mux-cool",
+    };
+    format!("vless/{carrier}/{transport}{vision}{wire}")
 }
 
 /// Everything a probe run needs to reach the test target.
@@ -489,6 +497,7 @@ impl ProbeOutcome {
     fn timed_out(registry: &ProxyRegistry, node: &Node) -> Self {
         let packet_result = registry
             .find(node.protocol)
+            .filter(|entry| (entry.descriptor.supports_udp)(node))
             .and_then(|entry| entry.packet.as_ref())
             .map(|_| Err(ProbeFailureKind::Timeout));
         Self {
@@ -653,6 +662,9 @@ async fn probe_udp_dns(
     let Some(entry) = registry.find(node.protocol) else {
         return Some(Err(ProbeFailureKind::Handler));
     };
+    if !(entry.descriptor.supports_udp)(node) {
+        return None;
+    }
     let packet = entry.packet.as_ref()?;
     let dns_server = SocketAddr::from(([8, 8, 8, 8], 53));
     let transport = match packet
@@ -711,6 +723,9 @@ async fn probe_udp_quic(
     let Some(entry) = registry.find(node.protocol) else {
         return Some(Err(ProbeFailureKind::Handler));
     };
+    if !(entry.descriptor.supports_udp)(node) {
+        return None;
+    }
     let packet = entry.packet.as_ref()?;
     let addr = match tokio::net::lookup_host((url_host, url_port)).await {
         Ok(mut addrs) => addrs.find(SocketAddr::is_ipv4)?,
@@ -763,12 +778,16 @@ mod tests {
     }
 
     #[test]
-    fn registry_contains_vless_tcp_probe_without_udp() {
+    fn registry_contains_node_dependent_vless_udp() {
         let registry = ProxyRegistry::default_resolver().unwrap();
         let entry = registry.find(NodeProtocol::VLess).unwrap();
         assert_eq!(entry.descriptor.protocol, NodeProtocol::VLess);
         assert!(entry.probeable.is_some());
-        assert!(entry.packet.is_none());
+        assert!(entry.packet.is_some());
+        let mut node = vless_node();
+        assert!(!(entry.descriptor.supports_udp)(&node));
+        node.vless_mode = WireMode::UotV2;
+        assert!((entry.descriptor.supports_udp)(&node));
     }
 
     #[test]
@@ -866,6 +885,12 @@ mod tests {
         node.transport.clear();
         assert_eq!(vless_shape(&node), "vless/plain/tcp");
 
+        node.vless_mode = WireMode::Xudp;
+        assert_eq!(vless_shape(&node), "vless/plain/tcp/xudp");
+        node.vless_mode = WireMode::MuxCool;
+        assert_eq!(vless_shape(&node), "vless/plain/tcp/mux-cool");
+        node.vless_mode = WireMode::Legacy;
+
         node.tls = true;
         node.transport = "ws".into();
         assert_eq!(vless_shape(&node), "vless/tls/ws");
@@ -889,6 +914,20 @@ mod tests {
         let rendered = render_outcome(&outcome);
         assert!(rendered.contains("dns: n/a"));
         assert!(rendered.contains("quic: n/a"));
+    }
+
+    #[test]
+    fn vless_udp_mode_is_rendered_as_probeable() {
+        let registry = ProxyRegistry::default_resolver().unwrap();
+        let mut node = vless_node();
+        node.vless_mode = WireMode::H2mux;
+        let outcome = ProbeOutcome::timed_out(&registry, &node);
+        assert!(matches!(
+            outcome.udp_dns,
+            Some(Err(ProbeFailureKind::Timeout))
+        ));
+        assert!(render_outcome(&outcome).contains("dns: FAIL(timeout)"));
+        assert_eq!(outcome.shape, "vless/tls/tcp/h2mux");
     }
 
     #[test]

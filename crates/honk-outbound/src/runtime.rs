@@ -8,8 +8,8 @@
 //! node may belong to many groups, and group rebuilds must not destroy
 //! live sessions). ProxyRegistry stays stateless handlers.
 //!
-//! AnyTLS owns its node-local session pool here; the QUIC protocols own
-//! their per-node client (and thereby the shared QUIC connection) here.
+//! AnyTLS, VLESS H2MUX, and VLESS Mux.Cool own node-local session pools here;
+//! QUIC protocols own their per-node client (and shared connection) here.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -28,27 +28,33 @@ use honk_config::node::Node;
 pub enum GenerationRuntime {
     None,
     AnyTls,
+    VlessH2Mux,
+    VlessCoolMux,
     Quic,
 }
 
 impl GenerationRuntime {
     pub(crate) fn build(self) -> ProtocolRuntime {
         match self {
-            GenerationRuntime::None => ProtocolRuntime::None,
-            GenerationRuntime::AnyTls => ProtocolRuntime::AnyTls(AnyTlsRuntime::new()),
-            GenerationRuntime::Quic => ProtocolRuntime::Quic(QuicRuntime::new()),
+            Self::None => ProtocolRuntime::None,
+            Self::AnyTls => ProtocolRuntime::AnyTls(AnyTlsRuntime::new()),
+            Self::VlessH2Mux => ProtocolRuntime::VlessMux(VlessMuxRuntime::h2()),
+            Self::VlessCoolMux => ProtocolRuntime::VlessMux(VlessMuxRuntime::cool()),
+            Self::Quic => ProtocolRuntime::Quic(QuicRuntime::new()),
         }
     }
 }
 
-/// The session-layer runtime for one node. AnyTLS owns a `SessionPool`; QUIC
-/// protocols own their connection/auth state here instead of in handlers so
-/// a reload cannot send an old flow to a newly published generation.
+/// The session-layer runtime for one node. Multiplexed protocols own
+/// `SessionPool`s; QUIC protocols own connection/auth state here instead of
+/// in handlers so a reload cannot send an old flow to a replacement generation.
 #[derive(Debug)]
 pub enum ProtocolRuntime {
     None,
     /// One node-local AnyTLS session pool.
     AnyTls(AnyTlsRuntime),
+    /// One concrete node-local H2MUX or Mux.Cool session pool.
+    VlessMux(VlessMuxRuntime),
     /// Type-erased TUIC, Juicity, or Hysteria2 client slot. Policy warm
     /// ownership may release the cached client before generation retirement.
     Quic(QuicRuntime),
@@ -256,7 +262,78 @@ impl AnyTlsRuntime {
     }
 }
 
-/// Live warm-session gauge of one runtime: retained AnyTLS pool sessions
+#[derive(Debug)]
+pub enum VlessMuxRuntime {
+    H2(Arc<crate::proxy::vless_mux::VlessMuxPool>),
+    Cool(Arc<crate::proxy::vless_cool::VlessCoolPool>),
+}
+
+impl VlessMuxRuntime {
+    fn h2() -> Self {
+        Self::H2(Arc::new(crate::session::SessionPool::new(
+            crate::proxy::vless_mux::session_pool_config(),
+        )))
+    }
+
+    fn cool() -> Self {
+        Self::Cool(Arc::new(crate::session::SessionPool::new(
+            crate::proxy::vless_cool::session_pool_config(),
+        )))
+    }
+
+    fn set_warm_retained(&self, retained: bool) {
+        match self {
+            Self::H2(pool) => pool.set_warm_retained(retained),
+            Self::Cool(pool) => pool.set_warm_retained(retained),
+        }
+    }
+
+    fn shutdown(&self) {
+        match self {
+            Self::H2(pool) => pool.shutdown(),
+            Self::Cool(pool) => pool.shutdown(),
+        }
+    }
+
+    fn retire(&self) {
+        match self {
+            Self::H2(pool) => pool.retire(),
+            Self::Cool(pool) => pool.retire(),
+        }
+    }
+
+    fn has_usable_session(&self) -> bool {
+        match self {
+            Self::H2(pool) => pool.has_usable_session(),
+            Self::Cool(pool) => pool.has_usable_session(),
+        }
+    }
+
+    fn live_session_count(&self) -> usize {
+        match self {
+            Self::H2(pool) => pool.live_session_count(),
+            Self::Cool(pool) => pool.live_session_count(),
+        }
+    }
+
+    #[cfg(test)]
+    fn is_warm_retained(&self) -> bool {
+        match self {
+            Self::H2(pool) => pool.is_warm_retained(),
+            Self::Cool(pool) => pool.is_warm_retained(),
+        }
+    }
+
+    #[cfg(test)]
+    fn is_retired(&self) -> bool {
+        match self {
+            Self::H2(pool) => pool.is_retired(),
+            Self::Cool(pool) => pool.is_retired(),
+        }
+    }
+}
+
+/// Live warm-state gauge of one runtime: retained AnyTLS/VLESS mux sessions
 /// and one occupied QUIC client slot (`None` = count unknown under lock
 /// contention, to be treated as warm rather than cold).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -353,6 +430,7 @@ impl Drop for WarmAttempt {
                 runtime.pool.set_warm_retained(false);
                 runtime.tls.evict();
             }
+            ProtocolRuntime::VlessMux(runtime) => runtime.set_warm_retained(false),
             ProtocolRuntime::Quic(_) => {
                 drop(retention);
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -376,7 +454,7 @@ impl NodeRuntime {
             node: Arc::new(node.clone()),
             udp_capable: (crate::descriptor::descriptor(node.protocol).supports_udp)(node),
             runtime: crate::descriptor::descriptor(node.protocol)
-                .generation_runtime
+                .generation_runtime(node)
                 .build(),
             ephemeral: true,
             warm_retention: Arc::new(tokio::sync::Mutex::new(0)),
@@ -402,8 +480,12 @@ impl NodeRuntime {
         let inserted = *retention & bit == 0;
         let was_unretained = *retention == 0;
         *retention |= bit;
-        if was_unretained && let ProtocolRuntime::AnyTls(runtime) = &self.runtime {
-            runtime.pool.set_warm_retained(true);
+        if was_unretained {
+            match &self.runtime {
+                ProtocolRuntime::AnyTls(runtime) => runtime.pool.set_warm_retained(true),
+                ProtocolRuntime::VlessMux(runtime) => runtime.set_warm_retained(true),
+                ProtocolRuntime::None | ProtocolRuntime::Quic(_) => {}
+            }
         }
         WarmAttempt {
             runtime: Arc::clone(self),
@@ -419,6 +501,7 @@ impl NodeRuntime {
                 runtime.pool.set_warm_retained(false);
                 runtime.tls.evict();
             }
+            ProtocolRuntime::VlessMux(runtime) => runtime.set_warm_retained(false),
             ProtocolRuntime::Quic(runtime) => runtime.release_warm().await,
             ProtocolRuntime::None => {}
         }
@@ -466,12 +549,13 @@ impl NodeRuntime {
         self.release_warm_locked(retention, reason).await;
     }
 
-    /// Close every session-layer resource this runtime owns: AnyTLS pool
-    /// sessions (connections + demux tasks) or one cached QUIC client
+    /// Close every session-layer resource this runtime owns: AnyTLS or VLESS
+    /// mux pool sessions (connections + drivers), or one cached QUIC client
     /// (connection + endpoint driver). Terminal for the runtime; idempotent.
     pub async fn close(&self) {
         match &self.runtime {
             ProtocolRuntime::AnyTls(runtime) => runtime.pool.shutdown(),
+            ProtocolRuntime::VlessMux(runtime) => runtime.shutdown(),
             ProtocolRuntime::Quic(runtime) => runtime.force_close().await,
             ProtocolRuntime::None => {}
         }
@@ -482,6 +566,26 @@ impl NodeRuntime {
             anyhow::bail!("node '{}' has no AnyTLS runtime", self.node.name);
         };
         Ok(Arc::clone(&runtime.pool))
+    }
+
+    #[cfg_attr(not(feature = "rprx"), allow(dead_code))]
+    pub(crate) fn vless_h2_pool(
+        &self,
+    ) -> anyhow::Result<Arc<crate::proxy::vless_mux::VlessMuxPool>> {
+        let ProtocolRuntime::VlessMux(VlessMuxRuntime::H2(pool)) = &self.runtime else {
+            anyhow::bail!("node '{}' has no VLESS H2MUX runtime", self.node.name);
+        };
+        Ok(Arc::clone(pool))
+    }
+
+    #[cfg_attr(not(feature = "rprx"), allow(dead_code))]
+    pub(crate) fn vless_cool_pool(
+        &self,
+    ) -> anyhow::Result<Arc<crate::proxy::vless_cool::VlessCoolPool>> {
+        let ProtocolRuntime::VlessMux(VlessMuxRuntime::Cool(pool)) = &self.runtime else {
+            anyhow::bail!("node '{}' has no VLESS Mux.Cool runtime", self.node.name);
+        };
+        Ok(Arc::clone(pool))
     }
 
     pub(crate) async fn quic_client<T, F, Fut>(&self, build: F) -> anyhow::Result<Arc<T>>
@@ -511,11 +615,12 @@ impl NodeRuntime {
         match &self.runtime {
             ProtocolRuntime::None => true,
             ProtocolRuntime::AnyTls(runtime) => runtime.pool.has_usable_session(),
+            ProtocolRuntime::VlessMux(runtime) => runtime.has_usable_session(),
             ProtocolRuntime::Quic(runtime) => runtime.client_count().is_none_or(|count| count != 0),
         }
     }
 
-    /// Live reusable state: AnyTLS sessions or one occupied QUIC client slot.
+    /// Live reusable state: AnyTLS/VLESS sessions or one occupied QUIC client slot.
     /// `clients` is `None` while the slot lock is held; callers treat that
     /// in-flight state as warm rather than pruning its attribution.
     pub fn warm_counts(&self) -> WarmCounts {
@@ -523,6 +628,10 @@ impl NodeRuntime {
             ProtocolRuntime::None => WarmCounts::default(),
             ProtocolRuntime::AnyTls(runtime) => WarmCounts {
                 sessions: runtime.pool.live_session_count(),
+                clients: Some(0),
+            },
+            ProtocolRuntime::VlessMux(runtime) => WarmCounts {
+                sessions: runtime.live_session_count(),
                 clients: Some(0),
             },
             ProtocolRuntime::Quic(runtime) => WarmCounts {
@@ -535,14 +644,16 @@ impl NodeRuntime {
     fn tls_connector_sample(&self) -> Option<(Instant, u64)> {
         match &self.runtime {
             ProtocolRuntime::AnyTls(runtime) => runtime.tls.sample(),
-            ProtocolRuntime::None | ProtocolRuntime::Quic(_) => None,
+            ProtocolRuntime::None | ProtocolRuntime::VlessMux(_) | ProtocolRuntime::Quic(_) => None,
         }
     }
 
     fn evict_tls_connector_if_sample(&self, sample: (Instant, u64)) -> bool {
         match &self.runtime {
             ProtocolRuntime::AnyTls(runtime) => runtime.tls.evict_if_sample(sample),
-            ProtocolRuntime::None | ProtocolRuntime::Quic(_) => false,
+            ProtocolRuntime::None | ProtocolRuntime::VlessMux(_) | ProtocolRuntime::Quic(_) => {
+                false
+            }
         }
     }
 
@@ -550,7 +661,9 @@ impl NodeRuntime {
     pub(crate) fn tls_connector_loaded(&self) -> bool {
         match &self.runtime {
             ProtocolRuntime::AnyTls(runtime) => runtime.tls.is_loaded(),
-            ProtocolRuntime::None | ProtocolRuntime::Quic(_) => false,
+            ProtocolRuntime::None | ProtocolRuntime::VlessMux(_) | ProtocolRuntime::Quic(_) => {
+                false
+            }
         }
     }
 }
@@ -575,8 +688,8 @@ impl EphemeralRuntimeGuard {
     }
 
     /// Initiate the close without awaiting it: idempotent and Drop-safe.
-    /// AnyTLS pool teardown is fully synchronous and completes here; QUIC
-    /// client teardown awaits locks, so it is handed to a runtime-driven
+    /// AnyTLS/VLESS mux pool teardown is synchronous and completes here;
+    /// QUIC client teardown awaits locks, so it is handed to a runtime-driven
     /// task when one is available.
     pub fn request_close(&mut self) {
         let Some(runtime) = self.runtime.take() else {
@@ -584,6 +697,7 @@ impl EphemeralRuntimeGuard {
         };
         match &runtime.runtime {
             ProtocolRuntime::AnyTls(anytls) => anytls.pool.shutdown(),
+            ProtocolRuntime::VlessMux(vless) => vless.shutdown(),
             ProtocolRuntime::Quic(_) => {
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
                     handle.spawn(async move { runtime.close().await });
@@ -756,7 +870,7 @@ impl OutboundRuntimeRegistry {
                     node: Arc::new(node.clone()),
                     udp_capable: (crate::descriptor::descriptor(node.protocol).supports_udp)(node),
                     runtime: crate::descriptor::descriptor(node.protocol)
-                        .generation_runtime
+                        .generation_runtime(node)
                         .build(),
                     ephemeral: false,
                     warm_retention: Arc::new(tokio::sync::Mutex::new(0)),
@@ -900,8 +1014,10 @@ impl OutboundRuntimeRegistry {
             if moved_out.contains(id) {
                 continue;
             }
-            if let ProtocolRuntime::AnyTls(anytls) = &runtime.runtime {
-                anytls.pool.retire();
+            match &runtime.runtime {
+                ProtocolRuntime::AnyTls(anytls) => anytls.pool.retire(),
+                ProtocolRuntime::VlessMux(vless) => vless.retire(),
+                ProtocolRuntime::None | ProtocolRuntime::Quic(_) => {}
             }
         }
     }
@@ -933,6 +1049,32 @@ mod tests {
             protocol,
             address: "1.2.3.4:443".to_string(),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn vless_registry_runtime_follows_wire_mode() {
+        use honk_config::node::WireMode;
+        for (mode, expected) in [
+            (WireMode::Legacy, 0),
+            (WireMode::UotV2, 0),
+            (WireMode::Xudp, 0),
+            (WireMode::H2mux, 1),
+            (WireMode::H2muxPadded, 1),
+            (WireMode::MuxCool, 2),
+        ] {
+            let node = Node {
+                vless_mode: mode,
+                ..node("vless", NodeProtocol::VLess)
+            };
+            let registry = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
+            let actual = match &registry.get(&node.id).unwrap().runtime {
+                ProtocolRuntime::None => 0,
+                ProtocolRuntime::VlessMux(VlessMuxRuntime::H2(_)) => 1,
+                ProtocolRuntime::VlessMux(VlessMuxRuntime::Cool(_)) => 2,
+                _ => panic!("unexpected VLESS runtime"),
+            };
+            assert_eq!(actual, expected);
         }
     }
 
@@ -979,22 +1121,31 @@ mod tests {
 
     #[tokio::test]
     async fn warm_retention_releases_only_after_last_owner() {
-        let node = node("anytls-retained", NodeProtocol::AnyTLS);
-        let registry = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
-        let runtime = registry.get(&node.id).unwrap();
+        for node in [
+            node("anytls-retained", NodeProtocol::AnyTLS),
+            Node {
+                vless_mode: honk_config::node::WireMode::H2mux,
+                ..node("vless-retained", NodeProtocol::VLess)
+            },
+        ] {
+            let registry = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
+            let runtime = registry.get(&node.id).unwrap();
 
-        runtime.retain_warm(WarmRetention::Selector).await.commit();
-        runtime.retain_warm(WarmRetention::Udp).await.commit();
-        let ProtocolRuntime::AnyTls(anytls) = &runtime.runtime else {
-            panic!("AnyTLS node must own a session pool");
-        };
-        assert!(anytls.pool.is_warm_retained());
+            runtime.retain_warm(WarmRetention::Selector).await.commit();
+            runtime.retain_warm(WarmRetention::Udp).await.commit();
+            let retained = || match &runtime.runtime {
+                ProtocolRuntime::AnyTls(anytls) => anytls.pool.is_warm_retained(),
+                ProtocolRuntime::VlessMux(vless) => vless.is_warm_retained(),
+                _ => panic!("session protocol must own a pool"),
+            };
+            assert!(retained());
 
-        runtime.release_warm(WarmRetention::Selector).await;
-        assert!(anytls.pool.is_warm_retained());
+            runtime.release_warm(WarmRetention::Selector).await;
+            assert!(retained());
 
-        runtime.release_warm(WarmRetention::Udp).await;
-        assert!(!anytls.pool.is_warm_retained());
+            runtime.release_warm(WarmRetention::Udp).await;
+            assert!(!retained());
+        }
     }
 
     #[test]
@@ -1172,7 +1323,10 @@ mod tests {
 
     #[test]
     fn build_reusing_reuses_unchanged_nodes_and_reports_them() {
-        let unchanged = node("anytls", NodeProtocol::AnyTLS);
+        let unchanged = Node {
+            vless_mode: honk_config::node::WireMode::H2mux,
+            ..node("vless", NodeProtocol::VLess)
+        };
         let mut changed = node("tuic", NodeProtocol::Tuic);
         let first = OutboundRuntimeRegistry::build(&[unchanged.clone(), changed.clone()]).unwrap();
         let first_unchanged = first.get(&unchanged.id).unwrap();
@@ -1242,6 +1396,70 @@ mod tests {
             anytls.pool.is_retired(),
             "the new generation owns the reused runtime's shutdown"
         );
+    }
+
+    #[tokio::test]
+    async fn vless_mux_pools_retire_and_shut_down_with_their_generation() {
+        use honk_config::node::WireMode;
+        for mode in [WireMode::H2mux, WireMode::MuxCool] {
+            let node = Node {
+                vless_mode: mode,
+                ..node("vless", NodeProtocol::VLess)
+            };
+            let registry = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
+            let runtime = registry.get(&node.id).unwrap();
+            let ProtocolRuntime::VlessMux(mux) = &runtime.runtime else {
+                panic!("VLESS mux runtime expected");
+            };
+            registry.drain_session_pools();
+            assert!(mux.is_retired());
+
+            let registry = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
+            let runtime = registry.get(&node.id).unwrap();
+            let ProtocolRuntime::VlessMux(mux) = &runtime.runtime else {
+                panic!("VLESS mux runtime expected");
+            };
+            registry.shutdown().await;
+            assert!(mux.is_retired());
+        }
+    }
+
+    #[test]
+    fn vless_mux_runtime_reuse_is_mode_exact() {
+        use honk_config::node::WireMode;
+        let node = Node {
+            vless_mode: WireMode::MuxCool,
+            ..node("vless-cool", NodeProtocol::VLess)
+        };
+        let first = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
+        let (unchanged, reused) =
+            OutboundRuntimeRegistry::build_reusing(std::slice::from_ref(&node), 64, Some(&first))
+                .unwrap();
+        assert_eq!(reused, HashSet::from([node.id]));
+        assert!(Arc::ptr_eq(
+            &first.get(&node.id).unwrap(),
+            &unchanged.get(&node.id).unwrap()
+        ));
+
+        let changed = Node {
+            vless_mode: WireMode::H2mux,
+            ..node.clone()
+        };
+        let (changed_registry, reused) = OutboundRuntimeRegistry::build_reusing(
+            std::slice::from_ref(&changed),
+            64,
+            Some(&first),
+        )
+        .unwrap();
+        assert!(reused.is_empty());
+        assert!(!Arc::ptr_eq(
+            &first.get(&node.id).unwrap(),
+            &changed_registry.get(&node.id).unwrap()
+        ));
+        assert!(matches!(
+            changed_registry.get(&node.id).unwrap().runtime,
+            ProtocolRuntime::VlessMux(VlessMuxRuntime::H2(_))
+        ));
     }
 
     #[test]

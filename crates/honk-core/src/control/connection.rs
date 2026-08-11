@@ -2119,7 +2119,7 @@ impl ControlPlaneHandle {
         // entering this path. For a pool miss, gate only work that can open
         // a physical connection: a warm generation-owned QUIC/AnyTLS runtime
         // merely opens a logical stream on its retained transport.
-        let reuses_generation_transport = entry.descriptor.has_generation_runtime()
+        let reuses_generation_transport = entry.descriptor.has_generation_runtime(node)
             && generation
                 .get(&node.id)
                 .is_some_and(|runtime| runtime.is_warm_or_stateless());

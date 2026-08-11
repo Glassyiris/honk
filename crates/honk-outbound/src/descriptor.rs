@@ -1,32 +1,36 @@
 //! Per-protocol facts: UDP support, pooling behavior, generation runtime
 //! ownership, and share-link schemes.
 
-use honk_config::node::Node;
+use honk_config::node::{Node, WireMode};
 use honk_config::types::NodeProtocol;
 
 use crate::runtime::GenerationRuntime;
 
 /// Per-protocol facts. Function-typed fields cover per-node conditions:
-/// Trojan and AnyTLS gate UDP on `node.network`, while Trojan ready-stream
-/// pooling additionally depends on its transport.
+/// VLESS, Trojan, and AnyTLS gate UDP on `node.network`, while Trojan
+/// ready-stream pooling additionally depends on its transport.
 pub struct ProtocolDescriptor {
     pub protocol: NodeProtocol,
     pub supports_udp: fn(&Node) -> bool,
     pub pool_ready_streams: fn(&Node) -> bool,
     pub pool_bare_tcp: fn(&Node) -> bool,
-    pub generation_runtime: GenerationRuntime,
+    pub generation_runtime: fn(&Node) -> GenerationRuntime,
     pub share_link_schemes: &'static [&'static str],
 }
 
 impl ProtocolDescriptor {
-    pub fn has_generation_runtime(&self) -> bool {
-        self.generation_runtime != GenerationRuntime::None
+    pub fn generation_runtime(&self, node: &Node) -> GenerationRuntime {
+        (self.generation_runtime)(node)
+    }
+
+    pub fn has_generation_runtime(&self, node: &Node) -> bool {
+        self.generation_runtime(node) != GenerationRuntime::None
     }
 }
 
-/// The dial-time network gate, shared by the capability table and the
-/// trojan/anytls UDP dial paths: no `network` restriction means UDP is
-/// allowed; otherwise the list must contain "udp".
+/// The dial-time network gate shared by capability predicates and UDP dial
+/// paths: no `network` restriction means UDP is allowed; otherwise the list
+/// must contain "udp".
 pub(crate) fn network_allows_udp(node: &Node) -> bool {
     node.network.as_deref().is_none_or(|network| {
         network
@@ -41,6 +45,37 @@ fn never(_: &Node) -> bool {
 
 fn always(_: &Node) -> bool {
     true
+}
+
+fn no_runtime(_: &Node) -> GenerationRuntime {
+    GenerationRuntime::None
+}
+
+fn anytls_runtime(_: &Node) -> GenerationRuntime {
+    GenerationRuntime::AnyTls
+}
+
+fn quic_runtime(_: &Node) -> GenerationRuntime {
+    GenerationRuntime::Quic
+}
+
+fn vless_supports_udp(node: &Node) -> bool {
+    node.vless_mode != WireMode::Legacy && network_allows_udp(node)
+}
+
+fn vless_pool_bare_tcp(node: &Node) -> bool {
+    matches!(
+        node.vless_mode,
+        WireMode::Legacy | WireMode::UotV2 | WireMode::Xudp
+    )
+}
+
+fn vless_runtime(node: &Node) -> GenerationRuntime {
+    match node.vless_mode {
+        WireMode::H2mux | WireMode::H2muxPadded => GenerationRuntime::VlessH2Mux,
+        WireMode::MuxCool => GenerationRuntime::VlessCoolMux,
+        WireMode::Legacy | WireMode::UotV2 | WireMode::Xudp => GenerationRuntime::None,
+    }
 }
 
 /// Poolable only on the plain TCP transport: `dial()` completes the TLS
@@ -59,7 +94,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         supports_udp: always,
         pool_ready_streams: never,
         pool_bare_tcp: always,
-        generation_runtime: GenerationRuntime::None,
+        generation_runtime: no_runtime,
         share_link_schemes: &["ss"],
     },
     ProtocolDescriptor {
@@ -67,7 +102,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         supports_udp: network_allows_udp,
         pool_ready_streams: trojan_pool_ready_streams,
         pool_bare_tcp: always,
-        generation_runtime: GenerationRuntime::None,
+        generation_runtime: no_runtime,
         share_link_schemes: &["trojan"],
     },
     ProtocolDescriptor {
@@ -75,15 +110,15 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         supports_udp: never,
         pool_ready_streams: never,
         pool_bare_tcp: always,
-        generation_runtime: GenerationRuntime::None,
+        generation_runtime: no_runtime,
         share_link_schemes: &["vmess"],
     },
     ProtocolDescriptor {
         protocol: NodeProtocol::VLess,
-        supports_udp: never,
+        supports_udp: vless_supports_udp,
         pool_ready_streams: never,
-        pool_bare_tcp: always,
-        generation_runtime: GenerationRuntime::None,
+        pool_bare_tcp: vless_pool_bare_tcp,
+        generation_runtime: vless_runtime,
         share_link_schemes: &["vless"],
     },
     // After the greeting (+ optional RFC 1929 auth) and a successful CONNECT
@@ -95,7 +130,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         supports_udp: always,
         pool_ready_streams: always,
         pool_bare_tcp: always,
-        generation_runtime: GenerationRuntime::None,
+        generation_runtime: no_runtime,
         share_link_schemes: &["socks5", "socks4", "socks4a"],
     },
     // QUIC-based (hy2/tuic/juicity): a pooled bare TCP is unusable — their
@@ -106,7 +141,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         supports_udp: always,
         pool_ready_streams: never,
         pool_bare_tcp: never,
-        generation_runtime: GenerationRuntime::Quic,
+        generation_runtime: quic_runtime,
         share_link_schemes: &["hysteria2", "hysteria"],
     },
     ProtocolDescriptor {
@@ -114,7 +149,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         supports_udp: always,
         pool_ready_streams: never,
         pool_bare_tcp: never,
-        generation_runtime: GenerationRuntime::Quic,
+        generation_runtime: quic_runtime,
         share_link_schemes: &["tuic"],
     },
     ProtocolDescriptor {
@@ -122,7 +157,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         supports_udp: always,
         pool_ready_streams: never,
         pool_bare_tcp: never,
-        generation_runtime: GenerationRuntime::Quic,
+        generation_runtime: quic_runtime,
         share_link_schemes: &["juicity"],
     },
     // Multiplexed: the node-owned session pool already keeps reusable
@@ -133,7 +168,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         supports_udp: network_allows_udp,
         pool_ready_streams: never,
         pool_bare_tcp: never,
-        generation_runtime: GenerationRuntime::AnyTls,
+        generation_runtime: anytls_runtime,
         share_link_schemes: &["anytls"],
     },
     ProtocolDescriptor {
@@ -141,7 +176,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         supports_udp: always,
         pool_ready_streams: never,
         pool_bare_tcp: always,
-        generation_runtime: GenerationRuntime::None,
+        generation_runtime: no_runtime,
         share_link_schemes: &[],
     },
     ProtocolDescriptor {
@@ -149,7 +184,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         supports_udp: never,
         pool_ready_streams: never,
         pool_bare_tcp: always,
-        generation_runtime: GenerationRuntime::None,
+        generation_runtime: no_runtime,
         share_link_schemes: &[],
     },
 ];
@@ -186,12 +221,59 @@ mod tests {
 
     #[test]
     fn generation_runtime_matches_protocol_family() {
-        assert!(descriptor(NodeProtocol::AnyTLS).has_generation_runtime());
-        assert!(descriptor(NodeProtocol::Tuic).has_generation_runtime());
-        assert!(descriptor(NodeProtocol::Juicity).has_generation_runtime());
-        assert!(descriptor(NodeProtocol::Hysteria2).has_generation_runtime());
-        assert!(!descriptor(NodeProtocol::Trojan).has_generation_runtime());
-        assert!(!descriptor(NodeProtocol::Direct).has_generation_runtime());
+        let node = |protocol| Node {
+            protocol,
+            ..Default::default()
+        };
+        for protocol in [
+            NodeProtocol::AnyTLS,
+            NodeProtocol::Tuic,
+            NodeProtocol::Juicity,
+            NodeProtocol::Hysteria2,
+        ] {
+            let node = node(protocol);
+            assert!(descriptor(protocol).has_generation_runtime(&node));
+        }
+        for protocol in [
+            NodeProtocol::VLess,
+            NodeProtocol::Trojan,
+            NodeProtocol::Direct,
+        ] {
+            let node = node(protocol);
+            assert!(!descriptor(protocol).has_generation_runtime(&node));
+        }
+    }
+
+    #[test]
+    fn vless_capabilities_follow_wire_mode() {
+        let descriptor = descriptor(NodeProtocol::VLess);
+        for (mode, udp, bare, runtime) in [
+            (WireMode::Legacy, false, true, GenerationRuntime::None),
+            (WireMode::UotV2, true, true, GenerationRuntime::None),
+            (WireMode::Xudp, true, true, GenerationRuntime::None),
+            (WireMode::H2mux, true, false, GenerationRuntime::VlessH2Mux),
+            (
+                WireMode::H2muxPadded,
+                true,
+                false,
+                GenerationRuntime::VlessH2Mux,
+            ),
+            (
+                WireMode::MuxCool,
+                true,
+                false,
+                GenerationRuntime::VlessCoolMux,
+            ),
+        ] {
+            let node = Node {
+                protocol: NodeProtocol::VLess,
+                vless_mode: mode,
+                ..Default::default()
+            };
+            assert_eq!((descriptor.supports_udp)(&node), udp);
+            assert_eq!((descriptor.pool_bare_tcp)(&node), bare);
+            assert_eq!(descriptor.generation_runtime(&node), runtime);
+        }
     }
 
     #[test]
@@ -220,6 +302,15 @@ mod tests {
             ..Default::default()
         };
         assert!(!anytls(&ws_only));
+
+        let vless = descriptor(NodeProtocol::VLess).supports_udp;
+        let tcp_only = Node {
+            protocol: NodeProtocol::VLess,
+            vless_mode: WireMode::H2mux,
+            network: Some("tcp".to_string()),
+            ..Default::default()
+        };
+        assert!(!vless(&tcp_only));
 
         let ss = descriptor(NodeProtocol::SS).supports_udp;
         let restricted = Node {

@@ -41,6 +41,9 @@ const GLOBAL_PAYLOAD_CAPACITY: usize = 8 * 1024 * 1024;
 const TRANSPORT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const DRIVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(6);
 const DRIVER_ABORT_TIMEOUT: Duration = Duration::from_secs(1);
+/// Includes the eagerly-created original-destination socket. Reaching the
+/// bound fails the endpoint closed rather than replying from the wrong source.
+const MAX_REPLY_SOCKETS_PER_ENDPOINT: usize = 8;
 /// A pooled UDP endpoint representing one NAT mapping.
 pub struct UdpEndpoint {
     /// The proxy-side framed UDP transport (upstream).
@@ -190,32 +193,20 @@ impl UdpEndpoint {
 
     /// Record a peer we've sent a packet to (for reply validation).
     ///
-    /// Stores the peer address in a ring buffer. During the probing phase
-    /// (before the first reply is received), only replies from recorded
-    /// peers are accepted.
+    /// Stores the peer address in a ring buffer. Transports without an
+    /// explicit full-cone capability accept replies only from these peers.
     pub fn record_pending_reply_peer(&self, peer: SocketAddr) {
         let mut ring = self.pending_reply_peers.lock();
         let next = self.pending_reply_next.fetch_add(1, Ordering::Relaxed) as usize % 8;
         ring[next] = (peer, true);
     }
 
-    /// Validate that a reply peer is expected.
-    ///
-    /// Returns `true` if the reply should be accepted:
-    /// - After `has_reply` is true: always accept (established state).
-    /// - During probing: only accept if the peer was recorded via
-    ///   `record_pending_reply_peer`.
+    /// Validate that a reply peer is expected for a fixed-peer transport.
     pub fn validate_reply_peer(&self, peer: SocketAddr) -> bool {
-        if self.has_reply.load(Ordering::Relaxed) {
-            return true;
-        }
-        let ring = self.pending_reply_peers.lock();
-        for (addr, valid) in ring.iter() {
-            if *valid && *addr == peer {
-                return true;
-            }
-        }
-        false
+        self.pending_reply_peers
+            .lock()
+            .iter()
+            .any(|(addr, valid)| *valid && *addr == peer)
     }
 }
 
@@ -301,18 +292,18 @@ pub(crate) struct EndpointRemoval {
 }
 
 /// A synchronously-created anyfrom socket. The default factory calls the
-/// daens-scoped production helper; tests and embedders may inject a real
-/// alternative without duplicating the endpoint state machine.
+/// daens-scoped production helper so eager and lazy sockets preserve the same
+/// network-namespace and source-address invariants.
 pub(super) trait UdpReplySocketFactory: Send + Sync + std::fmt::Debug {
-    fn create(&self, original_dst: SocketAddr) -> io::Result<UdpSocket>;
+    fn create(&self, source: SocketAddr) -> io::Result<UdpSocket>;
 }
 
 #[derive(Debug)]
 struct SystemUdpReplySocketFactory;
 
 impl UdpReplySocketFactory for SystemUdpReplySocketFactory {
-    fn create(&self, original_dst: SocketAddr) -> io::Result<UdpSocket> {
-        super::new_udp_reply_socket(original_dst)
+    fn create(&self, source: SocketAddr) -> io::Result<UdpSocket> {
+        super::new_udp_reply_socket(source)
     }
 }
 /// One retained packet owns all permits that account for it. Socket ingress
@@ -899,9 +890,9 @@ impl UdpEndpointPool {
         )
     }
 
-    /// Production dependency injection seam for synchronous anyfrom creation.
-    /// The factory is called before the driver starts and never from a
-    /// transport-I/O await path.
+    /// Dependency injection seam for synchronous anyfrom creation. The first
+    /// socket is created before the driver starts; accepted alternate reply
+    /// sources use the same factory lazily in the driver.
     pub(super) fn with_reply_socket_factory(
         capacity_limit: usize,
         reply_socket_factory: Arc<dyn UdpReplySocketFactory>,
@@ -943,8 +934,8 @@ impl UdpEndpointPool {
         }
     }
 
-    pub(super) fn create_reply_socket(&self, original_dst: SocketAddr) -> io::Result<UdpSocket> {
-        self.reply_socket_factory.create(original_dst)
+    pub(super) fn create_reply_socket(&self, source: SocketAddr) -> io::Result<UdpSocket> {
+        self.reply_socket_factory.create(source)
     }
 
     pub(crate) fn set_remove_sink(&self, tx: tokio::sync::mpsc::Sender<EndpointRemoval>) {
@@ -1811,6 +1802,7 @@ struct UdpDriverContext {
     endpoint: Arc<UdpEndpoint>,
     queue_rx: mpsc::Receiver<QueuedDatagram>,
     reply_socket: Arc<UdpSocket>,
+    reply_socket_factory: Arc<dyn UdpReplySocketFactory>,
     client_addr: SocketAddr,
     client_dst: SocketAddr,
     alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
@@ -1927,6 +1919,7 @@ impl UdpEndpointPool {
                     endpoint: Arc::clone(&endpoint),
                     queue_rx,
                     reply_socket,
+                    reply_socket_factory: Arc::clone(&pool.reply_socket_factory),
                     client_addr,
                     client_dst,
                     alive_set,
@@ -1966,6 +1959,7 @@ async fn run_endpoint_driver(
         endpoint,
         queue_rx,
         reply_socket,
+        reply_socket_factory,
         client_addr,
         client_dst,
         alive_set,
@@ -2018,6 +2012,7 @@ async fn run_endpoint_driver(
     let receiver = receive_loop(
         Arc::clone(&endpoint),
         reply_socket,
+        reply_socket_factory,
         client_addr,
         client_dst,
         Arc::clone(&alive_set),
@@ -2109,9 +2104,11 @@ async fn send_one(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn receive_loop(
     endpoint: Arc<UdpEndpoint>,
     reply_socket: Arc<UdpSocket>,
+    reply_socket_factory: Arc<dyn UdpReplySocketFactory>,
     client_addr: SocketAddr,
     client_dst: SocketAddr,
     alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
@@ -2123,6 +2120,9 @@ async fn receive_loop(
     } else {
         honk_outbound::alive::IpVersion::V6
     };
+    // The normal fixed-target path keeps using the pre-created socket without
+    // allocating. Full-cone sources populate this small endpoint-local cache.
+    let mut alternate_reply_sockets = Vec::new();
     let mut buf = [0u8; 65536];
     loop {
         let received = tokio::time::timeout(
@@ -2140,13 +2140,47 @@ async fn receive_loop(
                 ));
             }
         };
-        if source != endpoint.relay_addr && !endpoint.validate_reply_peer(source) {
+        if source != endpoint.relay_addr
+            && !endpoint.proxy_socket.allows_full_cone_replies()
+            && !endpoint.validate_reply_peer(source)
+        {
             debug!(
                 "UDP endpoint driver rejecting unexpected reply peer {}",
                 source
             );
             continue;
         }
+        if source.is_ipv4() != client_addr.is_ipv4() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "UDP reply source {} and client {} use different address families",
+                    source, client_addr
+                ),
+            ));
+        }
+        let reply_socket = if source == client_dst {
+            reply_socket.as_ref()
+        } else {
+            let index = match alternate_reply_sockets
+                .iter()
+                .position(|(cached_source, _)| *cached_source == source)
+            {
+                Some(index) => index,
+                None => {
+                    if alternate_reply_sockets.len() >= MAX_REPLY_SOCKETS_PER_ENDPOINT - 1 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AddrNotAvailable,
+                            "UDP endpoint reply-source socket cache is full",
+                        ));
+                    }
+                    let socket = reply_socket_factory.create(source)?;
+                    alternate_reply_sockets.push((source, socket));
+                    alternate_reply_sockets.len() - 1
+                }
+            };
+            &alternate_reply_sockets[index].1
+        };
         reply_socket.send_to(&buf[..n], client_addr).await?;
         endpoint.mark_reply();
         if let Some(elapsed) = endpoint.take_first_reply_metric() {
@@ -2251,6 +2285,7 @@ mod tests {
                 endpoint,
                 queue_rx,
                 reply_socket,
+                reply_socket_factory: Arc::new(SystemUdpReplySocketFactory),
                 client_addr,
                 client_dst,
                 alive_set,
@@ -2296,6 +2331,7 @@ mod tests {
         sent: Mutex<Vec<Vec<u8>>>,
         confirmed_sends: std::sync::atomic::AtomicUsize,
         send_progress: tokio::sync::Notify,
+        allows_full_cone_replies: bool,
     }
 
     impl ScriptedPacketTransport {
@@ -2307,6 +2343,7 @@ mod tests {
                 sent: Mutex::new(Vec::new()),
                 confirmed_sends: std::sync::atomic::AtomicUsize::new(0),
                 send_progress: tokio::sync::Notify::new(),
+                allows_full_cone_replies: false,
             }
         }
 
@@ -2322,7 +2359,13 @@ mod tests {
                 sent: Mutex::new(Vec::new()),
                 confirmed_sends: std::sync::atomic::AtomicUsize::new(0),
                 send_progress: tokio::sync::Notify::new(),
+                allows_full_cone_replies: false,
             }
+        }
+
+        fn allowing_full_cone_replies(mut self) -> Self {
+            self.allows_full_cone_replies = true;
+            self
         }
 
         fn sent_packets(&self) -> Vec<Vec<u8>> {
@@ -2348,6 +2391,10 @@ mod tests {
     impl honk_outbound::proxy::PacketTransport for ScriptedPacketTransport {
         fn relay_addr(&self) -> SocketAddr {
             self.relay
+        }
+
+        fn allows_full_cone_replies(&self) -> bool {
+            self.allows_full_cone_replies
         }
 
         async fn send_packet(&self, data: &[u8]) -> io::Result<()> {
@@ -2446,8 +2493,58 @@ mod tests {
         Arc::new(UdpEndpoint::new(transport, relay, TEST_NODE_ID))
     }
 
+    #[test]
+    fn fixed_peer_validation_survives_establishment() {
+        let expected = make_addr("192.0.2.1", 53);
+        let unexpected = make_addr("192.0.2.2", 53);
+        let transport = Arc::new(ScriptedPacketTransport::new(expected, []));
+        let endpoint = driver_test_endpoint(transport, expected);
+        endpoint.record_pending_reply_peer(expected);
+        assert!(endpoint.validate_reply_peer(expected));
+        endpoint.mark_reply();
+        assert!(!endpoint.validate_reply_peer(unexpected));
+    }
+
     async fn test_reply_socket() -> Arc<UdpSocket> {
         Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap())
+    }
+
+    #[derive(Debug)]
+    struct InjectedReplySocketFactory {
+        sockets: Mutex<std::collections::HashMap<SocketAddr, std::net::UdpSocket>>,
+        created: Mutex<Vec<SocketAddr>>,
+    }
+
+    impl InjectedReplySocketFactory {
+        fn new(sockets: impl IntoIterator<Item = std::net::UdpSocket>) -> Self {
+            Self {
+                sockets: Mutex::new(
+                    sockets
+                        .into_iter()
+                        .map(|socket| (socket.local_addr().unwrap(), socket))
+                        .collect(),
+                ),
+                created: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn created(&self) -> Vec<SocketAddr> {
+            self.created.lock().clone()
+        }
+    }
+
+    impl UdpReplySocketFactory for InjectedReplySocketFactory {
+        fn create(&self, source: SocketAddr) -> io::Result<UdpSocket> {
+            let socket = self.sockets.lock().remove(&source).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    format!("no injected reply socket for {source}"),
+                )
+            })?;
+            socket.set_nonblocking(true)?;
+            self.created.lock().push(source);
+            UdpSocket::from_std(socket)
+        }
     }
 
     fn commit_ready(
@@ -3217,6 +3314,93 @@ mod tests {
         pool.remove(client, dst);
         tokio::task::yield_now().await;
         assert!(pool.is_empty());
+    }
+
+    #[tokio::test]
+    async fn udp_endpoint_replies_from_each_accepted_transport_source() {
+        let source_socket_a = std::net::UdpSocket::bind("127.0.0.2:0").unwrap();
+        let source_socket_b = std::net::UdpSocket::bind("127.0.0.3:0").unwrap();
+        let source_a = source_socket_a.local_addr().unwrap();
+        let source_b = source_socket_b.local_addr().unwrap();
+        let factory = Arc::new(InjectedReplySocketFactory::new([
+            source_socket_a,
+            source_socket_b,
+        ]));
+        let pool = Arc::new(UdpEndpointPool::with_reply_socket_factory(
+            1,
+            factory.clone(),
+        ));
+        let stats = Arc::new(StatsManager::new());
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = client_socket.local_addr().unwrap();
+        let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        let mut lease =
+            match pool.reserve_or_enqueue(client, source_a, b"request", slow_permit, &stats) {
+                EndpointReservation::Initializing(lease) => lease,
+                _ => panic!("reply-source fixture must initialize"),
+            };
+        let transport = Arc::new(
+            ScriptedPacketTransport::with_receive_actions(
+                source_a,
+                [DriverSendAction::Ok],
+                [
+                    DriverReceiveAction::Packet {
+                        data: b"from-b".to_vec(),
+                        source: source_b,
+                    },
+                    DriverReceiveAction::Packet {
+                        data: b"from-a".to_vec(),
+                        source: source_a,
+                    },
+                    DriverReceiveAction::Packet {
+                        data: b"from-b-again".to_vec(),
+                        source: source_b,
+                    },
+                    DriverReceiveAction::Pending,
+                ],
+            )
+            .allowing_full_cone_replies(),
+        );
+        let endpoint = driver_test_endpoint(transport, source_a);
+        endpoint.record_pending_reply_peer(source_a);
+        let queue_rx = lease.take_queue_receiver().unwrap();
+        let reply_socket = Arc::new(pool.create_reply_socket(source_a).unwrap());
+        let mut driver = pool.spawn_driver(
+            client,
+            source_a,
+            lease.generation(),
+            lease.decision_token(),
+            Arc::clone(&endpoint),
+            queue_rx,
+            reply_socket,
+            Arc::new(honk_outbound::alive::AliveDialerSet::new()),
+            Arc::clone(&stats),
+            "test-node".to_owned(),
+        );
+        driver.wait_ready().await.unwrap();
+        assert!(lease.commit_ready(endpoint));
+        driver.start(lease.take_first().unwrap()).unwrap();
+        drop(lease);
+        driver.wait_first_ack().await.unwrap();
+
+        let mut buf = [0u8; 16];
+        for (expected_payload, expected_source) in [
+            (b"from-b".as_slice(), source_b),
+            (b"from-a".as_slice(), source_a),
+            (b"from-b-again".as_slice(), source_b),
+        ] {
+            let (n, source) =
+                tokio::time::timeout(Duration::from_secs(1), client_socket.recv_from(&mut buf))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(&buf[..n], expected_payload);
+            assert_eq!(source, expected_source);
+        }
+        assert_eq!(factory.created(), vec![source_a, source_b]);
+
+        driver.abort();
+        assert!(pool.shutdown().await);
     }
 
     #[tokio::test]

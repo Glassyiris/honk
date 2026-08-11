@@ -1,9 +1,9 @@
-//! VLESS throughput benchmark against a LAN target reachable from the
-//! proxy server's outbound. Measures download and upload throughput over
-//! the tunnel (median + peak over N runs) plus a coarse CPU usage sample.
+//! VLESS latency, throughput, and CPU benchmark against a reachable HTTP
+//! target. The share link selects the mode; generation-owned modes reuse
+//! their carrier across runs.
 //!
 //! Usage: vless_bench <share-link> <target-addr> [runs=5] [up_mb=256]
-//!   share-link:  vless://... (reality / reality+vision)
+//!   share-link:  any VLESS link accepted by `Node::from_share_link`
 //!   target-addr: host:port of the bench HTTP server (GET /big.bin,
 //!                POST /sink), e.g. 10.10.10.70:18080
 
@@ -34,19 +34,23 @@ fn cpu_ticks() -> u64 {
 }
 
 struct Sample {
+    open_ms: f64,
     mbps: f64,
     cpu_pct: f64,
 }
 
 /// Download `Content-Length` bytes through the tunnel; returns MB/s and CPU%.
 async fn bench_down(
-    tcp: &std::sync::Arc<dyn honk_outbound::proxy::TcpOutbound>,
-    node: &Node,
+    registry: &ProxyRegistry,
+    generation: std::sync::Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
+    node_id: uuid::Uuid,
     target: SocketAddr,
 ) -> anyhow::Result<Sample> {
-    let mut s = tcp
-        .dial(node, target, None, Duration::from_secs(10))
+    let open = Instant::now();
+    let mut s = registry
+        .dial_runtime(generation, node_id, target, None, Duration::from_secs(10))
         .await?;
+    let open_ms = open.elapsed().as_secs_f64() * 1000.0;
     s.stream
         .write_all(b"GET /big.bin HTTP/1.1\r\nHost: bench\r\nConnection: close\r\n\r\n")
         .await?;
@@ -76,6 +80,7 @@ async fn bench_down(
     let secs = t0.elapsed().as_secs_f64();
     let ticks1 = cpu_ticks();
     Ok(Sample {
+        open_ms,
         mbps: total as f64 / 1e6 / secs,
         cpu_pct: cpu_pct(ticks1 - ticks0, secs),
     })
@@ -83,14 +88,17 @@ async fn bench_down(
 
 /// Upload `bytes` through the tunnel to POST /sink; returns MB/s and CPU%.
 async fn bench_up(
-    tcp: &std::sync::Arc<dyn honk_outbound::proxy::TcpOutbound>,
-    node: &Node,
+    registry: &ProxyRegistry,
+    generation: std::sync::Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
+    node_id: uuid::Uuid,
     target: SocketAddr,
     bytes: u64,
 ) -> anyhow::Result<Sample> {
-    let mut s = tcp
-        .dial(node, target, None, Duration::from_secs(10))
+    let open = Instant::now();
+    let mut s = registry
+        .dial_runtime(generation, node_id, target, None, Duration::from_secs(10))
         .await?;
+    let open_ms = open.elapsed().as_secs_f64() * 1000.0;
     s.stream
         .write_all(
             format!(
@@ -125,6 +133,7 @@ async fn bench_up(
     let secs = t0.elapsed().as_secs_f64();
     let ticks1 = cpu_ticks();
     Ok(Sample {
+        open_ms,
         mbps: sent as f64 / 1e6 / secs,
         cpu_pct: cpu_pct(ticks1 - ticks0, secs),
     })
@@ -136,13 +145,17 @@ fn cpu_pct(delta_ticks: u64, secs: f64) -> f64 {
 }
 
 fn summarize(name: &str, samples: &[Sample]) {
-    let mut v: Vec<f64> = samples.iter().map(|s| s.mbps).collect();
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let median = v[v.len() / 2];
-    let peak = v[v.len() - 1];
-    let cpu = samples.iter().map(|s| s.cpu_pct).sum::<f64>() / samples.len() as f64;
+    let mut throughput: Vec<f64> = samples.iter().map(|sample| sample.mbps).collect();
+    throughput.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mut opens: Vec<f64> = samples.iter().map(|sample| sample.open_ms).collect();
+    opens.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median = throughput[throughput.len() / 2];
+    let peak = throughput[throughput.len() - 1];
+    let open_p50 = opens[opens.len() / 2];
+    let open_p95 = opens[(opens.len() * 95).div_ceil(100).saturating_sub(1)];
+    let cpu = samples.iter().map(|sample| sample.cpu_pct).sum::<f64>() / samples.len() as f64;
     println!(
-        "{name}: median {median:.1} MB/s, peak {peak:.1} MB/s, avg cpu {cpu:.0}% (runs: {})",
+        "{name}: open p50/p95 {open_p50:.3}/{open_p95:.3} ms; median {median:.1} MB/s, peak {peak:.1} MB/s, avg cpu {cpu:.0}% (runs: {})",
         samples
             .iter()
             .map(|s| format!("{:.1}", s.mbps))
@@ -160,11 +173,9 @@ async fn main() -> anyhow::Result<()> {
 
     let node = Node::from_share_link(&link)?;
     let registry = ProxyRegistry::default_resolver()?;
-    let tcp = registry
-        .find(node.protocol)
-        .expect("handler for protocol")
-        .tcp
-        .clone();
+    let generation = std::sync::Arc::new(honk_outbound::runtime::OutboundRuntimeRegistry::build(
+        std::slice::from_ref(&node),
+    )?);
 
     println!(
         "node: {} ({}:{}) flow={:?} reality={}",
@@ -178,18 +189,39 @@ async fn main() -> anyhow::Result<()> {
     let mut downs = Vec::with_capacity(runs);
     let mut ups = Vec::with_capacity(runs);
     for i in 1..=runs {
-        match bench_down(&tcp, &node, target).await {
+        match bench_down(
+            &registry,
+            std::sync::Arc::clone(&generation),
+            node.id,
+            target,
+        )
+        .await
+        {
             Ok(s) => {
-                println!("down run {i}: {:.1} MB/s (cpu {:.0}%)", s.mbps, s.cpu_pct);
+                println!(
+                    "down run {i}: open {:.3} ms, {:.1} MB/s (cpu {:.0}%)",
+                    s.open_ms, s.mbps, s.cpu_pct
+                );
                 downs.push(s);
             }
             Err(e) => println!("down run {i}: FAILED: {e:#}"),
         }
     }
     for i in 1..=runs {
-        match bench_up(&tcp, &node, target, up_bytes).await {
+        match bench_up(
+            &registry,
+            std::sync::Arc::clone(&generation),
+            node.id,
+            target,
+            up_bytes,
+        )
+        .await
+        {
             Ok(s) => {
-                println!("up   run {i}: {:.1} MB/s (cpu {:.0}%)", s.mbps, s.cpu_pct);
+                println!(
+                    "up   run {i}: open {:.3} ms, {:.1} MB/s (cpu {:.0}%)",
+                    s.open_ms, s.mbps, s.cpu_pct
+                );
                 ups.push(s);
             }
             Err(e) => println!("up   run {i}: FAILED: {e:#}"),
@@ -201,5 +233,6 @@ async fn main() -> anyhow::Result<()> {
     if !ups.is_empty() {
         summarize("UP   summary", &ups);
     }
+    generation.shutdown().await;
     Ok(())
 }
