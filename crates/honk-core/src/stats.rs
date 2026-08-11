@@ -394,9 +394,30 @@ pub struct WarmSnapshot {
     pub selector_nodes: u64,
     pub traffic_nodes: u64,
     pub anytls_sessions: u64,
+    pub vless_sessions: u64,
     pub tuic_clients: u64,
     pub juicity_clients: u64,
     pub hysteria2_clients: u64,
+}
+
+impl WarmSnapshot {
+    fn add_protocol_counts(
+        &mut self,
+        protocol: honk_config::types::NodeProtocol,
+        counts: honk_outbound::runtime::WarmCounts,
+    ) {
+        use honk_config::types::NodeProtocol;
+        match protocol {
+            NodeProtocol::AnyTLS => self.anytls_sessions += counts.sessions as u64,
+            NodeProtocol::VLess => self.vless_sessions += counts.sessions as u64,
+            NodeProtocol::Tuic => self.tuic_clients += counts.clients.unwrap_or(0) as u64,
+            NodeProtocol::Juicity => self.juicity_clients += counts.clients.unwrap_or(0) as u64,
+            NodeProtocol::Hysteria2 => {
+                self.hysteria2_clients += counts.clients.unwrap_or(0) as u64;
+            }
+            _ => {}
+        }
+    }
 }
 
 impl StatsManager {
@@ -433,20 +454,11 @@ impl StatsManager {
         generation: &honk_outbound::runtime::OutboundRuntimeRegistry,
         pool: &crate::pool::ConnectionPool,
     ) -> WarmSnapshot {
-        use honk_config::types::NodeProtocol;
         let mut snap = WarmSnapshot::default();
         let mut warm_ids = std::collections::HashSet::new();
         for runtime in generation.values() {
             let counts = runtime.warm_counts();
-            match runtime.node.protocol {
-                NodeProtocol::AnyTLS => snap.anytls_sessions += counts.sessions as u64,
-                NodeProtocol::Tuic => snap.tuic_clients += counts.clients.unwrap_or(0) as u64,
-                NodeProtocol::Juicity => snap.juicity_clients += counts.clients.unwrap_or(0) as u64,
-                NodeProtocol::Hysteria2 => {
-                    snap.hysteria2_clients += counts.clients.unwrap_or(0) as u64
-                }
-                _ => {}
-            }
+            snap.add_protocol_counts(runtime.node.protocol, counts);
             let bare =
                 pool.has_live_bare_entry(&format!("{}:{}", runtime.node.host(), runtime.node.port));
             // An unknown QUIC client count (map locked by an in-flight
@@ -999,6 +1011,19 @@ mod tests {
             honk_config::routing::DATAPATH_RESERVED_MARK_MASK,
             honk_ebpf_common::SKB_MARK_RESERVED_MASK
         );
+    }
+
+    #[test]
+    fn warm_snapshot_routes_vless_sessions() {
+        let mut snapshot = WarmSnapshot::default();
+        snapshot.add_protocol_counts(
+            honk_config::types::NodeProtocol::VLess,
+            honk_outbound::runtime::WarmCounts {
+                sessions: 2,
+                clients: Some(0),
+            },
+        );
+        assert_eq!(snapshot.vless_sessions, 2);
     }
 
     #[tokio::test]

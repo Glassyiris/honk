@@ -854,6 +854,7 @@ async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json
             },
             "sessions": {
                 "anytls": warm.anytls_sessions,
+                "vless": warm.vless_sessions,
                 "tuic": warm.tuic_clients,
                 "juicity": warm.juicity_clients,
                 "hysteria2": warm.hysteria2_clients,

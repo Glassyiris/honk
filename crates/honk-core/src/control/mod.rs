@@ -2275,7 +2275,7 @@ impl ControlPlane {
             listener.abort_and_join().await;
         }
         // Active flows own the current runtime until the drain completes; only
-        // then terminally close its AnyTLS pools and reject any late warm work.
+        // then terminally close its session pools and reject any late warm work.
         // Dropping this future on timeout detaches nothing: the force-closes
         // are synchronous once entered and none of the runtimes touch the
         // eBPF backend.

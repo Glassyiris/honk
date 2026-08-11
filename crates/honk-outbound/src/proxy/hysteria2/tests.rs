@@ -1,5 +1,11 @@
+use super::wire::{
+    AUTH_PADDING_MAX, AUTH_PADDING_MIN, FRAME_TYPE_TCP_REQUEST, HEADER_AUTH, HEADER_CC_RX,
+    HEADER_PADDING, HEADER_UDP, MAX_ADDRESS_LENGTH, MAX_FIELD_SECTION, MAX_PADDING_LENGTH,
+    STATUS_AUTH_OK, URL_HOST, URL_PATH, decode_udp_message, encode_tcp_request, encode_udp_message,
+    fragment_udp_message, random_padding, read_varint_stream, skip_bytes, write_varint,
+};
 use super::*;
-use crate::quic::testutil;
+use crate::quic::{recv_read_exact as read_exact, testutil};
 use honk_config::types::NodeProtocol;
 use quinn::EndpointConfig;
 use std::time::Instant;

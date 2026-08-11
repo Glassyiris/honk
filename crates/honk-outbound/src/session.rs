@@ -88,23 +88,30 @@ pub enum SessionState {
 
 /// RAII stream-slot reservation on one session — the single capacity
 /// truth. Released on Drop (stream end, failed open, caller cancel).
-pub struct SessionPermit<S> {
-    _session: Arc<S>,
-    _permit: tokio::sync::OwnedSemaphorePermit,
+pub struct SessionPermit<S: ManagedSession> {
+    session: Arc<S>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
-impl<S> SessionPermit<S> {
+impl<S: ManagedSession> SessionPermit<S> {
     pub fn new(session: Arc<S>, permit: tokio::sync::OwnedSemaphorePermit) -> Self {
         Self {
-            _session: session,
-            _permit: permit,
+            session,
+            permit: Some(permit),
         }
     }
 }
 
-impl<S> std::fmt::Debug for SessionPermit<S> {
+impl<S: ManagedSession> std::fmt::Debug for SessionPermit<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionPermit").finish_non_exhaustive()
+    }
+}
+
+impl<S: ManagedSession> Drop for SessionPermit<S> {
+    fn drop(&mut self) {
+        drop(self.permit.take());
+        self.session.permit_released();
     }
 }
 
@@ -134,6 +141,8 @@ pub trait ManagedSession: Send + Sync {
     /// Stop accepting new logical channels (GOAWAY, max-age); existing
     /// ones run to the end and the session closes at zero.
     fn begin_drain(&self) {}
+    /// Observe release after the semaphore slot becomes available.
+    fn permit_released(&self) {}
     /// Atomically reserve one stream slot: check `Active` → acquire →
     /// re-check `Active` (a session that began draining in between
     /// releases the permit immediately and reports `None`). Default `None`
@@ -193,6 +202,10 @@ pub enum OpenError {
     /// The target/protocol refused or auth failed: the session is
     /// healthy — surface immediately, never retry.
     Refused(anyhow::Error),
+    /// The carrier stopped accepting new streams but existing streams remain
+    /// valid. Drain it and retry on a fresh session without force-closing it.
+    #[cfg_attr(not(feature = "rprx"), allow(dead_code))]
+    Draining(anyhow::Error),
 }
 
 /// A speculative checkout atomically either reserves one stream on an
@@ -737,22 +750,22 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         for _attempt in 0..2 {
             let session = self.offer(dial.clone()).await?;
             let Some(permit) = session.try_reserve() else {
-                if session.state() != SessionState::Active {
-                    // Draining/closed between offer and reserve: prune and
-                    // retry — the pool dials a fresh session.
+                if session.state() == SessionState::Closed {
                     self.invalidate(&session);
                 }
-                // Saturated between offer and reserve: the session stays —
-                // it is healthy and its streams are alive, killing it
-                // would nuke up to a full session of live traffic (the
-                // "full-capacity false kill"). Retry instead: offer picks
-                // another session, dials a new one, or backs off at the cap.
+                // Active means capacity raced us; Draining means GOAWAY or
+                // protocol exhaustion raced us. Both retain live streams and
+                // must stay tracked while the next attempt finds a carrier.
                 last_err = Some(anyhow!("session has no stream capacity"));
                 continue;
             };
             match open(Arc::clone(&session), permit).await {
                 Ok(t) => return Ok(t),
                 Err(OpenError::Refused(e)) => return Err(e),
+                Err(OpenError::Draining(e)) => {
+                    session.begin_drain();
+                    last_err = Some(e);
+                }
                 Err(OpenError::Session(e)) => {
                     self.invalidate(&session);
                     last_err = Some(e);
@@ -1406,6 +1419,79 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pre_reservation_drain_does_not_close_live_session() {
+        #[derive(Debug)]
+        struct DrainOnReserveSession {
+            state: AtomicUsize,
+            drain_once: AtomicBool,
+            permits: Arc<tokio::sync::Semaphore>,
+        }
+
+        impl DrainOnReserveSession {
+            fn new(drain_once: bool) -> Arc<Self> {
+                Arc::new(Self {
+                    state: AtomicUsize::new(0),
+                    drain_once: AtomicBool::new(drain_once),
+                    permits: Arc::new(tokio::sync::Semaphore::new(1)),
+                })
+            }
+        }
+
+        impl ManagedSession for DrainOnReserveSession {
+            fn active_streams(&self) -> usize {
+                1 - self.permits.available_permits()
+            }
+
+            fn is_closed(&self) -> bool {
+                self.state.load(Ordering::Acquire) == 2
+            }
+
+            fn close(&self) {
+                self.state.store(2, Ordering::Release);
+            }
+
+            fn state(&self) -> SessionState {
+                match self.state.load(Ordering::Acquire) {
+                    0 => SessionState::Active,
+                    1 => SessionState::Draining,
+                    _ => SessionState::Closed,
+                }
+            }
+
+            fn try_reserve(self: &Arc<Self>) -> Option<SessionPermit<Self>> {
+                if self.drain_once.swap(false, Ordering::AcqRel) {
+                    self.state.store(1, Ordering::Release);
+                    return None;
+                }
+                if self.state() != SessionState::Active {
+                    return None;
+                }
+                let permit = Arc::clone(&self.permits).try_acquire_owned().ok()?;
+                Some(SessionPermit::new(Arc::clone(self), permit))
+            }
+        }
+
+        let pool = SessionPool::new(SessionPoolConfig {
+            max_sessions: 2,
+            max_streams_per_session: 1,
+            ..Default::default()
+        });
+        let draining = DrainOnReserveSession::new(true);
+        pool.insert(&draining);
+
+        pool.open_with(
+            || async { Ok(DrainOnReserveSession::new(false)) },
+            |_session, _permit| async { Ok::<_, OpenError>(()) },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(draining.state(), SessionState::Draining);
+        assert!(!draining.is_closed());
+        assert_eq!(pool.metrics().sessions, 2);
     }
 
     #[tokio::test(start_paused = true)]

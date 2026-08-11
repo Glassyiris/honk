@@ -130,7 +130,7 @@ pub async fn urltest_node(
 }
 /// Measure through reusable generation state only when that state is already
 /// warm. Cold session-owning nodes use an ephemeral runtime so a dashboard
-/// group scan cannot retain one QUIC client or AnyTLS pool per tested node.
+/// group scan cannot retain one QUIC client or session pool per tested node.
 pub async fn urltest_node_in_generation(
     generation: &Arc<crate::runtime::OutboundRuntimeRegistry>,
     node: &Node,
