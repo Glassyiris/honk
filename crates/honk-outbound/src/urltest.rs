@@ -433,10 +433,18 @@ mod resolver_hook_tests {
         set_urltest_resolver(std::sync::Arc::new(move |host, port| {
             let called2 = called2.clone();
             Box::pin(async move {
-                called2.store(true, std::sync::atomic::Ordering::Relaxed);
-                assert_eq!(host, "example.invalid");
-                assert_eq!(port, 443);
-                vec!["127.0.0.1:443".parse().unwrap()]
+                // Other urltest tests run concurrently against this global
+                // hook — answer only our host, pass foreigners through to
+                // the system resolver instead of breaking their dials.
+                if host == "example.invalid" && port == 443 {
+                    called2.store(true, std::sync::atomic::Ordering::Relaxed);
+                    vec!["127.0.0.1:443".parse().unwrap()]
+                } else {
+                    tokio::net::lookup_host(format!("{host}:{port}"))
+                        .await
+                        .map(|addrs| addrs.collect())
+                        .unwrap_or_default()
+                }
             })
         }));
         let node = Node::default();
