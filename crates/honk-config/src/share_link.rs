@@ -138,9 +138,11 @@ impl Node {
             }
             query.insert(key, value.into_owned());
         }
-        if protocol != NodeProtocol::VLess && query.contains_key("vless_mode") {
+        if protocol != NodeProtocol::VLess
+            && (query.contains_key("vless_mode") || query.contains_key("packetEncoding"))
+        {
             return Err(ConfigError::Parse(
-                "vless_mode is valid only for VLESS share links".into(),
+                "vless_mode/packetEncoding are valid only for VLESS share links".into(),
             ));
         }
 
