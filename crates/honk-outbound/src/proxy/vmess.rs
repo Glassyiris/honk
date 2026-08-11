@@ -8,8 +8,10 @@ use rand::Rng;
 use rand::RngExt;
 use sha2::Sha256;
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 
 use super::addr::{self, SocksAddr};
@@ -168,6 +170,51 @@ impl Session {
             resp_iv,
             resp_header: rng.random(),
         }
+    }
+}
+
+struct VmessStream {
+    inner: tokio::io::DuplexStream,
+    relay: tokio::task::AbortHandle,
+}
+
+impl std::fmt::Debug for VmessStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VmessStream").finish_non_exhaustive()
+    }
+}
+
+impl AsyncRead for VmessStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for VmessStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl Drop for VmessStream {
+    fn drop(&mut self) {
+        self.relay.abort();
     }
 }
 
@@ -357,10 +404,13 @@ impl VmessHandler {
         let header_wire = Self::seal_request_header(&cmd_key, &auth_id, &conn_nonce, &plain);
 
         let (client_half, server_half) = tokio::io::duplex(65536);
-        tokio::spawn(vmess_relay(stream, server_half, header_wire, session));
+        let relay = tokio::spawn(vmess_relay(stream, server_half, header_wire, session));
 
         Ok(ProxyStream {
-            stream: Box::new(client_half),
+            stream: Box::new(VmessStream {
+                inner: client_half,
+                relay: relay.abort_handle(),
+            }),
             target_addr: target,
             target_domain: target_domain.map(|s| s.to_string()),
         })
@@ -818,6 +868,35 @@ mod tests {
             let n = rx.open_chunk(&mut ct).unwrap();
             assert_eq!(&ct[..n], payload);
         }
+    }
+
+    #[tokio::test]
+    async fn dropping_vmess_stream_closes_physical_transport() {
+        let (physical, mut peer) = tokio::io::duplex(4096);
+        let uuid = uuid::Uuid::parse_str(UUID).unwrap();
+        let target = "93.184.216.34:53".parse().unwrap();
+        let stream =
+            VmessHandler::perform_handshake(uuid.as_bytes(), Box::new(physical), target, None)
+                .unwrap();
+
+        let mut first = [0];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            peer.read_exact(&mut first),
+        )
+        .await
+        .expect("VMess relay must write its request header")
+        .unwrap();
+        drop(stream);
+
+        let mut rest = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            peer.read_to_end(&mut rest),
+        )
+        .await
+        .expect("dropping the VMess stream must close its physical transport")
+        .unwrap();
     }
 
     #[test]
