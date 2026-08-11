@@ -803,3 +803,112 @@ async fn test_direct_probe_uses_direct_check_addr() {
         .await
     );
 }
+
+/// Failure demotion is sticky: a dial failure adds a strike that only
+/// max(strikes, 2) consecutive real probe successes clear — one lucky
+/// success never re-ranks a flaky node.
+#[test]
+fn test_failure_demotion_needs_consecutive_successes() {
+    let set = AliveDialerSet::new();
+    let node = id(1);
+    let probe_ok = |ms: u64| {
+        set.record_probe_latency(
+            node,
+            ProbeDomain::Tcp,
+            IpVersion::V4,
+            Duration::from_millis(ms),
+        );
+    };
+    let demoted = || set.is_failure_demoted(node, ProbeDomain::Tcp, IpVersion::V4);
+
+    probe_ok(10);
+    assert!(!demoted());
+
+    set.record_dial_failure(node, ProbeDomain::Tcp, IpVersion::V4);
+    assert!(demoted());
+    probe_ok(10);
+    assert!(demoted(), "one success must not clear the strike");
+    probe_ok(10);
+    assert!(!demoted(), "two consecutive successes clear it");
+
+    // A fresh failure resets the clear progress: the success between the
+    // two failures no longer counts toward the clear.
+    set.record_dial_failure(node, ProbeDomain::Tcp, IpVersion::V4);
+    probe_ok(10);
+    set.record_dial_failure(node, ProbeDomain::Tcp, IpVersion::V4);
+    probe_ok(10);
+    assert!(demoted(), "progress was reset by the second failure");
+    probe_ok(10);
+    assert!(!demoted());
+}
+
+/// Real-traffic fast path: three consecutive dials far above the node's own
+/// EMA demote it (synthetic strike + emergency-probe signal); mixed
+/// fast/slow sequences never do.
+#[test]
+fn test_report_dial_latency_demotes_after_three_slow_dials() {
+    let set = AliveDialerSet::new();
+    let node = id(1);
+    let report = |ms: u64| {
+        set.report_dial_latency(
+            node,
+            ProbeDomain::Tcp,
+            IpVersion::V4,
+            Duration::from_millis(ms),
+        )
+    };
+
+    // Warmup: the EMA learns ~100ms without judging.
+    assert!(!report(100));
+    assert!(!report(100));
+    assert!(!report(100));
+
+    // 400ms > min(2×100, 100+500) = 200ms → slow; two in a row are not
+    // enough, the third consecutive one demotes.
+    assert!(!report(400));
+    assert!(!report(400));
+    assert!(report(400), "third consecutive slow dial demotes");
+    assert!(set.is_failure_demoted(node, ProbeDomain::Tcp, IpVersion::V4));
+
+    // Streak resets on any fast dial: slow,slow,fast,slow,slow never
+    // reaches three consecutive.
+    let node2 = id(2);
+    let report2 = |ms: u64| {
+        set.report_dial_latency(
+            node2,
+            ProbeDomain::Tcp,
+            IpVersion::V4,
+            Duration::from_millis(ms),
+        )
+    };
+    report2(100);
+    report2(100);
+    report2(100);
+    assert!(!report2(400));
+    assert!(!report2(400));
+    assert!(!report2(100), "fast dial resets the streak");
+    assert!(!report2(400));
+    assert!(!report2(400));
+    assert!(!set.is_failure_demoted(node2, ProbeDomain::Tcp, IpVersion::V4));
+}
+
+/// Built-in direct/block nodes are exempt: local-egress latency is not
+/// node quality.
+#[test]
+fn test_report_dial_latency_ignores_builtin_nodes() {
+    let set = AliveDialerSet::new();
+    for _ in 0..6 {
+        assert!(!set.report_dial_latency(
+            DIRECT_NODE_ID,
+            ProbeDomain::Tcp,
+            IpVersion::V4,
+            Duration::from_secs(9),
+        ));
+        assert!(!set.report_dial_latency(
+            BLOCK_NODE_ID,
+            ProbeDomain::Tcp,
+            IpVersion::V4,
+            Duration::from_secs(9),
+        ));
+    }
+}

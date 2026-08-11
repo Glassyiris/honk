@@ -1519,7 +1519,7 @@ fn test_urltest_keeps_incumbent_within_tolerance_of_current_latency() {
 
 /// Lab scenario S3: a flaky node (fast when it works, but failing probes and
 /// dials) must not be re-adopted while the incumbent is healthy. A probe
-/// failure demotes the node via a synthetic-latest sample (history and the
+/// failure demotes the node via a failure strike (history and the
 /// real moving average are kept), recovery needs 2 successes, and a dial
 /// failure skips the incumbent's hysteresis exactly once — after that the
 /// tolerance guards the incumbent against the flaky node's lower average.
@@ -1546,7 +1546,7 @@ fn urltest_flaky_node_stays_demoted_after_dial_failure() {
     probe_ok(nid("c"), 42);
     assert_eq!(m.select_node("g").unwrap().name, "a");
 
-    // Probe failure on 'a' → synthetic-latest demotion moves the group to
+    // Probe failure on 'a' → strike demotion moves the group to
     // 'b' even though one failure no longer kills the node (TCP threshold 3).
     alive.mark_dead(nid("a"));
     assert!(alive.is_alive_for(nid("a"), ProbeDomain::Tcp, IpVersion::V4));
@@ -1558,8 +1558,8 @@ fn urltest_flaky_node_stays_demoted_after_dial_failure() {
     probe_ok(nid("a"), 7);
     assert_eq!(m.select_node("g").unwrap().name, "b");
 
-    // Now the flaky loop: a user dial through 'a' fails → synthetic sample,
-    // an emergency re-probe succeeds (the node works 60% of the time).
+    // Now the flaky loop: a user dial through 'a' fails → strike, an
+    // emergency re-probe succeeds (the node works 60% of the time).
     for round in 0..6 {
         alive.report_unavailable_traffic(nid("a"), ProbeDomain::Tcp, IpVersion::V4);
         alive.record_dial_failure(nid("a"), ProbeDomain::Tcp, IpVersion::V4);
@@ -1571,9 +1571,9 @@ fn urltest_flaky_node_stays_demoted_after_dial_failure() {
         );
     }
 
-    // When the incumbent itself fails a dial, its synthetic-latest sample
-    // skips hysteresis and the group moves immediately; one lucky re-probe
-    // does not let it reclaim the rank against the new incumbent.
+    // When the incumbent itself fails a dial, its strike skips hysteresis
+    // and the group moves immediately; one lucky re-probe does not let it
+    // reclaim the rank against the new incumbent.
     let alive2 = Arc::new(AliveDialerSet::new());
     let m2 = GroupManager::with_alive_set(
         &[make_group("g2", GroupPolicy::URLTest, vec![na, nb])],
@@ -1596,6 +1596,39 @@ fn probe_ok2(alive: &AliveDialerSet, n: uuid::Uuid, ms: u64) {
         IpVersion::V4,
         Duration::from_millis(ms),
     );
+}
+
+/// Strike stickiness at ranking level: one lucky probe success after a dial
+/// failure does NOT clear the demotion — even when the challenger's latency
+/// would win by far. Two consecutive successes clear it, and then the
+/// challenger wins only because the gap exceeds tolerance.
+#[test]
+fn urltest_strike_demotion_needs_two_consecutive_successes() {
+    let (na, nb) = (nid("a"), nid("b"));
+    let nodes = vec![make_node(na, "a"), make_node(nb, "b")];
+    let alive = Arc::new(AliveDialerSet::new());
+    let m = GroupManager::with_alive_set(
+        &[make_group("g", GroupPolicy::URLTest, vec![na, nb])],
+        &nodes,
+        Some(alive.clone()),
+    );
+    probe_ok2(&alive, nid("a"), 7);
+    probe_ok2(&alive, nid("b"), 21);
+    assert_eq!(m.select_node("g").unwrap().name, "a");
+
+    alive.record_dial_failure(nid("a"), ProbeDomain::Tcp, IpVersion::V4);
+    assert_eq!(m.select_node("g").unwrap().name, "b");
+
+    // One lucky success: the strike is still pending — 'a' stays demoted
+    // even though 7ms vs 200ms is far beyond tolerance.
+    probe_ok2(&alive, nid("a"), 7);
+    probe_ok2(&alive, nid("b"), 200);
+    assert_eq!(m.select_node("g").unwrap().name, "b");
+
+    // The second consecutive success clears the strike; with the gap beyond
+    // tolerance 'a' wins immediately.
+    probe_ok2(&alive, nid("a"), 7);
+    assert_eq!(m.select_node("g").unwrap().name, "a");
 }
 
 /// A URLTest group with a custom check_url ranks and filters by the

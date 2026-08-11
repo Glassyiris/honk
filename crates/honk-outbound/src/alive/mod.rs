@@ -7,7 +7,8 @@ mod probe;
 #[cfg(test)]
 mod tests;
 
-use self::collection::DialerCollection;
+use self::collection::{DialerCollection, SLOW_DIAL_STREAK_MAX, TrafficVerdict};
+use honk_config::config::{BLOCK_NODE_ID, DIRECT_NODE_ID};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -936,19 +937,16 @@ impl AliveDialerSet {
         if ma > Duration::ZERO { Some(ma) } else { None }
     }
 
-    /// Whether the node's newest sample in this domain is a synthetic
-    /// failure placeholder. Selection demotes such nodes below any node
-    /// with a real latest measurement.
-    pub fn has_synthetic_latest(
-        &self,
-        node_id: Uuid,
-        domain: ProbeDomain,
-        ipver: IpVersion,
-    ) -> bool {
+    /// Whether the node carries pending failure strikes in this domain.
+    /// Selection demotes such nodes below every non-demoted candidate; the
+    /// demotion clears only after max(strikes, 2) consecutive real
+    /// successes, so a fast-but-flaky node cannot reclaim rank with one
+    /// lucky probe.
+    pub fn is_failure_demoted(&self, node_id: Uuid, domain: ProbeDomain, ipver: IpVersion) -> bool {
         let idx = alive_index(domain, ipver);
         let cols = self.collections.read();
         cols.get(&node_id)
-            .is_some_and(|arr| arr[idx].latencies.latest_is_synthetic())
+            .is_some_and(|arr| arr[idx].is_failure_demoted())
     }
 
     /// Read the last probe latency for a node-domain pair.
@@ -996,15 +994,54 @@ impl AliveDialerSet {
         coll.latencies.avg().or_else(|| coll.latencies.last())
     }
 
-    /// Dial-failure handling: append one synthetic timeout sample. The
-    /// node's real history and moving average are retained so URLTest
-    /// tolerance hysteresis keeps its baseline; the synthetic-latest flag
-    /// demotes the node in ranking until the next real success, which is
-    /// what stops a fast-but-flaky node from reclaiming the top rank with
-    /// a single lucky probe.
+    /// Dial-failure handling: append one synthetic timeout sample and one
+    /// failure strike. The node's real history and moving average are
+    /// retained so URLTest tolerance hysteresis keeps its baseline; the
+    /// strike demotes the node in ranking until max(strikes, 2) consecutive
+    /// real successes clear it, which is what stops a fast-but-flaky node
+    /// from reclaiming the top rank with a single lucky probe.
     pub fn record_dial_failure(&self, node_id: Uuid, domain: ProbeDomain, ipver: IpVersion) {
         let coll = self.get_or_create_collection(node_id, alive_index(domain, ipver));
         coll.mark_unavailable();
+    }
+
+    /// Feed one REAL proxied dial's wall-clock latency (network round trip
+    /// only — pool-ready hits are excluded by the caller). Sudden
+    /// degradation (3 consecutive dials slower than min(2×ema, ema+500ms))
+    /// appends a synthetic failure strike (strike demotion) and returns
+    /// true so the caller fires an emergency probe. Gradual drift stays
+    /// owned by the probe cycle. Returns true once per demotion.
+    ///
+    /// A false positive (target-mix shift, not node decay) self-heals: the
+    /// emergency probe succeeds and consecutive probe successes clear the
+    /// strike while the replacement node serves traffic meanwhile.
+    pub fn report_dial_latency(
+        &self,
+        node_id: Uuid,
+        domain: ProbeDomain,
+        ipver: IpVersion,
+        elapsed: Duration,
+    ) -> bool {
+        // Local-egress latency is not node quality.
+        if node_id == DIRECT_NODE_ID || node_id == BLOCK_NODE_ID {
+            return false;
+        }
+        let coll = self.get_or_create_collection(node_id, alive_index(domain, ipver));
+        match coll.record_traffic_latency(elapsed) {
+            TrafficVerdict::Slow => {
+                if coll.bump_slow_streak() >= SLOW_DIAL_STREAK_MAX {
+                    coll.reset_slow_streak();
+                    coll.mark_unavailable();
+                    true
+                } else {
+                    false
+                }
+            }
+            TrafficVerdict::Fast | TrafficVerdict::Warmup => {
+                coll.reset_slow_streak();
+                false
+            }
+        }
     }
 
     /// Seed a persisted delay sample into the node's TCP-v4 latency

@@ -49,9 +49,13 @@ The effective tolerance is `max(configured tolerance, 1 ms)`. The incumbent stay
 
 `best latency + tolerance >= incumbent current measured latency`
 
-The incumbent baseline is read again at selection time, not retained from the moment it won. A degraded incumbent can therefore be replaced; this matches sing-box `Select()` behavior. Hysteresis is skipped for an incumbent whose newest sample is a synthetic failure placeholder — a just-failed incumbent is replaced immediately.
+The incumbent baseline is read again at selection time, not retained from the moment it won. A degraded incumbent can therefore be replaced; this matches sing-box `Select()` behavior. Hysteresis is skipped for an incumbent carrying failure strikes — a just-failed incumbent is replaced immediately.
 
-A probe or dial failure appends one synthetic 10-second placeholder sample. The node's real history and moving average are retained (the placeholder never feeds the average), but a candidate whose newest sample is synthetic ranks below every real-measured candidate until its next real success — this is the flap guard that stops a fast-but-flaky node from reclaiming first place with one lucky probe.
+A probe or dial failure appends one synthetic 10-second placeholder sample and one failure strike. The node's real history and moving average are retained (the placeholder never feeds the average; it is display-exclusion only), but a candidate with pending strikes ranks below every non-demoted candidate. Strikes clear only after `max(strikes, 2)` consecutive real successes — this is the flap guard that stops a fast-but-flaky node from reclaiming first place with one lucky probe.
+
+Real traffic also feeds ranking directly (TCP only). Each node keeps a self-referential EMA (α=1/8, after 3 warmup dials) of fresh dial latencies; pool-ready hits are excluded because they perform no network round trip. Three consecutive dials slower than `min(2×EMA, EMA+500 ms)` append one failure strike and fire an emergency probe. The probe moving average is never touched, and a false positive (a shifted target mix rather than node decay) self-heals when the emergency probe succeeds and consecutive probe successes clear the strike. Gradual drift stays owned by the probe cycle; UDP degradation keeps the probe-cycle plus `DataUdp` traffic-threshold handling.
+
+When an authoritative single-candidate dial fails, the just-reported failure usually changes the plan, so the flow retries exactly once with the re-planned replacement — the failure is invisible to the client. A re-plan yielding the same first leaf (Selector pin, Fallback pin on a still-alive member, single-node outbound) is not retried.
 
 A group `check_url` creates independent TCP-only liveness and latency state keyed by `(member tag, check_url)`. A failure removes that member only from groups using that target. Selector groups ignore `check_url` and emit a warning. URLTest probing sleeps after `idle_timeout`; an unset timeout uses the 30-minute health-layer default, and the next real selection wakes probes immediately.
 
@@ -103,7 +107,7 @@ A dead state normally needs two consecutive probe successes to recover. `notify_
 
 An alive-to-dead transition invokes the control-plane death callback, which purges the node's pooled connections and UDP endpoints so no stale reusable object is handed to new traffic.
 
-The last real TCP delay sample per node is written to `cache.db` every 60 seconds and restored at startup only when it is at most 24 hours old. Liveness is never restored from the cache. Synthetic 10-second placeholders demote the node in selection but are flagged, excluded from display history and the moving average, and never persisted as the last real sample.
+The last real TCP delay sample per node is written to `cache.db` every 60 seconds and restored at startup only when it is at most 24 hours old. Liveness is never restored from the cache. Synthetic 10-second placeholders are flagged, excluded from display history and the moving average, and never persisted as the last real sample; selection demotion lives on the failure-strike counters, not on the placeholder.
 
 ## UDP candidate eligibility
 

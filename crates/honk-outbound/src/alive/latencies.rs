@@ -4,10 +4,10 @@ use parking_lot::Mutex;
 use std::time::{Duration, SystemTime};
 
 /// One latency sample. `synthetic` marks the 10s placeholder pushed on
-/// failure: a synthetic-latest node is demoted below all real-measured
-/// nodes in selection, but the placeholder is not a real measurement and
-/// must never be displayed as clash delay history (dashboards otherwise
-/// show a bogus 10000ms). It never feeds the moving average.
+/// failure: it is not a real measurement and must never be displayed as
+/// clash delay history (dashboards otherwise show a bogus 10000ms), and it
+/// never feeds the moving average. Selection demotion no longer reads this
+/// flag — it lives on `DialerCollection::failure_strikes`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LatencySample {
     pub latency: Duration,
@@ -82,16 +82,6 @@ impl Latencies10 {
         Some(self.buf[self.last_index()?].latency)
     }
 
-    /// Whether the newest sample is a synthetic failure placeholder —
-    /// selection demotes such nodes below any node with a real latest
-    /// measurement until the next real success.
-    pub(crate) fn latest_is_synthetic(&self) -> bool {
-        let Some(idx) = self.last_index() else {
-            return false;
-        };
-        self.buf[idx].synthetic
-    }
-
     /// Latest REAL (non-synthetic) sample, scanning back from the tail —
     /// display semantics (clash delay history).
     pub(crate) fn last_real_sample(&self) -> Option<LatencySample> {
@@ -143,10 +133,6 @@ impl SyncLatencies10 {
         self.inner.lock().last()
     }
 
-    pub(crate) fn latest_is_synthetic(&self) -> bool {
-        self.inner.lock().latest_is_synthetic()
-    }
-
     pub(crate) fn last_real_sample(&self) -> Option<LatencySample> {
         self.inner.lock().last_real_sample()
     }
@@ -192,18 +178,6 @@ mod tests {
         assert_eq!(l.last(), None);
         assert_eq!(l.avg(), None);
         assert_eq!(l.count(), 0);
-    }
-
-    #[test]
-    fn test_latest_is_synthetic() {
-        let mut l = Latencies10::new(5);
-        assert!(!l.latest_is_synthetic());
-        l.append(real(100));
-        assert!(!l.latest_is_synthetic());
-        l.append(LatencySample::synthetic(Duration::from_secs(10)));
-        assert!(l.latest_is_synthetic());
-        l.append(real(120));
-        assert!(!l.latest_is_synthetic());
     }
 
     #[test]

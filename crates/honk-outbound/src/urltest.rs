@@ -368,10 +368,11 @@ pub async fn urltest_group(
     results
 }
 
-/// Empty or plain-HTTP URLs fall back to the default HTTPS liveness URL.
+/// Empty URLs fall back to the default HTTPS liveness URL; an explicit
+/// URL (http or https) is always honored as given.
 fn normalize_url(url: &str) -> &str {
     let url = url.trim();
-    if url.is_empty() || url.starts_with("http://") {
+    if url.is_empty() {
         DEFAULT_URLTEST_URL
     } else {
         url
@@ -654,7 +655,7 @@ mod tests {
         assert_eq!(normalize_url(""), DEFAULT_URLTEST_URL);
         assert_eq!(
             normalize_url("http://www.gstatic.com/generate_204"),
-            DEFAULT_URLTEST_URL
+            "http://www.gstatic.com/generate_204"
         );
         assert_eq!(
             normalize_url("https://example.com/x"),
@@ -780,14 +781,15 @@ mod tests {
         assert!(results[1].1.is_err());
 
         // Failure → synthetic penalty sample on top of the retained history:
-        // the latest sample is the 10s placeholder (selection demotes the
-        // node), while the real 999ms moving average survives unpoisoned.
+        // the latest sample is the 10s placeholder (display-only) and a
+        // failure strike demotes the node, while the real 999ms moving
+        // average survives unpoisoned.
         for m in &members {
             assert_eq!(
                 alive_set.get_last_latency(m.id, ProbeDomain::Tcp, IpVersion::V4),
                 Some(Duration::from_secs(10))
             );
-            assert!(alive_set.has_synthetic_latest(m.id, ProbeDomain::Tcp, IpVersion::V4));
+            assert!(alive_set.is_failure_demoted(m.id, ProbeDomain::Tcp, IpVersion::V4));
             assert_eq!(
                 alive_set.get_moving_average(m.id, ProbeDomain::Tcp, IpVersion::V4),
                 Some(Duration::from_millis(999))
