@@ -649,6 +649,7 @@ impl Config {
                     node.name
                 )));
             }
+            node.validate_vless_mode()?;
             // direct/block are the injected built-ins; a user node may
             // neither take their names nor their protocols.
             if matches!(
@@ -765,6 +766,60 @@ mod builtin_nodes_tests {
             config.nodes[0].transport = ok.into();
             assert!(config.validate().is_ok(), "transport '{ok}' must pass");
         }
+    }
+
+    #[test]
+    fn test_validate_rejects_vless_mode_conflicts() {
+        let base = crate::node::Node::from_share_link(
+            "vless://uuid@example.com:443?vless_mode=h2mux#vless",
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.nodes.push(base.clone());
+        assert!(config.validate().is_ok());
+
+        for mode in [
+            crate::node::WireMode::UotV2,
+            crate::node::WireMode::H2mux,
+            crate::node::WireMode::H2muxPadded,
+            crate::node::WireMode::MuxCool,
+        ] {
+            config.nodes[0] = base.clone();
+            config.nodes[0].vless_mode = mode;
+            config.nodes[0].flow = Some("xtls-rprx-vision".into());
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("with flow")
+            );
+        }
+        config.nodes[0] = base.clone();
+        config.nodes[0].vless_mode = crate::node::WireMode::Xudp;
+        config.nodes[0].flow = Some("xtls-rprx-vision".into());
+        assert!(config.validate().is_ok());
+
+        config.nodes[0] = base.clone();
+        config.nodes[0].encryption = Some("mlkem768x25519plus.native.1rtt.key".into());
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("with VLESS Encryption")
+        );
+
+        config.nodes[0] = base;
+        config.nodes[0].protocol = crate::types::NodeProtocol::Trojan;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("non-VLESS protocol")
+        );
     }
 
     #[test]

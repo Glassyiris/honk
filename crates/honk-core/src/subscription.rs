@@ -363,6 +363,225 @@ fn decode_base64_flexible(input: &str) -> anyhow::Result<Vec<u8>> {
     Ok(data)
 }
 
+fn yaml_value<'a>(mapping: &'a serde_yaml::Mapping, key: &str) -> Option<&'a serde_yaml::Value> {
+    mapping.get(serde_yaml::Value::String(key.to_string()))
+}
+
+fn yaml_alias<'a>(
+    mapping: &'a serde_yaml::Mapping,
+    keys: &[&str],
+) -> Result<Option<&'a serde_yaml::Value>, String> {
+    let mut found = None;
+    for key in keys {
+        if let Some(value) = yaml_value(mapping, key) {
+            if found.is_some() {
+                return Err(format!("conflicting aliases '{}'", keys.join("/")));
+            }
+            found = Some(value);
+        }
+    }
+    Ok(found)
+}
+
+fn parse_vless_external_mode(
+    mapping: &serde_yaml::Mapping,
+) -> Result<honk_config::node::WireMode, String> {
+    use honk_config::node::WireMode;
+    let udp = yaml_value(mapping, "udp")
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| "VLESS udp must be boolean".to_string())
+        })
+        .transpose()?;
+
+    let packet_encoding = yaml_alias(mapping, &["packet-encoding", "packet_encoding"])?;
+    let xudp = yaml_value(mapping, "xudp");
+    let xudp_enabled = match (packet_encoding, xudp) {
+        (Some(value), None) => {
+            let encoding = value
+                .as_str()
+                .ok_or_else(|| "VLESS packet encoding must be a string".to_string())?
+                .trim();
+            match encoding {
+                "" => false,
+                "xudp" => true,
+                _ => return Err(format!("unsupported VLESS packet encoding '{encoding}'")),
+            }
+        }
+        (None, Some(value)) => value
+            .as_bool()
+            .ok_or_else(|| "VLESS xudp must be boolean".to_string())?,
+        (None, None) => false,
+        (Some(_), Some(_)) => return Err("duplicate VLESS XUDP representations".into()),
+    };
+    if let Some(value) = yaml_alias(mapping, &["packet-addr", "packet_addr"])? {
+        let enabled = value
+            .as_bool()
+            .ok_or_else(|| "VLESS packet-addr must be boolean".to_string())?;
+        if enabled {
+            return Err("unsupported VLESS packet-addr mode".into());
+        }
+    }
+    if let Some(value) = yaml_value(mapping, "mux") {
+        let enabled = match value {
+            serde_yaml::Value::Bool(enabled) => *enabled,
+            serde_yaml::Value::Mapping(options) => match yaml_value(options, "enabled") {
+                Some(value) => value
+                    .as_bool()
+                    .ok_or_else(|| "VLESS mux.enabled must be boolean".to_string())?,
+                None => false,
+            },
+            _ => return Err("VLESS mux must be boolean or a mapping".into()),
+        };
+        if enabled {
+            return Err("top-level VLESS mux is unsupported".into());
+        }
+    }
+
+    let mut mux_mode = None;
+    if let Some(value) = yaml_alias(mapping, &["smux", "multiplex"])? {
+        let options = value
+            .as_mapping()
+            .ok_or_else(|| "VLESS multiplex settings must be a mapping".to_string())?;
+        let enabled = match yaml_value(options, "enabled") {
+            Some(value) => value
+                .as_bool()
+                .ok_or_else(|| "VLESS multiplex.enabled must be boolean".to_string())?,
+            None => false,
+        };
+        if enabled {
+            let protocol = match yaml_value(options, "protocol") {
+                Some(value) => {
+                    let protocol = value
+                        .as_str()
+                        .ok_or_else(|| "VLESS multiplex.protocol must be a string".to_string())?;
+                    let protocol = protocol.trim();
+                    (!protocol.is_empty()).then_some(protocol)
+                }
+                None => None,
+            };
+            if protocol.is_some_and(|protocol| protocol != "h2mux") {
+                return Err(format!(
+                    "unsupported VLESS multiplex protocol '{}'",
+                    protocol.unwrap_or_default()
+                ));
+            }
+            if let Some(value) = yaml_alias(options, &["only-tcp", "only_tcp"])? {
+                let only_tcp = value
+                    .as_bool()
+                    .ok_or_else(|| "VLESS multiplex.only-tcp must be boolean".to_string())?;
+                if only_tcp {
+                    return Err("VLESS multiplex.only-tcp is unsupported".into());
+                }
+            }
+            if let Some(value) = yaml_alias(options, &["brutal", "brutal-opts", "brutal_opts"])? {
+                let disabled = match value {
+                    serde_yaml::Value::Null | serde_yaml::Value::Bool(false) => true,
+                    serde_yaml::Value::Mapping(brutal) if brutal.is_empty() => true,
+                    serde_yaml::Value::Mapping(brutal) => match yaml_value(brutal, "enabled") {
+                        Some(value) => !value.as_bool().ok_or_else(|| {
+                            "VLESS multiplex Brutal enabled must be boolean".to_string()
+                        })?,
+                        None => false,
+                    },
+                    _ => false,
+                };
+                if !disabled {
+                    return Err("VLESS multiplex Brutal is unsupported".into());
+                }
+            }
+            for keys in [
+                ["max-connections", "max_connections"],
+                ["min-streams", "min_streams"],
+                ["max-streams", "max_streams"],
+            ] {
+                if let Some(value) = yaml_alias(options, &keys)? {
+                    let limit = value
+                        .as_u64()
+                        .ok_or_else(|| format!("VLESS multiplex.{} must be an integer", keys[0]))?;
+                    if limit != 0 {
+                        return Err(format!("VLESS multiplex.{} tuning is unsupported", keys[0]));
+                    }
+                }
+            }
+            let padding = yaml_value(options, "padding")
+                .map(|value| {
+                    value
+                        .as_bool()
+                        .ok_or_else(|| "VLESS multiplex.padding must be boolean".to_string())
+                })
+                .transpose()?;
+            if protocol.is_none() && padding.is_none() {
+                return Err(
+                    "enabled VLESS multiplex requires an explicit protocol or padding setting"
+                        .into(),
+                );
+            }
+            mux_mode = Some(if padding.unwrap_or(false) {
+                WireMode::H2muxPadded
+            } else {
+                WireMode::H2mux
+            });
+        }
+    }
+
+    let mut uot_enabled = false;
+    if let Some(value) = yaml_alias(mapping, &["udp-over-tcp", "udp_over_tcp"])? {
+        match value {
+            serde_yaml::Value::Bool(enabled) => uot_enabled = *enabled,
+            serde_yaml::Value::Mapping(options) => {
+                uot_enabled = match yaml_value(options, "enabled") {
+                    Some(value) => value
+                        .as_bool()
+                        .ok_or_else(|| "VLESS udp-over-tcp.enabled must be boolean".to_string())?,
+                    None => false,
+                };
+                if uot_enabled {
+                    let version = match yaml_value(options, "version") {
+                        Some(value) => value.as_u64().ok_or_else(|| {
+                            "VLESS udp-over-tcp.version must be an integer".to_string()
+                        })?,
+                        None => 0,
+                    };
+                    if !matches!(version, 0 | 2) {
+                        return Err(format!(
+                            "unsupported VLESS udp-over-tcp version '{version}'"
+                        ));
+                    }
+                }
+            }
+            _ => return Err("VLESS udp-over-tcp must be boolean or a mapping".to_string()),
+        }
+    }
+
+    if xudp_enabled && (mux_mode.is_some() || uot_enabled) {
+        return Err("VLESS XUDP cannot be combined with multiplex or udp-over-tcp".into());
+    }
+    if mux_mode.is_some() && uot_enabled {
+        return Err("VLESS multiplex and udp-over-tcp cannot both be enabled".into());
+    }
+    let mode = if xudp_enabled {
+        WireMode::Xudp
+    } else if let Some(mode) = mux_mode {
+        mode
+    } else if uot_enabled {
+        WireMode::UotV2
+    } else {
+        WireMode::Legacy
+    };
+    match (udp, mode) {
+        (Some(true), WireMode::Legacy) => {
+            Err("native VLESS UDP is unsupported; specify an explicit packet mode".into())
+        }
+        (Some(false), mode) if mode != WireMode::Legacy => Err(format!(
+            "VLESS mode '{}' enables UDP but udp is false",
+            mode.as_str()
+        )),
+        _ => Ok(mode),
+    }
+}
+
 fn parse_clash_subscription(
     content: &str,
     subscription_id: Option<uuid::Uuid>,
@@ -449,6 +668,15 @@ fn parse_clash_subscription(
             node.transport = network;
         }
         node.flow = get_str("flow").filter(|flow| !flow.is_empty());
+        if protocol == NodeProtocol::VLess {
+            node.vless_mode = match parse_vless_external_mode(mapping) {
+                Ok(mode) => mode,
+                Err(error) => {
+                    tracing::warn!(node = %node.name, reason = %error, "skipping unsupported VLESS node");
+                    continue;
+                }
+            };
+        }
 
         if let Some(tls) = get_value("tls").and_then(serde_yaml::Value::as_bool) {
             node.tls = tls;
@@ -505,6 +733,10 @@ fn parse_clash_subscription(
                     .unwrap_or_else(|| "/".to_string()),
             );
             node.tls = true;
+        }
+        if let Err(error) = node.validate_vless_mode() {
+            tracing::warn!(node = %node.name, reason = %error, "skipping unsupported VLESS node");
+            continue;
         }
 
         node.subscription_id = subscription_id;
@@ -730,6 +962,178 @@ proxies:
             assert_eq!(node.subscription_id, Some(subscription_id));
             assert_eq!(node.id, node.derive_id());
         }
+    }
+
+    #[test]
+    fn test_parse_clash_vless_modes() {
+        let yaml = r#"
+proxies:
+  - name: h2-default
+    type: vless
+    server: h2.example
+    port: 443
+    uuid: aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa
+    smux:
+      enabled: true
+      padding: false
+  - name: h2-padded
+    type: vless
+    server: padded.example
+    port: 443
+    uuid: bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb
+    multiplex:
+      enabled: true
+      protocol: h2mux
+      padding: true
+  - name: uot-default
+    type: vless
+    server: uot-default.example
+    port: 443
+    uuid: cccccccc-cccc-4ccc-8ccc-cccccccccccc
+    udp-over-tcp: true
+  - name: uot-v2
+    type: vless
+    server: uot-v2.example
+    port: 443
+    uuid: dddddddd-dddd-4ddd-8ddd-dddddddddddd
+    udp_over_tcp:
+      enabled: true
+      version: 2
+  - name: legacy
+    type: vless
+    server: legacy.example
+    port: 443
+    uuid: eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee
+    smux:
+      enabled: false
+  - name: xudp
+    type: vless
+    server: xudp.example
+    port: 443
+    uuid: ffffffff-ffff-4fff-8fff-ffffffffffff
+    packet-encoding: xudp
+    flow: xtls-rprx-vision
+    tls: true
+"#;
+
+        let nodes = parse_clash_subscription(yaml, None).unwrap();
+        assert_eq!(nodes.len(), 6);
+        assert_eq!(nodes[0].vless_mode, honk_config::node::WireMode::H2mux);
+        assert_eq!(
+            nodes[1].vless_mode,
+            honk_config::node::WireMode::H2muxPadded
+        );
+        assert_eq!(nodes[2].vless_mode, honk_config::node::WireMode::UotV2);
+        assert_eq!(nodes[3].vless_mode, honk_config::node::WireMode::UotV2);
+        assert_eq!(nodes[4].vless_mode, honk_config::node::WireMode::Legacy);
+        assert_eq!(nodes[5].vless_mode, honk_config::node::WireMode::Xudp);
+        assert_eq!(nodes[5].flow.as_deref(), Some("xtls-rprx-vision"));
+    }
+
+    #[test]
+    fn test_external_vless_mode_representations() {
+        use honk_config::node::WireMode;
+
+        for (options, expected) in [
+            ("{}", WireMode::Legacy),
+            ("packet-encoding: ''", WireMode::Legacy),
+            ("packet_encoding: xudp", WireMode::Xudp),
+            ("xudp: true", WireMode::Xudp),
+            ("xudp: false", WireMode::Legacy),
+            ("udp: true\nxudp: true", WireMode::Xudp),
+            ("udp: false", WireMode::Legacy),
+            (
+                "multiplex: { enabled: true, protocol: '', padding: false }",
+                WireMode::H2mux,
+            ),
+            (
+                "multiplex: { enabled: true, padding: true }",
+                WireMode::H2muxPadded,
+            ),
+        ] {
+            let value: serde_yaml::Value = serde_yaml::from_str(options).unwrap();
+            assert_eq!(
+                parse_vless_external_mode(value.as_mapping().unwrap()).unwrap(),
+                expected,
+                "{options}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rejects_ambiguous_external_vless_modes() {
+        for options in [
+            "smux: { enabled: true }",
+            "multiplex: { enabled: true, protocol: '' }",
+            "smux: { enabled: true, protocol: smux }",
+            "smux: { enabled: true, protocol: yamux }",
+            "udp-over-tcp: { enabled: true, version: 1 }",
+            "packet-encoding: packetaddr",
+            "packet-encoding: mux-cool",
+            "packet-encoding: unsupported",
+            "packet-addr: true",
+            "mux: true",
+            "mux: { enabled: true }",
+            "packet-encoding: xudp\nxudp: true",
+            "packet-encoding: xudp\npacket_encoding: xudp",
+            "packet-encoding: xudp\nsmux: { enabled: true }",
+            "xudp: true\nudp-over-tcp: true",
+            "smux: { enabled: true, only-tcp: true }",
+            "smux: { enabled: true, brutal: { enabled: true } }",
+            "smux: { enabled: true, brutal-opts: { enabled: true, up: 100 Mbps } }",
+            "smux: { enabled: true, max-connections: 2 }",
+            "smux: { enabled: true, min-streams: 1 }",
+            "smux: { enabled: true, max-streams: 128 }",
+            "smux: { enabled: true }\nudp-over-tcp: true",
+            "udp: true",
+            "udp: true\npacket-encoding: ''",
+            "udp: false\nxudp: true",
+        ] {
+            let value: serde_yaml::Value = serde_yaml::from_str(options).unwrap();
+            let mapping = value.as_mapping().unwrap();
+            assert!(
+                parse_vless_external_mode(mapping).is_err(),
+                "unsupported options must fail: {options}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_clash_import_skips_unsupported_vless_mode() {
+        let yaml = r#"
+proxies:
+  - name: unsupported
+    type: vless
+    server: bad.example
+    port: 443
+    uuid: aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa
+    packet-encoding: packetaddr
+  - name: unsupported-flow
+    type: vless
+    server: flow.example
+    port: 443
+    uuid: cccccccc-cccc-4ccc-8ccc-cccccccccccc
+    flow: xtls-rprx-vision
+    tls: true
+    smux:
+      enabled: true
+  - name: unsupported-encryption
+    type: vless
+    server: encryption.example
+    port: 443
+    uuid: dddddddd-dddd-4ddd-8ddd-dddddddddddd
+    encryption: mlkem768x25519plus.native.1rtt.key
+    udp-over-tcp: true
+  - name: valid
+    type: vless
+    server: good.example
+    port: 443
+    uuid: bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb
+    udp-over-tcp: true
+"#;
+        let nodes = parse_clash_subscription(yaml, None).unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].name, "valid");
     }
 
     #[test]

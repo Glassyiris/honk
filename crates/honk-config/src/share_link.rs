@@ -35,7 +35,7 @@ impl Node {
         // vmess:// carries a base64-encoded payload in place of a
         // URL-shaped authority, so it is decoded before the generic path.
         if let Some(payload) = first.strip_prefix("vmess://") {
-            return parse_vmess_link(first, payload);
+            return parse_vmess_link(payload);
         }
 
         // SIP002 also allows the whole authority to be base64-encoded
@@ -55,7 +55,7 @@ impl Node {
         };
 
         let url = url::Url::parse(first)
-            .map_err(|e| ConfigError::Parse(format!("invalid share link '{}': {}", first, e)))?;
+            .map_err(|_| ConfigError::Parse("invalid share link syntax".into()))?;
         let scheme = url.scheme();
 
         let protocol = match scheme {
@@ -73,7 +73,7 @@ impl Node {
 
         let host = url
             .host_str()
-            .ok_or_else(|| ConfigError::Parse(format!("missing host in share link '{}'", first)))?
+            .ok_or_else(|| ConfigError::Parse("missing host in share link".into()))?
             .to_string();
         let port = url.port().unwrap_or(443);
 
@@ -122,10 +122,27 @@ impl Node {
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| format!("{}-{}", scheme, host));
 
-        let query: HashMap<String, String> = url
-            .query_pairs()
-            .map(|(k, v)| (k.into_owned(), v.into_owned()))
-            .collect();
+        let mut query = HashMap::new();
+        let mut mode_seen = false;
+        for (key, value) in url.query_pairs() {
+            let key = key.into_owned();
+            if protocol == NodeProtocol::VLess
+                && matches!(key.as_str(), "vless_mode" | "packetEncoding")
+            {
+                if mode_seen {
+                    return Err(ConfigError::Parse(
+                        "duplicate VLESS share-link mode representation".into(),
+                    ));
+                }
+                mode_seen = true;
+            }
+            query.insert(key, value.into_owned());
+        }
+        if protocol != NodeProtocol::VLess && query.contains_key("vless_mode") {
+            return Err(ConfigError::Parse(
+                "vless_mode is valid only for VLESS share links".into(),
+            ));
+        }
 
         match protocol {
             NodeProtocol::Trojan | NodeProtocol::AnyTLS => {
@@ -329,6 +346,49 @@ impl Node {
         }
 
         if matches!(protocol, NodeProtocol::VLess | NodeProtocol::VMess) {
+            if protocol == NodeProtocol::VLess
+                && let Some(parameter) = [
+                    "mux",
+                    "smux",
+                    "multiplex",
+                    "udp-over-tcp",
+                    "udp_over_tcp",
+                    "packet-encoding",
+                    "packet_encoding",
+                    "packet-addr",
+                    "packet_addr",
+                    "xudp",
+                    "only-tcp",
+                    "only_tcp",
+                    "brutal",
+                    "brutal-opts",
+                    "brutal_opts",
+                    "max-connections",
+                    "max_connections",
+                    "min-streams",
+                    "min_streams",
+                    "max-streams",
+                    "max_streams",
+                ]
+                .into_iter()
+                .find(|parameter| query.contains_key(*parameter))
+            {
+                return Err(ConfigError::Parse(format!(
+                    "unsupported VLESS share-link parameter '{parameter}'; use vless_mode"
+                )));
+            }
+            if protocol == NodeProtocol::VLess {
+                if let Some(mode) = query.get("vless_mode") {
+                    node.vless_mode = mode.parse()?;
+                } else if let Some(encoding) = query.get("packetEncoding") {
+                    if encoding != "xudp" {
+                        return Err(ConfigError::Parse(
+                            "unsupported VLESS packetEncoding (expected xudp)".into(),
+                        ));
+                    }
+                    node.vless_mode = crate::node::WireMode::Xudp;
+                }
+            }
             // `security=reality` carries the REALITY handshake parameters.
             if query.get("security").is_some_and(|v| v == "reality") {
                 node.tls = true;
@@ -351,28 +411,21 @@ impl Node {
             }
         }
 
+        node.validate_vless_mode()?;
         node.id = node.derive_id();
         Ok(node)
     }
 }
 
 /// Parse a `vmess://` share link: base64 of a JSON object (v2rayN schema).
-fn parse_vmess_link(link: &str, payload: &str) -> Result<Node, ConfigError> {
-    let raw = base64_decode_flexible(payload).ok_or_else(|| {
-        ConfigError::Parse(format!(
-            "invalid vmess link '{}': base64 decode failed",
-            link
-        ))
-    })?;
-    let text = String::from_utf8(raw).map_err(|_| {
-        ConfigError::Parse(format!(
-            "invalid vmess link '{}': payload is not UTF-8",
-            link
-        ))
-    })?;
+fn parse_vmess_link(payload: &str) -> Result<Node, ConfigError> {
+    let raw = base64_decode_flexible(payload)
+        .ok_or_else(|| ConfigError::Parse("invalid vmess link: base64 decode failed".into()))?;
+    let text = String::from_utf8(raw)
+        .map_err(|_| ConfigError::Parse("invalid vmess link: payload is not UTF-8".into()))?;
     let json: VmessLinkJson = serde_json::from_str(&text)
-        .map_err(|e| ConfigError::Parse(format!("invalid vmess link '{}': {}", link, e)))?;
-    json.into_node(link)
+        .map_err(|_| ConfigError::Parse("invalid vmess link JSON".into()))?;
+    json.into_node()
 }
 
 /// Field set of a base64-JSON `vmess://` share link (v2rayN schema).
@@ -414,22 +467,16 @@ struct VmessLinkJson {
 }
 
 impl VmessLinkJson {
-    fn into_node(self, link: &str) -> Result<Node, ConfigError> {
+    fn into_node(self) -> Result<Node, ConfigError> {
         let host = self.add.filter(|h| !h.is_empty()).ok_or_else(|| {
-            ConfigError::Parse(format!(
-                "invalid vmess link '{}': missing server address",
-                link
-            ))
+            ConfigError::Parse("invalid vmess link: missing server address".into())
         })?;
-        let port = json_port(self.port).ok_or_else(|| {
-            ConfigError::Parse(format!(
-                "invalid vmess link '{}': missing or bad port",
-                link
-            ))
-        })?;
-        let id = self.id.filter(|s| !s.is_empty()).ok_or_else(|| {
-            ConfigError::Parse(format!("invalid vmess link '{}': missing user id", link))
-        })?;
+        let port = json_port(self.port)
+            .ok_or_else(|| ConfigError::Parse("invalid vmess link: missing or bad port".into()))?;
+        let id = self
+            .id
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ConfigError::Parse("invalid vmess link: missing user id".into()))?;
 
         let transport = self.net.unwrap_or_default();
 

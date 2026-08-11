@@ -248,7 +248,20 @@ node {
     }
 
     #[test]
-    fn test_node_section_rejects_removed_protocols_and_mux() {
+    fn test_parse_vless_mode_link() {
+        let config = parse_dae_config(
+            "node {\n    xudp: 'vless://uuid@example.com:443?vless_mode=xudp#node'\n    cool: 'vless://uuid@example.com:443?vless_mode=mux-cool#node'\n}",
+        )
+        .unwrap();
+        assert_eq!(config.nodes.len(), 2);
+        assert_eq!(config.nodes[0].name, "xudp");
+        assert_eq!(config.nodes[0].vless_mode, crate::node::WireMode::Xudp);
+        assert_eq!(config.nodes[1].name, "cool");
+        assert_eq!(config.nodes[1].vless_mode, crate::node::WireMode::MuxCool);
+    }
+
+    #[test]
+    fn test_node_section_rejects_removed_protocols_and_standalone_mux() {
         for input in [
             "node {\n    'ssr://a'\n}",
             "node {\n    'trojan-go://pw@example.com:443'\n}",
@@ -262,8 +275,8 @@ node {
         }
         let err = parse_dae_config("node {\n    mux = true\n}").unwrap_err();
         assert!(
-            err.to_string().contains("mux"),
-            "mux must be a hard error: {err}"
+            err.to_string().contains("vless_mode"),
+            "standalone mux must direct users to the normalized link mode: {err}"
         );
     }
 
@@ -739,6 +752,19 @@ group {
     assert_eq!(names("kw"), vec!["juicity-1"]);
     // Exact match on a shared prefix matches NOTHING (the test.dae case).
     assert!(names("nomatch").is_empty());
+}
+
+#[test]
+fn node_parse_diagnostic_redacts_share_link_credentials() {
+    for uri in [
+        "trojan://super-secret@",
+        "vless://uuid@example.com:443?vless_mode=super-secret",
+    ] {
+        let error = crate::node::Node::from_share_link(uri).unwrap_err();
+        let diagnostic = super::node_parse_diagnostic(&error);
+        assert!(!diagnostic.contains(uri));
+        assert!(!diagnostic.contains("super-secret"));
+    }
 }
 
 #[test]
