@@ -888,271 +888,59 @@ impl ControlPlaneHandle {
             (original_dst, None)
         };
 
-        // Try each candidate node in parallel (happy-eyeballs style).
-        // Each task first checks the connection pool: a *ready* stream
-        // (protocol handshake already completed for this exact node+target)
-        // is reused directly as the data channel; a raw pooled TCP to the
-        // proxy server saves the connect RTT and still performs the
-        // protocol-level handshake (SOCKS5 CONNECT, etc.).
-        // Failed nodes are reported via traffic-based thresholds to avoid
-        // killing a node from a single transient failure.
-        // The first successful dial wins; remaining tasks are cancelled.
-        // An overall deadline prevents blocking indefinitely when all nodes
-        // are unreachable or extremely slow.
-        let dial_deadline = {
-            let config = self.config.read().await;
-            let per_node_ms = config.global.connect_timeout_ms.max(1000);
-            let overall_ms = (per_node_ms * 4).max(10000);
-            tokio::time::Instant::now() + std::time::Duration::from_millis(overall_ms)
-        };
-        let (mut proxy_stream, node): (crate::proxy::ProxyStream, &Node) = {
-            let ctx = self.clone();
-            let target = resolved_target;
-            let target_domain = target_domain.clone();
-            let outbound = outbound_name.clone();
-
-            let cold_urltest = selection_mode == SelectionPlanMode::ColdUrlTest;
-            let mut set = tokio::task::JoinSet::new();
-            for (idx, node) in candidates.iter().enumerate() {
-                let ctx = ctx.clone();
-                let node = (*node).clone();
-                let target_domain = target_domain.clone();
-                let generation = Arc::clone(&runtime_generation);
-                set.spawn(async move {
-                    if cold_urltest {
-                        // Absolute releases make only candidate zero immediate;
-                        // unreleased work has no dial permit and abort_all()
-                        // cancels it before it can start.
-                        wait_for_cold_urltest_release(idx).await;
-                    }
-                    let start = std::time::Instant::now();
-                    let per_dial_timeout = connect_timeout * 3;
-                    let result = tokio::time::timeout(
-                        per_dial_timeout,
-                        Self::dial_pooled(
-                            &ctx.proxy_registry,
-                            &ctx.connection_pool,
-                            &generation,
-                            &node,
-                            target,
-                            target_domain.as_deref(),
-                            connect_timeout,
-                        ),
-                    )
-                    .await
-                    .unwrap_or_else(|_| {
-                        Err(anyhow::anyhow!(
-                            "dial timed out after {:?}",
-                            per_dial_timeout
-                        ))
-                    });
-                    let elapsed = start.elapsed();
-                    (result, idx, elapsed)
-                });
-            }
-
-            let mut last_err: Option<(String, String)> = None;
-            let mut first_err: Option<(String, String)> = None;
-            let mut timeout_count: usize = 0;
-            let mut winner: Option<(crate::proxy::ProxyStream, usize)> = None;
-            let mut remaining = set.len();
-
-            loop {
-                if remaining == 0 {
-                    break;
-                }
-                remaining -= 1;
-                match tokio::time::timeout_at(dial_deadline, set.join_next()).await {
-                    Ok(Some(task_result)) => match task_result {
-                        Ok((Ok(stream), idx, _elapsed)) => {
-                            let node = &candidates[idx];
-                            let ipver = if original_dst.is_ipv6() {
-                                IpVersion::V6
-                            } else {
-                                IpVersion::V4
-                            };
-                            ctx.alive_set.report_available_traffic(
-                                node.id,
-                                ProbeDomain::Tcp,
-                                ipver,
-                            );
-                            winner = Some((stream, idx));
-                            set.abort_all();
-                            break;
-                        }
-                        Ok((Err(e), idx, _elapsed)) => {
-                            let node = &candidates[idx];
-                            debug!("Parallel dial to {} failed: {}", node.name, e);
-                            ctx.stats.record_error(&outbound);
-                            let ipver = if original_dst.is_ipv6() {
-                                IpVersion::V6
-                            } else {
-                                IpVersion::V4
-                            };
-                            ctx.alive_set.report_unavailable_traffic(
-                                node.id,
-                                ProbeDomain::Tcp,
-                                ipver,
-                            );
-                            ctx.alive_set
-                                .record_dial_failure(node.id, ProbeDomain::Tcp, ipver);
-                            ctx.alive_set.notify_check_tcp(node.id);
-                            let msg = e.to_string();
-                            if msg.starts_with("dial timed out after") {
-                                timeout_count += 1;
-                            }
-                            if first_err.is_none() {
-                                first_err = Some((msg.clone(), node.name.clone()));
-                            }
-                            if remaining == 0 {
-                                last_err = Some((msg, node.name.clone()));
-                            }
-                        }
-                        Err(_join_err) => {}
-                    },
-                    Ok(None) => break,
-                    Err(_elapsed) => {
-                        set.abort_all();
-                        warn!(
-                            "Overall dial deadline reached for outbound '{}' ({} candidates, {} remaining)",
-                            outbound_name,
-                            candidates.len(),
-                            remaining
-                        );
-                        break;
-                    }
-                }
-            }
-
-            // Drain any remaining aborted tasks to avoid JoinSet drop panic.
-            while (set.join_next().await).is_some() {}
-
-            // Deposit fresh connections for losing candidates into the pool
-            // so the pool stays warm after a parallel-dial race. Limit to 2 deposits
-            // per race to avoid thundering herd on the proxy servers.
-            // Ready-capable handlers get a fully-dialed stream (handshake
-            // included, paid off the critical path); others get a bare TCP.
-            if outbound_name != "direct"
-                && outbound_name != "block"
-                && let Some((_, winning_idx)) = &winner
-            {
-                let mut deposit_count = 0u32;
-                for (idx, node) in candidates.iter().enumerate() {
-                    if idx == *winning_idx {
-                        continue;
-                    }
-                    if deposit_count >= 2 {
-                        break;
-                    }
-                    let node = node.clone();
-                    let node_addr = format!("{}:{}", node.host(), node.port);
-                    let pool = ctx.connection_pool.clone();
-                    let registry = ctx.proxy_registry.clone();
-                    let target_domain = target_domain.clone();
-                    let generation = Arc::clone(&runtime_generation);
-                    tokio::spawn(async move {
-                        let (ready_capable, bare_capable) = registry
-                            .find(node.protocol)
-                            .map(|entry| {
-                                (
-                                    (entry.descriptor.pool_ready_streams)(&node),
-                                    (entry.descriptor.pool_bare_tcp)(&node),
-                                )
-                            })
-                            .unwrap_or((false, false));
-                        if ready_capable {
-                            let key = ConnectionPool::ready_key(
-                                &node_addr,
-                                target,
-                                target_domain.as_deref(),
-                            );
-                            // Only hot targets earn a speculative ready
-                            // dial; a one-off flow gets none.
-                            let Some(_warm_guard) = pool.try_begin_warm(&key) else {
-                                return;
-                            };
-                            let _dial_permit = generation.acquire_dial_permit().await;
-                            match registry
-                                .dial_runtime(
-                                    generation,
-                                    node.id,
-                                    target,
-                                    target_domain.as_deref(),
-                                    connect_timeout,
-                                )
-                                .await
-                            {
-                                Ok(stream) => {
-                                    pool.deposit_ready(&key, stream).await;
-                                }
-                                Err(e) => {
-                                    debug!(
-                                        "Post-race pool deposit: ready dial to {} via {} failed: {}",
-                                        target, node_addr, e
-                                    );
-                                }
-                            }
-                            return;
-                        }
-                        if !bare_capable {
-                            // Multiplexed protocols pool whole sessions
-                            // instead; a bare TCP is useless to them.
-                            return;
-                        }
-                        let _dial_permit = generation.acquire_dial_permit().await;
-                        match honk_outbound::util::connect_outbound(&node_addr, connect_timeout)
-                            .await
-                        {
-                            Ok(stream) => {
-                                if is_tcp_stream_alive(&stream) {
-                                    pool.deposit_tcp(&node_addr, stream).await;
-                                } else {
-                                    debug!(
-                                        "Post-race pool deposit: stream to {} is dead",
-                                        node_addr
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                debug!(
-                                    "Post-race pool deposit: connect to {} failed: {}",
-                                    node_addr, e
-                                );
-                            }
-                        }
-                    });
-                    deposit_count += 1;
-                }
-            }
-
-            match winner {
-                Some((s, idx)) => (s, &candidates[idx]),
-                None => {
-                    if let Some((last_msg, last_name)) = last_err {
-                        let (first_msg, first_name) =
-                            first_err.unwrap_or_else(|| (last_msg.clone(), last_name.clone()));
-                        if outbound_name == "direct" || outbound_name == "block" {
-                            debug!(
-                                "Direct/block dial to {} failed ({}): {}",
-                                resolved_target, last_name, last_msg
-                            );
-                        } else {
-                            warn!(
-                                "All {} candidate(s) failed to dial {} ({} timed out; first error from '{}': {}; last error from '{}': {})",
-                                candidates.len(),
+        let cold_urltest = selection_mode == SelectionPlanMode::ColdUrlTest;
+        let candidate_refs: Vec<&Node> = candidates.iter().collect();
+        let raced = self
+            .race_candidates(
+                &candidate_refs,
+                resolved_target,
+                target_domain.clone(),
+                &outbound_name,
+                connect_timeout,
+                Arc::clone(&runtime_generation),
+                ipver,
+                cold_urltest,
+            )
+            .await;
+        let (mut proxy_stream, node): (crate::proxy::ProxyStream, Node) = match raced {
+            Some((stream, idx)) => (stream, candidates[idx].clone()),
+            None => {
+                // Exactly one retry when the just-reported failure may have
+                // moved the plan (URLTest strike demotion). Same-plan
+                // outcomes (Selector pin, Fallback pin on a still-alive
+                // node, single-node outbound) yield the identical candidate
+                // and are not retried.
+                let mut retried: Option<(crate::proxy::ProxyStream, Node)> = None;
+                if selection_mode == SelectionPlanMode::Authoritative && candidates.len() == 1 {
+                    let group_manager = self.group_manager.read().clone();
+                    let plan = group_manager.selection_plan_for_domain(
+                        &outbound_name,
+                        ProbeDomain::Tcp,
+                        ipver,
+                    );
+                    if !plan.nodes.is_empty() && plan.nodes[0].id != candidates[0].id {
+                        let nodes = &plan.nodes[..plan.nodes.len().min(3)];
+                        retried = self
+                            .race_candidates(
+                                nodes,
                                 resolved_target,
-                                timeout_count,
-                                first_name,
-                                first_msg,
-                                last_name,
-                                last_msg
-                            );
-                        }
+                                target_domain.clone(),
+                                &outbound_name,
+                                connect_timeout,
+                                Arc::clone(&runtime_generation),
+                                ipver,
+                                false,
+                            )
+                            .await
+                            .map(|(stream, idx)| (stream, nodes[idx].clone()));
                     }
-                    // Per-candidate failures already counted as errors above;
-                    // only balance the active-connections counter here.
-                    self.stats.record_close(&outbound_name);
-                    return Ok(());
+                }
+                match retried {
+                    Some(pair) => pair,
+                    None => {
+                        self.stats.record_close(&outbound_name);
+                        return Ok(());
+                    }
                 }
             }
         };
@@ -2070,6 +1858,267 @@ impl ControlPlaneHandle {
         (outcome, collected)
     }
 
+    /// Race the candidate dials: the first success wins, losers are
+    /// cancelled, and fresh connections for losers are deposited into the
+    /// pool (≤2 per race, off the critical path). Failures are reported via
+    /// traffic-based thresholds to avoid killing a node from a single
+    /// transient failure. Returns the winning stream and its index into
+    /// `candidates`; `None` means every candidate failed (already logged) —
+    /// close-accounting stays with the caller.
+    #[allow(clippy::too_many_arguments)]
+    async fn race_candidates(
+        &self,
+        candidates: &[&Node],
+        resolved_target: SocketAddr,
+        target_domain: Option<String>,
+        outbound_name: &str,
+        connect_timeout: Duration,
+        runtime_generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
+        ipver: IpVersion,
+        cold_urltest: bool,
+    ) -> Option<(crate::proxy::ProxyStream, usize)> {
+        let dial_deadline = {
+            let config = self.config.read().await;
+            let per_node_ms = config.global.connect_timeout_ms.max(1000);
+            let overall_ms = (per_node_ms * 4).max(10000);
+            tokio::time::Instant::now() + std::time::Duration::from_millis(overall_ms)
+        };
+        let ctx = self.clone();
+        let target = resolved_target;
+        let outbound = outbound_name.to_string();
+
+        let mut set = tokio::task::JoinSet::new();
+        for (idx, node) in candidates.iter().enumerate() {
+            let ctx = ctx.clone();
+            let node = (*node).clone();
+            let target_domain = target_domain.clone();
+            let generation = Arc::clone(&runtime_generation);
+            set.spawn(async move {
+                if cold_urltest {
+                    // Absolute releases make only candidate zero immediate;
+                    // unreleased work has no dial permit and abort_all()
+                    // cancels it before it can start.
+                    wait_for_cold_urltest_release(idx).await;
+                }
+                let start = std::time::Instant::now();
+                let per_dial_timeout = connect_timeout * 3;
+                let result = tokio::time::timeout(
+                    per_dial_timeout,
+                    Self::dial_pooled(
+                        &ctx.proxy_registry,
+                        &ctx.connection_pool,
+                        &generation,
+                        &node,
+                        target,
+                        target_domain.as_deref(),
+                        connect_timeout,
+                    ),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(anyhow::anyhow!(
+                        "dial timed out after {:?}",
+                        per_dial_timeout
+                    ))
+                });
+                let elapsed = start.elapsed();
+                (result, idx, elapsed)
+            });
+        }
+
+        let mut last_err: Option<(String, String)> = None;
+        let mut first_err: Option<(String, String)> = None;
+        let mut timeout_count: usize = 0;
+        let mut winner: Option<(crate::proxy::ProxyStream, usize)> = None;
+        let mut remaining = set.len();
+
+        loop {
+            if remaining == 0 {
+                break;
+            }
+            remaining -= 1;
+            match tokio::time::timeout_at(dial_deadline, set.join_next()).await {
+                Ok(Some(task_result)) => match task_result {
+                    Ok((Ok((stream, fresh)), idx, elapsed)) => {
+                        let node = &candidates[idx];
+                        ctx.alive_set
+                            .report_available_traffic(node.id, ProbeDomain::Tcp, ipver);
+                        // Real-traffic degradation fast path: a fresh
+                        // network dial far above the node's own EMA
+                        // counts toward strike demotion (3 in a row);
+                        // the emergency probe verifies the suspicion.
+                        if fresh
+                            && ctx.alive_set.report_dial_latency(
+                                node.id,
+                                ProbeDomain::Tcp,
+                                ipver,
+                                elapsed,
+                            )
+                        {
+                            ctx.alive_set.notify_check_tcp(node.id);
+                        }
+                        winner = Some((stream, idx));
+                        set.abort_all();
+                        break;
+                    }
+                    Ok((Err(e), idx, _elapsed)) => {
+                        let node = &candidates[idx];
+                        debug!("Parallel dial to {} failed: {}", node.name, e);
+                        ctx.stats.record_error(&outbound);
+                        ctx.alive_set
+                            .report_unavailable_traffic(node.id, ProbeDomain::Tcp, ipver);
+                        ctx.alive_set
+                            .record_dial_failure(node.id, ProbeDomain::Tcp, ipver);
+                        ctx.alive_set.notify_check_tcp(node.id);
+                        let msg = e.to_string();
+                        if msg.starts_with("dial timed out after") {
+                            timeout_count += 1;
+                        }
+                        if first_err.is_none() {
+                            first_err = Some((msg.clone(), node.name.clone()));
+                        }
+                        if remaining == 0 {
+                            last_err = Some((msg, node.name.clone()));
+                        }
+                    }
+                    Err(_join_err) => {}
+                },
+                Ok(None) => break,
+                Err(_elapsed) => {
+                    set.abort_all();
+                    warn!(
+                        "Overall dial deadline reached for outbound '{}' ({} candidates, {} remaining)",
+                        outbound_name,
+                        candidates.len(),
+                        remaining
+                    );
+                    break;
+                }
+            }
+        }
+
+        // Drain any remaining aborted tasks to avoid JoinSet drop panic.
+        while (set.join_next().await).is_some() {}
+
+        // Deposit fresh connections for losing candidates into the pool
+        // so the pool stays warm after a parallel-dial race. Limit to 2 deposits
+        // per race to avoid thundering herd on the proxy servers.
+        // Ready-capable handlers get a fully-dialed stream (handshake
+        // included, paid off the critical path); others get a bare TCP.
+        if outbound_name != "direct"
+            && outbound_name != "block"
+            && let Some((_, winning_idx)) = &winner
+        {
+            let mut deposit_count = 0u32;
+            for (idx, node) in candidates.iter().enumerate() {
+                if idx == *winning_idx {
+                    continue;
+                }
+                if deposit_count >= 2 {
+                    break;
+                }
+                let node = (*node).clone();
+                let node_addr = format!("{}:{}", node.host(), node.port);
+                let pool = ctx.connection_pool.clone();
+                let registry = ctx.proxy_registry.clone();
+                let target_domain = target_domain.clone();
+                let generation = Arc::clone(&runtime_generation);
+                tokio::spawn(async move {
+                    let (ready_capable, bare_capable) = registry
+                        .find(node.protocol)
+                        .map(|entry| {
+                            (
+                                (entry.descriptor.pool_ready_streams)(&node),
+                                (entry.descriptor.pool_bare_tcp)(&node),
+                            )
+                        })
+                        .unwrap_or((false, false));
+                    if ready_capable {
+                        let key =
+                            ConnectionPool::ready_key(&node_addr, target, target_domain.as_deref());
+                        // Only hot targets earn a speculative ready
+                        // dial; a one-off flow gets none.
+                        let Some(_warm_guard) = pool.try_begin_warm(&key) else {
+                            return;
+                        };
+                        let _dial_permit = generation.acquire_dial_permit().await;
+                        match registry
+                            .dial_runtime(
+                                generation,
+                                node.id,
+                                target,
+                                target_domain.as_deref(),
+                                connect_timeout,
+                            )
+                            .await
+                        {
+                            Ok(stream) => {
+                                pool.deposit_ready(&key, stream).await;
+                            }
+                            Err(e) => {
+                                debug!(
+                                    "Post-race pool deposit: ready dial to {} via {} failed: {}",
+                                    target, node_addr, e
+                                );
+                            }
+                        }
+                        return;
+                    }
+                    if !bare_capable {
+                        // Multiplexed protocols pool whole sessions
+                        // instead; a bare TCP is useless to them.
+                        return;
+                    }
+                    let _dial_permit = generation.acquire_dial_permit().await;
+                    match honk_outbound::util::connect_outbound(&node_addr, connect_timeout).await {
+                        Ok(stream) => {
+                            if is_tcp_stream_alive(&stream) {
+                                pool.deposit_tcp(&node_addr, stream).await;
+                            } else {
+                                debug!("Post-race pool deposit: stream to {} is dead", node_addr);
+                            }
+                        }
+                        Err(e) => {
+                            debug!(
+                                "Post-race pool deposit: connect to {} failed: {}",
+                                node_addr, e
+                            );
+                        }
+                    }
+                });
+                deposit_count += 1;
+            }
+        }
+
+        match winner {
+            Some((s, idx)) => Some((s, idx)),
+            None => {
+                if let Some((last_msg, last_name)) = last_err {
+                    let (first_msg, first_name) =
+                        first_err.unwrap_or_else(|| (last_msg.clone(), last_name.clone()));
+                    if outbound_name == "direct" || outbound_name == "block" {
+                        debug!(
+                            "Direct/block dial to {} failed ({}): {}",
+                            resolved_target, last_name, last_msg
+                        );
+                    } else {
+                        warn!(
+                            "All {} candidate(s) failed to dial {} ({} timed out; first error from '{}': {}; last error from '{}': {})",
+                            candidates.len(),
+                            resolved_target,
+                            timeout_count,
+                            first_name,
+                            first_msg,
+                            last_name,
+                            last_msg
+                        );
+                    }
+                }
+                None
+            }
+        }
+    }
+
     /// Dial through a node using the TCP connection pool.
     ///
     /// Acquisition order:
@@ -2082,6 +2131,11 @@ impl ControlPlaneHandle {
     ///
     /// Set `HONK_POOL_DISABLE=1` to bypass both pools entirely (fresh dial
     /// every time) — an A/B switch for diagnosing pool-related stalls.
+    ///
+    /// Returns the stream plus `fresh_network`: false ONLY on a ready-pool
+    /// acquire (local pool pop, no network round trip); bare-pool
+    /// handshakes, warm logical streams, and fresh dials all perform ≥1
+    /// round trip through the node and report true.
     async fn dial_pooled(
         registry: &ProxyRegistry,
         pool: &ConnectionPool,
@@ -2090,7 +2144,7 @@ impl ControlPlaneHandle {
         target: SocketAddr,
         target_domain: Option<&str>,
         connect_timeout: Duration,
-    ) -> anyhow::Result<crate::proxy::ProxyStream> {
+    ) -> anyhow::Result<(crate::proxy::ProxyStream, bool)> {
         static POOL_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let pool_disabled = *POOL_DISABLED.get_or_init(|| {
             std::env::var("HONK_POOL_DISABLE")
@@ -2111,7 +2165,7 @@ impl ControlPlaneHandle {
                     addr,
                     target
                 );
-                return Ok(stream);
+                return Ok((stream, false));
             }
         }
 
@@ -2141,7 +2195,8 @@ impl ControlPlaneHandle {
             return entry
                 .tcp
                 .dial_with_tcp(node, target, target_domain, tcp, connect_timeout)
-                .await;
+                .await
+                .map(|stream| (stream, true));
         }
 
         // Pool miss (or pools disabled) — fresh connect through the
@@ -2159,11 +2214,13 @@ impl ControlPlaneHandle {
                     connect_timeout,
                 )
                 .await
+                .map(|stream| (stream, true))
         } else {
             entry
                 .tcp
                 .dial(node, target, target_domain, connect_timeout)
                 .await
+                .map(|stream| (stream, true))
         }
     }
 }
@@ -2657,7 +2714,7 @@ mod dial_permit_scope_tests {
         .await;
         let registry = ProxyRegistry::default_resolver().unwrap();
 
-        let stream = tokio::time::timeout(
+        let (stream, fresh) = tokio::time::timeout(
             Duration::from_millis(100),
             ControlPlaneHandle::dial_pooled(
                 &registry,
@@ -2672,6 +2729,10 @@ mod dial_permit_scope_tests {
         .await
         .expect("ready stream must bypass an exhausted physical-dial gate")
         .unwrap();
+        assert!(
+            !fresh,
+            "a ready-pool acquire performs no network round trip"
+        );
 
         drop(stream);
         server.abort();

@@ -4576,3 +4576,187 @@ async fn nfqueue_stats_sampler_exit_completes_shutdown_without_double_join() {
     assert!(fixture.pending.is_empty());
     assert!(!fixture.listener_fatal_tx.is_closed());
 }
+
+/// A failed authoritative URLTest pick is retried once with the re-planned
+/// replacement: node a refuses every dial, so the client flow must succeed
+/// through b (invisible to the client) and a must end failure-demoted.
+#[tokio::test]
+async fn tcp_authoritative_dial_failure_retries_with_replacement() -> anyhow::Result<()> {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Echo listener: the FIRST accepted socket is the client flow handed to
+    // serve_connection (its local_addr is the flow's original destination);
+    // every later socket is the proxy's relayed connection and gets echoed.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let target = listener.local_addr()?;
+    let (flow_tx, flow_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let mut flow_tx = Some(flow_tx);
+        while let Ok((mut stream, peer)) = listener.accept().await {
+            if let Some(tx) = flow_tx.take() {
+                let _ = tx.send((stream, peer));
+                continue;
+            }
+            tokio::spawn(async move {
+                let mut buf = [0u8; 8192];
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => {
+                            if stream.write_all(&buf[..n]).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    // Minimal relaying SOCKS5 server: no auth, CONNECT to the requested
+    // target, then pipe both ways.
+    let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let socks_addr = socks_listener.local_addr()?;
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = socks_listener.accept().await {
+            tokio::spawn(async move {
+                let mut head = [0u8; 2];
+                if stream.read_exact(&mut head).await.is_err() || head[0] != 0x05 {
+                    return;
+                }
+                let mut methods = vec![0u8; head[1] as usize];
+                if stream.read_exact(&mut methods).await.is_err() {
+                    return;
+                }
+                if stream.write_all(&[0x05, 0x00]).await.is_err() {
+                    return;
+                }
+                let mut req = [0u8; 4];
+                if stream.read_exact(&mut req).await.is_err() || req[1] != 0x01 {
+                    return;
+                }
+                let target = match req[3] {
+                    0x01 => {
+                        let mut rest = [0u8; 6];
+                        if stream.read_exact(&mut rest).await.is_err() {
+                            return;
+                        }
+                        SocketAddr::new(
+                            IpAddr::V4(Ipv4Addr::new(rest[0], rest[1], rest[2], rest[3])),
+                            u16::from_be_bytes([rest[4], rest[5]]),
+                        )
+                    }
+                    // The test dials only IPv4 literals.
+                    _ => return,
+                };
+                let Ok(mut upstream) = tokio::net::TcpStream::connect(target).await else {
+                    return;
+                };
+                let _ = stream
+                    .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                    .await;
+                let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
+            });
+        }
+    });
+
+    let socks_node = |name: &str, port: u16| {
+        let mut node = Node {
+            name: name.into(),
+            protocol: honk_config::types::NodeProtocol::Socks5,
+            address: "127.0.0.1".into(),
+            port,
+            ..Default::default()
+        };
+        node.id = node.derive_id();
+        node
+    };
+    let node_a = socks_node("a", 1); // 127.0.0.1:1 — connection refused
+    let node_b = socks_node("b", socks_addr.port());
+    let group = Group {
+        name: "proxy".into(),
+        policy: honk_config::group::GroupPolicy::URLTest,
+        nodes: vec![node_a.id, node_b.id],
+        ..Default::default()
+    };
+    let config = udp_test_config("proxy", vec![node_a.clone(), node_b.clone()], vec![group]);
+    let router = Router::new(&config.routing.rules, &config.routing.default_outbound).unwrap();
+    let handle = ControlPlane::new(
+        config,
+        Box::new(crate::ebpf::mock::MockEbpfBackend::new()),
+        router,
+        Arc::new(honk_outbound::proxy::ProxyRegistry::default_resolver().unwrap()),
+        DnsResolver::new(&honk_config::dns::DnsConfig::default()).unwrap(),
+        udp_test_forwarder(),
+    )
+    .unwrap()
+    .spawn_handle();
+
+    // Warm URLTest measurements: a (1ms) wins over b (50ms).
+    handle.alive_set.record_probe_latency(
+        node_a.id,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(1),
+    );
+    handle.alive_set.record_probe_latency(
+        node_b.id,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(50),
+    );
+    {
+        let gm = handle.group_manager.read().clone();
+        let plan = gm.selection_plan_for_domain("proxy", ProbeDomain::Tcp, IpVersion::V4);
+        assert_eq!(plan.nodes.first().map(|n| n.name.as_str()), Some("a"));
+    }
+
+    let mut client = tokio::net::TcpStream::connect(target).await?;
+    let (flow_stream, client_addr) = flow_rx.await.expect("listener hands the flow over");
+    // serve_connection adopts only flows with kernel conn-state; seed the
+    // mock backend for this tuple.
+    let tuples = build_tuples_key(
+        target.ip(),
+        target.port(),
+        client_addr.ip(),
+        client_addr.port(),
+        6,
+    );
+    handle.ebpf.write().await.tcp_conn_state_store(
+        &tuples,
+        &honk_ebpf_common::conn::ConnState {
+            state: honk_ebpf_common::conn::TcpState::TcpStateActive as u8,
+            last_seen_ns: 0,
+            ..Default::default()
+        },
+    )?;
+    let serve = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.serve_connection(flow_stream, client_addr).await })
+    };
+
+    let payload = b"retry-with-replacement";
+    client.write_all(payload).await?;
+    let mut echoed = vec![0u8; payload.len()];
+    tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut echoed)).await??;
+    assert_eq!(
+        echoed, payload,
+        "the flow must succeed through the replacement"
+    );
+    serve.abort();
+
+    assert!(
+        handle
+            .alive_set
+            .is_failure_demoted(node_a.id, ProbeDomain::Tcp, IpVersion::V4),
+        "the refused node must carry a failure strike"
+    );
+    assert!(
+        !handle
+            .alive_set
+            .is_failure_demoted(node_b.id, ProbeDomain::Tcp, IpVersion::V4),
+        "the replacement node must stay clean"
+    );
+    Ok(())
+}
