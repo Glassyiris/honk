@@ -288,8 +288,7 @@ impl ConnectionPool {
                 );
                 if list.is_empty() {
                     drop(list);
-                    self.entries.remove(addr);
-                    if want_ready {
+                    if self.entries.remove(addr).is_some() && want_ready {
                         self.release_ready_target(&Self::ready_node(addr));
                     }
                 }
@@ -305,8 +304,7 @@ impl ConnectionPool {
                 }
                 if list.is_empty() {
                     drop(list);
-                    self.entries.remove(addr);
-                    if want_ready {
+                    if self.entries.remove(addr).is_some() && want_ready {
                         self.release_ready_target(&Self::ready_node(addr));
                     }
                 }
@@ -432,14 +430,18 @@ impl ConnectionPool {
         );
         counter
             .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                (current < MAX_READY_TARGETS_PER_NODE as u64).then_some(current + 1)
+                current
+                    .checked_add(1)
+                    .filter(|next| *next <= MAX_READY_TARGETS_PER_NODE as u64)
             })
             .is_ok()
     }
 
     fn release_ready_target(&self, node: &str) {
         if let Some(counter) = self.ready_targets.get(node) {
-            counter.fetch_sub(1, Ordering::AcqRel);
+            let _ = counter.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_sub(1)
+            });
         }
     }
 
@@ -1061,6 +1063,25 @@ mod tests {
         assert_eq!(
             pool.total_entries.load(Ordering::Acquire),
             MAX_READY_TARGETS_PER_NODE as u64
+        );
+    }
+
+    #[test]
+    fn stale_ready_target_release_does_not_poison_counter() {
+        let pool = ConnectionPool::new();
+        let node = "node:443";
+
+        assert!(pool.reserve_ready_target(node));
+        pool.release_ready_target(node);
+        // A concurrent miss may finish after the checkout that removed the key.
+        pool.release_ready_target(node);
+
+        assert!(pool.reserve_ready_target(node));
+        assert_eq!(
+            pool.ready_targets
+                .get(node)
+                .map(|count| count.load(Ordering::Acquire)),
+            Some(1)
         );
     }
 
