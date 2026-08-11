@@ -49,9 +49,9 @@ The effective tolerance is `max(configured tolerance, 1 ms)`. The incumbent stay
 
 `best latency + tolerance >= incumbent current measured latency`
 
-The incumbent baseline is read again at selection time, not retained from the moment it won. A degraded incumbent can therefore be replaced; this matches sing-box `Select()` behavior.
+The incumbent baseline is read again at selection time, not retained from the moment it won. A degraded incumbent can therefore be replaced; this matches sing-box `Select()` behavior. Hysteresis is skipped for an incumbent whose newest sample is a synthetic failure placeholder — a just-failed incumbent is replaced immediately.
 
-A dial failure clears that node's latency history and inserts one synthetic 10-second penalty sample. The next dial re-evaluates immediately, while one later fast sample cannot return a flaky node directly to first place.
+A probe or dial failure appends one synthetic 10-second placeholder sample. The node's real history and moving average are retained (the placeholder never feeds the average), but a candidate whose newest sample is synthetic ranks below every real-measured candidate until its next real success — this is the flap guard that stops a fast-but-flaky node from reclaiming first place with one lucky probe.
 
 A group `check_url` creates independent TCP-only liveness and latency state keyed by `(member tag, check_url)`. A failure removes that member only from groups using that target. Selector groups ignore `check_url` and emit a warning. URLTest probing sleeps after `idle_timeout`; an unset timeout uses the 30-minute health-layer default, and the next real selection wakes probes immediately.
 
@@ -97,13 +97,13 @@ A dead state normally needs two consecutive probe successes to recover. `notify_
 | --- | --- |
 | TCP | Sends the configured HTTP method to `tcp_check_url` through the node, or performs a raw TCP connect when no HTTP probe applies. Success records RTT only in the matching TCP family state. |
 | UDP | Sends one minimal DNS query to the first `udp_check_dns` target through the node's own `dial_udp_transport`. Success records the measured RTT and marks both `DnsUdp` and `DataUdp` alive; failure adds one probe failure to each UDP domain. It never changes TCP state. |
-| Per-group URL | Probes the dynamically resolved `(member tag, current leaf)` pairs. State is TCP-only, dies after one failure, and uses the same cooldown and two-success recovery. `sync_group_check_urls` replaces the active group/URL registry on reload. |
+| Per-group URL | Probes the dynamically resolved `(member tag, current leaf)` pairs. State is TCP-only, dies after three consecutive failures, and uses the same cooldown and two-success recovery. `sync_group_check_urls` replaces the active group/URL registry on reload. |
 
 `has_udp_state` distinguishes a node with no UDP observations from one explicitly observed dead. Established endpoint send, receive, and reply-idle errors report `DataUdp` traffic failures. Intentional endpoint retirement, node-death cancellation, and process shutdown are health-neutral.
 
 An alive-to-dead transition invokes the control-plane death callback, which purges the node's pooled connections and UDP endpoints so no stale reusable object is handed to new traffic.
 
-The last real TCP delay sample per node is written to `cache.db` every 60 seconds and restored at startup only when it is at most 24 hours old. Liveness is never restored from the cache. Synthetic 10-second penalties participate in selection but are flagged, excluded from display history, and never persisted as the last real sample.
+The last real TCP delay sample per node is written to `cache.db` every 60 seconds and restored at startup only when it is at most 24 hours old. Liveness is never restored from the cache. Synthetic 10-second placeholders demote the node in selection but are flagged, excluded from display history and the moving average, and never persisted as the last real sample.
 
 ## UDP candidate eligibility
 

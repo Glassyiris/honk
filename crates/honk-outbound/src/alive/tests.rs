@@ -108,10 +108,13 @@ fn test_merge_check_addrs_dedup() {
 fn test_alive_set_basic() {
     let set = AliveDialerSet::new();
     assert!(set.is_alive(id(1)));
-    // TCP probe threshold = 1 (Go: immediate death on probe failure):
-    // the first failure already marks the node dead.
+    // TCP probe threshold = 3: one transient failure must not kill the
+    // node; three consecutive failures do.
     set.mark_dead_for(id(1), ProbeDomain::Tcp, IpVersion::V4);
-    assert!(!set.is_alive(id(1)), "TCP should die after 1 probe failure");
+    assert!(set.is_alive(id(1)), "TCP survives one probe failure");
+    set.mark_dead_for(id(1), ProbeDomain::Tcp, IpVersion::V4);
+    set.mark_dead_for(id(1), ProbeDomain::Tcp, IpVersion::V4);
+    assert!(!set.is_alive(id(1)), "TCP dies after 3 probe failures");
     // DNS UDP probe threshold = 3 — verify per-protocol thresholds
     assert!(set.is_alive_for(id(1), ProbeDomain::DnsUdp, IpVersion::V4));
     set.mark_dead_for(id(1), ProbeDomain::DnsUdp, IpVersion::V4);
@@ -353,8 +356,10 @@ fn test_push_ebpf_uses_outbound_resolver() {
         calls2.lock().unwrap().push((o, d, ip, alive));
     }));
 
-    // No resolver installed → legacy outbound 0.
-    set.mark_dead(id(1)); // Tcp×V4+V6
+    // No resolver installed → legacy outbound 0. TCP dies at 3 failures.
+    for _ in 0..3 {
+        set.mark_dead(id(1)); // Tcp×V4+V6
+    }
     assert_eq!(
         calls.lock().unwrap().as_slice(),
         &[(0u8, 0u32, 0u32, false), (0u8, 0u32, 1u32, false)]
@@ -366,8 +371,10 @@ fn test_push_ebpf_uses_outbound_resolver() {
             if node == id(2) { Some(5u8) } else { None }
         },
     )));
-    set.mark_dead(id(2));
-    set.mark_dead(id(3));
+    for _ in 0..3 {
+        set.mark_dead(id(2));
+        set.mark_dead(id(3));
+    }
     assert_eq!(
         calls.lock().unwrap().as_slice(),
         &[
@@ -376,26 +383,6 @@ fn test_push_ebpf_uses_outbound_resolver() {
             (5u8, 0u32, 0u32, false),
             (5u8, 0u32, 1u32, false),
         ]
-    );
-}
-
-#[test]
-fn test_clear_latency() {
-    let set = AliveDialerSet::new();
-    set.record_probe_latency(
-        id(1),
-        ProbeDomain::Tcp,
-        IpVersion::V4,
-        Duration::from_millis(42),
-    );
-    assert_eq!(
-        set.get_last_latency(id(1), ProbeDomain::Tcp, IpVersion::V4),
-        Some(Duration::from_millis(42))
-    );
-    set.clear_latency(id(1));
-    assert_eq!(
-        set.get_last_latency(id(1), ProbeDomain::Tcp, IpVersion::V4),
-        None
     );
 }
 
@@ -662,8 +649,14 @@ fn test_death_callback_fires_on_flip_only() {
         calls2.lock().unwrap().push(node);
     })));
 
-    // Unregistered → outside grace; TCP probe threshold is 1. mark_dead
+    // Unregistered → outside grace; TCP probe threshold is 3. mark_dead
     // covers both IP versions → one call per flipped (domain, ipver).
+    set.mark_dead(id(1));
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "no flip before the threshold"
+    );
+    set.mark_dead(id(1));
     set.mark_dead(id(1));
     assert_eq!(calls.lock().unwrap().len(), 2);
 
@@ -719,7 +712,13 @@ fn test_url_probe_state_independence() {
         Some(Duration::from_millis(40))
     );
 
-    // One failure kills (TCP-probe parity) — for url_a only.
+    // Three consecutive failures kill (TCP-probe parity) — for url_a only.
+    set.record_url_probe_failure("n1", url_a);
+    assert!(
+        set.is_alive_for_url("n1", url_a),
+        "one failure is not death"
+    );
+    set.record_url_probe_failure("n1", url_a);
     set.record_url_probe_failure("n1", url_a);
     assert!(!set.is_alive_for_url("n1", url_a));
     assert!(set.is_alive_for_url("n1", url_b), "other URL unaffected");

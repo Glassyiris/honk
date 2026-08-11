@@ -738,10 +738,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_urltest_group_clears_latency_on_failure() {
+    async fn test_urltest_group_marks_failure_with_synthetic_sample() {
         // Plaintext HTTP server: every https measurement fails the TLS
-        // handshake, so the group run must clear latency history for both
-        // the dial-failing and the handshake-failing member.
+        // handshake, so the group run must append a synthetic penalty sample
+        // for both the dial-failing and the handshake-failing member.
         let addr = spawn_mock_http_server().await;
         let url = format!("https://{}:{}/", addr.ip(), addr.port());
 
@@ -779,12 +779,18 @@ mod tests {
         assert!(results[0].1.is_err());
         assert!(results[1].1.is_err());
 
-        // Failure → history replaced by the synthetic penalty sample, so the
-        // stale 999ms no longer ranks the node.
+        // Failure → synthetic penalty sample on top of the retained history:
+        // the latest sample is the 10s placeholder (selection demotes the
+        // node), while the real 999ms moving average survives unpoisoned.
         for m in &members {
             assert_eq!(
                 alive_set.get_last_latency(m.id, ProbeDomain::Tcp, IpVersion::V4),
                 Some(Duration::from_secs(10))
+            );
+            assert!(alive_set.has_synthetic_latest(m.id, ProbeDomain::Tcp, IpVersion::V4));
+            assert_eq!(
+                alive_set.get_moving_average(m.id, ProbeDomain::Tcp, IpVersion::V4),
+                Some(Duration::from_millis(999))
             );
         }
     }

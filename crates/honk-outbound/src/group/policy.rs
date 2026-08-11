@@ -135,7 +135,9 @@ impl GroupManager {
                 // (sing-box `Select()` / mihomo `fast()` parity): with the
                 // stale baseline a degraded incumbent could never be
                 // displaced. An incumbent with no current measurement gets
-                // no hysteresis.
+                // no hysteresis; neither does one whose latest sample is a
+                // synthetic failure placeholder — a just-failed incumbent is
+                // replaced immediately.
                 let current_latency = self.node_latency(
                     candidates[pos].node,
                     network,
@@ -144,6 +146,12 @@ impl GroupManager {
                     candidates[pos].tag,
                 );
                 if current_latency != Duration::MAX
+                    && !self.latest_is_synthetic(
+                        candidates[pos].node,
+                        network,
+                        ipver,
+                        group.check_url.as_deref(),
+                    )
                     && best_latency.saturating_add(tolerance) >= current_latency
                 {
                     return candidates[pos].node;
@@ -230,6 +238,11 @@ impl GroupManager {
     }
 
     /// Pick the candidate with the lowest probe latency from alive_set.
+    ///
+    /// Two tiers: a candidate whose newest sample is a synthetic failure
+    /// placeholder (recent probe/dial failure, not yet re-proven) ranks
+    /// below every candidate with a real latest measurement; within a tier
+    /// the (real-only) moving average decides.
     pub(super) fn pick_best_by_latency<'a>(
         &self,
         candidates: &[Candidate<'a>],
@@ -240,20 +253,48 @@ impl GroupManager {
         candidates
             .iter()
             .min_by_key(|c| {
-                self.node_latency(c.node, network, ipver, group.check_url.as_deref(), c.tag)
+                (
+                    self.latest_is_synthetic(c.node, network, ipver, group.check_url.as_deref()),
+                    self.node_latency(c.node, network, ipver, group.check_url.as_deref(), c.tag),
+                )
             })
             .copied()
             .unwrap_or(candidates[0])
     }
 
+    /// Whether the node's newest relevant sample is a synthetic failure
+    /// placeholder. UDP checks both UDP domains; the per-(node, url) TCP
+    /// path has no synthetic flag and always reports real.
+    fn latest_is_synthetic(
+        &self,
+        node: &Node,
+        network: SelectionNetwork,
+        ipver: IpVersion,
+        check_url: Option<&str>,
+    ) -> bool {
+        let Some(alive) = self.alive_set.as_ref() else {
+            return false;
+        };
+        match network {
+            SelectionNetwork::Tcp => {
+                check_url.is_none() && alive.has_synthetic_latest(node.id, ProbeDomain::Tcp, ipver)
+            }
+            SelectionNetwork::Udp => {
+                alive.has_synthetic_latest(node.id, ProbeDomain::DataUdp, ipver)
+                    || alive.has_synthetic_latest(node.id, ProbeDomain::DnsUdp, ipver)
+            }
+        }
+    }
+
     /// Effective selection latency for a node on the given network.
     ///
     /// Ranking uses the **halving moving average** (`(prev + sample) / 2`,
-    /// dae `min_moving_avg` semantics): recent samples weigh exponentially
-    /// more, so a degraded node is displaced within a few probe cycles
-    /// while single-sample jitter stays smoothed. Synthetic failure samples
-    /// feed the same average, so a failed probe or dial immediately sinks
-    /// the node's rank. TCP ranks by the TCP-probe average — or, when the
+    /// dae `min_moving_avg` semantics) over real measurements: recent
+    /// samples weigh exponentially more, so a degraded node is displaced
+    /// within a few probe cycles while single-sample jitter stays smoothed.
+    /// Synthetic failure samples never feed the average — their demotion is
+    /// handled by the synthetic-latest tier in `pick_best_by_latency`.
+    /// TCP ranks by the TCP-probe average — or, when the
     /// group has a custom `check_url`, by the per-(node, url) probe average
     /// (sing-box urltest `url` option). UDP ranks by the DataUDP then
     /// DNS-UDP averages only — a node with no UDP measurement ranks

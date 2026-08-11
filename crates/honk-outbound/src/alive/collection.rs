@@ -38,12 +38,13 @@ impl DialerCollection {
     }
 
     pub(crate) fn mark_unavailable(&self) {
-        // Synthetic 10s placeholder: pushes the node to the back of
-        // latency-sorted selection, flagged so it is never displayed as a
-        // measured delay (clash history would show a bogus 10000ms).
+        // Synthetic 10s placeholder: marks the latest sample as a failure so
+        // selection demotes the node (see `latest_is_synthetic`), flagged so
+        // it is never displayed as a measured delay (clash history would
+        // show a bogus 10000ms). It does NOT feed the moving average —
+        // ranking stays on real measurements.
         self.latencies
             .append(LatencySample::synthetic(TIMEOUT_LATENCY));
-        self.update_moving_average(TIMEOUT_LATENCY);
         self.alive.store(false, Ordering::Release);
     }
 
