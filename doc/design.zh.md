@@ -322,11 +322,11 @@ VMess 与 VLESS 由 honk-outbound 的 `rprx` cargo feature 编译（honk-core �
 
 `Node.vless_mode: WireMode` 把行为归一化为六种互斥且不协商的 contract。`legacy` 保留原 TCP 路径且无 packet 能力；`uot-v2` 保持 TCP 不变，并为每个 connected UDP transport 新建一条直连 UoT v2 stream；`xudp` 同样保持 TCP 不变，但为每个 UDP transport 建立一条 VLESS mux-command carrier，并使用 XUDP session id 0。
 
-`h2mux` 向 `sp.mux.sing-box.arpa:444` 发出 VLESS 请求、选择 H2MUX backend 2，再打开 HTTP/2 CONNECT stream，首个 DATA 为 `[flags u16][SocksAddr]`——flag 0 承载逻辑 TCP，flag 1 通过共用 UoT 长度 codec 承载 connected UDP。`h2mux-padded` 再增加 sing-mux v1 随机 preface，并对每个方向前 16 个 record 做 padding framing。每个 H2MUX 节点拥有 `SessionPool<VlessMuxSession>`，上限为两条物理 carrier × 每条 128 个逻辑 stream。HTTP/2 capacity 决定 admission；GOAWAY 与提交前 session 故障会排干并重试一次，目标拒绝不重试。driver 故障向所有子流传播；stream wrapper 保留 flow-control capacity 释放、half-close、reset 与惰性响应错误。
+`h2mux` 向 `sp.mux.sing-box.arpa:444` 发出 VLESS 请求、选择 H2MUX backend 2，再打开 HTTP/2 CONNECT stream，首个 DATA 为 `[flags u16][SocksAddr]`——flag 0 承载逻辑 TCP，flag 1 通过共用 UoT 长度 codec 承载 connected UDP。`h2mux-padded` 再增加 sing-mux v1 随机 preface，并对每个方向前 16 个 record 做 padding framing。每个 H2MUX 节点拥有 `SessionPool<VlessMuxSession>`，上限为两条可复用或正在拨号的物理 carrier × 每条 128 个逻辑 stream；draining carrier 可在现有 stream 结束前与 replacement 重叠。HTTP/2 capacity 决定 admission；GOAWAY 与提交前 session 故障会排干并重试一次，目标拒绝不重试。driver 故障向所有子流传播；stream wrapper 保留 flow-control capacity 释放、half-close、reset 与惰性响应错误。
 
-`mux-cool` 打开 Xray VLESS mux command，通过 `SessionPool<VlessCoolSession>` 承载逻辑 TCP 与 XUDP 子连接，上限同为两条 × 128。一个有序 writer 串行化所有子帧并保留取消时的 commitment；reader dispatch 不允许慢 TCP 子流阻塞兄弟。session id 单调且永不复用，因此发出 128 个 id 后 carrier 进入 drain。XUDP record 保留变化的回包地址，支持 full-cone UDP。不入池的 `xudp` 使用相同 frame codec 与保留 id 0，packet 上限为 7,526 字节；池化 Mux.Cool 最多接收 8 KiB。
+`mux-cool` 打开 Xray VLESS mux command，通过 `SessionPool<VlessCoolSession>` 承载逻辑 TCP 与 XUDP 子连接，上限同为两条 active carrier × 128。一个有序 writer 串行化所有子帧并保留取消时的 commitment；reader dispatch 不允许慢 TCP 子流阻塞兄弟。session id 单调且永不复用，因此发出 128 个 id 后 carrier 进入 draining，并可在活动子连接结束前与 replacement 重叠。XUDP record 保留变化的回包地址，支持 full-cone UDP。不入池的 `xudp` 使用相同 frame codec 与保留 id 0，packet 上限为 7,526 字节；池化 Mux.Cool 最多接收 8 KiB。
 
-generation-pinned TCP/UDP、Selector warm-up 与 UDP warm-up 共用所选 H2MUX 或 Mux.Cool pool。冷 speculative 拨号占 provisional pool slot：loser 永不发布，winner 在 endpoint 发布前只 commit 一次。未变 generation 在 reload 时转移 live pool；最后一个所有者消失时只排干可复用状态，不切断活动子连接。饱和时施加 backpressure，而不是无限新建 carrier。不存在运行时探测、fallback 或首包重放。所有非 `legacy` 模式都拒绝 VLESS Encryption；`flow=xtls-rprx-vision` 只允许 `legacy` 与 Single `xudp`。
+generation-pinned TCP/UDP、Selector warm-up 与 UDP warm-up 共用所选 H2MUX 或 Mux.Cool pool。冷 speculative 拨号占 provisional pool slot：loser 永不发布，winner 在 endpoint 发布前只 commit 一次。未变 generation 在 reload 时转移 live pool；最后一个所有者消失时只排干可复用状态，不切断活动子连接。两条可复用或正在拨号的 carrier 是饱和 backpressure 上限；只有仍有活动子连接的 draining carrier 可与 replacement 重叠。不存在运行时探测、fallback 或首包重放。所有非 `legacy` 模式都拒绝 VLESS Encryption；`flow=xtls-rprx-vision` 只允许 `legacy` 与 Single `xudp`。
 
 ### VLESS Encryption
 

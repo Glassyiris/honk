@@ -181,7 +181,7 @@ node {
 }
 ```
 
-H2MUX 与 Mux.Cool 每个节点都最多使用两条物理 carrier、每条最多 128 个逻辑 stream。H2MUX 保留 HTTP/2 flow control、half-close/reset、GOAWAY 滚动与可选 v1 padding。Mux.Cool 用一个有序 writer 串行化全部子帧，session id 永不复用，支持 full-cone UDP 回包源地址，并在发出 128 个 id 后滚动 carrier。两种 pool 都会在未变节点重载时复用，失去所有权后只排干可复用状态，不切断活动子连接。Single XUDP 明确不入池。饱和时等待；speculative loser 永不发布；所有模式都不探测、不降级，也不重放首包。
+H2MUX 与 Mux.Cool 每个节点都最多使用两条可复用或正在拨号的 carrier、每条最多 128 个逻辑 stream。H2MUX 保留 HTTP/2 flow control、half-close/reset、GOAWAY 滚动与可选 v1 padding。Mux.Cool 用一个有序 writer 串行化全部子帧，session id 永不复用，支持 full-cone UDP 回包源地址，并在发出 128 个 id 后滚动 carrier。进入 draining 的 carrier 不再占用该上限：GOAWAY 或 id 耗尽后可在活动子连接结束期间拨号 replacement，旧 carrier 在最后一个子连接结束后关闭。两种 pool 都会在未变节点重载时复用，失去所有权后只排干可复用状态，不切断活动子连接。Single XUDP 明确不入池。两条 active carrier 均饱和时等待；speculative loser 永不发布；所有模式都不探测、不降级，也不重放首包。
 
 所有非 `legacy` 模式都拒绝非 `none` VLESS Encryption。`flow=xtls-rprx-vision` 只能与 `legacy` 或 `xudp` 组合；其他模式会接管不兼容的内层 framing。规范分享链接使用 `vless_mode`；兼容参数 `packetEncoding=xudp` 会导入为 `xudp`，而含义有歧义的 `smux`、`multiplex`、`udp-over-tcp`、`packet-encoding`、`packet-addr`、`xudp` query 会被拒绝。Clash/mihomo YAML 仅在 `protocol: h2mux` 或显式 `padding` 布尔值能够判别 wire mode 时，才把已启用的 `smux`/`multiplex` 导入为 H2MUX；两者都缺失的已启用配置会被拒绝。`udp-over-tcp` 版本 0/2 导入为 UoT v2，`packet-encoding: xudp` 或 `xudp: true` 导入为 Single XUDP；冲突表示、packetaddr、不支持的 mux 协议/调优，以及没有显式 packet mode 的 `udp: true` 都会被拒绝。`mux-cool` 当前必须使用规范分享链接模式。官方 live 互通覆盖 sing-box 的 UoT/H2MUX，以及 Xray 的 Single XUDP/Mux.Cool，并包含 TLS、REALITY、padding 与 XUDP Vision。
 
