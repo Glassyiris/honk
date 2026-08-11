@@ -18,7 +18,7 @@ global {
     # Group will switch node only when new_latency <= old_latency - tolerance.
     check_tolerance: 30ms
 
-    # 预热与拨号预算(小中规模节点的推荐值;大订阅见 doc/configuration.zh.md)
+    # 预热与拨号预算(小中规模节点的推荐值;大订阅见 doc/zh/configuration.md)
     # 大订阅基线关闭额外 UDP 预热；Selector 选择仍单独保活。
     udp_warm_node_count: 0
     # 大订阅诊断基线也关闭启动裸 TCP 预连接。

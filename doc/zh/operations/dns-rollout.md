@@ -1,5 +1,7 @@
 # DNS 灰度与回滚操作手册
 
+本部署操作手册是 [DNS 设计](../design/dns.md)的运维配套文档。
+
 本清单只用于部署。由于真实 eBPF 加载/挂载、网络命名空间变更、透明套接字与
 路由 map 发布需要一台隔离、明确授权且具备 root 权限的 Linux 主机，本地开发
 环境没有执行这些操作。
@@ -81,3 +83,9 @@
 在部署工单中记录每条命令、退出状态、时间戳、checksum、routing generation、
 查询结果与相关 counter/log 快照。除非在隔离授权主机上满足全部前置条件，否则
 必须把特权清单标记为“未执行”。
+
+## 相关文档
+
+- [DNS 设计](../design/dns.md)
+- [DNS 配置参考](../reference/dns.md)
+- [实验性配置参考](../reference/experimental.md)

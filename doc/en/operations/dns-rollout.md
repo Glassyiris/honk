@@ -1,5 +1,7 @@
 # DNS Canary and Rollback Runbook
 
+This deployment runbook is the operational companion to the [DNS design](../design/dns.md).
+
 This checklist is deployment-only. It was not executed in the local
 development environment because real eBPF load/attach, network namespace
 changes, transparent sockets, and routing-map publication require an isolated,
@@ -98,3 +100,9 @@ Record every command, exit status, timestamp, checksum, routing generation,
 query result, and relevant counter/log snapshot in the deployment ticket.
 Mark the privileged checklist `NOT EXECUTED` unless all prerequisites above
 are met on an isolated authorized host.
+
+## Related docs
+
+- [DNS design](../design/dns.md)
+- [DNS configuration reference](../reference/dns.md)
+- [Experimental configuration reference](../reference/experimental.md)

@@ -28,22 +28,22 @@ experimental {
 
 修改 `experimental.udp_nfqueue.enabled` 后必须重启。启用时必须使用带 `ebpf` feature 的构建和真实 eBPF 后端；`--mock-ebpf` 或不带 `ebpf` 的构建会在启动时被拒绝。本机发起的 WAN 出口流量仍走规范 TPROXY 路径。DNS 53、`must`、`block` 和已经可以安全地在路由时直连的决策不会进入 NFQUEUE；只暂存仍可能在用户态改判的决策。
 
-该路径拥有 raw-netlink 队列 `320` 和 nftables 对象 `inet honk_nfqueue` / `udp_decision`；honk 运行期间，同一网络命名空间中的防火墙管理器不得修改它们。Direct 释放被保留的 skb，Proxy 把唯一的 payload 副本交给正常 UDP 初始化器，block/取消则丢弃报文。ingest actor 最多保留 256 个报文和 8 MiB payload；每个报文从 listener 收到时起都保留固定的三秒绝对期限。启用 Clash API 后，`/stats.udp.nfqueue` 会暴露 actor 深度、字节数、最老年龄以及明确的内核统计可用状态与读取失败数。完整不变量和指标 schema 见[设计文档](doc/design.zh.md)与[配置参考](doc/configuration.zh.md)。
+该路径拥有 raw-netlink 队列 `320` 和 nftables 对象 `inet honk_nfqueue` / `udp_decision`；honk 运行期间，同一网络命名空间中的防火墙管理器不得修改它们。Direct 释放被保留的 skb，Proxy 把唯一的 payload 副本交给正常 UDP 初始化器，block/取消则丢弃报文。ingest actor 最多保留 256 个报文和 8 MiB payload；每个报文从 listener 收到时起都保留固定的三秒绝对期限。启用 Clash API 后，`/stats.udp.nfqueue` 会暴露 actor 深度、字节数、最老年龄以及明确的内核统计可用状态与读取失败数。完整不变量和指标 schema 见 [NFQUEUE 设计](doc/zh/design/nfqueue.md)与 [API 参考](doc/zh/reference/api.md)。
 
 ### VLESS UDP、H2MUX 与 XUDP
 
 VLESS 分享链接通过 `vless_mode=legacy|uot-v2|h2mux|h2mux-padded|xudp|mux-cool` 选择唯一模式。`legacy` 是保持兼容的 TCP-only 默认值；`uot-v2` 保留该 TCP 路径并增加直连 UoT v2 UDP；`h2mux` 在共享 HTTP/2 carrier 上承载逻辑 TCP 与 sing-mux 原生 connected UDP；`h2mux-padded` 再启用 sing-mux v1 padding；`xudp` 保留普通 VLESS TCP，并为每个 UDP transport 建立一条 Single XUDP carrier；`mux-cool` 让逻辑 TCP 与 XUDP 共用节点所有的 Xray Mux.Cool carrier。
 
-这些模式不协商、不降级，也不会重放 UDP 首包。所有非 `legacy` 模式都不能使用 VLESS Encryption；只有 `xudp` 可与 `flow=xtls-rprx-vision` 组合。官方互通套件覆盖 sing-box 与 Xray：六种明文模式、TLS/REALITY 上的 H2MUX、padding，以及 XUDP Vision。wire、生命周期和导入规则见[组件参考](doc/components.zh.md#vless-mode)。
+这些模式不协商、不降级，也不会重放 UDP 首包。所有非 `legacy` 模式都不能使用 VLESS Encryption；只有 `xudp` 可与 `flow=xtls-rprx-vision` 组合。官方互通套件覆盖 sing-box 与 Xray：六种明文模式、TLS/REALITY 上的 H2MUX、padding，以及 XUDP Vision。wire、生命周期和导入规则见[节点参考](doc/zh/reference/nodes.md)。
 
 ### 文档
 
-| 文档         | English                                              | 中文                                                 |
-| ------------ | ---------------------------------------------------- | ---------------------------------------------------- |
-| 设计         | [doc/design.en.md](./doc/design.en.md)               | [doc/design.zh.md](./doc/design.zh.md)               |
-| 配置         | [doc/configuration.en.md](./doc/configuration.en.md) | [doc/configuration.zh.md](./doc/configuration.zh.md) |
-| 组件详细配置 | [doc/components.en.md](./doc/components.en.md)       | [doc/components.zh.md](./doc/components.zh.md)       |
-| 索引         | [doc/README.md](./doc/README.md)                     | 同上                                                 |
+| 文档     | English                                                    | 中文                                                     |
+| -------- | ---------------------------------------------------------- | -------------------------------------------------------- |
+| 配置指南 | [doc/en/configuration.md](./doc/en/configuration.md)       | [doc/zh/configuration.md](./doc/zh/configuration.md)     |
+| 设计     | [doc/en/design/overview.md](./doc/en/design/overview.md)   | [doc/zh/design/overview.md](./doc/zh/design/overview.md) |
+| 字段参考 | [doc/en/reference/global.md](./doc/en/reference/global.md) | [doc/zh/reference/global.md](./doc/zh/reference/global.md) |
+| 完整索引 | [doc/README.md](./doc/README.md)                           | 同上                                                     |
 
 ### 架构（crate）
 
@@ -217,7 +217,7 @@ routing {
 }
 ```
 
-完整说明：[doc/configuration.zh.md](./doc/configuration.zh.md)、[doc/components.zh.md](./doc/components.zh.md)。
+完整说明：[doc/zh/configuration.md](./doc/zh/configuration.md)、[doc/zh/reference/global.md](./doc/zh/reference/global.md)（其余小节见 [doc/README.md](./doc/README.md) 索引）。
 
 ### 致谢
 

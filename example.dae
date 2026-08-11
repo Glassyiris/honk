@@ -1,6 +1,6 @@
 # honk 示例配置（dae 语法）
 #
-# 说明文档：doc/configuration.zh.md（配置指南）、doc/components.zh.md（组件参考）
+# 说明文档：doc/zh/configuration.md（配置指南）、doc/README.md（设计与字段参考索引）
 # 最小示例见 config.min.dae；生产向完整示例见 config.dae。
 
 global {
@@ -26,7 +26,7 @@ global {
     check_interval: 30s
     # 新节点延迟 <= 旧节点延迟 - tolerance 才切换
     check_tolerance: 50ms
-    # 预热与拨号预算（详细语义见 doc/configuration.zh.md）：
+    # 预热与拨号预算（详细语义见 doc/zh/configuration.md）：
     # - 健康探测只测不暖:探测不会给冷节点留下常驻会话,无需担心节点多。
     # - UDP 预热：每组每 IP 族 top-N 个 UDP 叶子预建会话（单组封顶 3，
     #   进程总量封顶 4×N；大订阅建议 N=1-3）。

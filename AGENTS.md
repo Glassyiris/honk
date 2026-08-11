@@ -10,7 +10,7 @@ This file is written for AI coding agents that need to understand, build, test, 
 - Shared configuration types and parsers (`honk-config`) parse the original dae `{ section { ... } }` configuration syntax — the primary and only documented config format.
 - Status: **experimental alpha** (`v0.0.1-alpha`). Expect breaking changes.
 - License: **GPL-3.0-only**. Repository: <https://github.com/Glassyiris/honk>
-- Documentation: `README.md` / `README_CN.md` (bilingual overview, feature checklist, TODO list) and `doc/` — `design.en.md`, `configuration.en.md`, `components.en.md` plus `.zh.md` translations, all currently in sync with the code. Lab benchmark tooling, evidence, and bilingual benchmark docs live only on the dedicated `bench` branch.
+- Documentation: `README.md` / `README_CN.md` (bilingual overview, feature checklist, TODO list) and `doc/` — split by language into `doc/en/` and `doc/zh/` with identical layouts: `configuration.md` guide, `design/` architecture docs per subsystem (overview/datapath/routing/nfqueue/control-plane/dns/outbound/groups), `reference/` per-section field references (global/nodes/groups/routing/dns/subscription/experimental/api/cli), `operations/` runbooks, indexed by the bilingual `doc/README.md`. Lab benchmark tooling, evidence, and bilingual benchmark docs live only on the dedicated `bench` branch.
 
 ## Repository layout
 
@@ -24,7 +24,7 @@ This file is written for AI coding agents that need to understand, build, test, 
 ├── config.dae                # Full-featured example config (production-leaning)
 ├── config.min.dae            # Minimal example (good for --mock-ebpf dev)
 ├── example.dae               # Annotated example (Chinese comments)
-├── doc/                      # design / configuration / components docs (en + zh)
+├── doc/                      # en/ + zh/ doc trees: guide, design/, reference/, operations/
 ├── ci/                       # zigcc/zigcxx: zig cc/c++ wrappers for cross builds (strip CMake's clang-style --target from boring-sys ASM rules + rustc's aarch64 errata linker args; used by build-musl and the release workflow); zig-bindgen-env: derive BINDGEN_EXTRA_CLANG_ARGS from `zig cc -E -v` for cross bindgen
 ├── .github/workflows/        # release.yml: tag-triggered test + cross-build + GitHub Release
 └── crates/
@@ -102,7 +102,7 @@ Separate Cargo project (**excluded from the workspace**, own `Cargo.lock`) build
 - `src/route.rs` is the routing engine (`route()` + `RouteCtx` state machine over `MatchSet`s via `bpf_loop`, 1:1 port of Go dae's `kern/tproxy.c`, group-bitmap skip logic). `src/routing.rs` is only a small helper (`bpf_sock_is_dae_socket`) — don't confuse the two. (The old `tproxy_sockops`/`tproxy_sk_msg_redir` no-op stubs in `src/compat.rs` were removed — the sockops+sk_msg combo caused kernel panics on some kernels, TC redirect is used instead, and honk-core loads programs strictly by name so nothing referenced them.)
 - Key maps (`src/maps.rs`): `CONN_STATE_MAP` (plain hash, 512K), token-bound `REDIRECT_TRACK` and `ROUTING_HANDOFF_MAP` (plain hash, 64K each), persistent pinned one-slot spin-locked `UDP_DECISION_SEQUENCE`, the two-slot grace-period pair `UDP_DECISION_EPOCH` / per-CPU `UDP_DECISION_INFLIGHT`, per-tuple `UDP_DECISION_RETIRE_FENCE`, `CONN_STATE_OCCUPANCY`, double-buffered routing/LPM/domain maps, connectivity/stats/listener maps, `DATAPATH_STATE_MAP`, and `DATAPATH_FLAGS_MAP` (mode direct-offload bits plus NFQUEUE enabled/ready). The allocator retains the legacy 12-byte raw-token ABI across ordinary cleanup/restart and startup validates it without rewriting; eBPF becomes sticky-exhausted at a generation boundary until the fenced userspace supervisor rotates to a live-map-unused generation. Its ring event is a prompt and locked periodic userspace reads are the lossless backstop. Epoch slots let userspace wait only for pre-fence kernel readers; the tuple fence blocks new claims while exact-token cleanup revalidates and removes state.
   A rotation candidate is rollback-safe only when it and every higher generation through 3 are absent from all four token-bearing maps; a legacy allocator can advance through exactly that suffix.
-- Per-outbound stats: index `outbound * 4 + counter` (tx_packets/tx_bytes/rx_packets/rx_bytes); tx counted at `lan_ingress` when the routing decision lands, rx at `dae0_ingress`.
+- Per-outbound stats: per-CPU array of packed 32-byte `OutboundStatsCounters` (tx_packets/tx_bytes/rx_packets/rx_bytes) indexed directly by the `u8` outbound index (`MAX_OUTBOUNDS` entries); tx counted at `lan_ingress` when the routing decision lands, rx at `dae0_ingress`.
 - Build (needs nightly + `bpf-linker`):
 
   ```bash
@@ -219,7 +219,7 @@ Module map:
 
 CLI (`honk-core` binary):
 
-- Flags: `--config/-c` (default `/etc/honk/config.dae`), `--bpf-object/-b`, `--bpf-pin-root` (default `/sys/fs/bpf`), `--debug/-d`, `--mock-ebpf`. Log-level order: `--debug` → `RUST_LOG` → `global.log_level` → `info`.
+- Flags: `--config/-c` (default `/etc/honk/config.dae`), `--bpf-object/-b`, `--bpf-pin-root` (default `/sys/fs/bpf`), `--debug/-d`, `--mock-ebpf`. Log-level order: a valid `RUST_LOG` wins (`EnvFilter::try_from_default_env`), else `--debug` → `debug`, else `global.log_level`, else `info`.
 - Subcommands: `reload` sends SIGHUP to the real-datapath PID published in `/run/honk-core.lock`; `mode <rule|global|direct>` rewrites `global.dial_mode` in the config file; `proxy <group> <node>` validates existence and prints but persists nothing; `delay <node> [--url HOST:PORT]` performs raw TCP timing rather than a proxied urltest. The latter three are local-only and do not talk to the running engine.
 
 Benchmarks kept on `main`: `benches/dns.rs` (criterion, `harness = false`) covers DNS endpoint parse, cache get/put + 90/10 mix, per-query routing match, framing, forwarder cache-hit, and TcpPool/UpstreamPool exchange; run `cargo bench -p honk-core --features dns-bench --bench dns`. `benches/udp.rs` is the candidate-only UDP Criterion suite; run `cargo bench -p honk-core --bench udp -- --save-baseline udp-candidate`. Lab/deployment harnesses, raw evidence, and their documentation live only on branch `bench`; use `git worktree add ../honk-bench bench` when benchmarking so they never enter the `main` worktree.
@@ -410,7 +410,7 @@ with the `ja4probe` tool on .59 (`/usr/local/bin/ja4probe`, source at
 - Structs crossing the kernel/userspace boundary live in `honk-ebpf-common`, must be `#[repr(C)]` with stable layouts, and must be changed together with `honk-ebpf` and the `honk-core` map writers.
 - Follow `cargo fmt --all` and keep `cargo clippy --all -- -D warnings` clean.
 - Match the surrounding file's idioms; make minimal, scoped changes (no opportunistic cleanups).
-- Documentation language: code comments and `.en.md` docs are English; user docs are bilingual en/zh (`README_CN.md`, `doc/*.zh.md`) — update both when you change documented behavior.
+- Documentation language: code comments and `doc/en/` docs are English; user docs are bilingual (`README_CN.md`, `doc/zh/`) — update both when you change documented behavior.
 
 ## Testing instructions
 
@@ -434,7 +434,7 @@ with the `ja4probe` tool on .59 (`/usr/local/bin/ja4probe`, source at
 
 ## Configuration
 
-The primary (and only documented) format is the original **dae syntax** — `{ include { ... } global { ... } node { ... } group { ... } routing { ... } dns { ... } subscription { ... } experimental { ... } }`, parsed by `honk-config/src/parser/mod.rs`. `include` accepts bare/quoted `.dae` glob patterns, resolves relative paths from the entry config directory, merges entry sections before included sections, and rejects repeated/cyclic or escaping files. Root examples: `config.dae` (full), `config.min.dae` (minimal), `example.dae` (annotated). Field-by-field reference: `doc/components.en.md`; guide: `doc/configuration.en.md`.
+The primary (and only documented) format is the original **dae syntax** — `{ include { ... } global { ... } node { ... } group { ... } routing { ... } dns { ... } subscription { ... } experimental { ... } }`, parsed by `honk-config/src/parser/mod.rs`. `include` accepts bare/quoted `.dae` glob patterns, resolves relative paths from the entry config directory, merges entry sections before included sections, and rejects repeated/cyclic or escaping files. Root examples: `config.dae` (full), `config.min.dae` (minimal), `example.dae` (annotated). Field-by-field reference: `doc/en/reference/`; guide: `doc/en/configuration.md`.
 
 Held-first-packet UDP configuration has exactly one key:
 
@@ -485,7 +485,7 @@ managers must not mutate them while honk runs.
 
 - Check which crate a file belongs to before assuming command context; `honk-ebpf` is **not** a workspace member (separate `Cargo.lock`, nightly-only target) — workspace-wide `cargo` commands skip it.
 - When modifying eBPF map types, state transitions, marks, or constants, update `honk-ebpf-common`, `honk-ebpf`, `honk-core` backend writers/readers, and relevant `honk-nfqueue` mark/verdict assumptions together. Preserve `UDP_DECISION_SEQUENCE` ABI and token uniqueness across restart.
-- Consult `doc/design.en.md` (architecture), `doc/configuration.en.md` / `doc/components.en.md` (config surface) before changing behavior; update them (both en and zh) when behavior changes.
+- Consult `doc/en/design/overview.md` (architecture entry, with per-subsystem siblings under `doc/en/design/`) and `doc/en/configuration.md` / `doc/en/reference/` (config surface) before changing behavior; update both language trees (`doc/en/` and `doc/zh/`) when behavior changes.
 - If you add or remove workspace crates, update this file and the root `Cargo.toml` `[workspace] members` list.
 - The README contains an authorship disclosure: the eBPF datapath is the maintainer's primary focus; most userspace subsystems were largely AI-authored with partial review. Review userspace changes with corresponding care.
 
