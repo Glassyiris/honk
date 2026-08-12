@@ -458,6 +458,8 @@ unidirectional streams, static-table QPACK, and enough HEADERS handling for
 authentication. It must not advertise `SETTINGS_H3_DATAGRAM`; doing so starts a
 competing quic-go datagram reader that can consume Hysteria2 UDP packets.
 
+Hysteria2 follows sing-quic's lazy TCP setup: the first write merges the request and payload, and the first read strips the response, saving one RTT.
+
 Salamander obfuscation prefixes each wire datagram with an 8-byte random salt
 and XORs the payload with repeated `BLAKE2b-256(password || salt)`. Client-side
 port hopping selects a configured destination port from the first send onward.

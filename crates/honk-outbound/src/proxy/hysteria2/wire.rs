@@ -1,6 +1,5 @@
 use std::io;
 
-use anyhow::anyhow;
 use rand::RngExt;
 
 use crate::quic::recv_read_exact as read_exact;
@@ -106,58 +105,6 @@ pub(super) fn encode_tcp_request(addr: &str) -> Vec<u8> {
     write_varint(&mut out, padding.len() as u64);
     out.extend_from_slice(padding.as_bytes());
     out
-}
-
-/// Why a TCP stream handshake failed — distinguishes server-side refusals
-/// (healthy connection) from transport failures (cached connection suspect).
-#[derive(Debug)]
-pub(super) enum TcpHandshakeError {
-    /// The server answered with a non-OK status and an error message.
-    Remote(String),
-    /// Stream/connection level failure.
-    Transport(anyhow::Error),
-}
-
-impl std::fmt::Display for TcpHandshakeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TcpHandshakeError::Remote(msg) => write!(f, "Hysteria2: remote error: {msg}"),
-            TcpHandshakeError::Transport(e) => write!(f, "{e}"),
-        }
-    }
-}
-
-impl std::error::Error for TcpHandshakeError {}
-
-/// Read the TCP response head (`protocol/proxy.go:87-129`): status byte,
-/// message vstring, padding. The stream carries raw payload right after.
-pub(super) async fn read_tcp_response(
-    recv: &mut quinn::RecvStream,
-) -> Result<(), TcpHandshakeError> {
-    let transport = |e: io::Error| TcpHandshakeError::Transport(e.into());
-    let mut status = [0u8; 1];
-    read_exact(recv, &mut status).await.map_err(transport)?;
-    let message_len = read_varint_stream(recv).await.map_err(transport)?;
-    if message_len > MAX_MESSAGE_LENGTH {
-        return Err(TcpHandshakeError::Transport(anyhow!(
-            "Hysteria2: invalid TCP response message length {message_len}"
-        )));
-    }
-    let mut message = vec![0u8; message_len as usize];
-    read_exact(recv, &mut message).await.map_err(transport)?;
-    let padding_len = read_varint_stream(recv).await.map_err(transport)?;
-    if padding_len > MAX_PADDING_LENGTH {
-        return Err(TcpHandshakeError::Transport(anyhow!(
-            "Hysteria2: invalid TCP response padding length {padding_len}"
-        )));
-    }
-    skip_bytes(recv, padding_len).await.map_err(transport)?;
-    if status[0] != 0 {
-        return Err(TcpHandshakeError::Remote(
-            String::from_utf8_lossy(&message).into_owned(),
-        ));
-    }
-    Ok(())
 }
 
 /// One inbound UDP message (datagram), see `protocol/proxy.go:162-169`.

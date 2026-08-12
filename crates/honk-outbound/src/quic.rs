@@ -11,6 +11,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, anyhow};
+use bytes::Bytes;
 use quinn::congestion;
 use quinn::{
     ClientConfig, Connection, Endpoint, EndpointConfig, RecvStream, SendStream, TransportConfig,
@@ -791,6 +792,23 @@ impl QuicBiStream {
     pub fn with_on_drop(mut self, f: impl Fn() + Send + Sync + 'static) -> Self {
         self.guard.0 = Some(Box::new(f));
         self
+    }
+
+    /// Poll one cancellation-safe scatter write. `chunks` retains exactly the
+    /// unsent suffix when progress is made.
+    pub(crate) fn poll_write_chunks(
+        &mut self,
+        cx: &mut Context<'_>,
+        chunks: &mut [Bytes],
+    ) -> Poll<io::Result<usize>> {
+        use std::future::Future;
+
+        let result = std::pin::pin!(self.send.write_chunks(chunks)).poll(cx);
+        result.map(|result| {
+            result
+                .map(|written| written.bytes)
+                .map_err(io::Error::other)
+        })
     }
 
     /// Split into the raw quinn halves plus the drop guard (open-stream
