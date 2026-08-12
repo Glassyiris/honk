@@ -841,6 +841,55 @@ async fn test_group_delay_omits_failed_members() {
 }
 
 #[tokio::test]
+async fn test_group_delay_returns_member_results_for_zashboard_core_mode() {
+    let direct = Config::builtin_direct_node();
+    let group = Group {
+        name: "proxy".into(),
+        policy: honk_config::group::GroupPolicy::Selector,
+        nodes: vec![direct.id],
+        ..Default::default()
+    };
+    let app = spawn_app_with_config(
+        Config {
+            nodes: vec![direct],
+            groups: vec![group],
+            ..Default::default()
+        },
+        "",
+        "",
+    )
+    .await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    honk_outbound::urltest::set_urltest_direct_target(listener.local_addr().unwrap());
+
+    let response = http_client()
+        .get(app.url("/group/proxy/delay?url=http://unused.invalid/&timeout=1000"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert!(body[Config::BUILTIN_DIRECT_NODE].as_u64().is_some());
+
+    let proxies: serde_json::Value = http_client()
+        .get(app.url("/proxies"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        proxies["proxies"][Config::BUILTIN_DIRECT_NODE]["history"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn test_node_delay_failure_is_503() {
     let app = spawn_app("", "").await;
     let client = http_client();
