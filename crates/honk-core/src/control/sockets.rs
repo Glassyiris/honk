@@ -1,5 +1,5 @@
 use super::*;
-use crate::dns::query::is_exact_dns_query;
+use crate::dns::query::{ValidatedDnsQuery, validate_exact_dns_query};
 
 #[cfg(target_os = "linux")]
 const IPV6_ORIGDSTADDR_OPT: libc::c_int = 74;
@@ -606,9 +606,9 @@ pub(super) struct UdpRecvMeta {
 /// fallbacks by [`udp_original_dst`].
 pub(super) async fn recv_from_with_orig_dst(
     socket: &UdpSocket,
+    local_addr: SocketAddr,
     buf: &mut [u8],
 ) -> io::Result<(usize, SocketAddr, UdpRecvMeta)> {
-    let local_addr = socket.local_addr()?;
     socket
         .async_io(Interest::READABLE, || {
             recvmsg_origdst(socket.as_raw_fd(), buf, local_addr)
@@ -871,23 +871,41 @@ pub(super) fn packet_dst_ip_from_cmsg(
     packet_info_from_cmsg(cmsg_level, cmsg_type, data).map(|(ip, _)| ip)
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) struct UdpOriginalDst {
+    pub(super) address: SocketAddr,
+    pub(super) validated_dns: Option<ValidatedDnsQuery>,
+}
+
 /// Select a real original destination without inventing one from UDP payload
 /// shape. An ORIGDST cmsg is authoritative; PKTINFO can only supply an IP for
 /// a validated DNS query on port 53; a specifically bound listener is the
 /// final fallback. Wildcard listeners with no valid metadata fail closed.
-pub(super) fn udp_original_dst(meta: &UdpRecvMeta, data: &[u8]) -> Option<SocketAddr> {
+pub(super) fn udp_original_dst(meta: &UdpRecvMeta, data: &[u8]) -> Option<UdpOriginalDst> {
     // A present ORIGDST cmsg is authoritative. An unspecified ORIGDST is
     // invalid provenance, so do not downgrade it to pktinfo/local fallback.
     if let Some(original_dst) = meta.original_dst_cmsg {
-        return (!original_dst.ip().is_unspecified()).then_some(original_dst);
+        return (!original_dst.ip().is_unspecified()).then_some(UdpOriginalDst {
+            address: original_dst,
+            validated_dns: None,
+        });
     }
-    if is_exact_dns_query(data)
+
+    let validated_dns = validate_exact_dns_query(data);
+    if let Some(validated_dns) = validated_dns
         && let Some(packet_dst_ip) = meta.packet_dst_ip
         && !packet_dst_ip.is_unspecified()
     {
-        return Some(SocketAddr::new(packet_dst_ip, 53));
+        return Some(UdpOriginalDst {
+            address: SocketAddr::new(packet_dst_ip, 53),
+            validated_dns: Some(validated_dns),
+        });
     }
-    (!meta.local_addr.ip().is_unspecified()).then_some(meta.local_addr)
+
+    (!meta.local_addr.ip().is_unspecified()).then_some(UdpOriginalDst {
+        address: meta.local_addr,
+        validated_dns,
+    })
 }
 
 fn sockaddr_to_std(addr: &libc::sockaddr_storage, len: libc::socklen_t) -> io::Result<SocketAddr> {
@@ -974,6 +992,7 @@ pub(super) async fn udp_fast_path(
     data: &[u8],
     client_addr: SocketAddr,
     original_dst: SocketAddr,
+    validated_dns: Option<ValidatedDnsQuery>,
 ) -> bool {
     // Same drop pre-checks as serve_udp_connection: honk-internal subnet and
     // broadcast/multicast traffic must never be proxied.
@@ -992,10 +1011,8 @@ pub(super) async fn udp_fast_path(
         return true;
     }
 
-    // Only traffic the controller can consume takes the DNS slow path. The
-    // shared strict predicate guards any PKTINFO-derived port 53; DNS-shaped
-    // traffic to every other authoritative port remains ordinary UDP.
-    if original_dst.port() == 53 && is_exact_dns_query(data) {
+    // A carried proof keeps strict validation out of the Ready hot path.
+    if original_dst.port() == 53 && validated_dns.is_some() {
         return false;
     }
 

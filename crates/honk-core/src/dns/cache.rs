@@ -359,6 +359,7 @@ pub(crate) use key::{CacheKey, KeyIdentity, OperationKind};
 pub(crate) use service::PublicationEpoch;
 pub(crate) use service::{CacheSlot, DnsCacheService};
 pub use storage::{CachedEntry, NegativeCacheHit};
+pub(crate) use store::ExactLookup;
 
 use storage::{CacheValue, NegativeEntry};
 

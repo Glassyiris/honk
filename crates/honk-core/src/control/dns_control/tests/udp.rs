@@ -29,7 +29,7 @@ async fn udp_overload_is_refused_while_permit_owner_is_in_flight() {
         let client_addr = first_client.local_addr().expect("first client address");
         tokio::spawn(async move {
             controller
-                .handle_udp_dns(&first_query, client_addr, original_dst)
+                .handle_udp_dns(&first_query, client_addr, original_dst, None)
                 .await
         })
     };
@@ -42,6 +42,7 @@ async fn udp_overload_is_refused_while_permit_owner_is_in_flight() {
                 &second_query,
                 second_client.local_addr().expect("second client address"),
                 original_dst,
+                None,
             )
             .await
             .expect("second handler")

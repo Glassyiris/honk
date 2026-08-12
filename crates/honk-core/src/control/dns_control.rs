@@ -190,7 +190,7 @@ impl DnsController {
         {
             Ok((outcome, runtime)) => {
                 self.submit_projection(runtime.runtime(), &outcome);
-                outcome.rendered().to_vec()
+                outcome.into_rendered()
             }
             Err(error)
                 if error

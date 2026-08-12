@@ -1,19 +1,20 @@
 use std::collections::BTreeSet;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
 use crate::dns::routing::{DnsRequestDecision, DnsResponseDecision, DnsRouter};
 
 pub const MAX_RESPONSE_UPSTREAMS: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct UpstreamTag(String);
+pub struct UpstreamTag(Arc<str>);
 
 impl UpstreamTag {
     pub fn new(value: &str) -> Result<Self, PlanError> {
         if value.is_empty() {
             return Err(PlanError::EmptyUpstream);
         }
-        Ok(Self(value.to_string()))
+        Ok(Self(Arc::from(value)))
     }
 
     pub fn as_str(&self) -> &str {

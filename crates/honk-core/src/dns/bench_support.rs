@@ -160,6 +160,18 @@ pub fn record_observability_event() {
     crate::stats::record_dns_event(crate::stats::DnsStatEvent::CacheHit);
 }
 
+/// Validate a raw UDP query and return its derived advertised size.
+#[doc(hidden)]
+pub fn validate_udp_query_profile(raw: &[u8]) -> u16 {
+    match super::query::validate_exact_dns_query(raw)
+        .expect("benchmark query")
+        .ingress()
+    {
+        IngressProfile::Udp { advertised_size } => advertised_size,
+        _ => unreachable!("validated UDP query has a UDP ingress profile"),
+    }
+}
+
 pub fn observability_snapshot_checksum() -> u64 {
     let snapshot = crate::stats::dns::dns_snapshot();
     snapshot

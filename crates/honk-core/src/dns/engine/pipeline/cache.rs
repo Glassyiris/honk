@@ -2,7 +2,7 @@ use tracing::debug;
 
 use super::super::effective_expiry;
 use super::ExecutionContext;
-use crate::dns::cache::CacheKey;
+use crate::dns::cache::{CacheKey, ExactLookup, OperationKind};
 use crate::dns::forwarder::{
     DnsForwardError, extract_min_ttl, extract_soa_negative_ttl, rewrite_answer_ttls,
 };
@@ -16,37 +16,40 @@ pub(super) async fn lookup(
         return Ok(None);
     }
     let cache = context.forwarder.cache_service().await;
-    if let Some(hit) = cache.negative_hit_exact(&context.cache_key) {
-        let response = crate::dns::response::build_dns_error_response(context.raw_query, hit.rcode);
-        return context
-            .forwarder
-            .outcome_from_wire(
-                context.engine,
-                context.prepared,
-                response,
-                None,
-                OutcomeStatus::Accepted,
-                Provenance::Cache,
-                EffectiveExpiry::cacheable(hit.remaining_ttl),
-                None,
-                None,
-                Vec::new(),
-                context.mode,
-            )
-            .map(Some);
-    }
-    let Some(entry) = cache.get_exact(&context.cache_key) else {
-        return Ok(None);
+    let entry = match cache.lookup_exact(&context.cache_key) {
+        ExactLookup::Negative(hit) => {
+            let response =
+                crate::dns::response::build_dns_error_response(context.raw_query, hit.rcode);
+            return context
+                .forwarder
+                .outcome_from_wire(
+                    context.engine,
+                    context.prepared,
+                    response,
+                    None,
+                    OutcomeStatus::Accepted,
+                    Provenance::Cache,
+                    EffectiveExpiry::cacheable(hit.remaining_ttl),
+                    None,
+                    None,
+                    Vec::new(),
+                    context.mode,
+                )
+                .map(Some);
+        }
+        ExactLookup::Positive(entry) => entry,
+        ExactLookup::Miss => return Ok(None),
     };
     let remaining = entry.remaining_ttl_secs();
     debug!(remaining, "DNS forwarder: positive cache hit");
     let refresh_after = (entry.min_ttl as u64 / 10).max(1);
     if allow_refresh && remaining <= refresh_after {
+        let refresh_key = context.cache_key.with_operation(OperationKind::Refresh);
         context.forwarder.maybe_spawn_refresh(
             cache.clone(),
             context.raw_query,
             context.original_dst,
-            context.refresh_key.clone(),
+            refresh_key,
             context.publication_epoch,
         );
     }

@@ -154,6 +154,10 @@ impl DnsOutcome {
         &self.rendered
     }
 
+    pub(crate) fn into_rendered(self) -> Vec<u8> {
+        self.rendered
+    }
+
     pub const fn template(&self) -> Option<&ResponseTemplate> {
         self.template.as_ref()
     }

@@ -2,7 +2,7 @@ use crate::dns::planner::{RequestScope, UpstreamTag};
 use crate::dns::policy::PolicyId;
 use crate::dns::query::{IngressProfile, QueryContext};
 
-use super::{CacheKey, DnsCache, OperationKind, make_test_response};
+use super::{CacheKey, DnsCache, ExactLookup, OperationKind, make_test_response};
 
 #[test]
 fn exact_key_has_stable_typed_identity() {
@@ -207,4 +207,50 @@ fn expired_exact_negative_only_slot_is_removed() {
     assert_eq!(service.len(), 1);
     assert!(service.negative_hit_exact(&key).is_none());
     assert_eq!(service.len(), 0);
+}
+
+#[test]
+fn combined_exact_lookup_preserves_precedence_and_counts_once() {
+    let wire = crate::dns::forwarder::build_dns_query("combined.example", 1);
+    let query = QueryContext::parse(&wire).expect("query");
+    let key = CacheKey::new(
+        &query,
+        None,
+        RequestScope::Upstream(UpstreamTag::new("default").expect("scope")),
+        OperationKind::Resolve,
+    );
+    let miss = CacheKey::new(
+        &query,
+        None,
+        RequestScope::Upstream(UpstreamTag::new("other").expect("scope")),
+        OperationKind::Resolve,
+    );
+    let response = make_test_response([192, 0, 2, 1], 300);
+    let cache = DnsCache::new(4);
+    let service = cache.service();
+    service.put_exact(key.clone(), response.clone(), 300);
+    service.put_negative_exact(key.clone(), 60, 2);
+
+    let before = service.counters();
+    assert!(matches!(
+        service.lookup_exact(&key),
+        ExactLookup::Negative(hit) if hit.rcode == 2
+    ));
+    let after_negative = service.counters();
+    assert_eq!(after_negative.hits, before.hits + 1);
+    assert_eq!(after_negative.misses, before.misses);
+
+    service.insert_expired_negative_exact_for_test(key.clone(), 2);
+    match service.lookup_exact(&key) {
+        ExactLookup::Positive(entry) => assert_eq!(entry.response.as_ref(), response.as_slice()),
+        _ => panic!("expired negative must reveal the live positive"),
+    }
+    let after_positive = service.counters();
+    assert_eq!(after_positive.hits, before.hits + 2);
+    assert_eq!(after_positive.misses, before.misses);
+
+    assert!(matches!(service.lookup_exact(&miss), ExactLookup::Miss));
+    let after_miss = service.counters();
+    assert_eq!(after_miss.hits, before.hits + 2);
+    assert_eq!(after_miss.misses, before.misses + 1);
 }

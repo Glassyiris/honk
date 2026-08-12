@@ -497,19 +497,26 @@ impl StatsManager {
 
     /// Record a new connection on an outbound.
     pub fn record_connection(&self, outbound: &str) {
+        if let Some(tracker) = self.trackers.get(outbound) {
+            tracker.increment_connections();
+            return;
+        }
         self.trackers
-            .entry(outbound.to_string())
+            .entry(outbound.to_owned())
             .or_default()
             .increment_connections();
     }
 
     /// Track one connection with an exactly-once active counter balance.
     pub fn track_connection(self: &Arc<Self>, outbound: &str) -> ActiveConnectionGuard {
-        let tracker = self
-            .trackers
-            .entry(outbound.to_string())
-            .or_default()
-            .clone();
+        let tracker = if let Some(tracker) = self.trackers.get(outbound) {
+            tracker.clone()
+        } else {
+            self.trackers
+                .entry(outbound.to_owned())
+                .or_default()
+                .clone()
+        };
         tracker.increment_connections();
         ActiveConnectionGuard { tracker }
     }
@@ -845,16 +852,24 @@ impl StatsManager {
 
     /// Record bytes transferred through an outbound.
     pub fn record_bytes(&self, outbound: &str, tx: u64, rx: u64) {
+        if let Some(tracker) = self.trackers.get(outbound) {
+            tracker.add_bytes(tx, rx);
+            return;
+        }
         self.trackers
-            .entry(outbound.to_string())
+            .entry(outbound.to_owned())
             .or_default()
             .add_bytes(tx, rx);
     }
 
     /// Record an error on an outbound.
     pub fn record_error(&self, outbound: &str) {
+        if let Some(tracker) = self.trackers.get(outbound) {
+            tracker.increment_errors();
+            return;
+        }
         self.trackers
-            .entry(outbound.to_string())
+            .entry(outbound.to_owned())
             .or_default()
             .increment_errors();
     }
@@ -923,6 +938,28 @@ mod tests {
         assert_eq!(snap.get("proxy1").unwrap().total_conns, 2);
         assert_eq!(snap.get("proxy2").unwrap().total_conns, 1);
         assert_eq!(snap.get("proxy2").unwrap().errors, 1);
+    }
+
+    #[test]
+    fn warmed_stats_methods_reuse_one_tracker() {
+        let manager = Arc::new(StatsManager::new());
+        manager.record_connection("proxy");
+        let guard = manager.track_connection("proxy");
+        manager.record_bytes("proxy", 100, 200);
+        manager.record_error("proxy");
+
+        assert_eq!(manager.trackers.len(), 1);
+        let snapshot = manager.snapshot();
+        let tracker = snapshot.get("proxy").unwrap();
+        assert_eq!(tracker.total_conns, 2);
+        assert_eq!(tracker.active_conns, 2);
+        assert_eq!(tracker.tx_bytes, 100);
+        assert_eq!(tracker.rx_bytes, 200);
+        assert_eq!(tracker.errors, 1);
+
+        drop(guard);
+        manager.record_close("proxy");
+        assert_eq!(manager.snapshot()["proxy"].active_conns, 0);
     }
 
     #[test]

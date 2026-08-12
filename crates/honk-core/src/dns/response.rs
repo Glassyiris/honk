@@ -55,6 +55,10 @@ pub struct ResponseTemplate {
 }
 
 impl ResponseTemplate {
+    pub(crate) fn check(request: &QueryContext, response: &[u8]) -> Result<(), ResponseError> {
+        validate_layout(request, response).map(|_| ())
+    }
+
     pub fn validate(request: &QueryContext, response: &[u8]) -> Result<Self, ResponseError> {
         let (question_end, records) = validate_layout(request, response)?;
         Ok(Self {

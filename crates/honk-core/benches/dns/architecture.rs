@@ -11,7 +11,7 @@ use honk_config::dns::{
 use honk_core::dns::DnsResolver;
 use honk_core::dns::bench_support::{
     CacheKeyBenchmarkInput, ProjectionBenchmark, RuntimeBenchmark, observability_snapshot_checksum,
-    record_observability_event,
+    record_observability_event, validate_udp_query_profile,
 };
 use honk_core::dns::cache::DnsCache;
 use honk_core::dns::forwarder::build_dns_query;
@@ -97,6 +97,13 @@ pub(super) fn bench_warmed_forwarder_hits(c: &mut Criterion) {
         });
     });
     group.finish();
+}
+
+pub(super) fn bench_dns_udp_validation_profile(c: &mut Criterion) {
+    let query = build_dns_query("www.example.com", 1);
+    c.bench_function("dns_udp_validation_profile", |b| {
+        b.iter(|| black_box(validate_udp_query_profile(black_box(&query))));
+    });
 }
 
 pub(super) fn bench_projection_replacement(c: &mut Criterion) {

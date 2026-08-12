@@ -1,7 +1,7 @@
 use super::udp_dial::{UdpPrepare, UdpStaggerCallbacks, prepare_udp_plan};
 use super::*;
 use crate::control::udp_endpoint::UdpEndpoint;
-use crate::dns::query::is_exact_dns_query;
+use crate::dns::query::{IngressProfile, is_exact_dns_query, validate_exact_dns_query};
 
 #[cfg(feature = "ebpf")]
 #[test]
@@ -421,7 +421,7 @@ fn udp_original_dst_unspecified_origdst_is_authoritative_and_fails_closed() {
         local_addr: addr("192.0.2.20:5353"),
     };
 
-    assert_eq!(udp_original_dst(&meta, &dns_query_payload()), None);
+    assert!(udp_original_dst(&meta, &dns_query_payload()).is_none());
 }
 
 fn ipv4_origdst(ip: [u8; 4], port: u16) -> libc::sockaddr_in {
@@ -674,16 +674,23 @@ fn strict_dns_query_accepts_complete_query_and_edns_only() {
     edns.extend_from_slice(&[
         0x00, // root NAME
         0x00, 0x29, // TYPE OPT
-        0x10, 0x00, // UDP payload size
+        0x04, 0xd0, // UDP payload size (1232)
         0x00, 0x00, 0x00, 0x00, // extended RCODE/version/flags
         0x00, 0x00, // RDLENGTH
     ]);
     assert!(is_exact_dns_query(&edns));
+    assert_eq!(
+        validate_exact_dns_query(&edns).unwrap().ingress(),
+        IngressProfile::Udp {
+            advertised_size: 1232
+        }
+    );
 
     // A forged QDCOUNT cannot claim a second question that is not encoded.
     let mut forged_question_count = query.clone();
     forged_question_count[4..6].copy_from_slice(&2u16.to_be_bytes());
     assert!(!is_exact_dns_query(&forged_question_count));
+    assert!(validate_exact_dns_query(&forged_question_count).is_none());
 
     // Header record counts require a complete NAME + fixed RR + RDATA.
     let mut truncated_rr = query.clone();
@@ -713,6 +720,7 @@ fn strict_dns_query_accepts_complete_query_and_edns_only() {
     let mut trailing_junk = query;
     trailing_junk.push(0xde);
     assert!(!is_exact_dns_query(&trailing_junk));
+    assert!(validate_exact_dns_query(&trailing_junk).is_none());
 }
 
 fn dns_query_with_qname(qname: &[u8]) -> Vec<u8> {
@@ -801,14 +809,17 @@ async fn udp_dns_controller_declines_root_and_binary_questions() {
 
     let root = dns_query_with_qname(&[0x00]);
     assert!(
-        !controller.handle_udp_dns(&root, client, dst).await.unwrap(),
+        !controller
+            .handle_udp_dns(&root, client, dst, None)
+            .await
+            .unwrap(),
         "root qname must fall back to ordinary UDP"
     );
 
     let binary = dns_query_with_qname(&[0x01, 0xff, 0x00]);
     assert!(
         !controller
-            .handle_udp_dns(&binary, client, dst)
+            .handle_udp_dns(&binary, client, dst, None)
             .await
             .unwrap(),
         "binary qname must fall back to ordinary UDP"
@@ -821,6 +832,7 @@ async fn udp_dns_controller_declines_root_and_binary_questions() {
 fn udp_slow_path_only_forces_strict_dns_to_port_53() {
     let client = addr("10.0.0.1:12345");
     let data = dns_query_payload();
+    let validated = validate_exact_dns_query(&data).unwrap();
 
     let dns_pool = Arc::new(UdpEndpointPool::new());
     let dns_stats = Arc::new(StatsManager::new());
@@ -832,6 +844,7 @@ fn udp_slow_path_only_forces_strict_dns_to_port_53() {
         client,
         addr("203.0.113.53:53"),
         &data,
+        Some(validated),
     );
     assert!(matches!(
         dns_work,
@@ -848,6 +861,7 @@ fn udp_slow_path_only_forces_strict_dns_to_port_53() {
         client,
         addr("203.0.113.53:5353"),
         &data,
+        Some(validated),
     );
     assert!(matches!(ordinary_work, UdpSlowPathWork::Initialize(_)));
 }
@@ -861,10 +875,9 @@ fn udp_original_dst_cmsg_takes_precedence_over_other_metadata() {
         local_addr: addr("192.0.2.10:5353"),
     };
 
-    assert_eq!(
-        udp_original_dst(&meta, b"not a DNS query"),
-        Some(addr("203.0.113.10:4444"))
-    );
+    let destination = udp_original_dst(&meta, b"not a DNS query").unwrap();
+    assert_eq!(destination.address, addr("203.0.113.10:4444"));
+    assert!(destination.validated_dns.is_none());
 }
 
 #[test]
@@ -887,10 +900,9 @@ fn udp_original_dst_uses_ipv4_pktinfo_for_exact_dns_query() {
         packet_ifindex: None,
         local_addr: addr("0.0.0.0:15000"),
     };
-    assert_eq!(
-        udp_original_dst(&meta, &dns_query_payload()),
-        Some(addr("198.51.100.53:53"))
-    );
+    let destination = udp_original_dst(&meta, &dns_query_payload()).unwrap();
+    assert_eq!(destination.address, addr("198.51.100.53:53"));
+    assert!(destination.validated_dns.is_some());
 }
 
 #[test]
@@ -912,10 +924,9 @@ fn udp_original_dst_uses_ipv6_pktinfo_for_exact_dns_query() {
         packet_ifindex: None,
         local_addr: addr("[::]:15000"),
     };
-    assert_eq!(
-        udp_original_dst(&meta, &dns_query_payload()),
-        Some(addr("[2001:db8::53]:53"))
-    );
+    let destination = udp_original_dst(&meta, &dns_query_payload()).unwrap();
+    assert_eq!(destination.address, addr("[2001:db8::53]:53"));
+    assert!(destination.validated_dns.is_some());
 }
 
 #[test]
@@ -928,7 +939,12 @@ fn udp_original_dst_uses_non_wildcard_local_fallback() {
         local_addr,
     };
 
-    assert_eq!(udp_original_dst(&meta, b"opaque UDP"), Some(local_addr));
+    let destination = udp_original_dst(&meta, b"opaque UDP").unwrap();
+    assert_eq!(destination.address, local_addr);
+    assert!(destination.validated_dns.is_none());
+    let dns_destination = udp_original_dst(&meta, &dns_query_payload()).unwrap();
+    assert_eq!(dns_destination.address, local_addr);
+    assert!(dns_destination.validated_dns.is_some());
 }
 
 #[test]
@@ -940,7 +956,7 @@ fn udp_original_dst_fails_closed_for_wildcard_local_without_metadata() {
             packet_ifindex: None,
             local_addr,
         };
-        assert_eq!(udp_original_dst(&meta, b"opaque UDP"), None);
+        assert!(udp_original_dst(&meta, b"opaque UDP").is_none());
     }
 }
 
@@ -969,11 +985,10 @@ fn udp_original_dst_does_not_rewrite_non_exact_dns_payloads() {
         b"random non-53 UDP payload".as_slice(),
     ] {
         assert!(!is_exact_dns_query(payload));
-        assert_eq!(udp_original_dst(&packet_meta, payload), None);
-        assert_eq!(
-            udp_original_dst(&fallback_meta, payload),
-            Some(local_fallback)
-        );
+        assert!(udp_original_dst(&packet_meta, payload).is_none());
+        let destination = udp_original_dst(&fallback_meta, payload).unwrap();
+        assert_eq!(destination.address, local_fallback);
+        assert!(destination.validated_dns.is_none());
     }
 }
 
@@ -983,7 +998,7 @@ async fn udp_fast_path_miss_goes_slow() {
     let stats = StatsManager::new();
     let client = addr("10.0.0.1:12345");
     let dst = addr("203.0.113.1:443");
-    assert!(!udp_fast_path(&pool, &stats, b"hello", client, dst).await);
+    assert!(!udp_fast_path(&pool, &stats, b"hello", client, dst, None).await);
     let udp = stats.udp_snapshot();
     assert_eq!(udp.endpoint_misses, 1);
     assert_eq!(udp.endpoint_hits, 0);
@@ -1014,7 +1029,17 @@ async fn udp_fast_path_hit_enqueues_for_the_endpoint_driver() {
     let mut buf = [0u8; 64];
     // First packet was delivered through the driver start barrier.
     echo.recv_from(&mut buf).await.unwrap();
-    assert!(!udp_fast_path(&pool, &stats, b"wrong-client", addr("10.0.0.2:12345"), dst,).await);
+    assert!(
+        !udp_fast_path(
+            &pool,
+            &stats,
+            b"wrong-client",
+            addr("10.0.0.2:12345"),
+            dst,
+            None,
+        )
+        .await
+    );
     assert!(
         !udp_fast_path(
             &pool,
@@ -1022,6 +1047,7 @@ async fn udp_fast_path_hit_enqueues_for_the_endpoint_driver() {
             b"wrong-destination",
             client,
             addr("203.0.113.2:443"),
+            None,
         )
         .await
     );
@@ -1032,6 +1058,7 @@ async fn udp_fast_path_hit_enqueues_for_the_endpoint_driver() {
             b"wrong-client-port",
             addr("10.0.0.1:12346"),
             dst,
+            None,
         )
         .await
     );
@@ -1042,10 +1069,11 @@ async fn udp_fast_path_hit_enqueues_for_the_endpoint_driver() {
             b"wrong-destination-port",
             client,
             addr("203.0.113.1:444"),
+            None,
         )
         .await
     );
-    assert!(udp_fast_path(&pool, &stats, b"hello", client, dst).await);
+    assert!(udp_fast_path(&pool, &stats, b"hello", client, dst, None).await);
     let udp = stats.udp_snapshot();
     assert_eq!(udp.endpoint_hits, 1);
     assert_eq!(udp.endpoint_misses, 4);
@@ -1080,7 +1108,9 @@ async fn udp_fast_path_dns_goes_slow_even_with_endpoint() {
     )
     .await;
 
-    assert!(!udp_fast_path(&pool, &stats, &dns_query_payload(), client, dst).await);
+    let query = dns_query_payload();
+    let validated = validate_exact_dns_query(&query).unwrap();
+    assert!(!udp_fast_path(&pool, &stats, &query, client, dst, Some(validated)).await);
     let udp = stats.udp_snapshot();
     assert_eq!(udp.endpoint_hits, 0);
     assert_eq!(udp.endpoint_misses, 0);
@@ -1110,7 +1140,17 @@ async fn udp_fast_path_dns_shaped_non53_forwards() {
     let mut buf = [0u8; 64];
     echo.recv_from(&mut buf).await.unwrap();
     let query = dns_query_payload();
-    assert!(udp_fast_path(&pool, &stats, &query, client, dst).await);
+    assert!(
+        udp_fast_path(
+            &pool,
+            &stats,
+            &query,
+            client,
+            dst,
+            validate_exact_dns_query(&query),
+        )
+        .await
+    );
     assert_eq!(stats.udp_snapshot().endpoint_hits, 1);
 
     let (n, _) = tokio::time::timeout(Duration::from_secs(2), echo.recv_from(&mut buf))
@@ -1146,7 +1186,7 @@ async fn udp_fast_path_non_dns_port53_forwards() {
     let mut buf = [0u8; 64];
     echo.recv_from(&mut buf).await.unwrap();
     let garbage = [0u8; 20]; // QR=0 but qdcount=0 — not a DNS query
-    assert!(udp_fast_path(&pool, &stats, &garbage, client, dst).await);
+    assert!(udp_fast_path(&pool, &stats, &garbage, client, dst, None).await);
     assert_eq!(stats.udp_snapshot().endpoint_hits, 1);
 
     let (n, _) = tokio::time::timeout(Duration::from_secs(2), echo.recv_from(&mut buf))
@@ -1165,15 +1205,26 @@ async fn udp_fast_path_drops_internal_and_broadcast() {
     // honk-internal subnets (v4 + v6), either direction.  The v6 check
     // must match the real dae0 addresses (fd00:686f:6e6b::1/2, see the
     // DAENS_* constants in the crate root).
-    assert!(udp_fast_path(&pool, &stats, b"hello", client, addr("169.254.0.11:8080")).await);
-    assert!(udp_fast_path(&pool, &stats, b"hello", addr("169.254.0.1:1234"), dst).await);
     assert!(
         udp_fast_path(
             &pool,
             &stats,
             b"hello",
             client,
-            addr("[fd00:686f:6e6b::1]:8080")
+            addr("169.254.0.11:8080"),
+            None,
+        )
+        .await
+    );
+    assert!(udp_fast_path(&pool, &stats, b"hello", addr("169.254.0.1:1234"), dst, None).await);
+    assert!(
+        udp_fast_path(
+            &pool,
+            &stats,
+            b"hello",
+            client,
+            addr("[fd00:686f:6e6b::1]:8080"),
+            None,
         )
         .await
     );
@@ -1183,20 +1234,42 @@ async fn udp_fast_path_drops_internal_and_broadcast() {
             &stats,
             b"hello",
             addr("[fd00:686f:6e6b::2]:1234"),
-            dst
+            dst,
+            None,
         )
         .await
     );
     // Broadcast / multicast destinations.
-    assert!(udp_fast_path(&pool, &stats, b"hello", client, addr("255.255.255.255:67")).await);
-    assert!(udp_fast_path(&pool, &stats, b"hello", client, addr("192.168.1.255:67")).await);
     assert!(
         udp_fast_path(
             &pool,
             &stats,
             b"hello",
             client,
-            addr("239.255.255.250:1900")
+            addr("255.255.255.255:67"),
+            None,
+        )
+        .await
+    );
+    assert!(
+        udp_fast_path(
+            &pool,
+            &stats,
+            b"hello",
+            client,
+            addr("192.168.1.255:67"),
+            None,
+        )
+        .await
+    );
+    assert!(
+        udp_fast_path(
+            &pool,
+            &stats,
+            b"hello",
+            client,
+            addr("239.255.255.250:1900"),
+            None,
         )
         .await
     );
@@ -2751,7 +2824,9 @@ async fn udp_dns_dispatch_registers_connection_guard_before_task_poll() {
         drain: Arc::clone(&drain),
         handle: plane.spawn_handle(),
     };
-    super::dispatch_udp_slow_path(&state, client, dst, &dns_query_payload());
+    let query = dns_query_payload();
+    let validated = validate_exact_dns_query(&query);
+    super::dispatch_udp_slow_path(&state, client, dst, &query, validated);
     assert_eq!(
         drain.active_count(),
         1,
@@ -2805,12 +2880,17 @@ async fn udp_dns_with_ready_endpoint_uses_controller_not_queue() {
     let dns = production_dns_controller(upstream_calls.clone(), dns_response_payload());
     let slow = Arc::new(tokio::sync::Semaphore::new(1));
     let query = dns_query_payload();
+    let validated = validate_exact_dns_query(&query).unwrap();
 
     // Fast path must force DNS-shaped traffic slow even with Ready present.
-    assert!(!udp_fast_path(&pool, &stats, &query, client, dst).await);
+    assert!(!udp_fast_path(&pool, &stats, &query, client, dst, Some(validated)).await);
 
-    match super::begin_udp_slow_path(&pool, &stats, &slow, client, dst, &query) {
-        super::UdpSlowPathWork::DnsThenMaybeInitialize { permit, data } => {
+    match super::begin_udp_slow_path(&pool, &stats, &slow, client, dst, &query, Some(validated)) {
+        super::UdpSlowPathWork::DnsThenMaybeInitialize {
+            permit,
+            data,
+            validated,
+        } => {
             let lease = super::complete_udp_dns_slow_path(
                 super::UdpDnsSlowPathContext {
                     pool: &pool,
@@ -2821,6 +2901,7 @@ async fn udp_dns_with_ready_endpoint_uses_controller_not_queue() {
                 },
                 permit,
                 &data,
+                validated,
             )
             .await;
             assert!(
@@ -2868,10 +2949,15 @@ async fn udp_dns_with_initializing_endpoint_uses_controller_not_queue() {
     let dns = production_dns_controller(upstream_calls.clone(), dns_response_payload());
     let slow = Arc::new(tokio::sync::Semaphore::new(1));
     let query = dns_query_payload();
+    let validated = validate_exact_dns_query(&query).unwrap();
 
-    assert!(!udp_fast_path(&pool, &stats, &query, client, dst).await);
-    match super::begin_udp_slow_path(&pool, &stats, &slow, client, dst, &query) {
-        super::UdpSlowPathWork::DnsThenMaybeInitialize { permit, data } => {
+    assert!(!udp_fast_path(&pool, &stats, &query, client, dst, Some(validated)).await);
+    match super::begin_udp_slow_path(&pool, &stats, &slow, client, dst, &query, Some(validated)) {
+        super::UdpSlowPathWork::DnsThenMaybeInitialize {
+            permit,
+            data,
+            validated,
+        } => {
             let maybe_lease = super::complete_udp_dns_slow_path(
                 super::UdpDnsSlowPathContext {
                     pool: &pool,
@@ -2882,6 +2968,7 @@ async fn udp_dns_with_initializing_endpoint_uses_controller_not_queue() {
                 },
                 permit,
                 &data,
+                validated,
             )
             .await;
             assert!(maybe_lease.is_none());
@@ -2917,12 +3004,12 @@ async fn udp_initializing_follower_requires_slow_permit_via_shared_helper() {
     };
 
     // Fast path must miss for Initializing — no direct enqueue, no copy.
-    assert!(!udp_fast_path(&pool, &stats, b"follower", client, dst).await);
+    assert!(!udp_fast_path(&pool, &stats, b"follower", client, dst, None).await);
     assert_eq!(stats.udp_snapshot().endpoint_misses, 1);
     assert_eq!(stats.udp_snapshot().queue_accepted, 0);
 
     let zero = Arc::new(tokio::sync::Semaphore::new(0));
-    match super::begin_udp_slow_path(&pool, &stats, &zero, client, dst, b"follower") {
+    match super::begin_udp_slow_path(&pool, &stats, &zero, client, dst, b"follower", None) {
         super::UdpSlowPathWork::Done => {}
         _ => panic!("zero slow permit must not reserve or enqueue"),
     }
@@ -2931,7 +3018,7 @@ async fn udp_initializing_follower_requires_slow_permit_via_shared_helper() {
     assert_eq!(udp.queue_accepted, 0);
 
     let open = Arc::new(tokio::sync::Semaphore::new(1));
-    match super::begin_udp_slow_path(&pool, &stats, &open, client, dst, b"follower") {
+    match super::begin_udp_slow_path(&pool, &stats, &open, client, dst, b"follower", None) {
         super::UdpSlowPathWork::Done => {}
         super::UdpSlowPathWork::Initialize(_) => {
             panic!("Initializing follower must enqueue, not create a second lease")

@@ -21,8 +21,7 @@ impl DnsForwarder {
         Ok(self
             .resolve_inner(raw_query, None, ingress, false, ResolveMode::Compatibility)
             .await?
-            .rendered()
-            .to_vec())
+            .into_rendered())
     }
 
     /// Resolve a raw DNS query with optional original destination.
@@ -55,8 +54,7 @@ impl DnsForwarder {
                 ResolveMode::Compatibility,
             )
             .await?
-            .rendered()
-            .to_vec())
+            .into_rendered())
     }
 
     pub(crate) async fn resolve_strict_with_context_and_profile(
@@ -68,8 +66,7 @@ impl DnsForwarder {
         Ok(self
             .resolve_inner(raw_query, original_dst, ingress, false, ResolveMode::Strict)
             .await?
-            .rendered()
-            .to_vec())
+            .into_rendered())
     }
 
     pub async fn resolve_outcome(&self, raw_query: &[u8]) -> Result<DnsOutcome, DnsForwardError> {

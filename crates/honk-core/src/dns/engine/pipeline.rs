@@ -111,7 +111,6 @@ pub(super) struct ExecutionContext<'a> {
     pub(super) raw_query: &'a [u8],
     pub(super) original_dst: Option<SocketAddr>,
     pub(super) cache_key: CacheKey,
-    pub(super) refresh_key: CacheKey,
     pub(super) logical_upstream: UpstreamTag,
     pub(super) request_scope: RequestScope,
     pub(super) reuse_eligible: bool,
@@ -209,7 +208,6 @@ pub(crate) async fn resolve_with_owner(
 
     let (logical_upstream, request_scope) = request_exchange(&prepared)?;
     let resolve_key = prepared.cache_key(request_scope.clone(), OperationKind::Resolve);
-    let refresh_key = resolve_key.with_operation(OperationKind::Refresh);
     let context = ExecutionContext {
         forwarder,
         engine,
@@ -217,7 +215,6 @@ pub(crate) async fn resolve_with_owner(
         raw_query,
         original_dst,
         cache_key: resolve_key,
-        refresh_key,
         logical_upstream,
         request_scope: request_scope.clone(),
         reuse_eligible,

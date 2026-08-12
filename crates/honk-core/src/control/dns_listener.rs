@@ -7,7 +7,7 @@
 use super::{ConnectionGuard, try_admit_udp_slow_path};
 use crate::control::dns_control::DnsController;
 use crate::control::drain::DrainTracker;
-use crate::dns::query::{IngressProfile, udp_ingress_profile};
+use crate::dns::query::validate_exact_dns_query;
 use crate::stats::StatsManager;
 use honk_config::dns::DnsBindEndpoint;
 use std::io;
@@ -19,7 +19,6 @@ use tokio::task::JoinSet;
 use tracing::{debug, warn};
 
 const MAX_UDP_DNS_MESSAGE: usize = u16::MAX as usize;
-const MAX_STANDALONE_UDP_RESPONSE: u16 = 1232;
 const EPHEMERAL_BIND_ATTEMPTS: usize = 32;
 const fn standalone_tcp_capacity(total_connection_capacity: usize) -> usize {
     if total_connection_capacity == 0 {
@@ -27,15 +26,6 @@ const fn standalone_tcp_capacity(total_connection_capacity: usize) -> usize {
     } else {
         let quarter = total_connection_capacity / 4;
         if quarter == 0 { 1 } else { quarter }
-    }
-}
-
-fn standalone_udp_ingress_profile(query: &[u8]) -> IngressProfile {
-    let IngressProfile::Udp { advertised_size } = udp_ingress_profile(query) else {
-        unreachable!("UDP ingress parser always returns a UDP profile")
-    };
-    IngressProfile::Udp {
-        advertised_size: advertised_size.clamp(512, MAX_STANDALONE_UDP_RESPONSE),
     }
 }
 
@@ -354,6 +344,13 @@ async fn run_udp_supervisor(
 ) {
     let mut buffer = [0u8; MAX_UDP_DNS_MESSAGE];
     let mut children = JoinSet::new();
+    let local_addr = match socket.local_addr() {
+        Ok(local_addr) => local_addr,
+        Err(error) => {
+            warn!(error_kind = ?error.kind(), "standalone UDP DNS receive failed");
+            return;
+        }
+    };
 
     loop {
         tokio::select! {
@@ -366,7 +363,7 @@ async fn run_udp_supervisor(
             completed = children.join_next(), if !children.is_empty() => {
                 log_child_result(completed, "UDP query");
             }
-            received = super::sockets::recv_from_with_orig_dst(socket.as_ref(), &mut buffer) => {
+            received = super::sockets::recv_from_with_orig_dst(socket.as_ref(), local_addr, &mut buffer) => {
                 let (length, client_addr, meta) = match received {
                     Ok(received) => received,
                     Err(error) => {
@@ -404,18 +401,18 @@ async fn run_udp_supervisor(
                         continue;
                     }
                 };
-                if !crate::dns::query::is_exact_dns_query(query) {
+                let Some(validated) = validate_exact_dns_query(query) else {
                     let response = minimal_dns_error_response(query, 1);
                     if let Err(error) = send_bound_udp_response(socket.as_ref(), &response, response_source, client_addr).await {
                         debug!(error_kind = ?error.kind(), %client_addr, "standalone UDP DNS FORMERR send failed");
                     }
                     continue;
-                }
+                };
 
                 // All bounded admission is owned before the datagram copy and
                 // child allocation. Register the drain guard before spawn so a
                 // simultaneous shutdown cannot observe an untracked query.
-                let ingress = standalone_udp_ingress_profile(query);
+                let ingress = validated.ingress();
                 let query = query.to_vec();
                 let guard = ConnectionGuard::new(Arc::clone(&drain));
                 let child_socket = Arc::clone(&socket);
@@ -735,7 +732,7 @@ mod tests {
     }
 
     #[test]
-    fn standalone_listener_caps_are_bounded() {
+    fn standalone_listener_capacities_and_profiles_are_exact() {
         assert_eq!(standalone_tcp_capacity(0), 0);
         assert_eq!(standalone_tcp_capacity(1), 1);
         assert_eq!(standalone_tcp_capacity(8), 2);
@@ -744,19 +741,17 @@ mod tests {
         wire[10..12].copy_from_slice(&1u16.to_be_bytes());
         wire.extend_from_slice(&[0, 0, 41, 0xff, 0xff, 0, 0, 0, 0, 0, 0]);
         assert_eq!(
-            standalone_udp_ingress_profile(&wire),
-            IngressProfile::Udp {
-                advertised_size: MAX_STANDALONE_UDP_RESPONSE
+            validate_exact_dns_query(&wire).unwrap().ingress(),
+            crate::dns::query::IngressProfile::Udp {
+                advertised_size: u16::MAX
             }
         );
         let mut undersized = wire.clone();
         let opt_class = undersized.len() - 8;
         undersized[opt_class..opt_class + 2].copy_from_slice(&1u16.to_be_bytes());
         assert_eq!(
-            standalone_udp_ingress_profile(&undersized),
-            IngressProfile::Udp {
-                advertised_size: 512
-            }
+            validate_exact_dns_query(&undersized).unwrap().ingress(),
+            crate::dns::query::IngressProfile::Udp { advertised_size: 1 }
         );
 
         let mut opcode_query = query("opcode.example", 0x5252);
