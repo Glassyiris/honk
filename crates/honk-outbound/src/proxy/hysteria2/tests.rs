@@ -305,9 +305,13 @@ async fn handle_tcp_request(
         return;
     }
     let mut first_payload = [0; 8192];
-    let first_payload_len = match recv.read(&mut first_payload).await {
-        Ok(Some(count)) => count,
-        _ => return,
+    let first_payload_len = if response_status == 0 {
+        match recv.read(&mut first_payload).await {
+            Ok(Some(count)) => count,
+            _ => return,
+        }
+    } else {
+        0
     };
     tokio::time::sleep(response_delay).await;
     let padding = random_padding(128, 1024);
@@ -630,7 +634,7 @@ async fn test_dial_tcp_does_not_wait_for_response() {
 }
 
 #[tokio::test]
-async fn test_tcp_response_error_is_reported_on_first_read() {
+async fn test_first_read_sends_tcp_request_and_reports_response_error() {
     let server_addr = start_server_with_response(TEST_PASSWORD, Duration::ZERO, 1).await;
     let node = test_node(server_addr.port(), TEST_PASSWORD);
     let handler = Hysteria2Handler::new();
@@ -639,9 +643,10 @@ async fn test_tcp_response_error_is_reported_on_first_read() {
         .dial(&node, target, None, Duration::from_secs(5))
         .await
         .unwrap();
-
-    stream.stream.write_all(b"request").await.unwrap();
-    let error = stream.stream.read_u8().await.unwrap_err();
+    let error = tokio::time::timeout(Duration::from_secs(1), stream.stream.read_u8())
+        .await
+        .expect("first read did not send the Hysteria2 TCP request")
+        .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
 }
 

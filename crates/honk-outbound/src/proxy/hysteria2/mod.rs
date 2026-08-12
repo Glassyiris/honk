@@ -287,6 +287,9 @@ impl AsyncRead for Hy2TcpStream {
         if output.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
+        if self.request.is_some() {
+            std::task::ready!(self.as_mut().poll_flush(cx))?;
+        }
         loop {
             if let Some(offset) = self.body_offset {
                 if offset < self.response.len() {
