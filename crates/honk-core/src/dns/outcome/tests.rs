@@ -34,6 +34,7 @@ fn typed_outcome_exposes_projection_metadata_when_upstream_is_accepted() {
         &["192.0.2.1".parse::<std::net::IpAddr>().expect("IP")]
     );
     assert_eq!(outcome.rendered(), &[0x12, 0x34]);
+    assert_eq!(outcome.into_rendered(), vec![0x12, 0x34]);
 }
 
 #[test]

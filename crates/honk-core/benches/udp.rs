@@ -13,6 +13,19 @@ const STEADY_ENQUEUE_ITERATIONS: usize = 1_000_000;
 const RESERVE_ROLLBACK_ITERATIONS: usize = 10_000;
 const HISTOGRAM_ITERATIONS: usize = 1_000_000;
 const QUEUE_SATURATION_OPERATIONS: u64 = 64;
+const FIRST_REPLY_METRIC_ITERATIONS: usize = 1_000_000;
+
+fn bench_first_reply_metric_hot(c: &mut Criterion) {
+    let mut group = c.benchmark_group("udp_first_reply_metric_hot");
+    group.sample_size(10);
+    group.throughput(Throughput::Elements(FIRST_REPLY_METRIC_ITERATIONS as u64));
+    group.bench_function("one_million", |b| {
+        b.iter(|| {
+            bench_support::first_reply_metric_hot_batch(black_box(FIRST_REPLY_METRIC_ITERATIONS))
+        });
+    });
+    group.finish();
+}
 
 fn bench_steady_enqueue(c: &mut Criterion) {
     let mut group = c.benchmark_group("udp_steady_enqueue_128b");
@@ -77,5 +90,6 @@ criterion_group!(
     bench_reserve_rollback,
     bench_histogram_record_snapshot,
     bench_queue_saturation,
+    bench_first_reply_metric_hot,
 );
 criterion_main!(benches);

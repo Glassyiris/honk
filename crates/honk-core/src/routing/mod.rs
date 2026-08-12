@@ -409,6 +409,10 @@ impl Router {
         })
     }
 
+    pub const fn default_outbound(&self) -> &str {
+        self.default_outbound.as_str()
+    }
+
     pub fn route(&self, conn: &ConnectionInfo) -> &str {
         match self.route_full(conn) {
             Some(r) => r.outbound_name,
@@ -428,7 +432,7 @@ impl Router {
     pub fn route_with_must(&self, conn: &ConnectionInfo) -> (&str, bool) {
         match self.route_full(conn) {
             Some(r) => (r.outbound_name, r.must),
-            None => (self.route(conn), false),
+            None => (self.default_outbound(), false),
         }
     }
 

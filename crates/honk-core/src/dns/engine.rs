@@ -175,7 +175,7 @@ impl DnsEngine {
         strict: bool,
     ) -> Result<ResponseDirective, EngineError> {
         if strict {
-            ResponseTemplate::validate(&prepared.query, &wire)?;
+            ResponseTemplate::check(&prepared.query, &wire)?;
         }
         let class = classify_response(&wire);
         if matches!(class, ResponseClass::Nxdomain | ResponseClass::Servfail) {

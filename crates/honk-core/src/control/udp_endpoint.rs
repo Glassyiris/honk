@@ -39,6 +39,7 @@ const FLOW_QUEUE_CAPACITY: usize = 64;
 /// All retained payload bytes across UDP flows are bounded exactly by permits.
 const GLOBAL_PAYLOAD_CAPACITY: usize = 8 * 1024 * 1024;
 const TRANSPORT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const TRAFFIC_ALIVE_REPORT_INTERVAL: Duration = Duration::from_millis(200);
 const DRIVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(6);
 const DRIVER_ABORT_TIMEOUT: Duration = Duration::from_secs(1);
 /// Includes the eagerly-created original-destination socket. Reaching the
@@ -60,6 +61,8 @@ pub struct UdpEndpoint {
     has_reply: AtomicBool,
     /// Guard for the exactly-once first-reply metric.
     first_reply_recorded: AtomicBool,
+    /// Bounds traffic-state lock acquisition to five times per second per endpoint.
+    next_alive_report_at: AtomicI64,
     /// Creation time used for reply latency accounting.
     created_at: Instant,
     /// Reference count for active operations.
@@ -97,6 +100,7 @@ impl UdpEndpoint {
             expires_at: AtomicI64::new(now + nanos_from_dur(DEFAULT_NAT_TIMEOUT)),
             has_reply: AtomicBool::new(false),
             first_reply_recorded: AtomicBool::new(false),
+            next_alive_report_at: AtomicI64::new(0),
             created_at: Instant::now(),
             ref_count: AtomicI64::new(1),
             dead: AtomicBool::new(false),
@@ -157,7 +161,22 @@ impl UdpEndpoint {
     }
 
     fn take_first_reply_metric(&self) -> Option<Duration> {
+        if self.first_reply_recorded.load(Ordering::Acquire) {
+            return None;
+        }
         (!self.first_reply_recorded.swap(true, Ordering::AcqRel)).then(|| self.created_at.elapsed())
+    }
+
+    fn take_alive_report_slot(&self) -> bool {
+        let now = monotonic_nanos();
+        if now < self.next_alive_report_at.load(Ordering::Relaxed) {
+            return false;
+        }
+        self.next_alive_report_at.store(
+            now + nanos_from_dur(TRAFFIC_ALIVE_REPORT_INTERVAL),
+            Ordering::Relaxed,
+        );
+        true
     }
 
     pub fn has_reply(&self) -> bool {
@@ -2188,11 +2207,13 @@ async fn receive_loop(
         }
         endpoint.tracker_download(n as u64);
         outbound_tracker.add_bytes(0, n as u64);
-        alive_set.report_available_traffic(
-            endpoint.node_id,
-            honk_outbound::alive::ProbeDomain::DataUdp,
-            ipver,
-        );
+        if endpoint.take_alive_report_slot() {
+            alive_set.report_available_traffic(
+                endpoint.node_id,
+                honk_outbound::alive::ProbeDomain::DataUdp,
+                ipver,
+            );
+        }
     }
 }
 
@@ -2218,6 +2239,22 @@ mod tests {
     }
 
     use super::*;
+
+    #[tokio::test]
+    async fn first_reply_metric_and_alive_reporting_are_throttled() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let relay = "127.0.0.1:53".parse().unwrap();
+        let endpoint = UdpEndpoint::new(transport(socket, relay), relay, uuid::Uuid::new_v4());
+
+        assert!(endpoint.take_first_reply_metric().is_some());
+        assert!(endpoint.take_first_reply_metric().is_none());
+        assert!(endpoint.take_alive_report_slot());
+        assert!(!endpoint.take_alive_report_slot());
+        endpoint
+            .next_alive_report_at
+            .store(monotonic_nanos().saturating_sub(1), Ordering::Relaxed);
+        assert!(endpoint.take_alive_report_slot());
+    }
 
     async fn recv_and_ack(
         pool: &UdpEndpointPool,

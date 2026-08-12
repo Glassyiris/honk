@@ -587,19 +587,20 @@ impl ControlPlaneHandle {
             return Ok(());
         }
 
-        let dial_mode = {
+        let (dial_mode, connect_timeout, dns_resolve_timeout, overall_dial_timeout) = {
             let config = self.config.read().await;
-            config
-                .global
-                .dial_mode
-                .parse::<DialMode>()
-                .ok()
-                .unwrap_or(DialMode::DomainPlusPlus)
-        };
-
-        let connect_timeout = {
-            let config = self.config.read().await;
-            std::time::Duration::from_millis(config.global.connect_timeout_ms)
+            let connect_timeout_ms = config.global.connect_timeout_ms;
+            (
+                config
+                    .global
+                    .dial_mode
+                    .parse::<DialMode>()
+                    .ok()
+                    .unwrap_or(DialMode::DomainPlusPlus),
+                Duration::from_millis(connect_timeout_ms),
+                Duration::from_millis(config.global.dns_resolve_timeout_ms),
+                Duration::from_millis((connect_timeout_ms.max(1000) * 4).max(10000)),
+            )
         };
 
         // Skip sniffing if eBPF routing already decided with must flag
@@ -678,6 +679,20 @@ impl ControlPlaneHandle {
         // prefer all 'direct' need handoff, even if in complex chain select 'direct' outbound
         let reroute_by_sniffed_domain =
             Self::should_reroute_sniffed_domain(dial_mode, domain.as_deref(), handoff.as_ref());
+        let (userspace_outbound, userspace_must, matched_rule) = {
+            let router = self.router.read().await;
+            match router.route_full(&conn_info) {
+                Some(matched) => (
+                    matched.outbound_name.to_owned(),
+                    matched.must,
+                    Some((
+                        matched.rule_type.to_owned(),
+                        matched.rule_payload.to_owned(),
+                    )),
+                ),
+                None => (router.default_outbound().to_owned(), false, None),
+            }
+        };
         let (outbound_name, must) = if let Some(ho) = &handoff {
             debug!(
                 "eBPF handoff: outbound={}, mark=0x{:x}, dscp={}",
@@ -685,26 +700,12 @@ impl ControlPlaneHandle {
             );
             if ho.outbound == OutboundIndex::ControlPlaneRouting as u8 || reroute_by_sniffed_domain
             {
-                let router = self.router.read().await;
-                let (name, must) = router.route_with_must(&conn_info);
-                (name.to_string(), must)
+                (userspace_outbound, userspace_must)
             } else {
                 (self.outbound_index_to_name(ho.outbound).await, ho.must != 0)
             }
         } else {
-            let router = self.router.read().await;
-            let (name, must) = router.route_with_must(&conn_info);
-            (name.to_string(), must)
-        };
-
-        // Matched-rule identity for the /connections display. The userspace
-        // Router mirrors the eBPF-compiled rules, so this names eBPF-decided
-        // flows as well (display-only; the handoff decision above stands).
-        let matched_rule = {
-            let router = self.router.read().await;
-            router
-                .route_full(&conn_info)
-                .map(|m| (m.rule_type.to_string(), m.rule_payload.to_string()))
+            (userspace_outbound, userspace_must)
         };
 
         // Clash mode override (Direct/Global); no-op when the clash API is
@@ -842,10 +843,9 @@ impl ControlPlaneHandle {
                 // Resolve both IPv4 and IPv6, preferring the version that
                 // matches original_dst. Apply configurable timeout.
                 let is_v6 = original_dst.is_ipv6();
-                let dns_timeout = std::time::Duration::from_millis(
-                    self.config.read().await.global.dns_resolve_timeout_ms,
-                );
-                match tokio::time::timeout(dns_timeout, self.dns_resolver.resolve(domain)).await {
+                match tokio::time::timeout(dns_resolve_timeout, self.dns_resolver.resolve(domain))
+                    .await
+                {
                     Ok(Ok(resolved)) => {
                         // Prefer AAAA records for v6 original_dst, A records for v4.
                         let preferred_ip = if is_v6 {
@@ -897,13 +897,14 @@ impl ControlPlaneHandle {
                 target_domain.clone(),
                 &outbound_name,
                 connect_timeout,
+                overall_dial_timeout,
                 Arc::clone(&runtime_generation),
                 ipver,
                 cold_urltest,
             )
             .await;
-        let (mut proxy_stream, node): (crate::proxy::ProxyStream, Node) = match raced {
-            Some((stream, idx)) => (stream, candidates[idx].clone()),
+        let (mut proxy_stream, node) = match raced {
+            Some(pair) => pair,
             None => {
                 // Exactly one retry when the just-reported failure may have
                 // moved the plan (URLTest strike demotion). Same-plan
@@ -927,12 +928,12 @@ impl ControlPlaneHandle {
                                 target_domain.clone(),
                                 &outbound_name,
                                 connect_timeout,
+                                overall_dial_timeout,
                                 Arc::clone(&runtime_generation),
                                 ipver,
                                 false,
                             )
-                            .await
-                            .map(|(stream, idx)| (stream, nodes[idx].clone()));
+                            .await;
                     }
                 }
                 match retried {
@@ -1350,7 +1351,7 @@ impl ControlPlaneHandle {
         if !lease.dns_checked() {
             match self
                 .dns_controller
-                .handle_udp_dns(&data, client_addr, original_dst)
+                .handle_udp_dns(&data, client_addr, original_dst, None)
                 .await
             {
                 Ok(true) => {
@@ -1862,9 +1863,9 @@ impl ControlPlaneHandle {
     /// cancelled, and fresh connections for losers are deposited into the
     /// pool (≤2 per race, off the critical path). Failures are reported via
     /// traffic-based thresholds to avoid killing a node from a single
-    /// transient failure. Returns the winning stream and its index into
-    /// `candidates`; `None` means every candidate failed (already logged) —
-    /// close-accounting stays with the caller.
+    /// transient failure. Returns the winning stream and its already-owned
+    /// node; `None` means every candidate failed (already logged) — close
+    /// accounting stays with the caller.
     #[allow(clippy::too_many_arguments)]
     async fn race_candidates(
         &self,
@@ -1873,16 +1874,12 @@ impl ControlPlaneHandle {
         target_domain: Option<String>,
         outbound_name: &str,
         connect_timeout: Duration,
+        overall_dial_timeout: Duration,
         runtime_generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
         ipver: IpVersion,
         cold_urltest: bool,
-    ) -> Option<(crate::proxy::ProxyStream, usize)> {
-        let dial_deadline = {
-            let config = self.config.read().await;
-            let per_node_ms = config.global.connect_timeout_ms.max(1000);
-            let overall_ms = (per_node_ms * 4).max(10000);
-            tokio::time::Instant::now() + std::time::Duration::from_millis(overall_ms)
-        };
+    ) -> Option<(crate::proxy::ProxyStream, Node)> {
+        let dial_deadline = tokio::time::Instant::now() + overall_dial_timeout;
         let ctx = self.clone();
         let target = resolved_target;
         let outbound = outbound_name.to_string();
@@ -1922,14 +1919,14 @@ impl ControlPlaneHandle {
                     ))
                 });
                 let elapsed = start.elapsed();
-                (result, idx, elapsed)
+                (result, idx, elapsed, node)
             });
         }
 
         let mut last_err: Option<(String, String)> = None;
         let mut first_err: Option<(String, String)> = None;
         let mut timeout_count: usize = 0;
-        let mut winner: Option<(crate::proxy::ProxyStream, usize)> = None;
+        let mut winner: Option<(crate::proxy::ProxyStream, usize, Node)> = None;
         let mut remaining = set.len();
 
         loop {
@@ -1939,8 +1936,7 @@ impl ControlPlaneHandle {
             remaining -= 1;
             match tokio::time::timeout_at(dial_deadline, set.join_next()).await {
                 Ok(Some(task_result)) => match task_result {
-                    Ok((Ok((stream, fresh)), idx, elapsed)) => {
-                        let node = &candidates[idx];
+                    Ok((Ok((stream, fresh)), idx, elapsed, node)) => {
                         ctx.alive_set
                             .report_available_traffic(node.id, ProbeDomain::Tcp, ipver);
                         // Real-traffic degradation fast path: a fresh
@@ -1957,12 +1953,11 @@ impl ControlPlaneHandle {
                         {
                             ctx.alive_set.notify_check_tcp(node.id);
                         }
-                        winner = Some((stream, idx));
+                        winner = Some((stream, idx, node));
                         set.abort_all();
                         break;
                     }
-                    Ok((Err(e), idx, _elapsed)) => {
-                        let node = &candidates[idx];
+                    Ok((Err(e), _idx, _elapsed, node)) => {
                         debug!("Parallel dial to {} failed: {}", node.name, e);
                         ctx.stats.record_error(&outbound);
                         ctx.alive_set
@@ -2007,7 +2002,7 @@ impl ControlPlaneHandle {
         // included, paid off the critical path); others get a bare TCP.
         if outbound_name != "direct"
             && outbound_name != "block"
-            && let Some((_, winning_idx)) = &winner
+            && let Some((_, winning_idx, _)) = &winner
         {
             let mut deposit_count = 0u32;
             for (idx, node) in candidates.iter().enumerate() {
@@ -2091,7 +2086,7 @@ impl ControlPlaneHandle {
         }
 
         match winner {
-            Some((s, idx)) => Some((s, idx)),
+            Some((stream, _, node)) => Some((stream, node)),
             None => {
                 if let Some((last_msg, last_name)) = last_err {
                     let (first_msg, first_name) =
