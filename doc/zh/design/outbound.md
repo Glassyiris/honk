@@ -419,6 +419,8 @@ QPACK，以及认证所需的 HEADERS 处理。它不得宣告
 `SETTINGS_H3_DATAGRAM`；否则会启动一个竞争的 quic-go datagram reader，
 可能吞掉 Hysteria2 UDP packet。
 
+Hysteria2 沿用 sing-quic 的 lazy TCP 建立方式：首写合并 request 与 payload，首读移除 response，从而节省一次 RTT。
+
 Salamander obfuscation 在每个 wire datagram 前加 8 字节随机 salt，并用
 重复的 `BLAKE2b-256(password || salt)` 与 payload 做 XOR。client 端口
 跳跃从第一次发送起就选择配置的目标端口。服务端必须把该端口范围 DNAT

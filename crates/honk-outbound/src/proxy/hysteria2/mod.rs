@@ -55,9 +55,10 @@ use std::time::Duration;
 
 use anyhow::{Context as _, anyhow};
 use async_trait::async_trait;
+use bytes::Bytes;
 use honk_config::node::Node;
 use quinn::{AsyncUdpSocket, Endpoint, UdpPoller};
-use tokio::io::ReadBuf;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 use tracing::debug;
 
@@ -83,9 +84,9 @@ use h3::*;
 use salamander::*;
 use wire::{
     AUTH_PADDING_MAX, AUTH_PADDING_MIN, HEADER_AUTH, HEADER_CC_RX, HEADER_PADDING, HEADER_UDP,
-    MAX_ADDRESS_LENGTH, MAX_UDP_SIZE, STATUS_AUTH_OK, TcpHandshakeError, URL_HOST, URL_PATH,
-    UdpInbound, decode_udp_message, encode_tcp_request, fragment_udp_message, random_padding,
-    read_tcp_response,
+    MAX_ADDRESS_LENGTH, MAX_MESSAGE_LENGTH, MAX_PADDING_LENGTH, MAX_UDP_SIZE, STATUS_AUTH_OK,
+    URL_HOST, URL_PATH, UdpInbound, decode_udp_message, encode_tcp_request, fragment_udp_message,
+    random_padding,
 };
 
 /// Auth request: HEADERS frame for `POST https://hysteria/auth`
@@ -193,6 +194,193 @@ impl Hy2ConnState {
 
     fn alloc_session(&self) -> u32 {
         self.next_session.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+const MAX_TCP_RESPONSE_BUFFER: usize =
+    1 + 8 + MAX_MESSAGE_LENGTH as usize + 8 + MAX_PADDING_LENGTH as usize;
+
+#[derive(Debug)]
+struct Hy2TcpStream {
+    inner: crate::quic::QuicBiStream,
+    request: Option<Bytes>,
+    response: Vec<u8>,
+    body_offset: Option<usize>,
+}
+
+impl Hy2TcpStream {
+    fn new(inner: crate::quic::QuicBiStream, addr: &str) -> Self {
+        Self {
+            inner,
+            request: Some(encode_tcp_request(addr).into()),
+            response: Vec::new(),
+            body_offset: None,
+        }
+    }
+
+    fn parse_response(&self) -> io::Result<Option<usize>> {
+        let input = self.response.as_slice();
+        let Some(&status) = input.first() else {
+            return Ok(None);
+        };
+        let mut offset = 1;
+        let Some(message_len) = parse_varint(input, &mut offset) else {
+            return Ok(None);
+        };
+        if message_len > MAX_MESSAGE_LENGTH {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Hysteria2: invalid TCP response message length",
+            ));
+        }
+        let message_end = offset + message_len as usize;
+        let Some(message) = input.get(offset..message_end) else {
+            return Ok(None);
+        };
+        offset = message_end;
+        let Some(padding_len) = parse_varint(input, &mut offset) else {
+            return Ok(None);
+        };
+        if padding_len > MAX_PADDING_LENGTH {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Hysteria2: invalid TCP response padding length",
+            ));
+        }
+        let header_end = offset + padding_len as usize;
+        if input.get(offset..header_end).is_none() {
+            return Ok(None);
+        }
+        if status != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                format!(
+                    "Hysteria2: remote error: {}",
+                    String::from_utf8_lossy(message)
+                ),
+            ));
+        }
+        Ok(Some(header_end))
+    }
+}
+
+fn parse_varint(input: &[u8], offset: &mut usize) -> Option<u64> {
+    let first = *input.get(*offset)?;
+    let len = 1usize << (first >> 6);
+    let bytes = input.get(*offset..*offset + len)?;
+    *offset += len;
+    Some(
+        bytes[1..]
+            .iter()
+            .fold(u64::from(first & 0x3f), |value, byte| {
+                (value << 8) | u64::from(*byte)
+            }),
+    )
+}
+
+impl AsyncRead for Hy2TcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if output.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        loop {
+            if let Some(offset) = self.body_offset {
+                if offset < self.response.len() {
+                    let count = output.remaining().min(self.response.len() - offset);
+                    output.put_slice(&self.response[offset..offset + count]);
+                    self.body_offset = Some(offset + count);
+                    return Poll::Ready(Ok(()));
+                }
+                self.response.clear();
+                return AsyncRead::poll_read(Pin::new(&mut self.inner), cx, output);
+            }
+            if let Some(header_end) = self.parse_response()? {
+                self.body_offset = Some(header_end);
+                continue;
+            }
+            if self.response.len() == MAX_TCP_RESPONSE_BUFFER {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Hysteria2 TCP response header too large",
+                )));
+            }
+            let mut chunk = [0; 1024];
+            let mut input = ReadBuf::new(&mut chunk);
+            match AsyncRead::poll_read(Pin::new(&mut self.inner), cx, &mut input) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Ok(())) if input.filled().is_empty() => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "Hysteria2 TCP response truncated",
+                    )));
+                }
+                Poll::Ready(Ok(())) => self.response.extend_from_slice(input.filled()),
+            }
+        }
+    }
+}
+
+impl AsyncWrite for Hy2TcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        input: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if input.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        if let Some(request) = self.request.take() {
+            let request_len = request.len();
+            let mut chunks = [request, Bytes::copy_from_slice(input)];
+            match self.inner.poll_write_chunks(cx, &mut chunks) {
+                Poll::Pending => {
+                    self.request = Some(chunks[0].clone());
+                    Poll::Pending
+                }
+                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+                Poll::Ready(Ok(0)) => Poll::Ready(Err(io::ErrorKind::WriteZero.into())),
+                Poll::Ready(Ok(written)) if written <= request_len => {
+                    if !chunks[0].is_empty() {
+                        self.request = Some(chunks[0].clone());
+                    }
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                Poll::Ready(Ok(written)) => Poll::Ready(Ok(written - request_len)),
+            }
+        } else {
+            AsyncWrite::poll_write(Pin::new(&mut self.inner), cx, input)
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Some(request) = self.request.take() {
+            let mut chunks = [request];
+            match self.inner.poll_write_chunks(cx, &mut chunks) {
+                Poll::Pending => {
+                    self.request = Some(chunks[0].clone());
+                    return Poll::Pending;
+                }
+                Poll::Ready(Ok(_)) if !chunks[0].is_empty() => {
+                    self.request = Some(chunks[0].clone());
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                Poll::Ready(Ok(_)) => {}
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            }
+        }
+        AsyncWrite::poll_flush(Pin::new(&mut self.inner), cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        std::task::ready!(self.as_mut().poll_flush(cx))?;
+        AsyncWrite::poll_shutdown(Pin::new(&mut self.inner), cx)
     }
 }
 
@@ -443,37 +631,16 @@ impl Hysteria2Handler {
                 async move { client.connection(timeout).await }
             },
             connect_timeout,
-            move |conn| {
-                let addr = addr.clone();
-                async move {
-                    let handshake: Result<_, TcpHandshakeError> = async {
-                        let (mut send, mut recv) = conn.open_bi().await.map_err(|e| {
-                            TcpHandshakeError::Transport(anyhow!("Hysteria2: open stream: {e}"))
-                        })?;
-                        send.write_all(&encode_tcp_request(&addr))
-                            .await
-                            .map_err(|e| {
-                                TcpHandshakeError::Transport(anyhow!(
-                                    "Hysteria2: send TCP request: {e}"
-                                ))
-                            })?;
-                        read_tcp_response(&mut recv).await?;
-                        Ok((send, recv))
-                    }
-                    .await;
-                    handshake.map_err(anyhow::Error::from)
-                }
+            move |conn| async move {
+                conn.open_bi()
+                    .await
+                    .map_err(|error| anyhow!("Hysteria2: open stream: {error}"))
             },
-            // The server refusing a target is not a connection problem.
-            |e| {
-                !matches!(
-                    e.downcast_ref::<TcpHandshakeError>(),
-                    Some(TcpHandshakeError::Remote(_))
-                )
-            },
+            |_| true,
             "Hysteria2",
         )
         .await?;
+        let stream = Hy2TcpStream::new(stream, &addr);
         Ok(ProxyStream {
             stream: Box::new(stream),
             target_addr: target,
