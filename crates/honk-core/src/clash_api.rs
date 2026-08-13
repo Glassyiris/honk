@@ -654,11 +654,13 @@ async fn get_proxy_delay(
             );
         };
         let tcp = entry.tcp.clone();
+        let warmable = entry.warmable.clone();
         let generation = s.runtime_registry.read().clone();
         let measured = urltest_node_in_generation(
             &generation,
             &node,
             tcp.as_ref(),
+            warmable.as_deref(),
             &query.url,
             query.timeout(),
         )

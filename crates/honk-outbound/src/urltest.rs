@@ -128,31 +128,38 @@ pub async fn urltest_node(
     )
     .await
 }
-/// Measure through reusable generation state only when that state is already
-/// warm. Cold session-owning nodes use an ephemeral runtime so a dashboard
-/// group scan cannot retain one QUIC client or session pool per tested node.
+/// Reuse generation-owned state for every node. Multiplexed protocols run one
+/// unmeasured exchange first when cold, matching sing-box URLTest warm-up.
 pub async fn urltest_node_in_generation(
     generation: &Arc<crate::runtime::OutboundRuntimeRegistry>,
     node: &Node,
     handler: &dyn TcpOutbound,
+    warmable: Option<&dyn crate::proxy::WarmableOutbound>,
     url: &str,
     timeout: Duration,
 ) -> anyhow::Result<Duration> {
-    let (runtime, guard) = match generation
+    let runtime = generation
         .get(&node.id)
-        .filter(|runtime| runtime.is_warm_or_stateless())
+        .ok_or_else(|| anyhow!("no runtime for node '{}'", node.name))?;
+    if matches!(runtime.runtime, crate::runtime::ProtocolRuntime::AnyTls(_))
+        && !runtime.is_warm_or_stateless()
     {
-        Some(runtime) => (runtime, None),
-        None => {
-            let guard = crate::runtime::NodeRuntime::ephemeral_guarded(node);
-            (guard.runtime(), Some(guard))
-        }
-    };
-    let result = urltest_node(&runtime, handler, url, timeout).await;
-    if let Some(guard) = guard {
-        guard.close().await;
+        warmable
+            .ok_or_else(|| anyhow!("no warm handler for node '{}'", node.name))?
+            .warm(
+                Arc::clone(&runtime),
+                timeout,
+                crate::proxy::WarmRequirement::Session,
+            )
+            .await?;
+    } else if matches!(
+        runtime.runtime,
+        crate::runtime::ProtocolRuntime::VlessMux(_)
+    ) && !runtime.is_warm_or_stateless()
+    {
+        urltest_node(&runtime, handler, url, timeout).await?;
     }
-    result
+    urltest_node(&runtime, handler, url, timeout).await
 }
 
 /// [`urltest_node`] with a caller-chosen destination address (e.g. an
@@ -182,11 +189,14 @@ async fn measure_head_exchange(
 ) -> anyhow::Result<Duration> {
     let node = runtime.node.as_ref();
     let fut = async {
-        let start = Instant::now();
+        let mut start = Instant::now();
         let proxy = handler
             .dial_runtime(Arc::clone(runtime), addr, target_domain, timeout)
             .await?;
         tracing::debug!(node = %node.name, %addr, "urltest: dial established");
+        if matches!(node.protocol, honk_config::types::NodeProtocol::Hysteria2) {
+            start = Instant::now();
+        }
         let stream = proxy.stream;
 
         if is_https {
@@ -329,6 +339,7 @@ pub async fn urltest_group(
                         &generation,
                         &node,
                         entry.tcp.as_ref(),
+                        entry.warmable.as_deref(),
                         &url,
                         timeout,
                     )
@@ -491,6 +502,29 @@ mod tests {
                 stream: Box::new(stream),
                 target_addr: target,
                 target_domain: target_domain.map(|s| s.to_string()),
+            })
+        }
+    }
+
+    struct DelayedDialHandler {
+        delay: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl TcpOutbound for DelayedDialHandler {
+        async fn dial(
+            &self,
+            _node: &Node,
+            target: SocketAddr,
+            target_domain: Option<&str>,
+            _connect_timeout: Duration,
+        ) -> anyhow::Result<ProxyStream> {
+            tokio::time::sleep(self.delay).await;
+            let stream = tokio::net::TcpStream::connect(target).await?;
+            Ok(ProxyStream {
+                stream: Box::new(stream),
+                target_addr: target,
+                target_domain: target_domain.map(str::to_string),
             })
         }
     }
@@ -658,9 +692,33 @@ mod tests {
         assert!(exchange_head_h2(stream, "localhost").await.is_err());
     }
 
+    #[tokio::test]
+    async fn hysteria2_excludes_pre_write_dial_time() {
+        let addr = spawn_mock_http_server().await;
+        let node = Node {
+            id: uuid::Uuid::new_v4(),
+            name: "hysteria2".into(),
+            protocol: NodeProtocol::Hysteria2,
+            ..Default::default()
+        };
+        let elapsed = urltest_node_addr(
+            &crate::runtime::NodeRuntime::ephemeral(&node),
+            &DelayedDialHandler {
+                delay: Duration::from_millis(100),
+            },
+            "http://localhost/",
+            addr,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+
+        assert!(elapsed < Duration::from_millis(50), "{elapsed:?}");
+    }
     #[test]
     fn test_normalize_and_parse_url() {
         assert_eq!(normalize_url(""), DEFAULT_URLTEST_URL);
+
         assert_eq!(
             normalize_url("http://www.gstatic.com/generate_204"),
             "http://www.gstatic.com/generate_204"
