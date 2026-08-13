@@ -1713,7 +1713,6 @@ impl ControlPlane {
                         self.config.clone(),
                         self.proxy_registry.clone(),
                         self.runtime_registry.clone(),
-                        self.stats.clone(),
                         check_method.clone(),
                     ));
                     alive_set

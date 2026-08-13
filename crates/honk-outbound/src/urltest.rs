@@ -128,6 +128,27 @@ pub async fn urltest_node(
     )
     .await
 }
+/// Reuse an already-warm generation runtime; otherwise create a throwaway
+/// runtime whose guard closes any session or client established for probing.
+pub fn probe_runtime(
+    generation: &crate::runtime::OutboundRuntimeRegistry,
+    node: &Node,
+) -> (
+    Arc<crate::runtime::NodeRuntime>,
+    Option<crate::runtime::EphemeralRuntimeGuard>,
+) {
+    match generation
+        .get(&node.id)
+        .filter(|runtime| runtime.is_warm_or_stateless())
+    {
+        Some(runtime) => (runtime, None),
+        None => {
+            let guard = crate::runtime::NodeRuntime::ephemeral_guarded(node);
+            (guard.runtime(), Some(guard))
+        }
+    }
+}
+
 /// Reuse an already-warm generation runtime. Cold reusable transports warm a
 /// throwaway runtime before measurement so a group scan retains no new state.
 pub async fn urltest_node_in_generation(
@@ -143,16 +164,7 @@ pub async fn urltest_node_in_generation(
     } else {
         timeout
     };
-    let (runtime, guard) = match generation
-        .get(&node.id)
-        .filter(|runtime| runtime.is_warm_or_stateless())
-    {
-        Some(runtime) => (runtime, None),
-        None => {
-            let guard = crate::runtime::NodeRuntime::ephemeral_guarded(node);
-            (guard.runtime(), Some(guard))
-        }
-    };
+    let (runtime, guard) = probe_runtime(generation, node);
     let result = async {
         if !runtime.is_warm_or_stateless() {
             warmable
@@ -600,6 +612,22 @@ mod tests {
             node.vless_mode = honk_config::node::WireMode::H2mux;
         }
         node
+    }
+
+    #[test]
+    fn probe_runtime_reuses_only_warm_or_stateless_nodes() {
+        let anytls = reusable_node("anytls", NodeProtocol::AnyTLS);
+        let trojan = reusable_node("trojan", NodeProtocol::Trojan);
+        let absent = reusable_node("absent", NodeProtocol::SS);
+        let generation =
+            crate::runtime::OutboundRuntimeRegistry::build(&[anytls.clone(), trojan.clone()])
+                .unwrap();
+
+        assert!(probe_runtime(&generation, &anytls).1.is_some());
+        assert!(probe_runtime(&generation, &absent).1.is_some());
+        let (runtime, guard) = probe_runtime(&generation, &trojan);
+        assert!(Arc::ptr_eq(&runtime, &generation.get(&trojan.id).unwrap()));
+        assert!(guard.is_none());
     }
 
     async fn assert_cold_reusable_transport_warms_before_measurement(node: Node) {

@@ -82,17 +82,25 @@ impl DialerCollection {
         }
     }
 
+    /// Record a real dial failure for ranking. Periodic probe failures use
+    /// [`Self::mark_probe_unavailable`] instead and never create strikes or
+    /// synthetic latency samples.
     pub(crate) fn mark_unavailable(&self) {
-        // Synthetic 10s placeholder: feeds display exclusion only (clash
-        // history would otherwise show a bogus 10000ms); ranking demotion
-        // lives on the failure-strike counters. Never feeds the moving
-        // average — ranking stays on real measurements.
+        // The synthetic sample is display-excluded and never feeds the moving
+        // average; the failure strike owns ranking demotion.
         self.latencies
             .append(LatencySample::synthetic(TIMEOUT_LATENCY));
         self.alive.store(false, Ordering::Release);
         let strikes = self.failure_strikes.load(Ordering::Relaxed);
         self.failure_strikes
             .store((strikes + 1).min(FAILURE_STRIKES_MAX), Ordering::Relaxed);
+        self.strike_clear_progress.store(0, Ordering::Relaxed);
+    }
+
+    /// Record probe unavailability without creating a ranking strike. Probe
+    /// liveness counters own exclusion; dial failures alone own demotion.
+    pub(crate) fn mark_probe_unavailable(&self) {
+        self.alive.store(false, Ordering::Release);
         self.strike_clear_progress.store(0, Ordering::Relaxed);
     }
 

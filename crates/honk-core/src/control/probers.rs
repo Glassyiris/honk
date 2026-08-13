@@ -9,7 +9,6 @@ pub(super) struct ProxyHttpProber {
     config: Arc<RwLock<Config>>,
     proxy_registry: Arc<ProxyRegistry>,
     runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
-    stats: Arc<StatsManager>,
     check_method: String,
 }
 
@@ -18,14 +17,12 @@ impl ProxyHttpProber {
         config: Arc<RwLock<Config>>,
         proxy_registry: Arc<ProxyRegistry>,
         runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
-        stats: Arc<StatsManager>,
         check_method: String,
     ) -> Self {
         Self {
             config,
             proxy_registry,
             runtime_registry,
-            stats,
             check_method,
         }
     }
@@ -49,114 +46,81 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
         addr: SocketAddr,
         url: &str,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<std::time::Duration, String>> + Send + 'static>,
+        Box<dyn Future<Output = honk_outbound::alive::HttpProbeResult> + Send + 'static>,
     > {
         let node = self.find_node(node_name);
-        let node_name_owned = node_name.to_string();
+        let node_name = node_name.to_string();
         let registry = self.proxy_registry.clone();
         let generation = self.runtime_registry.read().clone();
         let check_url = url.to_string();
         let check_method = self.check_method.clone();
         let config = self.config.clone();
-        let stats = self.stats.clone();
 
         Box::pin(async move {
-            let node = node.ok_or_else(|| format!("node '{}' not found", node_name_owned))?;
-            let entry = registry
-                .find(node.protocol)
-                .ok_or_else(|| format!("no handler for protocol {:?}", node.protocol))?;
-            let tcp = entry.tcp.clone();
-
-            let start = std::time::Instant::now();
-            let connect_timeout = {
-                let config = config
-                    .try_read()
-                    .map_err(|_| "config lock busy".to_string())?;
-                std::time::Duration::from_millis(config.global.connect_timeout_ms)
+            let Some(node) = node else {
+                return honk_outbound::alive::HttpProbeResult::SetupFailure(format!(
+                    "node '{node_name}' not found"
+                ));
             };
-            // Proxy nodes dial the check URL by domain: the node's egress
-            // resolver answers it, which both proves the real user path and
-            // sidesteps local DNS poisoning (a poisoned system answer turns
-            // every check into an "empty HTTP response" from a black hole).
-            // `direct` keeps the pre-resolved IP — its reality IS local DNS.
-            let domain = if node.protocol == honk_config::types::NodeProtocol::Direct {
+            let Some(entry) = registry.find(node.protocol) else {
+                return honk_outbound::alive::HttpProbeResult::SetupFailure(format!(
+                    "no handler for protocol {:?}",
+                    node.protocol
+                ));
+            };
+            let connect_timeout = match config.try_read() {
+                Ok(config) => Duration::from_millis(config.global.connect_timeout_ms),
+                Err(_) => {
+                    return honk_outbound::alive::HttpProbeResult::SetupFailure(
+                        "config lock busy".to_string(),
+                    );
+                }
+            };
+            let domain = if node.protocol == NodeProtocol::Direct {
                 None
             } else {
                 url_host(&check_url)
             };
-            // Dial through the generation runtime only when the node already
-            // holds warm session state: a cold-node probe through the pool
-            // would leave a janitor-kept standby session behind on every
-            // node after every cycle. Cold nodes get an ephemeral one-shot
-            // dial that is closed deterministically after the probe — their
-            // measured latency is then the real cold-start latency, while
-            // warm nodes report the hot path.
-            let (dialed, ephemeral) = probe_dial(&generation, &node, |runtime| {
-                tcp.dial_runtime(runtime, addr, domain.as_deref(), connect_timeout)
-            })
-            .await;
-            if ephemeral.is_none() {
-                stats.mark_warm(node.id, crate::stats::WarmReason::Health);
+            let (runtime, ephemeral) = honk_outbound::urltest::probe_runtime(&generation, &node);
+            if !runtime.is_warm_or_stateless() {
+                let warmed = match entry.warmable.as_ref() {
+                    Some(warmable) => warmable
+                        .warm(
+                            Arc::clone(&runtime),
+                            connect_timeout,
+                            honk_outbound::proxy::WarmRequirement::Session,
+                        )
+                        .await
+                        .map_err(|error| format!("warm failed: {error}")),
+                    None => Err(format!("no warm handler for node '{}'", node.name)),
+                };
+                if let Err(error) = warmed {
+                    close_ephemeral(ephemeral).await;
+                    return honk_outbound::alive::HttpProbeResult::SetupFailure(error);
+                }
             }
+
+            let start = std::time::Instant::now();
+            let dialed = entry
+                .tcp
+                .dial_runtime(runtime, addr, domain.as_deref(), connect_timeout)
+                .await;
             let proxy = match dialed {
                 Ok(proxy) => proxy,
-                Err(e) => {
+                Err(error) => {
                     close_ephemeral(ephemeral).await;
-                    return Err(format!("dial failed: {}", e));
+                    return honk_outbound::alive::HttpProbeResult::SetupFailure(format!(
+                        "dial failed: {error}"
+                    ));
                 }
             };
-
-            // Send HTTP request over the proxy connection.
-            let check = Self::http_check(proxy.stream, &check_url, &check_method).await;
+            let result = Self::http_check(proxy.stream, &check_url, &check_method).await;
             close_ephemeral(ephemeral).await;
-            check?;
-
-            // Measure the full request round trip, not just the dial: mux
-            // protocols (AnyTLS, QUIC tunnels) open a stream on an
-            // already-warm session, so a dial-only measurement reports ~0ms
-            // for every such node and makes URLTest ranking meaningless.
-            let elapsed = start.elapsed();
-            Ok(elapsed)
+            match result {
+                Ok(()) => honk_outbound::alive::HttpProbeResult::WarmSuccess(start.elapsed()),
+                Err(error) => honk_outbound::alive::HttpProbeResult::ExchangeFailure(error),
+            }
         })
-    }
-}
-
-/// The node's generation runtime when it already holds warm session state,
-/// else `None` — probers then take the ephemeral one-shot path so a probe
-/// cycle never leaves retained sessions/clients on cold nodes.
-pub(super) fn warm_runtime(
-    generation: &honk_outbound::runtime::OutboundRuntimeRegistry,
-    node: &Node,
-) -> Option<Arc<honk_outbound::runtime::NodeRuntime>> {
-    generation
-        .get(&node.id)
-        .filter(|runtime| runtime.is_warm_or_stateless())
-}
-
-/// Dial `node` through its warm generation runtime when it has one, else
-/// through an ephemeral one-shot runtime. The returned guard (Some only on
-/// the ephemeral path) closes the runtime on drop — covering timeout/abort
-/// paths that drop the probe future — and SHOULD be passed to
-/// [`close_ephemeral`] on normal exits to await the teardown.
-async fn probe_dial<T, F, Fut>(
-    generation: &honk_outbound::runtime::OutboundRuntimeRegistry,
-    node: &Node,
-    dial: F,
-) -> (
-    anyhow::Result<T>,
-    Option<honk_outbound::runtime::EphemeralRuntimeGuard>,
-)
-where
-    F: FnOnce(Arc<honk_outbound::runtime::NodeRuntime>) -> Fut,
-    Fut: std::future::Future<Output = anyhow::Result<T>>,
-{
-    match warm_runtime(generation, node) {
-        Some(runtime) => (dial(runtime).await, None),
-        None => {
-            let guard = honk_outbound::runtime::NodeRuntime::ephemeral_guarded(node);
-            let result = dial(guard.runtime()).await;
-            (result, Some(guard))
-        }
     }
 }
 
@@ -347,12 +311,11 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                     .map_err(|_| "config lock busy".to_string())?;
                 std::time::Duration::from_millis(config.global.connect_timeout_ms)
             };
-
+            let (runtime, ephemeral) = honk_outbound::urltest::probe_runtime(&generation, &node);
             let start = std::time::Instant::now();
-            let (dialed, ephemeral) = probe_dial(&generation, &node, |runtime| {
-                packet.dial_udp_transport_runtime(runtime, dns_target, None, connect_timeout)
-            })
-            .await;
+            let dialed = packet
+                .dial_udp_transport_runtime(runtime, dns_target, None, connect_timeout)
+                .await;
             if ephemeral.is_none() {
                 stats.mark_warm(node.id, crate::stats::WarmReason::Health);
             }

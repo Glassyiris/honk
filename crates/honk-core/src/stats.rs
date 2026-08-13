@@ -364,8 +364,8 @@ pub struct StatsManager {
 pub enum WarmReason {
     /// Startup bare-TCP preconnect deposit.
     Preconnect,
-    /// A health probe observed the node warm (probes never warm cold
-    /// nodes — they only reuse existing warm state).
+    /// A health probe reused an already-warm generation resource. Throwaway
+    /// probe warm-up is closed after measurement and is never attributed.
     Health,
     /// The UDP warm coordinator established the session/client.
     Udp,

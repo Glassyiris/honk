@@ -93,20 +93,30 @@ pub fn alive_index(domain: ProbeDomain, ipver: IpVersion) -> usize {
 
 pub type ProtocolDomain = ProbeDomain;
 
+/// Result of one HTTP health probe. Only a complete warm exchange is healthy
+/// and contributes latency; setup and target-exchange failures stay distinct
+/// for diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HttpProbeResult {
+    WarmSuccess(Duration),
+    SetupFailure(String),
+    ExchangeFailure(String),
+}
+
 /// Trait for HTTP-based health check probing through proxy nodes.
 ///
 /// Implemented by `honk-core` to route HTTP requests through the proxy
 /// registry, matching Go's `Dialer.HttpCheck`. `url` is the check target
 /// (global `tcp_check_url`, or a group's custom `check_url`); `addr` is a
-/// pre-resolved IP for that URL's host. Returns the measured round-trip
-/// latency on success, or an error string on failure.
+/// pre-resolved IP for that URL's host. Only [`HttpProbeResult::WarmSuccess`]
+/// is healthy and carries a ranking RTT.
 pub trait HttpProber: Send + Sync {
     fn probe_http(
         &self,
         node_name: &str,
         addr: SocketAddr,
         url: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<Duration, String>> + Send + 'static>>;
+    ) -> Pin<Box<dyn Future<Output = HttpProbeResult> + Send + 'static>>;
 }
 
 /// Type-erased HTTP prober stored in `AliveDialerSet`.
@@ -740,12 +750,11 @@ impl AliveDialerSet {
                 }
             }
         }
-        let coll = self.get_or_create_collection(node_id, idx);
         if !is_traffic {
-            // Only append synthetic TIMEOUT_LATENCY for probe failures,
-            // not for traffic-based reporting (which may succeed through
-            // other nodes without indicating a true latency change).
-            coll.mark_unavailable();
+            // Probe counters own liveness and cooldown; ranking strikes are
+            // reserved for real dial failures.
+            self.get_or_create_collection(node_id, idx)
+                .mark_probe_unavailable();
         }
 
         self.record_probe_history(node_id, idx, false, None);
@@ -865,15 +874,8 @@ impl AliveDialerSet {
         Arc::clone(&arr[idx])
     }
 
-    /// Record a successful probe latency for a node + domain + ip version.
-    ///
-    /// This is the core method that feeds latency data into the per-node
-    /// `Latencies10` ring buffer and `MovingAverage`, which downstream
-    /// `GroupManager` can read for selection.
-    ///
-    /// Applies recovery hysteresis: a dead node needs
-    /// `RECOVERY_SUCCESSES_NEEDED` consecutive successes before being
-    /// marked alive again. An already-alive node stays alive immediately.
+    /// Record a successful probe latency for a node + domain + IP version.
+    /// Applies recovery hysteresis and feeds the selection moving average.
     pub fn record_probe_latency(
         &self,
         node_id: Uuid,
@@ -1240,11 +1242,8 @@ impl AliveDialerSet {
             .unwrap_or_default()
     }
 
-    /// Whether the member is alive for a custom check URL. The key is
-    /// the member TAG (a direct member's node name, or a sub-group's
-    /// tag — sing-box RealTag semantics): the parent ranks sub-groups as
-    /// units. Members never probed default to alive (same as the global
-    /// path).
+    /// Whether the member is alive for a custom check URL. The key is the
+    /// member tag; members never probed default to alive.
     pub fn is_alive_for_url(&self, node_id: &str, url: &str) -> bool {
         self.url_states
             .read()
