@@ -261,7 +261,7 @@ See the [experimental reference](./reference/experimental.md) and [UDP NFQUEUE d
 
 ## Warm-up and dial budget
 
-These mechanisms are independent and bounded by configured groups or explicit budgets rather than raw subscription size:
+These mechanisms are independent and bounded by configured groups or explicit budgets rather than raw subscription size. On-demand Clash delay tests are separate: cold AnyTLS/VLESS multiplex nodes use a throwaway warm session for measurement and close it afterward.
 
 | Mechanism | Key | Default | Behavior |
 | --- | --- | --- | --- |

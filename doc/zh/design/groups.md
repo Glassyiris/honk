@@ -137,7 +137,7 @@ eBPF alive slot 属于组，而不是某个节点。对于每个域和地址族�
 
 Selector 与 UDP 所有权是可复用节点 runtime 上相互独立的 bit。移除一个所有者时，如果另一个仍在，资源继续保留；只有最后一个所有者释放后，才会排空未来可复用状态。活跃流持有自己的 stream 或 connection 句柄，不会被切断。启动预连接只是 pool seed，不参与这些 bit。
 
-重载时，配置未变化的节点会把现有 `NodeRuntime` 转移给替代 generation，其中包括存活的 AnyTLS、VLESS H2MUX/Mux.Cool 与 QUIC 状态。旧 generation 不再接受新的预热工作，活跃流则正常排空。健康探测会测量冷节点，但不会预热订阅中的每个成员。
+重载时，配置未变化的节点会把现有 `NodeRuntime` 转移给替代 generation，其中包括存活的 AnyTLS、VLESS H2MUX/Mux.Cool 与 QUIC 状态。旧 generation 不再接受新的预热工作，活跃流则正常排空。周期健康探测只测量冷节点，不会预热 generation；按需 Clash 延迟测试则先在临时 runtime 中预热冷 AnyTLS/VLESS multiplex 状态，计时后关闭，因此组扫描不会为每个成员保留一个新 pool。
 
 ## 拨号准入预算
 

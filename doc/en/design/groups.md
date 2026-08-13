@@ -137,7 +137,7 @@ Warm-up has three independent mechanisms:
 
 Selector and UDP ownership are independent bits on reusable node runtimes. Removing one owner leaves the resource retained for the other; only the final owner release drains future reusable state. Active flows keep their own stream or connection handles and are not cut. Startup preconnect is only a pool seed and does not participate in these bits.
 
-On reload, unchanged node configurations transfer their existing `NodeRuntime`, including live AnyTLS, VLESS H2MUX/Mux.Cool, and QUIC state, to the replacement generation. The old generation becomes terminal to new warm work while active flows drain normally. Health probes measure cold nodes but do not warm every subscription member.
+On reload, unchanged node configurations transfer their existing `NodeRuntime`, including live AnyTLS, VLESS H2MUX/Mux.Cool, and QUIC state, to the replacement generation. The old generation becomes terminal to new warm work while active flows drain normally. Periodic health probes measure cold nodes without warming the generation. On-demand Clash delay tests instead warm cold AnyTLS/VLESS multiplex state in a throwaway runtime before timing, then close it; a group scan therefore does not retain one new pool per member.
 
 ## Dial admission budget
 

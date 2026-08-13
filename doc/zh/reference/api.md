@@ -30,8 +30,8 @@ WebSocket upgrade 也可以改用 `?token=<percent-encoded-secret>`。honk 会�
 | GET | `/proxies` | 返回所有节点和组，以及合成的 `GLOBAL` Selector。 |
 | GET | `/proxies/{name}` | 返回一个节点、组或 `GLOBAL` Selector。 |
 | PUT | `/proxies/{name}` | 用 `{"name":"member"}` 选择 Selector 组的直接成员；也可修改合成的 `GLOBAL` Selector。 |
-| GET | `/proxies/{name}/delay` | 对节点或组执行按需 URL 延迟测试。 |
-| GET | `/group/{name}/delay` | 测试所有组成员，并返回成功成员的延迟。 |
+| GET | `/proxies/{name}/delay` | 对节点或组执行按需 URL 延迟测试。已热 transport 会复用；冷 AnyTLS/VLESS multiplex 状态会先在临时 runtime 中预热，再开始计时。 |
+| GET | `/group/{name}/delay` | 最多并发 10 个任务测试全部组成员，并以相同计时语义返回成功成员的延迟。 |
 | GET | `/rules` | 每条路由返回一行。简单 matcher 使用原生 Clash rule type；组合、取反和 `must` 规则使用 `complex`，并保留完整 dae 语句。 |
 | GET | `/connections` | 返回连接快照；WebSocket upgrade 后改为推送快照。 |
 | DELETE | `/connections` | 关闭所有已跟踪连接。 |
@@ -48,6 +48,14 @@ WebSocket upgrade 也可以改用 `?token=<percent-encoded-secret>`。honk 会�
 | GET | `/ui`, `/ui/*` | 将 `/ui` 重定向到 `/ui/`，并提供已配置的外部 UI 目录。 |
 
 对普通 HTTP GET，`/traffic`、`/memory` 和 `/logs` 每行发送一个 JSON 文档。`/logs` 仅在存在 subscriber 时安装动态 tracing interest；没有 subscriber 时，Clash tracing layer 不会格式化 event。
+
+### 延迟测量
+
+延迟测试计量经代理发送 HTTP `HEAD` 到收到响应 header 的时间；HTTPS 包含目标站 TLS 握手。冷 AnyTLS、VLESS H2MUX 与 VLESS Mux.Cool 节点先在临时 runtime 中建立可复用 session，再用该 session 执行一次计时交换。临时 runtime 随后关闭，因此扫描大组不会为每个已测试节点留下常驻 session pool。预热和正式测量各有一次 timeout，所以冷请求最坏可耗时为指定 timeout 的两倍。
+
+Hysteria2 遵循 sing-box 的 lazy-handshake 规则：其目标请求与首次应用写入合并，因此 outbound dial 返回后才开始计时。TUIC 与 Juicity 会在 `dial_runtime` 返回前完成目标请求 header，所以其 dial 仍计入报告延迟。因此升级后显示值可能低于包含冷 session 或 Hysteria2 建连时间的旧版本。
+
+成功测量会更新节点延迟历史。单节点失败返回 `503`；组测量会省略失败成员；两者都会追加供 URLTest 选择使用的 failure strike。
 
 ## 模式与 Selector 修改
 

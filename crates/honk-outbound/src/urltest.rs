@@ -128,8 +128,8 @@ pub async fn urltest_node(
     )
     .await
 }
-/// Reuse generation-owned state for every node. Multiplexed protocols establish
-/// their reusable session before the timed exchange, matching sing-box URLTest.
+/// Reuse an already-warm generation runtime. Cold session-owning nodes warm a
+/// throwaway runtime before measurement so a group scan retains no new pools.
 pub async fn urltest_node_in_generation(
     generation: &Arc<crate::runtime::OutboundRuntimeRegistry>,
     node: &Node,
@@ -138,24 +138,44 @@ pub async fn urltest_node_in_generation(
     url: &str,
     timeout: Duration,
 ) -> anyhow::Result<Duration> {
-    let runtime = generation
+    let timeout = if timeout.is_zero() {
+        DEFAULT_URLTEST_TIMEOUT
+    } else {
+        timeout
+    };
+    let (runtime, guard) = match generation
         .get(&node.id)
-        .ok_or_else(|| anyhow!("no runtime for node '{}'", node.name))?;
-    if matches!(
-        runtime.runtime,
-        crate::runtime::ProtocolRuntime::AnyTls(_) | crate::runtime::ProtocolRuntime::VlessMux(_)
-    ) && !runtime.is_warm_or_stateless()
+        .filter(|runtime| runtime.is_warm_or_stateless())
     {
-        warmable
-            .ok_or_else(|| anyhow!("no warm handler for node '{}'", node.name))?
-            .warm(
-                Arc::clone(&runtime),
-                timeout,
-                crate::proxy::WarmRequirement::Session,
-            )
-            .await?;
+        Some(runtime) => (runtime, None),
+        None => {
+            let guard = crate::runtime::NodeRuntime::ephemeral_guarded(node);
+            (guard.runtime(), Some(guard))
+        }
+    };
+    let result = async {
+        if matches!(
+            runtime.runtime,
+            crate::runtime::ProtocolRuntime::AnyTls(_)
+                | crate::runtime::ProtocolRuntime::VlessMux(_)
+        ) && !runtime.is_warm_or_stateless()
+        {
+            warmable
+                .ok_or_else(|| anyhow!("no warm handler for node '{}'", node.name))?
+                .warm(
+                    Arc::clone(&runtime),
+                    timeout,
+                    crate::proxy::WarmRequirement::Session,
+                )
+                .await?;
+        }
+        urltest_node(&runtime, handler, url, timeout).await
     }
-    urltest_node(&runtime, handler, url, timeout).await
+    .await;
+    if let Some(guard) = guard {
+        guard.close().await;
+    }
+    result
 }
 
 /// [`urltest_node`] with a caller-chosen destination address (e.g. an
@@ -537,17 +557,20 @@ mod tests {
     struct RecordingWarmable {
         calls: Arc<std::sync::atomic::AtomicUsize>,
         fail: bool,
+        ephemeral: Arc<std::sync::atomic::AtomicBool>,
     }
 
     #[async_trait::async_trait]
     impl crate::proxy::WarmableOutbound for RecordingWarmable {
         async fn warm(
             &self,
-            _runtime: Arc<crate::runtime::NodeRuntime>,
+            runtime: Arc<crate::runtime::NodeRuntime>,
             _connect_timeout: Duration,
             requirement: crate::proxy::WarmRequirement,
         ) -> anyhow::Result<()> {
             assert_eq!(requirement, crate::proxy::WarmRequirement::Session);
+            self.ephemeral
+                .store(runtime.is_ephemeral(), std::sync::atomic::Ordering::Relaxed);
             self.calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if self.fail {
@@ -572,9 +595,11 @@ mod tests {
             crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
         );
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ephemeral = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let warmable = RecordingWarmable {
             calls: Arc::clone(&calls),
             fail: false,
+            ephemeral: Arc::clone(&ephemeral),
         };
 
         urltest_node_in_generation(
@@ -589,6 +614,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(ephemeral.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[tokio::test]
@@ -612,9 +638,11 @@ mod tests {
             crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
         );
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ephemeral = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let warmable = RecordingWarmable {
             calls: Arc::clone(&calls),
             fail: true,
+            ephemeral: Arc::clone(&ephemeral),
         };
 
         let error = urltest_node_in_generation(
@@ -632,6 +660,7 @@ mod tests {
 
         assert!(error.to_string().contains("simulated warm failure"));
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(ephemeral.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     struct RecordingHandler {
