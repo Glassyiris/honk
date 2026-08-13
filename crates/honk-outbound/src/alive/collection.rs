@@ -27,6 +27,10 @@ pub(crate) const SLOW_DIAL_MARGIN: Duration = Duration::from_millis(500);
 /// floor `min(2×ema, ema+margin)` collapses to 2×ema and flaps URLTest.
 pub(crate) const SLOW_DIAL_FLOOR: Duration = Duration::from_millis(250);
 
+/// Consecutive dial failures that produce one strike — a lone transient
+/// failure (the retry race rescues the flow) must not demote the node.
+pub(crate) const DIAL_FAILURE_STRIKE_AT: u8 = 2;
+
 /// Verdict of one real dial against the node's own traffic EMA.
 pub(crate) enum TrafficVerdict {
     /// EMA still warming up — no judgement made.
@@ -41,6 +45,7 @@ pub(crate) struct DialerCollection {
     pub alive: AtomicBool,
     failure_strikes: AtomicU8,
     strike_clear_progress: AtomicU8,
+    dial_fail_streak: AtomicU8,
     traffic_ema_nanos: AtomicU64,
     traffic_samples: AtomicU8,
     slow_dial_streak: AtomicU8,
@@ -54,6 +59,7 @@ impl DialerCollection {
             alive: AtomicBool::new(true),
             failure_strikes: AtomicU8::new(0),
             strike_clear_progress: AtomicU8::new(0),
+            dial_fail_streak: AtomicU8::new(0),
             traffic_ema_nanos: AtomicU64::new(0),
             traffic_samples: AtomicU8::new(0),
             slow_dial_streak: AtomicU8::new(0),
@@ -106,6 +112,20 @@ impl DialerCollection {
     pub(crate) fn mark_probe_unavailable(&self) {
         self.alive.store(false, Ordering::Release);
         self.strike_clear_progress.store(0, Ordering::Relaxed);
+    }
+
+    /// One more consecutive dial failure; returns the new streak length.
+    pub(crate) fn bump_dial_fail_streak(&self) -> u8 {
+        let streak = self.dial_fail_streak.load(Ordering::Relaxed);
+        let streak = streak.saturating_add(1);
+        self.dial_fail_streak.store(streak, Ordering::Relaxed);
+        streak
+    }
+
+    /// A real dial success breaks the failure streak (probe successes do
+    /// not — a probe-alive but dial-dead node must still accumulate).
+    pub(crate) fn reset_dial_fail_streak(&self) {
+        self.dial_fail_streak.store(0, Ordering::Relaxed);
     }
 
     /// Failure-demoted nodes rank below every non-demoted candidate until

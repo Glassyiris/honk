@@ -323,6 +323,44 @@ impl GroupManager {
         )
     }
 
+    /// Retry candidates after an authoritative single-candidate dial
+    /// failure: the URLTest members in latency order (≤3). Within the race
+    /// order is irrelevant — a just-failed incumbent that still measures
+    /// fastest re-races alongside its alternates and loses by failing
+    /// again; a strike-demoted one is re-raced too, since the race itself
+    /// is the verdict. Non-URLTest groups yield no candidates (pins are
+    /// not retried).
+    pub fn urltest_retry_candidates(
+        &self,
+        group_name: &str,
+        domain: ProbeDomain,
+        ipver: IpVersion,
+    ) -> Vec<&Node> {
+        let Some(group) = self.groups.get(group_name) else {
+            return Vec::new();
+        };
+        if group.policy != GroupPolicy::URLTest {
+            return Vec::new();
+        }
+        let mut visited = Vec::new();
+        let candidates = self.flatten_candidates(
+            group,
+            domain,
+            ipver,
+            &mut visited,
+            0,
+            SelectionEffects::Peek,
+        );
+        let candidates =
+            self.filter_alive_candidates(candidates, domain, ipver, group.check_url.as_deref());
+        let network = SelectionNetwork::from_probe_domain(domain);
+        self.order_by_latency(candidates, network, ipver, group.check_url.as_deref())
+            .into_iter()
+            .take(3)
+            .map(|c| c.node)
+            .collect()
+    }
+
     fn selection_plan_for_domain_with_effects(
         &self,
         group_name: &str,

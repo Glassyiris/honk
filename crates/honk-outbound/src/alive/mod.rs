@@ -7,7 +7,9 @@ mod probe;
 #[cfg(test)]
 mod tests;
 
-use self::collection::{DialerCollection, SLOW_DIAL_STREAK_MAX, TrafficVerdict};
+use self::collection::{
+    DIAL_FAILURE_STRIKE_AT, DialerCollection, SLOW_DIAL_STREAK_MAX, TrafficVerdict,
+};
 use honk_config::config::{BLOCK_NODE_ID, DIRECT_NODE_ID};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
@@ -791,6 +793,11 @@ impl AliveDialerSet {
     /// the data-UDP health domain (Go: `ReportAvailableTraffic`).
     pub fn report_available_traffic(&self, node_id: Uuid, domain: ProbeDomain, ipver: IpVersion) {
         let idx = alive_index(domain, ipver);
+        // A real dial success breaks the consecutive dial-failure streak —
+        // even when the state is clean and nothing else needs updating.
+        if let Some(arr) = self.collections.read().get(&node_id) {
+            arr[idx].reset_dial_fail_streak();
+        }
         if self
             .states
             .read()
@@ -996,15 +1003,19 @@ impl AliveDialerSet {
         coll.latencies.avg().or_else(|| coll.latencies.last())
     }
 
-    /// Dial-failure handling: append one synthetic timeout sample and one
-    /// failure strike. The node's real history and moving average are
-    /// retained so URLTest tolerance hysteresis keeps its baseline; the
+    /// Dial-failure handling: only DIAL_FAILURE_STRIKE_AT consecutive dial
+    /// failures append the synthetic timeout sample and one failure strike —
+    /// a lone transient failure (the retry race rescues that flow) leaves no
+    /// selection state at all. The node's real history and moving average
+    /// are retained so URLTest tolerance hysteresis keeps its baseline; the
     /// strike demotes the node in ranking until max(strikes, 2) consecutive
     /// real successes clear it, which is what stops a fast-but-flaky node
     /// from reclaiming the top rank with a single lucky probe.
     pub fn record_dial_failure(&self, node_id: Uuid, domain: ProbeDomain, ipver: IpVersion) {
         let coll = self.get_or_create_collection(node_id, alive_index(domain, ipver));
-        coll.mark_unavailable();
+        if coll.bump_dial_fail_streak() >= DIAL_FAILURE_STRIKE_AT {
+            coll.mark_unavailable();
+        }
     }
 
     /// Feed one REAL proxied dial's wall-clock latency (network round trip

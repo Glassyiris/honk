@@ -906,24 +906,29 @@ impl ControlPlaneHandle {
         let (mut proxy_stream, node) = match raced {
             Some(pair) => pair,
             None => {
-                // Exactly one retry when the just-reported failure may have
-                // moved the plan (URLTest strike demotion). Same-plan
-                // outcomes (Selector pin, Fallback pin on a still-alive
-                // node, single-node outbound) yield the identical candidate
-                // and are not retried.
+                // Exactly one retry for an authoritative single-candidate
+                // failure, racing the URLTest latency-ordered top-3: when
+                // the just-recorded strike moved the pick the incumbent is
+                // replaced; otherwise it re-races alongside its alternates
+                // — a lone transient failure leaves no strike and must not
+                // hard-fail the flow. Non-URLTest plans and single-leaf
+                // outcomes yield no retry candidates and fail the flow.
                 let mut retried: Option<(crate::proxy::ProxyStream, Node)> = None;
                 if selection_mode == SelectionPlanMode::Authoritative && candidates.len() == 1 {
                     let group_manager = self.group_manager.read().clone();
-                    let plan = group_manager.selection_plan_for_domain(
+                    let retry_nodes = group_manager.urltest_retry_candidates(
                         &outbound_name,
                         ProbeDomain::Tcp,
                         ipver,
                     );
-                    if !plan.nodes.is_empty() && plan.nodes[0].id != candidates[0].id {
-                        let nodes = &plan.nodes[..plan.nodes.len().min(3)];
+                    if retry_nodes.len() > 1
+                        || retry_nodes
+                            .first()
+                            .is_some_and(|n| n.id != candidates[0].id)
+                    {
                         retried = self
                             .race_candidates(
-                                nodes,
+                                &retry_nodes,
                                 resolved_target,
                                 target_domain.clone(),
                                 &outbound_name,

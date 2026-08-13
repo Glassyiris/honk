@@ -869,9 +869,10 @@ async fn test_direct_probe_uses_direct_check_addr() {
     );
 }
 
-/// Failure demotion is sticky: a dial failure adds a strike that only
-/// max(strikes, 2) consecutive real probe successes clear — one lucky
-/// success never re-ranks a flaky node.
+/// Failure demotion is sticky: two consecutive dial failures add a strike
+/// that only max(strikes, 2) consecutive real probe successes clear — one
+/// lucky success never re-ranks a flaky node. A lone transient failure
+/// leaves no strike at all.
 #[test]
 fn test_failure_demotion_needs_consecutive_successes() {
     let set = AliveDialerSet::new();
@@ -890,21 +891,45 @@ fn test_failure_demotion_needs_consecutive_successes() {
     assert!(!demoted());
 
     set.record_dial_failure(node, ProbeDomain::Tcp, IpVersion::V4);
-    assert!(demoted());
+    assert!(!demoted(), "a lone dial failure must not demote");
+    set.record_dial_failure(node, ProbeDomain::Tcp, IpVersion::V4);
+    assert!(demoted(), "two consecutive dial failures demote");
     probe_ok(10);
     assert!(demoted(), "one success must not clear the strike");
     probe_ok(10);
     assert!(!demoted(), "two consecutive successes clear it");
 
-    // A fresh failure resets the clear progress: the success between the
-    // two failures no longer counts toward the clear.
+    // Once the failure streak is hot (no dial success intervened), further
+    // failures keep striking; a fresh strike resets the clear progress, so
+    // the success between the two strikes no longer counts toward the
+    // clear.
     set.record_dial_failure(node, ProbeDomain::Tcp, IpVersion::V4);
     probe_ok(10);
     set.record_dial_failure(node, ProbeDomain::Tcp, IpVersion::V4);
     probe_ok(10);
-    assert!(demoted(), "progress was reset by the second failure");
+    assert!(demoted(), "progress was reset by the second strike");
     probe_ok(10);
     assert!(!demoted());
+}
+
+/// A real dial success breaks the consecutive dial-failure streak: two
+/// failures separated by a success never strike. Probe successes do NOT
+/// reset the streak — a probe-alive but dial-dead node still accumulates.
+#[test]
+fn test_dial_success_resets_failure_streak() {
+    let set = AliveDialerSet::new();
+    let node = id(1);
+    let demoted = || set.is_failure_demoted(node, ProbeDomain::Tcp, IpVersion::V4);
+
+    set.record_dial_failure(node, ProbeDomain::Tcp, IpVersion::V4);
+    set.report_available_traffic(node, ProbeDomain::Tcp, IpVersion::V4);
+    set.record_dial_failure(node, ProbeDomain::Tcp, IpVersion::V4);
+    assert!(
+        !demoted(),
+        "failures separated by a dial success never strike"
+    );
+    set.record_dial_failure(node, ProbeDomain::Tcp, IpVersion::V4);
+    assert!(demoted());
 }
 
 /// Real-traffic fast path: three consecutive dials far above the node's own

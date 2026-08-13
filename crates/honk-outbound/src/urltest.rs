@@ -1021,8 +1021,10 @@ mod tests {
     #[tokio::test]
     async fn test_urltest_group_marks_failure_with_synthetic_sample() {
         // Plaintext HTTP server: every https measurement fails the TLS
-        // handshake, so the group run must append a synthetic penalty sample
-        // for both the dial-failing and the handshake-failing member.
+        // handshake, so two consecutive failing group runs must append a
+        // synthetic penalty sample for both the dial-failing and the
+        // handshake-failing member (a lone transient failure strikes
+        // nothing).
         let addr = spawn_mock_http_server().await;
         let url = format!("https://{}:{}/", addr.ip(), addr.port());
 
@@ -1044,9 +1046,10 @@ mod tests {
             );
         }
 
+        let runtime = Arc::new(crate::runtime::OutboundRuntimeRegistry::build(&members).unwrap());
         let results = urltest_group(
             &members,
-            &Arc::new(crate::runtime::OutboundRuntimeRegistry::build(&members).unwrap()),
+            &runtime,
             &registry,
             &alive_set,
             &url,
@@ -1060,10 +1063,26 @@ mod tests {
         assert!(results[0].1.is_err());
         assert!(results[1].1.is_err());
 
-        // Failure → synthetic penalty sample on top of the retained history:
-        // the latest sample is the 10s placeholder (display-only) and a
-        // failure strike demotes the node, while the real 999ms moving
-        // average survives unpoisoned.
+        // One failed run leaves no selection state.
+        for m in &members {
+            assert!(!alive_set.is_failure_demoted(m.id, ProbeDomain::Tcp, IpVersion::V4));
+        }
+
+        let results = urltest_group(
+            &members,
+            &runtime,
+            &registry,
+            &alive_set,
+            &url,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(results.iter().all(|(_, r)| r.is_err()));
+
+        // The second consecutive failure → synthetic penalty sample on top
+        // of the retained history: the latest sample is the 10s placeholder
+        // (display-only) and a failure strike demotes the node, while the
+        // real 999ms moving average survives unpoisoned.
         for m in &members {
             assert_eq!(
                 alive_set.get_last_latency(m.id, ProbeDomain::Tcp, IpVersion::V4),
