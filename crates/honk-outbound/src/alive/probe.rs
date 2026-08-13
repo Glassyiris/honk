@@ -126,7 +126,7 @@ impl AliveDialerSet {
                 match tokio::time::timeout(timeout, prober.probe_http(node_name, *a, &check_url))
                     .await
                 {
-                    Ok(Ok(elapsed)) => {
+                    Ok(HttpProbeResult::WarmSuccess(elapsed)) => {
                         tracing::debug!(
                             "HTTP health check succeeded for node '{}' via {} ({}ms)",
                             node_name,
@@ -138,12 +138,20 @@ impl AliveDialerSet {
                         family_ok = true;
                         break;
                     }
-                    Ok(Err(err_msg)) => {
+                    Ok(HttpProbeResult::SetupFailure(error)) => {
                         tracing::debug!(
-                            "HTTP health check failed for node '{}' via {}: {}",
+                            "HTTP health check establishment failed for node '{}' via {}: {}",
                             node_name,
                             a,
-                            err_msg
+                            error
+                        );
+                    }
+                    Ok(HttpProbeResult::ExchangeFailure(error)) => {
+                        tracing::debug!(
+                            "HTTP health check warm exchange failed for node '{}' via {}: {}",
+                            node_name,
+                            a,
+                            error
                         );
                     }
                     Err(_) => {
@@ -221,7 +229,7 @@ impl AliveDialerSet {
         let mut any_ok = false;
         for a in addrs.into_iter().take(3) {
             match tokio::time::timeout(timeout, prober.probe_http(leaf, a, url)).await {
-                Ok(Ok(elapsed)) => {
+                Ok(HttpProbeResult::WarmSuccess(elapsed)) => {
                     tracing::debug!(
                         "HTTP health check succeeded for member '{}' (leaf '{}') via {} ({}ms, url={})",
                         tag,
@@ -234,14 +242,24 @@ impl AliveDialerSet {
                     any_ok = true;
                     break;
                 }
-                Ok(Err(err_msg)) => {
+                Ok(HttpProbeResult::SetupFailure(error)) => {
                     tracing::debug!(
-                        "HTTP health check failed for member '{}' (leaf '{}') via {} (url={}): {}",
+                        "HTTP health check establishment failed for member '{}' (leaf '{}') via {} (url={}): {}",
                         tag,
                         leaf,
                         a,
                         url,
-                        err_msg
+                        error
+                    );
+                }
+                Ok(HttpProbeResult::ExchangeFailure(error)) => {
+                    tracing::debug!(
+                        "HTTP health check warm exchange failed for member '{}' (leaf '{}') via {} (url={}): {}",
+                        tag,
+                        leaf,
+                        a,
+                        url,
+                        error
                     );
                 }
                 Err(_) => {

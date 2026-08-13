@@ -51,7 +51,7 @@ facade 与内部实现按职责拆分：
 
 当前选择的基线在每次选择时重新读取，而不是保留它胜出时的旧值。因此已退化的当前节点可以被替换；这与 sing-box `Select()` 行为一致。若当前节点带有未清除的失败标记（strike），则跳过滞后——刚失败的当前节点会被立即替换。
 
-探测或拨号失败会追加一个 10 秒合成占位样本并记一次失败 strike。节点的真实历史与移动平均被保留（占位样本不进入平均值，仅用于显示排除），但带有未清除 strike 的候选排在所有无降级候选之后。strike 只有在连续 `max(strikes, 2)` 次真实成功后才会清除——这就是防止不稳定节点凭一次走运探测重回第一的防抖保护。
+探测失败只更新活性与冷却，不会产生合成延迟样本或排名 strike。真实拨号失败会追加一个不显示的 10 秒合成占位样本，并记一次失败 strike。真实历史与移动平均仍保留，但带有未清除拨号失败 strike 的候选排在所有无降级候选之后。strike 只有在连续 `max(strikes, 2)` 次真实成功后才会清除——这就是防止不稳定节点凭一次走运探测重回第一的防抖保护。
 
 真实流量也会直接回馈排名（仅 TCP）。每个节点为自身的新鲜拨号延迟维护一个自引用 EMA（α=1/8，前 3 次拨号为预热期）；命中就绪连接池的拨号不产生网络往返，不计入。连续 3 次拨号慢于 `min(2×EMA, EMA+500 ms)` 会记一次失败 strike 并触发紧急探测。探测移动平均不受影响；误报（目标分布变化而非节点劣化）会自愈——紧急探测成功后，连续探测成功会清除 strike。渐进式劣化仍由探测周期负责；UDP 劣化保持探测周期加 `DataUdp` 流量阈值的处理方式。
 
@@ -99,9 +99,9 @@ facade 与内部实现按职责拆分：
 
 | 探测路径 | 行为 |
 | --- | --- |
-| TCP | 通过节点向 `tcp_check_url` 发送已配置 HTTP 方法；不适用 HTTP 探测时执行裸 TCP 连接。成功只把 RTT 记录到匹配的 TCP 地址族状态。 |
+| TCP | 通过节点向 `tcp_check_url` 发送已配置 HTTP 方法；不适用 HTTP 探测时执行裸 TCP 连接。冷的可复用节点会先在临时 runtime 中建立 session/client；setup 不计时，随后只有完成的 HTTP 交换才把暖路径 RTT 记录到匹配的 TCP 地址族状态。setup 与目标交换失败都会更新活性/冷却，但不贡献延迟或排名 strike。 |
 | UDP | 通过节点自己的 `dial_udp_transport`，向第一个 `udp_check_dns` 目标发送一个最小 DNS 查询。成功记录实测 RTT，并把 `DnsUdp` 与 `DataUdp` 都标记为存活；失败分别给两个 UDP 域增加一次探测失败。它从不修改 TCP 状态。 |
-| 按组 URL | 探测动态解析出的 `(member tag, current leaf)` 对。状态为 TCP-only，连续三次失败即死亡，并使用相同冷却与连续两次成功恢复。重载时 `sync_group_check_urls` 替换有效的组/URL 注册表。 |
+| 按组 URL | 用与全局 TCP 探测相同的临时暖路径计时，探测动态解析出的 `(member tag, current leaf)` 对。状态为 TCP-only，连续三次失败即死亡，并使用相同冷却与连续两次成功恢复。重载时 `sync_group_check_urls` 替换有效的组/URL 注册表。 |
 
 `has_udp_state` 区分从未观察过 UDP 的节点与已明确观察为死亡的节点。已建立 endpoint 的发送、接收和回包空闲错误会上报 `DataUdp` 流量失败。主动 endpoint 退役、节点死亡取消和进程关闭不影响健康状态。
 
@@ -137,7 +137,7 @@ eBPF alive slot 属于组，而不是某个节点。对于每个域和地址族�
 
 Selector 与 UDP 所有权是可复用节点 runtime 上相互独立的 bit。移除一个所有者时，如果另一个仍在，资源继续保留；只有最后一个所有者释放后，才会排空未来可复用状态。活跃流持有自己的 stream 或 connection 句柄，不会被切断。启动预连接只是 pool seed，不参与这些 bit。
 
-重载时，配置未变化的节点会把现有 `NodeRuntime` 转移给替代 generation，其中包括存活的 AnyTLS、VLESS H2MUX/Mux.Cool 与 QUIC 状态。旧 generation 不再接受新的预热工作，活跃流则正常排空。健康探测会测量冷节点，但不会预热订阅中的每个成员。
+重载时，配置未变化的节点会把现有 `NodeRuntime` 转移给替代 generation，其中包括存活的 AnyTLS、VLESS H2MUX/Mux.Cool 与 QUIC 状态。旧 generation 不再接受新的预热工作，活跃流则正常排空。周期 HTTP 健康探测与按需 Clash 延迟测试都会先在临时 runtime 中预热冷的可复用 session 或 QUIC client，再开始计时并在结束后关闭，因此扫描不会新增每成员常驻 transport 状态。只有预热后的目标交换成功才报告健康并向选择逻辑贡献 RTT。
 
 ## 拨号准入预算
 

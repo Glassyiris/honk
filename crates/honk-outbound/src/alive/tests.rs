@@ -427,6 +427,71 @@ fn test_sync_urltest_groups_full_refresh() {
     assert!(!set.is_urltest_group_idle("g1")); // removed → never idle
     assert!(!set.is_probe_suspended(id(2))); // no groups → not suspended
 }
+struct MockHttpProber {
+    result: HttpProbeResult,
+}
+
+impl HttpProber for MockHttpProber {
+    fn probe_http(
+        &self,
+        _node_name: &str,
+        _addr: std::net::SocketAddr,
+        _url: &str,
+    ) -> Pin<Box<dyn Future<Output = HttpProbeResult> + Send + 'static>> {
+        let result = self.result.clone();
+        Box::pin(async move { result })
+    }
+}
+
+#[tokio::test]
+async fn warm_http_probe_is_the_only_result_recorded_as_latency() {
+    let set = AliveDialerSet::new();
+    set.register_node(id(1), "n1".into(), "127.0.0.1:1".into());
+    set.set_http_probe(
+        Arc::new(MockHttpProber {
+            result: HttpProbeResult::WarmSuccess(Duration::from_millis(42)),
+        }),
+        "http://127.0.0.1/".into(),
+        "HEAD".into(),
+    )
+    .await;
+
+    assert!(set.probe_node(id(1), Duration::from_millis(200)).await);
+    assert_eq!(
+        set.get_last_latency(id(1), ProbeDomain::Tcp, IpVersion::V4),
+        Some(Duration::from_millis(42))
+    );
+
+    for result in [
+        HttpProbeResult::SetupFailure("connect refused".into()),
+        HttpProbeResult::ExchangeFailure("HTTP read failed".into()),
+    ] {
+        let set = AliveDialerSet::new();
+        set.record_probe_latency(
+            id(1),
+            ProbeDomain::Tcp,
+            IpVersion::V4,
+            Duration::from_millis(42),
+        );
+        set.set_http_probe(
+            Arc::new(MockHttpProber { result }),
+            "http://127.0.0.1/".into(),
+            "HEAD".into(),
+        )
+        .await;
+        assert!(!set.probe_node(id(1), Duration::from_millis(200)).await);
+        assert_eq!(
+            set.get_last_real_sample(id(1), ProbeDomain::Tcp, IpVersion::V4)
+                .map(|sample| sample.0),
+            Some(Duration::from_millis(42)),
+            "a failed health signal must not become a ranking latency"
+        );
+        assert!(
+            !set.is_failure_demoted(id(1), ProbeDomain::Tcp, IpVersion::V4),
+            "periodic probe failure must not become a dial-failure strike"
+        );
+    }
+}
 
 struct MockUdpProber {
     result: std::sync::Mutex<Result<Duration, String>>,

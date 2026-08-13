@@ -1570,12 +1570,11 @@ fn test_urltest_keeps_incumbent_within_tolerance_of_current_latency() {
     assert_eq!(m.select_node("g").unwrap().name, "a");
 }
 
-/// Lab scenario S3: a flaky node (fast when it works, but failing probes and
-/// dials) must not be re-adopted while the incumbent is healthy. A probe
-/// failure demotes the node via a failure strike (history and the
-/// real moving average are kept), recovery needs 2 successes, and a dial
-/// failure skips the incumbent's hysteresis exactly once — after that the
-/// tolerance guards the incumbent against the flaky node's lower average.
+/// Lab scenario S3: a flaky node (fast when it works, but failing real dials)
+/// must not be re-adopted while the incumbent is healthy. Probe failures own
+/// liveness without creating ranking strikes; a dial failure demotes the node
+/// while retaining its real moving average, and tolerance then guards the
+/// incumbent against the flaky node's lower average.
 #[test]
 fn urltest_flaky_node_stays_demoted_after_dial_failure() {
     let (na, nb, nc) = (nid("a"), nid("b"), nid("c"));
@@ -1599,10 +1598,13 @@ fn urltest_flaky_node_stays_demoted_after_dial_failure() {
     probe_ok(nid("c"), 42);
     assert_eq!(m.select_node("g").unwrap().name, "a");
 
-    // Probe failure on 'a' → strike demotion moves the group to
-    // 'b' even though one failure no longer kills the node (TCP threshold 3).
+    // One probe failure keeps 'a' alive and does not bypass tolerance.
     alive.mark_dead(nid("a"));
     assert!(alive.is_alive_for(nid("a"), ProbeDomain::Tcp, IpVersion::V4));
+    assert_eq!(m.select_node("g").unwrap().name, "a");
+
+    // A real dial failure supplies the ranking strike and moves to 'b'.
+    alive.record_dial_failure(nid("a"), ProbeDomain::Tcp, IpVersion::V4);
     assert_eq!(m.select_node("g").unwrap().name, "b");
 
     // 'a' recovers after two good probes; 7ms beats b's 21ms but stays

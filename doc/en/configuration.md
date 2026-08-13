@@ -261,7 +261,7 @@ See the [experimental reference](./reference/experimental.md) and [UDP NFQUEUE d
 
 ## Warm-up and dial budget
 
-These mechanisms are independent and bounded by configured groups or explicit budgets rather than raw subscription size:
+These mechanisms are independent and bounded by configured groups or explicit budgets rather than raw subscription size. On-demand Clash delay tests are separate: cold session/QUIC nodes use a throwaway warm transport for measurement and close it afterward.
 
 | Mechanism | Key | Default | Behavior |
 | --- | --- | --- | --- |
@@ -270,7 +270,7 @@ These mechanisms are independent and bounded by configured groups or explicit bu
 | UDP warm set | `udp_warm_node_count` | `0` | Takes the top `min(N,3)` UDP leaves per group and IP family, runs at most 4 attempts concurrently, and caps retained nodes at `4×N`. UDP and Selector ownership are independent. |
 | Concurrent dial cap | `max_concurrent_dials` | `64` | Bounds physical proxy connects and handshakes per generation. Ready-pool hits, logical streams on warm transports, `direct`, and `block` are exempt; overlapping reload generations also share the startup descriptor gate. |
 
-Health checks probe but never warm a cold node, so a large subscription does not create one idle tunnel per node.
+Periodic HTTP health checks use the same throwaway warm-path timing as Clash delay tests: cold reusable transports warm outside the timer and close afterward. Only a successful post-warm target exchange reports health and supplies selection RTT; setup and exchange failures update liveness/cooldown without a latency sample or ranking strike. Scans never retain one idle tunnel per node.
 
 See the [group selection design](./design/groups.md).
 

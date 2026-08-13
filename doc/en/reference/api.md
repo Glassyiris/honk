@@ -30,8 +30,8 @@ The table follows the router in `crates/honk-core/src/clash_api.rs`.
 | GET | `/proxies` | Return every node and group plus the synthetic `GLOBAL` selector. |
 | GET | `/proxies/{name}` | Return one node, group, or `GLOBAL` selector. |
 | PUT | `/proxies/{name}` | Select a direct member of a Selector group with `{"name":"member"}`; also mutates the synthetic `GLOBAL` selector. |
-| GET | `/proxies/{name}/delay` | Run an on-demand URL delay test for a node or group. |
-| GET | `/group/{name}/delay` | Test all group members and return successful member delays. |
+| GET | `/proxies/{name}/delay` | Run an on-demand URL delay test for a node or group. Already-warm transports are reused; every cold reusable session or QUIC client is warmed in a throwaway runtime before timing. |
+| GET | `/group/{name}/delay` | Test all group members concurrently (maximum 10) and return successful member delays with the same timing semantics. |
 | GET | `/rules` | Return one row per route. Simple matchers use native Clash rule types; compound, negated, and `must` rules use `complex` with the full dae statement. |
 | GET | `/connections` | Return a connection snapshot, or stream snapshots after a WebSocket upgrade. |
 | DELETE | `/connections` | Close all tracked connections. |
@@ -48,6 +48,14 @@ The table follows the router in `crates/honk-core/src/clash_api.rs`.
 | GET | `/ui`, `/ui/*` | Redirect `/ui` to `/ui/` and serve the configured external UI directory. |
 
 `/traffic`, `/memory`, and `/logs` send one JSON document per line for a plain HTTP GET. `/logs` installs dynamic tracing interest only while subscribers exist; with no subscribers, the Clash tracing layer does not format events.
+
+### Delay measurement
+
+Delay tests time the proxied HTTP `HEAD` exchange through receipt of response headers; HTTPS includes the target TLS handshake. Cold reusable transports—AnyTLS, VLESS H2MUX/Mux.Cool, Hysteria2, TUIC, and Juicity—first establish their session or QUIC client in a temporary runtime, then run one measured exchange through it. The temporary runtime closes afterward, so scanning a large group does not leave reusable state per tested node resident. This warm-up has its own timeout before the measured timeout; a cold request can therefore take up to twice the requested timeout.
+
+Hysteria2 additionally follows sing-box's lazy-handshake rule: timing starts after its outbound dial returns because the target request is coalesced with the first application write. TUIC and Juicity complete the target request header inside the now-warm dial. All three QUIC protocols therefore exclude cold QUIC connection/authentication setup, while preserving their wire-specific target-handshake boundary. Reported values can be lower than releases that included cold setup.
+
+Successful measurements update the node latency history. Failures return `503` for a single node, are omitted from the group result, and append a failure strike used by URLTest selection.
 
 ## Mode and selector mutations
 

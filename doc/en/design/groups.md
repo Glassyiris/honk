@@ -51,7 +51,7 @@ The effective tolerance is `max(configured tolerance, 1 ms)`. The incumbent stay
 
 The incumbent baseline is read again at selection time, not retained from the moment it won. A degraded incumbent can therefore be replaced; this matches sing-box `Select()` behavior. Hysteresis is skipped for an incumbent carrying failure strikes — a just-failed incumbent is replaced immediately.
 
-A probe or dial failure appends one synthetic 10-second placeholder sample and one failure strike. The node's real history and moving average are retained (the placeholder never feeds the average; it is display-exclusion only), but a candidate with pending strikes ranks below every non-demoted candidate. Strikes clear only after `max(strikes, 2)` consecutive real successes — this is the flap guard that stops a fast-but-flaky node from reclaiming first place with one lucky probe.
+Probe failures update only liveness and cooldown; they never create synthetic latency samples or ranking strikes. Real dial failures append a display-excluded synthetic 10-second placeholder plus one failure strike. Real history and moving average are retained, but a candidate with pending dial-failure strikes ranks below every non-demoted candidate. Strikes clear only after `max(strikes, 2)` consecutive real successes — this is the flap guard that stops a fast-but-flaky node from reclaiming first place with one lucky probe.
 
 Real traffic also feeds ranking directly (TCP only). Each node keeps a self-referential EMA (α=1/8, after 3 warmup dials) of fresh dial latencies; pool-ready hits are excluded because they perform no network round trip. Three consecutive dials slower than `min(2×EMA, EMA+500 ms)` append one failure strike and fire an emergency probe. The probe moving average is never touched, and a false positive (a shifted target mix rather than node decay) self-heals when the emergency probe succeeds and consecutive probe successes clear the strike. Gradual drift stays owned by the probe cycle; UDP degradation keeps the probe-cycle plus `DataUdp` traffic-threshold handling.
 
@@ -99,9 +99,9 @@ A dead state normally needs two consecutive probe successes to recover. `notify_
 
 | Probe path | Behavior |
 | --- | --- |
-| TCP | Sends the configured HTTP method to `tcp_check_url` through the node, or performs a raw TCP connect when no HTTP probe applies. Success records RTT only in the matching TCP family state. |
+| TCP | Sends the configured HTTP method to `tcp_check_url` through the node, or performs a raw TCP connect when no HTTP probe applies. A cold reusable node first establishes its session/client in a throwaway runtime; setup is untimed, then only a completed HTTP exchange records warm-path RTT in the matching TCP family state. Setup and target-exchange failures both update liveness/cooldown without contributing latency or ranking strikes. |
 | UDP | Sends one minimal DNS query to the first `udp_check_dns` target through the node's own `dial_udp_transport`. Success records the measured RTT and marks both `DnsUdp` and `DataUdp` alive; failure adds one probe failure to each UDP domain. It never changes TCP state. |
-| Per-group URL | Probes the dynamically resolved `(member tag, current leaf)` pairs. State is TCP-only, dies after three consecutive failures, and uses the same cooldown and two-success recovery. `sync_group_check_urls` replaces the active group/URL registry on reload. |
+| Per-group URL | Probes the dynamically resolved `(member tag, current leaf)` pairs with the same throwaway warm-path timing as the global TCP probe. State is TCP-only, dies after three consecutive failures, and uses the same cooldown and two-success recovery. `sync_group_check_urls` replaces the active group/URL registry on reload. |
 
 `has_udp_state` distinguishes a node with no UDP observations from one explicitly observed dead. Established endpoint send, receive, and reply-idle errors report `DataUdp` traffic failures. Intentional endpoint retirement, node-death cancellation, and process shutdown are health-neutral.
 
@@ -137,7 +137,7 @@ Warm-up has three independent mechanisms:
 
 Selector and UDP ownership are independent bits on reusable node runtimes. Removing one owner leaves the resource retained for the other; only the final owner release drains future reusable state. Active flows keep their own stream or connection handles and are not cut. Startup preconnect is only a pool seed and does not participate in these bits.
 
-On reload, unchanged node configurations transfer their existing `NodeRuntime`, including live AnyTLS, VLESS H2MUX/Mux.Cool, and QUIC state, to the replacement generation. The old generation becomes terminal to new warm work while active flows drain normally. Health probes measure cold nodes but do not warm every subscription member.
+On reload, unchanged node configurations transfer their existing `NodeRuntime`, including live AnyTLS, VLESS H2MUX/Mux.Cool, and QUIC state, to the replacement generation. The old generation becomes terminal to new warm work while active flows drain normally. Periodic HTTP health probes and on-demand Clash delay tests both warm a cold reusable session or QUIC client in a throwaway runtime before timing, then close it; a scan therefore retains no new per-member transport state. Only a successful post-warm target exchange reports health and contributes RTT to selection.
 
 ## Dial admission budget
 

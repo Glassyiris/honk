@@ -128,17 +128,16 @@ pub async fn urltest_node(
     )
     .await
 }
-/// Measure through reusable generation state only when that state is already
-/// warm. Cold session-owning nodes use an ephemeral runtime so a dashboard
-/// group scan cannot retain one QUIC client or session pool per tested node.
-pub async fn urltest_node_in_generation(
-    generation: &Arc<crate::runtime::OutboundRuntimeRegistry>,
+/// Reuse an already-warm generation runtime; otherwise create a throwaway
+/// runtime whose guard closes any session or client established for probing.
+pub fn probe_runtime(
+    generation: &crate::runtime::OutboundRuntimeRegistry,
     node: &Node,
-    handler: &dyn TcpOutbound,
-    url: &str,
-    timeout: Duration,
-) -> anyhow::Result<Duration> {
-    let (runtime, guard) = match generation
+) -> (
+    Arc<crate::runtime::NodeRuntime>,
+    Option<crate::runtime::EphemeralRuntimeGuard>,
+) {
+    match generation
         .get(&node.id)
         .filter(|runtime| runtime.is_warm_or_stateless())
     {
@@ -147,8 +146,39 @@ pub async fn urltest_node_in_generation(
             let guard = crate::runtime::NodeRuntime::ephemeral_guarded(node);
             (guard.runtime(), Some(guard))
         }
+    }
+}
+
+/// Reuse an already-warm generation runtime. Cold reusable transports warm a
+/// throwaway runtime before measurement so a group scan retains no new state.
+pub async fn urltest_node_in_generation(
+    generation: &Arc<crate::runtime::OutboundRuntimeRegistry>,
+    node: &Node,
+    handler: &dyn TcpOutbound,
+    warmable: Option<&dyn crate::proxy::WarmableOutbound>,
+    url: &str,
+    timeout: Duration,
+) -> anyhow::Result<Duration> {
+    let timeout = if timeout.is_zero() {
+        DEFAULT_URLTEST_TIMEOUT
+    } else {
+        timeout
     };
-    let result = urltest_node(&runtime, handler, url, timeout).await;
+    let (runtime, guard) = probe_runtime(generation, node);
+    let result = async {
+        if !runtime.is_warm_or_stateless() {
+            warmable
+                .ok_or_else(|| anyhow!("no warm handler for node '{}'", node.name))?
+                .warm(
+                    Arc::clone(&runtime),
+                    timeout,
+                    crate::proxy::WarmRequirement::Session,
+                )
+                .await?;
+        }
+        urltest_node(&runtime, handler, url, timeout).await
+    }
+    .await;
     if let Some(guard) = guard {
         guard.close().await;
     }
@@ -182,11 +212,14 @@ async fn measure_head_exchange(
 ) -> anyhow::Result<Duration> {
     let node = runtime.node.as_ref();
     let fut = async {
-        let start = Instant::now();
+        let mut start = Instant::now();
         let proxy = handler
             .dial_runtime(Arc::clone(runtime), addr, target_domain, timeout)
             .await?;
         tracing::debug!(node = %node.name, %addr, "urltest: dial established");
+        if matches!(node.protocol, honk_config::types::NodeProtocol::Hysteria2) {
+            start = Instant::now();
+        }
         let stream = proxy.stream;
 
         if is_https {
@@ -329,6 +362,7 @@ pub async fn urltest_group(
                         &generation,
                         &node,
                         entry.tcp.as_ref(),
+                        entry.warmable.as_deref(),
                         &url,
                         timeout,
                     )
@@ -495,6 +529,29 @@ mod tests {
         }
     }
 
+    struct DelayedDialHandler {
+        delay: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl TcpOutbound for DelayedDialHandler {
+        async fn dial(
+            &self,
+            _node: &Node,
+            target: SocketAddr,
+            target_domain: Option<&str>,
+            _connect_timeout: Duration,
+        ) -> anyhow::Result<ProxyStream> {
+            tokio::time::sleep(self.delay).await;
+            let stream = tokio::net::TcpStream::connect(target).await?;
+            Ok(ProxyStream {
+                stream: Box::new(stream),
+                target_addr: target,
+                target_domain: target_domain.map(str::to_string),
+            })
+        }
+    }
+
     fn make_node(name: &str) -> Node {
         Node {
             id: uuid::Uuid::new_v4(),
@@ -502,6 +559,197 @@ mod tests {
             protocol: NodeProtocol::Socks5,
             ..Default::default()
         }
+    }
+
+    struct RecordingWarmable {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        fail: bool,
+        ephemeral: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    struct DelayedWarmable {
+        delay: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::proxy::WarmableOutbound for DelayedWarmable {
+        async fn warm(
+            &self,
+            _runtime: Arc<crate::runtime::NodeRuntime>,
+            _connect_timeout: Duration,
+            requirement: crate::proxy::WarmRequirement,
+        ) -> anyhow::Result<()> {
+            assert_eq!(requirement, crate::proxy::WarmRequirement::Session);
+            tokio::time::sleep(self.delay).await;
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::proxy::WarmableOutbound for RecordingWarmable {
+        async fn warm(
+            &self,
+            runtime: Arc<crate::runtime::NodeRuntime>,
+            _connect_timeout: Duration,
+            requirement: crate::proxy::WarmRequirement,
+        ) -> anyhow::Result<()> {
+            assert_eq!(requirement, crate::proxy::WarmRequirement::Session);
+            self.ephemeral
+                .store(runtime.is_ephemeral(), std::sync::atomic::Ordering::Relaxed);
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.fail {
+                anyhow::bail!("simulated warm failure");
+            }
+            Ok(())
+        }
+    }
+
+    fn reusable_node(name: &str, protocol: NodeProtocol) -> Node {
+        let mut node = make_node(name);
+        node.protocol = protocol;
+        if protocol == NodeProtocol::VLess {
+            node.vless_mode = honk_config::node::WireMode::H2mux;
+        }
+        node
+    }
+
+    #[test]
+    fn probe_runtime_reuses_only_warm_or_stateless_nodes() {
+        let anytls = reusable_node("anytls", NodeProtocol::AnyTLS);
+        let trojan = reusable_node("trojan", NodeProtocol::Trojan);
+        let absent = reusable_node("absent", NodeProtocol::SS);
+        let generation =
+            crate::runtime::OutboundRuntimeRegistry::build(&[anytls.clone(), trojan.clone()])
+                .unwrap();
+
+        assert!(probe_runtime(&generation, &anytls).1.is_some());
+        assert!(probe_runtime(&generation, &absent).1.is_some());
+        let (runtime, guard) = probe_runtime(&generation, &trojan);
+        assert!(Arc::ptr_eq(&runtime, &generation.get(&trojan.id).unwrap()));
+        assert!(guard.is_none());
+    }
+
+    async fn assert_cold_reusable_transport_warms_before_measurement(node: Node) {
+        let addr = spawn_mock_http_server().await;
+        let generation = Arc::new(
+            crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
+        );
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ephemeral = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let warmable = RecordingWarmable {
+            calls: Arc::clone(&calls),
+            fail: false,
+            ephemeral: Arc::clone(&ephemeral),
+        };
+
+        urltest_node_in_generation(
+            &generation,
+            &node,
+            &MockHandler,
+            Some(&warmable),
+            &format!("http://{addr}/"),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(ephemeral.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn cold_anytls_warms_before_measurement() {
+        assert_cold_reusable_transport_warms_before_measurement(reusable_node(
+            "anytls",
+            NodeProtocol::AnyTLS,
+        ))
+        .await;
+    }
+
+    #[cfg(feature = "rprx")]
+    #[tokio::test]
+    async fn cold_vless_mux_warms_before_measurement() {
+        assert_cold_reusable_transport_warms_before_measurement(reusable_node(
+            "vless",
+            NodeProtocol::VLess,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn cold_quic_protocols_warm_before_measurement() {
+        for (name, protocol) in [
+            ("hysteria2", NodeProtocol::Hysteria2),
+            ("tuic", NodeProtocol::Tuic),
+            ("juicity", NodeProtocol::Juicity),
+        ] {
+            assert_cold_reusable_transport_warms_before_measurement(reusable_node(name, protocol))
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_quic_warm_time_is_not_reported() {
+        let addr = spawn_mock_http_server().await;
+        for (name, protocol) in [
+            ("hysteria2", NodeProtocol::Hysteria2),
+            ("tuic", NodeProtocol::Tuic),
+            ("juicity", NodeProtocol::Juicity),
+        ] {
+            let node = reusable_node(name, protocol);
+            let generation = Arc::new(
+                crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node))
+                    .unwrap(),
+            );
+            let elapsed = urltest_node_in_generation(
+                &generation,
+                &node,
+                &MockHandler,
+                Some(&DelayedWarmable {
+                    delay: Duration::from_millis(100),
+                }),
+                &format!("http://{addr}/"),
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+
+            assert!(elapsed < Duration::from_millis(50), "{name}: {elapsed:?}");
+        }
+    }
+
+    #[cfg(feature = "rprx")]
+    #[tokio::test]
+    async fn cold_vless_mux_warm_failure_skips_measurement() {
+        let node = reusable_node("vless", NodeProtocol::VLess);
+        let generation = Arc::new(
+            crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
+        );
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ephemeral = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let warmable = RecordingWarmable {
+            calls: Arc::clone(&calls),
+            fail: true,
+            ephemeral: Arc::clone(&ephemeral),
+        };
+
+        let error = urltest_node_in_generation(
+            &generation,
+            &node,
+            &DelayedDialHandler {
+                delay: Duration::from_secs(10),
+            },
+            Some(&warmable),
+            "http://localhost/",
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("simulated warm failure"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(ephemeral.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     struct RecordingHandler {
@@ -658,9 +906,33 @@ mod tests {
         assert!(exchange_head_h2(stream, "localhost").await.is_err());
     }
 
+    #[tokio::test]
+    async fn hysteria2_excludes_pre_write_dial_time() {
+        let addr = spawn_mock_http_server().await;
+        let node = Node {
+            id: uuid::Uuid::new_v4(),
+            name: "hysteria2".into(),
+            protocol: NodeProtocol::Hysteria2,
+            ..Default::default()
+        };
+        let elapsed = urltest_node_addr(
+            &crate::runtime::NodeRuntime::ephemeral(&node),
+            &DelayedDialHandler {
+                delay: Duration::from_millis(100),
+            },
+            "http://localhost/",
+            addr,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+
+        assert!(elapsed < Duration::from_millis(50), "{elapsed:?}");
+    }
     #[test]
     fn test_normalize_and_parse_url() {
         assert_eq!(normalize_url(""), DEFAULT_URLTEST_URL);
+
         assert_eq!(
             normalize_url("http://www.gstatic.com/generate_204"),
             "http://www.gstatic.com/generate_204"
