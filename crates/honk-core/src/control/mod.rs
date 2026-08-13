@@ -8,9 +8,16 @@ pub mod janitor;
 #[cfg(feature = "ebpf")]
 pub(crate) mod nfqueue;
 pub mod packet_sniffer;
+mod preconnect;
 mod probers;
 pub mod quic;
 pub(crate) mod reload;
+mod reload_connectivity;
+mod reload_policy;
+mod reload_subscription;
+#[cfg(test)]
+mod reload_tests;
+mod reload_warm;
 mod resource_budget;
 pub mod routing_matcher;
 mod sockets;
@@ -19,6 +26,7 @@ pub mod tcp_sniff;
 mod tests;
 mod udp_dial;
 pub mod udp_endpoint;
+mod udp_removal;
 use crate::connection_tracker::ConnectionTracker;
 use crate::control::packet_sniffer::PacketSnifferPool;
 use crate::control::routing_matcher::DOMAIN_BITMAPS;
@@ -457,36 +465,15 @@ async fn wait_nfqueue_event(
 /// out and log rather than leave the process half-torn-down forever.
 const SHUTDOWN_STAGE_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub mod commands {
-    use honk_config::{Config, node::Node};
-
-    #[derive(Debug)]
-    #[allow(clippy::large_enum_variant)]
-    pub enum ControlCommand {
-        ReloadConfig {
-            request_id: u64,
-            config: Box<Config>,
-        },
-        /// Merge freshly fetched subscription nodes into the running config,
-        /// replacing the previous node set of that subscription. Used by
-        /// late startup fetches and periodic refreshes; subscription nodes
-        /// live in memory only and are never written back to the config file.
-        MergeSubscription {
-            subscription_id: uuid::Uuid,
-            name: String,
-            nodes: Vec<Node>,
-        },
-        /// Refresh generated gateway-address rules and bypass stale health
-        /// backoff after a link, address, route, or interface-role change.
-        NetworkChanged,
-        Shutdown,
-    }
-}
+mod commands;
 
 pub use commands::ControlCommand;
 use connection::*;
 use probers::*;
 use reload::*;
+use reload_connectivity::{
+    group_check_url_registrations, sync_health_check_nodes, urltest_group_registrations,
+};
 pub(crate) use resource_budget::{MAX_EFFECTIVE_NOFILE, ResourceBudget};
 use sockets::*;
 
@@ -499,8 +486,7 @@ pub struct ControlPlane {
     dns_resolver: Arc<DnsResolver>,
     dns_controller: Arc<crate::control::dns_control::DnsController>,
     group_manager: SharedGroupManager,
-    /// Per-node runtime ownership (v3.1 phase 2A): the single owner of
-    /// every outbound's session-layer resources, keyed by Node.id.
+    /// Single owner of every outbound session runtime, keyed by Node.id.
     runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
     stats: Arc<StatsManager>,
     drain_tracker: Arc<DrainTracker>,
@@ -565,103 +551,7 @@ fn accepts_transparent_connection(drain: &DrainTracker) -> bool {
     !drain.should_reject()
 }
 
-/// Retire an endpoint only through its token-bound backend incarnation, then
-/// acknowledge the exact pool tombstone while preserving kernel handoffs.
-pub(crate) fn spawn_udp_removal_worker(
-    udp_pool: Arc<UdpEndpointPool>,
-    ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
-    tracker: Arc<ConnectionTracker>,
-    fatal_tx: mpsc::UnboundedSender<anyhow::Error>,
-) -> tokio::task::JoinHandle<()> {
-    use crate::control::udp_endpoint::RemovalReason;
-    const UDP_REMOVAL_QUEUE_CAPACITY: usize = 1024;
-    const UDP_REMOVAL_BATCH_SIZE: usize = 128;
-    let (remove_tx, mut remove_rx) = tokio::sync::mpsc::channel::<
-        crate::control::udp_endpoint::EndpointRemoval,
-    >(UDP_REMOVAL_QUEUE_CAPACITY);
-    udp_pool.set_remove_sink(remove_tx);
-    tokio::spawn(async move {
-        let mut removals = Vec::with_capacity(UDP_REMOVAL_BATCH_SIZE);
-        while let Some(first) = remove_rx.recv().await {
-            removals.clear();
-            removals.push(first);
-            while removals.len() < UDP_REMOVAL_BATCH_SIZE {
-                match remove_rx.try_recv() {
-                    Ok(removal) => removals.push(removal),
-                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-                    | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
-                }
-            }
-
-            let mut backend = ebpf.write().await;
-            for removal in removals.drain(..) {
-                if let Some(id) = removal.conn_id.as_deref() {
-                    tracker.remove(id);
-                }
-                let backend_clean = if removal.reason == RemovalReason::UserspaceEndpointRetired {
-                    let key = crate::control::connection::build_tuples_key(
-                        removal.dst.ip(),
-                        removal.dst.port(),
-                        removal.client.ip(),
-                        removal.client.port(),
-                        17,
-                    );
-                    match backend.remove_udp_flow(&key, removal.decision_token) {
-                        Ok(crate::ebpf::UdpDecisionCommitResult::Applied)
-                        | Ok(crate::ebpf::UdpDecisionCommitResult::Missing)
-                        | Ok(crate::ebpf::UdpDecisionCommitResult::Superseded) => true,
-                        Ok(result) => {
-                            warn!(
-                                ?result,
-                                token = removal.decision_token,
-                                generation = removal.generation,
-                                "UDP retirement identity mismatch; retaining tombstone and signaling fatal"
-                            );
-                            let _ = fatal_tx.send(anyhow::anyhow!(
-                                "UDP retirement identity mismatch: result={result:?}, token={}, generation={}",
-                                removal.decision_token,
-                                removal.generation
-                            ));
-                            false
-                        }
-                        Err(error) => {
-                            error!(
-                                %error,
-                                token = removal.decision_token,
-                                generation = removal.generation,
-                                "token-bound UDP retirement failed; retaining tombstone and signaling fatal"
-                            );
-                            let _ = fatal_tx.send(anyhow::anyhow!(
-                                "token-bound UDP retirement failed: {error}; token={}, generation={}",
-                                removal.decision_token,
-                                removal.generation
-                            ));
-                            false
-                        }
-                    }
-                } else {
-                    true
-                };
-                if backend_clean
-                    && !udp_pool.complete_removal(
-                        removal.client,
-                        removal.dst,
-                        removal.decision_token,
-                        removal.generation,
-                    )
-                {
-                    debug!(
-                        token = removal.decision_token,
-                        generation = removal.generation,
-                        "ignored stale UDP retirement acknowledgement"
-                    );
-                }
-            }
-            drop(backend);
-            udp_pool.flush_removal_dirty();
-        }
-    })
-}
+pub(crate) use udp_removal::spawn_udp_removal_worker;
 
 impl ControlPlane {
     pub fn new(
@@ -2614,7 +2504,7 @@ fn dispatch_udp_slow_path(
     }
 }
 
-/// Compatibility wrapper used by family-symmetric admission tests: acquire
+/// Test helper for family-symmetric admission: acquire
 /// the slow permit then synchronously reserve/enqueue (non-DNS path).
 #[cfg(test)]
 fn reserve_udp_slow_path(
@@ -2726,51 +2616,4 @@ pub(crate) fn direct_check_addr(bootstrap_resolver: &str) -> String {
     }
 }
 
-/// Pick the nodes the startup preconnect warm-up dials: each group's current
-/// selection (selector pick / urltest winner, peek semantics) first, then
-/// config order to fill the remaining budget. Eligibility is
-/// descriptor-driven — multiplexed (AnyTLS) and QUIC nodes can never consume
-/// a pooled bare TCP — and the built-in direct/block markers have no server
-/// to dial. `count == 0` disables the warm-up; the
-/// [`honk_config::config::PRECONNECT_NODE_COUNT_AUTO`] sentinel caps at
-/// `min(nodes, 8)`.
-pub(super) fn preconnect_candidates(
-    config: &Config,
-    group_manager: &GroupManager,
-    count: usize,
-) -> Vec<Node> {
-    if count == 0 {
-        return Vec::new();
-    }
-    let limit = if count == honk_config::config::PRECONNECT_NODE_COUNT_AUTO {
-        config.nodes.len().min(8)
-    } else {
-        count
-    };
-    fn eligible(node: &Node) -> bool {
-        !matches!(node.protocol, NodeProtocol::Direct | NodeProtocol::Block)
-            && (honk_outbound::descriptor::descriptor(node.protocol).pool_bare_tcp)(node)
-    }
-    let mut seen = std::collections::HashSet::new();
-    let mut selected: Vec<Node> = Vec::new();
-    let push = |node: &Node,
-                seen: &mut std::collections::HashSet<uuid::Uuid>,
-                selected: &mut Vec<Node>| {
-        if selected.len() < limit && eligible(node) && seen.insert(node.id) {
-            selected.push(node.clone());
-        }
-    };
-    for group in &config.groups {
-        if let Some(node) = group_manager
-            .peek_selection_plan_for_domain(&group.name, ProbeDomain::Tcp, IpVersion::V4)
-            .nodes
-            .first()
-        {
-            push(node, &mut seen, &mut selected);
-        }
-    }
-    for node in &config.nodes {
-        push(node, &mut seen, &mut selected);
-    }
-    selected
-}
+pub(super) use preconnect::preconnect_candidates;
