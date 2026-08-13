@@ -928,8 +928,8 @@ fn test_report_dial_latency_demotes_after_three_slow_dials() {
     assert!(!report(100));
     assert!(!report(100));
 
-    // 400ms > min(2×100, 100+500) = 200ms → slow; two in a row are not
-    // enough, the third consecutive one demotes.
+    // 400ms > max(min(2×100, 100+500), 250) = 250ms → slow; two in a row are
+    // not enough, the third consecutive one demotes.
     assert!(!report(400));
     assert!(!report(400));
     assert!(report(400), "third consecutive slow dial demotes");
@@ -955,6 +955,36 @@ fn test_report_dial_latency_demotes_after_three_slow_dials() {
     assert!(!report2(400));
     assert!(!report2(400));
     assert!(!set.is_failure_demoted(node2, ProbeDomain::Tcp, IpVersion::V4));
+}
+
+/// Fast-node floor: a ~60ms-EMA incumbent roughly doubling under load
+/// (~120ms dials) is normal, not degradation — the 250ms floor keeps the
+/// threshold from collapsing to 2×EMA and flapping URLTest.
+#[test]
+fn test_report_dial_latency_floor_covers_fast_node_load_jitter() {
+    let set = AliveDialerSet::new();
+    let node = id(3);
+    let report = |ms: u64| {
+        set.report_dial_latency(
+            node,
+            ProbeDomain::Tcp,
+            IpVersion::V4,
+            Duration::from_millis(ms),
+        )
+    };
+
+    report(60);
+    report(60);
+    report(60);
+    for _ in 0..10 {
+        assert!(!report(120), "2×EMA below the 250ms floor is never slow");
+    }
+    assert!(!set.is_failure_demoted(node, ProbeDomain::Tcp, IpVersion::V4));
+
+    // Real degradation past the floor still demotes in three dials.
+    assert!(!report(400));
+    assert!(!report(400));
+    assert!(report(400));
 }
 
 /// Built-in direct/block nodes are exempt: local-egress latency is not

@@ -1009,7 +1009,8 @@ impl AliveDialerSet {
 
     /// Feed one REAL proxied dial's wall-clock latency (network round trip
     /// only — pool-ready hits are excluded by the caller). Sudden
-    /// degradation (3 consecutive dials slower than min(2×ema, ema+500ms))
+    /// degradation (3 consecutive dials slower than min(2×ema, ema+500ms),
+    /// floored at 250ms so fast nodes under load don't trip it)
     /// appends a synthetic failure strike (strike demotion) and returns
     /// true so the caller fires an emergency probe. Gradual drift stays
     /// owned by the probe cycle. Returns true once per demotion.

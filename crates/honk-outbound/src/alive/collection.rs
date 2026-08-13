@@ -22,6 +22,10 @@ pub(crate) const TRAFFIC_EMA_WARMUP: u8 = 3;
 pub(crate) const SLOW_DIAL_STREAK_MAX: u8 = 3;
 /// Absolute slack on top of the relative 2×EMA slow threshold.
 pub(crate) const SLOW_DIAL_MARGIN: Duration = Duration::from_millis(500);
+/// Absolute slow-threshold floor: a fast node's RTT roughly doubling under
+/// incumbency load (e.g. 60→120ms) is normal, not degradation — without the
+/// floor `min(2×ema, ema+margin)` collapses to 2×ema and flaps URLTest.
+pub(crate) const SLOW_DIAL_FLOOR: Duration = Duration::from_millis(250);
 
 /// Verdict of one real dial against the node's own traffic EMA.
 pub(crate) enum TrafficVerdict {
@@ -111,25 +115,28 @@ impl DialerCollection {
     }
 
     /// Judge one real dial against the node's own traffic EMA, then fold it
-    /// in. Sudden degradation (elapsed > min(2×ema, ema+SLOW_DIAL_MARGIN))
-    /// reports Slow; gradual drift stays owned by the probe cycle.
+    /// in. Sudden degradation (elapsed > min(2×ema, ema+SLOW_DIAL_MARGIN),
+    /// floored at SLOW_DIAL_FLOOR) reports Slow; gradual drift stays owned
+    /// by the probe cycle.
     pub(crate) fn record_traffic_latency(&self, elapsed: Duration) -> TrafficVerdict {
         let elapsed_nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
         let ema = self.traffic_ema_nanos.load(Ordering::Relaxed);
         let samples = self.traffic_samples.load(Ordering::Relaxed);
-        let verdict =
-            if samples < TRAFFIC_EMA_WARMUP {
-                TrafficVerdict::Warmup
-            } else if ema > 0
-                && elapsed_nanos
-                    > ema.saturating_mul(2).min(ema.saturating_add(
+        let verdict = if samples < TRAFFIC_EMA_WARMUP {
+            TrafficVerdict::Warmup
+        } else if ema > 0
+            && elapsed_nanos
+                > ema
+                    .saturating_mul(2)
+                    .min(ema.saturating_add(
                         u64::try_from(SLOW_DIAL_MARGIN.as_nanos()).unwrap_or(u64::MAX),
                     ))
-            {
-                TrafficVerdict::Slow
-            } else {
-                TrafficVerdict::Fast
-            };
+                    .max(u64::try_from(SLOW_DIAL_FLOOR.as_nanos()).unwrap_or(u64::MAX))
+        {
+            TrafficVerdict::Slow
+        } else {
+            TrafficVerdict::Fast
+        };
         let new_ema = if ema == 0 {
             elapsed_nanos
         } else {
