@@ -128,8 +128,8 @@ pub async fn urltest_node(
     )
     .await
 }
-/// Reuse generation-owned state for every node. Multiplexed protocols run one
-/// unmeasured exchange first when cold, matching sing-box URLTest warm-up.
+/// Reuse generation-owned state for every node. Multiplexed protocols establish
+/// their reusable session before the timed exchange, matching sing-box URLTest.
 pub async fn urltest_node_in_generation(
     generation: &Arc<crate::runtime::OutboundRuntimeRegistry>,
     node: &Node,
@@ -141,8 +141,10 @@ pub async fn urltest_node_in_generation(
     let runtime = generation
         .get(&node.id)
         .ok_or_else(|| anyhow!("no runtime for node '{}'", node.name))?;
-    if matches!(runtime.runtime, crate::runtime::ProtocolRuntime::AnyTls(_))
-        && !runtime.is_warm_or_stateless()
+    if matches!(
+        runtime.runtime,
+        crate::runtime::ProtocolRuntime::AnyTls(_) | crate::runtime::ProtocolRuntime::VlessMux(_)
+    ) && !runtime.is_warm_or_stateless()
     {
         warmable
             .ok_or_else(|| anyhow!("no warm handler for node '{}'", node.name))?
@@ -152,12 +154,6 @@ pub async fn urltest_node_in_generation(
                 crate::proxy::WarmRequirement::Session,
             )
             .await?;
-    } else if matches!(
-        runtime.runtime,
-        crate::runtime::ProtocolRuntime::VlessMux(_)
-    ) && !runtime.is_warm_or_stateless()
-    {
-        urltest_node(&runtime, handler, url, timeout).await?;
     }
     urltest_node(&runtime, handler, url, timeout).await
 }
@@ -536,6 +532,106 @@ mod tests {
             protocol: NodeProtocol::Socks5,
             ..Default::default()
         }
+    }
+
+    struct RecordingWarmable {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::proxy::WarmableOutbound for RecordingWarmable {
+        async fn warm(
+            &self,
+            _runtime: Arc<crate::runtime::NodeRuntime>,
+            _connect_timeout: Duration,
+            requirement: crate::proxy::WarmRequirement,
+        ) -> anyhow::Result<()> {
+            assert_eq!(requirement, crate::proxy::WarmRequirement::Session);
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.fail {
+                anyhow::bail!("simulated warm failure");
+            }
+            Ok(())
+        }
+    }
+
+    fn session_node(name: &str, protocol: NodeProtocol) -> Node {
+        let mut node = make_node(name);
+        node.protocol = protocol;
+        if protocol == NodeProtocol::VLess {
+            node.vless_mode = honk_config::node::WireMode::H2mux;
+        }
+        node
+    }
+
+    async fn assert_cold_session_warms_before_measurement(node: Node) {
+        let addr = spawn_mock_http_server().await;
+        let generation = Arc::new(
+            crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
+        );
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let warmable = RecordingWarmable {
+            calls: Arc::clone(&calls),
+            fail: false,
+        };
+
+        urltest_node_in_generation(
+            &generation,
+            &node,
+            &MockHandler,
+            Some(&warmable),
+            &format!("http://{addr}/"),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn cold_anytls_warms_before_measurement() {
+        assert_cold_session_warms_before_measurement(session_node("anytls", NodeProtocol::AnyTLS))
+            .await;
+    }
+
+    #[cfg(feature = "rprx")]
+    #[tokio::test]
+    async fn cold_vless_mux_warms_before_measurement() {
+        assert_cold_session_warms_before_measurement(session_node("vless", NodeProtocol::VLess))
+            .await;
+    }
+
+    #[cfg(feature = "rprx")]
+    #[tokio::test]
+    async fn cold_vless_mux_warm_failure_skips_measurement() {
+        let node = session_node("vless", NodeProtocol::VLess);
+        let generation = Arc::new(
+            crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
+        );
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let warmable = RecordingWarmable {
+            calls: Arc::clone(&calls),
+            fail: true,
+        };
+
+        let error = urltest_node_in_generation(
+            &generation,
+            &node,
+            &DelayedDialHandler {
+                delay: Duration::from_secs(10),
+            },
+            Some(&warmable),
+            "http://localhost/",
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("simulated warm failure"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     struct RecordingHandler {
