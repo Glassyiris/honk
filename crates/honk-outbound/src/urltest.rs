@@ -128,8 +128,8 @@ pub async fn urltest_node(
     )
     .await
 }
-/// Reuse an already-warm generation runtime. Cold session-owning nodes warm a
-/// throwaway runtime before measurement so a group scan retains no new pools.
+/// Reuse an already-warm generation runtime. Cold reusable transports warm a
+/// throwaway runtime before measurement so a group scan retains no new state.
 pub async fn urltest_node_in_generation(
     generation: &Arc<crate::runtime::OutboundRuntimeRegistry>,
     node: &Node,
@@ -154,12 +154,7 @@ pub async fn urltest_node_in_generation(
         }
     };
     let result = async {
-        if matches!(
-            runtime.runtime,
-            crate::runtime::ProtocolRuntime::AnyTls(_)
-                | crate::runtime::ProtocolRuntime::VlessMux(_)
-        ) && !runtime.is_warm_or_stateless()
-        {
+        if !runtime.is_warm_or_stateless() {
             warmable
                 .ok_or_else(|| anyhow!("no warm handler for node '{}'", node.name))?
                 .warm(
@@ -560,6 +555,24 @@ mod tests {
         ephemeral: Arc<std::sync::atomic::AtomicBool>,
     }
 
+    struct DelayedWarmable {
+        delay: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::proxy::WarmableOutbound for DelayedWarmable {
+        async fn warm(
+            &self,
+            _runtime: Arc<crate::runtime::NodeRuntime>,
+            _connect_timeout: Duration,
+            requirement: crate::proxy::WarmRequirement,
+        ) -> anyhow::Result<()> {
+            assert_eq!(requirement, crate::proxy::WarmRequirement::Session);
+            tokio::time::sleep(self.delay).await;
+            Ok(())
+        }
+    }
+
     #[async_trait::async_trait]
     impl crate::proxy::WarmableOutbound for RecordingWarmable {
         async fn warm(
@@ -580,7 +593,7 @@ mod tests {
         }
     }
 
-    fn session_node(name: &str, protocol: NodeProtocol) -> Node {
+    fn reusable_node(name: &str, protocol: NodeProtocol) -> Node {
         let mut node = make_node(name);
         node.protocol = protocol;
         if protocol == NodeProtocol::VLess {
@@ -589,7 +602,7 @@ mod tests {
         node
     }
 
-    async fn assert_cold_session_warms_before_measurement(node: Node) {
+    async fn assert_cold_reusable_transport_warms_before_measurement(node: Node) {
         let addr = spawn_mock_http_server().await;
         let generation = Arc::new(
             crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
@@ -619,21 +632,69 @@ mod tests {
 
     #[tokio::test]
     async fn cold_anytls_warms_before_measurement() {
-        assert_cold_session_warms_before_measurement(session_node("anytls", NodeProtocol::AnyTLS))
-            .await;
+        assert_cold_reusable_transport_warms_before_measurement(reusable_node(
+            "anytls",
+            NodeProtocol::AnyTLS,
+        ))
+        .await;
     }
 
     #[cfg(feature = "rprx")]
     #[tokio::test]
     async fn cold_vless_mux_warms_before_measurement() {
-        assert_cold_session_warms_before_measurement(session_node("vless", NodeProtocol::VLess))
-            .await;
+        assert_cold_reusable_transport_warms_before_measurement(reusable_node(
+            "vless",
+            NodeProtocol::VLess,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn cold_quic_protocols_warm_before_measurement() {
+        for (name, protocol) in [
+            ("hysteria2", NodeProtocol::Hysteria2),
+            ("tuic", NodeProtocol::Tuic),
+            ("juicity", NodeProtocol::Juicity),
+        ] {
+            assert_cold_reusable_transport_warms_before_measurement(reusable_node(name, protocol))
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_quic_warm_time_is_not_reported() {
+        let addr = spawn_mock_http_server().await;
+        for (name, protocol) in [
+            ("hysteria2", NodeProtocol::Hysteria2),
+            ("tuic", NodeProtocol::Tuic),
+            ("juicity", NodeProtocol::Juicity),
+        ] {
+            let node = reusable_node(name, protocol);
+            let generation = Arc::new(
+                crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node))
+                    .unwrap(),
+            );
+            let elapsed = urltest_node_in_generation(
+                &generation,
+                &node,
+                &MockHandler,
+                Some(&DelayedWarmable {
+                    delay: Duration::from_millis(100),
+                }),
+                &format!("http://{addr}/"),
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+
+            assert!(elapsed < Duration::from_millis(50), "{name}: {elapsed:?}");
+        }
     }
 
     #[cfg(feature = "rprx")]
     #[tokio::test]
     async fn cold_vless_mux_warm_failure_skips_measurement() {
-        let node = session_node("vless", NodeProtocol::VLess);
+        let node = reusable_node("vless", NodeProtocol::VLess);
         let generation = Arc::new(
             crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
         );
