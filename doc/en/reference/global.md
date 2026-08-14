@@ -18,7 +18,7 @@ Compatibility-only keys are accepted by the dae parser and stored in `GlobalConf
 | `lan_interface` | `lan_interface` | `[]` | Comma-separated LAN interfaces on which forwarded traffic is intercepted. Empty installs no LAN hooks. See [Interface semantics](#interface-semantics). |
 | `wan_interface` | `wan_interface` | `[]` | Comma-separated WAN interfaces whose hooks intercept host-originated TCP and UDP. The literal `auto` follows the lowest-metric IPv4 default route. |
 | `auto_config_kernel_parameter` | `auto_config_kernel_parameter` | `false` | Compatibility switch for automatic sysctl setup. The current runtime does not branch on this field; the real datapath applies its fixed best-effort sysctl setup. |
-| `data_dir` | `data_dir` | `"/var/share/honk"` | Absolute, non-empty root for generated state and relative runtime assets. Missing directories are created recursively at startup. A change requires restart. |
+| `data_dir` | `data_dir` | `"/var/share/honk"` | Absolute, non-empty root for generated state and relative runtime assets. Missing directories are created recursively at startup; creation failure falls back to the process working directory. A change requires restart. |
 | `store_subscribe` | `store_subscribe` | `true` | Persist each last valid subscription body under `data_dir/.sub` for startup and reload recovery. A change requires restart. |
 | `tcp_check_url` | `tcp_check_url` | `["https://www.gstatic.com/generate_204"]` | Comma-separated TCP/HTTP health-check URLs. The current health loop uses the first value; an empty list falls back to a plain TCP check. |
 | `tcp_check_http_method` | `tcp_check_http_method` | `"HEAD"` | HTTP method sent by the URL health check. An empty value is treated as `HEAD`. |
@@ -66,7 +66,7 @@ An empty `lan_interface` is literal: honk installs no LAN TC hooks and never sub
 
 ## Data directory and asset paths
 
-`data_dir` defaults to `/var/share/honk`, must be an absolute non-empty path, and is installed once for the process. If it does not exist, honk creates it recursively during startup; a creation failure aborts startup. Absolute child paths remain unchanged.
+`data_dir` defaults to `/var/share/honk`, must be an absolute non-empty path, and is installed once for the process. If it does not exist, honk creates it recursively during startup. On failure, honk logs a warning and installs the process working directory instead. Absolute child paths remain unchanged.
 
 `geoip.dat` and `geosite.dat` use the first existing file in this exact order:
 

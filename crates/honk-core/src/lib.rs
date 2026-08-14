@@ -399,10 +399,21 @@ fn validate_udp_nfqueue_runtime(enabled: bool, mock_ebpf: bool) -> anyhow::Resul
     Ok(())
 }
 
-fn ensure_runtime_data_dir(path: &std::path::Path) -> anyhow::Result<()> {
-    std::fs::create_dir_all(path).map_err(|error| {
-        anyhow::anyhow!("create runtime data directory {}: {error}", path.display())
-    })
+fn prepare_runtime_data_dir(
+    requested: &std::path::Path,
+) -> anyhow::Result<(PathBuf, Option<std::io::Error>)> {
+    match std::fs::create_dir_all(requested) {
+        Ok(()) => Ok((requested.to_path_buf(), None)),
+        Err(create_error) => {
+            let fallback = std::env::current_dir().map_err(|fallback_error| {
+                anyhow::anyhow!(
+                    "create runtime data directory {}: {create_error}; determine fallback working directory: {fallback_error}",
+                    requested.display()
+                )
+            })?;
+            Ok((fallback, Some(create_error)))
+        }
+    }
 }
 
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
@@ -412,16 +423,16 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let mut config = Config::from_file(cli.config.to_str().unwrap())?;
     config.validate()?;
     validate_udp_nfqueue_runtime(config.experimental.udp_nfqueue.enabled, cli.mock_ebpf)?;
-    honk_config::paths::set_data_dir(PathBuf::from(&config.global.data_dir)).map_err(
-        |requested| {
-            anyhow::anyhow!(
-                "runtime data directory is already {}; cannot switch to {}",
-                honk_config::paths::data_dir().display(),
-                requested.display()
-            )
-        },
-    )?;
-    ensure_runtime_data_dir(honk_config::paths::data_dir())?;
+    let requested_data_dir = PathBuf::from(&config.global.data_dir);
+    let (runtime_data_dir, data_dir_creation_error) =
+        prepare_runtime_data_dir(&requested_data_dir)?;
+    honk_config::paths::set_data_dir(runtime_data_dir).map_err(|requested| {
+        anyhow::anyhow!(
+            "runtime data directory is already {}; cannot switch to {}",
+            honk_config::paths::data_dir().display(),
+            requested.display()
+        )
+    })?;
     // Make `direct`/`block` usable as group members without declaring them
     // in the config (Direct/Block protocols → DirectHandler/BlockHandler).
     config.ensure_builtin_nodes();
@@ -483,6 +494,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     info!("honk-core v{} starting", env!("CARGO_PKG_VERSION"));
     info!("Config: {}", cli.config.display());
+    if let Some(error) = data_dir_creation_error {
+        warn!(
+            requested = %requested_data_dir.display(),
+            fallback = %honk_config::paths::data_dir().display(),
+            %error,
+            "Failed to create runtime data directory; using process working directory"
+        );
+    }
     info!(directory = %honk_config::paths::data_dir().display(), "Runtime data directory configured");
     if let Some(path) = log_file_path {
         info!(path = %path.display(), "File logging enabled");
@@ -1963,7 +1982,7 @@ fn is_mountpoint(path: &str) -> bool {
 #[cfg(test)]
 mod startup_lifecycle_tests {
     use super::{
-        ClashCommand, Cli, ensure_runtime_data_dir, publish_instance_pid, running_instance_pid,
+        ClashCommand, Cli, prepare_runtime_data_dir, publish_instance_pid, running_instance_pid,
         validate_udp_nfqueue_runtime,
     };
     use clap::Parser;
@@ -1994,9 +2013,28 @@ mod startup_lifecycle_tests {
         let data_dir = root.path().join("nested/data");
         assert!(!data_dir.exists());
 
-        ensure_runtime_data_dir(&data_dir).expect("create runtime data directory");
+        let (effective, error) =
+            prepare_runtime_data_dir(&data_dir).expect("prepare runtime data directory");
 
-        assert!(data_dir.is_dir());
+        assert_eq!(effective, data_dir);
+        assert!(error.is_none());
+        assert!(effective.is_dir());
+    }
+
+    #[test]
+    fn data_directory_creation_failure_uses_working_directory() {
+        let root = tempfile::tempdir().expect("create temporary directory");
+        let invalid = root.path().join("not-a-directory");
+        std::fs::write(&invalid, "file").expect("create blocking file");
+
+        let (effective, error) =
+            prepare_runtime_data_dir(&invalid).expect("prepare fallback data directory");
+
+        assert_eq!(
+            effective,
+            std::env::current_dir().expect("read working directory")
+        );
+        assert!(error.is_some());
     }
 
     #[test]
