@@ -410,4 +410,69 @@ impl PendingUdpVerdicts {
             self.empty.notify_waiters();
         }
     }
+
+    pub(in crate::control) fn is_empty(&self) -> bool {
+        self.cells.is_empty() && self.scheduled_cleanups.lock().is_empty()
+    }
+
+    pub(in crate::control) async fn wait_empty(&self) {
+        loop {
+            if self.is_empty() {
+                return;
+            }
+            let notified = self.empty.notified();
+            if self.is_empty() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub(in crate::control) async fn cancel_all(&self) {
+        self.admission.close_and_wait().await;
+        loop {
+            self.drain_scheduled_cleanups().await;
+            let mut pending = Vec::new();
+            let mut armed = Vec::new();
+            let mut terminal = Vec::new();
+            for entry in &self.cells {
+                let cell = Arc::clone(entry.value());
+                match &*cell.state.lock() {
+                    CellState::Pending { armed: true, .. } => armed.push(Arc::clone(&cell)),
+                    CellState::Pending { armed: false, .. } => pending.push(cell.identity),
+                    _ => terminal.push((cell.identity.key, Arc::clone(&cell))),
+                }
+            }
+            for identity in pending {
+                let _ = self.cancel(identity).await;
+            }
+            for (key, cell) in terminal {
+                self.remove_cell_now(key, &cell);
+            }
+            if armed.is_empty() {
+                break;
+            }
+            for cell in armed {
+                let notified = cell.changed.notified();
+                if matches!(&*cell.state.lock(), CellState::Pending { armed: true, .. }) {
+                    tokio::select! {
+                        _ = notified => {}
+                        _ = tokio::time::sleep(WATCHDOG_INTERVAL) => {
+                            self.fail_armed(&cell, cell.identity);
+                        }
+                    }
+                }
+            }
+        }
+        self.drain_scheduled_cleanups().await;
+        let leftovers: Vec<_> = self
+            .cells
+            .iter()
+            .map(|entry| (*entry.key(), Arc::clone(entry.value())))
+            .collect();
+        for (key, cell) in leftovers {
+            self.remove_cell_now(key, &cell);
+        }
+        self.notify_empty_if_needed();
+    }
 }
