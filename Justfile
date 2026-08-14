@@ -66,17 +66,13 @@ fmt:
 
 # ── Test ─────────────────────────────────────────────────
 
-# Run all tests (includes known-failing pre-existing tests — see AGENTS.md)
+# Run the full workspace suite.
 test:
     cargo test --all
 
-# CI-equivalent gate: full suite minus the known-failing pre-existing tests
-# (share_link TOML round-trip ×2, config_dae_routing ×1 — see AGENTS.md)
+# CI-equivalent gate: full suite minus the known pre-existing routing failure.
 test-ci:
-    cargo test --workspace --no-fail-fast -- \
-        --skip test_config_toml_round_trip \
-        --skip test_to_file_and_from_file_by_extension \
-        --skip test_routing_with_config_dae
+    cargo test --workspace --no-fail-fast -- --skip test_routing_with_config_dae
 
 # Run core + outbound tests
 test-core:
