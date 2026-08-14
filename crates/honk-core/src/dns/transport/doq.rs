@@ -90,18 +90,14 @@ impl DoqClient {
     }
 
     async fn dial(&self) -> anyhow::Result<Connection> {
-        tokio::time::timeout(
-            self.dial_timeout,
-            quic_connect_endpoint(
-                &self.quic_ep,
-                &self.quic_config,
-                &self.endpoint,
-                self.dial_timeout,
-                "DoQ",
-            ),
+        quic_connect_endpoint(
+            &self.quic_ep,
+            &self.quic_config,
+            &self.endpoint,
+            tokio::time::Instant::now() + self.dial_timeout,
+            "DoQ",
         )
         .await
-        .map_err(|_| anyhow::anyhow!("DoQ dial timed out after {:?}", self.dial_timeout))?
     }
 
     async fn close_connection(&self) {

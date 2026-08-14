@@ -1,5 +1,7 @@
-use crate::dns::endpoint::DnsEndpoint;
 use std::time::Duration;
+
+use super::dial::dial_candidates;
+use crate::dns::endpoint::DnsEndpoint;
 
 /// Shared QUIC client config for DNS transports (15s keep-alive, cubic).
 pub(super) async fn dns_quic_config(alpn: &[&[u8]]) -> anyhow::Result<quinn::ClientConfig> {
@@ -46,23 +48,21 @@ impl SharedQuicEndpoint {
     }
 }
 
-/// Connect `config` to `addr` through the shared endpoint, with a handshake
-/// timeout. `label` prefixes error messages (`DoQ` / `DoH3 QUIC`).
-pub(super) async fn quic_connect(
+/// Connect `config` to `addr` through the shared endpoint. `label` prefixes
+/// error messages (`DoQ` / `DoH3 QUIC`).
+async fn quic_connect(
     endpoint: &SharedQuicEndpoint,
     config: &quinn::ClientConfig,
     addr: std::net::SocketAddr,
     sni: &str,
-    timeout: Duration,
     label: &str,
 ) -> anyhow::Result<quinn::Connection> {
     let ep = endpoint.get(addr.is_ipv6()).await?;
     let connecting = ep
         .connect_with(config.clone(), addr, sni)
         .map_err(|e| anyhow::anyhow!("{label} connect_with: {e}"))?;
-    tokio::time::timeout(timeout, connecting)
+    connecting
         .await
-        .map_err(|_| anyhow::anyhow!("{label} handshake timed out"))?
         .map_err(|e| anyhow::anyhow!("{label} handshake: {e}"))
 }
 
@@ -70,24 +70,14 @@ pub(super) async fn quic_connect_endpoint(
     endpoint: &SharedQuicEndpoint,
     config: &quinn::ClientConfig,
     target: &DnsEndpoint,
-    timeout: Duration,
+    deadline: tokio::time::Instant,
     label: &str,
 ) -> anyhow::Result<quinn::Connection> {
-    let per_address = timeout.min(Duration::from_secs(3));
-    let mut last_error = None;
-    for address in target.resolve_addrs().await? {
-        match quic_connect(endpoint, config, address, &target.sni, per_address, label).await {
-            Ok(connection) => return Ok(connection),
-            Err(error) => {
-                tracing::debug!(
-                    %address,
-                    transport = label,
-                    error_kind = "handshake_failed",
-                    "DNS QUIC dial failed; trying next address"
-                );
-                last_error = Some(anyhow::anyhow!("{label} dial to {address}: {error}"));
-            }
-        }
-    }
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("{label} resolved to no addresses")))
+    let addresses = tokio::time::timeout_at(deadline, target.resolve_addrs())
+        .await
+        .map_err(|_| anyhow::anyhow!("{label} address resolution timed out"))??;
+    dial_candidates(addresses, deadline, label, |address, _| {
+        quic_connect(endpoint, config, address, &target.sni, label)
+    })
+    .await
 }

@@ -148,23 +148,20 @@ impl Doh3Client {
     }
 
     async fn handshake(&self) -> anyhow::Result<H3Session> {
-        let (conn, mut driver, sender) = tokio::time::timeout(self.dial_timeout, async {
-            let conn = quic_connect_endpoint(
-                &self.quic_ep,
-                &self.quic_config,
-                &self.endpoint,
-                self.dial_timeout,
-                "DoH3 QUIC",
-            )
-            .await?;
-            let quinn_conn = H3QuinnConnection::new(conn.clone());
-            let (driver, sender) = h3::client::new(quinn_conn)
-                .await
-                .map_err(|e| anyhow::anyhow!("DoH3 h3::client::new: {e}"))?;
-            Ok::<_, anyhow::Error>((conn, driver, sender))
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("DoH3 dial timed out after {:?}", self.dial_timeout))??;
+        let deadline = tokio::time::Instant::now() + self.dial_timeout;
+        let conn = quic_connect_endpoint(
+            &self.quic_ep,
+            &self.quic_config,
+            &self.endpoint,
+            deadline,
+            "DoH3 QUIC",
+        )
+        .await?;
+        let quinn_conn = H3QuinnConnection::new(conn.clone());
+        let (mut driver, sender) = tokio::time::timeout_at(deadline, h3::client::new(quinn_conn))
+            .await
+            .map_err(|_| anyhow::anyhow!("DoH3 dial timed out after {:?}", self.dial_timeout))?
+            .map_err(|e| anyhow::anyhow!("DoH3 h3::client::new: {e}"))?;
 
         let driver = OwnedTask::spawn(
             async move {

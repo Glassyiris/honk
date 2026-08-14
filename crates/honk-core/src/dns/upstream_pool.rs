@@ -160,10 +160,30 @@ mod entries {
         pub(super) pools: [Option<(SocketAddr, Arc<UdpPool>)>; 2],
     }
 
+    impl UdpState {
+        pub(super) fn current_pool(&self) -> Option<(SocketAddr, Arc<UdpPool>)> {
+            let current = self.current?;
+            let family = usize::from(current.is_ipv6());
+            self.pools[family]
+                .as_ref()
+                .filter(|(address, _)| *address == current)
+                .map(|(_, pool)| (current, Arc::clone(pool)))
+        }
+
+        pub(super) fn mark_current(&mut self, address: SocketAddr) {
+            let family = usize::from(address.is_ipv6());
+            if self.pools[family]
+                .as_ref()
+                .is_some_and(|(cached, _)| *cached == address)
+            {
+                self.current = Some(address);
+            }
+        }
+    }
+
     pub(super) struct UpstreamEntry {
         pub(super) protocol: honk_config::types::DnsProtocol,
         pub(super) endpoint: DnsEndpoint,
-        pub(super) address: String,
         pub(super) outbound: Option<String>,
         pub(super) transports:
             parking_lot::Mutex<HashMap<TransportKey, Arc<LifecycleSlot<PooledTransport>>>>,
@@ -196,7 +216,6 @@ mod entries {
                 UpstreamEntry {
                     protocol: upstream.protocol,
                     endpoint,
-                    address: upstream.address.clone(),
                     outbound: upstream.outbound.clone(),
                     transports: parking_lot::Mutex::new(HashMap::new()),
                     udp: parking_lot::Mutex::new(UdpState::default()),

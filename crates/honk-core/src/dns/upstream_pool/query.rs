@@ -5,6 +5,7 @@ use honk_config::types::DnsProtocol;
 use tracing::debug;
 
 use super::UpstreamPool;
+use super::admission::AdmissionPermit;
 use super::entries::UpstreamEntry;
 use crate::dns::forwarder::DnsUpstreamPool;
 fn udp_attempt_addresses(
@@ -24,7 +25,7 @@ fn udp_attempt_addresses(
 }
 
 impl UpstreamPool {
-    async fn udp_pool(
+    pub(super) async fn udp_pool(
         &self,
         entry: &UpstreamEntry,
         address: SocketAddr,
@@ -41,12 +42,12 @@ impl UpstreamPool {
             Arc::clone(&self.active_transport_tasks),
         )
         .await?;
-        let (pool, unused, replaced) = {
+        let (pool, unused) = {
             let mut state = entry.udp.lock();
             if let Some((cached_address, pool)) = state.pools[family].as_ref()
                 && *cached_address == address
             {
-                (Arc::clone(pool), Some(candidate), None)
+                (Arc::clone(pool), Some(candidate))
             } else {
                 if state
                     .current
@@ -54,62 +55,45 @@ impl UpstreamPool {
                 {
                     state.current = None;
                 }
-                let replaced = state.pools[family]
-                    .replace((address, Arc::clone(&candidate)))
-                    .map(|(_, pool)| pool);
-                (candidate, None, replaced)
+                let _ = state.pools[family].replace((address, Arc::clone(&candidate)));
+                (candidate, None)
             }
         };
-        for discarded in [unused, replaced].into_iter().flatten() {
-            discarded.close().await;
+        if let Some(unused) = unused {
+            unused.close().await;
         }
         Ok(pool)
     }
 
-    async fn query_udp(&self, entry: &UpstreamEntry, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let addresses = Self::resolve_udp_addrs(entry).await?;
-        let current = entry.udp.lock().current;
-        let [first, retry] = udp_attempt_addresses(&addresses, current)
-            .ok_or_else(|| anyhow::anyhow!("DNS upstream resolved to no addresses"))?;
-        let first_result = match self.udp_pool(entry, first).await {
-            Ok(pool) => pool.exchange(raw_query).await,
-            Err(error) => Err(error),
-        };
-        match first_result {
-            Ok(response) => {
-                entry.udp.lock().current = Some(first);
-                Ok(response)
-            }
-            Err(first_error) => {
-                debug!(
-                    address = %first,
-                    retry_address = %retry,
-                    error_kind = "exchange_failed",
-                    "UDP DNS query candidate failed; retrying"
-                );
-                let retry_result = match self.udp_pool(entry, retry).await {
-                    Ok(pool) => pool.exchange(raw_query).await,
-                    Err(error) => Err(error),
-                };
-                match retry_result {
-                    Ok(response) => {
-                        entry.udp.lock().current = Some(retry);
-                        Ok(response)
-                    }
-                    Err(error) => Err(anyhow::anyhow!(
-                        "UDP DNS failed via {retry}: {error} (first {first}: {first_error})"
-                    )),
-                }
-            }
-        }
+    async fn admit_query(&self) -> anyhow::Result<AdmissionPermit<'_>> {
+        let admission = self
+            .admission
+            .admit()
+            .ok_or_else(|| anyhow::anyhow!("DNS upstream pool is closed"))?;
+        #[cfg(test)]
+        self.pause_after_admission_for_test().await;
+        Ok(admission)
+    }
+
+    async fn exchange_direct_udp<'a>(
+        &'a self,
+        entry: &UpstreamEntry,
+        address: SocketAddr,
+        raw_query: &[u8],
+    ) -> anyhow::Result<(Vec<u8>, AdmissionPermit<'a>)> {
+        let admission = self.admit_query().await?;
+        let response = self
+            .udp_pool(entry, address)
+            .await?
+            .exchange(raw_query)
+            .await?;
+        entry.udp.lock().mark_current(address);
+        Ok((response, admission))
     }
 
     pub(super) async fn resolve_udp_addrs(
         entry: &UpstreamEntry,
     ) -> anyhow::Result<Vec<SocketAddr>> {
-        if let Ok(address) = entry.address.parse::<SocketAddr>() {
-            return Ok(vec![address]);
-        }
         entry.endpoint.resolve_addrs().await
     }
 
@@ -121,29 +105,36 @@ impl UpstreamPool {
             .ok_or_else(|| anyhow::anyhow!("DNS upstream resolved to no addresses"))
     }
 
-    async fn query_datagram(
+    async fn query_udp_via_proxy(
         &self,
         upstream_name: &str,
         entry: &UpstreamEntry,
-        proxy_node: Option<&honk_config::node::Node>,
+        node: &honk_config::node::Node,
         raw_query: &[u8],
     ) -> anyhow::Result<Vec<u8>> {
-        if let Some(node) = proxy_node {
-            let response = self
-                .get_transport(entry, Some(node))
-                .await?
-                .exchange(raw_query)
-                .await?;
-            debug!(
-                "DNS upstream '{}' (udp via proxy {}) returned {} bytes",
-                upstream_name,
-                node.name,
-                response.len()
-            );
-            return Ok(response);
-        }
+        let _admission = self.admit_query().await?;
+        let response = self
+            .get_transport(entry, Some(node))
+            .await?
+            .exchange(raw_query)
+            .await?;
+        debug!(
+            "DNS upstream '{}' (udp via proxy {}) returned {} bytes",
+            upstream_name,
+            node.name,
+            response.len()
+        );
+        Ok(response)
+    }
 
-        let response = self.query_udp(entry, raw_query).await?;
+    async fn finish_direct_udp_query(
+        &self,
+        upstream_name: &str,
+        entry: &UpstreamEntry,
+        raw_query: &[u8],
+        response: Vec<u8>,
+        _admission: AdmissionPermit<'_>,
+    ) -> anyhow::Result<Vec<u8>> {
         if response.len() >= 4 && response[2] & 0x02 != 0 {
             debug!(
                 "DNS upstream '{}' UDP answer has TC set — retrying over TCP",
@@ -162,6 +153,125 @@ impl UpstreamPool {
         );
         Ok(response)
     }
+
+    async fn query_datagram(
+        &self,
+        upstream_name: &str,
+        entry: &UpstreamEntry,
+        raw_query: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
+        let forced_route = entry.outbound.is_some();
+        if forced_route {
+            let proxy_node = self.resolve_dial_leaf(entry).await?;
+            debug!(
+                "DNS upstream '{}' dial leaf={:?} (forced=true)",
+                upstream_name,
+                proxy_node.as_ref().map(|node| node.name.as_str())
+            );
+            if let Some(node) = proxy_node.as_ref() {
+                return self
+                    .query_udp_via_proxy(upstream_name, entry, node, raw_query)
+                    .await;
+            }
+        }
+
+        let current = { entry.udp.lock().current_pool() };
+        let failed = if let Some((address, pool)) = current {
+            if !forced_route
+                && let Some(node) = self.resolve_dial_leaf_for_address(entry, address).await?
+            {
+                return self
+                    .query_udp_via_proxy(upstream_name, entry, &node, raw_query)
+                    .await;
+            }
+            let admission = self.admit_query().await?;
+            match pool.exchange(raw_query).await {
+                Ok(response) => {
+                    entry.udp.lock().mark_current(address);
+                    return self
+                        .finish_direct_udp_query(
+                            upstream_name,
+                            entry,
+                            raw_query,
+                            response,
+                            admission,
+                        )
+                        .await;
+                }
+                Err(error) => {
+                    drop(admission);
+                    Some((address, error))
+                }
+            }
+        } else {
+            None
+        };
+
+        let addresses = Self::resolve_udp_addrs(entry).await?;
+        let (first, first_error, retry) = if let Some((failed_address, first_error)) = failed {
+            let [first, retry] = udp_attempt_addresses(&addresses, Some(failed_address))
+                .ok_or_else(|| anyhow::anyhow!("DNS upstream resolved to no addresses"))?;
+            let retry = if first == failed_address {
+                retry
+            } else {
+                first
+            };
+            (failed_address, first_error, retry)
+        } else {
+            let [first, retry] = udp_attempt_addresses(&addresses, None)
+                .ok_or_else(|| anyhow::anyhow!("DNS upstream resolved to no addresses"))?;
+            if !forced_route
+                && let Some(node) = self.resolve_dial_leaf_for_address(entry, first).await?
+            {
+                return self
+                    .query_udp_via_proxy(upstream_name, entry, &node, raw_query)
+                    .await;
+            }
+            match self.exchange_direct_udp(entry, first, raw_query).await {
+                Ok((response, admission)) => {
+                    return self
+                        .finish_direct_udp_query(
+                            upstream_name,
+                            entry,
+                            raw_query,
+                            response,
+                            admission,
+                        )
+                        .await;
+                }
+                Err(first_error) => (first, first_error, retry),
+            }
+        };
+
+        debug!(
+            address = %first,
+            retry_address = %retry,
+            error_kind = "exchange_failed",
+            "UDP DNS query candidate failed; retrying"
+        );
+        if !forced_route
+            && retry != first
+            && let Some(node) = self.resolve_dial_leaf_for_address(entry, retry).await?
+        {
+            return self
+                .query_udp_via_proxy(upstream_name, entry, &node, raw_query)
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "UDP DNS failed via {retry}: {error} (first {first}: {first_error})"
+                    )
+                });
+        }
+        match self.exchange_direct_udp(entry, retry, raw_query).await {
+            Ok((response, admission)) => {
+                self.finish_direct_udp_query(upstream_name, entry, raw_query, response, admission)
+                    .await
+            }
+            Err(error) => Err(anyhow::anyhow!(
+                "UDP DNS failed via {retry}: {error} (first {first}: {first_error})"
+            )),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -176,28 +286,20 @@ impl DnsUpstreamPool for UpstreamPool {
             .entries
             .get(upstream_name)
             .ok_or_else(|| anyhow::anyhow!("unknown upstream: {upstream_name}"))?;
+        if entry.protocol == DnsProtocol::Udp {
+            return self.query_datagram(upstream_name, entry, raw_query).await;
+        }
         let proxy_node = self
             .resolve_dial_leaf(entry)
             .await
             .map_err(|error| anyhow::anyhow!("DNS upstream '{upstream_name}': {error}"))?;
-        let _admission = self
-            .admission
-            .admit()
-            .ok_or_else(|| anyhow::anyhow!("DNS upstream pool is closed"))?;
-        #[cfg(test)]
-        self.pause_after_admission_for_test().await;
+        let _admission = self.admit_query().await?;
         debug!(
             "DNS upstream '{}' dial leaf={:?} (forced={})",
             upstream_name,
             proxy_node.as_ref().map(|node| node.name.as_str()),
             entry.outbound.is_some()
         );
-
-        if entry.protocol == DnsProtocol::Udp {
-            return self
-                .query_datagram(upstream_name, entry, proxy_node.as_ref(), raw_query)
-                .await;
-        }
         if matches!(entry.protocol, DnsProtocol::Quic | DnsProtocol::H3) && proxy_node.is_some() {
             anyhow::bail!(
                 "DNS upstream '{}' protocol {:?} does not support outbound proxy yet",
