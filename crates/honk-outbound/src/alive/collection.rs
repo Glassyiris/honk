@@ -38,14 +38,36 @@ pub(crate) enum TrafficVerdict {
     Fast,
     Slow,
 }
+#[derive(Default)]
+struct FailureState {
+    strikes: u8,
+    clear_progress: u8,
+    dial_fail_streak: u8,
+}
+
+impl FailureState {
+    fn record_strike(&mut self) {
+        self.strikes = self.strikes.saturating_add(1).min(FAILURE_STRIKES_MAX);
+        self.clear_progress = 0;
+    }
+
+    fn record_probe_success(&mut self) {
+        if self.strikes == 0 {
+            return;
+        }
+        self.clear_progress = self.clear_progress.saturating_add(1);
+        if self.clear_progress >= self.strikes.max(STRIKE_CLEAR_SUCCESSES) {
+            self.strikes = 0;
+            self.clear_progress = 0;
+        }
+    }
+}
 
 pub(crate) struct DialerCollection {
     pub latencies: SyncLatencies10,
     pub moving_average: Mutex<Duration>,
     pub alive: AtomicBool,
-    failure_strikes: AtomicU8,
-    strike_clear_progress: AtomicU8,
-    dial_fail_streak: AtomicU8,
+    failure_state: Mutex<FailureState>,
     traffic_ema_nanos: AtomicU64,
     traffic_samples: AtomicU8,
     slow_dial_streak: AtomicU8,
@@ -57,9 +79,7 @@ impl DialerCollection {
             latencies: SyncLatencies10::new(10),
             moving_average: Mutex::new(Duration::ZERO),
             alive: AtomicBool::new(true),
-            failure_strikes: AtomicU8::new(0),
-            strike_clear_progress: AtomicU8::new(0),
-            dial_fail_streak: AtomicU8::new(0),
+            failure_state: Mutex::new(FailureState::default()),
             traffic_ema_nanos: AtomicU64::new(0),
             traffic_samples: AtomicU8::new(0),
             slow_dial_streak: AtomicU8::new(0),
@@ -76,62 +96,58 @@ impl DialerCollection {
     }
 
     pub(crate) fn mark_available(&self, latency: Duration) {
+        let mut failure = self.failure_state.lock();
         self.latencies.append(LatencySample::real(latency));
         self.update_moving_average(latency);
         self.alive.store(true, Ordering::Release);
         // Demotion clears only after max(strikes, STRIKE_CLEAR_SUCCESSES)
         // consecutive real successes — a fast-but-flaky node cannot reclaim
         // rank with one lucky probe.
-        let strikes = self.failure_strikes.load(Ordering::Relaxed);
-        if strikes > 0 {
-            let progress = self.strike_clear_progress.fetch_add(1, Ordering::Relaxed) + 1;
-            if progress >= strikes.max(STRIKE_CLEAR_SUCCESSES) {
-                self.failure_strikes.store(0, Ordering::Relaxed);
-                self.strike_clear_progress.store(0, Ordering::Relaxed);
-            }
-        }
+        failure.record_probe_success();
     }
 
-    /// Record a real dial failure for ranking. Periodic probe failures use
-    /// [`Self::mark_probe_unavailable`] instead and never create strikes or
-    /// synthetic latency samples.
-    pub(crate) fn mark_unavailable(&self) {
+    fn mark_unavailable_locked(&self, failure: &mut FailureState) {
+        failure.record_strike();
         // The synthetic sample is display-excluded and never feeds the moving
         // average; the failure strike owns ranking demotion.
         self.latencies
             .append(LatencySample::synthetic(TIMEOUT_LATENCY));
         self.alive.store(false, Ordering::Release);
-        let strikes = self.failure_strikes.load(Ordering::Relaxed);
-        self.failure_strikes
-            .store((strikes + 1).min(FAILURE_STRIKES_MAX), Ordering::Relaxed);
-        self.strike_clear_progress.store(0, Ordering::Relaxed);
+    }
+
+    pub(crate) fn mark_unavailable(&self) {
+        let mut failure = self.failure_state.lock();
+        self.mark_unavailable_locked(&mut failure);
     }
 
     /// Record probe unavailability without creating a ranking strike. Probe
     /// liveness counters own exclusion; dial failures alone own demotion.
     pub(crate) fn mark_probe_unavailable(&self) {
+        let mut failure = self.failure_state.lock();
         self.alive.store(false, Ordering::Release);
-        self.strike_clear_progress.store(0, Ordering::Relaxed);
+        failure.clear_progress = 0;
     }
 
-    /// One more consecutive dial failure; returns the new streak length.
-    pub(crate) fn bump_dial_fail_streak(&self) -> u8 {
-        let streak = self.dial_fail_streak.load(Ordering::Relaxed);
-        let streak = streak.saturating_add(1);
-        self.dial_fail_streak.store(streak, Ordering::Relaxed);
-        streak
+    /// Record one real dial failure. The streak threshold, strike, and
+    /// unavailable publication share one order with real-success resets.
+    pub(crate) fn record_dial_failure(&self) {
+        let mut failure = self.failure_state.lock();
+        failure.dial_fail_streak = failure.dial_fail_streak.saturating_add(1);
+        if failure.dial_fail_streak >= DIAL_FAILURE_STRIKE_AT {
+            self.mark_unavailable_locked(&mut failure);
+        }
     }
 
     /// A real dial success breaks the failure streak (probe successes do
     /// not — a probe-alive but dial-dead node must still accumulate).
     pub(crate) fn reset_dial_fail_streak(&self) {
-        self.dial_fail_streak.store(0, Ordering::Relaxed);
+        self.failure_state.lock().dial_fail_streak = 0;
     }
 
     /// Failure-demoted nodes rank below every non-demoted candidate until
     /// enough consecutive real successes clear the strikes.
     pub(crate) fn is_failure_demoted(&self) -> bool {
-        self.failure_strikes.load(Ordering::Relaxed) > 0
+        self.failure_state.lock().strikes > 0
     }
 
     /// Judge one real dial against the node's own traffic EMA, then fold it

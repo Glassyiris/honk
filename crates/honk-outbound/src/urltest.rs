@@ -5,8 +5,8 @@
 //! server negotiates h2 via ALPN (dispatched per connection — the probe
 //! offers `h2,http/1.1` and speaks whichever the server picks, Go-client
 //! style). Successful measurements feed the node's latency history in
-//! [`AliveDialerSet`]; failed ones clear it (sing-box "delete history"
-//! semantics), so a failed node immediately sorts last in URLTest selection.
+//! [`AliveDialerSet`]. A lone failure leaves history unchanged; a second
+//! consecutive failure adds a synthetic penalty and demotes the node.
 //!
 //! Used by the clash API delay endpoints; the periodic health check loop in
 //! `alive` is unaffected by these ad-hoc measurements.
@@ -331,8 +331,8 @@ where
 
 /// Measure every member of a group concurrently (at most
 /// [`URLTEST_MAX_CONCURRENT`] at a time) and fold the results into the
-/// alive set: successes record the measured TCP latency, failures clear
-/// the node's latency history (sing-box deletes history on failure).
+/// alive set: successes record the measured TCP latency; only a second
+/// consecutive failure adds a synthetic penalty and demotes the node.
 ///
 /// Returns one `(node_name, result)` entry per member, in member order.
 pub async fn urltest_group(
