@@ -273,49 +273,9 @@ fn connection_chains(mut selection_chain: Vec<String>, node_name: &str) -> Vec<S
     selection_chain
 }
 
-pub(super) struct ConnectionGuard {
-    drain: Arc<DrainTracker>,
-}
+mod context;
 
-impl ConnectionGuard {
-    pub(super) fn new(drain: Arc<DrainTracker>) -> Self {
-        drain.increment();
-        Self { drain }
-    }
-}
-
-impl Drop for ConnectionGuard {
-    fn drop(&mut self) {
-        self.drain.decrement();
-    }
-}
-
-/// Shared context bundle passed to every connection handler.
-/// Bundles all shared fields under a single `Arc` to eliminate
-/// per-field atomic reference-count overhead on the hot path.
-#[derive(Clone)]
-pub(super) struct ControlPlaneHandle {
-    pub(super) config: Arc<RwLock<Config>>,
-    pub(super) router: Arc<RwLock<Router>>,
-    pub(super) proxy_registry: Arc<ProxyRegistry>,
-    pub(super) runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
-    pub(super) dns_resolver: Arc<DnsResolver>,
-    pub(super) group_manager: SharedGroupManager,
-    pub(super) stats: Arc<StatsManager>,
-    pub(super) ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
-    pub(super) udp_pool: Arc<UdpEndpointPool>,
-    #[cfg(feature = "ebpf")]
-    pub(super) pending_udp_verdicts: Option<Arc<crate::control::nfqueue::PendingUdpVerdicts>>,
-    pub(super) tcp_sniff_neg_cache: Arc<crate::control::tcp_sniff::TcpSniffNegCache>,
-    pub(super) sniffer_pool: Arc<crate::control::packet_sniffer::PacketSnifferPool>,
-    pub(super) dns_controller: Arc<crate::control::dns_control::DnsController>,
-    pub(super) alive_set: Arc<AliveDialerSet>,
-    pub(super) connection_pool: Arc<ConnectionPool>,
-    pub(super) connection_tracker: Arc<ConnectionTracker>,
-    pub(super) tcp_flow_pins: Arc<TcpFlowPins>,
-    /// Shared clash mode state (None when the clash API is disabled).
-    pub(super) mode_state: Option<crate::mode::SharedModeState>,
-}
+pub(super) use context::{ConnectionGuard, ControlPlaneHandle};
 
 mod flow;
 
