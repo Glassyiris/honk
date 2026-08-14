@@ -24,6 +24,8 @@ pub(super) use context::{ConnectionGuard, ControlPlaneHandle};
 
 mod tcp;
 
+mod udp;
+
 mod flow;
 
 #[cfg(test)]
