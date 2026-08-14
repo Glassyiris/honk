@@ -220,7 +220,7 @@ Module map:
 
 CLI (`honk-core` binary):
 
-- Flags: `--config/-c` (default `/etc/honk/config.dae`), `--bpf-object/-b`, `--bpf-pin-root` (default `/sys/fs/bpf`), `--debug/-d`, `--mock-ebpf`. Log-level order: a valid `RUST_LOG` wins (`EnvFilter::try_from_default_env`), else `--debug` → `debug`, else `global.log_level`, else `info`.
+- Flags: `--config/-c` (default `/etc/honk/config.dae`), `--log-file` (process-local override of `global.log_file`), `--bpf-object/-b`, `--bpf-pin-root` (default `/sys/fs/bpf`), `--debug/-d`, `--mock-ebpf`. Log-level order: a valid `RUST_LOG` wins (`EnvFilter::try_from_default_env`), else `--debug` → `debug`, else `global.log_level`, else `info`.
 - Subcommands: `reload` sends SIGHUP to the real-datapath PID published in `/run/honk-core.lock`; `mode <rule|global|direct>` rewrites `global.dial_mode` in the config file; `proxy <group> <node>` validates existence and prints but persists nothing; `delay <node> [--url HOST:PORT]` performs raw TCP timing rather than a proxied urltest. The latter three are local-only and do not talk to the running engine.
 
 Benchmarks kept on `main`: `benches/dns.rs` (criterion, `harness = false`) covers DNS endpoint parse, cache get/put + 90/10 mix, per-query routing match, framing, forwarder cache-hit, and TcpPool/UpstreamPool exchange; run `cargo bench -p honk-core --features dns-bench --bench dns`. `benches/udp.rs` is the candidate-only UDP Criterion suite; run `cargo bench -p honk-core --bench udp -- --save-baseline udp-candidate`. Lab/deployment harnesses, raw evidence, and their documentation live only on branch `bench`; use `git worktree add ../honk-bench bench` when benchmarking so they never enter the `main` worktree.

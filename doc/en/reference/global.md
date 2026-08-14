@@ -13,6 +13,7 @@ Compatibility-only keys are accepted by the dae parser and stored in `GlobalConf
 | `pprof_port` | `pprof_port` | `0` | Compatibility pprof HTTP port; `0` means disabled. honk currently starts no pprof server and does not read this field. |
 | `so_mark_from_dae` | `so_mark_from_dae` | `0` | Compatibility socket-mark value. Validation rejects overlap with datapath-reserved mark bits, but the current runtime does not apply it to sockets. |
 | `log_level` | `log_level` | `"info"` | Startup log filter. `--debug` takes precedence, followed by `RUST_LOG`, then this value. A SIGHUP change is restart-required. |
+| `log_file` | `log_file` | `""` | Optional append-only log path. Empty disables file output; a relative path resolves below `data_dir`. Console logging remains enabled, and a SIGHUP change requires restart. |
 | `disable_waiting_network` | `disable_waiting_network` | `false` | Compatibility key; the current startup path does not read it. Unresolved `auto` interfaces already remain pending without blocking startup. |
 | `lan_interface` | `lan_interface` | `[]` | Comma-separated LAN interfaces on which forwarded traffic is intercepted. Empty installs no LAN hooks. See [Interface semantics](#interface-semantics). |
 | `wan_interface` | `wan_interface` | `[]` | Comma-separated WAN interfaces whose hooks intercept host-originated TCP and UDP. The literal `auto` follows the lowest-metric IPv4 default route. |
@@ -79,6 +80,7 @@ Other relative runtime paths preserve legacy installations as follows:
 | Path | Resolution and legacy fallback |
 | ---- | ------------------------------ |
 | Node `ech_config_path` | Prefer an existing `<data_dir>/<path>`, then an existing working-directory-relative path. If neither exists, resolve to `<data_dir>/<path>` so the read error names the intended location. |
+| `global.log_file` | Relative paths resolve to `<data_dir>/<path>`; parent directories are created at startup. Absolute paths remain explicit. honk appends without rotation; use the platform log-rotation facility when needed. |
 | `experimental.cache_file.path` | Prefer an existing `<data_dir>/<path>`, then an existing path relative to the original configuration directory. New databases are created below `data_dir`. |
 | `experimental.clash_api.external_ui` | Prefer an existing `<data_dir>/<path>`, then an existing working-directory-relative directory. If neither exists, use `<data_dir>/<path>` for the dashboard download. |
 | Subscription store | Use `<data_dir>/.sub`; retain an existing legacy `./.sub` until it is moved. |
@@ -97,6 +99,7 @@ Other relative runtime paths preserve legacy installations as follows:
 global {
     tproxy_port: 12345
     log_level: info
+    log_file: 'honk.log'
     data_dir: '/var/share/honk'
     store_subscribe: true
 

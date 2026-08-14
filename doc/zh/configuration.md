@@ -42,7 +42,7 @@ include {
 
 ## 运行时数据目录
 
-`global.data_dir` 是运行时状态与相对运行时资源的进程级根目录。默认值为 `/var/share/honk`，必须是非空绝对路径，修改后需重启。相对的 `experimental.cache_file.path`、`experimental.clash_api.external_ui`、`.sub` 订阅存储、`geoip.dat`、`geosite.dat` 与节点 `ech_config_path` 均在其下解析；绝对子路径保持原样。若首选的数据目录副本不存在，honk 会继续使用入口配置旁已有的旧缓存、已有 `./.sub`、或工作目录中已有的 UI/ECH 路径，直至手动迁移。Geo 查找首先使用已存在的 `$DAE_LOCATION_ASSET/<file>`，随后检查 `data_dir`、工作目录与 dae 标准资源目录。
+`global.data_dir` 是运行时状态与相对运行时资源的进程级根目录。默认值为 `/var/share/honk`，必须是非空绝对路径，修改后需重启。相对的 `global.log_file`、`experimental.cache_file.path`、`experimental.clash_api.external_ui`、`.sub` 订阅存储、`geoip.dat`、`geosite.dat` 与节点 `ech_config_path` 均在其下解析；绝对子路径保持原样。若首选的数据目录副本不存在，honk 会继续使用入口配置旁已有的旧缓存、已有 `./.sub`、或工作目录中已有的 UI/ECH 路径，直至手动迁移。Geo 查找首先使用已存在的 `$DAE_LOCATION_ASSET/<file>`，随后检查 `data_dir`、工作目录与 dae 标准资源目录。
 
 详见 [Global 参考](./reference/global.md)。
 
@@ -59,6 +59,8 @@ global {
     lan_interface: eth0
     # 输出常规运行日志。
     log_level: info
+    # 同时追加写入 <data_dir>/honk.log。
+    log_file: 'honk.log'
     # 嗅探域名并校验目的 IP。
     dial_mode: domain
     # 应用推荐的网关 sysctl。
@@ -117,6 +119,7 @@ global {
     wan_interface: auto
     lan_interface: br-lan
     log_level: info
+    log_file: 'honk.log'
     dial_mode: domain++
     auto_config_kernel_parameter: true
     data_dir: '/var/share/honk'

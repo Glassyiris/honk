@@ -688,6 +688,9 @@ fn restart_required_changes(current: &Config, candidate: &Config) -> Vec<&'stati
     if old_global.log_level != new_global.log_level {
         changed.push("global.log_level");
     }
+    if old_global.log_file != new_global.log_file {
+        changed.push("global.log_file");
+    }
     if old_global.lan_interface != new_global.lan_interface {
         changed.push("global.lan_interface");
     }
@@ -1762,6 +1765,18 @@ mod atomic_reload_tests {
         assert_eq!(
             restart_required_changes(&current, &replacement),
             vec!["global.data_dir"]
+        );
+    }
+
+    #[test]
+    fn log_file_change_requires_restart() {
+        let current = Config::default();
+        let mut replacement = current.clone();
+        replacement.global.log_file = "/var/log/honk/honk.log".into();
+
+        assert_eq!(
+            restart_required_changes(&current, &replacement),
+            vec!["global.log_file"]
         );
     }
 

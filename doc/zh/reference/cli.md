@@ -15,6 +15,7 @@ honk-core [OPTIONS] [COMMAND]
 | 参数 | 默认值 | 作用 |
 | --- | --- | --- |
 | `-c`, `--config PATH` | `/etc/honk/config.dae` | 配置入口文件。`mode`、`proxy` 和 `delay` 也读取此路径。`reload` 忽略此项，仅向运行中实例发送信号；运行实例重载其启动时使用的路径。 |
+| `--log-file PATH` | 未设置 | 仅为本次引擎进程覆盖 `global.log_file`，不重写配置文件。相对路径在 `global.data_dir` 下解析，控制台日志保持启用。 |
 | `-b`, `--bpf-object PATH` | 内嵌目标文件 | 覆盖 `ebpf` 构建内嵌的目标文件。仅真实后端使用。 |
 | `--bpf-pin-root PATH` | `/sys/fs/bpf` | eBPF map 的 pin 根目录。 |
 | `-d`, `--debug` | 关 | 当 `RUST_LOG` 未提供有效 filter 时，选择 `debug` 作为默认控制台 filter。 |

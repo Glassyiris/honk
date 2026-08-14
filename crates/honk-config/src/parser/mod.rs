@@ -748,6 +748,9 @@ fn parse_global_section(section: &Section) -> Result<GlobalConfig, crate::Config
     if let Some(v) = kv.get("log_level") {
         cfg.log_level = v.clone();
     }
+    if let Some(v) = kv.get("log_file") {
+        cfg.log_file = v.clone();
+    }
     if let Some(v) = kv.get("disable_waiting_network") {
         cfg.disable_waiting_network = parse_bool(v);
     }

@@ -176,6 +176,10 @@ pub struct Cli {
     #[arg(short, long, default_value = "/etc/honk/config.dae")]
     pub config: PathBuf,
 
+    /// Append operational logs to this path, overriding `global.log_file`
+    #[arg(long, value_name = "PATH")]
+    pub log_file: Option<PathBuf>,
+
     /// Path to an external eBPF object file (for real eBPF backend).
     /// If omitted, the built-in object file is used.
     #[arg(short = 'b', long)]
@@ -428,14 +432,44 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level));
 
-    // The console and Clash API have independent per-layer filters. With no
-    // `/logs` subscription, the API layer contributes no callsite interest.
+    let log_file_path = cli
+        .log_file
+        .as_deref()
+        .map(honk_config::paths::resolve_artifact_path)
+        .or_else(|| match config.global.log_file.trim() {
+            "" => None,
+            path => Some(honk_config::paths::resolve_artifact_path(path)),
+        });
+    let log_file_layer = if let Some(path) = log_file_path.as_ref() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                anyhow::anyhow!("create log directory {}: {error}", parent.display())
+            })?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|error| anyhow::anyhow!("open log file {}: {error}", path.display()))?;
+        Some(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file))
+                .with_filter(env_filter.clone()),
+        )
+    } else {
+        None
+    };
+
+    // Console, optional file, and Clash API output use independent layers.
+    // With no `/logs` subscription, the API layer contributes no callsite interest.
     #[cfg(feature = "clash-api")]
     let (clash_log_layer, clash_log_handle) = clash_api::logs::layer();
 
     use tracing_subscriber::prelude::*;
     let registry = tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_filter(env_filter));
+        .with(tracing_subscriber::fmt::layer().with_filter(env_filter))
+        .with(log_file_layer);
     #[cfg(feature = "clash-api")]
     let registry = registry.with(clash_log_layer);
     registry.init();
@@ -443,6 +477,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     info!("honk-core v{} starting", env!("CARGO_PKG_VERSION"));
     info!("Config: {}", cli.config.display());
     info!(directory = %honk_config::paths::data_dir().display(), "Runtime data directory configured");
+    if let Some(path) = log_file_path {
+        info!(path = %path.display(), "File logging enabled");
+    }
 
     let effective_nofile = match raise_nofile_rlimit() {
         Ok(limit) => limit,
@@ -1940,6 +1977,17 @@ mod startup_lifecycle_tests {
         assert_eq!(
             honk_config::routing::DATAPATH_RESERVED_MARK_MASK,
             honk_ebpf_common::SKB_MARK_RESERVED_MASK,
+        );
+    }
+
+    #[test]
+    fn log_file_option_parses() {
+        let cli =
+            Cli::try_parse_from(["honk-core", "--log-file", "/var/log/honk/cli.log", "reload"])
+                .expect("parse log file option");
+        assert_eq!(
+            cli.log_file.as_deref(),
+            Some(std::path::Path::new("/var/log/honk/cli.log"))
         );
     }
 

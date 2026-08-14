@@ -25,12 +25,14 @@ mod parser_tests {
 global {
     tproxy_port: 12345
     log_level: info
+    log_file: '/var/log/honk/honk.log'
     dial_mode: domain
 }
 "#;
         let config = parse_dae_config(input).unwrap();
         assert_eq!(config.global.tproxy_port, 12345);
         assert_eq!(config.global.log_level, "info");
+        assert_eq!(config.global.log_file, "/var/log/honk/honk.log");
         assert_eq!(config.global.dial_mode, "domain");
     }
 

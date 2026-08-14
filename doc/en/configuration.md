@@ -42,7 +42,7 @@ The entry file's own sections merge first regardless of where its `include` bloc
 
 ## Runtime data directory
 
-`global.data_dir` is the process-wide root for runtime state and relative runtime-supplied files. It defaults to `/var/share/honk`, must be a non-empty absolute path, and is restart-required. Relative `experimental.cache_file.path`, `experimental.clash_api.external_ui`, the `.sub` subscription store, `geoip.dat`, `geosite.dat`, and node `ech_config_path` resolve under it; absolute child paths stay literal. If the preferred data-directory copy is absent, honk retains an existing legacy cache beside the entry config, an existing `./.sub` store, or an existing working-directory UI/ECH path until it is moved. Geo lookup gives an existing `$DAE_LOCATION_ASSET/<file>` first priority, then checks `data_dir`, the working directory, and dae's standard asset directories.
+`global.data_dir` is the process-wide root for runtime state and relative runtime-supplied files. It defaults to `/var/share/honk`, must be a non-empty absolute path, and is restart-required. Relative `global.log_file`, `experimental.cache_file.path`, `experimental.clash_api.external_ui`, the `.sub` subscription store, `geoip.dat`, `geosite.dat`, and node `ech_config_path` resolve under it; absolute child paths stay literal. If the preferred data-directory copy is absent, honk retains an existing legacy cache beside the entry config, an existing `./.sub` store, or an existing working-directory UI/ECH path until it is moved. Geo lookup gives an existing `$DAE_LOCATION_ASSET/<file>` first priority, then checks `data_dir`, the working directory, and dae's standard asset directories.
 
 See the [global reference](./reference/global.md).
 
@@ -59,6 +59,8 @@ global {
     lan_interface: eth0
     # Emit normal operational logs.
     log_level: info
+    # Also append logs to <data_dir>/honk.log.
+    log_file: 'honk.log'
     # Sniff domains and verify their destination IP.
     dial_mode: domain
     # Apply the recommended gateway sysctls.
@@ -117,6 +119,7 @@ global {
     wan_interface: auto
     lan_interface: br-lan
     log_level: info
+    log_file: 'honk.log'
     dial_mode: domain++
     auto_config_kernel_parameter: true
     data_dir: '/var/share/honk'
