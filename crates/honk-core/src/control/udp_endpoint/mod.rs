@@ -33,20 +33,11 @@ pub(in crate::control) use admission::{EndpointReservation, QueuedDatagram, UdpI
 
 const DEFAULT_NAT_TIMEOUT: Duration = Duration::from_secs(30);
 const JANITOR_INTERVAL: Duration = Duration::from_secs(5);
-/// How long the endpoint driver waits for proxy data before giving up.
-const REPLY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Hard cap on pooled endpoints. A unique-tuple UDP flood must not be able
 /// to grow the pool (and with it sockets, reply tasks and memory) without
 /// bound — at the cap new mappings are refused and the datagram is dropped,
 /// which UDP tolerates by design.
 pub(crate) const MAX_ENDPOINTS: usize = 8192;
-const TRANSPORT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
-const TRAFFIC_ALIVE_REPORT_INTERVAL: Duration = Duration::from_millis(200);
-const DRIVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(6);
-const DRIVER_ABORT_TIMEOUT: Duration = Duration::from_secs(1);
-/// Includes the eagerly-created original-destination socket. Reaching the
-/// bound fails the endpoint closed rather than replying from the wrong source.
-const MAX_REPLY_SOCKETS_PER_ENDPOINT: usize = 8;
 /// A pooled UDP endpoint representing one NAT mapping.
 pub struct UdpEndpoint {
     /// The proxy-side framed UDP transport (upstream).
@@ -267,72 +258,6 @@ struct SystemUdpReplySocketFactory;
 impl UdpReplySocketFactory for SystemUdpReplySocketFactory {
     fn create(&self, source: SocketAddr) -> io::Result<UdpSocket> {
         super::new_udp_reply_socket(source)
-    }
-}
-
-struct TaskRegistry {
-    closed: bool,
-    tasks: tokio::task::JoinSet<()>,
-}
-
-impl Default for TaskRegistry {
-    fn default() -> Self {
-        Self {
-            closed: false,
-            tasks: tokio::task::JoinSet::new(),
-        }
-    }
-}
-
-async fn drain_registered_tasks(tasks: &mut tokio::task::JoinSet<()>, label: &str) -> bool {
-    let mut clean = true;
-    while let Some(result) = tasks.join_next().await {
-        if let Err(error) = result
-            && !error.is_cancelled()
-        {
-            clean = false;
-            debug!("UDP {} task join failed during shutdown: {}", label, error);
-        }
-    }
-    clean
-}
-
-async fn join_registered_tasks(
-    mut tasks: tokio::task::JoinSet<()>,
-    label: &str,
-    graceful_timeout: Duration,
-    abort_first: bool,
-) -> bool {
-    if abort_first {
-        tasks.abort_all();
-    }
-    match tokio::time::timeout(
-        if abort_first {
-            DRIVER_ABORT_TIMEOUT
-        } else {
-            graceful_timeout
-        },
-        drain_registered_tasks(&mut tasks, label),
-    )
-    .await
-    {
-        Ok(clean) => clean,
-        Err(_) => {
-            debug!(
-                "Forcing cancellation of UDP {} tasks during shutdown",
-                label
-            );
-            tasks.abort_all();
-            tokio::time::timeout(
-                DRIVER_ABORT_TIMEOUT,
-                drain_registered_tasks(&mut tasks, label),
-            )
-            .await
-            .unwrap_or_else(|_| {
-                debug!("Timed out joining aborted UDP {} tasks", label);
-                false
-            })
-        }
     }
 }
 
@@ -748,9 +673,15 @@ impl Default for UdpEndpointPool {
 
 mod driver;
 
+use driver::{
+    DRIVER_ABORT_TIMEOUT, DRIVER_SHUTDOWN_TIMEOUT, TRAFFIC_ALIVE_REPORT_INTERVAL, TaskRegistry,
+    join_registered_tasks, monotonic_nanos, nanos_from_dur,
+};
 #[cfg(test)]
-use driver::{UdpDriverContext, UdpDriverStart, run_endpoint_driver};
-use driver::{monotonic_nanos, nanos_from_dur};
+use driver::{
+    REPLY_IDLE_TIMEOUT, TRANSPORT_SEND_TIMEOUT, UdpDriverContext, UdpDriverStart,
+    run_endpoint_driver,
+};
 
 #[cfg(test)]
 mod tests;

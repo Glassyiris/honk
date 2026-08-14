@@ -1,5 +1,81 @@
 use super::*;
 
+/// How long the endpoint driver waits for proxy data before giving up.
+pub(super) const REPLY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+pub(super) const TRANSPORT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const TRAFFIC_ALIVE_REPORT_INTERVAL: Duration = Duration::from_millis(200);
+pub(super) const DRIVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(6);
+pub(super) const DRIVER_ABORT_TIMEOUT: Duration = Duration::from_secs(1);
+/// Includes the eagerly-created original-destination socket. Reaching the
+/// bound fails the endpoint closed rather than replying from the wrong source.
+const MAX_REPLY_SOCKETS_PER_ENDPOINT: usize = 8;
+pub(super) struct TaskRegistry {
+    pub(super) closed: bool,
+    pub(super) tasks: tokio::task::JoinSet<()>,
+}
+
+impl Default for TaskRegistry {
+    fn default() -> Self {
+        Self {
+            closed: false,
+            tasks: tokio::task::JoinSet::new(),
+        }
+    }
+}
+
+async fn drain_registered_tasks(tasks: &mut tokio::task::JoinSet<()>, label: &str) -> bool {
+    let mut clean = true;
+    while let Some(result) = tasks.join_next().await {
+        if let Err(error) = result
+            && !error.is_cancelled()
+        {
+            clean = false;
+            debug!("UDP {} task join failed during shutdown: {}", label, error);
+        }
+    }
+    clean
+}
+
+pub(super) async fn join_registered_tasks(
+    mut tasks: tokio::task::JoinSet<()>,
+    label: &str,
+    graceful_timeout: Duration,
+    abort_first: bool,
+) -> bool {
+    if abort_first {
+        tasks.abort_all();
+    }
+    match tokio::time::timeout(
+        if abort_first {
+            DRIVER_ABORT_TIMEOUT
+        } else {
+            graceful_timeout
+        },
+        drain_registered_tasks(&mut tasks, label),
+    )
+    .await
+    {
+        Ok(clean) => clean,
+        Err(_) => {
+            debug!(
+                "Forcing cancellation of UDP {} tasks during shutdown",
+                label
+            );
+            tasks.abort_all();
+            tokio::time::timeout(
+                DRIVER_ABORT_TIMEOUT,
+                drain_registered_tasks(&mut tasks, label),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                debug!("Timed out joining aborted UDP {} tasks", label);
+                false
+            })
+        }
+    }
+}
+
 pub(super) struct UdpDriverStart {
     pub(super) first: QueuedDatagram,
     pub(super) followers: Vec<QueuedDatagram>,
