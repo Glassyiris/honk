@@ -1,5 +1,18 @@
 use super::*;
+#[cfg(not(feature = "ebpf"))]
+#[allow(dead_code)]
+enum NfqueueRuntimeEvent {
+    Fatal(anyhow::Error),
+    TokenExhausted,
+}
 
+#[cfg(not(feature = "ebpf"))]
+async fn wait_nfqueue_event(
+    _runtime: &mut (),
+    _ebpf: &Arc<RwLock<Box<dyn EbpfBackend>>>,
+) -> NfqueueRuntimeEvent {
+    std::future::pending::<NfqueueRuntimeEvent>().await
+}
 fn accepts_transparent_connection(drain: &DrainTracker) -> bool {
     !drain.should_reject()
 }

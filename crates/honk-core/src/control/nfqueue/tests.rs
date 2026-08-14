@@ -1,6 +1,5 @@
 use super::*;
 
-use super::*;
 use honk_ebpf_common::{ConnState, NFQUEUE_PENDING_MARK, RoutingMeta};
 
 fn identity(token: u32, generation: u64) -> PendingUdpIdentity {
