@@ -3292,7 +3292,7 @@ async fn udp_stagger_uses_absolute_offsets_bounds_inflight_and_drains_losers() {
         let active = active.clone();
         let max_active = max_active.clone();
         let release_first = release_first.clone();
-        Arc::new(move |node: Node| {
+        Arc::new(move |_: usize, node: Node| {
             let starts = starts.clone();
             let active = active.clone();
             let max_active = max_active.clone();
@@ -3427,7 +3427,7 @@ async fn udp_stagger_drain_reports_completed_error_without_cancelling_ready_lose
     let cancellations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let prepare: UdpPrepare<String> = {
         let release = release.clone();
-        Arc::new(move |node: Node| {
+        Arc::new(move |_: usize, node: Node| {
             let release = release.clone();
             Box::pin(async move {
                 release.notified().await;
@@ -3499,7 +3499,8 @@ async fn udp_stagger_authoritative_prepares_only_the_current_node_without_delay(
     let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let winners = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let cancellations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let prepare: UdpPrepare<String> = Arc::new(|node: Node| Box::pin(async move { Ok(node.name) }));
+    let prepare: UdpPrepare<String> =
+        Arc::new(|_: usize, node: Node| Box::pin(async move { Ok(node.name) }));
     let callbacks = UdpStaggerCallbacks {
         is_eligible: Arc::new(|_| true),
         on_dial_error: Arc::new(|_| panic!("authoritative success must not report an error")),
@@ -3552,7 +3553,7 @@ async fn udp_stagger_authoritative_failure_preserves_fixed_metric_zeros() {
     let winners = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let cancellations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let prepare: UdpPrepare<()> =
-        Arc::new(|_: Node| Box::pin(async { Err(anyhow::anyhow!("dial failed")) }));
+        Arc::new(|_: usize, _: Node| Box::pin(async { Err(anyhow::anyhow!("dial failed")) }));
     let callbacks = UdpStaggerCallbacks {
         is_eligible: Arc::new(|_| true),
         on_dial_error: {
@@ -3608,7 +3609,7 @@ async fn udp_stagger_all_dial_failures_report_health_without_cancellation() {
     let errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let cancellations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let prepare: UdpPrepare<()> =
-        Arc::new(|_: Node| Box::pin(async { Err(anyhow::anyhow!("dial failed")) }));
+        Arc::new(|_: usize, _: Node| Box::pin(async { Err(anyhow::anyhow!("dial failed")) }));
     let callbacks = UdpStaggerCallbacks {
         is_eligible: Arc::new(|_| true),
         on_dial_error: {
@@ -3659,7 +3660,7 @@ async fn udp_stagger_rechecks_eligibility_before_accepting_prepared_transport() 
     let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let prepare: UdpPrepare<String> = {
         let became_ineligible = became_ineligible.clone();
-        Arc::new(move |node: Node| {
+        Arc::new(move |_: usize, node: Node| {
             let became_ineligible = became_ineligible.clone();
             Box::pin(async move {
                 if node.name == "became-ineligible" {

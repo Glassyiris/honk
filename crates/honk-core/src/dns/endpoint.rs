@@ -23,6 +23,7 @@ pub struct DnsEndpoint {
     /// TLS/QUIC server name (SNI). Falls back to `host` when host is not an IP.
     pub sni: String,
     bootstrap_resolver: Option<honk_outbound::bootstrap::BootstrapResolver>,
+    resolved_addr: Option<SocketAddr>,
 }
 
 impl DnsEndpoint {
@@ -73,7 +74,12 @@ impl DnsEndpoint {
             path,
             sni,
             bootstrap_resolver,
+            resolved_addr: None,
         })
+    }
+    pub(crate) fn with_resolved_addr(mut self, address: SocketAddr) -> Self {
+        self.resolved_addr = Some(address);
+        self
     }
 
     /// Resolve host → one `SocketAddr` via bootstrap (bypass-marked) DNS.
@@ -81,10 +87,13 @@ impl DnsEndpoint {
     /// Prefers IPv4 when both families are returned so broken dual-stack
     /// networks (common on gateways without working IPv6 egress) still dial.
     pub async fn resolve_addr(&self) -> anyhow::Result<SocketAddr> {
-        let mut addrs = self.resolve_addrs().await?;
-        addrs.pop().ok_or_else(|| {
-            anyhow::anyhow!("bootstrap resolve '{}' returned no addresses", self.host)
-        })
+        self.resolve_addrs()
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                anyhow::anyhow!("bootstrap resolve '{}' returned no addresses", self.host)
+            })
     }
 
     /// Resolve host → all candidate addresses (IPv4 preferred, then IPv6).
@@ -99,6 +108,9 @@ impl DnsEndpoint {
         &self,
         bootstrap_resolver: Option<honk_outbound::bootstrap::BootstrapResolver>,
     ) -> anyhow::Result<Vec<SocketAddr>> {
+        if let Some(address) = self.resolved_addr {
+            return Ok(vec![address]);
+        }
         if let Ok(ip) = self.host.parse::<IpAddr>() {
             return Ok(vec![SocketAddr::new(ip, self.port)]);
         }

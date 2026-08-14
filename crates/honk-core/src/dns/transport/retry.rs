@@ -1,31 +1,86 @@
-/// Uniform retry-once wrapper for all transports: on failure, run `reset`
-/// (drop the cached session/connection) and retry the exchange once.
+use std::future::Future;
+
+#[cfg(feature = "honk-policy")]
 pub(super) async fn exchange_with_retry<Once, Fut, Reset, ResetFut>(
     label: &'static str,
+    raw_query: &[u8],
+    once: Once,
+    reset: Reset,
+    feedback: Option<&honk_outbound::group::HonkFeedback>,
+) -> anyhow::Result<Vec<u8>>
+where
+    Once: Fn(Option<honk_outbound::group::HonkReporter>) -> Fut,
+    Fut: Future<Output = anyhow::Result<Vec<u8>>>,
+    Reset: FnOnce() -> ResetFut,
+    ResetFut: Future<Output = ()>,
+{
+    async fn attempt<Once, Fut>(
+        once: &Once,
+        feedback: Option<&honk_outbound::group::HonkFeedback>,
+        raw_query: &[u8],
+    ) -> anyhow::Result<Vec<u8>>
+    where
+        Once: Fn(Option<honk_outbound::group::HonkReporter>) -> Fut,
+        Fut: Future<Output = anyhow::Result<Vec<u8>>>,
+    {
+        let reporter = feedback.map(honk_outbound::group::HonkFeedback::start);
+        let result = once(reporter.clone()).await;
+        if let Some(reporter) = &reporter {
+            match &result {
+                Ok(response) if super::is_valid_response(raw_query, response) => {
+                    reporter.finish(honk_outbound::group::HonkOutcome::Success)
+                }
+                Ok(_) => reporter.finish(honk_outbound::group::HonkOutcome::Other),
+                Err(error) => reporter.finish(honk_outbound::group::HonkOutcome::from_error(error)),
+            }
+        }
+        result
+    }
+
+    match attempt(&once, feedback, raw_query).await {
+        Ok(response) => Ok(response),
+        Err(first) => {
+            record_reset(label);
+            reset().await;
+            attempt(&once, feedback, raw_query).await.map_err(|error| {
+                anyhow::anyhow!("{label} failed after retry: {error} (first: {first})")
+            })
+        }
+    }
+}
+
+#[cfg(not(feature = "honk-policy"))]
+pub(super) async fn exchange_with_retry<Once, Fut, Reset, ResetFut>(
+    label: &'static str,
+    _raw_query: &[u8],
     once: Once,
     reset: Reset,
 ) -> anyhow::Result<Vec<u8>>
 where
     Once: Fn() -> Fut,
-    Fut: std::future::Future<Output = anyhow::Result<Vec<u8>>>,
+    Fut: Future<Output = anyhow::Result<Vec<u8>>>,
     Reset: FnOnce() -> ResetFut,
-    ResetFut: std::future::Future<Output = ()>,
+    ResetFut: Future<Output = ()>,
 {
     match once().await {
-        Ok(resp) => Ok(resp),
+        Ok(response) => Ok(response),
         Err(first) => {
-            crate::stats::record_dns_event(crate::stats::DnsStatEvent::TransportReset);
-            tracing::debug!(
-                transport = label,
-                error_kind = "exchange_failed",
-                "DNS transport reset before retry"
-            );
+            record_reset(label);
             reset().await;
-            once()
-                .await
-                .map_err(|e| anyhow::anyhow!("{label} failed after retry: {e} (first: {first})"))
+            once().await.map_err(|error| {
+                anyhow::anyhow!("{label} failed after retry: {error} (first: {first})")
+            })
         }
     }
+}
+
+fn record_reset(label: &'static str) {
+    crate::stats::record_dns_event(crate::stats::DnsStatEvent::TransportReset);
+    tracing::debug!(
+        transport = label,
+        error_kind = "exchange_failed",
+        "DNS transport reset before retry"
+    );
 }
 
 #[cfg(test)]
@@ -65,8 +120,27 @@ mod tests {
             .finish();
         let _subscriber = tracing::subscriber::set_default(subscriber);
 
+        #[cfg(feature = "honk-policy")]
         let response = super::exchange_with_retry(
             "test",
+            &[0; 12],
+            |_| async {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    anyhow::bail!("secret endpoint value")
+                }
+                Ok(vec![1, 2, 3])
+            },
+            || async {
+                resets.fetch_add(1, Ordering::SeqCst);
+            },
+            None,
+        )
+        .await
+        .expect("retry succeeds");
+        #[cfg(not(feature = "honk-policy"))]
+        let response = super::exchange_with_retry(
+            "test",
+            &[0; 12],
             || async {
                 if calls.fetch_add(1, Ordering::SeqCst) == 0 {
                     anyhow::bail!("secret endpoint value")

@@ -19,4 +19,7 @@ pub enum ConfigError {
 
     #[error("Unknown node protocol: {0}")]
     UnknownProtocol(String),
+
+    #[error("Unsupported feature: {0}")]
+    UnsupportedFeature(String),
 }

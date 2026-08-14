@@ -28,17 +28,43 @@ impl DotPool {
         }))
     }
 
-    pub async fn exchange(self: &Arc<Self>, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
-        exchange_with_retry("DoT", || self.exchange_once(raw_query), || async {}).await
+    pub async fn exchange(
+        self: &Arc<Self>,
+        raw_query: &[u8],
+        #[cfg(feature = "honk-policy")] feedback: Option<&honk_outbound::group::HonkFeedback>,
+    ) -> anyhow::Result<Vec<u8>> {
+        #[cfg(feature = "honk-policy")]
+        return exchange_with_retry(
+            "DoT",
+            raw_query,
+            |reporter| async move { self.exchange_once(raw_query, reporter.as_ref()).await },
+            || async {},
+            feedback,
+        )
+        .await;
+        #[cfg(not(feature = "honk-policy"))]
+        exchange_with_retry(
+            "DoT",
+            raw_query,
+            || self.exchange_once(raw_query),
+            || async {},
+        )
+        .await
     }
 
-    async fn exchange_once(&self, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+    async fn exchange_once(
+        &self,
+        raw_query: &[u8],
+        #[cfg(feature = "honk-policy")] reporter: Option<&honk_outbound::group::HonkReporter>,
+    ) -> anyhow::Result<Vec<u8>> {
         idle_pool_exchange(
             &self.lifecycle,
             &self.idle,
             || self.dial_tls(),
             raw_query,
             self.dial.query_timeout,
+            #[cfg(feature = "honk-policy")]
+            reporter,
         )
         .await
     }

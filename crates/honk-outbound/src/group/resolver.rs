@@ -16,21 +16,56 @@ impl GroupManager {
         depth: usize,
         effects: SelectionEffects,
     ) -> Option<&'a Node> {
+        self.pick_candidate_in_group(group, domain, ipver, visited, depth, effects)
+            .map(|candidate| candidate.node)
+    }
+
+    pub(super) fn pick_candidate_in_group<'a>(
+        &'a self,
+        group: &'a Group,
+        domain: ProbeDomain,
+        ipver: IpVersion,
+        visited: &mut Vec<&'a str>,
+        depth: usize,
+        effects: SelectionEffects,
+    ) -> Option<Candidate<'a>> {
         let candidates = self.flatten_candidates(group, domain, ipver, visited, depth, effects);
         let candidates =
             self.filter_alive_candidates(candidates, domain, ipver, group.check_url.as_deref());
         if candidates.is_empty() {
-            return self.last_resort_tcp_leaf(group, domain);
+            return self
+                .last_resort_tcp_leaf(group, domain)
+                .map(|node| Candidate {
+                    tag: node.name.as_str(),
+                    node,
+                    #[cfg(feature = "honk-policy")]
+                    attribution: Vec::new(),
+                    #[cfg(feature = "honk-policy")]
+                    selection_chain: vec![node.name.as_str()],
+                });
         }
         let network = SelectionNetwork::from_probe_domain(domain);
-        Some(match group.policy {
+        let candidate = match group.policy {
             GroupPolicy::Selector => self.pick_selector(&candidates, group),
             GroupPolicy::URLTest => self.pick_urltest(&candidates, group, network, ipver, effects),
             GroupPolicy::LoadBalance => {
                 self.pick_load_balance(&candidates, group, network, effects)
             }
             GroupPolicy::Fallback => self.pick_fallback(&candidates, group, network, effects),
-        })
+            #[cfg(feature = "honk-policy")]
+            GroupPolicy::Honk => self.pick_honk(
+                &candidates,
+                group,
+                &HonkSelectionContext::aggregate(network, domain, ipver),
+            ),
+        };
+        #[cfg(feature = "honk-policy")]
+        let mut candidate = candidate;
+        #[cfg(feature = "honk-policy")]
+        if group.policy == GroupPolicy::Honk {
+            candidate.attribution.push(group.name.as_str());
+        }
+        Some(candidate)
     }
 
     /// Flatten a group's members into dial candidates: every direct member
@@ -58,6 +93,10 @@ impl GroupManager {
             .map(|node| Candidate {
                 tag: node.name.as_str(),
                 node,
+                #[cfg(feature = "honk-policy")]
+                attribution: Vec::new(),
+                #[cfg(feature = "honk-policy")]
+                selection_chain: vec![node.name.as_str()],
             })
             .collect();
         for sub_tag in &group.groups {
@@ -70,12 +109,11 @@ impl GroupManager {
             if effects.applies() {
                 self.mark_used(sub_tag);
             }
-            if let Some(leaf) = self.pick_in_group(sub, domain, ipver, visited, depth + 1, effects)
+            if let Some(mut candidate) =
+                self.pick_candidate_in_group(sub, domain, ipver, visited, depth + 1, effects)
             {
-                out.push(Candidate {
-                    tag: sub_tag.as_str(),
-                    node: leaf,
-                });
+                candidate.tag = sub_tag.as_str();
+                out.push(candidate);
             }
         }
         visited.pop();
@@ -254,6 +292,8 @@ impl GroupManager {
                     self.get_fallback_selection_for_network(&group.name, network)
                 }
                 GroupPolicy::LoadBalance => None,
+                #[cfg(feature = "honk-policy")]
+                GroupPolicy::Honk => self.get_honk_selection_for_network(&group.name, network),
             };
             let Some(tag) = next else { break };
             if tag == current || chain.contains(&tag) {

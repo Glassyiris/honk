@@ -735,14 +735,10 @@ impl ControlPlane {
         let alive_set = Arc::new(
             crate::outbound::AliveDialerSet::new().with_so_mark(honk_ebpf_common::DAE_BYPASS_MARK),
         );
-        // direct is probed against the bootstrap resolver rather than the
-        // proxy check URL (which is unreachable over direct egress), so the
-        // clash API gets a real direct latency too. The urltest (on-demand
-        // delay) path shares the same target.
+        // Periodic direct health uses a stable bootstrap target; on-demand
+        // URL tests still measure their requested URL.
         let direct_target = direct_check_addr(&config.global.bootstrap_resolver);
-        let direct_target_socket = direct_target.parse()?;
         alive_set.set_direct_check_addr(direct_target.clone());
-        honk_outbound::urltest::set_urltest_direct_target(direct_target_socket);
         // Register health checks per the config's group membership; reload
         // re-runs the same sync via `reload_group_manager`.
         let (added, _) = sync_health_check_nodes(&alive_set, &config);
@@ -776,6 +772,13 @@ impl ControlPlane {
         // they currently select, and the tag keeps the result. The cell
         // keeps working across reloads (the manager inside is swapped).
         let group_manager = group_manager.into_shared();
+        #[cfg(feature = "honk-policy")]
+        {
+            let group_manager = group_manager.clone();
+            alive_set.set_honk_feedback_factory(move |node_id, context| {
+                group_manager.read().feedback_for_node(node_id, context)
+            });
+        }
         // Per-node runtime registry (single owner of session-layer
         // resources, keyed by Node.id). Invalid node sets (nil/duplicate
         // UUIDs) are a fatal config error at startup.
@@ -1714,6 +1717,8 @@ impl ControlPlane {
                         self.proxy_registry.clone(),
                         self.runtime_registry.clone(),
                         check_method.clone(),
+                        #[cfg(feature = "honk-policy")]
+                        self.group_manager.clone(),
                     ));
                     alive_set
                         .set_http_probe(prober, check_url, check_method)
@@ -1764,6 +1769,10 @@ impl ControlPlane {
                     self.runtime_registry.clone(),
                     self.stats.clone(),
                     dns_target,
+                    #[cfg(feature = "honk-policy")]
+                    udp_probe_identity(&dns_raw, dns_target),
+                    #[cfg(feature = "honk-policy")]
+                    self.group_manager.clone(),
                 )));
                 info!("UDP health check enabled (dns={})", dns_target);
             }
@@ -1847,11 +1856,13 @@ impl ControlPlane {
             } else {
                 count.min(8)
             };
-            let nodes = {
+            let (nodes, manager) = {
                 let manager = self.group_manager.read().clone();
-                preconnect_candidates(&config, &manager, count)
+                (preconnect_candidates(&config, &manager, count), manager)
             };
             drop(config);
+            #[cfg(not(feature = "honk-policy"))]
+            drop(manager);
 
             if !nodes.is_empty() {
                 let node_count = nodes.len();
@@ -1861,29 +1872,59 @@ impl ControlPlane {
                 let handle = tokio::spawn(async move {
                     let mut set = tokio::task::JoinSet::new();
                     for node in nodes {
+                        #[cfg(feature = "honk-policy")]
+                        let feedback = manager.feedback_for_node(
+                            node.id,
+                            crate::group::HonkSelectionContext::aggregate(
+                                crate::group::SelectionNetwork::Tcp,
+                                ProbeDomain::Tcp,
+                                IpVersion::V4,
+                            ),
+                        );
                         let addr = format!("{}:{}", node.host(), node.port);
                         let pool = pool.clone();
                         let stats = stats.clone();
                         let sem = semaphore.clone();
                         set.spawn(async move {
                             let _permit = sem.acquire_owned().await;
+                            #[cfg(feature = "honk-policy")]
+                            let reporter = feedback.map(|feedback| feedback.start());
                             match honk_outbound::util::connect_outbound(&addr, connect_timeout)
                                 .await
                             {
-                                Ok(stream) => {
-                                    if is_tcp_stream_alive(&stream) {
-                                        pool.deposit_tcp(&addr, stream).await;
-                                        stats.mark_warm(
-                                            node.id,
-                                            crate::stats::WarmReason::Preconnect,
-                                        );
-                                        debug!(
-                                            "Preconnect warmup: deposited connection to {}",
-                                            addr
-                                        );
+                                Ok(stream) if is_tcp_stream_alive(&stream) => {
+                                    #[cfg(feature = "honk-policy")]
+                                    if let Some(reporter) = &reporter {
+                                        reporter.setup_succeeded();
+                                    }
+                                    pool.deposit_tcp(&addr, stream).await;
+                                    stats.mark_warm(node.id, crate::stats::WarmReason::Preconnect);
+                                    #[cfg(feature = "honk-policy")]
+                                    if let Some(reporter) = &reporter {
+                                        reporter.finish(crate::group::HonkOutcome::Success);
+                                    }
+                                    debug!("Preconnect warmup: deposited connection to {}", addr);
+                                }
+                                Ok(_) =>
+                                {
+                                    #[cfg(feature = "honk-policy")]
+                                    if let Some(reporter) = &reporter {
+                                        reporter.setup_failed(crate::group::HonkOutcome::Io(
+                                            io::ErrorKind::ConnectionAborted,
+                                        ));
                                     }
                                 }
                                 Err(e) => {
+                                    #[cfg(feature = "honk-policy")]
+                                    if let Some(reporter) = &reporter {
+                                        reporter.setup_failed(
+                                            if e.kind() == io::ErrorKind::TimedOut {
+                                                crate::group::HonkOutcome::Timeout
+                                            } else {
+                                                crate::group::HonkOutcome::Io(e.kind())
+                                            },
+                                        );
+                                    }
                                     debug!("Preconnect warmup to {} failed: {}", addr, e);
                                 }
                             }

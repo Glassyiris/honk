@@ -1,11 +1,11 @@
 //! Shared DNS stream framing helpers (RFC 7766 length-prefix).
 
+#[cfg(feature = "honk-policy")]
+use honk_outbound::group::HonkReporter;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
-
-/// Write a length-prefixed DNS message and read the response from `stream`.
 pub async fn exchange_length_prefixed<S>(
     stream: &mut S,
     raw_query: &[u8],
@@ -14,10 +14,40 @@ pub async fn exchange_length_prefixed<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    exchange_length_prefixed_reported(
+        stream,
+        raw_query,
+        query_timeout,
+        #[cfg(feature = "honk-policy")]
+        None,
+    )
+    .await
+}
+
+pub(super) async fn exchange_length_prefixed_reported<S>(
+    stream: &mut S,
+    raw_query: &[u8],
+    query_timeout: Duration,
+    #[cfg(feature = "honk-policy")] reporter: Option<&HonkReporter>,
+) -> anyhow::Result<Vec<u8>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     timeout(query_timeout, async {
         write_length_prefixed(stream, raw_query).await?;
+        #[cfg(feature = "honk-policy")]
+        if let Some(reporter) = reporter {
+            reporter.tx(raw_query.len() as u64);
+        }
         let mut response = Vec::new();
         read_length_prefixed_into(stream, &mut response, None).await?;
+        #[cfg(feature = "honk-policy")]
+        if let Some(reporter) = reporter
+            && super::is_valid_response(raw_query, &response)
+        {
+            reporter.first_response();
+            reporter.rx(response.len() as u64);
+        }
         Ok::<_, anyhow::Error>(response)
     })
     .await

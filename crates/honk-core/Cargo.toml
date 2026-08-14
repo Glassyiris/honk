@@ -111,6 +111,8 @@ clash-api = ["dep:axum", "dep:tower-http"]
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 # VLESS / VMess proxy handlers (xtls-rprx-vision flow support)
 rprx = ["honk-outbound/rprx"]
+# Automatic reliability-aware group policy (default off)
+honk-policy = ["honk-config/honk-policy", "honk-outbound/honk-policy"]
 dns-bench = []
 
 [build-dependencies]

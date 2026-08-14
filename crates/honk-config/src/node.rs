@@ -451,14 +451,13 @@ impl Node {
 
 /// A group of nodes for load balancing / failover.
 ///
-/// Modeled after sing-box's outbound groups: Selector (manual), URLTest
-/// (auto), LoadBalance (round-robin) and Fallback (first alive, sticky).
+/// Modeled after sing-box's outbound groups, plus the optional Honk scorer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Group {
     #[serde(default = "uuid::Uuid::new_v4")]
     pub id: uuid::Uuid,
     pub name: String,
-    /// Group selection policy (Selector or URLTest).
+    /// Group selection policy.
     #[serde(default)]
     pub policy: GroupPolicy,
     /// Node UUIDs that belong to this group.
@@ -548,6 +547,9 @@ pub enum GroupPolicy {
     /// First alive node in declaration order, pinned until it dies. A
     /// recovered higher-preference node does not immediately win the pin back.
     Fallback,
+    /// Reliability-aware automatic selection trained by real connection outcomes.
+    #[cfg(feature = "honk-policy")]
+    Honk,
 }
 
 #[cfg(test)]
@@ -585,6 +587,22 @@ mod tests {
             serde_json::to_string(&GroupPolicy::URLTest).unwrap(),
             "\"urltest\""
         );
+        #[cfg(feature = "honk-policy")]
+        assert_eq!(
+            serde_json::from_str::<GroupPolicy>("\"honk\"").unwrap(),
+            GroupPolicy::Honk
+        );
+        #[cfg(feature = "honk-policy")]
+        assert_eq!(
+            serde_json::to_string(&GroupPolicy::Honk).unwrap(),
+            "\"honk\""
+        );
+    }
+
+    #[cfg(not(feature = "honk-policy"))]
+    #[test]
+    fn test_group_policy_serde_rejects_honk_without_feature() {
+        assert!(serde_json::from_str::<GroupPolicy>("\"honk\"").is_err());
     }
 
     #[test]

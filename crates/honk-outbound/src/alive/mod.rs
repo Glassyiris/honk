@@ -8,6 +8,8 @@ mod probe;
 mod tests;
 
 use self::collection::{DialerCollection, SLOW_DIAL_STREAK_MAX, TrafficVerdict};
+#[cfg(feature = "honk-policy")]
+use crate::group::{HonkFeedback, HonkSelectionContext};
 use honk_config::config::{BLOCK_NODE_ID, DIRECT_NODE_ID};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
@@ -17,6 +19,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+#[cfg(feature = "honk-policy")]
+type HonkFeedbackFactory =
+    Arc<dyn Fn(Uuid, HonkSelectionContext) -> Option<HonkFeedback> + Send + Sync>;
 
 /// Per-(node, check_url) probe state for URLTest groups with a custom
 /// `check_url` (sing-box urltest `url` option). Deliberately simpler than
@@ -110,12 +116,15 @@ pub enum HttpProbeResult {
 /// (global `tcp_check_url`, or a group's custom `check_url`); `addr` is a
 /// pre-resolved IP for that URL's host. Only [`HttpProbeResult::WarmSuccess`]
 /// is healthy and carries a ranking RTT.
+/// Implementations own timeout handling; callers do not wrap the future in a
+/// competing deadline.
 pub trait HttpProber: Send + Sync {
     fn probe_http(
         &self,
         node_name: &str,
         addr: SocketAddr,
         url: &str,
+        timeout: Duration,
     ) -> Pin<Box<dyn Future<Output = HttpProbeResult> + Send + 'static>>;
 }
 
@@ -132,10 +141,13 @@ pub type HttpProberRef = Arc<dyn HttpProber>;
 /// This catches nodes whose TCP path works but whose UDP path is broken
 /// (e.g. an AnyTLS server without UoT support) — a plain TCP probe can
 /// never see that failure mode.
+/// Implementations own timeout handling; callers do not wrap the future in a
+/// competing deadline.
 pub trait UdpProber: Send + Sync {
     fn probe_udp(
         &self,
         node_name: &str,
+        timeout: Duration,
     ) -> Pin<Box<dyn Future<Output = Result<Duration, String>> + Send + 'static>>;
 }
 
@@ -333,6 +345,8 @@ pub struct AliveDialerSet {
     /// When set, each periodic probe cycle runs a DNS-over-UDP exchange
     /// through the node's UDP data path after the TCP probe.
     udp_prober: RwLock<Option<UdpProberRef>>,
+    #[cfg(feature = "honk-policy")]
+    honk_feedback: RwLock<Option<HonkFeedbackFactory>>,
     /// Timestamp when each node was first registered (for grace period).
     node_registered_at: RwLock<HashMap<Uuid, Instant>>,
     /// Per-node per-domain/IP-version probe history for API/UI.
@@ -403,6 +417,8 @@ impl AliveDialerSet {
             direct_check_addr: RwLock::new(DEFAULT_DIRECT_CHECK_ADDR.to_string()),
             check_url_ips: RwLock::new(Vec::new()),
             udp_prober: RwLock::new(None),
+            #[cfg(feature = "honk-policy")]
+            honk_feedback: RwLock::new(None),
             node_registered_at: RwLock::new(HashMap::new()),
             probe_history: RwLock::new(HashMap::new()),
             outbound_resolver: RwLock::new(None),
@@ -475,6 +491,14 @@ impl AliveDialerSet {
     /// [`AliveDialerSet::probe_node_udp`] after each node's TCP probe.
     pub fn set_udp_probe(&self, prober: UdpProberRef) {
         *self.udp_prober.write() = Some(prober);
+    }
+
+    #[cfg(feature = "honk-policy")]
+    pub fn set_honk_feedback_factory<F>(&self, factory: F)
+    where
+        F: Fn(Uuid, HonkSelectionContext) -> Option<HonkFeedback> + Send + Sync + 'static,
+    {
+        *self.honk_feedback.write() = Some(Arc::new(factory));
     }
 
     /// Install the DNS resolver for health-check targets (see [`ResolveHook`]).

@@ -437,6 +437,7 @@ impl HttpProber for MockHttpProber {
         _node_name: &str,
         _addr: std::net::SocketAddr,
         _url: &str,
+        _timeout: Duration,
     ) -> Pin<Box<dyn Future<Output = HttpProbeResult> + Send + 'static>> {
         let result = self.result.clone();
         Box::pin(async move { result })
@@ -514,6 +515,7 @@ impl UdpProber for MockUdpProber {
     fn probe_udp(
         &self,
         _node_name: &str,
+        _timeout: Duration,
     ) -> Pin<Box<dyn Future<Output = Result<Duration, String>> + Send + 'static>> {
         let r = self.result.lock().unwrap().clone();
         Box::pin(async move { r })
@@ -526,8 +528,12 @@ impl UdpProber for PendingUdpProber {
     fn probe_udp(
         &self,
         _node_name: &str,
+        timeout: Duration,
     ) -> Pin<Box<dyn Future<Output = Result<Duration, String>> + Send + 'static>> {
-        Box::pin(std::future::pending())
+        Box::pin(async move {
+            tokio::time::sleep(timeout).await;
+            Err("UDP probe timeout".into())
+        })
     }
 }
 

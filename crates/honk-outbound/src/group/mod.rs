@@ -35,6 +35,11 @@ use crate::alive::{AliveDialerSet, IpVersion, ProbeDomain};
 
 use state::UrlTestSelections;
 
+#[cfg(feature = "honk-policy")]
+pub use honk::{
+    HonkAttribution, HonkFeedback, HonkOutcome, HonkPolicyState, HonkReporter,
+    HonkSelectionContext, HonkTarget,
+};
 pub use state::{InterruptCallback, PersistCallback, SelectorChangeCallback};
 
 /// Maximum nesting depth for group → sub-group resolution. Construction-
@@ -93,6 +98,21 @@ pub struct SelectionPlan<'a> {
     pub mode: SelectionPlanMode,
     pub nodes: Vec<&'a Node>,
 }
+#[cfg(feature = "honk-policy")]
+#[derive(Clone)]
+pub struct HonkSelectionEntry<'a> {
+    pub node: &'a Node,
+    pub feedback: Option<HonkFeedback>,
+    pub selection_chain: Vec<String>,
+}
+
+#[cfg(feature = "honk-policy")]
+#[derive(Clone)]
+pub struct HonkSelectionPlan<'a> {
+    pub mode: SelectionPlanMode,
+    pub health_family: IpVersion,
+    pub entries: Vec<HonkSelectionEntry<'a>>,
+}
 
 /// Whether resolving a selection may update group state or must only observe
 /// it. Peek is deliberately threaded through nested policies so warm-up
@@ -121,12 +141,16 @@ pub type SharedGroupManager = Arc<parking_lot::RwLock<Arc<GroupManager>>>;
 /// A dialable candidate of a group: a leaf node plus the member tag that
 /// selected it. Direct members use their node name; nested candidates use
 /// the sub-group tag while retaining the leaf chosen by that sub-group.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Candidate<'a> {
     /// Display tag: node name for direct members, sub-group tag for nested.
     tag: &'a str,
     /// Leaf node that would actually be dialed.
     node: &'a Node,
+    #[cfg(feature = "honk-policy")]
+    attribution: Vec<&'a str>,
+    #[cfg(feature = "honk-policy")]
+    selection_chain: Vec<&'a str>,
 }
 
 pub struct GroupManager {
@@ -152,6 +176,8 @@ pub struct GroupManager {
     selector_change_callback: RwLock<Option<SelectorChangeCallback>>,
     /// Invoked on selection changes for groups with interrupt_connections.
     interrupt_callback: RwLock<Option<InterruptCallback>>,
+    #[cfg(feature = "honk-policy")]
+    honk_state: Arc<HonkPolicyState>,
 }
 
 impl GroupManager {
@@ -163,6 +189,50 @@ impl GroupManager {
         groups: &[Group],
         nodes: &[Node],
         alive_set: Option<Arc<AliveDialerSet>>,
+    ) -> Self {
+        #[cfg(feature = "honk-policy")]
+        let honk_state = Arc::new(HonkPolicyState::default());
+        #[cfg(feature = "honk-policy")]
+        let manager = Self::with_alive_set_and_honk_state(groups, nodes, alive_set, honk_state);
+        #[cfg(feature = "honk-policy")]
+        manager.publish_honk_membership();
+        #[cfg(feature = "honk-policy")]
+        return manager;
+
+        #[cfg(not(feature = "honk-policy"))]
+        Self::build(groups, nodes, alive_set)
+    }
+
+    #[cfg(feature = "honk-policy")]
+    pub fn with_alive_set_and_honk_state(
+        groups: &[Group],
+        nodes: &[Node],
+        alive_set: Option<Arc<AliveDialerSet>>,
+        honk_state: Arc<HonkPolicyState>,
+    ) -> Self {
+        Self::build(groups, nodes, alive_set, honk_state)
+    }
+
+    #[cfg(feature = "honk-policy")]
+    fn build(
+        groups: &[Group],
+        nodes: &[Node],
+        alive_set: Option<Arc<AliveDialerSet>>,
+        honk_state: Arc<HonkPolicyState>,
+    ) -> Self {
+        Self::build_inner(groups, nodes, alive_set, honk_state)
+    }
+
+    #[cfg(not(feature = "honk-policy"))]
+    fn build(groups: &[Group], nodes: &[Node], alive_set: Option<Arc<AliveDialerSet>>) -> Self {
+        Self::build_inner(groups, nodes, alive_set)
+    }
+
+    fn build_inner(
+        groups: &[Group],
+        nodes: &[Node],
+        alive_set: Option<Arc<AliveDialerSet>>,
+        #[cfg(feature = "honk-policy")] honk_state: Arc<HonkPolicyState>,
     ) -> Self {
         let mut group_map: HashMap<String, Group> =
             groups.iter().map(|g| (g.name.clone(), g.clone())).collect();
@@ -195,6 +265,8 @@ impl GroupManager {
             persist_callback: RwLock::new(None),
             selector_change_callback: RwLock::new(None),
             interrupt_callback: RwLock::new(None),
+            #[cfg(feature = "honk-policy")]
+            honk_state,
         }
     }
 
@@ -381,13 +453,16 @@ impl GroupManager {
         match group.policy {
             GroupPolicy::Selector => SelectionPlan {
                 mode: SelectionPlanMode::Authoritative,
-                nodes: vec![self.pick_selector(&candidates, group)],
+                nodes: vec![self.pick_selector(&candidates, group).node],
             },
             GroupPolicy::URLTest => {
                 if urltest_has_data {
                     SelectionPlan {
                         mode: SelectionPlanMode::Authoritative,
-                        nodes: vec![self.pick_urltest(&candidates, group, network, ipver, effects)],
+                        nodes: vec![
+                            self.pick_urltest(&candidates, group, network, ipver, effects)
+                                .node,
+                        ],
                     }
                 } else {
                     SelectionPlan {
@@ -407,11 +482,29 @@ impl GroupManager {
             }
             GroupPolicy::LoadBalance => SelectionPlan {
                 mode: SelectionPlanMode::Authoritative,
-                nodes: vec![self.pick_load_balance(&candidates, group, network, effects)],
+                nodes: vec![
+                    self.pick_load_balance(&candidates, group, network, effects)
+                        .node,
+                ],
             },
             GroupPolicy::Fallback => SelectionPlan {
                 mode: SelectionPlanMode::Authoritative,
-                nodes: vec![self.pick_fallback(&candidates, group, network, effects)],
+                nodes: vec![
+                    self.pick_fallback(&candidates, group, network, effects)
+                        .node,
+                ],
+            },
+            #[cfg(feature = "honk-policy")]
+            GroupPolicy::Honk => SelectionPlan {
+                mode: SelectionPlanMode::Authoritative,
+                nodes: vec![
+                    self.pick_honk(
+                        &candidates,
+                        group,
+                        &HonkSelectionContext::aggregate(network, domain, ipver),
+                    )
+                    .node,
+                ],
             },
         }
     }
@@ -490,6 +583,8 @@ impl GroupManager {
 }
 
 mod filter;
+#[cfg(feature = "honk-policy")]
+mod honk;
 mod policy;
 mod resolver;
 mod state;

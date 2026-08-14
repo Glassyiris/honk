@@ -160,7 +160,7 @@ mod entries {
         pub(super) outbound: Option<String>,
         pub(super) transports:
             parking_lot::Mutex<HashMap<TransportKey, Arc<LifecycleSlot<PooledTransport>>>>,
-        pub(super) udp: parking_lot::Mutex<Option<Arc<UdpPool>>>,
+        pub(super) udp: parking_lot::Mutex<HashMap<std::net::SocketAddr, Arc<UdpPool>>>,
     }
 
     pub(super) fn build_entries(
@@ -190,7 +190,7 @@ mod entries {
                     address: upstream.address.clone(),
                     outbound: upstream.outbound.clone(),
                     transports: parking_lot::Mutex::new(HashMap::new()),
-                    udp: parking_lot::Mutex::new(None),
+                    udp: parking_lot::Mutex::new(HashMap::new()),
                 },
             );
         }

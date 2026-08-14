@@ -33,14 +33,67 @@ impl ControlPlane {
             Duration::from_millis(config.global.connect_timeout_ms)
         };
         let proxy_registry = self.proxy_registry.clone();
-        let dispatch = Arc::new(move |generation, node_id| {
-            let proxy_registry = proxy_registry.clone();
-            async move {
-                proxy_registry
-                    .warm_udp(generation, node_id, connect_timeout)
-                    .await
-            }
-        });
+        #[cfg(feature = "honk-policy")]
+        let group_manager = self.group_manager.clone();
+        let dispatch = Arc::new(
+            move |generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
+                  node_id: uuid::Uuid| {
+                let proxy_registry = proxy_registry.clone();
+                #[cfg(feature = "honk-policy")]
+                let group_manager = group_manager.clone();
+                async move {
+                    #[cfg(feature = "honk-policy")]
+                    let reporter = generation
+                        .get(&node_id)
+                        .filter(|runtime| {
+                            runtime.udp_capable
+                                && honk_outbound::descriptor::descriptor(runtime.node.protocol)
+                                    .has_generation_runtime(&runtime.node)
+                        })
+                        .and_then(|_| {
+                            group_manager.read().feedback_for_node(
+                                node_id,
+                                crate::group::HonkSelectionContext::aggregate(
+                                    crate::group::SelectionNetwork::Udp,
+                                    ProbeDomain::DataUdp,
+                                    IpVersion::V4,
+                                ),
+                            )
+                        })
+                        .map(|feedback| feedback.start());
+                    let result = proxy_registry
+                        .warm_udp(generation.clone(), node_id, connect_timeout)
+                        .await;
+                    #[cfg(feature = "honk-policy")]
+                    match &result {
+                        Ok(honk_outbound::proxy::WarmOutcome::Ready) => {
+                            if let Some(reporter) = &reporter {
+                                reporter.setup_succeeded();
+                                reporter.finish(crate::group::HonkOutcome::Success);
+                            }
+                        }
+                        Ok(honk_outbound::proxy::WarmOutcome::NotApplicable) => {}
+                        Err(_) if generation.is_shutdown() => {
+                            if let Some(reporter) = &reporter {
+                                reporter.finish(crate::group::HonkOutcome::Shutdown);
+                            }
+                        }
+                        Err(error) => {
+                            if let Some(reporter) = &reporter {
+                                reporter.setup_failed(
+                                    if error.is::<tokio::time::error::Elapsed>() {
+                                        crate::group::HonkOutcome::Timeout
+                                    } else {
+                                        crate::group::HonkOutcome::from_error(error)
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    result
+                }
+            },
+        );
         let handle = tokio::spawn(run_udp_warm_coordinator(
             self.config.clone(),
             self.group_manager.clone(),
@@ -78,6 +131,8 @@ impl ControlPlane {
                 generation,
                 proxy_registry: self.proxy_registry.clone(),
                 connection_pool: self.connection_pool.clone(),
+                #[cfg(feature = "honk-policy")]
+                group_manager: self.group_manager.clone(),
                 stats: self.stats.clone(),
                 selected_ids: self.selector_warm_ids.clone(),
                 bare_warm: self.selector_bare_warm.clone(),
@@ -131,6 +186,14 @@ impl ControlPlane {
             }
         };
         let old_group_manager = self.group_manager.read().clone();
+        #[cfg(feature = "honk-policy")]
+        let new_group_manager = Arc::new(GroupManager::with_alive_set_and_honk_state(
+            &new_config.groups,
+            &new_config.nodes,
+            Some(Arc::clone(&self.alive_set)),
+            old_group_manager.honk_state(),
+        ));
+        #[cfg(not(feature = "honk-policy"))]
         let new_group_manager = Arc::new(GroupManager::with_alive_set(
             &new_config.groups,
             &new_config.nodes,
@@ -183,14 +246,6 @@ impl ControlPlane {
             group_connectivity_snapshot(&new_config, &new_group_manager, &self.alive_set);
         let bootstrap = new_config.global.bootstrap_resolver.clone();
         let direct_target = super::direct_check_addr(&bootstrap);
-        let direct_target_socket = match direct_target.parse() {
-            Ok(target) => target,
-            Err(error) => {
-                error!(%error, "Failed to prepare direct health-check target");
-                self.stop_reload_rejection_if_healthy(drain);
-                return false;
-            }
-        };
         let bootstrap_resolver = honk_outbound::bootstrap::BootstrapResolver::parse(&bootstrap);
         let new_plan = match Self::compile_routing_plan(&new_config, &new_router) {
             Ok(plan) => Arc::new(plan),
@@ -389,6 +444,8 @@ impl ControlPlane {
                 *router_guard = new_router;
                 *config_guard = new_config;
                 *group_guard = Arc::clone(&new_group_manager);
+                #[cfg(feature = "honk-policy")]
+                new_group_manager.publish_honk_membership();
                 *outbound_guard = new_outbound_id_map;
                 *plan_guard = Arc::clone(&new_plan);
                 // The projection worker takes eBPF before its generation fence;
@@ -415,7 +472,6 @@ impl ControlPlane {
         routing_matcher::RoutingMatcherBuilder::activate_projection(&new_plan);
         honk_outbound::bootstrap::set_global(bootstrap_resolver);
         self.alive_set.set_direct_check_addr(direct_target);
-        honk_outbound::urltest::set_urltest_direct_target(direct_target_socket);
         install_interrupt_callback(
             &new_group_manager,
             &self.group_manager,
@@ -626,6 +682,14 @@ impl ControlPlane {
             let config = self.config.read().await;
             (config.groups.clone(), config.nodes.clone())
         };
+        #[cfg(feature = "honk-policy")]
+        let new_gm = GroupManager::with_alive_set_and_honk_state(
+            &groups,
+            &nodes,
+            Some(self.alive_set.clone()),
+            self.group_manager.read().honk_state(),
+        );
+        #[cfg(not(feature = "honk-policy"))]
         let new_gm = GroupManager::with_alive_set(&groups, &nodes, Some(self.alive_set.clone()));
         // Migrate runtime choices before wiring callbacks: migration must
         // not fire persistence or connection interruption.
@@ -637,7 +701,12 @@ impl ControlPlane {
                 db_cb.save_selector_choice(group, node);
             })));
         }
-        *self.group_manager.write() = Arc::new(new_gm);
+        {
+            let mut group_manager = self.group_manager.write();
+            #[cfg(feature = "honk-policy")]
+            new_gm.publish_honk_membership();
+            *group_manager = Arc::new(new_gm);
+        }
 
         // Refresh health-check registrations and the URLTest idle table to
         // match the new group membership.
@@ -735,6 +804,8 @@ struct SelectorWarmResources {
     generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
     proxy_registry: Arc<ProxyRegistry>,
     connection_pool: Arc<ConnectionPool>,
+    #[cfg(feature = "honk-policy")]
+    group_manager: crate::group::SharedGroupManager,
     stats: Arc<StatsManager>,
     selected_ids: Arc<parking_lot::Mutex<std::collections::HashSet<uuid::Uuid>>>,
     bare_warm: Arc<parking_lot::Mutex<std::collections::HashMap<uuid::Uuid, String>>>,
@@ -877,14 +948,17 @@ async fn warm_selector_candidate(
         generation,
         proxy_registry,
         connection_pool,
+        #[cfg(feature = "honk-policy")]
+        group_manager,
         stats,
         bare_warm,
         ..
     } = resources;
     // Purge a moved endpoint before redial: failure must not keep the old
     // socket pinned under a stable node ID.
-    let supports_bare = (honk_outbound::descriptor::descriptor(node.protocol).pool_bare_tcp)(&node);
-    let bare_addr = supports_bare.then(|| format!("{}:{}", node.host(), node.port));
+    let descriptor = honk_outbound::descriptor::descriptor(node.protocol);
+    let bare_addr =
+        (descriptor.pool_bare_tcp)(&node).then(|| format!("{}:{}", node.host(), node.port));
     let stale = {
         let mut retained = bare_warm.lock();
         match (retained.get(&node.id), bare_addr.as_ref()) {
@@ -897,48 +971,123 @@ async fn warm_selector_candidate(
         connection_pool.purge_bare(&stale);
         stats.clear_warm(node.id, crate::stats::WarmReason::Selector);
     }
-    match proxy_registry
-        .warm_session(Arc::clone(&generation), node.id, connect_timeout)
-        .await
-    {
-        Ok(honk_outbound::proxy::WarmOutcome::Ready) => {
-            if let Some(addr) = bare_warm.lock().remove(&node.id) {
-                connection_pool.purge_bare(&addr);
-            }
-            stats.mark_warm(node.id, crate::stats::WarmReason::Selector);
-        }
-        Ok(honk_outbound::proxy::WarmOutcome::NotApplicable) => {
-            let Some(addr) = bare_addr else {
-                return;
-            };
-            if !connection_pool.has_live_bare_entry(&addr) {
-                let stream =
-                    match honk_outbound::util::connect_outbound(&addr, connect_timeout).await {
-                        Ok(stream) if !generation.is_shutdown() && is_tcp_stream_alive(&stream) => {
-                            stream
-                        }
-                        Ok(_) => return,
-                        Err(error) => {
-                            debug!(node = %node.name, %error, "Selector warm bare TCP failed");
-                            return;
-                        }
-                    };
-                connection_pool.deposit_tcp(&addr, stream).await;
-            }
-            if connection_pool.has_live_bare_entry(&addr) {
-                let old = bare_warm.lock().insert(node.id, addr.clone());
-                if let Some(old) = old.filter(|old| old != &addr) {
-                    connection_pool.purge_bare(&old);
+
+    if descriptor.has_generation_runtime(&node) {
+        #[cfg(feature = "honk-policy")]
+        let reporter = group_manager
+            .read()
+            .feedback_for_node(
+                node.id,
+                crate::group::HonkSelectionContext::aggregate(
+                    crate::group::SelectionNetwork::Tcp,
+                    ProbeDomain::Tcp,
+                    IpVersion::V4,
+                ),
+            )
+            .map(|feedback| feedback.start());
+        match proxy_registry
+            .warm_session(Arc::clone(&generation), node.id, connect_timeout)
+            .await
+        {
+            Ok(honk_outbound::proxy::WarmOutcome::Ready) => {
+                #[cfg(feature = "honk-policy")]
+                if let Some(reporter) = &reporter {
+                    reporter.setup_succeeded();
+                    reporter.finish(crate::group::HonkOutcome::Success);
+                }
+                if let Some(addr) = bare_warm.lock().remove(&node.id) {
+                    connection_pool.purge_bare(&addr);
                 }
                 stats.mark_warm(node.id, crate::stats::WarmReason::Selector);
+                return;
+            }
+            Ok(honk_outbound::proxy::WarmOutcome::NotApplicable) => {}
+            Err(error) if generation.is_shutdown() => {
+                #[cfg(feature = "honk-policy")]
+                if let Some(reporter) = &reporter {
+                    reporter.finish(crate::group::HonkOutcome::Shutdown);
+                }
+                debug!(node = %node.name, %error, "Selector warm generation ended");
+                return;
+            }
+            Err(error) => {
+                #[cfg(feature = "honk-policy")]
+                if let Some(reporter) = &reporter {
+                    reporter.setup_failed(if error.is::<tokio::time::error::Elapsed>() {
+                        crate::group::HonkOutcome::Timeout
+                    } else {
+                        crate::group::HonkOutcome::from_error(&error)
+                    });
+                }
+                debug!(node = %node.name, %error, "Selector warm session failed");
+                return;
             }
         }
-        Err(error) if generation.is_shutdown() => {
-            debug!(node = %node.name, %error, "Selector warm generation ended");
+    }
+
+    let Some(addr) = bare_addr else {
+        return;
+    };
+    if !connection_pool.has_live_bare_entry(&addr) {
+        #[cfg(feature = "honk-policy")]
+        let reporter = group_manager
+            .read()
+            .feedback_for_node(
+                node.id,
+                crate::group::HonkSelectionContext::aggregate(
+                    crate::group::SelectionNetwork::Tcp,
+                    ProbeDomain::Tcp,
+                    IpVersion::V4,
+                ),
+            )
+            .map(|feedback| feedback.start());
+        let stream = match honk_outbound::util::connect_outbound(&addr, connect_timeout).await {
+            Ok(_) if generation.is_shutdown() => {
+                #[cfg(feature = "honk-policy")]
+                if let Some(reporter) = &reporter {
+                    reporter.finish(crate::group::HonkOutcome::Shutdown);
+                }
+                return;
+            }
+            Ok(stream) if is_tcp_stream_alive(&stream) => stream,
+            Ok(_) => {
+                #[cfg(feature = "honk-policy")]
+                if let Some(reporter) = &reporter {
+                    reporter.setup_failed(crate::group::HonkOutcome::Io(
+                        io::ErrorKind::ConnectionAborted,
+                    ));
+                }
+                return;
+            }
+            Err(error) => {
+                #[cfg(feature = "honk-policy")]
+                if let Some(reporter) = &reporter {
+                    reporter.setup_failed(if error.kind() == io::ErrorKind::TimedOut {
+                        crate::group::HonkOutcome::Timeout
+                    } else {
+                        crate::group::HonkOutcome::Io(error.kind())
+                    });
+                }
+                debug!(node = %node.name, %error, "Selector warm bare TCP failed");
+                return;
+            }
+        };
+        #[cfg(feature = "honk-policy")]
+        if let Some(reporter) = &reporter {
+            reporter.setup_succeeded();
         }
-        Err(error) => {
-            debug!(node = %node.name, %error, "Selector warm session failed");
+        connection_pool.deposit_tcp(&addr, stream).await;
+        #[cfg(feature = "honk-policy")]
+        if let Some(reporter) = &reporter {
+            reporter.finish(crate::group::HonkOutcome::Success);
         }
+    }
+    if connection_pool.has_live_bare_entry(&addr) {
+        let old = bare_warm.lock().insert(node.id, addr.clone());
+        if let Some(old) = old.filter(|old| old != &addr) {
+            connection_pool.purge_bare(&old);
+        }
+        stats.mark_warm(node.id, crate::stats::WarmReason::Selector);
     }
 }
 
@@ -1463,6 +1612,7 @@ fn open_group_connectivity(ebpf: &mut dyn EbpfBackend, group_count: usize) -> an
     Ok(())
 }
 
+#[cfg(any(not(feature = "honk-policy"), feature = "clash-api"))]
 pub(crate) fn resolve_outbound_nodes(
     config: &Config,
     group_manager: &GroupManager,
@@ -1527,6 +1677,157 @@ pub(crate) fn resolve_outbound_nodes(
     vec![Config::builtin_direct_node()]
 }
 
+#[cfg(feature = "honk-policy")]
+#[derive(Debug, Clone)]
+pub(super) struct ResolvedHonkPlan {
+    pub(super) mode: honk_outbound::group::SelectionPlanMode,
+    pub(super) nodes: Vec<Node>,
+    pub(super) health_family: IpVersion,
+    pub(super) feedback: Vec<Option<honk_outbound::group::HonkFeedback>>,
+    pub(super) selection_chains: Vec<Vec<String>>,
+}
+
+#[cfg(feature = "honk-policy")]
+pub(super) fn resolve_outbound_plan_for_target(
+    config: &Config,
+    group_manager: &GroupManager,
+    outbound_name: &str,
+    context: &honk_outbound::group::HonkSelectionContext,
+) -> ResolvedHonkPlan {
+    resolve_outbound_plan_for_target_inner(
+        config,
+        group_manager,
+        outbound_name,
+        context,
+        0,
+        &mut Vec::new(),
+    )
+}
+
+#[cfg(feature = "honk-policy")]
+fn resolve_outbound_plan_for_target_inner(
+    config: &Config,
+    group_manager: &GroupManager,
+    outbound_name: &str,
+    context: &honk_outbound::group::HonkSelectionContext,
+    depth: usize,
+    visited: &mut Vec<String>,
+) -> ResolvedHonkPlan {
+    if let Some(node) = config.builtin_node(outbound_name) {
+        return ResolvedHonkPlan {
+            mode: honk_outbound::group::SelectionPlanMode::Authoritative,
+            nodes: vec![node],
+            health_family: context.health_family,
+            feedback: vec![None],
+            selection_chains: vec![vec![outbound_name.to_owned()]],
+        };
+    }
+    if let Some(node) = config.nodes.iter().find(|node| node.name == outbound_name) {
+        let health_family = if group_manager.is_node_selectable_for_domain(
+            node.id,
+            context.probe_domain,
+            context.health_family,
+        ) {
+            Some(context.health_family)
+        } else if context.health_family == IpVersion::V6
+            && group_manager.is_node_selectable_for_domain(
+                node.id,
+                context.probe_domain,
+                IpVersion::V4,
+            )
+        {
+            Some(IpVersion::V4)
+        } else {
+            None
+        };
+        return ResolvedHonkPlan {
+            mode: honk_outbound::group::SelectionPlanMode::Authoritative,
+            nodes: health_family.map(|_| node.clone()).into_iter().collect(),
+            health_family: health_family.unwrap_or(context.health_family),
+            feedback: health_family.map(|_| None).into_iter().collect(),
+            selection_chains: health_family
+                .map(|_| vec![node.name.clone()])
+                .into_iter()
+                .collect(),
+        };
+    }
+    let Some(group) = config
+        .groups
+        .iter()
+        .find(|group| group.name == outbound_name)
+    else {
+        return ResolvedHonkPlan {
+            mode: honk_outbound::group::SelectionPlanMode::Authoritative,
+            nodes: vec![Config::builtin_direct_node()],
+            health_family: context.health_family,
+            feedback: vec![None],
+            selection_chains: vec![vec![Config::BUILTIN_DIRECT_NODE.to_owned()]],
+        };
+    };
+    if depth >= honk_outbound::group::MAX_GROUP_DEPTH
+        || visited.iter().any(|name| name == outbound_name)
+    {
+        return ResolvedHonkPlan {
+            mode: honk_outbound::group::SelectionPlanMode::Authoritative,
+            nodes: Vec::new(),
+            health_family: context.health_family,
+            feedback: Vec::new(),
+            selection_chains: Vec::new(),
+        };
+    }
+    let plan = group_manager.selection_plan_for_target_with_health_fallback(outbound_name, context);
+    if !plan.entries.is_empty() {
+        let mut nodes = Vec::with_capacity(plan.entries.len());
+        let mut feedback = Vec::with_capacity(plan.entries.len());
+        let mut selection_chains = Vec::with_capacity(plan.entries.len());
+        for entry in plan.entries {
+            nodes.push(entry.node.clone());
+            feedback.push(entry.feedback);
+            selection_chains.push(entry.selection_chain);
+        }
+        return ResolvedHonkPlan {
+            mode: plan.mode,
+            nodes,
+            health_family: plan.health_family,
+            feedback,
+            selection_chains,
+        };
+    }
+    let Some(final_name) = group.final_outbound.as_deref() else {
+        return ResolvedHonkPlan {
+            mode: plan.mode,
+            nodes: Vec::new(),
+            health_family: plan.health_family,
+            feedback: Vec::new(),
+            selection_chains: Vec::new(),
+        };
+    };
+    visited.push(outbound_name.to_owned());
+    let mut terminal = resolve_outbound_plan_for_target_inner(
+        config,
+        group_manager,
+        final_name,
+        context,
+        depth + 1,
+        visited,
+    );
+    visited.pop();
+    for chain in &mut terminal.selection_chains {
+        chain.insert(0, outbound_name.to_owned());
+    }
+    for (index, node) in terminal.nodes.iter().enumerate() {
+        let outer = group_manager.feedback_for_group_node(outbound_name, node.id, context.clone());
+        terminal.feedback[index] = match (outer, terminal.feedback[index].take()) {
+            (Some(outer), Some(inner)) => {
+                Some(inner.prepend_attribution(outer.attributions()[0].group.clone(), node.id))
+            }
+            (Some(outer), None) => Some(outer),
+            (None, inner) => inner,
+        };
+    }
+    terminal
+}
+
 /// Concrete UDP candidates plus the provenance and IP family selected by
 /// the final outbound resolution. This companion does not change the legacy
 /// TCP/DNS `resolve_outbound_nodes` API.
@@ -1535,6 +1836,10 @@ pub(super) struct ResolvedUdpPlan {
     pub(super) mode: honk_outbound::group::SelectionPlanMode,
     pub(super) nodes: Vec<Node>,
     pub(super) ipver: IpVersion,
+    #[cfg(feature = "honk-policy")]
+    pub(super) feedback: Vec<Option<honk_outbound::group::HonkFeedback>>,
+    #[cfg(feature = "honk-policy")]
+    pub(super) selection_chains: Vec<Vec<String>>,
 }
 
 /// Resolve UDP candidates without inferring policy from candidate count.
@@ -1544,6 +1849,7 @@ pub(super) struct ResolvedUdpPlan {
 /// mode and resolved IP version replace the outer plan. Recursive final
 /// chains are bounded and cycle-safe; a missing final target retains the
 /// historical direct fallback, while a cycle/depth breach fails closed.
+#[cfg(any(test, not(feature = "honk-policy")))]
 pub(super) fn resolve_udp_outbound_plan(
     config: &Config,
     group_manager: &GroupManager,
@@ -1560,6 +1866,24 @@ pub(super) fn resolve_udp_outbound_plan(
     )
 }
 
+#[cfg(feature = "honk-policy")]
+pub(super) fn resolve_udp_outbound_plan_for_target(
+    config: &Config,
+    group_manager: &GroupManager,
+    outbound_name: &str,
+    context: &honk_outbound::group::HonkSelectionContext,
+) -> ResolvedUdpPlan {
+    let plan = resolve_outbound_plan_for_target(config, group_manager, outbound_name, context);
+    ResolvedUdpPlan {
+        mode: plan.mode,
+        nodes: plan.nodes,
+        ipver: plan.health_family,
+        feedback: plan.feedback,
+        selection_chains: plan.selection_chains,
+    }
+}
+
+#[cfg(any(test, not(feature = "honk-policy")))]
 fn resolve_udp_outbound_plan_inner(
     config: &Config,
     group_manager: &GroupManager,
@@ -1573,6 +1897,10 @@ fn resolve_udp_outbound_plan_inner(
             mode: honk_outbound::group::SelectionPlanMode::Authoritative,
             nodes: vec![node],
             ipver,
+            #[cfg(feature = "honk-policy")]
+            feedback: Vec::new(),
+            #[cfg(feature = "honk-policy")]
+            selection_chains: Vec::new(),
         };
     }
     if let Some(node) = config.nodes.iter().find(|node| node.name == outbound_name) {
@@ -1599,6 +1927,10 @@ fn resolve_udp_outbound_plan_inner(
             mode: honk_outbound::group::SelectionPlanMode::Authoritative,
             nodes,
             ipver: selected_ipver,
+            #[cfg(feature = "honk-policy")]
+            feedback: Vec::new(),
+            #[cfg(feature = "honk-policy")]
+            selection_chains: Vec::new(),
         };
     }
     let Some(group) = config
@@ -1614,6 +1946,10 @@ fn resolve_udp_outbound_plan_inner(
             mode: honk_outbound::group::SelectionPlanMode::Authoritative,
             nodes: vec![Config::builtin_direct_node()],
             ipver,
+            #[cfg(feature = "honk-policy")]
+            feedback: Vec::new(),
+            #[cfg(feature = "honk-policy")]
+            selection_chains: Vec::new(),
         };
     };
     if depth >= honk_outbound::group::MAX_GROUP_DEPTH
@@ -1627,6 +1963,10 @@ fn resolve_udp_outbound_plan_inner(
             mode: honk_outbound::group::SelectionPlanMode::Authoritative,
             nodes: vec![],
             ipver,
+            #[cfg(feature = "honk-policy")]
+            feedback: Vec::new(),
+            #[cfg(feature = "honk-policy")]
+            selection_chains: Vec::new(),
         };
     }
 
@@ -1657,6 +1997,10 @@ fn resolve_udp_outbound_plan_inner(
             mode: plan.mode,
             nodes: plan.nodes.into_iter().cloned().collect(),
             ipver: selected_ipver,
+            #[cfg(feature = "honk-policy")]
+            feedback: Vec::new(),
+            #[cfg(feature = "honk-policy")]
+            selection_chains: Vec::new(),
         };
     }
 
@@ -1681,6 +2025,10 @@ fn resolve_udp_outbound_plan_inner(
         mode: plan.mode,
         nodes: vec![],
         ipver: selected_ipver,
+        #[cfg(feature = "honk-policy")]
+        feedback: Vec::new(),
+        #[cfg(feature = "honk-policy")]
+        selection_chains: Vec::new(),
     }
 }
 
@@ -2471,6 +2819,8 @@ mod atomic_reload_tests {
             generation: Arc::clone(&generation),
             proxy_registry: cp.proxy_registry.clone(),
             connection_pool: cp.connection_pool.clone(),
+            #[cfg(feature = "honk-policy")]
+            group_manager: cp.group_manager.clone(),
             stats: cp.stats.clone(),
             selected_ids: cp.selector_warm_ids.clone(),
             bare_warm: cp.selector_bare_warm.clone(),

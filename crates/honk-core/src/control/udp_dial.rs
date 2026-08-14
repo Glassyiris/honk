@@ -12,10 +12,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinSet;
 
-/// One candidate transport-preparation future. The concrete transport is
-/// generic so paused scheduler tests can use a lightweight stand-in.
-pub(super) type UdpPrepare<T> =
-    Arc<dyn Fn(Node) -> Pin<Box<dyn Future<Output = anyhow::Result<T>> + Send>> + Send + Sync>;
+/// One candidate transport-preparation future. The candidate index preserves
+/// path-specific feedback when the same leaf appears through multiple groups.
+pub(super) type UdpPrepare<T> = Arc<
+    dyn Fn(usize, Node) -> Pin<Box<dyn Future<Output = anyhow::Result<T>> + Send>> + Send + Sync,
+>;
 
 /// Fixed callbacks let the scheduler keep policy, health, and metric effects
 /// at the integration boundary. In particular, only an actual future `Err`
@@ -81,7 +82,7 @@ where
             }
             let prepare = Arc::clone(&prepare);
             tasks.spawn(async move {
-                let result = prepare(node.clone()).await;
+                let result = prepare(next - 1, node.clone()).await;
                 (node, result)
             });
         }

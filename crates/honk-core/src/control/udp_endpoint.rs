@@ -10,6 +10,8 @@
 use crate::stats::{ActiveConnectionGuard, OutboundTracker, StatsManager};
 use bytes::Bytes;
 use dashmap::DashMap;
+#[cfg(feature = "honk-policy")]
+use honk_outbound::group::{HonkOutcome, HonkReporter};
 use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::io;
@@ -83,6 +85,9 @@ pub struct UdpEndpoint {
     download: Arc<AtomicU64>,
     /// Clash-API tracker connection id; set once at registration, taken at
     /// removal.  Not touched on the per-packet path.
+    #[cfg(feature = "honk-policy")]
+    honk_reporter: Mutex<Option<HonkReporter>>,
+    health_family: honk_outbound::alive::IpVersion,
     tracker_id: Mutex<Option<String>>,
 }
 
@@ -91,6 +96,23 @@ impl UdpEndpoint {
         proxy_socket: Arc<dyn honk_outbound::proxy::PacketTransport>,
         relay_addr: SocketAddr,
         node_id: uuid::Uuid,
+    ) -> Self {
+        Self::new_scored(
+            proxy_socket,
+            relay_addr,
+            node_id,
+            honk_outbound::alive::IpVersion::V4,
+            #[cfg(feature = "honk-policy")]
+            None,
+        )
+    }
+
+    pub fn new_scored(
+        proxy_socket: Arc<dyn honk_outbound::proxy::PacketTransport>,
+        relay_addr: SocketAddr,
+        node_id: uuid::Uuid,
+        health_family: honk_outbound::alive::IpVersion,
+        #[cfg(feature = "honk-policy")] honk_reporter: Option<HonkReporter>,
     ) -> Self {
         let now = monotonic_nanos();
         Self {
@@ -115,6 +137,9 @@ impl UdpEndpoint {
             upload: Arc::new(AtomicU64::new(0)),
             download: Arc::new(AtomicU64::new(0)),
             tracker_id: Mutex::new(None),
+            #[cfg(feature = "honk-policy")]
+            honk_reporter: Mutex::new(honk_reporter),
+            health_family,
         }
     }
 
@@ -137,6 +162,24 @@ impl UdpEndpoint {
     /// Count proxy→client bytes (lock-free).
     pub fn tracker_download(&self, n: u64) {
         self.download.fetch_add(n, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "honk-policy")]
+    pub(crate) fn honk_first_response(&self) {
+        if let Some(reporter) = self.honk_reporter.lock().as_ref() {
+            reporter.first_response();
+        }
+    }
+
+    #[cfg(feature = "honk-policy")]
+    pub(crate) fn finish_honk(&self, outcome: HonkOutcome) {
+        if let Some(reporter) = self.honk_reporter.lock().take() {
+            let upload = self.upload.load(Ordering::Relaxed);
+            let download = self.download.load(Ordering::Relaxed);
+            reporter.tx(upload);
+            reporter.rx(download);
+            reporter.finish(outcome);
+        }
     }
 
     /// Take the tracker connection id (on endpoint removal).
@@ -1797,6 +1840,8 @@ struct UdpDriverCleanupGuard {
     generation: u64,
     decision_token: u32,
     endpoint: Arc<UdpEndpoint>,
+    #[cfg(feature = "honk-policy")]
+    outcome: Option<HonkOutcome>,
 }
 
 impl UdpDriverCleanupGuard {
@@ -1813,7 +1858,14 @@ impl UdpDriverCleanupGuard {
             generation,
             decision_token,
             endpoint,
+            #[cfg(feature = "honk-policy")]
+            outcome: None,
         }
+    }
+
+    #[cfg(feature = "honk-policy")]
+    fn set_outcome(&mut self, outcome: HonkOutcome) {
+        self.outcome = Some(outcome);
     }
 }
 
@@ -1827,10 +1879,18 @@ struct UdpDriverContext {
     alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
     stats: Arc<StatsManager>,
     outbound_tracker: OutboundTracker,
+    health_family: honk_outbound::alive::IpVersion,
 }
 
 impl Drop for UdpDriverCleanupGuard {
     fn drop(&mut self) {
+        #[cfg(feature = "honk-policy")]
+        self.endpoint
+            .finish_honk(if self.pool.terminal.load(Ordering::Acquire) {
+                HonkOutcome::Shutdown
+            } else {
+                self.outcome.unwrap_or(HonkOutcome::Cancelled)
+            });
         self.endpoint.release();
         self.pool
             .retire_if_same(self.key, self.decision_token, self.generation);
@@ -1878,6 +1938,27 @@ impl UdpDriverHandle {
         }
     }
 }
+#[cfg(feature = "honk-policy")]
+fn honk_driver_outcome(endpoint: &UdpEndpoint, result: &io::Result<()>) -> HonkOutcome {
+    if endpoint.dead.load(Ordering::Acquire) {
+        return if endpoint.has_reply() {
+            HonkOutcome::Success
+        } else {
+            HonkOutcome::Cancelled
+        };
+    }
+    match result {
+        Ok(()) => HonkOutcome::Success,
+        Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+            if endpoint.has_reply() {
+                HonkOutcome::Success
+            } else {
+                HonkOutcome::Timeout
+            }
+        }
+        Err(error) => HonkOutcome::Io(error.kind()),
+    }
+}
 
 impl UdpEndpointPool {
     #[allow(clippy::too_many_arguments)]
@@ -1921,7 +2002,7 @@ impl UdpEndpointPool {
         let task = drivers.tasks.spawn(async move {
             // Construct before every await so abort and panic take the same
             // cleanup path as an ordinary driver return.
-            let _cleanup = UdpDriverCleanupGuard::new(
+            let mut _cleanup = UdpDriverCleanupGuard::new(
                 Arc::clone(&pool),
                 key,
                 generation,
@@ -1944,11 +2025,14 @@ impl UdpEndpointPool {
                     alive_set,
                     stats,
                     outbound_tracker,
+                    health_family: endpoint.health_family,
                 },
                 initial,
                 first_ack_tx,
             )
             .await;
+            #[cfg(feature = "honk-policy")]
+            _cleanup.set_outcome(honk_driver_outcome(&endpoint, &result));
             if let Err(error) = result {
                 debug!(
                     "UDP endpoint driver {} -> {} stopped: {}",
@@ -1984,6 +2068,7 @@ async fn run_endpoint_driver(
         alive_set,
         stats,
         outbound_tracker,
+        health_family,
     } = context;
     // Sniffing may have consumed later QUIC Initial fragments from the queue.
     // Send that retained prefix before the untouched receiver queue so the
@@ -2006,17 +2091,14 @@ async fn run_endpoint_driver(
         }
         Err(error) => {
             if !endpoint.dead.load(Ordering::Acquire) {
-                let ipver = if client_dst.is_ipv4() {
-                    honk_outbound::alive::IpVersion::V4
-                } else {
-                    honk_outbound::alive::IpVersion::V6
-                };
                 alive_set.report_unavailable_traffic(
                     endpoint.node_id,
                     honk_outbound::alive::ProbeDomain::DataUdp,
-                    ipver,
+                    health_family,
                 );
             }
+            #[cfg(feature = "honk-policy")]
+            let _ = &error;
             let _ = first_ack.send(Err(io::Error::new(error.kind(), error.to_string())));
             return Err(error);
         }
@@ -2045,17 +2127,14 @@ async fn run_endpoint_driver(
         result = &mut receiver => result,
     };
     if result.is_err() && !endpoint.dead.load(Ordering::Acquire) {
-        let ipver = if client_dst.is_ipv4() {
-            honk_outbound::alive::IpVersion::V4
-        } else {
-            honk_outbound::alive::IpVersion::V6
-        };
         alive_set.report_unavailable_traffic(
             endpoint.node_id,
             honk_outbound::alive::ProbeDomain::DataUdp,
-            ipver,
+            health_family,
         );
     }
+    #[cfg(feature = "honk-policy")]
+    let _ = &result;
     result
 }
 
@@ -2134,11 +2213,7 @@ async fn receive_loop(
     stats: Arc<StatsManager>,
     outbound_tracker: OutboundTracker,
 ) -> io::Result<()> {
-    let ipver = if client_dst.is_ipv4() {
-        honk_outbound::alive::IpVersion::V4
-    } else {
-        honk_outbound::alive::IpVersion::V6
-    };
+    let ipver = endpoint.health_family;
     // The normal fixed-target path keeps using the pre-created socket without
     // allocating. Full-cone sources populate this small endpoint-local cache.
     let mut alternate_reply_sockets = Vec::new();
@@ -2206,6 +2281,8 @@ async fn receive_loop(
             stats.record_udp_first_reply_latency(elapsed);
         }
         endpoint.tracker_download(n as u64);
+        #[cfg(feature = "honk-policy")]
+        endpoint.honk_first_response();
         outbound_tracker.add_bytes(0, n as u64);
         if endpoint.take_alive_report_slot() {
             alive_set.report_available_traffic(
@@ -2254,6 +2331,26 @@ mod tests {
             .next_alive_report_at
             .store(monotonic_nanos().saturating_sub(1), Ordering::Relaxed);
         assert!(endpoint.take_alive_report_slot());
+    }
+
+    #[cfg(feature = "honk-policy")]
+    #[tokio::test]
+    async fn explicit_retirement_is_neutral_until_a_reply_makes_it_useful() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let relay = "127.0.0.1:53".parse().unwrap();
+        let endpoint = UdpEndpoint::new(transport(socket, relay), relay, uuid::Uuid::new_v4());
+        let result = Err(io::Error::new(io::ErrorKind::BrokenPipe, "retired"));
+        endpoint.kill();
+
+        assert_eq!(
+            honk_driver_outcome(&endpoint, &result),
+            HonkOutcome::Cancelled
+        );
+        endpoint.has_reply.store(true, Ordering::Relaxed);
+        assert_eq!(
+            honk_driver_outcome(&endpoint, &result),
+            HonkOutcome::Success
+        );
     }
 
     async fn recv_and_ack(
@@ -2328,6 +2425,11 @@ mod tests {
                 alive_set,
                 stats,
                 outbound_tracker,
+                health_family: if client_dst.is_ipv6() {
+                    honk_outbound::alive::IpVersion::V6
+                } else {
+                    honk_outbound::alive::IpVersion::V4
+                },
             },
             UdpDriverStart {
                 first,

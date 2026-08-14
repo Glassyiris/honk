@@ -402,6 +402,94 @@ async fn test_proxies_structure_and_selector_switch() {
     assert_eq!(resp.status(), 400);
 }
 
+#[cfg(feature = "honk-policy")]
+#[tokio::test]
+async fn test_honk_proxy_contract_and_put_rejection() {
+    use honk_outbound::group::{HonkOutcome, HonkSelectionContext, HonkTarget, SelectionNetwork};
+
+    let (a, b) = (make_node("node-a"), make_node("node-b"));
+    let group = Group {
+        name: "auto".into(),
+        policy: honk_config::group::GroupPolicy::Honk,
+        nodes: vec![a.id, b.id],
+        ..Default::default()
+    };
+    let app = spawn_app_with_config(
+        Config {
+            nodes: vec![a.clone(), b.clone()],
+            groups: vec![group],
+            ..Default::default()
+        },
+        "",
+        "",
+    )
+    .await;
+    let context = HonkSelectionContext {
+        network: SelectionNetwork::Tcp,
+        probe_domain: ProbeDomain::Tcp,
+        target_family: Some(IpVersion::V4),
+        health_family: IpVersion::V4,
+        target: Some(HonkTarget::domain("seed.example", 443)),
+    };
+    let manager = app.state.group_manager.read().clone();
+    let first = manager.selection_plan_for_target("auto", &context);
+    assert_eq!(first.entries[0].node.id, a.id);
+    first.entries[0]
+        .feedback
+        .as_ref()
+        .unwrap()
+        .start()
+        .setup_failed(HonkOutcome::Timeout);
+    let second = manager.selection_plan_for_target("auto", &context);
+    assert_eq!(second.entries[0].node.id, b.id);
+    let reporter = second.entries[0].feedback.as_ref().unwrap().start();
+    reporter.setup_succeeded();
+    reporter.tx(1);
+    reporter.rx(1);
+    reporter.finish(HonkOutcome::Success);
+
+    let client = http_client();
+    let body: serde_json::Value = client
+        .get(app.url("/proxies"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["proxies"]["auto"]["type"], "url_test");
+    assert_eq!(
+        body["proxies"]["auto"]["all"],
+        serde_json::json!(["node-a", "node-b"])
+    );
+    assert_eq!(body["proxies"]["auto"]["now"], "node-b");
+
+    let response = client
+        .put(app.url("/proxies/auto"))
+        .json(&serde_json::json!({"name": "node-a"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    assert_eq!(
+        app.state
+            .cache_db
+            .as_ref()
+            .unwrap()
+            .load_selector_choice("auto"),
+        None
+    );
+    let body: serde_json::Value = client
+        .get(app.url("/proxies/auto"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["now"], "node-b");
+}
+
 /// Dashboards (metacubexd/zashboard) send PUT/PATCH without a JSON
 /// Content-Type; the API must still accept them (mihomo parity).
 #[tokio::test]
@@ -840,6 +928,65 @@ async fn test_group_delay_omits_failed_members() {
     assert_eq!(resp.status(), 404);
 }
 
+#[cfg(feature = "honk-policy")]
+#[tokio::test]
+async fn test_honk_group_delay_returns_current_winner_latency() {
+    use honk_outbound::group::{HonkOutcome, HonkSelectionContext, SelectionNetwork};
+
+    let direct = Config::builtin_direct_node();
+    let unreachable = make_node("unreachable");
+    let group = Group {
+        name: "auto-delay".into(),
+        policy: honk_config::group::GroupPolicy::Honk,
+        nodes: vec![unreachable.id, direct.id],
+        ..Default::default()
+    };
+    let app = spawn_app_with_config(
+        Config {
+            nodes: vec![unreachable.clone(), direct.clone()],
+            groups: vec![group],
+            ..Default::default()
+        },
+        "",
+        "",
+    )
+    .await;
+    let manager = app.state.group_manager.read().clone();
+    let aggregate =
+        HonkSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
+    manager
+        .feedback_for_group_node("auto-delay", unreachable.id, aggregate.clone())
+        .unwrap()
+        .start()
+        .setup_failed(HonkOutcome::Timeout);
+    let reporter = manager
+        .feedback_for_group_node("auto-delay", direct.id, aggregate)
+        .unwrap()
+        .start();
+    reporter.setup_succeeded();
+    reporter.tx(1);
+    reporter.rx(1);
+    reporter.finish(HonkOutcome::Success);
+    assert_eq!(
+        manager.get_honk_selection_for_network("auto-delay", SelectionNetwork::Tcp),
+        Some(Config::BUILTIN_DIRECT_NODE.into())
+    );
+
+    let http_addr = spawn_mock_http_server().await;
+    let response = http_client()
+        .get(app.url(&format!(
+            "/proxies/auto-delay/delay?url=http://{http_addr}/&timeout=1000"
+        )))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let delay = response.json::<serde_json::Value>().await.unwrap()["delay"]
+        .as_u64()
+        .unwrap();
+    assert!(delay < 1000);
+}
+
 #[tokio::test]
 async fn test_group_delay_returns_member_results_for_zashboard_core_mode() {
     let direct = Config::builtin_direct_node();
@@ -859,11 +1006,12 @@ async fn test_group_delay_returns_member_results_for_zashboard_core_mode() {
         "",
     )
     .await;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    honk_outbound::urltest::set_urltest_direct_target(listener.local_addr().unwrap());
+    let http_addr = spawn_mock_http_server().await;
 
     let response = http_client()
-        .get(app.url("/group/proxy/delay?url=http://unused.invalid/&timeout=1000"))
+        .get(app.url(&format!(
+            "/group/proxy/delay?url=http://{http_addr}/&timeout=1000"
+        )))
         .send()
         .await
         .unwrap();

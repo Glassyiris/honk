@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::time::Duration;
 
 const MAX_IDLE_STREAMS: usize = 4;
@@ -15,11 +16,12 @@ pub(super) async fn idle_pool_exchange<S, Dial, DialFut>(
     dial: Dial,
     raw_query: &[u8],
     query_timeout: Duration,
+    #[cfg(feature = "honk-policy")] reporter: Option<&honk_outbound::group::HonkReporter>,
 ) -> anyhow::Result<Vec<u8>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     Dial: FnOnce() -> DialFut,
-    DialFut: std::future::Future<Output = anyhow::Result<S>>,
+    DialFut: Future<Output = anyhow::Result<S>>,
 {
     let lifecycle = lifecycle.read().await;
     match *lifecycle {
@@ -31,8 +33,18 @@ where
         Some(s) => s,
         None => dial().await?,
     };
-    let resp =
-        super::framing::exchange_length_prefixed(&mut stream, raw_query, query_timeout).await?;
+    #[cfg(feature = "honk-policy")]
+    if let Some(reporter) = reporter {
+        reporter.setup_succeeded();
+    }
+    let resp = super::framing::exchange_length_prefixed_reported(
+        &mut stream,
+        raw_query,
+        query_timeout,
+        #[cfg(feature = "honk-policy")]
+        reporter,
+    )
+    .await?;
     let mut guard = idle.lock();
     if guard.len() < MAX_IDLE_STREAMS {
         guard.push(stream);

@@ -59,18 +59,37 @@ impl GroupManager {
         &self,
         candidates: &[Candidate<'a>],
         group: &Group,
-    ) -> &'a Node {
+    ) -> Candidate<'a> {
         if let Some(choice) = self.selector_choice.read().get(&group.name)
             && let Some(c) = candidates.iter().find(|c| c.tag == choice.as_str())
         {
-            return c.node;
+            return c.clone();
         }
-        if let Some(ref default_name) = group.default
+        if let Some(default_name) = &group.default
             && let Some(c) = candidates.iter().find(|c| c.tag == default_name.as_str())
         {
-            return c.node;
+            return c.clone();
         }
-        candidates[0].node
+        candidates[0].clone()
+    }
+    #[cfg(feature = "honk-policy")]
+    pub(super) fn pick_honk<'a>(
+        &self,
+        candidates: &[Candidate<'a>],
+        group: &Group,
+        context: &HonkSelectionContext,
+    ) -> Candidate<'a> {
+        let mut unique = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            if !unique
+                .iter()
+                .any(|existing: &&Candidate<'a>| existing.node.id == candidate.node.id)
+            {
+                unique.push(candidate);
+            }
+        }
+        let nodes: Vec<_> = unique.iter().map(|candidate| candidate.node).collect();
+        unique[self.honk_state.rank(&group.name, context, &nodes)].clone()
     }
 
     /// URLTest policy: lowest-latency alive candidate with tolerance-based
@@ -87,7 +106,7 @@ impl GroupManager {
         network: SelectionNetwork,
         ipver: IpVersion,
         effects: SelectionEffects,
-    ) -> &'a Node {
+    ) -> Candidate<'a> {
         let tolerance = Duration::from_millis(group.tolerance.max(1));
 
         // UDP selection with no UDP-specific measurement data mirrors the
@@ -103,14 +122,14 @@ impl GroupManager {
                 cache.get(&group.name).and_then(|sel| sel.tcp.clone())
             };
             if let Some(entry) = tcp_entry
-                && let Some(&c) = candidates.iter().find(|c| c.tag == entry.tag)
+                && let Some(c) = candidates.iter().find(|c| c.tag == entry.tag)
             {
                 if effects.applies()
-                    && self.cache_urltest_selection(group, network, &c, entry.latency)
+                    && self.cache_urltest_selection(group, network, c, entry.latency)
                 {
                     self.maybe_interrupt(&group.name);
                 }
-                return c.node;
+                return c.clone();
             }
             // No usable TCP selection yet — fall through to the normal
             // evaluation (which ranks by the latency fallback chain).
@@ -153,7 +172,7 @@ impl GroupManager {
                     )
                     && best_latency.saturating_add(tolerance) >= current_latency
                 {
-                    return candidates[pos].node;
+                    return candidates[pos].clone();
                 }
             }
         }
@@ -169,7 +188,7 @@ impl GroupManager {
             self.maybe_interrupt(&group.name);
         }
 
-        best.node
+        best
     }
 
     /// LoadBalance policy: round-robin over the alive candidates in member
@@ -187,20 +206,20 @@ impl GroupManager {
         group: &Group,
         network: SelectionNetwork,
         effects: SelectionEffects,
-    ) -> &'a Node {
+    ) -> Candidate<'a> {
         let Some(counter) = self
             .lb_counters
             .get(&group.name)
             .map(|counters| &counters[network.slot()])
         else {
-            return candidates[0].node;
+            return candidates[0].clone();
         };
         let cursor = if effects.applies() {
             counter.fetch_add(1, Ordering::Relaxed)
         } else {
             counter.load(Ordering::Relaxed)
         };
-        candidates[cursor % candidates.len()].node
+        candidates[cursor % candidates.len()].clone()
     }
 
     /// Fallback policy: first alive candidate in member order, pinned.
@@ -218,22 +237,22 @@ impl GroupManager {
         group: &Group,
         network: SelectionNetwork,
         effects: SelectionEffects,
-    ) -> &'a Node {
+    ) -> Candidate<'a> {
         {
             let cache = self.fallback_cache.read();
             if let Some(pinned) = cache
                 .get(&group.name)
                 .and_then(|pins| pins[network.slot()].as_deref())
-                && let Some(&c) = candidates.iter().find(|c| c.tag == pinned)
+                && let Some(c) = candidates.iter().find(|c| c.tag == pinned)
             {
-                return c.node;
+                return c.clone();
             }
         }
-        let first = candidates[0];
+        let first = candidates[0].clone();
         if effects.applies() && self.cache_fallback_selection(group, network, &first) {
             self.maybe_interrupt(&group.name);
         }
-        first.node
+        first
     }
 
     /// Pick the candidate with the lowest probe latency from alive_set.
@@ -257,8 +276,8 @@ impl GroupManager {
                     self.node_latency(c.node, network, ipver, group.check_url.as_deref(), c.tag),
                 )
             })
-            .copied()
-            .unwrap_or(candidates[0])
+            .cloned()
+            .unwrap_or_else(|| candidates[0].clone())
     }
 
     /// Whether the node carries pending failure strikes. UDP checks both

@@ -27,6 +27,10 @@ use honk_config::node::Node;
 use honk_config::types::NodeProtocol;
 use honk_outbound::alive::{IpVersion, ProbeDomain};
 use honk_outbound::group::SharedGroupManager;
+#[cfg(feature = "honk-policy")]
+use honk_outbound::group::{
+    HonkFeedback, HonkOutcome, HonkReporter, HonkSelectionContext, HonkTarget, SelectionNetwork,
+};
 use honk_outbound::proxy::{AsyncReadWrite, ProxyRegistry};
 use honk_outbound::runtime::SharedRuntimeRegistry;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -34,6 +38,14 @@ use tokio::sync::RwLock;
 use tracing::info;
 
 use crate::routing::{ConnectionInfo, Router};
+#[cfg(feature = "honk-policy")]
+type UiHonkFeedback = Option<HonkFeedback>;
+#[cfg(not(feature = "honk-policy"))]
+type UiHonkFeedback = Option<()>;
+#[cfg(feature = "honk-policy")]
+type UiHonkReporter = Option<HonkReporter>;
+#[cfg(not(feature = "honk-policy"))]
+type UiHonkReporter = Option<()>;
 
 /// Default dashboard archive (zashboard release `dist.zip`, latest).
 pub const DEFAULT_UI_DOWNLOAD_URL: &str =
@@ -111,24 +123,54 @@ fn download_url() -> String {
 
 /// Where the routing decision sends the download.
 enum UiRoute {
-    Direct,
+    Direct {
+        feedback: UiHonkFeedback,
+    },
     Block,
-    Proxy(Box<Node>),
+    Proxy {
+        node: Box<Node>,
+        feedback: UiHonkFeedback,
+    },
 }
 
 /// Run the download target through the same routing pipeline as user
 /// traffic: `Router::route_with_must` for the outbound name, then the
 /// authoritative group/leaf resolution for the node to dial.
 async fn decide_route(ctx: &UiDownloadContext, host: &str, port: u16) -> anyhow::Result<UiRoute> {
-    let (dst_ip, domain) = match host.parse::<std::net::IpAddr>() {
-        Ok(ip) => (ip, None),
-        Err(_) => (
-            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+    #[cfg(feature = "honk-policy")]
+    let host_ip = parse_host_ip(host);
+    #[cfg(not(feature = "honk-policy"))]
+    let host_ip = host.parse::<std::net::IpAddr>().ok();
+    #[cfg(feature = "honk-policy")]
+    let resolved_ip = if let Some(ip) = host_ip {
+        Some(ip)
+    } else {
+        honk_outbound::bootstrap::resolve(host)
+            .await
+            .ok()
+            .and_then(|addresses| addresses.into_iter().next())
+    };
+    let (dst_ip, domain) = match host_ip {
+        Some(ip) => (
+            ip,
+            (!host.parse::<std::net::IpAddr>().is_ok()).then(|| host.to_string()),
+        ),
+        None => (
+            {
+                #[cfg(feature = "honk-policy")]
+                {
+                    resolved_ip.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+                }
+                #[cfg(not(feature = "honk-policy"))]
+                {
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+                }
+            },
             Some(host.to_string()),
         ),
     };
     let info = ConnectionInfo {
-        domain,
+        domain: domain.clone(),
         dst_ip,
         dst_port: port,
         src_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
@@ -146,37 +188,87 @@ async fn decide_route(ctx: &UiDownloadContext, host: &str, port: u16) -> anyhow:
             .map(|m| format!("{}:{}", m.rule_type, m.rule_payload));
         (outbound.to_string(), rule)
     };
-    let nodes = {
-        let config = ctx.config.read().await;
-        let group_manager = ctx.group_manager.read().clone();
-        let ipver = if matches!(dst_ip, std::net::IpAddr::V6(_)) {
+    let target_ipver = if matches!(dst_ip, std::net::IpAddr::V6(_)) {
+        IpVersion::V6
+    } else {
+        IpVersion::V4
+    };
+    #[cfg(feature = "honk-policy")]
+    let score_ipver = resolved_ip.map(|ip| {
+        if ip.is_ipv6() {
             IpVersion::V6
         } else {
             IpVersion::V4
-        };
+        }
+    });
+    #[cfg(feature = "honk-policy")]
+    let (nodes, feedback) = {
+        let config = ctx.config.read().await;
+        let group_manager = ctx.group_manager.read().clone();
+        if config.groups.iter().any(|group| group.name == outbound) {
+            let context = HonkSelectionContext {
+                network: SelectionNetwork::Tcp,
+                probe_domain: ProbeDomain::Tcp,
+                target_family: score_ipver,
+                health_family: score_ipver.unwrap_or(target_ipver),
+                target: Some(if domain.is_some() {
+                    HonkTarget::domain(host, port)
+                } else {
+                    std::net::SocketAddr::new(dst_ip, port).into()
+                }),
+            };
+            let plan =
+                group_manager.selection_plan_for_target_with_health_fallback(&outbound, &context);
+            let mut entries = plan.entries.into_iter();
+            match entries.next() {
+                Some(entry) => (vec![entry.node.clone()], entry.feedback),
+                None => (Vec::new(), None),
+            }
+        } else {
+            (
+                crate::control::reload::resolve_outbound_nodes(
+                    &config,
+                    &group_manager,
+                    &outbound,
+                    ProbeDomain::Tcp,
+                    target_ipver,
+                ),
+                None,
+            )
+        }
+    };
+    #[cfg(not(feature = "honk-policy"))]
+    let nodes = {
+        let config = ctx.config.read().await;
+        let group_manager = ctx.group_manager.read().clone();
         crate::control::reload::resolve_outbound_nodes(
             &config,
             &group_manager,
             &outbound,
             ProbeDomain::Tcp,
-            ipver,
+            target_ipver,
         )
     };
+    #[cfg(not(feature = "honk-policy"))]
+    let feedback = None;
     let Some(node) = nodes.into_iter().next() else {
         anyhow::bail!("external UI download: outbound '{outbound}' has no available node");
     };
     let route = match node.protocol {
-        NodeProtocol::Direct => UiRoute::Direct,
+        NodeProtocol::Direct => UiRoute::Direct { feedback },
         NodeProtocol::Block => UiRoute::Block,
-        _ => UiRoute::Proxy(Box::new(node)),
+        _ => UiRoute::Proxy {
+            node: Box::new(node),
+            feedback,
+        },
     };
     info!(
         outbound = %outbound,
         rule = rule.as_deref().unwrap_or("fallback"),
         via = match &route {
-            UiRoute::Direct => "direct",
+            UiRoute::Direct { .. } => "direct",
             UiRoute::Block => "block",
-            UiRoute::Proxy(node) => node.name.as_str(),
+            UiRoute::Proxy { node, .. } => node.name.as_str(),
         },
         "external UI download routed"
     );
@@ -214,19 +306,20 @@ async fn fetch_routed(ctx: &UiDownloadContext, url: &str) -> anyhow::Result<Vec<
     let mut url = url.to_string();
     for _ in 0..=MAX_REDIRECTS {
         let (host, port, path, is_https) = parse_download_url(&url)?;
-        match decide_route(ctx, &host, port).await? {
-            UiRoute::Direct => return fetch_direct(&url).await,
+        let response = match decide_route(ctx, &host, port).await? {
+            UiRoute::Direct { feedback } => fetch_direct(&url, feedback).await?,
             UiRoute::Block => {
                 anyhow::bail!("routing sends the external UI download to 'block'");
             }
-            UiRoute::Proxy(node) => {
-                match fetch_proxied(ctx, &node, &host, port, &path, is_https).await? {
-                    ProxiedFetch::Body(bytes) => return Ok(bytes),
-                    ProxiedFetch::Redirect(location) => {
-                        url = reqwest::Url::parse(&url)?.join(&location)?.to_string();
-                        info!(url = %url, "external UI download following redirect");
-                    }
-                }
+            UiRoute::Proxy { node, feedback } => {
+                fetch_proxied(ctx, &node, feedback, &host, port, &path, is_https).await?
+            }
+        };
+        match response {
+            ProxiedFetch::Body(bytes) => return Ok(bytes),
+            ProxiedFetch::Redirect(location) => {
+                url = reqwest::Url::parse(&url)?.join(&location)?.to_string();
+                info!(url = %url, "external UI download following redirect");
             }
         }
     }
@@ -236,22 +329,63 @@ async fn fetch_routed(ctx: &UiDownloadContext, url: &str) -> anyhow::Result<Vec<
 /// Direct fetch: plain reqwest (the control-plane PID bypass keeps the
 /// gateway's own traffic out of the datapath), streaming with the archive
 /// size cap.
-async fn fetch_direct(url: &str) -> anyhow::Result<Vec<u8>> {
-    let client = reqwest::Client::builder()
-        .timeout(DOWNLOAD_TIMEOUT)
-        .build()?;
-    let mut response = client.get(url).send().await?;
-    if !response.status().is_success() {
-        anyhow::bail!("download external ui failed: {}", response.status());
-    }
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
-        if bytes.len() + chunk.len() > MAX_ARCHIVE_BYTES {
-            anyhow::bail!("external UI archive exceeds {} bytes", MAX_ARCHIVE_BYTES);
+async fn fetch_direct(url: &str, feedback: UiHonkFeedback) -> anyhow::Result<ProxiedFetch> {
+    #[cfg(feature = "honk-policy")]
+    let reporter = feedback.as_ref().map(HonkFeedback::start);
+    #[cfg(not(feature = "honk-policy"))]
+    let reporter = feedback;
+    #[cfg(not(feature = "honk-policy"))]
+    let _ = &reporter;
+    let result = async {
+        let client = reqwest::Client::builder()
+            .timeout(DOWNLOAD_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        let mut response = client.get(url).send().await?;
+        #[cfg(feature = "honk-policy")]
+        if let Some(reporter) = &reporter {
+            reporter.setup_succeeded();
+            reporter.first_response();
+            reporter.tx(url.len() as u64);
         }
-        bytes.extend_from_slice(&chunk);
+        if matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .ok_or_else(|| anyhow::anyhow!("redirect {} without Location", response.status()))?
+                .to_str()?
+                .to_string();
+            #[cfg(feature = "honk-policy")]
+            if let Some(reporter) = &reporter {
+                reporter.rx(location.len() as u64);
+            }
+            return Ok(ProxiedFetch::Redirect(location));
+        }
+        if !response.status().is_success() {
+            anyhow::bail!("download external ui failed: {}", response.status());
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if bytes.len() + chunk.len() > MAX_ARCHIVE_BYTES {
+                anyhow::bail!("external UI archive exceeds {} bytes", MAX_ARCHIVE_BYTES);
+            }
+            #[cfg(feature = "honk-policy")]
+            if let Some(reporter) = &reporter {
+                reporter.rx(chunk.len() as u64);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(ProxiedFetch::Body(bytes))
     }
-    Ok(bytes)
+    .await;
+    #[cfg(feature = "honk-policy")]
+    if let Some(reporter) = &reporter {
+        reporter.finish(match &result {
+            Ok(_) => HonkOutcome::Success,
+            Err(error) => HonkOutcome::from_error(error),
+        });
+    }
+    result
 }
 
 enum ProxiedFetch {
@@ -265,6 +399,7 @@ enum ProxiedFetch {
 async fn fetch_proxied(
     ctx: &UiDownloadContext,
     node: &Node,
+    feedback: UiHonkFeedback,
     host: &str,
     port: u16,
     path: &str,
@@ -277,9 +412,13 @@ async fn fetch_proxied(
     let connect_timeout = Duration::from_millis(ctx.config.read().await.global.connect_timeout_ms);
     // Tunnel handlers dial by domain; the address is only a fallback for
     // handlers that need a numeric target.
-    let (domain, addr) = match host.parse::<std::net::IpAddr>() {
-        Ok(ip) => (None, std::net::SocketAddr::new(ip, port)),
-        Err(_) => (Some(host), std::net::SocketAddr::from(([0, 0, 0, 0], port))),
+    #[cfg(feature = "honk-policy")]
+    let host_ip = parse_host_ip(host);
+    #[cfg(not(feature = "honk-policy"))]
+    let host_ip = host.parse::<std::net::IpAddr>().ok();
+    let (domain, addr) = match host_ip {
+        Some(ip) => (None, std::net::SocketAddr::new(ip, port)),
+        None => (Some(host), std::net::SocketAddr::from(([0, 0, 0, 0], port))),
     };
     let generation = ctx.runtime_registry.read().clone();
     let (runtime, guard) = match generation
@@ -292,19 +431,36 @@ async fn fetch_proxied(
             (guard.runtime(), Some(guard))
         }
     };
+    #[cfg(feature = "honk-policy")]
+    let reporter = feedback.as_ref().map(HonkFeedback::start);
+    #[cfg(not(feature = "honk-policy"))]
+    let reporter = feedback;
     let result = match entry
         .tcp
         .dial_runtime(runtime, addr, domain, connect_timeout)
         .await
     {
-        Ok(proxy) => tokio::time::timeout(
+        Ok(proxy) => match tokio::time::timeout(
             DOWNLOAD_TIMEOUT,
-            proxied_get(proxy.stream, host, path, is_https),
+            proxied_get(proxy.stream, host, path, is_https, &reporter),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("external UI download timed out"))?,
+        {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::Error::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "external UI download timed out",
+            ))),
+        },
         Err(e) => Err(e.context("external UI download dial failed")),
     };
+    #[cfg(feature = "honk-policy")]
+    if let Some(reporter) = &reporter {
+        reporter.finish(match &result {
+            Ok(_) => HonkOutcome::Success,
+            Err(error) => HonkOutcome::from_error(error),
+        });
+    }
     if let Some(guard) = guard {
         guard.close().await;
     }
@@ -317,28 +473,50 @@ async fn proxied_get(
     host: &str,
     path: &str,
     is_https: bool,
+    reporter: &UiHonkReporter,
 ) -> anyhow::Result<ProxiedFetch> {
+    #[cfg(not(feature = "honk-policy"))]
+    let _ = reporter;
     if is_https {
         let connector = honk_outbound::tls::build_dns_connector(false, HTTP11_ALPN_WIRE)?;
         let mut tls = connector.connect(host, stream).await?;
-        http_get(&mut tls, host, path).await
+        #[cfg(feature = "honk-policy")]
+        if let Some(reporter) = reporter {
+            reporter.setup_succeeded();
+        }
+        http_get(&mut tls, host, path, reporter).await
     } else {
         let mut stream = stream;
-        http_get(&mut stream, host, path).await
+        #[cfg(feature = "honk-policy")]
+        if let Some(reporter) = reporter {
+            reporter.setup_succeeded();
+        }
+        http_get(&mut stream, host, path, reporter).await
     }
 }
 
 /// Minimal HTTP/1.1 GET: request, header parse, capped body read. Only
 /// identity bodies are supported (Content-Length or read-to-close); GitHub
 /// release assets always carry a length.
-async fn http_get<S>(stream: &mut S, host: &str, path: &str) -> anyhow::Result<ProxiedFetch>
+async fn http_get<S>(
+    stream: &mut S,
+    host: &str,
+    path: &str,
+    reporter: &UiHonkReporter,
+) -> anyhow::Result<ProxiedFetch>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    #[cfg(not(feature = "honk-policy"))]
+    let _ = reporter;
     let request = format!(
         "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: honk-ui-download/1.0\r\nAccept: */*\r\nConnection: close\r\n\r\n"
     );
     stream.write_all(request.as_bytes()).await?;
+    #[cfg(feature = "honk-policy")]
+    if let Some(reporter) = reporter {
+        reporter.tx(request.len() as u64);
+    }
 
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
@@ -346,6 +524,11 @@ where
         let n = stream.read(&mut chunk).await?;
         if n == 0 {
             anyhow::bail!("connection closed before response headers");
+        }
+        #[cfg(feature = "honk-policy")]
+        if let Some(reporter) = reporter {
+            reporter.first_response();
+            reporter.rx(n as u64);
         }
         buf.extend_from_slice(&chunk[..n]);
         if buf.len() > MAX_HEADER_BYTES {
@@ -397,6 +580,10 @@ where
             body.reserve(len.saturating_sub(body.len()));
             while body.len() < len {
                 let n = stream.read(&mut chunk).await?;
+                #[cfg(feature = "honk-policy")]
+                if let Some(reporter) = reporter {
+                    reporter.rx(n as u64);
+                }
                 if n == 0 {
                     anyhow::bail!("truncated archive: {} of {} bytes", body.len(), len);
                 }
@@ -409,6 +596,10 @@ where
             if n == 0 {
                 break;
             }
+            #[cfg(feature = "honk-policy")]
+            if let Some(reporter) = reporter {
+                reporter.rx(n as u64);
+            }
             if body.len() + n > MAX_ARCHIVE_BYTES {
                 anyhow::bail!("external UI archive exceeds {} bytes", MAX_ARCHIVE_BYTES);
             }
@@ -416,6 +607,13 @@ where
         },
     }
     Ok(ProxiedFetch::Body(body))
+}
+
+#[cfg(feature = "honk-policy")]
+fn parse_host_ip(host: &str) -> Option<std::net::IpAddr> {
+    host.parse()
+        .ok()
+        .or_else(|| host.strip_prefix('[')?.strip_suffix(']')?.parse().ok())
 }
 
 /// Split a download URL into (host, port, path, is_https); the scheme is
@@ -523,6 +721,8 @@ fn remove_all_in_directory(directory: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "honk-policy")]
+    use honk_config::group::{Group, GroupPolicy};
     use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
     use honk_outbound::group::GroupManager;
     use honk_outbound::proxy::{ProtocolEntry, ProxyStream, TcpOutbound};
@@ -711,6 +911,44 @@ mod tests {
         assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
     }
 
+    #[tokio::test]
+    async fn direct_redirect_reenters_routing_without_local_dns() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: http://blocked.test/ui.zip\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let rules = vec![RoutingRule {
+            name: "block-redirect".into(),
+            condition: RoutingCondition {
+                domain_suffix: vec!["blocked.test".into()],
+                ..Default::default()
+            },
+            outbound: RoutingOutbound::Simple("block".into()),
+            priority: 0,
+            must: false,
+            mark: 0,
+        }];
+        let dir = tempfile::tempdir().unwrap();
+
+        let error = fetch_routed(
+            &test_ctx(dir.path(), &rules),
+            &format!("http://{addr}/redirect"),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("routing sends"), "{error:#}");
+    }
+
     /// Mock tunnel handler: dials the target with a plain TcpStream, so the
     /// proxied fetch path runs end-to-end against a loopback server.
     struct LoopbackHandler;
@@ -773,5 +1011,183 @@ mod tests {
             std::fs::read(dir.path().join("index.html")).unwrap(),
             b"<html>p</html>"
         );
+    }
+    #[cfg(feature = "honk-policy")]
+    #[tokio::test]
+    async fn honk_route_attributes_target_and_rewards_useful_body_exchange() {
+        let body = b"dashboard bytes".to_vec();
+        let addr = spawn_zip_server(body.clone()).await;
+        let nodes = ["a", "b"].map(|name| {
+            let mut node = Node {
+                name: name.into(),
+                protocol: NodeProtocol::Socks5,
+                address: "127.0.0.1".into(),
+                port: 1,
+                ..Default::default()
+            };
+            node.id = node.derive_id();
+            node
+        });
+        let child = Group {
+            name: "ui-child".into(),
+            policy: GroupPolicy::Honk,
+            nodes: nodes.iter().map(|node| node.id).collect(),
+            ..Default::default()
+        };
+        let parent = Group {
+            name: "ui-parent".into(),
+            policy: GroupPolicy::Honk,
+            groups: vec![child.name.clone()],
+            ..Default::default()
+        };
+        let config = Config {
+            nodes: nodes.to_vec(),
+            groups: vec![child, parent],
+            ..Default::default()
+        };
+        let rules = vec![RoutingRule {
+            name: "honk-ui".into(),
+            condition: RoutingCondition {
+                ip: vec!["127.0.0.1/32".into()],
+                ..Default::default()
+            },
+            outbound: RoutingOutbound::Simple("ui-parent".into()),
+            priority: 0,
+            must: false,
+            mark: 0,
+        }];
+        let mut registry = ProxyRegistry::new();
+        registry.register(ProtocolEntry::new(
+            NodeProtocol::Socks5,
+            Arc::new(LoopbackHandler),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = UiDownloadContext {
+            external_ui: dir.path().to_string_lossy().into_owned(),
+            router: Arc::new(RwLock::new(Router::new(&rules, "direct").unwrap())),
+            group_manager: Arc::new(parking_lot::RwLock::new(Arc::new(GroupManager::new(
+                &config.groups,
+                &config.nodes,
+            )))),
+            config: Arc::new(RwLock::new(config)),
+            proxy_registry: Arc::new(registry),
+            runtime_registry: Arc::new(parking_lot::RwLock::new(Arc::new(
+                honk_outbound::runtime::OutboundRuntimeRegistry::build(&[]).unwrap(),
+            ))),
+        };
+
+        let UiRoute::Proxy { node, feedback } =
+            decide_route(&ctx, "127.0.0.1", addr.port()).await.unwrap()
+        else {
+            panic!("Honk group must resolve to a proxy leaf");
+        };
+        assert_eq!(node.id, nodes[0].id);
+        let feedback = feedback.expect("Honk route must carry feedback");
+        assert_eq!(
+            feedback
+                .attributions()
+                .iter()
+                .map(|attribution| attribution.group.as_str())
+                .collect::<Vec<_>>(),
+            ["ui-parent", "ui-child"]
+        );
+        let fetched = fetch_proxied(
+            &ctx,
+            &node,
+            Some(feedback),
+            "127.0.0.1",
+            addr.port(),
+            "/ui.zip",
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(fetched, ProxiedFetch::Body(bytes) if bytes == body));
+
+        let UiRoute::Proxy { node, feedback } =
+            decide_route(&ctx, "127.0.0.1", addr.port()).await.unwrap()
+        else {
+            panic!("Honk group must resolve to a proxy leaf");
+        };
+        assert_eq!(node.id, nodes[1].id);
+        let reporter = feedback.unwrap().start();
+        reporter.setup_succeeded();
+        reporter.finish(HonkOutcome::Success);
+
+        let UiRoute::Proxy { node, .. } =
+            decide_route(&ctx, "127.0.0.1", addr.port()).await.unwrap()
+        else {
+            panic!("Honk group must resolve to a proxy leaf");
+        };
+        assert_eq!(node.id, nodes[0].id);
+    }
+
+    #[cfg(feature = "honk-policy")]
+    #[tokio::test]
+    async fn direct_honk_ui_route_reports_target_exchange() {
+        let body = b"direct dashboard".to_vec();
+        let addr = spawn_zip_server(body.clone()).await;
+        let direct = Config::builtin_direct_node();
+        let group = Group {
+            name: "ui-direct".into(),
+            policy: GroupPolicy::Honk,
+            nodes: vec![direct.id],
+            ..Default::default()
+        };
+        let config = Config {
+            nodes: vec![direct],
+            groups: vec![group],
+            ..Default::default()
+        };
+        let rules = vec![RoutingRule {
+            name: "honk-ui-direct".into(),
+            condition: RoutingCondition {
+                ip: vec!["127.0.0.1/32".into()],
+                ..Default::default()
+            },
+            outbound: RoutingOutbound::Simple("ui-direct".into()),
+            priority: 0,
+            must: false,
+            mark: 0,
+        }];
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = UiDownloadContext {
+            external_ui: dir.path().to_string_lossy().into_owned(),
+            router: Arc::new(RwLock::new(Router::new(&rules, "direct").unwrap())),
+            group_manager: Arc::new(parking_lot::RwLock::new(Arc::new(GroupManager::new(
+                &config.groups,
+                &config.nodes,
+            )))),
+            config: Arc::new(RwLock::new(config)),
+            proxy_registry: Arc::new(ProxyRegistry::default_resolver().unwrap()),
+            runtime_registry: Arc::new(parking_lot::RwLock::new(Arc::new(
+                honk_outbound::runtime::OutboundRuntimeRegistry::build(&[]).unwrap(),
+            ))),
+        };
+        let UiRoute::Direct { feedback } =
+            decide_route(&ctx, "127.0.0.1", addr.port()).await.unwrap()
+        else {
+            panic!("Honk group must resolve to direct");
+        };
+        assert_eq!(
+            feedback
+                .as_ref()
+                .unwrap()
+                .attributions()
+                .iter()
+                .map(|attribution| attribution.group.as_str())
+                .collect::<Vec<_>>(),
+            ["ui-direct"]
+        );
+        let fetched = fetch_direct(&format!("http://{addr}/ui.zip"), feedback)
+            .await
+            .unwrap();
+        assert!(matches!(fetched, ProxiedFetch::Body(bytes) if bytes == body));
+        let UiRoute::Direct { feedback } =
+            decide_route(&ctx, "127.0.0.1", addr.port()).await.unwrap()
+        else {
+            panic!("Honk group must still resolve to direct");
+        };
+        feedback.unwrap().start().setup_failed(HonkOutcome::Timeout);
     }
 }

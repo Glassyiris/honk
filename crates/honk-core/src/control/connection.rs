@@ -4,6 +4,116 @@ use crate::control::udp_endpoint::{UdpEndpoint, UdpInitLease};
 use crate::group::{SelectionNetwork, SelectionPlanMode};
 use honk_config::types::NodeProtocol;
 use std::collections::{HashMap, HashSet};
+#[cfg(feature = "honk-policy")]
+type TcpHonkReporter = Option<crate::group::HonkReporter>;
+#[cfg(not(feature = "honk-policy"))]
+type TcpHonkReporter = Option<()>;
+#[cfg(feature = "honk-policy")]
+type TcpHonkFeedback = crate::group::HonkFeedback;
+#[cfg(not(feature = "honk-policy"))]
+type TcpHonkFeedback = ();
+#[cfg(feature = "honk-policy")]
+type UnpackedTcpHonkPlan = (
+    Vec<Node>,
+    SelectionPlanMode,
+    HashMap<uuid::Uuid, TcpHonkFeedback>,
+    HashMap<uuid::Uuid, Vec<String>>,
+    IpVersion,
+);
+
+#[cfg(feature = "honk-policy")]
+fn tcp_honk_context(
+    target: SocketAddr,
+    domain: Option<&str>,
+    health_family: IpVersion,
+) -> crate::group::HonkSelectionContext {
+    let target_family = if target.is_ipv6() {
+        IpVersion::V6
+    } else {
+        IpVersion::V4
+    };
+    crate::group::HonkSelectionContext {
+        network: SelectionNetwork::Tcp,
+        probe_domain: ProbeDomain::Tcp,
+        target_family: Some(target_family),
+        health_family,
+        target: Some(match domain {
+            Some(domain) => crate::group::HonkTarget::domain(domain, target.port()),
+            None => target.into(),
+        }),
+    }
+}
+
+#[cfg(feature = "honk-policy")]
+fn unpack_tcp_honk_plan(plan: super::reload::ResolvedHonkPlan) -> UnpackedTcpHonkPlan {
+    let mut seen = HashSet::new();
+    let mut nodes = Vec::with_capacity(plan.nodes.len());
+    let mut feedback = HashMap::new();
+    let mut selection_chains = HashMap::new();
+    for ((node, value), selection_chain) in plan
+        .nodes
+        .into_iter()
+        .zip(plan.feedback)
+        .zip(plan.selection_chains)
+    {
+        if !seen.insert(node.id) {
+            continue;
+        }
+        if let Some(value) = value {
+            feedback.insert(node.id, value);
+        }
+        selection_chains.insert(node.id, selection_chain);
+        nodes.push(node);
+    }
+    (
+        nodes,
+        plan.mode,
+        feedback,
+        selection_chains,
+        plan.health_family,
+    )
+}
+
+#[cfg(feature = "honk-policy")]
+fn timeout_started_honk_reporters(reporters: &parking_lot::Mutex<Vec<crate::group::HonkReporter>>) {
+    for reporter in reporters.lock().iter() {
+        reporter.setup_failed(crate::group::HonkOutcome::Timeout);
+    }
+}
+
+#[cfg(feature = "honk-policy")]
+fn honk_runtime_outcome(
+    generation: &honk_outbound::runtime::OutboundRuntimeRegistry,
+    error: &anyhow::Error,
+) -> crate::group::HonkOutcome {
+    if generation.is_shutdown() {
+        crate::group::HonkOutcome::Shutdown
+    } else {
+        crate::group::HonkOutcome::from_error(error)
+    }
+}
+
+fn report_dial_failure_if_current(
+    generation: &honk_outbound::runtime::OutboundRuntimeRegistry,
+    alive_set: &honk_outbound::alive::AliveDialerSet,
+    node_id: uuid::Uuid,
+    domain: ProbeDomain,
+    ipver: IpVersion,
+) {
+    if generation.is_shutdown() {
+        return;
+    }
+    alive_set.report_unavailable_traffic(node_id, domain, ipver);
+    alive_set.record_dial_failure(node_id, domain, ipver);
+    alive_set.notify_check_tcp(node_id);
+}
+
+#[cfg(all(test, feature = "honk-policy"))]
+fn started_honk_reporter_count(
+    reporters: &parking_lot::Mutex<Vec<crate::group::HonkReporter>>,
+) -> usize {
+    reporters.lock().len()
+}
 
 /// Result from the eBPF routing handoff map lookup.
 #[derive(Debug, Clone)]
@@ -731,8 +841,35 @@ impl ControlPlaneHandle {
         } else {
             IpVersion::V4
         };
+        // Hold the config read guard while cloning the group/runtime handles:
+        // reload publishes all three under their write guards, so this is one
+        // coherent generation rather than three individually-current values.
+        let generation_config_guard = self.config.read().await;
+        let generation_config = generation_config_guard.clone();
+        #[cfg(feature = "honk-policy")]
+        let generation_group_manager = self.group_manager.read().clone();
+        let runtime_generation = self.runtime_registry.read().clone();
+        drop(generation_config_guard);
+        #[cfg(feature = "honk-policy")]
+        let (
+            mut candidates,
+            mut selection_mode,
+            mut honk_feedback,
+            mut selection_chains,
+            health_ipver,
+        ) = {
+            let context = tcp_honk_context(original_dst, domain.as_deref(), ipver);
+            let plan = super::reload::resolve_outbound_plan_for_target(
+                &generation_config,
+                &generation_group_manager,
+                &outbound_name,
+                &context,
+            );
+            unpack_tcp_honk_plan(plan)
+        };
+        #[cfg(not(feature = "honk-policy"))]
         let (mut candidates, selection_mode, selection_chain) = {
-            let config = self.config.read().await;
+            let config = &generation_config;
             let gm = self.group_manager.read();
             let (candidates, selection_mode) = if let Some(group) = config
                 .groups
@@ -746,7 +883,7 @@ impl ControlPlaneHandle {
                 )
             } else {
                 (
-                    resolve_outbound_nodes(&config, &gm, &outbound_name, ProbeDomain::Tcp, ipver),
+                    resolve_outbound_nodes(config, &gm, &outbound_name, ProbeDomain::Tcp, ipver),
                     SelectionPlanMode::Authoritative,
                 )
             };
@@ -754,6 +891,10 @@ impl ControlPlaneHandle {
                 gm.selection_chain_for_network(&outbound_name, SelectionNetwork::Tcp);
             (candidates, selection_mode, selection_chain)
         };
+        #[cfg(not(feature = "honk-policy"))]
+        let honk_feedback = std::collections::HashMap::<uuid::Uuid, TcpHonkFeedback>::new();
+        #[cfg(not(feature = "honk-policy"))]
+        let health_ipver = ipver;
         // Only an unmeasured URLTest group is allowed to speculate. Its
         // candidate set is bounded before spawning so a large group cannot
         // turn one client flow into an unbounded dial storm.
@@ -762,10 +903,6 @@ impl ControlPlaneHandle {
         } else {
             candidates.truncate(1);
         }
-        // Pin this flow to the runtime generation admitted with its
-        // candidate selection: every dial, pool backfill, and permit below
-        // uses this snapshot, never a post-reload replacement.
-        let runtime_generation = self.runtime_registry.read().clone();
 
         // If eBPF already decided this flow should go direct (not just punted
         // it to userspace), skip userspace proxy dial, DNS, and relay entirely.
@@ -878,7 +1015,7 @@ impl ControlPlaneHandle {
                             }
                         }
                     }
-                    _ => {
+                    Ok(Err(_)) | Err(_) => {
                         debug!("DNS timed out or failed for {}, using original dst", domain);
                         (original_dst, Some(domain.clone()))
                     }
@@ -887,6 +1024,33 @@ impl ControlPlaneHandle {
         } else {
             (original_dst, None)
         };
+        #[cfg(feature = "honk-policy")]
+        if (resolved_target.is_ipv6() && ipver == IpVersion::V4)
+            || (resolved_target.is_ipv4() && ipver == IpVersion::V6)
+        {
+            // Local DNS fell back across address families. The preliminary
+            // plan was needed to decide whether local resolution was required,
+            // but no dial (and therefore no reporter) has started yet. Replace
+            // it with a plan keyed by the address that will actually be dialed
+            // while retaining the proxy-health family already selected.
+            let context = tcp_honk_context(resolved_target, target_domain.as_deref(), health_ipver);
+            let plan = super::reload::resolve_outbound_plan_for_target(
+                &generation_config,
+                &generation_group_manager,
+                &outbound_name,
+                &context,
+            );
+            let (nodes, mode, feedback, chains, _) = unpack_tcp_honk_plan(plan);
+            candidates = nodes;
+            selection_mode = mode;
+            honk_feedback = feedback;
+            selection_chains = chains;
+            if selection_mode == SelectionPlanMode::ColdUrlTest {
+                candidates.truncate(3);
+            } else {
+                candidates.truncate(1);
+            }
+        }
 
         let cold_urltest = selection_mode == SelectionPlanMode::ColdUrlTest;
         let candidate_refs: Vec<&Node> = candidates.iter().collect();
@@ -899,11 +1063,12 @@ impl ControlPlaneHandle {
                 connect_timeout,
                 overall_dial_timeout,
                 Arc::clone(&runtime_generation),
-                ipver,
+                health_ipver,
+                &honk_feedback,
                 cold_urltest,
             )
             .await;
-        let (mut proxy_stream, node) = match raced {
+        let (mut proxy_stream, node, honk_reporter) = match raced {
             Some(pair) => pair,
             None => {
                 // Exactly one retry when the just-reported failure may have
@@ -911,29 +1076,68 @@ impl ControlPlaneHandle {
                 // outcomes (Selector pin, Fallback pin on a still-alive
                 // node, single-node outbound) yield the identical candidate
                 // and are not retried.
-                let mut retried: Option<(crate::proxy::ProxyStream, Node)> = None;
+                let mut retried: Option<(crate::proxy::ProxyStream, Node, TcpHonkReporter)> = None;
                 if selection_mode == SelectionPlanMode::Authoritative && candidates.len() == 1 {
+                    #[cfg(feature = "honk-policy")]
+                    let group_manager = Arc::clone(&generation_group_manager);
+                    #[cfg(not(feature = "honk-policy"))]
                     let group_manager = self.group_manager.read().clone();
-                    let plan = group_manager.selection_plan_for_domain(
-                        &outbound_name,
-                        ProbeDomain::Tcp,
-                        ipver,
-                    );
-                    if !plan.nodes.is_empty() && plan.nodes[0].id != candidates[0].id {
-                        let nodes = &plan.nodes[..plan.nodes.len().min(3)];
-                        retried = self
+                    #[cfg(feature = "honk-policy")]
+                    let config = &generation_config;
+                    #[cfg(feature = "honk-policy")]
+                    let (retry_nodes, retry_feedback, retry_selection_chains, retry_health_ipver) = {
+                        let context = tcp_honk_context(
+                            resolved_target,
+                            target_domain.as_deref(),
+                            health_ipver,
+                        );
+                        let plan = super::reload::resolve_outbound_plan_for_target(
+                            config,
+                            &group_manager,
+                            &outbound_name,
+                            &context,
+                        );
+                        let (nodes, _, feedback, chains, health_family) =
+                            unpack_tcp_honk_plan(plan);
+                        (nodes, feedback, chains, health_family)
+                    };
+                    #[cfg(not(feature = "honk-policy"))]
+                    let (retry_nodes, retry_feedback, retry_health_ipver) = {
+                        let plan = group_manager.selection_plan_for_domain(
+                            &outbound_name,
+                            ProbeDomain::Tcp,
+                            ipver,
+                        );
+                        (
+                            plan.nodes.into_iter().cloned().collect::<Vec<_>>(),
+                            std::collections::HashMap::new(),
+                            ipver,
+                        )
+                    };
+                    if retry_nodes
+                        .first()
+                        .is_some_and(|node| node.id != candidates[0].id)
+                    {
+                        let nodes: Vec<_> = retry_nodes.iter().take(3).collect();
+                        let retry = self
                             .race_candidates(
-                                nodes,
+                                &nodes,
                                 resolved_target,
                                 target_domain.clone(),
                                 &outbound_name,
                                 connect_timeout,
                                 overall_dial_timeout,
                                 Arc::clone(&runtime_generation),
-                                ipver,
+                                retry_health_ipver,
+                                &retry_feedback,
                                 false,
                             )
                             .await;
+                        #[cfg(feature = "honk-policy")]
+                        if retry.is_some() {
+                            selection_chains = retry_selection_chains;
+                        }
+                        retried = retry;
                     }
                 }
                 match retried {
@@ -945,6 +1149,10 @@ impl ControlPlaneHandle {
                 }
             }
         };
+        #[cfg(feature = "honk-policy")]
+        let honk_reporter = honk_reporter;
+        #[cfg(not(feature = "honk-policy"))]
+        let _ = honk_reporter;
 
         let dscp_val = handoff.as_ref().map(|ho| ho.dscp).unwrap_or(0);
 
@@ -956,6 +1164,12 @@ impl ControlPlaneHandle {
         let (rule, rule_payload) = matched_rule
             .clone()
             .unwrap_or_else(|| ("Fallback".to_string(), String::new()));
+        #[cfg(feature = "honk-policy")]
+        let chains = connection_chains(
+            selection_chains.remove(&node.id).unwrap_or_default(),
+            &node.name,
+        );
+        #[cfg(not(feature = "honk-policy"))]
         let chains = connection_chains(selection_chain, &node.name);
         // Live byte counters shared with the relay task: it increments them
         // as data flows so /connections shows real-time totals instead of a
@@ -997,8 +1211,16 @@ impl ControlPlaneHandle {
                 warn!("Failed to write sniffed bytes to proxy: {}", e);
                 self.stats.record_error(&outbound_name);
                 self.stats.record_close(&outbound_name);
+                #[cfg(feature = "honk-policy")]
+                if let Some(reporter) = &honk_reporter {
+                    reporter.finish(crate::group::HonkOutcome::Io(e.kind()));
+                }
                 return Ok(());
             }
+        }
+        #[cfg(feature = "honk-policy")]
+        if let Some(reporter) = &honk_reporter {
+            reporter.tx(sniff_result.buffered.len() as u64);
         }
 
         // Zero-copy fast path: a direct dial yields plain `TcpStream`s on
@@ -1006,7 +1228,19 @@ impl ControlPlaneHandle {
         // fallback to the copy relay when the kernel rejects it). TLS- or
         // protocol-wrapped proxy streams keep the userspace copy relay.
         // Both paths update the connection's live byte counters as data flows.
-        let conn_progress = Some((conn_upload.clone(), conn_download.clone()));
+        #[cfg(feature = "honk-policy")]
+        let first_response = honk_reporter.as_ref().map(|reporter| {
+            let reporter = reporter.clone();
+            std::sync::Arc::new(move || reporter.first_response())
+                as std::sync::Arc<dyn Fn() + Send + Sync>
+        });
+        #[cfg(not(feature = "honk-policy"))]
+        let first_response = None;
+        let conn_progress = relay::RelayProgress {
+            upload: conn_upload.clone(),
+            download: conn_download.clone(),
+            first_response,
+        };
         let relay_result = match proxy_stream.into_tcp_stream() {
             Ok(upstream) => {
                 relay::splice::relay_splice(
@@ -1014,7 +1248,7 @@ impl ControlPlaneHandle {
                     upstream,
                     client_addr,
                     resolved_target,
-                    conn_progress,
+                    Some(conn_progress.clone()),
                 )
                 .await
             }
@@ -1024,11 +1258,21 @@ impl ControlPlaneHandle {
                     proxy_stream.stream,
                     client_addr,
                     resolved_target,
-                    conn_progress,
+                    Some(conn_progress),
                 )
                 .await
             }
         };
+        #[cfg(feature = "honk-policy")]
+        if let Some(reporter) = &honk_reporter {
+            let upload = conn_upload.load(std::sync::atomic::Ordering::Relaxed);
+            let download = conn_download.load(std::sync::atomic::Ordering::Relaxed);
+            reporter.tx(upload);
+            reporter.rx(download);
+            if download > 0 {
+                reporter.first_response();
+            }
+        }
         flow.retire().await;
 
         match relay_result {
@@ -1038,6 +1282,10 @@ impl ControlPlaneHandle {
                     relay_stats.client_to_proxy,
                     relay_stats.proxy_to_client,
                 );
+                #[cfg(feature = "honk-policy")]
+                if let Some(reporter) = &honk_reporter {
+                    reporter.finish(crate::group::HonkOutcome::Success);
+                }
                 self.stats.record_close(&outbound_name);
 
                 // Deposit a fresh connection for future reuse. Ready-capable
@@ -1051,6 +1299,10 @@ impl ControlPlaneHandle {
                     let registry = self.proxy_registry.clone();
                     let target_domain = target_domain.clone();
                     let generation = Arc::clone(&runtime_generation);
+                    #[cfg(feature = "honk-policy")]
+                    let pool_feedback = honk_reporter.as_ref().map(|reporter| reporter.feedback());
+                    #[cfg(feature = "honk-policy")]
+                    let pool_health_family = health_ipver;
                     tokio::spawn(async move {
                         let (ready_capable, bare_capable) = registry
                             .find(node.protocol)
@@ -1072,9 +1324,12 @@ impl ControlPlaneHandle {
                             if !pool.note_target(&key) {
                                 return;
                             }
+                            #[cfg(feature = "honk-policy")]
+                            let pool_reporter =
+                                pool_feedback.as_ref().map(|feedback| feedback.start());
                             match registry
                                 .dial_runtime(
-                                    generation,
+                                    Arc::clone(&generation),
                                     node.id,
                                     resolved_target,
                                     target_domain.as_deref(),
@@ -1083,9 +1338,26 @@ impl ControlPlaneHandle {
                                 .await
                             {
                                 Ok(stream) => {
+                                    if generation.is_shutdown() {
+                                        #[cfg(feature = "honk-policy")]
+                                        if let Some(reporter) = &pool_reporter {
+                                            reporter.finish(crate::group::HonkOutcome::Shutdown);
+                                        }
+                                        return;
+                                    }
+                                    #[cfg(feature = "honk-policy")]
+                                    if let Some(reporter) = &pool_reporter {
+                                        reporter.setup_succeeded();
+                                        reporter.finish_setup_only();
+                                    }
                                     pool.deposit_ready(&key, stream).await;
                                 }
                                 Err(e) => {
+                                    #[cfg(feature = "honk-policy")]
+                                    if let Some(reporter) = &pool_reporter {
+                                        reporter
+                                            .setup_failed(honk_runtime_outcome(&generation, &e));
+                                    }
                                     debug!(
                                         "Pool deposit: ready dial to {} via {} failed: {}",
                                         resolved_target, node_addr, e
@@ -1099,17 +1371,54 @@ impl ControlPlaneHandle {
                             // instead; a bare TCP is useless to them.
                             return;
                         }
+                        #[cfg(feature = "honk-policy")]
+                        let pool_reporter = pool_feedback.as_ref().map(|feedback| {
+                            feedback
+                                .clone()
+                                .with_context(crate::group::HonkSelectionContext::aggregate(
+                                    SelectionNetwork::Tcp,
+                                    ProbeDomain::Tcp,
+                                    pool_health_family,
+                                ))
+                                .start()
+                        });
                         match honk_outbound::util::connect_outbound(&node_addr, connect_timeout)
                             .await
                         {
                             Ok(stream) => {
+                                #[cfg(feature = "honk-policy")]
+                                if generation.is_shutdown() {
+                                    if let Some(reporter) = &pool_reporter {
+                                        reporter.finish(crate::group::HonkOutcome::Shutdown);
+                                    }
+                                    return;
+                                }
                                 if is_tcp_stream_alive(&stream) {
+                                    #[cfg(feature = "honk-policy")]
+                                    if let Some(reporter) = &pool_reporter {
+                                        reporter.setup_succeeded();
+                                        reporter.finish_setup_only();
+                                    }
                                     pool.deposit_tcp(&node_addr, stream).await;
                                 } else {
+                                    #[cfg(feature = "honk-policy")]
+                                    if let Some(reporter) = &pool_reporter {
+                                        reporter.setup_failed(crate::group::HonkOutcome::Io(
+                                            std::io::ErrorKind::ConnectionReset,
+                                        ));
+                                    }
                                     debug!("Pool deposit: stream to {} is dead", node_addr);
                                 }
                             }
                             Err(e) => {
+                                #[cfg(feature = "honk-policy")]
+                                if let Some(reporter) = &pool_reporter {
+                                    reporter.setup_failed(if generation.is_shutdown() {
+                                        crate::group::HonkOutcome::Shutdown
+                                    } else {
+                                        crate::group::HonkOutcome::Io(e.kind())
+                                    });
+                                }
                                 debug!("Pool deposit: connect to {} failed: {}", node_addr, e);
                             }
                         }
@@ -1146,6 +1455,10 @@ impl ControlPlaneHandle {
                 }
                 self.stats.record_error(&outbound_name);
                 self.stats.record_close(&outbound_name);
+                #[cfg(feature = "honk-policy")]
+                if let Some(reporter) = &honk_reporter {
+                    reporter.finish(crate::group::HonkOutcome::from_error(&e));
+                }
             }
         }
 
@@ -1528,13 +1841,38 @@ impl ControlPlaneHandle {
         } else {
             IpVersion::V4
         };
-        let (plan, selection_chain) = {
+        let (plan, selection_chains) = {
             let config = self.config.read().await;
             let gm = self.group_manager.read();
+            #[cfg(feature = "honk-policy")]
+            let plan = super::reload::resolve_udp_outbound_plan_for_target(
+                &config,
+                &gm,
+                &outbound_name,
+                &crate::group::HonkSelectionContext {
+                    network: SelectionNetwork::Udp,
+                    probe_domain: ProbeDomain::DataUdp,
+                    target_family: Some(requested_ipver),
+                    health_family: requested_ipver,
+                    target: Some(match quic_domain.as_deref() {
+                        Some(domain) => {
+                            crate::group::HonkTarget::domain(domain, original_dst.port())
+                        }
+                        None => original_dst.into(),
+                    }),
+                },
+            );
+            #[cfg(not(feature = "honk-policy"))]
             let plan = resolve_udp_outbound_plan(&config, &gm, &outbound_name, requested_ipver);
-            let selection_chain =
-                gm.selection_chain_for_network(&outbound_name, SelectionNetwork::Udp);
-            (plan, selection_chain)
+            #[cfg(feature = "honk-policy")]
+            let selection_chains = plan.selection_chains.clone();
+            #[cfg(not(feature = "honk-policy"))]
+            let selection_chains =
+                vec![
+                    gm.selection_chain_for_network(&outbound_name, SelectionNetwork::Udp);
+                    plan.nodes.len()
+                ];
+            (plan, selection_chains)
         };
 
         if plan.nodes.is_empty() {
@@ -1560,20 +1898,34 @@ impl ControlPlaneHandle {
         // a single eligible transport winner has been drained and accepted.
         let scheduler_ipver = plan.ipver;
         let plan_mode = plan.mode;
+        #[cfg(feature = "honk-policy")]
+        let honk_feedback = plan.feedback;
         let runtime_generation = self.runtime_registry.read().clone();
-        let prepare: UdpPrepare<honk_outbound::proxy::PreparedUdpTransport> = {
+        let prepare_generation = Arc::clone(&runtime_generation);
+        let prepare: UdpPrepare<(
+            honk_outbound::proxy::PreparedUdpTransport,
+            TcpHonkReporter,
+            Vec<String>,
+        )> = {
             let registry = self.proxy_registry.clone();
             let stats = self.stats.clone();
-            Arc::new(move |node: Node| {
+            #[cfg(feature = "honk-policy")]
+            let feedback = honk_feedback.clone();
+            Arc::new(move |index: usize, node: Node| {
                 let registry = registry.clone();
                 let stats = stats.clone();
-                let runtime_generation = Arc::clone(&runtime_generation);
+                let runtime_generation = Arc::clone(&prepare_generation);
+                #[cfg(feature = "honk-policy")]
+                let feedback = feedback.get(index).cloned().flatten();
+                let selection_chain = selection_chains.get(index).cloned().unwrap_or_default();
                 Box::pin(async move {
+                    #[cfg(feature = "honk-policy")]
+                    let reporter = feedback.map(|feedback| feedback.start());
                     let dial_started_at = std::time::Instant::now();
                     let result = if plan_mode == SelectionPlanMode::ColdUrlTest {
                         registry
                             .dial_udp_transport_speculative(
-                                runtime_generation,
+                                Arc::clone(&runtime_generation),
                                 node.id,
                                 original_dst,
                                 None,
@@ -1583,7 +1935,7 @@ impl ControlPlaneHandle {
                     } else {
                         registry
                             .dial_udp_transport_runtime(
-                                runtime_generation,
+                                Arc::clone(&runtime_generation),
                                 node.id,
                                 original_dst,
                                 None,
@@ -1593,7 +1945,32 @@ impl ControlPlaneHandle {
                             .map(honk_outbound::proxy::PreparedUdpTransport::ready)
                     };
                     stats.record_udp_dial_latency(dial_started_at.elapsed());
-                    result
+                    match result {
+                        Ok(transport) => Ok((
+                            transport,
+                            {
+                                #[cfg(feature = "honk-policy")]
+                                {
+                                    reporter
+                                }
+                                #[cfg(not(feature = "honk-policy"))]
+                                {
+                                    None
+                                }
+                            },
+                            selection_chain,
+                        )),
+                        Err(error) => {
+                            #[cfg(feature = "honk-policy")]
+                            if let Some(reporter) = &reporter {
+                                reporter.setup_failed(honk_runtime_outcome(
+                                    &runtime_generation,
+                                    &error,
+                                ));
+                            }
+                            Err(error)
+                        }
+                    }
                 })
             })
         };
@@ -1610,14 +1987,15 @@ impl ControlPlaneHandle {
             },
             on_dial_error: {
                 let alive_set = self.alive_set.clone();
+                let runtime_generation = Arc::clone(&runtime_generation);
                 Arc::new(move |node| {
-                    alive_set.report_unavailable_traffic(
+                    report_dial_failure_if_current(
+                        &runtime_generation,
+                        &alive_set,
                         node.id,
                         ProbeDomain::DataUdp,
                         scheduler_ipver,
                     );
-                    alive_set.record_dial_failure(node.id, ProbeDomain::DataUdp, scheduler_ipver);
-                    alive_set.notify_check_tcp(node.id);
                 })
             },
             on_attempt: {
@@ -1633,7 +2011,7 @@ impl ControlPlaneHandle {
                 Arc::new(move || stats.record_udp_stagger_cancellation())
             },
         };
-        let Some((node, prepared_transport)) =
+        let Some((node, (prepared_transport, honk_reporter, selection_chain))) =
             prepare_udp_plan(plan_mode, plan.nodes, prepare, callbacks).await
         else {
             debug!(
@@ -1643,11 +2021,17 @@ impl ControlPlaneHandle {
             self.stats.record_error(&outbound_name);
             return Ok(());
         };
+        #[cfg(not(feature = "honk-policy"))]
+        let _ = honk_reporter;
 
         // The prepared winner is bound only after every speculative loser has
         // been aborted/drained. Close the death-before-bind race again before
         // creating any endpoint state or allowing the Task 3 driver to send.
         if !lease.bind_selected_node(node.id) {
+            #[cfg(feature = "honk-policy")]
+            if let Some(reporter) = &honk_reporter {
+                reporter.finish(crate::group::HonkOutcome::Cancelled);
+            }
             return Err(anyhow::anyhow!(
                 "UDP initializer generation was cancelled before winner bind"
             ));
@@ -1660,6 +2044,10 @@ impl ControlPlaneHandle {
             )
         {
             lease.clear_selected_node();
+            #[cfg(feature = "honk-policy")]
+            if let Some(reporter) = &honk_reporter {
+                reporter.finish(crate::group::HonkOutcome::Cancelled);
+            }
             return Err(anyhow::anyhow!(
                 "UDP winner '{}' became ineligible before endpoint setup",
                 node.name
@@ -1668,7 +2056,20 @@ impl ControlPlaneHandle {
         // Promotion is explicit and still pre-publication: detached AnyTLS
         // sessions and QUIC clients become generation-owned only for the
         // finalized winner.
-        let transport = prepared_transport.commit().await?;
+        let transport = match prepared_transport.commit().await {
+            Ok(transport) => transport,
+            Err(error) => {
+                #[cfg(feature = "honk-policy")]
+                if let Some(reporter) = &honk_reporter {
+                    reporter.finish(honk_runtime_outcome(&runtime_generation, &error));
+                }
+                return Err(error);
+            }
+        };
+        #[cfg(feature = "honk-policy")]
+        if let Some(reporter) = &honk_reporter {
+            reporter.setup_succeeded();
+        }
 
         // Both capacity (at reservation time) and anyfrom creation happen
         // after the winner is finalized and before the only first send. Any
@@ -1680,6 +2081,10 @@ impl ControlPlaneHandle {
                 self.stats
                     .record_udp_reply_ready_latency(reply_ready_started.elapsed());
                 self.stats.record_error(&outbound_name);
+                #[cfg(feature = "honk-policy")]
+                if let Some(reporter) = &honk_reporter {
+                    reporter.finish(crate::group::HonkOutcome::Cancelled);
+                }
                 return Err(error.into());
             }
         };
@@ -1687,7 +2092,16 @@ impl ControlPlaneHandle {
             .record_udp_reply_ready_latency(reply_ready_started.elapsed());
 
         let relay_addr = transport.relay_addr();
-        let endpoint = Arc::new(UdpEndpoint::new(transport, relay_addr, node.id));
+        #[cfg(feature = "honk-policy")]
+        let honk_reporter = honk_reporter;
+        let endpoint = Arc::new(UdpEndpoint::new_scored(
+            transport,
+            relay_addr,
+            node.id,
+            scheduler_ipver,
+            #[cfg(feature = "honk-policy")]
+            honk_reporter,
+        ));
         endpoint.record_pending_reply_peer(relay_addr);
 
         let conn_id = uuid::Uuid::new_v4().to_string();
@@ -1877,19 +2291,30 @@ impl ControlPlaneHandle {
         overall_dial_timeout: Duration,
         runtime_generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
         ipver: IpVersion,
+        feedback: &std::collections::HashMap<uuid::Uuid, TcpHonkFeedback>,
         cold_urltest: bool,
-    ) -> Option<(crate::proxy::ProxyStream, Node)> {
+    ) -> Option<(crate::proxy::ProxyStream, Node, TcpHonkReporter)> {
         let dial_deadline = tokio::time::Instant::now() + overall_dial_timeout;
         let ctx = self.clone();
         let target = resolved_target;
         let outbound = outbound_name.to_string();
+        #[cfg(feature = "honk-policy")]
+        let feedback = feedback.clone();
+        #[cfg(not(feature = "honk-policy"))]
+        let _ = feedback;
 
         let mut set = tokio::task::JoinSet::new();
+        #[cfg(feature = "honk-policy")]
+        let started_reporters = Arc::new(parking_lot::Mutex::new(Vec::new()));
         for (idx, node) in candidates.iter().enumerate() {
             let ctx = ctx.clone();
             let node = (*node).clone();
             let target_domain = target_domain.clone();
             let generation = Arc::clone(&runtime_generation);
+            #[cfg(feature = "honk-policy")]
+            let feedback = feedback.clone();
+            #[cfg(feature = "honk-policy")]
+            let started_reporters = Arc::clone(&started_reporters);
             set.spawn(async move {
                 if cold_urltest {
                     // Absolute releases make only candidate zero immediate;
@@ -1897,6 +2322,17 @@ impl ControlPlaneHandle {
                     // cancels it before it can start.
                     wait_for_cold_urltest_release(idx).await;
                 }
+                let reporter = parking_lot::Mutex::new(None);
+                let on_start = || {
+                    #[cfg(feature = "honk-policy")]
+                    {
+                        let started = feedback.get(&node.id).map(|feedback| feedback.start());
+                        if let Some(reporter) = &started {
+                            started_reporters.lock().push(reporter.clone());
+                        }
+                        *reporter.lock() = started;
+                    }
+                };
                 let start = std::time::Instant::now();
                 let per_dial_timeout = connect_timeout * 3;
                 let result = tokio::time::timeout(
@@ -1906,27 +2342,41 @@ impl ControlPlaneHandle {
                         &ctx.connection_pool,
                         &generation,
                         &node,
-                        target,
-                        target_domain.as_deref(),
+                        (target, target_domain.as_deref()),
                         connect_timeout,
+                        on_start,
                     ),
                 )
                 .await
                 .unwrap_or_else(|_| {
-                    Err(anyhow::anyhow!(
-                        "dial timed out after {:?}",
-                        per_dial_timeout
-                    ))
+                    Err(anyhow::Error::new(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("dial timed out after {per_dial_timeout:?}"),
+                    )))
                 });
                 let elapsed = start.elapsed();
-                (result, idx, elapsed, node)
+                let reporter = reporter.into_inner();
+                #[cfg(feature = "honk-policy")]
+                match &result {
+                    Ok(_) => {
+                        if let Some(reporter) = &reporter {
+                            reporter.setup_succeeded();
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(reporter) = &reporter {
+                            reporter.setup_failed(honk_runtime_outcome(&generation, error));
+                        }
+                    }
+                }
+                (result, idx, elapsed, node, reporter)
             });
         }
 
         let mut last_err: Option<(String, String)> = None;
         let mut first_err: Option<(String, String)> = None;
         let mut timeout_count: usize = 0;
-        let mut winner: Option<(crate::proxy::ProxyStream, usize, Node)> = None;
+        let mut winner: Option<(crate::proxy::ProxyStream, usize, Node, TcpHonkReporter)> = None;
         let mut remaining = set.len();
 
         loop {
@@ -1936,7 +2386,7 @@ impl ControlPlaneHandle {
             remaining -= 1;
             match tokio::time::timeout_at(dial_deadline, set.join_next()).await {
                 Ok(Some(task_result)) => match task_result {
-                    Ok((Ok((stream, fresh)), idx, elapsed, node)) => {
+                    Ok((Ok((stream, fresh)), idx, elapsed, node, reporter)) => {
                         ctx.alive_set
                             .report_available_traffic(node.id, ProbeDomain::Tcp, ipver);
                         // Real-traffic degradation fast path: a fresh
@@ -1953,18 +2403,20 @@ impl ControlPlaneHandle {
                         {
                             ctx.alive_set.notify_check_tcp(node.id);
                         }
-                        winner = Some((stream, idx, node));
+                        winner = Some((stream, idx, node, reporter));
                         set.abort_all();
                         break;
                     }
-                    Ok((Err(e), _idx, _elapsed, node)) => {
+                    Ok((Err(e), _idx, _elapsed, node, _reporter)) => {
                         debug!("Parallel dial to {} failed: {}", node.name, e);
                         ctx.stats.record_error(&outbound);
-                        ctx.alive_set
-                            .report_unavailable_traffic(node.id, ProbeDomain::Tcp, ipver);
-                        ctx.alive_set
-                            .record_dial_failure(node.id, ProbeDomain::Tcp, ipver);
-                        ctx.alive_set.notify_check_tcp(node.id);
+                        report_dial_failure_if_current(
+                            &runtime_generation,
+                            &ctx.alive_set,
+                            node.id,
+                            ProbeDomain::Tcp,
+                            ipver,
+                        );
                         let msg = e.to_string();
                         if msg.starts_with("dial timed out after") {
                             timeout_count += 1;
@@ -1980,6 +2432,8 @@ impl ControlPlaneHandle {
                 },
                 Ok(None) => break,
                 Err(_elapsed) => {
+                    #[cfg(feature = "honk-policy")]
+                    timeout_started_honk_reporters(&started_reporters);
                     set.abort_all();
                     warn!(
                         "Overall dial deadline reached for outbound '{}' ({} candidates, {} remaining)",
@@ -1995,14 +2449,13 @@ impl ControlPlaneHandle {
         // Drain any remaining aborted tasks to avoid JoinSet drop panic.
         while (set.join_next().await).is_some() {}
 
-        // Deposit fresh connections for losing candidates into the pool
         // so the pool stays warm after a parallel-dial race. Limit to 2 deposits
         // per race to avoid thundering herd on the proxy servers.
         // Ready-capable handlers get a fully-dialed stream (handshake
         // included, paid off the critical path); others get a bare TCP.
         if outbound_name != "direct"
             && outbound_name != "block"
-            && let Some((_, winning_idx, _)) = &winner
+            && let Some((_, winning_idx, ..)) = &winner
         {
             let mut deposit_count = 0u32;
             for (idx, node) in candidates.iter().enumerate() {
@@ -2018,6 +2471,11 @@ impl ControlPlaneHandle {
                 let registry = ctx.proxy_registry.clone();
                 let target_domain = target_domain.clone();
                 let generation = Arc::clone(&runtime_generation);
+                #[cfg(feature = "honk-policy")]
+                let pool_feedback = feedback.get(&node.id).cloned();
+                #[cfg(feature = "honk-policy")]
+                let pool_health_family = ipver;
+                deposit_count += 1;
                 tokio::spawn(async move {
                     let (ready_capable, bare_capable) = registry
                         .find(node.protocol)
@@ -2037,9 +2495,11 @@ impl ControlPlaneHandle {
                             return;
                         };
                         let _dial_permit = generation.acquire_dial_permit().await;
+                        #[cfg(feature = "honk-policy")]
+                        let pool_reporter = pool_feedback.as_ref().map(|feedback| feedback.start());
                         match registry
                             .dial_runtime(
-                                generation,
+                                Arc::clone(&generation),
                                 node.id,
                                 target,
                                 target_domain.as_deref(),
@@ -2048,9 +2508,25 @@ impl ControlPlaneHandle {
                             .await
                         {
                             Ok(stream) => {
+                                if generation.is_shutdown() {
+                                    #[cfg(feature = "honk-policy")]
+                                    if let Some(reporter) = &pool_reporter {
+                                        reporter.finish(crate::group::HonkOutcome::Shutdown);
+                                    }
+                                    return;
+                                }
+                                #[cfg(feature = "honk-policy")]
+                                if let Some(reporter) = &pool_reporter {
+                                    reporter.setup_succeeded();
+                                    reporter.finish_setup_only();
+                                }
                                 pool.deposit_ready(&key, stream).await;
                             }
                             Err(e) => {
+                                #[cfg(feature = "honk-policy")]
+                                if let Some(reporter) = &pool_reporter {
+                                    reporter.setup_failed(honk_runtime_outcome(&generation, &e));
+                                }
                                 debug!(
                                     "Post-race pool deposit: ready dial to {} via {} failed: {}",
                                     target, node_addr, e
@@ -2065,15 +2541,52 @@ impl ControlPlaneHandle {
                         return;
                     }
                     let _dial_permit = generation.acquire_dial_permit().await;
+                    #[cfg(feature = "honk-policy")]
+                    let pool_reporter = pool_feedback.as_ref().map(|feedback| {
+                        feedback
+                            .clone()
+                            .with_context(crate::group::HonkSelectionContext::aggregate(
+                                SelectionNetwork::Tcp,
+                                ProbeDomain::Tcp,
+                                pool_health_family,
+                            ))
+                            .start()
+                    });
                     match honk_outbound::util::connect_outbound(&node_addr, connect_timeout).await {
                         Ok(stream) => {
+                            #[cfg(feature = "honk-policy")]
+                            if generation.is_shutdown() {
+                                if let Some(reporter) = &pool_reporter {
+                                    reporter.finish(crate::group::HonkOutcome::Shutdown);
+                                }
+                                return;
+                            }
                             if is_tcp_stream_alive(&stream) {
+                                #[cfg(feature = "honk-policy")]
+                                if let Some(reporter) = &pool_reporter {
+                                    reporter.setup_succeeded();
+                                    reporter.finish_setup_only();
+                                }
                                 pool.deposit_tcp(&node_addr, stream).await;
                             } else {
+                                #[cfg(feature = "honk-policy")]
+                                if let Some(reporter) = &pool_reporter {
+                                    reporter.setup_failed(crate::group::HonkOutcome::Io(
+                                        std::io::ErrorKind::ConnectionReset,
+                                    ));
+                                }
                                 debug!("Post-race pool deposit: stream to {} is dead", node_addr);
                             }
                         }
                         Err(e) => {
+                            #[cfg(feature = "honk-policy")]
+                            if let Some(reporter) = &pool_reporter {
+                                reporter.setup_failed(if generation.is_shutdown() {
+                                    crate::group::HonkOutcome::Shutdown
+                                } else {
+                                    crate::group::HonkOutcome::Io(e.kind())
+                                });
+                            }
                             debug!(
                                 "Post-race pool deposit: connect to {} failed: {}",
                                 node_addr, e
@@ -2081,12 +2594,11 @@ impl ControlPlaneHandle {
                         }
                     }
                 });
-                deposit_count += 1;
             }
         }
 
         match winner {
-            Some((stream, _, node)) => Some((stream, node)),
+            Some((stream, _, node, reporter)) => Some((stream, node, reporter)),
             None => {
                 if let Some((last_msg, last_name)) = last_err {
                     let (first_msg, first_name) =
@@ -2136,10 +2648,11 @@ impl ControlPlaneHandle {
         pool: &ConnectionPool,
         generation: &Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
         node: &Node,
-        target: SocketAddr,
-        target_domain: Option<&str>,
+        target: (SocketAddr, Option<&str>),
         connect_timeout: Duration,
+        on_start: impl FnOnce(),
     ) -> anyhow::Result<(crate::proxy::ProxyStream, bool)> {
+        let (target, target_domain) = target;
         static POOL_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let pool_disabled = *POOL_DISABLED.get_or_init(|| {
             std::env::var("HONK_POOL_DISABLE")
@@ -2160,6 +2673,7 @@ impl ControlPlaneHandle {
                     addr,
                     target
                 );
+                on_start();
                 return Ok((stream, false));
             }
         }
@@ -2186,6 +2700,7 @@ impl ControlPlaneHandle {
             && (entry.descriptor.pool_bare_tcp)(node)
             && let Some(tcp) = pool.acquire_tcp(&addr).await
         {
+            on_start();
             tracing::debug!("Pooled TCP to {} acquired for {}", addr, target);
             return entry
                 .tcp
@@ -2199,6 +2714,7 @@ impl ControlPlaneHandle {
         // (e.g. a hand-built test config without the built-in nodes
         // injected) falls back to the stateless node-based dial.
         tracing::debug!("Fresh TCP connect to {} for {}", addr, target);
+        on_start();
         if generation.get(&node.id).is_some() {
             registry
                 .dial_runtime(
@@ -2268,6 +2784,20 @@ pub(super) fn domain_reality_outcome(
 mod sniffed_domain_routing_tests {
     use super::*;
 
+    #[cfg(feature = "honk-policy")]
+    #[test]
+    fn tcp_honk_context_uses_resolved_target_family_not_health_family() {
+        let resolved: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let context = tcp_honk_context(resolved, Some("example.com"), IpVersion::V6);
+
+        assert_eq!(context.target_family, Some(IpVersion::V4));
+        assert_eq!(context.health_family, IpVersion::V6);
+        assert_eq!(
+            context.target,
+            Some(crate::group::HonkTarget::domain("example.com", 443))
+        );
+    }
+
     fn handoff(outbound: u8, must: u8) -> HandoffResult {
         HandoffResult {
             outbound,
@@ -2288,6 +2818,74 @@ mod sniffed_domain_routing_tests {
         assert_eq!(final_udp_rule_mark(false, "proxy", 0x1234), 0x1234);
     }
 
+    #[cfg(feature = "honk-policy")]
+    #[test]
+    fn unpack_tcp_honk_plan_deduplicates_shared_leaf_metadata() {
+        let node = Node {
+            id: uuid::Uuid::new_v4(),
+            name: "shared".into(),
+            ..Default::default()
+        };
+        let plan = super::reload::ResolvedHonkPlan {
+            mode: SelectionPlanMode::ColdUrlTest,
+            nodes: vec![node.clone(), node],
+            health_family: IpVersion::V4,
+            feedback: vec![None, None],
+            selection_chains: vec![
+                vec!["outer".into(), "shared".into()],
+                vec!["duplicate".into(), "shared".into()],
+            ],
+        };
+        let (nodes, mode, feedback, selection_chains, family) = unpack_tcp_honk_plan(plan);
+
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(mode, SelectionPlanMode::ColdUrlTest);
+        assert!(feedback.is_empty());
+        assert_eq!(
+            selection_chains[&nodes[0].id],
+            ["outer".to_owned(), "shared".to_owned()]
+        );
+        assert_eq!(family, IpVersion::V4);
+    }
+
+    #[cfg(feature = "honk-policy")]
+    #[test]
+    fn timeout_helper_finishes_started_reporter_before_abort_drop() {
+        let nodes = [
+            Node {
+                id: uuid::Uuid::new_v4(),
+                name: "a".into(),
+                ..Default::default()
+            },
+            Node {
+                id: uuid::Uuid::new_v4(),
+                name: "b".into(),
+                ..Default::default()
+            },
+        ];
+        let group = honk_config::group::Group {
+            name: "honk".into(),
+            policy: honk_config::group::GroupPolicy::Honk,
+            nodes: nodes.iter().map(|node| node.id).collect(),
+            ..Default::default()
+        };
+        let manager = crate::group::GroupManager::new(&[group], &nodes);
+        let context = tcp_honk_context("192.0.2.1:443".parse().unwrap(), None, IpVersion::V4);
+        let feedback = manager
+            .feedback_for_node(nodes[0].id, context.clone())
+            .unwrap();
+        let reporters = parking_lot::Mutex::new(vec![feedback.start()]);
+        assert_eq!(started_honk_reporter_count(&reporters), 1);
+        timeout_started_honk_reporters(&reporters);
+        drop(reporters);
+
+        assert_eq!(
+            manager.selection_plan_for_target("honk", &context).entries[0]
+                .node
+                .id,
+            nodes[1].id
+        );
+    }
     #[test]
     fn udp_domain_modes_reroute_preliminary_group_handoffs() {
         let group = handoff(OutboundIndex::UserBase as u8, 0);
@@ -2716,9 +3314,9 @@ mod dial_permit_scope_tests {
                 &pool,
                 &generation,
                 &node,
-                target,
-                None,
+                (target, None),
                 Duration::from_secs(1),
+                || {},
             ),
         )
         .await
@@ -2731,5 +3329,98 @@ mod dial_permit_scope_tests {
 
         drop(stream);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn feedback_does_not_start_while_waiting_for_dial_admission() {
+        let target: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let mut node = Node {
+            name: "blocked-socks".into(),
+            protocol: NodeProtocol::Socks5,
+            address: "127.0.0.1".into(),
+            port: 9,
+            ..Default::default()
+        };
+        node.id = node.derive_id();
+        let generation = Arc::new(
+            honk_outbound::runtime::OutboundRuntimeRegistry::build_reusing(
+                &[node.clone()],
+                1,
+                None,
+            )
+            .unwrap()
+            .0,
+        );
+        let _held = generation.acquire_dial_permit().await;
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started_on_dial = Arc::clone(&started);
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(20),
+            ControlPlaneHandle::dial_pooled(
+                &ProxyRegistry::default_resolver().unwrap(),
+                &ConnectionPool::new(),
+                &generation,
+                &node,
+                (target, None),
+                Duration::from_secs(1),
+                move || started_on_dial.store(true, std::sync::atomic::Ordering::Release),
+            ),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(!started.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[cfg(feature = "honk-policy")]
+    #[test]
+    fn retired_runtime_errors_are_neutral() {
+        let generation =
+            honk_outbound::runtime::OutboundRuntimeRegistry::build_reusing(&[], 1, None)
+                .unwrap()
+                .0;
+        generation.begin_retirement();
+
+        assert_eq!(
+            honk_runtime_outcome(&generation, &anyhow::anyhow!("retired")),
+            crate::group::HonkOutcome::Shutdown
+        );
+    }
+
+    #[test]
+    fn retired_generation_dial_failures_do_not_poison_health() {
+        let live_generation =
+            honk_outbound::runtime::OutboundRuntimeRegistry::build_reusing(&[], 1, None)
+                .unwrap()
+                .0;
+        let retired_generation =
+            honk_outbound::runtime::OutboundRuntimeRegistry::build_reusing(&[], 1, None)
+                .unwrap()
+                .0;
+        retired_generation.begin_retirement();
+        let live = honk_outbound::alive::AliveDialerSet::new();
+        let retired = honk_outbound::alive::AliveDialerSet::new();
+        let node_id = uuid::Uuid::new_v4();
+
+        for _ in 0..50 {
+            report_dial_failure_if_current(
+                &live_generation,
+                &live,
+                node_id,
+                ProbeDomain::DataUdp,
+                IpVersion::V4,
+            );
+            report_dial_failure_if_current(
+                &retired_generation,
+                &retired,
+                node_id,
+                ProbeDomain::DataUdp,
+                IpVersion::V4,
+            );
+        }
+
+        assert!(!live.is_alive_for(node_id, ProbeDomain::DataUdp, IpVersion::V4));
+        assert!(retired.is_alive_for(node_id, ProbeDomain::DataUdp, IpVersion::V4));
     }
 }
