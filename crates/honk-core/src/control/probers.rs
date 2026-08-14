@@ -416,6 +416,15 @@ fn health_https_connector() -> Result<honk_outbound::tls::TlsConnector, String> 
 /// or unresolvable (dae semantics: plain `8.8.8.8:53`).
 const DEFAULT_UDP_CHECK_DNS: &str = "8.8.8.8:53";
 
+#[cfg(feature = "honk-policy")]
+#[derive(Clone)]
+pub(super) struct QuicScoreTarget {
+    addr: SocketAddr,
+    host: String,
+    identity: HonkTarget,
+    config: quinn::ClientConfig,
+}
+
 /// UDP health check prober that routes a minimal DNS query through the
 /// proxy node's UDP data path.
 ///
@@ -437,9 +446,12 @@ pub(super) struct ProxyUdpProber {
     group_manager: SharedGroupManager,
     #[cfg(feature = "honk-policy")]
     dns_identity: HonkTarget,
+    #[cfg(feature = "honk-policy")]
+    quic_score_target: Option<QuicScoreTarget>,
 }
 
 impl ProxyUdpProber {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         config: Arc<RwLock<Config>>,
         proxy_registry: Arc<ProxyRegistry>,
@@ -447,6 +459,7 @@ impl ProxyUdpProber {
         stats: Arc<StatsManager>,
         dns_target: SocketAddr,
         #[cfg(feature = "honk-policy")] dns_identity: HonkTarget,
+        #[cfg(feature = "honk-policy")] quic_score_target: Option<QuicScoreTarget>,
         #[cfg(feature = "honk-policy")] group_manager: SharedGroupManager,
     ) -> Self {
         Self {
@@ -459,6 +472,8 @@ impl ProxyUdpProber {
             group_manager,
             #[cfg(feature = "honk-policy")]
             dns_identity,
+            #[cfg(feature = "honk-policy")]
+            quic_score_target,
         }
     }
 
@@ -493,6 +508,8 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
         let group_manager = self.group_manager.clone();
         #[cfg(feature = "honk-policy")]
         let dns_identity = self.dns_identity.clone();
+        #[cfg(feature = "honk-policy")]
+        let quic_score_target = self.quic_score_target.clone();
 
         Box::pin(async move {
             let node = node.ok_or_else(|| format!("node '{}' not found", node_name_owned))?;
@@ -516,7 +533,7 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                 node.id,
                 HonkSelectionContext {
                     network: SelectionNetwork::Udp,
-                    probe_domain: ProbeDomain::DataUdp,
+                    probe_domain: ProbeDomain::DnsUdp,
                     target_family: Some(target_family(dns_target)),
                     health_family: target_family(dns_target),
                     target: Some(dns_identity),
@@ -527,7 +544,12 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
             let start = std::time::Instant::now();
             let attempt = async {
                 let transport = packet
-                    .dial_udp_transport_runtime(runtime, dns_target, None, connect_timeout)
+                    .dial_udp_transport_runtime(
+                        Arc::clone(&runtime),
+                        dns_target,
+                        None,
+                        connect_timeout,
+                    )
                     .await?;
                 probe_setup(&reporter);
                 udp_probe_exchange(&transport, &reporter, timeout)
@@ -537,11 +559,7 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                 Ok::<(), anyhow::Error>(())
             };
             let result = tokio::time::timeout(timeout, attempt).await;
-            if ephemeral.is_none() {
-                stats.mark_warm(node.id, crate::stats::WarmReason::Health);
-            }
-            close_ephemeral(ephemeral).await;
-            match result {
+            let health_result = match result {
                 Ok(Ok(())) => {
                     #[cfg(feature = "honk-policy")]
                     probe_finish(&reporter, HonkOutcome::Success);
@@ -557,7 +575,25 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                     probe_finish(&reporter, HonkOutcome::Timeout);
                     Err("UDP probe timeout".to_string())
                 }
+            };
+            #[cfg(feature = "honk-policy")]
+            if let Some(target) = quic_score_target.as_ref() {
+                score_quic_probe(
+                    &packet,
+                    Arc::clone(&runtime),
+                    &node,
+                    target,
+                    &group_manager,
+                    connect_timeout,
+                    timeout,
+                )
+                .await;
             }
+            if ephemeral.is_none() {
+                stats.mark_warm(node.id, crate::stats::WarmReason::Health);
+            }
+            close_ephemeral(ephemeral).await;
+            health_result
         })
     }
 }
@@ -585,6 +621,66 @@ async fn udp_probe_exchange(
         return Err("malformed DNS probe response".to_string());
     }
     Ok(())
+}
+
+#[cfg(feature = "honk-policy")]
+pub(super) fn quic_probe_context(target: &QuicScoreTarget) -> HonkSelectionContext {
+    let family = target_family(target.addr);
+    HonkSelectionContext {
+        network: SelectionNetwork::Udp,
+        probe_domain: ProbeDomain::DataUdp,
+        target_family: Some(family),
+        health_family: family,
+        target: Some(target.identity.clone()),
+    }
+}
+
+#[cfg(feature = "honk-policy")]
+#[allow(clippy::too_many_arguments)]
+async fn score_quic_probe(
+    packet: &Arc<dyn honk_outbound::proxy::PacketOutbound>,
+    runtime: Arc<honk_outbound::runtime::NodeRuntime>,
+    node: &Node,
+    target: &QuicScoreTarget,
+    group_manager: &SharedGroupManager,
+    connect_timeout: Duration,
+    timeout: Duration,
+) {
+    let Some(reporter) = start_probe_feedback(group_manager, node.id, quic_probe_context(target))
+    else {
+        return;
+    };
+    let reporter = Some(reporter);
+    let target_domain = match &target.identity {
+        HonkTarget::Domain { .. } => Some(target.host.as_str()),
+        HonkTarget::Socket(_) => None,
+    };
+    let attempt = async {
+        let transport = packet
+            .dial_udp_transport_runtime(runtime, target.addr, target_domain, connect_timeout)
+            .await?;
+        probe_setup(&reporter);
+        honk_outbound::quic::quic_handshake_probe(
+            transport,
+            target.addr,
+            &target.host,
+            &target.config,
+            timeout,
+        )
+        .await
+    };
+    match tokio::time::timeout(timeout, attempt).await {
+        Ok(Ok(_)) => {
+            probe_first_response(&reporter);
+            // The handshake probe exposes no wire counters. Record only the
+            // bidirectional fact so it contributes reliability, not volume.
+            probe_tx(&reporter, 1);
+            probe_rx(&reporter, 1);
+            probe_finish(&reporter, HonkOutcome::Success);
+        }
+        Ok(Err(error)) => probe_finish(&reporter, HonkOutcome::from_error(&error)),
+        Err(_) => probe_finish(&reporter, HonkOutcome::Timeout),
+    }
 }
 
 /// Build the minimal DNS query used by the UDP health probe: a single
@@ -678,6 +774,66 @@ pub(super) fn udp_probe_identity(raws: &[String], resolved: SocketAddr) -> HonkT
         return HonkTarget::domain(host, port);
     }
     resolved.into()
+}
+
+#[cfg(feature = "honk-policy")]
+pub(super) async fn resolve_quic_score_target(
+    url: &str,
+    resolver: Option<crate::outbound::ResolveHook>,
+) -> Option<QuicScoreTarget> {
+    if !url.trim().starts_with("https://") {
+        warn!("Honk QUIC scoring disabled: tcp_check_url is not HTTPS");
+        return None;
+    }
+    let (host, _) = extract_url_host_path(url)?;
+    let host = host.to_string();
+    let port = url_port(url);
+    let addrs = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        vec![SocketAddr::new(ip, port)]
+    } else {
+        match resolver {
+            Some(resolve) => resolve(host.clone(), port).await,
+            None => tokio::net::lookup_host((host.as_str(), port))
+                .await
+                .map(|addrs| addrs.collect())
+                .unwrap_or_default(),
+        }
+    };
+    let addr = match addrs.into_iter().next() {
+        Some(addr) => addr,
+        None => {
+            warn!("Honk QUIC scoring disabled: tcp_check_url host did not resolve");
+            return None;
+        }
+    };
+    let identity = host
+        .parse::<std::net::IpAddr>()
+        .map_or_else(|_| HonkTarget::domain(&host, port), |_| addr.into());
+    let tls_node = Node {
+        sni: Some(host.clone()),
+        skip_cert_verify: true,
+        ..Node::default()
+    };
+    let config = match honk_outbound::quic::client_config(
+        &tls_node,
+        &[b"h3"],
+        honk_outbound::quic::QuicClientOptions::default(),
+    )
+    .await
+    {
+        Ok(config) => config,
+        Err(error) => {
+            warn!("Honk QUIC scoring disabled: failed to build QUIC client: {error:#}");
+            return None;
+        }
+    };
+    info!(host, %addr, "Honk QUIC scoring probe enabled");
+    Some(QuicScoreTarget {
+        addr,
+        host,
+        identity,
+        config,
+    })
 }
 
 /// Returns true if `ip` belongs to honk's own dae0 veth subnets.

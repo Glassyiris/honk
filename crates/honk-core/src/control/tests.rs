@@ -155,6 +155,99 @@ async fn test_resolve_udp_check_target() {
     );
 }
 
+#[cfg(feature = "honk-policy")]
+#[tokio::test]
+async fn quic_failure_trains_honk_without_failing_dns_udp_health() {
+    use honk_config::node::{Group, GroupPolicy};
+    use honk_outbound::group::{GroupManager, HonkTarget, SelectionNetwork};
+
+    let node = udp_test_node();
+    let mut other = node.clone();
+    other.name = "udp-test-other".into();
+    other.port += 1;
+    other.id = other.derive_id();
+    let group = Group {
+        name: "honk".into(),
+        policy: GroupPolicy::Honk,
+        nodes: vec![node.id, other.id],
+        ..Group::default()
+    };
+    let config = Config {
+        nodes: vec![node.clone(), other.clone()],
+        groups: vec![group.clone()],
+        ..Config::default()
+    };
+    let manager: SharedGroupManager = Arc::new(parking_lot::RwLock::new(Arc::new(
+        GroupManager::new(&[group], &[node.clone(), other.clone()]),
+    )));
+    let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let handler = Arc::new(UdpTestHandler {
+        mode: UdpTestMode::DnsResponse {
+            dials: Arc::clone(&dials),
+        },
+    });
+    let mut registry = ProxyRegistry::new();
+    registry.register(
+        honk_outbound::proxy::ProtocolEntry::new(node.protocol, handler.clone())
+            .with_packet(handler),
+    );
+    let runtime = Arc::new(parking_lot::RwLock::new(Arc::new(
+        honk_outbound::runtime::OutboundRuntimeRegistry::build(&[node.clone(), other.clone()])
+            .unwrap(),
+    )));
+    let resolver: crate::outbound::ResolveHook = Arc::new(|_host, port| {
+        Box::pin(async move { vec![SocketAddr::from(([127, 0, 0, 1], port))] })
+    });
+    let quic_target = resolve_quic_score_target(
+        "https://quic.example.test:9443/generate_204",
+        Some(resolver),
+    )
+    .await
+    .unwrap();
+    let context = probers::quic_probe_context(&quic_target);
+    assert_eq!(context.network, SelectionNetwork::Udp);
+    assert_eq!(context.probe_domain, ProbeDomain::DataUdp);
+    assert_eq!(context.target_family, Some(IpVersion::V4));
+    assert_eq!(
+        context.target,
+        Some(HonkTarget::domain("quic.example.test", 9443))
+    );
+    assert_eq!(
+        manager
+            .read()
+            .selection_plan_for_target("honk", &context)
+            .entries[0]
+            .node
+            .id,
+        node.id
+    );
+    let prober = probers::ProxyUdpProber::new(
+        Arc::new(RwLock::new(config)),
+        Arc::new(registry),
+        runtime,
+        Arc::new(StatsManager::new()),
+        "127.0.0.1:53".parse().unwrap(),
+        "127.0.0.1:53".parse::<SocketAddr>().unwrap().into(),
+        Some(quic_target),
+        manager.clone(),
+    );
+
+    let result =
+        honk_outbound::alive::UdpProber::probe_udp(&prober, &node.name, Duration::from_millis(30))
+            .await;
+    assert!(result.is_ok(), "DNS health result: {result:?}");
+    assert_eq!(dials.load(std::sync::atomic::Ordering::Relaxed), 2);
+    assert_eq!(
+        manager
+            .read()
+            .selection_plan_for_target("honk", &context)
+            .entries[0]
+            .node
+            .id,
+        other.id
+    );
+}
+
 #[test]
 fn extract_url_host_path_parses_all_forms() {
     // Regression: path must not leak into the Host header / DNS name.
@@ -1445,6 +1538,9 @@ enum UdpTestMode {
         sends: Arc<std::sync::atomic::AtomicUsize>,
     },
     Success,
+    DnsResponse {
+        dials: Arc<std::sync::atomic::AtomicUsize>,
+    },
     #[cfg(feature = "ebpf")]
     KernelSocket(Arc<UdpSocket>),
     TcpHold {
@@ -1472,6 +1568,7 @@ enum UdpTestMode {
 struct UdpTestTransport {
     mode: UdpTestMode,
     relay: SocketAddr,
+    replied: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -1506,11 +1603,23 @@ impl honk_outbound::proxy::PacketTransport for UdpTestTransport {
         }
     }
 
-    async fn recv_packet(&self, _buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+    async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
         #[cfg(feature = "ebpf")]
         if let UdpTestMode::KernelSocket(socket) = &self.mode {
-            let (size, _) = socket.recv_from(_buf).await?;
+            let (size, _) = socket.recv_from(buf).await?;
             return Ok((size, self.relay));
+        }
+        if matches!(self.mode, UdpTestMode::DnsResponse { .. })
+            && !self
+                .replied
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            let response = [0x12, 0x34, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0];
+            buf[..response.len()].copy_from_slice(&response);
+            return Ok((response.len(), self.relay));
+        }
+        if matches!(self.mode, UdpTestMode::DnsResponse { .. }) {
+            return std::future::pending().await;
         }
         Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
     }
@@ -1631,6 +1740,9 @@ impl honk_outbound::proxy::PacketOutbound for UdpTestHandler {
                 entered.notify_one();
                 release.notified().await;
             }
+            UdpTestMode::DnsResponse { dials } => {
+                dials.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             _ => {}
         }
         match &self.mode {
@@ -1640,6 +1752,7 @@ impl honk_outbound::proxy::PacketOutbound for UdpTestHandler {
             _ => Ok(Arc::new(UdpTestTransport {
                 mode: self.mode.clone(),
                 relay: target,
+                replied: std::sync::atomic::AtomicBool::new(false),
             })),
         }
     }

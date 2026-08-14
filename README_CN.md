@@ -14,7 +14,7 @@
 
 许可证：**GPL-3.0-only**。
 
-可靠性优先的 Honk 组策略仅在构建时启用默认关闭的 `honk-policy` Cargo feature 后可用；启用该 feature 的配置以 `policy: honk` 选择它，不会改变默认组行为。被选用时，它只在内存中从真实流量以及 DNS、探测、delay test、预热和直连或经代理的 UI 下载 attempt 学习，不会导出目标键。详见[组参考](doc/zh/reference/groups.md#honk-策略可选)。
+可靠性优先的 Honk 组策略仅在构建时启用默认关闭的 `honk-policy` Cargo feature 后可用；启用该 feature 的配置以 `policy: honk` 选择它，不会改变默认组行为。被选用时，它只在内存中从真实流量以及 DNS、真实 QUIC 握手、探测、delay test、预热和直连或经代理的 UI 下载 attempt 学习，不会导出目标键。详见[组参考](doc/zh/reference/groups.md#honk-策略可选)。
 
 ### 实验性首包保留 UDP 决策
 

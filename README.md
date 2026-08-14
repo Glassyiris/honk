@@ -16,7 +16,7 @@ It is **not** a line-for-line port of either project. The kernel path follows da
 
 License: **GPL-3.0-only**.
 
-The reliability-first Honk group policy is available only in builds with the default-off `honk-policy` Cargo feature; enabled configurations select it with `policy: honk`. It does not change default group behavior. When selected, it learns in memory from actual traffic plus DNS, probe, delay-test, warm-up, and direct or proxied UI-download attempts without exporting target keys. See the [group reference](doc/en/reference/groups.md#honk-policy-optional).
+The reliability-first Honk group policy is available only in builds with the default-off `honk-policy` Cargo feature; enabled configurations select it with `policy: honk`. It does not change default group behavior. When selected, it learns in memory from actual traffic plus DNS, real QUIC handshakes, probes, delay tests, warm-up, and direct or proxied UI downloads without exporting target keys. See the [group reference](doc/en/reference/groups.md#honk-policy-optional).
 
 ## Experimental held-first-packet UDP decisions
 

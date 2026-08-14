@@ -47,7 +47,7 @@ Honk 首先运行与其他策略相同的存活性过滤。过滤所用的 healt
 
 只有物理拨号、逻辑 stream、transport preparation 或 exchange 真正启动时才调用 `HonkFeedback::start()`。其可 clone reporter 记录 setup、首响应、发送/接收字节，并且只接受 success、timeout、`io::ErrorKind`、cancellation、shutdown 或 other 中的一个终态；第一个终态调用生效，最后一个未完成 handle 被 drop 时报告 cancellation。cancellation 与 shutdown 会撤销 start 而非降低可靠性。retry 会启动新的 reporter，未实际启动的 speculative work 则没有 reporter。
 
-同一 reporter 路径覆盖透明 TCP relay 与 UDP endpoint 生命周期、受支持的 DNS upstream exchange、周期 HTTP/UDP 健康探测、按需 Clash delay 测量、启动 preconnect、Selector/session 与 UDP 预热，以及外部 UI 下载。DNS 反馈跟随实际尝试的 carrier：UDP 使用 UDP 分桶，TCP/DoT/DoH 使用 TCP；UDP truncated answer 后的 TCP retry 会相应切换分桶；现有的 proxied DoQ/DoH3 限制保持不变。URL test 与下载对代理叶节点和内建 `direct` 叶节点都使用真实请求目标。周期 direct liveness 仍使用稳定 bootstrap 目标；仅连接 server/session 的预热只更新聚合 setup 证据。
+同一 reporter 路径覆盖透明 TCP relay 与 UDP endpoint 生命周期、受支持的 DNS upstream exchange、周期 HTTP/UDP 健康探测、按需 Clash delay 测量、启动 preconnect、Selector/session 与 UDP 预热，以及外部 UI 下载。DNS 反馈跟随实际尝试的 carrier：UDP 使用 UDP 分桶，TCP/DoT/DoH 使用 TCP；UDP truncated answer 后的 TCP retry 会相应切换分桶；现有的 proxied DoQ/DoH3 限制保持不变。启用 `honk-policy` 后，每个周期 UDP 探测会为 Honk 组中的每个节点另外打开一个 packet transport，对第一个 HTTPS `global.tcp_check_url` 完成 ALPN 为 `h3` 的真实 TLS-in-QUIC 握手。这个精确目标 `DataUdp` 评分与决定 UDP 存活性的 DNS exchange 相互独立；URL 缺失或不是 HTTPS 时不运行。由于 adapter 不提供 wire counter，成功握手只记录双向有效性，不奖励虚构的 byte volume。URL test 与下载对代理叶节点和内建 `direct` 叶节点都使用真实请求目标。周期 direct liveness 仍使用稳定 bootstrap 目标；仅连接 server/session 的预热只更新聚合 setup 证据。
 
 排名首先计算带 Beta 先验的 useful reliability 下置信估计。比最佳候选低出固定「可靠性接近」区间的成员，不会参与延迟、吞吐与 UCB 探索。在该区间内，更低的 setup/首响应延迟、有界吞吐和有界探索共同形成 utility。完全冷的候选按确定性顺序依次探索；其余平局按声明顺序和稳定 `NodeId` 解决。最终计划始终只包含一个权威叶节点，不会竞速候选。
 
@@ -118,7 +118,8 @@ Honk 首先运行与其他策略相同的存活性过滤。过滤所用的 healt
 | 探测路径 | 行为 |
 | --- | --- |
 | TCP | 通过节点向 `tcp_check_url` 发送已配置 HTTP 方法；不适用 HTTP 探测时执行裸 TCP 连接。冷的可复用节点会先在临时 runtime 中建立 session/client；setup 不计时，随后只有完成的 HTTP 交换才把暖路径 RTT 记录到匹配的 TCP 地址族状态。setup 与目标交换失败都会更新活性/冷却，但不贡献延迟或排名 strike。 |
-| UDP | 通过节点自己的 `dial_udp_transport`，向第一个 `udp_check_dns` 目标发送一个最小 DNS 查询。成功记录实测 RTT，并把 `DnsUdp` 与 `DataUdp` 都标记为存活；失败分别给两个 UDP 域增加一次探测失败。它从不修改 TCP 状态。 |
+| UDP 健康 | 通过节点自己的 `dial_udp_transport`，向第一个 `udp_check_dns` 目标发送一个最小 DNS 查询。成功记录实测 RTT，并把 `DnsUdp` 与 `DataUdp` 都标记为存活；失败分别给两个 UDP 域增加一次探测失败。它从不修改 TCP 状态。 |
+| Honk QUIC 评分 | 仅在启用 `honk-policy` 时，通过新的 packet transport 为 Honk 组中的每个节点单独执行一次 ALPN 为 `h3` 的真实 TLS-in-QUIC 握手，目标为第一个 HTTPS `tcp_check_url`。成功或失败会更新精确 `DataUdp` 分数与聚合先验，但绝不修改存活状态，也不奖励未观测的 byte volume。 |
 | 按组 URL | 用与全局 TCP 探测相同的临时暖路径计时，探测动态解析出的 `(member tag, current leaf)` 对。状态为 TCP-only，连续三次失败即死亡，并使用相同冷却与连续两次成功恢复。重载时 `sync_group_check_urls` 替换有效的组/URL 注册表。 |
 
 `has_udp_state` 区分从未观察过 UDP 的节点与已明确观察为死亡的节点。已建立 endpoint 的发送、接收和回包空闲错误会上报 `DataUdp` 流量失败。主动 endpoint 退役、节点死亡取消和进程关闭不影响健康状态。
