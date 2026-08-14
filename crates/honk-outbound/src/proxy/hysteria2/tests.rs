@@ -606,7 +606,10 @@ async fn test_dial_tcp_echo() {
         .expect("dial should succeed");
     stream.stream.write_all(b"hello hy2").await.unwrap();
     let mut buf = [0u8; 9];
-    stream.stream.read_exact(&mut buf).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), stream.stream.read_exact(&mut buf))
+        .await
+        .expect("TCP echo timed out")
+        .unwrap();
     assert_eq!(&buf, b"hello hy2");
 }
 
@@ -629,7 +632,13 @@ async fn test_dial_tcp_does_not_wait_for_response() {
 
     stream.stream.write_all(b"fast open").await.unwrap();
     let mut output = [0u8; 9];
-    stream.stream.read_exact(&mut output).await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        stream.stream.read_exact(&mut output),
+    )
+    .await
+    .expect("TCP echo timed out")
+    .unwrap();
     assert_eq!(&output, b"fast open");
 }
 
