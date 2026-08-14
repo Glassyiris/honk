@@ -491,3 +491,27 @@ impl PendingUdpVerdicts {
         }
     }
 }
+
+pub(super) fn retained_state(state: &honk_ebpf_common::ConnState) -> RetainedState {
+    match state.state {
+        value if value == UdpDecisionState::Pending as u8 => RetainedState::Pending,
+        value if value == UdpDecisionState::DirectArmed as u8 => RetainedState::DirectArmed,
+        value if value == UdpDecisionState::Proxy as u8 => RetainedState::Proxy,
+        value if value == UdpDecisionState::Block as u8 => RetainedState::Block,
+        value if value == UdpDecisionState::None as u8 => {
+            let raw = unsafe { state.meta.raw };
+            let outbound = raw as u8;
+            let direct_rule_mark = (raw >> 8) as u32;
+            if outbound == OutboundIndex::Direct as u8
+                && raw & (ROUTING_META_FLAG_PUBLISHED | ROUTING_META_FLAG_OFFLOAD)
+                    == ROUTING_META_FLAG_PUBLISHED | ROUTING_META_FLAG_OFFLOAD
+                && !skb_mark_has_reserved_bits(direct_rule_mark)
+            {
+                RetainedState::ActiveDirect(direct_rule_mark | CLASSIFIED_MARK)
+            } else {
+                RetainedState::Reject
+            }
+        }
+        _ => RetainedState::Reject,
+    }
+}
