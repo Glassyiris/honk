@@ -686,6 +686,7 @@ impl ControlPlane {
                 honk_outbound::bootstrap::BootstrapResolver::parse(
                     &config.global.bootstrap_resolver,
                 ),
+                config.dns.strategy.clone(),
             )?,
         );
         Self::new_with_upstream_pool(

@@ -909,6 +909,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             config.nodes.clone(),
             config.groups.clone(),
             honk_outbound::bootstrap::BootstrapResolver::parse(&config.global.bootstrap_resolver),
+            config.dns.strategy.clone(),
         )?
         .with_timeouts(
             std::time::Duration::from_millis(config.global.dns_resolve_timeout_ms),

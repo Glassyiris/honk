@@ -156,13 +156,27 @@ async fn close_joins_udp_receive_task_and_removes_query_path() {
         .expect("UDP response");
     responder.await.expect("UDP responder");
     assert_eq!(pool.lifecycle_stats().tasks, 1);
-    assert!(pool.entries["default"].udp.lock().is_some());
+    assert!(
+        pool.entries["default"]
+            .udp
+            .lock()
+            .pools
+            .iter()
+            .any(Option::is_some)
+    );
 
     pool.close().await;
     pool.close().await;
 
     assert_eq!(pool.lifecycle_stats().tasks, 0);
-    assert!(pool.entries["default"].udp.lock().is_none());
+    assert!(
+        pool.entries["default"]
+            .udp
+            .lock()
+            .pools
+            .iter()
+            .all(Option::is_none)
+    );
     assert!(
         pool.query("default", &mock_dns_query(0x5678))
             .await

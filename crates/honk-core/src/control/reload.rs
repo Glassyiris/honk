@@ -579,6 +579,7 @@ impl ControlPlane {
                 honk_outbound::bootstrap::BootstrapResolver::parse(
                     &config.global.bootstrap_resolver,
                 ),
+                config.dns.strategy.clone(),
             )?
             .with_runtime_generation(runtime_generation)
             .with_timeouts(

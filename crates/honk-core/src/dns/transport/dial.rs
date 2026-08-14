@@ -27,8 +27,7 @@ pub struct ProxyDial {
 impl DialContext {
     /// Dial a plain TCP stream to the upstream (marked, or via proxy).
     ///
-    /// Tries every bootstrap-resolved address (IPv4 preferred) so a single
-    /// unreachable AAAA does not fail the whole DoH/DoT dial.
+    /// Tries every bootstrap-resolved address in configured family order.
     pub async fn dial_tcp(&self) -> anyhow::Result<tokio::net::TcpStream> {
         if self.proxy.is_some() {
             // Proxy handlers return a boxed stream already connected to the
@@ -39,8 +38,7 @@ impl DialContext {
         let addrs = self.endpoint.resolve_addrs().await?;
         let mut last_err = None;
         for addr in addrs {
-            // Per-address budget: keep overall cold start reasonable when the
-            // first (often broken v6) candidate hangs.
+            // Keep time for later candidates when one address silently blackholes.
             let per = self.dial_timeout.min(Duration::from_secs(3));
             match tokio::time::timeout(
                 per,
@@ -70,26 +68,41 @@ impl DialContext {
     /// upstream DNS server address.
     pub async fn dial_tcp_boxed(&self) -> anyhow::Result<Box<dyn crate::proxy::AsyncReadWrite>> {
         if let Some(proxy) = &self.proxy {
-            let addr = self.endpoint.resolve_addr().await?;
-            let ps = if let Some(generation) = &proxy.generation {
-                proxy
-                    .registry
-                    .dial_runtime(
-                        Arc::clone(generation),
-                        proxy.node.id,
-                        addr,
-                        None,
-                        self.dial_timeout,
-                    )
-                    .await
-            } else {
-                proxy
-                    .registry
-                    .dial(&proxy.node, addr, None, self.dial_timeout)
-                    .await
+            let mut last_error = None;
+            for address in self.endpoint.resolve_addrs().await? {
+                let result = if let Some(generation) = &proxy.generation {
+                    proxy
+                        .registry
+                        .dial_runtime(
+                            Arc::clone(generation),
+                            proxy.node.id,
+                            address,
+                            None,
+                            self.dial_timeout,
+                        )
+                        .await
+                } else {
+                    proxy
+                        .registry
+                        .dial(&proxy.node, address, None, self.dial_timeout)
+                        .await
+                };
+                match result {
+                    Ok(stream) => return Ok(stream.stream),
+                    Err(error) => {
+                        tracing::debug!(
+                            %address,
+                            error_kind = "proxy_dial_failed",
+                            "Proxy dial for DNS upstream failed; trying next address"
+                        );
+                        last_error = Some(anyhow::anyhow!(
+                            "proxy dial for DNS upstream {address}: {error}"
+                        ));
+                    }
+                }
             }
-            .map_err(|e| anyhow::anyhow!("proxy dial for DNS upstream: {e}"))?;
-            return Ok(ps.stream);
+            return Err(last_error
+                .unwrap_or_else(|| anyhow::anyhow!("DNS upstream resolved to no addresses")));
         }
         let stream = self.dial_tcp().await?;
         Ok(Box::new(stream))

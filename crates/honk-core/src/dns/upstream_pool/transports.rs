@@ -162,11 +162,18 @@ impl UpstreamPool {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        let udp_pools = self
-            .entries
-            .values()
-            .filter_map(|entry| entry.udp.lock().take())
-            .collect::<Vec<_>>();
+        let mut udp_pools = Vec::new();
+        for entry in self.entries.values() {
+            let mut state = entry.udp.lock();
+            state.current = None;
+            udp_pools.extend(
+                state
+                    .pools
+                    .iter_mut()
+                    .filter_map(Option::take)
+                    .map(|(_, pool)| pool),
+            );
+        }
         for pool in udp_pools {
             pool.close().await;
         }

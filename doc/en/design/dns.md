@@ -79,6 +79,8 @@ Only IN-class A and AAAA queries use the snapshot. A known name with no address 
 
 A prefer-family sibling query changes only the first question's QTYPE. Transaction ID, flags, QCLASS, EDNS data, ingress profile, original destination, and the rest of the wire profile remain unchanged. Sibling failure or NODATA does not suppress a usable non-preferred response. For internal/application hostname resolution, the bootstrap fallback runs once only when every eligible family is unusable, then filters fallback addresses through the same family eligibility.
 
+The strategy also orders bootstrap-resolved upstream dial targets. `both` uses IPv4-first compatibility order; preference modes put their family first while retaining the other family. Stream and QUIC transports walk the ordered candidates. Direct UDP keeps the existing two-attempt bound: after the first candidate fails, its retry selects the other family before another address of the same family and caches the winner.
+
 ### DNS routing
 
 Conditions within one rule are ANDed; each condition can be negated. The compiled condition model covers qname, qtype, upstream name, and response IP. Rules are evaluated in source order and stop on the first match.

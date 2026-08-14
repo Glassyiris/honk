@@ -145,13 +145,20 @@ mod admission {
 }
 mod entries {
     use std::collections::HashMap;
+    use std::net::SocketAddr;
     use std::sync::Arc;
 
-    use honk_config::dns::DnsUpstream;
+    use honk_config::dns::{DnsStrategy, DnsUpstream};
 
     use super::transports::{PooledTransport, TransportKey};
     use crate::dns::endpoint::DnsEndpoint;
     use crate::dns::transport::{LifecycleSlot, UdpPool};
+
+    #[derive(Default)]
+    pub(super) struct UdpState {
+        pub(super) current: Option<SocketAddr>,
+        pub(super) pools: [Option<(SocketAddr, Arc<UdpPool>)>; 2],
+    }
 
     pub(super) struct UpstreamEntry {
         pub(super) protocol: honk_config::types::DnsProtocol,
@@ -160,12 +167,13 @@ mod entries {
         pub(super) outbound: Option<String>,
         pub(super) transports:
             parking_lot::Mutex<HashMap<TransportKey, Arc<LifecycleSlot<PooledTransport>>>>,
-        pub(super) udp: parking_lot::Mutex<Option<Arc<UdpPool>>>,
+        pub(super) udp: parking_lot::Mutex<UdpState>,
     }
 
     pub(super) fn build_entries(
         upstreams: &[DnsUpstream],
         bootstrap_resolver: Option<honk_outbound::bootstrap::BootstrapResolver>,
+        strategy: DnsStrategy,
     ) -> anyhow::Result<HashMap<String, UpstreamEntry>> {
         let mut entries = HashMap::new();
         for upstream in upstreams {
@@ -174,6 +182,7 @@ mod entries {
                 upstream.protocol,
                 upstream.tls_server_name.as_deref(),
                 bootstrap_resolver,
+                strategy.clone(),
             )
             .map_err(|error| {
                 anyhow::anyhow!(
@@ -190,7 +199,7 @@ mod entries {
                     address: upstream.address.clone(),
                     outbound: upstream.outbound.clone(),
                     transports: parking_lot::Mutex::new(HashMap::new()),
-                    udp: parking_lot::Mutex::new(None),
+                    udp: parking_lot::Mutex::new(UdpState::default()),
                 },
             );
         }
@@ -209,7 +218,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
-use honk_config::dns::DnsUpstream;
+use honk_config::dns::{DnsStrategy, DnsUpstream};
 use honk_config::node::{Group, Node};
 use honk_outbound::group::{GroupManager, SharedGroupManager};
 #[cfg(test)]
@@ -273,6 +282,7 @@ impl UpstreamPool {
             nodes,
             groups,
             honk_outbound::bootstrap::global(),
+            DnsStrategy::default(),
         )
     }
 
@@ -283,9 +293,10 @@ impl UpstreamPool {
         nodes: Vec<Node>,
         groups: Vec<Group>,
         bootstrap_resolver: Option<honk_outbound::bootstrap::BootstrapResolver>,
+        strategy: DnsStrategy,
     ) -> anyhow::Result<Self> {
         Ok(Self {
-            entries: build_entries(upstreams, bootstrap_resolver)?,
+            entries: build_entries(upstreams, bootstrap_resolver, strategy)?,
             proxy_registry,
             runtime_generation: std::sync::OnceLock::new(),
             nodes,

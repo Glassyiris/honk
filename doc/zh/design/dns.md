@@ -79,6 +79,8 @@ flowchart LR
 
 偏好地址族 sibling 查询只修改第一个问题的 QTYPE。事务 ID、flags、QCLASS、EDNS 数据、入口 profile、原始目的地址及其余 wire profile 均保持不变。Sibling 失败或 NODATA 不会压制可用的非偏好响应。对于内部/应用主机名解析，bootstrap fallback 仅在所有符合资格的地址族均不可用时运行一次，随后用同一地址族资格过滤 fallback 地址。
 
+该策略也决定 bootstrap 解析出的上游拨号目标顺序。`both` 使用 IPv4 优先的兼容顺序；偏好模式把对应地址族放在前面，同时保留另一地址族。stream 与 QUIC transport 会依次尝试候选地址。直连 UDP 保持现有两次尝试上限：首个候选失败后，唯一一次重试先选择另一地址族，再考虑同族其他地址，并缓存成功的 socket。
+
 ### DNS 路由
 
 同一规则内的条件按 AND 组合；每个条件都可取反。编译后的条件模型覆盖 qname、qtype、上游名与响应 IP。规则按源码顺序求值，并在首条命中时停止。

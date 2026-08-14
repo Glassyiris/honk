@@ -3,7 +3,6 @@
 //! One long-lived QUIC connection with ALPN `h3`, carrying POST requests of
 //! `application/dns-message` to the configured path (default `/dns-query`).
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
@@ -22,7 +21,7 @@ use super::lifecycle::LifecycleSlot;
 use super::owned_task::OwnedTask;
 use super::{
     DnsMessageBody, SharedQuicEndpoint, build_doh_request, dns_quic_config, doh_content_length,
-    exchange_with_retry, finish_doh_response, quic_connect,
+    exchange_with_retry, finish_doh_response, quic_connect_endpoint,
 };
 
 type H3Sender = SendRequest<h3_quinn::OpenStreams, Bytes>;
@@ -150,12 +149,10 @@ impl Doh3Client {
 
     async fn handshake(&self) -> anyhow::Result<H3Session> {
         let (conn, mut driver, sender) = tokio::time::timeout(self.dial_timeout, async {
-            let addr: SocketAddr = self.endpoint.resolve_addr().await?;
-            let conn = quic_connect(
+            let conn = quic_connect_endpoint(
                 &self.quic_ep,
                 &self.quic_config,
-                addr,
-                &self.endpoint.sni,
+                &self.endpoint,
                 self.dial_timeout,
                 "DoH3 QUIC",
             )

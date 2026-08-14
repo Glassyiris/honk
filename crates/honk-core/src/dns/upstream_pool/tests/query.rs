@@ -1,5 +1,8 @@
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+
+use honk_config::dns::DnsStrategy;
 
 use super::*;
 use crate::dns::forwarder::DnsUpstreamPool;
@@ -28,6 +31,84 @@ async fn test_udp_query() {
 
     assert_eq!(result, response);
     server_handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn udp_prefer_ipv6_falls_back_to_ipv4_and_reuses_winner() {
+    let upstream_server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let upstream_address = upstream_server.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let mut buffer = [0_u8; 512];
+        for _ in 0..2 {
+            let (_, source) = upstream_server.recv_from(&mut buffer).await.unwrap();
+            let mut response = mock_dns_response(0);
+            response[..2].copy_from_slice(&buffer[..2]);
+            upstream_server.send_to(&response, source).await.unwrap();
+        }
+    });
+    let (bootstrap_address, bootstrap_task) = spawn_dual_stack_bootstrap(8).await;
+    let resolver =
+        honk_outbound::bootstrap::BootstrapResolver::parse(&format!("udp://{bootstrap_address}"));
+    let upstream = make_upstream(
+        "dual",
+        &format!("dual.test:{}", upstream_address.port()),
+        DnsProtocol::Udp,
+    );
+    let pool = UpstreamPool::new_with_proxy_and_bootstrap(
+        &[upstream],
+        make_router(),
+        None,
+        Vec::new(),
+        Vec::new(),
+        resolver,
+        DnsStrategy::PreferIpv6,
+    )
+    .unwrap()
+    .with_timeouts(Duration::from_millis(50), Duration::from_millis(100));
+
+    for transaction_id in [0x1234, 0x5678] {
+        let response = pool
+            .query("dual", &mock_dns_query(transaction_id))
+            .await
+            .expect("IPv4 fallback response");
+        assert_eq!(response, mock_dns_response(transaction_id));
+    }
+    assert!(pool.entries["dual"].udp.lock().current.unwrap().is_ipv4());
+
+    pool.close().await;
+    upstream_task.await.unwrap();
+    bootstrap_task.await.unwrap();
+}
+
+async fn spawn_dual_stack_bootstrap(
+    requests: usize,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let address = server.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        for _ in 0..requests {
+            let mut query = [0_u8; 512];
+            let (length, source) = server.recv_from(&mut query).await.unwrap();
+            let query = &query[..length];
+            let qtype = u16::from_be_bytes([query[length - 4], query[length - 3]]);
+            let mut response = query.to_vec();
+            response[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+            response[6..8].copy_from_slice(&1_u16.to_be_bytes());
+            if qtype == 1 {
+                response.extend_from_slice(&[
+                    0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04, 127, 0,
+                    0, 1,
+                ]);
+            } else {
+                response.extend_from_slice(&[
+                    0xc0, 0x0c, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x10, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                ]);
+            }
+            server.send_to(&response, source).await.unwrap();
+        }
+    });
+    (address, task)
 }
 
 #[tokio::test]
