@@ -53,7 +53,7 @@ Clap 还提供 `-h`/`--help` 和 `-V`/`--version`。
 | `RUST_LOG` | 两个二进制 | Tracing filter。对 `honk-core` 采用上述当前有效优先级；`honk-tool` 在未设置时默认 `warn`。 |
 | `HONK_UI_DOWNLOAD_URL` | 启用 `clash-api` 的 `honk-core` | 当已配置的外部 UI 目录需要下载内容时，覆盖 dashboard zip URL。 |
 | `HONK_POOL_DISABLE=1` | `honk-core` | 绕过 Ready stream 与裸 TCP 两类池，每次全新拨号。代码也接受不区分大小写的 `true`；首次使用后缓存该值。 |
-| `HONK_MI_COLLECT_SECS` | 启用 `mimalloc` 的 `honk-core` | 空闲 worker 强制回收间隔，单位秒。默认 `60`；`0` 关闭回收器；无效值回退为 `60`。 |
+| `HONK_MI_COLLECT_SECS` | 启用 `mimalloc` 的 `honk-core` | worker 所有者在空闲 park 钩子与周期性已 park worker 扫描中的强制回收间隔，单位秒。默认 `60`；`0` 同时关闭两条回收路径；无效值回退为 `60`。 |
 | `DAE_LOCATION_ASSET` | 两个二进制的 Geo 加载 | 最先检查其中的 `geoip.dat` 与 `geosite.dat`。 |
 
 UDP NFQUEUE 没有环境变量开关，只能通过 `experimental.udp_nfqueue.enabled` 启用；见 [Experimental 配置参考](./experimental.md)。
