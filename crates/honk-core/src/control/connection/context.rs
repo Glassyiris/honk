@@ -1,4 +1,4 @@
-use super::*;
+use crate::control::*;
 
 pub(in crate::control) struct ConnectionGuard {
     drain: Arc<DrainTracker>,

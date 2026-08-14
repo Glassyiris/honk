@@ -1,4 +1,5 @@
-use super::*;
+use crate::control::*;
+use std::collections::{HashMap, HashSet};
 
 /// Build the eBPF conntrack key for a flow: IPs as 16-byte v4-mapped
 /// addresses, ports in host byte order, `l4proto` as the IANA number.

@@ -1,4 +1,12 @@
-use super::*;
+use super::handoff::HandoffResult;
+use crate::control::*;
+pub(super) fn connection_chains(mut selection_chain: Vec<String>, node_name: &str) -> Vec<String> {
+    if selection_chain.last().map(String::as_str) != Some(node_name) {
+        selection_chain.push(node_name.to_owned());
+    }
+    selection_chain.reverse();
+    selection_chain
+}
 
 #[cfg(any(feature = "ebpf", test))]
 pub(super) fn final_udp_rule_mark(
