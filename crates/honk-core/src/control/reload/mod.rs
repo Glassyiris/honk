@@ -1,13 +1,11 @@
 use super::*;
 mod connectivity;
+mod policy;
 mod subscription;
 mod transaction;
 mod warm;
 
-/// Fields whose current consumers are process-scoped and therefore cannot be
-/// swapped safely by the runtime generation publication. A rejected reload
-/// has not mutated any live state.
-use super::reload_policy::restart_required_changes;
+pub(in crate::control) use policy::restart_required_changes;
 
 #[cfg(test)]
 pub(in crate::control) use warm::{

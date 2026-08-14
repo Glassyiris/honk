@@ -23,7 +23,6 @@ mod preconnect;
 mod probers;
 pub mod quic;
 pub(crate) mod reload;
-mod reload_policy;
 #[cfg(test)]
 mod reload_tests;
 mod resource_budget;

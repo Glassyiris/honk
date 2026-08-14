@@ -1,5 +1,7 @@
 use super::*;
 
+/// Fields whose current consumers are process-scoped and therefore cannot be
+/// swapped safely by runtime generation publication.
 pub(crate) fn restart_required_changes(current: &Config, candidate: &Config) -> Vec<&'static str> {
     let mut changed = Vec::new();
     let dns_bind_changed = match (current.dns.bind_endpoint(), candidate.dns.bind_endpoint()) {
