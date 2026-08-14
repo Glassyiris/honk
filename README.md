@@ -16,6 +16,8 @@ It is **not** a line-for-line port of either project. The kernel path follows da
 
 License: **GPL-3.0-only**.
 
+The reliability-first Honk group policy is available only in builds with the default-off `honk-policy` Cargo feature; enabled configurations select it with `policy: honk`. It does not change default group behavior. When selected, it learns in memory from actual traffic plus DNS, probe, delay-test, warm-up, and direct or proxied UI-download attempts without exporting target keys. See the [group reference](doc/en/reference/groups.md#honk-policy-optional).
+
 ## Experimental held-first-packet UDP decisions
 
 The default-off UDP NFQUEUE path holds only ambiguous **LAN-forwarded** first packets after LAN TC and before conntrack/NAT. Enable it with a process configuration change:
@@ -56,9 +58,9 @@ These checkboxes indicate maintainer review status, not feature availability:
 
 ### TODO
 
+- [x] Add the default-off `honk-policy` score-based group policy
 - [ ] Evaluate AF_XDP and XDP paths for further performance gains
 - [ ] Add a honk REST API
-- [ ] Add a score-based group policy
 - [ ] Add inbound support
 - [ ] Track additional work through GitHub [Issues](https://github.com/Glassyiris/honk/issues) and [Discussions](https://github.com/Glassyiris/honk/discussions)
 

@@ -303,7 +303,7 @@ cargo +nightly build --release -Zbuild-std=core --target bpfel-unknown-none
 | Recipe | Purpose |
 | -------- | --------- |
 | `build` / `check` / `lint` / `fmt` | `cargo build --release` / `check` / `clippy --all -D warnings` / `fmt --all` |
-| `test` / `test-ci` / `test-core` / `test-config` / `test-ebpf` | Test suites (`test` = full incl. known failures; `test-ci` = CI gate with the 3 known failures skipped; `test-ebpf` = honk-ebpf-common only) |
+| `test` / `test-ci` / `test-core` / `test-config` / `test-ebpf` | Test suites (`test` = full workspace; `test-ci` = CI gate with the known legacy routing failure skipped; `test-ebpf` = honk-ebpf-common only) |
 | `test-netns` | Root-gated real-kernel tests: production NFQUEUE/nftables IPv4+IPv6 held-verdict contract, eBPF netlink/netns roundtrips, link ownership/rebind lifecycle, and pinned allocator rollback compatibility (`--features ebpf --ignored`, serial) |
 | `outbound-ci` / `outbound-ci-e2e` | honk-outbound gate (`ci/outbound-ci.sh`: fmt + clippy + honk-config & honk-outbound suites; `...-e2e` adds live hy2 e2e via `HONK_HY2_SERVER=`) — run after every outbound change |
 | `dns-ci` | DNS subsystem gate (`ci/dns-ci.sh`: fmt + clippy + honk-config + honk-core dns/control + honk-outbound suites) — run after every DNS-path change |
@@ -325,7 +325,7 @@ The old `run` / `deploy` / `docker*` recipes were removed: they called `scripts/
 
 `.github/workflows/ci.yml` runs fmt + clippy, the workspace gate, and an Ubuntu hosted-VM eBPF job. The VM job BTF-checks the kernel object, mounts bpffs, installs the geo assets required by eBPF-feature routing tests, runs the full `honk-core --features ebpf --lib` gate, then runs the real NFQUEUE/nftables netns contract, TC/cgroup link lifecycle, pinned allocator rollback-compatibility test, and root-only network tests serially without a job container.
 
-`.github/workflows/release.yml` runs on `v*` tags: a test gate (`cargo test --workspace --no-fail-fast` with the three named temporary excludes listed below — boring-sys needs `cmake` + `libclang-dev` installed), then builds `honk-core --features ebpf` for `x86_64`/`aarch64` × `gnu`/`musl` (native gnu via `cargo build`; the other three via **zig cc/c++ wrapper scripts `ci/zigcc` / `ci/zigcxx`** — under cross, CMake injects clang-style `--target` flags into boring-sys' ASM rules that real GCC rejects and zig rejects in Rust-triple spelling, so the wrappers strip them and re-anchor on `$ZIGCC_TARGET`; musl targets also set `link-self-contained=no` so zig supplies the CRT). Each of the four target triples ships a default mimalloc build and a `-stock` build without the `mimalloc` feature (lower RSS high-water on small gateways). The eBPF object is built once on the host with nightly + `bpf-linker` (the workflow substitutes the hardcoded linker path) and **verified to contain `.BTF`** before packaging. Tarballs go to a GitHub Release (prerelease when the tag contains `alpha`/`beta`/`rc`).
+`.github/workflows/release.yml` runs on `v*` tags: a test gate (`cargo test --workspace --no-fail-fast` with the named temporary routing exclude listed below — boring-sys needs `cmake` + `libclang-dev` installed), then builds `honk-core --features ebpf` for `x86_64`/`aarch64` × `gnu`/`musl` (native gnu via `cargo build`; the other three via **zig cc/c++ wrapper scripts `ci/zigcc` / `ci/zigcxx`** — under cross, CMake injects clang-style `--target` flags into boring-sys' ASM rules that real GCC rejects and zig rejects in Rust-triple spelling, so the wrappers strip them and re-anchor on `$ZIGCC_TARGET`; musl targets also set `link-self-contained=no` so zig supplies the CRT). Each of the four target triples ships a default mimalloc build and a `-stock` build without the `mimalloc` feature (lower RSS high-water on small gateways). The eBPF object is built once on the host with nightly + `bpf-linker` (the workflow substitutes the hardcoded linker path) and **verified to contain `.BTF`** before packaging. Tarballs go to a GitHub Release (prerelease when the tag contains `alpha`/`beta`/`rc`).
 
 ### Release process (standing convention)
 
@@ -357,15 +357,13 @@ The old `run` / `deploy` / `docker*` recipes were removed: they called `scripts/
 ## Current validation guidance
 
 Do not treat dated pass counts as repository status; use the current command output
-and CI for that evidence. The release workflow records the named temporary excludes
-for legacy config-format/routing tests. Reproduce that gate when needed:
+and CI for that evidence. The release workflow records the temporary exclude for
+the legacy routing test. Reproduce that gate when needed:
 
 ```bash
 CARGO_TARGET_DIR=/root/code/honk/target \
   env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
   cargo test --workspace --no-fail-fast -- \
-    --skip test_config_toml_round_trip \
-    --skip test_to_file_and_from_file_by_extension \
     --skip test_routing_with_config_dae
 CARGO_TARGET_DIR=/root/code/honk/target cargo clippy --workspace --all-targets -- -D warnings
 ```

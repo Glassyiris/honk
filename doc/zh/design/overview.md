@@ -10,7 +10,7 @@
 
 - 通过 eBPF 透明代理数据路径拦截 Linux 上的 LAN 转发流量和本机发起流量。
 - 将原生 `.dae` 配置语法保持为首要且唯一有文档说明的配置格式。
-- 提供多协议出站、Selector/URLTest/LoadBalance/Fallback 组、健康检查和 Clash 兼容控制 API。
+- 提供多协议出站、Selector/URLTest/LoadBalance/Fallback 组、可选 Honk 自动评分、健康检查和 Clash 兼容控制 API。
 - 只交付引擎 `honk-core`，不另设 GraphQL 服务或内置 dashboard 应用。
 
 ### 非目标
@@ -27,7 +27,7 @@
 | `honk-config` | 成员 | 共享配置模型、dae 语法解析器、include 处理、分享链接解析和订阅解码。 |
 | `honk-ebpf-common` | 成员 | 内核程序与用户态 map 写入端共享的 `no_std`、`#[repr(C)]` 常量和 ABI 类型。 |
 | `honk-nfqueue` | 成员 | raw `NETLINK_NETFILTER` 队列 `320`、verdict 所有权和自有 nftables 事务。 |
-| `honk-outbound` | 成员 | 协议 Handler、逐节点 runtime、出站组、健康状态和 URLTest 探测。 |
+| `honk-outbound` | 成员 | 协议 Handler、逐节点 runtime、出站组、健康状态、URLTest 探测和 feature-gated Honk 评分器。 |
 | `honk-core` | 成员 | 引擎库与二进制：eBPF/NFQUEUE runtime、控制面、DNS、路由、中继和 Clash API。 |
 | `honk-tool` | 成员 | 用于订阅/节点探测、数据路径诊断、固定 map 检查和 geo 资源查询的 CLI 工具箱。 |
 | `honk-ebpf` | 排除 | TC、`sk_lookup` 和 cgroup eBPF 程序；单独构建，并在启用真实 eBPF 时嵌入 `honk-core`。 |
@@ -78,7 +78,7 @@ flowchart TB
 4. 显式启用时，[NFQUEUE 暂存](./nfqueue.md)仅在 LAN TC 之后、conntrack/NAT 之前保留仍有歧义的 LAN 转发 UDP。每个暂存流在固定队列 `320` 中携带唯一决策 token；本机发起的 WAN 流量继续走普通透明路径。
 5. [控制面](./control-plane.md)恢复原始目的地址并消费 eBPF 路由 handoff。handoff 缺失或结果为 `ControlPlaneRouting` 时进入用户态路由。
 6. [路由路径](./routing.md)可嗅探 TLS SNI、HTTP Host 或 QUIC Initial SNI，并在内核结果尚未终结时运行用户态 `Router`。
-7. [组层](./groups.md)应用 Clash 模式覆盖但不改写最终 `must`/`block` 结果，再将权威组策略选择解析为叶节点。
+7. [组层](./groups.md)应用 Clash 模式覆盖但不改写最终 `must`/`block` 结果，再将权威组策略选择解析为叶节点。Honk 启用并被选用时，只在健康合格成员中按目标的 TCP/UDP 与目标地址族评分排名。
 8. [出站层](./outbound.md)拨号该叶节点，并中继 TCP 或数据报。嗅探得到的 TCP 字节先于后续流量转发。
 9. 控制面出口携带 `DAE_BYPASS_MARK`（`0x100`），避免再次被 WAN TC 拦截。代理 UDP 与透明 53 端口回包使用绑定原始目的地址的 [anyfrom 套接字](./control-plane.md)，使[返回数据路径](./datapath.md)保持源地址。
 
@@ -93,6 +93,8 @@ flowchart TB
 - **`must`/`block` 终结性：** Clash 模式覆盖永远不会替换 `block` 结果或 dae `(must)` 结果。
 - **失活出站 fail-closed：** `lan_ingress` 丢弃路由到失活出站的新流。未配置 `final` 且只有一个唯一叶节点的 TCP 组会让同一代理继续作为用户态最后尝试；UDP 和全部叶节点失活的多叶节点组仍保持 fail-closed。TCP 与 UDP 端口 `53` 例外；`honk-core` 在启动、重载和接口拓扑变化时注入 `dip(<每个 LAN/WAN 接口地址>) -> direct(must)`，使本机管理流量不依赖代理健康状态。
 - **组 OR 连通性：** 一个组的 eBPF alive slot 是全部叶子成员状态的 OR，并包含上述单叶 TCP 最后尝试例外。多叶节点组中的单个成员失活不得使整个组 fail-closed。
+- **可选 Honk 隔离：** Honk 用业务目标地址族评分，用代理服务器地址族过滤健康状态；其权威选择不能让死亡成员重新入选。精确目标键与聚合先验只存在于有界进程内存，通过共享状态跨 reload 保留，进程重启即清空，且不会新增到日志、Clash API 文档或 `cache.db`；已有连接元数据保持不变。
+- **Honk 反馈覆盖：** feature 启用后，与 Honk 叶节点关联的实际 attempt 会报告 setup、首响应、双向字节和一个紧凑终态，包括透明 TCP/UDP、受支持的 DNS transport、健康与 delay 探测、preconnect/session/UDP 预热，以及直连或经代理的 UI 下载；没有业务目标的任务只更新聚合 setup 证据。
 - **内部与特殊流量：** honk 自有 veth 网段 `169.254.0.0/16` 和 `fd00:686f:6e6b::/64` 永不代理。L2 广播/组播、IPv4 广播/组播/未指定目的地址以及 IPv6 组播会在路由或 conntrack 前直通。
 
 ## 构建 feature 与 mock 模式
@@ -105,6 +107,7 @@ flowchart TB
 | `clash-api` | 是 | 引入可选 `axum` 与 `tower-http`，提供 Clash 兼容 REST/WebSocket 服务。 |
 | `mimalloc` | 是 | 引入 `mimalloc` 与 `libmimalloc-sys`，并将 mimalloc 安装为 `honk-core` 二进制的 allocator。 |
 | `rprx` | 是 | 启用 `honk-outbound/rprx`，注册 VLESS 与 VMess Handler，包括受支持的 VLESS Encryption 和 `xtls-rprx-vision` 路径。 |
+| `honk-policy` | 否 | 将可选评分器转发给 `honk-config` 与 `honk-outbound`；启用 `policy: honk`，按 TCP/UDP、目标 IPv4/IPv6 地址族和精确目标隔离，进行权威的可靠性优先评分。它不增加运行时旋钮或持久化。 |
 
 `mock-ebpf` 不是 Cargo feature。不带 `ebpf` 的构建使用 `MockEbpfBackend`，`--mock-ebpf` 则显式选择无特权开发路径。该模式不能运行 `experimental.udp_nfqueue.enabled = true`。
 

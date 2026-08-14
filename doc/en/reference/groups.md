@@ -52,12 +52,25 @@ group {
 | `urltest` | `urltest`, `min_moving_avg`, `min_avg10`, `min_last_delay` | Selects the lowest-latency alive member using the halving moving average `(prev + sample) / 2` and tolerance; TCP and UDP selections are independent. |
 | `loadbalance` | `loadbalance`, `roundrobin`, `round_robin`, `balance` | Round-robins over alive members with independent counters per group and TCP/UDP network. |
 | `fallback` | `fallback` | Pins the first alive member in declaration order independently for TCP and UDP; recovery of an earlier member does not immediately fail back. |
+| `honk` | `honk` | With the default-off `honk-policy` Cargo feature, automatically selects one alive member from per-target, reliability-first scores; TCP and UDP and the target's IPv4/IPv6 family are independent. |
 
-Policy matching is ASCII case-insensitive. The parser removes an optional parenthesized suffix before matching, which accepts `fixed(0)`; an unrecognized policy silently becomes `selector`.
+Policy matching is ASCII case-insensitive. The parser removes an optional parenthesized suffix before matching, which accepts `fixed(0)`. An unrecognized policy silently becomes `selector`, except that `honk` produces an actionable error when the binary was built without the required `honk-policy` feature.
 
 If a group has exactly one unique leaf, no `final`, and that leaf is excluded by TCP health, honk still dials the same leaf as a last resort. The node remains marked dead until real traffic or probes recover it; this never implies a `direct` fallback. UDP keeps normal dead-member exclusion.
 
 Every configured Selector proxy leaf stays warm. After resolving a nested choice, honk retains a reusable multiplexed session, a QUIC client, or one bare server TCP connection according to the leaf protocol; `direct` and `block` need no warm resource.
+
+### Honk policy (optional)
+
+`policy: honk` is accepted only when the default-off `honk-policy` Cargo feature is enabled. The feature is forwarded by `honk-core` and `honk-tool` to the configuration and outbound crates; it adds no runtime configuration knobs and changes no default policy. A build without the feature rejects `honk` explicitly and does not allocate scorer state.
+
+Honk makes an authoritative single-member selection after the ordinary health filter has removed dead candidates. Health uses the proxy server's reachable IPv4/IPv6 family, independently of the business target family used for scoring; an IPv4 proxy server can therefore carry an IPv6 target. Among the remaining members, Honk ranks useful-outcome reliability first, then setup/first-response latency and a bounded throughput contribution. A bounded exploration bonus applies only while reliability is close. Cold-start exploration is deterministic, and final ties use declaration order and then stable node identity, so selection neither races members nor revives a dead one.
+
+Scores are isolated by group, TCP or UDP, target IPv4 or IPv6 family, normalized exact target (lowercase domain or IP plus port), and node identity. Target-specific evidence is blended with bounded group/network/family aggregate evidence until enough exact samples exist. Work with a real target updates both levels; targetless warm-up updates aggregates only. Nested selection attributes one completed attempt to every Honk group traversed.
+
+Feedback covers every actual attempt that traverses a Honk group: transparent TCP and UDP, DNS upstream exchanges, periodic HTTP/UDP health probes, on-demand Clash delay tests, startup/Selector/UDP warm-up, and external UI downloads. Target-bearing work uses its real host/IP, port, transport, and target family; server-only preconnect and session warm-up update aggregates without inventing a business target. Each started attempt records setup, first response when present, both byte directions, and one compact terminal outcome; cancelled or shutdown work is neutral, and retries are separate attempts.
+
+All score state is process memory. It has a hard LRU limit of 4,096 exact node-target cells plus 4,096 bounded aggregate cells. Reload keeps the shared state and removes cells for deleted groups or members; a process restart clears it. Score cells and scorer-only domain/IP keys are not emitted to logs or Clash API documents or written to `cache.db`; established connection metadata is unaffected.
 
 ## Filter resolution
 

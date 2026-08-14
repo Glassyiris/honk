@@ -14,6 +14,8 @@
 
 许可证：**GPL-3.0-only**。
 
+可靠性优先的 Honk 组策略仅在构建时启用默认关闭的 `honk-policy` Cargo feature 后可用；启用该 feature 的配置以 `policy: honk` 选择它，不会改变默认组行为。被选用时，它只在内存中从真实流量以及 DNS、探测、delay test、预热和直连或经代理的 UI 下载 attempt 学习，不会导出目标键。详见[组参考](doc/zh/reference/groups.md#honk-策略可选)。
+
 ### 实验性首包保留 UDP 决策
 
 默认关闭的 UDP NFQUEUE 路径只保留仍需用户态判定的 **LAN 转发**首包：报文已经过 LAN TC，但尚未进入 conntrack/NAT。通过进程配置启用：
@@ -122,7 +124,7 @@ honk 沿用 dae 的内核模型，但并非移植。主要不同点：
 - [x] VLESS + REALITY 客户端（含 `xtls-rprx-vision` flow），基于 boring-sys 补丁钩子改写 ClientHello；JA4 与真实 Chrome 对齐（ja4_a/ja4_b 完全一致）
 - [x] VLESS UDP/复用：UoT v2、H2MUX（padding）、Single XUDP 与 Mux.Cool；覆盖 TLS/REALITY
 - [x] 共享传输层（TLS/WS/gRPC）
-- [x] 组：Selector / URLTest / LoadBalance / Fallback + 嵌套组
+- [x] 组：Selector / URLTest / LoadBalance / Fallback + 嵌套组；另有默认关闭的 `honk-policy` 自动评分策略
 - [x] URLTest：tolerance、TCP/UDP 独立选择、idle_timeout、interrupt_connections
 - [x] `AliveDialerSet`：并发探测、恢复滞后、TCP+UDP 探测、推送 eBPF
 - [x] 订阅拉取 + 后台合并（节点仅内存）

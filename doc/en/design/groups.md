@@ -4,7 +4,7 @@ This document explains how honk resolves groups to leaf outbounds, tracks their 
 
 ## Scope
 
-The scope is `GroupManager`, `AliveDialerSet`, cold URLTest preparation, and the warm-resource coordinators. Group fields and policy syntax belong in the [group reference](../reference/groups.md); process-wide health, warm-up, and dial keys belong in the [global reference](../reference/global.md).
+The scope is `GroupManager`, `AliveDialerSet`, the optional Honk scorer, cold URLTest preparation, and the warm-resource coordinators. Group fields and policy syntax belong in the [group reference](../reference/groups.md); process-wide health, warm-up, and dial keys belong in the [global reference](../reference/global.md).
 
 ## Group manager and selection pipeline
 
@@ -22,6 +22,7 @@ The facade and its internals are split by responsibility:
 | `resolver.rs` | Nested-group expansion, member/leaf introspection, cycle cutting, and Selector-choice migration |
 | `filter.rs` | Network- and family-specific liveness filtering |
 | `policy.rs` | Selector, URLTest, LoadBalance, and Fallback picks and latency ranking |
+| `honk.rs` | Feature-gated Honk scoring, exact-once feedback, and target-aware selection |
 | `state.rs` | URLTest/Fallback caches, Selector choices, idle timestamps, and callbacks |
 
 Selection follows one invariant: after resolution and liveness filtering, the dial path uses exactly the policy pick. Selector returns its effective manual choice, URLTest its current winner, LoadBalance its next member, and Fallback its pin. The only multi-candidate exception is an unmeasured top-level URLTest group; all warm URLTest and non-URLTest plans are authoritative single-leaf plans. If a group with no `final` has exactly one unique leaf and TCP liveness excludes it, that same leaf remains an authoritative last resort: its health stays dead, but a real dial can prove recovery without leaking to `direct`. UDP keeps normal liveness exclusion.
@@ -34,6 +35,23 @@ Selection follows one invariant: after resolution and liveness filtering, the di
 | URLTest | Chooses the lowest halving moving average, keeps independent TCP and UDP selections, applies tolerance hysteresis, and re-evaluates lazily on dial and selection queries. A real selection change may invoke `InterruptCallback`. |
 | LoadBalance | Round-robins eligible members in declaration order. Every group owns independent `AtomicUsize` cursors for TCP and UDP. Rotation never invokes `InterruptCallback`. |
 | Fallback | Pins the first eligible member in declaration order independently for TCP and UDP. The pin stays until that member dies; recovery of an earlier member does not cause failback. |
+| Honk (optional) | With the default-off `honk-policy` Cargo feature, chooses one authoritative alive member using automatic target-aware, reliability-first scoring and bounded deterministic exploration. |
+
+### Honk scoring and lifecycle
+
+Honk first runs the same liveness filter as every other policy. The filter's health family describes connectivity to the proxy server; the separately carried target family selects the scoring bucket. Consequently a server reached over IPv4 remains eligible for an IPv6 business target, while no score can return a node already excluded as dead.
+
+The exact key is `(group, TCP/UDP, target IPv4/IPv6, normalized target, NodeId)`. Domains are ASCII-lowercased with one trailing dot removed and retain their port; IP targets retain the socket address. A second bounded `(group, TCP/UDP, optional target family, NodeId)` aggregate supplies the prior for cold targets and receives targetless warm-up samples. The target-family aggregate and exact layer each phase in reliability and throughput over their first eight terminal useful outcomes, and setup latency separately over their first eight setup completions. The family layer falls back to the global aggregate, so setup-only preparation cannot erase known reliability. Recursive selection carries the same target context and attributes the leaf outcome to every Honk group on the path.
+
+Each cell retains compact counters for starts, setup and useful outcomes; EWMA setup/first-response latency and bounded `log2(1 + bytes/second)` throughput; and last use. Setup failure is the strongest reliability penalty. Useful success requires a successful terminal outcome and nonzero traffic in both directions, so raw byte volume is not itself a reward. Error strings are reduced to compact outcome categories before feedback enters the state.
+
+`HonkFeedback::start()` is called only when a physical dial, logical stream, transport preparation, or exchange actually starts. Its cloneable reporter records setup, first response, transmitted/received bytes, and exactly one of success, timeout, `io::ErrorKind`, cancellation, shutdown, or other; the first terminal call wins and dropping the last unfinished handle reports cancellation. Cancellation and shutdown remove the start rather than degrading reliability. A retry starts a new reporter, while speculative work that never starts has no reporter.
+
+The same reporter path covers transparent TCP relay and UDP endpoint lifetime, supported DNS upstream exchanges, periodic HTTP/UDP health probes, on-demand Clash delay measurements, startup preconnect, Selector/session and UDP warm-up, and external UI downloads. DNS feedback follows the carrier actually attempted: UDP uses the UDP bucket, TCP/DoT/DoH use TCP, and a TCP retry after a truncated UDP answer switches buckets; the existing restriction on proxied DoQ/DoH3 remains unchanged. URL tests and downloads use the real requested target for both proxy and built-in `direct` leaves. Periodic direct liveness still uses its stable bootstrap target, and server/session-only warm work updates only aggregate setup evidence.
+
+Ranking begins with a Beta-prior lower confidence estimate of useful reliability. Candidates more than the fixed close-reliability band below the best are excluded from latency, throughput, and UCB exploration. Within that band, lower setup/first-response latency, bounded throughput, and bounded exploration contribute to utility. Completely cold candidates are visited deterministically; remaining ties use declaration order and stable `NodeId`. The resulting plan always contains one authoritative leaf rather than racing candidates.
+
+The shared, mutex-protected state is memory-only: exact cells use a 4,096-entry LRU and aggregate cells use a separate bounded 4,096-entry LRU. A committed reload reuses the state, publishes the new valid `(group, member)` set, and prunes removed cells; late feedback for deleted membership is ignored. Process restart clears everything. No score cell or scorer-only target data is emitted to logs or Clash API documents or written to `cache.db`; the existing `/connections` destination metadata remains unchanged.
 
 ### URLTest ranking and hysteresis
 

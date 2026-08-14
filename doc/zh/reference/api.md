@@ -29,7 +29,7 @@ WebSocket upgrade 也可以改用 `?token=<percent-encoded-secret>`。honk 会�
 | PATCH | `/configs` | 将 `mode` 设为 `Rule`、`Global` 或 `Direct`；匹配不区分大小写。 |
 | GET | `/proxies` | 返回所有节点和组，以及合成的 `GLOBAL` Selector。 |
 | GET | `/proxies/{name}` | 返回一个节点、组或 `GLOBAL` Selector。 |
-| PUT | `/proxies/{name}` | 用 `{"name":"member"}` 选择 Selector 组的直接成员；也可修改合成的 `GLOBAL` Selector。 |
+| PUT | `/proxies/{name}` | 用 `{"name":"member"}` 选择 Selector 组的直接成员；也可修改合成的 `GLOBAL` Selector。包括 Honk 在内的自动组会拒绝写入。 |
 | GET | `/proxies/{name}/delay` | 对节点或组执行按需 URL 延迟测试。已热 transport 会复用；每个冷可复用 session 或 QUIC client 都会先在临时 runtime 中预热，再开始计时。 |
 | GET | `/group/{name}/delay` | 最多并发 10 个任务测试全部组成员，并以相同计时语义返回成功成员的延迟。 |
 | GET | `/rules` | 每条路由返回一行。简单 matcher 使用原生 Clash rule type；组合、取反和 `must` 规则使用 `complex`，并保留完整 dae 语句。 |
@@ -57,6 +57,12 @@ Hysteria2 还遵循 sing-box 的 lazy-handshake 规则：其目标请求与首�
 
 成功测量会更新节点延迟历史。单节点失败返回 `503`；组测量会省略失败成员；两者都会追加供 URLTest 选择使用的 failure strike。
 
+启用 `honk-policy` 后，每次经代理或内建 `direct` 叶节点执行的 delay-test exchange 也会把真实 URL 目标及成功或失败反馈给包含该被测叶节点的每个 Honk 组。之前仅连接 server/session 的预热只报告聚合 setup，不会把该 URL 虚构为预热自身的目标。
+
+### Honk 组表示
+
+启用默认关闭的 `honk-policy` Cargo feature 后，配置为 `policy: honk` 的组会为兼容 Clash 而表示成 `type: "url_test"`。其 `all` 列表与其他组一样保留直接成员 tag，`now` 则报告当前 TCP 聚合胜者，而不是泄露某个精确目标的私有选择。Honk 始终保持自动且权威：`PUT /proxies/{name}` 会被拒绝，不会固定成员。评分 cell 与仅由 scorer 持有的目标数据不会新增到 proxy 文档、`/stats`、日志或 `cache.db`；`/connections` 保留已有的目标元数据。
+
 ## 模式与 Selector 修改
 
 `PATCH /configs` 接受如下 JSON 对象：
@@ -67,7 +73,7 @@ Hysteria2 还遵循 sing-box 的 lazy-handshake 规则：其目标请求与首�
 
 模式更新经过 `DatapathFlagsHandle`；它是 shared mode 与 `DATAPATH_FLAGS_MAP` 唯一的串行化 writer。因此模式修改会与 reload 的 NFQUEUE fence、reopen、disable 和 static flag 更新原子组合，不会重新发布过期的 readiness bit。启用 cache database 时会保存规范化后的模式。
 
-`PUT /proxies/{name}` 不要求特定 `Content-Type`。对已配置的 Selector 组，目标必须是直接成员 tag；只能经嵌套组到达的叶节点并非直接成员。选择确实发生变化时会调用 group manager 的 cache callback，因此启用 `cache_file` 后会把选择持久化到 `cache.db`。若该组设置了 `interrupt_connections`，honk 会移除与该组、其成员 tag 及可达叶节点关联的已跟踪连接，使后续流量通过新选择重新拨号。写入已有选择不会触发操作。
+`PUT /proxies/{name}` 不要求特定 `Content-Type`。对已配置的 Selector 组，目标必须是直接成员 tag；只能经嵌套组到达的叶节点并非直接成员。选择确实发生变化时会调用 group manager 的 cache callback，因此启用 `cache_file` 后会把选择持久化到 `cache.db`。若该组设置了 `interrupt_connections`，honk 会移除与该组、其成员 tag 及可达叶节点关联的已跟踪连接，使后续流量通过新选择重新拨号。写入已有选择不会触发操作。URLTest、LoadBalance、Fallback 及 feature-enabled Honk 组都会拒绝该修改。
 
 `GLOBAL` 是合成 Selector。`PUT /proxies/GLOBAL` 接受 `Proxy`、任意已配置组或任意已配置节点，并通过同一个 `DatapathFlagsHandle` 更新；启用 cache database 时，以 `GLOBAL` Selector key 保存该值。
 
@@ -75,7 +81,7 @@ Hysteria2 还遵循 sing-box 的 lazy-handshake 规则：其目标请求与首�
 
 设置 `experimental.clash_api.external_ui` 以提供静态 dashboard 目录。目录缺失或为空时，honk 会在后台下载最新 zashboard `dist.zip`；启动不会等待，文件可用前静态路由返回 `404`。`HONK_UI_DOWNLOAD_URL` 可覆盖 archive URL。
 
-下载遵循 honk 当前的流量路由决策。`direct` 结果使用直连 HTTP client，`block` 会中止下载，proxy 结果使用选中的出站叶节点。redirect target 会再次经过路由。下载或解压失败只写日志，不会停止引擎。
+下载遵循 honk 当前的流量路由决策。`direct` 结果使用直连 HTTP client，`block` 会中止下载，proxy 结果使用选中的出站叶节点。redirect target 会再次经过路由。启用 `honk-policy` 后，每次直连或经代理的 HTTP exchange 都会向路径经过的 Honk 组报告真实 host/IP、端口、setup、首响应、字节与终态。下载或解压失败只写日志，不会停止引擎。
 
 ## `GET /stats`
 

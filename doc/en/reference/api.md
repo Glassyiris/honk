@@ -29,7 +29,7 @@ The table follows the router in `crates/honk-core/src/clash_api.rs`.
 | PATCH | `/configs` | Set `mode` to `Rule`, `Global`, or `Direct`; matching is case-insensitive. |
 | GET | `/proxies` | Return every node and group plus the synthetic `GLOBAL` selector. |
 | GET | `/proxies/{name}` | Return one node, group, or `GLOBAL` selector. |
-| PUT | `/proxies/{name}` | Select a direct member of a Selector group with `{"name":"member"}`; also mutates the synthetic `GLOBAL` selector. |
+| PUT | `/proxies/{name}` | Select a direct member of a Selector group with `{"name":"member"}`; also mutates the synthetic `GLOBAL` selector. Automatic groups, including Honk, reject writes. |
 | GET | `/proxies/{name}/delay` | Run an on-demand URL delay test for a node or group. Already-warm transports are reused; every cold reusable session or QUIC client is warmed in a throwaway runtime before timing. |
 | GET | `/group/{name}/delay` | Test all group members concurrently (maximum 10) and return successful member delays with the same timing semantics. |
 | GET | `/rules` | Return one row per route. Simple matchers use native Clash rule types; compound, negated, and `must` rules use `complex` with the full dae statement. |
@@ -57,6 +57,12 @@ Hysteria2 additionally follows sing-box's lazy-handshake rule: timing starts aft
 
 Successful measurements update the node latency history. Failures return `503` for a single node, are omitted from the group result, and append a failure strike used by URLTest selection.
 
+With `honk-policy`, each delay-test exchange through a proxy or built-in `direct` leaf also reports its real URL target and success or failure to every Honk group containing the tested leaf. Any preliminary server/session warm-up reports aggregate setup only; it does not fabricate the URL as its own target.
+
+### Honk group representation
+
+With the default-off `honk-policy` Cargo feature, a configured `policy: honk` group is represented as Clash `type: "url_test"` for compatibility. Its `all` list keeps the same direct member tags as other groups, while `now` reports the current aggregate TCP winner rather than any one exact target's private selection. Honk remains automatic and authoritative: `PUT /proxies/{name}` is rejected rather than pinning a member. No score cell or scorer-only target data is added to proxy documents, `/stats`, logs, or `cache.db`; `/connections` retains its established destination metadata.
+
 ## Mode and selector mutations
 
 `PATCH /configs` accepts a JSON object such as:
@@ -67,7 +73,7 @@ Successful measurements update the node latency history. Failures return `503` f
 
 The mode update goes through `DatapathFlagsHandle`, the sole serialized writer for the shared mode and `DATAPATH_FLAGS_MAP`. Mode changes therefore compose atomically with reload's NFQUEUE fence, reopen, disable, and static-flag updates instead of republishing stale readiness bits. A cache database, when enabled, stores the normalized mode.
 
-`PUT /proxies/{name}` accepts the body regardless of `Content-Type`. For a configured Selector group, the target must be a direct member tag; a leaf reachable only through a nested group is not a direct member. An actual choice change invokes the group manager's cache callback, so an enabled `cache_file` persists the choice in `cache.db`. If that group sets `interrupt_connections`, honk removes tracked connections associated with the group, its member tags, and reachable leaves so subsequent traffic redials through the new choice. Writing the existing choice does nothing.
+`PUT /proxies/{name}` accepts the body regardless of `Content-Type`. For a configured Selector group, the target must be a direct member tag; a leaf reachable only through a nested group is not a direct member. An actual choice change invokes the group manager's cache callback, so an enabled `cache_file` persists the choice in `cache.db`. If that group sets `interrupt_connections`, honk removes tracked connections associated with the group, its member tags, and reachable leaves so subsequent traffic redials through the new choice. Writing the existing choice does nothing. URLTest, LoadBalance, Fallback, and feature-enabled Honk groups reject the mutation.
 
 `GLOBAL` is synthetic. `PUT /proxies/GLOBAL` accepts `Proxy`, any configured group, or any configured node and updates it through the same `DatapathFlagsHandle`; the cache database stores it under the `GLOBAL` selector key when enabled.
 
@@ -75,7 +81,7 @@ The mode update goes through `DatapathFlagsHandle`, the sole serialized writer f
 
 Set `experimental.clash_api.external_ui` to serve a static dashboard directory. If the directory is missing or empty, honk starts a background download of the latest zashboard `dist.zip`; startup does not wait, and the static route returns `404` until files are available. `HONK_UI_DOWNLOAD_URL` overrides the archive URL.
 
-The download follows honk's current traffic routing decision. A `direct` result uses the direct HTTP client, `block` aborts the download, and a proxy result uses the selected outbound leaf. Redirect targets are routed again. Download or extraction failures are logged and do not stop the engine.
+The download follows honk's current traffic routing decision. A `direct` result uses the direct HTTP client, `block` aborts the download, and a proxy result uses the selected outbound leaf. Redirect targets are routed again. With `honk-policy`, each direct or proxied HTTP exchange reports the real host/IP, port, setup, first response, bytes, and terminal outcome to its traversed Honk groups. Download or extraction failures are logged and do not stop the engine.
 
 ## `GET /stats`
 
