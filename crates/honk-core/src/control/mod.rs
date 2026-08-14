@@ -23,7 +23,6 @@ mod preconnect;
 mod probers;
 pub mod quic;
 pub(crate) mod reload;
-mod reload_connectivity;
 mod reload_policy;
 mod reload_subscription;
 #[cfg(test)]
@@ -95,9 +94,6 @@ pub use commands::ControlCommand;
 use connection::*;
 use probers::*;
 use reload::*;
-use reload_connectivity::{
-    group_check_url_registrations, sync_health_check_nodes, urltest_group_registrations,
-};
 pub(crate) use resource_budget::{MAX_EFFECTIVE_NOFILE, ResourceBudget};
 use sockets::*;
 

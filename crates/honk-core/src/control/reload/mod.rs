@@ -1,4 +1,5 @@
 use super::*;
+mod connectivity;
 mod transaction;
 mod warm;
 
@@ -19,52 +20,6 @@ impl ControlPlane {
         let drain = DrainTracker::new();
         self.apply_runtime_config(new_config, &drain).await;
     }
-
-    /// Rebuild the [`GroupManager`] from the current config after a reload.
-    ///
-    /// A fresh manager is installed into the shared cell so every holder
-    /// (control plane, per-connection handles, clash API) picks up new or
-    /// changed groups at once. Runtime selector choices migrate by group
-    /// name (choices whose group or selected node vanished are dropped);
-    /// cache.db-backed choices survive because every change is persisted
-    /// at set time, so no cache.db restore runs here. The alive set's
-    /// health-check registrations and URLTest group table are refreshed to
-    /// match the new group membership, and the node → eBPF outbound id map
-    /// (`outbound_id_map`, already refreshed by the reload path) is built
-    /// from the same config, keeping the two consistent.
-    pub async fn reload_group_manager(&self) {
-        let (groups, nodes) = {
-            let config = self.config.read().await;
-            (config.groups.clone(), config.nodes.clone())
-        };
-        let new_gm = GroupManager::with_alive_set(&groups, &nodes, Some(self.alive_set.clone()));
-        // Migrate runtime choices before wiring callbacks: migration must
-        // not fire persistence or connection interruption.
-        new_gm.migrate_selector_choices_from(&self.group_manager.read());
-        install_interrupt_callback(&new_gm, &self.group_manager, &self.connection_tracker);
-        if let Some(ref db) = self.cache_db {
-            let db_cb = db.clone();
-            new_gm.set_persist_callback(Some(Arc::new(move |group, node| {
-                db_cb.save_selector_choice(group, node);
-            })));
-        }
-        *self.group_manager.write() = Arc::new(new_gm);
-
-        // Refresh health-check registrations and the URLTest idle table to
-        // match the new group membership.
-        let config = self.config.read().await;
-        let (added, removed) = sync_health_check_nodes(&self.alive_set, &config);
-        self.alive_set
-            .sync_urltest_groups(&urltest_group_registrations(&config));
-        self.alive_set
-            .sync_group_check_urls(&group_check_url_registrations(&config));
-        info!(
-            "Group manager rebuilt: {} group(s), health checks +{}/-{} node(s)",
-            config.groups.len(),
-            added,
-            removed,
-        );
-    }
 }
 /// Fields whose current consumers are process-scoped and therefore cannot be
 /// swapped safely by the runtime generation publication. A rejected reload
@@ -79,13 +34,11 @@ pub(in crate::control) use warm::{
 
 pub(super) use super::reload_subscription::config_with_subscription_nodes;
 
-use super::reload_connectivity::{
-    group_connectivity_snapshot, open_group_connectivity, publish_group_connectivity,
-};
-
-pub(super) use super::reload_connectivity::{
-    build_outbound_id_map, group_datapath_alive, install_interrupt_callback,
-    install_selector_warm_callback,
+pub(in crate::control) use connectivity::{
+    build_outbound_id_map, group_check_url_registrations, group_connectivity_snapshot,
+    group_datapath_alive, install_interrupt_callback, install_selector_warm_callback,
+    open_group_connectivity, publish_group_connectivity, sync_health_check_nodes,
+    urltest_group_registrations,
 };
 
 pub(crate) fn resolve_outbound_nodes(

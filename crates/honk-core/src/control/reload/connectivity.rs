@@ -161,7 +161,7 @@ pub(in crate::control) fn group_check_url_registrations(config: &Config) -> Vec<
 /// manager out. Tracked connections record the dialed leaf node name, so
 /// the target set covers the group name, its member tags, and every leaf
 /// reachable through nested sub-groups.
-pub(super) fn install_interrupt_callback(
+pub(in crate::control) fn install_interrupt_callback(
     group_manager: &GroupManager,
     group_manager_cell: &SharedGroupManager,
     tracker: &Arc<ConnectionTracker>,
@@ -193,7 +193,7 @@ pub(super) fn install_interrupt_callback(
 /// Wake the Selector warm coordinator after a manual choice changes. The
 /// task re-resolves every Selector so shared/nested leaves stay reference
 /// correct without putting async work in the synchronous group callback.
-pub(super) fn install_selector_warm_callback(
+pub(in crate::control) fn install_selector_warm_callback(
     group_manager: &GroupManager,
     notify: &Arc<tokio::sync::Notify>,
 ) {
@@ -211,7 +211,9 @@ pub(super) fn install_selector_warm_callback(
 /// leaves so a leaf dialed via a sub-group still maps to the top group's
 /// slot. Nodes outside any group have no eBPF outbound id and are absent
 /// from the map.
-pub(super) fn build_outbound_id_map(config: &Config) -> std::collections::HashMap<uuid::Uuid, u8> {
+pub(in crate::control) fn build_outbound_id_map(
+    config: &Config,
+) -> std::collections::HashMap<uuid::Uuid, u8> {
     let by_name = groups_by_name(config);
     let mut map = std::collections::HashMap::new();
     for (i, group) in config.groups.iter().enumerate() {
@@ -229,7 +231,7 @@ type GroupConnectivity = (u8, u32, u32, bool);
 
 /// A sole TCP leaf with no configured fallback remains a userspace last resort:
 /// suppressing it in TC would prevent real traffic from proving recovery.
-pub(super) fn group_datapath_alive(
+pub(in crate::control) fn group_datapath_alive(
     group: &Group,
     group_manager: &GroupManager,
     alive_set: &crate::outbound::AliveDialerSet,
@@ -295,4 +297,52 @@ pub(crate) fn open_group_connectivity(
         }
     }
     Ok(())
+}
+
+impl ControlPlane {
+    /// Rebuild the [`GroupManager`] from the current config after a reload.
+    ///
+    /// A fresh manager is installed into the shared cell so every holder
+    /// (control plane, per-connection handles, clash API) picks up new or
+    /// changed groups at once. Runtime selector choices migrate by group
+    /// name (choices whose group or selected node vanished are dropped);
+    /// cache.db-backed choices survive because every change is persisted
+    /// at set time, so no cache.db restore runs here. The alive set's
+    /// health-check registrations and URLTest group table are refreshed to
+    /// match the new group membership, and the node → eBPF outbound id map
+    /// (`outbound_id_map`, already refreshed by the reload path) is built
+    /// from the same config, keeping the two consistent.
+    pub async fn reload_group_manager(&self) {
+        let (groups, nodes) = {
+            let config = self.config.read().await;
+            (config.groups.clone(), config.nodes.clone())
+        };
+        let new_gm = GroupManager::with_alive_set(&groups, &nodes, Some(self.alive_set.clone()));
+        // Migrate runtime choices before wiring callbacks: migration must
+        // not fire persistence or connection interruption.
+        new_gm.migrate_selector_choices_from(&self.group_manager.read());
+        install_interrupt_callback(&new_gm, &self.group_manager, &self.connection_tracker);
+        if let Some(ref db) = self.cache_db {
+            let db_cb = db.clone();
+            new_gm.set_persist_callback(Some(Arc::new(move |group, node| {
+                db_cb.save_selector_choice(group, node);
+            })));
+        }
+        *self.group_manager.write() = Arc::new(new_gm);
+
+        // Refresh health-check registrations and the URLTest idle table to
+        // match the new group membership.
+        let config = self.config.read().await;
+        let (added, removed) = sync_health_check_nodes(&self.alive_set, &config);
+        self.alive_set
+            .sync_urltest_groups(&urltest_group_registrations(&config));
+        self.alive_set
+            .sync_group_check_urls(&group_check_url_registrations(&config));
+        info!(
+            "Group manager rebuilt: {} group(s), health checks +{}/-{} node(s)",
+            config.groups.len(),
+            added,
+            removed,
+        );
+    }
 }

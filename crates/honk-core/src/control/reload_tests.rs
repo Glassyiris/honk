@@ -3,9 +3,6 @@ use super::reload::{
     SelectorWarmResources, run_udp_warm_dispatches, selector_warm_candidates, udp_warm_candidates,
     warm_selector_candidate,
 };
-use super::reload_connectivity::{
-    group_connectivity_snapshot, open_group_connectivity, publish_group_connectivity,
-};
 use super::reload_policy::restart_required_changes;
 use super::*;
 
