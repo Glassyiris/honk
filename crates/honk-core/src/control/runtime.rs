@@ -1,0 +1,1063 @@
+use super::*;
+
+fn accepts_transparent_connection(drain: &DrainTracker) -> bool {
+    !drain.should_reject()
+}
+impl ControlPlane {
+    pub async fn run(&mut self) -> anyhow::Result<()> {
+        let config = self.config.read().await;
+        let tproxy_port = config.global.tproxy_port;
+        let tproxy_mark = config.global.tproxy_mark;
+        let udp_nfqueue_enabled = config.experimental.udp_nfqueue.enabled;
+        let dns_bind_endpoint = config
+            .dns
+            .bind_endpoint()
+            .map_err(|error| anyhow::anyhow!("invalid dns.bind: {error}"))?;
+        drop(config);
+        let bound_dns_listener = dns_bind_endpoint
+            .as_ref()
+            .map(dns_listener::BoundDnsListener::bind)
+            .transpose()
+            .map_err(|error| anyhow::anyhow!("bind dns.bind listener: {error}"))?;
+        let tcp4_addr = SocketAddr::new("0.0.0.0".parse()?, tproxy_port);
+        let tcp6_addr = SocketAddr::new("::".parse()?, tproxy_port);
+        let udp4_addr = tcp4_addr;
+        let udp6_addr = tcp6_addr;
+
+        let tcp4_listener = bind_tproxy_tcp(tcp4_addr, tproxy_mark)?;
+        info!("Control plane listening for TPROXY TCPv4 on {}", tcp4_addr);
+
+        let tcp6_listener = match bind_tproxy_tcp(tcp6_addr, tproxy_mark) {
+            Ok(l) => {
+                info!("Control plane listening for TPROXY TCPv6 on {}", tcp6_addr);
+                Some(l)
+            }
+            Err(e) => {
+                warn!("TPROXY TCPv6 listener unavailable: {}", e);
+                None
+            }
+        };
+
+        // Parallel UDP listeners: the eBPF datapath hashes each flow's tuple
+        // into one of UDP_LISTENER_COUNT sockets per family (sk_lookup.rs);
+        // each socket gets its own receive loop task below, so flows drain
+        // in parallel across runtime workers.
+        const UDP_LISTENER_COUNT: usize = 4;
+        let udp4_sockets: Vec<Arc<UdpSocket>> =
+            bind_tproxy_udp_listeners(udp4_addr, UDP_LISTENER_COUNT)?
+                .into_iter()
+                .map(Arc::new)
+                .collect();
+        info!(
+            "Control plane listening for TPROXY UDPv4 x{} on {}",
+            udp4_sockets.len(),
+            udp4_addr
+        );
+
+        let udp6_sockets: Vec<Arc<UdpSocket>> =
+            match bind_tproxy_udp_listeners(udp6_addr, UDP_LISTENER_COUNT) {
+                Ok(sockets) => {
+                    let sockets: Vec<Arc<UdpSocket>> = sockets.into_iter().map(Arc::new).collect();
+                    info!(
+                        "Control plane listening for TPROXY UDPv6 x{} on {}",
+                        sockets.len(),
+                        udp6_addr
+                    );
+                    sockets
+                }
+                Err(e) => {
+                    warn!("TPROXY UDPv6 listener unavailable: {}", e);
+                    Vec::new()
+                }
+            };
+
+        // Publish listener socket FDs into the eBPF listen_socket_map so TC
+        // programs can bpf_sk_assign() proxy-bound packets directly to userspace.
+        {
+            use std::os::unix::io::AsRawFd;
+            let tcp4_fd = tcp4_listener.as_raw_fd();
+            let tcp6_fd = tcp6_listener.as_ref().map_or(tcp4_fd, |l| l.as_raw_fd());
+            let udp4_fds: Vec<_> = udp4_sockets.iter().map(|s| s.as_raw_fd()).collect();
+            let udp6_fds: Vec<_> = udp6_sockets.iter().map(|s| s.as_raw_fd()).collect();
+            let mut ebpf = self.ebpf.write().await;
+            // A partially published listener set means flows are assigned to
+            // sockets that don't exist — run nothing rather than that.
+            ebpf.publish_listener_sockets(tcp4_fd, tcp6_fd, &udp4_fds, &udp6_fds)
+                .map_err(|e| anyhow::anyhow!("publish listener sockets to eBPF: {}", e))?;
+        }
+
+        let mut dns_listener = match bound_dns_listener {
+            Some(bound) => {
+                let listener = bound
+                    .spawn(
+                        Arc::clone(&self.dns_controller),
+                        Arc::clone(&self.dns_concurrency_limit),
+                        Arc::clone(&self.concurrency_limit),
+                        Arc::clone(&self.stats),
+                        Arc::clone(&self.drain_tracker),
+                    )
+                    .map_err(|error| anyhow::anyhow!("start dns.bind listener: {error}"))?;
+                info!(
+                    address = %listener.local_addr(),
+                    tcp = dns_bind_endpoint.as_ref().is_some_and(|endpoint| endpoint.tcp_enabled()),
+                    udp = dns_bind_endpoint.as_ref().is_some_and(|endpoint| endpoint.udp_enabled()),
+                    "Standalone DNS listener started"
+                );
+                Some(listener)
+            }
+            None => None,
+        };
+
+        // One receive loop per listener socket. The datapath hashes flows
+        // into the group (see the comment above), so loops are flow-disjoint.
+        {
+            let state = UdpLoopState {
+                udp_pool: Arc::clone(&self.udp_pool),
+                stats: Arc::clone(&self.stats),
+                udp_concurrency_limit: Arc::clone(&self.udp_concurrency_limit),
+                dns_concurrency_limit: Arc::clone(&self.dns_concurrency_limit),
+                dns_controller: Arc::clone(&self.dns_controller),
+                drain: self.drain_tracker.clone(),
+                handle: self.spawn_handle(),
+            };
+            let mut tasks = self.background_tasks.lock().await;
+            for socket in &udp4_sockets {
+                tasks.push(tokio::spawn(udp_listener_loop(
+                    state.clone(),
+                    Arc::clone(socket),
+                    "v4",
+                )));
+            }
+            for socket in &udp6_sockets {
+                tasks.push(tokio::spawn(udp_listener_loop(
+                    state.clone(),
+                    Arc::clone(socket),
+                    "v6",
+                )));
+            }
+        }
+
+        let tcp6_listener = tcp6_listener;
+        #[cfg(feature = "ebpf")]
+        let mut nfqueue_runtime = match self.start_nfqueue_runtime(udp_nfqueue_enabled).await {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                if let Some(listener) = dns_listener.as_mut() {
+                    listener.stop_accepting();
+                    listener.abort_and_join().await;
+                }
+                self.cleanup_pre_admission_failure().await;
+                return Err(error);
+            }
+        };
+        #[cfg(not(feature = "ebpf"))]
+        let mut nfqueue_runtime = ();
+
+        {
+            let plan = self.active_routing_plan.read().clone();
+            let mut ebpf = self.ebpf.write().await;
+            match routing_matcher::RoutingMatcherBuilder::push_plan(ebpf.as_mut(), &plan) {
+                Ok(_) => {
+                    routing_matcher::RoutingMatcherBuilder::activate_projection(&plan);
+                }
+                Err(e) => {
+                    warn!("Failed to push routing to eBPF (non-fatal): {}", e);
+                }
+            }
+        }
+        let (mut udp_removal_task, mut udp_removal_fatal_rx) = {
+            let (fatal_tx, fatal_rx) = mpsc::unbounded_channel();
+            let mut tasks = self.background_tasks.lock().await;
+
+            let janitor = BpfJanitor::new(self.ebpf.clone(), self.tcp_flow_pins.clone());
+            tasks.push(janitor.spawn());
+            info!("BPF map janitor started");
+
+            let removal_task = spawn_udp_removal_worker(
+                Arc::clone(&self.udp_pool),
+                self.ebpf.clone(),
+                self.connection_tracker.clone(),
+                fatal_tx,
+            );
+
+            tasks.push(self.udp_pool.spawn_janitor());
+
+            tasks.push(self.sniffer_pool.spawn_janitor());
+
+            tasks.push(crate::control::tcp_sniff::spawn_sniff_neg_cache_janitor(
+                self.tcp_sniff_neg_cache.clone(),
+            ));
+            (removal_task, fatal_rx)
+        };
+
+        {
+            let alive_set = self.alive_set.clone();
+            let interval_secs = {
+                let c = self.config.read().await;
+                c.global.check_interval_secs
+            };
+            let check_timeout = std::time::Duration::from_secs(5);
+
+            {
+                let c = self.config.read().await;
+                honk_outbound::tls::set_tls_mode(&c.global.tls_implementation);
+                honk_outbound::tls::set_utls_imitate(&c.global.utls_imitate);
+            }
+
+            // Configure HTTP-based health checks from config (Go: TcpCheckOption).
+            {
+                let c = self.config.read().await;
+                let check_url = c.global.tcp_check_url.first().cloned().unwrap_or_default();
+                let check_method = if c.global.tcp_check_http_method.is_empty() {
+                    "HEAD".to_string()
+                } else {
+                    c.global.tcp_check_http_method.clone()
+                };
+                if !check_url.is_empty() {
+                    let prober = Arc::new(ProxyHttpProber::new(
+                        self.config.clone(),
+                        self.proxy_registry.clone(),
+                        self.runtime_registry.clone(),
+                        check_method.clone(),
+                    ));
+                    alive_set
+                        .set_http_probe(prober, check_url, check_method)
+                        .await;
+                    info!(
+                        "HTTP health check enabled (url={}, method={})",
+                        c.global.tcp_check_url.first().unwrap_or(&String::new()),
+                        c.global.tcp_check_http_method
+                    );
+                } else {
+                    info!(
+                        "HTTP health check disabled (no tcp_check_url configured), using TCP connect"
+                    );
+                }
+            }
+
+            // Configure UDP health checks (Go: UdpCheckOption): each probe
+            // cycle sends one DNS query through the node's own UDP data
+            // path, so nodes with working TCP but broken UDP (e.g. an
+            // AnyTLS server without UoT) are marked dead for the UDP
+            // domains and excluded from UDP selection.
+            {
+                let dns_raw = {
+                    let c = self.config.read().await;
+                    c.global.udp_check_dns.clone()
+                };
+                let dns_target = resolve_udp_check_target(
+                    &dns_raw,
+                    Some({
+                        let controller = self.dns_controller.clone();
+                        Arc::new(move |host: String, port: u16| {
+                            let controller = controller.clone();
+                            Box::pin(async move {
+                                controller
+                                    .resolve_domain(&host)
+                                    .await
+                                    .into_iter()
+                                    .map(|ip| std::net::SocketAddr::new(ip, port))
+                                    .collect()
+                            })
+                        })
+                    }),
+                )
+                .await;
+                alive_set.set_udp_probe(Arc::new(ProxyUdpProber::new(
+                    self.config.clone(),
+                    self.proxy_registry.clone(),
+                    self.runtime_registry.clone(),
+                    self.stats.clone(),
+                    dns_target,
+                )));
+                info!("UDP health check enabled (dns={})", dns_target);
+            }
+
+            info!(
+                "Starting health check loop (interval={}s, timeout={}s)",
+                interval_secs,
+                check_timeout.as_secs()
+            );
+            let ebpf = self.ebpf.clone();
+            let alive_for_push = alive_set.clone();
+            let group_manager_for_push = self.group_manager.clone();
+            let config_for_push = self.config.clone();
+            alive_set.set_ebpf_callback(Box::new(move |outbound_idx, domain, ipver, _alive| {
+                // Group slots normally publish the OR of their leaf health.
+                // A sole TCP leaf without `final` stays open so userspace can
+                // make the one real dial capable of proving recovery.
+                let probe_domain = match domain {
+                    1 => ProbeDomain::DnsUdp,
+                    2 => ProbeDomain::DataUdp,
+                    _ => ProbeDomain::Tcp,
+                };
+                let ip_version = if ipver == 1 {
+                    IpVersion::V6
+                } else {
+                    IpVersion::V4
+                };
+                // Group ids are OutboundIndex::UserBase + group index.
+                let group = config_for_push.try_read().ok().and_then(|c| {
+                    let idx = outbound_idx
+                        .checked_sub(honk_ebpf_common::OutboundIndex::UserBase as u8)?;
+                    c.groups.get(idx as usize).cloned()
+                });
+                let any_alive = match group {
+                    Some(group) => {
+                        let gm = group_manager_for_push.read().clone();
+                        reload::group_datapath_alive(
+                            &group,
+                            &gm,
+                            &alive_for_push,
+                            probe_domain,
+                            ip_version,
+                        )
+                    }
+                    // Unknown outbound: keep the datapath open (userspace
+                    // makes the final decision anyway).
+                    None => true,
+                };
+                let ebpf = ebpf.clone();
+                let _handle = tokio::spawn(async move {
+                    if let Ok(mut backend) = ebpf.try_write() {
+                        let _ = backend.set_outbound_alive(outbound_idx, domain, ipver, any_alive);
+                    }
+                });
+            }));
+            let period = std::time::Duration::from_secs(interval_secs);
+            let handle = alive_set.spawn_health_check_loop(period, check_timeout);
+            self.background_tasks.lock().await.push(handle);
+            info!(
+                "Outbound health check loop started (interval={}s)",
+                interval_secs
+            );
+        }
+
+        {
+            let pool_handle = self.connection_pool.spawn_janitor();
+            self.background_tasks.lock().await.push(pool_handle);
+            info!("Connection pool janitor started");
+        }
+
+        // Pre-establish TCP connections to configured proxy nodes so the
+        // first real connection hits a warm pool instead of paying the
+        // full TCP+TLS+handshake RTT on the critical path.
+        {
+            let config = self.config.read().await;
+            let count = config.global.preconnect_node_count;
+            let connect_timeout =
+                std::time::Duration::from_millis(config.global.connect_timeout_ms);
+            let max_concurrent = if count == honk_config::config::PRECONNECT_NODE_COUNT_AUTO {
+                4usize
+            } else {
+                count.min(8)
+            };
+            let nodes = {
+                let manager = self.group_manager.read().clone();
+                preconnect_candidates(&config, &manager, count)
+            };
+            drop(config);
+
+            if !nodes.is_empty() {
+                let node_count = nodes.len();
+                let pool = self.connection_pool.clone();
+                let stats = self.stats.clone();
+                let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+                let handle = tokio::spawn(async move {
+                    let mut set = tokio::task::JoinSet::new();
+                    for node in nodes {
+                        let addr = format!("{}:{}", node.host(), node.port);
+                        let pool = pool.clone();
+                        let stats = stats.clone();
+                        let sem = semaphore.clone();
+                        set.spawn(async move {
+                            let _permit = sem.acquire_owned().await;
+                            match honk_outbound::util::connect_outbound(&addr, connect_timeout)
+                                .await
+                            {
+                                Ok(stream) => {
+                                    if is_tcp_stream_alive(&stream) {
+                                        pool.deposit_tcp(&addr, stream).await;
+                                        stats.mark_warm(
+                                            node.id,
+                                            crate::stats::WarmReason::Preconnect,
+                                        );
+                                        debug!(
+                                            "Preconnect warmup: deposited connection to {}",
+                                            addr
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    debug!("Preconnect warmup to {} failed: {}", addr, e);
+                                }
+                            }
+                        });
+                    }
+                    while set.join_next().await.is_some() {}
+                });
+                self.background_tasks.lock().await.push(handle);
+                info!(
+                    "Preconnect warmup started for {} nodes (max {} concurrent)",
+                    node_count, max_concurrent
+                );
+            }
+        }
+
+        // Warm coordinators start only after group/runtime setup and retain
+        // this exact registry Arc for their complete lifetime.
+        let warm_generation = self.runtime_registry.read().clone();
+        self.start_udp_warm_coordinator(Arc::clone(&warm_generation))
+            .await;
+        self.start_selector_warm_coordinator(warm_generation).await;
+
+        {
+            let runtime_registry = self.runtime_registry.clone();
+            let handle = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(honk_outbound::runtime::TLS_REAP_INTERVAL);
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    let generation = runtime_registry.read().clone();
+                    let evicted = generation.reap_tls_connectors(std::time::Instant::now());
+                    if evicted > 0 {
+                        debug!(evicted, "released idle outbound TLS connectors");
+                    }
+                }
+            });
+            self.background_tasks.lock().await.push(handle);
+        }
+
+        #[cfg(feature = "ebpf")]
+        let nfqueue_startup_health = match nfqueue_runtime.as_mut() {
+            Some(runtime) => runtime.check_startup_health().await,
+            None => Ok(()),
+        };
+        #[cfg(feature = "ebpf")]
+        if let Err(error) = nfqueue_startup_health {
+            self.cleanup_nfqueue_startup_failure(&mut nfqueue_runtime)
+                .await;
+            self.cleanup_started_control_tasks(&mut udp_removal_task, dns_listener.as_mut())
+                .await;
+            return Err(anyhow::anyhow!("NFQUEUE failed before readiness: {error}"));
+        }
+        #[cfg(feature = "ebpf")]
+        let nfqueue_ready = nfqueue_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.sequence_ready);
+        #[cfg(not(feature = "ebpf"))]
+        let nfqueue_ready = false;
+        if let Err(error) = self
+            .initialize_datapath_flags(udp_nfqueue_enabled, nfqueue_ready)
+            .await
+        {
+            #[cfg(feature = "ebpf")]
+            self.cleanup_nfqueue_startup_failure(&mut nfqueue_runtime)
+                .await;
+            self.cleanup_started_control_tasks(&mut udp_removal_task, dns_listener.as_mut())
+                .await;
+            return Err(anyhow::anyhow!("initialize datapath flags: {error:#}"));
+        }
+        #[cfg(feature = "ebpf")]
+        if let Some(runtime) = nfqueue_runtime.as_ref()
+            && runtime.sequence_ready
+        {
+            runtime.pending.open_admission();
+        }
+        let datapath_open = {
+            let mut backend = self.ebpf.write().await;
+            backend.set_datapath_ready(true)
+        };
+        if let Err(error) = datapath_open {
+            if let Some(flags) = self.datapath_flags.as_ref() {
+                let _ = flags.fence_nfqueue().await;
+            }
+            #[cfg(feature = "ebpf")]
+            self.cleanup_nfqueue_startup_failure(&mut nfqueue_runtime)
+                .await;
+            self.cleanup_started_control_tasks(&mut udp_removal_task, dns_listener.as_mut())
+                .await;
+            return Err(anyhow::anyhow!("open eBPF datapath admission: {error}"));
+        }
+        info!("eBPF datapath admission opened after listener publication");
+        #[cfg(target_os = "linux")]
+        if let Err(error) =
+            libsystemd::daemon::notify(false, &[libsystemd::daemon::NotifyState::Ready])
+        {
+            warn!(%error, "sd_notify readiness failed");
+        }
+
+        let mut rx = self.command_rx.take().expect("command_rx already taken");
+        let drain = self.drain_tracker.clone();
+        let fatal_ebpf = Arc::clone(&self.ebpf);
+        let mut fatal_error = None;
+
+        let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut loop_count = 0u64;
+        loop {
+            loop_count += 1;
+            tokio::select! {
+                error = udp_removal_fatal_rx.recv() => {
+                    fatal_error = Some(error.unwrap_or_else(|| {
+                        anyhow::anyhow!("UDP removal fatal channel closed unexpectedly")
+                    }));
+                    break;
+                }
+                event = wait_nfqueue_event(&mut nfqueue_runtime, &fatal_ebpf) => {
+                    match event {
+                        NfqueueRuntimeEvent::Fatal(error) => {
+                            fatal_error = Some(error);
+                            break;
+                        }
+                        NfqueueRuntimeEvent::TokenExhausted => {
+                            #[cfg(feature = "ebpf")]
+                            if let Some(runtime) = nfqueue_runtime.as_mut()
+                                && let Err(error) = self
+                                    .recover_nfqueue_token_exhaustion(runtime)
+                                    .await
+                            {
+                                fatal_error = Some(anyhow::anyhow!(
+                                    "recover exhausted UDP decision token generation: {error:#}"
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    trace!(
+                        "control plane heartbeat (iteration {}, active_connections={})",
+                        loop_count,
+                        drain.active_count()
+                    );
+                    continue;
+                }
+                accept_result = tcp4_listener.accept() => {
+                    match accept_result {
+                        Ok((stream, addr)) => {
+                            debug!("Accepted TPROXY TCPv4 connection from {}", addr);
+                            if let Err(e) = set_so_mark_zero(&stream) {
+                                warn!("Failed to clear SO_MARK on accepted socket from {}: {}", addr, e);
+                            }
+                            if !accepts_transparent_connection(&drain) {
+                                debug!("Rejecting new connection from {} (draining)", addr);
+                                continue;
+                            }
+                            // try_acquire: never blocks the accept loop.
+                            let permit = match self.concurrency_limit.clone().try_acquire_owned() {
+                                Ok(p) => p,
+                                Err(_) => {
+                                    // At capacity — drop the connection
+                                    // immediately.  Holding the fd while
+                                    // waiting on the semaphore would exhaust
+                                    // the file-descriptor limit far faster
+                                    // than the limit's headroom allows.
+                                    debug!("Dropping TCPv4 from {} (at capacity)", addr);
+                                    continue;
+                                }
+                            };
+                            let handle = self.spawn_handle();
+                            let drain = drain.clone();
+                            tokio::spawn(async move {
+                                let _permit = permit;
+                                let _guard = ConnectionGuard::new(drain);
+                                if let Err(e) = handle.serve_connection(stream, addr).await {
+                                    warn!("Error handling TCPv4 from {}: {}", addr, e);
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            error!("TCPv4 accept error: {}", e);
+                            // On EMFILE, back off briefly to avoid a tight
+                            // spin that floods the log.
+                            if e.raw_os_error() == Some(libc::EMFILE) {
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                        }
+                    }
+                }
+
+                accept6_result = async {
+                    if let Some(ref l) = tcp6_listener {
+                        l.accept().await
+                    } else {
+                        std::future::pending::<io::Result<(TcpStream, SocketAddr)>>().await
+                    }
+                } => {
+                    match accept6_result {
+                        Ok((stream, addr)) => {
+                            debug!("Accepted TPROXY TCPv6 connection from {}", addr);
+                            if let Err(e) = set_so_mark_zero(&stream) {
+                                warn!("Failed to clear SO_MARK on accepted socket from {}: {}", addr, e);
+                            }
+                            if !accepts_transparent_connection(&drain) {
+                                debug!("Rejecting new connection from {} (draining)", addr);
+                                continue;
+                            }
+                            let permit = match self.concurrency_limit.clone().try_acquire_owned() {
+                                Ok(p) => p,
+                                Err(_) => {
+                                    debug!("Dropping TCPv6 from {} (at capacity)", addr);
+                                    continue;
+                                }
+                            };
+                            let handle = self.spawn_handle();
+                            let drain = drain.clone();
+                            tokio::spawn(async move {
+                                let _permit = permit;
+                                let _guard = ConnectionGuard::new(drain);
+                                if let Err(e) = handle.serve_connection(stream, addr).await {
+                                    warn!("Error handling TCPv6 from {}: {}", addr, e);
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            error!("TCPv6 accept error: {}", e);
+                            if e.raw_os_error() == Some(libc::EMFILE) {
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                        }
+                    }
+                }
+
+                cmd = rx.recv() => {
+                    match cmd {
+                        Some(ControlCommand::ReloadConfig { request_id, config }) => {
+                            info!("SIGHUP reload request {request_id} started");
+                            if self.apply_runtime_config(*config, &drain).await {
+                                info!("SIGHUP reload request {request_id} applied");
+                            } else {
+                                warn!("SIGHUP reload request {request_id} rejected");
+                            }
+                        }
+                        Some(ControlCommand::MergeSubscription { subscription_id, name, nodes }) => {
+                            info!(
+                                "Merging {} node(s) from subscription '{}'",
+                                nodes.len(),
+                                name
+                            );
+                            let new_config = {
+                                let current = self.config.read().await;
+                                config_with_subscription_nodes(&current, subscription_id, nodes)
+                            };
+                            // Same serialized rebuild path as ReloadConfig —
+                            // both commands queue on this single channel.
+                            let _ = self.apply_runtime_config(new_config, &drain).await;
+                        }
+                        Some(ControlCommand::NetworkChanged) => {
+                            let new_config = {
+                                let current = self.config.read().await;
+                                let mut next = current.clone();
+                                next.ensure_local_direct_rules().then_some(next)
+                            };
+                            if let Some(new_config) = new_config {
+                                info!("refreshing local direct rules after network change");
+                                if !self.apply_runtime_config(new_config, &drain).await {
+                                    warn!("network-triggered routing refresh rejected");
+                                }
+                            }
+                            self.alive_set.notify_network_change();
+                        }
+                        Some(ControlCommand::Shutdown) | None => break,
+                    }
+                }
+            }
+        }
+
+        if let Some(flags) = self.datapath_flags.as_ref()
+            && let Err(error) = flags.fence_nfqueue().await
+        {
+            fatal_error.get_or_insert_with(|| {
+                anyhow::anyhow!("failed to fence NFQUEUE during shutdown: {error:#}")
+            });
+        }
+        let datapath_closed = {
+            let mut backend = self.ebpf.write().await;
+            backend.set_datapath_ready(false)
+        };
+        if let Err(error) = datapath_closed {
+            fatal_error.get_or_insert_with(|| {
+                anyhow::anyhow!("failed to close eBPF datapath admission: {error:#}")
+            });
+        }
+        drain.start_rejecting();
+        #[cfg(feature = "ebpf")]
+        if let Some(runtime) = nfqueue_runtime.as_mut() {
+            runtime.begin_pending_drain().await;
+            if let Err(error) = runtime.check_startup_health().await {
+                fatal_error.get_or_insert_with(|| anyhow::Error::new(error));
+            }
+        }
+
+        if let Err(error) = self
+            .shutdown_datapath(&drain, &mut udp_removal_task, dns_listener.as_mut())
+            .await
+        {
+            fatal_error.get_or_insert(error);
+        }
+
+        #[cfg(feature = "ebpf")]
+        if let Some(runtime) = nfqueue_runtime.as_mut() {
+            if let Err(error) = runtime.shutdown_service().await {
+                fatal_error.get_or_insert(error);
+            }
+            if let Some(error) = runtime.take_shutdown_fatal() {
+                fatal_error.get_or_insert_with(|| anyhow::Error::new(error));
+            }
+            if let Err(error) = runtime.finish_pending_drain().await {
+                fatal_error.get_or_insert(error);
+            }
+            self.pending_udp_verdicts = None;
+        }
+
+        if let Some(flags) = self.datapath_flags.as_ref()
+            && let Err(error) = flags.disable().await
+        {
+            fatal_error.get_or_insert_with(|| {
+                anyhow::anyhow!("failed to disable datapath flags: {error:#}")
+            });
+        }
+
+        if let Err(error) = self.finalize_shutdown().await {
+            fatal_error.get_or_insert(error);
+        }
+        if let Some(error) = fatal_error {
+            Err(error)
+        } else {
+            Ok(())
+        }
+    }
+    pub(super) fn spawn_handle(&self) -> ControlPlaneHandle {
+        ControlPlaneHandle {
+            config: self.config.clone(),
+            router: self.router.clone(),
+            proxy_registry: self.proxy_registry.clone(),
+            runtime_registry: self.runtime_registry.clone(),
+            dns_resolver: self.dns_resolver.clone(),
+            group_manager: self.group_manager.clone(),
+            stats: self.stats.clone(),
+            ebpf: self.ebpf.clone(),
+            udp_pool: self.udp_pool.clone(),
+            #[cfg(feature = "ebpf")]
+            pending_udp_verdicts: self.pending_udp_verdicts.clone(),
+            tcp_sniff_neg_cache: self.tcp_sniff_neg_cache.clone(),
+            sniffer_pool: self.sniffer_pool.clone(),
+            dns_controller: self.dns_controller.clone(),
+            alive_set: self.alive_set.clone(),
+            connection_pool: self.connection_pool.clone(),
+            connection_tracker: self.connection_tracker.clone(),
+            tcp_flow_pins: self.tcp_flow_pins.clone(),
+            mode_state: self.mode_state.clone(),
+        }
+    }
+}
+/// Work produced by the shared IPv4/IPv6 UDP slow-path dispatcher after a
+/// fast-path miss. The accept loop never awaits PacketTransport I/O; DNS
+/// resolution (when required) runs inside a slow-permit-bounded task.
+pub(super) enum UdpSlowPathWork {
+    /// Fresh reservation: caller spawns `serve_udp_connection`.
+    Initialize(UdpInitLease),
+    /// DNS-shaped traffic: slow permit is already held and the payload has
+    /// been copied. Run the production DNS controller first; only if it
+    /// declines, continue through the same reserve/initializer path.
+    DnsThenMaybeInitialize {
+        permit: tokio::sync::OwnedSemaphorePermit,
+        data: Bytes,
+        validated: ValidatedDnsQuery,
+    },
+    /// Fully handled in the receive loop (enqueued / rejected / dropped).
+    Done,
+}
+
+/// Shared production admission helper used by both listener families and by
+/// focused tests. Order is always:
+/// `slow permit → (optional heap copy for DNS task) → reserve_or_enqueue`.
+/// Only strict DNS queries whose authoritative destination is port 53 return
+/// [`UdpSlowPathWork::DnsThenMaybeInitialize`]; DNS-shaped non-53 UDP stays
+/// on ordinary forwarding.
+pub(super) fn begin_udp_slow_path(
+    pool: &Arc<UdpEndpointPool>,
+    stats: &StatsManager,
+    concurrency_limit: &Arc<tokio::sync::Semaphore>,
+    src_addr: SocketAddr,
+    original_dst: SocketAddr,
+    data: &[u8],
+    validated_dns: Option<ValidatedDnsQuery>,
+) -> UdpSlowPathWork {
+    let Some(permit) = try_admit_udp_slow_path(stats, concurrency_limit) else {
+        return UdpSlowPathWork::Done;
+    };
+    if original_dst.port() == 53
+        && let Some(validated) = validated_dns
+    {
+        // Permit is acquired before the heap copy required to leave the
+        // receive buffer for a permit-bounded DNS task.
+        return UdpSlowPathWork::DnsThenMaybeInitialize {
+            permit,
+            data: Bytes::copy_from_slice(data),
+            validated,
+        };
+    }
+    match pool.reserve_or_enqueue(src_addr, original_dst, data, permit, stats) {
+        EndpointReservation::Initializing(lease) => UdpSlowPathWork::Initialize(lease),
+        EndpointReservation::Enqueued
+        | EndpointReservation::CapacityRejected
+        | EndpointReservation::QueueFull
+        | EndpointReservation::IdentityMismatch
+        | EndpointReservation::QueueClosed => UdpSlowPathWork::Done,
+    }
+}
+
+pub(super) struct UdpDnsSlowPathContext<'a> {
+    pub(super) pool: &'a Arc<UdpEndpointPool>,
+    pub(super) stats: &'a StatsManager,
+    pub(super) dns_controller: &'a crate::control::dns_control::DnsController,
+    pub(super) src_addr: SocketAddr,
+    pub(super) original_dst: SocketAddr,
+}
+
+/// Finish a DNS-forced slow path after the slow permit was acquired: run the
+/// production DNS controller first. If it handles the packet, do not
+/// reserve/enqueue. If it declines, continue through the same
+/// `reserve_or_enqueue` path used by ordinary slow traffic.
+pub(super) async fn complete_udp_dns_slow_path(
+    context: UdpDnsSlowPathContext<'_>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    data: &[u8],
+    validated: ValidatedDnsQuery,
+) -> Option<UdpInitLease> {
+    let UdpDnsSlowPathContext {
+        pool,
+        stats,
+        dns_controller,
+        src_addr,
+        original_dst,
+    } = context;
+    match dns_controller
+        .handle_udp_dns(data, src_addr, original_dst, Some(validated))
+        .await
+    {
+        Ok(true) => return None,
+        Ok(false) => {}
+        Err(error) => {
+            // Preserve the historical UDP fallback: a controller failure is
+            // not a reason to drop the original datagram before ordinary
+            // endpoint admission has had a chance to forward it.
+            warn!(
+                "DNS controller error for UDP {} -> {}; continuing UDP: {}",
+                src_addr, original_dst, error
+            );
+        }
+    }
+    match pool.reserve_or_enqueue(src_addr, original_dst, data, permit, stats) {
+        EndpointReservation::Initializing(mut lease) => {
+            // The controller was invoked exactly once for this packet. Carry
+            // that fact into initialize_udp_connection so an Ok(false) or
+            // Err continuation cannot call it again.
+            lease.mark_dns_checked();
+            Some(lease)
+        }
+        EndpointReservation::Enqueued
+        | EndpointReservation::CapacityRejected
+        | EndpointReservation::QueueFull
+        | EndpointReservation::IdentityMismatch
+        | EndpointReservation::QueueClosed => None,
+    }
+}
+
+/// Shared IPv4/IPv6 receive-loop dispatcher after a fast-path miss. Acquires
+/// the slow permit before any copy/spawn, prefers the DNS controller for
+/// DNS-shaped traffic, and only then reserves or enqueues.
+/// Everything a UDP listener loop needs, cloned from the control plane once
+/// so each socket's loop runs as an independent task (parallel drain).
+#[derive(Clone)]
+pub(super) struct UdpLoopState {
+    pub(super) udp_pool: Arc<UdpEndpointPool>,
+    pub(super) stats: Arc<StatsManager>,
+    pub(super) udp_concurrency_limit: Arc<tokio::sync::Semaphore>,
+    pub(super) dns_concurrency_limit: Arc<tokio::sync::Semaphore>,
+    pub(super) dns_controller: Arc<crate::control::dns_control::DnsController>,
+    pub(super) drain: Arc<DrainTracker>,
+    pub(super) handle: ControlPlaneHandle,
+}
+
+/// Receive loop for one UDP listener socket. The eBPF datapath hashes each
+/// flow to a specific socket of the group, so loops are flow-disjoint and
+/// run in parallel across runtime workers.
+async fn udp_listener_loop(state: UdpLoopState, socket: Arc<UdpSocket>, family: &'static str) {
+    let mut buf = vec![0u8; 64 * 1024];
+    let local_addr = match socket.local_addr() {
+        Ok(local_addr) => local_addr,
+        Err(error) => {
+            error!("{} UDP recv error: {}", family, error);
+            return;
+        }
+    };
+    loop {
+        match recv_from_with_orig_dst(&socket, local_addr, &mut buf).await {
+            Ok((n, src_addr, recv_meta)) => {
+                let Some(destination) = udp_original_dst(&recv_meta, &buf[..n]) else {
+                    debug!(
+                        "Dropping {} UDP from {} without original-destination provenance",
+                        family, src_addr
+                    );
+                    continue;
+                };
+                let original_dst = destination.address;
+                let mut validated_dns = destination.validated_dns;
+                if original_dst.port() == 53 && validated_dns.is_none() {
+                    validated_dns = validate_exact_dns_query(&buf[..n]);
+                }
+                if !accepts_transparent_connection(&state.drain) {
+                    state.stats.record_udp_slow_permit_closed();
+                    continue;
+                }
+                // Ready flows enqueue synchronously here; this loop never
+                // awaits PacketTransport I/O.
+                if udp_fast_path(
+                    &state.udp_pool,
+                    &state.stats,
+                    &buf[..n],
+                    src_addr,
+                    original_dst,
+                    validated_dns,
+                )
+                .await
+                {
+                    continue;
+                }
+                dispatch_udp_slow_path(&state, src_addr, original_dst, &buf[..n], validated_dns);
+            }
+            Err(e) => error!("{} UDP recv error: {}", family, e),
+        }
+    }
+}
+
+pub(super) fn dispatch_udp_slow_path(
+    state: &UdpLoopState,
+    src_addr: SocketAddr,
+    original_dst: SocketAddr,
+    data: &[u8],
+    validated_dns: Option<ValidatedDnsQuery>,
+) {
+    let concurrency_limit = if original_dst.port() == 53 && validated_dns.is_some() {
+        &state.dns_concurrency_limit
+    } else {
+        &state.udp_concurrency_limit
+    };
+    match begin_udp_slow_path(
+        &state.udp_pool,
+        &state.stats,
+        concurrency_limit,
+        src_addr,
+        original_dst,
+        data,
+        validated_dns,
+    ) {
+        UdpSlowPathWork::Done => {}
+        UdpSlowPathWork::Initialize(lease) => {
+            let handle = state.handle.clone();
+            let drain = Arc::clone(&state.drain);
+            state.udp_pool.spawn_slow_path(async move {
+                let _guard = ConnectionGuard::new(drain);
+                if let Err(e) = handle.serve_udp_connection(lease).await {
+                    warn!(
+                        "Error handling UDP from {} (orig {}): {}",
+                        src_addr, original_dst, e
+                    );
+                }
+            });
+        }
+        UdpSlowPathWork::DnsThenMaybeInitialize {
+            permit,
+            data,
+            validated,
+        } => {
+            let handle = state.handle.clone();
+            let guard = ConnectionGuard::new(Arc::clone(&state.drain));
+            let pool = Arc::clone(&state.udp_pool);
+            let stats = Arc::clone(&state.stats);
+            let dns_controller = Arc::clone(&state.dns_controller);
+            state.udp_pool.spawn_slow_path(async move {
+                // DNS handling is already accepted work. Register it before
+                // spawning so reload/shutdown drain cannot miss work before
+                // its first poll; keep the guard alive for the task lifetime.
+                let _guard = guard;
+                let Some(lease) = complete_udp_dns_slow_path(
+                    UdpDnsSlowPathContext {
+                        pool: &pool,
+                        stats: &stats,
+                        dns_controller: dns_controller.as_ref(),
+                        src_addr,
+                        original_dst,
+                    },
+                    permit,
+                    &data,
+                    validated,
+                )
+                .await
+                else {
+                    return;
+                };
+                if let Err(e) = handle.serve_udp_connection(lease).await {
+                    warn!(
+                        "Error handling UDP from {} (orig {}): {}",
+                        src_addr, original_dst, e
+                    );
+                }
+            });
+        }
+    }
+}
+
+/// Test helper for family-symmetric admission: acquire
+/// the slow permit then synchronously reserve/enqueue (non-DNS path).
+#[cfg(test)]
+pub(super) fn reserve_udp_slow_path(
+    pool: &Arc<UdpEndpointPool>,
+    stats: &StatsManager,
+    concurrency_limit: &Arc<tokio::sync::Semaphore>,
+    src_addr: SocketAddr,
+    original_dst: SocketAddr,
+    data: &[u8],
+) -> Option<UdpInitLease> {
+    match begin_udp_slow_path(
+        pool,
+        stats,
+        concurrency_limit,
+        src_addr,
+        original_dst,
+        data,
+        None,
+    ) {
+        UdpSlowPathWork::Initialize(lease) => Some(lease),
+        UdpSlowPathWork::DnsThenMaybeInitialize { permit, data, .. } => {
+            match pool.reserve_or_enqueue(src_addr, original_dst, &data, permit, stats) {
+                EndpointReservation::Initializing(lease) => Some(lease),
+                _ => None,
+            }
+        }
+        UdpSlowPathWork::Done => None,
+    }
+}
+
+/// Admit one datagram onto the current UDP slow path after a fast-path miss.
+///
+/// This is the sole production owner of `udp.slowPermit` accepted/rejected
+/// counters. Queue metrics are recorded by `reserve_or_enqueue` / the driver.
+pub(super) fn try_admit_udp_slow_path(
+    stats: &StatsManager,
+    concurrency_limit: &Arc<tokio::sync::Semaphore>,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    match concurrency_limit.clone().try_acquire_owned() {
+        Ok(permit) => {
+            stats.record_udp_slow_permit_accepted();
+            Some(permit)
+        }
+        Err(_) => {
+            stats.record_udp_slow_permit_rejected();
+            None
+        }
+    }
+}
