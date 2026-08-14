@@ -1,245 +1,22 @@
-//! UDP endpoint pool — NAT mapping and connection tracking for UDP relay.
-//!
-//! Each UDP "connection" (identified by client address + destination address)
-//! gets a pooled endpoint that handles bidirectional forwarding and
-//! NAT timeout management. Mirrors the Go `udp_endpoint_pool.go`.
-//!
-//! The pool is a [`DashMap`] so that per-packet lookups on the UDP fast path
-//! only contend on a single shard instead of one global mutex.
+use super::*;
 
-use crate::stats::{ActiveConnectionGuard, OutboundTracker, StatsManager};
-use bytes::Bytes;
-use dashmap::DashMap;
-use parking_lot::Mutex;
-use std::collections::HashSet;
-use std::io;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
-use tokio::net::UdpSocket;
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
-use tracing::debug;
-
-#[doc(hidden)]
-pub mod bench_support;
-
-const DEFAULT_NAT_TIMEOUT: Duration = Duration::from_secs(30);
-const JANITOR_INTERVAL: Duration = Duration::from_secs(5);
-/// How long the endpoint driver waits for proxy data before giving up.
-const REPLY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
-/// Hard cap on pooled endpoints. A unique-tuple UDP flood must not be able
-/// to grow the pool (and with it sockets, reply tasks and memory) without
-/// bound — at the cap new mappings are refused and the datagram is dropped,
-/// which UDP tolerates by design.
-pub(crate) const MAX_ENDPOINTS: usize = 8192;
 /// At most 64 datagrams, including the initializer's first packet, may be
 /// retained for one flow.
-const FLOW_QUEUE_CAPACITY: usize = 64;
+pub(super) const FLOW_QUEUE_CAPACITY: usize = 64;
 /// All retained payload bytes across UDP flows are bounded exactly by permits.
-const GLOBAL_PAYLOAD_CAPACITY: usize = 8 * 1024 * 1024;
-const TRANSPORT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
-const TRAFFIC_ALIVE_REPORT_INTERVAL: Duration = Duration::from_millis(200);
-const DRIVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(6);
-const DRIVER_ABORT_TIMEOUT: Duration = Duration::from_secs(1);
-/// Includes the eagerly-created original-destination socket. Reaching the
-/// bound fails the endpoint closed rather than replying from the wrong source.
-const MAX_REPLY_SOCKETS_PER_ENDPOINT: usize = 8;
-/// A pooled UDP endpoint representing one NAT mapping.
-pub struct UdpEndpoint {
-    /// The proxy-side framed UDP transport (upstream).
-    pub proxy_socket: Arc<dyn honk_outbound::proxy::PacketTransport>,
-    /// The relay target address (upstream proxy).
-    pub relay_addr: SocketAddr,
-    /// NodeId of the proxy node this endpoint dials through — used to
-    /// report UDP liveness when a reply actually arrives (see
-    /// `receive_loop`) and to retire the endpoint on node death.
-    node_id: uuid::Uuid,
-    /// When this endpoint expires (monotonic nanos).
-    expires_at: AtomicI64,
-    /// Whether the endpoint has received at least one reply.
-    has_reply: AtomicBool,
-    /// Guard for the exactly-once first-reply metric.
-    first_reply_recorded: AtomicBool,
-    /// Bounds traffic-state lock acquisition to five times per second per endpoint.
-    next_alive_report_at: AtomicI64,
-    /// Creation time used for reply latency accounting.
-    created_at: Instant,
-    /// Reference count for active operations.
-    ref_count: AtomicI64,
-    /// Set when the endpoint is being destroyed.
-    dead: AtomicBool,
-    /// Serializes node-death retirement with the linearization point for an
-    /// application send attempt. This lock is held only synchronously; no
-    /// transport I/O occurs while it is held.
-    send_gate: Mutex<()>,
-    /// Ring buffer of peers we've sent packets to (for reply validation).
-    pending_reply_peers: Mutex<[(SocketAddr, bool); 8]>,
-    /// Next ring position to write.
-    pending_reply_next: AtomicU64,
-    /// Live byte counters shared with the clash-API tracker entry (plain
-    /// atomics — the per-packet path must not take a lock).
-    upload: Arc<AtomicU64>,
-    download: Arc<AtomicU64>,
-    /// Clash-API tracker connection id; set once at registration, taken at
-    /// removal.  Not touched on the per-packet path.
-    tracker_id: Mutex<Option<String>>,
-}
-
-impl UdpEndpoint {
-    pub fn new(
-        proxy_socket: Arc<dyn honk_outbound::proxy::PacketTransport>,
-        relay_addr: SocketAddr,
-        node_id: uuid::Uuid,
-    ) -> Self {
-        let now = monotonic_nanos();
-        Self {
-            proxy_socket,
-            relay_addr,
-            node_id,
-            expires_at: AtomicI64::new(now + nanos_from_dur(DEFAULT_NAT_TIMEOUT)),
-            has_reply: AtomicBool::new(false),
-            first_reply_recorded: AtomicBool::new(false),
-            next_alive_report_at: AtomicI64::new(0),
-            created_at: Instant::now(),
-            ref_count: AtomicI64::new(1),
-            dead: AtomicBool::new(false),
-            send_gate: Mutex::new(()),
-            pending_reply_peers: Mutex::new(
-                [(
-                    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
-                    false,
-                ); 8],
-            ),
-            pending_reply_next: AtomicU64::new(0),
-            upload: Arc::new(AtomicU64::new(0)),
-            download: Arc::new(AtomicU64::new(0)),
-            tracker_id: Mutex::new(None),
-        }
-    }
-
-    /// Bind the clash-API tracker entry to this endpoint: the entry shares
-    /// the endpoint's atomic counters, and `conn_id` is stored for removal.
-    pub fn set_tracker(&self, conn_id: String) {
-        *self.tracker_id.lock() = Some(conn_id);
-    }
-
-    /// Counter clones for the tracker entry.
-    pub fn byte_counters(&self) -> (Arc<AtomicU64>, Arc<AtomicU64>) {
-        (self.upload.clone(), self.download.clone())
-    }
-
-    /// Count client→proxy bytes (lock-free).
-    pub fn tracker_upload(&self, n: u64) {
-        self.upload.fetch_add(n, Ordering::Relaxed);
-    }
-
-    /// Count proxy→client bytes (lock-free).
-    pub fn tracker_download(&self, n: u64) {
-        self.download.fetch_add(n, Ordering::Relaxed);
-    }
-
-    /// Take the tracker connection id (on endpoint removal).
-    pub fn take_tracker_id(&self) -> Option<String> {
-        self.tracker_id.lock().take()
-    }
-
-    pub fn is_expired(&self) -> bool {
-        monotonic_nanos() > self.expires_at.load(Ordering::Relaxed)
-    }
-
-    pub fn refresh(&self) {
-        self.expires_at.store(
-            monotonic_nanos() + nanos_from_dur(DEFAULT_NAT_TIMEOUT),
-            Ordering::Relaxed,
-        );
-    }
-
-    pub fn mark_reply(&self) {
-        self.has_reply.store(true, Ordering::Relaxed);
-        self.refresh();
-    }
-
-    fn take_first_reply_metric(&self) -> Option<Duration> {
-        if self.first_reply_recorded.load(Ordering::Acquire) {
-            return None;
-        }
-        (!self.first_reply_recorded.swap(true, Ordering::AcqRel)).then(|| self.created_at.elapsed())
-    }
-
-    fn take_alive_report_slot(&self) -> bool {
-        let now = monotonic_nanos();
-        if now < self.next_alive_report_at.load(Ordering::Relaxed) {
-            return false;
-        }
-        self.next_alive_report_at.store(
-            now + nanos_from_dur(TRAFFIC_ALIVE_REPORT_INTERVAL),
-            Ordering::Relaxed,
-        );
-        true
-    }
-
-    pub fn has_reply(&self) -> bool {
-        self.has_reply.load(Ordering::Relaxed)
-    }
-
-    pub fn release(&self) {
-        self.ref_count.fetch_sub(1, Ordering::Relaxed);
-    }
-
-    pub fn kill(&self) {
-        // A node-death retirement ordered before `begin_send_attempt` must
-        // prevent the transport call. Conversely, once an attempt has passed
-        // that point it is ambiguous and may not be replayed.
-        let _send_gate = self.send_gate.lock();
-        self.dead.store(true, Ordering::Release);
-    }
-
-    fn begin_send_attempt(&self) -> io::Result<()> {
-        let _send_gate = self.send_gate.lock();
-        if self.dead.load(Ordering::Acquire) {
-            return Err(io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "UDP endpoint was retired before transport send",
-            ));
-        }
-        Ok(())
-    }
-
-    pub fn ref_count(&self) -> i64 {
-        self.ref_count.load(Ordering::Relaxed)
-    }
-
-    /// Record a peer we've sent a packet to (for reply validation).
-    ///
-    /// Stores the peer address in a ring buffer. Transports without an
-    /// explicit full-cone capability accept replies only from these peers.
-    pub fn record_pending_reply_peer(&self, peer: SocketAddr) {
-        let mut ring = self.pending_reply_peers.lock();
-        let next = self.pending_reply_next.fetch_add(1, Ordering::Relaxed) as usize % 8;
-        ring[next] = (peer, true);
-    }
-
-    /// Validate that a reply peer is expected for a fixed-peer transport.
-    pub fn validate_reply_peer(&self, peer: SocketAddr) -> bool {
-        self.pending_reply_peers
-            .lock()
-            .iter()
-            .any(|(addr, valid)| *valid && *addr == peer)
-    }
-}
+pub(super) const GLOBAL_PAYLOAD_CAPACITY: usize = 8 * 1024 * 1024;
 
 /// Key for the endpoint pool: (client address, destination address).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct EndpointKey {
-    client_ip: [u8; 16],
-    client_port: u16,
-    dst_ip: [u8; 16],
-    dst_port: u16,
+pub(super) struct EndpointKey {
+    pub(super) client_ip: [u8; 16],
+    pub(super) client_port: u16,
+    pub(super) dst_ip: [u8; 16],
+    pub(super) dst_port: u16,
 }
 
 impl EndpointKey {
-    fn new(client: SocketAddr, dst: SocketAddr) -> Self {
+    pub(super) fn new(client: SocketAddr, dst: SocketAddr) -> Self {
         let mut cip = [0u8; 16];
         let mut dip = [0u8; 16];
         match client.ip() {
@@ -278,64 +55,26 @@ impl EndpointKey {
         }
     }
 
-    fn client_ip(&self) -> std::net::IpAddr {
+    pub(super) fn client_ip(&self) -> std::net::IpAddr {
         Self::ip_addr(&self.client_ip)
     }
 
-    fn dst_ip(&self) -> std::net::IpAddr {
+    pub(super) fn dst_ip(&self) -> std::net::IpAddr {
         Self::ip_addr(&self.dst_ip)
     }
 }
 
-/// Why a UDP pool entry went away.  The removal worker retires the flow's
-/// conntrack entries only when userspace owned the datapath.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum RemovalReason {
-    /// A userspace endpoint (or its uncommitted reservation) is gone; the
-    /// flow's conntrack entries are retired with it.
-    UserspaceEndpointRetired,
-    #[cfg(any(feature = "ebpf", test))]
-    /// The flow was handed to the kernel; its terminal conn_state must remain.
-    KernelHandoff,
-}
-
-/// Message sent to the endpoint-removal sink.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct EndpointRemoval {
-    pub(crate) client: SocketAddr,
-    pub(crate) dst: SocketAddr,
-    pub(crate) decision_token: u32,
-    pub(crate) generation: u64,
-    pub(crate) conn_id: Option<String>,
-    pub(crate) reason: RemovalReason,
-}
-
-/// A synchronously-created anyfrom socket. The default factory calls the
-/// daens-scoped production helper so eager and lazy sockets preserve the same
-/// network-namespace and source-address invariants.
-pub(super) trait UdpReplySocketFactory: Send + Sync + std::fmt::Debug {
-    fn create(&self, source: SocketAddr) -> io::Result<UdpSocket>;
-}
-
-#[derive(Debug)]
-struct SystemUdpReplySocketFactory;
-
-impl UdpReplySocketFactory for SystemUdpReplySocketFactory {
-    fn create(&self, source: SocketAddr) -> io::Result<UdpSocket> {
-        super::new_udp_reply_socket(source)
-    }
-}
 /// One retained packet owns all permits that account for it. Socket ingress
 /// acquires them before copying; owned ingress transfers its allocation only
 /// after the same bounded admission succeeds.
-pub(super) struct QueuedDatagram {
-    data: Bytes,
-    _flow_permit: OwnedSemaphorePermit,
-    _global_byte_permit: Option<OwnedSemaphorePermit>,
+pub(in crate::control) struct QueuedDatagram {
+    pub(super) data: Bytes,
+    pub(super) _flow_permit: OwnedSemaphorePermit,
+    pub(super) _global_byte_permit: Option<OwnedSemaphorePermit>,
 }
 
 impl QueuedDatagram {
-    pub(super) fn payload(&self) -> &[u8] {
+    pub(in crate::control) fn payload(&self) -> &[u8] {
         &self.data
     }
 }
@@ -369,34 +108,34 @@ enum PacketAdmissionError {
     FlowQueueFull,
     GlobalPayloadFull,
 }
-struct InitializingEndpoint {
-    decision_token: u32,
-    generation: u64,
-    queue_tx: mpsc::Sender<QueuedDatagram>,
-    queue_rx: Mutex<Option<mpsc::Receiver<QueuedDatagram>>>,
-    flow_slots: Arc<Semaphore>,
-    endpoint_permit: Mutex<Option<OwnedSemaphorePermit>>,
+pub(super) struct InitializingEndpoint {
+    pub(super) decision_token: u32,
+    pub(super) generation: u64,
+    pub(super) queue_tx: mpsc::Sender<QueuedDatagram>,
+    pub(super) queue_rx: Mutex<Option<mpsc::Receiver<QueuedDatagram>>>,
+    pub(super) flow_slots: Arc<Semaphore>,
+    pub(super) endpoint_permit: Mutex<Option<OwnedSemaphorePermit>>,
     /// A tracker registered after route selection but before the Ready
     /// transition. It must be removed if this initialization is cancelled.
-    tracker_id: Mutex<Option<String>>,
+    pub(super) tracker_id: Mutex<Option<String>>,
     /// Finalized transport winner for this generation. Bound only after
     /// speculative preparation has drained, so a death callback can
     /// generation-safely retire the entry before `commit_ready` publishes Ready.
-    selected_node: Mutex<Option<uuid::Uuid>>,
-    cancelled: AtomicBool,
-    cancel_notify: Notify,
+    pub(super) selected_node: Mutex<Option<uuid::Uuid>>,
+    pub(super) cancelled: AtomicBool,
+    pub(super) cancel_notify: Notify,
 }
 
 impl InitializingEndpoint {
-    fn take_receiver(&self) -> Option<mpsc::Receiver<QueuedDatagram>> {
+    pub(super) fn take_receiver(&self) -> Option<mpsc::Receiver<QueuedDatagram>> {
         self.queue_rx.lock().take()
     }
 
-    fn take_endpoint_permit(&self) -> Option<OwnedSemaphorePermit> {
+    pub(super) fn take_endpoint_permit(&self) -> Option<OwnedSemaphorePermit> {
         self.endpoint_permit.lock().take()
     }
 
-    fn set_tracker_id(&self, tracker_id: String) -> bool {
+    pub(super) fn set_tracker_id(&self, tracker_id: String) -> bool {
         let mut current = self.tracker_id.lock();
         if current.is_some() {
             return false;
@@ -405,23 +144,23 @@ impl InitializingEndpoint {
         true
     }
 
-    fn take_tracker_id(&self) -> Option<String> {
+    pub(super) fn take_tracker_id(&self) -> Option<String> {
         self.tracker_id.lock().take()
     }
 
-    fn bind_selected_node(&self, node_id: uuid::Uuid) {
+    pub(super) fn bind_selected_node(&self, node_id: uuid::Uuid) {
         *self.selected_node.lock() = Some(node_id);
     }
 
-    fn clear_selected_node(&self) {
+    pub(super) fn clear_selected_node(&self) {
         *self.selected_node.lock() = None;
     }
 
-    fn selected_node_is(&self, node_id: uuid::Uuid) -> bool {
+    pub(super) fn selected_node_is(&self, node_id: uuid::Uuid) -> bool {
         *self.selected_node.lock() == Some(node_id)
     }
 
-    fn cancel(&self) {
+    pub(super) fn cancel(&self) {
         if !self.cancelled.swap(true, Ordering::AcqRel) {
             self.cancel_notify.notify_waiters();
         }
@@ -438,25 +177,25 @@ impl InitializingEndpoint {
     }
 }
 
-struct ReadyEndpoint {
-    decision_token: u32,
-    generation: u64,
-    endpoint: Arc<UdpEndpoint>,
-    queue_tx: mpsc::Sender<QueuedDatagram>,
-    flow_slots: Arc<Semaphore>,
-    _endpoint_permit: OwnedSemaphorePermit,
-    _connection_guard: Option<ActiveConnectionGuard>,
-    alive: AtomicBool,
+pub(super) struct ReadyEndpoint {
+    pub(super) decision_token: u32,
+    pub(super) generation: u64,
+    pub(super) endpoint: Arc<UdpEndpoint>,
+    pub(super) queue_tx: mpsc::Sender<QueuedDatagram>,
+    pub(super) flow_slots: Arc<Semaphore>,
+    pub(super) _endpoint_permit: OwnedSemaphorePermit,
+    pub(super) _connection_guard: Option<ActiveConnectionGuard>,
+    pub(super) alive: AtomicBool,
 }
 
-enum EndpointEntry {
+pub(super) enum EndpointEntry {
     Initializing(Arc<InitializingEndpoint>),
     Ready(Arc<ReadyEndpoint>),
     Retiring { generation: u64, token: u32 },
 }
 
 impl EndpointEntry {
-    fn generation(&self) -> u64 {
+    pub(super) fn generation(&self) -> u64 {
         match self {
             Self::Initializing(entry) => entry.generation,
             Self::Ready(entry) => entry.generation,
@@ -464,7 +203,7 @@ impl EndpointEntry {
         }
     }
 
-    fn decision_token(&self) -> u32 {
+    pub(super) fn decision_token(&self) -> u32 {
         match self {
             Self::Initializing(entry) => entry.decision_token,
             Self::Ready(entry) => entry.decision_token,
@@ -472,11 +211,11 @@ impl EndpointEntry {
         }
     }
 
-    fn matches_identity(&self, generation: u64, token: u32) -> bool {
+    pub(super) fn matches_identity(&self, generation: u64, token: u32) -> bool {
         self.generation() == generation && self.decision_token() == token
     }
 
-    fn retire(&self) -> Option<String> {
+    pub(super) fn retire(&self) -> Option<String> {
         match self {
             Self::Initializing(entry) => entry.take_tracker_id(),
             Self::Ready(entry) => {
@@ -494,7 +233,7 @@ impl EndpointEntry {
 /// variants have released the permit before returning to the receive loop.
 /// The lease stays inline to avoid another allocation on every new UDP flow.
 #[allow(clippy::large_enum_variant)]
-pub(super) enum EndpointReservation {
+pub(in crate::control) enum EndpointReservation {
     Initializing(UdpInitLease),
     Enqueued,
     CapacityRejected,
@@ -506,7 +245,7 @@ pub(super) enum EndpointReservation {
 
 #[cfg(any(feature = "ebpf", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum OwnedEnqueueError {
+pub(in crate::control) enum OwnedEnqueueError {
     IdentityMismatch,
     QueueFull,
     QueueClosed,
@@ -515,9 +254,9 @@ pub(super) enum OwnedEnqueueError {
 /// Owns an uncommitted Initializing incarnation. Dropping it transactionally
 /// tombstones only this identity, closes followers, returns all permits, and
 /// wakes reload waiters. It can never retire a newer entry for the key.
-pub(super) struct UdpInitLease {
+pub(in crate::control) struct UdpInitLease {
     pool: Arc<UdpEndpointPool>,
-    key: EndpointKey,
+    pub(super) key: EndpointKey,
     generation: u64,
     decision_token: u32,
     /// Cancellation epoch captured while publishing this Initializing entry.
@@ -537,28 +276,30 @@ pub(super) struct UdpInitLease {
 }
 
 impl UdpInitLease {
-    pub(super) fn client_addr(&self) -> SocketAddr {
+    pub(in crate::control) fn client_addr(&self) -> SocketAddr {
         SocketAddr::new(self.key.client_ip(), self.key.client_port)
     }
 
-    pub(super) fn original_dst(&self) -> SocketAddr {
+    pub(in crate::control) fn original_dst(&self) -> SocketAddr {
         SocketAddr::new(self.key.dst_ip(), self.key.dst_port)
     }
 
-    pub(super) fn generation(&self) -> u64 {
+    pub(in crate::control) fn generation(&self) -> u64 {
         self.generation
     }
 
-    pub(super) fn decision_token(&self) -> u32 {
+    pub(in crate::control) fn decision_token(&self) -> u32 {
         self.decision_token
     }
 
     #[cfg(test)]
-    pub(super) fn cancellation(&self) -> watch::Receiver<u64> {
+    pub(in crate::control) fn cancellation(&self) -> watch::Receiver<u64> {
         self.cancellation.clone()
     }
 
-    pub(super) fn wait_cancellation(&self) -> impl Future<Output = ()> + Send + 'static {
+    pub(in crate::control) fn wait_cancellation(
+        &self,
+    ) -> impl Future<Output = ()> + Send + 'static {
         let mut epoch = self.cancellation.clone();
         let initializer = Arc::clone(&self.initializer);
         async move {
@@ -569,23 +310,23 @@ impl UdpInitLease {
         }
     }
 
-    pub(super) fn set_connection_guard(&mut self, guard: ActiveConnectionGuard) {
+    pub(in crate::control) fn set_connection_guard(&mut self, guard: ActiveConnectionGuard) {
         debug_assert!(self.connection_guard.is_none());
         self.connection_guard = Some(guard);
     }
 
-    pub(super) fn mark_dns_checked(&mut self) {
+    pub(in crate::control) fn mark_dns_checked(&mut self) {
         self.dns_checked = true;
     }
 
-    pub(super) fn dns_checked(&self) -> bool {
+    pub(in crate::control) fn dns_checked(&self) -> bool {
         self.dns_checked
     }
 
     /// Associate a tracker created after route selection with this exact
     /// Initializing incarnation. If commit never happens, `Drop` transfers it
     /// to the removal sink; Ready cleanup continues to use `UdpEndpoint`.
-    pub(super) fn set_tracker_id(&self, tracker_id: String) -> bool {
+    pub(in crate::control) fn set_tracker_id(&self, tracker_id: String) -> bool {
         let Some(entry) = self.pool.endpoints.get(&self.key) else {
             return false;
         };
@@ -604,7 +345,7 @@ impl UdpInitLease {
     /// generation after speculative preparation drains and before endpoint
     /// setup. Returns false when a newer generation or death/cancel path
     /// retired this entry.
-    pub(super) fn bind_selected_node(&self, node_id: uuid::Uuid) -> bool {
+    pub(in crate::control) fn bind_selected_node(&self, node_id: uuid::Uuid) -> bool {
         let Some(entry) = self.pool.endpoints.get(&self.key) else {
             return false;
         };
@@ -622,7 +363,7 @@ impl UdpInitLease {
 
     /// Clear the finalized winner's binding if it becomes ineligible before
     /// endpoint setup. This generation will retire; no later candidate rebinds.
-    pub(super) fn clear_selected_node(&self) {
+    pub(in crate::control) fn clear_selected_node(&self) {
         let Some(entry) = self.pool.endpoints.get(&self.key) else {
             return;
         };
@@ -637,7 +378,7 @@ impl UdpInitLease {
     /// True while this lease still owns the map's Initializing entry. Used as
     /// the post-bind / post-dial eligibility check so a death that won the
     /// race cannot proceed to dial or application send.
-    pub(super) fn still_initializing(&self) -> bool {
+    pub(in crate::control) fn still_initializing(&self) -> bool {
         let Some(entry) = self.pool.endpoints.get(&self.key) else {
             return false;
         };
@@ -649,7 +390,7 @@ impl UdpInitLease {
         )
     }
 
-    pub(super) fn take_queue_receiver(&self) -> Option<mpsc::Receiver<QueuedDatagram>> {
+    pub(in crate::control) fn take_queue_receiver(&self) -> Option<mpsc::Receiver<QueuedDatagram>> {
         let entry = self.pool.endpoints.get(&self.key)?;
         match entry.value() {
             EndpointEntry::Initializing(initializing)
@@ -662,7 +403,7 @@ impl UdpInitLease {
         }
     }
 
-    pub(super) fn first_payload(&self) -> Bytes {
+    pub(in crate::control) fn first_payload(&self) -> Bytes {
         self.first
             .as_ref()
             .expect("uncommitted UDP lease must retain its first datagram")
@@ -670,14 +411,14 @@ impl UdpInitLease {
             .clone()
     }
 
-    pub(super) fn take_first(&mut self) -> Option<QueuedDatagram> {
+    pub(in crate::control) fn take_first(&mut self) -> Option<QueuedDatagram> {
         self.first.take()
     }
 
     /// Replace the occupied Initializing entry in place. This is deliberately
     /// not an insert-after-lookup: a cancelled/old initializer cannot publish
     /// over a newer incarnation.
-    pub(super) fn commit_ready(&mut self, endpoint: Arc<UdpEndpoint>) -> bool {
+    pub(in crate::control) fn commit_ready(&mut self, endpoint: Arc<UdpEndpoint>) -> bool {
         // Keep the map-entry → epoch-gate order shared with reservation. The
         // cancellation path takes only the epoch gate, so it cannot form a
         // map/gate cycle and neither guard crosses an await.
@@ -719,7 +460,7 @@ impl UdpInitLease {
     /// published. The exact tombstone prevents this tuple from being reused
     /// until the removal worker acknowledges the kernel handoff.
     #[cfg(any(feature = "ebpf", test))]
-    pub(super) fn commit_kernel_handoff(&mut self) -> bool {
+    pub(in crate::control) fn commit_kernel_handoff(&mut self) -> bool {
         let mut occupied = match self.pool.endpoints.entry(self.key) {
             dashmap::mapref::entry::Entry::Occupied(occupied) => occupied,
             dashmap::mapref::entry::Entry::Vacant(_) => return false,
@@ -776,9 +517,9 @@ struct UdpInitializerGuard {
 
 #[cfg(test)]
 #[derive(Debug)]
-struct ReservationPublicationHook {
-    published: Arc<std::sync::Barrier>,
-    resume: Arc<std::sync::Barrier>,
+pub(super) struct ReservationPublicationHook {
+    pub(super) published: Arc<std::sync::Barrier>,
+    pub(super) resume: Arc<std::sync::Barrier>,
 }
 
 impl UdpInitializerGuard {
@@ -796,228 +537,22 @@ impl Drop for UdpInitializerGuard {
     }
 }
 
-struct TaskRegistry {
-    closed: bool,
-    tasks: tokio::task::JoinSet<()>,
-}
-
-impl Default for TaskRegistry {
-    fn default() -> Self {
-        Self {
-            closed: false,
-            tasks: tokio::task::JoinSet::new(),
-        }
-    }
-}
-
-async fn drain_registered_tasks(tasks: &mut tokio::task::JoinSet<()>, label: &str) -> bool {
-    let mut clean = true;
-    while let Some(result) = tasks.join_next().await {
-        if let Err(error) = result
-            && !error.is_cancelled()
-        {
-            clean = false;
-            debug!("UDP {} task join failed during shutdown: {}", label, error);
-        }
-    }
-    clean
-}
-
-async fn join_registered_tasks(
-    mut tasks: tokio::task::JoinSet<()>,
-    label: &str,
-    graceful_timeout: Duration,
-    abort_first: bool,
-) -> bool {
-    if abort_first {
-        tasks.abort_all();
-    }
-    match tokio::time::timeout(
-        if abort_first {
-            DRIVER_ABORT_TIMEOUT
-        } else {
-            graceful_timeout
-        },
-        drain_registered_tasks(&mut tasks, label),
-    )
-    .await
-    {
-        Ok(clean) => clean,
-        Err(_) => {
-            debug!(
-                "Forcing cancellation of UDP {} tasks during shutdown",
-                label
-            );
-            tasks.abort_all();
-            tokio::time::timeout(
-                DRIVER_ABORT_TIMEOUT,
-                drain_registered_tasks(&mut tasks, label),
-            )
-            .await
-            .unwrap_or_else(|_| {
-                debug!("Timed out joining aborted UDP {} tasks", label);
-                false
-            })
-        }
-    }
-}
-
-/// Pool state is a single map entry per tuple: Initializing, Ready, or the
-/// exact Retiring identity that fences reuse until cleanup is acknowledged.
-pub struct UdpEndpointPool {
-    endpoints: DashMap<EndpointKey, EndpointEntry>,
-    endpoint_slots: Arc<Semaphore>,
-    global_payload_bytes: Arc<Semaphore>,
-    /// Monotonic per-reservation incarnation; used only for map ownership.
-    next_generation: AtomicU64,
-    /// Serializes initializer publication, cancellation bumps, and Ready
-    /// commits. Reservations and commits take a map entry before this gate;
-    /// cancellation takes only this gate. It is never held across await.
-    initialization_epoch: Mutex<u64>,
-    cancel_epoch: watch::Sender<u64>,
-    active_initializers: AtomicUsize,
-    initializers_empty: Notify,
-    terminal: AtomicBool,
-    slow_tasks: Mutex<TaskRegistry>,
-    drivers: Mutex<TaskRegistry>,
-    reply_socket_factory: Arc<dyn UdpReplySocketFactory>,
-    /// Sink notified whenever an endpoint is removed; the control plane uses
-    /// it to retire conntrack and tracker state exactly once.
-    remove_sink: Mutex<Option<tokio::sync::mpsc::Sender<EndpointRemoval>>>,
-    /// Bounded compensation for removals observed while the sink is full.
-    removal_dirty: Mutex<HashSet<EndpointRemoval>>,
-    active_retirements: AtomicUsize,
-    retirements_empty: Notify,
-    /// Test-only synchronous barrier at the historical publication point.
-    /// It makes the cancellation linearization regression reproducible
-    /// without introducing an await into reservation.
-    #[cfg(test)]
-    reservation_publication_hook: Mutex<Option<Arc<ReservationPublicationHook>>>,
-}
-
 impl UdpEndpointPool {
-    /// Construct a max-capacity pool for tests and standalone callers.
-    pub fn new() -> Self {
-        Self::with_capacity_limit(MAX_ENDPOINTS)
-    }
-
-    /// Construct a pool with an explicit endpoint cap.
-    pub fn with_capacity_limit(capacity_limit: usize) -> Self {
-        Self::with_reply_socket_factory(
-            capacity_limit.min(MAX_ENDPOINTS),
-            Arc::new(SystemUdpReplySocketFactory),
-        )
-    }
-
-    /// Dependency injection seam for synchronous anyfrom creation. The first
-    /// socket is created before the driver starts; accepted alternate reply
-    /// sources use the same factory lazily in the driver.
-    pub(super) fn with_reply_socket_factory(
-        capacity_limit: usize,
-        reply_socket_factory: Arc<dyn UdpReplySocketFactory>,
-    ) -> Self {
-        let (cancel_epoch, _) = watch::channel(0u64);
-        Self {
-            endpoints: DashMap::new(),
-            endpoint_slots: Arc::new(Semaphore::new(capacity_limit)),
-            global_payload_bytes: Arc::new(Semaphore::new(GLOBAL_PAYLOAD_CAPACITY)),
-            next_generation: AtomicU64::new(1),
-            initialization_epoch: Mutex::new(0),
-            cancel_epoch,
-            active_initializers: AtomicUsize::new(0),
-            initializers_empty: Notify::new(),
-            terminal: AtomicBool::new(false),
-            slow_tasks: Mutex::new(TaskRegistry::default()),
-            drivers: Mutex::new(TaskRegistry::default()),
-            reply_socket_factory,
-            remove_sink: Mutex::new(None),
-            removal_dirty: Mutex::new(HashSet::new()),
-            active_retirements: AtomicUsize::new(0),
-            retirements_empty: Notify::new(),
-            #[cfg(test)]
-            reservation_publication_hook: Mutex::new(None),
-        }
-    }
-
     #[cfg(test)]
-    fn set_reservation_publication_hook(&self, hook: Option<Arc<ReservationPublicationHook>>) {
+    pub(super) fn set_reservation_publication_hook(
+        &self,
+        hook: Option<Arc<ReservationPublicationHook>>,
+    ) {
         *self.reservation_publication_hook.lock() = hook;
     }
 
     #[cfg(test)]
-    fn pause_after_reservation_publication(&self) {
+    pub(super) fn pause_after_reservation_publication(&self) {
         let hook = self.reservation_publication_hook.lock().clone();
         if let Some(hook) = hook {
             hook.published.wait();
             hook.resume.wait();
         }
-    }
-
-    pub(super) fn create_reply_socket(&self, source: SocketAddr) -> io::Result<UdpSocket> {
-        self.reply_socket_factory.create(source)
-    }
-
-    pub(crate) fn set_remove_sink(&self, tx: tokio::sync::mpsc::Sender<EndpointRemoval>) {
-        *self.remove_sink.lock() = Some(tx);
-        self.flush_removal_dirty();
-    }
-
-    pub(super) fn flush_removal_dirty(&self) {
-        let Some(tx) = self.remove_sink.lock().clone() else {
-            return;
-        };
-        let mut dirty = self.removal_dirty.lock();
-        dirty.retain(|removal| match tx.try_send(removal.clone()) {
-            Ok(()) => false,
-            Err(mpsc::error::TrySendError::Full(_)) | Err(mpsc::error::TrySendError::Closed(_)) => {
-                true
-            }
-        });
-    }
-
-    async fn drain_removal_dirty(&self) {
-        let Some(tx) = self.remove_sink.lock().clone() else {
-            return;
-        };
-        let pending = std::mem::take(&mut *self.removal_dirty.lock());
-        for removal in pending {
-            if tx.send(removal).await.is_err() {
-                break;
-            }
-        }
-    }
-
-    fn notify_removed(
-        &self,
-        client: SocketAddr,
-        dst: SocketAddr,
-        conn_id: Option<String>,
-        reason: RemovalReason,
-        decision_token: u32,
-        generation: u64,
-    ) {
-        let removal = EndpointRemoval {
-            client,
-            dst,
-            decision_token,
-            generation,
-            conn_id,
-            reason,
-        };
-        #[cfg(test)]
-        if self.remove_sink.lock().is_none() {
-            self.complete_removal(client, dst, decision_token, generation);
-            return;
-        }
-        let delivered = self
-            .remove_sink
-            .lock()
-            .as_ref()
-            .is_some_and(|tx| tx.try_send(removal.clone()).is_ok());
-        if !delivered {
-            self.removal_dirty.lock().insert(removal);
-        }
-        self.flush_removal_dirty();
     }
 
     fn packet_permits(
@@ -1168,7 +703,7 @@ impl UdpEndpointPool {
     /// Atomically reserve a cold tuple or synchronously enqueue onto its
     /// existing Initializing/Ready incarnation. No map or std-mutex guard is
     /// held across await because this entire operation is synchronous.
-    pub(super) fn reserve_or_enqueue(
+    pub(in crate::control) fn reserve_or_enqueue(
         self: &Arc<Self>,
         client: SocketAddr,
         dst: SocketAddr,
@@ -1240,7 +775,7 @@ impl UdpEndpointPool {
     /// A fresh call uses `None`; followers name the exact published generation.
     #[cfg(any(feature = "ebpf", test))]
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn reserve_owned_or_enqueue(
+    pub(in crate::control) fn reserve_owned_or_enqueue(
         self: &Arc<Self>,
         client: SocketAddr,
         dst: SocketAddr,
@@ -1313,7 +848,7 @@ impl UdpEndpointPool {
     /// Reconstruct an expired terminal Proxy cell from the same-token live
     /// initializer or Ready entry and return its generation with the enqueue.
     #[cfg(any(feature = "ebpf", test))]
-    pub(super) fn enqueue_owned_by_token(
+    pub(in crate::control) fn enqueue_owned_by_token(
         &self,
         client: SocketAddr,
         dst: SocketAddr,
@@ -1385,7 +920,7 @@ impl UdpEndpointPool {
     /// the tuple remains fenced until the removal worker acknowledges cleanup.
     /// Terminal shutdown returns `QueueClosed` directly
     /// so the listener drops the datagram instead of attempting slow admission.
-    pub(super) fn fast_path_enqueue(
+    pub(in crate::control) fn fast_path_enqueue(
         &self,
         client: SocketAddr,
         dst: SocketAddr,
@@ -1431,7 +966,11 @@ impl UdpEndpointPool {
     }
 
     #[cfg(test)]
-    pub(super) fn get(&self, client: SocketAddr, dst: SocketAddr) -> Option<Arc<UdpEndpoint>> {
+    pub(in crate::control) fn get(
+        &self,
+        client: SocketAddr,
+        dst: SocketAddr,
+    ) -> Option<Arc<UdpEndpoint>> {
         let entry = self.endpoints.get(&EndpointKey::new(client, dst))?;
         match entry.value() {
             EndpointEntry::Ready(ready)
@@ -1444,159 +983,7 @@ impl UdpEndpointPool {
         }
     }
 
-    /// Begin exact retirement of the currently observed incarnation.
-    pub fn remove(&self, client: SocketAddr, dst: SocketAddr) {
-        let key = EndpointKey::new(client, dst);
-        let identity = self.endpoints.get(&key).and_then(|entry| {
-            (!matches!(entry.value(), EndpointEntry::Retiring { .. }))
-                .then(|| (entry.value().decision_token(), entry.value().generation()))
-        });
-        if let Some((token, generation)) = identity {
-            self.retire_if_same(key, token, generation);
-        }
-    }
-
-    #[cfg(any(feature = "ebpf", test))]
-    pub(super) fn retire_staged_identity(
-        &self,
-        client: SocketAddr,
-        dst: SocketAddr,
-        decision_token: u32,
-        generation: u64,
-    ) -> bool {
-        decision_token != 0
-            && self.retire_if_same(EndpointKey::new(client, dst), decision_token, generation)
-    }
-
-    /// Replace only the exact live incarnation with its removal tombstone.
-    fn retire_if_same(&self, key: EndpointKey, token: u32, generation: u64) -> bool {
-        let entry = match self.endpoints.entry(key) {
-            dashmap::mapref::entry::Entry::Occupied(mut occupied)
-                if occupied.get().matches_identity(generation, token)
-                    && !matches!(occupied.get(), EndpointEntry::Retiring { .. }) =>
-            {
-                if let EndpointEntry::Initializing(initializing) = occupied.get() {
-                    initializing.cancel();
-                }
-                self.active_retirements.fetch_add(1, Ordering::AcqRel);
-                occupied.insert(EndpointEntry::Retiring { generation, token })
-            }
-            _ => return false,
-        };
-        let conn_id = entry.retire();
-        drop(entry);
-        self.notify_removed(
-            SocketAddr::new(key.client_ip(), key.client_port),
-            SocketAddr::new(key.dst_ip(), key.dst_port),
-            conn_id,
-            RemovalReason::UserspaceEndpointRetired,
-            token,
-            generation,
-        );
-        true
-    }
-
-    /// Acknowledge backend/tracker cleanup and delete only its exact tombstone.
-    pub(crate) fn complete_removal(
-        &self,
-        client: SocketAddr,
-        dst: SocketAddr,
-        decision_token: u32,
-        generation: u64,
-    ) -> bool {
-        let key = EndpointKey::new(client, dst);
-        let removed = match self.endpoints.entry(key) {
-            dashmap::mapref::entry::Entry::Occupied(occupied)
-                if matches!(
-                    occupied.get(),
-                    EndpointEntry::Retiring { generation: found, token }
-                        if *found == generation && *token == decision_token
-                ) =>
-            {
-                occupied.remove();
-                true
-            }
-            _ => false,
-        };
-        if removed && self.active_retirements.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.retirements_empty.notify_waiters();
-        }
-        removed
-    }
-
-    /// Retire Ready and bound-Initializing mappings for a dead node.
-    /// Only Initializing entries whose finalized winner is `node_id` are
-    /// removed; an unbound reservation is still awaiting a winner. Removal is
-    /// generation-safe.
-    pub fn remove_by_node(&self, node_id: uuid::Uuid) {
-        let stale: Vec<(EndpointKey, u32, u64)> = self
-            .endpoints
-            .iter()
-            .filter_map(|entry| match entry.value() {
-                EndpointEntry::Ready(ready) if ready.endpoint.node_id == node_id => {
-                    Some((*entry.key(), ready.decision_token, ready.generation))
-                }
-                EndpointEntry::Initializing(initializing)
-                    if initializing.selected_node_is(node_id) =>
-                {
-                    Some((
-                        *entry.key(),
-                        initializing.decision_token,
-                        initializing.generation,
-                    ))
-                }
-                _ => None,
-            })
-            .collect();
-        let removed = stale
-            .into_iter()
-            .filter(|(key, token, generation)| self.retire_if_same(*key, *token, *generation))
-            .count();
-        if removed != 0 {
-            debug!(
-                "Removed {} UDP endpoints bound to dead node {}",
-                removed, node_id
-            );
-        }
-    }
-
-    /// The driver owns liveness and removes its mapping on reply timeout or
-    /// I/O failure. Keep this janitor as a conservative backstop for entries
-    /// whose reply task has already released its reference.
-    pub fn janitor_cycle(&self) -> usize {
-        let stale: Vec<(EndpointKey, u32, u64)> = self
-            .endpoints
-            .iter()
-            .filter_map(|entry| match entry.value() {
-                EndpointEntry::Ready(ready)
-                    if ready.endpoint.ref_count() <= 0 && ready.endpoint.is_expired() =>
-                {
-                    Some((*entry.key(), ready.decision_token, ready.generation))
-                }
-                _ => None,
-            })
-            .collect();
-        let removed = stale
-            .iter()
-            .filter(|(key, token, generation)| self.retire_if_same(*key, *token, *generation))
-            .count();
-        if removed > 0 {
-            debug!("UDP endpoint janitor removed {} expired endpoints", removed);
-        }
-        removed
-    }
-
-    pub fn spawn_janitor(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
-        let pool = Arc::clone(self);
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(JANITOR_INTERVAL).await;
-                pool.janitor_cycle();
-            }
-        })
-    }
-
-    fn advance_initialization_epoch(&self, terminal: bool) {
+    pub(super) fn advance_initialization_epoch(&self, terminal: bool) {
         // This synchronous gate is the cancellation linearization point. It
         // is shared with reservation publication and commit_ready, and is
         // released before waiting for leases to drop.
@@ -1614,7 +1001,7 @@ impl UdpEndpointPool {
         debug_assert_ne!(next, 0);
     }
 
-    async fn wait_for_initializers(&self) -> bool {
+    pub(super) async fn wait_for_initializers(&self) -> bool {
         let wait = async {
             loop {
                 if self.active_initializers.load(Ordering::Acquire) == 0 {
@@ -1632,25 +1019,7 @@ impl UdpEndpointPool {
             .is_ok()
     }
 
-    pub(super) async fn wait_for_retirements(&self) -> bool {
-        let wait = async {
-            loop {
-                if self.active_retirements.load(Ordering::Acquire) == 0 {
-                    return;
-                }
-                let notified = self.retirements_empty.notified();
-                if self.active_retirements.load(Ordering::Acquire) == 0 {
-                    return;
-                }
-                notified.await;
-            }
-        };
-        tokio::time::timeout(Duration::from_secs(5), wait)
-            .await
-            .is_ok()
-    }
-
-    pub(super) fn spawn_slow_path<F>(&self, future: F) -> bool
+    pub(in crate::control) fn spawn_slow_path<F>(&self, future: F) -> bool
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
@@ -1669,112 +1038,8 @@ impl UdpEndpointPool {
         true
     }
 
-    pub(super) async fn cancel_initializers_and_wait(&self) -> bool {
+    pub(in crate::control) async fn cancel_initializers_and_wait(&self) -> bool {
         self.advance_initialization_epoch(false);
         self.wait_for_initializers().await
     }
-
-    /// Terminally close UDP admission, retire every mapping, and wait for all
-    /// generation-owned slow-path tasks and endpoint drivers. The removal sink
-    /// is closed only after task cleanup has completed so its consumer can
-    /// drain before the control plane tears down generic background tasks.
-    pub(super) async fn shutdown(&self) -> bool {
-        self.advance_initialization_epoch(true);
-        let slow_tasks = {
-            let mut tasks = self.slow_tasks.lock();
-            tasks.closed = true;
-            std::mem::take(&mut tasks.tasks)
-        };
-        {
-            let mut drivers = self.drivers.lock();
-            drivers.closed = true;
-        }
-
-        let initializers_graceful = self.wait_for_initializers().await;
-        let slow_tasks_clean = join_registered_tasks(
-            slow_tasks,
-            "slow-path",
-            DRIVER_ABORT_TIMEOUT,
-            !initializers_graceful,
-        )
-        .await;
-        let initializers_clean =
-            slow_tasks_clean && self.active_initializers.load(Ordering::Acquire) == 0;
-
-        let stale: Vec<(EndpointKey, u32, u64)> = self
-            .endpoints
-            .iter()
-            .filter_map(|entry| match entry.value() {
-                EndpointEntry::Initializing(initializing) => Some((
-                    *entry.key(),
-                    initializing.decision_token,
-                    initializing.generation,
-                )),
-                EndpointEntry::Ready(ready) => {
-                    Some((*entry.key(), ready.decision_token, ready.generation))
-                }
-                EndpointEntry::Retiring { .. } => None,
-            })
-            .collect();
-        for (key, token, generation) in stale {
-            self.retire_if_same(key, token, generation);
-        }
-
-        let driver_tasks = {
-            let mut drivers = self.drivers.lock();
-            std::mem::take(&mut drivers.tasks)
-        };
-        let drivers_clean = join_registered_tasks(
-            driver_tasks,
-            "endpoint driver",
-            DRIVER_SHUTDOWN_TIMEOUT,
-            false,
-        )
-        .await;
-
-        self.drain_removal_dirty().await;
-        let retirements_clean = self.wait_for_retirements().await;
-        self.remove_sink.lock().take();
-        initializers_clean && drivers_clean && retirements_clean
-    }
-
-    #[cfg(test)]
-    pub(super) fn len(&self) -> usize {
-        self.endpoints.len()
-    }
-
-    #[cfg(test)]
-    pub(super) fn is_empty(&self) -> bool {
-        self.endpoints.is_empty()
-    }
-
-    #[cfg(test)]
-    fn is_terminal(&self) -> bool {
-        self.terminal.load(Ordering::Acquire)
-    }
-
-    #[cfg(test)]
-    fn slow_task_count(&self) -> usize {
-        self.slow_tasks.lock().tasks.len()
-    }
-
-    #[cfg(test)]
-    fn driver_count(&self) -> usize {
-        self.drivers.lock().tasks.len()
-    }
 }
-
-impl Default for UdpEndpointPool {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-mod driver;
-
-#[cfg(test)]
-use driver::{UdpDriverContext, UdpDriverStart, run_endpoint_driver};
-use driver::{monotonic_nanos, nanos_from_dur};
-
-#[cfg(test)]
-mod tests;
