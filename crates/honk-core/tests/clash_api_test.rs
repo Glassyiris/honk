@@ -796,7 +796,7 @@ async fn test_group_delay_omits_failed_members() {
     let client = http_client();
     let http_addr = spawn_mock_http_server().await;
 
-    // Pre-seed latency history; a failed measurement must clear it.
+    // Pre-seed latency history; two consecutive failures replace it with a penalty.
     app.state.alive_set.record_probe_latency(
         make_node("node-a").id,
         ProbeDomain::Tcp,
@@ -807,21 +807,23 @@ async fn test_group_delay_omits_failed_members() {
     // The URL is https but the server speaks plaintext HTTP: the TLS
     // handshake fails, so both members are omitted from the result.
     let url = format!("https://{}/", http_addr);
-    let resp = client
-        .get(app.url(&format!("/group/proxy/delay?url={}&timeout=3000", url)))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let body: serde_json::Value = resp.json().await.unwrap();
-    let map = body.as_object().unwrap();
-    assert!(
-        !map.contains_key("node-a") && !map.contains_key("node-b"),
-        "failed members must be omitted, got: {map:?}"
-    );
+    for _ in 0..2 {
+        let resp = client
+            .get(app.url(&format!("/group/proxy/delay?url={}&timeout=3000", url)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let map = body.as_object().unwrap();
+        assert!(
+            !map.contains_key("node-a") && !map.contains_key("node-b"),
+            "failed members must be omitted, got: {map:?}"
+        );
+    }
 
-    // Failure replaced the seeded history with the synthetic penalty sample,
-    // so the node can no longer rank by its stale 123ms.
+    // Consecutive failures replaced the seeded history with the synthetic
+    // penalty sample, so the node can no longer rank by its stale 123ms.
     assert_eq!(
         app.state.alive_set.get_last_latency(
             make_node("node-a").id,
@@ -914,9 +916,9 @@ async fn test_node_delay_failure_is_503() {
 }
 
 /// Nested groups on the delay endpoints: `/group/{name}/delay` flattens
-/// sub-group members to their representative leaves (failures clear the
-/// LEAF's latency history), and `/proxies/{subgroup-tag}/delay` works
-/// through the group branch.
+/// sub-group members to their representative leaves (consecutive failures
+/// replace the leaf's latency history with a penalty), and
+/// `/proxies/{subgroup-tag}/delay` works through the group branch.
 #[tokio::test]
 async fn test_nested_group_delay_endpoints() {
     let (a, b) = (make_node("node-a"), make_node("node-b"));
@@ -941,8 +943,8 @@ async fn test_nested_group_delay_endpoints() {
     let app = spawn_app_with_config(config, "", "").await;
     let client = http_client();
 
-    // Seed latency on the sub-group's leaf: a failed measurement of the
-    // parent must clear it (proof the leaf was actually measured).
+    // Seed latency on the sub-group's leaf: two failed measurements of the
+    // parent must penalize it (proof the leaf was actually measured).
     app.state.alive_set.record_probe_latency(
         make_node("node-b").id,
         ProbeDomain::Tcp,
@@ -950,18 +952,20 @@ async fn test_nested_group_delay_endpoints() {
         Duration::from_millis(55),
     );
 
-    let resp = client
-        .get(app.url("/group/parent/delay?url=https://127.0.0.1:1/&timeout=1000"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let body: serde_json::Value = resp.json().await.unwrap();
-    let map = body.as_object().unwrap();
-    assert!(
-        !map.contains_key("node-a") && !map.contains_key("sub"),
-        "failed members must be omitted, got: {map:?}"
-    );
+    for _ in 0..2 {
+        let resp = client
+            .get(app.url("/group/parent/delay?url=https://127.0.0.1:1/&timeout=1000"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let map = body.as_object().unwrap();
+        assert!(
+            !map.contains_key("node-a") && !map.contains_key("sub"),
+            "failed members must be omitted, got: {map:?}"
+        );
+    }
     assert_eq!(
         app.state.alive_set.get_last_latency(
             make_node("node-b").id,

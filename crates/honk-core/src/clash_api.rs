@@ -637,7 +637,7 @@ fn delay_ms(d: Duration) -> u64 {
 
 /// GET /proxies/{name}/delay — live latency measurement (HEAD request
 /// through the node / group members). Successes refresh the alive-set
-/// latency history; failures clear it and return 503.
+/// latency history; failures record a dial failure and return 503.
 async fn get_proxy_delay(
     State(s): State<Arc<ClashState>>,
     Path(name): Path<String>,
@@ -672,9 +672,9 @@ async fn get_proxy_delay(
                 Json(serde_json::json!({"delay": delay_ms(latency)})).into_response()
             }
             Err(e) => {
-                // sing-box deletes the node's latency history on failure;
-                // the synthetic penalty sample keeps a flaky node from
-                // instantly re-ranking first.
+                // Two consecutive failures append the synthetic penalty
+                // sample, keeping a flaky node from instantly re-ranking
+                // first without penalizing one transient failure.
                 s.alive_set
                     .record_dial_failure(node.id, ProbeDomain::Tcp, IpVersion::V4);
                 error_response(
