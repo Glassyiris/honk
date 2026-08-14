@@ -399,6 +399,12 @@ fn validate_udp_nfqueue_runtime(enabled: bool, mock_ebpf: bool) -> anyhow::Resul
     Ok(())
 }
 
+fn ensure_runtime_data_dir(path: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(path).map_err(|error| {
+        anyhow::anyhow!("create runtime data directory {}: {error}", path.display())
+    })
+}
+
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // Load the configuration before initializing logging so `log_level` in
     // the config file is honored (previously only --debug/RUST_LOG had any
@@ -415,6 +421,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             )
         },
     )?;
+    ensure_runtime_data_dir(honk_config::paths::data_dir())?;
     // Make `direct`/`block` usable as group members without declaring them
     // in the config (Direct/Block protocols → DirectHandler/BlockHandler).
     config.ensure_builtin_nodes();
@@ -1956,7 +1963,8 @@ fn is_mountpoint(path: &str) -> bool {
 #[cfg(test)]
 mod startup_lifecycle_tests {
     use super::{
-        ClashCommand, Cli, publish_instance_pid, running_instance_pid, validate_udp_nfqueue_runtime,
+        ClashCommand, Cli, ensure_runtime_data_dir, publish_instance_pid, running_instance_pid,
+        validate_udp_nfqueue_runtime,
     };
     use clap::Parser;
 
@@ -1978,6 +1986,17 @@ mod startup_lifecycle_tests {
             honk_config::routing::DATAPATH_RESERVED_MARK_MASK,
             honk_ebpf_common::SKB_MARK_RESERVED_MASK,
         );
+    }
+
+    #[test]
+    fn missing_runtime_data_directory_is_created() {
+        let root = tempfile::tempdir().expect("create temporary directory");
+        let data_dir = root.path().join("nested/data");
+        assert!(!data_dir.exists());
+
+        ensure_runtime_data_dir(&data_dir).expect("create runtime data directory");
+
+        assert!(data_dir.is_dir());
     }
 
     #[test]
