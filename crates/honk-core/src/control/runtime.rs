@@ -352,70 +352,7 @@ impl ControlPlane {
             info!("Connection pool janitor started");
         }
 
-        // Pre-establish TCP connections to configured proxy nodes so the
-        // first real connection hits a warm pool instead of paying the
-        // full TCP+TLS+handshake RTT on the critical path.
-        {
-            let config = self.config.read().await;
-            let count = config.global.preconnect_node_count;
-            let connect_timeout =
-                std::time::Duration::from_millis(config.global.connect_timeout_ms);
-            let max_concurrent = if count == honk_config::config::PRECONNECT_NODE_COUNT_AUTO {
-                4usize
-            } else {
-                count.min(8)
-            };
-            let nodes = {
-                let manager = self.group_manager.read().clone();
-                preconnect_candidates(&config, &manager, count)
-            };
-            drop(config);
-
-            if !nodes.is_empty() {
-                let node_count = nodes.len();
-                let pool = self.connection_pool.clone();
-                let stats = self.stats.clone();
-                let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
-                let handle = tokio::spawn(async move {
-                    let mut set = tokio::task::JoinSet::new();
-                    for node in nodes {
-                        let addr = format!("{}:{}", node.host(), node.port);
-                        let pool = pool.clone();
-                        let stats = stats.clone();
-                        let sem = semaphore.clone();
-                        set.spawn(async move {
-                            let _permit = sem.acquire_owned().await;
-                            match honk_outbound::util::connect_outbound(&addr, connect_timeout)
-                                .await
-                            {
-                                Ok(stream) => {
-                                    if is_tcp_stream_alive(&stream) {
-                                        pool.deposit_tcp(&addr, stream).await;
-                                        stats.mark_warm(
-                                            node.id,
-                                            crate::stats::WarmReason::Preconnect,
-                                        );
-                                        debug!(
-                                            "Preconnect warmup: deposited connection to {}",
-                                            addr
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    debug!("Preconnect warmup to {} failed: {}", addr, e);
-                                }
-                            }
-                        });
-                    }
-                    while set.join_next().await.is_some() {}
-                });
-                self.background_tasks.lock().await.push(handle);
-                info!(
-                    "Preconnect warmup started for {} nodes (max {} concurrent)",
-                    node_count, max_concurrent
-                );
-            }
-        }
+        self.start_preconnect().await;
 
         // Warm coordinators start only after group/runtime setup and retain
         // this exact registry Arc for their complete lifetime.

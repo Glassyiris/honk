@@ -350,4 +350,5 @@ pub(crate) fn direct_check_addr(bootstrap_resolver: &str) -> String {
     }
 }
 
-pub(super) use preconnect::preconnect_candidates;
+#[cfg(test)]
+use preconnect::preconnect_candidates;
