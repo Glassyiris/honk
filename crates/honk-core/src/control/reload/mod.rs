@@ -1,26 +1,9 @@
 use super::*;
 mod connectivity;
+mod subscription;
 mod transaction;
 mod warm;
 
-impl ControlPlane {
-    /// Merge freshly fetched subscription nodes into the running config,
-    /// replacing the previous node set of `subscription_id`, and run the
-    /// shared rebuild pipeline.
-    ///
-    /// Production callers go through `ControlCommand::MergeSubscription` on
-    /// the command channel (which keeps merges serialized against SIGHUP
-    /// reloads); this public wrapper exists so integration tests can drive a
-    /// merge without binding the TPROXY accept loop.
-    pub async fn merge_subscription_nodes(&self, subscription_id: uuid::Uuid, nodes: Vec<Node>) {
-        let new_config = {
-            let current = self.config.read().await;
-            config_with_subscription_nodes(&current, subscription_id, nodes)
-        };
-        let drain = DrainTracker::new();
-        self.apply_runtime_config(new_config, &drain).await;
-    }
-}
 /// Fields whose current consumers are process-scoped and therefore cannot be
 /// swapped safely by the runtime generation publication. A rejected reload
 /// has not mutated any live state.
@@ -32,7 +15,7 @@ pub(in crate::control) use warm::{
     warm_selector_candidate,
 };
 
-pub(super) use super::reload_subscription::config_with_subscription_nodes;
+pub(in crate::control) use subscription::config_with_subscription_nodes;
 
 pub(in crate::control) use connectivity::{
     build_outbound_id_map, group_check_url_registrations, group_connectivity_snapshot,
