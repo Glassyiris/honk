@@ -15,7 +15,7 @@ honk-core [OPTIONS] [COMMAND]
 | Option | Default | Effect |
 | --- | --- | --- |
 | `-c`, `--config PATH` | `/etc/honk/config.dae` | Configuration entry file. `mode`, `proxy`, and `delay` also read this path. `reload` ignores it and signals the running instance, which reloads its own startup path. |
-| `--log-file PATH` | Unset | Override `global.log_file` for this engine process without rewriting the configuration. Relative paths resolve below `global.data_dir`; console logging remains enabled. |
+| `--log-file PATH` | Unset | Override `global.log_file` for this engine process without rewriting the configuration. Relative paths resolve below `global.data_dir`; console logging remains enabled. While set, SIGHUP ignores changes to the shadowed config value unless the effective destination changes. |
 | `-b`, `--bpf-object PATH` | Embedded object | Override the object embedded by an `ebpf` build. Used only by the real backend. |
 | `--bpf-pin-root PATH` | `/sys/fs/bpf` | Root for pinned eBPF maps. |
 | `-d`, `--debug` | Off | Select `debug` as the default console filter when `RUST_LOG` does not provide a valid filter. |

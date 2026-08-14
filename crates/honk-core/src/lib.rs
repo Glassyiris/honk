@@ -399,21 +399,93 @@ fn validate_udp_nfqueue_runtime(enabled: bool, mock_ebpf: bool) -> anyhow::Resul
     Ok(())
 }
 
+fn probe_runtime_data_dir(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    std::fs::create_dir_all(path)?;
+    if !std::fs::metadata(path)?.is_dir() {
+        return Err(std::io::Error::other(
+            "runtime data path is not a directory",
+        ));
+    }
+
+    let probe = path.join(format!(
+        ".honk-write-probe-{}",
+        uuid::Uuid::new_v4().as_simple()
+    ));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&probe)?;
+    drop(file);
+    std::fs::remove_file(probe)
+}
+
+fn prepare_runtime_data_dir_with_fallback(
+    requested: &std::path::Path,
+    fallback: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> anyhow::Result<(PathBuf, Option<std::io::Error>)> {
+    let requested_error = match probe_runtime_data_dir(requested) {
+        Ok(()) => return Ok((requested.to_path_buf(), None)),
+        Err(error) => error,
+    };
+    let fallback = fallback().map_err(|fallback_error| {
+        anyhow::anyhow!(
+            "runtime data directory {} is unusable: {requested_error}; determine fallback working directory: {fallback_error}",
+            requested.display()
+        )
+    })?;
+    probe_runtime_data_dir(&fallback).map_err(|fallback_error| {
+        anyhow::anyhow!(
+            "runtime data directory {} is unusable: {requested_error}; fallback {} is unusable: {fallback_error}",
+            requested.display(),
+            fallback.display()
+        )
+    })?;
+    Ok((fallback, Some(requested_error)))
+}
+
 fn prepare_runtime_data_dir(
     requested: &std::path::Path,
 ) -> anyhow::Result<(PathBuf, Option<std::io::Error>)> {
-    match std::fs::create_dir_all(requested) {
-        Ok(()) => Ok((requested.to_path_buf(), None)),
-        Err(create_error) => {
-            let fallback = std::env::current_dir().map_err(|fallback_error| {
-                anyhow::anyhow!(
-                    "create runtime data directory {}: {create_error}; determine fallback working directory: {fallback_error}",
-                    requested.display()
-                )
-            })?;
-            Ok((fallback, Some(create_error)))
-        }
+    prepare_runtime_data_dir_with_fallback(requested, std::env::current_dir)
+}
+
+fn resolved_log_file_path(
+    config: &Config,
+    cli_override: Option<&std::path::Path>,
+) -> Option<PathBuf> {
+    cli_override
+        .map(honk_config::paths::resolve_artifact_path)
+        .or_else(|| match config.global.log_file.trim() {
+            "" => None,
+            path => Some(honk_config::paths::resolve_artifact_path(path)),
+        })
+}
+
+fn open_log_file(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            anyhow::anyhow!("create log directory {}: {error}", parent.display())
+        })?;
     }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| anyhow::anyhow!("open log file {}: {error}", path.display()))?;
+    anyhow::ensure!(
+        file.metadata()?.is_file(),
+        "log destination is not a regular file: {}",
+        path.display()
+    );
+    Ok(file)
 }
 
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
@@ -450,25 +522,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level));
 
-    let log_file_path = cli
-        .log_file
-        .as_deref()
-        .map(honk_config::paths::resolve_artifact_path)
-        .or_else(|| match config.global.log_file.trim() {
-            "" => None,
-            path => Some(honk_config::paths::resolve_artifact_path(path)),
-        });
+    let log_file_path = resolved_log_file_path(&config, cli.log_file.as_deref());
     let log_file_layer = if let Some(path) = log_file_path.as_ref() {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| {
-                anyhow::anyhow!("create log directory {}: {error}", parent.display())
-            })?;
-        }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .map_err(|error| anyhow::anyhow!("open log file {}: {error}", path.display()))?;
+        let file = open_log_file(path)?;
         Some(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
@@ -499,11 +555,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             requested = %requested_data_dir.display(),
             fallback = %honk_config::paths::data_dir().display(),
             %error,
-            "Failed to create runtime data directory; using process working directory"
+            "Runtime data directory is unusable; using process working directory"
         );
     }
     info!(directory = %honk_config::paths::data_dir().display(), "Runtime data directory configured");
-    if let Some(path) = log_file_path {
+    if let Some(path) = log_file_path.as_ref() {
         info!(path = %path.display(), "File logging enabled");
     }
 
@@ -1012,6 +1068,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         dns_upstream_pool.clone(),
         resource_budget,
     )?;
+    control_plane.set_log_file_override(cli.log_file.clone(), log_file_path);
 
     #[cfg(feature = "ebpf")]
     let iface_watcher = if !cli.mock_ebpf {
@@ -1982,7 +2039,8 @@ fn is_mountpoint(path: &str) -> bool {
 #[cfg(test)]
 mod startup_lifecycle_tests {
     use super::{
-        ClashCommand, Cli, prepare_runtime_data_dir, publish_instance_pid, running_instance_pid,
+        ClashCommand, Cli, open_log_file, prepare_runtime_data_dir,
+        prepare_runtime_data_dir_with_fallback, publish_instance_pid, running_instance_pid,
         validate_udp_nfqueue_runtime,
     };
     use clap::Parser;
@@ -2019,22 +2077,94 @@ mod startup_lifecycle_tests {
         assert_eq!(effective, data_dir);
         assert!(error.is_none());
         assert!(effective.is_dir());
+        assert_eq!(std::fs::read_dir(&effective).unwrap().count(), 0);
     }
 
     #[test]
-    fn data_directory_creation_failure_uses_working_directory() {
+    fn runtime_data_directory_symlink_remains_usable() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("create temporary directory");
+        let target = root.path().join("data");
+        let link = root.path().join("data-link");
+        std::fs::create_dir(&target).expect("create data directory");
+        symlink(&target, &link).expect("create data directory symlink");
+
+        let (effective, error) = prepare_runtime_data_dir_with_fallback(&link, || {
+            Ok(root.path().join("unused-fallback"))
+        })
+        .expect("prepare symlinked runtime data directory");
+        assert_eq!(effective, link);
+        assert!(error.is_none());
+    }
+
+    #[test]
+    fn existing_read_only_data_directory_uses_writable_fallback() {
+        let fallback = tempfile::tempdir().expect("create fallback directory");
+
+        let (effective, error) =
+            prepare_runtime_data_dir_with_fallback(std::path::Path::new("/proc"), || {
+                Ok(fallback.path().to_path_buf())
+            })
+            .expect("prepare fallback data directory");
+
+        assert_eq!(effective, fallback.path());
+        assert!(error.is_some());
+    }
+
+    #[test]
+    fn unusable_data_directory_and_fallback_preserve_both_errors() {
         let root = tempfile::tempdir().expect("create temporary directory");
         let invalid = root.path().join("not-a-directory");
         std::fs::write(&invalid, "file").expect("create blocking file");
 
-        let (effective, error) =
-            prepare_runtime_data_dir(&invalid).expect("prepare fallback data directory");
+        let error = prepare_runtime_data_dir_with_fallback(&invalid, || {
+            Ok(std::path::PathBuf::from("/proc"))
+        })
+        .expect_err("reject unusable fallback");
+        let message = error.to_string();
+        assert!(message.contains(&invalid.display().to_string()));
+        assert!(message.contains("/proc"));
+        assert!(message.contains("fallback"));
+    }
 
+    #[test]
+    fn new_log_file_is_private_regular_and_existing_mode_is_preserved() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().expect("create temporary directory");
+        let path = root.path().join("logs/honk.log");
+        drop(open_log_file(&path).expect("create log file"));
+        let metadata = std::fs::metadata(&path).expect("read log metadata");
+        assert!(metadata.is_file());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))
+            .expect("set existing log permissions");
+        drop(open_log_file(&path).expect("reopen existing log file"));
         assert_eq!(
-            effective,
-            std::env::current_dir().expect("read working directory")
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
         );
-        assert!(error.is_some());
+    }
+
+    #[test]
+    fn log_symlink_is_rejected_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("create temporary directory");
+        let target = root.path().join("target.log");
+        let link = root.path().join("honk.log");
+        std::fs::write(&target, "unchanged").expect("create target");
+        symlink(&target, &link).expect("create log symlink");
+
+        assert!(open_log_file(&link).is_err());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "unchanged");
+    }
+
+    #[test]
+    fn non_regular_log_destination_is_rejected() {
+        assert!(open_log_file(std::path::Path::new("/dev/null")).is_err());
     }
 
     #[test]

@@ -42,7 +42,7 @@ include {
 
 ## 运行时数据目录
 
-`global.data_dir` 是运行时状态与相对运行时资源的进程级根目录。默认值为 `/var/share/honk`，必须是非空绝对路径，修改后需重启。目录不存在时，honk 会在启动阶段递归创建；创建失败时会记录警告并改用进程工作目录。相对的 `global.log_file`、`experimental.cache_file.path`、`experimental.clash_api.external_ui`、`.sub` 订阅存储、`geoip.dat`、`geosite.dat` 与节点 `ech_config_path` 均在实际生效的目录下解析；绝对子路径保持原样。若首选的数据目录副本不存在，honk 会继续使用入口配置旁已有的旧缓存、已有 `./.sub`、或工作目录中已有的 UI/ECH 路径，直至手动迁移。Geo 查找首先使用已存在的 `$DAE_LOCATION_ASSET/<file>`，随后检查实际生效的数据目录、工作目录与 dae 标准资源目录。
+`global.data_dir` 是运行时状态与相对运行时资源的进程级根目录。默认值为 `/var/share/honk`，必须是非空绝对路径，修改后需重启。启动时 honk 会递归创建目录，再以 create-new 方式创建并删除一个私有随机探测文件，且不跟随探测文件的符号链接。候选目录不可用时，只有通过同一探测的进程工作目录才能作为回退；两者均不可用时启动失败并保留两项原因。相对的 `global.log_file`、`experimental.cache_file.path`、`experimental.clash_api.external_ui`、`.sub` 订阅存储、`geoip.dat`、`geosite.dat` 与节点 `ech_config_path` 均在实际生效的目录下解析；绝对子路径保持原样。若首选的数据目录副本不存在，honk 会继续使用入口配置旁已有的旧缓存、已有 `./.sub`、或工作目录中已有的 UI/ECH 路径，直至手动迁移。Geo 查找首先使用已存在的 `$DAE_LOCATION_ASSET/<file>`，随后检查实际生效的数据目录、工作目录与 dae 标准资源目录。
 
 详见 [Global 参考](./reference/global.md)。
 

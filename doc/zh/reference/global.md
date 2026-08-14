@@ -13,12 +13,12 @@
 | `pprof_port` | `pprof_port` | `0` | pprof HTTP 端口兼容字段；`0` 表示关闭。honk 当前不启动 pprof 服务，也不读取该字段。 |
 | `so_mark_from_dae` | `so_mark_from_dae` | `0` | 套接字 mark 兼容值。校验会拒绝与数据路径保留 mark 位重叠的值，但当前运行时不会将其应用到套接字。 |
 | `log_level` | `log_level` | `"info"` | 启动日志过滤器。优先级依次为 `--debug`、`RUST_LOG`、该值。通过 SIGHUP 修改需重启。 |
-| `log_file` | `log_file` | `""` | 可选的追加写日志路径。空值关闭文件输出；相对路径在 `data_dir` 下解析。控制台日志保持启用，通过 SIGHUP 修改需重启。 |
+| `log_file` | `log_file` | `""` | 可选的追加写日志路径。空值关闭文件输出；相对路径在 `data_dir` 下解析，控制台日志保持启用。仅当解析后的实际目标发生变化时，SIGHUP 才要求重启；`--log-file` 会遮蔽此配置值。 |
 | `disable_waiting_network` | `disable_waiting_network` | `false` | 兼容键；当前启动路径不读取该字段。未解析的 `auto` 网卡本就保持待定，不会阻塞启动。 |
 | `lan_interface` | `lan_interface` | `[]` | 拦截转发流量的 LAN 网卡，逗号分隔。空值不安装任何 LAN hook。参见[网卡语义](#网卡语义)。 |
 | `wan_interface` | `wan_interface` | `[]` | 安装 hook 以拦截本机发起 TCP/UDP 的 WAN 网卡，逗号分隔。字面值 `auto` 跟随 metric 最低的 IPv4 默认路由。 |
 | `auto_config_kernel_parameter` | `auto_config_kernel_parameter` | `false` | 自动配置 sysctl 的兼容开关。当前运行时不会按该字段分支；真实数据路径会执行固定的 best-effort sysctl 设置。 |
-| `data_dir` | `data_dir` | `"/var/share/honk"` | 生成状态和相对运行时资源的非空绝对根目录；缺失目录会在启动时递归创建，创建失败则回退到进程工作目录；修改后需重启。 |
+| `data_dir` | `data_dir` | `"/var/share/honk"` | 生成状态和相对运行时资源的非空绝对根目录。缺失目录会递归创建；每个候选目录都必须通过私有的 create-new/remove 探测。候选目录不可用时，仅回退到通过同一探测的工作目录；修改后需重启。 |
 | `store_subscribe` | `store_subscribe` | `true` | 将每个订阅最近一次有效正文持久化到 `data_dir/.sub`，供启动和重载恢复；修改后需重启。 |
 | `tcp_check_url` | `tcp_check_url` | `["https://www.gstatic.com/generate_204"]` | TCP/HTTP 健康检查 URL，逗号分隔。当前健康检查循环使用第一个值；空列表退回普通 TCP 检查。 |
 | `tcp_check_http_method` | `tcp_check_http_method` | `"HEAD"` | URL 健康检查发送的 HTTP 方法；空值按 `HEAD` 处理。 |
@@ -66,7 +66,7 @@
 
 ## 数据目录与资源路径
 
-`data_dir` 默认为 `/var/share/honk`，必须是非空绝对路径，并在进程内只设置一次。目录不存在时，honk 会在启动阶段递归创建；创建失败时会记录警告并改为使用进程工作目录。子项使用绝对路径时保持不变。
+`data_dir` 默认为 `/var/share/honk`，必须是非空绝对路径，并在进程内只设置一次。启动时 honk 会递归创建目录，并以私有随机文件执行 create-new/remove 探测。候选目录不可用时，只有通过同一探测的进程工作目录才能作为回退；两者都不可用时，启动失败并报告两项原因。子项使用绝对路径时保持不变。
 
 `geoip.dat` 和 `geosite.dat` 严格使用以下顺序中第一个存在的文件：
 
@@ -80,7 +80,7 @@
 | 路径 | 解析与旧路径回退 |
 | ---- | ---------------- |
 | 节点 `ech_config_path` | 优先使用已存在的 `<data_dir>/<path>`，其次使用已存在的工作目录相对路径。两者都不存在时解析为 `<data_dir>/<path>`，使读取错误指出预期位置。 |
-| `global.log_file` | 相对路径解析为 `<data_dir>/<path>`，启动时创建父目录；绝对路径保持原样。honk 只追加写且不负责轮转，需要时使用系统日志轮转工具。 |
+| `global.log_file` | 相对路径解析为 `<data_dir>/<path>`，启动时创建父目录；绝对路径保持原样。在 Linux 上，新日志文件使用 mode `0600`；符号链接与非普通文件会被拒绝，已有普通文件的权限保持不变。honk 只追加写且不负责轮转，需要时使用系统日志轮转工具。 |
 | `experimental.cache_file.path` | 优先使用已存在的 `<data_dir>/<path>`，其次使用相对于原始配置目录且已存在的路径。新数据库在 `data_dir` 下创建。 |
 | `experimental.clash_api.external_ui` | 优先使用已存在的 `<data_dir>/<path>`，其次使用已存在的工作目录相对目录。两者都不存在时，dashboard 下载使用 `<data_dir>/<path>`。 |
 | 订阅存储 | 使用 `<data_dir>/.sub`；已有旧 `./.sub` 会继续使用，直至迁移。 |

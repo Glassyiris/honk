@@ -97,7 +97,14 @@ impl ControlPlane {
         drain: &DrainTracker,
     ) -> bool {
         let current_config = self.config.read().await.clone();
-        let restart_required = restart_required_changes(&current_config, &new_config);
+        let candidate_log_file =
+            crate::resolved_log_file_path(&new_config, self.log_file_override.as_deref());
+        let restart_required = restart_required_changes(
+            &current_config,
+            &new_config,
+            self.effective_log_file.as_deref(),
+            candidate_log_file.as_deref(),
+        );
         if !restart_required.is_empty() {
             error!(
                 fields = ?restart_required,
@@ -659,7 +666,12 @@ impl ControlPlane {
 /// Fields whose current consumers are process-scoped and therefore cannot be
 /// swapped safely by the runtime generation publication. A rejected reload
 /// has not mutated any live state.
-fn restart_required_changes(current: &Config, candidate: &Config) -> Vec<&'static str> {
+fn restart_required_changes(
+    current: &Config,
+    candidate: &Config,
+    current_log_file: Option<&Path>,
+    candidate_log_file: Option<&Path>,
+) -> Vec<&'static str> {
     let mut changed = Vec::new();
     let dns_bind_changed = match (current.dns.bind_endpoint(), candidate.dns.bind_endpoint()) {
         (Ok(current), Ok(candidate)) => current != candidate,
@@ -688,7 +700,7 @@ fn restart_required_changes(current: &Config, candidate: &Config) -> Vec<&'stati
     if old_global.log_level != new_global.log_level {
         changed.push("global.log_level");
     }
-    if old_global.log_file != new_global.log_file {
+    if current_log_file != candidate_log_file {
         changed.push("global.log_file");
     }
     if old_global.lan_interface != new_global.lan_interface {
@@ -1697,6 +1709,17 @@ mod atomic_reload_tests {
     use crate::ebpf::mock::MockEbpfBackend;
     use crate::stats::StatsManager;
 
+    fn restart_required_changes(current: &Config, candidate: &Config) -> Vec<&'static str> {
+        let current_log_file = crate::resolved_log_file_path(current, None);
+        let candidate_log_file = crate::resolved_log_file_path(candidate, None);
+        super::restart_required_changes(
+            current,
+            candidate,
+            current_log_file.as_deref(),
+            candidate_log_file.as_deref(),
+        )
+    }
+
     #[test]
     fn subscription_store_toggle_requires_restart() {
         let current = Config::default();
@@ -1778,6 +1801,40 @@ mod atomic_reload_tests {
             restart_required_changes(&current, &replacement),
             vec!["global.log_file"]
         );
+    }
+
+    #[test]
+    fn cli_log_override_shadows_configured_log_file_change() {
+        let mut current = Config::default();
+        current.global.log_file = "old.log".into();
+        let mut replacement = current.clone();
+        replacement.global.log_file = "new.log".into();
+        let cli_override = Path::new("cli.log");
+        let current_log_file = crate::resolved_log_file_path(&current, Some(cli_override));
+        let candidate_log_file = crate::resolved_log_file_path(&replacement, Some(cli_override));
+
+        assert!(
+            super::restart_required_changes(
+                &current,
+                &replacement,
+                current_log_file.as_deref(),
+                candidate_log_file.as_deref(),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn equivalent_resolved_log_file_path_does_not_require_restart() {
+        let mut current = Config::default();
+        current.global.log_file = "honk.log".into();
+        let mut replacement = current.clone();
+        replacement.global.log_file = honk_config::paths::data_dir()
+            .join("honk.log")
+            .to_string_lossy()
+            .into_owned();
+
+        assert!(restart_required_changes(&current, &replacement).is_empty());
     }
 
     fn test_dns_forwarder() -> std::sync::Arc<dns::forwarder::DnsForwarder> {

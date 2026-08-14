@@ -51,7 +51,7 @@ use socket2::{Domain, Socket, Type};
 use std::io;
 use std::net::SocketAddr;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::Mutex;
@@ -493,6 +493,8 @@ use sockets::*;
 /// The main control plane.
 pub struct ControlPlane {
     config: Arc<RwLock<Config>>,
+    log_file_override: Option<PathBuf>,
+    effective_log_file: Option<PathBuf>,
     ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
     router: Arc<RwLock<Router>>,
     proxy_registry: Arc<ProxyRegistry>,
@@ -728,6 +730,7 @@ impl ControlPlane {
         resource_budget: ResourceBudget,
     ) -> anyhow::Result<Self> {
         let (tx, rx) = mpsc::channel(256);
+        let effective_log_file = crate::resolved_log_file_path(&config, None);
 
         // Create alive set for node health checking and pass it into the group
         // manager so dead nodes are excluded from group selection.
@@ -887,6 +890,8 @@ impl ControlPlane {
 
         let control_plane = Self {
             config: config_arc,
+            log_file_override: None,
+            effective_log_file,
             ebpf: ebpf_arc,
             router: router_arc,
             proxy_registry,
@@ -955,6 +960,14 @@ impl ControlPlane {
         control_plane.install_node_death_callback();
 
         Ok(control_plane)
+    }
+    pub(crate) fn set_log_file_override(
+        &mut self,
+        log_file_override: Option<PathBuf>,
+        effective_log_file: Option<PathBuf>,
+    ) {
+        self.log_file_override = log_file_override;
+        self.effective_log_file = effective_log_file;
     }
 
     /// Reap node-bound UDP entries as soon as a real AliveDialerSet transition
