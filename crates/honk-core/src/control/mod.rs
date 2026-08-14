@@ -28,7 +28,6 @@ mod reload_policy;
 mod reload_subscription;
 #[cfg(test)]
 mod reload_tests;
-mod reload_warm;
 mod resource_budget;
 mod runtime;
 mod shutdown;

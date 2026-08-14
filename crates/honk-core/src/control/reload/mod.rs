@@ -1,92 +1,8 @@
 use super::*;
 mod transaction;
+mod warm;
 
 impl ControlPlane {
-    /// Stop and join the prior generation's warm coordinator. Aborting the
-    /// parent drops its JoinSet, so in-flight child dispatches are cancelled
-    /// without becoming health or per-outbound error events.
-    pub(super) async fn stop_udp_warm_coordinator(&self) {
-        let handle = self.udp_warm_task.lock().await.take();
-        if let Some(handle) = handle {
-            handle.abort();
-            let _ = handle.await;
-        }
-    }
-
-    /// Start a warm coordinator bound to one immutable runtime generation.
-    /// A zero count releases the prior UDP retention set without creating a
-    /// task or touching attempt metrics. Positive counts re-rank after every
-    /// probe cycle.
-    pub(super) async fn start_udp_warm_coordinator(
-        &self,
-        generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
-    ) {
-        if generation.is_shutdown() {
-            return;
-        }
-        let count = self.config.read().await.global.udp_warm_node_count;
-        if count == 0 {
-            reconcile_udp_warm_retention(&[], &generation, &self.stats, &self.udp_warm_ids).await;
-            return;
-        }
-        let connect_timeout = {
-            let config = self.config.read().await;
-            Duration::from_millis(config.global.connect_timeout_ms)
-        };
-        let proxy_registry = self.proxy_registry.clone();
-        let dispatch = Arc::new(move |generation, node_id| {
-            let proxy_registry = proxy_registry.clone();
-            async move {
-                proxy_registry
-                    .warm_udp(generation, node_id, connect_timeout)
-                    .await
-            }
-        });
-        let handle = tokio::spawn(run_udp_warm_coordinator(
-            self.config.clone(),
-            self.group_manager.clone(),
-            generation,
-            self.stats.clone(),
-            dispatch,
-            self.udp_warm_ids.clone(),
-        ));
-        *self.udp_warm_task.lock().await = Some(handle);
-    }
-
-    pub(super) async fn stop_selector_warm_coordinator(&self) {
-        let handle = self.selector_warm_task.lock().await.take();
-        if let Some(handle) = handle {
-            handle.abort();
-            let _ = handle.await;
-        }
-    }
-
-    /// Pin every configured Selector leaf in this immutable runtime
-    /// generation. Choice changes wake the task immediately; the periodic
-    /// pass repairs independently lost sessions and consumed bare sockets.
-    pub(super) async fn start_selector_warm_coordinator(
-        &self,
-        generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
-    ) {
-        if generation.is_shutdown() {
-            return;
-        }
-        let handle = tokio::spawn(run_selector_warm_coordinator(SelectorWarmCoordinator {
-            config: self.config.clone(),
-            group_manager: self.group_manager.clone(),
-            notify: self.selector_warm_notify.clone(),
-            resources: SelectorWarmResources {
-                generation,
-                proxy_registry: self.proxy_registry.clone(),
-                connection_pool: self.connection_pool.clone(),
-                stats: self.stats.clone(),
-                selected_ids: self.selector_warm_ids.clone(),
-                bare_warm: self.selector_bare_warm.clone(),
-            },
-        }));
-        *self.selector_warm_task.lock().await = Some(handle);
-    }
-
     /// Merge freshly fetched subscription nodes into the running config,
     /// replacing the previous node set of `subscription_id`, and run the
     /// shared rebuild pipeline.
@@ -155,7 +71,11 @@ impl ControlPlane {
 /// has not mutated any live state.
 use super::reload_policy::restart_required_changes;
 
-use super::reload_warm::*;
+#[cfg(test)]
+pub(in crate::control) use warm::{
+    SelectorWarmResources, run_udp_warm_dispatches, selector_warm_candidates, udp_warm_candidates,
+    warm_selector_candidate,
+};
 
 pub(super) use super::reload_subscription::config_with_subscription_nodes;
 

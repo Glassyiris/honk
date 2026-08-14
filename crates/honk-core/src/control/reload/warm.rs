@@ -3,13 +3,15 @@ use super::*;
 const SELECTOR_WARM_RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
-pub(super) struct SelectorWarmResources {
-    pub(super) generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
-    pub(super) proxy_registry: Arc<ProxyRegistry>,
-    pub(super) connection_pool: Arc<ConnectionPool>,
-    pub(super) stats: Arc<StatsManager>,
-    pub(super) selected_ids: Arc<parking_lot::Mutex<std::collections::HashSet<uuid::Uuid>>>,
-    pub(super) bare_warm: Arc<parking_lot::Mutex<std::collections::HashMap<uuid::Uuid, String>>>,
+pub(in crate::control) struct SelectorWarmResources {
+    pub(in crate::control) generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
+    pub(in crate::control) proxy_registry: Arc<ProxyRegistry>,
+    pub(in crate::control) connection_pool: Arc<ConnectionPool>,
+    pub(in crate::control) stats: Arc<StatsManager>,
+    pub(in crate::control) selected_ids:
+        Arc<parking_lot::Mutex<std::collections::HashSet<uuid::Uuid>>>,
+    pub(in crate::control) bare_warm:
+        Arc<parking_lot::Mutex<std::collections::HashMap<uuid::Uuid, String>>>,
 }
 
 pub(super) struct SelectorWarmCoordinator {
@@ -22,7 +24,7 @@ pub(super) struct SelectorWarmCoordinator {
 /// One configured leaf per Selector, preserving config order and deduplicating
 /// nodes shared by several groups. The group manager intentionally resolves
 /// the configured choice rather than liveness-falling away from it.
-pub(super) fn selector_warm_candidates(
+pub(in crate::control) fn selector_warm_candidates(
     config: &Config,
     group_manager: &GroupManager,
     generation: &honk_outbound::runtime::OutboundRuntimeRegistry,
@@ -226,7 +228,7 @@ pub(in crate::control) async fn warm_selector_candidate(
 /// retained resources bounded as the group count grows. The merged set is
 /// re-ranked by global UDP latency and truncated, sacrificing only the
 /// slowest leaves.
-pub(super) fn udp_warm_candidates(
+pub(in crate::control) fn udp_warm_candidates(
     config: &Config,
     group_manager: &GroupManager,
     generation: &honk_outbound::runtime::OutboundRuntimeRegistry,
@@ -411,5 +413,92 @@ pub(in crate::control) async fn run_udp_warm_dispatches<F, Fut>(
             debug!("UDP warm dispatch panicked: {err}");
             stats.record_udp_warm_failure();
         }
+    }
+}
+
+impl ControlPlane {
+    /// Stop and join the prior generation's warm coordinator. Aborting the
+    /// parent drops its JoinSet, so in-flight child dispatches are cancelled
+    /// without becoming health or per-outbound error events.
+    pub(in crate::control) async fn stop_udp_warm_coordinator(&self) {
+        let handle = self.udp_warm_task.lock().await.take();
+        if let Some(handle) = handle {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+
+    /// Start a warm coordinator bound to one immutable runtime generation.
+    /// A zero count releases the prior UDP retention set without creating a
+    /// task or touching attempt metrics. Positive counts re-rank after every
+    /// probe cycle.
+    pub(in crate::control) async fn start_udp_warm_coordinator(
+        &self,
+        generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
+    ) {
+        if generation.is_shutdown() {
+            return;
+        }
+        let count = self.config.read().await.global.udp_warm_node_count;
+        if count == 0 {
+            reconcile_udp_warm_retention(&[], &generation, &self.stats, &self.udp_warm_ids).await;
+            return;
+        }
+        let connect_timeout = {
+            let config = self.config.read().await;
+            Duration::from_millis(config.global.connect_timeout_ms)
+        };
+        let proxy_registry = self.proxy_registry.clone();
+        let dispatch = Arc::new(move |generation, node_id| {
+            let proxy_registry = proxy_registry.clone();
+            async move {
+                proxy_registry
+                    .warm_udp(generation, node_id, connect_timeout)
+                    .await
+            }
+        });
+        let handle = tokio::spawn(run_udp_warm_coordinator(
+            self.config.clone(),
+            self.group_manager.clone(),
+            generation,
+            self.stats.clone(),
+            dispatch,
+            self.udp_warm_ids.clone(),
+        ));
+        *self.udp_warm_task.lock().await = Some(handle);
+    }
+
+    pub(in crate::control) async fn stop_selector_warm_coordinator(&self) {
+        let handle = self.selector_warm_task.lock().await.take();
+        if let Some(handle) = handle {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+
+    /// Pin every configured Selector leaf in this immutable runtime
+    /// generation. Choice changes wake the task immediately; the periodic
+    /// pass repairs independently lost sessions and consumed bare sockets.
+    pub(in crate::control) async fn start_selector_warm_coordinator(
+        &self,
+        generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
+    ) {
+        if generation.is_shutdown() {
+            return;
+        }
+        let handle = tokio::spawn(run_selector_warm_coordinator(SelectorWarmCoordinator {
+            config: self.config.clone(),
+            group_manager: self.group_manager.clone(),
+            notify: self.selector_warm_notify.clone(),
+            resources: SelectorWarmResources {
+                generation,
+                proxy_registry: self.proxy_registry.clone(),
+                connection_pool: self.connection_pool.clone(),
+                stats: self.stats.clone(),
+                selected_ids: self.selector_warm_ids.clone(),
+                bare_warm: self.selector_bare_warm.clone(),
+            },
+        }));
+        *self.selector_warm_task.lock().await = Some(handle);
     }
 }
