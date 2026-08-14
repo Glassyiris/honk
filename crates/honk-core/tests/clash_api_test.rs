@@ -796,7 +796,7 @@ async fn test_group_delay_omits_failed_members() {
     let client = http_client();
     let http_addr = spawn_mock_http_server().await;
 
-    // Pre-seed latency history; a failed measurement must clear it.
+    // A lone transient failure must preserve the existing latency history.
     app.state.alive_set.record_probe_latency(
         make_node("node-a").id,
         ProbeDomain::Tcp,
@@ -820,15 +820,13 @@ async fn test_group_delay_omits_failed_members() {
         "failed members must be omitted, got: {map:?}"
     );
 
-    // Failure replaced the seeded history with the synthetic penalty sample,
-    // so the node can no longer rank by its stale 123ms.
     assert_eq!(
         app.state.alive_set.get_last_latency(
             make_node("node-a").id,
             ProbeDomain::Tcp,
             IpVersion::V4
         ),
-        Some(Duration::from_secs(10))
+        Some(Duration::from_millis(123))
     );
 
     // Unknown group → 404.
@@ -914,9 +912,9 @@ async fn test_node_delay_failure_is_503() {
 }
 
 /// Nested groups on the delay endpoints: `/group/{name}/delay` flattens
-/// sub-group members to their representative leaves (failures clear the
-/// LEAF's latency history), and `/proxies/{subgroup-tag}/delay` works
-/// through the group branch.
+/// sub-group members to their representative leaves, consecutive failures
+/// replace the leaf's display history, and `/proxies/{subgroup-tag}/delay`
+/// works through the group branch.
 #[tokio::test]
 async fn test_nested_group_delay_endpoints() {
     let (a, b) = (make_node("node-a"), make_node("node-b"));
@@ -941,8 +939,8 @@ async fn test_nested_group_delay_endpoints() {
     let app = spawn_app_with_config(config, "", "").await;
     let client = http_client();
 
-    // Seed latency on the sub-group's leaf: a failed measurement of the
-    // parent must clear it (proof the leaf was actually measured).
+    // Seed the sub-group leaf: the parent failure is transient, while the
+    // follow-up sub-group failure supplies the strike.
     app.state.alive_set.record_probe_latency(
         make_node("node-b").id,
         ProbeDomain::Tcp,
@@ -968,8 +966,8 @@ async fn test_nested_group_delay_endpoints() {
             ProbeDomain::Tcp,
             IpVersion::V4
         ),
-        Some(Duration::from_secs(10)),
-        "sub-group leaf must have been measured (penalty sample on failure)"
+        Some(Duration::from_millis(55)),
+        "one transient failure must preserve the leaf's latency"
     );
 
     // The sub-group tag itself is a valid delay target (group branch):
@@ -980,6 +978,15 @@ async fn test_nested_group_delay_endpoints() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 503);
+    assert_eq!(
+        app.state.alive_set.get_last_latency(
+            make_node("node-b").id,
+            ProbeDomain::Tcp,
+            IpVersion::V4
+        ),
+        Some(Duration::from_secs(10)),
+        "the consecutive failure must append the penalty sample"
+    );
 }
 
 #[tokio::test]
