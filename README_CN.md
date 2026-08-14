@@ -66,7 +66,7 @@ honk 沿用 dae 的内核模型，但并非移植。主要不同点：
 **eBPF 数据面**
 
 - 工具链：Rust [aya](https://github.com/aya-rs/aya)（内核侧 `aya-ebpf`），而非 Go `cilium/ebpf`。
-- LAN/WAN 投递与 dae 同构，并非重写：TC 程序给代理流量打标并重定向进 `dae0` veth，随后 `daens` 命名空间内的 `sk_lookup` + `bpf_sk_assign` 把报文交给透明监听 socket。与 Go dae 一样，**不安装任何全局 `iptables` `TPROXY` 规则**。
+- LAN/WAN 投递与 dae 同构，并非重写：TC 程序给代理流量打标并重定向进 `dae0`；`dae0`/`dae0peer` 在内核支持时使用 L2 netkit pair，否则回退到 veth。随后 `daens` 命名空间内的 `sk_lookup` + `bpf_sk_assign` 把报文交给透明监听 socket。与 Go dae 一样，**不安装任何全局 `iptables` `TPROXY` 规则**。
 - 内核侧按出站统计：TC 程序维护 per-CPU `OUTBOUND_STATS` 数组（每出站的 tx/rx 包数/字节数）；dae 的内核路径没有按出站的计数器。
 - 路由快路径：推送规则时，用户态按四个 `(l4proto, ipversion)` 组（TCP4/TCP6/UDP4/UDP6）预计算规则掩码；内核为每个流量组通过一次 `ROUTING_GROUP_META_MAP` 查询同时取得规则数和掩码，并在完整写入非活动 bank 后最后切换 generation selector。eBPF 路由循环可直接跳过不可能命中的整条规则链；dae 的 `route()` 顺序评估每个 match set，除此之外核心状态机是 1:1 移植。
 - Map 设计：conntrack / redirect-track / routing-handoff 均为 **LRU** hash map（满了自动淘汰最旧条目），dae 则是普通 hash map + 溢出计数；LPM trie 容量限制为 64K 条（每个约 1.3 MB），dae 为 2M。

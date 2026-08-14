@@ -638,7 +638,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Some(acquire_instance_lock(&cli.bpf_pin_root)?)
     };
 
-    // Create dae0 veth BEFORE eBPF load so PARAM.dae0_ifindex is correct.
+    // Create the dae0 link pair before eBPF load so PARAM.dae0_ifindex is correct.
     // dae0peer stays in the host namespace during the dae0 attach, then moves
     // to the daens netns in setup_daens_namespace() below.
     #[cfg(feature = "ebpf")]
@@ -664,9 +664,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             if let Some(lan_ifname) = configured_ifaces.lan.first() {
                 let _ = set_sysctl(&format!("net.ipv4.conf.{}.rp_filter", lan_ifname), "0");
             }
-            _dae0_guard = Some(create_dae0_veth()?);
+            _dae0_guard = Some(create_dae0_link()?);
             info!(
-                "dae0 veth created before eBPF load (ifindex={})",
+                "dae0 link created before eBPF load (ifindex={})",
                 _dae0_guard.as_ref().unwrap().ifindex
             );
         }
@@ -871,7 +871,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     // We follow Go dae-core: no global iptables PREROUTING rules. Proxy-bound
     // traffic is selected by the LAN ingress TC eBPF program and redirected to
-    // the dae0 veth; dae0peer_ingress / tproxy_sk_lookup in daens then assign
+    // the dae0 link; dae0peer_ingress / tproxy_sk_lookup in daens then assign
     // it (bpf_sk_assign) to the TPROXY listener sockets bound inside daens.
     // Accepted connections are handled on host-netns worker threads, and
     // replies to the client egress dae0peer and take the host dae0_ingress
@@ -1355,9 +1355,8 @@ pub struct Dae0Setup {
     pub peer_mac: [u8; 6],
 }
 
-/// Guard that removes the `dae0` veth pair and policy routing when it goes
-/// out of scope.  If setup fails mid-way, the drop impl cleans up whatever was
-/// already installed.
+/// Guard that removes the `dae0` link pair and policy routing when it goes out
+/// of scope. If setup fails mid-way, drop cleans up whatever was installed.
 ///
 /// Link-local addressing (169.254.0.1/32 on dae0, 169.254.0.11/32 on dae0peer)
 /// eliminates the need for iptables MASQUERADE and TCP MSS clamping — the kernel
@@ -1385,7 +1384,7 @@ impl Drop for Dae0Guard {
 }
 
 #[cfg(feature = "ebpf")]
-fn create_dae0_veth() -> anyhow::Result<Dae0Guard> {
+fn create_dae0_link() -> anyhow::Result<Dae0Guard> {
     let mut guard = Dae0Guard::new();
 
     // Stale-state cleanup (previous run): drop the compat bind-mount (the
@@ -1404,9 +1403,10 @@ fn create_dae0_veth() -> anyhow::Result<Dae0Guard> {
     create_daens_namespace()?;
 
     let mut nl = netlink::NlSock::new().map_err(|e| anyhow::anyhow!("netlink: {e}"))?;
-    nl.add_veth_pair("dae0", "dae0peer")
-        .map_err(|e| anyhow::anyhow!("failed to add dae0 veth pair: {e}"))?;
-    info!("Created dae0/dae0peer veth pair");
+    let link_kind = nl
+        .add_link_pair("dae0", "dae0peer")
+        .map_err(|e| anyhow::anyhow!("failed to add dae0 link pair: {e}"))?;
+    info!(kind = ?link_kind, "Created dae0/dae0peer link pair");
 
     let dae0_idx = netlink::ifindex_of("dae0")?;
     let peer_idx = netlink::ifindex_of("dae0peer")?;
@@ -1444,7 +1444,7 @@ fn create_dae0_veth() -> anyhow::Result<Dae0Guard> {
         .map_err(|e| anyhow::anyhow!("dae0 IPv4 address {}: {e}", host_v4))?;
 
     // Assign an IPv6 ULA address to the host-side dae0 so the daens
-    // namespace can route IPv6 replies back through this veth.
+    // namespace can route IPv6 replies back through this link.
     let host_v6: std::net::Ipv6Addr = DAENS_HOST_IPV6.parse().unwrap();
     let _ = nl.addr_op(false, dae0_idx, netlink::FAM_V6, &host_v6.octets(), 64);
     let _ = nl.addr_op(true, dae0_idx, netlink::FAM_V6, &host_v6.octets(), 64);
@@ -1554,7 +1554,7 @@ fn setup_daens_namespace(tproxy_mark: u32, tproxy_port: u16) -> anyhow::Result<(
             Some(peer),
         );
 
-        // Static neighbours for the host side of the veth (v4 + v6).
+        // Static neighbours for the host side of the link (v4 + v6).
         n.neigh_replace(peer, FAM_V4, &host_v4.octets(), &dae0_mac)?;
         let _ = n.neigh_replace(peer, FAM_V6, &host_v6.octets(), &dae0_mac);
 
@@ -1857,7 +1857,7 @@ fn cleanup_dae0_interface(recorded_ifindex: Option<u32>) {
     let _ = nl.del_rule_fwmark(netlink::FAM_V6, honk_ebpf_common::TPROXY_MARK, 100);
 }
 
-/// Addressing for the dae0/dae0peer veth pair between the host namespace and
+/// Addressing for the dae0/dae0peer link pair between the host namespace and
 /// the isolated `daens` namespace.  These strings are the canonical values:
 /// the netns setup consumes them (ebpf feature only), while the control
 /// plane's internal-traffic filter (`control::is_honk_internal_addr`) uses
@@ -1871,7 +1871,7 @@ fn cleanup_dae0_interface(recorded_ifindex: Option<u32>) {
 pub(crate) const DAENS_HOST_IP: &str = "169.254.0.1";
 #[cfg(any(feature = "ebpf", test))]
 pub(crate) const DAENS_PEER_IP: &str = "169.254.0.11";
-/// IPv6 ULA addresses of the dae0/dae0peer veth pair (fd00:686f:6e6b::/64).
+/// IPv6 ULA addresses of the dae0/dae0peer link pair (fd00:686f:6e6b::/64).
 /// The middle hextets are ASCII "honk" (`68 6f 6e 6b`) so the mnemonic
 /// stays readable while remaining a valid IPv6 ULA prefix.
 #[cfg(any(feature = "ebpf", test))]

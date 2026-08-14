@@ -27,7 +27,7 @@ flowchart LR
 
 一个临时线程调用 `unshare(CLONE_NEWNET)`，打开 `/proc/thread-self/ns/net`，再把得到的 `OwnedFd` 交给进程。该 FD 在进程生命周期内固定 `daens`。`/var/run/netns/daens` 只是尽力创建的兼容性 bind mount；引擎不依赖它持有网络命名空间。
 
-Rtnetlink 创建 `dae0`/`dae0peer`，通过网络命名空间 FD 移动 `dae0peer`，并配置链路、地址、邻居、策略规则与路由。当前地址为：
+内核支持时，rtnetlink 以 L2 netkit pair 创建 `dae0`/`dae0peer`；否则回退到 veth pair。随后通过网络命名空间 FD 移动 `dae0peer`，并配置链路、地址、邻居、策略规则与路由。当前地址为：
 
 | 一侧 | IPv4 | IPv6 |
 | --- | --- | --- |
@@ -133,7 +133,7 @@ LAN TCP 和 UDP 的目的端口为 `53` 时跳过路由循环，直接进入控�
 - IPv4 `255.255.255.255`、`224.0.0.0/4` 或 `0.0.0.0`；
 - IPv6 `ff00::/8`。
 
-这使 DHCP、mDNS、SSDP、LLMNR 等链路流量不进入代理。veth 地址空间同样属于内部范围：`169.254.0.0/16` 和 `fd00:686f:6e6b::/64`。当任一端点位于这些范围时，控制平面 UDP 准入拒绝初始化代理；引擎自身的交付路径由 `dae0`/`dae0peer` 挂钩处理。
+这使 DHCP、mDNS、SSDP、LLMNR 等链路流量不进入代理。内部链路地址空间为 `169.254.0.0/16` 和 `fd00:686f:6e6b::/64`。当任一端点位于这些范围时，控制平面 UDP 准入拒绝初始化代理；引擎自身的交付路径由 `dae0`/`dae0peer` 挂钩处理。
 
 ### 出站存活状态
 
