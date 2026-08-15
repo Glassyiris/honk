@@ -561,10 +561,13 @@ impl Hysteria2Handler {
                 keep_alive: Some(KEEP_ALIVE_INTERVAL),
                 // Download throughput is capped by our advertised receive
                 // windows (window/RTT): quinn's 1.25 MiB stream default
-                // tops out around 2 Gbps on a LAN. Match the TUIC
-                // defaults (8 MiB stream / 32 MiB conn).
+                // tops out around 2 Gbps on a LAN. Stream window keeps the
+                // single-flow ceiling high; the conn window doubles as the
+                // per-connection memory budget (slow consumers buffer up to
+                // ~3x it), so it stays at 8 MiB — measured throughput-neutral
+                // on a 75ms/15%-loss link.
                 stream_receive_window: node.hy2_init_stream_recv_window.or(Some(8 << 20)),
-                conn_receive_window: node.hy2_init_conn_recv_window.or(Some(32 << 20)),
+                conn_receive_window: node.hy2_init_conn_recv_window.or(Some(8 << 20)),
                 disable_mtu_discovery: node.hy2_disable_mtu_discovery == Some(true),
                 max_udp_payload_size: node.quic_mtu,
             },

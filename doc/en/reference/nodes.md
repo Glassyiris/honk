@@ -64,13 +64,13 @@ The Node model exposes the fields below. Share links populate operator-facing fi
 | `hy2_auth` / `hy2_obfs` | string? | null | Hysteria2 authentication and salamander password |
 | `hy2_up_mbps` / `hy2_down_mbps` | u32? | null | Hysteria2 brutal sender/receiver bandwidth hints |
 | `hy2_port_hopping` / `hy2_hop_interval` | string? / u64? | null | Hysteria2 `mport` list and `mhop` seconds; effective interval is 30 s |
-| `hy2_init_stream_recv_window` / `hy2_init_conn_recv_window` | u64? | null | Hysteria2 QUIC receive windows; effective defaults are 8 MiB / 32 MiB |
+| `hy2_init_stream_recv_window` / `hy2_init_conn_recv_window` | u64? | null | Hysteria2 QUIC receive windows; effective defaults are 8 MiB / 8 MiB (the conn window doubles as the per-connection memory budget: slow consumers buffer up to ~3× it; RSS ≈ active connections × 3 × conn window) |
 | `hy2_disable_mtu_discovery` | bool? | null | Hysteria2 `disablePathMTUDiscovery` |
 | `quic_mtu` | u16? | null | QUIC UDP payload size from `mtu`; effective default 1252, accepted link range 1200–65527 |
 | `tls_pin_sha256` | string? | null | Leaf-certificate SHA-256 pin from `pinSHA256` or `pin_sha256` |
 | `tuic_uuid` / `tuic_password` | string? | null | Dedicated TUIC credentials; handlers fall back to generic userinfo fields |
 | `tuic_congestion` / `tuic_alpn` | string? | null | TUIC `congestion_control` and comma-separated `alpn` |
-| `tuic_init_stream_recv_window` / `tuic_init_conn_recv_window` | u64? | null | TUIC QUIC receive windows; effective defaults are 8 MiB / 32 MiB |
+| `tuic_init_stream_recv_window` / `tuic_init_conn_recv_window` | u64? | null | TUIC QUIC receive windows; effective defaults are 8 MiB / 8 MiB |
 | `juicity_uuid` / `juicity_password` | string? | null | Dedicated Juicity credentials; handlers fall back to generic userinfo fields |
 | `anytls_password` | string? | null | AnyTLS secret copied from link userinfo |
 | `anytls_min_idle_session` | usize? | null | Requested idle-session floor from `min_idle_session`; effective default 0, bounded by the two-session pool cap |
@@ -161,7 +161,7 @@ node {
 | TUIC | `alpn` | Comma-separated ALPN override; default is `tuic` |
 | TUIC | `initStreamReceiveWindow` / `initConnReceiveWindow` | Receive-window overrides |
 | Juicity | `uuid:password` userinfo | Generic `username` / `password`; handler fallback for `juicity_uuid` / `juicity_password` |
-| Juicity | protocol defaults | ALPN `h3`, BBR, and fixed 8 MiB / 32 MiB receive windows |
+| Juicity | protocol defaults | ALPN `h3`, BBR, and fixed 8 MiB / 8 MiB receive windows |
 | Both | `mtu`, `sni`, insecure aliases, pin, ECH | Shared QUIC/TLS parameters |
 
 ### AnyTLS
