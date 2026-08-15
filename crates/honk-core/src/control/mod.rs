@@ -490,6 +490,21 @@ use reload::*;
 pub(crate) use resource_budget::{MAX_EFFECTIVE_NOFILE, ResourceBudget};
 use sockets::*;
 
+/// Re-send `NetworkChanged` with bounded backoff after a rejected refresh.
+/// The handler re-derives rules from live interface addresses, so duplicate
+/// deliveries after convergence are cheap no-ops.
+fn spawn_network_refresh_retry(tx: mpsc::Sender<ControlCommand>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        for delay_secs in [5, 15, 60] {
+            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+            if tx.send(ControlCommand::NetworkChanged).await.is_err() {
+                return;
+            }
+        }
+        warn!("network-triggered routing refresh retries exhausted");
+    })
+}
+
 /// The main control plane.
 pub struct ControlPlane {
     config: Arc<RwLock<Config>>,
@@ -511,6 +526,10 @@ pub struct ControlPlane {
     tcp_sniff_neg_cache: Arc<crate::control::tcp_sniff::TcpSniffNegCache>,
     command_tx: mpsc::Sender<ControlCommand>,
     command_rx: Option<mpsc::Receiver<ControlCommand>>,
+    /// Backoff retry for a rejected network-triggered rule refresh: the
+    /// iface watcher consumes each change once, so a transient rejection
+    /// would otherwise strand the generated gateway-address rules.
+    network_refresh_retry: Option<tokio::task::JoinHandle<()>>,
     alive_set: Arc<crate::outbound::AliveDialerSet>,
     connection_pool: Arc<ConnectionPool>,
     connection_tracker: Arc<ConnectionTracker>,
@@ -908,6 +927,7 @@ impl ControlPlane {
             tcp_sniff_neg_cache: Arc::new(crate::control::tcp_sniff::TcpSniffNegCache::new()),
             command_tx: tx,
             command_rx: Some(rx),
+            network_refresh_retry: None,
             alive_set,
             connection_pool: Arc::new(ConnectionPool::with_capacity_limit(
                 resource_budget.tcp_pool_entries,
@@ -2160,10 +2180,24 @@ impl ControlPlane {
                                 let mut next = current.clone();
                                 next.ensure_local_direct_rules().then_some(next)
                             };
-                            if let Some(new_config) = new_config {
-                                info!("refreshing local direct rules after network change");
-                                if !self.apply_runtime_config(new_config, &drain).await {
-                                    warn!("network-triggered routing refresh rejected");
+                            let applied = match new_config {
+                                Some(new_config) => {
+                                    info!("refreshing local direct rules after network change");
+                                    self.apply_runtime_config(new_config, &drain).await
+                                }
+                                // Already converged — nothing to apply.
+                                None => true,
+                            };
+                            if !applied {
+                                warn!("network-triggered routing refresh rejected");
+                                if self
+                                    .network_refresh_retry
+                                    .as_ref()
+                                    .is_none_or(|retry| retry.is_finished())
+                                {
+                                    self.network_refresh_retry = Some(
+                                        spawn_network_refresh_retry(self.command_sender()),
+                                    );
                                 }
                             }
                             self.alive_set.notify_network_change();
