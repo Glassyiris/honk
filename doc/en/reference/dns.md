@@ -137,6 +137,8 @@ The compatibility schema retains flat `routing.rules` entries with `domain` and 
 
 In a preference mode, both families remain queryable. For a non-preferred A/AAAA request, honk issues the preferred-family sibling query through the same pipeline while preserving the caller's wire profile except QTYPE. If the preferred family has an address, the non-preferred answer is suppressed as NODATA; if it has none or its sibling query fails, the non-preferred answer is returned. This adds one upstream query on a relevant cache miss.
 
+The same strategy orders bootstrap-resolved addresses for an upstream hostname. `both` and `preferipv4` dial IPv4 first; `preferipv6` dials IPv6 first. TCP, DoT, DoH, DoQ, DoH3, and proxied DNS try subsequent addresses after a failed dial. Direct UDP uses its one retry for the other family before another address in the same family, then reuses the successful socket. The compatibility-only `ipv4only` and `ipv6only` strategies filter upstream dial candidates to that family.
+
 The internal `ipv4only` and `ipv6only` modes are not expressible with dae `ipversion_prefer` syntax.
 
 ## Cache and fixed TTL

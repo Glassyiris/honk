@@ -796,7 +796,7 @@ async fn test_group_delay_omits_failed_members() {
     let client = http_client();
     let http_addr = spawn_mock_http_server().await;
 
-    // Pre-seed latency history; two consecutive failures replace it with a penalty.
+    // A lone transient failure must preserve the existing latency history.
     app.state.alive_set.record_probe_latency(
         make_node("node-a").id,
         ProbeDomain::Tcp,
@@ -807,30 +807,26 @@ async fn test_group_delay_omits_failed_members() {
     // The URL is https but the server speaks plaintext HTTP: the TLS
     // handshake fails, so both members are omitted from the result.
     let url = format!("https://{}/", http_addr);
-    for _ in 0..2 {
-        let resp = client
-            .get(app.url(&format!("/group/proxy/delay?url={}&timeout=3000", url)))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        let map = body.as_object().unwrap();
-        assert!(
-            !map.contains_key("node-a") && !map.contains_key("node-b"),
-            "failed members must be omitted, got: {map:?}"
-        );
-    }
+    let resp = client
+        .get(app.url(&format!("/group/proxy/delay?url={}&timeout=3000", url)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let map = body.as_object().unwrap();
+    assert!(
+        !map.contains_key("node-a") && !map.contains_key("node-b"),
+        "failed members must be omitted, got: {map:?}"
+    );
 
-    // Consecutive failures replaced the seeded history with the synthetic
-    // penalty sample, so the node can no longer rank by its stale 123ms.
     assert_eq!(
         app.state.alive_set.get_last_latency(
             make_node("node-a").id,
             ProbeDomain::Tcp,
             IpVersion::V4
         ),
-        Some(Duration::from_secs(10))
+        Some(Duration::from_millis(123))
     );
 
     // Unknown group → 404.
@@ -916,9 +912,9 @@ async fn test_node_delay_failure_is_503() {
 }
 
 /// Nested groups on the delay endpoints: `/group/{name}/delay` flattens
-/// sub-group members to their representative leaves (consecutive failures
-/// replace the leaf's latency history with a penalty), and
-/// `/proxies/{subgroup-tag}/delay` works through the group branch.
+/// sub-group members to their representative leaves, consecutive failures
+/// replace the leaf's display history, and `/proxies/{subgroup-tag}/delay`
+/// works through the group branch.
 #[tokio::test]
 async fn test_nested_group_delay_endpoints() {
     let (a, b) = (make_node("node-a"), make_node("node-b"));
@@ -943,8 +939,8 @@ async fn test_nested_group_delay_endpoints() {
     let app = spawn_app_with_config(config, "", "").await;
     let client = http_client();
 
-    // Seed latency on the sub-group's leaf: two failed measurements of the
-    // parent must penalize it (proof the leaf was actually measured).
+    // Seed the sub-group leaf: the parent failure is transient, while the
+    // follow-up sub-group failure supplies the strike.
     app.state.alive_set.record_probe_latency(
         make_node("node-b").id,
         ProbeDomain::Tcp,
@@ -952,28 +948,26 @@ async fn test_nested_group_delay_endpoints() {
         Duration::from_millis(55),
     );
 
-    for _ in 0..2 {
-        let resp = client
-            .get(app.url("/group/parent/delay?url=https://127.0.0.1:1/&timeout=1000"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        let map = body.as_object().unwrap();
-        assert!(
-            !map.contains_key("node-a") && !map.contains_key("sub"),
-            "failed members must be omitted, got: {map:?}"
-        );
-    }
+    let resp = client
+        .get(app.url("/group/parent/delay?url=https://127.0.0.1:1/&timeout=1000"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let map = body.as_object().unwrap();
+    assert!(
+        !map.contains_key("node-a") && !map.contains_key("sub"),
+        "failed members must be omitted, got: {map:?}"
+    );
     assert_eq!(
         app.state.alive_set.get_last_latency(
             make_node("node-b").id,
             ProbeDomain::Tcp,
             IpVersion::V4
         ),
-        Some(Duration::from_secs(10)),
-        "sub-group leaf must have been measured (penalty sample on failure)"
+        Some(Duration::from_millis(55)),
+        "one transient failure must preserve the leaf's latency"
     );
 
     // The sub-group tag itself is a valid delay target (group branch):
@@ -984,6 +978,15 @@ async fn test_nested_group_delay_endpoints() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 503);
+    assert_eq!(
+        app.state.alive_set.get_last_latency(
+            make_node("node-b").id,
+            ProbeDomain::Tcp,
+            IpVersion::V4
+        ),
+        Some(Duration::from_secs(10)),
+        "the consecutive failure must append the penalty sample"
+    );
 }
 
 #[tokio::test]

@@ -2,7 +2,12 @@ use super::*;
 
 /// Fields whose current consumers are process-scoped and therefore cannot be
 /// swapped safely by runtime generation publication.
-pub(crate) fn restart_required_changes(current: &Config, candidate: &Config) -> Vec<&'static str> {
+pub(crate) fn restart_required_changes(
+    current: &Config,
+    candidate: &Config,
+    current_log_file: Option<&Path>,
+    candidate_log_file: Option<&Path>,
+) -> Vec<&'static str> {
     let mut changed = Vec::new();
     let dns_bind_changed = match (current.dns.bind_endpoint(), candidate.dns.bind_endpoint()) {
         (Ok(current), Ok(candidate)) => current != candidate,
@@ -30,6 +35,9 @@ pub(crate) fn restart_required_changes(current: &Config, candidate: &Config) -> 
     }
     if old_global.log_level != new_global.log_level {
         changed.push("global.log_level");
+    }
+    if current_log_file != candidate_log_file {
+        changed.push("global.log_file");
     }
     if old_global.lan_interface != new_global.lan_interface {
         changed.push("global.lan_interface");

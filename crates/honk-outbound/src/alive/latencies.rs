@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 /// failure: it is not a real measurement and must never be displayed as
 /// clash delay history (dashboards otherwise show a bogus 10000ms), and it
 /// never feeds the moving average. Selection demotion no longer reads this
-/// flag — it lives on `DialerCollection::failure_strikes`.
+/// flag — it lives in `DialerCollection`'s coherent failure state.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LatencySample {
     pub latency: Duration,

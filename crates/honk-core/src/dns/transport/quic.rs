@@ -1,5 +1,8 @@
 use std::time::Duration;
 
+use super::dial::dial_candidates;
+use crate::dns::endpoint::DnsEndpoint;
+
 /// Shared QUIC client config for DNS transports (15s keep-alive, cubic).
 pub(super) async fn dns_quic_config(alpn: &[&[u8]]) -> anyhow::Result<quinn::ClientConfig> {
     honk_outbound::quic::client_config(
@@ -13,50 +16,68 @@ pub(super) async fn dns_quic_config(alpn: &[&[u8]]) -> anyhow::Result<quinn::Cli
     .await
 }
 
-/// Lazily-created QUIC client endpoint reused across reconnects (DoQ/DoH3).
-pub(super) struct SharedQuicEndpoint(tokio::sync::Mutex<Option<quinn::Endpoint>>);
+/// Lazily-created per-family QUIC client endpoints reused across reconnects.
+pub(super) struct SharedQuicEndpoint(tokio::sync::Mutex<[Option<quinn::Endpoint>; 2]>);
 
 impl SharedQuicEndpoint {
     pub(super) fn new() -> Self {
-        Self(tokio::sync::Mutex::new(None))
+        Self(tokio::sync::Mutex::new([None, None]))
     }
 
     async fn get(&self, ipv6: bool) -> anyhow::Result<quinn::Endpoint> {
-        let mut guard = self.0.lock().await;
-        if let Some(ep) = guard.as_ref() {
-            return Ok(ep.clone());
+        let mut endpoints = self.0.lock().await;
+        let endpoint = &mut endpoints[if ipv6 { 1 } else { 0 }];
+        if let Some(endpoint) = endpoint.as_ref() {
+            return Ok(endpoint.clone());
         }
-        let ep = honk_outbound::quic::client_endpoint(ipv6)
+        let created = honk_outbound::quic::client_endpoint(ipv6)
             .map_err(|e| anyhow::anyhow!("QUIC client endpoint: {e}"))?;
-        *guard = Some(ep.clone());
-        Ok(ep)
+        *endpoint = Some(created.clone());
+        Ok(created)
     }
 
     pub(super) async fn close(&self, timeout: Duration) {
-        let endpoint = self.0.lock().await.take();
-        if let Some(endpoint) = endpoint {
+        let endpoints = {
+            let mut endpoints = self.0.lock().await;
+            [endpoints[0].take(), endpoints[1].take()]
+        };
+        for endpoint in endpoints.into_iter().flatten() {
             endpoint.close(0_u32.into(), b"shutdown");
             let _ = tokio::time::timeout(timeout, endpoint.wait_idle()).await;
         }
     }
 }
 
-/// Connect `config` to `addr` through the shared endpoint, with a handshake
-/// timeout. `label` prefixes error messages (`DoQ` / `DoH3 QUIC`).
-pub(super) async fn quic_connect(
+/// Connect `config` to `addr` through the shared endpoint. `label` prefixes
+/// error messages (`DoQ` / `DoH3 QUIC`).
+async fn quic_connect(
     endpoint: &SharedQuicEndpoint,
     config: &quinn::ClientConfig,
     addr: std::net::SocketAddr,
     sni: &str,
-    timeout: Duration,
     label: &str,
 ) -> anyhow::Result<quinn::Connection> {
     let ep = endpoint.get(addr.is_ipv6()).await?;
     let connecting = ep
         .connect_with(config.clone(), addr, sni)
         .map_err(|e| anyhow::anyhow!("{label} connect_with: {e}"))?;
-    tokio::time::timeout(timeout, connecting)
+    connecting
         .await
-        .map_err(|_| anyhow::anyhow!("{label} handshake timed out"))?
         .map_err(|e| anyhow::anyhow!("{label} handshake: {e}"))
+}
+
+pub(super) async fn quic_connect_endpoint(
+    endpoint: &SharedQuicEndpoint,
+    config: &quinn::ClientConfig,
+    target: &DnsEndpoint,
+    deadline: tokio::time::Instant,
+    label: &str,
+) -> anyhow::Result<quinn::Connection> {
+    let addresses = tokio::time::timeout_at(deadline, target.resolve_addrs())
+        .await
+        .map_err(|_| anyhow::anyhow!("{label} address resolution timed out"))??;
+    dial_candidates(addresses, deadline, label, |address, _| {
+        quic_connect(endpoint, config, address, &target.sni, label)
+    })
+    .await
 }

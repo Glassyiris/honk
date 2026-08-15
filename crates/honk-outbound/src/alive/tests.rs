@@ -910,6 +910,17 @@ fn test_failure_demotion_needs_consecutive_successes() {
     assert!(demoted(), "progress was reset by the second strike");
     probe_ok(10);
     assert!(!demoted());
+
+    // Repeated failures cap at three strikes, so exactly three consecutive
+    // probe successes clear even after many more failures.
+    for _ in 0..8 {
+        set.record_dial_failure(node, ProbeDomain::Tcp, IpVersion::V4);
+    }
+    probe_ok(10);
+    probe_ok(10);
+    assert!(demoted(), "the strike cap still requires three successes");
+    probe_ok(10);
+    assert!(!demoted());
 }
 
 /// A real dial success breaks the consecutive dial-failure streak: two
@@ -930,6 +941,29 @@ fn test_dial_success_resets_failure_streak() {
     );
     set.record_dial_failure(node, ProbeDomain::Tcp, IpVersion::V4);
     assert!(demoted());
+}
+
+#[test]
+fn test_concurrent_dial_failures_cannot_collapse() {
+    for _ in 0..64 {
+        let collection = Arc::new(collection::DialerCollection::new());
+        let start = Arc::new(std::sync::Barrier::new(3));
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                let collection = Arc::clone(&collection);
+                let start = Arc::clone(&start);
+                scope.spawn(move || {
+                    start.wait();
+                    collection.record_dial_failure();
+                });
+            }
+            start.wait();
+        });
+        assert!(
+            collection.is_failure_demoted(),
+            "two simultaneous failures must produce the threshold strike"
+        );
+    }
 }
 
 /// Real-traffic fast path: three consecutive dials far above the node's own

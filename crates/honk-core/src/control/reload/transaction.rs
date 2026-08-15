@@ -12,7 +12,14 @@ impl ControlPlane {
         drain: &DrainTracker,
     ) -> bool {
         let current_config = self.config.read().await.clone();
-        let restart_required = restart_required_changes(&current_config, &new_config);
+        let candidate_log_file =
+            crate::resolved_log_file_path(&new_config, self.log_file_override.as_deref());
+        let restart_required = restart_required_changes(
+            &current_config,
+            &new_config,
+            self.effective_log_file.as_deref(),
+            candidate_log_file.as_deref(),
+        );
         if !restart_required.is_empty() {
             error!(
                 fields = ?restart_required,
@@ -477,6 +484,7 @@ impl ControlPlane {
                 honk_outbound::bootstrap::BootstrapResolver::parse(
                     &config.global.bootstrap_resolver,
                 ),
+                config.dns.strategy.clone(),
             )?
             .with_runtime_generation(runtime_generation)
             .with_timeouts(

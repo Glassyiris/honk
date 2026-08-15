@@ -74,7 +74,7 @@ use socket2::{Domain, Socket, Type};
 use std::io;
 use std::net::SocketAddr;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::Mutex;
@@ -98,6 +98,8 @@ use sockets::*;
 /// The main control plane.
 pub struct ControlPlane {
     config: Arc<RwLock<Config>>,
+    log_file_override: Option<PathBuf>,
+    effective_log_file: Option<PathBuf>,
     ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
     router: Arc<RwLock<Router>>,
     proxy_registry: Arc<ProxyRegistry>,

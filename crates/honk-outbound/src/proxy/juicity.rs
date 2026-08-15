@@ -167,9 +167,10 @@ impl JuicityHandler {
                 max_udp_payload_size: node.quic_mtu,
                 // Same receive-window rationale as hy2/tuic: quinn's
                 // 1.25 MiB stream default caps downloads around 2 Gbps
-                // on a LAN.
+                // on a LAN. Conn window doubles as the per-connection
+                // memory budget (see hy2).
                 stream_receive_window: Some(8 << 20),
-                conn_receive_window: Some(32 << 20),
+                conn_receive_window: Some(8 << 20),
                 ..crate::quic::QuicClientOptions::with_congestion(Some("bbr"))
             },
         )

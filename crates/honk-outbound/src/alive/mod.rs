@@ -7,9 +7,7 @@ mod probe;
 #[cfg(test)]
 mod tests;
 
-use self::collection::{
-    DIAL_FAILURE_STRIKE_AT, DialerCollection, SLOW_DIAL_STREAK_MAX, TrafficVerdict,
-};
+use self::collection::{DialerCollection, SLOW_DIAL_STREAK_MAX, TrafficVerdict};
 use honk_config::config::{BLOCK_NODE_ID, DIRECT_NODE_ID};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
@@ -1012,10 +1010,8 @@ impl AliveDialerSet {
     /// real successes clear it, which is what stops a fast-but-flaky node
     /// from reclaiming the top rank with a single lucky probe.
     pub fn record_dial_failure(&self, node_id: Uuid, domain: ProbeDomain, ipver: IpVersion) {
-        let coll = self.get_or_create_collection(node_id, alive_index(domain, ipver));
-        if coll.bump_dial_fail_streak() >= DIAL_FAILURE_STRIKE_AT {
-            coll.mark_unavailable();
-        }
+        self.get_or_create_collection(node_id, alive_index(domain, ipver))
+            .record_dial_failure();
     }
 
     /// Feed one REAL proxied dial's wall-clock latency (network round trip

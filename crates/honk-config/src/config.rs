@@ -52,6 +52,10 @@ pub struct GlobalConfig {
     pub so_mark_from_dae: u32,
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    /// Optional append-only operational log file. Relative paths resolve below
+    /// [`GlobalConfig::data_dir`]; empty keeps file logging disabled.
+    #[serde(default)]
+    pub log_file: String,
     #[serde(default)]
     pub disable_waiting_network: bool,
     #[serde(default)]
@@ -310,6 +314,7 @@ impl Default for GlobalConfig {
             pprof_port: 0,
             so_mark_from_dae: 0,
             log_level: default_log_level(),
+            log_file: String::new(),
             disable_waiting_network: false,
             lan_interface: vec![],
             wan_interface: vec![],

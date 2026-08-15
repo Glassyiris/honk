@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use honk_config::node::Node;
 use honk_config::types::DnsProtocol;
@@ -102,6 +102,14 @@ impl UpstreamPool {
                 return Ok(None);
             }
         };
+        self.resolve_dial_leaf_for_address(entry, target).await
+    }
+
+    pub(super) async fn resolve_dial_leaf_for_address(
+        &self,
+        entry: &UpstreamEntry,
+        target: SocketAddr,
+    ) -> anyhow::Result<Option<Node>> {
         let host_is_ip = entry.endpoint.host.parse::<IpAddr>().is_ok();
         let protocol = match entry.protocol {
             DnsProtocol::Udp => "udp",

@@ -23,6 +23,7 @@ impl ControlPlane {
                 honk_outbound::bootstrap::BootstrapResolver::parse(
                     &config.global.bootstrap_resolver,
                 ),
+                config.dns.strategy.clone(),
             )?,
         );
         Self::new_with_upstream_pool(
@@ -64,6 +65,7 @@ impl ControlPlane {
         resource_budget: ResourceBudget,
     ) -> anyhow::Result<Self> {
         let (tx, rx) = mpsc::channel(256);
+        let effective_log_file = crate::resolved_log_file_path(&config, None);
 
         // Create alive set for node health checking and pass it into the group
         // manager so dead nodes are excluded from group selection.
@@ -223,6 +225,8 @@ impl ControlPlane {
 
         let control_plane = Self {
             config: config_arc,
+            log_file_override: None,
+            effective_log_file,
             ebpf: ebpf_arc,
             router: router_arc,
             proxy_registry,
@@ -291,6 +295,14 @@ impl ControlPlane {
         control_plane.install_node_death_callback();
 
         Ok(control_plane)
+    }
+    pub(crate) fn set_log_file_override(
+        &mut self,
+        log_file_override: Option<PathBuf>,
+        effective_log_file: Option<PathBuf>,
+    ) {
+        self.log_file_override = log_file_override;
+        self.effective_log_file = effective_log_file;
     }
 
     /// Reap node-bound UDP entries as soon as a real AliveDialerSet transition

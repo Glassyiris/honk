@@ -605,9 +605,12 @@ async fn test_dial_tcp_echo() {
         .await
         .expect("dial should succeed");
     stream.stream.write_all(b"hello hy2").await.unwrap();
-    let mut buf = [0u8; 64];
-    let n = stream.stream.read(&mut buf).await.unwrap();
-    assert_eq!(&buf[..n], b"hello hy2");
+    let mut buf = [0u8; 9];
+    tokio::time::timeout(Duration::from_secs(1), stream.stream.read_exact(&mut buf))
+        .await
+        .expect("TCP echo timed out")
+        .unwrap();
+    assert_eq!(&buf, b"hello hy2");
 }
 
 #[tokio::test]
@@ -628,9 +631,15 @@ async fn test_dial_tcp_does_not_wait_for_response() {
     let mut stream = stream;
 
     stream.stream.write_all(b"fast open").await.unwrap();
-    let mut output = [0; 16];
-    let count = stream.stream.read(&mut output).await.unwrap();
-    assert_eq!(&output[..count], b"fast open");
+    let mut output = [0u8; 9];
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        stream.stream.read_exact(&mut output),
+    )
+    .await
+    .expect("TCP echo timed out")
+    .unwrap();
+    assert_eq!(&output, b"fast open");
 }
 
 #[tokio::test]

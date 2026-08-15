@@ -66,3 +66,7 @@ results
 bench
 .task*
 .qa*
+
+# Local design drafts (not tracked for now)
+doc/zh/design/af-xdp-dataplane-proposal.md
+doc/zh/design/outbound-vs-dae.md

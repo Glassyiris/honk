@@ -93,7 +93,7 @@ flowchart TB
 - **`must`/`block` finality:** Clash mode overrides never replace a `block` result or a dae `(must)` result.
 - **Fail-closed dead outbounds:** `lan_ingress` drops new flows routed to a dead outbound. A TCP group with one unique leaf and no `final` keeps that same proxy as a userspace last resort; UDP and all-dead multi-leaf groups remain fail-closed. TCP and UDP port `53` are exempt, and `honk-core` injects `dip(<each LAN/WAN interface address>) -> direct(must)` at startup, reload, and interface-topology changes so local administration does not depend on proxy health.
 - **Group-OR connectivity:** the eBPF alive slot for a group is the OR of all leaf-member states, plus the sole-TCP-leaf last-resort exception above. A single dead member in a multi-leaf group must not make the whole group fail closed.
-- **Internal and special traffic:** honk's `169.254.0.0/16` and `fd00:686f:6e6b::/64` veth ranges are never proxied. L2 broadcast/multicast, IPv4 broadcast/multicast/unspecified destinations, and IPv6 multicast pass through before routing or conntrack.
+- **Internal and special traffic:** honk's link-internal ranges `169.254.0.0/16` and `fd00:686f:6e6b::/64` are never proxied. L2 broadcast/multicast, IPv4 broadcast/multicast/unspecified destinations, and IPv6 multicast pass through before routing or conntrack.
 
 ## Build features and mock mode
 
