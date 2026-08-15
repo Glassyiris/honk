@@ -9,7 +9,7 @@ This file is written for AI coding agents that need to understand, build, test, 
 - An eBPF transparent proxy engine (`honk-core`) normally intercepts with TC redirect and relays through userspace proxy handlers. Its default-off LAN UDP path can instead hold ambiguous originals in fixed NFQUEUE 320 for token-checked terminal decisions; this uses a wholly owned nftables table/chain but still installs no global `iptables` TPROXY rules.
 - Shared configuration types and parsers (`honk-config`) parse the original dae `{ section { ... } }` configuration syntax — the primary and only documented config format.
 - Status: **experimental alpha** (`v0.0.1-alpha`). Expect breaking changes.
-- License: **GPL-3.0-only**. Repository: <https://github.com/Glassyiris/honk>
+- License: **GPL-3.0-only**. Repository: <https://github.com/daeuniverse/honk>
 - Documentation: `README.md` / `README_CN.md` (bilingual overview, feature checklist, TODO list) and `doc/` — split by language into `doc/en/` and `doc/zh/` with identical layouts: `configuration.md` guide, `design/` architecture docs per subsystem (overview/datapath/routing/nfqueue/control-plane/dns/outbound/groups), `reference/` per-section field references (global/nodes/groups/routing/dns/subscription/experimental/api/cli), `operations/` runbooks, indexed by the bilingual `doc/README.md`. Lab benchmark tooling, evidence, and bilingual benchmark docs live only on the dedicated `bench` branch.
 
 ## Repository layout
@@ -339,19 +339,20 @@ The old `run` / `deploy` / `docker*` recipes were removed: they called `scripts/
 
   ## What's Changed
   ### New Features
-  * <subject> by @colores-slave in <short-hash>
+  * <subject> by @<github-author> in <short-hash>
   ### Bug Fixes
-  * <subject> by @colores-slave in <short-hash>
+  * <subject> by @<github-author> in <short-hash>
   ### Performance
   * ...
   ### Documentation
   * ...
 
-  **Full Changelog**: https://github.com/Glassyiris/honk/compare/<prev-tag>...<tag>
+  **Full Changelog**: https://github.com/daeuniverse/honk/compare/<prev-tag>...<tag>
   ```
 
+  - Attribute each commit to its GitHub-resolved author (`gh api repos/daeuniverse/honk/commits/<sha> --jq .author.login`), never the raw git `Author:` name — now that the repo lives under the daeuniverse org, org-visible identity is what the Release page should show.
   - Group commits by their `type(scope)` prefix (`feat` → New Features, `fix` → Bug Fixes, `perf` → Performance, `docs`/`bench` → Documentation, `refactor`/`test` → fold into the nearest section or omit).
-  - Apply with `gh release edit <tag> --repo Glassyiris/honk --notes-file <file>`; the Release page exists only after the workflow's `release` job finishes, so curate after the build completes.
+  - Apply with `gh release edit <tag> --repo daeuniverse/honk --notes-file <file>`; the Release page exists only after the workflow's `release` job finishes, so curate after the build completes.
 - **Deployment:** after tagging, the musl mimalloc tarball is the canonical gateway binary; manual `scp` deploys (as used during development) should be noted in the PR/issue of record when they diverge from the release artifact.
 
 ## Current validation guidance
