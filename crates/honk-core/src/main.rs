@@ -7,6 +7,20 @@ use honk_core::Cli;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+#[cfg(feature = "mimalloc")]
+fn enable_cross_thread_page_reclaim() {
+    const MI_OPTION_PAGE_RECLAIM_ON_FREE: libmimalloc_sys::mi_option_t = 35;
+    // Tokio commonly frees buffers on a worker other than the allocating worker.
+    // SAFETY: this runs once before any runtime worker starts; 35 is the bundled mimalloc v3 option.
+    unsafe {
+        libmimalloc_sys::mi_option_set(MI_OPTION_PAGE_RECLAIM_ON_FREE, 1);
+        debug_assert_eq!(
+            libmimalloc_sys::mi_option_get(MI_OPTION_PAGE_RECLAIM_ON_FREE),
+            1
+        );
+    }
+}
+
 #[cfg(all(feature = "mimalloc", target_os = "linux"))]
 fn disable_transparent_huge_pages() -> std::io::Result<()> {
     // SAFETY: prctl receives fixed integer arguments and no pointers.
@@ -220,6 +234,9 @@ where
 }
 
 fn main() -> anyhow::Result<()> {
+    #[cfg(feature = "mimalloc")]
+    enable_cross_thread_page_reclaim();
+
     #[cfg(all(feature = "mimalloc", target_os = "linux"))]
     disable_transparent_huge_pages()?;
 
