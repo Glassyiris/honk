@@ -77,7 +77,7 @@ enum AsIsExchangeError {
     },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ResolveMode {
     Strict,
     Compatibility,
@@ -464,15 +464,14 @@ mod response {
 mod strategy {
     use anyhow::Context;
     use bytes::Bytes;
-    use std::net::SocketAddr;
 
     use tracing::debug;
 
-    use crate::dns::query::QueryContext;
+    use crate::dns::query::{DnsRequestMeta, QueryContext};
     use honk_config::dns::DnsStrategy;
 
-    use super::DnsForwarder;
     use super::response::{make_empty_response, qtype_name, response_has_family_ips};
+    use super::{DnsForwarder, ResolveMode};
 
     impl DnsForwarder {
         /// Prefer-mode strategy (sing-box / dae `ipversion_prefer` semantics):
@@ -485,7 +484,8 @@ mod strategy {
             query: &QueryContext,
             qtype: u16,
             response: Bytes,
-            original_dst: Option<SocketAddr>,
+            metadata: DnsRequestMeta,
+            mode: ResolveMode,
         ) -> anyhow::Result<Bytes> {
             let preferred = match (&self.strategy, qtype) {
                 (DnsStrategy::PreferIpv4, 28) => 1u16,
@@ -493,7 +493,7 @@ mod strategy {
                 _ => return Ok(response),
             };
             if self
-                .preferred_family_has_answers(raw_query, query, preferred, original_dst)
+                .preferred_family_has_answers(raw_query, query, preferred, metadata, mode)
                 .await?
             {
                 debug!(
@@ -514,7 +514,8 @@ mod strategy {
             raw_query: &[u8],
             query: &QueryContext,
             preferred_qtype: u16,
-            original_dst: Option<SocketAddr>,
+            metadata: DnsRequestMeta,
+            mode: ResolveMode,
         ) -> anyhow::Result<bool> {
             let offsets = query
                 .question_offsets()
@@ -532,14 +533,16 @@ mod strategy {
 
             // Boxed: breaks the async recursion cycle through resolve_with_context
             // (the sibling uses the preferred qtype, so it never re-enters here).
-            let sibling = Box::pin(self.resolve_with_context_and_profile(
+            let sibling = Box::pin(self.resolve_inner(
                 &sibling_query,
-                original_dst,
+                metadata,
                 query.ingress(),
+                false,
+                mode,
             ))
             .await;
             Ok(match sibling {
-                Ok(resp) => response_has_family_ips(&resp, preferred_qtype),
+                Ok(outcome) => response_has_family_ips(outcome.rendered(), preferred_qtype),
                 Err(_) => {
                     debug!(
                         error_kind = "preferred_family_probe_failed",
@@ -569,7 +572,7 @@ mod tests {
     use std::net::{IpAddr, SocketAddr};
     use std::time::Duration;
 
-    use crate::dns::query::IngressProfile;
+    use crate::dns::query::{DnsRequestMeta, IngressProfile};
 
     include!("forwarder/tests/fixtures.rs");
     include!("forwarder/tests/service_flush.rs");

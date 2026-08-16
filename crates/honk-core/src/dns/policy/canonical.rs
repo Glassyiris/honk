@@ -103,6 +103,7 @@ use self::normalize::{exact, host, lowercase};
 use self::wire::Writer;
 use super::PolicyError;
 use crate::dns::endpoint::DnsEndpoint;
+use crate::routing::parse_ip_net_str;
 
 const FORMAT_VERSION: u8 = 2;
 // Stale controls are not configurable yet, so identity pins the cache/forwarder defaults.
@@ -210,6 +211,23 @@ fn conditions(writer: &mut Writer, values: &[DnsCond]) -> Result<(), PolicyError
                 writer.len(types.len())?;
                 for value in types {
                     writer.u16(*value);
+                }
+            }
+            DnsCond::Sip { not, cidrs } => {
+                if cidrs.is_empty() {
+                    return Err(PolicyError::EmptyName {
+                        field: "source IP condition",
+                    });
+                }
+                writer.byte(4);
+                writer.byte(u8::from(*not));
+                writer.len(cidrs.len())?;
+                for value in cidrs {
+                    let network =
+                        parse_ip_net_str(value).ok_or_else(|| PolicyError::InvalidCidr {
+                            value: value.clone(),
+                        })?;
+                    writer.string(&network.trunc().to_string())?;
                 }
             }
             DnsCond::Upstream { not, names } => {

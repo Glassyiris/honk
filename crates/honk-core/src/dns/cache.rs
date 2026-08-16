@@ -288,6 +288,7 @@ mod storage {
         pub expires_at: Instant,
         /// Minimum TTL from the DNS record set, in seconds.
         pub min_ttl: u32,
+        pub(crate) strict_reusable: bool,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]

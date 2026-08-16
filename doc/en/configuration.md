@@ -227,20 +227,20 @@ Upstream forms are bare `host:port` (UDP) or `udp://`, `tcp://`, `tcp+udp://`/`u
 ```dae
 dns {
     upstream {
-        secure: 'https://dns.google/dns-query' -> proxy
+        home: 'udp://223.5.5.5:53' -> direct
+        lan_proxy: 'https://dns.google/dns-query' -> proxy
     }
     routing {
         request {
-            qname(suffix: example.org) && !qtype(aaaa) -> secure
-            fallback: secure
-        }
-        response {
-            upstream(secure) -> accept
-            fallback: accept
+            sip(192.168.50.0/24, 100.64.0.0/10) -> lan_proxy
+            sip(127.0.0.0/8, ::1/128) && qname(suffix: example-isp.cn) -> asis
+            fallback: home
         }
     }
 }
 ```
+
+`sip(...)` is request-only and matches the logical DNS client IP against host addresses or CIDRs. Transparent port-53 and `dns.bind` queries use their socket peer; DNS lookups made for an admitted TCP/UDP flow use that flow's client address. Internal, bootstrap, prefetch, and Clash API queries have no client source, so neither `sip(...)` nor `!sip(...)` matches and routing falls through. A source-aware flow lookup still has no intercepted DNS-server destination, so selecting `asis` fails closed.
 
 Leave `bind` empty for transparent port-53 interception only. Standalone forms require an explicit port: bare numeric `IP:port` (UDP), `udp://host:port`, `tcp://host:port`, or `tcp+udp://host:port`; an empty host binds wildcard addresses. Bind loopback unless a host firewall protects LAN exposure. Omit `ipversion_prefer` for `both`, or set `4`/`6` to prefer that family for both DNS results and bootstrap-resolved upstream dials; a failed preferred-family dial falls back to the other family.
 

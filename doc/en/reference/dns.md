@@ -100,8 +100,11 @@ A trailing `-> tag` forces the upstream through that node or group. Without it, 
 | `qname(regex: ...)` | Request and response | Rust regular expression match. |
 | `qname(geosite: cn)` | Request and response | Match domains expanded from the named geosite code. |
 | `qtype(a, aaaa, ...)` | Request and response | Match QTYPE names or a numeric `u16`. Recognized names are `A`, `AAAA`, `CNAME`, `MX`, `TXT`, `NS`, `PTR`, `SOA`, `SRV`, `HTTPS`, `SVCB`, `ANY`, and `*`. |
+| `sip(192.168.50.1, 100.64.0.0/10, 2001:db8::/32)` | Request only | Match the logical client source against any listed IP host or CIDR. |
 | `upstream(name, ...)` | Response only | Match the upstream that produced the current response. |
 | `ip(192.0.2.0/24, geoip: private, ...)` | Response only | Match when any answer IP belongs to a listed CIDR or GeoIP set. |
+
+For transparent port-53 and `dns.bind` ingress, the logical source is the socket peer. DNS resolution performed for an admitted TCP/UDP flow uses that flow's client address. Internal, bootstrap, prefetch, and Clash API queries have no logical source. An unknown source makes both positive and negated `sip` conditions false, so request routing continues to the next rule or fallback. `sip` is not valid in response routing.
 
 ### Request actions
 
@@ -111,6 +114,8 @@ A trailing `-> tag` forces the upstream through that node or group. Without it, 
 | `asis` | Dial the intercepted original DNS destination. A transparent query preserves its ingress transport; UDP retries the same destination over TCP when the response has `TC` set. A standalone query has no original destination and fails instead of recursing into the listener. |
 | Upstream name | Query that named upstream. |
 | `fallback: reject\|asis\|<upstream>` | Action used when no request rule matches; default is upstream `default`. |
+
+A source-aware lookup made for an admitted flow carries no intercepted DNS-server destination. If its request policy selects `asis`, resolution fails closed; it never falls through to the compatibility/default upstream.
 
 ### Response actions
 
@@ -135,7 +140,7 @@ The compatibility schema retains flat `routing.rules` entries with `domain` and 
 | `ipversion_prefer: 4` | `preferipv4` | Prefer IPv4 while retaining IPv6 fallback. |
 | `ipversion_prefer: 6` | `preferipv6` | Prefer IPv6 while retaining IPv4 fallback. |
 
-In a preference mode, both families remain queryable. For a non-preferred A/AAAA request, honk issues the preferred-family sibling query through the same pipeline while preserving the caller's wire profile except QTYPE. If the preferred family has an address, the non-preferred answer is suppressed as NODATA; if it has none or its sibling query fails, the non-preferred answer is returned. This adds one upstream query on a relevant cache miss.
+In a preference mode, both families remain queryable. For a non-preferred A/AAAA request, honk issues the preferred-family sibling query through the same pipeline while preserving the caller's logical source, original destination, ingress profile, and wire profile except QTYPE. If the preferred family has an address, the non-preferred answer is suppressed as NODATA; if it has none or its sibling query fails, the non-preferred answer is returned. This adds one upstream query on a relevant cache miss.
 
 The same strategy orders bootstrap-resolved addresses for an upstream hostname. `both` and `preferipv4` dial IPv4 first; `preferipv6` dials IPv6 first. TCP, DoT, DoH, DoQ, DoH3, and proxied DNS try subsequent addresses after a failed dial. Direct UDP uses its one retry for the other family before another address in the same family, then reuses the successful socket. The compatibility-only `ipv4only` and `ipv6only` strategies filter upstream dial candidates to that family.
 
@@ -149,6 +154,8 @@ The internal `ipv4only` and `ipv6only` modes are not expressible with dae `ipver
 | `optimistic_cache_ttl` | `600` | Overrides the positive answer's minimum TTL for cache lifetime and returned wire RR TTLs. `0` keeps the answer TTL. |
 | `max_cache_size` | `10000` | Entry limit. It also scales the retained query/response wire-byte budget at 4 KiB per configured entry, with at least 65,535 bytes per shard and a 64 MiB global cap. `0` is warned and clamped to one entry. |
 | `fixed_domain_ttl { domain: seconds }` | empty | Per-domain override applied before `optimistic_cache_ttl`; `0` makes that domain uncacheable. |
+
+Request routing runs before cache lookup. Cache and background-refresh identity uses the selected upstream or exact `asis` destination, not the raw client source: clients selecting the same exchange scope share entries, while different selected upstreams or `asis` destinations remain isolated. Preferred-family rendering still retains source metadata, so source-dependent sibling policy cannot leak through foreground singleflight.
 
 For example:
 
@@ -176,6 +183,7 @@ dns {
 
     routing {
         request {
+            sip(192.168.50.0/24, 100.64.0.0/10) -> google_doh
             qname(geosite: category-ads-all) -> reject
             qname(suffix: cn) -> default
             qtype(https) -> reject

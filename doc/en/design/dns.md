@@ -30,6 +30,8 @@ Both ingress adapters use the same `DnsController`, current `DnsServiceProvider`
 | Transparent port 53 | The eBPF TCP and UDP fast path redirects port-53 traffic without the full route loop. The adapter preserves the intercepted original destination and ingress transport. | Transparent UDP uses an anyfrom socket bound to the original destination; TCP replies on the intercepted stream. Request action `asis` dials that original destination and preserves TCP/UDP, including UDP `TC` fallback to TCP. |
 | Standalone `dns.bind` | Selected TCP/UDP sockets are ordinary unmarked sockets in the host network namespace. They have no intercepted destination. | TCP replies on the accepted socket. UDP uses packet info so a wildcard bind replies from the exact local address and interface that received the query. |
 
+`DnsRequestMeta` carries the logical client source and intercepted destination as one immutable value. Both transparent and standalone adapters set `source_ip` from the socket peer; only transparent interception sets `original_dst`. IPv4-mapped IPv6 peers normalize to IPv4. Flow-associated TCP/UDP lookups use the admitted flow's client address and have no intercepted DNS destination. Internal, bootstrap, prefetch, and Clash API queries have neither value.
+
 The standalone listener has these lifecycle and admission invariants:
 
 - It binds every selected transport synchronously and all-or-nothing before starting a supervisor. One bind failure closes the partial set and fails startup.
@@ -52,7 +54,7 @@ The production path is ordered as follows:
 | 1. Admission and generation | `DnsController` takes an owned semaphore permit and a runtime lease. The 2,048-query permit remains held through reply completion; saturation degrades to `REFUSED`. The lease pins one coherent generation for the request. |
 | 2. Parse and validate | The adapter requires one complete request. `DnsEngine` parses the wire, rejects zero or multiple usable questions, canonicalizes the qname to lowercase, and records the ingress profile. |
 | 3. Family gate and hosts | `ipv4only`/`ipv6only` reject the other address family with NODATA before hosts or upstream work. Otherwise the immutable hosts snapshot runs before request routing, cache, and upstream exchange. |
-| 4. Request planning | Source-ordered request rules choose reject, `asis`, or a named upstream. First match wins. |
+| 4. Request planning | Source-ordered request rules choose reject, `asis`, or a named upstream from the canonical qname, QTYPE, and logical client source. First match wins. |
 | 5. Reuse | Eligible requests look up the exact-identity positive/negative cache, then share one singleflight exchange on a miss. Ineligible requests bypass both. |
 | 6. Exchange | The request scope selects the intercepted destination or an `UpstreamPool` transport. |
 | 7. Response planning | Every upstream response is strictly matched to the query before policy uses it. Response rules accept, reject, or re-query through a named upstream; traversal is acyclic and contains at most three upstreams. |
@@ -77,24 +79,24 @@ Only IN-class A and AAAA queries use the snapshot. A known name with no address 
 | `ipv4only` | Only A is eligible. AAAA is answered NODATA without upstream I/O. |
 | `ipv6only` | Only AAAA is eligible. A is answered NODATA without upstream I/O. |
 
-A prefer-family sibling query changes only the first question's QTYPE. Transaction ID, flags, QCLASS, EDNS data, ingress profile, original destination, and the rest of the wire profile remain unchanged. Sibling failure or NODATA does not suppress a usable non-preferred response. For internal/application hostname resolution, the bootstrap fallback runs once only when every eligible family is unusable, then filters fallback addresses through the same family eligibility.
+A prefer-family sibling query changes only the first question's QTYPE. Transaction ID, flags, QCLASS, EDNS data, ingress profile, logical client source, original destination, and the rest of the wire profile remain unchanged. Sibling failure or NODATA does not suppress a usable non-preferred response. For internal/application hostname resolution, the bootstrap fallback runs once only when every eligible family is unusable, then filters fallback addresses through the same family eligibility.
 
 The strategy also orders bootstrap-resolved upstream dial targets. `both` uses IPv4-first compatibility order; preference modes put their family first while retaining the other family. Stream and QUIC transports walk the ordered candidates. Direct UDP keeps the existing two-attempt bound: after the first candidate fails, its retry selects the other family before another address of the same family and caches the winner.
 
 ### DNS routing
 
-Conditions within one rule are ANDed; each condition can be negated. The compiled condition model covers qname, qtype, upstream name, and response IP. Rules are evaluated in source order and stop on the first match.
+Conditions within one rule are ANDed; arguments inside one condition are ORed; each condition can be negated. The compiled condition model covers qname, qtype, request-only source IP, upstream name, and response IP. Rules are evaluated in source order and stop on the first match. An unknown source makes both `sip(...)` and `!sip(...)` false, and response rules reject `sip` during configuration.
 
 | Phase | Inputs used by policy | Actions |
 | --- | --- | --- |
-| Request | Canonical qname and QTYPE; `asis` additionally requires an intercepted original destination. | `reject`, `asis`, or `upstream(name)` |
+| Request | Canonical qname, QTYPE, and logical client source; `asis` additionally requires an intercepted original destination. | `reject`, `asis`, or `upstream(name)` |
 | Response | Canonical qname, QTYPE, current upstream, and extracted answer IPs. | `accept`, `reject`, or `upstream(name)` for re-query |
 
 A response re-query always sends the original request wire to the selected upstream. Cycles are rejected, and the traversal depth is at most three upstreams.
 
 ### Cache and singleflight identity
 
-Cache and singleflight share one immutable key identity:
+Cache and persistence use this immutable `CacheKey`:
 
 ```text
 canonical query wire (TXID zeroed)
@@ -104,7 +106,11 @@ canonical query wire (TXID zeroed)
 + operation (resolve or refresh)
 ```
 
-The wire identity retains flags, exact question encoding, QCLASS, and EDNS material. UDP advertised size remains part of the ingress profile. Scope distinguishes named upstreams from `asis` destinations, and policy identity prevents reuse across semantic reloads.
+The wire identity retains flags, exact question encoding, QCLASS, and EDNS material. UDP advertised size remains part of the ingress profile. The logical request scope is materialized after request routing: it distinguishes named upstreams from `asis` destinations, while policy identity prevents reuse across semantic reloads.
+
+Client IP is not part of cache or persistence identity. Different sources selecting the same named upstream share its source-neutral answer; sources selecting different upstreams partition naturally, and `asis` remains partitioned by original destination. A foreground `FlightKey::Resolve` wraps the resolve `CacheKey`, always adds strict/compatibility mode, and adds `DnsRequestMeta` only when a preference-sensitive sibling query can change the published response. Other foreground flights still coalesce across clients. A background `FlightKey::Refresh` contains only the refresh `CacheKey`; its leader captures the initiating metadata and mode. Positive, negative, and stale cache hits rerun preference rendering with the current caller's metadata.
+
+A response chain accepted only by compatibility mode—for example, one ending at a response-routing cycle/depth limit or failing strict response-template validation—is not admitted to shared memory cache or persistence. A later strict lookup therefore cannot inherit compatibility-only acceptance. Because HDNS v2 stores no execution-mode provenance, restored entries remain compatibility-only until a current-process exchange replaces them; the persistence codec stays at v2.
 
 Reuse is limited to a standard single-question QUERY with no answer or authority records and at most one option-free EDNS-v0 OPT. ECS, COOKIE, any other EDNS option, EDNS-v1, multiple OPT records, or unusual flags bypass both cache and singleflight. The request still uses the normal strict exchange path.
 
@@ -150,6 +156,8 @@ Direct UDP assigns each query a fresh CSPRNG-selected 16-bit ID, verifies both I
 | Accepted positive | Replace the domain's IP set and expiry using the answer's effective TTL. Multiple domain owners of one IP contribute ORed routing bitmaps. |
 | Accepted NODATA or NXDOMAIN | Clear that domain owner. |
 | Accepted SERVFAIL or rejected policy result | Retain current state. |
+
+`DOMAIN_ROUTING_MAP` remains global and source-independent. Source-aware request routing isolates DNS exchange scopes and answers; it does not partition eBPF domain observations or ordinary traffic routing.
 
 The worker reconciles generation-tagged desired state in batches of at most 256 sets/removes. Failed writes remain dirty and retry with bounded backoff. Before a batch mutates the backend, the worker acquires the backend lock and rechecks the generation while holding the publication fence. Reload installs the replacement projection snapshot under the same backend lock. An old batch can therefore neither enter nor continue mutating the map after a replacement generation is published.
 

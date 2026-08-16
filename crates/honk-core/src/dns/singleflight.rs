@@ -2,14 +2,54 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use honk_config::dns::DnsStrategy;
+
 use tokio::sync::broadcast;
 
-use super::cache::CacheKey;
-use super::cache::OperationKind;
+use super::cache::{CacheKey, OperationKind};
+use super::forwarder::ResolveMode;
+use super::query::DnsRequestMeta;
 use super::response::ResponseTemplate;
 
 pub(crate) const MAX_ACTIVE_FLIGHTS: usize = 2048;
 pub(crate) const MAX_WAITERS_PER_FLIGHT: usize = 256;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum FlightKey {
+    Resolve {
+        cache_key: CacheKey,
+        mode: ResolveMode,
+        prefer_meta: Option<DnsRequestMeta>,
+    },
+    Refresh(CacheKey),
+}
+
+impl FlightKey {
+    pub(crate) fn resolve(
+        cache_key: CacheKey,
+        mode: ResolveMode,
+        strategy: &DnsStrategy,
+        qtype: u16,
+        metadata: DnsRequestMeta,
+    ) -> Self {
+        let prefer_meta = matches!(
+            (strategy, qtype),
+            (DnsStrategy::PreferIpv4, 28) | (DnsStrategy::PreferIpv6, 1)
+        )
+        .then_some(metadata);
+        Self::Resolve {
+            cache_key,
+            mode,
+            prefer_meta,
+        }
+    }
+
+    fn operation(&self) -> OperationKind {
+        match self {
+            Self::Resolve { cache_key, .. } | Self::Refresh(cache_key) => cache_key.operation(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FlightCounters {
@@ -47,7 +87,7 @@ enum FlightState {
 
 #[derive(Clone, Default)]
 pub(crate) struct Singleflight {
-    entries: Arc<Mutex<HashMap<CacheKey, FlightEntry>>>,
+    entries: Arc<Mutex<HashMap<FlightKey, FlightEntry>>>,
     counters: Arc<CounterSet>,
 }
 
@@ -64,13 +104,13 @@ pub(crate) struct FlightWaiter {
 }
 
 pub(crate) struct FlightLeader {
-    key: Option<CacheKey>,
-    entries: Arc<Mutex<HashMap<CacheKey, FlightEntry>>>,
+    key: Option<FlightKey>,
+    entries: Arc<Mutex<HashMap<FlightKey, FlightEntry>>>,
     counters: Arc<CounterSet>,
 }
 
 impl Singleflight {
-    pub(crate) fn acquire(&self, key: CacheKey) -> FlightRole {
+    pub(crate) fn acquire(&self, key: FlightKey) -> FlightRole {
         let mut entries = lock(&self.entries);
         if let Some(entry) = entries.get(&key) {
             if let FlightState::Published(template) = &entry.state {

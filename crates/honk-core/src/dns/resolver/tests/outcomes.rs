@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use honk_config::dns::DnsStrategy;
 use tokio::sync::{Mutex, Notify, Semaphore};
 
-use super::{address_response, resolver_with_strategy};
+use super::{address_response, resolver_with_config, resolver_with_strategy};
 use crate::dns::cache::DnsCache;
 use crate::dns::forwarder::{DnsForwarder, DnsUpstreamPool, parse_dns_question};
 use crate::dns::routing::DnsRouter;
@@ -200,6 +200,78 @@ async fn fallback_runs_once_only_when_both_families_are_unusable() {
     .await
     .expect_err("ineligible fallback family");
     assert!(filtered.to_string().contains("no A/AAAA records"));
+}
+
+#[tokio::test]
+async fn source_specific_resolution_is_strict_and_uses_sip() {
+    let pool = ScriptedPool::new(Reply::Address(300), Reply::Failure);
+    let mut config = honk_config::dns::DnsConfig {
+        strategy: DnsStrategy::Ipv4Only,
+        ..Default::default()
+    };
+    config.routing.request.rules = vec![honk_config::dns::DnsRequestRule {
+        conditions: vec![honk_config::dns::DnsCond::Sip {
+            not: false,
+            cidrs: vec!["192.0.2.0/24".into()],
+        }],
+        action: honk_config::dns::DnsRequestAction::Upstream("default".into()),
+    }];
+    config.routing.request.fallback = honk_config::dns::DnsRequestAction::Reject;
+    let resolver = resolver_with_config(pool.clone(), &config);
+
+    let resolved = resolver
+        .resolve_for_source("example.com", "192.0.2.10".parse().unwrap())
+        .await
+        .expect("matching source");
+    let rejected = resolver
+        .resolve_for_source("example.com", "198.51.100.10".parse().unwrap())
+        .await;
+
+    assert_eq!(resolved.ipv4, ["192.0.2.10".parse::<IpAddr>().unwrap()]);
+    assert!(rejected.is_err());
+    assert_eq!(pool.counts(), [1, 0]);
+
+    config.routing.request.rules[0].action = honk_config::dns::DnsRequestAction::AsIs;
+    config.routing.request.fallback =
+        honk_config::dns::DnsRequestAction::Upstream("default".into());
+    let asis_pool = ScriptedPool::new(Reply::Address(300), Reply::Failure);
+    let asis = resolver_with_config(asis_pool.clone(), &config)
+        .resolve_for_source("example.com", "192.0.2.10".parse().unwrap())
+        .await;
+    assert!(asis.is_err());
+    assert_eq!(asis_pool.counts(), [0, 0]);
+}
+
+#[tokio::test]
+async fn source_resolution_rejects_asis_from_either_family() {
+    let pool = ScriptedPool::new(Reply::Address(300), Reply::Address(300));
+    let mut config = honk_config::dns::DnsConfig {
+        strategy: DnsStrategy::Both,
+        ..Default::default()
+    };
+    config.routing.request.rules = vec![honk_config::dns::DnsRequestRule {
+        conditions: vec![
+            honk_config::dns::DnsCond::Sip {
+                not: false,
+                cidrs: vec!["192.0.2.0/24".into()],
+            },
+            honk_config::dns::DnsCond::Qtype {
+                not: false,
+                types: vec![1],
+            },
+        ],
+        action: honk_config::dns::DnsRequestAction::AsIs,
+    }];
+    config.routing.request.fallback =
+        honk_config::dns::DnsRequestAction::Upstream("default".into());
+
+    let error = resolver_with_config(pool.clone(), &config)
+        .resolve_for_source("example.com", "192.0.2.10".parse().unwrap())
+        .await
+        .expect_err("A asis without an original destination must fail the whole lookup");
+
+    assert!(error.to_string().contains("original destination"));
+    assert_eq!(pool.counts(), [0, 1]);
 }
 
 #[tokio::test]

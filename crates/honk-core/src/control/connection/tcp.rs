@@ -126,7 +126,9 @@ impl ControlPlaneHandle {
         if matches!(dial_mode, DialMode::Domain)
             && let Some(ref d) = domain
         {
-            let verified = self.verify_domain_reality(d, original_dst.ip()).await;
+            let verified = self
+                .verify_domain_reality(d, original_dst.ip(), client_addr.ip())
+                .await;
             if !verified {
                 debug!(
                     "Sniffed domain {} failed reality check against {}, falling back to IP",
@@ -326,8 +328,12 @@ impl ControlPlaneHandle {
                 // Resolve both IPv4 and IPv6, preferring the version that
                 // matches original_dst. Apply configurable timeout.
                 let is_v6 = original_dst.is_ipv6();
-                match tokio::time::timeout(dns_resolve_timeout, self.dns_resolver.resolve(domain))
-                    .await
+                match tokio::time::timeout(
+                    dns_resolve_timeout,
+                    self.dns_resolver
+                        .resolve_for_source(domain, client_addr.ip()),
+                )
+                .await
                 {
                     Ok(Ok(resolved)) => {
                         // Prefer AAAA records for v6 original_dst, A records for v4.

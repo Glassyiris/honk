@@ -100,8 +100,11 @@ cloudflare_dot: 'tls://1.1.1.1:853?tls_server_name=cloudflare-dns.com'
 | `qname(regex: ...)` | Request 与 response | Rust 正则表达式匹配。 |
 | `qname(geosite: cn)` | Request 与 response | 匹配由指定 geosite 代码展开的域名。 |
 | `qtype(a, aaaa, ...)` | Request 与 response | 匹配 QTYPE 名称或数字 `u16`。可识别名称为 `A`、`AAAA`、`CNAME`、`MX`、`TXT`、`NS`、`PTR`、`SOA`、`SRV`、`HTTPS`、`SVCB`、`ANY` 和 `*`。 |
+| `sip(192.168.50.1, 100.64.0.0/10, 2001:db8::/32)` | 仅 request | 将逻辑客户端来源与任一所列 IP 主机地址或 CIDR 匹配。 |
 | `upstream(name, ...)` | 仅 response | 匹配生成当前应答的上游。 |
 | `ip(192.0.2.0/24, geoip: private, ...)` | 仅 response | 任一应答 IP 属于所列 CIDR 或 GeoIP 集时匹配。 |
+
+透明 53 端口与 `dns.bind` 入口的逻辑来源是 socket peer；代表已接纳 TCP/UDP 流执行的 DNS 解析使用该流的客户端地址。内部、bootstrap、prefetch 与 Clash API 查询没有逻辑来源。来源未知时，正向和取反的 `sip` 条件都为 false，请求路由会继续执行下一条规则或 fallback。response 路由不接受 `sip`。
 
 ### Request 动作
 
@@ -111,6 +114,8 @@ cloudflare_dot: 'tls://1.1.1.1:853?tls_server_name=cloudflare-dns.com'
 | `asis` | 拨向拦截所得的原始 DNS 目的地址。透明查询保留入口 transport；UDP 应答带 `TC` 时，对同一目的地址改用 TCP 重试。独立查询没有原始目的地址，会失败而不会递归拨回监听器。 |
 | 上游名 | 查询该命名上游。 |
 | `fallback: reject\|asis\|<upstream>` | 无 request 规则匹配时使用的动作；默认使用上游 `default`。 |
+
+代表已接纳流执行的带来源查询没有被拦截 DNS 服务器的原始目的地址。若其 request 策略选择 `asis`，解析会 fail closed，绝不会回退到兼容/default 上游。
 
 ### Response 动作
 
@@ -135,7 +140,7 @@ cloudflare_dot: 'tls://1.1.1.1:853?tls_server_name=cloudflare-dns.com'
 | `ipversion_prefer: 4` | `preferipv4` | 偏好 IPv4，同时保留 IPv6 回退。 |
 | `ipversion_prefer: 6` | `preferipv6` | 偏好 IPv6，同时保留 IPv4 回退。 |
 
-偏好模式下，两个地址族仍可查询。对于非偏好族的 A/AAAA 请求，honk 会让偏好族 sibling query 经过同一管线，并保留调用方除 QTYPE 外的 wire profile。偏好族有地址时，非偏好族应答会被压制为 NODATA；偏好族没有地址或 sibling query 失败时，则返回非偏好族应答。相关缓存未命中时，这会增加一次上游查询。
+偏好模式下，两个地址族仍可查询。对于非偏好族的 A/AAAA 请求，honk 会让偏好族 sibling query 经过同一管线，并保留调用方的逻辑来源、原始目的地址、入口 profile 以及除 QTYPE 外的 wire profile。偏好族有地址时，非偏好族应答会被压制为 NODATA；偏好族没有地址或 sibling query 失败时，则返回非偏好族应答。相关缓存未命中时，这会增加一次上游查询。
 
 同一策略也决定上游主机名经 bootstrap 解析后的地址拨号顺序。`both` 与 `preferipv4` 先拨 IPv4；`preferipv6` 先拨 IPv6。TCP、DoT、DoH、DoQ、DoH3 以及经代理承载的 DNS 会在拨号失败后继续尝试后续地址。直连 UDP 会把唯一一次重试优先用于另一地址族，再考虑同族的其他地址，并复用成功的 socket。仅兼容格式可用的 `ipv4only` 与 `ipv6only` 会把上游拨号候选限制在对应地址族。
 
@@ -149,6 +154,8 @@ cloudflare_dot: 'tls://1.1.1.1:853?tls_server_name=cloudflare-dns.com'
 | `optimistic_cache_ttl` | `600` | 覆盖正应答的最小 TTL，用于缓存生命周期和返回的 wire RR TTL。`0` 保留应答 TTL。 |
 | `max_cache_size` | `10000` | 条目上限。它还按每个配置条目 4 KiB 缩放保留 query/response wire 字节预算；每个分片至少 65,535 字节，全局上限 64 MiB。`0` 会告警并钳制为一个条目。 |
 | `fixed_domain_ttl { domain: seconds }` | 空 | 先于 `optimistic_cache_ttl` 应用的按域名覆盖；`0` 使该域名不可缓存。 |
+
+Request 路由先于缓存查询执行。缓存与后台 refresh 的标识使用选中的上游或精确 `asis` 目的地址，而不是原始客户端来源：选择相同交换 scope 的客户端共享条目，选择不同上游或 `asis` 目的地址的客户端仍相互隔离。偏好地址族的渲染继续保留来源元数据，因此依赖来源的 sibling 策略不会经 foreground singleflight 泄漏。
 
 例如：
 
@@ -176,6 +183,7 @@ dns {
 
     routing {
         request {
+            sip(192.168.50.0/24, 100.64.0.0/10) -> google_doh
             qname(geosite: category-ads-all) -> reject
             qname(suffix: cn) -> default
             qtype(https) -> reject

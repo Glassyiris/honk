@@ -22,7 +22,7 @@ impl DnsCacheService {
         self.get_slot(&CacheSlot::Exact(key.clone()))
     }
 
-    pub(crate) fn lookup_exact(&self, key: &CacheKey) -> ExactLookup {
+    pub(crate) fn lookup_exact(&self, key: &CacheKey, require_strict: bool) -> ExactLookup {
         let key = CacheSlot::Exact(key.clone());
         let index = self.shard_index(&key);
         let now = Instant::now();
@@ -66,6 +66,7 @@ impl DnsCacheService {
             let (positive, clear_positive) = match shard.get(&key) {
                 Some(value) => match value.positive.as_ref() {
                     Some(entry) if entry.is_stale_retention_exceeded() => (None, true),
+                    Some(entry) if require_strict && !entry.strict_reusable => (None, false),
                     Some(entry) if !entry.is_expired() => (Some(entry.clone()), false),
                     Some(_) | None => (None, false),
                 },
@@ -97,8 +98,12 @@ impl DnsCacheService {
         result
     }
 
-    pub(crate) fn get_stale_exact(&self, key: &CacheKey) -> Option<CachedEntry> {
-        self.get_stale_slot(&CacheSlot::Exact(key.clone()))
+    pub(crate) fn get_stale_exact(
+        &self,
+        key: &CacheKey,
+        require_strict: bool,
+    ) -> Option<CachedEntry> {
+        self.get_stale_slot(&CacheSlot::Exact(key.clone()), require_strict)
     }
 
     fn get_slot(&self, key: &CacheSlot) -> Option<CachedEntry> {
@@ -128,16 +133,17 @@ impl DnsCacheService {
     }
 
     pub fn get_stale(&self, key: &str) -> Option<CachedEntry> {
-        self.get_stale_slot(&CacheSlot::Legacy(key.to_owned()))
+        self.get_stale_slot(&CacheSlot::Legacy(key.to_owned()), false)
     }
 
-    fn get_stale_slot(&self, key: &CacheSlot) -> Option<CachedEntry> {
+    fn get_stale_slot(&self, key: &CacheSlot, require_strict: bool) -> Option<CachedEntry> {
         let index = self.shard_index(key);
         let mut shard = lock(&self.shards[index]);
         let result = shard.get(key).and_then(|value| {
             value
                 .positive
                 .as_ref()
+                .filter(|entry| !require_strict || entry.strict_reusable)
                 .filter(|entry| entry.is_expired() && !entry.is_stale_retention_exceeded())
                 .cloned()
         });
@@ -151,13 +157,13 @@ impl DnsCacheService {
 
     pub fn put(&self, key: String, response: Vec<u8>, min_ttl: u32) {
         let ttl = min_ttl.max(1);
-        self.put_restored(key, response, ttl);
+        self.put_slot(CacheSlot::Legacy(key), response.into(), ttl, true);
     }
 
     pub(crate) fn put_exact(&self, key: CacheKey, response: Vec<u8>, min_ttl: u32) {
         let ttl = min_ttl.max(1);
         let response = bytes::Bytes::from(response);
-        let retained = self.put_slot(CacheSlot::Exact(key.clone()), response.clone(), ttl);
+        let retained = self.put_slot(CacheSlot::Exact(key.clone()), response.clone(), ttl, true);
         if retained && let Some(persister) = lock(&self.persister).clone() {
             persister.save(
                 key,
@@ -181,20 +187,23 @@ impl DnsCacheService {
         self.put_exact(key, response, min_ttl);
     }
 
-    pub(crate) fn put_restored(&self, key: String, response: Vec<u8>, min_ttl: u32) {
-        self.put_slot(CacheSlot::Legacy(key), response.into(), min_ttl);
-    }
-
     pub(crate) fn put_restored_exact(&self, key: CacheKey, response: Vec<u8>, min_ttl: u32) {
-        self.put_slot(CacheSlot::Exact(key), response.into(), min_ttl);
+        self.put_slot(CacheSlot::Exact(key), response.into(), min_ttl, false);
     }
 
-    fn put_slot(&self, key: CacheSlot, response: bytes::Bytes, min_ttl: u32) -> bool {
+    fn put_slot(
+        &self,
+        key: CacheSlot,
+        response: bytes::Bytes,
+        min_ttl: u32,
+        strict_reusable: bool,
+    ) -> bool {
         let ttl = min_ttl.max(1);
         let entry = CachedEntry {
             response,
             expires_at: Instant::now() + Duration::from_secs(u64::from(ttl)),
             min_ttl,
+            strict_reusable,
         };
         let index = self.shard_index(&key);
         lock(&self.shards[index]).put(key, CacheValue::positive(entry))
@@ -210,6 +219,7 @@ impl DnsCacheService {
                 response: response.into(),
                 expires_at: Instant::now() - Duration::from_secs(1),
                 min_ttl,
+                strict_reusable: true,
             }),
         );
     }
@@ -229,6 +239,7 @@ impl DnsCacheService {
                 response: response.into(),
                 expires_at: Instant::now() - Duration::from_secs(1),
                 min_ttl,
+                strict_reusable: true,
             }),
         );
     }
@@ -276,6 +287,7 @@ impl DnsCacheService {
                     - super::storage::STALE_RETENTION
                     - Duration::from_secs(1),
                 min_ttl,
+                strict_reusable: true,
             }),
         );
     }

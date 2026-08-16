@@ -45,7 +45,7 @@ fn request_rules_are_first_match() {
         .plan_request(RequestContext {
             domain: "example.test",
             qtype: 1,
-            original_dst: Some(SocketAddr::from(([1, 1, 1, 1], 53))),
+            metadata: DnsRequestMeta::new(None, Some(SocketAddr::from(([1, 1, 1, 1], 53)))),
         })
         .expect("request plan");
 
@@ -88,7 +88,7 @@ fn asis_request_scope_retains_original_destination() {
         .plan_request(RequestContext {
             domain: "example.test",
             qtype: 28,
-            original_dst: Some(destination),
+            metadata: DnsRequestMeta::new(None, Some(destination)),
         })
         .expect("request plan");
 
@@ -166,7 +166,7 @@ fn upstream_request_scope_uses_logical_tag() {
         .plan_request(RequestContext {
             domain: "example.test",
             qtype: 1,
-            original_dst: None,
+            metadata: DnsRequestMeta::EMPTY,
         })
         .expect("plan");
 
@@ -188,7 +188,7 @@ fn asis_without_original_destination_is_a_typed_failure() {
     let result = planner.plan_request(RequestContext {
         domain: "example.test",
         qtype: 28,
-        original_dst: None,
+        metadata: DnsRequestMeta::EMPTY,
     });
 
     // Then
@@ -245,6 +245,43 @@ fn response_fallback_rejects() {
 
     // Then
     assert_eq!(result, ResponsePlan::Reject);
+}
+
+#[test]
+fn request_planning_uses_source_ip() {
+    let routing = DnsRouting {
+        request: DnsRequestRouting {
+            rules: vec![DnsRequestRule {
+                conditions: vec![DnsCond::Sip {
+                    not: false,
+                    cidrs: vec!["192.0.2.0/24".into()],
+                }],
+                action: DnsRequestAction::Upstream("second".into()),
+            }],
+            fallback: DnsRequestAction::Upstream("default".into()),
+        },
+        ..DnsRouting::default()
+    };
+    let planner = Planner::new(
+        DnsRouter::new(&routing).expect("router"),
+        BTreeSet::from([
+            UpstreamTag::new("default").expect("tag"),
+            UpstreamTag::new("second").expect("tag"),
+        ]),
+    );
+
+    let plan = planner
+        .plan_request(RequestContext {
+            domain: "example.test",
+            qtype: 1,
+            metadata: DnsRequestMeta::new(Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))), None),
+        })
+        .expect("plan");
+
+    assert!(matches!(
+        plan,
+        RequestPlan::Exchange(RequestScope::Upstream(upstream)) if upstream.as_str() == "second"
+    ));
 }
 
 fn request_rule(action: DnsRequestAction) -> DnsRequestRule {

@@ -30,6 +30,8 @@ flowchart LR
 | 透明 53 端口 | eBPF TCP 与 UDP 快速路径不经过完整路由循环，直接重定向 53 端口流量。adapter 保留拦截所得的原始目的地址与入口 transport。 | 透明 UDP 使用绑定到原始目的地址的 anyfrom socket；TCP 在被拦截的 stream 上应答。请求动作 `asis` 拨该原始目的地址并保留 TCP/UDP，包括 UDP `TC` 后回退 TCP。 |
 | 独立 `dns.bind` | 所选 TCP/UDP socket 是 host network namespace 中普通且未打 mark 的 socket。它们没有拦截所得的目的地址。 | TCP 在 accept 得到的 socket 上应答。UDP 使用 packet info，使通配 bind 从查询实际命中的本地地址与网卡应答。 |
 
+`DnsRequestMeta` 以一个不可变值承载逻辑客户端来源与拦截所得目的地址。透明 adapter 和独立 adapter 都从 socket peer 设置 `source_ip`；只有透明拦截设置 `original_dst`。IPv4-mapped IPv6 peer 会规范化为 IPv4。代表已接纳 TCP/UDP 流执行的查询使用该流的客户端地址，且没有拦截所得的 DNS 目的地址。内部、bootstrap、prefetch 与 Clash API 查询两者都为空。
+
 独立监听器具有以下生命周期与准入不变量：
 
 - 启动 supervisor 前，同步且 all-or-nothing 地 bind 全部所选 transport。任一 bind 失败都会关闭部分集合并令启动失败。
@@ -52,7 +54,7 @@ flowchart LR
 | 1. 准入与 generation | `DnsController` 取得 owned semaphore permit 与 runtime lease。2,048 查询的 permit 一直保留到应答完成；饱和时降级为 `REFUSED`。lease 为该请求固定一个完整 generation。 |
 | 2. 解析与校验 | adapter 要求一条完整请求。`DnsEngine` 解析 wire，拒绝没有可用问题或有多个问题的请求，将 qname 规范化为小写，并记录入口 profile。 |
 | 3. 地址族 gate 与 hosts | `ipv4only`/`ipv6only` 在 hosts 或上游工作前，以 NODATA 拒绝另一地址族。除此之外，不可变 hosts 快照先于请求路由、缓存与上游交换执行。 |
-| 4. 请求规划 | 按源码顺序的请求规则选择 reject、`asis` 或命名上游。首条命中。 |
+| 4. 请求规划 | 按源码顺序的请求规则依据规范 qname、QTYPE 与逻辑客户端来源选择 reject、`asis` 或命名上游。首条命中。 |
 | 5. 复用 | 符合资格的请求先查询精确身份的正/负缓存；未命中时共用一次 singleflight 交换。不符合资格的请求绕过两者。 |
 | 6. 交换 | 请求 scope 选择拦截所得目的地址或某个 `UpstreamPool` transport。 |
 | 7. 响应规划 | 策略使用每个上游响应前，都会严格核对其与查询是否匹配。响应规则执行 accept、reject 或经命名上游重新查询；遍历无环且最多包含三个上游。 |
@@ -77,24 +79,24 @@ flowchart LR
 | `ipv4only` | 只有 A 符合资格。AAAA 不进行上游 I/O，直接应答 NODATA。 |
 | `ipv6only` | 只有 AAAA 符合资格。A 不进行上游 I/O，直接应答 NODATA。 |
 
-偏好地址族 sibling 查询只修改第一个问题的 QTYPE。事务 ID、flags、QCLASS、EDNS 数据、入口 profile、原始目的地址及其余 wire profile 均保持不变。Sibling 失败或 NODATA 不会压制可用的非偏好响应。对于内部/应用主机名解析，bootstrap fallback 仅在所有符合资格的地址族均不可用时运行一次，随后用同一地址族资格过滤 fallback 地址。
+偏好地址族 sibling 查询只修改第一个问题的 QTYPE。事务 ID、flags、QCLASS、EDNS 数据、入口 profile、逻辑客户端来源、原始目的地址及其余 wire profile 均保持不变。Sibling 失败或 NODATA 不会压制可用的非偏好响应。对于内部/应用主机名解析，bootstrap fallback 仅在所有符合资格的地址族均不可用时运行一次，随后用同一地址族资格过滤 fallback 地址。
 
 该策略也决定 bootstrap 解析出的上游拨号目标顺序。`both` 使用 IPv4 优先的兼容顺序；偏好模式把对应地址族放在前面，同时保留另一地址族。stream 与 QUIC transport 会依次尝试候选地址。直连 UDP 保持现有两次尝试上限：首个候选失败后，唯一一次重试先选择另一地址族，再考虑同族其他地址，并缓存成功的 socket。
 
 ### DNS 路由
 
-同一规则内的条件按 AND 组合；每个条件都可取反。编译后的条件模型覆盖 qname、qtype、上游名与响应 IP。规则按源码顺序求值，并在首条命中时停止。
+同一规则内的条件按 AND 组合；一个条件内的参数按 OR 组合；每个条件都可取反。编译后的条件模型覆盖 qname、qtype、仅请求可用的来源 IP、上游名与响应 IP。规则按源码顺序求值，并在首条命中时停止。来源未知时，`sip(...)` 与 `!sip(...)` 都为 false；response 规则中的 `sip` 会在配置阶段被拒绝。
 
 | 阶段 | 策略使用的输入 | 动作 |
 | --- | --- | --- |
-| 请求 | 规范 qname 与 QTYPE；`asis` 还要求存在拦截所得的原始目的地址。 | `reject`、`asis` 或 `upstream(name)` |
+| 请求 | 规范 qname、QTYPE 与逻辑客户端来源；`asis` 还要求存在拦截所得的原始目的地址。 | `reject`、`asis` 或 `upstream(name)` |
 | 响应 | 规范 qname、QTYPE、当前上游与提取出的应答 IP。 | `accept`、`reject` 或用于重新查询的 `upstream(name)` |
 
 响应重新查询始终向所选上游发送原始请求 wire。环会被拒绝，遍历深度最多为三个上游。
 
 ### 缓存与 singleflight 身份
 
-缓存与 singleflight 共用一个不可变 key 身份：
+缓存与持久化使用以下不可变 `CacheKey`：
 
 ```text
 canonical query wire (TXID zeroed)
@@ -104,7 +106,11 @@ canonical query wire (TXID zeroed)
 + operation (resolve or refresh)
 ```
 
-wire 身份保留 flags、精确 question 编码、QCLASS 与 EDNS 内容。UDP 声明大小仍属于入口 profile。scope 区分命名上游与 `asis` 目的地址，policy identity 防止跨语义 reload 复用。
+wire 身份保留 flags、精确 question 编码、QCLASS 与 EDNS 内容。UDP 声明大小仍属于入口 profile。逻辑 request scope 在请求路由后确定：它区分命名上游与 `asis` 目的地址，policy identity 防止跨语义 reload 复用。
+
+客户端 IP 不属于缓存或持久化身份。不同来源选择同一命名上游时共享其与来源无关的应答；选择不同上游时由 scope 自然隔离，`asis` 仍按原始目的地址隔离。前台 `FlightKey::Resolve` 包含 resolve `CacheKey`，始终额外区分 strict/compatibility mode，并且仅在 preference-sensitive sibling 查询可能改变发布应答时加入 `DnsRequestMeta`；其他前台 flight 仍可跨客户端合并。后台 `FlightKey::Refresh` 只包含 refresh `CacheKey`，由 leader 捕获发起方 metadata 与 mode。正缓存、负缓存与 stale 命中都会用当前调用方 metadata 重新执行偏好地址族渲染。
+
+仅被 compatibility mode 接受的响应链不会进入共享内存缓存或持久化，例如终止于响应路由环/深度上限，或未通过 strict response-template 校验的响应链。因此后续 strict 查询不会继承 compatibility-only 的接受结果。由于 HDNS v2 不存储执行模式来源，恢复的条目在当前进程完成一次上游交换并替换它们之前仅供 compatibility mode 使用；持久化 codec 仍保持 v2。
 
 复用仅适用于标准单问题 QUERY：没有 answer 或 authority record，且至多一个无 option 的 EDNS-v0 OPT。ECS、COOKIE、任何其他 EDNS option、EDNS-v1、多个 OPT record 或异常 flags 会同时绕过缓存与 singleflight。请求仍使用正常的严格交换路径。
 
@@ -150,6 +156,8 @@ wire 身份保留 flags、精确 question 编码、QCLASS 与 EDNS 内容。UDP 
 | 已接受的 positive | 用应答的有效 TTL 替换该域名的 IP 集合与 expiry。同一 IP 的多个域名 owner 会贡献按 OR 合并的路由 bitmap。 |
 | 已接受的 NODATA 或 NXDOMAIN | 清除该域名 owner。 |
 | 已接受的 SERVFAIL 或被策略拒绝 | 保留当前状态。 |
+
+`DOMAIN_ROUTING_MAP` 保持全局且与来源无关。带来源的请求路由隔离 DNS 交换 scope 与应答；它不划分 eBPF domain observation 或普通流量路由。
 
 worker 以最多 256 个 set/remove 为一批，协调带 generation 的 desired state。失败写入保持 dirty，并以有界退避重试。批次修改 backend 前，worker 获取 backend lock，并在持有 publication fence 时重新检查 generation。reload 在同一个 backend lock 下安装替换投影快照。因此，旧批次在替换 generation 发布后既不能进入，也不能继续修改 map。
 

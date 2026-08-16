@@ -185,3 +185,172 @@ async fn delayed_preflight_miss_does_not_open_a_second_exchange_after_cache_publ
         "a caller delayed after its cache miss opened a second exchange"
     );
 }
+
+struct PreferenceSourceUpstream {
+    primary_calls: AtomicUsize,
+    primary_entered: tokio::sync::Semaphore,
+    primary_release: tokio::sync::Semaphore,
+}
+
+#[async_trait]
+impl DnsUpstreamPool for PreferenceSourceUpstream {
+    async fn query(&self, upstream_name: &str, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let (_, qtype) = parse_dns_question(raw_query).expect("question");
+        if qtype == 1 {
+            self.primary_calls.fetch_add(1, Ordering::SeqCst);
+            self.primary_entered.add_permits(1);
+            self.primary_release.acquire().await?.forget();
+            return Ok(make_a_response([192, 0, 2, 1], 300));
+        }
+        Ok(if upstream_name == "preferred" {
+            make_aaaa_response([0x20, 1, 0xdb, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], 300)
+        } else {
+            nodata_response("example.com", 28)
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn non_reusable_preference_sensitive_sources_do_not_share_a_flight() {
+    use std::collections::HashMap;
+
+    use honk_config::dns::{
+        DnsCond, DnsRequestAction, DnsRequestRouting, DnsRequestRule, DnsStrategy,
+    };
+
+    let routing = DnsRouting {
+        request: DnsRequestRouting {
+            rules: vec![
+                DnsRequestRule {
+                    conditions: vec![DnsCond::Qtype {
+                        not: false,
+                        types: vec![1],
+                    }],
+                    action: DnsRequestAction::Upstream("shared".into()),
+                },
+                DnsRequestRule {
+                    conditions: vec![
+                        DnsCond::Sip {
+                            not: false,
+                            cidrs: vec!["192.0.2.0/24".into()],
+                        },
+                        DnsCond::Qtype {
+                            not: false,
+                            types: vec![28],
+                        },
+                    ],
+                    action: DnsRequestAction::Upstream("preferred".into()),
+                },
+            ],
+            fallback: DnsRequestAction::Upstream("default".into()),
+        },
+        ..Default::default()
+    };
+
+    for (cache_enabled, fixed_ttl) in [(false, None), (true, Some(0))] {
+        let fixed_ttl = fixed_ttl
+            .map(|ttl| HashMap::from([("example.com".to_string(), ttl)]))
+            .unwrap_or_default();
+        let upstream = Arc::new(PreferenceSourceUpstream {
+            primary_calls: AtomicUsize::new(0),
+            primary_entered: tokio::sync::Semaphore::new(0),
+            primary_release: tokio::sync::Semaphore::new(0),
+        });
+        let router = Arc::new(
+            DnsRouter::new_with_fixed_ttl(&routing, &fixed_ttl).expect("source router"),
+        );
+        let forwarder = Arc::new(
+            DnsForwarder::new(upstream.clone(), test_cache(), router)
+                .with_cache_enabled(cache_enabled)
+                .with_strategy(DnsStrategy::PreferIpv6),
+        );
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for source in ["192.0.2.10", "198.51.100.10"] {
+            let forwarder = Arc::clone(&forwarder);
+            tasks.spawn(async move {
+                forwarder
+                    .resolve_outcome_with_context(
+                        &make_a_query(),
+                        DnsRequestMeta::new(Some(source.parse().expect("source")), None),
+                    )
+                    .await
+                    .expect("resolve")
+                    .into_rendered()
+            });
+        }
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            upstream.primary_entered.acquire_many(2),
+        )
+        .await
+        .expect("preference-sensitive sources shared one exchange")
+        .expect("entry semaphore")
+        .forget();
+        upstream.primary_release.add_permits(2);
+
+        let mut answer_counts = Vec::new();
+        while let Some(result) = tasks.join_next().await {
+            answer_counts.push(answer_count(&result.expect("task")));
+        }
+        answer_counts.sort_unstable();
+        assert_eq!(answer_counts, [0, 1]);
+        assert_eq!(upstream.primary_calls.load(Ordering::SeqCst), 2);
+    }
+
+    for (cache_enabled, fixed_ttl) in [(false, None), (true, Some(0))] {
+        let fixed_ttl = fixed_ttl
+            .map(|ttl| HashMap::from([("example.com".to_string(), ttl)]))
+            .unwrap_or_default();
+        let upstream = Arc::new(GatedUpstream {
+            response: make_a_response([192, 0, 2, 1], 300),
+            call_count: AtomicUsize::new(0),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let cache = test_cache();
+        let router = Arc::new(
+            DnsRouter::new_with_fixed_ttl(
+                &DnsRouting {
+                    rules: Vec::new(),
+                    fallback: "default".into(),
+                    ..Default::default()
+                },
+                &fixed_ttl,
+            )
+            .expect("source-neutral router"),
+        );
+        let forwarder = Arc::new(
+            DnsForwarder::new(upstream.clone(), cache.clone(), router)
+                .with_cache_enabled(cache_enabled),
+        );
+        let flights = cache.lock().await.singleflight();
+        let mut tasks = tokio::task::JoinSet::new();
+        for source in ["192.0.2.10", "198.51.100.10"] {
+            let forwarder = Arc::clone(&forwarder);
+            tasks.spawn(async move {
+                forwarder
+                    .resolve_outcome_with_context(
+                        &make_a_query(),
+                        DnsRequestMeta::new(Some(source.parse().expect("source")), None),
+                    )
+                    .await
+                    .expect("resolve")
+            });
+        }
+        upstream.entered.notified().await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while flights.counters().waiters == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("source-neutral query did not join the shared exchange");
+        upstream.release.notify_one();
+        while let Some(result) = tasks.join_next().await {
+            result.expect("task");
+        }
+        assert_eq!(upstream.call_count.load(Ordering::SeqCst), 1);
+    }
+}

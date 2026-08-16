@@ -14,5 +14,5 @@ use crate::dns::cache::{CacheKey, DnsCache, OperationKind};
 use crate::dns::forwarder::{DnsForwardError, DnsForwarder, DnsUpstreamPool, build_dns_query};
 use crate::dns::outcome::{OutcomeStatus, Provenance, ResponseClass};
 use crate::dns::planner::{PlanError, RequestPlan};
-use crate::dns::query::IngressProfile;
+use crate::dns::query::{DnsRequestMeta, IngressProfile};
 use crate::dns::routing::DnsRouter;

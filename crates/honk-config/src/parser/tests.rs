@@ -1002,6 +1002,51 @@ dns {
 }
 
 #[test]
+fn test_parse_dns_request_routing_sip() {
+    let input = r#"
+dns {
+    routing {
+        request {
+            sip(192.168.50.1, 100.64.0.0/10, 2001:db8::/32) -> lan_proxy
+            !sip(127.0.0.0/8, ::1/128) && qname(suffix: example-isp.cn) -> asis
+        }
+        response {
+            sip(192.168.50.0/24) -> reject
+            fallback: accept
+        }
+    }
+}
+"#;
+    let config = parse_dae_config(input).unwrap();
+    let rules = &config.dns.routing.request.rules;
+    assert_eq!(rules.len(), 2);
+    match &rules[0].conditions[0] {
+        crate::dns::DnsCond::Sip { not, cidrs } => {
+            assert!(!not);
+            assert_eq!(cidrs, &["192.168.50.1", "100.64.0.0/10", "2001:db8::/32"]);
+        }
+        _ => panic!("expected Sip"),
+    }
+    match &rules[1].conditions[0] {
+        crate::dns::DnsCond::Sip { not, cidrs } => {
+            assert!(*not);
+            assert_eq!(cidrs, &["127.0.0.0/8", "::1/128"]);
+        }
+        _ => panic!("expected Sip"),
+    }
+    assert_eq!(rules[1].conditions.len(), 2);
+    let response_rules = &config.dns.routing.response.rules;
+    assert_eq!(response_rules.len(), 1);
+    match &response_rules[0].conditions[0] {
+        crate::dns::DnsCond::Sip { not, cidrs } => {
+            assert!(!not);
+            assert_eq!(cidrs, &["192.168.50.0/24"]);
+        }
+        _ => panic!("expected response Sip to be rejected by the router"),
+    }
+}
+
+#[test]
 fn test_parse_dns_request_routing_negation() {
     let input = r#"
 dns {

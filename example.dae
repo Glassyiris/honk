@@ -82,7 +82,8 @@ dns {
     }
     routing {
         request {
-            # qname / qtype / reject / asis 均已支持；此处示例全部走 alidns
+            # sip / qname / qtype / reject / asis 均已支持；此处示例全部走 alidns
+            # sip(192.168.50.0/24, 100.64.0.0/10) -> googledns
             # qname(geosite: category-ads-all) -> reject
             # qtype(https) -> reject
             fallback: alidns

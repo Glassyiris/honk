@@ -52,12 +52,14 @@ fn test_stale_retention_exceeded() {
         response: bytes::Bytes::new(),
         expires_at: Instant::now() - Duration::from_secs(7200),
         min_ttl: 1,
+        strict_reusable: true,
     };
     assert!(entry.is_stale_retention_exceeded());
     let fresh = CachedEntry {
         response: bytes::Bytes::new(),
         expires_at: Instant::now() - Duration::from_secs(10),
         min_ttl: 1,
+        strict_reusable: true,
     };
     assert!(!fresh.is_stale_retention_exceeded());
 }
@@ -68,6 +70,7 @@ fn test_remaining_ttl() {
         response: bytes::Bytes::new(),
         expires_at: Instant::now() + Duration::from_secs(45),
         min_ttl: 45,
+        strict_reusable: true,
     };
     let remaining = entry.remaining_ttl_secs();
     assert!(

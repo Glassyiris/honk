@@ -182,7 +182,9 @@ impl ControlPlaneHandle {
         }
         if matches!(dial_mode, DialMode::Domain)
             && let Some(domain) = &quic_domain
-            && !self.verify_domain_reality(domain, original_dst.ip()).await
+            && !self
+                .verify_domain_reality(domain, original_dst.ip(), client_addr.ip())
+                .await
         {
             debug!(
                 "QUIC domain {} failed reality check against {}, falling back to IP",

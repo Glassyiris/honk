@@ -51,6 +51,7 @@ dns {
         # 根据 DNS 查询，决定使用哪个 DNS 上游。
         # 按由上到下的顺序匹配。
         request {
+            # sip(192.168.50.0/24, 100.64.0.0/10) -> homedns
             fallback: homedns
         }
     }

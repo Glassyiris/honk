@@ -1,4 +1,4 @@
-use crate::dns::cache::{CacheKey, DnsCache, OperationKind};
+use crate::dns::cache::{CacheKey, DnsCache, ExactLookup, OperationKind};
 use crate::dns::forwarder::build_dns_query;
 use crate::dns::query::{IngressProfile, QueryContext};
 use crate::dns::response::ResponseTemplate;
@@ -30,6 +30,14 @@ async fn exact_entry_round_trips_across_restart_and_renders_caller_txid() {
             .expect("restore"),
         1
     );
+    assert!(matches!(
+        restored_service.lookup_exact(&key, true),
+        ExactLookup::Miss
+    ));
+    assert!(matches!(
+        restored_service.lookup_exact(&key, false),
+        ExactLookup::Positive(_)
+    ));
     let entry = restored_service.get_exact(&key).expect("exact hit");
     let mut caller_wire = build_dns_query("example.com", 1);
     caller_wire[0..2].copy_from_slice(&0x1234_u16.to_be_bytes());
@@ -37,6 +45,9 @@ async fn exact_entry_round_trips_across_restart_and_renders_caller_txid() {
     let template = ResponseTemplate::validate(&caller, &entry.response).expect("template");
     let rendered = template.render(&caller).expect("render");
     assert_eq!(&rendered[0..2], &0x1234_u16.to_be_bytes());
+    restored_service.expire_positive_exact_for_test(&key);
+    assert!(restored_service.get_stale_exact(&key, true).is_none());
+    assert!(restored_service.get_stale_exact(&key, false).is_some());
     restart.shutdown().await.expect("restart shutdown");
 }
 
