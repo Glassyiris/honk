@@ -86,7 +86,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, trace, warn};
 
-mod commands;
+pub mod commands;
 
 pub use commands::ControlCommand;
 use connection::*;
