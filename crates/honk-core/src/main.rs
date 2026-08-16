@@ -10,7 +10,15 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[cfg(all(feature = "mimalloc", target_os = "linux"))]
 fn disable_transparent_huge_pages() -> std::io::Result<()> {
     // SAFETY: prctl receives fixed integer arguments and no pointers.
-    let result = unsafe { libc::prctl(libc::PR_SET_THP_DISABLE, 1, 0, 0, 0) };
+    let result = unsafe {
+        libc::prctl(
+            libc::PR_SET_THP_DISABLE,
+            1 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+        )
+    };
     if result == 0 {
         Ok(())
     } else {
