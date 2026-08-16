@@ -3,7 +3,7 @@ use std::process::Command;
 
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
 
-use super::{IngressProfile, QueryContext};
+use super::{DnsRequestMeta, IngressProfile, QueryContext};
 
 mod allocation;
 
@@ -215,6 +215,18 @@ fn canonical_identity_distinguishes_response_affecting_query_fields() {
             .canonical_wire(),
         base.canonical_wire()
     );
+}
+
+#[test]
+fn request_metadata_normalizes_ipv4_mapped_source() {
+    let original_dst = "[2001:db8::53]:53".parse().expect("destination");
+    let metadata = DnsRequestMeta::new(
+        Some("::ffff:192.0.2.10".parse().expect("mapped source")),
+        Some(original_dst),
+    );
+
+    assert_eq!(metadata.source_ip(), Some("192.0.2.10".parse().unwrap()));
+    assert_eq!(metadata.original_dst(), Some(original_dst));
 }
 
 #[test]

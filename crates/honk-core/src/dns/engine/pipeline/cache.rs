@@ -4,7 +4,7 @@ use super::super::effective_expiry;
 use super::ExecutionContext;
 use crate::dns::cache::{CacheKey, ExactLookup, OperationKind};
 use crate::dns::forwarder::{
-    DnsForwardError, extract_min_ttl, extract_soa_negative_ttl, rewrite_answer_ttls,
+    DnsForwardError, ResolveMode, extract_min_ttl, extract_soa_negative_ttl, rewrite_answer_ttls,
 };
 use crate::dns::outcome::{DnsOutcome, EffectiveExpiry, OutcomeStatus, Provenance, ResponseClass};
 
@@ -16,10 +16,24 @@ pub(super) async fn lookup(
         return Ok(None);
     }
     let cache = context.forwarder.cache_service().await;
-    let entry = match cache.lookup_exact(&context.cache_key) {
+    let entry = match cache.lookup_exact(
+        &context.cache_key,
+        matches!(context.mode, ResolveMode::Strict),
+    ) {
         ExactLookup::Negative(hit) => {
             let response =
                 crate::dns::response::build_dns_error_response(context.raw_query, hit.rcode);
+            let response = context
+                .forwarder
+                .apply_prefer_strategy(
+                    context.raw_query,
+                    context.prepared.query(),
+                    context.prepared.qtype(),
+                    response.into(),
+                    context.metadata,
+                    context.mode,
+                )
+                .await?;
             return context
                 .forwarder
                 .outcome_from_wire(
@@ -48,7 +62,8 @@ pub(super) async fn lookup(
         context.forwarder.maybe_spawn_refresh(
             cache.clone(),
             context.raw_query,
-            context.original_dst,
+            context.metadata,
+            context.mode,
             refresh_key,
             context.publication_epoch,
         );
@@ -61,7 +76,8 @@ pub(super) async fn lookup(
             context.prepared.query(),
             context.prepared.qtype(),
             response,
-            context.original_dst,
+            context.metadata,
+            context.mode,
         )
         .await?;
     context

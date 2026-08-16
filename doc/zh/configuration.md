@@ -227,20 +227,20 @@ honk 会在启动与重载时注入 `dip(<每个已配置 LAN/WAN 接口地址>)
 ```dae
 dns {
     upstream {
-        secure: 'https://dns.google/dns-query' -> proxy
+        home: 'udp://223.5.5.5:53' -> direct
+        lan_proxy: 'https://dns.google/dns-query' -> proxy
     }
     routing {
         request {
-            qname(suffix: example.org) && !qtype(aaaa) -> secure
-            fallback: secure
-        }
-        response {
-            upstream(secure) -> accept
-            fallback: accept
+            sip(192.168.50.0/24, 100.64.0.0/10) -> lan_proxy
+            sip(127.0.0.0/8, ::1/128) && qname(suffix: example-isp.cn) -> asis
+            fallback: home
         }
     }
 }
 ```
+
+`sip(...)` 仅用于 request，将逻辑 DNS 客户端 IP 与主机地址或 CIDR 匹配。透明 53 端口与 `dns.bind` 查询使用 socket peer；代表已接纳 TCP/UDP 流执行的 DNS 查询使用该流的客户端地址。内部、bootstrap、prefetch 与 Clash API 查询没有客户端来源，因此 `sip(...)` 和 `!sip(...)` 都不匹配并继续执行 fallback。带来源的流查询仍没有被拦截 DNS 服务器的原始目的地址，因此选择 `asis` 会 fail closed。
 
 `bind` 留空时仅使用透明 53 端口拦截。独立监听形式都要求显式端口：裸数字 `IP:port`（仅 UDP）、`udp://host:port`、`tcp://host:port` 或 `tcp+udp://host:port`；空 host 表示绑定通配地址。除非有主机防火墙保护 LAN 暴露，否则只绑定 loopback。省略 `ipversion_prefer` 时策略为 `both`，也可设为 `4`/`6` 以同时控制 DNS 结果和 bootstrap 解析出的上游拨号顺序；偏好地址族拨号失败时会回退到另一地址族。
 

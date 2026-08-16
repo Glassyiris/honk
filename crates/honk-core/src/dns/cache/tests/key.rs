@@ -181,11 +181,15 @@ fn expired_exact_negative_preserves_the_stale_positive() {
     );
 
     service.expire_positive_exact_for_test(&key);
-    assert!(service.get_stale_exact(&key).is_some());
+    assert!(service.get_stale_exact(&key, true).is_some());
     service.insert_expired_negative_exact_for_test(key.clone(), 2);
     assert!(service.negative_hit_exact(&key).is_none());
     assert_eq!(
-        service.get_stale_exact(&key).unwrap().response.as_ref(),
+        service
+            .get_stale_exact(&key, true)
+            .unwrap()
+            .response
+            .as_ref(),
         response
     );
 }
@@ -233,7 +237,7 @@ fn combined_exact_lookup_preserves_precedence_and_counts_once() {
 
     let before = service.counters();
     assert!(matches!(
-        service.lookup_exact(&key),
+        service.lookup_exact(&key, true),
         ExactLookup::Negative(hit) if hit.rcode == 2
     ));
     let after_negative = service.counters();
@@ -241,7 +245,7 @@ fn combined_exact_lookup_preserves_precedence_and_counts_once() {
     assert_eq!(after_negative.misses, before.misses);
 
     service.insert_expired_negative_exact_for_test(key.clone(), 2);
-    match service.lookup_exact(&key) {
+    match service.lookup_exact(&key, true) {
         ExactLookup::Positive(entry) => assert_eq!(entry.response.as_ref(), response.as_slice()),
         _ => panic!("expired negative must reveal the live positive"),
     }
@@ -249,7 +253,10 @@ fn combined_exact_lookup_preserves_precedence_and_counts_once() {
     assert_eq!(after_positive.hits, before.hits + 2);
     assert_eq!(after_positive.misses, before.misses);
 
-    assert!(matches!(service.lookup_exact(&miss), ExactLookup::Miss));
+    assert!(matches!(
+        service.lookup_exact(&miss, true),
+        ExactLookup::Miss
+    ));
     let after_miss = service.counters();
     assert_eq!(after_miss.hits, before.hits + 2);
     assert_eq!(after_miss.misses, before.misses + 1);

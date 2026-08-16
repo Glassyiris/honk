@@ -69,6 +69,69 @@ fn canonical_policy_normalizes_equivalent_endpoint_spellings() {
 }
 
 #[test]
+fn sip_policy_identity_normalizes_addresses_and_preserves_semantics() {
+    fn config(cidrs: &[&str], not: bool, action: DnsRequestAction) -> DnsConfig {
+        let mut config = DnsConfig::default();
+        config.routing.request.rules = vec![DnsRequestRule {
+            conditions: vec![DnsCond::Sip {
+                not,
+                cidrs: cidrs.iter().map(|cidr| (*cidr).to_owned()).collect(),
+            }],
+            action,
+        }];
+        config
+    }
+
+    let id = |config: &DnsConfig| PolicyId::from_config(config).expect("valid policy");
+    assert_eq!(
+        id(&config(
+            &["192.0.2.10", "2001:db8::10", "2001:db8:0:0::/64"],
+            false,
+            DnsRequestAction::Reject,
+        )),
+        id(&config(
+            &["192.0.2.10/32", "2001:db8::10/128", "2001:db8::/64"],
+            false,
+            DnsRequestAction::Reject,
+        )),
+    );
+    assert!(PolicyId::from_config(&config(&[], false, DnsRequestAction::Reject)).is_err());
+    assert!(
+        PolicyId::from_config(&config(&["not-an-ip"], false, DnsRequestAction::Reject,)).is_err()
+    );
+
+    let base = id(&config(
+        &["192.0.2.10", "198.51.100.0/24"],
+        false,
+        DnsRequestAction::Reject,
+    ));
+    assert_ne!(
+        base,
+        id(&config(
+            &["198.51.100.0/24", "192.0.2.10"],
+            false,
+            DnsRequestAction::Reject,
+        )),
+    );
+    assert_ne!(
+        base,
+        id(&config(
+            &["192.0.2.10", "198.51.100.0/24"],
+            true,
+            DnsRequestAction::Reject,
+        )),
+    );
+    assert_ne!(
+        base,
+        id(&config(
+            &["192.0.2.10", "198.51.100.0/24"],
+            false,
+            DnsRequestAction::AsIs,
+        )),
+    );
+}
+
+#[test]
 fn semantic_policy_fields_change_identity() {
     // Given
     let base = representative_config();

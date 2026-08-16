@@ -70,7 +70,7 @@ fn mixed_case_request_target_matches_direct_router_decision() {
         .plan_request(RequestContext {
             domain: "example.test",
             qtype: 1,
-            original_dst: None,
+            metadata: DnsRequestMeta::EMPTY,
         })
         .expect("request plan");
 

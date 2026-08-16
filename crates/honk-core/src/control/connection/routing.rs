@@ -38,11 +38,17 @@ impl ControlPlaneHandle {
         &self,
         domain: &str,
         expected: std::net::IpAddr,
+        source_ip: std::net::IpAddr,
     ) -> bool {
         let dns_timeout = std::time::Duration::from_millis(
             self.config.read().await.global.dns_resolve_timeout_ms,
         );
-        match tokio::time::timeout(dns_timeout, self.dns_resolver.resolve(domain)).await {
+        match tokio::time::timeout(
+            dns_timeout,
+            self.dns_resolver.resolve_for_source(domain, source_ip),
+        )
+        .await
+        {
             Ok(Ok(resolved)) => {
                 match domain_reality_outcome(expected, &resolved.ipv4, &resolved.ipv6) {
                     RealityOutcome::ExactMatch => true,

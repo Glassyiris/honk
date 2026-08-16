@@ -1197,6 +1197,11 @@ fn parse_dns_conditions(expr: &str, is_response: bool) -> Vec<crate::dns::DnsCon
             continue;
         }
 
+        if let Some(cidrs) = extract_fn_args(inner, "sip") {
+            conds.push(crate::dns::DnsCond::Sip { not, cidrs });
+            continue;
+        }
+
         if is_response {
             if let Some(args) = extract_fn_args(inner, "upstream") {
                 conds.push(crate::dns::DnsCond::Upstream { not, names: args });

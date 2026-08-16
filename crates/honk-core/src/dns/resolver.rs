@@ -56,6 +56,16 @@ impl DnsResolver {
         self.service.resolve_name(domain).await
     }
 
+    pub async fn resolve_for_source(
+        &self,
+        domain: &str,
+        source_ip: IpAddr,
+    ) -> anyhow::Result<ResolvedAddr> {
+        self.service
+            .resolve_name_for_source(domain, source_ip)
+            .await
+    }
+
     pub async fn resolve_first_ipv4(&self, domain: &str) -> anyhow::Result<Option<IpAddr>> {
         let result = self.resolve(domain).await?;
         Ok(result.ipv4.first().copied())

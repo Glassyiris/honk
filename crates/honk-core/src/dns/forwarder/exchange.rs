@@ -9,8 +9,9 @@ use crate::dns::cache::{CacheKey, DnsCacheService, PublicationEpoch};
 use crate::dns::engine::{DnsEngine, ParsedQuery, PreparedQuery};
 use crate::dns::outcome::{DnsOutcome, EffectiveExpiry, OutcomeParts, OutcomeStatus, Provenance};
 use crate::dns::planner::RequestScope;
-use crate::dns::query::{IngressProfile, QueryContext};
+use crate::dns::query::{DnsRequestMeta, IngressProfile, QueryContext};
 use crate::dns::response::ResponseTemplate;
+use crate::dns::singleflight::FlightKey;
 use honk_ebpf_common::DAE_BYPASS_MARK;
 
 use super::message::{build_dns_query, new_asis_socket_with_mark};
@@ -150,12 +151,13 @@ impl DnsForwarder {
         &self,
         cache_key: &CacheKey,
         raw_query: &[u8],
+        mode: ResolveMode,
     ) -> Option<Vec<u8>> {
         if !self.cache_enabled {
             return None;
         }
         let cache = self.cache_service().await;
-        let entry = cache.get_stale_exact(cache_key)?;
+        let entry = cache.get_stale_exact(cache_key, matches!(mode, ResolveMode::Strict))?;
         let mut response = entry.response.to_vec();
         rewrite_answer_ttls(&mut response, SERVE_STALE_TTL_SECS);
         if response.len() >= 2 && raw_query.len() >= 2 {
@@ -173,13 +175,14 @@ impl DnsForwarder {
         &self,
         cache: Arc<DnsCacheService>,
         raw_query: &[u8],
-        original_dst: Option<SocketAddr>,
+        metadata: DnsRequestMeta,
+        mode: ResolveMode,
         flight_key: crate::dns::cache::CacheKey,
         publication_epoch: PublicationEpoch,
     ) {
         let ingress = flight_key.ingress();
         let crate::dns::singleflight::FlightRole::Leader(owner) =
-            cache.singleflight().acquire(flight_key)
+            cache.singleflight().acquire(FlightKey::Refresh(flight_key))
         else {
             return;
         };
@@ -189,10 +192,10 @@ impl DnsForwarder {
             let result = crate::dns::engine::pipeline::resolve_with_owner(
                 &this,
                 &query,
-                original_dst,
+                metadata,
                 ingress,
                 true,
-                ResolveMode::Strict,
+                mode,
                 crate::dns::engine::pipeline::ResolveExecution::refresh(owner, publication_epoch),
             )
             .await;

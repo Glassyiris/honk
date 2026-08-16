@@ -343,6 +343,13 @@ pub enum DnsCond {
         /// QTYPE values (OR-ed within).
         types: Vec<u16>,
     },
+    /// Request only: match the client source address.
+    Sip {
+        /// Negate this condition.
+        not: bool,
+        /// IP hosts or CIDRs (OR-ed within).
+        cidrs: Vec<String>,
+    },
     /// Response only: match the upstream that produced the answer.
     Upstream {
         /// Negate this condition.

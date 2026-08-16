@@ -30,8 +30,16 @@ async fn singleflight_dedups_and_restores_txid() {
     let second = query_with_txid("example.com", 0xbbbb);
 
     let (first_response, second_response) = tokio::join!(
-        controller.answer_query(&first, None, crate::dns::query::IngressProfile::Internal,),
-        controller.answer_query(&second, None, crate::dns::query::IngressProfile::Internal,),
+        controller.answer_query(
+            &first,
+            crate::dns::query::DnsRequestMeta::EMPTY,
+            crate::dns::query::IngressProfile::Internal,
+        ),
+        controller.answer_query(
+            &second,
+            crate::dns::query::DnsRequestMeta::EMPTY,
+            crate::dns::query::IngressProfile::Internal,
+        ),
     );
 
     assert_eq!(&first_response[0..2], &first[0..2]);
@@ -56,8 +64,16 @@ async fn ineligible_queries_bypass_singleflight() {
     let second = query_with_edns_option(0xbbbb);
 
     let _ = tokio::join!(
-        controller.answer_query(&first, None, crate::dns::query::IngressProfile::Internal,),
-        controller.answer_query(&second, None, crate::dns::query::IngressProfile::Internal,),
+        controller.answer_query(
+            &first,
+            crate::dns::query::DnsRequestMeta::EMPTY,
+            crate::dns::query::IngressProfile::Internal,
+        ),
+        controller.answer_query(
+            &second,
+            crate::dns::query::DnsRequestMeta::EMPTY,
+            crate::dns::query::IngressProfile::Internal,
+        ),
     );
 
     assert_eq!(upstream.calls.load(Ordering::SeqCst), 2);

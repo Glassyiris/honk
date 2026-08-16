@@ -1445,6 +1445,280 @@ fn domain_reality_same_family_wrong_ip_is_mismatch() {
     );
 }
 
+fn source_routed_dns_resolver(
+    source_cidr: &str,
+    selected_ip: std::net::Ipv4Addr,
+    fallback_ip: std::net::Ipv4Addr,
+) -> anyhow::Result<DnsResolver> {
+    struct SourceRoutedUpstream {
+        selected_ip: std::net::Ipv4Addr,
+        fallback_ip: std::net::Ipv4Addr,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::dns::forwarder::DnsUpstreamPool for SourceRoutedUpstream {
+        async fn query(&self, upstream_name: &str, raw: &[u8]) -> anyhow::Result<Vec<u8>> {
+            let ip = if upstream_name == "selected" {
+                self.selected_ip
+            } else {
+                self.fallback_ip
+            };
+            let mut response = raw.to_vec();
+            anyhow::ensure!(response.len() >= 12, "short DNS query");
+            response[2] = 0x81;
+            response[3] = 0x80;
+            response[6..8].copy_from_slice(&1u16.to_be_bytes());
+            response.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
+            response.extend_from_slice(&ip.octets());
+            Ok(response)
+        }
+    }
+
+    let config = honk_config::dns::DnsConfig {
+        strategy: honk_config::dns::DnsStrategy::Ipv4Only,
+        routing: honk_config::dns::DnsRouting {
+            request: honk_config::dns::DnsRequestRouting {
+                rules: vec![honk_config::dns::DnsRequestRule {
+                    conditions: vec![honk_config::dns::DnsCond::Sip {
+                        not: false,
+                        cidrs: vec![source_cidr.into()],
+                    }],
+                    action: honk_config::dns::DnsRequestAction::Upstream("selected".into()),
+                }],
+                fallback: honk_config::dns::DnsRequestAction::Upstream("fallback".into()),
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let router = Arc::new(crate::dns::routing::DnsRouter::new_from_dns_config(
+        &config,
+    )?);
+    let forwarder = Arc::new(
+        crate::dns::forwarder::DnsForwarder::new(
+            Arc::new(SourceRoutedUpstream {
+                selected_ip,
+                fallback_ip,
+            }),
+            Arc::new(tokio::sync::Mutex::new(crate::dns::cache::DnsCache::new(1))),
+            router,
+        )
+        .with_cache_enabled(false)
+        .with_policy_from_config(&config)?,
+    );
+    DnsResolver::with_forwarder(&config, forwarder)
+}
+
+fn tls_client_hello(sni: &str) -> Vec<u8> {
+    let hello = crate::control::quic::test_utils::build_client_hello(Some(sni));
+    let mut record = vec![0x16, 0x03, 0x01];
+    record.extend_from_slice(&(hello.len() as u16).to_be_bytes());
+    record.extend_from_slice(&hello);
+    record
+}
+
+async fn store_active_tcp_flow(
+    handle: &ControlPlaneHandle,
+    original_dst: SocketAddr,
+    client_addr: SocketAddr,
+) -> anyhow::Result<()> {
+    let tuples = build_tuples_key(
+        original_dst.ip(),
+        original_dst.port(),
+        client_addr.ip(),
+        client_addr.port(),
+        6,
+    );
+    handle.ebpf.write().await.tcp_conn_state_store(
+        &tuples,
+        &honk_ebpf_common::conn::ConnState {
+            state: honk_ebpf_common::conn::TcpState::TcpStateActive as u8,
+            last_seen_ns: 1,
+            ..Default::default()
+        },
+    )?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn tcp_domain_reality_uses_client_source() -> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let original_dst = listener.local_addr()?;
+    let mut config = udp_test_config("udp-test", vec![udp_test_node()], vec![]);
+    config.ensure_builtin_nodes();
+    config.global.dial_mode = "domain".into();
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut handle = udp_test_handle(
+        config,
+        UdpTestMode::TcpHold {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        },
+        1,
+    );
+    handle.dns_resolver = Arc::new(source_routed_dns_resolver(
+        "127.0.0.42/32",
+        original_dst.ip().to_string().parse()?,
+        "192.0.2.1".parse()?,
+    )?);
+
+    let client_socket = tokio::net::TcpSocket::new_v4()?;
+    client_socket.bind("127.0.0.42:0".parse()?)?;
+    let mut client = client_socket.connect(original_dst).await?;
+    let (accepted, client_addr) = listener.accept().await?;
+    store_active_tcp_flow(&handle, original_dst, client_addr).await?;
+    let task_handle = handle.clone();
+    let mut task =
+        tokio::spawn(async move { task_handle.serve_connection(accepted, client_addr).await });
+    let hello = tls_client_hello("source.test");
+    client.write_all(&hello).await?;
+    tokio::select! {
+        _ = entered.notified() => {}
+        result = &mut task => anyhow::bail!("TCP handler exited before dial: {result:?}"),
+        _ = tokio::time::sleep(Duration::from_secs(5)) => anyhow::bail!("TCP dial timed out"),
+    }
+    release.notify_one();
+    let (mut upstream, _) =
+        tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
+
+    let tracked = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(entry) = handle.connection_tracker.snapshot().into_iter().next() {
+                break entry;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert_eq!(tracked.domain.as_deref(), Some("source.test"));
+
+    let mut received = vec![0; hello.len()];
+    upstream.read_exact(&mut received).await?;
+    assert_eq!(received, hello);
+    client.shutdown().await?;
+    upstream.shutdown().await?;
+    drop(client);
+    drop(upstream);
+    tokio::time::timeout(Duration::from_secs(5), task).await???;
+    Ok(())
+}
+
+#[tokio::test]
+async fn udp_domain_reality_uses_client_source() -> anyhow::Result<()> {
+    let client = addr("192.0.2.10:53000");
+    let original_dst = addr("198.51.100.20:443");
+    let mut config = udp_test_config("udp-test", vec![udp_test_node()], vec![]);
+    config.ensure_builtin_nodes();
+    config.global.dial_mode = "domain".into();
+    let mut handle = udp_test_handle(config, UdpTestMode::Success, 1);
+    handle.dns_resolver = Arc::new(source_routed_dns_resolver(
+        "192.0.2.0/24",
+        original_dst.ip().to_string().parse()?,
+        "203.0.113.20".parse()?,
+    )?);
+
+    let hello = crate::control::quic::test_utils::build_client_hello(Some("source.test"));
+    let packet = crate::control::quic::test_utils::protect_initial_packet(
+        b"dcid1234",
+        b"",
+        1,
+        0,
+        1,
+        &crate::control::quic::test_utils::wrap_crypto_frame(0, &hello),
+    );
+    serve_test_udp_to(&handle, client, original_dst, &packet).await?;
+
+    let tracked = handle
+        .connection_tracker
+        .snapshot()
+        .into_iter()
+        .next()
+        .expect("ready UDP endpoint must be tracked");
+    assert_eq!(tracked.domain.as_deref(), Some("source.test"));
+    handle.udp_pool.remove(client, original_dst);
+    Ok(())
+}
+
+#[tokio::test]
+async fn tcp_local_resolution_uses_client_source() -> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = TcpListener::bind("0.0.0.0:0").await?;
+    let original_dst = SocketAddr::new("127.0.0.1".parse()?, listener.local_addr()?.port());
+    let mut node = Node {
+        name: "local-resolve".into(),
+        protocol: honk_config::types::NodeProtocol::VMess,
+        address: "127.0.0.1".into(),
+        port: 9,
+        ..Default::default()
+    };
+    node.id = node.derive_id();
+    let mut config = udp_test_config("local-resolve", vec![node], vec![]);
+    config.ensure_builtin_nodes();
+    config.global.dial_mode = "domain+".into();
+    let router = Router::new(&config.routing.rules, &config.routing.default_outbound)?;
+    let dial_target = Arc::new(std::sync::Mutex::new(None));
+    let handler = Arc::new(UdpTestHandler {
+        mode: UdpTestMode::TcpCaptureTarget(Arc::clone(&dial_target)),
+    });
+    let mut registry = ProxyRegistry::new();
+    registry.register(honk_outbound::proxy::ProtocolEntry::new(
+        honk_config::types::NodeProtocol::VMess,
+        handler,
+    ));
+    let dns_resolver =
+        source_routed_dns_resolver("127.0.0.42/32", "127.0.0.2".parse()?, "127.0.0.3".parse()?)?;
+    let dns_forwarder = dns_resolver.forwarder();
+    let plane = ControlPlane::new(
+        config,
+        Box::new(crate::ebpf::mock::MockEbpfBackend::new()),
+        router,
+        Arc::new(registry),
+        dns_resolver,
+        dns_forwarder,
+    )?;
+    let handle = plane.spawn_handle();
+
+    let client_socket = tokio::net::TcpSocket::new_v4()?;
+    client_socket.bind("127.0.0.42:0".parse()?)?;
+    let mut client = client_socket.connect(original_dst).await?;
+    let (accepted, client_addr) = listener.accept().await?;
+    store_active_tcp_flow(&handle, original_dst, client_addr).await?;
+    let task_handle = handle.clone();
+    let task =
+        tokio::spawn(async move { task_handle.serve_connection(accepted, client_addr).await });
+    let hello = tls_client_hello("source.test");
+    client.write_all(&hello).await?;
+    let (mut upstream, _) =
+        tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
+    let (captured_target, captured_domain) = dial_target
+        .lock()
+        .expect("dial target")
+        .clone()
+        .expect("captured dial");
+    assert_eq!(captured_domain.as_deref(), Some("source.test"));
+    assert_eq!(
+        captured_target,
+        SocketAddr::new("127.0.0.2".parse()?, original_dst.port())
+    );
+
+    let mut received = vec![0; hello.len()];
+    upstream.read_exact(&mut received).await?;
+    assert_eq!(received, hello);
+    client.shutdown().await?;
+    upstream.shutdown().await?;
+    drop(client);
+    drop(upstream);
+    tokio::time::timeout(Duration::from_secs(5), task).await???;
+    Ok(())
+}
+
+type CapturedTcpTarget = Arc<std::sync::Mutex<Option<(SocketAddr, Option<String>)>>>;
+
 #[derive(Debug, Clone)]
 enum UdpTestMode {
     DialError,
@@ -1477,6 +1751,7 @@ enum UdpTestMode {
         entered: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
     },
+    TcpCaptureTarget(CapturedTcpTarget),
     Hold {
         entered: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
@@ -1602,13 +1877,17 @@ impl honk_outbound::proxy::TcpOutbound for UdpTestHandler {
         target_domain: Option<&str>,
         _connect_timeout: Duration,
     ) -> anyhow::Result<honk_outbound::proxy::ProxyStream> {
-        let UdpTestMode::TcpHold { entered, release } = &self.mode else {
-            return Err(anyhow::anyhow!(
-                "TCP dial is not used by the UDP lifecycle tests"
-            ));
-        };
-        entered.notify_one();
-        release.notified().await;
+        match &self.mode {
+            UdpTestMode::TcpHold { entered, release } => {
+                entered.notify_one();
+                release.notified().await;
+            }
+            UdpTestMode::TcpCaptureTarget(captured) => {
+                *captured.lock().expect("dial target") =
+                    Some((target, target_domain.map(str::to_owned)));
+            }
+            _ => anyhow::bail!("TCP dial is not used by the UDP lifecycle tests"),
+        }
         let stream = TcpStream::connect(target).await?;
         Ok(honk_outbound::proxy::ProxyStream {
             stream: Box::new(stream),
