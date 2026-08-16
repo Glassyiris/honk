@@ -8,6 +8,14 @@ use honk_core::Cli;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[cfg(feature = "mimalloc")]
+fn configure_mimalloc() {
+    const MI_OPTION_PAGE_RECLAIM_ON_FREE: libmimalloc_sys::mi_option_t = 35;
+    // Cross-thread frees are common on Tokio; reclaiming their pages avoids worker-heap fragmentation.
+    // SAFETY: this runs once, before the runtime starts, with the option index from bundled mimalloc v3.
+    unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PAGE_RECLAIM_ON_FREE, 1) };
+}
+
+#[cfg(feature = "mimalloc")]
 fn mimalloc_collect_period(value: Option<&str>) -> Option<std::time::Duration> {
     let seconds = value.and_then(|value| value.parse().ok()).unwrap_or(60);
     (seconds > 0).then(|| std::time::Duration::from_secs(seconds))
@@ -201,6 +209,9 @@ where
 }
 
 fn main() -> anyhow::Result<()> {
+    #[cfg(feature = "mimalloc")]
+    configure_mimalloc();
+
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all();
 
