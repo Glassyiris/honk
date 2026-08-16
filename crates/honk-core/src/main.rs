@@ -7,6 +7,25 @@ use honk_core::Cli;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+#[cfg(all(feature = "mimalloc", target_os = "linux"))]
+fn disable_transparent_huge_pages() -> std::io::Result<()> {
+    // SAFETY: prctl receives fixed integer arguments and no pointers.
+    let result = unsafe {
+        libc::prctl(
+            libc::PR_SET_THP_DISABLE,
+            1 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 #[cfg(feature = "mimalloc")]
 fn mimalloc_collect_period(value: Option<&str>) -> Option<std::time::Duration> {
     let seconds = value.and_then(|value| value.parse().ok()).unwrap_or(60);
@@ -44,16 +63,153 @@ where
 }
 
 #[cfg(feature = "mimalloc")]
+const OWNER_SWEEP_RENDEZVOUS_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(5);
+#[cfg(feature = "mimalloc")]
+const OWNER_SWEEP_MAX_ROUNDS: usize = 3;
+#[cfg(feature = "mimalloc")]
+const OWNER_SWEEP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
+#[cfg(feature = "mimalloc")]
+#[derive(Clone)]
+struct OwnerCollector {
+    period: std::time::Duration,
+    worker_count: usize,
+    parked_workers: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(feature = "mimalloc")]
+struct SweepState {
+    workers: std::collections::HashSet<std::thread::ThreadId>,
+    released: bool,
+}
+
+#[cfg(feature = "mimalloc")]
+impl OwnerCollector {
+    async fn run(self) {
+        let mut interval = tokio::time::interval(self.period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if !self.workers_idle_for_sweep() {
+                continue;
+            }
+            let covered = self.sweep().await;
+            if covered < self.worker_count {
+                tracing::warn!(
+                    covered,
+                    expected = self.worker_count,
+                    "mimalloc owner sweep could not reach every Tokio worker"
+                );
+            }
+        }
+    }
+
+    fn workers_idle_for_sweep(&self) -> bool {
+        // The interval task itself occupies one worker.
+        self.parked_workers
+            .load(std::sync::atomic::Ordering::Relaxed)
+            >= self.worker_count.saturating_sub(1)
+    }
+
+    async fn sweep(&self) -> usize {
+        let covered = std::sync::Arc::new(parking_lot::Mutex::new(
+            std::collections::HashSet::with_capacity(self.worker_count),
+        ));
+        for round in 0..OWNER_SWEEP_MAX_ROUNDS {
+            if covered.lock().len() == self.worker_count {
+                break;
+            }
+            self.sweep_round(&covered).await;
+            if round + 1 < OWNER_SWEEP_MAX_ROUNDS && covered.lock().len() < self.worker_count {
+                tokio::time::sleep(OWNER_SWEEP_RETRY_DELAY.min(self.period)).await;
+            }
+        }
+        covered.lock().len()
+    }
+
+    async fn sweep_round(
+        &self,
+        covered: &std::sync::Arc<
+            parking_lot::Mutex<std::collections::HashSet<std::thread::ThreadId>>,
+        >,
+    ) {
+        // Blocking here makes pending tasks occupy distinct workers; collection stays
+        // in each worker's ordinary idle callback after these tasks return.
+        let rendezvous = std::sync::Arc::new((
+            parking_lot::Mutex::new(SweepState {
+                workers: std::collections::HashSet::with_capacity(self.worker_count),
+                released: false,
+            }),
+            parking_lot::Condvar::new(),
+        ));
+        let mut tasks = Vec::with_capacity(self.worker_count);
+        for _ in 0..self.worker_count {
+            let collector = self.clone();
+            let rendezvous = std::sync::Arc::clone(&rendezvous);
+            let covered = std::sync::Arc::clone(covered);
+            tasks.push(tokio::spawn(async move {
+                collector.rendezvous_and_mark(&rendezvous, &covered);
+            }));
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
+    }
+
+    fn rendezvous_and_mark(
+        &self,
+        rendezvous: &(parking_lot::Mutex<SweepState>, parking_lot::Condvar),
+        covered: &parking_lot::Mutex<std::collections::HashSet<std::thread::ThreadId>>,
+    ) {
+        let (state, wake) = rendezvous;
+        let deadline = std::time::Instant::now() + OWNER_SWEEP_RENDEZVOUS_TIMEOUT;
+        let worker = std::thread::current().id();
+        let mut state = state.lock();
+        state.workers.insert(worker);
+        if state.workers.len() == self.worker_count {
+            state.released = true;
+            wake.notify_all();
+        }
+        while !state.released {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() || wake.wait_for(&mut state, remaining).timed_out() {
+                state.released = true;
+                wake.notify_all();
+                break;
+            }
+        }
+        drop(state);
+        covered.lock().insert(worker);
+    }
+}
+
+#[cfg(feature = "mimalloc")]
 fn install_idle_collector<F>(
     builder: &mut tokio::runtime::Builder,
     period: std::time::Duration,
     collect: F,
-) where
+) -> std::sync::Arc<std::sync::atomic::AtomicUsize>
+where
     F: Fn() + Send + Sync + 'static,
 {
+    builder.on_thread_start(|| {
+        LAST_MI_COLLECT.with(|last_collect| {
+            last_collect.set(Some(std::time::Instant::now()));
+        });
+    });
+    let parked_workers = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let parked = std::sync::Arc::clone(&parked_workers);
     builder.on_thread_park(move || {
         collect_mimalloc_on_idle(std::time::Instant::now(), period, &collect);
+        parked.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     });
+    let unparked = std::sync::Arc::clone(&parked_workers);
+    builder.on_thread_unpark(move || {
+        let previous = unparked.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        debug_assert!(previous > 0);
+    });
+    parked_workers
 }
 fn block_on_worker<F, T>(runtime: &tokio::runtime::Runtime, future: F) -> anyhow::Result<T>
 where
@@ -64,22 +220,42 @@ where
 }
 
 fn main() -> anyhow::Result<()> {
+    #[cfg(all(feature = "mimalloc", target_os = "linux"))]
+    disable_transparent_huge_pages()?;
+
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all();
 
     #[cfg(feature = "mimalloc")]
-    {
+    let collector = {
         let value = std::env::var("HONK_MI_COLLECT_SECS").ok();
-        if let Some(period) = mimalloc_collect_period(value.as_deref()) {
-            install_idle_collector(&mut builder, period, || {
-                // SAFETY: this hook runs on the worker that owns the default heap.
+        mimalloc_collect_period(value.as_deref()).map(|period| {
+            let parked_workers = install_idle_collector(&mut builder, period, || {
+                // SAFETY: callbacks run on the worker owning this default heap.
                 unsafe { libmimalloc_sys::mi_collect(true) };
             });
-        }
-    }
+            (period, parked_workers)
+        })
+    };
 
     let runtime = builder.build()?;
-    block_on_worker(&runtime, async_main())
+    #[cfg(feature = "mimalloc")]
+    let sweep = collector.map(|(period, parked_workers)| {
+        runtime.spawn(
+            OwnerCollector {
+                period,
+                worker_count: runtime.metrics().num_workers(),
+                parked_workers,
+            }
+            .run(),
+        )
+    });
+    let result = block_on_worker(&runtime, async_main());
+    #[cfg(feature = "mimalloc")]
+    if let Some(sweep) = sweep {
+        sweep.abort();
+    }
+    result
 }
 
 async fn async_main() -> anyhow::Result<()> {
@@ -141,11 +317,12 @@ mod tests {
 
         let mut builder = tokio::runtime::Builder::new_multi_thread();
         builder.worker_threads(4).enable_all();
-        install_idle_collector(&mut builder, std::time::Duration::ZERO, move || {
-            let (threads, wake) = &*callback_threads;
-            threads.lock().insert(std::thread::current().id());
-            wake.notify_all();
-        });
+        let _parked_workers =
+            install_idle_collector(&mut builder, std::time::Duration::ZERO, move || {
+                let (threads, wake) = &*callback_threads;
+                threads.lock().insert(std::thread::current().id());
+                wake.notify_all();
+            });
         let runtime = builder.build().unwrap();
 
         let barrier = Arc::new(Barrier::new(5));
@@ -180,6 +357,88 @@ mod tests {
         }
 
         assert_eq!(*task_threads.lock(), *observed);
+    }
+
+    #[cfg(feature = "mimalloc")]
+    #[test]
+    fn periodic_sweep_collects_workers_that_remain_parked() {
+        use parking_lot::{Condvar, Mutex};
+        use std::collections::HashSet;
+        use std::sync::{Arc, Barrier};
+
+        let started = Arc::new(Mutex::new(HashSet::new()));
+        let observed = Arc::new((Mutex::new(HashSet::new()), Condvar::new()));
+        let callback_observed = Arc::clone(&observed);
+        let period = std::time::Duration::ZERO;
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder.worker_threads(4).enable_all();
+        let parked_workers = install_idle_collector(&mut builder, period, move || {
+            let (threads, wake) = &*callback_observed;
+            threads.lock().insert(std::thread::current().id());
+            wake.notify_all();
+        });
+        let runtime = builder.build().unwrap();
+
+        let barrier = Arc::new(Barrier::new(5));
+        let tasks = (0..4)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                let started = Arc::clone(&started);
+                runtime.spawn(async move {
+                    started.lock().insert(std::thread::current().id());
+                    barrier.wait();
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        runtime.block_on(async {
+            for task in tasks {
+                task.await.unwrap();
+            }
+        });
+        let started = started.lock().clone();
+        assert_eq!(started.len(), 4);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while parked_workers.load(std::sync::atomic::Ordering::Relaxed) < 4 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "not every runtime worker parked"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        observed.0.lock().clear();
+        let collector = OwnerCollector {
+            period,
+            worker_count: runtime.metrics().num_workers(),
+            parked_workers,
+        };
+        assert_eq!(runtime.block_on(collector.sweep()), 4);
+
+        let (threads, wake) = &*observed;
+        let mut observed = threads.lock();
+        while observed.len() < 4 {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!remaining.is_zero(), "not every runtime worker collected");
+            let timeout = wake.wait_for(&mut observed, remaining);
+            assert!(!timeout.timed_out() || observed.len() == 4);
+        }
+        assert_eq!(*observed, started);
+    }
+
+    #[cfg(feature = "mimalloc")]
+    #[test]
+    fn periodic_sweep_waits_until_other_workers_are_parked() {
+        let parked_workers = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(2));
+        let collector = OwnerCollector {
+            period: std::time::Duration::from_secs(60),
+            worker_count: 4,
+            parked_workers: std::sync::Arc::clone(&parked_workers),
+        };
+
+        assert!(!collector.workers_idle_for_sweep());
+        parked_workers.store(3, std::sync::atomic::Ordering::Relaxed);
+        assert!(collector.workers_idle_for_sweep());
     }
     #[test]
     fn top_level_future_runs_on_a_runtime_worker() {
