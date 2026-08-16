@@ -7,12 +7,15 @@ use honk_core::Cli;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-#[cfg(feature = "mimalloc")]
-fn configure_mimalloc() {
-    const MI_OPTION_PAGE_RECLAIM_ON_FREE: libmimalloc_sys::mi_option_t = 35;
-    // Cross-thread frees are common on Tokio; reclaiming their pages avoids worker-heap fragmentation.
-    // SAFETY: this runs once, before the runtime starts, with the option index from bundled mimalloc v3.
-    unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PAGE_RECLAIM_ON_FREE, 1) };
+#[cfg(all(feature = "mimalloc", target_os = "linux"))]
+fn disable_transparent_huge_pages() -> std::io::Result<()> {
+    // SAFETY: prctl receives fixed integer arguments and no pointers.
+    let result = unsafe { libc::prctl(libc::PR_SET_THP_DISABLE, 1, 0, 0, 0) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 #[cfg(feature = "mimalloc")]
@@ -209,8 +212,8 @@ where
 }
 
 fn main() -> anyhow::Result<()> {
-    #[cfg(feature = "mimalloc")]
-    configure_mimalloc();
+    #[cfg(all(feature = "mimalloc", target_os = "linux"))]
+    disable_transparent_huge_pages()?;
 
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all();
