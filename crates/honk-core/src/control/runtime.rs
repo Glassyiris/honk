@@ -601,10 +601,22 @@ impl ControlPlane {
                                 let mut next = current.clone();
                                 next.ensure_local_direct_rules().then_some(next)
                             };
-                            if let Some(new_config) = new_config {
-                                info!("refreshing local direct rules after network change");
-                                if !self.apply_runtime_config(new_config, &drain).await {
-                                    warn!("network-triggered routing refresh rejected");
+                            let applied = match new_config {
+                                Some(new_config) => {
+                                    info!("refreshing local direct rules after network change");
+                                    self.apply_runtime_config(new_config, &drain).await
+                                }
+                                None => true,
+                            };
+                            if !applied {
+                                warn!("network-triggered routing refresh rejected");
+                                if self
+                                    .network_refresh_retry
+                                    .as_ref()
+                                    .is_none_or(|retry| retry.is_finished())
+                                {
+                                    self.network_refresh_retry =
+                                        Some(spawn_network_refresh_retry(self.command_sender()));
                                 }
                             }
                             self.alive_set.notify_network_change();

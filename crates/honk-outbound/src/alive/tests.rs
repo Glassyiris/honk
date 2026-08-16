@@ -493,6 +493,53 @@ async fn warm_http_probe_is_the_only_result_recorded_as_latency() {
     }
 }
 
+#[tokio::test]
+async fn v4_only_check_url_leaves_v6_family_untouched() {
+    let set = AliveDialerSet::new();
+    set.register_node(id(1), "n1".into(), "127.0.0.1:1".into());
+    // Age the node out of the registration grace period so failures count.
+    set.node_registered_at
+        .write()
+        .insert(id(1), Instant::now() - GRACE_PERIOD);
+    set.set_http_probe(
+        Arc::new(MockHttpProber {
+            result: HttpProbeResult::WarmSuccess(Duration::from_millis(10)),
+        }),
+        "http://127.0.0.1/".into(),
+        "HEAD".into(),
+    )
+    .await;
+
+    for _ in 0..4 {
+        assert!(set.probe_node(id(1), Duration::from_millis(200)).await);
+    }
+    assert!(
+        set.is_alive_for(id(1), ProbeDomain::Tcp, IpVersion::V6),
+        "a v4-only check URL carries no v6 evidence; the family must stay alive (#46)"
+    );
+}
+
+#[tokio::test]
+async fn raw_tcp_probe_with_v4_only_node_address_leaves_v6_untouched() {
+    let set = AliveDialerSet::new();
+    set.register_node(id(1), "n1".into(), "127.0.0.1:9".into());
+    set.node_registered_at
+        .write()
+        .insert(id(1), Instant::now() - GRACE_PERIOD);
+
+    for _ in 0..4 {
+        assert!(!set.probe_node(id(1), Duration::from_millis(100)).await);
+    }
+    assert!(
+        !set.is_alive_for(id(1), ProbeDomain::Tcp, IpVersion::V4),
+        "real v4 connect failures must still kill the v4 family"
+    );
+    assert!(
+        set.is_alive_for(id(1), ProbeDomain::Tcp, IpVersion::V6),
+        "a v4-only node address carries no v6 evidence (#46)"
+    );
+}
+
 struct MockUdpProber {
     result: std::sync::Mutex<Result<Duration, String>>,
 }

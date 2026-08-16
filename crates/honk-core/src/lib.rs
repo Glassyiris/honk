@@ -784,6 +784,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 let _ = set_sysctl(&format!("net.ipv4.conf.{}.rp_filter", lan_ifname), "0");
             }
             _dae0_guard = Some(create_dae0_link()?);
+            for wan_ifname in &configured_ifaces.wan {
+                enable_wan_accept_ra(wan_ifname);
+            }
             info!(
                 "dae0 link created before eBPF load (ifindex={})",
                 _dae0_guard.as_ref().unwrap().ifindex
@@ -2007,7 +2010,7 @@ pub(crate) const DAE0_IPV6_PREFIX_HI: u64 = 0xfd00_686f_6e6b_0000;
 /// (169.254.0.0/16), as a big-endian u32.
 pub(crate) const DAE0_IPV4_NET: u32 = 0xA9FE_0000;
 
-fn set_sysctl(key: &str, value: &str) -> anyhow::Result<()> {
+pub(crate) fn set_sysctl(key: &str, value: &str) -> anyhow::Result<()> {
     // Prefer /proc/sys because the standalone `sysctl` binary may not be on
     // PATH in minimal environments (e.g. NixOS containers).
     let path = format!("/proc/sys/{}", key.replace('.', "/"));
@@ -2027,6 +2030,17 @@ fn set_sysctl(key: &str, value: &str) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Keep RA reception alive on a WAN interface across the datapath's
+/// all.forwarding=1 pin: with the stock accept_ra=1 the kernel drops RAs
+/// once forwarding is on, and networkd's userspace RA disables itself the
+/// same way — either path lets the SLAAC default route expire (#46).
+#[cfg(feature = "ebpf")]
+pub(crate) fn enable_wan_accept_ra(ifname: &str) {
+    if let Err(e) = set_sysctl(&format!("net.ipv6.conf.{ifname}.accept_ra"), "2") {
+        warn!("failed to set accept_ra for {ifname}: {e}");
+    }
 }
 
 /// Whether `path` is a mountpoint (appears in /proc/mounts).

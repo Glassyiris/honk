@@ -284,6 +284,9 @@ async fn reconcile(
                         hooks,
                     },
                 );
+                if matches!(role, IfaceRole::Wan | IfaceRole::LanWan) {
+                    crate::enable_wan_accept_ra(&name);
+                }
                 info!(interface = %name, role = ?role, "attached eBPF programs to new interface");
                 changed = true;
             }

@@ -66,6 +66,32 @@ fn nfqueue_token_retry_backoff_caps_at_thirty_seconds() {
     assert_eq!(backoff.failed(), Duration::from_secs(1));
 }
 
+#[tokio::test(start_paused = true)]
+async fn network_refresh_retry_resends_with_backoff_then_stops() {
+    let (tx, mut rx) = mpsc::channel(4);
+    let retry = spawn_network_refresh_retry(tx);
+
+    for delay in [5, 15, 60] {
+        tokio::time::advance(Duration::from_secs(delay)).await;
+        assert!(matches!(
+            rx.recv().await,
+            Some(ControlCommand::NetworkChanged)
+        ));
+    }
+    retry
+        .await
+        .expect("retry task stops after the backoff ladder");
+}
+
+#[tokio::test(start_paused = true)]
+async fn network_refresh_retry_exits_when_control_plane_is_gone() {
+    let (tx, rx) = mpsc::channel::<ControlCommand>(1);
+    drop(rx);
+    let retry = spawn_network_refresh_retry(tx);
+    tokio::time::advance(Duration::from_secs(5)).await;
+    retry.await.expect("retry task exits on a closed channel");
+}
+
 #[test]
 fn test_build_dns_probe_query() {
     let q = build_dns_probe_query();

@@ -243,6 +243,7 @@ impl ControlPlane {
             tcp_sniff_neg_cache: Arc::new(crate::control::tcp_sniff::TcpSniffNegCache::new()),
             command_tx: tx,
             command_rx: Some(rx),
+            network_refresh_retry: None,
             alive_set,
             connection_pool: Arc::new(ConnectionPool::with_capacity_limit(
                 resource_budget.tcp_pool_entries,
