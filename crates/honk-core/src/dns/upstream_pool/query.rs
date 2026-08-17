@@ -287,15 +287,15 @@ impl DnsUpstreamPool for UpstreamPool {
             .entries
             .get(upstream_name)
             .ok_or_else(|| anyhow::anyhow!("unknown upstream: {upstream_name}"))?;
-        let injected = match self.client_subnet {
-            Some(subnet) => match crate::dns::ecs::EcsQuery::prepare(raw_query, subnet) {
+        let injected = match (self.client_subnet, entry.outbound.is_none()) {
+            (Some(subnet), true) => match crate::dns::ecs::EcsQuery::prepare(raw_query, subnet) {
                 Ok(injected) => injected,
                 Err(error) => {
                     debug!(%error, "DNS query is not eligible for configured ECS injection");
                     None
                 }
             },
-            None => None,
+            _ => None,
         };
         let effective_query = injected
             .as_ref()

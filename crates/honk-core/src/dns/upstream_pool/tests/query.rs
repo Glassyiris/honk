@@ -37,32 +37,45 @@ async fn test_udp_query() {
 }
 
 #[tokio::test]
-async fn configured_ecs_is_added_upstream_and_hidden_from_client() {
+async fn configured_ecs_is_added_only_without_explicit_outbound() {
     let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let server_address = server.local_addr().unwrap();
-    let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
     let server_handle = tokio::spawn(async move {
-        let mut buffer = [0_u8; 512];
-        let (length, source) = server.recv_from(&mut buffer).await.unwrap();
-        let mut response = buffer[..length].to_vec();
-        response[2] |= 0x80;
-        seen_tx.send(response.clone()).unwrap();
-        server.send_to(&response, source).await.unwrap();
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let mut buffer = [0_u8; 512];
+            let (length, source) = server.recv_from(&mut buffer).await.unwrap();
+            let mut response = buffer[..length].to_vec();
+            seen.push(response.clone());
+            response[2] |= 0x80;
+            server.send_to(&response, source).await.unwrap();
+        }
+        seen
     });
 
-    let upstream = make_upstream("test-ecs", &server_address.to_string(), DnsProtocol::Udp);
-    let pool = UpstreamPool::new(&[upstream], make_router())
+    let plain = make_upstream("ecs-plain", &server_address.to_string(), DnsProtocol::Udp);
+    let explicit = DnsUpstream {
+        outbound: Some("direct".into()),
+        ..make_upstream(
+            "ecs-explicit",
+            &server_address.to_string(),
+            DnsProtocol::Udp,
+        )
+    };
+    let pool = UpstreamPool::new(&[plain, explicit], make_router())
         .unwrap()
         .with_client_subnet(Some("203.0.113.0/24".parse().unwrap()));
     let query = mock_dns_query(0x1234);
-    let response = pool.query("test-ecs", &query).await.unwrap();
+    let plain_response = pool.query("ecs-plain", &query).await.unwrap();
+    let explicit_response = pool.query("ecs-explicit", &query).await.unwrap();
 
-    let seen = seen_rx.await.unwrap();
-    assert!(seen.ends_with(&[0, 8, 0, 7, 0, 1, 24, 0, 203, 0, 113]));
+    let seen = server_handle.await.unwrap();
+    assert!(seen[0].ends_with(&[0, 8, 0, 7, 0, 1, 24, 0, 203, 0, 113]));
+    assert_eq!(seen[1][2..], query[2..]);
     let mut expected = query;
     expected[2] |= 0x80;
-    assert_eq!(response, expected);
-    server_handle.await.unwrap();
+    assert_eq!(plain_response, expected);
+    assert_eq!(explicit_response, expected);
 }
 
 #[tokio::test]

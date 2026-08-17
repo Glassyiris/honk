@@ -47,7 +47,7 @@ SIGHUP 会构建新快照。若 `/etc/hosts` 不可读，启动失败；重载�
 
 `client_subnet` 只作用于命名上游。IPv4 地址表示 `/32`；IPv4 CIDR 会归一化到网络地址。`auto` 向 `1.1.1.1:33434` 发送带 bypass mark 的 UDP 探测，`auto(IPv4)` 只替换该探测目标。若路由选出的本地地址是公网地址则直接使用；否则每个 TTL 使用 3 个独立 UDP flow、最多检查 12 个 TTL，并把首个公网 ICMP hop 作为 `/24`。探测不依赖 DNS 或 HTTP 服务。启动、SIGHUP 以及 route/link/address 变化会为替换 DNS generation 解析一个新的不可变值；有界探测失败时，该 generation 不生成 ECS。
 
-honk 不会覆盖客户端自带的 ECS，包括 `/0`。对于没有 ECS 且发往命名上游的合格查询，它在 cache/singleflight 接纳后添加配置的 option，校验上游回显的 ECS，并在缓存或答复前只移除自身注入的状态。有效 prefix 会进入 DNS policy identity，因此自动 prefix 变化前后的应答不会交叉复用。`asis` 请求保持逐字节不变。ECS 会向上游权威服务器暴露近似客户端网络；只有 CDN 本地性确有需要时才应启用。
+honk 不会覆盖客户端自带的 ECS，包括 `/0`。凡显式声明 `-> tag` 或旧式 `outbound:` 的上游都不注入生成的 ECS；未声明的上游即使随后被普通流量路由选到代理，仍属合格。这个静态 opt-out 避免把直连网络 prefix 与显式选择的出口组合，并避免向该解析器泄露该 prefix。对于没有 ECS 且发往合格命名上游的查询，honk 在 cache/singleflight 接纳后添加配置的 option，校验上游回显的 ECS，并在缓存或答复前只移除自身注入的状态。有效 prefix 会进入 DNS policy identity，因此自动 prefix 变化前后的应答不会交叉复用。`asis` 请求保持逐字节不变。ECS 会向上游权威服务器暴露近似客户端网络；只有 CDN 本地性确有需要时才应启用。
 
 ## 上游
 
