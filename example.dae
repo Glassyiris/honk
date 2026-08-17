@@ -72,28 +72,29 @@ group {
 }
 
 dns {
-    # 默认只用透明 :53；需要普通 host-netns UDP socket 时再启用
-    # bind: '127.0.0.1:1053'
+    # 省略 bind，只保留透明 :53，避免额外暴露无认证的递归监听器。
     ipversion_prefer: 4
-    # use_host: true  # 优先使用 /etc/hosts；修改后需 SIGHUP
-    # client_subnet: auto  # 也可写 IPv4/CIDR 或 auto(探测目标 IPv4)
+    use_host: true
+    # 自动推断直连公网路径的 /24；代理上游不会携带生成的 ECS。
+    client_subnet: auto
     upstream {
-        alidns: 'udp://223.5.5.5:53'
-        googledns: 'udp+tcp://8.8.8.8:53'
+        # 固定 IP 避免 bootstrap 依赖；显式 direct 让国内 CDN 使用直连 ECS。
+        alidns: 'https://223.5.5.5/dns-query?tls_server_name=dns.alidns.com' -> direct
+        # 境外解析使用可代理的 DoH；DoQ/DoH3 当前仍只能直连。
+        googledns: 'https://8.8.8.8/dns-query?tls_server_name=dns.google' -> auto
     }
     routing {
         request {
-            # sip / qname / qtype / reject / asis 均已支持；此处示例全部走 alidns
-            # sip(192.168.50.0/24, 100.64.0.0/10) -> googledns
-            # qname(geosite: category-ads-all) -> reject
-            # qtype(https) -> reject
+            # 已知污染域名直接走代理，其余先取更接近直连出口的应答。
+            qname(geosite: gfw) -> googledns
             fallback: alidns
         }
-        # response {
-        #     upstream(googledns) -> accept
-        #     ip(geoip: private) && !qname(geosite: cn) -> googledns
-        #     fallback: accept
-        # }
+        response {
+            upstream(googledns) -> accept
+            qname(geosite: private) -> accept
+            ip(geoip: cn) -> accept
+            fallback: googledns
+        }
     }
 }
 
