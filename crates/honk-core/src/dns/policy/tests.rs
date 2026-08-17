@@ -53,6 +53,37 @@ fn dns_v2_persistence_cache_identity_matches_external_golden_contract() {
 }
 
 #[test]
+fn effective_client_subnet_partitions_policy_identity() {
+    let disabled = representative_config();
+    let mut unresolved = representative_config();
+    unresolved.client_subnet = "auto(9.9.9.9)".into();
+    assert_eq!(
+        PolicyId::from_config(&disabled).unwrap(),
+        PolicyId::from_config(&unresolved).unwrap()
+    );
+
+    let mut first = unresolved.clone();
+    first.resolved_client_subnet = Some("198.51.100.0/24".parse().unwrap());
+    let mut same = first.clone();
+    same.client_subnet = "auto(1.1.1.1)".into();
+    let mut second = same.clone();
+    second.resolved_client_subnet = Some("203.0.113.0/24".parse().unwrap());
+
+    assert_eq!(
+        PolicyId::from_config(&first).unwrap(),
+        PolicyId::from_config(&same).unwrap()
+    );
+    assert_ne!(
+        PolicyId::from_config(&disabled).unwrap(),
+        PolicyId::from_config(&first).unwrap()
+    );
+    assert_ne!(
+        PolicyId::from_config(&first).unwrap(),
+        PolicyId::from_config(&second).unwrap()
+    );
+}
+
+#[test]
 fn canonical_policy_normalizes_equivalent_endpoint_spellings() {
     // Given
     let first = representative_config();

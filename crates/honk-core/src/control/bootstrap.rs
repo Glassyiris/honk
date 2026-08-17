@@ -24,7 +24,8 @@ impl ControlPlane {
                     &config.global.bootstrap_resolver,
                 ),
                 config.dns.strategy.clone(),
-            )?,
+            )?
+            .with_client_subnet(config.dns.effective_client_subnet()?),
         );
         Self::new_with_upstream_pool(
             config,

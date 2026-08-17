@@ -557,6 +557,9 @@ impl Config {
         self.dns
             .bind_endpoint()
             .map_err(|error| crate::ConfigError::Validation(error.to_string()))?;
+        self.dns
+            .client_subnet_mode()
+            .map_err(|error| crate::ConfigError::Validation(error.to_string()))?;
 
         // The eBPF datapath has the mark compiled in; userspace cannot inject
         // a different value, so a custom mark would silently break the proxy.
@@ -711,6 +714,15 @@ mod builtin_nodes_tests {
             error.to_string().contains("dns.bind"),
             "validation error must identify dns.bind: {error}"
         );
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_structured_dns_client_subnet() {
+        let config =
+            Config::from_json_str(r#"{"dns":{"client_subnet":"auto(dns.google)"}}"#).unwrap();
+        let error = config.validate().unwrap_err();
+        assert!(matches!(error, crate::ConfigError::Validation(_)));
+        assert!(error.to_string().contains("dns.client_subnet"));
     }
 
     #[test]

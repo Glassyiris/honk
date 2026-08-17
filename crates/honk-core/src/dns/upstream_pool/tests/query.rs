@@ -37,6 +37,35 @@ async fn test_udp_query() {
 }
 
 #[tokio::test]
+async fn configured_ecs_is_added_upstream_and_hidden_from_client() {
+    let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server_address = server.local_addr().unwrap();
+    let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+    let server_handle = tokio::spawn(async move {
+        let mut buffer = [0_u8; 512];
+        let (length, source) = server.recv_from(&mut buffer).await.unwrap();
+        let mut response = buffer[..length].to_vec();
+        response[2] |= 0x80;
+        seen_tx.send(response.clone()).unwrap();
+        server.send_to(&response, source).await.unwrap();
+    });
+
+    let upstream = make_upstream("test-ecs", &server_address.to_string(), DnsProtocol::Udp);
+    let pool = UpstreamPool::new(&[upstream], make_router())
+        .unwrap()
+        .with_client_subnet(Some("203.0.113.0/24".parse().unwrap()));
+    let query = mock_dns_query(0x1234);
+    let response = pool.query("test-ecs", &query).await.unwrap();
+
+    let seen = seen_rx.await.unwrap();
+    assert!(seen.ends_with(&[0, 8, 0, 7, 0, 1, 24, 0, 203, 0, 113]));
+    let mut expected = query;
+    expected[2] |= 0x80;
+    assert_eq!(response, expected);
+    server_handle.await.unwrap();
+}
+
+#[tokio::test]
 async fn udp_prefer_ipv6_falls_back_to_ipv4_and_reuses_winner() {
     let upstream_server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let upstream_address = upstream_server.local_addr().unwrap();

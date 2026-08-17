@@ -8,6 +8,7 @@
 | --- | --- | --- |
 | `bind` | 省略 / `""` | 可选的独立 DNS 监听器；空值只关闭此监听器。 |
 | `use_host` | `false` | 使用每个 DNS runtime generation 对应的一份 `/etc/hosts` 快照应答匹配的 IN class A/AAAA 查询。 |
+| `client_subnet` | 省略 / `""` | 可选的 EDNS Client Subnet preset：IPv4、IPv4 CIDR、`auto` 或 `auto(IPv4)`。 |
 | `upstream { ... }` | `default: 'udp://223.5.5.5:53'` | 命名上游服务器。第一个显式 `upstream` 块会替换内置条目。 |
 | `routing { ... }` | 无规则；request fallback 为 `default`；response fallback 为 `accept` | 有序的 request 与 response 路由。 |
 | `ipversion_prefer` | 省略：`both` | `4` 选择 `preferipv4`；`6` 选择 `preferipv6`。 |
@@ -41,6 +42,12 @@
 在 `ipv4only`/`ipv6only` 的硬地址族过滤之后，已知名称的 IN class A 或 AAAA 查询优先于 request 规则（包括 `reject`）、缓存查询和上游交换。名称存在但没有所请求地址族时，honk 返回 NOERROR/NODATA，且不查询上游。其他 class 和 qtype 继续走正常管线。Hosts 应答使用 60 秒 TTL，并绕过 honk 的 DNS 缓存。
 
 SIGHUP 会构建新快照。若 `/etc/hosts` 不可读，启动失败；重载时，替换 generation 会在发布前失败，当前 generation 继续使用。
+
+## EDNS Client Subnet（`client_subnet`）
+
+`client_subnet` 只作用于命名上游。IPv4 地址表示 `/32`；IPv4 CIDR 会归一化到网络地址。`auto` 向 `1.1.1.1:33434` 发送带 bypass mark 的 UDP 探测，`auto(IPv4)` 只替换该探测目标。若路由选出的本地地址是公网地址则直接使用；否则最多检查 12 个 TTL，并把首个公网 ICMP hop 作为 `/24`。探测不依赖 DNS 或 HTTP 服务。启动、SIGHUP 以及 route/link/address 变化会为替换 DNS generation 解析一个新的不可变值；有界探测失败时，该 generation 不生成 ECS。
+
+honk 不会覆盖客户端自带的 ECS，包括 `/0`。对于没有 ECS 且发往命名上游的合格查询，它在 cache/singleflight 接纳后添加配置的 option，校验上游回显的 ECS，并在缓存或答复前只移除自身注入的状态。有效 prefix 会进入 DNS policy identity，因此自动 prefix 变化前后的应答不会交叉复用。`asis` 请求保持逐字节不变。ECS 会向上游权威服务器暴露近似客户端网络；只有 CDN 本地性确有需要时才应启用。
 
 ## 上游
 

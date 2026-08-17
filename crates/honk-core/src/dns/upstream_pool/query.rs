@@ -1,3 +1,4 @@
+use anyhow::Context;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -286,44 +287,68 @@ impl DnsUpstreamPool for UpstreamPool {
             .entries
             .get(upstream_name)
             .ok_or_else(|| anyhow::anyhow!("unknown upstream: {upstream_name}"))?;
-        if entry.protocol == DnsProtocol::Udp {
-            return self.query_datagram(upstream_name, entry, raw_query).await;
-        }
-        let proxy_node = self
-            .resolve_dial_leaf(entry)
-            .await
-            .map_err(|error| anyhow::anyhow!("DNS upstream '{upstream_name}': {error}"))?;
-        let _admission = self.admit_query().await?;
-        debug!(
-            "DNS upstream '{}' dial leaf={:?} (forced={})",
-            upstream_name,
-            proxy_node.as_ref().map(|node| node.name.as_str()),
-            entry.outbound.is_some()
-        );
-        if matches!(entry.protocol, DnsProtocol::Quic | DnsProtocol::H3) && proxy_node.is_some() {
-            anyhow::bail!(
-                "DNS upstream '{}' protocol {:?} does not support outbound proxy yet",
+        let injected = match self.client_subnet {
+            Some(subnet) => match crate::dns::ecs::EcsQuery::prepare(raw_query, subnet) {
+                Ok(injected) => injected,
+                Err(error) => {
+                    debug!(%error, "DNS query is not eligible for configured ECS injection");
+                    None
+                }
+            },
+            None => None,
+        };
+        let effective_query = injected
+            .as_ref()
+            .map_or(raw_query, crate::dns::ecs::EcsQuery::wire);
+
+        let response = if entry.protocol == DnsProtocol::Udp {
+            self.query_datagram(upstream_name, entry, effective_query)
+                .await?
+        } else {
+            let proxy_node = self
+                .resolve_dial_leaf(entry)
+                .await
+                .map_err(|error| anyhow::anyhow!("DNS upstream '{upstream_name}': {error}"))?;
+            let _admission = self.admit_query().await?;
+            debug!(
+                "DNS upstream '{}' dial leaf={:?} (forced={})",
                 upstream_name,
-                entry.protocol
+                proxy_node.as_ref().map(|node| node.name.as_str()),
+                entry.outbound.is_some()
             );
+            if matches!(entry.protocol, DnsProtocol::Quic | DnsProtocol::H3) && proxy_node.is_some()
+            {
+                anyhow::bail!(
+                    "DNS upstream '{}' protocol {:?} does not support outbound proxy yet",
+                    upstream_name,
+                    entry.protocol
+                );
+            }
+            let response = self
+                .get_transport(entry, proxy_node.as_ref())
+                .await?
+                .exchange(effective_query)
+                .await?;
+            debug!(
+                "DNS upstream '{}' ({:?} {} via {:?}) returned {} bytes",
+                upstream_name,
+                entry.protocol,
+                entry.endpoint.host,
+                proxy_node
+                    .as_ref()
+                    .map(|node| node.name.as_str())
+                    .unwrap_or("direct"),
+                response.len()
+            );
+            response
+        };
+
+        match injected {
+            Some(injected) => injected
+                .restore_response(response)
+                .context("invalid ECS response from DNS upstream"),
+            None => Ok(response),
         }
-        let response = self
-            .get_transport(entry, proxy_node.as_ref())
-            .await?
-            .exchange(raw_query)
-            .await?;
-        debug!(
-            "DNS upstream '{}' ({:?} {} via {:?}) returned {} bytes",
-            upstream_name,
-            entry.protocol,
-            entry.endpoint.host,
-            proxy_node
-                .as_ref()
-                .map(|node| node.name.as_str())
-                .unwrap_or("direct"),
-            response.len()
-        );
-        Ok(response)
     }
 }
 

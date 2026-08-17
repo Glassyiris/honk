@@ -17,6 +17,7 @@
 #[cfg(feature = "dns-bench")]
 pub mod bench_support;
 pub mod cache;
+pub(crate) mod ecs;
 pub mod endpoint;
 pub mod engine;
 pub mod forwarder;

@@ -114,6 +114,8 @@ A response chain accepted only by compatibility mode—for example, one ending a
 
 Reuse is limited to a standard single-question QUERY with no answer or authority records and at most one option-free EDNS-v0 OPT. ECS, COOKIE, any other EDNS option, EDNS-v1, multiple OPT records, or unusual flags bypass both cache and singleflight. The request still uses the normal strict exchange path.
 
+Configured ECS is a generation-pinned named-upstream transport policy, not ingress identity. The effective IPv4 prefix is included in `PolicyId`; the original query remains the cache/singleflight key. The upstream pool adds ECS only after admission, preserves any client ECS, validates an echoed generated option, and removes generated EDNS state before response analysis and cache publication. `asis` bypasses this transformation. Automatic inference is refreshed transactionally on startup, reload, and network events, so active queries retain their old generation while a replacement is probed and built.
+
 ## Cache and persistence
 
 | Mechanism | Invariant |

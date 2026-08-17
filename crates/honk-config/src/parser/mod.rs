@@ -877,6 +877,11 @@ fn parse_dns_section(section: &Section) -> Result<DnsConfig, crate::ConfigError>
     if let Some(v) = kv.get("use_host") {
         cfg.use_host = parse_bool(v);
     }
+    if let Some(value) = kv.get("client_subnet") {
+        cfg.client_subnet.clone_from(value);
+        cfg.client_subnet_mode()
+            .map_err(|error| crate::ConfigError::Parse(error.to_string()))?;
+    }
 
     if let Some(v) = kv.get("ipversion_prefer") {
         cfg.strategy = parse_ip_prefer(v);

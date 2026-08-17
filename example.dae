@@ -76,6 +76,7 @@ dns {
     # bind: '127.0.0.1:1053'
     ipversion_prefer: 4
     # use_host: true  # 优先使用 /etc/hosts；修改后需 SIGHUP
+    # client_subnet: auto  # 也可写 IPv4/CIDR 或 auto(探测目标 IPv4)
     upstream {
         alidns: 'udp://223.5.5.5:53'
         googledns: 'udp+tcp://8.8.8.8:53'

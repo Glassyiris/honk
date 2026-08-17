@@ -573,6 +573,29 @@ async fn valid_reload_commits() {
 }
 
 #[tokio::test]
+async fn client_subnet_reload_publishes_effective_policy() {
+    let cp = test_cp().await;
+    let mut replacement = Config::default();
+    replacement.dns.client_subnet = "198.51.100.9/24".into();
+
+    assert!(
+        cp.apply_runtime_config(replacement, &DrainTracker::new())
+            .await
+    );
+    let config = cp.config_handle().read().await.clone();
+    assert_eq!(
+        config.dns.effective_client_subnet().unwrap(),
+        Some("198.51.100.0/24".parse().unwrap())
+    );
+    let expected_policy = crate::dns::policy::PolicyId::from_config(&config.dns).unwrap();
+    let runtime = cp.dns_controller.runtime_provider().acquire();
+    assert_eq!(
+        runtime.runtime().forwarder().policy_id.as_ref(),
+        Some(&expected_policy)
+    );
+}
+
+#[tokio::test]
 async fn routing_push_failure_replays_old_plan_and_keeps_userspace_generation() {
     let cp = test_cp().await;
     cp.ebpf

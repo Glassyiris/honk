@@ -8,6 +8,15 @@ impl ControlPlane {
     /// subscription merges share this command-channel-serialized path.
     pub(in crate::control) async fn apply_runtime_config(
         &self,
+        mut new_config: Config,
+        drain: &DrainTracker,
+    ) -> bool {
+        crate::dns::ecs::resolve_client_subnet(&mut new_config.dns).await;
+        self.apply_resolved_runtime_config(new_config, drain).await
+    }
+
+    pub(in crate::control) async fn apply_resolved_runtime_config(
+        &self,
         new_config: Config,
         drain: &DrainTracker,
     ) -> bool {
@@ -486,6 +495,7 @@ impl ControlPlane {
                 ),
                 config.dns.strategy.clone(),
             )?
+            .with_client_subnet(config.dns.effective_client_subnet()?)
             .with_runtime_generation(runtime_generation)
             .with_timeouts(
                 std::time::Duration::from_millis(config.global.dns_resolve_timeout_ms),
