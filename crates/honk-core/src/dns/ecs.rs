@@ -18,10 +18,11 @@ const ECS_OPTION_CODE: u16 = 8;
 const OPT_RECORD_TYPE: u16 = 41;
 const DEFAULT_EDNS_PAYLOAD: u16 = 1232;
 const PROBE_PORT: u16 = 33434;
+const PROBES_PER_TTL: u16 = 3;
 const ICMP_TIME_EXCEEDED: u8 = 11;
 const ICMP_TTL_EXCEEDED: u8 = 0;
 const MAX_PROBE_TTL: u32 = 12;
-const HOP_TIMEOUT: Duration = Duration::from_millis(200);
+const HOP_TIMEOUT: Duration = Duration::from_millis(150);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(crate) async fn resolve_client_subnet(config: &mut DnsConfig) {
@@ -63,44 +64,56 @@ pub(crate) async fn resolve_client_subnet(config: &mut DnsConfig) {
 }
 
 async fn first_public_hop(target: Ipv4Addr) -> io::Result<Option<Ipv4Addr>> {
-    let socket = honk_outbound::util::marked_udp_socket(SocketAddr::V4(SocketAddrV4::new(
-        Ipv4Addr::UNSPECIFIED,
-        0,
-    )))?;
-    setsockopt(&socket, sockopt::Ipv4RecvErr, &true).map_err(io::Error::from)?;
-    socket.connect(SocketAddrV4::new(target, PROBE_PORT))?;
-    let socket = tokio::net::UdpSocket::from_std(socket)?;
-
-    if let SocketAddr::V4(local) = socket.local_addr()?
+    let route_socket = probe_socket(target, PROBE_PORT)?;
+    if let SocketAddr::V4(local) = route_socket.local_addr()?
         && is_public_ipv4(*local.ip())
     {
         return Ok(Some(*local.ip()));
     }
 
     for ttl in 1..=MAX_PROBE_TTL {
-        loop {
-            match recv_hop(socket.as_raw_fd()) {
-                Ok(HopReply::Public(address)) => return Ok(Some(address)),
-                Ok(HopReply::Other) => {}
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                Err(error) => return Err(error),
+        // Vary the UDP flow so one ICMP-silent ECMP path cannot promote a later backbone hop.
+        let port = PROBE_PORT + (ttl as u16 - 1) * PROBES_PER_TTL;
+        let replies = tokio::join!(
+            probe_hop(target, port, ttl),
+            probe_hop(target, port + 1, ttl),
+            probe_hop(target, port + 2, ttl),
+        );
+        for reply in [replies.0?, replies.1?, replies.2?].into_iter().flatten() {
+            if let HopReply::Public(address) = reply {
+                return Ok(Some(address));
             }
-        }
-        socket.set_ttl(ttl)?;
-        socket.send(&[0]).await?;
-        let reply = tokio::time::timeout(
-            HOP_TIMEOUT,
-            socket.async_io(Interest::ERROR, || recv_hop(socket.as_raw_fd())),
-        )
-        .await;
-        match reply {
-            Ok(Ok(HopReply::Public(address))) => return Ok(Some(address)),
-            Ok(Ok(HopReply::Other)) | Err(_) => {}
-            Ok(Err(error)) if error.kind() == io::ErrorKind::WouldBlock => {}
-            Ok(Err(error)) => return Err(error),
         }
     }
     Ok(None)
+}
+
+fn probe_socket(target: Ipv4Addr, port: u16) -> io::Result<std::net::UdpSocket> {
+    let socket = honk_outbound::util::marked_udp_socket(SocketAddr::V4(SocketAddrV4::new(
+        Ipv4Addr::UNSPECIFIED,
+        0,
+    )))?;
+    setsockopt(&socket, sockopt::Ipv4RecvErr, &true).map_err(io::Error::from)?;
+    socket.connect(SocketAddrV4::new(target, port))?;
+    Ok(socket)
+}
+
+async fn probe_hop(target: Ipv4Addr, port: u16, ttl: u32) -> io::Result<Option<HopReply>> {
+    let socket = probe_socket(target, port)?;
+    socket.set_ttl(ttl)?;
+    let socket = tokio::net::UdpSocket::from_std(socket)?;
+    socket.send(&[0]).await?;
+    match tokio::time::timeout(
+        HOP_TIMEOUT,
+        socket.async_io(Interest::ERROR, || recv_hop(socket.as_raw_fd())),
+    )
+    .await
+    {
+        Ok(Ok(reply)) => Ok(Some(reply)),
+        Ok(Err(error)) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Ok(None),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
