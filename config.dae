@@ -40,19 +40,22 @@ subscription {
 
 # 对于中国大陆域名使用 alidns，其他使用 googledns 查询。
 dns {
-    # 保持注释可避免与现有 dnsmasq/AdGuardHome 抢占；透明 :53 仍生效
-    # bind: 'tcp+udp://:1053'
-    ipversion_prefer: 4
-    # use_host: true  # SIGHUP 后重新加载 /etc/hosts
+    #ipversion_prefer: 4
     upstream {
-        homedns: 'udp+tcp://10.10.10.1:53'
+        local: 'udp://127.0.0.1:53'
+        remote: 'tcp+udp://dns.google:53'
     }
     routing {
-        # 根据 DNS 查询，决定使用哪个 DNS 上游。
-        # 按由上到下的顺序匹配。
         request {
-            # sip(192.168.50.0/24, 100.64.0.0/10) -> homedns
-            fallback: homedns
+            qtype(https) -> reject
+            qname(geosite:gfw) -> remote
+            fallback: local
+        }
+        response {
+            upstream(remote) -> accept
+            qname(geosite:private) -> accept
+            ip(geoip:cn) -> accept
+            fallback: remote
         }
     }
 }
