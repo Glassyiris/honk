@@ -4702,6 +4702,35 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
                 let direct_stats = control.stats.udp_snapshot().nfqueue;
                 anyhow::ensure!(direct_stats.direct_accepted == 1);
                 anyhow::ensure!(direct_stats.proxy_copied == 0);
+                let tc_status = std::process::Command::new("tc")
+                    .args([
+                        "filter",
+                        "add",
+                        "dev",
+                        "honk-wan0",
+                        "egress",
+                        "pref",
+                        "1",
+                        "matchall",
+                        "action",
+                        "drop",
+                    ])
+                    .status()?;
+                anyhow::ensure!(tc_status.success(), "failed to install classic TC sentinel");
+                client.send_to(b"later-hook", direct_dst).await?;
+                anyhow::ensure!(
+                    tokio::time::timeout(
+                        Duration::from_millis(25),
+                        server_direct.recv_from(&mut buffer),
+                    )
+                    .await
+                    .is_err(),
+                    "honk terminated the TC chain before a later classifier"
+                );
+                let tc_status = std::process::Command::new("tc")
+                    .args(["filter", "del", "dev", "honk-wan0", "egress", "pref", "1"])
+                    .status()?;
+                anyhow::ensure!(tc_status.success(), "failed to remove classic TC sentinel");
 
                 let proxy_dst = SocketAddr::from(([198, 51, 100, 2], 41002));
                 let proxy_payload = b"\x80proxy-first";
