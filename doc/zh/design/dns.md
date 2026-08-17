@@ -141,6 +141,8 @@ wire 身份保留 flags、精确 question 编码、QCLASS 与 EDNS 内容。UDP 
 | DoQ | 一个长生命周期 QUIC connection；每个查询一条双向 stream。 | 仅直连。 |
 | DoH3 | 一个长生命周期 QUIC 与 HTTP/3 session。 | 仅直连。 |
 
+DoQ 与 DoH3 目前仅支持直连，因为它们的客户端会在带 bypass mark 的原生 UDP socket 上创建 quinn endpoint，而 DNS 代理拨号路径当前只提供 boxed TCP 字节流；QUIC 无法运行在这种 stream 上。代理支持需要把所选出站的 `PacketTransport` 适配到 quinn 的 `AsyncUdpSocket` 接口，并保留 datagram 边界、地址元数据、MTU 行为、generation 所有权、重连与关闭语义。在该适配层完成前，选到代理的 DoQ/DoH3 上游会在拨号前失败，而不会静默绕过所选路由；需要代理加密 DNS 时应使用 DoT 或 DoH。
+
 `-> node-or-group` 强制选择一个由 generation 固定的拨号叶子。没有显式目标时，上游 endpoint 经过固定的流量 Router 与组快照。UDP+代理有意使用 TCP-DNS；此策略独立于普通代理 UDP 流量使用的 SOCKS5 RFC 1928 UDP transport。
 
 直连上游 socket 带 bypass mark，使其流量不会重新进入透明拦截。主机名 endpoint 通过 generation 捕获的 bootstrap resolver 解析；拨号从不依赖 honk 被拦截的 resolver 路径。

@@ -141,6 +141,8 @@ When `store_dns` enables persistence, a bounded actor mirrors retained positive 
 | DoQ | One long-lived QUIC connection; one bidirectional stream per query. | Direct only. |
 | DoH3 | One long-lived QUIC and HTTP/3 session. | Direct only. |
 
+DoQ and DoH3 are direct-only because their clients create a quinn endpoint on a native bypass-marked UDP socket, while the DNS proxy dial path currently provides only a boxed TCP byte stream. QUIC cannot run over that stream. Proxy support requires adapting the selected outbound's `PacketTransport` to quinn's `AsyncUdpSocket` interface while preserving datagram boundaries, address metadata, MTU behavior, generation ownership, reconnects, and shutdown. Until that adapter exists, a proxy-selected DoQ or DoH3 upstream fails before dialing rather than silently bypassing the selected route; use DoT or DoH for proxied encrypted DNS.
+
 `-> node-or-group` forces one generation-pinned dial leaf. Without an explicit target, the upstream endpoint is passed through the pinned traffic router and group snapshot. UDP+proxy deliberately uses TCP-DNS; this policy is separate from the SOCKS5 RFC 1928 UDP transport used by ordinary proxied UDP flows.
 
 Direct upstream sockets carry the bypass mark so their traffic cannot re-enter transparent interception. Hostname endpoints resolve through the generation-captured bootstrap resolver; dials never depend on honk's intercepted resolver path.
